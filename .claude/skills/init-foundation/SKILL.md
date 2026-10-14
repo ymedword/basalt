@@ -77,7 +77,8 @@ disable-model-invocation: false
 
 ### 步骤 0：前置检查
 
-- **`git init` 由用户执行**——本 skill **不得**自行初始化仓库；仓库尚无 `.git` 时，
+- **`git init` 由用户执行**——本 skill **不得**自行初始化仓库（本仓 2026-10-15 已初始化，
+  见 `docs/GettingStarted.md` §1.4）；仓库尚无 `.git` 时，
   `git` 类判据（文档入库时间等）一律记 `未入库`
 - Go 工具链 1.27.2 就位（`go version`；1.27.2 是**构建版本**，`go.mod` 的 `go` 行
   只写最低要求 `go 1.27`）；`GOPROXY=https://goproxy.cn` 可连通
@@ -128,13 +129,22 @@ US 决定，但**必须**在 `make check` 里有这一环。`fmt` 目标**先查
 fmt:  ; out="$$(gofmt -l .)" || { echo "gofmt 异常退出（退出码 $$?，多为语法错误）"; exit 1; }; test -z "$$out" || { echo "未格式化（gofmt）："; echo "$$out"; exit 1; }; out="$$(gofumpt -l .)" || { echo "gofumpt 异常退出（退出码 $$?）"; exit 1; }; test -z "$$out" || { echo "未格式化（gofumpt）："; echo "$$out"; exit 1; }
 ```
 
+`lint` 目标里的 staticcheck **必须显式指定判定集**（2026-10-15 定）：
+`staticcheck -checks=inherit,ST1000,ST1003,ST1016,ST1020,ST1021,ST1022 ./...`
+——`inherit` 取默认集，追加子集把命名与注释规范变成门禁判卷；形式取命令行旗标
+（Makefile 一处钉死，AI 与 CI 同一入口）。⚠ 本机实测更正（2026-10-15）：源码在
+`%TEMP%` 等用户缓存目录下时 staticcheck **跳过配置文件定位**——曾据此把
+`staticcheck.conf` 写法误判为无效；该写法**有效**，但缓存目录内的探针会给出假象，
+论证工具行为必须在缓存目录之外建探针（口径见 `docs/EngineeringStandards.md` §1.1）。
+
 ### 步骤 4：CI 双 job（各自固定 CGO 状态）
 
-`.github/workflows/`：job `test` = `make fmt lint sec test test-integration`
-（默认开启 CGO——`-race` 必需；Linux runner 自带 gcc）；job `build` =
+`.github/workflows/`：job `test` = `make fmt lint sec test test-integration cover`
+（默认开启 CGO——`-race` 必需；Linux runner 自带 gcc；`cover` 按包阈值阻断）；job `build` =
 `CGO_ENABLED=0` 四平台交叉编译（linux/amd64、linux/arm64、windows/amd64、
-darwin/arm64）——**不得**在此 job 跑 `-race`（CGO 状态冲突）。覆盖率报告入库或
-上传工件。**"安全扫描拖慢默认构建"的问题在 Go 不存在**——gosec / govulncheck
+darwin/arm64）——**不得**在此 job 跑 `-race`（CGO 状态冲突）。覆盖率报告入库或上传工件。GitHub 侧把两个 job 设为**必需检查**（branch
+protection，由用户设置、设置后回读一次；口径见 `docs/AiProgrammingGuide.md`
+§8.3 第 6 项）。**"安全扫描拖慢默认构建"的问题在 Go 不存在**——gosec / govulncheck
 都是秒级，全部进默认门禁。
 
 两个 job **都必须**经 `actions/setup-go` 把工具链钉到 `go-version: 1.27.2`（与

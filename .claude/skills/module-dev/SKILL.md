@@ -142,7 +142,7 @@ implement 期间逐任务执行，附加门禁：
   处理）；④安全类（gosec）报警按编程指南 §7 陷阱表对应条目修（如 `http.Server`
   四超时必设、路径白名单必须真实路径投影后再比前缀）；⑤不为"消灭告警"牺牲可观测
   性（错误路径 WARN 日志与审计落库两者都要）。**案例不在此内嵌**——复核方式一律
-  指 `docs/AiProgrammingGuide.md` §7 陷阱表（34 条，每条带"怎么发现"与"怎么
+  指 `docs/AiProgrammingGuide.md` §7 陷阱表（39 条，每条带"怎么发现"与"怎么
   复核"）。核心逻辑实现必须与颗粒度文档第 2 节的「核心逻辑」流程图/伪代码
   **逐块对照落地**（同构性核对，签名逐字一致）。**注释语言**（遵循项目 CLAUDE.md
   约定）：正文中文为主，英文标识符/术语保留原文不翻译；**关键注释（包级 /
@@ -150,7 +150,8 @@ implement 期间逐任务执行，附加门禁：
   英文**（`TestXxx_yyy` 形态），不得用中文函数名；文档 harness 里若给出中文用例名，
   翻译成语义等价的英文名落地，并以注释保留文档原文以便对号。
 - **写后**（任务级 DoD）：实现与测试一起落地，跑该模块测试，失败即时修复，不
-  累积到任务末尾。
+  累积到任务末尾；同一问题修复 3 次不收敛 → 停下走 `/debug` 四阶段根因定位
+  （**不得**第 4 次盲修）。
 - 文档"验收测试（Harness）"里**写出代码的关键回归测试必须原样落地**（断言逻辑
   逐条保真；函数名按上条规则译成英文，文档原文以注释保留）。
 
@@ -183,7 +184,8 @@ implement 期间逐任务执行，附加门禁：
 
 > 本节是唯一允许因项目而异的部分；上文所有章节跨项目不动。
 > 本实例按 Basalt 预填，事实来源：`docs/TechnicalSolution.md`（最权威）、
-> 项目根 `CLAUDE.md`、`docs/AiProgrammingGuide.md`、`docs/Roadmap.md`。
+> 项目根 `CLAUDE.md`、`docs/AiProgrammingGuide.md`、`docs/EngineeringStandards.md`、
+> `docs/Roadmap.md`。
 > 术语：**模块执行颗粒度文档** = 模块级设计文档（本项目统一用该称法）。
 
 ### 输入与模块类型分流（规则式——**不在本 skill 内维护 US 清单**）
@@ -218,8 +220,23 @@ implement 期间逐任务执行，附加门禁：
     据此改写技术方案原文
   - 模块落位 = 台账「模块落位（摘要）」列；细节以该 US 颗粒度文档 §3（交付物
     清单 + 改造点）为准，改造点属软门禁，逐条停下报告
+- 兼容承诺（条件触发）：US 触及 NivroOS 兼容承诺时（`docs/Compatibility.md`
+  §2 对照矩阵行 / §5 共享验收样例）→ 对应节为**附加事实源**，§5 样例逐条作
+  验收判据；无涉及不读
 - US-15 起（开放序列）：章节来源按 `docs/Roadmap.md` §4.2 取对应方向节
   （颗粒度文档头部已注明），台账列取 `/us-register` 的派生值
+
+### 编码规范（取数规则）
+
+`docs/EngineeringStandards.md` 是本项目的工程规范（Go / 测试 / 数据库 / 日志 /
+提交；§1 以 Go Code Review Comments 为基线，机器可判子集由 staticcheck
+`-checks` 判卷）：
+
+- **步骤 6 编码前**：**必须**读与本模块相关的节——Go 代码 §1、测试 §2、
+  SQL / 迁移 §3、日志 / 错误 §4（改动涉及哪块读哪块）
+- **步骤 7 收尾**：全局不变量自查按本节清单逐条执行；实测新坑按陷阱表惯例
+  拟条（带「怎么发现」与「怎么复核」），**经用户确认后**入库
+- 提交信息口径 §5（模板 `.gitmessage`；AI 不自动 commit / push / tag）
 
 ### 模块结构（单 Go module + `internal/` 十包为起点——**包数不冻结**）
 
@@ -245,13 +262,12 @@ implement 期间逐任务执行，附加门禁：
 
 ### 分支口径
 
-⚠ **开工前置**：本仓库**尚无 `.git`**（`git init` 由用户执行，AI **不得**自行
-初始化）——**在此之前不得开跑本 skill**（步骤 1.3 的分支检查无法满足）。
-git init 之后：仓库无 `.specify/extensions.yml`（即无 `before_specify` hook）→
-speckit-specify 不会建分支，按步骤 1.3 **手动建**：
-`git checkout -b {NNN}-<slug>`（如 `001-foundation`；NNN 取 specs 目录序号，
-slug 取颗粒度文档短名）。合回 main 的口径由用户定（建议快进合回，保持线性历史）；
-**AI 不自动 merge / push**。
+**仓库已初始化**（2026-10-15：`git init -b main`、首个 commit、推送 `origin/main`；
+授权与分工记录见 `docs/GettingStarted.md` §1.4）。仓库无 `.specify/extensions.yml`
+（即无 `before_specify` hook）→ speckit-specify 不会建分支，按步骤 1.3 **手动建**：
+`git checkout -b {NNN}-<slug>`（如 `001-foundation`；NNN 取 specs 目录序号，slug 取
+颗粒度文档短名）。合回 main 的口径由用户定（建议快进合回，保持线性历史）；
+**AI 不自动 commit / merge / push / tag**——每个 US 的 commit 由用户执行。
 
 ### 固定技术栈句
 
@@ -298,6 +314,8 @@ slug 取颗粒度文档短名）。合回 main 的口径由用户定（建议快
 5. 无 ORM / 无自动迁移：`grep -nE "gorm|entgo|ent\.io|xorm" go.mod` 零命中；建表与迁移只在 `schema.sql` + `schema_version`（已发布迁移只追加、不改写）
 6. 单二进制：`CGO_ENABLED=0 go build ./...` 通过（`-race` 不在该命令内）
 7. 时区禁用词：`grep -rn "time.Local\|time.Now().Location()" --include='*.go' .` 零命中（调度 zone 缺省 UTC、Agent 配置显式 zone）
+8. 随机源红线：`grep -rn '"math/rand' --include='*.go' cmd internal` 零命中——密钥 / 令牌 / 随机标识一律 `crypto/rand`（EngineeringStandards §1.8；gosec G404 复核）
+9. 点导入零命中：`grep -rnE '^import[[:space:]]+\.|^[[:space:]]+\.[[:space:]]*"' --include='*.go' cmd internal` 零命中——`import .` 只在测试的循环依赖特例允许（EngineeringStandards §1.3）
 
 ### 语法禁区
 

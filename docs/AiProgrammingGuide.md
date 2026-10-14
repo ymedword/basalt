@@ -128,7 +128,7 @@ mkdir -p cmd/basalt internal/{app,core,provider,memory,tool,channel,web,storage,
 gofmt -l .                               # 格式：不合规文件打印到 stdout 且退出码 0——须显式判空；语法错误则退出码非 0——须先查退出码（见下）
 gofumpt -l .                             # 更严格式：同 gofmt，两条都要跑
 go vet ./...                             # 标准静态检查
-staticcheck ./...                        # 静态检查（honnef）
+staticcheck -checks=inherit,ST1000,ST1003,ST1016,ST1020,ST1021,ST1022 ./...  # 判定集显式指定（EngineeringStandards.md §1.1）——不得裸跑
 gosec -quiet ./...                       # 安全扫描
 govulncheck ./...                        # 依赖漏洞扫描
 go test -race -cover ./...               # 测试 + 竞态 + 覆盖率——⚠ 需 CGO + C 编译器
@@ -150,7 +150,7 @@ fmt:  ; out="$$(gofmt -l .)" || { echo "gofmt 异常退出（退出码 $$?，多
 test:  ; go test -race -cover ./...
 test-integration: ; go test -tags=integration ./...
 cover:  ; scripts/check-coverage.sh        # 按包阈值判失败；脚本由 US-1 交付（读数来源 go test -cover ./...）
-lint:  ; go vet ./... && staticcheck ./...
+lint:  ; go vet ./... && staticcheck -checks=inherit,ST1000,ST1003,ST1016,ST1020,ST1021,ST1022 ./...
 sec:  ; gosec -quiet ./... && govulncheck ./...
 build:  ; CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/basalt ./cmd/basalt
 check:  fmt lint sec test test-integration cover build
@@ -162,7 +162,7 @@ check:  fmt lint sec test test-integration cover build
 
 | job | 内容 | 关键点 |
 | --- | --- | --- |
-| `test` | `make fmt lint sec test test-integration` | 默认开启 CGO（`-race` 必需）；Linux runner 自带 gcc |
+| `test` | `make fmt lint sec test test-integration cover` | 默认开启 CGO（`-race` 必需）；Linux runner 自带 gcc；`cover` 按包阈值阻断——低于底线 CI 即红 |
 | `build` | `CGO_ENABLED=0` 四平台交叉编译 | 验证单二进制承诺；**不得**在此 job 跑 `-race`（CGO 状态冲突） |
 
 覆盖率报告入库或上传工件。两个 job 都**必须**经 `actions/setup-go` 把工具链钉到 `go-version: 1.27.2`（与 `go.mod` 的 `toolchain` 行一致）——**准确构建版本**由 `toolchain` 行与 CI 两处表达，`go.mod` 的 `go` 行只是**最低版本要求**（Go 1.21 起语义）。**"安全扫描拖慢默认构建"的问题在 Go 不存在**——gosec / govulncheck 都是秒级，全部进默认门禁。
@@ -205,10 +205,10 @@ check:  fmt lint sec test test-integration cover build
 
 - **核心目标**：从干净检出到 `make check` 全绿、`basalt init` 产出 `.basalt/` 工作区、SQLite 库与全部表就位（幂等 schema）
 - **涉及包**：根（`go.mod` / `Makefile` / CI）、`app`（装配骨架）、`cli`（init / status）、`workspace`（目录约定）、`storage`（SQLite 打开 + schema.sql 幂等 + 仓储接口与实现）
-- **task 大类**：`go.mod` + `internal/` 十包骨架（**起点布局，包数不冻结**——纪律是依赖方向 / 接口定义在消费方 / 第三方实现就近封装，见 §3.2 与技术方案 §10）→ Makefile 门禁（gofmt / gofumpt / vet / staticcheck / gosec / govulncheck / test -race / `test -tags=integration` / `CGO_ENABLED=0` build）+ CI 双 job（test / build，CGO 状态各自固定）→ `basalt.yaml` 加载与 `${ENV_VAR}` 占位校验（未解析残留即拒、不静默取默认）→ slog 双档日志（dev 文本 / prod JSON）→ `basalt init` 工作区幂等生成（agents / skills / memory / logs / archive / AGENTS.md / SOUL.md / USER.md / mcp_servers.yaml）→ SQLite（modernc、WAL；读写池分离、写池 1）→ `schema.sql` 幂等建齐**核心八张 + 支撑三张**（sessions / messages / runs / config_snapshots / llm_calls / tool_invocations / scheduled_tasks / task_executions + notify_channels / memory_entries / schema_version）→ 仓储接口（core 定义 / storage 实现）→ **时区数据库内嵌**（`import _ "time/tzdata"`——裸镜像里 IANA 时区名才解析得出来，否则带 `zone: Asia/Shanghai` 的 Agent 到了容器里整只不注册；见 [Operations.md](Operations.md) §3）→ 契约 YAML 解析单测（用项目已有的 YAML 依赖解析 `docs/contracts/*.yaml`——别名指示符类隐性错误当场红，见 §7 陷阱 32）→ `basalt status`
+- **task 大类**：`go.mod` + `internal/` 十包骨架（**起点布局，包数不冻结**——纪律是依赖方向 / 接口定义在消费方 / 第三方实现就近封装，见 §3.2 与技术方案 §10）→ Makefile 门禁（gofmt / gofumpt / vet / staticcheck / gosec / govulncheck / test -race / `test -tags=integration` / `CGO_ENABLED=0` build）+ CI 双 job（test / build，CGO 状态各自固定）→ `basalt.yaml` 加载与 `${ENV_VAR}` 占位校验（未解析残留即拒、不静默取默认）→ slog 双档日志（dev 文本 / prod JSON）→ `basalt init` 工作区幂等生成（agents / skills / memory / logs / archive / AGENTS.md / SOUL.md / USER.md / mcp_servers.yaml）→ SQLite（modernc、WAL；读写池分离、写池 1）→ `schema.sql` 幂等建齐**核心八张 + 支撑三张**（sessions / messages / runs / config_snapshots / llm_calls / tool_invocations / scheduled_tasks / task_executions + notify_channels / memory_entries / schema_version）→ 仓储接口（core 定义 / storage 实现）→ **时区数据库内嵌**（`import _ "time/tzdata"`——裸镜像里 IANA 时区名才解析得出来，否则带 `zone: Asia/Shanghai` 的 Agent 到了容器里整只不注册；见 [Operations.md](Operations.md) §3）→ 契约 YAML 解析单测（用项目已有的 YAML 依赖解析 `docs/contracts/*.yaml`——别名指示符类隐性错误当场红，见 §7 陷阱 32）→ **测试基础设施**（临时工作区 / 本地 HTTP 测试服务——假 Provider 随 US-2、MCP 测试服务随 US-7 以同口径补，见 §8.3 第 2 项）→ `basalt status`
 - **颗粒度**：最大的管线类 US（多为样板代码）；约 25~30 个文件
 - **硬依赖**：无
-- **验收 Demo**：干净检出 `make check` 全绿；`basalt init` 出工作区、二跑幂等（已有文件不覆盖）；`basalt status` 显示库与表就绪；`CGO_ENABLED=0 go build` 出静态二进制；`TZ=` 清空 + 无系统 zoneinfo 的环境里 `time.LoadLocation("Asia/Shanghai")` 仍成功（tzdata 内嵌生效）
+- **验收 Demo**：干净检出 `make check` 全绿；`basalt init` 出工作区、二跑幂等（已有文件不覆盖）；`basalt status` 显示库与表就绪；`CGO_ENABLED=0 go build` 出静态二进制；`TZ=` 清空 + 无系统 zoneinfo 的环境里 `time.LoadLocation("Asia/Shanghai")` 仍成功（tzdata 内嵌生效）；测试基础设施跑通首个不依赖真实网络的用例（本地 HTTP 测试服务）
 
 ### 4.2 US-2 Provider 对接（能力一）
 
@@ -234,10 +234,10 @@ check:  fmt lint sec test test-integration cover build
 
 - **核心目标**：第一条真正的 agent 竖切——四段提示词 → 循环 → 工具执行（沙箱正式实现，非桩）→ 结果回填 → 多轮会话落库；`basalt chat` 可用
 - **涉及包**：`core`（ReActLoop / PromptBuilder / ToolExecutor / AgentService / `Policy` 与 `CommandRunner` 接口）、`tool`（Registry / WhitelistPolicy / LocalRunner / FileTools）、`channel`（CliChannel）、`cli`（chat / session list）、`storage`（sessions / messages / runs 读写）
-- **task 大类**：PromptBuilder 四段拼接（段 4 工具列表来自 Registry）→ Tool 接口 + Registry 显式注册 → **`WhitelistPolicy`（授权）+ `LocalRunner`（执行）**——文件真实路径投影、可执行名整串比对、域名 + scheme 固定、子进程环境变量白名单、超时杀进程树——与四段式拒绝信息（模型可见契约）→ ToolExecutor（**先 `Policy.Check` 再 `CommandRunner.Run`**）→ **完整消息模型**（`tool_calls` / `tool_call_id` / `reasoning_content` 原样回传；裁剪按完整工具交互组）→ ReActLoop（工具顺序执行、失败信息回填、`max_iterations` → `limit_reached`）→ **`AgentService.Run(ctx, RunRequest) (RunResult, error)`**（生成 `run_id`、每次运行重建配置快照并运行内冻结、同会话准入检查、取消与超时）→ FileTools 三件（read_file / write_file / list_dir，写范围 = 当前 Agent 自己的目录）→ **审计两阶段写**（`tool_invocations` 先插 `pending`，插入失败即拒绝执行；`llm_calls` 带 `run_id` + `round`）→ CliChannel（真控制台 vs 管道分流的装配，平台差异走 build tag）→ `chat`（多轮 + `--message` 单条）→ 会话落 SQLite 并跨重启恢复 + `session list` → 加载期"工具名在注册池"门禁接入 AgentLoader
+- **task 大类**：PromptBuilder 四段拼接（段 4 工具列表来自 Registry）→ Tool 接口 + Registry 显式注册 → **`WhitelistPolicy`（授权）+ `LocalRunner`（执行）**——文件真实路径投影、可执行名整串比对、域名 + scheme 固定、子进程环境变量白名单、超时杀进程树——与四段式拒绝信息（模型可见契约）→ ToolExecutor（**先 `Policy.Check` 再 `CommandRunner.Run`**）→ **完整消息模型**（`tool_calls` / `tool_call_id` / `reasoning_content` 原样回传；裁剪按完整工具交互组）→ ReActLoop（工具顺序执行、失败信息回填、`max_iterations` → `limit_reached`）→ **`AgentService.Run(ctx, RunRequest) (RunResult, error)`**（生成 `run_id`、每次运行重建配置快照并运行内冻结、同会话准入检查、取消与超时）→ FileTools 三件（read_file / write_file / list_dir，写范围 = 当前 Agent 自己的目录）→ **审计两阶段写**（`tool_invocations` 先插 `pending`，插入失败即拒绝执行；`llm_calls` 带 `run_id` + `round`）→ CliChannel（真控制台 vs 管道分流的装配，平台差异走 build tag）→ `chat`（多轮 + `--message` 单条）→ 会话落 SQLite 并跨重启恢复 + `session list` → 加载期"工具名在注册池"门禁接入 AgentLoader → **行为评测基座**（`evals/` 首批固定任务集 + 运行脚本：工具选择 / 实际结果 / 越权尝试 / 调用次数 / 成本读数，业务结果判定——见 §8.3 第 3 项）→ **注入类安全用例**（网页 / 文件 / 工具返回中的恶意指令不改变执行层权限——见 §8.3 第 4 项）
 - **颗粒度**：全项目**唯一保留的大 US**——再拆会出现"有循环没工具"或"有工具没人调"的半截状态；约 25~30 个文件
 - **硬依赖**：US-3
-- **验收 Demo**：`basalt chat` 多轮对话（AGENT.md 身份生效）；模型调 `read_file` 读工作区文件并用于回答；越界路径被四段式拒绝且审计落 `failed` + `error_kind=sandbox_denied`；思考模式模型连续多轮带工具调用**不报 400**（`reasoning_content` 回传）；重启进程后会话历史仍在并可继续
+- **验收 Demo**：`basalt chat` 多轮对话（AGENT.md 身份生效）；模型调 `read_file` 读工作区文件并用于回答；越界路径被四段式拒绝且审计落 `failed` + `error_kind=sandbox_denied`；思考模式模型连续多轮带工具调用**不报 400**（`reasoning_content` 回传）；重启进程后会话历史仍在并可继续；行为评测首批任务集跑通（五读数入库）；注入用例的越权尝试被四段式拒绝且审计落 `failed`
 
 ### 4.5 US-5 Shell 与 HTTP 工具（Demo 一）
 
@@ -323,11 +323,11 @@ check:  fmt lint sec test test-integration cover build
 ### 4.14 US-14 发布收尾（三个每日 Demo + v0.1.0）
 
 - **核心目标**：三个每日 Demo 入素材库并真跑；干净检出发布走查；`v0.1.0` 锚点
-- **涉及包**：素材库 `examples/`、根（走查与 tag）
-- **task 大类**：三份 Agent 目录（天气光杆 / 科技日报带 `skills:` 声明 / GitHub 日报带 `scripts/`）→ 素材钉住测试（可被加载器读回、cron 6 段合法、声明的工具名在池、技能与脚本文件存在）→ 免 key 数据源域名进白名单 → 三个 Demo 真跑（含真通知渠道，人工验收）→ 干净检出全量门禁 + 发布走查（按 US-13 的 README / 站点口径）→ `v0.1.0`（打 tag 由用户手动）
-- **颗粒度**：素材 + 文案；约 10~15 个文件
+- **涉及包**：素材库 `examples/`、e2e 测试目录与脚本（`e2e` 目标）、Makefile 与发布工作流、根（走查与 tag）
+- **task 大类**：三份 Agent 目录（天气光杆 / 科技日报带 `skills:` 声明 / GitHub 日报带 `scripts/`）→ 素材钉住测试（可被加载器读回、cron 6 段合法、声明的工具名在池、技能与脚本文件存在）→ 免 key 数据源域名进白名单 → 三个 Demo 真跑（含真通知渠道，人工验收）→ 干净检出全量门禁 + **mock 模型集成测试**（假 OpenAI 兼容服务 + 发布候选二进制，**零真实凭证**、确定性判定；七场景——工具闭环 / 越权拒绝 / 取消与工具超时 / 崩溃恢复 / 同会话并发 409 / 运行中热加载 / Web·调度·通知，覆盖 §3.4 五链路 + 越权 + Web·调度·通知；独立 Make 目标 `e2e`（`//go:build e2e`），新构建步骤按「构建步骤追加」登记并注明**仅发布流程必跑**——见 §8.3 第 8 项与 §8.4）+ 发布走查（按 US-13 的 README / 站点口径）→ **数据与长期运行策略落实**（保留期 / 访问权限 / 磁盘告警与满盘行为 / 清理时消息组与关联记录完整——策略文本落 [Operations.md](Operations.md)，见 §8.3 第 7 项）→ **发布与平台验证**（版本号 + commit + 产物 sha256；锁 / 中文控制台 / 进程树取消在目标系统实跑；前端资源随工件；升级 / 恢复演练——见 §8.3 第 8 项）→ `v0.1.0`（打 tag 由用户手动）
+- **颗粒度**：素材 + 文案 + 发布验证代码（e2e 场景 / 假模型服务 / 脚本）；约 15~20 个文件
 - **硬依赖**：US-13（README / 站点就绪，走查按它做）+ US-5 / US-6 / US-7 / US-8 / US-10（Demo 会用到 HTTP / 记忆 / 技能 / 脚本 / 通知 / 定时）
-- **验收 Demo**：三个每日 Demo 自动跑通（人工验收）；`v0.1.0` 锚点
+- **验收 Demo**：三个每日 Demo 自动跑通（人工验收）；`v0.1.0` 锚点；升级 / 恢复演练一次通过（按 Operations §5）；mock 模型集成测试全绿（独立目标 `e2e`，七场景覆盖五链路 + 越权 + Web·调度·通知；绑定候选产物 sha256——发布闸门，口径见 §8.4）
 
 ### 4.15 协作模式（人与 AI 分工）
 
@@ -336,6 +336,7 @@ check:  fmt lint sec test test-integration cover build
 | 宪法与未决事项裁决 | **决定** | 提供建议与影响分析 |
 | 颗粒度文档 | 审核 | 生成 |
 | 代码 + 测试 | 抽查 | 实现 |
+| 已批准 US 内的实现细节（辅助函数 / 私有类型 / 包内测试） | 抽查 | 自主完成、不逐项请示（边界见 §8.3 第 1 项） |
 | 门禁 | 看结果 | 修复（修实现，不改断言） |
 | 真实凭证类冒烟 | **执行**（凭证人手输入） | 准备步骤与核对清单 |
 | commit / push / tag | **决定时机** | 不自动执行 |
@@ -346,7 +347,7 @@ check:  fmt lint sec test test-integration cover build
 | --- | --- |
 | 引入框架"省事" | 回到宪法 I / II 条；Agent 框架不得作为直接或间接依赖引入；协议 SDK（如 MCP SDK）可用，但不得接管 ReAct 循环或自动执行工具 |
 | 出现包级可变状态 | grep 包级变量；改 context 显式传递 |
-| 新类型 / 新配置键未申报 | 停下问用户；进颗粒度文档后再落地 |
+| 新增**对外契约 / 架构边界**未申报（新配置键 / 端点字段 / 错误码 / Run 状态 / 表结构 / 新包 / 依赖坐标） | 停下确认（进颗粒度文档或用户裁决）；**私有实现类型**（辅助函数、私有结构、包内测试）不属此列——已批准范围内自主落地（§8.3 第 1 项） |
 | 测试变红改断言 | **禁止**；改实现；认为测试错 → 停下报告 |
 | 门禁不过想加豁免 | 优先改实现；确需抑制 → 逐条说明理由并经用户确认 |
 | "顺便重构"前序代码 | 越出本 US 范围即停；重构单独提案 |
@@ -396,7 +397,10 @@ check:  fmt lint sec test test-integration cover build
 **发布收尾模板**：
 
 ```text
-按 docs/TechnicalSolution.md §10.2 出四平台产物；
+按 docs/TechnicalSolution.md §10.2 出四平台产物，记录版本号 + commit + 产物 sha256；
+干净检出跑全量门禁（make check）+ mock 模型集成测试（make e2e，绑定候选产物
+sha256、录读数——口径见 docs/AiProgrammingGuide.md §8.4；缺前置即失败、不得跳过、
+产物变化重跑）；
 跑三个每日 Demo 冒烟（人工项列清单）；对照 docs/DemandAnalysis.md §13 逐条验收；
 不 commit / 不 push / 不打 tag（由用户决定）。
 ```
@@ -468,8 +472,34 @@ check:  fmt lint sec test test-integration cover build
 1. **测试纪律**：不得删断言、不得跳过测试、不得放宽阈值让测试变绿。实现错修实现；认为测试错 → 停下报告
 2. **如实汇报**：报错贴原文、跳过步骤明说、没验证的部分标注——**不得**掩饰
 3. **凭证纪律**：真实凭证不明文落盘 / 落日志 / 进对话；通知渠道地址在库里也只存 `${ENV_VAR}` 引用、**发送时解析**（解析失败点名环境变量、不静默）；凭证类操作由人执行
-4. **提交纪律**：AI 不自动 commit / push / tag；提交时机由用户决定（提交信息用 Conventional Commits 标题 + 四段正文（Problem / Design / Testing / Impact），模板入库）
+4. **提交纪律**：AI 不自动 commit / push / tag；提交时机由用户决定（提交信息 = 英文 Conventional Commits 标题 + 四段**双语**正文（Problem / Design / Testing / Impact——每段先英文段、空行、再中文段逐段对照）；规范原文见 [EngineeringStandards.md](EngineeringStandards.md) §5，模板 `.gitmessage` 入库）
 5. **文档纪律**：四份权威文档各司其职，**不得**互相"修正"；有冲突先裁决（技术方案最权威）再动手
+6. **完成证据纪律**：任何「完成 / 通过 / 修好」的表述**必须**附**本轮当场**跑出的命令与输出（含退出码）——「没在本轮跑过那条验证命令，就不能声称它通过」；**不得**以「应该能过 / 上次跑过 / 局部过了」外推（2026-10-15 摘编自 superpowers 的 `verification-before-completion`，MIT，按本仓口径重写）
+7. **审查回执纪律**：收到审查 / 评审意见——先验证再实施、不清楚先问，**不得**猜着改；审查方「跳过不判」的项**必须**显式列出、由执行者裁决，**不得**静默丢弃；**不得**表演式应答（「你说得对 / 好问题 / 感谢指正」式客套免掉，以技术回应与动作作答）（2026-10-15 摘编自 superpowers 的 code-review 两技能，MIT）
+
+### 8.3 工程治理八项（2026-10-15 立；逐项带生效时点与可验证判据）
+
+八项规则本体集中在本节；US 章节只保留一行挂点（§4.1 / §4.4 / §4.14），跑偏纠正表（§4.16）与 CI 表（§3.2）同口径。测试案例与检查脚本**随代码维护**（`evals/` / `scripts/` / 测试文件本身），本节只记规则与判据。
+
+1. **修改权限（自主 vs 确认分档）**——已批准 US 范围内（颗粒度文档 §3 交付物清单内）的**实现细节**——辅助函数、私有类型、包内测试、不涉契约的内部重构——**自主完成、不逐项请示**；清单**外**的结构性变更——新增对外契约（API / 错误码 / Run 状态机 / 配置键 / 表结构）、架构边界（新包 / 依赖方向）、依赖坐标与版本、跨 US 重构——**必须**停下确认（软门禁）。**生效**：即日（US-1 起）。**判据**：每 US 收尾报告逐条列出本轮停等确认项（无则记「无」），§4.16 同口径。
+2. **测试策略（基础设施 + 五类重点 + 验收先定）**——自 US-1 起建立**可复用测试基础设施**：临时工作区、本地 HTTP 测试服务（`httptest`）先落，固定假 Provider 随 US-2 接口落位、MCP 测试服务随 US-7 补齐——后续 US 一律复用，**不得**各自造桩（同 §1.3 不出现「先做桩、后面替换」式返工序）；五类重点在各 US 的验收测试（Harness）中**显式覆盖**：取消、并发、崩溃恢复、错误模型响应、审计写入失败；验收条件（Harness）**编码前定稿**（颗粒度文档先行），实现期**不得**事后放宽——放宽 = 变更，走用户确认。**生效**：US-1 起。**判据**：基础设施包被后续 US 复用（import 可知）；五个关键词在测试名可 grep。
+3. **Agent 行为评测（固定任务集 + 变更重跑）**——自 US-4 起积累**固定任务集**（`evals/`，随代码维护），每次运行记录五项读数：工具选择、实际结果、越权尝试、调用次数、成本；**模型 / 提示词 / 技能变更后必须重跑**；按**业务结果**判定（任务是否达成），**不得**要求回答逐字一致。**生效**：US-4 起（首批随 US-4 落）。**判据**：每 US「变更导读」附重跑读数（通过率 / 调用次数 / 成本）。
+4. **安全专项测试（注入与越权由执行层兜底）**——网页内容、文件内容、工具返回中嵌入恶意指令的用例：权限**仍由执行层**（模型之外的代码）控制；覆盖三类手法：路径绕过、重定向、环境变量泄露；授权与最小权限由模型外代码执行（宪法第 6 条），用例设计参考 OWASP LLM Top 10（提示注入 / 过度代理）。**生效**：US-4 起（有工具即有注入面）。**判据**：注入用例组全绿——越权尝试 → 四段式拒绝 + 审计 `failed`。
+5. **契约变更规则（同批更新 + 旧态显式）**——修改 API / 错误码 / Run 状态 / 配置键 / 数据库结构时，**同一变更内**同步更新 `docs/contracts/`、消费方（实现 + 测试）与 [Compatibility.md](Compatibility.md)（双侧契约变化时）；**旧配置 / 旧工作区的处理必须显式**——迁移或拒绝（报错点名），**不得**静默兼容；契约冻结（§3.3）后的修改 = 变更提案，走用户确认。**生效**：即日。**判据**：变更类 commit 里 contracts / 实现 / 测试同批出现。
+6. **CI 与人工审查（门禁全量入 CI + 审查重点排序）**——测试 / 覆盖率 / 安全扫描 / 构建**全部**为合并前检查（§3.2 双 job 全跑、`cover` 按包阈值阻断）；GitHub 侧两个 job 设为**必需检查**（branch protection，由用户设置、设置后回读一次）；人工审查按风险排序覆盖五类：文件访问 / 进程执行 / 凭证处理 / 迁移 / 恢复逻辑——每 US「变更导读」的 review 清单按此排序。**生效**：US-1（CI 内容）；远端就绪后（必需检查）。**判据**：CI 配置含 `cover`；branch protection 回读一次；变更导读符合五类排序。
+7. **数据与长期运行（发布前必须定策略）**——**首次发布前必须明确**：审计 / 会话 / 日志 / 备份的**保留期与访问权限**、**磁盘告警**、**磁盘满时的行为**（失败关闭、报错可读、审计记录不破坏）、**清理如何保持消息组与关联记录完整**（工具调用组与 run 关联不得因清理断裂）；策略文本落 [Operations.md](Operations.md)、涉存储行为的设计落技术方案（改动走用户确认）；**未定即阻断发布**。**生效**：US-14 发布收尾前。**判据**：US-14 走查对照 Operations 对应节；满盘行为有实测读数。
+8. **发布与平台验证（记录校验值 + 平台实跑 + 回归闸门）**——固定构建工具版本（`toolchain` 行 / CI setup-go 已锁）；每次发布的记录 = **版本号 + commit + 产物校验值（sha256）**；**锁、中文控制台、进程树取消**在目标系统（Windows + Linux）**实跑**验证；发布工件**包含前端资源**（US-13 站点）；升级与恢复按 [Operations.md](Operations.md) §5 **演练一次**；**每次发布前必须先跑一次 mock 模型集成测试**（独立目标 `e2e`，**零真实凭证**：假 OpenAI 兼容服务 + 发布候选二进制全链路回归；场景挂点见 §4.14，六条口径见 §8.4）。**生效**：首次发布（US-14）。**判据**：发布记录含校验值清单；平台实测读数；升级 / 恢复演练记录；mock 集成测试全绿（记录绑定候选产物 sha256，产物变化后重跑）。
+
+### 8.4 mock 模型集成测试口径（六条，2026-10-15 定；US-14 落地）
+
+与 §3.4 五链路原型验证（开发期）、§4.14 每日 Demo（真实链路人工验收）并列的**发布前自动化回归**——发布闸门，不进日常门禁；场景集（七场景）与挂点见 §4.14。
+
+1. **构造三条硬边界**——① **不加入 `make check`**（七目标不含 `e2e`，日常门禁不被发布回归拖累）；② **生产代码无测试开关**（不设 test-only 分支 / 旁路环境变量，测试只经正式配置项——如 provider `base_url`——指到假服务）；③ **执行发布候选二进制**（跑将要发布的那份产物，不是源码形态）。测试记录**绑定候选产物的 sha256**；产物发生任何变化后**必须重跑**。
+2. **入口隔离与防假绿**——测试代码用独立 build tag `//go:build e2e`（**不得**并入 `integration`，日常 `-tags=integration` 不携带它）；独立 Make 目标，登记构建步骤时注明**仅发布流程必跑**（不进入每个 US 的全量门禁）；发布运行**不得**因缺少产物 / 环境而跳过（缺前置 = 失败）；若由 `go test` 驱动，**必须** `-count=1` 禁用测试缓存（Go 官方推荐的禁缓存写法——缓存会把"没真跑"渲染成通过）。
+3. **假模型双向断言**——假服务除返回预设响应外，**必须**断言**收到的请求**：`tool_call_id` 回填正确、工具结果已进入下一轮请求、消息顺序符合契约；**遇到预期之外的请求即失败**——专防"数据库记录齐了、发给模型的协议错了"。
+4. **取消与超时分开验收**——**主动取消 / Run 超时 → Run 落 `cancelled`**（契约 §4.1：取消优先于预算判定）；**工具自身超时 → 工具审计落 `failed`（`error_kind = timeout`）、Run 继续**（契约 §7.3；失败结果回填后续轮继续）——两者判据不同，用例分开写；两者都验证**进程树清理**（无孤儿进程）；取消后**在同一会话再发一条消息**，确认会话可继续（契约 §4.4 补齐链路）。
+5. **崩溃测试先确认命中故障点**——**不得**靠固定 sleep 掐时机：先等到"assistant 工具声明已落库 + 工具处于阻塞（经测试服务 / 辅助进程握手确认）+ 对应审计行为 `pending`"三点齐备，再强杀进程；恢复后核对：Run 收尾、审计归一化（`pending` → `unknown`）、工具交互组补齐、**无副作用重放**（恢复语义 = 标记不重放）；**再次重启**确认没有重复追加（恢复可重入，契约 §4.3.2）。
+6. **环境完全独立、调度断言有来源**——每个场景：临时工作区 + 独立端口 + 测试环境变量。"零凭证"的准确表述是**零真实凭证**：启动校验仍要求非空 key，用虚构值（环境变量指向假值）。通知接收器用**域名形态**（如 `localhost`）——渠道域名不在白名单即 `sandbox_denied`（契约 §5.5），IP 字面量目标直接拒（§5.3），域名形态顺带把白名单匹配纳入回归。cron 断言**同时**核对 `task_executions` 与关联 Run（证明通知来自自动触发，而非手工发消息）；一切等待**有界**（到点即失败，不无限等）。
 
 ---
 

@@ -1,13 +1,31 @@
 <type>(<scope>): <subject>
 
 **Problem:**
-<为什么要改：现象、触发场景、根因>
+<English: why this change is needed — symptom / trigger / root cause>
+
+<中文：为什么需要这次改动——现象 / 触发场景 / 根因>
 
 **Design:**
-<怎么改：关键决策、结构、对应的原则 / 文档章节>
+<English: what and how — key decisions, referenced principles / documents>
+
+<中文：改了什么、怎么改——关键决策，引用的原则 / 文档章节>
 
 **Testing:**
-<怎么验证：命令、用例、结果>
+<English: how it was verified — commands run this round and their results; state what was NOT verified>
+
+<中文：如何验证——本轮当场跑过的命令与结果；未验证 / 未覆盖处如实写明>
 
 **Impact:**
-<影响范围：涉及包、依赖 / 兼容性、后续项>
+<English: scope — packages / contracts / dependencies / compatibility / follow-ups>
+
+<中文：影响范围——涉及包 / 契约 / 依赖 / 兼容性、后续项>
+
+# ---- 填写说明（# 开头行不会进入提交信息）----
+# 标题：英文、祈使句、动词开头、<=72 字符、句尾无句号；标题只用英文
+# type：feat | fix | docs | refactor | test | chore | ci | build | perf | revert
+# scope：internal 包名（app core provider memory tool channel web storage cli workspace）或 build / docs；可省略；跨多包可省略
+# 正文：四段逐段对照——每段先英文段落、空行、再对应中文段落
+# 破坏性变更：type/scope 后加 "!"，正文末尾补 BREAKING CHANGE: <说明>
+# 项目发布版本只进 git tag（构建注入是其派生）；依赖 / 迁移版本属背景事实，应写进正文
+# 小改动（如单文件 docs）可只留标题，删掉不需要的小节
+# 规范原文：docs/EngineeringStandards.md §5

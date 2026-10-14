@@ -58,7 +58,7 @@ CI 工作流（`.github/workflows/`，双 job：`test` 开 CGO 跑 `-race` / `bu
 | 2 | 远程仓库 | GitHub · **Public** · 账号 `ymedword` · 仓库名 `basalt` | §3.3 的 `git remote add origin https://github.com/ymedword/basalt.git`；推到 GitHub 后 CI 生效（1.2） |
 | 3 | 本机装 C 编译器 | **装**（MSYS2 + mingw-w64 gcc，见 2.4） | 本机 `make check` 整条可跑通，`-race` 本地即时可见（1.3） |
 
-**第 2 / 3 步的执行分工（2026-10-15 定案，同日修订）**：初次定案为「全部由用户执行」；用户随后**明确指令改为由 AI 执行第 2、3 步**——工具链安装、`git init`、三个仓库级配置文件与首个 commit 已由 AI 在本机执行完毕（**唯一一次代跑**，时点由用户指令决定，与 CLAUDE.md「禁止**自动** commit / push / tag」不冲突）。**远程仓库创建与 `push` 未执行**——待用户明确授权（1.2）。此后每个 US 的 commit 仍按原口径由用户执行，本次授权**不构成**对后续的默认授权。
+**第 2 / 3 步的执行分工（2026-10-15 定案，同日修订）**：初次定案为「全部由用户执行」；用户随后**明确指令改为由 AI 执行第 2、3 步**——工具链安装、`git init`、三个仓库级配置文件与首个 commit 已由 AI 在本机执行完毕（代跑均由用户指令逐次触发，与 CLAUDE.md「禁止**自动** commit / push / tag」不冲突）。远程仓库由用户在 GitHub 网页创建（`ymedword/basalt`）；**经用户明确授权，`push` 亦已执行**（2026-10-15：`main` → `origin/main`，本地分支已跟踪）。此后每个 US 的 commit 仍按原口径由用户执行，这两次授权**不构成**对后续的默认授权。
 
 ## 2. 环境准备（你执行）
 
@@ -266,25 +266,33 @@ git init -b main
 .env
 ```
 
-**`.gitmessage`**（提交信息模板，[AiProgrammingGuide.md](AiProgrammingGuide.md) §8.2 第 4 条要求「模板入库」）：
+**`.gitmessage`**（提交信息模板，规范原文见 [EngineeringStandards.md](EngineeringStandards.md) §5；[AiProgrammingGuide.md](AiProgrammingGuide.md) §8.2 第 4 条要求「模板入库」）：
 
 ```text
 <type>(<scope>): <subject>
 
 **Problem:**
-<为什么要改：现象、触发场景、根因>
+<English: why this change is needed — symptom / trigger / root cause>
+
+<中文：为什么需要这次改动——现象 / 触发场景 / 根因>
 
 **Design:**
-<怎么改：关键决策、结构、对应的原则 / 文档章节>
+<English: what and how — key decisions, referenced principles / documents>
+
+<中文：改了什么、怎么改——关键决策，引用的原则 / 文档章节>
 
 **Testing:**
-<怎么验证：命令、用例、结果>
+<English: how it was verified — commands run this round and their results; state what was NOT verified>
+
+<中文：如何验证——本轮当场跑过的命令与结果；未验证 / 未覆盖处如实写明>
 
 **Impact:**
-<影响范围：涉及包、依赖 / 兼容性、后续项>
+<English: scope — packages / contracts / dependencies / compatibility / follow-ups>
+
+<中文：影响范围——涉及包 / 契约 / 依赖 / 兼容性、后续项>
 ```
 
-`<type>` 取 Conventional Commits 标准类型（`feat` / `fix` / `docs` / `refactor` / `chore` / `test` / `perf` / `style`），`<subject>` 英文祈使句。挂上模板：
+标题**英文**祈使句 ≤ 72 字符；正文四段**逐段对照**（先英文段、空行、再中文段）；`<type>` 取 `feat` / `fix` / `docs` / `refactor` / `test` / `chore` / `ci` / `build` / `perf` / `revert`。完整填写说明见 `.gitmessage` 内的 `#` 注释。挂上模板：
 
 ```bash
 git config commit.template .gitmessage    # 仓库级；此后 git commit 自动带出模板
@@ -304,10 +312,14 @@ git commit                        # 打开编辑器，模板已带出
 
 ### 3.3 远程仓库与 CI（可选）
 
+**已执行（2026-10-15）**：`origin` = `https://github.com/ymedword/basalt.git`（用户在 GitHub 网页创建仓库后授权推送）；`main` 已推至 `origin/main`，本地分支已跟踪。参考命令：
+
 ```bash
-git remote add origin <仓库 URL>
+git remote add origin https://github.com/ymedword/basalt.git
 git push -u origin main
 ```
+
+推送按**单次**凭证助手执行（`git -c credential.helper= -c credential.https://github.com.helper='!gh auth git-credential' push -u origin main`），**未向 git 配置写入任何凭证**；以后本机被要求登录时先跑一次 `gh auth setup-git`。
 
 推到 GitHub 后，**US-1 交付的 CI 工作流**才会真正开跑。在此之前没有 CI，本机 `make check` 是唯一门禁执行者。
 
@@ -393,7 +405,7 @@ commit（你手动）
 
 1. 再跑一次 `/speckit-analyze`（与实施前那次同源：这次核对**实现与文档**的一致性，不只看 spec / plan / tasks 三件）
 2. 对齐**七项证据**（[AiProgrammingGuide.md](AiProgrammingGuide.md) §5）：门禁全绿 / 测试映射 / 交付物核对 / 前序回归 / 全局不变量自查 / 验收 Demo / 变更导读
-3. 你手动 commit（模板四段：Problem / Design / Testing / Impact）
+3. 你手动 commit（四段双语模板：Problem / Design / Testing / Impact——规范见 [EngineeringStandards.md](EngineeringStandards.md) §5，模板见 3.1）
 
 ### 5.6 US 顺序与依赖（[AiProgrammingGuide.md](AiProgrammingGuide.md) §1.3）
 
@@ -425,7 +437,7 @@ US-1 → US-2 → US-3 → US-4 ─→ US-5 ─→ US-9 → US-10 → US-11 → 
 
 ## 6. 提交、版本锚点与发布形态
 
-- **提交时机**：每个 US 收口一个 commit；提交信息用 Conventional Commits 标题 + 四段正文（模板见 3.1）。AI 不自动 commit / push / tag
+- **提交时机**：每个 US 收口一个 commit；提交信息用**英文** Conventional Commits 标题 + 四段**双语**正文（逐段英中对照；模板见 3.1，规范原文见 [EngineeringStandards.md](EngineeringStandards.md) §5）。AI 不自动 commit / push / tag
 - **版本号只有两个载体**：构建注入（`-ldflags "-X main.version=..."`）与 git tag；**文档正文不写版本号**（写进去的版本号就是会腐烂的事实，[Roadmap.md](Roadmap.md) §4.4）
 - **`v0.1.0`** = 第一阶段交付范围（US-1~US-14），打 tag 由你手动执行
 - **发布形态**：`CGO_ENABLED=0` 静态单二进制，四平台交叉编译（linux/amd64、linux/arm64、windows/amd64、darwin/arm64）——由 US-1 的 CI `build` job 承载
