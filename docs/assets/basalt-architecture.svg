@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2300" height="1920" viewBox="0 0 2300 1920" role="img" aria-labelledby="title desc">
+<title id="title">Basalt Agent OS 核心架构</title>
+<desc id="desc">从左向右阅读运行主线：CLI、REST 与管理台、定时调度归一进入 AgentService.Run，随后进入手写 ReActLoop。循环内从上向下为 PromptBuilder、ProviderService、ToolExecutor；工具结果在卡片外侧回填至下一轮。下方独立区域包含声明式工作区、加载与配置快照、MemoryService、内置工具与 MCP 适配，以及 SQLite 和文件系统。右侧模型服务与 MCP Server 位于进程外。内置工具由 WhitelistPolicy 授权，shell 由 LocalRunner 执行；外部 MCP Server 的内部行为不经过本地 Policy。大框表示 Basalt 实例的 Go 运行时与本地工作区。实线表示调用与返回，虚线表示上下文或持久化关系，不表示 Go 包的 import 方向。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#476585"/></marker>
+<marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#77869a"/></marker>
+<marker id="arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#127e78"/></marker>
+</defs><style>text {font-family:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC","Segoe UI",Arial,sans-serif;} .mono {font-family:Consolas,"SFMono-Regular",monospace;}</style>
+<rect x="0" y="0" width="2300" height="1920" rx="0" fill="#ffffff" stroke="none" stroke-width="1.5"/>
+<rect x="52" y="48" width="8" height="92" rx="4" fill="#127e78" stroke="none" stroke-width="1.5"/>
+<text x="80" y="95" font-size="54" fill="#142c42" font-weight="700">Basalt</text>
+<text x="300" y="94" font-size="34" fill="#66788a" font-weight="500">Agent OS</text>
+<text x="80" y="140" font-size="26" fill="#516174" font-weight="400">三条入口统一归约为 Run，由 ReAct 驱动模型与工具。</text>
+<rect x="1480" y="57" width="214" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
+<text x="1587" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">Go 单二进制</text>
+<rect x="1718" y="57" width="224" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
+<text x="1830" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">SQLite 内嵌</text>
+<rect x="1966" y="57" width="278" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
+<text x="2105" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">管理台资源 embed</text>
+<g id="basalt-instance">
+<rect x="40" y="192" width="1768" height="1638" rx="24" fill="#f8fafc" stroke="#c9d6e5" stroke-width="2"/>
+<text x="72" y="246" font-size="26" fill="#45617b" font-weight="600">Basalt 实例 · Go 运行时与本地工作区</text>
+<text x="1780" y="244" font-size="23" fill="#77869a" font-weight="400" text-anchor="end">核心阶段设计</text>
+</g>
+<g id="entrypoints">
+<text x="72" y="285" font-size="30" fill="#24465d" font-weight="700">01  接入入口</text>
+<rect x="72" y="310" width="340" height="144" rx="18" fill="#ffffff" stroke="#c5d7e8" stroke-width="1.5"/>
+<text x="100" y="353" font-size="32" fill="#23425c" font-weight="700">CLI</text>
+<text x="100" y="396" font-size="25" fill="#516174" font-weight="400">CliChannel</text>
+<text x="100" y="431" font-size="23" fill="#77869a" font-weight="400">basalt chat</text>
+<rect x="72" y="502" width="340" height="144" rx="18" fill="#ffffff" stroke="#c5d7e8" stroke-width="1.5"/>
+<text x="100" y="545" font-size="32" fill="#23425c" font-weight="700">REST / 管理台</text>
+<text x="100" y="588" font-size="25" fill="#516174" font-weight="400">HTTP API</text>
+<text x="100" y="623" font-size="23" fill="#77869a" font-weight="400">embed 管理台资源</text>
+<rect x="72" y="694" width="340" height="144" rx="18" fill="#ffffff" stroke="#c5d7e8" stroke-width="1.5"/>
+<text x="100" y="737" font-size="32" fill="#23425c" font-weight="700">定时调度</text>
+<text x="100" y="780" font-size="25" fill="#516174" font-weight="400">AgentScheduler</text>
+<text x="100" y="815" font-size="23" fill="#77869a" font-weight="400">cron · 每任务时区</text>
+<path d="M 412 382 H 480 V 574" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 412 766 H 480 V 574" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 412 574 H 544" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<circle cx="480" cy="574" r="4" fill="#476585"/>
+</g>
+<g id="agent-service">
+<rect x="544" y="458" width="432" height="232" rx="20" fill="#e8f1fb" stroke="#93b5d5" stroke-width="2"/>
+<text x="572" y="502" font-size="34" fill="#183e64" font-weight="700">02  统一 Run</text>
+<text x="572" y="546" font-size="29" fill="#183e64" font-weight="600" class="mono">AgentService.Run</text>
+<text x="572" y="590" font-size="26" fill="#365d7c" font-weight="400">run_id / Session</text>
+<text x="572" y="632" font-size="25" fill="#365d7c" font-weight="400">配置快照 / 预算 / 准入</text>
+<text x="572" y="672" font-size="23" fill="#516f89" font-weight="400">同会话串行 · 跨会话并行</text>
+<path d="M 976 574 H 1036" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+</g>
+<g id="react-loop">
+<rect x="1036" y="310" width="740" height="680" rx="20" fill="#f3f7fc" stroke="#99b7d3" stroke-width="2"/>
+<text x="1064" y="360" font-size="35" fill="#183e64" font-weight="700" class="mono">03  ReActLoop</text>
+<text x="1748" y="357" font-size="26" fill="#516f89" font-weight="600" text-anchor="end">手写循环</text>
+<rect x="1116" y="398" width="588" height="116" rx="16" fill="#ffffff" stroke="#c7d7e7" stroke-width="1.5"/>
+<text x="1144" y="441" font-size="30" fill="#23425c" font-weight="700" class="mono">PromptBuilder</text>
+<text x="1144" y="486" font-size="25" fill="#516174" font-weight="400">配置 · 记忆 · 历史 · 工具定义 → 提示词</text>
+<rect x="1116" y="572" width="588" height="116" rx="16" fill="#ffffff" stroke="#c7d7e7" stroke-width="1.5"/>
+<text x="1144" y="615" font-size="30" fill="#23425c" font-weight="700" class="mono">ProviderService</text>
+<text x="1144" y="660" font-size="25" fill="#516174" font-weight="400">显式 Provider 映射 · OpenAI 兼容协议</text>
+<rect x="1116" y="746" width="588" height="116" rx="16" fill="#ffffff" stroke="#c7d7e7" stroke-width="1.5"/>
+<text x="1144" y="789" font-size="30" fill="#23425c" font-weight="700" class="mono">ToolExecutor</text>
+<text x="1144" y="834" font-size="25" fill="#516174" font-weight="400">ToolRegistry → 授权 → 执行 → 审计</text>
+<path d="M 1410 514 V 572" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 1410 688 V 746" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 1660 862 V 922 H 1072 V 454 H 1116" fill="none" stroke="#127e78" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-teal)"/>
+<text x="1410" y="901" font-size="25" fill="#127e78" font-weight="600" text-anchor="middle">工具结果回填 · 进入下一轮</text>
+<text x="1410" y="975" font-size="24" fill="#516174" font-weight="400" text-anchor="middle">无工具调用 → 最终回答返回来源渠道</text>
+</g>
+<g id="context-support">
+<text x="72" y="1066" font-size="28" fill="#24465d" font-weight="700">上下文支撑</text>
+<rect x="72" y="1100" width="488" height="278" rx="18" fill="#edf8f6" stroke="#c5e2dd" stroke-width="1.5"/>
+<text x="100" y="1145" font-size="31" fill="#176960" font-weight="700">声明式工作区</text>
+<text x="100" y="1193" font-size="24" fill="#416961" font-weight="500" class="mono">AGENT.md · skills/ · Bootstrap</text>
+<text x="100" y="1233" font-size="23" fill="#416961" font-weight="400" class="mono">basalt.yaml · mcp_servers.yaml</text>
+<text x="100" y="1273" font-size="24" fill="#416961" font-weight="500" class="mono">AgentLoader / ContextLoader</text>
+<text x="100" y="1313" font-size="24" fill="#176960" font-weight="600">校验 → 快照 · 本次 Run 冻结</text>
+<text x="100" y="1353" font-size="24" fill="#516174" font-weight="400">变更在下一次 Run 生效</text>
+<rect x="600" y="1100" width="376" height="278" rx="18" fill="#f4f0fb" stroke="#dacfed" stroke-width="1.5"/>
+<text x="628" y="1145" font-size="31" fill="#594383" font-weight="600" class="mono">MemoryService</text>
+<text x="628" y="1200" font-size="26" fill="#516174" font-weight="400">Agent 层 / 全局回退</text>
+<text x="628" y="1248" font-size="26" fill="#516174" font-weight="400">Markdown / SQLite</text>
+<text x="628" y="1296" font-size="25" fill="#516174" font-weight="400">运行内记忆快照</text>
+<text x="628" y="1344" font-size="25" fill="#516174" font-weight="400">记忆工具读写</text>
+<path d="M 316 1100 V 1038 H 760" fill="none" stroke="#127e78" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8"/>
+<path d="M 788 1100 V 1038 H 760" fill="none" stroke="#127e78" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8"/>
+<path d="M 760 1038 V 690" fill="none" stroke="#127e78" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8" marker-end="url(#arrow-teal)"/>
+<circle cx="760" cy="1038" r="4" fill="#127e78"/>
+<text x="788" y="1008" font-size="25" fill="#127e78" font-weight="500">配置与记忆快照</text>
+</g>
+<g id="tool-dispatch">
+<text x="1036" y="1066" font-size="28" fill="#77551e" font-weight="700">工具执行</text>
+<path d="M 1704 804 H 1792 V 1070 H 1208 V 1100" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M 1604 1070 V 1100" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<circle cx="1604" cy="1070" r="4" fill="#476585"/>
+<rect x="1036" y="1100" width="344" height="278" rx="18" fill="#fff9ef" stroke="#e8d9b8" stroke-width="1.5"/>
+<text x="1064" y="1145" font-size="30" fill="#77551e" font-weight="700">内置 / 代码扩展</text>
+<text x="1064" y="1194" font-size="26" fill="#80673e" font-weight="600" class="mono">WhitelistPolicy</text>
+<text x="1064" y="1235" font-size="25" fill="#80673e" font-weight="400">文件 / 命令 / 域名</text>
+<text x="1064" y="1276" font-size="24" fill="#80673e" font-weight="400">shell → LocalRunner</text>
+<text x="1064" y="1317" font-size="24" fill="#80673e" font-weight="400">argv · 超时 · 进程树</text>
+<rect x="1432" y="1100" width="344" height="278" rx="18" fill="#fff9ef" stroke="#e8d9b8" stroke-width="1.5"/>
+<text x="1460" y="1145" font-size="30" fill="#77551e" font-weight="700">外部工具适配</text>
+<text x="1460" y="1194" font-size="26" fill="#80673e" font-weight="600" class="mono">MCP Client</text>
+<text x="1460" y="1235" font-size="25" fill="#80673e" font-weight="400">统一 Tool 接口</text>
+<text x="1460" y="1276" font-size="25" fill="#80673e" font-weight="400">stdio / HTTP</text>
+<text x="1460" y="1317" font-size="24" fill="#80673e" font-weight="400">管理员显式登记</text>
+</g>
+<g id="external-connections">
+<text x="1864" y="330" font-size="32" fill="#24465d" font-weight="700">外部能力</text>
+<text x="1864" y="375" font-size="25" fill="#77869a" font-weight="400">按配置连接</text>
+<rect x="1864" y="570" width="380" height="186" rx="18" fill="#eef6fc" stroke="#bdd4e6" stroke-width="1.5"/>
+<text x="1892" y="615" font-size="34" fill="#234e70" font-weight="700">模型服务</text>
+<text x="1892" y="663" font-size="27" fill="#456b88" font-weight="400">云端 / 本地 LLM</text>
+<text x="1892" y="709" font-size="26" fill="#456b88" font-weight="400">OpenAI 兼容 API</text>
+<path d="M 1704 630 H 1864" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<rect x="1864" y="1100" width="380" height="278" rx="18" fill="#fff9ef" stroke="#e8d9b8" stroke-width="1.5"/>
+<text x="1892" y="1145" font-size="32" fill="#77551e" font-weight="700">外部 MCP Server</text>
+<text x="1892" y="1197" font-size="27" fill="#80673e" font-weight="400">独立进程 / 远程服务</text>
+<text x="1892" y="1246" font-size="26" fill="#80673e" font-weight="400">由管理员登记与评审</text>
+<text x="1892" y="1295" font-size="25" fill="#80673e" font-weight="400">内部文件与网络行为</text>
+<text x="1892" y="1344" font-size="25" fill="#80673e" font-weight="400">不经过本地 Policy</text>
+<path d="M 1776 1239 H 1864" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+</g>
+<g id="persistence">
+<rect x="72" y="1480" width="1704" height="318" rx="20" fill="#edf2f8" stroke="#c9d7e6" stroke-width="1.5"/>
+<text x="100" y="1533" font-size="32" fill="#24465d" font-weight="700">持久化与运行保障</text>
+<rect x="96" y="1560" width="764" height="166" rx="16" fill="#ffffff" stroke="#d1dce8" stroke-width="1.5"/>
+<text x="124" y="1608" font-size="32" fill="#23425c" font-weight="700">SQLite · WAL</text>
+<text x="124" y="1656" font-size="27" fill="#516174" font-weight="400">会话 · 消息 · Run · 配置快照</text>
+<text x="124" y="1700" font-size="26" fill="#516174" font-weight="400">LLM / 工具审计 · 定时 · 通知 · 记忆</text>
+<rect x="900" y="1560" width="852" height="166" rx="16" fill="#ffffff" stroke="#d1dce8" stroke-width="1.5"/>
+<text x="928" y="1608" font-size="32" fill="#23425c" font-weight="700">本地文件系统 · .basalt/</text>
+<text x="928" y="1656" font-size="26" fill="#516174" font-weight="400" class="mono">agents/ · skills/ · memory/ · archive/</text>
+<text x="928" y="1700" font-size="26" fill="#516174" font-weight="400">声明式配置 · Markdown 记忆 · 日志</text>
+<text x="100" y="1770" font-size="25" fill="#536b81" font-weight="400">同会话串行 · 跨会话并行 · 预算上限 · 取消传播 · 实例锁 · 幂等恢复</text>
+<path d="M 1208 1378 V 1480" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8" marker-end="url(#arrow-muted)"/>
+<text x="1250" y="1440" font-size="23" fill="#77869a" font-weight="400">状态 · 消息 · 审计</text>
+</g>
+<g id="legend">
+<text x="1864" y="1520" font-size="29" fill="#24465d" font-weight="600">阅读图例</text>
+<path d="M 1864 1573 H 1920" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1944" y="1581" font-size="24" fill="#516174" font-weight="400">运行调用 / 返回</text>
+<path d="M 1864 1632 H 1920" fill="none" stroke="#476585" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8" marker-end="url(#arrow-muted)"/>
+<text x="1944" y="1640" font-size="24" fill="#516174" font-weight="400">上下文 / 持久化</text>
+<text x="1864" y="1700" font-size="24" fill="#77869a" font-weight="400">大框：Basalt 实例</text>
+<text x="1864" y="1745" font-size="24" fill="#77869a" font-weight="400">运行时 + 本地工作区</text>
+<text x="1864" y="1790" font-size="23" fill="#77869a" font-weight="400">箭头不表示 Go import</text>
+</g>
+<text x="52" y="1884" font-size="22" fill="#7b8899" font-weight="400">Basalt v0.1 · 核心阶段设计（待原型验证）</text>
+<text x="2244" y="1884" font-size="22" fill="#7b8899" font-weight="400" text-anchor="end">依据 TechnicalSolution.md §§2–11</text>
+</svg>

@@ -1,0 +1,5 @@
+# 默认：入库与检出统一 LF——gofmt 要求 LF，CRLF 会让格式门禁永远报"未格式化"
+* text=auto eol=lf
+# 例外：批处理脚本必须 CRLF（cmd.exe 对 LF 结尾的 .bat / .cmd 会出问题）
+*.bat text eol=crlf
+*.cmd text eol=crlf
