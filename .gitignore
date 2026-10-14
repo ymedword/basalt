@@ -1,0 +1,10 @@
+# 运行时工作区（`basalt init` 生成：SQLite 库 / 记忆 / 日志 / Agent 目录）——是数据，不入库
+.basalt/
+
+# 构建产物
+/bin/
+*.exe
+
+# 本地环境文件（凭证一律走 ${ENV_VAR}，明文不得落盘——万一写下也绝不入库）
+*.local.env
+.env

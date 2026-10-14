@@ -1,0 +1,1122 @@
+openapi: 3.1.0
+info:
+  title: Basalt REST API
+  version: 0.1.0
+  description: |
+    Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalSolution.md) §7 冲突时以技术方案为准。
+
+    **文档状态**：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 AiProgrammingGuide.md §3.4）。
+
+    约定的固定事实：
+
+    - **统一前缀** `/api/v1`（`servers[0].url` 已含前缀，`paths` 内的路径**不含**前缀）；**统一信封** `{code, message, data, timestamp}`，成功 `code=OK`
+    - **默认监听** `127.0.0.1:8080`——远程访问必须显式改配置（安全默认）
+    - **核心阶段无认证**（内网假设）；RBAC / 限流属扩展阶段
+    - **JSON 字段命名** snake_case
+    - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
+    - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案 §6.5）
+    - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
+    - 挂载点标注：本文件冻结了技术方案 §7.3（10 个核心端点）与 §7.4（管理台追加端点）的全部路径
+servers:
+  - url: http://127.0.0.1:8080/api/v1
+    description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr
+tags:
+  - name: core
+    description: 核心端点（技术方案 §7.3，10 个）
+  - name: runs
+    description: 运行查询与取消（Run 为执行与审计的单位）
+  - name: console
+    description: 管理台只读观测
+  - name: agents
+    description: Agent 动态管理（创建 / 编辑 / 生成草稿 / 提交文件 / 归档删除）
+  - name: schedules
+    description: 定时任务管理
+  - name: notify
+    description: 通知渠道 CRUD
+  - name: workspace
+    description: 工作区只读浏览
+
+paths:
+  # ==========================================================
+  # 核心端点
+  # ==========================================================
+  /health:
+    get:
+      tags: [core]
+      summary: 健康检查
+      responses:
+        '200':
+          description: 服务健康（200 即健康）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, example: ok }
+
+  /info:
+    get:
+      tags: [core]
+      summary: 运行信息 + Provider 状态
+      description: 响应**不含**任何凭证——Provider 只回名称、模型提示与配置是否就绪。
+      responses:
+        '200':
+          description: 运行信息
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/InfoView' }
+
+  /profiles:
+    get:
+      tags: [core]
+      summary: 列所有 Agent 配置
+      responses:
+        '200':
+          description: Agent 配置列表（含加载期校验状态）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ProfileView' }
+
+  /tools:
+    get:
+      tags: [core]
+      summary: 列可用工具
+      responses:
+        '200':
+          description: 工具列表（内置 / MCP / 代码内注册）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ToolView' }
+
+  /memory:
+    get:
+      tags: [core]
+      summary: 查长期记忆（全局层）
+      description: 全局回退层（`.basalt/memory/MEMORY.md`）。Agent 层记忆走 `/agents/{name}/memory`。
+      responses:
+        '200':
+          description: 长期记忆内容
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryView' }
+
+  /sessions:
+    post:
+      tags: [core]
+      summary: 创建会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent]
+              properties:
+                agent: { type: string, description: Agent 名 }
+                channel: { type: string, default: web }
+                user_id: { type: string, default: anonymous }
+      responses:
+        '200':
+          description: 会话（已存在同组合会话时幂等返回既有会话）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SessionSummary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [console]
+      summary: 列会话（管理台）
+      parameters:
+        - name: agent
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, archived] }
+      responses:
+        '200':
+          description: 会话列表（固定按 last_active_at 倒序；**不得**提供排序参数）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/SessionSummary' }
+
+  /sessions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [core]
+      summary: 查会话历史
+      description: 返回最近 **100 条**消息（超出部分从最早开始不返回）。
+      responses:
+        '200':
+          description: 会话详情（含消息）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SessionDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [core]
+      summary: 归档会话
+      description: 归档不删数据（status 置 archived）。
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sessions/{id}/messages:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [core]
+      summary: 发消息（触发一次 Run）
+      description: |
+        同步等待 Run 完成。**达迭代上限不算服务故障**：HTTP 仍为 200，`data.status = limit_reached`
+        并附部分结果（见 contracts/run-and-errors.md §1.3）。
+        请求体总上限 `http.max_request_bytes`（缺省 1 MiB，超限在解析前 400）；单条消息另有 ≤ 32 KB 的入口上限。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, description: 用户消息（≤ 32 KB） }
+      responses:
+        '200':
+          description: Run 结果（status 取值见 §2）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RunView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/SessionBusy' }
+        '429': { $ref: '#/components/responses/TooManyRuns' }
+        '504': { $ref: '#/components/responses/Timeout' }
+
+  /agents/{name}/invoke:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [core]
+      summary: 无状态调用 Agent
+      description: 不落会话历史（`session_id` 为空），仍落 Run 与审计。超时 60 秒 → 504。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string }
+      responses:
+        '200':
+          description: Run 结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RunView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRuns' }
+        '504': { $ref: '#/components/responses/Timeout' }
+
+  /agents/{name}/memory:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [console]
+      summary: 查某个 Agent 的长期记忆（Agent 层）
+      description: 返回 Agent 层内容；为空时返回空而非回退全局层（回退发生在提示词组装时，不发生在查询时）。
+      responses:
+        '200':
+          description: Agent 层记忆
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # 运行（Run）
+  # ==========================================================
+  /runs:
+    get:
+      tags: [runs]
+      summary: 列运行
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: agent
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [running, completed, limit_reached, cancelled, failed] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: 运行列表（固定按 started_at 倒序；**不得**提供排序参数）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/RunView' }
+
+  /runs/{run_id}:
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [runs]
+      summary: 查一次运行
+      responses:
+        '200':
+          description: 运行详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RunView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /runs/{run_id}/cancel:
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [runs]
+      summary: 取消一次运行
+      description: |
+        幂等：运行中 → 取消并回 `cancelled`；已是终态 → 200 且返回当前状态（message 说明无需取消）。
+        取消语义（审计解耦、进程树清理）见 contracts/run-and-errors.md §4。
+      responses:
+        '200':
+          description: 当前状态（cancelled 或原终态）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RunView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # 管理台只读观测
+  # ==========================================================
+  /skills:
+    get:
+      tags: [console]
+      summary: 列技能库
+      responses:
+        '200':
+          description: 公共技能库条目（name / description / 路径）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/SkillView' }
+
+  /mcp-servers:
+    get:
+      tags: [console]
+      summary: 列 MCP server 与连接状态
+      description: 响应**不含** server 的 env 值与命令参数中的凭证（只回名称 / 传输方式 / 连接状态 / 工具数）。
+      responses:
+        '200':
+          description: MCP server 列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/McpServerView' }
+
+  /sandbox:
+    get:
+      tags: [console]
+      summary: 查沙箱白名单
+      description: 只读展示白名单（路径 / 可执行名 / 受控解释器 / 域名）。修改白名单需改配置并重启。
+      responses:
+        '200':
+          description: 白名单
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+
+  # ==========================================================
+  # Agent 动态管理
+  # ==========================================================
+  /agents:
+    post:
+      tags: [agents]
+      summary: 模板脚手架创建 Agent
+      description: 名字 + 描述 → 写出最小可加载的 Agent 目录。**先验后写**，任一步失败回滚（不留残余目录）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: Agent 名（= 目录名） }
+                description: { type: string }
+                model: { type: string, description: 留空写入可见占位符「请在此填写模型名」 }
+      responses:
+        '200':
+          description: 创建结果（落盘后的真值）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /agents/{name}/content:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [agents]
+      summary: 读整份 AGENT.md（配置编辑器）
+      responses:
+        '200':
+          description: 文件全文
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          content: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [agents]
+      summary: 写整份 AGENT.md（配置编辑器）
+      description: 经**同一段**注册写入门（先验后写）：校验不通过 → 400 且**磁盘逐字节不变**。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+      responses:
+        '200':
+          description: 保存结果（保存即生效，无需重启）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /agents/{name}/generate-files:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 一句话生成 Agent 目录草稿
+      description: |
+        模型起草一份或多份文件（必含 `AGENT.md`）。**不落盘、不注册、不要求该 Agent 已存在**——
+        唯一写入是 LLM 调用审计（关联标识 `agent-author-<name>`）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description]
+              properties:
+                description: { type: string, description: 一句描述（可带 provider / model 提示） }
+      responses:
+        '200':
+          description: 草稿文件集合（未落盘）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
+
+  /agents/{name}/files:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 提交多文件草稿
+      description: |
+        先校验（含 AGENT.md / 相对路径规范化后仍在目录内 / 整份配置过加载期校验 / 定时 id 不撞车）→ 才动磁盘。
+        写入在 **staging 目录**构建完整副本（原目录不动），校验通过后经**两次 rename** 完成目录交换（原目录先移为 `.backup`，staging 移为正式目录，再删 `.backup`）——
+        崩溃窗口有界：启动时按残留判定**回滚**（正式目录缺失、`.backup` 在）或**前滚**（正式目录完整、`.backup` 尚在，清理残留），见 contracts/run-and-errors.md §4.3.2 第 5 步。
+        返回的**是落盘后的真值**（重新读取，不是请求回声）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  items: { $ref: '#/components/schemas/FileDraft' }
+      responses:
+        '200':
+          description: 落盘后的真值
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /agents/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [agents]
+      summary: 归档删除 Agent
+      description: |
+        顺序：注销定时 → 移出注册索引 → **取消该 Agent 在跑的 Run 并等待退出（有界等待；超时报错并恢复注册，不留半残态）** → 目录移入 `.basalt/archive/`（同名以时间戳唯一化）。
+        归档失败恢复注册并报错。**会话 / 记忆 / 审计数据一律不动**（配置下线 ≠ 数据下线）。
+        该 Agent 的定时登记**不物理删**（置下线标记），历史执行记录保留、数据库外键永不撞。
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # 定时任务
+  # ==========================================================
+  /schedules:
+    get:
+      tags: [schedules]
+      summary: 列定时任务
+      responses:
+        '200':
+          description: 任务列表（定义源在各 AGENT.md；此表只存状态）。重启对账：**enabled 以库为准、定义以文件为准**（文件改动不回翻停用）；Agent 归档删除的任务置**下线标记**（不物理删，历史执行记录保留）；停机期间错过的触发点**不补跑**（记 WARN，补跑走 `/schedules/{id}/run`）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ScheduleView' }
+
+  /schedules/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [schedules]
+      summary: 启用 / 停用任务
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /schedules/{id}/executions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [schedules]
+      summary: 列执行历史
+      responses:
+        '200':
+          description: 执行记录（固定按 started_at 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ExecutionView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /schedules/{id}/run:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [schedules]
+      summary: 立即执行一次（手动补跑）
+      description: 走与到点触发**完全相同**的链路；审计以 `trigger=manual` 区分。
+      responses:
+        '200':
+          description: 本次触发的 Run 结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/RunView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 该任务上一轮尚未结束（幂等跳过语义见技术方案 §8.5）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  # ==========================================================
+  # 通知渠道
+  # ==========================================================
+  /notify-channels:
+    get:
+      tags: [notify]
+      summary: 列通知渠道
+      description: 响应中地址**只回 scheme + host**（`url_host`），原始地址（含 token）没有任何载体。
+      responses:
+        '200':
+          description: 渠道列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/NotifyChannelView' }
+    post:
+      tags: [notify]
+      summary: 登记通知渠道
+      description: url 填 `${ENV_VAR}` 引用（发送时解析）；写前预跑沙箱域名校验，失败文案只含 host。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotifyChannelUpsert' }
+      responses:
+        '200':
+          description: 登记结果（只回 host）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/NotifyChannelView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /notify-channels/types:
+    get:
+      tags: [notify]
+      summary: 列已装配的渠道类型
+      description: 类型支持集只有**一份真值**（装配层显式映射表）；此端点同时供页面下拉框与写侧校验。
+      responses:
+        '200':
+          description: 类型列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { type: string, example: feishu }
+
+  /notify-channels/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [notify]
+      summary: 更新渠道
+      description: "**url 留空 = 保留原值**（页面不回填已存地址）。"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotifyChannelUpsert' }
+      responses:
+        '200':
+          description: 更新结果（只回 host）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/NotifyChannelView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [notify]
+      summary: 删除渠道
+      description: 先扫各 AGENT.md 正文**整词**匹配渠道名；被引用 → 400 并点名那些 Agent。`?force=true`（字面 true）强删。
+      parameters:
+        - name: force
+          in: query
+          schema: { type: string, enum: ['true'] }
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '400':
+          description: 渠道被 AGENT.md 引用（响应点名引用者）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # 工作区（只读）
+  # ==========================================================
+  /workspace/tree:
+    get:
+      tags: [workspace]
+      summary: 工作区目录树
+      description: 根固定为 `.basalt/agents/`；不跟随软连接（列为软连接条目）；真实路径投影校验，越界 400。
+      parameters:
+        - name: path
+          in: query
+          schema: { type: string, description: 相对根目录的路径，缺省为根 }
+      responses:
+        '200':
+          description: 目录条目列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/WorkspaceEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workspace/file:
+    get:
+      tags: [workspace]
+      summary: 预览单个文件（只读）
+      description: 上限 256 KB（超限 400 可读）；越界或经软连接越出根 → 400；**只读，不提供写**。
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string, description: 相对根目录的文件路径 }
+      responses:
+        '200':
+          description: 文件内容
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/WorkspaceFile' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  responses:
+    OK:
+      description: 操作成功
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    BadRequest:
+      description: 参数非法 / 超限 / 路径越界
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    NotFound:
+      description: 目标不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    SessionBusy:
+      description: 该会话已有运行在执行（不排队，稍后重试）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    TooManyRuns:
+      description: 实例级并发运行超限
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Timeout:
+      description: 运行超过调用方时限（Run 侧记为 cancelled）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    NotConfigured:
+      description: 能力未配置（文案点名配置键，一次 LLM 调用都不会发出）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+
+  schemas:
+    Envelope:
+      type: object
+      required: [code, message, timestamp]
+      properties:
+        code: { type: string, description: 业务码；成功为 OK，其余见 contracts/run-and-errors.md §8, example: OK }
+        message: { type: string, example: success }
+        data: { description: 载荷；失败时通常为空 }
+        timestamp: { type: string, format: date-time }
+
+    InfoView:
+      type: object
+      properties:
+        version: { type: string }
+        uptime_seconds: { type: integer }
+        agents: { type: integer, description: 已注册 Agent 数 }
+        tools: { type: integer }
+        mcp_servers: { type: integer, description: 已连接数 }
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              models: { type: array, items: { type: string } }
+              configured: { type: boolean }
+
+    ProfileView:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        tools: { type: array, items: { type: string } }
+        skills: { type: array, items: { type: string } }
+        schedules: { type: integer }
+        registered: { type: boolean, description: 加载期校验是否通过 }
+        problems: { type: array, items: { type: string }, description: 未通过时的点名原因 }
+
+    ToolView:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        source: { type: string, enum: [builtin, mcp, code] }
+
+    MemoryView:
+      type: object
+      properties:
+        scope: { type: string, enum: [global, agent] }
+        agent: { type: string, description: scope=agent 时给出 }
+        backend: { type: string, enum: [markdown, sqlite] }
+        core: { type: string }
+        archive: { type: string }
+
+    SessionSummary:
+      type: object
+      properties:
+        session_id: { type: string }
+        profile_name: { type: string }
+        channel: { type: string }
+        user_id: { type: string }
+        status: { type: string, enum: [active, archived] }
+        message_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        last_active_at: { type: string, format: date-time }
+
+    MessageView:
+      type: object
+      properties:
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content: { type: string }
+        tool_calls:
+          type: array
+          description: assistant 消息发起（id / name / arguments）
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              arguments: { type: string }
+        tool_call_id: { type: string, description: tool 消息回填哪次调用 }
+        created_at: { type: string, format: date-time }
+
+    SessionDetail:
+      allOf:
+        - $ref: '#/components/schemas/SessionSummary'
+        - type: object
+          properties:
+            messages:
+              type: array
+              description: 最近 100 条
+              items: { $ref: '#/components/schemas/MessageView' }
+
+    RunView:
+      type: object
+      properties:
+        run_id: { type: string }
+        session_id: { type: string, description: 无状态调用时为空 }
+        agent: { type: string }
+        channel: { type: string }
+        trigger: { type: string, enum: [user, cron, manual, api] }
+        status: { type: string, enum: [running, completed, limit_reached, cancelled, failed] }
+        reason: { type: string, description: 非正常终止的可读原因 }
+        final_text: { type: string }
+        iterations: { type: integer }
+        tool_calls: { type: integer }
+        config_hash: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    SkillView:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        path: { type: string }
+
+    McpServerView:
+      type: object
+      properties:
+        name: { type: string }
+        transport: { type: string, enum: [stdio, http] }
+        connected: { type: boolean }
+        tools: { type: array, items: { type: string } }
+
+    SandboxView:
+      type: object
+      properties:
+        file_allowed_paths: { type: array, items: { type: string } }
+        shell_allowed_commands: { type: array, items: { type: string } }
+        shell_interpreters: { type: array, items: { type: string }, description: 受控脚本通道的解释器白名单（argv 必须 [脚本路径, 参数…]，脚本限于 Agent scripts/ 与技能库，见 contracts/agent-md.md §5.2） }
+        http_allowed_domains: { type: array, items: { type: string } }
+
+    FileDraft:
+      type: object
+      required: [path, content]
+      properties:
+        path: { type: string, description: 相对 Agent 目录的路径（规范化后必须仍在目录内） }
+        content: { type: string }
+
+    AgentFilesView:
+      type: object
+      properties:
+        agent: { type: string }
+        files:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              size: { type: integer }
+
+    ScheduleView:
+      type: object
+      properties:
+        id: { type: string }
+        agent: { type: string }
+        cron: { type: string, description: 6 段（秒 分 时 日 月 周） }
+        zone: { type: string, description: 缺省 UTC }
+        message: { type: string }
+        enabled: { type: boolean }
+        last_run_at: { type: string, format: date-time }
+        last_status: { type: string }
+
+    ExecutionView:
+      type: object
+      properties:
+        task_id: { type: string }
+        run_id: { type: string }
+        status: { type: string, enum: [started, completed, failed, skipped] }
+        trigger: { type: string, enum: [cron, manual] }
+        duration_ms: { type: integer }
+        error_message: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    NotifyChannelUpsert:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type: { type: string, description: 取值来自 /notify-channels/types }
+        url: { type: string, description: '${ENV_VAR} 引用；更新时留空 = 保留原值' }
+        description: { type: string }
+
+    NotifyChannelView:
+      type: object
+      description: 地址只以 host 形式出现；原始地址没有任何载体（凭证红线）
+      properties:
+        name: { type: string }
+        type: { type: string }
+        description: { type: string }
+        url_host: { type: string, description: scheme + host；解析不出来回空 }
+
+    WorkspaceEntry:
+      type: object
+      properties:
+        path: { type: string, description: 相对根目录 }
+        type: { type: string, enum: [file, dir, symlink] }
+        size: { type: integer, description: 文件字节数；目录与软连接为 0 }
+
+    WorkspaceFile:
+      type: object
+      properties:
+        path: { type: string }
+        content: { type: string }
+        size: { type: integer }
+        truncated: { type: boolean, description: 永远为 false（超限直接 400，不截断） }
