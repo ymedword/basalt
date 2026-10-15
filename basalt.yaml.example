@@ -1,0 +1,56 @@
+# Basalt 实例配置样例
+#
+# 用法：复制成与工作区同级的 `basalt.yaml`（不在 .basalt/ 内）后按环境改。
+# 实例配置不入库（.gitignore 已排除 /basalt.yaml）——仓库只带本样例。
+#
+# 凭证红线：一切凭证只允许 `${ENV_VAR}` 占位。加载期统一解析——
+#   变量不存在 / 解析后为空 / 替换后仍残留 `${` / 写成明文，四种情形一律拒绝启动并点名配置键。
+# Sample configuration; copy to `basalt.yaml`. Credentials MUST stay as ${ENV_VAR}
+# placeholders — plaintext values, unresolved or empty expansions are rejected at load time.
+
+# 服务段：监听地址与请求体上限（安全默认：只听本机，远程访问必须显式改）
+http:
+  addr: 127.0.0.1:8080        # 缺省本机；远程部署显式改，出处 docs/contracts/openapi.yaml
+  max_request_bytes: 1048576  # 请求体总上限（缺省 1 MiB，解析前拒绝）
+
+# 日志档位（US-1 消费）：text = dev 可读文本；json = prod 结构化
+log:
+  level: info                   # debug | info | warn | error
+  format: text                  # text（dev）| json（prod）
+
+# Provider 清单：装配处一次构建「provider name → 客户端实例」显式映射表（宪法 III）
+providers:
+  - name: deepseek
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    default_model: deepseek-chat
+  - name: qwen
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: ${DASHSCOPE_API_KEY}
+    default_model: qwen-plus
+  - name: local
+    base_url: http://127.0.0.1:8000/v1
+    api_key: ${LOCAL_LLM_KEY}
+    default_model: qwen2.5-32b-instruct
+
+# 预算：运维定的上限，模型只能缩短不能放大（Profile 仅可覆盖 settings.max_iterations）
+budget:
+  max_iterations: 10        # ReAct 轮次上限
+  max_tool_calls: 50        # 一次 Run 的工具调用次数上限
+  max_output_bytes: 262144  # 单工具输出 256 KB（读取中截断）
+  context_tokens: 32768     # 上下文 token 硬上限
+
+# 沙箱白名单（WhitelistPolicy 的配置入口；逐项以 docs/TechnicalSolution.md §6.5 为准）
+sandbox:
+  cross_agent_read: []      # 允许读取的其它 Agent 名；缺省空 = 一个都不许
+shell:
+  allowed_commands: []      # executable 整串逐字比对；给 bash / sh 放行是被禁止的
+  interpreters: []          # 解释器受控通道：只接受 [脚本路径, 参数…] 形态
+  env_passthrough: [PATH, HOME, LANG, TZ]  # 子进程不继承完整环境，只透传这些
+
+# 记忆后端：markdown（缺省）/ sqlite / mem0——换后端只改这一行
+memory:
+  backend: markdown
+
+# 作者模型段：键集由 US-12（Agent 动态管理）落位，本样例不预造键
+author:
