@@ -1,0 +1,103 @@
+name: CI
+
+# 双 job 的拆分理由是 CGO 状态相反，不是"跑得快"：
+#   test  job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
+#   build job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
+# 参见 docs/AiProgrammingGuide.md §3.2 的"三条实测纪律"。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test（默认 CGO：fmt / lint / sec / test / test-integration / cover）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 与 go.mod 的 toolchain 行一致：准确构建版本由这两处表达。
+          go-version: "1.27.2"
+          cache: true
+
+      # 四检查工具固定版本安装——"干净检出 + Go"不足以跑全门禁。
+      # 注意传给 go install 的是**含 /cmd/... 的安装路径**（module 路径另算）。
+      - name: Install check tools
+        run: |
+          go install mvdan.cc/gofumpt@v0.12.0
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+      - name: Gate (fmt / lint / sec / test / test-integration / cover)
+        run: make fmt lint sec test test-integration cover
+
+      # tzdata 隔离组**必跑**（不入 make check）：默认层在装有系统时区的机器上
+      # 没有判别力，只有真删掉系统数据与 GOROOT 的 zoneinfo.zip 才成立。
+      # 删后**断言不存在**（fail-closed）：删不动就只能判红，不能静默降级成"没隔离也算过"。
+      # 容器里跑 go test 需要拉依赖，故代理用默认值（runner 可直连 proxy.golang.org）。
+      - name: tzdata isolated check
+        run: |
+          docker run --rm -v "$PWD":/src -w /src golang:1.27.2 bash -c '
+            set -e
+            rm -rf /usr/share/zoneinfo "$(go env GOROOT)/lib/time/zoneinfo.zip"
+            test ! -e /usr/share/zoneinfo && test ! -e "$(go env GOROOT)/lib/time/zoneinfo.zip"
+            go test -tags=tzisolated ./cmd/basalt -run "TestTZData_Isolated" -count=1
+          '
+
+  build:
+    name: build（CGO_ENABLED=0 四平台交叉编译）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: true
+
+      # 单二进制承诺的判据：无 CGO 也能出四平台产物。
+      # 版本标识经 -X main.version 注入，与本机 make build 同形。
+      - name: Cross-compile four targets
+        run: |
+          set -e
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/arm64; do
+            os=${target%%/*}
+            arch=${target##*/}
+            out="bin/basalt-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA::7}" -o "$out" ./cmd/basalt
+            echo "built $out"
+          done
+
+      # 单二进制的**静态**判据：CGO_ENABLED=0 只是手段，产物本身要无动态依赖。
+      # 判据两条证据都要（宪法 VIII 的复核方式 = file / ldd）：file 认"statically
+      # linked"，ldd 必须报"not a dynamic executable"——ldd 若成功列出依赖即判红。
+      # 只断言原生架构（linux/amd64）：ldd 对异架构产物无法给出可靠读数。
+      # 本机 Windows 验不了 Linux 产物，这里是取得该读数的唯一途径。
+      - name: Assert Linux artifact is static (file / ldd)
+        run: |
+          set -e
+          file bin/basalt-linux-amd64
+          file bin/basalt-linux-amd64 | grep -q "statically linked"
+          if out=$(ldd bin/basalt-linux-amd64 2>&1); then
+            echo "ldd 列出了动态依赖（单二进制承诺被破坏）：$out" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"not a dynamic executable"*) echo "ldd: ok（无动态依赖）" ;;
+            *) echo "ldd 输出无法确认静态（预期 not a dynamic executable）：$out" >&2; exit 1 ;;
+          esac
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: basalt-binaries
+          path: bin/
+          if-no-files-found: error

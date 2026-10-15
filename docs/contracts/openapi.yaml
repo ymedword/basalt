@@ -1042,7 +1042,10 @@ components:
       properties:
         file_allowed_paths: { type: array, items: { type: string } }
         shell_allowed_commands: { type: array, items: { type: string } }
-        shell_interpreters: { type: array, items: { type: string }, description: 受控脚本通道的解释器白名单（argv 必须 [脚本路径, 参数…]，脚本限于 Agent scripts/ 与技能库，见 contracts/agent-md.md §5.2） }
+        shell_interpreters:
+          type: array
+          items: { type: string }
+          description: 受控脚本通道的解释器白名单（argv 必须 [脚本路径, 参数…]，脚本限于 Agent scripts/ 与技能库，见 contracts/agent-md.md §5.2）
         http_allowed_domains: { type: array, items: { type: string } }
 
     FileDraft:

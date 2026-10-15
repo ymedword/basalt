@@ -8,3 +8,6 @@
 # 本地环境文件（凭证一律走 ${ENV_VAR}，明文不得落盘——万一写下也绝不入库）
 *.local.env
 .env
+
+# 实例配置（与工作区同级；仓库只带样例 basalt.yaml.example——见 docs/Operations.md §6）
+/basalt.yaml
