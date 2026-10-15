@@ -102,7 +102,7 @@
 ### Implementation for User Story 3
 
 - [x] T021 [US3] `internal/cli/config.go`（修改）：`validateConfig` 新增三条规则——① `providers[].name` 重名拒绝（点名两条目下标）；② `providers[].base_url` 必填；③ `base_url` 拒绝 userinfo / query / fragment（只支持 scheme + host + path，缺 scheme **不代补**）——文案只点名键路径与成分名、不回显原 URL 与其中的值（`url.Parse` 原始错误**不得**直传）；**不**改动既有六类校验的语义与文案风格（前序改造点 1，§3.5）
-- [ ] T022 [US3] 真实调用验收（**人执行**）：按 [quickstart.md](./quickstart.md) 场景 4 跑正例 + 不可达反例，读数记录；凭证经环境变量注入（不落盘 / 不落日志 / 不进对话）；**`t.Skip` 不算通过**——收口报告必须区分 `--- PASS` 与 `--- SKIP`
+- [x] T022 [US3] 真实调用验收（**人执行**）：按 [quickstart.md](./quickstart.md) 场景 4 跑正例 + 不可达反例，读数记录；凭证经环境变量注入（不落盘 / 不落日志 / 不进对话）；**`t.Skip` 不算通过**——收口报告必须区分 `--- PASS` 与 `--- SKIP`。**2026-10-16 已执行**（用户显式授权并指定本地凭证文件；命令由 AI 代为运行——非无人值守，门控与凭证注入口径不变）：DeepSeek `deepseek-chat` 正例 `--- PASS`（0.72s）、Kimi `kimi-k2.6` 正例 `--- PASS`（2.77s，第二次运行把 kimi 置 `Providers[0]`，因用例只调用第一家）、不可达端点反例 `--- PASS`（0.07s）；凭证仅存在于 env、演示目录用后即删、basalt 仓库与 nivroos 均零改动（记录见 [docs/us/us2-provider.md](../../docs/us/us2-provider.md) §6）
 
 **Checkpoint**: 三个用户故事全部独立可验收
 

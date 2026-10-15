@@ -96,37 +96,37 @@ grep -rn "ResponseRead\|OverLimit\|EncodedHashInPath\|BigIntegers" internal/prov
 
 ## 场景 4：真实调用验收（**人执行**；双门控）
 
-前置：① 独立临时工作区（**不复用开发库**）；② `basalt.yaml` 配**两家** provider（`api_key` 一律 `${VAR}` 占位）；③ 真实凭证经**环境变量**注入（不落盘 / 不落日志 / 不进对话）；④ **显式执行开关**与凭证 env **同时**满足，缺一即 `t.Skip` 并写明理由。
+前置：① 独立临时**目录**，内含 `basalt.yaml`（两家 provider，`api_key` 一律 `${VAR}` 占位）——正例只读这一个文件，**不需要** `basalt init`、也不触碰任何既有库；② 真实凭证经**环境变量**注入（不落盘 / 不落日志 / 不进对话）；③ **显式执行开关**与凭证 env **同时**满足，缺一即 `t.Skip` 并写明理由。
 
 正例：
 
 ```bash
-BASALT_REAL_CALL=1 BASALT_DEMO_DIR=<演示工作区> go test -tags=integration -count=1 -run TestProviderService ./internal/app/
+BASALT_REAL_CALL=1 BASALT_DEMO_DIR=<演示目录> go test -tags=integration -count=1 -v -run TestProviderService_RealCallWritesAudit ./internal/app/
 ```
 
-**预期**：`--- PASS`（**不是** `--- SKIP`——跳过不构成验收通过）；用例入口显式设截止时间；随后查库：
+**预期**：`--- PASS`（**不是** `--- SKIP`——跳过不构成验收通过）；用例入口显式设截止时间（60 秒测试常量，不是配置键）。审计行由**用例自身**在 `t.TempDir()` 的临时库里读取断言——**无需** `sqlite3`，也**不会**写入演示目录。
+
+**判据**（用例内断言，逐条同源）：`status=success`；token 三列**与响应一致**——未返回 usage 则三列 0 且**仍判成功**（不得把 `token > 0` 写成无条件判据，也**不得**由 `total_tokens > 0` 反推"供应商返回了 usage"）；`error_kind` 为空；`model` 非空（生效模型落审计行）。
+
+> 用例只调用 `cfg.Providers[0]`——两家都想真发一次，把两家在 `basalt.yaml` 里的顺序对调再跑一遍（首列为调用对象）。
+
+反例（**不需要凭证**，故不因缺凭证跳过；**独立用例**，不读演示目录）：
 
 ```bash
-sqlite3 <演示工作区>/.basalt/basalt.db "SELECT provider, model, status, prompt_tokens, completion_tokens, total_tokens, error_kind FROM llm_calls;"
+go test -tags=integration -count=1 -v -run TestProviderService_UnreachableEndpointRecordsFailedAudit ./internal/app/
 ```
 
-**判据**：`status=success`；token 三列**与响应一致**——未返回 usage 则三列 0 且**仍判成功**（不得把 `token > 0` 写成无条件判据，也**不得**由 `total_tokens > 0` 反推"供应商返回了 usage"）；`error_kind` 为空。
-
-反例（**不需要凭证**，故不因缺凭证跳过）：
-
-```bash
-BASALT_REAL_CALL=1 BASALT_DEMO_DIR=<演示工作区> go test -tags=integration -count=1 -run TestProviderService ./internal/app/
-```
-
-**判据**：把某家 `base_url` 指向不可达端点重跑 → 失败同样落审计（`failed` + `error_kind` 非空，预期 `external_error`）。
+**判据**：用例内建的不可达端点（`http://127.0.0.1:1`，回环上没人监听）→ 一次调用即失败、不重试，失败同样落审计（`failed` + `error_kind=external_error` + `error_message` 非空）；错误文案不含该 URL、审计行不含凭证。
 
 凭证复核（范围限定为**运行对象**——全仓 grep 会命中文档示例，不作为判据）：
 
 ```bash
-grep -rnE "sk-|api_key: [^$]" <演示工作区>/basalt.yaml   # 预期：零命中
+grep -rnE "sk-|api_key: [^$]" <演示目录>/basalt.yaml   # 预期：零命中
 ```
 
 > 缺凭证（或未开执行开关）时用例会 SKIP——收口报告必须区分 `--- PASS` 与 `--- SKIP`，跳过的那次**不构成**「真实调用验收通过」。
+
+**执行记录（2026-10-16）**：本场景已执行——先做缺凭证干跑验证跳过路径（`--- SKIP`，文案点名未注入的环境变量），随后 DeepSeek `deepseek-chat` 与 Kimi `kimi-k2.6`（两次运行、对调首列）各 `--- PASS`，不可达反例 `--- PASS`；凭证仅存在于执行 shell 的 env（零打印 / 零落盘 / 零进对话），演示目录用后即删。明细见 [docs/us/us2-provider.md](../../docs/us/us2-provider.md) §6。
 
 ## 参考
 
