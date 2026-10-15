@@ -681,18 +681,38 @@ func TestTZData_IsolatedControlWithoutImport(t *testing.T) {
 | 验收 Demo（编程指南 §4.1 五条 + 修订） | ①`make check` 全绿；②`basalt init` 出工作区（含 `basalt.db`）、**二跑幂等**；③`basalt status` 在**无配置文件**下 exit 0：显示库、`schema_version`、11 表就绪（节 2 报「未发现配置」不计失败——评审修订 P2-5；**无需**配置准备步骤）；④`CGO_ENABLED=0 go build` 出静态二进制，且 `./bin/basalt --version` **包含**注入版本（`$$(git describe --tags --always)` 生效——评审修订 P2-4）；⑤测试基础设施跑通首个不依赖真实网络的用例（`TestTestutil_HTTPServer`）；⑥ tzdata 见下行（必验） |
 | 负向三连 | 故意留未格式化文件 → `make fmt` 非零；语法错误文件 → 同非零（**先查退出码**）；留 `${UNRESOLVED}` 残留 → 启动即拒并点名 |
 | tzdata 内嵌实测（**必验**，三稿口径） | ①本机：`TestTZData_LoadLocationPortable` 通过（可移植读数——**不**作隔离结论，Windows 注册表源不可遮蔽）；②**CI 隔离容器步骤（必跑）**：主组通过 + 对照组**以「时区加载失败」（exit 3 + `TZ_LOAD_FAILED`）**失败（启动失败 / 崩溃 / 任意错误不算通过）。隔离结论只取 ②；步骤缺失或隔离断言未落实 → 如实登记为未完成项 |
-| 探针（「口径丙」，**不入库**） | 在本仓之外空目录、内存 SQLite：①按契约 §4.3 恢复语义手工构造反例状态（`running` Run / `pending` 审计行 / 半截工具组），验恢复算法可重入、补组以消息为入口、事务边界；②验实例锁语义（活实例持锁 → 第二写模式进程拒绝启动；暂停的实例**不得**被抢锁——Windows 对应手段见「待决事项」#2）。**记读数**（锁语义与恢复可重入性**分开记**）；偏离契约处 → 给出偏差与拟改点**回写 `contracts/`**（交用户确认，`/speckit-analyze` 收口核对）。**记录口径**：暂停实例一项未验证时，**链路 5 不得记「全部通过」**，如实保留为未完成项（评审修订）。**归属与门槛（2026-10-15 裁决）**：小探针是 **US-1 交付后的独立待办项**——**不得整体后移**（链路 1 / 3 / 4 的验证随 US-4 执行，不带上它）；它**不阻断** US-2 / US-3 开工，但完成前**必须**如实留在 US-1 的剩余项清单里 |
+| 探针（「口径丙」，**不入库**） | 在本仓之外空目录、内存 SQLite：①按契约 §4.3 恢复语义手工构造反例状态（`running` Run / `pending` 审计行 / 半截工具组），验恢复算法可重入、补组以消息为入口、事务边界；②验实例锁语义（活实例持锁 → 第二写模式进程拒绝启动；暂停的实例**不得**被抢锁——Windows 对应手段见「待决事项」#2）。**记读数**（锁语义与恢复可重入性**分开记**）；偏离契约处 → 给出偏差与拟改点**回写 `contracts/`**（交用户确认，`/speckit-analyze` 收口核对）。**记录口径**：暂停实例一项未验证时，**链路 5 不得记「全部通过」**，如实保留为未完成项（评审修订）。**归属与门槛（2026-10-15 裁决）**：小探针是 **US-1 交付后的独立待办项**——**不得整体后移**（链路 1 / 3 / 4 的验证随 US-4 执行，不带上它）；它**不阻断** US-2 / US-3 开工，但完成前**必须**如实留在 US-1 的剩余项清单里。（**2026-10-16 更新**：小探针已完成，三场景 × 三手段读数见本节末「小探针读数（2026-10-16 完成）」；① 按契约 §4.3 构造反例状态的恢复算法验证随 US-4。） |
 | CI 与分支保护 | 首次推送后 `.github/workflows/ci.yml` 全绿——双 job + test job 内 **tzdata 隔离步骤（必跑）**（前置含四工具固定版本安装与 module 路径复核，见 §3.3）；GitHub 侧把两 job 设为**必需检查**（由用户设置、设置后**回读一次**——编程指南 §8.3 第 6 项） |
 | 凭证复核 | 范围收窄为**运行对象**：`basalt.yaml.example`、测试夹具与**捕获的三路输出**——错误文案（`TestConfig_RejectsPlaintextCredential`）、logger 缓冲与 stdout/stderr（`TestStatus_NoCredentialLeakInOutputs`）均带 `NotContains` 断言（评审修订三稿补充：补 err.Error() 之外的实测面）；实例配置按 Operations §6 原式核（`grep -rnE "sk-\|api_key: [^$]" <实例目录>/basalt.yaml` 零命中）。**全仓 grep 会命中文档示例，不作为判据** |
 | 装配确认（人工走查） | `go.mod` 无框架 / ORM 坐标（宪法 I / IX）；业务代码 `context.WithValue` 零使用（宪法 VII）；`app.Run` 装配面仅配置 / 日志 / 工作区 / 存储；`internal/storage/schema.sql` 与契约一致（由单测兜底）；入口包覆盖率达标（由用例兜底，无豁免） |
 | 静态构建平台验证 | Linux 产物 `file` / `ldd` 断言静态；Windows 产物无额外依赖直接启动（宪法 VIII 复核方式） |
+
+### 小探针读数（2026-10-16 完成；对应上行「探针（「口径丙」，**不入库**）」行）
+
+**状态**：US-1 代码交付完成；小探针已完成（三场景 × 三手段读数在案），正式实现归 US-4。
+
+**交付读数（2026-10-16）**：代码提交 `96a9989`（PR #1）；CI run [38766112554](https://github.com/ymedword/basalt/actions/runs/38766112554) 双 job 全绿——build job 含 Linux 静态断言读数（`file`：`statically linked`；`ldd`：无动态依赖），test job 含 tzdata 隔离组 `ok`（前置已删除系统 zoneinfo 与 GOROOT `zoneinfo.zip` 并断言删除成功）。CI 专有读数以此为准，本机 Windows 不重测。
+
+**手段评估**：标准库 `syscall` **无** `LockFileEx` 符号（实测 `go doc syscall.LockFileEx` → `no symbol LockFileEx in package syscall`；`go doc syscall` 中仅无关的 `ForkLock` / `VirtualLock`）→ 采用已在依赖图中的 `golang.org/x/sys/windows` **v0.48.0**（`go.mod` indirect 行；模块代理实测另有 v0.49.0，**不动版本**）——**无新增坐标**。
+
+**探针方法**：仓库外一次性 Go 程序 + Python 驱动（用后即删、不入库）；holder 经 `taskkill /F`（TerminateProcess，等价崩溃）与 `NtSuspendProcess`（挂起，等价 SIGSTOP）处置；每条读数前后以 `GetExitCodeProcess` 判 holder 活性，**不自活的读数判为无效**；恢复可重入以 journal 待办翻转模拟（首跑 flipped=1、二跑 flipped=0 方判幂等）。
+
+| 场景 | `LockFileEx`（x/sys） | `O_EXCL` 锁文件 | 心跳 TTL（2s） |
+| --- | --- | --- | --- |
+| S1 恢复可重入 | 崩溃后再取锁 **ACQUIRED**；recover 首跑 flipped=1、二跑 flipped=0 ✓ | **REFUSED**——残留锁文件，必须人工清理 ✗ | 未测（TTL 窗口内不可恢复） |
+| S2 活实例互斥 | REFUSED ✓ | REFUSED ✓ | REFUSED ✓ |
+| S3 暂停实例互斥（挂起 3s） | REFUSED ✓（内核按句柄持有） | （暂停不移除文件，形态上同样拒绝） | **ACQUIRED**——挂起 2.5s > TTL，锁被抢、双实例并存 ✗ |
+
+**结论**：`windows.LockFileEx` 是唯一三场景全绿的手段——崩溃即由内核释放（无残留、无 TTL 竞态），进程存活（含被挂起 / 卡住）期间句柄持有即互斥。**US-4 正式实现取此手段**（Linux 侧对应 `flock`，经 `x/sys/unix`）；`O_EXCL` 文件与心跳 TTL 两形态**不得**用于实例锁。
+
+**覆盖范围**：本读数覆盖 ② 实例锁语义全项（活实例互斥 / 暂停实例不被抢 / 崩溃后可再取锁）与恢复动作的幂等重跑形态；① 按契约 §4.3 构造反例状态（内存 SQLite：`running` Run / `pending` 审计行 / 半截工具组）的恢复算法验证与「补组以消息为入口」「事务边界」随 **US-4**——与「正式实现归 US-4」同一口径。
 
 ## 已决事项（2026-10-15 用户裁决带入本 US；出处：起步手册 §4「口径丙」+ 本次评审修订）
 
 - **五链路原型分阶段执行**（口径丙）：本 US 交付后，用**不入库**小探针先验链路 5（崩溃恢复算法 + 实例锁语义，内存 SQLite，不碰 provider / 循环）；链路 1 / 3 / 4 在 US-4 交付后立即验证；链路 2 的 HTTP 准入面（409 / 429）到 US-9 补齐。**记录口径**：暂停实例（SIGSTOP / Windows 挂起）一项若未验证，链路 5 **不得**记「全部通过」——如实保留为未完成项。**归属口径**：小探针是 **US-1 交付后的独立待办项**（**不得**整体后移；**不阻断** US-2 / US-3 开工），崩溃恢复与实例锁的**正式实现**归 **US-4**。
 - **契约状态**：运行时契约四件套在对应链路验证通过前为**待验证设计草案**——**不构成** US-2 / US-3 开工阻断；最终冻结条件 = 五链路全部通过 + 真实模型调用往返，实测偏差回写 `contracts/` 并更新状态头。
 - **实例锁与恢复的实现归属**：US 序列中尚无明确归属，**建议归 US-4**（US-4 颗粒度文档定案；本 US 不带实现）。
-- **探针期的锁实现手段**：Windows 锁手段在**探针启动前单独确认**（标准库 `syscall` vs `golang.org/x/sys`——含新增坐标则先请示）；Unix 侧 `syscall.Flock` 无争议。
+- **探针期的锁实现手段**：Windows 锁手段在**探针启动前单独确认**（标准库 `syscall` vs `golang.org/x/sys`——含新增坐标则先请示）；Unix 侧 `syscall.Flock` 无争议。（**2026-10-16 已决**：`syscall` 无 `LockFileEx` 符号（实测 `go doc`）；取 `golang.org/x/sys/windows` v0.48.0——已在依赖图中，无新增坐标；探针读数见 §6 末块。）
 - **退出码口径**：成功 0 / 失败 1，具体原因由文案区分（不采用分档非零）。
 - **`basalt init` 参数面**：仅作用于**当前目录**（需求 §5.1 字面），不加 `--dir` / 位置参数；需要时另议。
 - **`basalt status` 输出形态**：首版仅人类可读文本；机器可读 `--json` 随管理台（US-11）需要时另议。
@@ -702,7 +722,7 @@ func TestTZData_IsolatedControlWithoutImport(t *testing.T) {
 ## 待决事项（交用户裁决；附默认建议）
 
 1. **配置是否提供「工作区路径」覆盖键**（DA §5.13 把「工作区路径」列为服务配置项；Operations §1.1 / §5.3 为 CWD 固定口径）：本 US 不引入、按 CWD 落（§2.4 取数澄清）。默认建议：维持 CWD 口径，该键随 US-9 装配面复核时再议（引入需同步改 init / status / 运维手册的路径语义）。
-2. **探针启动前的 Windows 锁手段确认**（见「已决事项」）：默认建议优先评估标准库侧可行性（`syscall` 包的 `LockFileEx` 调用能力，写前核实），不可行则 `golang.org/x/sys/windows`（**新增坐标需用户确认**）。
+2. **探针启动前的 Windows 锁手段确认**（见「已决事项」）：默认建议优先评估标准库侧可行性（`syscall` 包的 `LockFileEx` 调用能力，写前核实），不可行则 `golang.org/x/sys/windows`（**新增坐标需用户确认**）。（**2026-10-16 已决**：标准库侧不可行——`go doc syscall.LockFileEx` 报 no symbol；采用 `golang.org/x/sys/windows` v0.48.0，**复用已在依赖图中的坐标**（`go.mod` indirect），无新增坐标；读数与结论见 §6 末「小探针读数」。）
 
 ## 附录 A：易漏维度核对（US-1 适用性）
 
