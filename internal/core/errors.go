@@ -34,4 +34,10 @@ var (
 	// ErrWorkspaceNotInitialized 表示工作区未初始化（缺 .basalt/）。
 	// ErrWorkspaceNotInitialized means the workspace is not initialized.
 	ErrWorkspaceNotInitialized = errors.New("workspace is not initialized")
+
+	// ErrProviderNotConfigured 表示请求的 provider 不在显式映射表内——路由查表不中，
+	// 不遍历推断、不取"唯一的那个"当默认（宪法 III）。对外映射为 NOT_CONFIGURED（US-9）。
+	// ErrProviderNotConfigured means the requested provider is not in the explicit map;
+	// routing never iterates and never falls back to a default.
+	ErrProviderNotConfigured = errors.New("provider is not configured")
 )

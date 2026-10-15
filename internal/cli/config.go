@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -167,7 +168,7 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 // to the directory the file lives in.
 //
 // 为什么不用裸 os.ReadFile(path)：路径来自调用方参数，静态安全扫描对此判 G304
-// （CWE-22 文件包含），而抑制手段（`#nosec`）默认禁用。以父目录为 root 读取既消除
+// （CWE-22 文件包含），而抑制手段（gosec 的 nosec 标注）默认禁用。以父目录为 root 读取既消除
 // 该判定，又真把「跳到目录之外的软连接」挡在门外——fail-closed，与编程指南 §7
 // 陷阱 7 的真实路径口径同向。错误经 %w 保留 fs.ErrNotExist 链，LoadConfig 对
 // 调用方的判态契约（errors.Is(err, fs.ErrNotExist)）不变（已实测）。
@@ -319,13 +320,88 @@ func validateConfig(cfg *Config) error {
 	if cfg.Log.Format != "" && !validLogFormats[cfg.Log.Format] {
 		return fmt.Errorf("配置项 log.format 取值非法（%s）——只允许 text / json", cfg.Log.Format)
 	}
+	// seen 记条目名 → **首次出现**的下标：重名拒绝要同时点名两条，只报后一条会让
+	// 用户不知道跟谁撞了。
+	// seen maps a name to its first index so a duplicate can name both entries.
+	seen := make(map[string]int, len(cfg.Providers))
 	for i, p := range cfg.Providers {
 		if p.Name == "" {
 			return fmt.Errorf("必填配置项 providers[%d].name 缺失——供应商条目必须有名字（映射表的键）", i)
 		}
+		if first, dup := seen[p.Name]; dup {
+			// 第 7 类 fail-closed：重名不拒绝，映射表就会静默保留最后一条——前面的
+			// 条目从此不可达，而失败形态只是"配了却路由不过去"，没有任何报错。
+			// A duplicate would leave one entry silently unreachable.
+			return fmt.Errorf(
+				"配置项 providers[%d].name 与 providers[%d] 重复（%q）——映射表的键必须唯一，否则重名的条目静默不可达",
+				first, i, p.Name)
+		}
+		seen[p.Name] = i
+
+		// base_url 自本 US 起必填：没有地址就构造不出客户端（端点 = base_url + /chat/completions）。
+		if p.BaseURL == "" {
+			return fmt.Errorf("必填配置项 providers[%d].base_url 缺失——无地址无法构造客户端", i)
+		}
+		if err := validateProviderBaseURL(p.BaseURL, i); err != nil {
+			return err
+		}
+
 		if p.APIKey == "" {
 			return fmt.Errorf("必填配置项 providers[%d].api_key 缺失——凭证一律写 ${VAR} 占位", i)
 		}
+	}
+	return nil
+}
+
+// validateProviderBaseURL 是第 8 类 fail-closed：`base_url` 只支持 scheme + host +
+// path 三部分，含 userinfo / query / fragment 的取值**拒绝**（缺失 scheme 不代补；
+// 非 http(s) 方案同拒——两种情形文案各说各的，原因不同不混写）。
+// validateProviderBaseURL rejects every base_url carrying a component outside
+// scheme + host + path; it never rewrites the user's configuration.
+//
+// 为什么拒绝而不是静默裁剪：删掉这些部分会**改写用户配置的含义**——userinfo 里可能
+// 就是认证信息、query 里可能带着网关路由参数；裁剪把认证 / 路由错误推迟成运行时才
+// 暴露、且难定位的故障。
+// Silently dropping them would rewrite the configuration's meaning and turn an
+// authentication or routing error into a hard-to-place runtime failure.
+//
+// 文案纪律：只点名 `providers[i].base_url` 与不支持的**成分名**，**不回显原 URL、
+// 也不回显其中的值**（userinfo 里可能就是一份凭证）——`url.Parse` 的原始错误自带
+// 整条 URL，**不得**直传。
+// The message names the key path and the offending component only, never the URL
+// or any of its values.
+func validateProviderBaseURL(raw string, i int) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		// 原错误直传会把整条 URL 带进文案——这里只保留"解析不了"这个事实。
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 无法解析——只支持 scheme + host + path（不支持的成分: scheme）", i)
+	}
+	switch {
+	case parsed.Scheme == "":
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: scheme）——缺失 scheme 不代补 https", i)
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		// 与上一条分开：方案存在但不受支持时，说"缺失 scheme"是错的事实陈述——
+		// 文案只点成分名 + 支持面，不描述被拒的具体取值（取值来自配置，不外带）。
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: scheme）——只接受 http 与 https 方案", i)
+	case parsed.Host == "":
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: host）", i)
+	case parsed.User != nil:
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: userinfo）", i)
+	case parsed.RawQuery != "" || parsed.ForceQuery:
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: query）", i)
+	case parsed.Fragment != "" || strings.Contains(raw, "#"):
+		// 尾随的空 `#`（`…/v1#`）解析后 Fragment 是**空串**，只看成分字段会漏——而拼接端点后
+		// `/chat/completions` 整段落进 fragment，请求实际打到 base path（静默改写端点）。
+		// `url.URL` 没有 ForceFragment 字段（query 侧才有 ForceQuery），故按字面 `#` 判；
+		// 路径里的 `%23` 是合法编码，不含字面 `#`，不连坐。
+		return fmt.Errorf(
+			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: fragment）", i)
 	}
 	return nil
 }
