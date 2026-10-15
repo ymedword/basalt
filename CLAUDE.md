@@ -60,7 +60,7 @@ Basalt 是 **NivroOS（Java 实现）的 Go 移植**——同一份 Agent 资产
 - **`git init` 由用户执行**——AI **不得**自行初始化仓库；同样**不得**自动 commit / push / tag
 - 提交信息 = **英文** Conventional Commits 标题 + 四段**双语**正文（Problem / Design / Testing / Impact——每段先英文段、空行、再中文段逐段对照），规范原文见 [docs/EngineeringStandards.md](docs/EngineeringStandards.md) §5
 
-## 常见陷阱（首版 6 条；全表 45 条见[编程指南 §7](docs/AiProgrammingGuide.md)）
+## 常见陷阱（首版 6 条；全表 52 条见[编程指南 §7](docs/AiProgrammingGuide.md)）
 
 | 陷阱 | 症状 / 修复 |
 | --- | --- |
