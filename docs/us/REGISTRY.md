@@ -25,6 +25,7 @@
 | US | 类型 | 模块执行颗粒度文档 | 技术方案章节 | 需求文档章节 | 模块落位（摘要） | 文档入库 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 开发类 | `docs/us/us1-foundation.md` | §1.2 / §8.1 / §8.7 / §8.8 / §9.1 / §9.2 / §10.1 / §10.2 / §11.1 | §1.5 / §5.1 / §5.12 / §5.13 / §8 / §10.1 / §10.2 / §13.4 | 根（`go.mod` / `Makefile` / CI / `scripts/`）、`cmd/basalt`、`internal/{app,cli,workspace,storage,core,testutil}` | 2026-10-16 |
+| 2 | 开发类 | `docs/us/us2-provider.md` | §3.1 / §3.2 / §3.3 / §4.1 / §4.4 / §8.7 / §9.1 / §9.2 / §9.4 / §10.1 / §13 | §1.5 / §5.3 / §5.12 / §5.13 / §13.4 | `go.mod`（新增 `go-openai v1.43.0`）、`internal/{core,provider,storage,app,cli,testutil}` | 2026-10-16 |
 
 ## 能力追加登记（非 per-US）
 

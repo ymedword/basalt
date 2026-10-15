@@ -3,6 +3,7 @@ package cli_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -244,9 +245,13 @@ func TestConfig_RejectsInvalidValues(t *testing.T) {
 			want: "providers[0].name",
 		},
 		{
+			// 夹具随 US-2 补上 base_url：该字段自 US-2 起同为必填（前序改造点 1），
+			// 不补则本子例命中的是 base_url 分支而不是它要判的 api_key 分支——
+			// 判据不变，缺的只是"其余字段齐备"这个前提。
 			name: "必填缺失：api_key 空缺",
 			content: `providers:
   - name: demo
+    base_url: https://api.example.com/v1
 `,
 			want: "providers[0].api_key",
 		},
@@ -275,4 +280,113 @@ func TestConfig_RejectsInvalidValues(t *testing.T) {
 			require.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// TestConfig_RejectsDuplicateProviderName 前序改造点 1（第 7 类 fail-closed）：
+// `providers[].name` 重名 → 装载期拒绝并**点名两条目下标**。
+//
+// 为什么这条必须是装载期错误：映射表的键就是条目名——重名会让 map 静默保留最后一条，
+// 前面的条目从此不可达而**无人知晓**（症状是"配了却路由不过去"，而不是一条报错）。
+// Duplicate names must fail at load time: the map key is the entry name, so a
+// duplicate silently drops an entry and the operator never learns about it.
+func TestConfig_RejectsDuplicateProviderName(t *testing.T) {
+	path := writeConfig(t, `providers:
+  - name: demo
+    base_url: https://alpha.example.com/v1
+    api_key: ${DEMO_KEY}
+  - name: other
+    base_url: https://other.example.com/v1
+    api_key: ${DEMO_KEY}
+  - name: demo
+    base_url: https://beta.example.com/v1
+    api_key: ${DEMO_KEY}
+`)
+
+	_, err := cli.LoadConfig(path, envLookup(map[string]string{"DEMO_KEY": "resolved-secret-value"}))
+
+	require.Error(t, err, "重名必须拒绝（否则映射表静默缺条目）")
+	require.Contains(t, err.Error(), "providers[0]", "必须点名先出现的那条下标")
+	require.Contains(t, err.Error(), "providers[2]", "必须点名后出现的那条下标")
+	require.Contains(t, err.Error(), "demo", "必须点名重复的名字")
+	require.NotContains(t, err.Error(), "resolved-secret-value", "不得回显凭证值")
+}
+
+// TestConfig_RejectsMissingProviderBaseURL 前序改造点 1：`base_url` 提为**必填**
+// （无 base_url 无法构造客户端）。独立用例——不复用其他必填判据的断言。
+func TestConfig_RejectsMissingProviderBaseURL(t *testing.T) {
+	path := writeConfig(t, `providers:
+  - name: demo
+    api_key: ${DEMO_KEY}
+`)
+
+	_, err := cli.LoadConfig(path, envLookup(map[string]string{"DEMO_KEY": "resolved-secret-value"}))
+
+	require.Error(t, err, "缺 base_url 必须拒绝（客户端构造不出没有端点的供应商）")
+	require.Contains(t, err.Error(), "providers[0].base_url", "必须点名键路径")
+	require.Contains(t, err.Error(), "必填", "必须说明是必填项缺失")
+	require.NotContains(t, err.Error(), "resolved-secret-value", "不得回显凭证值")
+}
+
+// TestConfig_RejectsProviderBaseURLWithUserinfoQueryFragment —— 第 8 类 fail-closed（§2.4 注 9）。
+// 判决两个对象：① **拒绝**——含这些成分的地址不得生效（静默裁剪会让配置在运行时"变味"，
+// 认证 / 路由错误由此变成难定位的故障）；② **文案纪律**——只点名键路径与成分名，不回显原 URL、
+// 也不回显其中的值（userinfo 里可能正是一份凭证）。子用例各带一个"敏感片段"，逐例断言它
+// 不出现在错误文案里（与 US-1 的"明文不回显"同口径）。
+func TestConfig_RejectsProviderBaseURLWithUserinfoQueryFragment(t *testing.T) {
+	// component 与用例名分开：后两个子例的**成分名**同为 `scheme`（缺 scheme 与
+	// 非 http(s) 方案走同一条判定），但拒因不同、子例名要各说各的。
+	// 子例覆盖面以颗粒度文档 §3.2 的行为准（userinfo / query / fragment / 缺 scheme；
+	// 非 http(s) 方案同判；**空 fragment / 空 query 分隔符同拒**）——§4.3 的写出代码
+	// 是摘录，只列了前三类。合法 `%23` 路径的正例是独立用例
+	// （TestConfig_AcceptsEncodedHashInPath）。
+	// The component is asserted separately from the subtest name because the last
+	// two cases share the component `scheme` while being rejected for different
+	// reasons; the empty-delimiter cases name the literal trailing `#` / `?`.
+	cases := []struct {
+		name      string
+		baseURL   string
+		component string
+		sensitive string
+	}{
+		{"userinfo", "https://user-x9:secret-7f@api.example.com/v1", "userinfo", "secret-7f"},
+		{"query", "https://api.example.com/v1?route=9f3a", "query", "route=9f3a"},
+		{"fragment", "https://api.example.com/v1#alt-2b", "fragment", "alt-2b"},
+		{"空 fragment（尾随 #）", "https://api.example.com/marker-a1f#", "fragment", "marker-a1f"},
+		{"空 query（尾随 ?）", "https://api.example.com/marker-b2e?", "query", "marker-b2e"},
+		{"缺 scheme", "api.example.com/v1", "scheme", "api.example.com"},
+		{"非 http(s) 方案", "ftp://api.example.com/v1", "scheme", "ftp://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, providerConfigWithBaseURL(tc.baseURL)) // US-1 既有夹具
+			_, err := cli.LoadConfig(path, envLookup(map[string]string{"DEMO_KEY": "resolved-secret-value"}))
+
+			require.Error(t, err, "含 %s 的 base_url 必须被拒绝", tc.name)
+			require.Contains(t, err.Error(), "providers[0].base_url", "必须点名键路径")
+			require.Contains(t, err.Error(), tc.component, "必须点出不支持的成分")
+			require.NotContains(t, err.Error(), tc.baseURL, "不得回显原 URL")
+			require.NotContains(t, err.Error(), tc.sensitive, "不得回显其中的值")
+		})
+	}
+}
+
+// TestConfig_AcceptsEncodedHashInPath —— 空 fragment 拒绝的**正例守卫**：被拒的是字面 `#`
+// 分隔符（尾随空 `#` 会让拼接的端点整段落进 fragment）；路径里编码过的 `%23` 是合法成分，
+// 不得连坐——且取值**原样保留**（不裁剪、不重编码，`%23` 不是 fragment 分隔符）。
+// TestConfig_AcceptsEncodedHashInPath: the encoded `%23` stays legal and is preserved
+// verbatim, so the empty-fragment rejection does not overshoot.
+func TestConfig_AcceptsEncodedHashInPath(t *testing.T) {
+	const baseURL = "https://api.example.com/v1%23suffix"
+	path := writeConfig(t, providerConfigWithBaseURL(baseURL))
+
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{"DEMO_KEY": "resolved-secret-value"}))
+
+	require.NoError(t, err, "%23 是合法编码 path，不得被 fragment 判定连坐")
+	require.Equal(t, baseURL, cfg.Providers[0].BaseURL, "取值原样保留")
+}
+
+// providerConfigWithBaseURL 以 US-1 的 baseConfig 为底，只替换 base_url 一行——
+// 子用例之间的唯一变量就是被拒的那个成分。
+func providerConfigWithBaseURL(baseURL string) string {
+	return strings.Replace(baseConfig, "base_url: http://${DEMO_HOST}:8080/v1", "base_url: "+baseURL, 1)
 }
