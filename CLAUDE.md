@@ -53,7 +53,7 @@ Basalt 是 **NivroOS（Java 实现）的 Go 移植**——同一份 Agent 资产
 ## 工作流（三步链）
 
 - 从零起步（开发机工具链、`git init`、逐 US 手动操作）见 [docs/GettingStarted.md](docs/GettingStarted.md)
-- 每个 US 固定流程：`/module-doc-gen N` → `/us-register N` → `/module-dev N`；**`/speckit-analyze` 是实施前阻断检查**——`tasks` 确认后先跑一次，CRITICAL 未清零不得进 `implement`；收口再跑一次（实现与文档一致性核对）
+- 每个 US 固定流程：`/module-doc-gen N` → `/us-register N` → `/module-dev N`；**`/speckit-analyze` 是实施前阻断检查**——`tasks` 确认后先跑一次，CRITICAL 未清零不得进 `implement`；收口走「**收口三件套**」（analyze 复跑 → [独立复核](.claude/skills/module-dev/SKILL.md) → 七项证据 DoD，module-dev 步骤 7）
 - **US-1 也走三步链**；工程地基（`go.mod` / 包骨架 / Makefile / CI / 日志 / SQLite）的**装法**参照 `/init-foundation`（流程与验收仍以 US-1 颗粒度文档为准）
 - **规范前置（编码类改动）**：写 / 改 Go 代码、SQL、日志、测试前**必须**先读 [docs/EngineeringStandards.md](docs/EngineeringStandards.md) 对应节（§1 Go / §2 测试 / §3 数据库 / §4 日志；提交口径 §5）——三步链 `/module-dev`、`/debug` 与一切直改均适用
 - 台账 [docs/us/REGISTRY.md](docs/us/REGISTRY.md) 是 US 登记的**唯一登记处**（`/us-register N` 写入）；US 是**开放序列**（US-15 起顺延，编号只增不改），见 [docs/Roadmap.md](docs/Roadmap.md) §4
@@ -83,6 +83,6 @@ Basalt 是 **NivroOS（Java 实现）的 Go 移植**——同一份 Agent 资产
 
 - 禁止自动 `git init` / commit / push / tag / 部署——时机由用户决定
 - 禁止明文落盘凭证——一律 `${ENV_VAR}` 占位
-- 禁止删断言 / 无理由跳过测试（`t.Skip` 须写明理由）/ 放宽阈值让门禁变绿
-- `specs/**` 按状态区分：**当前 US 的草案可修订**（`clarify` / `analyze` 调整内容、`implement` 更新任务勾选）；**已批准范围的变更必须经用户确认**；**完成验收后的历史设计不得静默改写**（须用户裁决并在文档里留裁决记录）。已发布迁移脚本**不得**改写（只追加）
+- 禁止删断言 / 无理由跳过测试（`t.Skip` 须写明理由）/ 放宽阈值让门禁变绿；**判据面变更 = 变更**——改变验收语义须停下确认（允许新增测试、等价重构、随已批准接口适配；判据面口径与**单一权威枚举**见 [docs/EngineeringStandards.md](docs/EngineeringStandards.md) §2）
+- `specs/**` 按状态区分：**当前 US 的草案可修订**（`clarify` / `analyze` 调整内容、`implement` 更新任务勾选）；**已批准范围的变更必须经用户确认**；**完成验收后的历史设计不得静默改写**（须用户裁决并在文档里留裁决记录）。已发布迁移脚本**不得**改写（只追加）。`specs/**/run-state.md` 是**过程状态**（非设计工件）：失败台账只追加、不改旧行；唯一可原地翻转的是未验证清单「未验证 → 已验证」（须注日期与证据）；收口后保留，**不**按临时物清理
 - 禁止自行修订 [.specify/memory/constitution.md](.specify/memory/constitution.md)——宪法修订**必须**经用户确认（走 `/speckit-constitution`）

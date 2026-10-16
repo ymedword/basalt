@@ -405,7 +405,7 @@ commit（你手动）
 
 每个 US 都是这条链，**US-1 也不例外**——工程地基的**装法**参照 `/init-foundation` skill，但流程与验收仍走 `/module-dev 1`（[CLAUDE.md](../CLAUDE.md) 工作流段）。
 
-**分支**：本仓库**没有** `.specify/extensions.yml`（即无 `before_specify` hook），speckit 不会自动建分支——每个 US 开跑前手动建：`git checkout -b {NNN}-<slug>`（NNN 取 specs 目录序号，如 `001-foundation`）。建分支不是 commit / push，可以让 AI 建，也可以你自己建。开跑前确认工作区干净（`git status --short` 为空），中途要回滚才有退路。
+**分支**：本仓库 `.specify/extensions.yml` **未登记 `before_specify` hook**（只登记了 `before_tasks` / `after_implement` 两条提醒），speckit 不会自动建分支——每个 US 开跑前手动建：`git checkout -b {NNN}-<slug>`（NNN 取 specs 目录序号，如 `001-foundation`）。建分支不是 commit / push，可以让 AI 建，也可以你自己建。开跑前确认工作区干净（`git status --short` 为空），中途要回滚才有退路。
 
 ### 5.2 步骤 A：`/module-doc-gen 1`
 
@@ -427,13 +427,16 @@ commit（你手动）
 
 ⚠ **`analyze` 是实施前的阻断检查**：停点确认后先跑一次 `/speckit-analyze`，**CRITICAL 问题清零前不得进入 `implement`**（修 spec / plan / tasks，不得稀释原则）；分析结论贴进验收报告。
 
+⚠ **续跑不重生成**：该 feature 目录已存在且 `tasks.md` 含勾选时，**不得**再调 `/speckit-tasks`（重生成会毁掉勾选与内嵌证据）——按 `/module-dev` 步骤 0 分流表从**首个未完成任务**继续；三件输入（颗粒度文档 / `spec.md` / `plan.md`）与 run-state 基线不一致时走**追加式修订**（`/speckit-converge`）并停下确认。
+
 实现期间的硬约束（AI 侧）：写前核实第三方 API、已定字面量逐字保真、异常不吞、失败路径审计与 WARN 双轨；测试纪律：不得删断言 / 不得跳过测试 / 不得放宽阈值。
 
 ### 5.5 每个 US 收口
 
 1. 再跑一次 `/speckit-analyze`（与实施前那次同源：这次核对**实现与文档**的一致性，不只看 spec / plan / tasks 三件）
-2. 对齐**七项证据**（[AiProgrammingGuide.md](AiProgrammingGuide.md) §5）：门禁全绿 / 测试映射 / 交付物核对 / 前序回归 / 全局不变量自查 / 验收 Demo / 变更导读
-3. 你手动 commit（四段双语模板：Problem / Design / Testing / Impact——规范见 [EngineeringStandards.md](EngineeringStandards.md) §5，模板见 3.1）
+2. **独立复核**（module-dev 步骤 7 收口三件套）：以独立上下文对照冻结规格与判据面 diff，产出 findings 表 + 未覆盖面清单，逐条处置后才算完成
+3. 对齐**七项证据**（[AiProgrammingGuide.md](AiProgrammingGuide.md) §5），并按**四态登记**——每个验收点标通过 / 失败 / 跳过 / 未验证（均附本轮当场读数）；**必验项处于跳过 / 未验证 → 该项验收保持未完成**，并进 `specs/{NNN}-<slug>/run-state.md` 的未验证清单
+4. 你手动 commit（四段双语模板：Problem / Design / Testing / Impact——规范见 [EngineeringStandards.md](EngineeringStandards.md) §5，模板见 3.1）
 
 ### 5.6 US 顺序与依赖（[AiProgrammingGuide.md](AiProgrammingGuide.md) §1.3）
 

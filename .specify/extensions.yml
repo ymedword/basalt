@@ -1,0 +1,29 @@
+# Basalt 本地 Hook 登记（2026-10-17 接线）
+#
+# 载体：speckit-* 各 skill 的固定检查逻辑（无本文件时静默跳过）。命令名里的点
+# （.）落为连字符（-）：speckit.analyze -> /speckit-analyze。
+#
+# 边界（与 module-dev 配置区「Hooks」节同口径）：
+# - Hook 判不了"语义"（如"这次测试改动是否改变验收语义"），只做提醒 / 强制询问，
+#   不得冒充机器门禁；机器判据以 module-dev 步骤 0 / 步骤 7 与门禁命令为准。
+# - 本仓 skill 的检查逻辑会**跳过任何带 condition 字段的条目**——条件一律写进
+#   prompt 文本（如"若 tasks.md 已有勾选则……"），**不得**用 condition 字段。
+# - 全部登记为 optional: true（提醒级）：skill 打印提醒块，由执行者照做，不自动
+#   执行命令；改动一律改本文件，不在各 skill 里散改。
+
+hooks:
+  before_tasks:
+    - extension: "rerun-guard"
+      command: "module-dev"
+      description: "tasks.md 已有勾选时不得重生成（续跑保护）"
+      enabled: true
+      optional: true
+      prompt: "先看 FEATURE_DIR/tasks.md：若已存在且含勾选（- [x] / - [X]，大小写不敏感）→ 停下询问用户「续跑还是重生成」，本仓默认续跑——按 /module-dev 步骤 0 分流表从首个未完成任务继续，不得整体重生成、不得重做已勾选任务；若三件输入（颗粒度文档 / spec.md / plan.md）确有变化 → 只允许追加式修订（/speckit-converge 口径），并按软门禁停车裁决。若 tasks.md 不存在或全未勾选 → 忽略本条，照常生成。"
+
+  after_implement:
+    - extension: "collect-closeout"
+      command: "speckit.analyze"
+      description: "实施完毕进入收口三件套（analyze 复跑 → 独立复核 → 七项证据）"
+      enabled: true
+      optional: true
+      prompt: "实施完成后按 /module-dev 步骤 7 收口三件套收口：① 复跑 /speckit-analyze（CRITICAL 未清零不得继续）；② 独立复核（独立上下文对照冻结规格与判据面 diff，findings 与未覆盖面清单逐条处置后方可宣布完成）；③ 七项证据 DoD（四态登记、变更总结四段、判据面变更逐路径核对）。commit / push 归用户。"

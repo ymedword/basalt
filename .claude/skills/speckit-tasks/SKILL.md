@@ -55,6 +55,14 @@ You **MUST** consider the user input before proceeding (if not empty).
     After emitting the block above you MUST actually invoke the hook and wait for it to finish before continuing. Run it the same way you would run the command yourself in this agent/session (the invocation may differ from the literal `{command}` id shown above, e.g. a skills-mode agent runs it as `/skill:speckit-...` or `$speckit-...`). Emitting the block alone does not run the hook.
 - If no hooks are registered or `.specify/extensions.yml` does not exist, skip silently
 
+## 本仓守卫：续跑保护（本仓本地改造，2026-10-17）
+
+生成前**必须**检查 `FEATURE_DIR/tasks.md`：
+
+- 已存在且含 ≥1 个勾选（`- [x]` / `- [X]`，大小写不敏感）→ **停止**：不得整体重生成；报告首个未完成任务（全文件文档序第一条 `- [ ]`）并交 `/module-dev` 步骤 0 分流表处理
+- 输入（颗粒度文档 / `spec.md` / `plan.md`）确有变化 → 只允许**追加式修订**（`/speckit-converge` 口径：只追加、不重编号、不改既有勾选）
+- 其余情况照常生成
+
 ## Outline
 
 1. **Setup**: Run `.specify/scripts/powershell/setup-tasks.ps1 -Json` from repo root and parse FEATURE_DIR, TASKS_TEMPLATE_CONTENT, TASKS_TEMPLATE, and AVAILABLE_DOCS list. `FEATURE_DIR` and `TASKS_TEMPLATE` must be absolute paths when provided. `AVAILABLE_DOCS` is a list of document names/relative paths available under `FEATURE_DIR` (for example `research.md` or `contracts/`). For single quotes in args like "I'm Groot", use escape syntax: e.g 'I'\''m Groot' (or double-quote if possible: "I'm Groot").
@@ -215,3 +223,13 @@ Every task MUST strictly follow this format:
 - [ ] tasks.md generated with all phases, task IDs, and file paths
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with task count, story breakdown, and MVP scope
+
+---
+
+## 本仓本地改造登记
+
+本文件相对上游 Specify CLI 模板为**本仓本地改造**（首次分叉 2026-10-17）：
+
+| 位置 | 改造内容 | 依据 |
+| --- | --- | --- |
+| 「本仓守卫：续跑保护」节 | 插入续跑守卫：`tasks.md` 已有勾选 → 停止不重生成；输入变化只允许追加式修订 | Long-task 续跑机制（module-dev 步骤 0 分流表）；上游刷新模板后按本节回补 |
