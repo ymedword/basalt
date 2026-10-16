@@ -38,4 +38,10 @@ type Deps struct {
 	// cli never imports the implementation packages.
 	Store     Store
 	Workspace Workspace
+
+	// Agents 是 Agent 目录端口：list / show 只读（轻路径——不取实例锁、不触数据库），
+	// create / delete 是**写模式**（实现侧先取实例锁：被活实例持有时拒绝启动且零写入）。
+	// Agents is the agent-directory port: list / show stay read-only, while create /
+	// delete write through the instance lock taken inside the implementation.
+	Agents Agents
 }

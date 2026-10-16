@@ -42,8 +42,8 @@ func Run(ctx context.Context, args []string) int {
 
 	logger := bootstrapLogger(workDir)
 
-	// Store / Workspace 是装配层注入的适配器（ports.go）：命令面只认自己声明的
-	// 端口，storage / workspace 的实现细节不越过这道接缝。
+	// Store / Workspace / Agents 是装配层注入的适配器（ports.go）：命令面只认自己
+	// 声明的端口，storage / workspace 的实现细节不越过这道接缝。
 	// The adapters are injected here; the command surface only sees its own ports.
 	deps := cli.Deps{
 		WorkDir:                workDir,
@@ -51,6 +51,8 @@ func Run(ctx context.Context, args []string) int {
 		Logger:                 logger,
 		Store:                  storageStore{},
 		Workspace:              workspacePort{},
+		// Agents 是写模式端口（create / delete 由实现侧取实例锁）——构造参数显式传递。
+		Agents: agentsPort{WorkDir: workDir, Logger: logger},
 	}
 
 	root := cli.NewRootCommand(deps)

@@ -26,6 +26,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 开发类 | `docs/us/us1-foundation.md` | §1.2 / §8.1 / §8.7 / §8.8 / §9.1 / §9.2 / §10.1 / §10.2 / §11.1 | §1.5 / §5.1 / §5.12 / §5.13 / §8 / §10.1 / §10.2 / §13.4 | 根（`go.mod` / `Makefile` / CI / `scripts/`）、`cmd/basalt`、`internal/{app,cli,workspace,storage,core,testutil}` | 2026-10-16 |
 | 2 | 开发类 | `docs/us/us2-provider.md` | §3.1 / §3.2 / §3.3 / §4.1 / §4.4 / §8.7 / §9.1 / §9.2 / §9.4 / §10.1 / §13 | §1.5 / §5.3 / §5.12 / §5.13 / §13.4 | `go.mod`（新增 `go-openai v1.43.0`）、`internal/{core,provider,storage,app,cli,testutil}` | 2026-10-16 |
+| 3 | 开发类 | `docs/us/us3-agent-profile.md` | §4.2 / §8.1 / §8.2 / §8.3 / §8.5 / §8.7 / §10.1 / §11.1 / §11.2 / §11.3 / §11.4 / §11.5 / §13 | §1.5 / §5.1 / §5.2 / §5.10 / §5.12 / §5.13 / §5.14 / §9.1 / §9.5 / §10.2 / §13.4 | `go.mod`（新增 `robfig/cron/v3 v3.0.1`；`golang.org/x/sys` 迁直接依赖）、`internal/{workspace,core,cli}`、`internal/app`（既有适配器改造） | 未入库 |
 
 ## 能力追加登记（非 per-US）
 

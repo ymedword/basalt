@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	"github.com/ymedword/basalt/internal/cli"
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -62,4 +65,72 @@ func (workspacePort) Inspect(root string) ([]string, error) {
 		return nil, err
 	}
 	return report.Missing, nil
+}
+
+// agentsPort 把 workspace 包适配成 cli.Agents（list / show 读，create / delete 写）。
+// agentsPort adapts the workspace package to cli.Agents.
+//
+// 错误一律**原样**上抛——拒锁 / 已存在 / 归档撞名都是实现层的事实，端口不改写语义。
+// 两个字段各有各的用途：装载器拿到**注入的**日志器（装载期的逐条点名 WARN 因此走配置
+// 档位，而不是进程默认档）；写模式的两次调用各记一条 DEBUG——写的是持久状态，"哪个
+// 工作目录上的哪个 Agent"排障时要能一句话答上来（prod 默认关闭，见工程规范 §4）。
+// Errors travel through unchanged; the fix-up-free forwarding is the whole point of
+// the adapter. The injected logger carries the configured profile into the loader's
+// per-agent WARN lines, and the work directory gives the write-mode debug lines the
+// one fact the workspace root does not carry: which instance the command ran in.
+type agentsPort struct {
+	// WorkDir 是命令跑在哪个目录（实例配置 basalt.yaml 所在层）——写模式日志的上下文。
+	// WorkDir is the directory the command ran in, where basalt.yaml lives.
+	WorkDir string
+
+	// Logger 是装配层注入的日志器（带配置档位）；nil 时回落进程默认档。
+	// Logger is the injected logger; a nil falls back to the process default.
+	Logger *slog.Logger
+}
+
+// List 转调装载器：provider 名集由调用方显式传入（适配器**不**另读一次配置）。
+// List forwards to the loader with the provider names passed in explicitly; the
+// adapter never re-reads the configuration file.
+func (p agentsPort) List(root string, providers []string) ([]core.AgentEntry, error) {
+	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers: providers,
+		Logger:    p.logger(),
+	}).LoadAll(root)
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// Create 转调写模式创建（实现侧取实例锁）。
+// Create forwards to the write-mode create, which takes the instance lock.
+func (p agentsPort) Create(root, name string, providers []string) ([]string, error) {
+	p.logger().Debug("Agent 工作区创建", "workdir", p.WorkDir, "workspace", root, "agent", name)
+
+	created, err := workspace.CreateAgent(root, name, providers)
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+// Delete 转调写模式归档（实现侧取实例锁；now 由命令层显式传入）。
+// Delete forwards to the write-mode archive with the caller's clock.
+func (p agentsPort) Delete(root, name string, now time.Time) (string, error) {
+	p.logger().Debug("Agent 工作区归档", "workdir", p.WorkDir, "workspace", root, "agent", name)
+
+	archived, err := workspace.DeleteAgent(root, name, now)
+	if err != nil {
+		return "", err
+	}
+	return archived, nil
+}
+
+// logger 保证日志出口永远可用：适配器不因为缺日志器而 panic（缺省档与 cli 侧同口径）。
+// logger keeps the log outlet usable even when no logger was injected.
+func (p agentsPort) logger() *slog.Logger {
+	if p.Logger == nil {
+		return slog.Default()
+	}
+	return p.Logger
 }
