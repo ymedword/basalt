@@ -17,19 +17,19 @@ import (
 // Config 是 basalt.yaml 的解析结果。
 // Config is the parsed form of basalt.yaml.
 //
-// 已钉死键的段用类型化结构承载；键集尚未落位的段（sandbox / shell / memory /
-// author）以原始结构保留——消费它们的 US 落位前不预造键（颗粒度文档 §3.1 的
-// 「解析并保留」口径）。
+// 已钉死键的段用类型化结构承载；键集尚未落位的段（memory / author）以原始结构保留——
+// 消费它们的 US 落位前不预造键（颗粒度文档 §3.1 的「解析并保留」口径）。sandbox / shell /
+// http 三段自本 US 起落为结构（§3.5 第 4 项：**沿用既有键名**，不新增也不删除）。
 // Sections whose keys are fixed carry typed structures; sections whose key sets
 // are not yet decided keep their raw decoded shape so that no key is invented
-// ahead of the US that consumes it.
+// ahead of the US that consumes it. sandbox / shell / http became typed here.
 type Config struct {
 	HTTP      HTTPConfig       `yaml:"http"`
 	Log       LogConfig        `yaml:"log"`
 	Providers []ProviderConfig `yaml:"providers"`
 	Budget    BudgetConfig     `yaml:"budget"`
-	Sandbox   map[string]any   `yaml:"sandbox"`
-	Shell     map[string]any   `yaml:"shell"`
+	Sandbox   SandboxConfig    `yaml:"sandbox"`
+	Shell     ShellConfig      `yaml:"shell"`
 	Memory    map[string]any   `yaml:"memory"`
 	Author    map[string]any   `yaml:"author"`
 }
@@ -44,6 +44,46 @@ type HTTPConfig struct {
 	// MaxRequestBytes 是请求体总上限（缺省 1 MiB，解析前拒绝）。
 	// MaxRequestBytes caps the whole request body, enforced before parsing.
 	MaxRequestBytes int64 `yaml:"max_request_bytes"`
+
+	// AllowedDomains 是出网域名白名单（大小写不敏感）；空 = 一个都不放行。
+	// 键名出处 docs/Operations.md §2.2，**消费归 US-5** 的 http_get / http_post——
+	// 本 US 只把键从原始结构搬进类型化字段（消费者未落位不等于键可以晚配：
+	// 配置键的形状一变，运维侧就得改文件）。
+	// AllowedDomains is the outbound domain allowlist, consumed by US-5's network tools.
+	AllowedDomains []string `yaml:"allowed_domains"`
+}
+
+// SandboxConfig 是沙箱授权判定的配置面（`sandbox` 段）。
+// SandboxConfig is the sandbox section.
+//
+// 语义读者是 `WhitelistPolicy`（授权判定只看"谁、要碰什么"）：本结构只承载取值，
+// 判定规则不在这里——配置装载与策略求值分开，改规则不必改装载。
+// The values live here; the rules live in the policy that consumes them.
+type SandboxConfig struct {
+	// CrossAgentRead 是允许被**跨 Agent 读取**的 Agent 名清单；空 = 一个都不许
+	// （未授权即拒，拒绝文案点名本键——FR-011）。
+	// CrossAgentRead lists the agents readable across agent boundaries; empty denies all.
+	CrossAgentRead []string `yaml:"cross_agent_read"`
+}
+
+// ShellConfig 是受控子进程执行的配置面（`shell` 段）——三个键都是白名单，空即全拒。
+// ShellConfig is the controlled-subprocess section; every key is an allowlist.
+type ShellConfig struct {
+	// AllowedCommands 是命令白名单：executable **整串逐字**比对（多词串因此天然不命中）；
+	// 给 `bash` / `sh` 放行被硬性禁止——写进这里是配置错误，不是授权（在策略侧硬拒）。
+	// AllowedCommands matches the executable byte for byte; bash and sh are refused
+	// by the policy regardless of what the operator writes here.
+	AllowedCommands []string `yaml:"allowed_commands"`
+
+	// Interpreters 是受控解释器通道：只接受 `[脚本路径, 参数…]` 形态（argv 校验在执行侧）。
+	// Interpreters is the controlled interpreter channel; argv shape is checked at execution.
+	Interpreters []string `yaml:"interpreters"`
+
+	// EnvPassthrough 是透传给子进程的环境变量名白名单——不写进来的变量一律不继承
+	// （代理与凭证类变量因此默认不进子进程，FR-012）。
+	// EnvPassthrough names the variables handed to child processes; everything else,
+	// proxy and credential variables included, is dropped by default.
+	EnvPassthrough []string `yaml:"env_passthrough"`
 }
 
 // LogConfig 是日志档位——本 US 唯一消费的配置（键名经 2026-10-15 用户裁决：

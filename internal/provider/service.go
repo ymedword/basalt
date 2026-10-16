@@ -84,7 +84,7 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 		Round:      req.Round,
 		Provider:   req.Provider,
 		Model:      req.Model,
-		ConfigHash: req.ConfigHash, // 本 US 恒空（§2.4 裁决注 3）→ 列写 NULL
+		ConfigHash: req.ConfigHash, // 由运行入口运行期填充（US-4 起）；空则列写 NULL
 		CreatedAt:  time.Now(),
 	})
 	cancelBegin()

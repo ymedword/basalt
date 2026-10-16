@@ -47,7 +47,7 @@
 | 测试 | 标准库 `testing` + `github.com/stretchr/testify` **v1.12.1** | 断言可读；集成测试用 build tag 隔离 |
 | 格式 | `gofmt` + `mvdan.cc/gofumpt` **v0.12.0** | 门禁 `gofmt -l` 零输出 |
 | 静态检查 | `go vet` + `honnef.co/go/tools`（staticcheck）**v0.8.2** | 可选汇总入口 `golangci-lint` **v2.14.0** |
-| 安全扫描 | `gosec` **v2.29.0** + `govulncheck`（`golang.org/x/vuln` **v1.9.0**） | 静态安全 + 依赖漏洞，双轨 |
+| 安全扫描 | `gosec` **v2.29.0** + `govulncheck`（`golang.org/x/vuln` **v1.9.0**） | 静态安全 + 依赖漏洞，双轨。gosec **不得**用 `go install ...@v2.29.0` 装：它自带的 `golang.org/x/tools` **v0.49.0** 读不了 Go 1.27 的导出数据（版本 5 > 最高支持 4），扫描静默降级、类型相关规则整批失效；构建**必须**钉 `golang.org/x/tools` **v0.50.0**——配方与探针读数见[起步手册 §2.5](GettingStarted.md)，CI 同一配方 |
 | 构建 | `go build`（`CGO_ENABLED=0`、`-trimpath`、`-ldflags "-s -w -X main.version=..."`） | 交叉编译矩阵见 §10.2 |
 | 官网展示主页 | `vitepress` **v1.6.4** + Node（**仅构建期**，不进单二进制） | `website/` 静态站点（US-13）；2026-10-14 经 npm registry 核实 |
 

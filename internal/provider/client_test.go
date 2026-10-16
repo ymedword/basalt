@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -609,6 +611,191 @@ func TestOpenAIClient_CancelOrDeadlineDuringResponseReadStaysTimeout(t *testing.
 			require.Contains(t, callErr.Message, "未取完响应", "文案点名阶段，与传输失败（未取得响应）区分")
 		})
 	}
+}
+
+// readFileSchema / listDirSchema 是 U1 用的两份工具 schema：键序**故意不是字典序**
+// （`type` 打头、`additionalProperties` 收尾）——逐字透传的实现会原样回发，解析后重序列化
+// 的实现会把它排成字典序，本用例因此分得出"RawMessage 透传"与"解析再编"。
+// readFileSchema / listDirSchema carry deliberately non-alphabetical key order, so the
+// verbatim-passthrough case is distinguishable from a parse-and-re-encode implementation.
+const (
+	readFileSchema = `{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`
+	listDirSchema  = `{"type":"object","properties":{"path":{"type":"string"}}}`
+)
+
+// TestOpenAIClient_EncodesToolsInOutboundRequest —— 技术方案 §4.2 段 4 + 颗粒度文档 §2.4
+// 裁决注 3 的出站判据：带工具池时请求体**恰一个** `tools` 键，形如
+// `[{"function":{name,description,parameters},"type":"function"}]`（Function Calling 形态，
+// 经 go-openai 类型编解码），按声明顺序排列、schema **逐字**透传。
+// TestOpenAIClient_EncodesToolsInOutboundRequest pins the single tools key, its Function
+// Calling shape, the declaration order and the byte-for-byte schema passthrough.
+func TestOpenAIClient_EncodesToolsInOutboundRequest(t *testing.T) {
+	base, rawBodies := captureRawRequests(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	client, err := provider.NewOpenAIClient(provider.Options{Name: "p", BaseURL: base, APIKey: "k"})
+	require.NoError(t, err)
+
+	_, err = client.Chat(context.Background(), core.ChatRequest{
+		Model:    "m",
+		Messages: []core.Message{{Role: core.RoleUser, Content: "hi"}},
+		Tools: []core.ToolSpec{
+			{Name: "read_file", Description: "读取工作区内的文件", Parameters: json.RawMessage(readFileSchema)},
+			{Name: "list_dir", Description: "列出目录（不递归）", Parameters: json.RawMessage(listDirSchema)},
+		},
+	})
+	require.NoError(t, err)
+
+	raw := rawBodies()
+	require.Len(t, raw, 1)
+	require.Equal(t, 1, strings.Count(raw[0], `"tools":`),
+		`出站体里 "tools" 只允许出现一次：%s`, raw[0])
+	require.Contains(t, raw[0], readFileSchema, "参数 schema 逐字透传（键序即判据：解析再编会排成字典序）")
+	require.Contains(t, raw[0], listDirSchema)
+	require.Less(t, strings.Index(raw[0], `"read_file"`), strings.Index(raw[0], `"list_dir"`),
+		"工具按声明顺序排列（不是 map 遍历顺序）")
+
+	var sent map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw[0]), &sent))
+	tools, ok := sent["tools"].([]any)
+	require.True(t, ok, "tools 必须是数组，实际 %T", sent["tools"])
+	require.Len(t, tools, 2)
+
+	first := tools[0].(map[string]any)
+	require.Equal(t, "function", first["type"])
+	fn, ok := first["function"].(map[string]any)
+	require.True(t, ok, "function 必须是对象，实际 %T", first["function"])
+	require.Equal(t, "read_file", fn["name"])
+	require.Equal(t, "读取工作区内的文件", fn["description"])
+	require.Equal(t, []string{"description", "name", "parameters"}, slices.Sorted(maps.Keys(fn)),
+		"function 对象只含三要素（不得混入库默认字段，如 strict）")
+
+	var wantSchema any
+	require.NoError(t, json.Unmarshal([]byte(readFileSchema), &wantSchema))
+	require.Equal(t, wantSchema, fn["parameters"], "parameters = 该工具的 InputSchema")
+}
+
+// TestOpenAIClient_OmitsToolsKeyWhenPoolIsEmpty —— **空池不带键 = 旧行为逐字不变**（颗粒度
+// 文档 §3.5 改造点 2 的软门禁）：nil 与空切片两种空池形态都不产出 `tools` 键，且两份出站体
+// **逐字相同**、整份请求体等于 US-2 以来的字面量（形态一旦被改动，本用例立刻判红）。
+// TestOpenAIClient_OmitsToolsKeyWhenPoolIsEmpty keeps the empty-pool body byte-identical to
+// what this client has always sent, for both the nil and the empty-slice pool.
+func TestOpenAIClient_OmitsToolsKeyWhenPoolIsEmpty(t *testing.T) {
+	base, rawBodies := captureRawRequests(t, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	client, err := provider.NewOpenAIClient(provider.Options{Name: "p", BaseURL: base, APIKey: "k"})
+	require.NoError(t, err)
+
+	msgs := []core.Message{{Role: core.RoleUser, Content: "hi"}}
+	_, err = client.Chat(context.Background(), core.ChatRequest{Model: "m", Messages: msgs})
+	require.NoError(t, err)
+	_, err = client.Chat(context.Background(), core.ChatRequest{Model: "m", Messages: msgs, Tools: []core.ToolSpec{}})
+	require.NoError(t, err)
+
+	raw := rawBodies()
+	require.Len(t, raw, 2)
+	require.NotContains(t, raw[0], `"tools"`, "空池（nil）不得带 tools 键")
+	require.NotContains(t, raw[1], `"tools"`, "空池（空切片）不得带 tools 键——判据是长度，不是 nil")
+	require.Equal(t, raw[0], raw[1], "两种空池形态的出站体逐字相同")
+
+	// 字面量取自**本机实测**（库基座 ChatCompletionRequest 的 `stream` 无 omitempty，
+	// 故恒以 false 出现）：空池请求体 = US-2 以来的字面量，形态变化必须连同本判据复核。
+	const legacyBody = `{"messages":[{"content":"hi","role":"user"}],"model":"m","stream":false}`
+	require.Equal(t, legacyBody, raw[0],
+		"空池请求体 = US-2 以来的字面量；形态变化必须连同本判据一起被审视（库升级同理）")
+}
+
+// TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip —— 技术方案 §4.4 三条硬约束的
+// 客户端侧（颗粒度文档 §4.2 映射表：U3 对号 `tool_call_id` / `reasoning_content`）：入站
+// `tool_calls` 映射到 `core.ToolCall`（id / name 显式列、arguments **原样保留为字符串**），
+// 两跳之后出站体里 `tool_calls` / `reasoning_content` / `tool_call_id` 逐字仍在——
+// 清空思考内容会让供应商返回 400（Compatibility §5.3 判据 3）。
+// TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip: tool calls parse into the
+// explicit fields and all three round-trip fields survive the second hop verbatim.
+func TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip(t *testing.T) {
+	base, rawBodies := captureRawRequests(t,
+		`{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"think",`+
+			`"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file",`+
+			`"arguments":"{\"path\":\"notes.txt\"}"}}]}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+	client, err := provider.NewOpenAIClient(provider.Options{Name: "p", BaseURL: base, APIKey: "k"})
+	require.NoError(t, err)
+
+	resp, err := client.Chat(context.Background(), core.ChatRequest{
+		Model:    "m",
+		Messages: []core.Message{{Role: core.RoleUser, Content: "hi"}},
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.ToolCalls, 1)
+	require.Equal(t, "call-1", resp.ToolCalls[0].ID)
+	require.Equal(t, "read_file", resp.ToolCalls[0].Name)
+	require.Equal(t, `{"path":"notes.txt"}`, resp.ToolCalls[0].Arguments,
+		"arguments 是字符串，客户端不解析（执行权归 ToolExecutor）")
+	require.Equal(t, "think", resp.ReasoningContent)
+
+	// 第二跳：助手消息（含工具调用与思考内容）与工具结果消息一起回发。
+	_, err = client.Chat(context.Background(), core.ChatRequest{Model: "m", Messages: []core.Message{
+		{
+			Role: core.RoleAssistant, Content: resp.Content,
+			ToolCalls: resp.ToolCalls, ReasoningContent: resp.ReasoningContent,
+		},
+		{Role: core.RoleTool, Content: "文件内容：a", ToolCallID: resp.ToolCalls[0].ID},
+	}})
+	require.NoError(t, err)
+
+	raw := rawBodies()
+	require.Len(t, raw, 2)
+	require.Equal(t, 1, strings.Count(raw[1], `"tool_calls":`), `只允许一个 tool_calls 键：%s`, raw[1])
+	require.Contains(t, raw[1],
+		`"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"notes.txt\"}"}}]`,
+		"工具调用三要素（id / name / arguments）逐字回发")
+	require.Contains(t, raw[1], `"reasoning_content":"think"`,
+		"思考内容必须回传（清空即供应商 400——Compatibility §5.3 判据 3）")
+	require.Contains(t, raw[1], `"tool_call_id":"call-1"`,
+		"工具结果消息必须带回被回填的那次调用 id")
+}
+
+// TestOpenAIClient_RoundTripsVendorExtrasOnToolCallMessage —— 技术方案 §4.4 约束 3 的
+// 携带工具调用形态（颗粒度文档 §4.2 映射表：U4 对号 ProviderExtra 往返保真）：供应商扩展
+// 字段与 `tool_calls` 同处一条消息时两跳仍逐字；数字按**原始字面量**回发——默认解码把
+// 数字变 float64，`1e3` 会写成 `1000`、长小数会被截到 17 位有效数字，UseNumber 才留得住。
+// TestOpenAIClient_RoundTripsVendorExtrasOnToolCallMessage asserts the raw outbound JSON:
+// the decoded view would float64-ize the numbers and mask the very defect under test.
+func TestOpenAIClient_RoundTripsVendorExtrasOnToolCallMessage(t *testing.T) {
+	const (
+		exponentLiteral = `"retry_after":1e3`
+		preciseLiteral  = `"temperature":0.1234567890123456789`
+	)
+	base, rawBodies := captureRawRequests(t,
+		`{"choices":[{"message":{"role":"assistant","content":null,`+
+			`"tool_calls":[{"id":"call-7","type":"function","function":{"name":"read_file","arguments":"{}"}}],`+
+			`"vendor_sampling":{"temperature":0.1234567890123456789,"retry_after":1e3},`+
+			`"vendor_tag":"a b"}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+	client, err := provider.NewOpenAIClient(provider.Options{Name: "p", BaseURL: base, APIKey: "k"})
+	require.NoError(t, err)
+
+	resp, err := client.Chat(context.Background(), core.ChatRequest{
+		Model:    "m",
+		Messages: []core.Message{{Role: core.RoleUser, Content: "hi"}},
+	})
+	require.NoError(t, err)
+	require.Contains(t, resp.ProviderExtra, "vendor_sampling", "未知字段必须进透传位")
+	require.Equal(t, "a b", resp.ProviderExtra["vendor_tag"])
+	require.Len(t, resp.ToolCalls, 1)
+
+	_, err = client.Chat(context.Background(), core.ChatRequest{Model: "m", Messages: []core.Message{{
+		Role: core.RoleAssistant, Content: resp.Content,
+		ToolCalls: resp.ToolCalls, ProviderExtra: resp.ProviderExtra,
+	}}})
+	require.NoError(t, err)
+
+	raw := rawBodies()
+	require.Len(t, raw, 2)
+	require.Contains(t, raw[1], exponentLiteral, "指数写法按原字面量回发（float64 会写成 1000）：%s", raw[1])
+	require.NotContains(t, raw[1], "1000", "不得退化成 float64 的可表示值")
+	require.Contains(t, raw[1], preciseLiteral, "长小数逐位保真（float64 只留 17 位有效数字）")
+	require.Contains(t, raw[1], `"vendor_tag":"a b"`)
+	require.Contains(t, raw[1], `"name":"read_file"`,
+		"扩展字段与工具调用同处一条消息时互不顶替（额外键不得盖掉已知字段）")
 }
 
 // 编译期断言：客户端形态与本 US 的契约面一致（用例经 NewOpenAIClient 构造，此处再钉一次）。

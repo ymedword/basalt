@@ -93,6 +93,20 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, target int) error {
 	})
 }
 
+// Migrate 是机制层 Migrate 的 *DB 形态（**装配面**）：持锁重路径（US-4 起）手里只有
+// 从 OpenWritable 拿到的句柄，写池 `DB.write` 与嵌入源 `schemaFS` 都不出包。
+// DB.Migrate is the assembly-facing form of the machinery function; the write pool and
+// the embedded schema source stay inside this package.
+//
+// 只读句柄（write 为 nil）在这里**显式拒绝**，而不是让它崩在一句 nil 解引用上。
+// A read-only handle is refused explicitly instead of panicking on a nil pool.
+func (db *DB) Migrate(ctx context.Context, target int) error {
+	if db == nil || db.write == nil {
+		return errors.New("storage: 只读句柄没有写池，不得迁移（先经 OpenWritable 取得写模式句柄）")
+	}
+	return Migrate(ctx, db.write, schemaFS, target)
+}
+
 // createNewDatabase 走新库分支：建表脚本全量执行 + 写入版本行。
 // createNewDatabase runs the full schema script and records the version row.
 //

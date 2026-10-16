@@ -1,0 +1,81 @@
+# 读数：业务结果 —— 多步工具链（先列目录、再读其中一个文件）跑完后，
+# 最终回答是否用上了**第二步**读到的内容。判据：tool_sequence 逐位相等（顺序也是断言的一部分）、
+# 最终文本含目标文件里的事实、两条审计行各自 success。
+id: outcome-list-and-read
+kind: 业务结果
+provider: ""
+description: 两步工具链（list_dir → read_file）——期望顺序正确、最终回答用上第二步读到的内容
+message: 先看看 reports 目录里有哪些文件，再读 alpha.md，告诉我它的发布窗口。
+fixture:
+  agent: lister-agent
+  agent_md: |
+    ---
+    name: lister-agent
+    description: 评测夹具——业务结果读数
+    provider:
+      name: probe
+      model: eval-probe-model
+    tools:
+      - list_dir
+      - read_file
+    settings:
+      max_iterations: 10
+    ---
+
+    你是评测夹具 Agent：先列目录再读文件，最后用一句话回答。
+  files:
+    reports/alpha.md: |
+      # Alpha 报告
+      发布窗口：周三 22:00。
+    reports/beta.md: |
+      # Beta 报告
+      发布窗口：周五 22:00。
+budget:
+  max_iterations: 5
+  max_tool_calls: 8
+  context_tokens: 32768
+script:
+  - content: 先列一下 reports 目录。
+    usage:
+      prompt: 150
+      completion: 16
+      total: 166
+    tool_calls:
+      - id: call-list-1
+        name: list_dir
+        arguments: '{"path": "reports"}'
+  - content: 目录里有两个文件，我读 alpha.md。
+    usage:
+      prompt: 260
+      completion: 22
+      total: 282
+    tool_calls:
+      - id: call-read-2
+        name: read_file
+        arguments: '{"path": "reports/alpha.md"}'
+  - content: alpha.md 的发布窗口是周三 22:00。
+    usage:
+      prompt: 340
+      completion: 20
+      total: 360
+expect:
+  status: completed
+  tool_sequence:
+    - list_dir
+    - read_file
+  text_contains:
+    - 周三 22:00
+  tool_results_contain:
+    # 第一步读数的证据：目录列表里点名了两个文件。
+    - alpha.md
+    - beta.md
+    # 第二步读数的证据：文件正文被原样喂回模型。
+    - 发布窗口：周三
+  audit:
+    - tool_call_id: call-list-1
+      status: success
+    - tool_call_id: call-read-2
+      status: success
+  llm_calls: 3
+  min_total_tokens: 808
+  usage_complete: true

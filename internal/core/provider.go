@@ -55,13 +55,14 @@ type ChatRequest struct {
 	RunID      string // 审计关联单位（契约 §7.1）；空 = 拒绝发出（NOT NULL 列的语义位）
 	SessionID  string // 可空（列允许 NULL）
 	Round      int    // 该 Run 内第几轮（1 起）
-	ConfigHash string // 配置快照 hash；本 US 恒空（§2.4 裁决注 3）
+	ConfigHash string // 配置快照 hash；US-4 起由运行入口**运行期填充**，空则列写 NULL（§2.4 裁决注 3）
 
 	// —— 协议内容（ProviderClient 消费）——
 	// Protocol payload, consumed by ProviderClient.
 
-	Model    string    // 空 = 用供应商缺省模型（models 映射）
-	Messages []Message // 完整消息模型（含 tool_calls / reasoning_content，原样发出）
+	Model    string     // 空 = 用供应商缺省模型（models 映射）
+	Messages []Message  // 完整消息模型（含 tool_calls / reasoning_content，原样发出）
+	Tools    []ToolSpec // 工具定义（Function Calling 形态）；**空 = 请求体不带 tools 键**（客户端行为逐字不变）
 }
 
 // ChatResponse 是一次调用的返回（usage 可空；tool_calls 只透传，执行权归 US-4 的 ToolExecutor）。
@@ -144,6 +145,30 @@ type LLMCallResult struct {
 	Duration         time.Duration
 	ErrorMessage     string    // 截断 4 KB 的责任在 storage（§3.4）
 	ErrorKind        ErrorKind // 失败必填（契约 §7.3）；成功留空 → 列写 NULL
+}
+
+// LLMCallView 是审计行的**只读视图**（评测基座读 token 用量与行状态用）：只带读面需要的
+// 字段——轮号 / 状态 / token 三列——不把整行搬进 core（审计列面归 storage）。
+// **不带时间列**：用量读数与时长无关，多一列就多一处对不上契约的漂移点。
+// LLMCallView is the read-only view of an audit row: exactly the fields the usage reader
+// needs, so the column surface of llm_calls stays inside storage.
+type LLMCallView struct {
+	Round            int           // 该 Run 内第几轮（1 起）
+	Status           LLMCallStatus // 四值：pending / success / failed / unknown
+	PromptTokens     int           // 三列平铺，与审计表列同构；全 0 = 供应商未回 usage
+	CompletionTokens int
+	TotalTokens      int
+}
+
+// LLMCallReader 是 llm_calls 的**只读**查询面（评测基座 `evals` 消费：token 用量与
+// 「计量不完整」判定的唯一来源）。写路径仍只有 `LLMCallStore` 一条——读面单独成接口，
+// 写入方就不可能顺手拿到它。
+// LLMCallReader is the read-only query surface of llm_calls. The write path stays with
+// LLMCallStore; a separate read interface keeps writers from reaching for it.
+type LLMCallReader interface {
+	// CallsByRun 按轮号升序取该 Run 的全部模型调用行；该 Run 无行时返回空切片而非错误。
+	// CallsByRun returns every call of one run in round order; no rows is empty, not an error.
+	CallsByRun(ctx context.Context, runID string) ([]LLMCallView, error)
 }
 
 // LLMCallStore 是 ProviderService 消费的审计仓储接口（接口定义在消费方 core，实现放 storage）。

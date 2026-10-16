@@ -105,7 +105,7 @@ func NewOpenAIClient(opts Options) (*OpenAIClient, error) {
 // Chat performs exactly one call: build the body, POST once, parse the response. Every
 // failure leaves through a CallError.
 func (c *OpenAIClient) Chat(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
-	body, err := c.buildRequestBody(req.Model, req.Messages)
+	body, err := c.buildRequestBody(req.Model, req.Messages, req.Tools)
 	if err != nil {
 		// 请求体组装失败是**本仓**的问题（不是供应商的），故归 unknown 而不是 external_error。
 		// A body assembly failure is ours, not the provider's.
@@ -213,9 +213,13 @@ func (c *OpenAIClient) statusError(status int, body []byte) *CallError {
 // buildRequestBody 组装出站信封：以库的请求类型为**已知字段基座**（model / stream 等），
 // 再把 `messages` **显式覆盖**为我们自己编好的数组——不依赖 Go 结构体的字段仲裁，
 // 出站体里 `"messages"` 只此一份（判据见 TestOpenAIClient_RequestEnvelopeKeepsSingleMessagesKey）。
+// `tools` 同理：**空池不带该键**（旧行为逐字不变——工具池为空时"没有工具"与"没传工具"
+// 对供应商是同一件事，改出站形态会让所有既有请求体变样）。
 // buildRequestBody uses the library request as the known-field base and then explicitly
-// overrides the messages key, so the envelope carries exactly one such key.
-func (c *OpenAIClient) buildRequestBody(model string, msgs []core.Message) ([]byte, error) {
+// overrides the messages key, so the envelope carries exactly one such key. The tools
+// key appears only when the pool is non-empty, keeping the empty-pool body byte-identical
+// to what this client has always sent.
+func (c *OpenAIClient) buildRequestBody(model string, msgs []core.Message, tools []core.ToolSpec) ([]byte, error) {
 	base, err := json.Marshal(openai.ChatCompletionRequest{Model: model})
 	if err != nil {
 		return nil, err
@@ -235,7 +239,38 @@ func (c *OpenAIClient) buildRequestBody(model string, msgs []core.Message) ([]by
 	}
 	envelope["messages"] = rawMessages
 
+	if len(tools) > 0 {
+		rawTools, err := json.Marshal(encodeTools(tools))
+		if err != nil {
+			return nil, err
+		}
+		envelope["tools"] = rawTools
+	}
+
 	return json.Marshal(envelope)
+}
+
+// encodeTools 把工具定义编成 Function Calling 形态（协议形状 `[{"type":"function",
+// "function":{...}}]`；库的 `Tool.MarshalJSON` 走 map 序列化，出站体的键序是
+// `function` 在前、`type` 在后——同形不同序，判据看**解码后的形状**与 schema 的逐字字节）；
+// `Parameters` 是工具自己的 JSON Schema，**原样透传**——解析后重序列化会改键序与数字形状
+// （与 ToolCall.Arguments 同一条纪律）。
+// encodeTools renders the Function Calling shape; the library serializes the object
+// through a map, so key order is function-then-type, and the schema passes through
+// untouched byte for byte.
+func encodeTools(specs []core.ToolSpec) []openai.Tool {
+	encoded := make([]openai.Tool, 0, len(specs))
+	for _, spec := range specs {
+		encoded = append(encoded, openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        spec.Name,
+				Description: spec.Description,
+				Parameters:  spec.Parameters,
+			},
+		})
+	}
+	return encoded
 }
 
 // encodeMessages 把消息模型编成协议对象：**已知字段 + 透传位平铺**（未知键以原名原值回到

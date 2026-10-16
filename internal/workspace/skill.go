@@ -38,12 +38,17 @@ const (
 	skillLibraryPrefix = ".basalt/skills"
 )
 
-// skillCard 是段一的 L1 卡片三要素（技术方案 §11.3：name + description + 技能库真路径）。
-// skillCard is the L1 card: name, description and the true skill-library path.
+// skillCard 是段一的 L1 卡片三要素（技术方案 §11.3：name + description + 技能库真路径），
+// 外加两件读取产物：清单路径与原始字节——快照的 `{path, sha256}` 必须与**这张卡片**
+// 出自同一次读取（§2.2 约束 7「注入内容与哈希共享同次读取产物」），故随卡片带出。
+// skillCard is the L1 card (three display elements) plus the read artefacts the
+// snapshot manifest needs from the very same read.
 type skillCard struct {
-	name        string // SKILL.md frontmatter name；缺失回落技能目录名（声明即绑定以目录名为准）
-	description string // SKILL.md frontmatter description；缺失为空串（契约 §2.1 无此校验规则——不发明）
-	path        string // 逐字 .basalt/skills/<name>/SKILL.md（技术方案 §11.3 字面量）
+	name         string // SKILL.md frontmatter name；缺失回落技能目录名（声明即绑定以目录名为准）
+	description  string // SKILL.md frontmatter description；缺失为空串（契约 §2.1 无此校验规则——不发明）
+	path         string // 逐字 .basalt/skills/<name>/SKILL.md（技术方案 §11.3 字面量）
+	relativePath string // 相对工作区根的读取路径 skills/<目录名>/SKILL.md——清单的 path 列（按**声明名**，frontmatter name 改了也不动它）
+	raw          []byte // 同一份读取的原始字节——清单条 sha256 的来源
 }
 
 // skillRelativePath 给出技能定义相对**工作区根**（.basalt/）的路径——只用于文案与
@@ -152,6 +157,10 @@ func skillCardFor(lib *os.Root, name string) (skillCard, error) {
 	card := skillCard{
 		name: name, // 缺省 = 技能目录名（声明即绑定以目录名为准）
 		path: skillCardPath(name),
+		// 清单路径按**声明名**（卡片显示名可被 frontmatter 覆盖，读取路径不受影响）；
+		// raw 与 rel 同源：这条 sha256 对应的正是进段一那一份字节。
+		relativePath: rel,
+		raw:          raw,
 	}
 
 	front, _, err := splitFrontmatter(raw)

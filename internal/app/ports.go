@@ -134,3 +134,48 @@ func (p agentsPort) logger() *slog.Logger {
 	}
 	return p.Logger
 }
+
+// runServicePort 把 core.AgentService（唯一运行入口）适配成 cli.RunService。
+// runServicePort adapts the run entry point to the command surface's port.
+//
+// 这一层**不做任何事**——不改写请求、不翻译错误、不加超时：`core` 的返回语义本就与端口
+// 同源（调用方问题走 error、运行期失败走 `RunResult.Status`，契约 §1.2），适配器一旦
+// "顺手"加工，两层语义立刻开始分叉。本类型是**接缝**而不是工厂：装配（wire.go）给出
+// 实例，命令面只认接口。
+// The adapter is a seam, not a factory: it forwards verbatim, because the return
+// semantics of core and the port are the same by design.
+type runServicePort struct {
+	service *core.AgentService
+}
+
+// Run 转调唯一运行入口：准入、装配、循环、收尾全在 core 之内。
+// Run forwards to the single run entry point.
+func (p runServicePort) Run(ctx context.Context, req core.RunRequest) (core.RunResult, error) {
+	return p.service.Run(ctx, req)
+}
+
+// sessionListerPort 把 storage.SessionStore 适配成 cli.SessionLister（**只读**端口：
+// `session list` 与 `chat` 的历史读取，写路径不在这里——追加的唯一出口在 core）。
+// sessionListerPort adapts the session store to the read-only port.
+type sessionListerPort struct {
+	store *storage.SessionStore
+}
+
+// ListSessions 转调会话清单（排序与去重是实现侧的事，端口保序）。
+// ListSessions forwards the session list; ordering stays the implementation's call.
+func (p sessionListerPort) ListSessions(ctx context.Context) ([]core.SessionRecord, error) {
+	return p.store.ListSessions(ctx)
+}
+
+// Messages 转调一个会话的完整历史。
+// Messages forwards one session's full history.
+func (p sessionListerPort) Messages(ctx context.Context, sessionID string) ([]core.Message, error) {
+	return p.store.Messages(ctx, sessionID)
+}
+
+// 编译期断言：端口形状与实现签名一旦对不上，在这里先红——不是在装配处报"缺方法"。
+// Compile-time assertions: the ports and the implementations must match here first.
+var (
+	_ cli.RunService    = runServicePort{}
+	_ cli.SessionLister = sessionListerPort{}
+)

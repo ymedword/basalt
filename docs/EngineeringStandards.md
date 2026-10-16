@@ -63,7 +63,7 @@
 - **同步执行模型**（宪法第 7 条；CRC: Synchronous Functions）：**不得**引入异步编排 / 后台任务框架；启出的 goroutine 必须能说清"何时退出"，说不清就不起（CRC: Goroutine Lifetimes）
 - `context.Context` **必须**是函数的第一个参数（`func F(ctx context.Context, …)`）；**不得**把 context 存进结构体字段——签名受接口（标准库 / 第三方）强制的除外（CRC: Contexts）
 - `context` 只承载取消 / 截止 / 追踪标识（trace id）；Profile / Session 等业务状态**必须**显式类型化传递（`RunRequest` / `RunEnv`）；**不得**用包级变量模拟 ThreadLocal。复核：grep `context.WithValue` 命中处逐处确认为追踪标识（陷阱表 §7 第 24 条）
-- **时区纪律**：库内时间一律 UTC（Unix 毫秒，[schema.sql](contracts/schema.sql) 迁移纪律 4）；代码**不得**依赖进程本地时区（禁 `time.Local` 做隐式换算），需要地方时区处按显式配置的 IANA 名（`zone` 字段）换算；时区数据库经 `time/tzdata` 内嵌（US-1）。症状：开发机 CST、容器 UTC，展示 / 定时触发差 8 小时；复核：grep `time.Local` 零命中（本仓已有纪律——`/module-dev` 收尾全局不变量第 7 条）。来源：本仓全局不变量 + NivroOS 同源条款（zone 默认 UTC、禁 `ZoneId.systemDefault()`）+ 时区内嵌口径（编程指南 §3.2）
+- **时区纪律**：库内时间一律 UTC（Unix 毫秒，[schema.sql](contracts/schema.sql) 迁移纪律 4）；代码**不得**依赖进程本地时区（禁 `time.Local` 做隐式换算），需要地方时区处按显式配置的 IANA 名（`zone` 字段）换算；时区数据库经 `time/tzdata` 内嵌（US-1）。症状：开发机 CST、容器 UTC，展示 / 定时触发差 8 小时；复核：`grep -rnE "time\.Local|[.]Local[(][)]|time\.Now[(][)]\.Location[(][)]" --include='*.go' .` 零命中（本仓已有纪律——`/module-dev` 收尾全局不变量第 7 条；**`.Local()` 与 `time.Local` 一并判**——2026-10-16 实测 `session list` 渲染路径用 `.Local()` 躲过了只查字面的旧判据，见陷阱 #10）。来源：本仓全局不变量 + NivroOS 同源条款（zone 默认 UTC、禁 `ZoneId.systemDefault()`）+ 时区内嵌口径（编程指南 §3.2）
 
 ### 1.7 依赖与版本
 

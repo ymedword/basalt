@@ -147,8 +147,36 @@ gcc --version
 ```bash
 go install mvdan.cc/gofumpt@v0.12.0
 go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
-go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+# gosec **不得**用 `go install ...@v2.29.0` 装——见下方「gosec 的构建配方」。
+```
+
+#### gosec 的构建配方（2026-10-16 实测踩到）
+
+`go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0` 装出来的二进制**在 Go 1.27 上读不了导出数据**：它带的 `golang.org/x/tools` **v0.49.0** 最高只认导出数据版本 4，而 go1.27.2 的编译器**无条件**写版本 5（源码读数：`$(go env GOROOT)/src/cmd/compile/internal/noder/unified.go` 的 `const uirVersion = pkgbits.V5`，对应 `pkgbits` 的 `V5 Version` 条目）。
+
+后果不是报错停下，而是**静默降级**——扫描器只按语法树判，类型相关规则整批失效。2026-10-16 的探针读数（三处明摆着的违规：`uint32(int)` 窄化、`os.ReadFile` 变量路径、`0644` 写入）：
+
+| 扫描器 | 探针命中 | 仓库命中 | 「无法解析导出数据」报错 |
+| --- | --- | --- | --- |
+| `go install` 装出的 v2.29.0（x/tools v0.49.0） | **1 / 4** | 不报错也不命中——**读数不可信** | 探针侧 3 条；仓库侧时有时无 |
+| 按下方配方构建（x/tools v0.50.0） | **4 / 4** | 0 命中（本轮修复后） | 零 |
+
+结论一句话：**命中数不能证明扫描完整**——同一个二进制既会打印「cannot decode … version 5 is greater than maximum supported version 4」，也会一声不吭地漏掉三条规则。配方固定 `gosec v2.29.0 + golang.org/x/tools v0.50.0`，在任意临时模块里构建：
+
+```bash
+mkdir -p "$(go env GOPATH)/tmp/gosec-build" && cd "$(go env GOPATH)/tmp/gosec-build"
+go mod init basalt-gosec-build
+go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+go get golang.org/x/tools@v0.50.0
+go build -o "$(go env GOPATH)/bin/gosec$(go env GOEXE)" github.com/securego/gosec/v2/cmd/gosec
+```
+
+装完的**来源判据**（两道都要看，`Version: dev` 是 `go build` 的正常读数）：
+
+```bash
+go version -m "$(go env GOPATH)/bin/gosec$(go env GOEXE)" | grep -E "gosec/v2|x/tools"
+# 期望两行：mod github.com/securego/gosec/v2 v2.29.0 …／dep golang.org/x/tools v0.50.0 …
 ```
 
 它们装进 `$(go env GOPATH)/bin`（默认 `C:\Users\<你>\go\bin`）。**这个目录不在默认 PATH 里**，先查出实际路径：
@@ -478,10 +506,15 @@ US-1 → US-2 → US-3 → US-4 ─→ US-5 ─→ US-9 → US-10 → US-11 → 
 - 第 3 节：`git init -b main` + 三个仓库级配置文件 + 首个 commit 落地（53 文件 / 12,033 行）；`git status --short` 空；`git ls-files --eol` 的 w/ 列全为 lf（唯一非 lf = 二进制 png，属预期）；spec-kit CLI 生成的 5 个 `.specify/` JSON **原为 CRLF**，已规整为 LF（3.1 / 3.2 / 3.4）
 - `git check-attr text -- docs/TechnicalSolution.md` 实测返回 **`text: auto`**：3.4 原文期望的 `text: set` 与 3.1 给定的 `.gitattributes` 内容（`* text=auto eol=lf`）对不上——`auto` 才是该内容的读回值，改成 `set` 会把二进制也按文本处理（错误方向），**判据以实测为准**（3.4 已注）
 
+**已实测（2026-10-16，US-4 收口复核）**：
+
+- **gosec 重装（2.5 配方修正）**：原 `go install ...@v2.29.0` 的二进制带 `x/tools v0.49.0`，在 Go 1.27 上读不了导出数据（探针读数 4 条违规只报 1 条、仓库侧时而不报错也不命中）→ 按 2.5 配方重建为 `gosec v2.29.0 + x/tools v0.50.0`（`go version -m` 两行读数已核；探针 4/4、仓库 0 命中且零解码报错）
+- `make check` 整条：修 sec 之前读数 **exit 2**（`sec` 目标失败，gosec 5 条：G101×2 / G304×2 / G306×1）；修复后 **exit 0**（七目标全绿，`govulncheck` 报 `No vulnerabilities found.`）
+- 11 条全局不变量复核中，不变量 7（禁用进程本地时区）**一度判红**：旧判据只查 `time.Local` 字面量，3 处命中于 `internal/cli/session_test.go` 夹具；`internal/cli/session.go` 渲染路径的 `.Local()` 是同一条禁令的另一种写法、**躲过了旧判据**（用户裁决：判据扩展 + 实现改 UTC，不设例外、不收窄范围）。修复后按扩展判据（并入 `.Local()` 与 `time.Now().Location()`）复核**零命中**；测试改用 UTC 夹具 + 一个显式非 UTC 固化时区夹具验证换算
+
 **仍未实测（首次执行时以实际输出为准，并把读数回写本节）**：
 
 - 原生 make 在 Git Bash 下调用配方的 shell 归属（第 7 节倒数第四行）
-- `make check` 整条（依赖 US-1 交付的 Makefile）
 - 推送到 GitHub 后的 CI（`.github/workflows/` 属 US-1 交付物，尚未交付）
 
 **已决（2026-10-15，用户裁决）**：第 4 节原型五链路的执行时机 = **口径丙**（乙 + US-1 小探针，见 §4 文末裁决记录）——**分阶段执行，不阻塞 US-2 / US-3 开工**。

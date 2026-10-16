@@ -142,7 +142,7 @@ implement 期间逐任务执行，附加门禁：
   处理）；④安全类（gosec）报警按编程指南 §7 陷阱表对应条目修（如 `http.Server`
   四超时必设、路径白名单必须真实路径投影后再比前缀）；⑤不为"消灭告警"牺牲可观测
   性（错误路径 WARN 日志与审计落库两者都要）。**案例不在此内嵌**——复核方式一律
-  指 `docs/AiProgrammingGuide.md` §7 陷阱表（52 条，每条带"怎么发现"与"怎么
+  指 `docs/AiProgrammingGuide.md` §7 陷阱表（55 条，每条带"怎么发现"与"怎么
   复核"）。核心逻辑实现必须与颗粒度文档第 2 节的「核心逻辑」流程图/伪代码
   **逐块对照落地**（同构性核对，签名逐字一致）。**注释语言**（遵循项目 CLAUDE.md
   约定）：正文中文为主，英文标识符/术语保留原文不翻译；**关键注释（包级 /
@@ -313,9 +313,11 @@ implement 期间逐任务执行，附加门禁：
 4. 凭证零明文：配置与代码中的凭证一律 `${ENV_VAR}` 占位，加载期未解析残留即拒（点名配置键）；`grep -rnE "sk-[A-Za-z0-9]{16,}" --include='*.go' --include='*.yaml' .` 零命中
 5. 无 ORM / 无自动迁移：`grep -nE "gorm|entgo|ent\.io|xorm" go.mod` 零命中；建表与迁移只在 `schema.sql` + `schema_version`（已发布迁移只追加、不改写）
 6. 单二进制：`CGO_ENABLED=0 go build ./...` 通过（`-race` 不在该命令内）
-7. 时区禁用词：`grep -rn "time.Local\|time.Now().Location()" --include='*.go' .` 零命中（调度 zone 缺省 UTC、Agent 配置显式 zone）
+7. 时区禁用词：`grep -rnE "time\.Local|[.]Local[(][)]|time\.Now[(][)]\.Location[(][)]" --include='*.go' .` 零命中（调度 zone 缺省 UTC、Agent 配置显式 zone；**`.Local()` 是同一条禁令的另一种写法**——对 `time.Time` 值调 `.Local()` 与写 `time.Local` 一样语义上依赖进程本地时区，只是躲过了字面 grep：2026-10-16 实测 `internal/cli/session.go` 的渲染路径就是这种漏网写法）
 8. 随机源红线：`grep -rn '"math/rand' --include='*.go' cmd internal` 零命中——密钥 / 令牌 / 随机标识一律 `crypto/rand`（EngineeringStandards §1.8；gosec G404 复核）
 9. 点导入零命中：`grep -rnE '^import[[:space:]]+\.|^[[:space:]]+\.[[:space:]]*"' --include='*.go' cmd internal` 零命中——`import .` 只在测试的循环依赖特例允许（EngineeringStandards §1.3）
+10. `core` 只依赖标准库：`GOPROXY=https://goproxy.cn go list -f '{{.Imports}}' ./internal/core` 只出标准库包名（零第三方路径、零 `github.com/ymedword/basalt/internal/...`；登记读数 `[context errors time]`）——`core` 自 US-4 起首次有可执行语句，架构约束「核心抽象与引擎只依赖标准库」自该 US 起按此判据复核（技术方案 §10.1 三条包纪律之一）
+11. LLM 审计入口唯一：`grep -rn '\.BeginCall(' --include='*.go' internal/core` 零命中（登记读数：零命中）——两阶段审计（`pending` 预写 / 终态回填）只由 `internal/provider` 的 `ProviderService` 调用；`core` 只**声明** `LLMCallStore` 接口、**不得**出现调用点（宪法 II / V：审计写入路径唯一、运行引擎不自建第二套）
 
 ### 语法禁区
 

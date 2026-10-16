@@ -1,0 +1,62 @@
+# 读数：资源用量 —— 一次运行的两轮调用各自落审计行，token 用量与被调次数来自审计读数，
+# 不是另建一套统计。判据：llm_calls（审计行数）+ min_total_tokens（三列求和的下界）
+# + usage_complete（两轮都成功且都回了用量 → 计量完整）。
+# 本读数只称"资源用量"，**不换算金额**——金额不在本项目的数据模型里。
+id: usage-token-accounting
+kind: 资源用量
+provider: ""
+description: 一次运行两轮模型调用——期望审计行数 2、token 总量 ≥ 各轮用量之和、计量完整
+message: 读一下 report.txt，然后总结里面的本季度用量。
+fixture:
+  agent: usage-agent
+  agent_md: |
+    ---
+    name: usage-agent
+    description: 评测夹具——资源用量读数
+    provider:
+      name: probe
+      model: eval-probe-model
+    tools:
+      - read_file
+    settings:
+      max_iterations: 10
+    ---
+
+    你是评测夹具 Agent：读取文件后给出简短总结。
+  files:
+    report.txt: |
+      季度用量报告
+      本季度用量：390 台
+budget:
+  max_iterations: 3
+  max_tool_calls: 5
+  context_tokens: 32768
+script:
+  - content: 我读一下 report.txt。
+    usage:
+      prompt: 300
+      completion: 40
+      total: 340
+    tool_calls:
+      - id: call-report-1
+        name: read_file
+        arguments: '{"path": "report.txt"}'
+  - content: report.txt 里写着本季度用量 390 台。
+    usage:
+      prompt: 420
+      completion: 60
+      total: 480
+expect:
+  status: completed
+  tool_sequence:
+    - read_file
+  text_contains:
+    - 390
+  tool_results_contain:
+    - 本季度用量
+  audit:
+    - tool_call_id: call-report-1
+      status: success
+  llm_calls: 2
+  min_total_tokens: 820
+  usage_complete: true
