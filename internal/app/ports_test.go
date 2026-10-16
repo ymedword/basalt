@@ -1,17 +1,20 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/testutil"
+	"github.com/ymedword/basalt/internal/workspace"
 )
 
 // 本文件的被测面是装配层的**适配器**（ports.go）：它们是"实现包 ↔ 命令行端口"之间
@@ -107,6 +110,119 @@ func TestWorkspacePort_InitErrorForwarded(t *testing.T) {
 	require.Error(t, err, "父路径是文件时必须失败")
 	require.Nil(t, created)
 	require.Nil(t, kept)
+}
+
+// writeAgentDir 在给定工作区根下造一个 Agent 目录（内容由调用方给定）。
+// writeAgentDir lays down one agent directory under the workspace root.
+func writeAgentDir(t *testing.T, root, name, content string) {
+	t.Helper()
+
+	dir := filepath.Join(root, "agents", name)
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644))
+}
+
+// TestAgentsPort_ListForwardsLoaderEntries list 的转调：装载器的条目**原样**交回端口
+// （注册与拒绝**都有一条**——单只失败不静默消失），装载期的点名 WARN 走**注入的**日志器
+// （配置档位）而不是进程默认档——这正是适配器持有 Logger 的理由。
+// Acceptance point: List forwards every entry (registered or rejected) and the
+// loader's per-agent WARN lines land on the injected logger.
+func TestAgentsPort_ListForwardsLoaderEntries(t *testing.T) {
+	workDir := testutil.TempWorkspace(t)
+	root := filepath.Join(workDir, ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	writeAgentDir(t, root, "compat-check", `---
+name: compat-check
+provider:
+  name: deepseek
+  model: deepseek-chat
+---
+
+段一素材。
+`)
+	writeAgentDir(t, root, "mismatch-agent", `---
+name: other-name
+provider:
+  name: deepseek
+  model: deepseek-chat
+---
+
+目录名与 name 不一致——必须整只不注册。
+`)
+
+	var logs bytes.Buffer
+	port := agentsPort{WorkDir: workDir, Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+
+	entries, err := port.List(root, []string{"deepseek"})
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "每个 Agent 目录一条：注册与拒绝都交回端口")
+
+	byName := make(map[string]core.AgentEntry, len(entries))
+	for _, entry := range entries {
+		byName[entry.Name] = entry
+	}
+
+	registered := byName["compat-check"]
+	require.True(t, registered.Registered, "应注册：%s", registered.RejectReason)
+	require.Equal(t, "deepseek", registered.Profile.Provider.Name)
+
+	rejected := byName["mismatch-agent"]
+	require.False(t, rejected.Registered)
+	require.NotEmpty(t, rejected.RejectReason, "未注册必须带原因（不得静默消失）")
+
+	// 注入的日志器收到点名 WARN：固定三键 agent / reason / detail 都在。
+	require.Contains(t, logs.String(), "agent=mismatch-agent")
+	require.Contains(t, logs.String(), "reason=")
+	require.Contains(t, logs.String(), "detail=")
+}
+
+// TestAgentsPort_CreateAndDeleteReachWorkspace 写模式两方法的转调：create 落盘后经**同一
+// 端口** list 即为已注册（模板可装载是 create 的判据）；delete 用**注入的固定时刻**归档，
+// 源目录移出、归档副本在；两条路径的错误（已存在 / 缺目录）原样上抛；写模式调用各留一条
+// DEBUG 排障线（工作目录 + 工作区根）。
+// Acceptance point: both write-mode methods reach the workspace, and the injected
+// instant is what lands in the archive name.
+func TestAgentsPort_CreateAndDeleteReachWorkspace(t *testing.T) {
+	workDir := testutil.TempWorkspace(t)
+	root := filepath.Join(workDir, ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	// 排障线是 DEBUG 档（prod 默认关闭），这里的 handler 必须显式开 Debug 才看得见。
+	var logs bytes.Buffer
+	port := agentsPort{
+		WorkDir: workDir,
+		Logger:  slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+
+	created, err := port.Create(root, "demo-agent", []string{"deepseek"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"agents/demo-agent/AGENT.md"}, created)
+
+	entries, err := port.List(root, []string{"deepseek"})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "刚写的模板应当可装载：%s", entries[0].RejectReason)
+
+	_, err = port.Create(root, "demo-agent", []string{"deepseek"})
+	require.Error(t, err, "已存在的目录必须拒绝")
+	require.Contains(t, err.Error(), "demo-agent", "错误点名被拒目录")
+
+	now := time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC)
+	archived, err := port.Delete(root, "demo-agent", now)
+	require.NoError(t, err)
+	require.Equal(t, "archive/demo-agent-20261016-093000", archived, "注入的时刻原样进入归档名")
+	require.NoDirExists(t, filepath.Join(root, "agents", "demo-agent"))
+	require.FileExists(t, filepath.Join(root, "archive", "demo-agent-20261016-093000", "AGENT.md"))
+
+	_, err = port.Delete(root, "demo-agent", now)
+	require.Error(t, err, "缺目录必须失败")
+	require.Contains(t, err.Error(), "demo-agent")
+
+	require.Contains(t, logs.String(), "level=DEBUG", "写模式调用留 DEBUG 排障线")
+	require.Contains(t, logs.String(), "workdir=")
 }
 
 // TestLogLevel_MapsConfigValues 取值域已由 cli.LoadConfig 判卷，本用例只判**翻译**

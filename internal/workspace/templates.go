@@ -1,5 +1,11 @@
 package workspace
 
+import (
+	"fmt"
+
+	"github.com/goccy/go-yaml"
+)
+
 // 目录清单：顺序即创建顺序，也是报告顺序（CLI 输出稳定可比）。
 // Directories in creation order; the report keeps the same order so that the
 // CLI output stays stable and comparable between runs.
@@ -95,3 +101,61 @@ Agent 不写本文件；需要记住的事写进长期记忆 memory/MEMORY.md。
 ## 归档记忆
 `
 )
+
+// 占位文本：create 模板里"没配完"的**可见**标记（契约 agent-md.md §2 字段表 + 技术方案
+// §11.5：占位模型名是普通文本、天然放行——"没配完"在文件里一眼可见，报错发生在调用模型时）。
+// Placeholder texts that make an unfinished template visible in the file itself.
+const (
+	placeholderProviderName = "请在此填写 provider 名"
+	placeholderModelName    = "请在此填写模型名"
+)
+
+// agentTemplateDTO 是 profile create 模板的落盘形态：**经 yaml.Marshal 编码**——不得字符串
+// 插值（名字可含空格 / 冒号 / 中文，插值会写坏 YAML）；provider.model 恒为占位；tools 显式
+// 空列表；其余列表字段（skills / mcp_servers / bootstrap / schedules）省略
+// （颗粒度文档 §3.1 CreateAgent 注释 + data-model「profile create 模板」）。
+// agentTemplateDTO is the on-disk shape of a created template; names go through the encoder.
+type agentTemplateDTO struct {
+	Name        string                `yaml:"name"`
+	Description string                `yaml:"description"`
+	Provider    agentTemplateProvider `yaml:"provider"`
+	Tools       []string              `yaml:"tools"`
+}
+
+// agentTemplateProvider 是模板里的 provider 段：name 取配置首项（或占位文本）、model 恒为占位。
+// agentTemplateProvider is the provider section of a created template.
+type agentTemplateProvider struct {
+	Name  string `yaml:"name"`
+	Model string `yaml:"model"`
+}
+
+// agentTemplate 渲染一份**可装载**的 AGENT.md 模板（frontmatter 围栏 + 围栏外正文）。
+// providers 为空 → provider.name 写占位文本（命令面另加"模板尚未注册"的说明）。
+// agentTemplate renders a loadable AGENT.md template.
+func agentTemplate(name string, providers []string) (string, error) {
+	providerName := placeholderProviderName
+	if len(providers) > 0 {
+		providerName = providers[0] // 配置数组首项（§2.3 流程 C）
+	}
+
+	dto := agentTemplateDTO{
+		Name:        name,
+		Description: "一句话说明这个 Agent 的职责（可留空）",
+		Provider:    agentTemplateProvider{Name: providerName, Model: placeholderModelName},
+		Tools:       []string{}, // tools: []（记忆工具到 US-6 才在池）
+	}
+
+	front, err := yaml.Marshal(dto)
+	if err != nil {
+		return "", fmt.Errorf("编码 Agent 模板: %w", err)
+	}
+	return "---\n" + string(front) + "---\n\n" + agentTemplateBody(name) + "\n", nil
+}
+
+// agentTemplateBody 是模板的正文（段一素材之一）：只说明"该写什么"，不写进任何后续 US
+// 会推翻的产品语义。
+// agentTemplateBody is the prose body of a created template.
+func agentTemplateBody(name string) string {
+	return "你是「" + name + "」。把这一段改成这个 Agent 的职责与行为约定：做什么、不做什么、\n" +
+		"输出成什么样。本段正文与 bootstrap: 声明的文件会作为系统提示词的第一段注入。\n"
+}

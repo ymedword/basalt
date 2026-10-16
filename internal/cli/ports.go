@@ -1,6 +1,11 @@
 package cli
 
-import "context"
+import (
+	"context"
+	"time"
+
+	"github.com/ymedword/basalt/internal/core"
+)
 
 // 本文件是命令面的**端口**（依赖倒置的接口面）：接口定义在消费方，实现由装配层
 // internal/app 注入。cli 因而不 import storage / workspace——依赖方向保持
@@ -58,4 +63,32 @@ type Workspace interface {
 	// 返回 core.ErrWorkspaceNotInitialized。
 	// Inspect inventories the skeleton; an empty missing means it is complete.
 	Inspect(root string) (missing []string, err error)
+}
+
+// Agents 是命令面对 Agent 目录的端口：list / show 读（轻路径），create / delete 写
+// （写模式，取实例锁）。
+// Agents is the command surface's port onto the agent directories: list / show read
+// (the light path) while create / delete write (holding the instance lock).
+//
+// providers 是注册判定的**显式输入**（命令面经 LoadConfig 取得——§2.4 注 2）；
+// 适配器不另读配置——注册判定与装载因此共用同一条代码路径（FR-012）。
+// providers is passed in explicitly rather than re-read inside the adapter, so the
+// registration verdict and the loader share one code path.
+//
+// Delete 的 now 由命令层传入（归档名含时间戳——时间显式传入是可判卷前提，§2.4 注 11）。
+// Delete receives the clock from the command layer because the archive name carries
+// a timestamp and an injected clock is what makes the archive testable.
+type Agents interface {
+	// List 装载全部 Agent 目录：注册成功与失败**都有一条**（失败不静默消失）。
+	// List loads every agent directory; rejects are reported, never dropped.
+	List(root string, providers []string) ([]core.AgentEntry, error)
+
+	// Create 写入最小 AGENT.md 模板并返回本次新落盘的相对路径（实现侧先取实例锁）。
+	// Create writes a minimal template and returns the paths it created.
+	Create(root, name string, providers []string) (created []string, err error)
+
+	// Delete 把 Agent 目录归档进 archive/<name>-<时间戳>/，返回归档目标的相对路径
+	// （实现侧先取实例锁）。
+	// Delete archives the agent directory and returns the archive path.
+	Delete(root, name string, now time.Time) (archived string, err error)
 }
