@@ -359,3 +359,64 @@ func TestWhitelistPolicy_RefusalCopyIsFourSegments(t *testing.T) {
 		"域名不在白名单：evil.example.com。这是安全策略，请勿反复重试；如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。",
 		err.Error(), "四段式文案是模型可见契约，逐字保真")
 }
+
+// —— US-5 追加四条（端口档：口径 15 冻结的放行组合、拒绝面与脱敏）——
+// Four added by US-5: the frozen port rule's allow list, its refusals, and its copy.
+
+// TestWhitelistPolicy_AllowsSchemeDefaultPortsVerbatim 覆盖 F19：**缺省与显式默认端口等价**——
+// http 省略端口与显式 `:80`、https 省略端口与显式 `:443` 四种写法都放行（口径 15 的冻结组合：
+// 域内白名单域名 + 本 scheme 的默认端口）。四个例子都在白名单里，故放行只能来自端口档。
+func TestWhitelistPolicy_AllowsSchemeDefaultPortsVerbatim(t *testing.T) {
+	f := newPolicyFixture(t, func(opts *tool.PolicyOptions) {
+		opts.AllowedDomains = []string{"api.example.com"}
+	})
+	for _, target := range []string{
+		"http://api.example.com/v1/chat",      // 省略端口 = 80
+		"http://api.example.com:80/v1/chat",   // 显式 80 = 同一档
+		"https://api.example.com/v1/chat",     // 省略端口 = 443
+		"https://api.example.com:443/v1/chat", // 显式 443 = 同一档
+	} {
+		requireAllowed(t, f.policy, httpAction(target))
+	}
+}
+
+// TestWhitelistPolicy_RefusesNonDefaultPorts 覆盖 F20：**非默认端口一律拒**，且判定发生在
+// 域名白名单**之前**——端口档是独立的一道（`http://evil.example.com:8080/x` 得到的是端口拒绝，
+// 不是"域名不在白名单"：指引必须指向真问题，否则模型会去改错的东西）。
+func TestWhitelistPolicy_RefusesNonDefaultPorts(t *testing.T) {
+	f := newPolicyFixture(t, func(opts *tool.PolicyOptions) {
+		opts.AllowedDomains = []string{"api.example.com"}
+	})
+	requireRefused(t, f.policy, httpAction("http://api.example.com:8080/x"), "出网目标端口不在默认档")
+	requireRefused(t, f.policy, httpAction("https://api.example.com:8443/x"), "出网目标端口不在默认档")
+	// 端口档先于域名档：域名没进白名单也照样走端口拒绝（判序判据）。
+	requireRefused(t, f.policy, httpAction("http://evil.example.com:8080/x"), "出网目标端口不在默认档")
+}
+
+// TestWhitelistPolicy_RefusesSchemePortMismatch 覆盖 F21：**交叉档**同样拒——`http` 配 `:443`、
+// `https` 配 `:80` 都不是"本 scheme 的默认端口"（放行它们等于让同一台主机的明文口与加密口
+// 互相借道）。
+func TestWhitelistPolicy_RefusesSchemePortMismatch(t *testing.T) {
+	f := newPolicyFixture(t, func(opts *tool.PolicyOptions) {
+		opts.AllowedDomains = []string{"api.example.com"}
+	})
+	requireRefused(t, f.policy, httpAction("http://api.example.com:443/x"), "出网目标端口不在默认档")
+	requireRefused(t, f.policy, httpAction("https://api.example.com:80/x"), "出网目标端口不在默认档")
+}
+
+// TestWhitelistPolicy_NonDefaultPortCopyIsFrozenAndRedacted 覆盖 F22：端口档的四段式文案**逐字**
+// 冻结（段 4 是"当前版本不支持非默认端口"，**不得**指向域名白名单——白名单管 host、不管端口），
+// 且段 2 只点名 host:port：**不含** userinfo、**不含** query（§3.5 第 9 项脱敏）。
+func TestWhitelistPolicy_NonDefaultPortCopyIsFrozenAndRedacted(t *testing.T) {
+	f := newPolicyFixture(t, nil)
+	message := requireRefused(t, f.policy,
+		httpAction("https://user:pass@api.example.com:8443/x?token=secret"),
+		"出网目标端口不在默认档")
+	require.Equal(t,
+		"出网目标端口不在默认档：api.example.com:8443。这是安全策略，请勿反复重试；"+
+			"当前版本不支持非默认端口（http 用 80、https 用 443，或省略端口）；没有配置键可以加。",
+		message, "端口档文案逐字保真——段 2 只回 host:port，段 4 不得指向域名白名单")
+	require.NotContains(t, message, "user:pass", "userinfo 不进文案（敏感面纪律）")
+	require.NotContains(t, message, "token=secret", "query 不进文案（敏感面纪律）")
+	require.NotContains(t, message, "http.allowed_domains", "端口不归域名白名单管——指引不得指向它")
+}

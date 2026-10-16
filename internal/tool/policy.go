@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -62,6 +63,13 @@ const (
 	guidanceScheme            = "只允许 http / https（代码固定，配置放行不了）；没有配置键可以加。"
 	ruleDomainNotAllowed      = "域名不在白名单"
 	guidanceDomainNotAllowed  = "如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。"
+	// 端口档（口径 15，2026-10-17 用户裁决冻结）：只允许 scheme 的默认端口；放行通道
+	// 归扩展阶段——指引**不得**指向域名白名单（它管 host、不管端口）。
+	ruleNonDefaultPort     = "出网目标端口不在默认档"
+	guidanceNonDefaultPort = "当前版本不支持非默认端口（http 用 80、https 用 443，或省略端口）；没有配置键可以加。"
+	// 段 2 的安全文案：目标不可点名时（URL 解析失败 / 缺 host）**不得**回显原文——原文可能
+	// 带 userinfo 与 query（§3.5 第 9 项脱敏）。
+	targetUnresolvable = "（目标无法解析）"
 )
 
 // PolicyOptions 是 WhitelistPolicy 的构造参数——**键名逐字沿用** `basalt.yaml`
@@ -229,11 +237,14 @@ func (p *WhitelistPolicy) checkShellCommand(action core.Action) error {
 
 // checkHTTPRequest 落 §2.3 流程 F 的出网档：逐跳校验由调用方在每一跳发送前再次 Check；
 // 跳数上限 5 是调用方的代码常量（US-5 的 http 工具），本档只判"这一跳去哪"。
+// 判定序：解析 → scheme → hostname / IP 字面量 → **端口档（口径 15）** → 域名白名单；
+// 初始请求与每一次重定向同判（判定只此一处）。两处拒绝分支只回安全文案与 host，
+// **不得**回显 `action.Target` 原文（原文可能带 userinfo / query——§3.5 第 9 项）。
 // Per-hop judgement; the redirect hop cap lives with the http tools (US-5).
 func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 	u, err := url.Parse(action.Target)
 	if err != nil {
-		return deny(ruleNotDomain, action.Target, guidanceNotDomain)
+		return deny(ruleNotDomain, targetUnresolvable, guidanceNotDomain)
 	}
 	// scheme 只认 http / https（**代码固定**：配置放行不了）。
 	if u.Scheme != "http" && u.Scheme != "https" {
@@ -241,13 +252,40 @@ func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 	}
 	host := u.Hostname()
 	// 白名单按域名匹配：IP 字面量目标直接拒（放行 IP 等于绕过白名单）。
-	if host == "" || net.ParseIP(host) != nil {
-		return deny(ruleNotDomain, action.Target, guidanceNotDomain)
+	if host == "" {
+		return deny(ruleNotDomain, targetUnresolvable, guidanceNotDomain)
+	}
+	if net.ParseIP(host) != nil {
+		// 段 2 点名 IP 字面量本身——它不含 userinfo / query，回显它不泄漏任何东西。
+		return deny(ruleNotDomain, host, guidanceNotDomain)
+	}
+	// 端口档（口径 15，冻结）：`http` 配省略端口或显式 `:80`、`https` 配省略端口或显式
+	// `:443` 放行，其余组合（含交叉档 http:443 / https:80）一律拒——判定在 hostname 之后、
+	// 域名白名单之前：域名档管 host、端口档管端口，两档不互相顶替。
+	if port := u.Port(); port != "" {
+		defaultPort, ok := defaultPortFor(u.Scheme)
+		if !ok || port != strconv.Itoa(defaultPort) {
+			// 段 2 点名 host 与端口（`u.Host` 不含 userinfo），**不含** query。
+			return deny(ruleNonDefaultPort, u.Host, guidanceNonDefaultPort)
+		}
 	}
 	if !p.domainAllowed(host) {
 		return deny(ruleDomainNotAllowed, host, guidanceDomainNotAllowed)
 	}
 	return nil
+}
+
+// defaultPortFor 返回 scheme 的默认端口；不认识的 scheme 返回 false（调用方据此拒）。
+// defaultPortFor reports the scheme's default port; unknown schemes report false.
+func defaultPortFor(scheme string) (int, bool) {
+	switch scheme {
+	case "http":
+		return 80, true
+	case "https":
+		return 443, true
+	default:
+		return 0, false
+	}
 }
 
 // domainAllowed 按域名匹配（大小写不敏感）：完整域名逐字比较；条目写成 `*.example.com`

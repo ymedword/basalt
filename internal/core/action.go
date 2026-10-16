@@ -38,10 +38,11 @@ const (
 // carried separately: authorization compares the executable string verbatim while the
 // runner validates argv shape.
 type Command struct {
-	Executable string   // 与 shell.allowed_commands / interpreters 比对的对象（多词串必拒）
-	Args       []string // argv 原样传递，不经任何 shell 解释
-	Dir        string   // 工作目录：有 Agent 上下文 = 该 Agent 的目录；空 = 进程默认 CWD（不引入全局 chdir）
-	Env        []string // 工具显式声明的附加变量（KEY=VALUE）；透传白名单在 Runner 侧统一执行
+	Executable     string   // 与 shell.allowed_commands / interpreters 比对的对象（多词串必拒）
+	Args           []string // argv 原样传递，不经任何 shell 解释
+	Dir            string   // 工作目录：有 Agent 上下文 = 该 Agent 的目录；空 = 进程默认 CWD（不引入全局 chdir）
+	Env            []string // 工具显式声明的附加变量（KEY=VALUE）；透传白名单在 Runner 侧统一执行
+	MaxOutputBytes int      // 本次执行的读取侧上限；<=0 = 用 runner 装配值；只许比装配值更短
 }
 
 // CommandResult 是一次受控执行的产出：stdout 与 stderr **合并**为单串（顺序即进程写出顺序）。

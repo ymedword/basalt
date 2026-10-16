@@ -112,3 +112,62 @@ type InstanceFullError struct {
 func (e *InstanceFullError) Error() string {
 	return fmt.Sprintf("instance is at capacity (limit %d)", e.Limit)
 }
+
+// —— 工具链失败承载（US-5 新增）——
+// Tool-chain failure carriers added by US-5.
+
+// ExternalError 是**外部系统错误**的承载（契约 §7.3 `external_error`）：4xx / 5xx 响应与
+// DNS 解析失败 / 连接被拒 / TLS 握手失败 / 响应读取失败。**不复用** `provider.CallError`
+// （core 只依赖标准库，反向 import 为禁），与 `SandboxViolationError` **平级**。
+// 文案纪律（口径 17）：`Error()` 只输出**自产类别摘要**——**不得**带 URL 原文 / query /
+// 响应体 / Location 原文（`url.Error` 的原文含整条 URL，直接透传即泄漏）；原始错误只经
+// `Unwrap()` 供 `errors.Is` / `errors.As` 分类与排障，**不进文案**。
+// ExternalError carries an external-system failure: 4xx/5xx responses and DNS / connect /
+// TLS / read failures. Its message is a self-authored summary only; the underlying error
+// stays reachable through Unwrap and never enters the text.
+type ExternalError struct {
+	Target string // 外部目标：状态码与 host 的组合，或 host（不含 path / query / userinfo）
+	Reason string // 自产类别摘要（如「连接失败：example.com」「HTTP 404：example.com」）
+	Cause  error  // 原因链：只经 Unwrap 供分类与排障，不进文案
+}
+
+// Error 返回自产的安全摘要——即 `Reason` 本身（不做任何拼接、不引入外部原文）。
+// Error returns the self-authored summary verbatim.
+func (e *ExternalError) Error() string { return e.Reason }
+
+// Unwrap 暴露原因链：`errors.Is` / `errors.As` 可穿透到原始错误——两条防线并存，
+// 即便未来某处把 ctx 错误经 `%w` 包进 `Cause`，取消 / 截止仍判得出来（约束 20）。
+// Unwrap exposes the cause chain so cancellation identity survives even if some future
+// site wraps a context error into Cause.
+func (e *ExternalError) Unwrap() error { return e.Cause }
+
+// IsExternalError 判定错误链里是否有外部系统错误——`ToolExecutor` 据此分类为
+// `external_error`（判据只认类型，**不比文本**）。
+// IsExternalError reports whether the chain contains an external-system failure.
+func IsExternalError(err error) bool {
+	var target *ExternalError
+	return errors.As(err, &target)
+}
+
+// InvalidInputError 是**入参非法**的承载（契约 §7.3 `invalid_input`）：模型给的参数不合法，
+// 不是本仓缺陷（注 11）。两类产出方产出同一类别、分层不重复——执行器入口判「合法 JSON
+// 对象 + 必填键」（`checkToolInput`），工具在解码点判「字段类型与取值」。`Reason` 承载
+// **完整可读文案**（模型可见）；既有文件工具的失败文本因此逐字不变、只换类型。
+// InvalidInputError carries an invalid-argument failure produced by the executor entry
+// check or a tool's own decode point: the model's input was invalid, not a defect here.
+type InvalidInputError struct {
+	Tool   string // 工具名（点名哪件工具的入参）
+	Reason string // 可读原因（完整文案，原样进工具结果）
+}
+
+// Error 返回可读原因文本。
+// Error returns the readable reason verbatim.
+func (e *InvalidInputError) Error() string { return e.Reason }
+
+// IsInvalidInput 判定错误链里是否有入参非法——`ToolExecutor` 据此分类为 `invalid_input`
+// （判据只认类型，**不比文本**）。
+// IsInvalidInput reports whether the chain contains an invalid-input failure.
+func IsInvalidInput(err error) bool {
+	var target *InvalidInputError
+	return errors.As(err, &target)
+}

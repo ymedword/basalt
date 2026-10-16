@@ -8,6 +8,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -173,9 +174,30 @@ func (p sessionListerPort) Messages(ctx context.Context, sessionID string) ([]co
 	return p.store.Messages(ctx, sessionID)
 }
 
+// toolListerPort 把 tool.Registry（装配期构建的内存注册池）适配成 cli.ToolLister。
+// toolListerPort adapts the assembly-time tool registry to the command surface's port.
+//
+// 这一层做的**唯一一件事**是选顺序：`Specs(Names())` 的名字排序是清单顺序的唯一定义处
+// （命令面保序渲染、零重排），适配器不排序、不过滤、不补默认值。接口给的是**数据**
+// （`core.ToolSpec` 三件字段），所以本类型不把工具实现包带进 cli——依赖方向保持
+// app → 两侧，cli 与 tool 互不相识。
+// The adapter's only job is to pick the order: Specs(Names()) is the single definition
+// of the listing order. It passes data, not the implementation package, so cli and tool
+// stay strangers to each other.
+type toolListerPort struct {
+	registry *tool.Registry
+}
+
+// Tools 转调注册池的清单（顺序 = 注册池的名字排序，由 Names() 定义）。
+// Tools forwards the registry's specs in the registry's own order.
+func (p toolListerPort) Tools() []core.ToolSpec {
+	return p.registry.Specs(p.registry.Names())
+}
+
 // 编译期断言：端口形状与实现签名一旦对不上，在这里先红——不是在装配处报"缺方法"。
 // Compile-time assertions: the ports and the implementations must match here first.
 var (
 	_ cli.RunService    = runServicePort{}
 	_ cli.SessionLister = sessionListerPort{}
+	_ cli.ToolLister    = toolListerPort{}
 )

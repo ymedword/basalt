@@ -128,3 +128,19 @@ type SessionLister interface {
 	// Messages reads one session's history in seq order; an unknown session is empty.
 	Messages(ctx context.Context, sessionID string) ([]core.Message, error)
 }
+
+// ToolLister 是命令面对**工具注册池**的端口（`tool list` 消费，适配器 ← `tool.Registry`）。
+// ToolLister is the command surface's port onto the tool registry.
+//
+// 只给一个方法：命令面要的是「注册了什么」这一份**数据**（`core.ToolSpec` 是 core 的
+// 类型，不是工具实现包的类型——这正是本端口不引入实现依赖的原因）。清单的**顺序由实现侧
+// 给定**（注册池按名字排序导出），命令面保序渲染、**不得**重排（口径 13）；工具池是装配期
+// 构建的内存对象，所以 `tool list` 属**重路径**——清单只在那次装配之后才存在。
+// One method is enough: the command surface wants the data, and the order is the
+// implementation's to give. The pool lives in memory, built at assembly time — hence
+// the heavy path.
+type ToolLister interface {
+	// Tools 返回注册池的清单（顺序稳定、由实现侧负责——命令面逐行渲染、零重排）。
+	// Tools returns the registry's specs; the implementation owns the order.
+	Tools() []core.ToolSpec
+}

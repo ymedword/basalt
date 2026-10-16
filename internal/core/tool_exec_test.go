@@ -460,3 +460,116 @@ func TestToolExecutor_TruncatesOutputAndPacksFailureText(t *testing.T) {
 	require.Equal(t, failed, failRes.Content, "失败信息必须回填（模型看不到失败就不会收敛）")
 	require.Equal(t, core.ErrorKindRuntimeError, f.audit.row(1).result.ErrorKind)
 }
+
+// —— US-5 追加四条（流程 C 的两条新分支与七值完整性）——
+// Four added by US-5: flow C's two new branches plus the seven-value completeness fixture.
+
+// TestToolExecutor_ClassifiesExternalError 守"外部系统错误按类型判卷"：
+// 验收点（流程 C 新增分支 + 契约 §7.3）——`*core.ExternalError` → `external_error`；
+// 落库的 `error_message` 是**自产安全摘要**（口径 17）：`Cause` 里的原始错误含整条 URL / query，
+// 只经 `Unwrap` 供分类与排障，**不进文案**、也不进 WARN 日志（可观测性双轨同一口径）。
+func TestToolExecutor_ClassifiesExternalError(t *testing.T) {
+	f := newExecFixture(t)
+	raw := errors.New(`Get "http://api.example.com/weather?token=secret": connection refused`)
+	external := &core.ExternalError{
+		Target: "api.example.com",
+		Reason: "连接失败：api.example.com",
+		Cause:  raw,
+	}
+	f.tool.err = external
+
+	res := f.executor.Execute(f.rctx, f.env(), execToolSet, execCall("c1", "read_file", `{"path":"x"}`))
+	require.Equal(t, "连接失败：api.example.com", res.Content, "回填的是安全摘要（即外部错误文案）")
+
+	row := f.audit.row(0)
+	require.True(t, row.terminal, "外部系统错误发生在执行之内——有行")
+	require.Equal(t, core.LLMCallFailed, row.status)
+	require.Equal(t, core.ErrorKindExternalError, row.result.ErrorKind, "判据只认类型，不比文本")
+	require.Equal(t, "连接失败：api.example.com", row.result.ErrorMessage,
+		"入库的是自产摘要——原始错误（url.Error 原文含整条 URL）不得进错误文案")
+	require.NotContains(t, string(row.result.ResultJSON), "token=secret", "query 不进结果体（口径 17）")
+	require.NotContains(t, f.logs.String(), "token=secret", "WARN 的 detail 是安全摘要——原文不得进日志")
+	require.ErrorIs(t, external, raw, "Unwrap 穿透：原因链可达（供分类与排障，不进文案）")
+	require.Contains(t, f.logs.String(), "reason=external_error", "审计落库与 WARN 构成双轨")
+}
+
+// TestToolExecutor_ClassifiesInvalidInputCarrier 守"工具解码点与执行器入口同类别"：
+// 验收点（流程 C 新增分支 + 注 11）——工具内部解出 `*core.InvalidInputError`（字段类型不符 /
+// 取值为空）与执行器入口的必填校验产出**同一个** `invalid_input`；完整可读文案原样回填。
+func TestToolExecutor_ClassifiesInvalidInputCarrier(t *testing.T) {
+	f := newExecFixture(t)
+	reason := "解析 read_file 入参：json: cannot unmarshal string into Go struct field .path of type string"
+	f.tool.err = &core.InvalidInputError{Tool: "read_file", Reason: reason}
+
+	res := f.executor.Execute(f.rctx, f.env(), execToolSet, execCall("c1", "read_file", `{"path":"x"}`))
+	require.Equal(t, reason, res.Content, "完整可读文案原样回填给模型")
+	require.Equal(t, 1, f.tool.executedCount(), "工具确实被调用过——故必须有审计行")
+
+	row := f.audit.row(0)
+	require.True(t, row.terminal)
+	require.Equal(t, core.ErrorKindInvalidInput, row.result.ErrorKind, "载体改造后与入口校验同类别")
+	require.Equal(t, reason, row.result.ErrorMessage)
+	require.Contains(t, f.logs.String(), "reason=invalid_input")
+}
+
+// TestToolExecutor_ContextIdentityOutranksExternalError 守"取消 / 截止的身份优先"（约束 20 的第二道防线）：
+// 验收点（流程 C 的**判序**）——`ExternalError` 包着 `context.DeadlineExceeded` 时仍归 `timeout`：
+// ctx 判定排在外部系统**之前**；即便未来某处把 ctx 错误经 `%w` 包进 `Cause`（或再包一层），
+// `errors.Is` 也能穿透判出——先判后包与 Unwrap 两条防线并存。
+func TestToolExecutor_ContextIdentityOutranksExternalError(t *testing.T) {
+	f := newExecFixture(t)
+	env := f.env()
+
+	f.tool.err = &core.ExternalError{
+		Target: "api.example.com",
+		Reason: "连接失败：api.example.com",
+		Cause:  context.DeadlineExceeded,
+	}
+	_ = f.executor.Execute(f.rctx, env, execToolSet, execCall("c1", "read_file", `{"path":"a.txt"}`))
+	require.Equal(t, core.ErrorKindTimeout, f.audit.row(0).result.ErrorKind,
+		"出网超时仍归 timeout——外部分支不得截胡 ctx 身份")
+
+	f.tool.err = fmt.Errorf("重试耗尽：%w", &core.ExternalError{
+		Target: "api.example.com",
+		Reason: "连接失败：api.example.com",
+		Cause:  context.Canceled,
+	})
+	_ = f.executor.Execute(f.rctx, env, execToolSet, execCall("c2", "read_file", `{"path":"b.txt"}`))
+	require.Equal(t, core.ErrorKindTimeout, f.audit.row(1).result.ErrorKind,
+		"再包一层也要认：ctx 分支在外部系统之前（判序不可交换）")
+}
+
+// TestToolExecutor_ClassifiesSevenKindsVerbatim 守"七值字面量完整性"（契约 §7.3 冻结集）：
+// 验收点——分类器产出的每一类**逐值对号**（防 `default` 把新增分支吞回 `runtime_error`）；
+// 第七值 `unknown` 由**恢复扫描**写入（崩溃窗口的 pending 行），分类器不产出它——该边界同样钉住。
+func TestToolExecutor_ClassifiesSevenKindsVerbatim(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want core.ErrorKind
+	}{
+		{"sandbox_denied", &core.SandboxViolationError{Rule: "读白名单未放行", Target: "x", Guidance: "g"}, core.ErrorKindSandboxDenied},
+		{"timeout", context.DeadlineExceeded, core.ErrorKindTimeout},
+		{"not_found", fmt.Errorf("open notes.txt: %w", fs.ErrNotExist), core.ErrorKindNotFound},
+		{"invalid_input", &core.InvalidInputError{Tool: "read_file", Reason: "r"}, core.ErrorKindInvalidInput},
+		{"external_error", &core.ExternalError{Target: "api.example.com", Reason: "HTTP 500：api.example.com"}, core.ErrorKindExternalError},
+		{"runtime_error", errors.New("进程启动失败：exec format error"), core.ErrorKindRuntimeError},
+	}
+	classified := make([]core.ErrorKind, 0, len(cases))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newExecFixture(t)
+			f.tool.err = c.err
+			_ = f.executor.Execute(f.rctx, f.env(), execToolSet, execCall("c1", "read_file", `{"path":"a.txt"}`))
+			row := f.audit.row(0)
+			require.Equal(t, core.LLMCallFailed, row.status)
+			require.Equal(t, c.want, row.result.ErrorKind)
+			require.Equal(t, c.name, string(row.result.ErrorKind), "字面量与契约 §7.3 逐字一致")
+			classified = append(classified, row.result.ErrorKind)
+		})
+	}
+	// 第七值：恢复扫描写的 `unknown`——它不出自分类器，故表里六行都不该是它；
+	// 同时钉住该字面量本身（七值集完整，改字面量即改契约）。
+	require.NotContains(t, classified, core.ErrorKindUnknown, "分类器不得产出 unknown（那由崩溃恢复写）")
+	require.Equal(t, "unknown", string(core.ErrorKindUnknown))
+}

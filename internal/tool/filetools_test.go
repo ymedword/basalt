@@ -427,3 +427,48 @@ func TestListDirTool_FailuresMatchContract(t *testing.T) {
 	require.ErrorIs(t, err, fs.ErrNotExist)
 	require.Contains(t, err.Error(), "read_file", "要指路到读文件的工具")
 }
+
+// —— US-5 追加两条（入参非法的分层：执行器入口判必填、工具在解码点判类型与取值）——
+// Two added by US-5: both halves of the invalid-input layering land on the same class.
+
+// TestFileTools_TypeMismatchIsInvalidInput 覆盖 I15：字段**类型**不符是调用方的入参问题，
+// 不是本仓缺陷——失败载体必须是 `*core.InvalidInputError`（执行器据此分类 `invalid_input`），
+// 且文案**逐字不变**（只换承载类型，模型可见文案一个字都不改）。
+func TestFileTools_TypeMismatchIsInvalidInput(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	for _, c := range []struct {
+		tool core.Tool
+		name string
+	}{
+		{f.read, "read_file"},
+		{f.write, "write_file"},
+		{f.list, "list_dir"},
+	} {
+		_, err := runTool(t, c.tool, f.toolEnv(), `{"path":42}`)
+		require.Error(t, err, "类型不符必须失败：%s", c.name)
+		require.True(t, core.IsInvalidInput(err),
+			"解码失败归 invalid_input（给错类型不能落成 runtime_error——那会把模型的错记成本仓的锅）")
+		require.ErrorContains(t, err, "解析 "+c.name+" 入参：", "文案逐字不变——只换承载类型")
+	}
+}
+
+// TestFileTools_EmptyPathIsInvalidInput 覆盖 I16：`{"path":""}` 在 Schema 上**合法**（键在、
+// 类型对），必填校验放它过去；空路径在解码点被取值校验拦下——两处产出**同一个类别**，
+// 模型看到的完整文案与改造前逐字一致。
+func TestFileTools_EmptyPathIsInvalidInput(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	for _, c := range []struct {
+		tool  core.Tool
+		name  string
+		input string
+	}{
+		{f.read, "read_file", `{"path":""}`},
+		{f.write, "write_file", `{"path":"","content":"x"}`},
+		{f.list, "list_dir", `{"path":""}`},
+	} {
+		_, err := runTool(t, c.tool, f.toolEnv(), c.input)
+		require.Error(t, err, "空路径必须失败：%s", c.name)
+		require.True(t, core.IsInvalidInput(err), "取值为空与类型不符同属 invalid_input")
+		require.Equal(t, c.name+" 的 path 不能为空", err.Error(), "文案逐字不变（完整文案原样回填给模型）")
+	}
+}
