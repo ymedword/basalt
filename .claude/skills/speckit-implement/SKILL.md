@@ -173,6 +173,7 @@ You **MUST** consider the user input before proceeding (if not empty).
    - Provide clear error messages with context for debugging
    - Suggest next steps if implementation cannot proceed
    - **IMPORTANT** For completed tasks, make sure to mark the task off as [X] in the tasks file.
+   - **本仓守卫（本地改造，2026-10-17）**：已是 `[X]` / `[x]` 的任务**默认跳过**，不得重做 / 覆盖；确需重做须用户在当轮明示。续跑时从 tasks.md 全文件文档序**首个未完成任务**开始（module-dev 步骤 0 分流表）。
 
 9. Completion validation:
    - Verify all required tasks are completed
@@ -227,3 +228,13 @@ Report final status with summary of completed work.
 - [ ] Implementation validated against specification, plan, and test coverage
 - [ ] Extension hooks dispatched or skipped according to the rules in Mandatory Post-Execution Hooks above
 - [ ] Completion reported to user with summary of completed work
+
+---
+
+## 本仓本地改造登记
+
+本文件相对上游 Specify CLI 模板为**本仓本地改造**（首次分叉 2026-10-17）：
+
+| 位置 | 改造内容 | 依据 |
+| --- | --- | --- |
+| 步骤 8「Progress tracking and error handling」 | 已勾选任务默认跳过、重做须用户明示；续跑从首个未完成任务开始 | Long-task 续跑机制（module-dev 步骤 0 分流表）；上游刷新模板后按本节回补 |
