@@ -4,9 +4,14 @@ name: CI
 #   test  job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
 #   build job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
 # 参见 docs/AiProgrammingGuide.md §3.2 的"三条实测纪律"。
+#
+# 触发面覆盖**所有分支**（`'**'` 只匹配分支、不匹配 tag）：US 分支一推即判卷，
+# 问题在分支阶段暴露，而不是等合回 main 才发现——US-4 的 runner_unix.go 就吃过这个亏
+# （本地 Windows 门禁编译不到 unix 文件，main-only 触发让 CI 红直到合回主干才出现，
+# 用户 2026-10-17 裁决扩面）。
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 permissions:

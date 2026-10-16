@@ -30,6 +30,16 @@ var _ guardedProcess = (*unixProcess)(nil)
 // argv 直执不经任何 shell 解释，可执行名的查找语义交给 exec。
 // spawnGuarded starts a child in its own process group; no shell is involved.
 func spawnGuarded(req spawnRequest) (guardedProcess, error) {
+	// gosec G204 是本仓唯一一处"受控动态 argv"豁免：`req.executable` 到达本函数前已由
+	// `WhitelistPolicy` 按 SHELL_COMMAND 判据**整串逐字**比对 `shell.allowed_commands`
+	// （`bash` / `sh` 由代码常量拒绝），argv 全部走 `req.args` 逐项原样传递、不经任何 shell
+	// 解释——"动态"正是这个受控执行器的功能本身，不是缺陷。G204 只接受常量实参，跨包的
+	// 授权不变式它看不见，故**无法**用代码消除；消除它只剩改走 os.StartProcess（同类风险、
+	// 只是不再被规则表覆盖）或把调用藏进 reflect（掩盖审计点）两条更差的路。
+	// The one adjudicated dynamic-argv exemption in this repo: the executable was allowlisted
+	// verbatim before reaching here and argv never touches a shell; G204 accepts constants
+	// only, so the cross-package invariant is statically invisible.
+	// #nosec G204 -- 豁免理由：① 可执行名已由 WhitelistPolicy 整串逐字判过白名单（bash / sh 代码常量拒），argv 逐项直执不经 shell；② G204 只接受常量实参，跨包授权不变式静态不可见，无法用代码消除；③ 消除它只能改走 os.StartProcess 或把调用藏进 reflect（掩盖审计点），二者都更差（用户 2026-10-17 裁决）。
 	cmd := exec.Command(req.executable, req.args...)
 	cmd.Dir = req.dir
 	cmd.Env = req.env
