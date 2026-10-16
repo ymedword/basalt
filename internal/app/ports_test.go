@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/testutil"
+	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -245,5 +247,78 @@ func TestLogLevel_MapsConfigValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, logLevel(tc.input))
 		})
+	}
+}
+
+// —— US-5 追加两条（工具清单端口与装配池六件）——
+// Two added by US-5: the tool-listing adapter and the six-tool assembly pool.
+
+// portsFakeTool 是注册池判据用的假工具：池只经 `core.Tool` 接口看它——名字、描述与 schema
+// 各自可辨认，转调是否**逐字段**保真因此判得出（比对名字相等会漏掉描述 / schema 的漂移）。
+// A fake tool whose three fields are individually recognisable, so the adapter's
+// pass-through is judged field by field rather than by name alone.
+type portsFakeTool struct{ name string }
+
+// Name 是注册名。
+func (t portsFakeTool) Name() string { return t.name }
+
+// Description 是给模型的能力说明（含名字，便于逐条对号）。
+func (t portsFakeTool) Description() string { return "假工具：" + t.name }
+
+// InputSchema 是内联 Schema（转调保真的判据面之一）。
+func (t portsFakeTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}`)
+}
+
+// Execute 是假执行体（本文件只判清单转调，不判执行）。
+func (t portsFakeTool) Execute(context.Context, core.ToolEnv, json.RawMessage) (core.Result, error) {
+	return core.Result{}, nil
+}
+
+// TestToolListerPort_ForwardsSpecsInRegistryOrder 端口转调：`Tools()` 就是
+// `registry.Specs(registry.Names())`——顺序（排序稳定）与三个字段都同源，命令面因此
+// **不得**重排也无法另取一份（渲染顺序的唯一来源）。
+//
+// 注册顺序刻意打乱：转调若按插入顺序或 map 遍历顺序导出，这里立刻分道扬镳。
+func TestToolListerPort_ForwardsSpecsInRegistryOrder(t *testing.T) {
+	registry := tool.NewRegistry(nil)
+	for _, name := range []string{"zulu", "alpha", "mid"} {
+		require.NoError(t, registry.Register(portsFakeTool{name: name}))
+	}
+
+	port := toolListerPort{registry: registry}
+	specs := port.Tools()
+
+	require.NotEmpty(t, specs, "池非空时清单不得为空")
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	require.Equal(t, []string{"alpha", "mid", "zulu"}, names, "顺序 = Names() 的排序稳定顺序")
+	require.Equal(t, registry.Specs(registry.Names()), specs, "转调必须逐字段保真（描述与 schema 一并）")
+}
+
+// TestToolListerPort_HeavyAssemblyRegistersSixTools：重路径装配池**六件**——三件文件工具
+// 加本 US 的 `shell` / `http_get` / `http_post`，且新三件确实可解析（`Resolve` 命中），
+// 不再是"注册了名字、背后没有实体"的形态。
+func TestToolListerPort_HeavyAssemblyRegistersSixTools(t *testing.T) {
+	fx := newWireFixture(t)
+	rt := fx.assemble(t)
+
+	specs := rt.tools().Tools()
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	require.Equal(t, []string{
+		"http_get", "http_post", "list_dir", "read_file", "shell", "write_file",
+	}, names, "装配池补到六件（三件文件工具 + 本 US 三件）")
+
+	for _, name := range []string{"shell", "http_get", "http_post"} {
+		resolved, ok := rt.registry.Resolve(name)
+		require.True(t, ok, "新工具必须在注册池内可解析：%s", name)
+		require.Equal(t, name, resolved.Name())
+		require.NotEmpty(t, resolved.Description(), "描述是给模型的能力说明")
+		require.NotEmpty(t, resolved.InputSchema(), "schema 是执行侧判必填的唯一依据")
 	}
 }

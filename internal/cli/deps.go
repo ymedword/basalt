@@ -53,6 +53,13 @@ type Deps struct {
 	RunService    RunService
 	SessionLister SessionLister
 
+	// Tools 是工具注册池端口（见 ports.go）：`tool list` 经它取「注册了什么」这一份数据，
+	// 清单的顺序由实现侧给出、命令面零重排。只有重路径装配才构建过注册池，因此该端口
+	// **只在重路径上非空**——命令面拿到 nil 即报缺件，不自造第二份清单。
+	// The tool-registry port: only the heavy path ever builds the pool, so a nil here
+	// means a wiring gap and is reported as such.
+	Tools ToolLister
+
 	// In / Out 是命令面应当读写的**介质**（真控制台或管道——分流由渠道层按句柄判定，
 	// 不看环境变量）；Signals 是中断来源。三者为空即用进程标准流与渠道自建的中断源。
 	// 注入是为了可判卷：真控制台与真 Ctrl-C 只能在人工项里按，自动化这一侧拿得住的

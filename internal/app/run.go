@@ -30,10 +30,15 @@ var Version = "dev"
 // heavyCommands lists the commands that need the full runtime: those that read or write
 // the agent registry or the database. Everything else takes the zero-assembly path.
 //
+// `tool` 属重路径的理由是**答案的来源**而不是命令的动作：`tool list` 列的是装配期构建的
+// 内存注册池，池之外不存在这份清单（它不写任何东西——"只读"的准确含义见颗粒度文档注 9）。
+// tool is heavy because of where its answer lives, not because of what it does: the pool
+// only exists after assembly.
+//
 // 清单只有这一份，判据落在命令名上——装配层不猜意图，命令面也不会因为注册顺序不同
 // 而走到另一条路上（`serve` 落位时在此追加一名即可）。
 // One list, keyed by command name; serving a new heavy command means adding one entry.
-var heavyCommands = []string{"chat"}
+var heavyCommands = []string{"chat", "tool"}
 
 // readStoreCommands 是需要**只读库句柄**的命令组：`session list` 要读会话数据，但它
 // **不是**重命令——不取锁、不做恢复、不写库（口径 23：别的实例持锁时也该能看清单）。
@@ -109,6 +114,9 @@ func Run(ctx context.Context, args []string) int {
 		}()
 		deps.RunService = rt.runService()
 		deps.SessionLister = rt.sessionLister()
+		// 工具清单端口也只在这一次装配之后才有内容（`tool list` 走的就是这条路）。
+		// The tool-listing port also only has content after this assembly.
+		deps.Tools = rt.tools()
 	} else if needsReadStore(args) {
 		// 轻路径里需要数据的命令：**只读**打开一次（不取锁、不做恢复、不开写池）。
 		// 打不开就如实报——库里没有可列的东西时，"列不出来"比"列出空清单"更接近事实。

@@ -46,14 +46,14 @@ const (
 	guidanceScriptOutside    = "受控脚本必须落在当前 Agent 的 scripts/ 目录或工作区技能库 skills/ 内（代码常量），没有配置键可以加。"
 )
 
-// RunnerOptions 是 LocalRunner 的构造参数——键名逐字沿用 `basalt.yaml` 的 shell 段
-// （§2.4 注 6：沿用已有契约键、不另造）。
+// RunnerOptions 是 LocalRunner 的构造参数——键名逐字沿用 `basalt.yaml` 的既有配置键
+// （§2.4 注 6：沿用已有契约键、不另造；输出预算的出口是 `budget.max_output_bytes`）。
 // RunnerOptions mirrors the existing configuration keys verbatim.
 type RunnerOptions struct {
 	Root           string   // 工作区根（`.basalt`）：解释器脚本允许区 skills/ 相对它定位
 	EnvPassthrough []string // shell.env_passthrough：透传给子进程的父进程变量名
 	Interpreters   []string // shell.interpreters：受控解释器通道（形态与脚本范围由本包校验）
-	MaxOutputBytes int      // shell.max_output_bytes：生效上限；非正值按缺省 256 KB
+	MaxOutputBytes int      // budget.max_output_bytes：装配期上限；非正值按缺省 256 KB
 }
 
 // LocalRunner 是 v1 唯一的受控执行实现（技术方案 §6.5 授权矩阵的**执行侧**）：
@@ -65,7 +65,7 @@ type LocalRunner struct {
 	root           string
 	envPassthrough []string
 	interpreters   map[string]struct{}
-	maxOutputBytes int
+	maxOutputBytes int // 装配期上限（非正值按缺省）；逐 Run 收窄经 effectiveMaxOutputBytes
 }
 
 // 编译期断言：调用方只依赖 `core.CommandRunner`，换实现只动装配处（宪法 VI）。
@@ -73,12 +73,9 @@ type LocalRunner struct {
 var _ core.CommandRunner = (*LocalRunner)(nil)
 
 // NewLocalRunner 装配受控执行器；列表逐条建集合表（显式面，不做前缀 / 通配推断）。
+// 上限按**装配值原样**存下（含非正值），生效值逐次执行时由 effectiveMaxOutputBytes 算。
 // NewLocalRunner wires the runner; the lists become explicit lookup tables.
 func NewLocalRunner(opts RunnerOptions) *LocalRunner {
-	maxBytes := opts.MaxOutputBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxOutputBytes
-	}
 	interpreters := make(map[string]struct{}, len(opts.Interpreters))
 	for _, name := range opts.Interpreters {
 		interpreters[name] = struct{}{}
@@ -87,8 +84,24 @@ func NewLocalRunner(opts RunnerOptions) *LocalRunner {
 		root:           filepath.Clean(opts.Root),
 		envPassthrough: slices.Clone(opts.EnvPassthrough),
 		interpreters:   interpreters,
-		maxOutputBytes: maxBytes,
+		maxOutputBytes: opts.MaxOutputBytes,
 	}
+}
+
+// effectiveMaxOutputBytes 算**本次执行**的读取侧上限：min(装配值、逐命令正值、256 KB 硬上限)。
+// 逐命令值（`Command.MaxOutputBytes`）来自逐 Run 预算，**只许收窄**——它比装配值更长时装配值
+// 说话（"更短才生效"是预算下传的固定口径）；两者都非正时回落缺省 256 KB（0 不得解释成"不限量"，
+// 那等于把这条防线整个关掉）；装配值自身超硬上限同样夹回 256 KB。
+// The per-command budget may only narrow the assembly value; the 256 KB ceiling binds either way.
+func (r *LocalRunner) effectiveMaxOutputBytes(cmd core.Command) int {
+	maxBytes := r.maxOutputBytes
+	if maxBytes <= 0 || maxBytes > defaultMaxOutputBytes {
+		maxBytes = defaultMaxOutputBytes
+	}
+	if cmd.MaxOutputBytes > 0 && cmd.MaxOutputBytes < maxBytes {
+		maxBytes = cmd.MaxOutputBytes
+	}
+	return maxBytes
 }
 
 // Run 执行一次受控命令：形态校验 → 组装白名单环境 → 起进程 → 等退出（或按 ctx 取消
@@ -132,8 +145,9 @@ func (r *LocalRunner) Run(ctx context.Context, cmd core.Command) (core.CommandRe
 		return core.CommandResult{}, errors.Join(err, proc.killTree(), proc.close())
 	}
 
+	maxBytes := r.effectiveMaxOutputBytes(cmd)
 	readCh := make(chan readOutcome, 1)
-	go func() { readCh <- readOutput(reader, r.maxOutputBytes) }()
+	go func() { readCh <- readOutput(reader, maxBytes) }()
 	waitCh := make(chan waitOutcome, 1)
 	go func() {
 		code, waitErr := proc.wait()
@@ -196,7 +210,7 @@ func (r *LocalRunner) Run(ctx context.Context, cmd core.Command) (core.CommandRe
 	}
 	text := string(outcome.data)
 	if outcome.truncated {
-		text += core.TruncationMarker(r.maxOutputBytes)
+		text += core.TruncationMarker(maxBytes)
 	}
 	return core.CommandResult{Output: text, ExitCode: waited.code, Truncated: outcome.truncated}, nil
 }

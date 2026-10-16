@@ -436,6 +436,57 @@ func TestLocalRunner_AppliesDirAndSkipsShell(t *testing.T) {
 	require.Contains(t, res.Output, "cwd="+workDir+"\n", "没有 Agent 上下文时回落进程默认工作目录")
 }
 
+// TestLocalRunner_NarrowsCapPerCommand 覆盖约束 28 的逐命令收窄：`Command.MaxOutputBytes` 比
+// 装配值更短时，读取端按**该 Run 的预算**停下（配置收紧的预算必须到达子进程读取口——
+// 只在执行器末端截断意味着子进程仍把装配值那么多字节读完）。标记里的数字是生效上限。
+// Acceptance point (constraint 28): a per-command budget narrows the read cap.
+func TestLocalRunner_NarrowsCapPerCommand(t *testing.T) {
+	const assemblyBytes = 64
+	const commandBytes = 32
+	fixture := newRunnerFixture(t, func(opts *tool.RunnerOptions) { opts.MaxOutputBytes = assemblyBytes })
+	command := fixture.command(helperModeFlood, helperFloodVar+"=4096")
+	command.MaxOutputBytes = commandBytes
+	res, err := fixture.runner.Run(context.Background(), command)
+	require.NoError(t, err)
+	require.Equal(t, 0, res.ExitCode)
+	require.True(t, res.Truncated)
+	require.Equal(t, strings.Repeat("a", commandBytes)+core.TruncationMarker(commandBytes), res.Output,
+		"生效上限 = min(装配值 64, 逐命令 32)：标记里的数字也是 32")
+}
+
+// TestLocalRunner_ClampsCapToHardCeiling 覆盖约束 28 的夹取：生效读取上限 =
+// min(装配值、逐命令正值、256 KB 硬上限)——装配值与逐命令值哪个超了都夹到 256 KB，
+// 逐命令值**只许收窄、不许放宽**装配值；两者都非正时回落缺省 256 KB。
+// Acceptance point (constraint 28): the effective cap is clamped to the 256 KB ceiling.
+func TestLocalRunner_ClampsCapToHardCeiling(t *testing.T) {
+	const ceiling = 256 * 1024
+	const floodBytes = 300 * 1024 // 比硬上限多一截：截断判据必定命中
+	cases := []struct {
+		name       string
+		assembly   int
+		perCommand int
+		want       int
+	}{
+		{"装配值超硬上限 → 夹到 256 KB", ceiling * 2, 0, ceiling},
+		{"逐命令值超硬上限 → 夹到 256 KB", ceiling * 2, ceiling * 2, ceiling},
+		{"逐命令值不许放宽装配值", 64 * 1024, ceiling * 2, 64 * 1024},
+		{"两者都非正 → 缺省 256 KB", 0, 0, ceiling},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t, func(opts *tool.RunnerOptions) { opts.MaxOutputBytes = tc.assembly })
+			command := fixture.command(helperModeFlood, helperFloodVar+"="+strconv.Itoa(floodBytes))
+			command.MaxOutputBytes = tc.perCommand
+			res, err := fixture.runner.Run(context.Background(), command)
+			require.NoError(t, err)
+			require.Equal(t, 0, res.ExitCode)
+			require.True(t, res.Truncated)
+			require.Equal(t, strings.Repeat("a", tc.want)+core.TruncationMarker(tc.want), res.Output,
+				"生效上限 = min(装配值、逐命令正值、256 KB)")
+		})
+	}
+}
+
 // waitForHeartbeats 轮询心跳文件直到行数达标：供"先确认孙进程跑起来了、再取消"的顺序用。
 func waitForHeartbeats(t *testing.T, path string, want int) {
 	t.Helper()

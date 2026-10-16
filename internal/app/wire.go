@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -188,14 +189,30 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		AllowedDomains:  cfg.HTTP.AllowedDomains,
 	})
 	registry := tool.NewRegistry(logger)
-	// 本 US 只注册三件文件工具（§3.5 占位：shell / http_get / http_post 归 US-5，`use_skill`
-	// 永久禁）。write_file 的构造期 Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，
-	// "判定的那个 Agent"与"写入的那棵树"同源由运行环境保证。
-	// Only the three file tools exist yet; the per-call ToolEnv carries the real write root.
+	// 受控本地执行器在**本 US 首次接线**（US-4 交付了实现与用例、零生产调用点）：shell 工具
+	// 持有的是 `core.CommandRunner` 接口，具体实现在这里一处选定（宪法 VI）。装配上限接
+	// `budget.max_output_bytes` 而**不是** 0——传 0 会让读取侧恒用 256 KB 缺省，配置收紧的
+	// 预算就到不了读取端（子进程仍把 256 KB 读完才算完）。
+	// The controlled executor is wired for the first time here; the assembly-time cap comes
+	// from the existing budget key rather than from the runner's own default.
+	runner := tool.NewLocalRunner(tool.RunnerOptions{
+		Root:           root,
+		EnvPassthrough: cfg.Shell.EnvPassthrough,
+		Interpreters:   cfg.Shell.Interpreters,
+		MaxOutputBytes: outputBudget(cfg),
+	})
+	// 六件工具：三件文件工具 + 本 US 的 shell / http_get / http_post（技能调用工具永久禁；
+	// `notify` / `manage_schedule` 与 US-6 / US-7 / US-10 各件仍为占位）。write_file 的构造期
+	// Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
+	// 那棵树"同源由运行环境保证。
+	// Six tools: the three file tools plus this US's shell and HTTP pair.
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
 		tool.NewListDirTool(policy, root),
+		tool.NewShellTool(policy, runner),
+		tool.NewHTTPGetTool(policy),
+		tool.NewHTTPPostTool(policy),
 	} {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
@@ -248,6 +265,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		sessions:    sessions,
 		invocations: invocations,
 		llmCalls:    llmCalls,
+		registry:    registry,
 	}, nil
 }
 
@@ -284,6 +302,18 @@ func providerNames(cfg *cli.Config) []string {
 	return names
 }
 
+// outputBudget 把配置面的输出预算（int64）收成执行侧装配值（int）；超出 int 表示范围的取值
+// **不搬运**——留在零值由 runner 补缺省，比截断成一个无声改写的上限更接近配置者的意图
+// （与 `cli/chat.go` 的运行预算同一套转换口径）。
+// outputBudget narrows the configured cap to the executor's int, dropping out-of-range
+// values rather than truncating them into a cap nobody wrote.
+func outputBudget(cfg *cli.Config) int {
+	if v := cfg.Budget.MaxOutputBytes; v > 0 && v <= math.MaxInt {
+		return int(v)
+	}
+	return 0
+}
+
 // heavyRuntime 是重路径运行期的资源句柄：实例锁、数据库、运行入口与三个只读消费面。
 // 生命周期 = 一次重命令——`chat` 在整场交互期间持有它，退出时释放。
 // heavyRuntime owns the heavy path's resources for the lifetime of one heavy command.
@@ -311,6 +341,11 @@ type heavyRuntime struct {
 	// One implementation feeds both the write path (the loop) and the read face.
 	invocations *storage.ToolInvocationRepo
 	llmCalls    *storage.LLMCallRepo
+
+	// registry 是装配期构建的工具注册池（只读面）：`tool list` 要的"注册了什么"只存在于
+	// 这一次装配之后——池是内存对象，命令面经 `cli.ToolLister` 取它的**数据**。
+	// The assembly-time tool registry, kept for the command surface's listing.
+	registry *tool.Registry
 }
 
 // Close 按**相反次序**释放：先关库（写池的最后一批使用者就是运行入口），再放实例锁——
@@ -335,6 +370,10 @@ func (r *heavyRuntime) runService() cli.RunService { return runServicePort{servi
 // sessionLister 把会话仓储交给命令面的**只读**端口；写路径不在这里（追加的唯一出口在 core）。
 // sessionLister hands the session store to the read-only port.
 func (r *heavyRuntime) sessionLister() cli.SessionLister { return sessionListerPort{store: r.sessions} }
+
+// tools 把装配期注册池交给命令面的工具清单端口（`tool list` 消费）。
+// tools hands the assembly-time registry to the command surface's tool-listing port.
+func (r *heavyRuntime) tools() cli.ToolLister { return toolListerPort{registry: r.registry} }
 
 // agentSourcePort 是 `core.AgentSource` 的适配器（端口定义在消费方 core，实现落在装配层）：
 // 装配期装载出来的注册结果 + 工作区根 + 段一 / 快照装配器，回答运行入口的三个问题——

@@ -297,21 +297,29 @@ type fileToolInput struct {
 }
 
 // decodeFileToolInput 解出共用入参，错误里点名工具——失败信息要能让模型知道改哪一处。
-// decodeFileToolInput names the tool in the error so the model knows what to fix.
+// **字段类型**不符是调用方的入参问题，不是本仓缺陷：失败载体是 `*core.InvalidInputError`，
+// 执行器据此分类 `invalid_input`；文案与改造前逐字一致（只换承载类型）。
+// decodeFileToolInput names the tool in the error so the model knows what to fix; a type
+// mismatch is an invalid input, never a defect of this repository.
 func decodeFileToolInput(toolName string, input json.RawMessage) (fileToolInput, error) {
 	var args fileToolInput
 	if err := json.Unmarshal(input, &args); err != nil {
-		return fileToolInput{}, fmt.Errorf("解析 %s 入参：%w", toolName, err)
+		return fileToolInput{}, &core.InvalidInputError{
+			Tool:   toolName,
+			Reason: fmt.Sprintf("解析 %s 入参：%s", toolName, err.Error()),
+		}
 	}
 	return args, nil
 }
 
 // check 兜"路径为空"：`{"path":""}` 在 Schema 上合法（键存在），但它没有可解释的目标，
-// 放它进解析只会拿基准目录当目标，得到与模型意图无关的结果。
-// An empty path passes the schema (the key exists) but has no interpretable target.
+// 放它进解析只会拿基准目录当目标，得到与模型意图无关的结果。取值问题与解码失败**同类**
+// （`*core.InvalidInputError`）——执行器入口的必填校验与这里的两处判别产出同一个 `error_kind`。
+// An empty path passes the schema (the key exists) but has no interpretable target; it is
+// the same invalid-input class as a decode failure.
 func (a fileToolInput) check(toolName string) error {
 	if a.Path == "" {
-		return fmt.Errorf("%s 的 path 不能为空", toolName)
+		return &core.InvalidInputError{Tool: toolName, Reason: fmt.Sprintf("%s 的 path 不能为空", toolName)}
 	}
 	return nil
 }

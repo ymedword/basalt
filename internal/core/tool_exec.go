@@ -209,23 +209,38 @@ const auditUnavailableText = "审计不可用：工具调用审计写入失败�
 
 // classifyToolError 把工具返回的错误映射为 `error_kind` 七类之一（契约 §7.3 取值口径）。
 // 判定一律走错误链（errors.Is / errors.As），**不得**比对错误文本。
+// **判序不可交换**（颗粒度文档 §2.3 流程 C）：沙箱 → 入参非法 → 取消 / 截止 → 外部系统 →
+// 文件不存在 → 兜底。两条分界的理由：① 入参非法排在取消 / 截止**之前**——入参在工具动身
+// 之前就已判死，归类不该被"恰好同时到点的截止"改写；② 外部系统排在取消 / 截止**之后**——
+// 取消与截止的**身份**优先于"错误是从哪个系统回来的"，出网超时仍归 timeout。
+// 第七值 `unknown` 不在此产生：它由崩溃恢复扫描写给半截的 pending 行（§4 口径）。
 // classifyToolError maps a tool error onto the seven error_kind values by inspecting the
-// error chain only.
+// error chain only. The order is fixed: sandbox, invalid input, cancellation, external
+// error, missing file, fallback — identity of cancellation outranks where a failure came
+// from, and an invalid input is decided before the tool ever departs.
 func classifyToolError(err error) ErrorKind {
 	switch {
 	case err == nil:
 		return "" // 成功留空 → 列写 NULL
 	case IsSandboxViolation(err):
 		return ErrorKindSandboxDenied
+	case IsInvalidInput(err):
+		// 入参非法（工具解码点：字段类型与取值——入口的必填校验另有 refuseInvalidInput）。
+		return ErrorKindInvalidInput
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// ctx 错误一律归 timeout（**与 ProviderService.classifyError 同口径**）——
 		// 含 Run 级取消：Run 记 `cancelled`，审计按既有口径记 `failed` + `timeout`。
+		// 这一条排在 external_error 之前：外部错误包着 ctx 错误时（`%w` 包装或结果就是
+		// ctx 本身），取消 / 截止的身份说话。
 		return ErrorKindTimeout
+	case IsExternalError(err):
+		// 外部系统错误（DNS / 连接 / TLS / 读取失败 / 4xx / 5xx）——文案是自产的类别摘要。
+		return ErrorKindExternalError
 	case errors.Is(err, fs.ErrNotExist):
 		// 文件 / 脚本目标不存在。
 		return ErrorKindNotFound
 	default:
-		// 进程启动失败 / 编码错误 / 其余本仓内部错误（外部系统错误 US-5 起另有 external_error）。
+		// 进程启动失败 / 编码错误 / 其余本仓内部错误。
 		return ErrorKindRuntimeError
 	}
 }

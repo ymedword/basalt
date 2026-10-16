@@ -28,6 +28,7 @@
 | 2 | 开发类 | `docs/us/us2-provider.md` | §3.1 / §3.2 / §3.3 / §4.1 / §4.4 / §8.7 / §9.1 / §9.2 / §9.4 / §10.1 / §13 | §1.5 / §5.3 / §5.12 / §5.13 / §13.4 | `go.mod`（新增 `go-openai v1.43.0`）、`internal/{core,provider,storage,app,cli,testutil}` | 2026-10-16 |
 | 3 | 开发类 | `docs/us/us3-agent-profile.md` | §4.2 / §8.1 / §8.2 / §8.3 / §8.5 / §8.7 / §10.1 / §11.1 / §11.2 / §11.3 / §11.4 / §11.5 / §13 | §1.5 / §5.1 / §5.2 / §5.10 / §5.12 / §5.13 / §5.14 / §9.1 / §9.5 / §10.2 / §13.4 | `go.mod`（新增 `robfig/cron/v3 v3.0.1`；`golang.org/x/sys` 迁直接依赖）、`internal/{workspace,core,cli}`、`internal/app`（既有适配器改造） | 2026-10-16 |
 | 4 | 开发类 | `docs/us/us4-react-loop.md` | §3.1 / §3.2 / §4.1 / §4.2 / §4.3 / §4.4 / §4.5 / §4.6 / §4.7 / §6.1 / §6.2 / §6.4 / §6.5 / §8.4 / §8.7 / §9.1 / §9.4 / §10.1 / §11.5 / §13 | §1.2 / §5.2 / §5.4 / §5.6 / §5.7 / §5.9 / §5.11 / §5.12 / §9.2 / §10.1 / §10.2 / §13.1 / §13.5 | `internal/{core,tool,channel,cli,storage}`（引擎 / 沙箱与内置工具 / 终端通道 / 命令面 / 仓储与恢复）、`internal/{workspace,app,provider}`（快照构造 / 装配与端口适配 / 出站 `tools` 编解码——既有面改造）、`evals/`（评测基座，仓库根新顶层目录）；`go.mod` 零新增坐标 | 2026-10-17 |
+| 5 | 开发类 | `docs/us/us5-shell-http-tools.md` | §6.1 / §6.2 / §6.3 / §6.4 / §6.5 / §6.6 / §7 / §8.7 / §10.1 / §13 | §1.2 / §5.6 / §5.7 / §5.12 / §13.1 / §13.4 | `internal/tool`（ShellTools / HttpTools + policy 端口规则与拒绝文案脱敏 + runner 输出预算下传）、`internal/cli`（`tool list`）、`internal/core`（`external_error` / `invalid_input` 承载与分类分支 + `Command.MaxOutputBytes`）、`internal/app`（装配接线：注册池 +3、`LocalRunner` 首次接线含预算接线、工具清单端口适配器）；`go.mod` 零新增坐标 | 未入库 |
 
 ## 能力追加登记（非 per-US）
 
