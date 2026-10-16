@@ -27,12 +27,19 @@ jobs:
 
       # 四检查工具固定版本安装——"干净检出 + Go"不足以跑全门禁。
       # 注意传给 go install 的是**含 /cmd/... 的安装路径**（module 路径另算）。
+      # gosec **不得**用 `go install ...@v2.29.0`：它带的 x/tools v0.49.0 读不了 Go 1.27 的
+      # 导出数据（版本 5 > 最高支持 4），扫描会静默降级成只判语法树、类型相关规则整批失效。
+      # 配方因此固定 x/tools v0.50.0，依据与探针读数见 docs/GettingStarted.md §2.5。
       - name: Install check tools
         run: |
           go install mvdan.cc/gofumpt@v0.12.0
           go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
           go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          mkdir -p "$RUNNER_TEMP/gosec-build" && cd "$RUNNER_TEMP/gosec-build"
+          go mod init basalt-gosec-build
+          go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go get golang.org/x/tools@v0.50.0
+          go build -o "$(go env GOPATH)/bin/gosec" github.com/securego/gosec/v2/cmd/gosec
 
       - name: Gate (fmt / lint / sec / test / test-integration / cover)
         run: make fmt lint sec test test-integration cover

@@ -92,3 +92,39 @@ type Agents interface {
 	// Delete archives the agent directory and returns the archive path.
 	Delete(root, name string, now time.Time) (archived string, err error)
 }
+
+// RunService 是命令面对**唯一运行入口**的端口（`chat` 消费，适配器 ← `core.AgentService`）。
+// RunService is the command surface's port onto the single run entry point.
+//
+// 返回语义沿用契约 §1.2 两层分离：**调用方问题**（请求非法 / Agent 不存在 / 同会话忙 /
+// 实例数超限）走 error，**运行期失败**在 `RunResult.Status` 里——命令面据此分工：
+// 前者终止会话并以非零退出码收场，后者按 §6.2 固定口径 4 渲染状态行。
+// Caller-side problems travel as errors; run-time failures ride in the status.
+type RunService interface {
+	// Run 执行一次运行：准入、装配、循环、收尾全在这一层之内。
+	// Run performs one run: admission, wiring, loop and finish.
+	Run(ctx context.Context, req core.RunRequest) (core.RunResult, error)
+}
+
+// SessionLister 是命令面对会话仓储的**只读**端口（`session list` 与 `chat` 消费，
+// 适配器 ← `storage.SessionStore`）。
+// SessionLister is the command surface's read-only port onto the session store.
+//
+// 为什么 chat 也用它——端口是按**消费面**划的，不是按命令划的：`RunResult` 只有工具
+// 调用的**计数**（`ToolCalls int`，没有名字），而渲染口径要求逐条打出
+// `⚙ 调用工具 <name>…` 与"已得部分结果"（§6.2 固定口径 4）。同步运行模型下（调用方
+// 阻塞等 `Run` 返回、全仓无进度回调），**消息历史是唯一能取到这两样的读面**：每次运行
+// 返回后按位置增量确认本轮新增的消息，工具调用提示行取自其中的助手消息、部分结果取自
+// 最后一条非空助手正文。**只读**——命令面从不经此端口写历史（追加唯一路径在 core）。
+// chat reads the very same port: RunResult carries a tool-call count but no names, and
+// under the synchronous run model the message history is the only read face that has
+// them. The port stays read-only; appending remains core's single path.
+type SessionLister interface {
+	// ListSessions 列出全部会话（排序与去重由实现侧负责——命令面保序渲染、不重排）。
+	// ListSessions lists every session; the command surface preserves the order.
+	ListSessions(ctx context.Context) ([]core.SessionRecord, error)
+
+	// Messages 读一个会话的完整历史（按 seq 升序；未知会话返回空切片而非错误）。
+	// Messages reads one session's history in seq order; an unknown session is empty.
+	Messages(ctx context.Context, sessionID string) ([]core.Message, error)
+}

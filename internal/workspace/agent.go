@@ -1,9 +1,10 @@
 package workspace
 
 // 本文件是「一个目录 = 一个 Agent」的装载主体：扫描 .basalt/agents/ 的每个子目录，
-// 解析 AGENT.md 的围栏 frontmatter，执行八条加载期校验（六条全量 + 两条占位登记），
-// 产出 core.AgentEntry 列表。单只失败不拖垮整批——失败进条目（Registered=false）
-// 并记一条点名 WARN，顶层 error 只留给「工作区结构不可读」。
+// 解析 AGENT.md 的围栏 frontmatter，执行八条加载期校验（规则 4 的工具门禁自 US-4 起
+// 执行、规则 6 的「连接成功」半条随 US-7，其余全量），产出 core.AgentEntry 列表。
+// 单只失败不拖垮整批——失败进条目（Registered=false）并记一条点名 WARN，顶层 error
+// 只留给「工作区结构不可读」。
 // This file loads agent directories: it parses the fenced frontmatter of AGENT.md,
 // runs the load-time checks, and returns one entry per directory. A single failure
 // never blocks the others; the top-level error is reserved for an unreadable
@@ -77,6 +78,11 @@ type AgentLoaderOptions struct {
 	// 不得自己再读一次配置：同一文件两次读取正是陷阱 39 的根因形态）。
 	Providers []string
 
+	// Tools 是已注册工具名（注册池名字快照）：装配期从工具注册表导出后注入，
+	// workspace 因此**不**反向依赖 tool 包（§2.4 注 4）。零值 = **空池**——未声明
+	// `tools:` 的 Agent 照常注册，声明了 `tools:` 的 Agent 整只不注册。
+	Tools []string
+
 	// Logger 是点名 WARN 的出口；nil 时用 slog.Default。
 	Logger *slog.Logger
 }
@@ -85,18 +91,23 @@ type AgentLoaderOptions struct {
 // AgentLoader turns every agent directory into one AgentEntry, registered or not.
 type AgentLoader struct {
 	providers []string
+	tools     []string
 	logger    *slog.Logger
 }
 
-// NewAgentLoader 构造装载器；provider 名集切片在构造时拷贝一份，调用方后续改动
-// 不影响判定（判定输入一旦给定就冻结）。
-// NewAgentLoader snapshots the injected provider names.
+// NewAgentLoader 构造装载器；provider 与工具名集切片在构造时各拷贝一份，调用方
+// 后续改动不影响判定（判定输入一旦给定就冻结）。
+// NewAgentLoader snapshots the injected provider and tool names.
 func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &AgentLoader{providers: slices.Clone(opts.Providers), logger: logger}
+	return &AgentLoader{
+		providers: slices.Clone(opts.Providers),
+		tools:     slices.Clone(opts.Tools),
+		logger:    logger,
+	}
 }
 
 // LoadAll 装载全部 Agent 目录；单只失败不拖垮整批（其余照常）。不提供 LoadOne——
@@ -252,8 +263,15 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames []string
 			detail: "已声明的 temperature 必须落在 0–2 且有限，实际 " + strconv.FormatFloat(*t, 'g', -1, 64),
 		}
 	}
-	// 规则 4（tools 全部可解析）是**占位登记**：只解析进 Profile，不判存在——
-	// 门禁随 US-4 的工具注册表接入，本 US 不得顺手补齐。
+	// 规则 4（tools 全部可解析）自 US-4 起**执行**：声明的名字必须落在注册池内，
+	// 缺一即整只不注册并点名（§2.4 注 4）。报的是**声明序**里的第一个缺名——遍历
+	// 按声明序而非池序，判卷才与"池的遍历顺序随机"无关。空池（未注入名字集）下
+	// 未声明 `tools:` 的 Agent 照常注册：空声明列表本来就无名字可判。
+	for _, toolName := range profile.Tools {
+		if !slices.Contains(l.tools, toolName) {
+			return entry, reject{reason: "tool not registered: " + toolName}
+		}
+	}
 	if missing := missingSkill(lib, profile.Skills); missing != "" { // 规则 5
 		return entry, reject{reason: "skill not found: " + missing}
 	}

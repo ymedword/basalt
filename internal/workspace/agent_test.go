@@ -65,6 +65,19 @@ schedules:
 你是一个用于兼容性验证的助手。收到任何消息时，回复"compat ok"。
 `
 
+// compatSampleToolNames 是共享样例声明的 10 个工具名（与上文逐字一致），作为
+// **注册池**注入装载器使用——判据 2 的落点是"加载器对已注册名字集不误拒"，不是
+// "这 10 件工具都实现了"（§2.4 注 4）。
+// compatSampleToolNames is the sample's ten declared tool names, injected as the
+// registered pool: the acceptance point is that the loader never misrejects a
+// registered name set.
+func compatSampleToolNames() []string {
+	return []string{
+		"read_file", "write_file", "list_dir", "shell", "http_get", "http_post",
+		"save_memory", "recall_memory", "notify", "manage_schedule",
+	}
+}
+
 // digestFormatSkillMD 是技能库实体 digest-format：description 供段一卡片断言，
 // 正文「技能说明正文占位」是 L2 负向探针——不得预载进段一。
 // The digest-format skill entity; its body is the L2 negative probe.
@@ -187,22 +200,36 @@ func logText(t *testing.T) string {
 }
 
 // newTestLoader 造一只 provider 名集显式注入、WARN 进测试缓冲的装载器
-// （§2.4 注 2：名集由调用方注入，装载器不自己读配置）。
-// newTestLoader builds a loader with the provider set injected explicitly.
+// （§2.4 注 2：名集由调用方注入，装载器不自己读配置；工具池缺省 = 空池）。
+// newTestLoader builds a loader with the provider set injected explicitly and an
+// empty tool pool.
 func newTestLoader(t *testing.T, providers ...string) *workspace.AgentLoader {
+	t.Helper()
+	return newTestLoaderWithTools(t, nil, providers...)
+}
+
+// newTestLoaderWithTools 在 newTestLoader 之上注入注册池名字集（§2.4 注 4：
+// 名字集由装配期从工具注册表导出后给，workspace 不反向依赖 tool 包）——只影响
+// "声明了 tools: 的 Agent 能否注册"，未声明 tools: 的 Agent 不受影响。
+// newTestLoaderWithTools injects the registered-tool name set on top of
+// newTestLoader; it only affects agents that declare tools.
+func newTestLoaderWithTools(t *testing.T, tools []string, providers ...string) *workspace.AgentLoader {
 	t.Helper()
 	return workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: providers,
+		Tools:     tools,
 		Logger:    bufferedLogger(t),
 	})
 }
 
 // loadOnlyAgent 装载 root 并返回**唯一**的一条结果；要求该条已注册
-// （兼容样例夹具的既定事实，段一用例据此取条目）。
-// loadOnlyAgent loads a single-agent workspace and returns the registered entry.
+// （兼容样例夹具的既定事实，段一用例据此取条目——样例声明了 10 个工具名，
+// 故装载器须注入对应的注册池；§2.4 注 4）。
+// loadOnlyAgent loads a single-agent workspace and returns the registered entry;
+// the compat sample declares ten tools, so the loader injects that name set.
 func loadOnlyAgent(t *testing.T, root string) core.AgentEntry {
 	t.Helper()
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoaderWithTools(t, compatSampleToolNames(), "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered, "夹具应当注册：%s", entries[0].RejectReason)
@@ -212,19 +239,27 @@ func loadOnlyAgent(t *testing.T, root string) core.AgentEntry {
 // 中文验收点：Compatibility §5.1 共享样例加载——注册成功、10 个工具名逐字解析、
 // 技能声明即绑定、schedules 派生命中；判据 3：从**固定起点** 2026-10-01T00:00:00Z
 // 起未来 10 次触发逐条相同（Next 严格晚于传入时刻——robfig v3.0.1 源码实测）。
-// Acceptance point: the shared compatibility sample loads, and its cron fires on
-// the same ten instants on both platforms from a fixed start.
+// 改造落点（§2.4 注 4）：装载器注入 10 个名字作注册池——注册成功 + `tool not
+// registered` **零命中**；样例 AGENT.md 一个字不动。
+// Acceptance point: the shared compatibility sample loads with its ten names
+// injected as the registered pool, and its cron fires on the same ten instants on
+// both platforms from a fixed start.
 func TestAgentLoader_LoadsCompatSampleAgent(t *testing.T) {
 	root := writeCompatSampleWorkspace(t) // Compatibility §5.1 样例逐字：.basalt/agents/compat-check/AGENT.md
 	// + .basalt/{AGENTS.md, SOUL.md, USER.md}（bootstrap 三件）+ .basalt/skills/digest-format/SKILL.md
 	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames(), // 判据 2 前半：10 个名字全部在注册池内
 		Logger:    bufferedLogger(t),
 	})
 
 	entries, err := loader.LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
+	for _, e := range entries {
+		require.NotContains(t, e.RejectReason, "tool not registered",
+			"判据 2 反例面：已注册的 10 个名字一个都不得被误判为未注册")
+	}
 
 	entry := entries[0]
 	require.True(t, entry.Registered, "样例必须注册：%s", entry.RejectReason)
@@ -259,6 +294,71 @@ func TestAgentLoader_LoadsCompatSampleAgent(t *testing.T) {
 		at = parsed.Next(at)
 		require.True(t, want.Equal(at), "第 %d 次触发：want %s，got %s", i, want, at)
 	}
+}
+
+// 中文验收点：注入 3 个名字（read_file / write_file / list_dir）→ 同一份兼容样例
+// 被拒，reason 逐字 `tool not registered: shell`——报的是**声明序**里的第一个缺名
+// （多缺名也只报一条；报哪条不以池的遍历顺序为转移）。
+// Acceptance point: a declared-but-unregistered tool rejects the whole agent and
+// the reason names the first missing name in declaration order.
+func TestAgentLoader_RejectsAgentDeclaringUnregisteredTool(t *testing.T) {
+	root := writeCompatSampleWorkspace(t)
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames()[:3], // 前三个：read_file / write_file / list_dir
+		Logger:    bufferedLogger(t),
+	})
+
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	entry := entries[0]
+	require.False(t, entry.Registered, "声明的工具名不在注册池 → 整只不注册")
+	require.Equal(t, "tool not registered: shell", entry.RejectReason,
+		"reason 逐字点名声明序里的第一个缺名（shell）")
+	require.Equal(t, compatSampleToolNames(), entry.Profile.Tools,
+		"声明面照常解析进 Profile（未注册也可供 list / show 展示）")
+	require.Contains(t, logText(t), "tool not registered: shell",
+		"未注册同时经 WARN 点名（reason 取契约字面量原样）")
+}
+
+// 中文验收点：**空池语义**前半（§2.4 注 4）——装载器未注入任何工具名（`Tools` 零值）
+// 时，未声明 `tools:` 的 Agent 照常注册，行为与改造前的占位一致。
+// Acceptance point: an empty tool pool still registers an agent that declares no
+// tools — the behavior before the gate landed.
+func TestAgentLoader_EmptyToolPoolKeepsAgentWithoutToolsDeclaration(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "pool-less", `
+name: pool-less
+provider: {name: deepseek, model: deepseek-chat}
+`, "正文占位")
+
+	entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered,
+		"空池不得拦下未声明 tools: 的 Agent：%s", entries[0].RejectReason)
+	require.Empty(t, entries[0].Profile.Tools)
+}
+
+// 中文验收点：**空池语义**后半——`Tools` 零值且 Agent **声明了** `tools:` →
+// 整只不注册，reason 逐字点名首个声明名（空池不是"全部放行"）。
+// Acceptance point: the other half — a declared tool can never pass while nothing
+// is registered, so the empty pool is not a blanket pass.
+func TestAgentLoader_EmptyToolPoolRejectsAgentDeclaringTools(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "declaring", `
+name: declaring
+provider: {name: deepseek, model: deepseek-chat}
+tools: [read_file]
+`, "正文占位")
+
+	entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.False(t, entries[0].Registered, "空池下声明的名字一律视作未注册")
+	require.Equal(t, "tool not registered: read_file", entries[0].RejectReason)
 }
 
 // 中文验收点：目录名与 frontmatter name 逐字一致——不一致整只不注册且点名；
@@ -528,7 +628,9 @@ schedules: []
 	writeFileInRoot(t, root, "AGENTS.md", "引导")
 	writeMCPServers(t, root, []string{"search"})
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	// 规则 4 门禁：夹具声明了 tools: [read_file] → 注册池里必须真有这个名字
+	// （§2.4 注 4；映射断言本身逐字不变）。
+	entries, err := newTestLoaderWithTools(t, []string{"read_file"}, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered, "样例应注册：%s", entries[0].RejectReason)

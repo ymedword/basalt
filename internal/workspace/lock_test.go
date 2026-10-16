@@ -261,8 +261,10 @@ func TestInstanceLock_ReadOnlyCommandsDoNotTouchLockFile(t *testing.T) {
 	before := readLockDiagnosticArea(t, lockPath)
 
 	// 只读命令面走的路径：profile list / show 的装载 + 段一装配（无写、无锁）。
+	// 样例声明了 10 个工具名 → 装载器注入对应注册池（§2.4 注 4）；断言逐字不变。
 	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames(),
 		Logger:    bufferedLogger(t),
 	}).LoadAll(root)
 	require.NoError(t, err)

@@ -249,3 +249,57 @@ func TestLLMCallRepo_ConcurrentBeginCall(t *testing.T) {
 		`SELECT count(*) FROM llm_calls WHERE status = 'pending'`).Scan(&count))
 	require.Equal(t, n, count, "并发预写全部落库且均为 pending")
 }
+
+// TestLLMCallRepo_CallsByRunReturnsRoundOrderedViews：只读面按轮号升序取该 Run 的行——
+// 过滤只认 run_id（别的 Run 的行不得混入）、同轮号按写入序（次级键 id），故读数行序在
+// 两次相同运行之间不可能漂移；无行的 Run 返回**空切片且无错误**（"这个 Run 没有审计行"
+// 是评测里"计量不完整"那一档读数，不是读取失败）；pending 行按原样带出、三列 0——
+// 正是评测判"用量缺失"的输入形态，读面**不得**替它编一个成功态。
+func TestLLMCallRepo_CallsByRunReturnsRoundOrderedViews(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	repo := NewLLMCallRepo(db)
+
+	// 两个 Run 交错写入：过滤若漏掉 run_id，会在轮号序列里当场露馅。
+	for _, call := range []core.LLMCall{
+		{RunID: "run-a", Round: 2, Provider: "fake", Model: "m"},
+		{RunID: "run-b", Round: 1, Provider: "fake", Model: "m"},
+		{RunID: "run-a", Round: 1, Provider: "fake", Model: "m"},
+	} {
+		id, err := repo.BeginCall(ctx, call)
+		require.NoError(t, err)
+		if call.RunID == "run-b" {
+			continue // run-b 那一行**留在 pending**（判"计量不完整"的输入形态）
+		}
+		require.NoError(t, repo.FinishCall(ctx, id, core.LLMCallResult{
+			Status: core.LLMCallSuccess, PromptTokens: call.Round * 10,
+			CompletionTokens: call.Round * 100, TotalTokens: call.Round * 110,
+			Duration: time.Millisecond,
+		}))
+	}
+	// 同一轮号第二行：先写在前（次级键 id 决定行序）。
+	dupID, err := repo.BeginCall(ctx, core.LLMCall{RunID: "run-a", Round: 2, Provider: "fake", Model: "m"})
+	require.NoError(t, err)
+	require.NoError(t, repo.FinishCall(ctx, dupID, core.LLMCallResult{
+		Status: core.LLMCallFailed, ErrorKind: core.ErrorKindUnknown,
+	}))
+
+	views, err := repo.CallsByRun(ctx, "run-a")
+	require.NoError(t, err)
+	require.Equal(t, []core.LLMCallView{
+		{Round: 1, Status: core.LLMCallSuccess, PromptTokens: 10, CompletionTokens: 100, TotalTokens: 110},
+		{Round: 2, Status: core.LLMCallSuccess, PromptTokens: 20, CompletionTokens: 200, TotalTokens: 220},
+		{Round: 2, Status: core.LLMCallFailed},
+	}, views, "按轮号升序、同轮按写入序；状态与三 token 列原样带出")
+
+	bViews, err := repo.CallsByRun(ctx, "run-b")
+	require.NoError(t, err)
+	require.Len(t, bViews, 1, "别的 Run 的行不得混入")
+	require.Equal(t, 1, bViews[0].Round)
+	require.Equal(t, core.LLMCallPending, bViews[0].Status, "pending 行按原样带出，不代判成败")
+	require.Zero(t, bViews[0].TotalTokens, "预写态三列 0——读面不编数")
+
+	none, err := repo.CallsByRun(ctx, "run-never")
+	require.NoError(t, err, "没有行的 Run 不是错误")
+	require.Empty(t, none)
+}

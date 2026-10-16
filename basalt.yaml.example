@@ -12,6 +12,7 @@
 http:
   addr: 127.0.0.1:8080        # 缺省本机；远程部署显式改，出处 docs/contracts/openapi.yaml
   max_request_bytes: 1048576  # 请求体总上限（缺省 1 MiB，解析前拒绝）
+  allowed_domains: []         # 出网域名白名单（大小写不敏感）；消费归 US-5 的 http_get / http_post，键名出处 docs/Operations.md §2.2
 
 # 日志档位（US-1 消费）：text = dev 可读文本；json = prod 结构化
 log:

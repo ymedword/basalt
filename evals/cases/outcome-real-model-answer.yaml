@@ -1,0 +1,41 @@
+# 真模型档（显式门控，缺一不发）：同一套用例格式、同一条运行入口，只是后端换成真供应商。
+#
+# 门控四件缺任何一样都不跑，且**跳过不计入通过**：
+#   ① 命令行 `--provider deepseek`（值必须与本文件的 provider 逐字相等）；
+#   ② 仓库根的 basalt.yaml 里存在同名供应商条目（本档把它**原样复制**进用例工作区——真模型
+#      读的就是运维写的那份配置，评测不替它改编）；
+#   ③ 该条目引用的凭证环境变量已导出（缺 → 配置装载 fail-closed 拒绝 → 本档按跳过处理）。
+#
+# 断言只判**结构读数**（终止状态 / 调用次数 / 用量 / 计量完整性），不判具体措辞——
+# 真模型的用词不是用例能钉死的；措辞断言归默认 fake 档。
+# 本档**不得**写 script：真模型的回答不是脚本回放，留着脚本会让读数看起来是脚本控制的。
+id: outcome-real-model-answer
+kind: 业务结果
+provider: deepseek
+description: 真模型单轮问答（显式门控）——只判结构读数：完成状态、恰 1 次调用、用量 ≥ 1 token、计量完整
+message: 请用一句话回答：评测链路是否就绪？
+fixture:
+  agent: real-model-agent
+  agent_md: |
+    ---
+    name: real-model-agent
+    description: 评测夹具——真模型档
+    provider:
+      name: deepseek
+      model: deepseek-chat
+    settings:
+      max_iterations: 3
+    ---
+
+    你是 Basalt 的评测夹具 Agent：用一句话回答问题，不调用任何工具。
+budget:
+  max_iterations: 3
+  max_tool_calls: 1
+  context_tokens: 32768
+# scripts 段刻意缺席：真模型档写 script 会被装载期拒绝。
+expect:
+  status: completed
+  tool_sequence: []
+  llm_calls: 1
+  min_total_tokens: 1
+  usage_complete: true

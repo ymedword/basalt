@@ -26,9 +26,44 @@ type LLMCallRepo struct{ db *DB }
 // Compile-time assertion that LLMCallRepo satisfies the consumer-declared interface.
 var _ core.LLMCallStore = (*LLMCallRepo)(nil)
 
+// 编译期断言：同一个实现也满足**只读**查询面（读写合成一个实现、两个消费面——与
+// ToolInvocationRepo 的既有形态一致）。
+// The same implementation also satisfies the read-only surface, mirroring the tool repo.
+var _ core.LLMCallReader = (*LLMCallRepo)(nil)
+
 // NewLLMCallRepo 绑定一个已打开的写模式库句柄。
 // NewLLMCallRepo binds the repo to an opened writable database handle.
 func NewLLMCallRepo(db *DB) *LLMCallRepo { return &LLMCallRepo{db: db} }
+
+// CallsByRun 按轮号升序取该 Run 的模型调用行（只读路径，走只读池）。
+// 排序带 `id` 做次级键：同一轮理论上只有一次调用，但真出现重复轮号时，行序必须**确定**——
+// 读数行序在两次运行之间漂移，用量对账就没法复核。
+// CallsByRun reads one run's call rows in round order, with the row id as a tiebreaker so
+// the order can never drift between two identical runs.
+func (r *LLMCallRepo) CallsByRun(ctx context.Context, runID string) ([]core.LLMCallView, error) {
+	rows, err := r.db.read.QueryContext(ctx,
+		`SELECT round, status, prompt_tokens, completion_tokens, total_tokens
+		   FROM llm_calls WHERE run_id = ? ORDER BY round, id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("读审计行（run_id=%s）: %w", runID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var views []core.LLMCallView
+	for rows.Next() {
+		var v core.LLMCallView
+		var status string
+		if err := rows.Scan(&v.Round, &status, &v.PromptTokens, &v.CompletionTokens, &v.TotalTokens); err != nil {
+			return nil, fmt.Errorf("扫描审计行（run_id=%s）: %w", runID, err)
+		}
+		v.Status = core.LLMCallStatus(status)
+		views = append(views, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历审计行（run_id=%s）: %w", runID, err)
+	}
+	return views, nil
+}
 
 // BeginCall 插入 status=pending 的审计行并返回行 id；失败 = 调用方**拒绝发出**该次调用。
 // BeginCall inserts the pending audit row and returns its id. A failure here means the

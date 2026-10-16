@@ -2,6 +2,7 @@ package cli
 
 import (
 	"log/slog"
+	"os"
 )
 
 // Deps 是命令面的显式类型化装配参数——工作目录、目标 schema 版本与日志器一律
@@ -44,4 +45,22 @@ type Deps struct {
 	// Agents is the agent-directory port: list / show stay read-only, while create /
 	// delete write through the instance lock taken inside the implementation.
 	Agents Agents
+
+	// RunService 与 SessionLister 是运行面端口（见 ports.go）：`chat` 走前者跑一次运行、
+	// 经后者读回本轮新增的消息，`session list` 只用后者。
+	// The run-face ports: chat runs through RunService and reads history through
+	// SessionLister; session list consumes SessionLister only.
+	RunService    RunService
+	SessionLister SessionLister
+
+	// In / Out 是命令面应当读写的**介质**（真控制台或管道——分流由渠道层按句柄判定，
+	// 不看环境变量）；Signals 是中断来源。三者为空即用进程标准流与渠道自建的中断源。
+	// 注入是为了可判卷：真控制台与真 Ctrl-C 只能在人工项里按，自动化这一侧拿得住的
+	// 只有一对管道和一条信号通道（颗粒度文档 §6.1 第 4 项）。
+	// In/Out/Signals are the media and the interrupt source; nil falls back to the
+	// process standard streams and a channel-owned signal source. Injecting them is
+	// what makes the interactive path testable at all.
+	In      *os.File
+	Out     *os.File
+	Signals <-chan os.Signal
 }

@@ -390,3 +390,78 @@ func TestConfig_AcceptsEncodedHashInPath(t *testing.T) {
 func providerConfigWithBaseURL(baseURL string) string {
 	return strings.Replace(baseConfig, "base_url: http://${DEMO_HOST}:8080/v1", "base_url: "+baseURL, 1)
 }
+
+// allowlistSections 是 `sandbox` / `shell` / `http.allowed_domains` 三段的白名单形态。
+// 五个键名逐字取自颗粒度文档 §3.5 第 4 项（US-4 的 T058 把它们从原始 map 搬进类型化
+// 字段，**不改键名、不删键**）——写成字面量而不是引用常量：键名本身就是被测面，
+// 引用同一份声明会让"两边一起改"也判成通过。
+const allowlistSections = `http:
+  addr: "127.0.0.1:8080"
+  allowed_domains:
+    - api.internal.example
+    - Mirror.Example.COM
+log:
+  level: info
+providers:
+  - name: demo
+    base_url: http://${DEMO_HOST}:8080/v1
+    api_key: ${DEMO_KEY}
+sandbox:
+  cross_agent_read:
+    - notes-agent
+    - archive-agent
+shell:
+  allowed_commands:
+    - git
+    - go
+  interpreters:
+    - python
+    - node
+  env_passthrough:
+    - PATH
+    - HOME
+`
+
+// TestLoadConfig_ParsesAllowlistSections 三段白名单落进类型化字段：五个键名逐字沿用、
+// 取值与顺序原样保留（`allowed_commands` 是整串逐字比对、域名大小写不敏感——重排或规范化
+// 都会改变策略语义，装载层因此只搬运、不加工）。
+// TestLoadConfig_ParsesAllowlistSections: the five allowlist keys land in typed fields
+// verbatim, order included.
+func TestLoadConfig_ParsesAllowlistSections(t *testing.T) {
+	path := writeConfig(t, allowlistSections)
+
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err, "三段都是可选段，配了就该原样落地")
+
+	require.Equal(t, []string{"api.internal.example", "Mirror.Example.COM"}, cfg.HTTP.AllowedDomains,
+		"http.allowed_domains：大小写原样保留（不敏感判定归策略侧）")
+	require.Equal(t, []string{"notes-agent", "archive-agent"}, cfg.Sandbox.CrossAgentRead,
+		"sandbox.cross_agent_read：允许被跨 Agent 读取的 Agent 名清单")
+	require.Equal(t, []string{"git", "go"}, cfg.Shell.AllowedCommands, "shell.allowed_commands")
+	require.Equal(t, []string{"python", "node"}, cfg.Shell.Interpreters, "shell.interpreters")
+	require.Equal(t, []string{"PATH", "HOME"}, cfg.Shell.EnvPassthrough, "shell.env_passthrough")
+}
+
+// TestLoadConfig_AllowlistSectionsDefaultToEmpty 缺省形态：三段一个键都不写 → 零值**空清单**
+// （而不是报错）。空清单在策略侧的语义是"一个都不放行"——这在授权面是安全默认，在装载面
+// 是"没配就不拦"，两处口径由消费者各自落实，装载层不得替它们补白名单。
+// TestLoadConfig_AllowlistSectionsDefaultToEmpty: an absent section is an empty
+// allowlist, which the policy side reads as deny-all.
+func TestLoadConfig_AllowlistSectionsDefaultToEmpty(t *testing.T) {
+	path := writeConfig(t, baseConfig)
+
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err, "可选段缺失不是错误")
+
+	require.Empty(t, cfg.HTTP.AllowedDomains)
+	require.Empty(t, cfg.Sandbox.CrossAgentRead)
+	require.Empty(t, cfg.Shell.AllowedCommands)
+	require.Empty(t, cfg.Shell.Interpreters)
+	require.Empty(t, cfg.Shell.EnvPassthrough)
+}

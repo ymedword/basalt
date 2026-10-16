@@ -35,15 +35,17 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		},
 	}
 
-	// 注册点：init / status / provider / profile 四条子命令由各自的任务落地后在此注册
-	// ——骨架期保持"零子命令也可编译"，避免门禁依赖尚未交付的故事。
-	// Registration site: init, status, provider and profile land here as their tasks
-	// complete, so the skeleton stays buildable ahead of those stories.
+	// 注册点：init / status / provider / profile / chat / session 六条子命令由各自的任务
+	// 落地后在此注册——骨架期保持"零子命令也可编译"，避免门禁依赖尚未交付的故事。
+	// Registration site: init, status, provider, profile, chat and session land here as
+	// their tasks complete, so the skeleton stays buildable ahead of those stories.
 	root.AddCommand(
 		newInitCommand(deps),
 		newStatusCommand(deps),
 		newProviderCommand(deps),
 		newProfileCommand(deps),
+		newChatCmd(deps),
+		newSessionCmd(deps),
 	)
 
 	return root

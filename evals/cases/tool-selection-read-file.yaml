@@ -1,0 +1,67 @@
+# 读数：工具选择 —— 模型在两个可用工具之间选了哪一个。
+# 判据落在 tool_sequence 上：期望序列**恰是** [read_file]（一次都没调 list_dir）；
+# 再加上 tool_results_contain，证明选中的那次调用真的把文件内容喂回了模型。
+id: tool-selection-read-file
+kind: 工具选择
+provider: ""
+description: 用户点名要读一个已知文件——期望模型直接选 read_file（不是 list_dir），并把文件内容用进最终回答
+message: 读一下 config.ini，告诉我里面的端口号是多少。
+fixture:
+  agent: selector-agent
+  agent_md: |
+    ---
+    name: selector-agent
+    description: 评测夹具——工具选择读数
+    provider:
+      name: probe
+      model: eval-probe-model
+    tools:
+      - read_file
+      - list_dir
+    settings:
+      max_iterations: 10
+    ---
+
+    你是评测夹具 Agent：按用户要求读取文件并用文件内容回答问题。
+  files:
+    config.ini: |
+      # 服务配置
+      [server]
+      port=8080
+    notes/unrelated.txt: |
+      与本次问题无关的另一个文件：目标是凑出"不止一个可选对象"的选择场景。
+budget:
+  max_iterations: 3
+  max_tool_calls: 5
+  context_tokens: 32768
+script:
+  # 第一轮：只给工具调用、不给结论——这一轮若直接给结论，工具选择读数就没有依据。
+  - content: 我先读一下配置文件。
+    usage:
+      prompt: 120
+      completion: 18
+      total: 138
+    tool_calls:
+      - id: call-config-1
+        name: read_file
+        arguments: '{"path": "config.ini"}'
+  # 第二轮：无工具调用即完成，最终回答里必须出现文件内容里的端口号。
+  - content: 配置文件里的端口号是 8080。
+    usage:
+      prompt: 210
+      completion: 24
+      total: 234
+expect:
+  status: completed
+  tool_sequence:
+    - read_file
+  text_contains:
+    - 8080
+  tool_results_contain:
+    - port=8080
+  audit:
+    - tool_call_id: call-config-1
+      status: success
+  llm_calls: 2
+  min_total_tokens: 372
+  usage_complete: true

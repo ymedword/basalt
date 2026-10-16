@@ -57,3 +57,28 @@ func newProviderService(cfg *cli.Config, store core.LLMCallStore,
 	}
 	return provider.NewProviderService(clients, models, store, logger), nil
 }
+
+// modelClient 返回运行入口消费的模型客户端：**两条路拿到的都是 ProviderService**——路由
+// 查表与两阶段审计一步不少（宪法 III + V）。区别只在"谁来回答"。
+// modelClient returns the client the run entry point consumes. Both paths are the
+// routing-and-audit service, so the audit chain is never bypassed.
+//
+// 替身路（`App.providerOverride` 非 nil；评测基座的默认后端）**照建全表**：每个配置名各一条，
+// 都指向同一个替身。表里只放一个条目等于绕开路由查表，评测就失去对"配置名 → 客户端"
+// 对应关系的检验——而那正是宪法 III 要求显式建表的地方。
+// The override path still builds one entry per configured name; a single-entry map would
+// bypass routing and stop the evals from exercising it.
+func (a *App) modelClient(cfg *cli.Config, store core.LLMCallStore,
+	logger *slog.Logger,
+) (core.ProviderClient, error) {
+	if a.providerOverride == nil {
+		return newProviderService(cfg, store, logger)
+	}
+	clients := make(map[string]core.ProviderClient, len(cfg.Providers))
+	models := make(map[string]string, len(cfg.Providers))
+	for _, entry := range cfg.Providers {
+		clients[entry.Name] = a.providerOverride
+		models[entry.Name] = entry.DefaultModel
+	}
+	return provider.NewProviderService(clients, models, store, logger), nil
+}
