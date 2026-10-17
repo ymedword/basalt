@@ -38,7 +38,7 @@ func TestAgentLoader_RejectsFiveFieldCron(t *testing.T) {
 // Acceptance point: a syntax error carries the parser's own message.
 func TestAgentLoader_CronSyntaxErrorCarriesParserText(t *testing.T) {
 	root := writeWorkspaceWithSchedule(t, "0 0 8 * * nope", "UTC") // 周字段不是合法名
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -70,7 +70,7 @@ func TestAgentLoader_DefaultZoneIsUTC(t *testing.T) {
 // Acceptance point: an unloadable zone name is rejected with the loader's message.
 func TestAgentLoader_InvalidZoneRejected(t *testing.T) {
 	root := writeWorkspaceWithSchedule(t, "0 0 8 * * *", "Mars/Olympus")
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -85,7 +85,7 @@ func TestAgentLoader_InvalidZoneRejected(t *testing.T) {
 // Acceptance point: zone Local is blacklisted explicitly.
 func TestAgentLoader_RejectsLocalZone(t *testing.T) {
 	root := writeWorkspaceWithSchedule(t, "0 0 8 * * *", "Local")
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -144,7 +144,7 @@ func TestAgentLoader_RejectsSevenInDayOfWeek(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := writeWorkspaceWithSchedule(t, tc.cron, "UTC")
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 
 			entry := entries[0]
@@ -177,7 +177,7 @@ func TestAgentLoader_RejectsUnsupportedTokens(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := writeWorkspaceWithSchedule(t, tc.cron, "UTC")
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 
 			entry := entries[0]
@@ -202,7 +202,7 @@ schedules:
     message: "   "
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -215,7 +215,7 @@ schedules:
 // Acceptance point: a single task without an id derives <agent>-1.
 func TestAgentLoader_ScheduleIDSingleTaskDerivesAgentSuffix(t *testing.T) {
 	root := writeWorkspaceWithSchedule(t, "0 0 8 * * *", "UTC")
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -240,7 +240,7 @@ schedules:
     message: 午报
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -267,7 +267,7 @@ schedules:
     message: 午报
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	entry := entries[0]
@@ -299,7 +299,7 @@ schedules:
     message: 晚报
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	byName := make(map[string]core.AgentEntry, len(entries))
@@ -380,7 +380,7 @@ schedules:
     message: 晚报
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 
 	byName := make(map[string]core.AgentEntry, len(entries))
@@ -429,7 +429,7 @@ func TestAgentLoader_RejectsCronWithTimezonePrefix(t *testing.T) {
 	for _, expr := range []string{"CRON_TZ=Asia/Shanghai 0 0 8 * * *", "TZ=UTC 0 0 8 * * *"} {
 		t.Run(strings.Fields(expr)[0], func(t *testing.T) {
 			root := writeWorkspaceWithSchedule(t, expr, "Asia/Shanghai")
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 			require.Len(t, entries, 1)
 

@@ -257,27 +257,22 @@ type readOutcome struct {
 	err       error
 }
 
-// childEnv 组装子进程的环境：**只**透传白名单命中的父进程变量，加上工具显式声明的变量；
-// 同名时以**工具声明**为准（调用方显式给的值优先于环境里的老值）。返回值**必须**是非 nil
-// 切片——平台侧在 env 为空时都会回落到"继承整个父进程环境"，空切片才表达"一个都不透传"。
-// childEnv builds the child environment: allowlisted parent variables plus tool-declared
-// ones, with the declaration winning on name collisions. The result is never nil, because
-// an empty slice is what expresses "inherit nothing" on every platform.
-func (r *LocalRunner) childEnv(cmd core.Command) ([]string, error) {
-	declared := make(map[string]string, len(cmd.Env))
-	order := make([]string, 0, len(cmd.Env))
-	for _, entry := range cmd.Env {
-		name, _, ok := strings.Cut(entry, "=")
-		if !ok || name == "" {
-			return nil, fmt.Errorf("工具声明的环境变量 %q 不是 KEY=VALUE 形态", entry)
-		}
-		if _, seen := declared[name]; !seen {
-			order = append(order, name)
-		}
-		declared[name] = entry
+// mergeChildEnv 组装子进程的环境变量块：**只**透传白名单命中的父进程变量，加上调用方
+// 显式声明的变量；同名时以**声明**为准（显式给的值优先于环境里的老值）。返回值**必须**是
+// 非 nil 切片——平台侧在 env 为空时都会回落到"继承整个父进程环境"，空切片才表达"一个都不
+// 透传"。声明项按键名排序输出：`cmd.Env` 的 map 形态丢掉了输入顺序，排序让结果仍可复现；
+// 被声明覆盖的透传名整条跳过，因此输出里不存在同名重复项（Windows 的"先出现为准"不受影响）。
+// mergeChildEnv builds the child environment: allowlisted parent variables plus
+// explicitly declared ones, with declarations winning on collisions. The result is
+// never nil, because an empty slice is what expresses "inherit nothing".
+func mergeChildEnv(passthrough []string, declared map[string]string) []string {
+	names := make([]string, 0, len(declared))
+	for name := range declared {
+		names = append(names, name)
 	}
-	env := make([]string, 0, len(r.envPassthrough)+len(order))
-	for _, name := range r.envPassthrough {
+	slices.Sort(names)
+	env := make([]string, 0, len(passthrough)+len(names))
+	for _, name := range passthrough {
 		if _, overridden := declared[name]; overridden {
 			continue
 		}
@@ -285,10 +280,25 @@ func (r *LocalRunner) childEnv(cmd core.Command) ([]string, error) {
 			env = append(env, name+"="+value)
 		}
 	}
-	for _, name := range order {
-		env = append(env, declared[name])
+	for _, name := range names {
+		env = append(env, name+"="+declared[name])
 	}
-	return env, nil
+	return env
+}
+
+// childEnv 把工具声明的 KEY=VALUE 条目解析成声明表后交给 mergeChildEnv——本函数只做
+// 形态校验（缺 `=` / 空键即拒），合并语义只有 mergeChildEnv 一处实现（shell 与 MCP 共用）。
+// childEnv validates the tool-declared KEY=VALUE entries and delegates the merge.
+func (r *LocalRunner) childEnv(cmd core.Command) ([]string, error) {
+	declared := make(map[string]string, len(cmd.Env))
+	for _, entry := range cmd.Env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("工具声明的环境变量 %q 不是 KEY=VALUE 形态", entry)
+		}
+		declared[name] = value
+	}
+	return mergeChildEnv(r.envPassthrough, declared), nil
 }
 
 // checkInterpreter 是解释器受控通道的**执行侧**校验（§2.2 约束 17 / 流程 F ⑤）：授权面

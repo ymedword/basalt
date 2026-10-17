@@ -30,7 +30,7 @@ provider: {name: deepseek, model: deepseek-chat}
 bootstrap: [PIPE]
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.False(t, entries[0].Registered, "bootstrap 指向特殊文件必须整只不注册")

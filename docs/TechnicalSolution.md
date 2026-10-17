@@ -588,7 +588,7 @@ const (
 
 **跨 Agent 读取需要显式授权**：文件读默认**只读得到自己**——避免一个 Agent 用 `read_file` 窥探另一个 Agent 的提示词与配置。授权键 `sandbox.cross_agent_read`（字符串列表，元素 = 允许读取的 Agent 名；缺省空 = 一个都不许）。基线差异登记见 [Compatibility.md](Compatibility.md) §3。
 
-**子进程环境变量白名单**：`shell` 起的子进程**不得**继承调用进程完整环境（那会把 `BASALT_*` / 云凭证 / 代理设置一并送给任意脚本）。只透传 `shell.env_passthrough` 列出的变量（缺省 `PATH` / `HOME` / `LANG` / `TZ`）+ 工具显式声明的变量；其余一律清空。
+**子进程环境变量白名单**：`shell` 起的子进程**不得**继承调用进程完整环境（那会把 `BASALT_*` / 云凭证 / 代理设置一并送给任意脚本）。只透传 `shell.env_passthrough` **显式登记**的变量；示例配置 `basalt.yaml.example` 登记 `PATH` / `HOME` / `LANG` / `TZ`。**代码无内置默认白名单**——省略该键或配置为空列表时，**不透传**父进程环境变量；工具显式声明的变量仍按规则传入。其余一律清空。
 
 #### 执行控制（`LocalRunner`）
 

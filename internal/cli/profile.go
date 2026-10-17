@@ -291,19 +291,34 @@ func runProfileDelete(out io.Writer, deps Deps, name string, now time.Time) erro
 }
 
 // renderProfileList 逐条渲染 + 汇总行——两行状态行与汇总行的措辞是**固定口径**
-// （§6 第 3 项），改措辞等于改判据。
-// renderProfileList renders every entry plus the summary line, verbatim per §6.
+// （§6 第 3 项），改措辞等于改判据。US-7 增第三态后缀：**未验证数 > 0** 时才追加
+// `/ 未验证 %d`（斜杠前一个空格）；零计数时汇总行与 US-3 逐字节相同（轻路径在零 MCP
+// 配置下的行为承诺）。
+// renderProfileList renders every entry plus the summary line, verbatim per §6; the
+// unverified suffix appears only when the count is positive, keeping the zero case
+// byte-identical to US-3.
 func renderProfileList(out io.Writer, entries []core.AgentEntry) {
 	for _, entry := range entries {
 		renderProfileLine(out, entry)
 	}
-	fmt.Fprintf(out, "汇总：%d 个 Agent 目录（已注册 %d）\n", len(entries), registeredCount(entries))
+	fmt.Fprintf(out, "汇总：%d 个 Agent 目录（已注册 %d）", len(entries), registeredCount(entries))
+	if unverified := unverifiedCount(entries); unverified > 0 {
+		fmt.Fprintf(out, " / 未验证 %d", unverified)
+	}
+	fmt.Fprintln(out)
 }
 
 // renderProfileLine 是 list / show 共用的状态行（§6 固定口径 3）：注册行带 provider 与
 // 模型（取自声明面），未注册行带原因（契约字面量原样 + detail 的人读合并，§6 第 6 项）。
-// renderProfileLine is the line list and show share.
+// 第三态 `unverified` 是轻路径专属（重路径两名单齐备、不产生）——行文固定，不带原因：
+// 「待确认」不是拒载，写成 `registered=false——` 会让运维把它当失败处理。
+// renderProfileLine is the line list and show share; the unverified state is the light
+// path's third state and must not degrade into the rejected line.
 func renderProfileLine(out io.Writer, entry core.AgentEntry) {
+	if entry.Unverified {
+		fmt.Fprintf(out, "  %s：registered=unverified——MCP 工具与连接需重路径确认\n", entry.Name)
+		return
+	}
 	if !entry.Registered {
 		fmt.Fprintf(out, "  %s：registered=false——%s\n", entry.Name, entry.RejectReason)
 		return
@@ -318,12 +333,26 @@ func renderProfileLine(out io.Writer, entry core.AgentEntry) {
 	fmt.Fprintf(out, "  %s：registered=true（provider %s / 模型 %s）\n", entry.Name, providerName, model)
 }
 
-// registeredCount 数已注册的条目（汇总行的第二个数）。
-// registeredCount counts the registered entries for the summary line.
+// registeredCount 数已注册的条目（汇总行的第二个数）。语义不变：只数 `Registered`——
+// 第三态 `unverified` 的 `Registered` 恒 false，不混进"已注册"。
+// registeredCount counts the registered entries for the summary line; the third state
+// never counts as registered.
 func registeredCount(entries []core.AgentEntry) int {
 	count := 0
 	for _, entry := range entries {
 		if entry.Registered {
+			count++
+		}
+	}
+	return count
+}
+
+// unverifiedCount 数第三态条目（汇总行后缀的判据来源）。
+// unverifiedCount counts the unverified entries for the summary suffix.
+func unverifiedCount(entries []core.AgentEntry) int {
+	count := 0
+	for _, entry := range entries {
+		if entry.Unverified {
 			count++
 		}
 	}

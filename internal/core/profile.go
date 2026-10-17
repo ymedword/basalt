@@ -70,12 +70,16 @@ type Schedule struct {
 
 // AgentEntry 是一个 Agent 目录的装载结果——注册成功与失败**都有一条**（失败不静默消失）。
 // 两段语义互相独立：Profile 非 nil ⇔ frontmatter 解析成功；Registered ⇔ 八条校验全过。
+// 第三态 Unverified 只出现在轻路径（不连 MCP、无法判定连接结果）：`Registered == false &&
+// Unverified == true` 表示「可能依赖 MCP，需重路径确认」——只改展示与摘要，不进运行面。
 // AgentEntry is the load result of one agent directory; every directory yields one
 // entry, registered or not. The two facts are independent: a non-nil Profile means the
-// frontmatter parsed, and Registered means every check passed.
+// frontmatter parsed, and Registered means every check passed. Unverified is the
+// light-path third state (Registered == false && Unverified == true): display only.
 type AgentEntry struct {
 	Name         string   // 目录名（= Agent 名）
 	Registered   bool     // 八条校验全过（+ temperature 字段约束）
+	Unverified   bool     // 轻路径待确认（只改展示与摘要；运行面仍只收 Registered）
 	Profile      *Profile // frontmatter 解析成功时非 nil（未注册也可非 nil——供 list / show 展示）
-	RejectReason string   // Registered == false 时非空：reason（契约 §2.1 字面量原样）+ detail 的人读合并
+	RejectReason string   // Registered == false 且 Unverified == false 时非空：reason + detail 的人读合并
 }
