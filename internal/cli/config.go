@@ -17,12 +17,14 @@ import (
 // Config 是 basalt.yaml 的解析结果。
 // Config is the parsed form of basalt.yaml.
 //
-// 已钉死键的段用类型化结构承载；键集尚未落位的段（memory / author）以原始结构保留——
+// 已钉死键的段用类型化结构承载；键集尚未落位的段（author）以原始结构保留——
 // 消费它们的 US 落位前不预造键（颗粒度文档 §3.1 的「解析并保留」口径）。sandbox / shell /
-// http 三段自本 US 起落为结构（§3.5 第 4 项：**沿用既有键名**，不新增也不删除）。
+// http 三段自 US-5 起落为结构（§3.5 第 4 项：**沿用既有键名**，不新增也不删除）；
+// memory 段自 US-6 起落为结构（§3.5 第 1 项——`backend` 是 `basalt.yaml.example` 里
+// 已有的键，零新增配置键）。
 // Sections whose keys are fixed carry typed structures; sections whose key sets
 // are not yet decided keep their raw decoded shape so that no key is invented
-// ahead of the US that consumes it. sandbox / shell / http became typed here.
+// ahead of the US that consumes it. Only author still keeps its raw shape.
 type Config struct {
 	HTTP      HTTPConfig       `yaml:"http"`
 	Log       LogConfig        `yaml:"log"`
@@ -30,7 +32,7 @@ type Config struct {
 	Budget    BudgetConfig     `yaml:"budget"`
 	Sandbox   SandboxConfig    `yaml:"sandbox"`
 	Shell     ShellConfig      `yaml:"shell"`
-	Memory    map[string]any   `yaml:"memory"`
+	Memory    MemoryConfig     `yaml:"memory"`
 	Author    map[string]any   `yaml:"author"`
 }
 
@@ -129,6 +131,21 @@ type BudgetConfig struct {
 	ContextTokens  int   `yaml:"context_tokens"`
 }
 
+// MemoryConfig 是长期记忆的配置面（`memory` 段，US-6 落位）。
+// MemoryConfig is the memory section, landed by US-6.
+//
+// 只有一个键：载体档位。取值域只有两档，由 validateConfig 判卷（fail-closed）；
+// 空串（不写 memory 段 / 写了段省略 backend 两条路径）在装载期**就地归一到 markdown**
+// ——缺省只有一个来源，下游读到的一定是两档之一，不必各自再写一遍缺省分支。
+// The only key is the carrier backend; the empty value is normalized to the default
+// at load time so downstream code never re-decides what "unset" means.
+type MemoryConfig struct {
+	// Backend 取 markdown（缺省，人可读可手改）/ sqlite（可并发可查询）；
+	// 其余取值（含 mem0）拒绝启动并点名键与取值。
+	// Backend is markdown (default) or sqlite; anything else fails closed.
+	Backend string `yaml:"backend"`
+}
+
 // 凭证键路径：只有 providers[i].api_key 是 US-1 认得的凭证键（其余凭证形态——
 // mem0 api-key、notify_channels url——随各自消费 US 落位）。
 // Credential key paths: providers[i].api_key is the only credential US-1 knows.
@@ -145,6 +162,18 @@ var (
 	validLogLevels  = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	validLogFormats = map[string]bool{"text": true, "json": true}
 )
+
+// defaultMemoryBackend 是 memory.backend 的唯一缺省档（约束 18：不写 memory 段
+// 与省略 backend 两条路径读到同一个值）。同址声明缺省值与取值域——两者是同一份
+// 契约的两面，分开写会漂移。
+// defaultMemoryBackend and validMemoryBackends are declared together: the default
+// and the domain are two faces of one contract.
+const defaultMemoryBackend = "markdown"
+
+// validMemoryBackends 是载体档位的取值域——两档之外（mem0 / 任意未知取值）一律
+// 拒绝启动：静默降级会让「我配了 mem0」悄悄变成「记忆写进了文件」，载体形态与
+// 运维预期分叉。
+var validMemoryBackends = map[string]bool{"markdown": true, "sqlite": true}
 
 // LoadConfig 装载并校验 basalt.yaml。
 // LoadConfig loads and validates basalt.yaml.
@@ -359,6 +388,19 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Log.Format != "" && !validLogFormats[cfg.Log.Format] {
 		return fmt.Errorf("配置项 log.format 取值非法（%s）——只允许 text / json", cfg.Log.Format)
+	}
+	// memory.backend：**先归一后判域**——空串（不写 memory 段 / 写了段省略 backend）
+	// 是合法输入，在此就地写回缺省档：缺省只有一个来源，装配层读到的一定是两档之一
+	// （那里的 default 分支因此只是纵深防御，不是日常路径）。
+	if cfg.Memory.Backend == "" {
+		cfg.Memory.Backend = defaultMemoryBackend
+	}
+	if !validMemoryBackends[cfg.Memory.Backend] {
+		// 取值域外 fail-closed（约束 18）：mem0 载体延后实现（Compatibility §4 #2），
+		// 未知取值同样拒绝——**不得**静默降级到 markdown，否则载体形态与运维预期分叉。
+		return fmt.Errorf(
+			"配置项 memory.backend 取值非法（%s）——只允许 markdown（缺省）或 sqlite；mem0 载体尚未实现，未知取值一律拒绝启动，不静默降级",
+			cfg.Memory.Backend)
 	}
 	// seen 记条目名 → **首次出现**的下标：重名拒绝要同时点名两条，只报后一条会让
 	// 用户不知道跟谁撞了。

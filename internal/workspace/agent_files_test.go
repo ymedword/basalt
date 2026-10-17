@@ -54,7 +54,8 @@ func initWorkspaceRoot(t *testing.T) string {
 }
 
 // 中文验收点：create 产出**可装载**的模板——占位模型是普通文本、天然放行（技术方案
-// §11.5），provider.name 取配置数组首项（明示"选中了谁"的结果面），tools 为空列表；
+// §11.5），provider.name 取配置数组首项（明示"选中了谁"的结果面），tools 为两件记忆
+// 工具（US-6 起模板默认声明 `save_memory` / `recall_memory`——口径 26 / FR-026）；
 // created 报出本次落盘的相对路径（供命令输出）。
 // Acceptance point: the created template loads and registers as is.
 func TestCreateAgent_WritesLoadableTemplate(t *testing.T) {
@@ -65,8 +66,11 @@ func TestCreateAgent_WritesLoadableTemplate(t *testing.T) {
 	require.Equal(t, []string{"agents/demo-agent/AGENT.md"}, created)
 
 	// 模板必须经**同一条装载路径**注册成功——create 的判据是"可被加载"，不是"文件写出来了"。
+	// 池按模板声明的两件记忆工具注入：零值（空池）会让模板这类"声明了 tools: 的 Agent"
+	// **整只不注册**，注册断言随之落红——池与模板必须成对演进（T032 判的就是这条成对关系）。
 	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: []string{"deepseek", "openai"},
+		Tools:     []string{"save_memory", "recall_memory"},
 		Logger:    bufferedLogger(t),
 	}).LoadAll(root)
 	require.NoError(t, err)
@@ -75,7 +79,8 @@ func TestCreateAgent_WritesLoadableTemplate(t *testing.T) {
 	require.Equal(t, "demo-agent", entries[0].Name)                // 目录名 = frontmatter name
 	require.Equal(t, "deepseek", entries[0].Profile.Provider.Name) // 配置数组首项（§2.3 流程 C）
 	require.NotEmpty(t, entries[0].Profile.Provider.Model)         // 占位模型名非空白 → 放行（规则 3）
-	require.Empty(t, entries[0].Profile.Tools)                     // tools: []（记忆工具到 US-6 才在池）
+	// tools 逐字（判据面随 US-6 变更：原为"空列表"——模板默认工具落位后语义改为两件记忆工具）
+	require.Equal(t, []string{"save_memory", "recall_memory"}, entries[0].Profile.Tools)
 }
 
 // 中文验收点：已存在目录 → 拒绝且**零写入**——既有目录及其内容逐字节保留（不覆盖、
@@ -146,6 +151,7 @@ func TestCreateAgent_EncodesNamesThroughYAML(t *testing.T) {
 
 	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: []string{provider},
+		Tools:     []string{"save_memory", "recall_memory"}, // 模板默认声明的两件（US-6）
 		Logger:    bufferedLogger(t),
 	}).LoadAll(root)
 	require.NoError(t, err)

@@ -61,6 +61,7 @@ type ServiceOptions struct {
 	Runs          RunStore             // 运行账本
 	Snapshots     SnapshotStore        // 配置快照落库
 	Audit         ToolInvocationReader // 半截组补齐的分类依据（只读；可为 nil → 一律走"无行"分支）
+	Memory        MemoryReader         // 记忆读取端口（可空：nil = 段 2 恒空，行为与无记忆逐字节相同）
 	Loop          *ReActLoop           // 自实现的循环本体
 	Logger        *slog.Logger         // 为空 → 进程缺省日志器
 	Now           func() time.Time     // 时钟注入；为空 → time.Now
@@ -152,7 +153,8 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	}
 
 	// ④ 组装运行环境：ToolSet 取**快照冻结的** Profile（中途改盘不换配置），
-	// 预算按"请求值与 Profile 收紧取小"合并；模型客户端经显式映射表的查表结果注入。
+	// 预算按"请求值与 Profile 收紧取小"合并；模型客户端经显式映射表的查表结果注入；
+	// 记忆**在运行开始时读一次**、写进运行环境后冻结（运行内不重读——中途改盘不换记忆）。
 	env := &RunEnv{
 		Req:       req,
 		Snapshot:  snap,
@@ -161,6 +163,15 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		ToolSet:   snapshotTools(snap),
 		llmClient: s.opts.Client,
 		agentDir:  s.opts.Agents.Dir(req.Agent),
+	}
+	if s.opts.Memory != nil {
+		text, err := s.opts.Memory.LoadEffective(ctx, req.Agent)
+		if err != nil {
+			// 读取失败 = 拒绝启动（与段一读取失败同口径：零 LLM 调用、零工具执行），
+			// 形状沿用既有 StatusFailed——不另立一套失败形态。
+			return RunResult{RunID: runID, Status: StatusFailed, Reason: err.Error(), ConfigHash: snap.Hash}, nil
+		}
+		env.memory = text
 	}
 
 	// ⑤ 预写账本行（status=running）：**写失败 → 直接 error**——账本不落下就不开跑。

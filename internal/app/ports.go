@@ -89,12 +89,18 @@ type agentsPort struct {
 	Logger *slog.Logger
 }
 
-// List 转调装载器：provider 名集由调用方显式传入（适配器**不**另读一次配置）。
-// List forwards to the loader with the provider names passed in explicitly; the
-// adapter never re-reads the configuration file.
+// List 转调装载器：provider 名集由调用方显式传入（适配器**不**另读一次配置）；工具池用
+// 装配层的**声明名集**（`declaredToolNames`，wire.go）——轻路径不建注册池，但装载判定必须
+// 与重路径同一份名字，否则同一份 AGENT.md 会因走了哪条命令而得到相反的结论。传零值等于
+// "空池"，那会把所有声明了工具的 Agent 判成未注册（装载器的空池语义，US-4 已判卷）。
+// List forwards to the loader with the provider names passed in explicitly and the declared
+// tool pool: the light path builds no registry, so the declaration is what keeps both paths
+// in agreement. Passing nothing would mean an empty pool, which would reject every agent
+// that declares tools.
 func (p agentsPort) List(root string, providers []string) ([]core.AgentEntry, error) {
 	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers: providers,
+		Tools:     declaredToolNames,
 		Logger:    p.logger(),
 	}).LoadAll(root)
 	if err != nil {

@@ -366,3 +366,51 @@ func TestPromptBuilder_EstimatorVersionReadable(t *testing.T) {
 	require.Equal(t, defaultContextTokens-ReserveTokens, contextLimit(0), "零值兜底用缺省预算")
 	require.Equal(t, 0, contextLimit(512), "预算小于余量时下限为 0（由准入拒绝兜底）")
 }
+
+// —— 段 2 记忆注入（US-6）——
+
+// TestPromptBuilder_Build_InjectsMemorySegment 守"段 2 拼接形态固定"：
+// 验收点（约束 22）——`Prompt.System` = 段一正文 + 两换行 + 核心区文本；记忆文本经
+// `RunEnv` 的非导出注入位传入（同包测试可直接置位——这正是段 2 能在本文件单测的原因）。
+func TestPromptBuilder_Build_InjectsMemorySegment(t *testing.T) {
+	const coreText = "## 核心记忆\n\n- 用户偏好简洁回答"
+	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+	env.memory = coreText
+
+	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	require.NoError(t, err)
+	require.Equal(t, testSectionOne+"\n\n"+coreText, p.System,
+		"段 2 拼接形态逐字：段一正文 + 两换行 + 核心区文本")
+}
+
+// TestPromptBuilder_Build_EmptyMemoryIsByteIdenticalToSectionOne 守"空记忆逐字节回归"：
+// 验收点（约束 22）——核心区为空则段 2 **不产生任何字符**（不加分隔符、不留空白），
+// 系统提示词与无记忆时逐字节相同。
+func TestPromptBuilder_Build_EmptyMemoryIsByteIdenticalToSectionOne(t *testing.T) {
+	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+	// 空记忆 = 注入位零值（不赋值即空串——与"没有记忆端口"同形）。
+	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	require.NoError(t, err)
+	require.Equal(t, testSectionOne, p.System, "空记忆不得在系统提示词里留下任何痕迹")
+}
+
+// TestPromptBuilder_Build_MemoryCountsTowardTokenBudget 守"段 2 计入上下文预算"：
+// 验收点（约束 22 / R4b 的 prompt 层半面）——段 2 是**不可裁**部分，超预算即拒绝启动，
+// error 文本点名 `budget.context_tokens`；同预算、无记忆必须放行（对照组——"闸门真的
+// 接在记忆上"由此钉死，而不是靠一个本来就超限的预算蒙对）。
+func TestPromptBuilder_Build_MemoryCountsTowardTokenBudget(t *testing.T) {
+	// 对照组：小预算 + 无记忆 → 放行（该预算本身不构成超限）。
+	control := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+	control.Budget = Budget{ContextTokens: 8192}
+	_, controlErr := NewPromptBuilder(stubResolver{}).Build(control)
+	require.NoError(t, controlErr, "对照组：同预算、无记忆必须放行")
+
+	// 实验组：同一预算 + 超大幅核心区（estimateText 下远超 8192 − 1024 余量）→ 拒绝启动。
+	over := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+	over.Budget = Budget{ContextTokens: 8192}
+	over.memory = strings.Repeat("- 偏好\n", 10000)
+
+	_, err := NewPromptBuilder(stubResolver{}).Build(over)
+	require.Error(t, err, "段 2 计入 token 估算 → 超预算必须报错（不得静默截断）")
+	require.Contains(t, err.Error(), "budget.context_tokens", "错误文本必须点名配置键")
+}

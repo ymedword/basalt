@@ -76,9 +76,9 @@ type RunResult struct {
 }
 
 // RunEnv 是循环内部持有的运行环境：由 AgentService 依 RunRequest 与配置快照构造，值传递。
-// 五个导出字段是契约 §1.1 的字段字**逐字**（不增不改）；两个非导出字段是冻结签名下的
-// 注入位——`client()` 与 `ToolEnv(ctx, runID)` 都不收"客户端 / Agent 目录"参数，而这两样
-// 恰恰只有构造方知道；它们不是契约字段，也不进任何出站形态。
+// 五个导出字段是契约 §1.1 的字段字**逐字**（不增不改）；三个非导出字段是冻结签名下的
+// 注入位——`client()` 与 `ToolEnv(ctx, runID)` 都不收"客户端 / Agent 目录 / 记忆文本"参数，
+// 而这三样恰恰只有构造方知道；它们不是契约字段，也不进任何出站形态。
 // RunEnv is the run environment held by the loop. Its exported fields are the contract
 // §1.1 set verbatim; the unexported fields are injection points forced by the frozen
 // method signatures and never appear in any outbound shape.
@@ -91,6 +91,13 @@ type RunEnv struct {
 
 	llmClient ProviderClient // 唯一的模型调用入口（实现为 ProviderService：路由 + 两阶段审计在其内）
 	agentDir  string         // Agent 目录绝对路径（ToolEnv.AgentDir）；空串 = 无 Agent 上下文
+
+	// memory 是本次运行生效的核心区文本（运行开始时读一次、运行内冻结）——**不是契约字段、
+	// 不进任何出站形态**；经段 2 拼进 `Prompt.System` 的是它的内容，不是这个字段本身。
+	// 空串 = 无记忆（段 2 不产生任何字符——与无记忆逐字节相同）。
+	// memory is the core-region text that takes effect for this run, read once at run
+	// start and frozen for the rest of it; an empty string means no memory at all.
+	memory string
 }
 
 // Budget 是一次运行的执行预算五件（契约 §6）。**值语义**：计数由循环持有、预算只读。
@@ -144,7 +151,7 @@ func (e *RunEnv) client() ProviderClient { return e.llmClient }
 func (e *RunEnv) llmEnv(runID string, round int, p Prompt) ChatRequest {
 	ref := e.providerRef()
 	msgs := make([]Message, 0, len(p.History)+1)
-	msgs = append(msgs, Message{Role: roleSystem, Content: p.System}) // 段 1（+ 段 2 恒空）
+	msgs = append(msgs, Message{Role: roleSystem, Content: p.System}) // 段 1 + 段 2（记忆核心区；空记忆时与段 1 逐字节相同）
 	msgs = append(msgs, p.History...)
 	return ChatRequest{
 		Provider:   ref.Name,
