@@ -80,8 +80,9 @@ jobs:
             set -eo pipefail
             rm -rf /usr/share/zoneinfo "$(go env GOROOT)/lib/time/zoneinfo.zip"
             test ! -e /usr/share/zoneinfo && test ! -e "$(go env GOROOT)/lib/time/zoneinfo.zip"
-            go test -tags=tzisolated -json ./cmd/basalt -run "^TestTZData_Isolated$" -count=1 | tee /tmp/tz.json
-            grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_Isolated\"" /tmp/tz.json
+            go test -tags=tzisolated -json ./cmd/basalt -run "^TestTZData_Isolated(EmbeddedFallback|ControlWithoutImport)$" -count=1 | tee /tmp/tz.json
+            grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_IsolatedEmbeddedFallback\"" /tmp/tz.json
+            grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_IsolatedControlWithoutImport\"" /tmp/tz.json
           '
 
   build:
