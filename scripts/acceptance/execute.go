@@ -221,7 +221,7 @@ func atomicJSON(path string, data any) error {
 	if err := dir.Rename(filepath.Base(f.Name()), filepath.Base(path)); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(path))
+	return syncDir(dir)
 }
 
 func accept(ctx context.Context, root, out, scope string, checks []check, stdout io.Writer) (int, error) {
