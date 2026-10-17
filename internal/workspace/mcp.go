@@ -3,7 +3,7 @@ package workspace
 // 本文件是 mcp_servers.yaml 的解析与形态校验（US-7）：顶层映射 + `servers:` 列表，
 // 条目字段 name / transport / command / env；列表顺序原样保留（= 连接序 = 注册序）。
 // 本层**不读环境变量**——`env` 值只校验是否为精确 `${VAR}` 占位，解析（占位 → 终值）
-// 归装配层 `app.resolveMCPEnv`（已决 #2；技术方案 §8.8）。
+// 归装配层 `app.resolveMCPEnv`（已决 #2；技术方案 §3.7）。
 // This file parses and validates mcp_servers.yaml. It never reads the environment:
 // env values are only checked for the exact ${VAR} placeholder form; resolution
 // belongs to the assembly layer.

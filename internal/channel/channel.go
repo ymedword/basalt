@@ -10,7 +10,7 @@ import (
 
 // 本文件是渠道层的**平台中立半边**：接口形态 + 控制台读写面的抽象。平台半边在
 // `console_<goos>.go`（各带 build tag）——真控制台与管道 / 重定向在那里分流，
-// 判定由终端属性查询给出，**不**猜环境变量（FR-040 / 技术方案 §8.4）。
+// 判定由终端属性查询给出，**不**猜环境变量（FR-040 / 技术方案 §6.1.1）。
 // The platform-neutral half of the channel layer: the interface shapes plus the
 // console abstraction; the per-OS files decide console-API versus byte stream.
 

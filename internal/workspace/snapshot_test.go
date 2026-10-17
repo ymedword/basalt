@@ -90,7 +90,7 @@ func TestSnapshot_ContentKeepsRawAgentMD(t *testing.T) {
 }
 
 // 中文验收点：清单覆盖**注入面读到的每一个文件**（AGENT.md + bootstrap 文件 + 绑定
-// 技能的 SKILL.md——技术方案 §11.5），逐条 `{path, sha256}` 且 sha256 等于该文件内容的
+// 技能的 SKILL.md——技术方案 §3.6），逐条 `{path, sha256}` 且 sha256 等于该文件内容的
 // 哈希；路径按序排列（规整序列化的确定性）。
 // Acceptance point: the manifest covers every injected file, each hashed from the
 // very bytes that were injected, ordered by path.
@@ -208,7 +208,7 @@ func TestSnapshot_SectionOneDelegatesWithoutChangingBehavior(t *testing.T) {
 }
 
 // 中文验收点：L2/L3 技能正文与 `scripts/` **不进清单**（按需读取、读时为准），
-// 未声明的技能实体同样不进——清单只记"这次注入了什么"（技术方案 §11.5）。
+// 未声明的技能实体同样不进——清单只记"这次注入了什么"（技术方案 §3.6）。
 // Acceptance point: L2/L3 bodies, scripts and undeclared skills stay out of the
 // manifest; it records what was injected, nothing else.
 func TestSnapshot_ManifestExcludesBodiesAndScripts(t *testing.T) {

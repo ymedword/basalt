@@ -41,7 +41,7 @@ budget:
   max_output_bytes: 262144  # 单工具输出 256 KB（读取中截断）
   context_tokens: 32768     # 上下文 token 硬上限
 
-# 沙箱白名单（WhitelistPolicy 的配置入口；逐项以 docs/TechnicalSolution.md §6.5 为准）
+# 沙箱白名单（WhitelistPolicy 的配置入口；逐项以 docs/TechnicalDesign.md §4.3 为准）
 sandbox:
   cross_agent_read: []      # 允许读取的其它 Agent 名；缺省空 = 一个都不许
 shell:

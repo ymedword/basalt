@@ -394,7 +394,7 @@ func TestToolExecutor_ClassifiesNotFoundAndRuntimeError(t *testing.T) {
 	require.Equal(t, core.ErrorKindRuntimeError, f.audit.row(1).result.ErrorKind, "其余归 runtime_error")
 }
 
-// TestToolExecutor_KeepsToolCallIDAndReasoningInHistory 守"消息模型三条硬约束"（技术方案 §4.4）：
+// TestToolExecutor_KeepsToolCallIDAndReasoningInHistory 守"消息模型三条硬约束"（技术方案 §2.3）：
 // 验收点——`tool_call_id` 原样贯通"模型给出 → 审计行 → 回填消息 → 下一轮出站"，
 // `reasoning_content` 随助手消息落库并进下一轮请求（丢了供应商会 400）。
 func TestToolExecutor_KeepsToolCallIDAndReasoningInHistory(t *testing.T) {

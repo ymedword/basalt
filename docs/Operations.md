@@ -1,8 +1,8 @@
 # Basalt 运维手册：依赖条件、监听与出网、时区、备份、升级与停机、凭证
 
-> 本文档是 Basalt 三件套工件中的**运维篇**：装、看、备份、升级、凭证六件事的操作口径与判据。契约四件（Run 与错误 / AGENT.md 与工具 / 完整 DDL / 静态 OpenAPI）见 [contracts/](contracts/)，与 NivroOS 的逐项差异见 [Compatibility.md](Compatibility.md)，Why/What/How 见 [IndustryResearch.md](IndustryResearch.md)、[DemandAnalysis.md](DemandAnalysis.md)、[TechnicalSolution.md](TechnicalSolution.md)。
+> 本文档是 Basalt 三件套工件中的**运维篇**：装、看、备份、升级、停机、凭证六件事的操作口径与判据。契约四件（Run 与错误 / AGENT.md 与工具 / 完整 DDL / 静态 OpenAPI）见 [contracts/](contracts/)，兼容性与迁移边界见 [Compatibility.md](Compatibility.md)，Why/What/How 见 [IndustrySurvey.md](IndustrySurvey.md)、[Requirements.md](Requirements.md)、[TechnicalDesign.md](TechnicalDesign.md)。
 >
-> 本文与 [TechnicalSolution.md](TechnicalSolution.md) 冲突时**以技术方案为准**。本文不重复设计理由，只写"运维照着做"的动作、判据与代价。
+> 本文与 [TechnicalDesign.md](TechnicalDesign.md) 冲突时**以技术方案为准**。本文不重复设计理由，只写"运维照着做"的动作、判据与代价。
 
 ---
 
@@ -21,7 +21,7 @@
 
 | 依赖 | 谁需要 | 缺了会怎样 |
 | --- | --- | --- |
-| Python 3 | 用 `shell` 工具跑 `scripts/*.py` 的 Agent（如每日 Demo 的 GitHub 日报脚本）、自写的 stdio MCP server | 该工具调用失败（`runtime_error`）；MCP server 连不上 → 它的工具不注册 → **声明该工具的 Agent 整只不注册**（WARN 点名）。⚠ 走 `shell` 的解释器**必须**先登记进 `shell.interpreters`（受控脚本通道：只接受 `[<脚本路径>, <参数…>]` 形态、脚本须落在该 Agent `scripts/` 或技能库内）——**不得**为图省事放宽解释器白名单，那等于引入任意代码执行（见 [contracts/agent-md.md](contracts/agent-md.md) §5.2） |
+| Python 3 | 用 `shell` 工具跑 `scripts/*.py` 的 Agent（如每日 D3 的 CSV 检查脚本）、自写的 stdio MCP server | 该工具调用失败（`runtime_error`）；MCP server 连不上 → 它的工具不注册 → **声明该工具的 Agent 整只不注册**（WARN 点名）。⚠ 走 `shell` 的解释器**必须**先登记进 `shell.interpreters`（受控脚本通道：只接受 `[<脚本路径>, <参数…>]` 形态、脚本须落在该 Agent `scripts/` 或技能库内）——**不得**为图省事放宽解释器白名单，那等于引入任意代码执行（见 [contracts/agent-md.md](contracts/agent-md.md) §5.2） |
 | Node.js / `npx` | 用 `npx` 通道拉起的社区 MCP server | 同上 |
 | 宿主机 `sqlite3` CLI | **仅在线备份**需要（§4.2），不参与运行 | 退化为离线备份（停机拷贝，一样可靠，只是要停机窗口） |
 
@@ -40,7 +40,7 @@
 
 **必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并自行保证网络层隔离——反向代理 + 内网 ACL 优先。
 
-症状与代价：改了 `0.0.0.0` 却不加隔离 = 把"任何人可调 Agent（含 `shell` 工具）"挂到网上。OpenClaw 的 42,665 个暴露实例就是这么来的（见 [IndustryResearch.md](IndustryResearch.md) §5.4）。
+症状与代价：改了 `0.0.0.0` 却不加隔离 = 把"任何人可调 Agent（含 `shell` 工具）"挂到网上。OpenClaw 的 42,665 个暴露实例就是这么来的（见 [IndustrySurvey.md](IndustrySurvey.md) §4–5）。
 
 复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`。
 
@@ -50,7 +50,7 @@
 | --- | --- | --- |
 | 工具出网（`http_get` / `http_post`）+ 通知投递（`notify`） | **模型**可控 | **是**——`http.allowed_domains` 域名白名单，scheme 固定 http/https（代码固定，配置放行不了） |
 | 供应商模型调用（`providers[].base_url`） | 运维配置 | 否——端点由运维在 `basalt.yaml` 里定，模型碰不到 |
-| MCP server 自己的网络行为 | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §6.5） |
+| MCP server 自己的网络行为 | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §4.3） |
 
 企业若要求"模型调用也只能出内网"：把 `providers[].base_url` 指向内网网关（vLLM / 一方网关）即可，白名单不需要动。
 
@@ -95,12 +95,12 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 
 症状：带 `schedules[].zone: Asia/Shanghai` 的 Agent 在容器里**整只不注册**（加载期校验失败，WARN 点名），定时任务一个都不触发；而本机（有系统 tzdata）一切正常——"本地能跑、容器不跑"的经典成因。
 
-另两条时区口径与需求文档 §12 一致：
+另两条时区口径与需求文档 §7.6 一致：
 
 - `schedules[].zone` 缺省 **UTC**（不回落服务器本地时区；`ZoneId.systemDefault()` 一类的"取系统时区"在本项目是禁用写法）
 - 容器建议显式设 `TZ`——`PATH` / `HOME` / `LANG` / `TZ` 是示例配置 `basalt.yaml.example` 在 `shell.env_passthrough` 里登记的透传变量；若部署配置省略该键或配为空列表，子进程**不透传**父进程环境变量（`TZ` 也不例外），`shell` 工具里 `date` 的输出随宿主机漂移
 
-复核（可复制）：`POST /api/v1/schedules/{id}/run` 手动补跑一次带 `zone: Asia/Shanghai` 的任务，看 `next_run` 是否为北京时间。
+复核（可复制）：`POST /api/v1/schedules/{id}/run` 手动补跑一次带 `zone: Asia/Shanghai` 的任务，看最新 `task_executions` 行的触发时刻（Unix 毫秒经 `zone` 换算）是否为北京时间。
 
 ---
 
@@ -184,7 +184,7 @@ set -a; . "$BASALT_ENV_FILE"; set +a              # 与生产 EnvironmentFile= �
 #      宁可让演练里的调用失败，也不要让副本往生产群里发消息
 #   ③ 出网收口：副本 basalt.yaml 的 http.allowed_domains 改成**只含测试端点**——**写成域名形态**
 #      （localhost，或 hosts 里自造的测试域名）；**裸 IP 字面量会被直接拒**（白名单按域名匹配，
-#      放行 IP 等于绕过它，见技术方案 §6.5）。未被列入的域名调用以 sandbox_denied 失败
+#      放行 IP 等于绕过它，见技术方案 §4.3.1）。未被列入的域名调用以 sandbox_denied 失败
 #      ——正是演练想要的"副作用走不出去"（把白名单清空是最严的收口，一样达到目的）
 
 basalt status
@@ -281,7 +281,7 @@ systemctl stop basalt && systemctl show basalt -p ActiveState                # �
 | 位置 | 规则 |
 | --- | --- |
 | `basalt.yaml` 的 `providers[].api_key` | 只允许 `${ENV_VAR}` 占位；启动时解析，未解析（`${` 残留）或为空 → **拒绝启动**并点名配置项 |
-| 通知渠道（库表 `notify_channels.url`） | **只存 `${ENV_VAR}` 引用**，不存完整地址（相对 NivroOS 的有意改变）；发送时解析，解析失败给**点名环境变量**的可读错误 |
+| 通知渠道（库表 `notify_channels.url`） | **只存 `${ENV_VAR}` 引用**，不存完整地址；发送时解析，解析失败给**点名环境变量**的可读错误 |
 | 作者模型（US-12 的生成能力） | 与 provider 同规则 |
 
 红线段（day-one 硬约束，**不得**违反）：
@@ -300,3 +300,27 @@ sqlite3 /opt/basalt/.basalt/basalt.db \
 ```
 
 第二条只查 `name` / `type` / 长度——**不得**把 `url` 原值打印出来（一次回显就把它写进了终端历史与截图）。
+
+## 7. 每日 Demo 与隔离演练
+
+五套每日场景 D1–D5 的定义和验收见 [TechnicalDesign.md](TechnicalDesign.md) §8.1 与 [Requirements.md](Requirements.md) §2.5。它们是 US-14 待交付素材；环境未准备完时不能把规划命令或替身读数记成生产验证。
+
+- 每套场景在演练专用工作区运行，使用虚构数据、测试通知接收器及明确登记的凭证引用；恢复备份演练继续执行 §4.3 的停调度与副作用隔离。
+- D1 需要可控的 HTTP 测试域名；D2 需要已登记技能；D3 需要 Python 和受控脚本路径；D4 需要连续两次运行的记忆基线；D5 需要显式登记的只读 MCP server。逐项验证依赖，缺失时明确失败，不补造结果。
+- 核对工作区、时区、实际触发时刻（以固定起点计算的触发序列作对照，覆盖 DST 日）及 `task_executions` / Run 关联。演练可缩短计划，但保留原每日计划配置和现场读数；短周期或人工触发不能冒充完整每日验证。
+- 停机错过触发点不自动补跑；人工补跑单独记录 run_id。任务或通知结果不确定时先查审计，不盲目重试；通知没有端到端恰好一次承诺，重复执行可能产生重复消息。
+- 演练结束仅回收本轮拥有的服务、MCP 进程、端口和临时目录；确认记录中没有真实凭证，保留足够的脱敏证据供复验。
+
+## 8. 长期运行与发布前未决项
+
+下列策略必须在首次发布前明确并有实测读数；本次文档补充不代表已经实现自动清理、告警或资源限额。未决项由 US-14 发布清单承接，不能以默认值未说明的方式放行。
+
+| 面 | 发布前需明确 | 需留证据 |
+| --- | --- | --- |
+| 数据保留 | 会话、三张审计表、任务执行历史、记忆表（`memory_entries`）、配置快照（`config_snapshots`）、文件记忆、日志和备份的保留期 / 大小 / 访问主体 | 正常增长、达到边界、清理后关联和消息组仍完整 |
+| 磁盘与 SQLite | WAL 增长、备份空间、磁盘满 / 只读 / 损坏时的拒绝行为；告警由谁执行 | 审计预写失败不发生外部动作；错误可读；恢复后可继续 |
+| 外部服务 | Provider / MCP / 通知的超时、限流、凭证轮换与出网边界 | 失败不泄露正文或凭证；取消和停机后资源可回收 |
+| 副作用 | HTTP 写与通知可能已成功但回执丢失；人工处理与幂等责任 | 不把 unknown 当作可安全重放；演练能定位对应 run_id |
+| 制品与平台 | 二进制与前端资源、平台 / 架构、版本、commit 和 sha256 | 用候选制品走真实控制台、进程树取消、锁、升级 / 恢复；制品变更后重验 |
+
+业务指标默认用低基数维度（操作、结果类别、工具类型）；session_id、run_id、完整 URL、错误原文与凭证不作为指标标签。它们需要关联时放受控日志 / 审计，访问权限与保留期随数据策略一起确定。指标系统若尚未接入，保持为发布 / 扩展阶段设计，不声称已有 Prometheus 或追踪能力。

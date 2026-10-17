@@ -69,7 +69,7 @@ func TestNewProviderClients_InvalidBaseURLRejected(t *testing.T) {
 	require.Nil(t, models)
 }
 
-// TestNewProviderService_ConfigToAuditRowChain —— 端到端（编程指南 §4.2 验收 Demo 的仓内可判面）：
+// TestNewProviderService_ConfigToAuditRowChain —— 端到端（开发操作 §4.2.2 验收 Demo 的仓内可判面）：
 // 配置 → 显式映射 → 调用 → `llm_calls` 落库。走真客户端 + 假服务 + 真库，中途不换零件。
 func TestNewProviderService_ConfigToAuditRowChain(t *testing.T) {
 	ctx := context.Background()

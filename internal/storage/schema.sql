@@ -1,9 +1,9 @@
 -- Basalt 数据库结构契约（SQLite）
 --
--- 契约地位：本文档是 Basalt **数据结构**（表 / 列 / 状态字面量）的唯一事实源——技术方案 §9、
---   需求文档 §10 等处出现同名字段时以本文档为准；这几份文档的其余内容（架构、行为、验收）
---   仍以 docs/TechnicalSolution.md 为最权威。字段名与状态字面量**不得**在别处另立第二份定义。
--- 文档状态：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 AiProgrammingGuide.md §3.4）。
+-- 契约地位：本文档是 Basalt **数据结构**（表 / 列 / 状态字面量）的唯一事实源——技术方案§5、
+--   需求文档§3.4、§6.6 等处出现同名字段时以本文档为准；这几份文档的其余内容（架构、行为、验收）
+--   仍以 docs/TechnicalDesign.md 为最权威。字段名与状态字面量**不得**在别处另立第二份定义。
+-- 文档状态：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 DevelopmentLoop.md§5.2）。
 -- 迁移纪律：
 --   1. 建表一律用 IF NOT EXISTS（幂等）；结构变更 = 新增受控前向 SQL + 递增 schema_version，禁止 ORM 自动 DDL
 --   2. 新旧库判定以 schema_version 表**是否存在**为准：不存在 = 新库（全量建表）；存在 = 旧库（按当前
@@ -121,7 +121,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_config_snapshots_hash ON config_snapshots(
 -- 审计一：LLM 调用（两阶段写）
 -- ============================================================
 -- 与工具执行同一条纪律：调用前先插入 status=pending（插入失败即拒绝发出该次调用 = fail-closed），
--- 调用返回后更新为终态。相对 NivroOS 基线新增 run_id / round / status / error_kind / config_hash——
+-- 调用返回后更新为终态。run_id / round / status / error_kind / config_hash 用于关联与解释执行——
 -- 从"有记录"到"能关联、能解释失败"。
 -- 崩溃窗口：pending 行在重启后标 unknown；终态更新失败时保留 pending 并记 ERROR（见 run-and-errors.md §7.2）。
 

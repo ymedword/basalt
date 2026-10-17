@@ -9,7 +9,7 @@ import (
 
 // 本文件是运行面契约（字段字逐字取自 docs/contracts/run-and-errors.md §1.1——该节是
 // RunRequest / RunResult / RunEnv / ToolEnv 字段字的**唯一**事实源）+ 运行环境的出站
-// 组装与终态构造（技术方案 §4.1；流程 A~G 见 docs/us/us4-react-loop.md §2.3）。
+// 组装与终态构造（技术方案 §2.2.1；流程 A~G 见 docs/us/us4-react-loop.md §2.3）。
 // This file is the run-surface contract (field words verbatim from contract §1.1, the single
 // source of truth) plus the run environment's outbound assembly and outcome constructors.
 

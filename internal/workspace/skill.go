@@ -29,16 +29,16 @@ import (
 
 const (
 	// skillsDirName 是技能库目录名（工作区根部，与 agents/ 并列）；skillDefinitionFile
-	// 是技能定义文件名——技能库形态为 skills/<name>/SKILL.md（技术方案 §11.3）。
+	// 是技能定义文件名——技能库形态为 skills/<name>/SKILL.md（技术方案 §3.4.1）。
 	skillsDirName       = "skills"
 	skillDefinitionFile = "SKILL.md"
 
-	// skillLibraryPrefix 是卡片里「技能库真路径」的字面前缀（技术方案 §11.3）：
+	// skillLibraryPrefix 是卡片里「技能库真路径」的字面前缀（技术方案 §3.4.1）：
 	// 相对**工作区根**（.basalt/）的展示路径，US-4 的 read_file 必须能吃下该形态。
 	skillLibraryPrefix = ".basalt/skills"
 )
 
-// skillCard 是段一的 L1 卡片三要素（技术方案 §11.3：name + description + 技能库真路径），
+// skillCard 是段一的 L1 卡片三要素（技术方案 §3.4.1：name + description + 技能库真路径），
 // 外加两件读取产物：清单路径与原始字节——快照的 `{path, sha256}` 必须与**这张卡片**
 // 出自同一次读取（§2.2 约束 7「注入内容与哈希共享同次读取产物」），故随卡片带出。
 // skillCard is the L1 card (three display elements) plus the read artefacts the
@@ -46,7 +46,7 @@ const (
 type skillCard struct {
 	name         string // SKILL.md frontmatter name；缺失回落技能目录名（声明即绑定以目录名为准）
 	description  string // SKILL.md frontmatter description；缺失为空串（契约 §2.1 无此校验规则——不发明）
-	path         string // 逐字 .basalt/skills/<name>/SKILL.md（技术方案 §11.3 字面量）
+	path         string // 逐字 .basalt/skills/<name>/SKILL.md（技术方案 §3.4.1 字面量）
 	relativePath string // 相对工作区根的读取路径 skills/<目录名>/SKILL.md——清单的 path 列（按**声明名**，frontmatter name 改了也不动它）
 	raw          []byte // 同一份读取的原始字节——清单条 sha256 的来源
 }
@@ -182,7 +182,7 @@ func skillCardFor(lib *os.Root, name string) (skillCard, error) {
 	return card, nil
 }
 
-// skillFrontmatterDTO 是 SKILL.md 头的解析 DTO（技术方案 §11.3：frontmatter 为
+// skillFrontmatterDTO 是 SKILL.md 头的解析 DTO（技术方案 §3.4.1：frontmatter 为
 // name + description，正文是技能说明）。缺失与显式空串同判——卡片是展示面，不是判定面。
 // skillFrontmatterDTO parses the SKILL.md header; both keys are optional here.
 type skillFrontmatterDTO struct {

@@ -1,7 +1,7 @@
 // Package channel 承载渠道接入：外部消息进、回复出的适配面。
 // Package channel holds channel adapters: messages in, replies out.
 //
-// **编码纪律（技术方案 §8.4——平台差异是这里最大的坑）**：
+// **编码纪律（技术方案 §6.1.1——平台差异是这里最大的坑）**：
 //
 //   - 真控制台经**控制台 API** 读写（Windows：`ReadConsoleW` / `WriteConsoleW`；
 //     Unix：终端本身就是 UTF-8 字节流），**不**依赖标准输入输出的字节流假设；

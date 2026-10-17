@@ -16,7 +16,7 @@ import (
 )
 
 // TestBootstrap_CreatesNewDatabase：init 缺库 → created=true、11 表 + version
-// = target（需求 §5.1 的 basalt.db）。
+// = target（需求文档 §3.1 的 basalt.db）。
 func TestBootstrap_CreatesNewDatabase(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "basalt.db")
@@ -40,7 +40,7 @@ func TestBootstrap_CreatesNewDatabase(t *testing.T) {
 }
 
 // TestBootstrap_KeepsExistingCurrent：当前版本 → created=false、零写（版本行
-// 不变——技术方案 §8.1 幂等；契约 §4.3.1 已存在库零写）。
+// 不变——技术方案 §3.1.1 幂等；契约 §4.3.1 已存在库零写）。
 func TestBootstrap_KeepsExistingCurrent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "basalt.db")

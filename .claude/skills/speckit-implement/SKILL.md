@@ -21,6 +21,17 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 ## Pre-Execution Checks
 
+### Basalt：Loop 实现适配模式
+
+由 module-dev / stage driver 在已人审 US 范围内调用时，不增加 tasks 或实施前的
+固定人工确认。步骤 2 的未完成 checklist 交给 AI 控制侧按其原始判据核验、修复并
+回填，不询问是否绕过；无法通过则保存证据并停止，不能无证据勾选。自定义 reviewer
+清单由相应 AI 复核角色处理，真实人工决定仍只能由人工给出。
+
+Loop 实现者不得写冻结的 spec / plan / tasks、受保护测试或清单；后文“完成后勾选
+tasks”的动作在此模式由 AI 控制侧在验收通过的循环边界执行。driver 只实现和修复，
+控制侧先处理流程工件与 checklist，再启动 driver。独立非 Loop 调用保持原有行为。
+
 **Check for extension hooks (before implementation)**:
 - Check if `.specify/extensions.yml` exists in the project root.
 - If it exists, read it and look for entries under the `hooks.before_implement` key

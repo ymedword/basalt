@@ -94,7 +94,7 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 		return core.ChatResponse{}, err
 	}
 
-	// 4. 发出：一次调用、不重试、不 fallback（技术方案 §3.3）。
+	// 4. 发出：一次调用、不重试、不 fallback（技术方案 §2.4.3）。
 	start := time.Now()
 	resp, chatErr := client.Chat(ctx, req)
 	duration := time.Since(start)

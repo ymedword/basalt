@@ -21,6 +21,13 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 ## Pre-Execution Checks
 
+### Basalt：已人审 US 的自动推进模式
+
+由 module-dev 编排时，分析本身保持只读；输出 findings 后交回 AI 控制侧，自动修复
+已人审范围内的派生遗漏与不一致并复跑。不执行后文常规“是否需要修复建议”的人工
+询问。CRITICAL 未清零禁止实施，其他发现逐条记录处置；改变已审范围、权限、公共
+契约或验收语义的修订返回人工 review ①，不自动批准。独立只读调用不获得写权限。
+
 **Check for extension hooks (before analysis)**:
 - Check if `.specify/extensions.yml` exists in the project root.
 - If it exists, read it and look for entries under the `hooks.before_analyze` key

@@ -3,7 +3,7 @@
 // wires package implementations into a runnable instance.
 //
 // 本包承载进程退出码的唯一出口（Run）与日志装配（NewLogger）；业务逻辑
-// 不得写在这里，装配顺序与依赖方向见 docs/TechnicalSolution.md §10.1。
+// 不得写在这里，装配顺序与依赖方向见 docs/TechnicalDesign.md §7.1。
 //
 // The process exit code has exactly one outlet here (Run), as does logger
 // construction (NewLogger). No business logic belongs in this package.

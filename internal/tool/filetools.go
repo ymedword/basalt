@@ -16,11 +16,11 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// 本文件是三件内置文件工具（技术方案 §6.1、契约 §5.1）：read_file / write_file / list_dir。
+// 本文件是三件内置文件工具（技术方案 §4.1.1、契约 §5.1）：read_file / write_file / list_dir。
 // 两条纪律贯穿全篇：① 授权只经 **core.Policy 接口**判定——本文件不出现任何具体策略实现
 // （授权与执行分离，宪法 VI）；② 路径**不得**从 context、全局变量或进程环境猜"当前是哪个
 // Agent"（core.Tool 文档逐字），调用方经 ToolEnv 显式传入，相对路径以**当前 Agent 自有
-// 目录**为基准——AGENT.md 正文里的 `scripts/x.py` 因此可移植（技术方案 §6.5）。
+// 目录**为基准——AGENT.md 正文里的 `scripts/x.py` 因此可移植（技术方案 §4.3）。
 // The three builtin file tools of Technical Solution §6.1 / contract §5.1. Two rules run
 // through the file: authorization goes through the core.Policy interface only, and every
 // path is resolved from the explicitly passed ToolEnv rather than guessed from context.
@@ -327,7 +327,7 @@ func (a fileToolInput) check(toolName string) error {
 // resolveToolPath 把模型给的路径解析成**投影前**的字面绝对路径。基准顺位：
 // ① 绝对路径原样；② 相对路径以 base（本次调用所属 Agent 的自有目录）为基准——工具拿到的
 // 环境必须显式传入（core.Tool 文档），"当前 Agent 目录"正是 AGENT.md 正文里相对路径的
-// 基准（技术方案 §6.5）；③ base 为空（无 Agent 上下文）时回落工作区根——契约 §5.1
+// 基准（技术方案 §4.3）；③ base 为空（无 Agent 上下文）时回落工作区根——契约 §5.1
 // 「相对工作区根」的字面口径；④ 首段是工作区根字面前缀（`.basalt`）的形态按**工作区根**
 // 解析：技能卡片逐字注入的就是这个形态，read_file 必须能吃下（US-3 §2.2 约束 6）。
 // 纯词法：不碰文件系统——投影与授权分别是 resolveRealPath 与 Policy 的事。
@@ -352,7 +352,7 @@ func resolveToolPath(root, base, raw string) string {
 }
 
 // actionTarget 把解析后的绝对路径折成 Policy 的 Target 形态：同卷时给**相对工作区根**的
-// 形态——拒绝文案里因此不出现绝对路径（技术方案 §7.2：错误文案不得回显绝对路径），
+// 形态——拒绝文案里因此不出现绝对路径（技术方案 §6.2.2：错误文案不得回显绝对路径），
 // 越界目标则以 `..` 起头的形态暴露给模型；跨卷（Rel 报错）只能原样给绝对路径。
 // The workspace-relative form keeps absolute paths out of refusal copy.
 func actionTarget(root, target string) string {

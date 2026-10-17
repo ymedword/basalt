@@ -27,7 +27,7 @@ import (
 // 分工（约束 2 / 任务书裁决注 7）：`go-openai` 只出**协议类型与已知字段的编解码**
 // （请求信封基座、工具调用）；HTTP 往返由本文件自建（`net/http` + `encoding/json`）——
 // 一次 POST、不重试、不跟随重定向。库的消息编解码只认已知键，未知字段进出都会被丢，
-// 故消息对象的平铺与收集由本文件自己做（协议往返保真，技术方案 §4.4 约束 3）。
+// 故消息对象的平铺与收集由本文件自己做（协议往返保真，技术方案 §2.3 约束 3）。
 // go-openai supplies protocol types and known-field codecs only; the HTTP round trip is
 // built here because the library's message codec drops unknown keys in both directions.
 

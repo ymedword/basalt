@@ -39,7 +39,7 @@ func mcpToolNames(conns []tool.MCPConnection) []string {
 	return names
 }
 
-// resolveMCPEnv 在装配期把 `${VAR}` 占位换成环境值（技术方案 §8.8：所有占位在装配前统一
+// resolveMCPEnv 在装配期把 `${VAR}` 占位换成环境值（技术方案 §3.7：所有占位在装配前统一
 // 解析）。**未设置与空值同档拒绝**——空凭证送给 server 只会换来一个 401，排障方向会被引到
 // server 身上；错误点名 server / 键 / 变量名，**不回显值**（值可能正是凭证）。lookup 注入：
 // 生产传 `os.LookupEnv`，用例传替身（测试缝纪律：不为测试新增导出 API）。

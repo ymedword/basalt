@@ -3,9 +3,9 @@ info:
   title: Basalt REST API
   version: 0.1.0
   description: |
-    Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalSolution.md) §7 冲突时以技术方案为准。
+    Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalDesign.md)§6.2 冲突时以技术方案为准。
 
-    **文档状态**：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 AiProgrammingGuide.md §3.4）。
+    **文档状态**：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 DevelopmentLoop.md§5.2）。
 
     约定的固定事实：
 
@@ -14,15 +14,15 @@ info:
     - **核心阶段无认证**（内网假设）；RBAC / 限流属扩展阶段
     - **JSON 字段命名** snake_case
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
-    - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案 §6.5）
+    - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - 挂载点标注：本文件冻结了技术方案 §7.3（10 个核心端点）与 §7.4（管理台追加端点）的全部路径
+    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径
 servers:
   - url: http://127.0.0.1:8080/api/v1
     description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr
 tags:
   - name: core
-    description: 核心端点（技术方案 §7.3，10 个）
+    description: 核心端点（技术方案§6.2.3，10 个）
   - name: runs
     description: 运行查询与取消（Run 为执行与审计的单位）
   - name: console
@@ -708,7 +708,7 @@ paths:
                       data: { $ref: '#/components/schemas/RunView' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: 该任务上一轮尚未结束（幂等跳过语义见技术方案 §8.5）
+          description: 该任务上一轮尚未结束（幂等跳过语义见技术方案§6.3）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope' }

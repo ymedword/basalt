@@ -32,7 +32,7 @@ type providerRun struct {
 // The real root command is exercised so registration and the exit-code path are
 // under test too.
 //
-// 两个端口**故意留 nil**：轻路径不开库、不取实例锁、不做恢复（技术方案 §8.7）——
+// 两个端口**故意留 nil**：轻路径不开库、不取实例锁、不做恢复（技术方案 §6.1.2）——
 // 一旦有代码碰到它们就当场 panic，而不是悄悄通过。
 // Both ports are deliberately nil: the light path must never touch them, and a
 // touch panics loudly instead of passing quietly.

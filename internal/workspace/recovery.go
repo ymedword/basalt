@@ -1,7 +1,7 @@
 package workspace
 
 // 本文件是崩溃恢复六步里的第 ⑤ 步（颗粒度文档 §2.3 流程 G；契约 run-and-errors.md
-// §4.3.2 第 5 步）：目录交换（技术方案 §11.4 的"多文件提交"）中断在半路时，按残留把工作区
+// §4.3.2 第 5 步）：目录交换（技术方案 §3.4.2 的"多文件提交"）中断在半路时，按残留把工作区
 // 收敛回一个确定状态——**回滚**（`.backup` 恢复为正式目录）或**前滚**（正式目录已就位，
 // 删掉残留）。调用方是**持锁的重命令**，启动时（取锁后、开跑前）跑一次。
 // This file is step ⑤ of the crash-recovery scan: it converges the workspace after an
@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	// backupSuffix / stagingSuffix 是目录交换的两个残留后缀（技术方案 §11.4：原目录 →
+	// backupSuffix / stagingSuffix 是目录交换的两个残留后缀（技术方案 §3.4.2：原目录 →
 	// `.backup`，新内容先在 `.staging` 构建再顶上；契约 §4.3.2 第 5 步把两者合称
 	// "工作区替换残留"）。后缀即约定：`<name>.backup` 与 `<name>.staging` 与正式目录
 	// `<name>` 同在 agents/ 下——**同父目录**才可能用两次 rename 完成交换。

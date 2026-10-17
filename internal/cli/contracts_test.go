@@ -16,7 +16,7 @@ const contractsDir = "../../docs/contracts"
 // TestContractYAMLParses：docs/contracts/*.yaml 经 goccy/go-yaml 全解析通过。
 //
 // 契约是手写的 YAML，缩进、锚点、重复键这类隐性错误不解析就看不见——用项目已有的
-// YAML 依赖当"下游解析器"把它读回去，坏契约在门禁里当场红（编程指南 §7 陷阱 32）。
+// YAML 依赖当"下游解析器"把它读回去，坏契约在门禁里当场红（开发操作 §7 陷阱 32）。
 // Every contract YAML must parse through the project's own YAML dependency, so a
 // malformed contract fails the gate instead of surfacing at consumption time.
 func TestContractYAMLParses(t *testing.T) {

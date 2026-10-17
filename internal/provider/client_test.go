@@ -327,7 +327,7 @@ func TestOpenAIClient_RejectsBaseURLWithUnsupportedParts(t *testing.T) {
 	})
 }
 
-// TestOpenAIClient_RoundTripsUnknownFieldsTwoHops —— 技术方案 §4.4 约束 3 的验收（两跳，P1-1）。
+// TestOpenAIClient_RoundTripsUnknownFieldsTwoHops —— 技术方案 §2.3 约束 3 的验收（两跳，P1-1）。
 // 缺一不可：① 假服务在响应消息里放一个库不认识的字段；② 把解析结果交回客户端发第二次调用，
 // 假服务收到的第二个请求体**必须仍含该字段**。只对 core.Message 做一次 JSON 往返检不出
 // "库的编解码把未知键丢了"——那正是本条要防的失效。
@@ -623,7 +623,7 @@ const (
 	listDirSchema  = `{"type":"object","properties":{"path":{"type":"string"}}}`
 )
 
-// TestOpenAIClient_EncodesToolsInOutboundRequest —— 技术方案 §4.2 段 4 + 颗粒度文档 §2.4
+// TestOpenAIClient_EncodesToolsInOutboundRequest —— 技术方案 §2.2.2 段 4 + 颗粒度文档 §2.4
 // 裁决注 3 的出站判据：带工具池时请求体**恰一个** `tools` 键，形如
 // `[{"function":{name,description,parameters},"type":"function"}]`（Function Calling 形态，
 // 经 go-openai 类型编解码），按声明顺序排列、schema **逐字**透传。
@@ -703,7 +703,7 @@ func TestOpenAIClient_OmitsToolsKeyWhenPoolIsEmpty(t *testing.T) {
 		"空池请求体 = US-2 以来的字面量；形态变化必须连同本判据一起被审视（库升级同理）")
 }
 
-// TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip —— 技术方案 §4.4 三条硬约束的
+// TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip —— 技术方案 §2.3 三条硬约束的
 // 客户端侧（颗粒度文档 §4.2 映射表：U3 对号 `tool_call_id` / `reasoning_content`）：入站
 // `tool_calls` 映射到 `core.ToolCall`（id / name 显式列、arguments **原样保留为字符串**），
 // 两跳之后出站体里 `tool_calls` / `reasoning_content` / `tool_call_id` 逐字仍在——
@@ -753,7 +753,7 @@ func TestOpenAIClient_ParsesToolCallsAndKeepsReasoningRoundTrip(t *testing.T) {
 		"工具结果消息必须带回被回填的那次调用 id")
 }
 
-// TestOpenAIClient_RoundTripsVendorExtrasOnToolCallMessage —— 技术方案 §4.4 约束 3 的
+// TestOpenAIClient_RoundTripsVendorExtrasOnToolCallMessage —— 技术方案 §2.3 约束 3 的
 // 携带工具调用形态（颗粒度文档 §4.2 映射表：U4 对号 ProviderExtra 往返保真）：供应商扩展
 // 字段与 `tool_calls` 同处一条消息时两跳仍逐字；数字按**原始字面量**回发——默认解码把
 // 数字变 float64，`1e3` 会写成 `1000`、长小数会被截到 17 位有效数字，UseNumber 才留得住。

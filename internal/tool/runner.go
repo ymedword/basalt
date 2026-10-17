@@ -56,7 +56,7 @@ type RunnerOptions struct {
 	MaxOutputBytes int      // budget.max_output_bytes：装配期上限；非正值按缺省 256 KB
 }
 
-// LocalRunner 是 v1 唯一的受控执行实现（技术方案 §6.5 授权矩阵的**执行侧**）：
+// LocalRunner 是 v1 唯一的受控执行实现（技术方案 §4.3 授权矩阵的**执行侧**）：
 // 授权已由 `WhitelistPolicy` 判过，本层只管"怎么跑"——环境白名单、整树终止、读取中
 // 限流、解释器形态校验。它不做失败分类：非零退出码与输出原样交给调用方。
 // The only guarded execution implementation in v1; authorization has already been decided

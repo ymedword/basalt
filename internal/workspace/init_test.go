@@ -13,7 +13,7 @@ import (
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
-// 工作区骨架的固定清单（需求 §5.1 产物树；Compatibility §2.1）：顺序与报告一致。
+// 工作区骨架的固定清单（需求文档 §3.1 产物树；Compatibility §2.1）：顺序与报告一致。
 // The fixed skeleton inventory, in report order.
 var (
 	skeletonDirs  = []string{"agents", "skills", "memory", "logs", "archive", "sessions"}
@@ -69,7 +69,7 @@ func TestInit_TemplateContent(t *testing.T) {
 	require.Empty(t, servers, "mcp_servers.yaml 应当是空表")
 }
 
-// TestInit_Idempotent：二跑幂等——已有文件不覆盖（需求 §5.1；技术方案 §8.1）。
+// TestInit_Idempotent：二跑幂等——已有文件不覆盖（需求文档 §3.1；技术方案 §3.1.1）。
 func TestInit_Idempotent(t *testing.T) {
 	root := t.TempDir()
 	ws := filepath.Join(root, ".basalt")

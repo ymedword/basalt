@@ -1,6 +1,6 @@
 package core
 
-// 本文件是运行级配置快照的载体声明（技术方案 §11.5）：由 workspace 构造、storage 落库，
+// 本文件是运行级配置快照的载体声明（技术方案 §3.6）：由 workspace 构造、storage 落库，
 // 循环只消费。快照是"读即所记"的落点——注入内容与清单哈希出自同一次读取。
 // This file declares the run-level config snapshot (Technical Solution §11.5): built by
 // workspace, persisted by storage, consumed read-only by the loop.

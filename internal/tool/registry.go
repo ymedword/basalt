@@ -8,7 +8,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// Registry 是进程内的工具注册池（技术方案 §6.1）：显式注册、按名解析、导出名字集。
+// Registry 是进程内的工具注册池（技术方案 §4.1.1）：显式注册、按名解析、导出名字集。
 // 装配期一次构建、之后只读——名字集由 `app` 导出并注入 `AgentLoader`（宪法 III 的显式面；
 // `workspace` 不反向依赖本包）。解析**只查表**：未命中就是未命中，不遍历、不推断。
 // Registry is the in-process tool pool: explicit registration, lookup by name, and a

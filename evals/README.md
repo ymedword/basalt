@@ -45,7 +45,9 @@ GOPROXY=https://goproxy.cn go run ./evals --cases evals/cases --provider deepsee
 scripts/run-evals.sh
 ```
 
-参数只有两个（没有位置参数）：`-cases`（用例目录，缺省 `evals/cases`）与 `-provider`（门控的供应商名）。
+参数有三个（没有位置参数）：`-cases`（用例目录，缺省 `evals/cases`）、`-provider`（门控的供应商名）、`-results`（结果目录，缺省 `evals/results`）。CI / 验收入口用独立结果目录，不从历史目录取最近一份报告。
+
+项目自动化统一使用 `sh scripts/check-acceptance.sh --profile evals`（Windows：`.\scripts\check-acceptance.ps1 --profile evals`），同时跑两个目录并核对必跑 ID 和跳过规则；完整门禁用同入口的默认 full profile。CI 已接入相同入口并上传失败证据，详见 [Harness 说明](../harness/README.md)。下表是评测二进制的真实退出码；`go run` 会将非零子进程状态包装，自动化调用编译后的二进制。
 
 **退出码**三档，供脚本判卷：
 
@@ -200,4 +202,4 @@ GOPROXY=https://goproxy.cn go run ./evals --cases evals/cases --provider deepsee
 - **不换算金额**：只读 token 用量与调用次数
 - **不跑并行**：一轮内多工具是**串行**执行（与生产一致）
 - **不替真模型编写答案**：真模型档禁 `script`
-- **不进 `make check`**：评测层是开发期回归工具，门禁化属构建步骤变更，需单独裁决
+- **验收入口**：原 `make check` 保持七项目标，新增 `make acceptance` / `sh scripts/check-acceptance.sh` 将固定评测作为必验项，CI 调用统一入口；可选真模型 SKIP 不代表真实能力已验证

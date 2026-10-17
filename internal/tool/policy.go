@@ -84,7 +84,7 @@ type PolicyOptions struct {
 	AllowedDomains  []string // http.allowed_domains：出网域名白名单（大小写不敏感）
 }
 
-// WhitelistPolicy 是 v1 唯一的授权实现（技术方案 §6.5 授权矩阵 + §2.3 流程 F）：
+// WhitelistPolicy 是 v1 唯一的授权实现（技术方案 §4.3 授权矩阵 + §2.3 流程 F）：
 // 只看"谁、要碰什么"——`Action` 没有 argv 字段，形态类校验属执行侧（`LocalRunner`）。
 // WhitelistPolicy authorizes by "who touches what" only; shape checks belong to the runner.
 type WhitelistPolicy struct {

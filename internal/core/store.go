@@ -100,7 +100,7 @@ type ToolResolver interface {
 	Specs(names []string) []ToolSpec
 }
 
-// Policy 是授权判定接口（技术方案 §6.5 逐字）：回答"这个动作允许吗"，不负责"怎么做"。
+// Policy 是授权判定接口（技术方案 §4.3 逐字）：回答"这个动作允许吗"，不负责"怎么做"。
 // 调用点在**工具内部**（文件工具只需 Policy，命令执行才需 CommandRunner）——调用方
 // 只依赖本接口，**不得**依赖 WhitelistPolicy 等具体实现。
 // Policy answers "is this action allowed?"; the call site lives inside each tool and
@@ -111,7 +111,7 @@ type Policy interface {
 	Check(ctx context.Context, action Action) error
 }
 
-// CommandRunner 是受控子进程执行接口（技术方案 §6.5 逐字）：回答"怎么受控地执行"——
+// CommandRunner 是受控子进程执行接口（技术方案 §4.3 逐字）：回答"怎么受控地执行"——
 // cwd、环境变量白名单、输出上限、取消与进程树回收都在实现侧。
 // CommandRunner executes a command under control: cwd, env allowlist, output cap,
 // cancellation and process-tree cleanup all live in the implementation.

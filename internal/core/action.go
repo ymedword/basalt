@@ -1,6 +1,6 @@
 package core
 
-// 本文件是授权面与执行面的输入 / 产出声明（技术方案 §6.5 逐字）。
+// 本文件是授权面与执行面的输入 / 产出声明（技术方案 §4.3 逐字）。
 // 授权与执行分离（宪法 VI）：`Policy` 看 Action、`CommandRunner` 看 Command——
 // 一个答"允许吗"，一个答"怎么做"，两个接口各自演进。
 // This file declares the inputs and outputs of the authorization and execution faces
