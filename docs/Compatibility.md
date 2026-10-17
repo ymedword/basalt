@@ -43,7 +43,7 @@
 | 技能绑定机制 | 保持一致 | frontmatter `skills:` 声明式（US-7 已决 18 起） | 同；本地 `skills/` 软连接同样无视 + WARN | 无需动作 |
 | 技能库形态 | 保持一致 | `skills/<name>/SKILL.md` + 可选附属资源 | 同（路径前缀随根名变） | 无需动作 |
 | 记忆分层 | 保持一致 | Agent 层 `memory/agents/<name>/MEMORY.md` + 全局回退层 `memory/MEMORY.md`；两层不叠加 | 同 | 无需动作 |
-| 长期记忆门面工具 | 保持一致 | `save_memory` / `recall_memory`；`recall_memory` 传**单个关键词** | 逐字同（含"多词短语必不命中"这条已知行为） | 无需动作 |
+| 长期记忆门面工具 | 保持一致 | `save_memory` / `recall_memory`；`recall_memory` 传**单个关键词** | 逐字同（含"整串子串匹配——连续短语命中、分散词不自动组合"这条已知行为；2026-10-17 澄清，原文"多词短语必不命中"与 `contains` 语义不符） | 无需动作 |
 | `manage_schedule` 与 `schedules:` 段 | 保持一致 | 第 10 个内置工具，只能改当前 Agent 自己的 `schedules:` | v0.1 同步补齐为第 10 个（**这是特意补的**：缺它则声明该工具的 Agent 在 Basalt 上因 `tool not registered` **整只不注册**） | 无需动作 |
 | 通知渠道 | 保持一致 | SQLite 全局注册表；AGENT.md 正文按名引用；类型 → 适配器为装配层显式映射 | 同（表在 `basalt.db`） | 行数据不随文件走，需重新登记（见 §2.5） |
 | 默认监听地址 | 有意改变 | Spring Boot 缺省绑所有接口的 `8080` | **`127.0.0.1:8080`**，远程访问须显式改配置 | 需要配置或手工动作（容器部署改一行） |

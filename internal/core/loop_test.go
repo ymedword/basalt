@@ -65,6 +65,7 @@ type loopHarness struct {
 	tools    *spyTool
 	agents   *fakeAgentSource
 	logs     *bytes.Buffer
+	memory   core.MemoryReader // 记忆端口——**只能在构造期经 withMemory 置入**（nil = 无记忆端口）
 
 	toolSet   []string
 	budget    core.Budget
@@ -75,9 +76,24 @@ type loopHarness struct {
 	cancelRun context.CancelFunc
 }
 
+// harnessOption 是夹具的函数式选项（**在构造 `core.NewAgentService` 之前应用**——
+// 端口在构造期定格，构造之后再写 `h.memory` 对已建好的 service 无效）。
+// harnessOption customizes the fixture; options are applied *before* the service is
+// constructed, since its ports freeze at construction time.
+type harnessOption func(*loopHarness)
+
+// withMemory 把记忆端口**在构造期**置入 `core.ServiceOptions{Memory: ...}`。
+// 两条注入用例（R1 / R4b）**必须**经它传入——否则"有记忆"那组实际跑的是空端口，
+// 断言恒绿：实现错也不红。
+// withMemory injects the memory port at construction time; injecting it afterwards would
+// leave the built service unchanged and the assertions would pass vacuously.
+func withMemory(r core.MemoryReader) harnessOption {
+	return func(h *loopHarness) { h.memory = r }
+}
+
 // newLoopHarness 组装一套独立夹具（用例之间零共享状态）。
 // newLoopHarness assembles an isolated fixture; test cases share no state.
-func newLoopHarness(t *testing.T) *loopHarness {
+func newLoopHarness(t *testing.T, opts ...harnessOption) *loopHarness {
 	t.Helper()
 	h := &loopHarness{
 		t:         t,
@@ -96,6 +112,11 @@ func newLoopHarness(t *testing.T) *loopHarness {
 			ContextTokens:  32768,
 		},
 	}
+	// 选项**必须**在下面构造 service 之前应用——`Memory` 端口的接线发生在构造期。
+	for _, opt := range opts {
+		opt(h)
+	}
+
 	h.tools = &spyTool{name: "read_file"}
 	h.registry.register(h.tools)
 	h.audit = &fakeAudit{store: h.store}
@@ -110,6 +131,7 @@ func newLoopHarness(t *testing.T) *loopHarness {
 		Runs:      h.store,
 		Snapshots: h.store,
 		Audit:     h.audit,
+		Memory:    h.memory,
 		Loop: core.NewReActLoop(
 			core.NewPromptBuilder(h.registry),
 			core.NewToolExecutor(h.registry, h.audit, logger),
@@ -142,6 +164,52 @@ func (h *loopHarness) req(msg string) core.RunRequest {
 // cancel 取消本次运行（§4.3 的回归代码按此形状调用）。
 // cancel cancels the current run.
 func (h *loopHarness) cancel() { h.cancelRun() }
+
+// —— 假记忆端口 ——
+
+// fakeMemoryReader 是静态返回一段核心区文本的 `core.MemoryReader` 替身（R1 / R4b 用）。
+// fakeMemoryReader always returns the same core-region text.
+type fakeMemoryReader struct {
+	text string
+}
+
+// LoadEffective 恒返回预置文本。
+// LoadEffective returns the scripted text.
+func (r fakeMemoryReader) LoadEffective(context.Context, string) (string, error) {
+	return r.text, nil
+}
+
+// scriptedMemoryReader 是逐次返回不同文本并按次计数的 `core.MemoryReader` 替身——
+// 第 2 次读出"新偏好"即暴露"每轮重读"（R2 的判别力来源）。文本用尽后返回空串。
+// scriptedMemoryReader yields a different text per read and counts the reads; running out
+// of texts yields an empty string.
+type scriptedMemoryReader struct {
+	texts []string
+
+	mu    sync.Mutex
+	reads int
+}
+
+// LoadEffective 返回第 `reads` 次（0 起）脚本文本并计数。
+// LoadEffective returns the next scripted text and bumps the counter.
+func (r *scriptedMemoryReader) LoadEffective(context.Context, string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	text := ""
+	if r.reads < len(r.texts) {
+		text = r.texts[r.reads]
+	}
+	r.reads++
+	return text, nil
+}
+
+// readCount 是已发生的读取次数（运行内冻结的判据：整次运行**恰一次**）。
+// readCount reports how many times the port was read.
+func (r *scriptedMemoryReader) readCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads
+}
 
 // —— 假模型 ——
 

@@ -192,12 +192,25 @@ func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
 func (f *wireFixture) writeInstanceConfig(t *testing.T) {
 	t.Helper()
 
+	f.writeInstanceConfigBackend(t, "")
+}
+
+// writeInstanceConfigBackend 同上，并可显式写一行 `memory.backend`——**换档只改这一行配置**
+// 是 FR-017 的原话，记忆用例因此都经"配置装载"这条真路取档位，而不是在 Go 结构里塞值。
+// 空 backend = 不写 memory 段（缺省档由 cli 的取值域判定）。
+// The memory cases switch carriers by this very configuration line, loaded from disk.
+func (f *wireFixture) writeInstanceConfigBackend(t *testing.T, memoryBackend string) {
+	t.Helper()
+
 	t.Setenv("BASALT_WIRE_KEY", "wire-sentinel-not-a-secret")
 	content := "providers:\n" +
 		"  - name: probe\n" +
 		"    base_url: http://127.0.0.1:1\n" +
 		"    api_key: ${BASALT_WIRE_KEY}\n" +
 		"    default_model: probe-model\n"
+	if memoryBackend != "" {
+		content += "memory:\n  backend: " + memoryBackend + "\n"
+	}
 	require.NoError(t, os.WriteFile(filepath.Join(f.workDir, configFileName), []byte(content), 0o644))
 }
 
@@ -274,9 +287,15 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 // TestWire_RegistryNamesReachAgentLoader 是 T2：装配期注册池的名字集**流进**装载器——
 // 声明池内工具名的 Agent 注册成功，声明池外工具名的 Agent 整只不注册（宪法 IV）。
 // 判据落在行为上：同一个运行入口对前者不报"不存在"，对后者报"不存在"。
+//
+// 本 US 的名字清单**扩至八件**（+ 两件记忆工具）：清单是"池内名"的**行为面**载体，与
+// `ports_test.go` 的恰好八件名集（数据面）成对——数据面判"池里有什么"，这里判"池里的
+// 名字真能一路走到装载器"。
 func TestWire_RegistryNamesReachAgentLoader(t *testing.T) {
 	fx := newWireFixture(t)
-	fx.writeAgent(t, "reader", "read_file")   // 池内：装配期注册的三件文件工具之一
+	// 池内：三件文件工具之一 + US-5 四件 + 两件记忆工具（名字集没喂进装载器时，
+	// 本行声明的 Agent 会整只不注册 → 下面的 NoError 断言红）。
+	fx.writeAgent(t, "reader", "read_file", "shell", "http_get", "http_post", "save_memory", "recall_memory")
 	fx.writeAgent(t, "ghost", "no_such_tool") // 池外：整只不注册
 
 	rt := fx.assemble(t)
@@ -511,4 +530,183 @@ func TestWire_SnapshotLandsBeforeTheRunStarts(t *testing.T) {
 
 	// 时间戳是毫秒（判据只在量级上：秒级时间戳会比这个下界小两个数量级）。
 	require.Greater(t, createdAt, time.Now().Add(-time.Hour).UnixMilli(), "毫秒时间戳")
+}
+
+// —— US-6 追加三条（段 2 端到端 / Demo 二闭环 / sqlite 档载体隔离）+ 池名集扩至八件 ——
+// Three added by US-6. All of them assemble through the exported `OpenRuntime`, which loads
+// the configuration from disk — "switch the carrier by one configuration line" is therefore
+// exercised as a real configuration load rather than poked into an in-memory struct.
+
+// memoryEntry 是本节三条用例共用的那条核心记忆正文：判据只关心"这段文本是否出现在模型
+// 入站请求里"，故取可辨认的中文短语；它同时被写进工具参数（JSON 字符串），不做任何转义。
+// The one core-memory body shared by the memory cases; never escaped, so the scripted tool
+// call and the assertions compare the very same literal.
+const memoryEntry = "偏好：以后回答简洁点，先给结论。"
+
+// openWireRuntime 走**包外装配面**建一次重路径运行期（配置从盘上装载）。
+// openWireRuntime assembles one heavy-path runtime through the exported surface.
+func openWireRuntime(t *testing.T, fx *wireFixture, client core.ProviderClient) *Runtime {
+	t.Helper()
+
+	rt, err := OpenRuntime(context.Background(), Options{
+		WorkDir:                fx.workDir,
+		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		Logger:                 fx.logger,
+		ProviderClient:         client,
+	})
+	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
+	t.Cleanup(func() { require.NoError(t, rt.Close()) })
+	return rt
+}
+
+// systemMessage 取出站请求里的 system 消息正文——段 1 与段 2 合成**一条**且恒在首位
+// （`core.roleSystem` 未导出，这里按契约字面量判角色）。
+// systemMessage returns the merged system message; segments one and two share one message.
+func systemMessage(t *testing.T, req core.ChatRequest) string {
+	t.Helper()
+
+	require.NotEmpty(t, req.Messages, "出站请求至少要有段 1 + 段 2 合成的 system 消息")
+	first := req.Messages[0]
+	require.Equal(t, "system", first.Role, "段 1 与段 2 合成一条 system 消息，排在首位")
+	return first.Content
+}
+
+// appendCoreEntry 往 markdown 载体的核心区**手工**加一条条目，保留模板原有结构（文件标题
+// 在前、两分区标题齐备）——判据输入因此是人手编辑过的载体，不是夹具另造的一份文本。
+// appendCoreEntry edits the markdown carrier by hand while keeping the template's shape.
+func appendCoreEntry(t *testing.T, path, entry string) {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	text := string(raw)
+	require.Contains(t, text, "## 核心记忆", "工作区模板自带核心区标题")
+	updated := strings.Replace(text, "## 核心记忆", "## 核心记忆\n\n- "+entry, 1)
+	require.NoError(t, os.WriteFile(path, []byte(updated), 0o644))
+}
+
+// saveMemoryThenRestartAndRecall 跑一次 **Demo 二最小闭环**：真装配（含真记忆工具）里让
+// 替身模型调 `save_memory` 写一条核心记忆 → 关掉运行期（**进程重启语义**：实例锁与库句柄
+// 一起放掉）→ 再装配、开一个新会话再跑一次，返回第二次运行的入站 system 正文。
+//
+// 两次运行各用各的替身：第二次的入站请求**只可能**来自第二次运行，判据因此不靠调用次序去猜。
+// saveMemoryThenRestartAndRecall walks Demo two: a real tool write, a restart, and a second
+// run whose inbound system message is handed back.
+func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture, backend string) string {
+	t.Helper()
+
+	fx.writeInstanceConfigBackend(t, backend)
+	fx.writeAgent(t, "reader", "save_memory", "recall_memory")
+
+	// 第一跳：模型要写核心记忆；第二跳：确认（无工具调用 → 运行完成）。
+	writer := &scriptedProviderClient{replies: []core.ChatResponse{
+		{
+			ToolCalls: []core.ToolCall{{
+				ID:        "call-mem-write",
+				Name:      "save_memory",
+				Arguments: `{"scope":"CORE","content":"` + memoryEntry + `"}`,
+			}},
+			Usage: core.Usage{PromptTokens: 12, CompletionTokens: 5, TotalTokens: 17},
+		},
+		{Content: "记住了", Usage: core.Usage{PromptTokens: 21, CompletionTokens: 3, TotalTokens: 24}},
+	}}
+
+	first := openWireRuntime(t, fx, writer)
+	res, err := first.RunService().Run(context.Background(), core.RunRequest{
+		Agent: "reader", SessionID: "wire-t029-a", Message: "以后回答简洁点", Channel: "cli",
+	})
+	require.NoError(t, err, "声明两件记忆工具的 Agent 必须注册成功——工具没进注册池时整只不注册")
+	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
+	require.Equal(t, 1, res.ToolCalls, "第一跳必须真的执行了一次 save_memory")
+	require.NoError(t, first.Close(), "重启语义：第一次运行的运行期必须真的关掉（锁与库句柄）")
+
+	reader := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "好的"}}}
+	second := openWireRuntime(t, fx, reader)
+	res, err = second.RunService().Run(context.Background(), core.RunRequest{
+		Agent: "reader", SessionID: "wire-t029-b", Message: "继续", Channel: "cli",
+	})
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
+
+	sent := reader.requests()
+	require.Len(t, sent, 1, "第二次运行只该发一次请求（无工具调用的完成路径）")
+	return systemMessage(t, sent[0])
+}
+
+// TestWire_MemorySegmentReachesModelRequest 是 T029 第 1 条：段 2 **端到端**进模型入站请求
+// 的 system 消息（约束 22）——人手写进全局层载体的核心条目，经"配置装载 → 装配 → 记忆门面
+// → 运行入口 → 提示词组装 → 出站请求"整条路出现在 system 里；该 Agent 层为空故走全局层回退
+// （FR-004 的装配面读数），而归档区**一个字都不进**（FR-009）。
+func TestWire_MemorySegmentReachesModelRequest(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeInstanceConfig(t)
+	fx.writeAgent(t, "reader", "read_file")
+	appendCoreEntry(t, filepath.Join(fx.root, "memory", "MEMORY.md"), memoryEntry)
+
+	fake := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "好"}}}
+	rt := openWireRuntime(t, fx, fake)
+
+	res, err := rt.RunService().Run(context.Background(), core.RunRequest{
+		Agent: "reader", SessionID: "wire-t029-inject", Message: "以后回答简洁点", Channel: "cli",
+	})
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
+
+	sent := fake.requests()
+	require.Len(t, sent, 1, "一次无工具调用的运行只该发一次请求")
+	system := systemMessage(t, sent[0])
+	require.Contains(t, system, "## 核心记忆", "段 2 连分区标题一并进 system（读的是重建结果）")
+	require.Contains(t, system, memoryEntry,
+		"生效层（此处 Agent 层为空 → 全局层）的核心条目必须进模型入站 system——"+
+			"装配没把记忆门面接进运行入口时，这里逐字缺这条")
+	require.NotContains(t, system, "## 归档记忆",
+		"段 2 只含核心区：归档区不进系统提示词，只有 recall_memory 取得到")
+}
+
+// TestWire_SaveMemoryThenSecondRunRecalls 是 T029 第 2 条：**Demo 二最小闭环**——真装配 +
+// 真记忆工具写一条核心记忆，关掉运行期（进程重启语义）后再装配、再跑，第二次运行的段 2
+// 含该条目。**两档各跑一次**：换档只改 `memory.backend` 一行配置（FR-017）。
+func TestWire_SaveMemoryThenSecondRunRecalls(t *testing.T) {
+	for _, backend := range []string{"markdown", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			fx := newWireFixture(t)
+
+			system := saveMemoryThenRestartAndRecall(t, fx, backend)
+
+			require.Contains(t, system, memoryEntry,
+				"第一次运行经真工具写下的核心记忆必须进第二次运行的段 2（Demo 二：跨进程重启仍然记得）")
+			require.Contains(t, system, "## 核心记忆")
+		})
+	}
+}
+
+// TestWire_SqliteBackendLeavesWorkspaceFileUntouched 是 T029 第 3 条：sqlite 档的**载体
+// 隔离**——记忆落库，markdown 载体一个字节都不动、也不被读。两条负向判据把"换档只换读写面"
+// 钉在装配面上：
+//
+//	① 写下的条目出现在第二次运行的段 2 → 写入真的发生了（否则下面的"文件没变"是空判）；
+//	② `memory/MEMORY.md` 逐字节不变，且人手写进去的那条**不得**进段 2——sqlite 档不读该文件，
+//	   Agent 层也不得顺手在 `memory/agents/` 下落文件。
+func TestWire_SqliteBackendLeavesWorkspaceFileUntouched(t *testing.T) {
+	fx := newWireFixture(t)
+
+	globalFile := filepath.Join(fx.root, "memory", "MEMORY.md")
+	const handwritten = "手写的一条：只在 markdown 档生效。"
+	appendCoreEntry(t, globalFile, handwritten)
+	before, err := os.ReadFile(globalFile)
+	require.NoError(t, err)
+
+	system := saveMemoryThenRestartAndRecall(t, fx, "sqlite")
+
+	require.Contains(t, system, memoryEntry,
+		"sqlite 档的写入必须真的落到库里并生效——文件没变只有在写入发生过时才是证据")
+	require.NotContains(t, system, handwritten,
+		"sqlite 档不得回读 markdown 载体：换档换的是读写面，不是两档并读")
+
+	after, err := os.ReadFile(globalFile)
+	require.NoError(t, err)
+	require.Equal(t, string(before), string(after), "sqlite 档一个字节都不写 markdown 载体")
+
+	require.NoFileExists(t, filepath.Join(fx.root, "memory", "agents", "reader", "MEMORY.md"),
+		"sqlite 档的 Agent 层写入落库，不得顺手在 memory/agents/ 下落文件")
 }

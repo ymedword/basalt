@@ -112,7 +112,8 @@ const (
 
 // agentTemplateDTO 是 profile create 模板的落盘形态：**经 yaml.Marshal 编码**——不得字符串
 // 插值（名字可含空格 / 冒号 / 中文，插值会写坏 YAML）；provider.model 恒为占位；tools 显式
-// 空列表；其余列表字段（skills / mcp_servers / bootstrap / schedules）省略
+// 声明两件记忆工具（US-6 起——出厂即可记忆）；其余列表字段（skills / mcp_servers /
+// bootstrap / schedules）省略
 // （颗粒度文档 §3.1 CreateAgent 注释 + data-model「profile create 模板」）。
 // agentTemplateDTO is the on-disk shape of a created template; names go through the encoder.
 type agentTemplateDTO struct {
@@ -142,7 +143,7 @@ func agentTemplate(name string, providers []string) (string, error) {
 		Name:        name,
 		Description: "一句话说明这个 Agent 的职责（可留空）",
 		Provider:    agentTemplateProvider{Name: providerName, Model: placeholderModelName},
-		Tools:       []string{}, // tools: []（记忆工具到 US-6 才在池）
+		Tools:       []string{"save_memory", "recall_memory"}, // 默认两件记忆工具（US-6；声明即绑定——池外工具名会让本 Agent 整只不注册）
 	}
 
 	front, err := yaml.Marshal(dto)

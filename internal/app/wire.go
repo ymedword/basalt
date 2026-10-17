@@ -3,7 +3,8 @@ package app
 // 本文件是**唯一装配层**的重路径接线（技术方案 §8.7 轻 / 重两条路；颗粒度文档 §2.3 流程 D /
 // 口径 25）：重命令（本 US 是 `chat`——`serve` 归后续 US）在开跑之前，按**固定次序**把长生命
 // 周期资源接起来——取实例锁 → 写模式打开 → 显式迁移 → 崩溃恢复（账本六步 + 工作区残留第 ⑤ 步）
-// → 建工具注册池 → 注册池名字集喂 Agent 装载器 → 构造运行入口。
+// → 构建记忆门面（载体按 `memory.backend` 选，US-6）→ 建工具注册池 → 注册池名字集喂 Agent
+// 装载器 → 构造运行入口。
 // This file wires the heavy path, the one place where an instance's long-lived resources
 // are assembled. The order is a correctness constraint rather than a style: the lock
 // precedes every write, the recovery scan precedes the first run, and the agent registry
@@ -18,10 +19,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/memory"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -179,6 +182,21 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		"closed_runs", report.ClosedRuns, "rolled_back", residue.RolledBack,
 		"rolled_forward", residue.RolledForward)
 
+	// 记忆门面（US-6，位置在 ④ 与 ⑤ 之间——颗粒度文档 §3.1）：载体按 `memory.backend` 在工作区
+	// 根 / 库句柄之上选一次，门面**一个实例喂两个消费面**——工具侧（写路径）与运行入口的段 2
+	// 注入（读路径）拿到的是同一个对象，作用域回退、per-scope 写锁与注入期 WARN 因此只有一份
+	// 实现（口径 25）。构建期**零落盘**：markdown 档的 MEMORY.md 在首次写入时才创建。
+	// The memory facade is built once and handed to both consumers, so the fallback, the
+	// per-scope lock and the injection-time warning live in exactly one implementation.
+	memBackend, err := memoryCarrier(cfg, db, root, a.nowOr())
+	if err != nil {
+		return nil, abortRuntime(err, db, lock)
+	}
+	memSvc, err := memory.NewService(memory.Options{Backend: memBackend, Logger: logger})
+	if err != nil {
+		return nil, abortRuntime(fmt.Errorf("构建记忆门面: %w", err), db, lock)
+	}
+
 	// ⑤ 授权判定与工具注册池：策略先建（工具持有的是**接口**，具体实现在装配处一处选定）；
 	// 池是**全局**的——同一实例的注册池服务所有 Agent，声明的名字与之比对（宪法 IV）。
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{
@@ -201,11 +219,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Interpreters:   cfg.Shell.Interpreters,
 		MaxOutputBytes: outputBudget(cfg),
 	})
-	// 六件工具：三件文件工具 + 本 US 的 shell / http_get / http_post（技能调用工具永久禁；
-	// `notify` / `manage_schedule` 与 US-6 / US-7 / US-10 各件仍为占位）。write_file 的构造期
+	// 八件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 本 US 的两件记忆工具
+	// （技能调用工具永久禁；`notify` / `manage_schedule` 两件是注册池第 9 / 10 件、归 US-8 /
+	// US-10，US-7 的 MCP 各件同样仍为占位——颗粒度文档 §3.5 后续占位 1）。write_file 的构造期
 	// Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
 	// 那棵树"同源由运行环境保证。
-	// Six tools: the three file tools plus this US's shell and HTTP pair.
+	// Eight tools: the three file tools, US-5's shell/HTTP trio, and this US's memory pair.
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -213,10 +232,23 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		tool.NewShellTool(policy, runner),
 		tool.NewHTTPGetTool(policy),
 		tool.NewHTTPPostTool(policy),
+		tool.NewSaveMemoryTool(memSvc),
+		tool.NewRecallMemoryTool(memSvc),
 	} {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
 		}
+	}
+	// 注册池必须与**声明名集**（`declaredToolNames`）逐名一致：轻路径（`profile list` /
+	// `profile show`）不建注册池，Agent 的装载判定拿的就是那份声明——两者漂移会让同一份
+	// AGENT.md 在重 / 轻两条路上得到相反的注册结论。不一致即拒绝启动：两套判定的分歧比
+	// "哪一套对"更值得先停下。
+	// The registry must match the declared name set, or the same AGENT.md would be judged
+	// differently depending on which command read it.
+	if got := registry.Names(); !slices.Equal(got, declaredToolNames) {
+		return nil, abortRuntime(fmt.Errorf(
+			"注册池与声明名集不一致——声明 %v、实际注册 %v（重 / 轻两条路会给出相反的注册判定）",
+			declaredToolNames, got), db, lock)
 	}
 
 	// ⑥ 注册池名字集喂装载器：workspace **不得**反向 import tool，名字在装配期一次导出
@@ -252,6 +284,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Runs:      storage.NewRunStore(db),
 		Snapshots: storage.NewSnapshotStore(db),
 		Audit:     invocations,
+		Memory:    memSvc,
 		Loop:      loop,
 		Logger:    logger,
 		Now:       a.nowOr(),
@@ -291,6 +324,20 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 	return errors.Join(err, lock.Release())
 }
 
+// declaredToolNames 是装配层注册池的**声明名集**（颗粒度文档 US-4 §2.4 注 4：名字在装配期
+// 一次导出——`workspace` 不反向 import `tool`，装载器只认这份字符串清单）。两个消费面读的是
+// 同一份：① 重路径在注册完八件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
+// （`profile list` / `profile show` 经 `agentsPort`）不建注册池，直接拿它当池做装载判定
+// （池外工具名 → 整只不注册，宪法 IV）。两条路因此对同一份 AGENT.md 给出同一个结论。
+// 顺序 = `tool.Registry.Names()` 的排序序（比较逐名且保序）——**不得**按主题分组重排。
+// declaredToolNames is the pool declared once at assembly time and read by both paths: the
+// heavy path verifies its registry against it, the light path judges admission with it. The
+// order matches Registry.Names(), which is sorted.
+var declaredToolNames = []string{
+	"http_get", "http_post", "list_dir", "read_file",
+	"recall_memory", "save_memory", "shell", "write_file",
+}
+
 // providerNames 按配置顺序取出 provider 名集（显式遍历有序数组，**不**遍历映射表——Go 的
 // map 遍历顺序随机，任何"从表里挑"的写法都会让注册判定在两次启动之间漂移）。
 // providerNames lists the configured provider names in configuration order.
@@ -312,6 +359,31 @@ func outputBudget(cfg *cli.Config) int {
 		return int(v)
 	}
 	return 0
+}
+
+// memoryCarrier 按 `memory.backend` 选定记忆载体（颗粒度文档 §3.1 的装配行）：markdown 档建在
+// 工作区根之上（全部读写经根句柄，Agent 层目录与文件按需创建），sqlite 档复用重路径已打开的
+// 库句柄与**同一个时钟**（时间显式传入，载体内部不取 time.Now）。
+//
+// **空串归 markdown**：它只有两条来路——配置文件缺失 / 没有 memory 段的实例配置，以及测试夹具
+// 直接构造 `cli.Config`（不经过装载期校验）——两者都是"没配"而不是"配错"，缺省与装载期取同一档
+// （`cli.validateConfig` 已把空串就地写回该缺省，这里是同一条口径的第二处落点）。取值域外的取值
+// **再拒一次**：装配层不假设调用方一定走过装载期那道门（fail-closed 双保险，颗粒度文档 §3.5
+// 第 9 项）。
+// memoryCarrier picks the carrier named by memory.backend; an empty string means "not
+// configured" and lands on the documented default, while any value outside the two backends
+// is refused again here rather than silently degraded.
+func memoryCarrier(cfg *cli.Config, db *storage.DB, root string, now func() time.Time) (core.LongTermMemoryStore, error) {
+	switch cfg.Memory.Backend {
+	case "", "markdown":
+		return memory.NewMarkdownStore(root), nil
+	case "sqlite":
+		return storage.NewMemoryStore(db, now), nil
+	default:
+		return nil, fmt.Errorf(
+			"配置项 memory.backend 取值非法（%s）——只允许 markdown（缺省）或 sqlite；mem0 载体尚未实现，未知取值一律拒绝启动，不静默降级",
+			cfg.Memory.Backend)
+	}
 }
 
 // heavyRuntime 是重路径运行期的资源句柄：实例锁、数据库、运行入口与三个只读消费面。

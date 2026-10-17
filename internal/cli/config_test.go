@@ -465,3 +465,73 @@ func TestLoadConfig_AllowlistSectionsDefaultToEmpty(t *testing.T) {
 	require.Empty(t, cfg.Shell.Interpreters)
 	require.Empty(t, cfg.Shell.EnvPassthrough)
 }
+
+// TestLoadConfig_MemoryBackendDefaultsToMarkdown 缺省档 = markdown（约束 18）：**不写
+// memory 段**与写了段但省略 backend 两条路径的读数**必须相同**——默认值只有一个来源，
+// 哪条路径给都判同一个值。
+//
+// 不写 memory 段时断言的是**缺省值**而不是「零值恰好等于 markdown」：留空 → 归一到
+// markdown 正是本用例判的东西（只判"没报错"的写法，把「宁可写成空字符串」的实现也放过）。
+// 逆改点：把缺省改成空串或 sqlite → 两条子例的分区断言红。
+func TestLoadConfig_MemoryBackendDefaultsToMarkdown(t *testing.T) {
+	for _, tc := range []struct{ name, tail string }{
+		{name: "不写 memory 段", tail: ""},
+		{name: "写了段但省略 backend", tail: "memory:\n  backend: \"\"\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, baseConfig+tc.tail)
+			cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+				"DEMO_KEY":  "resolved-secret-value",
+				"DEMO_HOST": "api.internal",
+			}))
+			require.NoError(t, err, "记忆段是可选段：不配 = 用缺省档，不是错误")
+			require.Equal(t, "markdown", cfg.Memory.Backend,
+				"缺省档 = markdown（约束 18；零新增配置键——backend 是既有键）")
+		})
+	}
+}
+
+// TestLoadConfig_AcceptsSqliteBackend 取值域内的另一档：`sqlite` 原样落地（装载层只
+// 搬运、不加工——去哪找库文件是装配层的事，见 T036）；`${VAR}` 占位在**类型化之后**
+// 仍照常解析（配置面的占位纪律对 memory 段不因类型化而失效）。
+// 逆改点：把取值域写成只有 markdown 一种 → 显式 sqlite 被拒；类型化时漏掉占位解析路径
+// → 占位档读出字面 `${...}`。
+func TestLoadConfig_AcceptsSqliteBackend(t *testing.T) {
+	path := writeConfig(t, baseConfig+"memory:\n  backend: sqlite\n")
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err, "sqlite 在取值域内（约束 18）")
+	require.Equal(t, "sqlite", cfg.Memory.Backend)
+
+	path = writeConfig(t, baseConfig+"memory:\n  backend: ${MEMORY_BACKEND}\n")
+	cfg, err = cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":       "resolved-secret-value",
+		"DEMO_HOST":      "api.internal",
+		"MEMORY_BACKEND": "sqlite",
+	}))
+	require.NoError(t, err, "占位解析在类型化之后照常生效")
+	require.Equal(t, "sqlite", cfg.Memory.Backend)
+}
+
+// TestLoadConfig_RejectsUnknownMemoryBackend 取值域外 fail-closed（约束 18）：`mem0`
+// （接口预留、实现延后——需求 U-8）与一切未知取值**拒绝启动**，文案**点名键与取值**且
+// 给出可执行下一步；**不得**静默降级到 markdown——那会让「我配了 mem0」悄悄变成
+// 「记忆写进了文件」，载体形态与运维预期分叉。
+// 逆改点：把 default 分支改成回落 markdown → 三态全红（无错误）。
+func TestLoadConfig_RejectsUnknownMemoryBackend(t *testing.T) {
+	for _, backend := range []string{"mem0", "postgres", "MEMORY.DEFAULT"} {
+		t.Run(backend, func(t *testing.T) {
+			path := writeConfig(t, baseConfig+"memory:\n  backend: "+backend+"\n")
+			_, err := cli.LoadConfig(path, envLookup(map[string]string{
+				"DEMO_KEY":  "resolved-secret-value",
+				"DEMO_HOST": "api.internal",
+			}))
+			require.Error(t, err, "取值域外必须拒绝启动（不静默降级）：%s", backend)
+			require.Contains(t, err.Error(), "memory.backend", "拒绝文案必须点名配置键：%s", backend)
+			require.Contains(t, err.Error(), backend, "拒绝文案必须点名取值：%s", backend)
+			require.Contains(t, err.Error(), "markdown", "文案给出取值域（可执行下一步）：%s", backend)
+		})
+	}
+}

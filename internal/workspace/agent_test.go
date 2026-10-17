@@ -361,6 +361,41 @@ tools: [read_file]
 	require.Equal(t, "tool not registered: read_file", entries[0].RejectReason)
 }
 
+// 中文验收点：**模板声明 ↔ 注册池成对**（US-6：颗粒度文档 §6.2 口径 26 / spec FR-026 /
+// 宪法 IV 连带）——`CreateAgent` 造出的 Agent 声明两件记忆工具：池含这两件时**正常注册**
+// 且 `Profile.Tools` 逐字，池为空时**整只不注册**且 reason 点名首个缺名。
+//
+// 声明面刻意取自**真模板**而非本文件的手写 frontmatter 夹具：本条判的是"模板默认工具与
+// 注册池两边同时演进"，手写声明会让两条断言在池与模板脱钩时照常绿——那正是 US-6 真正的
+// 装配风险（新造的 Agent 一到池外就整只不注册，`profile create` 出来即死）。
+// Acceptance point: the created template's declared memory tools and the assembly
+// pool must agree — declared + in pool registers; declared + empty pool does not.
+func TestAgentLoader_MemoryToolsInPoolRegisterAgent(t *testing.T) {
+	memoryTools := []string{"save_memory", "recall_memory"}
+
+	root := initWorkspaceRoot(t)
+	_, err := workspace.CreateAgent(root, "remembering-agent", []string{"deepseek"})
+	require.NoError(t, err)
+
+	t.Run("池含两件", func(t *testing.T) {
+		entries, err := newTestLoaderWithTools(t, memoryTools, "deepseek").LoadAll(root)
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.True(t, entries[0].Registered, "池含两件 → 应当注册：%s", entries[0].RejectReason)
+		require.Equal(t, memoryTools, entries[0].Profile.Tools,
+			"模板声明的工具名逐字进 Profile（声明序不变）")
+	})
+
+	t.Run("空池", func(t *testing.T) {
+		entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.False(t, entries[0].Registered, "空池下声明的记忆工具名一律视作未注册")
+		require.Equal(t, "tool not registered: save_memory", entries[0].RejectReason,
+			"reason 逐字点名声明序里的首个缺名")
+	})
+}
+
 // 中文验收点：目录名与 frontmatter name 逐字一致——不一致整只不注册且点名；
 // 解析成功即有 Profile（未注册也可非 nil，供 list / show 展示声明面——§2.4 注 3）。
 // Acceptance point: a name that differs from the directory name rejects the agent.

@@ -9,7 +9,8 @@ import (
 )
 
 // 本文件是提示词面的组装（颗粒度文档 §2.3 流程 C）：四段 = 段 1 系统提示词 / 段 2 记忆注入
-// （本 US 恒空）/ 段 3 对话历史 / 段 4 工具定义；两级裁剪与上下文准入；token 估算器 v1。
+// （运行级冻结文本，空则无痕）/ 段 3 对话历史 / 段 4 工具定义；两级裁剪与上下文准入；
+// token 估算器 v1。
 // This file builds the prompt (flow C): four segments, two-level trimming, context
 // admission, and the v1 token estimator.
 //
@@ -34,8 +35,9 @@ func NewPromptBuilder(resolver ToolResolver) *PromptBuilder {
 // Prompt 是一轮组装好的完整提示词（四段）。
 // Prompt is the complete prompt assembled for one round.
 type Prompt struct {
-	// System 是段 1 系统提示词（快照冻结的段一正文）+ 段 2 记忆注入（本 US 恒空——装配位
-	// 保留、不产生文本；故两者合成一个字段，注入接上时无需改结构）。
+	// System 是段 1 系统提示词（快照冻结的段一正文）+ 段 2 记忆注入（本次运行生效的核心区
+	// 文本，运行开始时读一次、运行内冻结）；核心区为空则段 2 **不产生任何字符**（不加分隔
+	// 符、不留空白）——与无记忆时逐字节相同。两段合成一个字段。
 	System string
 	// History 是段 3 对话历史（经两级裁剪）；当前用户消息在末位——裁剪从最老处进行，
 	// 它天然不可裁。
@@ -73,7 +75,7 @@ const (
 	defaultMaxHistoryTurns = 20
 )
 
-// Build 组装一轮提示词：段 1 取快照 → 段 2 恒空 → 段 4 取工具规格 → 段 3 两级裁剪 →
+// Build 组装一轮提示词：段 1 取快照 → 段 2 拼生效记忆 → 段 4 取工具规格 → 段 3 两级裁剪 →
 // 估算与准入。
 // Build assembles one round's prompt: segments first, then two-level history trimming,
 // then the admission check.
@@ -90,8 +92,15 @@ func (b *PromptBuilder) Build(env *RunEnv) (Prompt, error) {
 	if env.Snapshot != nil {
 		system = env.Snapshot.SectionOne // 段 1：快照冻结的段一正文（**不重读**）
 	}
+	if env.memory != "" {
+		// 段 2：本次运行生效的核心区文本（**运行开始时读一次、运行内冻结**——本函数每轮
+		// 重组装，但**不重读**载体：文本来自 `RunEnv` 的注入位）。
+		// Segment 2 is the frozen core-region text injected into the run environment; this
+		// per-round rebuild never re-reads the carrier, and an empty text adds nothing.
+		system += "\n\n" + env.memory
+	}
 	p := Prompt{
-		System:  system, // 段 2（记忆注入）本 US 恒空——不产生文本，装配位保留
+		System:  system, // 段 1 + 段 2（段 2 为空时不产生任何字符）
 		History: trimByTurns(sessionMessages(env), maxHistoryTurns(env)),
 		Tools:   b.toolSpecs(env.ToolSet), // 段 4；空池 → nil
 	}
@@ -236,7 +245,7 @@ func dropUnit(msgs []Message, protected int) int {
 // 工具的固定包裹开销。
 // estimateTokens covers every outbound field plus fixed per-message and per-tool overhead.
 func estimateTokens(p Prompt) int {
-	total := estimateText(p.System) // 段 1 + 段 2（恒空）
+	total := estimateText(p.System) // 段 1 + 段 2（段 2 非空时一并计入）
 	for _, m := range p.History {
 		total += messageOverheadTokens + estimateText(m.Role) + estimateText(m.Content) +
 			estimateText(m.ToolCallID) + estimateText(m.ReasoningContent)

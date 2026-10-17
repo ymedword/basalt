@@ -298,10 +298,15 @@ func TestToolListerPort_ForwardsSpecsInRegistryOrder(t *testing.T) {
 	require.Equal(t, registry.Specs(registry.Names()), specs, "转调必须逐字段保真（描述与 schema 一并）")
 }
 
-// TestToolListerPort_HeavyAssemblyRegistersSixTools：重路径装配池**六件**——三件文件工具
-// 加本 US 的 `shell` / `http_get` / `http_post`，且新三件确实可解析（`Resolve` 命中），
-// 不再是"注册了名字、背后没有实体"的形态。
-func TestToolListerPort_HeavyAssemblyRegistersSixTools(t *testing.T) {
+// TestToolListerPort_HeavyAssemblyRegistersEightTools：重路径装配池**八件**——三件文件工具
+// 加 `shell` / `http_get` / `http_post`（US-5）与本 US 的 `save_memory` / `recall_memory`，
+// 且新件确实可解析（`Resolve` 命中），不再是"注册了名字、背后没有实体"的形态。
+//
+// 名集是**恰好八件**而不是"至少包含"：装配池少一件（记忆工具忘接）或多一件（误接线）
+// 都是装配故障，集合比较让两种都当场落红。
+// The pool is compared as an exact set: one tool short or one extra is an assembly
+// fault either way, and only the set comparison catches both.
+func TestToolListerPort_HeavyAssemblyRegistersEightTools(t *testing.T) {
 	fx := newWireFixture(t)
 	rt := fx.assemble(t)
 
@@ -311,12 +316,13 @@ func TestToolListerPort_HeavyAssemblyRegistersSixTools(t *testing.T) {
 		names = append(names, spec.Name)
 	}
 	require.Equal(t, []string{
-		"http_get", "http_post", "list_dir", "read_file", "shell", "write_file",
-	}, names, "装配池补到六件（三件文件工具 + 本 US 三件）")
+		"http_get", "http_post", "list_dir", "read_file", "recall_memory", "save_memory",
+		"shell", "write_file",
+	}, names, "装配池补到八件（三件文件工具 + shell / http_get / http_post + 两件记忆工具）")
 
-	for _, name := range []string{"shell", "http_get", "http_post"} {
+	for _, name := range []string{"shell", "http_get", "http_post", "save_memory", "recall_memory"} {
 		resolved, ok := rt.registry.Resolve(name)
-		require.True(t, ok, "新工具必须在注册池内可解析：%s", name)
+		require.True(t, ok, "工具必须在注册池内可解析：%s", name)
 		require.Equal(t, name, resolved.Name())
 		require.NotEmpty(t, resolved.Description(), "描述是给模型的能力说明")
 		require.NotEmpty(t, resolved.InputSchema(), "schema 是执行侧判必填的唯一依据")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +90,7 @@ func (h *loopHarness) assemble(maxConcurrent int) (*core.AgentService, *recordin
 		Runs:          store,
 		Snapshots:     store,
 		Audit:         h.audit,
+		Memory:        h.memory, // 随已批准接口适配（默认 nil = 段 2 恒空；判据不变）
 		Loop:          core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
 		Logger:        logger,
 		Now:           func() time.Time { return h.now },
@@ -453,4 +455,127 @@ func TestAgentService_SnapshotPersistedBeforeRunStart(t *testing.T) {
 		require.Zero(t, h.provider.callCount(), "零模型调用")
 		require.Zero(t, h.store.snapshotsOf(), "读失败不落半份快照")
 	})
+}
+
+// —— 段 2 记忆注入（US-6）——
+
+// failingMemoryReader 是 `Load` 恒失败的记忆端口替身——真文件造"读取失败"无法跨平台
+// 稳定复现（权限 / I/O 各平台形态不同），故用桩注入（与 memory 包的 `errorStore` 同理由）。
+// failingMemoryReader always fails; a real I/O failure cannot be reproduced portably.
+type failingMemoryReader struct {
+	err error
+}
+
+// LoadEffective 恒返回注入错误。
+// LoadEffective always returns the injected error.
+func (r failingMemoryReader) LoadEffective(context.Context, string) (string, error) {
+	return "", r.err
+}
+
+// R1 —— 段 2 注入 + 空记忆逐字节回归（core 层）。
+// 逆改点：把段 2 塞进 History / Tools 而不是 System → 第一组断言红。
+// 注：三组用的是**相对基线**（nil 端口组的现场读数），故"Build 给 System 加固定前后缀"会让
+// 基线与实验组同步平移、**本测试不红**——那条逆改由 TestAgentService_NilMemoryLeavesSegmentTwoEmpty
+// 的**绝对字面量**断言（sectionOneStatic）承载；两者经传递性合起来仍钉死"空记忆零痕迹"
+// （T015 逆改实测：该条逐字红 `expected: "段一：你是 demo。" actual: "[逆改固定前缀]段一：你是 demo。"`）。
+func TestAgentService_InjectsCoreMemorySegment(t *testing.T) {
+	const coreText = "## 核心记忆\n\n- 用户偏好简洁回答"
+
+	// 基线：不接记忆端口（nil）——US-4 的既有形状。
+	base := newLoopHarness(t)
+	base.provider.onCall(0, textResponse("好"))
+	_, err := base.service.Run(ctx, base.req("你好"))
+	require.NoError(t, err)
+	baseline := base.provider.request(0).Messages[0].Content
+
+	// 有记忆：段一 + 两换行 + 核心区文本（端口**只能在构造期**经 withMemory 置入）。
+	mem := newLoopHarness(t, withMemory(fakeMemoryReader{text: coreText}))
+	mem.provider.onCall(0, textResponse("好"))
+	_, err = mem.service.Run(ctx, mem.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, baseline+"\n\n"+coreText, mem.provider.request(0).Messages[0].Content)
+
+	// 空记忆：与基线**逐字节**相同（段 2 不产生任何文本）。
+	empty := newLoopHarness(t, withMemory(fakeMemoryReader{text: ""}))
+	empty.provider.onCall(0, textResponse("好"))
+	_, err = empty.service.Run(ctx, empty.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, baseline, empty.provider.request(0).Messages[0].Content,
+		"空记忆不得在系统提示词里留下任何痕迹")
+}
+
+// R2 —— 运行内冻结：整次运行只读一次记忆，第 2 轮不得看到"改后"文本（core 层）。
+// 逆改点：把读取挪进每轮组装（Build 内重读）→ 第 2 轮入站 system 变成"- 新偏好"，断言红。
+func TestAgentService_MemoryReadOncePerRun(t *testing.T) {
+	reader := &scriptedMemoryReader{texts: []string{"- 旧偏好", "- 新偏好"}}
+	h := newLoopHarness(t, withMemory(reader)) // 端口在构造期置入
+	h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":"AGENT.md"}`))
+	h.provider.onCall(1, textResponse("好"))
+
+	_, err := h.service.Run(ctx, h.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, 1, reader.readCount(), "每次运行只读一次（运行内冻结）")
+	for i := 0; i < 2; i++ {
+		require.Contains(t, h.provider.request(i).Messages[0].Content, "- 旧偏好")
+		require.NotContains(t, h.provider.request(i).Messages[0].Content, "- 新偏好")
+	}
+}
+
+// TestAgentService_MemoryReadFailureFailsRunBeforeModelCall 守"读取失败 = 拒绝启动"：
+// 验收点（约束 23）——与段一读取失败同口径：`StatusFailed` + 零 LLM 调用 + 零工具执行，
+// 失败形状沿 US-4 既有 `StatusFailed`（错误文本如实带回 Reason，不另立一套形状）。
+func TestAgentService_MemoryReadFailureFailsRunBeforeModelCall(t *testing.T) {
+	h := newLoopHarness(t, withMemory(failingMemoryReader{err: errors.New("injected: memory unreadable")}))
+
+	res, err := h.service.Run(ctx, h.req("在吗"))
+	require.NoError(t, err, "运行期失败归 Status，不是 Go error")
+	require.Equal(t, core.StatusFailed, res.Status)
+	require.Contains(t, res.Reason, "memory unreadable", "原因如实带回")
+	require.NotEmpty(t, res.RunID, "失败结果也带运行标识")
+	require.Zero(t, h.provider.callCount(), "拒绝启动 = 零模型调用")
+	require.Zero(t, h.tools.executed, "拒绝启动 = 零工具执行")
+}
+
+// TestAgentService_NilMemoryLeavesSegmentTwoEmpty 守"nil 端口容错"：
+// 验收点（约束 22）——`ServiceOptions.Memory == nil` 是**正常装配**（可空端口）：运行照常
+// 完成，系统提示词与无记忆时逐字节相同（既有的 US-4 行为基线由此再钉一次）。
+func TestAgentService_NilMemoryLeavesSegmentTwoEmpty(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("好"))
+
+	res, err := h.service.Run(ctx, h.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+	require.Equal(t, sectionOneStatic, h.provider.request(0).Messages[0].Content,
+		"nil 端口 = 段 2 不产生任何文本（与 US-4 逐字节相同）")
+}
+
+// R4b —— 注入后超上下文预算 → 拒绝启动、Reason 点名预算键、零 LLM（core 层）。
+// 预算与记忆两端**都取小值**（P1-2 修正）：旧值 `Repeat("- 偏好\n", 3000)` 只有 27 KB、
+// 估不出 32768 的缺省预算——用例恒绿、实现再错也不红，等于没判。现在把预算压到 8192
+// （可裁面 = 8192 - core.ReserveTokens 1024 = 7168），并加**对照组**：同一预算、不接记忆必须放行
+// ——"闸门是不是真的接在记忆上"由此钉死，而不是靠一个可能本来就超限的预算蒙对。
+// 逆改点：把超限改成"截断后继续跑" → 实验组 Status 非 failed 且 provider 被调用，两条断言皆红；
+// 把记忆漏接进 Build（`env.memory` 没喂给段 2）→ 实验组反而跑通，同样红。
+func TestAgentService_OversizedMemoryFailsRunBeforeModelCall(t *testing.T) {
+	const contextTokens = 8192
+
+	// 对照组：同一预算、不接记忆端口（nil）→ 正常跑完（本预算本身不构成超限）。
+	control := newLoopHarness(t)
+	control.budget.ContextTokens = contextTokens
+	control.provider.onCall(0, textResponse("好"))
+	res, err := control.service.Run(ctx, control.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status, "对照组：同预算、无记忆必须放行")
+	require.Equal(t, 1, control.provider.callCount())
+
+	// 实验组：同一预算 + 90000 字节记忆（estimateText 下 ≥ 22000 tokens，见 prompt.go）→
+	// 拒绝启动、Reason 点名预算键、零模型调用。
+	over := newLoopHarness(t, withMemory(fakeMemoryReader{text: strings.Repeat("- 偏好\n", 10000)}))
+	over.budget.ContextTokens = contextTokens
+	res, err = over.service.Run(ctx, over.req("你好"))
+	require.NoError(t, err, "运行期失败归 Status，不是 Go error")
+	require.Equal(t, core.StatusFailed, res.Status)
+	require.Contains(t, res.Reason, "budget.context_tokens", "原因必须点名上下文预算键")
+	require.Zero(t, over.provider.callCount(), "拒绝启动 = 零模型调用")
 }
