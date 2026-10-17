@@ -2,6 +2,8 @@ package cli
 
 // 本文件是 US-3 命令面的关键回归用例（颗粒度文档 §3.2 的 cli/profile_test.go 八例；
 // A7 = list / show 走轻路径，A8 = create 的输出明示"选中了谁"、A9 = delete 的归档接线）。
+// US-7 追加两条：轻路径第三态 `unverified` 的逐字行文与零计数汇总的逐字节不变
+// （颗粒度文档 us7-mcp.md §3.2：待决 #2 的展示面）。
 // 包内测试（`package cli`）：展示层与 run 级入口要能被**直接注入**判卷——假 Agents
 // 端口顶替实现（cli **不得** import workspace：适配器在 app），真根命令覆盖注册、
 // 参数校验与出口码面。
@@ -375,4 +377,52 @@ func TestProfileDelete_CommandUsesWriteModePort(t *testing.T) {
 	require.Error(t, bad.err, "缺目录必须失败")
 	require.Contains(t, bad.err.Error(), "ghost-agent")
 	require.NotContains(t, bad.stdout, "  归档：", "失败路径不得打印归档条目")
+}
+
+// 中文验收点（US-7 待决 #2 的展示面）：第三态行**逐字**渲染——行首两个空格、正文为
+// `registered=unverified——MCP 工具与连接需重路径确认`；不得落入未注册行的
+// `registered=false——`（空原因会渲染成一条尾巴空荡的行，把"待确认"误报成"拒载"）。
+// Acceptance point: the unverified line is rendered verbatim and never degrades into the
+// rejected line with an empty reason.
+func TestRenderProfileList_UnverifiedLine(t *testing.T) {
+	var out bytes.Buffer
+	renderProfileList(&out, []core.AgentEntry{
+		{Name: "mcp-agent", Unverified: true},
+	})
+
+	want := "  mcp-agent：registered=unverified——MCP 工具与连接需重路径确认\n" +
+		"汇总：1 个 Agent 目录（已注册 0） / 未验证 1\n"
+	require.Equal(t, want, out.String())
+}
+
+// 中文验收点（US-7 判据面边界）：未验证数为 0 时汇总行与 US-3 **逐字节相同**——新增后缀
+// 只在 > 0 时出现，斜杠前一个空格；未验证条目不计入"已注册"（`registeredCount` 语义不变）。
+// Acceptance point: with zero unverified entries the summary stays byte-identical to
+// US-3's wording; the suffix appears only when the count is positive.
+func TestRenderProfileList_ZeroUnverifiedKeepsSummaryBytes(t *testing.T) {
+	zero := []core.AgentEntry{
+		{
+			Name:       "ok-agent",
+			Registered: true,
+			Profile:    &core.Profile{Provider: core.ProviderRef{Name: "alpha", Model: "m-alpha"}},
+		},
+		{Name: "bad-agent", Registered: false, RejectReason: "tool not registered: ghost"},
+	}
+
+	var out bytes.Buffer
+	renderProfileList(&out, zero)
+	want := "  ok-agent：registered=true（provider alpha / 模型 m-alpha）\n" +
+		"  bad-agent：registered=false——tool not registered: ghost\n" +
+		"汇总：2 个 Agent 目录（已注册 1）\n"
+	require.Equal(t, want, out.String(), "零未验证时汇总行必须与 US-3 逐字节相同")
+
+	// > 0：追加后缀（斜杠前一个空格）；已注册仍只数 Registered（unverified 不算）。
+	mixed := append(append([]core.AgentEntry{}, zero...), core.AgentEntry{Name: "mcp-agent", Unverified: true})
+	var withUnverified bytes.Buffer
+	renderProfileList(&withUnverified, mixed)
+	wantMixed := "  ok-agent：registered=true（provider alpha / 模型 m-alpha）\n" +
+		"  bad-agent：registered=false——tool not registered: ghost\n" +
+		"  mcp-agent：registered=unverified——MCP 工具与连接需重路径确认\n" +
+		"汇总：3 个 Agent 目录（已注册 1） / 未验证 1\n"
+	require.Equal(t, wantMixed, withUnverified.String())
 }

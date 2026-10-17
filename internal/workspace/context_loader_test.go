@@ -133,7 +133,7 @@ func TestContextLoader_OnlyDeclaredSkillsReachSectionOne(t *testing.T) {
 func TestContextLoader_RefusesUnregisteredAgent(t *testing.T) {
 	// 5 段 cron → 整只不注册，但 frontmatter 已解析成功（Profile 非 nil）。
 	root := writeWorkspaceWithSchedule(t, "0 8 * * *", "")
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.False(t, entries[0].Registered)

@@ -98,7 +98,7 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 另两条时区口径与需求文档 §12 一致：
 
 - `schedules[].zone` 缺省 **UTC**（不回落服务器本地时区；`ZoneId.systemDefault()` 一类的"取系统时区"在本项目是禁用写法）
-- 容器建议显式设 `TZ`——它是 `shell` 子进程默认透传的四个变量之一（`PATH` / `HOME` / `LANG` / `TZ`）；不设则 `shell` 工具里 `date` 的输出随宿主机漂移
+- 容器建议显式设 `TZ`——`PATH` / `HOME` / `LANG` / `TZ` 是示例配置 `basalt.yaml.example` 在 `shell.env_passthrough` 里登记的透传变量；若部署配置省略该键或配为空列表，子进程**不透传**父进程环境变量（`TZ` 也不例外），`shell` 工具里 `date` 的输出随宿主机漂移
 
 复核（可复制）：`POST /api/v1/schedules/{id}/run` 手动补跑一次带 `zone: Asia/Shanghai` 的任务，看 `next_run` 是否为北京时间。
 

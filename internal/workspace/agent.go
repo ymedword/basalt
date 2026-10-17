@@ -36,7 +36,8 @@ const (
 	agentsDirName       = "agents"
 	agentDefinitionFile = "AGENT.md"
 
-	// mcpServersFile 是规则 6 的判据来源：顶层键名集即「已配置的 server 名」。
+	// mcpServersFile 是规则 6 的判据来源：`servers:` 列表里的 name 即「已配置的 server 名」
+	// （解析与校验在 mcp.go——同一文件只留一份解析器）。
 	mcpServersFile = "mcp_servers.yaml"
 
 	// defaultZone 是 schedule 缺省时区（契约 §3「zone 缺省 UTC」）——不得回落进程本地时区。
@@ -83,6 +84,18 @@ type AgentLoaderOptions struct {
 	// `tools:` 的 Agent 照常注册，声明了 `tools:` 的 Agent 整只不注册。
 	Tools []string
 
+	// MCPServers 是 mcp_servers.yaml 的**已配置** server 名（重路径注入，文件序）。
+	// nil = 未注入（轻路径 / 直接调用方）：LoadAll 自读一次配置取名字集——重路径已解析过
+	// 一遍，不得让同一文件读两遍（陷阱 39）。
+	// MCPServers is the configured server name set; nil means "read it here".
+	MCPServers []string
+
+	// MCPConnected 是**已连接**的 server 名（仅重路径注入）。nil = 连接结果未知——
+	// 轻路径据此对可能依赖 MCP 的 Agent 走第三态 `unverified`，不误报为拒载；非 nil 时
+	// 规则 6 要求"已配置且已连接"两条都过。
+	// MCPConnected is the connected set; nil means the connection verdict is unknown.
+	MCPConnected []string
+
 	// Logger 是点名 WARN 的出口；nil 时用 slog.Default。
 	Logger *slog.Logger
 }
@@ -90,9 +103,11 @@ type AgentLoaderOptions struct {
 // AgentLoader 扫描 .basalt/agents/ 的每个子目录：解析 → 校验 → 派生 Profile / 拒绝。
 // AgentLoader turns every agent directory into one AgentEntry, registered or not.
 type AgentLoader struct {
-	providers []string
-	tools     []string
-	logger    *slog.Logger
+	providers    []string
+	tools        []string
+	mcpServers   []string
+	mcpConnected []string
+	logger       *slog.Logger
 }
 
 // NewAgentLoader 构造装载器；provider 与工具名集切片在构造时各拷贝一份，调用方
@@ -104,9 +119,11 @@ func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 		logger = slog.Default()
 	}
 	return &AgentLoader{
-		providers: slices.Clone(opts.Providers),
-		tools:     slices.Clone(opts.Tools),
-		logger:    logger,
+		providers:    slices.Clone(opts.Providers),
+		tools:        slices.Clone(opts.Tools),
+		mcpServers:   slices.Clone(opts.MCPServers),
+		mcpConnected: slices.Clone(opts.MCPConnected),
+		logger:       logger,
 	}
 }
 
@@ -163,9 +180,15 @@ func (l *AgentLoader) LoadAll(root string) (entries []core.AgentEntry, err error
 	// 按名字节序显式排序（不得依赖库的隐式序）。
 	slices.SortFunc(dirs, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 
-	mcpNames, err := readMCPServerNames(base)
-	if err != nil {
-		return nil, err
+	// 已配置 server 名集：重路径由装配层解析后注入（同一文件只读一遍）；轻路径 / 直接调用方
+	// 未注入（nil）时在这里自读一次——两种形态共用同一份解析器，判定口径不会分家。
+	mcpNames := l.mcpServers
+	if mcpNames == nil {
+		specs, parseErr := parseMCPServers(base)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		mcpNames = mcpServerNames(specs)
 	}
 
 	claim := make(map[string]string) // 调度 id → 占用者；只由完整校验通过的 Agent 提交
@@ -174,18 +197,21 @@ func (l *AgentLoader) LoadAll(root string) (entries []core.AgentEntry, err error
 		if !d.IsDir() {
 			continue // 非目录 / 软连接条目如实忽略（附属物不得成为第二入口）
 		}
-		entry, rej := l.loadOne(base, lib, d.Name(), mcpNames, claim)
-		if rej.reason == "" {
+		entry, rej := l.loadOne(base, lib, d.Name(), mcpNames, l.mcpConnected, claim)
+		switch {
+		case rej.reason != "":
+			entry.RejectReason = rej.mergedReason()
+			// 固定键：agent / reason / detail（reason 取契约字面量原样）。
+			l.logger.Warn("Agent 未注册", "agent", entry.Name,
+				"reason", rej.reason, "detail", rej.detail)
+		case entry.Unverified:
+			// 第三态只展示：不提交调度 id 占用、不置 Registered（运行面只收 Registered）。
+		default:
 			// **整只提交**：本行是调度 id 占用的唯一提交点（§2.4 注 6 的 R1 裁决）。
 			for id, owner := range rej.claimed {
 				claim[id] = owner
 			}
 			entry.Registered = true
-		} else {
-			entry.RejectReason = rej.mergedReason()
-			// 固定键：agent / reason / detail（reason 取契约字面量原样）。
-			l.logger.Warn("Agent 未注册", "agent", entry.Name,
-				"reason", rej.reason, "detail", rej.detail)
 		}
 		entries = append(entries, entry)
 	}
@@ -220,7 +246,7 @@ func (r reject) mergedReason() string {
 // base 是工作区根（定义文件 / bootstrap 文件的读取面），lib 是技能库根（技能实体的
 // 查找面）——两个根分开传，技能查找**不得**拿到工作区根。
 // loadOne loads a single agent directory and reports its first failure, if any.
-func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames []string, claim map[string]string) (core.AgentEntry, reject) {
+func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConnected []string, claim map[string]string) (core.AgentEntry, reject) {
 	entry := core.AgentEntry{Name: name}
 
 	defPath := agentDefinitionPath(name)
@@ -267,16 +293,34 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames []string
 	// 缺一即整只不注册并点名（§2.4 注 4）。报的是**声明序**里的第一个缺名——遍历
 	// 按声明序而非池序，判卷才与"池的遍历顺序随机"无关。空池（未注入名字集）下
 	// 未声明 `tools:` 的 Agent 照常注册：空声明列表本来就无名字可判。
+	// US-7 第三态（待决 #2）：轻路径（`mcpConnected == nil`）且存在已配置 server 时，
+	// 池外工具名可能来自尚未连接的 MCP server——不立即拒，标记待确认继续判定；
+	// 重路径（连接结果已知）与零配置仍按原规则拒载。
+	deferred := false
 	for _, toolName := range profile.Tools {
-		if !slices.Contains(l.tools, toolName) {
-			return entry, reject{reason: "tool not registered: " + toolName}
+		if slices.Contains(l.tools, toolName) {
+			continue
 		}
+		if mcpConnected == nil && len(mcpNames) > 0 {
+			deferred = true
+			continue
+		}
+		return entry, reject{reason: "tool not registered: " + toolName}
 	}
 	if missing := missingSkill(lib, profile.Skills); missing != "" { // 规则 5
 		return entry, reject{reason: "skill not found: " + missing}
 	}
-	for _, m := range profile.MCPServers { // 规则 6（存在性半条；「连接成功」半条随 US-7）
+	// 规则 6（US-7 全条）：先判**已配置**、再判**已连接**——存在但未连接的 server
+	// 与不存在的 server 同判（R4）；轻路径连接结果未知时只标记待确认。
+	for _, m := range profile.MCPServers {
 		if !slices.Contains(mcpNames, m) {
+			return entry, reject{reason: "mcp server skipped", detail: m}
+		}
+		if mcpConnected == nil && len(mcpNames) > 0 {
+			deferred = true
+			continue
+		}
+		if !slices.Contains(mcpConnected, m) {
 			return entry, reject{reason: "mcp server skipped", detail: m}
 		}
 	}
@@ -288,6 +332,11 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames []string
 	claimed, err := validateSchedules(profile.Name, profile.Schedules, claim) // 规则 8
 	if err != nil {
 		return entry, reject{reason: "invalid schedule", detail: err.Error()}
+	}
+	if deferred {
+		// 第三态（待决 #2）：只标记，不放行、不参与运行；确定性规则已在上面先行拒载。
+		entry.Unverified = true
+		l.logger.Info("Agent 注册待确认", "agent", name)
 	}
 	return entry, reject{claimed: claimed}
 }
@@ -363,47 +412,6 @@ func fileKind(info fs.FileInfo) string {
 	default:
 		return "特殊文件"
 	}
-}
-
-// readMCPServerNames 读 mcp_servers.yaml 的顶层键名集（文件缺失或空文档 → 空集）。
-// readMCPServerNames lists the top-level keys of mcp_servers.yaml; a missing file
-// yields an empty set.
-//
-// 文件存在但不可解析 / 顶层不是映射是**工作区结构问题**（不是单只 Agent 的问题）：
-// 与「agents/ 缺失」同类，如实上抛——若静默按空集处理，每只声明了 mcp_servers 的
-// Agent 都会以 "mcp server skipped" 拒载，报出的原因与真相不符。
-// An unreadable mcp_servers.yaml is a workspace-structure problem and is reported
-// as such instead of masquerading as a missing server.
-func readMCPServerNames(base *os.Root) ([]string, error) {
-	raw, err := base.ReadFile(mcpServersFile)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("读取 %s: %w", mcpServersFile, err)
-	}
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nil, nil
-	}
-
-	var tree any
-	if err := yaml.Unmarshal(raw, &tree); err != nil {
-		return nil, fmt.Errorf("解析 %s: %s", mcpServersFile, frontmatterErrorSummary(err))
-	}
-	mapping, ok := tree.(map[string]any)
-	if !ok {
-		if tree == nil {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("%s 的顶层必须是映射（server 名 → 启动配置），实际是 %T", mcpServersFile, tree)
-	}
-
-	names := make([]string, 0, len(mapping))
-	for name := range mapping {
-		names = append(names, name)
-	}
-	slices.Sort(names) // 排序后返回：调用方之外的读数也稳定可比
-	return names, nil
 }
 
 // parseFrontmatter 从 AGENT.md 的字节解析 frontmatter：围栏切分 → 未知键扫描 →

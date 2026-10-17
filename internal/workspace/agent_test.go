@@ -144,14 +144,16 @@ func writeFileInRoot(t *testing.T, root, rel, content string) {
 	require.NoError(t, os.WriteFile(p, []byte(content), 0o644))
 }
 
-// writeMCPServers 在 root/mcp_servers.yaml 落一份顶层键名集（值为最小启动配置；
-// 本 US 只读顶层键名）。
-// writeMCPServers writes a top-level key set into mcp_servers.yaml.
+// writeMCPServers 在 root/mcp_servers.yaml 落一份 **servers: 列表**形态的最小配置
+// （US-7 起解析器只认这一形态；名字集 = 列表里的 name，顺序即文件序）。
+// writeMCPServers writes a servers-list shaped configuration; the name set is the
+// list's names in file order.
 func writeMCPServers(t *testing.T, root string, names []string) {
 	t.Helper()
 	var b strings.Builder
+	b.WriteString("servers:\n")
 	for _, name := range names {
-		fmt.Fprintf(&b, "%s:\n  command: echo\n", name)
+		fmt.Fprintf(&b, "  - name: %s\n    command: echo\n", name)
 	}
 	writeFileInRoot(t, root, "mcp_servers.yaml", b.String())
 }
@@ -201,24 +203,29 @@ func logText(t *testing.T) string {
 
 // newTestLoader 造一只 provider 名集显式注入、WARN 进测试缓冲的装载器
 // （§2.4 注 2：名集由调用方注入，装载器不自己读配置；工具池缺省 = 空池）。
+// MCP 两个名字集随 US-7 的装载器接口扩入：`mcpServers == nil` = 未注入（装载器自读
+// 配置，轻路径形态）、`mcpConnected == nil` = 连接结果未知（第三态 unverified）。
 // newTestLoader builds a loader with the provider set injected explicitly and an
-// empty tool pool.
-func newTestLoader(t *testing.T, providers ...string) *workspace.AgentLoader {
+// empty tool pool; nil MCP name sets mean "read config here" and "connection unknown".
+func newTestLoader(t *testing.T, mcpServers, mcpConnected []string, providers ...string) *workspace.AgentLoader {
 	t.Helper()
-	return newTestLoaderWithTools(t, nil, providers...)
+	return newTestLoaderWithTools(t, nil, mcpServers, mcpConnected, providers...)
 }
 
 // newTestLoaderWithTools 在 newTestLoader 之上注入注册池名字集（§2.4 注 4：
 // 名字集由装配期从工具注册表导出后给，workspace 不反向依赖 tool 包）——只影响
 // "声明了 tools: 的 Agent 能否注册"，未声明 tools: 的 Agent 不受影响。
-// newTestLoaderWithTools injects the registered-tool name set on top of
-// newTestLoader; it only affects agents that declare tools.
-func newTestLoaderWithTools(t *testing.T, tools []string, providers ...string) *workspace.AgentLoader {
+// 重路径的两条 MCP 名字集（已配置 / 已连接）由调用方显式给出；nil 的语义见上。
+// newTestLoaderWithTools injects the registered-tool and MCP name sets on top of
+// newTestLoader; it only affects agents that declare those names.
+func newTestLoaderWithTools(t *testing.T, tools, mcpServers, mcpConnected []string, providers ...string) *workspace.AgentLoader {
 	t.Helper()
 	return workspace.NewAgentLoader(workspace.AgentLoaderOptions{
-		Providers: providers,
-		Tools:     tools,
-		Logger:    bufferedLogger(t),
+		Providers:    providers,
+		Tools:        tools,
+		MCPServers:   mcpServers,
+		MCPConnected: mcpConnected,
+		Logger:       bufferedLogger(t),
 	})
 }
 
@@ -229,7 +236,7 @@ func newTestLoaderWithTools(t *testing.T, tools []string, providers ...string) *
 // the compat sample declares ten tools, so the loader injects that name set.
 func loadOnlyAgent(t *testing.T, root string) core.AgentEntry {
 	t.Helper()
-	entries, err := newTestLoaderWithTools(t, compatSampleToolNames(), "deepseek").LoadAll(root)
+	entries, err := newTestLoaderWithTools(t, compatSampleToolNames(), nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered, "夹具应当注册：%s", entries[0].RejectReason)
@@ -334,7 +341,7 @@ name: pool-less
 provider: {name: deepseek, model: deepseek-chat}
 `, "正文占位")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root) // 工具池缺省 = 空池
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered,
@@ -354,7 +361,7 @@ provider: {name: deepseek, model: deepseek-chat}
 tools: [read_file]
 `, "正文占位")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root) // 工具池缺省 = 空池
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.False(t, entries[0].Registered, "空池下声明的名字一律视作未注册")
@@ -378,7 +385,7 @@ func TestAgentLoader_MemoryToolsInPoolRegisterAgent(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("池含两件", func(t *testing.T) {
-		entries, err := newTestLoaderWithTools(t, memoryTools, "deepseek").LoadAll(root)
+		entries, err := newTestLoaderWithTools(t, memoryTools, nil, nil, "deepseek").LoadAll(root)
 		require.NoError(t, err)
 		require.Len(t, entries, 1)
 		require.True(t, entries[0].Registered, "池含两件 → 应当注册：%s", entries[0].RejectReason)
@@ -387,7 +394,7 @@ func TestAgentLoader_MemoryToolsInPoolRegisterAgent(t *testing.T) {
 	})
 
 	t.Run("空池", func(t *testing.T) {
-		entries, err := newTestLoader(t, "deepseek").LoadAll(root) // 工具池缺省 = 空池
+		entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root) // 工具池缺省 = 空池
 		require.NoError(t, err)
 		require.Len(t, entries, 1)
 		require.False(t, entries[0].Registered, "空池下声明的记忆工具名一律视作未注册")
@@ -406,7 +413,7 @@ name: beta
 provider: {name: deepseek, model: deepseek-chat}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
@@ -431,7 +438,7 @@ name: ghostly
 provider: {name: ghost, model: deepseek-chat}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "provider not registered: ghost")
@@ -447,7 +454,7 @@ name: blanky
 provider: {name: deepseek, model: "   "}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "blank model")
@@ -463,7 +470,7 @@ name: placeholder
 provider: {name: deepseek, model: 请在此填写模型名}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "占位文本不得被当作空白拒载：%s", entries[0].RejectReason)
 	require.Equal(t, "请在此填写模型名", entries[0].Profile.Provider.Model)
@@ -479,7 +486,7 @@ provider: {name: deepseek, model: deepseek-chat}
 skills: [ghost-skill]
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "skill not found: ghost-skill")
@@ -513,7 +520,7 @@ func TestAgentLoader_RejectsSkillNameOutsideLibrary(t *testing.T) {
 				"\nname: esc-agent\nprovider: {name: deepseek, model: deepseek-chat}\nskills:\n  - "+tc.skill+"\n",
 				"正文")
 
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 			require.Len(t, entries, 1)
 			require.False(t, entries[0].Registered, "越界技能名必须整只不注册")
@@ -523,7 +530,7 @@ func TestAgentLoader_RejectsSkillNameOutsideLibrary(t *testing.T) {
 }
 
 // 中文验收点：mcp_servers 只判存在性半条（规则 6）——名字不在 mcp_servers.yaml
-// 顶层键内即拒载；「连接成功」半条归 US-7（§2.4 注 7）。
+// 的 servers 列表内即拒载；「连接成功」半条随 US-7 的装配/装载器接线补齐。
 // Acceptance point: an MCP server missing from the registry rejects the agent.
 func TestAgentLoader_RejectsUnconfiguredMCPServer(t *testing.T) {
 	root := t.TempDir()
@@ -534,7 +541,7 @@ mcp_servers: [ghost-mcp]
 `, "正文")
 	writeMCPServers(t, root, []string{"search"}) // 配置里只有 search
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "mcp server skipped")
@@ -551,7 +558,7 @@ provider: {name: deepseek, model: deepseek-chat}
 bootstrap: [MISSING.md]
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "bootstrap file missing")
@@ -572,7 +579,7 @@ provider: {name: deepseek, model: deepseek-chat}
 bootstrap: [BOOT_DIR]
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.False(t, entries[0].Registered, "bootstrap 指向目录必须整只不注册")
@@ -594,7 +601,7 @@ provider: {name: deepseek, model: deepseek-chat}
 	writeFileInRoot(t, root, filepath.Join("agents", "legacy", "skills", "relic", "SKILL.md"),
 		"旧形态残留——不得被识别为绑定")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	entry := entries[0]
 	require.True(t, entry.Registered, "本地 skills/ 不得影响注册判定：%s", entry.RejectReason)
@@ -620,7 +627,7 @@ name: bbb
 provider: {name: deepseek, model: deepseek-chat}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 2, "失败不静默消失——每只目录恰一条结果")
 
@@ -665,7 +672,9 @@ schedules: []
 
 	// 规则 4 门禁：夹具声明了 tools: [read_file] → 注册池里必须真有这个名字
 	// （§2.4 注 4；映射断言本身逐字不变）。
-	entries, err := newTestLoaderWithTools(t, []string{"read_file"}, "deepseek").LoadAll(root)
+	// 规则 6 全条（US-7）：`search` 已配置**且已连接**才放行——两名单显式注入，
+	// 旧断言"文件里存在"由此升级为"已配置且已连接"的判据面。
+	entries, err := newTestLoaderWithTools(t, []string{"read_file"}, []string{"search"}, []string{"search"}, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered, "样例应注册：%s", entries[0].RejectReason)
@@ -695,7 +704,7 @@ description: 极简声明面
 provider: {name: deepseek, model: deepseek-chat}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "极简声明面必须能注册：%s", entries[0].RejectReason)
 
@@ -721,7 +730,7 @@ provider: {name: deepseek, model: deepseek-chat}
 channels: []
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
 	require.Empty(t, entries[0].Profile.Channels, "显式 [] 保持为空，不回落 [{name: cli}]")
@@ -740,7 +749,7 @@ future_section:
   nested_option: 1
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "未知键不得拒载：%s", entries[0].RejectReason)
 	require.NotNil(t, entries[0].Profile)
@@ -760,7 +769,7 @@ identity:
   legacy_field: s3cr3t-nested
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
 
@@ -794,7 +803,7 @@ provider:
   temperature: `+tc.temperature+`
 `, "正文")
 
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 			require.False(t, entries[0].Registered, "越界温度必须拒载")
 			require.Contains(t, entries[0].RejectReason, "invalid provider.temperature")
@@ -825,7 +834,7 @@ provider:
   temperature: `+tc.temperature+`
 `, "正文")
 
-			entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 			require.NoError(t, err)
 			require.False(t, entries[0].Registered, "非有限温度必须拒载")
 			require.Contains(t, entries[0].RejectReason, "invalid provider.temperature")
@@ -843,7 +852,7 @@ name: broken
 provider: {name: deepseek, model: *SENTINEL-ALIAS}
 `, "正文")
 
-	entries, err := newTestLoader(t, "deepseek").LoadAll(root)
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
 	require.NoError(t, err)
 	entry := entries[0]
 	require.False(t, entry.Registered, "解析失败必须整只不注册")
@@ -854,4 +863,127 @@ provider: {name: deepseek, model: *SENTINEL-ALIAS}
 	logs := logText(t)
 	require.Contains(t, logs, "invalid frontmatter")
 	require.NotContains(t, logs, "SENTINEL-ALIAS", "日志同样不得回显源码片段")
+}
+
+// TestAgentLoader_DeclaredServerConnectedRegistersAgent：规则 6 全条——已配置且已连接 → 注册，
+// 第三态不触发（对照组；判别力在 R4 的拒载方向）。
+// Acceptance point: a configured and connected server registers the agent and leaves
+// Unverified false.
+func TestAgentLoader_DeclaredServerConnectedRegistersAgent(t *testing.T) {
+	root := t.TempDir()
+	writeMCPServers(t, root, []string{"search"})
+	writeAgentFrontmatter(t, root, "scout", `
+name: scout
+provider: {name: probe, model: probe-model}
+mcp_servers: [search]
+`, "")
+
+	entries, err := newTestLoader(t, []string{"search"}, []string{"search"}, "probe").LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "已配置且已连接必须注册：%s", entries[0].RejectReason)
+	require.False(t, entries[0].Unverified)
+	require.Empty(t, entries[0].RejectReason)
+}
+
+// R4 —— 规则 6 的「连接成功」半条：存在但未连接的 server 与不存在的 server 同判。
+// 逆改点：只查 mcpNames 不查 mcpConnected → 第一组由拒转收，红；
+//
+//	守卫"接线忘了传连接结果"：传 nil 会走 unverified 分支，第二组红。
+//
+// R4: a configured but unconnected server is rejected exactly like a missing one.
+func TestAgentLoader_ConfiguredButNotConnectedRejects(t *testing.T) {
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", `
+servers:
+  - name: search
+    command: search-mcp
+`)
+	writeAgentFrontmatter(t, root, "scout", `
+name: scout
+provider: {name: probe, model: probe-model}
+mcp_servers: [search]
+`, "")
+
+	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers:    []string{"probe"},
+		MCPServers:   []string{"search"},
+		MCPConnected: []string{}, // 已配置、未连上
+	}).LoadAll(root)
+	require.NoError(t, err)
+	require.False(t, entries[0].Registered)
+	require.False(t, entries[0].Unverified)
+	require.Contains(t, entries[0].RejectReason, "mcp server skipped")
+	require.Contains(t, entries[0].RejectReason, "search", "detail 点名 server")
+}
+
+// TestAgentLoader_LightPathMarksMCPAgentsUnverified（待决 #2）：轻路径不连接 MCP——
+// MCPConnected == nil 且配置非空时，可能依赖 MCP 的 Agent 走第三态；确定性规则仍先拒。
+// 逆改点：第三态未实现 → Unverified 恒 false；把待确认当放行 → Registered 红。
+// Acceptance point: the light path reports unverified without rejecting, while
+// deterministic rules still reject first.
+func TestAgentLoader_LightPathMarksMCPAgentsUnverified(t *testing.T) {
+	root := t.TempDir()
+	writeMCPServers(t, root, []string{"search"})
+	writeAgentFrontmatter(t, root, "mcp-only", `
+name: mcp-only
+provider: {name: probe, model: probe-model}
+mcp_servers: [search]
+`, "")
+	writeAgentFrontmatter(t, root, "bad-provider", `
+name: bad-provider
+provider: {name: ghost, model: probe-model}
+mcp_servers: [search]
+`, "")
+
+	entries, err := newTestLoader(t, nil, nil, "probe").LoadAll(root) // 两名单皆 nil = 轻路径
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	byName := make(map[string]core.AgentEntry, len(entries))
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+	require.False(t, byName["mcp-only"].Registered)
+	require.True(t, byName["mcp-only"].Unverified, "轻路径必须给第三态")
+	require.Empty(t, byName["mcp-only"].RejectReason, "待确认不是拒载")
+	require.Contains(t, logText(t), "Agent 注册待确认")
+
+	require.False(t, byName["bad-provider"].Registered, "确定性规则仍先拒")
+	require.False(t, byName["bad-provider"].Unverified)
+	require.Contains(t, byName["bad-provider"].RejectReason, "provider not registered: ghost")
+}
+
+// TestAgentLoader_NoMCPConfigKeepsTwoStateBehavior：零 MCP 配置（无文件）时与 US-6 逐字节
+// 同判——普通 Agent 照常注册；声明了 server 的仍按规则 6 拒载；第三态不出现。
+// 逆改点：把「无配置」也当待确认 → 两处 Unverified 断言红；把 nil connected 一律放行
+// → 拒载断言红。
+// Acceptance point: without MCP configuration the two-state behavior is unchanged.
+func TestAgentLoader_NoMCPConfigKeepsTwoStateBehavior(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "plain", `
+name: plain
+provider: {name: probe, model: probe-model}
+`, "")
+	writeAgentFrontmatter(t, root, "declarer", `
+name: declarer
+provider: {name: probe, model: probe-model}
+mcp_servers: [search]
+`, "")
+
+	entries, err := newTestLoader(t, nil, nil, "probe").LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	byName := make(map[string]core.AgentEntry, len(entries))
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+	require.True(t, byName["plain"].Registered, "零配置下普通 Agent 照常注册：%s", byName["plain"].RejectReason)
+	require.False(t, byName["plain"].Unverified)
+
+	require.False(t, byName["declarer"].Registered)
+	require.False(t, byName["declarer"].Unverified, "零配置下不存在第三态")
+	require.Contains(t, byName["declarer"].RejectReason, "mcp server skipped")
+	require.Contains(t, byName["declarer"].RejectReason, "search")
 }

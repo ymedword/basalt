@@ -87,7 +87,8 @@ Agent 不写本文件；需要记住的事写进长期记忆 memory/MEMORY.md。
 `
 
 	templateMCPServersYAML = `# MCP server 注册表（默认空表）。
-# 键为 server 名，值为启动配置；AGENT.md 的 mcp_servers: 声明引用这里的名字。
+# 形态：顶层映射 + servers 列表；条目字段 name / transport / command / env。
+# AGENT.md 的 mcp_servers: 声明引用这里的 name。v1 只支持 stdio。
 {}
 `
 

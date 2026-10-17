@@ -92,6 +92,11 @@ type App struct {
 	// A non-nil override replaces the real clients behind every configured name while
 	// staying inside the routing and audit service, so evals exercise the very same chain.
 	providerOverride core.ProviderClient
+
+	// mcpConnect 是 MCP 连接池的**进程内替身**（沿 providerOverride 先例；生产路径恒 nil）。
+	// 非 nil 时装配面不再建真实连接池——app 层用例因此不起真实子进程，也不新增导出测试 API。
+	// A non-nil connector replaces the real pool; production leaves it nil.
+	mcpConnect mcpConnector
 }
 
 // wsRoot 返回工作区根的绝对路径。
@@ -251,15 +256,90 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			declaredToolNames, got), db, lock)
 	}
 
+	// MCP 接入在等值门禁**之后**（约束 9）：门禁比对的是八件内置声明名集，MCP 工具随后
+	// 注册、池随之变大；把注册挪到门禁之前，门禁会因池变大而拒绝启动。零 server（缺失 /
+	// 空 / {} / 无 servers）整段跳过——不建池、不连接、不发日志，零 MCP 配置时行为与 US-6
+	// 逐字节相同（约束 1）。解析失败是工作区结构问题，与「配置写错的实例配置」同档拒绝启动。
+	// MCP wiring happens after the equality gate: the gate compares the eight builtin names,
+	// and MCP tools join the pool afterwards. Zero servers skip the whole block.
+	mcpSpecs, err := workspace.ParseMCPServers(root)
+	if err != nil {
+		return nil, abortRuntime(fmt.Errorf("解析 MCP 配置: %w", err), db, lock)
+	}
+	var mcpConns []tool.MCPConnection
+	var mcpPool mcpConnector
+	if len(mcpSpecs) > 0 {
+		mcpPool = a.mcpConnect
+		if mcpPool == nil {
+			mcpPool = tool.NewMCPPool(tool.MCPPoolOptions{
+				Logger:         logger,
+				EnvPassthrough: cfg.Shell.EnvPassthrough,
+				Root:           root,
+			})
+		}
+	}
+
+	// fail（§3.5 改造点 ⑥）：连接池一经建立就可能持有真实子进程——自这一刻起的每一条
+	// 装配失败路径都**先收池、再走 abortRuntime**（库 → 锁），半开会话不得留在失败路径上。
+	// 零 server 时 mcpPool 为 nil，闭包退化为原 abortRuntime（零配置行为逐字节不变）。
+	// From the moment the pool exists, every failure path closes it before releasing the
+	// database and the lock; with zero servers the closure degenerates to abortRuntime.
+	fail := func(err error) (*heavyRuntime, error) {
+		if mcpPool != nil {
+			err = errors.Join(err, mcpPool.Close())
+		}
+		return nil, abortRuntime(err, db, lock)
+	}
+
+	if mcpPool != nil {
+		// 占位解析在连接**之前**（技术方案 §8.8）：解析不出来就不连接——fail-closed 发生在
+		// 任何子进程被拉起之前，错误里只有 server / 键 / 变量名，没有值。
+		mcpSpecs, err = resolveMCPEnv(mcpSpecs, os.LookupEnv)
+		if err != nil {
+			return fail(fmt.Errorf("解析 MCP server 环境变量: %w", err))
+		}
+		mcpConns, err = mcpPool.Connect(ctx, mcpSpecs)
+		if err != nil {
+			return fail(fmt.Errorf("连接 MCP server: %w", err))
+		}
+		// 注册序 = server 文件序 → 工具列表序（连接结果已按文件序返回）。重名 keep-first：
+		// 注册池保留先注册者（内置优先）并记 WARN `拒绝重复注册的工具`——重复不是装配失败
+		// （约束 8），其余 MCP 工具照常注册。
+		for _, conn := range mcpConns {
+			for _, t := range conn.Tools {
+				if regErr := registry.Register(t); regErr != nil {
+					continue
+				}
+			}
+		}
+		// 诊断旁路（Debug，缺省级别不输出）：连接序 → 注册序的工具名清单。
+		logger.Debug("MCP 工具进入注册池", "tools", mcpToolNames(mcpConns))
+	}
+
 	// ⑥ 注册池名字集喂装载器：workspace **不得**反向 import tool，名字在装配期一次导出
-	// （§2.4 注 4）。声明了池外工具名的 Agent 整只不注册（宪法 IV）。
+	// （§2.4 注 4）。声明了池外工具名的 Agent 整只不注册（宪法 IV）。MCP 两名单都是**显式
+	// 值**：已配置（文件序）与已连接（实际连上，文件序）——非 nil 的"已连接"集是重路径
+	// "知道连接结果"的判据，装载器据此对失败 server 的 Agent 直接拒载，而不是退化成轻
+	// 路径的第三态。轻路径两者皆 nil，由装载器自读配置并走第三态。
+	// Both MCP name sets are explicit on the heavy path; a non-nil connected set tells the
+	// loader the connection verdict is known, so failed servers are rejected outright.
+	configuredServers := make([]string, 0, len(mcpSpecs))
+	for _, spec := range mcpSpecs {
+		configuredServers = append(configuredServers, spec.Name)
+	}
+	connectedServers := make([]string, 0, len(mcpConns))
+	for _, conn := range mcpConns {
+		connectedServers = append(connectedServers, conn.Server)
+	}
 	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
-		Providers: providerNames(cfg),
-		Tools:     registry.Names(),
-		Logger:    logger,
+		Providers:    providerNames(cfg),
+		Tools:        registry.Names(),
+		MCPServers:   configuredServers,
+		MCPConnected: connectedServers,
+		Logger:       logger,
 	}).LoadAll(root)
 	if err != nil {
-		return nil, abortRuntime(fmt.Errorf("装载 Agent 目录: %w", err), db, lock)
+		return fail(fmt.Errorf("装载 Agent 目录: %w", err))
 	}
 	agents := newAgentSource(root, entries, logger)
 
@@ -270,7 +350,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	llmCalls := storage.NewLLMCallRepo(db)
 	client, err := a.modelClient(cfg, llmCalls, logger)
 	if err != nil {
-		return nil, abortRuntime(err, db, lock)
+		return fail(err)
 	}
 	loop := core.NewReActLoop(
 		core.NewPromptBuilder(registry),
@@ -290,7 +370,8 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Now:       a.nowOr(),
 	})
 
-	logger.Info("重路径装配完成", "agents", len(agents.entries), "tools", registry.Names())
+	logger.Info("重路径装配完成", "agents", len(agents.entries), "tools", registry.Names(),
+		"mcp_connected", len(mcpConns))
 	return &heavyRuntime{
 		lock:        lock,
 		db:          db,
@@ -299,6 +380,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		invocations: invocations,
 		llmCalls:    llmCalls,
 		registry:    registry,
+		mcp:         mcpPool,
 	}, nil
 }
 
@@ -418,13 +500,23 @@ type heavyRuntime struct {
 	// 这一次装配之后——池是内存对象，命令面经 `cli.ToolLister` 取它的**数据**。
 	// The assembly-time tool registry, kept for the command surface's listing.
 	registry *tool.Registry
+
+	// mcp 是 MCP 连接池（零配置时为 nil）。停机时必须先于库关闭：池收起子进程与会话，
+	// 之后才是写池的最后一批使用者（约束 21：MCP → 库 → 锁）。
+	// The MCP pool (nil without configuration); it must close before the database.
+	mcp mcpConnector
 }
 
-// Close 按**相反次序**释放：先关库（写池的最后一批使用者就是运行入口），再放实例锁——
-// 锁必须等所有写入收尾之后才松开。两处失败并入一条错误链，释放失败不得静默。
-// Close releases in reverse order and never hides a failure.
+// Close 按**相反次序**释放：MCP 连接池 → 数据库 → 实例锁（约束 21）。池先收子进程与
+// 会话，之后才关写池的最后一批使用者（库），锁必须等所有写入收尾之后才松开。每处失败
+// 并入同一条错误链，释放失败不得静默。
+// Close releases in reverse order — MCP pool, database, instance lock — and never hides
+// a failure.
 func (r *heavyRuntime) Close() error {
 	var errs []error
+	if r.mcp != nil {
+		errs = append(errs, r.mcp.Close())
+	}
 	if r.db != nil {
 		errs = append(errs, r.db.Close())
 	}
