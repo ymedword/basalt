@@ -180,7 +180,7 @@ var validMemoryBackends = map[string]bool{"markdown": true, "sqlite": true}
 //
 // 校验一律 fail-closed：变量不存在、凭证解析为空、模板畸形、凭证明文、必填缺失、
 // 类型非法——六类任一命中即拒绝，绝不静默取默认值。错误文案点名配置键路径
-// （如 providers[0].api_key）与变量名，但**不得**回显凭证值（需求 §5.13）；
+// （如 providers[0].api_key）与变量名，但**不得**回显凭证值（需求文档 §5.2）；
 // 解析 / 解码失败同样只报行列与类别，库的源码摘录一律不外泄（见 yamlErrorSummary）。
 // Validation is fail-closed on six classes: missing variable, empty credential,
 // malformed placeholder, plaintext credential, missing required field and bad
@@ -238,7 +238,7 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 //
 // 为什么不用裸 os.ReadFile(path)：路径来自调用方参数，静态安全扫描对此判 G304
 // （CWE-22 文件包含），而抑制手段（gosec 的 nosec 标注）默认禁用。以父目录为 root 读取既消除
-// 该判定，又真把「跳到目录之外的软连接」挡在门外——fail-closed，与编程指南 §7
+// 该判定，又真把「跳到目录之外的软连接」挡在门外——fail-closed，与开发操作 §7
 // 陷阱 7 的真实路径口径同向。错误经 %w 保留 fs.ErrNotExist 链，LoadConfig 对
 // 调用方的判态契约（errors.Is(err, fs.ErrNotExist)）不变（已实测）。
 // A read through the parent directory is both gate-clean and fail-closed; the

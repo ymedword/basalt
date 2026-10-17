@@ -1,6 +1,6 @@
 package workspace
 
-// 本文件是系统提示词**段一**的拼装与**运行级配置快照**的冻结（技术方案 §4.2「段 1
+// 本文件是系统提示词**段一**的拼装与**运行级配置快照**的冻结（技术方案 §2.2.2「段 1
 // 组合式」/ §8.3 段一 / §11.5 运行快照）：identity.prompt（若配置）→ 自我称谓 →
 // AGENT.md 正文 → Bootstrap 文件（声明顺序）→ 技能卡片 L1 → 末尾当前时间。
 //
@@ -26,7 +26,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// ContextLoader 组装系统提示词段一、并冻结运行级配置快照（技术方案 §8.3 / §11.5）。
+// ContextLoader 组装系统提示词段一、并冻结运行级配置快照（技术方案 §3.3 / §3.6）。
 // ContextLoader assembles section one and freezes the run-level config snapshot; it
 // holds no state beyond its logger — every call re-reads its sources.
 type ContextLoader struct {
@@ -57,7 +57,7 @@ func (c *ContextLoader) SectionOne(root string, entry core.AgentEntry, now time.
 	return snap.SectionOne, nil
 }
 
-// Snapshot 冻结一次运行的配置（技术方案 §11.5）：**同一份原始 AGENT.md** 解析出 Profile
+// Snapshot 冻结一次运行的配置（技术方案 §3.6）：**同一份原始 AGENT.md** 解析出 Profile
 // 与段一正文，原始字节另存 `Content`；清单逐条记 `{path, sha256}`，`Hash` = 清单**规整
 // 序列化**的 sha256——**当前时间不得混入**（同一内容不同时刻必须同哈希）。
 // Snapshot freezes the config for one run from a single read: profile, section one,
@@ -198,7 +198,7 @@ func (c *ContextLoader) freeze(root string, entry core.AgentEntry, now time.Time
 	if len(cards) > 0 {
 		b.WriteString("\n\n## 技能\n")
 		for _, card := range cards {
-			// 卡片三要素：name + description + 技能库真路径（技术方案 §11.3）——
+			// 卡片三要素：name + description + 技能库真路径（技术方案 §3.4.1）——
 			// 只给卡片，正文留给模型在 L2 用 read_file 自取（渐进披露）。
 			b.WriteString("- " + card.name + "：" + card.description + "（" + card.path + "）\n")
 		}

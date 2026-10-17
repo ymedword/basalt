@@ -26,6 +26,9 @@ $ARGUMENTS
 - **与 module-dev 的衔接**：本文档是 `/module-dev` 的输入；module-dev 的
   步骤 5 用"交付物清单"做任务比对，步骤 7 用 harness 做对号——因此本 skill
   产出的清单必须**逐项可核**。
+- **人工 review ①**：本 skill 生成文档、自检并完成独立 AI review 后提交人审。
+  人审通过后由 AI 连续登记、派生 spec / plan / tasks、analyze 和 Loop；中间不再
+  设置 tasks 或实施前的固定人工确认。第二处固定人工 review 在该 US 收口。
 
 ## 输入加载（完整读取，不得凭记忆）
 
@@ -46,7 +49,7 @@ $ARGUMENTS
 3. 交付物清单      —— 代码/测试/配置/表四类；类级粒度 + 关键方法签名；不写方法体
 4. 验收测试（Harness）—— 测试分层标准（是否访问真实网络）+ 测试类→验收点映射表 +
                          关键回归测试写出代码
-5. 范围边界        —— 核心阶段不做项，逐项标注依据（需求文档 §6 /
+5. 范围边界        —— 核心阶段不做项，逐项标注依据（需求文档 §7.1 /
                       技术方案"核心阶段不做"）
 6. 验证与验收      —— 剩余人工项（真模型/真 webhook/冒烟/安全扫描/装配确认/
                       验收 Demo 锚点）
@@ -122,12 +125,29 @@ $ARGUMENTS
 - 无外部概念、无凭空版本号（版本先核实纪律：写依赖坐标前查
   `GOPROXY=https://goproxy.cn go list -m -versions <module>`；npm 侧查 npm registry）。
 
+## 提交人工 review ①
+
+公共验收方法复用 [agent-harness](../agent-harness/SKILL.md) 的 `design` 协议，
+本仓命令与边界取 `harness/project.md`。专属 Harness 用五问检查失败模式、测试层次、
+断言可判定性、快 / 重执行时机和判据保护；不把测试数量或覆盖率替代关键失败验收。
+
+自检后以独立 AI 上下文核对原始事实源与文档，不以作者总结代替证据。检查六类输入：
+功能、交互时序、接口、字段 / 类型 / 约束、可判定结果与必需测试、允许范围与停止边界。
+同时核对公共 Harness 引用、US 专属反例、依赖 / 构建 / 公共不变量的增量，以及单机
+端到端链路或扩展故障验收是否完整。存在可依据原始输入确定的问题时先修复再复核。
+独立上下文不可用时注明隔离限制，不把同一作者自检声称为独立 review。
+
+提交可审阅材料：文档路径与 SHA-256、六项核对结果、AI findings 与逐项处置、未覆盖面、
+需要裁决的事项与具体建议。等待实际人工审核，不编造批准；批准后将真实决定及所审
+版本交给 us-register / module-dev，由后者建立 run-state 记录。无需另造审查台账。
+本 skill 不把未审草案直接送进 Loop，也不要求人再次批准其范围内的 tasks。
+
 ## 项目配置区（复制本 skill 到新项目时，只改写本节）
 
 > 本节与 `module-dev` 的「项目配置区」、以及 `docs/us/REGISTRY.md`（US 台账）
 > 保持同一份事实，复制到新项目时**同步修改**。本实例按 Basalt 预填，事实来源：
-> `docs/TechnicalSolution.md`（最权威）、项目根 `CLAUDE.md`、
-> `docs/AiProgrammingGuide.md`、`docs/Roadmap.md`。
+> `docs/TechnicalDesign.md`（最权威）、项目根 `CLAUDE.md`、
+> `docs/DevelopmentLoop.md`、`docs/Roadmap.md`。
 
 ### 输入与文档路径
 
@@ -138,6 +158,11 @@ $ARGUMENTS
 - US 是**开放序列**（US-15 起顺延，编号只增不改），见 `docs/Roadmap.md` §4.1
 
 ### 章节来源（取数规则）
+
+- 文档重组后的四份正文为 `docs/Requirements.md`、`docs/IndustrySurvey.md`、
+  `docs/TechnicalDesign.md`、`docs/DevelopmentLoop.md`。迁移前台账与历史模块中的章节号
+  按 `docs/Compatibility.md` §8 换算，不能直接套入新正文；新模块的事实源须写
+  正文路径与语义锚点，§ 编号仅辅助定位，不从 `§4.N` 推断 US。
 
 - 台账**已有**该 US → 以台账「技术方案章节 / 需求文档章节」列为取数依据
 - 台账**查无**（新 US 首次生成）→ 由本 skill 自行定位技术方案与需求文档的对应
@@ -152,6 +177,25 @@ $ARGUMENTS
 逐字取自 `docs/Roadmap.md` §4.2 的**唯一取数规则增补**（仅"本 Roadmap"路径化）：
 
 > 台账查无且 N > 14 时，「章节来源」**必须**取 `docs/Roadmap.md` 的对应方向节为事实源，写进颗粒度文档头部，供 `/us-register` 派生；方向节与四份权威文档冲突时，**以技术方案为准**（不变）。
+
+### 后续 US 的 Harness / Loop 落点
+
+保持六节结构不变，适用于所有后续 US 与未来扩展编号。§3 交付物中列出任务专属
+Harness、夹具与已有验收的保护路径；§4 为关键回归列出具名测试与反例判据、
+对应 check ID、命令 / 超时、必跑与跳过规则。§6 登记 Loop 的批准依据、实现范围、
+停止 / 人工验收边界与阶段配置预期路径（按 `harness/stage.example.json` 派生）。
+stage 仅映射 inputs / protect / checks / tasks，不含 CLI 或 prompt。
+后续由 loop-programming skill 驱动当前 Agent，任务、预算与恢复写入 run-state；
+不能把 skill 的过程记录写成机器 checkpoint 或编造执行证据。
+§4 显式区分“公共 Harness 引用”与“本 US 专属 Harness”：公共层引用项目规则和
+`harness/acceptance.json`，不复制清单；专属层按 `docs/DevelopmentLoop.md` §9.3
+列出判据依据、测试与反例、执行方式、范围与保护、任务交接。§2 / §5 写清该 US
+特有边界，§6 分别列出人工 review ① 的材料和人工 review ② 的收口证据要求。
+未生成 tasks 时使用映射占位，人审模块卡后由 module-dev 自动填实际任务映射，
+不为映射回写已审模块卡或再索取 tasks 批准；映射与派生指纹记录在 stage / run-state。
+不得编造批准、实跑读数或尚不存在的 CLI / 平台能力。
+项目门禁与固定评测引用 `harness/acceptance.json`，不复制一份可能漂移的清单。
+任务定向验收与最终 full 并集验收分别登记，机器通过不替代独立复核和发布闸门。
 
 ### 术语
 

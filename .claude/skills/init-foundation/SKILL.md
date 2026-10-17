@@ -38,7 +38,7 @@ disable-model-invocation: false
 ## 宪法级条目（不得违反）
 
 1. **版本必须先核实后落地**：任何模块坐标写入 `go.mod` 前，必须经模块代理核实
-   （步骤 2 命令模板），并与 `docs/TechnicalSolution.md` §1.2 对照；落地后
+   （步骤 2 命令模板），并与 `docs/TechnicalDesign.md` §1.3 对照；落地后
    `go.mod` / `go.sum` 是唯一事实源。
    - 违反症状：坐标版本不存在 / 与实测结果漂移（凭记忆或教程摘要写版本号）
 2. **`fmt` 门禁必须先查退出码、再判输出**（两个格式工具各查一遍）：格式差异时
@@ -93,7 +93,7 @@ mkdir -p cmd/basalt internal/{app,core,provider,memory,tool,channel,web,storage,
 ```
 
 空目录放 `doc.go`（包注释 + 包声明）。包结构纪律（依赖方向 / 接口定义在消费方 /
-第三方实现就近封装）见 `docs/TechnicalSolution.md` §10.1；**包数是起点，不冻结**。
+第三方实现就近封装）见 `docs/TechnicalDesign.md` §7.1.2；**包数是起点，不冻结**。
 
 `go.mod` 就地写两行版本指令：`go 1.27`（**最低版本要求**——Go 1.21 起 `go` 行不再
 是准确版本锁定）+ `toolchain go1.27.2`（**准确构建版本**；本地工具链旧于它时按
@@ -111,7 +111,7 @@ for m in github.com/spf13/cobra github.com/goccy/go-yaml github.com/sashabaranov
 done
 ```
 
-结果与 `docs/TechnicalSolution.md` §1.2（2026-10-14 经模块代理实测）对照；不一致 →
+结果与 `docs/TechnicalDesign.md` §1.3（2026-10-14 经模块代理实测）对照；不一致 →
 停下报告（软门禁）。写入 `go.mod` 后由 `go.sum` 锁定。
 
 ### 步骤 3：Makefile 门禁七目标
@@ -122,7 +122,7 @@ done
 按包解析结果并 `exit 1` 的检查脚本（`core` / `tool` / `memory` / `storage` ≥ 70%，
 其余 ≥ 50%；有可执行语句但无测试文件的包计 0%、无语句包跳过）。脚本实现形态由本
 US 决定，但**必须**在 `make check` 里有这一环。`fmt` 目标**先查退出码、再判输出**
-（两个格式工具各查一遍）。配方照 `docs/AiProgrammingGuide.md` §3.2 的 Makefile 建议
+（两个格式工具各查一遍）。配方照 `docs/DevelopmentLoop.md` §2.2 的 Makefile 建议
 原文落地——例如 `fmt` 目标：
 
 ```makefile
@@ -143,7 +143,7 @@ fmt:  ; out="$$(gofmt -l .)" || { echo "gofmt 异常退出（退出码 $$?，多
 （默认开启 CGO——`-race` 必需；Linux runner 自带 gcc；`cover` 按包阈值阻断）；job `build` =
 `CGO_ENABLED=0` 四平台交叉编译（linux/amd64、linux/arm64、windows/amd64、
 darwin/arm64）——**不得**在此 job 跑 `-race`（CGO 状态冲突）。覆盖率报告入库或上传工件。GitHub 侧把两个 job 设为**必需检查**（branch
-protection，由用户设置、设置后回读一次；口径见 `docs/AiProgrammingGuide.md`
+protection，由用户设置、设置后回读一次；口径见 `docs/DevelopmentLoop.md`
 §8.3 第 6 项）。**"安全扫描拖慢默认构建"的问题在 Go 不存在**——gosec / govulncheck
 都是秒级，全部进默认门禁。
 
@@ -185,7 +185,7 @@ protection，由用户设置、设置后回读一次；口径见 `docs/AiProgram
 
 - 用项目已有的 YAML 依赖（`goccy/go-yaml`）解析 `docs/contracts/*.yaml`——值以
   `*` / `&` / `!` / `%` 等指示符开头又不加引号的标量会让整个文件解析失败，此类
-  隐性错误当场红（编程指南 §7 陷阱表第 32 条）
+  隐性错误当场红（开发操作 §7 陷阱表第 32 条）
 
 ### 步骤 10：验证（正向 + 负向）与报告
 
@@ -216,7 +216,7 @@ protection，由用户设置、设置后回读一次；口径见 `docs/AiProgram
 - [ ] 契约 YAML 解析单测绿（`docs/contracts/*.yaml`）
 - [ ] `CGO_ENABLED=0 go build` 通过（静态单二进制）
 - [ ] 凭证全 `${ENV_VAR}` 占位，无明文
-- [ ] 坐标版本经 goproxy.cn 核实并与技术方案 §1.2 对照
+- [ ] 坐标版本经 goproxy.cn 核实并与技术方案 §1.3 对照
 
 ## 与 constitution / Spec-Kit 的分工
 

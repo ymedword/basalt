@@ -6,7 +6,7 @@ import (
 )
 
 // 本文件是记忆面的**声明面**（纯类型 + 常量 + 两个接口，零文件与 SQL——颗粒度文档
-// §3.1 / 技术方案 §5.1 契约 1）：载体实现落在 `internal/memory`（markdown 档与门面）
+// §3.1 / 技术方案 §3.5.1 契约 1）：载体实现落在 `internal/memory`（markdown 档与门面）
 // 与 `internal/storage`（sqlite 档），流经 `core` 的只有接口形状。
 //
 // 两个维度**不得混淆**：`Scope` 是**分层**（这是谁的记忆），`Section` 是**分区**

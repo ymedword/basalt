@@ -335,8 +335,9 @@ func mainRun(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	casesDir := fs.String("cases", defaultCasesDir, "用例目录（其中的 *.yaml 逐例执行）")
 	provider := fs.String("provider", "", "真模型门控：仅执行声明了同名 provider 的用例（凭证走环境变量）")
+	results := fs.String("results", resultsDirName, "结果目录（CI 使用独立目录，避免读取历史报告）")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "用法：go run ./evals [--cases <目录>] [--provider <名称>]\n\n")
+		fmt.Fprintf(stderr, "用法：go run ./evals [--cases <目录>] [--provider <名称>] [--results <目录>]\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -349,17 +350,18 @@ func mainRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	// 时间在这里取一次并显式向下传：用例名、结果文件名与报告时刻同源，跨零点也自洽。
-	if code := runEvals(*casesDir, *provider, time.Now(), stdout, stderr); code != exitOK {
+	if code := runEvalsTo(*casesDir, *provider, *results, time.Now(), stdout, stderr); code != exitOK {
 		return code
 	}
 	return exitOK
 }
 
-// runEvals 跑一轮评测：装载 → 逐例执行（跳过 / 运行 / 判定）→ 落结果文件 → 打印汇总。
+// runEvalsTo 跑一轮评测：装载 → 逐例执行（跳过 / 运行 / 判定）→ 落结果文件 → 打印汇总。
 // 返回进程退出码。
-// runEvals loads the cases, executes them one by one, writes the result file and prints
+// runEvalsTo loads the cases, executes them one by one, writes the result file and prints
 // the summary.
-func runEvals(casesDir, gate string, startedAt time.Time, stdout, stderr io.Writer) int {
+// The explicit resultsDir isolates each acceptance invocation.
+func runEvalsTo(casesDir, gate, resultsDir string, startedAt time.Time, stdout, stderr io.Writer) int {
 	cases, err := loadCases(casesDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "用例装载失败：%v\n", err)
@@ -405,7 +407,7 @@ func runEvals(casesDir, gate string, startedAt time.Time, stdout, stderr io.Writ
 	}
 
 	writeCaseLines(stdout, rpt)
-	path, err := writeReport(resultsDirName, rpt, startedAt)
+	path, err := writeReport(resultsDir, rpt, startedAt)
 	if err != nil {
 		fmt.Fprintf(stderr, "结果文件写入失败：%v\n", err)
 		return exitHarness

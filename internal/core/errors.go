@@ -48,7 +48,7 @@ var (
 // —— 运行面错误类型（本 US 新增；既有哨兵一个不动）——
 // Run-surface error types added by this US; the sentinels above stay untouched.
 
-// SandboxViolationError 是一次沙箱拒绝，文案**四段式**（技术方案 §6.5 逐字）：
+// SandboxViolationError 是一次沙箱拒绝，文案**四段式**（技术方案 §4.3 逐字）：
 // `<规则>：<越界值>。这是安全策略，请勿反复重试；<放行指引：配置键 + 需重启>`。
 // 三个字段承载可变量、第三句是固定句（不发散、不改写——它是四方共享的判卷锚点）。
 // 拒绝信息**原样进工具结果**：模型看不到"为什么被拒"就不会收敛，故**不得**吞掉、

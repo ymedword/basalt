@@ -11,7 +11,7 @@ import (
 // CLI output stays stable and comparable between runs.
 //
 // memory/agents/ **不在**清单里：Agent 层记忆在 save_memory 时按需落盘，预建
-// 空目录会把"有没有 Agent 层记忆"这个事实抹平（需求 §5.1 产物树注释）。
+// 空目录会把"有没有 Agent 层记忆"这个事实抹平（需求文档 §3.1 产物树注释）。
 // memory/agents/ is deliberately absent: it appears on demand.
 var directories = []string{
 	"agents",

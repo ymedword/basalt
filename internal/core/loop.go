@@ -5,7 +5,7 @@ import (
 	"log/slog"
 )
 
-// 本文件是自实现的 ReAct 循环本体（颗粒度文档 §2.3 流程 B；技术方案 §4.1 是算法主源——
+// 本文件是自实现的 ReAct 循环本体（颗粒度文档 §2.3 流程 B；技术方案 §2.2.1 是算法主源——
 // 两处差异逐条冻结在颗粒度文档 §2.4 注 12，本文件按该注落地）。
 // This file is the hand-rolled ReAct loop (flow B). The design is ours: no agent framework
 // takes over the iteration, and no protocol SDK auto-executes tools (constitution I/II).

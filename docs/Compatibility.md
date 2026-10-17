@@ -3,7 +3,7 @@
 > 本文档回答一个问题：**同一份 Agent 资产、同一套使用方式，在两个底座之间能互换到什么程度。**
 >
 > 三态口径：每条对照项标 `保持一致` / `有意改变` / `暂不支持` 之一，**不允许含糊表述**（"基本兼容"这类词不出现）。
-> 与 [技术方案](TechnicalSolution.md) 冲突时以技术方案为准；本文只记**差异与承诺**，重合内容（目录协议、工具契约、API 形状）不在此复制。
+> 与 [技术方案](TechnicalDesign.md) 冲突时以技术方案为准；本文只记**差异与承诺**，重合内容（目录协议、工具契约、API 形状）不在此复制。
 
 ---
 
@@ -140,12 +140,12 @@
 | 工具 schema | `@Tool` 注解生成 | 工具接口显式给出 JSON Schema（手写 schema 常量） | 形态不同：Go 无注解生态，schema 是显式契约（防漂移靠测试） |
 | 持久化 | Spring Data JPA | `database/sql` + 手写 SQL + repository 接口 | 形态不同：接口位置（core）与依赖倒置不变 |
 | 上下文终止 | 中断标志 + 设回 | `context.Context` 取消传播 | Go 原生机制替代 |
-| 管理台前端 | Vue 3 + Vite 构建产物入库 | **同左**：Vue + Vite 产物经 `go:embed` 进二进制（Node 仅构建期；U-9 已按评审翻转，见技术方案 §7.4） | 形态一致：一套前端心智，产物入库，无 Node 也能出包 |
+| 管理台前端 | Vue 3 + Vite 构建产物入库 | **同左**：Vue + Vite 产物经 `go:embed` 进二进制（Node 仅构建期；U-9 已按评审翻转，见技术方案 §6.2.4） | 形态一致：一套前端心智，产物入库，无 Node 也能出包 |
 | cron 表达式 | 6 段（秒 分 时 日 月 周） | 同左 | **公共子集内逐字对齐**：两侧语法差异（`7` / `L` / `W` / `#`）见 §5.2 |
 
 ### 2.8 模块 / 包结构对照（备案）
 
-包不是兼容面（Go 单二进制下包是编译单元、不是交付单元），下表仅作两仓库的导航对照；Basalt 的包纪律（依赖方向 + 职责清晰 + 无环）见 [技术方案](TechnicalSolution.md) §10.1：
+包不是兼容面（Go 单二进制下包是编译单元、不是交付单元），下表仅作两仓库的导航对照；Basalt 的包纪律（依赖方向 + 职责清晰 + 无环）见 [技术方案](TechnicalDesign.md) §7.1：
 
 | NivroOS 模块 | Basalt 包 | 说明 |
 | --- | --- | --- |
@@ -175,7 +175,7 @@
 | 5 | 取消语义（ctx 传播 → 杀进程树 → 审计**解耦**写入，`context.WithoutCancel` + 5 秒短超时 → 未完成工具组补齐为「已取消」） | 被取消的 Run 正是最需要证据的时刻，审计不能随请求一起被掐掉；半截的工具组会让会话哑掉（供应商 400），取消后必须仍可继续 | 无 | contracts/run-and-errors.md §4.1~4.2、§4.4；取消后同会话再发一条消息能完成 |
 | 6 | 崩溃恢复：**实例锁**决定谁恢复（**操作系统级独占文件锁**，心跳仅诊断；写模式被活实例持锁时拒绝启动）；`running` → `failed`、两表 `pending` → `unknown`（**不猜测**外部副作用）；未完成工具组以**消息**为入口扫出（**按位置判定**：assistant 组 + 其后 `seq` 紧邻的连续 tool 段，**不得**全会话按 `tool_call_id` 全局查找——旧 Run 同 id 的结果行会让新组被误判完成）、与 Run 状态修复**同事务**按审计补齐（会话可继续），补组后另扫 `runs` 收尾无半截组的 `running` Run——**组看消息、Run 看表**；CLI `profile create` / `profile delete` 同样属**写模式命令**（会写工作区），被活实例持锁时拒绝启动并指引服务 API / 管理台 | 崩溃时 shell / HTTP 可能已产生外部影响，猜"没执行"就是撒谎；且"读一次库"的进程不该把活实例的 Run 标成失败；恢复以 Run 为入口且分两步提交时，中途再崩会把半截组**永久遗留**（Run 已不再是 `running`，扫不到）——故**工具组**的入口放在消息、状态与补齐同事务；而没有半截组可补的 `running` Run（等首次 LLM 响应 / 最终回答已落库而终态未写 / 无状态 invoke）只有扫 `runs` 找得到，故补组后仍需再扫一次表（**组看消息、Run 看表**） | 无 | contracts/run-and-errors.md §4.3~4.4；重启用例（含 kill -9 后同会话继续；恢复中再 kill -9 后重启仍收口） |
 | 7 | 审计 fail-closed（**两表同一套两阶段写**，插入失败即拒绝执行）+ 扩列（run_id / round / tool_call_id / status / error_kind / config_hash） | 从"有记录"到"能关联、能解释失败"；审计有洞比服务不可用更糟——前者无人知晓 | 数据不迁移 | contracts/run-and-errors.md §7；schema.sql |
-| 8 | 配置快照（**冻结清单 manifest 内容寻址**——AGENT.md + bootstrap 文件 + 绑定技能 `SKILL.md` 逐文件 `{path, sha256}`，运行内冻结）+ 原子发布 + 失败保旧 | 消解"旧 Profile × 新正文"混搭；热加载的正确性基础。**读即所记**：同一次读取产出注入内容与清单哈希，任一文件读失败则该次 Run 拒绝启动——否则 `config_hash` 证明不了"当时用的就是这份配置" | 无（行为更可预期） | 技术方案 §11.5；contracts/schema.sql `config_snapshots` 节 |
+| 8 | 配置快照（**冻结清单 manifest 内容寻址**——AGENT.md + bootstrap 文件 + 绑定技能 `SKILL.md` 逐文件 `{path, sha256}`，运行内冻结）+ 原子发布 + 失败保旧 | 消解"旧 Profile × 新正文"混搭；热加载的正确性基础。**读即所记**：同一次读取产出注入内容与清单哈希，任一文件读失败则该次 Run 拒绝启动——否则 `config_hash` 证明不了"当时用的就是这份配置" | 无（行为更可预期） | 技术方案 §3.6；contracts/schema.sql `config_snapshots` 节 |
 | 9 | 文件读写范围收窄：写 = 当前 Agent 目录（**不含其 `scripts/` 子目录**——该区对模型只读，代码常量判定）；读 = 当前 Agent 目录 + 技能库；跨 Agent 读须显式授权（`sandbox.cross_agent_read`） | "一个 Agent 能读遍所有 Agent 的提示词与脚本"不应默认成立；`scripts/` 只读是脚本受控通道（第 20 条）成立的前提——脚本能被模型改写，通道就拦不住它 | 跨 Agent 共享内容需授权或移入技能库 | 白名单用例：未授权读别的 Agent 目录 → `sandbox_denied`；写 `scripts/` 被拒 |
 | 10 | 子进程环境变量白名单（`shell.env_passthrough`） | 子进程默认继承**完整**环境 = 把所有凭证一并交给被执行的脚本 | 依赖自定义变量的脚本需登记白名单（拒绝文案点名配置键） | shell 用例：未登记变量在子进程中不可见 |
 | 11 | 渠道地址存 `${ENV_VAR}` 引用，发送时解析 | "零明文落盘"字面成立；地址的路径 / 查询串**就是凭证**，且这类凭证通常不过期，泄漏即长期有效 | 行数据不迁移（重新登记） | 登记后查库：`url` 列含 `${`；响应只回 host |
@@ -183,14 +183,14 @@
 | 13 | 失败分类 `error_kind` 七类 | 没有类别，审计只能答"失败了"、不能答"为什么" | 数据不迁移 | contracts/run-and-errors.md §7.3 |
 | 14 | 执行预算五项 + 上下文预算 + 核心记忆写配额 | 一次 Run 的消耗必须有界；"永不截断"的前提是有界 | 长任务可能撞 `RunTimeout` | contracts/run-and-errors.md §6 |
 | 15 | 运行查询与取消的 3 个 API | 运维要能看"这一次跑了什么"、要能停 | 无（纯新增） | contracts/openapi.yaml `runs` 组 |
-| 16 | 前端复用 NivroOS 的 Vue + Vite 方案（产物 embed，Node 仅构建期） | 一套前端心智、产物入库、无 Node 也能出包——与 NivroOS 的验证过的形态一致 | 无 | 技术方案 U-9 结论；干净检出可构建 |
+| 16 | 前端复用 NivroOS 的 Vue + Vite 方案（产物 embed，Node 仅构建期） | 一套前端心智、产物入库、无 Node 也能出包——与 NivroOS 的验证过的形态一致 | 无 | 需求文档 §7.6（U-9）；干净检出可构建 |
 | 17 | 工具参数**扩展**：`shell.timeout_seconds`、`http_get.headers`、`http_post.content_type` / `headers`（均可选，agent-md.md §5 标「扩展」） | 超时可控、请求头可控是真实需求；共有参数与必填性**逐字不动**是互换底线 | 无需动作（模型不填即零影响；`timeout_seconds` 只能缩短，不能放大） | contracts/agent-md.md §5 的「扩展」标注；Compat 样例 AGENT.md 两侧加载 |
-| 18 | 沙箱拆成两个接口：`Policy.Check`（授权）+ `CommandRunner.Run`（执行） | 授权（"允许吗"）与执行（"怎么做"）职责不同、升级路径也不同；容器化档要连执行方式一起换，"单接口不变、只新增实现类"的承诺不成立 | 无（接口为新增设计，无历史调用方） | 技术方案 §6.5；白名单授权与进程树用例 |
-| 19 | 包结构约束改为**依赖方向 + 职责清晰 + 无环**（包数是起点、按需增删，不再"固定不拆不并"） | Go 单二进制下包是编译单元不是交付单元，"固定包数"没有工程意义且阻碍第三方实现（cron / MCP / storage）落位 | 无 | 技术方案 §10；CI `go list` 无环复核 |
+| 18 | 沙箱拆成两个接口：`Policy.Check`（授权）+ `CommandRunner.Run`（执行） | 授权（"允许吗"）与执行（"怎么做"）职责不同、升级路径也不同；容器化档要连执行方式一起换，"单接口不变、只新增实现类"的承诺不成立 | 无（接口为新增设计，无历史调用方） | 技术方案 §4.3；白名单授权与进程树用例 |
+| 19 | 包结构约束改为**依赖方向 + 职责清晰 + 无环**（包数是起点、按需增删，不再"固定不拆不并"） | Go 单二进制下包是编译单元不是交付单元，"固定包数"没有工程意义且阻碍第三方实现（cron / MCP / storage）落位 | 无 | 技术方案 §7.1.2；CI `go list` 无环复核 |
 | 20 | **脚本受控通道**：新增 `shell.interpreters`（解释器白名单）；解释器只接受 `[<脚本路径>, <参数…>]` 形态（`arguments[0]` 以 `-` 开头一律拒）；脚本真实路径须落在该 Agent `scripts/` 或技能库；`scripts/` 对模型**只读**；`bash` / `sh` 仍在禁用之列 | 给"模型能跑脚本"开一条**形态受控**的路：解释器不是普通可执行名——只放行 `python` 而不约束形态，`-c` 内联代码就等于任意代码执行，`scripts/` 只读也白设；脚本区只读是该通道成立的前提（模型改不动自己要跑的脚本） | 想跑脚本的 Agent 须把脚本放进自己的 `scripts/`（或技能库）并在 `basalt.yaml` 登记解释器路径 | contracts/agent-md.md §5.2；shell 用例：`-c` 形态被拒、脚本越界被拒、`scripts/` 写入被拒（代码常量判定） |
 | 21 | 定时任务 `id` 规则：**单项可缺省**（派生 `<agent>-1`）、**两项及以上每项必须显式声明**、显式 `id` 全局唯一 | 全缺省派生的 id 绑在"列表顺序"上——调一次 `schedules:` 顺序就把 `enabled` 开关与执行历史换到别的任务头上，且无声无息 | 多任务 Agent 的 `AGENT.md` 须补显式 `id`（加载期拒绝并点名）；给派生任务补显式 `id` = 换身份（旧状态不跟随） | contracts/agent-md.md §3；加载期用例（≥2 项缺 `id` 被拒） |
 | 22 | 定时任务**下线 = 标记不物理删**（`scheduled_tasks.retired_at`）；重启对账（`enabled` 以库为准、定义以文件为准）；停机期间错过的触发点**不补跑**（记 WARN，补跑走 `/schedules/{id}/run`） | 物理删登记行会撞 `task_executions` 的外键（历史执行记录要么级联删、要么删不掉），而"历史执行记录"正是审计资产；"错过不补跑"与"不自动重试、恢复不重放"是同一条纪律 | 归档删除的 Agent 其任务行留在库里（`retired_at` 置位），查历史仍可见 | contracts/schema.sql `scheduled_tasks` 节；contracts/openapi.yaml `/schedules`；用例：归档后任务不触发、`executions` 仍在 |
-| 23 | 多文件提交 = **staging 构建 + 目录交换**（先在 `.staging` 构建完整副本，校验通过后原目录 → `.backup`、staging → 正式目录、删 `.backup`） | 就地写入的多文件提交会留下"半个新配置"的中间态：崩溃后磁盘上既有旧文件又有新文件，加载器读到的是**从没被校验过**的组合 | 无（对外行为不变） | 技术方案 §11.4；contracts/run-and-errors.md §4.3.2 第 5 步（残留判定：回滚 / 前滚）；用例：提交中途 `kill -9` → 重启后按残留收敛 |
+| 23 | 多文件提交 = **staging 构建 + 目录交换**（先在 `.staging` 构建完整副本，校验通过后原目录 → `.backup`、staging → 正式目录、删 `.backup`） | 就地写入的多文件提交会留下"半个新配置"的中间态：崩溃后磁盘上既有旧文件又有新文件，加载器读到的是**从没被校验过**的组合 | 无（对外行为不变） | 技术方案 §3.4.2；contracts/run-and-errors.md §4.3.2 第 5 步（残留判定：回滚 / 前滚）；用例：提交中途 `kill -9` → 重启后按残留收敛 |
 | 24 | MCP 配置条目的 `transport` 只接受 `stdio`（缺省 / 空串 / `null` = `stdio`）；非字符串或 `sse` / `http` 等取值 → **拒绝启动**并点名 server 与字段（NivroOS：WARN 后跳过该条目） | v1 只实现 stdio；跳过等于把"配了但不生效"静默化，与加载期 fail-closed 纪律（格式非法明确报错、不静默取默认）一致；代价是含非 stdio 条目的 NivroOS 配置在 Basalt 上整体起不来——**有意接受的迁移摩擦**。非字符串若被强转成空串，还会悄悄按缺省 stdio 获得执行含义 | 删除或注释非 stdio 条目后重启（`mcp_servers.yaml` 变更需重启） | `TestParseMCPServers_RejectsUnsupportedTransport` / `TestParseMCPServers_TransportDefaultsToStdio` / `TestParseMCPServers_RejectsNonStringTransport`（`1` / `true` / `[]` / `{}` 四态拒载）；错误点名文件、条目与字段 |
 | 25 | MCP 结果中的非文本内容块（图片 / 音频 / 资源链接 / 内嵌资源）渲染为**类型化占位符**（如 `[非文本内容：image image/png]`），base64 原文**不进模型上下文**（NivroOS：`toString()` 直接把 base64 当文本） | base64 进上下文既烧预算又无工具价值，还会在会话历史留下二进制副本；文本块仍按序换行连接、无文本时用结构化内容 JSON | 需要原始二进制的消费方须经其他路径获取（v1 不做落盘 / 附件引用） | `TestMCPToolAdapter_RendersNonTextAsPlaceholderNoBase64`；`TestMCPToolAdapter_RendersTextBlocksJoined` / `TestMCPToolAdapter_FallsBackToStructuredContentAndNoOutput` 守其余口径 |
 | 26 | MCP server 子进程环境 = `shell.env_passthrough` 透传白名单（示例配置 `basalt.yaml.example` 登记 `PATH` / `HOME` / `LANG` / `TZ`；**代码层无内置缺省**，未配置即不透传）+ 条目 `env` 声明覆盖同名键、其余**清空**；工作目录 = 工作区根（NivroOS：继承完整父进程环境） | 继承完整环境会把 `BASALT_*` / 云凭证 / 代理设置一并交给外部 server 进程；与 shell 子进程同一纪律、复用同一配置键（少一个键、少一处漂移）。白名单约束的是**继承面**，不是 server 内部的文件 / 网络行为——后者不经 Basalt Policy，可治理面 = 管理员登记的配置行 | server 依赖的自定义变量须登记 `shell.env_passthrough` 或在条目 `env` 声明；`${VAR}` 在装配期解析，未设置即拒绝启动 | `TestMCPPool_DialCommandEnvAndDir`（透传 / 覆盖 / 空清单非 nil）+ shell 用例（未登记变量子进程不可见） |
@@ -220,7 +220,7 @@
 
 这三组样例是**"可互换"这句话的判据**——两个底座各跑一遍，结果逐条比对。
 
-> 执行时点：本机无 Go 工具链，以下样例在**原型期**（见 [AiProgrammingGuide.md](AiProgrammingGuide.md) §3.4）两底座分别执行并记录读数。本仓当前只固化样例与判据。
+> 执行时点：本机无 Go 工具链，以下样例在**原型期**（见[开发操作](DevelopmentLoop.md) §5.2）两底座分别执行并记录读数。本仓当前只固化样例与判据。
 
 ### 5.1 样例 AGENT.md（两底座都能加载）
 
@@ -415,10 +415,10 @@ for (int i = 0; i < 10; i++) {
 1. **基线锚在 commit 上**，不写"最新版"——NivroOS 侧事实以 `50e1b30` 为准，其后续演进不自动进入本文
 2. 矩阵行**只用三态**；发现含糊表述即视为文档缺陷（"基本/大概/部分兼容"在本文里是禁词）
 3. `保持一致` 的行如果两侧实现路径不同（如 cron 时区），**必须在说明列写明路径差异**
-4. 本文的每条 `有意改变` 必须能指回 [技术方案](TechnicalSolution.md) 或 [contracts/](contracts/) 的具体段落——没有依据的改变是缺陷
+4. 本文的每条 `有意改变` 必须能指回 [技术方案](TechnicalDesign.md) 或 [contracts/](contracts/) 的具体段落——没有依据的改变是缺陷
 5. 双侧契约变化时更新本文；文档间的差异**不擅自"修正"**，以技术方案为准并在此记差异
 6. **两仓库关系**：Basalt 把 NivroOS 第一阶段实践的结论作为 day-one 输入（本文即该输入的存档），此后两仓库**各自独立演进、互不回写**；文档互为参照、不互为权威，本文也不随 NivroOS 演进自动更新（见第 1 条）
-7. **引用纪律（防漂移）**：四份权威文档与三件套**自述为主**——NivroOS 只允许以两种身份出现：①血缘一句话（文档头部）+ 指向本文的指针；②兼容承诺句里作为语法宾语的必要指称（如"参数名与 NivroOS 基线逐字一致""同一份 `AGENT.md` 两底座可加载"）。**对照性叙述**（逐项对照、差异裁决、模块映射、有意改变清单）**只存在于本文**；别处再出现第二份对照表即视为漂移缺陷
+7. **引用纪律（防漂移）**：项目历史来源、跨项目差异、模块映射与迁移对照仅在本文记录。其他项目文档直接陈述 Basalt 的需求、设计、契约和验收依据，可以链接本文，但不重复来源叙事；既有历史 US 与访谈材料保持原记录。本文保留真实历史，不由项目介绍的措辞调整推导出新的兼容承诺。
 
 ---
 
@@ -431,3 +431,262 @@ for (int i = 0; i < 10; i++) {
 | 数据库结构与迁移纪律 | [contracts/schema.sql](contracts/schema.sql) |
 | REST 端点与信封 | [contracts/openapi.yaml](contracts/openapi.yaml) |
 | 部署、备份与升级（两个底座通用口径） | [Operations.md](Operations.md) |
+
+<a id="document-reference-index"></a>
+
+## 8. 文档引用索引（2026-10-18）
+
+四份正文按产品任务、平台评估、Run 生命周期和开发 Loop 重新组织。文件改名不改变宪法顺位、固定契约、已批准 US 的范围或验收语义；历史文件不批量改写。
+
+| 历史路径（现为导航页） | 正文 |
+| --- | --- |
+| `DemandAnalysis.md` | [需求文档](Requirements.md) |
+| `IndustryResearch.md` | [行业调研](IndustrySurvey.md) |
+| `TechnicalSolution.md` | [技术方案](TechnicalDesign.md) |
+| `AiProgrammingGuide.md` | [开发操作](DevelopmentLoop.md) |
+
+本次重排时台账 `docs/us/REGISTRY.md` 的 SHA-256 为 `3956f610d8d94cdc218ffd5f89e6cad0bedfd278fd9c08050cda27e74a7dd7c2`；该基线已有行的章节按旧版解析，新增行使用当前正文路径与语义锚点。
+
+旧编号按下表定位。表中保留历史标题只为解释已有引用，不再作为新正文目录；新增模块引用当前正文的语义锚点。
+
+### 8.1 `DemandAnalysis.md` 的章节迁移
+
+| 历史章节 | 当前定位 |
+| --- | --- |
+| §1 · 1. 项目概述 | [需求文档 §1](Requirements.md#product-boundary) |
+| §1.1 · 1.1 Basalt 是什么 | [需求文档 §1.1](Requirements.md#product-users) |
+| §1.2 · 1.2 能干什么——五大核心能力 | [需求文档 §1.3](Requirements.md#product-capabilities) |
+| §1.3 · 1.3 交付分两段 | [需求文档 §7.1](Requirements.md#release-scope) |
+| §1.4 · 1.4 产品边界与演进依据 | [需求文档 §1.4](Requirements.md#product-scope-changes) |
+| §1.5 · 1.5 实施节奏（US 依赖序） | [需求文档 §7.2](Requirements.md#delivery-slices) |
+| §2 · 2. 术语 | [需求文档 §8](Requirements.md#terms) |
+| §3 · 3. 设计目标 | [需求文档 §1.2](Requirements.md#product-success) |
+| §4 · 4. 典型场景 | [需求文档 §2](Requirements.md#user-outcomes) |
+| §5 · 5. 核心功能 | [需求文档 §3–6](Requirements.md#agent-assets) |
+| §5.1 · 5.1 工作区初始化（`basalt init`） | [需求文档 §3.1](Requirements.md#workspace-init) |
+| §5.2 · 5.2 一个目录 = 一个 Agent | [需求文档 §3.2](Requirements.md#agent-definition) |
+| §5.3 · 5.3 能力一：对接 LLM（Provider） | [需求文档 §4.2](Requirements.md#provider-routing) |
+| §5.4 · 5.4 能力二：ReAct 循环 | [需求文档 §4.1](Requirements.md#run-progress) |
+| §5.5 · 5.5 能力三：Memory | [需求文档 §4.4](Requirements.md#long-term-memory) |
+| §5.6 · 5.6 能力四：Tool 体系 | [需求文档 §5.1](Requirements.md#tool-permissions) |
+| §5.7 · 5.7 Channel（核心阶段：CLI） | [需求文档 §5.3](Requirements.md#human-channel) |
+| §5.8 · 5.8 能力五：Web Service | [需求文档 §5.4](Requirements.md#http-access) |
+| §5.9 · 5.9 Session 管理 | [需求文档 §4.3](Requirements.md#session-history) |
+| §5.10 · 5.10 定时任务（第三触发源） | [需求文档 §5.5](Requirements.md#scheduled-work) |
+| §5.11 · 5.11 三种运行模式 | [需求文档 §5.7](Requirements.md#process-modes) |
+| §5.12 · 5.12 命令行工具（12 个） | [需求文档 §5.8](Requirements.md#cli-surface) |
+| §5.13 · 5.13 配置与密钥 | [需求文档 §5.2](Requirements.md#configuration) |
+| §5.14 · 5.14 管理台与 Agent 动态管理（核心阶段收尾批次） | [需求文档 §3.3](Requirements.md#agent-management) |
+| §5.15 · 5.15 官网展示主页（对外门面） | [需求文档 §6.1](Requirements.md#public-site) |
+| §6 · 6. 扩展功能（方向定义，不排期） | [需求文档 §7.4](Requirements.md#extension-options) |
+| §7 · 7. 社区共建 | [需求文档 §7.5](Requirements.md#contribution-surface) |
+| §8 · 8. 非功能需求 | [需求文档 §6.2](Requirements.md#nonfunctional) |
+| §9 · 9. 关键流程 | [需求文档 §4](Requirements.md#run-promises) |
+| §9.1 · 9.1 启动加载 | [需求文档 §3.5](Requirements.md#startup-outcome) |
+| §9.2 · 9.2 一次对话（含工具） | [需求文档 §4.5](Requirements.md#conversation-events) |
+| §9.3 · 9.3 记忆写入与召回 | [需求文档 §4.6](Requirements.md#memory-events) |
+| §9.4 · 9.4 定时触发 | [需求文档 §5.6](Requirements.md#schedule-events) |
+| §9.5 · 9.5 技能渐进披露 | [需求文档 §3.6](Requirements.md#skill-disclosure) |
+| §10 · 10. 数据模型 | [需求文档 §3.4、§6.6](Requirements.md#file-ownership) |
+| §10.1 · 10.1 SQLite 表 | [需求文档 §6.6](Requirements.md#stored-data) |
+| §10.2 · 10.2 文件系统数据 | [需求文档 §3.4](Requirements.md#file-ownership) |
+| §11 · 11. 里程碑 | [需求文档 §7.3](Requirements.md#milestones) |
+| §12 · 12. 风险与未决 | [需求文档 §7.6](Requirements.md#scope-decisions) |
+| §12.1 · 12.1 风险 | [需求文档 §6.7](Requirements.md#product-risks) |
+| §12.2 · 12.2 未决事项（U-1~U-10 已于 2026-10-15 全部裁决） | [需求文档 §7.6](Requirements.md#scope-decisions) |
+| §13 · 13. 验收标准 | [需求文档 §2.4、§6](Requirements.md#quality-evidence) |
+| §13.1 · 13.1 功能验收（五个可演示 Demo） | [需求文档 §2.4](Requirements.md#feature-examples) |
+| §13.2 · 13.2 五个每日 Demo 验收（钟推，D1–D5） | [需求文档 §2.5](Requirements.md#daily-workflows) |
+| §13.3 · 13.3 运维验收 | [需求文档 §6.3](Requirements.md#operations-acceptance) |
+| §13.4 · 13.4 质量门禁验收 | [需求文档 §6.4](Requirements.md#quality-gates) |
+| §13.5 · 13.5 运行时契约验收（按依赖分阶段） | [需求文档 §6.5](Requirements.md#runtime-proofs) |
+| §14 · 14. 总结 | [需求文档 §1.2](Requirements.md#product-success) |
+
+### 8.2 `IndustryResearch.md` 的章节迁移
+
+| 历史章节 | 当前定位 |
+| --- | --- |
+| Basalt 行业调研：Agent OS 版图、Go 生态位与 Basalt 定位 · Basalt 行业调研：Agent OS 版图、Go 生态位与 Basalt 定位 | [行业调研 §7](IndustrySurvey.md#research-notes) |
+| 一、什么是 Agent OS · 一、什么是 Agent OS | [行业调研 §1](IndustrySurvey.md#selection-questions) |
+| §1.1 · 1.1 让一个 Agent "能干活"需要什么 | [行业调研 §1–2](IndustrySurvey.md#selection-questions) |
+| §1.2 · 1.2 从 runtime 到 Agent OS | [行业调研 §1–2](IndustrySurvey.md#selection-questions) |
+| §1.3 · 1.3 与相邻概念的区别 | [行业调研 §1–2](IndustrySurvey.md#selection-questions) |
+| §1.4 · 1.4 部署形态 | [行业调研 §1–2](IndustrySurvey.md#selection-questions) |
+| 二、业界两个最具代表性的开源项目 · 二、业界两个最具代表性的开源项目 | [行业调研 §3](IndustrySurvey.md#candidate-samples) |
+| §2.1 · 2.1 OpenClaw（TypeScript，个人级 Agent 的爆发样本） | [行业调研 §3](IndustrySurvey.md#candidate-samples) |
+| §2.2 · 2.2 Hermes Agent（Python，NousResearch） | [行业调研 §3](IndustrySurvey.md#candidate-samples) |
+| §2.3 · 2.3 两个项目共同留下的空白 | [行业调研 §3](IndustrySurvey.md#candidate-samples) |
+| 三、企业为什么需要私有可控的 Agent 底座 · 三、企业为什么需要私有可控的 Agent 底座 | [行业调研 §1](IndustrySurvey.md#selection-questions) |
+| §3.1 · 3.1 需求是真实的，且集中在大中型组织 | [行业调研 §1](IndustrySurvey.md#selection-questions) |
+| §3.2 · 3.2 严监管企业的铁律 | [行业调研 §1](IndustrySurvey.md#selection-questions) |
+| §3.3 · 3.3 价值锚点是知识沉淀，不是自动化率 | [行业调研 §1](IndustrySurvey.md#selection-questions) |
+| 四、Go 生态在这件事上的位置 · 四、Go 生态在这件事上的位置 | [行业调研 §3–4](IndustrySurvey.md#candidate-samples) |
+| §4.1 · 4.1 分层盘点（2026-10-14 实测） | [行业调研 §3–4](IndustrySurvey.md#candidate-samples) |
+| §4.2 · 4.2 空白确认（"空白"到底还剩什么） | [行业调研 §3–4](IndustrySurvey.md#candidate-samples) |
+| §4.3 · 4.3 Go 作为底座语言的六个技术支点 | [行业调研 §3–4](IndustrySurvey.md#candidate-samples) |
+| §4.4 · 4.4 MCP：Go 生态已经就位 | [行业调研 §3–4](IndustrySurvey.md#candidate-samples) |
+| §4.5 · 4.5 Basalt 的独立验证命题 | [行业调研 §5](IndustrySurvey.md#validation-plan) |
+| 五、Basalt 定位与愿景 · 五、Basalt 定位与愿景 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| §5.1 · 5.1 Basalt 是什么 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| §5.2 · 5.2 锚在需求，不锚在概念 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| §5.3 · 5.3 边界：做什么，不做什么 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| §5.4 · 5.4 安全怎么不重蹈开路者的覆辙 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| §5.5 · 5.5 跟业界项目的关系 | [行业调研 §4–5](IndustrySurvey.md#design-hypotheses) |
+| 六、未来方向：从单机到分布式 · 六、未来方向：从单机到分布式 | [行业调研 §6](IndustrySurvey.md#evolution-triggers) |
+| 附录 A：术语 · 附录 A：术语 | [行业调研 §7.2](IndustrySurvey.md#survey-terms) |
+| 附录 B：参考资料与核实记录 · 附录 B：参考资料与核实记录 | [行业调研 §7.1](IndustrySurvey.md#research-evidence) |
+
+### 8.3 `TechnicalSolution.md` 的章节迁移
+
+| 历史章节 | 当前定位 |
+| --- | --- |
+| §1 · 1. 方案概述 | [技术方案 §1](TechnicalDesign.md#architecture-constraints) |
+| §1.1 · 1.1 关键决策 | [技术方案 §1.1](TechnicalDesign.md#invariants) |
+| §1.2 · 1.2 技术栈（版本均为 2026-10-14 实测） | [技术方案 §1.3](TechnicalDesign.md#dependency-baseline) |
+| §1.3 · 1.3 设计事实与兼容性边界 | [技术方案 §1.2](TechnicalDesign.md#design-boundary) |
+| §2 · 2. 整体架构 | [技术方案 §2.1、§7.1](TechnicalDesign.md#run-entry) |
+| §2.1 · 2.1 三条入口，一条链路 | [技术方案 §2.1](TechnicalDesign.md#run-entry) |
+| §2.2 · 2.2 分层视图 | [技术方案 §7.1.1](TechnicalDesign.md#layer-view) |
+| §2.3 · 2.3 五大能力的关系 | [技术方案 §2.6](TechnicalDesign.md#runtime-collaboration) |
+| §2.4 · 2.4 架构总览图 | [技术方案 §2.7](TechnicalDesign.md#deployment-view) |
+| §3 · 3. 能力一：对接 LLM（Provider） | [技术方案 §2.4](TechnicalDesign.md#model-request) |
+| §3.1 · 3.1 设计 | [技术方案 §2.4.1](TechnicalDesign.md#model-client) |
+| §3.2 · 3.2 显式映射（硬约束） | [技术方案 §2.4.2](TechnicalDesign.md#model-mapping) |
+| §3.3 · 3.3 核心阶段不做 | [技术方案 §2.4.3](TechnicalDesign.md#model-limits) |
+| §4 · 4. 能力二：ReAct 循环 | [技术方案 §2](TechnicalDesign.md#run-path) |
+| §4.1 · 4.1 算法（核心循环） | [技术方案 §2.2.1](TechnicalDesign.md#loop-algorithm) |
+| §4.2 · 4.2 四个部件 | [技术方案 §2.2.2](TechnicalDesign.md#loop-components) |
+| §4.3 · 4.3 边界行为 | [技术方案 §2.5.2](TechnicalDesign.md#termination-behavior) |
+| §4.4 · 4.4 完整消息模型（工具调用轮次的硬约束） | [技术方案 §2.3](TechnicalDesign.md#message-protocol) |
+| §4.5 · 4.5 Run 状态机 | [技术方案 §5.1](TechnicalDesign.md#run-state) |
+| §4.6 · 4.6 并发、取消与崩溃恢复 | [技术方案 §5.2](TechnicalDesign.md#recovery-order) |
+| §4.7 · 4.7 执行预算与准入控制 | [技术方案 §2.5.1](TechnicalDesign.md#admission-budget) |
+| §5 · 5. 能力三：Memory | [技术方案 §3.5](TechnicalDesign.md#memory-input) |
+| §5.1 · 5.1 统一门面与行为契约 | [技术方案 §3.5.1](TechnicalDesign.md#memory-contract) |
+| §5.2 · 5.2 作用域：Agent 层 + 全局回退层 | [技术方案 §3.5.2](TechnicalDesign.md#memory-scopes) |
+| §5.3 · 5.3 三档载体 | [技术方案 §3.5.3](TechnicalDesign.md#memory-backends) |
+| §5.4 · 5.4 MEMORY.md 的形态 | [技术方案 §3.5.4](TechnicalDesign.md#memory-format) |
+| §6 · 6. 能力四：Tool 体系 | [技术方案 §4](TechnicalDesign.md#action-boundary) |
+| §6.1 · 6.1 工具接口 | [技术方案 §4.1.1](TechnicalDesign.md#tool-interface) |
+| §6.2 · 6.2 内置十工具 | [技术方案 §4.2](TechnicalDesign.md#builtin-actions) |
+| §6.3 · 6.3 三档扩展 | [技术方案 §4.4](TechnicalDesign.md#tool-extension) |
+| §6.4 · 6.4 ToolRegistry | [技术方案 §4.1.2](TechnicalDesign.md#tool-registry) |
+| §6.5 · 6.5 授权与执行：Policy / Runner 两个接口 | [技术方案 §4.3](TechnicalDesign.md#policy-runner) |
+| §6.6 · 6.6 通知渠道（NotifyTools） | [技术方案 §6.4](TechnicalDesign.md#notification) |
+| §7 · 7. 能力五：Web Service | [技术方案 §6.2](TechnicalDesign.md#http-service) |
+| §7.1 · 7.1 服务器装配 | [技术方案 §6.2.1](TechnicalDesign.md#http-assembly) |
+| §7.2 · 7.2 统一信封与错误 | [技术方案 §6.2.2](TechnicalDesign.md#http-envelope) |
+| §7.3 · 7.3 10 个核心端点 | [技术方案 §6.2.3](TechnicalDesign.md#http-endpoints) |
+| §7.4 · 7.4 管理台与追加端点（核心阶段收尾批次） | [技术方案 §6.2.4](TechnicalDesign.md#management-surface) |
+| §7.5 · 7.5 限制与不做 | [技术方案 §6.2.5](TechnicalDesign.md#http-limits) |
+| §8 · 8. 支撑模块 | [技术方案 §3、§6](TechnicalDesign.md#execution-inputs) |
+| §8.1 · 8.1 工作区初始化（`basalt init`） | [技术方案 §3.1.1](TechnicalDesign.md#instance-init) |
+| §8.2 · 8.2 AgentLoader：加载与校验 | [技术方案 §3.2](TechnicalDesign.md#agent-loader) |
+| §8.3 · 8.3 ContextLoader：系统提示词 | [技术方案 §3.3](TechnicalDesign.md#prompt-inputs) |
+| §8.4 · 8.4 Channel 与 CLI 交互 | [技术方案 §6.1.1](TechnicalDesign.md#terminal-channel) |
+| §8.5 · 8.5 AgentScheduler（第三触发源） | [技术方案 §6.3](TechnicalDesign.md#scheduler) |
+| §8.6 · 8.6 三种运行模式 | [技术方案 §6.5](TechnicalDesign.md#runtime-modes) |
+| §8.7 · 8.7 CLI 命令（12 个，cobra） | [技术方案 §6.1.2](TechnicalDesign.md#cli-commands) |
+| §8.8 · 8.8 ConfigLoader | [技术方案 §3.7](TechnicalDesign.md#config-loader) |
+| §9 · 9. 数据持久化 | [技术方案 §5](TechnicalDesign.md#recovery) |
+| §9.1 · 9.1 SQLite 装配 | [技术方案 §5.3](TechnicalDesign.md#sqlite-runtime) |
+| §9.2 · 9.2 表清单 | [技术方案 §5.4](TechnicalDesign.md#persistence-tables) |
+| §9.3 · 9.3 文件系统数据 | [技术方案 §5.5](TechnicalDesign.md#persistent-files) |
+| §9.4 · 9.4 审计模型：从"有记录"到"能解释失败" | [技术方案 §4.5](TechnicalDesign.md#audit-links) |
+| §10 · 10. 工程结构 | [技术方案 §7](TechnicalDesign.md#code-and-artifacts) |
+| §10.1 · 10.1 包结构（依赖方向约束） | [技术方案 §7.1.2](TechnicalDesign.md#package-layout) |
+| §10.2 · 10.2 构建与发布 | [技术方案 §7.2](TechnicalDesign.md#release-build) |
+| §11 · 11. 目录协议与渐进披露（单一事实源） | [技术方案 §3](TechnicalDesign.md#execution-inputs) |
+| §11.1 · 11.1 一个目录 = 一个 Agent | [技术方案 §3.1.2](TechnicalDesign.md#agent-directory) |
+| §11.2 · 11.2 AGENT.md 完整样例 | [技术方案 §3.1.3](TechnicalDesign.md#agent-example) |
+| §11.3 · 11.3 渐进披露（Skill 的三层，形态对齐 agentskills 开放标准） | [技术方案 §3.4.1](TechnicalDesign.md#skill-levels) |
+| §11.4 · 11.4 核心文件系统 vs 扩展 API | [技术方案 §3.4.2](TechnicalDesign.md#configuration-writers) |
+| §11.5 · 11.5 热加载：不可变配置快照 | [技术方案 §3.6](TechnicalDesign.md#immutable-snapshot) |
+| §12 · 12. 五个每日端到端 Demo | [技术方案 §8.1](TechnicalDesign.md#daily-proof) |
+| §12.1 · 12.1 可复现输入与依赖 | [技术方案 §8.1.1](TechnicalDesign.md#daily-proof-1) |
+| §12.2 · 12.2 时钟、故障与证据 | [技术方案 §8.1.2](TechnicalDesign.md#daily-proof-2) |
+| §13 · 13. 实施节奏 | [技术方案 §8.2](TechnicalDesign.md#delivery-sequence) |
+| §13.1 · 13.1 开发 Harness 与 Loop | [技术方案 §8.2.1](TechnicalDesign.md#delivery-sequence-1) |
+| §14 · 14. 性能目标 | [技术方案 §7.3](TechnicalDesign.md#performance-targets) |
+| §15 · 15. 总结 | [技术方案 §8.3](TechnicalDesign.md#reliability-first) |
+
+### 8.4 `AiProgrammingGuide.md` 的章节迁移
+
+| 历史章节 | 当前定位 |
+| --- | --- |
+| §1 · 1. 实施总览 | [开发操作 §1](DevelopmentLoop.md#work-entry) |
+| §1.1 · 1.1 两个阶段 | [开发操作 §1.1](DevelopmentLoop.md#next-action) |
+| §1.2 · 1.2 输入映射（文档 → 工件） | [开发操作 §1.3](DevelopmentLoop.md#execution-artifacts) |
+| §1.3 · 1.3 US 依赖图与节奏 | [开发操作 §4.1](DevelopmentLoop.md#us-dependencies) |
+| §2 · 2. Spec-Kit 匹配度评估 | [开发操作 §3](DevelopmentLoop.md#planning-boundary) |
+| §2.1 · 2.1 适配良好的部分（照搬） | [开发操作 §3.1](DevelopmentLoop.md#planning-tools) |
+| §2.2 · 2.2 需要项目化改造的部分 | [开发操作 §3.2](DevelopmentLoop.md#before-code) |
+| §3 · 3. 准备阶段（一次性） | [开发操作 §2](DevelopmentLoop.md#worksite) |
+| §3.1 · 3.1 项目宪法（十条原则） | [开发操作 §6.1](DevelopmentLoop.md#engineering-invariants) |
+| §3.2 · 3.2 仓库骨架与门禁 | [开发操作 §2.2](DevelopmentLoop.md#project-gates) |
+| §3.3 · 3.3 写第一行代码前的人工确认清单 | [开发操作 §6.4](DevelopmentLoop.md#foundation-record) |
+| §3.4 · 3.4 原型五链路验证（分阶段执行） | [开发操作 §5.2](DevelopmentLoop.md#runtime-validation) |
+| §4 · 4. 逐 US 拆解 | [开发操作 §4](DevelopmentLoop.md#delivery-map) |
+| §4.1 · 4.1 US-1 工程地基（骨架 + 门禁 + 配置 + 日志 + 工作区 + 持久化） | [开发操作 §4.2.1](DevelopmentLoop.md#us-1) |
+| §4.2 · 4.2 US-2 Provider 对接（能力一） | [开发操作 §4.2.2](DevelopmentLoop.md#us-2) |
+| §4.3 · 4.3 US-3 Agent 目录与 Profile 加载 | [开发操作 §4.2.3](DevelopmentLoop.md#us-3) |
+| §4.4 · 4.4 US-4 ReAct 循环与首个工具闭环（能力二） | [开发操作 §4.2.4](DevelopmentLoop.md#us-4) |
+| §4.5 · 4.5 US-5 Shell 与 HTTP 工具（Demo 一） | [开发操作 §4.3.1](DevelopmentLoop.md#us-5) |
+| §4.6 · 4.6 US-6 Memory（能力三，Demo 二） | [开发操作 §4.3.2](DevelopmentLoop.md#us-6) |
+| §4.7 · 4.7 US-7 MCP 集成（Demo 三） | [开发操作 §4.3.3](DevelopmentLoop.md#us-7) |
+| §4.8 · 4.8 US-8 通知渠道 | [开发操作 §4.3.4](DevelopmentLoop.md#us-8) |
+| §4.9 · 4.9 US-9 Web Service（能力五，Demo 四 / 五） | [开发操作 §4.4.1](DevelopmentLoop.md#us-9) |
+| §4.10 · 4.10 US-10 定时任务 | [开发操作 §4.4.2](DevelopmentLoop.md#us-10) |
+| §4.11 · 4.11 US-11 观测与管理台 | [开发操作 §4.4.3](DevelopmentLoop.md#us-11) |
+| §4.12 · 4.12 US-12 Agent 动态管理 | [开发操作 §4.4.4](DevelopmentLoop.md#us-12) |
+| §4.13 · 4.13 US-13 官网展示主页（对外门面） | [开发操作 §4.5.1](DevelopmentLoop.md#us-13) |
+| §4.14 · 4.14 US-14 发布收尾（五个每日 Demo + v0.1.0） | [开发操作 §4.5.2](DevelopmentLoop.md#us-14) |
+| §4.15 · 4.15 协作模式（人与 AI 分工） | [开发操作 §1.2](DevelopmentLoop.md#delivery-owners) |
+| §4.16 · 4.16 跑偏纠正表 | [开发操作 §3.3](DevelopmentLoop.md#scope-correction) |
+| §5 · 5. 交付物（每个 US 的完成定义） | [开发操作 §5.1](DevelopmentLoop.md#module-evidence) |
+| §6 · 6. 增量阶段提示词模板（可直接复制） | [开发操作 §8.5](DevelopmentLoop.md#work-prompts) |
+| §7 · 7. 工程陷阱表（Go 实现与可复现反例） | [开发操作 §7](DevelopmentLoop.md#failure-cases) |
+| §8 · 8. 风险与纪律 | [开发操作 §6](DevelopmentLoop.md#engineering-boundary) |
+| §8.1 · 8.1 风险 | [开发操作 §6.3](DevelopmentLoop.md#engineering-risks) |
+| §8.2 · 8.2 纪律（不可违背） | [开发操作 §6.2](DevelopmentLoop.md#change-discipline) |
+| §8.3 · 8.3 工程治理八项（2026-10-15 立；逐项带生效时点与可验证判据） | [开发操作 §8.1](DevelopmentLoop.md#governance) |
+| §8.4 · 8.4 mock 模型集成测试口径（六条，2026-10-15 定；US-14 落地） | [开发操作 §5.3](DevelopmentLoop.md#release-e2e) |
+| §9 · 9. Loop 编程操作规程 | [开发操作 §9](DevelopmentLoop.md#loop-protocol) |
+| §9.1 · 9.1 输入：项目基准、公共底座、模块执行卡 | [开发操作 §9.1](DevelopmentLoop.md#loop-protocol-1) |
+| §9.2 · 9.2 进入循环与已有工作区保护 | [开发操作 §9.2](DevelopmentLoop.md#loop-protocol-2) |
+| §9.3 · 9.3 三层 Harness 与验收所有权 | [开发操作 §9.3](DevelopmentLoop.md#loop-protocol-3) |
+| §9.4 · 9.4 单轮执行与反馈 | [开发操作 §9.4](DevelopmentLoop.md#loop-protocol-4) |
+| §9.5 · 9.5 持久状态、指纹与中断恢复 | [开发操作 §9.5](DevelopmentLoop.md#loop-protocol-5) |
+| §9.6 · 9.6 停止条件与授权边界 | [开发操作 §9.6](DevelopmentLoop.md#loop-protocol-6) |
+| §9.7 · 9.7 独立复核、反馈归属与最小交接 | [开发操作 §9.7](DevelopmentLoop.md#loop-protocol-7) |
+| §9.8 · 9.8 可直接使用的启动提示词 | [开发操作 §9.8](DevelopmentLoop.md#loop-protocol-8) |
+| §9.9 · 9.9 两次系统整合 | [开发操作 §9.9](DevelopmentLoop.md#loop-protocol-9) |
+| §10 · 10. 开发机准备与起步操作（合并正文） | [开发操作 §10](DevelopmentLoop.md#environment) |
+| §10.1 · 10.1. 开工前先定三件事 | [开发操作 §10.1](DevelopmentLoop.md#environment-1) |
+| §10.1.1 · 10.1.1 模块路径（module path） | [开发操作 §10.1.1](DevelopmentLoop.md#environment-1-1) |
+| §10.1.2 · 10.1.2 远程仓库（决定 CI 是否生效） | [开发操作 §10.1.2](DevelopmentLoop.md#environment-1-2) |
+| §10.1.3 · 10.1.3 本机装不装 C 编译器（决定能否本地跑竞态检测） | [开发操作 §10.1.3](DevelopmentLoop.md#environment-1-3) |
+| §10.1.4 · 10.1.4 定案记录（2026-10-15） | [开发操作 §10.1.4](DevelopmentLoop.md#environment-1-4) |
+| §10.2 · 10.2. 环境准备（你执行） | [开发操作 §10.2](DevelopmentLoop.md#environment-2) |
+| §10.2.1 · 10.2.1 现状盘点（本机实测，2026-10-15） | [开发操作 §10.2.1](DevelopmentLoop.md#environment-2-1) |
+| §10.2.2 · 10.2.2 装 Go 1.27.2 | [开发操作 §10.2.2](DevelopmentLoop.md#environment-2-2) |
+| §10.2.3 · 10.2.3 装 make | [开发操作 §10.2.3](DevelopmentLoop.md#environment-2-3) |
+| §10.2.4 · 10.2.4 装 GCC（`-race` 需要，见 10.1.3） | [开发操作 §10.2.4](DevelopmentLoop.md#environment-2-4) |
+| §10.2.5 · 10.2.5 装四个 Go 工具（`go install`） | [开发操作 §10.2.5](DevelopmentLoop.md#environment-2-5) |
+| §10.2.6 · 10.2.6 Go 环境变量与一次探针验证 | [开发操作 §10.2.6](DevelopmentLoop.md#environment-2-6) |
+| §10.2.7 · 10.2.7 现在**不要**装的东西 | [开发操作 §10.2.7](DevelopmentLoop.md#environment-2-7) |
+| §10.2.8 · 10.2.8 环境完成判据 | [开发操作 §10.2.8](DevelopmentLoop.md#environment-2-8) |
+| §10.3 · 10.3. 仓库初始化（你执行） | [开发操作 §10.3](DevelopmentLoop.md#environment-3) |
+| §10.3.1 · 10.3.1 `git init` 与三个仓库级配置文件 | [开发操作 §10.3.1](DevelopmentLoop.md#environment-3-1) |
+| §10.3.2 · 10.3.2 首个 commit | [开发操作 §10.3.2](DevelopmentLoop.md#environment-3-2) |
+| §10.3.3 · 10.3.3 远程仓库与 CI（可选） | [开发操作 §10.3.3](DevelopmentLoop.md#environment-3-3) |
+| §10.3.4 · 10.3.4 完成判据 | [开发操作 §10.3.4](DevelopmentLoop.md#environment-3-4) |
+| §10.4 · 10.4 原型时序的历史裁决（2026-10-15） | [开发操作 §10.4](DevelopmentLoop.md#environment-4) |
+| §10.5 · 10.5 从起步转入开发循环 | [开发操作 §10.5](DevelopmentLoop.md#environment-5) |
+| §10.6 · 10.6. 提交、版本锚点与发布形态 | [开发操作 §10.6](DevelopmentLoop.md#environment-6) |
+| §10.7 · 10.7. 排障 | [开发操作 §10.7](DevelopmentLoop.md#environment-7) |
+| §10.8 · 10.8. 本指南的验证状态（如实登记） | [开发操作 §10.8](DevelopmentLoop.md#environment-8) |
+| §11 · 11. 文档维护与证据同步 | [开发操作 §8.2–8.4](DevelopmentLoop.md#document-ownership) |
+| §11.1 · 11.1 单一正文与来源边界 | [开发操作 §8.2](DevelopmentLoop.md#document-ownership) |
+| §11.2 · 11.2 已冻结模块与项目文档修订 | [开发操作 §8.3](DevelopmentLoop.md#frozen-inputs) |
+| §11.3 · 11.3 文档变更的最低检查 | [开发操作 §8.4](DevelopmentLoop.md#document-checks) |

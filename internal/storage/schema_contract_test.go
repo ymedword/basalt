@@ -8,7 +8,7 @@ import (
 )
 
 // TestSchemaFile_MatchesContract：实现副本与契约逐字节一致——防"字面量第二份
-// 定义"漂移（颗粒度文档 §2.2 约束 12；编程指南 §8.3 第 5 项）。
+// 定义"漂移（颗粒度文档 §2.2 约束 12；开发操作 §8.1 第 5 项）。
 // 契约变更 = 同批更新两处：docs/contracts/schema.sql 与 internal/storage/schema.sql。
 func TestSchemaFile_MatchesContract(t *testing.T) {
 	impl, err := os.ReadFile(schemaFileName)

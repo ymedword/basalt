@@ -128,7 +128,7 @@ func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 }
 
 // LoadAll 装载全部 Agent 目录；单只失败不拖垮整批（其余照常）。不提供 LoadOne——
-// show 复用本结果过滤（技术方案 §8.7「不得为同一语义写两份实现」）。
+// show 复用本结果过滤（技术方案 §6.1.2「不得为同一语义写两份实现」）。
 // LoadAll never fails because of one bad agent directory: the top-level error is
 // reserved for an unreadable workspace structure.
 //

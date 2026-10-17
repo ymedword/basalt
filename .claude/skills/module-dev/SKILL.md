@@ -2,8 +2,8 @@
 name: module-dev
 description: >-
   按「模块执行颗粒度文档」（模块级设计文档）驱动开发一个模块：输入模块编号/US 编号，自动完成
-  备料 → speckit-specify → clarify → plan → tasks（停等确认）→ analyze → implement →
-  模块级验收报告，全程施加硬/软两类门禁与测试纪律，保证产出严格贴合项目技术方案。跨项目
+  人审模块卡 → AI 备料 → speckit-specify → clarify → plan → tasks → analyze → Loop →
+  收口证据与人工收口 review，全程施加硬/软两类门禁与测试纪律。跨项目
   通用：项目相关事实全部在文末「项目配置区」。当用户说「开发模块 N / 实现 US-N /
   颗粒度文档驱动开发」时使用。
 argument-hint: "模块编号或 US 编号（合法值见项目配置区的分流规则），如：1"
@@ -31,20 +31,26 @@ $ARGUMENTS
 
 ## 总则
 
-1. 可机器判定的检查项必须由门禁强制执行，不得以人工检查替代；机器无法判定的
-   分歧必须停下等用户裁决，不得自行决定。
+0. **固定人工 review 仅两处**：颗粒度文档生成后、该 US 收口时。第一次人审通过后，
+   登记、spec / clarify / plan / tasks、交叉复核、Harness 与 Loop 全由 AI 推进。
+   tasks 比对与 analyze 仍必做，但不设人工批准停点。总则 2 的实质范围变更返回
+   第一次人审修订，不将可由已审输入确定的实现或派生问题逐项交人确认。
+1. 可机器判定的检查项必须由门禁强制执行，不得以人工检查替代；AI 先从已审输入
+   查证并解决歧义，只有无授权依据的范围或验收分歧才返回第一次人工 review。
 2. 软门禁：遇到下列任一情况，**立即停下、向用户报告、等确认后继续**：
    1. 需要创建"交付物清单"之外的任何对外概念（导出类型、配置键、数据表、
       REST 路径、`AGENT.md` frontmatter 字段）；
    2. 需要修改任何已定字面量（类型名、方法签名、配置键、表列名、端点路径）；
    3. 模块执行颗粒度文档与技术方案冲突（裁决：以项目技术方案为准，见配置区）；
    4. 需要修改前序模块交付的公共接口（当模块文档明确列为"改造点"的除外）；
-   5. 第三方 API 在本地依赖中核实不到；
+   5. 第三方 API 经依赖源码与官方资料核实后，仍需改变已审公共接口或依赖；
+      单纯缺少本地信息先由 AI 查证或修复环境，不作为例行人工询问；
    6. 需要新增 plan 未列明的第三方依赖（**例外**：配置区「固定技术栈句」与本 US
       颗粒度文档已列明、且已经用户裁决的依赖**直接落地**，不重复询问；版本变更
       仍按新增处理）；
-   7. 已批准 tasks 之后输入发生变化（颗粒度文档 / `spec.md` / `plan.md` 与
-      run-state 基线不符——见「运行状态文件」节与步骤 0 分流表）= 变更，走本门禁。
+   7. 已人审模块卡的范围、公共契约、权限或验收语义需要改变，或无法核实实际
+      批准依据。AI 控制侧可在已审范围内修正派生 spec / plan / tasks 并重跑分析，
+      记录差异与新基线；Loop 实现者不得改冻结输入，且不得靠修订重置失败预算。
 3. 测试纪律（保护**已批准的验收语义**，不是"测试文件一律不许动"——新增测试、
    等价重构、随已批准接口的适配**允许**）：不得删断言、不得无理由跳过测试
    （`t.Skip` 必须写明理由）、不得放宽阈值让测试变绿；**判据面变更 = 变更**，
@@ -69,19 +75,19 @@ $ARGUMENTS
 
 | 状态 | 动作 |
 | --- | --- |
-| 零命中 | 新 feature，正常走步骤 1~7（固定停点 = 步骤 5） |
+| 零命中 | 核对模块卡已完成实际人工 review，再正常走步骤 1~7；步骤 5 由 AI 比对 |
 | 目录存在、无 spec 或 spec-only | 从步骤 2 / 步骤 4 继续（specify/clarify/plan 未完成） |
 | `tasks.md` 存在且勾选数 ≥ 1 | **不得调 `/speckit-tasks`**；先做输入一致性核对（见下），通过后直接进步骤 6，从**首个未完成任务**继续（`grep -nE '^\s*- \[ \]'` 取全文件文档序第一条——追加 Phase 的任务 ID 更大、天然在后）；给 `/speckit-implement` 显式传参"从 T0xx 续、已勾选任务不得重做/覆盖" |
-| `tasks.md` 存在、全部未勾选 | 查 run-state 的 tasks 批准记录：已批准 → 从步骤 6 起；无记录 → 补跑步骤 5（比对 + 停点） |
+| `tasks.md` 存在、全部未勾选 | 查 run-state 的模块卡人审依据、AI 任务比对与冻结记录：齐全 → 从步骤 6 起；缺派生记录 → AI 补跑步骤 5，不重复索取批准 |
 | `tasks.md` 缺失/为空 | 正常走步骤 5 |
 
 **输入一致性核对（可机器判；三件输入 = 颗粒度文档 / `spec.md` / `plan.md`）**：
-与 run-state 基线段的 sha256 比对；基线缺失 → fallback 用 `git log -1
---format=%H -- <三件输入>` 与 tasks.md 最近改动提交比对；两者都不可用 → 停下让
-用户三选一（无变化继续 / 追加修订 / 重生成）。**不得用 mtime**（checkout / clone /
-换行归一都会动）。判定"有变化" → 列出差异 → **追加式修订**（优先调
-`/speckit-converge`——其契约只追加、不重编号、不改勾选；局限：converge 不读颗粒度
-文档，变化源在颗粒度文档时追加内容人工给）→ 按总则 2 软门禁停车等裁决。
+与 run-state 基线段的 sha256 比对；基线缺失时交叉核对 Git 历史、实际人审依据与
+现有工件，不用 mtime 推定批准。旧 tasks 的真实人工批准记录保留，不追造新流程证据。
+判定有变化时先由 AI 列出差异：已审范围内的派生遗漏或实现问题由控制侧追加式修订、
+复跑 analyze 并登记新基线；不得重编号、改已勾选正文或让 Loop 实现者修改冻结输入。
+只有实质范围变更或人审依据无法核实时返回人工 review ①。已有源码改动按工作区
+保护规则保留，不能为恢复流程覆盖。修订 stage 后累计失败预算继续有效。
 
 **修订后自检（机器判据，两条都必须为空——实测通过）**：
 
@@ -109,19 +115,23 @@ comm -23 \
 五段结构：
 
 1. **基线**（步骤 0 分流后写入）：起始 commit SHA；开跑时已有未提交改动清单
-   （**保留，不得 stash / checkout 覆盖**——先快照报告再询问用户）；本 US 允许
-   触碰的文件范围（颗粒度文档 §3 交付物清单）；三件输入的 sha256（在 tasks 批准
-   时点写入）；worktree 路径（如用）。
+   （**保留，不得 stash / checkout 覆盖**，快照后按已审范围继续）；本 US 允许
+   触碰的文件范围；模块卡人工 review 的真实决定、所审路径与 SHA-256；三件输入
+   的 sha256 和 tasks 正文指纹（AI 任务比对后冻结，勾选位归一）；worktree 路径。
 2. **失败台账**：日期 / 问题（测试名或首错位置 + 症状短语）/ 假设 / 结果 / 同题
    计数——`/debug` 与一切修复尝试都落账。
 3. **停止预算与计数**（默认值见配置区；跨会话从本段恢复计数）。
-4. **未验证清单**（与编程指南 §5 第 6 项、陷阱表第 55 条是同一概念，本文件是其
+4. **未验证清单**（与开发操作 §5.1 的四态口径、§7 陷阱表第 55 条是同一概念，本文件是其
    **持久载体**——其余处一律引用，不各写一份）。
-5. **收口结论**（四态汇总的指针，细节进验收报告）。
+5. **收口结论**：AI 验收与独立复核结论、待人工 review ② 状态、实际人工决定；
+   未收到决定不得写成人工接受。四态明细指向验收报告。
 
 写入时点：步骤 0 分流后建基线 → 失败即记台账 → 步骤 7 收口更新未验证清单与结论。
 
 ## 步骤 1：上下文加载与依赖检查
+
+先核对模块卡的人工 review ① 已实际通过，沿用已存在的真实批准；仅生成草案、AI
+自检通过或模板 `approval` 均不构成批准。缺少依据时提交模块卡评审包，不先产码。
 
 1. **读取以下三类输入**（完整读取，不得凭记忆）：
    - 当前模块执行颗粒度文档（从 US 台账的文档列取；文件缺失 → 软门禁停下，
@@ -155,8 +165,9 @@ comm -23 \
 
 ## 步骤 3：/speckit-clarify
 
-调用 `speckit-clarify`。有问题答问题（答案只从颗粒度文档和技术方案找，找不到 →
-软门禁停下问用户）；无问题继续。
+使用 `speckit-clarify` 的本仓自动推进模式：AI 从已审模块卡、公共契约和技术方案
+确定澄清答案，记录来源后继续，不在中间向用户逐题提问。无依据且影响范围或验收
+的歧义提交具体修订、返回人工 review ①；不虚构用户回答，也不把缺失默认为否。
 
 ## 步骤 4：组装并执行 /speckit-plan
 
@@ -166,26 +177,64 @@ comm -23 \
 - **模块落位**（按配置区取数规则取本模块落位，细节以技术方案模块章 / 该 US
   颗粒度文档 §3 为准）
 - **测试策略句**（从文档"验收测试（Harness）"抄）：`测试策略按文档"验收测试
-  （Harness）"执行：<测试类清单>（覆盖 <关键回归点>），单测默认执行、集成冒烟
-  环境守卫 CI 跳过；实现完成的定义是门禁全绿。`
+  （Harness）"执行：公共 Harness 引用项目配置，专属为 <测试类清单>（覆盖
+  <关键回归点>）；必跑与跳过按公共配置及本 US 判据执行，缺少环境不冒充通过。`
 - **语法禁区句**（配置区原文；若配置区写"无"，本句省略）
 
-## 步骤 5：/speckit-tasks + 固定软停点
+plan review 由 AI 检查依赖方向、审计入口、框架禁区、context 与单二进制纪律，
+问题在已审范围内自动修复留证，不另设人工 plan 批准。
+
+## 步骤 5：/speckit-tasks + AI 任务比对与冻结
 
 1. 调用 `speckit-tasks`（**前置**：`tasks.md` 已存在且有勾选时本步**不得执行**
    ——按步骤 0 分流表处理；重生成会毁掉勾选与内嵌证据）。
 2. **自动比对**：任务清单 ↔ 当前颗粒度文档"交付物清单"（代码/测试/配置/表逐
    项），并确认测试任务先于或伴随对应实现任务（harness 先行）。
-3. 输出比对结果（齐 / 缺什么 / 多什么），**停下等用户确认**后才进入下一步。
-   这是流程中唯一的固定停点，不得跳过。确认后把三件输入的 sha256 与批准记录
-   写进 run-state 基线段。
+3. AI 输出比对结果（齐 / 缺什么 / 多什么），修复派生遗漏与顺序错误，核对专属
+   check 可追溯到模块卡 §4、边界来自 §2 / §5，公共检查引用全局 ID 而不重复定义。
+   将实际任务 ID、check ID、保护路径和 stage 路径建立映射。
+4. 在 run-state 登记 AI 比对结论、三件输入与 tasks 正文指纹、引用的模块卡人审
+   决定；通过后自动进入步骤 6。**不索取 tasks 或实施前的固定人工确认**，不把 AI
+   比对写成用户批准。需要改变已审范围的事项按总则 2 返回人工 review ①。
 
 ## 步骤 6：/speckit-analyze（实施前**阻断**检查）+ /speckit-implement
 
-`tasks` 停点确认之后、进 implement 之前**必须**先跑一次 `/speckit-analyze`：
+读取历史模块或台账时，旧文档名与章节编号先按 `docs/Compatibility.md` §8 解析到
+当前正文；不改写历史冻结输入，也不把旧编号当成新正文的相同章节。
+
+AI 完成 tasks 比对之后、进 implement 之前**必须**先跑一次 `/speckit-analyze`：
 **CRITICAL 问题清零前不得进入 implement**（修 spec / plan / tasks，不得稀释原则，
 也不得自行改宪法）。analyze 结论贴进验收报告。US 收口由步骤 7「收口三件套」
 **再跑一次**（核对实现与文档一致性，证据进七项 DoD）。
+
+analyze 保持只读，由 AI 控制侧根据 findings 修复已审范围内的派生工件并复跑，
+不执行常规“是否要修复”的人工询问。CRITICAL 清零、其余发现逐条处置后继续；
+真实范围或验收变更重新打开人工 review ①。
+
+**后续 US 与扩展阶段由 Loop 编程 skill 推进**：
+
+[agent-harness](../agent-harness/SKILL.md) 持有公共判据设计 / verify / close 方法；
+[loop-programming](../loop-programming/SKILL.md) 驱动当前 Agent 实现、验收、修复与恢复。
+通过 `harness/project.md` 绑定项目命令和状态。module-dev 完成派生工件与分析后进入
+Loop skill，不启动 Coding Agent CLI，不递归调用 module-dev，也不依赖独立循环脚本。
+
+1. analyze 通过后，从已审模块卡派生 `harness/stage.example.json` 验收映射，登记
+   真实 review ① 决定、输入指纹、专属检查、task 绑定和保护路径；不设 tasks 人审。
+2. 控制侧先建立可判定断言和有效红态。Go 检查用 `go test -json -count=1` 与
+   `required_tests`；空匹配 / SKIP 不能通过。实现者按 `/speckit-implement` 的实现
+   规则工作，不改冻结输入或弱化判据；tasks 勾选由控制侧验收后更新。
+3. 使用 loop-programming 逐任务实现 / 验收 / 修复。Windows 验收命令为
+   `.\scripts\check-acceptance.ps1 --stage <配置> --task <任务>`；其他平台为
+   `sh scripts/check-acceptance.sh --stage <配置> --task <任务>`。
+   最后去掉 `--task`，通过 full、固定评测与全部阶段断言，再补适用整链路 / 外部验证。
+4. 状态以 `run-state.md` 为准：尝试前记累计次数和假设，验收后记报告及下一步。
+   恢复先复验可能完成的工作，源码 / 输入变化失效旧证据；输入修订不重置预算。
+   原 `.loop/state/` 保留历史，不再维护机器 checkpoint；不宣称 skill 是自动续跑进程。
+5. 环境 / 权限 / 预算阻断时保存证据和下一步，范围内常规故障自动修复；实质范围或
+   判据变化回到 review ①。自动化通过后执行步骤 7，再交人工 review ② 收口。
+
+执行模型、停止预算与证据细则见 `docs/DevelopmentLoop.md` §9 和 `harness/README.md`。
+历史 US 的冻结输入不为接线追改。
 
 implement 期间逐任务执行，附加门禁：
 
@@ -202,10 +251,10 @@ implement 期间逐任务执行，附加门禁：
   格式；全仓格式检查（`gofumpt -l .` / `make fmt`）保持**只读**——**不得**顺手重排
   无关文件（避免无关 diff；全仓初始格式化的唯一例外是 `/init-foundation`）；③vet /
   staticcheck 的真问题按语义修——不得用 `_ =` 把"未使用"糊过去（先判断该不该
-  处理）；④安全类（gosec）报警按编程指南 §7 陷阱表对应条目修（如 `http.Server`
+  处理）；④安全类（gosec）报警按开发操作 §7 陷阱表对应条目修（如 `http.Server`
   四超时必设、路径白名单必须真实路径投影后再比前缀）；⑤不为"消灭告警"牺牲可观测
   性（错误路径 WARN 日志与审计落库两者都要）。**案例不在此内嵌**——复核方式一律
-  指 `docs/AiProgrammingGuide.md` §7 陷阱表（60 条，每条带"怎么发现"与"怎么
+  指 `docs/DevelopmentLoop.md` §7 陷阱表（60 条，每条带"怎么发现"与"怎么
   复核"）。核心逻辑实现必须与颗粒度文档第 2 节的「核心逻辑」流程图/伪代码
   **逐块对照落地**（同构性核对，签名逐字一致）。**注释语言**（遵循项目 CLAUDE.md
   约定）：正文中文为主，英文标识符/术语保留原文不翻译；**关键注释（包级 /
@@ -238,14 +287,15 @@ implement 期间逐任务执行，附加门禁：
   **判据面 diff**（`git diff --stat` 路径即清单）；**不读作者叙述**；
 - 输出 = findings 表（id｜严重度｜规格锚点｜证据 `file:line`｜结论）+ **未覆盖面
   清单**（复核者跳过不判的项必须逐条列出）+ 总结论（通过 / 带条件 / 阻断）；
-- 必做触发 = 高风险五类改动（文件访问 / 进程执行 / 凭证处理 / 迁移 / 恢复逻辑，
-  编程指南 §8.3 第 6 项）；其余模块可裁剪但须注明"未做独立复核及理由"；
-- 发现清单按编程指南 §8.2 第 7 条（审查回执纪律）逐条验证 / 裁决，**不得**静默
+- 每个 US 的人工收口 review 前均执行 AI 复核；高风险五类改动（文件访问 / 进程
+  执行 / 凭证处理 / 迁移 / 恢复逻辑）的适用面不可省略。其他不适用面列明依据；
+  独立上下文不可用时重读原始工件并说明隔离限制，不把作者自检写成独立上下文复核；
+- 发现清单按开发操作 §6.2 第 7 条（审查回执纪律）逐条验证 / 裁决，**不得**静默
   丢弃。
 
 七项证据（全部满足才可宣布本模块完成，逐项写进验收报告）：
 
-**四态口径**（与 `docs/AiProgrammingGuide.md` §5 同源；术语定义只此两处，其余
+**四态口径**（与 `docs/DevelopmentLoop.md` §5.1 同源；术语定义只此两处，其余
 处引用）：每个验收点 / 门禁项标 **通过 / 失败 / 跳过 / 未验证**（均附本轮当场
 读数）；**必验项处于跳过 / 未验证 → 该项验收保持未完成**，并进 run-state
 未验证清单；跳过处置口径见陷阱表第 55 条（不复述）；"**不适用**"须给文档依据
@@ -274,15 +324,17 @@ implement 期间逐任务执行，附加门禁：
    - **如何验证**：可直接复制执行的命令块（全量门禁、只跑本模块测试、关键回归
      单测、依赖方向 grep 等），每条命令注明预期结果；最后重复剩余人工项。
 
-报告完停止——commit / push / 部署由用户决定。
+完成 AI 复核与修复后，输出人工 review ② 的收口包，run-state 保持“待人工收口
+review”；收到实际决定后记录通过、退回或有条件接受及未验证项。自动验收全绿
+不等于人工收口已通过。报告后等待该决定；commit / push / 部署沿用既有授权。
 
 ---
 
 ## 项目配置区（复制本 skill 到新项目时，只改写本节）
 
 > 本节是唯一允许因项目而异的部分；上文所有章节跨项目不动。
-> 本实例按 Basalt 预填，事实来源：`docs/TechnicalSolution.md`（最权威）、
-> 项目根 `CLAUDE.md`、`docs/AiProgrammingGuide.md`、`docs/EngineeringStandards.md`、
+> 本实例按 Basalt 预填，事实来源：`docs/TechnicalDesign.md`（最权威）、
+> 项目根 `CLAUDE.md`、`docs/DevelopmentLoop.md`、`docs/EngineeringStandards.md`、
 > `docs/Roadmap.md`。
 > 术语：**模块执行颗粒度文档** = 模块级设计文档（本项目统一用该称法）。
 
@@ -309,8 +361,8 @@ implement 期间逐任务执行，附加门禁：
 
 - 文档路径 = 台账「模块执行颗粒度文档」列；文件缺失 → 软门禁停下，先跑
   `/module-doc-gen N`
-- 技术方案：`docs/TechnicalSolution.md`（项目最权威文档）；需求文档：
-  `docs/DemandAnalysis.md`。文档与其冲突时以技术方案为准（软门禁报告）
+- 技术方案：`docs/TechnicalDesign.md`（项目最权威文档）；需求文档：
+  `docs/Requirements.md`。文档与其冲突时以技术方案为准（软门禁报告）
 - 章节对照与模块落位**不在本 skill 内逐 US 登记**：
   - 技术方案 / 需求文档对应章节 = 台账「技术方案章节 / 需求文档章节」列
   - 台账该列写「**无对应章节**」时：以该 US 颗粒度文档的**差异裁决注**为主源、
@@ -340,7 +392,7 @@ implement 期间逐任务执行，附加门禁：
 
 逐 US 的落位见台账「模块落位（摘要）」列（取数规则见上节）；**不得**为"导航方便"
 另建同义第二套包、**不得**让 `core` 反向依赖任何内部包。纪律是
-`docs/TechnicalSolution.md` §10.1 的**三条包纪律**：
+`docs/TechnicalDesign.md` §7.1.2 的**三条包纪律**：
 
 1. **依赖方向**：`channel` / `web` / `cli` → `core` ← `provider` / `memory` /
    `tool` / `storage` / `workspace`；`app` 是唯一允许"什么都知道"的装配层；
@@ -350,7 +402,7 @@ implement 期间逐任务执行，附加门禁：
 3. **第三方实现放消费方包内或 `internal/adapters/`**：MCP SDK 封装在 `tool`、
    SQLite 驱动封装在 `storage`；**cron 适配放独立内部包**（`internal/adapters/cron`），
    `core` 保留接口与纯业务逻辑、由 `app` 完成装配——新增一个第三方实现**不得**
-   迫使其他包跟着改。⚠ 此处按**宪法「架构约束」**的加固口径执行：技术方案 §10.1
+   迫使其他包跟着改。⚠ 此处按**宪法「架构约束」**的加固口径执行：技术方案 §7.1.2
    同时写着「`core` 只依赖标准库」与「cron 调度封装在 `core`」，两句自相矛盾；
    冲突以 2026-10-15 经用户确认的宪法为准
 
@@ -378,18 +430,18 @@ hook（`.specify/extensions.yml` 只登记了 `before_tasks` / `after_implement`
 
 `Go 1.27.2 构建版本（go.mod 的 go 行写最低版本要求 go 1.27，准确版本由 toolchain 指令与 CI 固定）+ 单 Go module（cmd/basalt + internal/ 十包）+ spf13/cobra v1.10.2 + goccy/go-yaml v1.19.2 + sashabaranov/go-openai v1.43.0（只做协议调用，禁自动工具循环）+ modernc.org/sqlite v1.60.1 + robfig/cron/v3 v3.0.1（6 段：cron.NewParser(Second|Minute|Hour|Dom|Month|Dow)，每任务时区经 CRON_TZ= 前缀）+ modelcontextprotocol/go-sdk v1.8.0 + fsnotify v1.10.1 + 标准库 net/http + ServeMux + log/slog + testify v1.12.1；凭证 ${ENV_VAR} 占位；不用 ORM（手写 SQL + schema.sql 幂等）；CGO_ENABLED=0；本技术栈句与已批准计划内的依赖直接落地、表外新增坐标或版本变更先问用户；GOPROXY=https://goproxy.cn；写坐标前先 go list -m -versions 核实`
 
-版本坐标明细见 `docs/TechnicalSolution.md` §1.2（2026-10-14 经模块代理实测）；
+版本坐标明细见 `docs/TechnicalDesign.md` §1.3（2026-10-14 经模块代理实测）；
 落地后以 `go.mod` / `go.sum` 为唯一事实源。追加段（如 US-11 起的官网展示前端）
 由 `/us-register` 按能力追加机制在对应 US 登记时补入——**本批不预写**。
 
 ### 门禁命令
 
 - 全量门禁：`make check`（= `fmt lint sec test test-integration cover build` 七目标
-  聚合；**Makefile 由 US-1 交付**——未落地前按 `docs/AiProgrammingGuide.md` §3.2
+  聚合；**Makefile 由 US-1 交付**——未落地前按 `docs/DevelopmentLoop.md` §2.2
   的命令序直跑：gofmt → gofumpt → go vet → staticcheck → gosec → govulncheck →
   `go test -race -cover ./...` → `go test -tags=integration ./...` →
   覆盖率阈值判卷（`make cover` 的等价脚本）→ `CGO_ENABLED=0 go build ./...`）
-- **三条实测纪律**（判卷顺序写错会让门禁"报绿而实际没检"，见编程指南 §3.2）：
+- **三条实测纪律**（判卷顺序写错会让门禁"报绿而实际没检"，见开发操作 §2.2）：
   1. `gofmt -l` / `gofumpt -l` 发现格式差异**不会自动失败**（退出码 0、只把文件
      打印到 stdout）——判卷**必须先查退出码、再判输出**（语法错误时退出码非 0
      而输出为空）；两个格式工具各查一遍
@@ -448,7 +500,7 @@ git 集成 skill，commit / push 归用户），不登记。Hook **判不了"语
 7. 时区禁用词：`grep -rnE "time\.Local|[.]Local[(][)]|time\.Now[(][)]\.Location[(][)]" --include='*.go' .` 零命中（调度 zone 缺省 UTC、Agent 配置显式 zone；**`.Local()` 是同一条禁令的另一种写法**——对 `time.Time` 值调 `.Local()` 与写 `time.Local` 一样语义上依赖进程本地时区，只是躲过了字面 grep：2026-10-16 实测 `internal/cli/session.go` 的渲染路径就是这种漏网写法）
 8. 随机源红线：`grep -rn '"math/rand' --include='*.go' cmd internal` 零命中——密钥 / 令牌 / 随机标识一律 `crypto/rand`（EngineeringStandards §1.8；gosec G404 复核）
 9. 点导入零命中：`grep -rnE '^import[[:space:]]+\.|^[[:space:]]+\.[[:space:]]*"' --include='*.go' cmd internal` 零命中——`import .` 只在测试的循环依赖特例允许（EngineeringStandards §1.3）
-10. `core` 只依赖标准库：`GOPROXY=https://goproxy.cn go list -f '{{.Imports}}' ./internal/core` 只出标准库包名（零第三方路径、零 `github.com/ymedword/basalt/internal/...`；登记读数 `[context errors time]`）——`core` 自 US-4 起首次有可执行语句，架构约束「核心抽象与引擎只依赖标准库」自该 US 起按此判据复核（技术方案 §10.1 三条包纪律之一）
+10. `core` 只依赖标准库：`GOPROXY=https://goproxy.cn go list -f '{{.Imports}}' ./internal/core` 只出标准库包名（零第三方路径、零 `github.com/ymedword/basalt/internal/...`；登记读数 `[context errors time]`）——`core` 自 US-4 起首次有可执行语句，架构约束「核心抽象与引擎只依赖标准库」自该 US 起按此判据复核（技术方案 §7.1.2 三条包纪律之一）
 11. LLM 审计入口唯一：`grep -rn '\.BeginCall(' --include='*.go' internal/core` 零命中（登记读数：零命中）——两阶段审计（`pending` 预写 / 终态回填）只由 `internal/provider` 的 `ProviderService` 调用；`core` 只**声明** `LLMCallStore` 接口、**不得**出现调用点（宪法 II / V：审计写入路径唯一、运行引擎不自建第二套）
 
 ### 语法禁区

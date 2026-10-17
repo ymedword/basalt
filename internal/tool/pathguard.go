@@ -11,7 +11,7 @@ import (
 
 // 本文件是路径白名单的**投影层**：每个文件动作在授权判定之前都要先问"这东西的真身在哪"。
 // 只做词法规范化是不够的——`..` 与软连接都能把词法上"在目录内"的路径指到目录外
-// （编程指南 §7 陷阱表第 7 条），故判定一律在**真实路径投影**之后做，投影不出来就拒。
+// （开发操作 §7 陷阱表第 7 条），故判定一律在**真实路径投影**之后做，投影不出来就拒。
 // This file projects a requested path onto its real location before any authorization
 // decision. Lexical normalisation alone is bypassable, so the projection is mandatory
 // and any unresolvable target fails closed.

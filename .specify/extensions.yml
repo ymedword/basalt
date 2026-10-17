@@ -18,7 +18,7 @@ hooks:
       description: "tasks.md 已有勾选时不得重生成（续跑保护）"
       enabled: true
       optional: true
-      prompt: "先看 FEATURE_DIR/tasks.md：若已存在且含勾选（- [x] / - [X]，大小写不敏感）→ 停下询问用户「续跑还是重生成」，本仓默认续跑——按 /module-dev 步骤 0 分流表从首个未完成任务继续，不得整体重生成、不得重做已勾选任务；若三件输入（颗粒度文档 / spec.md / plan.md）确有变化 → 只允许追加式修订（/speckit-converge 口径），并按软门禁停车裁决。若 tasks.md 不存在或全未勾选 → 忽略本条，照常生成。"
+      prompt: "先看 FEATURE_DIR/tasks.md：若已存在且含勾选（- [x] / - [X]，大小写不敏感），按 /module-dev 步骤 0 自动续跑首个未完成任务，不重复询问续跑或重生成，不得整体重生成或重做已勾选任务。输入变化先由 AI 区分：已审范围内的派生修正追加记录、复跑 analyze 并更新冻结基线；模块卡范围、公共契约、权限或验收语义变更返回人工 review ①。缺少实际人审依据不得推进。若 tasks.md 不存在或全未勾选，照常生成并由 AI 比对，不设 tasks 人工停点。"
 
   after_implement:
     - extension: "collect-closeout"

@@ -10,7 +10,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// 本文件是命令面内置工具 `shell`（技术方案 §6.2、契约 §5.2）：把模型给的「可执行名 + 参数
+// 本文件是命令面内置工具 `shell`（技术方案 §4.2、契约 §5.2）：把模型给的「可执行名 + 参数
 // 数组」交给受控执行器跑一次。两条纪律贯穿全篇：① 授权只经 **core.Policy 接口**判定、
 // 执行只经 **core.CommandRunner 接口**（授权与执行分离，宪法 VI）——本文件不出现任何具体
 // 策略 / 执行实现，argv 形态与脚本范围校验归执行侧；② executable 与 arguments **分开传**，

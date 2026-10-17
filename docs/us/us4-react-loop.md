@@ -836,7 +836,7 @@ func TestReActLoop_NoGoroutineLeakOnCancel(t *testing.T) {
 2. **`RunID` 形态**：`<channel>-<unix_millis>-<6 位 base36 小写>`（契约 §5 定"随机 6 位"，取值域本文冻结：`crypto/rand` 取 6 字符 `0-9a-z`）。
 3. **`chat` 交互循环终止语义**：stdin EOF → 正常退出（退出码 0）；`--message` → 单条即退；Ctrl-C → 该次 Run `cancelled`（打印 `已取消`）→ **进程退出**（退出码 0——取消是预期动作而非错误）；每次 Run 建 **60s** deadline（§2.4 注 7）。
 4. **`chat` 渲染**：单轮回复直接打正文；工具调用期间打印一行 `⚙ 调用工具 <name>…`（**不打印入参与结果全文**——脱敏纪律约束 26）；失败打印 `✗ <四段式/错误文本>`；`limit_reached` / `cancelled` 打印醒目提示 + 已得部分结果（契约 §1.3）。
-5. **`session list` 渲染**：一行一会话 `<id>：<消息数> 条（最后活动 <2006-01-02 15:04:05>）`；末尾汇总 `共 N 个会话`；空 → `未发现会话`。时刻一律按 **UTC** 呈现（`.UTC()`，**不得**对时间值调本地时区方法——`.Local()` 与 `time.Local` 是同一条禁令的两种写法，见[工程规范 §1.6](EngineeringStandards.md)；2026-10-16 用户裁决），命令帮助文案与本节一并注明 UTC。
+5. **`session list` 渲染**：一行一会话 `<id>：<消息数> 条（最后活动 <2006-01-02 15:04:05>）`；末尾汇总 `共 N 个会话`；空 → `未发现会话`。时刻一律按 **UTC** 呈现（`.UTC()`，**不得**对时间值调本地时区方法——`.Local()` 与 `time.Local` 是同一条禁令的两种写法，见[工程规范 §1.6](../EngineeringStandards.md)；2026-10-16 用户裁决），命令帮助文案与本节一并注明 UTC。
 6. **日志键**（固定）：工具执行 WARN = `run_id` / `session_id` / `tool` / `reason` / `detail`；审计写失败 ERROR = `run_id` / `store`（`llm_calls` / `tool_invocations`）/ `op`（`start` / `finish`）；恢复 INFO = `unknowns` / `repaired_groups` / `closed_runs`；快照 INFO/Debug = `agent` / `hash` / `files`（清单条数）。
 7. **截断标记形态**：结果超（生效的）`MaxOutputBytes` → content 尾部追加 `\n[已截断：输出超过 <N> 字节上限，此处不是完整输出]`（N = 生效上限）；审计侧在既有 `result_json` 内写 `"truncated": true`。**不承诺**"原始长度 N 字节"——读取中限流意味着从未读完整输出，报不出精确原始长度。
 8. **`runs.trigger` 映射**（契约 §1.1 的 `RunRequest` 无 `Trigger` 字段，且**不得**加字段）：按 `Channel` 映射——`cli` → `user`；`web` → `api`；`scheduler` → `cron`；`admin` → `manual`。

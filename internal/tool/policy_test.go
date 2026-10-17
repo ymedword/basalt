@@ -14,7 +14,7 @@ import (
 )
 
 // 本文件是授权判定的关键回归用例（颗粒度文档 §3.2 的 policy_test.go 十八例，F1~F18，
-// 判据面 = 技术方案 §6.5 授权矩阵 + §2.3 流程 F）。沙箱的**授权**与**执行**分离：
+// 判据面 = 技术方案 §4.3 授权矩阵 + §2.3 流程 F）。沙箱的**授权**与**执行**分离：
 // 本文件只判"谁、要碰什么"，argv 形态与脚本真实路径属执行侧（runner_test.go）。
 // Authorization regressions: the matrix is judged here, execution shape belongs to the runner.
 

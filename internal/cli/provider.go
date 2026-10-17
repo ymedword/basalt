@@ -37,7 +37,7 @@ func newProviderCommand(deps Deps) *cobra.Command {
 // newProviderListCommand 组装 provider list。
 // newProviderListCommand builds provider list.
 //
-// 轻路径（技术方案 §8.7）：只读配置文件——**不开库、不取实例锁、不做恢复、不构造
+// 轻路径（技术方案 §6.1.2）：只读配置文件——**不开库、不取实例锁、不做恢复、不构造
 // 客户端**，故 Deps 里的两个端口在这一路上一次都不碰（判卷侧干脆注入 nil：任何
 // 意外的开库动作都会当场 panic 而不是悄悄通过）。
 // A light path: it reads the configuration file only and never touches the store

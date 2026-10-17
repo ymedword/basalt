@@ -11,7 +11,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 )
 
-// baseConfig 是一份最小可用配置：凭证走 ${DEMO_KEY} 占位（需求 §5.13）。
+// baseConfig 是一份最小可用配置：凭证走 ${DEMO_KEY} 占位（需求文档 §5.2）。
 // baseConfig is a minimal valid configuration whose credential is a placeholder.
 const baseConfig = `http:
   addr: "127.0.0.1:8080"

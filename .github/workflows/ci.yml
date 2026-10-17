@@ -3,7 +3,7 @@ name: CI
 # 双 job 的拆分理由是 CGO 状态相反，不是"跑得快"：
 #   test  job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
 #   build job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
-# 参见 docs/AiProgrammingGuide.md §3.2 的"三条实测纪律"。
+# 参见 docs/DevelopmentLoop.md §2.2 的"三条实测纪律"。
 #
 # 触发面覆盖**所有分支**（`'**'` 只匹配分支、不匹配 tag）：US 分支一推即判卷，
 # 问题在分支阶段暴露，而不是等合回 main 才发现——US-4 的 runner_unix.go 就吃过这个亏
@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   test:
+    # 名称是 main 分支保护的必过检查（contexts 逐字匹配），**不得**改名。
+    # This exact name is a required status check on main; renaming it blocks every PR.
     name: test（默认 CGO：fmt / lint / sec / test / test-integration / cover）
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +36,7 @@ jobs:
       # 注意传给 go install 的是**含 /cmd/... 的安装路径**（module 路径另算）。
       # gosec **不得**用 `go install ...@v2.29.0`：它带的 x/tools v0.49.0 读不了 Go 1.27 的
       # 导出数据（版本 5 > 最高支持 4），扫描会静默降级成只判语法树、类型相关规则整批失效。
-      # 配方因此固定 x/tools v0.50.0，依据与探针读数见 docs/GettingStarted.md §2.5。
+      # 配方因此固定 x/tools v0.50.0，依据与探针读数见 docs/DevelopmentLoop.md §10.2.5.1。
       - name: Install check tools
         run: |
           go install mvdan.cc/gofumpt@v0.12.0
@@ -46,20 +48,40 @@ jobs:
           go get golang.org/x/tools@v0.50.0
           go build -o "$(go env GOPATH)/bin/gosec" github.com/securego/gosec/v2/cmd/gosec
 
-      - name: Gate (fmt / lint / sec / test / test-integration / cover)
-        run: make fmt lint sec test test-integration cover
+      - name: Unified acceptance (mandatory fake-model evals; explicit real-model skip)
+        # 控制台输出也落盘：报告被中断/覆盖时，console 是唯一的逐条进度证据。
+        # Keep the console stream as evidence too, not only report.json.
+        run: |
+          set -o pipefail
+          mkdir -p .loop/runs
+          sh scripts/check-acceptance.sh --profile ci --out .loop/runs/ci 2>&1 | tee .loop/runs/ci-console.log
+
+      - name: Upload acceptance evidence (including failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-evidence
+          # 整目录上传（报告 / 逐检查日志 / 评测报告 / console），缺文件即判红。
+          # Upload the whole runs tree; an empty artifact means evidence was lost.
+          path: .loop/runs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
       # tzdata 隔离组**必跑**（不入 make check）：默认层在装有系统时区的机器上
       # 没有判别力，只有真删掉系统数据与 GOROOT 的 zoneinfo.zip 才成立。
       # 删后**断言不存在**（fail-closed）：删不动就只能判红，不能静默降级成"没隔离也算过"。
       # 容器里跑 go test 需要拉依赖，故代理用默认值（runner 可直连 proxy.golang.org）。
       - name: tzdata isolated check
+        # 具名 PASS 事件是判据：退出码 0 也可能意味着 -run 没匹配到任何测试。
+        # A named pass event is required; exit 0 alone can mean the filter matched nothing.
         run: |
           docker run --rm -v "$PWD":/src -w /src golang:1.27.2 bash -c '
-            set -e
+            set -eo pipefail
             rm -rf /usr/share/zoneinfo "$(go env GOROOT)/lib/time/zoneinfo.zip"
             test ! -e /usr/share/zoneinfo && test ! -e "$(go env GOROOT)/lib/time/zoneinfo.zip"
-            go test -tags=tzisolated ./cmd/basalt -run "TestTZData_Isolated" -count=1
+            go test -tags=tzisolated -json ./cmd/basalt -run "^TestTZData_Isolated$" -count=1 | tee /tmp/tz.json
+            grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_Isolated\"" /tmp/tz.json
           '
 
   build:
@@ -106,6 +128,12 @@ jobs:
             *"not a dynamic executable"*) echo "ldd: ok（无动态依赖）" ;;
             *) echo "ldd 输出无法确认静态（预期 not a dynamic executable）：$out" >&2; exit 1 ;;
           esac
+
+      # 验收工具也按 Windows 目标编译：它**不**在产品四目标内，
+      # 只在 Linux 上跑测试会漏掉 windows 构建标签与 syscall 用法。
+      # Compile the acceptance tool for Windows even when checks run on Linux.
+      - name: Cross-compile development harness for Windows
+        run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /tmp/acceptance-windows.exe ./scripts/acceptance
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

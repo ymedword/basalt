@@ -2,11 +2,13 @@
 
 > 本文档是 Basalt 运行时契约的**配置与工具**篇：`AGENT.md` frontmatter 的完整字段规范，以及全部内置工具的模型可见契约（名称 / 参数 JSON Schema / 返回与失败语义）。
 >
-> 与 [技术方案](../TechnicalSolution.md) §6（Tool 体系）、§11（工作区与 Agent 目录）冲突时以技术方案为准。本文档中的字段名、工具名、参数名、返回文本是固定字面量，**不得**在实现中改写。
+> 与 [技术方案](../TechnicalDesign.md) §4（外部动作与工具）、§3（工作区与 Agent 目录）冲突时以技术方案为准。本文档中的字段名、工具名、参数名、返回文本是固定字面量，**不得**在实现中改写。
 >
-> **文档状态**：待验证设计草案（冻结条件：五链路原型验证通过 + 双底座样例加载实测，见 [AiProgrammingGuide.md](../AiProgrammingGuide.md) §3.4）。
+> **文档状态**：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返 + **双底座样例加载实测**——两个基座各装载 [Compatibility.md](../Compatibility.md) §5 的样例，见 [DevelopmentLoop.md](../DevelopmentLoop.md) §5.2）。
 >
-> **参数兼容口径**（与 NivroOS 基线 commit `50e1b30` 对照，见 [Compatibility.md](../Compatibility.md) §2.2）：两底座**共有**的工具，其**共有参数名与必填性逐字一致**（含 `save_memory` 的 `scope`、`http_post` 的 `body` 必填）；Basalt 新增的参数一律标注「**扩展**」，不改变共有参数的含义。NivroOS 的 Agent 迁移过来时，`tools:` 声明与调用语法不需改动。
+> **参数稳定性**：工具名称、参数名、类型和必填性以本文为准（含 `save_memory.scope`、`http_post.body`）。标注“扩展”的可选参数保留既有缺省语义；修改公开参数必须同步实现、测试与变更记录。外部资产兼容范围单独见 [Compatibility.md](../Compatibility.md)。
+>
+> **基线**：本文所称“基线”指 NivroOS 在 commit `50e1b30` 的已交付行为；对照范围与差异裁决见 [Compatibility.md](../Compatibility.md) §1 / §2。
 
 ---
 
@@ -102,27 +104,27 @@ schedules:
 | `zone` | string | 否 | `UTC` | IANA 时区名；**不得**回落服务器本地时区 |
 | `message` | string | **是** | — | 到点发给该 Agent 的消息（等价于人推的一条用户消息） |
 
-### 3.1 cron 公共子集（与 NivroOS 可互换的范围）
+### 3.1 cron 支持语法与时区
 
-**6 段制式不代表语法等价**。两底座可互换的表达式限于**公共子集**：
+**6 段制式不代表所有解析器语法等价**。Basalt 的支持范围与样例约束如下：
 
-| 语法 | 公共子集内 | 说明 |
+| 语法 | 支持 / 样例约束 | 说明 |
 | --- | --- | --- |
 | `*` 通配 | 是 | |
 | 数字 `5` | 是 | |
 | 范围 `1-5` | 是 | |
 | 列表 `1,3,5` | 是 | |
 | 步长 `*/5`、`1-30/5` | 是 | |
-| 月/周缩写 `JAN`、`MON` | 是 | 两侧均支持 |
-| 星期 `7` | **否** | Spring 认 7 = Sunday；robfig/cron 合法域 0–6 → **用 0** |
-| `L`（最后一天） | **否** | Spring 支持，robfig 不支持 |
-| `W`（最近工作日） | **否** | 同上 |
-| `#`（第 N 个星期几） | **否** | 同上 |
-| **`dom` 与 `dow` 同时被限定** | **否** | Spring 取**交集**（AND，两者都满足才触发）；robfig 取**并集**（OR，任一满足即触发）——**硬性规则：至少一个是裸 `*`** |
+| 月/周缩写 `JAN`、`MON` | 是 | 按解析器支持的名称填写 |
+| 星期 `7` | **否** | 合法域为 0–6；Sunday **用 0** |
+| `L`（最后一天） | **否** | 当前解析器不支持 |
+| `W`（最近工作日） | **否** | 当前解析器不支持 |
+| `#`（第 N 个星期几） | **否** | 当前解析器不支持 |
+| **`dom` 与 `dow` 同时被限定** | **不纳入样例** | 解析器取**并集**（OR，任一满足即触发）；样例**硬性规则：至少一个是裸 `*`** |
 
-**每任务时区**：Basalt 侧经 `CRON_TZ=<zone>` 前缀实现（`robfig/cron` v3.0.1 无 `parser.WithLocation`，时区是**调度器级** `cron.WithLocation` 或**任务级** `TZ=`/`CRON_TZ=` 前缀）。装载时把 `zone` 字段转成前缀，Agent 配置形态与 NivroOS 逐字相同。
+**每任务时区**：Basalt 侧经 `CRON_TZ=<zone>` 前缀实现（`robfig/cron` v3.0.1 无 `parser.WithLocation`，时区是**调度器级** `cron.WithLocation` 或**任务级** `TZ=`/`CRON_TZ=` 前缀）。装载时把 `zone` 字段转成前缀，公开配置仍使用 `zone` 字段。
 
-**验收样例**（两个底座各从**同一固定起点**——2026-10-01T00:00:00Z——跑一遍，未来 10 次触发时间必须逐条相同；**不得**用"当前时间"作起点）：
+**验收样例**（从**固定起点** 2026-10-01T00:00:00Z 计算未来 10 次触发，断言时间与预期；**不得**用“当前时间”作起点）：
 
 ```text
 cron = "0 0 8 * * *"     zone = Asia/Shanghai   → 每天 08:00:00 +08:00
@@ -130,9 +132,9 @@ cron = "0 30 23 * * 0"   zone = UTC             → 每周日 23:30:00 UTC
 cron = "0 0 */6 * * *"   zone = Asia/Shanghai   → 每 6 小时整点
 ```
 
-**已知差异例（不得用于对拍、不得写进样例 `AGENT.md`）**：`0 15 9 1-7 * 1`（Asia/Shanghai）——`dom` 与 `dow` 同时受限，恰好落在两底座语义不同的地方：以固定起点 2026-10-01（北京）实测，Spring（AND）第一次触发为 **2026-10-05 09:15 +08:00**；robfig（OR）预期为 2026-10-01 09:15 +08:00（待原型期实跑确认）。详细读数与对拍程序见 [Compatibility.md](../Compatibility.md) §5.2。
+**歧义防护例（不得写进公开样例 `AGENT.md`）**：`0 15 9 1-7 * 1`（Asia/Shanghai）同时限定日与星期，必须按 OR 语义理解，不能误读成“每月首个周一”。以 2026-10-01 北京时间零点为起点，首个预期触发是当日 09:15；实现读数需由解析器测试确认。跨实现差异与对拍程序只在 [Compatibility.md](../Compatibility.md) §5.2 维护。
 
-DST 边界例（`America/New_York`，2027-03-14 跳 02:00–03:00）：`0 30 2 * * *` 在该日的行为**必须实测、不得推断**——两底座**各自测出什么就记什么**；若两侧不同，登记为已知差异并移出公共子集（同 Compatibility.md §5.2）。
+DST 边界例（`America/New_York`，2027-03-14 跳 02:00–03:00）：`0 30 2 * * *` 在该日的行为**必须实测、不得推断**；跳过和重复时段分别留证，固定预期后再纳入回归。兼容性结论不由本节的单侧读数自动推导。
 
 ---
 
@@ -175,7 +177,7 @@ type ToolCall struct {
       → 供应商报"tool_call 无对应结果"，HTTP 400
 ```
 
-裁剪顺序：从最早的组开始整组丢弃，直到满足 `max_history_turns` 与 token 预算。**核心记忆区永不裁剪**（见技术方案 §5）。
+裁剪顺序：从最早的组开始整组丢弃，直到满足 `max_history_turns` 与 token 预算。**核心记忆区永不裁剪**（见技术方案 §3.5）。
 
 ---
 
@@ -183,7 +185,7 @@ type ToolCall struct {
 
 工具名与参数名是**模型可见契约**：改字面量等于改调用方式。
 
-**扩展标注约定**：表格「必填」列带 **扩展** 标记的行是 Basalt 相对 NivroOS 基线**新增**的参数——基线没有它，模型不传也能跑（有缺省值）；共有参数**不带**标记，其名称 / 类型 / 必填性与基线逐字一致。**不得**把扩展参数加进共有参数的含义里（例如不得让扩展的 `timeout_seconds` 改变 `arguments` 的传递方式）。
+**扩展标注约定**：表格“必填”列带 **扩展** 的行表示可选增强参数，不传时使用已定义缺省值。该标记保留现有契约分类；它不授权修改其他参数的含义，例如 `timeout_seconds` 不得改变 `arguments` 的传递方式。
 
 ### 5.1 FileTools（3 个）
 
@@ -197,7 +199,7 @@ type ToolCall struct {
 失败：`not_found`（文件不存在）/ `sandbox_denied`（路径越界）/ `runtime_error`（不可读）。
 上限：单文件 256 KB，超出返回可读错误（提示用 `shell` 工具处理大文件）。
 
-**读范围**：当前 Agent 自己的目录 + `.basalt/skills`（技能 L2 必需）。**跨 Agent 读取默认被拒**——读别的 Agent 目录需管理员在 `sandbox.cross_agent_read` 显式列出该 Agent 名（缺省空 = 一个都不许），技术方案 §6.5。
+**读范围**：当前 Agent 自己的目录 + `.basalt/skills`（技能 L2 必需）。**跨 Agent 读取默认被拒**——读别的 Agent 目录需管理员在 `sandbox.cross_agent_read` 显式列出该 Agent 名（缺省空 = 一个都不许），技术方案 §4.3。
 
 #### write_file
 
@@ -208,7 +210,7 @@ type ToolCall struct {
 
 返回：写入字节数。
 失败：`sandbox_denied`（越界、或目标是 `AGENT.md` / 技能库与 `scripts/` **只读区**）。
-约束：写入范围 = **当前 Agent 自己的目录**（详见技术方案 §6.5），其中 `scripts/` 子目录**只读**（代码常量拒绝——脚本受控通道的前提是模型改不动脚本，见 §5.2）；父目录不存在时**不**自动创建。
+约束：写入范围 = **当前 Agent 自己的目录**（详见技术方案 §4.3），其中 `scripts/` 子目录**只读**（代码常量拒绝——脚本受控通道的前提是模型改不动脚本，见 §5.2）；父目录不存在时**不**自动创建。
 
 #### list_dir
 
@@ -234,7 +236,7 @@ type ToolCall struct {
 
 **argv 契约（不得违反）**：`executable` 与 `arguments` **分开传**，进程 argv 直执、**不经任何 shell 解释**。**不得**传 `bash -c "……"`，也**不得**把参数拼进可执行名——`git status; curl evil.com` 这类串接在 argv 契约下不可能执行。
 工作目录：有 Agent 上下文且目录存在 → 该 Agent 自己的目录；无上下文 → 进程默认 CWD。
-环境变量：只透传白名单变量（见技术方案 §6.5），**不**继承调用进程完整环境。
+环境变量：只透传白名单变量（见技术方案 §4.3），**不**继承调用进程完整环境。
 
 **解释器受控通道（`shell.interpreters`）**：解释器（`python3` / `node` 等）**可以**被放行，但形态受硬约束——argv **必须**是 `[<脚本路径>, <参数…>]`：`arguments[0]` 是脚本路径、**不得**以 `-` 开头（`-c` / `-m` / `-e` 这类内联代码形态一律拒），脚本的真实路径（软连接投影后）**必须**落在该 Agent 的 `scripts/` 或 `.basalt/skills/` 内。`scripts/` 对模型 `write_file` **只读**（代码常量拒绝）——脚本约束的前提是模型改不动脚本。`bash` / `sh` **不得**放行（等于把解释层请回来）。解释器进程拥有**宿主同等权限**，容器化隔离属扩展阶段（见 Roadmap.md F 方向）。
 
@@ -289,7 +291,7 @@ type ToolCall struct {
 失败：无命中返回成功 + 空结果（不报错）。
 **契约语义**：按整串 `contains` 匹配，**不分词、不扩展、不向量化**。命中条件是**连续子串**：条目原文里含该连续短语（条目写着 `SQLite 方案 评估`）**会命中**；几个词分散在条目各处、只是"都出现过"（该条分别含 `SQLite` 与 `评估`，但从不连排）**不会**自动组合命中——这是已知行为，不是缺陷。参数仍要求**单个关键词**。
 
-> **2026-10-17 澄清**：本节此前写作"传多词短语**必不命中**"，与 `contains` 语义不符（连续短语在 `strings.Contains` / `instr` 下必然命中）。语义以本段为准：**整串子串匹配、不分词不扩词**；连续短语能命中、分散词不自动组合。同一句在 [Compatibility.md](../Compatibility.md) §2.2、[AiProgrammingGuide.md](../AiProgrammingGuide.md) §7 陷阱 11、[Roadmap.md](../Roadmap.md) B 方向与 M2 已同步改写；渲染测试**不得**钉"多词必不命中"，改钉"连续短语命中 / 分散词不命中"两态。
+> **2026-10-17 澄清**：本节此前写作"传多词短语**必不命中**"，与 `contains` 语义不符（连续短语在 `strings.Contains` / `instr` 下必然命中）。语义以本段为准：**整串子串匹配、不分词不扩词**；连续短语能命中、分散词不自动组合。同一句在 [Compatibility.md](../Compatibility.md) §2.2、[DevelopmentLoop.md](../DevelopmentLoop.md) §7 陷阱 11、[Roadmap.md](../Roadmap.md) B 方向与 M2 已同步改写；渲染测试**不得**钉"多词必不命中"，改钉"连续短语命中 / 分散词不命中"两态。
 
 ### 5.5 NotifyTools（1 个）
 
@@ -321,7 +323,7 @@ type ToolCall struct {
 
 **作用域硬边界**：只能改**当前 Agent 自己**的 `schedules:` 段（身份取自运行时上下文，**不**来自入参）；无 Agent 上下文一律拒绝。改动经与页面编辑器、脚手架创建**同一道**注册写入门（先验后写），不另立解析路径。
 
-> 该工具是相对 NivroOS 基线的**补齐项**：NivroOS 已有此工具（第 10 个），Basalt v0.1 同步交付——否则声明它的 Agent 在 Basalt 上会因 `tool not registered` **整只不注册**，破坏 `AGENT.md` 可互换这条核心承诺。
+> 该工具属于 Basalt v0.1 的任务管理能力：只修改当前 Agent 的 `schedules:`，与页面编辑器共用写入校验。声明该工具但注册池没有它时，该 Agent 以 `tool not registered` 整只不注册。
 
 ---
 
@@ -355,5 +357,5 @@ type ToolCall struct {
 | Run 状态机 / 并发 / 取消 / 崩溃恢复 / 错误码 | [run-and-errors.md](run-and-errors.md) |
 | 数据库结构（会话 / 消息 / 审计 / 快照） | [schema.sql](schema.sql) |
 | REST 端点与信封 | [openapi.yaml](openapi.yaml) |
-| 与 NivroOS 的逐项差异 | [Compatibility.md](../Compatibility.md) |
-| 沙箱与授权边界（Policy / Runner） | [技术方案](../TechnicalSolution.md) §6.5 |
+| 兼容性、迁移与历史对照 | [Compatibility.md](../Compatibility.md) |
+| 沙箱与授权边界（Policy / Runner） | [技术方案](../TechnicalDesign.md) §4.3 |

@@ -48,7 +48,7 @@ type ProviderRef struct {
 // implementation and is parsed but never validated here.
 type Channel struct {
 	Name   string         // channels[].name
-	Config map[string]any // channels[].config（技术方案 §11.2 样例形态；本 US 只解析不校验）
+	Config map[string]any // channels[].config（技术方案 §3.1.3 样例形态；本 US 只解析不校验）
 }
 
 // Settings 是运行参数上限；两字段经指针保留"显式 0"（不得写 if v == 0 { v = 10 } 形态）。

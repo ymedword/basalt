@@ -10,7 +10,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// 本文件是两件记忆工具（save_memory / recall_memory，契约 §5.4、技术方案 §5.1 契约 5）。
+// 本文件是两件记忆工具（save_memory / recall_memory，契约 §5.4、技术方案 §3.5.1 契约 5）。
 // 三条纪律贯穿全篇：① 作用域**只在工具层解析**且只取 `env.AgentName`——模型不得传
 // `agent_name`、工具不得从路径或包级状态反推（FR-021；空名 = 无 Agent 上下文 = 全局层，
 // 是正常取值不是异常）；② 工具**不持有 Policy / CommandRunner**（颗粒度文档 §2.4 注 3）：

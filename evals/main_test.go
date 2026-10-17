@@ -29,6 +29,28 @@ import (
 // 装载与校验
 // ---------------------------------------------------------------------------
 
+// TestMainRun_IsolatesResults exercises the CLI through the real runtime with a fake model.
+func TestMainRun_IsolatesResults(t *testing.T) {
+	root := t.TempDir()
+	cases := filepath.Join(root, "cases")
+	require.NoError(t, os.Mkdir(cases, 0o700))
+	writeCaseFile(t, cases, "case.yaml", fakeCaseYAML("isolated-cli", nil))
+	t.Chdir(root)
+	out := filepath.Join(root, "separate-results")
+	require.Zero(t, mainRun([]string{"--cases", cases, "--results", out}, io.Discard, io.Discard))
+	files, err := filepath.Glob(filepath.Join(out, "*.json"))
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	var rpt report
+	raw, err := os.ReadFile(files[0])
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &rpt))
+	require.Equal(t, 1, rpt.Totals.Passed)
+	require.Zero(t, rpt.Totals.Skipped)
+	_, err = os.Stat(resultsDirName)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 // TestLoadCases_LoadsInFilenameOrder 中文验收点：用例执行序**确定**（按文件名排序装载），
 // 与目录读取序无关；非 *.yaml 的文件不参与装载。
 func TestLoadCases_LoadsInFilenameOrder(t *testing.T) {

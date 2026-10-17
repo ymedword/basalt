@@ -263,7 +263,7 @@ func TestChat_RendersEveryTurnWithoutLeakingToolIO(t *testing.T) {
 		require.NoError(t, run.err, "stderr=%s", run.stderr)
 		assert.Contains(t, run.stdout, "⚙ 调用工具 read_file…", "工具调用一行提示，名字逐字")
 		assert.Contains(t, run.stdout, "文件里写的是 42。", "单轮回复直接打正文")
-		assert.NotContains(t, run.stdout, argsMarker, "入参不得上屏（需求 §5.13 脱敏纪律）")
+		assert.NotContains(t, run.stdout, argsMarker, "入参不得上屏（需求文档 §5.2 脱敏纪律）")
 		assert.NotContains(t, run.stdout, bodyMarker, "工具结果全文不得上屏")
 	})
 

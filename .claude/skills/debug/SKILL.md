@@ -24,7 +24,7 @@ $ARGUMENTS
   时，写码的软 / 硬门禁照 `/module-dev` 执行；本 skill 只管「找到根因 + 最小修复」
   的方法与取证。
 - **不自动** commit / push；**不得**改测试判据让红变绿（测试纪律见
-  `docs/AiProgrammingGuide.md` §8.2）。
+  `docs/DevelopmentLoop.md` §6.2）。
 
 ## 总则（不可违背）
 
@@ -45,7 +45,7 @@ $ARGUMENTS
 
 ## 步骤 0：先查已知坑
 
-扫 `docs/AiProgrammingGuide.md` §7 陷阱表（每条带「怎么发现」与「怎么复核」）：
+扫 `docs/DevelopmentLoop.md` §7 陷阱表（每条带「怎么发现」与「怎么复核」）：
 
 - **命中** → 按该条的「修复与复核」路径走，并跑它的复核命令确认真修掉；
 - **未命中** → 进四阶段。
@@ -78,7 +78,7 @@ $ARGUMENTS
 
 ### 阶段 3：假设与验证
 
-1. 写下**一个**具体假设：「我认为 <X> 导致 <Y>，因为 <Z>」；假设与结论**逐条
+1. 写下**一个**具体假设：「我认为 `X` 导致 `Y`，因为 `Z`」；假设与结论**逐条
    追加**进 run-state.md 失败台账（一行一次尝试：日期 / 假设 / 结果 / 同题计数）；
 2. 用**最小变更**验证（改一行 / 加一条断言 / 临时打印），一次一个；
 3. 与预期比对：成立 → 进阶段 4；不成立 → **回到阶段 1** 用新信息重新调查，
@@ -107,9 +107,9 @@ $ARGUMENTS
 ## 项目配置区（复制本 skill 到新项目时只改本节）
 
 - 门禁命令：`make check`（= fmt lint sec test test-integration cover build 七目标
-  聚合；Makefile 由 US-1 交付，未落地前按 `docs/AiProgrammingGuide.md` §3.2
+  聚合；Makefile 由 US-1 交付，未落地前按 `docs/DevelopmentLoop.md` §2.2
   命令序直跑）
-- 项目纪律：`docs/AiProgrammingGuide.md` §8.2（测试纪律 / 完成证据 / 审查回执）；
+- 项目纪律：`docs/DevelopmentLoop.md` §6.2（测试纪律 / 完成证据 / 审查回执）；
   陷阱表 §7
 - 本机纪律：`GOPROXY=https://goproxy.cn`；`go test -race`（需 CGO）与
   `CGO_ENABLED=0` 构建**分属不同命令**；build tag 集成测试须 `-tags=integration`

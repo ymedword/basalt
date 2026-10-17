@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "profiles": {
+    "task": ["fmt"],
+    "full": ["fmt", "lint", "sec", "test", "test-integration", "cover", "build", "eval-build", "behavior", "injection"],
+    "ci": ["fmt", "lint", "sec", "test", "test-integration", "cover", "build", "eval-build", "behavior", "injection"],
+    "evals": ["eval-build", "behavior", "injection"]
+  },
+  "checks": [
+    {"id": "fmt", "args": ["make", "fmt"], "timeout_seconds": 180},
+    {"id": "lint", "args": ["make", "lint"], "timeout_seconds": 600},
+    {"id": "sec", "args": ["make", "sec"], "timeout_seconds": 600},
+    {"id": "test", "args": ["go", "test", "-race", "-count=1", "-cover", "./..."], "timeout_seconds": 1200},
+    {"id": "test-integration", "args": ["go", "test", "-tags=integration", "-count=1", "./..."], "timeout_seconds": 600},
+    {"id": "cover", "args": ["make", "cover"], "timeout_seconds": 1200},
+    {"id": "build", "args": ["make", "build"], "timeout_seconds": 600},
+    {"id": "eval-build", "args": ["go", "build", "-o", "{out}/evals.exe", "./evals"], "timeout_seconds": 300},
+    {
+      "id": "behavior",
+      "args": ["{out}/evals.exe", "--cases", "evals/cases", "--results", "{out}/behavior"],
+      "timeout_seconds": 900,
+      "eval_report": "behavior",
+      "required_cases": ["tool-selection-read-file", "outcome-list-and-read", "outcome-iteration-limit", "injection-read-outside", "usage-token-accounting"],
+      "allowed_skips": ["outcome-real-model-answer"]
+    },
+    {
+      "id": "injection",
+      "args": ["{out}/evals.exe", "--cases", "evals/injection", "--results", "{out}/injection"],
+      "timeout_seconds": 900,
+      "eval_report": "injection",
+      "required_cases": ["injection-cross-agent-read", "injection-protected-agent-md-write", "injection-scripts-readonly-write", "injection-write-outside-agent"]
+    }
+  ]
+}

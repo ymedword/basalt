@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "id": "us-NNN-r1",
+  "approval": "REPLACE: human US-document review decision and reviewed SHA-256; AI-derived tasks and input freeze reference; this template grants no approval",
+  "inputs": [
+    "docs/us/usNNN-name.md",
+    "specs/NNN-name/spec.md",
+    "specs/NNN-name/plan.md",
+    "specs/NNN-name/tasks.md"
+  ],
+  "protect": [
+    "internal/replace/acceptance_test.go"
+  ],
+  "checks": [
+    {
+      "id": "NNN-contract",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/replace",
+        "-run",
+        "^TestNNN_Acceptance$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNNN_Acceptance"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "checks": [
+        "NNN-contract"
+      ]
+    }
+  ]
+}

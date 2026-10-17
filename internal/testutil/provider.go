@@ -24,7 +24,7 @@ type FakeStep struct {
 }
 
 // FakeProvider 是 core.ProviderClient 的固定假实现：按脚本回放响应 / 错误、记录收到的请求、
-// 支持阻塞到 ctx 取消（取消路径用例）。编程指南 §8.3 第 2 项：假 Provider 随 US-2 接口落位、后续 US 复用。
+// 支持阻塞到 ctx 取消（取消路径用例）。开发操作 §8.1 第 2 项：假 Provider 随 US-2 接口落位、后续 US 复用。
 // FakeProvider is the scripted fake implementation of core.ProviderClient: it replays
 // responses and errors, records the requests it received, and can block until the
 // context is done for cancellation paths.
@@ -132,7 +132,7 @@ type FakeOpenAIResponse struct {
 }
 
 // FakeOpenAIServer 是 OpenAI 兼容协议的回环假服务：按脚本回放 HTTP 状态与响应体，
-// 并**记录收到的请求体**（编程指南 §8.4 第 3 项的双向断言口径——遇预期之外的请求即失败，
+// 并**记录收到的请求体**（开发操作 §5.3 第 3 项的双向断言口径——遇预期之外的请求即失败，
 // 专防"库记录齐了、发给模型的协议错了"）。
 // FakeOpenAIServer is a loopback fake of the OpenAI-compatible protocol: it replays
 // HTTP statuses and bodies and records the request bodies it received. Requests that

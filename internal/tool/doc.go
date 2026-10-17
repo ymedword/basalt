@@ -15,7 +15,7 @@
 //     返回值"，**不**写审计行、**不**写会话消息——审计的两阶段写与失败分类归调度方
 //     与仓储。
 //
-// 授权矩阵摘要（面向实现者；逐条判据与配置键见技术方案 §6.5「授权矩阵」）：
+// 授权矩阵摘要（面向实现者；逐条判据与配置键见技术方案 §4.3「授权矩阵」）：
 //   - 判据只看"谁、要碰什么"：Action 的 Type / Target / Agent 三项；"打算怎么做"
 //     （命令行参数、执行细节）不携带授权；
 //   - 文件读：可读根 = 当前 Agent 自己的目录 + 技能库；跨 Agent 读取须显式授权
@@ -31,7 +31,7 @@
 // 拒绝是模型可见契约：一律返回四段式文案（规则 / 目标 / 出处 / 放行指引），放行
 // 指引点名配置键（契约 agent-md.md §6）。
 //
-// 执行控制摘要（面向实现者；设计原文见技术方案 §6.5「执行控制」）：子进程**不得**
+// 执行控制摘要（面向实现者；设计原文见技术方案 §4.3「执行控制」）：子进程**不得**
 // 继承调用进程完整环境（只透传配置列出的变量）；超时 / 取消终止**整棵进程树**
 // （Windows 走 Job 对象、Unix 走进程组，"启动与关联之间"的窗口必须消除）；输出
 // 边读边受上限约束、截断只记生效上限；argv 直执，**不经**任何 shell 解释。
@@ -42,8 +42,8 @@
 // 逐字口径的出处（本文件不复制其正文）：
 //   - 内置工具入参 / 出参 / 失败类别：docs/contracts/agent-md.md §5.1；
 //   - 拒绝信息四段式：docs/contracts/agent-md.md §6；
-//   - 授权矩阵与执行控制的设计原文：docs/TechnicalSolution.md §6.5；
-//   - 工具接口与工具池组装：docs/TechnicalSolution.md §6.1。
+//   - 授权矩阵与执行控制的设计原文：docs/TechnicalDesign.md §4.3；
+//   - 工具接口与工具池组装：docs/TechnicalDesign.md §4.1。
 //
 // The package currently ships the tool registry (explicit registration, duplicate
 // rejection, stable name order), the v1 whitelist policy, the v1 command runner
@@ -56,6 +56,6 @@
 // Refusals are model-facing and always four-part (rule / target / source /
 // guidance) per contract agent-md.md §6. Failure classification lives in the
 // caller (contract run-and-errors.md §7.3); this package only returns errors and
-// results. See docs/TechnicalSolution.md §6.5 for the authorization matrix and
-// execution control, and §6.1 for the tool interface and pool assembly.
+// results. See docs/TechnicalDesign.md §4.3 for the authorization matrix and
+// execution control, and §4.1 for the tool interface and pool assembly.
 package tool

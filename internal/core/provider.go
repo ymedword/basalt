@@ -11,7 +11,7 @@ import (
 // interface, audit data types and the audit store interface. Declarations only; the
 // implementations live in internal/provider and internal/storage.
 
-// Message 是一条对话消息。字段与 JSON 名逐字取自技术方案 §4.4：出站发什么、
+// Message 是一条对话消息。字段与 JSON 名逐字取自技术方案 §2.3：出站发什么、
 // 入站存什么，两端同形。
 // Message is one conversation message. Fields and JSON names mirror Technical Solution
 // §4.4 verbatim so the outbound request and the stored history share one shape.
@@ -42,7 +42,7 @@ type Usage struct {
 	TotalTokens      int
 }
 
-// ChatRequest 是一次调用的完整入参（技术方案 §3.1 + §4.1 的单参数调用形状）。
+// ChatRequest 是一次调用的完整入参（技术方案 §2.4.1 + §2.2.1 的单参数调用形状）。
 // 两组字段的读者不同：路由与审计关联组由 ProviderService 消费；协议内容组由 ProviderClient 消费。
 // ChatRequest is the complete input of one call. Two groups of fields with different
 // readers: ProviderService consumes routing and audit bindings, ProviderClient
@@ -76,7 +76,7 @@ type ChatResponse struct {
 	Usage            Usage
 }
 
-// ProviderClient 抽象单个供应商的调用能力（技术方案 §3.1 逐字）。
+// ProviderClient 抽象单个供应商的调用能力（技术方案 §2.4.1 逐字）。
 // ProviderClient abstracts a single provider's call capability. The loop itself is
 // ours (constitution I/II): this interface never schedules tools or owns history.
 type ProviderClient interface {

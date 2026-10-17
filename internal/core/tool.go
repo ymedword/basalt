@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 )
 
-// 本文件是工具面声明（技术方案 §6.1 逐字）：内置工具、MCP 适配与代码内扩展
+// 本文件是工具面声明（技术方案 §4.1.1 逐字）：内置工具、MCP 适配与代码内扩展
 // 都实现同一个 Tool 接口——ReAct 循环不感知工具来源。
 // This file declares the tool surface (Technical Solution §6.1): builtin tools, MCP
 // adapters and in-code extensions all implement the same Tool interface.
@@ -21,7 +21,7 @@ const (
 	RoleTool = "tool"
 )
 
-// Tool 是所有工具的统一抽象（技术方案 §6.1 逐字）。
+// Tool 是所有工具的统一抽象（技术方案 §4.1.1 逐字）。
 // `env` 是执行环境的**显式入口**（值传递的必填参数，不是可选装饰）：工具**不得**
 // 从 context、全局状态或进程环境里猜"当前是哪个 Agent / 哪次运行"。
 // Tool is the single abstraction over all tools. env is the explicit, value-passed

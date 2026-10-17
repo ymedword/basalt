@@ -772,7 +772,7 @@ func TestHttpGet_PerHopCheckPrecedesEverySend(t *testing.T) {
 }
 
 // TestHttpGet_RedirectHopLimitIsFive：契约 §5.3「跳数超过 5」归 sandbox_denied（不是
-// external_error）；技术方案 §6.5 授权矩阵同款。口径（§6.2 固定口径 4）：hop 计"已跟随的
+// external_error）；技术方案 §4.3 授权矩阵同款。口径（§6.2 固定口径 4）：hop 计"已跟随的
 // 重定向次数"，初始请求不计——5 跳跟完后第 6 个 3xx 即拒，故 doer 恰收到 6 次请求。
 func TestHttpGet_RedirectHopLimitIsFive(t *testing.T) {
 	n := 0
@@ -930,7 +930,7 @@ func TestHTTPGet_CancelDuringBodyReadReturnsPromptly(t *testing.T) {
 // TestHTTPWithRealClient_DrivesHopsAndIgnoresEnvProxy：假 doer 绕过真实 Client / Transport，
 // 两条行为只能在真链路上判——① 重定向由**逐跳循环**驱动而不是 Client 自行跟随（CheckRedirect
 // 返回 ErrUseLastResponse，302 的相对 Location 经 ResolveReference 后由工具再判再发）；
-// ② Transport.Proxy=nil：环境里有 HTTP_PROXY 也不读（技术方案 §6.5 授权矩阵 HTTP 行）。
+// ② Transport.Proxy=nil：环境里有 HTTP_PROXY 也不读（技术方案 §4.3 授权矩阵 HTTP 行）。
 // 夹具策略直接放行——本用例的判卷面是**客户端行为**；白名单与端口判定归 policy 用例。
 func TestHTTPWithRealClient_DrivesHopsAndIgnoresEnvProxy(t *testing.T) {
 	var mu sync.Mutex

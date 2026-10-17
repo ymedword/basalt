@@ -1,6 +1,20 @@
 <!--
 Sync Impact Report
 ==================
+版本变化：1.1.0 → 1.2.0（2026-10-18；用户明确要求的开发工作流修订）
+修改的原则：无；十大原则、架构约束、七目标与覆盖率底线保持原文。
+修改的章节：开发工作流，将 tasks 固定人工停点替换为模块卡生成后与 US 收口时的
+两处人工 review；中间由 AI 派生、分析、实施、验收与修复。plan review 由 AI 完成。
+补充两层 Harness：公共集中维护，专属随 US 文档；机器通过不替代人工收口决定。
+版本判定：MINOR，实质扩展工作流而未增删或重新定义原则。
+配套同步：CLAUDE.md、DevelopmentLoop.md、TechnicalDesign.md、Roadmap.md、
+harness/README.md 与 stage 模板、module-doc-gen / us-register / module-dev、
+speckit-clarify / analyze / implement 的自动推进模式及续跑提醒 hook。
+模板核对：constitution-template 解析成功，保留本仓现有原则 / 架构 / 工作流 / 治理结构。
+待办：真实后续 US 的完整实现与两处人工 review，未声称已发生。
+
+历史同步记录（保留）
+==================
 版本变化：1.0.0 → 1.1.0（2026-10-15 修订；用户裁决的四处修正 + 两处门禁补充）
 修改的原则（措辞澄清与范围澄清，原则条数不变）：
 - II 结果回填责任分界：原文「会话历史的追加只发生在 ReActLoop」范围过大——用户消息由
@@ -95,7 +109,7 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 
 ### VI. 授权与执行分离（两接口）
 
-**授权与受控命令执行分别通过 `Policy` 与 `CommandRunner` 接口完成；调用方不得直接依赖 `WhitelistPolicy`、`LocalRunner` 等具体实现。核心阶段由装配层显式选择这两个实现。** 签名以技术方案 §6.5 为准：`Policy.Check(ctx, action) error`；`CommandRunner.Run(ctx, cmd) (CommandResult, error)`。`CommandRunner` 负责 cwd、环境变量、输出上限、取消与进程树清理。升级（容器 / microVM）= 两接口各新增实现 + 装配切换，调用方零改动。**不得**把本条读成"所有工具都必须经过 `CommandRunner`"——它只承担受控命令执行（`SHELL_COMMAND`）；文件 / HTTP / 通知等动作经 `Policy` 授权后在各自执行路径落地。
+**授权与受控命令执行分别通过 `Policy` 与 `CommandRunner` 接口完成；调用方不得直接依赖 `WhitelistPolicy`、`LocalRunner` 等具体实现。核心阶段由装配层显式选择这两个实现。** 签名以技术方案 §4.3 为准：`Policy.Check(ctx, action) error`；`CommandRunner.Run(ctx, cmd) (CommandResult, error)`。`CommandRunner` 负责 cwd、环境变量、输出上限、取消与进程树清理。升级（容器 / microVM）= 两接口各新增实现 + 装配切换，调用方零改动。**不得**把本条读成"所有工具都必须经过 `CommandRunner`"——它只承担受控命令执行（`SHELL_COMMAND`）；文件 / HTTP / 通知等动作经 `Policy` 授权后在各自执行路径落地。
 
 - **违反时的症状**：升级要改多处；授权与执行职责糊在一起，无法单独替换
 - **复核方式（可验证）**：调用方代码 grep 不到 `WhitelistPolicy` / `LocalRunner`（只在装配处与实现文件出现）；装配处显式选择实现；容器档 = 两接口各加实现 + 装配切换
@@ -127,10 +141,10 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 
 ### X. 五大能力优先，范围卡紧
 
-核心阶段范围**以需求文档 §6 与已批准的 US 清单（台账 `docs/us/REGISTRY.md`）为准**——运行时内核五大能力（Provider / ReAct 循环 / Memory / Tool 体系 / Web Service）之外，管理台与观测、Agent 动态管理、每日 Demo、发布收尾等**已登记在 US 清单内的交付物同样属于核心阶段**；企业级治理层（认证、多租户、审计查询、Tool Policy、SSO）放扩展阶段。完不成的功能挪到扩展阶段，**不得**砍验收。
+核心阶段范围**以需求文档 §7.1 与已批准的 US 清单（台账 `docs/us/REGISTRY.md`）为准**——运行时内核五大能力（Provider / ReAct 循环 / Memory / Tool 体系 / Web Service）之外，管理台与观测、Agent 动态管理、每日 Demo、发布收尾等**已登记在 US 清单内的交付物同样属于核心阶段**；企业级治理层（认证、多租户、审计查询、Tool Policy、SSO）放扩展阶段。完不成的功能挪到扩展阶段，**不得**砍验收。
 
 - **违反时的症状**：功能蔓延，内核迟迟不完整；或反向误判——把已批准 US 清单里的交付物当成"超出五大能力"而拒做
-- **复核方式（可验证）**：每 US 范围对照需求文档 §6 边界**与台账已登记行**；清单外功能一律进扩展阶段（Roadmap 或新增 US，先经用户裁决）；**不得**以"超出五大能力"为由判已批准的 US 交付物越界
+- **复核方式（可验证）**：每 US 范围对照需求文档 §7.1 边界**与台账已登记行**；清单外功能一律进扩展阶段（Roadmap 或新增 US，先经用户裁决）；**不得**以"超出五大能力"为由判已批准的 US 交付物越界
 - **理由**：先交付最小完整内核，企业级治理在真实使用数据验证后再做
 
 ## 架构约束（Architecture Constraints）
@@ -153,7 +167,7 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 | 测试 | 标准库 `testing` + `testify` |
 | 记忆后端 | 核心阶段 markdown + sqlite 两档；mem0 接口预留（已定 U-8） |
 
-（裁决明细与理由见技术方案 §1.2 与需求文档 §12.2；U-1~U-10 已于 2026-10-15 全部裁决。）
+（裁决明细与理由见技术方案 §1.2 与需求文档 §7.6；U-1~U-10 已于 2026-10-15 全部裁决。）
 
 **Go 版本语义**（Go 1.21 起，[官方工具链文档](https://go.dev/doc/toolchain)、[go 指令语义](https://go.dev/ref/mod#go-mod-file-go)）：`go` 行声明的是**最低版本要求**——低于它的工具链会被拒绝，**它不是准确版本锁定**；准确构建版本由 **`toolchain` 指令**（`toolchain go1.27.2`）与 **CI 工具链配置**（`actions/setup-go` 的 `go-version: 1.27.2`）共同表达。本地工具链低于 `toolchain` 行时按 `GOTOOLCHAIN=auto` 切换 / 下载，高于它则照用。**不得**把 1.27.2 表述为"`go.mod` 锁定"。
 
@@ -172,11 +186,12 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 
 ## 开发工作流（Development Workflow）
 
-- **三步链**（每个 US 的固定流程）：`/module-doc-gen N` → `/us-register N` → `/module-dev N`；**`/speckit-analyze` 是实施前阻断检查**——`tasks` 确认（固定软停点）后先跑一次，CRITICAL 问题清零前**不得**进 `implement`；US 收口再跑一次（实现与文档一致性核对）
+- **固定人工 review 仅两处**：AI 生成 US 颗粒度文档、自检与独立 AI review 后交人审核；通过后 AI 自动执行 `/us-register N` 与 `/module-dev N` 的 spec / clarify / plan / tasks、任务比对、analyze、Loop 实施 / 验收 / 修复，不设置登记、tasks 或实现前的固定人工确认。收口由 AI 复跑 analyze、独立复核并汇总证据，再交人审核 US 收口；未收到实际决定保持待审核。**`/speckit-analyze` 仍是实施前阻断检查**，CRITICAL 清零前不得实施。已审范围内的派生或实现问题由 AI 修复，实质范围 / 公共契约 / 权限 / 验收变更返回模块卡评审修订，不能伪造批准
+- **两层 Harness**：公共规则与门禁集中维护、各轮复用，US 专属行为、故障与边界验收写入每份颗粒度文档，并由 AI 派生执行映射。公共门禁与专属验收均须通过，独立复核是审核方式，不另列第三层；人工收口与机器检查的结论分别记录
 - **交付口径**：每个 US 收口以「有可演示 Demo + 门禁全绿」为准（**不**列为原则，是本节的工作流定义）
 - **门禁**：`make check`（= `fmt lint sec test test-integration cover build` 七目标聚合）全绿是完成的定义。三条实测纪律：① `gofmt -l` / `gofumpt -l` **必须先查退出码、再判输出**（语法错误 → 非 0 退出；格式差异 → 退出 0 但输出非空）；② `-race` 需 CGO 开启，与 `CGO_ENABLED=0` 发布构建**分属不同命令 / job**；③ `-tags=integration` 默认不跑，**必须**单列
 - **覆盖率底线（必须有可执行判据）**：`core` / `tool`（沙箱）/ `memory` / `storage` ≥ 70%，其余 ≥ 50%。`go test -cover` 只打印百分比、**不会**因低于阈值而失败——**必须**由 US-1 交付的覆盖率检查脚本（`make cover`，纳入 `make check`）按包解析结果并判失败。判定口径：**有可执行语句但无测试文件的包**（`no test files`）计 0%，未达标即失败，**不得**豁免；**无可执行语句的包**（`coverage: [no statements]`）跳过（无从测量，不计通过也不计失败）。安全关键路径（沙箱三档、凭证红线、审计落库）**必须**有专项测试，不靠覆盖率兜底
-- **plan review 必查**：依赖方向无环 / 审计写入路径唯一 / 无框架坐标 / 无 `context.WithValue` 业务态 / 单二进制构建通过
+- **plan review 由 AI 执行，必查**：依赖方向无环 / 审计写入路径唯一 / 无框架坐标 / 无 `context.WithValue` 业务态 / 单二进制构建通过
 - **原型五链路验证（2026-10-15 修订：分阶段执行，**不**阻塞后续 US 开工；裁决全文见起步手册 §4「已决（口径丙）」）**：①`go.mod` 坐标经 goproxy.cn 实测（US-1 内完成）；②链路 5（崩溃恢复 + 实例锁）由 US-1 小探针先验（不入库，内存 SQLite）；③链路 1 / 3 / 4 在 US-4 交付后立即验证（含链路 5 的真实实现复验）；④链路 2 的 HTTP 准入面（409 / 429）到 US-9 补齐。**契约状态**：运行时契约四件套在**对应链路**验证通过前均为**待验证设计草案**（状态头见各契约文件）；US-2 / US-3 在草案状态下开工属**预期安排**，**不构成硬前置阻断**。**最终冻结条件**：五链路全部通过 + 实测偏差回写 `contracts/`
 - **提交纪律**：AI **不得**自动 commit / push / tag，提交时机由用户决定；提交信息 = Conventional Commits 标题 + 四段正文（Problem / Design / Testing / Impact）
 
@@ -188,4 +203,4 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 - 合规审查：每个 US 收口逐条自查十大原则与架构约束；`/speckit-analyze` 将宪法冲突判为 CRITICAL——**必须**调整 spec / plan / tasks，**不得**稀释原则
 - 文档纪律：四份权威文档各司其职，**不得**互相"修正"；有冲突先裁决（技术方案最权威）再动手
 
-**Version**: 1.1.0 | **Ratified**: 2026-10-15 | **Last Amended**: 2026-10-15
+**Version**: 1.2.0 | **Ratified**: 2026-10-15 | **Last Amended**: 2026-10-18

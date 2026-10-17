@@ -1,6 +1,6 @@
 package app
 
-// 本文件是**唯一装配层**的重路径接线（技术方案 §8.7 轻 / 重两条路；颗粒度文档 §2.3 流程 D /
+// 本文件是**唯一装配层**的重路径接线（技术方案 §6.1.2 轻 / 重两条路；颗粒度文档 §2.3 流程 D /
 // 口径 25）：重命令（本 US 是 `chat`——`serve` 归后续 US）在开跑之前，按**固定次序**把长生命
 // 周期资源接起来——取实例锁 → 写模式打开 → 显式迁移 → 崩溃恢复（账本六步 + 工作区残留第 ⑤ 步）
 // → 构建记忆门面（载体按 `memory.backend` 选，US-6）→ 建工具注册池 → 注册池名字集喂 Agent
@@ -292,7 +292,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	}
 
 	if mcpPool != nil {
-		// 占位解析在连接**之前**（技术方案 §8.8）：解析不出来就不连接——fail-closed 发生在
+		// 占位解析在连接**之前**（技术方案 §3.7）：解析不出来就不连接——fail-closed 发生在
 		// 任何子进程被拉起之前，错误里只有 server / 键 / 变量名，没有值。
 		mcpSpecs, err = resolveMCPEnv(mcpSpecs, os.LookupEnv)
 		if err != nil {

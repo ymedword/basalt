@@ -21,6 +21,14 @@ You **MUST** consider the user input before proceeding (if not empty).
 
 ## Pre-Execution Checks
 
+### Basalt：已人审 US 的自动推进模式
+
+由 module-dev 在已人审模块卡范围内调用时，保留歧义与覆盖扫描，由 AI 从模块卡、
+技术方案及公共契约查证答案，记录“AI 依据 <来源> 澄清”，不执行后文的逐题人工问答。
+不把 AI 推导写成用户回答。无依据且影响范围、权限、公共契约或验收的事项，汇总
+具体方案与影响并返回模块卡人工 review ①；不能猜选推荐项。范围内澄清完成后由
+编排层自动进入 plan。独立交互调用仍使用下文的问答流程。
+
 **Check for extension hooks (before clarification)**:
 - Check if `.specify/extensions.yml` exists in the project root.
 - If it exists, read it and look for entries under the `hooks.before_clarify` key
