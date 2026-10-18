@@ -224,12 +224,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Interpreters:   cfg.Shell.Interpreters,
 		MaxOutputBytes: outputBudget(cfg),
 	})
-	// 八件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 本 US 的两件记忆工具
-	// （技能调用工具永久禁；`notify` / `manage_schedule` 两件是注册池第 9 / 10 件、归 US-8 /
-	// US-10，US-7 的 MCP 各件同样仍为占位——颗粒度文档 §3.5 后续占位 1）。write_file 的构造期
+	// 九件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 + 本 US
+	// 的 notify（技能调用工具永久禁；`manage_schedule` 是注册池第 10 件、归 US-10，US-7 的
+	// MCP 各件在等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。write_file 的构造期
 	// Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
 	// 那棵树"同源由运行环境保证。
-	// Eight tools: the three file tools, US-5's shell/HTTP trio, and this US's memory pair.
+	// Nine tools: the file trio, US-5's shell/HTTP trio, the memory pair, and notify.
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -239,6 +239,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		tool.NewHTTPPostTool(policy),
 		tool.NewSaveMemoryTool(memSvc),
 		tool.NewRecallMemoryTool(memSvc),
+		tool.NewNotifyTool(storage.NewNotifyChannelRepo(db), policy, newNotifyAdapters()),
 	} {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
@@ -256,11 +257,11 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			declaredToolNames, got), db, lock)
 	}
 
-	// MCP 接入在等值门禁**之后**（约束 9）：门禁比对的是八件内置声明名集，MCP 工具随后
+	// MCP 接入在等值门禁**之后**（约束 9）：门禁比对的是九件内置声明名集，MCP 工具随后
 	// 注册、池随之变大；把注册挪到门禁之前，门禁会因池变大而拒绝启动。零 server（缺失 /
 	// 空 / {} / 无 servers）整段跳过——不建池、不连接、不发日志，零 MCP 配置时行为与 US-6
 	// 逐字节相同（约束 1）。解析失败是工作区结构问题，与「配置写错的实例配置」同档拒绝启动。
-	// MCP wiring happens after the equality gate: the gate compares the eight builtin names,
+	// MCP wiring happens after the equality gate: the gate compares the nine builtin names,
 	// and MCP tools join the pool afterwards. Zero servers skip the whole block.
 	mcpSpecs, err := workspace.ParseMCPServers(root)
 	if err != nil {
@@ -408,7 +409,7 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 
 // declaredToolNames 是装配层注册池的**声明名集**（颗粒度文档 US-4 §2.4 注 4：名字在装配期
 // 一次导出——`workspace` 不反向 import `tool`，装载器只认这份字符串清单）。两个消费面读的是
-// 同一份：① 重路径在注册完八件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
+// 同一份：① 重路径在注册完九件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
 // （`profile list` / `profile show` 经 `agentsPort`）不建注册池，直接拿它当池做装载判定
 // （池外工具名 → 整只不注册，宪法 IV）。两条路因此对同一份 AGENT.md 给出同一个结论。
 // 顺序 = `tool.Registry.Names()` 的排序序（比较逐名且保序）——**不得**按主题分组重排。
@@ -416,7 +417,7 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 // heavy path verifies its registry against it, the light path judges admission with it. The
 // order matches Registry.Names(), which is sorted.
 var declaredToolNames = []string{
-	"http_get", "http_post", "list_dir", "read_file",
+	"http_get", "http_post", "list_dir", "notify", "read_file",
 	"recall_memory", "save_memory", "shell", "write_file",
 }
 

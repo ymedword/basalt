@@ -110,7 +110,7 @@ func parseMCPServers(base *os.Root) ([]core.MCPServerConfig, error) {
 			}
 			for key, rawValue := range envMap {
 				placeholder, ok := rawValue.(string)
-				if !ok || !isEnvPlaceholder(placeholder) {
+				if _, isRef := core.EnvPlaceholderName(placeholder); !ok || !isRef {
 					// 错误只点名字段，**永不回显**配置值——值可能正是凭证（FR-004 / R1a）
 					return nil, fmt.Errorf("%s 的 server %s 的 env.%s 必须是 ${VAR} 占位（明文凭证不得入库）", mcpServersFile, name, key)
 				}
@@ -132,28 +132,6 @@ func mcpServerNames(specs []core.MCPServerConfig) []string {
 		names = append(names, spec.Name)
 	}
 	return names
-}
-
-// isEnvPlaceholder 判定精确 `${VAR}` 形态：`${` + 标识符 + `}`，标识符 = 字母或下划线
-// 开头、其后可带数字。半截占位（`${A}${B}` / `${A}x`）、`$A`、空名 `${}`、数字开头
-// `${1A}` 一律 false——放行它们等于把"凭证只能来自环境"的门禁变成前缀匹配。
-// isEnvPlaceholder accepts exactly ${VAR}: a brace-wrapped identifier starting
-// with a letter or underscore. Every near-miss form is rejected.
-func isEnvPlaceholder(s string) bool {
-	if len(s) < 4 || !strings.HasPrefix(s, "${") || !strings.HasSuffix(s, "}") {
-		return false
-	}
-	name := s[2 : len(s)-1]
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c == '_', c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z':
-		case i > 0 && c >= '0' && c <= '9':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // stringField 取映射里的字符串字段；缺失或非字符串一律按空串处理（空串在调用点

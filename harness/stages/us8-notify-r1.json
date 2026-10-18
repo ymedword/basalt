@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "id": "us8-notify-r1",
+  "approval": "Human review ① 2026-10-18 reviewed module card R1 sha256 8d65502e8c2746d61572338073cc75a038344eebce9e27803455dae6d421063b and decided: H1–H8 accepted into R2; tool set 8→9 approved; empty content / exact ${VAR} / runtime_error adjudications. R2 sha256 5f5890081c81be5cc806bffc2d0b37303122397aede5842f0d62fe9042d764c5 is the revised operating version and is not separately human-reviewed. AI task comparison and freeze 2026-10-18, tasks sha256 2adc868a02c775aa5ba8b40b79ce50370717810c41bb1fe0de672cce5903bd93; stage derived from module card §4.4 by module-dev step 6.1 and grants no approval by itself",
+  "inputs": [
+    "docs/us/us8-notify.md",
+    "specs/008-notify/spec.md",
+    "specs/008-notify/plan.md",
+    "specs/008-notify/tasks.md"
+  ],
+  "protect": [
+    "internal/app/ports_test.go",
+    "internal/workspace/mcp_test.go",
+    "internal/cli/config_test.go"
+  ],
+  "checks": [
+    {
+      "id": "008-envref",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^TestEnvPlaceholderName_ExactFormTable$"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestEnvPlaceholderName_ExactFormTable"
+      ]
+    },
+    {
+      "id": "008-executor-audit",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^(TestToolExecutor_PreWriteFailureRefusesExecution|TestToolExecutor_TerminalWriteFailureKeepsPendingRow)$"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestToolExecutor_PreWriteFailureRefusesExecution",
+        "TestToolExecutor_TerminalWriteFailureKeepsPendingRow"
+      ]
+    },
+    {
+      "id": "008-storage-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestNotifyChannelRepo_"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNotifyChannelRepo_ListsRowsOrderedByName",
+        "TestNotifyChannelRepo_EmptyRegistryReturnsEmptySlice",
+        "TestNotifyChannelRepo_ContextErrorPropagates",
+        "TestNotifyChannelRepo_SeesRowsInsertedAfterConstruction"
+      ]
+    },
+    {
+      "id": "008-tool-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "-run",
+        "^TestNotifyTool_"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNotifyTool_InputSchemaRequiresContentOnly",
+        "TestNotifyTool_MissingChannelIsNotFoundWithAvailableNames",
+        "TestNotifyTool_UnknownChannelIsNotFoundWithAvailableNames",
+        "TestNotifyTool_BlankChannelTreatedAsMissing",
+        "TestNotifyTool_ContentOverLimitFailsBeforeLookup",
+        "TestNotifyTool_ContentAtLimitIsAccepted",
+        "TestNotifyTool_ContentLimitCountsUTF8Bytes",
+        "TestNotifyTool_PlaintextURLFailsWithoutEcho",
+        "TestNotifyTool_NearMissPlaceholderFailsWithoutEcho",
+        "TestNotifyTool_UnsetEnvFailsClosed",
+        "TestNotifyTool_EmptyEnvFailsClosed",
+        "TestNotifyTool_PolicyDenialRedactsCredentialURL",
+        "TestNotifyTool_PolicySeesResolvedURLAndAgentBeforeAnySend",
+        "TestNotifyTool_UnknownTypeFailsWithoutPolicyOrSend",
+        "TestNotifyTool_RegistryReadFailureIsNotChannelMissing",
+        "TestNotifyTool_ReadsRegistryPerSend",
+        "TestNotifyTool_DispatchesResolvedContentToAdapter",
+        "TestNotifyTool_RejectsNonStringFields",
+        "TestNotifyTool_ExecutorAuditsBeforeAdapterSend",
+        "TestNotifyTool_ExecutorRecordsRuntimeErrorForUnsetEnv",
+        "TestNotifyTool_EmptyContentIsSent"
+      ]
+    },
+    {
+      "id": "008-tool-notify-adapters",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "-run",
+        "^(TestWebhookNotifyAdapter_|TestFeishuNotifyAdapter_|TestNotifyAdapters_)"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestWebhookNotifyAdapter_PostsContentJSON",
+        "TestWebhookNotifyAdapter_Non2xxIsExternalError",
+        "TestWebhookNotifyAdapter_DoesNotFollowRedirects",
+        "TestNotifyAdapters_ClientIgnoresEnvProxy",
+        "TestWebhookNotifyAdapter_TransportErrorRedactsURL",
+        "TestWebhookNotifyAdapter_ContextIdentityWins",
+        "TestFeishuNotifyAdapter_PostsTextPayload",
+        "TestFeishuNotifyAdapter_RequiresCodeZero",
+        "TestFeishuNotifyAdapter_UnparsableReceiptFails",
+        "TestFeishuNotifyAdapter_OversizedReceiptFails",
+        "TestFeishuNotifyAdapter_Non2xxFailsBeforeReceipt",
+        "TestFeishuNotifyAdapter_ReceiptReadFailureRespectsContext",
+        "TestNotifyAdapters_FixedContentType"
+      ]
+    },
+    {
+      "id": "008-app-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestNewNotifyAdapters_|TestAgentsPort_LightPathAcceptsNotifyDeclaration$)"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNewNotifyAdapters_ExactTypeSet",
+        "TestAgentsPort_LightPathAcceptsNotifyDeclaration"
+      ]
+    },
+    {
+      "id": "008-ports-nine",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^TestToolListerPort_HeavyAssemblyRegistersNineTools$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestToolListerPort_HeavyAssemblyRegistersNineTools"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T004",
+      "checks": ["008-envref"]
+    },
+    {
+      "id": "T007",
+      "checks": ["008-storage-notify"]
+    },
+    {
+      "id": "T011",
+      "checks": ["008-executor-audit"]
+    },
+    {
+      "id": "T021",
+      "checks": ["008-tool-notify"]
+    },
+    {
+      "id": "T022",
+      "checks": ["008-tool-notify-adapters"]
+    },
+    {
+      "id": "T023",
+      "checks": ["008-app-notify", "008-ports-nine"]
+    },
+    {
+      "id": "T024",
+      "checks": [
+        "008-tool-notify-adapters",
+        "008-tool-notify",
+        "008-app-notify",
+        "008-ports-nine"
+      ]
+    }
+  ]
+}

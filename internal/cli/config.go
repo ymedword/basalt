@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/ymedword/basalt/internal/core"
 )
 
 // Config 是 basalt.yaml 的解析结果。
@@ -150,9 +152,6 @@ type MemoryConfig struct {
 // mem0 api-key、notify_channels url——随各自消费 US 落位）。
 // Credential key paths: providers[i].api_key is the only credential US-1 knows.
 var credentialKey = regexp.MustCompile(`^providers\[\d+\]\.api_key$`)
-
-// 完整占位形态：凭证原始值必须整体是一个 ${VAR}，前后不得夹带明文。
-var wholePlaceholder = regexp.MustCompile(`^\$\{[A-Za-z_][A-Za-z0-9_]*\}$`)
 
 // 单个占位符；${} 与 ${1X} 这类畸形形态不匹配，会在「残留检查」处被判红。
 var placeholder = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
@@ -561,7 +560,7 @@ func resolveTree(node any, path string, lookupEnv func(string) (string, bool)) (
 func resolveString(raw, path string, lookupEnv func(string) (string, bool)) (any, error) {
 	credential := credentialKey.MatchString(path)
 
-	if credential && !wholePlaceholder.MatchString(raw) {
+	if _, isRef := core.EnvPlaceholderName(raw); credential && !isRef {
 		return nil, fmt.Errorf(
 			"配置项 %s 是明文凭证——凭证一律写 ${VAR} 占位并经环境变量提供", path)
 	}
