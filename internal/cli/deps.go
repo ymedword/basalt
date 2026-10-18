@@ -53,6 +53,11 @@ type Deps struct {
 	RunService    RunService
 	SessionLister SessionLister
 
+	// Server 是 HTTP 服务面端口（见 ports.go）：只有 `serve` 消费，且只由重路径注入——
+	// `gateway` / `chat` 拿到 nil 是正确的形态（前者不启 HTTP，后者不占端口）。
+	// The HTTP service port: only serve consumes it, and only the heavy path injects it.
+	Server Server
+
 	// Tools 是工具注册池端口（见 ports.go）：`tool list` 经它取「注册了什么」这一份数据，
 	// 清单的顺序由实现侧给出、命令面零重排。只有重路径装配才构建过注册池，因此该端口
 	// **只在重路径上非空**——命令面拿到 nil 即报缺件，不自造第二份清单。

@@ -36,9 +36,10 @@ var Version = "dev"
 // only exists after assembly.
 //
 // 清单只有这一份，判据落在命令名上——装配层不猜意图，命令面也不会因为注册顺序不同
-// 而走到另一条路上（`serve` 落位时在此追加一名即可）。
-// One list, keyed by command name; serving a new heavy command means adding one entry.
-var heavyCommands = []string{"chat", "tool"}
+// 而走到另一条路上。`serve` / `gateway` 自 US-9 起同属重路径（技术方案 §6.5）：两者都
+// 要全量装配，差别只在 HTTP 面与常驻形态。
+// One list, keyed by command name; serve and gateway are heavy since US-9.
+var heavyCommands = []string{"chat", "tool", "serve", "gateway"}
 
 // readStoreCommands 是需要**只读库句柄**的命令组：`session list` 要读会话数据，但它
 // **不是**重命令——不取锁、不做恢复、不写库（口径 23：别的实例持锁时也该能看清单）。
@@ -96,6 +97,16 @@ func Run(ctx context.Context, args []string) int {
 		cfgErr:           cfgErr,
 	}
 
+	// serve 的启动前兜底：工作区骨架先建齐再装配（技术方案 §3.1.1）。幂等——二次启动
+	// 逐字节不动既有文件；初始化失败即 1，半建的工作区不进入装配。
+	// serve initializes the workspace skeleton before assembly; the call is idempotent.
+	if needsServeInit(args) {
+		if initErr := ensureWorkspaceForServe(a.wsRoot(), logger); initErr != nil {
+			logger.Error("serve 兜底初始化失败", "error", initErr)
+			return 1
+		}
+	}
+
 	if needsRuntime(args) {
 		// 重路径：固定次序（取锁 → 打开 → 迁移 → 恢复）在 newRuntime 内一次走完，四个次序
 		// 读数以 `step` 键落日志（T050 T1 的判据）。
@@ -105,18 +116,35 @@ func Run(ctx context.Context, args []string) int {
 			logger.Error("重路径装配失败", "error", rtErr)
 			return 1
 		}
-		// 释放挂在唯一出口上：命令跑完（正常 / 报错 / 取消）都走同一条收尾路径。
-		// Release hangs off the single exit point, so every ending takes the same path.
-		defer func() {
-			if closeErr := rt.Close(); closeErr != nil {
-				logger.Error("重路径资源释放失败", "error", closeErr)
-			}
-		}()
 		deps.RunService = rt.runService()
 		deps.SessionLister = rt.sessionLister()
 		// 工具清单端口也只在这一次装配之后才有内容（`tool list` 走的就是这条路）。
 		// The tool-listing port also only has content after this assembly.
 		deps.Tools = rt.tools()
+		if needsServer(args) {
+			// HTTP 面只在 serve 上装配：端口背后是同一份重路径装配态（技术方案 §6.5）。
+			// The HTTP face is assembled only for serve, over the same runtime state.
+			srv, srvErr := a.newWebServer(rt)
+			if srvErr != nil {
+				logger.Error("HTTP 面装配失败", "error", srvErr)
+				// 服务没交出去也要释放：此刻锁已取、库已开（约束 20 ⑤）。
+				// Release even on this early exit: the lock and database are already held.
+				if closeErr := rt.Close(); closeErr != nil {
+					logger.Error("重路径资源释放失败", "error", closeErr)
+				}
+				return 1
+			}
+			deps.Server = srv
+		}
+		// 释放挂在唯一出口上且**在 exec 之后**：Serve 阻塞期间锁与库必须活着。
+		// Release hangs off this one exit point and runs after exec returns.
+		if execErr := runWithRuntime(rt, logger, func() error {
+			return executeRoot(ctx, args, deps)
+		}); execErr != nil {
+			logger.Error("命令执行失败", "error", execErr)
+			return 1
+		}
+		return 0
 	} else if needsReadStore(args) {
 		// 轻路径里需要数据的命令：**只读**打开一次（不取锁、不做恢复、不开写池）。
 		// 打不开就如实报——库里没有可列的东西时，"列不出来"比"列出空清单"更接近事实。
@@ -134,18 +162,23 @@ func Run(ctx context.Context, args []string) int {
 		deps.SessionLister = sessionListerPort{store: storage.NewSessionStore(read)}
 	}
 
-	root := cli.NewRootCommand(deps)
-	root.Version = Version
-	root.SetArgs(args)
-	root.SetOut(os.Stdout)
-	root.SetErr(os.Stderr)
-
-	if err := root.ExecuteContext(ctx); err != nil {
+	if err := executeRoot(ctx, args, deps); err != nil {
 		// cobra 已把可读文案写到标准错误；这里补结构化日志，失败路径两轨都在。
 		logger.Error("命令执行失败", "error", err)
 		return 1
 	}
 	return 0
+}
+
+// executeRoot 组装根命令并执行一次——重 / 轻两条分流共用这一处执行面。
+// executeRoot builds the root command and executes it once; both splits share it.
+func executeRoot(ctx context.Context, args []string, deps cli.Deps) error {
+	root := cli.NewRootCommand(deps)
+	root.Version = Version
+	root.SetArgs(args)
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
+	return root.ExecuteContext(ctx)
 }
 
 // needsRuntime 判定这次调用是否走重路径：取**第一个非选项参数**当命令名，与重命令清单比对。
@@ -179,6 +212,42 @@ func commandName(args []string) (string, bool) {
 		return arg, true
 	}
 	return "", false
+}
+
+// needsServer 判定这次调用是否需要 HTTP 面：目前只有 `serve`；`gateway` 只常驻等信号，
+// 不启 HTTP（技术方案 §6.5）。
+// needsServer reports whether the call needs the HTTP face; only serve does today.
+func needsServer(args []string) bool {
+	name, ok := commandName(args)
+	return ok && name == "serve"
+}
+
+// needsServeInit 判定这次调用是否要在装配之前做幂等工作区初始化：只有 `serve`——它要
+// 建库建工作区后才装配；`gateway` 不碰 HTTP 面，也不在此初始化。
+// needsServeInit reports whether the workspace is initialized before assembly; only
+// serve does, gateway merely parks until a signal arrives.
+func needsServeInit(args []string) bool {
+	name, ok := commandName(args)
+	return ok && name == "serve"
+}
+
+// runtimeCloser 是 runWithRuntime 需要的最小释放面（生产传 *heavyRuntime）。
+// runtimeCloser is the minimal release surface runWithRuntime needs.
+type runtimeCloser interface {
+	Close() error
+}
+
+// runWithRuntime 在 exec 返回之后释放重路径资源（约束 20 ⑤ / 回归 R17）：Serve 阻塞
+// 期间锁、库与 MCP 连接必须活着，释放**不得**早于 exec；正常返回与报错都恰好释放一次。
+// runWithRuntime releases the runtime after exec returns — never before, exactly once,
+// on both the success and error paths.
+func runWithRuntime(rt runtimeCloser, logger *slog.Logger, exec func() error) error {
+	defer func() {
+		if closeErr := rt.Close(); closeErr != nil {
+			logger.Error("重路径资源释放失败", "error", closeErr)
+		}
+	}()
+	return exec()
 }
 
 // bootstrapLogger 按已装载的配置选日志档位；配置缺失取缺省档，存在但无效记 WARN

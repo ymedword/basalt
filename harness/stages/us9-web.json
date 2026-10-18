@@ -1,0 +1,314 @@
+{
+  "version": 1,
+  "id": "us9-web-r1",
+  "approval": "Human review ① 2026-10-18 approved module card R4; reviewed sha256 7af94d2f66b315fe37dfce89921ab1680be8783ac25d97a4a106de048076c47b. D-01 approved 2026-10-18 (DELETE 409 SessionBusy, POST /sessions 400 BadRequest). Closeout review ② returned 2026-10-18 with four probe-reproduced findings (2 HIGH / 2 MEDIUM: Serve-error cleanup, drain-timeout exit, panic request id, failed diagnostic); user authorized repair within US-9 with named regressions and a full stage rerun, module card R5 sha256 d8f10a11fcefa39a8ec9a55d141c2f53c6be43ea73017d456e372d48c266e00d, spec sha256 b98d8a6e40712d1d5c89aba32b758101c670cc5296c8b6f142006490941396c8, plan sha256 3d199af23f76a50a24fec4ddd9f6851dbcda5c5199e60d7525ad99c40fd018d8. AI task comparison and freeze 2026-10-18, tasks sha256 bc289042e137db8e57fea5c7d066e9a53440e9c4681c96bf50fc9d2be407fbf1 (append-only T039-T044; checkbox-normalized). Independent review 2026-10-18 returned conditional pass (2 MEDIUM / 4 LOW: Authorization credential projection bypass, R21 discriminative power, module card doc drift, sanitizer edge cases, panic-after-header named coverage, client-disconnect diagnostic); R6 repair round disposed all six with fixtures inside existing test functions (no new test function names, required_tests unchanged), module card R6 sha256 a2ed7c560466dda36dbdeeefe6b545827596839078c961cc297547becdac9258, spec sha256 d72cef05e2e07801038d8bc70ce4ea9153053749e8b6809473d321c290daf885, plan sha256 39b09dd49152d0ed88481b4c981db322c2fcd6a2117e1182e22552011bc01aa7, tasks sha256 57fd838a197ba2ea39333eabee6e9ab7256617e5f38676ce280fc22d397f7c34 (append-only T045-T049; checkbox-normalized). Closeout review ② returned again 2026-10-18 with one MEDIUM (quoted credential value containing spaces leaked its tail past the old non-space credential rule; probe reproduced password with a quoted value containing prefix and SECRET-TAIL-P41); user authorized a small repair: credential value recognizes quoted content as a whole (spaces and backslash escapes; unterminated quote over-redacts to end of text), four combination regressions (double quote, single quote, escaped, unterminated) through the full handler, then a full stage rerun. R7 module card sha256 fc7b690e90f42bf0cd05d3ca0651071aadf7b0d2b45b4a8f4f8c281a05525160, spec sha256 3d2b1e2779f5aeeffcfb862de07f1280e930626483ebe376328e8e5600b4dde6, plan sha256 cbe4d3b668d0e530ec7db8a6413dfb756ea65949a2aee5478f27d93a2f6ddadf, tasks sha256 d78df60f70cb961f39a92e0f85437afed2bfab4072014c3c6d2c514d72ef6a97 (append-only T050-T052; checkbox-normalized); required_tests unchanged (fixtures inside existing test functions). stage derived from module card §4.4 by module-dev step 6.1 and grants no approval by itself",
+  "inputs": [
+    "docs/us/us9-web-service.md",
+    "specs/009-web-service/spec.md",
+    "specs/009-web-service/plan.md",
+    "specs/009-web-service/tasks.md"
+  ],
+  "protect": [
+    "internal/cli/chat_test.go",
+    "internal/storage/session_store_test.go",
+    "internal/app/run_test.go",
+    "internal/cli/config_test.go",
+    "internal/memory/memory_test.go"
+  ],
+  "checks": [
+    {
+      "id": "009-web-contract",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^TestContract_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestContract_EnvelopeShape",
+        "TestContract_TimestampAndContentType",
+        "TestContract_UnknownRouteIs404Envelope",
+        "TestContract_ErrorMappingByType",
+        "TestContract_ViewFieldShapes"
+      ]
+    },
+    {
+      "id": "009-web-handlers",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^(TestSessions_|TestMessages_|TestInvoke_|TestMeta_)"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSessions_CreateDefaultsAndIdempotency",
+        "TestSessions_GetDetailWindow",
+        "TestSessions_ArchiveSemantics",
+        "TestMessages_SuccessRunView",
+        "TestMessages_RequestValidation",
+        "TestMessages_AdmissionErrorMapping",
+        "TestMessages_RunStatusMapping",
+        "TestInvoke_Stateless",
+        "TestMeta_HealthInfo",
+        "TestMeta_ProfilesToolsMemory",
+        "TestMessages_MessageCapCountsBytesBeforeRun",
+        "TestMessages_RunBudgetPropagation",
+        "TestMessages_ClientDisconnectWritesNothing",
+        "TestSessions_ArchiveRejectedWhileRunInflight",
+        "TestMessages_FailureReasonRedaction",
+        "TestMessages_FailedRunDiagnosticLogged"
+      ]
+    },
+    {
+      "id": "009-web-server",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^TestServer_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestServer_Defaults",
+        "TestServer_TimeoutsAndWriteBudget",
+        "TestServer_GracefulShutdown",
+        "TestServer_ShutdownGraceExhausted",
+        "TestServer_WriteBudgetRealConnection",
+        "TestServer_RecoverMiddleware",
+        "TestServer_CrossOriginRejectsWrites",
+        "TestServer_RequestLog",
+        "TestServer_ServeErrorUnifiedCleanup",
+        "TestServer_ShutdownDrainTimeoutWaitsForHandler",
+        "TestServer_PanicLogSharesRequestID"
+      ]
+    },
+    {
+      "id": "009-web-race",
+      "args": [
+        "go",
+        "test",
+        "-race",
+        "-json",
+        "-count=1",
+        "./internal/web"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestContract_EnvelopeShape",
+        "TestContract_TimestampAndContentType",
+        "TestContract_UnknownRouteIs404Envelope",
+        "TestContract_ErrorMappingByType",
+        "TestContract_ViewFieldShapes",
+        "TestSessions_CreateDefaultsAndIdempotency",
+        "TestSessions_GetDetailWindow",
+        "TestSessions_ArchiveSemantics",
+        "TestMessages_SuccessRunView",
+        "TestMessages_RequestValidation",
+        "TestMessages_AdmissionErrorMapping",
+        "TestMessages_RunStatusMapping",
+        "TestInvoke_Stateless",
+        "TestMeta_HealthInfo",
+        "TestMeta_ProfilesToolsMemory",
+        "TestMessages_MessageCapCountsBytesBeforeRun",
+        "TestMessages_RunBudgetPropagation",
+        "TestMessages_ClientDisconnectWritesNothing",
+        "TestSessions_ArchiveRejectedWhileRunInflight",
+        "TestMessages_FailureReasonRedaction",
+        "TestMessages_FailedRunDiagnosticLogged",
+        "TestServer_Defaults",
+        "TestServer_TimeoutsAndWriteBudget",
+        "TestServer_GracefulShutdown",
+        "TestServer_ShutdownGraceExhausted",
+        "TestServer_WriteBudgetRealConnection",
+        "TestServer_RecoverMiddleware",
+        "TestServer_CrossOriginRejectsWrites",
+        "TestServer_RequestLog",
+        "TestServer_ServeErrorUnifiedCleanup",
+        "TestServer_ShutdownDrainTimeoutWaitsForHandler",
+        "TestServer_PanicLogSharesRequestID"
+      ]
+    },
+    {
+      "id": "009-storage-session-api",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestSessionStore_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestSessionStore_GetSessionReadsStatus",
+        "TestSessionStore_GetOrCreateIsIdempotent",
+        "TestSessionStore_ArchiveIsIdempotent",
+        "TestSessionStore_MessagesTailKeepsLatestInOrder"
+      ]
+    },
+    {
+      "id": "009-core-sessionid",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^TestDeriveSessionID_"
+      ],
+      "timeout_seconds": 60,
+      "required_tests": [
+        "TestDeriveSessionID_PinnedVectors",
+        "TestDeriveSessionID_AdjacentTuplesDoNotCollide",
+        "TestDeriveSessionID_ResultIsPathAndLogSafe",
+        "TestDeriveSessionID_EmptyPartsAreEncoded",
+        "TestDeriveSessionID_HostileChannelFallsBackToSafePrefix"
+      ]
+    },
+    {
+      "id": "009-cli-serve",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^(TestServeCommand_|TestGatewayCommand_|TestRootCommand_RegistersServeAndGateway)"
+      ],
+      "timeout_seconds": 90,
+      "required_tests": [
+        "TestServeCommand_RequiresServer",
+        "TestServeCommand_PropagatesRunError",
+        "TestGatewayCommand_BlocksUntilSignal",
+        "TestRootCommand_RegistersServeAndGateway"
+      ]
+    },
+    {
+      "id": "009-app-web",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestNewWebServer_|TestWebProviders_|TestNewToolCatalogPort_|TestEnsureWorkspaceForServe|TestNeedsServer|TestNewRuntime_MaxConcurrentRuns|TestRun_HeavyCommandSplit|TestRunWithRuntime_)"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestNewWebServer_OptionsProjection",
+        "TestWebProviders_NoCredentialFields",
+        "TestNewToolCatalogPort_ClassificationAndOrder",
+        "TestEnsureWorkspaceForServe",
+        "TestNeedsServer",
+        "TestNewRuntime_MaxConcurrentRuns",
+        "TestRun_HeavyCommandSplit",
+        "TestRunWithRuntime_ReleasesAfterExec"
+      ]
+    },
+    {
+      "id": "009-cli-config",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^TestConfig_RejectsNegativeMaxConcurrentRuns$"
+      ],
+      "timeout_seconds": 90,
+      "required_tests": [
+        "TestConfig_RejectsNegativeMaxConcurrentRuns"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T003",
+      "checks": ["009-core-sessionid"]
+    },
+    {
+      "id": "T004",
+      "checks": ["009-core-sessionid"]
+    },
+    {
+      "id": "T005",
+      "checks": ["009-storage-session-api"]
+    },
+    {
+      "id": "T006",
+      "checks": ["009-storage-session-api"]
+    },
+    {
+      "id": "T012",
+      "checks": ["009-web-contract"]
+    },
+    {
+      "id": "T025",
+      "checks": ["009-web-handlers"]
+    },
+    {
+      "id": "T026",
+      "checks": ["009-web-server", "009-web-race"]
+    },
+    {
+      "id": "T028",
+      "checks": ["009-cli-serve"]
+    },
+    {
+      "id": "T029",
+      "checks": ["009-cli-config"]
+    },
+    {
+      "id": "T033",
+      "checks": ["009-app-web"]
+    },
+    {
+      "id": "T039",
+      "checks": ["009-web-server", "009-web-race"]
+    },
+    {
+      "id": "T040",
+      "checks": ["009-web-server", "009-web-race"]
+    },
+    {
+      "id": "T041",
+      "checks": ["009-web-server", "009-web-race"]
+    },
+    {
+      "id": "T042",
+      "checks": ["009-web-handlers", "009-web-race"]
+    },
+    {
+      "id": "T045",
+      "checks": ["009-web-handlers", "009-web-race"]
+    },
+    {
+      "id": "T046",
+      "checks": ["009-web-server", "009-web-race"]
+    },
+    {
+      "id": "T047",
+      "checks": ["009-web-handlers", "009-web-race"]
+    },
+    {
+      "id": "T050",
+      "checks": ["009-web-handlers", "009-web-race"]
+    }
+  ]
+}

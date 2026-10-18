@@ -87,6 +87,23 @@ func (s *Service) RecallByKeyword(ctx context.Context, scope core.Scope, query s
 	return s.backend.RecallByKeyword(ctx, scope, query)
 }
 
+// Sections 读取整层原文并渲染两分区（带标题；空分区为空串）。/memory 端点的数据源：
+// **只读全局层**，不叠加 Agent 层，也不走生效层回退——读面展示的是"这一层写了什么"。
+// Sections renders both titled partitions of one layer for the /memory endpoint; an
+// empty partition is the empty string, not a bare heading.
+func (s *Service) Sections(ctx context.Context, scope core.Scope) (coreText, archiveText string, err error) {
+	text, err := s.backend.Load(ctx, scope)
+	if err != nil {
+		return "", "", err
+	}
+	coreEntries, archiveEntries, err := parseSections(text)
+	if err != nil {
+		return "", "", err
+	}
+	return renderSectionOrEmpty(sectionCoreTitle, coreEntries),
+		renderSectionOrEmpty(sectionArchiveTitle, archiveEntries), nil
+}
+
 // LoadEffective 返回**生效层**的核心区文本：有 Agent 上下文且该层有内容 → Agent 层，
 // 否则全局层；两层**不叠加**（Agent 层命中时全局层一个字都不进）。回退判定**只此
 // 一处**——提示词侧与工具侧都不得再判一次。
@@ -198,11 +215,19 @@ func (s *Service) coreSectionOf(scope core.Scope, text string) (string, error) {
 			"bytes", total,
 			"limit", core.MaxCoreSectionBytes)
 	}
-	rendered := make([]string, 0, len(coreEntries))
-	for _, entry := range coreEntries {
-		rendered = append(rendered, renderEntry(entry))
+	return renderSectionOrEmpty(sectionCoreTitle, coreEntries), nil
+}
+
+// renderSectionOrEmpty 渲染一个分区：空 → `""`；否则走既有 `renderSection`（标题 +
+// 条目，逐字同重建产物）。命名避开 `markdown.go` 的 `renderSection`——后者语义相反
+// （标题恒出、正文可空，注入期依赖它），两份语义不能合并。
+// renderSectionOrEmpty renders a partition or returns "" when it is empty; it exists
+// because renderSection always emits the heading, which the /memory view must not do.
+func renderSectionOrEmpty(title string, entries []string) string {
+	if len(entries) == 0 {
+		return ""
 	}
-	return sectionCoreTitle + "\n\n" + strings.Join(rendered, "\n\n"), nil
+	return renderSection(title, entries)
 }
 
 // scopeLocks 是进程内 per-scope 写锁：**按完整 core.Scope 分档**——每个 Agent 一把、

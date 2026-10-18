@@ -129,6 +129,19 @@ type SessionLister interface {
 	Messages(ctx context.Context, sessionID string) ([]core.Message, error)
 }
 
+// Server 是命令面对 HTTP 服务面的端口（`serve` 消费，适配器 ← `web.Server`）。
+// Server is the command surface's port onto the HTTP service face.
+//
+// 只声明一条 Run：监听地址、路由、中间件与五阶段停机全部属于实现侧——cli 因此
+// **不 import internal/web**（约束 32），`gateway` / `chat` 也从来看不到这个端口。
+// One method is enough: listening, routing, middleware and the shutdown protocol all
+// belong to the implementation, so cli never imports internal/web.
+type Server interface {
+	// Run 监听并服务，直到 ctx 取消后按五阶段协议收尾。
+	// Run serves until ctx is cancelled, then drains per the five-phase protocol.
+	Run(ctx context.Context) error
+}
+
 // ToolLister 是命令面对**工具注册池**的端口（`tool list` 消费，适配器 ← `tool.Registry`）。
 // ToolLister is the command surface's port onto the tool registry.
 //

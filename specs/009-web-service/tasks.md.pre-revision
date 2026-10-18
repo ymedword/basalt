@@ -1,0 +1,235 @@
+# Tasks: US-9 Web Service（HTTP 接入面与进程模式）
+
+**Input**: Design documents from `/specs/009-web-service/`
+
+**Prerequisites**: [plan.md](./plan.md)、[spec.md](./spec.md)、[research.md](./research.md)、[data-model.md](./data-model.md)、[quickstart.md](./quickstart.md)；事实源 = [docs/us/us9-web-service.md](../../docs/us/us9-web-service.md) §3 / §4 / §6.3
+
+**Tests**: 本 US 的测试是交付物的一部分（颗粒度文档 §3.2 明列 133 条）。测试任务与实现任务成对落位，关键回归**红态先行**（先看到逐字预期失败文案，再改实现）。
+
+**Organization**: 按 spec 的五个用户故事分阶段；Phase 2 承载跨故事的基础件（会话标识、存储读面、记忆分区、信封、视图、服务骨架、中间件）。
+
+## Format: `[ID] [P?] [Story] Description`
+
+- **[P]**: 不同文件、无未完成依赖，可并行
+- **[Story]**: 所属用户故事（US1~US5）；Setup / Foundational / Polish 无标签
+- 每条任务都带精确文件路径
+
+## Path Conventions
+
+单 Go module：`internal/` 下的包；测试与被测包同目录。零新增顶层目录、零新增第三方坐标。
+
+---
+
+## Phase 1: Setup（共享准备）
+
+**Purpose**: 基线核对与包注释改写；不产业务代码。
+
+- [x] T001 核对开工基线并登记：`go version`（≥ toolchain 1.27.2）、`git branch --show-current` = `009-web-service`、`GOPROXY=https://goproxy.cn`；确认 `M docs/contracts/openapi.yaml` 为 D-01 已批准增补、不得覆盖——记录到 `specs/009-web-service/run-state.md` 基线段
+- [x] T002 [P] 改写 `internal/web/doc.go` 包注释：移除「骨架占位：实现随 US-9 落位」，写明包职责（信封 / 路由 / 中间件 / 视图 / handlers）与依赖纪律（只依赖 `internal/core` + 标准库）
+
+---
+
+## Phase 2: Foundational（阻塞前置，所有用户故事依赖）
+
+**Purpose**: 会话标识、存储读面、记忆分区、信封、视图、服务骨架、中间件——五条故事共用的地基。
+
+**⚠ CRITICAL**: 本阶段完成前不进入用户故事阶段。
+
+- [x] T003 [P] 落 `internal/core/sessionid_test.go`：五个具名测试 `TestDeriveSessionID_PinnedVectors`（`cli-a2025c15b5cbc303`、`web-bb27c35eeb3cc34a`）、`TestDeriveSessionID_AdjacentTuplesDoNotCollide`、`TestDeriveSessionID_ResultIsPathAndLogSafe`、`TestDeriveSessionID_EmptyPartsAreEncoded`、`TestDeriveSessionID_HostileChannelFallsBackToSafePrefix`（`../etc` / 含空白与 `%` / 超 32 字符 → 前缀 `ch`）；红态先行
+- [x] T004 落 `internal/core/sessionid.go`：`DeriveSessionID(channel, user, profile string) string`（域串 `basalt/session/v1`、组件 `0x1F` 分隔 + 长度前缀、SHA-256 前 16 hex、安全前缀回落 `ch`）；改 `internal/cli/chat.go` 的 `deriveSessionID` 逐字委托（等价重构，CLI 向量不变）
+- [x] T005 [P] 落 `internal/storage/session_api_test.go`：四个具名测试 `TestSessionStore_GetSessionReadsStatus`（3 例）、`TestSessionStore_GetOrCreateIsIdempotent`（3 例）、`TestSessionStore_ArchiveIsIdempotent`（4 例）、`TestSessionStore_MessagesTailKeepsLatestInOrder`（120→100、首尾、`created_at` 回填）；红态先行
+- [x] T006 改 `internal/storage/session_store.go` 落四条 SQL 方法（`GetSession` / `GetOrCreateSession` / `ArchiveSession` / `MessagesTail`，逐字见颗粒度文档 §3.1；`ArchiveSession` 以 `RowsAffected()==0` → `fs.ErrNotExist`）；改 `internal/core/store.go` 给 `SessionRecord` 追加 `Status` / `ArchivedAt *time.Time`；改 `internal/core/provider.go` 给 `Message` 追加 `CreatedAt time.Time json:"-"`
+- [x] T007 [P] 改 `internal/memory/memory_test.go`（+1：`Sections` 两分区、空分区、与 `LoadEffective` 同源）；改 `internal/memory/memory.go` 落 `Sections(ctx, scope)` 与 `renderSectionOrEmpty`（空 → `""`），`coreSectionOf` 改调后者（输出逐字不变），既有 `renderSection` 不动
+- [x] T008 [P] 落 `internal/web/envelope.go`：`Envelope`、十个错误码常量、`messageSuccess` / `messageBusy` / `messageInternal`、三个 `publicReason*`、`limitReachedMessage`、`publicRunReason`、`writeOK` / `writeResult` / `writeError`（唯一出口；失败永不设 `data`）
+- [x] T009 [P] 落 `internal/web/views.go`：`InfoView` / `ProviderView` / `ProfileView` / `ToolView` / `MemoryView` / `SessionSummaryView` / `MessageView` / `ToolCallView` / `SessionDetailView` / `RunView` 与全部投影函数（空集合输出 `[]`、时间字段 RFC3339 UTC）
+- [x] T010 落 `internal/web/server.go`：`Options` / `ProviderInfo` / 五个端口接口（`RunService` / `SessionStore` / `AgentProfiles` / `ToolCatalog` / `MemorySections`）/ `Server` / `NewServer` / `handler` / `routes`（方法模式 + `/api/v1/` catch-all）/ `newHTTPServer`（四超时）/ `Run`（五阶段停机）/ `cancelBase` / `waitInflight` / `writeTimeout` / `admitRun` / `releaseRun` / `archiveSession`；同任务在 `internal/web/handlers_meta.go` 落 `registeredAgent(name)`（供建会话与 invoke 共用）
+- [x] T011 [P] 落 `internal/web/middleware.go`：`recover` → 请求日志 → `http.CrossOriginProtection` 链；`statusRecorder`、`requestID`、deny handler 写 403 信封（`code=BAD_REQUEST`、「跨源请求被拒绝」）
+- [x] T012 落 `internal/web/contract_test.go`：五个具名测试 `TestContract_EnvelopeShape`（2 例）、`TestContract_TimestampAndContentType`、`TestContract_UnknownRouteIs404Envelope`（未知路径 / 未实现列表 / 方法不符 / 前缀外 4 例）、`TestContract_ErrorMappingByType`（六类错误 6 例）、`TestContract_ViewFieldShapes`（2 例）
+
+**Checkpoint**: `go test ./internal/core ./internal/storage ./internal/memory ./internal/web` 中已落部分可编译；信封 / 路由 / 骨架可被后续故事驱动。
+
+---
+
+## Phase 3: User Story 1 - 业务系统以 HTTP 完成多轮会话 (Priority: P1) 🎯 MVP
+
+**Goal**: 建会话（幂等）→ 发消息（同步运行）→ 取历史（最近 100 条升序）→ 归档（无载荷成功）；每步统一信封。
+
+**Independent Test**: `go test -run 'TestSessions_|TestMessages_' ./internal/web` 全绿；手工链路见 [quickstart.md](./quickstart.md) §6「Demo 四」。
+
+### Implementation for User Story 1
+
+- [x] T013 [US1] 落 `internal/web/handlers_sessions.go` 的建会话与读会话：`handleCreateSession`（缺省 `web` / `anonymous`、`agent` 缺失或 null → 400、未知 / 未注册 → 404、幂等返回既有行、新建显式 `status=active`）、`handleGetSession`（最近 100 条、升序、归档可读）、`decodeBody`（`MaxBytesReader` + 二次 decode 到 EOF）、`writeStoreError`
+- [x] T014 [US1] 在 `internal/web/handlers_test.go` 落 `TestSessions_CreateDefaultsAndIdempotency`（6 例，含两条 400 分支 `GetOrCreateSession` 调用计数不变）与 `TestSessions_GetDetailWindow`（4 例）
+- [x] T015 [US1] 在 `internal/web/handlers_sessions.go` 落 `handlePostMessage`：`message` 必填 / 空串允许 / 32 KiB 运行前判定、归档态 400（`errSessionArchived` →「会话已归档，不可追加消息」）、`admitRun` 准入、`context.WithTimeout` 60s、客户端断开零响应、`writeRunResult` / `writeRunError` / `logClientGone`
+- [x] T016 [US1] 在 `internal/web/handlers_test.go` 落 `TestMessages_SuccessRunView`（2 例）、`TestMessages_RequestValidation`（7 例）、`TestMessages_MessageCapCountsBytesBeforeRun`（32766 / 32768 / 32769 / 零运行痕迹，4 例）
+- [x] T017 [US1] 在 `internal/web/handlers_sessions.go` 落 `handleArchiveSession`（只写 `status` + 首次 `archived_at`、重复幂等、成功无 `data`、忙时 409 冻结文案）与 `handleNotFound`（404 信封）
+- [x] T018 [US1] 在 `internal/web/handlers_test.go` 落 `TestSessions_ArchiveSemantics`（5 例：状态与时间、重复幂等、消息保留、成功响应无 `data` 键、未知 404）
+
+**Checkpoint**: 有状态会话链路可独立验证；信封 / 幂等 / 窗口 / 归档语义全部有测试。
+
+---
+
+## Phase 4: User Story 2 - 一次性任务的无状态调用 (Priority: P2)
+
+**Goal**: `POST /agents/{name}/invoke` 不建会话、不追加消息，但运行记录与审计照写。
+
+**Independent Test**: `go test -run 'TestInvoke_' ./internal/web` 全绿；手工见 [quickstart.md](./quickstart.md) §6「Demo 五」。
+
+- [x] T019 [US2] 在 `internal/web/handlers_sessions.go` 落 `handleInvoke`：`registeredAgent(name)` 不通过 → 404；`RunRequest{SessionID:"", UserID:"anonymous", Channel:"web"}`；无 409、只有 429；响应 `session_id` 为空串
+- [x] T020 [US2] 在 `internal/web/handlers_test.go` 落 `TestInvoke_Stateless`（5 例：`SessionID` 空、零建会话、响应 `session_id` 空、未知 404、32 KiB 超限 400）
+
+**Checkpoint**: 无状态调用与有状态链路共享同一执行入口，且零会话痕迹。
+
+---
+
+## Phase 5: User Story 3 - 并发准入与运行边界 (Priority: P3)
+
+**Goal**: 同会话 409（冻结文案）、实例超限 429（点名上限）、达上限 200 `LIMIT_REACHED`、超时 504、预算来自配置、归档与准入互斥。
+
+**Independent Test**: `go test -run 'TestMessages_(AdmissionErrorMapping|RunStatusMapping|FailureReasonRedaction|RunBudgetPropagation|ClientDisconnectWritesNothing)|TestSessions_ArchiveRejectedWhileRunInflight' ./internal/web` 全绿。
+
+- [x] T021 [US3] 在 `internal/web/handlers_test.go` 落 `TestMessages_AdmissionErrorMapping`（409 冻结文案 / 429 点名上限 / Agent 消失 404，3 例）与 `TestSessions_ArchiveRejectedWhileRunInflight`（同步屏障：运行先 → DELETE 409 且会话仍 active、消息不变；归档先 → POST 400 且 `Run` 零调用，2 例）
+- [x] T022 [US3] 在 `internal/web/handlers_test.go` 落 `TestMessages_RunStatusMapping`（3 例）、`TestMessages_FailureReasonRedaction`（6 例，夹具含绝对路径 / SQL 片段 / 哨兵 `INTERNAL-MARKER-7f3a`；断言响应体与 logger 缓冲均不含哨兵）、`TestMessages_RunBudgetPropagation`（message 与 invoke 各一例）、`TestMessages_ClientDisconnectWritesNothing`（1 例）
+- [x] T023 [US3] 在 `internal/web/server.go` 校核准入与归档的锁内顺序（`admitRun` 状态复核 + 计数、`releaseRun` 归零删除、`archiveSession` 判在途后写入），使 T021 的同步屏障成立；不得引入排队或异步编排
+
+**Checkpoint**: 并发拒绝语义与运行边界全部可判卷；在途计数无泄漏。
+
+---
+
+## Phase 6: User Story 4 - 运维探活与只读清单 (Priority: P4)
+
+**Goal**: `GET /health`、`/info`、`/profiles`、`/tools`、`/memory` 只读、无副作用、无凭证。
+
+**Independent Test**: `go test -run 'TestMeta_' ./internal/web` 全绿；逐项对照 [data-model.md](./data-model.md) §2.3 的字段表。
+
+- [x] T024 [US4] 在 `internal/web/handlers_meta.go` 落五个 handler：`handleHealth`、`handleInfo`（`agents` = 已注册数、`mcp_servers` = `Options.MCPConnected`、provider 无凭证）、`handleProfiles`（装载顺序、未注册给 `problems`）、`handleTools`（`registry.Names()` 顺序、来源 builtin / mcp / code）、`handleMemory`（全局层、两分区、空 → 空串、读取失败 500）
+- [x] T025 [US4] 在 `internal/web/handlers_test.go` 落 `TestMeta_HealthInfo`（4 例：health、info 读数、装载 1 注册 + 1 未注册 → `agents==1` 而 `/profiles` 返回 2 条、provider 摘要无凭证）与 `TestMeta_ProfilesToolsMemory`（7 例：顺序与 problems、三来源与顺序、memory 分区与 backend、读取失败 500）
+
+**Checkpoint**: 五个只读端点可独立验证；计数口径与视图形态与契约一致。
+
+---
+
+## Phase 7: User Story 5 - 进程模式与安全默认 (Priority: P5)
+
+**Goal**: `serve` / `gateway` 命令、装配、信号接线、超时与停机、跨源保护、并发上限与预算传导、资源释放顺序。
+
+**Independent Test**: `go test ./internal/web ./internal/app ./internal/cli`（`TestServer_*` / `TestNewWebServer_*` / `TestServeCommand_*` 等）全绿；真实进程项见 [quickstart.md](./quickstart.md) §6。
+
+- [x] T026 [US5] 在 `internal/web/server_test.go` 落八个具名测试 `TestServer_Defaults`（4 例）、`TestServer_TimeoutsAndWriteBudget`（2 例）、`TestServer_GracefulShutdown`（2 例）、`TestServer_ShutdownGraceExhausted`（1 例，事件序：运行开始 → 监听关闭 → 宽限 500ms 内运行仍存活 / handler ctx 未取消 → 宽限耗尽 → 运行取消 → `Run` 返回且在途计数 0）、`TestServer_WriteBudgetRealConnection`（2 例，真实回环 TCP）、`TestServer_RecoverMiddleware`（2 例）、`TestServer_CrossOriginRejectsWrites`（6 例，403 分支断言零副作用）、`TestServer_RequestLog`（1 例）
+- [x] T027 [US5] 落 `internal/cli/serve.go`：`newServeCommand` / `newGatewayCommand`（`Deps.Server` 为 nil → 可读错误；信号 → `Server.Run`；gateway 占位 INFO + 阻塞、不启 HTTP）；改 `internal/cli/root.go` 注册两条命令；改 `internal/cli/ports.go` 新增 `Server interface{ Run(ctx) error }`；改 `internal/cli/deps.go` 新增 `Server` 字段
+- [x] T028 [US5] 落 `internal/cli/serve_test.go`：`TestServeCommand_RequiresServer`、`TestServeCommand_PropagatesRunError`、`TestGatewayCommand_BlocksUntilSignal`（2 例）、`TestRootCommand_RegistersServeAndGateway`
+- [x] T029 [US5] 改 `internal/cli/config.go`：新增 `ServerConfig{MaxConcurrentRuns int yaml:"max_concurrent_runs"}` 与 `Config.Server`，`validateConfig` 拒负值（点名 `server.max_concurrent_runs`）；改 `internal/cli/config_test.go`（+1 `TestConfig_RejectsNegativeMaxConcurrentRuns`）
+- [x] T030 [US5] 改 `internal/app/wire.go`：`heavyRuntime` 保留 `cfg` / `entries` / `mem` / `mcpConns`；`ServiceOptions` 接线 `MaxConcurrent: cfg.Server.MaxConcurrentRuns`
+- [x] T031 [US5] 落 `internal/app/web.go`：`newWebServer` / `webBudget`（与 `cli.chatBudget` 同口径）/ `ensureWorkspaceForServe` / `webProviders` / `memoryBackendName` / `agentProfilesPort` / `toolCatalogPort` / `newToolCatalogPort`
+- [x] T032 [US5] 落 `internal/app/web_test.go`：`TestNewWebServer_OptionsProjection`（4 例）、`TestWebProviders_NoCredentialFields`（2 例）、`TestEnsureWorkspaceForServe`（2 例）、`TestNeedsServer`、`TestNewRuntime_MaxConcurrentRuns`、`TestNewToolCatalogPort_ClassificationAndOrder`（真实 `tool.Registry`，顺序与三来源）
+- [x] T033 [US5] 改 `internal/app/run.go`：`heavyCommands` 追加 `serve` / `gateway`、新增 `needsServer` / `needsServeInit`、只有 `serve` 自动初始化工作区并注入 `Deps.Server`、抽取 `runWithRuntime`（生产调用点传 `*heavyRuntime`，先 exec 后 Close 恰好一次）；改 `internal/app/run_test.go`（+3：`needsRuntime(serve/gateway)` 追加断言 + 新函数 `TestRunWithRuntime_ReleasesAfterExec`）
+- [x] T034 [US5] 在 `basalt.yaml.example` 的 `http:` 段之后新增 `server:` 段（`max_concurrent_runs: 32` 示例），与 `docs/contracts` 的键名一致
+
+**Checkpoint**: 五个故事全部可独立验证；进程模式、超时矩阵、跨源保护、资源释放顺序全部有测试。
+
+---
+
+## Phase 8: Polish & Cross-Cutting Concerns
+
+**Purpose**: 文档同步、stage 派生、阶段验收与收口证据。
+
+- [x] T035 [P] 同步 `docs/TechnicalDesign.md` §6.2.1（§3.5 #15 的文档同步点）；核对 `docs/contracts/openapi.yaml` 的 D-01 增补（DELETE 409 / POST /sessions 400）与实现一致，**不新增**契约变更
+- [x] T036 从 `harness/stage.example.json` 派生 `harness/stages/us9-web.json`：九个 check ID（`009-web-contract` / `009-web-handlers` / `009-web-server` / `009-web-race` / `009-storage-session-api` / `009-core-sessionid` / `009-cli-serve` / `009-app-web` / `009-cli-config`）的 argv、timeout、`required_tests` 逐字取自颗粒度文档 §4.4；登记 tasks 映射、保护路径与输入指纹
+- [x] T037 跑完整验收并记录证据：`sh scripts/check-acceptance.sh --stage harness/stages/us9-web.json`（Windows `.\scripts\check-acceptance.ps1`）九个 check 全 PASS；`make check` 七目标全绿；`make cover` 达标；按颗粒度文档 §6.1 在临时工作区执行真实进程项——启动 `basalt serve` 读端口绑定（`netstat -ano`）、归档后停止并重启复核 `status=archived`、SIGTERM 触发停机（Windows 记「未验证」并注原因）——读数一并写入收口报告与 `specs/009-web-service/run-state.md`（未验证项保持「未验证」）；临时物用毕即删
+- [x] T038 执行 [quickstart.md](./quickstart.md) §5 的九条依赖方向 / 红线 grep 与 §8 清理（临时探针、临时工作区、临时二进制用毕即删；`run-state.md` 保留）
+
+---
+
+## Phase 9: 收口复核退回修复（R5，2026-10-18）
+
+**Purpose**: 用户四项故障探针复现的收尾与日志遗漏（2 HIGH / 2 MEDIUM）；逐项修复并补具名回归，复跑完整 stage 后重新提交 review ②。约束与边界同步见颗粒度文档 R5 节。
+
+- [x] T039 [修复] 改 `internal/web/server.go`：`Run` 的信号路径与 `Serve` 错误路径统一走 `stopServing`（置 draining → `cancelBase` → `srv.Close()` → 有界等待 → 超时记 ERROR 后继续 `inflight.Wait()`）；`lifecycleMu` 保护 `draining` 与在途登记互斥；新增 `drainTimeoutOverride` 测试接缝——对应用户探针缺陷 1 / 2
+- [x] T040 [修复] 在 `internal/web/server_test.go` 落 `TestServer_ServeErrorUnifiedCleanup`（R21：外部关闭监听器触发 Serve 错误，`Run` 返回前运行已取消、在途归零）与 `TestServer_ShutdownDrainTimeoutWaitsForHandler`（R22：等待超时后 handler 仍存活时 `Run` 不返回）
+- [x] T041 [修复] 改 `internal/web/middleware.go`：请求标识改在链首 `recoverMiddleware` 生成并注入 context；完成日志移入 `defer`（panic 未写头记 `status=500`，不 recover）；在 `internal/web/server_test.go` 落 `TestServer_PanicLogSharesRequestID`（R23：完整 `handler()` 链，panic 与完成日志共享非空 `request_id`）——对应用户探针缺陷 3
+- [x] T042 [修复] 改 `internal/web/envelope.go` 新增 `sanitizeRunReason`（凭证 / Bearer / 引号字面量 / URL / 绝对路径 / SQL 正文 → 占位，截断 256 字符）；改 `internal/web/handlers_sessions.go` 的 `writeRunResult` 为 failed 记 WARN（`run_id` / `request_id` / `session_id` / `agent` / 脱敏 `diagnostic`）；在 `handlers_test.go` 落 `TestMessages_FailedRunDiagnosticLogged`（R24）——对应用户探针缺陷 4
+- [x] T043 [修复] 同步颗粒度文档 R5 节（约束 20 / 21 / 23、§6.3 #21 / #22 / #24、§3.2 计数、§4.2~§4.4 映射、R21~R24）与 `specs/009-web-service/` 的 spec / plan / research / quickstart；刷新 `harness/stages/us9-web.json` 的 `required_tests`、T039~T042 任务绑定与 approval 指纹；对 `tasks.md.pre-revision` 跑两条修订自检命令
+- [x] T044 [修复] 复跑 `sh scripts/check-acceptance.sh --stage harness/stages/us9-web.json`（九个 check 含扩展后的 `required_tests`）、`make check` 与 `make cover`；读数写入 `run-state.md` 与收口报告后重新提交 review ②；真实模型 / 真实进程信号等项保持「未验证」
+
+---
+
+## Phase 10: 独立复核发现处置（R6，2026-10-18）
+
+**Purpose**: 独立复核（带条件通过）发现 2 MEDIUM / 4 LOW：Authorization 头凭证投影绕过、R21 判别力不足、模块卡文档漂移、sanitizer 边角、panic 已写头无具名用例、客户端断开丢失 failed 诊断。逐项处置并补具名夹具后复跑完整 stage，重新提交 review ②。
+
+- [x] T045 [修复] 改 `internal/web/envelope.go`：新增 `runReasonAuth` 专用规则（Authorization 连 scheme 与凭证整体投影，先于通用键值规则）；SQL 正文跨行遮蔽到分号或串尾；路径允许空格并覆盖 Windows 盘符与 UNC；引号支持反斜杠转义；在 `handlers_test.go` 的 R15 增 Bearer / Basic 两例、R24 增同两例与多行 SQL / 含空格路径 / UNC / 转义引号四例——对应 R5R-01 / R5R-04
+- [x] T046 [修复] 补强 `internal/web/server_test.go`：R21 改为 handler 收取消后继续阻塞（`drainTimeoutOverride=50ms`；断言清理开始、`srv.Close` 关闭活动连接、Run 在 300ms 内不返回、放行后在途归零）；R23 增「panic 已写头」子用例（逐字 200 / 单份信封 / 完成行 `status=200` / 共享 `request_id`）——对应 R5R-02 / R5R-05
+- [x] T047 [修复] 改 `internal/web/handlers_sessions.go`：两条客户端断开分支先 `logFailedRun` 再 `logClientGone`；在 `handlers_test.go` 的 R24 增「客户端断开仍留 failed 诊断」子用例（诊断存在、`run_id` 在场、敏感标记不落日志）——对应 R5R-06
+- [x] T048 [文档] 同步颗粒度文档 R6 节（§2.3 伪代码、§3.1 声明与函数清单、§3.2 计数与行 9 / 15 / 16、§4.3 R15 / R16 / R21 / R23 描述、`独立复核发现处置（R6）`）与 spec FR-029 / plan / quickstart 计数；刷新 `harness/stages/us9-web.json` 的 approval 输入指纹（`required_tests` 不新增函数名）；对 `tasks.md.pre-revision` 跑两条修订自检命令——对应 R5R-03
+- [x] T049 [验收] 复跑 `sh scripts/check-acceptance.sh --stage harness/stages/us9-web.json`、`make check` 与 `make cover`；固定行为 / 注入评测与阶段断言全绿；读数写入 `run-state.md` 与收口报告后重新提交 review ②；真实模型 / 真实进程信号等项保持「未验证」
+
+---
+
+## Dependencies & Execution Order
+
+### Phase Dependencies
+
+- **Setup (Phase 1)**: 无依赖，立即开始
+- **Foundational (Phase 2)**: 依赖 Setup；**阻塞全部用户故事**
+- **User Stories (Phase 3~7)**: 均依赖 Foundational；故事之间无硬依赖（US2 / US4 复用 US1 落下的 `handlers_sessions.go` 与 `handlers_meta.go`，按优先级顺序执行即可）
+- **Polish (Phase 8)**: 依赖全部故事完成
+
+### User Story Dependencies
+
+- **US1 (P1)**: Foundational 后即可开始——MVP
+- **US2 (P2)**: Foundational 后即可开始；与 US1 共享 `registeredAgent`（T010 已落）
+- **US3 (P3)**: Foundational 后即可开始；同步屏障依赖 T010 的准入辅助（T023 校核）
+- **US4 (P4)**: Foundational 后即可开始；只读端点互不依赖
+- **US5 (P5)**: 依赖 US1~US4 的行为已落（装配与进程模式把前四个故事接进真实二进制）
+
+### Within Each User Story
+
+- 测试与实现成对落位；关键回归先红后绿（T003 / T005 / T012 / T021 / T022 / T026）
+- 同一文件的任务按 ID 顺序执行（`handlers_sessions.go`：T013 → T015 → T017 → T019；`handlers_meta.go`：T010 → T024）
+
+### Parallel Opportunities
+
+- Foundational：T003 / T005 / T007 / T008 / T009 可并行（不同包 / 不同文件）
+- US4：T024 与 US1 / US2 的 handler 任务互不改文件（`handlers_meta.go` vs `handlers_sessions.go`）
+- Polish：T035 与代码任务无冲突
+
+---
+
+## Parallel Example: Foundational
+
+```bash
+# 不同包、不同文件，可同时开工：
+Task: "internal/core/sessionid_test.go 五个具名测试"       # T003
+Task: "internal/storage/session_api_test.go 四个具名测试"  # T005
+Task: "internal/memory/memory_test.go +1 与 Sections 读面" # T007
+Task: "internal/web/envelope.go"                           # T008
+Task: "internal/web/views.go"                              # T009
+```
+
+---
+
+## Implementation Strategy
+
+### MVP First (User Story 1 Only)
+
+1. Phase 1 Setup → Phase 2 Foundational
+2. Phase 3 US1（建会话 / 发消息 / 取历史 / 归档）
+3. **STOP and VALIDATE**：`go test -run 'TestSessions_|TestMessages_' ./internal/web`
+4. 可手工跑 [quickstart.md](./quickstart.md) §6 的 Demo 四
+
+### Incremental Delivery
+
+1. Foundational → 信封 / 路由 / 存储可独立验证
+2. US1 → 有状态链路（MVP）
+3. US2 → 无状态 invoke
+4. US3 → 并发与运行边界
+5. US4 → 只读清单
+6. US5 → 进程模式与安全默认
+7. Polish → 文档同步、stage、完整验收、清理
+
+### Notes
+
+- 每个任务先跑对应包测试，失败即时修复，不累积到任务末尾
+- 同一问题修复 3 次不收敛 → 停下走 `/debug`；预算与计数写 `run-state.md`
+- 判据面变更仅 §3.2 三处追加与 §3.5 第 6 / 10 条等价重构；既有断言零删除、零跳过、零放宽
+- 零新增第三方坐标、零迁移、零新增配置键；`go.mod` / `go.sum` / `schema.sql` 零 diff

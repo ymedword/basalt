@@ -35,10 +35,11 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		},
 	}
 
-	// 注册点：init / status / provider / profile / chat / session / tool 七条子命令由各自
-	// 的任务落地后在此注册——骨架期保持"零子命令也可编译"，避免门禁依赖尚未交付的故事。
-	// Registration site: init, status, provider, profile, chat, session and tool land here
-	// as their tasks complete, so the skeleton stays buildable ahead of those stories.
+	// 注册点：init / status / provider / profile / chat / session / tool / serve / gateway
+	// 九条子命令由各自的任务落地后在此注册——骨架期保持"零子命令也可编译"，避免门禁依赖
+	// 尚未交付的故事。
+	// Registration site: the nine subcommands land here as their tasks complete, so the
+	// skeleton stays buildable ahead of those stories.
 	root.AddCommand(
 		newInitCommand(deps),
 		newStatusCommand(deps),
@@ -47,6 +48,8 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newChatCmd(deps),
 		newSessionCmd(deps),
 		newToolCommand(deps),
+		newServeCommand(deps),
+		newGatewayCommand(deps),
 	)
 
 	return root

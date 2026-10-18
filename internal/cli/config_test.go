@@ -535,3 +535,35 @@ func TestLoadConfig_RejectsUnknownMemoryBackend(t *testing.T) {
 		})
 	}
 }
+
+// TestConfig_RejectsNegativeMaxConcurrentRuns 验收并发上限配置键落位（约束 31 /
+// W14）：负数在装载期拒绝并点名 `server.max_concurrent_runs`；0 与缺省原样通过
+// ——缺省 32 是 core 的唯一决定，装载层不预填、不改写。
+// 逆改点：删掉负数分支 → 第一个子用例拿不到错误（红）；把 0 也拒掉 → 后两个子用例红。
+func TestConfig_RejectsNegativeMaxConcurrentRuns(t *testing.T) {
+	env := envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	})
+
+	t.Run("负值拒载并点名配置键", func(t *testing.T) {
+		path := writeConfig(t, baseConfig+"server:\n  max_concurrent_runs: -1\n")
+		_, err := cli.LoadConfig(path, env)
+		require.Error(t, err, "负数必须拒绝启动（0 才是缺省）")
+		require.Contains(t, err.Error(), "server.max_concurrent_runs", "拒绝文案必须点名配置键")
+	})
+
+	t.Run("零表示缺省放行", func(t *testing.T) {
+		path := writeConfig(t, baseConfig+"server:\n  max_concurrent_runs: 0\n")
+		cfg, err := cli.LoadConfig(path, env)
+		require.NoError(t, err, "0 = 缺省 32，是合法取值")
+		require.Zero(t, cfg.Server.MaxConcurrentRuns, "装载层不预填缺省——32 由 core 决定")
+	})
+
+	t.Run("不写 server 段放行", func(t *testing.T) {
+		path := writeConfig(t, baseConfig)
+		cfg, err := cli.LoadConfig(path, env)
+		require.NoError(t, err, "server 段是可选段")
+		require.Zero(t, cfg.Server.MaxConcurrentRuns)
+	})
+}

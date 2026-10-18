@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
@@ -99,6 +100,142 @@ func (s *SessionStore) Messages(ctx context.Context, sessionID string) ([]core.M
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("读会话历史（session_id=%s）: %w", sessionID, err)
+	}
+	return out, nil
+}
+
+// GetSession 读一行会话（含 status / archived_at）；无行 → fs.ErrNotExist。
+// GetSession reads one session row, mapping a miss to fs.ErrNotExist.
+func (s *SessionStore) GetSession(ctx context.Context, id string) (core.SessionRecord, error) {
+	var (
+		rec                     core.SessionRecord
+		createdAt, lastActiveAt int64
+		archivedAt              sql.NullInt64
+	)
+	err := s.db.read.QueryRowContext(ctx,
+		`SELECT session_id, profile_name, channel, user_id, status, message_count,
+		        created_at, last_active_at, archived_at
+		   FROM sessions WHERE session_id = ?`, id).
+		Scan(&rec.ID, &rec.ProfileName, &rec.Channel, &rec.UserID, &rec.Status,
+			&rec.MessageCount, &createdAt, &lastActiveAt, &archivedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.SessionRecord{}, fs.ErrNotExist
+	}
+	if err != nil {
+		return core.SessionRecord{}, fmt.Errorf("读会话行（session_id=%s）: %w", id, err)
+	}
+	rec.CreatedAt = time.UnixMilli(createdAt).UTC()
+	rec.LastActiveAt = time.UnixMilli(lastActiveAt).UTC()
+	if archivedAt.Valid {
+		at := time.UnixMilli(archivedAt.Int64).UTC()
+		rec.ArchivedAt = &at
+	}
+	return rec, nil
+}
+
+// GetOrCreateSession 建行或返回既有行；created 表示本次新建。
+// 同 tuple 派生同一 id；已归档行原样返回（不复活）。
+// GetOrCreateSession inserts the row or returns the existing one; the DO NOTHING
+// conflict clause means an archived row stays archived with its original times.
+func (s *SessionStore) GetOrCreateSession(ctx context.Context, rec core.SessionRecord) (core.SessionRecord, bool, error) {
+	var created bool
+	err := withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx,
+			`INSERT INTO sessions (session_id, profile_name, channel, user_id,
+			                      message_count, created_at, last_active_at)
+			 VALUES (?, ?, ?, ?, 0, ?, ?)
+			 ON CONFLICT(session_id) DO NOTHING`,
+			rec.ID, rec.ProfileName, rec.Channel, rec.UserID,
+			rec.CreatedAt.UnixMilli(), rec.LastActiveAt.UnixMilli())
+		if err != nil {
+			return fmt.Errorf("建会话行（session_id=%s）: %w", rec.ID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("确认会话行写入（session_id=%s）: %w", rec.ID, err)
+		}
+		created = affected > 0
+		return nil
+	})
+	if err != nil {
+		return core.SessionRecord{}, false, err
+	}
+	got, err := s.GetSession(ctx, rec.ID)
+	if err != nil {
+		return core.SessionRecord{}, false, err
+	}
+	return got, created, nil
+}
+
+// ArchiveSession 置 archived 并首次写 archived_at；重复调用幂等；未知 id → fs.ErrNotExist。
+// ArchiveSession flips status to archived and keeps the first archived_at; SQLite counts
+// WHERE-matched rows even when the value is unchanged, so a repeat stays idempotent.
+func (s *SessionStore) ArchiveSession(ctx context.Context, id string, at time.Time) error {
+	return withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx,
+			`UPDATE sessions SET status = 'archived', archived_at = COALESCE(archived_at, ?)
+			 WHERE session_id = ?`, at.UnixMilli(), id)
+		if err != nil {
+			return fmt.Errorf("归档会话（session_id=%s）: %w", id, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("确认归档写入（session_id=%s）: %w", id, err)
+		}
+		if affected == 0 {
+			return fs.ErrNotExist
+		}
+		return nil
+	})
+}
+
+// MessagesTail 取最近 limit 条（按 seq 升序返回），含 created_at。
+// MessagesTail reads the latest limit messages in ascending seq order, created_at
+// included (the SQL runs DESC LIMIT and the slice is reversed in Go).
+func (s *SessionStore) MessagesTail(ctx context.Context, id string, limit int) ([]core.Message, error) {
+	rows, err := s.db.read.QueryContext(ctx,
+		`SELECT content, role, tool_calls, tool_call_id, reasoning_content,
+		        provider_extra, created_at
+		   FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`, id, limit)
+	if err != nil {
+		return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []core.Message
+	for rows.Next() {
+		var (
+			content, role, calls, callID, reasoning, extra sql.NullString
+			createdAt                                      int64
+		)
+		if err := rows.Scan(&content, &role, &calls, &callID, &reasoning, &extra, &createdAt); err != nil {
+			return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
+		}
+		parsedCalls, err := parseToolCalls(calls.String)
+		if err != nil {
+			// 解不开**不猜**（与 Messages 同一条判据）：这一列只由本仓写入。
+			return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
+		}
+		parsedExtra, err := decodeProviderExtra(extra.String)
+		if err != nil {
+			return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
+		}
+		out = append(out, core.Message{
+			Role:             role.String,
+			Content:          content.String,
+			ToolCalls:        parsedCalls,
+			ToolCallID:       callID.String,
+			ReasoningContent: reasoning.String,
+			ProviderExtra:    parsedExtra,
+			CreatedAt:        time.UnixMilli(createdAt).UTC(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
+	}
+	// SQL 取的是"最近 N 条"（DESC），对外按 seq 升序——反转在此处完成，调用方不排序。
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
 }

@@ -133,6 +133,8 @@ paths:
     post:
       tags: [core]
       summary: 创建会话
+      description: |
+        参数校验失败（含 `agent` 缺失 / `null`）返回 400，**不创建、不修改**任何会话。
       requestBody:
         required: true
         content:
@@ -155,6 +157,7 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/SessionSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
     get:
       tags: [console]
@@ -205,10 +208,14 @@ paths:
     delete:
       tags: [core]
       summary: 归档会话
-      description: 归档不删数据（status 置 archived）。
+      description: |
+        归档不删数据（status 置 archived）。
+        会话有在途运行时返回 409（不排队、不打断运行），**不产生任何归档写入**：
+        status、archived_at 与消息均保持不变。
       responses:
         '200': { $ref: '#/components/responses/OK' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/SessionBusy' }
 
   /sessions/{id}/messages:
     parameters:

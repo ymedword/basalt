@@ -22,6 +22,8 @@ type Message struct {
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 	ReasoningContent string         `json:"reasoning_content,omitempty"`
 	ProviderExtra    map[string]any `json:"provider_extra,omitempty"`
+	// CreatedAt 是读面时间戳：Messages 不填，仅 MessagesTail 填充；协议序列化不含它。
+	CreatedAt time.Time `json:"-"`
 }
 
 // ToolCall 是模型给出的工具调用请求：本 US 只透传，执行权归 US-4 的 ToolExecutor。

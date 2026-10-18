@@ -2,6 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,5 +42,74 @@ func TestRun_HeavyCommandSplit(t *testing.T) {
 	require.False(t, needsRuntime([]string{"session", "list"}), "session 仍是轻命令（不取锁）")
 	require.True(t, needsReadStore([]string{"session", "list"}), "session 需要一条只读库句柄")
 
+	require.True(t, needsRuntime([]string{"serve"}), "serve 是重命令（US-9：全量装配 + HTTP 面）")
+	require.True(t, needsRuntime([]string{"gateway"}), "gateway 是重命令（US-9：全量装配 + 常驻）")
+
 	require.False(t, needsRuntime([]string{"--version"}), "全是选项的调用没有命令名")
+}
+
+// TestRunWithRuntime_ReleasesAfterExec 对应颗粒度文档 R17（原文保留）：
+// 「逆改点：把 defer rt.Close() 留在 runWithRuntime 之外或提前执行 → order 变成
+// ["runtime-close", "exec"]，断言红；runWithRuntime 忘记 defer → exec 出错时资源不
+// 释放，第二分支红；Close 调用两次 → closeCalls 断言红」。
+func TestRunWithRuntime_ReleasesAfterExec(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("正常返回后释放", func(t *testing.T) {
+		rt := &closeRecorderRuntime{}
+		err := runWithRuntime(rt, logger, func() error {
+			rt.record("exec")
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{"exec", "runtime-close"}, rt.order(),
+			"共享资源必须在 exec（Serve）返回之后才释放")
+		require.Equal(t, 1, rt.closeCallCount(), "Close 必须恰好调用一次")
+	})
+
+	t.Run("exec 出错也释放", func(t *testing.T) {
+		rt := &closeRecorderRuntime{}
+		err := runWithRuntime(rt, logger, func() error {
+			rt.record("exec")
+			return errors.New("serve failed")
+		})
+		require.Error(t, err)
+		require.Equal(t, []string{"exec", "runtime-close"}, rt.order())
+		require.Equal(t, 1, rt.closeCallCount())
+	})
+}
+
+// closeRecorderRuntime 是 runtimeCloser 的记录型实现。heavyRuntime.Close 内部
+// 「MCP → DB → 锁」的顺序由既有实现保证（wire.go），本用例只验证调用时机与单次性。
+type closeRecorderRuntime struct {
+	mu         sync.Mutex
+	events     []string
+	closeCalls int
+}
+
+func (r *closeRecorderRuntime) record(e string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *closeRecorderRuntime) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, "runtime-close")
+	r.closeCalls++
+	return nil
+}
+
+// order / closeCallCount 返回加锁副本（-race 下不得直接读未加锁字段）。
+func (r *closeRecorderRuntime) order() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.events)
+}
+
+func (r *closeRecorderRuntime) closeCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closeCalls
 }

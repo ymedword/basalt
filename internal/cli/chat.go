@@ -9,8 +9,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -31,13 +29,6 @@ const (
 	// `context.WithTimeout` 取更早者——Ctrl-C 是取消、不是资源时限，两者互不替代。
 	// chatRunTimeout is the per-run deadline; an earlier caller deadline wins.
 	chatRunTimeout = 60 * time.Second
-
-	// sessionIDDomain 是派生哈希的域前缀（§6.2 固定口径 1 逐字）。
-	sessionIDDomain = "basalt/session/v1"
-	// sessionIDSep 是规范元组编码的字段分隔字节（0x1F，US——域内不会自然出现的控制字符）。
-	sessionIDSep = 0x1F
-	// sessionIDHashHexLen 是取十六进制**前 16 位**（§6.2 固定口径 1 逐字）。
-	sessionIDHashHexLen = 16
 
 	// toolLineFormat 是工具调用提示行（§6.2 固定口径 4 逐字：`⚙ 调用工具 <name>…`）——
 	// **只打工具名**：入参是模型给的内容、结果是工具产物（可能是整篇文件），两者都不落屏
@@ -208,25 +199,11 @@ func (r *chatRunner) handle(ctx context.Context, msg channel.Message) (channel.R
 	return channel.Reply{Text: text}, nil
 }
 
-// deriveSessionID 按**规范元组编码 + 稳定哈希**派生会话标识（§6.2 固定口径 1，逐字）：
-// `sha256("basalt/session/v1" ‖ 0x1F ‖ <len(channel)>:channel ‖ 0x1F ‖ <len(user)>:user ‖
-// 0x1F ‖ <len(profile)>:profile)` 取十六进制前 16 位，前缀渠道名（如 `cli-3f9a1c07b2d84e55`）。
-// deriveSessionID derives the session id from the canonical tuple encoding.
-//
-// **长度前缀**是这一步的全部要点：`user=a-b, profile=c` 与 `user=a, profile=b-c` 直接拼接
-// 出的字节完全一样，只有把每段的长度也编进元组，两种组合才会落到不同摘要上（§4.3 判据）。
-// 结果只含 `[a-z0-9-]`：渠道名是本地常量、其余部分是十六进制——哈希把任意用户输入（含
-// 路径分隔符与控制字符）折成定长十六进制，标识因此永远可以安全地当文件名与日志字段用。
-// The length prefix is the point: the same bytes concatenate from different tuples
-// otherwise. The hex digest keeps arbitrary user input out of the resulting id.
+// deriveSessionID 委托 `core.DeriveSessionID`（约束 12：唯一实现；等价重构，输出
+// 逐字不变——CLI 向量 `cli-a2025c15b5cbc303` 由 core 测试与既有 CLI 测试共同钉死）。
+// deriveSessionID delegates to core.DeriveSessionID; the CLI vector is unchanged.
 func deriveSessionID(channel, user, profile string) string {
-	digest := sha256.New()
-	digest.Write([]byte(sessionIDDomain))
-	for _, part := range []string{channel, user, profile} {
-		digest.Write([]byte{sessionIDSep})
-		fmt.Fprintf(digest, "%d:%s", len(part), part)
-	}
-	return channel + "-" + hex.EncodeToString(digest.Sum(nil))[:sessionIDHashHexLen]
+	return core.DeriveSessionID(channel, user, profile)
 }
 
 // renderTurn 把一轮运行渲染成文本（§6.2 固定口径 4）。返回文本与新的消息游标。

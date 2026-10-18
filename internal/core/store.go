@@ -172,6 +172,10 @@ type SessionRecord struct {
 	MessageCount int
 	CreatedAt    time.Time
 	LastActiveAt time.Time
+	// Status 是会话状态（active | archived）；ListSessions 不填，保持零值。
+	Status string
+	// ArchivedAt 是可空归档时间；仅 GetSession / ArchiveSession 填充。
+	ArchivedAt *time.Time
 }
 
 // RunRecord 是运行账本的**起始行载体**：只含开跑前可知的字段。

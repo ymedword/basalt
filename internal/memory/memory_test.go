@@ -123,6 +123,40 @@ func TestService_LoadEffective_ReturnsCoreSectionOnly(t *testing.T) {
 	require.NotContains(t, got, "只在检索时露面的细节", "归档区不进注入面")
 }
 
+// TestService_Sections_TwoPartitionsAndEmptyAsEmptyString 守 /memory 读面（W10）：
+// `Sections` 返回两分区全文（带标题、互不串门），空分区是空串（不是只剩标题行），
+// 且核心区逐字等于 `LoadEffective` 的注入文本（同一解析 + 重建路径）。
+// Sections returns both titled partitions, an empty partition as "", and the core
+// text identical to LoadEffective's injection text.
+func TestService_Sections_TwoPartitionsAndEmptyAsEmptyString(t *testing.T) {
+	for _, c := range carriersForTest(t) {
+		t.Run(c.name, func(t *testing.T) {
+			svc, err := memory.NewService(memory.Options{Backend: c.store, Logger: testLogger(t)})
+			require.NoError(t, err)
+
+			require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionCore, "- 每轮都要看的偏好"))
+			coreText, archiveText, err := svc.Sections(ctx, core.GlobalScope)
+			require.NoError(t, err)
+			require.Contains(t, coreText, "## 核心记忆")
+			require.Contains(t, coreText, "每轮都要看的偏好")
+			require.Equal(t, "", archiveText, "空分区必须是空串")
+
+			require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionArchive, "- 只在检索时露面的细节"))
+			coreText, archiveText, err = svc.Sections(ctx, core.GlobalScope)
+			require.NoError(t, err)
+			require.Contains(t, coreText, "每轮都要看的偏好")
+			require.NotContains(t, coreText, "只在检索时露面的细节")
+			require.Contains(t, archiveText, "## 归档记忆")
+			require.Contains(t, archiveText, "只在检索时露面的细节")
+			require.NotContains(t, archiveText, "每轮都要看的偏好")
+
+			injection, err := svc.LoadEffective(ctx, "")
+			require.NoError(t, err)
+			require.Equal(t, coreText, injection, "Sections 核心区必须与 LoadEffective 同源")
+		})
+	}
+}
+
 // TestService_RequiresBackend 守「没有载体就没有记忆」（口径 18 同族）：`Options.Backend`
 // 零值 → `NewService` 拒绝构造（fail-closed），且**不得**交出可用实例。
 // 验收点：口径 18。

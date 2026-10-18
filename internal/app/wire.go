@@ -369,6 +369,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Loop:      loop,
 		Logger:    logger,
 		Now:       a.nowOr(),
+		// 并发上限接线（US-9 约束 31）：0 / 未配置由 core 落缺省 32，负数已在装载期拒绝。
+		// The cap is wired explicitly; zero falls back to core's single default.
+		MaxConcurrent: cfg.Server.MaxConcurrentRuns,
 	})
 
 	logger.Info("重路径装配完成", "agents", len(agents.entries), "tools", registry.Names(),
@@ -382,6 +385,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		llmCalls:    llmCalls,
 		registry:    registry,
 		mcp:         mcpPool,
+		// US-9 追加的只读装配态：全部是本次装配里**已经算出来的值**的保留，不新增读取。
+		// US-9's read-only assembly state: values already computed here, merely retained.
+		cfg:      cfg,
+		entries:  entries,
+		mem:      memSvc,
+		mcpConns: mcpConns,
 	}, nil
 }
 
@@ -506,6 +515,27 @@ type heavyRuntime struct {
 	// 之后才是写池的最后一批使用者（约束 21：MCP → 库 → 锁）。
 	// The MCP pool (nil without configuration); it must close before the database.
 	mcp mcpConnector
+
+	// 以下为 US-9 追加的只读装配态（均为既有局部值的保留，不新增读取）：
+	// US-9 retains the read-only assembly state computed above.
+	//
+	// cfg 是**生效配置**：配置文件缺失时装配用的是 `&cli.Config{}`，此处保存的是同一个值，
+	// 绝不可能是 nil——HTTP 装配面因此不必再判一次"配置在不在"。
+	// cfg is the effective configuration, never nil.
+	cfg *cli.Config
+
+	// entries 是**全部**装载结果（含未注册项）——`/profiles` 要把未注册原因作为 problems
+	// 呈现出来，只保留注册成功项会让拒绝原因静默消失。
+	// entries keeps every loader result, rejects included, for /profiles' problems.
+	entries []core.AgentEntry
+
+	// mem 是记忆门面（`/memory` 两分区读面）；与工具侧消费的是同一个实例。
+	// mem is the one memory facade shared with the tool side.
+	mem *memory.Service
+
+	// mcpConns 是已连接的 MCP server 与工具（`/info` 的连接数与 `/tools` 的 mcp 来源）。
+	// mcpConns carries the connected MCP servers and their tools.
+	mcpConns []tool.MCPConnection
 }
 
 // Close 按**相反次序**释放：MCP 连接池 → 数据库 → 实例锁（约束 21）。池先收子进程与

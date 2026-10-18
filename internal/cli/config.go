@@ -29,6 +29,7 @@ import (
 // ahead of the US that consumes it. Only author still keeps its raw shape.
 type Config struct {
 	HTTP      HTTPConfig       `yaml:"http"`
+	Server    ServerConfig     `yaml:"server"`
 	Log       LogConfig        `yaml:"log"`
 	Providers []ProviderConfig `yaml:"providers"`
 	Budget    BudgetConfig     `yaml:"budget"`
@@ -55,6 +56,19 @@ type HTTPConfig struct {
 	// 配置键的形状一变，运维侧就得改文件）。
 	// AllowedDomains is the outbound domain allowlist, consumed by US-5's network tools.
 	AllowedDomains []string `yaml:"allowed_domains"`
+}
+
+// ServerConfig 是进程级服务参数（`server` 段，技术方案 §5.2）。
+// ServerConfig is the process-level service section.
+//
+// 本段只承载本 US 落位的既有契约键 `max_concurrent_runs`；其余服务旋钮
+// （停机宽限、运行时限）按需求边界保持不可配置。
+// Only the already-contracted max_concurrent_runs key lands here; the shutdown grace
+// and run timeout stay non-configurable by scope.
+type ServerConfig struct {
+	// MaxConcurrentRuns 是实例并发运行上限；0 / 缺省 = core 缺省 32，负数装载期拒绝。
+	// MaxConcurrentRuns is the instance-wide run cap; zero defers to core's default 32.
+	MaxConcurrentRuns int `yaml:"max_concurrent_runs"`
 }
 
 // SandboxConfig 是沙箱授权判定的配置面（`sandbox` 段）。
@@ -382,6 +396,12 @@ func credentialValues(tree map[string]any) []string {
 // validateConfig 做取值域与必填校验（类型校验已由解码完成）。
 // validateConfig checks value domains and required fields.
 func validateConfig(cfg *Config) error {
+	// server.max_concurrent_runs：负数拒绝、0 交给 core 的缺省逻辑（32）——装载期
+	// 只判"不可能取值"，缺省语义只在一处（core.NewAgentService）。
+	// Negative values fail closed; zero defers to the single default in core.
+	if cfg.Server.MaxConcurrentRuns < 0 {
+		return fmt.Errorf("配置项 server.max_concurrent_runs 不得为负：%d（0 表示缺省 32）", cfg.Server.MaxConcurrentRuns)
+	}
 	if cfg.Log.Level != "" && !validLogLevels[cfg.Log.Level] {
 		return fmt.Errorf("配置项 log.level 取值非法（%s）——只允许 debug / info / warn / error", cfg.Log.Level)
 	}
