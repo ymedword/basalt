@@ -35,13 +35,19 @@ const roleSystem = "system"
 // RunRequest 承载一次运行的全部输入（显式类型化参数，不放在 context 里——宪法 VII）。
 // RunRequest carries every input of one run as an explicit typed value.
 type RunRequest struct {
-	Agent      string // Agent 名（Profile 解析的键）
-	SessionID  string // 会话标识；无状态调用时为空
-	Message    string // 用户消息
-	Channel    string // 来源渠道：cli / web / scheduler / admin
-	UserID     string // 用户标识
-	Budget     Budget // 执行预算（见契约 §6）
-	ConfigHash string // 由运行时填充的配置快照版本（调用方不填）
+	RunID     string  // 调用方指定；空 = 由 AgentService 生成（web / cli 保持空）
+	Agent     string  // Agent 名（Profile 解析的键）
+	SessionID string  // 会话标识；无状态调用时为空
+	Message   string  // 用户消息
+	Channel   string  // 来源渠道：cli / web / scheduler / admin
+	UserID    string  // 用户标识
+	Trigger   Trigger // 空 = 由 Channel 推导；scheduler 渠道填 cron / manual
+	// RequireExistingSession 为真时，会话不存在 → *SessionNotFoundError（HTTP 消息面）；
+	// 为假时会话缺失由 Run 自动创建（CLI / 调度器）。两种情况都拒绝已归档会话，
+	// 但仅当 SessionID != "" 且装配了 SessionStatusStore；无状态调用（空会话）不适用。
+	RequireExistingSession bool
+	Budget                 Budget // 执行预算（见契约 §6）
+	ConfigHash             string // 由运行时填充的配置快照版本（调用方不填）
 }
 
 // RunStatus 是运行状态的五值字面量（契约 §2；与审计状态四值是**两套**，不得混用）。

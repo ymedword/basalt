@@ -313,7 +313,7 @@ type ToolCall struct {
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `action` | string | 是 | `set` / `remove` / `list` |
-| `id` | string | 否 | 任务 id；`remove` 必填；`set` 省略时仅当该 Agent 恰有一个任务时可派生 `<agent>-1`（其余情况**必须**显式给 id，与 §3 规则一致） |
+| `id` | string | 否 | 任务 id；`remove` 必填；`set` 省略时仅当该 Agent **恰有一个任务**时生效，定位到**该现有任务的实际 id**（如唯一任务叫 `daily-report` 就更新它，不是 `<agent>-1`）；任务数为 0 或多个时**必须**显式给 id（与 §3 规则一致）。`<agent>-1` **仅用于**加载期对原始配置缺省 id 的规范化 |
 | `cron` | string | 否 | 6 段表达式；`set` 必填 |
 | `zone` | string | 否 | 缺省 `UTC` |
 | `message` | string | 否 | 到点发给自己的消息；`set` 必填 |

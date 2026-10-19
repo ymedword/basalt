@@ -171,3 +171,42 @@ func IsInvalidInput(err error) bool {
 	var target *InvalidInputError
 	return errors.As(err, &target)
 }
+
+// —— 调度面错误载体（US-10 新增；既有哨兵与错误类型一个不动）——
+// Scheduling-surface error carriers added by US-10; existing sentinels stay untouched.
+
+// SessionArchivedError 表示目标会话已归档——调用方问题：不排队、不重建、不发起运行
+// （调度到点映射为执行行 `skipped`，HTTP 映射 400）。
+// SessionArchivedError reports an archived session: the call is refused outright, never
+// queued, and the session is never recreated.
+type SessionArchivedError struct{ SessionID string }
+
+// Error 返回不带标点的消息。
+// Error renders the message without trailing punctuation.
+func (e *SessionArchivedError) Error() string { return "session is archived: " + e.SessionID }
+
+// SessionNotFoundError 表示要求复用的会话不存在（`RequireExistingSession` 打开时；
+// HTTP 映射 404）。自由会话请求不受影响——缺失即按既有逻辑自动创建。
+// SessionNotFoundError means the session to reuse does not exist (only when
+// RequireExistingSession is set); free-session requests still create one as before.
+type SessionNotFoundError struct{ SessionID string }
+
+// Error 返回不带标点的消息。
+// Error renders the message without trailing punctuation.
+func (e *SessionNotFoundError) Error() string { return "session not found: " + e.SessionID }
+
+// SessionGateUnavailableError 表示装配缺失 `SessionStatusStore`——装配缺陷（HTTP 映射 500），
+// 不是调用方问题；`Archive` 在 nil 门禁时返回它，避免把缺陷伪装成业务拒绝。
+// SessionGateUnavailableError reports a missing SessionStatusStore: an assembly defect
+// mapped to 500, never disguised as a business refusal.
+type SessionGateUnavailableError struct{}
+
+// Error 返回不带标点的消息。
+// Error renders the message without trailing punctuation.
+func (e *SessionGateUnavailableError) Error() string { return "session gate is not configured" }
+
+// ErrTaskOwnerConflict 表示 task_id 已归属其他 Agent——跨 Agent 接管一律拒绝（约束 42；
+// retired 行同样算占用）。启动对账撞上它是致命错误，运行期事务撞上它整批回滚。
+// ErrTaskOwnerConflict means the task_id already belongs to another agent; retired rows
+// count as owned too. Startup treats it as fatal and runtime transactions roll back.
+var ErrTaskOwnerConflict = errors.New("scheduler: task id belongs to another agent")

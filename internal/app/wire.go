@@ -97,6 +97,12 @@ type App struct {
 	// 非 nil 时装配面不再建真实连接池——app 层用例因此不起真实子进程，也不新增导出测试 API。
 	// A non-nil connector replaces the real pool; production leaves it nil.
 	mcpConnect mcpConnector
+
+	// notifyContext 是信号接线的**进程内接缝**（约束 24 的单一信号源；生产路径恒 nil）。
+	// nil 时 `signalContext` 取标准库 `signal.NotifyContext`；用例注入可取消 ctx 的同形
+	// 函数即可驱动取消传播，**不向进程发真实信号**。
+	// notifyContext is the signal-wiring seam; nil falls back to signal.NotifyContext.
+	notifyContext func(context.Context, ...os.Signal) (context.Context, context.CancelFunc)
 }
 
 // wsRoot 返回工作区根的绝对路径。
@@ -224,12 +230,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Interpreters:   cfg.Shell.Interpreters,
 		MaxOutputBytes: outputBudget(cfg),
 	})
-	// 九件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 + 本 US
-	// 的 notify（技能调用工具永久禁；`manage_schedule` 是注册池第 10 件、归 US-10，US-7 的
-	// MCP 各件在等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。write_file 的构造期
-	// Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
+	// 十件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 +
+	// US-8 的 notify + US-10 的 manage_schedule（技能调用工具永久禁；US-7 的 MCP 各件在
+	// 等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。`manage_schedule` 的编辑后端在
+	// runtime（loader / scheduler）之后才存在，这里先建**两段绑定**的槽位，装配完成后
+	// 由下方 `Bind` 接入生产适配器（颗粒度文档 §3.1.8 图 E）。write_file 的构造期 Agent
+	// 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
 	// 那棵树"同源由运行环境保证。
-	// Nine tools: the file trio, US-5's shell/HTTP trio, the memory pair, and notify.
+	// Ten tools: the file trio, US-5's shell/HTTP trio, the memory pair, notify, and
+	// manage_schedule — whose editor is bound in two stages once the runtime exists.
+	scheduleSlot := tool.NewScheduleEditorSlot()
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -240,6 +250,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		tool.NewSaveMemoryTool(memSvc),
 		tool.NewRecallMemoryTool(memSvc),
 		tool.NewNotifyTool(storage.NewNotifyChannelRepo(db), policy, newNotifyAdapters()),
+		tool.NewManageScheduleTool(scheduleSlot),
 	} {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
@@ -257,11 +268,11 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			declaredToolNames, got), db, lock)
 	}
 
-	// MCP 接入在等值门禁**之后**（约束 9）：门禁比对的是九件内置声明名集，MCP 工具随后
+	// MCP 接入在等值门禁**之后**（约束 9）：门禁比对的是十件内置声明名集，MCP 工具随后
 	// 注册、池随之变大；把注册挪到门禁之前，门禁会因池变大而拒绝启动。零 server（缺失 /
 	// 空 / {} / 无 servers）整段跳过——不建池、不连接、不发日志，零 MCP 配置时行为与 US-6
 	// 逐字节相同（约束 1）。解析失败是工作区结构问题，与「配置写错的实例配置」同档拒绝启动。
-	// MCP wiring happens after the equality gate: the gate compares the nine builtin names,
+	// MCP wiring happens after the equality gate: the gate compares the ten builtin names,
 	// and MCP tools join the pool afterwards. Zero servers skip the whole block.
 	mcpSpecs, err := workspace.ParseMCPServers(root)
 	if err != nil {
@@ -332,13 +343,19 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	for _, conn := range mcpConns {
 		connectedServers = append(connectedServers, conn.Server)
 	}
-	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+	// loader 保留句柄：`manage_schedule` 的编辑适配器与装载共用**同一个**实例——
+	// `ApplySchedule` 的 writeMu 因此也覆盖未来的装载调用（约束 29 / 39），
+	// 不让第二条写入路径从另一个实例进入。
+	// Keep the loader: the schedule editor shares this very instance so its write lock
+	// stays the single gate for workspace writes.
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
 		Providers:    providerNames(cfg),
 		Tools:        registry.Names(),
 		MCPServers:   configuredServers,
 		MCPConnected: connectedServers,
 		Logger:       logger,
-	}).LoadAll(root)
+	})
+	entries, err := loader.LoadAll(root)
 	if err != nil {
 		return fail(fmt.Errorf("装载 Agent 目录: %w", err))
 	}
@@ -359,9 +376,15 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		logger,
 	)
 	service := core.NewAgentService(core.ServiceOptions{
-		Agents:    agents,
-		Client:    client,
-		Messages:  sessions,
+		Agents:   agents,
+		Client:   client,
+		Messages: sessions,
+		// Sessions 是准入处的会话门禁端口（US-10 约束 40）：调度运行与手动补跑都经
+		// `AgentService.Run`，已归档会话必须在唯一准入点被拒——门禁只能挂在 core，
+		// web / app 都不得另写一份判定。nil 会让门禁静默消失，因此这里显式接上。
+		// The session gate lives at the single admission point; a nil port would silently
+		// disable it, so the store is wired explicitly.
+		Sessions:  sessions,
 		Runs:      storage.NewRunStore(db),
 		Snapshots: storage.NewSnapshotStore(db),
 		Audit:     invocations,
@@ -374,17 +397,30 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		MaxConcurrent: cfg.Server.MaxConcurrentRuns,
 	})
 
+	// 调度器在重路径中**始终构造**（约束 21 / 图 A）：chat / tool 只是不 Start，
+	// `webOptions.Schedules` 因此恒非 nil；启动接缝只认 serve / gateway（约束 20）。
+	// 定义快照在 core.NewScheduler 构造时一次冻结，此后调用方改 entries 不影响对账。
+	// The scheduler is always constructed on the heavy path; only serve/gateway Start it.
+	scheduler := a.newScheduler(storage.NewTaskStore(db), service, entries, cfg, logger)
+	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
+	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
+	// Second half of the two-stage binding: the production editor backend is installed
+	// once the loader and scheduler exist.
+	scheduleSlot.Bind(newScheduleEditorAdapter(loader, root, entries, scheduler, logger))
+
 	logger.Info("重路径装配完成", "agents", len(agents.entries), "tools", registry.Names(),
 		"mcp_connected", len(mcpConns))
 	return &heavyRuntime{
-		lock:        lock,
-		db:          db,
-		service:     service,
-		sessions:    sessions,
-		invocations: invocations,
-		llmCalls:    llmCalls,
-		registry:    registry,
-		mcp:         mcpPool,
+		lock:         lock,
+		db:           db,
+		service:      service,
+		sessions:     sessions,
+		invocations:  invocations,
+		llmCalls:     llmCalls,
+		registry:     registry,
+		mcp:          mcpPool,
+		scheduler:    scheduler,
+		scheduleSlot: scheduleSlot,
 		// US-9 追加的只读装配态：全部是本次装配里**已经算出来的值**的保留，不新增读取。
 		// US-9's read-only assembly state: values already computed here, merely retained.
 		cfg:      cfg,
@@ -418,7 +454,7 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 
 // declaredToolNames 是装配层注册池的**声明名集**（颗粒度文档 US-4 §2.4 注 4：名字在装配期
 // 一次导出——`workspace` 不反向 import `tool`，装载器只认这份字符串清单）。两个消费面读的是
-// 同一份：① 重路径在注册完九件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
+// 同一份：① 重路径在注册完十件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
 // （`profile list` / `profile show` 经 `agentsPort`）不建注册池，直接拿它当池做装载判定
 // （池外工具名 → 整只不注册，宪法 IV）。两条路因此对同一份 AGENT.md 给出同一个结论。
 // 顺序 = `tool.Registry.Names()` 的排序序（比较逐名且保序）——**不得**按主题分组重排。
@@ -426,7 +462,7 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 // heavy path verifies its registry against it, the light path judges admission with it. The
 // order matches Registry.Names(), which is sorted.
 var declaredToolNames = []string{
-	"http_get", "http_post", "list_dir", "notify", "read_file",
+	"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
 	"recall_memory", "save_memory", "shell", "write_file",
 }
 
@@ -512,9 +548,21 @@ type heavyRuntime struct {
 	registry *tool.Registry
 
 	// mcp 是 MCP 连接池（零配置时为 nil）。停机时必须先于库关闭：池收起子进程与会话，
-	// 之后才是写池的最后一批使用者（约束 21：MCP → 库 → 锁）。
+	// 之后才是写池的最后一批使用者（约束 22：scheduler → MCP → 库 → 锁）。
 	// The MCP pool (nil without configuration); it must close before the database.
 	mcp mcpConnector
+
+	// scheduler 是运行期调度器（重路径始终构造，chat / tool 不 Start）。停机时**最先**
+	// 停它：Stop 可耗满 70s 宽限，必须在库关闭之前收尾在途运行（约束 22）。
+	// The scheduler is always constructed; Stop runs first so in-flight runs finish
+	// before the database closes.
+	scheduler *core.Scheduler
+
+	// scheduleSlot 是 `manage_schedule` 的两段绑定槽位（颗粒度文档 §3.1.17）：注册池
+	// 先于 runtime 构建，工具持槽、runtime 就绪后 Bind 生产适配器。保留句柄只为让装配
+	// 面可见"第 10 件工具确实完成绑定"，不把适配器暴露给任何消费方。
+	// The two-stage slot for manage_schedule; kept only to make the binding visible.
+	scheduleSlot *tool.ScheduleEditorSlot
 
 	// 以下为 US-9 追加的只读装配态（均为既有局部值的保留，不新增读取）：
 	// US-9 retains the read-only assembly state computed above.
@@ -538,13 +586,16 @@ type heavyRuntime struct {
 	mcpConns []tool.MCPConnection
 }
 
-// Close 按**相反次序**释放：MCP 连接池 → 数据库 → 实例锁（约束 21）。池先收子进程与
-// 会话，之后才关写池的最后一批使用者（库），锁必须等所有写入收尾之后才松开。每处失败
-// 并入同一条错误链，释放失败不得静默。
-// Close releases in reverse order — MCP pool, database, instance lock — and never hides
-// a failure.
+// Close 按**相反次序**释放：调度器 → MCP 连接池 → 数据库 → 实例锁（约束 22）。调度器
+// 先停：Stop 会在 70s 宽限内等待在途运行，库必须活到它收尾之后；随后池收子进程与会话，
+// 最后才关写池的使用者（库），锁等所有写入收尾之后才松开。每处失败并入同一条错误链，
+// 释放失败不得静默。Stop 幂等（sync.Once），与 Start 内部信号 watcher 并发调用安全。
+// Close releases in reverse order — scheduler, MCP pool, database, instance lock.
 func (r *heavyRuntime) Close() error {
 	var errs []error
+	if r.scheduler != nil {
+		r.scheduler.Stop()
+	}
 	if r.mcp != nil {
 		errs = append(errs, r.mcp.Close())
 	}

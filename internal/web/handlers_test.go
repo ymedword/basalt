@@ -28,13 +28,18 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// fakeRunService 记录每次运行请求；result / err 由用例预置。
-// fakeRunService records every run request.
+// fakeRunService 记录每次运行 / 归档请求；result / err / archiveErr 由用例预置，
+// archiveFn 让归档用例把「服务语义」注入假端口（web 层只负责映射）。
+// fakeRunService records every run and archive request; archiveFn lets archive tests
+// inject service semantics while the web layer only maps results.
 type fakeRunService struct {
-	mu     sync.Mutex
-	reqs   []core.RunRequest
-	result core.RunResult
-	err    error
+	mu         sync.Mutex
+	reqs       []core.RunRequest
+	result     core.RunResult
+	err        error
+	archiveErr error
+	archiveFn  func(id string) error
+	archived   []string
 }
 
 func (f *fakeRunService) Run(_ context.Context, req core.RunRequest) (core.RunResult, error) {
@@ -44,10 +49,32 @@ func (f *fakeRunService) Run(_ context.Context, req core.RunRequest) (core.RunRe
 	return f.result, f.err
 }
 
+// Archive 记录归档调用；archiveErr 优先于 archiveFn（错误注入优先）。
+// Archive records the call; archiveErr takes precedence over archiveFn.
+func (f *fakeRunService) Archive(_ context.Context, id string) error {
+	f.mu.Lock()
+	f.archived = append(f.archived, id)
+	err, fn := f.archiveErr, f.archiveFn
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if fn != nil {
+		return fn(id)
+	}
+	return nil
+}
+
 func (f *fakeRunService) requests() []core.RunRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.reqs)
+}
+
+func (f *fakeRunService) archivedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.archived)
 }
 
 // fakeSessionStore 是内存版会话仓储；getOrCreateCalls 供「invoke 零建会话」断言。
@@ -638,8 +665,10 @@ func TestMessages_SuccessRunView(t *testing.T) {
 }
 
 // TestMessages_RequestValidation 覆盖解码与入口校验的七条拒绝路径（模块卡 §4.1
-// handlers 表第 5 行；约束 16 / 33）。每条拒绝都必须发生在运行入口之前。
-// 逆改点：尾随内容被静默接受 / null 与缺失不分 / 请求体超限返回 413 → 对应断言红。
+// handlers 表第 5 行；约束 16 / 33）。解码类拒绝（前六条）必须发生在运行入口之前；
+// 归档会话的判定归属 AgentService（约束 40），本组只断言 400 + 冻结文案与请求
+// 进入唯一运行入口。逆改点：尾随内容被静默接受 / null 与缺失不分 / 请求体超限
+// 返回 413 / 归档错误不映射 400 → 对应断言红。
 func TestMessages_RequestValidation(t *testing.T) {
 	newWithRunSpy := func(t *testing.T) (*Server, *fakeRunService, *fakeSessionStore) {
 		t.Helper()
@@ -703,10 +732,14 @@ func TestMessages_RequestValidation(t *testing.T) {
 		store.seed(core.SessionRecord{
 			ID: "web-x", ProfileName: "ops-agent", Channel: channelWeb, UserID: "u", Status: statusArchived,
 		})
+		// 归档判定唯一归属 AgentService（约束 40 / D-21）：web 不预检，错误由 Run 带回。
+		runs.err = &core.SessionArchivedError{SessionID: "web-x"}
 		rec := post(t, s, `{"message":"hi"}`)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		require.Contains(t, rec.Body.String(), "已归档")
-		require.Empty(t, runs.requests(), "归档会话不得进入运行入口")
+		reqs := runs.requests()
+		require.Len(t, reqs, 1, "归档判定由 Run 完成——请求必须进入唯一运行入口")
+		require.True(t, reqs[0].RequireExistingSession)
 	})
 
 	t.Run("请求体超 max_request_bytes", func(t *testing.T) {
@@ -757,8 +790,10 @@ func TestMessages_MessageCapCountsBytesBeforeRun(t *testing.T) {
 }
 
 // TestSessions_ArchiveSemantics 覆盖归档的状态与时间、幂等、消息保留、成功无 data、
-// 未知 404（模块卡 §4.1 handlers 表第 3 行，5 例；约束 3 / 8 / 14）。
-// 逆改点：重复归档改写 archived_at / 成功响应多出 data / 归档删消息 → 对应断言红。
+// 未知 404（模块卡 §4.1 handlers 表第 3 行，5 例；约束 3 / 8 / 14）。归档经
+// fake RunService.Archive 驱动：真实互斥与写库语义的归属在 core（§3.5 第 4 条），
+// web 层只保留状态码 / 错误码 / 冻结文案与「仓储不被误改」的断言口径。
+// 逆改点：成功响应多出 data / 未知会话不再 404 → 对应断言红。
 func TestSessions_ArchiveSemantics(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	newStore := func() *fakeSessionStore {
@@ -770,6 +805,16 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 		store.seedMessages("web-x", core.Message{Role: "user", Content: "before"})
 		return store
 	}
+	// newServer 用 fake Archive 复刻服务语义（写库 + 首次时间），web 侧仍只做映射。
+	newServer := func(store *fakeSessionStore) *Server {
+		return newTestServer(t, func(o *Options) {
+			o.Sessions = store
+			o.Now = func() time.Time { return now }
+			o.Runs = &fakeRunService{archiveFn: func(id string) error {
+				return store.ArchiveSession(context.Background(), id, now)
+			}}
+		})
+	}
 	delete := func(s *Server, id string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/"+id, nil))
@@ -778,10 +823,7 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 
 	t.Run("状态与首次归档时间", func(t *testing.T) {
 		store := newStore()
-		s := newTestServer(t, func(o *Options) {
-			o.Sessions = store
-			o.Now = func() time.Time { return now }
-		})
+		s := newServer(store)
 		rec := delete(s, "web-x")
 		require.Equal(t, http.StatusOK, rec.Code)
 
@@ -794,10 +836,7 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 
 	t.Run("重复归档幂等", func(t *testing.T) {
 		store := newStore()
-		s := newTestServer(t, func(o *Options) {
-			o.Sessions = store
-			o.Now = func() time.Time { return now }
-		})
+		s := newServer(store)
 		require.Equal(t, http.StatusOK, delete(s, "web-x").Code)
 		now = now.Add(time.Hour)
 		require.Equal(t, http.StatusOK, delete(s, "web-x").Code, "重复 DELETE 是幂等成功")
@@ -811,7 +850,7 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 
 	t.Run("消息保留", func(t *testing.T) {
 		store := newStore()
-		s := newTestServer(t, func(o *Options) { o.Sessions = store })
+		s := newServer(store)
 		require.Equal(t, http.StatusOK, delete(s, "web-x").Code)
 		msgs, err := store.MessagesTail(context.Background(), "web-x", 0)
 		require.NoError(t, err)
@@ -820,7 +859,7 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 
 	t.Run("成功响应不含 data 键", func(t *testing.T) {
 		store := newStore()
-		s := newTestServer(t, func(o *Options) { o.Sessions = store })
+		s := newServer(store)
 		rec := delete(s, "web-x")
 		require.Equal(t, http.StatusOK, rec.Code)
 		require.Contains(t, rec.Body.String(), `"code":"OK"`)
@@ -829,7 +868,10 @@ func TestSessions_ArchiveSemantics(t *testing.T) {
 	})
 
 	t.Run("未知会话 404", func(t *testing.T) {
-		s := newTestServer(t, nil)
+		// 未知会话由服务以 *SessionNotFoundError 报告（存储未命中在服务内已转换）。
+		s := newTestServer(t, func(o *Options) {
+			o.Runs = &fakeRunService{archiveErr: &core.SessionNotFoundError{SessionID: "nope"}}
+		})
 		rec := delete(s, "nope")
 		require.Equal(t, http.StatusNotFound, rec.Code)
 		require.Contains(t, rec.Body.String(), codeNotFound)
@@ -938,6 +980,8 @@ func (deadlineRunService) Run(ctx context.Context, _ core.RunRequest) (core.RunR
 	<-ctx.Done()
 	return core.RunResult{RunID: "run-1", Status: core.StatusCancelled, Reason: "超过运行时限"}, nil
 }
+
+func (deadlineRunService) Archive(context.Context, string) error { return nil }
 
 // TestInvoke_Stateless 逐字保留模块卡 R6（W7），并补未知 Agent 与 32 KiB 两条拒绝路径。
 // 逆改点：给 invoke 填一个派生会话 id → SessionID 断言红；调用 GetOrCreateSession →
@@ -1050,25 +1094,27 @@ func (c cancellingRunService) Run(context.Context, core.RunRequest) (core.RunRes
 	return core.RunResult{RunID: "run-1", Status: core.StatusCompleted}, nil
 }
 
-// TestSessions_ArchiveRejectedWhileRunInflight 逐字保留模块卡 R14（W6/W8）：
-// 屏障建在准入窗口内，不靠 sleep 竞猜。
-// 逆改点：状态复核 / 计数与归档拆成无锁两步 → DELETE 会在 POST 还卡在 GetSession 时
-// 就完成归档（100ms 内完成的断言红），或运行中途被归档（状态断言红）；
-// archived 检查挪出 admitRun → 第二个子用例的零运行断言红；
-// releaseRun 只减不删 → 末尾 len(inflightRuns) 断言红。
+func (c cancellingRunService) Archive(context.Context, string) error { return nil }
+
+// TestSessions_ArchiveRejectedWhileRunInflight 保留模块卡 R14（W6/W8）的 web 面
+// 断言口径：在途运行期间 DELETE 409、会话保持 active、archived_at 不写、消息不变、
+// 已准入运行继续到底。互斥判定本身已收归 AgentService（§3.5 第 4 条），本用例经
+// fake RunService.Archive 注入忙语义；真实互斥由 core
+// TestAgentService_Archive_RejectsInflightRun 与 app 跨入口用例承接。
+// 逆改点：handleArchiveSession 不映射 SessionBusyError（退化成 500）→ 409 断言红。
 func TestSessions_ArchiveRejectedWhileRunInflight(t *testing.T) {
 	seed := core.SessionRecord{
 		ID: "web-x", ProfileName: "ops-agent", Channel: channelWeb, UserID: "u", Status: statusActive,
 	}
 
-	t.Run("运行先：准入锁挡住 DELETE，放行后 409，会话保持 active", func(t *testing.T) {
-		runs := &blockingRunService{started: make(chan struct{}), release: make(chan struct{})}
-		store := &gatedSessionStore{
-			fakeSessionStore: &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}},
-			entered:          make(chan struct{}),
-			release:          make(chan struct{}),
+	t.Run("运行先：DELETE 409，会话保持 active，运行继续到底", func(t *testing.T) {
+		runs := &blockingRunService{
+			started:    make(chan struct{}),
+			release:    make(chan struct{}),
+			archiveErr: &core.SessionBusyError{SessionID: "web-x"},
 		}
-		store.fakeSessionStore.seed(seed)
+		store := &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}}
+		store.seed(seed)
 		store.seedMessages("web-x", core.Message{Role: "user", Content: "before"})
 		s := newTestServer(t, func(o *Options) { o.Runs = runs; o.Sessions = store })
 
@@ -1079,27 +1125,16 @@ func TestSessions_ArchiveRejectedWhileRunInflight(t *testing.T) {
 				"/api/v1/sessions/web-x/messages", strings.NewReader(`{"message":"hi"}`)))
 			postDone <- rec
 		}()
-		<-store.entered // POST 已持有 admissionMu，卡在 GetSession 内
+		<-runs.started // POST 已进入运行入口，在途窗口成立
 
-		deleteDone := make(chan *httptest.ResponseRecorder, 1)
-		go func() {
+		delRec := func() *httptest.ResponseRecorder {
 			rec := httptest.NewRecorder()
 			s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/web-x", nil))
-			deleteDone <- rec
+			return rec
 		}()
-		select {
-		case <-deleteDone:
-			t.Fatal("DELETE 在运行准入窗口内完成——状态复核与归档未互斥")
-		case <-time.After(100 * time.Millisecond):
-			// 预期：DELETE 被准入锁挡住
-		}
-
-		close(store.release) // 放行 POST：计数登记 → 运行启动
-		<-runs.started
-
-		delRec := <-deleteDone
 		require.Equal(t, http.StatusConflict, delRec.Code, "在途运行期间归档必须 409")
 		require.Contains(t, delRec.Body.String(), `"code":"SESSION_BUSY"`)
+		require.Contains(t, delRec.Body.String(), messageBusy)
 		got, err := s.opts.Sessions.GetSession(context.Background(), "web-x")
 		require.NoError(t, err)
 		require.Equal(t, statusActive, got.Status, "归档被拒绝后会话必须保持 active")
@@ -1111,15 +1146,22 @@ func TestSessions_ArchiveRejectedWhileRunInflight(t *testing.T) {
 		close(runs.release)
 		postRec := <-postDone
 		require.Equal(t, http.StatusOK, postRec.Code, "已准入运行必须继续到底")
-		s.admissionMu.Lock()
-		require.Zero(t, len(s.inflightRuns), "运行结束后 inflightRuns 不得留下零值项")
-		s.admissionMu.Unlock()
 	})
 
-	t.Run("归档先：POST 400，零运行", func(t *testing.T) {
+	t.Run("归档先：POST 400（归档判定由 Run 完成）", func(t *testing.T) {
+		store := &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}}
+		store.seed(seed)
 		runs := &fakeRunService{result: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
-		s := newTestServer(t, func(o *Options) { o.Runs = runs })
-		s.opts.Sessions.(*fakeSessionStore).seed(seed)
+		runs.archiveFn = func(id string) error {
+			if err := store.ArchiveSession(context.Background(), id, time.Now()); err != nil {
+				return err
+			}
+			runs.mu.Lock()
+			runs.err = &core.SessionArchivedError{SessionID: id}
+			runs.mu.Unlock()
+			return nil
+		}
+		s := newTestServer(t, func(o *Options) { o.Runs = runs; o.Sessions = store })
 
 		rec := httptest.NewRecorder()
 		s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/web-x", nil))
@@ -1130,32 +1172,20 @@ func TestSessions_ArchiveRejectedWhileRunInflight(t *testing.T) {
 			"/api/v1/sessions/web-x/messages", strings.NewReader(`{"message":"hi"}`)))
 		require.Equal(t, http.StatusBadRequest, rec.Code)
 		require.Contains(t, rec.Body.String(), "已归档")
-		require.Empty(t, runs.requests(), "归档会话不得进入运行入口")
+		// 归档判定唯一归属 Run：请求必须进入运行入口并携带 RequireExistingSession，
+		// web 层不再预判（§3.5 第 4 条）。
+		reqs := runs.requests()
+		require.Len(t, reqs, 1, "归档判定由 Run 完成，web 层不得拦截")
+		require.True(t, reqs[0].RequireExistingSession, "会话发消息必须要求已有会话")
 	})
 }
 
-// gatedSessionStore 让**第一次** GetSession 在返回前停住：POST 的 admitRun 已持有
-// admissionMu、尚未登记计数。fake 的 mu 已在 GetSession 返回前释放，屏障只卡调用方。
-type gatedSessionStore struct {
-	*fakeSessionStore
-	once    sync.Once
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (g *gatedSessionStore) GetSession(ctx context.Context, id string) (core.SessionRecord, error) {
-	rec, err := g.fakeSessionStore.GetSession(ctx, id)
-	g.once.Do(func() {
-		close(g.entered)
-		<-g.release
-	})
-	return rec, err
-}
-
-// blockingRunService 卡住运行直到 release，制造「在途运行」窗口。
+// blockingRunService 卡住运行直到 release，制造「在途运行」窗口；Archive 返回
+// 预置错误（在途互斥由 core 判定，web 层只消费其结果）。
 type blockingRunService struct {
-	started chan struct{}
-	release chan struct{}
+	started    chan struct{}
+	release    chan struct{}
+	archiveErr error
 }
 
 func (b *blockingRunService) Run(ctx context.Context, _ core.RunRequest) (core.RunResult, error) {
@@ -1166,6 +1196,60 @@ func (b *blockingRunService) Run(ctx context.Context, _ core.RunRequest) (core.R
 	case <-ctx.Done():
 		return core.RunResult{RunID: "run-1", Status: core.StatusCancelled}, nil
 	}
+}
+
+func (b *blockingRunService) Archive(context.Context, string) error { return b.archiveErr }
+
+// TestRunView_TriggerFallback：空 Trigger 回落 api（既有 REST 行为不变，约束 15）。
+// 逆改点：runView 直接写 string(req.Trigger) → 空串断言红。
+func TestRunView_TriggerFallback(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	view := runView(core.RunRequest{Agent: "ops-agent", SessionID: "web-x", Channel: channelWeb},
+		core.RunResult{RunID: "run-1", Status: core.StatusCompleted}, now, now)
+	require.Equal(t, triggerAPI, view.Trigger, "空 Trigger 必须回落 api")
+}
+
+// TestRunView_TriggerFromRequest：manual 原样透传（契约 §5，R18）。
+// 逆改点：固定写 api（忽略 req.Trigger）→ 断言红。
+func TestRunView_TriggerFromRequest(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	view := runView(core.RunRequest{
+		Agent: "ops-agent", SessionID: "web-x", Channel: channelWeb, Trigger: core.TriggerManual,
+	}, core.RunResult{RunID: "run-1", Status: core.StatusCompleted}, now, now)
+	require.Equal(t, string(core.TriggerManual), view.Trigger, "manual 必须由请求透传")
+}
+
+// TestPostMessage_ArchivedMapsTo400：*core.SessionArchivedError → 400 + 冻结文案。
+// 逆改点：writeRunError 不特判归档错误 → 落到 500，状态码与文案断言红。
+func TestPostMessage_ArchivedMapsTo400(t *testing.T) {
+	runs := &fakeRunService{err: &core.SessionArchivedError{SessionID: "web-x"}}
+	s := newTestServer(t, func(o *Options) { o.Runs = runs })
+	s.opts.Sessions.(*fakeSessionStore).seed(core.SessionRecord{
+		ID: "web-x", ProfileName: "ops-agent", Channel: channelWeb, UserID: "u", Status: statusArchived,
+	})
+
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost,
+		"/api/v1/sessions/web-x/messages", strings.NewReader(`{"message":"hi"}`)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), `"code":"BAD_REQUEST"`)
+	require.Contains(t, rec.Body.String(), "会话已归档，不可追加消息")
+	require.NotContains(t, rec.Body.String(), `"data"`)
+}
+
+// TestArchiveSession_ServiceBusyMapsTo409：RunService.Archive 返回 *SessionBusyError
+// → 409 SESSION_BUSY + messageBusy（web 不再自持准入状态，约束 40）。
+// 逆改点：DELETE 路由不映射忙错误 → 500；文案漂移 → messageBusy 断言红。
+func TestArchiveSession_ServiceBusyMapsTo409(t *testing.T) {
+	runs := &fakeRunService{archiveErr: &core.SessionBusyError{SessionID: "web-x"}}
+	s := newTestServer(t, func(o *Options) { o.Runs = runs })
+
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/sessions/web-x", nil))
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Contains(t, rec.Body.String(), `"code":"SESSION_BUSY"`)
+	require.Contains(t, rec.Body.String(), messageBusy)
+	require.Equal(t, []string{"web-x"}, runs.archivedIDs(), "归档必须经 RunService.Archive")
 }
 
 // TestMessages_FailureReasonRedaction 逐字保留模块卡 R15（W9）。

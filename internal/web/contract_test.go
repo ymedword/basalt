@@ -13,9 +13,12 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/goccy/go-yaml"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -164,4 +167,91 @@ func TestContract_ViewFieldShapes(t *testing.T) {
 		require.Contains(t, string(raw), `"created_at":""`)
 		require.Contains(t, string(raw), `"session_id":""`)
 	})
+}
+
+// TestOpenAPI_ScheduleTimeFields 验证调度时间字段在真实契约中的 oneOf 语义（R31）：
+// ScheduleView.last_run_at 与 ExecutionView.finished_at 同为
+// 「RFC3339 date-time | 空串」——同一输入分别喂两个字段的 schema，合法 RFC3339 与
+// `""` 接受，非法串与数字拒绝。
+// 逆改点：删掉 `{ const: "" }` 分支 → 空串用例红；去掉 `format: date-time` 或未
+// 启用 AssertFormat → 非法串用例红；oneOf 放宽为任意类型 → 数字用例红。
+// The two schedule time fields must accept RFC3339 or the empty string and reject
+// every other value, validated against the real docs/contracts/openapi.yaml.
+func TestOpenAPI_ScheduleTimeFields(t *testing.T) {
+	root, err := os.OpenRoot("../../docs/contracts")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, root.Close()) })
+	raw, err := root.ReadFile("openapi.yaml")
+	require.NoError(t, err)
+
+	var doc map[string]any
+	require.NoError(t, yaml.Unmarshal(raw, &doc))
+
+	schemas := map[string]*jsonschema.Schema{
+		"ScheduleView.last_run_at":  compileFieldSchema(t, doc, "ScheduleView", "last_run_at"),
+		"ExecutionView.finished_at": compileFieldSchema(t, doc, "ExecutionView", "finished_at"),
+	}
+
+	cases := []struct {
+		name  string
+		value any
+		valid bool
+	}{
+		{"valid RFC3339", "2026-10-18T12:00:00Z", true},
+		{"empty string", "", true},
+		{"invalid time string", "not-a-time", false},
+		{"number", 12345, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, schema := range schemas {
+				err := schema.Validate(tc.value)
+				if tc.valid {
+					require.NoError(t, err, "%s 必须接受 %#v", name, tc.value)
+				} else {
+					require.Error(t, err, "%s 必须拒绝 %#v", name, tc.value)
+				}
+			}
+		})
+	}
+}
+
+// mustDig 按路径从 openapi 文档中取出子节点；任一步缺失即失败——契约结构漂移
+// （改名 / 挪位）必须让测试红，而不是静默跳过校验。
+// mustDig walks a path through the parsed OpenAPI document and fails on any missing
+// step, so contract structure drift turns red instead of skipping validation.
+func mustDig(t *testing.T, doc map[string]any, path ...string) any {
+	t.Helper()
+	var cur any = doc
+	for i, key := range path {
+		m, ok := cur.(map[string]any)
+		require.Truef(t, ok, "路径 %v 的第 %d 步不是映射", path, i)
+		cur, ok = m[key]
+		require.Truef(t, ok, "openapi.yaml 缺少路径 %v", path[:i+1])
+	}
+	return cur
+}
+
+// compileFieldSchema 把 openapi.yaml 中某个字段的 schema 编译成可独立校验的
+// Draft 2020-12 实例；AssertFormat 让 `format: date-time` 真正参与断言。
+// compileFieldSchema compiles one field's schema as a standalone Draft 2020-12
+// instance with format assertions enabled.
+func compileFieldSchema(t *testing.T, doc map[string]any, schemaName, field string) *jsonschema.Schema {
+	t.Helper()
+	fieldSchema, ok := mustDig(t, doc, "components", "schemas", schemaName, "properties", field).(map[string]any)
+	require.Truef(t, ok, "%s.%s 的 schema 不是映射", schemaName, field)
+
+	schemaDoc := map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema"}
+	for k, v := range fieldSchema {
+		schemaDoc[k] = v
+	}
+
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.AssertFormat()
+	loc := "inline://basalt/openapi/" + schemaName + "/" + field
+	require.NoError(t, compiler.AddResource(loc, schemaDoc))
+	schema, err := compiler.Compile(loc)
+	require.NoError(t, err)
+	return schema
 }

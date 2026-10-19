@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -103,6 +104,19 @@ type AgentLoaderOptions struct {
 // AgentLoader 扫描 .basalt/agents/ 的每个子目录：解析 → 校验 → 派生 Profile / 拒绝。
 // AgentLoader turns every agent directory into one AgentEntry, registered or not.
 type AgentLoader struct {
+	// writeMu 串行化「装载」与「schedules 写入（读 → 改 → 验 → 写）」两段全过程：
+	// 双方看到的必须是同一份文件状态，两个并发写入也不得各读旧文件后互相覆盖
+	//（约束 29）。锁序固定 `adapter.mu → writeMu`，**不得反向**获取（§3.1.8）。
+	// writeMu serializes loading and the full read-modify-validate-write sequence
+	// of schedule edits; the lock order adapter.mu → writeMu must not reverse.
+	writeMu sync.Mutex
+
+	// rename 是原子替换的测试注入点（生产恒为 nil → os.Root.Rename）：rename 失败
+	// 无法跨平台确定性制造，与记忆仓储的故障注入同一手法（颗粒度文档 §3.2 的
+	// TestApplySchedule_AtomicOnRenameFailure）。同包测试可临时替换，生产路径不受影响。
+	// rename is a test seam for the atomic replace; production leaves it nil.
+	rename func(root *os.Root, oldname, newname string) error
+
 	providers    []string
 	tools        []string
 	mcpServers   []string
@@ -137,6 +151,12 @@ func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 // Scanning and reading are confined to the workspace root, and the scan order is
 // sorted explicitly because "first come first served" presupposes a fixed order.
 func (l *AgentLoader) LoadAll(root string) (entries []core.AgentEntry, err error) {
+	// 与 ApplySchedule 共用同一把写锁（约束 29）：装载的读-校验全程不得与
+	// schedules 写入的读-改-写交错——否则装载结果可能对应写入前的文件，
+	// 而占用集又混入写入后的声明。
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+
 	base, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, fmt.Errorf("打开工作区目录 %s: %w", root, err)

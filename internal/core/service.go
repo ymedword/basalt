@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"sync"
 	"time"
@@ -50,6 +51,15 @@ type AgentSource interface {
 	Snapshot(ctx context.Context, name string, now time.Time) (*ConfigSnapshot, error)
 }
 
+// SessionStatusStore 是会话状态端口（消费方 = AgentService，实现 = storage.SessionStore）：
+// 运行准入据它拒绝已归档会话，归档动作经它与在途运行互斥。未命中一律 fs.ErrNotExist。
+// SessionStatusStore is the session-status port the entry point consumes; a miss is
+// always fs.ErrNotExist.
+type SessionStatusStore interface {
+	GetSession(ctx context.Context, id string) (SessionRecord, error)  // 未命中返回 fs.ErrNotExist
+	ArchiveSession(ctx context.Context, id string, at time.Time) error // 未命中返回 fs.ErrNotExist
+}
+
 // ServiceOptions 是运行入口的装配面。字段即依赖：没有任何一项从包级状态或 context 里取
 // （宪法 VII）——`Now` 也显式注入，业务时间戳因此在测试里完全可控。
 // ServiceOptions is the assembly surface of the run entry point; every dependency is an
@@ -66,6 +76,12 @@ type ServiceOptions struct {
 	Logger        *slog.Logger         // 为空 → 进程缺省日志器
 	Now           func() time.Time     // 时钟注入；为空 → time.Now
 	MaxConcurrent int                  // 实例级并发运行上限；<=0 → 32
+	// Sessions 是会话状态端口（归档 / 缺失判定）；生产装配必须由 wire.go 单点传入。
+	// nil = 不做会话门禁（仅既有零值单测），此时 Archive 返回 *SessionGateUnavailableError，
+	// 不得 nil 解引用。
+	// Sessions is the session-status port. Nil disables the gate (zero-value tests only);
+	// Archive then returns *SessionGateUnavailableError instead of dereferencing nil.
+	Sessions SessionStatusStore
 }
 
 // AgentService 是唯一运行入口的实现：准入计数 + 一次运行的完整编排。
@@ -76,9 +92,9 @@ type ServiceOptions struct {
 type AgentService struct {
 	opts ServiceOptions
 
-	mu       sync.Mutex
-	sessions map[string]struct{} // 会话锁集合：键 = session_id（空串不入集——无状态调用之间互不相干）
-	running  int                 // 实例级在跑数
+	mu      sync.Mutex
+	busy    map[string]struct{} // 会话忙集：键 = session_id（空串不入集——无状态调用之间互不相干）
+	running int                 // 实例级在跑数
 }
 
 // NewAgentService 组装运行入口。缺省值在此补齐（缺省日志器 / 时钟 / 并发上限），
@@ -94,7 +110,7 @@ func NewAgentService(opts ServiceOptions) *AgentService {
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = defaultMaxConcurrentRuns
 	}
-	return &AgentService{opts: opts, sessions: map[string]struct{}{}}
+	return &AgentService{opts: opts, busy: map[string]struct{}{}}
 }
 
 // Run 执行一次运行。返回的 `RunResult` 无论成败都非零（Status 表达结局）；**函数级 error
@@ -107,7 +123,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if s.opts.Agents == nil || !s.opts.Agents.Exists(req.Agent) {
 		return RunResult{}, &AgentNotFoundError{Name: req.Agent}
 	}
-	release, err := s.admit(req.SessionID)
+	release, err := s.admit(ctx, req)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -119,7 +135,12 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	}
 
 	now := s.opts.Now()
-	runID := NewRunID(req.Channel, now, runSuffix())
+	// 调用方给了 RunID 就原样用（调度器预生成，用于把执行行与 Run 关联）；否则按既有
+	// 公式生成——既有 CLI / REST / 评测调用方零改动（约束 13 / 14）。
+	runID := req.RunID
+	if runID == "" {
+		runID = NewRunID(req.Channel, now, runSuffix())
+	}
 
 	// ② 冻结运行级快照并**先落库**：读盘失败或落库失败都拒绝启动（零 LLM 调用、零工具执行）。
 	// 这一份快照在 Run 内不变——中途改盘不换配置（读即所记）。
@@ -182,6 +203,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			Agent:      req.Agent,
 			Channel:    req.Channel,
 			UserID:     req.UserID,
+			Trigger:    req.Trigger,
 			ConfigHash: snap.Hash,
 			StartedAt:  now,
 		}); err != nil {
@@ -224,22 +246,48 @@ func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, re
 	return res
 }
 
-// admit 完成准入的记账：会话锁与实例计数。返回的释放函数**幂等**（defer 与错误路径都可能调）。
+// admit 完成准入的四步记账（**全部在同一把 `s.mu` 临界区内**）：忙集 → 实例满 →
+// 会话状态（归档 / 缺失）→ 登记忙集。返回的释放函数**幂等**（defer 与错误路径都可能调）。
 // 反了顺序就会漏记：先占会话再判实例，实例满时那次占用再也释放不掉。
-// admit accounts for the session lock and the instance counter; the returned release is
-// idempotent and every acquisition is undone on every rejection path.
-func (s *AgentService) admit(sessionID string) (func(), error) {
+// 无会话请求（SessionID == ""，无状态 invoke）只走实例上限一步——不得入忙集，否则
+// 两条并发 invoke 会因空会话互相 409。
+// admit performs the four admission steps inside one critical section: busy set, instance
+// cap, session status, then registration. Stateless requests only face the instance cap.
+func (s *AgentService) admit(ctx context.Context, req RunRequest) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, busy := s.sessions[sessionID]; sessionID != "" && busy {
-		return nil, &SessionBusyError{SessionID: sessionID}
+	sessionID := req.SessionID
+	if sessionID != "" {
+		if _, busy := s.busy[sessionID]; busy {
+			return nil, &SessionBusyError{SessionID: sessionID}
+		}
 	}
 	if s.running >= s.opts.MaxConcurrent {
 		return nil, &InstanceFullError{Limit: s.opts.MaxConcurrent}
 	}
+	// 会话状态门禁：只有"要复用某个会话"的请求才查；DB 读在锁内（单次主键查询，
+	// 这把锁只保护准入与归档，不覆盖整个运行——已知取舍）。
+	// 未命中：要求既有 → 调用方错误；否则放行，后续 UpsertSession 自动创建。
+	// 命中且已归档 → 一律拒绝（不论 RequireExistingSession）——cron / 手动触发也挡在这里。
+	// 其它读错误原样上抛（fail-closed，不把基础设施故障当成"会话不存在"）。
+	if sessionID != "" && s.opts.Sessions != nil {
+		rec, err := s.opts.Sessions.GetSession(ctx, sessionID)
+		switch {
+		case err == nil:
+			if rec.Status == "archived" {
+				return nil, &SessionArchivedError{SessionID: sessionID}
+			}
+		case errors.Is(err, fs.ErrNotExist):
+			if req.RequireExistingSession {
+				return nil, &SessionNotFoundError{SessionID: sessionID}
+			}
+		default:
+			return nil, err
+		}
+	}
 	if sessionID != "" {
-		s.sessions[sessionID] = struct{}{}
+		s.busy[sessionID] = struct{}{}
 	}
 	s.running++
 
@@ -252,10 +300,38 @@ func (s *AgentService) admit(sessionID string) (func(), error) {
 		}
 		released = true
 		if sessionID != "" {
-			delete(s.sessions, sessionID)
+			delete(s.busy, sessionID)
 		}
 		s.running--
 	}, nil
+}
+
+// Archive 归档一个会话：与在途运行互斥（同一把锁保护准入与归档），重复归档幂等。
+// 空会话 → *SessionNotFoundError（无可归档）；nil 门禁 → *SessionGateUnavailableError
+// （装配缺陷，映射 500——不 nil 转发、不静默成功）；仓储未命中 → *SessionNotFoundError，
+// 其余错误原样上抛。
+// Archive archives a session, mutually exclusive with in-flight runs; archiving twice is
+// idempotent. A nil gate is an assembly defect and never a silent success.
+func (s *AgentService) Archive(ctx context.Context, sessionID string) error {
+	if s.opts.Sessions == nil {
+		return &SessionGateUnavailableError{}
+	}
+	if sessionID == "" {
+		return &SessionNotFoundError{SessionID: sessionID}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.busy[sessionID]; busy {
+		return &SessionBusyError{SessionID: sessionID}
+	}
+	if err := s.opts.Sessions.ArchiveSession(ctx, sessionID, s.opts.Now()); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return &SessionNotFoundError{SessionID: sessionID}
+		}
+		return err
+	}
+	return nil
 }
 
 // mergeBudget 合并实际预算：请求值未填的项补契约 §6 缺省，再让 Profile **只能收紧**迭代上限。

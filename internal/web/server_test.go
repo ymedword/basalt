@@ -597,6 +597,8 @@ func (s *slowRunService) Run(ctx context.Context, _ core.RunRequest) (core.RunRe
 	}
 }
 
+func (s *slowRunService) Archive(context.Context, string) error { return nil }
+
 // TestServer_RecoverMiddleware 逐字保留模块卡 R11（W12）。
 // 逆改点：recover 只记日志不写 500 → 第一个子用例状态码红；
 // 已写头后再写第二份信封 → ResponseRecorder 捕获到双写（body 含两份 JSON）→ 红。
@@ -739,6 +741,9 @@ type runFunc func(context.Context, core.RunRequest) (core.RunResult, error)
 func (f runFunc) Run(ctx context.Context, req core.RunRequest) (core.RunResult, error) {
 	return f(ctx, req)
 }
+
+// Archive 是编译适配桩：这些用例不覆盖归档面（判据面零变更，模块卡 §3.5）。
+func (f runFunc) Archive(context.Context, string) error { return nil }
 
 func mustLoopbackListener(t *testing.T) net.Listener {
 	t.Helper()

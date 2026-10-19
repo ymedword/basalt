@@ -64,6 +64,11 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		Agents:   agentProfilesPort{entries: rt.entries},
 		Tools:    newToolCatalogPort(rt.registry, rt.mcpConns),
 		Memory:   rt.mem,
+		// Schedules 在重路径中**恒非 nil**（约束 21）：chat / tool 只是不 Start，
+		// 调度器本身始终构造，四个 /schedules 端点因此不会因模式而缺端口。
+		// The scheduler port is always present on the heavy path; only Start is
+		// deferred to serve / gateway.
+		Schedules: rt.scheduler,
 	}
 }
 
@@ -150,7 +155,7 @@ func (p agentProfilesPort) Profiles() []core.AgentEntry { return p.entries }
 
 // toolCatalogPort 把注册池与 MCP 连接结果适配成工具清单（约束 27）：顺序 =
 // `Registry.Names()`（排序序），来源判定 builtin 集 → builtin、MCP 连接池 → mcp、
-// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（九件内置的唯一声明），
+// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（十件内置的唯一声明），
 // 另写一份名单必然漂移。
 // toolCatalogPort adapts the registry plus MCP connections; the builtin set is the
 // single declared name set, so a second hand-maintained list can never drift.

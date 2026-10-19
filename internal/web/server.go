@@ -1,10 +1,11 @@
 package web
 
-// 本文件是 HTTP 面的装配与生命周期（模块卡 §3.1）：Options 是唯一装配输入、五个端口由
-// app 层适配；Server 只持有这些端口、标准库 HTTP 服务与**准入锁**。停机按五阶段协议
-// （约束 20）：停止接入 → 宽限等待 → 取消并断开 → 有界收尾 → 由调用方释放共享资源。
+// 本文件是 HTTP 面的装配与生命周期（模块卡 §3.1）：Options 是唯一装配输入、端口由
+// app 层适配；Server 只持有这些端口与标准库 HTTP 服务——会话准入（忙集、实例上限、
+// 归档互斥）的唯一归属是 core.AgentService，web 不另建互斥（约束 40）。停机按五阶段
+// 协议（约束 20）：停止接入 → 宽限等待 → 取消并断开 → 有界收尾 → 由调用方释放共享资源。
 // This file assembles the HTTP face and owns its lifecycle; runtime dependencies arrive
-// only through Options, and graceful shutdown follows the five-phase protocol.
+// only through Options, and session admission belongs to core.AgentService alone.
 
 import (
 	"context"
@@ -36,11 +37,12 @@ type Options struct {
 	StartedAt       time.Time        // /info uptime 起点；零值 → NewServer 时刻
 	Listener        net.Listener     // 测试接缝；nil → Run 内 net.Listen(Addr)
 
-	Runs     RunService
-	Sessions SessionStore
-	Agents   AgentProfiles
-	Tools    ToolCatalog
-	Memory   MemorySections
+	Runs      RunService
+	Sessions  SessionStore
+	Agents    AgentProfiles
+	Tools     ToolCatalog
+	Memory    MemorySections
+	Schedules ScheduleService // 可选：nil 时四个 /schedules 端点按 500 返回（装配缺失是错误）
 
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
@@ -58,18 +60,20 @@ type ProviderInfo struct {
 	Configured bool
 }
 
-// RunService 是唯一运行入口（适配 *core.AgentService）。
-// RunService is the only run entry point.
+// RunService 是唯一运行入口与归档入口（适配 *core.AgentService）：归档与在途运行
+// 的互斥在服务端同一把锁内判定（约束 40），web 不再登记任何在途计数。
+// RunService is the only run and archive entry point; admission lives in the service.
 type RunService interface {
 	Run(ctx context.Context, req core.RunRequest) (core.RunResult, error)
+	Archive(ctx context.Context, id string) error
 }
 
-// SessionStore 是会话读面与建 / 归档写面（适配 *storage.SessionStore）。
-// SessionStore is the session read face plus create/archive writes.
+// SessionStore 是会话读面与建行写面（适配 *storage.SessionStore）；归档写面已收归
+// RunService.Archive，本端口不再暴露归档。
+// SessionStore is the session read/create face; archiving moved to RunService.
 type SessionStore interface {
 	GetOrCreateSession(ctx context.Context, rec core.SessionRecord) (core.SessionRecord, bool, error)
 	GetSession(ctx context.Context, id string) (core.SessionRecord, error)
-	ArchiveSession(ctx context.Context, id string, at time.Time) error
 	MessagesTail(ctx context.Context, id string, limit int) ([]core.Message, error)
 }
 
@@ -98,10 +102,10 @@ type MemorySections interface {
 	Sections(ctx context.Context, scope core.Scope) (coreText, archiveText string, err error)
 }
 
-// Server 是 HTTP 面的运行时状态。跨源保护实例在装配期构造一次；准入锁把
-// 「会话状态复核 + 在途运行登记」与归档放进同一个临界区（约束 36）。
-// Server holds the runtime state; the admission mutex makes status re-check,
-// in-flight registration, and archiving a single critical section.
+// Server 是 HTTP 面的运行时状态。跨源保护实例在装配期构造一次；会话准入状态
+// 不在 web 持有——它唯一归属 core.AgentService（约束 40）。
+// Server holds the runtime state; session admission state is owned by
+// core.AgentService alone.
 type Server struct {
 	opts Options
 
@@ -116,9 +120,6 @@ type Server struct {
 	lifecycleMu sync.Mutex
 	draining    bool
 	inflight    sync.WaitGroup
-
-	admissionMu  sync.Mutex
-	inflightRuns map[string]int
 }
 
 // 缺省值与超时常量（约束 18 / 19 / 20；字面量以模块卡 §3.1 为准）。
@@ -168,7 +169,7 @@ func NewServer(opts Options) (*Server, error) {
 		return nil, errors.New("web: 装配缺少必需端口（Runs / Sessions / Agents / Tools / Memory）")
 	}
 
-	s := &Server{opts: opts, inflightRuns: map[string]int{}}
+	s := &Server{opts: opts}
 	s.crossOrigin = http.NewCrossOriginProtection()
 	s.crossOrigin.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 拒绝发生在读 body 之前：跨源请求零副作用（约束 21）。
@@ -295,6 +296,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleArchiveSession)
 	mux.HandleFunc("POST /api/v1/sessions/{id}/messages", s.handlePostMessage)
 	mux.HandleFunc("POST /api/v1/agents/{name}/invoke", s.handleInvoke)
+	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)
+	mux.HandleFunc("PUT /api/v1/schedules/{id}", s.handleSetScheduleEnabled)
+	mux.HandleFunc("GET /api/v1/schedules/{id}/executions", s.handleListExecutions)
+	mux.HandleFunc("POST /api/v1/schedules/{id}/run", s.handleRunSchedule)
 	mux.HandleFunc("/", s.handleNotFound)
 }
 
@@ -373,52 +378,4 @@ func (s *Server) drainTimeoutValue() time.Duration {
 		return s.opts.drainTimeoutOverride
 	}
 	return drainTimeout
-}
-
-// admitRun 在准入锁内完成「读会话 + 状态复核 + 在途登记」——与 archiveSession 互斥
-// （约束 36）；失败路径不改变任何计数。调用方必须在成功后 defer releaseRun。
-// admitRun performs the status re-check and in-flight registration under the admission
-// lock; the caller must defer releaseRun once it succeeds.
-func (s *Server) admitRun(ctx context.Context, id string) (core.SessionRecord, error) {
-	s.admissionMu.Lock()
-	defer s.admissionMu.Unlock()
-
-	rec, err := s.opts.Sessions.GetSession(ctx, id)
-	if err != nil {
-		return core.SessionRecord{}, err
-	}
-	if rec.Status == statusArchived {
-		return core.SessionRecord{}, errSessionArchived
-	}
-	s.inflightRuns[id]++
-	return rec, nil
-}
-
-// releaseRun 在运行结束（含错误 / 取消路径）时递减计数，归零即删表项。
-// releaseRun decrements the counter and removes the entry at zero.
-func (s *Server) releaseRun(id string) {
-	s.admissionMu.Lock()
-	defer s.admissionMu.Unlock()
-
-	if n := s.inflightRuns[id]; n <= 1 {
-		delete(s.inflightRuns, id)
-		return
-	}
-	s.inflightRuns[id]--
-}
-
-// archiveSession 在准入锁内归档：在途运行期间拒绝（哨兵 error → 409），归档写入
-// 完成即为生效点——此前已准入的运行继续到底（约束 36）。
-// archiveSession archives under the admission lock; the write is the point of effect.
-func (s *Server) archiveSession(ctx context.Context, id string, at time.Time) error {
-	s.admissionMu.Lock()
-	defer s.admissionMu.Unlock()
-
-	if _, err := s.opts.Sessions.GetSession(ctx, id); err != nil {
-		return err
-	}
-	if s.inflightRuns[id] > 0 {
-		return errSessionRunning
-	}
-	return s.opts.Sessions.ArchiveSession(ctx, id, at)
 }

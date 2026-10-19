@@ -242,6 +242,39 @@ func TestRunStore_TimestampsAreUnixMilli(t *testing.T) {
 		"Unix 毫秒是 13 位十进制——秒（10 位）与纳秒（19 位）都落在这里之外")
 }
 
+// TestRunStore_TriggerForScheduler —— 约束 15：显式 trigger 只允许 `scheduler` 渠道下的
+// `cron` / `manual`；其余组合一律拒绝落账（显式值不得绕过渠道约束）。
+// 逆改点：只校验显式值、不校验渠道 → web+manual / cli+cron 两例红。
+// TestRunStore_TriggerForScheduler pins the explicit-trigger channel constraint.
+func TestRunStore_TriggerForScheduler(t *testing.T) {
+	t.Run("scheduler_cron_accepted", func(t *testing.T) {
+		got, err := triggerFor("scheduler", core.TriggerCron)
+		require.NoError(t, err)
+		require.Equal(t, triggerCron, got)
+	})
+
+	t.Run("scheduler_manual_accepted", func(t *testing.T) {
+		got, err := triggerFor("scheduler", core.TriggerManual)
+		require.NoError(t, err)
+		require.Equal(t, triggerManual, got)
+	})
+
+	t.Run("scheduler_other_explicit_rejected", func(t *testing.T) {
+		_, err := triggerFor("scheduler", core.Trigger("weekly"))
+		require.Error(t, err, "scheduler 只接受 cron / manual")
+	})
+
+	t.Run("web_manual_rejected", func(t *testing.T) {
+		_, err := triggerFor("web", core.TriggerManual)
+		require.Error(t, err, "非 scheduler 渠道不得自称 manual")
+	})
+
+	t.Run("cli_cron_rejected", func(t *testing.T) {
+		_, err := triggerFor("cli", core.TriggerCron)
+		require.Error(t, err, "非 scheduler 渠道不得自称 cron")
+	})
+}
+
 // TestRunStore_TriggerDerivesFromChannel —— K6：`trigger` 由渠道映射取值（§6 固定口径 8），
 // 未映射的渠道**拒绝建行**（不落一行猜出来的记账）。
 // TestRunStore_TriggerDerivesFromChannel pins the channel-to-trigger mapping; an unmapped

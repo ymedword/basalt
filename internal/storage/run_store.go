@@ -52,7 +52,7 @@ func NewRunStore(db *DB) *RunStore { return &RunStore{db: db} }
 // The trigger mapping is an explicit table; an unknown channel is refused rather than
 // guessed, because the column carries audit meaning.
 func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord) error {
-	trigger, err := triggerFor(rec.Channel)
+	trigger, err := triggerFor(rec.Channel, rec.Trigger)
 	if err != nil {
 		return err
 	}
@@ -176,8 +176,23 @@ type sqlExecutor interface {
 }
 
 // triggerFor 按渠道映射 `runs.trigger`（§6 固定口径 8）。未知渠道 → 错误（见 StartRun 注释）。
-// triggerFor maps a channel onto the trigger column; unknown channels are refused.
-func triggerFor(channel string) (string, error) {
+// 显式值只允许 `scheduler` 渠道下的 `cron` / `manual`（约束 15）：显式值**不得**绕过渠道
+// 约束——否则任意渠道都能自称 manual，审计列随之失去意义。
+// An explicit trigger is accepted only for the scheduler channel (constraint 15); every
+// other combination is refused rather than silently rewritten.
+func triggerFor(channel string, explicit core.Trigger) (string, error) {
+	if explicit != "" {
+		switch {
+		case channel == "scheduler" && explicit == core.TriggerCron:
+			return triggerCron, nil
+		case channel == "scheduler" && explicit == core.TriggerManual:
+			return triggerManual, nil
+		default:
+			return "", fmt.Errorf(
+				"预写运行账本行: 渠道 %q 不接受显式 trigger %q（只有 scheduler 可用 cron / manual，约束 15）",
+				channel, explicit)
+		}
+	}
 	switch channel {
 	case "cli":
 		return triggerUser, nil

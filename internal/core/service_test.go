@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -81,6 +82,14 @@ func (s *recordingStore) columns(runID string) (int, int, time.Time) {
 // assemble builds a separate entry point over the harness fakes, returning a store that
 // records the terminal columns.
 func (h *loopHarness) assemble(maxConcurrent int) (*core.AgentService, *recordingStore) {
+	return h.assembleWith(maxConcurrent, nil)
+}
+
+// assembleWith 是 assemble 的可选会话门禁版本：sessions 在构造期并入 ServiceOptions；
+// assemble(n) 等价于 assembleWith(n, nil)——既有签名与全部既有调用不变（等价重构）。
+// assembleWith is the session-gate variant of assemble; assemble(n) equals
+// assembleWith(n, nil), so existing signatures and call sites stay unchanged.
+func (h *loopHarness) assembleWith(maxConcurrent int, sessions core.SessionStatusStore) (*core.AgentService, *recordingStore) {
 	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	store := newRecordingStore()
 	svc := core.NewAgentService(core.ServiceOptions{
@@ -95,6 +104,7 @@ func (h *loopHarness) assemble(maxConcurrent int) (*core.AgentService, *recordin
 		Logger:        logger,
 		Now:           func() time.Time { return h.now },
 		MaxConcurrent: maxConcurrent,
+		Sessions:      sessions,
 	})
 	return svc, store
 }
@@ -578,4 +588,270 @@ func TestAgentService_OversizedMemoryFailsRunBeforeModelCall(t *testing.T) {
 	require.Equal(t, core.StatusFailed, res.Status)
 	require.Contains(t, res.Reason, "budget.context_tokens", "原因必须点名上下文预算键")
 	require.Zero(t, over.provider.callCount(), "拒绝启动 = 零模型调用")
+}
+
+// —— 会话门禁与 Run ID / Trigger 传导（US-10）——
+
+// fakeSessionStatusStore 是 `core.SessionStatusStore` 的内存实现：会话行按 id 存，
+// 归档幂等（已归档再归档保留首次 `archived_at`），未命中返回 fs.ErrNotExist。
+// fakeSessionStatusStore is the in-memory SessionStatusStore: archive is idempotent and
+// keeps the first archived_at; a miss returns fs.ErrNotExist.
+type fakeSessionStatusStore struct {
+	mu   sync.Mutex
+	rows map[string]core.SessionRecord
+}
+
+// newFakeSessionStatusStore 组装空的门禁替身。
+func newFakeSessionStatusStore() *fakeSessionStatusStore {
+	return &fakeSessionStatusStore{rows: map[string]core.SessionRecord{}}
+}
+
+// put 预置一行会话（状态由调用方给）。
+func (f *fakeSessionStatusStore) put(rec core.SessionRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows[rec.ID] = rec
+}
+
+// GetSession 取会话行（未命中 fs.ErrNotExist）。
+func (f *fakeSessionStatusStore) GetSession(_ context.Context, id string) (core.SessionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.rows[id]
+	if !ok {
+		return core.SessionRecord{}, fs.ErrNotExist
+	}
+	return rec, nil
+}
+
+// ArchiveSession 置归档（未命中 fs.ErrNotExist；已归档保留首次时间）。
+// ArchiveSession marks the row archived; archiving twice keeps the first timestamp.
+func (f *fakeSessionStatusStore) ArchiveSession(_ context.Context, id string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rec, ok := f.rows[id]
+	if !ok {
+		return fs.ErrNotExist
+	}
+	if rec.Status != "archived" {
+		rec.Status = "archived"
+		stamp := at
+		rec.ArchivedAt = &stamp
+	}
+	f.rows[id] = rec
+	return nil
+}
+
+// statusOf 取会话状态字。
+func (f *fakeSessionStatusStore) statusOf(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows[id].Status
+}
+
+// archivedAtOf 取归档时间戳（未归档为 nil）。
+func (f *fakeSessionStatusStore) archivedAtOf(id string) *time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows[id].ArchivedAt
+}
+
+// TestAgentService_Run_UsesCallerRunID 守"调用方 RunID 原样使用"（约束 14）：
+// 调度器预生成的 `scheduler-` 标识经 RunRequest 传入后不得被再次生成覆盖。
+// 逆改点：沿用 `NewRunID(...)` 无条件生成 → 账本行键与调用方值不符，断言红。
+func TestAgentService_Run_UsesCallerRunID(t *testing.T) {
+	h := newLoopHarness(t)
+	svc, store := h.assemble(0)
+	h.provider.onCall(0, textResponse("好"))
+
+	const callerRunID = "scheduler-1760000000000-abc123"
+	req := h.req("在吗")
+	req.Channel = "scheduler"
+	req.RunID = callerRunID
+	res, err := svc.Run(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, callerRunID, res.RunID, "非空 RunID 必须原样使用")
+	require.Equal(t, callerRunID, store.runRow(t, callerRunID).RunID, "账本行以调用方 RunID 为键")
+}
+
+// TestAgentService_Run_DefaultRunIDUnchanged 守"缺省生成规则不变"（约束 14 回归）：
+// `RunID` 为空时仍由 AgentService 按既有 `渠道-毫秒-base36` 形态生成。
+// 逆改点：把"空值 → 固定前缀"或另换形态 → 正则断言红。
+func TestAgentService_Run_DefaultRunIDUnchanged(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("好"))
+
+	res, err := h.service.Run(ctx, h.req("在吗"))
+	require.NoError(t, err)
+	require.Regexp(t, regexp.MustCompile(`^cli-\d{13}-[0-9a-z]{6}$`), res.RunID,
+		"空 RunID 沿用既有生成形态（渠道-毫秒-6 位 base36 小写）")
+	require.Contains(t, res.RunID, fmt.Sprintf("-%d-", h.now.UnixMilli()), "毫秒段取注入时钟")
+}
+
+// TestAgentService_Run_PassesTriggerToLedger 守"触发方式进账本"（约束 13 / 14）：
+// `RunRequest.Trigger` 原样写入 `RunRecord`，仓储据此落 `runs.trigger`。
+// 逆改点：StartRun 不传 Trigger → 账本行 Trigger 为空，断言红。
+func TestAgentService_Run_PassesTriggerToLedger(t *testing.T) {
+	h := newLoopHarness(t)
+	svc, store := h.assemble(0)
+	h.provider.onCall(0, textResponse("好"))
+
+	const callerRunID = "scheduler-1760000000001-manual"
+	req := h.req("补跑")
+	req.Channel = "scheduler"
+	req.RunID = callerRunID
+	req.Trigger = core.TriggerManual
+	_, err := svc.Run(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, core.TriggerManual, store.runRow(t, callerRunID).Trigger,
+		"显式 Trigger 必须进入 RunRecord")
+}
+
+// TestAgentService_Archive_RejectsInflightRun 守"归档与在途运行互斥"（约束 40 / HIGH-1）：
+// ① 运行在途时归档 → *SessionBusyError，会话状态不变；② 运行结束后归档成功、状态落 archived。
+// 逆改点：Archive 不查 busy 集合 → 在途时返回 nil，断言红。
+func TestAgentService_Archive_RejectsInflightRun(t *testing.T) {
+	h := newLoopHarness(t)
+	sessions := newFakeSessionStatusStore()
+	sessions.put(core.SessionRecord{ID: h.sessionID, Status: "active"})
+	svc, _ := h.assembleWith(0, sessions)
+	started, done := startBlockedRun(t, h, svc, h.sessionID)
+
+	waitSignal(t, started, 2*time.Second, "在途运行未启动")
+	var busy *core.SessionBusyError
+	require.ErrorAs(t, svc.Archive(context.Background(), h.sessionID), &busy, "在途运行期间归档必须被拒")
+	require.Equal(t, "active", sessions.statusOf(h.sessionID), "被拒的归档不得改状态")
+
+	h.cancelRun() // 工具阻塞在 ctx 取消上，运行随之收尾
+	waitSignal(t, done, 2*time.Second, "取消后在途运行未返回")
+	require.NoError(t, svc.Archive(context.Background(), h.sessionID), "运行结束后归档应成功")
+	require.Equal(t, "archived", sessions.statusOf(h.sessionID))
+}
+
+// TestAgentService_Archive_Idempotent 守"重复归档幂等"（US-9 既有语义换承载点）：
+// 第二次归档返回 nil，`archived_at` 保留首次值。
+// 逆改点：每次都覆盖时间戳 → 时间断言红；第二次报错 → 错误断言红。
+func TestAgentService_Archive_Idempotent(t *testing.T) {
+	h := newLoopHarness(t)
+	sessions := newFakeSessionStatusStore()
+	sessions.put(core.SessionRecord{ID: h.sessionID, Status: "active"})
+	svc, _ := h.assembleWith(0, sessions)
+
+	require.NoError(t, svc.Archive(context.Background(), h.sessionID))
+	first := sessions.archivedAtOf(h.sessionID)
+	require.NotNil(t, first, "首次归档必须落 archived_at")
+
+	h.now = h.now.Add(time.Minute) // 第二次归档使用不同时刻
+	require.NoError(t, svc.Archive(context.Background(), h.sessionID), "重复归档幂等")
+	require.NotNil(t, sessions.archivedAtOf(h.sessionID))
+	require.True(t, first.Equal(*sessions.archivedAtOf(h.sessionID)), "archived_at 保留首次值")
+}
+
+// TestAgentService_Run_ArchivedSessionRejected 守"归档判定在服务层"（约束 40）：
+// 已归档会话的 Run 一律 *SessionArchivedError，**不论** RequireExistingSession 取值——
+// cron / 手动触发因此不依赖 HTTP 层也能被拒（零模型调用、零账本行）。
+// 逆改点：归档判定只在 HTTP 层 → 本用例红。
+func TestAgentService_Run_ArchivedSessionRejected(t *testing.T) {
+	h := newLoopHarness(t)
+	sessions := newFakeSessionStatusStore()
+	sessions.put(core.SessionRecord{ID: h.sessionID, Status: "archived"})
+	svc, store := h.assembleWith(0, sessions)
+
+	var archived *core.SessionArchivedError
+	_, err := svc.Run(ctx, h.req("在吗"))
+	require.ErrorAs(t, err, &archived, "归档会话必须被服务层拒绝")
+	require.Equal(t, h.sessionID, archived.SessionID)
+	require.Zero(t, h.provider.callCount(), "拒绝发生在模型调用之前")
+	require.Zero(t, store.runsOf(), "拒绝不落账本行")
+}
+
+// TestAgentService_Run_RequireExistingSession 守"要求既有会话"的两分支：
+// ① 缺失 + 要求既有 → *SessionNotFoundError（零模型调用）；② 缺失 + 未要求 → 自动创建并跑通。
+// 逆改点：缺会话一律拒绝 → ② 红；要求既有被忽略 → ① 红。
+func TestAgentService_Run_RequireExistingSession(t *testing.T) {
+	t.Run("missing_and_required_rejected", func(t *testing.T) {
+		h := newLoopHarness(t)
+		sessions := newFakeSessionStatusStore()
+		svc, _ := h.assembleWith(0, sessions)
+
+		req := h.req("在吗")
+		req.RequireExistingSession = true
+		var notFound *core.SessionNotFoundError
+		_, err := svc.Run(ctx, req)
+		require.ErrorAs(t, err, &notFound, "缺失且要求既有 → 调用方错误")
+		require.Equal(t, h.sessionID, notFound.SessionID)
+		require.Zero(t, h.provider.callCount(), "拒绝发生在模型调用之前")
+	})
+
+	t.Run("missing_and_free_created", func(t *testing.T) {
+		h := newLoopHarness(t)
+		sessions := newFakeSessionStatusStore()
+		svc, store := h.assembleWith(0, sessions)
+		h.provider.onCall(0, textResponse("好"))
+
+		res, err := svc.Run(ctx, h.req("在吗"))
+		require.NoError(t, err, "未要求既有时会话缺失不构成调用方错误")
+		require.Equal(t, core.StatusCompleted, res.Status)
+		require.Equal(t, 1, store.sessionsOf(), "会话行由 Run 自动创建")
+	})
+}
+
+// TestAgentService_StatelessRunsNotSerialized 守"无状态调用不互相串行"（约束 40 / R10-M9）：
+// 两条并发 `SessionID == ""` 的运行都必须跑通、零 *SessionBusyError。
+// 逆改点：门禁不判空会话 → 第二次准入看到 busy[""]，本用例红。
+//
+// 判别力来自模型调用钩子：第一次运行进入模型调用后（准入已完成）才发起第二次，
+// 第二次**必须**能顺利通过准入并完成——串行化实现会当场拒绝它。
+func TestAgentService_StatelessRunsNotSerialized(t *testing.T) {
+	h := newLoopHarness(t)
+	sessions := newFakeSessionStatusStore()
+	svc, _ := h.assembleWith(0, sessions)
+
+	firstCall := make(chan struct{})
+	release := make(chan struct{})
+	var hookOnce sync.Once
+	h.provider.hook = func(i int) {
+		if i == 0 {
+			hookOnce.Do(func() { close(firstCall) })
+			<-release
+		}
+	}
+	h.provider.onCall(0, textResponse("一"))
+	h.provider.onCall(1, textResponse("二"))
+
+	var wg sync.WaitGroup
+	var errFirst, errSecond error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		req := h.req("无状态一")
+		req.SessionID = ""
+		_, errFirst = svc.Run(context.Background(), req)
+	}()
+	go func() {
+		defer wg.Done()
+		<-firstCall // 第一次运行已通过准入并进入模型调用
+		req := h.req("无状态二")
+		req.SessionID = ""
+		_, errSecond = svc.Run(context.Background(), req)
+		close(release) // 第二次准入已完成，放行第一次
+	}()
+	wg.Wait()
+
+	require.NoError(t, errFirst)
+	require.NoError(t, errSecond, "空会话调用不得因忙集互斥被拒")
+	var busy *core.SessionBusyError
+	require.False(t, errors.As(errSecond, &busy), "零 SessionBusyError")
+}
+
+// TestAgentService_Archive_WithoutSessionStore 守"未装配门禁是装配缺陷"（约束 40 / R10-H1）：
+// `ServiceOptions.Sessions == nil` 时 Archive 返回 *SessionGateUnavailableError——
+// 不 nil 解引用、不静默成功。
+// 逆改点：直接调 opts.Sessions.ArchiveSession → panic，测试红。
+func TestAgentService_Archive_WithoutSessionStore(t *testing.T) {
+	h := newLoopHarness(t)
+	svc, _ := h.assemble(0)
+
+	var unavailable *core.SessionGateUnavailableError
+	require.ErrorAs(t, svc.Archive(context.Background(), h.sessionID), &unavailable)
 }

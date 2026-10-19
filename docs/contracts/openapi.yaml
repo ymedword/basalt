@@ -666,6 +666,7 @@ paths:
                 enabled: { type: boolean }
       responses:
         '200': { $ref: '#/components/responses/OK' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /schedules/{id}/executions:
@@ -701,7 +702,7 @@ paths:
     post:
       tags: [schedules]
       summary: 立即执行一次（手动补跑）
-      description: 走与到点触发**完全相同**的链路；审计以 `trigger=manual` 区分。
+      description: 走与到点触发**完全相同**的链路；审计以 `trigger=manual` 区分。所属会话已归档时返回 **400**（业务规则拒绝，文案沿用会话写拒绝「会话已归档，不可追加消息」）。
       responses:
         '200':
           description: 本次触发的 Run 结果
@@ -713,12 +714,15 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/RunView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: 该任务上一轮尚未结束（幂等跳过语义见技术方案§6.3）
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope' }
+        '429': { $ref: '#/components/responses/TooManyRuns' }
+        '504': { $ref: '#/components/responses/Timeout' }
 
   # ==========================================================
   # 通知渠道
@@ -1083,7 +1087,7 @@ components:
         zone: { type: string, description: 缺省 UTC }
         message: { type: string }
         enabled: { type: boolean }
-        last_run_at: { type: string, format: date-time }
+        last_run_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "零值渲染为空串（US-9 惯例）；否则为 RFC3339 date-time" }
         last_status: { type: string }
 
     ExecutionView:
@@ -1096,7 +1100,7 @@ components:
         duration_ms: { type: integer }
         error_message: { type: string }
         started_at: { type: string, format: date-time }
-        finished_at: { type: string, format: date-time }
+        finished_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "未结束（started）时为空串；结束后为 RFC3339 date-time" }
 
     NotifyChannelUpsert:
       type: object

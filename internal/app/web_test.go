@@ -1,6 +1,8 @@
 package app
 
-// 本文件是 US-9 装配层的验收面（颗粒度文档 §3.2 的 `internal/app/web_test.go` 六条）：
+// 本文件是 US-9 装配层的验收面（颗粒度文档 §3.2 的 `internal/app/web_test.go` 六条），
+// US-10 追加两条（§3.2.2）：T7 `TestDeclaredToolNames_IncludesManageSchedule`——十名
+// 声明清单逐字对照；T8 `TestWebOptions_SchedulesWired`——调度器与归档入口的装配注入。
 //
 //	T1 `TestNewWebServer_OptionsProjection`——addr / provider 摘要 / backend 归一化
 //	   与真实 MCP 连接数 / 预算映射（4 例）
@@ -9,6 +11,8 @@ package app
 //	T4 `TestNeedsServer`——只有 serve 需要 HTTP 面
 //	T5 `TestNewRuntime_MaxConcurrentRuns`——配置 1 → 第二个并发运行被拒（R13）
 //	T6 `TestNewToolCatalogPort_ClassificationAndOrder`——来源分类与顺序（R20）
+//	T7 `TestDeclaredToolNames_IncludesManageSchedule`——第 10 件内置工具的十名清单
+//	T8 `TestWebOptions_SchedulesWired`——Schedules 恒非 nil、Runs 指向 AgentService
 //
 // 全部离线：不访问真实网络与真实模型；T5 的 provider 卡在首次 Chat 上制造准入窗口。
 // Every case is offline; T5 parks the first run inside Chat to hold the admission window.
@@ -236,12 +240,14 @@ func (p *blockingProvider) Release() { p.releaseOnce.Do(func() { close(p.release
 
 // TestNewToolCatalogPort_ClassificationAndOrder 对应颗粒度文档 R20（原文保留）：
 // 「逆改点：来源改按名字前缀猜 → code_only_tool 被标 builtin/mcp，断言红；
-// builtin 集换成另写一份名单（与 declaredToolNames 漂移——漏名或多出未声明名）→
-// 九名逐项断言或 code_only_tool 断言红；顺序改成 map 遍历 → 与 Names() 的相等断言红」。
+// builtin 集换掉 → 九名逐项断言或 code_only_tool 断言红；顺序改成 map 遍历 →
+// 与 Names() 的相等断言红」。边界（US-10 §3.1.17 ① / P-03）：九名夹具只证明
+// **已注册**名归 builtin——漏登记的第十名仍绿，多列未注册名不可见；第十名的
+// 判别力由 T7 的十名清单承担。
 func TestNewToolCatalogPort_ClassificationAndOrder(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := tool.NewRegistry(logger)
-	// 九件声明名集的**字面量副本**：实现若与 app.declaredToolNames 漂移，逐项断言红。
+	// US-10 前十名子集（分类与顺序断言不变）：九名只验**已注册**名的来源分类。
 	builtinNames := []string{
 		"http_get", "http_post", "list_dir", "notify", "read_file",
 		"recall_memory", "save_memory", "shell", "write_file",
@@ -281,4 +287,34 @@ func (fakeTool) InputSchema() json.RawMessage { return json.RawMessage(`{"type":
 
 func (fakeTool) Execute(context.Context, core.ToolEnv, json.RawMessage) (core.Result, error) {
 	return core.Result{}, nil
+}
+
+// TestDeclaredToolNames_IncludesManageSchedule 对应颗粒度文档 §3.2.2（约束 32）：
+// 十名声明清单**逐字对照**（判据面变更 §3.5 #4）。实现若漏登记 `manage_schedule`，
+// 轻路径会判它"池外"；若多列未注册名，重路径等值门禁会拒绝启动——两种漂移都在这里红。
+// The ten-name literal list is the only judge of the tenth tool's drift: the nine-name
+// classification fixture above cannot see a missing or extra declaration (P-03).
+func TestDeclaredToolNames_IncludesManageSchedule(t *testing.T) {
+	require.Equal(t, []string{
+		"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
+		"recall_memory", "save_memory", "shell", "write_file",
+	}, declaredToolNames, "声明名集必须与注册池十件逐字一致（排序序）")
+}
+
+// TestWebOptions_SchedulesWired 对应颗粒度文档 §3.2.2（§3.1.19 / 约束 21）：
+// 重路径**始终**构造调度器，投影进 web.Options 的必须是同一个实例（chat / tool
+// 不 Start 只是不启动，端口不得为空）；Runs 仍指向唯一运行入口——其 `Archive`
+// 就是会话归档的唯一写面，非法改成另一个实例会在归档语义上分叉。
+// The scheduler is always constructed on the heavy path, and Runs must stay the one
+// service whose Archive is the sole archiving write face.
+func TestWebOptions_SchedulesWired(t *testing.T) {
+	f := newWireFixture(t)
+	rt := f.assemble(t)
+
+	opts := f.app().webOptions(rt)
+	require.NotNil(t, rt.scheduler, "重路径必须构造调度器（约束 21）")
+	require.NotNil(t, opts.Schedules, "调度器必须注入 web.Options.Schedules（重路径恒构造）")
+	require.Same(t, rt.scheduler, opts.Schedules, "web 端口必须指向装配出的同一个调度器实例")
+	require.NotNil(t, opts.Runs, "运行入口是归档的唯一写面")
+	require.Same(t, rt.service, opts.Runs, "Runs 必须指向唯一运行入口（AgentService.Archive）")
 }

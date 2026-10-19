@@ -6,9 +6,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/storage"
@@ -121,6 +123,34 @@ func Run(ctx context.Context, args []string) int {
 		// 工具清单端口也只在这一次装配之后才有内容（`tool list` 走的就是这条路）。
 		// The tool-listing port also only has content after this assembly.
 		deps.Tools = rt.tools()
+		// serve / gateway 的信号上下文在这里**唯一一次**派生（约束 24）：`cmd.Context()`
+		// 即 runCtx，cli 不再自建 NotifyContext——两个信号源并存会让调度器的 watcher
+		// 只监听其中一个，停机宽限静默失效。装配阶段仍用原始 ctx（Ctrl-C 保持默认处置）；
+		// chat / tool 完全跳过（信号处置与 US-9 一致）。
+		// The signal context is derived exactly once here for serve/gateway.
+		runCtx := ctx
+		if needsSchedules(args) {
+			var stopSignals context.CancelFunc
+			runCtx, stopSignals = a.signalContext(ctx)
+			defer stopSignals()
+
+			// 启动失败两层边界（注 16）：存储层致命 → fail closed；runCtx 已被信号取消
+			// → 属于"启动被信号打断"，退出码 0（WARN），其余 → 1（ERROR）。判定只调一次。
+			// A cancelled run context means the signal interrupted startup (0); anything
+			// else is a real failure (1).
+			if startErr := startSchedules(runCtx, args, rt.scheduler); startErr != nil {
+				code := scheduleStartExitCode(runCtx, startErr)
+				if code == 0 {
+					logger.Warn("启动被信号中断", "error", startErr)
+				} else {
+					logger.Error("调度器启动失败", "error", startErr)
+				}
+				if closeErr := rt.Close(); closeErr != nil {
+					logger.Error("重路径资源释放失败", "error", closeErr)
+				}
+				return code
+			}
+		}
 		if needsServer(args) {
 			// HTTP 面只在 serve 上装配：端口背后是同一份重路径装配态（技术方案 §6.5）。
 			// The HTTP face is assembled only for serve, over the same runtime state.
@@ -139,7 +169,7 @@ func Run(ctx context.Context, args []string) int {
 		// 释放挂在唯一出口上且**在 exec 之后**：Serve 阻塞期间锁与库必须活着。
 		// Release hangs off this one exit point and runs after exec returns.
 		if execErr := runWithRuntime(rt, logger, func() error {
-			return executeRoot(ctx, args, deps)
+			return executeRoot(runCtx, args, deps)
 		}); execErr != nil {
 			logger.Error("命令执行失败", "error", execErr)
 			return 1
@@ -220,6 +250,20 @@ func commandName(args []string) (string, bool) {
 func needsServer(args []string) bool {
 	name, ok := commandName(args)
 	return ok && name == "serve"
+}
+
+// signalContext 派生 serve / gateway 的**唯一信号上下文**（约束 24）：`App.notifyContext`
+// 非 nil 时用它（用例注入可取消 ctx 的同形函数，不发真实信号），nil 时取标准库
+// `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`。取消只表示"收到停机信号"，
+// 停止宽限由调度器内部按 70s 有界等待实现（约束 24），不在这里做另一套计时。
+// signalContext derives the single signal context for serve/gateway; the notifier seam
+// lets tests drive cancellation without sending real process signals.
+func (a *App) signalContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	notify := a.notifyContext
+	if notify == nil {
+		notify = signal.NotifyContext
+	}
+	return notify(ctx, os.Interrupt, syscall.SIGTERM)
 }
 
 // needsServeInit 判定这次调用是否要在装配之前做幂等工作区初始化：只有 `serve`——它要

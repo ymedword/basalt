@@ -103,9 +103,11 @@ type SessionDetailView struct {
 	Messages []MessageView `json:"messages"`
 }
 
-// RunView 是运行结果（契约 components.schemas.RunView）；trigger 固定 api，
-// reason 只出公开投影文案（约束 23 / 注 15）。
-// RunView is the run result; trigger is always api and reason is the public projection.
+// RunView 是运行结果（契约 components.schemas.RunView）；trigger 取自 RunRequest
+// （scheduler 面为 cron / manual，空值回落 api），reason 只出公开投影文案
+// （约束 23 / 注 5 / 注 15）。
+// RunView projects one run; trigger comes from the RunRequest (cron or manual on the
+// scheduler face, falling back to api when empty) and reason is the public projection.
 type RunView struct {
 	RunID      string `json:"run_id"`
 	SessionID  string `json:"session_id"`
@@ -120,6 +122,37 @@ type RunView struct {
 	ConfigHash string `json:"config_hash"`
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
+}
+
+// ScheduleView 是 /schedules 的元素（契约 components.schemas.ScheduleView）；id 取
+// TaskID，last_run_at 零值渲染空串。
+// ScheduleView is one /schedules element; id is the TaskID and a zero last run
+// renders as an empty string.
+type ScheduleView struct {
+	ID         string `json:"id"`
+	Agent      string `json:"agent"`
+	Cron       string `json:"cron"`
+	Zone       string `json:"zone"`
+	Message    string `json:"message"`
+	Enabled    bool   `json:"enabled"`
+	LastRunAt  string `json:"last_run_at"`
+	LastStatus string `json:"last_status"`
+}
+
+// ExecutionView 是 /schedules/{id}/executions 的元素（契约 components.schemas
+// .ExecutionView）；started 行的 run_id / finished_at 为空串，error_message 只出
+// 公开投影（约束 34）。
+// ExecutionView is one execution-history element; nullable columns render empty and
+// error_message is always the public projection.
+type ExecutionView struct {
+	TaskID       string `json:"task_id"`
+	RunID        string `json:"run_id"`
+	Status       string `json:"status"`
+	Trigger      string `json:"trigger"`
+	DurationMS   int64  `json:"duration_ms"`
+	ErrorMessage string `json:"error_message"`
+	StartedAt    string `json:"started_at"`
+	FinishedAt   string `json:"finished_at"`
 }
 
 // sessionSummaryView 投影一行会话记录。
@@ -202,12 +235,16 @@ func toolView(d ToolDescriptor) ToolView {
 // runView projects one run; the reason is projected, the raw value stays in the runs
 // table and logs.
 func runView(req core.RunRequest, res core.RunResult, started, finished time.Time) RunView {
+	trigger := string(req.Trigger)
+	if trigger == "" {
+		trigger = triggerAPI
+	}
 	return RunView{
 		RunID:      res.RunID,
 		SessionID:  req.SessionID,
 		Agent:      req.Agent,
 		Channel:    req.Channel,
-		Trigger:    triggerAPI,
+		Trigger:    trigger,
 		Status:     string(res.Status),
 		Reason:     publicRunReason(res.Status, res.Reason),
 		FinalText:  res.FinalText,
@@ -216,6 +253,68 @@ func runView(req core.RunRequest, res core.RunResult, started, finished time.Tim
 		ConfigHash: res.ConfigHash,
 		StartedAt:  formatTime(started),
 		FinishedAt: formatTime(finished),
+	}
+}
+
+// scheduleView 投影一条任务定义；时间列经 formatTime（零值渲染空串）。
+// scheduleView projects one task definition; times go through formatTime.
+func scheduleView(rec core.TaskRecord) ScheduleView {
+	return ScheduleView{
+		ID:         rec.TaskID,
+		Agent:      rec.Agent,
+		Cron:       rec.Cron,
+		Zone:       rec.Zone,
+		Message:    rec.Message,
+		Enabled:    rec.Enabled,
+		LastRunAt:  formatTime(rec.LastRunAt),
+		LastStatus: string(rec.LastStatus),
+	}
+}
+
+// executionView 投影一行执行历史：可空列（run_id / finished_at）渲染空串，
+// error_message 只经 publicExecutionMessage 出站（约束 34 / R22）。
+// executionView projects one execution row; the raw error never leaves this layer.
+func executionView(rec core.ExecutionRecord) ExecutionView {
+	return ExecutionView{
+		TaskID:       rec.TaskID,
+		RunID:        rec.RunID,
+		Status:       string(rec.Status),
+		Trigger:      string(rec.Trigger),
+		DurationMS:   rec.DurationMS,
+		ErrorMessage: publicExecutionMessage(rec.Status, rec.ErrorMessage),
+		StartedAt:    formatTime(rec.StartedAt),
+		FinishedAt:   formatTime(rec.FinishedAt),
+	}
+}
+
+// 执行历史的公开错误文案（约束 34 / D-21）：归档跳过文案由 scheduler 直写
+// error_message，其余 skipped 原文（锁失、兄弟任务占会话）一律落回通用文案。
+// Public execution messages: the archived-skip literal is written by the scheduler,
+// every other skip reason collapses into the generic text.
+const (
+	executionMessageArchived = "会话已归档，本轮跳过"
+	executionMessageSkipped  = "上一轮尚未结束，本轮跳过"
+)
+
+// publicExecutionMessage 按 status + 逐字匹配的 raw 做三路投影（约束 34）：
+// started / completed → 空串；failed → 运行失败；skipped 且 raw 恰为归档冻结文案
+// → 同文案；其余 skipped → 通用跳过文案。**不得**用子串 / 前缀匹配——未识别原文
+// （可能含绝对路径、SQL 正文与用户数据）只落库、永不出站。
+// publicExecutionMessage projects by status and an exact raw match; unknown text
+// always falls back to the generic skip message.
+func publicExecutionMessage(status core.ExecutionStatus, raw string) string {
+	switch status {
+	case core.ExecutionStarted, core.ExecutionCompleted:
+		return ""
+	case core.ExecutionFailed:
+		return publicReasonFailed
+	case core.ExecutionSkipped:
+		if raw == executionMessageArchived {
+			return executionMessageArchived
+		}
+		return executionMessageSkipped
+	default:
+		return ""
 	}
 }
 

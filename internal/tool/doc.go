@@ -3,9 +3,11 @@
 // controlled command execution and the built-in file tools.
 //
 // 本包当前交付：注册表（显式注册、重名拒绝、名字集顺序稳定）、白名单授权（Policy
-// 的 v1 实现）、受控命令执行器（CommandRunner 的 v1 实现及平台半边）与三件文件
-// 工具（read_file / write_file / list_dir）。shell / http 工具本体与工具清单命令
-// 归后续 US，**不得**在本包提前落位。
+// 的 v1 实现）、受控命令执行器（CommandRunner 的 v1 实现及平台半边）与十件内置
+// 工具：read_file / write_file / list_dir、shell、http_get / http_post、
+// save_memory / recall_memory、notify 与 manage_schedule（第 10 件）。调度写入同样
+// 经过工作区写闸门（`AgentLoader.ApplySchedule`，唯一写入路径）——本包只做入参
+// 校验与分派，不自行落盘。
 //
 // 两条原则约束先行（.specify/memory/constitution.md）：
 //   - 授权与执行分离为 Policy.Check 与 CommandRunner.Run 两接口（第 6 条）：调用方
@@ -47,8 +49,11 @@
 //
 // The package currently ships the tool registry (explicit registration, duplicate
 // rejection, stable name order), the v1 whitelist policy, the v1 command runner
-// with its per-platform halves, and the three file tools. Shell / HTTP tools and
-// the tool-listing command belong to later user stories. The constitution binds
+// with its per-platform halves, and ten built-in tools: read_file / write_file /
+// list_dir, shell, http_get / http_post, save_memory / recall_memory, notify, and
+// manage_schedule. Schedule writes go through the workspace write gate
+// (AgentLoader.ApplySchedule) as well; this package only validates and dispatches
+// and never writes files itself. The constitution binds
 // here first-hand: authorization and execution stay apart as Policy.Check and
 // CommandRunner.Run (principle 6 — callers must not depend on concrete
 // implementations), and tool scheduling belongs to core's ToolExecutor

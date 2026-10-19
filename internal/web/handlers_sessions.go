@@ -1,10 +1,11 @@
 package web
 
-// 本文件是会话与运行入口的 handler（模块卡 §3.1）：HTTP 层只做解码、边界判定、
-// 准入与结果映射——**不写消息、不执行工具、不另起循环**；消息追加与 Run 账本全部由
-// RunService 背后的 AgentService 完成（宪法 II / V）。
-// Session and run handlers; the HTTP layer decodes, validates, admits, and maps
-// results only. It never writes messages or executes tools itself.
+// 本文件是会话与运行入口的 handler（模块卡 §3.1）：HTTP 层只做解码、边界判定与
+// 结果映射——**不写消息、不执行工具、不另起循环、不持有准入状态**；会话准入（忙集、
+// 实例上限、归档互斥）与 Run 账本全部由 RunService 背后的 AgentService 完成
+// （宪法 II / V，约束 40）。
+// Session and run handlers; the HTTP layer decodes, validates, and maps results only.
+// Session admission and the run ledger belong to the RunService behind it.
 
 import (
 	"context"
@@ -28,14 +29,6 @@ const (
 	statusActive    = "active"
 	statusArchived  = "archived"
 	triggerAPI      = "api"
-)
-
-// 准入 / 归档的哨兵错误（约束 36 / 注 13）；映射到 400 / 409，不按文本匹配。
-// 两个 error 只在本包的准入路径里产生与识别——跨包传递一律走 core 的具名类型。
-// Sentinels for the admission path; they never escape this package.
-var (
-	errSessionArchived = errors.New("会话已归档")
-	errSessionRunning  = errors.New("会话有在途运行")
 )
 
 // handleCreateSession 派生 id 后按 (channel,user_id,agent) 建行；新建时 rec.Status
@@ -146,11 +139,13 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error, sessionID str
 	s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
 }
 
-// handlePostMessage 是发消息闭环：校验（含 32 KiB 运行前判定）→ 准入 → 运行 → 映射。
-// 客户端在运行期间断开时不写响应（写已断开的连接只会得到 broken pipe）；HTTP 层
-// 不写消息、不写审计——Run 行与消息追加都在 AgentService 内（宪法 II / V）。
-// handlePostMessage validates, admits, runs, and maps; a disconnected client gets no
-// response written at all.
+// handlePostMessage 是发消息闭环：校验（含 32 KiB 运行前判定）→ 读会话 → 运行 → 映射。
+// 归档与在途的互斥由 AgentService 判定（RequireExistingSession；归档会话返回
+// *SessionArchivedError → 400）。客户端在运行期间断开时不写响应（写已断开的连接
+// 只会得到 broken pipe）；HTTP 层不写消息、不写审计——Run 行与消息追加都在
+// AgentService 内（宪法 II / V）。
+// handlePostMessage validates, reads the session, runs, and maps; admission and
+// archiving are decided by the service, and a disconnected client gets no response.
 func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
@@ -170,27 +165,24 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, err := s.admitRun(r.Context(), id)
-	if errors.Is(err, errSessionArchived) {
-		s.writeError(w, http.StatusBadRequest, codeBadRequest, "会话已归档，不可追加消息")
-		return
-	}
+	// 读面只取 ProfileName / UserID；未命中 → 既有 404 文案。
+	rec, err := s.opts.Sessions.GetSession(r.Context(), id)
 	if err != nil {
 		s.writeStoreError(w, err, id)
 		return
 	}
-	defer s.releaseRun(id)
 
 	runCtx, cancel := context.WithTimeout(r.Context(), s.opts.RunTimeout)
 	defer cancel()
 	started := s.now()
 	req := core.RunRequest{
-		Agent:     rec.ProfileName,
-		SessionID: id,
-		Message:   *body.Message,
-		Channel:   channelWeb,
-		UserID:    rec.UserID,
-		Budget:    s.opts.RunBudget,
+		Agent:                  rec.ProfileName,
+		SessionID:              id,
+		Message:                *body.Message,
+		Channel:                channelWeb,
+		UserID:                 rec.UserID,
+		Budget:                 s.opts.RunBudget,
+		RequireExistingSession: true,
 	}
 	res, err := s.opts.Runs.Run(runCtx, req)
 	if r.Context().Err() != nil {
@@ -212,13 +204,19 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleArchiveSession 只改状态与首次归档时间：不删消息 / 会话 / 审计；重复归档幂等；
-// 在途运行期间由准入锁拒绝（409 冻结文案，归档不生效）。成功响应无 data（注 4）。
-// handleArchiveSession flips status and stamps archived_at once; success carries no data.
+// 在途运行期间由 AgentService 拒绝（409 冻结文案，归档不生效）。成功响应无 data（注 4）。
+// handleArchiveSession delegates archiving to the service; success carries no data.
 func (s *Server) handleArchiveSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	err := s.archiveSession(r.Context(), id, s.now())
-	if errors.Is(err, errSessionRunning) {
+	err := s.opts.Runs.Archive(r.Context(), id)
+	var busyErr *core.SessionBusyError
+	if errors.As(err, &busyErr) {
 		s.writeError(w, http.StatusConflict, codeSessionBusy, messageBusy)
+		return
+	}
+	var notFoundErr *core.SessionNotFoundError
+	if errors.As(err, &notFoundErr) {
+		s.writeError(w, http.StatusNotFound, codeNotFound, "未找到会话："+id)
 		return
 	}
 	if err != nil {
@@ -290,13 +288,19 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("未找到该接口（%s %s）", r.Method, r.URL.Path))
 }
 
-// writeRunError 按错误类型映射 404 / 409 / 429 / 504 / 500（约束 22），**不比对
-// 错误文本**；运行截止优先于错误类型判定（超时那一刻 Run 可能带回任意 wrapped error）。
-// 500 只出固定文案，原始错误进 ERROR 日志（约束 23）。
+// writeRunError 按错误类型映射 400 / 404 / 409 / 429 / 504 / 500（约束 22 / 43），
+// **不比对错误文本**；运行截止优先于错误类型判定（超时那一刻 Run 可能带回任意
+// wrapped error）。归档会话固定 400 + 冻结文案；500 只出固定文案，原始错误进
+// ERROR 日志（约束 23）。
 // writeRunError maps typed errors to status codes and never matches on text.
 func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.Context) {
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		s.writeError(w, http.StatusGatewayTimeout, codeTimeout, "运行超过 60 秒时限")
+		return
+	}
+	var archivedErr *core.SessionArchivedError
+	if errors.As(err, &archivedErr) {
+		s.writeError(w, http.StatusBadRequest, codeBadRequest, "会话已归档，不可追加消息")
 		return
 	}
 	var agentErr *core.AgentNotFoundError

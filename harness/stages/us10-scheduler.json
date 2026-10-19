@@ -1,0 +1,451 @@
+{
+  "version": 1,
+  "id": "us10-scheduler-r1",
+  "approval": "Human review ① 2026-10-19 approved module card R11 (reviewed sha256 0659bbb1d32935050869084b727fc346a2f96ba1060b3512aabb2a9b265fc6a3, 2627 lines) per user instruction to execute /us-register 10 and start module dev. Manual-item addendum of 2026-10-19 added §6.2 items 15/16 and §6.2.1; current card sha256 a471fc187a10bc9e33c2e7257ee75d270cd8b2915176295831802f4bb0770cfa (2661 lines), design body unchanged. Analyze first round 2026-10-19: 0 CRITICAL, 3 HIGH / 2 MEDIUM / 2 LOW disposed in-scope (spec sha256 3e7279a054c2f715986f66e9c724cbd3c9f0c64b2034a4214c28e29ec9371823, plan sha256 f8608b64d018313f7a189db38f8b5a05e63095318a4fce3dc9645b5b45fb4e82, tasks fingerprint add2532985360a350cdf5ce7ddfd8d3a378578b1ec5a7e8552152fc3cb2d8c47c, 277 lines / 45 tasks). Stage derived from module card §4.4 by module-dev step 6.1; tasks mapping filled from the frozen tasks.md and re-verified at T043; this stage grants no approval by itself.",
+  "inputs": [
+    "docs/us/us10-scheduler.md",
+    "specs/010-scheduler/spec.md",
+    "specs/010-scheduler/plan.md",
+    "specs/010-scheduler/tasks.md"
+  ],
+  "protect": [
+    "internal/core/run.go",
+    "internal/core/store.go",
+    "internal/core/service.go",
+    "internal/core/errors.go",
+    "internal/storage/run_store.go",
+    "internal/workspace/agent.go",
+    "internal/tool/doc.go",
+    "internal/web/server.go",
+    "internal/web/views.go",
+    "internal/web/handlers_sessions.go",
+    "internal/app/wire.go",
+    "internal/app/run.go",
+    "internal/app/web.go",
+    "internal/cli/serve.go",
+    "internal/core/service_test.go",
+    "internal/core/scheduler_test.go",
+    "internal/storage/run_store_test.go",
+    "internal/storage/task_store_test.go",
+    "internal/adapters/cron/cron_test.go",
+    "internal/workspace/schedule_write_test.go",
+    "internal/tool/manageschedule_test.go",
+    "internal/web/handlers_test.go",
+    "internal/web/handlers_schedules_test.go",
+    "internal/web/contract_test.go",
+    "internal/web/server_test.go",
+    "internal/app/web_test.go",
+    "internal/app/ports_test.go",
+    "internal/app/schedule_test.go",
+    "internal/app/crossentry_test.go",
+    "internal/app/run_test.go",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/agent-md.md",
+    "go.mod",
+    "go.sum",
+    "harness/acceptance.json",
+    "Makefile",
+    "scripts/check-acceptance.sh",
+    "scripts/check-acceptance.ps1",
+    "scripts/acceptance/acceptance_test.go",
+    "scripts/acceptance/config.go",
+    "scripts/acceptance/execute.go",
+    "scripts/acceptance/fingerprint.go",
+    "scripts/acceptance/main.go",
+    "scripts/acceptance/process_unix.go",
+    "scripts/acceptance/process_windows.go",
+    "scripts/acceptance/sync_unix.go",
+    "scripts/acceptance/sync_windows.go"
+  ],
+  "checks": [
+    {
+      "id": "010-core-scheduler",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestScheduler_",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScheduler_StartRecoversExecutions",
+        "TestScheduler_StartReconcilesDefinitions",
+        "TestScheduler_StartRegistersEnabledOnly",
+        "TestScheduler_StartTwice",
+        "TestScheduler_Fire_DerivesSessionAndRunID",
+        "TestScheduler_Fire_ExecutesAndRecords",
+        "TestScheduler_Fire_ReadsTaskFromStore",
+        "TestScheduler_Fire_FailureMapping",
+        "TestScheduler_Fire_AdmissionErrorRecordsFailed",
+        "TestScheduler_Fire_SessionBusyRecordsSkipped",
+        "TestScheduler_Fire_StartExecutionFailure",
+        "TestScheduler_Fire_LockMissRecordsSkipped",
+        "TestScheduler_Fire_PanicRecovered",
+        "TestScheduler_Fire_MissedTriggerWarnsWithoutRun",
+        "TestScheduler_RunNow_SameChain",
+        "TestScheduler_RunNow_BusyReturnsErrTaskBusy",
+        "TestScheduler_RunNow_HiddenTaskNotFound",
+        "TestScheduler_RunNow_DisabledTaskStillRuns",
+        "TestScheduler_RunNow_SessionBusyRecordsSkipped",
+        "TestScheduler_SetEnabled_TogglesRegistration",
+        "TestScheduler_SetEnabled_HiddenTaskNotFound",
+        "TestScheduler_List_FiltersAndOrders",
+        "TestScheduler_List_ReflectsRunState",
+        "TestScheduler_Executions_UsesLimit",
+        "TestScheduler_Executions_HiddenTaskNotFound",
+        "TestScheduler_LogFieldsAndNoBody",
+        "TestScheduler_StopConcurrent",
+        "TestScheduler_StopOnContextCancel",
+        "TestScheduler_StopBeforeStart",
+        "TestScheduler_StopTimeoutCancelsInflight",
+        "TestScheduler_ReconcileAgent",
+        "TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration",
+        "TestScheduler_Fire_FinishUsesCleanupCtx",
+        "TestScheduler_Start_StoreFailureFatal",
+        "TestScheduler_Start_TaskAddFailureStopsEngine",
+        "TestScheduler_SetEnabled_WritesDBFirst",
+        "TestScheduler_SetEnabled_ConcurrentToggles",
+        "TestScheduler_Fire_ArchivedSessionSkipped",
+        "TestScheduler_RunNow_ArchivedSessionPropagates",
+        "TestScheduler_Start_OwnerConflictFatal",
+        "TestScheduler_CheckOwnership",
+        "TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition",
+        "TestScheduler_OldCallbackAfterReconcile_NoRun",
+        "TestScheduler_ReconcileAgent_AddFailureReturnsError",
+        "TestScheduler_Start_SecondAgentApplyFails_NoHandles",
+        "TestScheduler_Fire_ConcurrentDistinctTasks"
+      ]
+    },
+    {
+      "id": "010-core-sessiongate",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestAgentService_(Archive_RejectsInflightRun|Archive_Idempotent|Run_ArchivedSessionRejected|Run_RequireExistingSession|StatelessRunsNotSerialized|Archive_WithoutSessionStore)$",
+        "./internal/core"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestAgentService_Archive_RejectsInflightRun",
+        "TestAgentService_Archive_Idempotent",
+        "TestAgentService_Run_ArchivedSessionRejected",
+        "TestAgentService_Run_RequireExistingSession",
+        "TestAgentService_StatelessRunsNotSerialized",
+        "TestAgentService_Archive_WithoutSessionStore"
+      ]
+    },
+    {
+      "id": "010-core-runid",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestAgentService_Run_(UsesCallerRunID|DefaultRunIDUnchanged|PassesTriggerToLedger)$",
+        "./internal/core"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestAgentService_Run_UsesCallerRunID",
+        "TestAgentService_Run_DefaultRunIDUnchanged",
+        "TestAgentService_Run_PassesTriggerToLedger"
+      ]
+    },
+    {
+      "id": "010-cron-adapter",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestEngine_",
+        "./internal/adapters/cron"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestEngine_RejectsFiveFieldSpec",
+        "TestEngine_RejectsMissingCRONTZ",
+        "TestEngine_ParsesSixFieldWithCRONTZ",
+        "TestEngine_OccurrencesFromFixedStart",
+        "TestEngine_OccurrencesCapsAtLimit",
+        "TestEngine_OccurrencesNoMoreTimes",
+        "TestEngine_AddAndStop",
+        "TestEngine_StopWaitsForJobs",
+        "TestEngine_UnknownZoneFails"
+      ]
+    },
+    {
+      "id": "010-storage-tasks",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestApplyAgentTasks_|TestTaskStore_|TestRunStore_TriggerForScheduler$)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestApplyAgentTasks_UpsertPreservesState",
+        "TestTaskStore_RetireAndRevive",
+        "TestApplyAgentTasks_SameOwnerReviveAllowed",
+        "TestApplyAgentTasks_CrossOwnerRejected",
+        "TestApplyAgentTasks_CrossOwnerRetiredRejected",
+        "TestApplyAgentTasks_RollbackOnSecondWrite",
+        "TestTaskStore_SetTaskEnabled",
+        "TestTaskStore_MarkTaskRun",
+        "TestTaskStore_StartExecutionAndFinish",
+        "TestTaskStore_FinishExecution",
+        "TestTaskStore_RecordSkipped",
+        "TestTaskStore_RecoverStartedExecutions",
+        "TestTaskStore_ListTasks",
+        "TestTaskStore_ListExecutions",
+        "TestRunStore_TriggerForScheduler"
+      ]
+    },
+    {
+      "id": "010-workspace-writegate",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestApplySchedule_|TestReadSchedules)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestApplySchedule_SetAddsAndReturnsValidated",
+        "TestApplySchedule_Remove",
+        "TestApplySchedule_PreservesOtherBytes",
+        "TestApplySchedule_RejectsInvalidCandidate",
+        "TestApplySchedule_CrossAgentIDRejected",
+        "TestApplySchedule_RemoveUnknownIDNotFound",
+        "TestApplySchedule_NoTempResidue",
+        "TestApplySchedule_AtomicOnRenameFailure",
+        "TestApplySchedule_ConcurrentSets",
+        "TestReadSchedules",
+        "TestApplySchedule_DoesNotTouchOtherAgents",
+        "TestApplySchedule_ClaimBaseline"
+      ]
+    },
+    {
+      "id": "010-tool-manageschedule",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestManageSchedule_",
+        "./internal/tool"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestManageSchedule_NoAgentContextRejected",
+        "TestManageSchedule_List",
+        "TestManageSchedule_Set",
+        "TestManageSchedule_Remove",
+        "TestManageSchedule_InvalidAction",
+        "TestManageSchedule_UsesEnvAgentOnly",
+        "TestManageSchedule_NotFoundClassified",
+        "TestManageSchedule_InvalidInputClassified",
+        "TestManageSchedule_UnboundSlotFails",
+        "TestManageSchedule_ToolSpec"
+      ]
+    },
+    {
+      "id": "010-web-schedules",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestSchedules_|TestRunView_Trigger|TestPostMessage_ArchivedMapsTo400|TestArchiveSession_ServiceBusyMapsTo409)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSchedules_ListShapeAndOrder",
+        "TestSchedules_SetEnabled",
+        "TestSchedules_Executions",
+        "TestSchedules_RunSuccess",
+        "TestSchedules_RunConflict",
+        "TestSchedules_RunNotFound",
+        "TestSchedules_RunTimeout",
+        "TestSchedules_ExecutionMessageProjection",
+        "TestSchedules_MethodNotAllowed404",
+        "TestSchedules_RunTooManyRuns",
+        "TestSchedules_NilServiceReturns500",
+        "TestSchedules_RunArchived400",
+        "TestRunView_TriggerFallback",
+        "TestRunView_TriggerFromRequest",
+        "TestPostMessage_ArchivedMapsTo400",
+        "TestArchiveSession_ServiceBusyMapsTo409"
+      ]
+    },
+    {
+      "id": "010-web-contract-schema",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestOpenAPI_ScheduleTimeFields$",
+        "./internal/web"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestOpenAPI_ScheduleTimeFields"
+      ]
+    },
+    {
+      "id": "010-app-schedule",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNeedsSchedules|TestNewScheduler_|TestScheduleEditorAdapter_|TestRun_Schedule|TestHeavyRuntime_CloseStopsSchedulerFirst|TestScheduleStartExitCode_|TestNewRuntime_ServiceHasSessionGate|TestApp_SignalContextUsesInjectedNotifier)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNeedsSchedules",
+        "TestNewScheduler_Options",
+        "TestScheduleEditorAdapter_MapsRejectionToInvalidInput",
+        "TestScheduleEditorAdapter_ReconcilesAfterWrite",
+        "TestRun_ScheduleStartModes",
+        "TestRun_ScheduleStartFailureExits",
+        "TestScheduleEditorAdapter_RefreshesClaimBaseline",
+        "TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
+        "TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
+        "TestHeavyRuntime_CloseStopsSchedulerFirst",
+        "TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite",
+        "TestScheduleStartExitCode_SignalCanceledReturnsZero",
+        "TestScheduleStartExitCode_FailureReturnsOne",
+        "TestNewRuntime_ServiceHasSessionGate",
+        "TestApp_SignalContextUsesInjectedNotifier"
+      ]
+    },
+    {
+      "id": "010-app-tools",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersTenTools)$",
+        "./internal/app"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestDeclaredToolNames_IncludesManageSchedule",
+        "TestWebOptions_SchedulesWired",
+        "TestRun_HeavyCommandSplit",
+        "TestToolListerPort_HeavyAssemblyRegistersTenTools"
+      ]
+    },
+    {
+      "id": "010-app-crossentry",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestCrossEntry_",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestCrossEntry_CronArchiveCoordination",
+        "TestCrossEntry_ManualRerunArchiveCoordination"
+      ]
+    },
+    {
+      "id": "010-race",
+      "args": [
+        "go",
+        "test",
+        "-race",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "./internal/adapters/cron",
+        "./internal/storage",
+        "./internal/workspace",
+        "./internal/tool",
+        "./internal/web",
+        "./internal/app"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestScheduler_StopConcurrent",
+        "TestScheduler_Fire_LockMissRecordsSkipped",
+        "TestScheduler_StopTimeoutCancelsInflight",
+        "TestScheduler_SetEnabled_ConcurrentToggles",
+        "TestScheduler_Fire_ConcurrentDistinctTasks",
+        "TestScheduler_OldCallbackAfterReconcile_NoRun",
+        "TestApplySchedule_ConcurrentSets",
+        "TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
+        "TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
+        "TestSchedules_RunConflict",
+        "TestHeavyRuntime_CloseStopsSchedulerFirst",
+        "TestAgentService_Archive_RejectsInflightRun",
+        "TestAgentService_StatelessRunsNotSerialized",
+        "TestCrossEntry_CronArchiveCoordination"
+      ]
+    }
+  ],
+  "tasks": [
+    { "id": "T007", "checks": ["010-core-sessiongate", "010-core-runid"] },
+    { "id": "T008", "checks": ["010-core-sessiongate", "010-core-runid"] },
+    { "id": "T009", "checks": ["010-storage-tasks"] },
+    { "id": "T010", "checks": ["010-storage-tasks"] },
+    { "id": "T011", "checks": ["010-storage-tasks"] },
+    { "id": "T012", "checks": ["010-storage-tasks"] },
+    { "id": "T013", "checks": ["010-cron-adapter"] },
+    { "id": "T014", "checks": ["010-cron-adapter"] },
+    { "id": "T016", "checks": ["010-core-scheduler"] },
+    { "id": "T017", "checks": ["010-core-scheduler"] },
+    { "id": "T018", "checks": ["010-app-schedule"] },
+    { "id": "T019", "checks": ["010-app-schedule"] },
+    { "id": "T020", "checks": ["010-app-schedule"] },
+    { "id": "T021", "checks": ["010-core-scheduler"] },
+    { "id": "T022", "checks": ["010-core-scheduler"] },
+    { "id": "T023", "checks": ["010-app-schedule"] },
+    { "id": "T024", "checks": ["010-core-scheduler"] },
+    { "id": "T025", "checks": ["010-core-scheduler"] },
+    { "id": "T026", "checks": ["010-web-schedules"] },
+    { "id": "T027", "checks": ["010-web-schedules"] },
+    { "id": "T028", "checks": ["010-web-schedules"] },
+    { "id": "T029", "checks": ["010-web-schedules"] },
+    { "id": "T030", "checks": ["010-web-schedules"] },
+    { "id": "T031", "checks": ["010-web-contract-schema"] },
+    { "id": "T032", "checks": ["010-workspace-writegate"] },
+    { "id": "T033", "checks": ["010-workspace-writegate"] },
+    { "id": "T034", "checks": ["010-tool-manageschedule"] },
+    { "id": "T035", "checks": ["010-tool-manageschedule"] },
+    { "id": "T036", "checks": ["010-core-scheduler"] },
+    { "id": "T037", "checks": ["010-app-schedule"] },
+    { "id": "T038", "checks": ["010-app-schedule"] },
+    { "id": "T039", "checks": ["010-app-tools"] },
+    { "id": "T040", "checks": ["010-app-crossentry"] },
+    { "id": "T042", "checks": ["010-race"] }
+  ]
+}
