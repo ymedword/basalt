@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -17,19 +18,20 @@ import (
 
 // checkTests 要求具名 PASS 事件且该名及其子测试都不出现 SKIP；空匹配、父测试放行都算失败。
 // checkTests requires a named pass event and rejects skips of that name or its subtests,
-// so an empty -run match or an all-skipped parent test cannot pass.
-func checkTests(log string, required []string) error {
+// so an empty -run match or an all-skipped parent test cannot pass. It also returns the
+// observed pass/skip event names for the published report.
+func checkTests(log string, required []string) (passed, skipped []string, err error) {
 	dir, err := os.OpenRoot(filepath.Dir(log))
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer dir.Close()
 	f, err := dir.Open(filepath.Base(log))
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	defer f.Close()
-	passed, skipped := map[string]bool{}, map[string]bool{}
+	passedSet, skippedSet := map[string]bool{}, map[string]bool{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4096), 4*1024*1024)
 	for scanner.Scan() {
@@ -42,47 +44,116 @@ func checkTests(log string, required []string) error {
 		}
 		switch event.Action {
 		case "pass":
-			passed[event.Test] = true
+			if !passedSet[event.Test] {
+				passedSet[event.Test] = true
+				passed = append(passed, event.Test)
+			}
 		case "skip":
-			skipped[event.Test] = true
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	for _, name := range required {
-		if !passed[name] {
-			return fmt.Errorf("required test did not execute and pass: %s", name)
-		}
-		if skipped[name] {
-			return fmt.Errorf("required test was skipped: %s", name)
-		}
-		for sub := range skipped {
-			if strings.HasPrefix(sub, name+"/") {
-				return fmt.Errorf("required test skipped a subtest: %s", sub)
+			if !skippedSet[event.Test] {
+				skippedSet[event.Test] = true
+				skipped = append(skipped, event.Test)
 			}
 		}
 	}
-	return nil
+	if err := scanner.Err(); err != nil {
+		return nil, nil, err
+	}
+	for _, name := range required {
+		if !passedSet[name] {
+			return passed, skipped, fmt.Errorf("required test did not execute and pass: %s", name)
+		}
+		if skippedSet[name] {
+			return passed, skipped, fmt.Errorf("required test was skipped: %s", name)
+		}
+		for sub := range skippedSet {
+			if strings.HasPrefix(sub, name+"/") {
+				return passed, skipped, fmt.Errorf("required test skipped a subtest: %s", sub)
+			}
+		}
+	}
+	return passed, skipped, nil
 }
 
 type result struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	ExitCode int    `json:"exit_code"`
-	Log      string `json:"log"`
-	Detail   string `json:"detail,omitempty"`
-	Millis   int64  `json:"duration_ms"`
+	ID           string   `json:"id"`
+	Level        string   `json:"level"`
+	Status       string   `json:"status"`
+	ExitCode     int      `json:"exit_code"`
+	Log          string   `json:"log"`
+	Detail       string   `json:"detail,omitempty"`
+	Millis       int64    `json:"duration_ms"`
+	PassedTests  []string `json:"passed_tests"`
+	SkippedTests []string `json:"skipped_tests"`
 }
 
 type acceptanceReport struct {
-	Version     int      `json:"version"`
-	Scope       string   `json:"scope"`
-	Fingerprint string   `json:"fingerprint"`
-	StartedAt   string   `json:"started_at"`
-	Status      string   `json:"status"`
-	ExitCode    int      `json:"exit_code"`
-	Checks      []result `json:"checks"`
+	Version            int            `json:"version"`
+	RunID              string         `json:"run_id"`
+	Scope              string         `json:"scope"`
+	Fingerprint        string         `json:"fingerprint"`
+	BaseCommit         string         `json:"base_commit"`
+	Dirty              bool           `json:"dirty"`
+	Environment        environment    `json:"environment"`
+	Authorization      *authorization `json:"authorization,omitempty"`
+	TestedBinarySHA256 *string        `json:"tested_binary_sha256,omitempty"`
+	StartedAt          string         `json:"started_at"`
+	Status             string         `json:"status"`
+	ExitCode           int            `json:"exit_code"`
+	Checks             []result       `json:"checks"`
+}
+
+var binaryMarker = regexp.MustCompile(`binary_sha256=([0-9a-f]{64})`)
+
+// projectReport 把日志路径投影为仓库相对路径并统一 `/` 分隔；报告落盘后即可跨机复跑核对。
+// projectReport rewrites log paths to repo-relative slash-separated form before writing.
+func projectReport(root string, rpt acceptanceReport) acceptanceReport {
+	projected := rpt
+	projected.Checks = slices.Clone(rpt.Checks)
+	for i := range projected.Checks {
+		if projected.Checks[i].Log == "" {
+			continue
+		}
+		rel, err := filepath.Rel(root, projected.Checks[i].Log)
+		if err == nil && relative(rel) {
+			projected.Checks[i].Log = filepath.ToSlash(rel)
+		}
+	}
+	return projected
+}
+
+// resolveBinaryHash 从 process / external check 的日志中提取唯一 binary_sha256 标记。
+// 缺失、多个或跨 check 不一致都按基础设施错误处理，不得降级为 source。
+// resolveBinaryHash extracts exactly one binary_sha256 marker from process/external logs;
+// missing, duplicated or disagreeing markers are infrastructure errors, never downgraded.
+func resolveBinaryHash(rpt *acceptanceReport) error {
+	hashes := map[string]bool{}
+	needed := false
+	for _, r := range rpt.Checks {
+		if r.Level != "process" && r.Level != "external" {
+			continue
+		}
+		needed = true
+		raw, err := os.ReadFile(r.Log)
+		if err != nil {
+			return fmt.Errorf("%s: level %s requires a binary_sha256 marker: %w", r.ID, r.Level, err)
+		}
+		matches := binaryMarker.FindAllSubmatch(raw, -1)
+		if len(matches) != 1 {
+			return fmt.Errorf("%s: level %s requires exactly one binary_sha256 marker, found %d", r.ID, r.Level, len(matches))
+		}
+		hashes[string(matches[0][1])] = true
+	}
+	if !needed {
+		return nil
+	}
+	if len(hashes) != 1 {
+		return fmt.Errorf("process/external checks report %d distinct binary_sha256 values", len(hashes))
+	}
+	for hash := range hashes {
+		value := hash
+		rpt.TestedBinarySHA256 = &value
+	}
+	return nil
 }
 
 // execute 直执受保护配置中的 argv，显式限制超时并清理进程树；日志不记录环境变量。
@@ -224,38 +295,59 @@ func atomicJSON(path string, data any) error {
 	return syncDir(dir)
 }
 
-func accept(ctx context.Context, root, out, scope string, checks []check, stdout io.Writer) (int, error) {
+func accept(ctx context.Context, root, out, scope string, checks []check, auth *authorization, stdout io.Writer) (int, acceptanceReport, error) {
+	hasExternal := slices.ContainsFunc(checks, func(c check) bool { return checkLevel(c) == "external" })
+	if hasExternal != (auth != nil) || (auth != nil && (strings.TrimSpace(auth.Ref) == "" || strings.TrimSpace(auth.Scope) == "")) {
+		return 2, acceptanceReport{}, errors.New("external checks require matching authorization ref and scope")
+	}
 	handle, err := os.OpenRoot(root)
 	if err != nil {
-		return 2, err
+		return 2, acceptanceReport{}, err
 	}
 	defer handle.Close()
 	rel, err := filepath.Rel(root, out)
 	if err != nil || !relative(rel) {
-		return 2, errors.New("output must stay within repository")
+		return 2, acceptanceReport{}, errors.New("output must stay within repository")
 	}
 	if err := handle.MkdirAll(filepath.Dir(rel), 0o700); err != nil {
-		return 2, err
+		return 2, acceptanceReport{}, err
 	}
 	// Fresh directories prevent stale reports from authorizing a new code state.
 	if err := handle.Mkdir(rel, 0o700); err != nil {
-		return 2, fmt.Errorf("output must be a fresh directory: %w", err)
+		return 2, acceptanceReport{}, fmt.Errorf("output must be a fresh directory: %w", err)
 	}
 	fingerprint, err := sourceFingerprint(root)
 	if err != nil {
-		return 2, err
+		return 2, acceptanceReport{}, err
 	}
-	rpt := acceptanceReport{Version: 1, Scope: scope, Fingerprint: fingerprint, StartedAt: time.Now().UTC().Format(time.RFC3339), Status: "running", Checks: []result{}}
+	commit, dirty, err := gitState(root)
+	if err != nil {
+		return 2, acceptanceReport{}, err
+	}
+	runID := filepath.Base(filepath.Clean(out))
+	rpt := acceptanceReport{
+		Version:       1,
+		RunID:         runID,
+		Scope:         scope,
+		Fingerprint:   fingerprint,
+		BaseCommit:    commit,
+		Dirty:         dirty,
+		Environment:   currentEnvironment(),
+		Authorization: auth,
+		StartedAt:     time.Now().UTC().Format(time.RFC3339),
+		Status:        "running",
+		Checks:        []result{},
+	}
 	writeProgress := func() error {
-		partial := rpt
+		partial := projectReport(root, rpt)
 		partial.Status, partial.ExitCode = "running", 2
 		return atomicJSON(filepath.Join(out, "report.json"), &partial)
 	}
 	for _, c := range checks {
-		rpt.Checks = append(rpt.Checks, result{ID: c.ID, Status: "not_run", ExitCode: -1})
+		rpt.Checks = append(rpt.Checks, result{ID: c.ID, Level: checkLevel(c), Status: "not_run", ExitCode: -1, PassedTests: []string{}, SkippedTests: []string{}})
 	}
 	if err := writeProgress(); err != nil {
-		return 2, err
+		return 2, acceptanceReport{}, err
 	}
 	for i, c := range checks {
 		// Cancellation between two checks must not leave an earlier pass authorizing the run.
@@ -263,7 +355,7 @@ func accept(ctx context.Context, root, out, scope string, checks []check, stdout
 			rpt.Status, rpt.ExitCode = "error", 2
 			break
 		}
-		r := result{ID: c.ID, Status: "passed", Log: filepath.Join(out, c.ID+".log")}
+		r := result{ID: c.ID, Level: checkLevel(c), Status: "passed", Log: filepath.Join(out, c.ID+".log"), PassedTests: []string{}, SkippedTests: []string{}}
 		start := time.Now()
 		code, runErr := execute(ctx, root, out, c.command, r.Log)
 		r.ExitCode = code
@@ -287,8 +379,10 @@ func accept(ctx context.Context, root, out, scope string, checks []check, stdout
 				}
 			}
 		}
-		if r.Status == "passed" && len(c.RequiredTests) > 0 {
-			if err := checkTests(r.Log, c.RequiredTests); err != nil {
+		if len(c.RequiredTests) > 0 {
+			passed, skipped, err := checkTests(r.Log, c.RequiredTests)
+			r.PassedTests, r.SkippedTests = passed, skipped
+			if err != nil && r.Status == "passed" {
 				r.Status, r.Detail = "failed", err.Error()
 				if rpt.ExitCode == 0 {
 					rpt.ExitCode = 1
@@ -305,15 +399,21 @@ func accept(ctx context.Context, root, out, scope string, checks []check, stdout
 		}
 		fmt.Fprintf(stdout, "%s %s (exit=%d) %s\n", r.Status, r.ID, r.ExitCode, r.Detail)
 		if err := writeProgress(); err != nil {
-			return 2, err
+			return 2, acceptanceReport{}, err
 		}
 		if ctx.Err() != nil || r.Status == "error" {
 			break
 		}
 	}
+	if rpt.Status != "error" && ctx.Err() == nil {
+		if err := resolveBinaryHash(&rpt); err != nil {
+			fmt.Fprintf(stdout, "error: %s\n", err)
+			rpt.Status, rpt.ExitCode = "error", 2
+		}
+	}
 	after, err := sourceFingerprint(root)
 	if err != nil {
-		return 2, err
+		return 2, acceptanceReport{}, err
 	}
 	if after != fingerprint {
 		rpt.Status, rpt.ExitCode = "source_changed", 2
@@ -325,9 +425,10 @@ func accept(ctx context.Context, root, out, scope string, checks []check, stdout
 	if rpt.ExitCode == 0 {
 		rpt.Status = "passed"
 	}
-	if err := atomicJSON(filepath.Join(out, "report.json"), &rpt); err != nil {
-		return 2, err
+	final := projectReport(root, rpt)
+	if err := atomicJSON(filepath.Join(out, "report.json"), &final); err != nil {
+		return 2, acceptanceReport{}, err
 	}
 	fmt.Fprintf(stdout, "acceptance %s: %s exit=%d report=%s\n", scope, rpt.Status, rpt.ExitCode, filepath.Join(out, "report.json"))
-	return rpt.ExitCode, nil
+	return rpt.ExitCode, final, nil
 }

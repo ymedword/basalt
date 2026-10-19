@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "record_id": "us15-t041-slow-r1-us10-6.2-12b",
+  "run_id": "us15-t041-slow-r1",
+  "run_kind": "backfill",
+  "executor": "ai",
+  "started_at": "2026-10-19T19:04:02Z",
+  "finished_at": "2026-10-19T19:11:38Z",
+  "subject": {
+    "kind": "manual_item",
+    "level": "process",
+    "items": [
+      "us10-6.2-12b"
+    ],
+    "check_id": "015-slow-timeout",
+    "test": "TestBackfill_SlowTimeout/run_timeout"
+  },
+  "criteria": {
+    "acceptance_sha256": "686fd775aed10db4a803c1b2e22a6ed74f5657ed6ec51d17afd73baf510716ce",
+    "stage_sha256": "599dcbb2e47c2e3c2c0fcd2154514737168f01cc4f43c077df6fed393cfd0120",
+    "inputs": [
+      {
+        "path": "docs/us/us15-acceptance-infra.md",
+        "sha256": "19b70290a83380a6ee65c8671a3348df07efe88d216b35ae7fc9b883a1c2aae8"
+      },
+      {
+        "path": "specs/015-acceptance-infra/spec.md",
+        "sha256": "c2ee61578a5e38ab0259ebc29c1ed0e87dbe106ab797d136e499e6f4b1b6529f"
+      },
+      {
+        "path": "specs/015-acceptance-infra/plan.md",
+        "sha256": "d1c76acca7daeaeac297be554582770aae8516921c2c86535b76db9a707bcd28"
+      },
+      {
+        "path": "specs/015-acceptance-infra/tasks.md",
+        "sha256": "e50c23990ba42f4d10423339114c6c67330c01de0b841a10e04245f648e8c742"
+      },
+      {
+        "path": "harness/acceptance.json",
+        "sha256": "686fd775aed10db4a803c1b2e22a6ed74f5657ed6ec51d17afd73baf510716ce"
+      },
+      {
+        "path": "internal/e2e/slow_test.go",
+        "sha256": "011d90d893627108ce7fa01aaff976881447ddc5010d2230f5f65520aab47b55"
+      }
+    ]
+  },
+  "code": {
+    "base_commit": "1b074a400cf35a9bce0ae2981303d11430744515",
+    "source_fingerprint": "1d0ea5551912d8e8bef4f56da98baadf9111b8736ac77c30c9f77dd4e3d6e5fd",
+    "dirty": true,
+    "tested_binary_sha256": "5a98546b23fac1907039e2c3e4d878817d2020748dafd9bb454a77a973f12dac"
+  },
+  "environment": {
+    "os": "windows",
+    "arch": "amd64",
+    "go_version": "go1.27.2",
+    "ci": false
+  },
+  "verdict": "passed",
+  "evidence": {
+    "report_path": "harness/acceptance/records/reports/us15-t041-slow-r1-us10-6.2-12b.json",
+    "report_sha256": "68d2eda2d1e31abb88bb5059ddfd5505e10f3af1498e7b3d8f10068b79dc190a",
+    "logs": [
+      {
+        "path": ".loop/runs/us15-t041-slow-r1/015-slow-timeout.log",
+        "sha256": "60d00b3527042df1b6db810ab02071c7dda2aad202566793a95afaec14f0c78d"
+      }
+    ]
+  },
+  "notes": "回填：结论取自同次运行 us15-t041-slow-r1 的 015-slow-timeout 报告段（passed_tests），未手填。"
+}

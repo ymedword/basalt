@@ -27,6 +27,16 @@ type check struct {
 	Required      []string `json:"required_cases,omitempty"`
 	AllowedSkips  []string `json:"allowed_skips,omitempty"`
 	RequiredTests []string `json:"required_tests,omitempty"`
+	Level         string   `json:"level,omitempty"`
+}
+
+// checkLevel 把未声明的旧 check 归一为 source；显式层级只在 stage 中声明。
+// checkLevel normalizes legacy checks to source; explicit levels live in stages.
+func checkLevel(c check) string {
+	if c.Level == "" {
+		return "source"
+	}
+	return c.Level
 }
 
 type configuration struct {
@@ -41,13 +51,17 @@ type task struct {
 }
 
 type stage struct {
-	Version  int      `json:"version"`
-	ID       string   `json:"id"`
-	Approval string   `json:"approval"`
-	Inputs   []string `json:"inputs"`
-	Protect  []string `json:"protect"`
-	Checks   []check  `json:"checks"`
-	Tasks    []task   `json:"tasks"`
+	Version          int               `json:"version"`
+	ID               string            `json:"id"`
+	Approval         string            `json:"approval"`
+	Inputs           []string          `json:"inputs"`
+	Protect          []string          `json:"protect"`
+	Checks           []check           `json:"checks"`
+	Tasks            []task            `json:"tasks"`
+	SupersededChecks map[string]string `json:"superseded_checks,omitempty"`
+	// path 记录 stage 文件自身的仓库相对路径，供记录写入 stage_sha256。
+	// path keeps the stage file's repo-relative location for record criteria.
+	path string
 }
 
 var identifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
@@ -124,6 +138,11 @@ func validateChecks(checks []check) error {
 		if len(c.RequiredTests) > 0 && (!slices.Contains(c.Args, "-json") || !slices.Contains(c.Args, "-count=1")) {
 			return fmt.Errorf("%s: required_tests needs go test -json -count=1", c.ID)
 		}
+		switch checkLevel(c) {
+		case "source", "process", "external":
+		default:
+			return fmt.Errorf("%s: unknown level %q", c.ID, c.Level)
+		}
 	}
 	return nil
 }
@@ -155,6 +174,7 @@ func loadStage(root, path string, cfg configuration) (stage, error) {
 	if err := readJSON(filepath.Join(root, path), &s); err != nil {
 		return s, err
 	}
+	s.path = path
 	if s.Version != 1 || !identifier.MatchString(s.ID) || strings.TrimSpace(s.Approval) == "" || len(s.Inputs) == 0 || len(s.Tasks) == 0 {
 		return s, errors.New("stage needs version=1, ID, approval reference, inputs and tasks")
 	}
@@ -174,6 +194,17 @@ func loadStage(root, path string, cfg configuration) (stage, error) {
 	for _, c := range s.Checks {
 		if isGoTest(c.Args) && len(c.RequiredTests) == 0 {
 			return s, fmt.Errorf("%s: stage Go test check requires named required_tests", c.ID)
+		}
+	}
+	// superseded_checks 只做显式替代映射，目标必须真实存在且不得自指。
+	// superseded_checks is an explicit replacement map; targets must exist and differ.
+	ids := map[string]bool{}
+	for _, c := range all {
+		ids[c.ID] = true
+	}
+	for old, replacement := range s.SupersededChecks {
+		if !identifier.MatchString(old) || !identifier.MatchString(replacement) || old == replacement || !ids[replacement] {
+			return s, fmt.Errorf("invalid superseded_checks entry: %s -> %s", old, replacement)
 		}
 	}
 	if err := validateChecks(all); err != nil {

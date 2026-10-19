@@ -26,6 +26,12 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	stagePath := fs.String("stage", "", "approved stage JSON inside repository")
 	taskID := fs.String("task", "", "task ID; without task runs every stage assertion")
 	out := fs.String("out", ".loop/runs/accept-"+time.Now().UTC().Format("20060102T150405.000000000"), "fresh report directory below .loop")
+	stageOnly := fs.Bool("stage-only", false, "run only stage checks without the profile")
+	lintStagesFlag := fs.Bool("lint-stages", false, "check that stage required tests exist; read-only")
+	executor := fs.String("executor", "", "record executor: ai | user | ci")
+	runKind := fs.String("run-kind", "", "record run kind: original | rerun | backfill")
+	authorizationRef := fs.String("authorization-ref", "", "runtime authorization reference for external checks")
+	authorizationScope := fs.String("authorization-scope", "", "runtime authorization scope for external checks")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return 2
 	}
@@ -41,6 +47,19 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	root, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	// stage lint 只读：在配置加载与独占锁之前返回，不产生报告或记录。
+	// Stage lint is read-only and returns before config loading and the exclusive lock.
+	if *lintStagesFlag {
+		return runStageLint(ctx, root, *stagePath, stdout, stderr)
+	}
+	if *stageOnly && explicitProfile {
+		fmt.Fprintln(stderr, "--stage-only cannot be combined with --profile")
+		return 2
+	}
+	if *stageOnly && *stagePath == "" {
+		fmt.Fprintln(stderr, "--stage-only requires --stage")
 		return 2
 	}
 	cfgPath := "harness/acceptance.json"
@@ -79,10 +98,18 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	ids, exists := cfg.Profiles[*profile]
-	if !exists || !relative(*out) || filepath.Dir(filepath.Clean(*out)) == "." || !isReportOutput(*out) {
-		fmt.Fprintln(stderr, "unknown profile or output outside .loop")
+	if !relative(*out) || filepath.Dir(filepath.Clean(*out)) == "." || !isReportOutput(*out) {
+		fmt.Fprintln(stderr, "output outside .loop")
 		return 2
+	}
+	var ids []string
+	if !*stageOnly {
+		var exists bool
+		ids, exists = cfg.Profiles[*profile]
+		if !exists {
+			fmt.Fprintln(stderr, "unknown profile")
+			return 2
+		}
 	}
 	if *taskID != "" && *stagePath == "" {
 		fmt.Fprintln(stderr, "--task requires --stage")
@@ -115,17 +142,48 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	scope := *profile
+	if *stageOnly {
+		scope = "stage-only"
+	}
 	if s.ID != "" {
 		scope += "/" + s.ID
 	}
 	if *taskID != "" {
 		scope += "/" + *taskID
 	}
-	code, err := accept(ctx, root, filepath.Join(root, *out), scope, checks, stdout)
+	auth, err := resolveAuthorization(authorizationFlags{Ref: *authorizationRef, Scope: *authorizationScope}, checks)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		return 2
 	}
-	return codeOrError(code, err)
+	code, rep, err := accept(ctx, root, filepath.Join(root, *out), scope, checks, auth, stdout)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return codeOrError(code, err)
+	}
+	// 基础设施错误 / 取消只留 report.json 与日志，不生成 record.json（C-04）。
+	// Infrastructure errors and cancellation leave only report.json and logs (C-04).
+	if rep.Status == "error" || ctx.Err() != nil {
+		return 2
+	}
+	rec, err := buildRecord(root, *out, scope, rep, cfg, &s, recordOptions{
+		Executor:      *executor,
+		RunKind:       *runKind,
+		Authorization: auth,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if err := validateRecord(root, rec); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if err := writeRecord(filepath.Join(root, *out), rec); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	return code
 }
 
 func codeOrError(code int, err error) int {

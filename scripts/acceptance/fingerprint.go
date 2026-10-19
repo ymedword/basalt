@@ -17,10 +17,16 @@ import (
 
 func ignored(path string) bool {
 	p := filepath.ToSlash(path)
-	for _, prefix := range []string{".git", ".loop", ".basalt", "bin", "evals/results"} {
+	// 发布后的记录与台账是证据面，不能改变其自身指纹；判据输入仍计入指纹。
+	// Published records and the ledger are evidence, so they never perturb the
+	// fingerprint that their own binding checks rely on.
+	for _, prefix := range []string{".git", ".loop", ".basalt", "bin", "evals/results", "harness/acceptance/records"} {
 		if p == prefix || strings.HasPrefix(p, prefix+"/") {
 			return true
 		}
+	}
+	if p == "harness/acceptance/ledger.md" {
+		return true
 	}
 	b := filepath.Base(path)
 	// run-state.md 是过程状态（失败台账只追加、勾选随实现翻转），不是源码/判据输入。

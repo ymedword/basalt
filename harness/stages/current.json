@@ -1,0 +1,995 @@
+{
+  "version": 1,
+  "id": "current-tree",
+  "approval": "Human review ① 2026-10-19 approved module card sha256 19b70290a83380a6ee65c8671a3348df07efe88d216b35ae7fc9b883a1c2aae8 (1322 lines); user authorized /us-register 15 and module development on 2026-10-19. Stage derived from module card §3.2 by module-dev step 6.1 and grants no approval by itself.",
+  "inputs": [
+    "docs/us/us15-acceptance-infra.md",
+    "specs/015-acceptance-infra/spec.md",
+    "specs/015-acceptance-infra/plan.md",
+    "specs/015-acceptance-infra/tasks.md",
+    "harness/acceptance.json",
+    "harness/stages/us8-notify-r1.json",
+    "harness/stages/us9-web.json",
+    "harness/stages/us10-scheduler.json"
+  ],
+  "protect": [
+    "scripts/acceptance/main.go",
+    "scripts/acceptance/execute.go",
+    "scripts/acceptance/fingerprint.go",
+    "scripts/acceptance/record.go",
+    "scripts/acceptance/stagelint.go",
+    "scripts/acceptance/config.go",
+    "scripts/acceptance/acceptance_test.go",
+    "scripts/acceptance/record_test.go",
+    "scripts/acceptance/stagelint_test.go",
+    "scripts/acceptance/stages_test.go",
+    "scripts/acceptance/records_test.go",
+    "scripts/acceptance/invariants_test.go",
+    "internal/e2e",
+    "harness/acceptance.json",
+    "harness/acceptance/ledger.md",
+    "harness/acceptance/records/README.md",
+    "harness/acceptance/records/reports"
+  ],
+  "checks": [
+    {
+      "id": "008-envref",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^TestEnvPlaceholderName_ExactFormTable$"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestEnvPlaceholderName_ExactFormTable"
+      ]
+    },
+    {
+      "id": "008-executor-audit",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^(TestToolExecutor_PreWriteFailureRefusesExecution|TestToolExecutor_TerminalWriteFailureKeepsPendingRow)$"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestToolExecutor_PreWriteFailureRefusesExecution",
+        "TestToolExecutor_TerminalWriteFailureKeepsPendingRow"
+      ]
+    },
+    {
+      "id": "008-storage-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestNotifyChannelRepo_"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNotifyChannelRepo_ListsRowsOrderedByName",
+        "TestNotifyChannelRepo_EmptyRegistryReturnsEmptySlice",
+        "TestNotifyChannelRepo_ContextErrorPropagates",
+        "TestNotifyChannelRepo_SeesRowsInsertedAfterConstruction"
+      ]
+    },
+    {
+      "id": "008-tool-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "-run",
+        "^TestNotifyTool_"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNotifyTool_InputSchemaRequiresContentOnly",
+        "TestNotifyTool_MissingChannelIsNotFoundWithAvailableNames",
+        "TestNotifyTool_UnknownChannelIsNotFoundWithAvailableNames",
+        "TestNotifyTool_BlankChannelTreatedAsMissing",
+        "TestNotifyTool_ContentOverLimitFailsBeforeLookup",
+        "TestNotifyTool_ContentAtLimitIsAccepted",
+        "TestNotifyTool_ContentLimitCountsUTF8Bytes",
+        "TestNotifyTool_PlaintextURLFailsWithoutEcho",
+        "TestNotifyTool_NearMissPlaceholderFailsWithoutEcho",
+        "TestNotifyTool_UnsetEnvFailsClosed",
+        "TestNotifyTool_EmptyEnvFailsClosed",
+        "TestNotifyTool_PolicyDenialRedactsCredentialURL",
+        "TestNotifyTool_PolicySeesResolvedURLAndAgentBeforeAnySend",
+        "TestNotifyTool_UnknownTypeFailsWithoutPolicyOrSend",
+        "TestNotifyTool_RegistryReadFailureIsNotChannelMissing",
+        "TestNotifyTool_ReadsRegistryPerSend",
+        "TestNotifyTool_DispatchesResolvedContentToAdapter",
+        "TestNotifyTool_RejectsNonStringFields",
+        "TestNotifyTool_ExecutorAuditsBeforeAdapterSend",
+        "TestNotifyTool_ExecutorRecordsRuntimeErrorForUnsetEnv",
+        "TestNotifyTool_EmptyContentIsSent"
+      ]
+    },
+    {
+      "id": "008-tool-notify-adapters",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "-run",
+        "^(TestWebhookNotifyAdapter_|TestFeishuNotifyAdapter_|TestNotifyAdapters_)"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestWebhookNotifyAdapter_PostsContentJSON",
+        "TestWebhookNotifyAdapter_Non2xxIsExternalError",
+        "TestWebhookNotifyAdapter_DoesNotFollowRedirects",
+        "TestNotifyAdapters_ClientIgnoresEnvProxy",
+        "TestWebhookNotifyAdapter_TransportErrorRedactsURL",
+        "TestWebhookNotifyAdapter_ContextIdentityWins",
+        "TestFeishuNotifyAdapter_PostsTextPayload",
+        "TestFeishuNotifyAdapter_RequiresCodeZero",
+        "TestFeishuNotifyAdapter_UnparsableReceiptFails",
+        "TestFeishuNotifyAdapter_OversizedReceiptFails",
+        "TestFeishuNotifyAdapter_Non2xxFailsBeforeReceipt",
+        "TestFeishuNotifyAdapter_ReceiptReadFailureRespectsContext",
+        "TestNotifyAdapters_FixedContentType"
+      ]
+    },
+    {
+      "id": "008-app-notify",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestNewNotifyAdapters_|TestAgentsPort_LightPathAcceptsNotifyDeclaration$)"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNewNotifyAdapters_ExactTypeSet",
+        "TestAgentsPort_LightPathAcceptsNotifyDeclaration"
+      ]
+    },
+    {
+      "id": "008-ports-ten",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^TestToolListerPort_HeavyAssemblyRegistersTenTools$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestToolListerPort_HeavyAssemblyRegistersTenTools"
+      ]
+    },
+    {
+      "id": "009-web-contract",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^TestContract_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestContract_EnvelopeShape",
+        "TestContract_TimestampAndContentType",
+        "TestContract_UnknownRouteIs404Envelope",
+        "TestContract_ErrorMappingByType",
+        "TestContract_ViewFieldShapes"
+      ]
+    },
+    {
+      "id": "009-web-handlers",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^(TestSessions_|TestMessages_|TestInvoke_|TestMeta_)"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSessions_CreateDefaultsAndIdempotency",
+        "TestSessions_GetDetailWindow",
+        "TestSessions_ArchiveSemantics",
+        "TestMessages_SuccessRunView",
+        "TestMessages_RequestValidation",
+        "TestMessages_AdmissionErrorMapping",
+        "TestMessages_RunStatusMapping",
+        "TestInvoke_Stateless",
+        "TestMeta_HealthInfo",
+        "TestMeta_ProfilesToolsMemory",
+        "TestMessages_MessageCapCountsBytesBeforeRun",
+        "TestMessages_RunBudgetPropagation",
+        "TestMessages_ClientDisconnectWritesNothing",
+        "TestSessions_ArchiveRejectedWhileRunInflight",
+        "TestMessages_FailureReasonRedaction",
+        "TestMessages_FailedRunDiagnosticLogged"
+      ]
+    },
+    {
+      "id": "009-web-server",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^TestServer_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestServer_Defaults",
+        "TestServer_TimeoutsAndWriteBudget",
+        "TestServer_GracefulShutdown",
+        "TestServer_ShutdownGraceExhausted",
+        "TestServer_WriteBudgetRealConnection",
+        "TestServer_RecoverMiddleware",
+        "TestServer_CrossOriginRejectsWrites",
+        "TestServer_RequestLog",
+        "TestServer_ServeErrorUnifiedCleanup",
+        "TestServer_ShutdownDrainTimeoutWaitsForHandler",
+        "TestServer_PanicLogSharesRequestID"
+      ]
+    },
+    {
+      "id": "009-web-race",
+      "args": [
+        "go",
+        "test",
+        "-race",
+        "-json",
+        "-count=1",
+        "./internal/web"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestContract_EnvelopeShape",
+        "TestContract_TimestampAndContentType",
+        "TestContract_UnknownRouteIs404Envelope",
+        "TestContract_ErrorMappingByType",
+        "TestContract_ViewFieldShapes",
+        "TestSessions_CreateDefaultsAndIdempotency",
+        "TestSessions_GetDetailWindow",
+        "TestSessions_ArchiveSemantics",
+        "TestMessages_SuccessRunView",
+        "TestMessages_RequestValidation",
+        "TestMessages_AdmissionErrorMapping",
+        "TestMessages_RunStatusMapping",
+        "TestInvoke_Stateless",
+        "TestMeta_HealthInfo",
+        "TestMeta_ProfilesToolsMemory",
+        "TestMessages_MessageCapCountsBytesBeforeRun",
+        "TestMessages_RunBudgetPropagation",
+        "TestMessages_ClientDisconnectWritesNothing",
+        "TestSessions_ArchiveRejectedWhileRunInflight",
+        "TestMessages_FailureReasonRedaction",
+        "TestMessages_FailedRunDiagnosticLogged",
+        "TestServer_Defaults",
+        "TestServer_TimeoutsAndWriteBudget",
+        "TestServer_GracefulShutdown",
+        "TestServer_ShutdownGraceExhausted",
+        "TestServer_WriteBudgetRealConnection",
+        "TestServer_RecoverMiddleware",
+        "TestServer_CrossOriginRejectsWrites",
+        "TestServer_RequestLog",
+        "TestServer_ServeErrorUnifiedCleanup",
+        "TestServer_ShutdownDrainTimeoutWaitsForHandler",
+        "TestServer_PanicLogSharesRequestID"
+      ]
+    },
+    {
+      "id": "009-storage-session-api",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestSessionStore_"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestSessionStore_GetSessionReadsStatus",
+        "TestSessionStore_GetOrCreateIsIdempotent",
+        "TestSessionStore_ArchiveIsIdempotent",
+        "TestSessionStore_MessagesTailKeepsLatestInOrder"
+      ]
+    },
+    {
+      "id": "009-core-sessionid",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "-run",
+        "^TestDeriveSessionID_"
+      ],
+      "timeout_seconds": 60,
+      "required_tests": [
+        "TestDeriveSessionID_PinnedVectors",
+        "TestDeriveSessionID_AdjacentTuplesDoNotCollide",
+        "TestDeriveSessionID_ResultIsPathAndLogSafe",
+        "TestDeriveSessionID_EmptyPartsAreEncoded",
+        "TestDeriveSessionID_HostileChannelFallsBackToSafePrefix"
+      ]
+    },
+    {
+      "id": "009-cli-serve",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^(TestServeCommand_|TestGatewayCommand_|TestRootCommand_RegistersServeAndGateway)"
+      ],
+      "timeout_seconds": 90,
+      "required_tests": [
+        "TestServeCommand_RequiresServer",
+        "TestServeCommand_PropagatesRunError",
+        "TestGatewayCommand_BlocksUntilSignal",
+        "TestRootCommand_RegistersServeAndGateway"
+      ]
+    },
+    {
+      "id": "009-app-web",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestNewWebServer_|TestWebProviders_|TestNewToolCatalogPort_|TestEnsureWorkspaceForServe|TestNeedsServer|TestNewRuntime_MaxConcurrentRuns|TestRun_HeavyCommandSplit|TestRunWithRuntime_)"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestNewWebServer_OptionsProjection",
+        "TestWebProviders_NoCredentialFields",
+        "TestNewToolCatalogPort_ClassificationAndOrder",
+        "TestEnsureWorkspaceForServe",
+        "TestNeedsServer",
+        "TestNewRuntime_MaxConcurrentRuns",
+        "TestRun_HeavyCommandSplit",
+        "TestRunWithRuntime_ReleasesAfterExec"
+      ]
+    },
+    {
+      "id": "009-cli-config",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^TestConfig_RejectsNegativeMaxConcurrentRuns$"
+      ],
+      "timeout_seconds": 90,
+      "required_tests": [
+        "TestConfig_RejectsNegativeMaxConcurrentRuns"
+      ]
+    },
+    {
+      "id": "010-core-scheduler",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestScheduler_",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScheduler_StartRecoversExecutions",
+        "TestScheduler_StartReconcilesDefinitions",
+        "TestScheduler_StartRegistersEnabledOnly",
+        "TestScheduler_StartTwice",
+        "TestScheduler_Fire_DerivesSessionAndRunID",
+        "TestScheduler_Fire_ExecutesAndRecords",
+        "TestScheduler_Fire_ReadsTaskFromStore",
+        "TestScheduler_Fire_FailureMapping",
+        "TestScheduler_Fire_AdmissionErrorRecordsFailed",
+        "TestScheduler_Fire_SessionBusyRecordsSkipped",
+        "TestScheduler_Fire_StartExecutionFailure",
+        "TestScheduler_Fire_LockMissRecordsSkipped",
+        "TestScheduler_Fire_PanicRecovered",
+        "TestScheduler_Fire_MissedTriggerWarnsWithoutRun",
+        "TestScheduler_RunNow_SameChain",
+        "TestScheduler_RunNow_BusyReturnsErrTaskBusy",
+        "TestScheduler_RunNow_HiddenTaskNotFound",
+        "TestScheduler_RunNow_DisabledTaskStillRuns",
+        "TestScheduler_RunNow_SessionBusyRecordsSkipped",
+        "TestScheduler_SetEnabled_TogglesRegistration",
+        "TestScheduler_SetEnabled_HiddenTaskNotFound",
+        "TestScheduler_List_FiltersAndOrders",
+        "TestScheduler_List_ReflectsRunState",
+        "TestScheduler_Executions_UsesLimit",
+        "TestScheduler_Executions_HiddenTaskNotFound",
+        "TestScheduler_LogFieldsAndNoBody",
+        "TestScheduler_StopConcurrent",
+        "TestScheduler_StopOnContextCancel",
+        "TestScheduler_StopBeforeStart",
+        "TestScheduler_StopTimeoutCancelsInflight",
+        "TestScheduler_ReconcileAgent",
+        "TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration",
+        "TestScheduler_Fire_FinishUsesCleanupCtx",
+        "TestScheduler_Start_StoreFailureFatal",
+        "TestScheduler_Start_TaskAddFailureStopsEngine",
+        "TestScheduler_SetEnabled_WritesDBFirst",
+        "TestScheduler_SetEnabled_ConcurrentToggles",
+        "TestScheduler_Fire_ArchivedSessionSkipped",
+        "TestScheduler_RunNow_ArchivedSessionPropagates",
+        "TestScheduler_Start_OwnerConflictFatal",
+        "TestScheduler_CheckOwnership",
+        "TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition",
+        "TestScheduler_OldCallbackAfterReconcile_NoRun",
+        "TestScheduler_ReconcileAgent_AddFailureReturnsError",
+        "TestScheduler_Start_SecondAgentApplyFails_NoHandles",
+        "TestScheduler_Fire_ConcurrentDistinctTasks"
+      ]
+    },
+    {
+      "id": "010-core-sessiongate",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestAgentService_(Archive_RejectsInflightRun|Archive_Idempotent|Run_ArchivedSessionRejected|Run_RequireExistingSession|StatelessRunsNotSerialized|Archive_WithoutSessionStore)$",
+        "./internal/core"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestAgentService_Archive_RejectsInflightRun",
+        "TestAgentService_Archive_Idempotent",
+        "TestAgentService_Run_ArchivedSessionRejected",
+        "TestAgentService_Run_RequireExistingSession",
+        "TestAgentService_StatelessRunsNotSerialized",
+        "TestAgentService_Archive_WithoutSessionStore"
+      ]
+    },
+    {
+      "id": "010-core-runid",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestAgentService_Run_(UsesCallerRunID|DefaultRunIDUnchanged|PassesTriggerToLedger)$",
+        "./internal/core"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestAgentService_Run_UsesCallerRunID",
+        "TestAgentService_Run_DefaultRunIDUnchanged",
+        "TestAgentService_Run_PassesTriggerToLedger"
+      ]
+    },
+    {
+      "id": "010-cron-adapter",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestEngine_",
+        "./internal/adapters/cron"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestEngine_RejectsFiveFieldSpec",
+        "TestEngine_RejectsMissingCRONTZ",
+        "TestEngine_ParsesSixFieldWithCRONTZ",
+        "TestEngine_OccurrencesFromFixedStart",
+        "TestEngine_OccurrencesCapsAtLimit",
+        "TestEngine_OccurrencesNoMoreTimes",
+        "TestEngine_AddAndStop",
+        "TestEngine_StopWaitsForJobs",
+        "TestEngine_UnknownZoneFails"
+      ]
+    },
+    {
+      "id": "010-storage-tasks",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestApplyAgentTasks_|TestTaskStore_|TestRunStore_TriggerForScheduler$)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestApplyAgentTasks_UpsertPreservesState",
+        "TestTaskStore_RetireAndRevive",
+        "TestApplyAgentTasks_SameOwnerReviveAllowed",
+        "TestApplyAgentTasks_CrossOwnerRejected",
+        "TestApplyAgentTasks_CrossOwnerRetiredRejected",
+        "TestApplyAgentTasks_RollbackOnSecondWrite",
+        "TestTaskStore_SetTaskEnabled",
+        "TestTaskStore_MarkTaskRun",
+        "TestTaskStore_StartExecutionAndFinish",
+        "TestTaskStore_FinishExecution",
+        "TestTaskStore_RecordSkipped",
+        "TestTaskStore_RecoverStartedExecutions",
+        "TestTaskStore_ListTasks",
+        "TestTaskStore_ListExecutions",
+        "TestRunStore_TriggerForScheduler"
+      ]
+    },
+    {
+      "id": "010-workspace-writegate",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestApplySchedule_|TestReadSchedules)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestApplySchedule_SetAddsAndReturnsValidated",
+        "TestApplySchedule_Remove",
+        "TestApplySchedule_PreservesOtherBytes",
+        "TestApplySchedule_RejectsInvalidCandidate",
+        "TestApplySchedule_CrossAgentIDRejected",
+        "TestApplySchedule_RemoveUnknownIDNotFound",
+        "TestApplySchedule_NoTempResidue",
+        "TestApplySchedule_AtomicOnRenameFailure",
+        "TestApplySchedule_ConcurrentSets",
+        "TestReadSchedules",
+        "TestApplySchedule_DoesNotTouchOtherAgents",
+        "TestApplySchedule_ClaimBaseline"
+      ]
+    },
+    {
+      "id": "010-tool-manageschedule",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestManageSchedule_",
+        "./internal/tool"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestManageSchedule_NoAgentContextRejected",
+        "TestManageSchedule_List",
+        "TestManageSchedule_Set",
+        "TestManageSchedule_Remove",
+        "TestManageSchedule_InvalidAction",
+        "TestManageSchedule_UsesEnvAgentOnly",
+        "TestManageSchedule_NotFoundClassified",
+        "TestManageSchedule_InvalidInputClassified",
+        "TestManageSchedule_UnboundSlotFails",
+        "TestManageSchedule_ToolSpec"
+      ]
+    },
+    {
+      "id": "010-web-schedules",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestSchedules_|TestRunView_Trigger|TestPostMessage_ArchivedMapsTo400|TestArchiveSession_ServiceBusyMapsTo409)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSchedules_ListShapeAndOrder",
+        "TestSchedules_SetEnabled",
+        "TestSchedules_Executions",
+        "TestSchedules_RunSuccess",
+        "TestSchedules_RunConflict",
+        "TestSchedules_RunNotFound",
+        "TestSchedules_RunTimeout",
+        "TestSchedules_ExecutionMessageProjection",
+        "TestSchedules_MethodNotAllowed404",
+        "TestSchedules_RunTooManyRuns",
+        "TestSchedules_NilServiceReturns500",
+        "TestSchedules_RunArchived400",
+        "TestRunView_TriggerFallback",
+        "TestRunView_TriggerFromRequest",
+        "TestPostMessage_ArchivedMapsTo400",
+        "TestArchiveSession_ServiceBusyMapsTo409"
+      ]
+    },
+    {
+      "id": "010-web-contract-schema",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestOpenAPI_ScheduleTimeFields$",
+        "./internal/web"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestOpenAPI_ScheduleTimeFields"
+      ]
+    },
+    {
+      "id": "010-app-schedule",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNeedsSchedules|TestNewScheduler_|TestScheduleEditorAdapter_|TestRun_Schedule|TestHeavyRuntime_CloseStopsSchedulerFirst|TestScheduleStartExitCode_|TestNewRuntime_ServiceHasSessionGate|TestApp_SignalContextUsesInjectedNotifier)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNeedsSchedules",
+        "TestNewScheduler_Options",
+        "TestScheduleEditorAdapter_MapsRejectionToInvalidInput",
+        "TestScheduleEditorAdapter_ReconcilesAfterWrite",
+        "TestRun_ScheduleStartModes",
+        "TestRun_ScheduleStartFailureExits",
+        "TestScheduleEditorAdapter_RefreshesClaimBaseline",
+        "TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
+        "TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
+        "TestHeavyRuntime_CloseStopsSchedulerFirst",
+        "TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite",
+        "TestScheduleStartExitCode_SignalCanceledReturnsZero",
+        "TestScheduleStartExitCode_FailureReturnsOne",
+        "TestNewRuntime_ServiceHasSessionGate",
+        "TestApp_SignalContextUsesInjectedNotifier"
+      ]
+    },
+    {
+      "id": "010-app-tools",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersTenTools)$",
+        "./internal/app"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestDeclaredToolNames_IncludesManageSchedule",
+        "TestWebOptions_SchedulesWired",
+        "TestRun_HeavyCommandSplit",
+        "TestToolListerPort_HeavyAssemblyRegistersTenTools"
+      ]
+    },
+    {
+      "id": "010-app-crossentry",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^TestCrossEntry_",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestCrossEntry_CronArchiveCoordination",
+        "TestCrossEntry_ManualRerunArchiveCoordination"
+      ]
+    },
+    {
+      "id": "010-race",
+      "args": [
+        "go",
+        "test",
+        "-race",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "./internal/adapters/cron",
+        "./internal/storage",
+        "./internal/workspace",
+        "./internal/tool",
+        "./internal/web",
+        "./internal/app"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestScheduler_StopConcurrent",
+        "TestScheduler_Fire_LockMissRecordsSkipped",
+        "TestScheduler_StopTimeoutCancelsInflight",
+        "TestScheduler_SetEnabled_ConcurrentToggles",
+        "TestScheduler_Fire_ConcurrentDistinctTasks",
+        "TestScheduler_OldCallbackAfterReconcile_NoRun",
+        "TestApplySchedule_ConcurrentSets",
+        "TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
+        "TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
+        "TestSchedules_RunConflict",
+        "TestHeavyRuntime_CloseStopsSchedulerFirst",
+        "TestAgentService_Archive_RejectsInflightRun",
+        "TestAgentService_StatelessRunsNotSerialized",
+        "TestCrossEntry_CronArchiveCoordination"
+      ]
+    },
+    {
+      "id": "015-acceptance-infra",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./scripts/acceptance",
+        "-run",
+        "^(TestRecord_|TestStageLint_|TestStages_|TestRecords_|TestLedger_|TestFingerprint_|TestAccept_ReportPathsRelative|TestAccept_ExternalRequiresAuthorizationFlags)"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestRecord_BuildFromReport",
+        "TestRecord_BuildFromSourceChanged",
+        "TestRecord_ValidateRequiredFields",
+        "TestRecord_ValidateNotVerified",
+        "TestRecord_OptionsDefaults",
+        "TestRecord_ValidateRejectsNAWithoutBasis",
+        "TestRecord_ValidateRejectsAbsolutePath",
+        "TestRecord_ValidateRejectsSecret",
+        "TestRecord_ValidateRedStateRequiresAppliesTo",
+        "TestRecord_ExternalAuthorization",
+        "TestStageLint_TransformListArgs",
+        "TestStageLint_DetectsMissingTest",
+        "TestStages_CurrentCoversHistorical",
+        "TestStages_CurrentMatchesHistorical",
+        "TestStages_HistoricalFilesPinned",
+        "TestStages_BackfillCatalogMatchesRequiredTests",
+        "TestStages_BackfillCatalogCoversRequiredSet",
+        "TestStages_RealCatalogCoversAuthorizedSet",
+        "TestStages_PinsUS15Checks",
+        "TestRecords_BackfillCoversCatalog",
+        "TestRecords_BackfillBindsToExecution",
+        "TestRecords_RealBindsToExecution",
+        "TestRecords_StatusDoesNotMaskConflicts",
+        "TestRecords_PublishedConform",
+        "TestRecords_NoSecretsOrAbsolutePaths",
+        "TestLedger_IndexesAllRecords",
+        "TestFingerprint_IgnoresAcceptanceEvidence",
+        "TestAccept_ReportPathsRelative",
+        "TestAccept_ExternalRequiresAuthorizationFlags"
+      ]
+    },
+    {
+      "id": "015-invariants",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./scripts/acceptance",
+        "-run",
+        "^TestRepoInvariants_"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestRepoInvariants_NoForbiddenAgentFramework",
+        "TestRepoInvariants_NoProcessLocalTimezone",
+        "TestRepoInvariants_NoPlaintextCredential",
+        "TestRepoInvariants_NoORM",
+        "TestRepoInvariants_TestOnlyDependencyNotLinked",
+        "TestRepoInvariants_CIRunDirsUnique"
+      ]
+    },
+    {
+      "id": "015-backfill",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e",
+        "./internal/e2e",
+        "-run",
+        "^(TestBackfill_Bootstrap|TestBackfill_AgentLoop|TestBackfill_ToolSandbox|TestBackfill_Memory|TestBackfill_MCP|TestBackfill_Notify|TestBackfill_Web|TestBackfill_CrossProcessLock|TestBackfill_RestartRecovery|TestBackfill_Scheduler|TestBackfill_ConsolePipe)$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestBackfill_AgentLoop/injection_denied",
+        "TestBackfill_AgentLoop/multiturn_identity",
+        "TestBackfill_AgentLoop/read_file",
+        "TestBackfill_AgentLoop/reasoning_required",
+        "TestBackfill_AgentLoop/reasoning_roundtrip",
+        "TestBackfill_AgentLoop/redaction",
+        "TestBackfill_AgentLoop/sandbox_denied_audit",
+        "TestBackfill_AgentLoop/skill_l1",
+        "TestBackfill_Bootstrap",
+        "TestBackfill_Bootstrap/assembly",
+        "TestBackfill_Bootstrap/bad_agents",
+        "TestBackfill_Bootstrap/cli_import_graph",
+        "TestBackfill_Bootstrap/credential_scan",
+        "TestBackfill_Bootstrap/credential_template",
+        "TestBackfill_Bootstrap/init_idempotent",
+        "TestBackfill_Bootstrap/negative_three",
+        "TestBackfill_Bootstrap/profile",
+        "TestBackfill_Bootstrap/provider_negative",
+        "TestBackfill_Bootstrap/provider_unreachable_audit",
+        "TestBackfill_Bootstrap/status_no_config",
+        "TestBackfill_Bootstrap/tool_list",
+        "TestBackfill_Bootstrap/version_injection",
+        "TestBackfill_ConsolePipe",
+        "TestBackfill_CrossProcessLock/heavy_commands",
+        "TestBackfill_CrossProcessLock/instance_lock",
+        "TestBackfill_CrossProcessLock/platform_lock",
+        "TestBackfill_CrossProcessLock/write_mode",
+        "TestBackfill_MCP/bad_command",
+        "TestBackfill_MCP/concurrency",
+        "TestBackfill_MCP/env_negative",
+        "TestBackfill_MCP/redaction",
+        "TestBackfill_MCP/shutdown",
+        "TestBackfill_MCP/tool_list",
+        "TestBackfill_MCP/two_paths",
+        "TestBackfill_MCP/zero_code",
+        "TestBackfill_Memory/archive_size",
+        "TestBackfill_Memory/concurrency",
+        "TestBackfill_Memory/corrupt",
+        "TestBackfill_Memory/demo_core",
+        "TestBackfill_Memory/demo_markdown",
+        "TestBackfill_Memory/demo_sqlite",
+        "TestBackfill_Memory/edit_timing",
+        "TestBackfill_Memory/quota",
+        "TestBackfill_Memory/redaction",
+        "TestBackfill_Memory/scopes",
+        "TestBackfill_Notify/agent_decl",
+        "TestBackfill_Notify/channel_registration",
+        "TestBackfill_Notify/domain_denied",
+        "TestBackfill_Notify/effect_timing",
+        "TestBackfill_Notify/env_negative",
+        "TestBackfill_Notify/sentinel_redaction",
+        "TestBackfill_RestartRecovery/crash_recovery",
+        "TestBackfill_RestartRecovery/missed_fire",
+        "TestBackfill_RestartRecovery/reconcile",
+        "TestBackfill_RestartRecovery/serve",
+        "TestBackfill_RestartRecovery/session_history",
+        "TestBackfill_Scheduler/agent_other_denied",
+        "TestBackfill_Scheduler/agent_self_manage",
+        "TestBackfill_Scheduler/archive_meets_cron",
+        "TestBackfill_Scheduler/concurrent_mutex",
+        "TestBackfill_Scheduler/cron_fire",
+        "TestBackfill_Scheduler/cross_agent_task_id",
+        "TestBackfill_Scheduler/manual_run",
+        "TestBackfill_Scheduler/two_tables",
+        "TestBackfill_Scheduler/zone_shanghai",
+        "TestBackfill_ToolSandbox/port_redaction",
+        "TestBackfill_ToolSandbox/process_tree",
+        "TestBackfill_ToolSandbox/sandbox_denied",
+        "TestBackfill_ToolSandbox/shell",
+        "TestBackfill_Web/archive_inflight",
+        "TestBackfill_Web/archive_restart",
+        "TestBackfill_Web/body_byte_limit",
+        "TestBackfill_Web/budget_limit",
+        "TestBackfill_Web/concurrency_cap",
+        "TestBackfill_Web/concurrent_409",
+        "TestBackfill_Web/credential_face",
+        "TestBackfill_Web/cross_origin",
+        "TestBackfill_Web/curl_flow",
+        "TestBackfill_Web/gateway_lifecycle",
+        "TestBackfill_Web/listen_addr",
+        "TestBackfill_Web/listen_addr_override",
+        "TestBackfill_Web/redaction",
+        "TestBackfill_Web/release_order",
+        "TestBackfill_Web/session_409",
+        "TestBackfill_Web/session_id",
+        "TestBackfill_Web/stateless_invoke",
+        "TestBackfill_Web/tool_catalog"
+      ],
+      "level": "process"
+    },
+    {
+      "id": "015-e2e-vet",
+      "args": [
+        "go",
+        "vet",
+        "-tags=e2e,slow,real",
+        "./internal/e2e"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "tasks": [
+    {
+      "id": "us8",
+      "checks": [
+        "008-envref",
+        "008-executor-audit",
+        "008-storage-notify",
+        "008-tool-notify",
+        "008-tool-notify-adapters",
+        "008-app-notify",
+        "008-ports-ten"
+      ]
+    },
+    {
+      "id": "us9",
+      "checks": [
+        "009-web-contract",
+        "009-web-handlers",
+        "009-web-server",
+        "009-web-race",
+        "009-storage-session-api",
+        "009-core-sessionid",
+        "009-cli-serve",
+        "009-app-web",
+        "009-cli-config"
+      ]
+    },
+    {
+      "id": "us10",
+      "checks": [
+        "010-core-scheduler",
+        "010-core-sessiongate",
+        "010-core-runid",
+        "010-cron-adapter",
+        "010-storage-tasks",
+        "010-workspace-writegate",
+        "010-tool-manageschedule",
+        "010-web-schedules",
+        "010-web-contract-schema",
+        "010-app-schedule",
+        "010-app-tools",
+        "010-app-crossentry",
+        "010-race"
+      ]
+    },
+    {
+      "id": "us15",
+      "checks": [
+        "015-acceptance-infra",
+        "015-invariants",
+        "015-backfill",
+        "015-e2e-vet"
+      ]
+    }
+  ],
+  "superseded_checks": {
+    "008-ports-nine": "008-ports-ten"
+  }
+}

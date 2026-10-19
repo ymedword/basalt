@@ -55,6 +55,8 @@ func TestCommandHelper(t *testing.T) {
 		if mode == "tree" {
 			time.Sleep(30 * time.Second)
 		}
+	case "marker":
+		fmt.Fprintf(os.Stdout, "binary_sha256=%s\n", strings.Repeat("a", 64))
 	case "touch":
 		require.NoError(t, os.WriteFile("changed.txt", []byte("changed"), 0o600))
 	case "check":
@@ -96,17 +98,17 @@ func TestAccept_FailureInfrastructureAndFreshEvidence(t *testing.T) {
 	root, _, _ := fixture(t)
 	out := filepath.Join(root, ".loop/accept")
 	checks := []check{{ID: "failed", command: helperCommand(t, "fail")}, {ID: "passed", command: helperCommand(t, "pass")}}
-	code, err := accept(context.Background(), root, out, "fixture", checks, io.Discard)
+	code, _, err := accept(context.Background(), root, out, "fixture", checks, nil, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, 1, code)
 	var rpt acceptanceReport
 	require.NoError(t, readJSON(filepath.Join(out, "report.json"), &rpt))
 	require.Len(t, rpt.Checks, 2)
 	require.Equal(t, "failed", rpt.Checks[0].Status)
-	_, err = accept(context.Background(), root, out, "fixture", checks, io.Discard)
+	_, _, err = accept(context.Background(), root, out, "fixture", checks, nil, io.Discard)
 	require.ErrorContains(t, err, "fresh")
 	checks[0].Args[0] = "this-executable-must-not-exist-basalt"
-	code, err = accept(context.Background(), root, out+"-infra", "fixture", checks, io.Discard)
+	code, _, err = accept(context.Background(), root, out+"-infra", "fixture", checks, nil, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, 2, code)
 }
@@ -183,7 +185,7 @@ func TestAccept_CanceledContextNeverPasses(t *testing.T) {
 	out := filepath.Join(root, ".loop/runs/canceled")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	code, err := accept(ctx, root, out, "fixture", []check{{ID: "late", command: helperCommand(t, "pass")}}, io.Discard)
+	code, _, err := accept(ctx, root, out, "fixture", []check{{ID: "late", command: helperCommand(t, "pass")}}, nil, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, 2, code)
 	var rpt acceptanceReport
@@ -198,7 +200,7 @@ func TestAccept_PlainExitTwoStaysCheckFailure(t *testing.T) {
 	out := filepath.Join(root, ".loop/runs/cmd-exit2")
 	// make 对 recipe 失败也返回 2；普通检查的 2 不得被当成基础设施错误而中止整轮。
 	checks := []check{{ID: "make-like", command: helperCommand(t, "infra")}, {ID: "later", command: helperCommand(t, "pass")}}
-	code, err := accept(context.Background(), root, out, "fixture", checks, io.Discard)
+	code, _, err := accept(context.Background(), root, out, "fixture", checks, nil, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, 1, code)
 	var rpt acceptanceReport
@@ -211,12 +213,70 @@ func TestAccept_PlainExitTwoStaysCheckFailure(t *testing.T) {
 func TestAccept_RejectsSourceChangedDuringChecks(t *testing.T) {
 	root, _, _ := fixture(t)
 	out := filepath.Join(root, ".loop/runs/changed")
-	code, err := accept(context.Background(), root, out, "fixture", []check{{ID: "mutation", command: helperCommand(t, "touch")}}, io.Discard)
+	code, _, err := accept(context.Background(), root, out, "fixture", []check{{ID: "mutation", command: helperCommand(t, "touch")}}, nil, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, 2, code)
 	var rpt acceptanceReport
 	require.NoError(t, readJSON(filepath.Join(out, "report.json"), &rpt))
 	require.Equal(t, "source_changed", rpt.Status)
+}
+
+// TestAccept_ReportPathsRelative 验证报告只含仓库相对、`/` 分隔的日志路径，并拒绝仓库外 --out。
+// TestAccept_ReportPathsRelative keeps report paths repo-relative and rejects outside output.
+func TestAccept_ReportPathsRelative(t *testing.T) {
+	root, _, _ := fixture(t)
+	out := filepath.Join(root, ".loop/runs/relative")
+	code, rpt, err := accept(context.Background(), root, out, "fixture", []check{{ID: "base", command: helperCommand(t, "pass")}}, nil, io.Discard)
+	require.NoError(t, err)
+	require.Zero(t, code)
+	require.Len(t, rpt.Checks, 1)
+	for _, c := range rpt.Checks {
+		require.False(t, filepath.IsAbs(c.Log))
+		require.NotContains(t, c.Log, `\`)
+		require.NotContains(t, c.Log, ":")
+		require.True(t, relative(c.Log))
+		_, statErr := os.Stat(filepath.Join(root, filepath.FromSlash(c.Log)))
+		require.NoError(t, statErr)
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "report.json"))
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), filepath.ToSlash(root))
+
+	outside := filepath.Join(t.TempDir(), "run")
+	code, _, err = accept(context.Background(), root, outside, "fixture", []check{{ID: "base", command: helperCommand(t, "pass")}}, nil, io.Discard)
+	require.Equal(t, 2, code)
+	require.ErrorContains(t, err, "output must stay within repository")
+	_, statErr := os.Stat(filepath.Join(outside, "report.json"))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+// TestAccept_ExternalRequiresAuthorizationFlags 验证外部检查与授权旗标必须成对。
+// TestAccept_ExternalRequiresAuthorizationFlags pairs external checks with authorization.
+func TestAccept_ExternalRequiresAuthorizationFlags(t *testing.T) {
+	root, _, _ := fixture(t)
+	ctx := context.Background()
+	external := []check{{ID: "real", Level: "external", command: helperCommand(t, "marker")}}
+
+	code, _, err := accept(ctx, root, filepath.Join(root, ".loop/runs/no-auth"), "fixture", external, nil, io.Discard)
+	require.Equal(t, 2, code)
+	require.ErrorContains(t, err, "external checks require matching authorization")
+	_, statErr := os.Stat(filepath.Join(root, ".loop/runs/no-auth/report.json"))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+
+	source := []check{{ID: "base", command: helperCommand(t, "pass")}}
+	code, _, err = accept(ctx, root, filepath.Join(root, ".loop/runs/source-auth"), "fixture", source, &authorization{Ref: "r", Scope: "s"}, io.Discard)
+	require.Equal(t, 2, code)
+	require.ErrorContains(t, err, "external checks require matching authorization")
+	_, statErr = os.Stat(filepath.Join(root, ".loop/runs/source-auth"))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+
+	auth := &authorization{Ref: "user-2026-10-19-real-llm-webhook", Scope: "real-llm:openai-compatible; real-webhook:feishu; synthetic-data-only; model-calls<=30; cny<=10; sends<=5"}
+	code, rpt, err := accept(ctx, root, filepath.Join(root, ".loop/runs/authorized"), "fixture", external, auth, io.Discard)
+	require.NoError(t, err)
+	require.Zero(t, code)
+	require.Equal(t, auth, rpt.Authorization)
+	require.Equal(t, "external", rpt.Checks[0].Level)
+	require.NotNil(t, rpt.TestedBinarySHA256)
 }
 
 func TestAccept_InProgressReportCannotAuthorizeAndInterruptedChecksAreListed(t *testing.T) {
@@ -226,7 +286,7 @@ func TestAccept_InProgressReportCannotAuthorizeAndInterruptedChecksAreListed(t *
 	defer cancel()
 	checks := []check{{ID: "slow", command: helperCommand(t, "sleep")}, {ID: "later", command: helperCommand(t, "pass")}}
 	done := make(chan int, 1)
-	go func() { code, _ := accept(ctx, root, out, "fixture", checks, io.Discard); done <- code }()
+	go func() { code, _, _ := accept(ctx, root, out, "fixture", checks, nil, io.Discard); done <- code }()
 	require.Eventually(t, func() bool {
 		var rpt acceptanceReport
 		return readJSON(filepath.Join(out, "report.json"), &rpt) == nil && rpt.Status == "running" && rpt.ExitCode == 2
@@ -261,7 +321,7 @@ func TestRequiredGoTests_EmptyMatchAndSkipCannotPass(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			log := filepath.Join(t.TempDir(), "test.log")
 			require.NoError(t, os.WriteFile(log, []byte(tc.content+"\n"), 0o600))
-			err := checkTests(log, []string{"TestContract"})
+			_, _, err := checkTests(log, []string{"TestContract"})
 			if tc.ok {
 				require.NoError(t, err)
 			} else {
@@ -352,9 +412,18 @@ func TestMainRun_ArgumentErrorsAndLock(t *testing.T) {
 	require.Equal(t, 2, mainRun(context.Background(), []string{"--out", "../escape"}, io.Discard, io.Discard))
 	var rpt acceptanceReport
 	require.NoError(t, readJSON(filepath.Join(root, ".loop/runs/test/report.json"), &rpt))
+	// 报告只记录四项环境读数；该断言保留“不采集任意环境变量”的原意。
+	// Only the four approved environment readings may appear; arbitrary env vars stay out.
 	raw, err := json.Marshal(rpt)
 	require.NoError(t, err)
-	require.NotContains(t, string(raw), "environment")
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &fields))
+	var env map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(fields["environment"], &env))
+	require.Len(t, env, 4)
+	for _, key := range []string{"os", "arch", "go_version", "ci"} {
+		require.Contains(t, env, key)
+	}
 }
 
 // TestMainRun_FullIncludesUnboundStageCheck 防止移除自动执行器后漏掉跨任务验收。

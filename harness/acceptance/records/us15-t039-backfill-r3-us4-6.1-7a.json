@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "record_id": "us15-t039-backfill-r3-us4-6.1-7a",
+  "run_id": "us15-t039-backfill-r3",
+  "run_kind": "backfill",
+  "executor": "ai",
+  "started_at": "2026-10-19T18:43:45Z",
+  "finished_at": "2026-10-19T19:11:38Z",
+  "subject": {
+    "kind": "manual_item",
+    "level": "process",
+    "items": [
+      "us4-6.1-7a"
+    ],
+    "check_id": "015-backfill",
+    "test": "TestBackfill_Bootstrap/assembly"
+  },
+  "criteria": {
+    "acceptance_sha256": "686fd775aed10db4a803c1b2e22a6ed74f5657ed6ec51d17afd73baf510716ce",
+    "stage_sha256": "c84c8a0a21124753b67af43e198ab6bbcbd33bf7fe1c6306287e64f7166cfa25",
+    "inputs": [
+      {
+        "path": "docs/us/us15-acceptance-infra.md",
+        "sha256": "19b70290a83380a6ee65c8671a3348df07efe88d216b35ae7fc9b883a1c2aae8"
+      },
+      {
+        "path": "specs/015-acceptance-infra/spec.md",
+        "sha256": "c2ee61578a5e38ab0259ebc29c1ed0e87dbe106ab797d136e499e6f4b1b6529f"
+      },
+      {
+        "path": "specs/015-acceptance-infra/plan.md",
+        "sha256": "d1c76acca7daeaeac297be554582770aae8516921c2c86535b76db9a707bcd28"
+      },
+      {
+        "path": "specs/015-acceptance-infra/tasks.md",
+        "sha256": "a21b52e0e4ca01aa25004ca3236f28de8b57e5ebc5ad11e5833dcb5498abc8a4"
+      },
+      {
+        "path": "harness/acceptance.json",
+        "sha256": "686fd775aed10db4a803c1b2e22a6ed74f5657ed6ec51d17afd73baf510716ce"
+      },
+      {
+        "path": "harness/stages/us8-notify-r1.json",
+        "sha256": "85fcb3ebaa1b6615d977ac4457ceaadfdb473d07e1a0b9d1d3d1e127162c2f91"
+      },
+      {
+        "path": "harness/stages/us9-web.json",
+        "sha256": "1ff4c036e178f30e01aa5d307c32b6d21ab7b5a3979b8972f025edcc8202a412"
+      },
+      {
+        "path": "harness/stages/us10-scheduler.json",
+        "sha256": "42670059a5f0ba1839fd37888f44ad32996ab4bc70233485dec16ded6bab444d"
+      }
+    ]
+  },
+  "code": {
+    "base_commit": "1b074a400cf35a9bce0ae2981303d11430744515",
+    "source_fingerprint": "14b8e88dc11b0d2b93198897d0b0a972fa6d47d83fbb90208ce23708a43798c4",
+    "dirty": true,
+    "tested_binary_sha256": "5a98546b23fac1907039e2c3e4d878817d2020748dafd9bb454a77a973f12dac"
+  },
+  "environment": {
+    "os": "windows",
+    "arch": "amd64",
+    "go_version": "go1.27.2",
+    "ci": false
+  },
+  "verdict": "passed",
+  "evidence": {
+    "report_path": "harness/acceptance/records/reports/us15-t039-backfill-r3-us4-6.1-7a.json",
+    "report_sha256": "eb0b233b49c654c5acebd23d24b5ddeaa0ac752696cd8062ac068ad0da0a850e",
+    "logs": [
+      {
+        "path": ".loop/runs/us15-t039-backfill-r3/015-backfill.log",
+        "sha256": "de960ea7e158a00a60e994e4c2c265e9c86604d4018c19918842a2ebaab82c07"
+      }
+    ]
+  },
+  "notes": "回填：结论取自同次运行 us15-t039-backfill-r3 的 015-backfill 报告段（passed_tests），未手填。"
+}

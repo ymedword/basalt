@@ -50,11 +50,28 @@ jobs:
 
       - name: Unified acceptance (mandatory fake-model evals; explicit real-model skip)
         # 控制台输出也落盘：报告被中断/覆盖时，console 是唯一的逐条进度证据。
-        # Keep the console stream as evidence too, not only report.json.
+        # 运行目录带 run id + attempt：同一 run 的重试（run_attempt 递增）会撞上已存在目录，
+        # 固定名还会让不同运行互相覆盖证据；accept 拒绝已存在目录、record_id 也会冲突。
+        # Keep the console stream as evidence too, not only report.json. Every --out carries
+        # both GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT (enforced by TestRepoInvariants_CIRunDirsUnique).
         run: |
           set -o pipefail
           mkdir -p .loop/runs
-          sh scripts/check-acceptance.sh --profile ci --out .loop/runs/ci 2>&1 | tee .loop/runs/ci-console.log
+          sh scripts/check-acceptance.sh --profile ci --out ".loop/runs/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" 2>&1 | tee ".loop/runs/ci-console-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+
+      # stage lint 只做只读存在性预检（-list 变换）：lint 通过不等于测试执行通过，
+      # 执行判据是下一段 current stage 的具名 PASS。
+      - name: Lint stage definitions (read-only existence precheck)
+        run: sh scripts/check-acceptance.sh --lint-stages --stage harness/stages/current.json
+
+      # 现行累计清单：历史 US-8 / 9 / 10 的专属 check 持续回归，加 US-15 专属 check。
+      - name: Current cumulative stage (historical checks keep regressing)
+        run: sh scripts/check-acceptance.sh --stage harness/stages/current.json --stage-only --out ".loop/runs/current-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      # Linux 专属通道：信号优雅停机与调度停机顺序只能在 Linux 上判卷（Windows 按平台限制未验证）。
+      # us15-real 不接入 CI：真实凭证与费用只在用户授权后于收口时执行。
+      - name: Linux-only stage (signal and scheduler shutdown)
+        run: sh scripts/check-acceptance.sh --stage harness/stages/us15-linux.json --stage-only --out ".loop/runs/us15-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
       - name: Upload acceptance evidence (including failures)
         if: always()

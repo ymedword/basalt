@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "us15-slow",
+  "approval": "Human review ① 2026-10-19 approved module card sha256 19b70290a83380a6ee65c8671a3348df07efe88d216b35ae7fc9b883a1c2aae8 (1322 lines); user authorized /us-register 15 and module development on 2026-10-19. Stage derived from module card §3.2 by module-dev step 6.1 and grants no approval by itself.",
+  "inputs": [
+    "docs/us/us15-acceptance-infra.md",
+    "specs/015-acceptance-infra/spec.md",
+    "specs/015-acceptance-infra/plan.md",
+    "specs/015-acceptance-infra/tasks.md",
+    "harness/acceptance.json",
+    "internal/e2e/slow_test.go"
+  ],
+  "protect": [
+    "internal/e2e",
+    "scripts/acceptance/stages_test.go"
+  ],
+  "checks": [
+    {
+      "id": "015-slow-timeout",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e slow",
+        "./internal/e2e",
+        "-run",
+        "^TestBackfill_SlowTimeout$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestBackfill_SlowTimeout/run_timeout"
+      ],
+      "level": "process"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "us15",
+      "checks": [
+        "015-slow-timeout"
+      ]
+    }
+  ]
+}
