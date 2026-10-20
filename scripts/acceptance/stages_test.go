@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -945,4 +946,81 @@ func catalogWithinChecks(entries []catalogEntry, checks map[string]check) []cata
 		}
 	}
 	return out
+}
+
+// ciStageRefPattern 提取 workflow 命令行中以字面量给出的 --stage 参数。
+// ciStageRefPattern extracts literal --stage arguments from workflow run lines.
+var ciStageRefPattern = regexp.MustCompile(`--stage\s+("[^"]*"|'[^']*'|\S+)`)
+
+// ciExecutedStages 返回 CI 实际执行的 stage 路径：current.json 恒被承载，
+// 再加上所有 workflow 中 --stage 点名的字面量路径。动态值无法核验，直接判红。
+// ciExecutedStages lists stages CI actually loads: current.json always, plus every
+// literal --stage path in the workflows. A dynamic value cannot be verified and is red.
+func ciExecutedStages(t *testing.T, root string) []string {
+	t.Helper()
+	seen := map[string]bool{"harness/stages/current.json": true}
+	var workflows []string
+	for _, glob := range []string{"*.yml", "*.yaml"} {
+		found, err := filepath.Glob(filepath.Join(root, ".github", "workflows", glob))
+		require.NoError(t, err, "glob workflow 失败")
+		workflows = append(workflows, found...)
+	}
+	require.NotEmpty(t, workflows, "未找到 workflow 文件——CI stage 可见性判据失效")
+	for _, wf := range workflows {
+		data, err := os.ReadFile(wf)
+		require.NoError(t, err, "读取 %s 失败", wf)
+		rel, err := filepath.Rel(root, wf)
+		require.NoError(t, err)
+		rel = filepath.ToSlash(rel)
+		for i, line := range strings.Split(string(data), "\n") {
+			// 注释行里的 --stage 只是说明文字，不构成 CI 执行引用。
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			for _, m := range ciStageRefPattern.FindAllStringSubmatch(line, -1) {
+				stagePath := strings.Trim(m[1], `"'`)
+				require.True(t, strings.HasSuffix(stagePath, ".json") && !strings.Contains(stagePath, "$"),
+					"%s:%d 的 --stage 参数 %q 不是字面量 stage 路径，无法核验 git 可见性", rel, i+1, stagePath)
+				seen[stagePath] = true
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// TestStages_CIInputsGitVisible 守 CI stage 的输入面与干净检出一致：CI 执行
+// （current.json 承载或 workflow 以 --stage 引用）的 stage，其 inputs / protect
+// 必须是 git 跟踪的入库路径。干净检出只有入库文件，私有模块卡（docs/us/*.md）
+// 一旦进入 CI stage，loadStage 的逐项存在性校验会让运行直接退出 2。
+// 判据：对每个 CI stage 的 inputs / protect 逐项执行 `git ls-files --error-unmatch`。
+// 逆改点：把 docs/us/*.md 加回 current.json 的 inputs，或让 workflow 引用含私有
+// 路径的 stage，即红。
+// TestStages_CIInputsGitVisible keeps every CI-executed stage loadable from a clean
+// checkout: each input/protect path must be git-visible. A private module card in a
+// CI stage makes loadStage fail with exit 2 before any check runs.
+func TestStages_CIInputsGitVisible(t *testing.T) {
+	root := stageTestRoot(t)
+	stages := ciExecutedStages(t, root)
+	require.NotEmpty(t, stages, "没有解析到 CI 执行的 stage——判据面失效")
+
+	for _, rel := range stages {
+		s := readStageForTest(t, root, rel)
+		scopes := []struct {
+			name  string
+			paths []string
+		}{
+			{name: "inputs", paths: s.Inputs},
+			{name: "protect", paths: s.Protect},
+		}
+		for _, scope := range scopes {
+			for _, p := range scope.paths {
+				cmd := exec.Command("git", "ls-files", "--error-unmatch", "--", p)
+				cmd.Dir = root
+				out, err := cmd.CombinedOutput()
+				require.NoError(t, err,
+					"%s 的 %s %q 不在 git 跟踪面内（干净检出加载该 stage 会失败）: %s",
+					rel, scope.name, p, strings.TrimSpace(string(out)))
+			}
+		}
+	}
 }

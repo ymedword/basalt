@@ -105,6 +105,7 @@
 | 2026-10-20 | T049 第三跑 `us15-real`（run `20261019T194329-real`）：`015-real-model` passed（49.1s）、`015-real-feishu` passed（7.8s），整体 exit 0 | 验证性运行，无新假设 | **通过**：`real_model_calls=21`（≤30）、`real_model_tokens=10701`、`real_feishu_sends=1`（≤5）、`feishu_target=https://open.feishu.cn`（仅 `scheme://host`）、两 check `binary_sha256=5a98546b…` 与报告一致；运行目录对 API key / 完整 webhook / `open-apis` 路径扫描 **0 命中**。以生成器发布 15 条 external `manual_item` 记录 + 1 条 run 记录 + 15 份同次报告 + 16 行台账（ledger 144 行、records 133、reports 129）；`go test -count=1 ./scripts/acceptance` 全绿（129/129 目录覆盖） | 1 |
 | 2026-10-20 | T057 首跑 `make check` → `sec` 目标失败（`make_check_exit=2`）：gosec 报 3 条——`scripts/acceptance/stagelint.go:108` G204（`exec.CommandContext` 变量实参）、`scripts/acceptance/record.go:344` 与 `record.go:171` G304（变量路径 `os.ReadFile`） | G304 可用 `os.Root` 做机制级根限定（Go 1.24+），属标准修复面；G204 的实参（`-tags` / 包路径）数据驱动，gosec 只接受全常量实参，静态无法消除——仓库外探针实测：变量命令名、常量命令 + 变量实参均报，仅全常量干净 | **修复后全绿**：① G304 新增 `readUnderRoot` / `fileSHA256(root, rel)` 经 `os.OpenRoot` 读取，全部调用点（含 `reportForRecord`）改为仓库相对路径；② G204 经用户 2026-10-20 裁决加 `#nosec G204` 并写明四条理由（命令名已固定、参数仅来自受保护 stage、只读 `go test -list`、替代写法只削弱审计面），与 `internal/tool` runner / mcp 的既有豁免同口径，review ② 披露；复跑 `gosec -quiet ./scripts/acceptance` 零命中。第二次 `make check` → `make_check_exit=0`，七目标：fmt 干净；lint（go vet + staticcheck 指定集）通过；sec（gosec + govulncheck）零命中；test 与 test-integration 通过；`check-coverage: 全部包达标`（`internal/core 86.67%`、`internal/tool 85.79%`、`internal/memory 91.32%`、`internal/storage 79.84%` 均 ≥70%，`scripts/acceptance 79.80%` ≥50%，`internal/e2e` 与 `scripts` 以「无可执行语句」跳过、有可执行语句包无一缺失）；build `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w …"` 成功。附带 `git diff --exit-code go.mod go.sum internal/storage/schema.sql docs/contracts/schema.sql Makefile harness/acceptance.json` exit 0（零新增坐标 / 迁移 / 配置键） | 1 |
 | 2026-10-20 | 推送后 CI 首跑（run 39324219967 分支 / 39324257392 main，同一提交 `2eba6dc`）：test job 第 7 步 `Current cumulative stage` 即时退出 2，日志 `input/protected path docs/us/us15-acceptance-infra.md: lstat ...: no such file or directory`；第 8 步 Linux stage 因前步失败被跳过 | `loadStage` 对 `inputs` / `protect` 逐项做存在性校验（`config.go:184-192`），`buildRecord` 再逐项算 sha256（`record.go:272-279`）；`docs/us/` 按私有策略不入库，CI 全新检出无此文件——本地通过只因私有文件在本机存在 | **已修复（用户 2026-10-20 裁决方案 A）**：`current.json` / `us15-linux.json` 的 inputs 移除私有卡（`us15-slow` / `us15-real` 仅本机执行、保留）；checks / `required_tests` / `protect` / 断言零变更。复跑证据：`--lint-stages` 退出 0（3 条已知 WARN）；无 `docs/us/` 的干净 worktree（`git worktree add --detach HEAD`）以 CI 同命令执行 `current` → 33/33 PASS、退出 0，record 的 `criteria.inputs` 7 项全为入库文件；`us15-linux` 同环境加载通过（Windows 上按预期报 `required test did not execute`，非 lstat）。CI 真实绿态待推送后回填 | 1 |
+| 2026-10-20 | CI 复跑（commit `136fed6`，run 39327737289）：test job 步骤 6 / 7 / 8 与 build job 全 success，整体 conclusion=success | F-09 修复（CI stage inputs 移除私有卡）后的验证性运行 | **通过**：`current-39327737289-1` / `us15-linux-39327737289-1` 两 stage `exit=0`（日志 `acceptance stage-only/...: passed`），运行目录带 `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}` 后缀；`acceptance-evidence` 工件已上传；§7.3 / §8.6 / §8.7 已回填 | 1 |
 
 ## 3. 停止预算与计数
 
@@ -222,7 +223,7 @@
 | US-8 飞书错误关键词 `code=19024` | 缺环境 | 关键词安全未确认 | 确认真实错误关键词后执行 |
 | US-4 Demo③ / ④ / ⑦ 与 §6.1 第 3 项 | 缺环境 | 模型 / provider 行为不确定；假模型路径已覆盖确定性拒绝与协议部分 | 真实服务行为可复现时补执行 |
 | US-4 token 估算 | 缺环境 | 缺分词器依赖 | 依赖获批后执行 |
-| 真实 CI 运行（lint-stages / current / us15-linux 三步） | 未验证（待推送） | 用户推送前 CI 不运行；本地仅核对 `ci.yml` 与目录唯一性不变量 | 推送后读取 Actions 结论与运行目录后缀，回填本行 |
+| 真实 CI 运行（lint-stages / current / us15-linux 三步） | 已验证（2026-10-20 翻转） | run [39327737289](https://github.com/ymedword/basalt/actions/runs/39327737289)（head `136fed6`，conclusion=success）——test job 步骤 6 / 7 / 8 全 success、build job success；运行目录 `ci-39327737289-1` / `current-39327737289-1` / `us15-linux-39327737289-1`，两个 stage `exit=0` | 首跑 `2eba6dc` 红于 F-09，修复推送后转绿；关闭 |
 | 丙类人工判断项 | 人判 | 证据充分性 / 控制台观感 / 备份面口径 / 差异可接受性 / 文档真实性由用户裁决 | review ② 逐条列于 §8（T061 收口包） |
 
 **停止预算与计数**：`/debug` 轮次 0（预算 ≤2）；单题最高尝试计数 2（T034 探针方法修正、T049 真实运行第二次），均收敛，未触发「3 次不收敛」；无「相邻两次无新证据」停点；预算未到期。
@@ -418,7 +419,7 @@ sh scripts/check-acceptance.sh --stage harness/stages/us15-real.json --stage-onl
 
 ### 8.6 未验证 / 不适用 / 丙类 / W3
 
-**未验证（缺环境 / 缺依赖 / 平台限制，不冒充通过）**：逐条见 §7.3 表——US-4 token 估算（缺分词器依赖）；US-7 真实第三方 MCP server（缺外部安装）；US-9 第二主机（缺第二台主机）；Windows 原生 SIGTERM / Ctrl+C 事件序（平台限制，Linux 侧经 WSL 已通过）；US-10 15b（平台限制）；US-8 飞书 `code=19024`（关键词安全未确认）；US-4 Demo③ / ④ / ⑦ 与 §6.1 第 3 项（模型 / provider 行为不确定）；真实 CI 运行（推送前不可执行；2026-10-20 首次推送后实测**失败**：F-09，stage inputs 含私有卡导致 `loadStage` 退出 2——见 §8.1 / §8.7；修复后待推送复跑，绿态回填 Actions 结论与运行目录后缀）。
+**未验证（缺环境 / 缺依赖 / 平台限制，不冒充通过）**：逐条见 §7.3 表——US-4 token 估算（缺分词器依赖）；US-7 真实第三方 MCP server（缺外部安装）；US-9 第二主机（缺第二台主机）；Windows 原生 SIGTERM / Ctrl+C 事件序（平台限制，Linux 侧经 WSL 已通过）；US-10 15b（平台限制）；US-8 飞书 `code=19024`（关键词安全未确认）；US-4 Demo③ / ④ / ⑦ 与 §6.1 第 3 项（模型 / provider 行为不确定）。真实 CI 运行曾于 2026-10-20 首跑红于 F-09（stage inputs 含私有卡导致 `loadStage` 退出 2，见 §8.1 / §8.7）；修复 `136fed6` 推送后 run 39327737289 全绿，已移出本清单。
 
 **不适用（`na_basis`）**：
 
@@ -436,6 +437,24 @@ sh scripts/check-acceptance.sh --stage harness/stages/us15-real.json --stage-onl
 ### 8.7 收口状态
 
 - AI 侧：T057 七目标、T058 quickstart 1–10、T059 登记、**T060 独立复核**（8 条 findings 全部处置，F-01 / F-02 阻断项修复后按逆改红态与干净副本复验）、**T061 收口包**（§8.1–§8.6）均已完成；绿色 current 运行 `20261019T203742-current` 已发布（134 条记录 / 134 份报告 / 134 行台账，lint 3 条 WARN 均为已知历史项）。AI 侧收口完成。
-- 推送后实测：CI 首跑红（F-09，stage inputs 私有卡）；已按用户 2026-10-20 裁决方案 A 修复并在无 `docs/us/` 的干净 worktree 复跑 `current` 33/33 PASS、`us15-linux` 加载通过（Windows 平台行为按预期失败于测试可见性）。修复提交待推送，真实 CI 绿态未回填前保持「未验证」。
+- 推送后实测：CI 首跑红（F-09，stage inputs 私有卡）；已按用户 2026-10-20 裁决方案 A 修复（commit `136fed6`）并在无 `docs/us/` 的干净 worktree 复跑 `current` 33/33 PASS、`us15-linux` 加载通过。修复推送后 run 39327737289 全绿（test / build 两 job success；步骤 6 / 7 / 8 全 success；运行目录 `ci-39327737289-1` / `current-39327737289-1` / `us15-linux-39327737289-1`），真实 CI 项已关闭。
 - 人工侧：**待用户 review ② 决定**。未收到决定前不得写成「人工接受」；用户可抽检任意记录（台账 → 记录 → 同次报告 → 原始日志）或亲自复跑 §8.3.4 的任一命令。
-- commit / push / tag 仍归用户；真实 CI 结论在推送后回填（当前为红，待修复提交推送后的复跑结论）。
+- commit / push / tag 仍归用户；真实 CI 结论已回填（run 39327737289 全绿，2026-10-20）。
+
+## 9. F-09 后续加固（例外 1 / 2，2026-10-20）
+
+F-09 的根因是「私有模块卡被声明为 CI 执行 stage 的 `inputs`」。修复提交 `136fed6` 只移除了本 US 两个 CI stage 的私有路径；为防复发，按用户指令「1 → 2.1 → 2.2」补了三处，**不改变既有判据**：
+
+| 项 | 落点 | 内容 | 版本库状态 |
+| --- | --- | --- | --- |
+| 1. 例外 1：外部授权不继承 | `.claude/skills/module-doc-gen/SKILL.md`「易漏维度核对表」 | 新增「外部授权登记」行：真实模型 / webhook / 跨仓 / 平台项 → §4.5 **必须**二选一写明「已授权（ref + scope：服务 / 接收方 / 数据范围 / 次数 / 费用上限）」或「未授权（进未验证清单并写明缺失授权）」，**不得**留空默认为已授权；ref 按 US 唯一、不继承 | 私有（`.git/info/exclude`），不入库 |
+| 2.1 例外 2：模板与规则 | `harness/stage.example.json`、`harness/README.md` | 模板 `inputs` 移除 `docs/us/usNNN-name.md`，改为 spec / plan / tasks + `harness/acceptance.json`；README 新增「CI 可见性硬规则」：CI 执行 stage 的 inputs / protect 必须 `git ls-files` 可见，私有卡只允许本机 stage；接入步骤 2 同步说明模板 inputs 口径 | 私有，不入库 |
+| 2.2 机器守卫 | `scripts/acceptance/stages_test.go` | 新增 `TestStages_CIInputsGitVisible`：解析 `current.json` + workflow 中 `--stage` 字面量，对每个 stage 的 `inputs` / `protect` 逐项执行 `git ls-files --error-unmatch`，任一不可见即红 | 入库（跟踪文件） |
+
+**判据面说明（review ② 披露）**：
+
+- **新增测试，非放宽**：只新增断言；`current.json` / `us15-linux.json` / `us15-slow.json` / `us15-real.json` 的 checks、`required_tests`、`protect`、既有断言**零变更**。
+- 新测试落在 `015-acceptance-infra` 既有 `-run '^(…TestStages_…)$'` 正则内，失败会使该 check 非零退出即判 failed；**未**追加进 `required_tests`（避免改 stage 字面量与 `pinnedRequiredTests` 静态钉值）。若后续要在报告中逐名列出，需单列裁决。
+- **红态探针（2026-10-20）**：临时把 `docs/us/us15-acceptance-infra.md` 加回 `current.json` 的 inputs，`TestStages_CIInputsGitVisible` 变红，逐字报 `inputs "docs/us/us15-acceptance-infra.md" 不在 git 跟踪面内（干净检出加载该 stage 会失败）: error: pathspec 'docs/us/us15-acceptance-infra.md' did not match any file(s) known to git`；恢复后 `current.json` sha256 与探针前一致（`efa189307e275e37fd9f48905b771e2ef46f14270158224f63291b339c17b3f5`），测试转绿。
+- **绿态读数**：`go test ./scripts/acceptance -run 'TestStages_' -count=1` 8/8 顶层测试 PASS（含新守卫，1.291s）；`make check` **exit 0**（七目标全绿；test 目标 `scripts/acceptance 6.486s coverage 79.8%`，`check-coverage: 全部包达标`，`CGO_ENABLED=0` 构建成功）。
+- 三个私有文件（skill / README / 模板）不在版本库，只在本工作区与灌注过私有资产的 worktree 生效；随 clone 生效的持久防线是入库测试。CI 执行面未新增步骤，`ci.yml` 零改动。
