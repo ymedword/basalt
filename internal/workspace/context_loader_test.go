@@ -160,6 +160,12 @@ func TestContextLoader_RefusesUnregisteredAgent(t *testing.T) {
 func TestContextLoader_RereadsBetweenCalls(t *testing.T) {
 	root := writeCompatSampleWorkspace(t)
 	entry := loadOnlyAgent(t, root)
+	// 本用例判**手工条目**的后备读盘路径（Definition == nil 才读盘）：注册表产出的条目
+	// 携带已校验字节、快照不再重读磁盘（人工 review ② 缺陷 1 的修复，由 app 层回归判卷）；
+	// 后备路径"每次调用重读、不缓存"的无状态性仍由本条守着。
+	// Hand-built entries are the only ones that read the disk; loaded entries freeze from
+	// their validated bytes (covered by the app-level regressions).
+	entry.Definition = nil
 	loader := workspace.NewContextLoader(bufferedLogger(t))
 
 	first, err := loader.SectionOne(root, entry, sectionOneNow())

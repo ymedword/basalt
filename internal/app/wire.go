@@ -42,13 +42,17 @@ const (
 	// The agents directory name, shared with the workspace and tool packages.
 	agentsDirName = "agents"
 
-	// stepLock / stepOpen / stepMigrate / stepRecover 是重路径四个次序读数（T050 T1 的判据）：
-	// 日志里 `step` 键的取值必须**按此序**出现——顺序错了就是接线错了。
-	// The four ordering readings: the `step` values must appear in exactly this order.
-	stepLock    = "lock"
-	stepOpen    = "open"
-	stepMigrate = "migrate"
-	stepRecover = "recover"
+	// stepLock / stepOpen / stepMigrate / stepRecover / stepBaseline / stepRecovery 是重路径
+	// 六个次序读数（图 A 的判据）：日志里 `step` 键的取值必须**按此序**出现——顺序错了就是
+	// 接线错了。基线排在崩溃恢复之后、管理面恢复之前（注 5）：先修账本与工作区残留，再补
+	// 资源指针与生命周期状态文件，最后才查证上次留下的 pending 管理操作。
+	// The six ordering readings: the `step` values must appear in exactly this order.
+	stepLock     = "lock"
+	stepOpen     = "open"
+	stepMigrate  = "migrate"
+	stepRecover  = "recover"
+	stepBaseline = "baseline"
+	stepRecovery = "recovery"
 )
 
 // App 是重路径装配的显式依赖面（宪法 VII：不塞 context、不用包级变量）——与命令面的
@@ -335,14 +339,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 路径的第三态。轻路径两者皆 nil，由装载器自读配置并走第三态。
 	// Both MCP name sets are explicit on the heavy path; a non-nil connected set tells the
 	// loader the connection verdict is known, so failed servers are rejected outright.
-	configuredServers := make([]string, 0, len(mcpSpecs))
-	for _, spec := range mcpSpecs {
-		configuredServers = append(configuredServers, spec.Name)
-	}
-	connectedServers := make([]string, 0, len(mcpConns))
-	for _, conn := range mcpConns {
-		connectedServers = append(connectedServers, conn.Server)
-	}
+	mcpRT := newMCPRuntime(mcpSpecs, mcpConns)
+	configuredServers := mcpRT.ConfiguredNames()
+	connectedServers := mcpRT.ConnectedNames()
 	// loader 保留句柄：`manage_schedule` 的编辑适配器与装载共用**同一个**实例——
 	// `ApplySchedule` 的 writeMu 因此也覆盖未来的装载调用（约束 29 / 39），
 	// 不让第二条写入路径从另一个实例进入。
@@ -359,33 +358,130 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	if err != nil {
 		return fail(fmt.Errorf("装载 Agent 目录: %w", err))
 	}
-	agents := newAgentSource(root, entries, logger)
 
-	// ⑦ 运行入口：模型调用唯一入口 + 四个仓储 + 自实现循环 + 显式时钟。provider 映射表由
-	// `newProviderService` 在这一次装配里**一次构建**（宪法 III：运行时只查表）。
-	sessions := storage.NewSessionStore(db)
-	invocations := storage.NewToolInvocationRepo(db)
-	llmCalls := storage.NewLLMCallRepo(db)
-	client, err := a.modelClient(cfg, llmCalls, logger)
+	// 启动基线（颗粒度文档 §3.1.19 / 图 A ③）：迁移之后、开放服务之前，把资源发布指针与
+	// 磁盘上的工作副本、生命周期状态文件对齐。Provider / MCP 的定义块按**原文逐行**取自实例
+	// 配置与 mcp_servers.yaml——发布版本记录的是运维写下的那一段，不是重新序列化的结果。
+	// 无活可做时不写操作行、不改状态文件（注 13），重复启动因此不在库里留新行。
+	// The baseline aligns pointers with the workspace before serving; it takes provider and
+	// MCP definitions verbatim from the files instead of re-serialising them.
+	providerDefs, err := loadProviderDefinitions(filepath.Join(a.workDir, configFileName), providerNames(cfg))
 	if err != nil {
 		return fail(err)
 	}
+	mcpDefs, err := loadMCPServerDefinitions(root, mcpRT.ConfiguredNames())
+	if err != nil {
+		return fail(err)
+	}
+	// 进程级共享闸门（约束 25 / 46，图 F）：**只有这一份** Agent 级读写锁表与发布 / 准入
+	// 闸门。基线此刻写状态文件用的锁，就是准入稍后重读用的锁，也是启停迁移与内容条件写
+	// 用的锁；T045 的运行资源解析将在这同一个 ResourceGate 的读锁内进行。两个实例各建
+	// 一份会让互斥形同虚设——装配层因此在第一次写之前建好、向下只传递。
+	// One per-agent lock table and one publish/admission gate for the whole process; the
+	// baseline writes under the very locks admission will read under.
+	agentGate := core.NewAgentGate()
+	resourceGate := &core.ResourceGate{}
+	ops := storage.NewManagementStore(db)
+	versions := storage.NewResourceStore(db)
+	lifecycle := workspace.NewLifecycleStore(root, a.nowOr())
+	// 技能库**一次构建**（T056）：基线发布、准入解析与发布版本快照读的是同一实例，
+	// 版本目录与工作副本的形态因此只有一个来源。
+	// One skill library shared by the baseline, admission and the published snapshot.
+	skills := workspace.NewSkillLibrary(root)
+	if err := runBaseline(ctx, BaselineDeps{
+		Operations: ops,
+		Resources:  versions,
+		Skills:     skills,
+		Lifecycle:  lifecycle,
+		Providers:  providerDefs,
+		MCPServers: mcpDefs,
+		Agents:     entries,
+		Logger:     logger,
+		Now:        a.nowOr(),
+	}); err != nil {
+		return fail(err)
+	}
+	logger.Info("重路径：启动基线完成", "step", stepBaseline,
+		"providers", len(providerDefs), "mcp", len(mcpDefs), "agents", len(entries))
+
+	// 管理面恢复（图 A ④ / 约束 38）：基线自己若留下 pending 行，它已在上一段收口；
+	// 其余按动作组查证，判定不了的标 unknown 并**保留原样**——重放一次停用会让 generation
+	// 跳两格，重放一次内容写会覆盖第三方的修改。
+	// Management recovery verifies each pending row and never replays a change.
+	if err := recoverPendingOperations(ctx, RecoveryDeps{
+		Operations: ops,
+		Resources:  versions,
+		Lifecycle:  lifecycle,
+		Editor:     workspace.NewAgentEditor(workspace.AgentEditorDeps{Root: root}),
+		Logger:     logger,
+		Now:        a.nowOr(),
+	}); err != nil {
+		return fail(err)
+	}
+	logger.Info("重路径：管理面恢复完成", "step", stepRecovery)
+
+	// 注册装配的技能发布过滤（约束 36 / FR-042，F-03 A）：装载器只校验技能实体，绑定
+	// 指针是否存在必须在这里补判——启动失败关闭（读不到指针即拒绝启动），与 watcher 的
+	// 热加载判定共用同一个函数。
+	// The skill-publication filter completes the registration invariant after the loader
+	// and before the registry; a failed lookup aborts startup, exactly like the watcher.
+	entries, err = registryEntriesWithSkillPublication(ctx, versions, entries, logger)
+	if err != nil {
+		return fail(fmt.Errorf("注册装配: %w", err))
+	}
+
+	// 不可变注册表（§3.1.20 / 图 A）：装载结果在恢复之后冻结成首版快照。它是管理台列表、
+	// 运行准入与调度器**共同**的读面——热加载之后以整份替换发布新版本，三处因此不可能
+	// 各自看到不同的 Agent 集合。
+	// The immutable registry is published after recovery and is the single read face for
+	// the console, admission and the scheduler.
+	agents := newAgentRegistry(root, entries, logger)
+
+	// ⑦ 运行入口：模型调用唯一入口 + 四个仓储 + 自实现循环 + 显式时钟。provider 映射表在
+	// 这一次装配里**一次构建**（宪法 III：运行时只查表）：运行准入拿它做"发布的 Provider
+	// 是否可用"判定，模型调用拿它做路由——两个消费面共享同一份目录，表不可能分叉。
+	// The one explicit provider catalog is built here and shared by admission and the
+	// model client; the two faces can never see different tables.
+	catalog, err := newProviderCatalogWithOverride(cfg, a.providerOverride)
+	if err != nil {
+		return fail(err)
+	}
+	sessions := storage.NewSessionStore(db)
+	invocations := storage.NewToolInvocationRepo(db)
+	llmCalls := storage.NewLLMCallRepo(db)
+	// 运行账本只建一次：AgentService 写、web.RunService 适配器读，同一实例保证
+	// "读到的"就是"写下的"（两条连接池之间的影子账本会让排障无从对齐）。
+	// One run store is shared by the writer (AgentService) and the reader (the web port).
+	runs := storage.NewRunStore(db)
+	client := modelClient(catalog, llmCalls, logger)
 	loop := core.NewReActLoop(
 		core.NewPromptBuilder(registry),
 		core.NewToolExecutor(registry, invocations, logger),
 		logger,
 	)
 	service := core.NewAgentService(core.ServiceOptions{
-		Agents:   agents,
-		Client:   client,
-		Messages: sessions,
+		Agents: agents,
+		// 生命周期准入（图 F ③ / 约束 15）：状态文件端口与 Agent 级闸门传的是上面那一份
+		// 共享实例——准入在读锁内现场重读，启停迁移持写锁，两者因此互斥。nil 会让准入
+		// 门禁与启停互斥同时静默消失，生产装配**不得**省略。
+		// Admission shares the very gate and store the lifecycle transitions use; a nil
+		// would silently disable the fail-closed gate.
+		Lifecycle: lifecycle,
+		Gate:      agentGate,
+		// 发布资源的两件必须同进同出（图 F ③ / N1）：解析端口在资源闸门读锁内固定版本，
+		// 快照构建器按固定的 SkillDirs 读发布目录；缺一件由 core 在准入前失败关闭。
+		// Resources and RunSnapshots are wired together; a partial wiring fails closed.
+		Resources:    NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate),
+		RunSnapshots: newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr()),
+		Client:       client,
+		Messages:     sessions,
 		// Sessions 是准入处的会话门禁端口（US-10 约束 40）：调度运行与手动补跑都经
 		// `AgentService.Run`，已归档会话必须在唯一准入点被拒——门禁只能挂在 core，
 		// web / app 都不得另写一份判定。nil 会让门禁静默消失，因此这里显式接上。
 		// The session gate lives at the single admission point; a nil port would silently
 		// disable it, so the store is wired explicitly.
 		Sessions:  sessions,
-		Runs:      storage.NewRunStore(db),
+		Runs:      runs,
 		Snapshots: storage.NewSnapshotStore(db),
 		Audit:     invocations,
 		Memory:    memSvc,
@@ -401,32 +497,49 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// `webOptions.Schedules` 因此恒非 nil；启动接缝只认 serve / gateway（约束 20）。
 	// 定义快照在 core.NewScheduler 构造时一次冻结，此后调用方改 entries 不影响对账。
 	// The scheduler is always constructed on the heavy path; only serve/gateway Start it.
-	scheduler := a.newScheduler(storage.NewTaskStore(db), service, entries, cfg, logger)
+	// 条目取自同一份注册表快照（FR-22）：调度注册集与准入集不会分叉。
+	// The scheduler reads the same registry snapshot, so its set can never diverge.
+	scheduler := a.newScheduler(storage.NewTaskStore(db), service, agents.Entries(), cfg, logger)
 	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
 	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
+	// 适配器同时保留在运行期上：配置热加载的调度联动必须走**同一实例**（约束 39 的
+	// 私有 claim 基线随之增减），另建一个只用裸 scheduler 的联动器会让基线分叉。
 	// Second half of the two-stage binding: the production editor backend is installed
-	// once the loader and scheduler exist.
-	scheduleSlot.Bind(newScheduleEditorAdapter(loader, root, entries, scheduler, logger))
+	// once the loader and scheduler exist, and the same instance is retained for hot reload.
+	scheduleEditor := newScheduleEditorAdapter(loader, root, entries, scheduler, logger)
+	scheduleSlot.Bind(scheduleEditor)
 
-	logger.Info("重路径装配完成", "agents", len(agents.entries), "tools", registry.Names(),
+	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpConns))
 	return &heavyRuntime{
-		lock:         lock,
-		db:           db,
-		service:      service,
-		sessions:     sessions,
-		invocations:  invocations,
-		llmCalls:     llmCalls,
-		registry:     registry,
-		mcp:          mcpPool,
-		scheduler:    scheduler,
-		scheduleSlot: scheduleSlot,
+		lock:           lock,
+		db:             db,
+		service:        service,
+		runs:           runs,
+		sessions:       sessions,
+		invocations:    invocations,
+		llmCalls:       llmCalls,
+		registry:       registry,
+		mcp:            mcpPool,
+		scheduler:      scheduler,
+		scheduleSlot:   scheduleSlot,
+		scheduleEditor: scheduleEditor,
+		agents:         agents,
+		agentGate:      agentGate,
+		lifecycle:      lifecycle,
+		resourceGate:   resourceGate,
+		versions:       versions,
+		ops:            ops,
+		mcpRT:          mcpRT,
+		skills:         skills,
 		// US-9 追加的只读装配态：全部是本次装配里**已经算出来的值**的保留，不新增读取。
 		// US-9's read-only assembly state: values already computed here, merely retained.
 		cfg:      cfg,
 		entries:  entries,
 		mem:      memSvc,
 		mcpConns: mcpConns,
+		root:     root,
+		loader:   loader,
 	}, nil
 }
 
@@ -531,6 +644,11 @@ type heavyRuntime struct {
 	// service 是唯一运行入口。
 	service *core.AgentService
 
+	// runs 是运行账本的唯一实例：AgentService 写入、web.RunService 适配器读取，
+	// 保留句柄是为了让装配面可核"读面与写面确实是同一个仓储"。
+	// runs is the one run store shared by the writer and the web read port.
+	runs *storage.RunStore
+
 	// sessions 是会话仓储；命令面经只读端口消费它（`chat` 读回本轮消息、`session list`
 	// 列清单）——写路径只有 core 一条。
 	sessions *storage.SessionStore
@@ -564,6 +682,60 @@ type heavyRuntime struct {
 	// The two-stage slot for manage_schedule; kept only to make the binding visible.
 	scheduleSlot *tool.ScheduleEditorSlot
 
+	// scheduleEditor 是绑定在槽位上的生产适配器本身（**同一实例**）。配置热加载让
+	// 调度器增减 Agent / 对账任务时必须走它：适配器维护的私有 claim 基线随热加载
+	// 同步增减（约束 39），换一个只用裸 scheduler 的联动器会让基线分叉。
+	// scheduleEditor is the very adapter bound to the slot, shared with hot reload so
+	// the private claim baseline stays in step with the scheduler.
+	scheduleEditor *scheduleEditorAdapter
+
+	// watch 是 serve 打开的配置监听（只有 serve 赋值；其余重命令为 nil）。停机时
+	// **最先**关闭它：它会在回调里推进注册表并联动调度器，必须赶在调度器停止与库
+	// 关闭之前把最后一个防抖窗口收完（约束 22 的次序在此向前延长一格）。
+	// watch is the serve-time config watcher (nil for other heavy commands); it closes
+	// first so no reload callback can touch the scheduler after it stops.
+	watch *workspace.Watcher
+
+	// agents 是进程内唯一的 Agent 注册表（§3.1.20 / FR-22）：运行准入、管理台列表与
+	// 调度器读的是同一份不可变快照，热加载以整份替换发布新版本。
+	// The one in-process agent registry shared by admission, the console and the scheduler.
+	agents *agentRegistry
+
+	// agentGate 是 Agent 级读写锁表（约束 25）：准入持读锁、启停迁移与内容条件写持写锁，
+	// 三者必须是同一实例——保留句柄让装配面可核"确实只有这一份"。
+	// The per-agent gate shared by admission, lifecycle transitions and content edits.
+	agentGate *core.AgentGate
+
+	// lifecycle 是生命周期状态文件的读写面：准入经它现场重读（失败关闭），管理面经它
+	// 迁移；与 `agentGate` 同属一份共享组合。
+	// lifecycle is the state-file surface admission re-reads and the console transitions.
+	lifecycle *workspace.LifecycleStore
+
+	// resourceGate 是发布 / 准入共用的进程级闸门（约束 46）：T045 的运行资源解析持读锁、
+	// 资源发布持写锁。在此保留装配产物，确保全进程只有这一份实例。
+	// The process-wide publish/admission gate later tasks resolve resources under.
+	resourceGate *core.ResourceGate
+
+	// versions / ops 是两个管理侧仓储：基线、管理恢复与准入解析共用同一实例，保留句柄
+	// 让装配面可核"只有这一份"（与 runs / sessions 的保留口径相同）。
+	// versions and ops are the resource and management stores shared across the assembly.
+	versions *storage.ResourceStore
+	ops      *storage.ManagementStore
+
+	// mcpRT 是已发布 MCP 定义的只读运行期句柄（配置与连接两份名单）；skills 是技能库
+	// 句柄——准入解析、基线发布与发布版本快照共用同一实例。
+	// mcpRT and skills are the runtime handles shared by admission and the baseline.
+	mcpRT  *mcpRuntime
+	skills *workspace.SkillLibrary
+
+	// root 是工作区根（`.basalt`）：内容条件写的编辑器与候选校验器都按它打开根约束；
+	// loader 是装配期那个**唯一**的装载器实例——候选校验必须与热加载共用同一实例，
+	// 两者的 writeMu 才是同一把锁（内容写与全量 rescan 不得交错）。
+	// root is the workspace root; loader is the single loader instance shared with hot
+	// reload, so candidate validation and rescans serialize on the same write lock.
+	root   string
+	loader *workspace.AgentLoader
+
 	// 以下为 US-9 追加的只读装配态（均为既有局部值的保留，不新增读取）：
 	// US-9 retains the read-only assembly state computed above.
 	//
@@ -586,13 +758,18 @@ type heavyRuntime struct {
 	mcpConns []tool.MCPConnection
 }
 
-// Close 按**相反次序**释放：调度器 → MCP 连接池 → 数据库 → 实例锁（约束 22）。调度器
-// 先停：Stop 会在 70s 宽限内等待在途运行，库必须活到它收尾之后；随后池收子进程与会话，
-// 最后才关写池的使用者（库），锁等所有写入收尾之后才松开。每处失败并入同一条错误链，
-// 释放失败不得静默。Stop 幂等（sync.Once），与 Start 内部信号 watcher 并发调用安全。
-// Close releases in reverse order — scheduler, MCP pool, database, instance lock.
+// Close 按**相反次序**释放：配置监听 → 调度器 → MCP 连接池 → 数据库 → 实例锁
+// （约束 22）。监听最先关：它的回调会推进注册表并联动调度器，必须在调度器停止与库
+// 关闭之前把最后一个防抖窗口收完（关闭会等回调退出，幂等，与 ctx 取消并发安全）。
+// 调度器随后停：Stop 会在 70s 宽限内等待在途运行，库必须活到它收尾之后；随后池收
+// 子进程与会话，最后才关写池的使用者（库），锁等所有写入收尾之后才松开。每处失败
+// 并入同一条错误链，释放失败不得静默。
+// Close releases in reverse order — watcher, scheduler, MCP pool, database, lock.
 func (r *heavyRuntime) Close() error {
 	var errs []error
+	if r.watch != nil {
+		errs = append(errs, r.watch.Close())
+	}
 	if r.scheduler != nil {
 		r.scheduler.Stop()
 	}
@@ -620,70 +797,6 @@ func (r *heavyRuntime) sessionLister() cli.SessionLister { return sessionListerP
 // tools 把装配期注册池交给命令面的工具清单端口（`tool list` 消费）。
 // tools hands the assembly-time registry to the command surface's tool-listing port.
 func (r *heavyRuntime) tools() cli.ToolLister { return toolListerPort{registry: r.registry} }
-
-// agentSourcePort 是 `core.AgentSource` 的适配器（端口定义在消费方 core，实现落在装配层）：
-// 装配期装载出来的注册结果 + 工作区根 + 段一 / 快照装配器，回答运行入口的三个问题——
-// 在不在、目录在哪、这一跑的配置快照是什么。
-// agentSourcePort answers the run entry point's three questions: is it registered, where
-// does it live, and what is this run's frozen configuration snapshot.
-type agentSourcePort struct {
-	// root 是工作区根（`.basalt`）。
-	root string
-
-	// entries 只含**注册成功**的 Agent——未注册的目录不进运行面（准入判据只有这一份）。
-	// Only registered agents make it into the run face.
-	entries map[string]core.AgentEntry
-
-	// contexts 冻结运行级配置快照（读即所记：Profile 与段一正文出自同一次读取）。
-	contexts *workspace.ContextLoader
-}
-
-// 编译期断言：端口形状与适配器一旦对不上，在这里先红。
-// Compile-time assertion that the adapter still matches the consumer's port.
-var _ core.AgentSource = agentSourcePort{}
-
-// newAgentSource 从装载结果建运行面：未注册的条目在这里被挡在外面，运行入口因此不必再判
-// 一次注册态——判定只发生一次，读的是同一份登记结果。
-// newAgentSource keeps the registered entries only, so registration is judged exactly once.
-func newAgentSource(root string, entries []core.AgentEntry, logger *slog.Logger) agentSourcePort {
-	registered := make(map[string]core.AgentEntry, len(entries))
-	for _, entry := range entries {
-		if entry.Registered {
-			registered[entry.Name] = entry
-		}
-	}
-	return agentSourcePort{root: root, entries: registered, contexts: workspace.NewContextLoader(logger)}
-}
-
-// Exists 报告 Agent 是否已注册。
-// Exists reports whether the agent is registered.
-func (p agentSourcePort) Exists(name string) bool {
-	_, ok := p.entries[name]
-	return ok
-}
-
-// Dir 返回 Agent 目录的绝对路径；未知 Agent 返回空串——`ToolEnv.AgentDir` 的空值语义是
-// "无 Agent 上下文"，工具据此不放宽任何一格。
-// Dir returns the agent directory; an empty string means "no agent context", which tools
-// never widen access on.
-func (p agentSourcePort) Dir(name string) string {
-	if _, ok := p.entries[name]; !ok {
-		return ""
-	}
-	return filepath.Join(p.root, agentsDirName, name)
-}
-
-// Snapshot 冻结一次运行的配置快照（Profile / 段一正文 / 清单哈希出自同一次读取，读即所记）。
-// 签名里的 ctx 是端口形状；这一段是短读、没有取消点——取消留给模型调用与工具执行。
-// Snapshot freezes one run's configuration. The context is part of the port's shape; this
-// is a short read with no cancellation point of its own.
-func (p agentSourcePort) Snapshot(_ context.Context, name string, now time.Time) (*core.ConfigSnapshot, error) {
-	entry, ok := p.entries[name]
-	if !ok {
-		return nil, fmt.Errorf("agent %s 未注册——无配置可冻结（先看 profile list 的拒绝原因）", name)
-	}
-	return p.contexts.Snapshot(p.root, entry, now)
-}
 
 // Options 是包外取得重路径运行期的显式入参（评测基座 `evals` 的装配点，颗粒度文档 §3.1）。
 // 字段与 `App` 的私有面一一对应：包外只说清"从哪来、什么版本、什么时钟、谁来回答"——

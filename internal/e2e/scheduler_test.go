@@ -887,7 +887,11 @@ type executionEntry struct {
 func listExecutions(t *testing.T, addr, id string) []executionEntry {
 	t.Helper()
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("http://" + addr + "/api/v1/schedules/" + id + "/executions")
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/api/v1/schedules/"+id+"/executions", nil)
+	if err != nil {
+		t.Fatalf("组装 GET /schedules/%s/executions 请求失败: %v", id, err)
+	}
+	resp, err := client.Do(applyAdminAuth(req))
 	if err != nil {
 		t.Fatalf("GET /schedules/%s/executions 失败: %v", id, err)
 	}

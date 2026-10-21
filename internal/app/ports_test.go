@@ -51,7 +51,7 @@ func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 11, "11 张表随 schema.sql 建齐")
+	require.Len(t, tables, 18, "18 张表随 schema.sql（v2）建齐——v1 11 张 + US-11 新增 7 张")
 }
 
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**

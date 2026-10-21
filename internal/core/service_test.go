@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -854,4 +855,650 @@ func TestAgentService_Archive_WithoutSessionStore(t *testing.T) {
 
 	var unavailable *core.SessionGateUnavailableError
 	require.ErrorAs(t, svc.Archive(context.Background(), h.sessionID), &unavailable)
+}
+
+// —— US-11：生命周期门禁（图 F ③，约束 15）——
+// Lifecycle gate at admission (flow F ③, constraint 15).
+
+// fakeLifecycle 是状态文件端口的测试替身：读面可脚本化（active / disabled / archived /
+// 缺失 / 损坏），写面一律返回冲突——T017 只落读面，测试若意外走写路径应立刻显形。
+// fakeLifecycle scripts the read face (four states plus missing and corrupt) and refuses
+// every write: this task lands the read face only.
+type fakeLifecycle struct {
+	mu      sync.Mutex
+	state   core.AgentState
+	exists  bool
+	readErr error
+	reads   int
+	onRead  func()
+}
+
+// newFakeLifecycle 造一个"存在且为给定状态"的替身。
+// newFakeLifecycle builds an existing state file in the given state.
+func newFakeLifecycle(state core.AgentState) *fakeLifecycle {
+	return &fakeLifecycle{state: state, exists: true}
+}
+
+// setState 模拟另一次迁移改写状态文件（调用方负责持写锁）。
+// setState mimics another transition rewriting the file under the write lock.
+func (f *fakeLifecycle) setState(state core.AgentState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state = state
+}
+
+// readCount 是已发生的读取次数。
+// readCount reports how many reads happened.
+func (f *fakeLifecycle) readCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+// Read 按脚本返回状态；onRead 在返回前调用（用于探测与写锁的重叠）。
+// Read returns the scripted state; onRead runs before returning so tests can probe
+// overlap with the write lock.
+func (f *fakeLifecycle) Read(_ context.Context, agent string) (core.LifecycleRecord, bool, error) {
+	f.mu.Lock()
+	f.reads++
+	state, exists, err, hook := f.state, f.exists, f.readErr, f.onRead
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return core.LifecycleRecord{}, false, err
+	}
+	if !exists {
+		return core.LifecycleRecord{}, false, nil
+	}
+	return core.LifecycleRecord{
+		SchemaVersion: 1,
+		Agent:         agent,
+		State:         state,
+		Generation:    1,
+	}, true, nil
+}
+
+// Transition 不在读面范围内：返回冲突，避免测试掩盖"误走写路径"。
+// Transition is out of scope for the read face and reports a conflict.
+func (f *fakeLifecycle) Transition(context.Context, string, core.AgentState, int64, core.AgentState, string) (core.LifecycleRecord, error) {
+	return core.LifecycleRecord{}, core.ErrLifecycleConflict
+}
+
+// Bootstrap 不在读面范围内：返回冲突。
+// Bootstrap is out of scope for the read face and reports a conflict.
+func (f *fakeLifecycle) Bootstrap(context.Context, string, string) (core.LifecycleRecord, error) {
+	return core.LifecycleRecord{}, core.ErrLifecycleConflict
+}
+
+// Discard 不在读面范围内：返回冲突。
+// Discard is out of scope for the read face and reports a conflict.
+func (f *fakeLifecycle) Discard(context.Context, string, string) error {
+	return core.ErrLifecycleConflict
+}
+
+// assembleWithLifecycle 在与既有用例相同的假件上装一个带生命周期门禁的运行入口。
+// assembleWithLifecycle builds a second entry point over the shared fakes, wired with the
+// lifecycle port and the agent gate.
+func (h *loopHarness) assembleWithLifecycle(lifecycle core.LifecyclePort, gate *core.AgentGate) (*core.AgentService, *recordingStore) {
+	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store := newRecordingStore()
+	svc := core.NewAgentService(core.ServiceOptions{
+		Agents:    h.agents,
+		Client:    h.provider,
+		Messages:  store,
+		Runs:      store,
+		Snapshots: store,
+		Audit:     h.audit,
+		Memory:    h.memory,
+		Loop:      core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
+		Logger:    logger,
+		Now:       func() time.Time { return h.now },
+		Lifecycle: lifecycle,
+		Gate:      gate,
+	})
+	return svc, store
+}
+
+// TestAgentService_Lifecycle_ActiveAdmitsRun 守"只有 active 放行"：状态为 active 时一次
+// 运行正常完成，且状态文件在准入时被读了恰一次（不是从目录 / 索引推断）。
+// 逆改点：跳过门禁 → 本用例仍绿（无判别力），由其余五例提供反证；此处守正向路径。
+func TestAgentService_Lifecycle_ActiveAdmitsRun(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("好"))
+	lifecycle := newFakeLifecycle(core.AgentActive)
+	svc, store := h.assembleWithLifecycle(lifecycle, core.NewAgentGate())
+
+	res, err := svc.Run(ctx, h.req("在吗"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+	require.Equal(t, 1, lifecycle.readCount(), "准入必须在现场读状态文件一次")
+	require.Equal(t, 1, store.runsOf(), "放行后账本照常预写")
+	require.Equal(t, 1, h.provider.callCount())
+}
+
+// TestAgentService_Lifecycle_DisabledRejected 守"停用是硬门"：状态为 disabled 时运行被
+// 拒绝（409 AGENT_UNAVAILABLE），且发生在任何落痕之前——零快照、零账本、零模型调用。
+// 逆改点：把状态缓存成 active → 本用例红（运行开始落账）。
+func TestAgentService_Lifecycle_DisabledRejected(t *testing.T) {
+	h := newLoopHarness(t)
+	lifecycle := newFakeLifecycle(core.AgentDisabled)
+	svc, store := h.assembleWithLifecycle(lifecycle, core.NewAgentGate())
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Equal(t, core.AgentDisabled, unavailable.State)
+	require.Contains(t, err.Error(), "disabled")
+	require.Contains(t, err.Error(), "enable", "文案必须给出修复入口")
+
+	require.Zero(t, store.snapshotsOf(), "拒绝必须发生在快照落库之前")
+	require.Zero(t, store.runsOf(), "拒绝必须发生在账本预写之前")
+	require.Zero(t, h.provider.callCount(), "拒绝必须发生在模型调用之前")
+}
+
+// TestAgentService_Lifecycle_ArchivedRejected 守"归档同样是硬门"：任何入口（HTTP / CLI /
+// 调度）都经同一准入判定，归档态拒绝新运行。
+// 逆改点：只判 disabled → 本用例红。
+func TestAgentService_Lifecycle_ArchivedRejected(t *testing.T) {
+	h := newLoopHarness(t)
+	lifecycle := newFakeLifecycle(core.AgentArchived)
+	svc, store := h.assembleWithLifecycle(lifecycle, core.NewAgentGate())
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Equal(t, core.AgentArchived, unavailable.State)
+	require.Contains(t, err.Error(), "archived")
+	require.Zero(t, store.runsOf())
+}
+
+// TestAgentService_Lifecycle_MissingStateRejected 守"缺失 = 失败关闭"：状态文件不存在时
+// 拒绝新运行、同时记 ERROR；`errors.Is(err, fs.ErrNotExist)` 经 Unwrap 仍可判定（底层错误
+// 不进文案）。
+// 逆改点：把缺失读成 active（目录存在即放行）→ 本用例红。
+func TestAgentService_Lifecycle_MissingStateRejected(t *testing.T) {
+	h := newLoopHarness(t)
+	lifecycle := &fakeLifecycle{exists: false, readErr: fs.ErrNotExist}
+	svc, store := h.assembleWithLifecycle(lifecycle, core.NewAgentGate())
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Empty(t, unavailable.State, "缺失时没有已知状态")
+	require.True(t, errors.Is(err, fs.ErrNotExist), "底层错误必须经 Unwrap 保留")
+	require.Contains(t, err.Error(), "missing")
+	require.Contains(t, h.logs.String(), "level=ERROR", "缺失必须同时记 ERROR")
+	require.Contains(t, h.logs.String(), "生命周期状态文件缺失")
+	require.Zero(t, store.runsOf())
+}
+
+// TestAgentService_Lifecycle_CorruptStateRejected 守"损坏 = 失败关闭"：读取失败（校验和不符
+// 等）同样拒绝，不得回退为 active；损坏与缺失在文案上可区分。
+// 逆改点：吞掉读取错误按 active 放行 → 本用例红。
+func TestAgentService_Lifecycle_CorruptStateRejected(t *testing.T) {
+	h := newLoopHarness(t)
+	corrupt := errors.New("lifecycle checksum mismatch")
+	lifecycle := &fakeLifecycle{exists: false, readErr: corrupt}
+	svc, store := h.assembleWithLifecycle(lifecycle, core.NewAgentGate())
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Contains(t, err.Error(), "corrupt")
+	require.False(t, errors.Is(err, fs.ErrNotExist), "损坏不得被当成缺失")
+	require.True(t, errors.Is(err, corrupt), "原因链必须保留")
+	require.Contains(t, h.logs.String(), "level=ERROR")
+	require.Contains(t, h.logs.String(), "生命周期状态文件损坏")
+	require.Zero(t, store.runsOf())
+}
+
+// TestAgentService_Lifecycle_DisableDuringAdmission 守"准入读锁与启停写锁互斥"（011-race
+// 必需用例）：写者持写锁把状态改成 disabled 时，准入必须等锁后再读——读到的永远是完整
+// 的旧状态或新状态，不会与迁移交叠。
+// 逆改点：准入不取 AgentGate 读锁 → 读在写者临界区内发生，interleaved 置位，用例红。
+func TestAgentService_Lifecycle_DisableDuringAdmission(t *testing.T) {
+	h := newLoopHarness(t)
+	gate := core.NewAgentGate()
+	lifecycle := newFakeLifecycle(core.AgentActive)
+
+	var writerInside, interleaved atomic.Bool
+	lifecycle.onRead = func() {
+		if writerInside.Load() {
+			interleaved.Store(true)
+		}
+	}
+	svc, store := h.assembleWithLifecycle(lifecycle, gate)
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		unlock := gate.Lock(loopAgentName)
+		writerInside.Store(true)
+		lifecycle.setState(core.AgentDisabled)
+		close(locked)
+		<-release
+		writerInside.Store(false)
+		unlock()
+	}()
+	<-locked
+
+	runErr := make(chan error, 1)
+	go func() {
+		_, err := svc.Run(ctx, h.req("在吗"))
+		runErr <- err
+	}()
+
+	select {
+	case err := <-runErr:
+		t.Fatalf("停用写锁未释放时准入不得完成（err=%v）", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	err := <-runErr
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	require.Equal(t, core.AgentDisabled, unavailable.State, "等锁后必须读到迁移后的状态")
+	require.False(t, interleaved.Load(), "准入读状态不得与启停写锁交叠")
+	require.Equal(t, 1, lifecycle.readCount())
+	require.Zero(t, store.runsOf())
+}
+
+// —— 准入资源固定（T026：图 F ③ 的解析 → 清单 → 传仓储 → 释放）——
+
+// fakeRuntime 是准入固定的运行时视图：记释放次数（约束 46 的判据），并按名字发放
+// 准入固定的模型客户端（人工 review ② 缺陷 2：运行时必须真的参与路由）。
+// fakeRuntime records releases and hands out the pinned model client for its one name.
+type fakeRuntime struct {
+	mu                sync.Mutex
+	releases          int
+	admissions        int                 // 准入读锁的归还次数（ReleaseAdmission 或 Release 的连带归还）
+	admissionReturned bool                // 与生产实现的 sync.Once 同口径：读锁只能归还一次
+	provider          core.ProviderClient // 准入固定的客户端；nil = 该运行时没有可发放的入口
+	providerName      string              // 只对这一条名字发放（路由只查固定表，不推断）
+}
+
+// Provider 只对自己固定的名字发放客户端；其余一律 false（失败关闭的判据面）。
+func (r *fakeRuntime) Provider(name string) (core.ProviderClient, bool) {
+	if r.provider == nil || name != r.providerName {
+		return nil, false
+	}
+	return r.provider, true
+}
+
+// MCP 不在本用例的判据面内。
+func (r *fakeRuntime) MCP(string) (core.MCPHandle, bool) { return nil, false }
+
+// ReleaseAdmission 记一次准入读锁归还（与 Release 的连带归一分列两个计数面）。
+// 与生产实现同口径幂等：读锁已归还时不再计数（否则重复 RUnlock 会 panic）。
+func (r *fakeRuntime) ReleaseAdmission() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.admissionReturned {
+		return
+	}
+	r.admissionReturned = true
+	r.admissions++
+}
+
+// Release 幂等计数（同一实例被释放两次即可见）；按生产口径连带归还准入读锁。
+func (r *fakeRuntime) Release() {
+	r.mu.Lock()
+	r.releases++
+	r.mu.Unlock()
+	r.ReleaseAdmission()
+}
+
+// releaseCount 是已发生的释放次数。
+func (r *fakeRuntime) releaseCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.releases
+}
+
+// admissionReleaseCount 是已发生的准入读锁归还次数（ReleaseAdmission + Release 连带）。
+func (r *fakeRuntime) admissionReleaseCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.admissions
+}
+
+// fakeRunResources 是准入解析端口的假件：按脚本返回固定结果或错误，并把运行时挂进结果。
+// fakeRunResources scripts the resolution outcome and attaches the counting runtime.
+type fakeRunResources struct {
+	mu       sync.Mutex
+	resolved core.ResolvedResources
+	err      error
+	runtime  *fakeRuntime
+	calls    int
+}
+
+// Resolve 返回脚本结果；runtime 非 nil 时挂进结果（调用方负责释放）。
+func (f *fakeRunResources) Resolve(_ context.Context, _ core.AgentEntry) (core.ResolvedResources, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return core.ResolvedResources{}, f.err
+	}
+	resolved := f.resolved
+	if f.runtime != nil {
+		resolved.Runtime = f.runtime
+	}
+	return resolved, nil
+}
+
+// callCount 是已发生的解析次数。
+func (f *fakeRunResources) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// fakeSnapshotBuilder 是发布版本快照构建的假件：默认返回一份可跑的快照，可注入错误。
+// fakeSnapshotBuilder returns a runnable published-version snapshot unless an error is set.
+type fakeSnapshotBuilder struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+// Build 返回固定快照（哈希与工作副本不同——用例据此分辨"哪条来源胜出"）。
+func (b *fakeSnapshotBuilder) Build(_ context.Context, entry core.AgentEntry, _ core.ResolvedResources) (core.ConfigSnapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.calls++
+	if b.err != nil {
+		return core.ConfigSnapshot{}, b.err
+	}
+	return core.ConfigSnapshot{
+		AgentName:  entry.Name,
+		Hash:       "published-snapshot-hash",
+		Content:    "---\nname: demo\n---\n" + sectionOneStatic + "\n",
+		Manifest:   []core.ManifestEntry{{Path: "AGENT.md", SHA256: "d41d8cd98f00b204"}},
+		SectionOne: sectionOneStatic,
+		Profile: &core.Profile{
+			Name:     entry.Name,
+			Provider: core.ProviderRef{Name: "fake", Model: "fake-model"},
+			Tools:    []string{"read_file"},
+			Settings: core.Settings{MaxIterations: 10, MaxHistoryTurns: 20},
+		},
+	}, nil
+}
+
+// callCount 是已发生的构建次数。
+func (b *fakeSnapshotBuilder) callCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// sampleResolvedRefs 造一份最小解析结果（Provider + 一条 MCP），供清单构造用。
+// sampleResolvedRefs builds a minimal resolution for manifest construction.
+func sampleResolvedRefs() core.ResolvedResources {
+	return core.ResolvedResources{
+		Provider:   core.ResourceVersionRef{Name: "fake", VersionID: 1, VersionNo: 1, ContentHash: "aaa"},
+		MCPServers: []core.ResourceVersionRef{{Name: "files", VersionID: 2, VersionNo: 1, ContentHash: "bbb"}},
+	}
+}
+
+// assembleWithResources 在与既有用例相同的假件上装一个资源接线齐全的运行入口。
+// assembleWithResources wires all three resource ports over the shared fakes.
+func (h *loopHarness) assembleWithResources(resources core.RunResources, snapshots core.RunSnapshotBuilder) (*core.AgentService, *recordingStore) {
+	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store := newRecordingStore()
+	svc := core.NewAgentService(core.ServiceOptions{
+		Agents:       h.agents,
+		Client:       h.provider,
+		Messages:     store,
+		Runs:         store,
+		Snapshots:    store,
+		Audit:        h.audit,
+		Loop:         core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
+		Logger:       logger,
+		Now:          func() time.Time { return h.now },
+		Lifecycle:    newFakeLifecycle(core.AgentActive),
+		Gate:         core.NewAgentGate(),
+		Resources:    resources,
+		RunSnapshots: snapshots,
+	})
+	return svc, store
+}
+
+// TestAgentService_Resources_ManifestPassesThroughAndRuntimeReleased：资源接线后，准入固定的
+// 清单随 StartRun 交给仓储（FormatVersion 非零、状态取门禁读数、版本冻结），运行结束后
+// 运行时恰好释放一次（约束 46）。
+// TestAgentService_Resources_ManifestPassesThroughAndRuntimeReleased pins the manifest
+// hand-off and the single runtime release after FinishRun.
+func TestAgentService_Resources_ManifestPassesThroughAndRuntimeReleased(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("好"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	builder := &fakeSnapshotBuilder{}
+	svc, store := h.assembleWithResources(resources, builder)
+
+	res, err := svc.Run(ctx, h.req("在吗"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+	require.Equal(t, "published-snapshot-hash", res.ConfigHash, "资源接线后快照必须走发布版本构建")
+	require.Equal(t, 1, resources.callCount())
+	require.Equal(t, 1, builder.callCount())
+
+	manifest := store.lastManifest
+	require.Equal(t, 1, manifest.FormatVersion, "清单必须是正式形态（零值 = 未接线）")
+	require.Equal(t, string(core.AgentActive), manifest.AgentLifecycle, "清单状态取准入门禁的同一次读数")
+	require.Equal(t, "fake", manifest.Provider.Name)
+	require.Equal(t, "aaa", manifest.Provider.ContentHash)
+	require.NotEmpty(t, manifest.Hash, "清单必须带哈希")
+	require.Equal(t, manifest.Hash, res.ManifestHash, "RunResult 必须带准入清单哈希（契约 §1.1）")
+	require.Equal(t, 1, runtime.releaseCount(), "在途结束后运行时必须恰好释放一次")
+}
+
+// TestAgentService_Resources_AdmissionLeaseSpansStartRun（人工 review ② US-12 交接裁决）：
+// 准入读锁的租约必须延续到 **StartRun 成功之后**——账本与资源引用落库时必须仍持读锁，
+// 发布才插不进"版本已固定、引用未落库"的窗口；落库成功后由 ReleaseAdmission 归还，
+// 运行时本身活到运行结束。两个观察点夹出归还窗口：StartRun 记账前**未**归还（0），
+// 第一次模型调用时**已**归还（1）。逆改点：在 StartRun 之前归还 → 记账前读数非 0；
+// 拖到运行结束随 Release 一起归还 → 首次模型调用时读数仍为 0。两条各自变红。
+// The admission lease still held while StartRun persists the ledger (0 at StartRun), already
+// returned by the first model call (1) — the two observations bracket the release window.
+func TestAgentService_Resources_AdmissionLeaseSpansStartRun(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("好"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	svc, store := h.assembleWithResources(resources, &fakeSnapshotBuilder{})
+
+	var observedAtStartRun, observedAtFirstChat int
+	store.fakeStore.onStartRun = func() { observedAtStartRun = runtime.admissionReleaseCount() }
+	h.provider.hook = func(call int) {
+		if call == 0 {
+			observedAtFirstChat = runtime.admissionReleaseCount()
+		}
+	}
+
+	res, err := svc.Run(ctx, h.req("在吗"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+
+	require.Zero(t, observedAtStartRun, "StartRun 落库时准入读锁必须仍被租用（发布不得插进这个窗口）")
+	require.Equal(t, 1, observedAtFirstChat, "第一次模型调用时读锁必须已归还——不得拖到运行结束才随 Release 归还")
+	require.Equal(t, 1, runtime.admissionReleaseCount(), "StartRun 成功后读锁恰好归还一次")
+	require.Equal(t, 1, runtime.releaseCount(), "运行结束时运行时恰好释放一次（读锁不得重复归还）")
+}
+
+// TestAgentService_Resources_AdmissionLeaseReleasedOnStartRunFailure：StartRun 失败 →
+// 准入租约与运行时由 defer 的 Release **一并**归还（失败路径只有一个收尾入口），
+// 且失败按函数级 error 上报、不得静默开跑。
+// A failed StartRun returns the lease and the runtime through the same Release.
+func TestAgentService_Resources_AdmissionLeaseReleasedOnStartRunFailure(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, textResponse("不该被调用"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	svc, store := h.assembleWithResources(resources, &fakeSnapshotBuilder{})
+	store.fakeStore.startRunErr = errors.New("injected: ledger unavailable")
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	require.Error(t, err)
+	require.ErrorContains(t, err, "start run ledger row")
+
+	require.Equal(t, 1, runtime.admissionReleaseCount(), "失败路径必须归还准入读锁（经 Release）")
+	require.Equal(t, 1, runtime.releaseCount(), "失败路径必须归还运行时")
+	require.Zero(t, h.provider.callCount(), "账本失败不得开始模型调用")
+}
+
+// TestAgentService_Resources_PinnedClientServesModelCalls（人工 review ② 缺陷 2）：资源接线
+// 后模型调用**只走准入固定的客户端**——装配期的全局客户端一次都不得被调用。此前 Resolve
+// 返回的运行时只被释放、从未参与路由（复现读数 final="GLOBAL" global_calls=1
+// pinned_calls=0）。逆改点：env.llmClient 改回 s.opts.Client → 本用例红。
+// The pinned client serves every model call once resources are wired; the global
+// assembly-time client must never be consulted (human review ② defect 2).
+func TestAgentService_Resources_PinnedClientServesModelCalls(t *testing.T) {
+	h := newLoopHarness(t)
+	pinned := newFakeProvider(t)
+	pinned.onCall(0, textResponse("来自固定客户端"))
+	runtime := &fakeRuntime{provider: pinned, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	builder := &fakeSnapshotBuilder{}
+	svc, _ := h.assembleWithResources(resources, builder)
+
+	res, err := svc.Run(ctx, h.req("在吗"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+	require.Equal(t, "来自固定客户端", res.FinalText, "响应必须来自固定客户端")
+	require.Equal(t, 1, pinned.callCount(), "模型调用必须走准入固定的客户端")
+	require.Zero(t, h.provider.callCount(), "不得退回装配期的全局客户端（审计外的第二入口）")
+	require.Equal(t, "fake", pinned.request(0).Provider, "出站路由名取快照冻结的 Provider")
+}
+
+// TestAgentService_Resources_ToolEnvCarriesBoundSkillDirs（人工 review ② F1）：准入固定的技能
+// 发布目录必须随每次工具调用进入 ToolEnv——文件工具只按这份绑定放行读，策略层不自行推断
+// 版本。断言**排序后**的切片：map 遍历顺序随机，绑定面必须是可复核的稳定输入。逆改点：
+// `RunEnv.ToolEnv` 不填 SkillDirs → 本用例红（文件工具随即读不到发布的 L2/L3）。
+// The run-bound skill directories reach every tool call in a deterministic order.
+func TestAgentService_Resources_ToolEnvCarriesBoundSkillDirs(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":".basalt/versions/skills/pdf/2/SKILL.md"}`))
+	h.provider.onCall(1, textResponse("done"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resolved := sampleResolvedRefs()
+	resolved.SkillDirs = map[string]string{
+		"writer": ".basalt/versions/skills/writer/1",
+		"pdf":    ".basalt/versions/skills/pdf/2",
+	}
+	resources := &fakeRunResources{resolved: resolved, runtime: runtime}
+	svc, _ := h.assembleWithResources(resources, &fakeSnapshotBuilder{})
+
+	res, err := svc.Run(ctx, h.req("读技能"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+	require.Equal(t, []string{
+		".basalt/versions/skills/pdf/2",
+		".basalt/versions/skills/writer/1",
+	}, h.tools.executedEnv().SkillDirs, "绑定目录必须排序后原样进入 ToolEnv（map 遍历顺序随机）")
+	require.True(t, h.tools.executedEnv().RunBound,
+		"循环构造的 ToolEnv 必须显式标记 Run 上下文（F-04 B1：不从 RunID / 绑定推断）")
+}
+
+// TestAgentService_Resources_MissingPinnedClientFailsClosed：准入固定的映射表里没有该
+// Provider → 500 分类、零快照、零账本、零模型调用——不得退回全局客户端"照样能跑"
+// （人工 review ② 缺陷 2 的失败关闭面）。
+// A missing pinned client fails closed before any trace or model call.
+func TestAgentService_Resources_MissingPinnedClientFailsClosed(t *testing.T) {
+	h := newLoopHarness(t)
+	runtime := &fakeRuntime{} // 没有可发放的客户端
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	builder := &fakeSnapshotBuilder{}
+	svc, store := h.assembleWithResources(resources, builder)
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.ResourceUnavailableError
+	require.ErrorAs(t, err, &unavailable, "固定表缺条目必须走资源不可用分类")
+	require.Contains(t, err.Error(), "republish", "文案必须给出修复入口")
+	require.Zero(t, builder.callCount(), "拒绝必须发生在快照构建之前")
+	require.Zero(t, store.snapshotsOf(), "拒绝必须发生在快照落库之前")
+	require.Zero(t, store.runsOf(), "拒绝必须发生在账本预写之前")
+	require.Zero(t, h.provider.callCount(), "拒绝必须发生在模型调用之前")
+	require.Equal(t, 1, runtime.releaseCount(), "固定成功后的失败分支必须归还运行时")
+}
+
+// TestAgentService_Resources_ResolveFailureIsResourceUnavailable：解析失败 → 500 分类
+// （*ResourceUnavailableError，文案给修复入口），且发生在任何落痕之前；没有固定成功的
+// 运行时，因此也没有释放。
+// TestAgentService_Resources_ResolveFailureIsResourceUnavailable maps a resolution failure
+// to the fixed 500 category before any trace is written.
+func TestAgentService_Resources_ResolveFailureIsResourceUnavailable(t *testing.T) {
+	h := newLoopHarness(t)
+	runtime := &fakeRuntime{}
+	resources := &fakeRunResources{err: errors.New("version 7 of provider openai-main not found"), runtime: runtime}
+	builder := &fakeSnapshotBuilder{}
+	svc, store := h.assembleWithResources(resources, builder)
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	var unavailable *core.ResourceUnavailableError
+	require.ErrorAs(t, err, &unavailable, "资源不可用必须走固定分类，不得混进调用方错误")
+	require.Contains(t, err.Error(), "republish", "文案必须给出修复入口")
+	require.NotContains(t, err.Error(), "C:\\", "底层错误原文（可能含路径）不得进响应文案")
+
+	require.Zero(t, store.snapshotsOf(), "拒绝必须发生在快照落库之前")
+	require.Zero(t, store.runsOf(), "拒绝必须发生在账本预写之前")
+	require.Zero(t, h.provider.callCount(), "拒绝必须发生在模型调用之前")
+	require.Zero(t, runtime.releaseCount(), "解析失败没有固定出运行时，不得凭空释放")
+	require.Zero(t, builder.callCount())
+}
+
+// TestAgentService_Resources_PartialWiringFailsClosed：只有解析端口、缺快照构建或生命周期
+// 端口 → 装配错误（函数级 error），零落痕——不得用半套来源拼出一份看似完整的账。
+// TestAgentService_Resources_PartialWiringFailsClosed refuses a partial resource wiring.
+func TestAgentService_Resources_PartialWiringFailsClosed(t *testing.T) {
+	h := newLoopHarness(t)
+	runtime := &fakeRuntime{}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+
+	// 缺快照构建：Lifecycle 有、RunSnapshots 无（半套接线必须失败关闭）。
+	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store := newRecordingStore()
+	svc := core.NewAgentService(core.ServiceOptions{
+		Agents:    h.agents,
+		Client:    h.provider,
+		Messages:  store,
+		Runs:      store,
+		Snapshots: store,
+		Loop:      core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
+		Logger:    logger,
+		Now:       func() time.Time { return h.now },
+		Lifecycle: newFakeLifecycle(core.AgentActive),
+		Resources: resources,
+	})
+
+	_, err := svc.Run(ctx, h.req("在吗"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "run resources are configured without", "装配错误必须点名缺的那一半")
+	require.Zero(t, resources.callCount(), "接线不全时不得开始解析")
+	require.Zero(t, store.runsOf())
+	require.Zero(t, runtime.releaseCount())
+}
+
+// TestAgentService_Resources_FixedRuntimeReleasedOnSnapshotFailure：解析成功后快照构建失败 →
+// Run failed（既有快照失败口径），**固定出的运行时仍须释放**——失败分支不得漏运行时。
+// TestAgentService_Resources_FixedRuntimeReleasedOnSnapshotFailure still releases the
+// pinned runtime when the published snapshot build fails.
+func TestAgentService_Resources_FixedRuntimeReleasedOnSnapshotFailure(t *testing.T) {
+	h := newLoopHarness(t)
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	builder := &fakeSnapshotBuilder{err: errors.New("published skill SKILL.md hash mismatch")}
+	svc, store := h.assembleWithResources(resources, builder)
+
+	res, err := svc.Run(ctx, h.req("在吗"))
+	require.NoError(t, err, "运行期失败归 RunResult.Status，不归函数级 error")
+	require.Equal(t, core.StatusFailed, res.Status)
+	require.Contains(t, res.Reason, "hash mismatch")
+	require.Equal(t, 1, runtime.releaseCount(), "固定成功后的失败分支必须归还运行时")
+	require.Zero(t, store.runsOf(), "快照失败发生在账本预写之前")
+	require.Zero(t, h.provider.callCount())
 }

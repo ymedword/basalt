@@ -78,11 +78,72 @@ type RunResult struct {
 	Iterations int       // 实际消耗的 ReAct 轮次（= 已收到模型响应的轮次数）
 	ToolCalls  int       // 实际执行的工具调用次数
 	ConfigHash string    // 本次运行使用的配置快照版本
-	Reason     string    // 非正常终止的可读原因（limit_reached / failed 时必填）
+	// ManifestHash 是本次运行准入清单的哈希（契约 §1.1）；旧版未记录时为空。
+	// ManifestHash is the admission manifest hash; empty when the run predates it.
+	ManifestHash string
+	Reason       string // 非正常终止的可读原因（limit_reached / failed 时必填）
 }
 
+// AgentUnavailableError 表示生命周期门禁拒绝新运行（契约 run-and-errors §9 的
+// 409 `AGENT_UNAVAILABLE`）：状态文件缺失 / 损坏 / 状态非 active 一律失败关闭——
+// **不得**回退为"目录存在即 active"。
+//
+// 文案纪律：`Reason` 是自产分类（含修复入口），**不得**拼接底层错误原文——workspace 的
+// 读取错误可能带绝对路径；底层错误只经 `Unwrap` 供 `errors.Is` / `errors.As` 分类与排障。
+// AgentUnavailableError is the lifecycle gate's refusal (409 AGENT_UNAVAILABLE). The
+// message is self-authored (category plus repair hint); the underlying error is reachable
+// only through Unwrap so absolute paths never leak into the text.
+type AgentUnavailableError struct {
+	Name   string     // Agent 名（原样带回，便于排障）
+	State  AgentState // 已知状态（disabled / archived）；缺失或损坏时为空
+	Reason string     // 自产分类与修复入口（不含底层错误原文）
+	Cause  error      // 原因链：只经 Unwrap 暴露
+}
+
+// Error 返回自产的拒绝文案。
+// Error renders the self-authored refusal text.
+func (e *AgentUnavailableError) Error() string {
+	reason := e.Reason
+	if reason == "" {
+		reason = "lifecycle state " + string(e.State)
+	}
+	return "agent unavailable: " + e.Name + " (" + reason + ")"
+}
+
+// Unwrap 暴露原因链：`errors.Is(err, fs.ErrNotExist)` 因此仍可判定"文件缺失"。
+// Unwrap exposes the cause so a missing state file stays recognizable via errors.Is.
+func (e *AgentUnavailableError) Unwrap() error { return e.Cause }
+
+// ResourceUnavailableError 表示准入时无法固定已发布的资源版本（契约 run-and-errors
+// §9 的 500 `INTERNAL`）：Provider / MCP / 技能的版本指针缺失、内容与发布哈希不符、
+// 运行时装配失败等——一律失败关闭，**不得**退回工作副本继续跑（那等于绕过发布闸门）。
+//
+// 文案纪律同 AgentUnavailableError：`Reason` 含修复入口，底层错误只经 `Unwrap`。
+// ResourceUnavailableError reports that admission could not pin the published resource
+// versions (500 INTERNAL). It fails closed rather than falling back to work copies; the
+// cause is exposed only through Unwrap so internal paths never reach the client.
+type ResourceUnavailableError struct {
+	Name   string // Agent 名（原样带回，便于排障）
+	Reason string // 自产分类与修复入口（不含底层错误原文）
+	Cause  error  // 原因链：只经 Unwrap 暴露
+}
+
+// Error 返回自产的拒绝文案。
+// Error renders the self-authored refusal text.
+func (e *ResourceUnavailableError) Error() string {
+	reason := e.Reason
+	if reason == "" {
+		reason = "published resource version unavailable"
+	}
+	return "resource unavailable: " + e.Name + " (" + reason + ")"
+}
+
+// Unwrap 暴露原因链，供上层 `errors.Is` / `errors.As` 分类与排障。
+// Unwrap exposes the cause for classification and troubleshooting.
+func (e *ResourceUnavailableError) Unwrap() error { return e.Cause }
+
 // RunEnv 是循环内部持有的运行环境：由 AgentService 依 RunRequest 与配置快照构造，值传递。
-// 五个导出字段是契约 §1.1 的字段字**逐字**（不增不改）；三个非导出字段是冻结签名下的
+// 六个导出字段是契约 §1.1 的字段字**逐字**（不增不改）；三个非导出字段是冻结签名下的
 // 注入位——`client()` 与 `ToolEnv(ctx, runID)` 都不收"客户端 / Agent 目录 / 记忆文本"参数，
 // 而这三样恰恰只有构造方知道；它们不是契约字段，也不进任何出站形态。
 // RunEnv is the run environment held by the loop. Its exported fields are the contract
@@ -91,12 +152,25 @@ type RunResult struct {
 type RunEnv struct {
 	Req      RunRequest
 	Snapshot *ConfigSnapshot // 本次运行冻结的配置快照（agent_name + hash + content；中途改盘不换配置）
-	Session  *Session        // 会话历史读写；无状态调用时为仅内存的临时会话
-	Budget   Budget          // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（契约 §6）
-	ToolSet  []string        // 本轮可用工具名（Profile 的 tools 解析结果，空 = 无工具）
+	// Resources 是准入时固定的资源版本清单（与 runs 行同事务写入）；未接线的装配路径
+	// 为空指针（历史运行读作"未记录"，**不补造**）。循环不按它路由——路由走快照与
+	// ToolSet；它是这次运行的资源账随运行携带的只读副本（约束 46：经 RunEnv 显式传递，
+	// 不经 context）。
+	Resources *RunResourceManifest
+	Session   *Session // 会话历史读写；无状态调用时为仅内存的临时会话
+	Budget    Budget   // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（契约 §6）
+	ToolSet   []string // 本轮可用工具名（Profile 的 tools 解析结果，空 = 无工具）
 
-	llmClient ProviderClient // 唯一的模型调用入口（实现为 ProviderService：路由 + 两阶段审计在其内）
-	agentDir  string         // Agent 目录绝对路径（ToolEnv.AgentDir）；空串 = 无 Agent 上下文
+	// llmClient 是唯一的模型调用入口：资源接线后取**准入固定的** ProviderService 视图
+	// （路由表只含本次 Provider，两阶段审计仍在其内）；未接线时取装配期的全局服务。
+	// llmClient is the sole model-call entry: the pinned ProviderService view when
+	// resources are wired, the assembly-time global service otherwise.
+	llmClient ProviderClient
+	agentDir  string // Agent 目录绝对路径（ToolEnv.AgentDir）；空串 = 无 Agent 上下文
+	// skillDirs 是准入固定的技能发布目录（`ResolvedResources.SkillDirs` 的稳定快照）——
+	// 文件工具只在这里列出的版本目录内读；未接资源时为 nil，版本树整体不可读。
+	// skillDirs freezes the admitted skill version directories for the file tools.
+	skillDirs []string
 
 	// memory 是本次运行生效的核心区文本（运行开始时读一次、运行内冻结）——**不是契约字段、
 	// 不进任何出站形态**；经段 2 拼进 `Prompt.System` 的是它的内容，不是这个字段本身。
@@ -129,6 +203,16 @@ type ToolEnv struct {
 	AgentDir       string        // Agent 目录绝对路径；空串 = 无上下文
 	Timeout        time.Duration // 本次调用生效的超时（工具默认 / Profile 覆盖 / 剩余预算三者取最小，见契约 §6）
 	MaxOutputBytes int           // 输出截断上限
+	// SkillDirs 是本次 Run 准入绑定的技能发布目录（`storage_path` 字面量）——文件工具据此
+	// 只读放行**当前 Run 绑定的版本**；空 = 无绑定（版本树一律拒）。
+	// SkillDirs carries the run-bound skill version directories to the file tools.
+	SkillDirs []string
+	// RunBound 标明本次调用来自一次 Run（由循环构造 ToolEnv 时置 true）。文件工具据此拒绝
+	// 技能工作副本（`.basalt/skills`）——Run 只读准入时固定的发布版本，工作副本的后续修改
+	// 不属于本次运行。**不得**由 RunID 是否为空或 SkillDirs 是否为空推断（F-04 B1）。
+	// RunBound marks environments built by a run: file tools must not fall back to the
+	// skill work copies, even when the run binds no skill at all.
+	RunBound bool
 }
 
 // NewRunID 生成运行标识：`<渠道>-<毫秒时间戳>-<6 位 base36 小写>`（契约 §5）。
@@ -197,6 +281,10 @@ func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
 		AgentDir:       e.agentDir,
 		Timeout:        e.toolTimeout(ctx),
 		MaxOutputBytes: e.maxOutputBytes(),
+		SkillDirs:      e.skillDirs,
+		// 循环构造的 ToolEnv 一律属于一次 Run（F-04 B1）：标记与是否绑定技能无关。
+		// Every environment built here belongs to a run, with or without skill bindings.
+		RunBound: true,
 	}
 }
 

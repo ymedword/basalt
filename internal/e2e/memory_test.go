@@ -877,10 +877,12 @@ func lastToolContent(req map[string]any) string {
 	return last
 }
 
-// configWithAddr 在最小可装载配置上追加 http.addr（serve 监听回环端口）。
-// configWithAddr appends an http.addr section to the minimal loadable configuration.
+// configWithAddr 在最小可装载配置上追加 http 段：监听回环端口 + 管理认证（T025 起
+// serve 没有管理认证配置就拒绝启动）。
+// configWithAddr appends the http section (listen address plus management auth);
+// serve refuses to start without the auth block since T025.
 func configWithAddr(baseURL, addr string) string {
-	return configWithProvider(baseURL) + "http:\n  addr: " + addr + "\n"
+	return configWithProvider(baseURL) + "http:\n  addr: " + addr + "\n" + adminAuthSection()
 }
 
 // freeLoopbackAddr 取一个当前空闲的回环地址（监听 0 端口后立刻释放）。
@@ -926,9 +928,14 @@ func postInvoke(addr, agent, message string) (invokeReading, error) {
 		return invokeReading{}, err
 	}
 	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Post(
-		"http://"+addr+"/api/v1/agents/"+agent+"/invoke",
-		"application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest(
+		http.MethodPost, "http://"+addr+"/api/v1/agents/"+agent+"/invoke",
+		bytes.NewReader(payload))
+	if err != nil {
+		return invokeReading{}, fmt.Errorf("组装 invoke 请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(applyAdminAuth(req))
 	if err != nil {
 		return invokeReading{}, fmt.Errorf("调用 invoke 失败: %w", err)
 	}

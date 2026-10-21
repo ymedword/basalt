@@ -159,6 +159,11 @@ func doWebRequest(ctx context.Context, method, addr, path, body string, header m
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// T025 起除健康检查外的端点一律要认证：夹具默认带上管理面 token，个别用例
+	// 仍可通过 header 覆盖（例如将来的缺凭据 / 错凭据场景）。
+	// Every non-public endpoint requires authentication since T025; the token is set
+	// centrally and an explicit header entry may still override it.
+	req.Header.Set("Authorization", "Bearer "+e2eAdminToken)
 	for key, value := range header {
 		req.Header.Set(key, value)
 	}
@@ -695,7 +700,7 @@ func testWebListenAddr(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
 	model := newFakeModel(t)
-	h.writeConfig(t, configWithProvider(model.URL()))
+	h.writeConfig(t, configWithAdminAuth(model.URL()))
 
 	p := startGrouped(t, h, fixtureEnv(), "serve")
 	defer p.stop(t)
@@ -954,10 +959,18 @@ func testWebCrossOrigin(t *testing.T) {
 		map[string]string{"Sec-Fetch-Site": "cross-site"})
 	requireWebStatus(t, resp, http.StatusForbidden, "BAD_REQUEST", webOriginDenied, "Sec-Fetch-Site 跨站")
 
+	// US-11 起管理面在跨源中间件之后还有 Origin 守卫：受保护端点的 Origin 必须
+	// 完整匹配允许列表，因此带恶意 Origin 的 GET 现在是 403（US-9 阶段该处只拦写、
+	// GET 放行；FR3 收紧为全端点判定）。文案由认证层给固定文案，不回命中规则。
+	// Since US-11 the auth guard rejects any non-allowlisted Origin on protected
+	// endpoints, so the evil-origin GET is now 403 instead of open.
 	resp = webRequest(t, addr, http.MethodGet, "/api/v1/sessions/"+sess.SessionID, "", evil)
-	requireWebStatus(t, resp, http.StatusOK, "OK", "", "跨源 GET")
+	requireWebStatus(t, resp, http.StatusForbidden, "FORBIDDEN", "管理面请求被拒绝", "跨源 GET")
 	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("GET 不得回 ACAO 头，实际 %q", got)
+	}
+	if resp.HasData {
+		t.Fatalf("403 不应带 data：%s", resp.Raw)
 	}
 
 	// 同源写请求放行：Origin 必须与请求 Host 完全一致。

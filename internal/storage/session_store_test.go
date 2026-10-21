@@ -385,7 +385,7 @@ func TestSessionStore_ListSessionsOrdersByLastActive(t *testing.T) {
 	db := openTempDB(t)
 	store := NewSessionStore(db)
 
-	sessions, err := store.ListSessions(ctx)
+	sessions, err := store.ListSessions(ctx, core.SessionFilter{})
 	require.NoError(t, err, "空库不是错误")
 	require.Empty(t, sessions)
 
@@ -398,7 +398,7 @@ func TestSessionStore_ListSessionsOrdersByLastActive(t *testing.T) {
 	require.NoError(t, store.AppendMessage(ctx, "cli-newest0000000000", storeRun,
 		core.Message{Role: core.RoleAssistant, Content: "二"}))
 
-	sessions, err = store.ListSessions(ctx)
+	sessions, err = store.ListSessions(ctx, core.SessionFilter{})
 	require.NoError(t, err)
 	require.Len(t, sessions, 3)
 	require.Equal(t,
@@ -445,4 +445,148 @@ func TestSessionStore_StatelessCallWritesNoMessages(t *testing.T) {
 	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
 		core.Message{Role: core.RoleUser, Content: "有状态"}))
 	require.Equal(t, 1, countMessageRows(t, db, storeSession))
+}
+
+// seedProfiledSession 建一条指定画像的夹具会话行：画像过滤用例需要不同的
+// `profile_name`，而共用的 seedStoreSession 固定写 `demo`。
+// seedProfiledSession seeds one session row with an explicit profile name.
+func seedProfiledSession(t *testing.T, store *SessionStore, id, profile string, at time.Time) {
+	t.Helper()
+	require.NoError(t, store.UpsertSession(context.Background(), core.SessionRecord{
+		ID:           id,
+		ProfileName:  profile,
+		Channel:      "web",
+		UserID:       "u",
+		CreatedAt:    at,
+		LastActiveAt: at,
+	}))
+}
+
+// TestSessionStore_ListSessionsFiltersByAgent —— `ListSessions(ctx, filter)` 的 agent 维：
+// 精确等值过滤、空字段不过滤、不存在的画像给空切片而不是错误。对应模块卡 §3.1.24
+// 的 session_store 行与 §3.2.2 的「过滤」增补。
+// TestSessionStore_ListSessionsFiltersByAgent pins the agent filter dimension.
+func TestSessionStore_ListSessionsFiltersByAgent(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewSessionStore(db)
+
+	seedProfiledSession(t, store, "web-demo", "demo", fixedMessageTime)
+	seedProfiledSession(t, store, "web-ops", "ops-agent", fixedMessageTime.Add(time.Hour))
+
+	got, err := store.ListSessions(ctx, core.SessionFilter{Agent: "ops-agent"})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, "web-ops", got[0].ID)
+
+	none, err := store.ListSessions(ctx, core.SessionFilter{Agent: "ghost"})
+	require.NoError(t, err, "查无此画像不是错误")
+	require.Empty(t, none)
+
+	all, err := store.ListSessions(ctx, core.SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, all, 2, "空 agent 不过滤")
+}
+
+// TestSessionStore_ListSessionsFiltersByStatus —— status 维按 `archived_at` 空 / 非空
+// 过滤；非法取值在 SQL 之前被拒（失败关闭：绝不退化成"不过滤"把归档行混进 active）。
+// TestSessionStore_ListSessionsFiltersByStatus pins the status dimension and the
+// fail-closed rejection of any other value.
+func TestSessionStore_ListSessionsFiltersByStatus(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewSessionStore(db)
+
+	seedProfiledSession(t, store, "web-live", "demo", fixedMessageTime)
+	seedProfiledSession(t, store, "web-closed", "demo", fixedMessageTime.Add(time.Hour))
+	require.NoError(t, store.ArchiveSession(ctx, "web-closed", fixedMessageTime.Add(2*time.Hour)))
+
+	active, err := store.ListSessions(ctx, core.SessionFilter{Status: "active"})
+	require.NoError(t, err)
+	require.Len(t, active, 1)
+	require.Equal(t, "web-live", active[0].ID)
+	require.Equal(t, "active", active[0].Status)
+
+	archived, err := store.ListSessions(ctx, core.SessionFilter{Status: "archived"})
+	require.NoError(t, err)
+	require.Len(t, archived, 1)
+	require.Equal(t, "web-closed", archived[0].ID)
+	require.Equal(t, "archived", archived[0].Status)
+	require.NotNil(t, archived[0].ArchivedAt, "归档行必须带回归档时刻")
+	require.Equal(t, fixedMessageTime.Add(2*time.Hour), *archived[0].ArchivedAt)
+
+	// 两维组合：同一画像内按状态收窄。
+	combined, err := store.ListSessions(ctx, core.SessionFilter{Agent: "demo", Status: "archived"})
+	require.NoError(t, err)
+	require.Len(t, combined, 1)
+	require.Equal(t, "web-closed", combined[0].ID)
+
+	_, err = store.ListSessions(ctx, core.SessionFilter{Status: "closed"})
+	require.Error(t, err, "非法状态必须拒绝，不得静默按不过滤处理")
+	require.Contains(t, err.Error(), "非法状态过滤")
+}
+
+// TestSessionStore_ListSessionsDerivesStatusFromArchivedAt —— 状态**只**从 `archived_at`
+// 派生，不读 `status` 列另造第二真值：两列人为矛盾时，以 `archived_at` 为准
+// （契约 SessionSummary 的口径）。
+// TestSessionStore_ListSessionsDerivesStatusFromArchivedAt proves the derived status
+// follows archived_at even when the legacy status column disagrees.
+func TestSessionStore_ListSessionsDerivesStatusFromArchivedAt(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewSessionStore(db)
+
+	// 行 1：归档过（两列一致），随后把 status 列改回 active —— archived_at 仍非空，
+	// 列表必须报 archived。
+	seedProfiledSession(t, store, "web-a", "demo", fixedMessageTime)
+	require.NoError(t, store.ArchiveSession(ctx, "web-a", fixedMessageTime.Add(time.Hour)))
+	_, err := db.write.ExecContext(ctx,
+		`UPDATE sessions SET status = 'active' WHERE session_id = ?`, "web-a")
+	require.NoError(t, err)
+
+	// 行 2：status 列写着 archived，但 archived_at 为空 —— 必须报 active。
+	seedProfiledSession(t, store, "web-b", "demo", fixedMessageTime.Add(2*time.Hour))
+	_, err = db.write.ExecContext(ctx,
+		`UPDATE sessions SET status = 'archived' WHERE session_id = ?`, "web-b")
+	require.NoError(t, err)
+
+	got, err := store.ListSessions(ctx, core.SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	byID := map[string]core.SessionRecord{got[0].ID: got[0], got[1].ID: got[1]}
+	require.Equal(t, "archived", byID["web-a"].Status, "archived_at 非空 → archived，与 status 列无关")
+	require.NotNil(t, byID["web-a"].ArchivedAt)
+	require.Equal(t, "active", byID["web-b"].Status, "archived_at 为空 → active，与 status 列无关")
+	require.Nil(t, byID["web-b"].ArchivedAt)
+}
+
+// TestSessionStore_ListSessionsUnfilteredKeepsExistingShape —— 空过滤器仍是命令面的全量
+// 口径：归档行也在结果里（各自带派生状态），排序与既有 SQL 逐字一致。这条守住
+// "`session list` 的既有调用不因新增过滤参数而变语义"。
+// TestSessionStore_ListSessionsUnfilteredKeepsExistingShape keeps the command surface's
+// full-list semantics intact: archived rows included, same ordering as before.
+func TestSessionStore_ListSessionsUnfilteredKeepsExistingShape(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewSessionStore(db)
+
+	base := fixedMessageTime
+	seedProfiledSession(t, store, "web-a", "demo", base)
+	seedProfiledSession(t, store, "web-b", "demo", base.Add(time.Hour))
+	seedProfiledSession(t, store, "web-c", "ops-agent", base.Add(2*time.Hour))
+	require.NoError(t, store.ArchiveSession(ctx, "web-b", base.Add(3*time.Hour)))
+
+	got, err := store.ListSessions(ctx, core.SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, got, 3, "空过滤器 = 全量（含归档行）")
+	require.Equal(t, []string{"web-c", "web-b", "web-a"},
+		[]string{got[0].ID, got[1].ID, got[2].ID},
+		"排序仍是 last_active_at DESC, session_id")
+	require.Equal(t, "active", got[0].Status)
+	require.Equal(t, "archived", got[1].Status)
+	require.Equal(t, "active", got[2].Status)
+	for _, rec := range got {
+		require.Contains(t, []string{"active", "archived"}, rec.Status,
+			"每一行都必须填派生状态（不得留空）")
+	}
 }

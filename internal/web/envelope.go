@@ -33,11 +33,22 @@ const (
 	codeUnsupportedType = "UNSUPPORTED_TYPE" // 契约保留；本 US 不产生
 	codeNotFound        = "NOT_FOUND"
 	codeSessionBusy     = "SESSION_BUSY"
+	codeAgentBusy       = "AGENT_BUSY"
 	codeTooManyRuns     = "TOO_MANY_RUNS"
 	codeLimitReached    = "LIMIT_REACHED"
 	codeTimeout         = "TIMEOUT"
 	codeNotConfigured   = "NOT_CONFIGURED" // 契约保留；US-12 作者模型
 	codeInternal        = "INTERNAL"
+
+	// US-11 新增（模块卡 §6.3 固定集合；`IMPORT_REJECTED` 属 US-12，本 US 不产生）。
+	// US-11 additions; IMPORT_REJECTED belongs to US-12.
+	codeUnauthorized       = "UNAUTHORIZED"
+	codeForbidden          = "FORBIDDEN"
+	codeEditUnsupported    = "EDIT_UNSUPPORTED"
+	codeAgentUnavailable   = "AGENT_UNAVAILABLE"
+	codeConflict           = "CONFLICT"
+	codePreconditionFailed = "PRECONDITION_FAILED"
+	codeAuthRateLimited    = "AUTH_RATE_LIMITED"
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自
@@ -160,6 +171,17 @@ func (s *Server) writeOK(w http.ResponseWriter, data any) {
 	})
 }
 
+// writeOKMessage 写 200 成功信封并替换 message——两个使用方：取消端点（契约
+// openapi /runs/{run_id}/cancel 要求用 message 说明"尚未结束 / 无需取消"）与
+// unknown 操作详情（提示"结果未查证、不得盲目重做"）。两者都只改提示，不改 data。
+// writeOKMessage is the 200-with-custom-message exit: cancellation and the unknown
+// operation hint both change the message only, never the data.
+func (s *Server) writeOKMessage(w http.ResponseWriter, data any, message string) {
+	s.writeEnvelope(w, http.StatusOK, Envelope{
+		Code: codeOK, Message: message, Data: data, Timestamp: s.timestamp(),
+	})
+}
+
 // writeResult 写 200 但 code 非 OK 的唯一场景（LIMIT_REACHED）：message 由 RunView
 // 里保留的原始 reason 组装，点名可调配置键；data 原样作为载荷。
 // writeResult is the only 200-with-non-OK-code exit; the message names the budget key.
@@ -185,13 +207,21 @@ func (s *Server) writeError(w http.ResponseWriter, status int, code, message str
 	})
 }
 
+// writeEnvelope 是 Server 侧的落盘入口；认证闸门没有 *Server，也走下面的包级
+// writeEnvelope——**不得**出现第二份信封序列化或第二套 Content-Type 约定。
+// The Server-side entry delegates to the package-level serializer so the auth guard
+// can share it; a second envelope writer would be a second contract.
+func (s *Server) writeEnvelope(w http.ResponseWriter, status int, env Envelope) {
+	writeEnvelope(w, status, env, s.logger())
+}
+
 // writeEnvelope 是唯一落盘点：Content-Type 固定、编码失败记 ERROR 并退回 500 信封。
 // writeEnvelope is the only serialization point; an encoding failure logs and falls
 // back to a 500 envelope rather than writing a half-formed body.
-func (s *Server) writeEnvelope(w http.ResponseWriter, status int, env Envelope) {
+func writeEnvelope(w http.ResponseWriter, status int, env Envelope, logger *slog.Logger) {
 	raw, err := json.Marshal(env)
 	if err != nil {
-		s.logger().Error("写响应信封：编码失败", "error", err, "status", status)
+		logger.Error("写响应信封：编码失败", "error", err, "status", status)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"code":"INTERNAL","message":"服务器内部错误"}`))
@@ -201,7 +231,7 @@ func (s *Server) writeEnvelope(w http.ResponseWriter, status int, env Envelope) 
 	w.WriteHeader(status)
 	if _, err := w.Write(raw); err != nil {
 		// 连接已断是客户端行为，不是服务端故障；留 WARN 便于排障（不写第二份响应）。
-		s.logger().Warn("写响应体失败", "error", err)
+		logger.Warn("写响应体失败", "error", err)
 	}
 }
 

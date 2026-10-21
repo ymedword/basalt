@@ -18,7 +18,7 @@ import (
 // SupportedSchemaVersion is the schema version this binary targets; it is the
 // first version-record anchor and the production value of the target parameter
 // threaded through OpenWritable, Bootstrap, OpenReadOnly and Migrate.
-const SupportedSchemaVersion = 1
+const SupportedSchemaVersion = 2
 
 // schemaFileName 是建表脚本在 fs.FS 里的路径——契约文件的嵌入副本。
 // schemaFileName is the path of the schema script inside the injected fs.FS.
@@ -33,11 +33,11 @@ const migrationsDir = "migrations"
 // schemaFS 是随二进制嵌入的建表脚本与迁移目录。
 // schemaFS is the embedded schema script plus the migrations directory.
 //
-// 嵌入清单里列 migrations 目录本身：本 US 无增量文件，目录里只有 .gitkeep 占位。
-// 前缀 all: 是必需的——go:embed 默认忽略以 . / _ 开头的文件，不加前缀时"目录里
-// 没有可嵌入文件"会直接编译报错（实测：pattern migrations: cannot embed
+// 嵌入清单里列 migrations 目录本身（US-11 起含 0002 增量文件；此前只有 .gitkeep
+// 占位）。前缀 all: 是必需的——go:embed 默认忽略以 . / _ 开头的文件，不加前缀时
+// "目录里没有可嵌入文件"会直接编译报错（实测：pattern migrations: cannot embed
 // directory migrations: contains no embeddable files）。有了这一行，后续 US 把
-// 0002_*.sql 放进目录即被发现，无需再改本声明。
+// 0003_*.sql 放进目录即被发现，无需再改本声明。
 // The all: prefix is required: the placeholder is a dotfile, which plain
 // embedding skips — and a directory with no embeddable file fails to compile.
 //

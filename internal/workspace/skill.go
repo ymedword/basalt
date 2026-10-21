@@ -95,6 +95,39 @@ func skillCardPath(name string) string {
 	return path.Join(skillLibraryPrefix, name, skillDefinitionFile)
 }
 
+// skillCardLine 渲染一条 L1 卡片行（含中文冒号、全角括号与结尾换行）——**唯一**渲染点：
+// 段一注入用它与 l1_hash 计算用它是同一份字节（颗粒度文档约束 32），两处不得各写一份。
+// skillCardLine renders one L1 card line; section-one rendering and l1_hash hashing
+// share this exact byte sequence.
+func skillCardLine(name, description, cardPath string) string {
+	return "- " + name + "：" + description + "（" + cardPath + "）\n"
+}
+
+// skillCardFields 从 SKILL.md 原始字节解析卡片要素：frontmatter 围栏缺失（或未闭合）
+// 按字段缺失处理（回落目录名 + 空 description）；围栏在但解析失败 → 返回错误
+// （作者缺陷不得静默降级成空卡片）。
+// skillCardFields parses the card elements from the raw SKILL.md bytes; a missing
+// fence degrades to defaults, a malformed fence is an error.
+func skillCardFields(raw []byte, fallbackName string) (name, description string, err error) {
+	front, _, splitErr := splitFrontmatter(raw)
+	if splitErr != nil {
+		if errors.Is(splitErr, errNoFrontmatterFence) || errors.Is(splitErr, errOpenFrontmatterFence) {
+			return fallbackName, "", nil
+		}
+		return "", "", splitErr
+	}
+
+	var dto skillFrontmatterDTO
+	if err := yaml.Unmarshal(front, &dto); err != nil {
+		return "", "", err
+	}
+	name = fallbackName
+	if declared := strings.TrimSpace(dto.Name); declared != "" {
+		name = declared
+	}
+	return name, strings.TrimSpace(dto.Description), nil
+}
+
 // missingSkill 按声明顺序找**第一个没有实体**的技能名（全有 → 空串）。规则 5 只判
 // 「有实体」：目录缺失、缺 SKILL.md、SKILL.md 是目录，三种都算没有实体。
 //
@@ -163,22 +196,12 @@ func skillCardFor(lib *os.Root, name string) (skillCard, error) {
 		raw:          raw,
 	}
 
-	front, _, err := splitFrontmatter(raw)
+	cardName, description, err := skillCardFields(raw, name)
 	if err != nil {
-		if errors.Is(err, errNoFrontmatterFence) || errors.Is(err, errOpenFrontmatterFence) {
-			return card, nil
-		}
 		return skillCard{}, fmt.Errorf("解析技能定义 %s: %s", rel, frontmatterErrorSummary(err))
 	}
-
-	var dto skillFrontmatterDTO
-	if err := yaml.Unmarshal(front, &dto); err != nil {
-		return skillCard{}, fmt.Errorf("解析技能定义 %s: %s", rel, frontmatterErrorSummary(err))
-	}
-	if declared := strings.TrimSpace(dto.Name); declared != "" {
-		card.name = declared
-	}
-	card.description = strings.TrimSpace(dto.Description)
+	card.name = cardName
+	card.description = description
 	return card, nil
 }
 

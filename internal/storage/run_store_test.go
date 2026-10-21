@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strconv"
 	"testing"
 	"time"
@@ -73,7 +74,7 @@ func TestRunStore_StartRunInsertsRunningRow(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("cli")
-	require.NoError(t, store.StartRun(ctx, rec))
+	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusRunning), row.Status, "起始态由仓储固定写 running")
@@ -98,7 +99,7 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("web")
-	require.NoError(t, store.StartRun(ctx, rec))
+	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 
 	finished := fixedStart.Add(90 * time.Second)
 	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished))
@@ -111,9 +112,12 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	require.Equal(t, finished.UnixMilli(), row.FinishedAt.Int64)
 	require.Equal(t, fixedStart.UnixMilli(), row.StartedAt, "起始时刻不被终态改写")
 
-	// 非正常终止：reason 落文本。
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusLimitReached, "工具调用次数超限", 3, 50, finished))
-	again := readRunRow(t, db, rec.RunID)
+	// 非正常终止：reason 落文本（另一行——同一行的第二次 Finish 归幂等用例，见 K7）。
+	limited := startRow("web")
+	limited.RunID = "web-1776000000123-limit1"
+	require.NoError(t, store.StartRun(ctx, limited, core.RunResourceManifest{}))
+	require.NoError(t, store.FinishRun(ctx, limited.RunID, core.StatusLimitReached, "工具调用次数超限", 3, 50, finished))
+	again := readRunRow(t, db, limited.RunID)
 	require.Equal(t, string(core.StatusLimitReached), again.Status)
 	require.Equal(t, "工具调用次数超限", again.Reason.String)
 	require.Equal(t, 50, again.ToolCalls)
@@ -131,31 +135,37 @@ func TestRunStore_CloseRunningLeavesTerminalRowsUntouched(t *testing.T) {
 	// 两种终态各一行 + 一行仍 running + 一行无状态（空 session）仍 running。
 	completed := startRow("cli")
 	completed.RunID = "cli-1776000000123-comple"
-	require.NoError(t, store.StartRun(ctx, completed))
+	require.NoError(t, store.StartRun(ctx, completed, core.RunResourceManifest{}))
 	require.NoError(t, store.FinishRun(ctx, completed.RunID, core.StatusCompleted, "", 1, 0, fixedStart))
 
 	cancelled := startRow("cli")
 	cancelled.RunID = "cli-1776000000123-cancel"
-	require.NoError(t, store.StartRun(ctx, cancelled))
+	require.NoError(t, store.StartRun(ctx, cancelled, core.RunResourceManifest{}))
 	require.NoError(t, store.FinishRun(ctx, cancelled.RunID, core.StatusCancelled, "context canceled", 1, 0, fixedStart))
 
 	stale := startRow("scheduler")
 	stale.RunID = "scheduler-1776000000123-stale0"
-	require.NoError(t, store.StartRun(ctx, stale))
+	require.NoError(t, store.StartRun(ctx, stale, core.RunResourceManifest{}))
 
 	stateless := startRow("web")
 	stateless.RunID = "web-1776000000123-statle"
 	stateless.SessionID = ""
-	require.NoError(t, store.StartRun(ctx, stateless))
+	require.NoError(t, store.StartRun(ctx, stateless, core.RunResourceManifest{}))
 
-	running, err := store.listRunning(ctx)
+	running, err := listRunningRunIDs(ctx, db.write)
 	require.NoError(t, err)
 	require.Len(t, running, 2, "扫描面只出仍为 running 的行（空会话的无状态运行也算）")
 
 	closedAt := fixedStart.Add(5 * time.Minute)
 	const reason = "进程中断（启动时发现未完成的运行）"
-	n, err := store.closeRunning(ctx, db.write, reason, closedAt)
-	require.NoError(t, err)
+	n := 0
+	for _, runID := range running {
+		closed, err := closeRunInTransaction(ctx, db.write, runID, closedAt)
+		require.NoError(t, err)
+		if closed {
+			n++
+		}
+	}
 	require.Equal(t, 2, n, "恰收尾两行仍 running 的运行")
 
 	// 已结束的两行**原样保留**（状态、原因、起始时刻都不动）。
@@ -177,10 +187,16 @@ func TestRunStore_CloseRunningLeavesTerminalRowsUntouched(t *testing.T) {
 	}
 
 	// 幂等：连跑第二次零变化（恢复扫描可随时重跑）。
-	again, err := store.closeRunning(ctx, db.write, reason, closedAt.Add(time.Minute))
-	require.NoError(t, err)
+	again := 0
+	for _, runID := range running {
+		closed, err := closeRunInTransaction(ctx, db.write, runID, closedAt.Add(time.Minute))
+		require.NoError(t, err)
+		if closed {
+			again++
+		}
+	}
 	require.Zero(t, again, "第二次收尾没有可收的行")
-	left, err := store.listRunning(ctx)
+	left, err := listRunningRunIDs(ctx, db.write)
 	require.NoError(t, err)
 	require.Empty(t, left)
 }
@@ -229,7 +245,7 @@ func TestRunStore_TimestampsAreUnixMilli(t *testing.T) {
 	start := time.Date(2026, 10, 16, 8, 30, 0, 987*int(time.Millisecond), time.UTC)
 	rec := startRow("admin")
 	rec.StartedAt = start
-	require.NoError(t, store.StartRun(ctx, rec))
+	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 
 	finish := start.Add(1500 * time.Millisecond)
 	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusFailed, "模型调用失败", 1, 0, finish))
@@ -291,15 +307,436 @@ func TestRunStore_TriggerDerivesFromChannel(t *testing.T) {
 		"admin":     triggerManual,
 	} {
 		rec := startRow(channel)
-		require.NoError(t, store.StartRun(ctx, rec), "渠道 %s", channel)
+		require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}), "渠道 %s", channel)
 		require.Equal(t, want, readRunRow(t, db, rec.RunID).Trigger, "渠道 %s 的 trigger", channel)
 	}
 
-	err := store.StartRun(ctx, startRow("email"))
+	err := store.StartRun(ctx, startRow("email"), core.RunResourceManifest{})
 	require.Error(t, err, "未映射的渠道不得建行")
 	require.Contains(t, err.Error(), "email", "错误必须点名渠道")
 
 	var count int
 	require.NoError(t, db.read.QueryRowContext(ctx, `SELECT count(*) FROM runs`).Scan(&count))
 	require.Equal(t, 4, count, "拒绝的渠道零落痕")
+}
+
+// ---- 运行资源账（约束 18 / 19，K7 / K8） ------------------------------------
+
+// runManifestFixture 是资源账用例的夹具：一 Provider、两 MCP、一技能，版本都已落库。
+// 清单由准入构造器产出（带哈希），与真实准入路径同形。
+// runManifestFixture seeds one provider, two MCP servers and one skill version, then
+// builds the admission manifest the same way the real admission path does.
+type runManifestFixture struct {
+	manifest core.RunResourceManifest
+	resolved core.ResolvedResources
+	versions []core.ResourceVersion
+}
+
+// seedRunManifest 落库四条资源版本并返回可准入的清单（生命周期 active）。
+// 版本行的外键要求管理操作先存在——真实路径由基线 / US-12 的 BeginOperation 提供。
+// seedRunManifest inserts the version rows (their FK requires an operation row first)
+// and returns a manifest that admission would accept.
+func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
+	t.Helper()
+	ctx := context.Background()
+	seedOperation(t, db, "op-run-manifest")
+	store := NewResourceStore(db)
+
+	provider, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:provider", "op-run-manifest", 0))
+	require.NoError(t, err)
+	browser, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:           core.ResourceMCPServer,
+		ResourceID:     "browser",
+		ContentHash:    "sha256:mcp-browser",
+		DefinitionYAML: "name: browser\ncommand: npx\n",
+		CreatedAt:      opNow.UnixMilli(),
+		OperationID:    "op-run-manifest",
+	})
+	require.NoError(t, err)
+	filesystem, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:           core.ResourceMCPServer,
+		ResourceID:     "filesystem",
+		ContentHash:    "sha256:mcp-filesystem",
+		DefinitionYAML: "name: filesystem\ncommand: npx\n",
+		CreatedAt:      opNow.UnixMilli(),
+		OperationID:    "op-run-manifest",
+	})
+	require.NoError(t, err)
+	skill, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:         core.ResourceSkill,
+		ResourceID:   "summarize",
+		ContentHash:  "sha256:skill-summarize",
+		ManifestJSON: `[{"path":"SKILL.md","sha256":"sha256:skill-file","size":12}]`,
+		StoragePath:  ".basalt/versions/skills/summarize/1",
+		CreatedAt:    opNow.UnixMilli(),
+		OperationID:  "op-run-manifest",
+	})
+	require.NoError(t, err)
+
+	refOf := func(v core.ResourceVersion) core.ResourceVersionRef {
+		return core.ResourceVersionRef{
+			Name:        v.ResourceID,
+			VersionID:   v.ID,
+			VersionNo:   v.VersionNo,
+			ContentHash: v.ContentHash,
+		}
+	}
+	// MCP 故意乱序给出：清单必须在构造时规范化，引用行落库顺序不得依赖调用方顺序。
+	resolved := core.ResolvedResources{
+		Provider:   refOf(provider),
+		MCPServers: []core.ResourceVersionRef{refOf(filesystem), refOf(browser)},
+		Skills: []core.SkillVersionRef{{
+			ResourceVersionRef: refOf(skill),
+			Files: []core.FileHash{{
+				Path:   "SKILL.md",
+				SHA256: "sha256:skill-file",
+				Size:   12,
+			}},
+		}},
+	}
+	manifest, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	require.NoError(t, err)
+	return runManifestFixture{
+		manifest: manifest,
+		resolved: resolved,
+		versions: []core.ResourceVersion{provider, browser, filesystem, skill},
+	}
+}
+
+// manifestRow 是 run_resource_manifests 一行的判卷形态。
+// manifestRow is the assertion shape of one manifest row.
+type manifestRow struct {
+	FormatVersion  int
+	ManifestHash   string
+	AgentLifecycle string
+	SnapshotJSON   string
+	CreatedAt      int64
+}
+
+// readManifestRow 按 run_id 读回清单行（读池判卷，与 run_query.go 同源）。
+// readManifestRow reads the manifest row back through the read pool.
+func readManifestRow(t *testing.T, db *DB, runID string) manifestRow {
+	t.Helper()
+	var row manifestRow
+	err := db.read.QueryRowContext(context.Background(),
+		`SELECT format_version, manifest_hash, agent_lifecycle_state, snapshot_json, created_at
+		   FROM run_resource_manifests WHERE run_id = ?`, runID).
+		Scan(&row.FormatVersion, &row.ManifestHash, &row.AgentLifecycle, &row.SnapshotJSON, &row.CreatedAt)
+	require.NoError(t, err)
+	return row
+}
+
+// runRefRow 是 run_resource_refs 一行的判卷形态（released_at 用 Null 形态判"未释放"）。
+// runRefRow is the assertion shape of one reference row.
+type runRefRow struct {
+	Kind        string
+	ResourceID  string
+	VersionID   int64
+	ContentHash string
+	ReleasedAt  sql.NullInt64
+}
+
+// readRunRefRows 按 run_id 读回引用行，按 (kind, id) 排序以得到稳定断言序。
+// readRunRefRows reads the reference rows in a stable (kind, id) order.
+func readRunRefRows(t *testing.T, db *DB, runID string) []runRefRow {
+	t.Helper()
+	rows, err := db.read.QueryContext(context.Background(),
+		`SELECT resource_kind, resource_id, version_id, content_hash, released_at
+		   FROM run_resource_refs WHERE run_id = ?
+		  ORDER BY resource_kind, resource_id`, runID)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	var out []runRefRow
+	for rows.Next() {
+		var row runRefRow
+		require.NoError(t, rows.Scan(&row.Kind, &row.ResourceID, &row.VersionID,
+			&row.ContentHash, &row.ReleasedAt))
+		out = append(out, row)
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// requireNoRunTrace 断言被拒绝的准入**零落痕**：runs / 清单 / 引用三表都没有该 run_id。
+// requireNoRunTrace asserts a refused admission left no trace in any of the three tables.
+func requireNoRunTrace(t *testing.T, db *DB, runID string) {
+	t.Helper()
+	ctx := context.Background()
+	var runs, manifests, refs int
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM runs WHERE run_id = ?`, runID).Scan(&runs))
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_manifests WHERE run_id = ?`, runID).Scan(&manifests))
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_refs WHERE run_id = ?`, runID).Scan(&refs))
+	require.Zero(t, runs, "整笔回滚：runs 不得留下半行")
+	require.Zero(t, manifests, "整笔回滚：清单不得留下半行")
+	require.Zero(t, refs, "整笔回滚：引用不得留下半行")
+}
+
+// rehashManifest 重算清单哈希（改过内容的夹具必须重算才可能通过哈希校验）。
+// rehashManifest re-derives the hash after a fixture is mutated on purpose.
+func rehashManifest(t *testing.T, m *core.RunResourceManifest) {
+	t.Helper()
+	hash, err := core.HashManifest(*m)
+	require.NoError(t, err)
+	m.Hash = hash
+}
+
+// TestRunStore_StartRunWithoutManifestWritesOnlyTheRow —— 零清单（FormatVersion == 0）
+// 表示装配未接线：只写运行行，**不伪造**清单行与引用（历史运行如实读作"未记录"）。
+// TestRunStore_StartRunWithoutManifestWritesOnlyTheRow writes the run row alone for a zero
+// manifest, so the run reads back as unrecorded rather than fabricated.
+func TestRunStore_StartRunWithoutManifestWritesOnlyTheRow(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+
+	rec := startRow("cli")
+	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusRunning), row.Status)
+
+	var manifests, refs int
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_manifests WHERE run_id = ?`, rec.RunID).Scan(&manifests))
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_refs WHERE run_id = ?`, rec.RunID).Scan(&refs))
+	require.Zero(t, manifests, "零清单不得写出清单行（假账会被读成事实）")
+	require.Zero(t, refs, "零清单不得写出资源引用")
+}
+
+// TestRunStore_StartRunWritesRunManifestAndRefs —— 约束 18 的正向判据：
+// 运行行、清单行与全部引用一次落库；清单哈希可被读侧重算复现；引用一律未释放。
+// TestRunStore_StartRunWritesRunManifestAndRefs pins the single-transaction
+// admission write: run row, manifest row and every reference commit together.
+func TestRunStore_StartRunWritesRunManifestAndRefs(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	rec := startRow("web")
+	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusRunning), row.Status, "准入写 running（由 SQL 固定）")
+	require.Equal(t, rec.ConfigHash, row.ConfigHash.String, "config_hash 保持 ConfigSnapshot 原义")
+
+	m := readManifestRow(t, db, rec.RunID)
+	require.Equal(t, fx.manifest.FormatVersion, m.FormatVersion)
+	require.Equal(t, fx.manifest.Hash, m.ManifestHash)
+	require.Equal(t, string(core.AgentActive), m.AgentLifecycle)
+	require.Equal(t, rec.StartedAt.UnixMilli(), m.CreatedAt)
+
+	var parsed core.RunResourceManifest
+	require.NoError(t, json.Unmarshal([]byte(m.SnapshotJSON), &parsed))
+	require.Equal(t, fx.manifest, parsed, "快照 JSON 必须逐字段还原准入清单")
+	gotHash, err := core.HashManifest(parsed)
+	require.NoError(t, err)
+	require.Equal(t, m.ManifestHash, gotHash, "读侧重算哈希必须与列值一致（run_query 同一口径）")
+
+	refs := readRunRefRows(t, db, rec.RunID)
+	require.Len(t, refs, 4, "Provider + 两个 MCP + 一个技能各一条引用")
+	require.Equal(t, []string{
+		"mcp_server/browser",
+		"mcp_server/filesystem",
+		"model_connection/openai",
+		"skill/summarize",
+	}, []string{
+		refs[0].Kind + "/" + refs[0].ResourceID,
+		refs[1].Kind + "/" + refs[1].ResourceID,
+		refs[2].Kind + "/" + refs[2].ResourceID,
+		refs[3].Kind + "/" + refs[3].ResourceID,
+	}, "引用集合与清单一致（种类 × 名称）")
+
+	byKey := make(map[string]core.ResourceVersion, len(fx.versions))
+	for _, v := range fx.versions {
+		byKey[string(v.Kind)+"/"+v.ResourceID] = v
+	}
+	for _, ref := range refs {
+		version, ok := byKey[ref.Kind+"/"+ref.ResourceID]
+		require.True(t, ok, "引用 %s/%s 必须来自夹具版本", ref.Kind, ref.ResourceID)
+		require.Equal(t, version.ID, ref.VersionID, "引用固定的是版本行 id")
+		require.Equal(t, version.ContentHash, ref.ContentHash)
+		require.False(t, ref.ReleasedAt.Valid, "准入刚写下的引用一律未释放")
+	}
+}
+
+// TestRunStore_StartRunRollsBackOnMissingVersion —— 约束 18 的反向判据：
+// 任一引用写不进去（版本行不存在）→ 整笔回滚，三表零落痕（零 Run、零引用）。
+// TestRunStore_StartRunRollsBackOnMissingVersion pins the all-or-nothing
+// admission: a missing version row rolls back the run and the manifest too.
+func TestRunStore_StartRunRollsBackOnMissingVersion(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	broken := fx.manifest
+	broken.Provider.VersionID = 999999 // 不存在的版本行
+	rehashManifest(t, &broken)         // 内容合法、哈希自洽——失败只能来自外键
+
+	rec := startRow("cli")
+	err := store.StartRun(ctx, rec, broken)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "预写运行资源引用", "失败点是被外键拒绝的引用行")
+	require.Contains(t, err.Error(), "model_connection/openai", "错误必须点名是哪条引用")
+	requireNoRunTrace(t, db, rec.RunID)
+}
+
+// TestRunStore_StartRunRejectsTamperedHash —— 哈希是派生值：内容被改而
+// 哈希未重算的清单在写侧就被拒绝，不落到读侧才被发现"账是坏的"。
+// TestRunStore_StartRunRejectsTamperedHash refuses a manifest whose
+// content no longer matches its recorded hash.
+func TestRunStore_StartRunRejectsTamperedHash(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	tampered := fx.manifest
+	tampered.Skills[0].Files[0].SHA256 = "sha256:tampered" // 故意不重算哈希
+
+	rec := startRow("cli")
+	err := store.StartRun(ctx, rec, tampered)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "哈希与内容不一致")
+	requireNoRunTrace(t, db, rec.RunID)
+}
+
+// TestRunStore_StartRunRejectsNonActiveLifecycle —— 清单里只可能出现
+// active（schema 注释与 §3.4）：停用 / 归档的 Agent 根本不该走到准入写库这一步。
+// TestRunStore_StartRunRejectsNonActiveLifecycle refuses a manifest frozen
+// under any state other than active.
+func TestRunStore_StartRunRejectsNonActiveLifecycle(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	disabled, err := core.BuildRunResourceManifest(core.AgentDisabled, fx.resolved)
+	require.NoError(t, err, "构造器允许冻结非启用态——拒绝发生在写侧")
+
+	rec := startRow("cli")
+	err = store.StartRun(ctx, rec, disabled)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "生命周期状态必须是 active")
+	requireNoRunTrace(t, db, rec.RunID)
+}
+
+// TestRunStore_FinishRunReleasesRefsInSameTransaction —— 约束 19 的正向判据：终态与
+// 引用释放一起提交，且释放按 run_id 收窄——共用同一批版本的另一个 Run 不受波及。
+// TestRunStore_FinishRunReleasesRefsInSameTransaction pins the same-transaction release,
+// scoped to the run that actually transitioned.
+func TestRunStore_FinishRunReleasesRefsInSameTransaction(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	rec := startRow("web")
+	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	other := startRow("web")
+	other.RunID = "web-1776000000123-other1"
+	require.NoError(t, store.StartRun(ctx, other, fx.manifest),
+		"同一批版本可被多个 Run 同时引用（引用表主键是 run_id + 资源）")
+
+	finished := fixedStart.Add(2 * time.Minute)
+	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished))
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusCompleted), row.Status)
+	require.Equal(t, finished.UnixMilli(), row.FinishedAt.Int64)
+
+	released := readRunRefRows(t, db, rec.RunID)
+	require.Len(t, released, 4)
+	for _, ref := range released {
+		require.True(t, ref.ReleasedAt.Valid, "终态的 Run 不得留着未释放引用（%s/%s）",
+			ref.Kind, ref.ResourceID)
+		require.Equal(t, finished.UnixMilli(), ref.ReleasedAt.Int64, "释放时刻与终态同一时刻")
+	}
+
+	for _, ref := range readRunRefRows(t, db, other.RunID) {
+		require.False(t, ref.ReleasedAt.Valid,
+			"释放只属于本次收尾的 Run——%s/%s 不得被连带释放", ref.Kind, ref.ResourceID)
+	}
+}
+
+// TestRunStore_FinishRunRollsBackWhenReleaseFails —— 约束 19 的反向判据：引用释放失败
+// 时终态转换一起回滚（同一事务），运行保持 running 等下次收口，不会出现"已结束但仍占着版本"。
+// TestRunStore_FinishRunRollsBackWhenReleaseFails proves the status flip and the release
+// commit or roll back as one unit.
+func TestRunStore_FinishRunRollsBackWhenReleaseFails(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	rec := startRow("cli")
+	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+
+	_, err := db.write.ExecContext(ctx, `CREATE TRIGGER fail_run_ref_release
+	    BEFORE UPDATE ON run_resource_refs
+	    BEGIN SELECT RAISE(ABORT, '注入的引用释放失败'); END`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := db.write.ExecContext(context.Background(),
+			`DROP TRIGGER IF EXISTS fail_run_ref_release`)
+		require.NoError(t, err)
+	})
+
+	err = store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 0, fixedStart.Add(time.Minute))
+	require.Error(t, err, "引用释放失败必须如实上抛")
+	require.Contains(t, err.Error(), "释放运行资源引用")
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusRunning), row.Status,
+		"引用释放失败 → 终态转换一起回滚（同一事务）")
+	require.False(t, row.FinishedAt.Valid)
+	for _, ref := range readRunRefRows(t, db, rec.RunID) {
+		require.False(t, ref.ReleasedAt.Valid, "回滚后引用仍未释放：%s/%s", ref.Kind, ref.ResourceID)
+	}
+}
+
+// TestRunStore_FinishRunDoesNotOverwriteTerminalState —— K7（约束 19）：同一行的第二次
+// Finish 是幂等成功——不覆盖已判定的终态、不改原因与计数（注 8）。
+// TestRunStore_FinishRunDoesNotOverwriteTerminalState: a second Finish is idempotent
+// success and never re-judges the terminal row.
+func TestRunStore_FinishRunDoesNotOverwriteTerminalState(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+
+	rec := startRow("web")
+	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	first := fixedStart.Add(90 * time.Second)
+	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, first))
+
+	// 迟到的失败写（并发收尾 / 重复取消）：必须有守卫，且按幂等成功返回。
+	late := first.Add(30 * time.Second)
+	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCancelled, "迟到的取消", 9, 9, late),
+		"已终态的行 → 幂等成功，不报错也不覆盖")
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得被改口")
+	require.False(t, row.Reason.Valid, "已写下的原因（此处为 NULL）不得被改")
+	require.Equal(t, 2, row.Iterations, "终态计数不得被迟到写入覆盖")
+	require.Equal(t, 1, row.ToolCalls)
+	require.Equal(t, first.UnixMilli(), row.FinishedAt.Int64, "终态时刻保持首次判定")
+}
+
+// TestRunStore_FinishRunMissingRowIsError —— 0 行影响分两种：行存在 = 幂等成功；行不存在
+// = **如实报错**——账本行缺失说明启动纪律被绕过，不得被"更新成功"掩盖。
+// TestRunStore_FinishRunMissingRowIsError treats a missing ledger row as a hard error.
+func TestRunStore_FinishRunMissingRowIsError(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+
+	err := store.FinishRun(ctx, "web-1776000000123-ghost", core.StatusFailed, "", 0, 0, fixedStart)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "账本行不存在")
 }

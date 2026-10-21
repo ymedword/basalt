@@ -5,6 +5,9 @@
 /bin/
 *.exe
 
+# 前端依赖目录（构建期依赖；dist 构建产物仍随源码提交，见约束 42）
+assets/console/node_modules/
+
 # 本地环境文件（凭证一律走 ${ENV_VAR}，明文不得落盘——万一写下也绝不入库）
 *.local.env
 .env

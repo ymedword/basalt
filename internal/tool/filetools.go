@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -102,9 +103,11 @@ func (t *ReadFileTool) Execute(ctx context.Context, env core.ToolEnv, input json
 	}
 	target := resolveToolPath(t.root, env.AgentDir, args.Path)
 	err = t.policy.Check(ctx, core.Action{
-		Type:   core.ActionFileRead,
-		Target: actionTarget(t.root, target),
-		Agent:  env.AgentName,
+		Type:      core.ActionFileRead,
+		Target:    actionTarget(t.root, target),
+		Agent:     env.AgentName,
+		SkillDirs: env.SkillDirs,
+		RunBound:  env.RunBound,
 	})
 	if err != nil {
 		return core.Result{}, err
@@ -242,9 +245,9 @@ func (t *ListDirTool) Description() string {
 // InputSchema returns the inline schema, pinned verbatim by tests.
 func (t *ListDirTool) InputSchema() json.RawMessage { return json.RawMessage(listDirInputSchema) }
 
-// Execute 列目录：判定 → 投影 → 读一层。条目按名字排序由 os.ReadDir 保证（标准库契约），
-// 不额外重排——多一处排序就多一处与平台读数脱钩的机会。
-// Execute lists one projected level; name ordering comes from os.ReadDir's contract.
+// Execute 列目录：判定 → 投影 → 经根句柄读一层。条目按名字排序（与 os.ReadDir 同一
+// 判据）——顺序不随平台文件系统变化。
+// Execute lists one projected level through the root handle, sorted by name.
 func (t *ListDirTool) Execute(ctx context.Context, env core.ToolEnv, input json.RawMessage) (core.Result, error) {
 	args, err := decodeFileToolInput(t.Name(), input)
 	if err != nil {
@@ -255,9 +258,11 @@ func (t *ListDirTool) Execute(ctx context.Context, env core.ToolEnv, input json.
 	}
 	target := resolveToolPath(t.root, env.AgentDir, args.Path)
 	err = t.policy.Check(ctx, core.Action{
-		Type:   core.ActionFileRead,
-		Target: actionTarget(t.root, target),
-		Agent:  env.AgentName,
+		Type:      core.ActionFileRead,
+		Target:    actionTarget(t.root, target),
+		Agent:     env.AgentName,
+		SkillDirs: env.SkillDirs,
+		RunBound:  env.RunBound,
 	})
 	if err != nil {
 		return core.Result{}, err
@@ -266,22 +271,13 @@ func (t *ListDirTool) Execute(ctx context.Context, env core.ToolEnv, input json.
 	if err != nil {
 		return core.Result{}, fmt.Errorf("解析目录 %s：%w", args.Path, err)
 	}
-	// 先判存在与类型再列：契约 §5.1 给 list_dir 的失败类别只有 not_found / sandbox_denied，
-	// 而直接 `os.ReadDir(文件)` 的平台错误会让同一输入在 Windows 归 not_found、在 Unix 归
-	// runtime_error——审计分类按平台分叉对可审计产品是硬伤，故这里自己判、跨平台一致。
-	info, err := os.Stat(real)
+	handle, err := os.OpenRoot(t.root)
 	if err != nil {
-		return core.Result{}, fmt.Errorf("列出目录 %s：%w", args.Path, err)
+		return core.Result{}, fmt.Errorf("打开读取根（工作区）：%w", err)
 	}
-	if !info.IsDir() {
-		return core.Result{}, fmt.Errorf("列出目录 %s：目标不是目录（读文件请用 read_file）：%w", args.Path, fs.ErrNotExist)
-	}
-	entries, err := os.ReadDir(real)
-	if err != nil {
-		return core.Result{}, fmt.Errorf("列出目录 %s：%w", args.Path, err)
-	}
-	content, err := formatDirEntries(entries)
-	if err != nil {
+	content, listErr := listWithinRoot(handle, t.root, real, args.Path)
+	closeErr := handle.Close()
+	if err := errors.Join(listErr, closeErr); err != nil {
 		return core.Result{}, err
 	}
 	return core.Result{Content: content}, nil
@@ -361,6 +357,46 @@ func actionTarget(root, target string) string {
 		return target
 	}
 	return rel
+}
+
+// listWithinRoot 经相对根句柄列一层目录。与读写两侧同源：先算 target 相对 base 的形态，
+// 再由句柄拒绝逃逸——目标本身是指向根外的软连接时，普通 `os.ReadDir(real)` 会把根外
+// 目录完整列出来，句柄则直接报错（约束 31 的读取边界）。
+// 先判存在与类型再列：契约 §5.1 给 list_dir 的失败类别只有 not_found / sandbox_denied，
+// 而直接对文件 ReadDir 的平台错误会让同一输入在 Windows 归 not_found、在 Unix 归
+// runtime_error——审计分类按平台分叉对可审计产品是硬伤，故这里自己判、跨平台一致。
+// Lists one level through the root handle; a directory that is itself a symlink out of
+// the root fails here instead of being enumerated.
+func listWithinRoot(handle *os.Root, base, target, display string) (string, error) {
+	rel, err := filepath.Rel(filepath.Clean(base), target)
+	if err != nil {
+		return "", fmt.Errorf("列出目录 %s：目标不在读取根所在卷上", display)
+	}
+	info, err := handle.Stat(rel)
+	if err != nil {
+		return "", fmt.Errorf("列出目录 %s：%w", display, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("列出目录 %s：目标不是目录（读文件请用 read_file）：%w", display, fs.ErrNotExist)
+	}
+	dir, err := handle.Open(rel)
+	if err != nil {
+		return "", fmt.Errorf("列出目录 %s：%w", display, err)
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return "", fmt.Errorf("列出目录 %s：%w", display, err)
+	}
+	// File.ReadDir 给的是目录序，os.ReadDir 的契约是按名字排序；这里显式补上同一条
+	// 排序判据（逐字节比较），模型看到的顺序不随平台文件系统变化。
+	// File.ReadDir returns directory order; replicate os.ReadDir's name ordering.
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	content, err := formatDirEntries(entries)
+	if err != nil {
+		return "", err
+	}
+	return content, nil
 }
 
 // readWithinRoot 经相对根句柄读一个**已投影**的普通文件。三件事与写入侧同源：先算 target

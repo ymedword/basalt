@@ -49,6 +49,10 @@ func TestSnapshot_UsesSingleReadOfAgentMD(t *testing.T) {
 	root := writeCompatSampleWorkspace(t)
 	entry := loadOnlyAgent(t, root) // 装载期的 Profile：agent_name「对照小助手」、正文「compat ok」
 	require.Equal(t, "对照小助手", entry.Profile.Identity.AgentName)
+	// 本用例判**后备读盘路径**（Definition == nil）：Profile 与段一必须出自同一次读取，
+	// 不得与装载期缓存的 entry.Profile 混用。装载器产出的条目携带已校验字节、冻结不重读
+	// 磁盘——那条契约由 app 层回归判卷（人工 review ② 缺陷 1）。
+	entry.Definition = nil
 
 	// 改盘：frontmatter 与正文同属一份文件——两处一起改，才看得出新读取覆盖了两处。
 	changed := strings.Replace(compatSampleAgentMD, "对照小助手", "改盘后的名字", 1)
@@ -165,6 +169,10 @@ func TestSnapshot_FailsWhenSourceFileDisappears(t *testing.T) {
 		t.Run(tc.label, func(t *testing.T) {
 			root := writeCompatSampleWorkspace(t)
 			entry := loadOnlyAgent(t, root)
+			// 判后备读盘路径（Definition == nil）：缺文件必须拒绝启动。携带已校验字节的
+			// 注册表条目按同一份字节冻结、不再读盘——磁盘消失不该挡住已发布的配置
+			//（人工 review ② 缺陷 1b），该契约由 app 层回归判卷。
+			entry.Definition = nil
 			require.NoError(t, os.Remove(filepath.Join(root, tc.gone)))
 
 			snap, err := loader.Snapshot(root, entry, sectionOneNow())

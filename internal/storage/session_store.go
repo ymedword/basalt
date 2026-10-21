@@ -267,16 +267,61 @@ func (s *SessionStore) UpsertSession(ctx context.Context, rec core.SessionRecord
 	return nil
 }
 
-// ListSessions 列出会话（`session list` 只读命令的数据源）。
-// ListSessions lists the sessions for the read-only `session list` command.
+// ListSessions 列出会话（`session list` 与 `GET /sessions` 的共用读面）。
+// ListSessions lists the sessions for the command surface and the console list.
 //
 // 排序口径在本层固定：**最后活动时间倒序**（最新在前），并以 `session_id` 兜底次序——
 // 时间相同时的次序也必须是确定的，否则两次同样的读取会给出两种渲染结果。
-// Ordering is fixed here: most recent activity first, with a deterministic tie-break.
-func (s *SessionStore) ListSessions(ctx context.Context) ([]core.SessionRecord, error) {
-	rows, err := s.db.read.QueryContext(ctx,
-		`SELECT session_id, profile_name, channel, user_id, message_count, created_at, last_active_at
-		   FROM sessions ORDER BY last_active_at DESC, session_id`)
+// 过滤只有 `agent` 等值与 `status`（`archived_at` 空 / 非空）两维；空过滤器保持
+// 既有全量语义（命令面走这一支）。`Status` 按 `archived_at` 派生——契约
+// SessionSummary 的口径，**不**读 `status` 列另造第二真值。
+// Ordering is fixed here; the two filter dimensions are agent equality and
+// archived_at emptiness, and Status is derived from archived_at (never re-read from
+// the status column, which would create a second truth).
+// 列表 SQL 的六种过滤组合都以**编译期常量**给出：运行期不拼 SQL，请求值只能走占位符；
+// 排序与窗口是常量，调用方无法影响。常量拼接在编译期折叠，不产生运行期字符串拼接。
+// The six filter combinations are compile-time constants: no SQL is assembled at runtime
+// and every request value binds as a placeholder; ordering stays constant.
+const (
+	sessionListSelect = `SELECT session_id, profile_name, channel, user_id, message_count,
+	                 created_at, last_active_at, archived_at
+	            FROM sessions`
+	sessionListTail = ` ORDER BY last_active_at DESC, session_id`
+
+	sessionListAll           = sessionListSelect + sessionListTail
+	sessionListByAgent       = sessionListSelect + ` WHERE profile_name = ?` + sessionListTail
+	sessionListActive        = sessionListSelect + ` WHERE archived_at IS NULL` + sessionListTail
+	sessionListArchived      = sessionListSelect + ` WHERE archived_at IS NOT NULL` + sessionListTail
+	sessionListByAgentActive = sessionListSelect + ` WHERE profile_name = ? AND archived_at IS NULL` + sessionListTail
+	sessionListByAgentArch   = sessionListSelect + ` WHERE profile_name = ? AND archived_at IS NOT NULL` + sessionListTail
+)
+
+func (s *SessionStore) ListSessions(ctx context.Context, filter core.SessionFilter) ([]core.SessionRecord, error) {
+	var (
+		query string
+		args  []any
+	)
+	switch {
+	case filter.Agent != "" && filter.Status == "active":
+		query, args = sessionListByAgentActive, []any{filter.Agent}
+	case filter.Agent != "" && filter.Status == "archived":
+		query, args = sessionListByAgentArch, []any{filter.Agent}
+	case filter.Agent != "" && filter.Status == "":
+		query, args = sessionListByAgent, []any{filter.Agent}
+	case filter.Agent == "" && filter.Status == "active":
+		query = sessionListActive
+	case filter.Agent == "" && filter.Status == "archived":
+		query = sessionListArchived
+	case filter.Agent == "" && filter.Status == "":
+		// 不过滤（命令面与无参列表走这一支）。
+		query = sessionListAll
+	default:
+		// 取值校验在 HTTP 层已做；这里再拒一次是失败关闭——非法状态绝不能退化成
+		// "不过滤"而把归档行混进 active 结果。
+		return nil, fmt.Errorf("列出会话: 非法状态过滤 %q（只接受 active / archived）", filter.Status)
+	}
+
+	rows, err := s.db.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("列出会话: %w", err)
 	}
@@ -288,13 +333,21 @@ func (s *SessionStore) ListSessions(ctx context.Context) ([]core.SessionRecord, 
 			rec          core.SessionRecord
 			createdAt    int64
 			lastActiveAt int64
+			archivedAt   sql.NullInt64
 		)
 		if err := rows.Scan(&rec.ID, &rec.ProfileName, &rec.Channel, &rec.UserID,
-			&rec.MessageCount, &createdAt, &lastActiveAt); err != nil {
+			&rec.MessageCount, &createdAt, &lastActiveAt, &archivedAt); err != nil {
 			return nil, fmt.Errorf("列出会话: %w", err)
 		}
 		rec.CreatedAt = time.UnixMilli(createdAt).UTC()
 		rec.LastActiveAt = time.UnixMilli(lastActiveAt).UTC()
+		if archivedAt.Valid {
+			at := time.UnixMilli(archivedAt.Int64).UTC()
+			rec.ArchivedAt = &at
+			rec.Status = "archived"
+		} else {
+			rec.Status = "active"
+		}
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {

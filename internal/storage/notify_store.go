@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -26,14 +27,14 @@ func NewNotifyChannelRepo(db *DB) *NotifyChannelRepo {
 	return &NotifyChannelRepo{db: db}
 }
 
-// ListNotifyChannels 按 `name` 升序返回全部渠道（只取消费的三列）。空表返回**空切片**
-// 而非错误——"没有渠道可发"与"读取失败"是两条不同的诊断路径。读取失败**原样上抛**：
-// 文案包装归工具层（本包不决定对外措辞）。
+// ListNotifyChannels 按 `name` 升序返回全部渠道（消费列 + 可空的说明列）。空表返回
+// **空切片**而非错误——"没有渠道可发"与"读取失败"是两条不同的诊断路径。读取失败
+// **原样上抛**：文案包装归工具层（本包不决定对外措辞）。
 // ListNotifyChannels returns all channels ordered by name; the empty registry is an empty
 // slice, not an error. Read failures propagate verbatim — wording belongs to the tool.
 func (r *NotifyChannelRepo) ListNotifyChannels(ctx context.Context) ([]core.NotifyChannel, error) {
 	rows, err := r.db.read.QueryContext(ctx,
-		`SELECT name, type, url FROM notify_channels ORDER BY name`)
+		`SELECT name, type, url, description FROM notify_channels ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -41,10 +42,14 @@ func (r *NotifyChannelRepo) ListNotifyChannels(ctx context.Context) ([]core.Noti
 
 	out := make([]core.NotifyChannel, 0)
 	for rows.Next() {
-		var ch core.NotifyChannel
-		if err := rows.Scan(&ch.Name, &ch.Type, &ch.URL); err != nil {
+		var (
+			ch          core.NotifyChannel
+			description sql.NullString
+		)
+		if err := rows.Scan(&ch.Name, &ch.Type, &ch.URL, &description); err != nil {
 			return nil, err
 		}
+		ch.Description = description.String // NULL → 空串（契约视图不出现 null）
 		out = append(out, ch)
 	}
 	if err := rows.Err(); err != nil {

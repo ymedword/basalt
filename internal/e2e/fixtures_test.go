@@ -271,10 +271,48 @@ func configWithProvider(baseURL string) string {
 		"    default_model: " + fixtureModel + "\n"
 }
 
-// fixtureEnv 返回每次调用都要带上的环境：凭证哨兵（值不落盘、不进记录）。
-// fixtureEnv returns the credential sentinel every invocation carries.
+// 管理面认证夹具（US-11 T025）：token 只写 ${VAR} 占位，值由 fixtureEnv 注入；
+// 监听地址全为回环，Host 白名单由 app 层按监听地址派生，因此无需显式列出。
+// Management-auth fixture (T025): the token is a ${VAR} placeholder; hosts derive
+// from the loopback listener, so no explicit allowlist is needed.
+const (
+	e2eAdminTokenEnv = "BASALT_E2E_ADMIN_TOKEN"
+	e2eAdminToken    = "e2e-admin-token-not-a-secret"
+)
+
+// fixtureEnv 返回每次调用都要带上的环境：凭证哨兵与管理面 token（值不落盘、不进记录）。
+// fixtureEnv returns the credential sentinel and management token every invocation
+// carries; neither value is written to disk or asserted into records.
 func fixtureEnv() []string {
-	return []string{fixtureKeyEnv + "=e2e-sentinel-not-a-secret"}
+	return []string{
+		fixtureKeyEnv + "=e2e-sentinel-not-a-secret",
+		e2eAdminTokenEnv + "=" + e2eAdminToken,
+	}
+}
+
+// adminAuthSection 返回 `http:` 映射内的 admin_auth 行（前置两空格缩进），供
+// 已开 `http:` 键的配置拼装；token 只写 ${VAR} 占位，值由 fixtureEnv 注入。
+// adminAuthSection renders the admin_auth rows inside an existing `http:` mapping;
+// the token stays a ${VAR} placeholder resolved from fixtureEnv.
+func adminAuthSection() string {
+	return "  admin_auth:\n    mode: token\n    token: ${" + e2eAdminTokenEnv + "}\n"
+}
+
+// configWithAdminAuth 在最小可装载配置上追加只含管理认证的 http 段（沿用默认监听
+// 地址）。T025 起 serve 必须有管理认证配置，否则拒绝启动。
+// configWithAdminAuth appends an http section carrying only the management-auth
+// block (default listen address); serve refuses to start without it since T025.
+func configWithAdminAuth(baseURL string) string {
+	return configWithProvider(baseURL) + "http:\n" + adminAuthSection()
+}
+
+// applyAdminAuth 给裸 http.Request 补管理面 token：T025 起除健康检查外的端点都要
+// 认证，doWebRequest 之外的请求构造点统一走本函数。
+// applyAdminAuth adds the management token to a hand-built request; every request
+// site outside doWebRequest goes through it.
+func applyAdminAuth(req *http.Request) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+e2eAdminToken)
+	return req
 }
 
 // agentFrontmatter 组装一份可装载的 AGENT.md frontmatter（provider 指向夹具假模型）。

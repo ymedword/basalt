@@ -2,9 +2,10 @@ module github.com/ymedword/basalt
 
 go 1.27
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-yaml v1.19.2
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/robfig/cron/v3 v3.0.1

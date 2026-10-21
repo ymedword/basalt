@@ -25,6 +25,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/assets"
 	"github.com/ymedword/basalt/internal/core"
 )
 
@@ -63,6 +64,20 @@ func (f *fakeRunService) Archive(_ context.Context, id string) error {
 		return fn(id)
 	}
 	return nil
+}
+
+// ListRuns / GetRun / Cancel 是编译适配桩：本文件的用例只覆盖运行与归档入口，
+// 账本读面与取消由 T028 的 handlers_runs_test.go 判卷（判据面不变）。
+func (f *fakeRunService) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (f *fakeRunService) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (f *fakeRunService) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
 }
 
 func (f *fakeRunService) requests() []core.RunRequest {
@@ -153,6 +168,27 @@ func (f *fakeSessionStore) MessagesTail(_ context.Context, id string, limit int)
 	return slices.Clone(all), nil
 }
 
+// ListSessions 按过滤器返回内存行；排序口径（标识升序）只服务假端口的确定性——
+// 生产排序由 storage 固定并在 session_store 用例判卷。
+// ListSessions returns the seeded rows filtered in memory; the ordering here exists
+// only to keep the fake deterministic.
+func (f *fakeSessionStore) ListSessions(_ context.Context, filter core.SessionFilter) ([]core.SessionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]core.SessionRecord, 0, len(f.sessions))
+	for _, rec := range f.sessions {
+		if filter.Agent != "" && rec.ProfileName != filter.Agent {
+			continue
+		}
+		if filter.Status != "" && rec.Status != filter.Status {
+			continue
+		}
+		out = append(out, rec)
+	}
+	slices.SortFunc(out, func(a, b core.SessionRecord) int { return strings.Compare(a.ID, b.ID) })
+	return out, nil
+}
+
 // seed 供测试预置行；并发用例必须走它（直接写 map 会绕过 mu）。
 func (f *fakeSessionStore) seed(rec core.SessionRecord) {
 	f.mu.Lock()
@@ -199,6 +235,14 @@ func newTestServer(t *testing.T, mutate func(*Options)) *Server {
 		Agents:        fakeAgents{entries: []core.AgentEntry{{Name: "ops-agent", Registered: true, Profile: &core.Profile{Name: "ops-agent"}}}},
 		Tools:         fakeTools{},
 		Memory:        fakeMemory{},
+		// 缺省资源端口给空清单：启用前置校验（约束 16）会读它，nil 会让所有启用
+		// 用例走「资源视图不可用」分支。缺端口行为由 TestResources_MissingPort 显式覆盖。
+		// The default resource port yields empty lists; the missing-port behavior is
+		// covered explicitly by TestResources_MissingPort.
+		Resources: fakeResources{},
+		// 管理台产物走真实 go:embed：路由表与公开面断言测的就是要发布的那份壳。
+		// The real embedded artifact backs every handler test.
+		Console: assets.Console(),
 	}
 	if mutate != nil {
 		mutate(&opts)
@@ -206,6 +250,37 @@ func newTestServer(t *testing.T, mutate func(*Options)) *Server {
 	srv, err := NewServer(opts)
 	require.NoError(t, err)
 	return srv
+}
+
+// adminRequest 构造管理面请求并预置允许列表内的 Host：认证闸门的判定顺序是
+// Host → Origin → 限速 → 凭据，Host 用 httptest 的默认值会让「缺凭据」变成 403
+// 而不是 401。用例按需改写 Host / Origin / Authorization。
+// adminRequest pre-sets an allowed Host so a missing credential surfaces as 401, not
+// 403 (the guard checks Host before credentials).
+func adminRequest(method, path, body string) *http.Request {
+	var req *http.Request
+	if body == "" {
+		req = httptest.NewRequest(method, path, nil)
+	} else {
+		req = httptest.NewRequest(method, path, strings.NewReader(body))
+	}
+	req.Host = "127.0.0.1:8080"
+	return req
+}
+
+// withBearer 给请求补上 Bearer 凭据。
+// withBearer attaches a bearer credential.
+func withBearer(req *http.Request, token string) *http.Request {
+	req.Header.Set("Authorization", "Bearer "+token)
+	return req
+}
+
+// serveAdmin 让请求走真实 handler 链并返回记录器。
+// serveAdmin runs one request through the real handler chain.
+func serveAdmin(s *Server, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, req)
+	return rec
 }
 
 // TestSessions_CreateDefaultsAndIdempotency 覆盖默认值、显式值、幂等与两条 400 分支
@@ -530,8 +605,15 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 			Data []ProfileView `json:"data"`
 		}
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
-		require.Equal(t, ProfileView{Name: "pending", Tools: []string{}, Skills: []string{}, Problems: []string{}},
-			env.Data[2])
+		require.Equal(t, ProfileView{
+			Name:     "pending",
+			Tools:    []string{},
+			Skills:   []string{},
+			Problems: []string{},
+			// 生命周期端口未装配时 valid=false 并给固定原因——不得伪装成可用。
+			// An unwired lifecycle port is valid=false with a fixed reason.
+			Lifecycle: AgentLifecycleView{Agent: "pending", LifecycleError: lifecycleUnwiredProblem},
+		}, env.Data[2])
 	})
 
 	toolsSrv := newTestServer(t, func(o *Options) {
@@ -593,6 +675,131 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 		require.Contains(t, rec.Body.String(), codeInternal)
 		require.Contains(t, rec.Body.String(), messageInternal)
 		require.NotContains(t, rec.Body.String(), "disk on fire", "底层错误不得透出")
+	})
+}
+
+// TestProfiles_LifecycleAndRunnable 覆盖 /profiles 的契约字段 lifecycle / runnable /
+// problems（模块卡 §3.1.9 视图表、约束 45；Demo B 的 state=disabled、
+// runnable=false 与 lifecycle_error 展示）。
+// 逆改点：缺失状态文件读成可用 → valid=true 断言红；runnable 只看 registered →
+// disabled 用例红；生命周期原始错误透出响应 → 路径不泄漏断言红。
+func TestProfiles_LifecycleAndRunnable(t *testing.T) {
+	updated := time.Date(2026, 10, 21, 8, 30, 0, 0, time.UTC)
+
+	entry := core.AgentEntry{
+		Name:       "ops",
+		Registered: true,
+		Profile: &core.Profile{
+			Name:       "ops",
+			Provider:   core.ProviderRef{Name: "openai", Model: "gpt-test"},
+			MCPServers: []string{"files"},
+			Skills:     []string{"pdf-extract"},
+		},
+	}
+	record := func(state core.AgentState) core.LifecycleRecord {
+		return core.LifecycleRecord{
+			SchemaVersion: 1,
+			Agent:         "ops",
+			State:         state,
+			Generation:    2,
+			UpdatedAt:     updated.UnixMilli(),
+			OperationID:   "op-2-enable",
+		}
+	}
+	sampleResources := func() fakeResources {
+		return fakeResources{
+			modelConns: []ModelConnectionView{sampleModelConnectionView()},
+			mcpServers: []McpServerView{sampleMcpServerView()},
+			skills:     []SkillView{sampleSkillView()},
+		}
+	}
+	serve := func(t *testing.T, lifecycle *fakeLifecycle, resources ResourceReader) *Server {
+		t.Helper()
+		return newTestServer(t, func(o *Options) {
+			o.Agents = fakeAgents{entries: []core.AgentEntry{entry}}
+			if lifecycle != nil {
+				o.Lifecycle = lifecycle
+			}
+			if resources != nil {
+				o.Resources = resources
+			}
+		})
+	}
+	fetch := func(t *testing.T, srv *Server) (ProfileView, string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		srv.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/profiles", nil))
+		require.Equal(t, http.StatusOK, rec.Code)
+		var env struct {
+			Data []ProfileView `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+		require.Len(t, env.Data, 1)
+		return env.Data[0], rec.Body.String()
+	}
+
+	t.Run("active 且资源全部有已发布版本 → runnable=true", func(t *testing.T) {
+		srv := serve(t, &fakeLifecycle{recs: map[string]core.LifecycleRecord{"ops": record(core.AgentActive)}}, sampleResources())
+		view, _ := fetch(t, srv)
+		require.True(t, view.Runnable)
+		require.Empty(t, view.Problems)
+		require.True(t, view.Lifecycle.Valid)
+		require.NotNil(t, view.Lifecycle.State)
+		require.Equal(t, "active", *view.Lifecycle.State)
+		require.Equal(t, int64(2), view.Lifecycle.Generation)
+		require.Equal(t, "2026-10-21T08:30:00Z", view.Lifecycle.UpdatedAt)
+		require.Empty(t, view.Lifecycle.LifecycleError)
+	})
+
+	t.Run("disabled → runnable=false 且不虚构问题项", func(t *testing.T) {
+		srv := serve(t, &fakeLifecycle{recs: map[string]core.LifecycleRecord{"ops": record(core.AgentDisabled)}}, sampleResources())
+		view, _ := fetch(t, srv)
+		require.False(t, view.Runnable)
+		require.Empty(t, view.Problems, "状态本身是原因，problems 只记点名的资源 / 加载问题")
+		require.True(t, view.Lifecycle.Valid)
+		require.NotNil(t, view.Lifecycle.State)
+		require.Equal(t, "disabled", *view.Lifecycle.State)
+	})
+
+	t.Run("active 但引用无已发布版本 → 点名缺失资源", func(t *testing.T) {
+		res := sampleResources()
+		mcp := sampleMcpServerView()
+		mcp.PublishedVersionID = 0
+		res.mcpServers = []McpServerView{mcp}
+		res.skills = []SkillView{}
+		srv := serve(t, &fakeLifecycle{recs: map[string]core.LifecycleRecord{"ops": record(core.AgentActive)}}, res)
+		view, _ := fetch(t, srv)
+		require.False(t, view.Runnable)
+		require.Equal(t, []string{"资源引用无已发布版本：mcp_server/files、skill/pdf-extract"}, view.Problems)
+	})
+
+	t.Run("状态文件缺失 → valid=false 且固定原因", func(t *testing.T) {
+		srv := serve(t, &fakeLifecycle{}, sampleResources())
+		view, _ := fetch(t, srv)
+		require.False(t, view.Runnable)
+		require.False(t, view.Lifecycle.Valid)
+		require.Nil(t, view.Lifecycle.State)
+		require.Equal(t, lifecycleMissingProblem, view.Lifecycle.LifecycleError)
+	})
+
+	t.Run("状态文件损坏 → 固定原因且不回显内部路径", func(t *testing.T) {
+		broken := errors.New(`打开工作区目录 D:\secret\basalt: boom`)
+		srv := serve(t, &fakeLifecycle{errs: map[string]error{"ops": broken}}, sampleResources())
+		view, body := fetch(t, srv)
+		require.False(t, view.Runnable)
+		require.False(t, view.Lifecycle.Valid)
+		require.Equal(t, lifecycleCorruptProblem, view.Lifecycle.LifecycleError)
+		require.NotContains(t, body, "secret", "约束 45：失败文案不回内部路径")
+		require.NotContains(t, body, "boom", "约束 45：底层错误只进日志")
+	})
+
+	t.Run("资源清单读取失败 → runnable 不可确认", func(t *testing.T) {
+		res := fakeResources{modelListErr: errors.New("resource store down")}
+		srv := serve(t, &fakeLifecycle{recs: map[string]core.LifecycleRecord{"ops": record(core.AgentActive)}}, res)
+		view, body := fetch(t, srv)
+		require.False(t, view.Runnable)
+		require.Equal(t, []string{resourceViewsProblem}, view.Problems)
+		require.NotContains(t, body, "resource store down")
 	})
 }
 
@@ -983,6 +1190,18 @@ func (deadlineRunService) Run(ctx context.Context, _ core.RunRequest) (core.RunR
 
 func (deadlineRunService) Archive(context.Context, string) error { return nil }
 
+func (deadlineRunService) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (deadlineRunService) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (deadlineRunService) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
 // TestInvoke_Stateless 逐字保留模块卡 R6（W7），并补未知 Agent 与 32 KiB 两条拒绝路径。
 // 逆改点：给 invoke 填一个派生会话 id → SessionID 断言红；调用 GetOrCreateSession →
 // 调用计数断言红；写入会话历史 → 消息断言红。
@@ -1096,6 +1315,18 @@ func (c cancellingRunService) Run(context.Context, core.RunRequest) (core.RunRes
 
 func (c cancellingRunService) Archive(context.Context, string) error { return nil }
 
+func (c cancellingRunService) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (c cancellingRunService) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (c cancellingRunService) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
 // TestSessions_ArchiveRejectedWhileRunInflight 保留模块卡 R14（W6/W8）的 web 面
 // 断言口径：在途运行期间 DELETE 409、会话保持 active、archived_at 不写、消息不变、
 // 已准入运行继续到底。互斥判定本身已收归 AgentService（§3.5 第 4 条），本用例经
@@ -1199,6 +1430,18 @@ func (b *blockingRunService) Run(ctx context.Context, _ core.RunRequest) (core.R
 }
 
 func (b *blockingRunService) Archive(context.Context, string) error { return b.archiveErr }
+
+func (b *blockingRunService) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (b *blockingRunService) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (b *blockingRunService) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
 
 // TestRunView_TriggerFallback：空 Trigger 回落 api（既有 REST 行为不变，约束 15）。
 // 逆改点：runView 直接写 string(req.Trigger) → 空串断言红。
@@ -1564,5 +1807,119 @@ func TestMessages_FailedRunDiagnosticLogged(t *testing.T) {
 		require.Contains(t, diagnostic, "run_id=run-42")
 		require.NotContains(t, diagnostic, "INTERNAL-MARKER-7f3a")
 		require.Contains(t, buf.String(), "客户端已断开")
+	})
+}
+
+// TestAuth_ExistingEndpoints 是既有端点的认证矩阵（模块卡 §4.4 关键回归第 7 条、
+// 任务 T024 的 +6）：缺失凭据一律 401 且零副作用、错误凭据同文案、有效凭据放行、
+// Host / Origin 不符 403、生命周期不可用 409 `AGENT_UNAVAILABLE`。
+// 逆改点：把闸门挂到端点之后 / 只在写端点挂 / 先判 fs.ErrNotExist → 对应子例红。
+// 中文用例名：既有端点认证矩阵。
+func TestAuth_ExistingEndpoints(t *testing.T) {
+	t.Run("missing credentials are rejected with zero side effects", func(t *testing.T) {
+		runs := &fakeRunService{result: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
+		store := &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Runs = runs
+			o.Sessions = store
+		})
+
+		cases := []struct{ method, path, body string }{
+			{http.MethodGet, "/api/v1/profiles", ""},
+			{http.MethodGet, "/api/v1/sessions/web-x", ""},
+			{http.MethodPost, "/api/v1/sessions", `{"agent":"ops-agent"}`},
+			{http.MethodPost, "/api/v1/sessions/web-x/messages", `{"message":"hi"}`},
+			{http.MethodPost, "/api/v1/agents/ops-agent/invoke", `{"message":"hi"}`},
+		}
+		for _, tc := range cases {
+			rec := serveAdmin(s, adminRequest(tc.method, tc.path, tc.body))
+			require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s", tc.method, tc.path)
+			env := decodeAuthEnvelope(t, rec)
+			require.Equal(t, codeUnauthorized, env.Code)
+			require.Empty(t, env.Data, "失败响应不得携带 data")
+		}
+		require.Empty(t, runs.requests(), "未认证请求不得触达运行入口")
+		require.Zero(t, store.getOrCreateCallCount(), "未认证请求不得建会话")
+		require.Zero(t, store.getSessionCallCount(), "未认证请求不得读会话")
+	})
+
+	t.Run("wrong credentials share the missing-credentials text", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		missing := serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/profiles", ""))
+		wrong := serveAdmin(s, withBearer(adminRequest(http.MethodGet, "/api/v1/profiles", ""), "not-the-token"))
+		require.Equal(t, http.StatusUnauthorized, missing.Code)
+		require.Equal(t, http.StatusUnauthorized, wrong.Code)
+		require.Equal(t, decodeAuthEnvelope(t, missing).Message, decodeAuthEnvelope(t, wrong).Message,
+			"401 不得区分「没提供」与「提供错」")
+	})
+
+	t.Run("valid credentials reach the handler", func(t *testing.T) {
+		store := &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Sessions = store
+		})
+		profiles := serveAdmin(s, withBearer(adminRequest(http.MethodGet, "/api/v1/profiles", ""), testToken))
+		require.Equal(t, http.StatusOK, profiles.Code)
+		created := serveAdmin(s,
+			withBearer(adminRequest(http.MethodPost, "/api/v1/sessions", `{"agent":"ops-agent"}`), testToken))
+		require.Equal(t, http.StatusOK, created.Code)
+		require.Equal(t, 1, store.getOrCreateCallCount(), "有效凭据必须真正到达处理函数")
+	})
+
+	t.Run("host mismatch is forbidden even with valid credentials", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		req := withBearer(adminRequest(http.MethodGet, "/api/v1/profiles", ""), testToken)
+		req.Host = "evil.example:8080"
+		rec := serveAdmin(s, req)
+		require.Equal(t, http.StatusForbidden, rec.Code)
+		require.Equal(t, codeForbidden, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("origin mismatch is forbidden", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		req := withBearer(adminRequest(http.MethodGet, "/api/v1/profiles", ""), testToken)
+		req.Header.Set("Origin", "http://evil.example")
+		rec := serveAdmin(s, req)
+		require.Equal(t, http.StatusForbidden, rec.Code)
+		require.Equal(t, codeForbidden, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("lifecycle refusal maps to 409 before the missing-file branch", func(t *testing.T) {
+		cases := []struct {
+			name string
+			err  error
+		}{
+			{"disabled agent", &core.AgentUnavailableError{
+				Name: "ops-agent", State: core.AgentDisabled,
+				Reason: "lifecycle state disabled; enable the agent first",
+			}},
+			// 状态文件缺失时 core 把 fs.ErrNotExist 挂在原因链上：409 必须优先于
+			// 下面的 fs 判定，否则失败关闭会被错报成 404。
+			{"missing state file", &core.AgentUnavailableError{
+				Name:   "ops-agent",
+				Reason: "lifecycle state file missing; restore it before running",
+				Cause:  fmt.Errorf("read C:\\secret\\state.json: %w", fs.ErrNotExist),
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newTestServer(t, func(o *Options) {
+					o.AdminAuth = testAdminAuth(testToken)
+					o.Runs = &fakeRunService{err: tc.err}
+				})
+				rec := serveAdmin(s,
+					withBearer(adminRequest(http.MethodPost,
+						"/api/v1/agents/ops-agent/invoke", `{"message":"hi"}`), testToken))
+				require.Equal(t, http.StatusConflict, rec.Code,
+					"生命周期拒绝必须是 409，不得被 fs.ErrNotExist 抢成 404")
+				env := decodeAuthEnvelope(t, rec)
+				require.Equal(t, codeAgentUnavailable, env.Code)
+				require.Contains(t, env.Message, "ops-agent")
+				require.NotContains(t, rec.Body.String(), "secret",
+					"底层错误原文（可能含路径）不得进入响应")
+			})
+		}
 	})
 }

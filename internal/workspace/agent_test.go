@@ -987,3 +987,112 @@ mcp_servers: [search]
 	require.Contains(t, byName["declarer"].RejectReason, "mcp server skipped")
 	require.Contains(t, byName["declarer"].RejectReason, "search")
 }
+
+// 中文验收点（T057 / 模块卡 §3.1.13 图 D）：内容条件写的装载期闸门——候选经与装载
+// 同一道规则 1–8 判定后返回已注册条目、段一正文与冻结清单；校验只读内存字节，磁盘
+// 原文逐字节不变。逆改点：跳过规则 / 返回未注册条目 / 校验时写盘 → 断言红。
+func TestAgentLoader_ValidateCandidate_AcceptsCandidate(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "alpha", "name: alpha\nprovider: {name: deepseek, model: deepseek-chat}\n", "原始正文")
+	loader := newTestLoader(t, nil, nil, "deepseek")
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "夹具必须已注册：%s", entries[0].RejectReason)
+
+	candidate := []byte("---\nname: alpha\nprovider: {name: deepseek, model: deepseek-chat}\n---\n\n新正文\n")
+	entry, section, manifest, err := loader.ValidateCandidate(root, entries, "alpha", candidate,
+		time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.True(t, entry.Registered, "合法候选返回已注册条目")
+	require.Equal(t, "alpha", entry.Name)
+	require.Contains(t, section, "新正文", "段一取候选字节，不取磁盘旧文")
+	require.NotEmpty(t, manifest, "清单至少含 AGENT.md 一条")
+
+	onDisk, readErr := os.ReadFile(filepath.Join(root, "agents", "alpha", "AGENT.md"))
+	require.NoError(t, readErr)
+	require.Contains(t, string(onDisk), "原始正文", "候选校验不得落盘")
+	require.NotContains(t, string(onDisk), "新正文")
+}
+
+// 中文验收点（T057）：候选违反装载规则时按装载口径拒载，错误文案取 reject 摘要——
+// 方向名不一致与空 model 各有固定 reason。逆改点：放行坏候选 → 断言红。
+func TestAgentLoader_ValidateCandidate_RejectsInvalidCandidates(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "alpha", "name: alpha\nprovider: {name: deepseek, model: deepseek-chat}\n", "正文")
+	loader := newTestLoader(t, nil, nil, "deepseek")
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		candidate string
+		wantPart  string
+	}{
+		{
+			name:      "frontmatter name 与目录名不一致",
+			candidate: "---\nname: other\nprovider: {name: deepseek, model: deepseek-chat}\n---\n\n正文\n",
+			wantPart:  "name mismatch",
+		},
+		{
+			name:      "空 model",
+			candidate: "---\nname: alpha\nprovider: {name: deepseek, model: \"\"}\n---\n\n正文\n",
+			wantPart:  "blank model",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, _, err := loader.ValidateCandidate(root, entries, "alpha", []byte(tc.candidate), now)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantPart)
+		})
+	}
+}
+
+// 中文验收点（T057 / 图 D）：候选的调度 id 占用以**其他**已注册 Agent 为基线——
+// 抢占别人的 id 拒载；保留自己的旧 id 放行（被编辑 Agent 的旧占用不参与）。并发保存
+// 只有一个成功的判定由调度占用基线 + AgentGate 写锁共同保证。
+// 逆改点：占用基线包含被编辑 Agent 自身（任何保留旧 id 的保存都被拒）/ 不含其他
+// Agent（冲突放行）→ 断言红。
+func TestAgentLoader_ValidateCandidate_ScheduleClaims(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "alpha", `
+name: alpha
+provider: {name: deepseek, model: deepseek-chat}
+schedules:
+  - id: daily-alpha
+    cron: "0 0 8 * * *"
+    message: alpha 播报
+`, "alpha 正文")
+	writeAgentFrontmatter(t, root, "beta", `
+name: beta
+provider: {name: deepseek, model: deepseek-chat}
+schedules:
+  - id: daily-beta
+    cron: "0 0 9 * * *"
+    message: beta 播报
+`, "beta 正文")
+	loader := newTestLoader(t, nil, nil, "deepseek")
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	for _, entry := range entries {
+		require.True(t, entry.Registered, "夹具必须全部注册：%s %s", entry.Name, entry.RejectReason)
+	}
+
+	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+	conflict := []byte("---\nname: beta\nprovider: {name: deepseek, model: deepseek-chat}\n" +
+		"schedules:\n  - id: daily-alpha\n    cron: \"0 0 9 * * *\"\n    message: beta 播报\n---\n\nbeta 正文\n")
+	_, _, _, err = loader.ValidateCandidate(root, entries, "beta", conflict, now)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid schedule")
+	require.Contains(t, err.Error(), "id 已被 alpha 占用：daily-alpha")
+
+	own := []byte("---\nname: beta\nprovider: {name: deepseek, model: deepseek-chat}\n" +
+		"schedules:\n  - id: daily-beta\n    cron: \"0 0 9 * * *\"\n    message: beta 播报（改）\n---\n\nbeta 新正文\n")
+	entry, _, _, err := loader.ValidateCandidate(root, entries, "beta", own, now)
+	require.NoError(t, err, "被编辑 Agent 保留自己的调度 id 不得与自身旧占用冲突")
+	require.True(t, entry.Registered)
+}

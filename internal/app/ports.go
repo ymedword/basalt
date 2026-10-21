@@ -168,10 +168,13 @@ type sessionListerPort struct {
 	store *storage.SessionStore
 }
 
-// ListSessions 转调会话清单（排序与去重是实现侧的事，端口保序）。
-// ListSessions forwards the session list; ordering stays the implementation's call.
+// ListSessions 转调会话清单（排序与去重是实现侧的事，端口保序）。命令面没有过滤参数，
+// 这里**固定传空过滤器**——既有的全量口径逐字不变；过滤与归档状态派生只服务
+// `GET /sessions`（web 端口直连仓储，不走本适配器）。
+// ListSessions forwards the unfiltered list: the command surface has no filter flags,
+// so an empty filter keeps its previous behaviour exactly.
 func (p sessionListerPort) ListSessions(ctx context.Context) ([]core.SessionRecord, error) {
-	return p.store.ListSessions(ctx)
+	return p.store.ListSessions(ctx, core.SessionFilter{})
 }
 
 // Messages 转调一个会话的完整历史。

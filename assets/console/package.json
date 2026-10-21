@@ -1,0 +1,29 @@
+{
+  "name": "basalt-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Basalt 管理台前端（构建期产物经 go:embed 进入单二进制）",
+  "engines": {
+    "node": ">=24.22.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build && node scripts/emit-integrity.mjs",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "3.5.44"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.10",
+    "@vue/test-utils": "2.5.1",
+    "jsdom": "30.1.3",
+    "typescript": "5.9.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.5",
+    "vue-tsc": "3.3.13"
+  }
+}

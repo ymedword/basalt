@@ -14,6 +14,17 @@ package app
 //	T7 `TestDeclaredToolNames_IncludesManageSchedule`——第 10 件内置工具的十名清单
 //	T8 `TestWebOptions_SchedulesWired`——Schedules 恒非 nil、Runs 指向 AgentService
 //
+// US-11 T023 追加认证装配五条（§3.1.2 的 app 侧）：
+//
+//	T9  `TestNewWebServer_RefusesInvalidAdminAuth`——缺 mode / 非法 mode / 缺凭据 /
+//	    未解析占位，一律在交出端口前拒绝启动（4 例）
+//	T10 `TestAdminAuthConfig_DerivesLoopbackDefaults`——回环监听派生 Host 三元组与
+//	    http origins（约束 4 / 5）
+//	T11 `TestAdminAuthConfig_KeepsExplicitValues`——显式白名单原样保留且与配置副本隔离
+//	T12 `TestAdminAuthConfig_NonLoopbackNeedsExplicitHosts`——非回环 / 通配监听不派生，
+//	    显式列出后才放行（D-10）
+//	T13 `TestListenAddr_DefaultsToLoopback`——空地址落回环缺省，绝不落到全接口监听
+//
 // 全部离线：不访问真实网络与真实模型；T5 的 provider 卡在首次 Chat 上制造准入窗口。
 // Every case is offline; T5 parks the first run inside Chat to hold the admission window.
 
@@ -22,8 +33,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +45,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 )
@@ -51,6 +65,11 @@ func TestNewWebServer_OptionsProjection(t *testing.T) {
 		require.Equal(t, "127.0.0.1:18099", opts.Addr)
 		require.EqualValues(t, 4096, opts.MaxRequestBytes)
 
+		// 装配会真实绑定监听（T023）：这里改用端口 0 拿临时端口，避免与别的进程抢固定端口；
+		// cfg 与 rt.cfg 是同一指针，webOptions 的投影断言已在上方完成。
+		// Assembly really binds now; port 0 keeps the case from fighting over a fixed port.
+		f.cfg.HTTP.Addr = "127.0.0.1:0"
+		f.cfg.HTTP.AdminAuth = cli.AdminAuthConfig{Mode: "token", Token: "test-token"}
 		srv, err := a.newWebServer(rt)
 		require.NoError(t, err, "装配态齐全时 HTTP 面必须能建")
 		require.NotNil(t, srv)
@@ -102,6 +121,139 @@ func TestNewWebServer_OptionsProjection(t *testing.T) {
 		require.Zero(t, (&App{}).webOptions(rt).RunBudget.MaxOutputBytes,
 			"非正数不搬运——留在零值由运行入口补缺省")
 	})
+}
+
+// TestNewWebServer_RefusesInvalidAdminAuth 判启动期拒绝（FR1 / 约束 1）：配置不成形时
+// 服务**不得**被构造出来——拒绝发生在监听创建之后、交出服务之前，错误须指向具体配置键。
+// Startup refusal: an invalid management-auth section never yields a server, and the
+// error names the offending key.
+func TestNewWebServer_RefusesInvalidAdminAuth(t *testing.T) {
+	cases := []struct {
+		name     string
+		auth     cli.AdminAuthConfig
+		wantPart string
+	}{
+		{name: "模式缺失", auth: cli.AdminAuthConfig{}, wantPart: `当前为 ""`},
+		{name: "模式非法", auth: cli.AdminAuthConfig{Mode: "none"}, wantPart: `当前为 "none"`},
+		{
+			name:     "token 模式缺少凭据",
+			auth:     cli.AdminAuthConfig{Mode: "token"},
+			wantPart: "http.admin_auth.token 缺失",
+		},
+		{
+			name:     "凭据仍是未解析占位",
+			auth:     cli.AdminAuthConfig{Mode: "token", Token: "${BASALT_ADMIN_TOKEN}"},
+			wantPart: "未解析的 ${...} 占位",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &heavyRuntime{cfg: &cli.Config{HTTP: cli.HTTPConfig{
+				Addr:      "127.0.0.1:0",
+				AdminAuth: tc.auth,
+			}}}
+			srv, err := (&App{}).newWebServer(rt)
+			require.Nil(t, srv, "拒绝启动时不得交出服务")
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "管理认证配置校验失败")
+			require.Contains(t, err.Error(), tc.wantPart, "错误须指向具体配置键，便于运维定位")
+		})
+	}
+}
+
+// TestAdminAuthConfig_DerivesLoopbackDefaults 判缺省派生（约束 4 / 5）：回环监听派生
+// 三个本机 Host（IPv4 / localhost / IPv6）与其 http:// origins，且派生结果能过启动校验。
+// A loopback listener derives the local-host trio and their http origins.
+func TestAdminAuthConfig_DerivesLoopbackDefaults(t *testing.T) {
+	cfg := &cli.Config{HTTP: cli.HTTPConfig{AdminAuth: cli.AdminAuthConfig{
+		Mode:  "token",
+		Token: "test-token",
+	}}}
+
+	auth := adminAuthConfig(cfg, "127.0.0.1:18080")
+	require.Equal(t, []string{"127.0.0.1:18080", "localhost:18080", "[::1]:18080"}, auth.AllowedHosts)
+	require.Equal(t, []string{
+		"http://127.0.0.1:18080",
+		"http://localhost:18080",
+		"http://[::1]:18080",
+	}, auth.AllowedOrigins, "缺省 origins 取有效 Host 的 http:// 形态")
+	require.Equal(t, "token", auth.Mode)
+	require.Equal(t, "test-token", auth.Token)
+	require.NoError(t, web.ValidateAdminAuth(auth, []string{"127.0.0.1:18080"}),
+		"派生结果必须能过启动校验，否则安全缺省形同虚设")
+
+	// IPv6 回环监听与 IPv4 回环同一口径（端口取自实际监听）。
+	v6 := adminAuthConfig(cfg, "[::1]:18081")
+	require.Equal(t, []string{"127.0.0.1:18081", "localhost:18081", "[::1]:18081"}, v6.AllowedHosts)
+}
+
+// TestAdminAuthConfig_KeepsExplicitValues 判显式配置不被缺省覆盖（约束 4）：只要
+// allowed_hosts 非空就原样使用；origins 缺省时按**有效** Host 派生；投影与配置切片
+// 互不共享底层数组（装配输入一经交出，后续改配置不得回写）。
+// Explicit lists win over derivation, and the projection never aliases the config slices.
+func TestAdminAuthConfig_KeepsExplicitValues(t *testing.T) {
+	cfg := &cli.Config{HTTP: cli.HTTPConfig{AdminAuth: cli.AdminAuthConfig{
+		Mode:           "local_trust",
+		AllowedHosts:   []string{"127.0.0.1:9000", "localhost:9000"},
+		TrustedProxies: []string{"10.0.0.0/8"},
+	}}}
+
+	auth := adminAuthConfig(cfg, "127.0.0.1:9000")
+	require.Equal(t, []string{"127.0.0.1:9000", "localhost:9000"}, auth.AllowedHosts,
+		"显式 Host 列表非空即原样使用，不补三元组")
+	require.Equal(t, []string{"http://127.0.0.1:9000", "http://localhost:9000"}, auth.AllowedOrigins,
+		"origins 缺省时按有效 Host 派生（约束 5）")
+	require.Equal(t, []string{"10.0.0.0/8"}, auth.TrustedProxies)
+
+	// 显式 origins 优先，且切片是副本。
+	cfg.HTTP.AdminAuth.AllowedOrigins = []string{"https://console.internal:9443"}
+	auth = adminAuthConfig(cfg, "127.0.0.1:9000")
+	require.Equal(t, []string{"https://console.internal:9443"}, auth.AllowedOrigins)
+	cfg.HTTP.AdminAuth.AllowedHosts[0] = "mutated:1"
+	cfg.HTTP.AdminAuth.AllowedOrigins[0] = "mutated:1"
+	require.Equal(t, []string{"127.0.0.1:9000", "localhost:9000"}, auth.AllowedHosts,
+		"投影必须是副本：改配置不得回写已交出的装配输入")
+	require.Equal(t, []string{"https://console.internal:9443"}, auth.AllowedOrigins)
+}
+
+// TestAdminAuthConfig_NonLoopbackNeedsExplicitHosts 判 D-10：非回环与通配监听**不派生**
+// 白名单，未显式列出即拒绝启动；显式列出后才放行（通配监听按同端口判定）。
+// Non-loopback and wildcard binds never derive; they start only when listed explicitly.
+func TestAdminAuthConfig_NonLoopbackNeedsExplicitHosts(t *testing.T) {
+	cfg := &cli.Config{HTTP: cli.HTTPConfig{AdminAuth: cli.AdminAuthConfig{
+		Mode:  "token",
+		Token: "test-token",
+	}}}
+
+	for _, listener := range []string{"192.168.1.10:8443", "0.0.0.0:8080", "[::]:8080"} {
+		auth := adminAuthConfig(cfg, listener)
+		require.Empty(t, auth.AllowedHosts, "非回环 / 通配监听不得派生 Host：%s", listener)
+		require.Empty(t, auth.AllowedOrigins)
+		require.Error(t, web.ValidateAdminAuth(auth, []string{listener}),
+			"未显式列出白名单必须拒绝启动：%s", listener)
+	}
+
+	// 通配监听：显式列出同端口的主机名即放行；origins 随显式 Host 派生。
+	cfg.HTTP.AdminAuth.AllowedHosts = []string{"127.0.0.1:8080", "basalt.internal:8080"}
+	auth := adminAuthConfig(cfg, "0.0.0.0:8080")
+	require.NoError(t, web.ValidateAdminAuth(auth, []string{"0.0.0.0:8080"}))
+	require.Equal(t, []string{"http://127.0.0.1:8080", "http://basalt.internal:8080"}, auth.AllowedOrigins)
+
+	// 具体非回环地址：监听地址本身在清单里才放行。
+	cfg.HTTP.AdminAuth.AllowedHosts = []string{"192.168.1.10:8443"}
+	auth = adminAuthConfig(cfg, "192.168.1.10:8443")
+	require.NoError(t, web.ValidateAdminAuth(auth, []string{"192.168.1.10:8443"}))
+}
+
+// TestListenAddr_DefaultsToLoopback 判安全缺省：未配置或空白地址一律落回环，
+// 绝不落成"全接口监听"；显式地址（含运维有意暴露的地址）原样使用。
+// An empty address stays loopback; explicit values pass through untouched.
+func TestListenAddr_DefaultsToLoopback(t *testing.T) {
+	require.Equal(t, "127.0.0.1:8080", listenAddr(nil), "配置缺失时不得落到全接口监听")
+	require.Equal(t, "127.0.0.1:8080", listenAddr(&cli.Config{}))
+	require.Equal(t, "127.0.0.1:8080", listenAddr(&cli.Config{HTTP: cli.HTTPConfig{Addr: "   "}}))
+	require.Equal(t, "0.0.0.0:9000", listenAddr(&cli.Config{HTTP: cli.HTTPConfig{Addr: "0.0.0.0:9000"}}),
+		"显式地址原样使用——是否安全由启动校验判定")
 }
 
 // TestWebProviders_NoCredentialFields 断言 /info 的 provider 摘要形状：模型列表
@@ -185,6 +337,9 @@ func TestNewRuntime_MaxConcurrentRuns(t *testing.T) {
 		blocker.Release()
 		require.NoError(t, rt.Close())
 	})
+	// 直接装配（不走夹具的自动启用）：基线写下的 disabled 必须先经真实迁移入口启用，
+	// 否则本用例判到的会是生命周期准入而不是并发上限（同一处 Run 入口，见 D-01 A）。
+	f.enableAgents(t, rt)
 
 	ctx := context.Background()
 	first := make(chan error, 1)
@@ -316,5 +471,105 @@ func TestWebOptions_SchedulesWired(t *testing.T) {
 	require.NotNil(t, opts.Schedules, "调度器必须注入 web.Options.Schedules（重路径恒构造）")
 	require.Same(t, rt.scheduler, opts.Schedules, "web 端口必须指向装配出的同一个调度器实例")
 	require.NotNil(t, opts.Runs, "运行入口是归档的唯一写面")
-	require.Same(t, rt.service, opts.Runs, "Runs 必须指向唯一运行入口（AgentService.Archive）")
+	adapter, ok := opts.Runs.(*runService)
+	require.True(t, ok, "Runs 必须是装配层适配器：*core.AgentService 方法集缺 ListRuns / GetRun（§3.1.31）")
+	require.Same(t, rt.service, adapter.Service, "Run / Archive / Cancel 必须指向唯一运行入口")
+	require.Same(t, rt.runs, adapter.Runs, "ListRuns / GetRun 必须读 AgentService 写入的同一份账本")
+}
+
+// 中文验收点（T057 / 模块卡 §3.1.15 的 webOptions 行）：重路径装配的管理面七端口
+// 全部非 nil——Registry / Lifecycle / Operations / Resources / System / Sampler /
+// AgentAdmin；Registry 指向装配期唯一的注册表快照，System 读数走真实库（库版本 +
+// 三个运行计数 + 三类发布指针计数），Sampler 按注入时钟构造。
+// 逆改点：漏装任一端口（handler 固定 500）/ Registry 另建清单 / System 伪造零值 → 断言红。
+func TestRunService_WebOptionsManagementPortsWired(t *testing.T) {
+	f := newWireFixture(t)
+	f.writeAgent(t, "alpha", "read_file")
+	rt := f.assemble(t)
+
+	opts := f.app().webOptions(rt)
+	require.NotNil(t, opts.Registry, "Registry 必须装配（管理台与准入看到同一份快照）")
+	require.NotNil(t, opts.Lifecycle, "Lifecycle 必须装配（生命周期读面）")
+	require.NotNil(t, opts.AgentAdmin, "AgentAdmin 必须装配（内容读写 + 启停）")
+	require.NotNil(t, opts.Operations, "Operations 必须装配（操作记录读面）")
+	require.NotNil(t, opts.Resources, "Resources 必须装配（六条只读资源路由）")
+	require.NotNil(t, opts.System, "System 必须装配（概览数据库侧读数）")
+	require.NotNil(t, opts.Sampler, "Sampler 按注入时钟构造")
+
+	entries := opts.Registry.Entries()
+	require.Len(t, entries, 1)
+	require.Equal(t, "alpha", entries[0].Name)
+	require.True(t, entries[0].Registered, "夹具 Agent 已启用且注册")
+
+	ctx := context.Background()
+	readings, err := opts.System.ReadOverview(ctx)
+	require.NoError(t, err, "概览读数走真实库，不得因缺端口失败")
+	require.Equal(t, storage.SupportedSchemaVersion, readings.SchemaVersion)
+	require.Zero(t, readings.RunsRunning, "空账本的运行中计数是真实读数 0")
+	require.Zero(t, readings.RunsLast24h)
+	require.Zero(t, readings.RunsFailedLast24h)
+
+	// 资源计数与只读资源路由同一处数据源：逐类与 ListPointers 的条数相等。
+	for _, tc := range []struct {
+		kind core.ResourceKind
+		got  int64
+	}{
+		{core.ResourceModelConnection, readings.ModelConnections},
+		{core.ResourceMCPServer, readings.MCPServers},
+		{core.ResourceSkill, readings.Skills},
+	} {
+		pointers, err := rt.versions.ListPointers(ctx, tc.kind)
+		require.NoError(t, err)
+		require.EqualValues(t, len(pointers), tc.got, "%s 计数必须等于未删除发布指针数", tc.kind)
+	}
+	require.NotZero(t, readings.ModelConnections, "基线已为探针 provider 发布 v1 指针")
+
+	require.NotZero(t, opts.Sampler.Sample().SampledAt)
+}
+
+// 中文验收点（T057 / Demo C 行 55）：内容条件写经**生产 webOptions 装配**走通——
+// 读取返回强 ETag；带 If-Match 的整份替换经与热加载同一道装载期校验后落盘并替换
+// 注册表条目；候选不合法（缺 provider.model）按 invalid_input 拒绝且磁盘逐字节不变。
+// 逆改点：Validate 未接装载器（编辑器报"缺少装载期校验器"）/ 校验放行坏候选 /
+// 拒绝仍写盘 → 断言红。
+func TestAgentConsole_WiredThroughWebOptions(t *testing.T) {
+	f := newWireFixture(t)
+	f.writeAgent(t, "alpha", "read_file")
+	rt := f.assemble(t)
+
+	opts := f.app().webOptions(rt)
+	require.NotNil(t, opts.AgentAdmin, "内容读写端点必须由生产装配提供")
+
+	ctx := context.Background()
+	current, err := opts.AgentAdmin.ReadContent(ctx, "alpha")
+	require.NoError(t, err)
+	require.NotEmpty(t, current.ETag, "读取必须返回强 ETag")
+
+	updated := strings.Replace(current.Content, "你是「alpha」。", "你是「alpha（已更新）」。", 1)
+	require.NotEqual(t, current.Content, updated, "夹具正文必须命中替换点")
+
+	files, err := opts.AgentAdmin.UpdateContent(ctx, "alpha",
+		core.AgentContentUpdate{Content: updated}, current.ETag, consoleActor())
+	require.NoError(t, err, "候选通过装载期校验后必须保存成功")
+	require.Equal(t, "alpha", files.Agent)
+	require.NotEmpty(t, files.Files, "成功返回该 Agent 的文件集合视图")
+
+	after, err := opts.AgentAdmin.ReadContent(ctx, "alpha")
+	require.NoError(t, err)
+	require.Equal(t, updated, after.Content)
+	require.NotEqual(t, current.ETag, after.ETag, "内容变化后 ETag 必须变化")
+	entry, ok := opts.Registry.Lookup("alpha")
+	require.True(t, ok)
+	require.True(t, entry.Registered, "写入后注册表保持注册（候选校验与热加载同一道规则）")
+
+	// 反例：候选缺 provider.model → 装载期校验拒绝为 invalid_input，磁盘逐字节不变。
+	broken := strings.Replace(updated, "  model: probe-model\n", "", 1)
+	require.NotEqual(t, updated, broken, "夹具必须命中 model 行")
+	_, err = opts.AgentAdmin.UpdateContent(ctx, "alpha",
+		core.AgentContentUpdate{Content: broken}, after.ETag, consoleActor())
+	var invalid *core.InvalidInputError
+	require.ErrorAs(t, err, &invalid, "坏候选必须按 invalid_input 拒绝")
+	onDisk, readErr := os.ReadFile(filepath.Join(f.root, agentsDirName, "alpha", "AGENT.md"))
+	require.NoError(t, readErr)
+	require.Equal(t, updated, string(onDisk), "拒绝时磁盘零写入")
 }

@@ -329,6 +329,8 @@ func testAgentLoopRedaction(t *testing.T) {
 
 // testAgentLoopSkillL1：技能声明即绑定，段一含 L1 三要素卡片、不含 SKILL.md 正文
 // （US-3 §6 Demo ③；渐进披露）。判据：卡片逐字为 name + description + 技能库路径。
+// 路径取发布版本真路径（US-11 约束 31 / D-02：Run 内按准入时固定的发布版本冻结，
+// 工作副本逻辑路径只用于快照清单与预览）。
 func testAgentLoopSkillL1(t *testing.T) {
 	const bodySentinel = "技能正文哨兵-5c1e：此正文不得进入段一。"
 	h := newHarness(t)
@@ -351,7 +353,7 @@ func testAgentLoopSkillL1(t *testing.T) {
 	system := systemPrompt(t, reqs[0])
 	requireContains(t, system, "## 技能", "段一技能小节")
 	requireContains(t, system,
-		"- digest-format：把内容整理成三段摘要（.basalt/skills/digest-format/SKILL.md）",
+		"- digest-format：把内容整理成三段摘要（.basalt/versions/skills/digest-format/1/SKILL.md）",
 		"L1 卡片三要素逐字")
 	requireAbsent(t, system, bodySentinel, "SKILL.md 正文不得预载进段一")
 }

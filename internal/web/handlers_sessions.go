@@ -288,10 +288,10 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("未找到该接口（%s %s）", r.Method, r.URL.Path))
 }
 
-// writeRunError 按错误类型映射 400 / 404 / 409 / 429 / 504 / 500（约束 22 / 43），
+// writeRunError 按错误类型映射 400 / 404 / 409 / 429 / 504 / 500（约束 22 / 37 / 43），
 // **不比对错误文本**；运行截止优先于错误类型判定（超时那一刻 Run 可能带回任意
-// wrapped error）。归档会话固定 400 + 冻结文案；500 只出固定文案，原始错误进
-// ERROR 日志（约束 23）。
+// wrapped error）。归档会话固定 400 + 冻结文案；生命周期不可用固定 409
+// `AGENT_UNAVAILABLE`；500 只出固定文案，原始错误进 ERROR 日志（约束 23）。
 // writeRunError maps typed errors to status codes and never matches on text.
 func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.Context) {
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
@@ -307,6 +307,17 @@ func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.
 	if errors.As(err, &agentErr) {
 		s.writeError(w, http.StatusNotFound, codeNotFound,
 			"Agent 请求名不存在或未注册："+agentErr.Name)
+		return
+	}
+	// 生命周期不可用是 409（约束 37），**必须先于**下面的 fs.ErrNotExist 判定：
+	// 状态文件缺失时 core 把 fs.ErrNotExist 挂在 Unwrap 链上，先判 fs 会把失败
+	// 关闭的 409 错报成 404。文案取 core 自产文本（原因 + 修复入口），底层错误
+	// 原文只经 Unwrap 隔离，不进入响应。
+	// The lifecycle refusal is checked before fs.ErrNotExist: the missing-state-file
+	// cause would otherwise turn a fail-closed 409 into a 404.
+	var unavailableErr *core.AgentUnavailableError
+	if errors.As(err, &unavailableErr) {
+		s.writeError(w, http.StatusConflict, codeAgentUnavailable, unavailableErr.Error())
 		return
 	}
 	if errors.Is(err, fs.ErrNotExist) {

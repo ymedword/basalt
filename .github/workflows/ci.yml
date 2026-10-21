@@ -1,9 +1,11 @@
 name: CI
 
-# 双 job 的拆分理由是 CGO 状态相反，不是"跑得快"：
-#   test  job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
-#   build job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
-# 参见 docs/DevelopmentLoop.md §2.2 的"三条实测纪律"。
+# job 按工具链边界拆分，不是"跑得快"：
+#   test    job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
+#   console job —— Node 前端工具链（npm ci / test / build + 产物可复现）。**必须**独立成
+#                  job：Go 门禁不调用 Node / npm，本机没有 Node 时 `make check` 照常判卷；
+#   build   job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
+# 参见 docs/DevelopmentLoop.md §2.2 的"三条实测纪律"；前端约束见模块卡约束 42。
 #
 # 触发面覆盖**所有分支**（`'**'` 只匹配分支、不匹配 tag）：US 分支一推即判卷，
 # 问题在分支阶段暴露，而不是等合回 main 才发现——US-4 的 runner_unix.go 就吃过这个亏
@@ -29,7 +31,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           # 与 go.mod 的 toolchain 行一致：准确构建版本由这两处表达。
-          go-version: "1.27.2"
+          go-version: "1.27.3"
           cache: true
 
       # 四检查工具固定版本安装——"干净检出 + Go"不足以跑全门禁。
@@ -102,6 +104,89 @@ jobs:
             grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_IsolatedControlWithoutImport\"" /tmp/tz.json
           '
 
+  console:
+    # 前端构建期工具链独立成 job（约束 42）：Go job **不得**调用 Node / npm——
+    # 本机没有 Node 时 `make check` 与验收入口必须照常判卷。Node 版本由
+    # `assets/console/.nvmrc` 固定，不依赖 runner 的默认版本。
+    # The Node toolchain is its own job; Go gates never invoke Node (constraint 42).
+    name: console（Node：npm ci / test / build + 产物可复现）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: assets/console
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node（版本由 .nvmrc 固定）
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: assets/console/.nvmrc
+          cache: npm
+          cache-dependency-path: assets/console/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Unit tests (Vitest)
+        run: npm test
+
+      - name: Build (typecheck + Vite + integrity manifest)
+        run: npm run build
+
+      # 可复现判据两条**同时**成立（约束 42）：
+      # ① 重建后的 dist 与提交树逐字节一致——`git status --porcelain` 连 `??` 未跟踪
+      #    文件一起判（新增文件不会被 `git diff` 看见，所以不得只看 diff）；
+      # ② 目录文件集合与 `integrity.json` 的 path 集合完全一致，且逐文件 sha256 相等。
+      # Two checks together: a clean worktree after rebuild (untracked files included)
+      # and manifest set/hash equality. `git diff` alone would miss new files.
+      - name: Verify rebuilt dist is reproducible and matches integrity.json
+        working-directory: .
+        run: |
+          set -euo pipefail
+          status=$(git status --porcelain -- assets/console/dist)
+          if [ -n "$status" ]; then
+            echo "前端构建不可复现：重新构建后 assets/console/dist 与提交树不一致" >&2
+            echo "$status" >&2
+            exit 1
+          fi
+          node <<'EOF'
+          const { createHash } = require('node:crypto');
+          const { readFileSync, readdirSync, statSync } = require('node:fs');
+          const { join, relative, sep } = require('node:path');
+
+          const root = 'assets/console/dist';
+          const manifest = JSON.parse(readFileSync(join(root, 'integrity.json'), 'utf8'));
+          const files = [];
+          const walk = (dir) => {
+            for (const name of readdirSync(dir).sort()) {
+              const full = join(dir, name);
+              if (statSync(full).isDirectory()) walk(full);
+              else files.push(relative(root, full).split(sep).join('/'));
+            }
+          };
+          walk(root);
+
+          const listed = Object.keys(manifest).sort();
+          const actual = files.filter((path) => path !== 'integrity.json').sort();
+          if (JSON.stringify(actual) !== JSON.stringify(listed)) {
+            console.error('integrity.json 的 path 集合与 dist 不一致');
+            console.error('  integrity.json:', listed);
+            console.error('  dist:', actual);
+            process.exit(1);
+          }
+
+          let failures = 0;
+          for (const path of actual) {
+            const sum = createHash('sha256').update(readFileSync(join(root, path))).digest('hex');
+            if (sum !== manifest[path]) {
+              console.error(`${path}: sha256 ${sum} != integrity.json 的 ${manifest[path]}`);
+              failures += 1;
+            }
+          }
+          if (failures > 0) process.exit(1);
+          console.log(`ok: ${actual.length} 个文件与 integrity.json 一致`);
+          EOF
+
   build:
     name: build（CGO_ENABLED=0 四平台交叉编译）
     runs-on: ubuntu-latest
@@ -110,7 +195,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.2"
+          go-version: "1.27.3"
           cache: true
 
       # 单二进制承诺的判据：无 CGO 也能出四平台产物。

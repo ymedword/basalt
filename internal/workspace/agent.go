@@ -117,6 +117,12 @@ type AgentLoader struct {
 	// rename is a test seam for the atomic replace; production leaves it nil.
 	rename func(root *os.Root, oldname, newname string) error
 
+	// contexts 是段一拼装与快照冻结的实现句柄：候选校验与运行期快照共用同一段组装
+	// 代码（内容写产出的段一 / 清单与下一次运行冻结的口径必须一致）。
+	// contexts is the shared section-one assembler used by candidate validation and
+	// by the run snapshot path.
+	contexts *ContextLoader
+
 	providers    []string
 	tools        []string
 	mcpServers   []string
@@ -133,6 +139,7 @@ func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 		logger = slog.Default()
 	}
 	return &AgentLoader{
+		contexts:     NewContextLoader(logger),
 		providers:    slices.Clone(opts.Providers),
 		tools:        slices.Clone(opts.Tools),
 		mcpServers:   slices.Clone(opts.MCPServers),
@@ -274,6 +281,11 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 	if err != nil {
 		return entry, reject{reason: "read AGENT.md failed", detail: defPath}
 	}
+	// 本次读到的字节就是这只 Agent 的**校验字节**：运行快照（content_loader.freeze）从它
+	// 冻结，不重读磁盘——注册表与快照因此共用同一份配置（review ② 缺陷 1）。
+	// The bytes read here are the agent's validated definition; run snapshots freeze
+	// from them instead of re-reading the disk.
+	entry.Definition = raw
 
 	// 同一份字节：先未知键扫描、再解 DTO（不得把文件读两遍——陷阱 39）。
 	profile, warns, err := parseFrontmatter(raw)
@@ -291,23 +303,43 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 
 	l.warnLocalSkillsDir(base, name)
 
+	rej, deferred := l.validateProfile(base, lib, name, profile, mcpNames, mcpConnected, claim)
+	if rej.reason != "" {
+		return entry, rej
+	}
+	if deferred {
+		// 第三态（待决 #2）：只标记，不放行、不参与运行；确定性规则已在 validateProfile
+		// 内先行拒载。
+		entry.Unverified = true
+		l.logger.Info("Agent 注册待确认", "agent", name)
+	}
+	return entry, rej
+}
+
+// validateProfile 对一份**已解析**的 Profile 执行装载期全部规则（规则 1–8）；读取与
+// 解析由调用方负责——loadOne 读目录里的 AGENT.md，ValidateCandidate 读内存候选字节，
+// 两条路径因此判定的是同一段代码（内容条件写与热加载同一道闸门）。返回首个失败的
+// reject；全过时 reject.claimed 是本只的占用集，deferred 表示存在连接结果未知的第三态。
+// validateProfile applies the load-time rules to an already-parsed profile; both the
+// directory loader and the candidate validator judge through this one function.
+func (l *AgentLoader) validateProfile(base, lib *os.Root, name string, profile *core.Profile, mcpNames, mcpConnected []string, claim map[string]string) (reject, bool) {
 	if profile.Name != name { // 规则 1
-		return entry, reject{
+		return reject{
 			reason: "name mismatch",
 			detail: fmt.Sprintf("目录名 %s 与 frontmatter name %s 不一致", name, profile.Name),
-		}
+		}, false
 	}
 	if !slices.Contains(l.providers, profile.Provider.Name) { // 规则 2
-		return entry, reject{reason: "provider not registered: " + profile.Provider.Name}
+		return reject{reason: "provider not registered: " + profile.Provider.Name}, false
 	}
 	if strings.TrimSpace(profile.Provider.Model) == "" { // 规则 3（占位文本是普通文本，天然放行）
-		return entry, reject{reason: "blank model"}
+		return reject{reason: "blank model"}, false
 	}
 	if t := profile.Provider.Temperature; t != nil && !validTemperature(*t) { // 契约 §2 字段约束
-		return entry, reject{
+		return reject{
 			reason: "invalid provider.temperature",
 			detail: "已声明的 temperature 必须落在 0–2 且有限，实际 " + strconv.FormatFloat(*t, 'g', -1, 64),
-		}
+		}, false
 	}
 	// 规则 4（tools 全部可解析）自 US-4 起**执行**：声明的名字必须落在注册池内，
 	// 缺一即整只不注册并点名（§2.4 注 4）。报的是**声明序**里的第一个缺名——遍历
@@ -325,40 +357,132 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 			deferred = true
 			continue
 		}
-		return entry, reject{reason: "tool not registered: " + toolName}
+		return reject{reason: "tool not registered: " + toolName}, false
 	}
 	if missing := missingSkill(lib, profile.Skills); missing != "" { // 规则 5
-		return entry, reject{reason: "skill not found: " + missing}
+		return reject{reason: "skill not found: " + missing}, false
 	}
 	// 规则 6（US-7 全条）：先判**已配置**、再判**已连接**——存在但未连接的 server
 	// 与不存在的 server 同判（R4）；轻路径连接结果未知时只标记待确认。
 	for _, m := range profile.MCPServers {
 		if !slices.Contains(mcpNames, m) {
-			return entry, reject{reason: "mcp server skipped", detail: m}
+			return reject{reason: "mcp server skipped", detail: m}, false
 		}
 		if mcpConnected == nil && len(mcpNames) > 0 {
 			deferred = true
 			continue
 		}
 		if !slices.Contains(mcpConnected, m) {
-			return entry, reject{reason: "mcp server skipped", detail: m}
+			return reject{reason: "mcp server skipped", detail: m}, false
 		}
 	}
 	for _, b := range profile.Bootstrap { // 规则 7
 		if detail, ok := checkBootstrapEntry(base, b); !ok {
-			return entry, reject{reason: "bootstrap file missing", detail: detail}
+			return reject{reason: "bootstrap file missing", detail: detail}, false
 		}
 	}
 	claimed, err := validateSchedules(profile.Name, profile.Schedules, claim) // 规则 8
 	if err != nil {
-		return entry, reject{reason: "invalid schedule", detail: err.Error()}
+		return reject{reason: "invalid schedule", detail: err.Error()}, false
+	}
+	return reject{claimed: claimed}, deferred
+}
+
+// ValidateCandidate 用**与装载同一道**规则判定一份候选 AGENT.md（内存字节，不落盘），
+// 成功时返回已注册条目、段一正文与冻结清单（三者出自同一份候选字节）。它是内容条件写
+// 的装载期闸门（模块卡 §3.1.13 / 图 D）：候选必须通过 loadOne 的全部规则 1–8，并以其
+// 他已注册 Agent 的调度占用为基线判定 id 冲突（被编辑 Agent 自身的旧占用不参与）。
+// ValidateCandidate judges an in-memory AGENT.md candidate through the very rules the
+// directory loader uses, returning the registered entry, section one and frozen manifest.
+func (l *AgentLoader) ValidateCandidate(root string, entries []core.AgentEntry, agent string, candidate []byte, now time.Time) (core.AgentEntry, string, []core.ManifestEntry, error) {
+	if err := ValidateAgentName(agent); err != nil {
+		return core.AgentEntry{}, "", nil, err
+	}
+	// 与 LoadAll / ApplySchedule 共用同一把写锁：候选校验读的是同一批目录文件
+	//（技能库、bootstrap、mcp_servers.yaml），不得与装载或调度写入交错。
+	l.writeMu.Lock()
+	defer l.writeMu.Unlock()
+
+	base, err := os.OpenRoot(root)
+	if err != nil {
+		return core.AgentEntry{}, "", nil, fmt.Errorf("打开工作区目录 %s: %w", root, err)
+	}
+	defer func() {
+		if closeErr := base.Close(); closeErr != nil {
+			l.logger.Warn("关闭工作区目录失败", "root", root, "error", closeErr)
+		}
+	}()
+	lib, err := openSkillsRoot(root)
+	if err != nil {
+		return core.AgentEntry{}, "", nil, err
+	}
+	if lib != nil {
+		defer func() {
+			if closeErr := lib.Close(); closeErr != nil {
+				l.logger.Warn("关闭技能库目录失败", "detail", skillsDirName, "error", closeErr)
+			}
+		}()
+	}
+
+	// 已配置 server 名集与 LoadAll 同口径：重路径注入、轻路径自读。
+	mcpNames := l.mcpServers
+	if mcpNames == nil {
+		specs, parseErr := parseMCPServers(base)
+		if parseErr != nil {
+			return core.AgentEntry{}, "", nil, parseErr
+		}
+		mcpNames = mcpServerNames(specs)
+	}
+
+	profile, warns, err := parseFrontmatter(candidate)
+	for _, w := range warns {
+		// 未知键同样只 WARN 不拒载；detail 只放键路径、不打印值（与 loadOne 同口径）。
+		l.logger.Warn("frontmatter 含未知键——已忽略", "agent", agent,
+			"reason", "unknown frontmatter key", "detail", w)
+	}
+	if err != nil {
+		return core.AgentEntry{Name: agent}, "", nil,
+			errors.New("invalid frontmatter: " + frontmatterErrorSummary(err))
+	}
+
+	// Definition 记候选字节（拷贝一份：调用方的切片可能被复用），与 loadOne 同口径——
+	// 候选通过后的发布与随后的运行快照读的是同一份已校验字节。
+	entry := core.AgentEntry{Name: agent, Profile: profile, Definition: slices.Clone(candidate)}
+	rej, deferred := l.validateProfile(base, lib, agent, profile, mcpNames, l.mcpConnected,
+		candidateClaims(entries, agent))
+	if rej.reason != "" {
+		return entry, "", nil, errors.New(rej.mergedReason())
 	}
 	if deferred {
-		// 第三态（待决 #2）：只标记，不放行、不参与运行；确定性规则已在上面先行拒载。
-		entry.Unverified = true
-		l.logger.Info("Agent 注册待确认", "agent", name)
+		// 连接结果未知（轻路径）下无法确认池外工具名与 MCP 声明——候选不得被当成已注册。
+		return entry, "", nil, errors.New("候选配置引用了待确认的 MCP 工具名，当前进程无法完成校验")
 	}
-	return entry, reject{claimed: claimed}
+	entry.Registered = true
+
+	frozen, err := l.contexts.freezeBytes(base, root, agent, candidate, now, nil)
+	if err != nil {
+		return entry, "", nil, err
+	}
+	return entry, frozen.section, frozen.manifest, nil
+}
+
+// candidateClaims 从当前注册表快照重建候选校验的占用基线：只收已注册且有 Profile 的
+// 其他条目（被编辑 Agent 的旧占用由候选重新声明，必须排除，否则任何任务都无法保留原 id）。
+// candidateClaims rebuilds the schedule-claim baseline from the live registry, skipping
+// the agent under edit so its own declared ids are not self-conflicting.
+func candidateClaims(entries []core.AgentEntry, editing string) map[string]string {
+	claim := make(map[string]string)
+	for _, entry := range entries {
+		if entry.Name == editing || !entry.Registered || entry.Profile == nil {
+			continue
+		}
+		for _, schedule := range entry.Profile.Schedules {
+			if id := strings.TrimSpace(schedule.ID); id != "" {
+				claim[id] = entry.Name
+			}
+		}
+	}
+	return claim
 }
 
 // warnLocalSkillsDir 对「Agent 本地 skills/ 目录存在」记一条 WARN（遗留形态备案）：

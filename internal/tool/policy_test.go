@@ -114,6 +114,86 @@ func TestWhitelistPolicy_AllowsReadInOwnAgentDirAndSkillsLibrary(t *testing.T) {
 	}
 }
 
+// TestWhitelistPolicy_AllowsOnlyRunBoundSkillVersionReads 覆盖约束 31 的读档边界（人工
+// review ② F1 / 模块卡行 610）：发布版本目录只放行**本次 Run 绑定的**那个——同技能的其它
+// 版本、未带绑定、绑定值不合契约字面量一律拒；写入整树拒绝，绑定不放宽只读。
+// 逆改点：checkFileRead 退回 `withinDir(real, p.skillVersionsDir())` → 未绑定版本断言红。
+// Only the version directories bound to this run are readable (human review ② F1).
+func TestWhitelistPolicy_AllowsOnlyRunBoundSkillVersionReads(t *testing.T) {
+	f := newPolicyFixture(t, nil)
+	for _, version := range []string{"1", "2"} {
+		dir := f.path(filepath.Join("versions", "skills", "demo-skill", version))
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("正文\n"), 0o644))
+	}
+	const bound = ".basalt/versions/skills/demo-skill/1"
+	v1 := filepath.Join("versions", "skills", "demo-skill", "1", "SKILL.md")
+	v2 := filepath.Join("versions", "skills", "demo-skill", "2", "SKILL.md")
+
+	boundRead := readAction(v1, policyAgent)
+	boundRead.SkillDirs = []string{bound}
+	requireAllowed(t, f.policy, boundRead)
+
+	// 目录本身也可枚举（list_dir 走同一个读判定），未绑定目录不可。
+	boundList := readAction(filepath.Dir(v1), policyAgent)
+	boundList.SkillDirs = []string{bound}
+	requireAllowed(t, f.policy, boundList)
+
+	unboundRead := readAction(v2, policyAgent)
+	unboundRead.SkillDirs = []string{bound}
+	requireRefused(t, f.policy, unboundRead, "读取目标不在可读根之内")
+
+	// 没有绑定 = 没有可读的版本目录（失败关闭，不是"退回整树放行"）。
+	requireRefused(t, f.policy, readAction(v1, policyAgent), "读取目标不在可读根之内")
+
+	// 绑定面只认契约字面量：整棵树 / 缺 `.basalt/` 前缀 / 绝对路径 / 爬级都**不**放宽一格。
+	malformed := readAction(v2, policyAgent)
+	malformed.SkillDirs = []string{
+		".basalt/versions/skills",
+		"versions/skills/demo-skill/2",
+		f.path(filepath.Join("versions", "skills", "demo-skill", "2")),
+		".basalt/versions/skills/demo-skill/../2",
+		".basalt/versions/skills/demo-skill/02",
+	}
+	requireRefused(t, f.policy, malformed, "读取目标不在可读根之内")
+
+	// 写入不受绑定影响：整棵发布版本树仍然只读。
+	boundWrite := writeAction(v1, policyAgent)
+	boundWrite.SkillDirs = []string{bound}
+	requireRefused(t, f.policy, boundWrite, "技能库不可写入")
+}
+
+// TestWhitelistPolicy_RefusesSkillWorkCopyReadInsideRun 覆盖 F-04 B1：Run 内**一律**拒绝
+// 技能工作副本的读 / 列目录——包括本次 Run 一个技能都没绑定的情况；绑定的发布版本目录
+// 仍可读，非 Run 调用保留既有规则。逆改点：checkFileRead 去掉 `action.RunBound` 分支
+// → 前两条拒绝断言红。
+// Within a run the skill work copy is never readable, bound or not; non-run callers
+// keep the existing rules and bound version directories stay readable.
+func TestWhitelistPolicy_RefusesSkillWorkCopyReadInsideRun(t *testing.T) {
+	f := newPolicyFixture(t, nil)
+	workCopy := filepath.Join("skills", "demo-skill", "SKILL.md")
+	require.NoError(t, os.MkdirAll(f.path(filepath.Join("skills", "demo-skill")), 0o750))
+	require.NoError(t, os.WriteFile(f.path(workCopy), []byte("正文\n"), 0o644))
+	boundDir := f.path(filepath.Join("versions", "skills", "demo-skill", "1"))
+	require.NoError(t, os.MkdirAll(boundDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(boundDir, "SKILL.md"), []byte("正文\n"), 0o644))
+
+	requireAllowed(t, f.policy, readAction(workCopy, policyAgent))
+
+	runRead := readAction(workCopy, policyAgent)
+	runRead.RunBound = true
+	requireRefused(t, f.policy, runRead, "技能工作副本在运行中不可读")
+
+	runList := readAction(filepath.Dir(workCopy), policyAgent)
+	runList.RunBound = true
+	requireRefused(t, f.policy, runList, "技能工作副本在运行中不可读")
+
+	boundRead := readAction(filepath.Join("versions", "skills", "demo-skill", "1", "SKILL.md"), policyAgent)
+	boundRead.SkillDirs = []string{".basalt/versions/skills/demo-skill/1"}
+	boundRead.RunBound = true
+	requireAllowed(t, f.policy, boundRead)
+}
+
 // TestWhitelistPolicy_AllowsCrossAgentReadWhenAuthorized 覆盖 F2：跨 Agent 读取**显式授权**后放行
 // （授权键 = sandbox.cross_agent_read；缺省空 = 一个都不许）。
 // Acceptance point (F2): an explicitly authorized cross-agent read goes through.
@@ -251,6 +331,59 @@ func TestWhitelistPolicy_ProtectionRulesPrecedeGeneralAllow(t *testing.T) {
 	}
 	// 对照组：同一目录下的普通文件放行（证明断言的是顺序，不是"写什么都拒"）。
 	requireAllowed(t, f.policy, writeAction(filepath.Join("agents", policyAgent, "notes", "ok.txt"), policyAgent))
+}
+
+// TestWhitelistPolicy_RefusesProtectedControlDir 覆盖约束 30（R21）：`.basalt/control/`
+// 对文件工具**读写一律拒**——状态文件若可写，模型就能自己改生命周期（自己启用自己）。
+// 判定在真实路径投影之后按前缀进行：`..` 绕行与软连接绕回控制目录同样命中，且拒绝必须
+// 出自控制目录这条固定规则，不得落成"工作区之外"的泛规则（两类原因对模型是两回事）。
+// Acceptance point (R21): the control directory is refused for reads and writes alike,
+// by its own rule, on the projected real path.
+func TestWhitelistPolicy_RefusesProtectedControlDir(t *testing.T) {
+	f := newPolicyFixture(t, nil)
+	stateFile := filepath.Join("control", "agents", policyAgent+".json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.path(stateFile)), 0o750))
+	require.NoError(t, os.WriteFile(f.path(stateFile), []byte(`{"state":"active"}`), 0o644))
+
+	for _, tc := range []struct {
+		name   string
+		target string
+	}{
+		{"state-file", stateFile},
+		{"directory-itself", "control"},
+		// 词法绕行：从自有目录爬两级回到控制目录——投影之后必须仍落在控制目录前缀内。
+		{"dot-dot-detour", "agents/" + policyAgent + "/../../control/agents/" + policyAgent + ".json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			readMessage := requireRefused(t, f.policy, readAction(tc.target, policyAgent), "受保护控制目录")
+			require.NotContains(t, readMessage, "读取目标不在可读根之内",
+				"控制目录必须出自专用规则，不得被泛规则顺带挡下")
+			writeMessage := requireRefused(t, f.policy, writeAction(tc.target, policyAgent), "受保护控制目录")
+			require.NotContains(t, writeMessage, "写入目标超出当前 Agent 的可写范围")
+			require.NotContains(t, writeMessage, "AGENT.md 是受保护文件",
+				"控制目录规则先于同名文件保护规则")
+		})
+	}
+}
+
+// TestWhitelistPolicy_RefusesSymlinkIntoControlDir 覆盖约束 30 的投影面：自有目录里的
+// 链接指向控制目录，投影后落在禁区之内——拒绝看的是真身，不是链接的落点。
+// 单独成例（不并入上一条）：本机（Windows 未开开发者模式）建不了软连接时整例跳过，
+// 不得让跳过的平台把上一条的其它断言一起报成 SKIP。
+// Acceptance point (R21): a symlink that resolves into the control directory is refused.
+func TestWhitelistPolicy_RefusesSymlinkIntoControlDir(t *testing.T) {
+	f := newPolicyFixture(t, nil)
+	controlAgents := f.path(filepath.Join("control", "agents"))
+	require.NoError(t, os.MkdirAll(controlAgents, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(controlAgents, policyAgent+".json"), []byte(`{"state":"active"}`), 0o644))
+	link := f.path(filepath.Join("agents", policyAgent, "state-link"))
+	if err := os.Symlink(controlAgents, link); err != nil {
+		t.Skip("本平台不允许创建符号链接（Windows 需开发者模式或特权）：" + err.Error())
+	}
+
+	target := filepath.Join("agents", policyAgent, "state-link", policyAgent+".json")
+	requireRefused(t, f.policy, readAction(target, policyAgent), "受保护控制目录")
+	requireRefused(t, f.policy, writeAction(target, policyAgent), "受保护控制目录")
 }
 
 // TestWhitelistPolicy_RefusesMultiWordExecutable 覆盖 F12：多词串必拒——

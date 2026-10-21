@@ -38,7 +38,8 @@ type RunResult struct {
     FinalText  string    // 最终回答文本；limit_reached / cancelled 时可能为空
     Iterations int       // 实际消耗的 ReAct 轮次
     ToolCalls  int       // 实际执行的工具调用次数
-    ConfigHash string    // 本次运行使用的配置快照版本
+    ConfigHash string    // 本次运行使用的配置快照版本（ConfigSnapshot.hash，原义不变）
+    ManifestHash string  // 本次运行的 RunResourceManifest 哈希；旧版未记录时为空
     Reason     string    // 非正常终止的可读原因（limit_reached / failed 时必填）
 }
 
@@ -52,14 +53,48 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 // RunEnv 是循环内部持有的运行环境：由 AgentService 依 RunRequest 与配置快照构造，值传递。
 // 本节是 RunEnv / ToolEnv 字段字的唯一事实源——技术方案与实现**不得**另抄字段清单。
 type RunEnv struct {
-    Req      RunRequest
-    Snapshot *ConfigSnapshot // 本次运行冻结的配置快照（agent_name + hash + content；中途改盘不换配置）
-    Session  *Session        // 会话历史读写；无状态调用时为仅内存的临时会话
-    Budget   Budget          // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（见 §6）
-    ToolSet  []string        // 本轮可用工具名（Profile 的 tools 解析结果，空 = 无工具）
+    Req       RunRequest
+    Snapshot  *ConfigSnapshot     // 本次运行冻结的配置快照（agent_name + hash + content；中途改盘不换配置）
+    Resources *RunResourceManifest // 准入时固定的资源版本清单（见下）；旧版 Run 为空
+    Session   *Session            // 会话历史读写；无状态调用时为仅内存的临时会话
+    Budget    Budget              // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（见 §6）
+    ToolSet   []string            // 本轮可用工具名（Profile 的 tools 解析结果，空 = 无工具）
 }
 
-// ToolEnv 是传给每个工具的执行环境：由 ToolExecutor 在每次调用前构造、值传递。
+// RunResourceManifest 是准入时固定的资源版本清单。它与 ConfigSnapshot 是两份记录：
+// config_hash 保持 ConfigSnapshot 原义；本清单单独记录 Provider / MCP / 技能的发布版本，
+// 不得倒写进 config_hash，也不得用当前版本给历史 Run 补造。
+type RunResourceManifest struct {
+    FormatVersion  int                 // 清单格式版本；首版为 1
+    Hash           string              // 本清单规整序列化的 sha256
+    AgentLifecycle string              // 准入时的生命周期状态（只可能为 active）
+    Provider       ResourceVersionRef  // 本 Run 使用的 Provider 发布版本
+    MCPServers     []ResourceVersionRef // 实际生效的 MCP 版本（待重启内容不算）
+    Skills         []SkillVersionRef    // 每个绑定技能的已发布版本与完整文件清单
+}
+
+// ResourceVersionRef 指向一个不可变资源版本。
+type ResourceVersionRef struct {
+    Name        string // provider / MCP server / 技能名
+    VersionID   int64  // resource_versions.id
+    VersionNo   int    // 逐资源版本号（1 起）
+    ContentHash string // 版本内容哈希（sha256 十六进制小写）
+}
+
+// SkillVersionRef 额外冻结完整 L1/L2/L3 文件清单；Run 内按需读取时从此清单取。
+type SkillVersionRef struct {
+    ResourceVersionRef
+    Files []FileHash // 按 path 升序；path 相对技能目录
+}
+
+// FileHash 是技能清单中的一个文件。
+type FileHash struct {
+    Path   string
+    SHA256 string // 十六进制小写
+    Size   int64
+}
+
+// ToolEnv 是传给每个工具的执行环境：由 ReAct 循环经 `RunEnv.ToolEnv` 构造、值传递（ToolExecutor 只接收它并执行）。
 // 工具的 Execute 方法**必须**显式接收它——业务参数（工作目录、作用域、身份）不走包级变量与 context。
 type ToolEnv struct {
     RunID          string        // 关联审计的 Run
@@ -68,6 +103,8 @@ type ToolEnv struct {
     AgentDir       string        // Agent 目录绝对路径；空串 = 无上下文
     Timeout        time.Duration // 本次调用生效的超时（工具默认 / Profile 覆盖 / 剩余预算三者取最小，见 §6）
     MaxOutputBytes int           // 输出截断上限
+    SkillDirs      []string      // 本次 Run 准入绑定的技能发布目录（storage_path 字面量，如 `.basalt/versions/skills/<name>/<no>`）；文件工具只对这些目录只读放行，空 = 无绑定（版本树一律拒）
+    RunBound       bool          // 本次调用来自一次 Run（循环构造 ToolEnv 时置 true）；**不得**由 RunID / SkillDirs 推断。Run 内文件工具拒绝技能工作副本（`.basalt/skills`），空绑定也一样
 }
 ```
 
@@ -120,6 +157,8 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 
 **状态只前进一次**：`running` → 任一终态，**不得**从终态回退。崩溃恢复时未完成的行由重启流程标记（见 §4.3）。
 
+Run 进入终态时，**在同一事务内**把该 Run 的 `run_resource_refs.released_at` 写为当前时间（最后引用释放后版本才可回收）；事务失败时 Run 仍可停在 `running` 或引用仍未释放，由启动恢复按终态 Run 补齐。**不得**先删引用行来“释放”——行是历史证据，释放只置 `released_at`。
+
 ---
 
 ## 3. 并发与准入
@@ -151,6 +190,22 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 - **客户端重传 = 新的一次 Run**：客户端（含管理台"重试"按钮）手工重发同一消息，服务端**视为全新运行**，同一份 `http_post` / `notify` 可能因此再次执行。服务端**无法识别**它是重传——v0.1 **不做**幂等键
 
 > **幂等键登记为扩展阶段**：届时消息端点接受调用方提供的幂等键，服务端落库去重（同键返回上次结果）。核心阶段调用方自己的对账手段：`GET /runs?session_id=` 查这次动作实际产生了几个 Run（见 [openapi.yaml](openapi.yaml)）。
+
+### 3.4 Agent 级准入一致性边界
+
+Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写锁**（`AgentGate`），所有入口（HTTP、CLI、定时器、内部调用）都必须经过；资源发布与准入另共用**进程级唯一**的 `ResourceGate`（发布写锁、准入读租约，进程内不得出现第二套互斥）。两道锁分工：
+
+| 操作 | 持锁方式 | 边界内动作 |
+| --- | --- | --- |
+| Run 准入 | `AgentGate` 读锁 | 重读状态文件并校验（`active` 才放行）；**只覆盖状态重读与校验这一小段**，判定后立即释放——状态放行判定即准入线性化点 |
+| Run 准入 | `ResourceGate` 读租约 | 校验通过后取得：解析并固定 `RunResourceManifest`（Provider / MCP / 技能发布版本与哈希）；租约覆盖"资源解析 → 固定资源 → `StartRun` 事务成功"，失败路径归还租约并释放已固定运行时 |
+| 禁用 / 启用 | `AgentGate` 写锁 | 校验 `expected_state` / `expected_generation` → 原子写状态文件（generation + 1）→ 更新生命周期索引 |
+| 归档 | `AgentGate` 写锁 | 注销定时 → 标记 `archived` → 移出注册索引 → 取消在跑 Run 并等待 → 移动目录；失败按 §9.4 查证并恢复注册 |
+
+- **禁用不取消已在跑的 Run**：它们继续完成；禁用返回后该 Agent 不再接受新 Run。但准入线性化点在状态放行判定——在禁用写锁取得**之前**已判定放行（并随即释放读锁）的准入，仍可能在禁用返回后完成 `StartRun`；**不得**声称"禁用返回即保证没有新 Run 开始"。归档才取消并等待。
+- 状态文件缺失 / 损坏时，准入在锁内直接拒绝（`409 AGENT_UNAVAILABLE`），**不得**回退为“按目录存在即 active”。
+- `AgentGate` 读锁只覆盖"重读状态文件并校验"，**不得**跨越资源解析、LLM 调用或工具执行；"资源已固定、账本未落库"的窗口由 `ResourceGate` 读租约覆盖（到 `StartRun` 事务成功为止），发布写锁因此插不进来；Run 开始后配置与资源版本已固定。
+- 归档等待有界（缺省 30 秒）；超时返回 `409 AGENT_BUSY` 并点名仍在运行的 Run，注册与生命周期状态回滚到归档前。
 
 ---
 
@@ -202,7 +257,7 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 3. **逐组修复，且与 Run 状态修复放进同一个短事务**：对每个含半截组的 Run（`messages.run_id`），在**一个事务**里做完两件事再提交——按 §4.4 补齐该 Run **全部**半截组缺的结果（合成结果只写 `messages`），并把该 Run 若仍是 `running` 则一并标 `failed`、`reason = '进程中断（启动时发现未完成的运行）'`、写 `finished_at`。崩溃发生在提交前 → 整个事务回滚，组与 Run 都保持原样，下次启动重新扫到；提交后 → 两者同时落地。因此**"Run 已翻成 failed 而组仍半截"这一中间态不可能持久化**
    - 半截组的 `run_id` 为空、或找不到对应 `runs` 行（异常数据）→ **仍然补组**（Run 状态无从修复），记 WARN 点名该 `run_id` 与会话
    - 崩溃时的 Run 一律标 `failed`，即使它当时正走在取消路径上：进程死在把 `cancelled` 写下来之前，"已取消"是没写成的意图、不是事实
-4. **收尾剩余 `running` 的 Run（这一步扫 `runs` 表）**：第 3 步只覆盖**含半截组**的 Run，而崩溃还会留下**没有半截组可补**的 `running` 行——典型三种：正在等第一次 LLM 响应（还没有 `tool_calls` 落库）；最终回答已落库但终态未写；无状态 `invoke`（不落会话消息，消息里根本没有它的组）。它们同样必须收尾。故在**补组完成之后、开放服务之前**再扫一次 `runs`：仍为 `running` 的行全部 → `failed`、`reason = '进程中断（启动时发现未完成的运行）'`、写 `finished_at`。第 3 步与第 4 步互补——**"这个组补齐了吗"只有消息能答，"这个 Run 结束了吗"只有 `runs` 能答**，两件事的入口不同，缺任何一个都会留下"永远 running"的记录
+4. **收尾剩余 `running` 的 Run，并释放已终态 Run 的资源引用（这一步扫 `runs` 表）**：第 3 步只覆盖**含半截组**的 Run，而崩溃还会留下**没有半截组可补**的 `running` 行——典型三种：正在等第一次 LLM 响应（还没有 `tool_calls` 落库）；最终回答已落库但终态未写；无状态 `invoke`（不落会话消息，消息里根本没有它的组）。它们同样必须收尾。故在**补组完成之后、开放服务之前**再扫一次 `runs`：仍为 `running` 的行全部 → `failed`、`reason = '进程中断（启动时发现未完成的运行）'`、写 `finished_at`；**同一轮**把 `run_resource_refs` 中 `released_at IS NULL` 且所属 Run 已是终态的行补写释放时间（覆盖“Run 已终态但引用未释放”的崩溃窗口）。第 3 步与第 4 步互补——**"这个组补齐了吗"只有消息能答，"这个 Run 结束了吗"只有 `runs` 能答**，两件事的入口不同，缺任何一个都会留下"永远 running"的记录
 5. **工作区替换残留判定**（多文件提交的目录交换中断，见技术方案 §3.4.2）：有 `<agent>/.backup` 且正式目录缺失 → **回滚**（把 `.backup` 恢复为正式目录）；正式目录完整且 `.backup` 尚在 → **前滚**（删除 `.backup` 与 `.staging` 残留）。判定只看文件系统状态，幂等可重跑，结果记 INFO 日志
 6. 恢复过程记 INFO 日志（数据库与工作区两部分），条数写进启动摘要
 
@@ -275,15 +330,18 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 
 ## 7. 审计模型
 
-三张表共同回答"它当时为什么那样做"，全部挂在 `run_id` 下。完整 DDL 见 [schema.sql](schema.sql)。
+**三张运行审计表**共同回答"这一次运行为什么那样做"，全部挂在 `run_id` 下；**第四张管理操作表**回答"谁改了什么、结果如何"，使用独立 `operation_id`，不挂 `run_id`。完整 DDL 见 [schema.sql](schema.sql)。
 
-### 7.1 三张表的分工
+### 7.1 四张表的分工
 
 | 表 | 一行代表 | 关联键 |
 | --- | --- | --- |
 | `runs` | 一次运行 | `run_id`（主键） |
 | `llm_calls` | 一次模型调用 | `run_id` + `round`（该 Run 内第几轮） |
 | `tool_invocations` | 一次工具执行 | `run_id` + `tool_call_id`（模型给的调用标识） |
+| `management_operations` | 一次管理面高权限变更 / 管理探针 | `operation_id`（主键；**不挂** `run_id`） |
+
+管理操作**不得**混写为模型 / 工具调用，也**不得**为了复用 `llm_calls` 而伪造一次 Run。模型连接测试不产生 Run：它仍先写 `management_operations` 的 `pending` 行（预写失败不得发出调用），结果、provider / model、耗时与 token 用量记在脱敏的 `detail_json`。
 
 ### 7.2 审计失败策略：fail-closed
 
@@ -301,6 +359,14 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 | 调用 / 工具已发生，但**终态更新失败** | 行停在 `pending` | 记 ERROR 日志，行保持 `pending`；下次启动恢复标 `unknown`（§4.3.2） |
 | Run 的**终态持久化失败** | Run 行停在 `running` | 记 ERROR 日志；下次启动恢复标 `failed`（§4.3.2） |
 | 调用已发出但审计**预写**失败 | **不存在** | 预写先于发出（第 1 步）——失败即不发，这正是选择"预注册"而非"事后写"的原因 |
+
+管理面高权限变更使用**同一 fail-closed 方向、独立的操作契约**：
+
+1. 执行变更前先插入 `management_operations(status=pending)`；插入失败**不得**执行变更
+2. 变更完成后更新终态（`success` / `failed`）；终态更新失败记 ERROR，行保持 `pending`
+3. 启动恢复只对 `pending` 操作**查证实际结果**，再写 `success` / `failed` / `unknown` 与 `verification`（§9.4）；**不得**套用模型 / 工具调用的 `unknown` 规则，**不得**盲目重做
+
+管理操作的 `unknown` 表示“无法从当前文件 / 数据库 / 指针状态判断变更是否已生效”，不是“调用可能已发生”的同义句；两者不得混用。
 
 ### 7.3 失败分类
 
@@ -336,11 +402,118 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 | 200 | `LIMIT_REACHED` | Run 达迭代/工具次数上限 | 说明撞了哪条上限 + 可调配置键 |
 | 400 | `BAD_REQUEST` | 参数非法、名字不合法、路径越界、**超限**（消息 > 32 KB / 文件预览 > 256 KB） | 点名非法值或给出上限值 |
 | 400 | `UNSUPPORTED_TYPE` | 渠道类型未装配 | 点名支持的取值集合 |
-| 404 | `NOT_FOUND` | Agent / 会话 / 渠道 / 静态资源不存在 | 点名查不到的名字 |
+| 400 | `EDIT_UNSUPPORTED` | 结构化编辑无法在保留注释 / 未改内容的前提下完成 | 说明改用整份原文编辑；**不得**静默重排 |
+| 400 | `IMPORT_REJECTED` | 技能导入含软连接 / 越界路径 / 非普通文件 / 超限 | 点名违规路径与上限 |
+| 401 | `UNAUTHORIZED` | 管理凭据缺失或无效（token 模式或 local_trust 模式）；或 token 模式启动配置无效时的管理请求 | 不区分"没提供"与"提供错"，不回显 token |
+| 403 | `FORBIDDEN` | 跨源 / 来源被拒、Host 不在白名单、已认证但无权执行 | 说明被拒的边界；不回显内部路径 |
+| 404 | `NOT_FOUND` | Agent / 会话 / 渠道 / 资源 / 版本 / 归档不存在 | 点名查不到的名字 |
 | 409 | `SESSION_BUSY` | 同会话已有 Run 在执行 | 说明"等待完成或稍后重试" |
+| 409 | `AGENT_BUSY` | 归档 / 删除 Agent 时仍有 Run 未退出（有界等待超时） | 点名仍在运行的 run_id；状态已回滚 |
+| 409 | `AGENT_UNAVAILABLE` | Agent 生命周期状态文件缺失 / 损坏，或状态为 disabled / archived | 说明当前状态与修复入口；**不得**回退为 active |
+| 409 | `CONFLICT` | 同名资源 / Agent 已存在、复制或恢复目标名冲突、生命周期 expected_generation 不匹配 | 点名冲突对象与当前 generation |
+| 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
 | 429 | `TOO_MANY_RUNS` | 实例级并发超限 | 给出当前上限 |
+| 429 | `AUTH_RATE_LIMITED` | 同一来源管理认证失败次数超限 | 给出重试等待秒数 |
 | 500 | `INTERNAL` | 未归类错误 | **不回显内部细节**（路径、堆栈、SQL） |
 | 503 | `NOT_CONFIGURED` | 能力未配置（作者模型缺失等） | **点名配置键** + 说明怎么配 |
 | 504 | `TIMEOUT` | Run 超过调用方时限 | 给出时限值；Run 本身记为 `cancelled` |
 
 **错误文案纪律**：面向运维，点名"要改什么"；**不得**回显凭证、绝对路径、堆栈。沙箱拒绝的文案是**模型可见契约**（四段式，见技术方案 §4.3），与其他错误的读者不同——它的读者是模型，目的是让模型停止重试并告知人类。
+
+---
+
+## 9. 管理面认证、条件写与管理操作
+
+### 9.1 配置键
+
+管理面认证配置位于 `basalt.yaml` 的 `http.admin_auth` 段。键名是**固定字面量**；缺键、非法取值或无法解析都拒绝启动，**不得**静默取默认值。
+
+| 键 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `http.admin_auth.mode` | string | **是** | `token` / `local_trust`。未显式配置 → 拒绝启动；默认监听 `127.0.0.1` **不自动**等于已启用管理认证 |
+| `http.admin_auth.token` | string | `token` 模式必填 | 只允许 `${ENV_VAR}` 引用；解析后非空。明文 token、空值或未解析占位 → 拒绝启动 |
+| `http.admin_auth.allowed_hosts` | []string | 否 | 允许的 `Host`（含端口）。缺省按监听地址派生 `127.0.0.1:<port>` / `localhost:<port>` / `[::1]:<port>`；非回环部署必须显式列出 |
+| `http.admin_auth.allowed_origins` | []string | 否 | 允许的浏览器 Origin，**完整匹配**（`scheme://host[:port]`）。缺省与缺省 Host 的 `http://` 形态一致 |
+| `http.admin_auth.trusted_proxies` | []string | 否 | 可信反向代理的 CIDR。只有来自这些地址的转发头才可用于**来源归因**；**不得**用转发头证明回环本机信任 |
+
+- `mode=local_trust` 只在**所有监听地址都是回环**时允许；否则拒绝启动。
+- `mode=token` 且 token 未配置 / 解析为空 / 仍含 `${...}` → 拒绝启动。
+- 浏览器 token 只在**页面内存**保存；不得写 localStorage / sessionStorage / cookie / URL / 日志 / 审计。
+- admin token 不是调用方 API Key，也不是企业 SSO / RBAC；共享 token 只证明持有管理凭据，不提供按人追责。
+
+### 9.2 认证与请求保护
+
+| 模式 | 凭据 | 适用 |
+| --- | --- | --- |
+| `token` | `Authorization: Bearer <token>` | 回环与非回环管理部署；非回环必须经 HTTPS 或明确的可信加密通道 |
+| `local_trust` | 直接回环连接 + `X-Basalt-Local-Trust: 1` + Host / Origin 校验 | 仅直接回环；**不得**经反向代理 / 隧道使用 |
+
+无论哪种模式，管理请求都必须满足：
+
+1. Host 在白名单；缺失或不匹配 → 403 `FORBIDDEN`
+2. 浏览器来源的 Origin 必须完整匹配白名单；缺失 / `null` Origin **不得**单独作为放行依据
+3. 写请求（`POST` / `PUT` / `PATCH` / `DELETE`）必须是 JSON 内容类型（明确声明的端点除外），并经正文大小上限
+4. 转发头只信 `trusted_proxies`；**不得**因为 `X-Forwarded-For` 里出现 `127.0.0.1` 就判为回环本机信任
+5. 反向代理 / 转发**不得**因上游连接是回环而绕过认证；认证结论只看直接对端 + 配置模式
+6. 标准库 `http.CrossOriginProtection` 只覆盖其声明范围，不能代替 admin 认证或 Host 策略
+
+- 凭据缺失 / 无效：401 `UNAUTHORIZED`，响应不区分两种情形
+- 来源 / Host / Origin 被拒，或已认证但无权执行：403 `FORBIDDEN`
+- 同一来源 60 秒内失败 10 次：429 `AUTH_RATE_LIMITED`，`Retry-After` 给出剩余秒数；计数在进程内，重启清零
+- `/api/v1/health` 与静态页面壳可公开；其余管理数据读面与**所有可触发执行 / 修改的端点**（含 `POST /sessions`、`POST /sessions/{id}/messages`、`POST /agents/{name}/invoke`）一律认证
+
+### 9.3 管理操作标识与审计
+
+- 操作标识格式：`op-<unix_millis>-<6 位小写字母数字>`，全局唯一、可排序；**不是** `run_id`，不得伪造成 Run
+- 预写：变更前插入 `pending`；预写失败 → **不得执行变更**，向调用方返回 500 `INTERNAL`（审计不可用）
+- 终态：`success` / `failed`；失败原文截断 4 KB，且不得含凭证
+- 记录：`action`、`target_kind`、`target_id`、`actor_subject`、`auth_method`、`source`、`requested_version_id`、`expected_etag`、脱敏 `detail_json`、时间
+- actor：
+  - `bearer` → `actor_subject = token:<sha256(token) 前 16 位十六进制>`；token 明文不落盘
+  - `local_trust` → `actor_subject = local_trust`，语义为“未验证个人身份”
+  - CLI → `actor_subject = cli:<本机用户>`；不冒充管理台登录身份
+  - 迁移 → `actor_subject = migration`
+- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `system.baseline_v2`
+- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system`
+- 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）
+- `agent.generate_files` 字面量保留，但该端点**不写**管理操作行（唯一写入是 LLM 调用审计）；实现**不得**据字面量补恢复行、伪造操作或把草稿当变更
+- 管理操作审计与模型 / 工具调用审计**互不混写**；同一请求不得既写 `management_operations` 又把变更伪装成一次 Run
+
+### 9.4 管理操作的恢复
+
+启动时持工作区实例锁，在开放服务前扫描 `status='pending'` 的管理操作。**只查证，不重做**：
+
+| action 组 | 查证对象 | `applied` | `not_applied` | 仍不确定 |
+| --- | --- | --- | --- | --- |
+| `agent.content.update` / `agent.files.update` / `agent.create` / `agent.copy` / `agent.restore` | 目标文件树 / 状态文件的内容哈希与 operation_id | 哈希与 `detail_json` 的候选一致 | 目标仍为旧哈希或不存在 | 部分文件匹配、目标被第三方改写 |
+| `agent.disable` / `agent.enable` | 状态文件的 `state` + `generation` + `operation_id` | 三者与候选一致 | 仍是旧状态 / 旧 generation | 文件缺失或校验和损坏 |
+| `agent.archive` | 归档目录存在且清单哈希一致，状态为 `archived` | 是 | 目录仍在活动区且状态为旧值 | 归档目录存在但清单不完整 |
+| `schedule.enable` / `schedule.disable` | `scheduled_tasks.enabled` 与 operation_id | 目标值已写 | 仍是旧值 | 行不存在或多行冲突 |
+| `model_connection.*` / `mcp_server.*` / `skill.*` | 定义文件 / 版本行 / 发布指针 / 删除标记 | 指针或删除标记指向候选版本 | 仍指向旧版本 / 未删除 | 文件与指针不一致 |
+| `notify_channel.*` | 行存在性与脱敏字段哈希 | 与候选一致 | 仍是旧值 / 不存在 | 行存在但字段被第三方改写 |
+| `model_connection.test` / `mcp_server.test` | `detail_json` 是否已有完整结果 | 已有结果 | 未发出调用（可证明） | 无法区分是否已发出 → `unknown`，**不得重发** |
+| `system.baseline_v2` | 各资源基线版本 / 指针 / 状态文件 | 全部完成 | 可证明未开始 | 部分完成 → 继续补齐缺失项（确定性幂等，不是重做已生效变更） |
+
+- `applied` → `success`；`not_applied` → `failed`；其余 → `unknown`；写 `recovered_at` 与 `verification`
+- 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试
+- `unknown` 操作在管理台单独列出，由人判断；不得自动删除或再次执行
+- 恢复完成后，该操作的 `pending` 行不再参与后续启动扫描
+
+### 9.5 条件写（ETag / If-Match）
+
+- 强 ETag 值：`"sha256:<64 位小写十六进制>"`（含双引号）；弱 ETag 与 `*` 不被接受
+- `GET /agents/{name}/content`、`GET /agents/{name}/files`、`GET /skills/{name}` 与资源详情返回当前 ETag；`PUT` / `DELETE` / `publish` / `POST /agents/{name}/files` 必须带 `If-Match`
+- Agent 多文件提交使用**受管文件集合 ETag**（按 path 升序的 `(path, sha256(内容))` 规整序列化）；它与 `AGENT.md` 单文件 ETag 不可互换。不匹配 → 412，且**不落盘、不写管理操作行**；比较与 staging 构建在同一 Agent 写锁内完成
+- `If-Match` 缺失、格式非法或不等于当前 ETag → 412 `PRECONDITION_FAILED`；**不得**用 409 `SESSION_BUSY` 表达
+- 412 的 `data` 可包含 `current_etag` 与当前版本号，供客户端重新读取；不含文件正文
+- 生命周期变更使用 `expected_state` + `expected_generation`（请求体）校验；不匹配 → 409 `CONFLICT`，不回退到“按名字猜状态”
+- 条件写必须在同一写入闸门内“比较 + 写入”；先比较后写入之间不得插入第二次写
+
+### 9.6 资源版本、发布与引用
+
+- 资源种类 `kind` 固定为 `model_connection` / `mcp_server` / `skill`；`version_id` 全局稳定，`version_no` 逐资源从 1 递增
+- 版本内容不可变；撤回 / 回滚 = **用旧版本内容创建新版本**，不回退 `version_no`、不改历史版本、不恢复已撤销的 `${ENV_VAR}` 解析值
+- Provider / 技能发布后对新准入 Run 立即生效；MCP 首版重启生效，`applied_version_id` 在重启时追平，管理面显示“待重启”
+- 删除资源前必须检查定义引用与活动 Run 引用：被引用 → 400 `BAD_REQUEST` 并点名引用者，**不提供 force**；通知渠道保留既有 `?force=true`，但不得自动强删
+- 版本回收只看 `run_resource_refs.released_at` 与发布指针：当前发布版本即使零 Run 也不得回收；历史引用行不删除
+- Run 资源清单缺失的历史 Run 标 `legacy_unrecorded`；**不得**用当前版本补造关联

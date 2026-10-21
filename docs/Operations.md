@@ -31,18 +31,133 @@
 
 ## 2. 监听与出网
 
-### 2.1 监听地址
+### 2.1 监听地址与管理认证
 
 | 项 | 值 |
 | --- | --- |
 | 配置键 | `http.addr`（`basalt.yaml`） |
-| 默认 | `127.0.0.1:8080`（只对本机开放；核心阶段无认证） |
+| 默认 | `127.0.0.1:8080`（只对本机开放） |
+| 管理认证 | `http.admin_auth.mode` **必填**：`token` / `local_trust`。未显式配置 → 拒绝启动 |
 
-**必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并自行保证网络层隔离——反向代理 + 内网 ACL 优先。
+**必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并配置 `http.admin_auth.mode=token` 与 `http.admin_auth.token=${BASALT_ADMIN_TOKEN}`；token 未配置、解析为空或仍含 `${...}` → 拒绝启动。反向代理 / 隧道**不得**因上游连接是回环而绕过认证；`local_trust` 只在所有监听地址都是回环时允许，且只看**直接对端**，不看 `X-Forwarded-For` / `X-Real-IP`。
 
-症状与代价：改了 `0.0.0.0` 却不加隔离 = 把"任何人可调 Agent（含 `shell` 工具）"挂到网上。OpenClaw 的 42,665 个暴露实例就是这么来的（见 [IndustrySurvey.md](IndustrySurvey.md) §4–5）。
+症状与代价：改了 `0.0.0.0` 却不配 token、不做 TLS 与网络隔离 = 把"可调 Agent（含 `shell` 工具）"连同 bearer token 一起暴露在明文链路上。admin token 只是核心阶段的最低门槛，**没有**企业 SSO / 多租户 / RBAC（扩展阶段）；远程管理**必须**经 HTTPS 或明确的可信加密通道，TLS 终止与证书轮换由部署方负责。OpenClaw 的 42,665 个暴露实例就是这么来的（见 [IndustrySurvey.md](IndustrySurvey.md) §4–5）。
 
-复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`。
+复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`；非回环部署在**不配置** `http.admin_auth.token` 时必须观察到启动失败（fail-closed），而不是"起来了但没人能进"。
+
+#### 2.1.1 生成 token 与注入环境变量
+
+管理 token 是共享凭据：只证明"持有管理面登录资格"，不代表个人身份（无 SSO / RBAC，见 §6 红线段）。生成一次、妥善保存；轮换 = 换值后重启进程。
+
+```bash
+# 生成 32 字节随机 token（64 位十六进制）；不要用人类可猜的短语
+openssl rand -hex 32
+# 无 openssl 的环境等价写法
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+```
+
+`basalt.yaml` 里**只写占位符**，值只放在进程环境里：
+
+```yaml
+http:
+  addr: 127.0.0.1:8080
+  admin_auth:
+    mode: token
+    token: ${BASALT_ADMIN_TOKEN}
+```
+
+注入方式三选一（选与部署形态同生命周期的那种）：
+
+| 方式 | 做法 | 注意 |
+| --- | --- | --- |
+| systemd | `EnvironmentFile=/etc/basalt/basalt.env`，文件内一行 `BASALT_ADMIN_TOKEN=<值>`，`chmod 600` | unit 文件里**不得**直接写 token 值（unit 常被复制 / 进版本库） |
+| 容器 | `docker run --env-file /etc/basalt/basalt.env …` | 同主机有权限的进程能读到环境变量；隔离靠宿主机权限 |
+| 交互 shell（仅本机调试） | `export BASALT_ADMIN_TOKEN=<值>` | 换终端即丢失；生产不要用 |
+
+启动时校验（fail-closed，违反即**拒绝启动**并点名配置项）：占位符未配置、解析为空、仍含 `${...}`，或在 `basalt.yaml` 里直接写了明文 token。token 明文**不得**进入响应 / 日志 / 错误文案 / 管理审计；审计只记 `token:<sha256 前 16 位十六进制>`（§6）。
+
+#### 2.1.2 三种部署形态
+
+##### 形态 A：仅本机回环（默认）
+
+```yaml
+http:
+  addr: 127.0.0.1:8080
+  admin_auth:
+    mode: local_trust   # 所有监听地址都是回环时才允许
+```
+
+浏览器直接开 `http://127.0.0.1:8080/console/`；脚本带 `X-Basalt-Local-Trust: 1` 直连回环。凡携带任何转发头（`Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `X-Forwarded-Host` / `X-Forwarded-Proto`）→ 403——同机反向代理不能替公网请求"代签"本机信任。
+
+##### 形态 B：反向代理终止 TLS（推荐的生产形态）
+
+Basalt 仍只监听回环，由 nginx / Caddy 对外提供 HTTPS，认证**照常开启**：
+
+```yaml
+http:
+  addr: 127.0.0.1:8080
+  admin_auth:
+    mode: token
+    token: ${BASALT_ADMIN_TOKEN}
+    allowed_hosts:
+      - basalt.example.com          # 写请求 Host 头里的值（HTTPS 默认端口在 Host 头中省略）
+    allowed_origins:
+      - https://basalt.example.com
+    trusted_proxies:
+      - 127.0.0.1/32                # 代理所在地址；跨机部署时换成代理的真实网段
+```
+
+要点：
+
+- 代理**必须**保留原始 Host（nginx：`proxy_set_header Host $host;`），否则 Host 白名单不命中 → 403
+- `mode` **不得**降为 `local_trust`：代理会把公网请求变成回环连接，`local_trust` 只看直接对端且**拒绝任何转发头**——它在这里既不放行也不该被使用
+- `trusted_proxies` 只影响失败限速的**来源归因**（取最右侧非可信地址），不参与认证放行
+- 代理需同时设置 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`，429 才按真实客户端计数；不设置时所有失败都记在代理地址上，多个客户端会互相连坐
+
+##### 形态 C：直接非回环监听（仅限网络已隔离的内网）
+
+```yaml
+http:
+  addr: 0.0.0.0:8080
+  admin_auth:
+    mode: token
+    token: ${BASALT_ADMIN_TOKEN}
+    allowed_hosts:
+      - 192.0.2.10:8080             # 非回环地址必须显式列出；缺省派生只覆盖回环
+      - basalt.internal:8080
+    allowed_origins:
+      - http://basalt.internal:8080
+```
+
+代价：明文 HTTP 上的 bearer token 可被同网段抓包。**必须**放在隔离网段或加密隧道内，或改走形态 B。`allowed_hosts` 未显式列出非回环地址 → 拒绝启动（fail-closed）。
+
+#### 2.1.3 认证失败排障：401 / 403 / 429
+
+失败响应只给固定分类，不解释命中哪条规则、不回显 token（契约见 [contracts/run-and-errors.md](contracts/run-and-errors.md) §9.2）。对照表：
+
+| 读数 | 错误码 | 常见成因 | 处置 |
+| --- | --- | --- | --- |
+| 401 | `UNAUTHORIZED` | `token` 模式：缺 `Authorization` 头、方案不是 `Bearer`、token 错 | 核对注入的环境变量与请求头；401 不区分"没提供"与"提供错" |
+| 403 | `FORBIDDEN` | Host 不在 `allowed_hosts`（端口不一致 / 代理没转发原始 Host）；Origin 不匹配；`local_trust` 下：非回环直连 / 带任一转发头 / 缺 `X-Basalt-Local-Trust: 1` | 按 §2.1.2 对应形态核对配置；反向代理下先查 `Host` 与 `X-Forwarded-*` 设置 |
+| 429 | `AUTH_RATE_LIMITED` | 同一来源 60 秒内认证失败第 10 次起（含第 10 次），在凭据校验**之前**直接拒绝 | 按 `Retry-After`（秒，向上取整）等待后重试；计数在进程内、重启清零；成功认证**不**重置窗口 |
+| 429 | `TOO_MANY_RUNS` | 与认证无关：实例并发运行数超过 `server.max_concurrent_runs` | 等运行结束或调高上限（运行准入不是认证限流） |
+
+**429 的两个来源不要混淆**：`AUTH_RATE_LIMITED` 是管理面暴力尝试保护（按**来源**计认证失败次数）；`TOO_MANY_RUNS` 是运行准入（按**实例**计并发运行数）。两者都是 429，但错误码不同、处置方向相反。
+
+限速口径：只统计 token 401 与 `local_trust` 的 403；Host / Origin 类 403 发生在认证之前、**不**消耗配额（否则攻击者可用错误 Host 把正常来源打进 429）。
+
+排障顺序（可复制）：
+
+```bash
+# 1. 公开端点：这里就不通 = 进程没起 / 地址不对，不是认证问题
+curl -i http://127.0.0.1:8080/api/v1/health
+# 2. 带凭据：仍 401 = 进程里的 token 与本次请求不一致（改了环境变量没重启）
+curl -i -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/api/v1/profiles
+# 3. 仍 403：-v 看实际 Host / Origin，与 allowed_hosts / allowed_origins 逐字核对（大小写不敏感，端口必须一致）
+curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/api/v1/profiles
+```
+
+持续 429 说明还有其他来源 / 脚本在连续失败——看 WARN 日志的来源归因（`来源进入认证限速` 一行标出 `source` 与 `retry_after_seconds`）。
 
 ### 2.2 出网：三种流量分开看
 
@@ -112,12 +227,18 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 
 | 内容 | 类别 | 丢了会怎样 |
 | --- | --- | --- |
-| `basalt.db`（+ `-wal` / `-shm`） | **不可再生** | 会话 / 消息 / 审计三表 / 记忆（sqlite 档）/ 定时状态全丢 |
+| `basalt.db`（+ `-wal` / `-shm`） | **不可再生** | 会话 / 消息 / 运行审计三表 + 管理操作审计 / 资源版本与发布指针 / Run 资源引用 / 记忆（sqlite 档）/ 定时状态全丢 |
+| `control/agents/*.json` | **不可再生** | Agent 生命周期状态（`active` / `disabled` / `archived`）丢失；DB 索引可由状态文件重建，反向不行。缺失时该 Agent 拒绝新 Run（fail-closed），不会静默当作 `active` |
+| 技能不可变版本快照目录（`resource_versions.storage_path` 指向） | **不可再生** | 已发布技能版本的内容丢失；数据库里的清单与哈希还在，但无法还原文件。Run 冻结的资源清单指向这些版本 |
 | `agents/`、`skills/` | 配置（可重建，但重建成本高） | Agent 与技能全丢 |
 | `memory/*.md`（markdown 档） | **不可再生** | 长期记忆丢（记忆后端为 markdown 时） |
 | `mcp_servers.yaml`、`AGENTS.md` / `SOUL.md` / `USER.md` | 配置 | 同上 |
-| `archive/` | 已下线 Agent 的目录 | 归档配置丢（会话 / 记忆 / 审计不受影响，它们不在文件里） |
+| `archive/` | 已下线 Agent 的目录；恢复默认 `disabled` | 归档配置丢（会话 / 记忆 / 审计不受影响，它们不在文件里） |
 | `logs/` | 可弃 | 只丢日志 |
+
+**控制目录 `.basalt/control/` 说明**：`control/agents/*.json` 是 Agent 启停的**唯一权威**（库里的生命周期索引只是可重建副本）。文件由生命周期服务以"同目录临时文件 + 原子 rename"写入，**不得**手工编辑或用脚本改状态——绕过服务写文件会撞上校验和 / 字段校验，校验失败时该 Agent 拒绝新 Run（fail-closed）。该目录同时**不在**配置热加载监听范围、**不在** Agent 文件工具白名单（模型读写它一律被拒）；备份时随 `.basalt/` 整目录一起带走。
+
+**备份一致性**：`basalt.db` 里的资源发布指针、`run_resource_refs` 与技能快照目录**必须**来自**同一次停机快照**。只恢复数据库、不恢复快照目录（或反过来）会得到"指针指向不存在的版本"——恢复验证（§4.3）**必须**检出这类不一致，**不得**当作恢复成功。
 
 **另外，实例配置 `basalt.yaml`（与工作区同级、**不在** `.basalt/` 内）也应一并备份**：它不含明文凭证（`${ENV_VAR}` 占位，见 §6），丢了要重建 provider 端点与各白名单——备份布局见 §4.2（备份目录里 `basalt.yaml` 与 `.basalt/` 并列），恢复验证与真实恢复都按该布局取文件。
 
@@ -221,13 +342,15 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 1. **停服**：`systemctl stop basalt`
 2. **备份，并保持停机**：按 §4.2 的离线步骤做（**跳过其中 `systemctl start` 那一行**）——升级前必做，这是回滚的唯一依托；备完不起服，直接接第 3 步
 3. **换二进制**：旧版改名留底（`mv basalt basalt.bak-<旧版本>`）→ 放新二进制 → `chmod +x`
-4. **启动并迁移**：`systemctl start basalt`——启动时按 `schema_version` 应用增量 SQL（迁移脚本入库、随二进制发布；**已发布的迁移不得改写**，只许追加新版本）。迁移失败**必须**报错退出——**不得**带着半迁移的库继续跑
+4. **启动并迁移**：`systemctl start basalt`——启动时按 `schema_version` 应用增量 SQL（迁移脚本入库、随二进制发布；**已发布的迁移不得改写**，只许追加新版本）。迁移失败**必须**报错退出——**不得**带着半迁移的库继续跑。US-11 / US-12 的首次升级从 `schema_version=1` 前向到 **2**：新增管理操作审计、资源版本 / 指针 / 引用、Agent 生命周期索引与归档表，**不改既有表**；SQL 迁移后还要执行一次资源基线（为已有 Provider / MCP / 技能建立 v1 已发布版本、为已有 Agent 建立初始状态文件，初始状态 `disabled`）。基线失败同样拒绝启动；重跑必须幂等
 5. **验证**：`basalt status` → `basalt session list` → `GET /api/v1/health` → 跑一次真实调用（同 §4.3 判据的 1~5）
 6. **观察**：`logs/` 里确认无 ERROR 级噪声
 
 **不得**把"停"与"起"拆成两段（先起旧版 → 换文件 → 再起新版）：那两段之间跑的还是**旧代码**——迁移没跑、验证假绿，真正的切换只发生在文件替换那一刻，而没有任何步骤检查过它。
 
 建议：先用备份在独立目录起一次新版做 dry run（与 §4.3 同一手法，含其中"演练隔离"三步），确认迁移与启动无误再动生产目录。
+
+**升级后的首个动作**：v2 资源基线把既有 Agent 的状态统一初始化为 `disabled`（**不得**在升级瞬间悄悄放行新 Run），因此升级完成后需要逐个复核并按需启用——`POST /api/v1/agents/{name}/enable` 或管理台「Agent → 启用」。这是设计行为，不是迁移失败；`GET /api/v1/profiles` 里 `runnable=false` 是同一件事的表现。
 
 ### 5.2 回滚
 
@@ -239,6 +362,8 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 两种情形同样是"**停 → 整备 → 起**"：**不得**在换回旧二进制之前先起一次服务——旧二进制面对已被新版迁移过的库，正是"库结构对不上"的现场，让它起来只会在日志里再制造一轮错误。
 
 核心阶段只做**前向迁移**，不提供反向迁移脚本——**不得**指望"降级脚本"，回滚的唯一可靠路径是"备份 + 旧二进制"。
+
+另一道保险：即使忘了先恢复备份，旧二进制打开已被新版迁移的库时会因 `schema_version` 高于自身支持版本而**拒绝启动**（fail-closed），不会以旧结构误读新库。
 
 ### 5.3 停机顺序与工作目录
 
@@ -281,12 +406,14 @@ systemctl stop basalt && systemctl show basalt -p ActiveState                # �
 | 位置 | 规则 |
 | --- | --- |
 | `basalt.yaml` 的 `providers[].api_key` | 只允许 `${ENV_VAR}` 占位；启动时解析，未解析（`${` 残留）或为空 → **拒绝启动**并点名配置项 |
+| `basalt.yaml` 的 `http.admin_auth.token` | 只允许 `${ENV_VAR}` 占位（如 `${BASALT_ADMIN_TOKEN}`）；`token` 模式下未配置、解析为空或残留 `${` → **拒绝启动**。`local_trust` 模式不读该值，且只在全部监听地址为回环时允许 |
 | 通知渠道（库表 `notify_channels.url`） | **只存 `${ENV_VAR}` 引用**，不存完整地址；发送时解析，解析失败给**点名环境变量**的可读错误 |
 | 作者模型（US-12 的生成能力） | 与 provider 同规则 |
 
 红线段（day-one 硬约束，**不得**违反）：
 
 - 渠道地址（路径与查询串就是 token）**不得**出现在响应 / 日志 / 错误文案——对外只回 **scheme + host**
+- 管理 admin token **不得**出现在响应 / 日志 / 错误文案 / 管理操作审计——认证成功后只记 `auth_method` 与 `actor_subject`（`token:<指纹>`），不记原值
 - 沙箱越界文案里**嵌着原始目标**（可能就是凭证），**不得**原样透传给响应或日志
 - 页面编辑框**不回填**已存地址，故「`url` 留空 = 保留原值」
 - 环境变量注入方式：systemd `EnvironmentFile=`（文件权限 `600`）或容器 `--env-file`；**不得**走命令行参数（`ps` 可见）或提交进仓库的文件
@@ -294,7 +421,7 @@ systemctl stop basalt && systemctl show basalt -p ActiveState                # �
 复核（可复制）：
 
 ```bash
-grep -rnE "sk-|api_key: [^$]" /opt/basalt/basalt.yaml       # 期望：零命中
+grep -rnE "sk-|(api_key|token): [^$]" /opt/basalt/basalt.yaml   # 期望：零命中（占位符以 ${ 开头）
 sqlite3 /opt/basalt/.basalt/basalt.db \
   "select name, type, length(url) from notify_channels;"    # url 应是 ${...} 占位形态
 ```

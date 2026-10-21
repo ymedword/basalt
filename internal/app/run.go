@@ -152,6 +152,21 @@ func Run(ctx context.Context, args []string) int {
 			}
 		}
 		if needsServer(args) {
+			// 配置监听在调度器就绪之后、HTTP 开放之前接入（图 A ⑧–⑩）：先接监听再交
+			// 端口，反过来的顺序会让"启动后头几秒的修改不生效"成为可复现的缺陷。调度联动
+			// 走运行期保留的**同一份**编辑适配器（私有 claim 基线随热加载增减，约束 39）。
+			// The config watcher starts after the scheduler and before the HTTP face opens;
+			// the scheduler seam is the very adapter retained on the runtime.
+			watcher, watchErr := startServeWatcher(runCtx, rt.root, rt.agents, rt.loader, rt.skills, rt.versions, rt.scheduleEditor, logger)
+			if watchErr != nil {
+				logger.Error("配置监听启动失败", "error", watchErr)
+				if closeErr := rt.Close(); closeErr != nil {
+					logger.Error("重路径资源释放失败", "error", closeErr)
+				}
+				return 1
+			}
+			rt.watch = watcher
+
 			// HTTP 面只在 serve 上装配：端口背后是同一份重路径装配态（技术方案 §6.5）。
 			// The HTTP face is assembled only for serve, over the same runtime state.
 			srv, srvErr := a.newWebServer(rt)

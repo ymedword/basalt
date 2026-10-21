@@ -567,3 +567,285 @@ func TestConfig_RejectsNegativeMaxConcurrentRuns(t *testing.T) {
 		require.Zero(t, cfg.Server.MaxConcurrentRuns)
 	})
 }
+
+// configWithAdminAuth 在 baseConfig 的 `http` 段内插入 `admin_auth` 子段；adminAuth
+// 的每行按 4 空格缩进写好。YAML 里同一映射键只能出现一次——追加第二个 `http:` 块
+// 会被判重复映射键，夹具必须替换而不是拼接。
+// configWithAdminAuth inserts the admin_auth block into the http section; a second
+// http block would be a duplicate mapping key.
+func configWithAdminAuth(adminAuth string) string {
+	return strings.Replace(baseConfig,
+		"http:\n  addr: \"127.0.0.1:8080\"\n",
+		"http:\n  addr: \"127.0.0.1:8080\"\n  admin_auth:\n"+adminAuth+"\n", 1)
+}
+
+// adminAuthEnv 是 admin_auth 用例共用的环境桩：provider 两键必须在位，管理 token
+// 由各子例自行决定放不放。测试不读真实环境。
+// adminAuthEnv is the shared environment stub for the admin-auth cases.
+func adminAuthEnv(extra map[string]string) func(string) (string, bool) {
+	values := map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}
+	for name, value := range extra {
+		values[name] = value
+	}
+	return envLookup(values)
+}
+
+// TestConfig_AdminAuthTokenModeAccepted token 模式四象限的**合法**一象限（约束 2）：
+// `${ADMIN_TOKEN}` 经环境变量解析后非空，五个键全部原样落地——加载层不派生、不补值。
+// The valid quadrant: the placeholder resolves to a non-empty value and all five keys
+// land verbatim.
+func TestConfig_AdminAuthTokenModeAccepted(t *testing.T) {
+	path := writeConfig(t, configWithAdminAuth(`
+    mode: token
+    token: ${ADMIN_TOKEN}
+    allowed_hosts:
+      - 127.0.0.1:8080
+      - localhost:8080
+      - "[::1]:8080"
+    allowed_origins:
+      - http://127.0.0.1:8080
+      - https://console.example.com
+    trusted_proxies:
+      - 10.0.0.0/8
+      - 127.0.0.1/32`))
+
+	cfg, err := cli.LoadConfig(path, adminAuthEnv(map[string]string{"ADMIN_TOKEN": "resolved-admin-token"}))
+	require.NoError(t, err, "合法 token 模式必须通过装载")
+
+	require.Equal(t, "token", cfg.HTTP.AdminAuth.Mode)
+	require.Equal(t, "resolved-admin-token", cfg.HTTP.AdminAuth.Token)
+	require.Equal(t, []string{"127.0.0.1:8080", "localhost:8080", "[::1]:8080"},
+		cfg.HTTP.AdminAuth.AllowedHosts, "Host 白名单原样保留（大小写与端口不加工）")
+	require.Equal(t, []string{"http://127.0.0.1:8080", "https://console.example.com"},
+		cfg.HTTP.AdminAuth.AllowedOrigins, "Origin 白名单原样保留")
+	require.Equal(t, []string{"10.0.0.0/8", "127.0.0.1/32"},
+		cfg.HTTP.AdminAuth.TrustedProxies, "可信代理 CIDR 原样保留")
+}
+
+// TestConfig_AdminAuthSectionOptional 段整体缺失**不是**装载错误（注 12）：chat /
+// tool / session 等命令不开放 HTTP 管理面；"serve 必须有 mode"由监听器创建后的
+// web.ValidateAdminAuth 判定，装载层不替它拒绝整份配置文件。
+// An entirely absent section is not a load error; serve enforces presence later.
+func TestConfig_AdminAuthSectionOptional(t *testing.T) {
+	path := writeConfig(t, baseConfig)
+
+	cfg, err := cli.LoadConfig(path, adminAuthEnv(nil))
+	require.NoError(t, err, "轻命令的配置不要求 admin_auth 段")
+
+	require.Empty(t, cfg.HTTP.AdminAuth.Mode)
+	require.Empty(t, cfg.HTTP.AdminAuth.Token)
+	require.Empty(t, cfg.HTTP.AdminAuth.AllowedHosts)
+	require.Empty(t, cfg.HTTP.AdminAuth.AllowedOrigins)
+	require.Empty(t, cfg.HTTP.AdminAuth.TrustedProxies)
+}
+
+// TestConfig_AdminAuthRejectsMissingMode 半截认证配置：写了段内任何一键但 mode 为空
+// → 装载期拒绝。文件里"看着配过"而实际没有模式，任何缺省解读都会让管理面裸奔。
+// A partial section without a mode is refused: there is no safe default mode.
+func TestConfig_AdminAuthRejectsMissingMode(t *testing.T) {
+	path := writeConfig(t, configWithAdminAuth(`
+    allowed_hosts:
+      - 127.0.0.1:8080`))
+
+	_, err := cli.LoadConfig(path, adminAuthEnv(nil))
+	require.Error(t, err, "段内已配置其它键时 mode 不得留空")
+	require.Contains(t, err.Error(), "http.admin_auth.mode", "拒绝文案必须点名配置键")
+	require.Contains(t, err.Error(), "必填", "必须说明是必填项缺失")
+}
+
+// TestConfig_AdminAuthRejectsInvalidMode 取值域只有 token / local_trust（§9.1）：
+// 其余取值（含大小写变体）拒绝启动并点名键与取值——不静默猜成某一档。
+// Any mode outside the two literals fails closed, case variants included.
+func TestConfig_AdminAuthRejectsInvalidMode(t *testing.T) {
+	for _, mode := range []string{"basic", "TOKEN", "none"} {
+		t.Run(mode, func(t *testing.T) {
+			path := writeConfig(t, configWithAdminAuth("\n    mode: "+mode))
+
+			_, err := cli.LoadConfig(path, adminAuthEnv(nil))
+			require.Error(t, err, "取值域外必须拒绝：%s", mode)
+			require.Contains(t, err.Error(), "http.admin_auth.mode", "拒绝文案必须点名配置键")
+			require.Contains(t, err.Error(), mode, "拒绝文案必须点名取值")
+			require.Contains(t, err.Error(), "token / local_trust", "文案给出取值域")
+		})
+	}
+}
+
+// TestConfig_AdminAuthRejectsInvalidTokens token 模式的其余三象限 + 键缺失：明文、
+// 解析为空、变量不存在一律拒绝；明文与非字符串值的错误文案**不得回显原值**。
+// credentialKey 覆盖本键，四条拒绝路径与 providers[i].api_key 同源。
+// The remaining token quadrants: plaintext, empty expansion and an unresolved
+// placeholder all fail closed, and no rejected value is echoed.
+func TestConfig_AdminAuthRejectsInvalidTokens(t *testing.T) {
+	const plaintext = "plaintext-admin-token-7c"
+	cases := []struct {
+		name   string
+		token  string // `token:` 行（空 = 整键不写）
+		env    map[string]string
+		want   []string
+		noEcho string
+	}{
+		{
+			name:   "明文 token",
+			token:  "    token: " + plaintext,
+			want:   []string{"http.admin_auth.token", "明文凭证"},
+			noEcho: plaintext,
+		},
+		{
+			name:  "解析为空",
+			token: "    token: ${ADMIN_TOKEN}",
+			env:   map[string]string{"ADMIN_TOKEN": ""},
+			want:  []string{"http.admin_auth.token", "不得为空"},
+		},
+		{
+			name:  "变量不存在",
+			token: "    token: ${ADMIN_TOKEN}",
+			want:  []string{"http.admin_auth.token", "ADMIN_TOKEN"},
+		},
+		{
+			name:   "非字符串值",
+			token:  "    token: 123456",
+			want:   []string{"http.admin_auth.token", "必须是 ${VAR} 形态的字符串", "int"},
+			noEcho: "123456",
+		},
+		{
+			name: "整键缺失",
+			want: []string{"http.admin_auth.token", "必填"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snippet := "\n    mode: token"
+			if tc.token != "" {
+				snippet += "\n" + tc.token
+			}
+			path := writeConfig(t, configWithAdminAuth(snippet))
+
+			_, err := cli.LoadConfig(path, adminAuthEnv(tc.env))
+			require.Error(t, err, "非法 token 必须拒绝启动：%s", tc.name)
+			for _, want := range tc.want {
+				require.Contains(t, err.Error(), want)
+			}
+			if tc.noEcho != "" {
+				require.NotContains(t, err.Error(), tc.noEcho, "错误文案不得回显被拒的 token 原值")
+			}
+		})
+	}
+}
+
+// TestConfig_AdminAuthValidatesAllowedHosts Host 白名单形状（约束 4）：禁通配、禁
+// userinfo、禁 scheme / 路径 / 查询、端口必填且为 1–65535 的整数——省略端口的条目
+// 永远匹配不上带端口的 Host，必须拒绝。
+// Host entries must carry a numeric port; wildcards and userinfo are refused.
+func TestConfig_AdminAuthValidatesAllowedHosts(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{"通配符", "*", "通配符"},
+		{"省略端口", "localhost", "缺端口"},
+		{"IPv6 缺方括号", "::1:8080", "缺端口"},
+		{"带 scheme", "http://127.0.0.1:8080", "只写 host:port"},
+		{"带路径", "127.0.0.1:8080/path", "只写 host:port"},
+		{"带 userinfo", "user@host:8080", "userinfo"},
+		{"端口非数字", "127.0.0.1:http", "端口非法"},
+		{"端口为零", "127.0.0.1:0", "端口非法"},
+		{"端口越界", "127.0.0.1:70000", "端口非法"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, configWithAdminAuth(`
+    mode: local_trust
+    allowed_hosts:
+      - "`+tc.entry+`"`))
+
+			_, err := cli.LoadConfig(path, adminAuthEnv(nil))
+			require.Error(t, err, "非法 Host 条目必须拒绝启动：%s", tc.name)
+			require.Contains(t, err.Error(), "http.admin_auth.allowed_hosts", "拒绝文案必须点名配置键")
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestConfig_AdminAuthValidatesAllowedOrigins Origin 白名单形状（约束 5）：每项必须
+// 是 `scheme://host[:port]`，`null`、路径、查询、fragment、userinfo、通配符一律拒绝
+// ——带路径的条目永远匹配不上浏览器发来的 Origin。
+// Origins must be exactly scheme://host[:port]; null, paths, queries and wildcards
+// are all refused.
+func TestConfig_AdminAuthValidatesAllowedOrigins(t *testing.T) {
+	cases := []struct {
+		name   string
+		origin string
+		want   string
+		noEcho string
+	}{
+		{"null", "null", "非法", ""},
+		{"通配符", "http://*.example.com", "通配符", ""},
+		{"裸星号", "*", "通配符", ""},
+		{"尾斜杠", "http://127.0.0.1:8080/", "非法", ""},
+		{"带路径", "http://127.0.0.1:8080/path", "非法", ""},
+		{"带查询", "http://127.0.0.1:8080?x=1", "非法", ""},
+		{"带 fragment", "http://127.0.0.1:8080#frag", "非法", ""},
+		{"缺 scheme", "127.0.0.1:8080", "非法", ""},
+		{"带 userinfo", "http://user:pw@127.0.0.1:8080", "userinfo", "pw"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, configWithAdminAuth(`
+    mode: local_trust
+    allowed_origins:
+      - "`+tc.origin+`"`))
+
+			_, err := cli.LoadConfig(path, adminAuthEnv(nil))
+			require.Error(t, err, "非法 Origin 条目必须拒绝启动：%s", tc.name)
+			require.Contains(t, err.Error(), "http.admin_auth.allowed_origins", "拒绝文案必须点名配置键")
+			require.Contains(t, err.Error(), tc.want)
+			if tc.noEcho != "" {
+				require.NotContains(t, err.Error(), tc.noEcho, "userinfo 里的值不得回显")
+			}
+		})
+	}
+}
+
+// TestConfig_AdminAuthValidatesTrustedProxies 可信代理只接受可解析 CIDR（约束 6）：
+// 裸 IP、越界前缀与任意字符串拒绝；空数组合法（没有反向代理的直连部署）。
+// Trusted proxies accept CIDRs only; a bare IP is refused rather than widened.
+func TestConfig_AdminAuthValidatesTrustedProxies(t *testing.T) {
+	t.Run("合法 CIDR 与空清单", func(t *testing.T) {
+		path := writeConfig(t, configWithAdminAuth(`
+    mode: local_trust
+    trusted_proxies:
+      - 10.0.0.0/8
+      - 127.0.0.1/32
+      - "::1/128"`))
+		cfg, err := cli.LoadConfig(path, adminAuthEnv(nil))
+		require.NoError(t, err)
+		require.Equal(t, []string{"10.0.0.0/8", "127.0.0.1/32", "::1/128"},
+			cfg.HTTP.AdminAuth.TrustedProxies)
+
+		path = writeConfig(t, configWithAdminAuth("\n    mode: local_trust\n    trusted_proxies: []"))
+		cfg, err = cli.LoadConfig(path, adminAuthEnv(nil))
+		require.NoError(t, err, "空数组合法（直连部署）")
+		require.Empty(t, cfg.HTTP.AdminAuth.TrustedProxies)
+	})
+
+	for _, entry := range []string{"10.0.0.1", "not-a-cidr", "300.0.0.0/8", "10.0.0.0/33"} {
+		t.Run("拒绝 "+entry, func(t *testing.T) {
+			path := writeConfig(t, configWithAdminAuth(`
+    mode: local_trust
+    trusted_proxies:
+      - "`+entry+`"`))
+
+			_, err := cli.LoadConfig(path, adminAuthEnv(nil))
+			require.Error(t, err, "非法 CIDR 必须拒绝启动：%s", entry)
+			require.Contains(t, err.Error(), "http.admin_auth.trusted_proxies", "拒绝文案必须点名配置键")
+			require.Contains(t, err.Error(), "CIDR")
+		})
+	}
+}

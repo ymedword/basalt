@@ -776,6 +776,60 @@ func (s *Scheduler) ReconcileAgent(ctx context.Context, agent string, tasks []Sc
 	return errors.Join(errs...)
 }
 
+// SetRegistered 在运行期增减调度器的 Agent 注册集合（颗粒度文档 §3.1.24 第 5 行 /
+// 约束 39）：注册集合不再构造期封死。加入只放开准入——任务定义经 ReconcileAgent 落库
+// 与注册；移除则退休该 Agent 全部未退休任务（只置 retired_at、不删行，与启动对账
+// 同口径）并停掉句柄，库读 / 写失败如实上抛，由装配层记 WARN 保留注册表撤销结果。
+// SetRegistered adds or removes an agent at run time. Adding only opens admission—
+// definitions still go through ReconcileAgent. Removing retires the agent's live tasks
+// (rows kept, retired_at set) and stops their handles.
+func (s *Scheduler) SetRegistered(agent string, registered bool) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	if registered {
+		s.registry[agent] = true
+		return nil
+	}
+	if _, ok := s.registry[agent]; !ok {
+		return nil
+	}
+	delete(s.registry, agent)
+	if !s.started || s.stopped {
+		return nil
+	}
+
+	ctx := s.baseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.store.ListTasks(ctx)
+	if err != nil {
+		s.logger.Error("移出注册集合时读取任务失败", "agent", agent, "error", err)
+		return fmt.Errorf("scheduler: list tasks: %w", err)
+	}
+	var ids []string
+	for _, row := range rows {
+		if row.Agent == agent && row.RetiredAt.IsZero() {
+			ids = append(ids, row.TaskID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := s.store.ApplyAgentTasks(ctx, agent, nil, ids, s.now()); err != nil {
+		s.logger.Error("移出注册集合时退休任务失败", "agent", agent, "error", err)
+		return fmt.Errorf("scheduler: retire agent %q: %w", agent, err)
+	}
+	affected := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		affected[id] = true
+	}
+	s.invalidateLocked(affected)
+	s.logger.Info("Agent 已移出调度注册集合，任务退休", "agent", agent, "tasks", len(ids))
+	return nil
+}
+
 // registerEnabledLocked 在启动路径为全部 enabled && !retired 的已注册任务注册句柄；
 // 先失效受影响代次（旧回调一律返回），任一失败立即上抛，由调用方停引擎清句柄。
 // registerEnabledLocked registers every enabled task of registered agents at startup;

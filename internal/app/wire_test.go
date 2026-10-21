@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -46,6 +47,16 @@ type wireFixture struct {
 	cfg     *cli.Config
 	logs    *bytes.Buffer
 	logger  *slog.Logger
+
+	// agents 按写入次序记下夹具落过 AGENT.md 的名字：装配之后要经真实迁移入口把它们
+	// 从基线态启用（见 `enableAgents`）。
+	// agents records the written agent names so assembly can enable them afterwards.
+	agents []string
+
+	// override 是可选的进程内模型替身（生产路径恒 nil）：需要判"实际调用了哪个
+	// Provider"的用例在这里挂脚本替身，装配时原样交给 `App.providerOverride`。
+	// override is the optional in-process model double handed to the assembly.
+	override core.ProviderClient
 }
 
 // newWireFixture 建骨架 + 配置 + 记录型日志器；**不开库**（库由重路径自己开，
@@ -61,7 +72,7 @@ func newWireFixture(t *testing.T) *wireFixture {
 	require.NoError(t, err, "工作区骨架是重路径的前置条件")
 
 	logs := &bytes.Buffer{}
-	return &wireFixture{
+	f := &wireFixture{
 		workDir: workDir,
 		root:    root,
 		cfg: &cli.Config{Providers: []cli.ProviderConfig{{
@@ -73,6 +84,13 @@ func newWireFixture(t *testing.T) *wireFixture {
 		logs:   logs,
 		logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
+	// 启动基线按**原文**取 Provider 定义块（`definition_yaml` 记的是运维写下的那一段），
+	// 所以内存里交给装配面的配置名必须能在磁盘上找到同名块：夹具一律落一份同源的
+	// basalt.yaml，名字对不上就由基线拒绝启动——那正是"拿错定义"该有的失败方式。
+	// The baseline reads provider blocks from disk, so the fixture persists the very
+	// configuration it hands the assembly in memory.
+	f.writeInstanceConfig(t)
+	return f
 }
 
 // dbPath 返回夹具工作区里的库文件路径（判"库已建 / 库未建"共用同一处）。
@@ -103,6 +121,7 @@ func (f *wireFixture) writeAgent(t *testing.T, name string, tools ...string) {
 		declared +
 		"---\n\n你是「" + name + "」。\n"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644))
+	f.agents = append(f.agents, name)
 }
 
 // assemble 走一次重路径装配，登记清理；返回的句柄归用例所有。
@@ -113,7 +132,65 @@ func (f *wireFixture) assemble(t *testing.T) *heavyRuntime {
 	rt, err := f.app().newRuntime(context.Background())
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
+
+	// 基线把既有 Agent 一律写成 disabled（D-01 A / 注 1）——这是本 US 的**行为变更**。
+	// 夹具经真实迁移入口把它们启用，让本 US 之前的用例继续验证各自原本的判据（随已批准
+	// 接口的行为适配，不改任何断言）。判"基线写下 disabled 且准入拒绝"的用例不走本入口，
+	// 而是直接调 `newRuntime`。
+	// The baseline disables every pre-existing agent; the fixture enables them through the
+	// real transition entry so earlier cases keep judging what they were written to judge.
+	f.enableAgents(t, rt)
 	return rt
+}
+
+// enableAgents 经**运行期自己**的 Agent 级闸门与状态文件存储把夹具 Agent 迁到 active：
+// 走的是生产装配传下来的同一份组合（约束 25），不是另起一套。
+// enableAgents walks the fixture's agents to active through the runtime's own gate and
+// store — the very instances the production assembly wired.
+func (f *wireFixture) enableAgents(t *testing.T, rt *heavyRuntime) {
+	t.Helper()
+
+	for _, name := range f.agents {
+		release := rt.agentGate.Lock(name)
+		err := activateAgent(context.Background(), rt.lifecycle, name)
+		release()
+		require.NoError(t, err, "启用 Agent %s 失败——基线必须已写下 disabled/1 的状态文件", name)
+	}
+}
+
+// enableAgentsBesideRuntime 用于只拿得到包外句柄（`OpenRuntime`）的用例：另建一份状态
+// 文件存储完成同一迁移。此时没有在途运行，文件是唯一权威；闸门只用于让迁移调用满足
+// "调用方持写锁"的前置条件。
+// enableAgentsBesideRuntime performs the same transition through a stand-alone store, for
+// cases that only hold the exported handle; nothing is in flight at that point.
+func (f *wireFixture) enableAgentsBesideRuntime(t *testing.T) {
+	t.Helper()
+
+	gate := core.NewAgentGate()
+	store := workspace.NewLifecycleStore(f.root, time.Now)
+	for _, name := range f.agents {
+		release := gate.Lock(name)
+		err := activateAgent(context.Background(), store, name)
+		release()
+		require.NoError(t, err, "启用 Agent %s 失败——基线必须已写下 disabled/1 的状态文件", name)
+	}
+}
+
+// activateAgent 把状态文件迁到 active：已是 active 时原样返回（重复装配的用例因此
+// 可以再跑一次），其余状态按**读到的**状态与代数作前置条件——与生产迁移同一口径。
+// activateAgent transitions the state file to active; an already-active agent is a no-op
+// so restart cases can enable twice.
+func activateAgent(ctx context.Context, store *workspace.LifecycleStore, name string) error {
+	record, exists, err := store.Read(ctx, name)
+	if err != nil {
+		return err
+	}
+	if exists && record.State == core.AgentActive {
+		return nil
+	}
+	_, err = store.Transition(ctx, name, record.State, record.Generation, core.AgentActive,
+		core.NewOperationID(time.Now()))
+	return err
 }
 
 // app 构造装配面：时钟与工作目录显式传入（时间显式传入是判卷前提）。
@@ -123,6 +200,7 @@ func (f *wireFixture) app() *App {
 		supportedVersion: storage.SupportedSchemaVersion,
 		logger:           f.logger,
 		cfg:              f.cfg,
+		providerOverride: f.override,
 	}
 }
 
@@ -245,16 +323,18 @@ func (c *scriptedProviderClient) requests() []core.ChatRequest {
 	return append([]core.ChatRequest(nil), c.seen...)
 }
 
-// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的四个次序读数在日志里**按序**可见，
+// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的六个次序读数在日志里**按序**可见，
 // 且恢复完成的一条携带启动摘要的五个计数；装配失败时句柄不半开（锁被放回）。
+// 基线与管理面恢复各自是一条读数（图 A ③④）：它们排在崩溃恢复之后、运行入口之前，
+// 中间被别的步骤插队就是接线错了。
 func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 	fx := newWireFixture(t)
 
 	rt := fx.assemble(t)
 
 	steps := logSteps(t, fx.logs.String())
-	require.Equal(t, []string{"lock", "open", "migrate", "recover"}, steps,
-		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 崩溃恢复（次序即正确性）")
+	require.Equal(t, []string{"lock", "open", "migrate", "recover", "baseline", "recovery"}, steps,
+		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 崩溃恢复 → 启动基线 → 管理面恢复（次序即正确性）")
 
 	recoverRec := findStep(t, fx.logs.String(), "recover")
 	for _, key := range []string{"unknowns", "repaired_groups", "closed_runs", "rolled_back", "rolled_forward"} {
@@ -282,6 +362,17 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "basalt init", "骨架缺失要给出可操作的指引，而不是裸 ENOENT")
 	})
+}
+
+// TestStartupOrder_HeavyPathStepsAppearInOrder 是颗粒度文档 §4.4 `011-app-baseline` 的
+// `TestStartupOrder_*` 族名落点：判据是重路径日志里 `step` 读数的先后顺序——
+// 取锁 → 写模式打开 → 显式迁移 → 崩溃恢复 → 启动基线 → 管理面恢复（次序即正确性）。
+// 断言体与 US-4 交付的 `TestWire_HeavyPathStepsAppearInOrder` 同源：这里只补一个卡上
+// 点名的具名入口，**不**写第二份断言；历史函数名保持可复跑（US-4 的冻结证据不失效）。
+// Named entry point for the card's TestStartupOrder_* family; it reuses the US-4
+// assertion body instead of duplicating it, so the historical name stays runnable.
+func TestStartupOrder_HeavyPathStepsAppearInOrder(t *testing.T) {
+	TestWire_HeavyPathStepsAppearInOrder(t)
 }
 
 // TestWire_RegistryNamesReachAgentLoader 是 T2：装配期注册池的名字集**流进**装载器——
@@ -389,6 +480,8 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 		})
 		require.NoError(t, err, "包外装配必须成功（失败先看日志里的 step 停在哪一步）")
 		t.Cleanup(func() { require.NoError(t, rt.Close(), "释放失败不得静默") })
+		// 基线把既有 Agent 写成 disabled（D-01 A）——启用后本子例继续判它原本要判的闭环。
+		outside.enableAgentsBesideRuntime(t)
 
 		res, err := rt.RunService().Run(context.Background(), core.RunRequest{
 			Agent: "reader", SessionID: "wire-open", Message: "读一下 notes.txt", Channel: "cli", UserID: "tester",
@@ -556,6 +649,10 @@ func openWireRuntime(t *testing.T, fx *wireFixture, client core.ProviderClient) 
 	})
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
+	// 包外句柄拿不到装配出来的闸门与存储：用一条独立存储在**无在途运行**时完成同一迁移。
+	// The exported handle hides the assembly's gate; a stand-alone store performs the same
+	// transition while nothing is in flight.
+	fx.enableAgentsBesideRuntime(t)
 	return rt
 }
 
@@ -709,4 +806,226 @@ func TestWire_SqliteBackendLeavesWorkspaceFileUntouched(t *testing.T) {
 
 	require.NoFileExists(t, filepath.Join(fx.root, "memory", "agents", "reader", "MEMORY.md"),
 		"sqlite 档的 Agent 层写入落库，不得顺手在 memory/agents/ 下落文件")
+}
+
+// —— US-11 T020 追加四条：闸门 / 注册表 / 生命周期装配与关闭顺序（模块卡 §3.2.2，
+// 图 A ⑦ / 图 F ③ / 约束 15 / 25 / 46）——
+// Four cases added by US-11 T020: the shared gates, the single registry read face, the
+// baseline's disabled verdict, and the release order of the instance lock.
+
+// TestWire_AgentGateSharedWithLifecycleConsole（图 F ③ / 约束 25 / 46）：启停迁移与运行
+// 准入必须共用装配层建出的**同一份** Agent 级闸门。判别方式：测试持有该 Agent 的写锁时，
+// 装配出来的管理面 Transition 必须等锁；释放之后才进入文件判定，并以"期望代数不符"的
+// 冲突收场、零操作行。
+// 人工 review ②（US-12 交接）后 Discard 改为调用方持写锁、状态文件存储不再自行取锁，
+// 共享关系改由控制台在写锁内调用 Transition 体现——判据对象换了，判据本身不变。
+// 逆改点：web.go 的 wireManagementPorts 给 NewAgentConsole 传 nil Gate（自建私有锁表）
+// → Transition 立刻返回，红。
+// The console's transition must wait on the very gate the assembly gives admission.
+func TestWire_AgentGateSharedWithLifecycleConsole(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader", "read_file")
+	rt := fx.assemble(t)
+
+	require.NotNil(t, rt.resourceGate, "发布 / 准入闸门必须由装配层建出（约束 46；T045 的解析将共用它）")
+	admin := fx.app().webOptions(rt).AgentAdmin
+	require.NotNil(t, admin, "重路径必须装配管理面：启停迁移与内容写都经它（失败关闭）")
+
+	release := rt.agentGate.Lock("reader")
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := admin.Transition(context.Background(), "reader", core.AgentDisabled,
+			core.AgentLifecycleTransition{ExpectedState: core.AgentActive, ExpectedGeneration: 1},
+			consoleActor())
+		done <- err
+	}()
+	<-started
+
+	select {
+	case err := <-done:
+		release()
+		t.Fatalf("Transition 未等待共享写锁就返回（err=%v）——管理面与准入用的不是同一把锁", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, core.ErrLifecycleConflict,
+			"拿到锁后才进入文件判定：期望代数 1 与已启用（代数 2）不符，冲突且零操作行")
+	case <-time.After(5 * time.Second):
+		t.Fatal("释放写锁后 Transition 仍未返回：管理面与闸门接错了实例")
+	}
+}
+
+// TestWire_RegistryIsSingleAdmissionSource（§3.1.20 / FR-22）：运行准入读的是注册表的
+// **当前快照**，不是装配时那份一次性副本——移除后立即拒绝，放回后立即放行。
+// 逆改点：把 ServiceOptions.Agents 退回装载结果副本 → 移除后仍放行，红。
+// Admission reads the registry's current snapshot: removing an agent refuses it at once,
+// and putting it back admits it again.
+func TestWire_RegistryIsSingleAdmissionSource(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader", "read_file")
+	rt := fx.assemble(t)
+
+	ctx := context.Background()
+	entry, ok := rt.agents.Lookup("reader")
+	require.True(t, ok, "装配之后注册表里有该 Agent")
+
+	rt.agents.Remove("reader")
+	_, err := rt.service.Run(ctx, core.RunRequest{
+		Agent: "reader", SessionID: "wire-registry-off", Message: "hi", Channel: "cli",
+	})
+	var notFound *core.AgentNotFoundError
+	require.ErrorAs(t, err, &notFound, "注册表移除后，同一运行入口必须立即拒绝")
+	require.Equal(t, "reader", notFound.Name)
+
+	rt.agents.Replace("reader", entry)
+	_, err = rt.service.Run(ctx, core.RunRequest{
+		Agent: "reader", SessionID: "wire-registry-on", Message: "hi", Channel: "cli",
+		Budget: core.Budget{ContextTokens: 1},
+	})
+	require.NoError(t, err, "放回注册表后立即放行——两处读的是同一份快照")
+}
+
+// TestWire_BaselineDisablesThenEnableAdmits（D-01 A / 注 1 / 图 F ③）：基线先于开放服务，
+// 把既有 Agent 写成 disabled / generation 1；准入读到它即失败关闭（零行运行账），经共享
+// 闸门启用后才放行。这是本 US 的**行为变更**：既有 Agent 默认停用，不得静默当作可用。
+// 逆改点：基线改写成 active，或准入忽略状态文件 → 第一次 Run 不报不可用，红。
+// The baseline writes disabled/generation 1 before serving; admission fails closed until a
+// real transition enables the agent.
+func TestWire_BaselineDisablesThenEnableAdmits(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader", "read_file")
+
+	// **不走**夹具的自动启用：本用例判的正是基线写下的初始态。
+	rt, err := fx.app().newRuntime(context.Background())
+	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
+	t.Cleanup(func() { require.NoError(t, rt.Close()) })
+
+	record, exists, err := rt.lifecycle.Read(context.Background(), "reader")
+	require.NoError(t, err, "基线必须为既有 Agent 写下状态文件")
+	require.True(t, exists)
+	require.Equal(t, core.AgentDisabled, record.State, "既有 Agent 一律基线为 disabled（D-01 A）")
+	require.EqualValues(t, 1, record.Generation, "首版状态文件是 generation 1")
+
+	ctx := context.Background()
+	_, err = rt.service.Run(ctx, core.RunRequest{
+		Agent: "reader", SessionID: "wire-lifecycle-off", Message: "hi", Channel: "cli",
+	})
+	var unavailable *core.AgentUnavailableError
+	require.ErrorAs(t, err, &unavailable, "停用的 Agent 在准入处被拒（失败关闭）")
+	require.Equal(t, core.AgentDisabled, unavailable.State)
+	require.Equal(t, "reader", unavailable.Name)
+
+	read := openRead(t, fx.dbPath())
+	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM runs`),
+		"准入拒绝发生在任何写入之前：一次运行都不该留下账")
+
+	fx.enableAgents(t, rt)
+
+	res, err := rt.service.Run(ctx, core.RunRequest{
+		Agent: "reader", SessionID: "wire-lifecycle-on", Message: "hi", Channel: "cli",
+		Budget: core.Budget{ContextTokens: 1},
+	})
+	require.NoError(t, err, "启用之后同一入口放行")
+	require.Equal(t, core.StatusFailed, res.Status, "预算准入拒绝走 Status，不掩盖启用本身")
+
+	enabled, exists, err := rt.lifecycle.Read(ctx, "reader")
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, core.AgentActive, enabled.State)
+	require.EqualValues(t, 2, enabled.Generation, "一次成功迁移把代数推进一格")
+}
+
+// TestWire_CloseReleasesInstanceLockLast（约束 22 / 图 F）：真实装配的释放次序——MCP 连接池
+// 关闭时实例锁**仍被持有**，`Close` 返回之后才可再次取得。库先于锁释放由既有
+// `TestWire_CloseClosesMCPBeforeDatabase` 判，两条合起来钉住"调度器 → MCP → 库 → 锁"。
+// 逆改点：Close 里把 lock.Release() 提到 mcp.Close() 之前 → 连接器回调能取得锁，红。
+// The instance lock outlives every other resource; only after Close returns can a second
+// instance acquire it.
+func TestWire_CloseReleasesInstanceLockLast(t *testing.T) {
+	fx := newWireFixture(t)
+	writeMCPServersYAML(t, fx.root, []string{"probe"})
+
+	lockHeldDuringMCPClose := false
+	connector := &fakeMCPConnector{onClose: func() error {
+		probe, err := workspace.AcquireInstanceLock(fx.root)
+		if err != nil {
+			var busy *workspace.LockBusyError
+			lockHeldDuringMCPClose = errors.As(err, &busy)
+			return nil
+		}
+		// 锁已被提前释放：立刻归还，让断言以"未持有"落红而不是污染后续判定。
+		_ = probe.Release()
+		return nil
+	}}
+
+	app := fx.app()
+	app.mcpConnect = connector
+	rt, err := app.newRuntime(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, rt.Close(), "释放失败不得静默")
+
+	require.True(t, connector.closed, "Close 必须先关闭 MCP 池")
+	require.True(t, lockHeldDuringMCPClose,
+		"实例锁不得先于 MCP 释放：有活句柄时另一个实例不得进得来")
+
+	reacquired, err := workspace.AcquireInstanceLock(fx.root)
+	require.NoError(t, err, "Close 返回后实例锁必须已释放")
+	require.NoError(t, reacquired.Release())
+}
+
+// TestRunService_AssemblyWiresPublishedSnapshots（T056 / 约束 31）：重路径装配把资源解析与
+// 发布版本快照构建器**成对**接进唯一运行入口——绑定技能的运行冻结出的清单记逻辑路径
+// `.basalt/skills/<name>/SKILL.md`（字节取发布目录），卡片真路径不进清单；四个共享句柄
+// （versions / ops / mcpRT / skills）由装配层保留。
+// 逆改点：ServiceOptions 漏传 RunSnapshots（装配失败关闭）/ Builder 改读工作副本
+// （清单记 `skills/...`）→ 断言红。
+// The heavy path wires the resource resolver and the published-version snapshot builder
+// together: a skill-bound run freezes the logical manifest path while the bytes come
+// from the published directory.
+func TestRunService_AssemblyWiresPublishedSnapshots(t *testing.T) {
+	fx := newWireFixture(t)
+
+	// 技能工作副本先于装配落盘：基线把它发布成版本 1，准入据此固定发布目录。
+	full := filepath.Join(fx.root, "skills", "writer-skill", "SKILL.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+	require.NoError(t, os.WriteFile(full,
+		[]byte("---\nname: writer-skill\ndescription: 快照探针\n---\n\n正文\n"), 0o644))
+
+	agentDir := filepath.Join(fx.root, agentsDirName, "writer")
+	require.NoError(t, os.MkdirAll(agentDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(agentDir, "AGENT.md"),
+		[]byte("---\nname: writer\ndescription: 快照探针\n"+
+			"provider:\n  name: probe\n  model: probe-model\n"+
+			"skills:\n  - writer-skill\ntools: []\n---\n\n你是「writer」。\n"), 0o644))
+	fx.agents = append(fx.agents, "writer")
+
+	rt := fx.assemble(t)
+
+	require.NotNil(t, rt.versions, "资源版本仓储必须由装配层保留（准入与基线共用同一实例）")
+	require.NotNil(t, rt.ops, "管理操作仓储必须由装配层保留")
+	require.NotNil(t, rt.mcpRT, "MCP 运行期句柄必须由装配层保留")
+	require.NotNil(t, rt.skills, "技能库句柄必须由装配层保留（基线 / 准入 / 快照共用）")
+
+	res, err := rt.service.Run(context.Background(), core.RunRequest{
+		Agent: "writer", SessionID: "wire-t056", Message: "hi", Channel: "cli",
+		Budget: core.Budget{ContextTokens: 1},
+	})
+	require.NoError(t, err, "运行期失败走 Status，不走函数级 error（契约 §1.2）")
+	require.Equal(t, core.StatusFailed, res.Status)
+
+	read := openRead(t, fx.dbPath())
+	var manifestJSON string
+	require.NoError(t, read.QueryRowContext(context.Background(),
+		`SELECT manifest_json FROM config_snapshots`).Scan(&manifestJSON))
+	require.Contains(t, manifestJSON, `".basalt/skills/writer-skill/SKILL.md"`,
+		"清单记逻辑路径，字节来自发布目录")
+	require.NotContains(t, manifestJSON, ".basalt/versions/",
+		"发布真路径只进卡片行，不进清单")
 }

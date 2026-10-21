@@ -83,6 +83,9 @@ func (f *fileToolFixture) agentDir() string {
 // The explicit per-call environment; the tool never guesses its context.
 func (f *fileToolFixture) toolEnv() core.ToolEnv {
 	// 三件文件工具不消费输出上限（截断是执行侧的事），故这里按契约缺省给一个具体值即可。
+	// RunID 非空而 RunBound 为 false 是**有意**的：运行标记只认显式字段，不从 RunID 推断
+	// （F-04 B1），本夹具代表既有的非 Run 调用形态。
+	// A non-empty RunID with RunBound false is deliberate: the marker is never inferred.
 	return core.ToolEnv{
 		RunID:          "run-files-1",
 		SessionID:      "sess-files-1",
@@ -90,6 +93,15 @@ func (f *fileToolFixture) toolEnv() core.ToolEnv {
 		AgentDir:       f.agentDir(),
 		MaxOutputBytes: 256 * 1024,
 	}
+}
+
+// toolEnvWithSkills 在 toolEnv 之上补**本次 Run 绑定的**技能发布目录（人工 review ② F1）：
+// 绑定值经显式执行环境传入，工具与策略都不得自行推断版本。
+// toolEnvWithSkills adds the run-bound skill version directories to the per-call env.
+func (f *fileToolFixture) toolEnvWithSkills(dirs ...string) core.ToolEnv {
+	env := f.toolEnv()
+	env.SkillDirs = dirs
+	return env
 }
 
 // runTool 调一次工具：入参是对象字面量的 JSON（与执行侧同形，不经任何封装）。
@@ -154,6 +166,41 @@ func TestReadFileTool_ResolvesAgentDirAndSkillCardPaths(t *testing.T) {
 	result, err = runTool(t, f.read, f.toolEnv(), fmt.Sprintf(`{"path":%q}`, note))
 	require.NoError(t, err)
 	require.Equal(t, "第一行\n第二行\n", result.Content, "绝对路径原样使用")
+}
+
+// TestFileTools_RunBoundRefusesSkillWorkCopy 覆盖 F-04 B1：Run 上下文（`RunBound=true`）
+// 读 / 列技能工作副本一律拒绝——**即使本次 Run 一个技能都没绑定**；绑定的发布版本目录
+// 仍可读；非 Run 调用保持既有规则（I2 已覆盖）。逆改点：filetools 不传 `RunBound` 或
+// 策略去掉该分支 → 本用例前两条断言红。
+// Acceptance point (F-04 B1): a run never reads the skill work copy, bound or not.
+func TestFileTools_RunBoundRefusesSkillWorkCopy(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	skillDir := f.path(filepath.Join("skills", "demo-skill"))
+	require.NoError(t, os.MkdirAll(skillDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# 技能卡片\n"), 0o644))
+
+	runEnv := f.toolEnv()
+	runEnv.RunBound = true
+
+	_, err := runTool(t, f.read, runEnv, `{"path":".basalt/skills/demo-skill/SKILL.md"}`)
+	require.Error(t, err)
+	require.True(t, core.IsSandboxViolation(err), "拒绝必须是授权拒绝，不是读取失败")
+	require.Contains(t, err.Error(), "技能工作副本在运行中不可读",
+		"Run 未绑定技能时也不得退回工作副本")
+
+	_, err = runTool(t, f.list, runEnv, `{"path":".basalt/skills/demo-skill"}`)
+	require.Error(t, err)
+	require.True(t, core.IsSandboxViolation(err))
+	require.Contains(t, err.Error(), "技能工作副本在运行中不可读", "list_dir 走同一个读判定")
+
+	versionDir := f.path(filepath.Join("versions", "skills", "demo-skill", "1"))
+	require.NoError(t, os.MkdirAll(versionDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(versionDir, "SKILL.md"), []byte("# 发布版\n"), 0o644))
+	boundEnv := f.toolEnvWithSkills(".basalt/versions/skills/demo-skill/1")
+	boundEnv.RunBound = true
+	result, err := runTool(t, f.read, boundEnv, `{"path":".basalt/versions/skills/demo-skill/1/SKILL.md"}`)
+	require.NoError(t, err)
+	require.Equal(t, "# 发布版\n", result.Content, "绑定的发布版本目录在 Run 内仍可读")
 }
 
 // TestReadFileTool_DecodesInvalidUTF8Tolerantly 覆盖 I3：UTF-8 宽容解码——非法字节以替换
@@ -305,6 +352,145 @@ func TestWriteFileTool_ProtectedTargetsAreRefused(t *testing.T) {
 	}
 }
 
+// TestFileTools_RefuseProtectedControlDir 覆盖约束 30（R21）的工具面：三件文件工具对
+// `.basalt/control/` 一律拒绝——读状态文件能看见自己的生命周期轨迹，写状态文件则等于
+// 让模型自己启用自己。四条路径形态（卡片逻辑路径 / 绝对路径 / 相对爬级 / 列目录）都要
+// 命中同一条规则，且被拒的写入**不落盘**（逐字节不变）。
+// Acceptance point (R21): all three file tools refuse the control directory on every
+// path shape, and a refused write leaves the state file byte-identical.
+func TestFileTools_RefuseProtectedControlDir(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	controlState := filepath.Join("control", "agents", policyAgent+".json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.path(controlState)), 0o750))
+	original := []byte(`{"state":"active"}`)
+	require.NoError(t, os.WriteFile(f.path(controlState), original, 0o644))
+
+	for _, target := range []string{
+		".basalt/" + filepath.ToSlash(controlState),     // 技能卡片同形的逻辑路径
+		f.path(controlState),                            // 绝对路径
+		"../../control/agents/" + policyAgent + ".json", // 自有目录相对爬两级
+	} {
+		_, err := runTool(t, f.read, f.toolEnv(), fmt.Sprintf(`{"path":%q}`, target))
+		require.Error(t, err, "控制目录读取必须被拒：%s", target)
+		require.True(t, core.IsSandboxViolation(err))
+		require.Contains(t, err.Error(), "受保护控制目录")
+		require.Contains(t, err.Error(), refusalFixedSentence)
+
+		_, err = runTool(t, f.write, f.toolEnv(), fmt.Sprintf(`{"path":%q,"content":"改成 enabled"}`, target))
+		require.Error(t, err, "控制目录写入必须被拒：%s", target)
+		require.True(t, core.IsSandboxViolation(err))
+		require.Contains(t, err.Error(), "受保护控制目录")
+		require.Contains(t, err.Error(), refusalFixedSentence)
+	}
+	onDisk, err := os.ReadFile(f.path(controlState))
+	require.NoError(t, err)
+	require.Equal(t, original, onDisk, "被拒之后状态文件必须逐字节不变")
+
+	_, err = runTool(t, f.list, f.toolEnv(), `{"path":".basalt/control"}`)
+	require.Error(t, err, "控制目录枚举必须被拒")
+	require.True(t, core.IsSandboxViolation(err))
+	require.Contains(t, err.Error(), "受保护控制目录")
+}
+
+// TestReadFileTool_ReadsPublishedSkillVersionPaths 覆盖约束 31 的读档矩阵（人工 review ② F1
+// 收紧口径）：只放行**本次 Run 绑定的**发布版本目录——卡片真路径形态、绝对路径、自有目录
+// 相对爬级都要读得到（L2/L3 从这里取正文）；同技能的其它版本、无绑定调用、`versions/`
+// 其它子树一律按"可读根之外"拒（模块卡行 610：不得为了历史版本放开整棵树）。
+// Acceptance point (R31/F1): only the run-bound version directory is readable on every
+// path shape; every other version stays outside the readable roots.
+func TestReadFileTool_ReadsPublishedSkillVersionPaths(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	published := filepath.Join("versions", "skills", "demo-skill", "1")
+	future := filepath.Join("versions", "skills", "demo-skill", "2")
+	for _, dir := range []string{filepath.Join(published, "references"), future} {
+		require.NoError(t, os.MkdirAll(f.path(dir), 0o750))
+	}
+	require.NoError(t, os.WriteFile(f.path(filepath.Join(published, "SKILL.md")), []byte("# 发布卡片\n"), 0o644))
+	require.NoError(t, os.WriteFile(f.path(filepath.Join(published, "references", "guide.md")), []byte("发布版本正文\n"), 0o644))
+	require.NoError(t, os.WriteFile(f.path(filepath.Join(future, "SKILL.md")), []byte("# 未绑定版本\n"), 0o644))
+	// 相邻子树：不在发布版本根之内，读取必须落到通用规则。
+	require.NoError(t, os.MkdirAll(f.path(filepath.Join("versions", "other")), 0o750))
+	require.NoError(t, os.WriteFile(f.path(filepath.Join("versions", "other", "data.txt")), []byte("别处\n"), 0o644))
+
+	env := f.toolEnvWithSkills(".basalt/versions/skills/demo-skill/1")
+	for _, target := range []string{
+		".basalt/versions/skills/demo-skill/1/SKILL.md",            // 卡片真路径形态
+		f.path(filepath.Join(published, "references", "guide.md")), // 绝对路径
+		"../../versions/skills/demo-skill/1/SKILL.md",              // 自有目录相对爬级
+	} {
+		result, err := runTool(t, f.read, env, fmt.Sprintf(`{"path":%q}`, target))
+		require.NoError(t, err, "绑定版本的路径必须可读：%s", target)
+		require.NotEmpty(t, result.Content)
+	}
+
+	// list_dir 走同一个读判定：绑定目录可枚举，未绑定目录不可。
+	_, err := runTool(t, f.list, env, `{"path":".basalt/versions/skills/demo-skill/1"}`)
+	require.NoError(t, err, "绑定版本的目录必须可枚举")
+	_, err = runTool(t, f.list, env, `{"path":".basalt/versions/skills/demo-skill/2"}`)
+	require.Error(t, err, "未绑定版本的目录必须被拒")
+	require.Contains(t, err.Error(), "读取目标不在可读根之内")
+
+	for _, c := range []struct {
+		name string
+		env  core.ToolEnv
+		path string
+	}{
+		{"同技能的未绑定版本", env, ".basalt/versions/skills/demo-skill/2/SKILL.md"},
+		{"没有绑定（失败关闭）", f.toolEnv(), ".basalt/versions/skills/demo-skill/1/SKILL.md"},
+		{"发布版本根之外的 versions/ 子树", env, ".basalt/versions/other/data.txt"},
+	} {
+		_, err := runTool(t, f.read, c.env, fmt.Sprintf(`{"path":%q}`, c.path))
+		require.Error(t, err, "%s：读取必须被拒（%s）", c.name, c.path)
+		require.True(t, core.IsSandboxViolation(err))
+		require.Contains(t, err.Error(), "读取目标不在可读根之内")
+	}
+}
+
+// TestWriteFileTool_RefusesPublishedSkillVersionPaths 覆盖约束 31 的写档矩阵：发布版本
+// 目录与工作副本同档只读——三种路径形态一律拒（规则 = 技能库只读），且被拒写入
+// **不落盘**；人工 review ② F1 之后，**本次 Run 绑定的**版本目录读得到也照样写不进
+// （只读放行不改变写侧规则）；`versions/` 其它子树的拒因是"可写范围之外"，两条规则
+// 不得互相顶替。
+// Acceptance point (R31/F1): the published tree stays read-only under the
+// skills-read-only rule even for the run-bound version, on every path shape, and a
+// refused write leaves the bytes untouched.
+func TestWriteFileTool_RefusesPublishedSkillVersionPaths(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	published := filepath.Join("versions", "skills", "demo-skill", "1")
+	require.NoError(t, os.MkdirAll(f.path(published), 0o750))
+	card := f.path(filepath.Join(published, "SKILL.md"))
+	original := []byte("---\nname: demo-skill\ndescription: 只读\n---\n\n正文\n")
+	require.NoError(t, os.WriteFile(card, original, 0o644))
+
+	bound := f.toolEnvWithSkills(".basalt/versions/skills/demo-skill/1")
+	for _, c := range []struct {
+		name string
+		env  core.ToolEnv
+		path string
+	}{
+		{"卡片真路径形态", bound, ".basalt/versions/skills/demo-skill/1/SKILL.md"},
+		{"绝对路径", bound, card},
+		{"自有目录相对爬级", bound, "../../versions/skills/demo-skill/1/SKILL.md"},
+		{"无绑定也要拒（失败关闭）", f.toolEnv(), ".basalt/versions/skills/demo-skill/1/SKILL.md"},
+	} {
+		_, err := runTool(t, f.write, c.env, fmt.Sprintf(`{"path":%q,"content":"篡改"}`, c.path))
+		require.Error(t, err, "%s：发布版本写入必须被拒（%s）", c.name, c.path)
+		require.True(t, core.IsSandboxViolation(err))
+		require.Contains(t, err.Error(), "技能库不可写入")
+		require.Contains(t, err.Error(), refusalFixedSentence)
+	}
+	onDisk, err := os.ReadFile(card)
+	require.NoError(t, err)
+	require.Equal(t, original, onDisk, "被拒之后发布版本必须逐字节不变")
+
+	// 相邻子树的拒因是写范围，不是技能库规则——两条规则不得互相顶替。
+	require.NoError(t, os.MkdirAll(f.path(filepath.Join("versions", "other")), 0o750))
+	_, err = runTool(t, f.write, f.toolEnv(), `{"path":".basalt/versions/other/data.txt","content":"x"}`)
+	require.Error(t, err)
+	require.True(t, core.IsSandboxViolation(err))
+	require.Contains(t, err.Error(), "写入目标超出当前 Agent 的可写范围")
+}
+
 // TestWriteFileTool_RelativeRootHandleBlocksEscape 覆盖 I10：**写入经相对根句柄**——换成
 // 永远放行的桩策略后，越界写入仍失败，且工作区外/写入根外**没有**留下文件。这正是
 // "先检查路径、随后普通 open 证明不了竞争窗口"的闭卷判据：挡住它的是句柄，不是策略。
@@ -398,6 +584,27 @@ func TestListDirTool_DoesNotRecurseAndDoesNotFollowSymlinks(t *testing.T) {
 		require.Contains(t, result.Content, "link - sublink\n", "链接以本层条目出现")
 		require.NotContains(t, result.Content, "secret.txt", "链接指向的目录内容不得被摊平进来")
 	})
+}
+
+// TestListDirTool_RefusesOutOfRootSymlinkTarget 覆盖人工 review ② F5：目标目录**本身**
+// 是指向工作区外的软连接时，list_dir 必须失败关闭。策略面全放行之后只剩相对根句柄
+// 还能挡住这次枚举——普通 `os.ReadDir(real)` 会把根外目录内容整份列出来。
+// 逆改点：list_dir 退回 os.ReadDir(real) 直接列目录 → 本用例红（根外文件被列出）。
+// Review finding F5: a directory that is itself an out-of-root symlink must not be
+// enumerated; with the policy out of the way only the root handle can refuse it.
+func TestListDirTool_RefusesOutOfRootSymlinkTarget(t *testing.T) {
+	f := newFileToolFixture(t, nil)
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("工作区外\n"), 0o644))
+	link := f.path(filepath.Join("agents", policyAgent, "outlink"))
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skip("本平台不允许创建符号链接（Windows 需开发者模式或特权）：" + err.Error())
+	}
+	list := tool.NewListDirTool(allowAllPolicy{}, f.root)
+
+	_, err := runTool(t, list, f.toolEnv(), `{"path":"outlink"}`)
+	require.Error(t, err, "指向工作区外的目录软连接必须被句柄拒")
+	require.NotContains(t, err.Error(), "secret.txt", "根外目录内容不得被枚举")
 }
 
 // TestListDirTool_FailuresMatchContract 覆盖 I14：失败类别逐字——目录不存在 → `not_found`；

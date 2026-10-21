@@ -11,6 +11,10 @@ type NotifyChannel struct {
 	Name string // 渠道名（主键；大小写敏感精确匹配）
 	Type string // 适配器类型（webhook / feishu，由装配层映射裁决）
 	URL  string // `${VAR}` 引用；本 US 零明文
+	// Description 是渠道说明（`notify_channels.description`，可空）；空列读成空串——
+	// 契约 NotifyChannelView.description 是非空余类型字符串，不是 null。
+	// Description is the optional channel note; a NULL column reads as an empty string.
+	Description string
 }
 
 // NotifyChannelReader 是渠道注册表的只读面（消费方声明，实现在 `storage`）：

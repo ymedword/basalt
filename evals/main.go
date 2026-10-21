@@ -841,6 +841,16 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 		}
 	}()
 
+	// US-11（D-01 A）：基线把既有 Agent 一律写成 disabled——评测夹具代表"运维已启用"的
+	// 初始态，所以在拿到运行入口之后、跑之前，按生产的同一条状态机把夹具 Agent 迁到
+	// active。迁移失败没有"没启用"的借口：fake 档与真模型档一样如实判 FAIL。
+	// US-11 (D-01 A): the baseline disables pre-existing agents, so the fixture is enabled
+	// through the production state machine before the one run.
+	if err := enableFixtureAgent(filepath.Join(workDir, workspaceDirName), ec.Fixture.Agent); err != nil {
+		cr.Error = fmt.Sprintf("启用夹具 Agent 失败：%v", err)
+		return cr
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, caseTimeout)
 	defer cancel()
 
@@ -884,6 +894,31 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 	cr.Checks = judge(ec, obs)
 	cr.Passed = allChecksPassed(cr.Checks)
 	return cr
+}
+
+// enableFixtureAgent 在基线之后把夹具 Agent 迁到 active：用独立闸门 + 生产状态存储完成
+// 一次真实迁移（此时没有在途运行，与包外适配同一手法）。已是 active 时原样返回，同一
+// 工作区重复执行的用例因此不会撞上"没有可执行的迁移"。
+// enableFixtureAgent transitions the fixture agent to active through the production
+// state machine once the baseline has written disabled/generation=1; an already-active
+// agent is a no-op.
+func enableFixtureAgent(wsRoot, agent string) error {
+	gate := core.NewAgentGate()
+	store := workspace.NewLifecycleStore(wsRoot, time.Now)
+
+	release := gate.Lock(agent)
+	defer release()
+
+	record, exists, err := store.Read(context.Background(), agent)
+	if err != nil {
+		return err
+	}
+	if exists && record.State == core.AgentActive {
+		return nil
+	}
+	_, err = store.Transition(context.Background(), agent, record.State, record.Generation,
+		core.AgentActive, core.NewOperationID(time.Now()))
+	return err
 }
 
 // caseReaders 是读数需要的三个只读面（接口形态取自消费方声明——包外拿到的是能力）。

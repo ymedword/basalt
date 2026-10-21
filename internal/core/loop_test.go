@@ -337,9 +337,22 @@ type fakeStore struct {
 
 	snapshots []core.ConfigSnapshot
 
+	// lastManifest 是最近一次 StartRun 收到的清单（零清单 = 装配未接线）。
+	lastManifest core.RunResourceManifest
+
+	// finishCalls 是 FinishRun 被调用的次数（取消用例的判据：取消路径**不得**写终态，
+	// 终态只能由 Run 自己经 FinishRun 写一次）。
+	finishCalls int
+
 	// failToolAppendOnce 注入"工具结果追加失败"（提前返回路径用例）——**一次性**：
 	// 只失败第一次，之后的补齐写入必须能落（否则测的是"存储全坏"，不是"提前返回路径"）。
 	failToolAppendOnce bool
+
+	// startRunErr 注入账本预写失败（准入租约的失败归还判据）；onStartRun 是记账前
+	// 的观察钩子——用例借此读取"StartRun 时刻准入读锁是否仍被租用"。
+	// startRunErr injects a ledger failure; onStartRun observes the state at StartRun.
+	startRunErr error
+	onStartRun  func()
 }
 
 func newFakeStore() *fakeStore {
@@ -382,8 +395,9 @@ func (s *fakeStore) UpsertSession(_ context.Context, rec core.SessionRecord) err
 	return nil
 }
 
-// ListSessions 列出会话（排序口径：标识升序）。
-func (s *fakeStore) ListSessions(_ context.Context) ([]core.SessionRecord, error) {
+// ListSessions 列出会话（排序口径：标识升序；本假存储不判过滤——过滤语义在
+// storage 的 session_store 用例里判卷）。
+func (s *fakeStore) ListSessions(_ context.Context, _ core.SessionFilter) ([]core.SessionRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]core.SessionRecord, 0, len(s.sessions))
@@ -393,12 +407,21 @@ func (s *fakeStore) ListSessions(_ context.Context) ([]core.SessionRecord, error
 	return out, nil
 }
 
-// StartRun 建 `running` 行。
-func (s *fakeStore) StartRun(_ context.Context, rec core.RunRecord) error {
+// StartRun 建 `running` 行（清单随运行传入，本假存储只记「零清单 / 非零清单」两态——
+// 清单内容的判据面在 storage 的 run_store 用例）。`startRunErr` 注入账本失败；
+// `onStartRun` 在记账前观察调用时刻的状态（准入租约的时点判据）。
+func (s *fakeStore) StartRun(_ context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
+	if hook := s.onStartRun; hook != nil {
+		hook()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.startRunErr != nil {
+		return s.startRunErr
+	}
 	s.runs[rec.RunID] = rec
 	s.status[rec.RunID] = core.StatusRunning
+	s.lastManifest = manifest
 	return nil
 }
 
@@ -408,7 +431,25 @@ func (s *fakeStore) FinishRun(_ context.Context, runID string, status core.RunSt
 	defer s.mu.Unlock()
 	s.status[runID] = status
 	s.reason[runID] = reason
+	s.finishCalls++
 	return nil
+}
+
+// GetRun 用内存里的起始行与终态组装详情（循环用例不读清单 / final_text——
+// 那两者是 storage 读侧的判据面）。未记录 → ErrRunNotFound。
+func (s *fakeStore) GetRun(_ context.Context, runID string) (core.RunDetail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.runs[runID]
+	if !ok {
+		return core.RunDetail{}, core.ErrRunNotFound
+	}
+	return core.RunDetail{RunRecord: rec, Status: s.status[runID], Reason: s.reason[runID]}, nil
+}
+
+// ListRuns 不在循环用例的判据面内，返回空窗口——存在只为满足接口方法集。
+func (s *fakeStore) ListRuns(_ context.Context, _ core.RunFilter) ([]core.RunDetail, error) {
+	return []core.RunDetail{}, nil
 }
 
 // SaveSnapshot 落配置快照（insert-if-absent 语义：同 hash 不覆盖）。
@@ -661,6 +702,7 @@ type spyTool struct {
 	executed  int
 	active    int
 	maxActive int
+	lastEnv   core.ToolEnv  // 最近一次执行收到的执行环境（准入绑定的技能目录等判据面）
 	finished  chan struct{} // 最近一次执行体返回时关闭
 
 	// 用例钩子。
@@ -682,10 +724,11 @@ func (s *spyTool) InputSchema() json.RawMessage {
 }
 
 // Execute 记一次执行；`blockUntilCancel` 时等 ctx 被取消再返回（取消传播用例的锚点）。
-func (s *spyTool) Execute(execCtx context.Context, _ core.ToolEnv, _ json.RawMessage) (core.Result, error) {
+func (s *spyTool) Execute(execCtx context.Context, env core.ToolEnv, _ json.RawMessage) (core.Result, error) {
 	s.mu.Lock()
 	call := s.executed
 	s.executed++
+	s.lastEnv = env
 	s.active++
 	if s.active > s.maxActive {
 		s.maxActive = s.active
@@ -724,6 +767,14 @@ func (s *spyTool) maxConcurrent() int {
 	return s.maxActive
 }
 
+// executedEnv 返回最近一次执行收到的执行环境（准入绑定目录的传播判据）。
+// executedEnv returns the environment of the most recent execution.
+func (s *spyTool) executedEnv() core.ToolEnv {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastEnv
+}
+
 // waitExited 限时等待最近一次执行体返回。
 func (s *spyTool) waitExited(t *testing.T, d time.Duration) {
 	t.Helper()
@@ -751,8 +802,13 @@ type fakeAgentSource struct {
 	profileIter  int   // Profile.settings.max_iterations（0 表示用装载器缺省 10）
 }
 
-// Exists 判定 Agent 是否可运行。
-func (a *fakeAgentSource) Exists(name string) bool { return name == loopAgentName }
+// Lookup 取注册条目（只有一只注册 Agent）。
+func (a *fakeAgentSource) Lookup(name string) (core.AgentEntry, bool) {
+	if name != loopAgentName {
+		return core.AgentEntry{}, false
+	}
+	return core.AgentEntry{Name: name, Registered: true}, true
+}
 
 // Dir 返回 Agent 目录绝对路径。
 func (a *fakeAgentSource) Dir(name string) string {
@@ -762,11 +818,13 @@ func (a *fakeAgentSource) Dir(name string) string {
 	return a.h.agentsDir
 }
 
-// Snapshot 冻结一份运行级快照：段一正文、Profile（含工具集）与哈希。
-func (a *fakeAgentSource) Snapshot(_ context.Context, name string, _ time.Time) (*core.ConfigSnapshot, error) {
+// Snapshot 冻结一份运行级快照：段一正文、Profile（含工具集）与哈希。快照从**准入条目**
+// 冻结（与生产实现同口径：不按名字二次查表）。
+func (a *fakeAgentSource) Snapshot(_ context.Context, entry core.AgentEntry, _ time.Time) (*core.ConfigSnapshot, error) {
 	if a.failSnapshot != nil {
 		return nil, a.failSnapshot
 	}
+	name := entry.Name
 	if name != loopAgentName {
 		return nil, &core.AgentNotFoundError{Name: name}
 	}

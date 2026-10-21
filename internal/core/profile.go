@@ -82,4 +82,12 @@ type AgentEntry struct {
 	Unverified   bool     // 轻路径待确认（只改展示与摘要；运行面仍只收 Registered）
 	Profile      *Profile // frontmatter 解析成功时非 nil（未注册也可非 nil——供 list / show 展示）
 	RejectReason string   // Registered == false 且 Unverified == false 时非空：reason + detail 的人读合并
+
+	// Definition 是装载 / 候选校验**实际校验过的那一份** AGENT.md 字节：运行快照从它出，
+	// **不得**回读磁盘。准入与快照之间若隔着一份尚未发布的磁盘编辑（合法改写或已被
+	// watcher 拒绝的坏改写），回读会让清单与实际模型调用分叉，或让坏编辑挡住新运行
+	//（人工 review ② 缺陷 1）。手工构造的条目（直接调用方 / 测试）可为 nil——冻结时退回读盘。
+	// Definition holds the exact AGENT.md bytes the loader validated; run snapshots freeze
+	// from it so an unpublished or rejected disk edit can never split manifest from call.
+	Definition []byte
 }

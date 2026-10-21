@@ -457,4 +457,5 @@ F-09 的根因是「私有模块卡被声明为 CI 执行 stage 的 `inputs`」�
 - 新测试落在 `015-acceptance-infra` 既有 `-run '^(…TestStages_…)$'` 正则内，失败会使该 check 非零退出即判 failed；**未**追加进 `required_tests`（避免改 stage 字面量与 `pinnedRequiredTests` 静态钉值）。若后续要在报告中逐名列出，需单列裁决。
 - **红态探针（2026-10-20）**：临时把 `docs/us/us15-acceptance-infra.md` 加回 `current.json` 的 inputs，`TestStages_CIInputsGitVisible` 变红，逐字报 `inputs "docs/us/us15-acceptance-infra.md" 不在 git 跟踪面内（干净检出加载该 stage 会失败）: error: pathspec 'docs/us/us15-acceptance-infra.md' did not match any file(s) known to git`；恢复后 `current.json` sha256 与探针前一致（`efa189307e275e37fd9f48905b771e2ef46f14270158224f63291b339c17b3f5`），测试转绿。
 - **绿态读数**：`go test ./scripts/acceptance -run 'TestStages_' -count=1` 8/8 顶层测试 PASS（含新守卫，1.291s）；`make check` **exit 0**（七目标全绿；test 目标 `scripts/acceptance 6.486s coverage 79.8%`，`check-coverage: 全部包达标`，`CGO_ENABLED=0` 构建成功）。
+- **真实 CI（2026-10-20）**：run [39418001271](https://github.com/ymedword/basalt/actions/runs/39418001271)（head `2188aa2`）conclusion=success；build 与 test 两个 job 均 success，test job 覆盖新增守卫。
 - 三个私有文件（skill / README / 模板）不在版本库，只在本工作区与灌注过私有资产的 worktree 生效；随 clone 生效的持久防线是入库测试。CI 执行面未新增步骤，`ci.yml` 零改动。

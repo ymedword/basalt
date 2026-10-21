@@ -105,3 +105,25 @@ func TestOpenReadOnly_MissingDatabase(t *testing.T) {
 	require.ErrorIs(t, err, core.ErrDatabaseMissing)
 	require.NoFileExists(t, path, "只读打开不得创建库文件")
 }
+
+// TestPing_ReportsReadPoolHealth：Ping 只探**读池**——只读句柄也能回答（系统概览的
+// database.status）；未装配读池 / 已关闭的句柄如实报错，不得把失败伪装成 ok。
+// Ping checks the read pool only: a read-only handle answers, a closed one reports an
+// error instead of a fake ok.
+func TestPing_ReportsReadPoolHealth(t *testing.T) {
+	ctx := context.Background()
+	path := writablePath(t)
+
+	created, err := OpenWritable(ctx, path, SupportedSchemaVersion)
+	require.NoError(t, err)
+	require.NoError(t, created.Close())
+
+	db, err := OpenReadOnly(ctx, path, SupportedSchemaVersion)
+	require.NoError(t, err)
+	require.NoError(t, db.Ping(ctx), "只读句柄不得因缺少写池而报错")
+
+	require.Error(t, (&DB{}).Ping(ctx), "未装配读池的句柄拒绝探活")
+
+	require.NoError(t, db.Close())
+	require.Error(t, db.Ping(ctx), "关闭后的句柄不得报 ok")
+}

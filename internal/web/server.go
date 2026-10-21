@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,6 +45,49 @@ type Options struct {
 	Memory    MemorySections
 	Schedules ScheduleService // 可选：nil 时四个 /schedules 端点按 500 返回（装配缺失是错误）
 
+	// 管理面端口（US-11；全部由 app 层适配，web 只依赖 core 与标准库）。
+	// AdminAuth 是认证闸门：公开面闭集以外的路由一律经它取得 actor。
+	// 其余端口各自对应一类观测 / 管理路由；缺失端口的必需性随对应路由落地收紧。
+	// Management-surface ports, adapted by the app layer; each port gates one route
+	// family, and the requirement to supply it tightens as those routes land.
+	AdminAuth  AdminAuth
+	Registry   AgentRegistry
+	Lifecycle  core.LifecyclePort
+	AgentAdmin core.AgentAdmin
+	Operations core.OperationStore
+
+	// System 是 /system/overview 的数据库侧读数（运行 / 资源计数与库版本）；
+	// Sampler 是 /system/sample 的采样器，nil 时按注入时钟构造。
+	// System supplies the overview's database readings; a nil Sampler is built from
+	// the injected clock at construction.
+	System  SystemReader
+	Sampler *Sampler
+
+	// Resources 是技能 / MCP / 模型连接只读面的数据源（§3.1.8）；六个资源路由
+	// 落地后为必需端口，缺端口按 500 INTERNAL 拒绝（不是空列表）。
+	// Resources backs the six read-only resource routes; a missing port is an
+	// assembly error answered with a fixed 500, never an empty list.
+	Resources ResourceReader
+
+	// Console 是管理台内嵌产物根（`assets.Console()`，§3.1.22）：装配期必需——缺它
+	// 就没有 `/console/*` 与根重定向的落点，NewServer 直接拒绝（约束 41 / 43）。
+	// Console is the embedded dist root; it is required at assembly time.
+	Console fs.FS
+
+	// Sandbox 是沙箱白名单的只读投影输入（§3.1.28）：路径一律是相对展示名，绝对
+	// 路径由投影层再挡一次；零值 = 四类白名单全空（不是"读配置"的失败）。
+	// Sandbox carries the sandbox allowlists as relative display names; the zero
+	// value means four empty allowlists, not a configuration failure.
+	Sandbox SandboxConfig
+
+	// Notify 是通知渠道的只读注册表（§3.1.29）；NotifyTypes 是装配层显式注册的有序
+	// 类型名（单一真值，US-12 写面复用同一映射表）。Notify 为 nil 时列表端点按 500
+	// INTERNAL 拒绝——缺端口是装配错误，不是空列表。
+	// Notify is the read-only channel registry; NotifyTypes is the assembly layer's
+	// single ordered type list.
+	Notify      core.NotifyChannelReader
+	NotifyTypes []string
+
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
 	readTimeoutOverride  time.Duration
@@ -60,12 +104,54 @@ type ProviderInfo struct {
 	Configured bool
 }
 
-// RunService 是唯一运行入口与归档入口（适配 *core.AgentService）：归档与在途运行
-// 的互斥在服务端同一把锁内判定（约束 40），web 不再登记任何在途计数。
-// RunService is the only run and archive entry point; admission lives in the service.
+// SandboxConfig 是 `/sandbox` 的投影输入（§3.1.28）：四类白名单。`FileAllowedPaths`
+// 是**相对工作区根的展示名**（如 `.basalt/agents/<agent>/`），装配层负责把固定目录
+// 规则翻成这些名字；web 层不再拼路径——两处各拼一次必有第三处漂移。
+// SandboxConfig carries the four allowlists; file paths are workspace-relative display
+// names filled by the assembly layer, never host paths.
+type SandboxConfig struct {
+	FileAllowedPaths     []string
+	ShellAllowedCommands []string
+	ShellInterpreters    []string
+	HTTPAllowedDomains   []string
+}
+
+// RunService 是运行入口、归档入口与运行账本读面的唯一组合端口：Run / Archive /
+// Cancel 归 `core.AgentService`（准入、归档互斥与取消等待都在 core），ListRuns /
+// GetRun 归 `storage.RunStore`（固定排序、窗口与过滤在 SQL 层）。生产实现是
+// `app.NewRunService`——`*core.AgentService` 的方法集不含 ListRuns / GetRun，
+// **不得**直接当本接口用；本层也不实现第二套账本读取或取消语义。
+// RunService joins the run entry point, archiving, cancellation and the ledger read
+// face. Delegation lives in app.runService; web never re-implements any of it.
 type RunService interface {
 	Run(ctx context.Context, req core.RunRequest) (core.RunResult, error)
-	Archive(ctx context.Context, id string) error
+	Archive(ctx context.Context, agent string) error
+	ListRuns(ctx context.Context, filter core.RunFilter) ([]core.RunDetail, error)
+	GetRun(ctx context.Context, runID string) (core.RunDetail, error)
+	Cancel(ctx context.Context, runID string) (core.RunDetail, error)
+}
+
+// AdminHandler 是受认证保护的处理函数：actor 由认证层以显式参数传入，
+// **不得**写入 context（宪法 VII）；未通过认证时不得调用本函数。
+// AdminHandler receives the authenticated actor as an explicit parameter, never via
+// context; it must never be invoked before authentication succeeds.
+type AdminHandler func(http.ResponseWriter, *http.Request, core.Actor)
+
+// AdminAuth 是管理面认证闸门的装配端口（实现在 auth.go）：公开面闭集以外的
+// 全部路由经 Wrap 包装，认证成功后以显式 actor 调用处理函数。
+// AdminAuth wraps every non-public route and hands the actor to the handler.
+type AdminAuth interface {
+	Wrap(next AdminHandler) http.Handler
+}
+
+// AgentRegistry 是注册表快照的只读端口（实现在 internal/app）：Entries 返回按
+// Agent 名升序的副本，Lookup 只查当前快照。管理台、准入与调度器看到同一份
+// 不可变快照（FR22）——web **不得**另建一份 Agent 清单。
+// AgentRegistry is the read-only view of the single immutable registry snapshot;
+// web must never keep a second agent list.
+type AgentRegistry interface {
+	Entries() []core.AgentEntry
+	Lookup(name string) (core.AgentEntry, bool)
 }
 
 // SessionStore 是会话读面与建行写面（适配 *storage.SessionStore）；归档写面已收归
@@ -75,6 +161,11 @@ type SessionStore interface {
 	GetOrCreateSession(ctx context.Context, rec core.SessionRecord) (core.SessionRecord, bool, error)
 	GetSession(ctx context.Context, id string) (core.SessionRecord, error)
 	MessagesTail(ctx context.Context, id string, limit int) ([]core.Message, error)
+	// ListSessions 是 `GET /sessions` 的读面：过滤只有 agent / status 两维，排序由
+	// 实现固定（`last_active_at DESC, session_id`），Status 按 `archived_at` 派生。
+	// ListSessions backs the console list; ordering and status derivation stay in
+	// the implementation.
+	ListSessions(ctx context.Context, filter core.SessionFilter) ([]core.SessionRecord, error)
 }
 
 // AgentProfiles 是装载结果（适配 app 保留的 entries）。
@@ -109,6 +200,11 @@ type MemorySections interface {
 type Server struct {
 	opts Options
 
+	// console 是构造期校验过的管理台静态壳（§3.1.3）；装配失败由 NewServer 拒绝，
+	// 路由表因此可以无条件登记 `/console/*`（约束 41）。
+	// console is the validated static shell; NewServer refuses to build without it.
+	console *consoleHandler
+
 	crossOrigin *http.CrossOriginProtection
 	baseCtx     context.Context
 	baseCancel  context.CancelFunc
@@ -139,6 +235,10 @@ const (
 // denyMessage is the fixed public text for rejected cross-origin writes.
 const denyMessage = "跨源请求被拒绝"
 
+// consoleRootPath 是管理台的挂载根：`GET /` 只做 302 到这里，不携带任何状态。
+// consoleRootPath is the console mount point; the root route only redirects here.
+const consoleRootPath = "/console/"
+
 // NewServer 补默认值并校验必需端口。缺端口是装配错误而非运行时故障——当场拒绝，
 // 避免进程起来后每个请求都 500。
 // NewServer fills defaults and rejects a missing port up front.
@@ -164,12 +264,22 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.StartedAt.IsZero() {
 		opts.StartedAt = opts.Now()
 	}
+	if opts.Sampler == nil {
+		opts.Sampler = NewSampler(opts.Now)
+	}
 	if opts.Runs == nil || opts.Sessions == nil || opts.Agents == nil ||
 		opts.Tools == nil || opts.Memory == nil {
 		return nil, errors.New("web: 装配缺少必需端口（Runs / Sessions / Agents / Tools / Memory）")
 	}
+	if opts.Console == nil {
+		return nil, errors.New("web: 装配缺少管理台资源（Console）")
+	}
+	console, err := NewConsoleHandler(opts.Console)
+	if err != nil {
+		return nil, err
+	}
 
-	s := &Server{opts: opts}
+	s := &Server{opts: opts, console: console}
 	s.crossOrigin = http.NewCrossOriginProtection()
 	s.crossOrigin.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 拒绝发生在读 body 之前：跨源请求零副作用（约束 21）。
@@ -282,25 +392,145 @@ func (s *Server) handler() http.Handler {
 	return s.recoverMiddleware(s.requestLogMiddleware(s.crossOriginMiddleware(mux)))
 }
 
-// routes 注册固定端点集与一条方法无关 catch-all（注 3）：未匹配的路径与方法
-// 一律落到 404 信封，不暴露 ServeMux 的纯文本 404 与自动 405。
-// routes registers the fixed endpoint set plus a method-agnostic catch-all.
+// routeVisibility 区分三类端点：公开（闭集：健康检查 / 管理台静态壳 / 根重定向）、
+// 受保护（一律认证）与兜底 404（不参与认证判定，方法无关）。
+// routeVisibility separates public, protected, and fallback endpoints.
+type routeVisibility int
+
+const (
+	routePublic routeVisibility = iota
+	routeProtected
+	routeFallback
+)
+
+// route 是路由表的一行。兜底项方法为空串（方法无关）；其余项必须显式给出方法。
+// 处理函数二选一：`handler` 是既有不消费认证主体的处理函数；`adminHandler` 是
+// US-11 起需要 actor 的处理函数——认证成功的 actor 由 `s.admin` 直接传入，**不经**
+// context（宪法 VII / 约束 9）。两者恰一非 nil，路由表仍是唯一枚举。
+// A route row; the fallback row carries an empty method. Exactly one of handler and
+// adminHandler is set: adminHandler receives the authenticated actor as a parameter.
+type route struct {
+	method       string
+	pattern      string
+	visibility   routeVisibility
+	handler      http.HandlerFunc
+	adminHandler AdminHandler
+}
+
+// routeTable 是端点集的唯一枚举：注册（routes）与认证遍历测试共用同一份表，
+// **不得**另写第二份清单（约束 8）。公开面是闭集（健康检查、管理台静态壳、根
+// 重定向），新增公开入口必须同时修订契约与本表。管理台两条静态壳路由随 console
+// 处理器（T049）一并登记：`/console` 精确路径单独成行，避免 ServeMux 对子树模式
+// 自动发 301（图 H 要求二者都直接得到 index.html）。
+// routeTable is the single enumeration shared by registration and the auth matrix;
+// the console rows are exact-path plus subtree, both serving the shell.
+func (s *Server) routeTable() []route {
+	return []route{
+		{method: http.MethodGet, pattern: "/{$}", visibility: routePublic, handler: s.handleRoot},
+		{method: http.MethodGet, pattern: "/api/v1/health", visibility: routePublic, handler: s.handleHealth},
+		{method: http.MethodGet, pattern: "/api/v1/info", visibility: routeProtected, handler: s.handleInfo},
+		{method: http.MethodGet, pattern: "/api/v1/profiles", visibility: routeProtected, handler: s.handleProfiles},
+		{method: http.MethodGet, pattern: "/api/v1/tools", visibility: routeProtected, handler: s.handleTools},
+		{method: http.MethodGet, pattern: "/api/v1/memory", visibility: routeProtected, handler: s.handleMemory},
+		{method: http.MethodPost, pattern: "/api/v1/sessions", visibility: routeProtected, handler: s.handleCreateSession},
+		{method: http.MethodGet, pattern: "/api/v1/sessions", visibility: routeProtected, adminHandler: s.handleListSessions},
+		{method: http.MethodGet, pattern: "/api/v1/sessions/{id}", visibility: routeProtected, handler: s.handleGetSession},
+		{method: http.MethodDelete, pattern: "/api/v1/sessions/{id}", visibility: routeProtected, handler: s.handleArchiveSession},
+		{method: http.MethodPost, pattern: "/api/v1/sessions/{id}/messages", visibility: routeProtected, handler: s.handlePostMessage},
+		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/invoke", visibility: routeProtected, handler: s.handleInvoke},
+		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/memory", visibility: routeProtected, adminHandler: s.handleAgentMemory},
+		{method: http.MethodGet, pattern: "/api/v1/sandbox", visibility: routeProtected, adminHandler: s.handleSandbox},
+		{method: http.MethodGet, pattern: "/api/v1/notify-channels", visibility: routeProtected, adminHandler: s.handleListNotifyChannels},
+		{method: http.MethodGet, pattern: "/api/v1/notify-channels/types", visibility: routeProtected, adminHandler: s.handleNotifyTypes},
+		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/content", visibility: routeProtected, adminHandler: s.handleGetAgentContent},
+		{method: http.MethodPut, pattern: "/api/v1/agents/{name}/content", visibility: routeProtected, adminHandler: s.handlePutAgentContent},
+		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/disable", visibility: routeProtected, adminHandler: s.handleDisableAgent},
+		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/enable", visibility: routeProtected, adminHandler: s.handleEnableAgent},
+		{method: http.MethodGet, pattern: "/api/v1/runs", visibility: routeProtected, adminHandler: s.handleListRuns},
+		{method: http.MethodGet, pattern: "/api/v1/runs/{id}", visibility: routeProtected, adminHandler: s.handleRunDetail},
+		{method: http.MethodPost, pattern: "/api/v1/runs/{id}/cancel", visibility: routeProtected, adminHandler: s.handleCancelRun},
+		{method: http.MethodGet, pattern: "/api/v1/operations", visibility: routeProtected, adminHandler: s.handleListOperations},
+		{method: http.MethodGet, pattern: "/api/v1/operations/{id}", visibility: routeProtected, adminHandler: s.handleOperationDetail},
+		{method: http.MethodGet, pattern: "/api/v1/system/overview", visibility: routeProtected, adminHandler: s.handleSystemOverview},
+		{method: http.MethodGet, pattern: "/api/v1/system/sample", visibility: routeProtected, adminHandler: s.handleSystemSample},
+		{method: http.MethodGet, pattern: "/api/v1/skills", visibility: routeProtected, adminHandler: s.handleListSkills},
+		{method: http.MethodGet, pattern: "/api/v1/skills/{name}", visibility: routeProtected, adminHandler: s.handleGetSkill},
+		{method: http.MethodGet, pattern: "/api/v1/mcp-servers", visibility: routeProtected, adminHandler: s.handleListMCPServers},
+		{method: http.MethodGet, pattern: "/api/v1/mcp-servers/{name}", visibility: routeProtected, adminHandler: s.handleGetMCPServer},
+		{method: http.MethodGet, pattern: "/api/v1/model-connections", visibility: routeProtected, adminHandler: s.handleListModelConnections},
+		{method: http.MethodGet, pattern: "/api/v1/model-connections/{name}", visibility: routeProtected, adminHandler: s.handleGetModelConnection},
+		{method: http.MethodGet, pattern: "/api/v1/schedules", visibility: routeProtected, handler: s.handleListSchedules},
+		{method: http.MethodPut, pattern: "/api/v1/schedules/{id}", visibility: routeProtected, handler: s.handleSetScheduleEnabled},
+		{method: http.MethodGet, pattern: "/api/v1/schedules/{id}/executions", visibility: routeProtected, handler: s.handleListExecutions},
+		{method: http.MethodPost, pattern: "/api/v1/schedules/{id}/run", visibility: routeProtected, handler: s.handleRunSchedule},
+		// 管理台静态壳（图 H、约束 41）：两条都是公开路由，由 consoleHandler 自行
+		// 区分真实资源与 SPA 回退——服务端不解析前端路由。
+		// The console shell is public; the handler decides asset versus SPA fallback.
+		{method: http.MethodGet, pattern: "/console", visibility: routePublic, handler: s.console.ServeHTTP},
+		{method: http.MethodGet, pattern: "/console/{path...}", visibility: routePublic, handler: s.console.ServeHTTP},
+		// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
+		// 不暴露 ServeMux 的纯文本 404 与自动 405。
+		{pattern: "/", visibility: routeFallback, handler: s.handleNotFound},
+	}
+}
+
+// routes 按路由表注册：每条非兜底项按 `方法 模式` 注册，兜底项方法无关。受保护
+// 路由在这里统一套上认证闸门——新增受保护端点只要进表就自动获得认证，不依赖
+// 逐条手工挂载（约束 8）。
+// routes registers every table entry; protected rows are wrapped with the auth guard
+// centrally, so a new protected endpoint cannot be registered without authentication.
 func (s *Server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
-	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
-	mux.HandleFunc("GET /api/v1/profiles", s.handleProfiles)
-	mux.HandleFunc("GET /api/v1/tools", s.handleTools)
-	mux.HandleFunc("GET /api/v1/memory", s.handleMemory)
-	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
-	mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)
-	mux.HandleFunc("DELETE /api/v1/sessions/{id}", s.handleArchiveSession)
-	mux.HandleFunc("POST /api/v1/sessions/{id}/messages", s.handlePostMessage)
-	mux.HandleFunc("POST /api/v1/agents/{name}/invoke", s.handleInvoke)
-	mux.HandleFunc("GET /api/v1/schedules", s.handleListSchedules)
-	mux.HandleFunc("PUT /api/v1/schedules/{id}", s.handleSetScheduleEnabled)
-	mux.HandleFunc("GET /api/v1/schedules/{id}/executions", s.handleListExecutions)
-	mux.HandleFunc("POST /api/v1/schedules/{id}/run", s.handleRunSchedule)
-	mux.HandleFunc("/", s.handleNotFound)
+	for _, rt := range s.routeTable() {
+		pattern := rt.pattern
+		if rt.method != "" {
+			pattern = rt.method + " " + rt.pattern
+		}
+		mux.Handle(pattern, s.routeHandler(rt))
+	}
+}
+
+// routeHandler 按可见性决定是否过认证闸门：受保护路由经 s.admin 包装，公开路由
+// 与兜底 404 **不经过**闸门（公开面是闭集，兜底不参与认证判定）。测试装配可以
+// 不提供 AdminAuth（新路由落地前的旧用例只关心处理函数本身）：此时需要 actor 的
+// 处理函数收到零值 actor，生产装配由 app 层保证非 nil——serve 在装配失败时拒绝启动。
+// routeHandler wraps protected rows with the auth guard; public and fallback rows
+// bypass it. Without AdminAuth (tests) an adminHandler receives the zero actor, and
+// the production assembly always supplies the guard.
+func (s *Server) routeHandler(rt route) http.Handler {
+	plain := rt.handler
+	if plain == nil && rt.adminHandler != nil {
+		admin := rt.adminHandler
+		plain = func(w http.ResponseWriter, r *http.Request) {
+			admin(w, r, core.Actor{})
+		}
+	}
+	if rt.visibility != routeProtected || s.opts.AdminAuth == nil {
+		return plain
+	}
+	if rt.adminHandler != nil {
+		return s.admin(rt.adminHandler)
+	}
+	return s.admin(func(w http.ResponseWriter, r *http.Request, _ core.Actor) {
+		plain(w, r)
+	})
+}
+
+// admin 是约束 9 的显式 actor 入口：认证成功后 actor 以参数交给处理函数，**不得**
+// 写入 context。当前既有处理函数不消费 actor，仍走同一包装并显式丢弃；生命周期 /
+// 内容写等需要 actor 的处理函数后续直接复用本包装。
+// admin is the explicit-actor entry point (constraint 9): the actor arrives as a
+// parameter, never through context; handlers that ignore it still use this wrapper.
+func (s *Server) admin(h AdminHandler) http.Handler {
+	return s.opts.AdminAuth.Wrap(h)
+}
+
+// handleRoot 是根路径重定向（图 H）：`GET /` → 302 `/console/`。根路径属于公开
+// 闭集——它只把浏览器送到管理台壳，不暴露任何状态。用 `GET /{$}` 精确匹配，
+// 未匹配的路径仍落到兜底 404，不被重定向吞掉。
+// handleRoot redirects the exact root path; unmatched paths still reach the 404
+// fallback because the route is registered as the exact pattern `GET /{$}`.
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, consoleRootPath, http.StatusFound)
 }
 
 // newHTTPServer 以 WithoutCancel + WithCancel 派生基上下文：信号取消不直接传递给

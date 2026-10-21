@@ -1,0 +1,1004 @@
+/* Basalt 管理台样式：A 地质图鉴风格（纸面、印刷、科学注记）。
+ * 设计口径见 career/design/WebsiteConsoleDesignReview.md §4：暖纸底、岩黑字、群青强调、
+ * 清晰边框、4–6px 圆角、状态同时有文字与形状。不引入任何第三方字体 / 图标 / 样式资源
+ * （约束 40），全部使用系统字体栈。
+ * Basalt console stylesheet — warm paper, ink text, ultramarine accent. No external
+ * fonts, icons or stylesheets; system stacks only (constraint 40).
+ */
+
+:root {
+  /* 纸面与墨色 */
+  --paper: #f2efe6;
+  --surface: #f8f6ef;
+  --surface-raised: #fbf9f3;
+  --ink: #181f21;
+  --muted: #5b6463;
+  --line: #d2d2c5;
+  --line-soft: #e3e1d5;
+
+  /* 品牌与语义色 */
+  --accent: #244bd8;
+  --accent-strong: #1d3db3;
+  --accent-wash: rgba(36, 75, 216, 0.07);
+  --ok: #1f6b4a;
+  --ok-wash: #e4efe7;
+  --warn: #8a5a00;
+  --warn-wash: #f4ebd8;
+  --bad: #a32222;
+  --bad-wash: #f6e3e0;
+
+  /* 字体族：中文无衬线正文，等宽用于路径 / 模型 / 配置 / 时间 */
+  --font-sans:
+    'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', -apple-system, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'SFMono-Regular', 'Cascadia Mono', Consolas, 'Liberation Mono',
+    Menlo, monospace;
+
+  /* 尺度 */
+  --radius: 6px;
+  --radius-sm: 4px;
+  --shadow-dialog: 0 18px 48px rgba(24, 31, 33, 0.28);
+  --measure: 78ch;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.6;
+  font-feature-settings: 'kern';
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(36, 75, 216, 0.18);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+kbd,
+samp,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ── 外壳与导航 ─────────────────────────────────────────── */
+
+.console-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.console-nav {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 0 28px;
+  height: 58px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+/* 柱状岩体标记：两道群青细柱 + 一道墨线，呼应玄武岩柱状节理 */
+.console-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.console-brand::before {
+  content: '';
+  width: 11px;
+  height: 18px;
+  background:
+    linear-gradient(90deg, var(--accent) 0 3px, transparent 3px 6px),
+    linear-gradient(90deg, transparent 6px, var(--ink) 6px 8px, transparent 8px),
+    linear-gradient(90deg, transparent 9px, var(--muted) 9px 11px, transparent 11px);
+  opacity: 0.9;
+}
+
+.console-nav nav {
+  display: flex;
+  align-items: stretch;
+  gap: 20px;
+  height: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.console-nav nav::-webkit-scrollbar {
+  display: none;
+}
+
+.console-nav nav a {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+
+.console-nav nav a:hover {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.console-nav nav a.active {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+
+.console-nav .link-button {
+  margin-left: auto;
+}
+
+.console-main {
+  flex: 1;
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 30px 28px 72px;
+}
+
+/* ── 视图与标题 ─────────────────────────────────────────── */
+
+.view {
+  animation: view-enter 140ms ease-out;
+}
+
+@keyframes view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.view > h1 {
+  margin: 0 0 6px;
+  font-size: 26px;
+  line-height: 1.3;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+/* 页首的小注记方块：管理台的“标本标签”式标记 */
+.view > h1::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 10px;
+  background: var(--accent);
+  vertical-align: 0.18em;
+}
+
+.view > h1 + .muted {
+  margin-top: 0;
+}
+
+.view h2 {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  margin: 0 0 12px;
+}
+
+/* 总览：宽屏双列铺开读数卡片，窄屏自动回落单列 */
+.view-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 16px;
+}
+
+.view-overview > h1,
+.view-overview > .notice,
+.view-overview > p {
+  grid-column: 1 / -1;
+}
+
+.view-overview > h1 {
+  margin-bottom: 0;
+}
+
+.view-overview > .card {
+  margin: 0;
+}
+
+.view h3 {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 22px 0 8px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.loading {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 14px 0;
+}
+
+/* 空状态做成整块留白注记，避免看起来像漏渲染的空白区域 */
+.empty {
+  margin: 16px 0 0;
+  padding: 22px 18px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* ── 卡片与定义列表 ─────────────────────────────────────── */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin: 16px 0;
+}
+
+.card > h2 {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.card > h2:first-child {
+  margin-top: -2px;
+}
+
+.definitions {
+  margin: 0;
+}
+
+dl.definitions {
+  display: grid;
+  grid-template-columns: minmax(120px, 190px) minmax(0, 1fr);
+  gap: 0 22px;
+  font-variant-numeric: tabular-nums;
+}
+
+.definitions dt {
+  color: var(--muted);
+  font-size: 12.5px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.definitions dd {
+  margin: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+  overflow-wrap: anywhere;
+}
+
+.definitions dt:last-of-type,
+.definitions dd:last-of-type {
+  border-bottom: none;
+}
+
+/* ── 表格 ──────────────────────────────────────────────── */
+
+.table-wrap {
+  overflow-x: auto;
+  margin-top: 4px;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 表格里的行内动作按钮压到与单元格文字同高 */
+.data-table button {
+  padding: 3px 10px;
+  font-size: 12.5px;
+}
+
+.data-table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table tbody tr:hover td {
+  background: var(--accent-wash);
+}
+
+.cell-stack {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.45;
+}
+
+/* ── 徽标与提示条 ──────────────────────────────────────── */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 9px 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+
+/* 状态点：颜色之外的第二种线索（约束：不只靠颜色识别状态） */
+.badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.badge-ok {
+  color: var(--ok);
+  background: var(--ok-wash);
+  border-color: #bfd8c6;
+}
+
+.badge-warn {
+  color: var(--warn);
+  background: var(--warn-wash);
+  border-color: #e3d2a8;
+}
+
+.badge-bad {
+  color: var(--bad);
+  background: var(--bad-wash);
+  border-color: #e5c3bd;
+}
+
+.badge-muted {
+  color: var(--muted);
+  background: #eceade;
+  border-color: var(--line);
+}
+
+.notice {
+  margin: 14px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--muted);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  font-size: 13.5px;
+}
+
+.notice-info {
+  border-left-color: var(--accent);
+  background: #eef1fb;
+}
+
+.notice-warn {
+  border-left-color: var(--warn);
+  background: var(--warn-wash);
+}
+
+.notice-error {
+  border-left-color: var(--bad);
+  background: var(--bad-wash);
+}
+
+/* ── 代码与等宽注记 ────────────────────────────────────── */
+
+code {
+  background: #ebe8dc;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  padding: 0.05em 0.35em;
+  overflow-wrap: anywhere;
+}
+
+.code-block {
+  margin: 10px 0;
+  padding: 14px 16px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.65;
+}
+
+.code-block code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+/* ── 表单与按钮 ────────────────────────────────────────── */
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+  color: var(--ink);
+  border-radius: 5px;
+  padding: 7px 14px;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: #f1eee2;
+  border-color: #a9a99b;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+button.danger {
+  color: var(--bad);
+  border-color: #cfa9a3;
+  background: transparent;
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--bad-wash);
+  border-color: var(--bad);
+}
+
+.link-button {
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 6px 2px;
+  font-size: 13px;
+}
+
+.link-button:hover:not(:disabled) {
+  background: none;
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+input,
+select,
+textarea {
+  color: var(--ink);
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 7px 10px;
+  font-size: 13.5px;
+}
+
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: #b6b6a8;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(36, 75, 216, 0.16);
+}
+
+textarea.editor {
+  width: 100%;
+  min-height: 420px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  padding: 12px 14px;
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 4px;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 16px;
+  margin: 18px 0 10px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.filters label input,
+.filters label select {
+  min-width: 150px;
+}
+
+/* 筛选表单的提交是这一屏的主要动作，沿用品牌强调色 */
+.filters button[type='submit'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.filters button[type='submit']:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+/* ── 页签 ──────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin: 20px 0 16px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  flex: none;
+  padding: 9px 13px;
+  color: var(--muted);
+  font-size: 13.5px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tab:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--accent-wash);
+  border-color: transparent transparent var(--line) transparent;
+  text-decoration: none;
+}
+
+.tab.active {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+
+.tab-panel {
+  animation: view-enter 120ms ease-out;
+}
+
+/* ── Agent 详情 ────────────────────────────────────────── */
+
+.agent-head {
+  display: block;
+}
+
+.breadcrumb {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+}
+
+.agent-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.agent-title h1 {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.25;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+/* Agent 名也是页标题，沿用页首的标本标记 */
+.agent-title h1::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 10px;
+  background: var(--accent);
+  vertical-align: 0.18em;
+}
+
+.agent-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.agent-meta .sep {
+  color: #b9b9aa;
+}
+
+.agent-meta code {
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.problems {
+  margin: 12px 0;
+  padding: 10px 14px 10px 30px;
+  background: var(--warn-wash);
+  border: 1px solid #e3d2a8;
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.problems li + li {
+  margin-top: 4px;
+}
+
+/* ── 会话记录 ──────────────────────────────────────────── */
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.message {
+  border-left: 2px solid var(--line);
+  padding: 2px 0 2px 14px;
+}
+
+.message-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.message-head strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.message-body {
+  margin-top: 5px;
+  max-width: var(--measure);
+}
+
+.message-body p,
+.final-text p {
+  margin: 0 0 0.7em;
+}
+
+.message-body p:last-child,
+.final-text p:last-child {
+  margin-bottom: 0;
+}
+
+.message-body pre,
+.final-text pre {
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  overflow: auto;
+}
+
+.tool-calls {
+  margin: 10px 0 0;
+  padding: 10px 14px 10px 26px;
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.tool-calls code {
+  background: none;
+  border: none;
+  color: var(--ink);
+}
+
+.final-text {
+  max-width: var(--measure);
+  line-height: 1.7;
+}
+
+/* ── 登录页 ────────────────────────────────────────────── */
+
+.view-login {
+  max-width: 460px;
+  margin: 9vh auto 0;
+  padding: 28px 30px 26px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.view-login > h1 {
+  font-size: 22px;
+}
+
+.view-login > h1::before {
+  display: none;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 20px 0 6px;
+}
+
+.login-form label {
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.login-form input {
+  width: 100%;
+}
+
+.login-form button {
+  margin-top: 10px;
+  align-self: flex-start;
+}
+
+.login-alt {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+
+.login-alt button {
+  margin-top: 4px;
+}
+
+/* ── 对话框 ────────────────────────────────────────────── */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(24, 31, 33, 0.45);
+}
+
+.dialog {
+  width: min(440px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow-dialog);
+  padding: 22px 24px 20px;
+}
+
+.dialog h2 {
+  margin: 0 0 10px;
+  font-size: 17px;
+}
+
+.dialog p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+/* ── 小节之间的留白与链接回退 ──────────────────────────── */
+
+.view > p > a,
+.view > .card > p > a {
+  font-size: 13px;
+}
+
+/* ── 窄屏：导航横滚、定义列表单列、表格横向浏览 ────────── */
+
+@media (max-width: 760px) {
+  .console-nav {
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    height: auto;
+    padding: 10px 16px;
+  }
+
+  .console-nav nav {
+    order: 3;
+    width: 100%;
+    height: 32px;
+    gap: 16px;
+  }
+
+  .console-nav .link-button {
+    margin-left: auto;
+  }
+
+  .console-main {
+    padding: 20px 16px 56px;
+  }
+
+  .view > h1 {
+    font-size: 22px;
+  }
+
+  .view-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  dl.definitions {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .definitions dt {
+    padding-bottom: 0;
+    border-bottom: none;
+    font-size: 12px;
+  }
+
+  .definitions dd {
+    padding-top: 2px;
+  }
+
+  .definitions dt:last-of-type,
+  .definitions dd:last-of-type {
+    border-bottom: none;
+  }
+
+  .filters label,
+  .filters label input,
+  .filters label select {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .view-login {
+    margin-top: 4vh;
+    padding: 22px 20px;
+  }
+}
+
+/* 尊重减少动态效果的系统设置 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

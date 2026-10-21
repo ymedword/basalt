@@ -13,6 +13,19 @@ http:
   addr: 127.0.0.1:8080        # 缺省本机；远程部署显式改，出处 docs/contracts/openapi.yaml
   max_request_bytes: 1048576  # 请求体总上限（缺省 1 MiB，解析前拒绝）
   allowed_domains: []         # 出网域名白名单（大小写不敏感）；消费归 US-5 的 http_get / http_post，键名出处 docs/Operations.md §2.2
+  # 管理面认证（键名出处 docs/contracts/run-and-errors.md §9.1）：serve 启动时必填；
+  # chat / tool / session 等不开放 HTTP 管理面的命令不要求本段。
+  admin_auth:
+    mode: token                    # token | local_trust（必填，不写缺省）
+    token: ${BASALT_ADMIN_TOKEN}   # 只接受 ${ENV_VAR}；明文 / 空值 / 未解析占位一律拒绝启动
+    allowed_hosts:                 # 缺省由 addr 派生（仅回环）；非回环监听必须显式列出
+      - 127.0.0.1:8080
+      - localhost:8080
+      - "[::1]:8080"
+    allowed_origins:               # 完整 scheme://host[:port]，与浏览器 Origin 全等比较
+      - http://127.0.0.1:8080
+      - http://localhost:8080
+    trusted_proxies: []            # CIDR；只有这些来源的转发头参与来源归属，不证明回环信任
 
 # 进程级服务参数（US-9 消费；出处 docs/TechnicalDesign.md §5.2）
 server:

@@ -151,8 +151,8 @@ func TestStatus_ReadyWithoutConfig(t *testing.T) {
 	require.Contains(t, run.stdout, "未发现配置", "节 2 必须明示未发现配置")
 	require.Contains(t, run.stdout, filepath.Join(root, "basalt.yaml"), "未发现配置必须点名路径")
 	require.Contains(t, run.stdout, "存储：就绪")
-	require.Contains(t, run.stdout, "schema v1")
-	require.Contains(t, run.stdout, "11 张表", "就绪时报版本 + 表清点（流程 D 节 3）")
+	require.Contains(t, run.stdout, "schema v2", "US-11 起目标版本为 v2（FR23）")
+	require.Contains(t, run.stdout, "18 张表", "就绪时报版本 + 表清点（流程 D 节 3；v1 11 张 + v2 7 张）")
 	require.Contains(t, run.stdout, "汇总：全部通过")
 
 	require.NotContains(t, run.logs, "level=ERROR", "全部通过时不得有 ERROR 日志；logs=%s", run.logs)

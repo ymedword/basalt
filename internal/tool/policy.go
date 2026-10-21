@@ -22,6 +22,23 @@ const (
 	memoryDirName       = "memory"
 	scriptsDirName      = "scripts"
 	agentDefinitionFile = "AGENT.md"
+	// workspaceDirName 是工作区目录名：`storage_path` 的契约字面量以它起头
+	// （`.basalt/versions/skills/<name>/<no>`），而策略根已经是这个目录本身。
+	// The workspace directory name; storage_path literals are prefixed with it while the
+	// policy root already is that directory.
+	workspaceDirName = ".basalt"
+	// versionsDirName 是技能不可变发布版本的根目录名（`.basalt/versions`，约束 31）。
+	// 运行期 L2/L3 从发布目录读：读档只放行**本次 Run 绑定的**版本目录（人工 review ② F1），
+	// 写入整树一律拒。
+	// The root of the immutable skill version directories; reads are limited to the run's
+	// bound versions and writes are refused for the whole tree.
+	versionsDirName = "versions"
+	// controlDirName 是受保护控制目录（`.basalt/control/`，生命周期状态文件的所在地）。
+	// 它**不在**任何一档放行面之内：单独列出来是为了让拒绝出自一条固定规则，而不是被
+	// "工作区之外"这条泛规则顺带挡下——模型读状态文件与读别处的失败原因必须能分开。
+	// The protected control directory; it gets its own refusal rule so that "touching the
+	// agent's own lifecycle state" is distinguishable from "touching the outside world".
+	controlDirName = "control"
 )
 
 // 拒绝文案的固定片段（四段式的段 1 规则 / 段 4 放行指引；段 2 是具体目标、段 3 由
@@ -29,24 +46,32 @@ const (
 // 措辞只在"该档确实有配置键可加"时分叉（contracts/agent-md.md §6）。
 // Frozen rule and guidance fragments of the model-visible refusal copy.
 const (
-	ruleReadOutside           = "读取目标不在可读根之内"
-	guidanceReadOutside       = "可读根固定为当前 Agent 自己的目录与 skills 库（工作区约定），没有配置键可以加。"
-	ruleCrossAgent            = "跨 Agent 读取未授权"
-	guidanceCrossAgent        = "如需授权，请联系运维把该 Agent 名加入配置键 sandbox.cross_agent_read 并重启服务。"
-	ruleAgentName             = "Agent 名不合法"
-	guidanceAgentName         = "Agent 名取自工作区目录名（单层名字，不含路径分隔符），没有配置键可以加。"
-	ruleUnresolvable          = "目标路径无法解析为真实路径"
-	guidanceUnresolvable      = "路径中存在悬空软链接 / 链接成环 / 不可进入的中间目录；请改指工作区内的普通路径。"
-	ruleUnknownAction         = "动作类型不在授权矩阵内"
-	guidanceUnknownAction     = "只有文件读 / 文件写 / 命令 / 出网四类动作可被判定；请检查工具实现传入了什么。"
-	ruleProtectedFile         = "AGENT.md 是受保护文件，写入被拒绝"
-	guidanceProtectedFile     = "Agent 定义经页面编辑器与脚手架（同一道注册写入门）修改，没有配置键可以加。"
-	ruleScriptsReadOnly       = "scripts/ 是只读区，写入被拒绝"
-	guidanceScriptsReadOnly   = "脚本受控通道的前提是模型改不动脚本（代码常量），没有配置键可以加。"
-	ruleSkillsReadOnly        = "技能库不可写入"
-	guidanceSkillsReadOnly    = "技能库由管理员在 skills/ 下维护（代码常量），没有配置键可以加。"
+	ruleReadOutside         = "读取目标不在可读根之内"
+	guidanceReadOutside     = "可读根固定为当前 Agent 自己的目录与 skills 库（工作区约定），没有配置键可以加。"
+	ruleCrossAgent          = "跨 Agent 读取未授权"
+	guidanceCrossAgent      = "如需授权，请联系运维把该 Agent 名加入配置键 sandbox.cross_agent_read 并重启服务。"
+	ruleAgentName           = "Agent 名不合法"
+	guidanceAgentName       = "Agent 名取自工作区目录名（单层名字，不含路径分隔符），没有配置键可以加。"
+	ruleUnresolvable        = "目标路径无法解析为真实路径"
+	guidanceUnresolvable    = "路径中存在悬空软链接 / 链接成环 / 不可进入的中间目录；请改指工作区内的普通路径。"
+	ruleUnknownAction       = "动作类型不在授权矩阵内"
+	guidanceUnknownAction   = "只有文件读 / 文件写 / 命令 / 出网四类动作可被判定；请检查工具实现传入了什么。"
+	ruleProtectedFile       = "AGENT.md 是受保护文件，写入被拒绝"
+	guidanceProtectedFile   = "Agent 定义经页面编辑器与脚手架（同一道注册写入门）修改，没有配置键可以加。"
+	ruleScriptsReadOnly     = "scripts/ 是只读区，写入被拒绝"
+	guidanceScriptsReadOnly = "脚本受控通道的前提是模型改不动脚本（代码常量），没有配置键可以加。"
+	ruleSkillsReadOnly      = "技能库不可写入"
+	guidanceSkillsReadOnly  = "技能库由管理员在 skills/ 下维护（代码常量），没有配置键可以加。"
+	// 运行中的技能工作副本档（F-04 B1）：Run 只读准入时固定的发布版本，工作副本的修改
+	// 要等显式发布后才属于新运行。**不得**因为本次 Run 没绑定技能就退回工作副本。
+	ruleRunSkillWorkCopy      = "技能工作副本在运行中不可读"
+	guidanceRunSkillWorkCopy  = "Run 内只读准入时固定的技能发布版本（发布目录路径已在技能卡片中给出）；工作副本的后续修改要经显式发布才进入新运行，没有配置键可以加。"
 	ruleMemoryNotWritable     = "记忆目录不在可写范围"
 	guidanceMemoryNotWritable = "记忆的写入归记忆工具，文件工具不改写 memory/（代码常量），没有配置键可以加。"
+	// 控制目录档（约束 30）：读与写**同一句话**——它对文件工具整目录不存在"只读"形态，
+	// 差异化的读 / 写说法只会让模型以为换个工具就能打开。
+	ruleControlDir            = "受保护控制目录不在文件工具的可访问范围"
+	guidanceControlDir        = "生命周期与基线状态由管理面维护（代码常量），没有配置键可以加。"
 	ruleWriteOutside          = "写入目标超出当前 Agent 的可写范围"
 	guidanceWriteOutside      = "写范围固定为当前 Agent 自己的目录（代码常量），没有配置键可以加。"
 	ruleParentMissing         = "目标父目录不存在"
@@ -153,7 +178,7 @@ const (
 // checkFile 落 §2.3 流程 F 的文件两档：先投影真实路径（投影不出来即拒），再按档判。
 // checkFile follows flow F: project first (refusing on failure), then judge per kind.
 func (p *WhitelistPolicy) checkFile(action core.Action, access fileAccess) error {
-	if action.Agent != "" && !validAgentName(action.Agent) {
+	if action.Agent != "" && !validSingleName(action.Agent) {
 		return deny(ruleAgentName, action.Agent, guidanceAgentName)
 	}
 	real, err := resolveRealPath(p.root, action.Target)
@@ -171,10 +196,33 @@ func (p *WhitelistPolicy) checkFile(action core.Action, access fileAccess) error
 // checkFileRead allows the agent's own directory, the skills library, and explicitly
 // authorized cross-agent reads.
 func (p *WhitelistPolicy) checkFileRead(action core.Action, real, ownDir string) error {
+	// 控制目录**先于**全部放行分支：它在读档本来就不在任何可读根之内，但拒绝必须出自
+	// 控制目录这条固定规则（约束 30），不能落成"工作区之外"——否则模型分不清"这是禁区"
+	// 与"你指错地方了"。比较发生在真实路径投影之后，软连接绕回控制目录同样命中。
+	// The control directory is judged first, on the projected real path, so a symlink
+	// that lands back inside it is refused by this rule rather than the generic one.
+	if withinDir(real, p.controlDir()) {
+		return deny(ruleControlDir, action.Target, guidanceControlDir)
+	}
 	if ownDir != "" && withinDir(real, ownDir) {
 		return nil
 	}
 	if withinDir(real, p.skillsDir()) {
+		// Run 没有工作副本这个读面（F-04 B1）：即使本次 Run 一个技能都没绑定，也**不得**
+		// 退回工作副本——那会读到未被本次运行固定的内容。非 Run 调用保留既有规则。
+		// Inside a run the work copy is never readable, even with no skill bound; the
+		// published version directories remain readable through the binding below.
+		if action.RunBound {
+			return deny(ruleRunSkillWorkCopy, action.Target, guidanceRunSkillWorkCopy)
+		}
+		return nil
+	}
+	// 发布版本目录只放行**本次 Run 绑定的**那些（人工 review ② F1 / 模块卡行 610）：
+	// Run 的 L1 卡片逐字给出发布真路径，L2/L3 也要从这里读，但没绑定的版本不属于本次
+	// 运行——放行整棵 `.basalt/versions/` 会越过"当前 Run 绑定版本"这条边界。
+	// Only the versions bound to this run are readable; the rest of the tree stays out of
+	// the readable roots, so a run can never read a version it was not admitted against.
+	if p.withinBoundSkillDir(real, action.SkillDirs) {
 		return nil
 	}
 	if other, isCrossAgent := p.crossAgentTarget(real); isCrossAgent {
@@ -192,12 +240,25 @@ func (p *WhitelistPolicy) checkFileRead(action core.Action, real, ownDir string)
 // Protection rules precede the general write allow; reversing the order would let the
 // "inside own directory" clause swallow the protected paths.
 func (p *WhitelistPolicy) checkFileWrite(action core.Action, real, ownDir string) error {
+	// 控制目录**先于**全部保护规则：它多数时候落在"自有目录之外"，但一个叫 AGENT.md 的
+	// 控制文件不该被报成保护文件——同一条禁区在读写两档必须是同一句规则（约束 30）。
+	// The control-directory rule runs before every other write protection so the same
+	// forbidden zone always reports the same reason on both access kinds.
+	if withinDir(real, p.controlDir()) {
+		return deny(ruleControlDir, action.Target, guidanceControlDir)
+	}
 	switch {
 	case foldCase(filepath.Base(real)) == foldCase(agentDefinitionFile):
 		return deny(ruleProtectedFile, action.Target, guidanceProtectedFile)
 	case ownDir != "" && withinDir(real, filepath.Join(ownDir, scriptsDirName)):
 		return deny(ruleScriptsReadOnly, action.Target, guidanceScriptsReadOnly)
 	case withinDir(real, p.skillsDir()):
+		return deny(ruleSkillsReadOnly, action.Target, guidanceSkillsReadOnly)
+	// 发布版本目录与工作副本同档：技能内容只能经发布动作改写（约束 31）。控制目录
+	// 规则在本 switch 之前，已先于该分支命中。
+	// The published tree is as read-only as the work copy; skill content only changes
+	// through an explicit publish.
+	case withinDir(real, p.skillVersionsDir()):
 		return deny(ruleSkillsReadOnly, action.Target, guidanceSkillsReadOnly)
 	case withinDir(real, filepath.Join(p.root, memoryDirName)):
 		return deny(ruleMemoryNotWritable, action.Target, guidanceMemoryNotWritable)
@@ -315,7 +376,7 @@ func (p *WhitelistPolicy) domainAllowed(host string) bool {
 // 调用方据此跳过"自有目录"分支（无上下文就没有自有目录，不是报错）。
 // agentDir locates the agent's own directory; an empty or invalid name yields "".
 func (p *WhitelistPolicy) agentDir(name string) string {
-	if !validAgentName(name) {
+	if !validSingleName(name) {
 		return ""
 	}
 	return filepath.Join(p.root, agentsDirName, name)
@@ -325,6 +386,72 @@ func (p *WhitelistPolicy) agentDir(name string) string {
 // skillsDir is the read-only skills library root.
 func (p *WhitelistPolicy) skillsDir() string {
 	return filepath.Join(p.root, skillsDirName)
+}
+
+// controlDir 是受保护控制目录（`.basalt/control`）——读写一律拒（约束 30）。
+// controlDir is the protected control directory, refused for both reads and writes.
+func (p *WhitelistPolicy) controlDir() string {
+	return filepath.Join(p.root, controlDirName)
+}
+
+// skillVersionsDir 是技能不可变发布版本的根（`.basalt/versions/skills`）——写入整树拒
+// （约束 31）；读取只放行本次 Run 绑定的版本子目录（见 boundSkillDir），根目录本身
+// 不是可读根。
+// skillVersionsDir is the write-protected root of the immutable skill version tree; reads
+// are limited to the run-bound version directories.
+func (p *WhitelistPolicy) skillVersionsDir() string {
+	return filepath.Join(p.root, versionsDirName, skillsDirName)
+}
+
+// withinBoundSkillDir 判定 real 是否落在本次 Run 绑定的某个技能发布版本目录内（人工
+// review ② F1）。绑定值来自 `ResolvedResources.SkillDirs` 的 `storage_path` 字面量；
+// 逐条按契约形态校验并投影成真实路径后比较——两边都在真实路径上，软连接绕回未绑定
+// 版本同样落空。不合形态的条目**只丢弃它自己**：失败关闭，不会退回"整树放行"。
+// withinBoundSkillDir reports whether real sits inside one of the run-bound version
+// directories; malformed entries are dropped individually, never widened to the tree.
+func (p *WhitelistPolicy) withinBoundSkillDir(real string, dirs []string) bool {
+	for _, dir := range dirs {
+		bound, ok := p.boundSkillDir(dir)
+		if !ok {
+			continue
+		}
+		if withinDir(real, bound) {
+			return true
+		}
+	}
+	return false
+}
+
+// boundSkillDir 把一处 `storage_path` 字面量投影为策略根下的真实目录；形态不在契约内
+// （缺 `.basalt/` 前缀 / 层级不是 `versions/skills/<name>/<no>` / 名字或版本号非法 /
+// 投影失败）一律 false——绑定面不接受"差不多"的路径。
+// boundSkillDir projects one storage_path literal onto a real directory; anything that is
+// not exactly the contract shape is refused.
+func (p *WhitelistPolicy) boundSkillDir(dir string) (string, bool) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(dir)))
+	if clean == "." || filepath.IsAbs(clean) {
+		return "", false
+	}
+	head, rest, found := strings.Cut(clean, string(filepath.Separator))
+	if !found || foldCase(head) != foldCase(workspaceDirName) {
+		return "", false
+	}
+	parts := strings.Split(rest, string(filepath.Separator))
+	if len(parts) != 4 || parts[0] != versionsDirName || parts[1] != skillsDirName {
+		return "", false
+	}
+	if !validSingleName(parts[2]) {
+		return "", false
+	}
+	version, err := strconv.Atoi(parts[3])
+	if err != nil || version < 1 || strconv.Itoa(version) != parts[3] {
+		return "", false
+	}
+	real, err := resolveRealPath(p.root, rest)
+	if err != nil {
+		return "", false
+	}
+	return real, true
 }
 
 // crossAgentTarget 判定 real 是否落在**别的** Agent 目录内并取回那个 Agent 名
@@ -346,10 +473,11 @@ func (p *WhitelistPolicy) crossAgentTarget(real string) (string, bool) {
 	return first, true
 }
 
-// validAgentName 只接受**单层名字**：Agent 名来自工作区目录名，含路径分隔符的形态
-// 会让"自有目录"指向工作区外的任意位置（自造的越界入口）。
-// Only a single path element is a legal agent name.
-func validAgentName(name string) bool {
+// validSingleName 只接受**单层目录名**（Agent 名与技能名同规则）：名字来自工作区目录名，
+// 含路径分隔符的形态会让"自有目录"或"绑定版本目录"指向工作区外的任意位置（自造的越界
+// 入口）。
+// Only a single path element is a legal agent or skill name.
+func validSingleName(name string) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
 	}

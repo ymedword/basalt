@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Basalt REST API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalDesign.md)§6.2 冲突时以技术方案为准。
 
@@ -11,24 +11,34 @@ info:
 
     - **统一前缀** `/api/v1`（`servers[0].url` 已含前缀，`paths` 内的路径**不含**前缀）；**统一信封** `{code, message, data, timestamp}`，成功 `code=OK`
     - **默认监听** `127.0.0.1:8080`——远程访问必须显式改配置（安全默认）
-    - **核心阶段无认证**（内网假设）；RBAC / 限流属扩展阶段
+    - **管理面最小认证**：`http.admin_auth.mode` 必填（`token` / `local_trust`）；非回环部署必须 `token`。`/health` 与静态页面壳可公开，其余管理数据读面与所有可触发执行 / 修改的端点均需认证。完整语义见 `contracts/run-and-errors.md` §9
+    - **管理台静态壳**：`GET /console/`（含深链接回退）由 `go:embed` 提供，不属于 `/api/v1` REST 契约；页面中的 admin token 只保存在内存
+    - **条件写**：`PUT` / `DELETE` / `publish` 对 Agent 内容与公共资源要求 `If-Match: "sha256:<64 位小写十六进制>"`；多文件提交（`POST /agents/{name}/files`）要求受管文件集合 ETag；缺失、格式非法、弱 ETag、`*` 或不匹配 → 412 `PRECONDITION_FAILED`，且不落盘、不写管理操作行
     - **JSON 字段命名** snake_case
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径
+    - **数据库目标版本**：`schema_version=2`（US-11 / US-12 追加资源版本、Run 资源引用、管理操作审计与生命周期索引）
+    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 新增路径同样以本文件为准
 servers:
   - url: http://127.0.0.1:8080/api/v1
-    description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr
+    description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr 并配置 admin token
+security:
+  - bearerAuth: []
+  - localTrust: []
 tags:
   - name: core
     description: 核心端点（技术方案§6.2.3，10 个）
   - name: runs
     description: 运行查询与取消（Run 为执行与审计的单位）
   - name: console
-    description: 管理台只读观测
+    description: 管理台只读观测与系统采样
   - name: agents
-    description: Agent 动态管理（创建 / 编辑 / 生成草稿 / 提交文件 / 归档删除）
+    description: Agent 动态管理（创建 / 编辑 / 生命周期 / 复制 / 归档恢复）
+  - name: resources
+    description: 模型连接 / MCP / 技能的版本、发布与引用
+  - name: operations
+    description: 管理操作审计查询
   - name: schedules
     description: 定时任务管理
   - name: notify
@@ -44,6 +54,8 @@ paths:
     get:
       tags: [core]
       summary: 健康检查
+      security: []
+      description: 唯一默认公开的 REST 端点；不返回配置、凭证或内部路径。
       responses:
         '200':
           description: 服务健康（200 即健康）
@@ -75,6 +87,46 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/InfoView' }
+
+  /system/overview:
+    get:
+      tags: [console]
+      summary: 系统概览
+      description: 管理台首页读数；不含凭证与绝对路径。数据库就绪用轻量 ping，不做完整性检查。
+      responses:
+        '200':
+          description: 系统概览
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SystemOverview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /system/sample:
+    get:
+      tags: [console]
+      summary: 节点采样
+      description: |
+        返回最近一次采样（服务端最多每 5 秒更新一次）。平台不支持的字段返回 `null` 并列入
+        `unavailable`；**不得**伪造 0 或猜测读数。`cpu_percent` 是进程 CPU 利用率，不是宿主整机利用率。
+      responses:
+        '200':
+          description: 最近一次采样
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SystemSample' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /profiles:
     get:
@@ -359,7 +411,7 @@ paths:
       summary: 查一次运行
       responses:
         '200':
-          description: 运行详情
+          description: 运行详情（含资源清单；历史 Run 标 legacy_unrecorded）
           content:
             application/json:
               schema:
@@ -367,8 +419,10 @@ paths:
                   - $ref: '#/components/schemas/Envelope'
                   - type: object
                     properties:
-                      data: { $ref: '#/components/schemas/RunView' }
+                      data: { $ref: '#/components/schemas/RunDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /runs/{run_id}/cancel:
     parameters:
@@ -400,11 +454,11 @@ paths:
   # ==========================================================
   /skills:
     get:
-      tags: [console]
-      summary: 列技能库
+      tags: [resources]
+      summary: 列技能库与发布状态
       responses:
         '200':
-          description: 公共技能库条目（name / description / 路径）
+          description: 技能条目（含当前发布版本；不返回文件正文）
           content:
             application/json:
               schema:
@@ -415,12 +469,168 @@ paths:
                       data:
                         type: array
                         items: { $ref: '#/components/schemas/SkillView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [resources]
+      summary: 创建技能骨架
+      description: 写最小 SKILL.md（name + 一句话 description），经发布闸门生成 version 1；同名存在 → 409 `CONFLICT`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillCreate' }
+      responses:
+        '200':
+          description: 创建结果（当前发布版本）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SkillView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /skills/import:
+    post:
+      tags: [resources]
+      summary: 导入技能
+      description: |
+        只接受相对路径、普通文件；拒绝绝对路径、`..` 越界、软连接 / 目录联接、隐藏目录。
+        单文件 ≤ 256 KiB、总量 ≤ 2 MiB、文件数 ≤ 200；导入不执行脚本，不做外部下载。
+        同名技能存在 → 409，不静默覆盖。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillImport' }
+      responses:
+        '200':
+          description: 导入后的当前发布版本
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SkillView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /skills/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: 查技能详情
+      description: 返回当前发布版本与完整文件清单；不返回已撤销版本。
+      responses:
+        '200':
+          description: 技能详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SkillDetail' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [resources]
+      summary: 全量替换技能文件
+      description: 必须先校验再落盘；`If-Match` 必须等于当前 ETag。成功后生成新发布版本，新 Run 冻结新版本。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillUpdate' }
+      responses:
+        '200':
+          description: 新发布版本
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SkillDetail' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+    delete:
+      tags: [resources]
+      summary: 删除技能
+      description: 被任一 Agent `skills:` 引用或活动 Run 引用时 → 400 点名引用者；不提供 force。历史版本与 Run 引用保留。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /skills/{name}/validate:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 校验技能草稿（不落盘）
+      description: 只做导入边界与 SKILL.md 校验，不写管理操作审计、不执行脚本。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillUpdate' }
+      responses:
+        '200':
+          description: 校验结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SkillValidateResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /mcp-servers:
     get:
-      tags: [console]
-      summary: 列 MCP server 与连接状态
-      description: 响应**不含** server 的 env 值与命令参数中的凭证（只回名称 / 传输方式 / 连接状态 / 工具数）。
+      tags: [resources]
+      summary: 列 MCP server 与连接 / 发布状态
+      description: 响应**不含** env 值（只回变量名）、命令参数中的凭证或解析后的地址。
       responses:
         '200':
           description: MCP server 列表
@@ -434,6 +644,305 @@ paths:
                       data:
                         type: array
                         items: { $ref: '#/components/schemas/McpServerView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [resources]
+      summary: 登记 MCP server
+      description: '`command` / `args` / `env` 是高权限配置；env 值只能是 `${ENV_VAR}`。写入经发布闸门，首版重启生效。'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McpServerUpsert' }
+      responses:
+        '200':
+          description: 登记结果（published 新版本；applied 可能仍是旧版本）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /mcp-servers/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: 查 MCP server
+      responses:
+        '200':
+          description: MCP server 详情（env 只回变量名）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerDetail' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [resources]
+      summary: 修改 MCP server
+      description: 写入新发布版本；首版仍重启生效。`If-Match` 必须等于当前 ETag。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McpServerUpsert' }
+      responses:
+        '200':
+          description: 修改结果（待重启时 pending_restart=true）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerView' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+    delete:
+      tags: [resources]
+      summary: 删除 MCP server
+      description: 被 Agent `mcp_servers:` 或活动 Run 引用时 → 400 点名；不提供 force。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /mcp-servers/{name}/test:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 测试 MCP server
+      description: |
+        显式、有超时的连接与工具发现测试；不改变发布指针。写 `management_operations` 的 pending
+        记录后再启动测试进程（预写失败不得启动）；结果与工具清单写脱敏 detail_json。
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerTestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '504': { $ref: '#/components/responses/Timeout' }
+
+  # ==========================================================
+  # 公共资源版本、发布与引用
+  # ==========================================================
+  /resources/{kind}/{id}/references:
+    parameters:
+      - $ref: '#/components/parameters/ResourceKind'
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [resources]
+      summary: 查资源引用
+      description: 返回引用该资源的 Agent 与活动 Run；删除闸门据此拒绝并点名。
+      responses:
+        '200':
+          description: 引用清单
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ResourceReferencesView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /resources/{kind}/{id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/ResourceKind'
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [resources]
+      summary: 列资源历史版本
+      description: 已发布迁移只追加；版本内容不可改写。撤回 = 以旧版本内容创建新版本，不改历史。
+      responses:
+        '200':
+          description: 版本列表（按 version_no 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ResourceVersionView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /resources/{kind}/{id}/publish:
+    parameters:
+      - $ref: '#/components/parameters/ResourceKind'
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [resources]
+      summary: 发布资源版本
+      description: |
+        不带 `version_id` 时发布当前最新版本（幂等）。带旧 `version_id` 时按该版本内容**创建新版本**
+        再发布，返回新版本；不修改历史版本。Provider / 技能立即生效，MCP 首版重启后生效并回 `pending_restart=true`。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishRequest' }
+      responses:
+        '200':
+          description: 发布后的版本与生效状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ResourcePublishResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /resource-versions/{version_id}:
+    parameters:
+      - name: version_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: 查单个资源版本
+      description: 返回脱敏后的定义；凭证只能是 `${ENV_VAR}` 引用。
+      responses:
+        '200':
+          description: 版本详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ResourceVersionDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # 管理操作审计
+  # ==========================================================
+  /operations:
+    get:
+      tags: [operations]
+      summary: 列管理操作
+      parameters:
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: target_kind
+          in: query
+          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, system] }
+        - name: target_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, success, failed, unknown] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: 管理操作列表（固定按 created_at 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/OperationView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /operations/{operation_id}:
+    parameters:
+      - name: operation_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [operations]
+      summary: 查管理操作详情
+      description: 返回脱敏 detail_json；`unknown` 表示崩溃窗口内结果未查证，需按独立操作契约恢复或补偿，**不得**盲目重做。
+      responses:
+        '200':
+          description: 操作详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/OperationDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /sandbox:
     get:
@@ -451,6 +960,156 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/SandboxView' }
+
+  # ==========================================================
+  # 模型连接（Provider 发布）
+  # ==========================================================
+  /model-connections:
+    get:
+      tags: [resources]
+      summary: 列模型连接与发布 / 生效版本
+      description: 响应**不含** api_key 值；只回 `${ENV_VAR}` 引用名。
+      responses:
+        '200':
+          description: 模型连接列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ModelConnectionView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [resources]
+      summary: 新建模型连接
+      description: |
+        `api_key` 只接受 `${ENV_VAR}` 引用；成功后构建不可变 ProviderCatalog、原子替换发布指针。
+        新 Run 在准入时固定该映射；失败保旧。同名存在 → 409。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelConnectionUpsert' }
+      responses:
+        '200':
+          description: 新建结果（published 与 applied 同一版本）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ModelConnectionView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /model-connections/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: 查模型连接
+      responses:
+        '200':
+          description: 模型连接详情（只回 env 引用名）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ModelConnectionView' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [resources]
+      summary: 修改模型连接
+      description: |
+        `If-Match` 必须等于当前 ETag。`api_key` 留空 = 保留原引用；成功后立即发布，新 Run 使用新映射，
+        已在途 Run 继续使用准入时固定的旧映射。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelConnectionUpsert' }
+      responses:
+        '200':
+          description: 修改结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ModelConnectionView' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+    delete:
+      tags: [resources]
+      summary: 删除模型连接
+      description: 被任一 Agent `provider:` 或活动 Run 引用时 → 400 点名引用者；不提供 force。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /model-connections/{name}/test:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 测试模型连接
+      description: |
+        用发布版本发一次最小协议调用（有超时）。**不创建 Run、不写 `llm_calls`**；写
+        `management_operations` 的 pending 记录后再发调用（预写失败不得发调用），结果脱敏落 detail_json。
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ModelConnectionTestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '504': { $ref: '#/components/responses/Timeout' }
 
   # ==========================================================
   # Agent 动态管理
@@ -493,9 +1152,10 @@ paths:
     get:
       tags: [agents]
       summary: 读整份 AGENT.md（配置编辑器）
+      description: 响应头 `ETag` 与 data.etag 同为强 ETag：`"sha256:<64 位小写十六进制>"`，按原始 UTF-8 字节计算。
       responses:
         '200':
-          description: 文件全文
+          description: 文件全文与 ETag
           content:
             application/json:
               schema:
@@ -503,24 +1163,27 @@ paths:
                   - $ref: '#/components/schemas/Envelope'
                   - type: object
                     properties:
-                      data:
-                        type: object
-                        properties:
-                          content: { type: string }
+                      data: { $ref: '#/components/schemas/AgentContent' }
+          headers:
+            ETag:
+              schema: { type: string }
         '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
     put:
       tags: [agents]
-      summary: 写整份 AGENT.md（配置编辑器）
-      description: 经**同一段**注册写入门（先验后写）：校验不通过 → 400 且**磁盘逐字节不变**。
+      summary: 写 AGENT.md（整份或结构化补丁）
+      description: |
+        经**同一段**注册写入门（先验后写）：校验不通过 → 400 且**磁盘逐字节不变**。
+        `If-Match` 必须等于当前 ETag；缺失、格式非法、弱 ETag、`*` 或与当前值不匹配 → 412。
+        结构化补丁无法保持注释时 → 400 `EDIT_UNSUPPORTED`，不落盘。成功后生成新的 ConfigSnapshot 与 ETag。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [content]
-              properties:
-                content: { type: string }
+            schema: { $ref: '#/components/schemas/AgentContentUpdate' }
       responses:
         '200':
           description: 保存结果（保存即生效，无需重启）
@@ -532,8 +1195,14 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/AgentFilesView' }
+          headers:
+            ETag:
+              schema: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
 
   /agents/{name}/generate-files:
     parameters:
@@ -546,7 +1215,9 @@ paths:
       summary: 一句话生成 Agent 目录草稿
       description: |
         模型起草一份或多份文件（必含 `AGENT.md`）。**不落盘、不注册、不要求该 Agent 已存在**——
-        唯一写入是 LLM 调用审计（关联标识 `agent-author-<name>`）。
+        唯一写入是 LLM 调用审计（关联标识 `agent-author-<name>`），**不产生**管理操作行。
+        草稿边界：路径规则同多文件提交（相对路径、规范化后仍在目录内、拒绝 `..` / 绝对路径 / 盘符 / NUL）；
+        内容必须为 UTF-8 文本；文件数 ≤ 64；单文件 ≤ 256 KiB；总量 ≤ 1 MiB（且不超过 `http.max_request_bytes`）。
       requestBody:
         required: true
         content:
@@ -558,7 +1229,7 @@ paths:
                 description: { type: string, description: 一句描述（可带 provider / model 提示） }
       responses:
         '200':
-          description: 草稿文件集合（未落盘）
+          description: 草稿文件集合（未落盘，含可编辑正文）
           content:
             application/json:
               schema:
@@ -566,7 +1237,7 @@ paths:
                   - $ref: '#/components/schemas/Envelope'
                   - type: object
                     properties:
-                      data: { $ref: '#/components/schemas/AgentFilesView' }
+                      data: { $ref: '#/components/schemas/AgentDraftView' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '503': { $ref: '#/components/responses/NotConfigured' }
 
@@ -576,14 +1247,42 @@ paths:
         in: path
         required: true
         schema: { type: string }
+    get:
+      tags: [agents]
+      summary: 读 Agent 受管文件集合（多文件编辑的基础版本）
+      description: |
+        返回 Agent 目录内的受管文件清单与强 ETag。受管文件 = Agent 目录下的普通文件（不含 `.staging` / `.backup`
+        残留、不跟随软连接）。ETag = 对按 path 升序排列的 `(path, sha256(内容))` 规整序列化后的 sha256，
+        形如 `"sha256:<64 位小写十六进制>"`；与 `GET /agents/{name}/content` 的单文件 ETag **不可互换**。
+      responses:
+        '200':
+          description: 文件清单与基础版本 ETag
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [agents]
       summary: 提交多文件草稿
       description: |
         先校验（含 AGENT.md / 相对路径规范化后仍在目录内 / 整份配置过加载期校验 / 定时 id 不撞车）→ 才动磁盘。
+        `If-Match` 必须等于 `GET /agents/{name}/files` 返回的受管文件集合 ETag；缺失、格式非法、弱 ETag、`*`
+        或不匹配 → 412，**不落盘、不写管理操作行**。比较与 staging 构建在同一 Agent 写锁内完成（锁内重新读取基础版本）。
         写入在 **staging 目录**构建完整副本（原目录不动），校验通过后经**两次 rename** 完成目录交换（原目录先移为 `.backup`，staging 移为正式目录，再删 `.backup`）——
         崩溃窗口有界：启动时按残留判定**回滚**（正式目录缺失、`.backup` 在）或**前滚**（正式目录完整、`.backup` 尚在，清理残留），见 contracts/run-and-errors.md §4.3.2 第 5 步。
         返回的**是落盘后的真值**（重新读取，不是请求回声）。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
@@ -607,6 +1306,10 @@ paths:
                     properties:
                       data: { $ref: '#/components/schemas/AgentFilesView' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
 
   /agents/{name}:
     parameters:
@@ -618,12 +1321,179 @@ paths:
       tags: [agents]
       summary: 归档删除 Agent
       description: |
-        顺序：注销定时 → 移出注册索引 → **取消该 Agent 在跑的 Run 并等待退出（有界等待；超时报错并恢复注册，不留半残态）** → 目录移入 `.basalt/archive/`（同名以时间戳唯一化）。
-        归档失败恢复注册并报错。**会话 / 记忆 / 审计数据一律不动**（配置下线 ≠ 数据下线）。
+        顺序：注销定时 → 标记 archived → 移出注册索引 → **取消该 Agent 在跑的 Run 并等待退出（默认 30 秒）**
+        → 目录移入 `.basalt/archive/`（同名以时间戳唯一化）。等待超时 → 409 `AGENT_BUSY` 并点名活动 Run，
+        恢复注册与状态，不留半残态。归档失败同样恢复。**会话 / 记忆 / 审计数据一律不动**。
         该 Agent 的定时登记**不物理删**（置下线标记），历史执行记录保留、数据库外键永不撞。
       responses:
-        '200': { $ref: '#/components/responses/OK' }
+        '200':
+          description: 归档结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentArchiveView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /agents/{name}/disable:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 停用 Agent
+      description: |
+        与 Run 准入共用 Agent 级一致性边界：校验 expected_state / expected_generation，原子写状态文件
+        （generation+1）后更新索引。停用**不取消**在途 Run，只拒绝新准入；disabled 仍可见。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentLifecycleTransition' }
+      responses:
+        '200':
+          description: 新生命周期状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentLifecycleView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /agents/{name}/enable:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 启用 Agent
+      description: |
+        同一准入边界：expected_state 必须为 disabled，原子写状态文件（generation+1）后更新索引。
+        启用后仍要求加载期校验与全部资源引用通过，否则拒绝新准入并保留可见错误。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentLifecycleTransition' }
+      responses:
+        '200':
+          description: 新生命周期状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentLifecycleView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /agents/{name}/copy:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 复制 Agent
+      description: |
+        复制目录内容到新 Agent 名；新 Agent 默认 `disabled`，并清空 `schedules`（避免全局 cron id 撞车）。
+        新名已存在 → 409；复制失败不留残余目录。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentCopyRequest' }
+      responses:
+        '200':
+          description: 新 Agent 文件清单与生命周期
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /archived-agents:
+    get:
+      tags: [agents]
+      summary: 列已归档 Agent
+      responses:
+        '200':
+          description: 归档列表（按 archived_at 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ArchivedAgentView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /archived-agents/{archive_id}/restore:
+    parameters:
+      - name: archive_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 恢复已归档 Agent
+      description: 恢复到原目录（或指定新名）；恢复后默认 `disabled`，清空 `schedules`；目标名已存在 → 409。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentRestoreRequest' }
+      responses:
+        '200':
+          description: 恢复结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentFilesView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   # ==========================================================
   # 定时任务
@@ -884,6 +1754,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <admin token>`。token 只从配置的 `${ENV_VAR}` 解析，不入库、不回显。
+        仅 `http.admin_auth.mode=token` 时可用；缺失或无效 → 401 `UNAUTHORIZED`。
+    localTrust:
+      type: apiKey
+      in: header
+      name: X-Basalt-Local-Trust
+      description: |
+        仅 `http.admin_auth.mode=local_trust` 且直连来源为回环地址时可用，值必须为 `1`。
+        `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 不能证明回环；反向代理或隧道不得绕过认证。
+        同时校验 Host 与 Origin（或 Sec-Fetch-Site），防 DNS rebinding / CSRF。
+  parameters:
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string, pattern: '^"sha256:[0-9a-f]{64}"$' }
+      description: 强 ETag；缺失、格式非法、弱 ETag、`*` 或与当前值不匹配 → 412。
+    ResourceKind:
+      name: kind
+      in: path
+      required: true
+      schema: { type: string, enum: [model_connection, mcp_server, skill] }
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, description: 资源名（模型连接 / MCP / 技能均按名标识） }
+
   responses:
     OK:
       description: 操作成功
@@ -917,6 +1820,31 @@ components:
           schema: { $ref: '#/components/schemas/Envelope' }
     NotConfigured:
       description: 能力未配置（文案点名配置键，一次 LLM 调用都不会发出）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Unauthorized:
+      description: 未认证（管理凭据缺失或无效，含 local_trust 模式未带本机信任头；业务码 `UNAUTHORIZED`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Forbidden:
+      description: 已认证但操作不允许（业务码 `FORBIDDEN`；回环本机信任不满足来源 / Host / Origin 校验）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Conflict:
+      description: 状态冲突（同名存在 / 生命周期 generation 或 expected_state 不匹配 / Agent 忙碌，业务码 `CONFLICT`、`AGENT_BUSY` 等）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    PreconditionFailed:
+      description: 条件写前置条件不满足（ETag 不匹配，业务码 `PRECONDITION_FAILED`）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    AuthRateLimited:
+      description: 认证失败次数超限（业务码 `AUTH_RATE_LIMITED`）
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -958,7 +1886,9 @@ components:
         tools: { type: array, items: { type: string } }
         skills: { type: array, items: { type: string } }
         schedules: { type: integer }
-        registered: { type: boolean, description: 加载期校验是否通过 }
+        lifecycle: { $ref: '#/components/schemas/AgentLifecycleView' }
+        registered: { type: boolean, description: 加载期校验是否通过（与生命周期独立） }
+        runnable: { type: boolean, description: 已注册且状态为 active 且资源引用全部可解析 }
         problems: { type: array, items: { type: string }, description: 未通过时的点名原因 }
 
     ToolView:
@@ -1029,24 +1959,38 @@ components:
         final_text: { type: string }
         iterations: { type: integer }
         tool_calls: { type: integer }
-        config_hash: { type: string }
+        config_hash: { type: string, description: 合成输入哈希（含义不变） }
+        manifest_hash: { type: string, description: 新增资源清单哈希；历史 Run 为空，查看时标 legacy_unrecorded }
         started_at: { type: string, format: date-time }
-        finished_at: { type: string, format: date-time }
+        finished_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "未结束（running 等非终态）时为空串；结束时为 RFC3339 date-time" }
 
     SkillView:
       type: object
       properties:
         name: { type: string }
         description: { type: string }
-        path: { type: string }
+        path: { type: string, description: 工作副本相对路径 }
+        version_id: { type: integer }
+        version_no: { type: integer }
+        content_hash: { type: string }
+        etag: { type: string, description: '强 ETag：sha256:<64 位小写十六进制>' }
+        file_count: { type: integer }
+        referenced_by: { type: array, items: { type: string } }
 
     McpServerView:
       type: object
       properties:
         name: { type: string }
         transport: { type: string, enum: [stdio, http] }
+        command: { type: string, description: 仅展示可执行名；参数不展示 }
+        env_keys: { type: array, items: { type: string }, description: 只回变量名，不返回值 }
         connected: { type: boolean }
         tools: { type: array, items: { type: string } }
+        published_version_id: { type: integer }
+        published_version_no: { type: integer }
+        applied_version_id: { type: integer }
+        applied_version_no: { type: integer }
+        pending_restart: { type: boolean, description: 已发布但运行中的进程仍是旧版本 }
 
     SandboxView:
       type: object
@@ -1070,6 +2014,10 @@ components:
       type: object
       properties:
         agent: { type: string }
+        lifecycle:
+          $ref: '#/components/schemas/AgentLifecycleView'
+          description: '本视图只保证 `state` / `valid` / `lifecycle_error` 的内容投影；其余字段在本响应里可能为零值（空串 / 0），**不代表**状态文件缺失。字段形状仍以 `AgentLifecycleView` 为准（2026-10-22 INFO-2 A）。'
+        etag: { type: string, description: '受管文件集合的强 ETag；草稿响应为空串' }
         files:
           type: array
           items:
@@ -1077,6 +2025,21 @@ components:
             properties:
               path: { type: string }
               size: { type: integer }
+
+    AgentDraftView:
+      type: object
+      description: |
+        模型草稿文件集合（未落盘）。`files[].content` 是 UTF-8 正文，可直接编辑后再走
+        `POST /agents/{name}/files` 提交；本视图不含大小与 ETag，因为磁盘上没有对应的基础版本。
+      properties:
+        agent: { type: string }
+        files:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              content: { type: string }
 
     ScheduleView:
       type: object
@@ -1134,3 +2097,392 @@ components:
         content: { type: string }
         size: { type: integer }
         truncated: { type: boolean, description: 永远为 false（超限直接 400，不截断） }
+
+    SystemOverview:
+      type: object
+      properties:
+        version: { type: string }
+        uptime_seconds: { type: integer }
+        started_at: { type: string, format: date-time }
+        agents:
+          type: object
+          properties:
+            total: { type: integer }
+            active: { type: integer }
+            disabled: { type: integer }
+            archived: { type: integer }
+            invalid: { type: integer, description: 加载期校验或状态文件异常 }
+        runs:
+          type: object
+          properties:
+            running: { type: integer }
+            last_24h: { type: integer }
+            failed_last_24h: { type: integer }
+        resources:
+          type: object
+          properties:
+            model_connections: { type: integer }
+            mcp_servers: { type: integer }
+            skills: { type: integer }
+        database:
+          type: object
+          properties:
+            status: { type: string, enum: [ok, unavailable] }
+            schema_version: { type: integer }
+        auth:
+          type: object
+          properties:
+            mode: { type: string, enum: [token, local_trust] }
+            loopback_only: { type: boolean, description: 当前监听是否仅回环 }
+
+    SystemSample:
+      type: object
+      description: 平台不支持的字段为 null，并列入 unavailable；不得伪造 0。
+      properties:
+        sampled_at: { type: string, format: date-time }
+        cpu_percent:
+          description: 进程 CPU 利用率（不是宿主整机）
+          oneOf: [{ type: number }, { type: "null" }]
+        memory_rss_bytes:
+          oneOf: [{ type: integer }, { type: "null" }]
+        goroutines:
+          oneOf: [{ type: integer }, { type: "null" }]
+        unavailable:
+          type: array
+          items: { type: string }
+
+    RunResourceManifestView:
+      type: object
+      properties:
+        format_version: { type: integer }
+        agent_lifecycle_state: { type: string, enum: [active, disabled, archived] }
+        legacy_unrecorded: { type: boolean, description: US-11 之前的 Run 无清单，不回填 }
+        providers:
+          type: array
+          items: { $ref: '#/components/schemas/ResourceVersionRef' }
+        mcp_servers:
+          type: array
+          items: { $ref: '#/components/schemas/ResourceVersionRef' }
+        skills:
+          type: array
+          items: { $ref: '#/components/schemas/SkillVersionRef' }
+        files:
+          type: array
+          items: { $ref: '#/components/schemas/FileHash' }
+
+    RunDetail:
+      allOf:
+        - $ref: '#/components/schemas/RunView'
+        - type: object
+          properties:
+            resource_manifest:
+              oneOf:
+                - $ref: '#/components/schemas/RunResourceManifestView'
+                - type: "null"
+
+    ResourceVersionRef:
+      type: object
+      properties:
+        kind: { type: string, enum: [model_connection, mcp_server] }
+        name: { type: string }
+        version_id: { type: integer }
+        version_no: { type: integer }
+        content_hash: { type: string }
+
+    SkillVersionRef:
+      type: object
+      properties:
+        name: { type: string }
+        version_id: { type: integer }
+        version_no: { type: integer }
+        content_hash: { type: string }
+        skill_md_hash: { type: string }
+        l1_hash: { type: string }
+        l2_hash: { type: string }
+        l3_hash: { type: string }
+
+    FileHash:
+      type: object
+      properties:
+        path: { type: string }
+        sha256: { type: string }
+        size: { type: integer }
+
+    AgentContent:
+      type: object
+      required: [content, etag]
+      properties:
+        content: { type: string }
+        etag: { type: string, description: '强 ETag：sha256:<64 位小写十六进制>' }
+
+    AgentContentChanges:
+      type: object
+      description: 只允许已知 frontmatter 字段；未给出的字段、正文与注释保持逐字节不变；未知字段 → 400。
+      properties:
+        description: { type: string }
+        identity:
+          type: object
+          properties:
+            agent_name: { type: string }
+            prompt: { type: string }
+        provider:
+          type: object
+          properties:
+            name: { type: string }
+            model: { type: string }
+            temperature: { type: number, minimum: 0, maximum: 2 }
+        tools: { type: array, items: { type: string } }
+        skills: { type: array, items: { type: string } }
+        mcp_servers: { type: array, items: { type: string } }
+        bootstrap: { type: array, items: { type: string } }
+        settings:
+          type: object
+          properties:
+            max_iterations: { type: integer }
+            max_history_turns: { type: integer }
+        schedules:
+          type: array
+          items: { type: object, additionalProperties: true }
+
+    AgentContentUpdate:
+      oneOf:
+        - type: object
+          required: [content]
+          properties:
+            content: { type: string, description: 整份替换 }
+        - type: object
+          required: [changes]
+          properties:
+            changes: { $ref: '#/components/schemas/AgentContentChanges' }
+
+    AgentLifecycleView:
+      type: object
+      properties:
+        agent: { type: string }
+        state:
+          oneOf:
+            - { type: string, enum: [active, disabled, archived] }
+            - { type: "null" }
+          description: 状态文件缺失或损坏时为 null，配合 valid=false 与 lifecycle_error
+        generation: { type: integer }
+        updated_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "状态文件缺失或损坏（valid=false）时为空串；否则为 RFC3339 date-time" }
+        operation_id: { type: string, description: 最近一次生命周期变更操作；状态文件缺失或损坏时为空串 }
+        valid: { type: boolean, description: 状态文件是否存在且校验和正确 }
+        lifecycle_error: { type: string, description: 状态文件缺失或损坏时的点名原因 }
+
+    AgentLifecycleTransition:
+      type: object
+      required: [expected_state, expected_generation]
+      properties:
+        expected_state: { type: string, enum: [active, disabled] }
+        expected_generation: { type: integer, description: 与状态文件 generation 不一致 → 409 }
+
+    AgentCopyRequest:
+      type: object
+      required: [new_name]
+      properties:
+        new_name: { type: string }
+
+    AgentRestoreRequest:
+      type: object
+      properties:
+        new_name: { type: string, description: 留空 = 恢复原目录名 }
+
+    AgentArchiveView:
+      type: object
+      properties:
+        archive_id: { type: string }
+        agent: { type: string }
+        archived_at: { type: string, format: date-time }
+        content_hash: { type: string }
+        restored_at: { type: string, description: 未恢复为空串 }
+        restored_agent_name: { type: string }
+
+    ArchivedAgentView:
+      allOf:
+        - $ref: '#/components/schemas/AgentArchiveView'
+
+    ModelConnectionView:
+      type: object
+      properties:
+        name: { type: string }
+        base_url: { type: string }
+        api_key_env: { type: string, description: '只回 `${ENV_VAR}` 引用名；未配置为空串' }
+        default_model: { type: string }
+        published_version_id: { type: integer }
+        published_version_no: { type: integer }
+        applied_version_id: { type: integer }
+        applied_version_no: { type: integer }
+        etag: { type: string }
+        referenced_by: { type: array, items: { type: string } }
+
+    ModelConnectionUpsert:
+      type: object
+      required: [name, base_url, default_model]
+      properties:
+        name: { type: string }
+        base_url: { type: string }
+        api_key: { type: string, description: '只接受 `${ENV_VAR}` 引用；更新时留空 = 保留原值' }
+        default_model: { type: string }
+
+    ModelConnectionTestResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+        error_code: { type: string }
+        error_message: { type: string, description: 脱敏，不含凭证或完整请求 }
+
+    McpServerDetail:
+      allOf:
+        - $ref: '#/components/schemas/McpServerView'
+        - type: object
+          properties:
+            args: { type: array, items: { type: string } }
+            url: { type: string, description: 仅 http 传输；凭证不得出现在 URL }
+            env_keys: { type: array, items: { type: string } }
+
+    McpServerUpsert:
+      type: object
+      required: [name, transport]
+      properties:
+        name: { type: string }
+        transport: { type: string, enum: [stdio, http] }
+        command: { type: string, description: stdio 必填 }
+        args: { type: array, items: { type: string } }
+        url: { type: string, description: http 必填 }
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: 值只能是 `${ENV_VAR}`；明文凭证 → 400
+
+    McpServerTestResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        latency_ms: { type: integer }
+        tools: { type: array, items: { type: string } }
+        error_code: { type: string }
+        error_message: { type: string, description: 脱敏 }
+
+    SkillFileView:
+      type: object
+      properties:
+        path: { type: string }
+        size: { type: integer }
+        sha256: { type: string }
+        content: { type: string, description: 文本文件全文；二进制导入不进入技能库 }
+
+    SkillDetail:
+      allOf:
+        - $ref: '#/components/schemas/SkillView'
+        - type: object
+          properties:
+            files:
+              type: array
+              items: { $ref: '#/components/schemas/SkillFileView' }
+
+    SkillCreate:
+      type: object
+      required: [name, description]
+      properties:
+        name: { type: string }
+        description: { type: string }
+
+    SkillImport:
+      type: object
+      required: [name, files]
+      properties:
+        name: { type: string }
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/FileDraft' }
+
+    SkillUpdate:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/FileDraft' }
+
+    SkillValidateResult:
+      type: object
+      properties:
+        valid: { type: boolean }
+        problems: { type: array, items: { type: string } }
+
+    ResourceVersionView:
+      type: object
+      properties:
+        version_id: { type: integer }
+        resource_kind: { type: string, enum: [model_connection, mcp_server, skill] }
+        resource_id: { type: string }
+        version_no: { type: integer }
+        content_hash: { type: string }
+        created_at: { type: string, format: date-time }
+        operation_id: { type: string }
+        published: { type: boolean }
+        applied: { type: boolean }
+        reverted_from_version_id:
+          oneOf: [{ type: integer }, { type: "null" }]
+          description: 非撤回版本为 null
+
+    ResourceVersionDetail:
+      allOf:
+        - $ref: '#/components/schemas/ResourceVersionView'
+        - type: object
+          properties:
+            definition_yaml: { type: string, description: '脱敏后的定义；凭证只能是 `${ENV_VAR}`' }
+            manifest: { type: object, additionalProperties: true }
+
+    PublishRequest:
+      type: object
+      properties:
+        version_id: { type: integer, description: 留空 = 发布当前最新；给旧版本则先创建同内容新版本再发布 }
+
+    ResourcePublishResult:
+      type: object
+      properties:
+        version: { $ref: '#/components/schemas/ResourceVersionView' }
+        pending_restart: { type: boolean, description: 仅 MCP 首版可能为 true }
+
+    ResourceReferencesView:
+      type: object
+      properties:
+        kind: { type: string, enum: [model_connection, mcp_server, skill] }
+        id: { type: string }
+        published_version_id: { type: integer }
+        agents: { type: array, items: { type: string } }
+        active_runs: { type: array, items: { type: string, description: run_id } }
+
+    OperationView:
+      type: object
+      properties:
+        operation_id: { type: string }
+        action: { type: string }
+        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, system] }
+        target_id: { type: string }
+        actor_subject: { type: string }
+        auth_method: { type: string, enum: [bearer, local_trust, cli, migration] }
+        source: { type: string, description: 脱敏来源地址 }
+        status: { type: string, enum: [pending, success, failed, unknown] }
+        result_code: { type: string }
+        error_message: { type: string, description: 脱敏 }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: string, description: 未结束为空串 }
+
+    OperationDetail:
+      allOf:
+        - $ref: '#/components/schemas/OperationView'
+        - type: object
+          properties:
+            request_hash: { type: string }
+            requested_version_id: { type: integer }
+            expected_etag: { type: string }
+            detail: { type: object, additionalProperties: true, description: 脱敏 detail_json }
+            recovered_at: { type: string, description: 未恢复为空串 }
+            verification: { type: string, enum: [not_required, applied, not_applied, indeterminate] }

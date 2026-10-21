@@ -83,7 +83,7 @@ func (s *sessionStore) Messages(_ context.Context, _ string) ([]core.Message, er
 func (s *sessionStore) UpsertSession(_ context.Context, _ core.SessionRecord) error { return nil }
 
 // ListSessions 是陪衬面（流程 E 不判它）。
-func (s *sessionStore) ListSessions(_ context.Context) ([]core.SessionRecord, error) {
+func (s *sessionStore) ListSessions(_ context.Context, _ core.SessionFilter) ([]core.SessionRecord, error) {
 	return nil, nil
 }
 

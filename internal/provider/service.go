@@ -129,6 +129,29 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	return resp, chatErr
 }
 
+// Pinned 返回某个 Provider 的**准入固定视图**（人工 review ② 缺陷 2）：路由表只含这一条，
+// 模型表、审计仓储与日志器共用。`RunRuntime` 发放的就是它——一个 Run 的模型调用因此只查
+// 准入时固定下来的那一行（宪法 III），发布换表不影响在途运行；调用仍走本服务的两阶段
+// 审计（宪法 V），**不得**退回裸协议客户端。名字不在映射表 → false，由准入失败关闭。
+// Pinned returns a one-entry routing view that shares the audit store, so a run can
+// neither reach another provider nor bypass the two-phase audit.
+func (s *ProviderService) Pinned(name string) (*ProviderService, bool) {
+	client, ok := s.clients[name]
+	if !ok {
+		return nil, false
+	}
+	models := make(map[string]string, 1)
+	if model, ok := s.models[name]; ok {
+		models[name] = model
+	}
+	return &ProviderService{
+		clients: map[string]core.ProviderClient{name: client},
+		models:  models,
+		store:   s.store,
+		logger:  s.logger,
+	}, true
+}
+
 // resolveModel 解析生效模型：请求模型 > 供应商缺省模型；都空则返回空串（调用方据此拒绝）。
 // resolveModel prefers the requested model and falls back to the provider default.
 func (s *ProviderService) resolveModel(req core.ChatRequest) string {

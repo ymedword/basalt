@@ -599,6 +599,18 @@ func (s *slowRunService) Run(ctx context.Context, _ core.RunRequest) (core.RunRe
 
 func (s *slowRunService) Archive(context.Context, string) error { return nil }
 
+func (s *slowRunService) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (s *slowRunService) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (s *slowRunService) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
 // TestServer_RecoverMiddleware 逐字保留模块卡 R11（W12）。
 // 逆改点：recover 只记日志不写 500 → 第一个子用例状态码红；
 // 已写头后再写第二份信封 → ResponseRecorder 捕获到双写（body 含两份 JSON）→ 红。
@@ -745,6 +757,19 @@ func (f runFunc) Run(ctx context.Context, req core.RunRequest) (core.RunResult, 
 // Archive 是编译适配桩：这些用例不覆盖归档面（判据面零变更，模块卡 §3.5）。
 func (f runFunc) Archive(context.Context, string) error { return nil }
 
+// 账本读面与取消同样是编译适配桩：由 T028 起的运行端点用例判卷。
+func (f runFunc) ListRuns(context.Context, core.RunFilter) ([]core.RunDetail, error) {
+	return nil, nil
+}
+
+func (f runFunc) GetRun(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
+func (f runFunc) Cancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, nil
+}
+
 func mustLoopbackListener(t *testing.T) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -762,4 +787,332 @@ type recordingListener struct {
 func (l *recordingListener) Close() error {
 	l.onClose()
 	return l.Listener.Close()
+}
+
+// routeKey 是路由表断言用的稳定标识（方法 + 模式）。
+// routeKey is the stable identity used by the route-table assertions.
+func routeKey(rt route) string { return rt.method + " " + rt.pattern }
+
+// concretePath 把 ServeMux 模式里的通配段替换成具体值，供 Handler 探测；根路径
+// 用精确结束标记 `{$}`，探测时换成真正的 "/"。
+// concretePath substitutes wildcard segments with concrete values; the exact-root
+// marker maps to the literal "/" path.
+func concretePath(pattern string) string {
+	if pattern == "/{$}" {
+		return "/"
+	}
+	p := strings.ReplaceAll(pattern, "{id}", "x")
+	p = strings.ReplaceAll(p, "{name}", "ops-agent")
+	// 管理台子树通配（T049）取一个资源路径；模式解析必须回到同一行。
+	// The console subtree wildcard resolves with a concrete asset path.
+	return strings.ReplaceAll(p, "{path...}", "assets/index.js")
+}
+
+// TestRouteTable_PublicSurfaceIsClosed 公开面闭集（约束 8）：只允许健康检查、
+// 管理台静态壳与根重定向三类；新增公开入口必须同时修订契约与该表。
+// 逆改点：把任一受保护端点标成 public → 本用例红。
+func TestRouteTable_PublicSurfaceIsClosed(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	public := 0
+	for _, rt := range s.routeTable() {
+		if rt.visibility != routePublic {
+			continue
+		}
+		public++
+		switch {
+		case rt.method == http.MethodGet && rt.pattern == "/api/v1/health":
+		// 管理台静态壳（约束 8 的公开闭集之一）：`/console` 精确路径与 `/console/*`
+		// 子树都由 consoleHandler 提供（T049）。
+		// The console shell is one closed public category: exact path plus subtree.
+		case rt.method == http.MethodGet && (rt.pattern == "/console" || strings.HasPrefix(rt.pattern, "/console/")):
+		case rt.method == http.MethodGet && rt.pattern == "/{$}":
+		default:
+			t.Errorf("未获批准的公开路由：%s", routeKey(rt))
+		}
+	}
+	require.Positive(t, public, "健康检查必须在公开面内")
+}
+
+// TestRouteTable_ExistingEndpointsEnumerated 既有端点逐个在表内且标记受保护。
+// 逆改点：漏登记任一既有端点或把方法写错 → 对应子例红。
+func TestRouteTable_ExistingEndpointsEnumerated(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	want := []string{
+		"GET /api/v1/health",
+		"GET /api/v1/info",
+		"GET /api/v1/profiles",
+		"GET /api/v1/tools",
+		"GET /api/v1/memory",
+		"POST /api/v1/sessions",
+		"GET /api/v1/sessions/{id}",
+		"DELETE /api/v1/sessions/{id}",
+		"POST /api/v1/sessions/{id}/messages",
+		"POST /api/v1/agents/{name}/invoke",
+		"GET /api/v1/schedules",
+		"PUT /api/v1/schedules/{id}",
+		"GET /api/v1/schedules/{id}/executions",
+		"POST /api/v1/schedules/{id}/run",
+	}
+	got := map[string]routeVisibility{}
+	for _, rt := range s.routeTable() {
+		got[routeKey(rt)] = rt.visibility
+	}
+	for _, key := range want {
+		visibility, ok := got[key]
+		require.True(t, ok, "路由表缺少 %s", key)
+		wantVisibility := routeProtected
+		if key == "GET /api/v1/health" {
+			wantVisibility = routePublic
+		}
+		require.Equal(t, wantVisibility, visibility, "%s 的可见性", key)
+	}
+}
+
+// TestRouteTable_NoDuplicateEntries 同一 (方法, 模式) 只允许登记一次——重复登记在
+// ServeMux 上会 panic，而在表上会掩盖后一条被覆盖的事实。
+// 逆改点：复制粘贴出第二条相同路由 → 本用例红。
+func TestRouteTable_NoDuplicateEntries(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	seen := map[string]bool{}
+	for _, rt := range s.routeTable() {
+		key := routeKey(rt)
+		require.False(t, seen[key], "路由重复登记：%s", key)
+		seen[key] = true
+	}
+}
+
+// TestRouteTable_FallbackIsUniqueAndMethodAgnostic 兜底项恰一条、方法为空、
+// 模式为 "/"：未匹配的路径与方法统一落到 404 信封（注 3）。
+// 逆改点：给兜底项写死方法 → 未知动词会得到纯文本 405 而非信封。
+func TestRouteTable_FallbackIsUniqueAndMethodAgnostic(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	var fallbacks []route
+	for _, rt := range s.routeTable() {
+		if rt.visibility == routeFallback {
+			fallbacks = append(fallbacks, rt)
+		}
+	}
+	require.Len(t, fallbacks, 1, "兜底项必须唯一")
+	require.Empty(t, fallbacks[0].method, "兜底项必须方法无关")
+	require.Equal(t, "/", fallbacks[0].pattern)
+}
+
+// TestRouteTable_ProtectedMethodsAreExplicit 受保护项必须显式给出合法动词且挂在
+// /api/ 下——空方法会把受保护端点变成"任意动词可命中"。
+// 逆改点：漏写方法或把受保护项挂到非 /api/ 路径 → 本用例红。
+func TestRouteTable_ProtectedMethodsAreExplicit(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	allowed := map[string]bool{
+		http.MethodGet: true, http.MethodPost: true,
+		http.MethodPut: true, http.MethodDelete: true,
+	}
+	for _, rt := range s.routeTable() {
+		if rt.visibility != routeProtected {
+			continue
+		}
+		require.True(t, allowed[rt.method], "受保护路由方法非法：%s", routeKey(rt))
+		require.True(t, strings.HasPrefix(rt.pattern, "/api/"),
+			"受保护路由必须挂在 /api/ 下：%s", routeKey(rt))
+	}
+}
+
+// TestRouteTable_RouterRegistersEveryEntry 注册与枚举同源：mux 对每一条非兜底项
+// 都能解析出与表中逐字相同的模式。
+// 逆改点：routes() 与 routeTable() 各写一份清单 → 缺注册的项解析成兜底 "/"。
+func TestRouteTable_RouterRegistersEveryEntry(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	mux := http.NewServeMux()
+	s.routes(mux)
+	for _, rt := range s.routeTable() {
+		if rt.visibility == routeFallback {
+			continue
+		}
+		req := httptest.NewRequest(rt.method, concretePath(rt.pattern), nil)
+		_, pattern := mux.Handler(req)
+		require.Equal(t, routeKey(rt), pattern, "路由未按表注册")
+	}
+}
+
+// TestRouteTable_UnknownPathAndMethodFallBack 未知路径与未知动词都落到兜底：
+// 不暴露 ServeMux 的纯文本 404 与自动 405。
+// 逆改点：去掉 catch-all 或给 "GET /" 加方法限定 → 对应探测得不到 "/"。
+func TestRouteTable_UnknownPathAndMethodFallBack(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	mux := http.NewServeMux()
+	s.routes(mux)
+
+	cases := []struct{ method, path string }{
+		{http.MethodGet, "/nope"},
+		{http.MethodPost, "/api/v1/nope"},
+		{http.MethodPatch, "/api/v1/health"}, // 已知路径的未知动词
+	}
+	for _, tc := range cases {
+		_, pattern := mux.Handler(httptest.NewRequest(tc.method, tc.path, nil))
+		require.Equal(t, "/", pattern, "%s %s 必须落到兜底", tc.method, tc.path)
+	}
+}
+
+// TestRouteTable_HealthNeedsNoCredentials 公开面唯一 API（健康检查）在无任何
+// 凭据时可直接返回成功信封——它是公开闭集的存在性证明。
+// 逆改点：把 health 标成受保护并接入未实现认证 → 本用例红。
+func TestRouteTable_HealthNeedsNoCredentials(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var env Envelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+	require.Equal(t, codeOK, env.Code)
+}
+
+// countingAuth 是 AdminAuth 的计数假件：Wrap 产出的处理函数每次被调用计一次，
+// 并以固定 actor 调用 next。它用来证明「受保护路由一律过闸门、公开路由与兜底
+// 不过闸门」，与具体守卫的判定逻辑解耦。
+// countingAuth counts guard entries and forwards with a fixed actor, isolating the
+// mounting matrix from the guard's own decisions.
+type countingAuth struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingAuth) Wrap(next AdminHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.calls++
+		c.mu.Unlock()
+		next(w, r, core.Actor{Subject: "test-subject", Method: core.AuthMethodBearer, Source: "test"})
+	})
+}
+
+func (c *countingAuth) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestAuth_RouteMatrix 覆盖认证挂载的路由矩阵（模块卡 §4.4 关键回归第 7 条、任务
+// T025 的 +8）：非公开路由无凭据一律 401 且零副作用、有效凭据放行、公开面（健康
+// 检查 / 根重定向）与兜底 404 不经过闸门、每条受保护项恰过闸门一次、`/` 只做
+// 302 且只接受 GET。
+// 逆改点：routes() 漏挂任一受保护项 / 把公开路由或兜底也包装 / 根路径改用可吞
+// 路径的 "/" 模式 → 对应子例红。
+// 中文用例名：非公开端点认证矩阵。
+func TestAuth_RouteMatrix(t *testing.T) {
+	protectedRows := func(t *testing.T, s *Server) []route {
+		t.Helper()
+		var rows []route
+		for _, rt := range s.routeTable() {
+			if rt.visibility == routeProtected {
+				rows = append(rows, rt)
+			}
+		}
+		require.Positive(t, len(rows), "路由表必须含受保护端点")
+		return rows
+	}
+
+	t.Run("every non-public route rejects missing credentials", func(t *testing.T) {
+		runs := &fakeRunService{result: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
+		store := &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}}
+		svc := &fakeScheduleService{runRes: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
+		rows := protectedRows(t, newTestServer(t, nil))
+
+		for _, rt := range rows {
+			// 每条路由一个**新装配**：限速窗口按来源累计，同一来源连打十几条
+			// 缺凭据请求会在第 10 条起变成 429，掩盖「该路由是否挂了闸门」。
+			s := newTestServer(t, func(o *Options) {
+				o.AdminAuth = testAdminAuth(testToken)
+				o.Runs = runs
+				o.Sessions = store
+				o.Schedules = svc
+			})
+			rec := serveAdmin(s, adminRequest(rt.method, concretePath(rt.pattern), ""))
+			require.Equal(t, http.StatusUnauthorized, rec.Code, "%s", routeKey(rt))
+			require.Equal(t, codeUnauthorized, decodeAuthEnvelope(t, rec).Code, "%s", routeKey(rt))
+		}
+
+		require.Empty(t, runs.requests(), "未认证请求不得触达运行入口")
+		require.Empty(t, runs.archivedIDs(), "未认证请求不得触达归档入口")
+		require.Zero(t, store.getOrCreateCallCount(), "未认证请求不得建会话")
+		require.Zero(t, store.getSessionCallCount(), "未认证请求不得读会话")
+		require.Zero(t, svc.listCallCount(), "未认证请求不得触达调度器")
+		require.Zero(t, svc.runCallCount())
+	})
+
+	t.Run("valid credentials pass the guard on every protected route", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Schedules = &fakeScheduleService{runRes: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
+		})
+		for _, rt := range protectedRows(t, s) {
+			rec := serveAdmin(s, withBearer(adminRequest(rt.method, concretePath(rt.pattern), ""), testToken))
+			require.NotEqual(t, http.StatusUnauthorized, rec.Code, "%s 有效凭据不得 401", routeKey(rt))
+			require.NotEqual(t, http.StatusForbidden, rec.Code, "%s 有效凭据不得 403", routeKey(rt))
+		}
+	})
+
+	t.Run("public routes and the 404 fallback bypass the guard", func(t *testing.T) {
+		auth := &countingAuth{}
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = auth })
+
+		health := serveAdmin(s, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+		require.Equal(t, http.StatusOK, health.Code)
+		root := serveAdmin(s, httptest.NewRequest(http.MethodGet, "/", nil))
+		require.Equal(t, http.StatusFound, root.Code)
+		unknown := serveAdmin(s, httptest.NewRequest(http.MethodGet, "/api/v1/nope", nil))
+		require.Equal(t, http.StatusNotFound, unknown.Code)
+		require.Equal(t, codeNotFound, decodeAuthEnvelope(t, unknown).Code)
+
+		require.Zero(t, auth.count(), "公开路由与兜底不得进入认证闸门")
+	})
+
+	t.Run("every protected route enters the guard exactly once", func(t *testing.T) {
+		auth := &countingAuth{}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = auth
+			o.Schedules = &fakeScheduleService{runRes: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}}
+		})
+		rows := protectedRows(t, s)
+		for _, rt := range rows {
+			serveAdmin(s, adminRequest(rt.method, concretePath(rt.pattern), ""))
+		}
+		require.Equal(t, len(rows), auth.count(),
+			"受保护路由必须一条不落地经 s.admin 挂载（恰过一次）")
+	})
+
+	t.Run("root redirects to the console", func(t *testing.T) {
+		s := newTestServer(t, nil)
+		rec := serveAdmin(s, httptest.NewRequest(http.MethodGet, "/", nil))
+		require.Equal(t, http.StatusFound, rec.Code)
+		require.Equal(t, consoleRootPath, rec.Header().Get("Location"))
+	})
+
+	t.Run("root is GET-only and other verbs fall back to 404", func(t *testing.T) {
+		s := newTestServer(t, nil)
+		rec := serveAdmin(s, httptest.NewRequest(http.MethodPost, "/", nil))
+		require.Equal(t, http.StatusNotFound, rec.Code)
+		require.Equal(t, codeNotFound, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("unknown paths stay 404 even with a guard configured", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		rec := serveAdmin(s, adminRequest(http.MethodPost, "/api/v1/nope", ""))
+		require.Equal(t, http.StatusNotFound, rec.Code, "兜底不参与认证判定")
+		require.Equal(t, codeNotFound, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("valid credentials reach the protected handler", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		rec := serveAdmin(s, withBearer(adminRequest(http.MethodGet, "/api/v1/info", ""), testToken))
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, codeOK, decodeAuthEnvelope(t, rec).Code)
+	})
 }

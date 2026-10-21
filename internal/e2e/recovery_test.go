@@ -404,7 +404,11 @@ type scheduleSummary struct {
 func listSchedules(t *testing.T, addr string) []scheduleSummary {
 	t.Helper()
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("http://" + addr + "/api/v1/schedules")
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/api/v1/schedules", nil)
+	if err != nil {
+		t.Fatalf("组装 GET /schedules 请求失败: %v", err)
+	}
+	resp, err := client.Do(applyAdminAuth(req))
 	if err != nil {
 		t.Fatalf("GET /schedules 失败: %v", err)
 	}
@@ -446,7 +450,7 @@ func setScheduleEnabled(t *testing.T, addr, id string, enabled bool) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := client.Do(applyAdminAuth(req))
 	if err != nil {
 		t.Fatalf("启停任务 %s 失败: %v", id, err)
 	}
@@ -466,7 +470,7 @@ func triggerScheduleRun(addr, id string) {
 	if err != nil {
 		return
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(applyAdminAuth(req))
 	if err != nil {
 		return
 	}

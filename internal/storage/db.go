@@ -94,6 +94,21 @@ func (db *DB) SchemaVersion(ctx context.Context) (int, error) {
 	return int(current.Int64), nil
 }
 
+// Ping 探活读池——系统概览的 `database.status`（ok / unavailable）判据。
+// 只探读池：只读句柄也能回答；失败原样上抛，由调用方记 unavailable 并列入
+// `unavailable` 清单——**不**在此吞错，更**不**伪造 ok（约束 33 的同一条纪律）。
+// Ping checks the read pool for the system overview's database.status; it never
+// masks a failure as "ok".
+func (db *DB) Ping(ctx context.Context) error {
+	if db == nil || db.read == nil {
+		return errors.New("storage: 句柄未装配读池，无法探活")
+	}
+	if err := db.read.PingContext(ctx); err != nil {
+		return fmt.Errorf("探测数据库连接: %w", err)
+	}
+	return nil
+}
+
 // TableNames 返回用户表表名（不含 sqlite_ 内部表），按名排序。
 // TableNames returns the user table names, sorted, excluding internals.
 func (db *DB) TableNames(ctx context.Context) ([]string, error) {

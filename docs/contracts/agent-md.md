@@ -68,7 +68,7 @@ schedules:
 | `provider.model` | string | **是** | — | 模型名；**空白即拒**（脚手架填占位符「请在此填写模型名」） |
 | `provider.temperature` | float | 否 | 供应商缺省 | 0–2 |
 | `tools` | []string | 否 | `[]` | **不声明 = 空池**：模型一行工具都看不到 |
-| `skills` | []string | 否 | `[]` | 元素 = 公共技能库目录名；**声明即绑定**；库里没有该名字 → 整只不注册 |
+| `skills` | []string | 否 | `[]` | 元素 = 公共技能库目录名；**声明即绑定**；只写名字，**不支持** `skill@version`；声明名在库里没有实体、或没有**已发布版本** → 整只不注册（Run 开始时冻结该发布版本的完整内容清单，见 §2.4） |
 | `mcp_servers` | []string | 否 | `[]` | 元素 = `mcp_servers.yaml` 里的 server 名 |
 | `channels` | []object | 否 | `[{name: cli}]` | 接入渠道（核心阶段只有 `cli`） |
 | `bootstrap` | []string | 否 | `[]` | 注入提示词的引导文件（相对工作区根） |
@@ -81,17 +81,84 @@ schedules:
 | # | 规则 | 不通过时 |
 | --- | --- | --- |
 | 1 | `name` 等于目录名 | WARN `name mismatch` |
-| 2 | `provider.name` 在已注册 provider 表里 | WARN `provider not registered: <name>` |
+| 2 | `provider.name` 在**已发布 Provider 版本表**里（`resource_pointers` 有未删除的发布版本） | WARN `provider version missing: <name>` |
 | 3 | `provider.model` 非空白 | WARN `blank model` |
 | 4 | `tools` 里每个名字都能解析（内置 10 个 / MCP / 代码内注册） | WARN `tool not registered: <name>` |
-| 5 | `skills` 里每个名字在 `.basalt/skills/<name>/SKILL.md` 有实体 | WARN `skill not found: <name>` |
-| 6 | `mcp_servers` 里每个名字在 `mcp_servers.yaml` 里且连接成功 | WARN `mcp server skipped` |
+| 5 | `skills` 里每个名字在技能库有实体（加载期），且存在**已发布版本**（注册装配期） | 无实体 → WARN `skill not found: <name>`；有实体但无已发布版本 → WARN `skill version missing: <name>[, <name>…]`（多个缺失名按升序、以逗号加空格连接，一条 WARN 点名该 Agent 的全部缺失技能） |
+| 6 | `mcp_servers` 里每个名字有**实际生效**的版本（待重启内容不算）且连接成功 | WARN `mcp server skipped: <name>` |
 | 7 | `bootstrap` 里每个文件存在 | WARN `bootstrap file missing` |
 | 8 | `schedules[].cron` 为 6 段且合法、`zone` 合法、`id` 全局唯一（**≥2 项时每项 `id` 必须显式声明**，见 §3） | WARN 并跳过该 Agent |
 
 **校验失败即整只不注册**（不是"跳过那一条继续"）——半可用的 Agent 比明确不可用更危险。
 
+**校验与生命周期是两件事**：上表判的是“配置是否可用”；`disabled` / `archived` / 状态文件损坏判的是“是否允许新 Run”。配置有效的 `disabled` Agent 仍然可见（`registered=true`、`runnable=false`），**不得**把它混报成 `registered=false`；状态文件缺失 / 损坏同样保留可见性，由 `lifecycle_error` 点名，并在 Run 准入时拒绝。
+
 > 遗留形态备案：Agent 本地曾用 `skills/` 目录下的相对软连接表达技能绑定。该机制**已废弃**（Windows 下不可行），本地 `skills/` 目录被无视并记一条 WARN，绑定一律以 frontmatter 的 `skills:` 声明为准。
+
+### 2.2 Agent 生命周期状态文件
+
+生命周期状态**不在** `AGENT.md` frontmatter 里，也不由目录是否存在推断。权威载体是受保护管理目录中的一个 JSON 文件：
+
+```text
+<workspace>/.basalt/control/agents/<agent>.json
+```
+
+```json
+{
+  "schema_version": 1,
+  "agent": "ops-agent",
+  "state": "active",
+  "generation": 3,
+  "updated_at": 1760000000000,
+  "operation_id": "op-1760000000000-a1b2c3",
+  "checksum": "sha256:<64 位小写十六进制>"
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `schema_version` | integer | 首版固定为 `1`；未来变更必须拒绝旧二进制误读 |
+| `agent` | string | 必须与目录名逐字一致 |
+| `state` | string | `active` / `disabled` / `archived` |
+| `generation` | integer | 每次状态迁移 +1，从 1 起；用于条件迁移与恢复查证 |
+| `updated_at` | integer | Unix 毫秒（UTC） |
+| `operation_id` | string | 写入本次状态的管理操作标识（资源基线使用 `system.baseline_v2` 的 `op-...`，不写 `migration` 字面量） |
+| `checksum` | string | 校验和；计算时把本字段置为空串，对文件的 UTF-8 原始字节做 sha256 |
+
+- **写入方式**：临时文件 + 原子 rename；只有生命周期服务可写。该目录不在 Agent 文件工具白名单、工作区浏览与 `fsnotify` 热加载范围内。
+- **缺失 / 损坏**：状态文件不存在、JSON 不合法、`agent` 不匹配、`schema_version` 不支持或 checksum 不符 → 该 Agent **拒绝新 Run**，索引 `state` 为空、`valid=0`，管理面返回 `lifecycle_error`。**不得**悄悄按 `active` 处理，**不得**自动重建为 active。
+- **状态语义**：
+  - `active`：允许新 Run；配置校验失败仍按 §2.1 整只不注册。
+  - `disabled`：仍在管理面可见、可编辑；拒绝新 Run；已在跑的 Run 继续完成。
+  - `archived`：不在活动注册表；只能经受控 restore 恢复，恢复默认 `disabled`。
+- **一致性边界**：禁用 / 启用与 Run 准入共用同一 Agent 级读写锁（见 [run-and-errors.md](run-and-errors.md) §3.4）；HTTP、CLI、定时器与内部入口都必须检查。
+- **复制与恢复**：复制创建新 Agent 目录，不复制生命周期文件、会话 / 记忆 / 审计、`schedules`（清空以免全局 `id` 冲突）；初始 `disabled`。归档恢复同样默认 `disabled`，并清空 `schedules`，由管理员显式启用 / 重配。不得把手工移动目录当作正常恢复。
+
+### 2.3 内容版本、ETag 与结构化编辑
+
+- `GET /agents/{name}/content` 返回整份 `AGENT.md` 与强 ETag：`"sha256:<64 位小写十六进制>"`（对文件原始 UTF-8 字节计算）。
+- `PUT /agents/{name}/content` **必须**带 `If-Match`；缺失、格式非法或与当前 ETag 不等 → **412** `PRECONDITION_FAILED`，磁盘逐字节不变。`*` 与弱 ETag 不接受。
+- `GET /agents/{name}/files` 返回 Agent 受管文件集合与**集合 ETag**：对按 path 升序排列的 `(path, sha256(内容))` 规整序列化后求 sha256，路径用相对目录的 `/` 分隔形式；只含 Agent 目录下的普通文件，不含 `.staging` / `.backup` 残留，不跟随软连接。集合 ETag 与单文件 `AGENT.md` ETag **不可互换**。
+- `POST /agents/{name}/files` **必须**带集合 ETag 的 `If-Match`；缺失、格式非法、弱 ETag、`*` 或不匹配 → **412**，**不落盘、不写管理操作行**。比较与 staging 构建在同一 Agent 写锁内完成，锁内重新读取基础版本（防"读旧版本 → 依次保存 → 后写覆盖前写"）。
+- `POST /agents/{name}/generate-files` 返回的草稿**没有**磁盘基础版本，响应不含 ETag；草稿不得直接当作已保存内容。
+- 请求体二选一：
+  - `{ "content": "<整份文件>" }`：整份替换；
+  - `{ "changes": { ... } }`：只改已知 frontmatter 字段的结构化 patch。服务端保留未改字段、正文与注释；无法在保留注释的前提下完成时返回 **400** `EDIT_UNSUPPORTED`，提示改用整份原文编辑。**不得**为了 patch 而整份重新生成、重排或丢注释。
+- 两种形态最终都走**同一段**解析、校验与发布闸门（先验后写）；成功后生成新的 `ConfigSnapshot`，返回新 ETag 与落盘真值。
+- `disabled` Agent 允许编辑；`archived` Agent 不允许直接编辑，必须先 restore。
+- 服务端不得存在绕过该闸门的第二条 `AGENT.md` 写入路径（页面编辑器、创建、多文件提交、技能导入、恢复共用它）。
+
+### 2.4 技能导入、发布与运行冻结
+
+- **按名绑定**：`skills:` 只写技能名；**不支持** `skill@version`，也不得用软连接 / 本地目录另立绑定。
+- **发布版本**：技能库由工作副本与不可变版本库组成。工作副本经校验 / 发布闸门生成不可变版本；`resource_pointers` 记录当前发布版本。新 Run 在准入时解析当前发布版本，并冻结完整 L1/L2/L3 文件清单（`RunResourceManifest`）；Run 内按需读取时从冻结清单取，工作副本后续修改不影响本 Run。仍是渐进披露——**不得**预载正文、**不得**新增 `use_skill` 工具。
+- **缺失基线**：技能没有已发布版本时，不得把工作副本静默当作已发布版本；该 Agent 不注册，直到建立基线 / 发布。
+- **导入边界**：
+  - 只接受相对路径；规范化后必须仍在技能目录内；拒绝绝对路径、`..` 越界、软连接 / 目录联接、非普通文件；
+  - 单文件 ≤ 256 KiB，单技能总量 ≤ 2 MiB，文件数 ≤ 200；
+  - 导入时**不执行**任何脚本，不解析或下载外部依赖；
+  - `.git` 等隐藏目录不导入；同名技能存在时导入失败，不静默覆盖。
+- 版本撤回 = 用旧版本内容创建新版本并发布；不回退版本号，不改历史版本，不恢复已撤销的凭据解析值。
 
 ---
 
@@ -355,7 +422,8 @@ type ToolCall struct {
 | 主题 | 文档 |
 | --- | --- |
 | Run 状态机 / 并发 / 取消 / 崩溃恢复 / 错误码 | [run-and-errors.md](run-and-errors.md) |
-| 数据库结构（会话 / 消息 / 审计 / 快照） | [schema.sql](schema.sql) |
+| 管理面认证 / 条件写 / 管理操作审计与恢复 | [run-and-errors.md](run-and-errors.md) §9 |
+| 数据库结构（会话 / 消息 / 审计 / 快照 / 资源版本 / 生命周期索引） | [schema.sql](schema.sql) |
 | REST 端点与信封 | [openapi.yaml](openapi.yaml) |
 | 兼容性、迁移与历史对照 | [Compatibility.md](../Compatibility.md) |
 | 沙箱与授权边界（Policy / Runner） | [技术方案](../TechnicalDesign.md) §4.3 |

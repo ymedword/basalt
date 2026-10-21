@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -56,6 +58,49 @@ type HTTPConfig struct {
 	// 配置键的形状一变，运维侧就得改文件）。
 	// AllowedDomains is the outbound domain allowlist, consumed by US-5's network tools.
 	AllowedDomains []string `yaml:"allowed_domains"`
+
+	// AdminAuth 是管理面认证配置（`http.admin_auth` 段；键名逐字取自
+	// docs/contracts/run-and-errors.md §9.1）。装载层只校验"配置本身是否成形"，
+	// "实际监听是否回环 / 非回环是否显式列出"归 web.ValidateAdminAuth（那里才有
+	// 真实监听地址）。
+	// AdminAuth carries the management-auth section; only shape checks live at load
+	// time — listener-dependent checks run after the listener is created.
+	AdminAuth AdminAuthConfig `yaml:"admin_auth"`
+}
+
+// AdminAuthConfig 是管理面认证配置段（`http.admin_auth`，颗粒度文档 §3.3）。
+// AdminAuthConfig is the management authentication section.
+//
+// 段整体缺失对不开放 HTTP 管理面的命令（chat / tool / session 等）合法——那是
+// 约束 1 与注 12 的口径；`serve` 必须在开放服务前要求 mode 显式给出（校验落在
+// web.ValidateAdminAuth，本结构只承载取值）。
+// An entirely absent section is legal for commands that never open the management
+// face; serve requires an explicit mode before it starts listening.
+type AdminAuthConfig struct {
+	// Mode 取 token / local_trust；`serve` 启动时必填。
+	// Mode is token or local_trust; serve requires it.
+	Mode string `yaml:"mode"`
+
+	// Token 是管理凭据：只允许 ${VAR} 占位（credentialKey 覆盖本键，与
+	// providers[i].api_key 同一套明文拒绝路径）；明文**不得**落盘、回显或入日志。
+	// Token is a credential: only a ${VAR} placeholder is accepted, through the same
+	// plaintext-rejection path as providers[i].api_key.
+	Token string `yaml:"token"`
+
+	// AllowedHosts 是允许的 Host（含端口）；空 = 由监听地址派生（仅回环监听）。
+	// AllowedHosts lists allowed Host values including the port; empty derives from a
+	// loopback listener.
+	AllowedHosts []string `yaml:"allowed_hosts"`
+
+	// AllowedOrigins 是允许的浏览器 Origin，**完整匹配**（scheme://host[:port]）。
+	// AllowedOrigins matches the browser Origin exactly.
+	AllowedOrigins []string `yaml:"allowed_origins"`
+
+	// TrustedProxies 是可信反向代理的 CIDR；只有这些来源的转发头参与来源归因，
+	// 且**不得**用于证明回环本机信任。
+	// TrustedProxies lists proxy CIDRs whose forwarded headers may feed source
+	// attribution; they never prove loopback trust.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // ServerConfig 是进程级服务参数（`server` 段，技术方案 §5.2）。
@@ -162,10 +207,12 @@ type MemoryConfig struct {
 	Backend string `yaml:"backend"`
 }
 
-// 凭证键路径：只有 providers[i].api_key 是 US-1 认得的凭证键（其余凭证形态——
-// mem0 api-key、notify_channels url——随各自消费 US 落位）。
-// Credential key paths: providers[i].api_key is the only credential US-1 knows.
-var credentialKey = regexp.MustCompile(`^providers\[\d+\]\.api_key$`)
+// 凭证键路径：providers[i].api_key 与管理面 token（http.admin_auth.token）走同一套
+// 占位形态、类型与明文拒绝检查；其余凭证形态（mem0 api-key、notify_channels url）
+// 随各自消费 US 落位。
+// Credential key paths: the provider API key and the admin token share the same
+// placeholder, type and plaintext-rejection checks.
+var credentialKey = regexp.MustCompile(`^(providers\[\d+\]\.api_key|http\.admin_auth\.token)$`)
 
 // 单个占位符；${} 与 ${1X} 这类畸形形态不匹配，会在「残留检查」处被判红。
 var placeholder = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
@@ -187,6 +234,10 @@ const defaultMemoryBackend = "markdown"
 // 拒绝启动：静默降级会让「我配了 mem0」悄悄变成「记忆写进了文件」，载体形态与
 // 运维预期分叉。
 var validMemoryBackends = map[string]bool{"markdown": true, "sqlite": true}
+
+// 管理认证模式的两档取值（docs/contracts/run-and-errors.md §9.1）——取值域外一律
+// 拒绝启动：未知模式既不是 token 也不是本机信任，放行等于"认证配置被静默忽略"。
+var validAdminAuthModes = map[string]bool{"token": true, "local_trust": true}
 
 // LoadConfig 装载并校验 basalt.yaml。
 // LoadConfig loads and validates basalt.yaml.
@@ -421,6 +472,13 @@ func validateConfig(cfg *Config) error {
 			"配置项 memory.backend 取值非法（%s）——只允许 markdown（缺省）或 sqlite；mem0 载体尚未实现，未知取值一律拒绝启动，不静默降级",
 			cfg.Memory.Backend)
 	}
+	// 管理认证段：缺席合法（轻命令不开 HTTP 管理面），半截配置不合法——见 validateAdminAuth。
+	// The admin-auth section may be absent for light commands; a partial section is
+	// never legal.
+	if err := validateAdminAuth(cfg.HTTP.AdminAuth); err != nil {
+		return err
+	}
+
 	// seen 记条目名 → **首次出现**的下标：重名拒绝要同时点名两条，只报后一条会让
 	// 用户不知道跟谁撞了。
 	// seen maps a name to its first index so a duplicate can name both entries.
@@ -449,6 +507,140 @@ func validateConfig(cfg *Config) error {
 
 		if p.APIKey == "" {
 			return fmt.Errorf("必填配置项 providers[%d].api_key 缺失——凭证一律写 ${VAR} 占位", i)
+		}
+	}
+	return nil
+}
+
+// validateAdminAuth 校验 `http.admin_auth` 段的配置形状（约束 1 / 2 / 4 / 5）。
+// validateAdminAuth checks the shape of the management-auth section.
+//
+// 段整体缺失合法：chat / tool / session 等命令不开放 HTTP 管理面（注 12），
+// `serve` 的"mode 必填"由监听器创建后的 web.ValidateAdminAuth 判定——那里同时
+// 拥有真实监听地址，能判"非回环监听必须显式列出 allowed_hosts"与 `local_trust`
+// 只能用于全回环监听。
+// An absent section is legal here; serve's presence requirement and the
+// listener-dependent rules live in web.ValidateAdminAuth.
+//
+// 但只要写了段里任何一键而 mode 为空，就在装载期拒绝：半截认证配置是最危险的
+// 形态——文件里"看着配过"，实际没有模式，任何"缺省放行"的解读都会让管理面裸奔。
+// A section carrying any key without a mode is refused: a half-written auth
+// configuration must never be read as "some default mode".
+func validateAdminAuth(auth AdminAuthConfig) error {
+	if auth.Mode == "" {
+		if auth.Token != "" || len(auth.AllowedHosts) > 0 || len(auth.AllowedOrigins) > 0 ||
+			len(auth.TrustedProxies) > 0 {
+			return fmt.Errorf(
+				"必填配置项 http.admin_auth.mode 缺失——一旦配置管理认证段就必须显式给出 mode（token / local_trust），不得留空")
+		}
+		return nil
+	}
+	if !validAdminAuthModes[auth.Mode] {
+		return fmt.Errorf(
+			"配置项 http.admin_auth.mode 取值非法（%s）——只允许 token / local_trust", auth.Mode)
+	}
+	if auth.Mode == "token" && auth.Token == "" {
+		// 明文 token 在 resolveTree / resolveString 已拒绝；这里拦的是"整个键没写"——
+		// 键不存在时凭证路径根本不会被走到，只能在此补判。
+		// Plaintext is rejected upstream; this catches the key being absent entirely.
+		return fmt.Errorf(
+			"必填配置项 http.admin_auth.token 缺失——token 模式必须提供 ${VAR} 占位并经环境变量注入")
+	}
+	if err := validateAdminAllowedHosts(auth.AllowedHosts); err != nil {
+		return err
+	}
+	if err := validateAdminAllowedOrigins(auth.AllowedOrigins); err != nil {
+		return err
+	}
+	return validateAdminTrustedProxies(auth.TrustedProxies)
+}
+
+// validateAdminAllowedHosts 逐项校验 Host 白名单的**形状**：不得通配、不得带
+// scheme / 路径 / 查询、必须含 1–65535 的数字端口（IPv6 用 [::1]:8080）。
+// validateAdminAllowedHosts checks each allowed-host entry: no wildcard, no scheme
+// or path, and a numeric port is mandatory.
+//
+// 为什么省略端口也拒绝：Host 比较要求"端口必须一致"（约束 4）——没有端口的条目
+// 永远匹配不上任何带端口的 Host，却会让运维误以为"已经列进去了"。
+// A port-less entry can never match a Host carrying a port, yet reads like it does.
+func validateAdminAllowedHosts(hosts []string) error {
+	for i, entry := range hosts {
+		// 文案按**下标**定位，不回显条目原文：host 段可能被人写成 `user:token@host:port`
+		// 这类带 userinfo 的形态，回显等于把其中的凭证带进 stdout / 日志。
+		// Messages point at the index rather than echoing the entry, because a
+		// malformed entry can carry userinfo that must not reach stdout or logs.
+		position := i + 1
+		if entry == "*" {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_hosts 第 %d 项不得使用通配符 *——必须逐项列出 host:port", position)
+		}
+		if strings.Contains(entry, "@") {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_hosts 第 %d 项不得包含 userinfo（@）——只写 host:port", position)
+		}
+		if strings.Contains(entry, "://") || strings.ContainsAny(entry, "/?#") {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_hosts 第 %d 项非法——只写 host:port（不带 scheme、路径或查询）", position)
+		}
+		host, port, err := net.SplitHostPort(entry)
+		if err != nil || host == "" || port == "" {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_hosts 第 %d 项缺端口——必须写成 host:port（IPv6 写成 [::1]:8080）", position)
+		}
+		if n, convErr := strconv.Atoi(port); convErr != nil || n < 1 || n > 65535 {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_hosts 第 %d 项的端口非法——必须是 1-65535 的整数", position)
+		}
+	}
+	return nil
+}
+
+// validateAdminAllowedOrigins 校验浏览器 Origin 白名单：每项 `scheme://host[:port]`，
+// 无路径 / 查询 / userinfo / 通配符；字面量 `null` 同样拒绝（约束 5）。
+// validateAdminAllowedOrigins requires each entry to be exactly
+// scheme://host[:port]; the literal `null` is refused as well.
+//
+// 完整匹配是比对面唯一的语义：带尾斜杠或路径的条目永远匹配不上浏览器发来的
+// Origin（Origin 只到端口），放行它等于给运维一个不会生效的"白名单"。
+// A trailing slash or path can never match a browser Origin, so accepting such an
+// entry would only create the illusion of an allowlist.
+func validateAdminAllowedOrigins(origins []string) error {
+	for i, entry := range origins {
+		// 同 Host 白名单：按**下标**定位，不回显原文——Origin 语法允许 userinfo，
+		// 而 userinfo 里可能正是凭证。
+		// Index-based messages for the same reason: Origin syntax admits userinfo.
+		position := i + 1
+		if strings.Contains(entry, "*") {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_origins 第 %d 项不得使用通配符——Origin 必须完整列出", position)
+		}
+		if strings.Contains(entry, "@") {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_origins 第 %d 项不得包含 userinfo（@）——只写 scheme://host[:port]", position)
+		}
+		parsed, err := url.Parse(entry)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+			parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery ||
+			parsed.Fragment != "" || strings.Contains(entry, "#") {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.allowed_origins 第 %d 项非法——必须写成 scheme://host[:port]（无路径、查询、userinfo 或通配）", position)
+		}
+	}
+	return nil
+}
+
+// validateAdminTrustedProxies 校验可信代理网段：每项必须是可解析的 CIDR（约束 6）。
+// validateAdminTrustedProxies requires every entry to parse as a CIDR.
+//
+// 裸 IP 也拒绝：解析失败的可信代理如果被当成"整段放行"或"忽略"，前者扩大信任面、
+// 后者让来源归因静默退化——两种失败都没人会发现。
+// A bare IP is refused too: silently widening or silently ignoring a bad proxy entry
+// both fail invisibly.
+func validateAdminTrustedProxies(proxies []string) error {
+	for _, entry := range proxies {
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			return fmt.Errorf(
+				"配置项 http.admin_auth.trusted_proxies 条目 %q 不是合法 CIDR——写成 10.0.0.0/8 或 127.0.0.1/32 这样的网段", entry)
 		}
 	}
 	return nil

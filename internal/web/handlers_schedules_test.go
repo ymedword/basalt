@@ -688,3 +688,69 @@ func TestSchedules_RunArchived400(t *testing.T) {
 	require.Equal(t, "会话已归档，不可追加消息", env.Message, "冻结文案逐字取自约束 43")
 	require.Nil(t, env.Data)
 }
+
+// TestAuth_ScheduleEndpoints 覆盖调度四端点的认证与 409 映射（任务 T024 的 +3）：
+// 无凭据一律 401 且零端口调用、有效凭据放行、RunNow 返回生命周期不可用 → 409
+// `AGENT_UNAVAILABLE`（与 messages / invoke 同一张错误映射表）。
+// 逆改点：只给部分调度端点挂闸门 / 把 AGENT_UNAVAILABLE 落回 500 → 对应子例红。
+// 中文用例名：调度端点需认证。
+func TestAuth_ScheduleEndpoints(t *testing.T) {
+	endpoints := []struct{ method, path, body string }{
+		{http.MethodGet, "/api/v1/schedules", ""},
+		{http.MethodPut, "/api/v1/schedules/demo-1", `{"enabled":true}`},
+		{http.MethodGet, "/api/v1/schedules/demo-1/executions", ""},
+		{http.MethodPost, "/api/v1/schedules/demo-1/run", ""},
+	}
+
+	t.Run("missing credentials are rejected on all four endpoints", func(t *testing.T) {
+		svc := &fakeScheduleService{}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Schedules = svc
+		})
+		for _, tc := range endpoints {
+			rec := serveAdmin(s, adminRequest(tc.method, tc.path, tc.body))
+			require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s", tc.method, tc.path)
+			require.Equal(t, codeUnauthorized, decodeScheduleEnvelope(t, rec).Code)
+		}
+		require.Zero(t, svc.listCallCount(), "未认证请求不得触达调度器")
+		require.Empty(t, svc.setSnapshot(), "未认证请求不得改启停")
+		require.Zero(t, svc.runCallCount(), "未认证请求不得触发补跑")
+	})
+
+	t.Run("valid credentials reach every schedule handler", func(t *testing.T) {
+		svc := &fakeScheduleService{
+			runRes: core.RunResult{RunID: "run-1", Status: core.StatusCompleted},
+		}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Schedules = svc
+		})
+		for _, tc := range endpoints {
+			rec := serveAdmin(s, withBearer(adminRequest(tc.method, tc.path, tc.body), testToken))
+			require.Equal(t, http.StatusOK, rec.Code, "%s %s; body=%s",
+				tc.method, tc.path, rec.Body.String())
+		}
+		require.Equal(t, 1, svc.listCallCount())
+		require.Len(t, svc.setSnapshot(), 1)
+		require.Equal(t, 1, svc.runCallCount())
+	})
+
+	t.Run("lifecycle refusal on run-now maps to 409", func(t *testing.T) {
+		svc := &fakeScheduleService{runErr: &core.AgentUnavailableError{
+			Name:   "ops-agent",
+			State:  core.AgentDisabled,
+			Reason: "lifecycle state disabled; enable the agent first",
+		}}
+		s := newTestServer(t, func(o *Options) {
+			o.AdminAuth = testAdminAuth(testToken)
+			o.Schedules = svc
+		})
+		rec := serveAdmin(s,
+			withBearer(adminRequest(http.MethodPost, "/api/v1/schedules/demo-1/run", ""), testToken))
+		require.Equal(t, http.StatusConflict, rec.Code)
+		env := decodeScheduleEnvelope(t, rec)
+		require.Equal(t, codeAgentUnavailable, env.Code)
+		require.Contains(t, env.Message, "ops-agent")
+	})
+}

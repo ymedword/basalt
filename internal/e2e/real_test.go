@@ -160,10 +160,15 @@ func newRealHarness(t *testing.T, llm realLLM) *harness {
 	return h
 }
 
-// realEnv 返回调用真实 provider 所需的环境：只有 key，值在子进程环境内解析。
-// realEnv returns the child environment: the API key only.
+// realEnv 返回调用真实 provider 所需的环境：真实 key 与管理面 token（serve 场景
+// 需要后者；token 值是夹具哨兵，不是真实凭证）。
+// realEnv returns the child environment: the real API key plus the management token
+// the serve scenarios need.
 func realEnv(llm realLLM) []string {
-	return []string{realLLMAPIKeyEnv + "=" + llm.APIKey}
+	return []string{
+		realLLMAPIKeyEnv + "=" + llm.APIKey,
+		e2eAdminTokenEnv + "=" + e2eAdminToken,
+	}
 }
 
 // realConfig 组装临时 basalt.yaml：provider `real` 指向运行时给出的端点，`api_key` 只写
@@ -177,13 +182,15 @@ func realConfig(llm realLLM, extra string) string {
 		"    default_model: \"" + llm.Model + "\"\n" + extra
 }
 
-// realHTTPBlock 组装 http 段：addr 与 allowed_domains 都可省略（空段返回空串）。
-// realHTTPBlock renders the http section; both fields are optional.
+// realHTTPBlock 组装 http 段：addr 与 allowed_domains 都可省略（空段返回空串）；
+// 有段时必带管理认证（T025 起 serve 没有它拒绝启动）。
+// realHTTPBlock renders the http section; when non-empty it always carries the
+// management-auth block serve requires since T025.
 func realHTTPBlock(addr string, domains []string) string {
 	if addr == "" && len(domains) == 0 {
 		return ""
 	}
-	out := "http:\n"
+	out := "http:\n" + adminAuthSection()
 	if addr != "" {
 		out += "  addr: " + addr + "\n"
 	}

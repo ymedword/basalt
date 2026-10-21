@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -476,8 +477,11 @@ func (h *harness) writeConfig(t *testing.T, body string) {
 }
 
 // writeAgent 落一份 AGENT.md：frontmatter 原样放进两条 `---` 之间，正文追加在后。
+// 同时写一份 active 的生命周期状态文件——US-11（D-01 A）之后既有 Agent 基线一律为
+// disabled，夹具必须先给出"运维已启用"的初始态，本套件才能继续判它原本要判的进程行为。
 // writeAgent writes one AGENT.md: the frontmatter verbatim between the `---` fences,
-// then the prompt body.
+// then the prompt body. It also seeds an active lifecycle state file, since US-11 baselines
+// every pre-existing agent to disabled.
 func (h *harness) writeAgent(t *testing.T, name, frontmatter, body string) {
 	t.Helper()
 	dir := filepath.Join(h.Root, ".basalt", "agents", name)
@@ -487,6 +491,57 @@ func (h *harness) writeAgent(t *testing.T, name, frontmatter, body string) {
 	content := "---\n" + strings.TrimRight(frontmatter, "\n") + "\n---\n\n" + strings.TrimRight(body, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644); err != nil {
 		t.Fatalf("写 AGENT.md %s 失败: %v", name, err)
+	}
+	h.writeActiveLifecycleState(t, name)
+}
+
+// lifecycleStateFile 是状态文件的**契约形态**（agents 契约 §2.2）：字段顺序即编码顺序。
+// The on-disk state file shape, declared in contract order.
+type lifecycleStateFile struct {
+	SchemaVersion int    `json:"schema_version"`
+	Agent         string `json:"agent"`
+	State         string `json:"state"`
+	Generation    int64  `json:"generation"`
+	UpdatedAt     int64  `json:"updated_at"`
+	OperationID   string `json:"operation_id"`
+	Checksum      string `json:"checksum"`
+}
+
+// writeActiveLifecycleState 按契约字面量写 `.basalt/control/agents/<name>.json`：紧凑
+// JSON、固定字段顺序、checksum = "sha256:" + 十六进制（对 checksum 置空后的整份字节取
+// sha256）。夹具直接按契约生成字节——本套件只测真实二进制，不 import internal 包来造状态。
+// The fixture speaks the contract's on-disk bytes literally: compact JSON in fixed field
+// order with the documented checksum, generated without importing internal packages.
+func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
+	t.Helper()
+
+	now := time.Now()
+	record := lifecycleStateFile{
+		SchemaVersion: 1,
+		Agent:         name,
+		State:         "active",
+		// 代数 2 = "基线写入（1）之后的一次启用"，与真实启停路径留下的形态一致。
+		Generation:  2,
+		UpdatedAt:   now.UnixMilli(),
+		OperationID: fmt.Sprintf("op-e2e-%s-%d", name, now.UnixNano()),
+	}
+	unsigned, err := json.Marshal(record) // checksum 为空串，正与被哈希的形态一致
+	if err != nil {
+		t.Fatalf("编码生命周期状态 %s 失败: %v", name, err)
+	}
+	sum := sha256.Sum256(unsigned)
+	record.Checksum = "sha256:" + hex.EncodeToString(sum[:])
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("编码生命周期状态 %s 失败: %v", name, err)
+	}
+
+	dir := filepath.Join(h.Root, ".basalt", "control", "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("建生命周期控制目录 %s 失败: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name+".json"), raw, 0o644); err != nil {
+		t.Fatalf("写生命周期状态 %s 失败: %v", name, err)
 	}
 }
 

@@ -14,6 +14,19 @@ type Action struct {
 	Type   ActionType // 判据维度
 	Target string     // 判据主体：文件路径 / 可执行名 / URL（按 Type 解释）
 	Agent  string     // 发起动作的 Agent 名；空 = 无 Agent 上下文（CLI 顶层调用，不是异常）
+	// SkillDirs 是本次 Run 准入绑定的技能发布目录（`storage_path` 字面量，如
+	// `.basalt/versions/skills/<name>/<no>`）。文件工具只对这些目录**只读放行**；
+	// 空 = 无绑定，版本树一律拒（人工 review ② F1：放行以"当前 Run 绑定的版本"为界，
+	// **不得**放开整棵 `.basalt/versions/`）。
+	// SkillDirs lists the skill version directories bound to this run; only they are
+	// readable, and an empty list refuses the whole version tree.
+	SkillDirs []string
+	// RunBound 标明该动作来自一次 Run（从 `ToolEnv.RunBound` 显式透传，**不得**推断）。
+	// 读档据此拒绝技能工作副本（`.basalt/skills`）：Run 只读准入时固定的发布版本；
+	// 非 Run 调用保留既有规则（F-04 B1）。写档不受影响——工作副本本来整目录只读。
+	// RunBound marks actions issued by a run; reads of skill work copies are refused for
+	// them even when no skill is bound. Non-run callers keep the existing rules.
+	RunBound bool
 }
 
 // ActionType 是四类动作的字面量集合（**动作类型不含命令行参数**）。

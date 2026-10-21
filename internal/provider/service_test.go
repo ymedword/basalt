@@ -152,6 +152,38 @@ func TestProviderService_RoutesByExplicitMap(t *testing.T) {
 	require.Equal(t, "m-beta", fx.lastRow(t).Model, "缺省模型同样按表取——不跨供应商借用")
 }
 
+// TestProviderService_PinnedKeepsOneRouteAndTheAuditStore（人工 review ② 缺陷 2）：准入固定
+// 视图只认自己那一条路由；别的名字在预写之前拒绝（零审计行）；自己的名字照常预写 + 回填
+// （审计仓储共用，不是换了一本账）；表里没有的名字不发放视图。
+// The pinned view keeps exactly one route and shares the audit store.
+func TestProviderService_PinnedKeepsOneRouteAndTheAuditStore(t *testing.T) {
+	ctx := context.Background()
+	fx := openTempDB(t)
+	pinnedFake := testutil.NewFakeProvider(testutil.FakeStep{Response: core.ChatResponse{Content: "pinned"}})
+	other := testutil.NewFakeProvider(testutil.FakeStep{Response: core.ChatResponse{Content: "other"}})
+	svc := testService(map[string]core.ProviderClient{"alpha": pinnedFake, "beta": other},
+		map[string]string{"alpha": "m-alpha", "beta": "m-beta"}, fx.repo, nil)
+
+	pinned, ok := svc.Pinned("alpha")
+	require.True(t, ok)
+
+	_, err := pinned.Chat(ctx, core.ChatRequest{Provider: "beta", RunID: "run-1", Round: 1})
+	require.ErrorIs(t, err, core.ErrProviderNotConfigured, "固定视图只认准入固定的那一条")
+	require.Zero(t, other.CallCount(), "固定视图不得把调用发给别的供应商")
+	require.Zero(t, fx.countRows(t, `SELECT count(*) FROM llm_calls`), "拒绝发生在预写之前")
+
+	resp, err := pinned.Chat(ctx, core.ChatRequest{Provider: "alpha", RunID: "run-2", Round: 1})
+	require.NoError(t, err)
+	require.Equal(t, "pinned", resp.Content)
+	row := fx.lastRow(t)
+	require.Equal(t, "m-alpha", row.Model, "缺省模型按固定视图自己的那一条取")
+	require.Equal(t, core.LLMCallSuccess, row.Status, "固定视图写的是同一本审计账")
+	require.Equal(t, 1, fx.countRows(t, `SELECT count(*) FROM llm_calls`))
+
+	_, ok = svc.Pinned("ghost")
+	require.False(t, ok, "表里没有的名字不得发放固定视图")
+}
+
 // TestProviderService_UnknownProviderRejectedWithoutAuditRow —— 「无行 = 确定没执行」。
 // 查表不中 → 点名错误、**零调用**、**零审计行**；日志轨收到 WARN（FR-013：路由失败记日志）。
 func TestProviderService_UnknownProviderRejectedWithoutAuditRow(t *testing.T) {

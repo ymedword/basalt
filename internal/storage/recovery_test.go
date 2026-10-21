@@ -664,3 +664,128 @@ func TestRecovery_RepairsGroupsWithUnknownRun(t *testing.T) {
 	require.Contains(t, log, "session_id=s-orphan", "WARN 点名该会话")
 	require.Contains(t, log, "session_id=s-ghost")
 }
+
+// ---- 运行资源账（约束 19 的恢复面） -----------------------------------------
+
+// TestRecovery_ClosesRunningRunsAndReleasesRefs —— 崩溃收尾与引用释放必须同事务：
+// 正常路径一起提交（Run 终态 + 引用已释放）；释放失败时一起回滚（Run 保持 running，
+// 等下次启动重扫），不得留下"Run 已 failed、版本却仍被引用"的中间态。
+// TestRecovery_ClosesRunningRunsAndReleasesRefs pins the crash closure and the reference
+// release to one transaction, in both the success and the failure path.
+func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("closes_and_releases", func(t *testing.T) {
+		db := openTempDB(t)
+		fx := seedRunManifest(t, db)
+		rec := startRow("web")
+		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+
+		report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
+		require.NoError(t, err)
+		require.Equal(t, 1, report.ClosedRuns)
+
+		row := readRunRow(t, db, rec.RunID)
+		require.Equal(t, string(core.StatusFailed), row.Status)
+		require.Equal(t, recoveryCloseReason, row.Reason.String)
+		require.Equal(t, fixedNow.UnixMilli(), row.FinishedAt.Int64)
+
+		refs := readRunRefRows(t, db, rec.RunID)
+		require.Len(t, refs, 4)
+		for _, ref := range refs {
+			require.True(t, ref.ReleasedAt.Valid,
+				"崩溃收尾必须同事务释放引用（%s/%s）", ref.Kind, ref.ResourceID)
+			require.Equal(t, fixedNow.UnixMilli(), ref.ReleasedAt.Int64)
+		}
+	})
+
+	t.Run("release_failure_keeps_run_running", func(t *testing.T) {
+		db := openTempDB(t)
+		fx := seedRunManifest(t, db)
+		rec := startRow("web")
+		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+
+		_, err := db.write.ExecContext(ctx, `CREATE TRIGGER recovery_block_release
+		    BEFORE UPDATE ON run_resource_refs
+		    BEGIN SELECT RAISE(ABORT, '注入的引用释放失败'); END`)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, err := db.write.ExecContext(context.Background(),
+				`DROP TRIGGER IF EXISTS recovery_block_release`)
+			require.NoError(t, err)
+		})
+
+		report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
+		require.Error(t, err, "释放失败必须如实上抛（启动方据此决定要不要开跑）")
+		require.Contains(t, err.Error(), rec.RunID)
+		require.Zero(t, report.ClosedRuns)
+
+		require.Equal(t, string(core.StatusRunning), loadRunStatus(t, db.write, rec.RunID),
+			"释放失败 → 整个收尾事务回滚，Run 保持 running 等下次重扫")
+		for _, ref := range readRunRefRows(t, db, rec.RunID) {
+			require.False(t, ref.ReleasedAt.Valid,
+				"回滚后引用仍未释放：%s/%s", ref.Kind, ref.ResourceID)
+		}
+	})
+}
+
+// TestRecovery_BackfillsTerminalRunResidualRefs —— 已终态 Run 的残留引用由启动恢复补齐
+// （约束 19 末句）：④ 的扫描面看不到它们，step ⑤ 的幂等语句按"Run 已终态"补齐，
+// 且**不改**已判定的状态、原因与终态时刻。
+// TestRecovery_BackfillsTerminalRunResidualRefs releases residual references of runs that
+// are already terminal, without re-judging their state.
+func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	fx := seedRunManifest(t, db)
+	rec := startRow("web")
+	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+
+	// 模拟"终态已写、释放没跑到"的残留：直接改状态列，不走 FinishRun（它会连带释放）。
+	settled := fixedStart.Add(10 * time.Minute)
+	_, err := db.write.ExecContext(ctx,
+		`UPDATE runs SET status = ?, reason = ?, finished_at = ? WHERE run_id = ?`,
+		string(core.StatusCompleted), "人工修库留下的终态", settled.UnixMilli(), rec.RunID)
+	require.NoError(t, err)
+
+	report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
+	require.NoError(t, err)
+	require.Zero(t, report.ClosedRuns, "已终态的 Run 不在收尾扫描面里")
+
+	row := readRunRow(t, db, rec.RunID)
+	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得被恢复改口")
+	require.Equal(t, "人工修库留下的终态", row.Reason.String)
+	require.Equal(t, settled.UnixMilli(), row.FinishedAt.Int64)
+
+	refs := readRunRefRows(t, db, rec.RunID)
+	require.Len(t, refs, 4)
+	for _, ref := range refs {
+		require.True(t, ref.ReleasedAt.Valid,
+			"终态 Run 的残留引用必须被补齐释放（%s/%s）", ref.Kind, ref.ResourceID)
+		require.Equal(t, fixedNow.UnixMilli(), ref.ReleasedAt.Int64)
+	}
+}
+
+// TestRecovery_DoesNotFabricateResourceLedger —— 恢复收尾历史运行（本能力之前产生的、
+// 没有清单的账本）时**不得补造**资源账：清单与引用一行为零，Run 照常收尾。
+// 补造的账会被读成事实，比"未记录"更糟（约束 24）。
+// TestRecovery_DoesNotFabricateResourceLedger closes legacy runs without inventing a
+// manifest or references for them.
+func TestRecovery_DoesNotFabricateResourceLedger(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	seedRun(t, db.write, "run-legacy", "running")
+
+	report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.ClosedRuns)
+	require.Equal(t, string(core.StatusFailed), loadRunStatus(t, db.write, "run-legacy"))
+
+	var manifests, refs int
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_manifests WHERE run_id = ?`, "run-legacy").Scan(&manifests))
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM run_resource_refs WHERE run_id = ?`, "run-legacy").Scan(&refs))
+	require.Zero(t, manifests, "恢复不得为历史运行补造清单")
+	require.Zero(t, refs, "恢复不得为历史运行补造引用")
+}

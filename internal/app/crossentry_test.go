@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/assets"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/tool"
@@ -147,12 +148,15 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 	}
 	require.NotEmpty(t, env.taskID, "夹具必须有至少一条调度定义")
 
+	// 账本只建一次：AgentService 写、web 适配器读（与生产装配同一条纪律）。
+	// One store instance: AgentService writes, the web adapter reads.
+	runs := storage.NewRunStore(db)
 	env.svc = core.NewAgentService(core.ServiceOptions{
-		Agents:        newAgentSource(root, entries, logger),
+		Agents:        newAgentRegistry(root, entries, logger),
 		Client:        providerClientFunc(env.chat),
 		Messages:      sessions,
 		Sessions:      sessions,
-		Runs:          storage.NewRunStore(db),
+		Runs:          runs,
 		Snapshots:     storage.NewSnapshotStore(db),
 		Audit:         invocations,
 		Loop:          loop,
@@ -182,12 +186,13 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 		RunBudget:     core.Budget{MaxIterations: 2, MaxToolCalls: 2, ContextTokens: 4096},
 		ShutdownGrace: 5 * time.Second,
 		Logger:        logger,
-		Runs:          env.svc,
+		Runs:          NewRunService(env.svc, runs),
 		Sessions:      sessions,
 		Agents:        agentProfilesPort{entries: entries},
 		Tools:         newToolCatalogPort(registry, nil),
 		Memory:        emptyMemorySections{},
 		Schedules:     env.sched,
+		Console:       assets.Console(),
 	})
 	require.NoError(t, err)
 	env.baseURL = "http://" + ln.Addr().String()

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -32,25 +33,75 @@ type MessageStore interface {
 	// UpsertSession inserts or refreshes the session row.
 	UpsertSession(ctx context.Context, rec SessionRecord) error
 
-	// ListSessions 列出会话（`session list` 只读命令的数据源；排序口径由实现固定）。
-	// ListSessions lists sessions for the read-only `session list` command.
-	ListSessions(ctx context.Context) ([]SessionRecord, error)
+	// ListSessions 列出会话（`session list` 与 `GET /sessions` 的共用读面；排序口径由
+	// 实现固定）。空过滤器 = 既有全量口径——命令面走的就是这一支。
+	// ListSessions lists sessions; an empty filter keeps the command surface's
+	// unfiltered behaviour, and ordering stays fixed by the implementation.
+	ListSessions(ctx context.Context, filter SessionFilter) ([]SessionRecord, error)
 }
 
-// RunStore 是运行账本的写接口。**不接受 finalText 参数**——最终回答只存在
+// ErrRunNotFound 表示按标识查不到账本行——web 映射 404（约束 21 / §3.1.18），
+// 恢复路径不得把它当成"已收尾"。
+// ErrRunNotFound means no ledger row exists for the id; the web layer maps it to 404.
+var ErrRunNotFound = errors.New("run not found")
+
+// RunFilter 是运行列表的三个过滤参数（约束 21）：只有会话 / Agent / 状态三个过滤，
+// 排序与窗口由仓储固定——**不得**随请求派生 ORDER BY 或任意分页参数。
+// RunFilter carries exactly the three allowed list filters; ordering and window are fixed
+// by the repository and never derived from the request.
+type RunFilter struct {
+	SessionID string
+	Agent     string
+	Status    string
+	Limit     int
+}
+
+// RunDetail 是运行行的读侧投影：账本起始行 + 终态列 + 资源清单摘要。
+// `FinalText` **不是**账本列（`runs` 表没有它，约束 22）：由该 Run 最近一条 assistant
+// 消息派生；`ResourceManifest` 只在详情读取时填充，列表只带 `ManifestHash`。
+// RunDetail is the read-side projection of one run: the starting row plus terminal columns.
+// FinalText derives from the latest assistant message, never from a column; the full
+// manifest is filled on detail reads only, while lists carry just its hash.
+type RunDetail struct {
+	RunRecord
+	Status           RunStatus
+	Reason           string
+	Iterations       int
+	ToolCalls        int
+	FinalText        string
+	ManifestHash     string
+	FinishedAt       time.Time
+	ResourceManifest *RunResourceManifest
+}
+
+// RunStore 是运行账本的读写接口。**不接受 finalText 参数**——最终回答只存在
 // RunResult 与会话的 assistant 消息里（§3.4：`runs` 表无 `final_text` 列）。
-// RunStore is the write interface of the run ledger. FinishRun takes no finalText:
+// RunStore is the read/write interface of the run ledger. FinishRun takes no finalText:
 // the final answer lives in RunResult and the assistant message only.
 type RunStore interface {
-	// StartRun 建 `status=running` 的账本行（`trigger` 由 Channel 按契约 §5 映射）。
-	// StartRun inserts the running ledger row; the trigger derives from Channel (contract §5).
-	StartRun(ctx context.Context, rec RunRecord) error
+	// StartRun 建 `status=running` 的账本行（`trigger` 由 Channel 按契约 §5 映射），并在
+	// 同一事务内写入准入清单与全部资源引用；任一失败整笔回滚（约束 18）。
+	// `manifest.FormatVersion == 0` 表示装配尚未接线：只写运行行、**不伪造**清单——这类
+	// 运行在读取面如实呈现为"未记录"（legacy_unrecorded），不得补造。
+	// StartRun inserts the running row and, in the same transaction, the admission manifest
+	// and its resource refs. A zero manifest writes only the row — recorded as unrecorded,
+	// never fabricated.
+	StartRun(ctx context.Context, rec RunRecord, manifest RunResourceManifest) error
 
 	// FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at）。
 	// 写失败**不得**覆盖已得结果：调用方如实返回 RunResult，行留给下次启动的恢复扫描收尾。
 	// FinishRun writes the terminal state onto the same row. A write failure must not
 	// overwrite an obtained result: the caller returns it as-is and recovery closes the row.
 	FinishRun(ctx context.Context, runID string, status RunStatus, reason string, iterations, toolCalls int, now time.Time) error
+
+	// GetRun 取单条运行详情（含准入清单）；不存在返回 ErrRunNotFound。
+	// GetRun returns one run detail including its admission manifest, or ErrRunNotFound.
+	GetRun(ctx context.Context, runID string) (RunDetail, error)
+
+	// ListRuns 按固定排序（started_at DESC, run_id DESC）与固定窗口返回运行列表。
+	// 列表只带清单哈希、不带完整清单——与 openapi 的 RunView 一致（详情才含清单）。
+	// ListRuns returns runs in the fixed order and window, carrying only the manifest hash.
+	ListRuns(ctx context.Context, filter RunFilter) ([]RunDetail, error)
 }
 
 // ToolInvocationStore 是工具审计的两阶段写接口（契约 §7.2，fail-closed）：
@@ -172,10 +223,21 @@ type SessionRecord struct {
 	MessageCount int
 	CreatedAt    time.Time
 	LastActiveAt time.Time
-	// Status 是会话状态（active | archived）；ListSessions 不填，保持零值。
+	// Status 是会话状态（active | archived）；GetSession 读 `status` 列，
+	// ListSessions 按 `archived_at` 是否为空派生（契约 SessionSummary 的口径）。
 	Status string
 	// ArchivedAt 是可空归档时间；仅 GetSession / ArchiveSession 填充。
 	ArchivedAt *time.Time
+}
+
+// SessionFilter 是会话列表的过滤条件（模块卡 §3.1.26 / 约束 21）：只有 `agent` 与
+// `status` 两维，空字段 = 该维不过滤。`Status` 取 `active` / `archived`——**不是**
+// 任意字符串：调用方（HTTP 层）先校验取值，非法值不得落到 SQL。
+// SessionFilter narrows the session list by agent and status only; an empty field
+// filters nothing, and Status must be one of the two fixed literals.
+type SessionFilter struct {
+	Agent  string // 画像名（sessions.profile_name 精确匹配）
+	Status string // active | archived
 }
 
 // RunRecord 是运行账本的**起始行载体**：只含开跑前可知的字段。

@@ -100,6 +100,8 @@ func Recover(ctx context.Context, db *sql.DB, logger *slog.Logger, now time.Time
 	// ④ 另扫 runs：仍为 running 且**不在** ③ 里的行，同样收尾。这一类包含"一条消息都没写就
 	// 崩在首次模型响应上""最终回答已落库但终态没写""无状态 invoke"——它们的共同点是：
 	// 消息侧看不出任何异常，只有账本知道上次没跑完。
+	// 每个 Run 一个短事务：收尾与资源引用释放一起提交（约束 19）——分开写会留下
+	// "Run 已终态、版本却仍被引用"的中间态。
 	runningIDs, err := listRunningRunIDs(ctx, db)
 	if err != nil {
 		return report, errors.Join(append(errs, err)...)
@@ -108,7 +110,7 @@ func Recover(ctx context.Context, db *sql.DB, logger *slog.Logger, now time.Time
 		if _, done := handled[runID]; done {
 			continue
 		}
-		closed, err := closeRunningRun(ctx, db, runID, now)
+		closed, err := closeRunInTransaction(ctx, db, runID, now)
 		if err != nil {
 			errs = append(errs, err)
 			logger.Error("崩溃恢复：运行收尾失败（该 Run 保持 running，下次启动重扫）",
@@ -118,6 +120,14 @@ func Recover(ctx context.Context, db *sql.DB, logger *slog.Logger, now time.Time
 		if closed {
 			report.ClosedRuns++
 		}
+	}
+
+	// ⑤ 终态 Run 的残留引用补齐（约束 19 末句 / 契约 DDL 注释）：它们早已不是 running，
+	// ④ 的扫描面看不到；一条幂等语句按"Run 已终态"补齐。正常路径（FinishRun / ③ / ④）
+	// 都是同事务释放，这一步只兜版本间残留与人工修库留下的行——**不**补造任何历史。
+	if err := releaseTerminalRefs(ctx, db, now); err != nil {
+		errs = append(errs, err)
+		logger.Error("崩溃恢复：终态运行的残留资源引用补齐失败", "error", err)
 	}
 
 	// ⑥ 启动摘要。三键与返回值里的三个读数**同源**（一处算、两处读），日志与报告的差异
@@ -365,7 +375,7 @@ func repairRunGroups(ctx context.Context, db *sql.DB, logger *slog.Logger, runID
 			repairedGroups++
 		}
 
-		closedNow, err := closeRunningRun(ctx, conn, runID, now)
+		closedNow, err := closeAndReleaseRun(ctx, conn, runID, now)
 		if err != nil {
 			return err
 		}
@@ -407,12 +417,32 @@ func recoveryReasonFor(status string) string {
 	}
 }
 
-// closeRunningRun 把**指定的、仍为 `running`** 的行收尾为 `failed`（步骤 ③④）。
-// 与 `RunStore.closeRunning` 同判据、**不同收尾面**：那条是全表（恢复后不再有 per-Run 事务
-// 需求），本条钉在单个 run_id 上——步骤 ③ 要求"运行收尾不出这个事务"。两条的守卫都是
-// `status = 'running'`：已结束的行**不得**被覆盖，幂等靠它。
-// Same guard as RunStore.closeRunning on a narrower scope, so step ③ can close a run inside
-// the group-repair transaction.
+// closeAndReleaseRun 收尾**指定的、仍为 `running`** 的行，并在**同一事务**释放它的资源
+// 引用（步骤 ③④，约束 19 / 注 8）。两个动作必须一起提交：只关不加锁引用会让版本永远
+// 显示"被引用"，只释放不关行则是把 Running 的账静默变成"没有引用"。
+// 已终态的行不会被覆盖（`status = 'running'` 守卫），但它的残留引用照样释放——这正是
+// "终态 Run 残留补齐"在单 Run 面上的落点；行根本不存在时释放是 0 行 no-op。
+// closeAndReleaseRun closes the run and releases its references in the caller's
+// transaction; an already-terminal row keeps its status but still gets its residual
+// references released.
+//
+// `ex` 收执行面而非库句柄：步骤 ③ 在组修复的短事务里调用，步骤 ④ 由
+// closeRunInTransaction 开事务；两步的事务边界都在调用方，本函数不自开事务。
+func closeAndReleaseRun(ctx context.Context, ex sqlExecutor, runID string, now time.Time) (bool, error) {
+	closed, err := closeRunningRun(ctx, ex, runID, now)
+	if err != nil {
+		return false, err
+	}
+	if _, err := releaseRunRefs(ctx, ex, runID, now); err != nil {
+		return false, err
+	}
+	return closed, nil
+}
+
+// closeRunningRun 把**指定的、仍为 `running`** 的行收尾为 `failed`（步骤 ③④ 的状态转换，
+// 引用释放由 closeAndReleaseRun 在同一事务内追加）。`WHERE status = 'running'` 是这条
+// 语句的全部意义：恢复扫描可能在任何时刻重跑，幂等靠它。
+// closeRunningRun performs the guarded status flip; closeAndReleaseRun adds the release.
 func closeRunningRun(ctx context.Context, ex sqlExecutor, runID string, now time.Time) (bool, error) {
 	res, err := ex.ExecContext(ctx,
 		`UPDATE runs
@@ -427,6 +457,44 @@ func closeRunningRun(ctx context.Context, ex sqlExecutor, runID string, now time
 		return false, fmt.Errorf("确认运行收尾（run_id=%s）: %w", runID, err)
 	}
 	return affected > 0, nil
+}
+
+// closeRunInTransaction 为步骤 ④ 的单个 Run 开一个短事务，把收尾与引用释放一起提交
+// （约束 19）。步骤 ③ 已在组修复事务里，不能重复开事务——两条路径因此共用
+// closeAndReleaseRun，事务边界各自给。
+// closeRunInTransaction wraps closeAndReleaseRun in one short transaction for step ④;
+// step ③ already sits inside the group-repair transaction.
+func closeRunInTransaction(ctx context.Context, db *sql.DB, runID string, now time.Time) (bool, error) {
+	var closed bool
+	err := withWriteLock(ctx, db, func(ctx context.Context, conn *sql.Conn) error {
+		var err error
+		closed, err = closeAndReleaseRun(ctx, conn, runID, now)
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return closed, nil
+}
+
+// releaseTerminalRefs 补齐**已终态** Run 仍挂着的未释放引用（约束 19 末句）：步骤 ④ 只
+// 扫得到 running 行，而版本间残留 / 人工修库留下的行可能早就不是 running 了。一条语句
+// 按"Run 已终态"收口，幂等；**不**碰 running 行，也**不**补造清单或历史。
+// releaseTerminalRefs releases residual references on already-terminal runs; running rows
+// are untouched and nothing historical is fabricated.
+func releaseTerminalRefs(ctx context.Context, db *sql.DB, now time.Time) error {
+	return withWriteLock(ctx, db, func(ctx context.Context, conn *sql.Conn) error {
+		_, err := conn.ExecContext(ctx,
+			`UPDATE run_resource_refs
+			    SET released_at = ?
+			  WHERE released_at IS NULL
+			    AND run_id IN (SELECT run_id FROM runs WHERE status <> ?)`,
+			now.UnixMilli(), string(core.StatusRunning))
+		if err != nil {
+			return fmt.Errorf("补齐终态运行的残留资源引用: %w", err)
+		}
+		return nil
+	})
 }
 
 // listRunningRunIDs 扫出仍为 `running` 的 run_id（步骤 ④ 的取数面——"组看消息、Run 看表"

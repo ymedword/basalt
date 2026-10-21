@@ -73,14 +73,21 @@ func tableNamesOf(t *testing.T, db *sql.DB) []string {
 	return names
 }
 
-// contractTables 是契约 schema.sql 建齐的 11 张用户表（排序后）。
-// contractTables are the eleven user tables of the contract schema, sorted.
+// contractTables 是契约 schema.sql 建齐的 18 张用户表（v1 十一张 + v2 七张，排序后）。
+// contractTables are the eighteen user tables of the v2 contract schema, sorted.
 var contractTables = []string{
+	"agent_archives",
+	"agent_lifecycle",
 	"config_snapshots",
 	"llm_calls",
+	"management_operations",
 	"memory_entries",
 	"messages",
 	"notify_channels",
+	"resource_pointers",
+	"resource_versions",
+	"run_resource_manifests",
+	"run_resource_refs",
 	"runs",
 	"scheduled_tasks",
 	"schema_version",
@@ -89,7 +96,7 @@ var contractTables = []string{
 	"tool_invocations",
 }
 
-// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 11 表 + 版本行 = target；
+// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 18 表 + 版本行 = target；
 // 建表与版本行同一事务（颗粒度文档 §4.2 映射）。
 func TestMigrate_NewDatabaseCreatesAllTables(t *testing.T) {
 	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
@@ -244,4 +251,75 @@ func TestMigrate_MissingMigrationFileRejected(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "migrations/0002_*.sql", "错误必须点名期望的迁移文件")
 	require.Equal(t, 1, mustVersion(t, db), "缺文件时版本不得前进")
+}
+
+// TestMigrate_NewDatabaseDoesNotRunMigrations：新库只执行全量脚本——迁移目录里的
+// 文件即使损坏也不得被新库路径执行（否则升级文件成了第二份建表源）。
+// A new database runs the full script only; migration files are never executed.
+func TestMigrate_NewDatabaseDoesNotRunMigrations(t *testing.T) {
+	script, err := schemaFS.ReadFile(schemaFileName)
+	require.NoError(t, err)
+	brokenFS := fstest.MapFS{
+		"schema.sql":                 &fstest.MapFile{Data: script},
+		"migrations/0002_broken.sql": &fstest.MapFile{Data: []byte("THIS IS NOT SQL")},
+	}
+	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
+
+	require.NoError(t, Migrate(context.Background(), db, brokenFS, SupportedSchemaVersion))
+	require.Equal(t, SupportedSchemaVersion, mustVersion(t, db))
+	requireV2Tables(t, db)
+}
+
+// TestMigrate_CurrentDatabaseSkipsMigrationFiles：库已是目标版本时无需任何迁移文件
+// （只读打开 / 重复启动不得因为迁移目录缺失而失败）。
+// A current database needs no migration files at all.
+func TestMigrate_CurrentDatabaseSkipsMigrationFiles(t *testing.T) {
+	ctx := context.Background()
+	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
+	require.NoError(t, Migrate(ctx, db, schemaFS, SupportedSchemaVersion))
+
+	script, err := schemaFS.ReadFile(schemaFileName)
+	require.NoError(t, err)
+	noMigrations := fstest.MapFS{"schema.sql": &fstest.MapFile{Data: script}}
+
+	require.NoError(t, Migrate(ctx, db, noMigrations, SupportedSchemaVersion))
+	require.Equal(t, SupportedSchemaVersion, mustVersion(t, db))
+}
+
+// TestMigrate_VersionRowsRecordDescriptions：版本行的 description 指向实际执行的
+// 源——新库是全量脚本名，前向迁移是具体迁移文件名（可审计）。
+// Version rows name the source that was actually executed.
+func TestMigrate_VersionRowsRecordDescriptions(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("new database", func(t *testing.T) {
+		db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
+		require.NoError(t, Migrate(ctx, db, schemaFS, SupportedSchemaVersion))
+
+		var desc string
+		require.NoError(t, db.QueryRow(
+			`SELECT description FROM schema_version WHERE version = ?`, SupportedSchemaVersion).Scan(&desc))
+		require.Equal(t, schemaFileName, desc)
+	})
+
+	t.Run("incremental migration", func(t *testing.T) {
+		db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
+		fsys := v1ToV2FS(t)
+		require.NoError(t, Migrate(ctx, db, fsys, 1))
+		require.NoError(t, Migrate(ctx, db, fsys, 2))
+
+		var desc string
+		require.NoError(t, db.QueryRow(
+			`SELECT description FROM schema_version WHERE version = 2`).Scan(&desc))
+		require.Equal(t, "migrations/0002_us11_us12_resources.sql", desc)
+	})
+}
+
+// TestMigrate_SupportedVersionHasMigrationFile：支持版本与迁移文件名编号对齐——
+// 常量改动而忘记追加迁移文件时在此拦下（契约 v2 基线）。
+// The supported version must have its own migration file.
+func TestMigrate_SupportedVersionHasMigrationFile(t *testing.T) {
+	name, err := migrationFile(schemaFS, SupportedSchemaVersion)
+	require.NoError(t, err)
+	require.Equal(t, "migrations/0002_us11_us12_resources.sql", name)
 }

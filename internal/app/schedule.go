@@ -118,8 +118,14 @@ type scheduleEditorAdapter struct {
 	claims map[string][]core.Schedule
 }
 
-// 编译期断言：适配器就是工具消费的编辑后端。
-var _ tool.ScheduleEditor = (*scheduleEditorAdapter)(nil)
+// 编译期断言：适配器就是工具消费的编辑后端，同时兼任注册表变更的调度器接缝
+// （注册表热加载后 claim 基线与调度器集合一起推进，约束 39）。
+// The adapter is both the tool's editor backend and the scheduler seam for registry
+// changes, so the claim baseline follows hot reloads.
+var (
+	_ tool.ScheduleEditor = (*scheduleEditorAdapter)(nil)
+	_ ScheduleRegistry    = (*scheduleEditorAdapter)(nil)
+)
 
 // newScheduleEditorAdapter 构造适配器并拷出私有 claim 基线。
 // newScheduleEditorAdapter snapshots the private claim baseline from entries.
@@ -147,6 +153,35 @@ func newScheduleEditorAdapter(loader *workspace.AgentLoader, root string, entrie
 // ReadSchedules reads the file's current task set; no DB, no cache.
 func (e *scheduleEditorAdapter) ReadSchedules(_ context.Context, agent string) ([]core.Schedule, error) {
 	return e.loader.ReadSchedules(e.root, agent)
+}
+
+// SetRegistered 让注册集合的增减同时反映到私有 claim 基线（约束 39 / 约束 30）：
+// 移出的 Agent 不再参与归属预检，否则热加载后旧 claim 会让 manage_schedule 误判
+// 跨 Agent 冲突。加入不在这里写 claim——紧随其后的 ReconcileAgent 会带上新定义。
+// SetRegistered keeps the claim baseline in step with the registry: a removed agent
+// leaves the ownership check, and an added one learns its claims from ReconcileAgent.
+func (e *scheduleEditorAdapter) SetRegistered(agent string, registered bool) error {
+	if err := e.scheduler.SetRegistered(agent, registered); err != nil {
+		return err
+	}
+	if registered {
+		return nil
+	}
+	e.mu.Lock()
+	delete(e.claims, agent)
+	e.mu.Unlock()
+	return nil
+}
+
+// ReconcileAgent 先刷新 claim 基线再委托调度器（与 ApplySchedule 同序：文件事实先行，
+// 库对齐失败不回退 claim——它记的是文件真值）。
+// ReconcileAgent refreshes the claim baseline first, then delegates, matching
+// ApplySchedule's order: the file's truth leads, a failed DB sync does not roll it back.
+func (e *scheduleEditorAdapter) ReconcileAgent(ctx context.Context, agent string, schedules []core.Schedule) error {
+	e.mu.Lock()
+	e.claims[agent] = append([]core.Schedule(nil), schedules...)
+	e.mu.Unlock()
+	return e.scheduler.ReconcileAgent(ctx, agent, schedules)
 }
 
 // ApplySchedule 在私有临界区内完成一次读-改-验-写：先按当前文件解析出本次触碰的 id，

@@ -1614,8 +1614,10 @@ func TestScheduler_StopTimeoutCancelsInflight(t *testing.T) {
 	invoker := &countingInvoker{run: func(ctx context.Context, _ RunRequest) (RunResult, error) {
 		entered <- struct{}{}
 		<-ctx.Done()
-		sawCancel.Store(true)
+		// 先记时间戳再置位标志：Eventually 轮询到 sawCancel 时必须读到已写入的 cancelAt，
+		// 反过来写会让轮询落在两次存储之间、读到 0（负载下间歇性红）。
 		cancelAt.Store(time.Now().UnixNano())
+		sawCancel.Store(true)
 		return RunResult{Status: StatusCancelled, Reason: "停机取消"}, nil
 	}}
 	engine := newBlockingFakeEngine()
@@ -1740,6 +1742,99 @@ func TestScheduler_ReconcileAgent(t *testing.T) {
 		require.True(t, ok)
 		require.False(t, gone.RetiredAt.IsZero())
 		require.Equal(t, 1, engine.liveHandles(), "退休项句柄必须摘除")
+	})
+}
+
+// TestScheduler_SetRegistered_RetiresRemovedAgent 覆盖约束 39：Agent 移出注册集合时，
+// 只退休它自己的未退休任务（一次事务）、摘除句柄，其他 Agent 不受影响。
+// 逆改点：删掉 ApplyAgentTasks + invalidateLocked 段 → 退休读数与句柄断言红。
+func TestScheduler_SetRegistered_RetiresRemovedAgent(t *testing.T) {
+	store := newFakeTaskStore()
+	engine := &fakeEngine{}
+	logger, logs := newCaptureLogger()
+	sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
+		[]AgentEntry{
+			agentEntry(schedAgent, true, demoTask(schedTaskID), demoTask(schedTaskID2)),
+			agentEntry("other", true, demoTask("other-task")),
+		}, nil)
+	startSched(t, sched)
+	require.Equal(t, 3, engine.liveHandles())
+	base := len(store.snapshotApplied())
+
+	require.NoError(t, sched.SetRegistered(schedAgent, false))
+
+	applied := store.snapshotApplied()
+	require.Len(t, applied, base+1, "一个 Agent 的退休必须一次事务完成")
+	require.ElementsMatch(t, []string{schedTaskID, schedTaskID2}, applied[base].RetireIDs)
+	require.Empty(t, applied[base].UpsertIDs, "退休事务不得顺带上写")
+	require.Equal(t, 1, engine.liveHandles(), "只摘除该 Agent 的句柄")
+	for _, id := range []string{schedTaskID, schedTaskID2} {
+		rec, ok := store.task(id)
+		require.True(t, ok)
+		require.False(t, rec.RetiredAt.IsZero(), "任务 %s 必须标退休", id)
+	}
+	other, ok := store.task("other-task")
+	require.True(t, ok)
+	require.True(t, other.RetiredAt.IsZero(), "其他 Agent 的任务不得被波及")
+	rec := logs.requireRecord(t, slog.LevelInfo, "Agent 已移出调度注册集合，任务退休")
+	tasks, ok := attrOf(rec, "tasks")
+	require.True(t, ok)
+	require.Equal(t, "2", tasks.String())
+}
+
+// TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry 覆盖未启动时的注册集合
+// 增减只做内存操作：不读库、不落库、不动句柄（定义由 Start 对账）。
+func TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+
+	require.NoError(t, f.sched.SetRegistered(schedAgent, false))
+	require.NoError(t, f.sched.SetRegistered("never-registered", false))
+	require.NoError(t, f.sched.SetRegistered(schedAgent, true))
+
+	require.Zero(t, f.store.listReadings(), "未启动不得读库")
+	require.Empty(t, f.store.snapshotApplied(), "未启动不得落库")
+	require.Zero(t, f.engine.liveHandles())
+	f.sched.stateMu.RLock()
+	_, stillIn := f.sched.registry[schedAgent]
+	f.sched.stateMu.RUnlock()
+	require.True(t, stillIn, "registered=true 必须重新纳入调度集合")
+}
+
+// TestScheduler_SetRegistered_ErrorKeepsRemovalAndHandles 覆盖失败处置：注册集合先
+// 收回（准入失败关闭），库读 / 库写失败如实上抛，旧句柄与旧任务保持原样。
+func TestScheduler_SetRegistered_ErrorKeepsRemovalAndHandles(t *testing.T) {
+	t.Run("list failure", func(t *testing.T) {
+		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+		f.start(t)
+		before := f.engine.liveHandleSpecs()
+		listErr := errors.New("disk unavailable")
+		f.store.listErr = listErr
+
+		require.ErrorIs(t, f.sched.SetRegistered(schedAgent, false), listErr)
+
+		require.Equal(t, before, f.engine.liveHandleSpecs(), "读库失败不得摘句柄")
+		f.sched.stateMu.RLock()
+		_, stillIn := f.sched.registry[schedAgent]
+		f.sched.stateMu.RUnlock()
+		require.False(t, stillIn, "移出注册集合先于库操作（准入立即失败关闭）")
+		rec, ok := f.store.task(schedTaskID)
+		require.True(t, ok)
+		require.True(t, rec.RetiredAt.IsZero(), "读库失败不得退休")
+	})
+
+	t.Run("apply failure", func(t *testing.T) {
+		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+		f.start(t)
+		before := f.engine.liveHandleSpecs()
+		applyErr := errors.New("db down")
+		f.store.applyErr = applyErr
+
+		require.ErrorIs(t, f.sched.SetRegistered(schedAgent, false), applyErr)
+
+		require.Equal(t, before, f.engine.liveHandleSpecs(), "写库失败不得摘句柄")
+		rec, ok := f.store.task(schedTaskID)
+		require.True(t, ok)
+		require.True(t, rec.RetiredAt.IsZero(), "写库失败任务保持未退休")
 	})
 }
 
