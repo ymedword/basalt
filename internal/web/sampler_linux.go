@@ -8,6 +8,7 @@ package web
 // Linux sampling from /proc; parse failures degrade to "unsupported".
 
 import (
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +18,12 @@ import (
 // linuxUserHZ 是内核 USER_HZ：stat 的 utime / stime 以 1/100 秒计。
 // linuxUserHZ is the kernel clock-tick frequency used by /proc/self/stat.
 const linuxUserHZ = 100
+
+// linuxTickDuration 是一个 tick 的时长（10ms）。解析结果一律先做上界检查再换算：
+// 超出 time.Duration 范围时按"平台不支持"降级，**不得**让强制转换静默回绕。
+// linuxTickDuration is one 10ms tick; out-of-range values degrade to unsupported
+// instead of letting a conversion wrap silently.
+const linuxTickDuration = time.Second / linuxUserHZ
 
 // readProcessCPU 读当前进程的累计用户态 / 内核态 CPU 时间。
 // readProcessCPU returns the cumulative user and kernel CPU time.
@@ -37,18 +44,21 @@ func readProcessCPU() (cpuTime, bool) {
 	if len(fields) < 13 {
 		return cpuTime{}, false
 	}
-	user, err := strconv.ParseUint(fields[11], 10, 64)
-	if err != nil {
+	user, err := strconv.ParseInt(fields[11], 10, 64)
+	if err != nil || user < 0 {
 		return cpuTime{}, false
 	}
-	system, err := strconv.ParseUint(fields[12], 10, 64)
-	if err != nil {
+	system, err := strconv.ParseInt(fields[12], 10, 64)
+	if err != nil || system < 0 {
 		return cpuTime{}, false
 	}
-	tick := time.Second / linuxUserHZ
+	maxTicks := math.MaxInt64 / int64(linuxTickDuration)
+	if user > maxTicks || system > maxTicks {
+		return cpuTime{}, false
+	}
 	return cpuTime{
-		User:   time.Duration(user) * tick,
-		System: time.Duration(system) * tick,
+		User:   time.Duration(user * int64(linuxTickDuration)),
+		System: time.Duration(system * int64(linuxTickDuration)),
 	}, true
 }
 
@@ -63,9 +73,13 @@ func readProcessRSS() (int64, bool) {
 	if len(fields) < 2 {
 		return 0, false
 	}
-	pages, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
+	pages, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || pages < 0 {
 		return 0, false
 	}
-	return int64(pages) * int64(os.Getpagesize()), true
+	pageSize := os.Getpagesize()
+	if pageSize <= 0 || pages > math.MaxInt64/int64(pageSize) {
+		return 0, false
+	}
+	return pages * int64(pageSize), true
 }
