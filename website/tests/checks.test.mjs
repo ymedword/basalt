@@ -122,19 +122,36 @@ function jobBlock(text, name) {
   const end = rest.search(/^  [A-Za-z0-9_-]+:[ \t]*(?:#.*)?$/m)
   return end < 0 ? rest : rest.slice(0, end)
 }
-function assertManualPages(text) {
-  const on = onSection(text)
-  assert.equal(on.replace(/#.*$/gm, '').trim(), 'workflow_dispatch:', 'workflow_dispatch is the only trigger')
+function pagesTriggers(text) {
+  const on = onSection(text).replace(/#.*$/gm, '')
   assert.ok(!on.startsWith('['), 'array triggers are forbidden')
+  return [...on.matchAll(/^(?: {2})?([a-z_]+):/gm)].map(match => match[1])
+}
+function assertPagesWorkflow(text) {
+  const on = onSection(text).replace(/#.*$/gm, '')
+  assert.deepEqual(pagesTriggers(text), ['workflow_run', 'workflow_dispatch'], 'workflow_run and workflow_dispatch are the only triggers')
+  assert.match(on, /^ {0,2}workflow_run:\n {4}workflows: \["CI"\]\n {4}types: \[completed\]\n {4}branches: \[main\]$/m)
+  assert.match(on, /^ {2}workflow_dispatch:$/m)
   assert.ok(!/secrets\./.test(text), 'no secrets references')
   assert.match(text, /actions\/deploy-pages@/)
+  const deploy = jobBlock(text, 'deploy').replace(/#.*$/gm, '').replace(/\s+/g, ' ')
+  assert.match(deploy, /github\.event_name == 'workflow_dispatch'/)
+  assert.match(deploy, /github\.event\.workflow_run\.conclusion == 'success'/)
+  assert.match(deploy, /github\.event\.workflow_run\.head_sha == github\.sha/)
+  assert.match(deploy, /ref: \$\{\{ github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_sha \|\| github\.sha \}\}/)
 }
-test('Pages workflow is manual only with the approved deployment permissions', async () => {
+test('Pages workflow publishes only after successful CI on main and keeps manual dispatch', async () => {
   const text = await readFile(path.join(root, '.github', 'workflows', 'pages.yml'), 'utf8')
-  assertManualPages(text)
-  for (const trigger of ['push', 'pull_request', 'schedule', 'release']) assert.throws(() => assertManualPages(text.replace('  workflow_dispatch:', `  workflow_dispatch:\n  ${trigger}:`)))
-  assert.throws(() => assertManualPages(text.replace(/on:\s*\n  workflow_dispatch:/, 'on: [push]')))
-  assert.throws(() => assertManualPages(text + '\n# ${{ secrets.TOKEN }}\n'))
+  assertPagesWorkflow(text)
+  for (const trigger of ['push', 'pull_request', 'schedule', 'release']) assert.throws(() => assertPagesWorkflow(text.replace('  workflow_dispatch:', `  ${trigger}:\n  workflow_dispatch:`)))
+  assert.throws(() => assertPagesWorkflow(text.replace('workflows: ["CI"]', 'workflows: ["Website"]')))
+  assert.throws(() => assertPagesWorkflow(text.replace('types: [completed]', 'types: [requested]')))
+  assert.throws(() => assertPagesWorkflow(text.replace('branches: [main]', 'branches: [develop]')))
+  assert.throws(() => assertPagesWorkflow(text.replace("github.event.workflow_run.conclusion == 'success' &&", '')))
+  assert.throws(() => assertPagesWorkflow(text.replace('github.event.workflow_run.head_sha == github.sha', 'true')))
+  assert.throws(() => assertPagesWorkflow(text.replace("github.event_name == 'workflow_dispatch' ||", '')))
+  assert.throws(() => assertPagesWorkflow(text.replace(/on:\s*\n  workflow_run:/, 'on: [push]\n  workflow_run:')))
+  assert.throws(() => assertPagesWorkflow(text + '\n# ${{ secrets.TOKEN }}\n'))
   for (const pattern of [/contents:\s*read/, /pages:\s*write/, /id-token:\s*write/, /name:\s*github-pages/, /actions\/configure-pages@/, /actions\/upload-pages-artifact@/, /path:\s*website\/\.vitepress\/dist/]) assert.match(text, pattern)
 })
 test('CI isolates the website build and keeps complete history for provenance', async () => {

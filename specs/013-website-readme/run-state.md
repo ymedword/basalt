@@ -71,7 +71,7 @@
 | 三档视口（1440×900 / 768×1024 / 390×844） | 已验证（2026-10-24） | 24 次页面读取 0 横向溢出；六卡 3 / 2 / 1 列；移动菜单可开合并导航；六张插图滚动后 6/6 加载（§12） |
 | 语言切换与键盘操作 | 已验证（2026-10-24） | 9/9 语言链接（含查询串与锚点）且实际点击落点正确；键盘可达 quickstart、页脚、语言切换，焦点可见；减少动态效果直接显示全文（§12） |
 | 真实厂商模型 | 未授权 / 未执行 | 不作为收口条件 |
-| GitHub Pages 线上部署与线上 URL | 未授权 / 未执行 | 不作为收口条件 |
+| GitHub Pages 线上部署与线上 URL | 已验证（2026-10-25） | 手动运行 `40113966453` 部署 `24de00e` 成功；deployment `7301645031`；线上 `LICENSE` / `NOTICE` / `THIRD_PARTY_NOTICES` 均 HTTP 200 且 SHA-256 与仓库根文件一致（§14.3） |
 
 ## 5. 临时物
 
@@ -207,3 +207,78 @@ Chrome 155 headless + CDP 真实输入 / 点击，11 步，0 页面错误：
 - 已停止本轮预览 4173、开发预览 18771、headless Chrome 9222；用户 8080 `basalt serve`（PID 17924）未操作，仍在监听。
 - 已删除 `tmp/us13-*`（便携 Node、验证脚本 / 截图 / 日志、Codex 交接与实现辅助文件、缓存）与空目录 `.loop/us13-test-fixtures`；`tmp/` 仅余用户既有目录；`git status` 仍为 74 项，无 tmp 条目。验收报告与各检查日志保留在 `.loop/runs/accept-20261024T112621.359117900/`。
 - 剩余未验证：真实厂商模型（未授权）、GitHub Pages 线上部署与 URL（未授权 / 未执行）、外部链接 HTTP 200 探测（未执行）、完整教程时长（未测量）、私有 `docs/TechnicalDesign.md` §8.2 修改不提交故不构成公开证据。
+
+## 13. 许可与 README 收口（2026-10-25）
+
+### 13.1 触发与人审决定
+
+用户在 US-13 收尾评审中给出“有条件通过”：英文单份 README、官网双语、Logo 与导航、单张架构简图均符合要求；Apache 官方全文与官网声明副本一致，19 项站点测试和链接 / 图源检查通过。两项阻断项为：
+
+1. 跨平台依赖合计 25 个模块，第三方声明漏 `github.com/google/uuid v1.6.0`（Linux / macOS 使用）。
+2. CI 二进制 artifact 未包含 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES`。
+
+两项补齐并验证后，用户于 2026-10-25 确认“暂时没问题了……us-13 可以收口”，随后再次确认“us13 收口吧”。据此记为最终 review ② 通过，US-13 收口。
+
+### 13.2 收口修正
+
+| 项 | 落点 | 结果 |
+| --- | --- | --- |
+| uuid 声明 | `THIRD_PARTY_NOTICES` §1 / §5.2.2 | 补 `github.com/google/uuid v1.6.0`（BSD-3-Clause，`Copyright (c) 2009,2014 Google Inc.`）；§1 改为四目标合计 25 个第三方模块加标准库，并注明平台差异 |
+| 官网副本 | `website/public/THIRD_PARTY_NOTICES` | 与根文件逐字节一致，SHA-256 `eacc1f0f7ca08112a37c6502d012f2f128287e95f5026437f0db0fe494d51c4d` |
+| CI artifact | `.github/workflows/ci.yml` build job | 上传前 `cp LICENSE NOTICE THIRD_PARTY_NOTICES bin/`；`basalt-binaries` 含四个二进制与三份声明 |
+| README / 许可 | 根 `LICENSE`、`NOTICE`、`README.md` | Apache-2.0 官方全文；英文单份并删除 `README.zh-CN.md`；官网保持双语 |
+
+### 13.3 验证读数
+
+- 目标依赖并集：`go list -deps` 四目标（linux/amd64、linux/arm64、windows/amd64、darwin/arm64）的第三方模块并集为 25；uuid 在 Linux 两目标与 darwin/arm64 存在，windows/amd64 不存在；与声明表 25 行一致。
+- 站点：Node 24.22.0 测试 19/19；`vitepress build` 2.45s；`check-links` 与 `check-diagrams` 无发现；构建产物三份声明与仓库根文件逐字节一致。
+- CI 工作流：`.github/workflows/ci.yml` 经 yaml.v3 解析通过；`bin/` 暂存复制在临时目录实际执行（四个二进制 + 三份声明），未在本地执行 GitHub Actions。
+- 远端：`docs/readme-license` 与 `main` 均为 `24de00e`；CI run `40112200903` 的 test / build / console / website 四个 job 全部 success，用时 14 分 53 秒。直接快进推送 `main` 时绕过 2 项必需状态检查，随后 push CI 在同一 commit 上补跑为全绿。
+- 提交检查：`git show --check` 通过；收口记录写入前工作区干净。
+
+### 13.4 剩余非阻断项
+
+- Logo 明暗主题目视检查未执行；用户明确不阻断本次收口。
+- 历史 stage / spec 中的 `README.zh-CN.md` 引用保留为历史证据，不静默回改；用户明确不阻断。
+- 页脚 License 入口未新增；用户明确不阻断。
+- 真实厂商模型、GitHub Pages 线上部署与 URL、外部链接 HTTP 200 探测、完整教程时长，维持 §12.7 的未授权 / 未执行 / 未测量口径。
+
+### 13.5 收口基线
+
+- 公开基线 commit：`24de00e`（`docs: add Apache-2.0 licensing and an English-only README`）。
+- 远端 `origin/main` 与 `origin/docs/readme-license` 均指向 `24de00e`，`main` CI 全绿。
+- 本节只追加收口记录，不改验收判据、历史任务勾选或已发布证据；模块卡 §6.10 末尾状态行同步为已收口（私有，不入库），更新后 SHA-256 为 `782a5d3e11d0cb2baf69421bc1738021ba5ca81403b25de56556f59dad89b6a8`（1,403 行）。
+
+## 14. Pages 自动发布策略（2026-10-25）
+
+### 14.1 用户裁决与范围
+
+用户 2026-10-25 对“先手动部署一次，再把 Pages 改为 CI 成功后在 `main` 自动部署”的建议回复“按你的建议来即可”。该裁决只改变发布触发方式，不放宽门禁：自动发布仍须完整 `CI` 成功，手动 `workflow_dispatch` 保留为受权维护者回退；`ci.yml` 继续只构建 `website-dist`，不执行部署。
+
+### 14.2 工作流改动
+
+| 项 | 新口径 |
+| --- | --- |
+| 自动触发 | `workflow_run` 监听 `CI` 的 `completed`，仅 `branches: [main]` |
+| 发布门 | 仅当 `workflow_run.conclusion == 'success'` 且 `workflow_run.head_sha == github.sha`；后者排除“CI 完成时默认分支已前移”的旧提交 |
+| 手动回退 | 保留 `workflow_dispatch`，始终按所选 ref 重新构建、测试、检查 |
+| 检出 | 自动运行检出 CI 运行的 `head_sha`；手动运行检出 `github.sha` |
+| 禁止 | 不直接监听 `push` / `pull_request` / `schedule` / `release`，不引用 secrets；`ci.yml` 不出现 `deploy-pages` |
+| 权限 | 仍为 `contents: read`、`pages: write`、`id-token: write` |
+
+`website/tests/checks.test.mjs` 的 Pages 用例同步改为上述触发与门禁断言，并保留对额外触发、错误工作流名 / 类型 / 分支、缺失成功或 `head_sha` 门、数组触发与 secrets 的负向夹具。`website/README.md` 的发布说明同步更新。
+
+### 14.3 首次手动部署（基线 24de00e）
+
+- 运行 `40113966453`（`workflow_dispatch`，`main`，`24de00e`）结论 `success`；GitHub deployment `7301645031`，ref `main`，sha `24de00e`。
+- 线上 `https://ymedword.github.io/basalt/LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES` 均 HTTP 200；SHA-256 依次为 `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`、`d53cfa6fbb0fbbe128059c1f7ebea7b7837ba2b651e6919a7d950cc474cee02c`、`eacc1f0f7ca08112a37c6502d012f2f128287e95f5026437f0db0fe494d51c4d`，与仓库根文件逐字节一致。
+
+### 14.4 本地验证与未验证
+
+- Node 24.22.0：`npm test` 19 pass / 0 fail；`npm run build` 2.13s；`npm run check` 的链接与图源检查均无发现。
+- `pages.yml` 以 `gopkg.in/yaml.v3` 解析通过；`on` 键为 `workflow_run` / `workflow_dispatch`，`workflow_run` 为 `[CI]` / `[completed]` / `[main]`。
+- 未验证：自动触发要等本次改动推送并 CI 完成后才能取得运行证据；本节不预写结果。
+
+### 14.5 历史记录边界
+
+§12.5、§13.4 中“仅 `workflow_dispatch` / 不会自动部署”的表述是当时收口事实，保留不改；`docs/us/us13-website-readme.md` 的 D-3 A 与历史 spec 同为已批准历史设计，不静默改写。本节的自动发布口径是用户 2026-10-25 的新裁决，自本节起覆盖操作层发布策略。

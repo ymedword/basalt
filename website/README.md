@@ -12,7 +12,7 @@ npm run check
 npm run dev -- --host 127.0.0.1
 ```
 
-The development URL includes `/basalt/`. Use `dev --host 127.0.0.1` for a loopback-only preview. The built artifact is in `.vitepress/dist`; `npm run preview` serves it through VitePress's static server. VitePress 1.6.4's static preview ignores the host option and binds all interfaces, so it does not provide the same loopback binding. Neither command publishes to Pages. The separate Pages workflow is manual and must be triggered by an authorized maintainer. CI builds an artifact and never deploys it.
+The development URL includes `/basalt/`. Use `dev --host 127.0.0.1` for a loopback-only preview. The built artifact is in `.vitepress/dist`; `npm run preview` serves it through VitePress's static server. VitePress 1.6.4's static preview ignores the host option and binds all interfaces, so it does not provide the same loopback binding. Neither command publishes to Pages. The separate Pages workflow publishes automatically after the `CI` workflow succeeds on `main`; an authorized maintainer can still trigger it manually through `workflow_dispatch`. It checks out the CI run's head commit and refuses to publish when that commit is no longer the default branch tip. CI itself builds an artifact and never deploys it.
 
 ## Content and commands
 
