@@ -156,6 +156,10 @@ test('Pages workflow publishes only after successful CI on main and keeps manual
 })
 test('CI isolates the website build and keeps complete history for provenance', async () => {
   const text = await readFile(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8')
+  const on = onSection(text).replace(/#.*$/gm, '')
+  assert.match(text, /^name: CI$/m)
+  assert.match(on, /^(?: {2})?push:/m)
+  assert.match(on, /^(?: {2})?pull_request:/m)
   const job = jobBlock(text, 'website').replace(/#.*$/gm, '')
   assert.ok(!/deploy-pages/.test(text))
   for (const command of ['npm ci', 'npm test', 'npm run build', 'npm run check']) assert.ok(job.includes(command), command)

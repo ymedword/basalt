@@ -71,7 +71,7 @@
 | 三档视口（1440×900 / 768×1024 / 390×844） | 已验证（2026-10-24） | 24 次页面读取 0 横向溢出；六卡 3 / 2 / 1 列；移动菜单可开合并导航；六张插图滚动后 6/6 加载（§12） |
 | 语言切换与键盘操作 | 已验证（2026-10-24） | 9/9 语言链接（含查询串与锚点）且实际点击落点正确；键盘可达 quickstart、页脚、语言切换，焦点可见；减少动态效果直接显示全文（§12） |
 | 真实厂商模型 | 未授权 / 未执行 | 不作为收口条件 |
-| GitHub Pages 线上部署与线上 URL | 已验证（2026-10-25） | 手动运行 `40113966453` 部署 `24de00e` 成功；deployment `7301645031`；线上 `LICENSE` / `NOTICE` / `THIRD_PARTY_NOTICES` 均 HTTP 200 且 SHA-256 与仓库根文件一致（§14.3） |
+| GitHub Pages 线上部署与线上 URL | 已验证（2026-10-25） | 手动运行 `40113966453` 部署 `24de00e` 成功（deployment `7301645031`）；自动运行 `40115518583` 经 `workflow_run` 部署 `a58a832` 成功（deployment `7301876762`）；线上 `LICENSE` / `NOTICE` / `THIRD_PARTY_NOTICES` 均 HTTP 200 且 SHA-256 与仓库根文件一致（§14.3、§15） |
 
 ## 5. 临时物
 
@@ -282,3 +282,20 @@ Chrome 155 headless + CDP 真实输入 / 点击，11 步，0 页面错误：
 ### 14.5 历史记录边界
 
 §12.5、§13.4 中“仅 `workflow_dispatch` / 不会自动部署”的表述是当时收口事实，保留不改；`docs/us/us13-website-readme.md` 的 D-3 A 与历史 spec 同为已批准历史设计，不静默改写。本节的自动发布口径是用户 2026-10-25 的新裁决，自本节起覆盖操作层发布策略。
+
+## 15. Pages 自动发布验证（2026-10-25）
+
+### 15.1 CI 与自动触发
+
+- 提交 `a58a832`（`ci: publish the website after CI succeeds on main`）推送 `main` 后，CI 运行 `40114418712` 于 2026-10-24T17:18:24Z 完成；test / console / build / website 四个 job 全部 `success`。
+- CI 完成后，Pages 运行 `40115518583` 由 `workflow_run` 触发：`headBranch` `main`，`headSha` `a58a832`，`conclusion` `success`；deploy job 用时 35s。
+- GitHub deployment `7301876762`，ref `main`，sha `a58a832`，于 2026-10-24T17:19:06Z 完成。
+
+### 15.2 线上复核
+
+- `https://ymedword.github.io/basalt/LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES` 仍均 HTTP 200；SHA-256 与仓库根文件一致（同 §14.3）。
+- 本次验证了 `workflow_run` → CI 全绿 → 发布链路；手动 `workflow_dispatch` 回退保留，但本次未重复执行。
+
+### 15.3 结论
+
+§14.4 的“自动触发未验证”已关闭。发布门仍为完整 CI 成功且 `head_sha == github.sha`；本次运行满足两者。历史 §12.5 / §13.4 的旧口径保留，由 §14.5 说明覆盖关系。
