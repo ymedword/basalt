@@ -8,7 +8,7 @@
 
 Basalt is a self-hosted Agent OS for enterprise teams. Define independent business agents through directories and declarative configuration, with their own models, tools, sessions and scoped memory. Share execution, connections, scheduling, storage and auditing across the platform.
 
-[Quick start](#quick-start) · [Documentation](website/docs/index.md) · [Architecture](#architecture) · [Issues](https://github.com/ymedword/basalt/issues)
+[Quick start](#quick-start) · [Documentation](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Issues](https://github.com/ymedword/basalt/issues)
 
 ## Why Basalt
 
@@ -24,7 +24,7 @@ For example, configure daily-report for scheduled briefings and file-review for 
 
 ![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)
 
-The current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](website/architecture/index.md) covers execution, dependencies and deployment; [product documentation](website/docs/index.md) separates current capabilities from planned direction.
+The current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.
 
 ## Quick start
 
@@ -125,15 +125,15 @@ basalt session list
 
 <!-- quickstart-commands:end -->
 
-[The full quickstart](website/quickstart/index.md) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.
+[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.
 
 ## Documentation
 
 | Your goal | Start here |
 | --- | --- |
-| Understand the Agent OS, current scope and direction | [Product documentation](website/docs/index.md) |
-| Build, configure and run an agent | [Quickstart](website/quickstart/index.md) |
-| Explore detailed architecture and execution | [Architecture](website/architecture/index.md) |
+| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |
+| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |
+| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |
 | Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |
 | Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |
 

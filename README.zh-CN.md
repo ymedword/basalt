@@ -8,7 +8,7 @@
 
 Basalt 是面向企业自托管的 Agent OS。每个业务 Agent 通过独立目录和声明式配置定义身份、模型、工具与任务，分别管理会话和作用域记忆；平台统一提供执行、接入、调度、存储与审计。
 
-[快速开始](#快速开始) · [文档](website/zh/docs/index.md) · [架构](#架构) · [问题反馈](https://github.com/ymedword/basalt/issues)
+[快速开始](#快速开始) · [文档](https://ymedword.github.io/basalt/zh/docs/) · [架构](#架构) · [问题反馈](https://github.com/ymedword/basalt/issues)
 
 ## 为什么选择 Basalt
 
@@ -24,7 +24,7 @@ Basalt 是面向企业自托管的 Agent OS。每个业务 Agent 通过独立目
 
 ![Basalt 简化架构：接入层、应用层、执行引擎层、基础服务层和存储层](website/public/diagrams/zh/system-architecture.svg)
 
-当前是单节点、多 Agent 托管，Agent 按逻辑作用域管理。[完整项目架构图](website/public/diagrams/zh/project-overview.svg)展开系统与外部边界，[架构文档](website/zh/architecture/index.md)说明组件、执行流程、包依赖和部署结构；[产品文档](website/zh/docs/index.md)区分当前能力与未来方向。
+当前是单节点、多 Agent 托管，Agent 按逻辑作用域管理。[完整项目架构图](website/public/diagrams/zh/project-overview.svg)展开系统与外部边界，[架构文档](https://ymedword.github.io/basalt/zh/architecture/)说明组件、执行流程、包依赖和部署结构；[产品文档](https://ymedword.github.io/basalt/zh/docs/)区分当前能力与未来方向。
 
 ## 快速开始
 
@@ -125,15 +125,15 @@ basalt session list
 
 <!-- quickstart-commands:end -->
 
-[完整教程与排障](website/zh/quickstart/index.md)提供页面字段说明和预期输出。模型回复取决于你的服务与配置，首页动画使用明确标注的本地脚本化演示。
+[完整教程与排障](https://ymedword.github.io/basalt/zh/quickstart/)提供页面字段说明和预期输出。模型回复取决于你的服务与配置，首页动画使用明确标注的本地脚本化演示。
 
 ## 文档
 
 | 要做什么 | 入口 |
 | --- | --- |
-| 理解 Agent OS、当前能力与未来方向 | [产品文档](website/zh/docs/index.md) |
-| 安装、配置并跑通对话 | [快速开始](website/zh/quickstart/index.md) |
-| 查看详细架构、执行与存储边界 | [架构文档](website/zh/architecture/index.md) |
+| 理解 Agent OS、当前能力与未来方向 | [产品文档](https://ymedword.github.io/basalt/zh/docs/) |
+| 安装、配置并跑通对话 | [快速开始](https://ymedword.github.io/basalt/zh/quickstart/) |
+| 查看详细架构、执行与存储边界 | [架构文档](https://ymedword.github.io/basalt/zh/architecture/) |
 | 部署、管理认证、备份与升级 | [运维手册](docs/Operations.md) |
 | 查配置样例与 API | [配置样例](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |
 
