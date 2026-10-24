@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="1690" viewBox="0 0 1380 1690" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="execution-flow" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<title id="diagram-title">一次 Run，边界清楚，记录可查。</title>
+<desc id="diagram-desc">当前执行流程包含请求准入、生命周期与资源资格、Run 资源和预算固定、PromptBuilder、模型审计 pending 预写、Provider 协议调用、模型审计 success/failed、assistant 消息追加、工具归属与入参检查、工具审计 pending 预写、受策略约束的执行、工具审计 success/failed 与工具结果追加。明确展示失败、拒绝、取消、恢复分支。Run 的四个终态为 completed、limit_reached、cancelled、failed。limit_reached 保留部分结果，不是错误；工具拒绝或失败会回填模型，不自动使 Run 失败；取消判断优先于预算。启动恢复先持有实例锁：pending 调用审计归为 unknown，未完成 Run 归为 failed，补齐半截工具组，绝不自动重放。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
+<rect width="1380" height="1690" fill="#f7f4eb"/>
+<g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
+<text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / EXECUTION FLOW</text>
+<text x="40" y="85" font-size="32" font-weight="600">一次 Run，边界清楚，记录可查。</text>
+<text x="40" y="115" font-size="17" fill="#5d6a70">Run 终态与模型／工具审计终态分别管理</text>
+<rect x="45" y="136" width="690" height="1335" rx="10" fill="none" stroke="#bfc9cc"/>
+<rect x="780" y="136" width="555" height="1335" rx="10" fill="none" stroke="#bfc9cc"/>
+<path d="M390,260 L390,305" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M700,353 L815,353" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="740.5" y="331" width="34" height="21" rx="3" fill="#f7f4eb"/>
+<text x="757.5" y="345" text-anchor="middle" font-size="13" fill="#244bd8">拒绝</text>
+<path d="M390,401 L390,450" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M700,489 L815,489" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1045,528 L1045,557 L390,557 L390,585" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M700,624 L815,624" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1045,663 L1045,692 L390,692 L390,720" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1125,663 L1125,720" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="1108" y="669.5" width="34" height="21" rx="3" fill="#f7f4eb"/>
+<text x="1125" y="683.5" text-anchor="middle" font-size="13" fill="#244bd8">失败</text>
+<path d="M390,798 L390,855" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="355" y="804.5" width="70" height="21" rx="3" fill="#f7f4eb"/>
+<text x="390" y="818.5" text-anchor="middle" font-size="13" fill="#244bd8">有工具调用</text>
+<path d="M80,759 L25,759 L25,1560 L80,1560" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="123" y="818" width="214" height="21" rx="3" fill="#f7f4eb"/>
+<text x="230" y="832" text-anchor="middle" font-size="13" fill="#244bd8">无工具调用 → completed</text>
+<path d="M700,894 L815,894" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1045,933 L1045,962 L390,962 L390,990" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M700,1038 L815,1038" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1045,1086 L1045,1112 L390,1112 L390,1140" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M80,894 L52,894 L52,1188 L80,1188" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="173" y="1100" width="94" height="21" rx="3" fill="#f7f4eb"/>
+<text x="220" y="1114" text-anchor="middle" font-size="13" fill="#244bd8">拒绝 → 回填</text>
+<path d="M700,1188 L755,1188 L755,430 L390,430 L390,450" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="549.5" y="408" width="46" height="21" rx="3" fill="#f7f4eb"/>
+<text x="572.5" y="422" text-anchor="middle" font-size="13" fill="#244bd8">下一轮</text>
+<path d="M390,1236 L390,1290" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M390,1386 L390,1510" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M1300,759 L1350,759 L1350,1561 L1300,1561" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="1309" y="1138" width="82" height="21" rx="3" fill="#f7f4eb"/>
+<text x="1350" y="1152" text-anchor="middle" font-size="13" fill="#244bd8">failed</text>
+<path d="M1055,1268 L1055,1510" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="1014" y="1367" width="82" height="21" rx="3" fill="#f7f4eb"/>
+<text x="1055" y="1381" text-anchor="middle" font-size="13" fill="#244bd8">恢复；不重放</text>
+<text x="65" y="163" font-size="13" letter-spacing="1" fill="#244bd8" stroke="#f7f4eb" stroke-width="5" paint-order="stroke">运行与消息路径</text>
+<text x="800" y="163" font-size="13" letter-spacing="1" fill="#244bd8" stroke="#f7f4eb" stroke-width="5" paint-order="stroke">审计与异常路径</text>
+<g data-node-id="request"><rect x="80" y="190" width="620" height="70" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="218" font-size="20" font-weight="600">Agent 请求</text>
+<text x="98" y="243" font-size="16" fill="#5d6a70">CLI／HTTP／定时 → AgentService</text>
+</g>
+<g data-node-id="admission"><rect x="80" y="305" width="620" height="96" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="333" font-size="20" font-weight="600">准入与 Run 快照</text>
+<text x="98" y="358" font-size="16" fill="#5d6a70">生命周期 active、资格、并发与预算</text>
+<text x="98" y="381" font-size="16" fill="#5d6a70">固定本轮使用的已发布资源版本</text>
+</g>
+<g data-node-id="rejected"><rect x="815" y="305" width="485" height="96" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="833" y="333" font-size="20" font-weight="600">请求被拒绝</text>
+<text x="833" y="358" font-size="16" fill="#5d6a70">不发出模型或工具调用</text>
+<text x="833" y="381" font-size="16" fill="#5d6a70">请求拒绝不是 Run 的第五种终态</text>
+</g>
+<g data-node-id="prompt"><rect x="80" y="450" width="620" height="78" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="478" font-size="20" font-weight="600">PromptBuilder</text>
+<text x="98" y="503" font-size="16" fill="#5d6a70">组装上下文、保留约束、按完整交互组裁剪</text>
+</g>
+<g data-node-id="model-pending"><rect x="815" y="450" width="485" height="78" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="833" y="478" font-size="20" font-weight="600">llm_calls → pending</text>
+<text x="833" y="503" font-size="16" fill="#5d6a70">先预写；预写失败不发出模型请求</text>
+</g>
+<g data-node-id="provider"><rect x="80" y="585" width="620" height="78" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="613" font-size="20" font-weight="600">Provider 协议调用</text>
+<text x="98" y="638" font-size="16" fill="#5d6a70">仅查询本 Run 固定的显式 Provider 映射</text>
+</g>
+<g data-node-id="model-terminal"><rect x="815" y="585" width="485" height="78" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="833" y="613" font-size="20" font-weight="600">llm_calls → success / failed</text>
+<text x="833" y="638" font-size="16" fill="#5d6a70">调用结束后更新同一审计行</text>
+</g>
+<g data-node-id="assistant"><rect x="80" y="720" width="620" height="78" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="748" font-size="20" font-weight="600">追加 assistant 消息</text>
+<text x="98" y="773" font-size="16" fill="#5d6a70">执行工具前先保存包含 tool_calls 的消息</text>
+</g>
+<g data-node-id="fatal"><rect x="815" y="720" width="485" height="78" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="833" y="748" font-size="20" font-weight="600">致命失败 → Run failed</text>
+<text x="833" y="773" font-size="16" fill="#5d6a70">模型、上下文或消息持久化的致命失败</text>
+</g>
+<g data-node-id="tool-check"><rect x="80" y="855" width="620" height="78" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="883" font-size="20" font-weight="600">工具解析与入参检查</text>
+<text x="98" y="908" font-size="16" fill="#5d6a70">检查注册工具、Agent 声明工具集与参数</text>
+</g>
+<g data-node-id="tool-pending"><rect x="815" y="855" width="485" height="78" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="833" y="883" font-size="20" font-weight="600">tool_invocations → pending</text>
+<text x="833" y="908" font-size="16" fill="#5d6a70">Tool.Execute 前预写；失败则拒绝执行</text>
+</g>
+<g data-node-id="execute"><rect x="80" y="990" width="620" height="96" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="1018" font-size="20" font-weight="600">Tool.Execute</text>
+<text x="98" y="1043" font-size="16" fill="#5d6a70">Policy.Check → 受控动作／CommandRunner</text>
+<text x="98" y="1066" font-size="16" fill="#5d6a70">单工具超时与有界输出</text>
+</g>
+<g data-node-id="tool-terminal"><rect x="815" y="990" width="485" height="96" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="833" y="1018" font-size="20" font-weight="600">tool_invocations → success / failed</text>
+<text x="833" y="1043" font-size="16" fill="#5d6a70">策略拒绝记 failed／sandbox_denied</text>
+<text x="833" y="1066" font-size="16" fill="#5d6a70">失败回填模型，Run 可以继续</text>
+</g>
+<g data-node-id="result"><rect x="80" y="1140" width="620" height="96" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="1168" font-size="20" font-weight="600">追加工具结果，检查取消与预算</text>
+<text x="98" y="1193" font-size="16" fill="#5d6a70">进入下一轮时重新组装提示词</text>
+<text x="98" y="1216" font-size="16" fill="#5d6a70">assistant／tool 消息仅由 ReActLoop 追加</text>
+</g>
+<g data-node-id="recovery"><rect x="815" y="1140" width="485" height="128" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="833" y="1168" font-size="20" font-weight="600">崩溃恢复 · 必须持有实例锁</text>
+<text x="833" y="1193" font-size="16" fill="#5d6a70">pending 审计 → unknown；running Run → failed</text>
+<text x="833" y="1216" font-size="16" fill="#5d6a70">补齐半截工具组；不自动重放</text>
+<text x="833" y="1239" font-size="16" fill="#5d6a70">管理操作按独立契约查证实际结果</text>
+</g>
+<g data-node-id="budget"><rect x="80" y="1290" width="620" height="96" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="98" y="1318" font-size="20" font-weight="600">预算停止／取消</text>
+<text x="98" y="1343" font-size="16" fill="#5d6a70">迭代或工具次数上限 → limit_reached（部分结果）</text>
+<text x="98" y="1366" font-size="16" fill="#5d6a70">取消或 Run 截止时间 → cancelled</text>
+</g>
+<g data-node-id="outcome"><rect x="80" y="1510" width="1220" height="102" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="98" y="1538" font-size="20" font-weight="600">Run 终态</text>
+<text x="98" y="1563" font-size="16" fill="#5d6a70">completed  ·  limit_reached（部分结果，非错误）  ·  cancelled  ·  failed</text>
+<text x="98" y="1586" font-size="16" fill="#5d6a70">持久化运行结果并释放资源引用；调用审计仍使用独立状态机</text>
+</g>
+<text x="40" y="1645" font-size="15" fill="#5d6a70">预算用于约束执行，不触发重试。工具失败不自动等于 Run 失败；取消判断优先。</text>
+<text x="40" y="1671" font-size="12" fill="#5d6a70">源码提交: eb97cd539e51 · 当前实现</text>
+</g></svg>

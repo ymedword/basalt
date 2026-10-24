@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1120" viewBox="0 0 1320 1120" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="deployment" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<title id="diagram-title">当前部署：单节点，自托管。</title>
+<desc id="diagram-desc">当前产品拓扑为单节点：自托管 Go 二进制内嵌管理台，读取 basalt.yaml，使用 .basalt 工作区中的 SQLite、Agent 定义、技能和记忆。管理台默认仅回环监听。CLI 写命令与 serve 共用工作区实例锁，不能并行写同一工作区。远程管理需由部署方提供 TLS／反向代理或可信加密通道，serve 不内置 TLS。模型与外部工具端点按配置连接。托管凭据主密钥位于工作区之外，单独备份。不承诺容器或多 Worker 拓扑。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
+<rect width="1320" height="1120" fill="#f7f4eb"/>
+<g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
+<text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / DEPLOYMENT</text>
+<text x="40" y="85" font-size="32" font-weight="600">当前部署：单节点，自托管。</text>
+<text x="40" y="115" font-size="17" fill="#5d6a70">官网独立构建，不嵌入产品二进制</text>
+<rect x="40" y="230" width="805" height="750" rx="10" fill="none" stroke="#bfc9cc"/>
+<path d="M395,160 L435,160 L435,425 L370,425 L370,455" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="355.5" y="403" width="94" height="21" rx="3" fill="#f7f4eb"/>
+<text x="402.5" y="417" text-anchor="middle" font-size="13" fill="#244bd8">回环 HTTP</text>
+<path d="M660,195 L660,295" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="625" y="223" width="70" height="21" rx="3" fill="#f7f4eb"/>
+<text x="660" y="237" text-anchor="middle" font-size="13" fill="#244bd8">HTTPS</text>
+<path d="M660,385 L660,455" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="613" y="398" width="94" height="21" rx="3" fill="#f7f4eb"/>
+<text x="660" y="412" text-anchor="middle" font-size="13" fill="#244bd8">本机 HTTP</text>
+<path d="M235,405 L235,517 L245,517" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="121" y="431" width="58" height="21" rx="3" fill="#f7f4eb"/>
+<text x="150" y="445" text-anchor="middle" font-size="13" fill="#244bd8">互斥写入</text>
+<path d="M235,675 L235,625 L390,625 L390,580" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M620,580 L620,675" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M805,517 L935,517" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="823" y="495" width="94" height="21" rx="3" fill="#f7f4eb"/>
+<text x="870" y="509" text-anchor="middle" font-size="13" fill="#244bd8">按配置发送请求</text>
+<path d="M805,885 L875,885 L875,565 L805,565" fill="none" stroke="#244bd8" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="846" y="703" width="58" height="21" rx="3" fill="#f7f4eb"/>
+<text x="875" y="717" text-anchor="middle" font-size="13" fill="#244bd8">按需读取</text>
+<text x="60" y="257" font-size="13" letter-spacing="1" fill="#244bd8" stroke="#f7f4eb" stroke-width="5" paint-order="stroke">自托管主机 · 同一工作区一把实例锁</text>
+<g data-node-id="browser"><rect x="65" y="125" width="330" height="70" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="83" y="153" font-size="20" font-weight="600">本机浏览器</text>
+<text x="83" y="178" font-size="15" fill="#5d6a70">访问管理台</text>
+</g>
+<g data-node-id="remote"><rect x="485" y="125" width="350" height="70" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="503" y="153" font-size="20" font-weight="600">远程维护者</text>
+<text x="503" y="178" font-size="15" fill="#5d6a70">由部署方提供 HTTPS</text>
+</g>
+<g data-node-id="proxy"><rect x="485" y="295" width="320" height="90" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="503" y="323" font-size="20" font-weight="600">可选：反向代理／TLS</text>
+<text x="503" y="348" font-size="15" fill="#5d6a70">独立部署组件</text>
+<text x="503" y="371" font-size="15" fill="#5d6a70">管理认证始终开启</text>
+</g>
+<g data-node-id="binary"><rect x="245" y="455" width="560" height="125" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="263" y="483" font-size="20" font-weight="600">basalt · 单个 Go 二进制</text>
+<text x="263" y="508" font-size="16" fill="#5d6a70">serve → 127.0.0.1:8080 ＋ 内嵌 /console/</text>
+<text x="263" y="531" font-size="16" fill="#5d6a70">运行、定时、管理与审计</text>
+</g>
+<g data-node-id="cli"><rect x="75" y="315" width="320" height="90" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="93" y="343" font-size="20" font-weight="600">本机终端</text>
+<text x="93" y="368" font-size="15" fill="#5d6a70">chat／tool／profile 命令</text>
+<text x="93" y="391" font-size="15" fill="#5d6a70">独立 CLI 写操作前先停止 serve</text>
+</g>
+<g data-node-id="config"><rect x="75" y="675" width="320" height="90" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="93" y="703" font-size="20" font-weight="600">basalt.yaml</text>
+<text x="93" y="728" font-size="15" fill="#5d6a70">实例配置</text>
+<text x="93" y="751" font-size="15" fill="#5d6a70">环境变量凭据引用</text>
+</g>
+<g data-node-id="data"><rect x="435" y="675" width="370" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="453" y="703" font-size="20" font-weight="600">自托管工作区 .basalt/</text>
+<text x="453" y="728" font-size="16" fill="#5d6a70">basalt.db · 内嵌 SQLite</text>
+<text x="453" y="751" font-size="16" fill="#5d6a70">Agent／技能／会话／记忆数据</text>
+<text x="453" y="774" font-size="16" fill="#5d6a70">按运维流程备份</text>
+</g>
+<g data-node-id="external"><rect x="935" y="455" width="330" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="953" y="483" font-size="20" font-weight="600">配置的外部服务</text>
+<text x="953" y="508" font-size="15" fill="#5d6a70">模型端点</text>
+<text x="953" y="531" font-size="15" fill="#5d6a70">MCP／HTTP／通知服务</text>
+<text x="953" y="554" font-size="15" fill="#5d6a70">各自的凭据与依赖</text>
+</g>
+<g data-node-id="key"><rect x="75" y="830" width="730" height="110" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="93" y="858" font-size="20" font-weight="600">使用托管凭据时</text>
+<text x="93" y="883" font-size="16" fill="#5d6a70">主密钥保存在 .basalt/ 之外，配置独立权限并单独备份</text>
+<text x="93" y="906" font-size="16" fill="#5d6a70">纯环境变量凭据模式不需要此主密钥</text>
+</g>
+<text x="40" y="1075" font-size="15" fill="#5d6a70">远程代理、认证、备份与升级请按公开运维手册操作；本图不把多节点部署画成现状。</text>
+<text x="40" y="1101" font-size="12" fill="#5d6a70">源码提交: eb97cd539e51 · 当前实现</text>
+</g></svg>

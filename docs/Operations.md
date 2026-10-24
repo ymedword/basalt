@@ -1,8 +1,8 @@
 # Basalt 运维手册：依赖条件、监听与出网、时区、备份、升级与停机、凭证
 
-> 本文档是 Basalt 三件套工件中的**运维篇**：装、看、备份、升级、停机、凭证六件事的操作口径与判据。契约四件（Run 与错误 / AGENT.md 与工具 / 完整 DDL / 静态 OpenAPI）见 [contracts/](contracts/)，兼容性与迁移边界见 [Compatibility.md](Compatibility.md)，Why/What/How 见 [IndustrySurvey.md](IndustrySurvey.md)、[Requirements.md](Requirements.md)、[TechnicalDesign.md](TechnicalDesign.md)。
+> 本文档是 Basalt 的**运维篇**：装、看、备份、升级、停机、凭证六件事的操作口径与判据。契约四件（Run 与错误 / AGENT.md 与工具 / 完整 DDL / 静态 OpenAPI）见 [contracts/](contracts/)，项目入口见 [README](../README.md)。设计正文（兼容性与迁移、Why / What / How）由维护者内部维护，不随公开仓库发布，本文不重复。
 >
-> 本文与 [TechnicalDesign.md](TechnicalDesign.md) 冲突时**以技术方案为准**。本文不重复设计理由，只写"运维照着做"的动作、判据与代价。
+> 本文与维护者的技术方案冲突时**以技术方案为准**（技术方案不随公开仓库发布）。本文不重复设计理由，只写"运维照着做"的动作、判据与代价。
 
 ---
 
@@ -41,7 +41,7 @@
 
 **必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并配置 `http.admin_auth.mode=token` 与 `http.admin_auth.token=${BASALT_ADMIN_TOKEN}`；token 未配置、解析为空或仍含 `${...}` → 拒绝启动。反向代理 / 隧道**不得**因上游连接是回环而绕过认证；`local_trust` 只在所有监听地址都是回环时允许，且只看**直接对端**，不看 `X-Forwarded-For` / `X-Real-IP`。
 
-症状与代价：改了 `0.0.0.0` 却不配 token、不做 TLS 与网络隔离 = 把"可调 Agent（含 `shell` 工具）"连同 bearer token 一起暴露在明文链路上。admin token 只是核心阶段的最低门槛，**没有**企业 SSO / 多租户 / RBAC（扩展阶段）；远程管理**必须**经 HTTPS 或明确的可信加密通道，TLS 终止与证书轮换由部署方负责。OpenClaw 的 42,665 个暴露实例就是这么来的（见 [IndustrySurvey.md](IndustrySurvey.md) §4–5）。
+症状与代价：改了 `0.0.0.0` 却不配 token、不做 TLS 与网络隔离 = 把"可调 Agent（含 `shell` 工具）"连同 bearer token 一起暴露在明文链路上。admin token 只是核心阶段的最低门槛，**没有**企业 SSO / 多租户 / RBAC（扩展阶段）；远程管理**必须**经 HTTPS 或明确的可信加密通道，TLS 终止与证书轮换由部署方负责。公开报道中已有大量 agent 管理端口暴露在公网导致会话与凭证泄漏的案例，不要把"能连上"当成"可以这样部署"。
 
 复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`；非回环部署在**不配置** `http.admin_auth.token` 时必须观察到启动失败（fail-closed），而不是"起来了但没人能进"。
 
@@ -583,7 +583,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 
 ## 7. 每日 Demo 与隔离演练
 
-五套每日场景 D1–D5 的定义和验收见 [TechnicalDesign.md](TechnicalDesign.md) §8.1 与 [Requirements.md](Requirements.md) §2.5。它们是 US-14 待交付素材；环境未准备完时不能把规划命令或替身读数记成生产验证。
+五套每日场景 D1–D5 属于维护者发布验收流程（US-14 待交付素材），定义与验收保存在维护者内部文档。本节只规定演练环境与凭证边界；环境未准备完时不能把规划命令或替身读数记成生产验证。
 
 - 每套场景在演练专用工作区运行，使用虚构数据、测试通知接收器及明确登记的凭证引用；恢复备份演练继续执行 §4.3 的停调度与副作用隔离。
 - D1 需要可控的 HTTP 测试域名；D2 需要已登记技能；D3 需要 Python 和受控脚本路径；D4 需要连续两次运行的记忆基线；D5 需要显式登记的只读 MCP server。逐项验证依赖，缺失时明确失败，不补造结果。

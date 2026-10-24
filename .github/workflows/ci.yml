@@ -244,3 +244,33 @@ jobs:
           name: basalt-binaries
           path: bin/
           if-no-files-found: error
+
+  website:
+    name: website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: website/.nvmrc
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+      - name: Test website
+        working-directory: website
+        run: npm test
+      - name: Build website
+        working-directory: website
+        run: npm run build
+      - name: Check website artifacts
+        working-directory: website
+        run: npm run check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-dist
+          path: website/.vitepress/dist
+          if-no-files-found: error

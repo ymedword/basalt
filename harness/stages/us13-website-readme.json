@@ -1,0 +1,439 @@
+{
+  "version": 1,
+  "id": "us13-website-readme-r1",
+  "approval": "Human review ① 2026-10-24 approved the US-13 module card R2 (docs/us/us13-website-readme.md, sha256 79f53f81736c49e11ff58c9f795610b073dd7cedd616830de9883e1712d4a14a, 1383 lines; R1 submitted at sha256 5fb388d76886ca5279e63640748d7927f326ebf2d9e2a8c15a7833fcd982aa3c, 1335 lines). The ruling selected option A for D-1 through D-6: four pages (docs index added), local reproducible scripted stub, no Pages deployment this round, bilingual diagrams from one drawio source, no site search, and immediate public Operations link fixes. After implementation the user confirmed on 2026-10-24 the current site, README and diagram baseline (R3): six diagram classes with 12 bilingual SVGs and a 12-page drawio source; one localized simplified system-architecture image per README (the historical dual-image README requirement is superseded); five architecture layers with security and audit cross-cutting; all-English terminal demo using read_file; 62 new public files (workspace 68 / public 65 / private 3). Inputs now include those 62 public files individually per T041; no directories. checks are go-docs-consistency (TestPublicDocs_UseAgentFlag, covering the public, requirements-local and operations-links subtests), website-test, website-build, website-check, workflow and scope. Local-only stage: inputs include private docs/us and the three private document edits, so it must not enter harness/stages/current.json or CI; TestStages_CIInputsGitVisible only constrains CI-visible stages. This stage grants no approval by itself. protect uses the whole internal tree plus the contract, gate and ledger paths the module card names; frontend assets and new website files are not stage checks. website-test/-build/-check split the module card website-build family into three ordered checks because the acceptance executor runs argv directly without a shell; all three are required, so no assertion surface is reduced. Node is required for the website checks; no Node means error/not_run, never passed, and not_run cannot close review ②.",
+  "inputs": [
+    "docs/us/us13-website-readme.md",
+    "specs/013-website-readme/spec.md",
+    "specs/013-website-readme/plan.md",
+    "specs/013-website-readme/tasks.md",
+    "harness/acceptance.json",
+    "docs/Operations.md",
+    "docs/TechnicalDesign.md",
+    "docs/Requirements.md",
+    "docs/DevelopmentLoop.md",
+    "docs/us/REGISTRY.md",
+    ".github/workflows/ci.yml",
+    "go.mod",
+    "go.sum",
+    ".gitignore",
+    "README.md",
+    "README.zh-CN.md",
+    ".github/workflows/pages.yml",
+    "internal/cli/public_docs_test.go",
+    "website/.nvmrc",
+    "website/.vitepress/config.mts",
+    "website/.vitepress/data/capabilities.mjs",
+    "website/.vitepress/data/demo.mjs",
+    "website/.vitepress/data/navigation.mjs",
+    "website/.vitepress/data/quickstart.mjs",
+    "website/.vitepress/theme/Layout.vue",
+    "website/.vitepress/theme/components/CapabilityGrid.vue",
+    "website/.vitepress/theme/components/CliDemo.vue",
+    "website/.vitepress/theme/components/DiagramFigure.vue",
+    "website/.vitepress/theme/components/HomeHero.vue",
+    "website/.vitepress/theme/components/LanguageSwitch.vue",
+    "website/.vitepress/theme/components/SiteFooter.vue",
+    "website/.vitepress/theme/custom.css",
+    "website/.vitepress/theme/index.ts",
+    "website/README.md",
+    "website/architecture/index.md",
+    "website/demo/local-model.mjs",
+    "website/demo/transcript.json",
+    "website/diagrams/basalt-diagrams.drawio",
+    "website/docs/index.md",
+    "website/index.md",
+    "website/package-lock.json",
+    "website/package.json",
+    "website/public/brand/basalt-logo.svg",
+    "website/public/brand/favicon.svg",
+    "website/public/brand/rock-column.svg",
+    "website/public/diagrams/en/deployment.svg",
+    "website/public/diagrams/en/execution-flow.svg",
+    "website/public/diagrams/en/module-map.svg",
+    "website/public/diagrams/en/package-dependencies.svg",
+    "website/public/diagrams/en/project-overview.svg",
+    "website/public/diagrams/en/system-architecture.svg",
+    "website/public/diagrams/zh/deployment.svg",
+    "website/public/diagrams/zh/execution-flow.svg",
+    "website/public/diagrams/zh/module-map.svg",
+    "website/public/diagrams/zh/package-dependencies.svg",
+    "website/public/diagrams/zh/project-overview.svg",
+    "website/public/diagrams/zh/system-architecture.svg",
+    "website/public/illustrations/01-define.svg",
+    "website/public/illustrations/02-extend.svg",
+    "website/public/illustrations/03-schedule.svg",
+    "website/public/illustrations/04-remember.svg",
+    "website/public/illustrations/05-observe.svg",
+    "website/public/illustrations/06-self-host.svg",
+    "website/quickstart/index.md",
+    "website/scripts/check-diagrams.mjs",
+    "website/scripts/check-links.mjs",
+    "website/scripts/check-scope.mjs",
+    "website/tests/checks.test.mjs",
+    "website/tests/content.test.mjs",
+    "website/tests/contrast.test.mjs",
+    "website/tests/demo.test.mjs",
+    "website/tests/routes.test.mjs",
+    "website/zh/architecture/index.md",
+    "website/zh/docs/index.md",
+    "website/zh/index.md",
+    "website/zh/quickstart/index.md"
+  ],
+  "protect": [
+    "internal",
+    "docs/contracts",
+    "docs/Operations.md",
+    "docs/TechnicalDesign.md",
+    "docs/Requirements.md",
+    "docs/DevelopmentLoop.md",
+    "docs/us/REGISTRY.md",
+    "specs/012-agent-resource-management",
+    "go.mod",
+    "go.sum",
+    "Makefile",
+    "harness/acceptance.json",
+    "scripts/check-acceptance.sh",
+    "scripts/check-acceptance.ps1",
+    ".github/workflows/ci.yml"
+  ],
+  "checks": [
+    {
+      "id": "go-docs-consistency",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^TestPublicDocs_UseAgentFlag$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestPublicDocs_UseAgentFlag"
+      ]
+    },
+    {
+      "id": "website-test",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "test"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "website-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "website-check",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "run",
+        "check"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "workflow",
+      "args": [
+        "node",
+        "--test",
+        "website/tests/checks.test.mjs"
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "scope",
+      "args": [
+        "node",
+        "website/scripts/check-scope.mjs"
+      ],
+      "timeout_seconds": 300
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T002",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T003",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T007",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T010",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T011",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T015",
+      "checks": [
+        "website-test"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "website-test"
+      ]
+    },
+    {
+      "id": "T017",
+      "checks": [
+        "website-test"
+      ]
+    },
+    {
+      "id": "T018",
+      "checks": [
+        "website-build",
+        "website-check"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T020",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T022",
+      "checks": [
+        "website-test",
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T023",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T024",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T027",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T028",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T029",
+      "checks": [
+        "website-test"
+      ]
+    },
+    {
+      "id": "T030",
+      "checks": [
+        "website-test"
+      ]
+    },
+    {
+      "id": "T031",
+      "checks": [
+        "website-check"
+      ]
+    },
+    {
+      "id": "T032",
+      "checks": [
+        "website-check"
+      ]
+    },
+    {
+      "id": "T033",
+      "checks": [
+        "scope"
+      ]
+    },
+    {
+      "id": "T034",
+      "checks": [
+        "workflow",
+        "website-test"
+      ]
+    },
+    {
+      "id": "T035",
+      "checks": [
+        "workflow"
+      ]
+    },
+    {
+      "id": "T036",
+      "checks": [
+        "workflow"
+      ]
+    },
+    {
+      "id": "T037",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T038",
+      "checks": [
+        "website-build"
+      ]
+    },
+    {
+      "id": "T039",
+      "checks": [
+        "website-test",
+        "website-build",
+        "website-check"
+      ]
+    },
+    {
+      "id": "T040",
+      "checks": [
+        "go-docs-consistency"
+      ]
+    },
+    {
+      "id": "T041",
+      "checks": [
+        "scope"
+      ]
+    },
+    {
+      "id": "T042",
+      "checks": [
+        "scope"
+      ]
+    },
+    {
+      "id": "T043",
+      "checks": [
+        "website-build",
+        "website-check"
+      ]
+    },
+    {
+      "id": "T044",
+      "checks": [
+        "scope"
+      ]
+    }
+  ]
+}

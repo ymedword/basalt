@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1690" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、内嵌 SQLite 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。</desc>
+<metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
+<rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
+<text x="40" y="35" font-size="15" fill="#2447df">BASALT / PROJECT OVERVIEW</text>
+<text x="40" y="85" font-size="34" fill="#151e2b" font-weight="600">Basalt · 项目架构全景</text>
+<text x="40" y="119" font-size="19" fill="#59687a">当前实现 · 独立业务 Agent，共享自托管 Go 运行底座</text>
+<rect x="310" y="160" width="980" height="1325" rx="14" fill="none" stroke="#2447df" stroke-width="2"/>
+<text x="335" y="197" font-size="23" fill="#151e2b" font-weight="600">BASALT · 统一 Go 运行与管理边界</text>
+<text x="335" y="220" font-size="16" fill="#59687a">internal/app 显式装配；CLI 或服务运行模式</text>
+<rect x="330" y="235" width="940" height="110" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
+<text x="350" y="263" font-size="17" fill="#2447df" font-weight="600">01 / 接入层</text>
+<rect x="330" y="385" width="940" height="345" rx="8" fill="#f1f0fa" stroke="#ccd1d8"/>
+<text x="350" y="413" font-size="17" fill="#2447df" font-weight="600">02 / 应用层</text>
+<rect x="330" y="770" width="940" height="150" rx="8" fill="#edf1fb" stroke="#ccd1d8"/>
+<text x="350" y="798" font-size="17" fill="#2447df" font-weight="600">03 / 执行引擎层</text>
+<rect x="330" y="960" width="940" height="155" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
+<text x="350" y="988" font-size="17" fill="#2447df" font-weight="600">04 / 基础服务层</text>
+<rect x="330" y="1155" width="940" height="185" rx="8" fill="#f0f5ef" stroke="#ccd1d8"/>
+<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / 存储层 · .basalt/</text>
+<rect x="330" y="1375" width="940" height="95" rx="8" fill="#e9edf9" stroke="#ccd1d8"/>
+<text x="350" y="1403" font-size="17" fill="#2447df" font-weight="600">安全与运行保障（跨层）</text>
+<path data-edge-id="layer-0" d="M800 345 L800 385" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,385 796,376 804,376" fill="#2447df"/>
+<path data-edge-id="layer-1" d="M800 730 L800 770" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,770 796,761 804,761" fill="#2447df"/>
+<path data-edge-id="layer-2" d="M800 920 L800 960" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,960 796,951 804,951" fill="#2447df"/>
+<path data-edge-id="layer-3" d="M800 1115 L800 1155" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,1155 796,1146 804,1146" fill="#2447df"/>
+<path data-edge-id="console-api" d="M960 307 L940 307" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="940,307 949,303 949,311" fill="#2447df"/>
+<path data-edge-id="cli-entry" d="M280 307 L350 307" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="350,307 341,311 341,303" fill="#2447df"/>
+<path data-edge-id="api-entry" d="M280 362 L300 362 L300 369 L745 369 L745 332" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="745,332 749,341 741,341" fill="#2447df"/>
+<path data-edge-id="config-input" d="M280 665 L330 665" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="330,665 321,669 321,661" fill="#7953a6"/>
+<path data-edge-id="prompt-loop" d="M635 852 L655 852" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="655,852 646,856 646,848" fill="#2447df"/>
+<path data-edge-id="loop-tool" d="M940 852 L960 852" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="960,852 951,856 951,848" fill="#2447df"/>
+<path data-edge-id="tool-result" d="M1110 892 L1110 907 L800 907 L800 892" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,892 804,901 796,901" fill="#2447df"/>
+<path data-edge-id="model-call" d="M350 1049 L280 1049" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="280,1049 289,1045 289,1053" fill="#7953a6"/>
+<path data-edge-id="local-call" d="M1250 852 L1300 852 L1300 670 L1320 670" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,670 1311,674 1311,666" fill="#7953a6"/>
+<path data-edge-id="mcp-call" d="M915 1007 L915 946 L1304 946 L1304 1040 L1320 1040" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,1040 1311,1044 1311,1036" fill="#7953a6"/>
+<path data-edge-id="notify-call" d="M1250 1050 L1299 1050 L1299 1240 L1320 1240" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,1240 1311,1244 1311,1236" fill="#7953a6"/>
+<g data-node-id="cli"><rect x="350" y="282" width="285" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="314" font-size="21" fill="#151e2b" font-weight="600">命令行</text>
+</g>
+<g data-node-id="api"><rect x="655" y="282" width="285" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="314" font-size="21" fill="#151e2b" font-weight="600">HTTP API</text>
+</g>
+<g data-node-id="console"><rect x="960" y="282" width="290" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="314" font-size="21" fill="#151e2b" font-weight="600">Web 管理台</text>
+</g>
+<g data-node-id="report-agent"><rect x="350" y="434" width="440" height="90" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="459" font-size="21" fill="#151e2b" font-weight="600">daily-report · 业务 Agent 示例</text>
+<text x="364" y="482" font-size="17" fill="#59687a">独立 AGENT.md · 模型／工具／技能</text>
+<text x="364" y="504" font-size="17" fill="#59687a">按作用域管理会话、任务与记忆</text>
+</g>
+<g data-node-id="review-agent"><rect x="810" y="434" width="440" height="90" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="459" font-size="21" fill="#151e2b" font-weight="600">file-review · 业务 Agent 示例</text>
+<text x="824" y="482" font-size="17" fill="#59687a">独立 AGENT.md · 模型／工具／技能</text>
+<text x="824" y="504" font-size="17" fill="#59687a">按作用域管理会话、任务与记忆</text>
+</g>
+<g data-node-id="admission"><rect x="350" y="635" width="285" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="660" font-size="21" fill="#151e2b" font-weight="600">Agent 管理服务</text>
+<text x="364" y="683" font-size="17" fill="#59687a">生命周期与运行准入</text>
+<text x="364" y="705" font-size="17" fill="#59687a">每次 Run 固定资源快照</text>
+</g>
+<g data-node-id="resources"><rect x="655" y="635" width="285" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="660" font-size="21" fill="#151e2b" font-weight="600">资源管理服务</text>
+<text x="669" y="683" font-size="17" fill="#59687a">连接与技能版本</text>
+<text x="669" y="705" font-size="17" fill="#59687a">UID／作用域绑定</text>
+</g>
+<g data-node-id="scheduler"><rect x="960" y="635" width="290" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="660" font-size="21" fill="#151e2b" font-weight="600">任务调度服务</text>
+<text x="974" y="683" font-size="17" fill="#59687a">定时与手动触发</text>
+<text x="974" y="705" font-size="17" fill="#59687a">定时执行结果投递</text>
+</g>
+<g data-node-id="prompt"><rect x="350" y="814" width="285" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="839" font-size="21" fill="#151e2b" font-weight="600">PromptBuilder</text>
+<text x="364" y="862" font-size="17" fill="#59687a">系统提示／记忆／历史</text>
+<text x="364" y="884" font-size="17" fill="#59687a">工具定义与上下文限制</text>
+</g>
+<g data-node-id="loop"><rect x="655" y="814" width="285" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="839" font-size="21" fill="#151e2b" font-weight="600">ReActLoop</text>
+<text x="669" y="862" font-size="17" fill="#59687a">模型与工具的有界循环</text>
+<text x="669" y="884" font-size="17" fill="#59687a">预算／取消／停止</text>
+</g>
+<g data-node-id="executor"><rect x="960" y="814" width="290" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="839" font-size="21" fill="#151e2b" font-weight="600">ToolExecutor</text>
+<text x="974" y="862" font-size="17" fill="#59687a">声明工具集校验</text>
+<text x="974" y="884" font-size="17" fill="#59687a">先审计、后调用；限制输出</text>
+</g>
+<g data-node-id="provider"><rect x="350" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="1032" font-size="20" fill="#151e2b" font-weight="600">模型接入</text>
+<text x="364" y="1055" font-size="17" fill="#59687a">显式名称映射</text>
+<text x="364" y="1077" font-size="17" fill="#59687a">兼容模型协议</text>
+</g>
+<g data-node-id="memory"><rect x="580" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="594" y="1032" font-size="20" fill="#151e2b" font-weight="600">记忆</text>
+<text x="594" y="1055" font-size="17" fill="#59687a">核心记忆注入</text>
+<text x="594" y="1077" font-size="17" fill="#59687a">关键词回查</text>
+</g>
+<g data-node-id="tools"><rect x="810" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="1032" font-size="20" fill="#151e2b" font-weight="600">工具适配</text>
+<text x="824" y="1055" font-size="17" fill="#59687a">内置工具／技能／MCP</text>
+<text x="824" y="1077" font-size="17" fill="#59687a">策略与本地受控执行</text>
+</g>
+<g data-node-id="notify"><rect x="1040" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="1054" y="1032" font-size="20" fill="#151e2b" font-weight="600">通知</text>
+<text x="1054" y="1055" font-size="17" fill="#59687a">命名通知渠道</text>
+<text x="1054" y="1077" font-size="17" fill="#59687a">工具与定时结果投递</text>
+</g>
+<g data-node-id="sqlite"><rect x="350" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">内嵌 SQLite · basalt.db</text>
+<text x="364" y="1251" font-size="17" fill="#59687a">会话／运行／模型与工具审计</text>
+<text x="364" y="1273" font-size="17" fill="#59687a">资源发布版本／加密凭据</text>
+<text x="364" y="1295" font-size="17" fill="#59687a">管理操作／投递／可选记忆载体</text>
+</g>
+<g data-node-id="files"><rect x="810" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="1228" font-size="21" fill="#151e2b" font-weight="600">工作区文件</text>
+<text x="824" y="1251" font-size="17" fill="#59687a">agents/&lt;name&gt;/AGENT.md</text>
+<text x="824" y="1273" font-size="17" fill="#59687a">技能、发布目录与 Agent 自有文件</text>
+<text x="824" y="1295" font-size="17" fill="#59687a">记忆默认使用 Markdown 载体</text>
+</g>
+<g data-node-id="users"><rect x="30" y="245" width="250" height="155" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="270" font-size="20" fill="#151e2b" font-weight="600">使用者与业务系统</text>
+<text x="44" y="293" font-size="17" fill="#59687a">终端使用者</text>
+<text x="44" y="315" font-size="17" fill="#59687a">浏览器 → /console/</text>
+<text x="44" y="337" font-size="17" fill="#59687a">业务系统 → HTTP API</text>
+</g>
+<g data-node-id="config"><rect x="30" y="540" width="250" height="170" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="565" font-size="20" fill="#151e2b" font-weight="600">配置与密钥</text>
+<text x="44" y="588" font-size="17" fill="#59687a">basalt.yaml／环境引用</text>
+<text x="44" y="610" font-size="17" fill="#59687a">托管凭据主密钥</text>
+<text x="44" y="632" font-size="17" fill="#59687a">保存在工作区之外</text>
+<text x="44" y="654" font-size="17" fill="#59687a">按需读取</text>
+</g>
+<g data-node-id="models"><rect x="30" y="970" width="250" height="170" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="995" font-size="20" fill="#151e2b" font-weight="600">模型端点</text>
+<text x="44" y="1018" font-size="17" fill="#59687a">OpenAI 兼容协议</text>
+<text x="44" y="1040" font-size="17" fill="#59687a">远程或本地模型</text>
+<text x="44" y="1062" font-size="17" fill="#59687a">显式配置连接凭据</text>
+<text x="44" y="1084" font-size="17" fill="#59687a">按配置发送请求数据</text>
+</g>
+<g data-node-id="processes"><rect x="1320" y="590" width="250" height="160" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">本地子进程</text>
+<text x="1334" y="638" font-size="17" fill="#59687a">命令与脚本</text>
+<text x="1334" y="660" font-size="17" fill="#59687a">策略与 LocalRunner</text>
+<text x="1334" y="682" font-size="17" fill="#59687a">当前不提供容器</text>
+<text x="1334" y="704" font-size="17" fill="#59687a">级别的故障隔离</text>
+</g>
+<g data-node-id="mcp"><rect x="1320" y="970" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="995" font-size="20" fill="#151e2b" font-weight="600">外部工具系统</text>
+<text x="1334" y="1018" font-size="17" fill="#59687a">MCP 服务</text>
+<text x="1334" y="1040" font-size="17" fill="#59687a">HTTP 业务接口</text>
+<text x="1334" y="1062" font-size="17" fill="#59687a">各自的执行与访问边界</text>
+</g>
+<g data-node-id="destinations"><rect x="1320" y="1170" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="1195" font-size="20" fill="#151e2b" font-weight="600">通知接收方</text>
+<text x="1334" y="1218" font-size="17" fill="#59687a">命名渠道适配器</text>
+<text x="1334" y="1240" font-size="17" fill="#59687a">按配置访问 Webhook</text>
+<text x="1334" y="1262" font-size="17" fill="#59687a">记录投递结果</text>
+</g>
+<text x="350" y="559" font-size="18" fill="#59687a">每个 Agent 有独立声明，按作用域管理业务状态。</text>
+<text x="350" y="606" font-size="18" fill="#59687a">应用服务：生命周期／资源管理／任务调度</text>
+<text x="350" y="1426" font-size="18" fill="#59687a">管理 token · 作用域绑定 · 执行预算／取消</text>
+<text x="350" y="1453" font-size="18" fill="#59687a">两阶段调用审计 · 实例锁 · 恢复时不自动重放</text>
+<text x="40" y="1530" font-size="18" fill="#2447df">实线：进程内调用或依赖     虚线：按配置跨越运行边界</text>
+<text x="40" y="1560" font-size="18" fill="#2447df">这里展示逻辑分层，不是执行时序；CLI 写命令与 serve 共用工作区实例锁。</text>
+<text x="40" y="1600" font-size="18" fill="#59687a">Agent 按逻辑作用域管理；当前图不承诺 Agent 协作、多节点执行或容器隔离。</text>
+<text x="40" y="1629" font-size="18" fill="#59687a">模型与 MCP 可按配置在主机外处理数据；本地工具策略不能约束外部 MCP 服务自身的 I/O。</text>
+<text x="40" y="1665" font-size="15" fill="#59687a">当前实现 · 源码 eb97cd539e51</text>
+</g></svg>

@@ -5,6 +5,9 @@
 /bin/
 *.exe
 
+# 本地临时工具、缓存、验证日志与参考素材
+/tmp/
+
 # 前端依赖目录（构建期依赖；dist 构建产物仍随源码提交，见约束 42）
 assets/console/node_modules/
 
@@ -18,3 +21,9 @@ assets/console/node_modules/
 # Development loop checkpoints, private command logs and generated eval reports
 /.loop/
 /evals/results/
+
+# 官网仅在构建期使用；源图、锁文件和测试保留入库。
+website/node_modules/
+website/.vitepress/dist/
+website/.vitepress/cache/
+website/.vitepress/.temp/

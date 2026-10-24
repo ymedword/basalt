@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1690" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<title id="overview-title">Basalt project architecture</title><desc id="overview-desc">Basalt project overview of the current single-node implementation: entry points and triggers, independently defined Agent scopes, management and admission, shared PromptBuilder/ReActLoop/ToolExecutor, Provider/Memory/tool/notification capabilities, embedded SQLite and workspace files. External users, model APIs, local processes, MCP/HTTP systems and notification destinations are outside the Go runtime boundary. Lifecycle and resource scope checks, published Run snapshots, execution budgets, cancellation, fail-closed two-phase audit, instance locking and non-replay recovery cut across the layers. Logical scopes are not container isolation; CLI and serve writers share an exclusive workspace lock. External model and tool requests follow configured data boundaries. This is a logical project map, not a claimed dynamic workflow or future distributed architecture.</desc>
+<metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
+<rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
+<text x="40" y="35" font-size="15" fill="#2447df">BASALT / PROJECT OVERVIEW</text>
+<text x="40" y="85" font-size="34" fill="#151e2b" font-weight="600">Basalt · project architecture</text>
+<text x="40" y="119" font-size="19" fill="#59687a">Current implementation · independent agents on a shared, self-hosted Go runtime</text>
+<rect x="310" y="160" width="980" height="1325" rx="14" fill="none" stroke="#2447df" stroke-width="2"/>
+<text x="335" y="197" font-size="23" fill="#151e2b" font-weight="600">BASALT · shared Go runtime and management boundary</text>
+<text x="335" y="220" font-size="16" fill="#59687a">Explicitly composed by internal/app; CLI or service mode</text>
+<rect x="330" y="235" width="940" height="110" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
+<text x="350" y="263" font-size="17" fill="#2447df" font-weight="600">01 / ACCESS LAYER</text>
+<rect x="330" y="385" width="940" height="345" rx="8" fill="#f1f0fa" stroke="#ccd1d8"/>
+<text x="350" y="413" font-size="17" fill="#2447df" font-weight="600">02 / APPLICATION LAYER</text>
+<rect x="330" y="770" width="940" height="150" rx="8" fill="#edf1fb" stroke="#ccd1d8"/>
+<text x="350" y="798" font-size="17" fill="#2447df" font-weight="600">03 / EXECUTION ENGINE LAYER</text>
+<rect x="330" y="960" width="940" height="155" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
+<text x="350" y="988" font-size="17" fill="#2447df" font-weight="600">04 / INFRASTRUCTURE SERVICE LAYER</text>
+<rect x="330" y="1155" width="940" height="185" rx="8" fill="#f0f5ef" stroke="#ccd1d8"/>
+<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / STORAGE LAYER · .basalt/</text>
+<rect x="330" y="1375" width="940" height="95" rx="8" fill="#e9edf9" stroke="#ccd1d8"/>
+<text x="350" y="1403" font-size="17" fill="#2447df" font-weight="600">SECURITY AND EXECUTION CONTROLS · CROSS-CUTTING</text>
+<path data-edge-id="layer-0" d="M800 345 L800 385" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,385 796,376 804,376" fill="#2447df"/>
+<path data-edge-id="layer-1" d="M800 730 L800 770" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,770 796,761 804,761" fill="#2447df"/>
+<path data-edge-id="layer-2" d="M800 920 L800 960" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,960 796,951 804,951" fill="#2447df"/>
+<path data-edge-id="layer-3" d="M800 1115 L800 1155" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,1155 796,1146 804,1146" fill="#2447df"/>
+<path data-edge-id="console-api" d="M960 307 L940 307" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="940,307 949,303 949,311" fill="#2447df"/>
+<path data-edge-id="cli-entry" d="M280 307 L350 307" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="350,307 341,311 341,303" fill="#2447df"/>
+<path data-edge-id="api-entry" d="M280 362 L300 362 L300 369 L745 369 L745 332" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="745,332 749,341 741,341" fill="#2447df"/>
+<path data-edge-id="config-input" d="M280 665 L330 665" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="330,665 321,669 321,661" fill="#7953a6"/>
+<path data-edge-id="prompt-loop" d="M635 852 L655 852" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="655,852 646,856 646,848" fill="#2447df"/>
+<path data-edge-id="loop-tool" d="M940 852 L960 852" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="960,852 951,856 951,848" fill="#2447df"/>
+<path data-edge-id="tool-result" d="M1110 892 L1110 907 L800 907 L800 892" fill="none" stroke="#2447df" stroke-width="1.6"/>
+<polygon points="800,892 804,901 796,901" fill="#2447df"/>
+<path data-edge-id="model-call" d="M350 1049 L280 1049" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="280,1049 289,1045 289,1053" fill="#7953a6"/>
+<path data-edge-id="local-call" d="M1250 852 L1300 852 L1300 670 L1320 670" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,670 1311,674 1311,666" fill="#7953a6"/>
+<path data-edge-id="mcp-call" d="M915 1007 L915 946 L1304 946 L1304 1040 L1320 1040" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,1040 1311,1044 1311,1036" fill="#7953a6"/>
+<path data-edge-id="notify-call" d="M1250 1050 L1299 1050 L1299 1240 L1320 1240" fill="none" stroke="#7953a6" stroke-width="1.6" stroke-dasharray="6 5"/>
+<polygon points="1320,1240 1311,1244 1311,1236" fill="#7953a6"/>
+<g data-node-id="cli"><rect x="350" y="282" width="285" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="314" font-size="21" fill="#151e2b" font-weight="600">CLI</text>
+</g>
+<g data-node-id="api"><rect x="655" y="282" width="285" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="314" font-size="21" fill="#151e2b" font-weight="600">HTTP API</text>
+</g>
+<g data-node-id="console"><rect x="960" y="282" width="290" height="50" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="314" font-size="21" fill="#151e2b" font-weight="600">Web console</text>
+</g>
+<g data-node-id="report-agent"><rect x="350" y="434" width="440" height="90" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="459" font-size="21" fill="#151e2b" font-weight="600">daily-report · example Agent</text>
+<text x="364" y="482" font-size="17" fill="#59687a">Own AGENT.md · model / tools / skills</text>
+<text x="364" y="504" font-size="17" fill="#59687a">Scoped sessions, tasks and memory</text>
+</g>
+<g data-node-id="review-agent"><rect x="810" y="434" width="440" height="90" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="459" font-size="21" fill="#151e2b" font-weight="600">file-review · example Agent</text>
+<text x="824" y="482" font-size="17" fill="#59687a">Own AGENT.md · model / tools / skills</text>
+<text x="824" y="504" font-size="17" fill="#59687a">Scoped sessions, tasks and memory</text>
+</g>
+<g data-node-id="admission"><rect x="350" y="635" width="285" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="660" font-size="21" fill="#151e2b" font-weight="600">Agent services</text>
+<text x="364" y="683" font-size="17" fill="#59687a">Lifecycle and admission</text>
+<text x="364" y="705" font-size="17" fill="#59687a">Per-Run resource snapshots</text>
+</g>
+<g data-node-id="resources"><rect x="655" y="635" width="285" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="660" font-size="21" fill="#151e2b" font-weight="600">Resource services</text>
+<text x="669" y="683" font-size="17" fill="#59687a">Connections / skill versions</text>
+<text x="669" y="705" font-size="17" fill="#59687a">UID / scope bindings</text>
+</g>
+<g data-node-id="scheduler"><rect x="960" y="635" width="290" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="660" font-size="21" fill="#151e2b" font-weight="600">Task scheduler</text>
+<text x="974" y="683" font-size="17" fill="#59687a">Cron and manual triggers</text>
+<text x="974" y="705" font-size="17" fill="#59687a">Scheduled result delivery</text>
+</g>
+<g data-node-id="prompt"><rect x="350" y="814" width="285" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="839" font-size="21" fill="#151e2b" font-weight="600">PromptBuilder</text>
+<text x="364" y="862" font-size="17" fill="#59687a">System · memory · history</text>
+<text x="364" y="884" font-size="17" fill="#59687a">Tools · context bounds</text>
+</g>
+<g data-node-id="loop"><rect x="655" y="814" width="285" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="669" y="839" font-size="21" fill="#151e2b" font-weight="600">ReActLoop</text>
+<text x="669" y="862" font-size="17" fill="#59687a">Model and tool rounds</text>
+<text x="669" y="884" font-size="17" fill="#59687a">Budgets · cancel · stop</text>
+</g>
+<g data-node-id="executor"><rect x="960" y="814" width="290" height="78" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="974" y="839" font-size="21" fill="#151e2b" font-weight="600">ToolExecutor</text>
+<text x="974" y="862" font-size="17" fill="#59687a">Declared tool checks</text>
+<text x="974" y="884" font-size="17" fill="#59687a">Audit first · bounded I/O</text>
+</g>
+<g data-node-id="provider"><rect x="350" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="1032" font-size="20" fill="#151e2b" font-weight="600">Provider</text>
+<text x="364" y="1055" font-size="17" fill="#59687a">Explicit name mapping</text>
+<text x="364" y="1077" font-size="17" fill="#59687a">Compatible model API</text>
+</g>
+<g data-node-id="memory"><rect x="580" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="594" y="1032" font-size="20" fill="#151e2b" font-weight="600">Memory</text>
+<text x="594" y="1055" font-size="17" fill="#59687a">Core context injection</text>
+<text x="594" y="1077" font-size="17" fill="#59687a">Keyword recall</text>
+</g>
+<g data-node-id="tools"><rect x="810" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="1032" font-size="20" fill="#151e2b" font-weight="600">Tool adapters</text>
+<text x="824" y="1055" font-size="17" fill="#59687a">Built-ins · skills · MCP</text>
+<text x="824" y="1077" font-size="17" fill="#59687a">Policy + LocalRunner</text>
+</g>
+<g data-node-id="notify"><rect x="1040" y="1007" width="210" height="84" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="1054" y="1032" font-size="20" fill="#151e2b" font-weight="600">Notifications</text>
+<text x="1054" y="1055" font-size="17" fill="#59687a">Named channels</text>
+<text x="1054" y="1077" font-size="17" fill="#59687a">Tool / scheduled output</text>
+</g>
+<g data-node-id="sqlite"><rect x="350" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">Embedded SQLite · basalt.db</text>
+<text x="364" y="1251" font-size="17" fill="#59687a">Sessions · runs · model / tool audits</text>
+<text x="364" y="1273" font-size="17" fill="#59687a">Resource versions · encrypted credentials</text>
+<text x="364" y="1295" font-size="17" fill="#59687a">Operations · delivery · optional memory</text>
+</g>
+<g data-node-id="files"><rect x="810" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
+<text x="824" y="1228" font-size="21" fill="#151e2b" font-weight="600">Workspace files</text>
+<text x="824" y="1251" font-size="17" fill="#59687a">agents/&lt;name&gt;/AGENT.md</text>
+<text x="824" y="1273" font-size="17" fill="#59687a">Skills, versions and Agent-local files</text>
+<text x="824" y="1295" font-size="17" fill="#59687a">Markdown memory by default</text>
+</g>
+<g data-node-id="users"><rect x="30" y="245" width="250" height="155" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="270" font-size="20" fill="#151e2b" font-weight="600">People and systems</text>
+<text x="44" y="293" font-size="17" fill="#59687a">Terminal operators</text>
+<text x="44" y="315" font-size="17" fill="#59687a">Browser → /console/</text>
+<text x="44" y="337" font-size="17" fill="#59687a">Business apps → HTTP API</text>
+</g>
+<g data-node-id="config"><rect x="30" y="540" width="250" height="170" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="565" font-size="20" fill="#151e2b" font-weight="600">Config and secrets</text>
+<text x="44" y="588" font-size="17" fill="#59687a">basalt.yaml · env refs</text>
+<text x="44" y="610" font-size="17" fill="#59687a">Managed master key</text>
+<text x="44" y="632" font-size="17" fill="#59687a">Outside the workspace</text>
+<text x="44" y="654" font-size="17" fill="#59687a">Loaded only when needed</text>
+</g>
+<g data-node-id="models"><rect x="30" y="970" width="250" height="170" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="44" y="995" font-size="20" fill="#151e2b" font-weight="600">Model endpoints</text>
+<text x="44" y="1018" font-size="17" fill="#59687a">OpenAI-compatible API</text>
+<text x="44" y="1040" font-size="17" fill="#59687a">Hosted or local models</text>
+<text x="44" y="1062" font-size="17" fill="#59687a">Configured credentials</text>
+<text x="44" y="1084" font-size="17" fill="#59687a">Request / response data</text>
+</g>
+<g data-node-id="processes"><rect x="1320" y="590" width="250" height="160" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">Local processes</text>
+<text x="1334" y="638" font-size="17" fill="#59687a">Commands and scripts</text>
+<text x="1334" y="660" font-size="17" fill="#59687a">Policy + LocalRunner</text>
+<text x="1334" y="682" font-size="17" fill="#59687a">No container boundary</text>
+<text x="1334" y="704" font-size="17" fill="#59687a">in this version</text>
+</g>
+<g data-node-id="mcp"><rect x="1320" y="970" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="995" font-size="20" fill="#151e2b" font-weight="600">External tool systems</text>
+<text x="1334" y="1018" font-size="17" fill="#59687a">MCP servers</text>
+<text x="1334" y="1040" font-size="17" fill="#59687a">HTTP business endpoints</text>
+<text x="1334" y="1062" font-size="17" fill="#59687a">Their own I/O boundary</text>
+</g>
+<g data-node-id="destinations"><rect x="1320" y="1170" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
+<text x="1334" y="1195" font-size="20" fill="#151e2b" font-weight="600">Notification targets</text>
+<text x="1334" y="1218" font-size="17" fill="#59687a">Named channel adapters</text>
+<text x="1334" y="1240" font-size="17" fill="#59687a">Configured webhooks</text>
+<text x="1334" y="1262" font-size="17" fill="#59687a">Delivery results recorded</text>
+</g>
+<text x="350" y="559" font-size="18" fill="#59687a">Each Agent has its own declaration and scoped business state.</text>
+<text x="350" y="606" font-size="18" fill="#59687a">Application services · lifecycle / resources / task scheduling</text>
+<text x="350" y="1426" font-size="18" fill="#59687a">Admin token · scoped bindings · execution budgets / cancellation</text>
+<text x="350" y="1453" font-size="18" fill="#59687a">Two-phase call audit · instance lock · recovery without replay</text>
+<text x="40" y="1530" font-size="18" fill="#2447df">SOLID: in-process dependency     DASHED: configured boundary crossing</text>
+<text x="40" y="1560" font-size="18" fill="#2447df">Logical layers, not an execution sequence. CLI and serve share an exclusive workspace lock.</text>
+<text x="40" y="1600" font-size="18" fill="#59687a">Agent scopes are logical. Collaboration, multi-node execution and container isolation are outside this view.</text>
+<text x="40" y="1629" font-size="18" fill="#59687a">Models and MCP may process data outside the host. Local tool policies do not contain an external MCP server.</text>
+<text x="40" y="1665" font-size="15" fill="#59687a">Current implementation · source eb97cd539e51</text>
+</g></svg>

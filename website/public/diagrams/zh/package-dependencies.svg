@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1300" viewBox="0 0 1320 1300" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="package-dependencies" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<title id="diagram-title">依赖指向内核，内核不依赖实现。</title>
+<desc id="diagram-desc">实际本地 Go 导入图：cmd/basalt 导入 internal/app；app 导入 cli、web、provider、tool、storage、memory、workspace、adapters/cron、core 和 assets；cli 导入 core 与 channel；web、provider、tool、storage、memory、workspace、adapters/cron 导入 core；memory 还导入 workspace。channel 与 assets 不导入其他本地生产包，core 只导入标准库。省略标准库、外部协议 SDK 与测试专用依赖。箭头由导入者指向依赖。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
+<rect width="1320" height="1300" fill="#f7f4eb"/>
+<g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
+<text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / PACKAGE DEPENDENCIES</text>
+<text x="40" y="85" font-size="32" font-weight="600">依赖指向内核，内核不依赖实现。</text>
+<text x="40" y="115" font-size="17" fill="#5d6a70">当前源码中的 Go 直接导入关系 · 仅生产包</text>
+<path d="M180,225 L180,580" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,186 L490,186" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,306 L490,306" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,426 L490,426" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,546 L490,546" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,666 L490,666" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,786 L490,786" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,906 L490,906" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M305,627 L390,627 L390,1026 L490,1026" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,186 L900,186 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,306 L900,306 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,426 L900,426 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,546 L900,546 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,666 L900,666 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,786 L900,786 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,906 L900,906 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,1026 L900,1026 L900,692 L1010,692" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M770,186 L835,186 L835,357 L1010,357" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M630,822 L630,870" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="601" y="824" width="58" height="21" rx="3" fill="#f7f4eb"/>
+<text x="630" y="838" text-anchor="middle" font-size="13" fill="#244bd8">直接导入</text>
+<path d="M305,605 L340,605 L340,133 L1135,133 L1135,150" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M180,675 L180,1140 L1135,1140 L1135,755" fill="none" stroke="#244bd8" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="592.5" y="1118" width="130" height="21" rx="3" fill="#f7f4eb"/>
+<text x="657.5" y="1132" text-anchor="middle" font-size="13" fill="#244bd8">app → core</text>
+<g data-node-id="cmd"><rect x="55" y="150" width="250" height="75" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="73" y="178" font-size="18" font-weight="600">cmd/basalt</text>
+<text x="73" y="203" font-size="15" fill="#5d6a70">可执行入口</text>
+</g>
+<g data-node-id="app"><rect x="55" y="580" width="250" height="95" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="73" y="608" font-size="18" font-weight="600">internal/app</text>
+<text x="73" y="633" font-size="15" fill="#5d6a70">装配根</text>
+<text x="73" y="656" font-size="15" fill="#5d6a70">显式持有各实现依赖</text>
+</g>
+<g data-node-id="cli"><rect x="490" y="150" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="193" font-size="18" font-weight="600">internal/cli</text>
+</g>
+<g data-node-id="web"><rect x="490" y="270" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="313" font-size="18" font-weight="600">internal/web</text>
+</g>
+<g data-node-id="provider"><rect x="490" y="390" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="433" font-size="18" font-weight="600">internal/provider</text>
+</g>
+<g data-node-id="tool"><rect x="490" y="510" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="553" font-size="18" font-weight="600">internal/tool</text>
+</g>
+<g data-node-id="storage"><rect x="490" y="630" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="673" font-size="18" font-weight="600">internal/storage</text>
+</g>
+<g data-node-id="memory"><rect x="490" y="750" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="793" font-size="18" font-weight="600">internal/memory</text>
+</g>
+<g data-node-id="workspace"><rect x="490" y="870" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="913" font-size="18" font-weight="600">internal/workspace</text>
+</g>
+<g data-node-id="cron"><rect x="490" y="990" width="280" height="72" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="508" y="1033" font-size="18" font-weight="600">internal/adapters/cron</text>
+</g>
+<g data-node-id="assets"><rect x="1010" y="150" width="250" height="75" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="1028" y="178" font-size="18" font-weight="600">assets</text>
+<text x="1028" y="203" font-size="15" fill="#5d6a70">内嵌管理台资源</text>
+</g>
+<g data-node-id="channel"><rect x="1010" y="320" width="250" height="75" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
+<text x="1028" y="348" font-size="18" font-weight="600">internal/channel</text>
+<text x="1028" y="373" font-size="15" fill="#5d6a70">不导入本地生产包</text>
+</g>
+<g data-node-id="core"><rect x="1010" y="630" width="250" height="125" rx="7" fill="#e9edf9" stroke="#244bd8" stroke-width="1.2"/>
+<text x="1028" y="658" font-size="18" font-weight="600">internal/core</text>
+<text x="1028" y="683" font-size="15" fill="#5d6a70">领域端口与运行内核</text>
+<text x="1028" y="706" font-size="15" fill="#5d6a70">仅依赖标准库</text>
+<text x="1028" y="729" font-size="15" fill="#5d6a70">不导入具体实现包</text>
+</g>
+<text x="40" y="1255" font-size="15" fill="#5d6a70">箭头表示直接导入；省略标准库、协议 SDK 与测试专用依赖。执行循环不由 Agent 框架接管。</text>
+<text x="40" y="1281" font-size="12" fill="#5d6a70">源码提交: eb97cd539e51 · 当前实现</text>
+</g></svg>

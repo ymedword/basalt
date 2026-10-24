@@ -1,0 +1,12 @@
+{
+    "capturedAt":  "2026-10-24T09:52:31.8241711+00:00",
+    "source":  "local-openai-compatible",
+    "stub":  "website/demo/local-model.mjs",
+    "command":  "basalt chat --agent demo --message \"Hello\"",
+    "lines":  [
+                  "⚙ 调用工具 read_file…",
+                  "Basalt is a self-hosted Agent OS.",
+                  "Independent agents share execution, scheduling and auditing."
+              ],
+    "exitCode":  0
+}

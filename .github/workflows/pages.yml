@@ -1,0 +1,44 @@
+name: Publish website manually
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: website/.nvmrc
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Build and check website
+        working-directory: website
+        run: |
+          npm ci
+          npm test
+          npm run build
+          npm run check
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/.vitepress/dist
+      - name: Publish static website
+        id: deployment
+        uses: actions/deploy-pages@v4
