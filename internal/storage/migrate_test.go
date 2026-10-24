@@ -73,22 +73,35 @@ func tableNamesOf(t *testing.T, db *sql.DB) []string {
 	return names
 }
 
-// contractTables 是契约 schema.sql 建齐的 18 张用户表（v1 十一张 + v2 七张，排序后）。
-// contractTables are the eighteen user tables of the v2 contract schema, sorted.
+// contractTables 是契约 schema.sql 建齐的 29 张用户表（v1 十一张 + v2 七张 +
+// v3 八张 + v4 两张 + v5 一张，排序后）。v4 两张 = schedule_deliveries /
+// resource_connection_tests；v5 一张 = network_domain_policy（出网域名白名单的唯一权威行）。
+// contractTables are the twenty-nine user tables of the v5 contract schema, sorted.
 var contractTables = []string{
 	"agent_archives",
 	"agent_lifecycle",
+	"agent_resource_bindings",
 	"config_snapshots",
+	"credential_versions",
+	"credentials",
 	"llm_calls",
 	"management_operations",
 	"memory_entries",
 	"messages",
+	"network_domain_policy",
 	"notify_channels",
+	"notify_deliveries",
+	"resource_connection_tests",
+	"resource_identities",
 	"resource_pointers",
+	"resource_version_credentials",
 	"resource_versions",
+	"run_credential_refs",
+	"run_notify_refs",
 	"run_resource_manifests",
 	"run_resource_refs",
 	"runs",
+	"schedule_deliveries",
 	"scheduled_tasks",
 	"schema_version",
 	"sessions",
@@ -96,7 +109,7 @@ var contractTables = []string{
 	"tool_invocations",
 }
 
-// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 18 表 + 版本行 = target；
+// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 29 表 + 版本行 = target；
 // 建表与版本行同一事务（颗粒度文档 §4.2 映射）。
 func TestMigrate_NewDatabaseCreatesAllTables(t *testing.T) {
 	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
@@ -316,10 +329,10 @@ func TestMigrate_VersionRowsRecordDescriptions(t *testing.T) {
 }
 
 // TestMigrate_SupportedVersionHasMigrationFile：支持版本与迁移文件名编号对齐——
-// 常量改动而忘记追加迁移文件时在此拦下（契约 v2 基线）。
+// 常量改动而忘记追加迁移文件时在此拦下（契约 v5 基线）。
 // The supported version must have its own migration file.
 func TestMigrate_SupportedVersionHasMigrationFile(t *testing.T) {
 	name, err := migrationFile(schemaFS, SupportedSchemaVersion)
 	require.NoError(t, err)
-	require.Equal(t, "migrations/0002_us11_us12_resources.sql", name)
+	require.Equal(t, "migrations/0005_network_domain_policy.sql", name)
 }

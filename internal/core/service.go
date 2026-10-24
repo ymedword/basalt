@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -262,7 +263,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
 		}
-		manifest, err = BuildRunResourceManifest(lifecycle.State, resolved)
+		manifest, err = BuildRunResourceManifest(lifecycle.AgentUID, lifecycle.State, resolved)
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
 		}
@@ -327,16 +328,35 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if s.opts.Resources != nil {
 		runResources = &manifest
 	}
+	// 通知授权随准入落定（R4.7）：接了资源解析端口时，模式与**具体渠道 UID** 来自准入
+	// 枚举结果；没有端口（轻装配 / 直调）时退回 Profile 兼容读取（空 = 不限，工具按名判定）。
+	// The notify grant is frozen at admission: concrete channel uids when resources are
+	// wired, the profile compatibility read otherwise.
+	notifyMode, notifyChannels := s.notifyGrant(resolved, snap)
+	toolSet := snapshotTools(snap)
+	// 系统代投的 Run 不向模型提供 notify（R7）：工具名集里删掉它，模式固定 none。
+	// 授权层仍按 none 兜底——即使工具因装配错误仍在池里，调用也会被拒。
+	// A system-delivery run never sees the notify tool, and the grant is forced to none as
+	// the authorization-layer backstop.
+	if req.SuppressNotify {
+		notifyMode, notifyChannels = NotifyModeNone, nil
+		toolSet = withoutToolName(toolSet, "notify")
+	}
 	env := &RunEnv{
 		Req:       req,
+		AgentUID:  lifecycle.AgentUID,
 		Snapshot:  snap,
 		Resources: runResources,
 		Session:   sess,
 		Budget:    mergeBudget(req.Budget, snap.Profile),
-		ToolSet:   snapshotTools(snap),
+		ToolSet:   toolSet,
 		llmClient: llmClient,
 		agentDir:  s.opts.Agents.Dir(req.Agent),
 		skillDirs: boundSkillDirs(resolved),
+		// 模式与渠道集合随 Run 准入冻结，工具调用只读这一份副本（改文件不影响在途运行）。
+		// The mode and channel set are frozen at admission; tool calls never re-read the file.
+		notifyMode:     notifyMode,
+		notifyChannels: notifyChannels,
 	}
 	if s.opts.Memory != nil {
 		text, err := s.opts.Memory.LoadEffective(ctx, req.Agent)
@@ -542,15 +562,15 @@ func (s *AgentService) admitLifecycle(ctx context.Context, agent string) (Lifecy
 	switch {
 	case err != nil && errors.Is(err, fs.ErrNotExist):
 		s.opts.Logger.Error("生命周期状态文件缺失，拒绝新运行", "agent", agent, "op", "admit")
-		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Reason: agentUnavailableMissing, Cause: err}
+		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Kind: AgentUnavailableMissing, Reason: agentUnavailableMissing, Cause: err}
 	case err != nil:
 		s.opts.Logger.Error("生命周期状态文件损坏，拒绝新运行", "agent", agent, "op", "admit")
-		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Reason: agentUnavailableCorrupt, Cause: err}
+		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Kind: AgentUnavailableCorrupt, Reason: agentUnavailableCorrupt, Cause: err}
 	case !exists:
 		s.opts.Logger.Error("生命周期状态文件缺失，拒绝新运行", "agent", agent, "op", "admit")
-		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Reason: agentUnavailableMissing}
+		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, Kind: AgentUnavailableMissing, Reason: agentUnavailableMissing}
 	case rec.State != AgentActive:
-		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, State: rec.State, Reason: lifecycleReason(rec.State)}
+		return LifecycleRecord{}, &AgentUnavailableError{Name: agent, State: rec.State, Kind: lifecycleKind(rec.State), Reason: lifecycleReason(rec.State)}
 	}
 	return rec, nil
 }
@@ -629,6 +649,19 @@ func (s *AgentService) resourceUnavailable(agent string, cause error) error {
 		Name:   agent,
 		Reason: "published resource version unavailable; re-run the baseline or republish",
 		Cause:  cause,
+	}
+}
+
+// lifecycleKind 把非 active 状态映射为机器可判分类（界面文案由 web 层按它出中文）。
+// lifecycleKind maps a non-active state to the machine-judgeable category.
+func lifecycleKind(state AgentState) AgentUnavailableKind {
+	switch state {
+	case AgentDisabled:
+		return AgentUnavailableDisabled
+	case AgentArchived:
+		return AgentUnavailableArchived
+	default:
+		return AgentUnavailableOther
 	}
 }
 
@@ -761,6 +794,24 @@ func mergeBudget(req Budget, profile *Profile) Budget {
 	return req
 }
 
+// notifyGrant 摊平本次 Run 的通知授权（R4.7）：接了资源解析端口时取准入枚举的**具体
+// 渠道 UID**（`all_eligible` 已枚举共享 ∪ 本人专属、`allowlist` 只取声明 UID，`none`
+// 为空），顺序沿用清单的 UID 升序；没有端口时退回 Profile 兼容读取（US-8 口径）。
+// 冻结之后工具面只认这份副本——空集合在 Run 内不等于「不限制」。
+// notifyGrant flattens the admitted notification grant into concrete channel uids; without
+// the resources port it falls back to the profile compatibility read.
+func (s *AgentService) notifyGrant(resolved ResolvedResources, snap *ConfigSnapshot) (NotifyMode, []string) {
+	if s.opts.Resources != nil {
+		uids := make([]string, 0, len(resolved.Notify.Channels))
+		for _, ref := range resolved.Notify.Channels {
+			uids = append(uids, string(ref.ResourceUID))
+		}
+		return resolved.Notify.Mode, uids
+	}
+	return EffectiveNotifyMode(snap.Profile.NotifyMode, snap.Profile.NotifyChannels),
+		slices.Clone(snap.Profile.NotifyChannels)
+}
+
 // snapshotTools 取快照冻结的工具名集；Profile 缺失（未注册的 Agent 不会有快照）时为空池。
 // **空池 ≠ 全部可用**：不声明就是没有工具（陷阱 #9）。
 // snapshotTools returns the frozen tool-name set; an absent profile means an empty pool,
@@ -770,6 +821,20 @@ func snapshotTools(snap *ConfigSnapshot) []string {
 		return nil
 	}
 	return snap.Profile.Tools
+}
+
+// withoutToolName 返回去掉指定工具名的副本（不修改快照切片——快照被多个 Run 共享）。
+// withoutToolName returns a copy without the named tool; the snapshot slice is shared and
+// must never be mutated.
+func withoutToolName(tools []string, name string) []string {
+	out := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if tool == name {
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
 }
 
 // runSuffix 生成 RunID 的随机段：**6 位 base36 小写**（§6 固定口径）。

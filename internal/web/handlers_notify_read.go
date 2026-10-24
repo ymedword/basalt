@@ -9,6 +9,7 @@ package web
 // 本 US **不**提供创建 / 更新 / 删除（US-12 落地写面）。
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 
@@ -31,11 +32,34 @@ func (s *Server) handleListNotifyChannels(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
 		return
 	}
+	names := make([]string, 0, len(channels))
+	for _, ch := range channels {
+		names = append(names, ch.Name)
+	}
+	references, err := s.notifyReferences(r.Context(), names)
+	if err != nil {
+		// 失败关闭：空引用集合会被页面读成"没有任何 Agent 引用"。
+		// Fail closed: an empty map would read as "no agent references this channel".
+		s.logger().Error("扫描通知渠道引用失败", "error", err)
+		s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
+		return
+	}
 	views := make([]NotifyChannelView, 0, len(channels))
 	for _, ch := range channels {
-		views = append(views, notifyChannelView(ch))
+		views = append(views, notifyChannelView(ch, references[ch.Name]))
 	}
 	s.writeOK(w, views)
+}
+
+// notifyReferences 查询一组渠道的文档引用者。端口未装配（测试 / 无工作区嵌入）时
+// 返回空映射；读面**不得**把查询失败降级成空映射（见 handleListNotifyChannels）。
+// notifyReferences resolves document references; a missing port is an empty map, but
+// a failed scan is never downgraded to one.
+func (s *Server) notifyReferences(ctx context.Context, names []string) (map[string][]string, error) {
+	if s.opts.NotifyReferences == nil || len(names) == 0 {
+		return map[string][]string{}, nil
+	}
+	return s.opts.NotifyReferences.NotifyReferences(ctx, names)
 }
 
 // handleNotifyTypes 处理 `GET /api/v1/notify-channels/types`：返回装配层登记的类型名，

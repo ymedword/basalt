@@ -80,6 +80,15 @@ type AgentLoaderOptions struct {
 	// 不得自己再读一次配置：同一文件两次读取正是陷阱 39 的根因形态）。
 	Providers []string
 
+	// ProvidersFunc 是**当前**已发布 provider 名集的动态来源（R4 运行期发布）：
+	// 非 nil 时每次判定都重新取值，覆盖 Providers 的构造期快照。装配层传运行期目录
+	// 原子持有者的读取函数——发布 / 撤回 / 删除对下一次候选校验与热加载立即生效，
+	// 新建的模型连接因此无需重启即可被 Agent 绑定（2026-10-23 浏览器走查发现的
+	// 「新建连接保存绑定报 provider not registered」缺口）。
+	// ProvidersFunc, when non-nil, supplies the current published name set on every
+	// validation and takes precedence over the construction-time snapshot.
+	ProvidersFunc func() []string
+
 	// Tools 是已注册工具名（注册池名字快照）：装配期从工具注册表导出后注入，
 	// workspace 因此**不**反向依赖 tool 包（§2.4 注 4）。零值 = **空池**——未声明
 	// `tools:` 的 Agent 照常注册，声明了 `tools:` 的 Agent 整只不注册。
@@ -123,29 +132,42 @@ type AgentLoader struct {
 	// by the run snapshot path.
 	contexts *ContextLoader
 
-	providers    []string
-	tools        []string
-	mcpServers   []string
-	mcpConnected []string
-	logger       *slog.Logger
+	providers     []string
+	providersFunc func() []string
+	tools         []string
+	mcpServers    []string
+	mcpConnected  []string
+	logger        *slog.Logger
 }
 
 // NewAgentLoader 构造装载器；provider 与工具名集切片在构造时各拷贝一份，调用方
-// 后续改动不影响判定（判定输入一旦给定就冻结）。
-// NewAgentLoader snapshots the injected provider and tool names.
+// 后续改动不影响判定（判定输入一旦给定就冻结）。ProvidersFunc 是对"冻结"的显式
+// 例外：它的值本身就是运行期目录的当前快照，每次判定重新读取。
+// NewAgentLoader snapshots the injected provider and tool names; ProvidersFunc is the
+// explicit exception because its value is the runtime catalog's current snapshot.
 func NewAgentLoader(opts AgentLoaderOptions) *AgentLoader {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &AgentLoader{
-		contexts:     NewContextLoader(logger),
-		providers:    slices.Clone(opts.Providers),
-		tools:        slices.Clone(opts.Tools),
-		mcpServers:   slices.Clone(opts.MCPServers),
-		mcpConnected: slices.Clone(opts.MCPConnected),
-		logger:       logger,
+		contexts:      NewContextLoader(logger),
+		providers:     slices.Clone(opts.Providers),
+		providersFunc: opts.ProvidersFunc,
+		tools:         slices.Clone(opts.Tools),
+		mcpServers:    slices.Clone(opts.MCPServers),
+		mcpConnected:  slices.Clone(opts.MCPConnected),
+		logger:        logger,
 	}
+}
+
+// registeredProviders 返回本次判定使用的 provider 名集：动态来源优先，静态快照兜底。
+// registeredProviders prefers the dynamic source and falls back to the snapshot.
+func (l *AgentLoader) registeredProviders() []string {
+	if l.providersFunc != nil {
+		return l.providersFunc()
+	}
+	return l.providers
 }
 
 // LoadAll 装载全部 Agent 目录；单只失败不拖垮整批（其余照常）。不提供 LoadOne——
@@ -226,11 +248,13 @@ func (l *AgentLoader) LoadAll(root string) (entries []core.AgentEntry, err error
 		}
 		entry, rej := l.loadOne(base, lib, d.Name(), mcpNames, l.mcpConnected, claim)
 		switch {
-		case rej.reason != "":
+		case rej.kind != "":
+			entry.RejectKind = rej.kind
+			entry.RejectDetail = rej.detail
 			entry.RejectReason = rej.mergedReason()
 			// 固定键：agent / reason / detail（reason 取契约字面量原样）。
 			l.logger.Warn("Agent 未注册", "agent", entry.Name,
-				"reason", rej.reason, "detail", rej.detail)
+				"reason", rej.logReason(), "detail", rej.detail)
 		case entry.Unverified:
 			// 第三态只展示：不提交调度 id 占用、不置 Registered（运行面只收 Registered）。
 		default:
@@ -245,28 +269,41 @@ func (l *AgentLoader) LoadAll(root string) (entries []core.AgentEntry, err error
 	return entries, nil
 }
 
-// reject 是加载失败的内部形态（非导出）：reason 取契约字面量原样或自描述短语，
+// reject 是加载失败的内部形态（非导出）：kind 是契约字面量的**类型化分类**，
 // detail 放点名细节。两者分开是因为日志要**分键**（agent / reason / detail），
 // 而 AgentEntry.RejectReason 给人读（mergedReason）。
-// reject is the internal failure shape: reason is the contract literal, detail the
-// pointer, and LogReason merges the two for human eyes.
+// reject is the internal failure shape: kind is the typed contract literal, detail the
+// pointer, and mergedReason joins the two for logs.
 //
-// claimed 是本只 Agent 的调度 id 占用集——只有"reason 为空"（全过）时非零，
+// claimed 是本只 Agent 的调度 id 占用集——只有"kind 为空"（全过）时非零，
 // LoadAll 据此提交；被拒时为零值（本只的占用一律不入表）。
 type reject struct {
-	reason  string            // name mismatch / blank model / skill not found: <n> / invalid schedule / …
-	detail  string            // 键路径 / 文件路径 / 任务 id / cron 原文——契约字面量含名字时不重复填
-	claimed map[string]string // 任务 id → 占用者（本只）；被拒时为零值
+	kind    core.AgentRejectKind // 零值 = 未被拒
+	detail  string               // 键路径 / 文件路径 / 任务 id / cron 原文——契约字面量含名字时不重复填
+	claimed map[string]string    // 任务 id → 占用者（本只）；被拒时为零值
 }
 
 // mergedReason 人读合并：detail 为空 → reason；否则 "reason: detail"
 // （契约字面量原样在前——用例断言一律用 Contains 判前缀）。
-// mergedReason joins reason and detail for terminal output.
+// mergedReason joins the kind literal and detail for terminal output.
 func (r reject) mergedReason() string {
 	if r.detail == "" {
-		return r.reason
+		return string(r.kind)
 	}
-	return r.reason + ": " + r.detail
+	return string(r.kind) + ": " + r.detail
+}
+
+// logReason 复刻历史 WARN 形状：provider / tool 两类把对象并入 `reason`
+// （契约字面量 `provider not registered: <name>` / `tool not registered: <name>`），
+// 其余类别 `reason` 只出类别、对象进 `detail`。日志是诊断面，保持既有可读性。
+// logReason keeps the historical WARN shape for the two name-carrying categories.
+func (r reject) logReason() string {
+	switch r.kind {
+	case core.AgentRejectProviderNotRegistered, core.AgentRejectToolNotRegistered:
+		return r.mergedReason()
+	default:
+		return string(r.kind)
+	}
 }
 
 // loadOne 装载单只 Agent 目录：读取 → 解析 → 八条校验 → 拒绝或返回占用集。
@@ -279,7 +316,7 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 	defPath := agentDefinitionPath(name)
 	raw, err := base.ReadFile(filepath.FromSlash(defPath))
 	if err != nil {
-		return entry, reject{reason: "read AGENT.md failed", detail: defPath}
+		return entry, reject{kind: core.AgentRejectReadFailed, detail: defPath}
 	}
 	// 本次读到的字节就是这只 Agent 的**校验字节**：运行快照（content_loader.freeze）从它
 	// 冻结，不重读磁盘——注册表与快照因此共用同一份配置（review ② 缺陷 1）。
@@ -297,14 +334,22 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 	}
 	if err != nil {
 		// 解析 / 解码失败：位置 + 自产类别，库文案一个字不外传（§2.4 注 12）。
-		return entry, reject{reason: "invalid frontmatter", detail: frontmatterErrorSummary(err)}
+		kind := core.AgentRejectInvalidFrontmatter
+		detail := frontmatterErrorSummary(err)
+		// 绑定块结构非法走独立的 WARN 类别（规则 11 / 契约 agent-md §2.1）：
+		// detail 用固定短语，不把库文案或绑定值带进日志。
+		if errors.Is(err, core.ErrAgentResourceBindingInvalid) {
+			kind = core.AgentRejectInvalidResourceBindings
+			detail = "块结构非法"
+		}
+		return entry, reject{kind: kind, detail: detail}
 	}
 	entry.Profile = profile // 解析成功即有 Profile（即使校验未过——供 list / show 展示声明面）
 
 	l.warnLocalSkillsDir(base, name)
 
 	rej, deferred := l.validateProfile(base, lib, name, profile, mcpNames, mcpConnected, claim)
-	if rej.reason != "" {
+	if rej.kind != "" {
 		return entry, rej
 	}
 	if deferred {
@@ -325,19 +370,19 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 func (l *AgentLoader) validateProfile(base, lib *os.Root, name string, profile *core.Profile, mcpNames, mcpConnected []string, claim map[string]string) (reject, bool) {
 	if profile.Name != name { // 规则 1
 		return reject{
-			reason: "name mismatch",
+			kind:   core.AgentRejectNameMismatch,
 			detail: fmt.Sprintf("目录名 %s 与 frontmatter name %s 不一致", name, profile.Name),
 		}, false
 	}
-	if !slices.Contains(l.providers, profile.Provider.Name) { // 规则 2
-		return reject{reason: "provider not registered: " + profile.Provider.Name}, false
+	if !slices.Contains(l.registeredProviders(), profile.Provider.Name) { // 规则 2
+		return reject{kind: core.AgentRejectProviderNotRegistered, detail: profile.Provider.Name}, false
 	}
 	if strings.TrimSpace(profile.Provider.Model) == "" { // 规则 3（占位文本是普通文本，天然放行）
-		return reject{reason: "blank model"}, false
+		return reject{kind: core.AgentRejectBlankModel}, false
 	}
 	if t := profile.Provider.Temperature; t != nil && !validTemperature(*t) { // 契约 §2 字段约束
 		return reject{
-			reason: "invalid provider.temperature",
+			kind:   core.AgentRejectInvalidTemperature,
 			detail: "已声明的 temperature 必须落在 0–2 且有限，实际 " + strconv.FormatFloat(*t, 'g', -1, 64),
 		}, false
 	}
@@ -357,33 +402,70 @@ func (l *AgentLoader) validateProfile(base, lib *os.Root, name string, profile *
 			deferred = true
 			continue
 		}
-		return reject{reason: "tool not registered: " + toolName}, false
+		return reject{kind: core.AgentRejectToolNotRegistered, detail: toolName}, false
 	}
 	if missing := missingSkill(lib, profile.Skills); missing != "" { // 规则 5
-		return reject{reason: "skill not found: " + missing}, false
+		return reject{kind: core.AgentRejectSkillNotFound, detail: missing}, false
 	}
 	// 规则 6（US-7 全条）：先判**已配置**、再判**已连接**——存在但未连接的 server
 	// 与不存在的 server 同判（R4）；轻路径连接结果未知时只标记待确认。
 	for _, m := range profile.MCPServers {
 		if !slices.Contains(mcpNames, m) {
-			return reject{reason: "mcp server skipped", detail: m}, false
+			return reject{kind: core.AgentRejectMCPServerSkipped, detail: m}, false
 		}
 		if mcpConnected == nil && len(mcpNames) > 0 {
 			deferred = true
 			continue
 		}
 		if !slices.Contains(mcpConnected, m) {
-			return reject{reason: "mcp server skipped", detail: m}, false
+			return reject{kind: core.AgentRejectMCPServerSkipped, detail: m}, false
 		}
 	}
 	for _, b := range profile.Bootstrap { // 规则 7
 		if detail, ok := checkBootstrapEntry(base, b); !ok {
-			return reject{reason: "bootstrap file missing", detail: detail}, false
+			return reject{kind: core.AgentRejectBootstrapMissing, detail: detail}, false
 		}
 	}
 	claimed, err := validateSchedules(profile.Name, profile.Schedules, claim) // 规则 8
 	if err != nil {
-		return reject{reason: "invalid schedule", detail: err.Error()}, false
+		return reject{kind: core.AgentRejectInvalidSchedule, detail: err.Error()}, false
+	}
+	// notify_channels 的声明校验：空名无法匹配任何渠道，直接拒载；
+	// 名字是否存在**不在这里判**——渠道属于运行期注册表，装载器不持有它。
+	// Blank names are refused here; existence is a runtime concern.
+	for _, ch := range profile.NotifyChannels {
+		if strings.TrimSpace(ch) == "" {
+			return reject{kind: core.AgentRejectInvalidNotifyChannels, detail: "通知渠道名不得为空白"}, false
+		}
+	}
+	// 规则 10（契约 agent-md §2.1）：`notify_mode` 取值合法且与 `notify_channels`
+	// 组合成立。未声明不做任何推断——兼容读取（空 → all_eligible）属于准入侧，
+	// 且**不得**改写文件。组合的意义：`none` / `all_eligible` 时白名单必须为空
+	// （空数组不表示禁用），`allowlist` 至少一个元素。
+	if profile.NotifyMode != "" {
+		mode, modeErr := core.ParseNotifyMode(string(profile.NotifyMode))
+		if modeErr != nil {
+			return reject{
+				kind:   core.AgentRejectInvalidNotifyMode,
+				detail: "取值必须是 none / all_eligible / allowlist，实际 " + string(profile.NotifyMode),
+			}, false
+		}
+		switch mode {
+		case core.NotifyModeNone, core.NotifyModeAllEligible:
+			if len(profile.NotifyChannels) > 0 {
+				return reject{
+					kind:   core.AgentRejectInvalidNotifyMode,
+					detail: string(mode) + " 时 notify_channels 必须为空数组",
+				}, false
+			}
+		case core.NotifyModeAllowlist:
+			if len(profile.NotifyChannels) == 0 {
+				return reject{
+					kind:   core.AgentRejectInvalidNotifyMode,
+					detail: "allowlist 至少需要一个 notify_channels 元素",
+				}, false
+			}
+		}
 	}
 	return reject{claimed: claimed}, deferred
 }
@@ -441,8 +523,20 @@ func (l *AgentLoader) ValidateCandidate(root string, entries []core.AgentEntry, 
 			"reason", "unknown frontmatter key", "detail", w)
 	}
 	if err != nil {
-		return core.AgentEntry{Name: agent}, "", nil,
-			errors.New("invalid frontmatter: " + frontmatterErrorSummary(err))
+		// 绑定块错误保留哨兵：保存期的 400 必须能按 `AGENT_RESOURCE_BINDING_INVALID`
+		// 点名，而不是被折叠成无类别的 frontmatter 失败。分类同时进 Kind，供管理台
+		// 出中文；英文 Error() 只服务日志与审计。
+		if errors.Is(err, core.ErrAgentResourceBindingInvalid) {
+			return core.AgentEntry{Name: agent}, "", nil, &core.AgentDefinitionRejectedError{
+				Kind:   core.AgentRejectInvalidResourceBindings,
+				Detail: "块结构非法",
+				Cause:  core.ErrAgentResourceBindingInvalid,
+			}
+		}
+		return core.AgentEntry{Name: agent}, "", nil, &core.AgentDefinitionRejectedError{
+			Kind:   core.AgentRejectInvalidFrontmatter,
+			Detail: frontmatterErrorSummary(err),
+		}
 	}
 
 	// Definition 记候选字节（拷贝一份：调用方的切片可能被复用），与 loadOne 同口径——
@@ -450,8 +544,11 @@ func (l *AgentLoader) ValidateCandidate(root string, entries []core.AgentEntry, 
 	entry := core.AgentEntry{Name: agent, Profile: profile, Definition: slices.Clone(candidate)}
 	rej, deferred := l.validateProfile(base, lib, agent, profile, mcpNames, l.mcpConnected,
 		candidateClaims(entries, agent))
-	if rej.reason != "" {
-		return entry, "", nil, errors.New(rej.mergedReason())
+	if rej.kind != "" {
+		return entry, "", nil, &core.AgentDefinitionRejectedError{
+			Kind:   rej.kind,
+			Detail: rej.detail,
+		}
 	}
 	if deferred {
 		// 连接结果未知（轻路径）下无法确认池外工具名与 MCP 声明——候选不得被当成已注册。
@@ -511,6 +608,51 @@ func (l *AgentLoader) warnLocalSkillsDir(base *os.Root, name string) {
 // agentDefinitionPath is the single source of the agent definition path literal.
 func agentDefinitionPath(name string) string {
 	return path.Join(agentsDirName, name, agentDefinitionFile)
+}
+
+// AgentNames 是 v3 迁移编排的 Agent 目录清单：只列 agents/ 的直接子目录，按名字节序
+// 排序；名称不合法（staging / backup 残骸、点前缀、含分隔符）的条目按装载面同一份
+// ValidateAgentName 判据跳过，不另立规则。本函数**只读**，不解析 AGENT.md——迁移第 2 步
+// 只按名字升级状态文件，内容解析留给第 4 步。
+// AgentNames lists the agent directories for the v3 migration. It skips the same
+// invalid names the loader skips and never parses AGENT.md.
+func AgentNames(root string) (names []string, err error) {
+	base, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("打开工作区目录 %s: %w", root, err)
+	}
+	defer func() {
+		if closeErr := base.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("关闭工作区目录 %s: %w", root, closeErr))
+		}
+	}()
+
+	dir, err := base.Open(agentsDirName)
+	if err != nil {
+		return nil, fmt.Errorf("打开 Agent 目录: %w", err)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("关闭 Agent 目录: %w", closeErr))
+		}
+	}()
+
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Agent 目录: %w", err)
+	}
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	names = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if nameErr := ValidateAgentName(entry.Name()); nameErr != nil {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	return names, nil
 }
 
 // checkBootstrapEntry 校验 bootstrap 声明的单个条目：存在**且是普通文件**才放行，
@@ -578,7 +720,20 @@ func parseFrontmatter(raw []byte) (*core.Profile, []string, error) {
 	if err := yaml.Unmarshal(front, &dto); err != nil {
 		return nil, warns, err
 	}
-	return intoProfile(dto), warns, nil
+	// `resource_bindings` 单独走严格结构校验（bindings.go）：DTO 解码只忽略未知键，
+	// 不拒绝"对象里多一个子键"这类形状错误；规则 11 要求结构非法即整只不注册。
+	// 同一份 frontmatter 字节，不把文件读两遍。
+	// The bindings block gets its own strict structural check from the same bytes.
+	bindings, err := parseBindingsFront(front)
+	if err != nil {
+		return nil, warns, err
+	}
+	profile := intoProfile(dto)
+	// 字面量合法性不在解析期判：规则 10 与绑定完整性分别由加载期与保存期判定，
+	// 解析器只负责把声明原样带出来（`invalid notify_mode` 是加载期 WARN）。
+	profile.NotifyMode = core.NotifyMode(dto.NotifyMode)
+	profile.ResourceBindings = bindings
+	return profile, warns, nil
 }
 
 // splitFrontmatter 把 AGENT.md 切成围栏内 frontmatter 与围栏外正文两段
@@ -601,6 +756,160 @@ func splitFrontmatter(raw []byte) (front, body []byte, err error) {
 		}
 	}
 	return nil, nil, errOpenFrontmatterFence
+}
+
+// RewriteAgentName 改写 AGENT.md frontmatter 的身份字段：顶层 `name`（必改——`name`
+// 必须等于目录名，漏改会让目标 Agent 整只不注册，约束 31）与 `identity.agent_name`
+// （块式映射里存在时一并改写，不存在不补写）。围栏外正文、行序、注释与未触及的键逐字
+// 保留：**不**重新序列化整份文档（那会丢注释与未知键，与约束 6 的块编辑口径一致）。
+//
+// `identity` 写成流式映射（`identity: {agent_name: x}`）时无法安全改写字面量 → 拒绝；
+// 宁可让复制 / 恢复失败并点名，也不留下自称旧名的 Agent（fail-closed）。
+// RewriteAgentName rewrites the top-level name and, when present as a block mapping,
+// identity.agent_name. Everything else stays byte-identical; a flow-style identity is
+// refused rather than silently left stale.
+func RewriteAgentName(agentMD []byte, newName string) ([]byte, error) {
+	if err := ValidateAgentName(newName); err != nil {
+		return nil, err
+	}
+
+	// 容忍 UTF-8 BOM；必须写转义——字面量会触发 Go 扫描器的「illegal byte order mark」。
+	text := string(agentMD)
+	bom := ""
+	if strings.HasPrefix(text, "\ufeff") {
+		bom, text = "\ufeff", strings.TrimPrefix(text, "\ufeff")
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 || strings.TrimSuffix(lines[0], "\r") != "---" {
+		return nil, errNoFrontmatterFence
+	}
+	closing := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSuffix(lines[i], "\r") == "---" {
+			closing = i
+			break
+		}
+	}
+	if closing < 0 {
+		return nil, errOpenFrontmatterFence
+	}
+
+	rendered := renderYAMLScalar(newName)
+	nameSeen, identitySeen, identityIndent := false, false, -1
+	for i := 1; i < closing; i++ {
+		trimmed := strings.TrimSuffix(lines[i], "\r")
+		if strings.TrimSpace(trimmed) == "" {
+			continue
+		}
+		key, rest, ok := splitFrontmatterKey(trimmed)
+		if !ok {
+			continue
+		}
+		indent := len(trimmed) - len(strings.TrimLeft(trimmed, " \t"))
+		if indent == 0 {
+			// 顶层普通键结束 identity 分支（identity 自己的那一行在下面重新打开）。
+			identitySeen, identityIndent = false, -1
+			switch key {
+			case "name":
+				if nameSeen {
+					return nil, fmt.Errorf("frontmatter 含重复键 name，无法判定改写目标")
+				}
+				nameSeen = true
+				rewritten, err := replaceFrontmatterValue(trimmed, rest, rendered)
+				if err != nil {
+					return nil, fmt.Errorf("改写 frontmatter name: %w", err)
+				}
+				lines[i] = rewritten + lineEnding(lines[i])
+			case "identity":
+				identitySeen = true
+				if value := strings.TrimSpace(rest); value != "" && strings.Contains(value, "agent_name") {
+					return nil, fmt.Errorf("frontmatter identity 是流式映射（%s），无法安全改写 agent_name", value)
+				}
+			}
+			continue
+		}
+		if !identitySeen || key != "agent_name" {
+			continue
+		}
+		if identityIndent < 0 {
+			identityIndent = indent
+		}
+		if indent != identityIndent {
+			continue // 更深层的同名键不是 identity 的直接子键
+		}
+		rewritten, err := replaceFrontmatterValue(trimmed, rest, rendered)
+		if err != nil {
+			return nil, fmt.Errorf("改写 frontmatter identity.agent_name: %w", err)
+		}
+		lines[i] = rewritten + lineEnding(lines[i])
+	}
+	if !nameSeen {
+		return nil, fmt.Errorf("frontmatter 缺少 name：无法改写为目录名 %q", newName)
+	}
+
+	return []byte(bom + strings.Join(lines, "\n")), nil
+}
+
+// splitFrontmatterKey 把一行切成键与冒号后的原文：键是**朴素标量**（契约字段表里的键
+// 从不加引号），冒号必须后跟空白或行尾——`a:b` 是标量值而不是键。
+// splitFrontmatterKey splits one line at the key colon; quoted keys are not ours.
+func splitFrontmatterKey(line string) (key, rest string, ok bool) {
+	if strings.HasPrefix(line, "\"") || strings.HasPrefix(line, "'") {
+		return "", "", false
+	}
+	for i := 0; i < len(line); i++ {
+		if line[i] != ':' {
+			continue
+		}
+		if i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t' {
+			return strings.TrimSpace(line[:i]), line[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
+// replaceFrontmatterValue 用渲染好的标量替换一行的值，保留缩进与行尾注释（` #...`）：
+// 只改值本身，行结构不动。行尾注释的判定与 YAML 一致——`#` 前必须是空白。
+// replaceFrontmatterValue swaps only the scalar, keeping the trailing comment.
+func replaceFrontmatterValue(line, rest, rendered string) (string, error) {
+	value, comment := splitTrailingComment(rest)
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("键的值为空，缺少可改写的标量")
+	}
+	out := line[:len(line)-len(rest)] + " " + rendered
+	if comment != "" {
+		out += " " + comment
+	}
+	return out, nil
+}
+
+// splitTrailingComment 把冒号后的原文切成「值」与「行尾注释」（注释含 `#` 本身，
+// 不含前导空白）：引号内的 `#` 不算注释起点。
+// splitTrailingComment separates the value from a trailing YAML comment.
+func splitTrailingComment(rest string) (value, comment string) {
+	quote := byte(0)
+	for i := 0; i < len(rest); i++ {
+		switch c := rest[i]; {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '#' && (i == 0 || rest[i-1] == ' ' || rest[i-1] == '\t'):
+			return strings.TrimRight(rest[:i], " \t"), rest[i:]
+		}
+	}
+	return strings.TrimRight(rest, " \t"), ""
+}
+
+// lineEnding 取一行原有的换行残留（CRLF 文件里是 "\r"），改写后原样保留。
+// lineEnding keeps the carriage return of a CRLF line.
+func lineEnding(line string) string {
+	if strings.HasSuffix(line, "\r") {
+		return "\r"
+	}
+	return ""
 }
 
 // scanUnknownKeys 用同一份字节扫出字段表之外的键路径（已排序）：契约 §2 的字段表
@@ -639,12 +948,26 @@ type keySpec struct {
 // frontmatterKnownKeys 是契约 §2 字段表的键集（与 frontmatterDTO 的 yaml 标签一一对应）。
 // frontmatterKnownKeys mirrors the contract field table key by key.
 var frontmatterKnownKeys = map[string]keySpec{
-	"name":        {},
-	"description": {},
-	"tools":       {},
-	"skills":      {},
-	"mcp_servers": {},
-	"bootstrap":   {},
+	"name":         {},
+	"description":  {},
+	"display_name": {},
+	"tools":        {},
+	"skills":       {},
+	"mcp_servers":  {},
+	"bootstrap":    {},
+	// notify_channels 是通知渠道白名单（非空 = 限制；空 / 未声明 = 不限制）。
+	// The notification-channel allowlist: non-empty restricts, empty / absent does not.
+	"notify_channels": {},
+	// notify_mode 是通知意图三态（v3）；未声明时按兼容规则读取、不改写文件。
+	// The three-state notification intent; undeclared values follow the compatibility
+	// read rules and never rewrite the file.
+	"notify_mode": {},
+	// resource_bindings 是资源绑定的唯一权威（结构见 bindings.go，规则 11）。
+	// resource_bindings is the sole binding authority; its shape is checked by rule 11.
+	"resource_bindings": {children: map[string]keySpec{
+		"model_connection": {items: map[string]keySpec{"name": {}, "uid": {}}},
+		"notify_channel":   {items: map[string]keySpec{"name": {}, "uid": {}}},
+	}},
 	"identity": {children: map[string]keySpec{
 		"agent_name": {},
 		"prompt":     {},
@@ -663,10 +986,11 @@ var frontmatterKnownKeys = map[string]keySpec{
 		"config": {opaque: true},
 	}},
 	"schedules": {items: map[string]keySpec{
-		"id":      {},
-		"cron":    {},
-		"zone":    {},
-		"message": {},
+		"id":         {},
+		"cron":       {},
+		"zone":       {},
+		"message":    {},
+		"deliver_to": {},
 	}},
 }
 
@@ -728,7 +1052,10 @@ func intoProfile(dto frontmatterDTO) *core.Profile {
 		if zone == "" {
 			zone = defaultZone
 		}
-		schedules = append(schedules, core.Schedule{ID: s.ID, Cron: s.Cron, Zone: zone, Message: s.Message})
+		schedules = append(schedules, core.Schedule{
+			ID: s.ID, Cron: s.Cron, Zone: zone, Message: s.Message,
+			DeliverTo: strings.TrimSpace(s.DeliverTo),
+		})
 	}
 
 	agentName := strings.TrimSpace(dto.Identity.AgentName)
@@ -739,6 +1066,7 @@ func intoProfile(dto frontmatterDTO) *core.Profile {
 	return &core.Profile{
 		Name:        dto.Name,
 		Description: dto.Description,
+		DisplayName: strings.TrimSpace(dto.DisplayName),
 		Identity:    core.Identity{AgentName: agentName, Prompt: dto.Identity.Prompt},
 		Provider: core.ProviderRef{
 			Name:        dto.Provider.Name,
@@ -749,9 +1077,12 @@ func intoProfile(dto frontmatterDTO) *core.Profile {
 		Skills:     dto.Skills,
 		MCPServers: dto.MCPServers,
 		Bootstrap:  dto.Bootstrap,
-		Channels:   channels,
-		Settings:   settings,
-		Schedules:  schedules,
+		// 显式拷贝：DTO 切片归解析器所有，Profile 会被快照长期持有。
+		// Explicit copy: the DTO slice belongs to the parser, the profile outlives it.
+		NotifyChannels: slices.Clone(dto.NotifyChannels),
+		Channels:       channels,
+		Settings:       settings,
+		Schedules:      schedules,
 	}
 }
 
@@ -767,17 +1098,24 @@ func validTemperature(t float64) bool {
 // frontmatterDTO is the private parsing DTO; the pointers keep absent values
 // distinguishable from explicit zero ones.
 type frontmatterDTO struct {
-	Name        string        `yaml:"name"`
-	Description string        `yaml:"description"`
-	Identity    identityDTO   `yaml:"identity"`
-	Provider    providerDTO   `yaml:"provider"`
-	Tools       []string      `yaml:"tools"`
-	Skills      []string      `yaml:"skills"`
-	MCPServers  []string      `yaml:"mcp_servers"`
-	Bootstrap   []string      `yaml:"bootstrap"`
-	Channels    []channelDTO  `yaml:"channels"`
-	Settings    settingsDTO   `yaml:"settings"`
-	Schedules   []scheduleDTO `yaml:"schedules"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+	// DisplayName 是管理台展示名（R6）：只影响展示，装载期不因它拒绝整只 Agent。
+	// DisplayName is display-only; the loader never rejects an agent because of it.
+	DisplayName string      `yaml:"display_name"`
+	Identity    identityDTO `yaml:"identity"`
+	Provider    providerDTO `yaml:"provider"`
+	Tools       []string    `yaml:"tools"`
+	Skills      []string    `yaml:"skills"`
+	MCPServers  []string    `yaml:"mcp_servers"`
+	Bootstrap   []string    `yaml:"bootstrap"`
+	// NotifyMode 原样保留声明值：空串 = 未声明（兼容读取在准入侧），非法字面量
+	// 由加载期规则 10 拒绝。
+	NotifyMode     string        `yaml:"notify_mode"`
+	NotifyChannels []string      `yaml:"notify_channels"`
+	Channels       []channelDTO  `yaml:"channels"`
+	Settings       settingsDTO   `yaml:"settings"`
+	Schedules      []scheduleDTO `yaml:"schedules"`
 }
 
 type identityDTO struct {
@@ -806,6 +1144,9 @@ type scheduleDTO struct {
 	Cron    string `yaml:"cron"`
 	Zone    string `yaml:"zone"`
 	Message string `yaml:"message"`
+	// DeliverTo 是系统代投渠道的**资源 UID**（R7）；空串 = 不代投。
+	// DeliverTo is the notify-channel resource uid; empty means no system delivery.
+	DeliverTo string `yaml:"deliver_to"`
 }
 
 // cronHasTimezonePrefix 判定表达式是否自带时区前缀（robfig 认 TZ= 与 CRON_TZ= 两种）。
@@ -842,6 +1183,7 @@ func validateSchedules(agent string, ss []core.Schedule, claim map[string]string
 		if ss[i].Zone == "" {
 			ss[i].Zone = defaultZone
 		}
+		ss[i].DeliverTo = strings.TrimSpace(ss[i].DeliverTo)
 		if err := validateScheduleEntry(ss[i]); err != nil {
 			return nil, err
 		}
@@ -908,7 +1250,40 @@ func validateScheduleEntry(s core.Schedule) error {
 	if strings.TrimSpace(s.Message) == "" {
 		return errors.New("message 为必填")
 	}
+	// deliver_to 只接受资源 UID 形态；目标是否存在 / 是否为可用通知渠道由保存与运行
+	// 两侧按数据库校验（装载期不读库）。按名字查找的实现会让同名重建后的旧任务发往
+	// 新机器人——这里从一开始就不接受名字。
+	// The loader only checks the uid shape; existence and eligibility are checked where
+	// the database is available.
+	if deliverTo := strings.TrimSpace(s.DeliverTo); deliverTo != "" {
+		if _, err := core.ParseResourceUID(deliverTo); err != nil {
+			return errors.New("deliver_to 必须是通知渠道的资源 UID（rs_ 前缀）")
+		}
+	}
 	return nil
+}
+
+// ValidateScheduleCandidate 按装载期**同一套**规则校验一个外部候选（R6.4.3）：去空白、
+// zone 缺省 UTC，再走 validateScheduleEntry（6 段、公共子集、`CRON_TZ=` 拼接后可解析、
+// zone 可加载且非 `Local`、message 非空），返回规整后的副本。管理面定时候选与装载期
+// 判定共用本函数内部的唯一实现——**不得**另写一套 cron 判断。
+// ValidateScheduleCandidate applies the load-time schedule rules verbatim to an external
+// candidate and returns the normalized copy; there is no second cron judge.
+func ValidateScheduleCandidate(s core.Schedule) (core.Schedule, error) {
+	normalized := core.Schedule{
+		ID:        strings.TrimSpace(s.ID),
+		Cron:      strings.TrimSpace(s.Cron),
+		Zone:      strings.TrimSpace(s.Zone),
+		Message:   strings.TrimSpace(s.Message),
+		DeliverTo: strings.TrimSpace(s.DeliverTo),
+	}
+	if normalized.Zone == "" {
+		normalized.Zone = defaultZone
+	}
+	if err := validateScheduleEntry(normalized); err != nil {
+		return core.Schedule{}, err
+	}
+	return normalized, nil
 }
 
 // checkCronSubset 执行公共子集预检（契约 §3.1）：L / W / # 拒、周字段值 7 拒、

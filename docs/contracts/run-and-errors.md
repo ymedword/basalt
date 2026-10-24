@@ -55,6 +55,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 type RunEnv struct {
     Req       RunRequest
     Snapshot  *ConfigSnapshot     // 本次运行冻结的配置快照（agent_name + hash + content；中途改盘不换配置）
+    AgentUID  string              // 准入时从生命周期状态文件读取的稳定 Agent 身份；资源资格判定只用它，不用名称
     Resources *RunResourceManifest // 准入时固定的资源版本清单（见下）；旧版 Run 为空
     Session   *Session            // 会话历史读写；无状态调用时为仅内存的临时会话
     Budget    Budget              // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（见 §6）
@@ -62,20 +63,45 @@ type RunEnv struct {
 }
 
 // RunResourceManifest 是准入时固定的资源版本清单。它与 ConfigSnapshot 是两份记录：
-// config_hash 保持 ConfigSnapshot 原义；本清单单独记录 Provider / MCP / 技能的发布版本，
-// 不得倒写进 config_hash，也不得用当前版本给历史 Run 补造。
+// config_hash 保持 ConfigSnapshot 原义；本清单单独记录 Provider / MCP / 技能的发布版本、
+// Provider 凭据版本与通知渠道 UID 集合，不得倒写进 config_hash，也不得用当前版本给历史 Run 补造。
 type RunResourceManifest struct {
-    FormatVersion  int                 // 清单格式版本；首版为 1
-    Hash           string              // 本清单规整序列化的 sha256
-    AgentLifecycle string              // 准入时的生命周期状态（只可能为 active）
-    Provider       ResourceVersionRef  // 本 Run 使用的 Provider 发布版本
+    FormatVersion  int                  // 清单格式版本；首版为 1，当前为 2（v1 可读）
+    Hash           string               // 本清单规整序列化的 sha256
+    AgentUID       string               // 准入时的 Agent 稳定身份（v2 起必填）
+    AgentLifecycle string               // 准入时的生命周期状态（只可能为 active）
+    Provider       ProviderVersionRef   // 本 Run 使用的 Provider 发布版本 + 凭据版本
     MCPServers     []ResourceVersionRef // 实际生效的 MCP 版本（待重启内容不算）
     Skills         []SkillVersionRef    // 每个绑定技能的已发布版本与完整文件清单
+    Notify         NotifyManifest       // 通知模式与准入时冻结的具体渠道 UID（v2 起）
+}
+
+// ProviderVersionRef 在通用版本引用上增加模型名与凭据固定。
+// 模式不单独存字段：CredentialID 为空即 env 模式，非空即 managed 模式（同一事实只记一处）。
+type ProviderVersionRef struct {
+    ResourceVersionRef
+    Model             string // 本次 Run 使用的模型名（来自该发布版本的定义，准入时冻结）
+    CredentialID      string // 准入时固定的凭据身份；env 模式为空
+    CredentialVersion int    // 准入时固定的凭据版本；env 模式为 0
+    TargetBinding     string // 规范化目标地址的 sha256（不含明文 URL）
+}
+
+// NotifyManifest 冻结通知授权：mode 取 none / all_eligible / allowlist；
+// channels 是解析后的**具体渠道**，不设 '*' 通配。mode=none 时 channels 为空。
+type NotifyManifest struct {
+    Mode     string             `json:"mode"`
+    Channels []NotifyChannelRef `json:"channels"`
+}
+
+type NotifyChannelRef struct {
+    Name        string `json:"name"`
+    ResourceUID string `json:"resource_uid"`
 }
 
 // ResourceVersionRef 指向一个不可变资源版本。
 type ResourceVersionRef struct {
     Name        string // provider / MCP server / 技能名
+    ResourceUID string // 稳定资源身份（v2 起必填）
     VersionID   int64  // resource_versions.id
     VersionNo   int    // 逐资源版本号（1 起）
     ContentHash string // 版本内容哈希（sha256 十六进制小写）
@@ -105,6 +131,9 @@ type ToolEnv struct {
     MaxOutputBytes int           // 输出截断上限
     SkillDirs      []string      // 本次 Run 准入绑定的技能发布目录（storage_path 字面量，如 `.basalt/versions/skills/<name>/<no>`）；文件工具只对这些目录只读放行，空 = 无绑定（版本树一律拒）
     RunBound       bool          // 本次调用来自一次 Run（循环构造 ToolEnv 时置 true）；**不得**由 RunID / SkillDirs 推断。Run 内文件工具拒绝技能工作副本（`.basalt/skills`），空绑定也一样
+    AgentUID       string        // 本次 Run 的 Agent 稳定身份（准入时固定）；资源范围判定用 UID，不用名称
+    NotifyMode     string        // 本次 Run 冻结的通知模式：none / all_eligible / allowlist（准入时按兼容规则解析为显式值）
+    NotifyChannels []string      // 本次 Run 冻结的**具体渠道 UID** 集合（准入时枚举）：notify 工具只放行集合内渠道；NotifyMode=none 时为空。空集合**不**表示「不限制」。工具不得在调用时回读 AGENT.md
 }
 ```
 
@@ -198,7 +227,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 操作 | 持锁方式 | 边界内动作 |
 | --- | --- | --- |
 | Run 准入 | `AgentGate` 读锁 | 重读状态文件并校验（`active` 才放行）；**只覆盖状态重读与校验这一小段**，判定后立即释放——状态放行判定即准入线性化点 |
-| Run 准入 | `ResourceGate` 读租约 | 校验通过后取得：解析并固定 `RunResourceManifest`（Provider / MCP / 技能发布版本与哈希）；租约覆盖"资源解析 → 固定资源 → `StartRun` 事务成功"，失败路径归还租约并释放已固定运行时 |
+| Run 准入 | `ResourceGate` 读租约 | 校验通过后取得：解析并固定 `RunResourceManifest` v2（Provider / MCP / 技能发布版本与哈希、Provider 凭据版本与目标绑定、按 `notify_mode` 枚举出的具体渠道 UID）；校验绑定 UID 的资格（共享或本 Agent 专属）与绑定完整性，写入 `run_resource_refs` / `run_credential_refs` / `run_notify_refs`；租约覆盖"资源解析 → 固定资源 → `StartRun` 事务成功"，失败路径归还租约并释放已固定运行时 |
 | 禁用 / 启用 | `AgentGate` 写锁 | 校验 `expected_state` / `expected_generation` → 原子写状态文件（generation + 1）→ 更新生命周期索引 |
 | 归档 | `AgentGate` 写锁 | 注销定时 → 标记 `archived` → 移出注册索引 → 取消在跑 Run 并等待 → 移动目录；失败按 §9.4 查证并恢复注册 |
 
@@ -206,6 +235,8 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - 状态文件缺失 / 损坏时，准入在锁内直接拒绝（`409 AGENT_UNAVAILABLE`），**不得**回退为“按目录存在即 active”。
 - `AgentGate` 读锁只覆盖"重读状态文件并校验"，**不得**跨越资源解析、LLM 调用或工具执行；"资源已固定、账本未落库"的窗口由 `ResourceGate` 读租约覆盖（到 `StartRun` 事务成功为止），发布写锁因此插不进来；Run 开始后配置与资源版本已固定。
 - 归档等待有界（缺省 30 秒）；超时返回 `409 AGENT_BUSY` 并点名仍在运行的 Run，注册与生命周期状态回滚到归档前。
+- **准入绑定校验**：`resource_bindings` 缺少对 `provider.name` / `notify_channels` 的绑定 → `409 AGENT_RESOURCE_BINDING_MISSING`；绑定 UID 与当前发布指针不符、已删除或未发布 → `409 AGENT_RESOURCE_BINDING_INVALID`；绑定的资源是其他 Agent 的专属（或当前 Agent 使用声明外渠道）→ `409 RESOURCE_NOT_ELIGIBLE`；Provider 凭据已撤销 → `409 CREDENTIAL_REVOKED`；托管凭据因主密钥不可用无法解密 → `503 CREDENTIAL_UNAVAILABLE`。以上都只拒绝**新 Run**，不改写配置、不自动改绑、不静默回退到同名资源。
+- **准入固定粒度**：Provider 固定到**凭据版本**（`run_credential_refs`），Run 内每次模型调用前检查该版本状态；通知只固定**渠道 UID 集合**（`run_notify_refs`），**不**固定渠道凭据版本——每次发送解析当前 `active` 版本。两者不得互相套用。
 
 ---
 
@@ -343,6 +374,8 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 
 管理操作**不得**混写为模型 / 工具调用，也**不得**为了复用 `llm_calls` 而伪造一次 Run。模型连接测试不产生 Run：它仍先写 `management_operations` 的 `pending` 行（预写失败不得发出调用），结果、provider / model、耗时与 token 用量记在脱敏的 `detail_json`。
 
+`run_resource_refs` / `run_credential_refs` / `run_notify_refs` / `notify_deliveries` 是**关联与明细记录**，不构成独立审计结论：它们固定 Run 使用的资源版本、Provider 凭据版本与通知渠道（具体 UID），成败仍由 `llm_calls` / `tool_invocations` 表达。`notify_deliveries` 不设单独的 success / failed 列，查询时与 `tool_invocations` join。
+
 ### 7.2 审计失败策略：fail-closed
 
 **写入审计是执行的前置条件**，不是事后动作。`llm_calls` 与 `tool_invocations` **同一套两阶段写**：
@@ -377,6 +410,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `sandbox_denied` | 沙箱拒绝 | 路径越界、域名不在白名单 |
 | `timeout` | 超时 | shell 超时、HTTP 超时 |
 | `not_found` | 目标不存在 | 文件、渠道、MCP 工具 |
+| `notify_disabled` | 通知被配置或凭据状态禁用 | `notify_mode: none`；渠道托管凭据已撤销 |
 | `invalid_input` | 参数非法 | JSON 不合法、必填缺失 |
 | `external_error` | 外部系统错误 | HTTP 5xx、模型供应商 4xx/5xx |
 | `runtime_error` | 运行时错误 | 进程启动失败、编码错误 |
@@ -388,7 +422,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 
 **不存**：通知渠道地址原文（凭证）、模型推理的 `reasoning_content`（体积大且含模型内部过程；仅在会话消息里按供应商要求回传，**不**入审计表）。
 
-**脱敏不是承诺**：本表如实记录工具入参与结果——**Agent 通过工具读到的内容会进审计**。运维需知晓这一点（这也是"审计能解释失败"的前提）。凭证的防线在别处：渠道地址只以 `${ENV_VAR}` 引用形态入库（发送时解析），配置中的 api_key 只从环境变量读。
+**脱敏不是承诺**：本表如实记录工具入参与结果——**Agent 通过工具读到的内容会进审计**。运维需知晓这一点（这也是"审计能解释失败"的前提）。凭证的防线在别处：env 模式下渠道地址与 api_key 只以精确 `${ENV_VAR}` 引用形态入库、使用前解析；managed 模式下地址与密钥以 AES-256-GCM 密文落库（仅 `key_id` / `last4` / 目标绑定哈希可读），主密钥在工作区之外，解密只在按需使用时发生。管理操作的 `detail_json`、日志、诊断与错误响应**不得**出现明文 URL、密钥或主密钥；`notify_deliveries` 只记渠道 UID / 名称 / 目标 host。
 
 ---
 
@@ -404,21 +438,41 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 400 | `UNSUPPORTED_TYPE` | 渠道类型未装配 | 点名支持的取值集合 |
 | 400 | `EDIT_UNSUPPORTED` | 结构化编辑无法在保留注释 / 未改内容的前提下完成 | 说明改用整份原文编辑；**不得**静默重排 |
 | 400 | `IMPORT_REJECTED` | 技能导入含软连接 / 越界路径 / 非普通文件 / 超限 | 点名违规路径与上限 |
+| 400 | `CREDENTIAL_MODE_REQUIRED` | 凭据值与当前模式不符且未显式给出目标 `credential_mode`（创建时普通值、更新时模式不匹配） | 点名字段与两种模式的合法值；不推断模式 |
+| 400 | `CREDENTIAL_REF_READ_ONLY` | 请求体出现只读 `credential_ref` / 客户端自造凭据 ID | 说明凭据引用由服务端生成 |
+| 400 | `RESOURCE_NOT_ELIGIBLE` | 绑定的资源对当前 Agent 无资格（其他 Agent 专属，或渠道不在 Agent 声明内） | 点名资源、所有者与资格规则；保存零写入 |
+| 400 | `AGENT_RESOURCE_UNAVAILABLE` | Agent 引用的资源不存在、已删除或没有已发布版本 | 点名引用名与 UID 前 8 位；提示重新选择 |
+| 400 | `AGENT_RESOURCE_BINDING_MISSING` | 保存或准入时 `resource_bindings` 缺少对某个引用的绑定 | 点名缺失的 `{kind, name}`；不按名补绑 |
+| 400 | `AGENT_RESOURCE_BINDING_INVALID` | 绑定结构非法、UID 与当前发布指针不符、重复名或孤儿绑定 | 点名冲突字段；零写入 |
+| 400 | `CREDENTIAL_REVOKED` | 绑定的 Provider 凭据已撤销（保存时重新校验） | 点名资源与凭据状态；提示重新录入新值 |
 | 401 | `UNAUTHORIZED` | 管理凭据缺失或无效（token 模式或 local_trust 模式）；或 token 模式启动配置无效时的管理请求 | 不区分"没提供"与"提供错"，不回显 token |
 | 403 | `FORBIDDEN` | 跨源 / 来源被拒、Host 不在白名单、已认证但无权执行 | 说明被拒的边界；不回显内部路径 |
 | 404 | `NOT_FOUND` | Agent / 会话 / 渠道 / 资源 / 版本 / 归档不存在 | 点名查不到的名字 |
 | 409 | `SESSION_BUSY` | 同会话已有 Run 在执行 | 说明"等待完成或稍后重试" |
 | 409 | `AGENT_BUSY` | 归档 / 删除 Agent 时仍有 Run 未退出（有界等待超时） | 点名仍在运行的 run_id；状态已回滚 |
 | 409 | `AGENT_UNAVAILABLE` | Agent 生命周期状态文件缺失 / 损坏，或状态为 disabled / archived | 说明当前状态与修复入口；**不得**回退为 active |
-| 409 | `CONFLICT` | 同名资源 / Agent 已存在、复制或恢复目标名冲突、生命周期 expected_generation 不匹配 | 点名冲突对象与当前 generation |
+| 409 | `CONFLICT` | 同名活动技能 / 模型连接 / MCP / Agent 已存在（通知渠道同名创建为 400 `BAD_REQUEST`）、复制或恢复目标名冲突、生命周期 expected_generation 不匹配 | 点名冲突对象与当前 generation |
+| 409 | `RESOURCE_SCOPE_IN_USE` | 共享转专属时仍被其他 Agent 绑定、活动 Run 或消息路由引用 | 点名全部引用者；不提供 force，不自动解绑 |
+| 409 | `RESOURCE_UID_MISMATCH` | 请求携带的 `resource_uid` 与该名称当前指针不一致 | 给出当前 UID（可公开部分）；不按名猜测 |
+| 409 | `CREDENTIAL_OWNER_MISMATCH` | 试图把凭据绑定到其他资源 UID，或借用其他资源的凭据 ID | 点名凭据与目标资源；不跨资源复用 |
+| 409 | `AGENT_COPY_BLOCKED` | 复制源 Agent 引用了源 Agent 专属资源，且未提供显式映射 | 列出需要映射的资源名与类型；不产生副本 |
 | 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
 | 429 | `TOO_MANY_RUNS` | 实例级并发超限 | 给出当前上限 |
 | 429 | `AUTH_RATE_LIMITED` | 同一来源管理认证失败次数超限 | 给出重试等待秒数 |
 | 500 | `INTERNAL` | 未归类错误 | **不回显内部细节**（路径、堆栈、SQL） |
 | 503 | `NOT_CONFIGURED` | 能力未配置（作者模型缺失等） | **点名配置键** + 说明怎么配 |
+| 503 | `CREDENTIAL_UNAVAILABLE` | 托管凭据无法在当前主密钥下读取（文件缺失 / 权限不符 / 格式错误 / `key_id` 不匹配 / 解密失败） | 点名固定原因；说明 env 模式不受影响；不回显密钥材料 |
 | 504 | `TIMEOUT` | Run 超过调用方时限 | 给出时限值；Run 本身记为 `cancelled` |
 
 **错误文案纪律**：面向运维，点名"要改什么"；**不得**回显凭证、绝对路径、堆栈。沙箱拒绝的文案是**模型可见契约**（四段式，见技术方案 §4.3），与其他错误的读者不同——它的读者是模型，目的是让模型停止重试并告知人类。
+
+**语言分工（US-12 R8 起）**：错误码、HTTP 状态与生命周期拒绝语义是契约，**不随文案语言变化**。
+
+- 内部错误值、系统日志模板与原因分类一律**英文**：日志要可检索、可聚合，并能与上游 SDK 的原始错误直接对照
+- 管理台与调用方可见的响应文案一律**中文**，写明当前状态与修复建议
+- 中文文案只由**类型化 reason → 中文映射**产生（枚举分支，见 `internal/web/errors_zh.go`）；**不得**匹配英文错误字符串、按前缀推断，或依赖 `error.Error()` 的措辞
+- 执行历史展示使用**安全中文投影**：只呈现受控的状态与原因短语，**不回显原始错误文本**
+- 同一故障"日志英文、页面中文"是设计使然而非缺陷；验收**必须**同时检查中文界面与英文日志
 
 ---
 
@@ -473,9 +527,11 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
   - `local_trust` → `actor_subject = local_trust`，语义为“未验证个人身份”
   - CLI → `actor_subject = cli:<本机用户>`；不冒充管理台登录身份
   - 迁移 → `actor_subject = migration`
-- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `system.baseline_v2`
-- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system`
-- 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）
+- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.test` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `system.baseline_v2` / `system.baseline_v3` / `network_allowlist.update`
+- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system` / `network_allowlist`
+- 凭据与范围动作的 `target_id` = 资源 `resource_uid`（不是名称）；`detail_json` 只记资源名、`credential_id`、版本号、模式与状态，**不记明文 URL / 密钥 / 主密钥**。资源更新若同时改变凭据，按主操作写一条 `*.update`，不重复拆成两条互不相关的动作
+- `network_allowlist.update` 的 `target_id` = `policy_scope` 固定字面量 `http.allowed_domains`；`detail_json` 只记 `before_revision` / `after_revision` / `candidate_sha256`（规整域名按行连接的摘要），供启动恢复三态判定，不另存请求体
+- 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）；通知渠道测试**也要写**（它会对外发送一条 `Basalt 连通性测试`），同样不产生 Run、不伪造模型工具调用
 - `agent.generate_files` 字面量保留，但该端点**不写**管理操作行（唯一写入是 LLM 调用审计）；实现**不得**据字面量补恢复行、伪造操作或把草稿当变更
 - 管理操作审计与模型 / 工具调用审计**互不混写**；同一请求不得既写 `management_operations` 又把变更伪装成一次 Run
 
@@ -491,11 +547,14 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `schedule.enable` / `schedule.disable` | `scheduled_tasks.enabled` 与 operation_id | 目标值已写 | 仍是旧值 | 行不存在或多行冲突 |
 | `model_connection.*` / `mcp_server.*` / `skill.*` | 定义文件 / 版本行 / 发布指针 / 删除标记 | 指针或删除标记指向候选版本 | 仍指向旧版本 / 未删除 | 文件与指针不一致 |
 | `notify_channel.*` | 行存在性与脱敏字段哈希 | 与候选一致 | 仍是旧值 / 不存在 | 行存在但字段被第三方改写 |
-| `model_connection.test` / `mcp_server.test` | `detail_json` 是否已有完整结果 | 已有结果 | 未发出调用（可证明） | 无法区分是否已发出 → `unknown`，**不得重发** |
+| `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` | **四证**：`operation_id`、DB 提交事实（凭据行 / 版本行 / `revocation_epoch` / 资源 `revision`）、凭据版本号、目标绑定哈希 | 四证一致且全部指向候选终态 | 可证明未提交：旧状态完好且无候选版本行 | 任一证据缺失、彼此矛盾或只对上一部分 → `unknown`；**不得**重新加密、重放撤销或自动补写 |
+| `model_connection.test` / `mcp_server.test` / `notify_channel.test` | `detail_json` 是否已有完整结果 | 已有结果 | 未发出调用（可证明） | 无法区分是否已发出 → `unknown`，**不得重发**；通知测试即使成功也不补发第二条消息 |
 | `system.baseline_v2` | 各资源基线版本 / 指针 / 状态文件 | 全部完成 | 可证明未开始 | 部分完成 → 继续补齐缺失项（确定性幂等，不是重做已生效变更） |
+| `system.baseline_v3` | 活动区各 Agent 状态文件的 `schema_version` 与 `agent_uid`，以及 `agent_lifecycle` 镜像 | 全部为 schema 2 且 UID 合法、镜像一致 | 全部仍为 schema 1 / 无 UID（可证明未写入） | 部分升级、文件损坏或镜像与文件不一致 → `unknown`；**不得**给同一 Agent 补发第二个 UID |
+| `network_allowlist.update` | `network_domain_policy` 单行（`policy_scope = http.allowed_domains`）的 `revision` 与域名摘要，对照 `detail_json` 的 `before_revision` / `after_revision` / `candidate_sha256` | `revision = after_revision` 且摘要与 `candidate_sha256` 一致 | `revision = before_revision` | 行缺失、读库失败或 `revision` 是第三个值 → `unknown`；**不得**重放写入 |
 
 - `applied` → `success`；`not_applied` → `failed`；其余 → `unknown`；写 `recovered_at` 与 `verification`
-- 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试
+- 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试；凭据动作**不得**重做加密、重新生成密文或补写凭据版本——四证不足时停在 `unknown`，由人核对后显式重做
 - `unknown` 操作在管理台单独列出，由人判断；不得自动删除或再次执行
 - 恢复完成后，该操作的 `pending` 行不再参与后续启动扫描
 
@@ -508,12 +567,16 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - 412 的 `data` 可包含 `current_etag` 与当前版本号，供客户端重新读取；不含文件正文
 - 生命周期变更使用 `expected_state` + `expected_generation`（请求体）校验；不匹配 → 409 `CONFLICT`，不回退到“按名字猜状态”
 - 条件写必须在同一写入闸门内“比较 + 写入”；先比较后写入之间不得插入第二次写
+- **资源条件 ETag** 覆盖的不只是定义内容：还包括 `resource_uid`、`scope` / `owner_agent_uid`、凭据版本与状态、撤销序号与 `revision`。仅替换 Key、撤销凭据或改变范围也必须使 ETag 变化，否则并发替换无法被发现。Agent 的 `content_etag` 不吸收资源变化（见 [agent-md.md](agent-md.md) §2.3）
+- 涉及资源身份的动作（范围转换、凭据撤销、删除）在 `If-Match` 之外还必须携带 `resource_uid`；与当前指针不一致 → `409 RESOURCE_UID_MISMATCH`，不按名称猜测目标
 
 ### 9.6 资源版本、发布与引用
 
 - 资源种类 `kind` 固定为 `model_connection` / `mcp_server` / `skill`；`version_id` 全局稳定，`version_no` 逐资源从 1 递增
-- 版本内容不可变；撤回 / 回滚 = **用旧版本内容创建新版本**，不回退 `version_no`、不改历史版本、不恢复已撤销的 `${ENV_VAR}` 解析值
+- **稳定身份**：每个资源实例有不可变 `resource_uid`（`resource_identities` 记录身份与墓碑）。名称只是当前标签：活动名称唯一；删除后允许同名重建，但生成**新 UID**，版本号从 1 重新计，旧 UID 的版本、凭据与引用保留在墓碑下可查。版本唯一键为 `(resource_kind, resource_uid, version_no)`，只按名称查询默认只回当前指针 UID 的版本
+- 版本内容不可变；撤回 / 回滚 = **用旧版本内容创建新版本**，不回退 `version_no`、不改历史版本、不恢复已撤销的 `${ENV_VAR}` 解析值或已撤销的托管凭据
 - Provider / 技能发布后对新准入 Run 立即生效；MCP 首版重启生效，`applied_version_id` 在重启时追平，管理面显示“待重启”
-- 删除资源前必须检查定义引用与活动 Run 引用：被引用 → 400 `BAD_REQUEST` 并点名引用者，**不提供 force**；通知渠道保留既有 `?force=true`，但不得自动强删
-- 版本回收只看 `run_resource_refs.released_at` 与发布指针：当前发布版本即使零 Run 也不得回收；历史引用行不删除
-- Run 资源清单缺失的历史 Run 标 `legacy_unrecorded`；**不得**用当前版本补造关联
+- **凭据按版本**：托管凭据的每个不可变版本绑定目标地址（AAD）；替换 Key 创建新版本，发布版本只记录发布时的活动凭据版本供审计。Run 准入固定凭据版本，调用检查点发现撤销即终止该 Run；通知每次发送解析当前 `active` 版本。撤销按**整个凭据身份的全部版本**执行（`revocation_epoch` +1），旧版本永不复活；重新录入生成新版本
+- 删除资源前必须检查**绑定**（AGENT.md `resource_bindings` 中的 UID，含归档 Agent）、定义名引用与活动 Run 引用：被引用 → 400 `BAD_REQUEST` 并点名引用者，**不提供 force**；通知渠道保留既有 `?force=true`，但不得自动强删。删除只置墓碑（`deleted_at` / 身份 `state='deleted'`），不物理删除历史
+- 版本回收只看 `run_resource_refs.released_at` 与发布指针：当前发布版本即使零 Run 也不得回收；历史引用行不删除。通知的 Run 冻结集合记录在 `run_notify_refs`（具体 `channel_uid`，无 `'*'` 通配），发送明细在 `notify_deliveries`（与 `tool_invocations` 一对一）
+- Run 资源清单缺失的历史 Run 标 `legacy_unrecorded`；**不得**用当前版本补造关联。Agent 生命周期状态文件 schema v2 的 `agent_uid` 是身份权威，`agent_lifecycle` 索引与 `agent_archives` 只做镜像，索引可重建

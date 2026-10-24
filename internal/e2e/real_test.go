@@ -404,7 +404,7 @@ func testRealMCPTool(t *testing.T) {
 	h := newRealHarness(t, llm)
 	initWorkspace(t, h)
 	h.writeMCPServers(t, mcpServersYAML(mcpHelperServer))
-	h.writeConfig(t, realConfig(llm, ""))
+	h.writeConfig(t, realConfig(llm, mcpShellAllowed()))
 	h.writeAgent(t, "demo",
 		realAgentFrontmatter("demo", llm.Model, []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"真实 MCP 演示")
@@ -534,6 +534,8 @@ func testRealSchedulerManageOtherDenied(t *testing.T) {
 		"归属演示")
 	h.writeAgent(t, "demo-b", realAgentFrontmatter("demo-b", llm.Model, []string{"manage_schedule"}, nil),
 		"归属演示")
+	// 同 scheduler_test：先完成发布与补绑再取快照（v3 准入要求定义里写当前指针身份）。
+	h.publishBeforeSnapshot(t, realEnv(llm))
 	beforeA := agentFile(t, h, "demo-a")
 	beforeB := agentFile(t, h, "demo-b")
 

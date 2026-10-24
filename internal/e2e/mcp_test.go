@@ -63,7 +63,7 @@ func testMCPZeroCode(t *testing.T) {
 		toolCallResponse("call-zero-code", mcpEchoTool, `{"text":"零代码接入-回显"}`),
 		textResponse("工具调用完成"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllowed())
 	h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"零代码接入演示")
 
@@ -97,24 +97,25 @@ func testMCPZeroCode(t *testing.T) {
 }
 
 // testMCPBadCommand：错误 `command` 负向（U-2 第 3 项）。判据：启动不中断；日志出现
-// `MCP server 未连接——已跳过` 并点名 server 与固定短语；依赖它的 Agent 未注册
-// （`mcp server skipped`）；其余 Agent 正常可聊。
+// `MCP server 启动失败——继续其余 server` 并点名 server；依赖它的 Agent 未注册
+// （`mcp server skipped`）；其余 Agent 正常可聊。命令在 `shell.allowed_commands` 名单内
+// （US-12 起 supervisor 连接前先判可执行名），因此走的仍是**连接失败**而不是策略拒绝。
 func testMCPBadCommand(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
 	h.writeMCPServers(t, "servers:\n  - name: broken\n    command: basalt-e2e-missing-mcp-server\n")
 	fake := newFakeModel(t, textResponse("正常回答"))
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllow("basalt-e2e-missing-mcp-server"))
 	h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", nil, []string{"broken"}), "依赖坏 server 的 Agent")
 	h.writeAgent(t, "safe", agentFrontmatter("safe", nil), "不依赖 MCP 的 Agent")
 
 	res := h.run(t, fixtureEnv(), "chat", "--agent", "safe", "--message", "你好")
 	requireExit(t, res, 0, "坏 command 不中断启动")
 	requireContains(t, res.Stdout, "正常回答", "其余 Agent 正常可聊")
-	requireContains(t, res.Stderr, "MCP server 未连接——已跳过", "连接失败 WARN")
+	requireContains(t, res.Stderr, "MCP server 启动失败——继续其余 server", "单 server 失败不中断其余")
 	requireContains(t, res.Stderr, "server=broken", "WARN 点名 server")
-	requireContains(t, res.Stderr, "reason=初始化失败", "WARN 带固定短语（可执行文件不存在在握手期暴露）")
-	requireContains(t, res.Stderr, "detail=可执行文件不存在", "WARN 的 detail 不出现原始命令")
+	requireContains(t, res.Stderr, "detail=连接失败", "WARN 的 detail 只给固定短语")
+	requireAbsent(t, res.Stderr, "basalt-e2e-missing-mcp-server", "WARN 不得回显原始 command")
 	requireContains(t, res.Stderr, "mcp_connected=0", "启动摘要按实际连接数计 0")
 	requireContains(t, res.Stderr, "Agent 未注册", "依赖失败 server 的 Agent 未注册")
 	requireContains(t, res.Stderr, `reason="mcp server skipped"`, "拒载原因取契约字面量")
@@ -134,7 +135,7 @@ func testMCPTwoPaths(t *testing.T) {
 		initWorkspace(t, h)
 		h.writeMCPServers(t, mcpServersYAML(mcpHelperServer))
 		fake := newFakeModel(t, textResponse("重路径回答"))
-		h.writeConfig(t, configWithProvider(fake.URL()))
+		h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllowed())
 		h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 			"两档展示演示")
 
@@ -168,7 +169,7 @@ func testMCPTwoPaths(t *testing.T) {
 func testMCPToolList(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
-	h.writeConfig(t, configWithProvider("http://127.0.0.1:1"))
+	h.writeConfig(t, configWithProvider("http://127.0.0.1:1")+mcpShellAllowed())
 
 	baseline := h.run(t, fixtureEnv(), "tool", "list")
 	requireExit(t, baseline, 0, "tool list 基线")
@@ -188,7 +189,7 @@ func testMCPToolList(t *testing.T) {
 		toolCallResponse("call-schema", mcpEchoTool, `{"text":"schema 抽验"}`),
 		textResponse("schema 抽验完成"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllowed())
 	h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"schema 抽验")
 	res := h.run(t, mcpHelperEnv(), "chat", "--agent", "demo", "--message", "抽验 schema")
@@ -273,7 +274,7 @@ func testMCPShutdown(t *testing.T) {
 	initWorkspace(t, h)
 	h.writeMCPServers(t, mcpServersYAML(mcpHelperServer))
 	fake := newFakeModel(t, textResponse("结束"))
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllowed())
 	h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"停机检查演示")
 
@@ -300,7 +301,7 @@ func testMCPRedaction(t *testing.T) {
 		h.writeMCPServers(t, mcpServersYAMLWithEnv(mcpHelperServer,
 			[2]string{"BASALT_MCP_HELPER", "${" + mcpHelperEnvRef + "}"},
 			[2]string{"EXTRA_CREDENTIAL", "${BASALT_E2E_MCP_EXTRA}"}))
-		h.writeConfig(t, configWithProvider("http://127.0.0.1:1"))
+		h.writeConfig(t, configWithProvider("http://127.0.0.1:1")+mcpShellAllowed())
 		env := append(mcpHelperEnv(), "BASALT_E2E_MCP_EXTRA="+sentinel)
 
 		res := h.run(t, env, "tool", "list")
@@ -315,12 +316,12 @@ func testMCPRedaction(t *testing.T) {
 		initWorkspace(t, h)
 		h.writeMCPServers(t, "servers:\n  - name: broken\n    command: basalt-missing-"+sentinel+"-server\n")
 		fake := newFakeModel(t, textResponse("正常回答"))
-		h.writeConfig(t, configWithProvider(fake.URL()))
+		h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllow("basalt-missing-"+sentinel+"-server"))
 		h.writeAgent(t, "safe", agentFrontmatter("safe", nil), "原始命令不回显")
 
 		res := h.run(t, fixtureEnv(), "chat", "--agent", "safe", "--message", "你好")
 		requireExit(t, res, 0, "原始命令不回显")
-		requireContains(t, res.Stderr, "detail=可执行文件不存在", "detail 只给固定短语")
+		requireContains(t, res.Stderr, "detail=连接失败", "detail 只给固定短语")
 		requireAbsent(t, res.Stdout+res.Stderr, sentinel, "WARN 不得回显原始 command")
 	})
 
@@ -333,7 +334,7 @@ func testMCPRedaction(t *testing.T) {
 			toolCallResponse("call-bad-arg", mcpEchoTool, `{"text": 1}`),
 			textResponse("失败已回填"),
 		)
-		h.writeConfig(t, configWithProvider(fake.URL()))
+		h.writeConfig(t, configWithProvider(fake.URL())+mcpShellAllowed())
 		h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 			"协议错误脱敏")
 
@@ -402,7 +403,7 @@ func testMCPConcurrency(t *testing.T) {
 		}
 		_, _ = fmt.Fprintf(w, "%s", textResponse("完成-并发MCP-"+k).Body)
 	}))
-	h.writeConfig(t, configWithAddr(server.URL, addr))
+	h.writeConfig(t, configWithAddr(server.URL, addr)+mcpShellAllowed())
 	h.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"并发调用演示")
 

@@ -9,12 +9,16 @@ package workspace_test
 // assert the equivalent behaviour through the parser instead of adding test seams.
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -281,9 +285,12 @@ servers:
 	require.Equal(t, "nulled", nullSpecs[0].Name)
 }
 
-// TestParseMCPServers_RejectsUnsupportedTransport：非 stdio 的 transport 一律拒载，
-// 点名 server 与取值（已决 #1 方案 A）。
-// A non-stdio transport is rejected fail-closed, naming the server and the value.
+// TestParseMCPServers_RejectsUnsupportedTransport：stdio / http 之外的 transport 一律
+// 拒载，点名 server 与取值（已决 #1 方案 A；US-12 约束 8 起 http 受支持，判据从
+// 「只支持 stdio」改为「只支持 stdio / http」）。
+// Any transport outside stdio / http is rejected fail-closed, naming the server and
+// the value. Since US-12 (constraint 8) http is supported too, so the fixed phrase
+// names both transports.
 func TestParseMCPServers_RejectsUnsupportedTransport(t *testing.T) {
 	root := t.TempDir()
 	writeFileInRoot(t, root, "mcp_servers.yaml", `
@@ -296,7 +303,7 @@ servers:
 	require.Error(t, err)
 	require.Empty(t, specs)
 	require.Contains(t, err.Error(), "server web 的 transport 不受支持（sse）")
-	require.Contains(t, err.Error(), "v1 只支持 stdio")
+	require.Contains(t, err.Error(), "只支持 stdio / http")
 }
 
 // TestParseMCPServers_RejectsNonStringTransport：`transport` 字段一旦出现就必须是字符串。
@@ -488,4 +495,342 @@ servers:
 			require.Contains(t, err.Error(), "env.TOKEN")
 		})
 	}
+}
+
+// TestParseMCPServers_CandidateMatrix：严格候选的传输分支矩阵（约束 8）——stdio 必须
+// 有单可执行名 command、不得有 url；http 必须有 http(s) 且无 userinfo 的 url、不得有
+// command / args；transport 必须显式；合法候选返回规范化配置。
+// Strict candidate matrix: transport must be explicit, stdio requires a command and
+// forbids a url, http requires a url and forbids command/args.
+func TestParseMCPServers_CandidateMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     core.MCPServerConfig
+		wantErr string
+		want    core.MCPServerConfig
+	}{
+		{
+			name: "stdio 合法（显式 transport + 单可执行名 + args）",
+			cfg: core.MCPServerConfig{
+				Name: "local", Transport: "stdio", Command: "npx", Args: []string{"-y", "@scope/server"},
+			},
+			want: core.MCPServerConfig{
+				Name: "local", Transport: "stdio", Command: "npx", Args: []string{"-y", "@scope/server"},
+			},
+		},
+		{
+			name: "http 合法（url 无 userinfo）",
+			cfg: core.MCPServerConfig{
+				Name: "remote", Transport: "http", URL: "https://mcp.example.com/v1",
+				Env: map[string]string{"MCP_TOKEN": "${MCP_TOKEN}"},
+			},
+			want: core.MCPServerConfig{
+				Name: "remote", Transport: "http", URL: "https://mcp.example.com/v1",
+				Env: map[string]string{"MCP_TOKEN": "${MCP_TOKEN}"},
+			},
+		},
+		{name: "缺 transport", cfg: core.MCPServerConfig{Name: "x", Command: "npx"}, wantErr: "必须显式给出 transport"},
+		{name: "缺 name", cfg: core.MCPServerConfig{Transport: "stdio", Command: "npx"}, wantErr: "name 必填"},
+		{name: "未知 transport", cfg: core.MCPServerConfig{Name: "x", Transport: "sse", URL: "https://a.example"}, wantErr: "transport 不受支持"},
+		{name: "stdio 缺 command", cfg: core.MCPServerConfig{Name: "x", Transport: "stdio"}, wantErr: "缺少 command"},
+		{name: "stdio 带 url", cfg: core.MCPServerConfig{Name: "x", Transport: "stdio", Command: "npx", URL: "https://a.example"}, wantErr: "不得给出 url"},
+		{name: "http 缺 url", cfg: core.MCPServerConfig{Name: "x", Transport: "http"}, wantErr: "缺少 url"},
+		{name: "http 带 command", cfg: core.MCPServerConfig{Name: "x", Transport: "http", URL: "https://a.example", Command: "npx"}, wantErr: "不得给出 command"},
+		{name: "http 带 args", cfg: core.MCPServerConfig{Name: "x", Transport: "http", URL: "https://a.example", Args: []string{"-y"}}, wantErr: "不得给出 args"},
+		{name: "http 非 http(s) scheme", cfg: core.MCPServerConfig{Name: "x", Transport: "http", URL: "ftp://a.example"}, wantErr: "http / https"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := workspace.ValidateMCPServerCandidate(tc.cfg)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantErr)
+				require.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestParseMCPServers_RejectsUserinfoAndPlaintextTokenArgs：http url 带 userinfo、
+// args 以明文承载凭证（`--flag=value` 与 `--flag value` 两种形态）一律拒绝；
+// 错误文案不回显取值；`${VAR}` 占位形式通过（约束 8 / 23）。
+// Userinfo URLs and plaintext credential args are rejected without echoing values;
+// exact ${VAR} placeholders pass.
+func TestParseMCPServers_RejectsUserinfoAndPlaintextTokenArgs(t *testing.T) {
+	secret := "sk-live-must-not-leak"
+
+	_, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "u", Transport: "http", URL: "https://user:" + secret + "@mcp.example.com",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "url")
+	require.NotContains(t, err.Error(), secret, "错误文案不得回显 URL 里的凭证")
+
+	_, err = workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "t", Transport: "stdio", Command: "mcp", Args: []string{"--token=" + secret},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "args[0]")
+	require.NotContains(t, err.Error(), secret, "错误文案不得回显参数取值")
+
+	_, err = workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "t2", Transport: "stdio", Command: "mcp", Args: []string{"--token", secret},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "args[0]")
+	require.NotContains(t, err.Error(), secret)
+
+	for _, args := range [][]string{
+		{"--token=${MCP_TOKEN}"},
+		{"--token", "${MCP_TOKEN}"},
+		{"--config=plain-value", "--verbose"},
+	} {
+		_, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+			Name: "ok", Transport: "stdio", Command: "mcp", Args: args,
+		})
+		require.NoError(t, err, "占位或非凭证参数必须通过：%v", args)
+	}
+}
+
+// TestParseMCPServers_LegacyCommandSplitWarns：既有文件的旧格式多词 command 按
+// strings.Fields 拆分（与旧 tool 层行为逐字等价），并记一次 WARN 提示迁移到 args；
+// 兼容拆分不得泄漏完整 command（可能夹带凭证）。
+// Legacy multi-word commands are split exactly like strings.Fields and warn once
+// about migrating to args; the full command is never logged.
+func TestParseMCPServers_LegacyCommandSplitWarns(t *testing.T) {
+	var logBuf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	legacy := "npx  -y   @scope/server"
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", `
+servers:
+  - name: legacy
+    command: "`+legacy+`"
+`)
+	specs, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	require.Equal(t, "stdio", specs[0].Transport)
+	require.Equal(t, strings.Fields(legacy), append([]string{specs[0].Command}, specs[0].Args...),
+		"拆分结果必须与旧 strings.Fields 逐字等价")
+
+	logged := logBuf.String()
+	require.Contains(t, logged, "WARN")
+	require.Contains(t, logged, "拆分")
+	require.Contains(t, logged, "args")
+	require.Contains(t, logged, "legacy", "WARN 必须点名 server")
+	require.NotContains(t, logged, legacy, "不得整体回显旧 command")
+}
+
+// TestParseMCPServers_LegacyAmbiguousRejected：既有文件同时给出 args 与多词 command
+// → 拒绝（只允许一种写法，约束 8）；严格候选同样拒绝。
+// A file entry carrying both args and a multi-word command is rejected; the strict
+// candidate path rejects it too.
+func TestParseMCPServers_LegacyAmbiguousRejected(t *testing.T) {
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", `
+servers:
+  - name: ambiguous
+    command: "npx -y server"
+    args: ["--fast"]
+`)
+	_, err := workspace.ParseMCPServers(root)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "同时给出 args 与多词 command")
+
+	_, err = workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "ambiguous", Transport: "stdio", Command: "npx -y server", Args: []string{"--fast"},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "同时给出 args 与多词 command")
+}
+
+// TestParseMCPServers_StrictMultiWordCommandRejected：候选（严格路径）的多词 command
+// 直接 400 类错误并指引用 args 字段，不做兼容拆分（约束 47 ②）。
+// Strict candidates reject a multi-word command instead of splitting it and point
+// the operator at the args field.
+func TestParseMCPServers_StrictMultiWordCommandRejected(t *testing.T) {
+	_, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "legacy", Transport: "stdio", Command: "npx -y server",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "单个可执行名")
+	require.Contains(t, err.Error(), "args 字段")
+}
+
+// TestParseMCPServers_TransportRequiredForCandidate：候选必须显式给 transport；
+// 既有文件缺省仍按 stdio 读入（两条路径的唯一语义差异）。
+// Candidates must state the transport explicitly; existing files still default to
+// stdio — the only semantic difference between the two paths.
+func TestParseMCPServers_TransportRequiredForCandidate(t *testing.T) {
+	_, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{Name: "x", Command: "npx"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "必须显式给出 transport")
+
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", "servers:\n  - name: legacy\n    command: npx\n")
+	specs, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	require.Equal(t, "stdio", specs[0].Transport, "既有文件缺省 transport 按 stdio 读入")
+}
+
+// TestParseMCPServers_ExtendedFieldsRoundTrip：扩展字段逐项保留——stdio 的 args 顺序、
+// http 的 url、两种传输的 env 占位原文（解析层不做值替换）。
+// The extended fields survive verbatim: args order, url, and env placeholders.
+func TestParseMCPServers_ExtendedFieldsRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", `
+servers:
+  - name: local
+    transport: stdio
+    command: uvx
+    args: ["--from", "pkg", "server"]
+    env:
+      MCP_TOKEN: ${MCP_TOKEN}
+  - name: remote
+    transport: http
+    url: https://mcp.example.com/v1
+    env:
+      REMOTE_TOKEN: ${REMOTE_TOKEN}
+`)
+	specs, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, specs, 2)
+
+	require.Equal(t, "local", specs[0].Name)
+	require.Equal(t, "stdio", specs[0].Transport)
+	require.Equal(t, "uvx", specs[0].Command)
+	require.Equal(t, []string{"--from", "pkg", "server"}, specs[0].Args)
+	require.Equal(t, map[string]string{"MCP_TOKEN": "${MCP_TOKEN}"}, specs[0].Env)
+
+	require.Equal(t, "remote", specs[1].Name)
+	require.Equal(t, "http", specs[1].Transport)
+	require.Empty(t, specs[1].Command)
+	require.Empty(t, specs[1].Args)
+	require.Equal(t, "https://mcp.example.com/v1", specs[1].URL)
+	require.Equal(t, map[string]string{"REMOTE_TOKEN": "${REMOTE_TOKEN}"}, specs[1].Env)
+}
+
+// TestParseMCPServerBlock_AcceptsBothStoredShapes：已发布版本的 `definition_yaml` 有
+// 两种已落库形态——管理写路径的块式列表片段（带 `- ` 指示符）与基线 / 对账路径的
+// 顶层条目映射；两者都必须解析回同一条配置（图 C 的"读取 published 版本"）。
+// Both stored shapes — the block item written by the admin path and the mapping form
+// written by baseline — parse back into the same configuration.
+func TestParseMCPServerBlock_AcceptsBothStoredShapes(t *testing.T) {
+	blockForm := []byte("  - name: local\n    transport: stdio\n    command: uvx\n    args:\n      - --from\n      - pkg\n")
+	cfg, err := workspace.ParseMCPServerBlock(blockForm)
+	require.NoError(t, err)
+	require.Equal(t, core.MCPServerConfig{
+		Name: "local", Transport: "stdio", Command: "uvx", Args: []string{"--from", "pkg"},
+	}, cfg)
+
+	mappingForm := []byte("name: remote\ntransport: http\nurl: https://mcp.example.com/v1\nenv:\n  REMOTE_TOKEN: ${REMOTE_TOKEN}\n")
+	cfg, err = workspace.ParseMCPServerBlock(mappingForm)
+	require.NoError(t, err)
+	require.Equal(t, "remote", cfg.Name)
+	require.Equal(t, "http", cfg.Transport)
+	require.Equal(t, "https://mcp.example.com/v1", cfg.URL)
+	require.Equal(t, map[string]string{"REMOTE_TOKEN": "${REMOTE_TOKEN}"}, cfg.Env)
+}
+
+// TestParseMCPServerBlock_RejectsNonSingleShape：多条目列表、标量与非法传输都被拒
+// （定义行只承载**一条**配置；一条版本行里出现两个 server 是存储分叉，不猜选）。
+// 缺省 transport 不在此列：既有文件的兼容路径按 stdio 读入（约束 8 / 47）。
+// Multiple entries, scalars and invalid transports are refused; a missing transport
+// stays accepted because the legacy reading path defaults it to stdio.
+func TestParseMCPServerBlock_RejectsNonSingleShape(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "两个条目", raw: "  - name: a\n    transport: http\n    url: https://a.example\n  - name: b\n    transport: http\n    url: https://b.example\n"},
+		{name: "标量", raw: "just-a-string\n"},
+		{name: "空值", raw: "null\n"},
+		{name: "非法传输", raw: "name: a\ntransport: grpc\ncommand: uvx\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := workspace.ParseMCPServerBlock([]byte(tc.raw))
+			require.ErrorIs(t, err, workspace.ErrInvalidDefinition)
+		})
+	}
+
+	legacy, err := workspace.ParseMCPServerBlock([]byte("name: a\ncommand: uvx\n"))
+	require.NoError(t, err)
+	require.Equal(t, "stdio", legacy.Transport)
+}
+
+// TestParseMCPServerBlock_LegacyMultiWordCommandSplits：存储字节可能来自旧格式文件，
+// 多词 command 按兼容路径拆分（约束 47②：编辑前的既有条目在发布 / 重启路径照旧可用）。
+// A stored legacy multi-word command still splits on the reading path.
+func TestParseMCPServerBlock_LegacyMultiWordCommandSplits(t *testing.T) {
+	cfg, err := workspace.ParseMCPServerBlock([]byte("name: legacy\ntransport: stdio\ncommand: \"npx -y server\"\n"))
+	require.NoError(t, err)
+	require.Equal(t, "npx", cfg.Command)
+	require.Equal(t, []string{"-y", "server"}, cfg.Args)
+}
+
+// TestRenderMCPServerEntry_DeterministicAndRoundTrip：渲染键序固定（name → transport →
+// command / url → args → env），env 键按升序，输出能被文件解析器原样读回同一条配置；
+// 严格候选规则在渲染前生效（多词 command → 错误、零写入）。
+// Rendering is deterministic, sorted, round-trips through the file parser, and applies
+// the strict candidate rules before producing any bytes.
+func TestRenderMCPServerEntry_DeterministicAndRoundTrip(t *testing.T) {
+	stdio := core.MCPServerConfig{
+		Name:      "local",
+		Transport: "stdio",
+		Command:   "uvx",
+		Args:      []string{"--from", "pkg", "server"},
+		Env:       map[string]string{"B_TOKEN": "${B_TOKEN}", "A_TOKEN": "${A_TOKEN}"},
+	}
+	rendered, err := workspace.RenderMCPServerEntry(stdio)
+	require.NoError(t, err)
+	want := "  - name: local\n    transport: stdio\n    command: uvx\n    args:\n" +
+		"      - \"--from\"\n      - pkg\n      - server\n" +
+		"    env:\n      A_TOKEN: ${A_TOKEN}\n      B_TOKEN: ${B_TOKEN}\n"
+	require.Equal(t, want, string(rendered))
+
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", "servers:\n"+string(rendered))
+	specs, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	require.Equal(t, stdio, specs[0])
+
+	httpCfg := core.MCPServerConfig{Name: "remote", Transport: "http", URL: "https://mcp.example.com/v1"}
+	rendered, err = workspace.RenderMCPServerEntry(httpCfg)
+	require.NoError(t, err)
+	require.Equal(t, "  - name: remote\n    transport: http\n    url: https://mcp.example.com/v1\n", string(rendered))
+
+	_, err = workspace.RenderMCPServerEntry(core.MCPServerConfig{
+		Name: "legacy", Transport: "stdio", Command: "npx -y server",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "args")
+}
+
+// TestParseMCPServers_DuplicateNamesAcrossTransports：重名判定与传输无关——一个 stdio
+// 与一个 http 同名同样拒载（名字是 server 的唯一标识）。
+// Duplicate names are rejected regardless of transport.
+func TestParseMCPServers_DuplicateNamesAcrossTransports(t *testing.T) {
+	root := t.TempDir()
+	writeFileInRoot(t, root, "mcp_servers.yaml", `
+servers:
+  - name: dup
+    transport: stdio
+    command: local-mcp
+  - name: dup
+    transport: http
+    url: https://mcp.example.com
+`)
+	_, err := workspace.ParseMCPServers(root)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "server 名重复: dup")
 }

@@ -63,6 +63,7 @@ type TaskRecord struct {
 	Cron           string
 	Zone           string
 	Message        string
+	DeliverTo      string
 	Enabled        bool
 	DefinitionHash string
 	LastRunAt      time.Time
@@ -74,16 +75,25 @@ type TaskRecord struct {
 
 // ExecutionRecord 是 `task_executions` 的一行（执行历史；无 Run 的终态行 RunID 为空）。
 // ExecutionRecord is one task_executions row; terminal rows without a Run carry an empty RunID.
+//
+// Delivery / DeliveryChannel / DeliveryDetail 是从 `schedule_deliveries` 左连接来的
+// **投递结果**，与 Status 的**执行结果**分开展示（R7）：`Delivery == ""` 表示本行没有
+// 代投记录（任务未配置代投或本轮未创建投递行）。
+// The delivery fields are projected from schedule_deliveries and stay separate from the
+// execution status; an empty Delivery means this row has no delivery record.
 type ExecutionRecord struct {
-	ID           int64
-	TaskID       string
-	RunID        string
-	Status       ExecutionStatus
-	Trigger      Trigger
-	DurationMS   int64
-	ErrorMessage string
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	ID              int64
+	TaskID          string
+	RunID           string
+	Status          ExecutionStatus
+	Trigger         Trigger
+	DurationMS      int64
+	ErrorMessage    string
+	Delivery        DeliveryStatus
+	DeliveryChannel string
+	DeliveryDetail  string
+	StartedAt       time.Time
+	FinishedAt      time.Time
 }
 
 // TaskStore 是任务定义与执行历史的仓储接口（实现在 internal/storage，SQL 只在那里出现）。

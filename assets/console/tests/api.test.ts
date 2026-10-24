@@ -2,7 +2,13 @@
 // API client tests: envelope unwrapping, credential headers, conditional writes,
 // error mapping and the 401 / 429 paths from the contracts.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiClient, ApiError, errorMessage } from '../src/api'
+import {
+  ApiClient,
+  ApiError,
+  RESOURCE_ERROR_COPY,
+  errorMessage,
+  resourceErrorCopy,
+} from '../src/api'
 import { ConsoleAuth } from '../src/auth'
 
 interface FakeResponse {
@@ -251,5 +257,69 @@ describe('ApiClient failure mapping', () => {
   it('keeps the server message for plain errors', () => {
     expect(errorMessage(new Error('boom'))).toBe('boom')
     expect(errorMessage('weird')).toBe('请求失败')
+  })
+})
+
+describe('failure data projection', () => {
+  it('keeps the four arrays and the three whitelisted scalars', async () => {
+    stubFetch(
+      fakeResponse({
+        status: 409,
+        body: {
+          code: 'RESOURCE_UID_MISMATCH',
+          message: '资源身份不一致',
+          data: {
+            agents: ['writer'],
+            resource_uid: 'rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A',
+            operation_id: 'op_01J8Z6YQ4M2S3T7V9W0X1Y2Z3B',
+            current_etag: `"sha256:${'b'.repeat(64)}"`,
+            ignored: '不该出站',
+          },
+        },
+      }),
+    )
+    const api = new ApiClient(new ConsoleAuth())
+    const error = await expectApiError(api.getInfo(), 409, 'RESOURCE_UID_MISMATCH')
+    expect(error.data).not.toBeNull()
+    expect(error.data?.agents).toEqual(['writer'])
+    expect(error.data?.resource_uid).toBe('rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A')
+    expect(error.data?.operation_id).toBe('op_01J8Z6YQ4M2S3T7V9W0X1Y2Z3B')
+    expect(error.data?.current_etag).toBe(`"sha256:${'b'.repeat(64)}"`)
+    // 白名单之外的同名键没有载荷：记录里只有契约字段。
+    expect(Object.keys(error.data ?? {})).not.toContain('ignored')
+  })
+
+  it('drops empty scalars and unknown shapes entirely', async () => {
+    stubFetch(
+      fakeResponse({
+        status: 412,
+        body: {
+          code: 'PRECONDITION_FAILED',
+          message: '版本已变化',
+          data: { current_etag: '', resource_uid: 5, other: ['x'] },
+        },
+      }),
+    )
+    const api = new ApiClient(new ConsoleAuth())
+    const error = await expectApiError(api.getInfo(), 412, 'PRECONDITION_FAILED')
+    // 空串按“未携带”处理：没有任何白名单字段时 data 为 null。
+    expect(error.data).toBeNull()
+  })
+})
+
+describe('resource error copy', () => {
+  it('covers the twelve contract codes and nothing else', () => {
+    expect(Object.keys(RESOURCE_ERROR_COPY)).toHaveLength(12)
+    for (const [code, copy] of Object.entries(RESOURCE_ERROR_COPY)) {
+      expect(copy, code).not.toBe('')
+    }
+  })
+
+  it('returns the page copy for a known code and empty for others', () => {
+    expect(resourceErrorCopy(new ApiError(400, 'CREDENTIAL_REVOKED', '已撤销'))).toContain(
+      '重新录入',
+    )
+    expect(resourceErrorCopy(new ApiError(400, 'SOMETHING_ELSE', 'x'))).toBe('')
+    expect(resourceErrorCopy(new Error('boom'))).toBe('')
   })
 })

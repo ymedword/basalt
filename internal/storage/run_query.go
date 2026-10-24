@@ -1,8 +1,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -248,15 +251,45 @@ func loadRunManifest(ctx context.Context, q queryer, runID string) (*core.RunRes
 	if err := json.Unmarshal([]byte(snapshotJSON), &manifest); err != nil {
 		return nil, fmt.Errorf("解析运行资源清单（run_id=%s）: %w", runID, err)
 	}
-	gotHash, err := core.HashManifest(manifest)
-	if err != nil {
-		return nil, fmt.Errorf("重算运行资源清单哈希（run_id=%s）: %w", runID, err)
-	}
-	if gotHash != wantHash {
-		return nil, fmt.Errorf("运行资源清单哈希不一致（run_id=%s）: 库里 %s，重算 %s",
-			runID, wantHash, gotHash)
+	if err := verifyManifestBytes([]byte(snapshotJSON), wantHash, runID); err != nil {
+		return nil, err
 	}
 	return &manifest, nil
+}
+
+// verifyManifestBytes 用**已存储的字节**校验清单：写入时 `manifest_hash` 是「同一份
+// JSON 把顶层 hash 值置空」后的 sha256，因此校验也必须回放同一定义，而不是把
+// snapshot_json 解析进**当前**结构体再重新序列化——结构体新增字段（v1 → v2 增加
+// agent_uid / provider.model / 凭据固定 / notify）会改变重序列化字节，把合法的历史行
+// 误判成损坏（实测：v1 清单的 Run 详情 500）。
+//
+// `hash` 是结构体声明序的第二个字段（v1 / v2 都是），所以首个 `"hash":"` 就是顶层
+// 字段；值只含小写十六进制，不存在转义。截取它的值后，剩余字节必须逐字节等于写入时
+// 的哈希输入。篡改任何其它字节都会改变重算结果。
+// verifyManifestBytes replays the writer's hash definition over the stored bytes.
+// Re-marshalling through the current struct would reject every pre-v2 row once the
+// struct grows new fields; verifying the stored bytes stays format-independent.
+func verifyManifestBytes(raw []byte, wantHash, runID string) error {
+	const hashField = `"hash":"`
+	idx := bytes.Index(raw, []byte(hashField))
+	if idx < 0 {
+		return fmt.Errorf("运行资源清单缺少 hash 字段（run_id=%s）", runID)
+	}
+	start := idx + len(hashField)
+	end := start + len(wantHash)
+	if end >= len(raw) || string(raw[start:end]) != wantHash || raw[end] != '"' {
+		return fmt.Errorf("运行资源清单哈希不一致（run_id=%s）: 库里 %s", runID, wantHash)
+	}
+	input := make([]byte, 0, len(raw)-len(wantHash))
+	input = append(input, raw[:start]...)
+	input = append(input, raw[end:]...)
+	sum := sha256.Sum256(input)
+	got := hex.EncodeToString(sum[:])
+	if got != wantHash {
+		return fmt.Errorf("运行资源清单哈希不一致（run_id=%s）: 库里 %s，重算 %s",
+			runID, wantHash, got)
+	}
+	return nil
 }
 
 // normalizeRunListLimit 收敛窗口：缺省 50、上限 200、非正数按缺省（约束 21）。

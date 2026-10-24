@@ -108,6 +108,8 @@ func registryEntriesWithSkillPublication(ctx context.Context, source skillPointe
 			continue
 		}
 		adjusted[i].Registered = false
+		adjusted[i].RejectKind = core.AgentRejectSkillVersionMissing
+		adjusted[i].RejectDetail = strings.Join(missing, "、")
 		adjusted[i].RejectReason = skillPublicationReject(missing)
 		logger.Warn("Agent 绑定技能无发布版本，不注册",
 			"agent", adjusted[i].Name, "reason", adjusted[i].RejectReason)

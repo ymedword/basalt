@@ -84,11 +84,15 @@ func contentValidator(_ context.Context, agent string, _ []byte) (core.AgentEntr
 		[]core.ManifestEntry{{Path: "AGENT.md", SHA256: strings.Repeat("0", 64)}}, nil
 }
 
-// contentRejectingValidator 模拟"候选未通过装载期校验"：reason 走 entry 的
-// RejectReason，由编辑器映射为 400 BAD_REQUEST。
-// contentRejectingValidator mimics a candidate refused by the load-time gate.
+// contentRejectingValidator 模拟"候选未通过装载期校验"：与生产装载器同形返回
+// 类型化拒绝（英文合并文本只在 Error() 里），由 web 层映射为 400 BAD_REQUEST。
+// contentRejectingValidator mimics a candidate refused by the load-time gate with the
+// same typed rejection the production loader returns.
 func contentRejectingValidator(_ context.Context, agent string, _ []byte) (core.AgentEntry, string, []core.ManifestEntry, error) {
-	return core.AgentEntry{Name: agent, Registered: false, RejectReason: "provider 段未配置"}, "", nil, nil
+	return core.AgentEntry{Name: agent}, "", nil, &core.AgentDefinitionRejectedError{
+		Kind:   core.AgentRejectProviderNotRegistered,
+		Detail: "main",
+	}
 }
 
 // fileAgentConsole 是 `core.AgentAdmin` 在测试侧的组装：内容读写委托给真实的
@@ -477,7 +481,12 @@ type contentEnv struct {
 	scheduler *contentSchedulesFake
 	lifecycle *workspace.LifecycleStore
 	runs      *fakeRunService
-	server    *Server
+	// admin 是服务端使用的同一个适配器实例：结构化配置用例要拿它重建一台带
+	// AgentConfigService 的服务端，同时保持 /content 与 /config 读的是同一份装配。
+	// admin is the same adapter the server holds, so the config cases can rebuild a
+	// server with an extra port while keeping the real editor.
+	admin  *fileAgentConsole
+	server *Server
 }
 
 // newContentEnv 组装默认夹具（内容校验恒通过）。
@@ -525,6 +534,7 @@ func newContentEnvWith(t *testing.T, tune func(*workspace.AgentEditorDeps)) *con
 		editor:    workspace.NewAgentEditor(deps),
 		lifecycle: env.lifecycle,
 	}
+	env.admin = admin
 	env.server = newTestServer(t, func(o *Options) {
 		o.AdminAuth = testAdminAuth(testToken)
 		o.AgentAdmin = admin
@@ -832,6 +842,58 @@ func TestAgentContent_PutPatch_Success(t *testing.T) {
 	require.Equal(t, "AGENT.md", view.Files[0].Path)
 }
 
+// TestAgentContentChanges_TemperatureTriState：温度补丁三态——省略 = 不修改，
+// 数字（含 0）= 写入，`null` = 清除（回到供应商缺省）。省略**不得**被读成清除。
+// 对应契约：agent-md §2.3 `changes.provider.temperature`。
+func TestAgentContentChanges_TemperatureTriState(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantClear bool
+		wantValue *float64
+	}{
+		{
+			name: "omitted leaves unchanged",
+			body: `{"changes":{"provider":{"model":"m"}}}`,
+		},
+		{
+			name:      "explicit null clears",
+			body:      `{"changes":{"provider":{"temperature":null}}}`,
+			wantClear: true,
+		},
+		{
+			name:      "explicit zero is a value",
+			body:      `{"changes":{"provider":{"temperature":0}}}`,
+			wantValue: ptrFloat(0),
+		},
+		{
+			name:      "number sets value",
+			body:      `{"changes":{"provider":{"temperature":0.7}}}`,
+			wantValue: ptrFloat(0.7),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body contentUpdateBody
+			require.NoError(t, json.Unmarshal([]byte(tc.body), &body))
+			require.NotNil(t, body.Changes)
+			changes, err := body.Changes.toCore()
+			require.NoError(t, err)
+			require.NotNil(t, changes.Provider)
+			require.Equal(t, tc.wantClear, changes.Provider.ClearTemperature)
+			if tc.wantValue == nil {
+				require.Nil(t, changes.Provider.Temperature)
+				return
+			}
+			require.NotNil(t, changes.Provider.Temperature)
+			require.InDelta(t, *tc.wantValue, *changes.Provider.Temperature, 1e-9)
+		})
+	}
+}
+
+// ptrFloat 取浮点指针，仅供上表写字面量期望值。
+func ptrFloat(v float64) *float64 { return &v }
+
 // TestAgentContent_PutPatchEditUnsupported：目标值带行内注释时补丁拒绝执行，
 // 返回 400 `EDIT_UNSUPPORTED` 并提示改用整份原文；磁盘零写入、零操作行。
 // 逆改点：静默丢注释 → 200 且磁盘字节变化，红。
@@ -871,7 +933,8 @@ func TestAgentContent_PutValidationFailure(t *testing.T) {
 
 	envelope := decodeAuthEnvelope(t, rec)
 	require.Equal(t, codeBadRequest, envelope.Code)
-	require.Contains(t, envelope.Message, "provider 段未配置")
+	require.Contains(t, envelope.Message, "引用的模型连接未发布或不存在：main")
+	require.NotContains(t, envelope.Message, "provider not registered", "英文拒因不得进入用户文案")
 	require.Equal(t, before, readAgentDoc(t, env.root, contentAgentName), "校验失败必须磁盘零写入")
 	require.Empty(t, env.ops.begunRecords())
 	require.Zero(t, env.snapshots.savedCount())
@@ -1459,4 +1522,131 @@ func TestAgentContent_OperationSharesAgentGate(t *testing.T) {
 		t.Fatal("释放写锁后保存必须继续完成")
 	}
 	require.NotEqual(t, before, readAgentDoc(t, env.root, contentAgentName))
+}
+
+// TestAgentContent_PutPatch_BodyNotifyModeAndBindings：契约 agent-md §2.3 列出的
+// `body` / `notify_mode` / `bindings` 三个补丁键必须在线上形状里可用并落到文件——
+// changesBody 缺任一键时 DisallowUnknownFields 会把页面保存挡成 400。
+// 逆改点：删掉任一线上字段 → 对应请求变 400；按名称补绑 → UID 断言红。
+// Acceptance point: the three contract-declared patch keys reach the file verbatim.
+func TestAgentContent_PutPatch_BodyNotifyModeAndBindings(t *testing.T) {
+	env := newContentEnv(t)
+	const channelUID = "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z4C"
+	const body = "全新的正文。"
+
+	req := contentPUT(contentAgentName, `{"changes":{`+
+		`"body":"全新的正文。",`+
+		`"notify_mode":"allowlist",`+
+		`"notify_channels":["alerts"],`+
+		`"bindings":[{"resource_kind":"notify_channel","ref_name":"alerts","resource_uid":"`+channelUID+`"}]}}`,
+		currentETag(t, env))
+	rec := serveAdmin(env.server, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	raw := readAgentDoc(t, env.root, contentAgentName)
+	require.Contains(t, string(raw), `notify_mode: "allowlist"`)
+	require.Contains(t, string(raw), `  - "alerts"`)
+	bindings, parseErr := workspace.ParseResourceBindings(raw)
+	require.NoError(t, parseErr)
+	require.Equal(t, []core.ResourceBinding{{Name: "alerts", UID: channelUID}},
+		bindings.NotifyChannels, "绑定必须逐字录用请求体给的 UID")
+	require.True(t, strings.HasSuffix(string(raw), "---\n\n"+body+"\n"),
+		"正文必须整段替换为请求值，实得: %q", string(raw))
+}
+
+// TestAgentContent_PutPatch_RejectsInvalidNotifyModeAndBinding：非法的
+// `notify_mode` 字面量与格式非法的绑定 UID 都在写锁之前 400，磁盘零写入——
+// 前者按请求体校验拒绝，后者按绑定专用码拒绝（不按名猜 UID）。
+// 逆改点：静默接受未知模式 / 把非法 UID 当缺省 → 200 且磁盘变化，红。
+func TestAgentContent_PutPatch_RejectsInvalidNotifyModeAndBinding(t *testing.T) {
+	spy := &contentAdminSpy{}
+	srv := newTestServer(t, func(o *Options) {
+		o.AdminAuth = testAdminAuth(testToken)
+		o.AgentAdmin = spy
+	})
+
+	rec := serveAdmin(srv, contentPUT(contentAgentName,
+		`{"changes":{"notify_mode":"sometimes"}}`, strongETagOf('a')))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	envelope := decodeAuthEnvelope(t, rec)
+	require.Equal(t, codeBadRequest, envelope.Code)
+	require.Contains(t, envelope.Message, "none / all_eligible / allowlist")
+	require.Zero(t, spy.writeCount(), "非法 notify_mode 不得触达适配器")
+
+	env := newContentEnv(t)
+	rec = serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"bindings":[{"resource_kind":"notify_channel","ref_name":"alerts","resource_uid":"not-a-uid"}]}}`,
+		currentETag(t, env)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, codeAgentResourceBindingInvalid, decodeAuthEnvelope(t, rec).Code)
+	require.Equal(t, contentAgentDoc, string(readAgentDoc(t, env.root, contentAgentName)),
+		"绑定非法必须磁盘零写入")
+	require.Empty(t, env.ops.begunRecords())
+}
+
+// TestAgentContentChanges_DisplayNameTriState：`changes.display_name` 三态（R6.2）——
+// 省略 = 不修改（nil），空串 = 移除该行，非空 = 写入；省略不得被读成清除。
+// 对应契约：agent-md §2 的 changes 表。
+// TestAgentContentChanges_DisplayNameTriState pins the omitted / empty / value states.
+func TestAgentContentChanges_DisplayNameTriState(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantNil bool
+		want    string
+	}{
+		{name: "omitted leaves unchanged", body: `{"changes":{"description":"新描述"}}`, wantNil: true},
+		{name: "empty string clears", body: `{"changes":{"display_name":""}}`, want: ""},
+		{name: "value sets", body: `{"changes":{"display_name":" 值班助手 "}}`, want: " 值班助手 "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body contentUpdateBody
+			require.NoError(t, json.Unmarshal([]byte(tc.body), &body))
+			require.NotNil(t, body.Changes)
+			changes, err := body.Changes.toCore()
+			require.NoError(t, err)
+			if tc.wantNil {
+				require.Nil(t, changes.DisplayName)
+				return
+			}
+			require.NotNil(t, changes.DisplayName)
+			require.Equal(t, tc.want, *changes.DisplayName)
+		})
+	}
+}
+
+// TestAgentContent_PutDisplayNameRoundTrip：写入展示名后磁盘只多一行，读回 ETag 与
+// 响应一致；用新 ETag 清空后逐字节回到原文件。长度越界按 400 拒绝且零写入。
+// TestAgentContent_PutDisplayNameRoundTrip sets and clears the display name through the
+// real endpoint and refuses an oversized value with zero writes.
+func TestAgentContent_PutDisplayNameRoundTrip(t *testing.T) {
+	env := newContentEnv(t)
+	rec := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"display_name":"值班助手"}}`, currentETag(t, env)))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	withDisplay := strings.Replace(contentAgentDoc,
+		"  - \"file_read\"\n---\n",
+		"  - \"file_read\"\ndisplay_name: \"值班助手\"\n---\n", 1)
+	require.Equal(t, withDisplay, string(readAgentDoc(t, env.root, contentAgentName)))
+	view := decodeAgentFilesView(t, rec)
+	require.Equal(t, workspace.ContentETag([]byte(withDisplay)), view.ETag)
+
+	rec = serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"display_name":""}}`, view.ETag))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, contentAgentDoc, string(readAgentDoc(t, env.root, contentAgentName)),
+		"空串必须移除该行并逐字节回到原文件")
+
+	tooLong, err := json.Marshal(map[string]string{"display_name": strings.Repeat("名", 65)})
+	require.NoError(t, err)
+	rec = serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":`+string(tooLong)+`}`, currentETag(t, env)))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	envelope := decodeAuthEnvelope(t, rec)
+	require.Equal(t, codeBadRequest, envelope.Code)
+	require.Contains(t, envelope.Message, "display_name")
+	require.Equal(t, contentAgentDoc, string(readAgentDoc(t, env.root, contentAgentName)),
+		"非法展示名必须磁盘零写入")
 }

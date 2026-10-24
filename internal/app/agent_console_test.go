@@ -47,6 +47,7 @@ provider:
 type agentConsoleEnv struct {
 	console   core.AgentAdmin
 	root      string
+	db        *storage.DB
 	ops       *storage.ManagementStore
 	versions  *storage.ResourceStore
 	lifecycle *workspace.LifecycleStore
@@ -85,6 +86,10 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 		Now:       baselineClock,
 	})
 	console := NewAgentConsole(AgentConsoleDeps{
+		// 内容写完之后按落盘文件重建绑定投影：夹具给真实现，判据才看得见"投影跟文件走"。
+		Root: root,
+		Projection: NewBindingProjection(storage.NewBindingStore(db), versions,
+			storage.NewAgentAdminStore(db), root, logger, baselineClock),
 		Editor:     editor,
 		Lifecycle:  lifecycle,
 		Index:      versions,
@@ -96,6 +101,7 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 	return &agentConsoleEnv{
 		console:   console,
 		root:      root,
+		db:        db,
 		ops:       ops,
 		versions:  versions,
 		lifecycle: lifecycle,
@@ -254,8 +260,71 @@ func TestAgentConsole_UpdateContentDelegatesToEditor(t *testing.T) {
 		require.NoError(t, err, "状态文件缺失不得把已生效的写入说成失败")
 		require.False(t, files.Lifecycle.Valid)
 		require.Nil(t, files.Lifecycle.State)
-		require.Equal(t, lifecycleMissingReason, files.Lifecycle.LifecycleError,
+		require.Equal(t, lifecycleMissingNotice, files.Lifecycle.LifecycleError,
 			"原因只给自产分类，不拼底层路径")
+	})
+}
+
+// TestAgentConsole_UpdateContentRebuildsBindingProjection —— 内容补丁可以整块替换
+// `resource_bindings`，写入成功之后投影必须跟着**落盘的文件**走（T128 / R4.6）：
+// 不重建的话删除闸门与准入会按旧投影反查引用——旧绑定继续挡删除，新绑定不被看见。
+// 身份取状态文件；状态文件缺失时只记 ERROR，写入本身仍然成功。
+func TestAgentConsole_UpdateContentRebuildsBindingProjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("binding_patch_projects_to_identity", func(t *testing.T) {
+		t.Parallel()
+		env := newAgentConsoleEnv(t)
+		bootstrapConsoleAgent(t, env)
+		rec, exists, readErr := env.lifecycle.Read(context.Background(), "writer")
+		require.NoError(t, readErr)
+		require.True(t, exists)
+		store := storage.NewBindingStore(env.db)
+		require.Empty(t, mustBindings(t, store, rec.AgentUID), "基线定义不带绑定块")
+
+		current, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		_, err = env.console.UpdateContent(context.Background(), "writer", core.AgentContentUpdate{
+			Changes: &core.AgentContentChanges{Bindings: []core.BindingChange{{
+				ResourceKind: core.BindingModelConnection,
+				RefName:      "fake",
+				ResourceUID:  bindingModelUID,
+			}}},
+		}, current.ETag, consoleActor())
+		require.NoError(t, err)
+
+		rows := mustBindings(t, store, rec.AgentUID)
+		require.Len(t, rows, 1, "投影必须按落盘文件重建")
+		require.Equal(t, core.BindingModelConnection, rows[0].Kind)
+		require.Equal(t, "fake", rows[0].RefName)
+		require.Equal(t, bindingModelUID, rows[0].ResourceUID)
+		require.Equal(t, "writer", rows[0].AgentName)
+
+		// 再清空绑定块：投影行随文件消失（否则被摘掉的引用会永远挡住删除）。
+		content, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		_, err = env.console.UpdateContent(context.Background(), "writer", core.AgentContentUpdate{
+			Changes: &core.AgentContentChanges{Bindings: []core.BindingChange{}},
+		}, content.ETag, consoleActor())
+		require.NoError(t, err)
+		require.Empty(t, mustBindings(t, store, rec.AgentUID))
+	})
+
+	t.Run("missing_state_file_skips_projection_without_failing", func(t *testing.T) {
+		t.Parallel()
+		env := newAgentConsoleEnv(t)
+
+		current, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		_, err = env.console.UpdateContent(context.Background(), "writer", core.AgentContentUpdate{
+			Changes: &core.AgentContentChanges{Bindings: []core.BindingChange{{
+				ResourceKind: core.BindingModelConnection,
+				RefName:      "fake",
+				ResourceUID:  bindingModelUID,
+			}}},
+		}, current.ETag, consoleActor())
+		require.NoError(t, err, "身份缺失不得把已生效的写入改写成失败")
+		require.Contains(t, env.logs.String(), "重建绑定投影跳过")
 	})
 }
 

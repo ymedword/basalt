@@ -32,7 +32,7 @@ const messageOperationUnknown = "操作结果未查证，需按独立操作契�
 // Fixed 400 texts for the three validated parameters; request values are not echoed.
 const (
 	badOperationStatusMessage = "status 取值非法（可选：pending / success / failed / unknown）"
-	badOperationKindMessage   = "target_kind 取值非法（可选：agent / schedule / model_connection / mcp_server / skill / notify_channel / system）"
+	badOperationKindMessage   = "target_kind 取值非法（可选：agent / schedule / model_connection / mcp_server / skill / notify_channel / network_allowlist / system）"
 	badOperationLimitMessage  = "limit 必须是 1–200 之间的整数"
 )
 
@@ -84,11 +84,13 @@ func validOperationStatus(status string) bool {
 	}
 }
 
-// validOperationTargetKind 只接受契约 target_kind 的七个枚举值。
-// validOperationTargetKind accepts exactly the seven contract kind literals.
+// validOperationTargetKind 只接受契约 target_kind 的八个枚举值；网络白名单的
+// 写入行由 `network_allowlist.update` 产生，读侧必须能按同一字面量过滤。
+// validOperationTargetKind accepts exactly the eight contract kind literals.
 func validOperationTargetKind(kind string) bool {
 	switch kind {
-	case "agent", "schedule", "model_connection", "mcp_server", "skill", "notify_channel", "system":
+	case "agent", "schedule", "model_connection", "mcp_server", "skill", "notify_channel",
+		"network_allowlist", "system":
 		return true
 	default:
 		return false

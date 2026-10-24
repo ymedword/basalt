@@ -95,6 +95,10 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 	if !ok {
 		return Result{Content: auditUnavailableText}
 	}
+	// 预写成功后把行 id 注入执行环境：工具（目前是 notify）据此写与本次调用一对一的
+	// 派生记录。没有行 id 时不写——审计失败已经在上面 fail-closed。
+	// Inject the audit row id so the tool can write its one-per-invocation derived record.
+	env.ToolInvocationID = id
 
 	// ④⑤ 执行：`env` 由循环侧构造（本流程只消费）；单工具超时在这里**实际建立**
 	// （env.Timeout 已是"工具默认 / Profile 覆盖 / 剩余 Run 预算"三者最小，工具要更短
@@ -207,23 +211,31 @@ func pendingInvocation(env ToolEnv, call ToolCall) ToolInvocation {
 // auditUnavailableText is handed back when the audit store refuses the pre-write.
 const auditUnavailableText = "审计不可用：工具调用审计写入失败，本次调用未执行（fail-closed 策略）"
 
-// classifyToolError 把工具返回的错误映射为 `error_kind` 七类之一（契约 §7.3 取值口径）。
+// classifyToolError 把工具返回的错误映射为 `error_kind` 八类之一（契约 §7.3 取值口径）。
 // 判定一律走错误链（errors.Is / errors.As），**不得**比对错误文本。
-// **判序不可交换**（颗粒度文档 §2.3 流程 C）：沙箱 → 入参非法 → 取消 / 截止 → 外部系统 →
-// 文件不存在 → 兜底。两条分界的理由：① 入参非法排在取消 / 截止**之前**——入参在工具动身
-// 之前就已判死，归类不该被"恰好同时到点的截止"改写；② 外部系统排在取消 / 截止**之后**——
-// 取消与截止的**身份**优先于"错误是从哪个系统回来的"，出网超时仍归 timeout。
+// **判序不可交换**（颗粒度文档 §2.3 流程 C）：沙箱 → 通知禁用 → 入参非法 → 取消 / 截止 →
+// 外部系统 → 文件不存在 → 兜底。两条分界的理由：① 入参非法排在取消 / 截止**之前**——入参
+// 在工具动身之前就已判死，归类不该被"恰好同时到点的截止"改写；② 外部系统排在取消 / 截止
+// **之后**——取消与截止的**身份**优先于"错误是从哪个系统回来的"，出网超时仍归 timeout。
+// `notify_disabled` 紧跟沙箱：它是**授权面**的裁决（工具有没有资格发），与沙箱同属"动身之前
+// 就被拒"的一类，排在会携带 ctx 原因的其余档之前，避免被改写。
 // 第七值 `unknown` 不在此产生：它由崩溃恢复扫描写给半截的 pending 行（§4 口径）。
-// classifyToolError maps a tool error onto the seven error_kind values by inspecting the
-// error chain only. The order is fixed: sandbox, invalid input, cancellation, external
-// error, missing file, fallback — identity of cancellation outranks where a failure came
-// from, and an invalid input is decided before the tool ever departs.
+// classifyToolError maps a tool error onto the eight error_kind values by inspecting the
+// error chain only. The order is fixed: sandbox, notify-disabled, invalid input,
+// cancellation, external error, missing file, fallback — a disabled notification surface
+// is an authorization verdict decided before the call departs.
 func classifyToolError(err error) ErrorKind {
 	switch {
 	case err == nil:
 		return "" // 成功留空 → 列写 NULL
 	case IsSandboxViolation(err):
 		return ErrorKindSandboxDenied
+	case IsNotifyDisabled(err):
+		// 通知被配置 / 凭据状态禁用（R4.7）：自带固定文案的独立类型，不参与其余五档的
+		// 身份判定——它既不是入参问题，也不该被"恰好同时到点的截止"改写成 timeout。
+		// A disabled notification surface carries its own fixed text and is decided before
+		// the identity of any wrapped cause.
+		return ErrorKindNotifyDisabled
 	case IsInvalidInput(err):
 		// 入参非法（工具解码点：字段类型与取值——入口的必填校验另有 refuseInvalidInput）。
 		return ErrorKindInvalidInput

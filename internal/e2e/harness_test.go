@@ -13,6 +13,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -189,6 +190,11 @@ type harness struct {
 	runTimeout time.Duration
 	mu         sync.Mutex
 	secrets    []string
+
+	// notifyChannels 是夹具登记的通知渠道（`insertNotifyChannel` 写入）：重命令启动前
+	// 补给声明 `notify` 工具的 Agent——R4 起 Run 只冻结定义里声明过的渠道。
+	// notifyChannels are the fixture-registered channels seeded into notify-capable agents.
+	notifyChannels []fixtureChannel
 }
 
 // runResult 是一次短命命令的完整读数。
@@ -296,8 +302,12 @@ func (h *harness) redact(text string) string {
 }
 
 // command 组装一条对被测二进制的调用：cwd = 工作目录，环境 = 继承 + 覆盖。
-// command assembles one invocation of the binary under test.
-func (h *harness) command(ctx context.Context, env []string, args ...string) *exec.Cmd {
+// 重命令启动前先补齐夹具的模型连接绑定（v3 准入要求 AGENT.md 自带 `resource_bindings`）。
+// command assembles one invocation of the binary under test; heavy commands seed the
+// model-connection bindings their hand-written definitions need first.
+func (h *harness) command(t *testing.T, ctx context.Context, env []string, args ...string) *exec.Cmd {
+	t.Helper()
+	h.prepareHeavy(t, env, args)
 	cmd := exec.CommandContext(ctx, h.Binary, args...)
 	cmd.Dir = h.Root
 	cmd.Env = h.environ(env)
@@ -318,7 +328,7 @@ func (h *harness) runInput(t *testing.T, env []string, stdin string, args ...str
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout())
 	defer cancel()
-	cmd := h.command(ctx, env, args...)
+	cmd := h.command(t, ctx, env, args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -358,7 +368,7 @@ type process struct {
 // start launches a long-lived process and registers a kill-on-cleanup fallback.
 func (h *harness) start(t *testing.T, env []string, args ...string) *process {
 	t.Helper()
-	cmd := h.command(context.Background(), env, args...)
+	cmd := h.command(t, context.Background(), env, args...)
 	p := &process{cmd: cmd, stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, done: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = p.stdout, p.stderr
 	if err := cmd.Start(); err != nil {
@@ -489,22 +499,93 @@ func (h *harness) writeAgent(t *testing.T, name, frontmatter, body string) {
 		t.Fatalf("建 Agent 目录 %s 失败: %v", dir, err)
 	}
 	content := "---\n" + strings.TrimRight(frontmatter, "\n") + "\n---\n\n" + strings.TrimRight(body, "\n") + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644); err != nil {
+	path := filepath.Join(dir, "AGENT.md")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("写 AGENT.md %s 失败: %v", name, err)
 	}
 	h.writeActiveLifecycleState(t, name)
+	// 写盘即补绑定（当前指针已存在时）：用例常在启动前快照 AGENT.md，"启动失败不得改写
+	// 定义"一类断言若等到重命令启动才由夹具补绑，会把夹具自己的写入误判成产品改写。
+	// Seed at write time when the pointer already exists, so pre-start snapshots do not
+	// mistake the fixture's own seeding for a rewrite by the process under test.
+	h.seedBindings(t, path)
 }
 
-// lifecycleStateFile 是状态文件的**契约形态**（agents 契约 §2.2）：字段顺序即编码顺序。
-// The on-disk state file shape, declared in contract order.
+// seedBindings 给一份**夹具自有**的 AGENT.md 补 model_connection / notify_channel 绑定；
+// 读不到当前发布指针（库未建、Provider 尚未发布）时返回 false，由 prepareHeavy 在重命令
+// 启动前触发基线后重试。用例显式写出的绑定块与 `notify_mode:` 一律不动。
+// seedBindings fills fixture-owned bindings from the current published pointers; when no
+// pointer is readable yet it returns false and prepareHeavy retries after the warm-up.
+func (h *harness) seedBindings(t *testing.T, path string) bool {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	doc, ok := parseBindingDoc(string(raw))
+	if !ok || doc.Explicit {
+		return false
+	}
+	var bindings []fixtureBinding
+	if doc.Provider != "" {
+		uid, found := h.modelConnectionUID(t, doc.Provider)
+		if !found {
+			return false
+		}
+		bindings = append(bindings, fixtureBinding{Kind: "model_connection", Name: doc.Provider, UID: uid})
+	}
+	var declared []string
+	if doc.Notify {
+		for _, channel := range h.fixtureChannels() {
+			bindings = append(bindings, fixtureBinding{Kind: "notify_channel", Name: channel.name, UID: channel.uid})
+			declared = append(declared, channel.name)
+		}
+	}
+	if len(bindings) == 0 {
+		return false
+	}
+	rewriteFixtureBindings(t, path, declared, bindings)
+	return true
+}
+
+// lifecycleStateFile 是状态文件的**契约形态**（agents 契约 §2.2 的 v2）：字段顺序即
+// 编码顺序——`agent_uid` 在 `agent` 之后、`state` 之前，checksum 覆盖整份字节。
+// The on-disk state file shape in contract order; v2 carries agent_uid after agent.
 type lifecycleStateFile struct {
 	SchemaVersion int    `json:"schema_version"`
 	Agent         string `json:"agent"`
+	AgentUID      string `json:"agent_uid"`
 	State         string `json:"state"`
 	Generation    int64  `json:"generation"`
 	UpdatedAt     int64  `json:"updated_at"`
 	OperationID   string `json:"operation_id"`
 	Checksum      string `json:"checksum"`
+}
+
+// fixtureAgentUID 生成一个契约合法的 Agent 身份（`ag_` + 26 位 Crockford Base32）：
+// 夹具不 import internal 包，字符集在这里按契约字面量复制一份。
+// fixtureAgentUID mints a contract-legal agent uid without importing internal packages.
+func fixtureAgentUID(t *testing.T) string {
+	t.Helper()
+	return fixtureUID(t, "ag_")
+}
+
+// fixtureUID 生成 `<prefix>` + 26 位 Crockford Base32 的契约身份：Agent 用 `ag_`，
+// 资源用 `rs_`（v3 起通知渠道以资源 UID 为主键）。
+// fixtureUID mints a contract-legal identity with the given prefix.
+func fixtureUID(t *testing.T, prefix string) string {
+	t.Helper()
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	var buf [26]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		t.Fatalf("生成身份随机源失败: %v", err)
+	}
+	out := make([]byte, 0, len(prefix)+len(buf))
+	out = append(out, prefix...)
+	for _, b := range buf {
+		out = append(out, alphabet[int(b)%len(alphabet)])
+	}
+	return string(out)
 }
 
 // writeActiveLifecycleState 按契约字面量写 `.basalt/control/agents/<name>.json`：紧凑
@@ -517,8 +598,11 @@ func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
 
 	now := time.Now()
 	record := lifecycleStateFile{
-		SchemaVersion: 1,
+		// v3 库的准入要求状态文件给出稳定身份（缺 UID 的 v1 文件仍可读，但没有身份
+		// 的 Agent 不能使用任何资源）；夹具因此直接写契约 v2 的形态。
+		SchemaVersion: 2,
 		Agent:         name,
+		AgentUID:      fixtureAgentUID(t),
 		State:         "active",
 		// 代数 2 = "基线写入（1）之后的一次启用"，与真实启停路径留下的形态一致。
 		Generation:  2,
@@ -542,6 +626,33 @@ func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, name+".json"), raw, 0o644); err != nil {
 		t.Fatalf("写生命周期状态 %s 失败: %v", name, err)
+	}
+	h.seedLifecycleOperation(t, record.OperationID, name, now.UnixMilli())
+}
+
+// seedLifecycleOperation 在库里补一条**真实存在**的启用操作行：v3 的
+// `agent_lifecycle.operation_id` 外键指向 `management_operations`，而夹具伪造的状态
+// 文件携带的 `op-...` 在真实工作区里本来就对应一条历史操作行（US-11 的 `agent.enable`）。
+// 不补行时启动基线写索引会以 FOREIGN KEY 失败（只 WARN），索引缺身份后准入全部拒绝。
+// 库尚未由 `init` 建立时跳过——调用方没有可运行的工作区，先建库再写 Agent。
+// seedLifecycleOperation mirrors the historical enable row a pre-v3 state file points
+// at; without it the v3 index write fails its foreign key and admission refuses.
+func (h *harness) seedLifecycleOperation(t *testing.T, operationID, agent string, atMillis int64) {
+	t.Helper()
+	if _, err := os.Stat(h.dbPath()); errors.Is(err, os.ErrNotExist) {
+		return
+	} else if err != nil {
+		t.Fatalf("检查库文件 %s 失败: %v", h.dbPath(), err)
+	}
+	db := openDB(t, h.dbPath())
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO management_operations
+		   (operation_id, action, target_kind, target_id, actor_subject, auth_method,
+		    source, status, result_code, created_at, finished_at)
+		 VALUES (?, 'agent.enable', 'agent', ?, 'cli:e2e-fixture', 'cli', 'cli',
+		         'success', 'OK', ?, ?)`,
+		operationID, agent, atMillis, atMillis); err != nil {
+		t.Fatalf("补启用操作行 %s（Agent %s）失败: %v", operationID, agent, err)
 	}
 }
 
@@ -619,4 +730,574 @@ func normalizeValue(value any) any {
 	default:
 		return v
 	}
+}
+
+// —— US-12 管理写面夹具（模块卡 §3.1.9 / §4.4，T065）——
+// US-12 admin write-surface fixtures. Every struct below mirrors exactly one
+// published view from internal/web/views*.go; fields not asserted are omitted
+// and ignored by encoding/json, so a view addition never breaks this file.
+
+// adminFileView 是 AgentFileView 的判卷副本。
+type adminFileView struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+// adminLifecycleView 是 AgentLifecycleView 的判卷副本。
+type adminLifecycleView struct {
+	Agent          string  `json:"agent"`
+	State          *string `json:"state"`
+	Generation     int64   `json:"generation"`
+	UpdatedAt      string  `json:"updated_at"`
+	OperationID    string  `json:"operation_id"`
+	Valid          bool    `json:"valid"`
+	LifecycleError string  `json:"lifecycle_error"`
+}
+
+// adminFilesView 是 AgentFilesView 的判卷副本（写结果与读取同一形状）。
+type adminFilesView struct {
+	Agent     string             `json:"agent"`
+	Lifecycle adminLifecycleView `json:"lifecycle"`
+	ETag      string             `json:"etag"`
+	Files     []adminFileView    `json:"files"`
+}
+
+// adminArchiveRow 是归档记录 AgentArchiveView 的判卷副本。
+type adminArchiveRow struct {
+	ArchiveID         string `json:"archive_id"`
+	Agent             string `json:"agent"`
+	ArchivedAt        string `json:"archived_at"`
+	ContentHash       string `json:"content_hash"`
+	RestoredAt        string `json:"restored_at"`
+	RestoredAgentName string `json:"restored_agent_name"`
+}
+
+// adminVersionRow 是 ResourceVersionView 的判卷副本。
+type adminVersionRow struct {
+	VersionID             int64  `json:"version_id"`
+	ResourceKind          string `json:"resource_kind"`
+	ResourceID            string `json:"resource_id"`
+	VersionNo             int    `json:"version_no"`
+	ContentHash           string `json:"content_hash"`
+	CreatedAt             string `json:"created_at"`
+	OperationID           string `json:"operation_id"`
+	Published             bool   `json:"published"`
+	Applied               bool   `json:"applied"`
+	RevertedFromVersionID *int64 `json:"reverted_from_version_id"`
+}
+
+// adminPublishResult 是 ResourcePublishResultView 的判卷副本。
+type adminPublishResult struct {
+	Version        adminVersionRow `json:"version"`
+	PendingRestart bool            `json:"pending_restart"`
+}
+
+// adminProfileRow 是 /profiles 一行的判卷子集：写后要等的是"注册表是否已看见"。
+type adminProfileRow struct {
+	Name       string             `json:"name"`
+	Registered bool               `json:"registered"`
+	Lifecycle  adminLifecycleView `json:"lifecycle"`
+	// Tools / NotifyChannels 是定义文件声明的投影：定义重载后它们随注册表一起变，
+	// 可当作「新定义已生效」的可观测信号（引用视图不覆盖通知渠道）。
+	// Tools / NotifyChannels project the definition file and follow registry reloads,
+	// so they serve as an observable "new definition in effect" signal.
+	Tools          []string `json:"tools"`
+	NotifyChannels []string `json:"notify_channels"`
+}
+
+// adminWrite 发一次管理写请求；payload 为 nil 表示空请求体（与 webRequest 同一口径）。
+// adminWrite issues one admin write; a nil payload means an empty body.
+func adminWrite(t *testing.T, addr, method, path string, payload any, header map[string]string) *webResponse {
+	t.Helper()
+	body := ""
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("%s %s 编码请求体失败: %v", method, path, err)
+		}
+		body = string(raw)
+	}
+	return webRequest(t, addr, method, path, body, header)
+}
+
+// requireWriteOK 断言 200 + OK 信封；dst 非 nil 时继续解析 data。
+// requireWriteOK asserts a 200 OK envelope and optionally decodes data.
+func requireWriteOK(t *testing.T, resp *webResponse, dst any, label string) {
+	t.Helper()
+	requireWebStatus(t, resp, http.StatusOK, "OK", "", label)
+	if dst != nil {
+		decodeWebData(t, resp, dst, label)
+	}
+}
+
+// requireLifecycle 断言一次生命周期读数的状态与代数。
+// requireLifecycle asserts the state and generation of one lifecycle reading.
+func requireLifecycle(t *testing.T, view adminLifecycleView, state string, generation int64, label string) {
+	t.Helper()
+	if view.State == nil || *view.State != state {
+		t.Fatalf("%s：生命周期状态 = %v，期望 %q", label, view.State, state)
+	}
+	if view.Generation != generation {
+		t.Fatalf("%s：generation = %d，期望 %d", label, view.Generation, generation)
+	}
+}
+
+// readProfile 读一次 /profiles 并返回指定名字的行；不存在时 ok=false。
+// readProfile reads /profiles once and returns the row for name, if present.
+func readProfile(t *testing.T, addr, name string) (row adminProfileRow, ok bool) {
+	t.Helper()
+	resp := webRequest(t, addr, http.MethodGet, "/api/v1/profiles", "", nil)
+	requireWebStatus(t, resp, http.StatusOK, "OK", "", "读取 profiles")
+	var rows []adminProfileRow
+	decodeWebData(t, resp, &rows, "读取 profiles")
+	for _, item := range rows {
+		if item.Name == name {
+			return item, true
+		}
+	}
+	return adminProfileRow{}, false
+}
+
+// waitProfile 轮询 /profiles 直到 ready 成立；超时报告最后一次读数。
+// waitProfile polls /profiles until ready holds, reporting the last reading on timeout.
+func waitProfile(t *testing.T, addr, name, what string, ready func(adminProfileRow, bool) bool) adminProfileRow {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var (
+		last adminProfileRow
+		ok   bool
+	)
+	for time.Now().Before(deadline) {
+		last, ok = readProfile(t, addr, name)
+		if ready(last, ok) {
+			return last
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("等待 %s 超时：最后一次读数 %+v（存在=%v）", what, last, ok)
+	return adminProfileRow{}
+}
+
+// waitAgentRegistered 等注册表看见并注册成功该 Agent（创建 / 复制 / 恢复后的
+// 监听器去抖窗口）。
+// waitAgentRegistered waits until the registry lists the agent as registered.
+func waitAgentRegistered(t *testing.T, addr, name string) adminProfileRow {
+	t.Helper()
+	return waitProfile(t, addr, name, "Agent "+name+" 注册", func(row adminProfileRow, ok bool) bool {
+		return ok && row.Registered
+	})
+}
+
+// waitAgentGone 等该 Agent 从注册表消失（归档后目录移出、监听器重新装载）。
+// waitAgentGone waits until the registry no longer lists the agent.
+func waitAgentGone(t *testing.T, addr, name string) {
+	t.Helper()
+	waitProfile(t, addr, name, "Agent "+name+" 从注册表消失", func(_ adminProfileRow, ok bool) bool {
+		return !ok
+	})
+}
+
+// enableAgentRequest 发一次启用请求（两个期望字段都是必填指针）。
+// enableAgentRequest sends one enable request; both expectation fields are required.
+func enableAgentRequest(t *testing.T, addr, name string, generation int64) *webResponse {
+	t.Helper()
+	return adminWrite(t, addr, http.MethodPost, "/api/v1/agents/"+name+"/enable", map[string]any{
+		"expected_state":      "disabled",
+		"expected_generation": generation,
+	}, nil)
+}
+
+// waitAgentEnabled 轮询启用：加载器尚未看见（404）与条目暂不可启用
+// （409 AGENT_UNAVAILABLE）都是创建后的正常中间态；其它响应立即判红。
+// waitAgentEnabled retries enable across the post-create watcher window; any
+// other status fails immediately.
+func waitAgentEnabled(t *testing.T, addr, name string, generation int64) adminLifecycleView {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	last := ""
+	for time.Now().Before(deadline) {
+		resp := enableAgentRequest(t, addr, name, generation)
+		last = fmt.Sprintf("HTTP %d：%s", resp.Status, resp.Raw)
+		switch {
+		case resp.Status == http.StatusOK:
+			var view adminLifecycleView
+			decodeWebData(t, resp, &view, "启用 Agent")
+			requireLifecycle(t, view, "active", generation+1, "启用 Agent")
+			return view
+		case resp.Status == http.StatusNotFound:
+			// 监听器去抖窗口内装载器还没有该条目。
+		case resp.Status == http.StatusConflict && resp.Env.Code == "AGENT_UNAVAILABLE":
+			// 已注册但引用资源尚未就绪。
+		default:
+			t.Fatalf("启用 Agent %s：%s", name, last)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("等待启用 Agent %s 超时：最后一次响应 %s", name, last)
+	return adminLifecycleView{}
+}
+
+// adminAgentFiles 读受管文件集合，并断言响应头 ETag 与 data.etag 逐字一致（契约 D-16）。
+// adminAgentFiles reads the managed file set and pins header ETag == data.etag.
+func adminAgentFiles(t *testing.T, addr, name string) adminFilesView {
+	t.Helper()
+	resp := webRequest(t, addr, http.MethodGet, "/api/v1/agents/"+name+"/files", "", nil)
+	var view adminFilesView
+	requireWriteOK(t, resp, &view, "读取 Agent 文件集合")
+	if got := resp.Header.Get("ETag"); got != view.ETag {
+		t.Fatalf("读取 Agent 文件集合：响应头 ETag = %q，data.etag = %q", got, view.ETag)
+	}
+	if view.ETag == "" {
+		t.Fatalf("读取 Agent 文件集合：data.etag 为空")
+	}
+	return view
+}
+
+// adminModelConnection 读一个模型连接：模板创建与提交正文都要用到发布指针的
+// `resource_uid`（绑定必须携带 UID，按名解析是被禁止的）。
+// adminModelConnection reads one connection so the fixtures can carry its uid.
+func adminModelConnection(t *testing.T, addr, name string) adminModelConnectionView {
+	t.Helper()
+	resp := webRequest(t, addr, http.MethodGet, "/api/v1/model-connections/"+name, "", nil)
+	var view adminModelConnectionView
+	requireWriteOK(t, resp, &view, "读取模型连接 "+name)
+	if view.ResourceUID == "" {
+		t.Fatalf("读取模型连接 %s：resource_uid 为空（v3 起必须记录身份）", name)
+	}
+	return view
+}
+
+// bindingsBlock 渲染一段 `resource_bindings` 文本（四条空格缩进、与契约示例同形），
+// 供手工拼 AGENT.md 的用例显式写出绑定——服务端不按名补绑。
+// bindingsBlock renders one binding block for hand-written AGENT.md fixtures.
+func bindingsBlock(kind, refName, uid string) string {
+	return "resource_bindings:\n  " + kind + ":\n    - name: " + refName + "\n      uid: " + uid + "\n"
+}
+
+// heavyCommands 与 internal/app 的重命令清单同口径（组装层不 import internal 包，
+// 这里按命令名复制一份：多一条只会多一次无害装配，少一条会让绑定漏补）。
+// heavyCommands mirrors the assembly layer's heavy command list.
+var heavyCommands = map[string]bool{
+	"chat": true, "tool": true, "serve": true, "gateway": true, "secrets": true,
+}
+
+// isHeavyCommand 报告这条调用是否走完整运行期（跳过前导旗标取子命令名）。
+// isHeavyCommand reports whether this invocation takes the full-runtime path.
+func isHeavyCommand(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		return heavyCommands[arg]
+	}
+	return false
+}
+
+// bindingMarker 标记夹具自动补写的绑定块：只有带这一行的块会被下一轮补绑整体替换；
+// 用例显式写出的 `resource_bindings`（v3 与 US-12 用例的写法）一律不动。
+// bindingMarker tags the fixture-owned bindings block; explicit blocks are left alone.
+const bindingMarker = "  # e2e-fixture-bindings"
+
+// fixtureBinding 是待写入 frontmatter 的一条资源绑定。
+// fixtureBinding is one resource binding to render into a definition.
+type fixtureBinding struct {
+	Kind string
+	Name string
+	UID  string
+}
+
+// bindingDoc 是一个活动区 Agent 的绑定现状（只读扫描结果）。
+// bindingDoc is the bindings state of one active agent definition.
+type bindingDoc struct {
+	Agent    string
+	Path     string
+	Provider string
+	Notify   bool // frontmatter 的 tools 列声明了 notify
+	Explicit bool // 用例自己写了 `resource_bindings`（没有夹具标记）
+}
+
+// prepareHeavy 在重命令启动前给手写的 AGENT.md 补齐 `resource_bindings`。v3 准入要求
+// 定义显式声明绑定、且 UID 等于该名称的**当前指针**（agent-md 契约 §2.5「不自动补绑」）；
+// 夹具在首次基线发布之前无从得知 `rs_` 身份，因此按运维的真实顺序分两段：先读指针，
+// 读不到就跑一次 `tool list` 触发启动基线发布，再读指针并写回绑定块。通知渠道的绑定
+// 取自 `insertNotifyChannel` 登记的渠道——它代替"运维在 AGENT.md 里声明渠道"这一步。
+// prepareHeavy seeds the bindings v3 admission requires; hand-written fixtures cannot
+// know the published `rs_` identity before the first baseline run.
+func (h *harness) prepareHeavy(t *testing.T, env []string, args []string) {
+	t.Helper()
+	if !isHeavyCommand(args) {
+		return
+	}
+	docs := h.bindingDocs(t)
+	if len(docs) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(docs))
+	missing := false
+	for _, doc := range docs {
+		if doc.Provider == "" {
+			continue
+		}
+		if _, done := seen[doc.Provider]; done {
+			continue
+		}
+		seen[doc.Provider] = struct{}{}
+		if _, ok := h.modelConnectionUID(t, doc.Provider); !ok {
+			missing = true
+		}
+	}
+	if missing {
+		h.runBaselineWarmup(t, env)
+	}
+
+	// provider 仍未发布（配置里没有或基线失败）时 seedBindings 自动跳过：交给被测命令
+	// 按原判据报错，夹具不替它掩盖。
+	// A provider that is still unpublished is left alone so the command under test reports it.
+	for _, doc := range docs {
+		h.seedBindings(t, doc.Path)
+	}
+}
+
+// publishBeforeSnapshot 在用例**快照定义文件之前**完成一次启动基线发布并补齐夹具绑定，
+// 等价于运维的真实顺序（先发布 Provider，再在 AGENT.md 里写出当前指针身份）。没有它，
+// "启动 / 调用不得改写定义"一类字节快照会把夹具自己的补绑误判成产品改写。
+// publishBeforeSnapshot publishes the baseline and seeds fixture bindings before a test
+// snapshots definition bytes, mirroring the operator's real order.
+func (h *harness) publishBeforeSnapshot(t *testing.T, env []string) {
+	t.Helper()
+	h.runBaselineWarmup(t, env)
+	for _, doc := range h.bindingDocs(t) {
+		h.seedBindings(t, doc.Path)
+	}
+}
+
+// bindingDocs 扫描活动区的 AGENT.md，读出 provider / notify 工具声明与绑定现状。
+// 夹具 frontmatter 由本包按固定形态生成，这里只做逐行判定，不引入 YAML 依赖。
+// bindingDocs scans the active definitions for provider refs, the notify tool and the
+// bindings state; fixture frontmatter is line-oriented, so no YAML dependency is used.
+func (h *harness) bindingDocs(t *testing.T) []bindingDoc {
+	t.Helper()
+	dir := filepath.Join(h.Root, ".basalt", "agents")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []bindingDoc
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name(), "AGENT.md")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		doc, ok := parseBindingDoc(string(raw))
+		if !ok {
+			continue
+		}
+		doc.Agent, doc.Path = entry.Name(), path
+		out = append(out, doc)
+	}
+	return out
+}
+
+// parseBindingDoc 取 frontmatter 里的 provider.name、tools 是否含 notify，并区分
+// 夹具写的绑定块（带标记，可重写）与用例写的绑定块（不动）。
+// parseBindingDoc extracts provider.name and the notify tool, and tells fixture-owned
+// bindings from explicit ones.
+func parseBindingDoc(text string) (bindingDoc, bool) {
+	if !strings.HasPrefix(text, "---\n") {
+		return bindingDoc{}, false
+	}
+	rest := text[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		return bindingDoc{}, false
+	}
+	lines := strings.Split(rest[:end], "\n")
+	var doc bindingDoc
+	inProvider, inTools := false, false
+	for i, line := range lines {
+		if line == "resource_bindings:" {
+			doc.Explicit = i+1 >= len(lines) || lines[i+1] != bindingMarker
+			continue
+		}
+		if line == "notify_channels:" {
+			// 带标记的是夹具上一轮写的块（可整体重写）；否则是用例自己的声明，不动。
+			if i+1 >= len(lines) || lines[i+1] != bindingMarker {
+				doc.Explicit = true
+			}
+			continue
+		}
+		if line == "notify_mode:" {
+			doc.Explicit = true
+			continue
+		}
+		switch {
+		case line == "provider:":
+			inProvider, inTools = true, false
+			continue
+		case line == "tools:":
+			inProvider, inTools = false, true
+			continue
+		case !strings.HasPrefix(line, " "):
+			inProvider, inTools = false, false
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if inProvider {
+			if name, ok := strings.CutPrefix(trimmed, "name:"); ok {
+				doc.Provider = strings.Trim(strings.TrimSpace(name), `"`)
+				inProvider = false
+			}
+			continue
+		}
+		if inTools && trimmed == "- notify" {
+			doc.Notify = true
+		}
+	}
+	return doc, true
+}
+
+// fixtureChannel 是夹具登记的通知渠道（名字 + 资源身份）。
+// fixtureChannel is one channel registered by the fixture.
+type fixtureChannel struct{ name, uid string }
+
+// recordNotifyChannel 登记夹具渠道：声明 `notify` 工具的 Agent 在下一次重命令前会
+// 得到对应绑定（R4 起渠道必须显式声明，Run 只冻结声明过的渠道）。
+// recordNotifyChannel registers a channel so notify-capable agents get its binding.
+func (h *harness) recordNotifyChannel(name, uid string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.notifyChannels {
+		if h.notifyChannels[i].name == name {
+			h.notifyChannels[i].uid = uid
+			return
+		}
+	}
+	h.notifyChannels = append(h.notifyChannels, fixtureChannel{name: name, uid: uid})
+}
+
+// fixtureChannels 返回已登记渠道的快照。
+// fixtureChannels returns a snapshot of the registered channels.
+func (h *harness) fixtureChannels() []fixtureChannel {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]fixtureChannel(nil), h.notifyChannels...)
+}
+
+// modelConnectionUID 读模型连接的当前发布指针身份；库未建、指针缺失或已删除都返回
+// false（调用方先触发基线再重试）。
+// modelConnectionUID reads the published pointer identity of one model connection.
+func (h *harness) modelConnectionUID(t *testing.T, name string) (string, bool) {
+	t.Helper()
+	if _, err := os.Stat(h.dbPath()); err != nil {
+		return "", false
+	}
+	db := openDB(t, h.dbPath())
+	var uid string
+	err := db.QueryRow(
+		`SELECT resource_uid FROM resource_pointers
+		  WHERE resource_kind = 'model_connection' AND resource_id = ? AND deleted_at IS NULL`,
+		name).Scan(&uid)
+	if err != nil || uid == "" {
+		return "", false
+	}
+	return uid, true
+}
+
+// runBaselineWarmup 跑一次 `tool list` 触发启动基线：基线只补建发布版本与指针
+// （内容未变则 no-op），不改 Agent 状态、不写管理操作行。输出与退出码刻意忽略——
+// 这次调用只为了让指针存在，判卷交给随后的被测命令；失败（如锁被占用）同样不影响判卷。
+// runBaselineWarmup publishes the baseline once; its output and exit code are ignored.
+func (h *harness) runBaselineWarmup(t *testing.T, env []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, h.Binary, "tool", "list")
+	cmd.Dir = h.Root
+	cmd.Env = h.environ(env)
+	_ = cmd.Run()
+}
+
+// rewriteFixtureBindings 用一份完整块替换夹具上一轮写的块（闭合 `---` 之前）：
+// 块外字节逐字保留，正文不受影响；内容未变则不落盘（避免无谓的 mtime 扰动）。
+// 渠道名声明（`notify_channels`）与绑定名严格一一对应，两者必须同一轮写入。
+// rewriteFixtureBindings replaces the fixture-owned block before the closing fence;
+// the channel declaration and its bindings are always rewritten together.
+func rewriteFixtureBindings(t *testing.T, path string, declared []string, bindings []fixtureBinding) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 %s 补绑定失败: %v", path, err)
+	}
+	text := string(raw)
+	if !strings.HasPrefix(text, "---\n") {
+		return
+	}
+	rest := text[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		return
+	}
+	front, tail := rest[:end], rest[end:]
+	for _, key := range []string{"notify_channels:", "resource_bindings:"} {
+		if marker := strings.Index(front, key+"\n"+bindingMarker+"\n"); marker >= 0 {
+			front = strings.TrimRight(front[:marker], "\n")
+		}
+	}
+	updated := "---\n" + front + "\n" + renderFixtureBindings(declared, bindings) + tail[1:]
+	if updated == text {
+		return
+	}
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		t.Fatalf("写回 %s 补绑定失败: %v", path, err)
+	}
+}
+
+// renderFixtureBindings 按固定顺序渲染渠道声明与绑定块（model_connection 在前）。
+// renderFixtureBindings renders the channel declaration and the bindings block.
+func renderFixtureBindings(declared []string, bindings []fixtureBinding) string {
+	var out strings.Builder
+	if len(declared) > 0 {
+		// 非空声明即 allowlist（契约 agent-md §2.1 规则 10 的兼容读取）。
+		out.WriteString("notify_channels:\n" + bindingMarker + "\n")
+		for _, name := range declared {
+			out.WriteString("  - " + name + "\n")
+		}
+	}
+	out.WriteString("resource_bindings:\n" + bindingMarker + "\n")
+	for _, kind := range []string{"model_connection", "notify_channel"} {
+		wrote := false
+		for _, entry := range bindings {
+			if entry.Kind != kind {
+				continue
+			}
+			if !wrote {
+				out.WriteString("  " + kind + ":\n")
+				wrote = true
+			}
+			out.WriteString("    - name: " + entry.Name + "\n      uid: " + entry.UID + "\n")
+		}
+	}
+	return out.String()
+}
+
+// readLifecycleStateFile 读 `.basalt/control/agents/<name>.json`（生命周期状态文件
+// 是 generation 的唯一权威载体；写结果视图可能零值投影）。
+// readLifecycleStateFile reads the on-disk lifecycle state, the generation authority.
+func readLifecycleStateFile(t *testing.T, h *harness, name string) lifecycleStateFile {
+	t.Helper()
+	path := filepath.Join(h.Root, ".basalt", "control", "agents", name+".json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取生命周期状态文件 %s 失败: %v", path, err)
+	}
+	var state lifecycleStateFile
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("解析生命周期状态文件 %s 失败: %v", path, err)
+	}
+	return state
 }

@@ -13,6 +13,20 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
+// US-12 R4 起清单 v2 必填：Agent / 资源稳定 UID 与目标绑定哈希。UID 字面量按契约取
+// `ag_` / `rs_` + 26 位 Crockford Base32（无 I/L/O/U），末位按资源序号变化便于辨认。
+// Manifest v2 requires stable uids and the target-binding hash in fixtures.
+const (
+	testAgentUID      core.AgentUID = "ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"
+	testTargetBinding string        = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+// testResourceUID 造一个合法的资源 UID（末位区分同一测试里的多个资源）。
+// testResourceUID builds a valid resource uid varying only in its last byte.
+func testResourceUID(last byte) core.ResourceUID {
+	return core.ResourceUID("rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3" + string(last))
+}
+
 // runRow 是 runs 一行的判卷形态（列全部显式——可空列用 Null 形态，判 NULL 与判空串不同）。
 // runRow is the assertion shape of one runs row; nullable columns stay nullable.
 type runRow struct {
@@ -347,6 +361,7 @@ func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
 	require.NoError(t, err)
 	browser, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
 		Kind:           core.ResourceMCPServer,
+		ResourceUID:    resourceUIDFor(core.ResourceMCPServer, "browser"),
 		ResourceID:     "browser",
 		ContentHash:    "sha256:mcp-browser",
 		DefinitionYAML: "name: browser\ncommand: npx\n",
@@ -356,6 +371,7 @@ func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
 	require.NoError(t, err)
 	filesystem, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
 		Kind:           core.ResourceMCPServer,
+		ResourceUID:    resourceUIDFor(core.ResourceMCPServer, "filesystem"),
 		ResourceID:     "filesystem",
 		ContentHash:    "sha256:mcp-filesystem",
 		DefinitionYAML: "name: filesystem\ncommand: npx\n",
@@ -365,6 +381,7 @@ func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
 	require.NoError(t, err)
 	skill, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
 		Kind:         core.ResourceSkill,
+		ResourceUID:  resourceUIDFor(core.ResourceSkill, "summarize"),
 		ResourceID:   "summarize",
 		ContentHash:  "sha256:skill-summarize",
 		ManifestJSON: `[{"path":"SKILL.md","sha256":"sha256:skill-file","size":12}]`,
@@ -374,9 +391,12 @@ func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
 	})
 	require.NoError(t, err)
 
+	// 引用行的 UID 取自版本行自身：清单固定的身份与落库的版本必须是同一个实例。
+	// The reference takes the version's own uid so the manifest and the row agree.
 	refOf := func(v core.ResourceVersion) core.ResourceVersionRef {
 		return core.ResourceVersionRef{
 			Name:        v.ResourceID,
+			ResourceUID: v.ResourceUID,
 			VersionID:   v.ID,
 			VersionNo:   v.VersionNo,
 			ContentHash: v.ContentHash,
@@ -394,8 +414,11 @@ func seedRunManifest(t *testing.T, db *DB) runManifestFixture {
 				Size:   12,
 			}},
 		}},
+		ProviderModel:      "gpt-test",
+		ProviderCredential: core.CredentialPin{Mode: core.CredentialModeEnv, TargetBinding: testTargetBinding},
+		Notify:             core.NotifyManifest{Mode: core.NotifyModeAllEligible, Channels: []core.NotifyChannelRef{}},
 	}
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	manifest, err := core.BuildRunResourceManifest(testAgentUID, core.AgentActive, resolved)
 	require.NoError(t, err)
 	return runManifestFixture{
 		manifest: manifest,
@@ -430,11 +453,13 @@ func readManifestRow(t *testing.T, db *DB, runID string) manifestRow {
 // runRefRow 是 run_resource_refs 一行的判卷形态（released_at 用 Null 形态判"未释放"）。
 // runRefRow is the assertion shape of one reference row.
 type runRefRow struct {
-	Kind        string
-	ResourceID  string
-	VersionID   int64
-	ContentHash string
-	ReleasedAt  sql.NullInt64
+	Kind         string
+	ResourceID   string
+	ResourceUID  sql.NullString
+	ResourceName sql.NullString
+	VersionID    int64
+	ContentHash  string
+	ReleasedAt   sql.NullInt64
 }
 
 // readRunRefRows 按 run_id 读回引用行，按 (kind, id) 排序以得到稳定断言序。
@@ -442,7 +467,8 @@ type runRefRow struct {
 func readRunRefRows(t *testing.T, db *DB, runID string) []runRefRow {
 	t.Helper()
 	rows, err := db.read.QueryContext(context.Background(),
-		`SELECT resource_kind, resource_id, version_id, content_hash, released_at
+		`SELECT resource_kind, resource_id, resource_uid, resource_name,
+		        version_id, content_hash, released_at
 		   FROM run_resource_refs WHERE run_id = ?
 		  ORDER BY resource_kind, resource_id`, runID)
 	require.NoError(t, err)
@@ -450,8 +476,8 @@ func readRunRefRows(t *testing.T, db *DB, runID string) []runRefRow {
 	var out []runRefRow
 	for rows.Next() {
 		var row runRefRow
-		require.NoError(t, rows.Scan(&row.Kind, &row.ResourceID, &row.VersionID,
-			&row.ContentHash, &row.ReleasedAt))
+		require.NoError(t, rows.Scan(&row.Kind, &row.ResourceID, &row.ResourceUID,
+			&row.ResourceName, &row.VersionID, &row.ContentHash, &row.ReleasedAt))
 		out = append(out, row)
 	}
 	require.NoError(t, rows.Err())
@@ -561,6 +587,11 @@ func TestRunStore_StartRunWritesRunManifestAndRefs(t *testing.T) {
 		require.True(t, ok, "引用 %s/%s 必须来自夹具版本", ref.Kind, ref.ResourceID)
 		require.Equal(t, version.ID, ref.VersionID, "引用固定的是版本行 id")
 		require.Equal(t, version.ContentHash, ref.ContentHash)
+		// 身份与名称快照同时落库：删除闸门按 UID 判定，历史核对按名称。
+		require.Equal(t, string(version.ResourceUID), ref.ResourceUID.String,
+			"引用行的 resource_uid 必须等于版本行的身份")
+		require.Equal(t, version.ResourceID, ref.ResourceName.String,
+			"resource_name 是准入时的名称快照")
 		require.False(t, ref.ReleasedAt.Valid, "准入刚写下的引用一律未释放")
 	}
 }
@@ -584,6 +615,49 @@ func TestRunStore_StartRunRollsBackOnMissingVersion(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "预写运行资源引用", "失败点是被外键拒绝的引用行")
 	require.Contains(t, err.Error(), "model_connection/openai", "错误必须点名是哪条引用")
+	requireNoRunTrace(t, db, rec.RunID)
+}
+
+// TestRunStore_StartRunRejectsMissingIdentity —— US-12 R4：引用行的身份是删除闸门
+// 与范围判定的依据。清单缺资源 UID 时在写侧拒绝并点名是哪条引用，而不是让 NOT NULL
+// 在事务中途报一个分不清主语的约束错误；三表零落痕。
+// TestRunStore_StartRunRejectsMissingIdentity refuses a manifest whose references
+// carry no resource uid, naming the offending reference.
+func TestRunStore_StartRunRejectsMissingIdentity(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	broken := fx.manifest
+	broken.MCPServers[0].ResourceUID = ""
+	rehashManifest(t, &broken)
+
+	rec := startRow("cli")
+	err := store.StartRun(ctx, rec, broken)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "资源身份")
+	require.Contains(t, err.Error(), broken.MCPServers[0].Name, "错误必须点名是哪条引用")
+	requireNoRunTrace(t, db, rec.RunID)
+}
+
+// TestRunStore_StartRunRejectsMissingAgentUID —— v2 清单必须固定 Agent 身份：
+// 缺 UID 的清单会让"这次运行是哪个 Agent"只能靠名称推断，同名重建后即失真。
+// TestRunStore_StartRunRejectsMissingAgentUID refuses a v2 manifest without an agent uid.
+func TestRunStore_StartRunRejectsMissingAgentUID(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	broken := fx.manifest
+	broken.AgentUID = ""
+	rehashManifest(t, &broken)
+
+	rec := startRow("cli")
+	err := store.StartRun(ctx, rec, broken)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Agent 身份")
 	requireNoRunTrace(t, db, rec.RunID)
 }
 
@@ -617,7 +691,7 @@ func TestRunStore_StartRunRejectsNonActiveLifecycle(t *testing.T) {
 	store := NewRunStore(db)
 	fx := seedRunManifest(t, db)
 
-	disabled, err := core.BuildRunResourceManifest(core.AgentDisabled, fx.resolved)
+	disabled, err := core.BuildRunResourceManifest(testAgentUID, core.AgentDisabled, fx.resolved)
 	require.NoError(t, err, "构造器允许冻结非启用态——拒绝发生在写侧")
 
 	rec := startRow("cli")

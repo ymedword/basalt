@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -151,8 +152,9 @@ func TestStatus_ReadyWithoutConfig(t *testing.T) {
 	require.Contains(t, run.stdout, "未发现配置", "节 2 必须明示未发现配置")
 	require.Contains(t, run.stdout, filepath.Join(root, "basalt.yaml"), "未发现配置必须点名路径")
 	require.Contains(t, run.stdout, "存储：就绪")
-	require.Contains(t, run.stdout, "schema v2", "US-11 起目标版本为 v2（FR23）")
-	require.Contains(t, run.stdout, "18 张表", "就绪时报版本 + 表清点（流程 D 节 3；v1 11 张 + v2 7 张）")
+	require.Contains(t, run.stdout, fmt.Sprintf("schema v%d", storage.SupportedSchemaVersion),
+		"目标版本以 storage.SupportedSchemaVersion 为准（US-12 R7 起 v4）")
+	require.Contains(t, run.stdout, "29 张表", "就绪时报版本 + 表清点（v1 11 张 + v2 7 张 + v3 8 张 + v4 2 张 + v5 1 张）")
 	require.Contains(t, run.stdout, "汇总：全部通过")
 
 	require.NotContains(t, run.logs, "level=ERROR", "全部通过时不得有 ERROR 日志；logs=%s", run.logs)

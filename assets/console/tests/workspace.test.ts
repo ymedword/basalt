@@ -13,8 +13,8 @@ const summary = {
   database: { status: 'ok', schema_version: 2 }, auth: { mode: 'token', loopback_only: true },
 }
 const profiles = ['writer', 'reviewer'].map((name, index) => ({
-  name, description: name + ' description', provider: 'local-model', model: 'model-v1',
-  tools: [], skills: [], schedules: 0, registered: true, runnable: index === 0, problems: [],
+  name, display_name: '', description: name + ' description', provider: 'local-model', model: 'model-v1',
+  tools: [], skills: [], schedules: 0, registered: true, runnable: index === 0, problems: [], notify_channels: [],
   lifecycle: { agent: name, state: index === 0 ? 'active' : 'disabled', valid: true, generation: 1, updated_at: '2026-10-21T12:00:00Z', operation_id: 'op-test', lifecycle_error: '' },
 }))
 let wrapper: ReturnType<typeof mount> | undefined
@@ -150,7 +150,10 @@ describe('workspace navigation', () => {
   it('preserves full tool identifiers and explains the backend directory template', async () => {
     await signIn(false, {
       '/api/v1/tools': [{ name: 'manage_schedule', description: '维护定时任务', source: 'builtin' }],
-      '/api/v1/sandbox': { file_allowed_paths: ['.basalt/agents/<agent>/'], shell_allowed_commands: [], shell_interpreters: [], http_allowed_domains: [] },
+      '/api/v1/sandbox': {
+        file_allowed_paths: ['.basalt/agents/<agent>/'], shell_allowed_commands: [], shell_interpreters: [],
+        http_allowed_domains: [], network_allowlist: { etag: '"sha256:test"', revision: 1, source: 'config_seed', updated_at: '', updated_by: '' },
+      },
     })
     await visit('/console/library/tools')
     expect(wrapper!.find('.col-tool .cell-id').attributes('title')).toBe('manage_schedule')

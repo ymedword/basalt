@@ -50,6 +50,6 @@ func Example() {
 	fmt.Println("tables:", len(tables))
 	// Output:
 	// created: true
-	// version: 2
-	// tables: 18
+	// version: 5
+	// tables: 29
 }

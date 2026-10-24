@@ -19,11 +19,16 @@ import (
 	"sync"
 )
 
-// runResourceManifestFormatVersion 是清单持久形态的首版版本号；结构变更必须同时升级
-// schema 与视图，不得让旧读者按子集猜测（schema.sql 的 DEFAULT 1 与之同值）。
-// runResourceManifestFormatVersion pins the first manifest format; structural changes
-// must bump it together with the schema and views.
-const runResourceManifestFormatVersion = 1
+// runResourceManifestFormatVersion 是清单持久形态的版本号：v1 是 US-11 的形态，
+// v2（US-12 R4）增加 `agent_uid`、Provider 凭据固定与 `notify` 三态冻结。v1 清单
+// 只读保留、不回写；结构变更必须同时升级 schema 与视图，不得让旧读者按子集猜测。
+// runResourceManifestFormatVersion pins the manifest format; v2 adds agent_uid, the
+// provider credential pin and the notify freeze. v1 manifests stay readable, never rewritten.
+const runResourceManifestFormatVersion = 2
+
+// sha256HexLength 是小写十六进制 sha256 的固定长度（`target_binding` 与各类哈希同形）。
+// sha256HexLength is the fixed length of a lowercase hex sha256.
+const sha256HexLength = 64
 
 // ResourceGate 是发布与准入共用的**进程级唯一**读写闸（颗粒度文档约束 25）：准入持读锁、
 // US-12 的资源发布持写锁，一次发布对 Run 来说要么全可见、要么全不可见。不得出现第二套互斥。
@@ -84,6 +89,25 @@ type ResolvedResources struct {
 	Skills     []SkillVersionRef
 	SkillDirs  map[string]string // 技能名 → 发布版本绝对目录
 	Runtime    RunRuntime        // 与上述版本逐一对应；调用方负责 Release
+
+	// ProviderModel 是本次 Run 使用的模型名（来自已发布版本的定义，准入时冻结）。
+	// ProviderCredential 是同一发布版本上固定的凭据引用与目标绑定哈希。
+	// Notify 是准入时按 notify_mode 枚举出的具体渠道集合（v2 起必填）。
+	// ProviderModel and ProviderCredential pin the provider version's model and credential;
+	// Notify freezes the resolved notification channels.
+	ProviderModel      string
+	ProviderCredential CredentialPin
+	Notify             NotifyManifest
+}
+
+// CredentialPin 是准入时固定的凭据引用：模式、身份 / 版本（env 模式为空 / 0）与
+// 目标绑定哈希（规范化目标地址的 sha256，AAD 与摘要同源）。
+// CredentialPin pins the credential reference at admission; env mode carries no id/version.
+type CredentialPin struct {
+	Mode          CredentialMode
+	ID            string
+	Version       int
+	TargetBinding string
 }
 
 // RunResources 是准入解析端口：实现（app）在 ResourceGate.RLock 内查发布指针、构造
@@ -110,6 +134,11 @@ const (
 	ResourceMCPServer ResourceKind = "mcp_server"
 	// ResourceSkill 是技能资源。
 	ResourceSkill ResourceKind = "skill"
+	// ResourceNotifyChannel 是通知渠道在**身份表**里的种类：渠道有身份与删除历史，
+	// 但没有版本行——`resource_versions` 仍只认上面三值（ParseResourceKind 口径不变）。
+	// ResourceNotifyChannel exists only in the identity table: channels have identities
+	// and deletion history but no version rows.
+	ResourceNotifyChannel ResourceKind = "notify_channel"
 )
 
 // ErrResourceNotFound 表示按标识查不到资源版本 / 指针——只读面映射 404，
@@ -119,11 +148,14 @@ const (
 var ErrResourceNotFound = errors.New("resource not found")
 
 // ResourceVersion 是 resource_versions 行的领域形态，也是 US-12 发布路径的输入
-// （storage 与 US-12 共用本类型，**不得**另建同名类型）。
-// ResourceVersion is the domain shape of one immutable resource version row.
+// （storage 与 US-12 共用本类型，**不得**另建同名类型）。`ResourceUID` 是身份键：
+// 版本号逐 UID 从 1 起，同名重建（新 UID）重新计数；`ResourceID` 只是名称快照。
+// ResourceVersion is the domain shape of one immutable resource version row. The uid is
+// the identity key: version numbers count per uid, so a same-name rebuild restarts at 1.
 type ResourceVersion struct {
 	ID             int64
 	Kind           ResourceKind
+	ResourceUID    ResourceUID
 	ResourceID     string
 	VersionNo      int
 	ContentHash    string
@@ -136,26 +168,110 @@ type ResourceVersion struct {
 
 // ResourcePointer 是 resource_pointers 行的领域形态：发布指针与运行时实际生效指针
 // 可以不同（MCP 首版需重启）。可空列用指针表达"未生效 / 未删除"。
-// ResourcePointer is the domain shape of a publish pointer; the published and applied
-// versions may differ until a restart catches MCP up.
+// `ResourceUID` 是名称**当前**指向的资源实例（同名重建会换成新 UID，旧 UID 的墓碑在
+// identity 表）；`Scope` / `OwnerAgentUID` / `Revision` 随范围与凭据变更更新并参与资源 ETag。
+// ResourcePointer is the domain shape of a publish pointer. The uid is the instance the
+// name currently resolves to; scope, owner and revision take part in the resource ETag.
 type ResourcePointer struct {
 	Kind               ResourceKind
 	ResourceID         string
+	ResourceUID        ResourceUID
 	PublishedVersionID int64
 	AppliedVersionID   *int64 // nil = 基线尚未生效（MCP 首版重启前）
+	Scope              ResourceScope
+	OwnerAgentUID      AgentUID // 空 = 共享范围
+	Revision           int
 	DeletedAt          *int64 // Unix 毫秒；nil = 未删除
 	UpdatedAt          int64
 	OperationID        string
 }
 
 // ResourceVersionRef 指向一个不可变资源版本（契约 run-and-errors §1.1）。
-// 名字是 provider / MCP server / 技能名；版本号逐资源从 1 起。
-// ResourceVersionRef points at one immutable resource version.
+// 名字是 provider / MCP server / 技能名；资源 UID 是稳定身份（v2 起必填）；
+// 版本号逐资源从 1 起。
+// ResourceVersionRef points at one immutable resource version; the resource uid is
+// required from v2 on.
 type ResourceVersionRef struct {
-	Name        string `json:"name"`
-	VersionID   int64  `json:"version_id"`
-	VersionNo   int    `json:"version_no"`
-	ContentHash string `json:"content_hash"`
+	Name        string      `json:"name"`
+	ResourceUID ResourceUID `json:"resource_uid"`
+	VersionID   int64       `json:"version_id"`
+	VersionNo   int         `json:"version_no"`
+	ContentHash string      `json:"content_hash"`
+}
+
+// ProviderVersionRef 在通用版本引用上增加模型名与凭据固定（契约 run-and-errors
+// §1.1 的 ProviderVersionRef；`model` 供 manifest 视图的 ProviderManifestView 投影，
+// 凭据字段只记引用与目标绑定哈希——**不含**明文 Key 或完整 URL）。
+// ProviderVersionRef adds the model and the credential pin; it never carries plaintext
+// keys or full URLs.
+type ProviderVersionRef struct {
+	ResourceVersionRef
+	Model             string `json:"model"`
+	CredentialID      string `json:"credential_ref"`
+	CredentialVersion int    `json:"credential_version"`
+	TargetBinding     string `json:"target_binding"`
+}
+
+// CredentialMode 由 CredentialID 是否为空判定（空 = env，非空 = managed）；
+// 清单不再单独持久化模式字段，避免同一事实两处记录而漂移。
+// The credential mode is derived from CredentialID rather than stored twice.
+func (r ProviderVersionRef) CredentialMode() CredentialMode {
+	if r.CredentialID == "" {
+		return CredentialModeEnv
+	}
+	return CredentialModeManaged
+}
+
+// NotifyToolName 是通知工具的注册名，也是系统**唯一**允许自动增删的工具名
+// （宪法约束 11）。写面装配与工具注册共用这两个字面量，避免两处各写一份。
+// NotifyToolName is the registered notify tool name and the only tool the system may
+// auto-add or auto-remove on the controlled write face.
+const NotifyToolName = "notify"
+
+// NotifyMode 是通知意图的三值字面量（契约 agent-md §2；schema.sql CHECK 逐字）。
+// NotifyMode is the three-value notification intent literal set.
+type NotifyMode string
+
+const (
+	// NotifyModeNone 表示不发送：工具面固定报 `notify_disabled`。
+	NotifyModeNone NotifyMode = "none"
+	// NotifyModeAllEligible 表示可使用全部当前有资格的渠道（准入时枚举冻结）。
+	NotifyModeAllEligible NotifyMode = "all_eligible"
+	// NotifyModeAllowlist 表示仅限 `notify_channels` 列出的渠道。
+	NotifyModeAllowlist NotifyMode = "allowlist"
+)
+
+// ParseNotifyMode 逐字解析通知模式；未知值与空串一律拒绝（兼容读取由准入侧按
+// agent-md 的规则归一为显式值，不在这里猜缺省）。
+// ParseNotifyMode accepts exactly the three literals; compatibility defaulting belongs
+// to admission, not here.
+func ParseNotifyMode(raw string) (NotifyMode, error) {
+	switch NotifyMode(raw) {
+	case NotifyModeNone:
+		return NotifyModeNone, nil
+	case NotifyModeAllEligible:
+		return NotifyModeAllEligible, nil
+	case NotifyModeAllowlist:
+		return NotifyModeAllowlist, nil
+	default:
+		return "", fmt.Errorf("%w: 非法的通知模式 %q", ErrResourceNotEligible, raw)
+	}
+}
+
+// NotifyChannelRef 是准入时冻结的一个具体渠道：名称只作标签，UID 才是身份。
+// NotifyChannelRef freezes one concrete channel; the uid is the identity.
+type NotifyChannelRef struct {
+	Name        string      `json:"name"`
+	ResourceUID ResourceUID `json:"resource_uid"`
+}
+
+// NotifyManifest 冻结通知授权：mode 三选一，channels 是解析后的具体渠道，
+// 不设 `*` 通配；`none` / `all_eligible` 时 channels 为空（后者表示全部有资格渠道
+// 已在准入时枚举进集合）。
+// NotifyManifest freezes the notification grant; there is no `*` wildcard.
+type NotifyManifest struct {
+	Mode     NotifyMode         `json:"mode"`
+	Channels []NotifyChannelRef `json:"channels"`
 }
 
 // FileHash 是技能清单中的一个文件：路径相对技能目录，哈希为小写十六进制。
@@ -190,12 +306,17 @@ type SkillVersionRef struct {
 // is the struct declaration order; maps are forbidden; the builder normalizes list
 // order (names ascending, file paths ascending) and makes every list non-nil.
 type RunResourceManifest struct {
-	FormatVersion  int                  `json:"format_version"`
-	Hash           string               `json:"hash"`
+	FormatVersion int    `json:"format_version"`
+	Hash          string `json:"hash"`
+	// AgentUID 是准入时固定下来的 Agent 稳定身份（v2 起必填；v1 清单为空）。
+	AgentUID       AgentUID             `json:"agent_uid"`
 	AgentLifecycle string               `json:"agent_lifecycle_state"`
-	Provider       ResourceVersionRef   `json:"provider"`
+	Provider       ProviderVersionRef   `json:"provider"`
 	MCPServers     []ResourceVersionRef `json:"mcp_servers"`
 	Skills         []SkillVersionRef    `json:"skills"`
+	// Notify 是准入时冻结的通知授权（v2 起必填；v1 清单为零值，旧语义是
+	// 「空白名单 = 不限制」）。
+	Notify NotifyManifest `json:"notify"`
 }
 
 // MarshalManifest 输出清单的规整 JSON：字段顺序固定、紧凑无多余空白。
@@ -222,23 +343,36 @@ func HashManifest(m RunResourceManifest) (string, error) {
 }
 
 // BuildRunResourceManifest 由准入解析结果构造清单：先按 name 升序规范化 MCP 与技能、
-// 再按 path 升序规范化每个技能的文件清单，三个列表一律非 nil，最后回填 `Hash`。
-// 输入切片不被修改（调用方可能还在别处持有同一份解析结果）。
-// BuildRunResourceManifest normalizes ordering (names ascending, file paths ascending),
-// makes every list non-nil, fills Hash, and never mutates its input.
+// 再按 path 升序规范化每个技能的文件清单、按资源 UID 稳定排序通知渠道，列表一律非 nil，
+// 最后回填 `Hash`。输入切片不被修改（调用方可能还在别处持有同一份解析结果）。
+// BuildRunResourceManifest normalizes ordering, makes every list non-nil, fills Hash and
+// never mutates its input.
 //
-// 缺失绑定资源（Provider / MCP / 技能名字为空）直接报错：注册不变量已被破坏的运行
-// **不得**带着空清单落库——空清单会被读成"这一跑确实没用任何资源"。
-// A missing binding is an error: an empty manifest would be read as "no resources used".
-func BuildRunResourceManifest(state AgentState, resolved ResolvedResources) (RunResourceManifest, error) {
+// 缺失绑定资源（Agent UID 为空、Provider / MCP / 技能名字或 UID 为空、凭据固定不成立、
+// 通知模式与渠道组合非法）直接报错：注册不变量已被破坏的运行 **不得** 带着残缺清单落库
+// ——空清单会被读成"这一跑确实没用任何资源"。
+// A missing binding or an inconsistent credential/notify pin is an error: an incomplete
+// manifest would be read as "no resources used".
+func BuildRunResourceManifest(agentUID AgentUID, state AgentState, resolved ResolvedResources) (RunResourceManifest, error) {
+	if _, err := ParseAgentUID(string(agentUID)); err != nil {
+		return RunResourceManifest{}, errors.New("构造资源清单：缺少合法的 Agent UID")
+	}
 	if resolved.Provider.Name == "" {
 		return RunResourceManifest{}, errors.New("构造资源清单：缺少 Provider 发布版本")
+	}
+	if _, err := ParseResourceUID(string(resolved.Provider.ResourceUID)); err != nil {
+		return RunResourceManifest{}, errors.New("构造资源清单：Provider 发布版本缺少合法的资源 UID")
+	}
+	provider, err := buildProviderRef(resolved)
+	if err != nil {
+		return RunResourceManifest{}, err
 	}
 
 	manifest := RunResourceManifest{
 		FormatVersion:  runResourceManifestFormatVersion,
+		AgentUID:       agentUID,
 		AgentLifecycle: string(state),
-		Provider:       resolved.Provider,
+		Provider:       provider,
 		MCPServers:     make([]ResourceVersionRef, 0, len(resolved.MCPServers)),
 		Skills:         make([]SkillVersionRef, 0, len(resolved.Skills)),
 	}
@@ -247,6 +381,9 @@ func BuildRunResourceManifest(state AgentState, resolved ResolvedResources) (Run
 		if ref.Name == "" {
 			return RunResourceManifest{}, errors.New("构造资源清单：MCP 服务发布版本的 name 为空")
 		}
+		if _, err := ParseResourceUID(string(ref.ResourceUID)); err != nil {
+			return RunResourceManifest{}, errors.New("构造资源清单：MCP 服务发布版本缺少合法的资源 UID")
+		}
 		manifest.MCPServers = append(manifest.MCPServers, ref)
 	}
 	slices.SortFunc(manifest.MCPServers, compareVersionRef)
@@ -254,6 +391,9 @@ func BuildRunResourceManifest(state AgentState, resolved ResolvedResources) (Run
 	for _, skill := range resolved.Skills {
 		if skill.Name == "" {
 			return RunResourceManifest{}, errors.New("构造资源清单：技能发布版本的 name 为空")
+		}
+		if _, err := ParseResourceUID(string(skill.ResourceUID)); err != nil {
+			return RunResourceManifest{}, errors.New("构造资源清单：技能发布版本缺少合法的资源 UID")
 		}
 		normalized := skill
 		normalized.Files = make([]FileHash, len(skill.Files))
@@ -267,12 +407,96 @@ func BuildRunResourceManifest(state AgentState, resolved ResolvedResources) (Run
 		return strings.Compare(a.Name, b.Name)
 	})
 
+	notify, err := buildNotifyManifest(resolved.Notify)
+	if err != nil {
+		return RunResourceManifest{}, err
+	}
+	manifest.Notify = notify
+
 	hash, err := HashManifest(manifest)
 	if err != nil {
 		return RunResourceManifest{}, err
 	}
 	manifest.Hash = hash
 	return manifest, nil
+}
+
+// buildProviderRef 组装 Provider 版本引用与凭据固定：env 模式必须没有凭据身份与版本，
+// managed 模式必须有合法的 `cred_` 引用与版本号；两种模式都必须带目标绑定哈希。
+// buildProviderRef assembles the provider ref; env carries no credential identity and
+// managed must carry a valid cred_ reference, both need a target-binding hash.
+func buildProviderRef(resolved ResolvedResources) (ProviderVersionRef, error) {
+	pin := resolved.ProviderCredential
+	mode, err := ParseCredentialMode(string(pin.Mode))
+	if err != nil {
+		return ProviderVersionRef{}, fmt.Errorf("构造资源清单：%w", err)
+	}
+	switch mode {
+	case CredentialModeEnv:
+		if pin.ID != "" || pin.Version != 0 {
+			return ProviderVersionRef{}, errors.New("构造资源清单：env 模式不得固定凭据身份或版本")
+		}
+	case CredentialModeManaged:
+		if err := ValidateCredentialID(pin.ID); err != nil {
+			return ProviderVersionRef{}, fmt.Errorf("构造资源清单：托管凭据引用非法: %w", err)
+		}
+		if pin.Version <= 0 {
+			return ProviderVersionRef{}, errors.New("构造资源清单：托管凭据缺少有效版本号")
+		}
+	}
+	if len(pin.TargetBinding) != sha256HexLength {
+		return ProviderVersionRef{}, errors.New("构造资源清单：目标绑定哈希必须是 64 位小写十六进制")
+	}
+	return ProviderVersionRef{
+		ResourceVersionRef: resolved.Provider,
+		Model:              resolved.ProviderModel,
+		CredentialID:       pin.ID,
+		CredentialVersion:  pin.Version,
+		TargetBinding:      pin.TargetBinding,
+	}, nil
+}
+
+// buildNotifyManifest 校验并规范化通知冻结集合：模式三选一；`none` 不得带渠道；
+// `all_eligible` 携带准入时枚举出的有资格渠道（可为空——当前没有有资格渠道）；
+// `allowlist` 至少一个；渠道按资源 UID 稳定排序（名称只是标签）。
+// buildNotifyManifest validates the mode/channel combination (none carries none,
+// all_eligible carries the enumerated eligible set, allowlist needs at least one) and
+// sorts channels by resource uid for a stable hash.
+func buildNotifyManifest(in NotifyManifest) (NotifyManifest, error) {
+	mode, err := ParseNotifyMode(string(in.Mode))
+	if err != nil {
+		return NotifyManifest{}, err
+	}
+	out := NotifyManifest{Mode: mode, Channels: make([]NotifyChannelRef, 0, len(in.Channels))}
+	switch mode {
+	case NotifyModeNone:
+		if len(in.Channels) != 0 {
+			return NotifyManifest{}, errors.New("构造资源清单：notify_mode=none 不得冻结渠道")
+		}
+		return out, nil
+	case NotifyModeAllowlist:
+		if len(in.Channels) == 0 {
+			return NotifyManifest{}, errors.New("构造资源清单：notify_mode=allowlist 至少需要一个渠道")
+		}
+	}
+	seen := make(map[ResourceUID]struct{}, len(in.Channels))
+	for _, channel := range in.Channels {
+		if channel.Name == "" {
+			return NotifyManifest{}, errors.New("构造资源清单：通知渠道缺少名称")
+		}
+		if _, err := ParseResourceUID(string(channel.ResourceUID)); err != nil {
+			return NotifyManifest{}, errors.New("构造资源清单：通知渠道缺少合法的资源 UID")
+		}
+		if _, ok := seen[channel.ResourceUID]; ok {
+			return NotifyManifest{}, fmt.Errorf("构造资源清单：通知渠道 UID 重复 %q", channel.ResourceUID)
+		}
+		seen[channel.ResourceUID] = struct{}{}
+		out.Channels = append(out.Channels, channel)
+	}
+	slices.SortFunc(out.Channels, func(a, b NotifyChannelRef) int {
+		return strings.Compare(string(a.ResourceUID), string(b.ResourceUID))
+	})
+	return out, nil
 }
 
 // compareVersionRef 是 ResourceVersionRef 的 name 升序比较器（清单与视图共用同一口径）。

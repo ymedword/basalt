@@ -36,7 +36,9 @@ const (
 // 适配器与 web 只读面此后都不回写它（P-05 / 约束 3）。
 // newScheduler builds the scheduler; core.NewScheduler snapshots Entries at construction,
 // so later mutations of the caller's slice cannot change definitions.
-func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entries []core.AgentEntry, cfg *cli.Config, logger *slog.Logger) *core.Scheduler {
+func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entries []core.AgentEntry,
+	delivery core.ScheduleDelivery, cfg *cli.Config, logger *slog.Logger,
+) *core.Scheduler {
 	if logger == nil {
 		logger = a.loggerOr()
 	}
@@ -46,6 +48,7 @@ func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entrie
 		Engine:     cronadapter.New(logger),
 		Entries:    entries,
 		CronSpec:   workspace.CronSpec,
+		Delivery:   delivery,
 		Budget:     webBudget(cfg),
 		RunTimeout: scheduleRunTimeout,
 		StopGrace:  scheduleStopGrace,
@@ -109,8 +112,13 @@ type scheduleEditorAdapter struct {
 	logger    *slog.Logger
 
 	// mu 覆盖"读 claims → CheckOwnership → 校验 → 落盘 → 刷新 claims → ReconcileAgent"
-	// 整段临界区（约束 30）：两个 Agent 并发写同一 id 由此串行化。锁序固定
-	// adapter.mu → loader.writeMu、adapter.mu → stateMu，不得反向（约束 39）。
+	// 整段临界区（约束 30）：两个 Agent 并发写同一 id 由此串行化。SetRegistered 与
+	// ReconcileAgent 的调度器委托同样在这把锁内完成——归档注销、热加载对账不得与写面
+	// 交错。锁序固定 adapter.mu → loader.writeMu、adapter.mu → scheduler.stateMu，
+	// 不得反向。
+	// mu serialises the whole read-check-write-reconcile cycle and the registry hooks'
+	// scheduler delegation; the lock order adapter.mu → loader.writeMu /
+	// scheduler.stateMu is fixed and never reversed.
 	mu sync.Mutex
 
 	// claims 是私有 claim 基线（只含已注册 Agent 的 schedules）：构造时从 entries 拷出，
@@ -155,32 +163,40 @@ func (e *scheduleEditorAdapter) ReadSchedules(_ context.Context, agent string) (
 	return e.loader.ReadSchedules(e.root, agent)
 }
 
-// SetRegistered 让注册集合的增减同时反映到私有 claim 基线（约束 39 / 约束 30）：
-// 移出的 Agent 不再参与归属预检，否则热加载后旧 claim 会让 manage_schedule 误判
-// 跨 Agent 冲突。加入不在这里写 claim——紧随其后的 ReconcileAgent 会带上新定义。
-// SetRegistered keeps the claim baseline in step with the registry: a removed agent
-// leaves the ownership check, and an added one learns its claims from ReconcileAgent.
+// SetRegistered 让注册集合的增减同时反映到私有 claim 基线（约束 39 / 约束 30），并在
+// adapter.mu 内完成调度器委托：归档注销不得与 manage_schedule 的落盘 / 对账交错
+// （约束 42 的写锁顺序 adapter.mu → scheduler.stateMu）。移出的 Agent 不再参与归属
+// 预检，否则归档后旧 claim 会让 manage_schedule 误判跨 Agent 冲突；加入不在这里写
+// claim——紧随其后的 ReconcileAgent 会带上新定义。注销成功才清 claim：调度器失败时
+// 调用方按回滚矩阵恢复注册，旧基线保留到下一轮对齐。
+// SetRegistered delegates to the scheduler under the same lock and drops the claim
+// baseline only after the removal succeeds; an added agent learns its claims from
+// ReconcileAgent.
 func (e *scheduleEditorAdapter) SetRegistered(agent string, registered bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.scheduler.SetRegistered(agent, registered); err != nil {
 		return err
 	}
-	if registered {
-		return nil
+	if !registered {
+		delete(e.claims, agent)
 	}
-	e.mu.Lock()
-	delete(e.claims, agent)
-	e.mu.Unlock()
 	return nil
 }
 
-// ReconcileAgent 先刷新 claim 基线再委托调度器（与 ApplySchedule 同序：文件事实先行，
-// 库对齐失败不回退 claim——它记的是文件真值）。
-// ReconcileAgent refreshes the claim baseline first, then delegates, matching
-// ApplySchedule's order: the file's truth leads, a failed DB sync does not roll it back.
+// ReconcileAgent 在同一临界区内先刷新 claim 基线再委托调度器（与 ApplySchedule 同序：
+// 文件事实先行，库对齐失败不回退 claim——它记的是文件真值）。空定义（归档注销）只
+// 退休任务行；本方法**不**自动启用任何任务——归档恢复本身不触碰调度器（约束 32），
+// 恢复后的 Agent 要重新产生定时任务，只能由显式定义（热加载或下一次 manage_schedule）
+// 驱动。
+// ReconcileAgent refreshes the claim baseline and delegates under one critical section.
+// Empty definitions only retire rows; this method never auto-enables a restored agent.
 func (e *scheduleEditorAdapter) ReconcileAgent(ctx context.Context, agent string, schedules []core.Schedule) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.claims[agent] = append([]core.Schedule(nil), schedules...)
-	e.mu.Unlock()
 	return e.scheduler.ReconcileAgent(ctx, agent, schedules)
 }
 

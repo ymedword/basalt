@@ -16,10 +16,11 @@ package workspace
 // rollback) and two are deliberately left intact and logged — where nothing can be judged,
 // nothing is deleted.
 //
-// **本 US 无 staged 写入方**（多文件提交的产生方是 US-12），因此这一段是**休眠分支**：
-// 代码按契约就位，行为读数进验收报告人工项清单（§3.2 未为本文件单列用例条数）。
-// There is no staged writer yet: the branch is dormant by design, and its readings belong
-// to the manual acceptance list.
+// **US-12 起有 staged 写入方**：Agent 多文件提交（`SubmitAgentFiles`）与模板创建
+// （`CreateAgentStaged`）都会在 `agents/` 下产出 `<name>.staging` / `<name>.backup`，
+// 本段因此是**活动分支**——启动恢复按残留收敛，冲突与判不动的现场保留并告警。
+// US-12 adds the staged writers (multi-file submission and template creation under
+// agents/), so this path is live; the residue pass converges or preserves-and-warns.
 
 import (
 	"errors"

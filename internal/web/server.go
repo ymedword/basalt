@@ -74,11 +74,20 @@ type Options struct {
 	// Console is the embedded dist root; it is required at assembly time.
 	Console fs.FS
 
-	// Sandbox 是沙箱白名单的只读投影输入（§3.1.28）：路径一律是相对展示名，绝对
-	// 路径由投影层再挡一次；零值 = 四类白名单全空（不是"读配置"的失败）。
+	// Sandbox 是沙箱白名单的投影输入（§3.1.28）：路径一律是相对展示名，绝对
+	// 路径由投影层再挡一次；零值 = 四类白名单全空（不是"读配置"的失败）。其中
+	// `HTTPAllowedDomains` 只在未装配 NetworkAllowlist 时作只读兜底。
 	// Sandbox carries the sandbox allowlists as relative display names; the zero
 	// value means four empty allowlists, not a configuration failure.
 	Sandbox SandboxConfig
+
+	// NetworkAllowlist 是出网域名白名单的管理端口（R8 裁决 2）：读**当前生效**
+	// 值、执行带 If-Match 的条件写。装配时必须与运行期消费者共用同一策略实例，
+	// 否则"热生效"只改了副本。nil = 只读装配（GET 退回配置投影、PUT 按装配错误
+	// 500）：生产装配由 app 层提供且不可缺省。
+	// NetworkAllowlist is the managed outbound allowlist port; a nil port is the
+	// read-only assembly seam and makes PUT fail closed with a fixed 500.
+	NetworkAllowlist core.NetworkAllowlistAdmin
 
 	// Notify 是通知渠道的只读注册表（§3.1.29）；NotifyTypes 是装配层显式注册的有序
 	// 类型名（单一真值，US-12 写面复用同一映射表）。Notify 为 nil 时列表端点按 500
@@ -87,6 +96,36 @@ type Options struct {
 	// single ordered type list.
 	Notify      core.NotifyChannelReader
 	NotifyTypes []string
+
+	// NotifyReferences 是「哪些 Agent 文档引用了某渠道」的只读端口（US-12 R3.6）：
+	// 按渠道名分组返回排序去重的 Agent 名（归档项带 `archive:` 前缀）。它是**文档
+	// 引用扫描**，不是精确绑定；精确的可用范围在 Agent 的 notify_channels 声明。
+	// nil = 列表照常返回、引用集合为空（测试与无工作区嵌入）；生产装配必须提供，
+	// 扫描失败按 500 失败关闭——**不得**把失败降级成"没有 Agent 引用"。
+	// NotifyReferences groups document references by channel name. It is a textual
+	// scan, not the exact binding. A scan failure fails closed, never an empty result.
+	NotifyReferences NotifyReferenceReader
+
+	// 写面端口（US-12；同样由 app 层适配）。五个端口与 US-11 的 `AgentAdmin`
+	// **互不替代**：后者是内容读写与启停（`GET/PUT /content`、enable / disable），
+	// 这里承载创建 / 草稿 / 多文件提交 / 复制 / 归档 / 恢复，模型连接、MCP、
+	// 技能、通知渠道与工作区的读写，以及结构化配置读面。端口为 nil 时对应 handler
+	// 按固定 500 失败关闭——**不得**用空实现冒充已装配，也不得把它们合并成一个
+	// "大接口"。
+	// The US-12 write ports; they never replace the US-11 content editor in
+	// AgentAdmin. A nil port fails closed with a fixed 500.
+	AgentAdminService    AgentAdminService
+	ResourceAdminService ResourceAdminService
+	NotifyAdminService   NotifyAdminService
+	WorkspaceService     WorkspaceService
+	AgentConfigService   AgentConfigService
+	// ResourceStateService 是撤销托管凭据与切换使用范围两条状态动作的端口
+	// （`ports_admin.go`）；它与 `ResourceAdminService` 分开，是因为两条端点各要
+	// "条件写 + 显式身份 + 操作行"的完整编排，而资源写面不承担这层组合。
+	// ResourceStateService carries the revoke and scope orchestrations; it is separate
+	// from the resource write port because both need the full conditional-write
+	// orchestration that the write port does not carry.
+	ResourceStateService ResourceStateService
 
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
@@ -129,6 +168,15 @@ type RunService interface {
 	ListRuns(ctx context.Context, filter core.RunFilter) ([]core.RunDetail, error)
 	GetRun(ctx context.Context, runID string) (core.RunDetail, error)
 	Cancel(ctx context.Context, runID string) (core.RunDetail, error)
+}
+
+// NotifyReferenceReader 是通知渠道反向引用的消费方端口：输入一组渠道名，
+// 返回 `渠道名 → Agent 名列表`（排序去重）。实现扫描工作区的 Agent 文档与归档；
+// 扫描失败必须返回错误——空映射会被页面读成"没有任何 Agent 引用"。
+// NotifyReferenceReader resolves channel names to the agents that mention them;
+// a failed scan is an error, never an empty map.
+type NotifyReferenceReader interface {
+	NotifyReferences(ctx context.Context, channels []string) (map[string][]string, error)
 }
 
 // AdminHandler 是受认证保护的处理函数：actor 由认证层以显式参数传入，
@@ -422,10 +470,13 @@ type route struct {
 // 重定向），新增公开入口必须同时修订契约与本表。管理台两条静态壳路由随 console
 // 处理器（T049）一并登记：`/console` 精确路径单独成行，避免 ServeMux 对子树模式
 // 自动发 301（图 H 要求二者都直接得到 index.html）。
+// 表由两段组成：US-11 及以前的字面行 + `adminRoutes()` 返回的 US-12 写面行，
+// 兜底恒为最后一行。两段都只是**同一张表**的组成部分，注册与遍历看到的行一致。
 // routeTable is the single enumeration shared by registration and the auth matrix;
-// the console rows are exact-path plus subtree, both serving the shell.
+// the console rows are exact-path plus subtree, and the US-12 rows are appended from
+// admin_routes.go ahead of the fallback, which always stays last.
 func (s *Server) routeTable() []route {
-	return []route{
+	rows := []route{
 		{method: http.MethodGet, pattern: "/{$}", visibility: routePublic, handler: s.handleRoot},
 		{method: http.MethodGet, pattern: "/api/v1/health", visibility: routePublic, handler: s.handleHealth},
 		{method: http.MethodGet, pattern: "/api/v1/info", visibility: routeProtected, handler: s.handleInfo},
@@ -442,6 +493,7 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodGet, pattern: "/api/v1/sandbox", visibility: routeProtected, adminHandler: s.handleSandbox},
 		{method: http.MethodGet, pattern: "/api/v1/notify-channels", visibility: routeProtected, adminHandler: s.handleListNotifyChannels},
 		{method: http.MethodGet, pattern: "/api/v1/notify-channels/types", visibility: routeProtected, adminHandler: s.handleNotifyTypes},
+		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/config", visibility: routeProtected, adminHandler: s.handleGetAgentConfig},
 		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/content", visibility: routeProtected, adminHandler: s.handleGetAgentContent},
 		{method: http.MethodPut, pattern: "/api/v1/agents/{name}/content", visibility: routeProtected, adminHandler: s.handlePutAgentContent},
 		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/disable", visibility: routeProtected, adminHandler: s.handleDisableAgent},
@@ -468,10 +520,16 @@ func (s *Server) routeTable() []route {
 		// The console shell is public; the handler decides asset versus SPA fallback.
 		{method: http.MethodGet, pattern: "/console", visibility: routePublic, handler: s.console.ServeHTTP},
 		{method: http.MethodGet, pattern: "/console/{path...}", visibility: routePublic, handler: s.console.ServeHTTP},
-		// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
-		// 不暴露 ServeMux 的纯文本 404 与自动 405。
-		{pattern: "/", visibility: routeFallback, handler: s.handleNotFound},
 	}
+	// US-12 写面 30 条由 admin_routes.go 唯一枚举（§3.7.1）：逐行标记受保护，
+	// 条件写在认证之后套 If-Match。并入点固定在兜底之前——兜底必须仍是最后一行，
+	// 否则未匹配路径会先撞上兜底以外的行。
+	// The US-12 admin rows join before the method-agnostic fallback, which must stay
+	// last; the rows themselves are enumerated only in admin_routes.go.
+	rows = append(rows, s.adminRoutes()...)
+	// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
+	// 不暴露 ServeMux 的纯文本 404 与自动 405。
+	return append(rows, route{pattern: "/", visibility: routeFallback, handler: s.handleNotFound})
 }
 
 // routes 按路由表注册：每条非兜底项按 `方法 模式` 注册，兜底项方法无关。受保护

@@ -190,7 +190,7 @@ func testSignalOrder(t *testing.T) {
 	)
 	addr := freeLoopbackAddr(t)
 	h.writeMCPServers(t, mcpServersYAML(mcpHelperServer))
-	h.writeConfig(t, configWithAddr(model.URL(), addr))
+	h.writeConfig(t, configWithAddr(model.URL(), addr)+mcpShellAllowed())
 	h.writeAgent(t, "demo",
 		mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer})+
 			scheduleBlock(cron, "", signalMessage),

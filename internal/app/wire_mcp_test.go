@@ -63,14 +63,29 @@ type fakeMCPConnector struct {
 // Compile-time assertion that the fixture matches the assembly-layer interface.
 var _ mcpConnector = (*fakeMCPConnector)(nil)
 
-// Connect 记录 specs 并返回构造好的连接或注入错误。
-// Connect records the specs and returns the canned result.
+// Connect 记录 specs 并返回构造好的连接或注入错误。US-12 起 supervisor 对每个 server
+// 单独建一个连接池（一次 Connect 只带一个 spec），夹具因此按请求的 server 名过滤罐装
+// 连接——"没请求到的 server 不返回"正是生产连接池的单 server 语义。
+// Connect records the specs and returns the canned connections for the requested servers,
+// mirroring the per-server pool the supervisor now creates.
 func (f *fakeMCPConnector) Connect(_ context.Context, specs []core.MCPServerConfig) ([]tool.MCPConnection, error) {
-	f.specs = specs
+	// 累积而非覆盖：supervisor 每个 server 单独 Connect 一次，覆盖只会留下最后一台。
+	// Append, not overwrite: the supervisor connects one server per call.
+	f.specs = append(f.specs, specs...)
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.conns, nil
+	wanted := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		wanted[spec.Name] = struct{}{}
+	}
+	conns := make([]tool.MCPConnection, 0, len(f.conns))
+	for _, conn := range f.conns {
+		if _, ok := wanted[conn.Server]; ok {
+			conns = append(conns, conn)
+		}
+	}
+	return conns, nil
 }
 
 // Close 记录关闭并执行可选回调；回调的错误原样上抛（R10 后半靠它观察停机顺序）。
@@ -281,7 +296,10 @@ func TestWire_MCPConfigChangesNeedRestart(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt2.Close()) })
 
-	require.Equal(t, []string{"beta"}, mcpSpecNames(second.specs), "重建后才读新配置")
+	// 重建后的运行集 = 新文件条目（beta，基线发布）∪ 指针保留项（alpha，删条目不删指针）：
+	// 判据是"beta 确实进了新 runtime"，alpha 仍在册是已批准语义（FR17），不是配置热加载。
+	// The rebuilt runtime reads beta from the file plus the retained alpha pointer.
+	require.Equal(t, []string{"beta", "alpha"}, mcpSpecNames(second.specs), "重建后才读新配置")
 	require.Contains(t, rt2.registry.Names(), "beta_tool")
 	require.NotContains(t, rt2.registry.Names(), "alpha_tool")
 }
@@ -307,10 +325,16 @@ func TestWire_CloseClosesMCPBeforeDatabase(t *testing.T) {
 	fx := newWireFixture(t)
 	writeMCPServersYAML(t, fx.root, []string{"probe"}) // 建池前提：至少一个 server
 	var rt *heavyRuntime
-	connector := &fakeMCPConnector{onClose: func() error {
-		_, err := rt.db.SchemaVersion(context.Background()) // 库还活着 = 顺序正确
-		return err
-	}}
+	// 连接必须成功：supervisor 对"零连接"按连接失败处理并当场收池，回调会落在装配期
+	// （rt 尚未赋值）而不是停机路径上。给一条真实连接，关闭时机才回到 heavyRuntime.Close。
+	// The connect must succeed, otherwise the supervisor closes the pool during assembly.
+	connector := &fakeMCPConnector{
+		conns: []tool.MCPConnection{{Server: "probe", Tools: []core.Tool{&fakeMCPTool{name: "probe_tool"}}}},
+		onClose: func() error {
+			_, err := rt.db.SchemaVersion(context.Background()) // 库还活着 = 顺序正确
+			return err
+		},
+	}
 	app := fx.app()
 	app.mcpConnect = connector
 	got, err := app.newRuntime(context.Background())

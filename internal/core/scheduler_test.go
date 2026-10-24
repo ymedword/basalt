@@ -298,6 +298,7 @@ func (s *fakeTaskStore) ApplyAgentTasks(_ context.Context, agent string, upserts
 		ids = append(ids, up.TaskID)
 		if old, ok := s.tasks[up.TaskID]; ok {
 			old.Cron, old.Zone, old.Message = up.Cron, up.Zone, up.Message
+			old.DeliverTo = up.DeliverTo
 			old.DefinitionHash = up.DefinitionHash
 			old.RetiredAt = time.Time{}
 			old.UpdatedAt = now

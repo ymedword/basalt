@@ -220,3 +220,72 @@ func head(s string, n int) string {
 	}
 	return string(runes[:n])
 }
+
+// pathTestUID 是一个固定的合法资源身份（rs_ + 26 位 Crockford 载荷）。
+const pathTestUID = core.ResourceUID("rs_01J9ZQ7K3W8V2N5R6T4YHBCDEF")
+
+// 中文验收点（约束 25 / 主裁决 3）：工作副本与不可变版本目录的**同一份映射**——
+// 工作副本 `skills/<name>`、新发布版本目录 `versions/skills/<name>/<uid>/<no>`、其契约
+// 字面量 `.basalt/versions/skills/<name>/<uid>/<no>`；后两者是同一目录的两种写法（只差
+// `.basalt/` 前缀），发布快照按字面量记录、文件访问按相对形态取。
+// 2026-10-23 裁定：新发布一律身份分段；旧扁平目录按持久化 storage_path 只读兼容。
+// Acceptance point: the work copy and the identity-segmented version directory map onto
+// each other, and the contract literal is the relative form with the .basalt/ prefix.
+func TestSkillPaths_MapsWorkCopyToVersionDir(t *testing.T) {
+	workCopy, err := workspace.SkillWorkCopyRelDir("digest-format")
+	require.NoError(t, err)
+	require.Equal(t, "skills/digest-format", workCopy)
+
+	versionDir, err := workspace.SkillVersionRelDir("digest-format", pathTestUID, 3)
+	require.NoError(t, err)
+	require.Equal(t, "versions/skills/digest-format/rs_01J9ZQ7K3W8V2N5R6T4YHBCDEF/3", versionDir)
+
+	logicalDir, err := workspace.SkillVersionLogicalDir("digest-format", pathTestUID, 3)
+	require.NoError(t, err)
+	require.Equal(t, ".basalt/versions/skills/digest-format/rs_01J9ZQ7K3W8V2N5R6T4YHBCDEF/3", logicalDir,
+		"storage_path 契约字面量（约束 31）")
+
+	// 两种写法必须成对：字面量去掉 `.basalt/` 前缀就是相对形态，不得各拼一份。
+	require.Equal(t, ".basalt/"+versionDir, logicalDir)
+
+	// 已登记路径的投影：两种形态都认，形态之外一律拒绝。
+	rel, err := workspace.PublishedVersionRelDir(logicalDir)
+	require.NoError(t, err)
+	require.Equal(t, versionDir, rel)
+	legacyRel, err := workspace.PublishedVersionRelDir(".basalt/versions/skills/digest-format/3")
+	require.NoError(t, err)
+	require.Equal(t, "versions/skills/digest-format/3", legacyRel)
+}
+
+// 中文验收点：名字先过**同一份**单目录名判据（越界名不拼路径——拼接面拒绝任何
+// 分隔符 / 点前缀 / 保留后缀）；资源身份必须合法。
+// Acceptance point: every mapping refuses invalid names and resource identities.
+func TestSkillPaths_RejectsInvalidName(t *testing.T) {
+	for _, name := range []string{"", "../agents", "a/b", `a\b`, ".hidden", "a.staging", ".."} {
+		_, err := workspace.SkillWorkCopyRelDir(name)
+		require.Error(t, err, "工作副本映射必须拒绝：%q", name)
+		_, err = workspace.SkillVersionRelDir(name, pathTestUID, 1)
+		require.Error(t, err, "版本目录映射必须拒绝：%q", name)
+		_, err = workspace.SkillVersionLogicalDir(name, pathTestUID, 1)
+		require.Error(t, err, "版本目录字面量必须拒绝：%q", name)
+	}
+
+	for _, uid := range []core.ResourceUID{"", "rs_short", "ag_01J9ZQ7K3W8V2N5R6T4YHBCDEF"} {
+		_, err := workspace.SkillVersionRelDir("digest-format", uid, 1)
+		require.Error(t, err, "身份 %q 必须被拒", uid)
+		_, err = workspace.SkillVersionLogicalDir("digest-format", uid, 1)
+		require.Error(t, err, "身份 %q 必须被拒", uid)
+	}
+}
+
+// 中文验收点：版本号必须是正整数——0 / 负数不得拼出看似合理的目录（版本目录只由
+// 发布序列产生，版本 0 不存在）。
+// Acceptance point: a version directory requires a positive version number.
+func TestSkillPaths_RejectsNonPositiveVersion(t *testing.T) {
+	for _, versionNo := range []int{0, -1} {
+		_, err := workspace.SkillVersionRelDir("digest-format", pathTestUID, versionNo)
+		require.Error(t, err, "版本号 %d 必须被拒", versionNo)
+		_, err = workspace.SkillVersionLogicalDir("digest-format", pathTestUID, versionNo)
+		require.Error(t, err, "版本号 %d 必须被拒", versionNo)
+	}
+}

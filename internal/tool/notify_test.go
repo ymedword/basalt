@@ -201,12 +201,23 @@ func (p *notifyPolicySpy) judgmentCount() int {
 	return len(p.judged)
 }
 
-// newTestNotifyTool 注入固定的环境查找函数（生产缺省 os.LookupEnv）。
-// newTestNotifyTool injects a fixed env lookup; production defaults to os.LookupEnv.
+// newTestNotifyTool 注入固定的环境查找函数（生产缺省 os.LookupEnv）；托管凭据解析面
+// 留空——需要它的用例走 `newTestNotifyToolWithCredentials`。
+// newTestNotifyTool injects a fixed env lookup and leaves the managed credential
+// resolver nil; tests that need one use newTestNotifyToolWithCredentials.
 func newTestNotifyTool(channels core.NotifyChannelReader, policy core.Policy,
 	adapters map[string]NotifyAdapter, env map[string]string,
 ) *NotifyTool {
-	t := NewNotifyTool(channels, policy, adapters)
+	return newTestNotifyToolWithCredentials(channels, policy, adapters, env, nil)
+}
+
+// newTestNotifyToolWithCredentials 同 `newTestNotifyTool`，但带上托管凭据解析面。
+// newTestNotifyToolWithCredentials also wires the managed credential resolver.
+func newTestNotifyToolWithCredentials(channels core.NotifyChannelReader, policy core.Policy,
+	adapters map[string]NotifyAdapter, env map[string]string,
+	credentials NotifyCredentialResolver,
+) *NotifyTool {
+	t := NewNotifyTool(channels, policy, adapters, credentials, nil)
 	t.lookupEnv = func(name string) (string, bool) {
 		value, ok := env[name]
 		return value, ok
@@ -377,6 +388,82 @@ func TestNotifyTool_UnknownChannelIsNotFoundWithAvailableNames(t *testing.T) {
 	require.Contains(t, err.Error(), "ops")
 	require.Contains(t, err.Error(), "team")
 	require.Equal(t, 0, policy.judgmentCount())
+	require.Equal(t, 0, adapter.count())
+}
+
+// TestNotifyTool_DeclaredAllowlistGatesChannels —— notify_channels 非空 = 白名单：
+// 声明内的渠道可发送；声明外的渠道即使已登记也按 not_found 拒绝，文案点明是**声明
+// 限制**而不是渠道不存在，且零判定零外呼。
+// A non-empty declaration is an allowlist: declared channels send, everything else is
+// refused as a declaration limit (not_found) before policy judgement.
+func TestNotifyTool_DeclaredAllowlistGatesChannels(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{Name: "ops", Type: "webhook", URL: "${OPS_HOOK}"},
+		{Name: "team", Type: "webhook", URL: "${TEAM_HOOK}"},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{
+			"OPS_HOOK":  "https://hooks.example.com/T",
+			"TEAM_HOOK": "https://hooks.example.com/U",
+		})
+	env := core.ToolEnv{AgentName: "digest", NotifyChannels: []string{"ops"}}
+
+	res, err := tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+	require.NoError(t, err)
+	require.Equal(t, "已推送到通知渠道：ops", res.Content)
+	require.Equal(t, 1, adapter.count(), "声明内的渠道正常发送")
+
+	_, err = tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"team","content":"日报"}`))
+	require.ErrorIs(t, err, fs.ErrNotExist, "声明外的渠道按 not_found 拒绝")
+	require.Contains(t, err.Error(), "notify_channels", "文案点明声明限制")
+	require.NotContains(t, err.Error(), "不存在", "不得伪装成渠道不存在")
+	require.Contains(t, err.Error(), "ops", "可用名只列声明内的渠道")
+	require.Equal(t, 1, adapter.count(), "拒绝时零外呼")
+	require.Equal(t, 1, policy.judgmentCount(), "声明拒绝发生在策略判定之前")
+}
+
+// TestNotifyTool_EmptyDeclarationKeepsBackwardCompatibility —— 未声明或显式空列表
+// = 不限制：既有 Agent 不声明也能使用任意已登记渠道（行为与引入白名单前一致）。
+// An absent or empty declaration stays unrestricted for existing agents.
+func TestNotifyTool_EmptyDeclarationKeepsBackwardCompatibility(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{Name: "team", Type: "webhook", URL: "${TEAM_HOOK}"},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	tool := newTestNotifyTool(channels, &notifyPolicySpy{allowed: []string{"hooks.example.com"}},
+		map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{"TEAM_HOOK": "https://hooks.example.com/U"})
+
+	for _, declared := range [][]string{nil, {}} {
+		res, err := tool.Execute(context.Background(),
+			core.ToolEnv{AgentName: "digest", NotifyChannels: declared},
+			json.RawMessage(`{"channel":"team","content":"日报"}`))
+		require.NoError(t, err, "空声明不限制：%v", declared)
+		require.Equal(t, "已推送到通知渠道：team", res.Content)
+	}
+	require.Equal(t, 2, adapter.count())
+}
+
+// TestNotifyTool_DeclaredButUnregisteredExplainsEmptyIntersection —— 声明非空但一个
+// 渠道都没登记时，失败文案说「声明的渠道均未登记」，而不是误导性的「注册表为空」。
+// When no declared channel is registered, the failure names the empty intersection.
+func TestNotifyTool_DeclaredButUnregisteredExplainsEmptyIntersection(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{Name: "ops", Type: "webhook", URL: "${OPS_HOOK}"},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	tool := newTestNotifyTool(channels, &notifyPolicySpy{},
+		map[string]NotifyAdapter{"webhook": adapter}, nil)
+
+	_, err := tool.Execute(context.Background(),
+		core.ToolEnv{AgentName: "digest", NotifyChannels: []string{"ghost"}},
+		json.RawMessage(`{"content":"日报"}`))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.Contains(t, err.Error(), "notify_channels 声明的渠道均未登记")
 	require.Equal(t, 0, adapter.count())
 }
 
@@ -835,4 +922,464 @@ func TestNotifyTool_UnknownTypeFailsWithoutPolicyOrSend(t *testing.T) {
 	require.Equal(t, 0, policy.judgmentCount(), "类型未装配不得调策略判定")
 	require.Equal(t, 0, adapter.count(), "类型未装配不得发送")
 	require.Equal(t, 1, channels.readCount(), "查表本身仍读一次注册表")
+}
+
+// mustChannelUID 造一个合法的资源 UID 供冻结集合使用（生成失败即测试环境故障）。
+// mustChannelUID mints a valid resource uid for the frozen set.
+func mustChannelUID(t *testing.T) core.ResourceUID {
+	t.Helper()
+	uid, err := core.NewResourceUID()
+	require.NoError(t, err)
+	return uid
+}
+
+// fakeNotifyCredentials 记录托管凭据解析次数并按预置结果返回；地址与错误二选一。
+// fakeNotifyCredentials records resolutions and returns the configured address or error.
+type fakeNotifyCredentials struct {
+	mu      sync.Mutex
+	addr    string
+	credID  string
+	version int
+	err     error
+	calls   int
+}
+
+// ResolveNotifyCredential 返回预置地址或错误（每次发送都应被调用一次），并带上预置的
+// 凭据身份与实际使用版本号。
+// ResolveNotifyCredential returns the configured address or error per call, with the
+// configured credential identity and version.
+func (f *fakeNotifyCredentials) ResolveNotifyCredential(context.Context, core.NotifyChannel) (core.NotifyCredentialResolution, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return core.NotifyCredentialResolution{}, f.err
+	}
+	return core.NotifyCredentialResolution{
+		Target:            f.addr,
+		CredentialID:      f.credID,
+		CredentialVersion: f.version,
+	}, nil
+}
+
+// callCount 是解析次数（钉住"每次发送都重新解析、不缓存"）。
+// callCount returns how many sends resolved the credential.
+func (f *fakeNotifyCredentials) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// fakeNotifyDeliveries 记录工具写出的投递记录，并可注入写入错误。
+// fakeNotifyDeliveries records delivery writes and can inject a failure.
+type fakeNotifyDeliveries struct {
+	mu      sync.Mutex
+	records []core.NotifyDeliveryRecord
+	err     error
+}
+
+// Record 追加一条投递记录（注入错误时一次都不追加）。
+// Record appends one delivery record unless an error is injected.
+func (f *fakeNotifyDeliveries) Record(_ context.Context, record core.NotifyDeliveryRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.records = append(f.records, record)
+	return nil
+}
+
+// rows 返回记录克隆（顺序即调用顺序）。
+// rows returns a clone of the recorded rows.
+func (f *fakeNotifyDeliveries) rows() []core.NotifyDeliveryRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.records)
+}
+
+// TestNotifyTool_RecordsDeliveryInsideRun —— R4.8：Run 内成功投递后写一条
+// `notify_deliveries` 派生记录，记实际使用的凭据身份 / 版本与目标 host；env 模式的凭据
+// 身份与版本保持零值。地址明文**不得**进入记录。
+// Inside a run a successful send writes one delivery row with the credential actually used
+// and the bare target host; env mode leaves the credential identity and version zero.
+func TestNotifyTool_RecordsDeliveryInsideRun(t *testing.T) {
+	agentUID, err := core.NewAgentUID()
+	require.NoError(t, err)
+
+	t.Run("managed_records_credential_version_and_host", func(t *testing.T) {
+		const hook = "https://hooks.example.com/managed/secret?token=abc"
+		channelUID := mustChannelUID(t)
+		channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+			ResourceUID:    channelUID,
+			Name:           "ops",
+			Type:           "webhook",
+			CredentialMode: core.CredentialModeManaged,
+			Scope:          core.ScopeShared,
+		}}}
+		credentials := &fakeNotifyCredentials{addr: hook, credID: "cred_managed01", version: 3}
+		deliveries := &fakeNotifyDeliveries{}
+		tool := newTestNotifyToolWithCredentials(channels,
+			&notifyPolicySpy{allowed: []string{"hooks.example.com"}},
+			map[string]NotifyAdapter{"webhook": &recordingNotifyAdapter{}}, nil, credentials)
+		tool.deliveries = deliveries
+
+		res, err := tool.Execute(context.Background(), core.ToolEnv{
+			RunID:            "webhook-1700000000000-abc123",
+			AgentUID:         agentUID,
+			AgentName:        "digest",
+			RunBound:         true,
+			NotifyMode:       core.NotifyModeAllEligible,
+			NotifyChannels:   []string{string(channelUID)},
+			ToolInvocationID: 42,
+		}, json.RawMessage(`{"channel":"ops","content":"日报"}`))
+		require.NoError(t, err)
+		require.Equal(t, "已推送到通知渠道：ops", res.Content)
+
+		rows := deliveries.rows()
+		require.Len(t, rows, 1, "一次调用至多一条投递记录")
+		require.Equal(t, int64(42), rows[0].ToolInvocationID)
+		require.Equal(t, "webhook-1700000000000-abc123", rows[0].RunID)
+		require.Equal(t, agentUID, rows[0].AgentUID)
+		require.Equal(t, channelUID, rows[0].ChannelUID)
+		require.Equal(t, "ops", rows[0].ChannelName)
+		require.Equal(t, "cred_managed01", rows[0].CredentialID)
+		require.Equal(t, 3, rows[0].CredentialVersion)
+		require.Equal(t, "hooks.example.com", rows[0].TargetHost, "只记 host，不记路径与查询串")
+		require.NotContains(t, rows[0].TargetHost, "secret", "记录不得含地址明文")
+	})
+
+	t.Run("env_mode_records_empty_credential", func(t *testing.T) {
+		channelUID := mustChannelUID(t)
+		channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+			ResourceUID: channelUID, Name: "ops", Type: "webhook", URL: "${OPS_HOOK}",
+			Scope: core.ScopeShared,
+		}}}
+		deliveries := &fakeNotifyDeliveries{}
+		tool := newTestNotifyTool(channels,
+			&notifyPolicySpy{allowed: []string{"hooks.example.com"}},
+			map[string]NotifyAdapter{"webhook": &recordingNotifyAdapter{}},
+			map[string]string{"OPS_HOOK": "https://hooks.example.com/T"})
+		tool.deliveries = deliveries
+
+		_, err := tool.Execute(context.Background(), core.ToolEnv{
+			RunID:            "webhook-1700000000001-def456",
+			AgentUID:         agentUID,
+			AgentName:        "digest",
+			RunBound:         true,
+			NotifyMode:       core.NotifyModeAllEligible,
+			NotifyChannels:   []string{string(channelUID)},
+			ToolInvocationID: 7,
+		}, json.RawMessage(`{"channel":"ops","content":"摘要"}`))
+		require.NoError(t, err)
+
+		rows := deliveries.rows()
+		require.Len(t, rows, 1)
+		require.Empty(t, rows[0].CredentialID, "env 模式没有凭据身份")
+		require.Zero(t, rows[0].CredentialVersion, "env 模式没有凭据版本")
+		require.Equal(t, "hooks.example.com", rows[0].TargetHost)
+	})
+}
+
+// TestNotifyTool_NoDeliveryRecordWithoutInvocationOrAfterFailure —— 派生记录只在
+// 「Run 内 + 执行器已注入调用 id + 发送成功」时写；记录写入失败也不得把已完成的发送
+// 改判为失败（模型重试会重复推送）。
+// The delivery row is written only for run-bound calls with an audit id after a successful
+// send; a recorder failure never turns a completed send into a failure.
+func TestNotifyTool_NoDeliveryRecordWithoutInvocationOrAfterFailure(t *testing.T) {
+	agentUID, err := core.NewAgentUID()
+	require.NoError(t, err)
+	channelUID := mustChannelUID(t)
+	baseEnv := core.ToolEnv{
+		RunID:            "webhook-1700000000002-ghi789",
+		AgentUID:         agentUID,
+		AgentName:        "digest",
+		RunBound:         true,
+		NotifyMode:       core.NotifyModeAllEligible,
+		NotifyChannels:   []string{string(channelUID)},
+		ToolInvocationID: 9,
+	}
+	newTool := func(t *testing.T, adapter *recordingNotifyAdapter,
+		deliveries *fakeNotifyDeliveries,
+	) *NotifyTool {
+		t.Helper()
+		channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+			ResourceUID: channelUID, Name: "ops", Type: "webhook", URL: "${OPS_HOOK}",
+			Scope: core.ScopeShared,
+		}}}
+		tool := newTestNotifyTool(channels,
+			&notifyPolicySpy{allowed: []string{"hooks.example.com"}},
+			map[string]NotifyAdapter{"webhook": adapter},
+			map[string]string{"OPS_HOOK": "https://hooks.example.com/T"})
+		tool.deliveries = deliveries
+		return tool
+	}
+
+	t.Run("no_audit_id_means_no_record", func(t *testing.T) {
+		deliveries := &fakeNotifyDeliveries{}
+		env := baseEnv
+		env.ToolInvocationID = 0
+		_, err := newTool(t, &recordingNotifyAdapter{}, deliveries).Execute(
+			context.Background(), env, json.RawMessage(`{"channel":"ops","content":"摘要"}`))
+		require.NoError(t, err)
+		require.Empty(t, deliveries.rows())
+	})
+
+	t.Run("non_run_call_means_no_record", func(t *testing.T) {
+		deliveries := &fakeNotifyDeliveries{}
+		env := baseEnv
+		env.RunBound = false
+		env.NotifyChannels = nil // 非 Run 调用按声明名判定；空 = 未声明（不限制）
+		_, err := newTool(t, &recordingNotifyAdapter{}, deliveries).Execute(
+			context.Background(), env, json.RawMessage(`{"channel":"ops","content":"摘要"}`))
+		require.NoError(t, err)
+		require.Empty(t, deliveries.rows(), "非 Run 调用没有审计行，不写派生记录")
+	})
+
+	t.Run("failed_send_means_no_record", func(t *testing.T) {
+		deliveries := &fakeNotifyDeliveries{}
+		adapter := &recordingNotifyAdapter{err: errors.New("推送失败")}
+		_, err := newTool(t, adapter, deliveries).Execute(
+			context.Background(), baseEnv, json.RawMessage(`{"channel":"ops","content":"摘要"}`))
+		require.Error(t, err)
+		require.Empty(t, deliveries.rows(), "发送失败没有投递")
+	})
+
+	t.Run("recorder_failure_keeps_send_success", func(t *testing.T) {
+		deliveries := &fakeNotifyDeliveries{err: errors.New("写库失败")}
+		adapter := &recordingNotifyAdapter{}
+		res, err := newTool(t, adapter, deliveries).Execute(
+			context.Background(), baseEnv, json.RawMessage(`{"channel":"ops","content":"摘要"}`))
+		require.NoError(t, err, "派生账写失败不得改判已完成的发送")
+		require.Equal(t, "已推送到通知渠道：ops", res.Content)
+		require.Equal(t, 1, adapter.count())
+	})
+}
+
+// TestNotifyTool_RunBoundNoneReportsNotifyDisabled —— R4.7 ①：`notify_mode: none`
+// 在任何查表与外呼之前按固定文案失败，错误链可被判成 `notify_disabled`。
+// R4.7 step one: none mode fails with the fixed text before the registry read and any
+// outbound call, and the error chain classifies as notify_disabled.
+func TestNotifyTool_RunBoundNoneReportsNotifyDisabled(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{Name: "ops", Type: "webhook", URL: "${OPS_HOOK}"},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{"OPS_HOOK": "https://hooks.example.com/T"})
+
+	_, err := tool.Execute(context.Background(), core.ToolEnv{
+		AgentName:  "digest",
+		RunBound:   true,
+		NotifyMode: core.NotifyModeNone,
+	}, json.RawMessage(`{"channel":"ops","content":"日报"}`))
+
+	require.Error(t, err)
+	require.True(t, core.IsNotifyDisabled(err), "none 模式归 notify_disabled")
+	require.Equal(t, "该 Agent 未启用通知（notify_mode: none）", err.Error(), "固定文案逐字")
+	require.Equal(t, 0, channels.readCount(), "none 模式不读注册表")
+	require.Equal(t, 0, policy.judgmentCount(), "none 模式不调策略判定")
+	require.Equal(t, 0, adapter.count(), "none 模式不投递")
+}
+
+// TestNotifyTool_RunBoundFreezesChannelUIDs —— R4.7 ②：Run 内只认准入时冻结的**具体
+// UID**；集合外的渠道即使已登记也按 not_found 拒绝，文案点明是冻结集合限制并只列可用名。
+// Inside a run only the frozen uids are usable; an out-of-set channel is not_found
+// naming the frozen-set limit, before any policy judgement or send.
+func TestNotifyTool_RunBoundFreezesChannelUIDs(t *testing.T) {
+	opsUID := mustChannelUID(t)
+	teamUID := mustChannelUID(t)
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{ResourceUID: opsUID, Name: "ops", Type: "webhook", URL: "${OPS_HOOK}", Scope: core.ScopeShared},
+		{ResourceUID: teamUID, Name: "team", Type: "webhook", URL: "${TEAM_HOOK}", Scope: core.ScopeShared},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{
+			"OPS_HOOK":  "https://hooks.example.com/T",
+			"TEAM_HOOK": "https://hooks.example.com/U",
+		})
+	env := core.ToolEnv{
+		AgentName:      "digest",
+		RunBound:       true,
+		NotifyMode:     core.NotifyModeAllEligible,
+		NotifyChannels: []string{string(opsUID)},
+	}
+
+	res, err := tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+	require.NoError(t, err, "冻结集合内的渠道正常发送")
+	require.Equal(t, "已推送到通知渠道：ops", res.Content)
+
+	_, err = tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"team","content":"日报"}`))
+	require.ErrorIs(t, err, fs.ErrNotExist, "集合外的渠道按 not_found 拒绝")
+	require.Contains(t, err.Error(), "不在本 Run 冻结的通知渠道集合内", "文案点明冻结集合限制")
+	require.NotContains(t, err.Error(), "不存在", "不得伪装成渠道不存在")
+	require.Contains(t, err.Error(), "（可用渠道：ops）", "可用名只列集合内的渠道")
+	require.Equal(t, 1, adapter.count(), "拒绝时零外呼")
+	require.Equal(t, 1, policy.judgmentCount(), "拒绝发生在策略判定之前")
+}
+
+// TestNotifyTool_RunBoundEmptyFrozenSetAuthorizesNothing —— R4.7：Run 内空集合**不是**
+// 「不限制」，它表示这次准入没有拿到任何渠道；任何发送请求都按 not_found 失败。
+// An empty frozen set inside a run authorizes nothing; it never means unrestricted.
+func TestNotifyTool_RunBoundEmptyFrozenSetAuthorizesNothing(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{
+		{ResourceUID: mustChannelUID(t), Name: "ops", Type: "webhook", URL: "${OPS_HOOK}"},
+	}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{"OPS_HOOK": "https://hooks.example.com/T"})
+	env := core.ToolEnv{
+		AgentName:      "digest",
+		RunBound:       true,
+		NotifyMode:     core.NotifyModeAllEligible,
+		NotifyChannels: nil,
+	}
+
+	_, err := tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.Contains(t, err.Error(), "本 Run 冻结的通知渠道集合为空或均不可用")
+	require.Equal(t, 0, adapter.count(), "空集合不得放行任何发送")
+	require.Equal(t, 0, policy.judgmentCount())
+}
+
+// TestNotifyTool_RunBoundExclusiveChannelOfAnotherAgentIsNotFound —— R4.7 ③：冻结之后
+// 渠道若变成他人专属，当前 Agent 失去资格（fail-closed，不当成"渠道不存在"以外的话术）。
+// A channel that became another agent's exclusive after admission stops working.
+func TestNotifyTool_RunBoundExclusiveChannelOfAnotherAgentIsNotFound(t *testing.T) {
+	channelUID := mustChannelUID(t)
+	otherOwner, err := core.NewAgentUID()
+	require.NoError(t, err)
+	callerUID, err := core.NewAgentUID()
+	require.NoError(t, err)
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+		ResourceUID:   channelUID,
+		Name:          "ops",
+		Type:          "webhook",
+		URL:           "${OPS_HOOK}",
+		Scope:         core.ScopeExclusive,
+		OwnerAgentUID: otherOwner,
+	}}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter},
+		map[string]string{"OPS_HOOK": "https://hooks.example.com/T"})
+	env := core.ToolEnv{
+		AgentName:      "digest",
+		AgentUID:       callerUID,
+		RunBound:       true,
+		NotifyMode:     core.NotifyModeAllEligible,
+		NotifyChannels: []string{string(channelUID)},
+	}
+
+	_, err = tool.Execute(context.Background(), env,
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.Contains(t, err.Error(), "已不在本 Agent 的可用范围内")
+	require.Equal(t, 0, adapter.count(), "失去资格不得发送")
+	require.Equal(t, 0, policy.judgmentCount())
+}
+
+// TestNotifyTool_ManagedCredentialResolvedPerSend —— R4.8：managed 渠道每次发送都重新
+// 解析当前 active 凭据（不缓存、不回退明文），地址只进适配器不进成功文案。
+// Managed channels resolve their current credential on every send; the address reaches
+// the adapter only and never the success text.
+func TestNotifyTool_ManagedCredentialResolvedPerSend(t *testing.T) {
+	const hook = "https://hooks.example.com/managed/secret"
+	channelUID := mustChannelUID(t)
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+		ResourceUID:    channelUID,
+		Name:           "ops",
+		Type:           "webhook",
+		CredentialMode: core.CredentialModeManaged,
+		CredentialID:   "cred_test",
+		Scope:          core.ScopeShared,
+	}}}
+	adapter := &recordingNotifyAdapter{}
+	credentials := &fakeNotifyCredentials{addr: hook}
+	tool := newTestNotifyToolWithCredentials(channels,
+		&notifyPolicySpy{allowed: []string{"hooks.example.com"}},
+		map[string]NotifyAdapter{"webhook": adapter}, nil, credentials)
+	env := core.ToolEnv{
+		AgentName:      "digest",
+		RunBound:       true,
+		NotifyMode:     core.NotifyModeAllEligible,
+		NotifyChannels: []string{string(channelUID)},
+	}
+
+	for range 2 {
+		res, err := tool.Execute(context.Background(), env,
+			json.RawMessage(`{"channel":"ops","content":"日报"}`))
+		require.NoError(t, err)
+		require.Equal(t, "已推送到通知渠道：ops", res.Content)
+		require.NotContains(t, res.Content, "hooks.example.com", "成功文案不含地址")
+	}
+
+	require.Equal(t, 2, credentials.callCount(), "每次发送都重新解析凭据")
+	sent := adapter.sends()
+	require.Len(t, sent, 2)
+	require.Equal(t, hook, sent[0].URL)
+}
+
+// TestNotifyTool_RevokedManagedCredentialIsNotifyDisabled —— R4.8：托管凭据撤销是终态，
+// 按 `notify_disabled` 固定文案失败，零外呼、零策略判定。
+// A revoked managed credential fails as notify_disabled with the fixed text, before any
+// policy judgement or send.
+func TestNotifyTool_RevokedManagedCredentialIsNotifyDisabled(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+		ResourceUID:    mustChannelUID(t),
+		Name:           "ops",
+		Type:           "webhook",
+		CredentialMode: core.CredentialModeManaged,
+	}}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	credentials := &fakeNotifyCredentials{
+		err: fmt.Errorf("凭据已撤销: %w", core.ErrCredentialRevoked),
+	}
+	tool := newTestNotifyToolWithCredentials(channels, policy,
+		map[string]NotifyAdapter{"webhook": adapter}, nil, credentials)
+
+	_, err := tool.Execute(context.Background(),
+		core.ToolEnv{AgentName: "digest"},
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+
+	require.Error(t, err)
+	require.True(t, core.IsNotifyDisabled(err), "撤销归 notify_disabled")
+	require.Contains(t, err.Error(), "已撤销")
+	require.Contains(t, err.Error(), "notify_disabled")
+	require.Equal(t, 0, adapter.count(), "撤销后不得发送")
+	require.Equal(t, 0, policy.judgmentCount())
+}
+
+// TestNotifyTool_ManagedWithoutResolverFailsClosed —— 装配缺凭据解析器时 managed 渠道
+// 失败关闭（不回退明文、不猜测地址），env 渠道不受影响。
+// Without a resolver every managed channel fails closed; env channels are unaffected.
+func TestNotifyTool_ManagedWithoutResolverFailsClosed(t *testing.T) {
+	channels := &fakeNotifyChannels{rows: []core.NotifyChannel{{
+		ResourceUID:    mustChannelUID(t),
+		Name:           "ops",
+		Type:           "webhook",
+		CredentialMode: core.CredentialModeManaged,
+	}}}
+	adapter := &recordingNotifyAdapter{}
+	policy := &notifyPolicySpy{allowed: []string{"hooks.example.com"}}
+	tool := newTestNotifyTool(channels, policy, map[string]NotifyAdapter{"webhook": adapter}, nil)
+
+	_, err := tool.Execute(context.Background(),
+		core.ToolEnv{AgentName: "digest"},
+		json.RawMessage(`{"channel":"ops","content":"日报"}`))
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "未装配凭据解析器")
+	require.Equal(t, 0, adapter.count())
+	require.Equal(t, 0, policy.judgmentCount())
 }

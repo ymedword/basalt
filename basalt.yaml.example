@@ -3,16 +3,22 @@
 # 用法：复制成与工作区同级的 `basalt.yaml`（不在 .basalt/ 内）后按环境改。
 # 实例配置不入库（.gitignore 已排除 /basalt.yaml）——仓库只带本样例。
 #
-# 凭证红线：一切凭证只允许 `${ENV_VAR}` 占位。加载期统一解析——
-#   变量不存在 / 解析后为空 / 替换后仍残留 `${` / 写成明文，四种情形一律拒绝启动并点名配置键。
-# Sample configuration; copy to `basalt.yaml`. Credentials MUST stay as ${ENV_VAR}
-# placeholders — plaintext values, unresolved or empty expansions are rejected at load time.
+# 凭证红线：本文件不出现任何明文凭证。两种显式模式——
+#   env     ：只允许 `${ENV_VAR}` 占位；变量不存在 / 解析后为空 / 替换后仍残留 `${` / 写成明文，
+#             四种情形一律拒绝启动并点名配置键；
+#   managed ：管理台录入，密文存 SQLite，主密钥在工作区之外（见 secrets 段）。本文件只出现服务端
+#             写入的 `credential_mode: managed` 与只读 `credential_ref: cred_...`，不出现 Key 或完整 URL。
+# Sample configuration; copy to `basalt.yaml`. No plaintext credentials ever appear here:
+# env mode uses ${ENV_VAR} placeholders (unresolved/empty/plaintext rejected at load time);
+# managed mode stores ciphertext in SQLite and only a server-written `credential_ref` in this file.
 
 # 服务段：监听地址与请求体上限（安全默认：只听本机，远程访问必须显式改）
 http:
   addr: 127.0.0.1:8080        # 缺省本机；远程部署显式改，出处 docs/contracts/openapi.yaml
   max_request_bytes: 1048576  # 请求体总上限（缺省 1 MiB，解析前拒绝）
-  allowed_domains: []         # 出网域名白名单（大小写不敏感）；消费归 US-5 的 http_get / http_post，键名出处 docs/Operations.md §2.2
+  allowed_domains: []         # 出网域名白名单的**首次种子**（大小写不敏感）：只在数据库 network_domain_policy 无行时写入；
+                              # 之后权威源是数据库，请在管理台「执行环境」编辑（保存即生效、无需重启）。改本键不覆盖已保存值。
+                              # 消费者：http_get / http_post、通知投递、MCP http 连接；边界见 docs/Operations.md §2.2
   # 管理面认证（键名出处 docs/contracts/run-and-errors.md §9.1）：serve 启动时必填；
   # chat / tool / session 等不开放 HTTP 管理面的命令不要求本段。
   admin_auth:
@@ -31,15 +37,32 @@ http:
 server:
   max_concurrent_runs: 32     # 实例并发运行上限；缺省/0 = 32，超出返回 429（准入不是限流）
 
+# 托管凭据的主密钥（US-12 范围修订；出处 docs/Operations.md §6.1）。
+# 主密钥是 AES-256-GCM 的 32 字节密钥，单独存放且路径必须在工作区之外；
+# 本文件只写路径——密钥内容不得写进 basalt.yaml、环境变量或工作区任何文件。
+# 文件格式：{"version":1,"key_id":"k_...","key":"<base64 32 bytes>"}，由 `basalt secrets init` 生成；
+# Linux 目录 0700 / 文件 0600，Windows 用等价 ACL 约束（DACL 只授予服务账号 / SYSTEM / Administrators）。
+# 纯 env 实例可整段省略；存在「当前托管模型连接」时缺失 / 权限不符 / 格式错误 → 拒绝启动并点名资源。
+secrets:
+  master_key_file: /etc/basalt/master.key   # 示例路径；不得落在工作区内
+
 # 日志档位（US-1 消费）：text = dev 可读文本；json = prod 结构化
 log:
   level: info                   # debug | info | warn | error
   format: text                  # text（dev）| json（prod）
 
-# Provider 清单：装配处一次构建「provider name → 客户端实例」显式映射表（宪法 III）
+# Provider（模型连接）清单：装配处一次构建「provider name → 客户端实例」显式映射表（宪法 III）。
+# 每条连接的凭证二选一（`credential_mode` 显式声明，不按值的形态推断）：
+#   env     —— 本文件写 `api_key: ${VAR}`；显式 `credential_mode: env` 或省略（省略只按 env 规则：
+#              非 `${VAR}` 的非空值 → 400 CREDENTIAL_MODE_REQUIRED，不隐式转 managed）；
+#   managed —— 管理台录入，密文存 SQLite；服务端在本文件写 `credential_mode: managed` 与只读
+#              `credential_ref: cred_...`，`api_key` 不再出现；客户请求体出现 `credential_ref` → 400。
+# 使用范围（`shared` / `exclusive` + 所有者 Agent）不写在本文件：
+# 由管理面 `POST /resources/model_connection/{name}/scope` 存入数据库，运行时资格 = 共享 ∪ 本人专属。
 providers:
   - name: deepseek
     base_url: https://api.deepseek.com
+    credential_mode: env    # 可选；显式写出便于与 managed 条目区分
     api_key: ${DEEPSEEK_API_KEY}
     default_model: deepseek-chat
   - name: qwen
@@ -62,7 +85,7 @@ budget:
 sandbox:
   cross_agent_read: []      # 允许读取的其它 Agent 名；缺省空 = 一个都不许
 shell:
-  allowed_commands: []      # executable 整串逐字比对；给 bash / sh 放行是被禁止的
+  allowed_commands: []      # executable 整串逐字比对；给 bash / sh 放行是被禁止的；MCP 命令必须在此列内
   interpreters: []          # 解释器受控通道：只接受 [脚本路径, 参数…] 形态
   env_passthrough: [PATH, HOME, LANG, TZ]  # 子进程不继承完整环境，只透传这些
 
@@ -70,5 +93,10 @@ shell:
 memory:
   backend: markdown
 
-# 作者模型段：键集由 US-12（Agent 动态管理）落位，本样例不预造键
+# 作者模型段（US-12）：管理台「一句话生成 Agent 文件」的单次草稿调用。
+# 删除整段即关闭一句话生成（作者功能关闭）；保留段但省略 provider / model 时启动
+# 不失败，调用该端点返回 503。temperature 缺省 0.2，闭区间 [0,2]；未知键拒绝启动。
 author:
+  provider: deepseek      # 必须是已发布模型连接的 name
+  model: deepseek-chat    # 该连接下的模型名
+  temperature: 0.2        # 可选，缺省 0.2，取值 [0,2]

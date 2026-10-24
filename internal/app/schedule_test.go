@@ -40,6 +40,10 @@ import (
 //	TestScheduleEditorAdapter_ConcurrentCrossAgentSameID —— 并发同名 id 恰一个成功（-race）
 //	TestScheduleEditorAdapter_ConcurrentWithProfilesRead —— 与 /profiles 读面并发不回写 entries（P-05）
 //	TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite —— 库内归属冲突零写入（约束 42）
+//	TestAgentArchive_SchedulesRetiredNotDeleted —— 归档注销只退休、不删行（约束 32 ②）
+//	TestAgentArchive_RollbackRestoresRetirement —— 注销回滚清 retired_at 并恢复 claim 基线
+//	TestAgentRestore_DoesNotAutoEnableSchedules —— 恢复不自动启用旧任务（约束 32）
+//	TestAgentArchive_UnregisterSerializedWithScheduleWrite —— 注销委托与写面同一把锁（约束 42）
 //
 // 全部离线：装配面的其余部分（模型 / MCP）不参与本组用例。
 // Every case stays offline; no real model or network call is involved.
@@ -429,7 +433,7 @@ func newScheduleTestScheduler(t *testing.T, cfg *cli.Config, entries []core.Agen
 		logger: slog.Default(),
 		now:    func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
 	}
-	sched := a.newScheduler(store, invoker, entries, cfg, slog.Default())
+	sched := a.newScheduler(store, invoker, entries, nil, cfg, slog.Default())
 	return sched, invoker, store
 }
 
@@ -699,6 +703,236 @@ func TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Equal(t, "他家的任务", rows[0].Message, "不得走到 ReconcileAgent（库行原样）")
+}
+
+// TestAgentArchive_SchedulesRetiredNotDeleted 覆盖约束 32 的②（模块卡 §3.2.1
+// schedule_test.go 的注销用例）：归档注销 = SetRegistered(false) + ReconcileAgent(nil)，
+// 任务行只写 retired_at、不物理删除，定义与启停原样保留；重复注销幂等。
+// 逆改点：把退休实现成物理删除 → 行数断言红；退休翻转 enabled → 断言红。
+func TestAgentArchive_SchedulesRetiredNotDeleted(t *testing.T) {
+	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")},
+		storage.NewTaskStore(openScheduleDB(t)))
+
+	before := f.rowsFor(t, "demo")
+	require.Len(t, before, 1)
+	require.True(t, before["demo-1"].RetiredAt.IsZero(), "启动对账后任务行未退休")
+
+	require.NoError(t, f.adapter.SetRegistered("demo", false))
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
+
+	after := f.rowsFor(t, "demo")
+	require.Len(t, after, 1, "归档注销不得物理删除任务行（约束 32）")
+	row := after["demo-1"]
+	require.False(t, row.RetiredAt.IsZero(), "归档注销必须写 retired_at")
+	require.Equal(t, before["demo-1"].Cron, row.Cron, "退休保留 cron 定义")
+	require.Equal(t, before["demo-1"].Message, row.Message, "退休保留 message 定义")
+	require.Equal(t, before["demo-1"].Zone, row.Zone)
+	require.Equal(t, before["demo-1"].Enabled, row.Enabled, "退休不得翻转 enabled")
+
+	require.NoError(t, f.adapter.SetRegistered("demo", false))
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
+	again := f.rowsFor(t, "demo")
+	require.Len(t, again, 1)
+	require.Equal(t, row.RetiredAt, again["demo-1"].RetiredAt, "重复注销不改已退休行")
+}
+
+// TestAgentArchive_RollbackRestoresRetirement 覆盖约束 32 的④回滚：注销后按
+// restoreArchiveRegistration 的同一顺序回滚——先 ReconcileAgent(旧定义) 清 retired_at，
+// 再 SetRegistered(true) 放回注册集合——任务行恢复为未退休，私有 claim 基线也一并恢复
+// （其他 Agent 再写同名 id 必须被归属预检拒绝）。
+// 逆改点：回滚不清 retired_at → 未退休断言红；回滚不恢复 claim 基线 → other 写入成功、
+// IsInvalidInput 断言红。
+func TestAgentArchive_RollbackRestoresRetirement(t *testing.T) {
+	entries := []core.AgentEntry{demoEntry("demo-1"), registeredEntry("other")}
+	f := newArchiveScheduleFixture(t, entries, storage.NewTaskStore(openScheduleDB(t)))
+	schedules := entries[0].Profile.Schedules
+
+	require.NoError(t, f.adapter.SetRegistered("demo", false))
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
+	retired := f.rowsFor(t, "demo")
+	require.False(t, retired["demo-1"].RetiredAt.IsZero())
+
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", schedules))
+	require.NoError(t, f.adapter.SetRegistered("demo", true))
+
+	restored := f.rowsFor(t, "demo")
+	require.True(t, restored["demo-1"].RetiredAt.IsZero(), "回滚必须清 retired_at")
+
+	_, err := f.adapter.ApplySchedule(context.Background(), "other", core.ScheduleSet,
+		core.Schedule{ID: "demo-1", Cron: "*/9 * * * * *", Message: "抢占"})
+	require.True(t, core.IsInvalidInput(err), "回滚后 claim 基线必须恢复：%v", err)
+	require.Contains(t, err.Error(), "demo", "拒绝 detail 必须点名原 owner")
+
+	rows, listErr := f.store.ListTasks(context.Background())
+	require.NoError(t, listErr)
+	require.Len(t, rows, 1, "被拒写入不得新增任务行")
+}
+
+// TestAgentRestore_DoesNotAutoEnableSchedules 覆盖"恢复不自动启用"（约束 32 / 模块卡
+// §3.2.1 schedule_test.go 的恢复用例）：归档注销后，恢复动作本身不触碰调度器；即使
+// 恢复后的 Agent 再经热加载重新登记（SetRegistered(true) + 以恢复文件里的空定义对账），
+// 旧任务行也必须保持 retired——重新启用只能由显式任务定义驱动。
+// 逆改点：注销后再次登记 / 空定义对账清掉 retired_at → 断言红。
+func TestAgentRestore_DoesNotAutoEnableSchedules(t *testing.T) {
+	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")},
+		storage.NewTaskStore(openScheduleDB(t)))
+
+	require.NoError(t, f.adapter.SetRegistered("demo", false))
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
+	retired := f.rowsFor(t, "demo")
+	require.False(t, retired["demo-1"].RetiredAt.IsZero())
+
+	require.NoError(t, f.adapter.SetRegistered("demo", true))
+	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
+
+	after := f.rowsFor(t, "demo")
+	require.Len(t, after, 1)
+	require.Equal(t, retired["demo-1"].RetiredAt, after["demo-1"].RetiredAt,
+		"恢复不自动启用：重新登记 + 空定义对账不得清 retired_at")
+}
+
+// gatedTaskStore 是 core.TaskStore 的阻塞探针：arm 之后第一次 ListTasks 停在 release
+// 上，用来把 SetRegistered(false) 的调度器委托卡在适配器临界区内部。
+// gatedTaskStore blocks the first ListTasks after arm so the unregister delegation can
+// be held inside the adapter's critical section.
+type gatedTaskStore struct {
+	core.TaskStore
+
+	mu      sync.Mutex
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+// newGatedTaskStore 包装真实仓储并预置同步通道。
+// newGatedTaskStore wraps a real store and prepares the gate channels.
+func newGatedTaskStore(inner core.TaskStore) *gatedTaskStore {
+	return &gatedTaskStore{
+		TaskStore: inner,
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+}
+
+// arm 让下一次 ListTasks 阻塞（只拦一次）。
+// arm blocks the next ListTasks call once.
+func (s *gatedTaskStore) arm() {
+	s.mu.Lock()
+	s.armed = true
+	s.mu.Unlock()
+}
+
+// ListTasks 在 armed 时通知 entered 并等待 release，之后转发真实仓储。
+// ListTasks announces the gate and waits for release before delegating.
+func (s *gatedTaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
+	s.mu.Lock()
+	block := s.armed
+	s.armed = false
+	s.mu.Unlock()
+	if block {
+		close(s.entered)
+		<-s.release
+	}
+	return s.TaskStore.ListTasks(ctx)
+}
+
+// TestAgentArchive_UnregisterSerializedWithScheduleWrite 覆盖约束 42 的写锁顺序：
+// SetRegistered(false) 的调度器委托必须在 adapter.mu 内完成——注销进行中（阻塞在任务
+// 仓储读取上）时，并发 manage_schedule 写入既不得落盘也不得返回；注销结束后写入按序
+// 成功。反向：写入线程先落盘再等注销 → 文件断言红。
+// 逆改点：调度器委托移到锁外（旧实现）→ 写入在注销期间完成并改写文件，断言红。
+func TestAgentArchive_UnregisterSerializedWithScheduleWrite(t *testing.T) {
+	gated := newGatedTaskStore(storage.NewTaskStore(openScheduleDB(t)))
+	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")}, gated)
+	before := readAgentFixture(t, f.root, "demo")
+
+	release := sync.OnceFunc(func() { close(gated.release) })
+	defer release()
+
+	gated.arm()
+	unregisterDone := make(chan error, 1)
+	go func() {
+		unregisterDone <- f.adapter.SetRegistered("demo", false)
+	}()
+	<-gated.entered
+
+	writeStarted := make(chan struct{})
+	writeDone := make(chan error, 1)
+	go func() {
+		close(writeStarted)
+		_, err := f.adapter.ApplySchedule(context.Background(), "demo", core.ScheduleSet,
+			core.Schedule{ID: "demo-2", Cron: "*/3 * * * * *", Message: "归档期间的写入"})
+		writeDone <- err
+	}()
+	<-writeStarted
+
+	select {
+	case err := <-writeDone:
+		t.Fatalf("注销临界区内 schedule 写入已完成（err=%v）：写锁没有覆盖调度器委托", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	require.Equal(t, before, readAgentFixture(t, f.root, "demo"), "注销临界区内不得落盘")
+
+	release()
+	require.NoError(t, <-unregisterDone)
+	require.NoError(t, <-writeDone, "注销结束后写入必须按序成功")
+}
+
+// archiveScheduleFixture 是归档注销 / 恢复联动的夹具：真实写入门 + 已 Start 的真实
+// 调度器（探针引擎，不触发运行）+ 真实任务仓储，并暴露根目录供字节级对照。
+// archiveScheduleFixture wires the real write gate, a started scheduler with a probe
+// engine, and a real task store for the archive/restore linkage cases.
+type archiveScheduleFixture struct {
+	root    string
+	adapter *scheduleEditorAdapter
+	store   core.TaskStore
+}
+
+// newArchiveScheduleFixture 构造夹具并为每个条目落一份最小 AGENT.md。
+// newArchiveScheduleFixture builds the fixture and writes one minimal AGENT.md per entry.
+func newArchiveScheduleFixture(t *testing.T, entries []core.AgentEntry, store core.TaskStore) *archiveScheduleFixture {
+	t.Helper()
+
+	root := t.TempDir()
+	for _, entry := range entries {
+		writeAgentFixture(t, root, entry.Name)
+	}
+	sched := core.NewScheduler(core.SchedulerOptions{
+		Store:      store,
+		Invoker:    &scheduleTestInvoker{},
+		Engine:     &orderProbeEngine{},
+		Entries:    entries,
+		CronSpec:   workspace.CronSpec,
+		RunTimeout: scheduleRunTimeout,
+		StopGrace:  scheduleStopGrace,
+		Logger:     slog.Default(),
+		Now:        func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
+	})
+	require.NoError(t, sched.Start(context.Background()))
+	t.Cleanup(sched.Stop)
+
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{Logger: slog.Default()})
+	return &archiveScheduleFixture{
+		root:    root,
+		adapter: newScheduleEditorAdapter(loader, root, entries, sched, slog.Default()),
+		store:   store,
+	}
+}
+
+// rowsFor 返回库内该 Agent 的任务行（按 task_id 索引）。
+// rowsFor returns the agent's task rows keyed by task id.
+func (f *archiveScheduleFixture) rowsFor(t *testing.T, agent string) map[string]core.TaskRecord {
+	t.Helper()
+
+	rows, err := f.store.ListTasks(context.Background())
+	require.NoError(t, err)
+	out := make(map[string]core.TaskRecord, len(rows))
+	for _, row := range rows {
+		if row.Agent == agent {
+			out[row.TaskID] = row
+		}
+	}
+	return out
 }
 
 // writeAgentFixture 落一份最小可写的 AGENT.md（合法 frontmatter、无 schedules 块），

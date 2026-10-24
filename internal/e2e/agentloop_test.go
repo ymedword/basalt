@@ -352,9 +352,19 @@ func testAgentLoopSkillL1(t *testing.T) {
 	}
 	system := systemPrompt(t, reqs[0])
 	requireContains(t, system, "## 技能", "段一技能小节")
-	requireContains(t, system,
-		"- digest-format：把内容整理成三段摘要（.basalt/versions/skills/digest-format/1/SKILL.md）",
-		"L1 卡片三要素逐字")
+	// 新发布的技能版本目录按身份分段：<name>/<resource_uid>/<version_no>（2026-10-23
+	// 裁定）。身份由基线随机分配，这里判形态——前缀逐字、身份段是合法的 `rs_` 载荷、
+	// 版本号与文件名逐字。
+	const cardPrefix = "- digest-format：把内容整理成三段摘要（.basalt/versions/skills/digest-format/"
+	requireContains(t, system, cardPrefix, "L1 卡片三要素逐字")
+	rest := system[strings.Index(system, cardPrefix)+len(cardPrefix):]
+	uid, _, ok := strings.Cut(rest, "/1/SKILL.md）")
+	if !ok {
+		t.Fatalf("L1 卡片真路径必须以 <resource_uid>/1/SKILL.md 收尾，实际：%q", rest[:min(len(rest), 80)])
+	}
+	if !strings.HasPrefix(uid, "rs_") || len(uid) != len("rs_")+26 || strings.ContainsAny(uid, `/\`) {
+		t.Fatalf("版本目录的身份段必须是合法的资源 UID，实际：%q", uid)
+	}
 	requireAbsent(t, system, bodySentinel, "SKILL.md 正文不得预载进段一")
 }
 

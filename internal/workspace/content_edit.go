@@ -33,6 +33,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/goccy/go-yaml"
 
@@ -116,6 +118,18 @@ type AgentEditorDeps struct {
 	Scheduler ScheduleReconciler
 	// Validate 是装载期校验与发布闸门：返回 (entry, 段一正文, 冻结清单, error)。
 	Validate func(ctx context.Context, agent string, candidate []byte) (core.AgentEntry, string, []core.ManifestEntry, error)
+	// ValidateBindings 是保存期的资源绑定校验（颗粒度文档 R4.3 的写语义：存在 /
+	// 当前指针 / 已发布 / 有资格 / 凭据可用）。装载期只做结构校验，资源状态在数据库里，
+	// workspace 不依赖仓储——由装配层注入；nil 时跳过（只读 / 轻量装配面）。
+	// ValidateBindings is the save-time binding check injected by the assembly layer;
+	// the workspace package never reaches into the resource stores itself.
+	ValidateBindings func(ctx context.Context, agent string, profile *core.Profile) error
+	// AssembleTools 是受控工具装配（R7 / 宪法约束 11）：在结构化补丁落到候选字节之后、
+	// 装载期校验之前调用，输入补丁后的 profile，返回最终 tools 与需要回显的增删。
+	// 只有 `notify` 允许被自动增删；nil 时跳过（只读 / 轻量装配面）。
+	// AssembleTools is the controlled tool assembly injected by the assembly layer;
+	// its only allowed delta is notify, and a nil hook skips assembly.
+	AssembleTools func(ctx context.Context, agent string, profile *core.Profile) (tools []string, change core.ToolChange, err error)
 	// Now 是注入时钟；nil 时退回 time.Now。
 	Now func() time.Time
 }
@@ -132,6 +146,8 @@ type AgentEditor struct {
 	registry  EntryReplacer
 	scheduler ScheduleReconciler
 	validate  func(ctx context.Context, agent string, candidate []byte) (core.AgentEntry, string, []core.ManifestEntry, error)
+	bindings  func(ctx context.Context, agent string, profile *core.Profile) error
+	assemble  func(ctx context.Context, agent string, profile *core.Profile) ([]string, core.ToolChange, error)
 	now       func() time.Time
 	rename    renameFunc
 }
@@ -154,6 +170,8 @@ func NewAgentEditor(deps AgentEditorDeps) *AgentEditor {
 		registry:  deps.Registry,
 		scheduler: deps.Scheduler,
 		validate:  deps.Validate,
+		bindings:  deps.ValidateBindings,
+		assemble:  deps.AssembleTools,
 		now:       deps.Now,
 	}
 }
@@ -266,10 +284,35 @@ func (e *AgentEditor) UpdateContent(ctx context.Context, agent string, update co
 			return core.AgentFiles{}, err
 		}
 	}
+	// 受控工具装配（R7 / 宪法约束 11）：结构化补丁与整份原文都是受控写面，候选字节
+	// 先按补丁后的通知意图装配 `notify`，再进装载期校验。系统改动只允许 notify 一项，
+	// 且必须随保存结果带回；整份原文路径同样如此——用户手动写对时是无操作，
+	// 写错时给出可执行的下一步而不是静默保留不一致。
+	// Controlled tool assembly runs on every candidate (patch or whole-file); notify is
+	// the only name the system may add or remove, and the delta is always returned.
+	toolChange, err := e.assembleCandidateTools(ctx, agent, &candidate)
+	if err != nil {
+		return core.AgentFiles{}, err
+	}
 
 	entry, section, manifest, err := e.validateCandidate(ctx, agent, candidate)
 	if err != nil {
+		// 装载期的类型化拒绝原样上抛：HTTP 层据此按分类出中文文案（SC-033），
+		// 包成 InvalidInputError 会把英文摘要当作用户可见原因。
+		// Typed load-time rejections pass through so the HTTP layer can localize them.
+		var rejected *core.AgentDefinitionRejectedError
+		if errors.As(err, &rejected) {
+			return core.AgentFiles{}, err
+		}
 		return core.AgentFiles{}, &core.InvalidInputError{Tool: "agent.content", Reason: err.Error()}
+	}
+	// 保存期绑定校验排在**任何目标写入之前**（卡 R4.3 的校验顺序）：装载期只保证结构
+	// 合法，资源存在性 / 当前指针 / 已发布 / 资格 / 凭据在仓储里。错误原样上抛——绑定
+	// 哨兵由 HTTP 层映射成四条 400 专用码，包成 InvalidInputError 会丢掉「该修哪一处」。
+	// The save-time binding check runs before any target write; its sentinels pass
+	// through untouched so the HTTP layer keeps the four dedicated 400 codes.
+	if err := e.validateBindings(ctx, agent, entry.Profile); err != nil {
+		return core.AgentFiles{}, err
 	}
 
 	now := e.nowFn()
@@ -352,7 +395,66 @@ func (e *AgentEditor) UpdateContent(ctx context.Context, agent string, update co
 		slog.Default().Error("内容写成功但文件清单读取失败", "agent", agent, "operation_id", opID, "error", err)
 		return core.AgentFiles{}, fmt.Errorf("读取 Agent 文件清单（operation %s）: %w", opID, err)
 	}
-	return core.AgentFiles{Agent: agent, Files: files}, nil
+	return core.AgentFiles{Agent: agent, Files: files, Changes: toolChange}, nil
+}
+
+// assembleCandidateTools 在候选字节上执行受控工具装配（R7 / 宪法约束 11）：
+// 解析候选 frontmatter 得到补丁后的通知意图，交给装配层决定最终 `tools`；有变更时
+// 再用**只含 tools 一项**的行级补丁改写候选（其余字节逐字保留），并把增删原样带回。
+//
+// 三条边界：
+//   - 候选本身不可解析时不装配——交给装载期校验给出标准拒绝文案，不在这里抢答；
+//   - 装配层返回 `notify` 之外的任何工具名即视为实现漂移，直接拒绝（系统不得自动
+//     增删其他工具）；
+//   - 需要变更但 `tools` 段无法安全改写（注释 / 流式集合）时拒绝并点名下一步，
+//     不静默保留不一致；用户手动写对后重试即无变更、不再需要改写。
+//
+// assembleCandidateTools applies the controlled tool assembly to the candidate and
+// re-patches only the tools line when the assembly reports a delta.
+func (e *AgentEditor) assembleCandidateTools(ctx context.Context, agent string, candidate *[]byte) (core.ToolChange, error) {
+	if e.assemble == nil {
+		return core.ToolChange{}, nil
+	}
+	profile, _, err := parseFrontmatter(*candidate)
+	if err != nil {
+		return core.ToolChange{}, nil
+	}
+	tools, change, err := e.assemble(ctx, agent, profile)
+	if err != nil {
+		return core.ToolChange{}, fmt.Errorf("受控工具装配: %w", err)
+	}
+	if err := checkToolChange(change); err != nil {
+		return core.ToolChange{}, err
+	}
+	if change.Empty() {
+		return change, nil
+	}
+	patched, err := ApplyChanges(*candidate, core.AgentContentChanges{Tools: &tools})
+	if err != nil {
+		if errors.Is(err, ErrEditUnsupported) {
+			reason := strings.TrimPrefix(err.Error(), ErrEditUnsupported.Error()+": ")
+			return core.ToolChange{}, &core.InvalidInputError{
+				Tool: "agent.content",
+				Reason: "通知意图要求自动调整 tools 中的 notify，但 tools 段无法安全改写（" + reason +
+					"）；请在 tools 中手动加入或移除 notify 后重试",
+			}
+		}
+		return core.ToolChange{}, err
+	}
+	*candidate = patched
+	return change, nil
+}
+
+// checkToolChange 强制"系统自动增删的唯一工具名是 notify"（宪法约束 11）：
+// 装配层若能返回别的名字，这条不变量就只剩注释。
+// checkToolChange enforces notify as the only name the system may auto-add or remove.
+func checkToolChange(change core.ToolChange) error {
+	for _, name := range append(slices.Clone(change.Added), change.Removed...) {
+		if name != core.NotifyToolName {
+			return fmt.Errorf("受控工具装配返回了不允许的工具名 %q（只允许 %q）", name, core.NotifyToolName)
+		}
+	}
+	return nil
 }
 
 // requireWriteDeps 在动任何文件之前确认写路径装配完整：缺依赖是装配错误，
@@ -381,13 +483,23 @@ func (e *AgentEditor) validateCandidate(ctx context.Context, agent string, candi
 		return core.AgentEntry{}, "", nil, err
 	}
 	if !entry.Registered || entry.Profile == nil {
-		reason := entry.RejectReason
-		if reason == "" {
-			reason = "候选配置未通过装载期校验"
-		}
-		return core.AgentEntry{}, "", nil, errors.New(reason)
+		// 校验器返回 nil 错误却给出未注册条目：生产路径的拒绝已由
+		// `ValidateCandidate` 以类型化错误上抛，走到这里只可能是装配注入的校验器。
+		// 文案固定中文，不把条目里的英文 reason 回显给用户。
+		return core.AgentEntry{}, "", nil, errors.New("候选配置未通过装载期校验")
 	}
 	return entry, section, manifest, nil
+}
+
+// validateBindings 调用装配层注入的保存期绑定校验；未注入时跳过（workspace 不持有
+// 资源仓储，缺省装配面只做装载期校验）。
+// validateBindings delegates to the injected save-time check and is a no-op when the
+// assembly did not provide one.
+func (e *AgentEditor) validateBindings(ctx context.Context, agent string, profile *core.Profile) error {
+	if e.bindings == nil {
+		return nil
+	}
+	return e.bindings(ctx, agent, profile)
 }
 
 // rollbackContent 按约束 27 回滚后置失败：文件 → 注册表 → 调度。回滚不依赖请求
@@ -614,6 +726,27 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 			return nil, err
 		}
 	}
+	if changes.DisplayName != nil {
+		value := strings.TrimSpace(*changes.DisplayName)
+		if err := validateDisplayName(value); err != nil {
+			return nil, &core.InvalidInputError{Tool: "agent.content", Reason: err.Error()}
+		}
+		if value == "" {
+			// 空串 = 移除该行（回到回退技术名）；字段不存在时是空操作。
+			if raw, err = removeTopScalarField(raw, "display_name"); err != nil {
+				return nil, err
+			}
+		} else if raw, err = patchScalarField(raw, "display_name", yamlQuote(value)); err != nil {
+			return nil, err
+		}
+	}
+	if changes.NotifyMode != nil {
+		// 字面量合法性由装载期规则 10 判定（与其他字段同一道闸门）：补丁只负责
+		// 把值写进 frontmatter，若非法则候选行校验失败、磁盘零写入。
+		if raw, err = patchScalarField(raw, "notify_mode", yamlQuote(string(*changes.NotifyMode))); err != nil {
+			return nil, err
+		}
+	}
 	if changes.Identity != nil {
 		var leaves []patchLeaf
 		if changes.Identity.AgentName != nil {
@@ -622,12 +755,16 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 		if changes.Identity.Prompt != nil {
 			leaves = append(leaves, patchLeaf{"prompt", yamlQuote(*changes.Identity.Prompt)})
 		}
-		if raw, err = patchMapField(raw, "identity", leaves); err != nil {
+		if raw, err = patchMapField(raw, "identity", leaves, nil); err != nil {
 			return nil, err
 		}
 	}
 	if changes.Provider != nil {
+		if changes.Provider.Temperature != nil && changes.Provider.ClearTemperature {
+			return nil, fmt.Errorf("%w: provider.temperature 不能同时写值与清除", ErrEditUnsupported)
+		}
 		var leaves []patchLeaf
+		var removals []string
 		if changes.Provider.Name != nil {
 			leaves = append(leaves, patchLeaf{"name", yamlQuote(*changes.Provider.Name)})
 		}
@@ -637,7 +774,10 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 		if changes.Provider.Temperature != nil {
 			leaves = append(leaves, patchLeaf{"temperature", strconv.FormatFloat(*changes.Provider.Temperature, 'f', -1, 64)})
 		}
-		if raw, err = patchMapField(raw, "provider", leaves); err != nil {
+		if changes.Provider.ClearTemperature {
+			removals = append(removals, "temperature")
+		}
+		if raw, err = patchMapField(raw, "provider", leaves, removals); err != nil {
 			return nil, err
 		}
 	}
@@ -649,11 +789,24 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 		{"skills", changes.Skills},
 		{"mcp_servers", changes.MCPServers},
 		{"bootstrap", changes.Bootstrap},
+		{"notify_channels", changes.NotifyChannels},
 	} {
 		if seq.items == nil {
 			continue
 		}
 		if raw, err = patchSequenceField(raw, seq.key, *seq.items); err != nil {
+			return nil, err
+		}
+	}
+	// `changes.bindings` 是整块替换（契约 agent-md §2.3）：nil = 不改；非 nil（含
+	// 空切片）= 以数组为唯一内容重写 `resource_bindings`。**不**按名称重新解析 UID、
+	// **不**与现有块按名合并——UID 只能来自请求体里显式给出的值。
+	if changes.Bindings != nil {
+		bindings, bindErr := bindingsFromChanges(changes.Bindings)
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		if raw, err = PatchResourceBindings(raw, bindings); err != nil {
 			return nil, err
 		}
 	}
@@ -665,7 +818,7 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 		if changes.Settings.MaxHistoryTurns != nil {
 			leaves = append(leaves, patchLeaf{"max_history_turns", strconv.Itoa(*changes.Settings.MaxHistoryTurns)})
 		}
-		if raw, err = patchMapField(raw, "settings", leaves); err != nil {
+		if raw, err = patchMapField(raw, "settings", leaves, nil); err != nil {
 			return nil, err
 		}
 	}
@@ -674,10 +827,71 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 			return nil, err
 		}
 	}
+	// 正文替换放在最后：前面的补丁按行定位、行号随替换而变，先把 frontmatter 改完
+	// 再整段换正文，避免两套偏移计算互相干扰。
+	if changes.Body != nil {
+		if raw, err = patchBodyField(raw, *changes.Body); err != nil {
+			return nil, err
+		}
+	}
 	if err := verifyPatched(original, raw, bodyBefore, changes); err != nil {
 		return nil, err
 	}
 	return raw, nil
+}
+
+// patchBodyField 整段替换围栏外正文（契约 agent-md §2.3）：frontmatter 与闭合围栏
+// 逐字节保留，围栏之后的内容替换为给定字符串；空串 = 清空正文。围栏与正文之间保留
+// 一个空行分隔（与 `splitFrontmatter` 的切分口径一致：分隔空行不属于正文）。
+// patchBodyField replaces everything after the closing fence and keeps the frontmatter
+// bytes untouched; an empty string clears the body.
+func patchBodyField(raw []byte, body string) ([]byte, error) {
+	f, err := parseFenced(raw)
+	if err != nil {
+		return nil, err
+	}
+	prefix := strings.Join(f.lines[:f.closing+1], "")
+	if !strings.HasSuffix(prefix, "\n") {
+		prefix += f.newline
+	}
+	if body == "" {
+		return []byte(prefix), nil
+	}
+	return []byte(prefix + f.newline + body + f.newline), nil
+}
+
+// bindingsFromChanges 把补丁元素按 `resource_kind` 分组为绑定块领域形态：顺序
+// 保留请求体给出的次序，类别字面量、UID 格式、同名 / 同 UID 重复全部在
+// `core.ResourceBindings.Validate` 里判定，错误包装
+// `core.ErrAgentResourceBindingInvalid`（保存期据此回 400）。
+// bindingsFromChanges groups the patch entries by kind and validates them; the
+// literals are never reinterpreted and no uid is resolved from a name.
+func bindingsFromChanges(changes []core.BindingChange) (core.ResourceBindings, error) {
+	out := core.ResourceBindings{}
+	for _, change := range changes {
+		kind, err := core.ParseBindingKind(string(change.ResourceKind))
+		if err != nil {
+			return core.ResourceBindings{}, err
+		}
+		uid, err := core.ParseResourceUID(string(change.ResourceUID))
+		if err != nil {
+			// 统一包装成绑定错误哨兵：保存期的 400 只有一个可映射的类别。
+			return core.ResourceBindings{}, fmt.Errorf(
+				"%w: %s 绑定 %q 的 UID 非法: %w",
+				core.ErrAgentResourceBindingInvalid, kind, change.RefName, err)
+		}
+		entry := core.ResourceBinding{Name: change.RefName, UID: uid}
+		switch kind {
+		case core.BindingModelConnection:
+			out.ModelConnections = append(out.ModelConnections, entry)
+		case core.BindingNotifyChannel:
+			out.NotifyChannels = append(out.NotifyChannels, entry)
+		}
+	}
+	if err := out.Validate(); err != nil {
+		return core.ResourceBindings{}, err
+	}
+	return out, nil
 }
 
 // patchLeaf 是一个待写入的映射叶子：键名 + 已渲染的单行 YAML 标量。
@@ -879,6 +1093,48 @@ func patchScalarField(raw []byte, key, rendered string) ([]byte, error) {
 	return f.bytes(), nil
 }
 
+// removeTopScalarField 删除一个顶层标量键的整行：键缺失是空操作（字节与 ETag 都不变），
+// 多行值拒绝——删除只能整行进行，**不得**只删首行留下悬空缩进。
+// removeTopScalarField deletes one top-level scalar line; absent is a no-op and a
+// multi-line value refuses the patch.
+func removeTopScalarField(raw []byte, key string) ([]byte, error) {
+	f, err := parseFenced(raw)
+	if err != nil {
+		return nil, err
+	}
+	blk, found, err := f.locateTopBlock(key)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return f.bytes(), nil
+	}
+	if blk.end > blk.start+1 {
+		return nil, fmt.Errorf("%w: %s 含多行值", ErrEditUnsupported, key)
+	}
+	return f.replaceRange(blk.start, blk.end, "")
+}
+
+// displayNameMaxRunes 是展示名的长度上限（R6）；只约束结构化写面，装载期不判。
+// displayNameMaxRunes caps the display name on the structured write surface only.
+const displayNameMaxRunes = 64
+
+// validateDisplayName 校验结构化写面的展示名：去首尾空白后 ≤ 64 个字符且不含控制
+// 字符。空串合法（= 清除）。**不**在装载期调用——显示字段不阻断运行。
+// validateDisplayName checks the structured write surface only; the loader never
+// rejects an agent because of a display-only field.
+func validateDisplayName(value string) error {
+	if count := utf8.RuneCountInString(value); count > displayNameMaxRunes {
+		return fmt.Errorf("display_name 最多 %d 个字符（当前 %d 个）", displayNameMaxRunes, count)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return errors.New("display_name 不得包含控制字符或换行")
+		}
+	}
+	return nil
+}
+
 // mapChild 是映射块内的一行子项。
 // mapChild records one `key: value` child line of a map block.
 type mapChild struct {
@@ -890,8 +1146,8 @@ type mapChild struct {
 // patchMapField 改写映射块内的叶子：已存在的键只换值（保留该行的缩进与行尾），
 // 缺失的键按块内缩进补在块尾；块本身不存在时整块插在收尾围栏之前。
 // patchMapField rewrites existing leaves in place and appends missing ones to the block.
-func patchMapField(raw []byte, key string, leaves []patchLeaf) ([]byte, error) {
-	if len(leaves) == 0 {
+func patchMapField(raw []byte, key string, leaves []patchLeaf, removals []string) ([]byte, error) {
+	if len(leaves) == 0 && len(removals) == 0 {
 		return raw, nil
 	}
 	f, err := parseFenced(raw)
@@ -903,6 +1159,9 @@ func patchMapField(raw []byte, key string, leaves []patchLeaf) ([]byte, error) {
 		return nil, err
 	}
 	if !found {
+		if len(leaves) == 0 {
+			return raw, nil // 只要求清除、但块本来就不存在：目标状态已满足。
+		}
 		var b strings.Builder
 		b.WriteString(key + ":" + f.newline)
 		for _, leaf := range leaves {
@@ -919,6 +1178,39 @@ func patchMapField(raw []byte, key string, leaves []patchLeaf) ([]byte, error) {
 	existing := make(map[string]int, len(children))
 	for _, child := range children {
 		existing[child.key] = child.index
+	}
+	// 先处理清除（行号会随之变化，按索引倒序删除）；叶子写入再按剩余行定位。
+	removed := 0
+	for _, name := range removals {
+		at, ok := existing[name]
+		if !ok {
+			continue
+		}
+		f.lines = append(f.lines[:at], f.lines[at+1:]...)
+		delete(existing, name)
+		removed++
+	}
+	if removed > 0 {
+		// 删除后重新扫描块边界与子项，避免使用过期行号。
+		blk, found, err = f.locateTopBlock(key)
+		if err != nil {
+			return nil, err
+		}
+		if !found || blk.end == blk.start+1 {
+			// 唯一的子项被清掉：连同顶层键一起删除，避免留下 `provider:` 空值。
+			if found {
+				f.lines = append(f.lines[:blk.start], f.lines[blk.end:]...)
+			}
+			return f.bytes(), nil
+		}
+		children, indent, err = f.scanMapBlock(key, blk)
+		if err != nil {
+			return nil, err
+		}
+		existing = make(map[string]int, len(children))
+		for _, child := range children {
+			existing[child.key] = child.index
+		}
 	}
 	for _, leaf := range leaves {
 		if at, ok := existing[leaf.key]; ok {
@@ -1275,9 +1567,10 @@ func lineTerminator(line string) string {
 	}
 }
 
-// verifyPatched 是补丁的**回读闸门**：正文逐字节不变、frontmatter 仍可解析、
-// 每个被改字段回读等于请求值；任一不符 → ErrEditUnsupported（宁可拒绝，不静默
-// 落一份与请求不一致的配置）。正文比较挡住"补丁越过围栏"这类结构性错误。
+// verifyPatched 是补丁的**回读闸门**：正文逐字节不变（显式给 `body` 时改为核对
+// 替换结果）、frontmatter 仍可解析、每个被改字段回读等于请求值；任一不符 →
+// ErrEditUnsupported（宁可拒绝，不静默落一份与请求不一致的配置）。正文比较挡住
+// "补丁越过围栏"这类结构性错误。
 // verifyPatched re-reads the candidate: body bytes unchanged, frontmatter parses,
 // and every requested field round-trips; otherwise the patch is refused.
 func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentContentChanges) error {
@@ -1285,7 +1578,9 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 	if err != nil {
 		return fmt.Errorf("%w: 补丁后 frontmatter 不可解析: %w", ErrEditUnsupported, err)
 	}
-	if !bytes.Equal(bodyBefore, bodyAfter) {
+	// `changes.body` 显式给出时正文本来就该变：此时不做「逐字节不变」比较，改在
+	// 回读阶段核对替换结果与请求值一致（见下方 body 分支）。
+	if changes.Body == nil && !bytes.Equal(bodyBefore, bodyAfter) {
 		return fmt.Errorf("%w: 补丁改变了围栏外正文", ErrEditUnsupported)
 	}
 
@@ -1303,6 +1598,17 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 
 	if changes.Description != nil && dto.Description != *changes.Description {
 		return mismatch("description")
+	}
+	if changes.DisplayName != nil {
+		want := strings.TrimSpace(*changes.DisplayName)
+		if strings.TrimSpace(dto.DisplayName) != want {
+			return mismatch("display_name")
+		}
+	}
+	// 正文按 splitFrontmatter 的口径比较（首尾空白行不计入正文），与整份原文保存
+	// 走同一把回读闸门：落盘字节必须就是请求给的那一段。
+	if changes.Body != nil && string(bodyAfter) != strings.Trim(*changes.Body, "\r\n") {
+		return mismatch("body")
 	}
 	if changes.Identity != nil {
 		if changes.Identity.AgentName != nil && dto.Identity.AgentName != *changes.Identity.AgentName {
@@ -1323,6 +1629,9 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 			(dto.Provider.Temperature == nil || *dto.Provider.Temperature != *changes.Provider.Temperature) {
 			return mismatch("provider.temperature")
 		}
+		if changes.Provider.ClearTemperature && dto.Provider.Temperature != nil {
+			return mismatch("provider.temperature")
+		}
 	}
 	if changes.Tools != nil && !slices.Equal(dto.Tools, *changes.Tools) {
 		return mismatch("tools")
@@ -1335,6 +1644,24 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 	}
 	if changes.Bootstrap != nil && !slices.Equal(dto.Bootstrap, *changes.Bootstrap) {
 		return mismatch("bootstrap")
+	}
+	if changes.NotifyChannels != nil && !slices.Equal(dto.NotifyChannels, *changes.NotifyChannels) {
+		return mismatch("notify_channels")
+	}
+	if changes.NotifyMode != nil && core.NotifyMode(dto.NotifyMode) != *changes.NotifyMode {
+		return mismatch("notify_mode")
+	}
+	if changes.Bindings != nil {
+		want, wantErr := bindingsFromChanges(changes.Bindings)
+		if wantErr != nil {
+			return mismatch("bindings")
+		}
+		got, gotErr := ParseResourceBindings(patched)
+		if gotErr != nil ||
+			!slices.Equal(got.ModelConnections, want.ModelConnections) ||
+			!slices.Equal(got.NotifyChannels, want.NotifyChannels) {
+			return mismatch("bindings")
+		}
 	}
 	if changes.Settings != nil {
 		if changes.Settings.MaxIterations != nil &&
@@ -1352,7 +1679,8 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 		}
 		for i, want := range *changes.Schedules {
 			got := dto.Schedules[i]
-			if got.ID != want.ID || got.Cron != want.Cron || got.Zone != want.Zone || got.Message != want.Message {
+			if got.ID != want.ID || got.Cron != want.Cron || got.Zone != want.Zone ||
+				got.Message != want.Message || got.DeliverTo != want.DeliverTo {
 				return mismatch("schedules")
 			}
 		}

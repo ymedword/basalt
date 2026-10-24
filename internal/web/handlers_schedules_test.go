@@ -610,6 +610,40 @@ func TestSchedules_ExecutionMessageProjection(t *testing.T) {
 	})
 }
 
+// TestSchedules_DeliveryProjection：投递结果与执行结果**分开**投影——"任务完成 /
+// 飞书投递失败"必须能同时看到；没有投递记录时三项均为空串，不臆造状态（R7）。
+// The delivery verdict is projected separately from the execution status; a row
+// without a delivery record renders empty strings instead of an invented status.
+func TestSchedules_DeliveryProjection(t *testing.T) {
+	view := executionView(core.ExecutionRecord{
+		Status:          core.ExecutionCompleted,
+		Delivery:        core.DeliveryFailed,
+		DeliveryChannel: "rs_deliverytarget00000000000000",
+		DeliveryDetail:  "飞书返回 code=19001",
+	})
+	require.Equal(t, "completed", view.Status)
+	require.Equal(t, "failed", view.DeliveryStatus)
+	require.Equal(t, "rs_deliverytarget00000000000000", view.DeliveryChannel)
+	require.Equal(t, "飞书返回 code=19001", view.DeliveryDetail)
+
+	plain := executionView(core.ExecutionRecord{Status: core.ExecutionCompleted})
+	require.Empty(t, plain.DeliveryStatus, "无投递记录不得投影成任何状态")
+	require.Empty(t, plain.DeliveryChannel)
+	require.Empty(t, plain.DeliveryDetail)
+}
+
+// TestSchedules_ScheduleViewCarriesDeliverTo：任务列表回显系统代投目标（资源 UID）；
+// 未绑定时为空串。
+func TestSchedules_ScheduleViewCarriesDeliverTo(t *testing.T) {
+	view := scheduleView(core.TaskRecord{
+		TaskID:    "demo-1",
+		Agent:     "reporter",
+		DeliverTo: "rs_deliverytarget00000000000000",
+	})
+	require.Equal(t, "rs_deliverytarget00000000000000", view.DeliverTo)
+	require.Empty(t, scheduleView(core.TaskRecord{TaskID: "demo-2"}).DeliverTo)
+}
+
 // TestSchedules_MethodNotAllowed404 覆盖方法不匹配落到既有 404 信封（1 例）：
 // GET 命中 POST-only 的 /run 不得返回 ServeMux 的纯文本 405。
 // 逆改点：外层的 catch-all 被移除 → ServeMux 返回 405 纯文本，断言红。

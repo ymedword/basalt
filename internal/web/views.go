@@ -47,17 +47,34 @@ type ProviderView struct {
 // runnable is a read-only "registered + active + published pointers exist" hint, never
 // the admission gate itself.
 type ProfileView struct {
-	Name        string             `json:"name"`
-	Description string             `json:"description"`
-	Provider    string             `json:"provider"`
-	Model       string             `json:"model"`
-	Tools       []string           `json:"tools"`
-	Skills      []string           `json:"skills"`
-	Schedules   int                `json:"schedules"`
-	Lifecycle   AgentLifecycleView `json:"lifecycle"`
-	Registered  bool               `json:"registered"`
-	Runnable    bool               `json:"runnable"`
-	Problems    []string           `json:"problems"`
+	Name string `json:"name"`
+	// DisplayName 是展示投影（R6）：AGENT.md 未声明或为空时回退为技术名 Name，
+	// 恒非空；它只影响展示，技术名、目录名与 UID 不受影响。
+	// DisplayName is the resolved display value and never empty; the technical name
+	// remains available in Name and is unaffected.
+	DisplayName string   `json:"display_name"`
+	Description string   `json:"description"`
+	Provider    string   `json:"provider"`
+	Model       string   `json:"model"`
+	Tools       []string `json:"tools"`
+	Skills      []string `json:"skills"`
+	// NotifyMode 是通知意图的**有效值**（`none` / `all_eligible` / `allowlist`）：
+	// 显式声明逐字投影，未声明按兼容规则推断（与准入同一份 `core.EffectiveNotifyMode`）。
+	// 它是契约枚举，**不得**为空、**不得**出现非法字面量——声明非法或没有定义时按
+	// 「未声明」的兼容规则取值，真实后果（该 Agent 不可运行）由 `problems` 与
+	// `runnable` 说明，不由本字段兜底。
+	// NotifyMode is the effective intent; an invalid declaration falls back to the
+	// undeclared reading and the real consequence shows in problems / runnable.
+	NotifyMode string `json:"notify_mode"`
+	// NotifyChannels 是 AGENT.md 的 notify_channels 声明：非空 = 该 Agent 只能使用
+	// 这些通知渠道；空 = 不限制。它是**声明**，不是渠道存在性判断。
+	// NotifyChannels is the declared allowlist; empty means unrestricted.
+	NotifyChannels []string           `json:"notify_channels"`
+	Schedules      int                `json:"schedules"`
+	Lifecycle      AgentLifecycleView `json:"lifecycle"`
+	Registered     bool               `json:"registered"`
+	Runnable       bool               `json:"runnable"`
+	Problems       []string           `json:"problems"`
 }
 
 // ToolView 是 /tools 的元素；Source 枚举 builtin | mcp | code。
@@ -79,23 +96,102 @@ type MemoryView struct {
 }
 
 // SandboxView 是 /sandbox 的响应体（契约 components.schemas.SandboxView）：四类白名单
-// 原样投影，空配置输出 `[]`（约束 34）。修改白名单需改配置并重启，本面只读。
-// SandboxView projects the four allowlists; an empty configuration is `[]`.
+// 原样投影，空集合输出 `[]`（约束 34）。其中 `http_allowed_domains` 是**当前生效**
+// 值（管理台可条件写、保存即热生效，R8 裁决 2）；其余三类仍是部署者配置，改配置需
+// 重启。`network_allowlist` 给出该列表的生效元数据，页面不靠猜测判断权威来源。
+// SandboxView projects the four allowlists; http_allowed_domains is the live value
+// (managed and hot-swapped), the other three stay deployment configuration.
 type SandboxView struct {
 	FileAllowedPaths     []string `json:"file_allowed_paths"`
 	ShellAllowedCommands []string `json:"shell_allowed_commands"`
 	ShellInterpreters    []string `json:"shell_interpreters"`
 	HTTPAllowedDomains   []string `json:"http_allowed_domains"`
+	// NetworkAllowlist 是出网域名白名单的生效元数据（R8.2.2）：`etag` 用于条件写
+	// 的 If-Match，`revision` 从 1 起（0 = 管理服务未装载），`source` 为
+	// config_seed | database，`updated_by` 是脱敏 actor（种子为空串）。
+	// NetworkAllowlist carries the live metadata of the managed outbound allowlist.
+	NetworkAllowlist NetworkAllowlistView `json:"network_allowlist"`
+}
+
+// NetworkAllowlistView 是 `network_allowlist` 的固定投影；`updated_at` 零值渲染为
+// 空串（US-9 惯例），不输出 `null`。
+// NetworkAllowlistView is the fixed metadata projection; a zero time renders as "".
+type NetworkAllowlistView struct {
+	ETag      string `json:"etag"`
+	Revision  int64  `json:"revision"`
+	Source    string `json:"source"`
+	UpdatedAt string `json:"updated_at"`
+	UpdatedBy string `json:"updated_by"`
+}
+
+// ConnectionTestView 是资源「最后一次连接测试」的脱敏投影（契约
+// components.schemas.ConnectionTestView）：`last_test` 为 **null** 表示从未测过——
+// 页面**不得**用 availability（本地配置就绪）冒充它。`tested_at` 是 RFC3339 UTC，
+// `detail` 只含固定短语（目标 host、回执码、变量名），不含地址原值与凭据。
+// ConnectionTestView projects the last live test; null means never tested, and local
+// readiness must never stand in for it.
+type ConnectionTestView struct {
+	Status   string `json:"status"` // success | failed | unknown
+	TestedAt string `json:"tested_at"`
+	Detail   string `json:"detail"`
+}
+
+// ConnectionTestViewOf 投影一条连接测试记录；nil 保持 nil（JSON null）。
+// app 层投影模型连接时复用同一格式，避免两处各写一份时间格式。
+// ConnectionTestViewOf projects one record; nil stays nil. The app layer reuses it for
+// model connections so the time format exists in exactly one place.
+func ConnectionTestViewOf(rec *core.ResourceConnectionTest) *ConnectionTestView {
+	if rec == nil {
+		return nil
+	}
+	return &ConnectionTestView{
+		Status:   rec.Status,
+		TestedAt: rec.TestedAt.UTC().Format(time.RFC3339),
+		Detail:   rec.Detail,
+	}
 }
 
 // NotifyChannelView 是 /notify-channels 的元素（契约 components.schemas.NotifyChannelView）：
 // 地址只以 `url_host`（scheme + host）出现，原始 URL 与查询串**没有任何载体**。
 // NotifyChannelView carries only the scheme+host projection; the raw URL has no carrier.
 type NotifyChannelView struct {
-	Name        string `json:"name"`
+	Name string `json:"name"`
+	// ResourceUID 是渠道的稳定身份；同名重建会生成新 UID（旧绑定不自动接管）。
+	ResourceUID string `json:"resource_uid"`
 	Type        string `json:"type"`
 	Description string `json:"description"`
 	URLHost     string `json:"url_host"`
+	// URLConfigured 表示存储里是否**有地址引用**（非空）。它与 URLHost 是两件事：
+	// `${ENV_VAR}` 形态有引用但解析不出 host（URLConfigured=true、URLHost=""），
+	// 页面**不得**把这种情况显示成"地址为空"。
+	// URLConfigured reports whether a URL reference is stored; a `${VAR}` reference
+	// is configured but has no host projection.
+	URLConfigured bool `json:"url_configured"`
+	// ReferencedBy 是扫描 Agent 文档得到的引用者名单（按名称排序、去重；归档项带
+	// `archive:` 前缀）。它只是**文档引用**，不是精确绑定——精确允许范围在 Agent
+	// 的 notify_channels 声明。
+	// ReferencedBy lists agents whose documents mention the channel; it is a textual
+	// reference scan, not the exact binding declared by notify_channels.
+	ReferencedBy []string `json:"referenced_by"`
+	// AddressStatus 是地址可用性的四值投影；`url_host` 为空**不等于**未配置。
+	AddressStatus string `json:"address_status"`
+	// 凭据面只出模式、只读引用、状态、版本号与尾号——**没有**任何明文载体。
+	CredentialMode    string `json:"credential_mode"`
+	CredentialRef     string `json:"credential_ref"`
+	CredentialState   string `json:"credential_state"`
+	CredentialVersion int    `json:"credential_version"`
+	Last4             string `json:"last4"`
+	// 范围与条件写：scope / owner_agent / revision / etag 由 app 层的同一份判定给出。
+	Scope      string `json:"scope"`
+	OwnerAgent string `json:"owner_agent"`
+	Revision   int    `json:"revision"`
+	ETag       string `json:"etag"`
+	// Availability 是本地配置就绪三值（ready / unconfigured / unavailable）；
+	// LastTest 是最后一次实测结果（null = 从未测过）。两者分开展示：本地看起来可用
+	// **不等于**实测通过，页面不得把 availability 显示成"已验证"。
+	// Availability is local readiness; LastTest is the live result, shown separately.
+	Availability string              `json:"availability"`
+	LastTest     *ConnectionTestView `json:"last_test"`
 }
 
 // SessionSummaryView 是会话摘要（契约 components.schemas.SessionSummary）。
@@ -176,21 +272,65 @@ type RunDetailView struct {
 // back-derives persisted shapes.
 type RunResourceManifestView struct {
 	FormatVersion int `json:"format_version"`
+	// AgentUID 是 v2 清单固定的 Agent 稳定身份；v1 清单按契约输出空串（不是省略）——
+	// 字段集恒定，读的人不必区分「没这一项」与「有但为空」。
+	// AgentUID is the v2 agent identity; v1 emits an empty string per the contract.
+	AgentUID string `json:"agent_uid"`
 	// AgentLifecycleState 在历史 Run 上**省略**（注 17）：不知道就不填 active。
-	AgentLifecycleState string                   `json:"agent_lifecycle_state,omitempty"`
-	LegacyUnrecorded    bool                     `json:"legacy_unrecorded"`
-	Providers           []ResourceVersionRefView `json:"providers"`
-	MCPServers          []ResourceVersionRefView `json:"mcp_servers"`
-	Skills              []SkillVersionRefView    `json:"skills"`
-	Files               []FileHashView           `json:"files"`
+	AgentLifecycleState string `json:"agent_lifecycle_state,omitempty"`
+	LegacyUnrecorded    bool   `json:"legacy_unrecorded"`
+	// Provider 是 v2 的单 Provider 固定（含模型与凭据引用）；v1 清单为 null。
+	Provider *ProviderManifestView `json:"provider"`
+	// Providers 是 v1 兼容字段：v1 清单把当时那一个条目放在这里；v2 起恒为 `[]`。
+	Providers  []ResourceVersionRefView `json:"providers"`
+	MCPServers []ResourceVersionRefView `json:"mcp_servers"`
+	Skills     []SkillVersionRefView    `json:"skills"`
+	Files      []FileHashView           `json:"files"`
+	// Notify 是 v2 起必填的通知授权（模式 + 具体渠道 UID）；v1 清单为 null，
+	// 旧语义是「空白名单 = 不限制」。
+	Notify *NotifyManifestView `json:"notify"`
+}
+
+// ProviderManifestView 是 v2 清单里的单个 Provider 固定（契约 components.schemas
+// .ProviderManifestView）：凭据只出引用、版本与目标绑定哈希，**没有**明文字段。
+// ProviderManifestView pins the provider without any plaintext credential material.
+type ProviderManifestView struct {
+	Name              string `json:"name"`
+	Model             string `json:"model"`
+	ResourceUID       string `json:"resource_uid"`
+	VersionID         int64  `json:"version_id"`
+	VersionNo         int    `json:"version_no"`
+	CredentialRef     string `json:"credential_ref"`
+	CredentialVersion int    `json:"credential_version"`
+	TargetBinding     string `json:"target_binding"`
+}
+
+// NotifyManifestView 是 v2 清单冻结的通知授权（契约 components.schemas
+// .NotifyManifestView）：渠道是准入时枚举出来的具体 UID 集合，**没有** `*` 通配。
+// NotifyManifestView freezes concrete channel uids; there is no wildcard.
+type NotifyManifestView struct {
+	Mode     string                 `json:"mode"`
+	Channels []NotifyChannelRefView `json:"channels"`
+}
+
+// NotifyChannelRefView 是一个冻结的渠道引用：名称只作标签，身份是 UID。
+// NotifyChannelRefView carries one frozen channel ref; the uid is the identity.
+type NotifyChannelRefView struct {
+	Name        string `json:"name"`
+	ResourceUID string `json:"resource_uid"`
 }
 
 // ResourceVersionRefView 是清单里的一个版本引用；kind 枚举 model_connection /
 // mcp_server（契约 components.schemas.ResourceVersionRef）。
 // ResourceVersionRefView carries the contract kind enum and version identity.
 type ResourceVersionRefView struct {
-	Kind        string `json:"kind"`
-	Name        string `json:"name"`
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// ResourceUID 是资源的稳定身份；v1 清单**没有**记录这一项（那时还没有 UID），
+	// 所以历史行输出空串——**不得**回填当前指针的 UID 冒充当时的固定值。
+	// ResourceUID stays empty for v1 rows: backfilling the current uid would invent a
+	// fact the admission never froze.
+	ResourceUID string `json:"resource_uid"`
 	VersionID   int64  `json:"version_id"`
 	VersionNo   int    `json:"version_no"`
 	ContentHash string `json:"content_hash"`
@@ -225,7 +365,11 @@ type FileHashView struct {
 // Manifest view literals: the legacy format version, the skill definition file, and
 // the logical workspace prefix.
 const (
+	// legacyManifestFormatVersion 是**没有清单行**时的合成版本号；v2 是当前持久版本，
+	// 两者的差别决定 provider / notify 出 `null` 还是出具体值。
+	// The synthetic version for missing rows; v2 decides whether v2-only fields appear.
 	legacyManifestFormatVersion = 1
+	v2ManifestFormatVersion     = 2
 	skillDefinitionFile         = "SKILL.md"
 	skillLogicalPrefix          = ".basalt/skills/"
 )
@@ -235,11 +379,14 @@ const (
 // ScheduleView is one /schedules element; id is the TaskID and a zero last run
 // renders as an empty string.
 type ScheduleView struct {
-	ID         string `json:"id"`
-	Agent      string `json:"agent"`
-	Cron       string `json:"cron"`
-	Zone       string `json:"zone"`
-	Message    string `json:"message"`
+	ID      string `json:"id"`
+	Agent   string `json:"agent"`
+	Cron    string `json:"cron"`
+	Zone    string `json:"zone"`
+	Message string `json:"message"`
+	// DeliverTo 是系统代投目标通知渠道的**资源 UID**（R7）；空串 = 不代投。
+	// DeliverTo is the resource uid of the system-delivery channel; empty means none.
+	DeliverTo  string `json:"deliver_to"`
 	Enabled    bool   `json:"enabled"`
 	LastRunAt  string `json:"last_run_at"`
 	LastStatus string `json:"last_status"`
@@ -259,6 +406,14 @@ type ExecutionView struct {
 	ErrorMessage string `json:"error_message"`
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
+	// 系统代投结果（R7）与执行结果**分开**展示：`delivery_status` 为空串表示本行
+	// 没有代投记录（任务未绑定投递目标）；有值时取 pending / sent / failed / unknown /
+	// skipped。`delivery_channel` 是渠道资源 UID，`delivery_detail` 是脱敏短语。
+	// The delivery verdict is projected separately from the execution status; an empty
+	// delivery_status means this execution has no delivery record.
+	DeliveryStatus  string `json:"delivery_status"`
+	DeliveryChannel string `json:"delivery_channel"`
+	DeliveryDetail  string `json:"delivery_detail"`
 }
 
 // sessionSummaryView 投影一行会话记录。
@@ -302,8 +457,9 @@ func sessionDetailView(rec core.SessionRecord, msgs []core.Message) SessionDetai
 	return SessionDetailView{SessionSummaryView: sessionSummaryView(rec), Messages: out}
 }
 
-// sandboxView 投影沙箱白名单：路径只出相对展示形态——宿主绝对路径是装配层布局，
-// 不属于对外契约（任何只读面不得泄露绝对路径）。四个数组空时输出 `[]`。
+// sandboxView 投影部署者配置的三类白名单与路径展示名：路径只出相对展示形态——宿主
+// 绝对路径是装配层布局，不属于对外契约（任何只读面不得泄露绝对路径）。四个数组空时
+// 输出 `[]`。出网域名走 `sandboxView` 方法的生效值覆盖，本函数只提供兜底。
 // sandboxView keeps only relative display paths: host layout never leaves the process.
 func sandboxView(cfg SandboxConfig) SandboxView {
 	views := make([]string, 0, len(cfg.FileAllowedPaths))
@@ -320,7 +476,44 @@ func sandboxView(cfg SandboxConfig) SandboxView {
 		ShellAllowedCommands: nonNilStrings(cfg.ShellAllowedCommands),
 		ShellInterpreters:    nonNilStrings(cfg.ShellInterpreters),
 		HTTPAllowedDomains:   nonNilStrings(cfg.HTTPAllowedDomains),
+		NetworkAllowlist:     NetworkAllowlistView{Source: core.NetworkAllowlistSourceConfigSeed},
 	}
+}
+
+// sandboxView 叠加管理面的**生效**出网白名单：`http_allowed_domains` 取策略实例
+// 当前快照（保存后立即变化，不读启动时的配置副本）；`network_allowlist` 同时给出
+// ETag / 修订号 / 来源 / 最近写入。未装配管理端口（只读装配 / 测试接缝）时退回
+// 配置投影：`revision=0`、空 ETag 如实表示"没有可条件写的权威行"。
+// sandboxView overlays the live allowlist; the read-only fallback reports revision 0
+// and an empty ETag, which truthfully means "no authoritative row to write against".
+func (s *Server) sandboxView() SandboxView {
+	view := sandboxView(s.opts.Sandbox)
+	if s.opts.NetworkAllowlist == nil {
+		return view
+	}
+	policy := s.opts.NetworkAllowlist.Current()
+	view.HTTPAllowedDomains = nonNilStrings(policy.Domains)
+	view.NetworkAllowlist = networkAllowlistView(policy)
+	return view
+}
+
+// networkAllowlistView 把策略行投影为对外元数据；时间固定 RFC3339 UTC。
+// networkAllowlistView renders the policy row into the fixed metadata projection.
+func networkAllowlistView(policy core.NetworkDomainPolicy) NetworkAllowlistView {
+	view := NetworkAllowlistView{
+		Revision:  policy.Revision,
+		Source:    policy.Source(),
+		UpdatedBy: policy.UpdatedBy,
+	}
+	if policy.Revision > 0 {
+		// 未装载（revision 0）时没有可写的权威修订，ETag 留空：页面拿不到一个"看起来
+		// 合法"的条件值，PUT 会在形状级被 412 拒绝，而不是预写之后才发现 CAS 落败。
+		view.ETag = core.NetworkDomainETag(policy)
+	}
+	if !policy.UpdatedAt.IsZero() {
+		view.UpdatedAt = policy.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	return view
 }
 
 // nonNilStrings 把 nil 切片归一成空切片（约束 34：空集合输出 `[]`）。
@@ -349,13 +542,77 @@ func rootedPath(p string) bool {
 
 // notifyChannelView 投影一条通知渠道：地址只经 `notifyURLHost` 出站（解析不出回空）。
 // notifyChannelView projects one channel; the address leaves only as scheme+host.
-func notifyChannelView(ch core.NotifyChannel) NotifyChannelView {
+func notifyChannelView(ch core.NotifyChannel, referencedBy []string) NotifyChannelView {
 	return NotifyChannelView{
-		Name:        ch.Name,
-		Type:        ch.Type,
-		Description: ch.Description,
-		URLHost:     notifyURLHost(ch.URL),
+		Name:              ch.Name,
+		ResourceUID:       string(ch.ResourceUID),
+		Type:              ch.Type,
+		Description:       ch.Description,
+		URLHost:           notifyURLHost(ch.URL),
+		URLConfigured:     strings.TrimSpace(ch.URL) != "",
+		ReferencedBy:      nonNilStrings(referencedBy),
+		AddressStatus:     notifyAddressStatus(ch),
+		CredentialMode:    string(channelCredentialMode(ch)),
+		CredentialRef:     ch.CredentialID,
+		CredentialState:   string(ch.CredentialState),
+		CredentialVersion: ch.CredentialVersion,
+		Last4:             ch.Last4,
+		Scope:             string(channelScope(ch)),
+		OwnerAgent:        ch.OwnerAgentName,
+		Revision:          ch.Revision,
+		ETag:              ch.ETag,
+		Availability:      ch.Availability,
+		LastTest:          ConnectionTestViewOf(ch.LastTest),
 	}
+}
+
+// channelCredentialMode 归一化渠道地址模式：空列读成 `env`——`contract`
+// 的枚举没有第五个值，而 v3 迁移把既有行一律回填为 `env`（`schema.sql` 注释），
+// 所以"空 = env"是同一事实的读法，不是替存储猜。托管渠道由仓储读出 `managed`。
+// channelCredentialMode reads an empty column as env, matching the migration backfill.
+func channelCredentialMode(ch core.NotifyChannel) core.CredentialMode {
+	if ch.CredentialMode == core.CredentialModeManaged {
+		return core.CredentialModeManaged
+	}
+	return core.CredentialModeEnv
+}
+
+// channelScope 归一化使用范围：空列读成 `shared`（列默认值与迁移回填值，
+// `schema.sql` 的 `resource_pointers` / `notify_channels` 同一口径）。
+// channelScope reads an empty column as shared, the documented column default.
+func channelScope(ch core.NotifyChannel) core.ResourceScope {
+	if ch.Scope == core.ScopeExclusive {
+		return core.ScopeExclusive
+	}
+	return core.ScopeShared
+}
+
+// 渠道地址可用性四值（契约 NotifyChannelView.address_status）。`url_host` 为空**不等于**
+// 未配置：`${VAR}` 引用与托管密文都有地址，只是解析不出可展示的主机。
+// The four address-status literals; an empty url_host never means "not configured".
+const (
+	addressStatusManagedConfigured  = "managed_configured"
+	addressStatusEnv                = "env"
+	addressStatusEmpty              = "empty"
+	addressStatusManagedUnavailable = "managed_unavailable"
+)
+
+// notifyAddressStatus 按模式与凭据身份状态投影地址可用性。它**不**预判主密钥可读性——
+// 那是解析期的事实（下一次发送 / 准入报 `CREDENTIAL_UNAVAILABLE`），页面不猜。
+// managed 模式下没有 active 身份即 `managed_unavailable`：说不出"可用"就不能说。
+// notifyAddressStatus derives the four-value status without predicting whether the
+// master key itself is readable; that belongs to resolution time.
+func notifyAddressStatus(ch core.NotifyChannel) string {
+	if ch.CredentialMode != core.CredentialModeManaged {
+		if strings.TrimSpace(ch.URL) != "" {
+			return addressStatusEnv
+		}
+		return addressStatusEmpty
+	}
+	if ch.CredentialState == core.CredentialIdentityActive {
+		return addressStatusManagedConfigured
+	}
+	return addressStatusManagedUnavailable
 }
 
 // profileView 投影一条装载结果（约束 26）：顺序由调用方保持；未注册项的 problems
@@ -364,26 +621,52 @@ func notifyChannelView(ch core.NotifyChannel) NotifyChannelView {
 // reject reason in problems, and a nil profile yields empty derived fields.
 func profileView(entry core.AgentEntry) ProfileView {
 	v := ProfileView{
-		Name:       entry.Name,
-		Tools:      []string{},
-		Skills:     []string{},
-		Problems:   []string{},
-		Registered: entry.Registered,
+		Name:           entry.Name,
+		DisplayName:    entry.Name,
+		Tools:          []string{},
+		Skills:         []string{},
+		NotifyMode:     string(effectiveNotifyMode(entry.Profile)),
+		NotifyChannels: []string{},
+		Problems:       []string{},
+		Registered:     entry.Registered,
 	}
 	if p := entry.Profile; p != nil {
+		if p.DisplayName != "" {
+			v.DisplayName = p.DisplayName
+		}
 		v.Description = p.Description
 		v.Provider = p.Provider.Name
 		v.Model = p.Provider.Model
 		v.Tools = stringSlice(p.Tools)
 		v.Skills = stringSlice(p.Skills)
+		v.NotifyChannels = stringSlice(p.NotifyChannels)
 		v.Schedules = len(p.Schedules)
 	}
-	if !entry.Registered && entry.RejectReason != "" {
-		// 未注册且已给拒因 → 恰含一项（约束 26）；轻路径的待确认项没有拒因，
-		// 输出 `[]` 而不是一个空串问题。
-		v.Problems = []string{entry.RejectReason}
+	if !entry.Registered && entry.RejectKind != "" {
+		// 未注册且已给分类 → 恰含一项（约束 26）；轻路径的待确认项没有分类，
+		// 输出 `[]` 而不是一个空串问题。文案按类型化分类投影为中文，英文原文与
+		// 可能携带的路径只留在服务端日志。
+		// Exactly one problem item, projected from the typed kind; English stays in logs.
+		v.Problems = []string{entryRejectMessage(entry)}
 	}
 	return v
+}
+
+// effectiveNotifyMode 取可投影的通知意图：合法声明逐字返回；未声明**或**非法字面量
+// 按兼容规则推断，没有定义文件时就是「未声明且无渠道」的推断结果。视图字段是契约
+// 枚举，**不得**留空、**不得**透出非法值——声明非法的真实后果是该 Agent 不可运行，
+// 由 `problems` 与 `runnable` 表达，不靠这个字段兜底。
+// effectiveNotifyMode never emits an empty or invalid literal: an invalid declaration
+// reads as undeclared, and problems / runnable carry the actual consequence.
+func effectiveNotifyMode(p *core.Profile) core.NotifyMode {
+	if p == nil {
+		return core.EffectiveNotifyMode("", nil)
+	}
+	mode := core.EffectiveNotifyMode(p.NotifyMode, p.NotifyChannels)
+	if _, err := core.ParseNotifyMode(string(mode)); err != nil {
+		return core.EffectiveNotifyMode("", p.NotifyChannels)
+	}
+	return mode
 }
 
 // toolView 投影一个工具描述符；来源枚举由装配层保证（builtin | mcp | code）。
@@ -458,13 +741,18 @@ func runDetailView(rec core.RunDetail) RunDetailView {
 // runResourceManifestView 把准入清单投影为契约视图（约束 23 / 24）：
 //
 //   - nil 或 FormatVersion 为零 = 没有清单行 → legacy 形态：format_version 固定 1、
-//     legacy_unrecorded=true、数组一律 `[]`、**省略** agent_lifecycle_state（注 17）；
-//   - 有清单 → 按持久结构逐项投影：Provider 一项（kind=model_connection）、每个 MCP
-//     一项（kind=mcp_server）、技能四个哈希、文件扁平化为逻辑路径。
+//     legacy_unrecorded=true、数组一律 `[]`、provider / notify 为 null、**省略**
+//     agent_lifecycle_state 与 agent_uid（注 17）；
+//   - v1 清单（历史 Run）→ provider 为 null，那一个条目仍走 `providers`（兼容字段）；
+//     notify 为 null，旧语义是「空白名单 = 不限制」；
+//   - v2 清单 → provider 与 notify 各自投影，`providers` 恒为空数组，并补 agent_uid。
 //
-// 本函数不读发布目录、不查当前版本——历史 Run 的清单只来自它自己的持久行。
-// The projector never reads published directories or current versions; a historical
-// run's manifest comes only from its own persisted row.
+// 两代的差别不是展示偏好，而是持久结构本身不同：给 v1 行补一个凭据引用或通知授权，
+// 就是在替历史 Run 编造它从未固定过的事实。本函数不读发布目录、不查当前版本——
+// 历史 Run 的清单只来自它自己的持久行。
+// The v1/v2 split mirrors the persisted shapes; projecting v2 fields onto a v1 row
+// would invent facts the run never froze, and the projector never reads published
+// directories or current versions.
 func runResourceManifestView(m *core.RunResourceManifest) *RunResourceManifestView {
 	if m == nil || m.FormatVersion == 0 {
 		return &RunResourceManifestView{
@@ -476,9 +764,6 @@ func runResourceManifestView(m *core.RunResourceManifest) *RunResourceManifestVi
 			Files:            []FileHashView{},
 		}
 	}
-	providers := []ResourceVersionRefView{
-		resourceVersionRefView(core.ResourceModelConnection, m.Provider),
-	}
 	mcpServers := make([]ResourceVersionRefView, 0, len(m.MCPServers))
 	for _, ref := range m.MCPServers {
 		mcpServers = append(mcpServers, resourceVersionRefView(core.ResourceMCPServer, ref))
@@ -487,14 +772,52 @@ func runResourceManifestView(m *core.RunResourceManifest) *RunResourceManifestVi
 	for _, skill := range m.Skills {
 		skills = append(skills, skillVersionRefView(skill))
 	}
-	return &RunResourceManifestView{
+	view := &RunResourceManifestView{
 		FormatVersion:       m.FormatVersion,
 		AgentLifecycleState: m.AgentLifecycle,
-		Providers:           providers,
+		Providers:           []ResourceVersionRefView{},
 		MCPServers:          mcpServers,
 		Skills:              skills,
 		Files:               flattenSkillFiles(m.Skills),
 	}
+	if m.FormatVersion < v2ManifestFormatVersion {
+		view.Providers = []ResourceVersionRefView{
+			resourceVersionRefView(core.ResourceModelConnection, m.Provider.ResourceVersionRef),
+		}
+		return view
+	}
+	view.AgentUID = string(m.AgentUID)
+	view.Provider = providerManifestView(m.Provider)
+	view.Notify = notifyManifestView(m.Notify)
+	return view
+}
+
+// providerManifestView 投影 v2 的 Provider 固定；凭据只出引用与绑定哈希。
+// providerManifestView projects the v2 provider pin without plaintext material.
+func providerManifestView(ref core.ProviderVersionRef) *ProviderManifestView {
+	return &ProviderManifestView{
+		Name:              ref.Name,
+		Model:             ref.Model,
+		ResourceUID:       string(ref.ResourceUID),
+		VersionID:         ref.VersionID,
+		VersionNo:         ref.VersionNo,
+		CredentialRef:     ref.CredentialID,
+		CredentialVersion: ref.CredentialVersion,
+		TargetBinding:     ref.TargetBinding,
+	}
+}
+
+// notifyManifestView 投影 v2 的通知授权；渠道空集合输出 `[]`，不是 null。
+// notifyManifestView projects the v2 grant; an empty channel set is `[]`, not null.
+func notifyManifestView(grant core.NotifyManifest) *NotifyManifestView {
+	channels := make([]NotifyChannelRefView, 0, len(grant.Channels))
+	for _, ref := range grant.Channels {
+		channels = append(channels, NotifyChannelRefView{
+			Name:        ref.Name,
+			ResourceUID: string(ref.ResourceUID),
+		})
+	}
+	return &NotifyManifestView{Mode: string(grant.Mode), Channels: channels}
 }
 
 // resourceVersionRefView 给版本引用补上契约枚举的 kind。
@@ -503,6 +826,7 @@ func resourceVersionRefView(kind core.ResourceKind, ref core.ResourceVersionRef)
 	return ResourceVersionRefView{
 		Kind:        string(kind),
 		Name:        ref.Name,
+		ResourceUID: string(ref.ResourceUID),
 		VersionID:   ref.VersionID,
 		VersionNo:   ref.VersionNo,
 		ContentHash: ref.ContentHash,
@@ -622,16 +946,34 @@ type SkillView struct {
 // ModelConnectionView is the contract shape for one model connection; api_key_env
 // carries the reference name only, never the resolved secret.
 type ModelConnectionView struct {
-	Name               string   `json:"name"`
-	BaseURL            string   `json:"base_url"`
-	APIKeyEnv          string   `json:"api_key_env"`
-	DefaultModel       string   `json:"default_model"`
+	Name string `json:"name"`
+	// ResourceUID 是资源的稳定身份；同名重建生成新 UID（旧绑定不自动接管）。
+	ResourceUID  string `json:"resource_uid"`
+	BaseURL      string `json:"base_url"`
+	APIKeyEnv    string `json:"api_key_env"`
+	DefaultModel string `json:"default_model"`
+	// 凭据面只出模式、只读引用、状态、版本号与尾号——**没有**任何明文载体；
+	// `credential_mode` 由「有没有凭据身份」判定，不另存一份模式列。
+	CredentialMode    string `json:"credential_mode"`
+	CredentialRef     string `json:"credential_ref"`
+	CredentialState   string `json:"credential_state"`
+	CredentialVersion int    `json:"credential_version"`
+	Last4             string `json:"last4"`
+	// 范围与条件写：scope / owner_agent / revision / etag 由 app 层的同一份判定给出。
+	Scope              string   `json:"scope"`
+	OwnerAgent         string   `json:"owner_agent"`
+	Revision           int      `json:"revision"`
 	PublishedVersionID int64    `json:"published_version_id"`
 	PublishedVersionNo int      `json:"published_version_no"`
 	AppliedVersionID   int64    `json:"applied_version_id"`
 	AppliedVersionNo   int      `json:"applied_version_no"`
 	ETag               string   `json:"etag"`
 	ReferencedBy       []string `json:"referenced_by"`
+	// Availability 是本地配置就绪三值；LastTest 是最后一次实测结果（null = 从未测过）。
+	// 两者分开展示：本地看起来可用**不等于**实测通过。
+	// Availability is local readiness; LastTest is the live result, shown separately.
+	Availability string              `json:"availability"`
+	LastTest     *ConnectionTestView `json:"last_test"`
 }
 
 // McpServerView 是 /mcp-servers 的元素（契约 components.schemas.McpServerView）：
@@ -754,7 +1096,11 @@ func operationDetailView(rec core.OperationRecord) OperationDetailView {
 // the non-sensitive recovery inputs US-11 actually writes. Everything else is dropped.
 func projectOperationDetailValue(key string, value any) (any, bool) {
 	switch key {
-	case "providers", "mcp", "skills", "agents", "expected_generation", "version_no":
+	// `before_revision` / `after_revision` 是网络白名单的恢复证据（run-and-errors §8）：
+	// 修订号前后值决定三态查证，与 `candidate_sha256` 一起构成详情页可核对的依据。
+	// Allowlist recovery evidence: the before/after revisions drive the verdict.
+	case "providers", "mcp", "skills", "agents", "expected_generation", "version_no",
+		"before_revision", "after_revision":
 		return detailInteger(value)
 	case "candidate_sha256", "previous_sha256":
 		text, ok := value.(string)
@@ -881,6 +1227,7 @@ func scheduleView(rec core.TaskRecord) ScheduleView {
 		Cron:       rec.Cron,
 		Zone:       rec.Zone,
 		Message:    rec.Message,
+		DeliverTo:  rec.DeliverTo,
 		Enabled:    rec.Enabled,
 		LastRunAt:  formatTime(rec.LastRunAt),
 		LastStatus: string(rec.LastStatus),
@@ -900,6 +1247,12 @@ func executionView(rec core.ExecutionRecord) ExecutionView {
 		ErrorMessage: publicExecutionMessage(rec.Status, rec.ErrorMessage),
 		StartedAt:    formatTime(rec.StartedAt),
 		FinishedAt:   formatTime(rec.FinishedAt),
+		// 投递结果是独立账：待投 / 已投 / 失败 / 结果未知 / 跳过各有自己的状态，
+		// 不折进执行状态（"任务完成 / 飞书投递失败"必须能同时看到）。
+		// Delivery is its own record and never folds into the execution status.
+		DeliveryStatus:  string(rec.Delivery),
+		DeliveryChannel: rec.DeliveryChannel,
+		DeliveryDetail:  rec.DeliveryDetail,
 	}
 }
 
@@ -978,10 +1331,14 @@ func infoView(opts Options, now time.Time) InfoView {
 // AgentLifecycleView 是启停成功后的生命周期状态视图（契约 AgentLifecycleView）：
 // 一次成功迁移意味着状态文件刚通过校验，因此 valid 恒为 true、state 非空；
 // `updated_at` 取状态文件的 Unix 毫秒并按视图统一口径投影为 RFC3339 UTC。
-// The lifecycle view returned by a successful transition; the file was just validated,
-// so valid is always true and state is never null.
+// `agent_uid` / `uid_source` 是 R4 的稳定身份：v2 状态文件给 `state_file`，合法但
+// 未记录身份的 v1 文件给 `legacy_unrecorded`；状态文件缺失 / 损坏时两者都为空串。
+// The lifecycle view returned by a successful transition; uid_source is state_file
+// for v2 records and legacy_unrecorded for still-valid v1 records.
 type AgentLifecycleView struct {
 	Agent          string  `json:"agent"`
+	AgentUID       string  `json:"agent_uid"`
+	UIDSource      string  `json:"uid_source"`
 	State          *string `json:"state"`
 	Generation     int64   `json:"generation"`
 	UpdatedAt      string  `json:"updated_at"`
@@ -990,14 +1347,27 @@ type AgentLifecycleView struct {
 	LifecycleError string  `json:"lifecycle_error"`
 }
 
+const (
+	// lifecycleUIDSourceStateFile：身份由状态文件记录（v2 起必填）。
+	lifecycleUIDSourceStateFile = "state_file"
+	// lifecycleUIDSourceLegacy：状态文件合法但未记录身份（v1 形态，迁移后补写）。
+	lifecycleUIDSourceLegacy = "legacy_unrecorded"
+)
+
 // agentLifecycleView 投影一条生命周期记录：失败路径没有 data（信封省略），因此本
 // 函数只服务成功迁移——缺失 / 损坏的状态用 409 表达，不在这里伪装成 valid=false。
 // Only successful transitions reach this projection; missing or corrupt state files
 // are expressed as 409 responses, never as a valid=false body.
 func agentLifecycleView(rec core.LifecycleRecord) AgentLifecycleView {
 	state := string(rec.State)
+	source := lifecycleUIDSourceLegacy
+	if rec.AgentUID != "" {
+		source = lifecycleUIDSourceStateFile
+	}
 	return AgentLifecycleView{
 		Agent:          rec.Agent,
+		AgentUID:       string(rec.AgentUID),
+		UIDSource:      source,
 		State:          &state,
 		Generation:     rec.Generation,
 		UpdatedAt:      formatTime(time.UnixMilli(rec.UpdatedAt)),
@@ -1032,6 +1402,18 @@ type AgentFilesView struct {
 	Lifecycle AgentLifecycleView `json:"lifecycle"`
 	ETag      string             `json:"etag"`
 	Files     []AgentFileView    `json:"files"`
+	// Changes 是系统在本次保存中自动应用的受控工具增删（R7 / 宪法约束 11）：
+	// 只可能是 `notify`；两个数组恒非 nil，页面据此提示"系统已自动加入/移除"。
+	// Changes reports the system-applied tool deltas of this save; notify is the only
+	// possible name and both arrays are always present.
+	Changes AgentToolChangeView `json:"changes"`
+}
+
+// AgentToolChangeView 是系统自动工具变更的响应投影（数组恒非 nil，约束 34）。
+// AgentToolChangeView is the response shape of the system-applied tool delta.
+type AgentToolChangeView struct {
+	Added   []string `json:"tools_added"`
+	Removed []string `json:"tools_removed"`
 }
 
 // agentFilesView 投影一次成功的内容写：ETag 由调用方从随后的读取给出（核心类型
@@ -1057,6 +1439,10 @@ func agentFilesView(files core.AgentFiles, etag string) AgentFilesView {
 		},
 		ETag:  etag,
 		Files: items,
+		Changes: AgentToolChangeView{
+			Added:   stringSlice(files.Changes.Added),
+			Removed: stringSlice(files.Changes.Removed),
+		},
 	}
 }
 

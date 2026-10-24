@@ -554,6 +554,7 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 			Registered: true,
 			Profile: &core.Profile{
 				Name:        "ops-agent",
+				DisplayName: "运维小助手",
 				Description: "运维助手",
 				Provider:    core.ProviderRef{Name: "openai", Model: "gpt-5"},
 				Tools:       []string{"fs_read"},
@@ -563,7 +564,13 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 				},
 			},
 		},
-		{Name: "ghost", Registered: false, RejectReason: "缺少 system prompt"},
+		{
+			Name:         "ghost",
+			Registered:   false,
+			RejectKind:   core.AgentRejectInvalidFrontmatter,
+			RejectDetail: "缺少 system prompt",
+			RejectReason: "invalid frontmatter: missing system prompt",
+		},
 		{Name: "pending", Registered: false},
 	}
 	profilesSrv := newTestServer(t, func(o *Options) { o.Agents = fakeAgents{entries: entries} })
@@ -588,14 +595,25 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 		require.Empty(t, env.Data[0].Problems)
 	})
 
-	t.Run("未注册项 problems 恰含拒因", func(t *testing.T) {
+	t.Run("display_name 取声明值或回退技术名", func(t *testing.T) {
+		var env struct {
+			Data []ProfileView `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(get(profilesSrv, "/api/v1/profiles").Body.Bytes(), &env))
+		require.Equal(t, "运维小助手", env.Data[0].DisplayName, "声明值优先")
+		require.Equal(t, "ops-agent", env.Data[0].Name, "技术名不因展示名改变")
+		require.Equal(t, "ghost", env.Data[1].DisplayName, "无定义时回退技术名")
+	})
+
+	t.Run("未注册项 problems 恰含分类文案", func(t *testing.T) {
 		var env struct {
 			Data []ProfileView `json:"data"`
 		}
 		require.NoError(t, json.Unmarshal(get(profilesSrv, "/api/v1/profiles").Body.Bytes(), &env))
 		require.False(t, env.Data[1].Registered)
-		require.Equal(t, []string{"缺少 system prompt"}, env.Data[1].Problems,
-			"registered=false 时 problems 恰含 RejectReason 一项")
+		require.Equal(t, []string{"AGENT.md 的 frontmatter 无法解析（详情见服务端日志）"},
+			env.Data[1].Problems,
+			"registered=false 时 problems 恰含分类映射的中文文案一项")
 	})
 
 	t.Run("Profile 为 nil 时派生字段为空且数组为 []", func(t *testing.T) {
@@ -606,10 +624,22 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 		}
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 		require.Equal(t, ProfileView{
-			Name:     "pending",
-			Tools:    []string{},
-			Skills:   []string{},
-			Problems: []string{},
+			Name: "pending",
+			// R6：`display_name` 是展示投影，没有可读定义时回退为技术名（非空）；
+			// 它只影响展示，不改变 Name / 目录 / UID 与历史关联。
+			// R6: display_name is a display projection and falls back to the technical
+			// name when nothing readable exists; it never replaces Name or identity.
+			DisplayName: "pending",
+			Tools:       []string{},
+			// R4：`notify_mode` 是**非空枚举**，没有可读定义时按「未声明且无渠道」的
+			// 兼容规则取值（all_eligible）；该 Agent 实际不可运行由 registered=false /
+			// runnable=false 表达，不由这个字段兜底。其余派生字段仍为空。
+			// R4: notify_mode is a non-empty enum; a missing definition reads as
+			// undeclared-with-no-channels, and runnable carries the real consequence.
+			NotifyMode:     string(core.NotifyModeAllEligible),
+			Skills:         []string{},
+			NotifyChannels: []string{},
+			Problems:       []string{},
 			// 生命周期端口未装配时 valid=false 并给固定原因——不得伪装成可用。
 			// An unwired lifecycle port is valid=false with a fixed reason.
 			Lifecycle: AgentLifecycleView{Agent: "pending", LifecycleError: lifecycleUnwiredProblem},
@@ -1892,13 +1922,14 @@ func TestAuth_ExistingEndpoints(t *testing.T) {
 			err  error
 		}{
 			{"disabled agent", &core.AgentUnavailableError{
-				Name: "ops-agent", State: core.AgentDisabled,
+				Name: "ops-agent", State: core.AgentDisabled, Kind: core.AgentUnavailableDisabled,
 				Reason: "lifecycle state disabled; enable the agent first",
 			}},
 			// 状态文件缺失时 core 把 fs.ErrNotExist 挂在原因链上：409 必须优先于
 			// 下面的 fs 判定，否则失败关闭会被错报成 404。
 			{"missing state file", &core.AgentUnavailableError{
 				Name:   "ops-agent",
+				Kind:   core.AgentUnavailableMissing,
 				Reason: "lifecycle state file missing; restore it before running",
 				Cause:  fmt.Errorf("read C:\\secret\\state.json: %w", fs.ErrNotExist),
 			}},

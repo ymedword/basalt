@@ -47,19 +47,30 @@ type fakeAgents struct {
 	deleteNow  time.Time
 	archived   string
 	deleteErr  error
+
+	// 调用计数（US-12）：读命令不得触碰写路径，写命令只允许调用一次写端口——
+	// 重复调用会在真实端口留下第二行操作记录或第二次归档尝试。
+	// Call counters: read commands never touch the write path and write commands call
+	// the write port exactly once.
+	listCalls   int
+	createCalls int
+	deleteCalls int
 }
 
 func (f *fakeAgents) List(root string, providers []string) ([]core.AgentEntry, error) {
+	f.listCalls++
 	f.listRoot, f.listProviders = root, providers
 	return f.listEntries, f.listErr
 }
 
 func (f *fakeAgents) Create(root, name string, providers []string) ([]string, error) {
+	f.createCalls++
 	f.createRoot, f.createName, f.createProviders = root, name, providers
 	return f.created, f.createErr
 }
 
 func (f *fakeAgents) Delete(root, name string, now time.Time) (string, error) {
+	f.deleteCalls++
 	f.deleteRoot, f.deleteName, f.deleteNow = root, name, now
 	return f.archived, f.deleteErr
 }
@@ -377,6 +388,54 @@ func TestProfileDelete_CommandUsesWriteModePort(t *testing.T) {
 	require.Error(t, bad.err, "缺目录必须失败")
 	require.Contains(t, bad.err.Error(), "ghost-agent")
 	require.NotContains(t, bad.stdout, "  归档：", "失败路径不得打印归档条目")
+}
+
+// 中文验收点（US-12 卡 §3.2.2 的「profile list / show 不进入写路径」）：两个读命令只走
+// 装载端口，写端口一次都不调用——命令层不取实例锁、不开库，写路径的完整生命周期由
+// 端口的实现侧持有（约束 49；本包不得 import internal/app）。
+// Acceptance point: list / show never touch the write-mode port.
+func TestProfileListAndShow_SkipWriteModePort(t *testing.T) {
+	dir := initProfileWorkspace(t)
+	fake := &fakeAgents{listEntries: []core.AgentEntry{{
+		Name:       "compat-check",
+		Registered: true,
+		Profile:    &core.Profile{Provider: core.ProviderRef{Name: "alpha", Model: "m-alpha"}},
+	}}}
+
+	list := executeProfile(t, profileDeps(dir, fake), "profile", "list")
+	require.NoError(t, list.err, "stderr=%s", list.stderr)
+	show := executeProfile(t, profileDeps(dir, fake), "profile", "show", "compat-check")
+	require.NoError(t, show.err, "stderr=%s", show.stderr)
+
+	require.Equal(t, 2, fake.listCalls, "list / show 共用同一条只读装载")
+	require.Zero(t, fake.createCalls, "读命令不得触碰创建端口")
+	require.Zero(t, fake.deleteCalls, "读命令不得触碰删除端口")
+}
+
+// 中文验收点（US-12）：两个写命令各只调用一次写端口——重复调用会在真实端口留下第二行
+// 操作记录（create）或第二次归档尝试（delete）；写前的 provider 装载走配置，不借装载端口。
+// Acceptance point: each write command calls the write port exactly once and does not
+// borrow the read port for its pre-checks.
+func TestProfileWriteCommands_TouchPortExactlyOnce(t *testing.T) {
+	dir := initProfileWorkspace(t)
+	fake := &fakeAgents{
+		created:  []string{"agents/demo-agent/AGENT.md"},
+		archived: "archive/demo-agent-20261016-093000",
+	}
+
+	created := executeProfile(t, profileDeps(dir, fake), "profile", "create", "demo-agent")
+	require.NoError(t, created.err, "stderr=%s", created.stderr)
+	require.Equal(t, 1, fake.createCalls, "一次 create 只调用一次写端口")
+	require.Zero(t, fake.listCalls, "写命令的前置校验不得走装载端口")
+	require.Equal(t, filepath.Join(dir, workspaceDirName), fake.createRoot, "写路径的根是工作区")
+
+	deleted := executeProfile(t, profileDeps(dir, fake), "profile", "delete", "demo-agent")
+	require.NoError(t, deleted.err, "stderr=%s", deleted.stderr)
+	require.Equal(t, 1, fake.deleteCalls, "一次 delete 只调用一次写端口")
+	require.Zero(t, fake.listCalls, "写命令的前置校验不得走装载端口")
+	require.Equal(t, filepath.Join(dir, workspaceDirName), fake.deleteRoot, "写路径的根是工作区")
+	require.False(t, fake.deleteNow.IsZero(), "命令入口取真实时钟")
+	require.Equal(t, "demo-agent", fake.deleteName)
 }
 
 // 中文验收点（US-7 待决 #2 的展示面）：第三态行**逐字**渲染——行首两个空格、正文为

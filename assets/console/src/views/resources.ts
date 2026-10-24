@@ -2,13 +2,24 @@
 // 模型连接只展示环境变量引用名，MCP 只展示变量键名，绝不回显凭据值。
 // Read-only resources. Model connections show the environment-variable reference
 // only; MCP entries show key names only. Credential values never reach the page.
-import { defineComponent, h } from 'vue'
+import { defineComponent, h, ref } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import type { McpServerView, ModelConnectionView, SkillView } from '../api'
+import { ResourceForm } from '../components/resource-form'
 import { DataTable, Notice, shortHash } from '../components/ui'
 import type { TableRow } from '../components/ui'
 import type { ResourceKind } from '../router'
-import { badge, capabilityTabs, identifier, pageHeading, useLoader, viewProps } from './shared'
+import { resourceDetailHref } from '../router'
+import {
+  AVAILABILITY_LABELS,
+  availabilityTone,
+  badge,
+  capabilityTabs,
+  identifier,
+  pageHeading,
+  useLoader,
+  viewProps,
+} from './shared'
 
 const KIND_LABELS: Record<ResourceKind, string> = {
   skills: '技能',
@@ -19,8 +30,13 @@ const KIND_LABELS: Record<ResourceKind, string> = {
 const KIND_NOTES: Record<ResourceKind, string> = {
   skills: '工作区已发布的技能。Agent 通过配置引用，运行使用准入时固定的版本。',
   'mcp-servers': '查看 MCP 服务的连接状态、工具与已应用版本。这里只展示环境变量键名。',
-  'model-connections': '查看模型服务的地址、默认模型与引用关系。配置存在不代表服务已经探测可用。',
+  'model-connections':
+    '列表只列名称、默认模型、使用范围与本地配置就绪；地址、凭据、版本、所有者与配置引用 Agent 都在详情页。本地配置就绪不代表已实测连通——实测结果与时间单独记录，两种信息不互相冒充。',
 }
+
+/** 列表用的范围短标签（完整说明在资源详情页的范围选择器下方）。 */
+// Short scope labels for the list; the full sentence lives on the detail page.
+const SCOPE_SHORT = { shared: '共享', exclusive: '专属' } as const
 
 type ResourceRow = SkillView | McpServerView | ModelConnectionView
 
@@ -50,17 +66,37 @@ export const ResourcesView = defineComponent({
       }
     })
 
+    // 新建表单是列表页的展开式组件（不占新路由）；写入后由本页重新读取，
+    // 表单本身不做乐观更新，也不维护第二份列表。
+    const formOpen = ref(false)
+    const createdNotice = ref('')
+
+    function openForm(): void {
+      createdNotice.value = ''
+      formOpen.value = true
+    }
+
+    function closeForm(): void {
+      formOpen.value = false
+    }
+
+    function onCreated(): void {
+      formOpen.value = false
+      createdNotice.value = '已创建并发布；列表将从服务端重新读取。'
+      void listing.reload()
+    }
+
     function skillRows(data: SkillView[]): TableProps {
       return {
-        headers: ['技能', '描述', '版本', '文件数', '被引用', '内容哈希'],
+        headers: ['技能', '描述', '版本', '文件数', '配置引用 Agent', '内容哈希'],
         tableClass: 'skills-table',
         columnClasses: ['col-name', '', 'col-number', 'col-number', 'col-name', 'col-hash'],
         rows: data.map((item) => ({
           key: item.name,
           cells: [
-            identifier(item.name),
+            identifier(item.name, resourceDetailHref('skills', item.name)),
             item.description === '' ? '—' : item.description,
-            String(item.version_no),
+            `v${item.version_no}`,
             String(item.file_count),
             item.referenced_by.length === 0 ? '无' : item.referenced_by.join('、'),
             h('code', { title: item.content_hash }, shortHash(item.content_hash)),
@@ -78,14 +114,14 @@ export const ResourcesView = defineComponent({
         rows: data.map((item) => ({
           key: item.name,
           cells: [
-            identifier(item.name),
+            identifier(item.name, resourceDetailHref('mcp-servers', item.name)),
             item.transport,
             item.command,
             item.env_keys.length === 0 ? '无' : item.env_keys.join('、'),
             item.connected ? '已连接' : '未连接',
             item.tools.length === 0 ? '无' : item.tools.join('、'),
-            String(item.published_version_no),
-            String(item.applied_version_no),
+            `v${item.published_version_no}`,
+            `v${item.applied_version_no}`,
             item.pending_restart ? badge('需重启', 'warn') : '否',
           ],
         })),
@@ -95,19 +131,20 @@ export const ResourcesView = defineComponent({
 
     function modelRows(data: ModelConnectionView[]): TableProps {
       return {
-        headers: ['名称', 'Base URL', '凭据引用', '默认模型', '发布版本', '已应用', '被引用'],
+        // R7：列表只留选择连接需要看的信息（名称 / 默认模型 / 范围 / 本地就绪）；
+        // 地址、凭据、版本、所有者与引用者都在详情页，避免列表横向铺满。
+        // R7: the list keeps only what choosing a connection needs; everything else
+        // (address, credential, versions, owner, referencers) lives on the detail page.
+        headers: ['名称', '默认模型', '范围', '可用性'],
         tableClass: 'models-table',
-        columnClasses: ['col-name', 'col-target', 'col-keys', 'col-name', 'col-number', 'col-number', 'col-name'],
+        columnClasses: ['col-name', 'col-name', 'col-short', 'col-state'],
         rows: data.map((item) => ({
           key: item.name,
           cells: [
-            identifier(item.name),
-            identifier(item.base_url),
-            item.api_key_env === '' ? '未配置' : identifier(item.api_key_env),
+            identifier(item.name, resourceDetailHref('model-connections', item.name)),
             identifier(item.default_model),
-            String(item.published_version_no),
-            String(item.applied_version_no),
-            item.referenced_by.length === 0 ? '无' : item.referenced_by.join('、'),
+            badge(SCOPE_SHORT[item.scope], item.scope === 'exclusive' ? 'warn' : 'muted'),
+            badge(AVAILABILITY_LABELS[item.availability], availabilityTone(item.availability)),
           ],
         })),
         empty: '还没有模型连接定义',
@@ -136,15 +173,30 @@ export const ResourcesView = defineComponent({
       if (listing.error.value !== '') {
         content.push(h(Notice, { tone: 'error', text: listing.error.value }))
       }
+      if (createdNotice.value !== '') {
+        content.push(h(Notice, { tone: 'info', text: createdNotice.value }))
+      }
+      if (formOpen.value) {
+        content.push(h(ResourceForm, { api, kind, onCreated, onCancel: closeForm }))
+      }
       if (listing.loading.value && listing.data.value === null) {
         content.push(h('p', { class: 'muted' }, '加载中…'))
       }
       content.push(renderTable())
 
       return h('section', { class: 'view view-resources' }, [
-        pageHeading('RESOURCES / ' + (kind === 'skills' ? '05' : kind === 'mcp-servers' ? '04' : '03'), kind === 'mcp-servers' ? '工具与 MCP' : KIND_LABELS[kind], KIND_NOTES[kind]),
+        pageHeading(
+          'RESOURCES / ' + (kind === 'skills' ? '05' : kind === 'mcp-servers' ? '04' : '03'),
+          kind === 'mcp-servers' ? '工具与 MCP' : KIND_LABELS[kind],
+          KIND_NOTES[kind],
+          h('button', { type: 'button', class: 'primary', onClick: openForm }, '新建'),
+        ),
         ...content,
-        h('p', { class: 'muted small resource-note' }, '此页为只读目录，不显示凭据值。'),
+        h(
+          'p',
+          { class: 'muted small resource-note' },
+          '点击名称进入详情：查看版本、修改定义与删除。列表只读取服务端当前状态，任何页面都不回显凭据值。',
+        ),
       ])
     }
   },

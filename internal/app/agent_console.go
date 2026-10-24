@@ -38,6 +38,12 @@ const (
 	lifecycleMissingReason = "lifecycle state file missing; restore it before toggling"
 	lifecycleCorruptReason = "lifecycle state file corrupt; restore it from a trusted copy"
 
+	// 管理台可见的 `lifecycle_error` 用中文（R8 裁决 1：用户可见响应用中文；英文原因只进
+	// 日志与错误链）。两处投影（本文件 withLifecycle / agent_admin.go lifecycleView）共用。
+	// The console-visible lifecycle_error is Chinese; English stays in logs and errors.
+	lifecycleMissingNotice = "生命周期状态文件缺失，无法确认该 Agent 的当前状态；请联系管理员恢复状态文件。"
+	lifecycleCorruptNotice = "生命周期状态文件损坏，无法确认该 Agent 的当前状态；请联系管理员用可信副本恢复。"
+
 	// lifecycleTool 是启停入参错误的点名标识（*core.InvalidInputError.Tool）。
 	// lifecycleTool names the transition surface in invalid-input errors.
 	lifecycleTool = "agent.transition"
@@ -54,6 +60,13 @@ var _ core.AgentAdmin = (*agentConsole)(nil)
 // Editor / Lifecycle / Index; the shared gate, operation store, logger and clock are
 // injected as well because §3.1.30's behaviour requires them (see run-state I-54).
 type AgentConsoleDeps struct {
+	// Root 是工作区根：内容写成功之后按落盘文件重建绑定投影时要重新读定义文件。
+	// Root is the workspace root, re-read after a content write to rebuild the projection.
+	Root string
+	// Projection 是绑定投影的重建面：内容补丁可以整块替换 `resource_bindings`，
+	// 投影必须跟着文件走。投影未装配时跳过（只读 / 轻量装配面）。
+	// Projection rebuilds the binding projection after a content edit; nil skips.
+	Projection *BindingProjection
 	// Editor 是内容条件写的实现（workspace 的写锁与操作留痕都在它内部）。
 	Editor *workspace.AgentEditor
 	// Lifecycle 是状态文件的唯一写者；Transition 要求调用方已持有该 Agent 写锁。
@@ -73,6 +86,8 @@ type AgentConsoleDeps struct {
 // agentConsole 是 core.AgentAdmin 的组合实现；字段全部私有，构造后不再变化。
 // agentConsole implements core.AgentAdmin; its fields are fixed at construction.
 type agentConsole struct {
+	root       string
+	projection *BindingProjection
 	editor     *workspace.AgentEditor
 	lifecycle  *workspace.LifecycleStore
 	index      core.LifecycleIndex
@@ -100,6 +115,8 @@ func NewAgentConsole(deps AgentConsoleDeps) core.AgentAdmin {
 		now = time.Now
 	}
 	return &agentConsole{
+		root:       deps.Root,
+		projection: deps.Projection,
 		editor:     deps.Editor,
 		lifecycle:  deps.Lifecycle,
 		index:      deps.Index,
@@ -128,7 +145,28 @@ func (a *agentConsole) UpdateContent(ctx context.Context, agent string, update c
 	if err != nil {
 		return core.AgentFiles{}, err
 	}
+	// 内容补丁可能整块替换 `resource_bindings`：投影必须跟着落盘的文件走，否则删除闸门
+	// 与准入会按旧投影反查引用。身份取状态文件；取不到就跳过并记 ERROR（投影可重建，
+	// 写入已经生效）。
+	// A content patch may replace the bindings block wholesale, so the projection follows
+	// the file; an unreadable or absent identity skips the rebuild and logs.
+	a.rebuildProjection(ctx, agent)
 	return a.withLifecycle(ctx, files), nil
+}
+
+// rebuildProjection 按落盘定义重建该 Agent 的绑定投影；身份缺失 / 读取失败只记 ERROR。
+// rebuildProjection rebuilds from the on-disk definition; a missing identity logs only.
+func (a *agentConsole) rebuildProjection(ctx context.Context, agent string) {
+	if a.projection == nil || a.root == "" {
+		return
+	}
+	rec, exists, err := a.lifecycle.Read(context.WithoutCancel(ctx), agent)
+	if err != nil || !exists {
+		a.logger.Error("重建绑定投影跳过：读取生命周期状态失败（写入已生效，投影待下次重建）",
+			"agent", agent, "exists", exists, "error", err)
+		return
+	}
+	RebuildAgentFromDisk(ctx, a.projection, a.root, agent, rec.AgentUID, a.logger)
 }
 
 // withLifecycle 把状态文件读取结果投影到 `AgentFiles.Lifecycle`：分类与启停前置
@@ -145,11 +183,11 @@ func (a *agentConsole) withLifecycle(ctx context.Context, files core.AgentFiles)
 	rec, exists, err := a.lifecycle.Read(context.WithoutCancel(ctx), files.Agent)
 	switch {
 	case err != nil && errors.Is(err, fs.ErrNotExist):
-		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleMissingReason}
+		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleMissingNotice}
 	case err != nil:
-		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleCorruptReason}
+		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleCorruptNotice}
 	case !exists:
-		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleMissingReason}
+		files.Lifecycle = core.AgentLifecycleView{LifecycleError: lifecycleMissingNotice}
 	default:
 		state := string(rec.State)
 		files.Lifecycle = core.AgentLifecycleView{State: &state, Valid: true}
@@ -247,11 +285,11 @@ func (a *agentConsole) checkTransitionPrecondition(ctx context.Context, agent st
 	current, exists, err := a.lifecycle.Read(ctx, agent)
 	switch {
 	case err != nil && errors.Is(err, fs.ErrNotExist):
-		return &core.AgentUnavailableError{Name: agent, Reason: lifecycleMissingReason, Cause: err}
+		return &core.AgentUnavailableError{Name: agent, Kind: core.AgentUnavailableMissing, Reason: lifecycleMissingReason, Cause: err}
 	case err != nil:
-		return &core.AgentUnavailableError{Name: agent, Reason: lifecycleCorruptReason, Cause: err}
+		return &core.AgentUnavailableError{Name: agent, Kind: core.AgentUnavailableCorrupt, Reason: lifecycleCorruptReason, Cause: err}
 	case !exists:
-		return &core.AgentUnavailableError{Name: agent, Reason: lifecycleMissingReason}
+		return &core.AgentUnavailableError{Name: agent, Kind: core.AgentUnavailableMissing, Reason: lifecycleMissingReason}
 	case current.State != expected.ExpectedState || current.Generation != expected.ExpectedGeneration:
 		return fmt.Errorf("%w: Agent %s 期望 %s/%d，当前 %s/%d",
 			core.ErrLifecycleConflict, agent, expected.ExpectedState, expected.ExpectedGeneration,

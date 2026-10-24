@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strings"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -15,10 +16,15 @@ import (
 // SupportedSchemaVersion 是本二进制支持的目标 schema 版本，也是首个版本记录
 // 锚点：生产装配把它作为 target 传给 OpenWritable / Bootstrap / OpenReadOnly /
 // Migrate；测试传合成值以覆盖单版本期不可达的分支（旧版本 / 损坏态）。
+// v3 = US-12 范围修订：资源 UID 身份与墓碑、使用范围、托管凭据、绑定投影、
+// 通知 Run 引用与发送明细（含 resource_versions / notify_channels 重建）。
+// v4 = US-12 R7：定时任务系统代投（deliver_to / schedule_deliveries）与资源连接
+// 测试最后结果（resource_connection_tests）。
+// v5 = US-12 R8：网络域名白名单的唯一权威源（network_domain_policy 单行表）。
 // SupportedSchemaVersion is the schema version this binary targets; it is the
 // first version-record anchor and the production value of the target parameter
 // threaded through OpenWritable, Bootstrap, OpenReadOnly and Migrate.
-const SupportedSchemaVersion = 2
+const SupportedSchemaVersion = 5
 
 // schemaFileName 是建表脚本在 fs.FS 里的路径——契约文件的嵌入副本。
 // schemaFileName is the path of the schema script inside the injected fs.FS.
@@ -70,7 +76,13 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, target int) error {
 		return fmt.Errorf("storage: 目标版本 %d 非法——版本从 1 起", target)
 	}
 
-	return withWriteLock(ctx, db, func(ctx context.Context, conn *sql.Conn) error {
+	return withWriteLockOptions(ctx, db, writeLockOptions{
+		// 表重建（create new → copy → drop → rename）只允许在未发布迁移里，且必须在
+		// 外键关闭时进行：resource_versions / notify_channels 被其它表引用，DROP 在
+		// 外键开启时会因引用行失败（迁移纪律 8）。
+		foreignKeysOff: true,
+		preCommit:      checkForeignKeys,
+	}, func(ctx context.Context, conn *sql.Conn) error {
 		state, current, err := inspectSchema(ctx, conn, target)
 		if err != nil {
 			return err
@@ -91,6 +103,44 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, target int) error {
 		// 五种状态在上方穷举——保留兜底，防新增状态漏改（不可达）。
 		return fmt.Errorf("storage: 未处理的 schema 状态 %d", state)
 	})
+}
+
+// checkForeignKeys 在提交前跑 PRAGMA foreign_key_check：任何违例都让整个迁移
+// 回滚（迁移纪律 8 —— 重建后的外键必须逐条复核通过才提交）。
+// checkForeignKeys runs PRAGMA foreign_key_check before COMMIT; any violation
+// aborts the transaction.
+func checkForeignKeys(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("外键校验: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	const maxReported = 5
+	var violations []string
+	for rows.Next() {
+		var (
+			table  string
+			rowid  sql.NullInt64
+			parent string
+			fkid   int64
+		)
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("外键校验结果: %w", err)
+		}
+		violations = append(violations,
+			fmt.Sprintf("%s(rowid=%d)→%s(fk#%d)", table, rowid.Int64, parent, fkid))
+		if len(violations) >= maxReported {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("外键校验: %w", err)
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf("迁移后外键校验失败（%s）——事务已回滚，请按备份恢复", strings.Join(violations, ", "))
+	}
+	return nil
 }
 
 // Migrate 是机制层 Migrate 的 *DB 形态（**装配面**）：持锁重路径（US-4 起）手里只有

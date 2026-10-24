@@ -286,6 +286,19 @@ pre {
   text-align: center;
 }
 
+/* 空状态里的新建入口：与说明文字留出呼吸，不贴边 */
+.empty button {
+  margin-top: 12px;
+}
+
+/* 页头动作组：计数与按钮同排；窄屏换行沿用 .page-heading 的 flex 规则 */
+.page-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+}
+
 /* ── 卡片与定义列表 ─────────────────────────────────────── */
 
 .card {
@@ -303,6 +316,16 @@ pre {
 
 .card > h2:first-child {
   margin-top: -2px;
+}
+
+/* 危险操作区：只加红色边线与标题颜色，不改变卡片既有间距 */
+.card.danger-zone {
+  margin-top: 28px;
+  border-color: #cfa9a3;
+}
+
+.card.danger-zone > h2 {
+  color: var(--bad);
 }
 
 .definitions {
@@ -990,6 +1013,134 @@ textarea.editor {
     margin-top: 4vh;
     padding: 22px 20px;
   }
+}
+
+/* ── 表单字段 / 能力绑定 / 聊天输入 / 定时任务（US-12 R3.5）── */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 12px 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.field span {
+  letter-spacing: 0.02em;
+}
+
+.tab-actions {
+  margin: 4px 0 6px;
+}
+
+.binding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 7px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+
+.check-row input[type='checkbox'] {
+  flex: none;
+  margin: 3px 0 0;
+}
+
+.check-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-head h2 {
+  margin: 0;
+}
+
+.card-head .form-actions {
+  margin: 0;
+}
+
+.chat-composer {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--line);
+}
+
+/* 会话详情：消息区独立滚动并停在最新一条，长对话不把输入区推到页面底部。 */
+.view-session-detail .transcript {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+.chat-composer textarea.editor,
+.schedule-form textarea.editor {
+  min-height: 96px;
+}
+
+/* 上次投递单元格：状态与脱敏说明分两行；读失败用错误色，避免与“未投递”混淆。 */
+.delivery-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.delivery-failed {
+  color: var(--bad);
+}
+
+.skill-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 10px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.skill-file-editor {
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.skill-file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.skill-file-head input {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+}
+
+.skill-file-editor textarea.editor {
+  min-height: 120px;
 }
 
 /* 尊重减少动态效果的系统设置 */

@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -42,6 +43,27 @@ const (
 
 	targetKindSystem = "system"
 	targetKindAgent  = "agent"
+)
+
+// 六个凭据 / 范围动作的固定字面量（契约 §9.3）：`target_id` 是资源 `resource_uid`
+// （不是名称），`detail_json` 只记资源名与凭据元数据，不记明文。
+// The six credential / scope action literals; their target id is the resource uid.
+const (
+	actionModelConnectionCredentialWrite  = "model_connection.credential.write"
+	actionModelConnectionCredentialRevoke = "model_connection.credential.revoke"
+	actionModelConnectionScope            = "model_connection.scope"
+	actionNotifyChannelCredentialWrite    = "notify_channel.credential.write"
+	actionNotifyChannelCredentialRevoke   = "notify_channel.credential.revoke"
+	actionNotifyChannelScope              = "notify_channel.scope"
+)
+
+// 状态文件的 schema 版本（与 internal/workspace/lifecycle.go 的
+// lifecycleSchemaVersionV1 / lifecycleSchemaVersion 同值）：v1 是 US-11 形态、不带
+// `agent_uid`，v2（US-12 R4）追加该字段。基线 v3 的恢复判据只区分这两档。
+// Lifecycle state-file schema versions: v1 carries no agent_uid, v2 adds it.
+const (
+	lifecycleFileSchemaV1 = 1
+	lifecycleFileSchemaV2 = 2
 )
 
 const (
@@ -81,13 +103,23 @@ type BaselineDeps struct {
 	Agents     []core.AgentEntry
 	Logger     *slog.Logger
 	Now        func() time.Time
+	// NewUID 是"指针缺失、待建首版"资源的身份分配器（缺省 `newResourceUID`）。
+	// 生产装配保持随机身份；夹具用确定性分配把版本目录变成可预期的断言目标。
+	// 已存在版本行的名称不会走到这里——那种情况复用既有 UID，不补发第二个身份。
+	// NewUID mints identities for resources that have no version yet; tests inject a
+	// deterministic allocator so the version directory is a predictable assertion target.
+	NewUID func(kind core.ResourceKind, name string) (core.ResourceUID, error)
 }
 
 // RecoveryDeps 是启动恢复的全部依赖；与 runBaseline 分开，恢复只查证、不重做。
-// `Registry` 与 `Scheduler` 属 US-12 的扩展面：本 US 的查证只需要磁盘与状态文件，
-// 注册表在 ⑤ 才构建、调度器在 ⑦ 才构造，恢复不依赖它们的当前值。
-// RecoveryDeps carries the recovery dependencies. Registry and Scheduler are carried
-// for US-12's expansion; this US verifies against the disk and the state file only.
+// US-11 的查证只需要磁盘与状态文件；US-12 按约束 44 扩到定义文件、版本行、发布指针、
+// 归档行与通知渠道行，因此新增的依赖一律**可选**：某一组查证的依赖缺失时该组只能
+// 判 indeterminate（→ unknown），**不得**因为装配少一项就把操作猜成成功或失败。
+// 生产装配在 wire.go 一次给全；`Registry` / `Scheduler` 在 ⑤ / ⑦ 才构建，恢复只
+// 查证它们的持久面，不读它们的当前值。
+// RecoveryDeps carries the recovery dependencies. The US-12 fields are optional on
+// purpose: a verifier whose dependency is missing returns indeterminate (unknown)
+// instead of guessing, because an incomplete assembly is never proof of an outcome.
 type RecoveryDeps struct {
 	Operations core.OperationStore
 	Resources  *storage.ResourceStore
@@ -97,6 +129,43 @@ type RecoveryDeps struct {
 	Scheduler  *core.Scheduler
 	Logger     *slog.Logger
 	Now        func() time.Time
+
+	// Root 是工作区根（`.basalt`）：Agent 目录、技能工作副本与 `mcp_servers.yaml`
+	// 都在它下面（约束 44 的"目标文件树"）。
+	// Root is the workspace root (.basalt) holding agent dirs, skill work copies and
+	// mcp_servers.yaml.
+	Root string
+	// ConfigPath 是实例配置（`basalt.yaml`）路径：模型连接定义的唯一宿主文件。
+	// ConfigPath is the instance config file owning the provider definitions.
+	ConfigPath string
+	// Skills 是技能库：工作副本哈希是技能写操作唯一的文件侧判据。
+	// Skills provides the work-copy hash used by every skill verdict.
+	Skills *workspace.SkillLibrary
+	// Gate 是进程级 Agent 写锁表：原名恢复的崩溃窗口补偿必须在它里面做（约束 44）。
+	// Gate is the per-agent write lock the original-name restore compensation needs.
+	Gate *core.AgentGate
+	// Archives 是归档行仓储：归档 / 恢复按 `operation_id` 与 `restored_at` 查证。
+	// Archives backs the archive and restore verdicts.
+	Archives *storage.AgentAdminStore
+	// Notify 是通知渠道仓储：按行存在性与脱敏字段哈希查证。
+	// Notify backs the notify-channel verdicts.
+	Notify *storage.NotifyAdminStore
+	// Credentials 是凭据仓储：凭据动作的四证（提交事实 / 版本状态 / 目标绑定哈希）
+	// 由它回答；缺失时该组只能判 indeterminate。
+	// Credentials backs the credential-action evidence.
+	Credentials *storage.CredentialStore
+	// Schema 回答库当前 schema 版本：v3 迁移操作的完成判据之一是库已在目标版本。
+	// Schema answers the current schema version for the v3-migration verdict.
+	Schema SchemaVersionSource
+	// NetworkPolicy 是网络域名白名单仓储：恢复按修订号与候选域名哈希判定三态。
+	// NetworkPolicy backs the allowlist verdict; nil means indeterminate only.
+	NetworkPolicy core.NetworkDomainPolicyStore
+}
+
+// SchemaVersionSource 回答库当前的 schema 版本（`*storage.DB` 满足）。
+// SchemaVersionSource reports the schema version held by the database.
+type SchemaVersionSource interface {
+	SchemaVersion(ctx context.Context) (int, error)
 }
 
 // ProviderDefinition 是一个模型连接定义的原文（配置文件中该条目逐行保真）。
@@ -179,6 +248,11 @@ type resourceWork struct {
 	id         string
 	definition []byte
 	versionID  int64
+	// uid 是建首版时要分配的资源身份（v3 起版本行必带 UID）；`versionID > 0`
+	// 的补 applied 路径不需要它——指针行的身份取自既有版本行。
+	// uid is the identity of a first version; the catch-up path takes it from the
+	// existing version row instead.
+	uid core.ResourceUID
 }
 
 // skillWork 是一条待建 / 待修技能项：`create` 建 v1 并物化快照，否则只按已发布版本
@@ -190,6 +264,9 @@ type skillWork struct {
 	create  bool
 	work    workspace.SkillVersion
 	version core.ResourceVersion
+	// uid 只在 `create` 时有意义：建首版要分配身份（复用中断基线留下的那一代）。
+	// uid only matters on the create path and is reused from an interrupted baseline.
+	uid core.ResourceUID
 }
 
 // agentWork 是一条待建 / 待补状态文件或索引的 Agent 项。
@@ -322,13 +399,24 @@ func runBaseline(ctx context.Context, deps BaselineDeps) error {
 // `operation_id`（约束 13 的可重入口径），多条 = 无法判断复用哪一条，拒绝启动。
 // findPendingBaseline reuses exactly one pending baseline row and refuses ambiguity.
 func findPendingBaseline(ctx context.Context, operations core.OperationStore) (string, bool, error) {
+	opID, pending, err := findPendingAction(ctx, operations, actionBaseline)
+	if err != nil {
+		return "", false, fmt.Errorf("启动基线：%w", err)
+	}
+	return opID, pending, nil
+}
+
+// findPendingAction 是上面两条"启动期迁移类操作"共用的查找面：按动作过滤未完成
+// 操作，0 条 = 新建、恰 1 条 = 复用、多条 = 拒绝（不猜复用哪一条）。
+// findPendingAction is the shared pending lookup; several rows of one action is refused.
+func findPendingAction(ctx context.Context, operations core.OperationStore, action string) (string, bool, error) {
 	pending, err := operations.PendingOperations(ctx)
 	if err != nil {
-		return "", false, fmt.Errorf("启动基线：读取未完成操作失败: %w", err)
+		return "", false, fmt.Errorf("读取未完成操作失败: %w", err)
 	}
 	var ids []string
 	for _, op := range pending {
-		if op.Action == actionBaseline {
+		if op.Action == action {
 			ids = append(ids, op.OperationID)
 		}
 	}
@@ -338,8 +426,8 @@ func findPendingBaseline(ctx context.Context, operations core.OperationStore) (s
 	case 1:
 		return ids[0], true, nil
 	default:
-		return "", false, fmt.Errorf("启动基线：发现 %d 条未完成的 %s 操作（%s），无法确定复用哪一条",
-			len(ids), actionBaseline, strings.Join(ids, "、"))
+		return "", false, fmt.Errorf("发现 %d 条未完成的 %s 操作（%s），无法确定复用哪一条",
+			len(ids), action, strings.Join(ids, "、"))
 	}
 }
 
@@ -392,6 +480,11 @@ func scanResource(ctx context.Context, deps BaselineDeps, kind core.ResourceKind
 	pointer, err := deps.Resources.Pointer(ctx, kind, id)
 	switch {
 	case errors.Is(err, core.ErrResourceNotFound):
+		uid, uidErr := baselineResourceUID(ctx, deps, kind, id)
+		if uidErr != nil {
+			return resourceWork{}, false, uidErr
+		}
+		item.uid = uid
 		return item, true, nil
 	case err != nil:
 		return resourceWork{}, false, err
@@ -420,6 +513,33 @@ func scanResource(ctx context.Context, deps BaselineDeps, kind core.ResourceKind
 	return resourceWork{}, false, nil
 }
 
+// baselineResourceUID 为"指针缺失、待建首版"的资源确定身份。库里现存该名称的版本行
+// 只可能来自"上次基线在建版与发布之间中断"——复用那一代的 UID，**不**给同一实例补发
+// 第二个身份（agent 侧同一条纪律）。同一名称下出现两代 UID 说明库被外部改写，无法
+// 判定该沿用哪一个：fail-closed 拒绝启动，不按名称猜。
+// baselineResourceUID reuses the uid of an interrupted baseline insert instead of
+// minting a second identity for the same instance; two uids for one name fail closed.
+func baselineResourceUID(ctx context.Context, deps BaselineDeps, kind core.ResourceKind, name string) (core.ResourceUID, error) {
+	versions, err := deps.Resources.Versions(ctx, kind, name)
+	if err != nil {
+		return "", fmt.Errorf("读取 %s %s 的既有版本: %w", kind, name, err)
+	}
+	if len(versions) == 0 {
+		if deps.NewUID != nil {
+			return deps.NewUID(kind, name)
+		}
+		return newResourceUID(kind, name)
+	}
+	uid := versions[0].ResourceUID
+	for _, version := range versions[1:] {
+		if version.ResourceUID != uid {
+			return "", fmt.Errorf("%s %s 的既有版本分属两个以上资源身份（%s / %s），基线不猜测应沿用哪一个",
+				kind, name, uid, version.ResourceUID)
+		}
+	}
+	return uid, nil
+}
+
 // scanSkills 逐个技能判定：不是技能实体（缺 SKILL.md）→ WARN 跳过；没有发布指针 → 建 v1；
 // 已发布版本快照缺失 → 按该版本补物化；工作副本内容变了 → 只 WARN"待发布"（注 9）。
 // scanSkills skips non-entities with a warning and only fixes missing pointers or
@@ -445,7 +565,11 @@ func scanSkills(ctx context.Context, deps BaselineDeps) ([]skillWork, error) {
 		pointer, ptrErr := deps.Resources.Pointer(ctx, core.ResourceSkill, name)
 		switch {
 		case errors.Is(ptrErr, core.ErrResourceNotFound):
-			work = append(work, skillWork{name: name, create: true, work: copyVersion})
+			uid, uidErr := baselineResourceUID(ctx, deps, core.ResourceSkill, name)
+			if uidErr != nil {
+				return nil, uidErr
+			}
+			work = append(work, skillWork{name: name, create: true, work: copyVersion, uid: uid})
 			continue
 		case ptrErr != nil:
 			return nil, ptrErr
@@ -549,6 +673,7 @@ func applyResourceWork(ctx context.Context, deps BaselineDeps, item resourceWork
 
 	version, inserted, err := deps.Resources.EnsureVersion(ctx, core.ResourceVersion{
 		Kind:           item.kind,
+		ResourceUID:    item.uid,
 		ResourceID:     item.id,
 		VersionNo:      baselineVersionNo,
 		ContentHash:    baselineResourceHash(string(item.kind), item.id, item.definition),
@@ -578,7 +703,7 @@ func applyResourceWork(ctx context.Context, deps BaselineDeps, item resourceWork
 // missing snapshot from the published version without touching the pointer.
 func applySkillWork(ctx context.Context, deps BaselineDeps, item skillWork, opID string, now time.Time) error {
 	if !item.create {
-		materialized, err := deps.Skills.Materialize(ctx, item.name, item.version.VersionNo, item.version.ContentHash)
+		materialized, err := deps.Skills.RestorePublished(ctx, item.name, item.version.VersionNo, item.version.ContentHash, item.version.StoragePath)
 		if err != nil {
 			return fmt.Errorf("技能 %s 的发布版本 v%d 快照缺失，且无法按该版本重建: %w",
 				item.name, item.version.VersionNo, err)
@@ -603,7 +728,7 @@ func applySkillWork(ctx context.Context, deps BaselineDeps, item skillWork, opID
 			if !errors.Is(loadErr, fs.ErrNotExist) {
 				return fmt.Errorf("技能 %s 的发布版本 v%d 不可用: %w", item.name, existing.VersionNo, loadErr)
 			}
-			if _, materializeErr := deps.Skills.Materialize(ctx, item.name, existing.VersionNo, existing.ContentHash); materializeErr != nil {
+			if _, materializeErr := deps.Skills.RestorePublished(ctx, item.name, existing.VersionNo, existing.ContentHash, existing.StoragePath); materializeErr != nil {
 				return fmt.Errorf("技能 %s 的发布版本 v%d 快照缺失，且无法按该版本重建: %w",
 					item.name, existing.VersionNo, materializeErr)
 			}
@@ -611,7 +736,7 @@ func applySkillWork(ctx context.Context, deps BaselineDeps, item skillWork, opID
 		return nil
 	}
 
-	materialized, err := deps.Skills.Materialize(ctx, item.name, baselineVersionNo, item.work.ContentHash)
+	materialized, err := deps.Skills.Materialize(ctx, item.name, item.uid, baselineVersionNo, item.work.ContentHash)
 	if err != nil {
 		return fmt.Errorf("技能 %s 物化首版快照: %w", item.name, err)
 	}
@@ -621,6 +746,7 @@ func applySkillWork(ctx context.Context, deps BaselineDeps, item skillWork, opID
 	}
 	version, inserted, err := deps.Resources.EnsureVersion(ctx, core.ResourceVersion{
 		Kind:         core.ResourceSkill,
+		ResourceUID:  item.uid,
 		ResourceID:   item.name,
 		VersionNo:    baselineVersionNo,
 		ContentHash:  materialized.ContentHash,
@@ -717,6 +843,10 @@ type operationDetail struct {
 	PreviousSHA256     string  `json:"previous_sha256"`
 	ExpectedState      *string `json:"expected_state"`
 	ExpectedGeneration *int64  `json:"expected_generation"`
+	// 网络域名白名单（R8.2.4 第 6 条）：修订号前后值与候选域名哈希。指针类型让
+	// "缺字段"区别于零值——缺字段即无法判定，不用 0 猜。
+	BeforeRevision *int64 `json:"before_revision"`
+	AfterRevision  *int64 `json:"after_revision"`
 }
 
 // decodeOperationDetail 解析 `detail_json`；空串 / 非法 JSON 都返回错误，由调用方
@@ -774,15 +904,76 @@ func recoverPendingOperations(ctx context.Context, deps RecoveryDeps) error {
 	return nil
 }
 
-// verifyOperation 按 action 组选择查证方式；其它 action（含 `system.baseline_v2`——
-// 它已在 ③ 完成或已拒绝启动）一律无法判定 → indeterminate，US-12 再扩展具体查证。
-// verifyOperation dispatches by action; unknown actions stay indeterminate.
+// verifyOperation 按 action 组选择查证方式（约束 44 / 契约 §9.4 的恢复表）：
+// `agent.content.update` / `agent.disable|enable` 沿用 US-11 的查证，其余本 US 动作组
+// 按目标文件树 / 状态文件 / 定义文件 / 版本行 / 指针 / 删除标记 / 渠道行查证。
+// `agent.generate_files` 不写管理操作行（契约 §9.3 注 3），因此不会出现在这里；
+// 其它 action（含 `system.baseline_v2`——它已在 ③ 完成或已拒绝启动）一律无法判定。
+// verifyOperation dispatches by action group; unknown actions stay indeterminate.
 func verifyOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
 	switch op.Action {
 	case actionContentUpdate:
 		return verifyContentUpdate(ctx, deps, op)
 	case actionDisable, actionEnable:
 		return verifyLifecycleOperation(ctx, deps, op)
+	case core.ActionAgentCreate, core.ActionAgentCopy:
+		return verifyAgentBootstrap(ctx, deps, op)
+	case core.ActionAgentFilesUpdate:
+		return verifyAgentFilesUpdate(deps, op)
+	case core.ActionAgentArchive:
+		return verifyAgentArchive(ctx, deps, op)
+	case core.ActionAgentRestore:
+		return verifyAgentRestore(ctx, deps, op)
+	case core.ActionModelConnectionCreate, core.ActionModelConnectionUpdate,
+		core.ActionModelConnectionPublish,
+		core.ActionMCPServerCreate, core.ActionMCPServerUpdate, core.ActionMCPServerPublish,
+		core.ActionSkillCreate, core.ActionSkillImport, core.ActionSkillUpdate,
+		core.ActionSkillPublish:
+		return verifyResourceWrite(ctx, deps, op)
+	case core.ActionModelConnectionDelete, core.ActionMCPServerDelete, core.ActionSkillDelete:
+		return verifyResourceDelete(ctx, deps, op)
+	case core.ActionModelConnectionTest, core.ActionMCPServerTest, core.ActionNotifyChannelTest:
+		return verifyResourceTest(op)
+	case core.ActionNotifyChannelCreate, core.ActionNotifyChannelUpdate,
+		core.ActionNotifyChannelDelete:
+		return verifyNotifyChannel(ctx, deps, op)
+	case actionModelConnectionCredentialWrite, actionModelConnectionCredentialRevoke,
+		actionNotifyChannelCredentialWrite, actionNotifyChannelCredentialRevoke:
+		return verifyCredentialAction(ctx, deps, op)
+	case actionModelConnectionScope, actionNotifyChannelScope:
+		return verifyScopeConversion(ctx, deps, op)
+	case actionBaselineV3:
+		return verifyBaselineV3(ctx, deps, op)
+	case core.ActionNetworkAllowlistUpdate:
+		return verifyNetworkAllowlist(ctx, deps, op)
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyNetworkAllowlist 按修订号与候选域名哈希判定白名单写入三态（R8.2.4 第 6 条）：
+// 当前修订 = after 且域名哈希一致 → applied；仍为 before → not_applied；其余
+// （含无行 / 读失败）→ indeterminate，**不重做**。
+// verifyNetworkAllowlist follows the revision-CAS verdicts for the allowlist write.
+func verifyNetworkAllowlist(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.NetworkPolicy == nil || op.TargetKind != core.TargetKindNetworkAllowlist {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeOperationDetail(op.DetailJSON)
+	if err != nil || detail.BeforeRevision == nil || detail.AfterRevision == nil ||
+		detail.CandidateSHA256 == "" {
+		return core.VerificationIndeterminate
+	}
+	policy, exists, loadErr := deps.NetworkPolicy.Load(ctx)
+	if loadErr != nil || !exists {
+		return core.VerificationIndeterminate
+	}
+	switch {
+	case policy.Revision == *detail.AfterRevision &&
+		networkDomainsSHA256(policy.Domains) == detail.CandidateSHA256:
+		return core.VerificationApplied
+	case policy.Revision == *detail.BeforeRevision:
+		return core.VerificationNotApplied
 	default:
 		return core.VerificationIndeterminate
 	}
@@ -864,6 +1055,1029 @@ func verifyLifecycleOperation(ctx context.Context, deps RecoveryDeps, op core.Op
 		return core.VerificationNotApplied
 	default:
 		return core.VerificationIndeterminate
+	}
+}
+
+// —— US-12 动作组的查证（约束 44 / 契约 §9.4）——
+// 三条纪律：① 只读目标面、不重做任何写——唯一例外是约束 44 点名的原名恢复崩溃窗口
+// 补偿，那是"把半残状态退回可重试"，不是重做；② 装配缺依赖或读不懂 `detail_json`
+// 一律 indeterminate，不把"读不到"读成"没生效"；③ 只有可证实的结果才给
+// applied / not_applied，其余一律 indeterminate → unknown 交人判断。
+// The US-12 verifiers only read. The sole exception is the original-name restore
+// compensation named by constraint 44. Missing dependencies or unreadable details are
+// always indeterminate: "cannot read" is never "did not apply".
+
+// verifyAgentBootstrap 判定 `agent.create` / `agent.copy`（契约 §9.4）：Bootstrap 先写
+// 状态文件、目录由 staging 单次 rename 落位，两者都在才是 applied；两者都不在是
+// not_applied（"目标不存在"）；只剩一半（状态先落 / 目录在而状态不在）→ indeterminate。
+// 这里**不**补偿：契约只对原名恢复点名了补偿窗口，其余半残状态交人查证。
+// verifyAgentBootstrap accepts both the disabled generation-1 state file and the target
+// directory as proof; any half state stays indeterminate and is never compensated.
+func verifyAgentBootstrap(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Lifecycle == nil || deps.Root == "" || op.TargetKind != targetKindAgent {
+		return core.VerificationIndeterminate
+	}
+	if err := workspace.ValidateAgentName(op.TargetID); err != nil {
+		return core.VerificationIndeterminate
+	}
+
+	record, exists, readErr := deps.Lifecycle.Read(ctx, op.TargetID)
+	dirPresent, dirErr := agentDirPresent(deps.Root, op.TargetID)
+	if dirErr != nil {
+		return core.VerificationIndeterminate
+	}
+
+	switch {
+	case readErr == nil && exists && record.State == core.AgentDisabled &&
+		record.Generation == 1 && record.OperationID == op.OperationID && dirPresent:
+		return core.VerificationApplied
+	case errors.Is(readErr, fs.ErrNotExist) && !dirPresent:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyAgentFilesUpdate 按契约 §9.4 判定多文件提交：当前受管集合 ETag = 候选 ETag →
+// applied；仍等于基础 ETag → not_applied；目标不存在 → not_applied（契约把"不存在"
+// 归入未生效）；其余（被第三方改写、读不懂 detail）→ indeterminate。
+// verifyAgentFilesUpdate compares the current managed-file ETag with the candidate and
+// base ETags recorded before the pre-write.
+func verifyAgentFilesUpdate(deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Root == "" || op.TargetKind != targetKindAgent {
+		return core.VerificationIndeterminate
+	}
+	if err := workspace.ValidateAgentName(op.TargetID); err != nil {
+		return core.VerificationIndeterminate
+	}
+	var detail agentFilesOperationDetail
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil || detail.CandidateETag == "" {
+		return core.VerificationIndeterminate
+	}
+
+	_, currentETag, err := workspace.ManagedAgentFiles(deps.Root, op.TargetID)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// 契约 §9.4："目标仍为旧哈希或不存在" 属 not_applied。
+			return core.VerificationNotApplied
+		}
+		return core.VerificationIndeterminate
+	}
+	switch {
+	case currentETag == detail.CandidateETag:
+		return core.VerificationApplied
+	case detail.BaseETag != "" && currentETag == detail.BaseETag:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyAgentArchive 按契约 §9.4 判定归档：状态文件 `archived`（本次 op 写的）且归档行
+// 存在、归档目录清单哈希与行一致 → applied；状态仍是归档前值且目录仍在活动区 →
+// not_applied；目录已移出但归档行缺失 / 清单不完整 → indeterminate（约束 32 ⑦ 的崩溃窗口）。
+// verifyAgentArchive requires the archived state, the archive row and a matching manifest
+// hash; a directory moved without its row stays indeterminate.
+func verifyAgentArchive(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if op.TargetKind != targetKindAgent || deps.Lifecycle == nil || deps.Archives == nil ||
+		deps.Root == "" {
+		return core.VerificationIndeterminate
+	}
+	if err := workspace.ValidateAgentName(op.TargetID); err != nil {
+		return core.VerificationIndeterminate
+	}
+	var detail agentArchiveOperationDetail
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil {
+		return core.VerificationIndeterminate
+	}
+	before := core.AgentState(detail.BeforeState)
+	if before != core.AgentActive && before != core.AgentDisabled {
+		return core.VerificationIndeterminate
+	}
+
+	record, exists, readErr := deps.Lifecycle.Read(ctx, op.TargetID)
+	if readErr != nil || !exists {
+		// 归档后状态文件必须保留（约束 32）：缺失或损坏都无法判定。
+		return core.VerificationIndeterminate
+	}
+	dirPresent, dirErr := agentDirPresent(deps.Root, op.TargetID)
+	if dirErr != nil {
+		return core.VerificationIndeterminate
+	}
+
+	switch {
+	case record.State == core.AgentArchived:
+		if record.OperationID != op.OperationID {
+			return core.VerificationIndeterminate
+		}
+		found, row, rowErr := archiveRowForOperation(ctx, deps.Archives, op)
+		if rowErr != nil || !found {
+			return core.VerificationIndeterminate
+		}
+		contentHash, hashErr := workspace.ArchiveDirContentHash(deps.Root,
+			path.Join(agentArchiveDirName, row.ArchiveID))
+		if hashErr != nil || contentHash != row.ContentHash {
+			return core.VerificationIndeterminate
+		}
+		return core.VerificationApplied
+	case record.State == before && dirPresent:
+		// 含"回滚已完成（generation 再 +1、op 仍是本次）"的形态：效果已退回，未生效。
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyAgentRestore 按契约 §9.4 与约束 44 判定恢复。原名路径状态文件必须保留为
+// `archived`；异名路径在 Bootstrap 之前不存在状态文件。唯一补偿窗口：原名恢复在
+// `Transition(archived → disabled)` 之后、目录 rename 之前崩溃（状态 disabled、目录
+// 不存在）——在 Agent 写锁内以当前 generation 条件补偿回 `archived` 后置 failed；
+// 其它不确定形态保持 unknown，不自动补做。
+// verifyAgentRestore compensates exactly the original-name crash window constraint 44
+// names; every other uncertain shape stays unknown.
+func verifyAgentRestore(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if op.TargetKind != targetKindAgent || deps.Lifecycle == nil || deps.Archives == nil ||
+		deps.Root == "" {
+		return core.VerificationIndeterminate
+	}
+	var detail agentRestoreOperationDetail
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil || detail.ArchiveID == "" {
+		return core.VerificationIndeterminate
+	}
+	if detail.Target == "" || detail.Target != op.TargetID {
+		return core.VerificationIndeterminate
+	}
+	if err := workspace.ValidateAgentName(detail.Target); err != nil {
+		return core.VerificationIndeterminate
+	}
+	row, rowErr := deps.Archives.ArchiveByID(ctx, detail.ArchiveID)
+	if rowErr != nil {
+		return core.VerificationIndeterminate
+	}
+	if detail.Renamed != (detail.Target != row.AgentName) {
+		// detail 与归档行的身份不自洽：不拿它做判据。
+		return core.VerificationIndeterminate
+	}
+
+	dirPresent, dirErr := agentDirPresent(deps.Root, detail.Target)
+	if dirErr != nil {
+		return core.VerificationIndeterminate
+	}
+	record, exists, readErr := deps.Lifecycle.Read(ctx, detail.Target)
+	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
+		return core.VerificationIndeterminate
+	}
+	if readErr != nil || !exists {
+		// 异名路径在 Bootstrap 之前崩溃 → 未生效；原名路径的状态文件归档后必须保留。
+		if !dirPresent && detail.Renamed && row.RestoredAt == nil {
+			return core.VerificationNotApplied
+		}
+		return core.VerificationIndeterminate
+	}
+
+	switch {
+	case record.State == core.AgentDisabled && record.OperationID == op.OperationID:
+		if row.RestoredAt != nil && dirPresent {
+			// 防御分支：`MarkRestored` 与终态同事务，pending 行本不该命中。
+			return core.VerificationApplied
+		}
+		if dirPresent || detail.Renamed {
+			// 目录已落而归档行未标记：效果在、记账缺；异名 Bootstrap 之后崩溃：卡片没有
+			// 点名补偿窗口。两种都交人查证，不自动补做。
+			return core.VerificationIndeterminate
+		}
+		return compensateOriginalRestore(ctx, deps, op, detail.Target)
+	case !detail.Renamed && record.State == core.AgentArchived &&
+		row.RestoredAt == nil && !dirPresent:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// compensateOriginalRestore 在 Agent 写锁内把"状态 disabled、目录不存在"的原名恢复
+// 崩溃窗口补偿回 `archived`（generation 再 +1，不回退），归档行保持未恢复、可重试。
+// 这是约束 44 点名的补偿**不是**重做：不重新复制归档内容，失败只保留 unknown。
+// compensateOriginalRestore rolls the half-applied original-name restore back to
+// archived under the agent write lock, exactly as constraint 44 mandates.
+func compensateOriginalRestore(ctx context.Context, deps RecoveryDeps,
+	op core.OperationRecord, target string,
+) string {
+	if deps.Gate == nil {
+		return core.VerificationIndeterminate
+	}
+	unlock := deps.Gate.Lock(target)
+	defer unlock()
+
+	// 锁内重读：补偿只建立在"当前事实仍是本操作留下的 disabled"之上。
+	current, exists, readErr := deps.Lifecycle.Read(ctx, target)
+	if readErr != nil || !exists || current.State != core.AgentDisabled ||
+		current.OperationID != op.OperationID {
+		return core.VerificationIndeterminate
+	}
+	compensated, transErr := deps.Lifecycle.Transition(ctx, target, core.AgentDisabled,
+		current.Generation, core.AgentArchived, op.OperationID)
+	if transErr != nil {
+		deps.logger().Error("启动恢复：原名恢复崩溃窗口补偿失败，保留 unknown",
+			"agent", target, "operation_id", op.OperationID, "error", transErr)
+		return core.VerificationIndeterminate
+	}
+	if deps.Resources != nil {
+		if idxErr := deps.Resources.PutLifecycleIndex(context.WithoutCancel(ctx),
+			compensated, true, ""); idxErr != nil {
+			// 索引是派生视图：失败只记 ERROR，状态文件才是权威（约束 32 / 36）。
+			deps.logger().Error("启动恢复：补偿后生命周期索引同步失败（状态文件为准，下次启动基线修复）",
+				"agent", target, "operation_id", op.OperationID, "error", idxErr)
+		}
+	}
+	deps.logger().Warn("启动恢复：原名恢复在目录落位前崩溃，状态已补偿回 archived 并置 failed",
+		"agent", target, "operation_id", op.OperationID)
+	return core.VerificationNotApplied
+}
+
+// verifyResourceWrite 判定模型连接 / MCP / 技能的写与发布（契约 §9.4）：指针指向本次
+// 操作写的版本 → applied（防御分支：版本 + 指针 + 终态同事务，pending 行本不该命中）；
+// 指针仍指向旧版本且文件仍与旧版本逐字节一致 → not_applied；文件与指针不一致（含文件
+// 缺失）→ indeterminate——这正是约束 13 的"文件已改而指针未改"崩溃窗口。
+// verifyResourceWrite proves "no byte landed" only when the pointer and the file still
+// agree on the old version; any file/pointer divergence stays indeterminate.
+func verifyResourceWrite(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Resources == nil {
+		return core.VerificationIndeterminate
+	}
+	kind, ok := resourceKindOfTarget(op.TargetKind)
+	if !ok {
+		return core.VerificationIndeterminate
+	}
+
+	if version, found, err := operationVersion(ctx, deps, kind, op); err != nil {
+		return core.VerificationIndeterminate
+	} else if found {
+		pointer, ptrErr := deps.Resources.Pointer(ctx, kind, op.TargetID)
+		if ptrErr == nil && pointer.DeletedAt == nil && pointer.PublishedVersionID == version.ID {
+			return core.VerificationApplied
+		}
+		return core.VerificationIndeterminate
+	}
+
+	pointer, ptrErr := deps.Resources.Pointer(ctx, kind, op.TargetID)
+	switch {
+	case errors.Is(ptrErr, core.ErrResourceNotFound):
+		// 没有指针：只有"创建 / 导入"且文件侧也证明资源不存在才是 not_applied。
+		return verifyResourceAbsent(deps, kind, op)
+	case ptrErr != nil:
+		return core.VerificationIndeterminate
+	case pointer.DeletedAt != nil:
+		// 资源已删除：删除可能发生在本操作之后，无法区分 → 不确定。
+		return core.VerificationIndeterminate
+	}
+
+	published, err := deps.Resources.VersionByID(ctx, pointer.PublishedVersionID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	matches, matchErr := versionMatchesFile(deps, kind, op.TargetID, published)
+	if matchErr != nil {
+		return core.VerificationIndeterminate
+	}
+	if matches {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyResourceAbsent 是"没有发布指针"时的进一步查证：创建 / 导入动作且定义文件里
+// 确实没有该条目（技能为工作副本不存在）才可判 not_applied；文件与库不一致时仍然交人。
+// verifyResourceAbsent only clears create/import actions when the file side agrees that
+// the resource does not exist.
+func verifyResourceAbsent(deps RecoveryDeps, kind core.ResourceKind, op core.OperationRecord) string {
+	switch op.Action {
+	case core.ActionModelConnectionCreate, core.ActionMCPServerCreate,
+		core.ActionSkillCreate, core.ActionSkillImport:
+	default:
+		return core.VerificationIndeterminate
+	}
+
+	if kind == core.ResourceSkill {
+		if deps.Skills == nil {
+			return core.VerificationIndeterminate
+		}
+		_, err := deps.Skills.HashWorkCopy(op.TargetID)
+		switch {
+		case err == nil:
+			// 工作副本在、指针不在：磁盘与库不一致，启动基线本应先建 v1。
+			return core.VerificationIndeterminate
+		case errors.Is(err, fs.ErrNotExist):
+			return core.VerificationNotApplied
+		default:
+			return core.VerificationIndeterminate
+		}
+	}
+
+	doc, err := definitionDocFor(deps, kind)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return core.VerificationNotApplied
+		}
+		return core.VerificationIndeterminate
+	}
+	present, presentErr := definitionBlockPresent(doc, definitionKeyOf(kind), op.TargetID)
+	if presentErr != nil || present {
+		return core.VerificationIndeterminate
+	}
+	return core.VerificationNotApplied
+}
+
+// verifyResourceDelete 判定删除（契约 §9.4 / 约束 13）：删除标记由本次操作写入 →
+// applied（防御分支）；指针未删除且文件仍与已发布版本一致 → not_applied；文件已被移除
+// 或与指针不一致 → indeterminate（"文件已改而指针未改"，不自动补做）。
+// verifyResourceDelete never redoes the delete: only a still-intact file proves that no
+// byte was touched.
+func verifyResourceDelete(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Resources == nil {
+		return core.VerificationIndeterminate
+	}
+	kind, ok := resourceKindOfTarget(op.TargetKind)
+	if !ok {
+		return core.VerificationIndeterminate
+	}
+
+	pointer, ptrErr := deps.Resources.Pointer(ctx, kind, op.TargetID)
+	switch {
+	case errors.Is(ptrErr, core.ErrResourceNotFound):
+		return core.VerificationApplied
+	case ptrErr != nil:
+		return core.VerificationIndeterminate
+	}
+	if pointer.DeletedAt != nil {
+		if pointer.OperationID == op.OperationID {
+			return core.VerificationApplied
+		}
+		return core.VerificationIndeterminate
+	}
+
+	published, err := deps.Resources.VersionByID(ctx, pointer.PublishedVersionID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	matches, matchErr := versionMatchesFile(deps, kind, op.TargetID, published)
+	if matchErr != nil {
+		return core.VerificationIndeterminate
+	}
+	if matches {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyResourceTest 查证模型 / MCP 测试操作（契约 §9.4 / 注 15）：pending 行上的
+// `detail_json` 是预写形态 `{}`，既没有完整结果、也证明不了"调用没发出"——两栏都无法
+// 成立，只能 indeterminate → unknown；恢复**不得重发**（重发会产生新的 operation_id，
+// 且在可能计费的调用上再打一次）。
+// A pending test row carries only the pre-write {} and can prove neither outcome, so the
+// verdict is always unknown and the call is never resent.
+func verifyResourceTest(op core.OperationRecord) string {
+	var detail modelTestOperationDetail
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil {
+		return core.VerificationIndeterminate
+	}
+	if detail.OK || detail.ErrorCode != "" {
+		// 防御分支：终态 detail 由 finish 写入，pending 行本不该命中。
+		return core.VerificationApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyNotifyChannel 按契约 §9.4 判定通知渠道写：行字段的脱敏哈希与候选一致 →
+// applied；仍是旧值 / 不存在 → not_applied（删除动作的"不存在"即 applied）；行存在但
+// 字段被第三方改写 → indeterminate。哈希对象是 `channelRequestHash` 的同一材料，
+// 不存渠道原文。
+// verifyNotifyChannel compares redacted field hashes; the raw channel never enters the
+// operation detail.
+func verifyNotifyChannel(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Notify == nil || op.TargetKind != core.TargetKindNotifyChannel ||
+		op.TargetID == "" {
+		return core.VerificationIndeterminate
+	}
+	var detail notifyChannelOperationDetail
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil {
+		return core.VerificationIndeterminate
+	}
+	if detail.BeforeSHA256 == "" && detail.AfterSHA256 == "" {
+		return core.VerificationIndeterminate
+	}
+
+	current, readErr := deps.Notify.Get(ctx, op.TargetID)
+	if errors.Is(readErr, core.ErrResourceNotFound) {
+		if op.Action == core.ActionNotifyChannelDelete && detail.AfterSHA256 == "" {
+			return core.VerificationApplied
+		}
+		return core.VerificationNotApplied
+	}
+	if readErr != nil {
+		return core.VerificationIndeterminate
+	}
+	currentHash := channelRequestHash(current)
+
+	switch op.Action {
+	case core.ActionNotifyChannelCreate:
+		if detail.AfterSHA256 != "" && currentHash == detail.AfterSHA256 {
+			return core.VerificationApplied
+		}
+		return core.VerificationIndeterminate
+	case core.ActionNotifyChannelUpdate:
+		switch {
+		case detail.AfterSHA256 != "" && currentHash == detail.AfterSHA256:
+			return core.VerificationApplied
+		case detail.BeforeSHA256 != "" && currentHash == detail.BeforeSHA256:
+			return core.VerificationNotApplied
+		default:
+			return core.VerificationIndeterminate
+		}
+	case core.ActionNotifyChannelDelete:
+		if detail.BeforeSHA256 != "" && currentHash == detail.BeforeSHA256 {
+			return core.VerificationNotApplied
+		}
+		return core.VerificationIndeterminate
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// credentialActionDetail 是凭据 / 范围动作 detail_json 的恢复投影（契约 §9.4 的四证）：
+// ① 操作 ID 与 detail（资源 kind / name / UID、写前写后 revision、凭据 ID 与版本号、
+// 目标绑定哈希、撤销纪元、范围前后值）；② 数据库提交事实由仓储行回答（`operation_id`
+// 是"这一事务确实提交过"的落点）；③ 凭据身份与版本状态；④ 目标绑定哈希。
+// 缺任何一个必需字段就是"证据不足"，**不得**用零值把它补成成功或失败。
+// credentialActionDetail is the four-evidence projection of a credential or scope action;
+// a missing field means the evidence is insufficient, never a zero-value guess.
+type credentialActionDetail struct {
+	Kind                  string `json:"kind"`
+	Name                  string `json:"name"`
+	ResourceUID           string `json:"resource_uid,omitempty"`
+	Revision              int    `json:"revision"`
+	PreviousRevision      int    `json:"previous_revision"`
+	Scope                 string `json:"scope,omitempty"`
+	OwnerAgentUID         string `json:"owner_agent_uid,omitempty"`
+	PreviousScope         string `json:"previous_scope,omitempty"`
+	PreviousOwnerAgentUID string `json:"previous_owner_agent_uid,omitempty"`
+	Mode                  string `json:"mode,omitempty"`
+	CredentialID          string `json:"credential_id,omitempty"`
+	VersionNo             int    `json:"version_no,omitempty"`
+	PreviousVersion       int    `json:"previous_version,omitempty"`
+	TargetBinding         string `json:"target_binding,omitempty"`
+	RevocationEpoch       int    `json:"revocation_epoch,omitempty"`
+	PreviousEpoch         int    `json:"previous_epoch,omitempty"`
+	// AffectedEligibleAgents 是切到专属后不再收到该渠道的 Agent 名单（R4.5 的影响提示）：
+	// 与响应同源，落进操作记录供事后核对"当时告诉过谁"。空名单省略。
+	// AffectedEligibleAgents mirrors the response hint into the audit record.
+	AffectedEligibleAgents []string `json:"affected_eligible_agents,omitempty"`
+}
+
+// decodeCredentialActionDetail 解析并做形状校验：资源种类必须是两类带凭据的资源之一，
+// `resource_uid`（若记录）必须是合法 UID 且与操作行目标一致。读不懂 → 交由调用方判
+// indeterminate。
+// decodeCredentialActionDetail parses and shape-checks the detail projection.
+func decodeCredentialActionDetail(op core.OperationRecord, uid core.ResourceUID) (credentialActionDetail, error) {
+	var detail credentialActionDetail
+	if len(op.DetailJSON) == 0 {
+		return detail, errors.New("detail_json 为空")
+	}
+	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil {
+		return credentialActionDetail{}, err
+	}
+	if _, err := core.ParseBindingKind(detail.Kind); err != nil {
+		return credentialActionDetail{}, err
+	}
+	if detail.ResourceUID != "" {
+		recorded, err := core.ParseResourceUID(detail.ResourceUID)
+		if err != nil {
+			return credentialActionDetail{}, err
+		}
+		if recorded != uid {
+			return credentialActionDetail{}, fmt.Errorf("detail 的资源 UID %s 与操作目标 %s 不一致", recorded, uid)
+		}
+	}
+	return detail, nil
+}
+
+// credentialTargetSnapshot 是目标资源行上由管理写维护的提交事实：`revision` 与
+// `operation_id` 回答"哪个事务写到了这一行"，`scope` / 属主回答范围动作的结果。
+// credentialTargetSnapshot carries the commit facts a credential or scope action leaves
+// on the resource row.
+type credentialTargetSnapshot struct {
+	Revision      int
+	OperationID   string
+	Scope         core.ResourceScope
+	OwnerAgentUID core.AgentUID
+}
+
+// readCredentialTarget 按资源种类读目标的提交事实：模型连接读发布指针，通知渠道读渠道行
+// （含墓碑——删除之后仍要能查证当时那一次写）。读不到即证据缺失（false）。
+// readCredentialTarget reads the commit facts; a read failure is missing evidence.
+func readCredentialTarget(ctx context.Context, deps RecoveryDeps, kind core.BindingKind,
+	uid core.ResourceUID,
+) (credentialTargetSnapshot, bool) {
+	switch kind {
+	case core.BindingModelConnection:
+		if deps.Resources == nil {
+			return credentialTargetSnapshot{}, false
+		}
+		ptr, err := deps.Resources.PointerByUID(ctx, core.ResourceModelConnection, uid)
+		if err != nil {
+			return credentialTargetSnapshot{}, false
+		}
+		return credentialTargetSnapshot{
+			Revision: ptr.Revision, OperationID: ptr.OperationID,
+			Scope: ptr.Scope, OwnerAgentUID: ptr.OwnerAgentUID,
+		}, true
+	case core.BindingNotifyChannel:
+		if deps.Notify == nil {
+			return credentialTargetSnapshot{}, false
+		}
+		channel, err := deps.Notify.GetByUID(ctx, uid)
+		if err != nil {
+			return credentialTargetSnapshot{}, false
+		}
+		return credentialTargetSnapshot{
+			Revision: channel.Revision, OperationID: channel.OperationID,
+			Scope: channel.Scope, OwnerAgentUID: channel.OwnerAgentUID,
+		}, true
+	default:
+		return credentialTargetSnapshot{}, false
+	}
+}
+
+// verifyCredentialAction 按契约 §9.4 的四证判定凭据写入 / 撤销：
+// 四证互相印证且全部指向候选终态 → applied；能证明未提交（旧状态完好且无候选版本行）
+// → not_applied；其余（证据缺失、彼此矛盾、只对上一部分）→ indeterminate。
+// 恢复**不得**重新加密、重放撤销或自动补写凭据版本。
+// verifyCredentialAction follows the contract's four-evidence table and never replays.
+func verifyCredentialAction(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Credentials == nil {
+		return core.VerificationIndeterminate
+	}
+	uid, err := core.ParseResourceUID(op.TargetID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeCredentialActionDetail(op, uid)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	kind := core.BindingKind(detail.Kind)
+	target, ok := readCredentialTarget(ctx, deps, kind, uid)
+	if !ok {
+		return core.VerificationIndeterminate
+	}
+
+	identity, identityErr := deps.Credentials.CredentialByOwner(ctx, kind, uid)
+	identityFound := true
+	switch {
+	case errors.Is(identityErr, core.ErrResourceNotFound):
+		identityFound = false
+	case identityErr != nil:
+		return core.VerificationIndeterminate
+	}
+
+	if op.Action == actionModelConnectionCredentialRevoke || op.Action == actionNotifyChannelCredentialRevoke {
+		return verifyCredentialRevoke(ctx, deps, op, identity, identityFound, target, detail)
+	}
+	if detail.Mode == string(core.CredentialModeEnv) {
+		// managed → env 的退役：身份降为 retired、版本号不变、密文保留（在途可解密）。
+		return verifyCredentialRetire(ctx, deps, op, identity, identityFound, target, detail)
+	}
+	if !identityFound {
+		// 写入必然产生身份与版本：查不到身份时，只有"写前无身份 + 资源未被改动"能证明未提交。
+		if detail.PreviousVersion == 0 && target.Revision == detail.PreviousRevision {
+			return core.VerificationNotApplied
+		}
+		return core.VerificationIndeterminate
+	}
+	return verifyCredentialWrite(ctx, deps, op, identity, target, detail)
+}
+
+// verifyCredentialWrite 判写入（创建新身份或追加新版本）：写后版本行必须带本操作的
+// `operation_id` 与 detail 记录的目标绑定哈希，身份停在 detail 的版本号上。
+// verifyCredentialWrite judges a credential write from the committed version row.
+func verifyCredentialWrite(ctx context.Context, deps RecoveryDeps, op core.OperationRecord,
+	identity core.CredentialRecord, target credentialTargetSnapshot, detail credentialActionDetail,
+) string {
+	if detail.CredentialID == "" || identity.ID != detail.CredentialID ||
+		detail.VersionNo < 1 || detail.TargetBinding == "" {
+		return core.VerificationIndeterminate
+	}
+	versions, err := deps.Credentials.Versions(ctx, identity.ID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	candidate, found := credentialVersionAt(versions, detail.VersionNo)
+
+	applied := found &&
+		identity.State == core.CredentialIdentityActive &&
+		identity.CurrentVersion == detail.VersionNo &&
+		identity.OperationID == op.OperationID &&
+		candidate.State == core.CredentialVersionActive &&
+		candidate.OperationID == op.OperationID &&
+		candidate.TargetBinding == detail.TargetBinding &&
+		target.Revision == detail.Revision
+	if applied {
+		return core.VerificationApplied
+	}
+
+	notApplied := !found &&
+		target.Revision == detail.PreviousRevision &&
+		identity.CurrentVersion == detail.PreviousVersion &&
+		identity.OperationID != op.OperationID
+	if notApplied {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyCredentialRevoke 判撤销：身份 `revoked` + 纪元等于候选值 + 全部版本 `revoked`
+// 且密文已清（证据 ③），行上的 `operation_id` 是本次操作（证据 ②），当前版本的
+// 目标绑定哈希与 detail 一致（证据 ④）。旧状态完好且未被本操作触碰 → not_applied。
+// verifyCredentialRevoke judges a revoke; revoked is terminal and never replayed.
+func verifyCredentialRevoke(ctx context.Context, deps RecoveryDeps, op core.OperationRecord,
+	identity core.CredentialRecord, identityFound bool, target credentialTargetSnapshot,
+	detail credentialActionDetail,
+) string {
+	if !identityFound || detail.TargetBinding == "" ||
+		detail.RevocationEpoch <= detail.PreviousEpoch {
+		return core.VerificationIndeterminate
+	}
+	versions, err := deps.Credentials.Versions(ctx, identity.ID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	current, ok := credentialVersionAt(versions, identity.CurrentVersion)
+	if !ok || current.TargetBinding != detail.TargetBinding {
+		return core.VerificationIndeterminate
+	}
+
+	if identity.State == core.CredentialIdentityRevoked {
+		if identity.RevocationEpoch == detail.RevocationEpoch &&
+			identity.OperationID == op.OperationID &&
+			target.Revision == detail.Revision &&
+			allCredentialVersionsRevoked(versions) {
+			return core.VerificationApplied
+		}
+		return core.VerificationIndeterminate
+	}
+
+	if identity.RevocationEpoch == detail.PreviousEpoch &&
+		identity.OperationID != op.OperationID &&
+		target.Revision == detail.PreviousRevision &&
+		!credentialVersionsTouchedBy(versions, op.OperationID) {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyCredentialRetire 判 managed → env 的退役：身份 `retired`、当前版本号**未变**
+// （退役不追加版本）、行上的 `operation_id` 是本次操作、该版本已 `retired`、资源
+// revision 到位 → applied；身份仍 active、版本仍 active、证据全停在写前值且本操作
+// 未触碰任何版本 → not_applied；其余 indeterminate。退役**不**清密文（在途可解密），
+// 因此密文不是这条动作的判据。
+// verifyCredentialRetire judges a managed→env retire from the state transition alone;
+// the ciphertext is deliberately kept, so it is not evidence here.
+func verifyCredentialRetire(ctx context.Context, deps RecoveryDeps, op core.OperationRecord,
+	identity core.CredentialRecord, identityFound bool, target credentialTargetSnapshot,
+	detail credentialActionDetail,
+) string {
+	if !identityFound || detail.CredentialID == "" || detail.VersionNo < 1 ||
+		identity.ID != detail.CredentialID {
+		return core.VerificationIndeterminate
+	}
+	versions, err := deps.Credentials.Versions(ctx, identity.ID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	candidate, found := credentialVersionAt(versions, detail.VersionNo)
+	if !found {
+		return core.VerificationIndeterminate
+	}
+
+	applied := identity.State == core.CredentialIdentityRetired &&
+		identity.CurrentVersion == detail.VersionNo &&
+		identity.OperationID == op.OperationID &&
+		candidate.State == core.CredentialVersionRetired &&
+		target.Revision == detail.Revision
+	if applied {
+		return core.VerificationApplied
+	}
+	if identity.State == core.CredentialIdentityActive &&
+		identity.CurrentVersion == detail.PreviousVersion &&
+		identity.OperationID != op.OperationID &&
+		candidate.State == core.CredentialVersionActive &&
+		target.Revision == detail.PreviousRevision &&
+		!credentialVersionsTouchedBy(versions, op.OperationID) {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyScopeConversion 判范围转换：范围 / 属主 / revision 与候选一致且行上的
+// `operation_id` 是本次操作 → applied；仍停在写前三者 → not_applied；其余 indeterminate。
+// 范围动作只改资源行，不产生版本，因此证据全在提交事实上。
+// verifyScopeConversion judges a scope conversion from the committed resource row.
+func verifyScopeConversion(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	uid, err := core.ParseResourceUID(op.TargetID)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeCredentialActionDetail(op, uid)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	scope, err := core.ParseScope(detail.Scope)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	previous, err := core.ParseScope(detail.PreviousScope)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	target, ok := readCredentialTarget(ctx, deps, core.BindingKind(detail.Kind), uid)
+	if !ok {
+		return core.VerificationIndeterminate
+	}
+
+	if target.OperationID == op.OperationID &&
+		target.Revision == detail.Revision &&
+		target.Scope == scope &&
+		target.OwnerAgentUID == core.AgentUID(detail.OwnerAgentUID) {
+		return core.VerificationApplied
+	}
+	if target.OperationID != op.OperationID &&
+		target.Revision == detail.PreviousRevision &&
+		target.Scope == previous &&
+		target.OwnerAgentUID == core.AgentUID(detail.PreviousOwnerAgentUID) {
+		return core.VerificationNotApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyBaselineV3 按契约 §9.4 判 v3 迁移：库已在目标版本，且活动区每个 Agent 的状态
+// 文件都是 schema 2、UID 合法、索引镜像一致 → applied；库仍旧版且所有状态文件仍是
+// schema 1 / 无 UID → not_applied；部分升级、文件缺失或镜像不一致 → indeterminate。
+// **不得**给同一 Agent 补发第二个 UID。
+// verifyBaselineV3 judges the migration; a partial upgrade stays unknown.
+func verifyBaselineV3(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if op.TargetKind != targetKindSystem || deps.Lifecycle == nil ||
+		deps.Resources == nil || deps.Root == "" || deps.Schema == nil {
+		return core.VerificationIndeterminate
+	}
+	targetVersion, err := deps.Schema.SchemaVersion(ctx)
+	if err != nil || targetVersion > storage.SupportedSchemaVersion {
+		return core.VerificationIndeterminate
+	}
+	names, err := workspace.AgentNames(deps.Root)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+
+	upgraded, legacy := 0, 0
+	for _, name := range names {
+		rec, exists, readErr := deps.Lifecycle.Read(ctx, name)
+		if readErr != nil || !exists {
+			// 状态文件缺失或损坏：没有可证明的版本事实，整条操作停在 unknown。
+			return core.VerificationIndeterminate
+		}
+		switch rec.SchemaVersion {
+		case lifecycleFileSchemaV2:
+			if !rec.AgentUID.Valid() {
+				return core.VerificationIndeterminate
+			}
+			uid, _, found, idxErr := deps.Resources.AgentIdentity(ctx, name)
+			if idxErr != nil || !found || uid != rec.AgentUID {
+				return core.VerificationIndeterminate
+			}
+			upgraded++
+		case lifecycleFileSchemaV1:
+			legacy++
+		default:
+			return core.VerificationIndeterminate
+		}
+	}
+
+	switch {
+	case targetVersion == storage.SupportedSchemaVersion && legacy == 0:
+		return core.VerificationApplied
+	case targetVersion < storage.SupportedSchemaVersion && upgraded == 0:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// credentialVersionAt 按版本号取凭据版本行。
+// credentialVersionAt picks one credential version by number.
+func credentialVersionAt(versions []core.CredentialVersionRecord, versionNo int) (core.CredentialVersionRecord, bool) {
+	for _, version := range versions {
+		if version.VersionNo == versionNo {
+			return version, true
+		}
+	}
+	return core.CredentialVersionRecord{}, false
+}
+
+// allCredentialVersionsRevoked 判定该凭据的每个版本都已撤销且密文已清（证据 ③）。
+// allCredentialVersionsRevoked reports whether every version is revoked and blanked.
+func allCredentialVersionsRevoked(versions []core.CredentialVersionRecord) bool {
+	narrowed := false
+	for _, version := range versions {
+		if version.State != core.CredentialVersionRevoked || len(version.Ciphertext) != 0 {
+			return false
+		}
+		narrowed = true
+	}
+	return narrowed
+}
+
+// credentialVersionsTouchedBy 判定是否有版本行由本操作写过（撤销的提交事实）。
+// credentialVersionsTouchedBy reports whether this operation wrote any version row.
+func credentialVersionsTouchedBy(versions []core.CredentialVersionRecord, operationID string) bool {
+	for _, version := range versions {
+		if version.OperationID == operationID {
+			return true
+		}
+	}
+	return false
+}
+
+// rebuildStartupBindings 在启动对账之后全量重建绑定投影（约束 38 / 图 A ⑤）：投影是
+// `AGENT.md` 的可重建派生视图，文件与已发布版本对齐后必须从文件重算。扫描失败属于
+// 工作区级问题 → 启动失败；单个 Agent 的失败只记 WARN，准入闸门随后按"可能引用"处理
+// （fail-closed），**不得**把失败的 Agent 当作无引用。
+// rebuildStartupBindings rebuilds the whole projection after reconciliation; a scan
+// failure aborts startup, per-agent failures stay fail-closed at the gate.
+func rebuildStartupBindings(ctx context.Context, projection *BindingProjection,
+	logger *slog.Logger,
+) (ProjectionReport, error) {
+	report, err := projection.RebuildAll(ctx)
+	if err != nil {
+		return report, fmt.Errorf("启动绑定投影重建: %w", err)
+	}
+	for _, failure := range report.Failures {
+		logger.Warn("绑定投影：该 Agent 的引用无法从定义文件重建，删除闸门按可能引用处理",
+			"agent", failure.Agent, "reason", failure.Reason)
+	}
+	return report, nil
+}
+
+// agentDirPresent 判定 `agents/<name>` 是否是真实目录：Lstat 与 AD-8 的归档判据同口径，
+// 符号链接不算 Agent 目录（返回错误 → 交人查证）。
+// agentDirPresent reports whether agents/<name> is a real directory; a symlink is an
+// error, never "present".
+func agentDirPresent(root, name string) (bool, error) {
+	base, err := os.OpenRoot(root)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = base.Close() }()
+
+	info, statErr := base.Lstat(path.Join(agentsDirName, name))
+	if statErr != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, statErr
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("agents/%s 不是目录", name)
+	}
+	return true, nil
+}
+
+// archiveRowForOperation 按 `operation_id` + Agent 名找归档行：归档行与终态同事务
+// （约束 37），pending 行命中只可能是崩溃窗口里的半成品，由调用方保守处理。
+func archiveRowForOperation(ctx context.Context, store *storage.AgentAdminStore,
+	op core.OperationRecord,
+) (bool, core.AgentArchiveRecord, error) {
+	rows, err := store.ListArchives(ctx)
+	if err != nil {
+		return false, core.AgentArchiveRecord{}, err
+	}
+	for _, row := range rows {
+		if row.OperationID == op.OperationID && row.AgentName == op.TargetID {
+			return true, row, nil
+		}
+	}
+	return false, core.AgentArchiveRecord{}, nil
+}
+
+// operationVersion 在资源版本行里找本操作写的版本：版本只追加（约束 14），按
+// `operation_id` 能唯一锁定"本次操作产出的候选版本"。
+func operationVersion(ctx context.Context, deps RecoveryDeps, kind core.ResourceKind,
+	op core.OperationRecord,
+) (core.ResourceVersion, bool, error) {
+	versions, err := deps.Resources.Versions(ctx, kind, op.TargetID)
+	if err != nil {
+		return core.ResourceVersion{}, false, err
+	}
+	for _, version := range versions {
+		if version.OperationID == op.OperationID {
+			return version, true, nil
+		}
+	}
+	return core.ResourceVersion{}, false, nil
+}
+
+// versionMatchesFile 判定定义文件（技能为工作副本）的当前字节是否仍是 `published`
+// 这一版本：两种已落库哈希形态都由 `definitionBlockMatchesFor` 接受，技能按完整文件
+// 清单哈希比较；任一读取失败都返回错误（→ indeterminate），不把"读不到"当"一致"。
+func versionMatchesFile(deps RecoveryDeps, kind core.ResourceKind, id string,
+	published core.ResourceVersion,
+) (bool, error) {
+	if kind == core.ResourceSkill {
+		if deps.Skills == nil {
+			return false, errors.New("装配缺技能库")
+		}
+		version, err := deps.Skills.HashWorkCopy(id)
+		if err != nil {
+			return false, err
+		}
+		return version.ContentHash == published.ContentHash, nil
+	}
+	doc, err := definitionDocFor(deps, kind)
+	if err != nil {
+		return false, err
+	}
+	return definitionBlockMatchesFor(doc, definitionKeyOf(kind), id, published), nil
+}
+
+// definitionDocFor 读取某资源种类的定义文件原文（模型连接在实例配置、MCP 在
+// `mcp_servers.yaml`，技能没有定义文件）。
+func definitionDocFor(deps RecoveryDeps, kind core.ResourceKind) ([]byte, error) {
+	switch kind {
+	case core.ResourceModelConnection:
+		if deps.ConfigPath == "" {
+			return nil, errors.New("装配缺实例配置路径")
+		}
+		return readFileUnder(filepath.Dir(deps.ConfigPath), filepath.Base(deps.ConfigPath))
+	case core.ResourceMCPServer:
+		if deps.Root == "" {
+			return nil, errors.New("装配缺工作区根")
+		}
+		return readFileUnder(deps.Root, mcpServersFileName)
+	default:
+		return nil, fmt.Errorf("资源种类 %s 没有定义文件", kind)
+	}
+}
+
+// definitionKeyOf 给出定义文件的顶层键（模型连接 `providers`、MCP `servers`）。
+func definitionKeyOf(kind core.ResourceKind) string {
+	switch kind {
+	case core.ResourceModelConnection:
+		return providerDefinitionsKey
+	case core.ResourceMCPServer:
+		return mcpServersDefinitionsKey
+	default:
+		return ""
+	}
+}
+
+// definitionBlockPresent 判定定义文件里是否存在某条目的块：两种已落库形态都接受
+// （块编辑器形态与基线切块形态），任一路径能读出即算存在；两条都读不懂才报错。
+// definitionBlockPresent accepts both stored block shapes; only an unreadable document
+// is an error.
+func definitionBlockPresent(doc []byte, key, name string) (bool, error) {
+	blocks, blockErr := workspace.BlockEntries(doc, key)
+	if blockErr == nil {
+		for _, block := range blocks {
+			if block.Name == name {
+				return true, nil
+			}
+		}
+	}
+	definitions, defErr := extractDefinitionBlocks(doc, key)
+	if defErr != nil {
+		if blockErr != nil {
+			return false, blockErr
+		}
+		return false, defErr
+	}
+	for _, definition := range definitions {
+		if definition.name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// resourceKindOfTarget 把操作行的目标类型映射成资源种类；`agent` 等非资源目标返回 false。
+func resourceKindOfTarget(targetKind string) (core.ResourceKind, bool) {
+	switch targetKind {
+	case core.TargetKindModelConnection:
+		return core.ResourceModelConnection, true
+	case core.TargetKindMCPServer:
+		return core.ResourceMCPServer, true
+	case core.TargetKindSkill:
+		return core.ResourceSkill, true
+	default:
+		return "", false
 	}
 }
 
@@ -1008,6 +2222,12 @@ func extractDefinitionBlocks(raw []byte, key string) ([]definitionBlock, error) 
 		return nil, nil
 	}
 	if _, ok := body.(*ast.NullNode); ok {
+		return nil, nil
+	}
+	// 只有注释的文档在 `ParseComments` 下表现为 CommentGroupNode，它等价于空文档
+	// （注释不是内容）：没有条目不是结构损坏，启动对账按「条目被删」处理。
+	// A comment-only document is an empty document, not a structural error.
+	if _, ok := body.(*ast.CommentGroupNode); ok {
 		return nil, nil
 	}
 	mapping, ok := body.(*ast.MappingNode)

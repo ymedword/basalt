@@ -433,7 +433,15 @@ func closeAndReleaseRun(ctx context.Context, ex sqlExecutor, runID string, now t
 	if err != nil {
 		return false, err
 	}
+	// 三类引用一起释放，与正常收尾 `FinishRun` 同一口径：漏掉通知冻结会让渠道删除
+	// 永远点名一个已失败的 Run，漏掉凭据固定会让凭据资源永远显示被引用。
 	if _, err := releaseRunRefs(ctx, ex, runID, now); err != nil {
+		return false, err
+	}
+	if _, err := releaseRunCredentialRefs(ctx, ex, runID, now); err != nil {
+		return false, err
+	}
+	if _, err := releaseRunNotifyRefs(ctx, ex, runID, now); err != nil {
 		return false, err
 	}
 	return closed, nil
@@ -484,14 +492,30 @@ func closeRunInTransaction(ctx context.Context, db *sql.DB, runID string, now ti
 // are untouched and nothing historical is fabricated.
 func releaseTerminalRefs(ctx context.Context, db *sql.DB, now time.Time) error {
 	return withWriteLock(ctx, db, func(ctx context.Context, conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx,
-			`UPDATE run_resource_refs
+		// 三类引用各一条语句（与 `FinishRun` 释放的三张表一致）：只补资源引用会让
+		// 崩溃 Run 的通知冻结与凭据固定永远悬着，删除 / 范围转换被一个已失败的 Run 挡住。
+		statements := []struct {
+			table string
+			sql   string
+		}{
+			{"run_resource_refs", `UPDATE run_resource_refs
 			    SET released_at = ?
 			  WHERE released_at IS NULL
-			    AND run_id IN (SELECT run_id FROM runs WHERE status <> ?)`,
-			now.UnixMilli(), string(core.StatusRunning))
-		if err != nil {
-			return fmt.Errorf("补齐终态运行的残留资源引用: %w", err)
+			    AND run_id IN (SELECT run_id FROM runs WHERE status <> ?)`},
+			{"run_credential_refs", `UPDATE run_credential_refs
+			    SET released_at = ?
+			  WHERE released_at IS NULL
+			    AND run_id IN (SELECT run_id FROM runs WHERE status <> ?)`},
+			{"run_notify_refs", `UPDATE run_notify_refs
+			    SET released_at = ?
+			  WHERE released_at IS NULL
+			    AND run_id IN (SELECT run_id FROM runs WHERE status <> ?)`},
+		}
+		for _, statement := range statements {
+			if _, err := conn.ExecContext(ctx, statement.sql,
+				now.UnixMilli(), string(core.StatusRunning)); err != nil {
+				return fmt.Errorf("补齐终态运行的残留引用（%s）: %w", statement.table, err)
+			}
 		}
 		return nil
 	})

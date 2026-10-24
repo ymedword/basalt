@@ -19,7 +19,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -289,20 +288,25 @@ func publishedCards(base *os.Root, declared []string, skills PublishedSkills) ([
 	return cards, nil
 }
 
-// publishedCardFor 读一个发布版本的 SKILL.md 并产出卡片：目录必须是契约字面量（path.Clean
-// 后与 `.basalt/versions/skills/<name>/<no>` 逐字相等，版本号为正整数），读取经工作区根句柄
-// ——发布目录之外（含工作副本）一律读不到。卡片行展示发布真路径，清单条记逻辑路径。
-// publishedCardFor reads one published SKILL.md after validating its directory literal.
+// publishedCardFor 读一个发布版本的 SKILL.md 并产出卡片：目录必须是持久化 storage_path
+// 的契约形态（身份分段 `.basalt/versions/skills/<name>/<uid>/<no>` 或旧扁平
+// `.basalt/versions/skills/<name>/<no>`，版本号为正整数，且属于声明技能），读取经工作区
+// 根句柄——发布目录之外（含工作副本）一律读不到。卡片行展示记录里的发布真路径，清单条
+// 记逻辑路径。
+// publishedCardFor reads one published SKILL.md after validating its recorded literal.
 func publishedCardFor(base *os.Root, name, dir string) (skillCard, error) {
 	if !validSkillName(name) {
 		return skillCard{}, fmt.Errorf("技能名不是单个目录名，拒绝读取发布目录外的定义：%q", name)
 	}
-	versionNo, err := publishedVersionNo(name, dir)
+	target, err := parseSkillStoragePath(dir)
 	if err != nil {
-		return skillCard{}, err
+		return skillCard{}, fmt.Errorf("技能 %s 的发布目录不可用：%w", name, err)
 	}
-	cardPath := publishedCardPath(name, versionNo)
-	raw, err := base.ReadFile(filepath.FromSlash(path.Join(skillVersionRelDir(name, versionNo), skillDefinitionFile)))
+	if target.name != name {
+		return skillCard{}, fmt.Errorf("技能 %s 的发布目录 %q 属于技能 %s，拒绝读取", name, dir, target.name)
+	}
+	cardPath := publishedCardPath(target.logicalDir)
+	raw, err := base.ReadFile(filepath.FromSlash(path.Join(target.relDir, skillDefinitionFile)))
 	if err != nil {
 		return skillCard{}, fmt.Errorf("读取技能定义 %s: %w", cardPath, err)
 	}
@@ -322,24 +326,6 @@ func publishedCardFor(base *os.Root, name, dir string) (skillCard, error) {
 	card.name = cardName
 	card.description = description
 	return card, nil
-}
-
-// publishedVersionNo 校验发布目录的契约字面量并取出版本号：`.basalt/versions/skills/
-// <name>/<no>`，<name> 与声明名一致，<no> 为正整数且无前导零 / 符号。形态不符即失败关闭
-// （不修路径、不猜版本）。
-// publishedVersionNo validates the published directory literal and returns its version.
-func publishedVersionNo(name, dir string) (int, error) {
-	clean := path.Clean(strings.TrimSpace(dir))
-	prefix := skillVersionsPrefix + "/" + name + "/"
-	rest, ok := strings.CutPrefix(clean, prefix)
-	if !ok {
-		return 0, fmt.Errorf("技能 %s 的发布目录 %q 不符合契约形态 %s<version_no>", name, dir, prefix)
-	}
-	versionNo, err := strconv.Atoi(rest)
-	if err != nil || versionNo < 1 || strconv.Itoa(versionNo) != rest {
-		return 0, fmt.Errorf("技能 %s 的发布目录 %q 的版本号非法", name, dir)
-	}
-	return versionNo, nil
 }
 
 // sha256Hex 给出字节的 sha256 十六进制小写（64 字符）——清单条与快照哈希共用同一形态。

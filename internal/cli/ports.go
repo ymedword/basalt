@@ -142,6 +142,58 @@ type Server interface {
 	Run(ctx context.Context) error
 }
 
+// SecretsStatus 是 `secrets init` / `secrets status` 的只读结果：**不含**密钥、密文或
+// 任何可用秘密。指纹是主密钥的公开比对值（供运维核对"当前生效的是哪把钥匙"），
+// 与密钥材料不可互推。类型定义在消费方，装配层负责投影（见 internal/app/ports.go）。
+// SecretsStatus is the read-only secrets result; the fingerprint is a public identifier,
+// never key material.
+type SecretsStatus struct {
+	// Initialized 表示主密钥文件已就位并可装载。
+	// Initialized reports whether the master key is present and loadable.
+	Initialized bool
+
+	// KeyID / Fingerprint 是主密钥的公开标识与比对值。
+	// KeyID / Fingerprint are the key's public identifiers.
+	KeyID       string
+	Fingerprint string
+
+	// ManagedModelConnections / ManagedNotifyChannels 是"当前托管依赖"计数——它们同时
+	// 是 `secrets init` 的拒绝条件（新建密钥会让既有密文变成孤儿）。
+	// The managed-dependency counts are also the refusal conditions of secrets init.
+	ManagedModelConnections int
+	ManagedNotifyChannels   int
+}
+
+// SecretsVerifyReport 是 `secrets verify` 的计数结果：只回检查与失败条数，明细只在
+// 结构化日志里（WARN 点名资源与凭据 ID，仍不含材料）。
+// SecretsVerifyReport counts checks and failures only.
+type SecretsVerifyReport struct {
+	Checked int
+	Failed  int
+}
+
+// Secrets 是命令面对主密钥与托管凭据运维动作的端口（`secrets` 命令组消费，适配器 ←
+// 装配层的 secrets 服务）。四个动作都不返回密钥材料；`revoke-managed` 也不需要解密。
+// Secrets is the command surface's port onto the secrets maintenance actions.
+type Secrets interface {
+	// Init 生成主密钥并落盘；文件已存在或存在当前托管依赖时拒绝（不提供自动轮换）。
+	// Init mints the master key; an existing file or a live managed dependency refuses.
+	Init(ctx context.Context) (SecretsStatus, error)
+
+	// Status 只读报告主密钥是否就绪与托管依赖计数。
+	// Status reports key readiness and managed-dependency counts.
+	Status(ctx context.Context) (SecretsStatus, error)
+
+	// Verify 逐条校验当前 active 托管凭据，只回计数。
+	// Verify checks every active managed credential and reports counts only.
+	Verify(ctx context.Context) (SecretsVerifyReport, error)
+
+	// RevokeManaged 撤销全部托管凭据（服务停止时的丢失恢复）：清空密文、升纪元、
+	// 写操作行。返回本次实际撤销的条数。
+	// RevokeManaged revokes every managed credential and returns how many changed.
+	RevokeManaged(ctx context.Context) (int, error)
+}
+
 // ToolLister 是命令面对**工具注册池**的端口（`tool list` 消费，适配器 ← `tool.Registry`）。
 // ToolLister is the command surface's port onto the tool registry.
 //

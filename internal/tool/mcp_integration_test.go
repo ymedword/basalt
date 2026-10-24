@@ -16,7 +16,6 @@ import (
 	"errors"
 	"log/slog"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -39,16 +38,14 @@ func TestMCPHelperProcess(t *testing.T) {
 	testutil.RunMCPHelper(t)
 }
 
-// helperCommand 组出「测试二进制 + 只跑 helper 入口」的命令串；路径含空白无法用空白切分
-// 表达（注 10 的已知边界），此时显式跳过。
-// helperCommand builds the self-exec command; a path containing whitespace cannot be
-// expressed through whitespace-only splitting, so the test skips with the reason.
-func helperCommand(t *testing.T) string {
-	t.Helper()
-	if strings.ContainsAny(os.Args[0], " \t") {
-		t.Skip("测试二进制路径含空白——command 按空白切分，无法表达")
-	}
-	return os.Args[0] + " -test.run=^TestMCPHelperProcess$"
+// helperCommand 组出「测试二进制 + 只跑 helper 入口」的命令与参数。US-12 起 MCP 配置把
+// `command` 与 `args` 分开保存（约束 8：命令 = 单可执行名、参数逐项直进 argv），本层不再
+// 按空白切分——测试二进制路径含空白也天然可表达，原先的跳过条件随之失效。
+// helperCommand returns the self-exec command and its args separately: since US-12 the
+// pool executes one executable name and passes args verbatim, so whitespace in the
+// binary path is no longer a limitation.
+func helperCommand() (string, []string) {
+	return os.Args[0], []string{"-test.run=^TestMCPHelperProcess$"}
 }
 
 // newHelperPool 造一只指向 helper 子进程的连接池并返回已连上的工具列表；含透传白名单
@@ -69,9 +66,11 @@ func newHelperPool(t *testing.T, logs *bytes.Buffer, extraEnv map[string]string)
 		ConnectTimeout: 5 * time.Second,
 		Version:        "us7-test",
 	})
+	command, args := helperCommand()
 	conns, err := pool.Connect(context.Background(), []core.MCPServerConfig{{
 		Name:    helperServerName,
-		Command: helperCommand(t),
+		Command: command,
+		Args:    args,
 		Env:     env, // 已解析形态：值直接传给子进程
 	}})
 	require.NoError(t, err)
@@ -131,9 +130,11 @@ func TestMCPIntegration_PaginationOverStdio(t *testing.T) {
 	})
 	t.Cleanup(func() { require.NoError(t, pool.Close()) })
 
+	command, args := helperCommand()
 	conns, err := pool.Connect(context.Background(), []core.MCPServerConfig{{
 		Name:    helperServerName,
-		Command: helperCommand(t),
+		Command: command,
+		Args:    args,
 		Env:     map[string]string{"BASALT_MCP_HELPER": "1", "BASALT_MCP_PAGE_SIZE": "1"},
 	}})
 	require.NoError(t, err)
@@ -200,8 +201,9 @@ func TestMCPIntegration_CallSucceedsAfterConnectBudgetReleased(t *testing.T) {
 		ConnectTimeout: 5 * time.Second,
 		Version:        "us7-test",
 	})
+	command, args := helperCommand()
 	conns, err := pool.Connect(context.Background(), []core.MCPServerConfig{{
-		Name: "helper", Command: helperCommand(t),
+		Name: "helper", Command: command, Args: args,
 		Env: map[string]string{"BASALT_MCP_HELPER": "1"}, // 已解析形态：值直接传给子进程
 	}})
 	require.NoError(t, err)

@@ -25,23 +25,37 @@ import (
 
 // sampleResolved 造一份两 MCP、两技能（含乱序文件）的解析结果。
 // sampleResolved builds a resolution with two MCP servers and two skills.
+// sampleAgentUID 是构造清单用的合法 Agent UID（v2 起必填）。
+// sampleAgentUID is a valid agent uid for manifest construction (required from v2 on).
+const sampleAgentUID core.AgentUID = "ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"
+
+// sampleTargetBinding 是目标绑定哈希的合法形态（64 位小写十六进制）。
+// sampleTargetBinding is a well-formed target-binding hash.
+const sampleTargetBinding = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func sampleResolved() core.ResolvedResources {
 	return core.ResolvedResources{
-		Provider: core.ResourceVersionRef{Name: "openai-main", VersionID: 7, VersionNo: 3, ContentHash: "aaa"},
+		Provider:      core.ResourceVersionRef{Name: "openai-main", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A", VersionID: 7, VersionNo: 3, ContentHash: "aaa"},
+		ProviderModel: "gpt-test",
+		ProviderCredential: core.CredentialPin{
+			Mode:          core.CredentialModeEnv,
+			TargetBinding: sampleTargetBinding,
+		},
+		Notify: core.NotifyManifest{Mode: core.NotifyModeAllEligible, Channels: []core.NotifyChannelRef{}},
 		MCPServers: []core.ResourceVersionRef{
-			{Name: "zeta", VersionID: 21, VersionNo: 2, ContentHash: "zzz"},
-			{Name: "alpha", VersionID: 20, VersionNo: 1, ContentHash: "yyy"},
+			{Name: "zeta", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3B", VersionID: 21, VersionNo: 2, ContentHash: "zzz"},
+			{Name: "alpha", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3C", VersionID: 20, VersionNo: 1, ContentHash: "yyy"},
 		},
 		Skills: []core.SkillVersionRef{
 			{
-				ResourceVersionRef: core.ResourceVersionRef{Name: "writer", VersionID: 31, VersionNo: 1, ContentHash: "www"},
+				ResourceVersionRef: core.ResourceVersionRef{Name: "writer", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3D", VersionID: 31, VersionNo: 1, ContentHash: "www"},
 				Files: []core.FileHash{
 					{Path: "SKILL.md", SHA256: "b", Size: 2},
 					{Path: "skill.json", SHA256: "a", Size: 1},
 				},
 			},
 			{
-				ResourceVersionRef: core.ResourceVersionRef{Name: "reporter", VersionID: 30, VersionNo: 1, ContentHash: "rrr"},
+				ResourceVersionRef: core.ResourceVersionRef{Name: "reporter", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3E", VersionID: 30, VersionNo: 1, ContentHash: "rrr"},
 				Files:              []core.FileHash{{Path: "SKILL.md", SHA256: "c", Size: 3}},
 			},
 		},
@@ -171,30 +185,31 @@ func TestResourceGate_ConcurrentPublishAndAdmission(t *testing.T) {
 	wg.Wait()
 }
 
-// TestBuildRunResourceManifest_FormatVersionIsOne：首版清单格式号固定为 1（schema.sql
-// 的 DEFAULT 与视图同值）。
-func TestBuildRunResourceManifest_FormatVersionIsOne(t *testing.T) {
+// TestBuildRunResourceManifest_FormatVersionIsTwo：v2 清单格式号固定为 2（v1 只读保留，
+// 视图按 format_version 区分代际）。
+func TestBuildRunResourceManifest_FormatVersionIsTwo(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
-	require.Equal(t, 1, manifest.FormatVersion)
+	require.Equal(t, 2, manifest.FormatVersion)
+	require.Equal(t, sampleAgentUID, manifest.AgentUID)
 }
 
 // TestBuildRunResourceManifest_SortsMCPServersByName：MCP 顺序只由 name 决定，与输入序无关。
 func TestBuildRunResourceManifest_SortsMCPServersByName(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
 	require.Equal(t, []core.ResourceVersionRef{
-		{Name: "alpha", VersionID: 20, VersionNo: 1, ContentHash: "yyy"},
-		{Name: "zeta", VersionID: 21, VersionNo: 2, ContentHash: "zzz"},
+		{Name: "alpha", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3C", VersionID: 20, VersionNo: 1, ContentHash: "yyy"},
+		{Name: "zeta", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3B", VersionID: 21, VersionNo: 2, ContentHash: "zzz"},
 	}, manifest.MCPServers)
 }
 
 // TestBuildRunResourceManifest_SortsSkillsByName：技能同样按 name 升序。
 func TestBuildRunResourceManifest_SortsSkillsByName(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
 	require.Len(t, manifest.Skills, 2)
 	require.Equal(t, "reporter", manifest.Skills[0].Name)
@@ -205,7 +220,7 @@ func TestBuildRunResourceManifest_SortsSkillsByName(t *testing.T) {
 // （清单哈希的稳定性来自这条规范化）。
 func TestBuildRunResourceManifest_SortsSkillFilesByPath(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
 	require.Equal(t, []string{"SKILL.md", "skill.json"}, []string{
 		manifest.Skills[1].Files[0].Path,
@@ -223,9 +238,9 @@ func TestRunResourceManifest_HashStableAcrossInputOrder(t *testing.T) {
 	second.Skills[0], second.Skills[1] = second.Skills[1], second.Skills[0]
 	second.Skills[1].Files[0], second.Skills[1].Files[1] = second.Skills[1].Files[1], second.Skills[1].Files[0]
 
-	manifestA, err := core.BuildRunResourceManifest(core.AgentActive, first)
+	manifestA, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, first)
 	require.NoError(t, err)
-	manifestB, err := core.BuildRunResourceManifest(core.AgentActive, second)
+	manifestB, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, second)
 	require.NoError(t, err)
 
 	require.Equal(t, manifestA.Hash, manifestB.Hash)
@@ -240,7 +255,7 @@ func TestRunResourceManifest_HashStableAcrossInputOrder(t *testing.T) {
 // 灌回去不影响结果。
 func TestRunResourceManifest_HashExcludesHashField(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
 
 	recomputed, err := core.HashManifest(manifest)
@@ -257,9 +272,9 @@ func TestRunResourceManifest_HashExcludesHashField(t *testing.T) {
 // 在 active / disabled 下是不同的清单。
 func TestRunResourceManifest_HashChangesWithLifecycleState(t *testing.T) {
 	t.Parallel()
-	active, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	active, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
-	disabled, err := core.BuildRunResourceManifest(core.AgentDisabled, sampleResolved())
+	disabled, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentDisabled, sampleResolved())
 	require.NoError(t, err)
 
 	require.NotEqual(t, active.Hash, disabled.Hash)
@@ -272,12 +287,18 @@ func TestRunResourceManifest_HashChangesWithLifecycleState(t *testing.T) {
 func TestBuildRunResourceManifest_EmptyListsAreNonNil(t *testing.T) {
 	t.Parallel()
 	resolved := core.ResolvedResources{
-		Provider: core.ResourceVersionRef{Name: "openai-main", VersionID: 1, VersionNo: 1, ContentHash: "x"},
+		Provider: core.ResourceVersionRef{Name: "openai-main", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A", VersionID: 1, VersionNo: 1, ContentHash: "x"},
+		ProviderCredential: core.CredentialPin{
+			Mode:          core.CredentialModeEnv,
+			TargetBinding: sampleTargetBinding,
+		},
+		Notify: core.NotifyManifest{Mode: core.NotifyModeNone, Channels: []core.NotifyChannelRef{}},
 	}
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.NoError(t, err)
 	require.NotNil(t, manifest.MCPServers)
 	require.NotNil(t, manifest.Skills)
+	require.NotNil(t, manifest.Notify.Channels, "通知渠道集合序列化为 [] 而非 null")
 	require.Empty(t, manifest.MCPServers)
 	require.Empty(t, manifest.Skills)
 
@@ -287,11 +308,15 @@ func TestBuildRunResourceManifest_EmptyListsAreNonNil(t *testing.T) {
 	require.True(t, bytes.Contains(raw, []byte(`"skills":[]`)), "空技能列表必须是 []：%s", raw)
 }
 
-// TestBuildRunResourceManifest_RejectsMissingProvider：缺 Provider 发布版本 → 拒绝构造
-// （不得落下"这一跑没用 Provider"的假清单）。
+// TestBuildRunResourceManifest_RejectsMissingProvider：缺 Agent UID 或 Provider 发布版本
+// → 拒绝构造（不得落下"这一跑没用 Provider"或身份不明的假清单）。
 func TestBuildRunResourceManifest_RejectsMissingProvider(t *testing.T) {
 	t.Parallel()
-	_, err := core.BuildRunResourceManifest(core.AgentActive, core.ResolvedResources{})
+	_, err := core.BuildRunResourceManifest("", core.AgentActive, sampleResolved())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Agent UID")
+
+	_, err = core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, core.ResolvedResources{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Provider")
 }
@@ -302,13 +327,13 @@ func TestBuildRunResourceManifest_RejectsEmptyMCPOrSkillName(t *testing.T) {
 
 	resolved := sampleResolved()
 	resolved.MCPServers = append(resolved.MCPServers, core.ResourceVersionRef{VersionID: 99})
-	_, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	_, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "MCP")
 
 	resolved = sampleResolved()
 	resolved.Skills = append(resolved.Skills, core.SkillVersionRef{})
-	_, err = core.BuildRunResourceManifest(core.AgentActive, resolved)
+	_, err = core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "技能")
 }
@@ -321,7 +346,7 @@ func TestBuildRunResourceManifest_DoesNotMutateInput(t *testing.T) {
 	before := resolved.MCPServers[0].Name
 	skillFiles := resolved.Skills[0].Files[0].Path
 
-	_, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	_, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.NoError(t, err)
 	require.Equal(t, before, resolved.MCPServers[0].Name)
 	require.Equal(t, skillFiles, resolved.Skills[0].Files[0].Path)
@@ -331,17 +356,19 @@ func TestBuildRunResourceManifest_DoesNotMutateInput(t *testing.T) {
 // 声明序输出（后面跟视图字段即偏离契约形态）。
 func TestRunResourceManifest_CanonicalJSONIsCompactAndOrdered(t *testing.T) {
 	t.Parallel()
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, sampleResolved())
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
 	raw, err := core.MarshalManifest(manifest)
 	require.NoError(t, err)
 
-	prefix := `{"format_version":1,"hash":"` + manifest.Hash + `","agent_lifecycle_state":"active","provider":`
+	prefix := `{"format_version":2,"hash":"` + manifest.Hash +
+		`","agent_uid":"` + sampleAgentUID.String() + `","agent_lifecycle_state":"active","provider":`
 	require.True(t, strings.HasPrefix(string(raw), prefix), "字段顺序偏离契约：%s", raw)
 	require.NotContains(t, string(raw), "\n")
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(raw, &decoded))
-	require.Len(t, decoded, 6)
+	require.Len(t, decoded, 8)
+	require.Contains(t, decoded, "notify")
 }
 
 // TestRunSnapshotBuilder_ProducesCanonicalHash：配置快照的构建入口把清单按 Path 升序后
@@ -457,7 +484,7 @@ func TestRunSnapshotBuilder_FrozenSkillVersionsSurviveResolutionMutation(t *test
 		"writer":   ".basalt/versions/skills/writer/1",
 		"reporter": ".basalt/versions/skills/reporter/1",
 	}
-	manifest, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.NoError(t, err)
 	wantHash := manifest.Hash
 
@@ -478,7 +505,7 @@ func TestRunSnapshotBuilder_FrozenSkillVersionsSurviveResolutionMutation(t *test
 	}, writer.Files, "技能文件清单是发布版本的副本，不与解析结果共享底层数组")
 
 	// 对照：下一次准入读到改动后的发布版本 → 新清单、新哈希（新运行用新配置）。
-	next, err := core.BuildRunResourceManifest(core.AgentActive, resolved)
+	next, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, resolved)
 	require.NoError(t, err)
 	require.NotEqual(t, wantHash, next.Hash, "新运行按改动后的版本重建清单")
 }
@@ -497,9 +524,9 @@ func TestRunSnapshotBuilder_SkillVersionDirsAreRuntimeOnly(t *testing.T) {
 	right.SkillDirs = map[string]string{"writer": `C:\basalt\.basalt\versions\skills\writer\1`}
 	right.Runtime = &fakeRuntime{}
 
-	leftManifest, err := core.BuildRunResourceManifest(core.AgentActive, left)
+	leftManifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, left)
 	require.NoError(t, err)
-	rightManifest, err := core.BuildRunResourceManifest(core.AgentActive, right)
+	rightManifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, right)
 	require.NoError(t, err)
 	require.Equal(t, leftManifest.Hash, rightManifest.Hash, "宿主目录与运行时实例不得进入清单哈希")
 

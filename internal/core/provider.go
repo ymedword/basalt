@@ -102,18 +102,22 @@ const (
 	LLMCallUnknown LLMCallStatus = "unknown"
 )
 
-// ErrorKind 是 llm_calls.error_kind 的七类字面量（契约 §7.3）。
-// ErrorKind is the seven-value literal set of llm_calls.error_kind (contract §7.3).
+// ErrorKind 是失败分类的八类字面量（契约 §7.3；R4 新增 notify_disabled）。
+// ErrorKind is the eight-value failure classification (contract §7.3; R4 adds
+// notify_disabled for a disabled notification mode or a revoked channel credential).
 type ErrorKind string
 
 const (
 	ErrorKindSandboxDenied ErrorKind = "sandbox_denied"
 	ErrorKindTimeout       ErrorKind = "timeout"
 	ErrorKindNotFound      ErrorKind = "not_found"
-	ErrorKindInvalidInput  ErrorKind = "invalid_input"
-	ErrorKindExternalError ErrorKind = "external_error"
-	ErrorKindRuntimeError  ErrorKind = "runtime_error"
-	ErrorKindUnknown       ErrorKind = "unknown"
+	// ErrorKindNotifyDisabled 表示通知被配置或凭据状态禁用（`notify_mode: none`；
+	// 渠道托管凭据已撤销）。它是工具面 kind，不是模型调用失败类别。
+	ErrorKindNotifyDisabled ErrorKind = "notify_disabled"
+	ErrorKindInvalidInput   ErrorKind = "invalid_input"
+	ErrorKindExternalError  ErrorKind = "external_error"
+	ErrorKindRuntimeError   ErrorKind = "runtime_error"
+	ErrorKindUnknown        ErrorKind = "unknown"
 )
 
 // LLMCall 是审计行的**预写形态**：只含调用前可知的字段（关联键 + 供应商 + 模型 + 快照）。

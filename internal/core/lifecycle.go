@@ -35,13 +35,16 @@ const (
 // LifecycleRecord is the domain shape of one agent state file; UpdatedAt is Unix
 // milliseconds in UTC, matching both the file bytes and the index column.
 type LifecycleRecord struct {
-	SchemaVersion int    // 契约固定首版 1
+	SchemaVersion int    // v1 为 US-11 形态；v2（US-12 R4）追加 AgentUID
 	Agent         string // Agent 名（= 目录名）
-	State         AgentState
-	Generation    int64  // 每次迁移 +1；启停的乐观锁字段
-	UpdatedAt     int64  // Unix 毫秒（UTC）
-	OperationID   string // 写入本次状态的真实 op-... 标识（含基线）
-	Checksum      string // "sha256:<64 位小写十六进制>"
+	// AgentUID 是稳定身份（`ag_` 前缀）：v2 起必填，v1 记录为空、由迁移补写。
+	// 资源资格判定与审计关联只认它，不认名称。
+	AgentUID    AgentUID // stable agent identity; empty on v1 records until migration
+	State       AgentState
+	Generation  int64  // 每次迁移 +1；启停的乐观锁字段
+	UpdatedAt   int64  // Unix 毫秒（UTC）
+	OperationID string // 写入本次状态的真实 op-... 标识（含基线）
+	Checksum    string // "sha256:<64 位小写十六进制>"
 }
 
 // ErrLifecycleConflict 表示生命周期迁移 / 撤销的前置条件不成立：期望状态或代数不符，
@@ -66,10 +69,25 @@ type LifecyclePort interface {
 	// Bootstrap 只在状态文件不存在时写 disabled / generation=1；已存在则原样返回。
 	// Bootstrap writes disabled/generation=1 only when the file is absent.
 	Bootstrap(ctx context.Context, agent, operationID string) (LifecycleRecord, error)
+	// BootstrapIdentity 与 Bootstrap 相同，但使用调用方给定的稳定身份：归档恢复（原名 /
+	// 异名两条路径）必须沿用原 agent_uid，不得在此另生成新身份。已存在的 v2 文件原样
+	// 返回；已存在且身份不同 → ErrLifecycleConflict（**不得**静默改身份）。
+	// BootstrapIdentity writes a disabled/generation=1 file carrying the caller's UID;
+	// archive restore must reuse the original identity, never mint a new one.
+	BootstrapIdentity(ctx context.Context, agent string, agentUID AgentUID, operationID string) (LifecycleRecord, error)
 	// Discard 只撤销"由同一 operationID 创建、generation=1"的状态文件；其它情况返回
 	// ErrLifecycleConflict。用于创建 / 复制 / 恢复失败后的回滚与 CLI 目录删除。
 	// Discard removes only a generation-1 file created by the same operation.
 	Discard(ctx context.Context, agent, operationID string) error
+}
+
+// IdentityUpgradePort 供迁移编排把 v1 状态文件升级为 v2（补发 agent_uid）。
+// 文件缺失返回 (zero, false, nil)：由调用方按 `legacy_unrecorded` 记数据库镜像，
+// **不得**按同名猜身份。
+// IdentityUpgradePort upgrades v1 state files during the v3 migration; a missing file
+// is reported as not-upgraded so callers can record legacy_unrecorded.
+type IdentityUpgradePort interface {
+	UpgradeIdentity(ctx context.Context, agent, operationID string) (LifecycleRecord, bool, error)
 }
 
 // LifecycleIndex 是 `agent_lifecycle` 索引的写端口：索引可由状态文件重建，

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -37,11 +38,27 @@ func seedOperation(t *testing.T, db *DB, operationID string) {
 	}))
 }
 
+// resourceUIDFor 按 `(kind, name)` 派生一个稳定的测试 UID：同名同种永远是同一实例，
+// 不同名称 / 不同种类是不同实例——测试要判的正是"身份跟着实例走、不跟着名称走"。
+// 真实路径的 UID 由 core.NewResourceUID 随机生成；测试里确定性更重要。
+// resourceUIDFor derives a stable test uid from kind and name; the production path uses
+// crypto/rand, while tests need reproducibility.
+func resourceUIDFor(kind core.ResourceKind, name string) core.ResourceUID {
+	sum := sha256.Sum256([]byte(string(kind) + "\x00" + name))
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	payload := make([]byte, 26)
+	for i := range payload {
+		payload[i] = alphabet[int(sum[i])%len(alphabet)]
+	}
+	return core.ResourceUID(core.ResourceUIDPrefix + string(payload))
+}
+
 // modelVersion 造一条模型连接版本；版本号 0 表示让仓储自动取号。
 // modelVersion builds a model_connection version; zero means auto-numbering.
 func modelVersion(resourceID, contentHash, operationID string, versionNo int) core.ResourceVersion {
 	return core.ResourceVersion{
 		Kind:           core.ResourceModelConnection,
+		ResourceUID:    resourceUIDFor(core.ResourceModelConnection, resourceID),
 		ResourceID:     resourceID,
 		VersionNo:      versionNo,
 		ContentHash:    contentHash,
@@ -122,21 +139,28 @@ func TestResourceStore_EnsureVersionAssignsMonotonicNumbers(t *testing.T) {
 	require.Equal(t, 1, other.VersionNo)
 }
 
-// TestResourceStore_EnsureVersionValidatesInput：未知类型、空标识 / 哈希、按类型缺失
-// 必填内容在写库前拒绝（schema CHECK 只是最后一道）。
+// TestResourceStore_EnsureVersionValidatesInput：未知类型、缺资源 UID、空标识 / 哈希、
+// 按类型缺失必填内容在写库前拒绝（schema CHECK 只是最后一道）。
 // 中文用例名：非法版本输入零写入。
 func TestResourceStore_EnsureVersionValidatesInput(t *testing.T) {
 	db := openTempDB(t)
 	seedOperation(t, db, "op-r-4")
 	store := NewResourceStore(db)
+	uid := resourceUIDFor(core.ResourceModelConnection, "x")
+	skillUID := resourceUIDFor(core.ResourceSkill, "x")
 
 	cases := []core.ResourceVersion{
-		{Kind: "unknown", ResourceID: "x", ContentHash: "h", DefinitionYAML: "y"},
-		{Kind: core.ResourceModelConnection, ResourceID: "", ContentHash: "h", DefinitionYAML: "y"},
-		{Kind: core.ResourceModelConnection, ResourceID: "x", ContentHash: ""},
-		{Kind: core.ResourceModelConnection, ResourceID: "x", ContentHash: "h"},
-		{Kind: core.ResourceSkill, ResourceID: "x", ContentHash: "h", StoragePath: "p"},
-		{Kind: core.ResourceSkill, ResourceID: "x", ContentHash: "h", ManifestJSON: "[]"},
+		{Kind: "unknown", ResourceUID: uid, ResourceID: "x", ContentHash: "h", DefinitionYAML: "y"},
+		{Kind: core.ResourceModelConnection, ResourceID: "x", ContentHash: "h", DefinitionYAML: "y"},
+		{
+			Kind: core.ResourceModelConnection, ResourceUID: "ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A",
+			ResourceID: "x", ContentHash: "h", DefinitionYAML: "y",
+		},
+		{Kind: core.ResourceModelConnection, ResourceUID: uid, ResourceID: "", ContentHash: "h", DefinitionYAML: "y"},
+		{Kind: core.ResourceModelConnection, ResourceUID: uid, ResourceID: "x", ContentHash: ""},
+		{Kind: core.ResourceModelConnection, ResourceUID: uid, ResourceID: "x", ContentHash: "h"},
+		{Kind: core.ResourceSkill, ResourceUID: skillUID, ResourceID: "x", ContentHash: "h", StoragePath: "p"},
+		{Kind: core.ResourceSkill, ResourceUID: skillUID, ResourceID: "x", ContentHash: "h", ManifestJSON: "[]"},
 	}
 	for _, v := range cases {
 		_, _, err := store.EnsureVersion(context.Background(), v)
@@ -403,6 +427,36 @@ func TestResourceStore_PublishWithVersionIsAtomic(t *testing.T) {
 	require.Empty(t, versions)
 }
 
+// TestResourceStore_PublishWithVersionStateKeepsApplied：`applied=false` 的版本化发布
+// 仍插入新版本并前进 published，但 applied 留在旧版本（MCP 发布等重启才生效）；
+// 操作终态与指针同事务回填。`PublishWithVersion` 默认 applied=true 的路径由上一用例覆盖。
+// 中文用例名：版本化发布保留旧生效指针。
+func TestResourceStore_PublishWithVersionStateKeepsApplied(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-r-14")
+	seedOperation(t, db, "op-r-15")
+	store := NewResourceStore(db)
+
+	first, err := store.PublishWithVersionState(context.Background(),
+		modelVersion("openai", "sha256:v1", "op-r-14", 0), true, "op-r-14", opNow)
+	require.NoError(t, err)
+
+	second, err := store.PublishWithVersionState(context.Background(),
+		modelVersion("openai", "sha256:v2", "op-r-15", 0), false, "op-r-15", opNow.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, 2, second.VersionNo)
+
+	ptr, err := store.Pointer(context.Background(), core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Equal(t, second.ID, ptr.PublishedVersionID)
+	require.NotNil(t, ptr.AppliedVersionID)
+	require.Equal(t, first.ID, *ptr.AppliedVersionID)
+
+	op, err := NewManagementStore(db).GetOperation(context.Background(), "op-r-15")
+	require.NoError(t, err)
+	require.Equal(t, core.OperationSuccess, op.Status)
+}
+
 // TestResourceStore_LifecycleIndexRoundTrip：索引写有效记录后可读回；`valid=false` 清空
 // state 并记原因；无索引行不是错误。
 // 中文用例名：生命周期索引往返与失效清空。
@@ -443,6 +497,309 @@ func TestResourceStore_LifecycleIndexRoundTrip(t *testing.T) {
 	require.Equal(t, "ghost", missing.Agent)
 }
 
+// TestResourceStore_MarkDeleted：删除只给指针打标记——`deleted_at` / `operation_id` /
+// `updated_at` 刷新为本次删除，published 与 applied 不动；指针行与版本行都保留，版本
+// 列表排除已删除资源，版本历史（含原 operation_id）原样可读；删除操作的终态在同一
+// 事务内回填 success。
+// 中文用例名：删除只标记指针、保留版本、同事务回填终态。
+func TestResourceStore_MarkDeleted(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-md-pub")
+	seedOperation(t, db, "op-md-del")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	version, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-md-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", version.ID, true, "op-md-pub", opNow))
+
+	at := opNow.Add(2 * time.Minute)
+	require.NoError(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-md-del", at))
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.NotNil(t, ptr.DeletedAt)
+	require.Equal(t, at.UnixMilli(), *ptr.DeletedAt)
+	require.Equal(t, at.UnixMilli(), ptr.UpdatedAt)
+	require.Equal(t, "op-md-del", ptr.OperationID)
+	require.Equal(t, version.ID, ptr.PublishedVersionID)
+	require.NotNil(t, ptr.AppliedVersionID)
+	require.Equal(t, version.ID, *ptr.AppliedVersionID)
+
+	// 只读面排除已删除；版本历史完整保留（连原 operation_id 都没被改写）。
+	list, err := store.ListPointers(ctx, core.ResourceModelConnection)
+	require.NoError(t, err)
+	require.Empty(t, list)
+
+	versions, err := store.Versions(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Len(t, versions, 1)
+	require.Equal(t, version.ID, versions[0].ID)
+	require.Equal(t, "op-md-pub", versions[0].OperationID)
+
+	// 删除操作的终态与指针标记同一事务落库。
+	op := readRawOperation(t, db, "op-md-del")
+	require.Equal(t, string(core.OperationSuccess), op.Status)
+	require.True(t, op.FinishedAt.Valid)
+	require.Equal(t, at.UnixMilli(), op.FinishedAt.Int64)
+}
+
+// TestResourceStore_MarkDeletedKeepsVersionsAppendOnly：删除后版本仍在、可继续追加；
+// 同名重建是**新 UID**——旧 UID 不得复活（删除即终态），新 UID 的版本号从 1 起，
+// 指针换成新 UID 并清掉删除标记，旧 UID 的版本仍按 UID 可查（SC-017 取代 SC-005 的
+// 「版本号继续递增」）。
+// 中文用例名：删除后版本只追加、同名重建换新 UID 并从 1 计数。
+func TestResourceStore_MarkDeletedKeepsVersionsAppendOnly(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-mv-all")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	v1, _, err := store.EnsureVersion(ctx, modelVersion("openai", "sha256:v1", "op-mv-all", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", v1.ID, true, "op-mv-all", opNow))
+	require.NoError(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-mv-all",
+		opNow.Add(time.Minute)))
+
+	// 删除后按 id 仍可读旧版本（历史是可查证据）。
+	got, err := store.VersionByID(ctx, v1.ID)
+	require.NoError(t, err)
+	require.Equal(t, v1, got)
+
+	// 旧 UID 已在墓碑下：再追加同样 UID 的版本并发布必须被拒（UID 永不复用）。
+	stale, inserted, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v2", "op-mv-all", 0))
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.ErrorIs(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", stale.ID, true, "op-mv-all", opNow.Add(time.Minute+time.Second)),
+		core.ErrResourceUIDMismatch)
+
+	// 同名重建 = 新实例：新 UID、版本号从 1 起。
+	rebuilt := modelVersion("openai", "sha256:rebuild", "op-mv-all", 0)
+	rebuilt.ResourceUID = resourceUIDFor(core.ResourceModelConnection, "openai#rebuild")
+	v2, _, err := store.EnsureVersion(ctx, rebuilt)
+	require.NoError(t, err)
+	require.Equal(t, 1, v2.VersionNo)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", v2.ID, true, "op-mv-all", opNow.Add(2*time.Minute)))
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Nil(t, ptr.DeletedAt)
+	require.Equal(t, v2.ID, ptr.PublishedVersionID)
+	require.Equal(t, rebuilt.ResourceUID, ptr.ResourceUID)
+
+	list, err := store.ListPointers(ctx, core.ResourceModelConnection)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+
+	// 名称快照包含两代；UID 维度各自成线。服务层的「按名只回当前 UID」用后者落实。
+	current, err := store.VersionsByUID(ctx, core.ResourceModelConnection, rebuilt.ResourceUID)
+	require.NoError(t, err)
+	require.Len(t, current, 1)
+	require.Equal(t, 1, current[0].VersionNo)
+	legacy, err := store.VersionsByUID(ctx, core.ResourceModelConnection, v1.ResourceUID)
+	require.NoError(t, err)
+	require.Len(t, legacy, 2)
+
+	byName, err := store.Versions(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Len(t, byName, 3)
+}
+
+// TestResourceStore_MarkDeletedIsIdempotent：重复删除不新增行、不加版本；标记覆盖为
+// 最近一次的时间与操作号，两次操作各自回填 success。
+// 中文用例名：重复删除幂等，标记覆盖、行数不变。
+func TestResourceStore_MarkDeletedIsIdempotent(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-idem-pub")
+	seedOperation(t, db, "op-idem-1")
+	seedOperation(t, db, "op-idem-2")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	version, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-idem-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", version.ID, true, "op-idem-pub", opNow))
+
+	first := opNow.Add(time.Minute)
+	second := opNow.Add(2 * time.Minute)
+	require.NoError(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-idem-1", first))
+	require.NoError(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-idem-2", second))
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.NotNil(t, ptr.DeletedAt)
+	require.Equal(t, second.UnixMilli(), *ptr.DeletedAt)
+	require.Equal(t, second.UnixMilli(), ptr.UpdatedAt)
+	require.Equal(t, "op-idem-2", ptr.OperationID)
+
+	var pointerRows, versionRows int
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM resource_pointers WHERE resource_kind = ? AND resource_id = ?`,
+		string(core.ResourceModelConnection), "openai").Scan(&pointerRows))
+	require.Equal(t, 1, pointerRows)
+	require.NoError(t, db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM resource_versions WHERE resource_kind = ? AND resource_id = ?`,
+		string(core.ResourceModelConnection), "openai").Scan(&versionRows))
+	require.Equal(t, 1, versionRows)
+
+	for _, opID := range []string{"op-idem-1", "op-idem-2"} {
+		op := readRawOperation(t, db, opID)
+		require.Equal(t, string(core.OperationSuccess), op.Status, "operation %s", opID)
+		require.True(t, op.FinishedAt.Valid)
+	}
+}
+
+// TestResourceStore_MarkDeletedMissingPointer：指针行不存在返回 core.ErrResourceNotFound，
+// 且不写操作终态（操作保持 pending，交由调用方 / 恢复路径处置）。
+// 中文用例名：未命中指针返回 not-found，操作不终态化。
+func TestResourceStore_MarkDeletedMissingPointer(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-miss-ptr")
+	store := NewResourceStore(db)
+
+	err := store.MarkDeleted(context.Background(), core.ResourceModelConnection, "ghost", "op-miss-ptr", opNow)
+	require.ErrorIs(t, err, core.ErrResourceNotFound)
+
+	op := readRawOperation(t, db, "op-miss-ptr")
+	require.Equal(t, string(core.OperationPending), op.Status)
+	require.False(t, op.FinishedAt.Valid)
+}
+
+// TestResourceStore_MarkDeletedMissingOperation：operation_id 外键要求删除操作已预写；
+// 悬空操作号在标记指针时被拒，指针标记与终态都不落库。
+// 中文用例名：删除必须挂已预写的操作，悬空操作号零写入。
+func TestResourceStore_MarkDeletedMissingOperation(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-mo-pub")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	version, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-mo-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", version.ID, true, "op-mo-pub", opNow))
+
+	err = store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-mo-ghost", opNow.Add(time.Minute))
+	require.ErrorContains(t, err, "标记删除")
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Nil(t, ptr.DeletedAt)
+	require.Equal(t, "op-mo-pub", ptr.OperationID)
+	require.Equal(t, opNow.UnixMilli(), ptr.UpdatedAt)
+}
+
+// TestResourceStore_MarkDeletedRollsBackWhenTerminalWriteFails：终态回填失败时（这里用
+// 触发器让 management_operations 的 UPDATE 中止），指针上的删除标记必须一起回滚——
+// 不允许"指针已删、操作还 pending"的中间态。
+// 中文用例名：终态写失败时删除标记整笔回滚。
+func TestResourceStore_MarkDeletedRollsBackWhenTerminalWriteFails(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-atomic-pub")
+	seedOperation(t, db, "op-atomic-del")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	version, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-atomic-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", version.ID, true, "op-atomic-pub", opNow))
+
+	_, err = db.write.ExecContext(ctx,
+		`CREATE TRIGGER block_terminal_write BEFORE UPDATE ON management_operations
+		 BEGIN SELECT RAISE(ABORT, 'terminal write blocked'); END`)
+	require.NoError(t, err)
+
+	err = store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-atomic-del",
+		opNow.Add(time.Minute))
+	require.ErrorContains(t, err, "回填管理操作")
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Nil(t, ptr.DeletedAt)
+	require.Equal(t, "op-atomic-pub", ptr.OperationID)
+}
+
+// TestResourceStore_MarkDeletedValidatesInput：未知类型、空标识、空操作号在开启事务前
+// 拒绝，已发布指针逐字段不变。
+// 中文用例名：非法删除输入零写入。
+func TestResourceStore_MarkDeletedValidatesInput(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-val-pub")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	version, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-val-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", version.ID, true, "op-val-pub", opNow))
+
+	require.Error(t, store.MarkDeleted(ctx, core.ResourceKind("unknown"), "openai", "op-val-pub", opNow))
+	require.Error(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "", "op-val-pub", opNow))
+	require.Error(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "", opNow))
+
+	ptr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Nil(t, ptr.DeletedAt)
+	require.Equal(t, "op-val-pub", ptr.OperationID)
+	require.Equal(t, opNow.UnixMilli(), ptr.UpdatedAt)
+}
+
+// TestResourceStore_MarkDeletedLeavesOtherResources：删除只作用于目标资源——同类其他
+// 指针不受影响（仍在未删除列表、标记为空），目标指针行保留作已删除证据。
+// 中文用例名：删除不波及其他资源。
+func TestResourceStore_MarkDeletedLeavesOtherResources(t *testing.T) {
+	db := openTempDB(t)
+	seedOperation(t, db, "op-other-pub")
+	seedOperation(t, db, "op-other-del")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	openai, _, err := store.EnsureVersion(ctx,
+		modelVersion("openai", "sha256:v1", "op-other-pub", 0))
+	require.NoError(t, err)
+	local, _, err := store.EnsureVersion(ctx,
+		modelVersion("local", "sha256:v1", "op-other-pub", 0))
+	require.NoError(t, err)
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"openai", openai.ID, true, "op-other-pub", opNow))
+	require.NoError(t, store.Publish(ctx, core.ResourceModelConnection,
+		"local", local.ID, true, "op-other-pub", opNow))
+
+	require.NoError(t, store.MarkDeleted(ctx, core.ResourceModelConnection, "openai", "op-other-del",
+		opNow.Add(time.Minute)))
+
+	list, err := store.ListPointers(ctx, core.ResourceModelConnection)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, "local", list[0].ResourceID)
+
+	localPtr, err := store.Pointer(ctx, core.ResourceModelConnection, "local")
+	require.NoError(t, err)
+	require.Nil(t, localPtr.DeletedAt)
+	require.Equal(t, "op-other-pub", localPtr.OperationID)
+
+	// 目标指针行没有删除：仍可按名读回带删除标记的证据行。
+	openaiPtr, err := store.Pointer(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.NotNil(t, openaiPtr.DeletedAt)
+
+	versions, err := store.Versions(ctx, core.ResourceModelConnection, "openai")
+	require.NoError(t, err)
+	require.Len(t, versions, 1)
+}
+
 // TestResourceStore_EnsureVersionRequiresOperation：版本行的 operation_id 外键指向管理
 // 操作——没有预写操作就建不了版本，发布路径无法绕过审计（宪法 V）。
 // 中文用例名：版本行必须挂已预写的操作。
@@ -460,4 +817,66 @@ func TestResourceStore_EnsureVersionRequiresOperation(t *testing.T) {
 	require.NoError(t, db.read.QueryRowContext(context.Background(),
 		`SELECT count(*) FROM resource_versions`).Scan(&count))
 	require.Zero(t, count)
+}
+
+// TestResourceStore_ConcurrentVersionNo：并发发布同一资源的不同内容——版本号在写连接上
+// 自动取号（MAX+1），不重复、不塌缩，指针最终指向本次发布的某个版本（012-race 必跑）。
+// 同一事务内完成取号、指针更新与操作终态回填是本用例的判据面。
+// TestResourceStore_ConcurrentVersionNo pins auto-numbering under concurrency: unique,
+// gap-free version numbers and a pointer that resolves to one of the winners.
+func TestResourceStore_ConcurrentVersionNo(t *testing.T) {
+	db := openTempDB(t)
+	store := NewResourceStore(db)
+
+	const workers = 8
+	operationIDs := make([]string, workers)
+	for i := 0; i < workers; i++ {
+		operationIDs[i] = fmt.Sprintf("op-race-%02d", i)
+		seedOperation(t, db, operationIDs[i])
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, workers)
+	versions := make([]core.ResourceVersion, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			versions[index], errs[index] = store.PublishWithVersionState(
+				context.Background(),
+				modelVersion("shared", fmt.Sprintf("sha256:race-%02d", index), operationIDs[index], 0),
+				true, operationIDs[index], opNow)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := make(map[int]string, workers)
+	for i := 0; i < workers; i++ {
+		require.NoError(t, errs[i], "worker %d", i)
+		require.NotZero(t, versions[i].VersionNo)
+		require.Zero(t, seen[versions[i].VersionNo], "版本号 %d 重复", versions[i].VersionNo)
+		seen[versions[i].VersionNo] = versions[i].ContentHash
+	}
+	require.Len(t, seen, workers)
+	for number := 1; number <= workers; number++ {
+		require.Contains(t, seen, number, "版本号必须从 1 起连续")
+	}
+
+	stored, err := store.Versions(context.Background(), core.ResourceModelConnection, "shared")
+	require.NoError(t, err)
+	require.Len(t, stored, workers)
+
+	winners := make(map[int64]bool, workers)
+	for _, version := range versions {
+		winners[version.ID] = true
+	}
+	ptr, err := store.Pointer(context.Background(), core.ResourceModelConnection, "shared")
+	require.NoError(t, err)
+	require.True(t, winners[ptr.PublishedVersionID], "指针必须指向本次发布的某个版本")
+	require.NotNil(t, ptr.AppliedVersionID)
+	require.Equal(t, ptr.PublishedVersionID, *ptr.AppliedVersionID,
+		"applied=true 的发布必须同时推进实际生效指针")
 }

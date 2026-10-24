@@ -26,6 +26,7 @@ const TARGET_KINDS: readonly OperationTargetKind[] = [
   'mcp_server',
   'skill',
   'notify_channel',
+  'network_allowlist',
   'system',
 ]
 
@@ -36,6 +37,7 @@ const TARGET_KIND_LABELS: Record<OperationTargetKind, string> = {
   mcp_server: 'MCP 服务',
   skill: '技能',
   notify_channel: '通知渠道',
+  network_allowlist: '网络白名单',
   system: '系统',
 }
 

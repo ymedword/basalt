@@ -55,11 +55,18 @@ func writeAgentWithProvider(t *testing.T, f *wireFixture, name, provider string)
 
 	dir := filepath.Join(f.root, agentsDirName, name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	// 绑定与种子版本用同一个确定性身份：准入要求 uid 与当前发布指针逐字相等。
+	// The binding names the same deterministic identity the seed publishes.
+	bindings := ""
+	if uid, ok := f.providerUID(provider); ok {
+		bindings = bindingsBlock([]core.ResourceBinding{{Name: provider, UID: uid}}, nil)
+	}
 	content := "---\n" +
 		"name: " + name + "\n" +
 		"description: 一致性探针\n" +
 		"provider:\n  name: " + provider + "\n  model: " + provider + "-model\n" +
 		"tools: []\n" +
+		bindings +
 		"---\n\n你是「" + name + "」。\n"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644))
 

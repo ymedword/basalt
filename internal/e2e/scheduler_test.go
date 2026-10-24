@@ -420,6 +420,9 @@ func testSchedulerAgentOtherDenied(t *testing.T) {
 			"schedules:\n  - id: shared\n    cron: \""+cron+"\"\n    message: 共享任务\n",
 		"归属演示")
 	h.writeAgent(t, "demo-b", agentFrontmatter("demo-b", []string{"manage_schedule"}), "归属演示")
+	// v3 准入要求定义里写当前发布指针身份：先按运维顺序完成发布与补绑，再取字节快照，
+	// 否则夹具自己的补绑会落在快照之后，被误判成产品改写。
+	h.publishBeforeSnapshot(t, fixtureEnv())
 	beforeA := agentFile(t, h, "demo-a")
 	beforeB := agentFile(t, h, "demo-b")
 

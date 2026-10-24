@@ -13,6 +13,10 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
+// v2TestResourceUID 是 v2 段用例里的资源 UID 字面量（v3 起 resource_versions 必填）。
+// v2TestResourceUID is the resource uid fixture used by the v2 section cases.
+const v2TestResourceUID = "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"
+
 // v2Tables 是 v2 增量迁移新增的七张表（契约 schema.sql「v2 新增」段）。
 // v2Tables lists the seven tables added by the v2 migration.
 var v2Tables = []string{
@@ -73,11 +77,11 @@ func TestSchemaV2_NewDatabaseHasV2Tables(t *testing.T) {
 	requireV2Tables(t, db)
 }
 
-// TestSchemaV2_VersionRecorded：新库的版本行 = 2（SupportedSchemaVersion）。
+// TestSchemaV2_VersionRecorded：新库的版本行 = 当前支持版本（SupportedSchemaVersion）。
 func TestSchemaV2_VersionRecorded(t *testing.T) {
 	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
 	require.NoError(t, Migrate(context.Background(), db, schemaFS, SupportedSchemaVersion))
-	require.Equal(t, 2, mustVersion(t, db))
+	require.Equal(t, SupportedSchemaVersion, mustVersion(t, db))
 }
 
 // TestSchemaV2_MigrateFromV1：旧库 1 → 2 执行真实迁移，七表落地且两版恰好各一行。
@@ -191,18 +195,18 @@ func TestSchemaV2_ResourceKindCheckConstraint(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = db.Exec(`INSERT INTO resource_versions
-		(resource_kind, resource_id, version_no, content_hash, created_at, operation_id)
-		VALUES ('skill', 'summary', 1, 'abc', 1, 'op-3-cccccc')`)
+		(resource_kind, resource_uid, resource_id, version_no, content_hash, created_at, operation_id)
+		VALUES ('skill', ?, 'summary', 1, 'abc', 1, 'op-3-cccccc')`, v2TestResourceUID)
 	require.Error(t, err, "skill 版本必须带 manifest_json 与 storage_path")
 
 	_, err = db.Exec(`INSERT INTO resource_versions
-		(resource_kind, resource_id, version_no, content_hash, manifest_json, storage_path, created_at, operation_id)
-		VALUES ('skill', 'summary', 1, 'abc', '[]', '.basalt/skills/summary', 1, 'op-3-cccccc')`)
+		(resource_kind, resource_uid, resource_id, version_no, content_hash, manifest_json, storage_path, created_at, operation_id)
+		VALUES ('skill', ?, 'summary', 1, 'abc', '[]', '.basalt/skills/summary', 1, 'op-3-cccccc')`, v2TestResourceUID)
 	require.NoError(t, err)
 
 	_, err = db.Exec(`INSERT INTO resource_versions
-		(resource_kind, resource_id, version_no, content_hash, definition_yaml, created_at, operation_id)
-		VALUES ('bogus', 'x', 1, 'abc', 'x', 1, 'op-3-cccccc')`)
+		(resource_kind, resource_uid, resource_id, version_no, content_hash, definition_yaml, created_at, operation_id)
+		VALUES ('bogus', ?, 'x', 1, 'abc', 'x', 1, 'op-3-cccccc')`, v2TestResourceUID)
 	require.Error(t, err, "非法 resource_kind 必须被 CHECK 拒绝")
 }
 

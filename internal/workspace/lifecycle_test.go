@@ -35,7 +35,7 @@ var lifecycleTestBase = time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 // lifecycleGoldenEmptyChecksumJSON 是校验和向量的**独立**输入：checksum 置空串时的
 // 规范字节。测试自己算 sha256，不调用被测的 lifecycleChecksum。
 // lifecycleGoldenEmptyChecksumJSON is the independent checksum vector input.
-const lifecycleGoldenEmptyChecksumJSON = `{"schema_version":1,"agent":"reporter","state":"disabled","generation":1,"updated_at":1760000000000,"operation_id":"op-1760000000000-a1b2c3","checksum":""}`
+const lifecycleGoldenEmptyChecksumJSON = `{"schema_version":2,"agent":"reporter","agent_uid":"ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A","state":"disabled","generation":1,"updated_at":1760000000000,"operation_id":"op-1760000000000-a1b2c3","checksum":""}`
 
 // lifecycleTestClock 是可推进的测试时钟；并发测试里多 goroutine 读取，故加锁。
 // lifecycleTestClock is an advanceable clock, guarded for concurrent readers.
@@ -74,6 +74,7 @@ func lifecycleGoldenRecord() core.LifecycleRecord {
 	return core.LifecycleRecord{
 		SchemaVersion: lifecycleSchemaVersion,
 		Agent:         "reporter",
+		AgentUID:      core.AgentUID("ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"),
 		State:         core.AgentDisabled,
 		Generation:    1,
 		UpdatedAt:     1760000000000,
@@ -500,7 +501,7 @@ func TestLifecycleState_EncodingIsCanonical(t *testing.T) {
 func TestLifecycleState_ChecksumVectorMatchesIndependentHash(t *testing.T) {
 	t.Parallel()
 
-	const emptyChecksum = `{"schema_version":1,"agent":"reporter","state":"active","generation":3,"updated_at":1760000000000,"operation_id":"op-1760000000000-a1b2c3","checksum":""}`
+	const emptyChecksum = `{"schema_version":2,"agent":"reporter","agent_uid":"ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A","state":"active","generation":3,"updated_at":1760000000000,"operation_id":"op-1760000000000-a1b2c3","checksum":""}`
 	sum := sha256.Sum256([]byte(emptyChecksum))
 	want := "sha256:" + hex.EncodeToString(sum[:])
 
@@ -547,7 +548,7 @@ func TestLifecycleState_DecodeRejectsInvalidFields(t *testing.T) {
 		mutate func(*core.LifecycleRecord)
 		want   string
 	}{
-		"schema 版本": {mutate: func(rec *core.LifecycleRecord) { rec.SchemaVersion = 2 }, want: "schema_version"},
+		"schema 版本": {mutate: func(rec *core.LifecycleRecord) { rec.SchemaVersion = 3 }, want: "schema_version"},
 		"状态字面量":     {mutate: func(rec *core.LifecycleRecord) { rec.State = core.AgentState("paused") }, want: "未知生命周期状态"},
 		"代数下界":      {mutate: func(rec *core.LifecycleRecord) { rec.Generation = 0 }, want: "generation"},
 		"时间下界":      {mutate: func(rec *core.LifecycleRecord) { rec.UpdatedAt = 0 }, want: "updated_at"},
@@ -642,4 +643,40 @@ func TestLifecycleStore_ConcurrentTransition(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.EqualValues(t, 1+succeeded.Load(), final.Generation)
+}
+
+// TestLifecycleStore_TransitionPreservesAgentUID：稳定身份跨状态迁移不变——启停与
+// 归档（active → archived）都沿用同一 `agent_uid`，只有 v1 记录首写才补发身份。
+// 归档恢复对原名的身份校验依赖这一事实：同一 Agent 的 UID 不得因迁移而更换。
+// Acceptance point: the stable identity survives every lifecycle transition.
+func TestLifecycleStore_TransitionPreservesAgentUID(t *testing.T) {
+	t.Parallel()
+	store, _, gate, clock := newLifecycleTestStore(t)
+	ctx := context.Background()
+
+	first, err := store.Bootstrap(ctx, "reporter", "op-bootstrap-1")
+	require.NoError(t, err)
+	require.True(t, first.AgentUID.Valid())
+
+	clock.advance(time.Minute)
+	release := gate.Lock("reporter")
+	active, err := store.Transition(ctx, "reporter", core.AgentDisabled, 1, core.AgentActive, "op-enable-1")
+	release()
+	require.NoError(t, err)
+	require.Equal(t, first.AgentUID, active.AgentUID, "启停不得更换稳定身份")
+
+	clock.advance(time.Minute)
+	release = gate.Lock("reporter")
+	archived, err := store.Transition(ctx, "reporter", core.AgentActive, 2, core.AgentArchived, "op-archive-1")
+	release()
+	require.NoError(t, err)
+	require.Equal(t, first.AgentUID, archived.AgentUID, "归档不得更换稳定身份")
+
+	// 归档记录里的身份来自状态文件：Read 必须回报同一 UID（恢复路径据此校验）。
+	read, exists, err := store.Read(ctx, "reporter")
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, first.AgentUID, read.AgentUID)
+	require.Equal(t, core.AgentArchived, read.State)
+	require.Equal(t, int64(3), read.Generation)
 }

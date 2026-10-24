@@ -62,6 +62,9 @@ const (
 	agentsDirName    = "agents"
 	agentFileName    = "AGENT.md"
 	configFileName   = "basalt.yaml"
+	// databaseFileName 是工作区库文件名（与装配层 `databaseFileName` 同值；此处按
+	// 字面量引用，不反向依赖装配层）。夹具只读它一次，用来取发布指针的 UID。
+	databaseFileName = "basalt.db"
 
 	// probeProviderName 是 fake 档临时配置里的供应商名。用例的 AGENT.md 声明它，
 	// 路由查表因此仍是一次真实查表（宪法 III 的显式映射在评测里一步不少）。
@@ -822,6 +825,22 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 	if ec.Provider == "" {
 		opts.ProviderClient = newScriptedClient(ec.Script)
 	}
+	// v3 绑定契约（US-12）：运行准入要求 `resource_bindings` 与定义里的引用逐一
+	// 对应，而资源 UID 只有**发布**时才生成——夹具在装配前写不出它。先装配一遍
+	// （基线发布配置里的条目），读出已发布指针的 UID，再按迁移第 4 步的同一手法
+	// （BackfillAgentBindings）把绑定写回定义文件，然后正式装配。两遍都走生产
+	// 入口，夹具不自己拼 UID（生产 UID 是随机的，按名抄一个等于伪造身份）。
+	// v3 binding contract: published UIDs only exist after the baseline publishes the
+	// configured entries, so the fixture is assembled twice — publish, then declare.
+	if err := declareFixtureBindings(ctx, workDir, ec, opts); err != nil {
+		if ec.Provider == "" {
+			cr.Error = fmt.Sprintf("装配失败：%v", err)
+			return cr
+		}
+		cr.Skipped = true
+		cr.SkipReason = fmt.Sprintf("门控不成立：装配失败（凭证 / 配置未就位）：%v", err)
+		return cr
+	}
 	rt, err := app.OpenRuntime(ctx, opts)
 	if err != nil {
 		if ec.Provider == "" {
@@ -894,6 +913,62 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 	cr.Checks = judge(ec, obs)
 	cr.Passed = allChecksPassed(cr.Checks)
 	return cr
+}
+
+// declareFixtureBindings 先装配一遍让基线发布配置里的条目，再把已发布身份的 UID
+// 写进夹具 Agent 的 `resource_bindings`（v3 起该块是绑定的唯一权威：准入与投影都
+// 只认它，缺块即"引用没有绑定"，整只不可用于运行）。没有引用的用例不动文件。
+// declareFixtureBindings publishes the configured entries, then writes the published
+// UIDs into the fixture's bindings block through the migration-time backfill.
+func declareFixtureBindings(ctx context.Context, workDir string, ec evalCase, opts app.Options) (err error) {
+	publisher, err := app.OpenRuntime(ctx, opts)
+	if err != nil {
+		return err
+	}
+	if closeErr := publisher.Close(); closeErr != nil {
+		return fmt.Errorf("发布遍装配释放失败：%w", closeErr)
+	}
+
+	wsRoot := filepath.Join(workDir, workspaceDirName)
+	view, err := workspace.InspectAgentForMigration(wsRoot, ec.Fixture.Agent)
+	if err != nil {
+		return fmt.Errorf("读取夹具 Agent 定义：%w", err)
+	}
+
+	db, err := storage.OpenReadOnly(ctx, filepath.Join(wsRoot, databaseFileName), storage.SupportedSchemaVersion)
+	if err != nil {
+		return fmt.Errorf("只读打开夹具库：%w", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("关闭夹具库：%w", closeErr))
+		}
+	}()
+
+	bindings := core.ResourceBindings{}
+	if name := view.Profile.Provider.Name; name != "" {
+		pointer, err := storage.NewResourceStore(db).Pointer(ctx, core.ResourceModelConnection, name)
+		if err != nil {
+			return fmt.Errorf("读模型连接 %s 的发布指针：%w", name, err)
+		}
+		bindings.ModelConnections = append(bindings.ModelConnections,
+			core.ResourceBinding{Name: name, UID: pointer.ResourceUID})
+	}
+	for _, name := range view.Profile.NotifyChannels {
+		channel, err := storage.NewNotifyAdminStore(db).Get(ctx, name)
+		if err != nil {
+			return fmt.Errorf("读通知渠道 %s 的身份：%w", name, err)
+		}
+		bindings.NotifyChannels = append(bindings.NotifyChannels,
+			core.ResourceBinding{Name: name, UID: channel.ResourceUID})
+	}
+	if len(bindings.ModelConnections) == 0 && len(bindings.NotifyChannels) == 0 {
+		return nil
+	}
+	if _, err := workspace.BackfillAgentBindings(wsRoot, ec.Fixture.Agent, bindings); err != nil {
+		return fmt.Errorf("写回夹具绑定：%w", err)
+	}
+	return nil
 }
 
 // enableFixtureAgent 在基线之后把夹具 Agent 迁到 active：用独立闸门 + 生产状态存储完成

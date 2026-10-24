@@ -251,6 +251,20 @@ func mcpServersYAML(name string) string {
 		name, mcpHelperCommand(), mcpHelperEnvRef)
 }
 
+// mcpShellAllowed 返回把 helper 可执行名加入 `shell.allowed_commands` 的配置段：US-12 起
+// MCP supervisor 在建立 stdio 连接前按该白名单判定可执行名（Operations §5.4），未列入即
+// 拒绝连接——夹具要判"连上之后"的行为，就必须像运维那样先把命令放进名单。
+// mcpShellAllowed allowlists the helper executable, which US-12 requires for stdio MCP.
+func mcpShellAllowed() string { return mcpShellAllow(os.Args[0]) }
+
+// mcpShellAllow 只放行指定可执行名。负向用例（命令在名单内、文件不存在）用它把判据
+// 留在"连接失败"而不是"策略拒绝"上。
+// mcpShellAllow allowlists exactly one executable so negative cases still exercise the
+// connect-failure path rather than policy denial.
+func mcpShellAllow(command string) string {
+	return "shell:\n  allowed_commands:\n    - '" + command + "'\n"
+}
+
 // TestMCPHelperProcess 是 MCP helper 的子进程入口：仅在 BASALT_MCP_HELPER 置位时服务
 // stdio；默认运行下 testutil.RunMCPHelper 自行 SKIP（它是入口，不是用例）。
 // TestMCPHelperProcess is the MCP helper subprocess entry; it serves stdio only when

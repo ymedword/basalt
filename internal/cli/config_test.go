@@ -849,3 +849,243 @@ func TestConfig_AdminAuthValidatesTrustedProxies(t *testing.T) {
 		})
 	}
 }
+
+// authorConfig 在最小可用配置上追加 author 段——其余段与 baseConfig 一致，
+// 子用例之间的唯一变量是 author 段内容。
+// authorConfig appends an author section to the minimal valid configuration.
+func authorConfig(section string) string {
+	return baseConfig + "author:\n" + section
+}
+
+// TestConfig_ParsesAuthorSection —— T006 的装载集成：`author:` 段经
+// ParseAuthorSection 落进类型化字段；省略 temperature 时取缺省 0.2。
+// TestConfig_ParsesAuthorSection proves LoadConfig lands the typed section and applies
+// the 0.2 default when temperature is omitted.
+func TestConfig_ParsesAuthorSection(t *testing.T) {
+	path := writeConfig(t, authorConfig("  provider: main\n  model: author-model\n  temperature: 1.5\n"))
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err)
+	require.Equal(t, "main", cfg.Author.Provider)
+	require.Equal(t, "author-model", cfg.Author.Model)
+	require.Equal(t, 1.5, cfg.Author.Temperature)
+
+	path = writeConfig(t, authorConfig("  provider: main\n  model: author-model\n"))
+	cfg, err = cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err)
+	require.Equal(t, 0.2, cfg.Author.Temperature, "省略 temperature 时取缺省 0.2")
+}
+
+// TestConfig_AuthorSectionAbsentDisablesFeature：不带 author 段的既有配置照常装载，
+// 解析结果是零值——作者功能关闭，不是"缺省温度 0.2 已配置"。
+// TestConfig_AuthorSectionAbsentDisablesFeature keeps existing configs loading and
+// yields the zero value, which downstream reads as "feature off".
+func TestConfig_AuthorSectionAbsentDisablesFeature(t *testing.T) {
+	path := writeConfig(t, baseConfig)
+	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}))
+	require.NoError(t, err, "没有 author 段不得阻断启动")
+	require.Empty(t, cfg.Author.Provider)
+	require.Empty(t, cfg.Author.Model)
+	require.Zero(t, cfg.Author.Temperature, "缺段必须返回零值（功能关闭），不填缺省温度")
+}
+
+// TestConfig_RejectsInvalidAuthorSection —— 段内错误在装载期拒绝：未知键、越界
+// temperature、非映射段与类型错误都点名 author 键路径。
+// TestConfig_RejectsInvalidAuthorSection surfaces section errors through LoadConfig.
+func TestConfig_RejectsInvalidAuthorSection(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "未知键",
+			content: "author:\n  modle: typo\n",
+			want:    "未知键",
+		},
+		{
+			name:    "temperature 越界",
+			content: "author:\n  temperature: 2.5\n",
+			want:    "author.temperature",
+		},
+		{
+			name:    "非映射段",
+			content: "author: oops\n",
+			want:    "author",
+		},
+		{
+			name:    "provider 类型错误",
+			content: "author:\n  provider: 123\n",
+			want:    "author.provider",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.content)
+			_, err := cli.LoadConfig(path, envLookup(nil))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// demoEnv 是最小可用配置所需的两个环境变量（其余子用例共用）。
+// demoEnv supplies the two variables the minimal valid configuration references.
+func demoEnv() map[string]string {
+	return map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	}
+}
+
+// secretsConfig 在最小可用配置上追加 secrets 段——子用例之间的唯一变量是段内容。
+// secretsConfig appends a secrets section to the minimal valid configuration.
+func secretsConfig(section string) string {
+	return baseConfig + "secrets:\n" + section
+}
+
+// TestConfig_MasterKeyFileRequired —— T136：整段省略合法（纯 env 实例不需要主密钥）；
+// 只要写了 `secrets:`（含空小节），就必须给出 `master_key_file`——写了段等于声明
+// "这台实例托管凭据"，空路径会让部署者以为已配好，故障推到每次托管写入才暴露。
+// TestConfig_MasterKeyFileRequired keeps an absent section legal while requiring the
+// path as soon as the section is written at all.
+func TestConfig_MasterKeyFileRequired(t *testing.T) {
+	t.Run("整段省略", func(t *testing.T) {
+		path := writeConfig(t, baseConfig)
+		cfg, err := cli.LoadConfig(path, envLookup(demoEnv()))
+		require.NoError(t, err, "纯 env 实例不因缺 secrets 段而失败")
+		require.Empty(t, cfg.Secrets.MasterKeyFile, "缺段必须是零值，不是某个缺省路径")
+	})
+
+	t.Run("写了段但缺路径", func(t *testing.T) {
+		for name, section := range map[string]string{
+			"空小节":  "",
+			"仅注释":  "  # 暂未配置\n",
+			"空映射":  "  {}\n",
+			"路径空串": "  master_key_file: \"\"\n",
+		} {
+			t.Run(name, func(t *testing.T) {
+				path := writeConfig(t, secretsConfig(section))
+				_, err := cli.LoadConfig(path, envLookup(demoEnv()))
+				require.Error(t, err, "写了 secrets 段就必须给出路径")
+				require.Contains(t, err.Error(), "secrets.master_key_file")
+			})
+		}
+	})
+
+	t.Run("给出工作区外绝对路径", func(t *testing.T) {
+		outside := filepath.Join(t.TempDir(), "keys", "master.key")
+		path := writeConfig(t, secretsConfig("  master_key_file: '"+outside+"'\n"))
+		cfg, err := cli.LoadConfig(path, envLookup(demoEnv()))
+		require.NoError(t, err)
+		require.Equal(t, outside, cfg.Secrets.MasterKeyFile)
+	})
+}
+
+// TestConfig_MasterKeyInsideWorkspaceRejected —— T136：主密钥**不得**落在工作区内。
+// 装载层按「配置文件同级 `.basalt/`」做词法判定（绝对与相对路径都换算到同一根）；
+// 工作区外与跨盘路径放行。链接 / 权限与真实工作区根由 LoadMasterKey 运行期复核。
+// TestConfig_MasterKeyInsideWorkspaceRejected walks the lexical boundary; runtime
+// link and permission checks still belong to LoadMasterKey.
+func TestConfig_MasterKeyInsideWorkspaceRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	cases := []struct {
+		name    string
+		keyPath string
+	}{
+		{name: "绝对路径落在工作区内", keyPath: filepath.Join(dir, ".basalt", "master.key")},
+		{name: "相对路径落在工作区内", keyPath: ".basalt/master.key"},
+		{name: "路径就是工作区根", keyPath: filepath.Join(dir, ".basalt")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, "basalt.yaml")
+			require.NoError(t, os.WriteFile(path,
+				[]byte(secretsConfig("  master_key_file: '"+tc.keyPath+"'\n")), 0o600))
+			_, err := cli.LoadConfig(path, envLookup(demoEnv()))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "工作区内")
+		})
+	}
+
+	t.Run("工作区外的同级目录", func(t *testing.T) {
+		path := filepath.Join(dir, "basalt.yaml")
+		outside := filepath.Join(dir, "keys", "master.key")
+		require.NoError(t, os.WriteFile(path,
+			[]byte(secretsConfig("  master_key_file: '"+outside+"'\n")), 0o600))
+		cfg, err := cli.LoadConfig(path, envLookup(demoEnv()))
+		require.NoError(t, err, "工作区外的路径不得被连坐拒绝")
+		require.Equal(t, outside, cfg.Secrets.MasterKeyFile)
+	})
+}
+
+// TestConfig_ManagedProviderNeedsNoAPIKey —— R4.8：服务端在定义文件里写
+// `credential_mode: managed` 且**没有** `api_key` 行；装载层必须接受自己写出的形态，
+// 否则下一次启动就拒绝装载本实例的定义文件（实例改由管理台托管凭据后无法重启）。
+// TestConfig_ManagedProviderNeedsNoAPIKey accepts the exact shape the server writes.
+func TestConfig_ManagedProviderNeedsNoAPIKey(t *testing.T) {
+	path := writeConfig(t, `http:
+  addr: "127.0.0.1:8080"
+providers:
+  - name: vault
+    base_url: https://api.example.com/v1
+    credential_mode: managed
+    default_model: vault-model
+`)
+
+	cfg, err := cli.LoadConfig(path, envLookup(nil))
+	require.NoError(t, err, "managed 条目没有 api_key 是契约形态，不是缺项")
+	require.Equal(t, "managed", cfg.Providers[0].CredentialMode, "模式字段原样落地")
+	require.Empty(t, cfg.Providers[0].APIKey, "managed 条目不得带 api_key")
+}
+
+// TestConfig_ProviderCredentialModeContradictions —— 两模式的矛盾形态逐条失败关闭：
+// env（含省略）缺占位、managed 又写 api_key、未知模式字面量。
+// TestConfig_ProviderCredentialModeContradictions fails closed on every contradictory
+// shape across the two modes.
+func TestConfig_ProviderCredentialModeContradictions(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{
+			name:  "env 缺 api_key",
+			entry: "  - name: demo\n    base_url: https://api.example.com/v1\n    default_model: m\n",
+			want:  "providers[0].api_key 缺失",
+		},
+		{
+			name: "managed 带 api_key",
+			entry: "  - name: demo\n    base_url: https://api.example.com/v1\n" +
+				"    credential_mode: managed\n    api_key: ${DEMO_KEY}\n    default_model: m\n",
+			want: "providers[0].api_key 在 credential_mode: managed 下不得出现",
+		},
+		{
+			name: "未知模式字面量",
+			entry: "  - name: demo\n    base_url: https://api.example.com/v1\n" +
+				"    credential_mode: plain\n    default_model: m\n",
+			want: "providers[0].credential_mode 取值非法",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, "http:\n  addr: \"127.0.0.1:8080\"\nproviders:\n"+tc.entry)
+
+			_, err := cli.LoadConfig(path, envLookup(demoEnv()))
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want, "必须点名键路径与规则")
+			require.NotContains(t, err.Error(), "resolved-secret-value", "不得回显解析后的凭证值")
+		})
+	}
+}

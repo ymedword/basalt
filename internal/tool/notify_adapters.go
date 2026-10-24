@@ -63,6 +63,27 @@ func (a *WebhookNotifyAdapter) Send(ctx context.Context, rawURL, content string)
 	return nil
 }
 
+// SendResult 是系统代投用的详细结果面：2xx 即 sent（自定义接收端没有业务回执可判），
+// 非 2xx 是确定失败，传输歧义按 classifyDeliveryTransport 三分。
+// SendResult reports the detailed outcome for system delivery: 2xx is sent, non-2xx is a
+// definite failure, and ambiguous transport errors are classified three ways.
+func (a *WebhookNotifyAdapter) SendResult(ctx context.Context, rawURL, content string) core.DeliveryOutcome {
+	display := notifyDisplayURL(rawURL)
+	resp, stage, err := notifyDispatch(ctx, a.doer, rawURL, webhookNotifyPayload{Content: content})
+	switch stage {
+	case notifySendEncode, notifySendRequest:
+		return failedOutcome(0, "构造通知请求失败："+display)
+	case notifySendTransport:
+		return classifyDeliveryTransport(ctx, err, display)
+	}
+	status := resp.StatusCode
+	discardBody(resp)
+	if status < 200 || status >= 300 {
+		return failedOutcome(status, fmt.Sprintf("HTTP %d：%s", status, display))
+	}
+	return sentOutcome(status, fmt.Sprintf("已发送（HTTP %d）：%s", status, display))
+}
+
 // FeishuNotifyAdapter 发 `{"msg_type":"text","content":{"text":"…"}}`；成功 = HTTP
 // 2xx 且回执 `code == 0`——飞书投递失败同样回 HTTP 200，状态码不是投递真值。
 // FeishuNotifyAdapter posts the fixed text payload; success requires 2xx and code == 0,
@@ -98,6 +119,51 @@ func (a *FeishuNotifyAdapter) Send(ctx context.Context, rawURL, content string) 
 	return feishuReceiptVerdict(ctx, resp, notifyDisplayURL(rawURL))
 }
 
+// SendResult 是系统代投用的详细结果面：2xx 且回执 code=0 才是 sent，明确回执错误是
+// failed，回执不可解析是 unknown——飞书失败同样回 HTTP 200，状态码不是投递真值。
+// SendResult needs both 2xx and code == 0 for a success; Feishu reports failures with
+// HTTP 200, and an unparsable receipt stays unknown.
+func (a *FeishuNotifyAdapter) SendResult(ctx context.Context, rawURL, content string) core.DeliveryOutcome {
+	display := notifyDisplayURL(rawURL)
+	resp, stage, err := notifyDispatch(ctx, a.doer, rawURL, feishuNotifyPayload{
+		MsgType: "text",
+		Content: feishuNotifyText{Text: content},
+	})
+	switch stage {
+	case notifySendEncode, notifySendRequest:
+		return failedOutcome(0, "构造通知请求失败："+display)
+	case notifySendTransport:
+		return classifyDeliveryTransport(ctx, err, display)
+	}
+	status := resp.StatusCode
+	if status < 200 || status >= 300 {
+		discardBody(resp)
+		return failedOutcome(status, fmt.Sprintf("HTTP %d：%s", status, display))
+	}
+	code, verdict, _ := readFeishuReceipt(resp)
+	switch verdict {
+	case receiptAccepted:
+		return core.DeliveryOutcome{
+			Status:      core.DeliverySent,
+			HTTPStatus:  status,
+			ReceiptCode: &code,
+			Detail:      "飞书已受理（code=0）：" + display,
+		}
+	case receiptRejected:
+		return core.DeliveryOutcome{
+			Status:      core.DeliveryFailed,
+			HTTPStatus:  status,
+			ReceiptCode: &code,
+			Detail:      fmt.Sprintf("飞书投递失败：code=%d（%s）", code, display),
+		}
+	}
+	return core.DeliveryOutcome{
+		Status:     core.DeliveryUnknown,
+		HTTPStatus: status,
+		Detail:     "飞书回执无法解析，结果未知：" + display,
+	}
+}
+
 // webhookNotifyPayload 是 webhook 适配器的固定载荷：`{"content": "…"}`。
 // webhookNotifyPayload is the fixed webhook payload.
 type webhookNotifyPayload struct {
@@ -125,6 +191,45 @@ type feishuNotifyReceipt struct {
 	Code *int `json:"code"`
 }
 
+// notifySendStage 标记发送在哪一步停下：编码 / 构造属**请求未发出**的确定失败，
+// 传输失败可能已送达，调用方据此区分确定失败与结果未知。
+// notifySendStage marks where a send stopped: encoding and request construction fail
+// before anything leaves the process, while transport errors may already have delivered.
+type notifySendStage int
+
+const (
+	// notifySendOK 表示请求已发出并拿到响应（含非 2xx）。
+	notifySendOK notifySendStage = iota
+	// notifySendEncode 表示载荷编码失败。
+	notifySendEncode
+	// notifySendRequest 表示请求构造失败。
+	notifySendRequest
+	// notifySendTransport 表示传输层失败，是否送达未知。
+	notifySendTransport
+)
+
+// notifyDispatch 编码、建请求并发送；非 2xx 的响应照常返回，由调用方判状态并关闭。
+// 这个分层让 `Send`（错误即失败）与 `SendResult`（三分结果）共享同一条发送路径。
+// notifyDispatch encodes and sends, returning non-2xx responses to the caller so the
+// binary and three-valued faces share one send path.
+func notifyDispatch(ctx context.Context, doer httpDoer, rawURL string, payload any) (*http.Response, notifySendStage, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, notifySendEncode, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, notifySendRequest, err
+	}
+	req.Header.Set("Content-Type", notifyContentType)
+
+	resp, err := doer.Do(req)
+	if err != nil {
+		return nil, notifySendTransport, err
+	}
+	return resp, notifySendOK, nil
+}
+
 // notifyPost 编码、建请求并发送；非 2xx（含 3xx）在此统一判 external_error 并关闭
 // 响应体，2xx 交回调用方（调用方在所有分支关闭 resp.Body）。编码 / 建请求失败属本侧
 // 问题（runtime_error），文案只含 `scheme://host`；传输失败先判 ctx 身份，原始错误
@@ -135,18 +240,13 @@ type feishuNotifyReceipt struct {
 func notifyPost(ctx context.Context, doer httpDoer, rawURL string, payload any) (*http.Response, error) {
 	display := notifyDisplayURL(rawURL)
 
-	body, err := json.Marshal(payload)
-	if err != nil {
+	resp, stage, err := notifyDispatch(ctx, doer, rawURL, payload)
+	switch stage {
+	case notifySendEncode:
 		return nil, fmt.Errorf("编码通知载荷失败：%s", display)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
-	if err != nil {
+	case notifySendRequest:
 		return nil, fmt.Errorf("构造通知请求失败：%s", display)
-	}
-	req.Header.Set("Content-Type", notifyContentType)
-
-	resp, err := doer.Do(req)
-	if err != nil {
+	case notifySendTransport:
 		if ctxErr := ctxPreferred(ctx, err); ctxErr != nil {
 			return nil, ctxErr
 		}
@@ -167,54 +267,75 @@ func notifyPost(ctx context.Context, doer httpDoer, rawURL string, payload any) 
 	return resp, nil
 }
 
-// feishuReceiptVerdict 读取并判定飞书回执：最多读 64 KiB **多读 1 字节**——超限是显式
-// 检测出的事实，不是截断后的猜测；解析用 json.Unmarshal（尾随垃圾同样报错）。空体 /
-// 非 JSON / code 缺失、null、非整数一律按「飞书回执无法解析」判失败——「结果未知」不
-// 冒充成功。读取错误先判 ctx 身份；所有分支关闭 resp.Body。
-// feishuReceiptVerdict reads at most 64 KiB plus one byte and treats anything it cannot
-// parse, including an over-limit receipt, as failure. The body is closed on every branch,
-// and read errors check the context identity first.
-func feishuReceiptVerdict(ctx context.Context, resp *http.Response, display string) error {
-	unparsable := func(cause error) error {
-		return &core.ExternalError{
-			Target: display,
-			Reason: "飞书回执无法解析：" + display,
-			Cause:  cause,
-		}
-	}
+// receiptVerdict 是飞书回执的三值判定。
+// receiptVerdict is the three-valued verdict of a Feishu receipt.
+type receiptVerdict int
 
+const (
+	// receiptAccepted 表示 2xx 且 code == 0。
+	receiptAccepted receiptVerdict = iota
+	// receiptRejected 表示回执明确给出非 0 的 code。
+	receiptRejected
+	// receiptUnparsable 表示回执读不全 / 不是 JSON / 缺 code——结果未知。
+	receiptUnparsable
+)
+
+// readFeishuReceipt 读取并判定回执：最多读 64 KiB **多读 1 字节**——超限是显式检测出
+// 的事实，不是截断后的猜测；解析用 json.Unmarshal（尾随垃圾同样报错）。空体 / 非 JSON
+// / code 缺失、null、非整数一律落 receiptUnparsable。所有分支关闭 resp.Body。
+// readFeishuReceipt reads at most 64 KiB plus one byte; anything it cannot parse, over
+// limit included, is unparsable. The body is closed on every branch.
+func readFeishuReceipt(resp *http.Response) (int, receiptVerdict, error) {
 	if resp.Body == nil {
-		return unparsable(nil)
+		return 0, receiptUnparsable, nil
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxNotifyReceiptBytes+1))
 	closeErr := resp.Body.Close()
 	if readErr != nil {
-		if ctxErr := ctxPreferred(ctx, readErr); ctxErr != nil {
-			return ctxErr
-		}
-		return unparsable(readErr)
+		return 0, receiptUnparsable, readErr
 	}
 	if closeErr != nil {
-		// 内容已读全，但连接状态可疑仍如实报失败（同包 httptools 的口径）。
-		// The content is complete, but a suspicious connection still fails honestly.
-		return unparsable(closeErr)
+		// 内容已读全，但连接状态可疑仍如实报未知（同包 httptools 的口径）。
+		// The content is complete, but a suspicious connection still reports unknown.
+		return 0, receiptUnparsable, closeErr
 	}
 	if len(raw) > maxNotifyReceiptBytes {
-		return unparsable(nil)
+		return 0, receiptUnparsable, nil
 	}
 
 	var receipt feishuNotifyReceipt
 	if err := json.Unmarshal(raw, &receipt); err != nil {
-		return unparsable(err)
+		return 0, receiptUnparsable, err
 	}
 	if receipt.Code == nil {
-		return unparsable(nil)
+		return 0, receiptUnparsable, nil
 	}
 	if *receipt.Code != 0 {
+		return *receipt.Code, receiptRejected, nil
+	}
+	return 0, receiptAccepted, nil
+}
+
+// feishuReceiptVerdict 把回执判定转成工具路径的错误：不可解析按失败（`Send` 只有二值
+// 结果），读取原因先判 ctx 身份。
+// feishuReceiptVerdict turns the verdict into the binary tool-path error.
+func feishuReceiptVerdict(ctx context.Context, resp *http.Response, display string) error {
+	code, verdict, cause := readFeishuReceipt(resp)
+	switch verdict {
+	case receiptAccepted:
+		return nil
+	case receiptRejected:
 		return &core.ExternalError{
 			Target: display,
-			Reason: fmt.Sprintf("飞书投递失败：code=%d（%s）", *receipt.Code, display),
+			Reason: fmt.Sprintf("飞书投递失败：code=%d（%s）", code, display),
 		}
 	}
-	return nil
+	if ctxErr := ctxPreferred(ctx, cause); ctxErr != nil {
+		return ctxErr
+	}
+	return &core.ExternalError{
+		Target: display,
+		Reason: "飞书回执无法解析：" + display,
+		Cause:  cause,
+	}
 }

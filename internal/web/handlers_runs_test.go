@@ -259,8 +259,10 @@ func TestRuns_DetailManifestView(t *testing.T) {
 			FormatVersion:  1,
 			Hash:           "manifest-hash-1",
 			AgentLifecycle: "active",
-			Provider: core.ResourceVersionRef{
-				Name: "openai", VersionID: 11, VersionNo: 1, ContentHash: "provider-hash",
+			Provider: core.ProviderVersionRef{
+				ResourceVersionRef: core.ResourceVersionRef{
+					Name: "openai", VersionID: 11, VersionNo: 1, ContentHash: "provider-hash",
+				},
 			},
 			MCPServers: []core.ResourceVersionRef{
 				{Name: "search", VersionID: 21, VersionNo: 2, ContentHash: "mcp-search"},

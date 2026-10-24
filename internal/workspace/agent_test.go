@@ -381,7 +381,7 @@ func TestAgentLoader_MemoryToolsInPoolRegisterAgent(t *testing.T) {
 	memoryTools := []string{"save_memory", "recall_memory"}
 
 	root := initWorkspaceRoot(t)
-	_, err := workspace.CreateAgent(root, "remembering-agent", []string{"deepseek"})
+	_, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "remembering-agent"}, []string{"deepseek"})
 	require.NoError(t, err)
 
 	t.Run("池含两件", func(t *testing.T) {
@@ -443,6 +443,40 @@ provider: {name: ghost, model: deepseek-chat}
 	require.False(t, entries[0].Registered)
 	require.Contains(t, entries[0].RejectReason, "provider not registered: ghost")
 	require.Contains(t, logText(t), "provider not registered: ghost")
+}
+
+// 中文验收点：provider 名集取动态来源时，规则 2 判的是**每次**读到的当前名集——
+// 启动后发布的模型连接无需重启即可被 Agent 绑定；名字撤下后下一次装载立即拒载。
+// 动态来源优先于构造期快照（静态名单里的名字不再被采信）。
+// Acceptance point: a runtime-published provider name binds without a restart and
+// the dynamic source overrides the construction-time snapshot.
+func TestAgentLoader_DynamicProviderSet(t *testing.T) {
+	root := writeCompatSampleWorkspace(t)
+	published := []string{"deepseek"}
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers:     []string{"only-at-startup"},
+		ProvidersFunc: func() []string { return published },
+		Tools:         compatSampleToolNames(),
+		Logger:        bufferedLogger(t),
+	})
+
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "动态名集里的 provider 必须放行：%s", entries[0].RejectReason)
+
+	published = nil
+	entries, err = loader.LoadAll(root)
+	require.NoError(t, err)
+	require.False(t, entries[0].Registered)
+	require.Equal(t, "provider not registered: deepseek", entries[0].RejectReason)
+
+	// 动态来源非 nil 时构造期快照不再是判据：静态名单里的名字不被采信。
+	published = []string{"ghost"}
+	entries, err = loader.LoadAll(root)
+	require.NoError(t, err)
+	require.False(t, entries[0].Registered)
+	require.Equal(t, "provider not registered: deepseek", entries[0].RejectReason)
 }
 
 // 中文验收点：model 空白拒载（规则 3）——空白含纯空格。
@@ -661,6 +695,7 @@ tools: [read_file]
 skills: []
 mcp_servers: [search]
 bootstrap: [AGENTS.md]
+notify_channels: [ops-alerts]
 channels: []
 settings:
   max_iterations: 42
@@ -686,6 +721,7 @@ schedules: []
 	require.Equal(t, []string{"read_file"}, p.Tools)
 	require.Equal(t, []string{"search"}, p.MCPServers) // mcp_servers（snake_case）
 	require.Equal(t, []string{"AGENTS.md"}, p.Bootstrap)
+	require.Equal(t, []string{"ops-alerts"}, p.NotifyChannels, "notify_channels（snake_case）")
 	require.Empty(t, p.Channels, "显式 channels: [] 不得回落缺省 [{name: cli}]")
 	require.Equal(t, 42, p.Settings.MaxIterations)  // max_iterations（snake_case）
 	require.Equal(t, 7, p.Settings.MaxHistoryTurns) // max_history_turns（snake_case）
@@ -734,6 +770,43 @@ channels: []
 	require.NoError(t, err)
 	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
 	require.Empty(t, entries[0].Profile.Channels, "显式 [] 保持为空，不回落 [{name: cli}]")
+}
+
+// 中文验收点：notify_channels 的空白条目无法匹配任何渠道 → 整只不注册
+// （WARN invalid notify_channels）；渠道是否存在属于运行期注册表，装载器不判。
+// Acceptance point: blank allowlist entries reject the agent; the loader does not
+// own channel existence (that is a runtime registry concern).
+func TestAgentLoader_NotifyChannelsBlankRejected(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "blank-notify", `
+name: blank-notify
+provider: {name: deepseek, model: deepseek-chat}
+notify_channels: ["  "]
+`, "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.False(t, entries[0].Registered, "空白渠道名必须整只不注册")
+	require.Contains(t, entries[0].RejectReason, "invalid notify_channels")
+	require.Contains(t, entries[0].RejectReason, "不得为空白")
+}
+
+// 中文验收点：声明了尚未登记的渠道名不拒载——存在性由运行期注册表判定，
+// notify 工具在调用时返回 not_found（与删除闸门/引用视图同口径）。
+// Acceptance point: unknown channel names stay loadable; the runtime registry decides.
+func TestAgentLoader_NotifyChannelsUnknownNameStaysLoadable(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "ghost-notify", `
+name: ghost-notify
+provider: {name: deepseek, model: deepseek-chat}
+notify_channels: [ghost-channel]
+`, "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.True(t, entries[0].Registered, "渠道存在性不由装载器判定：%s", entries[0].RejectReason)
+	require.Equal(t, []string{"ghost-channel"}, entries[0].Profile.NotifyChannels)
 }
 
 // 中文验收点：未知键宽容但可见（R1 裁决）——字段表之外的键不拒载（前向兼容：
@@ -1095,4 +1168,340 @@ schedules:
 	entry, _, _, err := loader.ValidateCandidate(root, entries, "beta", own, now)
 	require.NoError(t, err, "被编辑 Agent 保留自己的调度 id 不得与自身旧占用冲突")
 	require.True(t, entry.Registered)
+}
+
+// writeRewrittenSampleWorkspace 砌出「共享样例改名后」的工作区：把 Compatibility §5.1
+// 样例的 name / identity.agent_name 改写成 newName，落到 agents/<newName>/，bootstrap
+// 三件与技能库照抄共享样例——复制 / 恢复路径在磁盘上的产物形态。
+// writeRewrittenSampleWorkspace materializes the shared sample under a new name.
+func writeRewrittenSampleWorkspace(t *testing.T, newName string) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), ".basalt")
+	rewritten, err := workspace.RewriteAgentName([]byte(compatSampleAgentMD), newName)
+	require.NoError(t, err)
+	writeFileInRoot(t, root, filepath.Join("agents", newName, "AGENT.md"), string(rewritten))
+	writeFileInRoot(t, root, "AGENTS.md", "# AGENTS.md\n\n项目级行为说明占位。\n")
+	writeFileInRoot(t, root, "SOUL.md", "# SOUL.md\n\n人格定义占位。\n")
+	writeFileInRoot(t, root, "USER.md", "# USER.md\n\n用户偏好占位。\n")
+	writeFileInRoot(t, root, filepath.Join("skills", "digest-format", "SKILL.md"), digestFormatSkillMD)
+	return root
+}
+
+// 中文验收点（约束 31）：改名后的 Agent 仍按**新名字**整只注册——除目录名与两处名字
+// 字段外，provider / tools / skills / bootstrap / settings / schedules 逐项不变。
+// Acceptance point: a renamed copy registers under the new name with every other
+// profile field unchanged.
+func TestAgentLoader_RewrittenNameKeepsProfile(t *testing.T) {
+	root := writeRewrittenSampleWorkspace(t, "compat-copy")
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames(),
+		Logger:    bufferedLogger(t),
+	})
+
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	entry := entries[0]
+	require.True(t, entry.Registered, "改名副本必须可装载：%s", entry.RejectReason)
+	require.Equal(t, "compat-copy", entry.Name)
+	require.Equal(t, "compat-copy", entry.Profile.Name)
+	require.Equal(t, "compat-copy", entry.Profile.Identity.AgentName)
+	require.Equal(t, "deepseek", entry.Profile.Provider.Name)
+	require.Equal(t, "deepseek-chat", entry.Profile.Provider.Model)
+	require.Equal(t, compatSampleToolNames(), entry.Profile.Tools)
+	require.Equal(t, []string{"digest-format"}, entry.Profile.Skills)
+	require.Equal(t, []string{"AGENTS.md", "SOUL.md", "USER.md"}, entry.Profile.Bootstrap)
+	require.Equal(t, "你是一个用于兼容性验证的助手。", entry.Profile.Identity.Prompt)
+}
+
+// 中文验收点（约束 31）：改名不动 schedules——cron 表达式 / 时区 / 正文原样解析
+// （复制路径另有"清空定时任务"的编排，本层只保证文件字节不被改写破坏）。
+// Acceptance point: rewriting the name leaves the schedules block byte-identical.
+func TestAgentLoader_RewrittenNameKeepsSchedules(t *testing.T) {
+	root := writeRewrittenSampleWorkspace(t, "compat-copy")
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames(),
+		Logger:    bufferedLogger(t),
+	})
+
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
+	require.Len(t, entries[0].Profile.Schedules, 1)
+
+	spec, err := workspace.CronSpec(entries[0].Profile.Schedules[0])
+	require.NoError(t, err)
+	require.Equal(t, "CRON_TZ=Asia/Shanghai 0 0 8 * * *", spec)
+}
+
+// 中文验收点（反例，说明改写是**必需**的）：把样例原样拷到新目录、不改写名字 →
+// 装载器按"目录名 ≠ frontmatter name"整只不注册（只复制不改名的实现会静默失效）。
+// Acceptance point: a copy without the rewrite is rejected by the loader — which is
+// why the rewrite is mandatory.
+func TestAgentLoader_CopyWithoutRewriteIsRejected(t *testing.T) {
+	root := writeRewrittenSampleWorkspace(t, "compat-copy")
+	// 把未改写的样例放回同一新目录（覆盖改写后的文件），模拟"只拷贝不改名"。
+	writeFileInRoot(t, root, filepath.Join("agents", "compat-copy", "AGENT.md"), compatSampleAgentMD)
+
+	entries, err := workspace.NewAgentLoader(workspace.AgentLoaderOptions{
+		Providers: []string{"deepseek"},
+		Tools:     compatSampleToolNames(),
+		Logger:    bufferedLogger(t),
+	}).LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.False(t, entries[0].Registered, "目录名与 frontmatter name 不一致时必须整只不注册")
+	require.Contains(t, entries[0].RejectReason, "不一致")
+}
+
+// 绑定夹具用 UID：与 bindings_test.go 的同名常量值一致；test 包读取的是装配面
+// 暴露出来的值，不依赖白盒实现。
+const (
+	bindingModelUID  = "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"
+	bindingNotifyUID = "rs_01J8Z7A1B2C3D4E5F6G7H8J9K0"
+)
+
+// bindingsFrontmatter 拼一只声明了通知模式与完整绑定的 Agent。
+// bindingsFrontmatter builds an agent declaring a notify mode and full bindings.
+func bindingsFrontmatter(name string) string {
+	return "name: " + name + "\n" +
+		"provider: {name: deepseek, model: deepseek-chat}\n" +
+		"notify_mode: allowlist\n" +
+		"notify_channels: [ops]\n" +
+		"resource_bindings:\n" +
+		"  model_connection:\n" +
+		"    - name: deepseek\n" +
+		"      uid: " + bindingModelUID + "\n" +
+		"  notify_channel:\n" +
+		"    - name: ops\n" +
+		"      uid: " + bindingNotifyUID + "\n"
+}
+
+// 中文验收点：`resource_bindings` 与 `notify_mode` 经装载面暴露到 Profile——解析只做
+// 结构校验（规则 11），绑定与引用的一一对应属于保存期 / 准入判据，不在加载期判。
+// Acceptance point: both fields surface on the parsed profile; correspondence is not
+// a load-time concern.
+func TestAgentLoader_ExposesResourceBindingsAndNotifyMode(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "bound", bindingsFrontmatter("bound"), "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
+	require.NotNil(t, entries[0].Profile)
+	require.Equal(t, core.NotifyModeAllowlist, entries[0].Profile.NotifyMode)
+	require.Equal(t, []core.ResourceBinding{
+		{Name: "deepseek", UID: core.ResourceUID(bindingModelUID)},
+	}, entries[0].Profile.ResourceBindings.ModelConnections)
+	require.Equal(t, []core.ResourceBinding{
+		{Name: "ops", UID: core.ResourceUID(bindingNotifyUID)},
+	}, entries[0].Profile.ResourceBindings.NotifyChannels)
+}
+
+// 中文验收点：模板占位符与旧 Agent 仍可加载——未声明 `resource_bindings` 或只声明
+// 部分引用都不影响装载（契约 agent-md §2.1「加载期不要求完整」）。
+// Acceptance point: absent or incomplete bindings never block loading.
+func TestAgentLoader_MissingBindingsStayLoadable(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "unbound", `
+name: unbound
+provider: {name: deepseek, model: deepseek-chat}
+notify_mode: all_eligible
+`, "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
+	require.Equal(t, core.NotifyModeAllEligible, entries[0].Profile.NotifyMode)
+	require.Empty(t, entries[0].Profile.ResourceBindings.ModelConnections)
+	require.Empty(t, entries[0].Profile.ResourceBindings.NotifyChannels)
+}
+
+// 中文验收点：规则 10——`notify_mode` 取值合法且组合成立（none / all_eligible 时
+// 白名单为空；allowlist 至少一个），否则整只不注册并点名 `invalid notify_mode`。
+// Acceptance point: rule 10 rejects illegal literals and illegal combinations.
+func TestAgentLoader_InvalidNotifyModeRejected(t *testing.T) {
+	cases := map[string]string{
+		"非法字面量":            "notify_mode: sometimes\n",
+		"none 带渠道":         "notify_mode: none\nnotify_channels: [ops]\n",
+		"all_eligible 带渠道": "notify_mode: all_eligible\nnotify_channels: [ops]\n",
+		"allowlist 无渠道":    "notify_mode: allowlist\n",
+	}
+	for name, block := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			writeAgentFrontmatter(t, root, "mode-agent",
+				"\nname: mode-agent\nprovider: {name: deepseek, model: deepseek-chat}\n"+block, "正文")
+
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			require.False(t, entries[0].Registered, "规则 10 不通过必须整只不注册")
+			require.Contains(t, entries[0].RejectReason, "invalid notify_mode")
+			require.Contains(t, logText(t), "invalid notify_mode")
+		})
+	}
+}
+
+// 中文验收点：绑定块结构非法（规则 11）→ WARN 类别是 `invalid resource_bindings`
+// （与 generic frontmatter 失败分开），整只不注册。
+// Acceptance point: a structurally invalid block reports its own WARN category.
+func TestAgentLoader_InvalidResourceBindingsRejected(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "broken-bindings", `
+name: broken-bindings
+provider: {name: deepseek, model: deepseek-chat}
+resource_bindings:
+  model_connection:
+    - name: deepseek
+  notify_channel: []
+`, "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.False(t, entries[0].Registered, "绑定块结构非法必须整只不注册")
+	require.Contains(t, entries[0].RejectReason, "invalid resource_bindings")
+	require.Contains(t, logText(t), `reason="invalid resource_bindings"`)
+	require.NotContains(t, logText(t), `reason="invalid frontmatter"`)
+}
+
+// 中文验收点：候选校验（保存期闸门）保留绑定错误的哨兵——web 层据此回 400
+// `AGENT_RESOURCE_BINDING_INVALID`，而不是折叠成无类别的 500。
+// Acceptance point: ValidateCandidate keeps the binding sentinel for the save path.
+func TestAgentLoader_ValidateCandidateKeepsBindingSentinel(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "bound", bindingsFrontmatter("bound"), "正文")
+
+	candidate := []byte("---\n" +
+		"name: bound\n" +
+		"provider: {name: deepseek, model: deepseek-chat}\n" +
+		"resource_bindings:\n" +
+		"  model_connection:\n" +
+		"    - uid: " + bindingModelUID + "\n" + // 缺 name：结构非法
+		"  notify_channel: []\n" +
+		"---\n\n正文\n")
+
+	loader := newTestLoader(t, nil, nil, "deepseek")
+	_, _, _, err := loader.ValidateCandidate(root, nil, "bound", candidate, time.Now())
+	require.Error(t, err)
+	require.ErrorIs(t, err, core.ErrAgentResourceBindingInvalid)
+}
+
+// TestAgentLoader_DisplayName：`display_name` 是已知键（R6.2）——声明时去空白后写入
+// Profile，缺省或纯空白都读成空串（展示层回退技术名），不因它拒载；未知键仍只 WARN。
+// TestAgentLoader_DisplayName parses the known display_name key, reads absent/blank
+// values as empty, and keeps the unknown-key WARN for everything else.
+func TestAgentLoader_DisplayName(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{name: "declared", line: "display_name: 运维小助手\n", want: "运维小助手"},
+		{name: "declared-trimmed", line: "display_name: \"  值班助手  \"\n", want: "值班助手"},
+		{name: "blank", line: "display_name: \"   \"\n", want: ""},
+		{name: "absent", line: "", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeAgentFrontmatter(t, root, "display", `
+name: display
+description: 展示名用例
+provider: {name: deepseek, model: deepseek-chat}
+`+tc.line, "正文")
+
+			entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
+			require.Equal(t, tc.want, entries[0].Profile.DisplayName)
+			require.NotContains(t, logText(t), "display_name", "已知键不得进未知键 WARN")
+		})
+	}
+}
+
+// TestAgentLoader_DisplayNameKeepsUnknownKeyWarn：display_name 之外仍走未知键 WARN
+// （键路径可见、值不进日志），且两者可同时出现——登记新键不压缩前向兼容。
+// TestAgentLoader_DisplayNameKeepsUnknownKeyWarn keeps the unknown-key WARN intact
+// alongside a parsed display_name.
+func TestAgentLoader_DisplayNameKeepsUnknownKeyWarn(t *testing.T) {
+	root := t.TempDir()
+	writeAgentFrontmatter(t, root, "display", `
+name: display
+provider: {name: deepseek, model: deepseek-chat}
+display_name: 值班助手
+future_option: s3cr3t-value
+`, "正文")
+
+	entries, err := newTestLoader(t, nil, nil, "deepseek").LoadAll(root)
+	require.NoError(t, err)
+	require.True(t, entries[0].Registered, "%s", entries[0].RejectReason)
+	require.Equal(t, "值班助手", entries[0].Profile.DisplayName)
+
+	logs := logText(t)
+	require.Contains(t, logs, "unknown frontmatter key")
+	require.Contains(t, logs, "future_option")
+	require.NotContains(t, logs, "display_name", "已知键不得进未知键清单")
+	require.NotContains(t, logs, "s3cr3t-value")
+}
+
+// TestValidateScheduleCandidate_AcceptsAndNormalizes：候选四字段去空白、空 zone 取
+// UTC，随后走装载期同一套校验并原样返回规整副本。
+// TestValidateScheduleCandidate_AcceptsAndNormalizes trims the candidate, defaults the
+// zone to UTC, and returns the normalized copy through the load-time rules.
+func TestValidateScheduleCandidate_AcceptsAndNormalizes(t *testing.T) {
+	got, err := workspace.ValidateScheduleCandidate(core.Schedule{
+		ID:      " daily-report ",
+		Cron:    " 0 30 8 * * * ",
+		Zone:    "  ",
+		Message: " 生成每日运维日报 ",
+	})
+	require.NoError(t, err)
+	require.Equal(t, core.Schedule{
+		ID:      "daily-report",
+		Cron:    "0 30 8 * * *",
+		Zone:    "UTC",
+		Message: "生成每日运维日报",
+	}, got)
+
+	shanghai, err := workspace.ValidateScheduleCandidate(core.Schedule{
+		ID: "daily-report", Cron: "0 30 8 * * *", Zone: "Asia/Shanghai", Message: "生成日报",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "Asia/Shanghai", shanghai.Zone)
+}
+
+// TestValidateScheduleCandidate_RejectsInvalid：装载期的六条规则原样生效——5 段、
+// CRON_TZ 前缀、公共子集外记号、越界值、Local / 未知时区与空 message 都拒绝。
+// TestValidateScheduleCandidate_RejectsInvalid applies the six load-time rules verbatim.
+func TestValidateScheduleCandidate_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name     string
+		schedule core.Schedule
+		wantPart string
+	}{
+		{name: "five-fields", schedule: core.Schedule{ID: "d", Cron: "30 8 * * *", Zone: "UTC", Message: "m"}, wantPart: "6 fields"},
+		{name: "timezone-prefix", schedule: core.Schedule{ID: "d", Cron: "CRON_TZ=UTC 0 30 8 * * *", Zone: "UTC", Message: "m"}, wantPart: "CRON_TZ"},
+		{name: "outside-subset", schedule: core.Schedule{ID: "d", Cron: "0 30 8 L * *", Zone: "UTC", Message: "m"}, wantPart: "L/W/#"},
+		{name: "out-of-range", schedule: core.Schedule{ID: "d", Cron: "0 30 25 * * *", Zone: "UTC", Message: "m"}},
+		{name: "zone-local", schedule: core.Schedule{ID: "d", Cron: "0 30 8 * * *", Zone: "Local", Message: "m"}, wantPart: "Local"},
+		{name: "zone-unknown", schedule: core.Schedule{ID: "d", Cron: "0 30 8 * * *", Zone: "Mars/Olympus", Message: "m"}},
+		{name: "blank-message", schedule: core.Schedule{ID: "d", Cron: "0 30 8 * * *", Zone: "UTC", Message: "  "}, wantPart: "message"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := workspace.ValidateScheduleCandidate(tc.schedule)
+			require.Error(t, err)
+			if tc.wantPart != "" {
+				require.Contains(t, err.Error(), tc.wantPart)
+			}
+		})
+	}
 }

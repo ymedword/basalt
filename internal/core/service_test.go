@@ -913,8 +913,9 @@ func (f *fakeLifecycle) Read(_ context.Context, agent string) (core.LifecycleRec
 		return core.LifecycleRecord{}, false, nil
 	}
 	return core.LifecycleRecord{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Agent:         agent,
+		AgentUID:      "ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A",
 		State:         state,
 		Generation:    1,
 	}, true, nil
@@ -929,6 +930,12 @@ func (f *fakeLifecycle) Transition(context.Context, string, core.AgentState, int
 // Bootstrap 不在读面范围内：返回冲突。
 // Bootstrap is out of scope for the read face and reports a conflict.
 func (f *fakeLifecycle) Bootstrap(context.Context, string, string) (core.LifecycleRecord, error) {
+	return core.LifecycleRecord{}, core.ErrLifecycleConflict
+}
+
+// BootstrapIdentity 不在读面范围内：返回冲突（归档恢复路径由 app 层用例覆盖）。
+// BootstrapIdentity is out of scope for the read face and reports a conflict.
+func (f *fakeLifecycle) BootstrapIdentity(context.Context, string, core.AgentUID, string) (core.LifecycleRecord, error) {
 	return core.LifecycleRecord{}, core.ErrLifecycleConflict
 }
 
@@ -1203,6 +1210,8 @@ type fakeSnapshotBuilder struct {
 	mu    sync.Mutex
 	calls int
 	err   error
+	// notifyChannels 注入快照 Profile 的通知渠道白名单（空 = 不限制）。
+	notifyChannels []string
 }
 
 // Build 返回固定快照（哈希与工作副本不同——用例据此分辨"哪条来源胜出"）。
@@ -1220,10 +1229,11 @@ func (b *fakeSnapshotBuilder) Build(_ context.Context, entry core.AgentEntry, _ 
 		Manifest:   []core.ManifestEntry{{Path: "AGENT.md", SHA256: "d41d8cd98f00b204"}},
 		SectionOne: sectionOneStatic,
 		Profile: &core.Profile{
-			Name:     entry.Name,
-			Provider: core.ProviderRef{Name: "fake", Model: "fake-model"},
-			Tools:    []string{"read_file"},
-			Settings: core.Settings{MaxIterations: 10, MaxHistoryTurns: 20},
+			Name:           entry.Name,
+			Provider:       core.ProviderRef{Name: "fake", Model: "fake-model"},
+			Tools:          []string{"read_file"},
+			NotifyChannels: append([]string(nil), b.notifyChannels...),
+			Settings:       core.Settings{MaxIterations: 10, MaxHistoryTurns: 20},
 		},
 	}, nil
 }
@@ -1239,8 +1249,14 @@ func (b *fakeSnapshotBuilder) callCount() int {
 // sampleResolvedRefs builds a minimal resolution for manifest construction.
 func sampleResolvedRefs() core.ResolvedResources {
 	return core.ResolvedResources{
-		Provider:   core.ResourceVersionRef{Name: "fake", VersionID: 1, VersionNo: 1, ContentHash: "aaa"},
-		MCPServers: []core.ResourceVersionRef{{Name: "files", VersionID: 2, VersionNo: 1, ContentHash: "bbb"}},
+		Provider:      core.ResourceVersionRef{Name: "fake", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A", VersionID: 1, VersionNo: 1, ContentHash: "aaa"},
+		ProviderModel: "fake-model",
+		ProviderCredential: core.CredentialPin{
+			Mode:          core.CredentialModeEnv,
+			TargetBinding: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		},
+		Notify:     core.NotifyManifest{Mode: core.NotifyModeAllEligible, Channels: []core.NotifyChannelRef{}},
+		MCPServers: []core.ResourceVersionRef{{Name: "files", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3B", VersionID: 2, VersionNo: 1, ContentHash: "bbb"}},
 	}
 }
 
@@ -1288,7 +1304,7 @@ func TestAgentService_Resources_ManifestPassesThroughAndRuntimeReleased(t *testi
 	require.Equal(t, 1, builder.callCount())
 
 	manifest := store.lastManifest
-	require.Equal(t, 1, manifest.FormatVersion, "清单必须是正式形态（零值 = 未接线）")
+	require.Equal(t, 2, manifest.FormatVersion, "清单必须是正式形态 v2（零值 = 未接线）")
 	require.Equal(t, string(core.AgentActive), manifest.AgentLifecycle, "清单状态取准入门禁的同一次读数")
 	require.Equal(t, "fake", manifest.Provider.Name)
 	require.Equal(t, "aaa", manifest.Provider.ContentHash)
@@ -1402,6 +1418,45 @@ func TestAgentService_Resources_ToolEnvCarriesBoundSkillDirs(t *testing.T) {
 	}, h.tools.executedEnv().SkillDirs, "绑定目录必须排序后原样进入 ToolEnv（map 遍历顺序随机）")
 	require.True(t, h.tools.executedEnv().RunBound,
 		"循环构造的 ToolEnv 必须显式标记 Run 上下文（F-04 B1：不从 RunID / 绑定推断）")
+}
+
+// TestAgentService_Resources_ToolEnvCarriesFrozenNotifyChannels：通知授权在准入时按
+// **资源清单**（`ResolvedResources.Notify`）冻结成具体渠道 UID，随每次工具调用进入
+// ToolEnv；工具层只读这份副本（模式 + UID 集合），不重新读文件、不按名字猜。
+// 快照 Profile 的声明名只服务于未接资源面的兼容路径——资源接线时**不得**胜出。
+// The admission-time grant is frozen as concrete channel uids from the resolved manifest
+// and reaches every tool call through ToolEnv; the snapshot's declared names never win
+// once the resource face is wired.
+func TestAgentService_Resources_ToolEnvCarriesFrozenNotifyChannels(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":"AGENT.md"}`))
+	h.provider.onCall(1, textResponse("done"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resolved := sampleResolvedRefs()
+	resolved.Notify = core.NotifyManifest{
+		Mode: core.NotifyModeAllowlist,
+		Channels: []core.NotifyChannelRef{
+			{Name: "ops-alerts", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z4C"},
+			{Name: "night-ops", ResourceUID: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z4D"},
+		},
+	}
+	resources := &fakeRunResources{resolved: resolved, runtime: runtime}
+	builder := &fakeSnapshotBuilder{notifyChannels: []string{"stale-declared-name"}}
+	svc, _ := h.assembleWithResources(resources, builder)
+
+	res, err := svc.Run(ctx, h.req("读"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+
+	env := h.tools.executedEnv()
+	require.Equal(t, []string{
+		"rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z4C",
+		"rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z4D",
+	}, env.NotifyChannels, "ToolEnv 携带的是准入冻结的具体渠道 UID")
+	require.NotContains(t, env.NotifyChannels, "stale-declared-name",
+		"资源接线后快照里的声明名不得进入运行面")
+	require.Equal(t, core.NotifyModeAllowlist, env.NotifyMode, "冻结模式随 UID 集合一起进入 ToolEnv")
+	require.True(t, env.RunBound, "运行内调用必须带 RunBound 标记：工具按 UID 判定而不是按名字")
 }
 
 // TestAgentService_Resources_MissingPinnedClientFailsClosed：准入固定的映射表里没有该

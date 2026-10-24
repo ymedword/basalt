@@ -22,6 +22,8 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/tool"
+	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -75,12 +77,20 @@ func newWireFixture(t *testing.T) *wireFixture {
 	f := &wireFixture{
 		workDir: workDir,
 		root:    root,
-		cfg: &cli.Config{Providers: []cli.ProviderConfig{{
-			Name:         "probe",
-			BaseURL:      "http://127.0.0.1:1",
-			APIKey:       "placeholder-unused-3c71",
-			DefaultModel: "probe-model",
-		}}},
+		cfg: &cli.Config{
+			Providers: []cli.ProviderConfig{{
+				Name:         "probe",
+				BaseURL:      "http://127.0.0.1:1",
+				APIKey:       "placeholder-unused-3c71",
+				DefaultModel: "probe-model",
+			}},
+			// US-12 起 MCP 连接在**启动时**按传输过策略（约束 19）：stdio 走命令授权。
+			// 夹具的 MCP server 以 `unused-mcp` 为命令，白名单必须放行它，连接替身才会
+			// 被调用；策略拒绝的真实路径由 supervisor 自己的用例判。
+			// The supervisor authorizes stdio connects as shell commands at startup, so the
+			// fixture allowlist must admit the fake command.
+			Shell: cli.ShellConfig{AllowedCommands: []string{"unused-mcp"}},
+		},
 		logs:   logs,
 		logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
@@ -98,27 +108,134 @@ func (f *wireFixture) dbPath() string {
 	return filepath.Join(f.root, databaseFileName)
 }
 
+// providerUID 给出夹具配置里某个 Provider 名的**确定性**资源身份（`fixtureResourceUIDFor`，
+// 生产路径仍由 `core.NewResourceUID` 生成）。AGENT.md 的 `resource_bindings` 要求 uid 与
+// 当前发布指针逐字相等，而清单在库还不存在时就已落盘；同一个派生函数让"先写清单、
+// 后种子版本"两个动作对齐。名字不在当前配置里 → `false`：这类 Agent 的绑定由用例按需
+// 补，夹具不替它们编造。
+// providerUID returns the fixture's deterministic identity for a configured provider; the
+// second result is false for names the fixture configuration does not declare.
+func (f *wireFixture) providerUID(name string) (core.ResourceUID, bool) {
+	for _, entry := range f.cfg.Providers {
+		if entry.Name == name {
+			return fixtureResourceUIDFor(core.ResourceModelConnection, name), true
+		}
+	}
+	return "", false
+}
+
+// seedPublishedProviders 在**装配之前**为配置里**每个** provider 块写下首个已发布版本：
+// 版本行、发布指针、身份行与操作终态走的是与基线建首版同一条发布事务，因此基线再读
+// 文件会判"内容一致"、不重复建版，版本号仍从 1 起。重复调用幂等（指针已在即跳过）——
+// 重启序列的每一轮都会经这里，但只有第一轮真的写。只种 probe 一条会让"两 Provider
+// 配置"的用例在种子阶段就与磁盘分叉（名字集对不上直接失败），所以按磁盘块逐条种。
+// seedPublishedProviders publishes the first version of every provider block declared in
+// the fixture configuration, through the same publish transaction the baseline uses; a
+// second call is a no-op per provider.
+func (f *wireFixture) seedPublishedProviders(t *testing.T) {
+	t.Helper()
+
+	ctx := context.Background()
+	expected := make([]string, 0, len(f.cfg.Providers))
+	for _, entry := range f.cfg.Providers {
+		expected = append(expected, entry.Name)
+	}
+	definitions, err := loadProviderDefinitions(filepath.Join(f.workDir, configFileName), expected)
+	require.NoError(t, err, "种子版取的是配置里每个 provider 块的原文")
+	require.Len(t, definitions, len(expected), "配置条目与磁盘块必须逐条对上")
+
+	db, err := storage.OpenWritable(ctx, f.dbPath(), storage.SupportedSchemaVersion)
+	require.NoError(t, err, "种子版必须能写模式打开库（缺库时由本步建出）")
+	defer func() { require.NoError(t, db.Close()) }()
+
+	versions := storage.NewResourceStore(db)
+	operations := storage.NewManagementStore(db)
+	for _, definition := range definitions {
+		if _, err := versions.Pointer(ctx, core.ResourceModelConnection, definition.Name); err == nil {
+			continue
+		} else {
+			require.ErrorIs(t, err, core.ErrResourceNotFound, "读指针的失败方式只能是「不存在」")
+		}
+
+		now := time.Now()
+		operationID := core.NewOperationID(now)
+		contentHash := baselineResourceHash(string(core.ResourceModelConnection),
+			definition.Name, definition.Content)
+		require.NoError(t, operations.BeginOperation(ctx, core.OperationRecord{
+			OperationID:  operationID,
+			Action:       core.ActionModelConnectionCreate,
+			TargetKind:   core.TargetKindModelConnection,
+			TargetID:     definition.Name,
+			ActorSubject: core.ActorSubjectCLIPrefix + "fixture",
+			AuthMethod:   core.AuthMethodCLI,
+			Source:       "127.0.0.1:0",
+			RequestHash:  contentHash,
+			Status:       core.OperationPending,
+			DetailJSON:   []byte("{}"),
+			CreatedAt:    now,
+		}))
+		_, err = versions.PublishWithVersion(ctx, core.ResourceVersion{
+			Kind:           core.ResourceModelConnection,
+			ResourceUID:    fixtureResourceUIDFor(core.ResourceModelConnection, definition.Name),
+			ResourceID:     definition.Name,
+			ContentHash:    contentHash,
+			DefinitionYAML: string(definition.Content),
+			OperationID:    operationID,
+			CreatedAt:      now.UnixMilli(),
+		}, operationID, now)
+		require.NoError(t, err)
+	}
+}
+
 // writeAgent 落一份可装载的 AGENT.md：provider 指向探针，tools 取声明值。
 // 名字声明与目录名一致是装载规则 1；声明 pool 外的工具名 → 整只不注册（规则 4）。
 // writeAgent writes one loadable AGENT.md whose declared provider is the probe.
 func (f *wireFixture) writeAgent(t *testing.T, name string, tools ...string) {
 	t.Helper()
 
+	f.writeAgentContent(t, name, "probe", "probe-model", tools)
+}
+
+// writeAgentWithProvider 与 `writeAgent` 同形，只把 provider 名与模型换成调用方给的值：
+// 判"注册表按哪份 Provider 名集装载"的用例需要一只引用**配置文件里没有、只存在于已
+// 发布版本**的 Provider 的 Agent。
+// writeAgentWithProvider writes an AGENT.md that names an arbitrary provider, so a case
+// can point one agent at a published-only connection.
+func (f *wireFixture) writeAgentWithProvider(t *testing.T, name, provider, model string) {
+	t.Helper()
+
+	f.writeAgentContent(t, name, provider, model, nil)
+}
+
+// writeAgentContent 是两份写法的公共实现。
+// writeAgentContent is the shared writer behind both helpers.
+func (f *wireFixture) writeAgentContent(t *testing.T, name, provider, model string, tools []string) {
+	t.Helper()
+
 	dir := filepath.Join(f.root, agentsDirName, name)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 
-	declared := "tools: []"
+	declared := "tools: []\n"
 	if len(tools) > 0 {
 		declared = "tools:\n"
 		for _, toolName := range tools {
 			declared += "  - " + toolName + "\n"
 		}
 	}
+	// 声明它引用的那条已发布连接（v3 起准入要求 1:1 绑定，缺绑定即拒绝）。只有配置里
+	// 声明过的 provider 才有可对齐的种子身份；其余 provider 名的 Agent 由各自用例按需
+	// 补，夹具不替它们编造绑定。
+	// Agents pointing at a configured provider declare its seeded binding; others stay bare.
+	bindings := ""
+	if uid, ok := f.providerUID(provider); ok {
+		bindings = bindingsBlock([]core.ResourceBinding{{Name: provider, UID: uid}}, nil)
+	}
 	content := "---\n" +
 		"name: " + name + "\n" +
 		"description: 装配探针\n" +
-		"provider:\n  name: probe\n  model: probe-model\n" +
+		"provider:\n  name: " + provider + "\n  model: " + model + "\n" +
 		declared +
+		bindings +
 		"---\n\n你是「" + name + "」。\n"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644))
 	f.agents = append(f.agents, name)
@@ -129,6 +246,10 @@ func (f *wireFixture) writeAgent(t *testing.T, name string, tools ...string) {
 func (f *wireFixture) assemble(t *testing.T) *heavyRuntime {
 	t.Helper()
 
+	// 探针 provider 先有一份已发布版本，AGENT.md 的绑定才有可对齐的身份（见
+	// `seedPublishedProviders`）；不种子时基线会另发一个身份，绑定必然对不上。
+	// The probe must already be published so the fixture's bindings name a real pointer.
+	f.seedPublishedProviders(t)
 	rt, err := f.app().newRuntime(context.Background())
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
@@ -323,18 +444,21 @@ func (c *scriptedProviderClient) requests() []core.ChatRequest {
 	return append([]core.ChatRequest(nil), c.seen...)
 }
 
-// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的六个次序读数在日志里**按序**可见，
-// 且恢复完成的一条携带启动摘要的五个计数；装配失败时句柄不半开（锁被放回）。
-// 基线与管理面恢复各自是一条读数（图 A ③④）：它们排在崩溃恢复之后、运行入口之前，
-// 中间被别的步骤插队就是接线错了。
+// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的**九个**次序读数在日志里**按序**
+// 可见，且恢复完成的一条携带启动摘要的五个计数；装配失败时句柄不半开（锁被放回）。
+// 基线与管理面恢复各自是一条读数（图 A ③④）；US-12 追加对账 → 目录 → 注册表（图 A
+// ⑤⑥⑦）——定义对账先于运行目录与注册表，中间被别的步骤插队就是接线错了。
 func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 	fx := newWireFixture(t)
 
 	rt := fx.assemble(t)
 
 	steps := logSteps(t, fx.logs.String())
-	require.Equal(t, []string{"lock", "open", "migrate", "recover", "baseline", "recovery"}, steps,
-		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 崩溃恢复 → 启动基线 → 管理面恢复（次序即正确性）")
+	require.Equal(t, []string{
+		"lock", "open", "migrate", "recover", "baseline", "recovery",
+		"reconcile", "catalog", "registry",
+	}, steps,
+		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 崩溃恢复 → 启动基线 → 管理面恢复 → 定义对账 → 运行目录 → 注册表（次序即正确性）")
 
 	recoverRec := findStep(t, fx.logs.String(), "recover")
 	for _, key := range []string{"unknowns", "repaired_groups", "closed_runs", "rolled_back", "rolled_forward"} {
@@ -454,6 +578,9 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 		outside := newWireFixture(t)
 		outside.writeInstanceConfig(t)
 		outside.writeAgent(t, "reader", "read_file")
+		// 直接调包外入口也要先种发布版本：启用时准入要求绑定指向真实指针。
+		// The exported entry needs the seed before admission can accept the binding.
+		outside.seedPublishedProviders(t)
 
 		const body = "装配探针读到的正文"
 		agentDir := filepath.Join(outside.root, agentsDirName, "reader")
@@ -641,6 +768,9 @@ const memoryEntry = "偏好：以后回答简洁点，先给结论。"
 func openWireRuntime(t *testing.T, fx *wireFixture, client core.ProviderClient) *Runtime {
 	t.Helper()
 
+	// 包外入口同样要先有探针的已发布版本：AGENT.md 的绑定指向它（与 `assemble` 同一前置）。
+	// The exported entry needs the same pre-seeded published version as `assemble`.
+	fx.seedPublishedProviders(t)
 	rt, err := OpenRuntime(context.Background(), Options{
 		WorkDir:                fx.workDir,
 		SupportedSchemaVersion: storage.SupportedSchemaVersion,
@@ -902,7 +1032,11 @@ func TestWire_BaselineDisablesThenEnableAdmits(t *testing.T) {
 	fx := newWireFixture(t)
 	fx.writeAgent(t, "reader", "read_file")
 
-	// **不走**夹具的自动启用：本用例判的正是基线写下的初始态。
+	// **不走**夹具的自动启用：本用例判的正是基线写下的初始态。探针的已发布版本仍要先
+	// 种子（与 `assemble` 同一前置）：AGENT.md 的绑定要指向真实指针，否则启用之后放行的
+	// 那次 Run 会停在绑定准入而不是预算准入。
+	// The probe's version is still seeded first so the post-enable run reaches budget admission.
+	fx.seedPublishedProviders(t)
 	rt, err := fx.app().newRuntime(context.Background())
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
@@ -953,17 +1087,23 @@ func TestWire_CloseReleasesInstanceLockLast(t *testing.T) {
 	writeMCPServersYAML(t, fx.root, []string{"probe"})
 
 	lockHeldDuringMCPClose := false
-	connector := &fakeMCPConnector{onClose: func() error {
-		probe, err := workspace.AcquireInstanceLock(fx.root)
-		if err != nil {
-			var busy *workspace.LockBusyError
-			lockHeldDuringMCPClose = errors.As(err, &busy)
+	// 连接必须成功：supervisor 对"零连接"按连接失败处理并当场收池，回调会落在装配期而
+	// 不是停机路径上。给一条真实连接，关闭时机才回到 heavyRuntime.Close。
+	// The connect must succeed so Close runs on the shutdown path, not during assembly.
+	connector := &fakeMCPConnector{
+		conns: []tool.MCPConnection{{Server: "probe", Tools: []core.Tool{&fakeMCPTool{name: "probe_tool"}}}},
+		onClose: func() error {
+			probe, err := workspace.AcquireInstanceLock(fx.root)
+			if err != nil {
+				var busy *workspace.LockBusyError
+				lockHeldDuringMCPClose = errors.As(err, &busy)
+				return nil
+			}
+			// 锁已被提前释放：立刻归还，让断言以"未持有"落红而不是污染后续判定。
+			_ = probe.Release()
 			return nil
-		}
-		// 锁已被提前释放：立刻归还，让断言以"未持有"落红而不是污染后续判定。
-		_ = probe.Release()
-		return nil
-	}}
+		},
+	}
 
 	app := fx.app()
 	app.mcpConnect = connector
@@ -1003,7 +1143,11 @@ func TestRunService_AssemblyWiresPublishedSnapshots(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(agentDir, "AGENT.md"),
 		[]byte("---\nname: writer\ndescription: 快照探针\n"+
 			"provider:\n  name: probe\n  model: probe-model\n"+
-			"skills:\n  - writer-skill\ntools: []\n---\n\n你是「writer」。\n"), 0o644))
+			"skills:\n  - writer-skill\ntools: []\n"+
+			bindingsBlock([]core.ResourceBinding{{
+				Name: "probe", UID: fixtureResourceUIDFor(core.ResourceModelConnection, "probe"),
+			}}, nil)+
+			"---\n\n你是「writer」。\n"), 0o644))
 	fx.agents = append(fx.agents, "writer")
 
 	rt := fx.assemble(t)
@@ -1028,4 +1172,408 @@ func TestRunService_AssemblyWiresPublishedSnapshots(t *testing.T) {
 		"清单记逻辑路径，字节来自发布目录")
 	require.NotContains(t, manifestJSON, ".basalt/versions/",
 		"发布真路径只进卡片行，不进清单")
+}
+
+// TestWire_AgentAdminSharesAssemblyInstances（T023 / 约束 25 / 约束 49）：Agent 写面编排
+// 与准入、生命周期迁移共用**同一份** Agent 级锁表、状态文件存储与资源仓储——装配层另建
+// 一份会让写锁与准入的互斥静默消失。作者提示词的模板骨架必须与创建模板同源，且**不缓存**
+// 装配时刻的发布名单（provider / model 都是可见占位符，名单按每次调用渲染）。
+// 逆改点：NewAgentAdmin 漏传 Gate（退化为私有锁表）/ Index 换成新实例 / 作者模板里写入
+// 装配时的 Provider 名 → 断言红。
+// The write-surface orchestrator must share the very gate, lifecycle store and resource
+// store admission uses, and its prompt skeleton must not cache an expiring publish list.
+func TestWire_AgentAdminSharesAssemblyInstances(t *testing.T) {
+	fx := newWireFixture(t)
+	rt := fx.assemble(t)
+
+	require.NotNil(t, rt.agentAdmin, "Agent 写面编排必须由装配层构造并保留")
+	require.Same(t, rt.agentGate, rt.agentAdmin.gate,
+		"写面必须与准入共用同一把 Agent 级锁表（私有锁表会让互斥静默消失）")
+	require.Same(t, rt.lifecycle, rt.agentAdmin.lifecycle,
+		"状态文件唯一写者必须是同一份存储")
+	require.Same(t, rt.ops, rt.agentAdmin.operations,
+		"管理操作仓储必须是同一实例")
+	require.Same(t, rt.versions, rt.agentAdmin.index,
+		"生命周期索引写端口必须是同一资源仓储")
+
+	providers, err := rt.agentAdmin.published(context.Background())
+	require.NoError(t, err)
+	require.Len(t, providers, 1, "基线把探针 Provider 发布成版本 1，写面快照必须看得到")
+	require.Equal(t, "probe", providers[0].Name)
+
+	skills, err := rt.agentAdmin.publishedSkills(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, skills)
+
+	mcp, err := rt.agentAdmin.appliedMCP(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, mcp)
+
+	require.Contains(t, rt.agentAdmin.authorTemplate, "请在此填写 provider 名",
+		"作者模板骨架与创建模板同源：无已发布名单时写可见占位符")
+	require.Contains(t, rt.agentAdmin.authorTemplate, "你是「<name>」",
+		"骨架中的名字是中性占位，不含任何真实 Agent 名")
+	require.NotContains(t, rt.agentAdmin.authorTemplate, "probe",
+		"模板骨架不得缓存装配时刻的 Provider 名（名单按每次调用渲染）")
+}
+
+// TestWire_ResourceAdminSharesAssemblyInstances（T027 / 约束 16 / 17）：资源写面必须
+// 与准入共用同一道发布闸门、同一份版本 / 管理操作仓储与**同一个**运行期目录持有者——
+// 另建一份会让"发布持写锁、准入持读锁"与"新 Run 读新映射"同时静默失效。定义文件路径
+// 必须指向实例配置本身（模型连接块就写在 basalt.yaml）。
+// 逆改点：NewResourceAdmin 漏传 Gate（退化为私有闸门）/ Store 换成新实例 / Catalog 换
+// 成新持有者 / ConfigPath 指向别处 → 断言红。
+// The resource write orchestrator must share the very gate, stores and catalog holder
+// the assembly built, and must target the instance configuration file.
+func TestWire_ResourceAdminSharesAssemblyInstances(t *testing.T) {
+	fx := newWireFixture(t)
+	rt := fx.assemble(t)
+
+	require.NotNil(t, rt.resourceAdmin, "资源写面编排必须由装配层构造并保留")
+	require.NotNil(t, rt.catalogStore, "运行期目录持有者必须由装配层保留")
+	require.Same(t, rt.resourceGate, rt.resourceAdmin.gate,
+		"发布闸门必须是准入持读锁的同一实例（私有闸门会让互斥静默消失）")
+	require.Same(t, rt.versions, rt.resourceAdmin.store,
+		"版本仓储必须是基线与准入共用的同一实例")
+	require.Same(t, rt.ops, rt.resourceAdmin.operations,
+		"管理操作仓储必须是同一实例")
+	require.Same(t, rt.catalogStore, rt.resourceAdmin.catalog,
+		"运行期目录持有者必须是同一实例（发布替换后新 Run 才读得到）")
+	require.Equal(t, filepath.Join(fx.workDir, configFileName), rt.resourceAdmin.configPath,
+		"模型连接块写在实例配置里，路径必须指回工作区的 basalt.yaml")
+
+	// 装配期持有者以**已发布**目录初始化：基线把探针 Provider 发布成版本 1，持有者
+	// 里必须已经有它，而不是一个等待第一次发布才填充的空表。
+	catalog := rt.catalogStore.Load()
+	require.NotNil(t, catalog, "持有者不得以空指针启动")
+	require.Contains(t, catalog.clients, "probe",
+		"已发布 Provider 必须在装配期就进入运行期目录")
+	require.Equal(t, "probe-model", catalog.models["probe"])
+}
+
+// TestWire_ResourceAdminPortWiring（T043 / T053）：删除 / 引用 / 版本列表 / 版本详情
+// 四个端点必须真正接到装配实例上——端口填槽、三项依赖（归档根 / Agent 快照 / 评测替身）
+// 齐备，且端口读数与存储侧同一口径。MCP 方法族自 T048 起转调编排层；技能四方法自
+// T053 起转调编排层：创建走完整写路径（工作副本 + 首版快照落在同一工作区根），
+// 导入同名按 409、更新缺 If-Match 按 412、校验只读返回裁决——四者都不再是桩错误。
+// 逆改点：wire 漏传 Root / Agents / ProviderOverride → 依赖断言红；端口不填槽或 Versions
+// 不补指针状态 → 读数断言红；端口换回失败关闭桩 → 技能分支红。
+// The T043 wiring must fill the resource port, pass the archive root, the registry
+// snapshot and the provider override; since T053 the skill family forwards to the
+// real orchestration, so creation lands the work copy and version snapshot on disk.
+func TestWire_ResourceAdminPortWiring(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader")
+	override := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "ok"}}}
+	fx.override = override
+
+	rt := fx.assemble(t)
+	ctx := context.Background()
+
+	require.Equal(t, fx.root, rt.resourceAdmin.root, "归档扫描根必须是工作区根")
+	require.NotNil(t, rt.resourceAdmin.agents, "删除闸门的 Agent 引用必须来自注册表快照")
+	entries, err := rt.resourceAdmin.agents()
+	require.NoError(t, err)
+	require.Equal(t, rt.agents.Entries(), entries, "快照必须与注册表逐条一致")
+	require.Len(t, entries, 1)
+	require.Same(t, override, rt.resourceAdmin.providerOverride,
+		"评测替身必须与启动装配共用同一个值")
+
+	port := rt.writeServices.resourceAdmin
+	require.NotNil(t, port, "T043 之后资源写面端口必须已填槽")
+
+	pointer := probePointer(t, rt)
+	versions, err := port.Versions(ctx, core.ResourceModelConnection, "probe")
+	require.NoError(t, err)
+	require.NotEmpty(t, versions)
+	require.Equal(t, pointer.PublishedVersionID, versions[0].Version.ID, "最新版本在前")
+	require.True(t, versions[0].Published, "发布指针所在版本必须标 published")
+	require.True(t, versions[0].Applied, "模型连接发布即生效")
+	require.Nil(t, versions[0].RevertedFromVersionID)
+
+	detail, err := port.VersionDetail(ctx, pointer.PublishedVersionID)
+	require.NoError(t, err)
+	require.True(t, detail.Published)
+	require.NotEmpty(t, detail.DefinitionYAML, "模型连接详情必须带已发布块原文")
+
+	refs, err := port.References(ctx, core.ResourceModelConnection, "probe")
+	require.NoError(t, err)
+	require.Contains(t, refs.Agents, "reader", "引用视图必须点名当前 Agent")
+
+	// MCP 方法族自 T048 起转调编排层：空标识在写前校验阶段就被点名拒绝，证明端口
+	// 已接到真实实现（失败关闭桩只会返回固定桩错误）。
+	var invalidMCP *core.InvalidInputError
+	_, err = port.UpsertMCPServer(ctx, resourceActor(), web.MCPServerWrite{}, "")
+	require.ErrorAs(t, err, &invalidMCP)
+	var invalidMCPTest *core.InvalidInputError
+	_, err = port.TestMCPServer(ctx, resourceActor(), "")
+	require.ErrorAs(t, err, &invalidMCPTest)
+
+	// 技能方法族自 T053 起转调编排层：一次完整创建证明工作副本与首版快照目录都接在
+	// 同一工作区根上（桩只会返回固定桩错误，不会落盘）。
+	detailSkill, err := port.CreateSkill(ctx, resourceActor(), web.SkillCreateWrite{
+		Name:        "wire-skill",
+		Description: "接线判据",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "wire-skill", detailSkill.Name)
+	require.Equal(t, "接线判据", detailSkill.Description)
+	require.NotEmpty(t, detailSkill.Files, "创建响应必须带 SKILL.md 文件清单")
+	require.Equal(t, len(detailSkill.Files), detailSkill.FileCount, "file_count 取清单长度")
+	require.NotEmpty(t, detailSkill.ETag, "创建响应必须带发布版本 ETag")
+	workCopy := filepath.Join(fx.root, "skills", "wire-skill", "SKILL.md")
+	require.FileExists(t, workCopy, "工作副本必须落在工作区根的 skills/<name>/ 下")
+	// 首版快照按身份分段：versions/skills/<name>/<resource_uid>/1/（身份由创建时分配，
+	// 这里按"恰好一个"断言形态，不猜具体 UID）。
+	snapshots, err := filepath.Glob(filepath.Join(fx.root, "versions", "skills", "wire-skill", "*", "1", "SKILL.md"))
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1, "首版快照必须落在 versions/skills/<name>/<resource_uid>/1/ 下")
+
+	// 导入同名按 409（与创建同一闸门），更新缺 If-Match 按 412；两者都在预写之前。
+	var conflict *core.AdminError
+	_, err = port.ImportSkill(ctx, resourceActor(), web.SkillImportWrite{
+		Name:  "wire-skill",
+		Files: []web.FileDraftWrite{{Path: "SKILL.md", Content: string(detailSkill.Files[0].Content)}},
+	})
+	require.ErrorAs(t, err, &conflict)
+	require.ErrorIs(t, err, core.ErrConflict, "同名导入必须是 409")
+	var precondition *core.AdminError
+	_, err = port.UpdateSkill(ctx, resourceActor(), "wire-skill", web.SkillUpdateWrite{
+		Files: []web.FileDraftWrite{{Path: "SKILL.md", Content: string(detailSkill.Files[0].Content)}},
+	}, "")
+	require.ErrorAs(t, err, &precondition)
+	require.ErrorIs(t, err, core.ErrPreconditionFailed, "更新缺 If-Match 必须是 412")
+
+	// 校验只读：合法候选返回 valid=true，且工作副本字节不变（不落盘、不执行脚本）。
+	valid, err := port.ValidateSkill(ctx, "wire-skill", web.SkillUpdateWrite{
+		Files: []web.FileDraftWrite{{Path: "SKILL.md", Content: string(detailSkill.Files[0].Content)}},
+	})
+	require.NoError(t, err)
+	require.True(t, valid.Valid)
+	require.Empty(t, valid.Problems)
+	after, err := os.ReadFile(workCopy)
+	require.NoError(t, err)
+	require.Equal(t, detailSkill.Files[0].Content, string(after), "校验不得改写工作副本")
+}
+
+// TestWire_NotifyAdminPortWiring（T058）：通知渠道写面必须由装配层构造一次并填槽到
+// `writeServices.notifyAdmin`——扫描根、类型表与操作台账都取装配实例：类型表与
+// `GET /notify-channels/types`、发送面共用**同一有序切片**（约束 38），操作行落在
+// 同一张 `management_operations` 表。端口只做形状投影：空地址创建成功且 URL 保持
+// 空串；`${VAR}` 地址只以占位回传（解析值只用于白名单预检，不进响应）；更新留空
+// 保留原值；删除走同一整词扫描闸门。
+// 逆改点：wire 漏传 Root / Types → 依赖断言红；端口不填槽 → nil 断言红；适配器把
+// 占位解析成真实地址回传、或丢掉 keepURL 语义 → 读数断言红。
+// The channel write surface is assembled once; the scan root, the shared ordered type
+// slice and the operation store all come from that assembly. The port forwards the
+// three writes and returns the stored placeholder verbatim.
+func TestWire_NotifyAdminPortWiring(t *testing.T) {
+	t.Setenv("WIRE_HOOK_URL", "https://hooks.example.com/services/x?token=wire-secret")
+
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader")
+	// 出网白名单是写前预检的授权面：解析结果只用于判定，不落库、不进响应。
+	fx.cfg.HTTP.AllowedDomains = []string{"hooks.example.com"}
+
+	rt := fx.assemble(t)
+	ctx := context.Background()
+
+	require.NotNil(t, rt.notifyAdmin, "T058 之后通知写面必须由装配层构造")
+	require.Equal(t, fx.root, rt.notifyAdmin.root, "删除闸门扫描根必须是工作区根")
+	require.Equal(t, notifyTypeNames(), rt.notifyAdmin.types,
+		"写面类型表必须与 GET /notify-channels/types 同一有序切片")
+	require.NotNil(t, rt.notifyAdmin.operations, "操作台账必须是装配实例")
+
+	port := rt.writeServices.notifyAdmin
+	require.NotNil(t, port, "T058 之后通知写面端口必须已填槽")
+
+	// 空地址创建 = 暂不可发送：回显是**存储行**（带身份 / 模式 / 范围 / 修订号），URL 空串。
+	created, err := port.Create(ctx, resourceActor(), web.NotifyChannelWrite{
+		Name: "wire-empty", Type: "webhook", Description: "暂不可发送",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "wire-empty", created.Name)
+	require.Equal(t, "webhook", created.Type)
+	require.Equal(t, "暂不可发送", created.Description)
+	require.Empty(t, created.URL, "空地址是合法状态，回显不得补值")
+	require.NotEmpty(t, created.ResourceUID, "回显必须带存储行的资源身份")
+	require.Equal(t, core.CredentialModeEnv, created.CredentialMode)
+	require.Equal(t, core.ScopeShared, created.Scope)
+	require.Equal(t, 1, created.Revision, "新建行的修订号是列默认值 1")
+	require.NotEmpty(t, created.OperationID, "回显必须来自存储行（带创建操作号）")
+	require.NotEmpty(t, created.ETag, "写后回显必须带条件 ETag")
+	// 回显的 ETag 必须与读面**同一份配方**：条件写靠它比对，两处不一致会让写永远 412。
+	read, err := rt.channelRead.Channel(ctx, created.Name)
+	require.NoError(t, err)
+	require.Equal(t, read.ETag, created.ETag, "写后回显与读面必须共用同一份渠道 ETag 配方")
+
+	// 带 `${VAR}` 地址创建：库里只存占位（解析值只用于白名单预检，不进响应）。
+	hookURL := "${WIRE_HOOK_URL}"
+	placed, err := port.Create(ctx, resourceActor(), web.NotifyChannelWrite{
+		Name: "wire-hook", Type: "webhook", URL: &hookURL,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "${WIRE_HOOK_URL}", placed.URL,
+		"响应必须回库里原样占位，不得回解析后的地址")
+
+	// 更新留空 = 保留原值：空 url 原样下传，回读投影仍是占位。
+	kept, err := port.Update(ctx, resourceActor(), "wire-hook", web.NotifyChannelWrite{
+		Type: "webhook", Description: "保留地址",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "${WIRE_HOOK_URL}", kept.URL, "留空更新不得抹掉已登记地址")
+	require.Equal(t, "保留地址", kept.Description)
+
+	// 删除走整词扫描闸门（扫描根来自装配）：无引用即成功，并且每次写都留下操作行。
+	// 删除必须显式携带与当前指针一致的 resource_uid（契约 §9.5）。
+	require.NoError(t, port.Delete(ctx, resourceActor(), "wire-empty", string(created.ResourceUID), false))
+	require.NoError(t, port.Delete(ctx, resourceActor(), "wire-hook", string(placed.ResourceUID), false))
+
+	db := openRead(t, fx.dbPath())
+	require.Equal(t, 3, countRows(t, db,
+		"SELECT COUNT(*) FROM management_operations WHERE target_kind = ? AND target_id = ? AND status = ?",
+		core.TargetKindNotifyChannel, "wire-hook", string(core.OperationSuccess)),
+		"创建 + 更新 + 删除各留一行成功操作行（与资源写面同一张表）")
+	require.Equal(t, 2, countRows(t, db,
+		"SELECT COUNT(*) FROM management_operations WHERE target_kind = ? AND target_id = ? AND status = ?",
+		core.TargetKindNotifyChannel, "wire-empty", string(core.OperationSuccess)),
+		"创建 + 删除各留一行成功操作行")
+	// 删除只写墓碑（FR-073）：行保留供历史查询与审计回溯，活动行必须归零。判"删除发生了"
+	// 读的是墓碑列而不是行数——行数在墓碑语义下恒为 2，判不出任何东西。
+	// Deletion tombstones the row (FR-073): the verdict reads the tombstone column, not
+	// the row count, which is constant under tombstone semantics.
+	require.Equal(t, 2, countRows(t, db,
+		"SELECT COUNT(*) FROM notify_channels WHERE name IN (?, ?) AND deleted_at IS NOT NULL",
+		"wire-empty", "wire-hook"), "两次删除都必须真的写下墓碑")
+	require.Zero(t, countRows(t, db,
+		"SELECT COUNT(*) FROM notify_channels WHERE name IN (?, ?) AND deleted_at IS NULL",
+		"wire-empty", "wire-hook"), "删除后不得留下活动行")
+}
+
+// TestWire_WorkspaceBrowsePortWiring（T062）：工作区浏览由装配层构造一次并填槽到
+// `writeServices.workspace`——浏览根取自装配输入的工作区根（服务自己拼 `agents/`），
+// 端口把目录条目与文件预览按契约形状投影：条目逐字段相等、`truncated` 恒 false，
+// staging / backup 残骸不可见。浏览端口没有写面，本用例也不经它产生操作行。
+// 逆改点：wire 漏传工作区根 → 目录树报错 / 空；端口不填槽 → nil 断言红；端口伪造
+// `truncated` 或改写路径 → 读数断言红；残骸被列出 → 目录断言红。
+// The browser is assembled once, rooted at the fixture workspace, projected through the
+// web port; residue stays invisible and truncated is always false.
+func TestWire_WorkspaceBrowsePortWiring(t *testing.T) {
+	fx := newWireFixture(t)
+	fx.writeAgent(t, "reader")
+	// 残骸目录：与活动 Agent 同级，只用于判"目录树不列出残骸"。
+	// Residue beside the live agent: the tree must not list it.
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(fx.root, agentsDirName, "reader.staging"), 0o755))
+
+	rt := fx.assemble(t)
+	require.NotNil(t, rt.workspaceBrowse, "T062 之后浏览服务必须由装配层构造")
+	port := rt.writeServices.workspace
+	require.NotNil(t, port, "T062 之后浏览端口必须已填槽")
+
+	ctx := context.Background()
+	tree, err := port.Tree(ctx, "")
+	require.NoError(t, err)
+	require.Equal(t, web.WorkspaceTreeView{{Path: "reader", Type: "dir", Size: 0}}, tree,
+		"浏览根必须是 <工作区根>/agents，且残骸目录不可见")
+
+	tree, err = port.Tree(ctx, "reader")
+	require.NoError(t, err)
+	require.Len(t, tree, 1)
+	require.Equal(t, "reader/AGENT.md", tree[0].Path)
+	require.Equal(t, "file", tree[0].Type)
+	require.Positive(t, tree[0].Size)
+
+	file, err := port.File(ctx, "reader/AGENT.md")
+	require.NoError(t, err)
+	require.Equal(t, "reader/AGENT.md", file.Path)
+	require.Contains(t, file.Content, "你是「reader」")
+	require.Equal(t, int64(len(file.Content)), file.Size)
+	require.False(t, file.Truncated, "契约固定 truncated=false：超限是错误，不是截断")
+}
+
+// TestWire_CredentialComponentsAssembled（T134 / R4.8）：凭据五件必须由装配层一次
+// 构造并保留——解析器与迁移 / 写面共用**同一份**凭据仓储与版本仓储，纯 env 实例没有
+// 主密钥路径（不得凭空猜一个默认位置），secrets 服务经包外访问器给出同一实例。
+// 纯 env 是合法形态：`status` 报未初始化且零计数，`verify` 零检查零失败，`init` 按
+// 固定错误拒绝而不是在某处落盘造密钥。
+// 逆改点：解析器换新仓储实例 / MasterKeyFile 被填默认值 / 访问器另建服务 → 断言红。
+// The five credential components are built once and share the assembly's stores; a
+// pure-env instance reports uninitialised and refuses init instead of inventing a path.
+func TestWire_CredentialComponentsAssembled(t *testing.T) {
+	fx := newWireFixture(t)
+	rt := fx.assemble(t)
+
+	require.NotNil(t, rt.resolver, "凭据解析器必须由装配层构造并保留")
+	require.NotNil(t, rt.secrets, "secrets 服务必须由装配层构造并保留")
+	require.Same(t, rt.credentials, rt.resolver.deps.Credentials,
+		"解析器必须与迁移 / 写面共用同一份凭据仓储（另建一份会让撤销状态读不到）")
+	require.Same(t, rt.versions, rt.resolver.deps.Resources,
+		"解析器必须与版本仓储同源（绑定目标取自当前发布版本）")
+	require.Empty(t, rt.resolver.deps.MasterKeyFile,
+		"纯 env 实例未配置主密钥：解析器不得自行猜一个默认路径")
+	require.Equal(t, fx.root, rt.resolver.deps.WorkspaceRoot,
+		"工作区根必须与装配面一致（主密钥不得落在工作区内）")
+
+	runtime := &Runtime{inner: rt}
+	require.Same(t, rt.secrets, runtime.Secrets(), "包外访问器必须给出同一个服务实例")
+
+	ctx := context.Background()
+	status, err := runtime.Secrets().Status(ctx)
+	require.NoError(t, err, "未配置主密钥是合法形态，不是错误")
+	require.False(t, status.Initialized)
+	require.Empty(t, status.KeyID)
+	require.Empty(t, status.Fingerprint)
+	require.Zero(t, status.ManagedModelConnections)
+	require.Zero(t, status.ManagedNotifyChannels)
+
+	report, err := runtime.Secrets().Verify(ctx)
+	require.NoError(t, err)
+	require.Zero(t, report.Checked, "没有托管身份就没有可查验的凭据")
+	require.Zero(t, report.Failed)
+
+	_, err = runtime.Secrets().Init(ctx)
+	require.ErrorIs(t, err, core.ErrCredentialUnavailable,
+		"纯 env 实例可以跳过 init：空路径按固定错误拒绝，不在默认位置凭空造密钥")
+	require.NoFileExists(t, filepath.Join(fx.workDir, "master.key"), "拒绝路径不得落盘")
+}
+
+// TestWire_StartupRunsMigrationOrchestration（T134）：重路径的 ③ 必须走六步迁移编排，
+// 而不是直接调 `db.Migrate`。两条可观察判据：
+//
+//  1. 新库由 `OpenWritable` 直接建到目标版本 → 编排返回零报告，**不得**留下迁移操作行
+//     （每次启动都写一行 `system.baseline_v3` 会让操作台账被启动噪声淹没）；
+//  2. 骨架缺 `agents/` 时启动在**迁移**这一步失败——编排的入参校验要扫描 Agent 目录
+//     （绑定回填要按名单判身份连续性），只调 `db.Migrate` 的实现根本不看工作区。
+//
+// 逆改点：迁移块换回 `db.Migrate` → 判据 2 的启动会成功（随后由基线报错，错误串不含
+// 「扫描 Agent 目录」）→ 断言红；编排提前写操作行 → 判据 1 读数非零 → 断言红。
+// The startup step must run the six-step orchestration, not a bare db.Migrate: an
+// up-to-date database leaves no operation row, and a skeleton missing agents/ fails at
+// the migration step because the orchestration scans the agent directory.
+func TestWire_StartupRunsMigrationOrchestration(t *testing.T) {
+	t.Run("新库不写迁移操作行", func(t *testing.T) {
+		fx := newWireFixture(t)
+		rt := fx.assemble(t)
+
+		version, err := rt.db.SchemaVersion(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, storage.SupportedSchemaVersion, version, "启动后库必须停在目标版本")
+
+		db := openRead(t, fx.dbPath())
+		require.Zero(t, countRows(t, db,
+			"SELECT COUNT(*) FROM management_operations WHERE action = ?", actionBaselineV3),
+			"库已是目标版本：编排返回零报告，不得写迁移操作行")
+	})
+
+	t.Run("缺 Agent 目录在迁移步失败", func(t *testing.T) {
+		fx := newWireFixture(t)
+		require.NoError(t, os.RemoveAll(filepath.Join(fx.root, agentsDirName)))
+
+		_, err := fx.app().newRuntime(context.Background())
+		require.Error(t, err)
+		require.ErrorContains(t, err, "迁移数据库", "失败必须发生并归因到迁移这一步")
+		require.ErrorContains(t, err, "扫描 Agent 目录",
+			"只有六步编排会扫描 Agent 目录——错误串据此区分编排与裸 db.Migrate")
+	})
 }

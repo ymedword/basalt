@@ -13,6 +13,7 @@ package workspace_test
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -50,13 +51,35 @@ func TestMemoryFilePath_Convention(t *testing.T) {
 	require.Equal(t, "memory/MEMORY.md", workspace.MemoryFilePath(core.GlobalScope.Agent))
 }
 
+// templateFrontmatter 读回模板文件并解出 frontmatter 段（围栏之间）。
+// templateFrontmatter reads a created template back and returns its frontmatter.
+func templateFrontmatter(t *testing.T, root, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "agents", name, "AGENT.md"))
+	require.NoError(t, err)
+	front, _, found := strings.Cut(string(raw), "\n---\n")
+	require.True(t, found, "模板必须是 frontmatter 围栏形态（首行 --- 起、--- 止）：\n%s", raw)
+	return front
+}
+
+// templateDTO 是模板 frontmatter 的解码形态（只取本文件判的字段）。
+// templateDTO is the decoded shape of the template frontmatter.
+type templateDTO struct {
+	Description string `yaml:"description"`
+	Provider    struct {
+		Name  string `yaml:"name"`
+		Model string `yaml:"model"`
+	} `yaml:"provider"`
+	Tools []string `yaml:"tools"`
+}
+
 // TestTemplates_AgentTemplateDeclaresMemoryTools：新建 Agent 的模板**默认工具**逐字
 // = [save_memory, recall_memory]（颗粒度文档 §6.2 口径 26 / spec FR-026 / plan
 // Constraints）——记忆工具随本 US 进注册池，出厂模板即声明它们，`profile create`
 // 造出的 Agent 第一次运行就能记东西。
 //
 // 判卷装置刻意**不用装载器**：本条判的是**模板声明本身**（文件里写了什么），
-// 装载器的注册判定另有 T032 承载；走真模板路径（`CreateAgent` 落盘 → 读回文件 →
+// 装载器的注册判定另有 T032 承载；走真模板路径（`CreateAgentStaged` 落盘 → 读回文件 →
 // 按 YAML 解码 frontmatter），避免绕开 agentTemplate 直接读未导出函数。
 // 中文验收点：`agents/<name>/AGENT.md` 的 frontmatter `tools:` 恰为两件记忆工具。
 // The template's declared default tools are judged from the file the real path
@@ -66,20 +89,66 @@ func TestTemplates_AgentTemplateDeclaresMemoryTools(t *testing.T) {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	created, err := workspace.CreateAgent(root, "memory-tools", []string{"deepseek"})
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "memory-tools"}, []string{"deepseek"})
 	require.NoError(t, err)
-	require.Equal(t, []string{"agents/memory-tools/AGENT.md"}, created)
+	require.Len(t, created, 1)
+	require.Equal(t, "agents/memory-tools/AGENT.md", created[0].Path)
 
-	raw, err := os.ReadFile(filepath.Join(root, "agents", "memory-tools", "AGENT.md"))
-	require.NoError(t, err)
-
-	front, _, found := strings.Cut(string(raw), "\n---\n")
-	require.True(t, found, "模板必须是 frontmatter 围栏形态（首行 --- 起、--- 止）：\n%s", raw)
-
-	var dto struct {
-		Tools []string `yaml:"tools"`
-	}
-	require.NoError(t, yaml.Unmarshal([]byte(front), &dto))
+	var dto templateDTO
+	require.NoError(t, yaml.Unmarshal([]byte(templateFrontmatter(t, root, "memory-tools")), &dto))
 	require.Equal(t, []string{"save_memory", "recall_memory"}, dto.Tools,
 		"模板默认工具逐字：两件记忆工具（顺序即声明序，多余与缺失都算装配漂移）")
+}
+
+// 中文验收点（§3.2.2）：创建请求给了描述 → 描述**逐字**落进 frontmatter
+// （管理台的"一句描述"就是从这里进模板的，编码写入、不插值）。
+// Acceptance point: a supplied description lands in the frontmatter verbatim.
+func TestTemplates_DescriptionLandsInFrontmatter(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	description := "日报汇总：每日 09:00 汇总昨日告警 # 只读"
+	_, err = workspace.CreateAgentStaged(root, core.AgentSpec{Name: "digest", Description: description}, []string{"deepseek"})
+	require.NoError(t, err)
+
+	var dto templateDTO
+	require.NoError(t, yaml.Unmarshal([]byte(templateFrontmatter(t, root, "digest")), &dto))
+	require.Equal(t, description, dto.Description)
+}
+
+// 中文验收点（§3.2.2）：创建请求给了模型 → 模型**逐字**落进 provider.model
+// （不给才落占位文案；占位是普通文本、装载天然放行）。
+// Acceptance point: a supplied model lands in provider.model verbatim.
+func TestTemplates_ModelLandsInFrontmatter(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	_, err = workspace.CreateAgentStaged(root, core.AgentSpec{Name: "digest", Model: "deepseek-chat"}, []string{"deepseek"})
+	require.NoError(t, err)
+
+	var dto templateDTO
+	require.NoError(t, yaml.Unmarshal([]byte(templateFrontmatter(t, root, "digest")), &dto))
+	require.Equal(t, "deepseek-chat", dto.Provider.Model)
+	require.Equal(t, "deepseek", dto.Provider.Name, "provider.name 仍取候选列表首项")
+}
+
+// 中文验收点（FR-027 / 约束：不得遍历随机选择）：没有任何已发布 Provider 时，
+// provider.name 写**可见占位符**——确定性产物，不是随机挑一个或留空。
+// Acceptance point: with no providers the template writes the visible placeholder.
+func TestTemplates_NoProvidersWritesPlaceholder(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	for i := range 2 { // 跑两次：产物逐字节一致（确定性判据）
+		name := "digest" + strconv.Itoa(i)
+		_, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: name}, nil)
+		require.NoError(t, err)
+
+		var dto templateDTO
+		require.NoError(t, yaml.Unmarshal([]byte(templateFrontmatter(t, root, name)), &dto))
+		require.Equal(t, "请在此填写 provider 名", dto.Provider.Name, "无候选时必须写可见占位符")
+	}
 }

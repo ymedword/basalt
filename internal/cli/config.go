@@ -21,24 +21,41 @@ import (
 // Config 是 basalt.yaml 的解析结果。
 // Config is the parsed form of basalt.yaml.
 //
-// 已钉死键的段用类型化结构承载；键集尚未落位的段（author）以原始结构保留——
-// 消费它们的 US 落位前不预造键（颗粒度文档 §3.1 的「解析并保留」口径）。sandbox / shell /
-// http 三段自 US-5 起落为结构（§3.5 第 4 项：**沿用既有键名**，不新增也不删除）；
-// memory 段自 US-6 起落为结构（§3.5 第 1 项——`backend` 是 `basalt.yaml.example` 里
-// 已有的键，零新增配置键）。
-// Sections whose keys are fixed carry typed structures; sections whose key sets
-// are not yet decided keep their raw decoded shape so that no key is invented
-// ahead of the US that consumes it. Only author still keeps its raw shape.
+// 已钉死键的段用类型化结构承载。sandbox / shell / http 三段自 US-5 起落为结构
+// （§3.5 第 4 项：**沿用既有键名**，不新增也不删除）；memory 段自 US-6 起落为结构
+// （§3.5 第 1 项——`backend` 是 `basalt.yaml.example` 里已有的键，零新增配置键）；
+// author 段自 US-12 起由 ParseAuthorSection 类型化解析（颗粒度文档 §3.1.9），
+// 因需要"未知键报错"而保留独立解析入口，不经 yaml 解码器落结构。
+// Sections with fixed keys carry typed structures. The author section is parsed by
+// ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
+// entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
-	HTTP      HTTPConfig       `yaml:"http"`
-	Server    ServerConfig     `yaml:"server"`
-	Log       LogConfig        `yaml:"log"`
-	Providers []ProviderConfig `yaml:"providers"`
-	Budget    BudgetConfig     `yaml:"budget"`
-	Sandbox   SandboxConfig    `yaml:"sandbox"`
-	Shell     ShellConfig      `yaml:"shell"`
-	Memory    MemoryConfig     `yaml:"memory"`
-	Author    map[string]any   `yaml:"author"`
+	HTTP      HTTPConfig        `yaml:"http"`
+	Server    ServerConfig      `yaml:"server"`
+	Log       LogConfig         `yaml:"log"`
+	Providers []ProviderConfig  `yaml:"providers"`
+	Budget    BudgetConfig      `yaml:"budget"`
+	Sandbox   SandboxConfig     `yaml:"sandbox"`
+	Shell     ShellConfig       `yaml:"shell"`
+	Memory    MemoryConfig      `yaml:"memory"`
+	Secrets   SecretsConfig     `yaml:"secrets"`
+	Author    core.AuthorConfig `yaml:"-"`
+}
+
+// SecretsConfig 是托管凭据的部署段（`secrets` 段，颗粒度文档 §3.3）：段内只承载
+// 主密钥文件的位置，密钥材料本身**不在**配置里。路径边界、链接与权限由
+// `LoadMasterKey` 在每次解析时复核，装载层只做"段形状"这一档校验（T136）：
+// 写了段就必须给路径；路径按「配置文件同级 `.basalt/`」做**词法**边界判定。
+// 词法判定不碰文件系统——密钥文件由 `secrets init` 另行生成，装载期允许尚不存在。
+// SecretsConfig carries the master-key file location; key material never lives in the
+// configuration. Load-time checks are shape only (a written section requires a path,
+// and a lexical outside-workspace check); LoadMasterKey re-validates boundary, links
+// and permissions at every use.
+type SecretsConfig struct {
+	// MasterKeyFile 是主密钥文件路径（必须在工作区外）。空 = 未配置：纯 env 实例
+	// 可以没有它，托管写入与启动必需校验会以固定原因拒绝。
+	// MasterKeyFile is the master-key path outside the workspace; empty means unconfigured.
+	MasterKeyFile string `yaml:"master_key_file"`
 }
 
 // HTTPConfig 是服务段的监听与请求体上限（字面量出处 docs/contracts/openapi.yaml）。
@@ -177,6 +194,13 @@ type ProviderConfig struct {
 	// APIKey accepts a ${VAR} placeholder only, and never appears in errors or logs.
 	APIKey string `yaml:"api_key"`
 
+	// CredentialMode 是 v3 的两模式开关（R4.8）：空串 = env（兼容 v2 定义）；
+	// `managed` 时凭据存于凭据表，本文件只写模式、**没有** `api_key` 行。模式只由
+	// 字段判定，不按 `api_key` 的取值形态推断（与 `workspace.ProviderEntry` 同口径）。
+	// CredentialMode is the v3 two-mode switch: empty means env (v2 definitions);
+	// a managed entry carries no api_key at all.
+	CredentialMode string `yaml:"credential_mode"`
+
 	// DefaultModel 是该供应商的缺省模型（可被 Profile 覆盖）。
 	// DefaultModel is the provider default model.
 	DefaultModel string `yaml:"default_model"`
@@ -290,6 +314,13 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 	if err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
+	// secrets 段的"段形状"要在解码之后单独判：整段缺失与"写了段但没给路径"在
+	// 结构体里都是空串，只有原始树能区分两者（T136）。
+	// The secrets section is checked against the raw tree: after decoding, "section
+	// absent" and "section present without a path" are both the empty string.
+	if err := validateSecretsSection(resolvedMap, cfg.Secrets, path); err != nil {
+		return nil, fmt.Errorf("配置 %s: %w", path, err)
+	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
@@ -344,6 +375,20 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 		return nil, fmt.Errorf("配置项类型非法: %s",
 			redactCredentialValues(yamlErrorSummary(err), tree))
 	}
+
+	// author 段走独立解析入口（`yaml:"-"`，解码器不碰它）：未知键与 temperature
+	// 取值范围需要显式判定，yaml 解码器对未知键是静默忽略的。
+	// The author section is parsed explicitly: the yaml decoder silently ignores
+	// unknown keys, which is exactly what this section must refuse.
+	section, err := authorSection(tree)
+	if err != nil {
+		return nil, err
+	}
+	author, err := ParseAuthorSection(section)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Author = author
 	return cfg, nil
 }
 
@@ -505,11 +550,80 @@ func validateConfig(cfg *Config) error {
 			return err
 		}
 
-		if p.APIKey == "" {
-			return fmt.Errorf("必填配置项 providers[%d].api_key 缺失——凭证一律写 ${VAR} 占位", i)
+		// 凭据两模式（R4.8）：env 条目必须有 `${VAR}` 占位；managed 条目由服务端在
+		// 定义文件里写 `credential_mode: managed` 且**没有** `api_key` 行——把"缺
+		// api_key"当成缺项会让实例在下一次启动时拒绝装载自己的定义文件。
+		// The two credential modes: env requires the placeholder, managed must not
+		// carry an api_key line; treating its absence as missing would make the
+		// instance refuse to load the definition file it wrote itself.
+		switch mode := strings.TrimSpace(p.CredentialMode); mode {
+		case "", "env":
+			if p.APIKey == "" {
+				return fmt.Errorf("必填配置项 providers[%d].api_key 缺失——凭证一律写 ${VAR} 占位", i)
+			}
+		case "managed":
+			if strings.TrimSpace(p.APIKey) != "" {
+				return fmt.Errorf(
+					"配置项 providers[%d].api_key 在 credential_mode: managed 下不得出现——托管凭据存于凭据表，定义文件只写模式", i)
+			}
+		default:
+			return fmt.Errorf(
+				"配置项 providers[%d].credential_mode 取值非法（%s）——只允许 env（缺省）或 managed", i, mode)
 		}
 	}
 	return nil
+}
+
+// validateSecretsSection 校验 `secrets` 段的装载期形状（T136）。
+// validateSecretsSection checks the load-time shape of the secrets section.
+//
+// 两条规则：
+//  1. 整段缺失合法——纯 env 实例不托管凭据，不因缺主密钥而启动失败（Operations §6.1）。
+//     但只要写了 `secrets:`（哪怕是空小节），就必须给出 `master_key_file`：写了段
+//     等于声明"这台实例托管凭据"，空路径会让部署者以为已经配好，实际每次托管写入
+//     才报 CREDENTIAL_UNAVAILABLE。
+//  2. 路径不得落在工作区内。装载层只知道配置文件位置，按既有布局（`basalt.yaml`
+//     与 `.basalt/` 同级，见 status / init / profile 的工作区口径）做**词法**判定；
+//     真实工作区根、符号链接 / junction 与权限属运行期判定，由 `LoadMasterKey`
+//     每次使用前复核（本函数不碰文件系统：密钥文件由 `secrets init` 另行生成）。
+//
+// Two rules: an absent section is legal (pure-env deployments); a written section
+// requires the path, and the path may not lexically sit inside the sibling `.basalt/`
+// workspace. Runtime validation remains authoritative.
+func validateSecretsSection(tree map[string]any, cfg SecretsConfig, configPath string) error {
+	if _, present := tree["secrets"]; !present {
+		return nil
+	}
+	if strings.TrimSpace(cfg.MasterKeyFile) == "" {
+		return fmt.Errorf(
+			"必填配置项 secrets.master_key_file 缺失——写了 secrets 段就必须给出主密钥文件路径；不托管凭据的实例请整段省略")
+	}
+
+	root := filepath.Dir(configPath)
+	target := cfg.MasterKeyFile
+	if !filepath.IsAbs(target) {
+		// 相对路径在运行期按进程工作目录解析；装载层按配置文件所在目录换算，
+		// 与文档化的部署布局（配置与工作区同级）一致。
+		target = filepath.Join(root, target)
+	}
+	if pathWithin(filepath.Join(root, workspaceDirName), target) {
+		return fmt.Errorf(
+			"配置项 secrets.master_key_file 不得位于工作区内（%s/）——主密钥必须放在工作区之外",
+			workspaceDirName)
+	}
+	return nil
+}
+
+// pathWithin 判定 target 是否落在 root 之内（含 root 本身）；不同卷视为不包含。
+// pathWithin reports whether target lies inside root (root included); a different
+// volume never counts as inside.
+func pathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 // validateAdminAuth 校验 `http.admin_auth` 段的配置形状（约束 1 / 2 / 4 / 5）。

@@ -39,12 +39,20 @@ var _ core.CronEngine = (*Engine)(nil)
 // New builds the six-field parser (second minute hour dom month dow) and the engine;
 // time zones travel with each spec via the CRON_TZ= prefix.
 func New(logger *slog.Logger) *Engine {
-	p := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	p := newSixFieldParser()
 	return &Engine{
 		cron:   cron.New(cron.WithParser(p), cron.WithLogger(cronLogger{logger: logger})),
 		parser: p,
 		logger: logger,
 	}
+}
+
+// newSixFieldParser 构造 6 段解析器（秒 分 时 日 月 周）；引擎与不持有引擎的枚举
+// 入口（管理台定时候选的未来三次）共用这一份构造，段数规则只有一处。
+// newSixFieldParser is the single six-field parser constructor shared by the engine and
+// the engine-less enumeration entry point.
+func newSixFieldParser() cron.Parser {
+	return cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 }
 
 // Add 注册一个任务并返回停止句柄。缺少 CRON_TZ= 前缀或表达式非法（含 5 段）时拒绝注册。
@@ -74,10 +82,25 @@ func (e *Engine) Stop() context.Context { return e.cron.Stop() }
 // Occurrences enumerates at most limit trigger times in [from, to]; a parse failure
 // yields an empty slice because callers already validated the spec.
 func (e *Engine) Occurrences(spec string, from, to time.Time, limit int) []time.Time {
+	return occurrences(e.parser, spec, from, to, limit)
+}
+
+// ParseOccurrences 是不持有 Engine 的调用方（管理台定时候选的未来三次触发时间）
+// 复用同一份 6 段解析规则与枚举算法的入口：spec 必须已带 `CRON_TZ=` 前缀（由
+// workspace.CronSpec 生成），解析失败返回空切片。
+// ParseOccurrences lets engine-less callers enumerate with the same parser and
+// algorithm; the spec must already carry the CRON_TZ= prefix.
+func ParseOccurrences(spec string, from, to time.Time, limit int) []time.Time {
+	return occurrences(newSixFieldParser(), spec, from, to, limit)
+}
+
+// occurrences 是唯一的枚举实现：从 from 起循环 Next，最多 limit 个且不超过 to。
+// occurrences is the single enumeration algorithm behind both entry points.
+func occurrences(parser cron.Parser, spec string, from, to time.Time, limit int) []time.Time {
 	if limit <= 0 {
 		return nil
 	}
-	schedule, err := e.parser.Parse(spec)
+	schedule, err := parser.Parse(spec)
 	if err != nil {
 		return nil
 	}

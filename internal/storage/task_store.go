@@ -41,7 +41,7 @@ func NewTaskStore(db *DB) *TaskStore { return &TaskStore{db: db} }
 // ListTasks returns every row ordered by task_id, retired rows included; core filters.
 func (s *TaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
 	rows, err := s.db.read.QueryContext(ctx,
-		`SELECT task_id, agent_name, cron, zone, message, enabled, definition_hash,
+		`SELECT task_id, agent_name, cron, zone, message, deliver_to, enabled, definition_hash,
 		        last_run_at, last_status, retired_at, created_at, updated_at
 		   FROM scheduled_tasks ORDER BY task_id ASC`)
 	if err != nil {
@@ -60,7 +60,7 @@ func (s *TaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
 			updatedAt  int64
 		)
 		if err := rows.Scan(&rec.TaskID, &rec.Agent, &rec.Cron, &rec.Zone, &rec.Message,
-			&rec.Enabled, &rec.DefinitionHash, &lastRunAt, &lastStatus, &retiredAt,
+			&rec.DeliverTo, &rec.Enabled, &rec.DefinitionHash, &lastRunAt, &lastStatus, &retiredAt,
 			&createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("读取定时任务行: %w", err)
 		}
@@ -91,18 +91,19 @@ func (s *TaskStore) ApplyAgentTasks(ctx context.Context, agent string, upserts [
 			// 不写 agent_name / enabled / last_* / created_at——运行状态只归启停与执行路径。
 			res, err := conn.ExecContext(ctx,
 				`INSERT INTO scheduled_tasks
-				   (task_id, agent_name, cron, zone, message, enabled, definition_hash,
+				   (task_id, agent_name, cron, zone, message, deliver_to, enabled, definition_hash,
 				    last_run_at, last_status, retired_at, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?)
+				 VALUES (?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, NULL, ?, ?)
 				 ON CONFLICT(task_id) DO UPDATE SET
 				   cron            = excluded.cron,
 				   zone            = excluded.zone,
 				   message         = excluded.message,
+				   deliver_to      = excluded.deliver_to,
 				   definition_hash = excluded.definition_hash,
 				   updated_at      = excluded.updated_at,
 				   retired_at      = NULL
 				 WHERE scheduled_tasks.agent_name = excluded.agent_name`,
-				task.TaskID, agent, task.Cron, task.Zone, task.Message,
+				task.TaskID, agent, task.Cron, task.Zone, task.Message, task.DeliverTo,
 				task.DefinitionHash, now.UnixMilli(), now.UnixMilli())
 			if err != nil {
 				return fmt.Errorf("写入定时任务（task_id=%s）: %w", task.TaskID, err)
@@ -331,10 +332,12 @@ func (s *TaskStore) RecoverStartedExecutions(ctx context.Context, now time.Time)
 // ListExecutions returns the newest execution rows first, capped at limit.
 func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int) ([]core.ExecutionRecord, error) {
 	rows, err := s.db.read.QueryContext(ctx,
-		`SELECT id, task_id, run_id, status, trigger, duration_ms, error_message,
-		        started_at, finished_at
-		   FROM task_executions WHERE task_id = ?
-		  ORDER BY started_at DESC, id DESC LIMIT ?`, taskID, limit)
+		`SELECT e.id, e.task_id, e.run_id, e.status, e.trigger, e.duration_ms, e.error_message,
+		        d.status, d.channel_uid, d.detail, e.started_at, e.finished_at
+		   FROM task_executions e
+		   LEFT JOIN schedule_deliveries d ON d.run_id = e.run_id
+		  WHERE e.task_id = ?
+		  ORDER BY e.started_at DESC, e.id DESC LIMIT ?`, taskID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("列出任务执行历史（task_id=%s）: %w", taskID, err)
 	}
@@ -343,17 +346,21 @@ func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int
 	var out []core.ExecutionRecord
 	for rows.Next() {
 		var (
-			rec        core.ExecutionRecord
-			runID      sql.NullString
-			status     string
-			trigger    string
-			durationMS sql.NullInt64
-			errMsg     sql.NullString
-			startedAt  int64
-			finishedAt sql.NullInt64
+			rec             core.ExecutionRecord
+			runID           sql.NullString
+			status          string
+			trigger         string
+			durationMS      sql.NullInt64
+			errMsg          sql.NullString
+			deliveryStatus  sql.NullString
+			deliveryChannel sql.NullString
+			deliveryDetail  sql.NullString
+			startedAt       int64
+			finishedAt      sql.NullInt64
 		)
 		if err := rows.Scan(&rec.ID, &rec.TaskID, &runID, &status, &trigger,
-			&durationMS, &errMsg, &startedAt, &finishedAt); err != nil {
+			&durationMS, &errMsg, &deliveryStatus, &deliveryChannel, &deliveryDetail,
+			&startedAt, &finishedAt); err != nil {
 			return nil, fmt.Errorf("读取任务执行行: %w", err)
 		}
 		rec.RunID = runID.String
@@ -361,6 +368,9 @@ func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int
 		rec.Trigger = core.Trigger(trigger)
 		rec.DurationMS = durationMS.Int64
 		rec.ErrorMessage = errMsg.String
+		rec.Delivery = core.DeliveryStatus(deliveryStatus.String)
+		rec.DeliveryChannel = deliveryChannel.String
+		rec.DeliveryDetail = deliveryDetail.String
 		rec.StartedAt = time.UnixMilli(startedAt).UTC()
 		rec.FinishedAt = unixMilliOrZero(finishedAt)
 		out = append(out, rec)

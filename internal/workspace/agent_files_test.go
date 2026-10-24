@@ -1,23 +1,29 @@
 package workspace_test
 
-// 本文件是 US-3 写模式文件面的关键回归用例（颗粒度文档 §3.2 的 agent_files_test.go
-// 九例；A8 = 模板可装载、A9 = 归档语义）。夹具沿用 agent_test.go 的家族（§2.4 注 8）。
-// Regression tests for the write path: template creation and archive-delete.
-// Fixtures are shared with agent_test.go.
+// 本文件是 Agent 目录写路径的关键回归用例（颗粒度文档 §3.2 的 agent_files_test.go
+// 家族）：创建走 staging + 单次 rename、归档走单次 rename 并产清单、名称判据共用
+// 同一函数、生命周期状态文件只有唯一写者。夹具沿用 agent_test.go 的家族（§2.4 注 8）。
+// Regression tests for the agent directory write path: staged creation, archive with
+// manifest, the shared name rules, and the single-writer lifecycle assertion.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
-// archiveNow 是归档用例的统一固定时刻——DeleteAgent 的 now 由调用方显式传入
+// archiveNow 是归档用例的统一固定时刻——归档操作的 now 由调用方显式传入
 // （§2.2 约束 8：时间显式传入是可判卷前提，归档名含时间戳）。
 // archiveNow is the fixed instant every archive test passes in.
 func archiveNow() time.Time {
@@ -42,8 +48,8 @@ func dirNames(t *testing.T, dir string) []string {
 	return names
 }
 
-// initWorkspaceRoot 造一个**已初始化**的工作区根——写模式命令面只在初始化过的工作区里跑
-// （agents/ 缺失是命令面要点名的错误，不是写模式函数的常规输入；archive/ 由 init 建）。
+// initWorkspaceRoot 造一个**已初始化**的工作区根——写路径只在初始化过的工作区里跑
+// （agents/ 缺失是命令面要点名的错误，不是写路径函数的常规输入；archive/ 由 init 建）。
 // initWorkspaceRoot returns a workspace root built through the init path.
 func initWorkspaceRoot(t *testing.T) string {
 	t.Helper()
@@ -53,17 +59,28 @@ func initWorkspaceRoot(t *testing.T) string {
 	return root
 }
 
+// agentMDOf 读回一个 Agent 的定义文件原文。
+// agentMDOf reads back an agent's definition file.
+func agentMDOf(t *testing.T, root, name string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, "agents", name, "AGENT.md"))
+	require.NoError(t, err)
+	return string(raw)
+}
+
 // 中文验收点：create 产出**可装载**的模板——占位模型是普通文本、天然放行（技术方案
 // §11.5），provider.name 取配置数组首项（明示"选中了谁"的结果面），tools 为两件记忆
 // 工具（US-6 起模板默认声明 `save_memory` / `recall_memory`——口径 26 / FR-026）；
-// created 报出本次落盘的相对路径（供命令输出）。
+// 返回的文件行报出本次落盘的相对路径与字节数。
 // Acceptance point: the created template loads and registers as is.
 func TestCreateAgent_WritesLoadableTemplate(t *testing.T) {
 	root := initWorkspaceRoot(t)
 
-	created, err := workspace.CreateAgent(root, "demo-agent", []string{"deepseek", "openai"})
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "demo-agent"}, []string{"deepseek", "openai"})
 	require.NoError(t, err)
-	require.Equal(t, []string{"agents/demo-agent/AGENT.md"}, created)
+	require.Len(t, created, 1)
+	require.Equal(t, "agents/demo-agent/AGENT.md", created[0].Path)
+	require.Equal(t, int64(len(agentMDOf(t, root, "demo-agent"))), created[0].Size)
 
 	// 模板必须经**同一条装载路径**注册成功——create 的判据是"可被加载"，不是"文件写出来了"。
 	// 池按模板声明的两件记忆工具注入：零值（空池）会让模板这类"声明了 tools: 的 Agent"
@@ -83,6 +100,43 @@ func TestCreateAgent_WritesLoadableTemplate(t *testing.T) {
 	require.Equal(t, []string{"save_memory", "recall_memory"}, entries[0].Profile.Tools)
 }
 
+// 中文验收点（文档 §3.2.2 §6.2 口径 21）：**默认值不变**——创建请求不带描述与模型时，
+// 落盘内容与历史模板逐字一致（默认描述 / 占位模型是可见的"没配完"标记，不是新语义）。
+// 判卷装置：同一时刻造两份文件，一份走默认、一份显式给出历史文案，两文件除名字外
+// 逐字节相同——默认文案一旦漂移，这条断言立刻落红。
+// Acceptance point: an empty description/model falls back to the historical literals
+// byte for byte.
+func TestCreateAgent_DefaultsUnchanged(t *testing.T) {
+	root := initWorkspaceRoot(t)
+
+	_, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "bare-agent"}, []string{"deepseek"})
+	require.NoError(t, err)
+	_, err = workspace.CreateAgentStaged(root, core.AgentSpec{
+		Name:        "explicit-agent",
+		Description: "一句话说明这个 Agent 的职责（可留空）",
+		Model:       "请在此填写模型名",
+	}, []string{"deepseek"})
+	require.NoError(t, err)
+
+	bare := agentMDOf(t, root, "bare-agent")
+	explicit := agentMDOf(t, root, "explicit-agent")
+	require.Equal(t, strings.ReplaceAll(bare, "bare-agent", "explicit-agent"), explicit,
+		"空描述 / 空模型的产物必须与显式给出历史默认文案的产物逐字节一致")
+
+	// 再从文件里读回两个默认值（不经装载器：判的是模板声明的字面量本身）。
+	var dto struct {
+		Description string `yaml:"description"`
+		Provider    struct {
+			Model string `yaml:"model"`
+		} `yaml:"provider"`
+	}
+	front, _, found := strings.Cut(bare, "\n---\n")
+	require.True(t, found, "模板必须是 frontmatter 围栏形态")
+	require.NoError(t, yaml.Unmarshal([]byte(front), &dto))
+	require.Equal(t, "一句话说明这个 Agent 的职责（可留空）", dto.Description)
+	require.Equal(t, "请在此填写模型名", dto.Provider.Model)
+}
+
 // 中文验收点：已存在目录 → 拒绝且**零写入**——既有目录及其内容逐字节保留（不覆盖、
 // 不追加、不动兄弟文件）。"先写后判"的实现会在这里改掉既有文件。
 // Acceptance point: an existing agent directory is refused without a single byte written.
@@ -91,21 +145,20 @@ func TestCreateAgent_RefusesExistingDirectory(t *testing.T) {
 	original := "---\nname: demo-agent\nprovider: {name: deepseek, model: my-own-model}\n---\n\n既有正文\n"
 	writeFileInRoot(t, root, filepath.Join("agents", "demo-agent", "AGENT.md"), original)
 
-	created, err := workspace.CreateAgent(root, "demo-agent", []string{"deepseek"})
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "demo-agent"}, []string{"deepseek"})
 	require.Error(t, err)
 	require.Empty(t, created)
 	require.Contains(t, err.Error(), "demo-agent") // 点名被拒的目录
 
-	got, readErr := os.ReadFile(filepath.Join(root, "agents", "demo-agent", "AGENT.md"))
-	require.NoError(t, readErr)
-	require.Equal(t, original, string(got), "既有定义文件被改写了")
+	require.Equal(t, original, agentMDOf(t, root, "demo-agent"), "既有定义文件被改写了")
 	require.Equal(t, []string{"AGENT.md"}, dirNames(t, filepath.Join(root, "agents", "demo-agent")),
 		"既有目录里出现了新文件（拒绝路径必须零写入）")
 }
 
 // 中文验收点：Agent 名非法 → 拒绝且零写入；create / delete **共用同一校验函数**
-// （同一份判据，不得各写一份——§3.1 ValidateAgentName 注释）。合法但少见的名字
-// （空格 / 中文 / 井号）必须放行，不得过度收紧。
+// （同一份判据，不得各写一份——§3.1 ValidateAgentName 注释）。点前缀与 `.staging` /
+// `.backup` 后缀属写路径的残骸保留面（M9），必须拒绝；合法但少见的名字（空格 /
+// 中文 / 井号）必须放行，不得过度收紧。
 // Acceptance point: invalid names are refused by the shared validator, odd ones pass.
 func TestCreateAgent_RejectsInvalidName(t *testing.T) {
 	cases := []struct {
@@ -118,13 +171,16 @@ func TestCreateAgent_RejectsInvalidName(t *testing.T) {
 		{"dot", "."},
 		{"dotdot", ".."},
 		{"nul", "a\x00b"},
+		{"leading_dot", ".hidden"},
+		{"staging_suffix", "a.staging"},
+		{"backup_suffix", "a.backup"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
 			require.Error(t, workspace.ValidateAgentName(tc.name), "校验函数必须拒绝：%q", tc.name)
 
 			root := initWorkspaceRoot(t)
-			created, err := workspace.CreateAgent(root, tc.name, []string{"deepseek"})
+			created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: tc.name}, []string{"deepseek"})
 			require.Error(t, err)
 			require.Empty(t, created)
 			require.Empty(t, dirNames(t, filepath.Join(root, "agents")), "拒绝路径必须零写入")
@@ -132,7 +188,7 @@ func TestCreateAgent_RejectsInvalidName(t *testing.T) {
 	}
 
 	// 合法形态：单个目录名即可——空格 / 中文 / 井号都不是分隔符，不得被过度收紧。
-	for _, name := range []string{"spacey agent", "演示 智能体", "agent#1"} {
+	for _, name := range []string{"spacey agent", "演示 智能体", "agent#1", "agent.staging2"} {
 		require.NoError(t, workspace.ValidateAgentName(name), "合法名字被误拒：%q", name)
 	}
 }
@@ -145,7 +201,7 @@ func TestCreateAgent_EncodesNamesThroughYAML(t *testing.T) {
 	name := "spacey agent"
 	provider := "prov: v2 #1"
 
-	created, err := workspace.CreateAgent(root, name, []string{provider})
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: name}, []string{provider})
 	require.NoError(t, err)
 	require.NotEmpty(t, created)
 
@@ -161,30 +217,49 @@ func TestCreateAgent_EncodesNamesThroughYAML(t *testing.T) {
 	require.Equal(t, provider, entries[0].Profile.Provider.Name)
 }
 
-// 中文验收点：写模式命令被活实例持锁 → 拒绝启动且**零业务写入**（agents/ 一个字节
-// 都没建）；错误是 *LockBusyError 且能读到持有者诊断（诊断在锁定区之外——A10）。
-// 锁文件本身是取锁的副产物，不算业务写入。
-// Acceptance point: a held instance lock refuses creation before any business write.
-func TestCreateAgent_RefusesWhenInstanceLockHeld(t *testing.T) {
+// 中文验收点（H4：唯一取锁者）：目录操作**不取实例锁**——锁的归属是调用方
+// （HTTP 管理请求复用服务已持有的锁；CLI 写路径在端口层取一次）。判据：活实例持锁时
+// 创建照常成功，且锁**仍在本调用方手里**（第二次取锁必须被拒）。
+// Acceptance point: directory creation never touches the instance lock.
+func TestCreateAgent_DoesNotTakeInstanceLock(t *testing.T) {
 	root := initWorkspaceRoot(t)
 
 	lock, err := workspace.AcquireInstanceLock(root)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, lock.Release()) })
 
-	created, err := workspace.CreateAgent(root, "demo-agent", []string{"deepseek"})
-	require.Error(t, err)
-	require.Empty(t, created)
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "demo-agent"}, []string{"deepseek"})
+	require.NoError(t, err, "目录操作不得因外层持锁而失败：锁归调用方")
+	require.NotEmpty(t, created)
+	require.FileExists(t, filepath.Join(root, "agents", "demo-agent", "AGENT.md"))
 
-	var busy *workspace.LockBusyError
-	require.ErrorAs(t, err, &busy)
-	require.Equal(t, os.Getpid(), busy.PID, "拒锁文案必须点名持有者的 pid")
-	require.Contains(t, err.Error(), "pid="+strconv.Itoa(os.Getpid()))
-	require.Empty(t, dirNames(t, filepath.Join(root, "agents")), "拒锁路径必须零业务写入")
+	// 锁仍在调用方手里：再次取锁必须被拒（若目录操作擅自取 / 放锁，这里会漏判）。
+	second, err := workspace.AcquireInstanceLock(root)
+	require.Error(t, err, "实例锁必须仍被本调用方持有")
+	require.Nil(t, second)
 }
 
-// 中文验收点：delete 的语义是**归档**——单次原子移动进 archive/<name>-<时间戳>/，
-// 会话 / 记忆 / 审计数据一个字节都不动（DA §5.14）。
+// 中文验收点（约束 27 / 恢复路径第三态）：`agents/<name>.staging` 已存在 → 拒绝并点名，
+// **不**替运维决定删除；正式目录不得出现，残留一字不动。
+// Acceptance point: a stale staging tree is reported by name, never silently removed.
+func TestCreateAgent_RefusesStagingResidue(t *testing.T) {
+	root := initWorkspaceRoot(t)
+	residue := "半成品占位\n"
+	writeFileInRoot(t, root, filepath.Join("agents", "demo-agent.staging", "AGENT.md"), residue)
+
+	created, err := workspace.CreateAgentStaged(root, core.AgentSpec{Name: "demo-agent"}, []string{"deepseek"})
+	require.Error(t, err)
+	require.Empty(t, created)
+	require.Contains(t, err.Error(), "demo-agent.staging", "必须点名残留目录")
+
+	require.NoDirExists(t, filepath.Join(root, "agents", "demo-agent"), "拒绝路径不得落地正式目录")
+	got, readErr := os.ReadFile(filepath.Join(root, "agents", "demo-agent.staging", "AGENT.md"))
+	require.NoError(t, readErr, "残留目录必须原样保留（是否删除归运维 / 恢复路径判定）")
+	require.Equal(t, residue, string(got))
+}
+
+// 中文验收点：delete 的语义是**归档**——单次原子移动进 archive/<name>-<UTC 时间戳>/，
+// 会话 / 记忆 / 审计数据一个字节都不动（DA §5.14）；返回值携带归档标识与清单。
 // Acceptance point: delete archives the agent directory and leaves every data file intact.
 func TestDeleteAgent_ArchivesWithoutTouchingData(t *testing.T) {
 	root := initWorkspaceRoot(t)
@@ -197,9 +272,11 @@ func TestDeleteAgent_ArchivesWithoutTouchingData(t *testing.T) {
 	writeFileInRoot(t, root, filepath.Join("memory", "MEMORY.md"), memoryData)
 	writeFileInRoot(t, root, filepath.Join("audit", "audit.jsonl"), auditData)
 
-	archived, err := workspace.DeleteAgent(root, "compat-check", archiveNow())
+	result, err := workspace.ArchiveAgentDir(root, "compat-check", archiveNow())
 	require.NoError(t, err)
-	require.Equal(t, "archive/compat-check-"+archiveStamp, archived)
+	require.Equal(t, "compat-check-"+archiveStamp, result.ArchiveID)
+	require.NotEmpty(t, result.ManifestJSON)
+	require.Len(t, result.ContentHash, 64, "content_hash 是裸的 64 位十六进制")
 
 	// 源目录已移出、归档副本内容一致（单次 rename——不是复制 + 删除）。
 	require.NoDirExists(t, filepath.Join(root, "agents", "compat-check"))
@@ -219,14 +296,92 @@ func TestDeleteAgent_ArchivesWithoutTouchingData(t *testing.T) {
 	}
 }
 
+// 中文验收点（约束 32）：归档标识用 **UTC**——注入时刻的时区不影响归档名
+// （+08:00 的 17:30 落成同一 UTC 时刻的 09:30）。
+// Acceptance point: the archive id is formatted in UTC regardless of the injected zone.
+func TestDeleteAgent_UsesUTCStamp(t *testing.T) {
+	root := initWorkspaceRoot(t)
+	writeFileInRoot(t, root, filepath.Join("agents", "compat-check", "AGENT.md"), compatSampleAgentMD)
+
+	local := time.Date(2026, 10, 16, 17, 30, 0, 0, time.FixedZone("UTC+8", 8*3600))
+	result, err := workspace.ArchiveAgentDir(root, "compat-check", local)
+	require.NoError(t, err)
+	require.Equal(t, "compat-check-"+archiveStamp, result.ArchiveID,
+		"归档名必须按 UTC 格式化（+08:00 的 17:30 = UTC 09:30）")
+}
+
+// 中文验收点：归档清单逐字 `[{path,sha256,size}]`、按 path 升序；content_hash 是
+// `path\0sha256\0` 串的 sha256（与技能清单同一规则）——同一内容在两个工作区里必须算出
+// 同一个哈希（路径相对 Agent 根，不带工作区前缀）。
+// Acceptance point: the manifest is path-sorted with per-file hashes and the content
+// hash is recomputable from path+hash alone.
+func TestDeleteAgent_ComputesManifestAndHash(t *testing.T) {
+	build := func(t *testing.T) (root string, files map[string]string) {
+		t.Helper()
+		root = initWorkspaceRoot(t)
+		files = map[string]string{
+			"AGENT.md":               compatSampleAgentMD,
+			"notes/b.md":             "# B\n",
+			"notes/a.txt":            "甲\n",
+			"memory/agents/x/MD.md":  "记忆\n",
+			"skills/digest/SKILL.md": "# skill\n",
+		}
+		for rel, body := range files {
+			writeFileInRoot(t, root, filepath.Join("agents", "compat-check", filepath.FromSlash(rel)), body)
+		}
+		return root, files
+	}
+
+	root, files := build(t)
+	result, err := workspace.ArchiveAgentDir(root, "compat-check", archiveNow())
+	require.NoError(t, err)
+
+	var manifest []struct {
+		Path   string `json:"path"`
+		SHA256 string `json:"sha256"`
+		Size   int64  `json:"size"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(result.ManifestJSON), &manifest))
+	require.Len(t, manifest, len(files))
+
+	// 升序且相对 Agent 根（正斜杠）。
+	require.Equal(t, []string{"AGENT.md", "memory/agents/x/MD.md", "notes/a.txt", "notes/b.md", "skills/digest/SKILL.md"},
+		[]string{manifest[0].Path, manifest[1].Path, manifest[2].Path, manifest[3].Path, manifest[4].Path})
+
+	// 逐文件哈希与大小对得上磁盘内容。
+	for _, entry := range manifest {
+		want := files[entry.Path]
+		sum := sha256.Sum256([]byte(want))
+		require.Equal(t, hex.EncodeToString(sum[:]), entry.SHA256, "%s 的哈希", entry.Path)
+		require.Equal(t, int64(len(want)), entry.Size, "%s 的字节数", entry.Path)
+	}
+
+	// 规整哈希可由清单复算（同一规则的可验证形态）。
+	var canonical strings.Builder
+	for _, entry := range manifest {
+		canonical.WriteString(entry.Path)
+		canonical.WriteByte(0)
+		canonical.WriteString(entry.SHA256)
+		canonical.WriteByte(0)
+	}
+	sum := sha256.Sum256([]byte(canonical.String()))
+	require.Equal(t, hex.EncodeToString(sum[:]), result.ContentHash)
+
+	// 同一内容在另一个工作区里算出同一个哈希（路径相对 Agent 根）。
+	otherRoot, _ := build(t)
+	other, err := workspace.ArchiveAgentDir(otherRoot, "compat-check", archiveNow())
+	require.NoError(t, err)
+	require.Equal(t, result.ContentHash, other.ContentHash, "content_hash 不得随工作区路径漂移")
+}
+
 // 中文验收点：目录不存在 → 拒绝并点名（不是静默成功）；归档目录不得凭空出现（零写入）。
 // Acceptance point: deleting a missing agent fails loudly and writes nothing.
 func TestDeleteAgent_RefusesMissingAgent(t *testing.T) {
 	root := initWorkspaceRoot(t)
 
-	archived, err := workspace.DeleteAgent(root, "ghost-agent", archiveNow())
+	result, err := workspace.ArchiveAgentDir(root, "ghost-agent", archiveNow())
 	require.Error(t, err)
-	require.Empty(t, archived)
+	require.Empty(t, result)
 	require.Contains(t, err.Error(), "ghost-agent")
 	require.Empty(t, dirNames(t, filepath.Join(root, "archive")), "拒绝路径不得创建归档副本")
 }
@@ -234,11 +389,11 @@ func TestDeleteAgent_RefusesMissingAgent(t *testing.T) {
 // 中文验收点：Agent 名非法 → 拒绝且零写入；与 create 同一校验函数（同一表逐条判同一结果）。
 // Acceptance point: the delete path shares the validator with the create path.
 func TestDeleteAgent_RejectsInvalidName(t *testing.T) {
-	for _, name := range []string{"", "a/b", `a\b`, ".", "..", "a\x00b"} {
+	for _, name := range []string{"", "a/b", `a\b`, ".", "..", "a\x00b", ".hidden", "a.staging", "a.backup"} {
 		root := initWorkspaceRoot(t)
-		archived, err := workspace.DeleteAgent(root, name, archiveNow())
+		result, err := workspace.ArchiveAgentDir(root, name, archiveNow())
 		require.Error(t, err, "非法名字必须被拒：%q", name)
-		require.Empty(t, archived)
+		require.Empty(t, result)
 		require.Empty(t, dirNames(t, filepath.Join(root, "archive")), "拒绝路径不得创建归档副本")
 	}
 }
@@ -252,9 +407,9 @@ func TestDeleteAgent_RefusesNonDirectoryEntry(t *testing.T) {
 	notes := "运维随手记的说明\n"
 	writeFileInRoot(t, root, filepath.Join("agents", "notes.txt"), notes)
 
-	archived, err := workspace.DeleteAgent(root, "notes.txt", archiveNow())
+	result, err := workspace.ArchiveAgentDir(root, "notes.txt", archiveNow())
 	require.Error(t, err)
-	require.Empty(t, archived)
+	require.Empty(t, result)
 	require.Contains(t, err.Error(), "notes.txt") // 点名被拒的条目
 	require.Contains(t, err.Error(), "不是目录")
 	require.Empty(t, dirNames(t, filepath.Join(root, "archive")), "拒绝路径不得创建归档副本")
@@ -277,9 +432,9 @@ func TestDeleteAgent_RefusesSymlinkEntry(t *testing.T) {
 		t.Skip("本平台不允许创建符号链接（Windows 需开发者模式或特权）：" + err.Error())
 	}
 
-	archived, err := workspace.DeleteAgent(root, "link-agent", archiveNow())
+	result, err := workspace.ArchiveAgentDir(root, "link-agent", archiveNow())
 	require.Error(t, err)
-	require.Empty(t, archived)
+	require.Empty(t, result)
 	require.Contains(t, err.Error(), "link-agent")
 	require.Contains(t, err.Error(), "不是目录")
 	require.Empty(t, dirNames(t, filepath.Join(root, "archive")), "拒绝路径不得创建归档副本")
@@ -301,19 +456,50 @@ func TestDeleteAgent_RefusesCollidingArchiveTarget(t *testing.T) {
 	previous := "上一份归档副本占位\n"
 	writeFileInRoot(t, root, filepath.Join("archive", "compat-check-"+archiveStamp, "AGENT.md"), previous)
 
-	archived, err := workspace.DeleteAgent(root, "compat-check", archiveNow())
+	result, err := workspace.ArchiveAgentDir(root, "compat-check", archiveNow())
 	require.Error(t, err)
-	require.Empty(t, archived)
+	require.Empty(t, result)
 	require.Contains(t, err.Error(), "compat-check-"+archiveStamp) // 点名撞名目标
 
 	// 源目录及其定义文件原样保留（"先删后移"的实现会在这里判红）。
 	require.DirExists(t, filepath.Join(root, "agents", "compat-check"))
-	got, readErr := os.ReadFile(filepath.Join(root, "agents", "compat-check", "AGENT.md"))
-	require.NoError(t, readErr)
-	require.Equal(t, compatSampleAgentMD, string(got))
+	require.Equal(t, compatSampleAgentMD, agentMDOf(t, root, "compat-check"))
 
 	// 既有归档副本**未被覆盖**。
 	kept, readErr := os.ReadFile(filepath.Join(root, "archive", "compat-check-"+archiveStamp, "AGENT.md"))
 	require.NoError(t, readErr)
 	require.Equal(t, previous, string(kept))
+}
+
+// 中文验收点（约束 49，机器可判）：生命周期状态文件 `control/agents/*.json` 只有
+// **唯一写者** `lifecycle.go`——本包其余生产文件一律不得构造该路径。判卷装置是源码
+// grep：包目录下所有非测试 .go 文件里出现 `control/agents` 或 path 段常量的只有
+// lifecycle.go。测试文件可以出现（夹具建目录），所以只看非测试文件。
+// Acceptance point: lifecycle.go is the only production file that builds the
+// control/agents path; the assertion is a source grep over the package directory.
+func TestLifecycle_SingleWriter(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+
+	// 两个路径段常量与字面路径都算"构造该路径"——换个写法绕开判据同样算第二写者。
+	markers := []string{"controlDirName", "lifecycleAgentsDirName", "control/agents"}
+	var writers []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		raw, err := os.ReadFile(name)
+		require.NoError(t, err)
+		source := string(raw)
+		for _, marker := range markers {
+			if strings.Contains(source, marker) {
+				writers = append(writers, name)
+				break
+			}
+		}
+	}
+
+	require.Equal(t, []string{"lifecycle.go"}, writers,
+		"control/agents 的路径构造只允许出现在 lifecycle.go（唯一写者，约束 49）；命中文件：%v", writers)
 }

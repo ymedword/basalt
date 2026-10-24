@@ -204,9 +204,20 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 渠道仓储只读且与发送路径共用同一实现——页面读到的就是下一发会用的。
 		// Sandbox is a display projection of the configuration; the notify repo is the
 		// very same read face the send path uses.
-		Sandbox:     sandboxConfigView(cfg),
-		Notify:      storage.NewNotifyChannelRepo(rt.db),
+		Sandbox: sandboxConfigView(cfg),
+		// 出网域名白名单的管理端口（R8 裁决 2）：与运行期策略、MCP supervisor 同一批
+		// 实例，保存成功即热生效；`http.allowed_domains` 因此不再只来源于配置投影。
+		// The managed allowlist port is the very instance the live policy uses.
+		NetworkAllowlist: rt.networkAllowlist,
+		// 管理读面 = 发送读面 + 属主名 / 凭据状态 / 条件 ETag 三件事（notify_read.go）。
+		// 写后下一发即可见：两者共用同一个零缓存仓储实例。
+		// The admin read face wraps the very same send-path repository.
+		Notify: newNotifyChannelReadPort(storage.NewNotifyChannelRepo(rt.db), rt.credentials, rt.versions,
+			notifyReadDeps{ConnectionTests: rt.connectionTests}),
 		NotifyTypes: notifyTypeNames(),
+		// 反向引用与删除闸门同源：扫描活动与归档 AGENT.md 的整词提及。
+		// Reverse references share the delete gate's document scan.
+		NotifyReferences: notifyReferencePort{root: rt.root},
 
 		// 管理台产物是编译期常量（go:embed，约束 43）：装配期直接给出，运行时不读磁盘，
 		// 也不依赖 Node——单二进制复制到目标机后页面照常打开。
@@ -214,7 +225,616 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		Console: assets.Console(),
 	}
 	a.wireManagementPorts(&opts, rt)
+	wireWritePorts(&opts, rt)
 	return opts
+}
+
+// writeServices 是 US-12 写面适配器的装配槽：六个字段与 `web` 包的六组消费方接口
+// （ports_admin.go）一一对应。构造任务逐字段填入；本文件只做逐字段投影，空槽保持
+// nil——handler 对缺端口按固定 500 失败关闭，**不得**在装配层换成空实现冒充"可用"。
+// writeServices holds the US-12 write adapters; an empty slot stays nil so a handler
+// fails closed with a fixed 500 instead of pretending the port is assembled.
+type writeServices struct {
+	agentAdmin    web.AgentAdminService
+	resourceAdmin web.ResourceAdminService
+	notifyAdmin   web.NotifyAdminService
+	workspace     web.WorkspaceService
+	agentConfig   web.AgentConfigService
+	resourceState web.ResourceStateService
+}
+
+// wireWritePorts 把运行期的写面适配器逐个投影到 `web.Options`。**刻意不并入
+// wireManagementPorts**：后者在依赖不全时整体提前返回，而六个写面端口彼此独立——
+// 缺一个不影响其余，缺的那个由对应 handler 按 500 拒绝。六个端口与 US-11 的
+// `Options.AgentAdmin`（内容读写与启停）互不替代。
+// wireWritePorts projects each write port independently; it is deliberately separate
+// from wireManagementPorts, whose early return covers a different port family.
+func wireWritePorts(opts *web.Options, rt *heavyRuntime) {
+	if rt == nil {
+		return
+	}
+	opts.AgentAdminService = rt.writeServices.agentAdmin
+	opts.ResourceAdminService = rt.writeServices.resourceAdmin
+	opts.NotifyAdminService = rt.writeServices.notifyAdmin
+	opts.WorkspaceService = rt.writeServices.workspace
+	opts.AgentConfigService = rt.writeServices.agentConfig
+	opts.ResourceStateService = rt.writeServices.resourceState
+}
+
+// agentAdminPort 把 `*AgentAdmin` 适配成 `web.AgentAdminService`（`writeServices.agentAdmin`
+// 的唯一实现，§3.1.8 第 1 个端口）：两处转换只做形状投影、不改语义——`AgentFilesView`
+// 投影成 `web.AgentFileSet`，`AgentDraft` 取出 `[]core.AuthorFile`。作者配置在装配期
+// **一次冻结**（`author:` 段由命令面装载一次），端口自己不读配置、不补默认值；错误一律
+// 原样上抛，分类（412 / 409 / 503 …）与文案映射归 web 层（约束 43）。
+// agentAdminPort adapts the write orchestrator to the web port. Both conversions are
+// shape-only, the author config is frozen at assembly, and errors pass through verbatim.
+type agentAdminPort struct {
+	admin  *AgentAdmin
+	author core.AuthorConfig
+}
+
+// 编译期断言：端口方法一旦与端口形状对不上，在这里先红（与 ports.go 同一纪律）。
+// Compile-time assertion: every method must match the consumer-side port exactly.
+var _ web.AgentAdminService = agentAdminPort{}
+
+// Create 转调创建编排并投影受管文件集合。
+// Create forwards to the create orchestration and projects the managed file set.
+func (p agentAdminPort) Create(ctx context.Context, actor core.Actor, spec core.AgentSpec) (web.AgentFileSet, error) {
+	view, err := p.admin.Create(ctx, actor, spec)
+	if err != nil {
+		return web.AgentFileSet{}, err
+	}
+	return agentFileSet(view), nil
+}
+
+// GenerateFiles 用装配期冻结的作者配置生成内存草稿或澄清问题（不落盘、不注册）。
+// GenerateFiles drafts in memory with the frozen author config; nothing is written.
+func (p agentAdminPort) GenerateFiles(ctx context.Context, name, description string,
+	answers []core.AuthorAnswer,
+) (web.AgentDraftResult, error) {
+	draft, err := p.admin.GenerateFiles(ctx, p.author, name, description, answers)
+	if err != nil {
+		return web.AgentDraftResult{}, err
+	}
+	return web.AgentDraftResult{Agent: draft.Agent, Files: draft.Files, Questions: draft.Questions}, nil
+}
+
+// ScheduleDraft 用装配期冻结的作者配置生成未保存的定时候选与服务端计算的触发时间。
+// ScheduleDraft returns the unsaved candidate and the server-computed triggers.
+func (p agentAdminPort) ScheduleDraft(ctx context.Context, name, instruction string) (web.ScheduleDraftResult, error) {
+	draft, err := p.admin.ScheduleDraft(ctx, p.author, name, instruction)
+	if err != nil {
+		return web.ScheduleDraftResult{}, err
+	}
+	return web.ScheduleDraftResult{Agent: name, Candidate: draft.Candidate, NextRuns: draft.NextRuns}, nil
+}
+
+// Files 转调受管文件读取并投影集合 ETag。
+// Files forwards the managed-file read including the collection ETag.
+func (p agentAdminPort) Files(ctx context.Context, name string) (web.AgentFileSet, error) {
+	view, err := p.admin.Files(ctx, name)
+	if err != nil {
+		return web.AgentFileSet{}, err
+	}
+	return agentFileSet(view), nil
+}
+
+// SubmitFiles 转调条件多文件提交（If-Match 原样传入，不在本层归一化）。
+// SubmitFiles forwards the conditional submit; If-Match stays verbatim.
+func (p agentAdminPort) SubmitFiles(ctx context.Context, actor core.Actor, name, ifMatch string,
+	files []core.AuthorFile,
+) (web.AgentFileSet, error) {
+	view, err := p.admin.SubmitFiles(ctx, actor, name, ifMatch, files)
+	if err != nil {
+		return web.AgentFileSet{}, err
+	}
+	return agentFileSet(view), nil
+}
+
+// Copy 转调复制编排并投影受管文件集合；`resource_mapping` 原样透传（显式映射的
+// 解析归编排层，本层不按名称补映射）。
+// Copy forwards the copy orchestration; the explicit mapping passes through verbatim.
+func (p agentAdminPort) Copy(ctx context.Context, actor core.Actor, source, target string,
+	mapping []core.ResourceMapping,
+) (web.AgentFileSet, error) {
+	view, err := p.admin.Copy(ctx, actor, source, target, mapping)
+	if err != nil {
+		return web.AgentFileSet{}, err
+	}
+	return agentFileSet(view), nil
+}
+
+// Archive 转调归档编排（注销 / 等待 / 回滚矩阵全在编排层，本层不补步骤）。
+// Archive forwards the archive orchestration.
+func (p agentAdminPort) Archive(ctx context.Context, actor core.Actor, name string) (core.AgentArchiveRecord, error) {
+	return p.admin.Archive(ctx, actor, name)
+}
+
+// Restore 转调恢复编排并投影受管文件集合。
+// Restore forwards the restore orchestration.
+func (p agentAdminPort) Restore(ctx context.Context, actor core.Actor, archiveID, target string) (web.AgentFileSet, error) {
+	view, err := p.admin.Restore(ctx, actor, archiveID, target)
+	if err != nil {
+		return web.AgentFileSet{}, err
+	}
+	return agentFileSet(view), nil
+}
+
+// Archived 转调归档列表：CLI 与 HTTP 写下的行同在 `agent_archives` 一张表，本层不区分
+// 写入来源（约束 27 的「CLI 归档在管理台可见」就落在这条读路径上）。
+// Archived forwards the archive list; rows written by the CLI and by HTTP share one table.
+func (p agentAdminPort) Archived(ctx context.Context) ([]core.AgentArchiveRecord, error) {
+	return p.admin.Archived(ctx)
+}
+
+// agentFileSet 是写面视图到 web 端口的形状转换：字段一一对应，不重算 ETag、不重读磁盘。
+// agentFileSet converts the write-surface view into the web port shape without recomputing.
+func agentFileSet(view AgentFilesView) web.AgentFileSet {
+	return web.AgentFileSet{
+		Files: core.AgentFiles{
+			Agent:     view.Agent,
+			Lifecycle: view.Lifecycle,
+			Files:     view.Files,
+		},
+		ETag: view.ETag,
+	}
+}
+
+// resourceAdminPort 把 `*ResourceAdmin` 适配成 `web.ResourceAdminService`（`writeServices.resourceAdmin`
+// 的唯一实现，§3.1.8 第 2 个端口）。全部方法只做形状投影与转调：`Versions`
+// 把版本行补上指针状态与撤回来源（与 `VersionDetail` 同一派生口径，**不**在 web 层
+// 重算），模型连接与 MCP 写入后经只读投影回读一次视图（写后重读，不做乐观更新）；
+// 技能四方法把线上文件草稿投影成作者文件并回投影 `SkillDetail`，校验只转调只读裁决。
+// resourceAdminPort adapts the resource write surface to the web port. Every method
+// is a shape-only forward; skill drafts are projected into author files here.
+type resourceAdminPort struct {
+	admin *ResourceAdmin
+	// read 是 `Options.Resources` 的同一只读投影（同一构造、同一批存储）：写入成功后
+	// 经它回读视图，保证响应与随后 GET 读到的是同一口径。
+	// read is the same stateless read projection used by Options.Resources.
+	read web.ResourceReader
+}
+
+// 编译期断言：13 个方法一旦与端口形状对不上，在这里先红（与 agentAdminPort 同一纪律）。
+// Compile-time assertion: all thirteen methods must match the consumer-side port.
+var _ web.ResourceAdminService = resourceAdminPort{}
+
+// UpsertModelConnection 把线上请求投影成编排层请求：空 `ifMatch` 表示创建（POST），
+// 非空表示条件修改（PUT）；发布成功后按资源标识回读一次发布视图。
+// UpsertModelConnection maps the wire body to the orchestration request; an empty
+// ifMatch means create, and the published view is re-read afterwards.
+func (p resourceAdminPort) UpsertModelConnection(ctx context.Context, actor core.Actor,
+	write web.ModelConnectionWrite, ifMatch string,
+) (web.ModelConnectionView, error) {
+	req := ModelConnectionRequest{
+		Name:           write.Name,
+		BaseURL:        write.BaseURL,
+		DefaultModel:   write.DefaultModel,
+		Create:         ifMatch == "",
+		IfMatch:        ifMatch,
+		CredentialMode: write.CredentialMode,
+		Scope:          write.Scope,
+		OwnerAgent:     write.OwnerAgent,
+	}
+	// 字段省略（指针 nil）= 保留；出现即原样下传，"空串既不是保留也不是清除"由编排层判。
+	if write.APIKey != nil {
+		req.APIKey = *write.APIKey
+		req.APIKeySet = true
+	}
+	version, err := p.admin.UpsertModelConnection(ctx, actor, req)
+	if err != nil {
+		return web.ModelConnectionView{}, err
+	}
+	return p.read.ModelConnection(ctx, version.ResourceID)
+}
+
+// UpsertMCPServer 与模型连接同一形状：空 `ifMatch` 表示创建，非空表示条件修改；
+// 发布成功后按资源标识回读一次视图。回读走详情投影并只取 `View`——写响应与随后
+// `GET /mcp-servers/{name}` 的响应体同形（ETag 只走响应头）。
+// UpsertMCPServer follows the model-connection shape; the detail projection is re-read
+// after the publish and only its view is returned, so the body matches the GET.
+func (p resourceAdminPort) UpsertMCPServer(ctx context.Context, actor core.Actor,
+	write web.MCPServerWrite, ifMatch string,
+) (web.McpServerView, error) {
+	version, err := p.admin.UpsertMCPServer(ctx, actor, MCPServerRequest{
+		Name:      write.Name,
+		Transport: write.Transport,
+		Command:   write.Command,
+		Args:      write.Args,
+		URL:       write.URL,
+		Env:       write.Env,
+		Create:    ifMatch == "",
+		IfMatch:   ifMatch,
+	})
+	if err != nil {
+		return web.McpServerView{}, err
+	}
+	detail, err := p.read.McpServer(ctx, version.ResourceID)
+	if err != nil {
+		return web.McpServerView{}, err
+	}
+	return detail.View, nil
+}
+
+// skillFilesFromDrafts 把线上文件草稿投影成作者文件：路径与正文逐字保留，边界
+// （相对路径、隐藏段、大小、数量、大小写重复）由工作空间的同一校验函数裁决。
+// skillFilesFromDrafts projects wire drafts verbatim; the workspace gate decides
+// every boundary.
+func skillFilesFromDrafts(drafts []web.FileDraftWrite) []core.AuthorFile {
+	files := make([]core.AuthorFile, len(drafts))
+	for i, draft := range drafts {
+		files[i] = core.AuthorFile{Path: draft.Path, Content: draft.Content}
+	}
+	return files
+}
+
+// skillDetailView 把编排层的写结果投影成契约 `SkillDetail`：文件清单给出路径 /
+// 字节数 / sha256 / 正文，`file_count` 取清单长度（与只读面同一派生口径，不在 web
+// 层重算哈希或 ETag）。
+// skillDetailView projects the write result into the contract shape; file_count is
+// the manifest length and nothing is recomputed here.
+func skillDetailView(detail SkillDetail) web.SkillDetailView {
+	files := make([]web.SkillFileView, len(detail.Files))
+	for i, file := range detail.Files {
+		files[i] = web.SkillFileView{
+			Path:    file.Path,
+			Size:    file.Size,
+			SHA256:  file.SHA256,
+			Content: string(file.Content),
+		}
+	}
+	return web.SkillDetailView{
+		SkillView: web.SkillView{
+			Name:         detail.Name,
+			Description:  detail.Description,
+			Path:         detail.Path,
+			VersionID:    detail.VersionID,
+			VersionNo:    detail.VersionNo,
+			ContentHash:  detail.ContentHash,
+			ETag:         detail.ETag,
+			FileCount:    len(detail.Files),
+			ReferencedBy: detail.ReferencedBy,
+		},
+		Files: files,
+	}
+}
+
+// CreateSkill 转调骨架创建（最小 SKILL.md 由编排层渲染，不信任调用方正文）。
+// CreateSkill forwards skeleton creation; the orchestration renders the card.
+func (p resourceAdminPort) CreateSkill(ctx context.Context, actor core.Actor,
+	write web.SkillCreateWrite,
+) (web.SkillDetailView, error) {
+	detail, err := p.admin.CreateSkill(ctx, actor, SkillCreateRequest{
+		Name:        write.Name,
+		Description: write.Description,
+	})
+	if err != nil {
+		return web.SkillDetailView{}, err
+	}
+	return skillDetailView(detail), nil
+}
+
+// ImportSkill 转调目录导入（文件集合原样交边界校验）。
+// ImportSkill forwards the directory import; the file set stays verbatim.
+func (p resourceAdminPort) ImportSkill(ctx context.Context, actor core.Actor,
+	write web.SkillImportWrite,
+) (web.SkillDetailView, error) {
+	detail, err := p.admin.ImportSkill(ctx, actor, SkillImportRequest{
+		Name:  write.Name,
+		Files: skillFilesFromDrafts(write.Files),
+	})
+	if err != nil {
+		return web.SkillDetailView{}, err
+	}
+	return skillDetailView(detail), nil
+}
+
+// UpdateSkill 转调全量替换：名字取路径、If-Match 逐字传入（缺失由编排层按 412 拒绝）。
+// UpdateSkill forwards the full replacement; name and If-Match stay verbatim.
+func (p resourceAdminPort) UpdateSkill(ctx context.Context, actor core.Actor, name string,
+	write web.SkillUpdateWrite, ifMatch string,
+) (web.SkillDetailView, error) {
+	detail, err := p.admin.UpdateSkill(ctx, actor, SkillUpdateRequest{
+		Name:    name,
+		Files:   skillFilesFromDrafts(write.Files),
+		IfMatch: ifMatch,
+	})
+	if err != nil {
+		return web.SkillDetailView{}, err
+	}
+	return skillDetailView(detail), nil
+}
+
+// ValidateSkill 转调只读校验：与导入共用同一校验函数，不落盘、不写操作行、不执行脚本。
+// ValidateSkill forwards the read-only validation sharing the import gate.
+func (p resourceAdminPort) ValidateSkill(ctx context.Context, name string,
+	write web.SkillUpdateWrite,
+) (core.SkillValidateResult, error) {
+	return p.admin.ValidateSkill(ctx, name, SkillUpdateRequest{
+		Name:  name,
+		Files: skillFilesFromDrafts(write.Files),
+	})
+}
+
+// Delete 转调删除编排：引用闸门、块移除与事务都在编排层，本层不补步骤。
+// Delete forwards to the orchestration; the gate and transaction stay there.
+func (p resourceAdminPort) Delete(ctx context.Context, actor core.Actor, kind core.ResourceKind, id, ifMatch,
+	resourceUID string,
+) error {
+	return p.admin.Delete(ctx, actor, kind, id, ifMatch, resourceUID)
+}
+
+// Publish 转调发布编排（发布最新 / 显式撤回两种语义都在编排层）。
+// Publish forwards the publish orchestration, including explicit revert.
+func (p resourceAdminPort) Publish(ctx context.Context, actor core.Actor,
+	req core.ResourcePublishRequest,
+) (core.ResourcePublishResult, error) {
+	return p.admin.Publish(ctx, actor, req)
+}
+
+// CurrentETag 转调条件 ETag 的唯一服务端读取点（形状级 412 用它给出当前值）。
+// CurrentETag forwards the single server-side conditional-ETag reader.
+func (p resourceAdminPort) CurrentETag(ctx context.Context, kind core.ResourceKind, id string) (string, bool) {
+	return p.admin.CurrentETag(ctx, kind, id)
+}
+
+// Versions 返回带指针状态与撤回来源的版本列表（与 `VersionDetail` 同一派生口径）。
+// Versions returns the version list with the same derived fields as VersionDetail.
+func (p resourceAdminPort) Versions(ctx context.Context, kind core.ResourceKind, id string) ([]core.ResourceVersionDetail, error) {
+	return p.admin.versionDetails(ctx, kind, id)
+}
+
+// VersionDetail 转调只读版本详情（脱敏与 fail-closed 在编排层完成）。
+// VersionDetail forwards the read-only detail; redaction already happened upstream.
+func (p resourceAdminPort) VersionDetail(ctx context.Context, versionID int64) (core.ResourceVersionDetail, error) {
+	return p.admin.VersionDetail(ctx, versionID)
+}
+
+// References 转调引用联合视图（活动 Agent 快照 + 归档扫描 + 未释放运行引用）。
+// References forwards the reference union view.
+func (p resourceAdminPort) References(ctx context.Context, kind core.ResourceKind, id string) (core.ResourceReferences, error) {
+	return p.admin.References(ctx, kind, id)
+}
+
+// TestModelConnection 转调一次性连接测试（不建 Run、不换运行时映射）。
+// TestModelConnection forwards the one-shot connection test.
+func (p resourceAdminPort) TestModelConnection(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error) {
+	return p.admin.TestModelConnection(ctx, actor, name)
+}
+
+// TestMCPServer 转调一次性连接测试（按已发布版本、不建 Run、不写 llm_calls）。
+// TestMCPServer forwards the one-shot connection test against the published version.
+func (p resourceAdminPort) TestMCPServer(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error) {
+	return p.admin.TestMCPServer(ctx, actor, name)
+}
+
+// notifyAdminPort 把 `*NotifyAdmin` 适配成 `web.NotifyAdminService`（`writeServices.notifyAdmin`
+// 的唯一实现，§3.1.8 第 3 个端口）：三个方法只做形状投影与转调——请求投影成
+// `NotifyChannelRequest`，成功后回传**存储行**并经管理读面补齐（见 `echo`），URL 保持
+// **库里原样值**（精确 `${VAR}` 占位或空串）；解析后的地址不进入本层，host 投影仍只在
+// web 层 `notifyChannelView` 做一次（约束 38 的凭证红线）。错误一律原样上抛，分类与
+// 文案映射归 web 层（约束 43）。
+// notifyAdminPort adapts the channel write surface to the web port: the request maps to
+// NotifyChannelRequest, and the success echo is the stored row enriched by the admin read
+// face — the host projection stays in web.
+type notifyAdminPort struct {
+	admin *NotifyAdmin
+	// read 是写后回显用的管理读面：补凭据状态 / 属主名 / 条件 ETag。写成功后它读失败
+	// **不得**把写入说成失败——退回编排层已回读的行（缺 ETag，页面随后重新 GET）。
+	// read enriches the post-write echo; a read failure never turns a successful write
+	// into an error.
+	read *notifyChannelReadPort
+}
+
+// 编译期断言：三方法一旦与端口形状对不上，在这里先红（与其余三个端口同一纪律）。
+// Compile-time assertion: all three methods must match the consumer-side port.
+var _ web.NotifyAdminService = notifyAdminPort{}
+
+// Create 转调创建编排；同名 400、占位与白名单预检都在编排层完成。
+// Create forwards to the create orchestration; duplicate-name 400s and placeholder
+// checks stay upstream.
+func (p notifyAdminPort) Create(ctx context.Context, actor core.Actor,
+	write web.NotifyChannelWrite,
+) (core.NotifyChannel, error) {
+	stored, err := p.admin.Create(ctx, actor, notifyChannelRequest(write))
+	if err != nil {
+		return core.NotifyChannel{}, err
+	}
+	return p.echo(ctx, stored), nil
+}
+
+// Update 转调更新编排：空 `url` 原样下传，是否保留原值由编排层在写前解释；
+// 成功后的回显同样走 `echo`。
+// Update forwards the update; a blank url stays verbatim and the echo uses the same path.
+func (p notifyAdminPort) Update(ctx context.Context, actor core.Actor, name string,
+	write web.NotifyChannelWrite,
+) (core.NotifyChannel, error) {
+	stored, err := p.admin.Update(ctx, actor, name, notifyChannelRequest(write))
+	if err != nil {
+		return core.NotifyChannel{}, err
+	}
+	return p.echo(ctx, stored), nil
+}
+
+// Delete 转调整词引用闸门后的删除（`force` 由 web 层按字面量解析后传入，
+// `resourceUID` 原样下传，由编排层在预写前与当前指针比较）。
+// Delete forwards the delete gate; force was parsed in web and resourceUID is
+// compared against the current pointer in the adapter.
+func (p notifyAdminPort) Delete(ctx context.Context, actor core.Actor, name, resourceUID string, force bool) error {
+	return p.admin.Delete(ctx, actor, name, resourceUID, force)
+}
+
+// TestChannel 转调渠道连通性测试：预写管理操作、真实发送与三值结果都在编排层，
+// 本层只透传；测试结果同时写「最后测试」投影，列表页随后即可读到。
+// TestChannel forwards to the connectivity test; the pre-write, the real send and the
+// last-test projection all stay in the orchestrator.
+func (p notifyAdminPort) TestChannel(ctx context.Context, actor core.Actor,
+	name string,
+) (core.NotifyChannelTestResult, error) {
+	return p.admin.TestChannel(ctx, actor, name)
+}
+
+// notifyChannelRequest 把线上请求投影成编排层请求：字段逐字保留，名称 / 类型 / 占位
+// 的合法性与默认停用语义都由编排层裁决。`url` 省略（指针 nil）= 保留原值，出现即
+// 原样下传（空串 → 编排层 400）。
+// notifyChannelRequest projects the wire body field by field; validation stays upstream.
+func notifyChannelRequest(write web.NotifyChannelWrite) NotifyChannelRequest {
+	req := NotifyChannelRequest{
+		Name:           write.Name,
+		Type:           write.Type,
+		Description:    write.Description,
+		CredentialMode: write.CredentialMode,
+		Scope:          write.Scope,
+		OwnerAgent:     write.OwnerAgent,
+	}
+	if write.URL != nil {
+		req.URL = *write.URL
+		req.URLSet = true
+	}
+	return req
+}
+
+// echo 是写成功后的回显：管理读面补齐属主名 / 凭据状态 / 条件 ETag，页面拿到的字段与
+// 随后 GET 完全一致。读面失败**只记日志**并退回编排层已回读的存储行（缺 ETag）——
+// 写入已生效，把读失败说成写失败会让页面重试一次已经成功的创建（触发同名 400）。
+// echo enriches a successful write's stored row; a read failure is logged and falls back
+// to the stored row so a committed write is never reported as failed.
+func (p notifyAdminPort) echo(ctx context.Context, stored core.NotifyChannel) core.NotifyChannel {
+	if p.read == nil {
+		return stored
+	}
+	enriched, err := p.read.Channel(ctx, stored.Name)
+	if err != nil {
+		p.admin.logger.Error("通知渠道写后补齐失败（写入已生效）",
+			"channel", stored.Name, "error", err)
+		return stored
+	}
+	return enriched
+}
+
+// resourceStatePort 把 `*ResourceStateService` 适配成 `web.ResourceStateService`
+// （`writeServices.resourceState` 的唯一实现）：三个方法只做形状投影——线上请求体
+// 投影成领域命令、领域结论投影成契约视图。`credential_state` 在成功路径上恒为
+// `revoked`（撤销端点只会在撤销成功后返回）；`affected_eligible_agents` 在这里
+// 兜底成非 nil，保证契约数组形状。身份 / ETag 比较、预写与终态回填都在编排层，
+// 本适配器不重做校验；错误一律原样上抛，分类与文案映射归 web 层（约束 43）。
+// resourceStatePort adapts the state orchestrator to the web port. It only projects
+// shapes: the wire body becomes a command, the outcome becomes a contract view.
+type resourceStatePort struct {
+	state *ResourceStateService
+}
+
+// 编译期断言：三方法一旦与端口形状对不上，在这里先红（与其余端口同一纪律）。
+// Compile-time assertion: all three methods must match the consumer-side port.
+var _ web.ResourceStateService = resourceStatePort{}
+
+// CurrentETag 转调条件 ETag 的只读解析（形状级 412 的 `data.current_etag`）。
+// CurrentETag forwards the read-only conditional ETag lookup.
+func (p resourceStatePort) CurrentETag(ctx context.Context, kind, name string) (string, bool) {
+	return p.state.CurrentETag(ctx, kind, name)
+}
+
+// RevokeCredential 转调撤销编排并投影契约结果：`credential_ref` 是服务端生成的
+// 凭据身份引用（不是凭据材料），`revoked_versions` 是撤销后的全部版本数。
+// RevokeCredential forwards the revoke and projects the contract result.
+func (p resourceStatePort) RevokeCredential(ctx context.Context, actor core.Actor,
+	kind, name string, write web.CredentialRevokeWrite, ifMatch string,
+) (web.CredentialRevokeView, error) {
+	out, err := p.state.RevokeCredential(ctx, actor, CredentialRevokeCommand{
+		Kind:        kind,
+		Name:        name,
+		ResourceUID: write.ResourceUID,
+		Confirm:     write.Confirm,
+		IfMatch:     ifMatch,
+	})
+	if err != nil {
+		return web.CredentialRevokeView{}, err
+	}
+	return web.CredentialRevokeView{
+		ResourceUID:     string(out.ResourceUID),
+		CredentialRef:   out.CredentialID,
+		CredentialState: string(core.CredentialIdentityRevoked),
+		RevokedVersions: out.RevokedVersions,
+		RevocationEpoch: out.RevocationEpoch,
+		ETag:            out.ETag,
+	}, nil
+}
+
+// ConvertScope 转调范围切换编排并投影契约结果：`etag` 同时进响应体与响应头；
+// `affected_eligible_agents` 空集合也输出 `[]`。
+// ConvertScope forwards the conversion; an empty impact hint still renders as [].
+func (p resourceStatePort) ConvertScope(ctx context.Context, actor core.Actor,
+	kind, name string, write web.ResourceScopeWrite, ifMatch string,
+) (web.ResourceScopeView, error) {
+	out, err := p.state.ConvertScope(ctx, actor, ResourceScopeCommand{
+		Kind:        kind,
+		Name:        name,
+		ResourceUID: write.ResourceUID,
+		Scope:       write.Scope,
+		OwnerAgent:  write.OwnerAgent,
+		IfMatch:     ifMatch,
+	})
+	if err != nil {
+		return web.ResourceScopeView{}, err
+	}
+	affected := out.AffectedEligibleAgents
+	if affected == nil {
+		affected = []string{}
+	}
+	return web.ResourceScopeView{
+		ResourceUID:            string(out.ResourceUID),
+		Scope:                  string(out.Scope),
+		OwnerAgent:             out.OwnerAgent,
+		Revision:               out.Revision,
+		ETag:                   out.ETag,
+		AffectedEligibleAgents: affected,
+	}, nil
+}
+
+// workspaceBrowsePort 把 `*WorkspaceBrowse` 适配成 `web.WorkspaceService`
+// （`writeServices.workspace` 的唯一实现，§3.1.8 第 4 个端口）：两个方法只做形状
+// 投影——领域条目投影成契约视图，`truncated` 恒 false（超限是错误、不是截断）。
+// 路径规则、真实路径投影、残骸隐藏与 256 KiB 上限都在 `WorkspaceBrowse` 里，
+// 本适配器不重做校验；错误一律原样上抛，分类与文案映射归 web 层（约束 43）。
+// 名字带 Browse 以区别于 `ports.go` 里适配 `cli.Workspace` 的 `workspacePort`。
+// workspaceBrowsePort adapts the read-only browser to the web port. Both conversions
+// are shape-only: truncated is always false because oversized files fail instead of cut.
+type workspaceBrowsePort struct {
+	browse *WorkspaceBrowse
+}
+
+// 编译期断言：两方法一旦与端口形状对不上，在这里先红（与其余三个端口同一纪律）。
+// Compile-time assertion: both methods must match the consumer-side port.
+var _ web.WorkspaceService = workspaceBrowsePort{}
+
+// Tree 转调目录树并投影条目：路径原样下传，空树保持 nil（web 层用
+// `nonNilWorkspaceTree` 输出 `[]`）。
+// Tree forwards the tree request and projects the entries verbatim.
+func (p workspaceBrowsePort) Tree(ctx context.Context, path string) (web.WorkspaceTreeView, error) {
+	entries, err := p.browse.Tree(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	views := make(web.WorkspaceTreeView, len(entries))
+	for i, entry := range entries {
+		views[i] = web.WorkspaceEntryView{Path: entry.Path, Type: entry.Type, Size: entry.Size}
+	}
+	return views, nil
+}
+
+// File 转调单文件预览；`truncated` 由契约固定 false。
+// File forwards one preview; the contract fixes truncated at false.
+func (p workspaceBrowsePort) File(ctx context.Context, path string) (web.WorkspaceFileView, error) {
+	file, err := p.browse.File(ctx, path)
+	if err != nil {
+		return web.WorkspaceFileView{}, err
+	}
+	return web.WorkspaceFileView{
+		Path:      file.Path,
+		Content:   file.Content,
+		Size:      file.Size,
+		Truncated: false,
+	}, nil
 }
 
 // wireManagementPorts 装配管理面七个端口（模块卡 §3.1.15 的 webOptions 行）：Registry /
@@ -236,7 +856,8 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		opts.Operations = rt.ops
 	}
 	if rt.versions != nil && rt.lifecycle != nil {
-		opts.Resources = NewResourceViews(rt.versions, rt.lifecycle, rt.mcpRT)
+		opts.Resources = NewResourceViews(rt.versions, rt.lifecycle, rt.mcpRT, rt.credentials,
+			ResourceViewDeps{ConnectionTests: rt.connectionTests})
 	}
 	if rt.db != nil && rt.runs != nil && rt.versions != nil {
 		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, a.nowOr())
@@ -268,9 +889,25 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		Validate: func(_ context.Context, agent string, candidate []byte) (core.AgentEntry, string, []core.ManifestEntry, error) {
 			return rt.loader.ValidateCandidate(rt.root, rt.agents.Entries(), agent, candidate, now())
 		},
-		Now: now,
+		// 保存期绑定校验（卡 R4.3 的校验顺序：校验引用与绑定 → 原子写文件）：装载期
+		// 只保证结构，资源状态在仓储里，因此由装配层注入与准入**同一份**实现。
+		// The save-time binding check reuses the admission implementation.
+		ValidateBindings: SaveBindingCheck(rt.lifecycle, BindingCheckDeps{
+			Resources:      rt.versions,
+			Notify:         rt.notifyAdminStore,
+			NotifyChannels: storage.NewNotifyChannelRepo(rt.db),
+			Credentials:    rt.resolver,
+		}),
+		// 受控工具装配（R7 / 宪法约束 11）：与准入读同一份渠道目录与同一份生命周期
+		// 状态文件；系统只会增删 `notify`，且变更随保存结果回显。
+		// The controlled tool assembly reads the same catalog and lifecycle store the
+		// admission path uses; notify is the only name it may change.
+		AssembleTools: assembleNotifyToolsFor(rt),
+		Now:           now,
 	})
 	opts.AgentAdmin = NewAgentConsole(AgentConsoleDeps{
+		Root:       rt.root,
+		Projection: rt.projection,
 		Editor:     editor,
 		Lifecycle:  rt.lifecycle,
 		Index:      rt.versions,

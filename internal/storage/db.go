@@ -289,11 +289,50 @@ func inspectSchema(ctx context.Context, q queryer, target int) (schemaState, int
 // The lock and every statement of the transaction share one pinned connection;
 // IMMEDIATE (not DEFERRED) closes the window between judging and writing.
 func withWriteLock(ctx context.Context, db *sql.DB, fn func(context.Context, *sql.Conn) error) (err error) {
+	return withWriteLockOptions(ctx, db, writeLockOptions{}, fn)
+}
+
+// writeLockOptions 是写锁事务的可选行为，目前只服务迁移（表重建 + 外键校验）。
+// writeLockOptions carries optional migration-only behaviour.
+type writeLockOptions struct {
+	// foreignKeysOff 在 BEGIN **之前**关闭外键（PRAGMA foreign_keys 是连接级设置，
+	// 事务内设置无效），提交或回滚之后恢复为 ON——连接随后归还池，OFF 不得泄漏给
+	// 后续写入（迁移纪律 8：重建只允许在未发布迁移里，且只在关外键时做）。
+	// The pragma is connection-scoped and inert inside a transaction, so it is
+	// toggled around the transaction and restored before the connection returns.
+	foreignKeysOff bool
+	// preCommit 在提交前执行；返回错误即回滚（迁移把 PRAGMA foreign_key_check
+	// 挂在这里——校验不过不得提交）。
+	// preCommit runs before COMMIT; an error rolls the whole transaction back.
+	preCommit func(context.Context, *sql.Conn) error
+}
+
+// withWriteLockOptions 是 withWriteLock 的实现形态，接受迁移专用选项。
+// withWriteLockOptions is the option-carrying implementation of withWriteLock.
+func withWriteLockOptions(ctx context.Context, db *sql.DB, opts writeLockOptions, fn func(context.Context, *sql.Conn) error) (err error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("获取写连接: %w", err)
 	}
 	defer conn.Close()
+
+	if opts.foreignKeysOff {
+		// 先读原值再关：恢复的是**调用前**的状态（生产 DSN 为 ON，裸测试库默认
+		// OFF），不得把某种设定强加给连接的下一个使用者。
+		var previous int
+		if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&previous); err != nil {
+			return fmt.Errorf("读取外键约束状态: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+			return fmt.Errorf("关闭外键约束: %w", err)
+		}
+		defer func() {
+			restore := fmt.Sprintf("PRAGMA foreign_keys=%d", previous)
+			if _, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), restore); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("恢复外键约束: %w", restoreErr))
+			}
+		}()
+	}
 
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("取得写权（BEGIN IMMEDIATE）: %w", err)
@@ -312,6 +351,11 @@ func withWriteLock(ctx context.Context, db *sql.DB, fn func(context.Context, *sq
 
 	if fnErr := fn(ctx, conn); fnErr != nil {
 		return fnErr
+	}
+	if opts.preCommit != nil {
+		if checkErr := opts.preCommit(ctx, conn); checkErr != nil {
+			return checkErr
+		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return fmt.Errorf("提交事务: %w", err)

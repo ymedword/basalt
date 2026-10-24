@@ -92,9 +92,14 @@ func (s *Server) transitionAgent(w http.ResponseWriter, r *http.Request, actor c
 		if reason == "" {
 			reason = enableRejectedReason
 		}
-		s.logger().Warn("启用被拒：加载期校验或资源引用未通过", "agent", name, "reason", reason)
+		s.logger().Warn("enable refused: load-time validation or resource references failed",
+			"agent", name, "reason", reason)
+		message := enableRejectedReason
+		if entry.RejectKind != "" {
+			message = entryRejectMessage(entry)
+		}
 		s.writeError(w, http.StatusConflict, codeAgentUnavailable,
-			fmt.Sprintf("Agent %s 当前不可启用（%s）", name, reason))
+			fmt.Sprintf("Agent「%s」当前不可启用：%s", name, message))
 		return
 	}
 	if target == core.AgentActive {
@@ -105,9 +110,12 @@ func (s *Server) transitionAgent(w http.ResponseWriter, r *http.Request, actor c
 		// Requirement 16: enable re-checks that every referenced resource still has a
 		// published version; an unreadable index fails closed the same way.
 		if reason := s.enableResourceRejection(r.Context(), entry); reason != "" {
-			s.logger().Warn("启用被拒：资源引用无已发布版本", "agent", name, "reason", reason)
+			// 该拒绝由本层自产中文（资源视图不可确认 / 点名缺版资源），不再经映射。
+			// The refusal text is authored Chinese at this layer.
+			s.logger().Warn("enable refused: referenced resources have no published version",
+				"agent", name, "reason", reason)
 			s.writeError(w, http.StatusConflict, codeAgentUnavailable,
-				fmt.Sprintf("Agent %s 当前不可启用（%s）", name, reason))
+				fmt.Sprintf("Agent「%s」当前不可启用：%s", name, reason))
 			return
 		}
 	}
@@ -225,11 +233,16 @@ func (s *Server) writeLifecycleError(w http.ResponseWriter, err error, agent str
 	}
 	var unavailableErr *core.AgentUnavailableError
 	if errors.As(err, &unavailableErr) {
-		s.writeError(w, http.StatusConflict, codeAgentUnavailable, unavailableErr.Error())
+		// 中文按 Kind 投影（errors_zh.go）；英文 Reason 只进日志。
+		// The Chinese copy comes from the Kind projection; English stays in the log.
+		s.writeError(w, http.StatusConflict, codeAgentUnavailable, agentUnavailableMessage(unavailableErr))
 		return
 	}
 	if errors.Is(err, core.ErrLifecycleConflict) {
-		s.writeError(w, http.StatusConflict, codeConflict, err.Error())
+		// 期望不符与「已在目标态」同一条中文；英文哨兵只进日志。
+		// Both conflict paths share one Chinese message; the sentinel stays in the log.
+		s.logger().Warn("agent lifecycle transition conflict", "agent", agent, "error", err)
+		s.writeError(w, http.StatusConflict, codeConflict, lifecycleConflictMessage(agent))
 		return
 	}
 	s.logger().Error("Agent 启停失败", "agent", agent, "target", string(target), "error", err)

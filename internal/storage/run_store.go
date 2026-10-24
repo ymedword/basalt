@@ -102,19 +102,117 @@ func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest co
 		return fmt.Errorf("预写运行资源清单（run_id=%s）: %w", rec.RunID, err)
 	}
 	for _, ref := range refs {
+		// `resource_id` 是名称快照，`resource_uid` 是身份：引用闸门与"同名重建后旧
+		// 引用不误伤新实例"都只认后者，两者一起落库才能事后核对当时的名称。
+		// The name is a snapshot; the uid is the identity the delete gate trusts.
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO run_resource_refs
-			   (run_id, resource_kind, resource_id, version_id, content_hash, released_at)
-			 VALUES (?, ?, ?, ?, ?, NULL)`,
-			rec.RunID, string(ref.kind), ref.ref.Name, ref.ref.VersionID, ref.ref.ContentHash); err != nil {
+			   (run_id, resource_kind, resource_id, resource_uid, resource_name,
+			    version_id, content_hash, released_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+			rec.RunID, string(ref.kind), ref.ref.Name, string(ref.ref.ResourceUID),
+			ref.ref.Name, ref.ref.VersionID, ref.ref.ContentHash); err != nil {
 			return fmt.Errorf("预写运行资源引用（run_id=%s, %s/%s）: %w",
 				rec.RunID, ref.kind, ref.ref.Name, err)
+		}
+	}
+	// 凭据版本与通知渠道集合在**同一事务**里冻结：Run 行、版本引用与"用哪版 Key"
+	// 若分两次提交，崩在中间就会出现"有 Run 没固定凭据"的账。
+	// Credential pins and the notify channel set are frozen in the same transaction.
+	if pin, ok := manifestCredentialPin(rec.RunID, manifest); ok {
+		if err := insertRunCredentialRefTx(ctx, tx, pin); err != nil {
+			return fmt.Errorf("预写运行凭据固定（run_id=%s）: %w", rec.RunID, err)
+		}
+	}
+	for _, ref := range manifestNotifyRefs(rec.RunID, manifest) {
+		if err := insertRunNotifyRefTx(ctx, tx, ref); err != nil {
+			return fmt.Errorf("预写运行通知冻结（run_id=%s）: %w", rec.RunID, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("预写运行账本（run_id=%s）: 提交: %w", rec.RunID, err)
 	}
 	return nil
+}
+
+// validateManifestCredentialPin 校验清单里的凭据固定形状：托管模式三项齐备且合法，
+// env 模式三项全空。混合形态（有 id 没版本、有版本没 id）一律拒绝——它会让冻结行
+// 与清单各说一半。
+// validateManifestCredentialPin checks that the pin is coherent before it is frozen.
+func validateManifestCredentialPin(provider core.ProviderVersionRef) error {
+	// 目标绑定两种模式**都要**：它记的是规范化目标地址的哈希，是运行期复核的锚点，
+	// 不是凭据材料——env 模式同样有地址。
+	// The target binding is required in both modes; it hashes the target address, it is
+	// not credential material.
+	if !isSHA256Hex(provider.TargetBinding) {
+		return fmt.Errorf("资源清单的 %s 目标绑定哈希非法：必须是 64 位小写十六进制", provider.Name)
+	}
+	if provider.CredentialID == "" {
+		if provider.CredentialVersion != 0 {
+			return fmt.Errorf("资源清单的 %s 凭据固定不完整：env 模式不得带凭据版本", provider.Name)
+		}
+		return nil
+	}
+	if err := core.ValidateCredentialID(provider.CredentialID); err != nil {
+		return fmt.Errorf("资源清单的 %s 凭据引用非法: %w", provider.Name, err)
+	}
+	if provider.CredentialVersion < 1 {
+		return fmt.Errorf("资源清单的 %s 凭据版本非法（%d）", provider.Name, provider.CredentialVersion)
+	}
+	return nil
+}
+
+// sha256HexSize 是小写十六进制 sha256 的长度（与 core 的 `target_binding` 同形）。
+// sha256HexSize is the length of a lowercase hex sha256, matching core's target binding.
+const sha256HexSize = 64
+
+// isSHA256Hex 判定 64 位小写十六进制（sha256 的十六进制形态）。
+// isSHA256Hex reports whether the value is a 64-char lowercase hex digest.
+func isSHA256Hex(value string) bool {
+	if len(value) != sha256HexSize {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// manifestCredentialPin 把清单里的托管凭据固定摊平成 `run_credential_refs` 行；
+// env 模式（`CredentialID` 为空）**不写行**——env 没有凭据身份，凭空造一个 id 只会
+// 让审计里出现查不到的引用。
+// manifestCredentialPin yields the pin row, or ok=false for env mode.
+func manifestCredentialPin(runID string, manifest core.RunResourceManifest) (core.RunCredentialRef, bool) {
+	provider := manifest.Provider
+	if provider.CredentialID == "" {
+		return core.RunCredentialRef{}, false
+	}
+	return core.RunCredentialRef{
+		RunID:             runID,
+		CredentialID:      provider.CredentialID,
+		CredentialVersion: provider.CredentialVersion,
+		ResourceKind:      core.BindingModelConnection,
+		ResourceUID:       provider.ResourceUID,
+		ResourceName:      provider.Name,
+	}, true
+}
+
+// manifestNotifyRefs 把清单里冻结的渠道集合摊平成 `run_notify_refs` 行。
+// manifestNotifyRefs flattens the frozen channel set into notify-ref rows.
+func manifestNotifyRefs(runID string, manifest core.RunResourceManifest) []core.RunNotifyRef {
+	refs := make([]core.RunNotifyRef, 0, len(manifest.Notify.Channels))
+	for _, channel := range manifest.Notify.Channels {
+		refs = append(refs, core.RunNotifyRef{
+			RunID:       runID,
+			AgentUID:    manifest.AgentUID,
+			ChannelUID:  channel.ResourceUID,
+			ChannelName: channel.Name,
+		})
+	}
+	return refs
 }
 
 // FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at），
@@ -162,6 +260,12 @@ func (s *RunStore) FinishRun(ctx context.Context, runID string, status core.RunS
 	}
 
 	if _, err := releaseRunRefs(ctx, tx, runID, now); err != nil {
+		return err
+	}
+	if _, err := releaseRunCredentialRefs(ctx, tx, runID, now); err != nil {
+		return err
+	}
+	if _, err := releaseRunNotifyRefs(ctx, tx, runID, now); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -236,7 +340,7 @@ type manifestRef struct {
 // manifestRefs flattens the manifest into the reference rows, in the builder's order.
 func manifestRefs(m core.RunResourceManifest) []manifestRef {
 	refs := make([]manifestRef, 0, 1+len(m.MCPServers)+len(m.Skills))
-	refs = append(refs, manifestRef{kind: core.ResourceModelConnection, ref: m.Provider})
+	refs = append(refs, manifestRef{kind: core.ResourceModelConnection, ref: m.Provider.ResourceVersionRef})
 	for _, ref := range m.MCPServers {
 		refs = append(refs, manifestRef{kind: core.ResourceMCPServer, ref: ref})
 	}
@@ -266,6 +370,29 @@ func validateRunManifest(manifest core.RunResourceManifest) (string, []byte, []m
 			fmt.Errorf("资源清单的生命周期状态必须是 active（实际 %q）：非启用状态不得准入",
 				manifest.AgentLifecycle)
 	}
+	// v2 起清单必须固定 Agent 身份：引用视图与审计按 UID 归属，空 UID 的清单会让
+	// "这次运行是哪个 Agent"只能靠名称推断——同名重建后即失真。
+	// From v2 the manifest must pin the agent identity rather than rely on the name.
+	if manifest.FormatVersion >= 2 {
+		if _, err := core.ParseAgentUID(string(manifest.AgentUID)); err != nil {
+			return "", nil, nil, fmt.Errorf("资源清单的 Agent 身份非法: %w", err)
+		}
+		// 凭据固定：托管模式必须带合法 id、版本与目标绑定；env 模式三项全空。
+		// 这条判据是 freeze 的前提——不合法就写不出 `run_credential_refs` 的账。
+		// The credential pin must be coherent before it can be frozen.
+		if err := validateManifestCredentialPin(manifest.Provider); err != nil {
+			return "", nil, nil, err
+		}
+		// 通知渠道集合：每个条目都要能落到 `run_notify_refs`（名称非空、UID 合法）。
+		for _, channel := range manifest.Notify.Channels {
+			if channel.Name == "" {
+				return "", nil, nil, errors.New("资源清单含空的通知渠道名称")
+			}
+			if _, err := core.ParseResourceUID(string(channel.ResourceUID)); err != nil {
+				return "", nil, nil, fmt.Errorf("资源清单的通知渠道 %q 身份非法: %w", channel.Name, err)
+			}
+		}
+	}
 	hash, err := core.HashManifest(manifest)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("重算资源清单哈希: %w", err)
@@ -288,6 +415,13 @@ func validateRunManifest(manifest core.RunResourceManifest) (string, []byte, []m
 		if ref.ref.VersionID <= 0 {
 			return "", nil, nil,
 				fmt.Errorf("资源清单的 %s/%s 版本标识非法（%d）", ref.kind, ref.ref.Name, ref.ref.VersionID)
+		}
+		// 引用行的身份列是 NOT NULL 的前置判据：清单缺 UID 时在这里拒绝，
+		// 而不是让 SQL 约束在事务中途抛出看不出是哪条引用的错误。
+		// The uid is the reference's identity column; refuse a missing one here.
+		if _, err := core.ParseResourceUID(string(ref.ref.ResourceUID)); err != nil {
+			return "", nil, nil,
+				fmt.Errorf("资源清单的 %s/%s 资源身份非法: %w", ref.kind, ref.ref.Name, err)
 		}
 		key := string(ref.kind) + "\x00" + ref.ref.Name
 		if _, dup := seen[key]; dup {

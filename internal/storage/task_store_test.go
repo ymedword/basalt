@@ -934,6 +934,29 @@ func TestTaskStore_ListExecutions(t *testing.T) {
 		require.Equal(t, fixedNow.UnixMilli(), got.StartedAt.UnixMilli())
 	})
 
+	t.Run("delivery_join_reports_channel_uid", func(t *testing.T) {
+		db := openTempDB(t)
+		store := NewTaskStore(db)
+		seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		seedExecution(t, db.write, "demo-1", "run-d", core.ExecutionCompleted)
+		_, err := db.write.ExecContext(ctx,
+			`INSERT INTO schedule_deliveries
+			   (run_id, task_id, agent_name, agent_uid, channel_uid, channel_name,
+			    status, http_status, receipt_code, detail, created_at)
+			 VALUES ('run-d', 'demo-1', 'demo', 'ag_test',
+			         'rs_channeluid00000000000000000', 'feishu-ops',
+			         'sent', 200, 0, '已发送（HTTP 200）', ?)`, fixedNow.UnixMilli())
+		require.NoError(t, err)
+
+		rows, err := store.ListExecutions(ctx, "demo-1", 10)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, core.DeliverySent, rows[0].Delivery)
+		require.Equal(t, "rs_channeluid00000000000000000", rows[0].DeliveryChannel,
+			"按契约回渠道资源 UID；渠道名只是发送时快照，同名重建会换 UID")
+		require.Equal(t, "已发送（HTTP 200）", rows[0].DeliveryDetail)
+	})
+
 	t.Run("only_target_task", func(t *testing.T) {
 		db := openTempDB(t)
 		store := NewTaskStore(db)

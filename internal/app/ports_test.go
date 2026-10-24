@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 18, "18 张表随 schema.sql（v2）建齐——v1 11 张 + US-11 新增 7 张")
+	require.Len(t, tables, 29, "29 张表随 schema.sql（v5）建齐——v1 11 张 + US-11 新增 7 张 + US-12 新增 10 张 + v5 的 network_domain_policy")
 }
 
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**
@@ -195,8 +196,9 @@ func TestAgentsPort_CreateAndDeleteReachWorkspace(t *testing.T) {
 	// 排障线是 DEBUG 档（prod 默认关闭），这里的 handler 必须显式开 Debug 才看得见。
 	var logs bytes.Buffer
 	port := agentsPort{
-		WorkDir: workDir,
-		Logger:  slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		WorkDir:                workDir,
+		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		Logger:                 slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 
 	created, err := port.Create(root, "demo-agent", []string{"deepseek"})
@@ -225,6 +227,288 @@ func TestAgentsPort_CreateAndDeleteReachWorkspace(t *testing.T) {
 
 	require.Contains(t, logs.String(), "level=DEBUG", "写模式调用留 DEBUG 排障线")
 	require.Contains(t, logs.String(), "workdir=")
+}
+
+// —— US-12 追加四条：CLI 写路径的完整生命周期（约束 27 / 32 / 49）——
+// Four added by US-12: the CLI write path owns lock, database, operation row and
+// archive row. (卡 §3.2.2 把「写真实操作行 / 归档行」归在 cli 行；`internal/cli`
+// 不得 import `internal/app`（用户裁决）且 ports 类型未导出，因此两个真实行锚点
+// 落在端口层测试文件，命令层判「调没调端口」。裁决记录见 run-state §1.33。)
+
+// newCLIPortForTest 造本文件四个 CLI 写路径用例共用的端口与工作区骨架。
+// newCLIPortForTest builds the shared port and workspace skeleton for the CLI-path tests.
+func newCLIPortForTest(t *testing.T) (agentsPort, string, *bytes.Buffer) {
+	t.Helper()
+
+	workDir := testutil.TempWorkspace(t)
+	root := filepath.Join(workDir, ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+
+	var logs bytes.Buffer
+	port := agentsPort{
+		WorkDir:                workDir,
+		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		Logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	return port, root, &logs
+}
+
+// cliProfileAdminForTest 在端口释放实例锁之后按同一装配口径重建管理面：`Archived` 与
+// `Restore` 因此走的是 HTTP 端点背后的同一实现，不是测试自造的第二条路径。
+// cliProfileAdminForTest rebuilds the same management surface the HTTP handlers use.
+func cliProfileAdminForTest(t *testing.T, root string, logger *slog.Logger) *AgentAdmin {
+	t.Helper()
+
+	db, err := storage.OpenWritable(context.Background(),
+		filepath.Join(root, databaseFileName), storage.SupportedSchemaVersion)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	return NewAgentAdmin(AgentAdminDeps{
+		Root:       root,
+		Lifecycle:  workspace.NewLifecycleStore(root, time.Now),
+		Index:      storage.NewResourceStore(db),
+		Operations: storage.NewManagementStore(db),
+		Archives:   storage.NewAgentAdminStore(db),
+		Logger:     logger,
+		Now:        time.Now,
+	})
+}
+
+// TestCLIProfileCreate_WritesManagementOperation（约束 27 / 49；卡 §3.2.2 的
+// `TestCLIProfileCreate_WritesManagementOperation`）：`profile create` 经端口写**真实**
+// 管理操作行——pending → success、动作 / 目标 / 主体 / 认证方式逐字；状态文件由
+// `Bootstrap` 落成 disabled / generation=1，索引行与操作行同源；模板 provider 取命令层
+// 传入列表的首项（签名里的 providers 不是死参数）。
+// Acceptance point: a CLI create leaves a real success operation row, a bootstrap state
+// file and an index row, and the template honours the passed provider order.
+func TestCLIProfileCreate_WritesManagementOperation(t *testing.T) {
+	ctx := context.Background()
+	port, root, _ := newCLIPortForTest(t)
+
+	created, err := port.Create(root, "cli-agent", []string{"deepseek", "spare"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"agents/cli-agent/AGENT.md"}, created)
+
+	// 状态文件：默认停用、generation=1、operation_id 指向本次操作（约束 27）。
+	rec, exists, err := workspace.NewLifecycleStore(root, time.Now).Read(ctx, "cli-agent")
+	require.NoError(t, err)
+	require.True(t, exists, "创建必须留下生命周期状态文件")
+	require.Equal(t, core.AgentDisabled, rec.State, "创建默认停用")
+	require.Equal(t, int64(1), rec.Generation)
+	require.Regexp(t, `^op-\d{13}-[a-z0-9]{6}$`, rec.OperationID)
+
+	// 模板取命令层列表首项（约束 28）：不是目录遍历，也不是库内快照。
+	content, err := os.ReadFile(filepath.Join(root, "agents", "cli-agent", "AGENT.md"))
+	require.NoError(t, err)
+	require.Contains(t, string(content), "name: deepseek", "模板 provider 取配置列表首项")
+
+	// 操作行：pending → success，动作 / 目标 / 主体 / 认证方式逐字（契约 §9.3）。
+	db := openRead(t, filepath.Join(root, databaseFileName))
+	var action, targetKind, targetID, subject, method, source, status, resultCode string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT action, target_kind, target_id, actor_subject, auth_method, source, status, result_code
+		   FROM management_operations WHERE operation_id = ?`, rec.OperationID).
+		Scan(&action, &targetKind, &targetID, &subject, &method, &source, &status, &resultCode))
+	require.Equal(t, core.ActionAgentCreate, action)
+	require.Equal(t, targetKindAgent, targetKind)
+	require.Equal(t, "cli-agent", targetID)
+	require.True(t, strings.HasPrefix(subject, core.ActorSubjectCLIPrefix),
+		"actor_subject 必须是 cli:<本机用户>：%s", subject)
+	require.NotEqual(t, core.ActorSubjectCLIPrefix, subject, "用户名不得为空")
+	require.Equal(t, core.AuthMethodCLI, method)
+	require.Equal(t, cliOperationSource, source)
+	require.Equal(t, string(core.OperationSuccess), status)
+	require.Equal(t, lifecycleResultOK, resultCode)
+
+	// 生命周期索引落库（可重建视图；失败不回滚写，但正常路径必须写成功）。
+	var indexOP string
+	var valid int
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT operation_id, valid FROM agent_lifecycle WHERE agent_name = ?`, "cli-agent").
+		Scan(&indexOP, &valid))
+	require.Equal(t, rec.OperationID, indexOP)
+	require.Equal(t, 1, valid)
+
+	require.Equal(t, 1, countRows(t, db,
+		`SELECT COUNT(*) FROM management_operations WHERE target_id = ?`, "cli-agent"),
+		"一次创建只写一行操作记录")
+}
+
+// TestCLIProfileDelete_WritesArchiveRow（约束 32 / 49；卡 §3.2.2 的
+// `TestCLIProfileDelete_WritesArchiveRow`）：`profile delete` 走归档编排——目录搬入
+// 归档区、归档行与操作终态同事务写入、`/archived-agents` 可见、原名恢复可回活动区并
+// 标记 restored_at；注入时刻同时进入归档标识与操作行。
+// Acceptance point: a CLI delete writes a restorable archive row and moves the
+// directory; the injected instant drives the archive id.
+func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
+	ctx := context.Background()
+	port, root, _ := newCLIPortForTest(t)
+
+	_, err := port.Create(root, "cli-agent", []string{"deepseek"})
+	require.NoError(t, err)
+
+	now := time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC)
+	archived, err := port.Delete(root, "cli-agent", now)
+	require.NoError(t, err)
+	require.Equal(t, "archive/cli-agent-20261016-093000", archived)
+	require.NoDirExists(t, filepath.Join(root, "agents", "cli-agent"))
+	require.FileExists(t, filepath.Join(root, "archive", "cli-agent-20261016-093000", "AGENT.md"))
+
+	dbPath := filepath.Join(root, databaseFileName)
+	db := openRead(t, dbPath)
+
+	var operationID, agentName, contentHash, manifest string
+	var archivedAt int64
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT operation_id, agent_name, archived_at, content_hash, manifest_json
+		   FROM agent_archives WHERE archive_id = ?`, "cli-agent-20261016-093000").
+		Scan(&operationID, &agentName, &archivedAt, &contentHash, &manifest))
+	require.Equal(t, "cli-agent", agentName)
+	require.Equal(t, now.UnixMilli(), archivedAt, "归档时间以注入时刻为准")
+	require.NotEmpty(t, contentHash, "归档清单哈希可复算")
+	require.NotEmpty(t, manifest)
+
+	var status, subject, method, source string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT status, actor_subject, auth_method, source
+		   FROM management_operations WHERE operation_id = ?`, operationID).
+		Scan(&status, &subject, &method, &source))
+	require.Equal(t, string(core.OperationSuccess), status)
+	require.True(t, strings.HasPrefix(subject, core.ActorSubjectCLIPrefix), "actor_subject：%s", subject)
+	require.Equal(t, core.AuthMethodCLI, method)
+	require.Equal(t, cliOperationSource, source)
+
+	// `/archived-agents` 可见：与 HTTP 端点调用同一个方法（AgentAdmin.Archived）。
+	admin := cliProfileAdminForTest(t, root, port.logger())
+	rows, err := admin.Archived(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "cli-agent-20261016-093000", rows[0].ArchiveID)
+
+	// 可恢复：原名恢复把目录搬回活动区并把归档行标为已恢复。
+	view, err := admin.Restore(ctx, port.actor(), rows[0].ArchiveID, "")
+	require.NoError(t, err)
+	require.Equal(t, "cli-agent", view.Agent)
+	require.FileExists(t, filepath.Join(root, "agents", "cli-agent", "AGENT.md"))
+	// 恢复是"复制回活动区"：归档目录保留（物理清除与保留策略明确不在本模块范围）。
+	require.DirExists(t, filepath.Join(root, "archive", "cli-agent-20261016-093000"),
+		"归档副本保留，仅归档行标记 restored_at")
+	require.Equal(t, 1, countRows(t, db,
+		`SELECT COUNT(*) FROM agent_archives
+		  WHERE archive_id = ? AND restored_at IS NOT NULL AND restored_agent_name = ?`,
+		"cli-agent-20261016-093000", "cli-agent"))
+
+	rec, exists, err := workspace.NewLifecycleStore(root, time.Now).Read(ctx, "cli-agent")
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, core.AgentDisabled, rec.State, "恢复默认停用")
+	require.Equal(t, int64(3), rec.Generation, "创建 1 → 归档 2 → 恢复 3")
+}
+
+// TestArchivedList_IncludesCLIArchive（卡 §4.4 第 24 行 / §3.2.2）：`GET /archived-agents`
+// 的数据源是 `web.AgentAdminService.Archived`；本用例经 T037 装配的 `agentAdminPort` 读——
+// CLI `profile delete` 写下的归档行必须出现在这份列表里。CLI 与 HTTP 共写 `agent_archives`
+// 一张表，管理台因此不需要第二条读路径（约束 27「CLI 归档在管理台可见」）。
+// Acceptance point: the web archive port lists a row written by the CLI delete path.
+func TestArchivedList_IncludesCLIArchive(t *testing.T) {
+	ctx := context.Background()
+	port, root, _ := newCLIPortForTest(t)
+
+	_, err := port.Create(root, "cli-archive-agent", []string{"deepseek"})
+	require.NoError(t, err)
+
+	now := time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC)
+	archived, err := port.Delete(root, "cli-archive-agent", now)
+	require.NoError(t, err)
+	require.Equal(t, "archive/cli-archive-agent-20261016-093000", archived)
+
+	// 与 HTTP 端点背后是同一个实现：`agentAdminPort` 是 `web.AgentAdminService` 的唯一适配器。
+	// The same implementation behind the HTTP endpoint: the sole web port adapter.
+	admin := cliProfileAdminForTest(t, root, port.logger())
+	webPort := agentAdminPort{admin: admin}
+	rows, err := webPort.Archived(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "CLI 归档行必须出现在 /archived-agents 的数据源里")
+	require.Equal(t, "cli-archive-agent-20261016-093000", rows[0].ArchiveID)
+	require.Equal(t, "cli-archive-agent", rows[0].AgentName)
+	require.Nil(t, rows[0].RestoredAt, "未恢复的归档行 restored_at 为空")
+}
+
+// TestAgentsPort_WritePathReleasesLockOnFailure（卡 §3.2.2 CLI 写路径行）：失败路径同样
+// 关闭库、释放锁——同名再建的纯请求校验失败先于预写（零操作行），随后测试自己取锁成功、
+// 库文件可改名（Windows 上句柄未关会被占用），再接一次归档仍成功。
+// Acceptance point: a failed write closes the database and releases the lock, and a
+// pre-write validation failure leaves no second operation row.
+func TestAgentsPort_WritePathReleasesLockOnFailure(t *testing.T) {
+	port, root, _ := newCLIPortForTest(t)
+
+	_, err := port.Create(root, "locked-agent", nil)
+	require.NoError(t, err)
+
+	// 同名再建：锁与库都已取得，失败发生在目标空闲校验（FR1：纯请求校验不写操作行）。
+	_, err = port.Create(root, "locked-agent", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "locked-agent")
+
+	// 实例锁必须已释放：测试自己再取一次必须成功。
+	lock, err := workspace.AcquireInstanceLock(root)
+	require.NoError(t, err, "写路径失败后实例锁必须已释放")
+	require.NoError(t, lock.Release())
+
+	// 库句柄必须已关闭：Windows 上改名被打开的文件会失败；POSIX 下该操作恒成功，
+	// 因而不作为 POSIX 平台的判据。
+	dbPath := filepath.Join(root, databaseFileName)
+	moved := dbPath + ".closed-probe"
+	require.NoError(t, os.Rename(dbPath, moved), "写路径失败后库句柄必须已关闭")
+	require.NoError(t, os.Rename(moved, dbPath))
+
+	// 前一次失败没有留下第二套互斥或半截状态：归档照常走完。
+	archived, err := port.Delete(root, "locked-agent", time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, "archive/locked-agent-20261016-093000", archived)
+
+	db := openRead(t, dbPath)
+	require.Equal(t, 1, countRows(t, db,
+		`SELECT COUNT(*) FROM management_operations WHERE action = ? AND target_id = ?`,
+		core.ActionAgentCreate, "locked-agent"),
+		"同名再建的校验失败先于预写，只能有首次创建那一行")
+}
+
+// TestAgentsPort_LightPathSkipsWritePath（卡 §3.2.2 的「profile list / show 不进入写
+// 路径」）：活实例持锁（= serve 正在运行）时 list 照常工作，且不取锁、不打开 / 创建库、
+// 不写生命周期状态——零 SupportedSchemaVersion 也不影响读面。
+// Acceptance point: the read path takes no lock and never opens the database or writes
+// lifecycle state, even while another instance holds the lock.
+func TestAgentsPort_LightPathSkipsWritePath(t *testing.T) {
+	workDir := testutil.TempWorkspace(t)
+	root := filepath.Join(workDir, ".basalt")
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+	writeAgentDir(t, root, "reader", `---
+name: reader
+provider:
+  name: deepseek
+  model: deepseek-chat
+---
+
+只读浏览器。
+`)
+
+	lock, err := workspace.AcquireInstanceLock(root)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, lock.Release()) }()
+
+	port := agentsPort{WorkDir: workDir} // 刻意不设 schema 版本：读面不得依赖写路径配置
+
+	entries, err := port.List(root, []string{"deepseek"})
+	require.NoError(t, err, "读面不得取实例锁")
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Registered, "读面零写入：%s", entries[0].RejectReason)
+
+	require.NoFileExists(t, filepath.Join(root, databaseFileName), "轻路径不得创建数据库")
+	require.NoDirExists(t, filepath.Join(root, "control", "agents"), "轻路径不得写生命周期状态")
 }
 
 // TestLogLevel_MapsConfigValues 取值域已由 cli.LoadConfig 判卷，本用例只判**翻译**

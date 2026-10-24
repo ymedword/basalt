@@ -801,7 +801,12 @@ func concretePath(pattern string) string {
 	if pattern == "/{$}" {
 		return "/"
 	}
-	p := strings.ReplaceAll(pattern, "{id}", "x")
+	// US-12 写面的三段通配（T016 挂载）先替换，避免 `{id}` 之外的复合段残留。
+	// The US-12 wildcard segments are substituted before the older single-segment ones.
+	p := strings.ReplaceAll(pattern, "{archive_id}", "ops-agent-20261016T093000Z")
+	p = strings.ReplaceAll(p, "{version_id}", "7")
+	p = strings.ReplaceAll(p, "{kind}", "skill")
+	p = strings.ReplaceAll(p, "{id}", "x")
 	p = strings.ReplaceAll(p, "{name}", "ops-agent")
 	// 管理台子树通配（T049）取一个资源路径；模式解析必须回到同一行。
 	// The console subtree wildcard resolves with a concrete asset path.
@@ -1114,5 +1119,127 @@ func TestAuth_RouteMatrix(t *testing.T) {
 		rec := serveAdmin(s, withBearer(adminRequest(http.MethodGet, "/api/v1/info", ""), testToken))
 		require.Equal(t, http.StatusOK, rec.Code)
 		require.Equal(t, codeOK, decodeAuthEnvelope(t, rec).Code)
+	})
+}
+
+// TestConsoleAdmin_WriteRoutesMounted 是 T016 的挂载判卷（check
+// `012-web-etag-routes` 的必备锚点）：US-12 的 30 条写面路由全部进入**主路由表**，
+// 逐行受保护、恰带一个显式 actor 处理函数；兜底仍唯一且是最后一行；真实 mux 对
+// 每一条都能解析回与表中逐字相同的模式——"表里有、注册漏"在本用例直接变红。
+// 逆改点：routeTable 不并 adminRoutes / 兜底挪到写面之前 / 任一行改成公开或双处理
+// 函数 / 模式被更宽的行遮蔽 → 对应断言红。
+// 中文用例名：写面路由并入主路由表。
+func TestConsoleAdmin_WriteRoutesMounted(t *testing.T) {
+	s := newTestServer(t, nil)
+	table := s.routeTable()
+
+	got := make(map[string]route, len(table))
+	for _, rt := range table {
+		require.NotContains(t, got, routeKey(rt), "路由重复登记：%s", routeKey(rt))
+		got[routeKey(rt)] = rt
+	}
+
+	for _, key := range wantAdminRouteKeys() {
+		rt, ok := got[key]
+		require.True(t, ok, "写面路由未并入主路由表：%s", key)
+		require.Equal(t, routeProtected, rt.visibility, "%s 必须受保护", key)
+		require.NotNil(t, rt.adminHandler, "%s 必须带显式 actor 处理函数", key)
+		require.Nil(t, rt.handler, "%s 不得同时挂两个处理函数", key)
+	}
+
+	last := table[len(table)-1]
+	require.Equal(t, routeFallback, last.visibility, "兜底必须仍是最后一行")
+	require.Empty(t, last.method, "兜底必须方法无关")
+
+	mux := http.NewServeMux()
+	s.routes(mux)
+	for _, key := range wantAdminRouteKeys() {
+		rt := got[key]
+		req := httptest.NewRequest(rt.method, concreteAdminPath(rt.pattern), nil)
+		_, pattern := mux.Handler(req)
+		require.Equal(t, key, pattern, "%s 未按表注册或被更宽的模式遮蔽", key)
+	}
+}
+
+// TestConsoleAdmin_MissingCredentialsRejected：写面并入主表之后，30 条端点逐条
+// 无凭据请求一律 401 UNAUTHORIZED——与 `TestAuth_RouteMatrix` 同一口径，但固定
+// 写面集合并锁定"并入后的实际可见性"。
+// 逆改点：任一行漏挂闸门 / 标成公开 → 对应子例得到非 401。
+// 中文用例名：写面缺凭据一律拒绝。
+func TestConsoleAdmin_MissingCredentialsRejected(t *testing.T) {
+	for _, key := range wantAdminRouteKeys() {
+		method, pattern, ok := strings.Cut(key, " ")
+		require.True(t, ok, "路由键格式：%s", key)
+		// 每条路由一个**新装配**：认证限速按来源累计，同一实例连打会变 429。
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		rec := serveAdmin(s, adminRequest(method, concreteAdminPath(pattern), ""))
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "%s", key)
+		require.Equal(t, codeUnauthorized, decodeAuthEnvelope(t, rec).Code, "%s", key)
+	}
+}
+
+// TestConsoleAdmin_ConditionalWritesDemandIfMatch：挂载之后 8 条条件写仍要求
+// If-Match——缺失与弱 ETag 都在处理函数之前 412；非条件写行不因并入主表而开始
+// 要求请求头。认证先于 If-Match 已在 admin_routes_test 锁定，这里判的是**挂载后
+// 的实际行为**。
+// 逆改点：并入时丢掉 conditional 标记 / 中间件套错方向 → 对应子例红。
+// 中文用例名：条件写在主表上仍要求 If-Match。
+func TestConsoleAdmin_ConditionalWritesDemandIfMatch(t *testing.T) {
+	t.Run("conditional rows reject a missing If-Match", func(t *testing.T) {
+		for _, key := range wantConditionalRouteKeys() {
+			method, pattern, ok := strings.Cut(key, " ")
+			require.True(t, ok, "路由键格式：%s", key)
+			s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+			rec := serveAdmin(s, withBearer(adminRequest(method, concreteAdminPath(pattern), ""), testToken))
+			require.Equal(t, http.StatusPreconditionFailed, rec.Code, "%s", key)
+			require.Equal(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code, "%s", key)
+		}
+	})
+
+	t.Run("a weak If-Match is rejected on the mounted table", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		req := withBearer(adminRequest(http.MethodPut, "/api/v1/model-connections/primary", ""), testToken)
+		req.Header.Set("If-Match", "W/"+formatETag(strings.Repeat("a", 64)))
+		rec := serveAdmin(s, req)
+		require.Equal(t, http.StatusPreconditionFailed, rec.Code)
+		require.Equal(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("non-conditional rows do not demand If-Match", func(t *testing.T) {
+		s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+		rec := serveAdmin(s, withBearer(adminRequest(http.MethodPost, "/api/v1/notify-channels", ""), testToken))
+		require.NotEqual(t, http.StatusPreconditionFailed, rec.Code)
+		require.NotEqual(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code)
+	})
+}
+
+// TestConsoleAdmin_UnassembledPortsFailClosed：写面端口尚未装配时，占位处理
+// 函数按固定 500 INTERNAL 失败关闭——**不**伪装成功、**不**给空列表、**不**暴露
+// 内部原因。条件写行在 If-Match 形状合法时也必须走到占位（证明 412 只由形状
+// 决定，更深的比较属于服务层）。
+// 逆改点：占位改成 200 / 空数据 / 把 500 换成本文之外的原因 → 对应子例红。
+// 中文用例名：缺端口按固定 500 失败关闭。
+func TestConsoleAdmin_UnassembledPortsFailClosed(t *testing.T) {
+	s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
+
+	t.Run("a normal write row answers 500 INTERNAL", func(t *testing.T) {
+		rec := serveAdmin(s, withBearer(adminRequest(http.MethodPost, "/api/v1/agents", ""), testToken))
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+		require.Equal(t, codeInternal, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("a conditional row with a well-formed ETag reaches the placeholder", func(t *testing.T) {
+		req := withBearer(adminRequest(http.MethodPut, "/api/v1/model-connections/primary", ""), testToken)
+		req.Header.Set("If-Match", formatETag(strings.Repeat("a", 64)))
+		rec := serveAdmin(s, req)
+		require.Equal(t, http.StatusInternalServerError, rec.Code,
+			"合法 If-Match 必须越过中间件，由占位处理函数按装配缺失拒绝")
+		require.Equal(t, codeInternal, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("a read row answers 500 instead of an empty payload", func(t *testing.T) {
+		rec := serveAdmin(s, withBearer(adminRequest(http.MethodGet, "/api/v1/archived-agents", ""), testToken))
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+		require.Equal(t, codeInternal, decodeAuthEnvelope(t, rec).Code)
 	})
 }

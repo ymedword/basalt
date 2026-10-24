@@ -7,29 +7,39 @@ import { ConsoleAuth } from './auth'
 import { brandMark } from './components/brand'
 import { CONSOLE_BASE, ConsoleRouter, loginPath, resourceHref } from './router'
 import type { RouteMatch, RouteName } from './router'
+import { AgentConfigPage } from './views/agent-config'
 import { AgentDetailView } from './views/agent-detail'
+import { AgentsNewView } from './views/agents-new'
 import { AgentsView } from './views/agents'
+import { ArchivedAgentsView } from './views/archived-agents'
 import { LoginView } from './views/login'
 import { NotFoundView } from './views/not-found'
 import { OperationsView } from './views/operations'
 import { OverviewView } from './views/overview'
+import { ResourceDetailView } from './views/resource-detail'
 import { ResourcesView } from './views/resources'
 import { RunDetailView } from './views/run-detail'
 import { RunsView } from './views/runs'
+import { SessionDetailView } from './views/session-detail'
 import { ToolsView, GlobalMemoryView, NotificationsView, SandboxView } from './views/workspace'
+import { WorkspaceBrowserView } from './views/workspace-browser'
 import type { ConsoleContext } from './views/shared'
 
 const VIEWS: Record<RouteName, Component> = {
   overview: OverviewView, login: LoginView, agents: AgentsView,
-  'agent-detail': AgentDetailView, runs: RunsView, 'run-detail': RunDetailView,
-  resources: ResourcesView, operations: OperationsView, 'not-found': NotFoundView,
+  'agents-new': AgentsNewView, 'agent-detail': AgentDetailView, 'agent-config': AgentConfigPage,
+  'agent-session': SessionDetailView,
+  runs: RunsView, 'run-detail': RunDetailView,
+  resources: ResourcesView, 'resource-detail': ResourceDetailView,
+  archived: ArchivedAgentsView, workspace: WorkspaceBrowserView,
+  operations: OperationsView, 'not-found': NotFoundView,
   tools: ToolsView, memory: GlobalMemoryView, notifications: NotificationsView, sandbox: SandboxView,
 }
 interface NavItem { label: string; href: string; code: string; names?: readonly RouteName[] }
 const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
   { label: '工作区', items: [
     { label: '系统总览', href: CONSOLE_BASE + '/', code: '01', names: ['overview'] },
-    { label: 'Agents', href: CONSOLE_BASE + '/agents', code: '02', names: ['agents', 'agent-detail'] },
+    { label: 'Agents', href: CONSOLE_BASE + '/agents', code: '02', names: ['agents', 'agents-new', 'agent-detail', 'agent-config', 'agent-session', 'archived'] },
   ] },
   { label: '资源库', items: [
     { label: '模型与连接', href: resourceHref('model-connections'), code: '03' },
@@ -38,15 +48,18 @@ const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
     { label: '全局记忆', href: CONSOLE_BASE + '/library/memory', code: '06', names: ['memory'] },
   ] },
   { label: '系统管理', items: [
-    { label: '消息渠道', href: CONSOLE_BASE + '/settings/notifications', code: '07', names: ['notifications'] },
+    { label: '通知渠道', href: CONSOLE_BASE + '/settings/notifications', code: '07', names: ['notifications'] },
     { label: '执行环境', href: CONSOLE_BASE + '/settings/sandbox', code: '08', names: ['sandbox'] },
     { label: '管理操作', href: CONSOLE_BASE + '/operations', code: '09', names: ['operations'] },
   ] },
 ]
 const TITLES: Record<RouteName, string> = {
-  overview: '系统总览', login: '连接工作区', agents: 'Agents', 'agent-detail': 'Agent 工作区',
-  runs: '运行列表', 'run-detail': '运行详情', resources: '资源库', operations: '管理操作',
-  'not-found': '页面不存在', tools: '工具与 MCP', memory: '全局记忆', notifications: '消息渠道', sandbox: '执行环境',
+  overview: '系统总览', login: '连接工作区', agents: 'Agents', 'agents-new': '新建 Agent',
+  'agent-detail': 'Agent 工作区', 'agent-config': 'Agent 配置', 'agent-session': '会话详情',
+  runs: '运行列表', 'run-detail': '运行详情',
+  resources: '资源库', 'resource-detail': '资源详情', archived: '已归档 Agents', workspace: '工作区文件',
+  operations: '管理操作', 'not-found': '页面不存在',
+  tools: '工具与 MCP', memory: '全局记忆', notifications: '通知渠道', sandbox: '执行环境',
 }
 function currentLocation(): string { return window.location.pathname + window.location.search }
 function navActive(item: NavItem, match: RouteMatch): boolean {

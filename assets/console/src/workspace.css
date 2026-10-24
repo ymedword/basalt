@@ -109,6 +109,13 @@ a.dependency-row:hover strong { color: var(--accent); }
 .recent-agent { font: 500 12px/1.6 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recent-counts, .recent-time { font: 11px/1.6 var(--font-mono); color: var(--muted); white-space: nowrap; }
 .recent-action { color: var(--accent); white-space: nowrap; text-align: right; }
+/* 一句话创建：列表首屏可见，样式只做强调，不引入新交互模式 */
+.one-liner-create { display: grid; gap: 14px; margin: 0 0 22px; padding: 20px 22px; background: var(--accent-wash); border: 1px solid #cdd3e1; border-radius: 5px; }
+.one-liner-copy h2 { margin: 0 0 6px; font-size: 16px; }
+.one-liner-copy p { margin: 0; font-size: 12.5px; line-height: 1.8; }
+.one-liner-bar { display: flex; align-items: flex-end; gap: 10px; }
+.one-liner-bar textarea.editor { flex: 1; min-height: 0; height: 62px; background: var(--surface); }
+.one-liner-bar button { white-space: nowrap; }
 .agent-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 24px; }
 .agent-filters { display: flex; gap: 5px; }
 .agent-filters button { padding: 7px 9px; border: 0; background: transparent; font-size: 12px; color: var(--muted); white-space: nowrap; }
@@ -144,6 +151,14 @@ a.dependency-row:hover strong { color: var(--accent); }
 .agent-title h1 { font-size: 32px; letter-spacing: -.03em; }
 .agent-title > button { margin-left: auto; font-size: 12px; }
 .agent-meta { font-size: 12px; margin-top: 13px; }
+/* 定时页一句话生成：输入框占满剩余宽度；候选的触发时间逐行列出。 */
+.schedule-composer .form-actions { flex-wrap: wrap; }
+.schedule-composer input[type='text'] { flex: 1 1 260px; min-width: 0; }
+.schedule-run { margin: 2px 0; }
+/* 显示名旁的技术名：小号弱化，但与显示名同屏可见（目录 / API 只认技术名）。 */
+.agent-technical-name { font: 11.5px/1.5 var(--font-mono); color: var(--muted); font-weight: 400; }
+.agent-card h2 .agent-technical-name { margin-left: 8px; }
+.agent-meta .agent-technical-name { color: var(--muted); }
 .tabs { margin-top: 27px; gap: 10px; }
 .tab { padding: 10px 5px; font-size: 13px; }
 .tab-panel > .card:first-child { margin-top: 24px; }
@@ -262,6 +277,7 @@ a.cell-id { font: 12px/1.7 var(--font-mono); }
   .process-panel .panel-heading { align-items: flex-start; }
   .process-panel .panel-heading .small { font-size: 10px; text-align: right; }
   .agent-toolbar { flex-wrap: wrap; gap: 12px; }
+  .one-liner-bar { flex-direction: column; align-items: stretch; }
   .agent-search { width: 100%; }
   .page-count { font-size: 11px; margin-top: 28px; }
   .agent-grid { grid-template-columns: minmax(0, 1fr); }

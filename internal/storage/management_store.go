@@ -92,13 +92,18 @@ func (s *ManagementStore) BeginOperation(ctx context.Context, rec core.Operation
 // FinishOperation 回填终态。`UPDATE` 带 `WHERE operation_id = ? AND status = 'pending'`：
 // 影响 0 行时读取当前行——已终态则幂等返回、**不覆盖**；不存在则返回
 // core.ErrOperationNotFound。失败原文按 4 KB 截断（契约 §7.4）。
-// FinishOperation fills the terminal state under a pending-only guard; terminal rows
-// are left untouched and a missing row maps to core.ErrOperationNotFound.
+//
+// `detailJSON` 为空表示"本次没有新的细节"，**保留**预写阶段写下的候选终态投影
+// （凭据与范围动作的资源名 / `credential_id` / 版本号 / 模式，契约 §9.2）：`COALESCE`
+// 只有拿到 SQL NULL 才会保留旧值，所以空入参必须原样传 NULL——把它规整成 `{}` 会让
+// 每条终态行都丢掉预写投影。
+// An empty detailJSON means "nothing new" and keeps the pre-written projection; that
+// only works when the empty payload reaches SQL as NULL rather than `{}`.
 func (s *ManagementStore) FinishOperation(ctx context.Context, operationID string, status core.OperationStatus, resultCode, errorMessage string, detailJSON []byte, now time.Time) error {
 	if !isTerminalOperationStatus(status) {
 		return fmt.Errorf("回填管理操作 %s: 终态必须是 success / failed / unknown，收到 %q", operationID, status)
 	}
-	detail, err := normalizeDetailJSON(detailJSON)
+	detail, err := optionalDetailJSON(detailJSON)
 	if err != nil {
 		return fmt.Errorf("回填管理操作 %s: %w", operationID, err)
 	}
@@ -173,7 +178,7 @@ func (s *ManagementStore) RecoverOperation(ctx context.Context, operationID stri
 	if err := checkRecoveryPair(status, verification); err != nil {
 		return fmt.Errorf("恢复管理操作 %s: %w", operationID, err)
 	}
-	detail, err := normalizeDetailJSON(detailJSON)
+	detail, err := optionalDetailJSON(detailJSON)
 	if err != nil {
 		return fmt.Errorf("恢复管理操作 %s: %w", operationID, err)
 	}
@@ -395,6 +400,18 @@ func normalizeDetailJSON(raw []byte) ([]byte, error) {
 		return nil, errors.New("detail_json 不是合法 JSON")
 	}
 	return raw, nil
+}
+
+// optionalDetailJSON 只把**非空**入参规整成 JSON；空入参返回 nil（SQL NULL），供终态
+// 回填与恢复的 `COALESCE(?, detail_json)` 保留预写投影。`normalizeDetailJSON` 的 `{}`
+// 缺省只适用于 `BeginOperation`（列 NOT NULL、且"没有细节"本身要可读）。
+// optionalDetailJSON maps an empty payload to SQL NULL so the terminal write keeps the
+// pre-written projection; the `{}` default only belongs to BeginOperation.
+func optionalDetailJSON(raw []byte) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return normalizeDetailJSON(raw)
 }
 
 // isTerminalOperationStatus 判定终态三值（pending 不是终态）。

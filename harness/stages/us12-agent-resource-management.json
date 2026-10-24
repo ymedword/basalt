@@ -1,0 +1,2494 @@
+{
+  "version": 1,
+  "id": "us12-agent-resource-management-r1",
+  "approval": "Human review ① 2026-10-21 approved the US-12 module card R3 for registration; the 2026-10-22 review ruling accepted R3.1 corrections (H1-H4 / M1-M9 / L1-L3) as implementation input without re-registration (user: 『M1 修正状态，但不重新登记』 and 『这些修正主要是在落实已批准范围』). Reviewed path docs/us/us12-agent-resource-management.md, sha256 c59ca1d1dd365d06789ffedab8109905de358d77d5fda486ff7790ba99a716c4, 2214 lines (R3.2, 2026-10-22; R3.2 amends only §4.3.2 publish regression to the explicit-revert branch per user ruling 2026-10-22); registry line 39. Frozen derived inputs: spec sha256 6bac0de2fe63269f223bd50deddafdebd898afc50c934a02870b7a524932520e (368 lines, historical R3 count), plan sha256 0f5123cdc3fb8889ea0608d0b8d0592694df80da5d85e3f6f693b8309cb0c75c (208 lines, historical R3 count), tasks sha256 2c331ae26982959067ed71044518f14113aa503d09c9033d2870d7a25a332f39 (306 lines, 74 tasks, 0 checked at derivation). Stage derived by module-dev step 6.1 as a provisional, loadable red-state baseline: protect lists only paths that already exist; the 28 new test files are added at T068 because loadStage Lstat requires every protected path to exist. required_tests are control-side exact anchors; T068 expands each check to the full go test -list exact set before final acceptance. The anchors constrain names only within the families fixed by module card §4.4, and no assertion semantics are changed. This stage grants no approval by itself. Local-only: inputs include private docs/us, so it must not enter harness/stages/current.json or CI. T068 (2026-10-22) expanded every check's required_tests to exact go test -list names, excluding four tests whose only remaining cases are symlink subtests unsupported on this Windows host (TestParseMCPServers_ReadsThroughRoot, TestNotifyScan_DoesNotFollowSymlinks, TestDeleteAgent_RefusesSymlinkEntry, TestWorkspaceBrowse_NoSymlinkEscape); the tests stay in the delivery and run wherever symlinks are available. argv follows the implemented packages/tags where module card 4.4 argv diverges from the code (./internal/tool for TestMCPPool_*, ./internal/app for TestCLIProfile*/TestArchivedList_*, -tags=e2e for internal/e2e); no assertion or selection semantics were weakened. protect enumerates 96 paths: the card's 88-path formula plus the two modified production files and five modified existing test files that the card lists undercount (internal/app/resources.go, internal/web/handlers_agent_content.go, internal/app/recovery_operations_test.go, internal/app/resources_test.go, internal/app/wire_mcp_test.go, internal/app/wire_test.go, internal/workspace/content_edit_test.go). Four module card 4.4 families have no exact matches after the implementation consolidated them: workspace TestAgentAdmin_* now lives in internal/app/agent_admin_test.go (required by 012-app-agent-admin), workspace TestAgentDraft_* is covered by core TestAuthor_Draft* (required by 012-core-author-agent) and workspace TestAgentFiles_*, workspace TestValidateAgentName_* is covered by TestCreateAgent_RejectsInvalidName and TestAgentFiles_PathMatrix (both required here), and storage TestResourceVersions_* is covered by TestResourceStore_* version tests (required here); no delivered test was dropped and no family is judged empty. T068 also folded the delivered tests that no functional check selected into their owning checks (closing run-state U11 and the same audit): app TestSkill_*/TestSkillWrite_* into 012-app-resource-admin, app TestValidateAuthorConfig_* into 012-app-notify-author, and web TestModelConnection_*/TestAdminResourceVersions_*/TestAdminResourcePublish_* into 012-web-admin-resources. T069 (2026-10-22) adapted internal/tool/mcp_integration_test.go to the approved FR8 command/args split: the self-exec helper now passes Command=os.Args[0] and Args=[-test.run=^TestMCPHelperProcess$], and the obsolete whitespace-path skip is gone because Make check's test-integration target exposed that the pool no longer splits a command string; assertions are unchanged and coverage only widens. That file is now in protect. Local-only; still not in current.json or CI. R3.3 (2026-10-22) revised the §4.3.2 publish-failure scenario per the user ruling without touching 约束 9, FR-024 or the publish contract: preconditions are now published, content-different v1 and v2 with both pointers and the runtime on v2; the explicit revert to v1 uses the current v2 ETag and injects a version-insert failure; assertions now also prove the injection fired, the file restored to the pre-operation bytes, both pointers and the runtime stayed on v2 (same client, model m2), no residual version remained, and the operation row is failed. The idempotent publish coverage stays in TestPublish_Idempotent/TestPublish_SkillIdempotent. Current reviewed card: sha256 daccf82d2abb161faf10715db11ca879fd01700af037bee3131020ae57fd30ea, 2287 lines; tasks.md: sha256 4acc1d14fcd00db834929df1baf238e1c686414ed0f480cac4d29ae0c08c1dea, 307 lines, 75 tasks (T072 appended; T025 unchanged). R3.4 (2026-10-22) records the user-ruled page-operation closure: the US-11 Agents list, Agent detail and archived pages gained the create / archived entries, the copy dialog, the danger-zone archive action and the restore landing navigation, with 9 view-level Vitest tests in assets/console/tests/agent-actions.test.ts covering entry reachability, copy submit and navigation, the registry-lag retry (an arrival page must not report a just-created or just-restored agent as missing; it retries for about 5 seconds behind a pending message), cancel sending no request, archive navigation with a profile re-read, AGENT_BUSY run ids, repeat-click guards and the disabled restore landing. No route, API, dependency or formal contract change; frontend files are not stage checks, so checks and protect are unchanged. Verification read by the control side: npm test 87/87, a production build whose three dist files match integrity.json, a CGO_ENABLED=0 binary embedding the new assets, and a headless Edge CDP walkthrough that passed 8/8 steps (list create, copy, archive, restore) with zero page errors. R3.5 (2026-10-22) records the user-ruled page-operation path closure after manual acceptance reported six gaps: the Agent detail now drives session create / send / archive (an archived session is reopened under a fresh console user id because the store never revives an archived row), capability binding edits, and schedule create / edit / enable / disable / run-now / delete; resource pages create, import, edit skill files, replace MCP entries behind the env gate, edit model connections, and delete; the notify edit action scrolls to the form with an editing banner; the create page shows byte sizes instead of a bare B and retries the registry for about 5 seconds. Tools remain a binary registry, so the page only binds or unbinds them. 7 view-level Vitest tests were added in assets/console/tests/agent-operations.test.ts. No route, API, dependency, formal contract or migration change; frontend files are not stage checks, so checks and protect are unchanged. Verification read by the control side: npm test 94/94, typecheck clean, a production build whose four dist files match integrity.json (3 entries, 0 bad), a CGO_ENABLED=0 binary of 18,882,560 bytes embedding the new assets, go test ./internal/web -run 'Console|Integrity' passing, and a live demo instance returning an active session with a completed run. The full make check / stage was not rerun this round because no Go production file changed; one stage rerun is still required before closeout. Current reviewed card: sha256 f67fdfeba069f229c3c3a8add682fd9cad94b7493f3fa62134e0620e1e60021a, 2363 lines; tasks.md: sha256 94ddb61c87e40618f31b308606ff5ec670c202b117d93b4908eb3b6e5e16b0f7, 344 lines, 93 tasks (T081-T090 appended; no pre-existing task edited). Local-only; still not in current.json or CI. R3.6 (2026-10-23) records the user-ruled notification-channel declaration and channel-status closure after manual acceptance reported three issues: a self-built agent failed every run because the template placeholder model passes validation but cannot be called, the agent page could not choose which channels an agent may use, and a ${ENV_VAR} channel was shown as 'no address' because url_host is empty. AGENT.md gains notify_channels (empty = unrestricted, non-empty = allowlist frozen at run admission and enforced before send, naming the declaration instead of 'not found'); the channel view gains url_configured and referenced_by (whole-word scan of active and archived AGENT.md files, explicitly not a binding); the list fails closed (fixed 500) when the reference scan fails while a post-write response degrades to empty references with a WARN; the console shows the three target states, a document-reference column, agent-detail multi-select binding, and a placeholder-model warning; the page is named 通知渠道 and inbound routing stays out of scope. No new route, dependency or migration; binding reuses PUT /agents/{name}/content. Check anchors were extended additively only: 012-workspace-agent now runs and requires the notify_channels loader and patch tests, 012-core-resource-types requires the frozen-ToolEnv test, 012-app-notify-author also runs ./internal/tool and requires the three allowlist tests, and 012-web-admin-notify-workspace requires the notify read suite plus the two write-view reference tests (the read suite existed but had no stage anchor). protect grows by the eleven Go files this round touched. No existing assertion or selection semantics were weakened. Current reviewed card: sha256 ff798e17f12150caa0c07d1592ed00681199108b6c03f64c99ee663cf451fba4, 2393 lines; tasks.md: sha256 e5f9a6f6aeda3a24566becae2eb0f41d414b6768a23adade80feff2f5372d1bd, 365 lines, 105 tasks (T091-T102 appended; no pre-existing task edited). Local-only; still not in current.json or CI.\n\nR4 (2026-10-23) records the user-approved US-12 scope revision: 『按上述 Q1–Q5 和三处修正推进，继续现有 US-12 范围修订流程；完成正式修订与颗粒度评审后实施，最终统一验收。旧证据保留，新范围重新形成完整证据，人工 review ② 继续待定。』 The revision adds stable Agent/resource UIDs with tombstones, resource scope (shared/exclusive), AGENT.md binding authority with a rebuildable DB projection, notify-mode three states, managed credentials (AES-256-GCM with the master key outside the workspace), schema v3 (26 tables) and the forward migration 0003_credentials_scope.sql. Constitution amendment v2.1.0 covers the credential discipline and the two architecture constraints (resource scope; identity and binding authority). Current reviewed card: sha256 39a4afec82248fd0cbdde1ffa7e668f518459f4c195dd64503925956feea8145, 3040 lines (only the R4.17 verification-status table changed after the a163e410 review snapshot: implementation delivered, Demo L-O and unified acceptance still pending; no scope, contract or assertion text moved); spec.md: sha256 c1fa3e1a43c43254a8db8f9b2af17aca06466dd052a1ed9eff764223b30f89dd, 474 lines; plan.md: sha256 5d15501128dc8aace0c25c385772f49ffcd9e7d667fd26c01632464e2ee7924a, 256 lines; tasks.md: sha256 06498745158cfd76902ae10003336c15ded2203edb42ef6c9d814fa5a91b5dd9, 455 lines, 160 tasks, 157 checked / 3 open (T150-T152 at recompute time; post-review snapshot was sha256 4f58d2b46f7eeaf74b4b85eb0eed862e89fc2f69c864d4ab285b0cca0828ff5f before the T153-T157 checkmarks) (T103-T157 appended; no pre-existing task edited). Post-review analyze rulings (2026-10-23): R1-A keeps notify `?force=true` and same-name 400 (FR-059 / contract / existing tests), R2-A aligns FR-067 to the contract (by-name = current pointer; old UID requires explicit resource_uid); derived fixes add e2e/console/ETag/CLI/nonce/pre-write tests (T153-T157) and extend 012-app-scope / 012-credential-managed / 012-console-config required_tests. The 18 R3 checks keep their argv and required_tests; the 14 R4 checks are appended and the existing 012-race anchors gain three additive entries. protect grows by the existing files this round touches; files created by this round are added at T151 because loadStage Lstat requires every protected path to exist. R3 evidence (stage runs, report.json, record.json) is never deleted or overwritten; the R4 run uses a new output directory. T151 (2026-10-23) recomputed the reviewed hashes after T153-T157 and extended protect to the full R4 file set: the 137 provisional paths plus the 108 R4-created or R4-modified Go sources, tests and migrations/0003_credentials_scope.sql (frontend assets stay out because frontend files are not stage checks; the constitution, specs and this stage stay out as governance and process state). The twelve R4-touched existing files named by T151 were already present from the provisional derivation and are unchanged, so protect is now 245 paths. 012-credential-managed keeps its argv (./internal/app ./internal/cli) and required_tests: the four TestSecrets_* that T156 names are delivered in internal/app/credential_ops_test.go because the behaviour lives on the secrets service, and the cli package holds no duplicate wrappers; TestConsoleConfig_* and the three TestV3E2E_* are delivered and green. Required-test anchors were rechecked with go test -list. No check name, argv or assertion was removed, and 012-race keeps its additive three anchors. Local-only, still not in current.json or CI.\n\nR4 review fixes (2026-10-23) record the dispositions of the independent R4 review. B-1 wires a notify delivery recorder into the app assembly so every send writes its derived notify_deliveries row (a failed derived write stays a WARN: the send already happened, and flipping it to failed would trigger duplicate delivery). H-1 makes the shared-to-exclusive conversion always scan active and archived AGENT.md files for a whole-word resource name, unioning that evidence with the binding projection, so an unrecorded or stale projection can never hide a referrer; a missing workspace root or an unreadable scan fails closed. H-2 keeps a retired credential usable by runs that already pinned it while new admissions fail closed, and the previously asserted 'a credential identity can never recover' wording was narrowed to 'a revoked version can never recover' per the user's credential re-entry ruling. M-1 retires the owned credential identity and its active version inside the same delete transaction (revoked stays revoked; env delete is a no-op). M-2 makes crash recovery release run_resource_refs, run_credential_refs and run_notify_refs exactly like FinishRun, in both the close path and the terminal-run backfill. M-3 computes the affected eligible-agent list once and writes it into both the response and the success operation detail. M-4 records the Windows master-key DACL as a deployment duty (icacls) and corrects the Operations claim that the process verifies permissions there; no new x/sys/windows coordinate is allowed by the zero-dependency rule. L-1 accepts the more conservative run_resource_refs uid backfill (only a live pointer is trusted; deleted pointers stay NULL) and states the deviation in the migration comment. required_tests grew additively only: 012-storage-identity gains TestCredentialStore_ResourceDeleteRetiresCredential plus TestRecovery_ClosesRunningRunsAndReleasesRefs and TestRecovery_BackfillsTerminalRunResidualRefs, and its -run gains TestRecovery_; 012-app-scope gains TestScopeConversion_BlockedByDefinitionScan and TestResourceState_NotifyChannelUsesChannelETagAndImpactHint, and its -run gains TestResourceState_; 012-app-notify-author gains TestNotifyDelivery_ExecutorWritesDerivedRow; 012-credential-managed gains TestCredentialGuard_RetiredKeepsInFlightRunButBlocksAdmission. Test selection only widened; no existing anchor, argv or assertion was removed. Local-only, still not in current.json or CI. R5 (2026-10-23) records a second console-closure round inside the already-approved R4 scope: no check, argv, required_tests, protect path or assertion is added or changed; the two field defects fixed here (legacy v1 run manifest 500; create-page draft submission missing an explicit model-connection binding) are covered by existing checks (012-web-runs / 012-web-cfg-structured) plus frontend unit tests. Module card sha256 c1527b1d8e314567156112cfba37874a40638f6580609452e0b1d59f538e4dba, 3132 lines; tasks sha256 a0fc51e171c1a6a6cf4f050674a84e17fec808e36812c03df2f12628ed7065f3, 487 lines, T166-T179 appended and T178 left unchecked until the post-edit acceptance run (a later checkbox-only flip does not move the source fingerprint); spec/plan unchanged from the R4 approval. New product semantics (display_name, clarification turns, natural-language schedules, memory auto-extraction) are recorded as proposals only and are not implemented. R6 (2026-10-24) records the third review-① ruling inside the already-approved US-12 scope: 『display_name 采纳（只改显示，不改身份）；问答式补全采纳但仅信息不足时提问；定时任务一句话采纳，服务端复用现有 cron / 时区解析器计算未来三次触发』；memory auto-extraction stays on plan B and out of US-12. Module card sha256 93124569688d4d5607a7db2bfa8308395657e7912787ed07ea6cbe5053371ddc, 3220 lines (R6.1-R6.6 including the eight-item impact list and the 16-step browser evidence table); tasks.md sha256 1ce871f45652927d8f1a411ed5d2b6d8ff5bb8679b9e3cc4e936e4d8671c08d3, 507 lines (T180-T194 appended; the acceptance fingerprint normalizes task checkboxes, so a later checkbox-only flip does not change the recorded input hash). The stage keeps every check, argv entry, required_test, protect path and assertion from R1-R5; R6 only appends anchors: 012-core-author-agent +7 author Q&A / schedule parser tests; 012-workspace-agent +2 display_name loader tests, +2 TestValidateScheduleCandidate_ tests and +2 display_name patch tests, with its -run gaining TestValidateScheduleCandidate_; 012-app-agent-admin +4 generate-files answers / schedule-draft service tests, +TestAgentConfigFields_DisplayName and +TestParseOccurrences_MatchesEngine (argv now also runs ./internal/adapters/cron; -run gains TestAgentConfigFields_ and TestParseOccurrences_); 012-app-notify-author +4 TestAuthorService_ answer / schedule tests; 012-web-admin-agents +3 generate-files answers / schedule-draft handler tests; 012-web-cfg-structured now also runs and requires TestAgentContentChanges_DisplayNameTriState and TestAgentContent_PutDisplayNameRoundTrip; 012-web-etag-routes +TestAdminViews_ScheduleDraftProjection and +TestOpenAPI_ScheduleTimeFields, with -run gaining TestOpenAPI_. protect grows by internal/adapters/cron/cron.go and cron_test.go; frontend assets stay out because frontend files are not stage checks. inputs are unchanged and the stage stays local-only (not in harness/stages/current.json, not referenced by CI), so the private docs/us module card remains allowed by the CI-visibility rule; no new input path was added. No assertion or selection semantics were weakened.\n\nR7 (2026-10-24) records the fourth pre-review round responding to nine user-reported verification defects and the user's A-E ruling plus three corrections: scheduled results are now delivered by the system when a task names a channel resource UID (deliver_to), with a pre-written authoritative schedule_deliveries row, a success-only send, a three-valued sent/failed/unknown conclusion and no blind resend; runs with a delivery target suppress the model notify tool and the authorization layer still denies it; notify is the single tool the system may add or remove, and every change is returned in changes.tools_added / changes.tools_removed (constitution v3.0.0, architecture constraint 11; MAJOR because the absolute no-auto-tool-change rule became one controlled exception); the console gains a real session deep link, a shortened model-connection list, separate availability versus last_test, and an explicit session-history-versus-long-term-memory notice; connection tests send the fixed text and record a three-valued last_test projection; schema v4 adds migration 0004_schedule_delivery.sql (scheduled_tasks.deliver_to, schedule_deliveries, resource_connection_tests); the operations layer gains a one-time credential import (template outside the repository, existing admin write/encrypt/audit path, resource UID preserved, idempotent by last4 with an explicit -Rotate) and a local redeploy script (identify the basalt serve listener, graceful stop, preserve workspace/database/config/master key, start the new build, verify health/auth/frontend hashes). Stage changes are additive only: seven new checks (012-core-schedule-delivery, 012-app-schedule-delivery, 012-app-notify-assembly, 012-app-connection-tests, 012-storage-delivery-records, 012-tool-delivery, 012-web-schedule-delivery) plus one additive required test in 012-web-admin-agents (TestAdminAgents_AuthorFailureIsActionable); every existing check, argv, required_test, protect path and assertion is preserved, and protect grows by the R7-created or R7-modified Go sources, tests and migration 0004. Frontend assets remain outside stage checks. Real Feishu delivery and the real-model one-line schedule creation still require user-supplied credentials and stay recorded as unverified; review ② remains pending.\n\nR8 (2026-10-24) records the six user rulings and the resulting scope revision: Chinese UI copy via typed reason mapping with English log templates and a safe execution-history projection; the network domain allowlist becomes database-authoritative with console hot apply, pre-written audit, revision CAS and three-state recovery; session lists refresh automatically without a WebSocket and never auto-resend runs; terminology changes stay display-only; memory behaviour is explained without changing storage; the admin token remains minimal management authentication with enterprise identity deferred to B/G. Implementation adds schema v5 (migration 0005_network_domain_policy.sql, one policy row plus management_operations linkage), zero new Go coordinates and no new frontend runtime dependency. Stage changes are additive only: five new checks (012-storage-network-policy, 012-app-network-allowlist, 012-tool-allowlist-hot, 012-web-errors-zh, 012-web-sandbox-write), one additive race anchor (TestWhitelistPolicy_ConcurrentSwapAndCheck), and protect grows by the R8-created or R8-modified Go sources, tests and migration 0005; every existing check, argv, required_test, protect path and assertion is preserved. Frontend assets remain outside stage checks. review ② remains pending. R8R closeout (2026-10-24) dispositions the independent R8 review findings R8R-01..R8R-05 inside the approved R8 scope: typed reject kinds now reach every surface so English loader reasons never become user-visible copy, the lifecycle transition log message is English, network_allowlist is accepted on the operations read side, the whitelist management detail keeps before_revision/after_revision, and a 409 no longer returns current_etag while the losing process reloads the authoritative row. protect gains the four pre-existing files those fixes touched (internal/app/registry.go, internal/web/handlers_lifecycle.go, internal/web/handlers_lifecycle_test.go, internal/web/handlers_operations.go). R8R-01 also removed the prefix-table mapping the check used to freeze, so 012-web-errors-zh replaces its two TestProblemText_* anchors with the typed-mapping set (TestAgentRejectMessage_TypedKindsBecomeChinese, TestAgentRejectMessage_CoversEveryDefinedKind, TestEntryRejectMessage_IgnoresEnglishReason) and widens its -run accordingly; that is a strictly stronger anchor set for the approved typed mapping (18-case table, all-kind coverage, English never passes through), not a weakening. All other checks, argv, required_tests and assertions are unchanged.",
+  "inputs": [
+    "docs/us/us12-agent-resource-management.md",
+    "specs/012-agent-resource-management/spec.md",
+    "specs/012-agent-resource-management/plan.md",
+    "specs/012-agent-resource-management/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/core/errors.go",
+    "internal/core/mcp.go",
+    "internal/workspace/agent.go",
+    "internal/workspace/agent_files.go",
+    "internal/workspace/templates.go",
+    "internal/workspace/skill.go",
+    "internal/workspace/mcp.go",
+    "internal/storage/resource_store.go",
+    "internal/app/baseline.go",
+    "internal/app/providers.go",
+    "internal/app/mcp.go",
+    "internal/app/notify.go",
+    "internal/app/run.go",
+    "internal/app/schedule.go",
+    "internal/app/wire.go",
+    "internal/app/web.go",
+    "internal/app/ports.go",
+    "internal/web/envelope.go",
+    "internal/web/server.go",
+    "internal/cli/config.go",
+    "internal/tool/mcp.go",
+    "internal/cli/config_test.go",
+    "internal/cli/profile_test.go",
+    "internal/workspace/agent_files_test.go",
+    "internal/workspace/templates_test.go",
+    "internal/workspace/context_loader_test.go",
+    "internal/workspace/mcp_test.go",
+    "internal/workspace/agent_test.go",
+    "internal/storage/resource_store_test.go",
+    "internal/tool/mcp_test.go",
+    "internal/tool/mcp_integration_test.go",
+    "internal/app/providers_test.go",
+    "internal/app/mcp_test.go",
+    "internal/app/notify_test.go",
+    "internal/app/run_test.go",
+    "internal/app/schedule_test.go",
+    "internal/app/web_test.go",
+    "internal/app/ports_test.go",
+    "internal/web/server_test.go",
+    "internal/web/contract_test.go",
+    "internal/web/handlers_operations_test.go",
+    "internal/e2e/harness_test.go",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/run-and-errors.md",
+    "docs/contracts/schema.sql",
+    "docs/contracts/agent-md.md",
+    "go.mod",
+    "go.sum",
+    "Makefile",
+    "harness/acceptance.json",
+    "scripts/check-acceptance.sh",
+    "scripts/check-acceptance.ps1",
+    "scripts/acceptance/acceptance_test.go",
+    "scripts/acceptance/config.go",
+    "scripts/acceptance/execute.go",
+    "scripts/acceptance/fingerprint.go",
+    "scripts/acceptance/main.go",
+    "scripts/acceptance/process_unix.go",
+    "scripts/acceptance/process_windows.go",
+    "scripts/acceptance/sync_unix.go",
+    "scripts/acceptance/sync_windows.go",
+    "internal/app/resources.go",
+    "internal/web/handlers_agent_content.go",
+    "internal/app/recovery_operations_test.go",
+    "internal/app/resources_test.go",
+    "internal/app/wire_mcp_test.go",
+    "internal/app/wire_test.go",
+    "internal/workspace/content_edit_test.go",
+    "internal/core/author_test.go",
+    "internal/core/agent_admin_test.go",
+    "internal/core/resource_admin_test.go",
+    "internal/workspace/yaml_block_test.go",
+    "internal/workspace/provider_file_test.go",
+    "internal/workspace/skill_admin_test.go",
+    "internal/workspace/agent_admin_test.go",
+    "internal/workspace/agent_draft_test.go",
+    "internal/workspace/notify_scan_test.go",
+    "internal/storage/agent_admin_store_test.go",
+    "internal/storage/notify_admin_store_test.go",
+    "internal/app/resource_admin_test.go",
+    "internal/app/agent_admin_test.go",
+    "internal/app/mcp_supervisor_test.go",
+    "internal/app/definition_reconcile_test.go",
+    "internal/app/notify_admin_test.go",
+    "internal/app/author_test.go",
+    "internal/app/workspace_browse_test.go",
+    "internal/web/handlers_admin_agents_test.go",
+    "internal/web/handlers_admin_archived_test.go",
+    "internal/web/handlers_admin_resources_test.go",
+    "internal/web/handlers_admin_notify_test.go",
+    "internal/web/handlers_admin_workspace_test.go",
+    "internal/web/etag_test.go",
+    "internal/web/views_admin_test.go",
+    "internal/web/admin_routes_test.go",
+    "internal/cli/author_test.go",
+    "internal/e2e/admin_console_test.go",
+    "internal/core/profile.go",
+    "internal/core/run.go",
+    "internal/core/service.go",
+    "internal/core/service_test.go",
+    "internal/workspace/content_edit.go",
+    "internal/tool/notify.go",
+    "internal/tool/notify_test.go",
+    "internal/web/views.go",
+    "internal/web/handlers_notify_read.go",
+    "internal/web/handlers_notify_read_test.go",
+    "internal/web/handlers_admin_notify.go",
+    "internal/app/agent_admin.go",
+    "internal/app/agent_console.go",
+    "internal/app/baseline_test.go",
+    "internal/app/agent_console_test.go",
+    "internal/storage/migrate.go",
+    "internal/storage/schema.sql",
+    "internal/storage/migrate_test.go",
+    "internal/web/handlers_resources.go",
+    "internal/web/handlers_resources_test.go",
+    "internal/web/handlers_agent_content_test.go",
+    "internal/web/handlers_admin_agents.go",
+    "internal/web/console_test.go",
+    "internal/workspace/lifecycle.go",
+    "internal/workspace/lifecycle_test.go",
+    "basalt.yaml.example",
+    "docs/Operations.md",
+    "docs/Compatibility.md",
+    "internal/core/resources.go",
+    "internal/core/resources_test.go",
+    "internal/storage/run_store.go",
+    "internal/storage/run_store_test.go",
+    "internal/storage/run_query.go",
+    "internal/storage/run_query_test.go",
+    "internal/storage/notify_admin_store.go",
+    "internal/storage/notify_store.go",
+    "internal/storage/migration_v2_test.go",
+    "internal/cli/status_test.go",
+    "internal/e2e/bootstrap_test.go",
+    "internal/web/handlers_runs_test.go",
+    "docs/DevelopmentLoop.md",
+    "evals/main.go",
+    "internal/app/author.go",
+    "internal/app/bindings.go",
+    "internal/app/bindings_test.go",
+    "internal/app/config_consistency_test.go",
+    "internal/app/credential_crypto.go",
+    "internal/app/credential_crypto_test.go",
+    "internal/app/credential_crypto_unix.go",
+    "internal/app/credential_crypto_windows.go",
+    "internal/app/credential_guard.go",
+    "internal/app/credential_guard_test.go",
+    "internal/app/credential_leak_test.go",
+    "internal/app/credential_ops.go",
+    "internal/app/credential_ops_test.go",
+    "internal/app/credential_resolver.go",
+    "internal/app/credential_resolver_test.go",
+    "internal/app/definition_reconcile.go",
+    "internal/app/mcp_supervisor.go",
+    "internal/app/migrate_v3.go",
+    "internal/app/migrate_v3_test.go",
+    "internal/app/notify_admin.go",
+    "internal/app/notify_mode.go",
+    "internal/app/notify_mode_test.go",
+    "internal/app/notify_read.go",
+    "internal/app/resource_admin.go",
+    "internal/app/resource_state.go",
+    "internal/app/resource_state_test.go",
+    "internal/app/scope.go",
+    "internal/app/scope_test.go",
+    "internal/app/workspace_browse.go",
+    "internal/cli/author.go",
+    "internal/cli/deps.go",
+    "internal/cli/ports.go",
+    "internal/cli/root.go",
+    "internal/cli/secrets.go",
+    "internal/cli/secrets_test.go",
+    "internal/core/agent_admin.go",
+    "internal/core/author.go",
+    "internal/core/binding.go",
+    "internal/core/binding_test.go",
+    "internal/core/credential.go",
+    "internal/core/credential_test.go",
+    "internal/core/identity.go",
+    "internal/core/identity_test.go",
+    "internal/core/lifecycle.go",
+    "internal/core/lifecycle_test.go",
+    "internal/core/management.go",
+    "internal/core/notify.go",
+    "internal/core/provider.go",
+    "internal/core/resource_admin.go",
+    "internal/core/scope.go",
+    "internal/core/scope_test.go",
+    "internal/core/tool_exec.go",
+    "internal/e2e/agentloop_test.go",
+    "internal/e2e/v3_test.go",
+    "internal/storage/agent_admin_store.go",
+    "internal/storage/binding_store.go",
+    "internal/storage/binding_store_test.go",
+    "internal/storage/bootstrap_test.go",
+    "internal/storage/credential_store.go",
+    "internal/storage/credential_store_test.go",
+    "internal/storage/db.go",
+    "internal/storage/example_test.go",
+    "internal/storage/identity_store.go",
+    "internal/storage/identity_store_test.go",
+    "internal/storage/management_store.go",
+    "internal/storage/management_store_test.go",
+    "internal/storage/migration_v3_test.go",
+    "internal/storage/migrations/0003_credentials_scope.sql",
+    "internal/storage/notify_delivery_store.go",
+    "internal/storage/notify_delivery_store_test.go",
+    "internal/storage/notify_store_test.go",
+    "internal/storage/run_credential_store.go",
+    "internal/storage/run_credential_store_test.go",
+    "internal/storage/schema_contract_test.go",
+    "internal/tool/mcp_http_test.go",
+    "internal/tool/mcp_process_unix.go",
+    "internal/tool/mcp_process_windows.go",
+    "internal/tool/policy.go",
+    "internal/tool/policy_hot_test.go",
+    "internal/core/network_policy.go",
+    "internal/storage/network_policy_store.go",
+    "internal/storage/network_policy_store_test.go",
+    "internal/storage/migrations/0005_network_domain_policy.sql",
+    "internal/app/network_allowlist.go",
+    "internal/app/network_allowlist_test.go",
+    "internal/app/network_allowlist_recovery_test.go",
+    "internal/web/errors_zh.go",
+    "internal/web/errors_zh_test.go",
+    "internal/web/handlers_sandbox.go",
+    "internal/web/handlers_sandbox_write_test.go",
+    "internal/web/handlers_lifecycle.go",
+    "internal/web/handlers_lifecycle_test.go",
+    "internal/web/handlers_operations.go",
+    "internal/app/registry.go",
+    "internal/web/admin_routes.go",
+    "internal/web/console_config_test.go",
+    "internal/web/etag.go",
+    "internal/web/handlers_admin_archived.go",
+    "internal/web/handlers_admin_resources.go",
+    "internal/web/handlers_admin_workspace.go",
+    "internal/web/handlers_agent_config.go",
+    "internal/web/handlers_agent_config_test.go",
+    "internal/web/handlers_credentials.go",
+    "internal/web/handlers_credentials_test.go",
+    "internal/web/handlers_sessions.go",
+    "internal/web/handlers_system_test.go",
+    "internal/web/handlers_test.go",
+    "internal/web/ports_admin.go",
+    "internal/web/views_admin.go",
+    "internal/workspace/agent_admin.go",
+    "internal/workspace/agent_draft.go",
+    "internal/workspace/bindings.go",
+    "internal/workspace/bindings_test.go",
+    "internal/workspace/context_loader.go",
+    "internal/workspace/identity_state.go",
+    "internal/workspace/identity_state_test.go",
+    "internal/workspace/notify_scan.go",
+    "internal/workspace/provider_file.go",
+    "internal/workspace/recovery.go",
+    "internal/workspace/skill_admin.go",
+    "internal/workspace/skill_version.go",
+    "internal/workspace/skill_version_test.go",
+    "internal/workspace/yaml_block.go",
+    "internal/adapters/cron/cron.go",
+    "internal/adapters/cron/cron_test.go",
+    "internal/core/delivery.go",
+    "internal/core/scheduler.go",
+    "internal/core/scheduler_delivery_test.go",
+    "internal/app/delivery.go",
+    "internal/app/delivery_test.go",
+    "internal/app/notify_assembly.go",
+    "internal/app/notify_assembly_test.go",
+    "internal/app/notify_admin_connectivity_test.go",
+    "internal/app/resource_test_status_test.go",
+    "internal/storage/delivery_store.go",
+    "internal/storage/connection_test_store.go",
+    "internal/storage/connection_test_store_test.go",
+    "internal/storage/migrations/0004_schedule_delivery.sql",
+    "internal/tool/delivery.go",
+    "internal/tool/delivery_test.go",
+    "internal/web/handlers_schedules.go"
+  ],
+  "checks": [
+    {
+      "id": "012-core-author-agent",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAuthor_|TestAgentSpec_|TestManagementActions_)",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAgentSpec_RequiredFields",
+        "TestAgentSpec_ZeroValueHasNoDefaults",
+        "TestAgentSpec_ArchiveRecordFields",
+        "TestAgentSpec_ArchiveRecordUnrestoredNil",
+        "TestAgentSpec_FileInfoSize",
+        "TestAuthor_PromptStable",
+        "TestAuthor_PromptMarksEmptyReferences",
+        "TestAuthor_DraftParsesFiles",
+        "TestAuthor_DraftRejectsIllegalPaths",
+        "TestAuthor_DraftRequiresAgentMD",
+        "TestAuthor_DraftRejectsMalformedInput",
+        "TestAuthor_PromptWithAnswers",
+        "TestAuthor_NormalizeAnswers",
+        "TestAuthor_DraftParsesQuestions",
+        "TestAuthor_DraftRejectsMalformedQuestions",
+        "TestAuthor_SchedulePromptStable",
+        "TestAuthor_ScheduleCandidateParsing",
+        "TestAuthor_ScheduleInstructionAndID",
+        "TestManagementActions_LiteralSet",
+        "TestManagementActions_TargetKinds"
+      ]
+    },
+    {
+      "id": "012-core-resource-types",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestResourceKind_|TestResourceVersion_|TestResourcePointer_|TestAgentService_Resources_)",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestResourceKind_LiteralsOnly",
+        "TestResourceKind_RejectsUnknown",
+        "TestResourceVersion_Fields",
+        "TestResourceVersion_ETagShape",
+        "TestResourcePointer_Validation",
+        "TestResourcePointer_DeletedAndAppliedSemantics",
+        "TestAgentService_Resources_ToolEnvCarriesFrozenNotifyChannels"
+      ]
+    },
+    {
+      "id": "012-workspace-yaml-provider",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestYAMLBlock_|TestProviderDef_|TestProviderFile_|TestBlockEditor_|TestParseMCPServers_)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestProviderDef_ParseAndRender",
+        "TestProviderDef_ValidationMatrix",
+        "TestProviderDef_RejectsUnsupportedShapes",
+        "TestProviderDef_RejectsDuplicateNames",
+        "TestProviderDef_DoesNotResolveEnvironment",
+        "TestProviderFile_ReadProviderEntries",
+        "TestProviderFile_UpdateAppendsNewEntry",
+        "TestProviderFile_UpdateReplacesExistingEntry",
+        "TestProviderFile_UpdateCreatesBlockWhenAbsent",
+        "TestProviderFile_RemoveKeepsSiblings",
+        "TestProviderFile_CommentsLostNoWrite",
+        "TestProviderFile_AtomicWrite",
+        "TestProviderFile_ETagBytes",
+        "TestProviderFile_RejectsInvalidSibling",
+        "TestYAMLBlock_ReplacePreservesCommentsAndSurroundings",
+        "TestYAMLBlock_FindBlockLocatesBlock",
+        "TestYAMLBlock_BlockEntriesScansEntries",
+        "TestYAMLBlock_ReplaceEntryKeepsOutsideBytes",
+        "TestYAMLBlock_ReplaceEntryReportsCommentsLost",
+        "TestYAMLBlock_ReplaceEntryRejectsUnknownAndDuplicateNames",
+        "TestYAMLBlock_ReplaceEntryRejectsBadRenderedEntry",
+        "TestYAMLBlock_AppendEntryAfterLastItem",
+        "TestYAMLBlock_AppendEntryCreatesBlock",
+        "TestYAMLBlock_RemoveEntryKeepsSiblings",
+        "TestYAMLBlock_RemoveEntryReportsCommentsLost",
+        "TestBlockEditor_PreservesOutsideBytes",
+        "TestBlockEditor_RejectsFlowStyle",
+        "TestBlockEditor_RejectsDuplicateKeys",
+        "TestBlockEditor_RejectsAnchorsAliasesAndMergeKeys",
+        "TestYAMLBlock_ConcurrentReaders",
+        "TestBlockEditor_RejectsMultiDocument",
+        "TestParseMCPServers_MissingOrEmptyYieldsZero",
+        "TestParseMCPServers_ListOrderPreserved",
+        "TestParseMCPServers_RejectsNonMappingRoot",
+        "TestParseMCPServers_RejectsServersNotList",
+        "TestParseMCPServers_RejectsEntryNotMapping",
+        "TestParseMCPServers_RequiresNameAndCommand",
+        "TestParseMCPServers_RejectsDuplicateNames",
+        "TestParseMCPServers_RejectsEnvNotMapping",
+        "TestParseMCPServers_RejectsPlaintextEnvWithoutEchoingValue",
+        "TestParseMCPServers_AcceptsExactPlaceholderOnly",
+        "TestParseMCPServers_TransportDefaultsToStdio",
+        "TestParseMCPServers_RejectsUnsupportedTransport",
+        "TestParseMCPServers_RejectsNonStringTransport",
+        "TestParseMCPServers_IgnoresUnknownEntryKeys",
+        "TestParseMCPServers_EnvKeysPreserved",
+        "TestParseMCPServers_ParseErrorIsSummarized",
+        "TestParseMCPServers_CandidateMatrix",
+        "TestParseMCPServers_RejectsUserinfoAndPlaintextTokenArgs",
+        "TestParseMCPServers_LegacyCommandSplitWarns",
+        "TestParseMCPServers_LegacyAmbiguousRejected",
+        "TestParseMCPServers_StrictMultiWordCommandRejected",
+        "TestParseMCPServers_TransportRequiredForCandidate",
+        "TestParseMCPServers_ExtendedFieldsRoundTrip",
+        "TestParseMCPServers_DuplicateNamesAcrossTransports"
+      ]
+    },
+    {
+      "id": "012-workspace-skill",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestSkill|TestNotifyScan_)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSkillVersion_HashWorkCopyFixedVector",
+        "TestSkillVersion_L1CardLineUsesWorkCopyPath",
+        "TestSkillVersion_L2KeepsRawBodyBytes",
+        "TestSkillVersion_CRLFBodyIsNotNormalized",
+        "TestSkillVersion_L2WithoutFrontmatterUsesWholeFile",
+        "TestSkillVersion_EmptyL3HashesEmptyArray",
+        "TestSkillVersion_RejectsNonUTF8SkillMD",
+        "TestSkillVersion_RejectsMissingSKILLMD",
+        "TestSkillVersion_FilesAreSortedByPath",
+        "TestSkillLibrary_MaterializeFreezesPublishedCopy",
+        "TestSkillLibrary_MaterializeIsIdempotent",
+        "TestSkillLibrary_MaterializeRejectsHashMismatch",
+        "TestSkillLibrary_LoadPublishedRecomputesHashes",
+        "TestSkillLibrary_LoadPublishedRejectsForeignPath",
+        "TestSkillVersion_SnapshotPublishedUsesPublishedCard",
+        "TestSkillVersion_SnapshotPublishedFailsClosed",
+        "TestSkillVersion_SnapshotWorkCopyKeepsLegacyPaths",
+        "TestSkillPaths_MapsWorkCopyToVersionDir",
+        "TestSkillPaths_RejectsInvalidName",
+        "TestSkillPaths_RejectsNonPositiveVersion",
+        "TestNotifyScan_WordBoundary",
+        "TestNotifyScan_CaseSensitive",
+        "TestNotifyScan_ActiveDocuments",
+        "TestNotifyScan_ArchiveDocuments",
+        "TestNotifyScan_ParseFailureKeepsDocument",
+        "TestNotifyScan_SkipsNonDocuments",
+        "TestNotifyScan_RejectsNonRegularDefinition",
+        "TestNotifyScan_RejectsOversizeDocument",
+        "TestNotifyScan_RequiresInitializedWorkspace",
+        "TestSkillImport_TextOnly",
+        "TestSkillImport_BoundaryMatrix",
+        "TestSkillImport_CaseFoldDuplicate",
+        "TestSkillImport_SizeLimits",
+        "TestSkillImport_MissingSKILLMD",
+        "TestSkillImport_InvalidFrontmatter",
+        "TestSkillImport_InvalidNames",
+        "TestSkillImport_NoExecution",
+        "TestSkillCandidate_ManifestHashRecomputable",
+        "TestSkillValidate_SameGateAsImport",
+        "TestSkillValidate_NoWrites",
+        "TestSkillUpdate_FullReplacement",
+        "TestSkillUpdate_CrashResidue",
+        "TestSkillWrite_RejectsTamperedCandidate",
+        "TestSkillVersion_Immutable",
+        "TestSkillSnapshot_WorkCopyDrift",
+        "TestSkillSnapshot_RejectsSymlink",
+        "TestSkillDelete_WorkCopyArchived",
+        "TestSkillArchive_ConflictKeepsSource",
+        "TestSkillArchive_MissingSourceAndBadName"
+      ]
+    },
+    {
+      "id": "012-workspace-agent",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAgentFiles_|TestAgentAdmin_|TestAgentDraft_|TestRewriteAgentName_|TestValidateAgentName_|TestValidateScheduleCandidate_|TestCreateAgent_|TestDeleteAgent_|TestAgentCopy_|TestAgentRestore_|TestLifecycle_|TestAgentLoader_|TestApplyChanges_)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestRewriteAgentName_UpdatesNameAndIdentity",
+        "TestRewriteAgentName_LeavesAbsentIdentityAbsent",
+        "TestRewriteAgentName_PreservesCommentsAndEncodesValue",
+        "TestRewriteAgentName_RejectsFlowIdentity",
+        "TestRewriteAgentName_RequiresName",
+        "TestRewriteAgentName_RejectsDuplicateName",
+        "TestRewriteAgentName_PreservesCRLF",
+        "TestRewriteAgentName_RejectsInvalidName",
+        "TestAgentCopy_RewritesNameAndIdentity",
+        "TestAgentCopy_ClearsSchedules",
+        "TestAgentCopy_PreservesNestedFilesAndReturnsManagedSet",
+        "TestAgentCopy_RejectsMissingOrNonDirectorySource",
+        "TestAgentCopy_TargetExistsRefused",
+        "TestAgentCopy_DefinitionFailureLeavesNoStaging",
+        "TestAgentRestore_RewritesNameIdentityAndClearsSchedules",
+        "TestAgentRestore_RejectsUnrestorableArchive",
+        "TestAgentRestore_LeavesArchiveAndLifecycleUntouched",
+        "TestAgentFiles_CollectionETag",
+        "TestAgentFiles_ManagedFilesOnlyRegularDirect",
+        "TestAgentFiles_StaleETag412NoWrite",
+        "TestAgentFiles_IfMatchMalformed412",
+        "TestAgentFiles_FullCopyAndTwoRenames",
+        "TestAgentFiles_UnlistedFilesKept",
+        "TestAgentFiles_CrashResidue",
+        "TestAgentFiles_PathMatrix",
+        "TestAgentFiles_CaseCollision",
+        "TestAgentFiles_MissingAgentMDRejected",
+        "TestAgentFiles_NewFileSubdirectory",
+        "TestCreateAgent_WritesLoadableTemplate",
+        "TestCreateAgent_DefaultsUnchanged",
+        "TestCreateAgent_RefusesExistingDirectory",
+        "TestCreateAgent_RejectsInvalidName",
+        "TestCreateAgent_EncodesNamesThroughYAML",
+        "TestCreateAgent_DoesNotTakeInstanceLock",
+        "TestCreateAgent_RefusesStagingResidue",
+        "TestDeleteAgent_ArchivesWithoutTouchingData",
+        "TestDeleteAgent_UsesUTCStamp",
+        "TestDeleteAgent_ComputesManifestAndHash",
+        "TestDeleteAgent_RefusesMissingAgent",
+        "TestDeleteAgent_RejectsInvalidName",
+        "TestDeleteAgent_RefusesNonDirectoryEntry",
+        "TestDeleteAgent_RefusesCollidingArchiveTarget",
+        "TestLifecycle_SingleWriter",
+        "TestAgentLoader_ParsesAllFrontmatterFields",
+        "TestAgentLoader_NotifyChannelsBlankRejected",
+        "TestAgentLoader_NotifyChannelsUnknownNameStaysLoadable",
+        "TestAgentLoader_DisplayName",
+        "TestAgentLoader_DisplayNameKeepsUnknownKeyWarn",
+        "TestValidateScheduleCandidate_AcceptsAndNormalizes",
+        "TestValidateScheduleCandidate_RejectsInvalid",
+        "TestApplyChanges_NotifyChannelsPatchOnly",
+        "TestApplyChanges_DisplayNameThreeState",
+        "TestApplyChanges_DisplayNameRejectsInvalid"
+      ]
+    },
+    {
+      "id": "012-storage-admin",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestResourceStore_|TestResourceVersions_|TestAgentAdminStore_|TestNotifyAdminStore_|TestSchemaV2_)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAgentAdminStore_InsertArchiveWritesRow",
+        "TestAgentAdminStore_InsertArchiveFinishesOperation",
+        "TestAgentAdminStore_InsertArchiveRollsBackOnMissingOperation",
+        "TestAgentAdminStore_InsertArchiveRefusesDuplicateID",
+        "TestAgentAdminStore_MarkRestoredSetsFieldsAndFinishesOperation",
+        "TestAgentAdminStore_MarkRestoredMissingArchive",
+        "TestAgentAdminStore_ArchiveByIDRoundTripsRestoredFields",
+        "TestAgentAdminStore_ListArchivesNewestFirst",
+        "TestSchemaV2_NewDatabaseHasV2Tables",
+        "TestSchemaV2_VersionRecorded",
+        "TestSchemaV2_MigrateFromV1",
+        "TestSchemaV2_MigrationPreservesExistingRows",
+        "TestSchemaV2_MigrationIsIdempotent",
+        "TestSchemaV2_TooNewBinaryRefused",
+        "TestSchemaV2_IndexesCreated",
+        "TestSchemaV2_StatusCheckConstraint",
+        "TestSchemaV2_ResourceKindCheckConstraint",
+        "TestSchemaV2_RefPrimaryKey",
+        "TestNotifyAdminStore_CRUD",
+        "TestNotifyAdminStore_CreateEmptyURL",
+        "TestNotifyAdminStore_DuplicateNameIsConflict",
+        "TestNotifyAdminStore_UpdateKeepsURLWhenRequested",
+        "TestNotifyAdminStore_UpdateReplacesURL",
+        "TestNotifyAdminStore_DeleteMissingIsNotFound",
+        "TestNotifyAdminStore_RejectsInvalidWrites",
+        "TestResourceStore_EnsureVersionInsertsFirstVersion",
+        "TestResourceStore_EnsureVersionIsIdempotentByHash",
+        "TestResourceStore_EnsureVersionAssignsMonotonicNumbers",
+        "TestResourceStore_EnsureVersionValidatesInput",
+        "TestResourceStore_ConcurrentEnsure",
+        "TestResourceStore_PublishUpsertsPointer",
+        "TestResourceStore_PublishKeepsAppliedWhenNotApplied",
+        "TestResourceStore_PublishRejectsCrossResourceVersion",
+        "TestResourceStore_PublishClearsDeletedMark",
+        "TestResourceStore_PointerAndVersionNotFound",
+        "TestResourceStore_VersionsNewestFirstAndListPointersSkipsDeleted",
+        "TestResourceStore_ReferencedByCountsUnreleasedOnly",
+        "TestResourceStore_PublishWithVersionIsAtomic",
+        "TestResourceStore_PublishWithVersionStateKeepsApplied",
+        "TestResourceStore_LifecycleIndexRoundTrip",
+        "TestResourceStore_MarkDeleted",
+        "TestResourceStore_MarkDeletedKeepsVersionsAppendOnly",
+        "TestResourceStore_MarkDeletedIsIdempotent",
+        "TestResourceStore_MarkDeletedMissingPointer",
+        "TestResourceStore_MarkDeletedMissingOperation",
+        "TestResourceStore_MarkDeletedRollsBackWhenTerminalWriteFails",
+        "TestResourceStore_MarkDeletedValidatesInput",
+        "TestResourceStore_MarkDeletedLeavesOtherResources",
+        "TestResourceStore_EnsureVersionRequiresOperation",
+        "TestResourceStore_ConcurrentVersionNo"
+      ]
+    },
+    {
+      "id": "012-app-resource-admin",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestResourceAdmin_|TestResourceVersionDetail_|TestResourceDelete_|TestResourceRecreate_|TestResourceWrite_|TestReferences_|TestPublish_|TestProviderCatalog_|TestRunAdmission_|TestRunRuntime_|TestModelConnection_|TestSkill_|TestSkillWrite_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 240,
+      "required_tests": [
+        "TestProviderCatalog_PublishedNamesOnly",
+        "TestProviderCatalog_OverrideNoRealClient",
+        "TestProviderCatalog_OverridePerPublishedName",
+        "TestProviderCatalog_ZeroPublishedBuildsEmpty",
+        "TestProviderCatalog_BuildFailureKeepsOld",
+        "TestProviderCatalog_MissingEnvFailsClosed",
+        "TestProviderCatalog_DefinitionNameMismatchRejected",
+        "TestProviderCatalog_MultipleEntriesRejected",
+        "TestResourceAdmin_PublishFailureKeepsOldPointer",
+        "TestResourceAdmin_PublishBuildFailureKeepsOld",
+        "TestResourceAdmin_DBFailureRestoresFile",
+        "TestResourceAdmin_NoFileWriteOnPreWriteFailure",
+        "TestResourceAdmin_EveryWriteHasOperation",
+        "TestModelConnection_UpsertPublishes",
+        "TestModelConnection_UpdateInheritsAPIKey",
+        "TestModelConnection_ManagedSaveBuildsRuntimeClient",
+        "TestModelConnection_StaleETagZeroWrite",
+        "TestModelConnection_MissingEnvZeroWrite",
+        "TestModelConnection_DuplicateCreateWritesFailedOperation",
+        "TestResourceWrite_FileDivergedConflict",
+        "TestResourceWrite_DivergenceCheckedInsideFileLock",
+        "TestPublish_RewritesDefinitionFile",
+        "TestPublish_RevertCreatesNewVersion",
+        "TestPublish_ManagedCredentialPublishByVersion",
+        "TestPublish_Idempotent",
+        "TestPublish_RetryAfterFileRewriteCompletes",
+        "TestModelConnection_TestWritesOperation",
+        "TestModelConnection_TestFailureIsSuccessOperation",
+        "TestModelConnection_TestTimeout504",
+        "TestModelConnection_TestNotConfigured503",
+        "TestReferences_AgentAndRunUnion",
+        "TestReferences_ActiveRunRefs",
+        "TestReferences_DistinguishesReleasedRuns",
+        "TestReferences_DeletedResourceStillAnswerable",
+        "TestResourceDelete_ReferencedByAgent",
+        "TestResourceDelete_UnparseableAgentBlocks",
+        "TestResourceDelete_ArchivedAgentBlocks",
+        "TestResourceDelete_ActiveRunRef",
+        "TestResourceDelete_NoNewVersion",
+        "TestResourceRecreate_VersionContinues",
+        "TestResourceDelete_RebuildFailureRestoresFile",
+        "TestResourceDelete_SkipsTargetEnvResolution",
+        "TestResourceDelete_RetryAfterBlockRemovedCompletes",
+        "TestResourceDelete_SkillRetryAfterArchiveCompletes",
+        "TestResourceDelete_StaleETag412",
+        "TestResourceDelete_UnknownName404",
+        "TestResourceDelete_UnsupportedKind",
+        "TestResourceVersionDetail_Projection",
+        "TestResourceVersionDetail_DeletedResourceReadable",
+        "TestResourceVersionDetail_NotFound",
+        "TestResourceVersionDetail_RedactionFailClosed",
+        "TestResourceVersionDetail_SkillManifest",
+        "TestResourceAdmin_Versions_Projection",
+        "TestResourceAdmin_Versions_DeletedResourceReadable",
+        "TestResourceAdmin_Versions_NotFound",
+        "TestResourceAdmin_Versions_InvalidInput",
+        "TestResourceDelete_MCPStopFailureRestoresFile",
+        "TestResourceAdmin_SkillCreatePublishes",
+        "TestResourceAdmin_SkillImportPublishes",
+        "TestResourceAdmin_SkillUpdateFullReplacement",
+        "TestResourceAdmin_SkillDuplicateCreateZeroOperations",
+        "TestResourceAdmin_SkillCommitFailureRollsBack",
+        "TestResourceDelete_SkillArchivesWorkCopy",
+        "TestResourceRecreate_SkillVersionContinues",
+        "TestResourceDelete_SkillReferencedByAgent",
+        "TestPublish_SkillRevertCreatesNewVersion",
+        "TestPublish_SkillIdempotent",
+        "TestResourceAdmin_SkillValidateNoWrites",
+        "TestResourceAdmin_ConcurrentPublish",
+        "TestResourceAdmin_DeleteDuringPublish",
+        "TestRunAdmission_PinsProviderVersion",
+        "TestRunAdmission_PublishGateConsistent",
+        "TestRunAdmission_RoutingFollowsPublishedCatalog",
+        "TestRunRuntime_ReleaseAfterFinish",
+        "TestSkill_StaleETagZeroWrite",
+        "TestSkillWrite_WorkCopyDivergedConflict"
+      ]
+    },
+    {
+      "id": "012-app-agent-admin",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAgentAdmin_|TestAgentArchive_|TestAgentCopy_|TestAgentRestore_|TestAgentTemplate_|TestAgentLoad_|TestStartupOrder_|TestAgentConfigFields_|TestParseOccurrences_)",
+        "./internal/app",
+        "./internal/adapters/cron"
+      ],
+      "timeout_seconds": 240,
+      "required_tests": [
+        "TestAgentAdmin_CreateDefaultDisabled",
+        "TestAgentAdmin_CreateExistingName",
+        "TestAgentAdmin_CreateResidualStateRefused",
+        "TestAgentAdmin_CreateRejectsInvalidName",
+        "TestAgentAdmin_CreateNoResidueOnPreWriteFailure",
+        "TestAgentAdmin_CreateNoResidueOnFailure",
+        "TestAgentAdmin_CreateIndexFailureBestEffort",
+        "TestAgentAdmin_EveryWriteHasOperation",
+        "TestAgentTemplate_DeterministicProvider",
+        "TestAgentAdmin_FilesReturnsCollectionETag",
+        "TestAgentAdmin_FilesMissingAgent",
+        "TestAgentAdmin_SubmitCollectionETag",
+        "TestAgentAdmin_SubmitStaleETagNoOperation",
+        "TestAgentAdmin_SubmitMissingDefinitionRejected",
+        "TestAgentAdmin_SubmitInvalidPathNoOperation",
+        "TestAgentAdmin_SubmitValidationFailureNoOperation",
+        "TestAgentAdmin_SubmitWriteFailureFinishesFailed",
+        "TestAgentAdmin_SubmitPreWriteFailureZeroWrites",
+        "TestAgentAdmin_GenerateFilesNoOperationRow",
+        "TestAgentAdmin_GenerateFilesNotConfigured",
+        "TestAgentAdmin_GenerateFilesCallErrorPassthrough",
+        "TestAgentAdmin_GenerateFilesQuestions",
+        "TestAgentAdmin_GenerateFilesAnswers",
+        "TestAgentAdmin_ScheduleDraft",
+        "TestAgentAdmin_ScheduleDraftRejected",
+        "TestAgentCopy_DisabledBootstrap",
+        "TestAgentArchive_TimeoutRollsBack",
+        "TestAgentArchive_RollbackMatrix",
+        "TestAgentRestore_OriginalNameGeneration",
+        "TestAgentAdmin_ConcurrentCreate",
+        "TestAgentArchive_ConcurrentRun",
+        "TestAgentRestore_ConcurrentCopy",
+        "TestStartupOrder_PublishedBeforeRegistry",
+        "TestAgentLoad_PublishedOnly",
+        "TestAgentArchive_SchedulesRetiredNotDeleted",
+        "TestAgentArchive_RollbackRestoresRetirement",
+        "TestAgentRestore_DoesNotAutoEnableSchedules",
+        "TestAgentArchive_UnregisterSerializedWithScheduleWrite",
+        "TestStartupOrder_HeavyPathStepsAppearInOrder",
+        "TestAgentConfigFields_DisplayName",
+        "TestParseOccurrences_MatchesEngine"
+      ]
+    },
+    {
+      "id": "012-app-mcp-supervisor",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestMCP|TestCommandRunner_)",
+        "./internal/tool",
+        "./internal/app"
+      ],
+      "timeout_seconds": 240,
+      "required_tests": [
+        "TestMCPPool_ConnectReturnsConnectionsInSpecOrder",
+        "TestMCPPool_ListToolsPaginatesToEmptyCursor",
+        "TestMCPToolAdapter_RendersTextBlocksJoined",
+        "TestMCPToolAdapter_RendersNonTextAsPlaceholderNoBase64",
+        "TestMCPToolAdapter_FallsBackToStructuredContentAndNoOutput",
+        "TestMCPToolAdapter_InputObjectAndEmptyInput",
+        "TestMCPPool_ConnectSkipsFailedServerAndKeepsOthers",
+        "TestMCPPool_ConnectFailureClosesPartialSession",
+        "TestMCPPool_ConnectFailureLogOmitsSensitiveDetail",
+        "TestMCPPool_DialCommandEnvAndDir",
+        "TestMCPToolAdapter_ProtocolErrorOmitsSensitiveDetail",
+        "TestMCPToolAdapter_MapsIsErrorToExternalError",
+        "TestMCPToolAdapter_ContextIdentityWinsOverExternalError",
+        "TestMCPToolAdapter_CallIsAuditedBeforeExecute",
+        "TestMCPPool_CloseIsIdempotent",
+        "TestMCPCallArguments_PreservesLargeIntegers",
+        "TestMCPPool_ConnectReturnsErrorOnlyOnContextCancellation",
+        "TestMCPPool_ConnectCancellationDuringHandshake",
+        "TestMCPPool_ConnectPreservesToolDescriptionAndSchema",
+        "TestMCPPool_DialCommandArgsVerbatim",
+        "TestMCPPool_DialCommandNoWhitespaceSplitting",
+        "TestMCPPool_DialCommandEmptyCommand",
+        "TestMCPPool_DialCommandCapturesSnapshotAtCallTime",
+        "TestMCPPool_ConnectToolsFollowSnapshot",
+        "TestMCPPool_KillProcessTree",
+        "TestMCPHTTP_ConnectListAndCall",
+        "TestMCPHTTP_URLShapeRejected",
+        "TestMCPHTTP_UnknownTransportRejected",
+        "TestMCPHTTP_RedirectNotFollowed",
+        "TestMCPSupervisor_PolicyDenied",
+        "TestMCPSupervisor_PolicyDeniedDoesNotStart",
+        "TestMCPSupervisor_HTTPPolicyUsesHTTPAction",
+        "TestMCPSupervisor_HTTPRejectsIPLiteralAndNonDefaultPort",
+        "TestMCPSupervisor_IndependentLifecycle",
+        "TestMCPSupervisor_StdioOwnsProcessTree",
+        "TestMCPSupervisor_HTTPNoProcess",
+        "TestCommandRunner_NotUsedForMCP",
+        "TestMCPSupervisor_AppliedOnlyAfterConnect",
+        "TestMCPSupervisor_PendingRestartFlag",
+        "TestMCPSupervisor_ApplyFailureFailsClosed",
+        "TestMCPSupervisor_MarkAppliedSuperseded",
+        "TestMCPTest_NoRunNoLLMCall",
+        "TestMCPTest_ResolvesEnvBeforeConnect",
+        "TestMCPTest_MissingEnvNotConfigured",
+        "TestMCPTest_StdioCleansProcessTree",
+        "TestMCPTest_HTTPNoProcess",
+        "TestMCPTest_Timeout",
+        "TestMCPSupervisor_TestPolicyDeniedAudited",
+        "TestMCPSupervisor_ConcurrentRestart",
+        "TestMCPSupervisor_StopIdempotent",
+        "TestMCPRuntime_ConnectedNamesFollowSupervisor",
+        "TestMCPRuntime_ToolsFromSupervisorSnapshot",
+        "TestMCPRuntime_AppliedVersionAfterConnect",
+        "TestMCPRuntime_PendingRestart",
+        "TestMCPCreate_PublishesPendingRestart",
+        "TestMCP_StaleETagZeroWrite",
+        "TestMCPPublish_KeepsApplied",
+        "TestMCPServer_EditLegacyMultiWordRejected",
+        "TestMCPTest_EndpointPolicyDeniedAudited",
+        "TestMCPTest_EndpointTimeout504",
+        "TestMCPTest_EndpointNoRunNoLLMCall",
+        "TestMCPError_NoSecrets",
+        "TestMCPTest_NoProcessOnPreWriteFailure"
+      ]
+    },
+    {
+      "id": "012-app-reconcile",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestReconcile_|TestStartupReconcile_|TestRecoverPendingOperations_|TestRecoverAdmin_|TestRecoverTest_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestRecoverAdmin_ActionMatrix",
+        "TestReconcile_PublishesValidEdit",
+        "TestReconcile_InvalidEditKeepsPublished",
+        "TestReconcile_NoChangeSkipsEverything",
+        "TestReconcile_IgnoresRemoval",
+        "TestReconcile_MissingEnvKeepsPublished",
+        "TestReconcile_ManagedEditPublishes",
+        "TestReconcile_ManagedRevokedKeepsPublished",
+        "TestReconcile_ManagedWithoutGuardKeepsPublished",
+        "TestReconcile_FileUnparseableKeepsPublished",
+        "TestReconcile_SkillWorkCopyPublishes",
+        "TestReconcile_SkillSameContentIdempotent",
+        "TestReconcile_SkillMissingWorkCopyIgnored",
+        "TestReconcile_PublishedMissingRefusesStartup",
+        "TestReconcile_PublishFailureFailsStartup",
+        "TestReconcile_ConcurrentStartup",
+        "TestReconcile_MCPExternalEditPublishesPendingRestart",
+        "TestReconcile_MCPNoChangeSkipsEverything",
+        "TestReconcile_MCPInvalidEntryKeepsPublished",
+        "TestReconcile_MCPMissingEnvKeepsPublished",
+        "TestReconcile_MCPRemovalIgnored",
+        "TestReconcile_MCPPublishedMissingRefusesStartup",
+        "TestRecoverPendingOperations_ContentUpdateApplied",
+        "TestRecoverPendingOperations_ContentUpdateNotAppliedByPreviousHash",
+        "TestRecoverPendingOperations_ContentUpdateNotAppliedByExpectedETag",
+        "TestRecoverPendingOperations_ContentUpdateNotAppliedWhenFileMissing",
+        "TestRecoverPendingOperations_ContentUpdateIndeterminateKeepsDetail",
+        "TestRecoverPendingOperations_DisableApplied",
+        "TestRecoverPendingOperations_EnableNotApplied",
+        "TestRecoverPendingOperations_LifecycleIndeterminate",
+        "TestRecoverPendingOperations_BaselineKeptUnknownWithoutRedo",
+        "TestRecoverPendingOperations_TerminalRowsUntouched",
+        "TestRecoverAdmin_ResourceActionMatrix",
+        "TestRecoverTest_UnknownNotResent",
+        "TestStartupReconcile_ExternalEditPublishesWithCLIActor",
+        "TestStartupReconcile_InvalidFileKeepsPublished",
+        "TestStartupReconcile_RemovalIgnored"
+      ]
+    },
+    {
+      "id": "012-app-notify-author",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNotify|TestAuthorService_|TestWorkspaceBrowse_|TestValidateAuthorConfig_|TestWire_WorkspaceBrowsePortWiring$)",
+        "./internal/app",
+        "./internal/tool"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAuthorService_NotConfigured503",
+        "TestAuthorService_OnlyLLMCallAudit",
+        "TestAuthorService_NoRunCreated",
+        "TestAuthorService_NoOperationRow",
+        "TestAuthorService_InvalidDraftRejected",
+        "TestAuthorService_DraftLimits",
+        "TestAuthorService_DraftNotPersisted",
+        "TestAuthorService_DraftWithAnswers_Questions",
+        "TestAuthorService_DraftWithAnswers_PromptAndLimits",
+        "TestAuthorService_ScheduleDraft",
+        "TestAuthorService_ScheduleDraftRejected",
+        "TestNotifyAdmin_CreateAndUpdate",
+        "TestNotifyAdmin_CreateWithoutURL",
+        "TestNotifyAdmin_PlaceholderOnly",
+        "TestNotifyAdmin_MissingEnvRejected",
+        "TestNotifyAdmin_DomainNotAllowed",
+        "TestNotifyAdmin_DuplicateName",
+        "TestNotifyAdmin_EveryWriteHasOperation",
+        "TestNotifyAdmin_UpdateGuards",
+        "TestNotifyAdmin_DeleteReferenced",
+        "TestNotifyAdmin_ReferenceGate",
+        "TestNotifyAdmin_ForceDelete",
+        "TestNotifyAdmin_OnlyHost",
+        "TestNotifyAdmin_ConcurrentDelete",
+        "TestNotifyDelivery_ExecutorWritesDerivedRow",
+        "TestWire_WorkspaceBrowsePortWiring",
+        "TestWorkspaceBrowse_TreeListsEntries",
+        "TestWorkspaceBrowse_RejectsEscape",
+        "TestWorkspaceBrowse_SizeCap",
+        "TestWorkspaceBrowse_BinaryRejected",
+        "TestWorkspaceBrowse_HidesResidue",
+        "TestWorkspaceBrowse_FileAndTreeMismatch",
+        "TestWorkspaceBrowse_MissingPath",
+        "TestWorkspaceBrowse_ConcurrentRead",
+        "TestValidateAuthorConfig_PairedKeys",
+        "TestValidateAuthorConfig_TemperatureRange",
+        "TestValidateAuthorConfig_ProviderMustBePublished",
+        "TestNotifyTool_DeclaredAllowlistGatesChannels",
+        "TestNotifyTool_EmptyDeclarationKeepsBackwardCompatibility",
+        "TestNotifyTool_DeclaredButUnregisteredExplainsEmptyIntersection"
+      ]
+    },
+    {
+      "id": "012-web-admin-agents",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAdminAgents_|TestArchivedAgents_|TestArchivedList_)",
+        "./internal/web",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAdminAgents_CreateZeroResidue",
+        "TestAdminAgents_CreateRejectsUnknownField",
+        "TestAdminAgents_GenerateDraft",
+        "TestAdminAgents_GenerateDraftAnswers",
+        "TestAdminAgents_AuthorFailureIsActionable",
+        "TestAdminAgents_ScheduleDraft",
+        "TestAdminAgents_ScheduleDraftErrors",
+        "TestAdminAgents_GenerateNotConfigured",
+        "TestAdminAgents_GetFilesSetETag",
+        "TestAdminAgents_GetFilesNotFound",
+        "TestAdminAgents_SubmitProjectsFreshView",
+        "TestAdminAgents_SubmitStaleETagNoOperation",
+        "TestAdminAgents_SubmitRejectsMissingIfMatch",
+        "TestAdminAgents_SubmitRequiresFiles",
+        "TestAdminAgents_Copy",
+        "TestAdminAgents_MissingPort",
+        "TestArchivedAgents_List",
+        "TestArchivedAgents_ArchiveProjectsRecord",
+        "TestArchivedAgents_ArchiveBusy",
+        "TestArchivedAgents_ArchiveConflict",
+        "TestArchivedAgents_ArchiveNotFound",
+        "TestArchivedAgents_PostPendingFailureCarriesOperationID",
+        "TestArchivedAgents_RestoreOriginalName",
+        "TestArchivedAgents_RestoreRenamed",
+        "TestArchivedAgents_RestoreMissingArchive",
+        "TestArchivedAgents_RestoreInvalidBody",
+        "TestArchivedAgents_PortMissing",
+        "TestArchivedList_IncludesCLIArchive"
+      ]
+    },
+    {
+      "id": "012-web-admin-resources",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAdminResources_|TestAdminResourceVersions_|TestAdminResourcePublish_|TestSkillValidate_|TestMCPViews_|TestMCP_StaleETag|TestModelConnection_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAdminResources_StaleETag412NoSnapshot",
+        "TestModelConnection_StaleETag412",
+        "TestModelConnection_MissingEnv503",
+        "TestAdminResources_MissingPort500",
+        "TestAdminResources_DeleteModel",
+        "TestAdminResources_DeleteMCP",
+        "TestAdminResources_DeleteSkill",
+        "TestAdminResources_DeleteReferenced",
+        "TestAdminResources_DeleteStaleETag412",
+        "TestAdminResources_DeleteMissingIfMatch412",
+        "TestAdminResources_References",
+        "TestAdminResources_ReferencesNotFound",
+        "TestAdminResources_ReferencesUnknownKind",
+        "TestAdminResources_VersionDetail",
+        "TestAdminResources_VersionDetailSkillEmptyDefinition",
+        "TestAdminResources_VersionDetailRedaction",
+        "TestAdminResources_VersionDetailBadID404",
+        "TestAdminResources_CreateMCP",
+        "TestMCP_StaleETag412",
+        "TestAdminResources_UpdateMCPNameMismatch400",
+        "TestAdminResources_TestMCP",
+        "TestAdminResources_TestMCPPolicyDenied",
+        "TestMCPViews_NoEnvValues",
+        "TestAdminResources_CreateSkillProjectsView",
+        "TestAdminResources_CreateSkillDuplicate409",
+        "TestAdminResources_ImportSkillProjectsView",
+        "TestAdminResources_ImportSkillRejectsBoundary",
+        "TestAdminResources_UpdateSkillRequiresStrongIfMatch",
+        "TestAdminResources_UpdateSkillProjectsDetail",
+        "TestSkillValidate_NoWrites",
+        "TestSkillValidate_SameGateAsImport",
+        "TestAdminResources_ConcurrentIfMatch",
+        "TestAdminResourcePublish_OptionalBodyPublishesLatest",
+        "TestAdminResourcePublish_Precondition412",
+        "TestAdminResourcePublish_RevertCreatesNewVersion",
+        "TestAdminResourceVersions_Success",
+        "TestAdminResourceVersions_UnknownKind404",
+        "TestModelConnection_CreateSuccess",
+        "TestModelConnection_TestOKFalse",
+        "TestModelConnection_TestTimeout504",
+        "TestModelConnection_UpdateNameMismatch400"
+      ]
+    },
+    {
+      "id": "012-web-admin-notify-workspace",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAdminNotify_|TestAdminWorkspace_|TestNotifyRead_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAdminNotify_CreateDuplicate400",
+        "TestAdminNotify_CreateBodyRejected",
+        "TestAdminNotify_UpdateRequestShape",
+        "TestAdminNotify_UpdateErrorMapping",
+        "TestAdminNotify_DeleteForceLiteral",
+        "TestAdminNotify_DeleteReferenced400",
+        "TestAdminNotify_ListHostOnly",
+        "TestAdminNotify_PortMissing",
+        "TestAdminNotify_CreateViewOnlyHost",
+        "TestAdminWorkspace_TreeSkipsStaging",
+        "TestAdminWorkspace_FilePreview",
+        "TestAdminWorkspace_FileRequiresPath",
+        "TestAdminWorkspace_NotFound",
+        "TestAdminWorkspace_SizeCap",
+        "TestAdminWorkspace_SymlinkNotFollowed",
+        "TestNotifyRead_EmptyListsRenderArrays",
+        "TestNotifyRead_ListCarriesDocumentReferences",
+        "TestNotifyRead_ListErrorInternal",
+        "TestNotifyRead_ListProjectsURLHostOnly",
+        "TestNotifyRead_MissingPortInternal",
+        "TestNotifyRead_ReferenceScanFailureFailsClosed",
+        "TestNotifyRead_RequiresAuth",
+        "TestNotifyRead_TypesInAssemblyOrder",
+        "TestNotifyRead_UnparseableURLsYieldEmptyHost",
+        "TestNotifyRead_ViewShapeMatchesContract",
+        "TestAdminNotify_WriteViewCarriesDocumentReferences",
+        "TestAdminNotify_WriteReferenceScanFailureKeepsWrite"
+      ]
+    },
+    {
+      "id": "012-web-etag-routes",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestIfMatch_|TestAdminViews_|TestAdminRoutes_|TestContractAdmin_|TestOpenAPI_|TestConsoleAdmin_|TestOperations_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAdminRoutes_TableCoversContractSurface",
+        "TestAdminRoutes_VersionIDParsing",
+        "TestAdminRoutes_RequireAuthAndMethod",
+        "TestAdminRoutes_ConditionalWritesDemandIfMatch",
+        "TestAdminRoutes_NonConditionalRowsSkipIfMatch",
+        "TestAdminRoutes_AuthPrecedesIfMatch",
+        "TestAdminRoutes_EveryRowEntersGuardOnce",
+        "TestAdminRoutes_ShapeRejectionCarriesCurrentETag",
+        "TestContractAdmin_NewErrorCodes",
+        "TestContractAdmin_AgentDraftView",
+        "TestContractAdmin_ManagedFilesETag",
+        "TestContractAdmin_SkillDuplicateConflict",
+        "TestIfMatch_AcceptsStrongETagLiteral",
+        "TestIfMatch_RejectsWeakAndWildcard",
+        "TestIfMatch_RejectsCommaList",
+        "TestIfMatch_RejectsBareDigest",
+        "TestIfMatch_RejectsUppercaseHex",
+        "TestIfMatch_RejectsLengthDrift",
+        "TestIfMatch_RejectsSurroundingBytes",
+        "TestIfMatch_RejectsNonHexDigest",
+        "TestIfMatch_SingleAndSetShareGrammar",
+        "TestOperations_ListDefaultsAndFilters",
+        "TestOperations_ListRejectsInvalidParameters",
+        "TestOperations_ListProjectsRows",
+        "TestOperations_ListEmptyIsArray",
+        "TestOperations_ListStoreError",
+        "TestOperations_DetailRedacted",
+        "TestOperations_DetailUnknownHint",
+        "TestOperations_DetailFields",
+        "TestOperations_DetailNotFound",
+        "TestOperations_DetailStoreError",
+        "TestOperations_MissingPort",
+        "TestOperations_ListProjectsNewActionGroups",
+        "TestOperations_FilterAcceptsNewTargetKinds",
+        "TestOperations_DetailNewActionGroupsRedacted",
+        "TestConsoleAdmin_WriteRoutesMounted",
+        "TestConsoleAdmin_MissingCredentialsRejected",
+        "TestConsoleAdmin_ConditionalWritesDemandIfMatch",
+        "TestConsoleAdmin_UnassembledPortsFailClosed",
+        "TestAdminViews_AgentDraftProjection",
+        "TestAdminViews_ScheduleDraftProjection",
+        "TestOpenAPI_ScheduleTimeFields",
+        "TestAdminViews_AgentArchiveProjection",
+        "TestAdminViews_ResourceVersionProjection",
+        "TestAdminViews_ResourceVersionDetailFields",
+        "TestAdminViews_ErrorDataShape",
+        "TestAdminViews_EmptyCollections"
+      ]
+    },
+    {
+      "id": "012-cli-author",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestParseAuthorSection_|TestProfile(List|Show|Create|Delete)_|TestRenderProfileList_|TestCLIProfileCreate_|TestCLIProfileDelete_)",
+        "./internal/cli",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestProfileList_RendersRegisteredAndRejected",
+        "TestProfileList_FailsWhenWorkspaceMissing",
+        "TestProfileList_WithoutConfigStillListsWithNotice",
+        "TestProfileShow_UnknownNameFails",
+        "TestProfileShow_RendersDeclaredFields",
+        "TestProfileCreate_CommandUsesWriteModePort",
+        "TestProfileCreate_WithoutProvidersNotesUnregisteredTemplate",
+        "TestProfileDelete_CommandUsesWriteModePort",
+        "TestRenderProfileList_UnverifiedLine",
+        "TestRenderProfileList_ZeroUnverifiedKeepsSummaryBytes",
+        "TestParseAuthorSection_Defaults",
+        "TestParseAuthorSection_MissingKeysDoNotFail",
+        "TestParseAuthorSection_ParsesAllKeys",
+        "TestParseAuthorSection_TemperatureBounds",
+        "TestParseAuthorSection_RejectsUnknownKeys",
+        "TestParseAuthorSection_RejectsTypeErrors",
+        "TestCLIProfileCreate_WritesManagementOperation",
+        "TestCLIProfileDelete_WritesArchiveRow"
+      ]
+    },
+    {
+      "id": "012-e2e",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e",
+        "-run",
+        "^(TestAdminConsoleE2E_|TestUpgradeNotes_)",
+        "./internal/e2e"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestAdminConsoleE2E_FullFlow",
+        "TestAdminConsoleE2E_CreateCopyArchivedDefaults",
+        "TestAdminConsoleE2E_ModelConnectionPublishRevert",
+        "TestAdminConsoleE2E_SkillReferenceGate",
+        "TestAdminConsoleE2E_WorkspaceAndNotify",
+        "TestUpgradeNotes_Documented"
+      ]
+    },
+    {
+      "id": "012-race",
+      "args": [
+        "go",
+        "test",
+        "-race",
+        "-json",
+        "-count=1",
+        "./internal/core",
+        "./internal/storage",
+        "./internal/workspace",
+        "./internal/tool",
+        "./internal/web",
+        "./internal/app"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestResourceAdmin_ConcurrentPublish",
+        "TestResourceAdmin_DeleteDuringPublish",
+        "TestAgentAdmin_ConcurrentCreate",
+        "TestAgentArchive_ConcurrentRun",
+        "TestAgentRestore_ConcurrentCopy",
+        "TestMCPSupervisor_ConcurrentRestart",
+        "TestReconcile_ConcurrentStartup",
+        "TestNotifyAdmin_ConcurrentDelete",
+        "TestResourceStore_ConcurrentVersionNo",
+        "TestYAMLBlock_ConcurrentReaders",
+        "TestAdminResources_ConcurrentIfMatch",
+        "TestWorkspaceBrowse_ConcurrentRead",
+        "TestCredentialGuard_ConcurrentCheck",
+        "TestScopeConversion_Concurrent",
+        "TestBindingProjection_ConcurrentRebuild",
+        "TestWhitelistPolicy_ConcurrentSwapAndCheck"
+      ]
+    },
+    {
+      "id": "012-core-identity",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestIdentity_|TestBinding_|TestCredential_)",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestIdentity_Format",
+        "TestIdentity_RejectsConfusableChars",
+        "TestIdentity_UniqueGeneration",
+        "TestBinding_RoundTripShape",
+        "TestBinding_RejectsDuplicateName",
+        "TestBinding_RejectsUnknownKind",
+        "TestCredential_ModeLiterals",
+        "TestCredential_VersionStateMachine",
+        "TestCredential_RevocationIsTerminal"
+      ]
+    },
+    {
+      "id": "012-core-scope",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestScope_)",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScope_Eligibility",
+        "TestScope_ExclusiveOwnerOnly",
+        "TestScope_InvalidLiteral"
+      ]
+    },
+    {
+      "id": "012-workspace-bindings",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestBindings_|TestIdentityState_)",
+        "./internal/workspace"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestBindings_ParseSerializeRoundTripBytes",
+        "TestBindings_EditPreservesOutsideBytes",
+        "TestBindings_RejectsMalformedBlock",
+        "TestIdentityState_UpgradeV1ToV2",
+        "TestIdentityState_ChecksumRecomputed",
+        "TestIdentityState_UpgradeFailureKeepsV1"
+      ]
+    },
+    {
+      "id": "012-storage-identity",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestIdentityStore_|TestBindingStore_|TestCredentialStore_|TestRunCredentialStore_|TestNotifyDeliveryStore_|TestRecovery_)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestIdentityStore_Tombstone",
+        "TestIdentityStore_VersionScopeByUID",
+        "TestIdentityStore_SameNameRebuildStartsAtOne",
+        "TestBindingStore_RebuildIsIdempotent",
+        "TestBindingStore_ReverseLookup",
+        "TestBindingStore_RebuildReplacesStaleRows",
+        "TestCredentialStore_VersionAppendOnly",
+        "TestCredentialStore_RevokeClearsCiphertext",
+        "TestCredentialStore_NeverRevives",
+        "TestCredentialStore_ResourceDeleteRetiresCredential",
+        "TestRunCredentialStore_FreezeAndRelease",
+        "TestNotifyDeliveryStore_OnePerInvocation",
+        "TestRecovery_ClosesRunningRunsAndReleasesRefs",
+        "TestRecovery_BackfillsTerminalRunResidualRefs"
+      ]
+    },
+    {
+      "id": "012-migration-v3",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestMigrationV3_|TestMigrateV3_)",
+        "./internal/storage",
+        "./internal/app"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestMigrationV3_ForwardFromV2",
+        "TestMigrationV3_InterruptedRefusesStartup",
+        "TestMigrationV3_PublishedFilesUnchanged",
+        "TestMigrateV3_StepOrder",
+        "TestMigrateV3_BaselinePendingFailureWritesNothing",
+        "TestMigrateV3_BindingBackfillProofRule"
+      ]
+    },
+    {
+      "id": "012-app-binding",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestBindingProjection_|TestBindingAdmission_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestBindingProjection_RebuildsFromAgentMD",
+        "TestBindingProjection_ErrorFailsClosed",
+        "TestBindingAdmission_NamesMissingBinding"
+      ]
+    },
+    {
+      "id": "012-app-scope",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestScopeConversion_|TestResourceState_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScopeConversion_BlockedByBinding",
+        "TestScopeConversion_BlockedByRun",
+        "TestScopeConversion_BlockedByRoute",
+        "TestScopeConversion_BlockedByDefinitionScan",
+        "TestScopeConversion_AppliesAtomically",
+        "TestScopeConversion_Concurrent",
+        "TestResourceState_NotifyChannelUsesChannelETagAndImpactHint"
+      ]
+    },
+    {
+      "id": "012-app-notify-mode",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNotifyMode_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNotifyMode_ParsesThreeStates",
+        "TestNotifyMode_EmptyArrayIsAllEligible",
+        "TestNotifyMode_NoneDisablesNotify",
+        "TestNotifyMode_FreezesConcreteUIDs",
+        "TestNotifyMode_MidRunChangeKeepsFrozen"
+      ]
+    },
+    {
+      "id": "012-credential-managed",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestCredentialCrypto_|TestCredentialResolver_|TestCredentialGuard_|TestCredentialOps_|TestCredentialRecovery_|TestResources_Etag|TestResources_KeyChange|TestSecrets_)",
+        "./internal/app",
+        "./internal/cli"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestCredentialCrypto_AADFieldChangeFails",
+        "TestCredentialCrypto_MasterKeyOutsideWorkspace",
+        "TestCredentialCrypto_KeyPermissions",
+        "TestCredentialCrypto_NonceUniquePerKey",
+        "TestCredentialResolver_OnDemandScenarios",
+        "TestCredentialResolver_StartupDependencyScope",
+        "TestCredentialGuard_RejectsRevoked",
+        "TestCredentialGuard_RetiredKeepsInFlightRunButBlocksAdmission",
+        "TestCredentialGuard_ConcurrentCheck",
+        "TestCredentialOps_RevokeIsTerminal",
+        "TestCredentialOps_PreWriteFailureWritesNothing",
+        "TestCredentialRecovery_FourEvidenceOutcomes",
+        "TestResources_EtagKeyOnlyChange",
+        "TestResources_KeyChangeDoesNotBreakOtherAgentSave",
+        "TestSecrets_InitRefusesWhenKeyExists",
+        "TestSecrets_InitRefusesWithManagedDependency",
+        "TestSecrets_VerifyReportsFingerprint",
+        "TestSecrets_RevokeManaged"
+      ]
+    },
+    {
+      "id": "012-credential-leak-sentinel",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestCredentialLeak_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestCredentialLeak_NoPlaintextInSurfaces",
+        "TestCredentialLeak_GoldenFixtures"
+      ]
+    },
+    {
+      "id": "012-web-cfg-structured",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAgentConfig_|TestAgentContentChanges_DisplayNameTriState|TestAgentContent_PutDisplayNameRoundTrip)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAgentConfig_SharesContentETag",
+        "TestAgentConfig_RequiresBindingsOnContentSubmit",
+        "TestAgentConfig_DoesNotAutoFillBindings",
+        "TestAgentContentChanges_DisplayNameTriState",
+        "TestAgentContent_PutDisplayNameRoundTrip"
+      ]
+    },
+    {
+      "id": "012-web-credential",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestCredentialHandlers_|TestScopeHandlers_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestCredentialHandlers_ActionLiterals",
+        "TestCredentialHandlers_ErrorCodeMapping",
+        "TestCredentialHandlers_WriteOnlyFields",
+        "TestScopeHandlers_ConditionalWrite"
+      ]
+    },
+    {
+      "id": "012-console-config",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestConsoleConfig_|TestConsoleDist_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestConsoleConfig_NoDangerousDOM",
+        "TestConsoleConfig_ErrorCopyPresent",
+        "TestConsoleConfig_BackfillEvidenceCopy",
+        "TestConsoleDist_IntegrityMatchesFiles"
+      ]
+    },
+    {
+      "id": "012-e2e-v3",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e",
+        "-run",
+        "^(TestV3E2E_)",
+        "./internal/e2e"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestV3E2E_MigrateAdmitNotify",
+        "TestV3E2E_CredentialLifecycle",
+        "TestV3E2E_ScopeAndCopyMapping"
+      ]
+    },
+    {
+      "id": "012-core-schedule-delivery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestScheduler_Delivery|TestScheduler_ReconcileKeepsDeliverTo)",
+        "./internal/core"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScheduler_DeliveryPreparesBeforeRun",
+        "TestScheduler_DeliveryPrepareFailureAbortsBeforeRun",
+        "TestScheduler_DeliveryInvalidTargetUIDAborts",
+        "TestScheduler_DeliveryServiceMissingFailsClosed",
+        "TestScheduler_DeliverySkipsFailedRun",
+        "TestScheduler_DeliveryPanicSettlesAsSkip",
+        "TestScheduler_DeliveryNoTargetKeepsNotify",
+        "TestScheduler_DeliveryUnknownIsLoggedNotResent",
+        "TestScheduler_DeliveryUsesIndependentDeadline",
+        "TestScheduler_DeliveryRecoverAtStart",
+        "TestScheduler_ReconcileKeepsDeliverTo"
+      ]
+    },
+    {
+      "id": "012-app-schedule-delivery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestDeliveryService_|TestScheduleDeliveryTargets_|TestSaveBindingCheck_IncludesDeliveryTargets)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestScheduleDeliveryTargets_SaveTimeEligibility",
+        "TestSaveBindingCheck_IncludesDeliveryTargets",
+        "TestDeliveryService_PrepareWritesPendingRow",
+        "TestDeliveryService_PrepareRejectsOutsideDeclaredChannels",
+        "TestDeliveryService_PrepareAcceptsBoundDeclaredChannel",
+        "TestDeliveryService_PrepareFailsClosedWithoutProfiles",
+        "TestDeliveryService_PrepareRejectsUnknownAgentInRegistry",
+        "TestDeliveryService_PrepareRejectsOutOfScopeChannel",
+        "TestDeliveryService_PrepareRequiresLifecycle",
+        "TestDeliveryService_DeliverWritesTerminalState",
+        "TestDeliveryService_DeliverMissingRecordFailsWithoutSend",
+        "TestDeliveryService_DeliverUnknownIsRecordedNotRetried",
+        "TestDeliveryService_DeliverRecordLookupFailureFailsWithoutSend",
+        "TestDeliveryService_SkipKeepsRow",
+        "TestDeliveryService_FinishWriteFailureKeepsPending",
+        "TestDeliveryService_RecoverDelegates"
+      ]
+    },
+    {
+      "id": "012-app-notify-assembly",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestAssembleNotifyTool_|TestNotifyMode_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAssembleNotifyTool_NoneRemovesNotify",
+        "TestAssembleNotifyTool_AllEligibleRequiresOneEligibleChannel",
+        "TestAssembleNotifyTool_ExclusiveChannelsFollowAgentIdentity",
+        "TestAssembleNotifyTool_AllowlistRequiresEveryDeclaredChannel",
+        "TestAssembleNotifyTool_LegacyIntentFollowsCompatibilityRule",
+        "TestAssembleNotifyTool_InvalidIntentLeavesValidationToTheGates",
+        "TestAssembleNotifyTool_CatalogFailurePropagates",
+        "TestNotifyMode_ParsesThreeStates",
+        "TestNotifyMode_EmptyArrayIsAllEligible",
+        "TestNotifyMode_NoneDisablesNotify",
+        "TestNotifyMode_FreezesConcreteUIDs",
+        "TestNotifyMode_MidRunChangeKeepsFrozen"
+      ]
+    },
+    {
+      "id": "012-app-connection-tests",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestModelConnection_TestWritesLastTestProjection|TestNotifyChannelRead_AvailabilityAndLastTest|TestNotifyAdminTestChannel_AssemblyGaps)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestModelConnection_TestWritesLastTestProjection",
+        "TestNotifyChannelRead_AvailabilityAndLastTest",
+        "TestNotifyAdminTestChannel_AssemblyGaps"
+      ]
+    },
+    {
+      "id": "012-storage-delivery-records",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestConnectionTestStore_|TestNotifyDeliveryStore_|TestTaskStore_ListExecutions)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestConnectionTestStore_UpsertKeepsLastOnly",
+        "TestConnectionTestStore_KindIsolation",
+        "TestConnectionTestStore_RejectsInvalidShapes",
+        "TestNotifyDeliveryStore_OnePerInvocation",
+        "TestNotifyDeliveryStore_AdmissionFreezesChannels",
+        "TestTaskStore_ListExecutions"
+      ]
+    },
+    {
+      "id": "012-tool-delivery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestDeliverySender_|TestClassifyDeliveryTransport|TestNotifyTool_RecordsDeliveryInsideRun|TestNotifyTool_NoDeliveryRecordWithoutInvocationOrAfterFailure)",
+        "./internal/tool"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestDeliverySender_LookupResolvesByUID",
+        "TestDeliverySender_LookupRejects",
+        "TestDeliverySender_DeliverUsesResultSender",
+        "TestDeliverySender_DeliverEnvPlaceholderUnsetFailsClosed",
+        "TestDeliverySender_DeliverRedactsPolicyTarget",
+        "TestDeliverySender_DeliverManagedFailsClosed",
+        "TestDeliverySender_DeliverFallsBackToSend",
+        "TestDeliverySender_ManagedResolverTargetUsed",
+        "TestClassifyDeliveryTransport",
+        "TestNotifyTool_RecordsDeliveryInsideRun",
+        "TestNotifyTool_NoDeliveryRecordWithoutInvocationOrAfterFailure"
+      ]
+    },
+    {
+      "id": "012-web-schedule-delivery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestSchedules_DeliveryProjection)$",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSchedules_DeliveryProjection"
+      ]
+    },
+    {
+      "id": "012-storage-network-policy",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNetworkPolicyStore_)",
+        "./internal/storage"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestNetworkPolicyStore_LoadMissingIsNotAnError",
+        "TestNetworkPolicyStore_SeedOnceAndConfigNeverWins",
+        "TestNetworkPolicyStore_UpdateRevisionCAS",
+        "TestNetworkPolicyStore_UpdateWithoutRowConflicts",
+        "TestNetworkPolicyStore_EmptyListRoundTrip",
+        "TestNetworkPolicyStore_ActorComesFromAuditRow",
+        "TestNetworkPolicyStore_SingleRowOnly",
+        "TestNetworkPolicyStore_NonConflictErrorsAreNotMislabelled"
+      ]
+    },
+    {
+      "id": "012-app-network-allowlist",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestNetworkAllowlist_|TestNetworkAllowlistRecovery_)",
+        "./internal/app"
+      ],
+      "timeout_seconds": 240,
+      "required_tests": [
+        "TestNetworkAllowlist_ConfigNeverOverridesDatabase",
+        "TestNetworkAllowlist_CurrentZeroValueBeforeSeed",
+        "TestNetworkAllowlist_InvalidDomainWritesNothing",
+        "TestNetworkAllowlist_PostPendingFailureCarriesOperationID",
+        "TestNetworkAllowlist_PreWriteFailureRefuses",
+        "TestNetworkAllowlist_SeedOverLimitRefusesStart",
+        "TestNetworkAllowlist_SeedsOnceFromConfig",
+        "TestNetworkAllowlist_StaleETagWritesNothing",
+        "TestNetworkAllowlist_TighteningRevokesMCPHTTP",
+        "TestNetworkAllowlist_UpdateHotAppliesAndAudits",
+        "TestNetworkAllowlistRecovery_AppliedWhenRevisionAndHashMatch",
+        "TestNetworkAllowlistRecovery_NotAppliedWhenRevisionStillBefore",
+        "TestNetworkAllowlistRecovery_IndeterminateCases",
+        "TestNetworkAllowlistRecovery_MissingPortStaysUnknown"
+      ]
+    },
+    {
+      "id": "012-tool-allowlist-hot",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestWhitelistPolicy_)",
+        "./internal/tool"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestWhitelistPolicy_AllowedDomainsIsCopy",
+        "TestWhitelistPolicy_AllowsHostSharesDomainRule",
+        "TestWhitelistPolicy_ConcurrentSwapAndCheck",
+        "TestWhitelistPolicy_DomainGuidanceNamesConsole",
+        "TestWhitelistPolicy_EmptyDomainsDenyAll",
+        "TestWhitelistPolicy_HotSwapsDomains"
+      ]
+    },
+    {
+      "id": "012-web-errors-zh",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestProblemMessages_|TestPublicRunReason_|TestAgentUnavailableMessage_|TestLifecycleConflictMessage|TestAgentRejectMessage_|TestEntryRejectMessage_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestAgentRejectMessage_CoversEveryDefinedKind",
+        "TestAgentRejectMessage_TypedKindsBecomeChinese",
+        "TestAgentUnavailableMessage_MapsByKindNotReason",
+        "TestEntryRejectMessage_IgnoresEnglishReason",
+        "TestLifecycleConflictMessage",
+        "TestProblemMessages_ProjectsEachEntryAndNeverNil",
+        "TestPublicRunReason_ChineseOnlyAndSafe"
+      ]
+    },
+    {
+      "id": "012-web-sandbox-write",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-run",
+        "^(TestSandbox_)",
+        "./internal/web"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestSandbox_LiveAllowlistOverridesConfig",
+        "TestSandbox_NetworkDomainsBodyRules",
+        "TestSandbox_NetworkDomainsConditionalWrite",
+        "TestSandbox_NetworkDomainsMissingPort",
+        "TestSandbox_NetworkDomainsPostPendingFailures",
+        "TestSandbox_NetworkDomainsRequiresAuth",
+        "TestSandbox_NetworkDomainsRequiresIfMatch",
+        "TestSandbox_NetworkDomainsStaleCondition",
+        "TestSandbox_NetworkDomainsValidationFailure",
+        "TestSandbox_SeedMetadata"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T003",
+      "checks": [
+        "012-core-author-agent"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "012-core-author-agent"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "012-core-author-agent",
+        "012-core-resource-types"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "012-cli-author"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "012-workspace-yaml-provider"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "012-workspace-yaml-provider"
+      ]
+    },
+    {
+      "id": "T010",
+      "checks": [
+        "012-workspace-agent"
+      ]
+    },
+    {
+      "id": "T011",
+      "checks": [
+        "012-workspace-skill"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "012-storage-admin"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "012-web-etag-routes"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "012-web-etag-routes"
+      ]
+    },
+    {
+      "id": "T015",
+      "checks": [
+        "012-web-etag-routes"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "012-web-etag-routes"
+      ]
+    },
+    {
+      "id": "T017",
+      "checks": [
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T018",
+      "checks": [
+        "012-workspace-agent"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "012-app-notify-author"
+      ]
+    },
+    {
+      "id": "T020",
+      "checks": [
+        "012-workspace-agent"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "012-app-agent-admin"
+      ]
+    },
+    {
+      "id": "T022",
+      "checks": [
+        "012-web-admin-agents"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "012-web-admin-resources"
+      ]
+    },
+    {
+      "id": "T030",
+      "checks": [
+        "012-app-reconcile"
+      ]
+    },
+    {
+      "id": "T031",
+      "checks": [
+        "012-app-agent-admin",
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T032",
+      "checks": [
+        "012-app-agent-admin",
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T033",
+      "checks": [
+        "012-app-agent-admin"
+      ]
+    },
+    {
+      "id": "T034",
+      "checks": [
+        "012-web-admin-agents"
+      ]
+    },
+    {
+      "id": "T035",
+      "checks": [
+        "012-app-agent-admin"
+      ]
+    },
+    {
+      "id": "T036",
+      "checks": [
+        "012-cli-author"
+      ]
+    },
+    {
+      "id": "T037",
+      "checks": [
+        "012-web-admin-agents"
+      ]
+    },
+    {
+      "id": "T039",
+      "checks": [
+        "012-storage-admin"
+      ]
+    },
+    {
+      "id": "T040",
+      "checks": [
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T041",
+      "checks": [
+        "012-web-admin-resources"
+      ]
+    },
+    {
+      "id": "T042",
+      "checks": [
+        "012-app-resource-admin",
+        "012-web-admin-resources"
+      ]
+    },
+    {
+      "id": "T044",
+      "checks": [
+        "012-workspace-yaml-provider"
+      ]
+    },
+    {
+      "id": "T045",
+      "checks": [
+        "012-app-mcp-supervisor"
+      ]
+    },
+    {
+      "id": "T046",
+      "checks": [
+        "012-app-mcp-supervisor"
+      ]
+    },
+    {
+      "id": "T047",
+      "checks": [
+        "012-app-mcp-supervisor"
+      ]
+    },
+    {
+      "id": "T048",
+      "checks": [
+        "012-web-admin-resources"
+      ]
+    },
+    {
+      "id": "T049",
+      "checks": [
+        "012-app-mcp-supervisor"
+      ]
+    },
+    {
+      "id": "T050",
+      "checks": [
+        "012-workspace-skill"
+      ]
+    },
+    {
+      "id": "T051",
+      "checks": [
+        "012-app-resource-admin"
+      ]
+    },
+    {
+      "id": "T052",
+      "checks": [
+        "012-web-admin-resources"
+      ]
+    },
+    {
+      "id": "T054",
+      "checks": [
+        "012-workspace-skill"
+      ]
+    },
+    {
+      "id": "T055",
+      "checks": [
+        "012-storage-admin"
+      ]
+    },
+    {
+      "id": "T056",
+      "checks": [
+        "012-app-notify-author"
+      ]
+    },
+    {
+      "id": "T057",
+      "checks": [
+        "012-web-admin-notify-workspace"
+      ]
+    },
+    {
+      "id": "T060",
+      "checks": [
+        "012-app-notify-author"
+      ]
+    },
+    {
+      "id": "T061",
+      "checks": [
+        "012-web-admin-notify-workspace"
+      ]
+    },
+    {
+      "id": "T062",
+      "checks": [
+        "012-app-notify-author"
+      ]
+    },
+    {
+      "id": "T065",
+      "checks": [
+        "012-e2e"
+      ]
+    },
+    {
+      "id": "T066",
+      "checks": [
+        "012-web-etag-routes"
+      ]
+    },
+    {
+      "id": "T067A",
+      "checks": [
+        "012-app-reconcile"
+      ]
+    },
+    {
+      "id": "T067B",
+      "checks": [
+        "012-race"
+      ]
+    },
+    {
+      "id": "T103",
+      "checks": [
+        "012-core-identity"
+      ]
+    },
+    {
+      "id": "T104",
+      "checks": [
+        "012-core-scope"
+      ]
+    },
+    {
+      "id": "T105",
+      "checks": [
+        "012-core-identity"
+      ]
+    },
+    {
+      "id": "T106",
+      "checks": [
+        "012-core-identity"
+      ]
+    },
+    {
+      "id": "T107",
+      "checks": [
+        "012-app-binding"
+      ]
+    },
+    {
+      "id": "T108",
+      "checks": [
+        "012-workspace-bindings"
+      ]
+    },
+    {
+      "id": "T109",
+      "checks": [
+        "012-workspace-bindings"
+      ]
+    },
+    {
+      "id": "T110",
+      "checks": [
+        "012-workspace-bindings"
+      ]
+    },
+    {
+      "id": "T111",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T112",
+      "checks": [
+        "012-migration-v3"
+      ]
+    },
+    {
+      "id": "T113",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T114",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T115",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T116",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T117",
+      "checks": [
+        "012-migration-v3"
+      ]
+    },
+    {
+      "id": "T118",
+      "checks": [
+        "012-storage-identity"
+      ]
+    },
+    {
+      "id": "T119",
+      "checks": [
+        "012-migration-v3"
+      ]
+    },
+    {
+      "id": "T120",
+      "checks": [
+        "012-app-binding"
+      ]
+    },
+    {
+      "id": "T121",
+      "checks": [
+        "012-app-scope"
+      ]
+    },
+    {
+      "id": "T122",
+      "checks": [
+        "012-app-notify-mode"
+      ]
+    },
+    {
+      "id": "T123",
+      "checks": [
+        "012-app-scope"
+      ]
+    },
+    {
+      "id": "T124",
+      "checks": [
+        "012-app-notify-mode",
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T125",
+      "checks": [
+        "012-app-notify-mode"
+      ]
+    },
+    {
+      "id": "T126",
+      "checks": [
+        "012-app-binding",
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T127",
+      "checks": [
+        "012-credential-managed",
+        "012-app-binding"
+      ]
+    },
+    {
+      "id": "T128",
+      "checks": [
+        "012-app-binding"
+      ]
+    },
+    {
+      "id": "T129",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T130",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T131",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T132",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T133",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T134",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T135",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T136",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T137",
+      "checks": [
+        "012-credential-leak-sentinel"
+      ]
+    },
+    {
+      "id": "T138",
+      "checks": [
+        "012-web-cfg-structured"
+      ]
+    },
+    {
+      "id": "T139",
+      "checks": [
+        "012-web-credential"
+      ]
+    },
+    {
+      "id": "T140",
+      "checks": [
+        "012-web-credential"
+      ]
+    },
+    {
+      "id": "T141",
+      "checks": [
+        "012-web-credential"
+      ]
+    },
+    {
+      "id": "T142",
+      "checks": [
+        "012-web-cfg-structured",
+        "012-web-credential"
+      ]
+    },
+    {
+      "id": "T143",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T144",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T145",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T146",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T147",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T148",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T149",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T150",
+      "checks": [
+        "012-e2e-v3"
+      ]
+    },
+    {
+      "id": "T151",
+      "checks": [
+        "012-e2e-v3"
+      ]
+    },
+    {
+      "id": "T152",
+      "checks": [
+        "012-e2e-v3"
+      ]
+    },
+    {
+      "id": "T153",
+      "checks": [
+        "012-e2e-v3"
+      ]
+    },
+    {
+      "id": "T154",
+      "checks": [
+        "012-console-config"
+      ]
+    },
+    {
+      "id": "T155",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T156",
+      "checks": [
+        "012-credential-managed"
+      ]
+    },
+    {
+      "id": "T157",
+      "checks": [
+        "012-credential-managed"
+      ]
+    }
+  ]
+}

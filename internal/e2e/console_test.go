@@ -143,7 +143,7 @@ func TestBackfill_ConsolePipe(t *testing.T) {
 		toolCallResponse("call-pipe-echo", mcpEchoTool, mustJSON(map[string]string{"text": consoleEchoArg})),
 		textResponse("MCP 往返成功"),
 	)
-	hMCP.writeConfig(t, configWithProvider(fakeMCP.URL()))
+	hMCP.writeConfig(t, configWithProvider(fakeMCP.URL())+mcpShellAllowed())
 	hMCP.writeAgent(t, "demo", mcpAgentFrontmatter("demo", []string{mcpEchoTool}, []string{mcpHelperServer}),
 		"MCP 管道演示")
 

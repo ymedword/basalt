@@ -11,10 +11,12 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,19 +35,23 @@ import (
 // 只读 MCP 运行期视图 + 共享资源闸门。
 // runResourcesEnv is the fixture for both resource adapters.
 type runResourcesEnv struct {
-	root      string
-	dbPath    string
-	db        *storage.DB
-	versions  *storage.ResourceStore
-	ops       *storage.ManagementStore
-	providers *providerCatalog
-	llm       *provider.ProviderService
-	mcp       *mcpRuntime
-	skills    *workspace.SkillLibrary
-	lifecycle *workspace.LifecycleStore
-	gate      *core.ResourceGate
-	resources core.RunResources
-	views     web.ResourceReader
+	root        string
+	dbPath      string
+	db          *storage.DB
+	versions    *storage.ResourceStore
+	ops         *storage.ManagementStore
+	credentials *storage.CredentialStore
+	providers   *providerCatalog
+	llm         *provider.ProviderService
+	mcp         *mcpRuntime
+	skills      *workspace.SkillLibrary
+	lifecycle   *workspace.LifecycleStore
+	gate        *core.ResourceGate
+	resources   core.RunResources
+	views       web.ResourceReader
+	// admission 是准入侧的只读依赖（身份镜像 / 通知目录 / 绑定投影），与生产装配同形。
+	// admission mirrors the production admission dependencies.
+	admission AdmissionDeps
 	// opID 是夹具预写的一条 pending 管理操作：`resource_versions.operation_id` 是
 	// 非空外键，正常路径由基线或发布写入，夹具复用它承载全部种子版本。
 	// opID is the fixture's pending operation, reused as the FK for seeded versions.
@@ -101,22 +107,72 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 		CreatedAt:    baselineClock(),
 	}))
 
-	return &runResourcesEnv{
-		opID:      opID,
-		root:      root,
-		dbPath:    dbPath,
-		db:        db,
-		versions:  versions,
-		ops:       ops,
-		providers: providers,
-		llm:       llm,
-		mcp:       mcp,
-		skills:    skills,
-		lifecycle: lifecycle,
-		gate:      gate,
-		resources: NewRunResources(versions, providers, llm, mcp, skills, gate),
-		views:     NewResourceViews(versions, lifecycle, mcp),
+	// 准入要先把名字固定成 agent_uid（v3）；夹具按生产路径写入身份镜像行，
+	// 不给"没有身份也能跑"的假绿。
+	// Admission freezes the agent uid first, so the fixture records the identity row.
+	agentUID, err := core.NewAgentUID()
+	require.NoError(t, err)
+	require.NoError(t, versions.PutLifecycleIndex(context.Background(), core.LifecycleRecord{
+		SchemaVersion: 2,
+		Agent:         "writer",
+		AgentUID:      agentUID,
+		State:         core.AgentDisabled,
+		Generation:    1,
+		UpdatedAt:     baselineClock().UnixMilli(),
+		OperationID:   opID,
+	}, true, ""))
+
+	admission := AdmissionDeps{
+		Identities:  versions,
+		NotifyAdmin: storage.NewNotifyAdminStore(db),
+		Channels:    storage.NewNotifyChannelRepo(db),
+		Bindings:    storage.NewBindingStore(db),
 	}
+
+	return &runResourcesEnv{
+		opID:        opID,
+		root:        root,
+		dbPath:      dbPath,
+		db:          db,
+		versions:    versions,
+		ops:         ops,
+		credentials: storage.NewCredentialStore(db),
+		providers:   providers,
+		llm:         llm,
+		mcp:         mcp,
+		skills:      skills,
+		lifecycle:   lifecycle,
+		gate:        gate,
+		resources:   NewRunResources(versions, providers, llm, mcp, skills, gate, admission),
+		views:       NewResourceViews(versions, lifecycle, mcp, storage.NewCredentialStore(db), ResourceViewDeps{}),
+		admission:   admission,
+	}
+}
+
+// fixtureResourceUID 由 `(kind, id)` 派生一个**稳定**的资源身份：同一资源的多个版本
+// 必须共享一个 UID（指针与版本按 UID 对账），重复播种也要得到同一个值。载荷按
+// Crockford Base32 取模映射，与 `core.NewResourceUID` 的字符集一致。
+// fixtureResourceUID derives a stable uid for a (kind, id) pair so repeated seeding of
+// the same resource keeps one identity.
+func fixtureResourceUID(t *testing.T, kind core.ResourceKind, id string) core.ResourceUID {
+	t.Helper()
+	uid := fixtureResourceUIDFor(kind, id)
+	_, err := core.ParseResourceUID(string(uid))
+	require.NoError(t, err)
+	return uid
+}
+
+// fixtureResourceUIDFor 是 fixtureResourceUID 的无 *testing.T 版本：绑定声明要在构造
+// Agent 入口时同步给出同名 UID，那里拿不到 t。
+// fixtureResourceUIDFor is the t-free form so entry builders can declare bindings.
+func fixtureResourceUIDFor(kind core.ResourceKind, id string) core.ResourceUID {
+	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ" // 与 core 的字符集一致
+	sum := sha256.Sum256([]byte(string(kind) + "\x00" + id))
+	payload := make([]byte, 26)
+	for i := range payload {
+		payload[i] = crockford[int(sum[i%len(sum)])%len(crockford)]
+	}
+	return core.ResourceUID(core.ResourceUIDPrefix) + core.ResourceUID(payload)
 }
 
 // seedVersion 幂等写入一个资源版本行；哈希由内容原文派生，同内容天然幂等。
@@ -126,6 +182,7 @@ func (e *runResourcesEnv) seedVersion(t *testing.T, kind core.ResourceKind, id, 
 	version := core.ResourceVersion{
 		Kind:           kind,
 		ResourceID:     id,
+		ResourceUID:    fixtureResourceUID(t, kind, id),
 		ContentHash:    sha256Hex(t, []byte(definition+"\x00"+manifest+"\x00"+storagePath)),
 		DefinitionYAML: definition,
 		ManifestJSON:   manifest,
@@ -186,16 +243,23 @@ func skillManifest(paths ...string) string {
 // agentEntry 构造一个声明了 Provider / MCP / 技能的 Agent 入口。
 // agentEntry builds an agent entry with the given bindings.
 func agentEntry(provider string, mcps, skills []string) core.AgentEntry {
-	return core.AgentEntry{
+	profile := &core.Profile{
 		Name:       "writer",
-		Registered: true,
-		Profile: &core.Profile{
-			Name:       "writer",
-			Provider:   core.ProviderRef{Name: provider, Model: "alpha-model"},
-			MCPServers: mcps,
-			Skills:     skills,
-		},
+		Provider:   core.ProviderRef{Name: provider, Model: "alpha-model"},
+		MCPServers: mcps,
+		Skills:     skills,
 	}
+	if provider != "" {
+		// 引用与绑定严格一一对应（R4.4）：夹具按同一份 (kind, name) 派生 UID，
+		// 与 seedVersion 写入的资源身份天然一致。
+		profile.ResourceBindings = core.ResourceBindings{
+			ModelConnections: []core.ResourceBinding{{
+				Name: provider,
+				UID:  fixtureResourceUIDFor(core.ResourceModelConnection, provider),
+			}},
+		}
+	}
+	return core.AgentEntry{Name: "writer", Registered: true, Profile: profile}
 }
 
 // requireUnavailable 断言准入失败是 `*core.ResourceUnavailableError` 且 Reason 逐字命中。
@@ -354,7 +418,8 @@ func TestRunResources_ResolveMCPUsesAppliedVersion(t *testing.T) {
 
 		// 同一份库与目录，但运行期没有任何连接——句柄无从固定。
 		unconnected := NewRunResources(env.versions, env.providers, env.llm,
-			newMCPRuntime([]core.MCPServerConfig{{Name: "web"}}, nil), env.skills, env.gate)
+			newMCPRuntime([]core.MCPServerConfig{{Name: "web"}}, nil), env.skills, env.gate,
+			env.admission)
 		_, err := unconnected.Resolve(context.Background(), agentEntry("alpha", []string{"web"}, nil))
 		unavailable := requireUnavailable(t, err, resourceReasonMCP)
 		require.Contains(t, unavailable.Cause.Error(), "未在本进程连接")
@@ -584,7 +649,7 @@ func TestRunResources_ResourceViewsLists(t *testing.T) {
 	views := NewResourceViews(env.versions, env.lifecycle, newMCPRuntime(
 		[]core.MCPServerConfig{{Name: "web"}, {Name: "queue"}},
 		[]tool.MCPConnection{{Server: "web", Tools: []core.Tool{fakeTool{name: "web_search"}}}},
-	))
+	), env.credentials, ResourceViewDeps{})
 	// 约束 12：只读面不得写管理审计——读前读后操作行数相同。
 	before, err := env.ops.ListOperations(ctx, core.OperationFilter{Limit: 100})
 	require.NoError(t, err)
@@ -596,7 +661,11 @@ func TestRunResources_ResourceViewsLists(t *testing.T) {
 	require.Equal(t, ".basalt/skills/pdf", skills[1].Path)
 	require.Empty(t, skills[1].Description, "description 在本 US 没有可达来源")
 	require.Equal(t, 2, skills[1].FileCount)
-	require.Equal(t, `"sha256:`+skills[1].ContentHash+`"`, skills[1].ETag)
+	// R4 / FR-081 裁决（2026-10-23）：条件 ETag 不再是 content_hash 本身——还要覆盖
+	// 资源 UID、修订号、范围与凭据段。这里判强 ETag 形状与"不等于纯内容哈希"，逐字段
+	// 性质由 TestResources_EtagIncludesScopeAndCredential 判。
+	require.Regexp(t, `^"sha256:[0-9a-f]{64}"$`, skills[1].ETag)
+	require.NotEqual(t, `"sha256:`+skills[1].ContentHash+`"`, skills[1].ETag)
 	require.NotNil(t, skills[1].ReferencedBy)
 
 	mcpServers, err := views.MCPServers(ctx)
@@ -632,8 +701,10 @@ func TestRunResources_ResourceViewsLists(t *testing.T) {
 	mcpDetail, err := views.McpServer(ctx, "web")
 	require.NoError(t, err)
 	require.Equal(t, "web", mcpDetail.View.Name)
-	require.Equal(t, `"sha256:`+webServer.ContentHash+`"`, mcpDetail.ETag,
-		"详情 ETag 取发布版本 content_hash（人工 review ② F3），不得另算一份")
+	// 详情 ETag 与列表 / 写路径同源（FR-081 裁决取代"纯 content_hash"口径）：形状是
+	// 强 ETag，且已把身份与修订折进哈希——不得再回显裸内容哈希。
+	require.Regexp(t, `^"sha256:[0-9a-f]{64}"$`, mcpDetail.ETag)
+	require.NotEqual(t, `"sha256:`+webServer.ContentHash+`"`, mcpDetail.ETag)
 	bareDetail, err := views.McpServer(ctx, "queue")
 	require.NoError(t, err)
 	require.Zero(t, bareDetail.View.PublishedVersionID)
@@ -650,6 +721,47 @@ func TestRunResources_ResourceViewsLists(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, after, len(before), "只读投影不得写管理操作（约束 12）")
 	require.Len(t, after, 1, "夹具里只有预写的那条基线操作")
+}
+
+// TestRunResources_ResourceViewsBlockDefinition 覆盖 `definition_yaml` 的块式列表
+// 形态（管理写路径落库的块原文，约束 4）：只读投影必须与基线写入的条目映射形态
+// 同形可用——两种形态都接受，且读取不改写存储字节。
+// 逆改点：只按映射解析块原文 → 管理写路径写出的资源在列表 / 详情上直接 500
+// （e2e `TestAdminConsoleE2E_ModelConnectionPublishRevert` 实测的首错）。
+func TestRunResources_ResourceViewsBlockDefinition(t *testing.T) {
+	env := newRunResourcesEnv(t)
+	ctx := context.Background()
+
+	provider := "  - name: gamma\n" +
+		"    base_url: https://g.example\n" +
+		"    api_key: ${GAMMA_KEY}\n" +
+		"    default_model: gamma-model\n"
+	providerVersion := env.seedVersion(t, core.ResourceModelConnection, "gamma", provider, "", "")
+	env.publish(t, core.ResourceModelConnection, "gamma", providerVersion.ID, true)
+
+	mcp := "  - name: files\n" +
+		"    transport: stdio\n" +
+		"    command: npx\n" +
+		"    env:\n" +
+		"      FS_TOKEN: ${FS_TOKEN}\n"
+	mcpVersion := env.seedVersion(t, core.ResourceMCPServer, "files", mcp, "", "")
+	env.publish(t, core.ResourceMCPServer, "files", mcpVersion.ID, true)
+
+	views := NewResourceViews(env.versions, env.lifecycle, newMCPRuntime(nil, nil), env.credentials, ResourceViewDeps{})
+
+	connection, err := views.ModelConnection(ctx, "gamma")
+	require.NoError(t, err)
+	require.Equal(t, "https://g.example", connection.BaseURL)
+	require.Equal(t, "GAMMA_KEY", connection.APIKeyEnv)
+	require.Equal(t, "gamma-model", connection.DefaultModel)
+	require.Equal(t, providerVersion.VersionNo, connection.PublishedVersionNo)
+
+	detail, err := views.McpServer(ctx, "files")
+	require.NoError(t, err)
+	require.Equal(t, "stdio", detail.View.Transport)
+	require.Equal(t, "npx", detail.View.Command)
+	require.Equal(t, []string{"FS_TOKEN"}, detail.View.EnvKeys)
+	require.Equal(t, mcpVersion.ID, detail.View.PublishedVersionID)
 }
 
 // TestRunResources_ResourceViewsRedactCredentials 覆盖只读视图的凭证红线（约束 35）：
@@ -775,7 +887,7 @@ func (e *runResourcesEnv) publishSkillVersion(t *testing.T, name string, version
 	t.Helper()
 	work, err := e.skills.HashWorkCopy(name)
 	require.NoError(t, err)
-	published, err := e.skills.Materialize(context.Background(), name, versionNo, work.ContentHash)
+	published, err := e.skills.Materialize(context.Background(), name, fixtureResourceUID(t, core.ResourceSkill, name), versionNo, work.ContentHash)
 	require.NoError(t, err)
 	version := e.seedVersion(t, core.ResourceSkill, name, "", skillManifest("SKILL.md"), published.Dir)
 	e.publish(t, core.ResourceSkill, name, version.ID, true)
@@ -802,7 +914,8 @@ func TestRunResources_SnapshotBuilderUsesPublishedCards(t *testing.T) {
 	const publishedMD = "---\nname: pdf\ndescription: PDF 技能\n---\n\n发布正文\n"
 	env.writeWorkSkill(t, "pdf", publishedMD)
 	dir := env.publishSkillVersion(t, "pdf", 1)
-	require.Equal(t, ".basalt/versions/skills/pdf/1", dir)
+	require.Equal(t, ".basalt/versions/skills/pdf/"+string(fixtureResourceUID(t, core.ResourceSkill, "pdf"))+"/1", dir,
+		"新发布的版本目录按身份分段")
 
 	// 发布之后改写工作副本：快照不得读它。
 	env.writeWorkSkill(t, "pdf", "---\nname: pdf\ndescription: 改过的说明\n---\n\n改过的正文\n")
@@ -821,14 +934,14 @@ func TestRunResources_SnapshotBuilderUsesPublishedCards(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Contains(t, snapshot.SectionOne,
-		"- pdf：PDF 技能（.basalt/versions/skills/pdf/1/SKILL.md）", "卡片行展示发布真路径")
+		"- pdf：PDF 技能（"+dir+"/SKILL.md）", "卡片行展示发布真路径")
 	require.NotContains(t, snapshot.SectionOne, "改过的说明")
 	require.NotContains(t, snapshot.SectionOne, ".basalt/skills/pdf/SKILL.md")
 
 	manifest := manifestHashes(snapshot)
 	require.Equal(t, sha256Hex(t, []byte(publishedMD)), manifest[".basalt/skills/pdf/SKILL.md"],
 		"清单记逻辑路径，哈希取发布版本的字节")
-	require.NotContains(t, manifest, ".basalt/versions/skills/pdf/1/SKILL.md", "发布真路径不进清单")
+	require.NotContains(t, manifest, dir+"/SKILL.md", "发布真路径不进清单")
 }
 
 // TestRunResources_SnapshotBuilderFailsClosed 覆盖装配器的失败关闭矩阵：准入结果缺目录
@@ -880,7 +993,11 @@ func TestRunResources_SnapshotBuilderPinsAdmissionVersion(t *testing.T) {
 	admitted, err := env.resources.Resolve(context.Background(), entry)
 	require.NoError(t, err)
 	t.Cleanup(func() { admitted.Runtime.Release() })
-	require.Equal(t, ".basalt/versions/skills/pdf/1", admitted.SkillDirs["pdf"])
+	pdfDir := func(versionNo int) string {
+		return ".basalt/versions/skills/pdf/" + string(fixtureResourceUID(t, core.ResourceSkill, "pdf")) + "/" +
+			strconv.Itoa(versionNo)
+	}
+	require.Equal(t, pdfDir(1), admitted.SkillDirs["pdf"])
 	// 模拟 StartRun 成功：读锁租约到此归还，运行继续用准入时固定的视图——之后的发布不再被它挡住。
 	admitted.Runtime.ReleaseAdmission()
 
@@ -890,13 +1007,13 @@ func TestRunResources_SnapshotBuilderPinsAdmissionVersion(t *testing.T) {
 	refreshed, err := env.resources.Resolve(context.Background(), entry)
 	require.NoError(t, err)
 	t.Cleanup(func() { refreshed.Runtime.Release() })
-	require.Equal(t, ".basalt/versions/skills/pdf/2", refreshed.SkillDirs["pdf"])
+	require.Equal(t, pdfDir(2), refreshed.SkillDirs["pdf"])
 
 	builder := newRunSnapshotBuilder(workspace.NewContextLoader(nil), env.root, baselineClock)
 	snapshot, err := builder.Build(context.Background(), entry, admitted)
 	require.NoError(t, err)
-	require.Contains(t, snapshot.SectionOne, ".basalt/versions/skills/pdf/1/SKILL.md")
-	require.NotContains(t, snapshot.SectionOne, ".basalt/versions/skills/pdf/2/")
+	require.Contains(t, snapshot.SectionOne, pdfDir(1)+"/SKILL.md")
+	require.NotContains(t, snapshot.SectionOne, pdfDir(2)+"/")
 	require.NotContains(t, snapshot.SectionOne, "第二版")
 	require.Equal(t, sha256Hex(t, []byte(v1MD)), manifestHashes(snapshot)[".basalt/skills/pdf/SKILL.md"])
 }
@@ -988,4 +1105,431 @@ func TestRunResources_ProviderIsAuditedPinnedView(t *testing.T) {
 	require.Equal(t, 1, countRows(t, read,
 		`SELECT COUNT(*) FROM llm_calls WHERE provider = 'alpha' AND status = 'success'`),
 		"审计行的 provider 与生效状态")
+}
+
+// ---- US-12 条件 ETag 与墓碑（FR-066 / FR-067 / FR-081，模块卡 R4 裁决 2026-10-23）----
+
+// fixtureCredentialID 由属主派生一个稳定的 `cred_` ID；取模手法与 fixtureResourceUID
+// 相同，载荷落在 Crockford 字符集内（I / L / O / U 不在集合里）。
+// fixtureCredentialID derives a stable credential id for one owner.
+func fixtureCredentialID(t *testing.T, owner string) string {
+	t.Helper()
+	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ" // 与 core 的字符集一致
+	sum := sha256.Sum256([]byte("cred\x00" + owner))
+	payload := make([]byte, 26)
+	for i := range payload {
+		payload[i] = crockford[int(sum[i%len(sum)])%len(crockford)]
+	}
+	id := "cred_" + string(payload)
+	require.NoError(t, core.ValidateCredentialID(id))
+	return id
+}
+
+// seedCredential 为 `(kind, name)` 建第 1 个托管凭据版本；属主身份取资源 UID（不是名称）。
+// seedCredential creates version 1 of a managed credential owned by the resource uid.
+func (e *runResourcesEnv) seedCredential(t *testing.T, kind core.ResourceKind, name, baseURL string) string {
+	t.Helper()
+	return seedManagedCredential(t, e.credentials, e.opID, kind, name,
+		fixtureResourceUID(t, kind, name), baseURL)
+}
+
+// seedManagedCredential 建第 1 个托管凭据版本；属主 UID 由调用方给出——夹具里既可能
+// 来自 `fixtureResourceUID`，也可能来自仓储实际分配的指针身份（跨写面用例）。
+// seedManagedCredential creates version 1 with a caller-supplied owner uid.
+func seedManagedCredential(t *testing.T, store *storage.CredentialStore, opID string,
+	kind core.ResourceKind, name string, uid core.ResourceUID, baseURL string,
+) string {
+	t.Helper()
+	binding, ok := credentialBindingKind(kind)
+	require.True(t, ok, "只有模型连接与通知渠道有托管凭据身份")
+	credID := fixtureCredentialID(t, string(kind)+"/"+name)
+	require.NoError(t, store.Create(context.Background(), core.CredentialRecord{
+		ID:          credID,
+		OwnerKind:   binding,
+		OwnerUID:    uid,
+		OwnerName:   name,
+		KeyID:       "master/v1",
+		OperationID: opID,
+		CreatedAt:   baselineClock().UnixMilli(),
+	}, core.CredentialVersionRecord{
+		KeyID:         "master/v1",
+		TargetBinding: core.TargetBinding{Kind: binding, Owner: uid, BaseURL: baseURL}.Hash(),
+		Last4:         "0001",
+		Nonce:         make([]byte, 12),
+		Ciphertext:    []byte("sealed:" + name + ":v1"),
+		OperationID:   opID,
+	}))
+	return credID
+}
+
+// TestResources_EtagIncludesScopeAndCredential —— FR-081（模块卡 R4 v3 裁决）：条件
+// ETag 覆盖内容哈希、资源 UID、修订号、范围、属主与凭据段（凭据 ID / 当前版本 /
+// 版本状态 / 撤销纪元 / 目标绑定），且**不得**等于 `content_hash` 本身；只换 Key
+// （定义字节不变）必须换 ETag，换 Key 不得波及其他资源的 ETag；只读视图与写路径的
+// 当前值必须同源（否则条件写永远 412）。
+// 逆改点：ETag 退回纯内容哈希 → "只换 Key" 三次断言全红；漏掉 scope / revision →
+// 对应单字段扰动断言红；读面另写一份组成 → 同源断言红；换 Key 波及其他资源 →
+// beta 的恒定断言红。
+func TestResources_EtagIncludesScopeAndCredential(t *testing.T) {
+	t.Run("字段敏感度", func(t *testing.T) {
+		uid := fixtureResourceUID(t, core.ResourceModelConnection, "alpha")
+		otherUID := fixtureResourceUID(t, core.ResourceModelConnection, "beta")
+		owner, err := core.NewAgentUID()
+		require.NoError(t, err)
+		otherOwner, err := core.NewAgentUID()
+		require.NoError(t, err)
+
+		basePointer := core.ResourcePointer{
+			Kind: core.ResourceModelConnection, ResourceID: "alpha",
+			ResourceUID: uid, PublishedVersionID: 7, Revision: 3, Scope: core.ScopeShared,
+		}
+		baseVersion := core.ResourceVersion{ContentHash: strings.Repeat("a", 64)}
+		baseDigest := &credentialDigest{
+			ID: "cred_" + strings.Repeat("0", 26), Version: 1,
+			State: core.CredentialVersionActive, Epoch: 0,
+			TargetBinding: strings.Repeat("b", 64),
+		}
+		exclusive := basePointer
+		exclusive.Scope = core.ScopeExclusive
+		exclusive.OwnerAgentUID = owner
+		exclusiveOther := exclusive
+		exclusiveOther.OwnerAgentUID = otherOwner
+
+		baseline := resourceETag(basePointer, baseVersion, baseDigest)
+		require.Regexp(t, `^"sha256:[0-9a-f]{64}"$`, baseline)
+		require.Equal(t, baseline, resourceETag(basePointer, baseVersion, baseDigest), "同输入必须稳定")
+
+		mutations := []struct {
+			field  string
+			render func() string
+		}{
+			{"content_hash", func() string {
+				version := baseVersion
+				version.ContentHash = strings.Repeat("c", 64)
+				return resourceETag(basePointer, version, baseDigest)
+			}},
+			{"resource_uid", func() string {
+				pointer := basePointer
+				pointer.ResourceUID = otherUID
+				return resourceETag(pointer, baseVersion, baseDigest)
+			}},
+			{"revision", func() string {
+				pointer := basePointer
+				pointer.Revision++
+				return resourceETag(pointer, baseVersion, baseDigest)
+			}},
+			{"scope", func() string { return resourceETag(exclusive, baseVersion, baseDigest) }},
+			{"owner_agent_uid", func() string { return resourceETag(exclusiveOther, baseVersion, baseDigest) }},
+			{"credential_id", func() string {
+				digest := *baseDigest
+				digest.ID = "cred_" + strings.Repeat("1", 26)
+				return resourceETag(basePointer, baseVersion, &digest)
+			}},
+			{"credential_version", func() string {
+				digest := *baseDigest
+				digest.Version = 2
+				return resourceETag(basePointer, baseVersion, &digest)
+			}},
+			{"credential_version_state", func() string {
+				digest := *baseDigest
+				digest.State = core.CredentialVersionSuperseded
+				return resourceETag(basePointer, baseVersion, &digest)
+			}},
+			{"revocation_epoch", func() string {
+				digest := *baseDigest
+				digest.Epoch = 1
+				return resourceETag(basePointer, baseVersion, &digest)
+			}},
+			{"target_binding", func() string {
+				digest := *baseDigest
+				digest.TargetBinding = strings.Repeat("d", 64)
+				return resourceETag(basePointer, baseVersion, &digest)
+			}},
+			{"凭据段整体缺失（技能 / MCP / env 模式）", func() string {
+				return resourceETag(basePointer, baseVersion, nil)
+			}},
+		}
+		for _, mutation := range mutations {
+			require.NotEqual(t, baseline, mutation.render(), "字段 %s 单独变化必须换 ETag", mutation.field)
+		}
+	})
+
+	t.Run("只换 Key 必须换 ETag 且不影响其他资源", func(t *testing.T) {
+		ctx := context.Background()
+		env := newRunResourcesEnv(t)
+		alpha := env.seedVersion(t, core.ResourceModelConnection, "alpha",
+			providerDefinition("alpha", "https://a.example", "${ALPHA_KEY}", "alpha-model"), "", "")
+		env.publish(t, core.ResourceModelConnection, "alpha", alpha.ID, true)
+		beta := env.seedVersion(t, core.ResourceModelConnection, "beta",
+			providerDefinition("beta", "https://b.example", "${BETA_KEY}", "beta-model"), "", "")
+		env.publish(t, core.ResourceModelConnection, "beta", beta.ID, true)
+
+		admin := NewResourceAdmin(ResourceAdminDeps{
+			Store:       env.versions,
+			Operations:  env.ops,
+			Gate:        env.gate,
+			Credentials: env.credentials,
+			Now:         baselineClock,
+		})
+		readETag := func(name string) string {
+			t.Helper()
+			view, err := env.views.ModelConnection(ctx, name)
+			require.NoError(t, err)
+			current, ok := admin.CurrentETag(ctx, core.ResourceModelConnection, name)
+			require.True(t, ok, "写路径必须能取到当前条件值")
+			require.Equal(t, current, view.ETag, "只读视图与写路径必须同源")
+			return view.ETag
+		}
+		publishedHash := func() string {
+			t.Helper()
+			version, err := env.versions.VersionByID(ctx, alpha.ID)
+			require.NoError(t, err)
+			return version.ContentHash
+		}
+
+		initial := readETag("alpha")
+		betaInitial := readETag("beta")
+		require.Regexp(t, `^"sha256:[0-9a-f]{64}"$`, initial)
+		require.NotEqual(t, `"sha256:`+alpha.ContentHash+`"`, initial, "条件 ETag 不得等于纯内容哈希")
+
+		// 1) 范围转换：定义字节不变、revision +1、scope 与属主写入 → ETag 必须变。
+		// 属主必须能在生命周期索引里反查到名字——生产路径的范围转换先按名字解析出
+		// UID（`ScopeService.resolveOwner`），读面按同一前提反查，缺行即 fail-closed。
+		owner, err := core.NewAgentUID()
+		require.NoError(t, err)
+		require.NoError(t, env.versions.PutLifecycleIndex(ctx, core.LifecycleRecord{
+			SchemaVersion: 2, Agent: "alpha-owner", AgentUID: owner,
+			State: core.AgentDisabled, Generation: 1,
+			UpdatedAt: baselineClock().UnixMilli(), OperationID: env.opID,
+		}, true, ""))
+		_, err = env.versions.ConvertScope(ctx, storage.ScopeConversion{
+			Kind:          core.ResourceModelConnection,
+			Name:          "alpha",
+			ExpectUID:     fixtureResourceUID(t, core.ResourceModelConnection, "alpha"),
+			Target:        core.ScopeExclusive,
+			OwnerAgentUID: owner,
+			OperationID:   env.opID,
+			At:            baselineClock(),
+		})
+		require.NoError(t, err)
+		afterScope := readETag("alpha")
+		require.NotEqual(t, initial, afterScope, "范围与属主写入必须换 ETag")
+		require.Equal(t, alpha.ContentHash, publishedHash(), "范围转换不改内容字节")
+
+		// 2) 建托管凭据（env → managed）：内容字节完全不变，只有凭据段出现 → ETag 必须变。
+		credID := env.seedCredential(t, core.ResourceModelConnection, "alpha", "https://a.example")
+		afterCreate := readETag("alpha")
+		require.NotEqual(t, afterScope, afterCreate, "建立凭据身份必须换 ETag")
+		require.Equal(t, alpha.ContentHash, publishedHash())
+
+		// 3) 换 Key = 追加版本：定义字节仍然不变 → ETag 必须再变（纯内容哈希发现不了）。
+		require.NoError(t, env.credentials.AppendVersion(ctx, credID, "master/v1", env.opID,
+			core.CredentialVersionRecord{
+				KeyID: "master/v1",
+				TargetBinding: core.TargetBinding{
+					Kind:    core.BindingModelConnection,
+					Owner:   fixtureResourceUID(t, core.ResourceModelConnection, "alpha"),
+					BaseURL: "https://a.example",
+				}.Hash(),
+				Last4:       "0002",
+				Nonce:       make([]byte, 12),
+				Ciphertext:  []byte("sealed:alpha:v2"),
+				OperationID: env.opID,
+			}, baselineClock()))
+		afterRotate := readETag("alpha")
+		require.NotEqual(t, afterCreate, afterRotate, "只换 Key（内容不变）必须换 ETag")
+		require.Equal(t, alpha.ContentHash, publishedHash())
+
+		// 4) 撤销：版本状态 revoked + 撤销纪元 +1 → ETag 必须再变。
+		require.NoError(t, env.credentials.Revoke(ctx, credID, env.opID, baselineClock()))
+		afterRevoke := readETag("alpha")
+		require.NotEqual(t, afterRotate, afterRevoke, "撤销必须换 ETag")
+
+		require.Equal(t, betaInitial, readETag("beta"), "全程不得波及其他资源的 ETag")
+	})
+}
+
+// TestResources_EtagKeyOnlyChange —— FR-081 的单点判据：只换 Key（追加第 2 个凭据版本）
+// 时已发布内容哈希逐字节不变，资源 ETag 必须变化，且只读视图与写路径始终同源。
+// 逆改点：ETag 退回纯内容哈希 → "换 Key 必须换 ETag" 断言红；读面另算一份 → 同源断言红。
+func TestResources_EtagKeyOnlyChange(t *testing.T) {
+	ctx := context.Background()
+	env := newRunResourcesEnv(t)
+	published := env.seedVersion(t, core.ResourceModelConnection, "alpha",
+		providerDefinition("alpha", "https://a.example", "${ALPHA_KEY}", "alpha-model"), "", "")
+	env.publish(t, core.ResourceModelConnection, "alpha", published.ID, true)
+	credID := env.seedCredential(t, core.ResourceModelConnection, "alpha", "https://a.example")
+
+	admin := NewResourceAdmin(ResourceAdminDeps{
+		Store:       env.versions,
+		Operations:  env.ops,
+		Gate:        env.gate,
+		Credentials: env.credentials,
+		Now:         baselineClock,
+	})
+	readETag := func() string {
+		t.Helper()
+		view, err := env.views.ModelConnection(ctx, "alpha")
+		require.NoError(t, err)
+		current, ok := admin.CurrentETag(ctx, core.ResourceModelConnection, "alpha")
+		require.True(t, ok, "写路径必须能取到当前条件值")
+		require.Equal(t, current, view.ETag, "只读视图与写路径必须同源")
+		return view.ETag
+	}
+
+	before := readETag()
+	require.Regexp(t, `^"sha256:[0-9a-f]{64}"$`, before)
+	require.NotEqual(t, `"sha256:`+published.ContentHash+`"`, before, "条件 ETag 不得等于纯内容哈希")
+
+	// 只换 Key = 同一凭据追加第 2 个版本；定义文件与已发布版本字节完全不动。
+	require.NoError(t, env.credentials.AppendVersion(ctx, credID, "master/v1", env.opID,
+		core.CredentialVersionRecord{
+			KeyID: "master/v1",
+			TargetBinding: core.TargetBinding{
+				Kind:    core.BindingModelConnection,
+				Owner:   fixtureResourceUID(t, core.ResourceModelConnection, "alpha"),
+				BaseURL: "https://a.example",
+			}.Hash(),
+			Last4:       "0002",
+			Nonce:       make([]byte, 12),
+			Ciphertext:  []byte("sealed:alpha:v2"),
+			OperationID: env.opID,
+		}, baselineClock()))
+	stored, err := env.versions.VersionByID(ctx, published.ID)
+	require.NoError(t, err)
+	require.Equal(t, published.ContentHash, stored.ContentHash, "换 Key 不得改已发布内容")
+
+	after := readETag()
+	require.NotEqual(t, before, after, "只换 Key（内容字节不变）必须换 ETag")
+}
+
+// TestResources_KeyChangeDoesNotBreakOtherAgentSave —— 反向边界：凭据段进资源 ETag
+// 只影响**该资源**的条件写，不得把改动扩散到 Agent 正文保存。换 Key 之后，另一个
+// Agent 用换 Key 之前读到的集合 ETag 提交自己的定义文件必须成功（不 412）。
+// 逆改点：把凭据状态混进 Agent 集合 ETag → 提交断言红；资源 ETag 不随 Key 变化 →
+// 前半段断言红（两半互为对照，任一方向的"顺手统一"都会被抓到）。
+func TestResources_KeyChangeDoesNotBreakOtherAgentSave(t *testing.T) {
+	ctx := context.Background()
+	env := newAgentAdminEnv(t)
+	writeAdminAgent(t, env.root, "writer")
+
+	// 同库同工作区：已发布模型连接 + 托管凭据（属主身份取仓储实际分配的指针 UID）。
+	published := env.seedModel(t, "alpha")
+	opID := env.seedOperation(t)
+	credentials := storage.NewCredentialStore(env.db)
+	credID := seedManagedCredential(t, credentials, opID, core.ResourceModelConnection,
+		"alpha", published.ResourceUID, "https://api.example.com")
+	admin := NewResourceAdmin(ResourceAdminDeps{
+		Store:       env.versions,
+		Operations:  env.ops,
+		Credentials: credentials,
+		Now:         baselineClock,
+	})
+
+	files, err := env.admin.Files(ctx, "writer")
+	require.NoError(t, err)
+	resourceBefore, ok := admin.CurrentETag(ctx, core.ResourceModelConnection, "alpha")
+	require.True(t, ok)
+
+	// 换 Key：只追加凭据版本，模型连接的定义与发布指针都不动。
+	require.NoError(t, credentials.AppendVersion(ctx, credID, "master/v1", opID,
+		core.CredentialVersionRecord{
+			KeyID: "master/v1",
+			TargetBinding: core.TargetBinding{
+				Kind:    core.BindingModelConnection,
+				Owner:   published.ResourceUID,
+				BaseURL: "https://api.example.com",
+			}.Hash(),
+			Last4:       "0002",
+			Nonce:       make([]byte, 12),
+			Ciphertext:  []byte("sealed:alpha:v2"),
+			OperationID: opID,
+		}, baselineClock()))
+
+	resourceAfter, ok := admin.CurrentETag(ctx, core.ResourceModelConnection, "alpha")
+	require.True(t, ok)
+	require.NotEqual(t, resourceBefore, resourceAfter, "换 Key 必须换该资源的 ETag")
+
+	// Agent 集合 ETag 不含资源状态：换 Key 前后必须完全相同，旧 ETag 提交不得 412。
+	refreshed, err := env.admin.Files(ctx, "writer")
+	require.NoError(t, err)
+	require.Equal(t, files.ETag, refreshed.ETag, "资源凭据变化不得影响 Agent 集合 ETag")
+
+	updated := authorAgentMD("writer", "alpha", "alpha-model", nil, nil) + "\n额外一行\n"
+	view, err := env.admin.SubmitFiles(ctx, consoleActor(), "writer", files.ETag,
+		[]core.AuthorFile{{Path: "AGENT.md", Content: updated}})
+	require.NoError(t, err, "换 Key 之后，别处 Agent 用换 Key 前的集合 ETag 提交必须成功")
+	require.NotEqual(t, files.ETag, view.ETag)
+}
+
+// TestResources_TombstoneOnDelete —— FR-066 / FR-067 / SC-017（后者取代 SC-005
+// 后半句）：删除只打墓碑——按名不可见，但指针行、版本行与删除事实全部保留；同名重建
+// 是**新 UID**、版本号从 1 重新计，旧 UID 的版本不被接管，只有显式按 UID 才查得到；
+// 指针行的 revision 跨代继续递增（ETag 因此不会与删除前相同）。
+// 本节直接调用仓储，因此只断言仓储写下的指针墓碑；身份表的 `deleted` 行由管理写
+// 路径在同一动作里写（见 T128），不在这里伪造。
+// 逆改点：删除物理删行 / 按名仍可见 / 重建沿用旧 UID（版本号从 2 起）/ 旧 UID 版本
+// 混入新身份 → 各自断言红。
+func TestResources_TombstoneOnDelete(t *testing.T) {
+	ctx := context.Background()
+	env := newRunResourcesEnv(t)
+
+	version := env.seedVersion(t, core.ResourceSkill, "pdf", "",
+		skillManifest("SKILL.md"), ".basalt/versions/skills/pdf/1")
+	env.publish(t, core.ResourceSkill, "pdf", version.ID, true)
+	before, err := env.views.Skill(ctx, "pdf")
+	require.NoError(t, err)
+	oldUID := fixtureResourceUID(t, core.ResourceSkill, "pdf")
+
+	require.NoError(t, env.versions.MarkDeleted(ctx, core.ResourceSkill, "pdf", env.opID, baselineClock()))
+
+	// 墓碑：按名不可见（单查与列表同口径），指针行与版本行都还在。
+	_, err = env.views.Skill(ctx, "pdf")
+	require.ErrorIs(t, err, core.ErrResourceNotFound)
+	skills, err := env.views.Skills(ctx)
+	require.NoError(t, err)
+	require.Empty(t, skills, "已删除资源不得出现在列表里")
+	pointer, err := env.versions.Pointer(ctx, core.ResourceSkill, "pdf")
+	require.NoError(t, err)
+	require.NotNil(t, pointer.DeletedAt, "删除只打墓碑，不物理删指针行")
+	require.Equal(t, oldUID, pointer.ResourceUID)
+	revisionAfterDelete := pointer.Revision
+	historical, err := env.versions.VersionsByUID(ctx, core.ResourceSkill, oldUID)
+	require.NoError(t, err)
+	require.Len(t, historical, 1, "版本历史必须保留")
+	require.Equal(t, version.ID, historical[0].ID)
+
+	// 同名重建 = 新 UID：版本号从 1 重新计，墓碑清除，revision 跨代继续递增。
+	newUID := fixtureResourceUID(t, core.ResourceSkill, "pdf#rebuild")
+	rebuilt, err := env.versions.PublishWithVersionState(ctx, core.ResourceVersion{
+		Kind:         core.ResourceSkill,
+		ResourceID:   "pdf",
+		ResourceUID:  newUID,
+		ContentHash:  sha256Hex(t, []byte("重建后的技能正文")),
+		ManifestJSON: skillManifest("SKILL.md", "references/guide.md"),
+		StoragePath:  ".basalt/versions/skills/pdf/2",
+		CreatedAt:    baselineClock().UnixMilli(),
+		OperationID:  env.opID,
+	}, true, env.opID, baselineClock())
+	require.NoError(t, err)
+	require.Equal(t, 1, rebuilt.VersionNo, "新实例的版本号从 1 重新计（SC-017）")
+
+	after, err := env.views.Skill(ctx, "pdf")
+	require.NoError(t, err, "重建后按名可见")
+	require.NotEqual(t, before.ETag, after.ETag, "身份换代必须换 ETag")
+
+	pointer, err = env.versions.Pointer(ctx, core.ResourceSkill, "pdf")
+	require.NoError(t, err)
+	require.Nil(t, pointer.DeletedAt, "同名重建清除墓碑")
+	require.Equal(t, newUID, pointer.ResourceUID)
+	require.Greater(t, pointer.Revision, revisionAfterDelete, "指针行的修订号跨代继续递增")
+
+	// 按 UID 的历史彼此隔离：旧 UID 仍只有一条，新 UID 也只有一条。
+	historical, err = env.versions.VersionsByUID(ctx, core.ResourceSkill, oldUID)
+	require.NoError(t, err)
+	require.Len(t, historical, 1, "旧 UID 的版本不得被新身份接管")
+	current, err := env.versions.VersionsByUID(ctx, core.ResourceSkill, newUID)
+	require.NoError(t, err)
+	require.Len(t, current, 1)
+	require.Equal(t, rebuilt.ID, current[0].ID)
 }

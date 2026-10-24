@@ -1,10 +1,10 @@
 package web
 
-// 本文件覆盖沙箱白名单只读端点（模块卡 §3.1.28 / §4.1 第 24 行，6 例）：四类白名单
-// 原样投影、空配置输出四个 `[]`、宿主绝对路径与空路径**不**出站、认证闸门，以及
-// 响应字段集与契约一致。本端点只读——修改白名单需改配置并重启（约束 29）。
-// Sandbox allowlist acceptance: four lists projected verbatim, empty configuration as
-// [], host-absolute/empty paths dropped, the auth gate, and the contract field set.
+// 本文件覆盖沙箱白名单端点的只读面（模块卡 §3.1.28 / §4.1 第 24 行）：四类白名单
+// 原样投影、空配置输出四个 `[]`、宿主绝对路径与空路径**不**出站、认证闸门、响应
+// 字段集与契约一致。生效元数据与条件写的用例在 handlers_sandbox_write_test.go。
+// Sandbox acceptance: the read projection, the auth gate, and the contract field set;
+// the live metadata and the conditional write live in handlers_sandbox_write_test.go.
 
 import (
 	"encoding/json"

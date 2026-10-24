@@ -82,6 +82,10 @@ func (f *fakeLifecycle) Bootstrap(context.Context, string, string) (core.Lifecyc
 	return core.LifecycleRecord{}, errors.New("fakeLifecycle: Bootstrap 不在概览路径上")
 }
 
+func (f *fakeLifecycle) BootstrapIdentity(context.Context, string, core.AgentUID, string) (core.LifecycleRecord, error) {
+	return core.LifecycleRecord{}, errors.New("fakeLifecycle: BootstrapIdentity 不在概览路径上")
+}
+
 func (f *fakeLifecycle) Discard(context.Context, string, string) error {
 	return errors.New("fakeLifecycle: Discard 不在概览路径上")
 }

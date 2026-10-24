@@ -66,7 +66,7 @@ func testBootstrapInitIdempotent(t *testing.T) {
 	requireExit(t, second, 0, "init 二次")
 	requireContains(t, second.Stdout, "新建：（无）", "init 二次")
 	requireContains(t, second.Stdout, "保留（", "init 二次")
-	requireContains(t, second.Stdout, "已存在，零写（schema v2）", "init 二次")
+	requireContains(t, second.Stdout, "已存在，零写（schema v5）", "init 二次")
 
 	for _, rel := range files {
 		path := filepath.Join(h.Root, ".basalt", filepath.FromSlash(rel))
@@ -77,14 +77,14 @@ func testBootstrapInitIdempotent(t *testing.T) {
 }
 
 // testBootstrapStatusNoConfig：无配置文件时 `status` 仍 exit 0，且明示「未发现配置」。
-// 判据（US-1 §6 Demo ③）：库、schema 版本、18 张表就绪，汇总全部通过。
+// 判据（US-1 §6 Demo ③）：库、schema 版本、29 张表就绪，汇总全部通过。
 func testBootstrapStatusNoConfig(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
 
 	res := h.run(t, nil, "status")
 	requireExit(t, res, 0, "status 无配置")
-	for _, want := range []string{"未发现配置", "schema v2", "18 张表", "汇总：全部通过"} {
+	for _, want := range []string{"未发现配置", "schema v5", "29 张表", "汇总：全部通过"} {
 		requireContains(t, res.Stdout, want, "status 无配置")
 	}
 }

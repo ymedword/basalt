@@ -327,5 +327,5 @@ func TestBootstrap_ConcurrentInitRace(t *testing.T) {
 
 	names, err := db.TableNames(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, contractTables, names) // 终态：11 表齐备
+	require.Equal(t, contractTables, names) // 终态：29 表齐备
 }

@@ -2,12 +2,12 @@
 // 视图只依赖这里暴露的上下文，不自行创建客户端或访问全局状态。
 // Shared view layer: the console context, uniform view props, the loader composable
 // and status-label maps. Views never construct their own clients.
-import { h, onMounted, ref, shallowRef } from 'vue'
+import { h, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import type { PropType, Ref, ShallowRef, VNode, VNodeChild } from 'vue'
 import { errorMessage } from '../api'
-import type { AgentState, ApiClient, OperationStatus, RunStatus } from '../api'
+import type { AgentState, ApiClient, OperationStatus, RunStatus, RunView } from '../api'
 import type { ConsoleAuth } from '../auth'
-import { StatusBadge } from '../components/ui'
+import { StatusBadge, formatTimestamp } from '../components/ui'
 import type { Tone } from '../components/ui'
 import type { ConsoleRouter } from '../router'
 
@@ -76,6 +76,250 @@ export function useLoader<T>(load: () => Promise<T>, immediate = true): LoaderSt
   }
 
   return { data, error, loading, reload }
+}
+
+/** 轮询基线（20 秒）、退避上限（5 分钟）与可见性 / 聚焦去重窗口。 */
+// Polling base, backoff cap and the visibility/focus dedupe window.
+export const LIVE_REFRESH_BASE_MS = 20_000
+export const LIVE_REFRESH_MAX_MS = 300_000
+const LIVE_REFRESH_DEDUPE_MS = 3_000
+
+/** useLiveLoader 选项：轮询间隔与该数据所在页签是否活跃。 */
+export interface LiveLoaderOptions {
+  /** 轮询间隔；省略取 20 秒。 */
+  intervalMs?: number
+  /** 页签活跃标记：false 时停止轮询（页面卸载与登出由卸载清理覆盖）。 */
+  active?: Ref<boolean>
+}
+
+/** 带可见性轮询的加载状态：在 LoaderState 之上增加最近成功刷新时间与立即刷新。 */
+export interface LiveLoaderState<T> extends LoaderState<T> {
+  /** 最近一次成功刷新的本地时间；null = 本次进入后尚未成功刷新。 */
+  readonly lastRefreshedAt: Ref<Date | null>
+  /** 立即刷新（与轮询共用单飞闸：已有请求在途时跳过）。 */
+  refreshNow(): Promise<void>
+  /**
+   * 页内写后的重新读取：同样受单飞闸约束；若轮询已在途，等它结束后补一次，
+   * 保证读到的是写后状态而不是写前响应。
+   * Write-triggered reloads share the single-flight gate and queue one trailing read.
+   */
+  reload(): Promise<void>
+}
+
+/**
+ * useLiveLoader：在 useLoader 之上加"页签可见时定时刷新"（R8 裁决 3）。
+ *
+ * 约束：① 同一时刻只跑一个请求（过期响应由 useLoader 的代际号丢弃，数据与滚动
+ * 位置保持不动）；② 页面隐藏、切走页签、卸载时停止定时器；③ 失败按 2 倍退避到
+ * 5 分钟，成功后回到基线；④ visibilitychange / focus 触发的刷新在 3 秒内去重；
+ * ⑤ 只重读 GET 列表——**绝不**重发写请求或运行请求。
+ * Polls only while the tab is visible; failures back off; writes are never retried.
+ */
+export function useLiveLoader<T>(
+  load: () => Promise<T>,
+  options: LiveLoaderOptions = {},
+): LiveLoaderState<T> {
+  // 首次读取也走单飞刷新：失败计入退避，只有成功才写「最近刷新」。
+  // The initial read shares the single-flight path so the stamp stays truthful.
+  const state = useLoader(load, false)
+  const lastRefreshedAt = ref<Date | null>(null)
+  const interval = options.intervalMs ?? LIVE_REFRESH_BASE_MS
+  const active = options.active ?? ref(true)
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let delay = interval
+  let inFlight = false
+  let pendingWriteRefresh = false
+  let lastAttemptAt = 0
+  let stopped = false
+
+  function clearTimer(): void {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+
+  function mayRefresh(): boolean {
+    return !stopped && active.value && document.visibilityState !== 'hidden'
+  }
+
+  function schedule(): void {
+    clearTimer()
+    if (!mayRefresh() || interval <= 0) {
+      return
+    }
+    timer = setTimeout(() => {
+      timer = null
+      void tick()
+    }, delay)
+  }
+
+  /** 单飞刷新；返回 null = 本轮因在途请求跳过（不改变退避档位）。 */
+  async function run(): Promise<boolean | null> {
+    if (inFlight) {
+      return null
+    }
+    inFlight = true
+    lastAttemptAt = Date.now()
+    try {
+      await state.reload()
+      const ok = state.error.value === ''
+      if (ok) {
+        lastRefreshedAt.value = new Date()
+        delay = interval
+      }
+      return ok
+    } finally {
+      inFlight = false
+      // 页内写后刷新若撞上在途轮询，等它结束再补一次（仍是同一时刻一个请求）。
+      if (pendingWriteRefresh) {
+        pendingWriteRefresh = false
+        if (mayRefresh()) {
+          const ok = await run()
+          if (ok === false) {
+            delay = Math.min(delay * 2, LIVE_REFRESH_MAX_MS)
+          }
+        }
+      }
+    }
+  }
+
+  async function tick(): Promise<void> {
+    if (!mayRefresh()) {
+      return
+    }
+    if ((await run()) === false) {
+      delay = Math.min(delay * 2, LIVE_REFRESH_MAX_MS)
+    }
+    schedule()
+  }
+
+  async function refreshNow(): Promise<void> {
+    if (!mayRefresh()) {
+      return
+    }
+    if ((await run()) === false) {
+      delay = Math.min(delay * 2, LIVE_REFRESH_MAX_MS)
+    }
+    schedule()
+  }
+
+  /**
+   * 页内写后的重新读取（T215 / T216）：不再直接暴露 useLoader 的裸 reload，
+   * 否则会和轮询并发打同一端点。在途时排队一次尾随刷新，成功后时间戳照常前进。
+   * Write-triggered reads never overlap a poll; one trailing read is queued instead.
+   */
+  async function reloadAfterWrite(): Promise<void> {
+    if (!mayRefresh()) {
+      return
+    }
+    if (inFlight) {
+      pendingWriteRefresh = true
+      return
+    }
+    if ((await run()) === false) {
+      delay = Math.min(delay * 2, LIVE_REFRESH_MAX_MS)
+    }
+  }
+
+  /** 可见性 / 聚焦触发的刷新：3 秒内只认一次，避免两个事件叠成两次请求。 */
+  function refreshFromEvent(): void {
+    if (Date.now() - lastAttemptAt < LIVE_REFRESH_DEDUPE_MS) {
+      return
+    }
+    void refreshNow()
+  }
+
+  function onVisibilityChange(): void {
+    if (document.visibilityState === 'hidden') {
+      clearTimer()
+      return
+    }
+    refreshFromEvent()
+  }
+
+  onMounted(() => {
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('focus', refreshFromEvent)
+    void refreshNow()
+  })
+  onUnmounted(() => {
+    stopped = true
+    clearTimer()
+    document.removeEventListener('visibilitychange', onVisibilityChange)
+    window.removeEventListener('focus', refreshFromEvent)
+  })
+  // 进入 / 切回页签时立即重读一次，而不是等下一个轮询周期（裁决 3）。
+  // Entering the tab re-reads at once instead of waiting for the next tick.
+  watch(active, (value) => {
+    if (value) {
+      void refreshNow()
+    } else {
+      clearTimer()
+    }
+  })
+
+  // 显式覆盖 reload：页内操作与轮询共用同一道单飞闸（R8 裁决 3）。
+  return { ...state, reload: reloadAfterWrite, lastRefreshedAt, refreshNow }
+}
+
+/** 刷新时间戳的页面文案；尚未成功刷新时明确说"尚未刷新"，不伪造时间。 */
+export function refreshStamp(at: Date | null): string {
+  return at === null ? '尚未刷新' : `最近刷新 ${formatTimestamp(at.toISOString())}`
+}
+
+/** Notice 的三档色调；与状态徽标的 Tone 是两张表，不混用。 */
+// Notice tones are a separate three-value scale from the badge Tone.
+export type NoticeTone = 'info' | 'warn' | 'error'
+
+/** 资源本地配置就绪三值；与实测结果（last_test）分开呈现，绝不互相冒充。 */
+// Local readiness; never shown as if it were a live test result.
+export type Availability = 'ready' | 'unconfigured' | 'unavailable'
+
+export const AVAILABILITY_LABELS: Record<Availability, string> = {
+  ready: '配置就绪',
+  unconfigured: '未配置',
+  unavailable: '不可用',
+}
+
+export function availabilityTone(availability: Availability): Tone {
+  switch (availability) {
+    case 'ready':
+      return 'ok'
+    case 'unconfigured':
+      return 'muted'
+    default:
+      return 'bad'
+  }
+}
+
+/**
+ * 同步 Run 的结果文案：limit_reached 是 200 的正常结果，不是服务故障。
+ * 会话发送与「立即运行一轮」共用同一口径，避免两处文案漂移。
+ * A synchronous run's outcome; limit_reached is a normal 200 result.
+ */
+export function sendResultNotice(run: RunView): { tone: NoticeTone; text: string } {
+  switch (run.status) {
+    case 'completed':
+      return {
+        tone: 'info',
+        text: `运行完成（${run.iterations} 轮，${run.tool_calls} 次工具调用）。`,
+      }
+    case 'limit_reached':
+      return {
+        tone: 'warn',
+        text: `达到迭代上限（${run.iterations} 轮），运行以 limit_reached 结束；可查看运行详情与部分结果。`,
+      }
+    case 'failed':
+      return {
+        tone: 'error',
+        text: `运行失败：${run.reason === '' ? '服务端未给出原因，请查看运行详情。' : run.reason}`,
+      }
+    case 'cancelled':
+      return { tone: 'warn', text: '运行已取消。' }
+    default:
+      return { tone: 'info', text: `运行状态：${run.status}` }
+  }
 }
 
 /** Agent 生命周期状态的中文标签。 */

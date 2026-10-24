@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/ymedword/basalt/internal/core"
 )
 
 // 目录清单：顺序即创建顺序，也是报告顺序（CLI 输出稳定可比）。
@@ -109,10 +111,15 @@ Agent 不写本文件；需要记住的事写进长期记忆 memory/MEMORY.md。
 const (
 	placeholderProviderName = "请在此填写 provider 名"
 	placeholderModelName    = "请在此填写模型名"
+
+	// defaultAgentDescription 是创建请求没给描述时的模板默认文案（§3.2.2 templates_test.go：
+	// 「默认值不变」——空描述取代的是 US-3 起就写在模板里的那句话，逐字保留）。
+	defaultAgentDescription = "一句话说明这个 Agent 的职责（可留空）"
 )
 
 // agentTemplateDTO 是 profile create 模板的落盘形态：**经 yaml.Marshal 编码**——不得字符串
-// 插值（名字可含空格 / 冒号 / 中文，插值会写坏 YAML）；provider.model 恒为占位；tools 显式
+// 插值（名字可含空格 / 冒号 / 中文，插值会写坏 YAML）；provider.model 缺省为占位（给了
+// 候选值则逐字落盘）；tools 显式
 // 声明两件记忆工具（US-6 起——出厂即可记忆）；其余列表字段（skills / mcp_servers /
 // bootstrap / schedules）省略
 // （颗粒度文档 §3.1 CreateAgent 注释 + data-model「profile create 模板」）。
@@ -132,18 +139,29 @@ type agentTemplateProvider struct {
 }
 
 // agentTemplate 渲染一份**可装载**的 AGENT.md 模板（frontmatter 围栏 + 围栏外正文）。
-// providers 为空 → provider.name 写占位文本（命令面另加"模板尚未注册"的说明）。
-// agentTemplate renders a loadable AGENT.md template.
-func agentTemplate(name string, providers []string) (string, error) {
+// 描述与模型来自候选 spec：空串分别落回默认描述与可见占位符（§3.2.2「默认值不变」——
+// CLI 的 create 不带这两个参数时，产物与 US-3 起的模板逐字一致）。providers 为空 →
+// provider.name 写占位文本（命令面另加"模板尚未注册"的说明），provider 取配置数组首项。
+// agentTemplate renders a loadable AGENT.md template; empty description and model fall
+// back to the historical defaults so the CLI-created file stays byte-identical.
+func agentTemplate(spec core.AgentSpec, providers []string) (string, error) {
 	providerName := placeholderProviderName
 	if len(providers) > 0 {
 		providerName = providers[0] // 配置数组首项（§2.3 流程 C）
 	}
+	description := spec.Description
+	if description == "" {
+		description = defaultAgentDescription
+	}
+	model := spec.Model
+	if model == "" {
+		model = placeholderModelName
+	}
 
 	dto := agentTemplateDTO{
-		Name:        name,
-		Description: "一句话说明这个 Agent 的职责（可留空）",
-		Provider:    agentTemplateProvider{Name: providerName, Model: placeholderModelName},
+		Name:        spec.Name,
+		Description: description,
+		Provider:    agentTemplateProvider{Name: providerName, Model: model},
 		Tools:       []string{"save_memory", "recall_memory"}, // 默认两件记忆工具（US-6；声明即绑定——池外工具名会让本 Agent 整只不注册）
 	}
 
@@ -151,7 +169,25 @@ func agentTemplate(name string, providers []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("编码 Agent 模板: %w", err)
 	}
-	return "---\n" + string(front) + "---\n\n" + agentTemplateBody(name) + "\n", nil
+	return "---\n" + string(front) + "---\n\n" + agentTemplateBody(spec.Name) + "\n", nil
+}
+
+// agentTemplateSkeletonName 是作者提示词骨架里的名字占位：骨架只给**结构**，真实名字由
+// 提示词的其他段落给出，因此骨架里不出现任何一次真实 Agent 名（US-12 约束 29）。
+// agentTemplateSkeletonName is the neutral name used inside the author prompt skeleton.
+const agentTemplateSkeletonName = "<name>"
+
+// AgentTemplateSkeleton 返回作者提示词使用的 AGENT.md 结构骨架：与 `CreateAgentStaged`
+// 落盘的模板**同源**（同一个 `agentTemplate` 渲染器，经 `yaml.Marshal` 编码），名字写
+// 中性占位 `<name>`，provider 与 model 写可见占位符。骨架**只给结构**；已发布的 Provider /
+// 技能 / MCP 名单由提示词按**本次调用**的当前快照另行渲染（`core.AuthorReferences`），
+// 不让骨架缓存一份会过期的发布列表（颗粒度文档 §3.1.2「AuthorReferences.Template 是
+// 既有模板正文」）。
+// AgentTemplateSkeleton renders the very template CreateAgentStaged writes, with neutral
+// placeholders only; live published names are rendered separately so the skeleton never
+// caches an expiring snapshot.
+func AgentTemplateSkeleton() (string, error) {
+	return agentTemplate(core.AgentSpec{Name: agentTemplateSkeletonName}, nil)
 }
 
 // agentTemplateBody 是模板的正文（段一素材之一）：只说明"该写什么"，不写进任何后续 US

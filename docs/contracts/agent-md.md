@@ -35,6 +35,13 @@ skills:
   - digest-format
 mcp_servers:
   - github-mcp
+notify_mode: none
+notify_channels: []
+resource_bindings:
+  model_connection:
+    - name: deepseek
+      uid: rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A  # 系统分配，不得手填
+  notify_channel: []
 bootstrap:
   - AGENTS.md
   - SOUL.md
@@ -62,16 +69,20 @@ schedules:
 | --- | --- | --- | --- | --- |
 | `name` | string | **是** | — | 必须等于目录名（改名 = 新建 + 归档旧的） |
 | `description` | string | 否 | 空 | 一句话描述，管理台展示用 |
+| `display_name` | string | 否 | 空 | 管理台展示名。**只影响展示**（列表 / 详情 / 面包屑）：不参与提示词、目录名、`agent_uid` 或运行标识，改名不改身份。去空白后为空 = 未声明，展示回退 `name`。结构化写入拒绝控制字符与超过 64 字符的值；加载期不对它报错 |
 | `identity.agent_name` | string | 否 | `name` | 人格短名，注入提示词的自我称谓 |
 | `identity.prompt` | string | 否 | 空 | 人格提示词，拼在系统提示词开头 |
-| `provider.name` | string | **是** | — | 必须是 `basalt.yaml` 里已注册的 provider 名 |
+| `provider.name` | string | **是** | — | 必须是已发布模型连接名；保存与准入要求 `resource_bindings.model_connection` 中有且仅有一条同名绑定，且绑定 UID 是当前发布指针（加载期只判名字可用，见 §2.1） |
 | `provider.model` | string | **是** | — | 模型名；**空白即拒**（脚手架填占位符「请在此填写模型名」） |
 | `provider.temperature` | float | 否 | 供应商缺省 | 0–2 |
-| `tools` | []string | 否 | `[]` | **不声明 = 空池**：模型一行工具都看不到 |
+| `tools` | []string | 否 | `[]` | **不声明 = 空池**：模型一行工具都看不到。唯一例外是 `notify` 的受控装配：保存与装载按 `notify_mode` 与渠道资格自动增删且必须回报变更，见 §2.6 |
 | `skills` | []string | 否 | `[]` | 元素 = 公共技能库目录名；**声明即绑定**；只写名字，**不支持** `skill@version`；声明名在库里没有实体、或没有**已发布版本** → 整只不注册（Run 开始时冻结该发布版本的完整内容清单，见 §2.4） |
 | `mcp_servers` | []string | 否 | `[]` | 元素 = `mcp_servers.yaml` 里的 server 名 |
 | `channels` | []object | 否 | `[{name: cli}]` | 接入渠道（核心阶段只有 `cli`） |
 | `bootstrap` | []string | 否 | `[]` | 注入提示词的引导文件（相对工作区根） |
+| `notify_mode` | string | 否 | 未声明的兼容规则见下 | 通知意图三态：`none`（不发送）/ `all_eligible`（可使用全部有资格渠道）/ `allowlist`（仅限 `notify_channels` 列出的渠道）。`none` 与 `all_eligible` 时 `notify_channels` **必须**为空数组；`allowlist` 至少一个元素。**空数组不表示「禁用通知」**——禁用只能由 `notify_mode: none` 表达。Run 准入冻结模式与渠道 UID 集合，`notify` 工具按冻结值判定。未声明时的兼容读取：`notify_channels` 为空 / 缺省 → `all_eligible`；非空 → `allowlist`；解析结果不改写文件 |
+| `notify_channels` | []string | 否 | `[]` | `allowlist` 模式下的渠道名（= 全局通知渠道表的 `name`）。每个名字必须有资格且 `resource_bindings.notify_channel` 中有同名绑定；声明外的渠道按 `not_found` 失败并回填可用名。它只限制“能用哪些渠道”，**不**表示任务结束自动发送 |
+| `resource_bindings` | object | 否（准入必填） | `{}` | 资源绑定的**唯一权威**（AGENT.md 为源头，数据库只做投影）。结构见 §2.5：`model_connection[]` 与 `notify_channel[]`，元素为 `{name, uid}`。加载期不要求完整（模板占位符与旧 Agent 仍可加载）；**保存期与 Run 准入**要求与 `provider.name` / `notify_channels` 一一对应、UID 为当前发布指针、已发布、有资格。同名新资源不自动接管旧绑定 |
 | `settings.max_iterations` | int | 否 | 10 | ReAct 最大轮次；达上限 = `limit_reached`（见 [run-and-errors.md](run-and-errors.md) §2） |
 | `settings.max_history_turns` | int | 否 | 20 | 送进提示词的对话轮数上限 |
 | `schedules` | []object | 否 | `[]` | 定时任务（见 §3） |
@@ -88,6 +99,11 @@ schedules:
 | 6 | `mcp_servers` 里每个名字有**实际生效**的版本（待重启内容不算）且连接成功 | WARN `mcp server skipped: <name>` |
 | 7 | `bootstrap` 里每个文件存在 | WARN `bootstrap file missing` |
 | 8 | `schedules[].cron` 为 6 段且合法、`zone` 合法、`id` 全局唯一（**≥2 项时每项 `id` 必须显式声明**，见 §3） | WARN 并跳过该 Agent |
+| 9 | `notify_channels` 的每个元素非空白 | WARN `invalid notify_channels` |
+| 10 | `notify_mode` 取值合法且组合成立（`none` / `all_eligible` 时 `notify_channels` 必须为空；`allowlist` 至少一个元素；未声明按兼容规则读取，不改写文件） | WARN `invalid notify_mode` |
+| 11 | `resource_bindings` 结构合法（对象；只允许 `model_connection` / `notify_channel` 两个已知键；元素为 `{name, uid}` 且均非空） | WARN `invalid resource_bindings` |
+
+**加载期只判「当前可用 / 结构合法」**：名字能否解析、取值是否合法、结构是否完整。**绑定完整性不在加载期判**——模板占位符与旧 Agent 仍可加载（`resource_bindings` 可能为空或未覆盖全部引用）。每个引用恰有一条有效绑定、UID 是当前发布指针、已发布、有资格，属于**保存期与 Run 准入**判据（§2.3 / §2.5）；准入不通过只拒绝该 Agent 的新 Run 并点名，不把已加载的配置判成语法无效。
 
 **校验失败即整只不注册**（不是"跳过那一条继续"）——半可用的 Agent 比明确不可用更危险。
 
@@ -105,8 +121,9 @@ schedules:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "agent": "ops-agent",
+  "agent_uid": "ag_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A",
   "state": "active",
   "generation": 3,
   "updated_at": 1760000000000,
@@ -117,22 +134,23 @@ schedules:
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `schema_version` | integer | 首版固定为 `1`；未来变更必须拒绝旧二进制误读 |
+| `schema_version` | integer | 当前为 `2`；`1` 可读，写入时升级为 `2`；不支持的版本必须拒绝旧二进制误读 |
 | `agent` | string | 必须与目录名逐字一致 |
+| `agent_uid` | string | **稳定身份**（`ag_` 前缀 + ULID 形态）。生命周期事件常驻；复制、新建、同名重建生成新 UID；原名 / 异名恢复沿用原 UID；旧归档无可信来源时标 `legacy_unrecorded`，恢复时生成新 UID 并记录来源 |
 | `state` | string | `active` / `disabled` / `archived` |
-| `generation` | integer | 每次状态迁移 +1，从 1 起；用于条件迁移与恢复查证 |
+| `generation` | integer | 每次状态迁移 +1，从 1 起；只做生命周期版本与乐观锁，**不是**身份 |
 | `updated_at` | integer | Unix 毫秒（UTC） |
-| `operation_id` | string | 写入本次状态的管理操作标识（资源基线使用 `system.baseline_v2` 的 `op-...`，不写 `migration` 字面量） |
-| `checksum` | string | 校验和；计算时把本字段置为空串，对文件的 UTF-8 原始字节做 sha256 |
+| `operation_id` | string | 写入本次状态的管理操作标识（资源基线使用 `system.baseline_v2`、身份基线使用 `system.baseline_v3` 的 `op-...`，不写 `migration` 字面量） |
+| `checksum` | string | 校验和；计算时把本字段置为空串，对文件的 UTF-8 原始字节做 sha256；覆盖 `agent_uid` |
 
 - **写入方式**：临时文件 + 原子 rename；只有生命周期服务可写。该目录不在 Agent 文件工具白名单、工作区浏览与 `fsnotify` 热加载范围内。
-- **缺失 / 损坏**：状态文件不存在、JSON 不合法、`agent` 不匹配、`schema_version` 不支持或 checksum 不符 → 该 Agent **拒绝新 Run**，索引 `state` 为空、`valid=0`，管理面返回 `lifecycle_error`。**不得**悄悄按 `active` 处理，**不得**自动重建为 active。
+- **缺失 / 损坏**：状态文件不存在、JSON 不合法、`agent` 不匹配、`agent_uid` 缺失或格式非法（schema v2）、`schema_version` 不支持或 checksum 不符 → 该 Agent **拒绝新 Run**，索引 `state` 为空、`valid=0`，管理面返回 `lifecycle_error`。**不得**悄悄按 `active` 处理，**不得**自动重建为 active。
 - **状态语义**：
   - `active`：允许新 Run；配置校验失败仍按 §2.1 整只不注册。
   - `disabled`：仍在管理面可见、可编辑；拒绝新 Run；已在跑的 Run 继续完成。
   - `archived`：不在活动注册表；只能经受控 restore 恢复，恢复默认 `disabled`。
 - **一致性边界**：禁用 / 启用与 Run 准入共用同一 Agent 级读写锁（见 [run-and-errors.md](run-and-errors.md) §3.4）；HTTP、CLI、定时器与内部入口都必须检查。
-- **复制与恢复**：复制创建新 Agent 目录，不复制生命周期文件、会话 / 记忆 / 审计、`schedules`（清空以免全局 `id` 冲突）；初始 `disabled`。归档恢复同样默认 `disabled`，并清空 `schedules`，由管理员显式启用 / 重配。不得把手工移动目录当作正常恢复。
+- **复制与恢复**：复制创建新 Agent 目录与**新 `agent_uid`**，不复制生命周期文件、会话 / 记忆 / 审计、`schedules`（清空以免全局 `id` 冲突）；初始 `disabled`。归档恢复沿用**原 `agent_uid`**（原名与异名两条路径都只改名称、不改身份），默认 `disabled` 并清空 `schedules`，由管理员显式启用 / 重配。删除后同名重建是**新 Agent**：新 `agent_uid`，旧绑定与旧专属资源不自动连接。旧归档缺可信 UID 时标 `legacy_unrecorded`，恢复时生成新 UID，**不得**按同名猜出旧身份。不得把手工移动目录当作正常恢复。
 
 ### 2.3 内容版本、ETag 与结构化编辑
 
@@ -143,7 +161,16 @@ schedules:
 - `POST /agents/{name}/generate-files` 返回的草稿**没有**磁盘基础版本，响应不含 ETag；草稿不得直接当作已保存内容。
 - 请求体二选一：
   - `{ "content": "<整份文件>" }`：整份替换；
-  - `{ "changes": { ... } }`：只改已知 frontmatter 字段的结构化 patch。服务端保留未改字段、正文与注释；无法在保留注释的前提下完成时返回 **400** `EDIT_UNSUPPORTED`，提示改用整份原文编辑。**不得**为了 patch 而整份重新生成、重排或丢注释。
+  - `{ "changes": { ... } }`：只改已知 frontmatter 字段与正文的结构化 patch。服务端保留未改字段、正文与注释；无法在保留注释的前提下完成时返回 **400** `EDIT_UNSUPPORTED`，提示改用整份原文编辑。**不得**为了 patch 而整份重新生成、重排或丢注释。
+- `changes` 已知字段：`description`、`display_name`、`identity.agent_name`、`identity.prompt`、`body`、`provider.name`、`provider.model`、`provider.temperature`、`tools`、`skills`、`mcp_servers`、`notify_mode`、`notify_channels`、`settings.max_iterations`、`settings.max_history_turns`、`schedules`、`bootstrap`、`bindings`。未列出的键 → **400**（严格已知键；不静默忽略拼写错误）。
+- `changes.display_name`：三态——缺省 = **不修改**；非空字符串（去空白后）= 写入该行；空串 = 移除该行，展示回退 `name`。移除只在字段存在时改动文件；字段本就不存在时是空操作，ETag 不变。值含控制字符或超过 64 字符 → **400**。
+- `changes.body`：缺省 = **不改正文**；给出字符串 = 整段替换正文；空串 = 清空正文（页面须二次确认）。**不得**用「未给 body」推断清空。
+- `changes.provider.temperature`：三态——缺省 = **不修改**；数字（含显式 `0`，0 是合法值） = 写入该值；显式 `null` = 移除 `provider.temperature` 行，回到供应商缺省。**不得**把缺省读成清除，也**不得**把 `null` 当作 `0`。移除只在字段存在时改动文件；字段本就不存在时该补丁是空操作，ETag 不变。
+- `changes.bindings`：数组 `[{resource_kind, ref_name, resource_uid}]`，用于表单选择资源后同步写入 `resource_bindings`。`resource_kind` 取 `model_connection` / `notify_channel`；服务端在同一写边界内把它合并进 frontmatter 的对应块，**不**按名称重新解析 UID。
+- **保存期绑定校验**（与原文保存共用）：合并后的 `resource_bindings` 必须与 `provider.name` / `notify_channels` 一一对应；每条 `{name, uid}` 的 UID 必须存在、是当前发布指针、已发布、有资格（共享或本 Agent 专属）；不得引用已删除 UID、其他 Agent 的专属资源或未发布版本；不得有孤儿绑定或重复名。任一不满足 → **400** 并点名字段，零写入。
+- 原文保存**必须自带完整 `resource_bindings`**；服务端**不补写**、不按名解析、不猜意图。缺绑定或绑定与引用不一致 → 400，不落盘。
+- `resource_bindings` 写在 frontmatter，因此被 `AGENT.md` 原始字节哈希覆盖：重选资源会改变 `content_etag`，不另设第二套绑定 ETag。
+- 新增 `GET /agents/{name}/config`：返回结构化字段值、**一个**与 `GET /agents/{name}/content` 完全一致的强 `content_etag`，以及每个引用的解析状态（绑定 `resource_uid`、名称、是否已删除、是否仍有资格、`notify_mode` 的有效值）。它不复用 `GET /agents/{name}` 的归档视图，也不替代原文读取。
 - 两种形态最终都走**同一段**解析、校验与发布闸门（先验后写）；成功后生成新的 `ConfigSnapshot`，返回新 ETag 与落盘真值。
 - `disabled` Agent 允许编辑；`archived` Agent 不允许直接编辑，必须先 restore。
 - 服务端不得存在绕过该闸门的第二条 `AGENT.md` 写入路径（页面编辑器、创建、多文件提交、技能导入、恢复共用它）。
@@ -160,6 +187,48 @@ schedules:
   - `.git` 等隐藏目录不导入；同名技能存在时导入失败，不静默覆盖。
 - 版本撤回 = 用旧版本内容创建新版本并发布；不回退版本号，不改历史版本，不恢复已撤销的凭据解析值。
 
+### 2.5 资源绑定结构（`resource_bindings`）
+
+```yaml
+resource_bindings:
+  model_connection:
+    - name: deepseek
+      uid: rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A
+  notify_channel:
+    - name: ops-webhook
+      uid: rs_01J8Z7A1B2C3D4E5F6G7H8J9K0
+```
+
+| 键 | 类型 | 说明 |
+| --- | --- | --- |
+| `model_connection` | []object | 模型连接绑定；与 `provider.name` 严格一一对应（当前配置中每个 Agent 恰有一个 provider，故恰一条） |
+| `notify_channel` | []object | 通知渠道绑定；仅在 `notify_mode: allowlist` 时非空，且与 `notify_channels` 严格一一对应 |
+| 元素 `name` | string | 资源当前名称；只用于展示与对照，**不**作为身份 |
+| 元素 `uid` | string | 稳定资源身份（`rs_` 前缀）；由服务端在创建资源时分配，**不得**手填、不得改写 |
+
+- **权威与投影**：`AGENT.md` frontmatter 是绑定唯一权威；SQLite `agent_resource_bindings` 是可重建投影，供列表与引用视图查询，不作为写入口。
+- **身份优先于名称**：同名资源删除后重建会得到**新 `resource_uid`**，旧绑定继续指向旧 UID（墓碑可查），**不自动接管**新资源。要改用新资源必须显式重新选择并保存。
+- **不自动补绑**：迁移、复制、恢复、启动、Run 准入、原文保存都**不得**因为「名称当前能解析到某个资源」而写入或改写绑定。只有三个入口可以产生绑定：① 新建模板由服务端写入创建时选定的资源；② 表单显式选择（`changes.bindings`）；③ 原文显式写出。
+- **随配置流转**：复制、归档、恢复、导出携带绑定（UID 不变）；复制遇到源 Agent 专属资源时**阻断并点名**，要求显式映射（不提供「一键解除」），副本获得新 `agent_uid`，不复制源凭据。
+- **引用已删资源**：绑定仍指向旧 UID；Agent 可加载（加载期不判完整性），但**保存与准入**点名要求重新选择。恢复或改名不使旧 UID 复活。
+
+### 2.6 通知工具的受控装配（仅 notify）
+
+**唯一受控例外**：除 `notify` 外，系统**不得**自动增删 `tools` 中的任何工具名。`notify` 的装配结果必须与通知意图一致，并作为可见变更回报，不得静默改写：
+
+| `notify_mode` | 渠道资格 | `tools` 中的 `notify` | 保存响应 |
+| --- | --- | --- | --- |
+| `none` | 不适用 | **必须不装配**（原文件有则移除） | `changes.tools_removed` 含 `notify`（仅在确实移除时） |
+| `all_eligible` | 至少一个渠道有资格 | **必须装配**（原文件没有则补上） | `changes.tools_added` 含 `notify`（仅在确实补上时） |
+| `allowlist` | 声明的每个渠道都有资格 | **必须装配** | 同上 |
+| `allowlist` | 任一渠道无资格 / 未绑定 | **不装配**，保持原工具面 | 由装载 / 绑定闸门报错点名，不静默改写 |
+| 非法取值 | 不适用 | 不改写 | 交给既有 `invalid notify_mode` 校验 |
+
+- **保存期**：装配在条件写提交锁内进行；只在需要增删时改 `tools` 列表，`tools_added` / `tools_removed` 随 `AgentFilesView.changes` 返回，供页面展示。
+- **装载期**：以文件为准；不因通知意图回写文件。缺 `notify` 但 `notify_mode` 非 `none` 时按加载规则处理并在页面提示，下一次保存才装配。
+- **系统代投接管**：任务配置了 `deliver_to` 时，该轮 Run 在准入阶段固定 `notify_mode = none` 并从工具面剔除 `notify`（授权层仍兜底拒绝）；模型只返回正文，由系统在成功后发送。此规则**不**改写 `AGENT.md`。
+- **单一存储**：装配只改 `tools` 列表，不新建通知配置表；渠道权限边界仍由 `notify_mode` + `notify_channels` + `resource_bindings.notify_channel` 决定。
+
 ---
 
 ## 3. schedules 段（定时任务）
@@ -170,6 +239,7 @@ schedules:
 | `cron` | string | **是** | — | **6 段**：秒 分 时 日 月 周（`0 0 8 * * *` = 每天 8 点）；5 段拒 |
 | `zone` | string | 否 | `UTC` | IANA 时区名；**不得**回落服务器本地时区 |
 | `message` | string | **是** | — | 到点发给该 Agent 的消息（等价于人推的一条用户消息） |
+| `deliver_to` | string | 否 | `""` | 系统代投目标：通知渠道的 **`resource_uid`**（`rs_` 前缀；**不写渠道名**）。空串 = 不代投。保存时校验渠道存在、属于该 Agent `notify` 声明范围且当前有资格；运行开始时再次按 UID 校验并**冻结**目标，同名重建不自动接管。配置后这一轮运行由系统在成功后发送正文，不向模型提供 `notify`，见 §3.2 |
 
 ### 3.1 cron 支持语法与时区
 
@@ -202,6 +272,19 @@ cron = "0 0 */6 * * *"   zone = Asia/Shanghai   → 每 6 小时整点
 **歧义防护例（不得写进公开样例 `AGENT.md`）**：`0 15 9 1-7 * 1`（Asia/Shanghai）同时限定日与星期，必须按 OR 语义理解，不能误读成“每月首个周一”。以 2026-10-01 北京时间零点为起点，首个预期触发是当日 09:15；实现读数需由解析器测试确认。跨实现差异与对拍程序只在 [Compatibility.md](../Compatibility.md) §5.2 维护。
 
 DST 边界例（`America/New_York`，2027-03-14 跳 02:00–03:00）：`0 30 2 * * *` 在该日的行为**必须实测、不得推断**；跳过和重复时段分别留证，固定预期后再纳入回归。兼容性结论不由本节的单侧读数自动推导。
+
+### 3.2 结果投递（deliver_to）
+
+`deliver_to` 是**系统代投**，不是模型工具调用。语义固定如下：
+
+1. **目标身份**：值为渠道 `resource_uid`；保存时校验渠道存在、在 `notify` 声明范围内且有资格；运行开始时按 UID 再校验并冻结，运行中途改绑定 / 重建同名渠道**不**改变该轮目标。校验失败 → 该轮在发模型调用**之前**失败并留记录，不以模型结果兜底。
+2. **只发成功结果**：仅当本轮执行状态为「完成」才发送；取消 / 失败 / 超时不发送，投递记录为 `skipped`（或按恢复规则记为 `unknown`）。
+3. **先留痕再发送**：发送前写 `schedule_deliveries` 的 `pending` 行，与运行共用 `run_id`；系统投递**只认这条权威记录**，不伪造 `notify` 工具调用，也不写模型工具审计。发送成功后写终态；写终态失败的行由启动恢复处理。
+4. **三值结论**：`sent`（HTTP 2xx；`feishu` 还要求业务回执 `code == 0`）/ `failed`（确定失败）/ `unknown`（超时、回执不可解析）。**未知不得当作成功，也不得自动重发**；`skipped` 表示按规则未发送。
+5. **系统接管**：该轮 Run 准入时固定 `notify_mode = none` 并向模型剔除 `notify`（授权层兜底拒绝），避免模型与系统各发一次。此接管**不**改写 `AGENT.md`。
+6. **分开展示**：运行执行状态与投递状态是两条记录；视图以 `delivery_status` / `delivery_channel` / `delivery_detail` 投影，`delivery_status` 为空串表示**没有投递记录**，不得渲染成成功。
+
+正文格式固定为 `【<agent>】定时任务 <taskId> 执行完成` 加本轮最终文本；无最终文本时写明未产生文本。发送使用与 `notify` 相同的渠道适配器与凭据解析路径。
 
 ---
 
@@ -317,7 +400,7 @@ type ToolCall struct {
 | `headers` | object | 否（**扩展**） | 附加请求头 |
 
 返回：状态码 + 响应体（截断到 256 KB）。
-失败：`sandbox_denied`（域名不在 `http.allowed_domains` / scheme 非 http/https / **重定向目标越界** / **跳数超过 5**）/ `timeout` / `external_error`（4xx/5xx）。
+失败：`sandbox_denied`（域名不在网络域名白名单 / scheme 非 http/https / **重定向目标越界** / **跳数超过 5**）/ `timeout` / `external_error`（4xx/5xx）。
 
 **重定向与目标形态**（两个 http 工具共有）：目标地址按**逐跳**校验——每一跳在**发送前**过域名白名单与 scheme 判定，HTTP 客户端**不得**自行跟随；最多 5 跳，超限或越界一律判 `sandbox_denied`（不是 `external_error`）。白名单条目与目标 host **必须是域名**：IP 字面量目标直接拒（白名单按域名匹配，放行 IP 等于绕过它）。
 
@@ -366,11 +449,13 @@ type ToolCall struct {
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `channel` | string | 否 | 通知渠道名（`notify_channels` 表里的 `name`）。**缺省即失败**（不猜"默认渠道"——渠道由全局注册表管理，无默认概念），失败文案回填可用渠道名。必填性之所以标"否"：与基线一致，让模型不传时拿到可读失败而不是被供应商侧的 schema 校验拦下 |
+| `channel` | string | 否 | 通知渠道名（全局通知渠道表里的 `name`）。**缺省即失败**（不猜"默认渠道"——渠道由全局注册表管理，无默认概念），失败文案回填可用渠道名。必填性之所以标"否"：与基线一致，让模型不传时拿到可读失败而不是被供应商侧的 schema 校验拦下 |
 | `content` | string | 是 | 推送内容（≤ 20 KB，超限**发送前**失败） |
 
 返回：投递确认。
-失败：`not_found`（渠道不存在）/ `sandbox_denied`（渠道域名不在白名单）/ `external_error`（投递失败）。
+**可用范围**：Run 准入时按 `notify_mode` 冻结通知授权——`none` 不写任何渠道；`all_eligible` 枚举该 Agent 当前**有资格**的全部渠道并冻结具体 `channel_uid`；`allowlist` 只冻结声明的具体 `channel_uid`。工具**不得**在调用时回读文件，运行中途改声明不影响在途 Run。
+**发送判定顺序**：① 先判模式——`none` → 固定错误 `notify_disabled`（固定短语「该 Agent 未启用通知（notify_mode: none）」），不查渠道、不投递；② 再查冻结集合——集合外的渠道按 `not_found`（文案说清是声明限制）；③ 再查渠道当前范围 / 状态（已删除、已转为他人专属、凭据已撤销 → `not_found` 或 `notify_disabled` 的固定短语）；④ 解析当前 `active` 凭据版本后投递。
+失败：`notify_disabled`（`notify_mode: none` 或渠道凭据已撤销）/ `not_found`（渠道不存在、已删除或不在本 Agent 的冻结集合内）/ `sandbox_denied`（渠道域名不在白名单）/ `external_error`（投递失败）。
 **投递判定**：按渠道类型分派适配器——`webhook` 看 HTTP 状态码；`feishu` **只认响应体 `code == 0`**（投递失败也回 HTTP 200，只看状态码会把"没送达"记成成功）。回执解析不出来同样判失败（"结果未知"**不得**冒充成功）。
 
 ### 5.6 ManageScheduleTools（1 个）
@@ -405,10 +490,10 @@ type ToolCall struct {
 例：
 
 ```text
-域名不在白名单：evil.example.com。这是安全策略，请勿反复重试；如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。
+域名不在白名单：evil.example.com。这是安全策略，请勿反复重试；如需访问，请联系管理员在管理台「执行环境」页把该域名加入网络域名白名单，保存后立即生效，无需重启。
 ```
 
-指引**必须**点名配置键（该档确实有键可加时）+ 说明需要重启——模型据此停止重试并转告人类。文件档的指引分两种：
+指引**必须**给出该档真实的放行入口与生效方式——模型据此停止重试并转告人类。域名档的入口是管理台「执行环境」页的**网络域名白名单**：管理员保存后立即生效、不需要重启（`basalt.yaml` 的 `http.allowed_domains` 只在首次启动、数据库无策略行时作种子，此后改配置不覆盖管理台写入的值）。文件档的指引分两种：
 
 - **跨 Agent 读取被拒** → 点名 `sandbox.cross_agent_read`（授权后需重启）
 - **工作区之外的路径** → 可读根由工作区约定固定（当前 Agent 自己的目录 + `.basalt/skills`），**没有配置键可以加**；指引如实说明，**不得**点名不存在的配置键

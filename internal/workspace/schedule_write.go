@@ -223,6 +223,10 @@ func renderSchedulesBlock(schedules []core.Schedule) string {
 		fmt.Fprintf(&b, "    cron: %s\n", yamlQuote(s.Cron))
 		fmt.Fprintf(&b, "    zone: %s\n", yamlQuote(s.Zone))
 		fmt.Fprintf(&b, "    message: %s\n", yamlQuote(s.Message))
+		// 未配置代投时不渲染该键：既有任务的落盘字节保持不变（迁移零改写）。
+		if s.DeliverTo != "" {
+			fmt.Fprintf(&b, "    deliver_to: %s\n", yamlQuote(s.DeliverTo))
+		}
 	}
 	return b.String()
 }

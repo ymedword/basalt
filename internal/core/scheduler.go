@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,6 +35,9 @@ const (
 	schedulerMissedOccurrences = 1000
 	// schedulerFinishTimeout 是终态写的清理时限（约束 11 / 图 C）。
 	schedulerFinishTimeout = 5 * time.Second
+	// schedulerDeliveryTimeout 是系统代投单次发送的时限：运行已结束，发送用独立 ctx，
+	// 不继承可能已超时的运行 ctx；超时按「结果未知」记录，不自动重发（R7）。
+	schedulerDeliveryTimeout = 15 * time.Second
 	// schedulerStopWait 是宽限耗尽、取消在途运行后的第二段有界等待（约束 23）。
 	schedulerStopWait = 5 * time.Second
 )
@@ -45,11 +49,14 @@ var errSchedulerStarted = errors.New("scheduler: already started")
 // SchedulerOptions 是调度器的全部装配输入（§3.1.2 逐字）。
 // SchedulerOptions is the full assembly input of the scheduler.
 type SchedulerOptions struct {
-	Store      TaskStore
-	Invoker    RunInvoker
-	Engine     CronEngine
-	Entries    []AgentEntry
-	CronSpec   func(Schedule) (string, error) // workspace.CronSpec；唯一 CRON_TZ= 前缀出口
+	Store    TaskStore
+	Invoker  RunInvoker
+	Engine   CronEngine
+	Entries  []AgentEntry
+	CronSpec func(Schedule) (string, error) // workspace.CronSpec；唯一 CRON_TZ= 前缀出口
+	// Delivery 是系统代投端口（R7）；任务配置了 deliver_to 而这里为 nil 时，
+	// 该任务不发起运行并如实记失败——**不得**降级为"模型自己发通知"。
+	Delivery   ScheduleDelivery
 	Budget     Budget
 	RunTimeout time.Duration // 300s（§3.1.8）
 	StopGrace  time.Duration // 70s（§3.1.8）
@@ -66,6 +73,7 @@ type Scheduler struct {
 	invoker    RunInvoker
 	engine     CronEngine
 	cronSpec   func(Schedule) (string, error)
+	delivery   ScheduleDelivery
 	budget     Budget
 	runTimeout time.Duration
 	stopGrace  time.Duration
@@ -120,6 +128,7 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		invoker:     opts.Invoker,
 		engine:      opts.Engine,
 		cronSpec:    opts.CronSpec,
+		delivery:    opts.Delivery,
 		budget:      opts.Budget,
 		runTimeout:  opts.RunTimeout,
 		stopGrace:   opts.StopGrace,
@@ -153,6 +162,17 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		return fmt.Errorf("scheduler: recover started executions: %w", err)
 	}
 	s.logger.Info("启动恢复完成", "recovered", recovered)
+
+	// ②b 恢复遗留的投递 pending 行：关联运行已完成 → unknown（**不自动重发**），
+	// 其余（运行未完成 / 已失败）→ skipped。存储失败与执行行恢复同属致命。
+	if s.delivery != nil {
+		recoveredDeliveries, deliveryErr := s.delivery.Recover(ctx, now)
+		if deliveryErr != nil {
+			s.logger.Error("启动恢复遗留投递失败", "error", deliveryErr)
+			return fmt.Errorf("scheduler: recover schedule deliveries: %w", deliveryErr)
+		}
+		s.logger.Info("投递恢复完成", "recovered", recoveredDeliveries)
+	}
 
 	// ③ 读库。
 	rows, err := s.store.ListTasks(ctx)
@@ -381,12 +401,19 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 		return RunRequest{}, RunResult{}, startErr
 	}
 
-	// panic 兜底：运行 panic 必须吸收，并把已预写的执行行收尾为 failed（约束 11）。
+	// 代投的运行期固定目标：在运行前确定，panic 收尾也要据此把预写行改判。
+	var deliveryIntent DeliveryIntent
+	deliveryPrepared := false
+
+	// panic 兜底：运行 panic 必须吸收，并把已预写的执行行收尾为 failed（约束 11）；
+	// 已预写的投递行同样收尾（运行未成功 → 跳过）。
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error(schedulerPanicLog, append(s.runAttrs(task, runID, trigger), "panic", fmt.Sprint(r))...)
 			s.finishRun(ctx, execID, task, runID, trigger, ExecutionFailed,
 				fmt.Sprintf("运行 panic：%v", r), now)
+			s.settleDelivery(ctx, task, deliveryIntent, deliveryPrepared, trigger,
+				ExecutionFailed, RunResult{RunID: runID, Status: StatusFailed})
 			res = RunResult{RunID: runID, Status: StatusFailed}
 			err = fmt.Errorf("scheduler: run panic: %v", r)
 		}
@@ -398,6 +425,20 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 			append(s.runAttrs(task, runID, trigger), "error", markErr)...)
 	}
 
+	// R7：配置了系统代投的任务，运行前必须先落投递预写行并复核渠道资格；任一步失败
+	// 本轮不发起运行——没有记录就不投递，也不允许"先跑完再补记录"。
+	if task.DeliverTo != "" {
+		intent, prepErr := s.prepareDelivery(ctx, task, runID)
+		if prepErr != nil {
+			s.logger.Error("代投前置检查失败，本轮不发起运行",
+				append(s.runAttrs(task, runID, trigger), "error", prepErr)...)
+			s.finishRun(ctx, execID, task, runID, trigger, ExecutionFailed, prepErr.Error(), now)
+			return RunRequest{}, RunResult{}, prepErr
+		}
+		deliveryIntent = intent
+		deliveryPrepared = true
+	}
+
 	req = RunRequest{
 		RunID:     runID,
 		Agent:     task.Agent,
@@ -407,12 +448,87 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 		UserID:    "scheduler",
 		Trigger:   trigger,
 		Budget:    s.budget,
+		// 系统代投接管投递：本 Run 不向模型提供 `notify`，授权层同时固定为 none。
+		SuppressNotify: deliveryPrepared,
 	}
 	res, err = s.invoker.Run(ctx, req)
 
 	status, errMsg := s.classifyRun(task, runID, trigger, res, err)
 	s.finishRun(ctx, execID, task, runID, trigger, status, errMsg, now)
+	s.settleDelivery(ctx, task, deliveryIntent, deliveryPrepared, trigger, status, res)
 	return req, res, err
+}
+
+// prepareDelivery 校验代投目标并写 pending 行：投递服务未装配、UID 非法、渠道资格
+// 复核失败都返回错误，由调用方终止本轮运行。
+// prepareDelivery validates the target and writes the pending row; any failure aborts
+// the run before the model is called.
+func (s *Scheduler) prepareDelivery(ctx context.Context, task TaskRecord, runID string) (DeliveryIntent, error) {
+	if s.delivery == nil {
+		return DeliveryIntent{}, errors.New("任务配置了系统代投，但本实例未装配投递服务（装配错误）")
+	}
+	channelUID, uidErr := ParseResourceUID(task.DeliverTo)
+	if uidErr != nil {
+		return DeliveryIntent{}, fmt.Errorf("任务 %s 的代投目标不是合法的渠道资源 UID: %w",
+			task.TaskID, uidErr)
+	}
+	intent := DeliveryIntent{
+		RunID:      runID,
+		TaskID:     task.TaskID,
+		Agent:      task.Agent,
+		ChannelUID: channelUID,
+	}
+	if err := s.delivery.Prepare(ctx, intent); err != nil {
+		return DeliveryIntent{}, fmt.Errorf("系统代投预写失败: %w", err)
+	}
+	return intent, nil
+}
+
+// settleDelivery 在运行收尾后处理已预写的投递行：运行成功才发送，其余一律标跳过。
+// 发送用独立的 15s ctx（不继承可能已超时的运行 ctx），结果三分如实落库与记日志；
+// 未知**不**触发自动重发。
+// settleDelivery delivers only after a successful run and marks everything else skipped.
+// The send uses its own 15s context, and an unknown outcome never triggers a resend.
+func (s *Scheduler) settleDelivery(ctx context.Context, task TaskRecord, intent DeliveryIntent,
+	prepared bool, trigger Trigger, status ExecutionStatus, res RunResult,
+) {
+	if !prepared || s.delivery == nil {
+		return
+	}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerDeliveryTimeout)
+	defer cancel()
+
+	attrs := s.runAttrs(task, intent.RunID, trigger)
+	if status != ExecutionCompleted {
+		if err := s.delivery.Skip(finishCtx, intent, "运行未成功，未投递"); err != nil {
+			s.logger.Error("投递跳过写库失败（记录保持 pending，启动恢复改判）",
+				append(attrs, "error", err)...)
+		}
+		return
+	}
+
+	outcome := s.delivery.Deliver(finishCtx, intent, deliveryContent(task, res))
+	attrs = append(attrs, "delivery_status", string(outcome.Status), "detail", outcome.Detail)
+	switch outcome.Status {
+	case DeliverySent:
+		s.logger.Info("系统代投完成", attrs...)
+	case DeliveryFailed:
+		s.logger.Warn("系统代投失败", attrs...)
+	default:
+		// 未知需要人工核对：记录里保留可查证的事实，**不**盲目重发（R7）。
+		s.logger.Error("系统代投结果未知（不自动重发）", attrs...)
+	}
+}
+
+// deliveryContent 组装推送正文：点名 Agent 与任务，正文是模型本轮的最终回答。
+// 无文本（例如达迭代上限）时给固定说明，不把空消息发出去。
+// deliveryContent names the agent and task and carries the run's final text verbatim.
+func deliveryContent(task TaskRecord, res RunResult) string {
+	text := strings.TrimSpace(res.FinalText)
+	if text == "" {
+		text = "（本轮未产生文本回答）"
+	}
+	return fmt.Sprintf("【%s】定时任务 %s 执行完成\n\n%s", task.Agent, task.TaskID, text)
 }
 
 // classifyRun 把运行结果映射为执行行终态（约束 10 / D-18 / 约束 43）。
@@ -691,11 +807,15 @@ func (s *Scheduler) commitAgentLocked(ctx context.Context, agent string, schedul
 	for _, schedule := range schedules {
 		derived[schedule.ID] = true
 		upserts = append(upserts, TaskRecord{
-			TaskID:         schedule.ID,
-			Agent:          agent,
-			Cron:           schedule.Cron,
-			Zone:           schedule.Zone,
-			Message:        schedule.Message,
+			TaskID:  schedule.ID,
+			Agent:   agent,
+			Cron:    schedule.Cron,
+			Zone:    schedule.Zone,
+			Message: schedule.Message,
+			// 代投目标随定义落库：它是任务在 AGENT.md 里声明的一部分（R7），
+			// 不随定义指纹参与变更提示，但**必须**写入库列——漏写会让每次对账
+			// 把已登记的目标清空，任务照常运行却再也不投递。
+			DeliverTo:      schedule.DeliverTo,
 			DefinitionHash: definitionHash(agent, schedule),
 		})
 	}
@@ -954,7 +1074,10 @@ func (s *Scheduler) warnMissedTriggersLocked(rows []TaskRecord, now time.Time) {
 }
 
 // definitionHash 按 agent、id、cron、zone、message 顺序以换行连接后取 sha256（注 14）。
-// definitionHash computes the documented five-field fingerprint.
+// `deliver_to` **不在**这五字段指纹内：它是投放目标而不是任务定义，变更由库列与
+// AGENT.md 承载，不触发"任务定义已更新"提示。
+// definitionHash computes the documented five-field fingerprint; deliver_to stays out
+// because it is a delivery target rather than part of the task definition.
 func definitionHash(agent string, schedule Schedule) string {
 	sum := sha256.Sum256([]byte(agent + "\n" + schedule.ID + "\n" + schedule.Cron + "\n" + schedule.Zone + "\n" + schedule.Message))
 	return hex.EncodeToString(sum[:])

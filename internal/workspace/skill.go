@@ -25,6 +25,8 @@ import (
 	"strings"
 
 	"github.com/goccy/go-yaml"
+
+	"github.com/ymedword/basalt/internal/core"
 )
 
 const (
@@ -211,4 +213,51 @@ func skillCardFor(lib *os.Root, name string) (skillCard, error) {
 type skillFrontmatterDTO struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
+}
+
+// SkillWorkCopyRelDir 给出技能**工作副本**相对工作区根（.basalt/）的目录：`skills/<name>`。
+// 工作副本是编辑与预览面；发布后的运行只读不可变版本目录（约束 25）。
+// SkillWorkCopyRelDir returns the work-copy directory relative to the workspace root.
+func SkillWorkCopyRelDir(name string) (string, error) {
+	if !validSkillName(name) {
+		return "", fmt.Errorf("技能名不是单个目录名：%q", name)
+	}
+	return skillWorkDir(name), nil
+}
+
+// SkillVersionRelDir 给出**新发布**技能版本目录相对工作区根的形态：
+// `versions/skills/<name>/<resource_uid>/<no>`。与 SkillVersionLogicalDir 是同一个目录的
+// 两种写法：本函数用于文件系统访问，后者是 `storage_path` 的契约字面量（`versions/` 之前
+// 带 `.basalt/`）；两者不得各拼一份。旧扁平目录的读取走持久化的 storage_path。
+// SkillVersionRelDir returns the identity-segmented version directory for filesystem
+// access; legacy flat directories are addressed through their recorded storage_path.
+func SkillVersionRelDir(name string, uid core.ResourceUID, versionNo int) (string, error) {
+	target, err := newSkillVersionDir(name, uid, versionNo)
+	if err != nil {
+		return "", err
+	}
+	return target.relDir, nil
+}
+
+// SkillVersionLogicalDir 给出**新发布**技能版本目录的**契约字面量**：
+// `.basalt/versions/skills/<name>/<resource_uid>/<no>`（`ResourceVersion.StoragePath` 的
+// 口径）。同名重建的新身份因此与上一代目录互不相交，版本号可从 1 重新计。
+// SkillVersionLogicalDir returns the contract literal of a new publication directory.
+func SkillVersionLogicalDir(name string, uid core.ResourceUID, versionNo int) (string, error) {
+	target, err := newSkillVersionDir(name, uid, versionNo)
+	if err != nil {
+		return "", err
+	}
+	return target.logicalDir, nil
+}
+
+// PublishedVersionRelDir 把已登记的 storage_path 契约字面量投影为文件系统相对目录；两种
+// 形态（身份分段 / 旧扁平）都认，形态之外的路径一律拒绝。读取既有版本一律以记录为准。
+// PublishedVersionRelDir projects a recorded storage_path onto its filesystem form.
+func PublishedVersionRelDir(storagePath string) (string, error) {
+	target, err := parseSkillStoragePath(storagePath)
+	if err != nil {
+		return "", err
+	}
+	return target.relDir, nil
 }

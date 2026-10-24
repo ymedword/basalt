@@ -58,6 +58,11 @@ type Deps struct {
 	// The HTTP service port: only serve consumes it, and only the heavy path injects it.
 	Server Server
 
+	// Secrets 是主密钥与托管凭据运维的端口（见 ports.go）：只有重路径装配才产出该服务
+	// （它要库、撤销编排与解析器），轻路径拿到 nil 即报缺件，不自造第二套读面。
+	// Secrets is only produced by the heavy-path assembly; a nil here is a wiring gap.
+	Secrets Secrets
+
 	// Tools 是工具注册池端口（见 ports.go）：`tool list` 经它取「注册了什么」这一份数据，
 	// 清单的顺序由实现侧给出、命令面零重排。只有重路径装配才构建过注册池，因此该端口
 	// **只在重路径上非空**——命令面拿到 nil 即报缺件，不自造第二份清单。

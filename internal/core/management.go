@@ -220,6 +220,25 @@ type AgentFiles struct {
 	Agent     string
 	Lifecycle AgentLifecycleView
 	Files     []FileEntry
+	// Changes 是本次保存中系统自动应用的受控工具变更（R7 / 宪法约束 11）：
+	// 只可能是 `notify` 的加入或移除，且**必须**随保存结果返回，不得静默改写。
+	// Changes lists the system-applied tool deltas of this save; notify is the only
+	// possible name, and the delta is always reported back to the caller.
+	Changes ToolChange
+}
+
+// ToolChange 是系统在受控写面自动应用的受控工具增删（R7 / 宪法约束 11）：
+// 目前只有 `notify` 一项可能有值；其他工具名的自动增删一律不允许。
+// ToolChange carries the system-applied tool deltas; notify is the only allowed name.
+type ToolChange struct {
+	Added   []string
+	Removed []string
+}
+
+// Empty 报告本次是否有系统自动变更（无变更时响应省略 changes 的展示）。
+// Empty reports whether the system changed nothing.
+func (c ToolChange) Empty() bool {
+	return len(c.Added) == 0 && len(c.Removed) == 0
 }
 
 // AgentContentUpdate 是一次内容写请求：整份替换与结构化补丁**恰给一个**。
@@ -230,20 +249,39 @@ type AgentContentUpdate struct {
 }
 
 // AgentContentChanges 是 AGENT.md frontmatter 的结构化补丁：指针字段为 nil 表示不改；
-// `Tools` / `Skills` / `MCPServers` / `Bootstrap` / `Schedules` 用 `*[]T` 区分
-// "不改"（nil）与"改成空列表"（非 nil 空切片）。
+// `Tools` / `Skills` / `MCPServers` / `Bootstrap` / `NotifyChannels` / `Schedules`
+// 用 `*[]T` 区分"不改"（nil）与"改成空列表"（非 nil 空切片）。
 // AgentContentChanges patches the frontmatter; pointer fields distinguish "leave
 // unchanged" from "set to empty".
 type AgentContentChanges struct {
 	Description *string
+	// DisplayName 是展示名补丁（R6）：nil = 不改；空串（去空白后）= 移除该行，
+	// 展示回退技术名；非空 = 写入。字段不存在时的移除是空操作，ETag 不变。
+	// DisplayName patches the display-only name; empty clears the line.
+	DisplayName *string
 	Identity    *AgentIdentityChanges
-	Provider    *AgentProviderChanges
-	Tools       *[]string
-	Skills      *[]string
-	MCPServers  *[]string
-	Bootstrap   *[]string
-	Settings    *AgentSettingsChanges
-	Schedules   *[]Schedule
+	// Body 是围栏外正文的整段替换补丁（契约 agent-md §2.3）：nil = 不改；非 nil
+	// （含空串）= 以该字符串整段替换正文，空串表示清空。**不得**用「未给 body」
+	// 推断清空。
+	// Body replaces the whole body verbatim; nil leaves it untouched.
+	Body           *string
+	Provider       *AgentProviderChanges
+	Tools          *[]string
+	Skills         *[]string
+	MCPServers     *[]string
+	Bootstrap      *[]string
+	NotifyChannels *[]string
+	// Bindings 是 `resource_bindings` 块的整块替换补丁（契约 agent-md §2.3）：
+	// nil = 不改；非 nil（含空切片）= 以该数组为唯一内容整体替换，服务端不按名称
+	// 重新解析 UID、不做按名合并。
+	// Bindings replaces the whole block; a nil slice leaves it untouched.
+	Bindings []BindingChange
+	// NotifyMode 是通知意图三态补丁（`none` / `all_eligible` / `allowlist`）；
+	// nil = 不改。字面量与组合由装载期规则 10 判定。
+	// NotifyMode patches the three-state notification intent; nil leaves it as is.
+	NotifyMode *NotifyMode
+	Settings   *AgentSettingsChanges
+	Schedules  *[]Schedule
 }
 
 // AgentIdentityChanges 是 identity 段的结构化补丁。
@@ -254,12 +292,18 @@ type AgentIdentityChanges struct {
 }
 
 // AgentProviderChanges 是 provider 段的结构化补丁；Temperature 指针保留"显式 0"。
+// ClearTemperature 与 Temperature 互斥：true 表示**移除** temperature 行（回到
+// 供应商缺省），线上由 `temperature: null` 表达；省略字段仍然是"不修改"，不得用
+// 省略推断清除。
 // AgentProviderChanges patches the provider block; the temperature pointer keeps an
-// explicit zero distinct from "unset".
+// explicit zero distinct from "unset". ClearTemperature removes the key and is the
+// only meaning of a JSON null; omitting the field still means "leave unchanged".
 type AgentProviderChanges struct {
 	Name        *string
 	Model       *string
 	Temperature *float64
+	// ClearTemperature 移除 provider.temperature（与 Temperature 互斥）。
+	ClearTemperature bool
 }
 
 // AgentSettingsChanges 是 settings 段的结构化补丁。

@@ -210,6 +210,57 @@ func TestManagementStore_FinishOperationTruncatesErrorMessage(t *testing.T) {
 	require.Equal(t, "INTERNAL", row.ResultCode.String)
 }
 
+// TestManagementStore_TerminalWriteKeepsPendingDetail：终态回填与恢复在**不带** detail
+// 时必须保留预写投影（凭据与范围动作的四证就写在预写行里），带了才覆盖。
+// 逆改点：把空入参也规整成 `{}` → `COALESCE` 拿到非 NULL，预写投影被清空，两条断言红。
+// 中文用例名：终态回填 / 恢复保留预写 detail，带 detail 时覆盖。
+func TestManagementStore_TerminalWriteKeepsPendingDetail(t *testing.T) {
+	seed := func(t *testing.T) (*ManagementStore, *DB) {
+		t.Helper()
+		db := openTempDB(t)
+		store := NewManagementStore(db)
+		require.NoError(t, store.BeginOperation(context.Background(), core.OperationRecord{
+			OperationID:  "op-8-hhhhhh",
+			Action:       "model_connection.credential.write",
+			TargetKind:   "model_connection",
+			TargetID:     "model_connection_uid",
+			ActorSubject: core.ActorSubjectLocalTrust,
+			AuthMethod:   core.AuthMethodLocalTrust,
+			Source:       "127.0.0.1:50001",
+			DetailJSON:   []byte(`{"credential_id":"cred_seeded","version_no":1}`),
+			CreatedAt:    opNow,
+		}))
+		return store, db
+	}
+
+	t.Run("终态回填不带 detail 保留预写投影", func(t *testing.T) {
+		store, db := seed(t)
+		require.NoError(t, store.FinishOperation(context.Background(), "op-8-hhhhhh",
+			core.OperationSuccess, "", "", nil, opNow.Add(time.Minute)))
+
+		row := readRawOperation(t, db, "op-8-hhhhhh")
+		require.JSONEq(t, `{"credential_id":"cred_seeded","version_no":1}`, string(row.DetailJSON))
+	})
+
+	t.Run("终态回填带 detail 覆盖预写投影", func(t *testing.T) {
+		store, db := seed(t)
+		require.NoError(t, store.FinishOperation(context.Background(), "op-8-hhhhhh",
+			core.OperationSuccess, "", "", []byte(`{"result":"ok"}`), opNow.Add(time.Minute)))
+
+		row := readRawOperation(t, db, "op-8-hhhhhh")
+		require.JSONEq(t, `{"result":"ok"}`, string(row.DetailJSON))
+	})
+
+	t.Run("恢复不带 detail 保留预写投影", func(t *testing.T) {
+		store, db := seed(t)
+		require.NoError(t, store.RecoverOperation(context.Background(), "op-8-hhhhhh",
+			core.OperationUnknown, core.VerificationIndeterminate, nil, opNow.Add(time.Minute)))
+
+		row := readRawOperation(t, db, "op-8-hhhhhh")
+		require.JSONEq(t, `{"credential_id":"cred_seeded","version_no":1}`, string(row.DetailJSON))
+	})
+}
+
 // TestManagementStore_GetOperationRoundTripsNullColumns：领域形态与 NULL 的往返——
 // 空值读回零值、非空值逐字保留；不存在的标识映射 core.ErrOperationNotFound。
 // 中文用例名：Get 的 NULL 往返与 not-found。

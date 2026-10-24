@@ -48,6 +48,12 @@ type RunRequest struct {
 	RequireExistingSession bool
 	Budget                 Budget // 执行预算（见契约 §6）
 	ConfigHash             string // 由运行时填充的配置快照版本（调用方不填）
+	// SuppressNotify 为真时本 Run **不向模型提供** `notify` 工具，且通知授权固定为
+	// `none`（授权层兜底）——由调度器在任务配置了系统代投时设置：正文直接返回给系统，
+	// 由系统投递，模型不再自行推送（R7 / 宪法约束 11）。
+	// When set, the notify tool is removed from this run's ToolSet and the notify grant is
+	// forced to none; the scheduler sets it whenever the task delivers its result itself.
+	SuppressNotify bool
 }
 
 // RunStatus 是运行状态的五值字面量（契约 §2；与审计状态四值是**两套**，不得混用）。
@@ -96,8 +102,36 @@ type RunResult struct {
 type AgentUnavailableError struct {
 	Name   string     // Agent 名（原样带回，便于排障）
 	State  AgentState // 已知状态（disabled / archived）；缺失或损坏时为空
-	Reason string     // 自产分类与修复入口（不含底层错误原文）
-	Cause  error      // 原因链：只经 Unwrap 暴露
+	Reason string     // 自产分类与修复入口（英文；不含底层错误原文）
+	Kind   AgentUnavailableKind
+	Cause  error // 原因链：只经 Unwrap 暴露
+}
+
+// AgentUnavailableKind 是生命周期拒绝的**机器可判**分类：界面文案由 web 层按它映射成
+// 中文，**不得**按英文 `Reason` 做字符串匹配（文案一改，匹配就悄悄失效）。内部原因
+// 分类与日志继续保持英文。
+// AgentUnavailableKind is the machine-judgeable category. The web layer maps it to
+// Chinese copy; matching on the English Reason text is forbidden.
+type AgentUnavailableKind string
+
+// 生命周期拒绝的五类（`other` 是零值兜底：状态既不是已知非 active 状态，也没有更具体的
+// 分类——界面给出保守文案而不是空白）。
+// The five refusal categories; other is the conservative fallback.
+const (
+	AgentUnavailableMissing  AgentUnavailableKind = "missing"
+	AgentUnavailableCorrupt  AgentUnavailableKind = "corrupt"
+	AgentUnavailableDisabled AgentUnavailableKind = "disabled"
+	AgentUnavailableArchived AgentUnavailableKind = "archived"
+	AgentUnavailableOther    AgentUnavailableKind = "other"
+)
+
+// KindOrDefault 返回分类；零值按 `other` 处理。
+// KindOrDefault returns other for the zero value.
+func (e *AgentUnavailableError) KindOrDefault() AgentUnavailableKind {
+	if e.Kind == "" {
+		return AgentUnavailableOther
+	}
+	return e.Kind
 }
 
 // Error 返回自产的拒绝文案。
@@ -143,14 +177,17 @@ func (e *ResourceUnavailableError) Error() string {
 func (e *ResourceUnavailableError) Unwrap() error { return e.Cause }
 
 // RunEnv 是循环内部持有的运行环境：由 AgentService 依 RunRequest 与配置快照构造，值传递。
-// 六个导出字段是契约 §1.1 的字段字**逐字**（不增不改）；三个非导出字段是冻结签名下的
-// 注入位——`client()` 与 `ToolEnv(ctx, runID)` 都不收"客户端 / Agent 目录 / 记忆文本"参数，
-// 而这三样恰恰只有构造方知道；它们不是契约字段，也不进任何出站形态。
+// 七个导出字段是契约 §1.1 的字段字**逐字**（v3 增加 `AgentUID`）；三个非导出字段是冻结
+// 签名下的注入位——`client()` 与 `ToolEnv(ctx, runID)` 都不收"客户端 / Agent 目录 /
+// 记忆文本"参数，而这三样恰恰只有构造方知道；它们不是契约字段，也不进任何出站形态。
 // RunEnv is the run environment held by the loop. Its exported fields are the contract
-// §1.1 set verbatim; the unexported fields are injection points forced by the frozen
-// method signatures and never appear in any outbound shape.
+// §1.1 set verbatim (v3 adds AgentUID); the unexported fields are injection points forced
+// by the frozen method signatures and never appear in any outbound shape.
 type RunEnv struct {
-	Req      RunRequest
+	Req RunRequest
+	// AgentUID 是准入时从生命周期状态文件读取的稳定身份：资源资格判定只用它、不用名称。
+	// 空串 = 本次运行未接线生命周期（手工构造的测试环境），资格判定必须据此拒绝。
+	AgentUID AgentUID
 	Snapshot *ConfigSnapshot // 本次运行冻结的配置快照（agent_name + hash + content；中途改盘不换配置）
 	// Resources 是准入时固定的资源版本清单（与 runs 行同事务写入）；未接线的装配路径
 	// 为空指针（历史运行读作"未记录"，**不补造**）。循环不按它路由——路由走快照与
@@ -178,6 +215,40 @@ type RunEnv struct {
 	// memory is the core-region text that takes effect for this run, read once at run
 	// start and frozen for the rest of it; an empty string means no memory at all.
 	memory string
+
+	// notifyMode 是准入时冻结的通知模式；零值 = 未接三态解析，按兼容规则读作
+	// `all_eligible`（见 EffectiveNotifyMode）。
+	// notifyMode is the frozen notification mode; the zero value falls back to the
+	// compatibility default all_eligible.
+	notifyMode NotifyMode
+
+	// notifyChannels 是准入时冻结的**具体渠道 UID** 集合（R4.7）：`all_eligible` 枚举
+	// 「共享 ∪ 本人专属」、`allowlist` 只取声明的 UID，都在准入时落成具体值。工具调用
+	// 只能看到这一份副本，运行中途改 AGENT.md 不改变本次运行的可发送面。
+	// notifyChannels is the concrete channel-uid set frozen at admission; tool calls see
+	// this copy only, and a mid-run file edit cannot change it.
+	notifyChannels []string
+}
+
+// EffectiveNotifyMode 返回通知意图的**有效值**：显式声明原样返回，未声明按兼容规则
+// 推断（`notify_channels` 空 → `all_eligible`，非空 → `allowlist`）。
+//
+// 规则放在 core 而不是装配层，是因为它有两个读者：准入冻结（`app.ResolveNotifyMode`）
+// 与管理台只读视图（`web.ProfileView.notify_mode`，契约要求"显式或兼容推断"的有效值）。
+// 各写一份推断就是第二套约定，视图与准入会静默分叉。
+// EffectiveNotifyMode is the one compatibility rule shared by admission and the console
+// views; a second copy in either place would drift silently.
+//
+// 它**不**校验矛盾声明：`none` / `all_eligible` 配非空渠道属于非法，由准入侧拒绝。
+// It does not validate contradictions; admission refuses those.
+func EffectiveNotifyMode(mode NotifyMode, channels []string) NotifyMode {
+	if mode != "" {
+		return mode
+	}
+	if len(channels) > 0 {
+		return NotifyModeAllowlist
+	}
+	return NotifyModeAllEligible
 }
 
 // Budget 是一次运行的执行预算五件（契约 §6）。**值语义**：计数由循环持有、预算只读。
@@ -197,10 +268,12 @@ type Budget struct {
 // ToolEnv is the execution environment passed to every tool, built by the loop before each
 // call and passed by value.
 type ToolEnv struct {
-	RunID          string        // 关联审计的 Run
-	SessionID      string        // 可为空（无状态调用）
-	AgentName      string        // 空串 = 无 Agent 上下文（如 CLI 顶层调用），**不是**异常
-	AgentDir       string        // Agent 目录绝对路径；空串 = 无上下文
+	RunID     string // 关联审计的 Run
+	SessionID string // 可为空（无状态调用）
+	AgentName string // 空串 = 无 Agent 上下文（如 CLI 顶层调用），**不是**异常
+	AgentDir  string // Agent 目录绝对路径；空串 = 无上下文
+	// AgentUID 是本次运行的 Agent 稳定身份（准入时固定）；资源范围判定用 UID、不用名称。
+	AgentUID       AgentUID
 	Timeout        time.Duration // 本次调用生效的超时（工具默认 / Profile 覆盖 / 剩余预算三者取最小，见契约 §6）
 	MaxOutputBytes int           // 输出截断上限
 	// SkillDirs 是本次 Run 准入绑定的技能发布目录（`storage_path` 字面量）——文件工具据此
@@ -213,6 +286,24 @@ type ToolEnv struct {
 	// RunBound marks environments built by a run: file tools must not fall back to the
 	// skill work copies, even when the run binds no skill at all.
 	RunBound bool
+	// NotifyMode 是本次 Run 冻结的通知模式（none / all_eligible / allowlist）。
+	// `none` 让 notify 工具在任何查表与外呼之前返回固定的 `notify_disabled`。
+	// NotifyMode is the frozen notification mode; none short-circuits the notify tool
+	// with the fixed notify_disabled failure.
+	NotifyMode NotifyMode
+	// NotifyChannels 是本次 Run 冻结的**具体渠道 UID** 集合（准入时枚举，R4.7）。
+	// `RunBound` 为 true 时，notify 工具只放行 UID 在集合内、且当前范围仍对本 Agent
+	// 有资格的渠道；空集合**不**表示「不限制」——它表示这次准入没有拿到任何渠道。
+	// 工具**不得**在调用时回读 AGENT.md 或「临时枚举注册表」来扩大授权。
+	// NotifyChannels is the frozen channel-uid set; for run-bound calls an empty set means
+	// nothing is authorized, never "unrestricted".
+	NotifyChannels []string
+	// ToolInvocationID 是本次调用在 `tool_invocations` 里的行 id：执行器预写审计成功后
+	// 注入，工具**不得**自行生成或改写。通知工具据此写与调用一对一的 `notify_deliveries`
+	// 派生行；0 表示没有审计行（如非 Run 直调），此时不写投递记录。
+	// ToolInvocationID is the audit row id injected by the executor after the fail-closed
+	// pre-write; 0 means no audit row exists, so no delivery record is written.
+	ToolInvocationID int64
 }
 
 // NewRunID 生成运行标识：`<渠道>-<毫秒时间戳>-<6 位 base36 小写>`（契约 §5）。
@@ -279,12 +370,15 @@ func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
 		SessionID:      e.Req.SessionID,
 		AgentName:      e.agentName(),
 		AgentDir:       e.agentDir,
+		AgentUID:       e.AgentUID,
 		Timeout:        e.toolTimeout(ctx),
 		MaxOutputBytes: e.maxOutputBytes(),
 		SkillDirs:      e.skillDirs,
 		// 循环构造的 ToolEnv 一律属于一次 Run（F-04 B1）：标记与是否绑定技能无关。
 		// Every environment built here belongs to a run, with or without skill bindings.
-		RunBound: true,
+		RunBound:       true,
+		NotifyMode:     EffectiveNotifyMode(e.notifyMode, e.notifyChannels),
+		NotifyChannels: e.notifyChannels,
 	}
 }
 

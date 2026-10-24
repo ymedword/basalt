@@ -1,14 +1,19 @@
 package workspace
 
 // 本文件是技能**不可变发布版本**的落地（颗粒度文档 §3.1.15 / 约束 31、32）：工作副本
-// skills/<name>/ 只用于编辑与预览，Run 准入冻结的版本一律来自
-// versions/skills/<name>/<no>/（逻辑路径 .basalt/versions/skills/<name>/<no>）。
+// skills/<name>/ 只用于编辑与预览，Run 准入冻结的版本一律来自发布目录。**新发布**的目录
+// 按身份分段：versions/skills/<name>/<resource_uid>/<no>/（逻辑路径
+// .basalt/versions/skills/<name>/<resource_uid>/<no>）——同名重建产生新身份，两代版本号
+// 各自从 1 起算而目录互不相交。历史**扁平**目录 versions/skills/<name>/<no>/ 保持原样，
+// 只读不写：读取一律以持久化的 storage_path 为准，不做迁移。
 // 四个哈希按固定字节定义，**不做**换行归一、不 trim、不重新序列化 YAML——哈希必须能在
 // 不同机器上复算出同一结果，规范化会掩盖 CRLF 与编码差异。
-// This file implements immutable skill versions. Work copies under skills/<name>/ are
-// for editing and preview only; runs freeze versions under
-// versions/skills/<name>/<no>/. All four hashes use the fixed byte definitions with
-// no newline normalization, trimming, or YAML re-serialization.
+// This file implements immutable skill versions. New publications use
+// versions/skills/<name>/<resource_uid>/<no>/ so that a same-name rebuild (new UID,
+// version numbers restarting at 1) never collides with the previous generation; legacy
+// flat directories stay in place and remain readable through their recorded
+// storage_path. All four hashes use the fixed byte definitions with no newline
+// normalization, trimming, or YAML re-serialization.
 
 import (
 	"bytes"
@@ -33,9 +38,10 @@ const (
 	// versionsDirName is the immutable version directory under the workspace root.
 	versionsDirName = "versions"
 
-	// skillVersionsPrefix 是技能发布目录相对工作区根（.basalt/）的字面前缀
-	//（约束 31：storage_path 的实现取 .basalt/versions/skills/<name>/<version_no>）。
-	// skillVersionsPrefix is the contract literal of a published skill version dir.
+	// skillVersionsPrefix 是技能发布目录相对工作区根（.basalt/）的字面前缀。前缀之后有
+	// 两种契约形态：**新发布**的身份分段 <name>/<resource_uid>/<version_no>，与历史扁平
+	// 目录 <name>/<version_no>（只读兼容，不再新写）。
+	// skillVersionsPrefix is the common prefix of both published directory shapes.
 	skillVersionsPrefix = ".basalt/versions/skills"
 )
 
@@ -46,7 +52,7 @@ const (
 type SkillVersion struct {
 	Name        string
 	VersionNo   int
-	Dir         string // 工作区相对路径：.basalt/versions/skills/<name>/<no>；工作副本为空
+	Dir         string // 发布目录逻辑路径（.basalt/versions/skills/<name>/[<uid>/]<no>）；工作副本为空
 	ContentHash string
 	SkillMDHash string
 	L1Hash      string
@@ -129,21 +135,133 @@ func (l *SkillLibrary) HashWorkCopy(name string) (version SkillVersion, err erro
 	return hashSkillDir(base, name, 0, skillWorkDir(name), "", skillCardPath(name))
 }
 
-// Materialize 把工作副本冻结到 versions/skills/<name>/<no>/：已存在且哈希一致 → 直接
-// 复用；不一致 → 报错且**不覆盖**（已发布目录是不可变事实）；写入先逐文件校验读取字节
-// 与清单哈希相等，任何失败都清理本次创建的部分目录，避免半截快照挡住重试。
-// Materialize freezes the work copy into an immutable version dir; an existing dir is
-// reused only when hashes match, and a partially copied dir is removed on failure.
-func (l *SkillLibrary) Materialize(ctx context.Context, name string, versionNo int, contentHash string) (version SkillVersion, err error) {
+// skillVersionDir 是一个已登记的发布目录：技能名、资源身份、版本号与两种路径写法。
+// 新发布一律是身份分段形态（<name>/<resource_uid>/<version_no>）；旧扁平形态
+// （<name>/<version_no>）没有身份段，只用于读取既有版本，不再新写。
+// skillVersionDir is one recorded published directory; the legacy flat shape has no UID.
+type skillVersionDir struct {
+	name       string
+	uid        core.ResourceUID // 旧扁平形态为空串
+	versionNo  int
+	logicalDir string // 契约字面量（带 .basalt/ 前缀）
+	relDir     string // 文件系统相对工作区根的形态
+}
+
+// newSkillVersionDir 构造**新发布**目录（身份分段）：技能名、资源身份与版本号都先过关，
+// 路径由规范化的 UID 拼出——小写输入落到与大写同一目录，不生产第二份路径。
+// newSkillVersionDir builds the identity-segmented directory of a new publication.
+func newSkillVersionDir(name string, uid core.ResourceUID, versionNo int) (skillVersionDir, error) {
+	if !validSkillName(name) {
+		return skillVersionDir{}, fmt.Errorf("技能名不是单个目录名，拒绝物化：%q", name)
+	}
+	canonical, err := core.ParseResourceUID(string(uid))
+	if err != nil {
+		return skillVersionDir{}, fmt.Errorf("技能 %s 的资源身份不合法，拒绝物化：%w", name, err)
+	}
+	if versionNo < 1 {
+		return skillVersionDir{}, fmt.Errorf("技能 %s 的版本号必须 ≥ 1，当前 %d", name, versionNo)
+	}
+	return skillVersionDir{
+		name:       name,
+		uid:        canonical,
+		versionNo:  versionNo,
+		logicalDir: path.Join(skillVersionsPrefix, name, string(canonical), strconv.Itoa(versionNo)),
+		relDir:     path.Join(versionsDirName, skillsDirName, name, string(canonical), strconv.Itoa(versionNo)),
+	}, nil
+}
+
+// parseSkillStoragePath 解析一个已登记的 storage_path：只认两种契约形态——身份分段
+// .basalt/versions/skills/<name>/<uid>/<no> 与旧的扁平 .basalt/versions/skills/<name>/<no>。
+// 形态之外的路径（工作副本、缺 .basalt/ 前缀、带 `..` 或多余层级、非规范 UID、版本号带
+// 前导零）一律拒绝；**不**修补路径，也**不**把旧目录当作新形态的别名。
+// parseSkillStoragePath accepts exactly the two recorded contract shapes and repairs
+// nothing; anything else fails closed.
+func parseSkillStoragePath(dir string) (skillVersionDir, error) {
+	const shape = "必须是 .basalt/versions/skills/<name>/[<resource_uid>/]<version_no>"
+	trimmed := strings.TrimSpace(dir)
+	if trimmed == "" {
+		return skillVersionDir{}, fmt.Errorf("技能的 storage_path 为空，%s", shape)
+	}
+	if path.Clean(trimmed) != trimmed {
+		return skillVersionDir{}, fmt.Errorf("技能的 storage_path %q 不是规范形态（不得含 `..` / `//` / 尾斜杠），%s", dir, shape)
+	}
+	rest, ok := strings.CutPrefix(trimmed, skillVersionsPrefix+"/")
+	if !ok {
+		return skillVersionDir{}, fmt.Errorf("技能的 storage_path %q 不符合契约形态，%s", dir, shape)
+	}
+
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 && len(parts) != 3 {
+		return skillVersionDir{}, fmt.Errorf("技能的 storage_path %q 不符合契约形态，%s", dir, shape)
+	}
+	name := parts[0]
+	if !validSkillName(name) {
+		return skillVersionDir{}, fmt.Errorf("技能的 storage_path %q 的技能名不是单个目录名", dir)
+	}
+	versionPart := parts[len(parts)-1]
+	versionNo, err := strconv.Atoi(versionPart)
+	if err != nil || versionNo < 1 || strconv.Itoa(versionNo) != versionPart {
+		return skillVersionDir{}, fmt.Errorf("技能 %s 的发布目录 %q 的版本号非法", name, dir)
+	}
+
+	segments := []string{versionsDirName, skillsDirName, name}
+	parsed := skillVersionDir{name: name, versionNo: versionNo, logicalDir: trimmed}
+	if len(parts) == 3 {
+		uid, uidErr := core.ParseResourceUID(parts[1])
+		if uidErr != nil {
+			return skillVersionDir{}, fmt.Errorf("技能 %s 的发布目录 %q 的资源身份非法：%w", name, dir, uidErr)
+		}
+		if string(uid) != parts[1] {
+			return skillVersionDir{}, fmt.Errorf("技能 %s 的发布目录 %q 的资源身份不是规范形态", name, dir)
+		}
+		parsed.uid = uid
+		segments = append(segments, string(uid))
+	}
+	parsed.relDir = path.Join(append(segments, strconv.Itoa(versionNo))...)
+	return parsed, nil
+}
+
+// Materialize 把工作副本冻结到**新发布**目录 versions/skills/<name>/<uid>/<no>/：已存在
+// 且哈希一致 → 直接复用；不一致 → 报错且**不覆盖**（已发布目录是不可变事实）；写入先
+// 逐文件校验读取字节与清单哈希相等，任何失败都清理本次创建的部分目录，避免半截快照挡
+// 住重试。
+// Materialize freezes the work copy into the identity-segmented version dir; an
+// existing dir is reused only when hashes match and a partial copy is removed.
+func (l *SkillLibrary) Materialize(ctx context.Context, name string, uid core.ResourceUID, versionNo int, contentHash string) (SkillVersion, error) {
+	target, err := newSkillVersionDir(name, uid, versionNo)
+	if err != nil {
+		return SkillVersion{}, err
+	}
+	return l.materializeInto(ctx, target, contentHash)
+}
+
+// RestorePublished 按**已登记的 storage_path** 重建缺失的快照目录（崩溃 / 手工删除后的
+// 修复路径）：两种形态都按记录原样重建——旧扁平目录仍在原位重建，**不**迁到身份分段
+// 形态，也不改写已登记的路径。调用方把返回的 Dir 与记录逐字比对。
+// RestorePublished rebuilds a missing snapshot at the recorded storage_path, legacy
+// flat dirs included; a recorded location is never migrated.
+func (l *SkillLibrary) RestorePublished(ctx context.Context, name string, versionNo int, contentHash, dir string) (SkillVersion, error) {
+	target, err := parseSkillStoragePath(dir)
+	if err != nil {
+		return SkillVersion{}, err
+	}
+	if target.name != name {
+		return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录 %q 属于技能 %s，拒绝按该路径重建", name, dir, target.name)
+	}
+	if target.versionNo != versionNo {
+		return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录 %q 与登记的版本号 v%d 不一致", name, dir, versionNo)
+	}
+	return l.materializeInto(ctx, target, contentHash)
+}
+
+// materializeInto 是两条物化入口的共用实现：目标目录已按契约形态解析好，这里只做上下文 /
+// 哈希前置检查、幂等复用与拷贝。
+// materializeInto is the shared body behind both materialisation entry points.
+func (l *SkillLibrary) materializeInto(ctx context.Context, target skillVersionDir, contentHash string) (version SkillVersion, err error) {
 	if err := ctx.Err(); err != nil {
 		return SkillVersion{}, err
 	}
-	if !validSkillName(name) {
-		return SkillVersion{}, fmt.Errorf("技能名不是单个目录名，拒绝物化：%q", name)
-	}
-	if versionNo < 1 {
-		return SkillVersion{}, fmt.Errorf("技能 %s 的版本号必须 ≥ 1，当前 %d", name, versionNo)
-	}
+	name, logicalDir := target.name, target.logicalDir
 	if !isSHA256Hex(contentHash) {
 		return SkillVersion{}, fmt.Errorf("技能 %s 的 content_hash %q 不是 64 位小写十六进制", name, contentHash)
 	}
@@ -167,15 +285,13 @@ func (l *SkillLibrary) Materialize(ctx context.Context, name string, versionNo i
 		}
 	}()
 
-	logicalDir := skillVersionLogicalDir(name, versionNo)
-	relDir := skillVersionRelDir(name, versionNo)
-	info, statErr := base.Stat(filepath.FromSlash(relDir))
+	info, statErr := base.Stat(filepath.FromSlash(target.relDir))
 	switch {
 	case statErr == nil:
 		if !info.IsDir() {
 			return SkillVersion{}, fmt.Errorf("技能 %s 的发布路径 %s 已存在且不是目录", name, logicalDir)
 		}
-		published, loadErr := l.LoadPublished(ctx, name, versionNo, logicalDir)
+		published, loadErr := l.LoadPublished(ctx, name, target.versionNo, logicalDir)
 		if loadErr != nil {
 			return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录 %s 已存在但不可用，拒绝覆盖: %w", name, logicalDir, loadErr)
 		}
@@ -190,17 +306,17 @@ func (l *SkillLibrary) Materialize(ctx context.Context, name string, versionNo i
 		return SkillVersion{}, fmt.Errorf("检查技能 %s 的发布路径 %s: %w", name, logicalDir, statErr)
 	}
 
-	if err := copySkillVersion(base, skillWorkDir(name), relDir, work.Files); err != nil {
+	if err := copySkillVersion(base, skillWorkDir(name), target.relDir, work.Files); err != nil {
 		return SkillVersion{}, err
 	}
-	return l.LoadPublished(ctx, name, versionNo, logicalDir)
+	return l.LoadPublished(ctx, name, target.versionNo, logicalDir)
 }
 
-// LoadPublished 按 storage_path 读发布目录并重算全部哈希；返回结果由调用方与
-// resource_versions.manifest_json / content_hash 逐项比对（签名不含期望清单，
-// 比对归属调用方——不一致即注册不变量被破坏）。目录路径只接受契约字面量形态。
-// LoadPublished recomputes every hash from the published dir; the caller compares the
-// result with manifest_json / content_hash, since the signature carries no expectation.
+// LoadPublished 按持久化的 storage_path 读发布目录并重算全部哈希（两种契约形态都认）；
+// 返回结果由调用方与 resource_versions.manifest_json / content_hash 逐项比对（签名不含
+// 期望清单，比对归属调用方——不一致即注册不变量被破坏）。版本号必须与登记的版本行一致。
+// LoadPublished recomputes every hash from the recorded published dir; the caller
+// compares the result with manifest_json / content_hash.
 func (l *SkillLibrary) LoadPublished(ctx context.Context, name string, versionNo int, dir string) (version SkillVersion, err error) {
 	if err := ctx.Err(); err != nil {
 		return SkillVersion{}, err
@@ -212,13 +328,15 @@ func (l *SkillLibrary) LoadPublished(ctx context.Context, name string, versionNo
 		return SkillVersion{}, fmt.Errorf("技能 %s 的版本号必须 ≥ 1，当前 %d", name, versionNo)
 	}
 
-	expected := skillVersionLogicalDir(name, versionNo)
-	logicalDir := strings.TrimSpace(dir)
-	if logicalDir == "" {
-		logicalDir = expected
+	target, err := parseSkillStoragePath(dir)
+	if err != nil {
+		return SkillVersion{}, err
 	}
-	if path.Clean(logicalDir) != expected {
-		return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录必须是契约字面量 %s，当前 %q", name, expected, dir)
+	if target.name != name {
+		return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录 %q 属于技能 %s，拒绝读取", name, dir, target.name)
+	}
+	if target.versionNo != versionNo {
+		return SkillVersion{}, fmt.Errorf("技能 %s 的发布目录 %q 的版本号与登记的 v%d 不一致", name, dir, versionNo)
 	}
 
 	base, err := os.OpenRoot(l.root)
@@ -231,17 +349,17 @@ func (l *SkillLibrary) LoadPublished(ctx context.Context, name string, versionNo
 		}
 	}()
 
-	return hashSkillDir(base, name, versionNo, skillVersionRelDir(name, versionNo), logicalDir, publishedCardPath(name, versionNo))
+	return hashSkillDir(base, name, versionNo, target.relDir, target.logicalDir, publishedCardPath(target.logicalDir))
 }
 
 // CardPath 返回该版本的卡片真路径：发布版本 → 发布目录里的 SKILL.md；工作副本
 // （VersionNo=0）→ 工作副本卡片路径。两种都是对应 L1 哈希所覆盖的那一行路径。
 // CardPath returns the card path matching the version's L1 hash input.
 func (l *SkillLibrary) CardPath(v SkillVersion) string {
-	if v.VersionNo < 1 {
+	if v.VersionNo < 1 || v.Dir == "" {
 		return skillCardPath(v.Name)
 	}
-	return publishedCardPath(v.Name, v.VersionNo)
+	return publishedCardPath(v.Dir)
 }
 
 // skillWorkDir 给出工作副本相对工作区根（.basalt/）的目录：skills/<name>。
@@ -250,22 +368,10 @@ func skillWorkDir(name string) string {
 	return path.Join(skillsDirName, name)
 }
 
-// skillVersionLogicalDir 给出发布目录的契约字面量：.basalt/versions/skills/<name>/<no>。
-// skillVersionLogicalDir is the contract literal of a published version directory.
-func skillVersionLogicalDir(name string, versionNo int) string {
-	return path.Join(skillVersionsPrefix, name, strconv.Itoa(versionNo))
-}
-
-// skillVersionRelDir 给出发布目录在文件系统上相对工作区根的形态（去掉 .basalt/ 前缀）。
-// skillVersionRelDir strips the .basalt/ prefix for filesystem access.
-func skillVersionRelDir(name string, versionNo int) string {
-	return path.Join(versionsDirName, skillsDirName, name, strconv.Itoa(versionNo))
-}
-
 // publishedCardPath 给出发布版本里 SKILL.md 的真路径（约束 31 的 L1 卡片字面量）。
 // publishedCardPath is the L1 card path of a published version.
-func publishedCardPath(name string, versionNo int) string {
-	return path.Join(skillVersionLogicalDir(name, versionNo), skillDefinitionFile)
+func publishedCardPath(logicalDir string) string {
+	return path.Join(logicalDir, skillDefinitionFile)
 }
 
 // hashSkillDir 在已打开的根上计算一个技能目录的版本事实：递归收集普通文件、拒绝

@@ -585,15 +585,19 @@ paths:
     delete:
       tags: [resources]
       summary: 删除技能
-      description: 被任一 Agent `skills:` 引用或活动 Run 引用时 → 400 点名引用者；不提供 force。历史版本与 Run 引用保留。
+      description: |
+        被任一 Agent `skills:` 引用或活动 Run 引用时 → 400 点名引用者；不提供 force。历史版本与 Run 引用保留。
+        删除只写墓碑，必须携带与当前指针一致的 `resource_uid`。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/ResourceUID'
       responses:
         '200': { $ref: '#/components/responses/OK' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
 
   /skills/{name}/validate:
@@ -730,15 +734,19 @@ paths:
     delete:
       tags: [resources]
       summary: 删除 MCP server
-      description: 被 Agent `mcp_servers:` 或活动 Run 引用时 → 400 点名；不提供 force。
+      description: |
+        被 Agent `mcp_servers:` 或活动 Run 引用时 → 400 点名；不提供 force。
+        删除只写墓碑，必须携带与当前指针一致的 `resource_uid`。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/ResourceUID'
       responses:
         '200': { $ref: '#/components/responses/OK' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
 
   /mcp-servers/{name}/test:
@@ -779,7 +787,10 @@ paths:
     get:
       tags: [resources]
       summary: 查资源引用
-      description: 返回引用该资源的 Agent 与活动 Run；删除闸门据此拒绝并点名。
+      description: |
+        返回引用该资源的 Agent 与活动 Run；删除闸门据此拒绝并点名。Agent 引用包含两类：`resource_bindings`
+        中指向该 `resource_uid` 的绑定（含归档 Agent；权威），以及定义名引用（解析失败按可能引用处理）。
+        活动 Run 引用来自未释放的 `run_resource_refs` / `run_notify_refs`。
       responses:
         '200':
           description: 引用清单
@@ -802,7 +813,16 @@ paths:
     get:
       tags: [resources]
       summary: 列资源历史版本
-      description: 已发布迁移只追加；版本内容不可改写。撤回 = 以旧版本内容创建新版本，不改历史。
+      description: |
+        已发布迁移只追加；版本内容不可改写。撤回 = 以旧版本内容创建新版本，不改历史。
+        版本按 `(resource_kind, resource_uid, version_no)` 归属：只按名称查询默认只回当前指针 UID 的版本；
+        查旧 UID（同名重建前的历史）必须显式给 `resource_uid`。
+      parameters:
+        - name: resource_uid
+          in: query
+          required: false
+          schema: { type: string }
+          description: 显式指定资源身份；省略 = 当前指针 UID
       responses:
         '200':
           description: 版本列表（按 version_no 倒序）
@@ -855,6 +875,95 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
 
+  /resources/{kind}/{name}/credential/revoke:
+    parameters:
+      - $ref: '#/components/parameters/CredentialResourceKind'
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 撤销资源托管凭据（全部版本）
+      description: |
+        撤销该资源 UID 的整个凭据身份：全部版本置 `revoked`、活动密文置 NULL、`revocation_epoch + 1`，
+        资源条件 ETag 随之变化。**不需要读取主密钥、不解密**；不删除资源、不删除历史版本。
+        之后重新录入生成新版本，旧版本永不复活；在途 Run 在下一次模型调用检查点或下一次通知发送失败。
+        env 模式的资源没有托管凭据，调用返回 400。请求体必须带 `resource_uid` 与 `confirm: true`，
+        `If-Match` 必须匹配资源条件 ETag；`resource_uid` 与凭据 owner 不符（借用其他资源的凭据 ID）→
+        409 `CREDENTIAL_OWNER_MISMATCH`，不跨资源复用。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CredentialRevokeRequest' }
+      responses:
+        '200':
+          description: 撤销结果（只回状态与版本，不含凭据材料）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CredentialRevokeResult' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /resources/{kind}/{name}/scope:
+    parameters:
+      - $ref: '#/components/parameters/CredentialResourceKind'
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 切换资源使用范围
+      description: |
+        `shared` ⇄ `exclusive`。转专属必须给 `owner_agent`，且该 Agent 已存在。共享转专属前检查其他 Agent 的
+        `resource_bindings`、活动 Run 与消息路由引用；被引用 → 409 `RESOURCE_SCOPE_IN_USE` 并点名，**不提供 force**，
+        不自动解绑。有资格使用 `all_eligible` 的 Agent 作为影响提示返回，不静默移除。请求体必须带 `resource_uid`，
+        与当前指针不一致 → 409 `RESOURCE_UID_MISMATCH`；`If-Match` 必须匹配资源条件 ETag。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResourceScopeRequest' }
+      responses:
+        '200':
+          description: 切换后的资源视图
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ResourceScopeResult' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+
   /resource-versions/{version_id}:
     parameters:
       - name: version_id
@@ -893,7 +1002,7 @@ paths:
           schema: { type: string }
         - name: target_kind
           in: query
-          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, system] }
+          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, system] }
         - name: target_id
           in: query
           schema: { type: string }
@@ -948,7 +1057,11 @@ paths:
     get:
       tags: [console]
       summary: 查沙箱白名单
-      description: 只读展示白名单（路径 / 可执行名 / 受控解释器 / 域名）。修改白名单需改配置并重启。
+      description: |
+        展示白名单（路径 / 可执行名 / 受控解释器 / 域名）。文件路径、可执行名与受控解释器**只读**，
+        修改需改配置并重启；出网域名（`http_allowed_domains`）是**当前实际生效**值，可在管理台
+        「执行环境」页通过 `PUT /sandbox/network-domains` 保存、立即生效、无需重启。响应附
+        `network_allowlist` 生效元数据（ETag / 修订号 / 来源 / 最近写入时间与写入者）。
       responses:
         '200':
           description: 白名单
@@ -960,6 +1073,53 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/SandboxView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /sandbox/network-domains:
+    put:
+      tags: [console]
+      summary: 保存网络域名白名单（条件写，立即生效）
+      description: |
+        唯一权威源是数据库中的单行策略：`basalt.yaml` 的 `http.allowed_domains` 只在首次启动、
+        表内无行时作为种子，此后改配置不覆盖管理台写入的值。保存成功后新规则对**下一次**出站
+        判定立即生效，无需重启；已在途的连接与请求不会被撤回，收紧后不再被允许的 MCP http 长连接
+        会断开且**不**自动重连（放宽不重连）。全部域名先规整（去空白、小写、去重、升序），
+        非法条目 → 400 并点名第一处；`domains: []` 是合法值（受此策略约束的出站请求全部拒绝）。
+
+        **必须**带 `If-Match` 强 ETag（取自 `GET /sandbox` 的 `network_allowlist.etag`）。缺失、
+        弱 ETag 或 `*` → 412 且零写入；陈旧 ETag 同样 412，响应 `data.current_etag` 给出当前值，
+        页面应重取后再改。写入按修订号做 CAS，并发修改落败方 → 409 且零写入。校验或前置条件
+        失败不留管理操作行；一旦写入 `pending`，后续失败一律置 failed 并在 `data.operation_id`
+        返回操作标识。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkDomainsWrite' }
+      responses:
+        '200':
+          description: 保存后的实际生效状态（重新读出，不是回显请求体）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   # ==========================================================
   # 模型连接（Provider 发布）
@@ -968,7 +1128,9 @@ paths:
     get:
       tags: [resources]
       summary: 列模型连接与发布 / 生效版本
-      description: 响应**不含** api_key 值；只回 `${ENV_VAR}` 引用名。
+      description: |
+        响应**不含**任何 api_key 值：env 模式只回 `${ENV_VAR}` 引用名（`api_key_env`）；managed 模式只回
+        `credential_ref` / `credential_state` / `last4`。每项带不可变 `resource_uid`、`scope` 与 `owner_agent`。
       responses:
         '200':
           description: 模型连接列表
@@ -988,8 +1150,11 @@ paths:
       tags: [resources]
       summary: 新建模型连接
       description: |
-        `api_key` 只接受 `${ENV_VAR}` 引用；成功后构建不可变 ProviderCatalog、原子替换发布指针。
-        新 Run 在准入时固定该映射；失败保旧。同名存在 → 409。
+        凭据两种模式：`credential_mode: env` 时 `api_key` 必须是精确 `${ENV_VAR}` 引用；`credential_mode: managed`
+        时 `api_key` 是 **write-only 完整新值**（服务端 AES-256-GCM 加密落库，响应只回 `credential_ref` / `last4`）。
+        创建时未声明 `credential_mode` 只按 env 规则；普通值且未声明 → 400 `CREDENTIAL_MODE_REQUIRED`，不推断为 managed。
+        `scope` 取 `shared`（缺省）或 `exclusive`；`exclusive` 必须给 `owner_agent`，且该 Agent 已存在。
+        成功后构建不可变 ProviderCatalog、原子替换发布指针；新 Run 在准入时固定该映射；失败保旧。同名活动连接存在 → 409。
       requestBody:
         required: true
         content:
@@ -1022,7 +1187,7 @@ paths:
       summary: 查模型连接
       responses:
         '200':
-          description: 模型连接详情（只回 env 引用名）
+          description: 模型连接详情（env 只回引用名；managed 只回凭据引用 / 状态 / 尾号）
           content:
             application/json:
               schema:
@@ -1041,8 +1206,12 @@ paths:
       tags: [resources]
       summary: 修改模型连接
       description: |
-        `If-Match` 必须等于当前 ETag。`api_key` 留空 = 保留原引用；成功后立即发布，新 Run 使用新映射，
-        已在途 Run 继续使用准入时固定的旧映射。
+        `If-Match` 必须等于当前资源 ETag（资源 ETag 含定义、范围、凭据版本与状态、`revision`）。
+        `api_key` 省略 = 保留当前凭据；env 模式提供精确 `${ENV_VAR}`；managed 模式替换必须给完整新值，空串 → 400。
+        更新未声明 `credential_mode` 保持当前模式；显式切换必须给出目标模式所需的值（env → managed 需新值，
+        managed → env 需 `${VAR}`）。请求体出现只读 `credential_ref` → 400 `CREDENTIAL_REF_READ_ONLY`。
+        成功后立即发布，新 Run 使用新映射；已在途 Run 继续使用准入时固定的旧映射与旧凭据版本（撤销除外）。
+        范围转换不在此端点，走 `POST /resources/{kind}/{name}/scope`。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -1072,15 +1241,20 @@ paths:
     delete:
       tags: [resources]
       summary: 删除模型连接
-      description: 被任一 Agent `provider:` 或活动 Run 引用时 → 400 点名引用者；不提供 force。
+      description: |
+        被任一 Agent 的 `resource_bindings`（含归档 Agent）、定义名引用或活动 Run 引用时 → 400 点名引用者；不提供 force。
+        删除只写墓碑（`resource_identities.state='deleted'`），历史版本、凭据与引用记录保留；同名重建生成新 `resource_uid`，
+        旧绑定不自动接管，版本号从 1 重新计。必须携带与当前指针一致的 `resource_uid`。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/ResourceUID'
       responses:
         '200': { $ref: '#/components/responses/OK' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
 
   /model-connections/{name}/test:
@@ -1143,6 +1317,38 @@ paths:
                       data: { $ref: '#/components/schemas/AgentFilesView' }
         '400': { $ref: '#/components/responses/BadRequest' }
 
+  /agents/{name}/config:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [agents]
+      summary: 读结构化 Agent 配置（表单视图）
+      description: |
+        返回结构化字段值、**一个**与 `GET /agents/{name}/content` 完全一致的强 `content_etag`，以及每个引用的
+        解析状态（绑定 UID、名称、是否已删除、是否仍有资格、`notify_mode` 的有效值）。原文编辑继续用
+        `GET/PUT /agents/{name}/content`；两者不是二选一。**不引入** `config_etag`——表单保存与原文保存共用
+        `content_etag`。
+      responses:
+        '200':
+          description: 结构化配置与解析状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentConfigView' }
+          headers:
+            ETag:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /agents/{name}/content:
     parameters:
       - name: name
@@ -1175,8 +1381,12 @@ paths:
       summary: 写 AGENT.md（整份或结构化补丁）
       description: |
         经**同一段**注册写入门（先验后写）：校验不通过 → 400 且**磁盘逐字节不变**。
-        `If-Match` 必须等于当前 ETag；缺失、格式非法、弱 ETag、`*` 或与当前值不匹配 → 412。
+        `If-Match` 必须等于当前 `content_etag`（表单 `changes` 与整份 `content` **共用同一个**）；
+        缺失、格式非法、弱 ETag、`*` 或与当前值不匹配 → 412。
         结构化补丁无法保持注释时 → 400 `EDIT_UNSUPPORTED`，不落盘。成功后生成新的 ConfigSnapshot 与 ETag。
+        保存期还须校验 `resource_bindings` 与 `provider.name` / `notify_channels` 一一对应、UID 是当前发布指针、
+        已发布且有资格；缺失 / 非法 / 无资格 → 400 `AGENT_RESOURCE_BINDING_MISSING` / `AGENT_RESOURCE_BINDING_INVALID` /
+        `RESOURCE_NOT_ELIGIBLE` / `CREDENTIAL_REVOKED`，零写入。服务端**不补绑**、不按名解析、不猜意图。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -1227,6 +1437,20 @@ paths:
               required: [description]
               properties:
                 description: { type: string, description: 一句描述（可带 provider / model 提示） }
+                answers:
+                  type: array
+                  maxItems: 3
+                  description: |
+                    可选：上一轮 `questions` 的逐项回答（R6 问答补全）。最多 3 条；`id` / `question`
+                    非空且各 ≤ 256 字符，`answer` 去空白后非空且 ≤ 2000 字符，`id` 不重复。
+                    答案只在本次请求内进入提示词，**不落盘、不进日志、不写审计正文**。
+                  items:
+                    type: object
+                    required: [id, question, answer]
+                    properties:
+                      id: { type: string }
+                      question: { type: string }
+                      answer: { type: string }
       responses:
         '200':
           description: 草稿文件集合（未落盘，含可编辑正文）
@@ -1238,6 +1462,44 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/AgentDraftView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
+
+  /agents/{name}/schedule-draft:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [agents]
+      summary: 一句话生成定时任务候选（不保存）
+      description: |
+        一次作者模型调用生成一条定时任务候选。**不写管理操作行、不落盘、不注册、不改调度器**——
+        唯一写入是 LLM 调用审计（关联标识 `agent-schedule-<name>`）。候选的 `id` / `cron` / `zone` /
+        `message` 复用装载期同一套规则校验（6 段、公共子集、`CRON_TZ=` 拼接后可解析、zone 可加载
+        且非 `Local`、message 非空）；`next_runs` 只在服务端计算。候选**不自动保存**：确认后走
+        `PUT /agents/{name}/content` 的 `changes.schedules` 条件写，id 与现有任务冲突由页面阻止。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [instruction]
+              properties:
+                instruction: { type: string, description: 一句话指令（去空白后非空，≤ 1000 字符） }
+      responses:
+        '200':
+          description: 未保存的定时候选与服务端计算的未来三次触发时间
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ScheduleDraftView' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '503': { $ref: '#/components/responses/NotConfigured' }
 
@@ -1419,7 +1681,10 @@ paths:
       tags: [agents]
       summary: 复制 Agent
       description: |
-        复制目录内容到新 Agent 名；新 Agent 默认 `disabled`，并清空 `schedules`（避免全局 cron id 撞车）。
+        复制目录内容到新 Agent 名；副本获得**新 `agent_uid`**，默认 `disabled`，并清空 `schedules`（避免全局 cron id 撞车）。
+        共享资源绑定随目录携带（UID 不变）；源 Agent 引用任何**源专属**模型连接 / 通知渠道时，必须提供
+        `resource_mapping` 逐项显式映射，否则 409 `AGENT_COPY_BLOCKED` 并列出资源名与类型，不产生副本。
+        不复制源凭据、不复制源 `agent_uid`、不自动绑定源专属资源；`notify_mode` 按源模式处理，不用空数组冒充 `none`。
         新名已存在 → 409；复制失败不留残余目录。
       requestBody:
         required: true
@@ -1601,7 +1866,10 @@ paths:
     get:
       tags: [notify]
       summary: 列通知渠道
-      description: 响应中地址**只回 scheme + host**（`url_host`），原始地址（含 token）没有任何载体。
+      description: |
+        响应中地址**只回 scheme + host**（`url_host`），原始地址（含 token）没有任何载体。每项带不可变
+        `resource_uid`、`scope` / `owner_agent`、`credential_mode`、`credential_ref` / `credential_state` /
+        `last4`、`address_status` 与 `revision`。`url_host` 为空**不等于**未配置（env 引用或 managed 密文都可能无 host）。
       responses:
         '200':
           description: 渠道列表
@@ -1618,7 +1886,12 @@ paths:
     post:
       tags: [notify]
       summary: 登记通知渠道
-      description: url 填 `${ENV_VAR}` 引用（发送时解析）；写前预跑沙箱域名校验，失败文案只含 host。
+      description: |
+        地址两种模式：`credential_mode: env` 时 `url` 必须是精确 `${ENV_VAR}` 引用（发送时解析）；
+        `credential_mode: managed` 时 `url` 是 **write-only 完整地址**（AES-256-GCM 加密落库，响应只回 host 与尾号）。
+        创建未声明模式只按 env 规则；普通 URL 且未声明 → 400 `CREDENTIAL_MODE_REQUIRED`。
+        `scope` 取 `shared`（缺省）或 `exclusive`；`exclusive` 必须给 `owner_agent`。
+        写前预跑沙箱域名校验，失败文案只含 host。同名活动渠道 → 400 `BAD_REQUEST`（与 FR-059 一致，不新增 `CONFLICT`）。
       requestBody:
         required: true
         content:
@@ -1665,7 +1938,10 @@ paths:
     put:
       tags: [notify]
       summary: 更新渠道
-      description: "**url 留空 = 保留原值**（页面不回填已存地址）。"
+      description: |
+        **url 省略 = 保留原值**；页面不回填已存地址。env 模式给精确 `${ENV_VAR}`；managed 模式替换必须给完整
+        新地址，空串 → 400。更新未声明 `credential_mode` 保持当前模式；显式切换必须给出目标模式所需的值。
+        请求体出现只读 `credential_ref` → 400 `CREDENTIAL_REF_READ_ONLY`。
       requestBody:
         required: true
         content:
@@ -1687,8 +1963,12 @@ paths:
     delete:
       tags: [notify]
       summary: 删除渠道
-      description: 先扫各 AGENT.md 正文**整词**匹配渠道名；被引用 → 400 并点名那些 Agent。`?force=true`（字面 true）强删。
+      description: |
+        先按 `resource_bindings` 的 UID（含归档 Agent）与各 AGENT.md 正文**整词**匹配渠道名；被引用 → 400 并点名
+        那些 Agent。`?force=true`（字面 true）强删。删除只写墓碑，历史、凭据与发送记录保留；同名重建生成新
+        `resource_uid`，旧绑定不自动接管。必须携带与当前指针一致的 `resource_uid`。
       parameters:
+        - $ref: '#/components/parameters/ResourceUID'
         - name: force
           in: query
           schema: { type: string, enum: ['true'] }
@@ -1700,6 +1980,39 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /notify-channels/{name}/test:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [notify]
+      summary: 测试渠道连通性
+      description: |
+        先写 `notify_channel.test` 管理操作行（预写失败不发请求），再经**与定时代投 / `notify` 工具
+        同一个**发送面发出一条固定文案 `Basalt 连通性测试`——接收方一眼可区分测试与真实通知。
+        成功判定：HTTP 2xx；飞书还要求业务回执 `code == 0`。回执无法解析 / 超时 → `status=unknown`
+        （可能已送达，**不得**自动重发）；未知是测试结论，仍是 200 + `ok=false`，不是接口错误。
+        结果同时写入「最后一次连接测试」投影，列表页的 `last_test` 随之更新。地址完全未配置 →
+        503 `NOT_CONFIGURED`，且投影记为 failed（不得显示成已验证）；渠道不存在 → 404。
+      responses:
+        '200':
+          description: 测试已执行（`ok=false` 是失败或结果未知，不是接口错误）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/NotifyChannelTestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
 
   # ==========================================================
   # 工作区（只读）
@@ -1786,6 +2099,21 @@ components:
       in: path
       required: true
       schema: { type: string, description: 资源名（模型连接 / MCP / 技能均按名标识） }
+    ResourceUID:
+      name: resource_uid
+      in: query
+      required: true
+      schema: { type: string, description: '目标资源的稳定身份（`rs_` + 26 位 Crockford Base32）' }
+      description: |
+        涉及资源身份的动作（删除、范围转换、凭据撤销）必须在 `If-Match` 之外显式给出 `resource_uid`，
+        且必须等于该名称当前指针；缺失或与当前指针不一致 → 409 `RESOURCE_UID_MISMATCH`，**不**按名称猜测目标
+        （同名重建后旧 UID 的版本与凭据留在墓碑下，按名操作永远只作用于当前身份）。
+    CredentialResourceKind:
+      name: kind
+      in: path
+      required: true
+      schema: { type: string, enum: [model_connection, notify_channel] }
+      description: 范围与凭据动作只覆盖带使用范围的两类资源；通知渠道的 CRUD 仍走 `/notify-channels`。
 
   responses:
     OK:
@@ -1820,6 +2148,11 @@ components:
           schema: { $ref: '#/components/schemas/Envelope' }
     NotConfigured:
       description: 能力未配置（文案点名配置键，一次 LLM 调用都不会发出）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    ServiceUnavailable:
+      description: 托管凭据不可用（主密钥缺失 / 权限不符 / 格式错误 / key_id 不匹配 / 解密失败；业务码 `CREDENTIAL_UNAVAILABLE`）
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -1881,10 +2214,20 @@ components:
       properties:
         name: { type: string }
         description: { type: string }
+        display_name:
+          type: string
+          description: |
+            管理台展示名（已解析）：`AGENT.md` 的 `display_name` 去空白后非空时取它，否则回退 `name`，
+            因此该字段**永不为空**。它只影响展示，不改变技术名、目录名、`agent_uid` 或运行标识。
         provider: { type: string }
         model: { type: string }
         tools: { type: array, items: { type: string } }
         skills: { type: array, items: { type: string } }
+        notify_mode: { type: string, enum: [none, all_eligible, allowlist], description: 通知意图有效值（显式或兼容推断） }
+        notify_channels:
+          type: array
+          items: { type: string }
+          description: '仅 allowlist 模式下的渠道名；none / all_eligible 时为空数组——空数组不表示「禁用通知」'
         schedules: { type: integer }
         lifecycle: { $ref: '#/components/schemas/AgentLifecycleView' }
         registered: { type: boolean, description: 加载期校验是否通过（与生命周期独立） }
@@ -2001,7 +2344,37 @@ components:
           type: array
           items: { type: string }
           description: 受控脚本通道的解释器白名单（argv 必须 [脚本路径, 参数…]，脚本限于 Agent scripts/ 与技能库，见 contracts/agent-md.md §5.2）
-        http_allowed_domains: { type: array, items: { type: string } }
+        http_allowed_domains:
+          type: array
+          items: { type: string }
+          description: '当前实际生效的出网域名白名单（不是启动配置副本）：`[]` 表示受此策略约束的出站请求全部拒绝'
+        network_allowlist: { $ref: '#/components/schemas/NetworkAllowlistView' }
+
+    NetworkAllowlistView:
+      type: object
+      properties:
+        etag:
+          type: string
+          description: '当前生效策略的强 ETag，条件写 `If-Match` 的唯一取值来源；尚未装载时为空串'
+        revision: { type: integer, description: 从 1 起，每次成功写入 +1；尚未装载为 0 }
+        source:
+          type: string
+          enum: [config_seed, database]
+          description: 'config_seed = 首次启动由配置种子写入；database = 来自管理台写入'
+        updated_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "最近一次写入时间；零值渲染为空串（US-9 惯例）" }
+        updated_by: { type: string, description: '脱敏写入者（token:<指纹> / local_trust）；种子行为空串' }
+
+    NetworkDomainsWrite:
+      type: object
+      required: [domains]
+      properties:
+        domains:
+          type: array
+          maxItems: 200
+          items: { type: string, maxLength: 253 }
+          description: |
+            完整替换列表（不是增量）。条目为主机名或 `*.` 前缀的通配（只覆盖子域，不覆盖裸后缀）；
+            不接受 scheme / 端口 / 路径 / userinfo / IP。显式空数组 = 清空并拒绝全部受控出站请求。
 
     FileDraft:
       type: object
@@ -2025,12 +2398,20 @@ components:
             properties:
               path: { type: string }
               size: { type: integer }
+        changes:
+          type: object
+          description: '系统在本次保存中自动应用的受控工具增删（宪法约束 11 / R7）：只可能是 `notify`，且必须随保存结果返回；无变更时两个数组均为空数组（不为 `null`）。'
+          properties:
+            tools_added: { type: array, items: { type: string } }
+            tools_removed: { type: array, items: { type: string } }
 
     AgentDraftView:
       type: object
       description: |
-        模型草稿文件集合（未落盘）。`files[].content` 是 UTF-8 正文，可直接编辑后再走
+        模型草稿结果（未落盘）。`files[].content` 是 UTF-8 正文，可直接编辑后再走
         `POST /agents/{name}/files` 提交；本视图不含大小与 ETag，因为磁盘上没有对应的基础版本。
+        `files` 与 `questions` **互斥**：模型信息不足时返回问题（`files` 为空数组），
+        信息足够时返回文件（`questions` 为空数组）——两者都不会是 `null`。
       properties:
         agent: { type: string }
         files:
@@ -2040,6 +2421,34 @@ components:
             properties:
               path: { type: string }
               content: { type: string }
+        questions:
+          type: array
+          maxItems: 3
+          description: |
+            模型要求补充信息时给出的澄清问题（最多 3 个，`id` 不重复）。页面逐项必填后把答案经
+            `answers` 回传；答案只存在于页面内存，服务端不持久化。
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              question: { type: string }
+
+    ScheduleDraftView:
+      type: object
+      description: |
+        定时候选（**未保存**）。`next_runs` 由服务端复用装载期同一套 cron / 时区解析器计算
+        （RFC3339 UTC，最多 3 个，不足三次就返回实际数量）；浏览器**不**自行推导触发时间。
+        确认保存走既有的 `PUT /agents/{name}/content` 的 `changes.schedules` 条件写。
+      properties:
+        agent: { type: string }
+        id: { type: string, description: '匹配 ^[a-z0-9][a-z0-9-]{0,63}$' }
+        cron: { type: string, description: 6 段（秒 分 时 日 月 周），不带 CRON_TZ= 前缀 }
+        zone: { type: string, description: IANA 时区名；缺省 UTC，拒绝 Local }
+        message: { type: string }
+        next_runs:
+          type: array
+          maxItems: 3
+          items: { type: string, format: date-time }
 
     ScheduleView:
       type: object
@@ -2049,6 +2458,7 @@ components:
         cron: { type: string, description: 6 段（秒 分 时 日 月 周） }
         zone: { type: string, description: 缺省 UTC }
         message: { type: string }
+        deliver_to: { type: string, description: '系统代投目标通知渠道的**资源 UID**（`rs_` 前缀）；空串 = 不代投。不接受渠道名——名称只是标签（R7）。' }
         enabled: { type: boolean }
         last_run_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "零值渲染为空串（US-9 惯例）；否则为 RFC3339 date-time" }
         last_status: { type: string }
@@ -2064,6 +2474,11 @@ components:
         error_message: { type: string }
         started_at: { type: string, format: date-time }
         finished_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "未结束（started）时为空串；结束后为 RFC3339 date-time" }
+        delivery_status:
+          type: string
+          description: '系统代投结果，与执行结果**分开**展示。空串 = 本次执行没有代投记录（任务未绑定投递目标）；有值时取 pending / sent / failed / unknown / skipped。`unknown` 表示发送结果无法证明（如超时），**不会**自动重发。'
+        delivery_channel: { type: string, description: 目标渠道的资源 UID；无投递记录时为空串 }
+        delivery_detail: { type: string, description: '脱敏短语（如 HTTP 状态与飞书返回码），不含地址、密钥或响应正文' }
 
     NotifyChannelUpsert:
       type: object
@@ -2071,17 +2486,75 @@ components:
       properties:
         name: { type: string }
         type: { type: string, description: 取值来自 /notify-channels/types }
-        url: { type: string, description: '${ENV_VAR} 引用；更新时留空 = 保留原值' }
+        url:
+          type: string
+          description: 'env 模式：精确 `${ENV_VAR}`；managed 模式：write-only 完整新地址。更新时省略 = 保留原值；空串 = 400'
         description: { type: string }
+        credential_mode:
+          type: string
+          enum: [env, managed]
+          description: '可选。创建省略只按 env 规则；更新省略保持当前模式；显式切换必须给出目标模式所需值'
+        scope:
+          type: string
+          enum: [shared, exclusive]
+          description: '缺省 shared；exclusive 必须给 owner_agent'
+        owner_agent: { type: string, description: 'scope=exclusive 时必填，必须是在世 Agent 名' }
 
     NotifyChannelView:
       type: object
-      description: 地址只以 host 形式出现；原始地址没有任何载体（凭证红线）
+      description: 地址只以 host 形式出现；原始地址与密钥没有任何载体（凭证红线）
       properties:
         name: { type: string }
+        resource_uid: { type: string, description: 不可变资源身份；同名重建会生成新 UID }
         type: { type: string }
         description: { type: string }
-        url_host: { type: string, description: scheme + host；解析不出来回空 }
+        url_host: { type: string, description: 'scheme + host；${VAR} 引用与不可解析地址回空（空不等于未配置）' }
+        url_configured: { type: boolean, description: '存储里是否有非空地址；${VAR} 引用与 managed 密文均为 true 且 url_host 可能为空' }
+        address_status:
+          type: string
+          enum: [managed_configured, env, empty, managed_unavailable]
+          description: '地址可用性；managed_unavailable = 主密钥不可用或已撤销'
+        credential_mode: { type: string, enum: [env, managed] }
+        credential_ref: { type: string, description: '只读凭据引用；仅 managed 模式非空' }
+        credential_state: { type: string, enum: ['', active, revoked, retired], description: '空串 = env 模式或尚未写入' }
+        credential_version: { type: integer, description: '当前活动凭据版本；env 模式为 0' }
+        last4: { type: string, description: '托管密钥尾号；长度不足 8 位为空' }
+        scope: { type: string, enum: [shared, exclusive] }
+        owner_agent: { type: string, description: 'exclusive 时的所有者 Agent 名；shared 为空' }
+        revision: { type: integer, description: '行级修订号；资源条件 ETag 的组成之一' }
+        etag: { type: string, description: '资源条件 ETag（定义 + 范围 + 凭据版本 / 状态 + revision）' }
+        referenced_by:
+          type: array
+          items: { type: string }
+          description: '文档引用扫描结果（排序去重；归档项带 archive: 前缀）；精确绑定以 resource_bindings 为准'
+        availability:
+          type: string
+          enum: [ready, unconfigured, unavailable]
+          description: '本地配置就绪（env 变量存在且非空 / managed 凭据身份 active）；**不等于**实测可用——实测结论与时间戳只来自 last_test'
+        last_test:
+          description: '最后一次渠道连通性测试的脱敏结果；null = 从未测过（不得用 availability 冒充）'
+          oneOf:
+            - $ref: '#/components/schemas/ConnectionTestView'
+            - type: 'null'
+
+    ConnectionTestView:
+      type: object
+      description: 一次真实连接测试的脱敏结果；unknown 表示可能已送达（超时 / 回执无法解析），不得折叠成失败或成功
+      required: [status, tested_at, detail]
+      properties:
+        status: { type: string, enum: [success, failed, unknown] }
+        tested_at: { type: string, format: date-time, description: 'RFC3339 UTC，测试完成时刻' }
+        detail: { type: string, description: '只含固定短语（目标 host / 回执码 / 变量名），不含地址原值与凭据' }
+
+    NotifyChannelTestResult:
+      type: object
+      description: 渠道连通性测试结果；测试会真实发出一条固定文案 `Basalt 连通性测试`
+      required: [ok, status, latency_ms, detail]
+      properties:
+        ok: { type: boolean, description: 'true 当且仅当服务端已确认受理（飞书还要求业务回执 code == 0）' }
+        status: { type: string, enum: [success, failed, unknown] }
+        latency_ms: { type: integer }
+        detail: { type: string, description: '脱敏明细；unknown 时提示可能已送达、请查证后手动重试' }
 
     WorkspaceEntry:
       type: object
@@ -2154,12 +2627,19 @@ components:
     RunResourceManifestView:
       type: object
       properties:
-        format_version: { type: integer }
+        format_version: { type: integer, description: 'v1 为旧清单；v2 增加 agent_uid、凭据版本与 notify' }
+        agent_uid: { type: string, description: 'v2 起必填；v1 清单为空' }
         agent_lifecycle_state: { type: string, enum: [active, disabled, archived] }
         legacy_unrecorded: { type: boolean, description: US-11 之前的 Run 无清单，不回填 }
+        provider:
+          oneOf:
+            - $ref: '#/components/schemas/ProviderManifestView'
+            - type: "null"
+          description: 'v2 的单 Provider 固定；v1 清单为 null 并看 providers'
         providers:
           type: array
           items: { $ref: '#/components/schemas/ResourceVersionRef' }
+          description: 'v1 兼容字段；v2 起为空'
         mcp_servers:
           type: array
           items: { $ref: '#/components/schemas/ResourceVersionRef' }
@@ -2169,6 +2649,36 @@ components:
         files:
           type: array
           items: { $ref: '#/components/schemas/FileHash' }
+        notify:
+          oneOf:
+            - $ref: '#/components/schemas/NotifyManifestView'
+            - type: "null"
+          description: 'v2 起必填；v1 清单为 null（旧语义：空白名单 = 不限制）'
+
+    ProviderManifestView:
+      type: object
+      properties:
+        name: { type: string }
+        model: { type: string }
+        resource_uid: { type: string }
+        version_id: { type: integer }
+        version_no: { type: integer }
+        credential_ref: { type: string, description: '托管凭据引用；env 模式为空' }
+        credential_version: { type: integer, description: '准入时固定的凭据版本；env 模式为 0' }
+        target_binding: { type: string, description: '规范化目标地址的 sha256；不含明文 URL' }
+
+    NotifyManifestView:
+      type: object
+      properties:
+        mode: { type: string, enum: [none, all_eligible, allowlist] }
+        channels:
+          type: array
+          description: '解析后的具体渠道；无 "*" 通配；mode=none 时为空'
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              resource_uid: { type: string }
 
     RunDetail:
       allOf:
@@ -2185,6 +2695,7 @@ components:
       properties:
         kind: { type: string, enum: [model_connection, mcp_server] }
         name: { type: string }
+        resource_uid: { type: string }
         version_id: { type: integer }
         version_no: { type: integer }
         content_hash: { type: string }
@@ -2217,7 +2728,9 @@ components:
 
     AgentContentChanges:
       type: object
-      description: 只允许已知 frontmatter 字段；未给出的字段、正文与注释保持逐字节不变；未知字段 → 400。
+      description: |
+        只允许已知 frontmatter 字段；未给出的字段、正文与注释保持逐字节不变；未知字段 → 400（严格已知键，
+        不静默忽略拼写错误）。
       properties:
         description: { type: string }
         identity:
@@ -2225,16 +2738,41 @@ components:
           properties:
             agent_name: { type: string }
             prompt: { type: string }
+        body:
+          type: string
+          description: '正文。缺省 = 不改；字符串 = 整段替换；空串 = 清空（页面二次确认）。不得用未给推断清空'
         provider:
           type: object
           properties:
-            name: { type: string }
+            name: { type: string, description: 必须已在 resource_bindings 中绑定且 UID 是当前指针 }
             model: { type: string }
-            temperature: { type: number, minimum: 0, maximum: 2 }
+            temperature:
+              type: [number, 'null']
+              minimum: 0
+              maximum: 2
+              description: '三态：缺省 = 不修改；数字（含显式 0）= 写入；显式 null = 移除该字段回到供应商缺省。不得把缺省读成清除'
         tools: { type: array, items: { type: string } }
         skills: { type: array, items: { type: string } }
         mcp_servers: { type: array, items: { type: string } }
         bootstrap: { type: array, items: { type: string } }
+        notify_mode:
+          type: string
+          enum: [none, all_eligible, allowlist]
+          description: '通知意图三态；none / all_eligible 时 notify_channels 必须为空；allowlist 至少一个'
+        notify_channels:
+          type: array
+          items: { type: string }
+          description: 'allowlist 模式下的渠道名；每个名字必须有同名绑定。空数组不表示「禁用通知」'
+        bindings:
+          type: array
+          description: '表单显式选择资源时写入 resource_bindings；服务端在同一写边界合并，不按名重解析 UID'
+          items:
+            type: object
+            required: [resource_kind, ref_name, resource_uid]
+            properties:
+              resource_kind: { type: string, enum: [model_connection, notify_channel] }
+              ref_name: { type: string }
+              resource_uid: { type: string }
         settings:
           type: object
           properties:
@@ -2242,23 +2780,63 @@ components:
             max_history_turns: { type: integer }
         schedules:
           type: array
-          items: { type: object, additionalProperties: true }
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              cron: { type: string, description: 6 段（秒 分 时 日 月 周） }
+              zone: { type: string }
+              message: { type: string }
+              deliver_to:
+                type: string
+                description: '系统代投目标通知渠道的**资源 UID**（`rs_` 前缀）；空串 = 不代投。保存与运行两处都校验：保存期要求是合法 UID 形态，运行期要求渠道存在且对本 Agent 有资格；目标在 Run 准入时冻结（R7）。'
+            required: [id, cron, message]
 
     AgentContentUpdate:
       oneOf:
         - type: object
           required: [content]
           properties:
-            content: { type: string, description: 整份替换 }
+            content: { type: string, description: 整份替换；必须自带完整 resource_bindings（服务端不补绑） }
         - type: object
           required: [changes]
           properties:
             changes: { $ref: '#/components/schemas/AgentContentChanges' }
 
+    AgentConfigView:
+      type: object
+      description: 表单视图；与原文共用同一个 content_etag，不引入 config_etag
+      properties:
+        agent: { type: string }
+        agent_uid: { type: string, description: 生命周期状态文件 schema v2 的稳定身份 }
+        content_etag: { type: string, description: '与 GET /agents/{name}/content 完全一致；表单与原文保存共用' }
+        fields: { type: object, additionalProperties: true, description: '结构化字段值与原文一致；正文只在 content 接口读取' }
+        notify_mode: { type: string, enum: [none, all_eligible, allowlist], description: 有效值（显式或兼容推断） }
+        notify_mode_source: { type: string, enum: [explicit, legacy_inferred] }
+        references:
+          type: array
+          items: { $ref: '#/components/schemas/AgentConfigReference' }
+        binding_complete: { type: boolean, description: '所有引用都恰有一条有效绑定；false 时保存与准入会被拒绝并点名' }
+
+    AgentConfigReference:
+      type: object
+      properties:
+        resource_kind: { type: string, enum: [model_connection, notify_channel] }
+        ref_name: { type: string }
+        resource_uid: { type: string, description: '绑定声明的 UID；未绑定为空串' }
+        resource_name: { type: string, description: '该 UID 的当前名称（同名重建后仍指向旧名 / 旧资源）' }
+        binding_status: { type: string, enum: [bound, missing, stale_uid, orphan, duplicate] }
+        published: { type: boolean }
+        eligible: { type: boolean, description: 'shared 或属于当前 Agent；false 时保存与准入拒绝' }
+        deleted: { type: boolean, description: '绑定 UID 已删除（墓碑存在）；不自动改绑同名新资源' }
+        credential_state: { type: string, enum: ['', active, revoked, retired] }
+
     AgentLifecycleView:
       type: object
       properties:
         agent: { type: string }
+        agent_uid: { type: string, description: '状态文件 schema v2 的稳定身份；缺失或损坏时为空串' }
+        uid_source: { type: string, enum: ['', state_file, archive, legacy_unrecorded], description: '身份来源；空串 = 无有效状态文件' }
         state:
           oneOf:
             - { type: string, enum: [active, disabled, archived] }
@@ -2282,6 +2860,16 @@ components:
       required: [new_name]
       properties:
         new_name: { type: string }
+        resource_mapping:
+          type: array
+          description: '源专属资源的显式映射；目标资源必须已存在、对副本有资格，且不得沿用源 UID'
+          items:
+            type: object
+            required: [resource_kind, source_resource_uid, target_resource_uid]
+            properties:
+              resource_kind: { type: string, enum: [model_connection, notify_channel] }
+              source_resource_uid: { type: string }
+              target_resource_uid: { type: string }
 
     AgentRestoreRequest:
       type: object
@@ -2306,23 +2894,52 @@ components:
       type: object
       properties:
         name: { type: string }
+        resource_uid: { type: string, description: 不可变资源身份；同名重建会生成新 UID }
         base_url: { type: string }
-        api_key_env: { type: string, description: '只回 `${ENV_VAR}` 引用名；未配置为空串' }
+        api_key_env: { type: string, description: 'env 模式只回 `${ENV_VAR}` 引用名；managed 模式为空串' }
         default_model: { type: string }
+        credential_mode: { type: string, enum: [env, managed] }
+        credential_ref: { type: string, description: '只读凭据引用；仅 managed 模式非空' }
+        credential_state: { type: string, enum: ['', active, revoked, retired], description: '空串 = env 模式或尚未写入' }
+        credential_version: { type: integer, description: '当前活动凭据版本；env 模式为 0' }
+        last4: { type: string, description: '托管密钥尾号；长度不足 8 位为空' }
+        scope: { type: string, enum: [shared, exclusive] }
+        owner_agent: { type: string, description: 'exclusive 时的所有者 Agent 名；shared 为空' }
+        revision: { type: integer, description: '行级修订号；资源条件 ETag 的组成之一' }
         published_version_id: { type: integer }
         published_version_no: { type: integer }
         applied_version_id: { type: integer }
         applied_version_no: { type: integer }
-        etag: { type: string }
+        etag: { type: string, description: '资源条件 ETag（定义 + 范围 + 凭据版本 / 状态 + revision）' }
         referenced_by: { type: array, items: { type: string } }
+        availability:
+          type: string
+          enum: [ready, unconfigured, unavailable]
+          description: '本地配置就绪（env 变量存在且非空 / managed 凭据身份 active）；**不等于**实测可用——实测结论与时间戳只来自 last_test'
+        last_test:
+          description: '最后一次模型连接测试的脱敏结果；null = 从未测过（不得用 availability 冒充）'
+          oneOf:
+            - $ref: '#/components/schemas/ConnectionTestView'
+            - type: 'null'
 
     ModelConnectionUpsert:
       type: object
       required: [name, base_url, default_model]
       properties:
         name: { type: string }
-        base_url: { type: string }
-        api_key: { type: string, description: '只接受 `${ENV_VAR}` 引用；更新时留空 = 保留原值' }
+        base_url: { type: string, description: 'http/https；不含 userinfo；改地址必须给新凭据版本' }
+        api_key:
+          type: string
+          description: 'env 模式：精确 `${ENV_VAR}`；managed 模式：write-only 完整新值。省略 = 保留；空串 = 400'
+        credential_mode:
+          type: string
+          enum: [env, managed]
+          description: '可选。创建省略只按 env 规则；更新省略保持当前模式；显式切换必须给出目标模式所需值'
+        scope:
+          type: string
+          enum: [shared, exclusive]
+          description: '仅创建时可选；缺省 shared；exclusive 必须给 owner_agent。后续切换走 /scope 端点'
+        owner_agent: { type: string, description: 'scope=exclusive 时必填，必须是在世 Agent 名' }
         default_model: { type: string }
 
     ModelConnectionTestResult:
@@ -2421,6 +3038,7 @@ components:
         version_id: { type: integer }
         resource_kind: { type: string, enum: [model_connection, mcp_server, skill] }
         resource_id: { type: string }
+        resource_uid: { type: string, description: '该版本所属资源身份；同名重建后的新旧版本靠它区分' }
         version_no: { type: integer }
         content_hash: { type: string }
         created_at: { type: string, format: date-time }
@@ -2436,7 +3054,7 @@ components:
         - $ref: '#/components/schemas/ResourceVersionView'
         - type: object
           properties:
-            definition_yaml: { type: string, description: '脱敏后的定义；凭证只能是 `${ENV_VAR}`' }
+            definition_yaml: { type: string, description: '脱敏后的定义；env 凭证只能是 `${ENV_VAR}`，managed 凭证只显示 credential_ref' }
             manifest: { type: object, additionalProperties: true }
 
     PublishRequest:
@@ -2450,13 +3068,60 @@ components:
         version: { $ref: '#/components/schemas/ResourceVersionView' }
         pending_restart: { type: boolean, description: 仅 MCP 首版可能为 true }
 
+    CredentialRevokeRequest:
+      type: object
+      required: [resource_uid, confirm]
+      properties:
+        resource_uid: { type: string, description: 必须等于当前指针 UID；不一致 → 409 RESOURCE_UID_MISMATCH }
+        confirm: { type: boolean, enum: [true], description: 必须显式为 true }
+
+    CredentialRevokeResult:
+      type: object
+      properties:
+        resource_uid: { type: string }
+        credential_ref: { type: string }
+        credential_state: { type: string, enum: [revoked] }
+        revoked_versions: { type: integer }
+        revocation_epoch: { type: integer }
+
+    ResourceScopeRequest:
+      type: object
+      required: [resource_uid, scope]
+      properties:
+        resource_uid: { type: string }
+        scope: { type: string, enum: [shared, exclusive] }
+        owner_agent: { type: string, description: 'scope=exclusive 时必填' }
+
+    ResourceScopeResult:
+      type: object
+      properties:
+        resource_uid: { type: string }
+        scope: { type: string, enum: [shared, exclusive] }
+        owner_agent: { type: string }
+        revision: { type: integer }
+        etag: { type: string }
+        affected_eligible_agents:
+          type: array
+          items: { type: string }
+          description: 'all_eligible 模式下会受影响但不会被自动修改的 Agent 名（影响提示）'
+
     ResourceReferencesView:
       type: object
       properties:
         kind: { type: string, enum: [model_connection, mcp_server, skill] }
         id: { type: string }
+        resource_uid: { type: string }
         published_version_id: { type: integer }
-        agents: { type: array, items: { type: string } }
+        agents: { type: array, items: { type: string }, description: '定义名引用（解析失败按可能引用处理）' }
+        bound_agents:
+          type: array
+          description: '按 resource_bindings 的 UID 精确引用（含归档 Agent）'
+          items:
+            type: object
+            properties:
+              agent: { type: string }
+              agent_uid: { type: string }
+              archived: { type: boolean }
         active_runs: { type: array, items: { type: string, description: run_id } }
 
     OperationView:
@@ -2464,7 +3129,7 @@ components:
       properties:
         operation_id: { type: string }
         action: { type: string }
-        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, system] }
+        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, system] }
         target_id: { type: string }
         actor_subject: { type: string }
         auth_method: { type: string, enum: [bearer, local_trust, cli, migration] }

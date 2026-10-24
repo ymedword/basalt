@@ -2,9 +2,12 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,8 +68,10 @@ func sampleManifest() core.RunResourceManifest {
 	return core.RunResourceManifest{
 		FormatVersion:  1,
 		AgentLifecycle: "active",
-		Provider: core.ResourceVersionRef{
-			Name: "deepseek", VersionID: 11, VersionNo: 2, ContentHash: "aaaaaaaa",
+		Provider: core.ProviderVersionRef{
+			ResourceVersionRef: core.ResourceVersionRef{
+				Name: "deepseek", VersionID: 11, VersionNo: 2, ContentHash: "aaaaaaaa",
+			},
 		},
 		MCPServers: []core.ResourceVersionRef{
 			{Name: "zeta", VersionID: 12, VersionNo: 1, ContentHash: "bbbbbbbb"},
@@ -100,6 +105,33 @@ func seedManifestRow(t *testing.T, db *DB, runID string, m core.RunResourceManif
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		runID, m.FormatVersion, stored, m.AgentLifecycle, string(raw), queryBase.UnixMilli())
 	require.NoError(t, err)
+}
+
+// seedRawManifestRow 直接写入任意清单字节：用于复现历史格式（v1 没有 v2 字段）与
+// 篡改场景。hash 必须与写入时的「hash 值置空」定义一致（testFixture 计算）。
+// seedRawManifestRow inserts raw manifest bytes so legacy shapes and tampering can be
+// reproduced without the current struct.
+func seedRawManifestRow(t *testing.T, db *DB, runID string, formatVersion int, hash, raw string) {
+	t.Helper()
+	_, err := db.write.ExecContext(context.Background(),
+		`INSERT INTO run_resource_manifests
+		   (run_id, format_version, manifest_hash, agent_lifecycle_state, snapshot_json, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, formatVersion, hash, "active", raw, queryBase.UnixMilli())
+	require.NoError(t, err)
+}
+
+// v1ManifestFixture 生成 US-12 之前的清单字节（没有 agent_uid / provider.model /
+// 凭据固定 / notify）与按写入方定义算出的哈希（hash 值置空后的 sha256）。
+// v1ManifestFixture reproduces the pre-v2 payload and the writer's hash definition.
+func v1ManifestFixture() (raw, hash string) {
+	const input = `{"format_version":1,"hash":"","agent_lifecycle_state":"active",` +
+		`"provider":{"name":"demo","version_id":1,"version_no":1,"content_hash":"abc"},` +
+		`"mcp_servers":[],"skills":[]}`
+	sum := sha256.Sum256([]byte(input))
+	hash = hex.EncodeToString(sum[:])
+	raw = strings.Replace(input, `"hash":""`, `"hash":"`+hash+`"`, 1)
+	return raw, hash
 }
 
 // countRowsIn 数某张表的行数（读侧"零写入"判据——只对测试里写死的表名调用）。
@@ -456,6 +488,56 @@ func TestRunQuery_ManifestHashMismatchIsRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "清单哈希不一致")
 	require.False(t, errors.Is(err, core.ErrRunNotFound), "损坏不是不存在")
 	require.Empty(t, detail.RunID, "失败不返回半截详情")
+}
+
+// v1 清单（US-12 之前写入）按存储字节校验：结构体新增 v2 字段不得让历史行变成
+// 「损坏」。对应缺陷：历史 Run 详情 500（实测 13 条 v1 清单）。
+// 对应文档用例：「历史清单格式仍可读」。
+
+func TestRunQuery_GetRunVerifiesLegacyV1ManifestBytes(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000010-jjj000"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-4", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	raw, hash := v1ManifestFixture()
+	seedRawManifestRow(t, db, runID, 1, hash, raw)
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Equal(t, hash, detail.ManifestHash)
+	require.NotNil(t, detail.ResourceManifest)
+	require.Equal(t, 1, detail.ResourceManifest.FormatVersion)
+	require.Equal(t, "demo", detail.ResourceManifest.Provider.Name)
+	require.Empty(t, detail.ResourceManifest.AgentUID, "v1 没有 agent_uid")
+	require.Empty(t, detail.ResourceManifest.Notify.Mode, "v1 没有 notify")
+}
+
+// 清单内容被篡改（哈希列不变）→ 明确错误：校验回放存储字节，不因结构体演进而失效。
+// 对应文档用例：「篡改仍被发现」。
+
+func TestRunQuery_TamperedManifestBytesStillRejected(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000011-kkk111"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-5", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	raw, hash := v1ManifestFixture()
+	tampered := strings.Replace(raw, `"name":"demo"`, `"name":"other"`, 1)
+	require.NotEqual(t, raw, tampered, "夹具必须真的改到字节")
+	seedRawManifestRow(t, db, runID, 1, hash, tampered)
+
+	_, err := store.GetRun(ctx, runID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "清单哈希不一致")
 }
 
 // 概览计数：运行中不受时间窗限制；近 24 小时含端点（now-24h 那一刻算在窗内）；

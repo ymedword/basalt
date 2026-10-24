@@ -60,8 +60,11 @@ func testNotifyChannelRegistration(t *testing.T) {
 	if len(beforeReqs) != 2 {
 		t.Fatalf("登记前 chat 假模型应收到 2 次请求，实际 %d 次", len(beforeReqs))
 	}
+	// R4 起 Run 只冻结定义里声明过的渠道（本阶段未声明，冻结集合为空）：文案说清是
+	// 授权限制而不是"渠道不存在"（agent-md §2.1 的 all_eligible 口径）。
+	// R4 freezes only declared channels; the denial names the authorization limit.
 	requireToolResultContains(t, beforeReqs[1],
-		"通知渠道 ops 不存在（可用渠道：（注册表为空））", "登记前查无")
+		"通知渠道 ops 不在本 Run 冻结的通知渠道集合内", "登记前查无")
 
 	insertNotifyChannel(t, h, notifyChannelName, "webhook", "${"+notifyEnvRef+"}", "演示渠道")
 	if typ, url := notifyChannelRow(t, h, notifyChannelName); typ != "webhook" || url != "${"+notifyEnvRef+"}" {
@@ -167,7 +170,9 @@ func testNotifyAgentDecl(t *testing.T) {
 	if len(reqs) != 2 {
 		t.Fatalf("假模型应收到 2 次请求，实际 %d 次", len(reqs))
 	}
-	requireToolResultContains(t, reqs[1], "通知渠道 ops 不存在", "工具调用落到执行器")
+	// 未登记渠道、也未在定义里声明：Run 冻结集合为空，按授权限制拒绝（R4 口径）。
+	requireToolResultContains(t, reqs[1], "通知渠道 ops 不在本 Run 冻结的通知渠道集合内",
+		"工具调用落到执行器")
 
 	db := openDB(t, h.dbPath())
 	rows := queryRows(t, db, `SELECT tool_name, status, error_kind FROM tool_invocations ORDER BY id`)
@@ -332,16 +337,25 @@ func startServeWithEnv(t *testing.T, h *harness, addr string, env []string) *pro
 	return p
 }
 
-// insertNotifyChannel 直接往临时库插入一行渠道登记（不经工具面）。
-// insertNotifyChannel inserts one channel row directly into the temporary database.
+// insertNotifyChannel 直接往临时库插入一行渠道登记（不经工具面）。v3 起渠道以资源
+// UID 为主键、`scope` 必填（共享渠道对全部 Agent 有资格）、`operation_id` 非空。
+// 登记同时记进夹具的渠道清单：重命令启动前会给声明 `notify` 工具的 Agent 补绑定
+// （R4 起 Run 只冻结定义里声明过的渠道，服务端不按名补绑）。
+// insertNotifyChannel inserts one channel row and registers it for fixture bindings.
 func insertNotifyChannel(t *testing.T, h *harness, name, typ, url, description string) {
 	t.Helper()
+	now := time.Now().UnixMilli()
+	uid := fixtureUID(t, "rs_")
 	db := openDB(t, h.dbPath())
 	if _, err := db.Exec(
-		`INSERT INTO notify_channels(name, type, url, description, created_at) VALUES (?, ?, ?, ?, ?)`,
-		name, typ, url, description, time.Now().UnixMilli()); err != nil {
+		`INSERT INTO notify_channels(resource_uid, name, type, url, url_host,
+		        credential_mode, scope, owner_agent_uid, revision, description,
+		        created_at, updated_at, operation_id)
+		 VALUES (?, ?, ?, ?, '', 'env', 'shared', NULL, 1, ?, ?, ?, 'op-e2e-fixture-notify')`,
+		uid, name, typ, url, description, now, now); err != nil {
 		t.Fatalf("插入渠道行失败: %v", err)
 	}
+	h.recordNotifyChannel(name, uid)
 }
 
 // updateNotifyChannelURL 直接改渠道行的 url（生效时机用）。

@@ -259,3 +259,35 @@ func TestEngine_UnknownZoneFails(t *testing.T) {
 	_, err := e.Add("CRON_TZ=Not/AZone 0 0 8 * * *", func() {})
 	require.Error(t, err, "未知时区不得注册")
 }
+
+// TestParseOccurrences_MatchesEngine：包级 ParseOccurrences 与引擎同一套 6 段解析器
+// 与同一段枚举算法（R6.4.3）——同一 spec / 窗口下结果逐项相同；期望值为独立算出的
+// 字面量（D-16），非法 spec、5 段制式与 limit ≤ 0 都返回 nil。
+// TestParseOccurrences_MatchesEngine shares the six-field parser and enumeration with
+// the engine; invalid specs and non-positive limits yield nil.
+func TestParseOccurrences_MatchesEngine(t *testing.T) {
+	from := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)
+	spec := "CRON_TZ=Asia/Shanghai 0 30 8 * * *"
+
+	got := cronadapter.ParseOccurrences(spec, from, to, 3)
+	// 起点 00:00Z = 上海 08:00，当日 08:30 尚未到达 → 首项是同日的 00:30Z。
+	want := []string{
+		"2026-10-01T00:30:00Z", "2026-10-02T00:30:00Z", "2026-10-03T00:30:00Z",
+	}
+	rendered := make([]string, 0, len(got))
+	for _, at := range got {
+		rendered = append(rendered, at.UTC().Format(time.RFC3339))
+	}
+	require.Equal(t, want, rendered)
+
+	require.Equal(t, newTestEngine().Occurrences(spec, from, to, 3), got,
+		"包级函数与引擎必须共用同一实现")
+
+	require.Nil(t, cronadapter.ParseOccurrences("not-a-cron", from, to, 3), "非法 spec 返回空")
+	require.Nil(t, cronadapter.ParseOccurrences("CRON_TZ=UTC 30 8 * * *", from, to, 3),
+		"5 段制式返回空（6 段解析器）")
+	require.Nil(t, cronadapter.ParseOccurrences(spec, from, to, 0), "limit ≤ 0 返回空")
+	require.Empty(t, cronadapter.ParseOccurrences("CRON_TZ=UTC 0 0 8 * * *", from, from.Add(time.Hour), 3),
+		"窗口内没有触发点 → 空结果、不阻塞")
+}

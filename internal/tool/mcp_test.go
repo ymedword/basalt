@@ -14,9 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -375,10 +379,11 @@ func TestMCPPool_ConnectFailureLogOmitsSensitiveDetail(t *testing.T) {
 }
 
 // TestMCPPool_DialCommandEnvAndDir（约束 17 / 18 / 19 / 27）：检查**构造出的** `exec.Cmd`，
-// 不起真实子进程——command 按空白切分、工作目录 = 工作区根、环境 = 白名单透传 + 声明覆盖
-// （其余清空、永不为 nil）、由 `exec.Command` 创建（`Cancel` 为 nil，非 `CommandContext`）。
+// 不起真实子进程——command 与 args 分开进入 argv、工作目录 = 工作区根、环境 = 白名单透传
+// + 声明覆盖（其余清空、永不为 nil）、由 `exec.Command` 创建（`Cancel` 为 nil，非
+// `CommandContext`）。
 // 逆改点：换回 `exec.CommandContext` → `Cancel` 断言红；拼完整父进程环境 → Env 等值断言红。
-// Inspects the constructed exec.Cmd without starting a process: whitespace-only splitting,
+// Inspects the constructed exec.Cmd without starting a process: command plus args, the
 // workspace root as Dir, whitelist-plus-declared environment, and a nil Cancel.
 func TestMCPPool_DialCommandEnvAndDir(t *testing.T) {
 	t.Setenv("MCP_PROBE_PASS", "process-pass")
@@ -390,7 +395,8 @@ func TestMCPPool_DialCommandEnvAndDir(t *testing.T) {
 	})
 	spec := core.MCPServerConfig{
 		Name:    "gh",
-		Command: "gh-mcp --stdio  extra",
+		Command: "gh-mcp",
+		Args:    []string{"--stdio", "extra"},
 		Env: map[string]string{
 			"MCP_PROBE_OVERRIDE": "declared-override",
 			"GITHUB_TOKEN":       "tok-secret-value",
@@ -398,11 +404,11 @@ func TestMCPPool_DialCommandEnvAndDir(t *testing.T) {
 	}
 
 	transport, err := pool.dialCommand(spec)
-	require.NoError(t, err, "command 只按空白切分，构造阶段不得失败")
+	require.NoError(t, err, "command 与 args 分开传入，构造阶段不得失败")
 	commandTransport, ok := transport.(*mcp.CommandTransport)
 	require.True(t, ok, "dialCommand 必须返回 *mcp.CommandTransport")
 	require.Equal(t, []string{"gh-mcp", "--stdio", "extra"}, commandTransport.Command.Args,
-		"无 shell 引号语义、不得包裹 cmd /c")
+		"参数逐项进入 argv、无 shell 引号语义、不得包裹 cmd /c")
 	require.Equal(t, root, commandTransport.Command.Dir, "子进程工作目录 = 工作区根")
 	require.Equal(t, []string{
 		"MCP_PROBE_PASS=process-pass", // 透传且未被声明覆盖
@@ -857,4 +863,238 @@ func TestMCPPool_ConnectPreservesToolDescriptionAndSchema(t *testing.T) {
 	require.Len(t, specs, 1)
 	require.Equal(t, description, specs[0].Description, "注册池交给模型的描述必须保真")
 	require.JSONEq(t, string(wantSchema), string(specs[0].Parameters), "注册池交给模型的 schema 必须保真")
+}
+
+// TestMCPPool_DialCommandArgsVerbatim（约束 8）：`Args` 逐项原样进入 argv——含空白的
+// 参数保持为**单个** argv 元素，不重新切分、不加引号、不经 shell。
+// 逆改点：恢复 `strings.Fields(spec.Command)` 或把 Args 拼成一串 → 等值断言红。
+// Args enter argv one-for-one; arguments containing spaces stay single elements.
+func TestMCPPool_DialCommandArgsVerbatim(t *testing.T) {
+	pool := NewMCPPool(MCPPoolOptions{Root: t.TempDir()})
+	spec := core.MCPServerConfig{
+		Name:    "verbatim",
+		Command: "mcp-server",
+		Args: []string{
+			"--config=dir with space/config.yaml",
+			"hello world",
+			"--token=${MCP_TOKEN}",
+			"",
+		},
+	}
+
+	transport, err := pool.dialCommand(spec)
+	require.NoError(t, err)
+	command := transport.(*mcp.CommandTransport).Command
+	require.Equal(t, []string{
+		"mcp-server",
+		"--config=dir with space/config.yaml",
+		"hello world",
+		"--token=${MCP_TOKEN}",
+		"",
+	}, command.Args, "argv[0] = command，其余逐项等于 Args（空串也保留）")
+	require.Nil(t, command.Cancel, "exec.Command 创建——进程不绑握手预算")
+}
+
+// TestMCPPool_DialCommandNoWhitespaceSplitting（约束 8 / 47）：工具层**不再**对 command
+// 做空白拆分——多词字符串到达本层时原样作为单个 argv[0]（拆分只在解析层的旧文件兼容
+// 路径发生，且已带 WARN）。
+// 逆改点：恢复 `strings.Fields` → argv 长度断言红（一个元素变成三个）。
+// The tool layer performs no whitespace splitting: a multi-word command is one argv[0].
+func TestMCPPool_DialCommandNoWhitespaceSplitting(t *testing.T) {
+	pool := NewMCPPool(MCPPoolOptions{Root: t.TempDir()})
+	const legacy = "npx -y @scope/server"
+
+	transport, err := pool.dialCommand(core.MCPServerConfig{Name: "legacy", Command: legacy})
+	require.NoError(t, err)
+	command := transport.(*mcp.CommandTransport).Command
+	require.Equal(t, []string{legacy}, command.Args, "工具层不得按空白拆分 command")
+	require.Len(t, command.Args, 1, "argv 只有一个元素")
+}
+
+// TestMCPPool_DialCommandEmptyCommand：空白 command 在构造期 fail-closed（空 argv[0]
+// 会让 exec 报出与配置无关的系统错误，失去可诊断性）。
+// An empty or blank command fails at construction instead of reaching exec.
+func TestMCPPool_DialCommandEmptyCommand(t *testing.T) {
+	pool := NewMCPPool(MCPPoolOptions{Root: t.TempDir()})
+	for _, command := range []string{"", "   ", "\t"} {
+		_, err := pool.dialCommand(core.MCPServerConfig{Name: "empty", Command: command})
+		require.Error(t, err, "空白 command 必须拒绝：%q", command)
+		require.Contains(t, err.Error(), "command 为空")
+	}
+}
+
+// TestMCPPool_DialCommandCapturesSnapshotAtCallTime：argv 是调用时刻对配置快照的**拷贝**——
+// supervisor 之后修改快照里的 Args 不得改变已构造的命令（工具来源 = supervisor 快照，
+// 不是进程级全局，M8）。
+// 逆改点：把 Args 直接赋给 Cmd.Args → 快照后修改会穿透到已构造命令，断言红。
+// argv is a copy of the snapshot at call time; later snapshot mutations do not leak in.
+func TestMCPPool_DialCommandCapturesSnapshotAtCallTime(t *testing.T) {
+	pool := NewMCPPool(MCPPoolOptions{Root: t.TempDir()})
+	args := []string{"--stdio"}
+
+	transport, err := pool.dialCommand(core.MCPServerConfig{Name: "snap", Command: "mcp", Args: args})
+	require.NoError(t, err)
+	args[0] = "--mutated-after-dial"
+
+	command := transport.(*mcp.CommandTransport).Command
+	require.Equal(t, []string{"mcp", "--stdio"}, command.Args,
+		"已构造命令必须保留调用时刻的取参快照")
+}
+
+// TestMCPPool_ConnectToolsFollowSnapshot：工具集合只来自本次快照建立的连接——换一份快照
+// 再连接时，返回的工具随之替换，旧工具不残留（否证「进程级全局」；M8）。
+// The tool set follows the snapshot of each Connect call; no process-global residue.
+func TestMCPPool_ConnectToolsFollowSnapshot(t *testing.T) {
+	newToolPair := func(name string) mcp.Transport {
+		return testutil.NewInMemoryMCPPair(t, 0, testutil.MCPTestTool{
+			Name:        name,
+			Description: "快照探针 " + name,
+			Schema:      map[string]any{"type": "object"},
+			Handler: func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: name}}}, nil
+			},
+		})
+	}
+	transports := map[string]mcp.Transport{
+		"old": newToolPair("old_tool"),
+		"new": newToolPair("new_tool"),
+	}
+	pool := NewMCPPool(MCPPoolOptions{Logger: slog.New(slog.DiscardHandler), Root: t.TempDir()})
+	pool.dial = func(spec core.MCPServerConfig) (mcp.Transport, error) {
+		return transports[spec.Name], nil
+	}
+	t.Cleanup(func() { require.NoError(t, pool.Close()) })
+
+	first, err := pool.Connect(context.Background(),
+		[]core.MCPServerConfig{{Name: "old", Command: "old-mcp"}})
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.Len(t, first[0].Tools, 1)
+	require.Equal(t, "old_tool", first[0].Tools[0].Name())
+
+	second, err := pool.Connect(context.Background(),
+		[]core.MCPServerConfig{{Name: "new", Command: "new-mcp"}})
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	require.Equal(t, "new", second[0].Server)
+	require.Len(t, second[0].Tools, 1)
+	require.Equal(t, "new_tool", second[0].Tools[0].Name(), "工具集合随快照替换")
+}
+
+// —— US-12：进程树回收（约束 19 / 22）——
+// Process-tree reaping added by US-12.
+
+// 进程树用例的辅助角色：同一测试二进制按环境变量重入（父 → 孙两层），不依赖 shell
+// 或平台工具，Windows 与 Unix 走同一套断言。
+// The tree test re-enters the same test binary as parent and grandchild so one portable
+// assertion covers both platforms.
+const (
+	treeRoleEnv        = "BASALT_MCP_TREE_ROLE"
+	treeBeatEnv        = "BASALT_MCP_TREE_BEAT"
+	treeRoleParent     = "parent"
+	treeRoleGrandchild = "grandchild"
+)
+
+// TestMCPPool_KillProcessTree：整树终止必须连**孙进程**一起收掉——只杀直接子进程会
+// 留下继续写心跳的孤儿。逆改点：把 killMCPProcessTree 改成只 `Process.Kill()` →
+// 父进程死后孙进程继续写，末尾等值断言红。
+// Killing the tree must also reap the grandchild; a direct-child kill leaves a live
+// orphan writing heartbeats, which turns the size-equality assertion red.
+func TestMCPPool_KillProcessTree(t *testing.T) {
+	switch os.Getenv(treeRoleEnv) {
+	case treeRoleParent:
+		runTreeParent()
+		return
+	case treeRoleGrandchild:
+		runTreeGrandchild()
+		return
+	}
+
+	beat := filepath.Join(t.TempDir(), "beat.txt")
+	pidFile := beat + ".pid"
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPPool_KillProcessTree$")
+	cmd.Env = append(os.Environ(), treeRoleEnv+"="+treeRoleParent, treeBeatEnv+"="+beat)
+	// 与生产路径同一配置：Unix 独立进程组，Windows 空操作（整树由 taskkill 遍历）。
+	configureMCPChildProcess(cmd)
+	require.NoError(t, cmd.Start())
+	defer func() {
+		// 兜底清理：断言失败时也不得留下孤儿（先读孙进程 PID，再收父进程）。
+		if pid := readTreePID(pidFile); pid > 0 {
+			if process, err := os.FindProcess(pid); err == nil {
+				_ = process.Kill()
+			}
+		}
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(beat)
+		return err == nil && info.Size() > 2
+	}, 10*time.Second, 20*time.Millisecond, "辅助进程未能开始心跳")
+
+	require.NoError(t, killMCPProcessTree(cmd))
+	// 收尸放在 defer：若整树回收失效，父进程仍在等孙进程，这里调用 Wait 会挂死，
+	// 心跳断言就永远轮不到执行（红态必须是逐字断言，不是超时）。
+	time.Sleep(400 * time.Millisecond)
+	sizeAfterKill := treeBeatSize(t, beat)
+	time.Sleep(400 * time.Millisecond)
+	require.Equal(t, sizeAfterKill, treeBeatSize(t, beat),
+		"孙进程仍在写心跳——进程树未被整棵回收")
+}
+
+// runTreeParent 是父角色：再拉起一个孙角色进程并等它退出（等不到就说明整树没被收）。
+// runTreeParent spawns the grandchild role and waits; it never returns while the grandchild lives.
+func runTreeParent() {
+	beat := os.Getenv(treeBeatEnv)
+	child := exec.Command(os.Args[0], "-test.run=^TestMCPPool_KillProcessTree$")
+	child.Env = append(os.Environ(), treeRoleEnv+"="+treeRoleGrandchild, treeBeatEnv+"="+beat)
+	if err := child.Start(); err != nil {
+		os.Exit(3)
+	}
+	_ = child.Wait()
+	os.Exit(0)
+}
+
+// runTreeGrandchild 是孙角色：写一次 PID，然后持续追加心跳（10ms 一次）。
+// runTreeGrandchild records its pid and appends a heartbeat every 10ms.
+func runTreeGrandchild() {
+	beat := os.Getenv(treeBeatEnv)
+	if err := os.WriteFile(beat+".pid", []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(3)
+	}
+	for {
+		file, err := os.OpenFile(beat, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			os.Exit(4)
+		}
+		_, _ = file.WriteString("x")
+		_ = file.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// readTreePID 读孙进程 PID；文件未就绪返回 0。
+// readTreePID returns the grandchild pid, or 0 before the file exists.
+func readTreePID(path string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+// treeBeatSize 读心跳文件大小（继续增长 = 孙进程还活着）。
+// treeBeatSize reads the heartbeat size; a growing size means the grandchild lives.
+func treeBeatSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info.Size()
 }

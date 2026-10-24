@@ -1,17 +1,22 @@
-// 路由单元用例：十二条固定路径、未知路径 404、next 清洗与 History API 导航（约束 41）。
-// Router unit tests: the twelve fixed paths, unknown-path 404, `next` sanitizing and
-// History API navigation.
+// 路由单元用例：US-11 的十二条固定路径 + US-12 的五条新路径 + R7 会话深链、
+// 静态段先于动态段、未知路径 404、next 清洗与 History API 导航（约束 41 /
+// 卡片 §3.1.10；配置页 `agents/:name/config` 与深链
+// `agents/:name/sessions/:id` 分属两次受控新增）。
+// Router unit tests: twelve US-11 paths, five US-12 paths and the R7 session deep
+// link, static-before-dynamic matching, unknown-path 404, `next` sanitizing.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   CONSOLE_BASE,
   ConsoleRouter,
   RESOURCE_KINDS,
+  agentConfigHref,
   agentHref,
   loginPath,
   matchRoute,
   resourceHref,
   runHref,
   safeNextPath,
+  sessionHref,
 } from '../src/router'
 import type { RouteMatch } from '../src/router'
 
@@ -20,16 +25,22 @@ function resetLocation(path: string): void {
 }
 
 describe('matchRoute', () => {
-  it('matches the twelve approved console paths', () => {
-    // 十二条固定路径逐条命中（约束 41，UI-R2 扩展批准）。
+  it('matches the eighteen approved console paths', () => {
+    // 十二条 US-11 固定路径 + 五条 US-12 新路径 + R7 会话深链逐条命中。
     const cases: Array<[string, string]> = [
       ['/console/', 'overview'],
       ['/console/login', 'login'],
       ['/console/agents', 'agents'],
+      ['/console/agents/new', 'agents-new'],
       ['/console/agents/reporter', 'agent-detail'],
+      ['/console/agents/reporter/config', 'agent-config'],
+      ['/console/agents/reporter/sessions/s-1', 'agent-session'],
       ['/console/runs', 'runs'],
       ['/console/runs/run-1', 'run-detail'],
       ['/console/resources/skills', 'resources'],
+      ['/console/resources/skills/skill-1', 'resource-detail'],
+      ['/console/archived', 'archived'],
+      ['/console/workspace', 'workspace'],
       ['/console/operations', 'operations'],
       ['/console/library/tools', 'tools'],
       ['/console/library/memory', 'memory'],
@@ -38,6 +49,48 @@ describe('matchRoute', () => {
     ]
     for (const [path, name] of cases) {
       expect(matchRoute(path).name, path).toBe(name)
+    }
+  })
+
+  it('matches agents/new before the agent-detail dynamic segment', () => {
+    // 静态段先于动态段：`/console/agents/new` 不得被当成名为 "new" 的 Agent 页面。
+    const create = matchRoute('/console/agents/new')
+    expect(create.name).toBe('agents-new')
+    expect(create.params).toEqual({})
+    expect(matchRoute('/console/agents/new/extra').name).toBe('not-found')
+  })
+
+  it('matches the config page without shadowing the agent detail route', () => {
+    // 配置页三段、详情页两段：段数不同互不抢占；名字仍按段解码。
+    const config = matchRoute('/console/agents/a%2Fb/config')
+    expect(config.name).toBe('agent-config')
+    expect(config.params.name).toBe('a/b')
+    expect(matchRoute('/console/agents/a%2Fb').name).toBe('agent-detail')
+    // 尾段不是 config 时仍按 404：不为配置页开前缀匹配。
+    expect(matchRoute('/console/agents/reporter/config/extra').name).toBe('not-found')
+  })
+
+  it('matches the session deep link without shadowing agent detail or config', () => {
+    // 深链四段：与详情页（两段）、配置页（三段）互不抢占；两个参数都按段解码。
+    const session = matchRoute('/console/agents/a%2Fb/sessions/s%2F1')
+    expect(session.name).toBe('agent-session')
+    expect(session.params.name).toBe('a/b')
+    expect(session.params.id).toBe('s/1')
+    expect(matchRoute('/console/agents/a%2Fb/sessions').name).toBe('not-found')
+    expect(matchRoute('/console/agents/a%2Fb/sessions/s-1/extra').name).toBe('not-found')
+    // 会话深链的空 id 与非法编码都落到 404。
+    expect(matchRoute('/console/agents/reporter/sessions/').name).toBe('not-found')
+    expect(matchRoute('/console/agents/reporter/sessions/%E0%A4%A').name).toBe('not-found')
+  })
+
+  it('validates the kind on resource detail and decodes the id', () => {
+    // 详情页复用固定三值：未知 kind 落到 404；id 按段解码。
+    expect(matchRoute('/console/resources/widgets/1').name).toBe('not-found')
+    for (const kind of RESOURCE_KINDS) {
+      const match = matchRoute(`/console/resources/${kind}/a%2Fb`)
+      expect(match.name).toBe('resource-detail')
+      expect(match.params.kind).toBe(kind)
+      expect(match.params.id).toBe('a/b')
     }
   })
 
@@ -120,9 +173,11 @@ describe('loginPath and hrefs', () => {
     expect(loginPath('https://evil.example')).toBe('/console/login')
   })
 
-  it('encodes agent and run identifiers', () => {
+  it('encodes agent, run and session identifiers', () => {
     expect(agentHref('a b')).toBe('/console/agents/a%20b')
+    expect(agentConfigHref('a b')).toBe('/console/agents/a%20b/config')
     expect(runHref('run/1')).toBe('/console/runs/run%2F1')
+    expect(sessionHref('a b', 's/1')).toBe('/console/agents/a%20b/sessions/s%2F1')
     expect(resourceHref('mcp-servers')).toBe('/console/resources/mcp-servers')
   })
 })

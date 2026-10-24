@@ -667,6 +667,68 @@ func TestRecovery_RepairsGroupsWithUnknownRun(t *testing.T) {
 
 // ---- 运行资源账（约束 19 的恢复面） -----------------------------------------
 
+// recoveryLedgerManifest 在资源账夹具上再冻结一个托管凭据与两个通知渠道：正常收尾
+// `FinishRun` 释放三张引用表（资源 / 凭据 / 通知），恢复必须逐表同口径——只释放资源行
+// 会让已失败的 Run 永远点名凭据与渠道。
+// recoveryLedgerManifest adds a managed credential pin and two notify channels on top of
+// the resource fixture so all three reference tables hold unreleased rows.
+func recoveryLedgerManifest(t *testing.T, fx runManifestFixture) core.RunResourceManifest {
+	t.Helper()
+	resolved := fx.resolved
+	resolved.ProviderCredential = core.CredentialPin{
+		Mode:          core.CredentialModeManaged,
+		ID:            testCredentialID('C'),
+		Version:       1,
+		TargetBinding: testTargetBinding,
+	}
+	resolved.Notify = core.NotifyManifest{
+		Mode: core.NotifyModeAllEligible,
+		Channels: []core.NotifyChannelRef{
+			{Name: "ops", ResourceUID: testResourceUID('D')},
+			{Name: "mail", ResourceUID: testResourceUID('E')},
+		},
+	}
+	manifest, err := core.BuildRunResourceManifest(testAgentUID, core.AgentActive, resolved)
+	require.NoError(t, err)
+	return manifest
+}
+
+// requireRunLedgerReleased 判定三张引用表全部已释放或全部仍未释放——恢复的事务把
+// 资源引用、凭据固定与渠道冻结当一个整体，任何一张表单独落单都是中间态。
+// requireRunLedgerReleased checks the three reference tables share one terminal state.
+func requireRunLedgerReleased(t *testing.T, db *DB, runID string, wantReleased bool) {
+	t.Helper()
+	refs := readRunRefRows(t, db, runID)
+	require.Len(t, refs, 4)
+	for _, ref := range refs {
+		require.Equal(t, wantReleased, ref.ReleasedAt.Valid,
+			"运行资源引用的释放状态不符（%s/%s）", ref.Kind, ref.ResourceID)
+		if wantReleased {
+			require.Equal(t, fixedNow.UnixMilli(), ref.ReleasedAt.Int64)
+		}
+	}
+
+	pins, err := NewRunCredentialStore(db).Pins(context.Background(), runID)
+	require.NoError(t, err)
+	require.Len(t, pins, 1, "托管凭据固定必须随准入写入")
+	require.Equal(t, wantReleased, pins[0].ReleasedAt != nil,
+		"凭据固定的释放状态必须与资源引用一致")
+	if wantReleased {
+		require.Equal(t, fixedNow.UnixMilli(), *pins[0].ReleasedAt)
+	}
+
+	channels, err := NewNotifyDeliveryStore(db).Refs(context.Background(), runID)
+	require.NoError(t, err)
+	require.Len(t, channels, 2, "渠道冻结必须随准入写入")
+	for _, channel := range channels {
+		require.Equal(t, wantReleased, channel.ReleasedAt != nil,
+			"渠道冻结的释放状态必须与资源引用一致（%s）", channel.ChannelName)
+		if wantReleased {
+			require.Equal(t, fixedNow.UnixMilli(), *channel.ReleasedAt)
+		}
+	}
+}
+
 // TestRecovery_ClosesRunningRunsAndReleasesRefs —— 崩溃收尾与引用释放必须同事务：
 // 正常路径一起提交（Run 终态 + 引用已释放）；释放失败时一起回滚（Run 保持 running，
 // 等下次启动重扫），不得留下"Run 已 failed、版本却仍被引用"的中间态。
@@ -677,9 +739,9 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 
 	t.Run("closes_and_releases", func(t *testing.T) {
 		db := openTempDB(t)
-		fx := seedRunManifest(t, db)
+		manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 		rec := startRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
 
 		report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
 		require.NoError(t, err)
@@ -690,20 +752,14 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 		require.Equal(t, recoveryCloseReason, row.Reason.String)
 		require.Equal(t, fixedNow.UnixMilli(), row.FinishedAt.Int64)
 
-		refs := readRunRefRows(t, db, rec.RunID)
-		require.Len(t, refs, 4)
-		for _, ref := range refs {
-			require.True(t, ref.ReleasedAt.Valid,
-				"崩溃收尾必须同事务释放引用（%s/%s）", ref.Kind, ref.ResourceID)
-			require.Equal(t, fixedNow.UnixMilli(), ref.ReleasedAt.Int64)
-		}
+		requireRunLedgerReleased(t, db, rec.RunID, true)
 	})
 
 	t.Run("release_failure_keeps_run_running", func(t *testing.T) {
 		db := openTempDB(t)
-		fx := seedRunManifest(t, db)
+		manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 		rec := startRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
 
 		_, err := db.write.ExecContext(ctx, `CREATE TRIGGER recovery_block_release
 		    BEFORE UPDATE ON run_resource_refs
@@ -722,10 +778,7 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 
 		require.Equal(t, string(core.StatusRunning), loadRunStatus(t, db.write, rec.RunID),
 			"释放失败 → 整个收尾事务回滚，Run 保持 running 等下次重扫")
-		for _, ref := range readRunRefRows(t, db, rec.RunID) {
-			require.False(t, ref.ReleasedAt.Valid,
-				"回滚后引用仍未释放：%s/%s", ref.Kind, ref.ResourceID)
-		}
+		requireRunLedgerReleased(t, db, rec.RunID, false)
 	})
 }
 
@@ -737,9 +790,9 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 	ctx := context.Background()
 	db := openTempDB(t)
-	fx := seedRunManifest(t, db)
+	manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 	rec := startRow("web")
-	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
 
 	// 模拟"终态已写、释放没跑到"的残留：直接改状态列，不走 FinishRun（它会连带释放）。
 	settled := fixedStart.Add(10 * time.Minute)
@@ -757,13 +810,7 @@ func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 	require.Equal(t, "人工修库留下的终态", row.Reason.String)
 	require.Equal(t, settled.UnixMilli(), row.FinishedAt.Int64)
 
-	refs := readRunRefRows(t, db, rec.RunID)
-	require.Len(t, refs, 4)
-	for _, ref := range refs {
-		require.True(t, ref.ReleasedAt.Valid,
-			"终态 Run 的残留引用必须被补齐释放（%s/%s）", ref.Kind, ref.ResourceID)
-		require.Equal(t, fixedNow.UnixMilli(), ref.ReleasedAt.Int64)
-	}
+	requireRunLedgerReleased(t, db, rec.RunID, true)
 }
 
 // TestRecovery_DoesNotFabricateResourceLedger —— 恢复收尾历史运行（本能力之前产生的、

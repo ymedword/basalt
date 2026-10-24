@@ -1,7 +1,10 @@
-// History API 自实现路由（约束 41，UI-R2 扩展批准）：十二条路径 + 404 视图，不引入第三方路由库。
-// popstate 恢复视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
-// A hand-written History API router: eight fixed paths plus the 404 view, with
-// popstate restoration and a leave guard for unsaved edits.
+// History API 自实现路由（约束 41，UI-R2 扩展批准）：US-11 的十二条路径 + US-12 的
+// 五条新路径（`agents/new`、`agents/:name/config`、`resources/:kind/:id`、`archived`、
+// `workspace`）+ 会话详情深链（`agents/:name/sessions/:id`，R7）+ 404 视图，不引入
+// 第三方路由库；静态段先于动态段。popstate 恢复视图，未知路径渲染 404；离开守卫承载
+// 「未保存编辑离开前确认」。
+// A hand-written History API router: twelve US-11 paths, the five US-12 paths, the R7
+// session deep link, and the 404 view, matching static segments before dynamic ones.
 
 /** 管理台路径前缀；服务端对 /console/* 非静态资源一律回退 index.html。 */
 export const CONSOLE_BASE = '/console'
@@ -10,10 +13,16 @@ export type RouteName =
   | 'overview'
   | 'login'
   | 'agents'
+  | 'agents-new'
   | 'agent-detail'
+  | 'agent-config'
+  | 'agent-session'
   | 'runs'
   | 'run-detail'
   | 'resources'
+  | 'resource-detail'
+  | 'archived'
+  | 'workspace'
   | 'operations'
   | 'tools'
   | 'memory'
@@ -52,10 +61,26 @@ const ROUTES: readonly RoutePattern[] = [
   { name: 'overview', segments: [] },
   { name: 'login', segments: ['login'] },
   { name: 'agents', segments: ['agents'] },
+  // 静态段 `agents/new` 必须排在动态段 `agents/:name` 之前：否则创建页会被当成
+  // 名为 "new" 的 Agent 页面（卡片 §3.1.10 的匹配顺序）。
+  // Static `agents/new` precedes `agents/:name`, or the create page would be read as
+  // an agent literally named "new".
+  { name: 'agents-new', segments: ['agents', 'new'] },
+  // 结构化配置页（T145）：三段静态尾段 `config`，与 `agents/:name` 段数不同，
+  // 但仍排在动态段之后，保持“静态先于动态”的阅读顺序。
+  // The structured-config page shares the `agents` prefix but has one more segment.
+  { name: 'agent-config', segments: ['agents', ':name', 'config'] },
+  // 会话详情深链（R7）：四段路径，刷新 / 分享 / 前进后退都回到同一条会话；
+  // 内联面板在长列表底部才出现，深链是它的替代入口。
+  // The session deep link keeps refresh, sharing and history on one session.
+  { name: 'agent-session', segments: ['agents', ':name', 'sessions', ':id'] },
   { name: 'agent-detail', segments: ['agents', ':name'] },
   { name: 'runs', segments: ['runs'] },
   { name: 'run-detail', segments: ['runs', ':id'] },
   { name: 'resources', segments: ['resources', ':kind'] },
+  { name: 'resource-detail', segments: ['resources', ':kind', ':id'] },
+  { name: 'archived', segments: ['archived'] },
+  { name: 'workspace', segments: ['workspace'] },
   { name: 'operations', segments: ['operations'] },
   { name: 'tools', segments: ['library', 'tools'] },
   { name: 'memory', segments: ['library', 'memory'] },
@@ -131,7 +156,7 @@ export function matchRoute(url: string): RouteMatch {
     if (!matched) {
       continue
     }
-    if (route.name === 'resources') {
+    if (route.name === 'resources' || route.name === 'resource-detail') {
       const kind = params.kind ?? ''
       if (!isResourceKind(kind)) {
         return notFound
@@ -204,12 +229,28 @@ export function agentHref(name: string): string {
   return `${CONSOLE_BASE}/agents/${encodeURIComponent(name)}`
 }
 
+/** Agent 结构化配置页（字段与资源绑定）；原文编辑仍在 agentHref。 */
+export function agentConfigHref(name: string): string {
+  return `${CONSOLE_BASE}/agents/${encodeURIComponent(name)}/config`
+}
+
 export function runHref(runId: string): string {
   return `${CONSOLE_BASE}/runs/${encodeURIComponent(runId)}`
 }
 
+/** 会话详情深链：刷新、分享与浏览器历史都落在同一条会话上（R7）。 */
+export function sessionHref(agent: string, sessionId: string): string {
+  return `${CONSOLE_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(sessionId)}`
+}
+
 export function resourceHref(kind: ResourceKind): string {
   return `${CONSOLE_BASE}/resources/${kind}`
+}
+
+/** 资源详情（版本 / 修改 / 删除）：列表里的名字直接指向它。 */
+// Resource detail (versions, edit, delete); list names link straight to it.
+export function resourceDetailHref(kind: ResourceKind, id: string): string {
+  return `${CONSOLE_BASE}/resources/${kind}/${encodeURIComponent(id)}`
 }
 
 type RouteListener = (match: RouteMatch) => void

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -87,7 +88,10 @@ const (
 	ruleScheme                = "出网 scheme 不被允许"
 	guidanceScheme            = "只允许 http / https（代码固定，配置放行不了）；没有配置键可以加。"
 	ruleDomainNotAllowed      = "域名不在白名单"
-	guidanceDomainNotAllowed  = "如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。"
+	// R8 裁决 2：白名单改为管理台可写并热生效，指引**不得**再让模型等人「改配置并重启」。
+	// The allowlist is edited in the console and applied live; the guidance no longer
+	// tells anyone to edit config and restart.
+	guidanceDomainNotAllowed = "如需访问，请联系管理员在管理台「执行环境」页把该域名加入网络域名白名单，保存后立即生效，无需重启。"
 	// 端口档（口径 15，2026-10-17 用户裁决冻结）：只允许 scheme 的默认端口；放行通道
 	// 归扩展阶段——指引**不得**指向域名白名单（它管 host、不管端口）。
 	ruleNonDefaultPort     = "出网目标端口不在默认档"
@@ -111,13 +115,25 @@ type PolicyOptions struct {
 
 // WhitelistPolicy 是 v1 唯一的授权实现（技术方案 §4.3 授权矩阵 + §2.3 流程 F）：
 // 只看"谁、要碰什么"——`Action` 没有 argv 字段，形态类校验属执行侧（`LocalRunner`）。
-// WhitelistPolicy authorizes by "who touches what" only; shape checks belong to the runner.
+// 出网域名白名单是**唯一可热替换**的一档（R8 裁决 2）：其余三档仍是装配期快照。
+// WhitelistPolicy authorizes by "who touches what" only. The outbound domain allowlist
+// is the only hot-swappable dimension; the other three stay construction-time snapshots.
 type WhitelistPolicy struct {
 	root            string
 	crossAgentRead  map[string]struct{}
 	allowedCommands map[string]struct{}
 	interpreters    map[string]struct{}
-	allowedDomains  []string
+	// domains 以原子指针持有整份规则快照：保存成功后一次 `Store` 即对**下一次判定**
+	// 生效，读方不加锁、也不会看到半份新规则。`nil` 表示空规则（全部拒绝）。
+	// domains holds an immutable rule snapshot behind an atomic pointer so a swap is
+	// visible to the very next check without locking or partial state.
+	domains atomic.Pointer[domainRules]
+}
+
+// domainRules 是不可变的域名规则快照：条目已按小写、去首尾空白、去重、升序规整。
+// domainRules is the immutable, normalized snapshot swapped on save.
+type domainRules struct {
+	entries []string
 }
 
 // 编译期断言：调用方只依赖 `core.Policy`，换实现只动装配处（宪法 VI）。
@@ -132,7 +148,6 @@ func NewWhitelistPolicy(opts PolicyOptions) *WhitelistPolicy {
 		crossAgentRead:  make(map[string]struct{}, len(opts.CrossAgentRead)),
 		allowedCommands: make(map[string]struct{}, len(opts.AllowedCommands)),
 		interpreters:    make(map[string]struct{}, len(opts.Interpreters)),
-		allowedDomains:  slices.Clone(opts.AllowedDomains),
 	}
 	for _, name := range opts.CrossAgentRead {
 		policy.crossAgentRead[name] = struct{}{}
@@ -143,7 +158,48 @@ func NewWhitelistPolicy(opts PolicyOptions) *WhitelistPolicy {
 	for _, name := range opts.Interpreters {
 		policy.interpreters[name] = struct{}{}
 	}
+	policy.SetAllowedDomains(opts.AllowedDomains)
 	return policy
+}
+
+// SetAllowedDomains 原子替换出网域名规则：调用方已做过严格校验与规整（服务层），
+// 这里再做一次幂等的宽松规整，保证手工装配（CLI / 测试）也能得到同一份形状。
+// 传入 `nil` 表示空规则——受此策略约束的出站请求全部拒绝。
+// SetAllowedDomains swaps the outbound rule snapshot atomically; nil means deny-all.
+func (p *WhitelistPolicy) SetAllowedDomains(domains []string) {
+	normalized := make([]string, 0, len(domains))
+	for _, entry := range domains {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		normalized = append(normalized, entry)
+	}
+	slices.Sort(normalized)
+	normalized = slices.Compact(normalized)
+	p.domains.Store(&domainRules{entries: normalized})
+}
+
+// AllowedDomains 返回当前生效规则的副本（供视图投影；调用方改动不影响内部快照）。
+// AllowedDomains returns a copy of the live rules for the view layer.
+func (p *WhitelistPolicy) AllowedDomains() []string {
+	rules := p.domains.Load()
+	if rules == nil {
+		return []string{}
+	}
+	return slices.Clone(rules.entries)
+}
+
+// AllowsHost 只判出网规则的域名档：主机名是否在当前生效快照内。MCP http 长连接的
+// 撤销复判经它做——匹配器只有这一份，撤销与逐跳判定不可能分叉（通配 `*.suffix`
+// 只覆盖子域，不覆盖裸后缀）。scheme / 端口不是本方法的事。
+// AllowsHost judges the domain rule alone; MCP link revocation reuses this very
+// matcher so revocation and per-hop checks cannot drift apart.
+func (p *WhitelistPolicy) AllowsHost(host string) bool {
+	if p == nil {
+		return false
+	}
+	return p.domainAllowed(host)
 }
 
 // Check 判定一个动作是否放行；拒绝一律返回 `*core.SandboxViolationError`（四段式文案，
@@ -354,7 +410,11 @@ func defaultPortFor(scheme string) (int, bool) {
 // Domain matching is case-insensitive; a `*.suffix` entry covers subdomains only.
 func (p *WhitelistPolicy) domainAllowed(host string) bool {
 	host = strings.ToLower(host)
-	for _, entry := range p.allowedDomains {
+	rules := p.domains.Load()
+	if rules == nil {
+		return false
+	}
+	for _, entry := range rules.entries {
 		entry = strings.ToLower(strings.TrimSpace(entry))
 		if entry == "" {
 			continue
@@ -422,11 +482,12 @@ func (p *WhitelistPolicy) withinBoundSkillDir(real string, dirs []string) bool {
 	return false
 }
 
-// boundSkillDir 把一处 `storage_path` 字面量投影为策略根下的真实目录；形态不在契约内
-// （缺 `.basalt/` 前缀 / 层级不是 `versions/skills/<name>/<no>` / 名字或版本号非法 /
-// 投影失败）一律 false——绑定面不接受"差不多"的路径。
-// boundSkillDir projects one storage_path literal onto a real directory; anything that is
-// not exactly the contract shape is refused.
+// boundSkillDir 把一处 `storage_path` 字面量投影为策略根下的真实目录；两种契约形态都认
+// ——新的身份分段 `versions/skills/<name>/<resource_uid>/<no>` 与旧扁平
+// `versions/skills/<name>/<no>`（历史 Run 的绑定）。形态不在契约内（缺 `.basalt/` 前缀 /
+// 名字、身份或版本号非法 / 投影失败）一律 false——绑定面不接受"差不多"的路径。
+// boundSkillDir projects one storage_path literal onto a real directory; both the
+// identity-segmented and the legacy flat shapes are accepted, anything else is refused.
 func (p *WhitelistPolicy) boundSkillDir(dir string) (string, bool) {
 	clean := filepath.Clean(filepath.FromSlash(strings.TrimSpace(dir)))
 	if clean == "." || filepath.IsAbs(clean) {
@@ -437,14 +498,24 @@ func (p *WhitelistPolicy) boundSkillDir(dir string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(rest, string(filepath.Separator))
-	if len(parts) != 4 || parts[0] != versionsDirName || parts[1] != skillsDirName {
+	if len(parts) != 4 && len(parts) != 5 {
+		return "", false
+	}
+	if parts[0] != versionsDirName || parts[1] != skillsDirName {
 		return "", false
 	}
 	if !validSingleName(parts[2]) {
 		return "", false
 	}
-	version, err := strconv.Atoi(parts[3])
-	if err != nil || version < 1 || strconv.Itoa(version) != parts[3] {
+	if len(parts) == 5 {
+		uid, err := core.ParseResourceUID(parts[3])
+		if err != nil || string(uid) != parts[3] {
+			return "", false
+		}
+	}
+	versionPart := parts[len(parts)-1]
+	version, err := strconv.Atoi(versionPart)
+	if err != nil || version < 1 || strconv.Itoa(version) != versionPart {
 		return "", false
 	}
 	real, err := resolveRealPath(p.root, rest)

@@ -96,8 +96,76 @@ func TestNotifyRead_UnparseableURLsYieldEmptyHost(t *testing.T) {
 	require.Len(t, env.Data, 4)
 	for _, item := range env.Data {
 		require.Empty(t, item.URLHost, "%s 的地址解析不出 scheme+host，必须是空串", item.Name)
+		if item.Name == "empty" {
+			require.False(t, item.URLConfigured, "空地址 = 没有地址引用")
+		} else {
+			// `${VAR}` 引用解析不出 host，但存储里**有**地址引用——页面不得据此
+			// 显示"地址为空"（US-12 用户反馈的直接判据）。
+			require.True(t, item.URLConfigured,
+				"%s 存储里有地址引用，url_configured 与 url_host 不同义", item.Name)
+		}
 	}
 	require.NotContains(t, rec.Body.String(), "BASALT_WEBHOOK_URL", "环境变量引用名也不得回显")
+}
+
+// fakeNotifyReferences 是按渠道名分组的引用端口假件。
+// fakeNotifyReferences is a programmable reference reader keyed by channel name.
+type fakeNotifyReferences struct {
+	refs map[string][]string
+	err  error
+}
+
+func (f fakeNotifyReferences) NotifyReferences(_ context.Context, channels []string) (map[string][]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := make(map[string][]string, len(channels))
+	for _, name := range channels {
+		out[name] = f.refs[name]
+	}
+	return out, nil
+}
+
+// TestNotifyRead_ListCarriesDocumentReferences —— 列表把引用端口的扫描结果原样带上：
+// 活动 Agent 名与 `archive:` 标注都保留，无引用输出 `[]`（不是 null）。
+// The list carries the document-reference scan as-is; untouched channels get [].
+func TestNotifyRead_ListCarriesDocumentReferences(t *testing.T) {
+	s := newNotifyReadServer(t, func(o *Options) {
+		o.Notify = fakeNotifyChannels{channels: []core.NotifyChannel{
+			{Name: "ops-hook", Type: "webhook", URL: "https://hooks.example.com"},
+			{Name: "unused", Type: "feishu"},
+		}}
+		o.NotifyReferences = fakeNotifyReferences{refs: map[string][]string{
+			"ops-hook": {"writer", "archive:arc-1"},
+		}}
+	})
+	rec := serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/notify-channels", ""))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	env := decodeResourcesEnvelope[[]NotifyChannelView](t, rec)
+	require.Len(t, env.Data, 2)
+	require.Equal(t, []string{"writer", "archive:arc-1"}, env.Data[0].ReferencedBy)
+	require.Equal(t, []string{}, env.Data[1].ReferencedBy, "无引用必须是 []")
+}
+
+// TestNotifyRead_ReferenceScanFailureFailsClosed —— 引用扫描失败不得降级成
+// "没有任何 Agent 引用"：整个列表按固定 500 失败关闭，原因只进日志。
+// A failed reference scan fails the whole list closed instead of showing no references.
+func TestNotifyRead_ReferenceScanFailureFailsClosed(t *testing.T) {
+	errScan := errors.New("scan failed")
+	s := newNotifyReadServer(t, func(o *Options) {
+		o.Notify = fakeNotifyChannels{channels: []core.NotifyChannel{
+			{Name: "ops-hook", Type: "webhook", URL: "https://hooks.example.com"},
+		}}
+		o.NotifyReferences = fakeNotifyReferences{err: errScan}
+	})
+	rec := serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/notify-channels", ""))
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+
+	env := decodeResourcesEnvelope[map[string]any](t, rec)
+	require.Equal(t, codeInternal, env.Code)
+	require.Equal(t, messageInternal, env.Message)
+	require.NotContains(t, rec.Body.String(), errScan.Error())
 }
 
 // TestNotifyRead_TypesInAssemblyOrder —— 类型表逐字取装配层的顺序（单一真值），
@@ -190,6 +258,8 @@ func TestNotifyRead_ViewShapeMatchesContract(t *testing.T) {
 	s := newNotifyReadServer(t, func(o *Options) {
 		o.Notify = fakeNotifyChannels{channels: []core.NotifyChannel{{
 			Name: "ops-hook", Type: "webhook", Description: "告警", URL: "https://hooks.example.com",
+			// R7：availability 是合法枚举（本地配置就绪），last_test 留 null 表示从未测过。
+			Availability: core.AvailabilityReady,
 		}}}
 	})
 	rec := serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/notify-channels", ""))

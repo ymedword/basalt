@@ -255,7 +255,7 @@ type pipedProcess struct {
 // startPiped launches one piped long-lived process; cleanup closes stdin then kills.
 func startPiped(t *testing.T, h *harness, env []string, args ...string) *pipedProcess {
 	t.Helper()
-	cmd := h.command(context.Background(), env, args...)
+	cmd := h.command(t, context.Background(), env, args...)
 	cmd.SysProcAttr = groupedSysProcAttr()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

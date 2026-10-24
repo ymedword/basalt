@@ -489,7 +489,7 @@ func TestWhitelistPolicy_RefusalCopyIsFourSegments(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, core.IsSandboxViolation(err))
 	require.Equal(t,
-		"域名不在白名单：evil.example.com。这是安全策略，请勿反复重试；如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。",
+		"域名不在白名单：evil.example.com。这是安全策略，请勿反复重试；如需访问，请联系管理员在管理台「执行环境」页把该域名加入网络域名白名单，保存后立即生效，无需重启。",
 		err.Error(), "四段式文案是模型可见契约，逐字保真")
 }
 

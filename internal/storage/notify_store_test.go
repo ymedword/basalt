@@ -10,17 +10,33 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// insertNotifyChannel 直接向 notify_channels 落一行夹具：本 US 对注册表**只读**，
-// 生产侧零写入——夹具是唯一写入口，时刻显式传入（仓储不自取业务时间）。
-// insertNotifyChannel writes one fixture row; this US has no production write path,
-// the fixture is the only writer and the clock is explicit.
-func insertNotifyChannel(t *testing.T, db *DB, name, typ, url string) {
+// insertNotifyChannel 直接向 notify_channels 落一行夹具（v3 形状：主键是资源 UID，
+// 地址列与凭据模式列齐全）。返回 UID 供用例断言；时刻显式传入（仓储不自取业务时间）。
+// insertNotifyChannel writes one v3-shaped fixture row and returns its uid.
+func insertNotifyChannel(t *testing.T, db *DB, name, typ, url string) core.ResourceUID {
 	t.Helper()
-	createdAt := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
-	_, err := db.write.ExecContext(context.Background(),
-		`INSERT INTO notify_channels (name, type, url, description, created_at)
-		 VALUES (?, ?, ?, NULL, ?)`, name, typ, url, createdAt.UnixMilli())
+	uid, err := core.NewResourceUID()
 	require.NoError(t, err)
+	createdAt := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	_, err = db.write.ExecContext(context.Background(),
+		`INSERT INTO notify_channels
+		   (resource_uid, name, type, url, url_host, credential_mode, scope, revision,
+		    description, created_at, updated_at, operation_id)
+		 VALUES (?, ?, ?, ?, '', 'env', 'shared', 1, '', ?, ?, 'op-fixture-notify')`,
+		string(uid), name, typ, url, createdAt.UnixMilli(), createdAt.UnixMilli())
+	require.NoError(t, err)
+	return uid
+}
+
+// channelNames 把读取结果投影成「名称 / 类型 / 地址」三元组：发送读面的契约只消费
+// 这三列，其余身份 / 版本列由管理写面的用例单独判。
+// channelNames projects the read result onto the three consumed columns.
+func channelNames(channels []core.NotifyChannel) []core.NotifyChannel {
+	out := make([]core.NotifyChannel, 0, len(channels))
+	for _, ch := range channels {
+		out = append(out, core.NotifyChannel{Name: ch.Name, Type: ch.Type, URL: ch.URL})
+	}
+	return out
 }
 
 // TestNotifyChannelRepo_ListsRowsOrderedByName —— S1（约束 4）：读取按 `name` 升序，
@@ -41,7 +57,7 @@ func TestNotifyChannelRepo_ListsRowsOrderedByName(t *testing.T) {
 		{Name: "alerts", Type: "feishu", URL: "${ALERTS_HOOK}"},
 		{Name: "ops", Type: "feishu", URL: "${OPS_HOOK}"},
 		{Name: "weekly", Type: "webhook", URL: "${WEEKLY_HOOK}"},
-	}, got)
+	}, channelNames(got))
 }
 
 // TestNotifyChannelRepo_EmptyRegistryReturnsEmptySlice —— S2（约束 2 / 4）：空表返回
@@ -87,5 +103,30 @@ func TestNotifyChannelRepo_SeesRowsInsertedAfterConstruction(t *testing.T) {
 	insertNotifyChannel(t, db, "ops", "feishu", "${OPS_HOOK}")
 	after, err := repo.ListNotifyChannels(ctx)
 	require.NoError(t, err)
-	require.Equal(t, []core.NotifyChannel{{Name: "ops", Type: "feishu", URL: "${OPS_HOOK}"}}, after)
+	require.Equal(t, []core.NotifyChannel{{Name: "ops", Type: "feishu", URL: "${OPS_HOOK}"}},
+		channelNames(after))
+}
+
+// TestNotifyChannelRepo_ExcludesTombstones —— S5（US-12 R4）：墓碑行（`deleted_at`
+// 非空）不出现在发送读面——删除过的渠道**不得**再收到投递；同名重建的新行照常出现。
+// S5: tombstoned rows never reach the send path, while a same-name rebuild does.
+func TestNotifyChannelRepo_ExcludesTombstones(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	oldUID := insertNotifyChannel(t, db, "ops", "feishu", "${OPS_HOOK}")
+
+	_, err := db.write.ExecContext(ctx,
+		`UPDATE notify_channels SET deleted_at = ?, updated_at = ?, operation_id = ?
+		  WHERE resource_uid = ?`, 1_760_000_000_000, 1_760_000_000_000, "op-fixture-delete", string(oldUID))
+	require.NoError(t, err)
+
+	got, err := NewNotifyChannelRepo(db).ListNotifyChannels(ctx)
+	require.NoError(t, err)
+	require.Empty(t, got, "墓碑行不得出现在发送读面")
+
+	insertNotifyChannel(t, db, "ops", "feishu", "${NEW_OPS_HOOK}")
+	got, err = NewNotifyChannelRepo(db).ListNotifyChannels(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []core.NotifyChannel{{Name: "ops", Type: "feishu", URL: "${NEW_OPS_HOOK}"}},
+		channelNames(got), "同名重建的新行必须出现在发送读面")
 }

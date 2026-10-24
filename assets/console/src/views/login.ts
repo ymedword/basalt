@@ -98,6 +98,21 @@ export const LoginView = defineComponent({
             '使用本机信任',
           ),
         ]),
+        h('details', { class: 'technical-details login-identity' }, [
+          h('summary', '身份与权限说明'),
+          h(
+            'p',
+            { class: 'muted small' },
+            '当前的「管理 token」是最小管理认证：它证明请求来自持有该凭据的管理者，不等同于个人账户，也不提供企业级身份治理。' +
+              '审计记录可以归因到这份管理凭据，但多人共用同一 token 时无法区分到具体的人。',
+          ),
+          h(
+            'p',
+            { class: 'muted small' },
+            '后续规划：日常网页登录优先接入企业 SSO；自动化使用带用户或服务作用域的 API 密钥；模型厂商密钥仍属「模型连接」的凭据。' +
+              '三者用途不同，不得混用。管理员与成员会有不同权限，但可以共用一个登录入口；权限由后端按角色与资源范围校验，而不是只把按钮藏起来。',
+          ),
+        ]),
         error.value === '' ? null : h(Notice, { tone: 'error', text: error.value }),
         next === `${CONSOLE_BASE}/`
           ? null

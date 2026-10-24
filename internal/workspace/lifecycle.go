@@ -38,11 +38,14 @@ const (
 	// lifecycleAgentsDirName holds one state file per agent.
 	lifecycleAgentsDirName = "agents"
 
-	// lifecycleSchemaVersion 是状态文件首版固定版本号（契约 agent-md.md §2.2）；
-	// 未来版本变更必须让旧二进制拒绝误读，而不是按兼容子集猜测。
-	// lifecycleSchemaVersion pins the first on-disk schema; future versions must be
-	// rejected by older binaries rather than guessed at.
-	lifecycleSchemaVersion = 1
+	// lifecycleSchemaVersion 是当前写入版本（契约 agent-md.md §2.2 的 v2：追加 agent_uid）。
+	// 旧二进制读到 v2 必须拒绝误读，而不是按兼容子集猜测。
+	// lifecycleSchemaVersion is the version this binary writes (v2 adds agent_uid).
+	lifecycleSchemaVersion = 2
+
+	// lifecycleSchemaVersionV1 是 US-11 形态：可读、写入时升级为 v2。
+	// lifecycleSchemaVersionV1 is the US-11 shape: readable, upgraded to v2 on write.
+	lifecycleSchemaVersionV1 = 1
 
 	// checksumPrefix 是校验和字面量前缀（"sha256:" + 64 位小写十六进制）。
 	// checksumPrefix prefixes the lowercase hex checksum.
@@ -68,6 +71,23 @@ var _ core.LifecyclePort = (*LifecycleStore)(nil)
 type LifecycleStore struct {
 	root string
 	now  func() time.Time
+
+	// rename 是原子替换的测试注入点（生产恒为 nil → os.Root.Rename）：rename 失败
+	// 无法跨平台确定性制造，与 AgentLoader / AgentEditor 同一手法。同包测试可临时
+	// 替换，生产路径不受影响。
+	// rename is a test seam for the atomic replace; production leaves it nil.
+	rename func(root *os.Root, oldname, newname string) error
+}
+
+// renameFn 返回生效的原子替换函数。
+// renameFn returns the effective atomic-replace function.
+func (s *LifecycleStore) renameFn() renameFunc {
+	if s.rename != nil {
+		return s.rename
+	}
+	return func(root *os.Root, oldname, newname string) error {
+		return root.Rename(oldname, newname)
+	}
 }
 
 // NewLifecycleStore 组装状态文件存储；now 为 nil 时回落 time.Now。
@@ -158,6 +178,16 @@ func (s *LifecycleStore) Transition(ctx context.Context, agent string, expectedS
 	}
 
 	next := current
+	// 契约 agent-md §2.2：v1 可读、写入时升级为 v2——迁移前的首写补发稳定身份。
+	// A v1 record is upgraded on its first write by minting its stable identity.
+	if next.SchemaVersion == lifecycleSchemaVersionV1 {
+		agentUID, uidErr := core.NewAgentUID()
+		if uidErr != nil {
+			return core.LifecycleRecord{}, fmt.Errorf("生成 Agent %s 的稳定身份: %w", agent, uidErr)
+		}
+		next.SchemaVersion = lifecycleSchemaVersion
+		next.AgentUID = agentUID
+	}
 	next.State = target
 	next.Generation = current.Generation + 1
 	next.UpdatedAt = s.now().UnixMilli()
@@ -172,7 +202,7 @@ func (s *LifecycleStore) Transition(ctx context.Context, agent string, expectedS
 	if err != nil {
 		return core.LifecycleRecord{}, fmt.Errorf("生成 Agent %s 的状态文件字节: %w", agent, err)
 	}
-	if err := writeLifecycleStateAtomic(base, agent, data); err != nil {
+	if err := writeLifecycleStateAtomic(base, agent, data, s.renameFn()); err != nil {
 		return core.LifecycleRecord{}, err
 	}
 	return next, nil
@@ -211,9 +241,14 @@ func (s *LifecycleStore) Bootstrap(ctx context.Context, agent, operationID strin
 		return existing, nil
 	}
 
+	agentUID, err := core.NewAgentUID()
+	if err != nil {
+		return core.LifecycleRecord{}, fmt.Errorf("生成 Agent %s 的稳定身份: %w", agent, err)
+	}
 	rec = core.LifecycleRecord{
 		SchemaVersion: lifecycleSchemaVersion,
 		Agent:         agent,
+		AgentUID:      agentUID,
 		State:         core.AgentDisabled,
 		Generation:    1,
 		UpdatedAt:     s.now().UnixMilli(),
@@ -228,7 +263,7 @@ func (s *LifecycleStore) Bootstrap(ctx context.Context, agent, operationID strin
 	if err != nil {
 		return core.LifecycleRecord{}, fmt.Errorf("生成 Agent %s 的状态文件字节: %w", agent, err)
 	}
-	if err := writeLifecycleStateAtomic(base, agent, data); err != nil {
+	if err := writeLifecycleStateAtomic(base, agent, data, s.renameFn()); err != nil {
 		return core.LifecycleRecord{}, err
 	}
 	return rec, nil
@@ -286,11 +321,14 @@ func (s *LifecycleStore) Discard(ctx context.Context, agent, operationID string)
 type lifecycleStateFile struct {
 	SchemaVersion int    `json:"schema_version"`
 	Agent         string `json:"agent"`
-	State         string `json:"state"`
-	Generation    int64  `json:"generation"`
-	UpdatedAt     int64  `json:"updated_at"`
-	OperationID   string `json:"operation_id"`
-	Checksum      string `json:"checksum"`
+	// AgentUID 用 omitempty 保持 v1 字节形态：v1 文件没有该键，重编码比对必须逐字节一致。
+	// omitempty keeps v1 files byte-identical: they never had the agent_uid key.
+	AgentUID    string `json:"agent_uid,omitempty"`
+	State       string `json:"state"`
+	Generation  int64  `json:"generation"`
+	UpdatedAt   int64  `json:"updated_at"`
+	OperationID string `json:"operation_id"`
+	Checksum    string `json:"checksum"`
 }
 
 // lifecycleStateFileOf 把领域记录映射为落盘形态。
@@ -299,6 +337,7 @@ func lifecycleStateFileOf(rec core.LifecycleRecord) lifecycleStateFile {
 	return lifecycleStateFile{
 		SchemaVersion: rec.SchemaVersion,
 		Agent:         rec.Agent,
+		AgentUID:      string(rec.AgentUID),
 		State:         string(rec.State),
 		Generation:    rec.Generation,
 		UpdatedAt:     rec.UpdatedAt,
@@ -313,6 +352,7 @@ func (f lifecycleStateFile) lifecycleRecord() core.LifecycleRecord {
 	return core.LifecycleRecord{
 		SchemaVersion: f.SchemaVersion,
 		Agent:         f.Agent,
+		AgentUID:      core.AgentUID(f.AgentUID),
 		State:         core.AgentState(f.State),
 		Generation:    f.Generation,
 		UpdatedAt:     f.UpdatedAt,
@@ -403,8 +443,19 @@ func decodeLifecycleState(raw []byte) (core.LifecycleRecord, error) {
 // validateLifecycleRecord checks every field; any failure is corruption, never a
 // reason to guess.
 func validateLifecycleRecord(rec core.LifecycleRecord) error {
-	if rec.SchemaVersion != lifecycleSchemaVersion {
-		return fmt.Errorf("不支持的 schema_version %d（本二进制只读 %d）", rec.SchemaVersion, lifecycleSchemaVersion)
+	switch rec.SchemaVersion {
+	case lifecycleSchemaVersionV1:
+		// v1 没有 agent_uid 键；带值即不是合法 v1 字节形态。
+		if rec.AgentUID != "" {
+			return errors.New("v1 状态文件不得携带 agent_uid（该字段自 v2 起存在）")
+		}
+	case lifecycleSchemaVersion:
+		if !rec.AgentUID.Valid() {
+			return fmt.Errorf("状态文件 agent_uid 缺失或格式非法：%q（v2 起必填）", rec.AgentUID)
+		}
+	default:
+		return fmt.Errorf("不支持的 schema_version %d（本二进制读 %d / %d）",
+			rec.SchemaVersion, lifecycleSchemaVersionV1, lifecycleSchemaVersion)
 	}
 	if err := ValidateAgentName(rec.Agent); err != nil {
 		return fmt.Errorf("状态文件 agent 字段无效: %w", err)
@@ -463,11 +514,19 @@ func readLifecycleState(base *os.Root, agent string) (core.LifecycleRecord, bool
 // 一步失败都清理临时文件并返回错误，原文件保持不变（约束 14）。
 // writeLifecycleStateAtomic writes a sibling temp file and atomically renames it
 // over the target; every failure path removes the temp file.
-func writeLifecycleStateAtomic(base *os.Root, agent string, data []byte) error {
-	rel := lifecycleStateRelPath(agent)
+func writeLifecycleStateAtomic(base *os.Root, agent string, data []byte, rename renameFunc) error {
+	return writeRootFileAtomic(base, lifecycleStateRelPath(agent), data, rename)
+}
+
+// writeRootFileAtomic 是工作区内**单个文件**的原子写：同目录临时文件 + fsync + rename。
+// 状态文件升级与迁移期的绑定回填共用这一份实现（不得各写一份——两次 rename 交换与
+// 半截文件的窗口只允许存在一处代码）。
+// writeRootFileAtomic is the single atomic file write inside the workspace: a sibling
+// temp file, fsync, then rename; the state-file upgrade and the binding backfill share it.
+func writeRootFileAtomic(base *os.Root, rel string, data []byte, rename renameFunc) error {
 	dir := filepath.Dir(filepath.FromSlash(rel))
 	if err := base.MkdirAll(dir, dirPerm); err != nil {
-		return fmt.Errorf("创建生命周期控制目录 %s: %w", filepath.Dir(rel), err)
+		return fmt.Errorf("创建目录 %s: %w", filepath.Dir(rel), err)
 	}
 
 	tmp := filepath.Join(dir, filepath.Base(filepath.FromSlash(rel))+".tmp-"+lifecycleTempSuffix())
@@ -484,7 +543,7 @@ func writeLifecycleStateAtomic(base *os.Root, agent string, data []byte) error {
 	if err := file.Close(); err != nil {
 		return lifecycleTempFailure(base, tmp, fmt.Errorf("关闭临时文件 %s: %w", tmp, err), nil)
 	}
-	if err := base.Rename(tmp, filepath.FromSlash(rel)); err != nil {
+	if err := rename(base, tmp, filepath.FromSlash(rel)); err != nil {
 		return lifecycleTempFailure(base, tmp, fmt.Errorf("替换 %s: %w", rel, err), nil)
 	}
 	return nil

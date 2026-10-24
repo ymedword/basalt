@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -67,8 +68,13 @@ func TestAgentEditor_ReadContentReturnsRawBytesAndETag(t *testing.T) {
 	require.Equal(t, string(raw), content.Content)
 	require.Equal(t, ContentETag(raw), content.ETag)
 
-	_, err = editor.ReadContent(context.Background(), "../agents/writer")
+	_, err = editor.ReadContent(context.Background(), "agents/writer")
 	require.ErrorContains(t, err, "路径分隔符")
+
+	// 越界形态（`..` 前缀）同样在读取之前被拒；US-12 起点前缀规则先于分隔符规则命中，
+	// 故这里只判"被拒"，不锁定具体文案（判据面随 M9 的名称规则变更，见模块卡 §2.2）。
+	_, err = editor.ReadContent(context.Background(), "../agents/writer")
+	require.Error(t, err)
 }
 
 // TestAgentEditor_ReadContentMissingAgentWrapsNotExist：Agent 目录或 AGENT.md 缺失时
@@ -322,6 +328,15 @@ type editorFixture struct {
 
 func newEditorFixture(t *testing.T, raw string) *editorFixture {
 	t.Helper()
+	return newEditorFixtureWith(t, raw, nil)
+}
+
+// newEditorFixtureWith 与 newEditorFixture 同构，额外注入受控工具装配钩子。
+// newEditorFixtureWith is newEditorFixture plus an injected tool-assembly hook.
+func newEditorFixtureWith(t *testing.T, raw string,
+	assemble func(context.Context, string, *core.Profile) ([]string, core.ToolChange, error),
+) *editorFixture {
+	t.Helper()
 	root := t.TempDir()
 	writeAgentFile(t, root, "writer", []byte(raw))
 	fx := &editorFixture{
@@ -332,14 +347,15 @@ func newEditorFixture(t *testing.T, raw string) *editorFixture {
 		scheduler: &fakeScheduler{},
 	}
 	fx.editor = NewAgentEditor(AgentEditorDeps{
-		Root:      root,
-		Gate:      core.NewAgentGate(),
-		Ops:       fx.ops,
-		Snapshots: fx.snapshots,
-		Registry:  fx.registry,
-		Scheduler: fx.scheduler,
-		Validate:  testValidator(),
-		Now:       func() time.Time { return time.UnixMilli(1729500000123).UTC() },
+		Root:          root,
+		Gate:          core.NewAgentGate(),
+		Ops:           fx.ops,
+		Snapshots:     fx.snapshots,
+		Registry:      fx.registry,
+		Scheduler:     fx.scheduler,
+		Validate:      testValidator(),
+		AssembleTools: assemble,
+		Now:           func() time.Time { return time.UnixMilli(1729500000123).UTC() },
 	})
 	return fx
 }
@@ -394,6 +410,39 @@ func TestApplyChanges_ScalarEditsPreserveFormatting(t *testing.T) {
 	require.Equal(t, strings.ReplaceAll(expected, "\n", "\r\n"), string(patched))
 }
 
+// TestApplyChanges_ClearTemperatureRemovesOnlyThatLine：`temperature: null` 只移除
+// 目标行，其余字节逐字保留；字段本来不存在时是幂等 no-op（不是错误）。
+// Clearing removes exactly the temperature line and is a no-op when absent.
+func TestApplyChanges_ClearTemperatureRemovesOnlyThatLine(t *testing.T) {
+	withTemperature := strings.Replace(editorContent,
+		"  model: \"mock-model\"\n", "  model: \"mock-model\"\n  temperature: 0.7\n", 1)
+	require.Contains(t, withTemperature, "temperature: 0.7")
+
+	patched, err := ApplyChanges([]byte(withTemperature), core.AgentContentChanges{
+		Provider: &core.AgentProviderChanges{ClearTemperature: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, editorContent, string(patched), "只移除 temperature 行")
+
+	patched, err = ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Provider: &core.AgentProviderChanges{ClearTemperature: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, editorContent, string(patched), "字段不存在时清除是 no-op")
+}
+
+// TestApplyChanges_RejectsTemperatureSetAndClear：同一补丁同时写值与清除是请求形状
+// 错误——不得让后写覆盖先写而静默选一个。
+// Setting and clearing the same field in one patch is refused.
+func TestApplyChanges_RejectsTemperatureSetAndClear(t *testing.T) {
+	value := 0.0
+	_, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Provider: &core.AgentProviderChanges{Temperature: &value, ClearTemperature: true},
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrEditUnsupported)
+}
+
 // TestApplyChanges_SequenceEditsReplaceTargetBlocksOnly：序列整块替换；空列表渲染为
 // 流式 `[]`；块外的一切字节不动。
 // Sequence edits replace exactly the target block; an empty list renders as [].
@@ -411,6 +460,30 @@ func TestApplyChanges_SequenceEditsReplaceTargetBlocksOnly(t *testing.T) {
 	expected = strings.Replace(expected, "message: \"生成本周周报\"\n---\n",
 		"message: \"生成本周周报\"\nskills: []\n---\n", 1)
 	require.Equal(t, expected, string(patched))
+}
+
+// TestApplyChanges_NotifyChannelsPatchOnly：notify_channels 整块替换、块外字节不动；
+// 空列表写成 `notify_channels: []`（显式清空 = 不限制，与未声明同义）。
+// The allowlist is patched as one block; an empty list serialises as [].
+func TestApplyChanges_NotifyChannelsPatchOnly(t *testing.T) {
+	channels := []string{"ops-alerts", "night-ops"}
+	patched, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		NotifyChannels: &channels,
+	})
+	require.NoError(t, err)
+	expected := strings.Replace(editorContent,
+		"message: \"生成本周周报\"\n---\n",
+		"message: \"生成本周周报\"\nnotify_channels:\n  - \"ops-alerts\"\n  - \"night-ops\"\n---\n", 1)
+	require.Equal(t, expected, string(patched))
+
+	empty := []string{}
+	patched, err = ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		NotifyChannels: &empty,
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(patched), "notify_channels: []")
+	// 其余块逐字节不变：只动目标块是块编辑的硬前提。
+	require.Contains(t, string(patched), "tools:\n  - \"file_read\"\n  - \"file_write\"\n")
 }
 
 // TestApplyChanges_InsertsMissingKeysAndChildren：缺失的顶层键与映射子键按契约顺序
@@ -905,4 +978,363 @@ func TestAgentEditor_ConcurrentSave(t *testing.T) {
 	require.Len(t, fx.ops.begun, 1)
 	require.Len(t, fx.ops.finished, 1)
 	require.Equal(t, core.OperationSuccess, fx.ops.finished[0].status)
+}
+
+// bindingsEditorContent 是带 resource_bindings 块的原文夹具：块前块后都有字节，
+// 用于断言整块替换只动目标块。
+// bindingsEditorContent carries a bindings block with material on both sides.
+const bindingsEditorContent = `---
+name: writer
+description: "旧描述"
+provider:
+  name: "deepseek"
+  model: "mock-model"
+resource_bindings:
+  model_connection:
+    - name: old-conn
+      uid: "rs_01J8Z7A1B2C3D4E5F6G7H8J9K0"
+  notify_channel: []
+schedules: []
+---
+
+你是周报助手。
+`
+
+// TestApplyChanges_BindingsReplaceWholeBlock：`changes.bindings` 是整块替换——
+// nil = 不改（逐字节相同）；非 nil（含空切片）以数组为唯一内容重写，服务端不按
+// 名称重新解析 UID、不按名合并；块外字节逐字保留。
+// Acceptance point: bindings patch replaces the whole block and never merges by name.
+func TestApplyChanges_BindingsReplaceWholeBlock(t *testing.T) {
+	want := core.ResourceBindings{
+		ModelConnections: []core.ResourceBinding{
+			{Name: "deepseek", UID: testModelUID},
+			{Name: "backup", UID: testNotifyUID},
+		},
+		NotifyChannels: []core.ResourceBinding{},
+	}
+	patched, err := ApplyChanges([]byte(bindingsEditorContent), core.AgentContentChanges{
+		Bindings: []core.BindingChange{
+			{ResourceKind: core.BindingModelConnection, RefName: "deepseek", ResourceUID: testModelUID},
+			{ResourceKind: core.BindingModelConnection, RefName: "backup", ResourceUID: testNotifyUID},
+		},
+	})
+	require.NoError(t, err)
+	expected := strings.Replace(bindingsEditorContent,
+		"resource_bindings:\n  model_connection:\n    - name: old-conn\n      uid: \"rs_01J8Z7A1B2C3D4E5F6G7H8J9K0\"\n  notify_channel: []\n",
+		"resource_bindings:\n  model_connection:\n    - name: \"deepseek\"\n      uid: \""+testModelUID+"\"\n    - name: \"backup\"\n      uid: \""+testNotifyUID+"\"\n  notify_channel: []\n", 1)
+	require.Equal(t, expected, string(patched))
+
+	got, err := ParseResourceBindings(patched)
+	require.NoError(t, err)
+	require.Equal(t, want.ModelConnections, got.ModelConnections)
+	require.Empty(t, got.NotifyChannels)
+
+	// nil = 不改：逐字节相同。
+	same, err := ApplyChanges([]byte(bindingsEditorContent), core.AgentContentChanges{})
+	require.NoError(t, err)
+	require.Equal(t, bindingsEditorContent, string(same))
+
+	// 空切片 = 清空两组（显式替换，不是"不改"）。
+	cleared, err := ApplyChanges([]byte(bindingsEditorContent),
+		core.AgentContentChanges{Bindings: []core.BindingChange{}})
+	require.NoError(t, err)
+	require.Contains(t, string(cleared),
+		"resource_bindings:\n  model_connection: []\n  notify_channel: []\n")
+	require.Contains(t, string(cleared), "schedules: []\n---\n\n你是周报助手。\n",
+		"块外字节必须逐字保留")
+}
+
+// TestApplyChanges_RejectsInvalidBindingsPatch：类别字面量、UID 格式、重复名 / 重复
+// UID 任一非法 → 包装 ErrAgentResourceBindingInvalid 拒绝，不返回候选字节（零写入）。
+// Acceptance point: every structurally invalid patch refuses before any write.
+func TestApplyChanges_RejectsInvalidBindingsPatch(t *testing.T) {
+	cases := map[string][]core.BindingChange{
+		"未知类别": {{ResourceKind: "skill", RefName: "a", ResourceUID: testModelUID}},
+		"UID 非法": {
+			{ResourceKind: core.BindingModelConnection, RefName: "a", ResourceUID: "01J8Z6YQ4M2S3T7V9W0X1Y2Z3A"},
+		},
+		"重复名称": {
+			{ResourceKind: core.BindingModelConnection, RefName: "a", ResourceUID: testModelUID},
+			{ResourceKind: core.BindingModelConnection, RefName: "a", ResourceUID: testNotifyUID},
+		},
+		"重复 UID": {
+			{ResourceKind: core.BindingNotifyChannel, RefName: "a", ResourceUID: testModelUID},
+			{ResourceKind: core.BindingNotifyChannel, RefName: "b", ResourceUID: testModelUID},
+		},
+	}
+	for name, changes := range cases {
+		t.Run(name, func(t *testing.T) {
+			patched, err := ApplyChanges([]byte(bindingsEditorContent),
+				core.AgentContentChanges{Bindings: changes})
+			require.ErrorIs(t, err, core.ErrAgentResourceBindingInvalid)
+			require.Nil(t, patched, "拒绝时不得返回候选字节")
+		})
+	}
+}
+
+// TestApplyChanges_NotifyModePatch：`notify_mode` 是顶层标量补丁——缺失时插在收尾
+// 围栏之前，已存在时原位替换；其余字节逐字保留。
+// Acceptance point: notify_mode is patched in place and inserted before the fence.
+func TestApplyChanges_NotifyModePatch(t *testing.T) {
+	mode := core.NotifyModeAllEligible
+	patched, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{NotifyMode: &mode})
+	require.NoError(t, err)
+	expected := strings.Replace(editorContent, "message: \"生成本周周报\"\n---\n",
+		"message: \"生成本周周报\"\nnotify_mode: \"all_eligible\"\n---\n", 1)
+	require.Equal(t, expected, string(patched))
+
+	raw := "---\nname: writer\nnotify_mode: none\n---\n\n正文。\n"
+	allow := core.NotifyModeAllowlist
+	channels := []string{"ops"}
+	patched, err = ApplyChanges([]byte(raw), core.AgentContentChanges{
+		NotifyMode: &allow, NotifyChannels: &channels,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "---\nname: writer\nnotify_mode: \"allowlist\"\nnotify_channels:\n  - \"ops\"\n---\n\n正文。\n",
+		string(patched))
+}
+
+// TestApplyChanges_BodyReplaceAndClear：`changes.body` 整段替换围栏外正文——
+// frontmatter 与闭合围栏逐字节保留；空串清空正文；与 frontmatter 补丁同批提交时
+// 互不干扰；缺围栏仍按 ErrEditUnsupported 拒绝（不猜结构）。
+// Acceptance point: body patches replace or clear only the body, never the frontmatter.
+func TestApplyChanges_BodyReplaceAndClear(t *testing.T) {
+	body := "新的正文。\n第二行。"
+	patched, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{Body: &body})
+	require.NoError(t, err)
+	require.Equal(t, strings.Replace(editorContent, "---\n\n你是周报助手。\n",
+		"---\n\n新的正文。\n第二行。\n", 1), string(patched))
+
+	// 空串 = 清空正文：文件在闭合围栏行结束后截止，frontmatter 一个字节不动。
+	empty := ""
+	patched, err = ApplyChanges([]byte(editorContent), core.AgentContentChanges{Body: &empty})
+	require.NoError(t, err)
+	cut := strings.Index(editorContent, "---\n\n你是周报助手。\n") + len("---\n")
+	require.Equal(t, editorContent[:cut], string(patched), "空串必须清空正文且保留 frontmatter")
+
+	// 与 frontmatter 补丁同批提交：两段各自生效，互不吞噬。
+	desc := "新描述"
+	combined, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Description: &desc, Body: &body,
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(combined), `description: "新描述"`)
+	_, bodyAfter, splitErr := splitFrontmatter(combined)
+	require.NoError(t, splitErr)
+	require.Equal(t, body, string(bodyAfter))
+
+	// 缺围栏：补丁路径不补围栏，直接拒绝。
+	_, err = ApplyChanges([]byte("没有围栏的正文"), core.AgentContentChanges{Body: &body})
+	require.ErrorIs(t, err, ErrEditUnsupported)
+}
+
+// TestApplyChanges_DisplayNameThreeState：`display_name` 三态（R6.2）——非空写入
+// 去空白后的值（字段缺失时插在闭合围栏前），空串移除该行（回到回退技术名），
+// 字段不存在时移除是字节级空操作（ETag 不变）；其余字节逐字保留。
+// TestApplyChanges_DisplayNameThreeState pins set / clear / no-op and byte preservation.
+func TestApplyChanges_DisplayNameThreeState(t *testing.T) {
+	display := "  值班助手  "
+	patched, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{DisplayName: &display})
+	require.NoError(t, err)
+	expected := strings.Replace(editorContent,
+		"    message: \"生成本周周报\"\n---\n",
+		"    message: \"生成本周周报\"\ndisplay_name: \"值班助手\"\n---\n", 1)
+	require.Equal(t, expected, string(patched), "只追加展示名行，块外字节逐字保留")
+
+	// 已有值改为新值：只改该行。
+	next := "新的展示名"
+	replaced, err := ApplyChanges([]byte(expected), core.AgentContentChanges{DisplayName: &next})
+	require.NoError(t, err)
+	require.Equal(t, strings.Replace(expected,
+		`display_name: "值班助手"`, `display_name: "新的展示名"`, 1), string(replaced))
+
+	// 空串 = 移除该行；字段不存在时是字节级空操作（ETag 因而不变）。
+	clear := ""
+	cleared, err := ApplyChanges([]byte(expected), core.AgentContentChanges{DisplayName: &clear})
+	require.NoError(t, err)
+	require.Equal(t, editorContent, string(cleared), "移除后必须逐字节回到原文件")
+
+	noop, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{DisplayName: &clear})
+	require.NoError(t, err)
+	require.Equal(t, editorContent, string(noop), "字段不存在时移除为空操作")
+	require.Equal(t, ContentETag([]byte(editorContent)), ContentETag(noop), "空操作不得改变 ETag")
+}
+
+// TestApplyChanges_DisplayNameRejectsInvalid：结构化写面拒绝超过 64 字符与控制字符
+// 的展示名（400 口径的 InvalidInputError）；装载期不判这个字段，只有写面拦。
+// TestApplyChanges_DisplayNameRejectsInvalid refuses oversized and control-character
+// values on the structured write surface only.
+func TestApplyChanges_DisplayNameRejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "too-long", value: strings.Repeat("名", displayNameMaxRunes+1)},
+		{name: "control-char", value: "值班\n助手"},
+		{name: "tab", value: "值班\t助手"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{DisplayName: &tc.value})
+			var invalid *core.InvalidInputError
+			require.ErrorAs(t, err, &invalid)
+			require.False(t, errors.Is(err, ErrEditUnsupported), "非法值按 400 口径归类")
+		})
+	}
+
+	// 边界：恰好 64 个字符必须接受。
+	atCap := strings.Repeat("名", displayNameMaxRunes)
+	_, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{DisplayName: &atCap})
+	require.NoError(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// 受控工具装配（R7 / 宪法约束 11）
+// ---------------------------------------------------------------------------
+
+// assemblyContent 是受控工具装配用例的基础内容：`notify_mode` 已显式声明、
+// `tools` 是普通块序列（可被行级补丁安全改写）。
+// assemblyContent is the assembly fixture: an explicit notify_mode and a block tools list.
+const assemblyContent = `---
+name: writer
+notify_mode: all_eligible
+tools:
+  - "save_memory"
+provider:
+  name: "mock"
+  model: "mock-pro"
+---
+
+正文。
+`
+
+// assemblyNoneContent 与 assemblyContent 同形，但通知意图为 none 且已声明 notify——
+// 保存时系统必须把它移除并作为可见变更返回。
+// assemblyNoneContent declares notify_mode none together with the notify tool.
+const assemblyNoneContent = `---
+name: writer
+notify_mode: none
+tools:
+  - "save_memory"
+  - "notify"
+provider:
+  name: "mock"
+  model: "mock-pro"
+---
+
+正文。
+`
+
+// TestAgentEditor_UpdateContentAssemblesNotify：装配钩子的增删落到磁盘，并随保存
+// 结果返回；结构化补丁与整份原文两条写面走同一逻辑。
+// The assembly delta reaches the disk and is returned with the save result on both
+// the patch and the whole-file write faces.
+func TestAgentEditor_UpdateContentAssemblesNotify(t *testing.T) {
+	addNotify := func(_ context.Context, _ string, profile *core.Profile) ([]string, core.ToolChange, error) {
+		if slices.Contains(profile.Tools, core.NotifyToolName) {
+			return profile.Tools, core.ToolChange{}, nil
+		}
+		return append(slices.Clone(profile.Tools), core.NotifyToolName),
+			core.ToolChange{Added: []string{core.NotifyToolName}}, nil
+	}
+	dropNotify := func(_ context.Context, _ string, profile *core.Profile) ([]string, core.ToolChange, error) {
+		if !slices.Contains(profile.Tools, core.NotifyToolName) {
+			return profile.Tools, core.ToolChange{}, nil
+		}
+		return slices.DeleteFunc(slices.Clone(profile.Tools), func(name string) bool {
+				return name == core.NotifyToolName
+			}),
+			core.ToolChange{Removed: []string{core.NotifyToolName}}, nil
+	}
+
+	t.Run("结构化补丁加入 notify", func(t *testing.T) {
+		fx := newEditorFixtureWith(t, assemblyContent, addNotify)
+		description := "新描述"
+		files, err := fx.editor.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Changes: &core.AgentContentChanges{Description: &description}},
+			ContentETag([]byte(assemblyContent)), core.Actor{Subject: "token:test"})
+		require.NoError(t, err)
+
+		require.Equal(t, []string{core.NotifyToolName}, files.Changes.Added)
+		require.Empty(t, files.Changes.Removed)
+		disk := string(fx.disk(t))
+		require.Contains(t, disk, "  - \"notify\"\n", "装配结果必须落到磁盘")
+		require.Contains(t, disk, "description: \"新描述\"\n")
+		require.Len(t, fx.ops.begun, 1)
+		require.Equal(t, core.OperationSuccess, fx.ops.finished[0].status)
+	})
+
+	t.Run("整份原文移除 notify", func(t *testing.T) {
+		fx := newEditorFixtureWith(t, assemblyNoneContent, dropNotify)
+		files, err := fx.editor.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Content: assemblyNoneContent},
+			ContentETag([]byte(assemblyNoneContent)), core.Actor{Subject: "token:test"})
+		require.NoError(t, err)
+
+		require.Equal(t, []string{core.NotifyToolName}, files.Changes.Removed)
+		require.Empty(t, files.Changes.Added)
+		require.NotContains(t, string(fx.disk(t)), "  - \"notify\"\n", "none 下必须不装配 notify")
+	})
+
+	t.Run("无变更时不改写 tools", func(t *testing.T) {
+		// 内容里已声明 notify 时钩子返回零变更；tools 行逐字节保留。
+		raw := strings.Replace(assemblyContent, "  - \"save_memory\"\n", "  - \"save_memory\"\n  - \"notify\"\n", 1)
+		fx2 := newEditorFixtureWith(t, raw, addNotify)
+		description := "新描述"
+		files, err := fx2.editor.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Changes: &core.AgentContentChanges{Description: &description}},
+			ContentETag([]byte(raw)), core.Actor{Subject: "token:test"})
+		require.NoError(t, err)
+		require.True(t, files.Changes.Empty())
+		require.Contains(t, string(fx2.disk(t)), "tools:\n  - \"save_memory\"\n  - \"notify\"\n")
+	})
+}
+
+// TestAgentEditor_UpdateContentRejectsForeignToolChange：装配层返回 notify 之外的
+// 工具名即实现漂移——直接拒绝，磁盘零写入、零操作行（系统不得自动改其他工具）。
+// Any tool name other than notify from the assembly hook is refused outright.
+func TestAgentEditor_UpdateContentRejectsForeignToolChange(t *testing.T) {
+	hook := func(_ context.Context, _ string, profile *core.Profile) ([]string, core.ToolChange, error) {
+		return append(slices.Clone(profile.Tools), "shell"), core.ToolChange{Added: []string{"shell"}}, nil
+	}
+	fx := newEditorFixtureWith(t, assemblyContent, hook)
+	description := "新描述"
+	_, err := fx.editor.UpdateContent(context.Background(), "writer",
+		core.AgentContentUpdate{Changes: &core.AgentContentChanges{Description: &description}},
+		ContentETag([]byte(assemblyContent)), core.Actor{Subject: "token:test"})
+	require.ErrorContains(t, err, "不允许的工具名")
+	require.Equal(t, assemblyContent, string(fx.disk(t)))
+	require.Empty(t, fx.ops.begun, "拒绝必须发生在预写之前")
+}
+
+// TestAgentEditor_UpdateContentRefusesUnpatchableTools：通知意图要求装配但 tools
+// 段无法安全改写（流式集合）时拒绝并点名下一步，磁盘零写入——不静默保留不一致。
+// When the assembly needs a change but the tools segment cannot be rewritten safely,
+// the save refuses with an actionable message instead of silently keeping the mismatch.
+func TestAgentEditor_UpdateContentRefusesUnpatchableTools(t *testing.T) {
+	raw := `---
+name: writer
+notify_mode: all_eligible
+tools: [save_memory]
+provider:
+  name: "mock"
+  model: "mock-pro"
+---
+
+正文。
+`
+	hook := func(_ context.Context, _ string, profile *core.Profile) ([]string, core.ToolChange, error) {
+		return append(slices.Clone(profile.Tools), core.NotifyToolName),
+			core.ToolChange{Added: []string{core.NotifyToolName}}, nil
+	}
+	fx := newEditorFixtureWith(t, raw, hook)
+	description := "新描述"
+	_, err := fx.editor.UpdateContent(context.Background(), "writer",
+		core.AgentContentUpdate{Changes: &core.AgentContentChanges{Description: &description}},
+		ContentETag([]byte(raw)), core.Actor{Subject: "token:test"})
+	var invalid *core.InvalidInputError
+	require.ErrorAs(t, err, &invalid)
+	require.Contains(t, invalid.Reason, "手动")
+	require.Equal(t, raw, string(fx.disk(t)))
+	require.Empty(t, fx.ops.begun)
 }

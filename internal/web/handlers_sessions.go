@@ -293,6 +293,37 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 // wrapped error）。归档会话固定 400 + 冻结文案；生命周期不可用固定 409
 // `AGENT_UNAVAILABLE`；500 只出固定文案，原始错误进 ERROR 日志（约束 23）。
 // writeRunError maps typed errors to status codes and never matches on text.
+// writeRunAdmissionError 是运行准入专用码的出口（契约 §8 准入面）：绑定缺失 / 非法 /
+// 无资格 / 凭据已撤销 → 409，主密钥不可用 → 503。它与保存面共用同一批 sentinel，
+// 但状态码不同——保存期 400 是「改 `AGENT.md` 再存」，准入 409 是「资源状态已变，
+// 换绑或恢复资源后再跑」。`AGENT_RESOURCE_UNAVAILABLE` 没有独立准入分支：准入把同一
+// 条件并入 `AGENT_RESOURCE_BINDING_INVALID`（模块卡错误码表）。
+// writeRunAdmissionError maps the admission-time binding and credential sentinels to
+// their documented 409 / 503 codes, which differ from the save-time 400 split.
+func (s *Server) writeRunAdmissionError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, core.ErrAgentResourceBindingMissing):
+		s.writeError(w, http.StatusConflict, codeAgentResourceBindingMissing,
+			adminMessageOr(err, messageBindingMissing))
+	case errors.Is(err, core.ErrAgentResourceBindingInvalid):
+		s.writeError(w, http.StatusConflict, codeAgentResourceBindingInvalid,
+			adminMessageOr(err, messageBindingInvalid))
+	case errors.Is(err, core.ErrResourceNotEligible):
+		s.writeError(w, http.StatusConflict, codeResourceNotEligible,
+			adminMessageOr(err, messageNotEligible))
+	case errors.Is(err, core.ErrCredentialRevoked):
+		s.writeError(w, http.StatusConflict, codeCredentialRevoked,
+			adminMessageOr(err, messageCredentialRevoked))
+	case errors.Is(err, core.ErrCredentialUnavailable):
+		s.writeError(w, http.StatusServiceUnavailable, codeCredentialUnavailable,
+			adminMessageOr(err, messageCredentialUnavailable))
+	default:
+		return false
+	}
+	return true
+}
+
+// writeRunError 把运行失败按类型映射为固定响应；未识别的失败只记日志、回固定 500。
 func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.Context) {
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		s.writeError(w, http.StatusGatewayTimeout, codeTimeout, "运行超过 60 秒时限")
@@ -317,7 +348,16 @@ func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.
 	// cause would otherwise turn a fail-closed 409 into a 404.
 	var unavailableErr *core.AgentUnavailableError
 	if errors.As(err, &unavailableErr) {
-		s.writeError(w, http.StatusConflict, codeAgentUnavailable, unavailableErr.Error())
+		// 中文按 Kind 投影（errors_zh.go）；英文 Reason 只进日志。
+		// The Chinese copy comes from the Kind projection; English stays in the log.
+		s.writeError(w, http.StatusConflict, codeAgentUnavailable, agentUnavailableMessage(unavailableErr))
+		return
+	}
+	// 参与准入的绑定 / 凭据失败排在 fs.ErrNotExist 之前：主密钥不可用等错误可能把
+	// 文件系统原因挂在链上，先判 fs 会把 503 错报成 404。
+	// Admission refusals precede fs.ErrNotExist so a wrapped fs cause cannot turn a
+	// fail-closed 409/503 into a 404.
+	if s.writeRunAdmissionError(w, err) {
 		return
 	}
 	if errors.Is(err, fs.ErrNotExist) {

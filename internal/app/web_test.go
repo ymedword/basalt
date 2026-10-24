@@ -25,6 +25,12 @@ package app
 //	    显式列出后才放行（D-10）
 //	T13 `TestListenAddr_DefaultsToLoopback`——空地址落回环缺省，绝不落到全接口监听
 //
+// US-12 T016 追加写面端口投影三条（§3.1.8 的 app 侧）：
+//
+//	T14 `TestWritePorts_FailClosedWithoutAdapters`——半截运行期 → 四个写面端口全 nil
+//	T15 `TestWritePorts_ProjectedIdentically`——槽里的适配器逐字段同一实例投影
+//	T16 `TestWritePorts_IndependentOfContentEditor`——写面端口与 US-11 内容编辑器互不顶替
+//
 // 全部离线：不访问真实网络与真实模型；T5 的 provider 卡在首次 Chat 上制造准入窗口。
 // Every case is offline; T5 parks the first run inside Chat to hold the admission window.
 
@@ -329,6 +335,10 @@ func TestNewRuntime_MaxConcurrentRuns(t *testing.T) {
 	// 判的是并发准入，与工具无关；首个响应不含工具调用，声明不影响运行路径。
 	f.writeAgent(t, "ops-agent", "read_file")
 	blocker := &blockingProvider{started: make(chan struct{}), release: make(chan struct{})}
+	// 探针的已发布版本先种子：AGENT.md 的 `resource_bindings` 要指向真实指针，否则两次
+	// Run 都会停在绑定准入，判不到并发上限。
+	// Seed the probe's published version so admission reaches the concurrency gate.
+	f.seedPublishedProviders(t)
 	a := f.app()
 	a.providerOverride = blocker
 	rt, err := a.newRuntime(context.Background())
@@ -562,14 +572,226 @@ func TestAgentConsole_WiredThroughWebOptions(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, entry.Registered, "写入后注册表保持注册（候选校验与热加载同一道规则）")
 
-	// 反例：候选缺 provider.model → 装载期校验拒绝为 invalid_input，磁盘逐字节不变。
+	// 反例：候选缺 provider.model → 装载期以**类型化拒绝**上抛（HTTP 层映射为 400
+	// 并按分类出中文），磁盘逐字节不变。
 	broken := strings.Replace(updated, "  model: probe-model\n", "", 1)
 	require.NotEqual(t, updated, broken, "夹具必须命中 model 行")
 	_, err = opts.AgentAdmin.UpdateContent(ctx, "alpha",
 		core.AgentContentUpdate{Content: broken}, after.ETag, consoleActor())
-	var invalid *core.InvalidInputError
-	require.ErrorAs(t, err, &invalid, "坏候选必须按 invalid_input 拒绝")
+	var rejected *core.AgentDefinitionRejectedError
+	require.ErrorAs(t, err, &rejected, "坏候选必须按装载期分类拒绝")
+	require.Equal(t, core.AgentRejectBlankModel, rejected.Kind, "缺 model 归类为 blank model")
 	onDisk, readErr := os.ReadFile(filepath.Join(f.root, agentsDirName, "alpha", "AGENT.md"))
 	require.NoError(t, readErr)
 	require.Equal(t, updated, string(onDisk), "拒绝时磁盘零写入")
+}
+
+// fakeAgentAdminService 只实现一个写面接口：用例只判"投影是同一实例"，所有方法
+// 返回零值，不参与业务判定。`AgentAdminService.Create` 与 `NotifyAdminService.Create`
+// 签名不同，四个桩因此**不能**合并成一个类型——这正是按消费方拆分端口的结果。
+// The stub implements exactly one port; Create has different signatures in two ports,
+// so a single combined fake is impossible by construction.
+type fakeAgentAdminService struct{}
+
+var _ web.AgentAdminService = (*fakeAgentAdminService)(nil)
+
+func (*fakeAgentAdminService) Create(context.Context, core.Actor, core.AgentSpec) (web.AgentFileSet, error) {
+	return web.AgentFileSet{}, nil
+}
+
+func (*fakeAgentAdminService) GenerateFiles(context.Context, string, string, []core.AuthorAnswer) (web.AgentDraftResult, error) {
+	return web.AgentDraftResult{}, nil
+}
+
+func (*fakeAgentAdminService) ScheduleDraft(context.Context, string, string) (web.ScheduleDraftResult, error) {
+	return web.ScheduleDraftResult{}, nil
+}
+
+func (*fakeAgentAdminService) Files(context.Context, string) (web.AgentFileSet, error) {
+	return web.AgentFileSet{}, nil
+}
+
+func (*fakeAgentAdminService) SubmitFiles(context.Context, core.Actor, string, string, []core.AuthorFile) (web.AgentFileSet, error) {
+	return web.AgentFileSet{}, nil
+}
+
+func (*fakeAgentAdminService) Copy(context.Context, core.Actor, string, string, []core.ResourceMapping) (web.AgentFileSet, error) {
+	return web.AgentFileSet{}, nil
+}
+
+func (*fakeAgentAdminService) Archive(context.Context, core.Actor, string) (core.AgentArchiveRecord, error) {
+	return core.AgentArchiveRecord{}, nil
+}
+
+func (*fakeAgentAdminService) Restore(context.Context, core.Actor, string, string) (web.AgentFileSet, error) {
+	return web.AgentFileSet{}, nil
+}
+
+func (*fakeAgentAdminService) Archived(context.Context) ([]core.AgentArchiveRecord, error) {
+	return nil, nil
+}
+
+// fakeResourceAdminService 是资源写面端口的零值桩。
+// fakeResourceAdminService is the zero-value resource write stub.
+type fakeResourceAdminService struct{}
+
+var _ web.ResourceAdminService = (*fakeResourceAdminService)(nil)
+
+func (*fakeResourceAdminService) UpsertModelConnection(context.Context, core.Actor, web.ModelConnectionWrite, string) (web.ModelConnectionView, error) {
+	return web.ModelConnectionView{}, nil
+}
+
+func (*fakeResourceAdminService) UpsertMCPServer(context.Context, core.Actor, web.MCPServerWrite, string) (web.McpServerView, error) {
+	return web.McpServerView{}, nil
+}
+
+func (*fakeResourceAdminService) CreateSkill(context.Context, core.Actor, web.SkillCreateWrite) (web.SkillDetailView, error) {
+	return web.SkillDetailView{}, nil
+}
+
+func (*fakeResourceAdminService) ImportSkill(context.Context, core.Actor, web.SkillImportWrite) (web.SkillDetailView, error) {
+	return web.SkillDetailView{}, nil
+}
+
+func (*fakeResourceAdminService) UpdateSkill(context.Context, core.Actor, string, web.SkillUpdateWrite, string) (web.SkillDetailView, error) {
+	return web.SkillDetailView{}, nil
+}
+
+func (*fakeResourceAdminService) ValidateSkill(context.Context, string, web.SkillUpdateWrite) (core.SkillValidateResult, error) {
+	return core.SkillValidateResult{}, nil
+}
+
+func (*fakeResourceAdminService) Delete(context.Context, core.Actor, core.ResourceKind, string, string, string) error {
+	return nil
+}
+
+func (*fakeResourceAdminService) Publish(context.Context, core.Actor, core.ResourcePublishRequest) (core.ResourcePublishResult, error) {
+	return core.ResourcePublishResult{}, nil
+}
+
+func (*fakeResourceAdminService) Versions(context.Context, core.ResourceKind, string) ([]core.ResourceVersionDetail, error) {
+	return nil, nil
+}
+
+func (*fakeResourceAdminService) CurrentETag(context.Context, core.ResourceKind, string) (string, bool) {
+	return "", false
+}
+
+func (*fakeResourceAdminService) VersionDetail(context.Context, int64) (core.ResourceVersionDetail, error) {
+	return core.ResourceVersionDetail{}, nil
+}
+
+func (*fakeResourceAdminService) References(context.Context, core.ResourceKind, string) (core.ResourceReferences, error) {
+	return core.ResourceReferences{}, nil
+}
+
+func (*fakeResourceAdminService) TestModelConnection(context.Context, core.Actor, string) (core.ResourceTestResult, error) {
+	return core.ResourceTestResult{}, nil
+}
+
+func (*fakeResourceAdminService) TestMCPServer(context.Context, core.Actor, string) (core.ResourceTestResult, error) {
+	return core.ResourceTestResult{}, nil
+}
+
+// fakeNotifyAdminService 是通知渠道写面端口的零值桩。
+// fakeNotifyAdminService is the zero-value notify write stub.
+type fakeNotifyAdminService struct{}
+
+var _ web.NotifyAdminService = (*fakeNotifyAdminService)(nil)
+
+func (*fakeNotifyAdminService) Create(context.Context, core.Actor, web.NotifyChannelWrite) (core.NotifyChannel, error) {
+	return core.NotifyChannel{}, nil
+}
+
+func (*fakeNotifyAdminService) Update(context.Context, core.Actor, string, web.NotifyChannelWrite) (core.NotifyChannel, error) {
+	return core.NotifyChannel{}, nil
+}
+
+func (*fakeNotifyAdminService) Delete(context.Context, core.Actor, string, string, bool) error {
+	return nil
+}
+
+func (*fakeNotifyAdminService) TestChannel(context.Context, core.Actor, string) (core.NotifyChannelTestResult, error) {
+	return core.NotifyChannelTestResult{OK: true, Status: core.ConnectionTestSuccess}, nil
+}
+
+// fakeWorkspaceService 是只读工作区端口的零值桩。
+// fakeWorkspaceService is the zero-value workspace stub.
+type fakeWorkspaceService struct{}
+
+var _ web.WorkspaceService = (*fakeWorkspaceService)(nil)
+
+func (*fakeWorkspaceService) Tree(context.Context, string) (web.WorkspaceTreeView, error) {
+	return nil, nil
+}
+
+func (*fakeWorkspaceService) File(context.Context, string) (web.WorkspaceFileView, error) {
+	return web.WorkspaceFileView{}, nil
+}
+
+// TestWritePorts_FailClosedWithoutAdapters：半截运行期（只有配置）投影出的四个写面
+// 端口必须全为 nil——handler 对缺端口按固定 500 拒绝，装配层**不得**用空实现冒充
+// "可用"。与 wireManagementPorts 的失败关闭口径相同。
+// 逆改点：给任一端口填零值实现 / 在 webOptions 里临时构造服务 → 对应断言红。
+// 中文用例名：写面端口缺适配器时失败关闭。
+func TestWritePorts_FailClosedWithoutAdapters(t *testing.T) {
+	opts := (&App{}).webOptions(&heavyRuntime{cfg: &cli.Config{}})
+	require.Nil(t, opts.AgentAdminService)
+	require.Nil(t, opts.ResourceAdminService)
+	require.Nil(t, opts.NotifyAdminService)
+	require.Nil(t, opts.WorkspaceService)
+}
+
+// TestWritePorts_ProjectedIdentically：槽里放什么，`web.Options` 就得到什么——四个
+// 端口逐字段是**同一实例**（不是包装、不是副本）。构造任务把适配器填进
+// `heavyRuntime.writeServices` 后，路由处理函数看到的就是那个实例。
+// 逆改点：投影时重新包一层 / 字段串位（如把通知渠道装进 WorkspaceService）→ 红。
+// 中文用例名：写面端口逐字段同一实例投影。
+func TestWritePorts_ProjectedIdentically(t *testing.T) {
+	agentAdmin := &fakeAgentAdminService{}
+	resourceAdmin := &fakeResourceAdminService{}
+	notifyAdmin := &fakeNotifyAdminService{}
+	workspace := &fakeWorkspaceService{}
+
+	rt := &heavyRuntime{cfg: &cli.Config{}}
+	rt.writeServices = writeServices{
+		agentAdmin:    agentAdmin,
+		resourceAdmin: resourceAdmin,
+		notifyAdmin:   notifyAdmin,
+		workspace:     workspace,
+	}
+
+	opts := (&App{}).webOptions(rt)
+	require.Same(t, agentAdmin, opts.AgentAdminService)
+	require.Same(t, resourceAdmin, opts.ResourceAdminService)
+	require.Same(t, notifyAdmin, opts.NotifyAdminService)
+	require.Same(t, workspace, opts.WorkspaceService)
+}
+
+// TestWritePorts_IndependentOfContentEditor：US-11 的 `Options.AgentAdmin`（内容读写
+// 与启停）与 US-12 的写面端口互不顶替——装配出的内容编辑器**不**让写面端口变成
+// 非 nil，填了写面槽也**不**让内容编辑器出现。两个方向都判，避免以后把两者合并成
+// 一个"大接口"。
+// 逆改点：用 AgentAdmin 顶替 AgentAdminService / 把写面槽回填给 AgentAdmin → 红。
+// 中文用例名：写面端口与内容编辑器互不顶替。
+func TestWritePorts_IndependentOfContentEditor(t *testing.T) {
+	// 方向一：完整装配路径会给内容编辑器，写面端口仍只来自 writeServices 槽。
+	f := newWireFixture(t)
+	f.writeAgent(t, "alpha", "read_file")
+	rt := f.assemble(t)
+
+	opts := f.app().webOptions(rt)
+	require.NotNil(t, opts.AgentAdmin, "US-11 内容编辑器必须仍在装配面上")
+	require.Equal(t, rt.writeServices.agentAdmin == nil, opts.AgentAdminService == nil,
+		"AgentAdminService 只来自写面槽，不得由内容编辑器顶替")
+	require.Equal(t, rt.writeServices.resourceAdmin == nil, opts.ResourceAdminService == nil)
+	require.Equal(t, rt.writeServices.notifyAdmin == nil, opts.NotifyAdminService == nil)
+	require.Equal(t, rt.writeServices.workspace == nil, opts.WorkspaceService == nil)
+
+	// 方向二：只填写面槽（半截运行期）→ 内容编辑器保持 nil。
+	partial := &heavyRuntime{cfg: &cli.Config{}}
+	partial.writeServices.agentAdmin = &fakeAgentAdminService{}
+	opts = (&App{}).webOptions(partial)
+	require.NotNil(t, opts.AgentAdminService)
+	require.Nil(t, opts.AgentAdmin, "写面端口不得让内容编辑器变成非 nil")
 }

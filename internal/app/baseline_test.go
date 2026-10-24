@@ -284,7 +284,8 @@ func assertResourceVersion(t *testing.T, env *baselineEnv, kind core.ResourceKin
 }
 
 // TestRunBaseline_MaterializesSkillSnapshot：技能 v1 物化到契约路径，清单与磁盘一致，
-// `storage_path` 是 `.basalt/versions/skills/<name>/1` 字面量。
+// `storage_path` 是 `.basalt/versions/skills/<name>/<resource_uid>/1` 字面量
+// （2026-10-23 裁定：新发布按身份分段；旧扁平目录只读兼容、不搬迁）。
 func TestRunBaseline_MaterializesSkillSnapshot(t *testing.T) {
 	env := newBaselineEnv(t)
 	require.NoError(t, runBaseline(context.Background(), env.deps))
@@ -293,7 +294,7 @@ func TestRunBaseline_MaterializesSkillSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, versions, 1)
 	version := versions[0]
-	require.Equal(t, ".basalt/versions/skills/weekly/1", version.StoragePath)
+	require.Equal(t, ".basalt/versions/skills/weekly/"+string(version.ResourceUID)+"/1", version.StoragePath)
 
 	var files []core.FileHash
 	require.NoError(t, json.Unmarshal([]byte(version.ManifestJSON), &files))
@@ -303,7 +304,7 @@ func TestRunBaseline_MaterializesSkillSnapshot(t *testing.T) {
 	}
 	require.Equal(t, []string{"SKILL.md", "references/guide.md"}, paths, "清单按 path 升序")
 
-	snapshot := filepath.Join(env.root, "versions", "skills", "weekly", "1")
+	snapshot := filepath.Join(env.root, "versions", "skills", "weekly", string(version.ResourceUID), "1")
 	require.FileExists(t, filepath.Join(snapshot, "SKILL.md"))
 	require.FileExists(t, filepath.Join(snapshot, "references", "guide.md"))
 }
@@ -495,8 +496,14 @@ func TestRunBaseline_PartialFailureThenRerunCompletes(t *testing.T) {
 	env := newBaselineEnv(t)
 	ctx := context.Background()
 
-	occupied := filepath.Join(env.root, "versions", "skills", "weekly", "1")
-	writeWorkspaceFile(t, env.root, "versions/skills/weekly/1/SKILL.md",
+	// 确定性身份：占位目录必须正好是本次基线将要物化的目标（新发布按身份分段）。
+	uid := fixtureResourceUID(t, core.ResourceSkill, "weekly")
+	env.deps.NewUID = func(kind core.ResourceKind, name string) (core.ResourceUID, error) {
+		return fixtureResourceUIDFor(kind, name), nil
+	}
+	occupiedRel := "versions/skills/weekly/" + string(uid) + "/1"
+	occupied := filepath.Join(env.root, filepath.FromSlash(occupiedRel))
+	writeWorkspaceFile(t, env.root, occupiedRel+"/SKILL.md",
 		"---\nname: weekly\ndescription: 占位内容\n---\n\n别的正文\n")
 
 	err := runBaseline(ctx, env.deps)
@@ -678,10 +685,16 @@ func TestRunBaseline_RepairsMissingSkillSnapshot(t *testing.T) {
 	before, err := env.deps.Resources.Pointer(ctx, core.ResourceSkill, "weekly")
 	require.NoError(t, err)
 
-	require.NoError(t, os.RemoveAll(filepath.Join(env.root, "versions", "skills", "weekly", "1")))
+	versions, err := env.deps.Resources.Versions(ctx, core.ResourceSkill, "weekly")
+	require.NoError(t, err)
+	require.Len(t, versions, 1)
+	// 按登记行解析目录：修复必须在**原目录**重建，不迁移、不改写 storage_path。
+	versionRel, err := workspace.PublishedVersionRelDir(versions[0].StoragePath)
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(filepath.Join(env.root, filepath.FromSlash(versionRel))))
 	require.NoError(t, runBaseline(ctx, env.deps))
 
-	require.FileExists(t, filepath.Join(env.root, "versions", "skills", "weekly", "1", "SKILL.md"))
+	require.FileExists(t, filepath.Join(env.root, filepath.FromSlash(versionRel), "SKILL.md"))
 	require.Equal(t, 1, countResourceVersions(t, env.deps, core.ResourceSkill, "weekly"))
 	after, err := env.deps.Resources.Pointer(ctx, core.ResourceSkill, "weekly")
 	require.NoError(t, err)

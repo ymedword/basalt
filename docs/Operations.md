@@ -47,7 +47,7 @@
 
 #### 2.1.1 生成 token 与注入环境变量
 
-管理 token 是共享凭据：只证明"持有管理面登录资格"，不代表个人身份（无 SSO / RBAC，见 §6 红线段）。生成一次、妥善保存；轮换 = 换值后重启进程。
+管理 token 是**最小管理认证**：只证明"持有管理凭据"，不是个人账户，也不提供企业级身份治理（无 SSO / RBAC，见 §6 红线段）。审计能把操作归因到这份凭据，但多人共用同一 token 时**无法区分到具体的人**——需要按人追责时按角色分开发放，不要共用。生成一次、妥善保存；轮换 = 换值后重启进程。
 
 ```bash
 # 生成 32 字节随机 token（64 位十六进制）；不要用人类可猜的短语
@@ -163,17 +163,26 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 
 | 流量 | 谁控制 | 受不受白名单 |
 | --- | --- | --- |
-| 工具出网（`http_get` / `http_post`）+ 通知投递（`notify`） | **模型**可控 | **是**——`http.allowed_domains` 域名白名单，scheme 固定 http/https（代码固定，配置放行不了） |
-| 供应商模型调用（`providers[].base_url`） | 运维配置 | 否——端点由运维在 `basalt.yaml` 里定，模型碰不到 |
-| MCP server 自己的网络行为 | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §4.3） |
+| 工具出网（`http_get` / `http_post`）+ 通知投递（`notify`） | **模型**可控 | **是**——网络域名白名单（当前生效值）；scheme 固定 http/https（代码固定，配置放行不了） |
+| MCP http 传输的连接 | Basalt 发起 | **是**——连接前按当前生效白名单授权；收紧后不再允许的连接会被断开 |
+| 供应商模型调用（`providers[].base_url`） | 运维配置 | 否——模型连接的独立配置，端点由运维定，模型碰不到 |
+| MCP server 自己的网络行为（stdio 进程内） | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §4.3） |
 
 企业若要求"模型调用也只能出内网"：把 `providers[].base_url` 指向内网网关（vLLM / 一方网关）即可，白名单不需要动。
 
-**代理不由进程自己读**：`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 环境变量在 Basalt 里**一律不生效**（HTTP 客户端不读环境代理）。出网要么直连，要么由**运维侧网关**承担（透明代理 / NAT 出口）——这样"哪条流量从哪个口出去"由网络层决定，而不是由某个进程继承到的环境变量决定（否则同一条 `http_get` 在不同 unit / 容器里走向不同出口，白名单还在、边界已经变了）。MCP server 是独立进程，它读不读代理变量是自己的事（同上表第三行）。
+**代理不由进程自己读**：`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 环境变量在 Basalt 里**一律不生效**（HTTP 客户端不读环境代理）。出网要么直连，要么由**运维侧网关**承担（透明代理 / NAT 出口）——这样"哪条流量从哪个口出去"由网络层决定，而不是由某个进程继承到的环境变量决定（否则同一条 `http_get` 在不同 unit / 容器里走向不同出口，白名单还在、边界已经变了）。MCP server 是独立进程，它读不读代理变量是自己的事（同上表第四行）。
+
+**网络域名白名单：唯一权威源在数据库，页面保存即生效**：
+
+- 权威源是 SQLite 的 `network_domain_policy` 单行。管理台「执行环境 → 网络域名白名单」保存后，**下一次**出站判定即按新规则，**无需重启**；页面显示实际生效的域名、修订号、ETag 与来源
+- `basalt.yaml` 的 `http.allowed_domains` **只在数据库还没有这一行时**作为首次种子（新装 / 空表）；既有实例改配置**不会**覆盖页面保存的值，重启也不回退。排查时先看管理台或 `GET /api/v1/sandbox`，不要只看配置文件
+- 管理写与其他管理端点同一套认证；先校验（非法条目 400）、再比 `If-Match`（412）、再预写审计（`network_allowlist.update`）后落库。失败保留页面输入且**不得**显示成功；并发保存只有一方成功，另一方 409 需重新读取
+- **如实边界**：已发出的请求不能追溯撤回；放宽不自动重连、不补发此前被拒的请求；收紧后不再允许的 MCP http 长连接会断开（保留已应用版本事实），**不自动重连**
 
 **必须记住的生效时间差**：
 
-- **改完需重启**：`http.allowed_domains`、`shell.allowed_commands`、`shell.interpreters`、`shell.env_passthrough`、`sandbox.cross_agent_read`、`mcp_servers.yaml`、`http.addr`
+- **管理台热生效**：网络域名白名单（见上）
+- **改完需重启**：`shell.allowed_commands`、`shell.interpreters`、`shell.env_passthrough`、`sandbox.cross_agent_read`、`mcp_servers.yaml`、`http.addr`
 - **热加载（下一个 Run 生效）**：`.basalt/agents/` 下的 `AGENT.md` 与附属文件
 - **改环境变量也要重启**：`SSL_CERT_FILE` / `SSL_CERT_DIR` 一类只在进程启动时读一次（§2.3）
 
@@ -228,7 +237,7 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 | 内容 | 类别 | 丢了会怎样 |
 | --- | --- | --- |
 | `basalt.db`（+ `-wal` / `-shm`） | **不可再生** | 会话 / 消息 / 运行审计三表 + 管理操作审计 / 资源版本与发布指针 / Run 资源引用 / 记忆（sqlite 档）/ 定时状态全丢 |
-| `control/agents/*.json` | **不可再生** | Agent 生命周期状态（`active` / `disabled` / `archived`）丢失；DB 索引可由状态文件重建，反向不行。缺失时该 Agent 拒绝新 Run（fail-closed），不会静默当作 `active` |
+| `control/agents/*.json` | **不可再生** | Agent 生命周期状态（`active` / `disabled` / `archived`）丢失；DB 索引可由状态文件重建，反向不行。状态文件 schema 2 的 `agent_uid` 是 **Agent 身份**（绑定、专属资源、归档恢复按它关联），丢失后**不得**按同名猜回旧身份。缺失时该 Agent 拒绝新 Run（fail-closed），不会静默当作 `active` |
 | 技能不可变版本快照目录（`resource_versions.storage_path` 指向） | **不可再生** | 已发布技能版本的内容丢失；数据库里的清单与哈希还在，但无法还原文件。Run 冻结的资源清单指向这些版本 |
 | `agents/`、`skills/` | 配置（可重建，但重建成本高） | Agent 与技能全丢 |
 | `memory/*.md`（markdown 档） | **不可再生** | 长期记忆丢（记忆后端为 markdown 时） |
@@ -239,6 +248,8 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 **控制目录 `.basalt/control/` 说明**：`control/agents/*.json` 是 Agent 启停的**唯一权威**（库里的生命周期索引只是可重建副本）。文件由生命周期服务以"同目录临时文件 + 原子 rename"写入，**不得**手工编辑或用脚本改状态——绕过服务写文件会撞上校验和 / 字段校验，校验失败时该 Agent 拒绝新 Run（fail-closed）。该目录同时**不在**配置热加载监听范围、**不在** Agent 文件工具白名单（模型读写它一律被拒）；备份时随 `.basalt/` 整目录一起带走。
 
 **备份一致性**：`basalt.db` 里的资源发布指针、`run_resource_refs` 与技能快照目录**必须**来自**同一次停机快照**。只恢复数据库、不恢复快照目录（或反过来）会得到"指针指向不存在的版本"——恢复验证（§4.3）**必须**检出这类不一致，**不得**当作恢复成功。
+
+**主密钥单独备份**：托管凭据的主密钥（§6.1）在工作区**之外**，`.basalt/` 备份**不含**它。备份数据库时**必须**同时单独备份主密钥文件与它的 `key_id`，并与数据库备份**分开存放**。恢复时必须使用同一把密钥——缺主密钥的数据库备份仍可恢复，但所有托管凭据不可读（只能重新录入），不得尝试伪造密文或静默降级为 env。
 
 **另外，实例配置 `basalt.yaml`（与工作区同级、**不在** `.basalt/` 内）也应一并备份**：它不含明文凭证（`${ENV_VAR}` 占位，见 §6），丢了要重建 provider 端点与各白名单——备份布局见 §4.2（备份目录里 `basalt.yaml` 与 `.basalt/` 并列），恢复验证与真实恢复都按该布局取文件。
 
@@ -303,10 +314,14 @@ set -a; . "$BASALT_ENV_FILE"; set +a              # 与生产 EnvironmentFile= �
 #      已经把生产值载进环境了，"不管它"不会让它消失——不覆盖也不 unset，副本用的就是生产凭证。
 #      unset 后该变量在**发送时**解析失败（点名环境变量的可读错误）= **失败关闭**；
 #      宁可让演练里的调用失败，也不要让副本往生产群里发消息
-#   ③ 出网收口：副本 basalt.yaml 的 http.allowed_domains 改成**只含测试端点**——**写成域名形态**
+#   ③ 出网收口：把副本的白名单改成**只含测试端点**——**写成域名形态**
 #      （localhost，或 hosts 里自造的测试域名）；**裸 IP 字面量会被直接拒**（白名单按域名匹配，
 #      放行 IP 等于绕过它，见技术方案 §4.3.1）。未被列入的域名调用以 sandbox_denied 失败
 #      ——正是演练想要的"副作用走不出去"（把白名单清空是最严的收口，一样达到目的）
+#      ⚠ 副本库自带生产的策略行：改副本 basalt.yaml 的 http.allowed_domains **不会**生效
+#      （配置只在空表时作种子，见 §2.2）。做法二选一：起服务（已停调度）后到管理台
+#      「执行环境 → 网络域名白名单」保存测试端点；或使用空库演练让配置种子生效。
+#      **不得**用 SQL 直接改表——那会绕过审计与恢复，演练证据也就不成立
 
 basalt status
 basalt session list      # 关键判据：能看到备份时点之前已有的会话
@@ -342,7 +357,7 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 1. **停服**：`systemctl stop basalt`
 2. **备份，并保持停机**：按 §4.2 的离线步骤做（**跳过其中 `systemctl start` 那一行**）——升级前必做，这是回滚的唯一依托；备完不起服，直接接第 3 步
 3. **换二进制**：旧版改名留底（`mv basalt basalt.bak-<旧版本>`）→ 放新二进制 → `chmod +x`
-4. **启动并迁移**：`systemctl start basalt`——启动时按 `schema_version` 应用增量 SQL（迁移脚本入库、随二进制发布；**已发布的迁移不得改写**，只许追加新版本）。迁移失败**必须**报错退出——**不得**带着半迁移的库继续跑。US-11 / US-12 的首次升级从 `schema_version=1` 前向到 **2**：新增管理操作审计、资源版本 / 指针 / 引用、Agent 生命周期索引与归档表，**不改既有表**；SQL 迁移后还要执行一次资源基线（为已有 Provider / MCP / 技能建立 v1 已发布版本、为已有 Agent 建立初始状态文件，初始状态 `disabled`）。基线失败同样拒绝启动；重跑必须幂等
+4. **启动并迁移**：`systemctl start basalt`——启动时按 `schema_version` 应用增量 SQL（迁移脚本入库、随二进制发布；**已发布的迁移不得改写**，只许追加新版本）。迁移失败**必须**报错退出——**不得**带着半迁移的库继续跑。US-11 / US-12 的首次升级从 `schema_version=1` 前向到 **2**：新增管理操作审计、资源版本 / 指针 / 引用、Agent 生命周期索引与归档表，**不改既有表**；SQL 迁移后还要执行一次资源基线（为已有 Provider / MCP / 技能建立 v1 已发布版本、为已有 Agent 建立初始状态文件，初始状态 `disabled`）。US-12 范围修订把 **2 → 3**：新增 UID 级资源身份 / 墓碑、凭据与凭据版本、绑定投影、通知 Run 引用与发送明细，重建 `resource_versions` / `notify_channels`，给 `resource_pointers` / `run_resource_refs` / `agent_lifecycle` / `agent_archives` 加列；顺序固定为**状态文件先升级（分配 `agent_uid`、升为 schema 2）→ SQL 迁移 → 绑定回填**。两次迁移失败都拒绝启动、重跑必须幂等；v3 前必须确认**没有活动 Run**。US-12 R7 再把 **3 → 4**：新增 `schedule_deliveries`（每轮运行的系统代投权威记录，主键含运行标识），**只追加新表、不改既有表**；迁移失败同样拒绝启动、重跑幂等。US-12 R8 再把 **4 → 5**：新增 `network_domain_policy` 单行表（网络域名白名单的唯一权威源）；升级后表内无行，**首次启动**按 `basalt.yaml` 的 `http.allowed_domains` 写入种子，此后配置键不再读取、页面保存即热生效（§2.2）。三次迁移失败都拒绝启动、重跑必须幂等。升级到 v5 后旧二进制因 `schema_version` 高于自身支持版本而拒绝启动，回滚仍按 §5.2「备份 + 旧二进制」
 5. **验证**：`basalt status` → `basalt session list` → `GET /api/v1/health` → 跑一次真实调用（同 §4.3 判据的 1~5）
 6. **观察**：`logs/` 里确认无 ERROR 级噪声
 
@@ -351,6 +366,8 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 建议：先用备份在独立目录起一次新版做 dry run（与 §4.3 同一手法，含其中"演练隔离"三步），确认迁移与启动无误再动生产目录。
 
 **升级后的首个动作**：v2 资源基线把既有 Agent 的状态统一初始化为 `disabled`（**不得**在升级瞬间悄悄放行新 Run），因此升级完成后需要逐个复核并按需启用——`POST /api/v1/agents/{name}/enable` 或管理台「Agent → 启用」。这是设计行为，不是迁移失败；`GET /api/v1/profiles` 里 `runnable=false` 是同一件事的表现。
+
+**v3 升级不重置生命周期状态**：`2 → 3` 只为活动 Agent 补 `agent_uid` 并回填可证明的绑定，不改变 `active` / `disabled`。升级后如页面显示某 Agent「引用未记录（迁移前无法证明身份）」，说明该资源名在迁移前经历过删除 / 重建或操作台账缺失——这是如实标记，不是迁移失败；显式重新选择绑定即可恢复准入。数据库迁移失败而状态文件已升级为 schema 2 时，**不得**继续用旧库运行，按 §4.3 恢复备份。
 
 ### 5.2 回滚
 
@@ -399,16 +416,104 @@ systemctl show basalt -p WorkingDirectory -p TimeoutStopUSec -p KillSignal   # �
 systemctl stop basalt && systemctl show basalt -p ActiveState                # 期望 inactive；日志里应有停机收尾序列
 ```
 
+### 5.4 升级说明：MCP 命令白名单与旧格式迁移
+
+US-12 起 MCP supervisor 在建立连接前先做策略判定（约束 47，连接失败即不连接、不接管）：
+
+| 传输 | 连接前判定 | 未通过时 |
+| --- | --- | --- |
+| `stdio` | `command` 的可执行名**必须**在 `shell.allowed_commands` 里 | 拒绝连接，WARN 点名 server 与可执行名 |
+| `http` | URL 的域名**必须**在**当前生效**的网络域名白名单里 | 拒绝连接，WARN 只记 scheme + host |
+
+因此升级后 MCP 全部连不上时，先核对白名单，而不是先怀疑网络：
+
+```bash
+grep -n "allowed_commands" /opt/basalt/basalt.yaml   # stdio server 的 command 是否在内
+# http server 的域名看当前生效值（数据库是权威源，配置只在空表时作种子）：
+curl -s -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" \
+  http://127.0.0.1:8080/api/v1/sandbox | \
+  jq '.data.network_allowlist, .data.http_allowed_domains'
+```
+
+旧格式的多词 `command`（整行命令写在 `command` 里、读取时按空白切分）在**读取既有
+文件**时继续兼容：按约束 8 的兼容路径拆成 `command` + `args`，行为与旧的按空白切分
+逐字等价，启动日志给出 WARN 提示迁移。管理员一旦在管理台**编辑**该条目，候选走
+严格校验，多词 `command` → 400 `BAD_REQUEST` 并点名"改用 `args` 字段"，已发布版本与
+文件**保持不变**。手工改写示例：
+
+```yaml
+# 旧格式：读取兼容，编辑会被拒绝
+servers:
+  - name: files
+    command: "npx -y @modelcontextprotocol/server-filesystem /data"
+
+# 新格式：command 是单个可执行名，参数进 args
+servers:
+  - name: files
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/data"
+```
+
+把 `npx`（或实际可执行名）加入 `basalt.yaml` 的 `shell.allowed_commands` 后重启。
+旧技能目录同样收紧：含二进制文件或软链接的目录无法通过管理台发布，启动时以 WARN
+点名而不是静默跳过；**不得**为兼容旧目录放宽这些边界。
+
+### 5.5 本机重部署（Windows 开发 / 演示实例）
+
+**自动更新本机实例，不手工杀进程、不手工搬文件**。脚本 [scripts/redeploy-local.ps1](../scripts/redeploy-local.ps1) 在实例目录执行：
+
+```powershell
+# 凭据只经进程环境继承；脚本不读取、不打印、不落盘
+$env:BASALT_ADMIN_TOKEN = ...   # 由部署者按 §6 的安全方式注入
+powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1            # 沿用已构建前端
+powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1 -Frontend  # 先重跑前端构建
+```
+
+顺序**必须**是：识别监听 PID → 核验它是本仓库 `bin/basalt` 且命令行含 `serve`（不符即拒绝，`-AllowOtherBinary` 才放行）→ `CGO_ENABLED=0 go build` 到 `bin/basalt.new` → **优雅停止**（CTRL_BREAK；超时才 `taskkill /F` 并在输出里记 `Stop=forced`）→ 旧件留 `bin/basalt.old`、换上新件 → 以同一工作目录启动（独立隐藏控制台，日志写 `<工作目录>/logs/basalt-<时间戳>.out.log` / `.err.log`）→ 校验。
+
+| 校验项 | 判据 |
+| --- | --- |
+| 存活 | `GET /api/v1/health` 返回 `data.status=ok` |
+| 管理认证 | 带 `BASALT_ADMIN_TOKEN` 的 `GET /api/v1/system/overview` 返回 200；缺 token 时明确报 `Admin=unverified`，**不得**当成已验证 |
+| 构建标识 | `/api/v1/info` 的 `version`；`/system/overview` 的 `database.schema_version`（v4 起应为 4） |
+| 前端资源 | 按 `assets/console/dist/integrity.json` 逐项取 `/console/` 与 `/console/assets/...`，SHA256 必须与清单一致；不一致即失败 |
+
+脚本**不改写**配置、工作区、数据库与主密钥，也**不**自动回滚：`schema_version` 是前向迁移，失败时保留 `bin/basalt.old` 与日志供人工按 §5.2 处置。前端资源哈希不符说明运行中的二进制不是当前 `dist`——加 `-Frontend` 重新构建后重跑。
+
+**Windows 启动解析陷阱（脚本已规避，手工启动同样适用）**：同目录若还留着 `bin\basalt.exe`，经 `cmd /c` 或只写无扩展名的 `bin\basalt` 启动时，CreateProcess 会按追加 `.exe` 的规则解析到 `basalt.exe`——结果是旧构建在跑、部署却报成功。演练实测：cmd 启动实际执行的是 `bin\basalt.exe`（schema 2、旧前端 0/3），改成 `Start-Process -FilePath <完整路径>` 直连后才落到新构建（schema 4、资源 3/3）。因此脚本用完整路径直接启动；手工启动也**必须**给完整路径，并用 `Get-CimInstance Win32_Process` 的 `ExecutablePath` 复核实际镜像。
+
 ---
 
 ## 6. 凭证
 
+凭证有两种模式，由资源的 `credential_mode` **显式**声明（服务端不按值的形态推断）：
+
+| 模式 | 定义里存什么 | 真值在哪 | 适用 |
+| --- | --- | --- | --- |
+| `env` | 精确 `${ENV_VAR}` 占位（如 `${DEEPSEEK_API_KEY}`） | 部署者注入进程环境，使用时解析 | 默认；纯 env 实例**不需要**主密钥 |
+| `managed` | 不存明文（通知渠道只存解析出的 host） | `credential_versions` 的 AES-256-GCM 密文；主密钥在工作区之外 | 管理台直接录入 Key / Webhook 地址，无需重启 |
+
 | 位置 | 规则 |
 | --- | --- |
-| `basalt.yaml` 的 `providers[].api_key` | 只允许 `${ENV_VAR}` 占位；启动时解析，未解析（`${` 残留）或为空 → **拒绝启动**并点名配置项 |
+| `basalt.yaml` 的 `providers[].api_key` | 只允许 `${ENV_VAR}` 占位；启动按当前发布版本解析，未解析（`${` 残留）或为空 → **拒绝启动**并点名配置项 |
 | `basalt.yaml` 的 `http.admin_auth.token` | 只允许 `${ENV_VAR}` 占位（如 `${BASALT_ADMIN_TOKEN}`）；`token` 模式下未配置、解析为空或残留 `${` → **拒绝启动**。`local_trust` 模式不读该值，且只在全部监听地址为回环时允许 |
-| 通知渠道（库表 `notify_channels.url`） | **只存 `${ENV_VAR}` 引用**，不存完整地址；发送时解析，解析失败给**点名环境变量**的可读错误 |
-| 作者模型（US-12 的生成能力） | 与 provider 同规则 |
+| 通知渠道（库表 `notify_channels.url`） | `env` 模式**只存 `${ENV_VAR}` 引用**；`managed` 模式 `url` 为空、密文在 `credential_versions`。发送时解析 / 解密，失败给点名原因的可读错误 |
+| 管理台创建的模型连接 / 通知渠道 | 创建时未声明 `credential_mode` 只按 env 规则校验（普通值 → 400 `CREDENTIAL_MODE_REQUIRED`，不推断为 managed）。`managed` 的 Key / 地址是 **write-only**：响应只回 `credential_ref`、`credential_version`、`last4` 与 host；`credential_ref` 由服务端生成，请求体出现 → 400 `CREDENTIAL_REF_READ_ONLY` |
+| 作者模型（US-12 的生成能力） | 与 provider 同规则（env / managed 均可，推荐 env） |
+
+### 6.1 托管凭据与主密钥
+
+- **生成**：32 字节随机值（`openssl rand -base64 32` 或等价命令），存成**工作区之外**的文件（如 `/etc/basalt/master.key`），经 `basalt.yaml` 的 `secrets.master_key_file` 指向；`key_id` 由配置给出，随密文一起记录。**不得**把主密钥放进工作区、仓库、容器镜像或环境变量以外的共享配置。
+- **权限**：Linux `0600` 且属主为服务账户（`chown basalt:basalt`）；Windows 用 `icacls` 把主密钥**文件与父目录**都只授予服务账户、SYSTEM 与管理员组（`icacls <path> /inheritance:r /grant:r "<服务账户>:(R)" "NT AUTHORITY\\SYSTEM:(R)" "BUILTIN\\Administrators:(R)"`；目录带 `(OI)(CI)` 继承标志）。启动与每次使用前都会校验路径、格式与平台权限：Linux 按权限位（目录 0700 / 文件 0600），Windows 读取文件与父目录的实际 DACL——只允许当前进程用户、SYSTEM 与 Administrators 三类受托人，其他用户 / 组（含 `Users`、`Authenticated Users`、AppContainer 包 SID）、缺失或空的 DACL、无法读取的安全描述符一律拒绝并返回 `CREDENTIAL_UNAVAILABLE`。权限在校验之后被放宽，下一次读取会拒绝（不缓存校验结果）。`os.Chmod` 在 Windows 只切只读位，**不得**用它代替 `icacls`。
+- **按需加载**：主密钥**不常驻内存**——每次使用托管凭据时读取并校验（文件缺失 / 权限不符 / 长度不是 32 字节 / `key_id` 不匹配 / 解密失败），失败只影响本次调用（503 `CREDENTIAL_UNAVAILABLE`），**不**自动回退到 env 或旧版本。
+- **启动依赖**：先判定当前发布且被绑定的**托管**模型连接；只有它需要解密时才读取主密钥。纯 env 实例（含只配 env 的模型连接）**不因缺主密钥而启动失败**；通知渠道的托管凭据也不阻断启动，失败发生在发送时。
+- **备份与恢复**：主密钥与数据库**分开备份、分开存放**；恢复时必须是同一 `key_id` 与原密钥，否则所有托管凭据不可读。
+- **丢失的后果**：主密钥丢失 = 现有托管凭据**全部不可恢复**（只能逐个重新录入，生成新凭据版本）；不得尝试改写密文或猜测密钥，也不得把托管凭据静默降级为 env。
+- **撤销与替换**：撤销（`POST /resources/{kind}/{name}/credential/revoke`）**不需要读取主密钥**——它只把该凭据身份的全部版本置 `revoked` 并清空密文；重新录入生成新的 `version_no`，旧版本永不复活。Key 替换 = 新凭据版本，不动定义内容。
+- **混合实例**：同一实例里 env 与 managed 可以并存；启动依赖只由**当前绑定的托管模型连接**决定，不能用「存在凭据行」推断。
 
 红线段（day-one 硬约束，**不得**违反）：
 
@@ -416,6 +521,8 @@ systemctl stop basalt && systemctl show basalt -p ActiveState                # �
 - 管理 admin token **不得**出现在响应 / 日志 / 错误文案 / 管理操作审计——认证成功后只记 `auth_method` 与 `actor_subject`（`token:<指纹>`），不记原值
 - 沙箱越界文案里**嵌着原始目标**（可能就是凭证），**不得**原样透传给响应或日志
 - 页面编辑框**不回填**已存地址，故「`url` 留空 = 保留原值」
+- 托管凭据的明文（Key / 完整 URL）与主密钥**不得**出现在响应、日志、审计 `detail_json`、诊断导出或备份脚本的终端输出；密文与 `last4` 可以出现
+- 主密钥文件**不得**放在工作区内（备份工作区时不得连带打包）；`basalt.yaml` 只写路径，不写密钥内容
 - 环境变量注入方式：systemd `EnvironmentFile=`（文件权限 `600`）或容器 `--env-file`；**不得**走命令行参数（`ps` 可见）或提交进仓库的文件
 
 复核（可复制）：
@@ -423,10 +530,56 @@ systemctl stop basalt && systemctl show basalt -p ActiveState                # �
 ```bash
 grep -rnE "sk-|(api_key|token): [^$]" /opt/basalt/basalt.yaml   # 期望：零命中（占位符以 ${ 开头）
 sqlite3 /opt/basalt/.basalt/basalt.db \
-  "select name, type, length(url) from notify_channels;"    # url 应是 ${...} 占位形态
+  "select name, type, credential_mode, length(url), url_host from notify_channels;"  # env 行 url 应是 ${...}；managed 行 url 为空
+sqlite3 /opt/basalt/.basalt/basalt.db \
+  "select owner_kind, owner_name, state, current_version, revocation_epoch from credentials;"  # 只查元数据
+ls -l /etc/basalt/master.key    # 期望：600，属主为服务账户；路径不在工作区内
 ```
 
-第二条只查 `name` / `type` / 长度——**不得**把 `url` 原值打印出来（一次回显就把它写进了终端历史与截图）。
+前两条只查 `name` / `type` / 模式 / 长度 / host——**不得**把 `url` 原值或密文打印出来（一次回显就把它写进了终端历史与截图）。
+
+### 6.2 `basalt secrets` 命令组
+
+四条子命令共用一条纪律：**不自动轮换**、**只回公开标识**（`key_id` 与指纹，绝不回密钥、密文或渠道地址）、**撤销不解密**。纯 env 部署可以完全跳过本节。
+
+| 命令 | 作用 | 拒绝 / 失败条件 |
+| --- | --- | --- |
+| `basalt secrets init` | 生成 32 字节主密钥写入 `secrets.master_key_file`，Linux 目录 `0700` / 文件 `0600`；Windows 上文件继承父目录 DACL（**部署前**先用 `icacls` 把父目录收成最小权限，否则自检按 §6.1 的 DACL 规则拒绝并删除刚建的文件） | 密钥文件**已存在**（绝不覆盖——覆盖即让现有密文永久不可解）；当前仍有托管凭据依赖（拒绝制造孤儿密文）。两种情况都**零写入** |
+| `basalt secrets status` | 只读报告：是否就绪、`key_id`、指纹、托管依赖计数（模型连接 / 通知渠道各几个） | 未初始化只影响文案，**不是**命令失败——这是部署状态，不是故障 |
+| `basalt secrets verify` | 逐条校验当前 `active` 的托管凭据能否在当前主密钥下解密、目标绑定是否仍与当前定义一致；只回检查与失败计数，明细在 WARN 日志（不含材料） | 失败条数 **> 0** 即非零退出（脚本可判卷）；超过 0 时先查主密钥路径 / 权限 / `key_id`，再决定是否 `revoke-managed` |
+| `basalt secrets revoke-managed --confirm` | 清空全部托管凭据密文、推进撤销纪元、为每条写管理操作行；**不**读取主密钥——服务停止、主密钥丢失时的销毁性恢复 | 缺 `--confirm` 时**零调用零副作用**；执行后旧版本**永不复活**，只能重新录入新凭据版本 |
+
+典型时序：全新实例 `secrets init` → 管理台录入托管凭据 → 日常 `secrets status`；升级或怀疑密钥问题时 `secrets verify`；主密钥确实无法恢复时才 `secrets revoke-managed --confirm`，之后逐个资源重新录入。**不得**把 `revoke-managed` 当常规轮换手段。
+
+### 6.3 一次性初始化导入（仓库外模板）
+
+已有实例补录 `deepseek` 模型连接与 `feishu-ops` 通知渠道时，用 [scripts/import-credentials.ps1](../scripts/import-credentials.ps1)：读仓库外模板 → 经**现有管理写端点**更新既有资源（保留 `resource_uid`，复用服务端加密 / 审计 / 发布路径），不直连数据库、不接触主密钥。
+
+模板是 `KEY=VALUE` 文本，**必须**放在仓库之外（脚本检测到仓库内路径直接拒绝）：
+
+```text
+BASALT_BASE_URL=http://127.0.0.1:8080
+DEEPSEEK_API_KEY=...
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_DEFAULT_MODEL=deepseek-chat
+FEISHU_WEBHOOK_URL=...
+BASALT_ADMIN_TOKEN=...        # 推荐改由进程环境注入，不写进模板
+```
+
+```powershell
+powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
+  -TemplatePath D:\code\basalt-demo-us12\credentials.init -Test
+```
+
+| 行为 | 判据 |
+| --- | --- |
+| 幂等 | 模型连接已是托管凭据且尾号一致 → 跳过；通知渠道已是 `managed_configured` → 跳过（地址无法比对，不猜） |
+| 冲突不覆盖 | 尾号不同且未显式 `-Rotate` → 不动凭据、退出码 **3**；`-Rotate` 才生成新凭据版本 |
+| 模式升级 | env → managed 一次性切换；`base_url` / `default_model` 可在不带 `api_key` 的情况下更新 |
+| 真实测试 | `-Test` 发一次模型最小调用与一次固定文案 `Basalt 连通性测试`；结论分 `success` / `failed` / `unknown`，`unknown` 不显示成已验证 |
+| 输出 | 只含模式、尾号、host、状态与脱敏原因；**不**回显 Key / Webhook 地址 / admin token |
+
+前置：托管写入要求 `secrets.master_key_file` 已配置且主密钥可读（§6.1）；主密钥缺失时按 503 `CREDENTIAL_UNAVAILABLE` 失败，脚本不改用 env 兜底。**通知渠道**还要求**当前生效**的网络域名白名单含目标 host（飞书为 `open.feishu.cn`，§2.2 的同一张白名单）：不在白名单时创建 / 更新返回 400 并点名 host（演练实测），先到管理台「执行环境」补上（保存即生效，无需重启）再导入。导入完成后模板里的明文应删除或转入部署者的密钥保管处——脚本不会自动删文件。admin token **不得**贴进对话或工单，只经进程环境或该模板传递。
 
 ## 7. 每日 Demo 与隔离演练
 
@@ -451,3 +604,22 @@ sqlite3 /opt/basalt/.basalt/basalt.db \
 | 制品与平台 | 二进制与前端资源、平台 / 架构、版本、commit 和 sha256 | 用候选制品走真实控制台、进程树取消、锁、升级 / 恢复；制品变更后重验 |
 
 业务指标默认用低基数维度（操作、结果类别、工具类型）；session_id、run_id、完整 URL、错误原文与凭证不作为指标标签。它们需要关联时放受控日志 / 审计，访问权限与保留期随数据策略一起确定。指标系统若尚未接入，保持为发布 / 扩展阶段设计，不声称已有 Prometheus 或追踪能力。
+
+## 9. 管理面写操作要点（US-12 起）
+
+管理台（`/console/`）的写操作全部先写 `pending` 管理操作再动目标，可在「操作记录」里按 `operation_id` 查证终态。日常写操作有几条固定边界：
+
+| 面 | 固定行为 | 运维注意 |
+| --- | --- | --- |
+| 资源版本 | 版本只追加、不更新不删除；「撤回」用旧版本内容创建新版本，历史版本仍可查 | 版本号逐**资源 UID** 递增；同名删除后重建是**新 UID**，版本从 1 重新计，旧 UID 的版本、凭据与删除事实保留在 `resource_identities` 下可查；按名查询默认只回当前指针 UID |
+| 资源范围 | `shared` = 全部 Agent 可用；`exclusive` = 仅属主 Agent 可用。`shared → exclusive` 前检查其他 Agent 绑定、活动 Run 与消息路由，占用即 409 `RESOURCE_SCOPE_IN_USE`；专属 → 共享保留 UID、版本与引用 | 专属资源对其他人变成「不可见 / 不可选 / 准入拒绝」，不会自动解绑；Agent 复制遇到源专属引用会阻断并要求显式映射 |
+| 托管凭据 | Key / 地址写入 `credentials` + `credential_versions`（AES-256-GCM，主密钥在工作区外）；替换生成新版本，撤销把该身份全部版本置 `revoked` 并清空密文 | 撤销后旧 Run 在下一次模型调用检查点终止；通知发送解析当前 `active` 版本。**不**自动回退到 env，也不恢复旧 Key |
+| 资源绑定 | 绑定唯一权威是 `AGENT.md` 的 `resource_bindings`（`{name, uid}`）；数据库 `agent_resource_bindings` 是可重建投影 | 迁移、复制、恢复、启动、准入、原文保存都**不得**按同名补绑；引用无绑定时准入报 `AGENT_RESOURCE_BINDING_MISSING`，保存时需显式重新选择 |
+| 发布 | 定义文件承载期望内容，发布事实（版本与指针）在数据库；发布失败保留旧文件与旧指针 | 手工编辑定义文件同样走启动对账，不被静默覆盖 |
+| MCP 生效 | 发布版本 ≠ 应用版本即「待重启」；连接失败保留旧应用版本并标记未连接 | 改了 `mcp_servers.yaml` 相关条目后按 §5.4 核对白名单（http 域名在管理台热改，stdio 命令名仍需重启）并重启 |
+| 归档 / 恢复 | 归档把目录移入 `archive/`，会话 / 记忆 / 审计保留；恢复分两条路径：原名要求归档状态文件仍在且为 `archived`，条件迁移后 generation +1；**异名恢复保留原 `agent_uid`**（只改名称），默认 `disabled`。旧归档无可信 UID 标 `legacy_unrecorded`，恢复时生成新 UID | 归档前会等待在途 Run 有界退出，超时 409 且完整回滚；`basalt profile delete` 与页面归档写同一种归档行，可在归档列表看到；目标名被占 409，不自动换名 |
+| 通知渠道 | 地址两模式（env 占位 / managed 密文）；列表只回 `url_host`，`url_host` 为空**不代表**没有地址；删除写墓碑（身份 `state='deleted'`），活动同名新建 409，已删除名可用新 UID 重建；被绑定的 Agent 引用时删除 400 点名 | 全局页的「文档引用的 Agent」是活动与归档 `AGENT.md` 的整词扫描（归档项带 `archive:`），只是线索；**精确范围**由绑定的 UID 决定。Agent 的 `notify_mode` 三态：`none` = 不启用；`all_eligible` = 有资格的全部（共享 + 本人专属）；`allowlist` = `notify_channels` 列出的渠道。空数组**不是** `none`；旧配置空 / 未声明按 `all_eligible`、非空按 `allowlist` 读取。Run 准入冻结**具体渠道 UID 集合**，之后新建的渠道不会加入已运行任务；发送仍需调用时显式指定渠道，没有默认渠道或自动发送 |
+| 迁移 0003 | 升级到 `schema_version=3` 时先给活动 Agent 的状态文件分配 `agent_uid`（升级为 schema 2）、再做 SQL 迁移、最后回填可证明的 `resource_bindings` | 执行前确认**没有活动 Run**；无法证明资源身份连续的引用不写绑定，页面对应显示「引用未记录（迁移前无法证明身份）」，需显式重新选择；数据库迁移失败时状态文件可能已是 v2——按备份恢复，不自动降级 |
+| 工作区浏览 | 只读，根固定 `.basalt/agents/`；不跟随软链接、隐藏 staging / backup 残留；单文件超过 256 KiB 直接拒绝（不截断） | 浏览端点不写审计、不产生管理操作行；文件编辑仍走 Agent 文件提交 |
+
+条件写（修改 / 删除 / 发布）要求 `If-Match` 为当前 ETag 的逐字强 ETag：缺失或不匹配一律 412 且零写入。两个人同时保存时，后写者需要先重新读取 ETag。

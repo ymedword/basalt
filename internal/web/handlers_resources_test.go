@@ -117,15 +117,26 @@ func sampleMcpServerView() McpServerView {
 func sampleModelConnectionView() ModelConnectionView {
 	return ModelConnectionView{
 		Name:               "openai",
+		ResourceUID:        "rs_01J0000000000000000000000A",
 		BaseURL:            "https://api.example.test/v1",
 		APIKeyEnv:          "OPENAI_API_KEY",
 		DefaultModel:       "gpt-test",
+		CredentialMode:     "env",
+		CredentialRef:      "",
+		CredentialState:    "",
+		CredentialVersion:  0,
+		Last4:              "",
+		Scope:              "shared",
+		OwnerAgent:         "",
+		Revision:           1,
 		PublishedVersionID: 5,
 		PublishedVersionNo: 1,
 		AppliedVersionID:   5,
 		AppliedVersionNo:   1,
 		ETag:               `"sha256:` + resourceHashB + `"`,
 		ReferencedBy:       []string{},
+		// R7：本地就绪由管理读面补齐；这里给一个合法枚举值，契约 schema 才能判形状。
+		Availability: core.AvailabilityReady,
 	}
 }
 

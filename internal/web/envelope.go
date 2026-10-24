@@ -40,8 +40,8 @@ const (
 	codeNotConfigured   = "NOT_CONFIGURED" // 契约保留；US-12 作者模型
 	codeInternal        = "INTERNAL"
 
-	// US-11 新增（模块卡 §6.3 固定集合；`IMPORT_REJECTED` 属 US-12，本 US 不产生）。
-	// US-11 additions; IMPORT_REJECTED belongs to US-12.
+	// US-11 新增（模块卡 §6.3 固定集合）。
+	// US-11 additions.
 	codeUnauthorized       = "UNAUTHORIZED"
 	codeForbidden          = "FORBIDDEN"
 	codeEditUnsupported    = "EDIT_UNSUPPORTED"
@@ -49,6 +49,44 @@ const (
 	codeConflict           = "CONFLICT"
 	codePreconditionFailed = "PRECONDITION_FAILED"
 	codeAuthRateLimited    = "AUTH_RATE_LIMITED"
+
+	// US-12 **唯一**新增码（契约 run-and-errors §8 的 400 行）：技能导入拒绝越界
+	// 路径 / 软连接 / 非普通文件 / 超限。其余写面错误全部复用上面的既有常量——
+	// 再加一个码必须先改契约表，否则常量对账用例会红。
+	// US-12's one new code; every other write-surface error reuses the set above.
+	codeImportRejected = "IMPORT_REJECTED"
+	// codeResourceUIDMismatch 是契约 run-and-errors §8 已列出的 409 码：请求携带的
+	// `resource_uid` 与名称当前指针不一致（含缺失）。它不是本模块"新造"的码——契约
+	// 表早就有这一行，这里只是第一次产出。
+	// codeResourceUIDMismatch is the contract's pre-existing 409 code for an explicit
+	// resource_uid that does not equal the current pointer.
+	codeResourceUIDMismatch = "RESOURCE_UID_MISMATCH"
+	// codeAgentCopyBlocked 是复制遇源专属引用且未给映射时的 409（契约 §8 / FR-070）：
+	// 不产生副本、不产生操作行，`data.problems` 列出待映射的资源类别与名称。
+	// codeAgentCopyBlocked refuses a copy whose source-exclusive references lack an
+	// explicit mapping; no copy and no operation row are produced.
+	codeAgentCopyBlocked = "AGENT_COPY_BLOCKED"
+
+	// R4 新增（契约 run-and-errors §8 的凭据 / 范围 / 绑定行）。十条各有固定触发场景：
+	// 保存面 400（模式不符、只读引用、无资格、不可用、缺绑定 / 绑定非法、凭据已撤销）、
+	// 准入面 409（共享转专属仍被引用、跨资源借用凭据）、读取面 503（主密钥读不出密文）。
+	// 码本身与状态都是契约固定字面量，常量对账用例逐条比对；只加常量不加契约行 → 红。
+	// R4 additions: the credential, scope and binding rows of contract §8.
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeCredentialModeRequired = "CREDENTIAL_MODE_REQUIRED" // 400 保存时模式不符且未显式声明
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeCredentialRefReadOnly       = "CREDENTIAL_REF_READ_ONLY"       // 400 请求体自带只读凭据引用
+	codeResourceNotEligible         = "RESOURCE_NOT_ELIGIBLE"          // 400 资源对当前 Agent 无资格
+	codeAgentResourceUnavailable    = "AGENT_RESOURCE_UNAVAILABLE"     // 400 引用资源不存在 / 未发布
+	codeAgentResourceBindingMissing = "AGENT_RESOURCE_BINDING_MISSING" // 400 缺绑定（不按名补）
+	codeAgentResourceBindingInvalid = "AGENT_RESOURCE_BINDING_INVALID" // 400 绑定结构非法
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeCredentialRevoked  = "CREDENTIAL_REVOKED"    // 400 绑定的凭据已撤销
+	codeResourceScopeInUse = "RESOURCE_SCOPE_IN_USE" // 409 共享转专属仍被引用
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeCredentialOwnerMismatch = "CREDENTIAL_OWNER_MISMATCH" // 409 跨资源借用凭据
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeCredentialUnavailable = "CREDENTIAL_UNAVAILABLE" // 503 主密钥读不出密文
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自

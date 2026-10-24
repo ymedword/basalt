@@ -444,7 +444,7 @@ func groupedSysProcAttr() *syscall.SysProcAttr {
 // startGrouped launches a long-lived process with a kill-on-cleanup fallback.
 func startGrouped(t *testing.T, h *harness, env []string, args ...string) *groupedProcess {
 	t.Helper()
-	cmd := h.command(context.Background(), env, args...)
+	cmd := h.command(t, context.Background(), env, args...)
 	cmd.SysProcAttr = groupedSysProcAttr()
 	p := &groupedProcess{
 		cmd:      cmd,
@@ -1275,7 +1275,7 @@ func testWebToolCatalog(t *testing.T) {
 	initWorkspace(t, h)
 	addr := freeLoopbackAddr(t)
 	model := newFakeModel(t)
-	h.writeConfig(t, configWithAddr(model.URL(), addr))
+	h.writeConfig(t, configWithAddr(model.URL(), addr)+mcpShellAllowed())
 	writeWebAgent(t, h, "ops-agent", nil)
 	h.writeMCPServers(t, mcpServersYAML("helper"))
 
@@ -1298,7 +1298,8 @@ func testWebToolCatalog(t *testing.T) {
 		"save_memory", "shell", "write_file",
 	}
 	if len(tools) != len(wantNames) {
-		t.Fatalf("/tools 应有 %d 项，实际 %d 项：%v", len(wantNames), len(tools), tools)
+		t.Fatalf("/tools 应有 %d 项，实际 %d 项：%v\nserve 输出：\n%s",
+			len(wantNames), len(tools), tools, p.combined())
 	}
 	mcpSource := map[string]bool{"blob": true, "boom": true, "echo": true}
 	for i, tool := range tools {

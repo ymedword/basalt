@@ -300,7 +300,8 @@ func TestLifecycle_UnknownAgent_NotFound(t *testing.T) {
 }
 
 // TestLifecycle_ExpectedMismatch_Conflict 覆盖期望状态 / 代数不符 → 409 CONFLICT
-// （错误表第 3 行）：适配器在锁内比较失败，web 只做映射并点名当前代数。
+// （错误表第 3 行）：适配器在锁内比较失败，web 只做映射并点名 Agent。
+// R8 裁决 1 之后文案是固定中文；当前 generation 只进日志，客户端按约定重新读取。
 // 逆改点：冲突被误映射成 404 / 500 → 本用例红。
 func TestLifecycle_ExpectedMismatch_Conflict(t *testing.T) {
 	admin := &lifecycleAdminFake{err: fmt.Errorf(
@@ -312,8 +313,9 @@ func TestLifecycle_ExpectedMismatch_Conflict(t *testing.T) {
 	require.Equal(t, http.StatusConflict, rec.Code, "%s", rec.Body.String())
 	env := decodeAuthEnvelope(t, rec)
 	require.Equal(t, codeConflict, env.Code)
-	require.Contains(t, env.Message, "ops-agent")
-	require.Contains(t, env.Message, "disabled/4", "冲突文案必须点名当前 generation")
+	require.Equal(t, lifecycleConflictMessage("ops-agent"), env.Message)
+	require.NotContains(t, env.Message, "expected_generation",
+		"英文哨兵与内部字段名不得回显")
 }
 
 // TestLifecycle_StateFileMissing_Unavailable 覆盖状态文件缺失 → 409
@@ -322,6 +324,7 @@ func TestLifecycle_ExpectedMismatch_Conflict(t *testing.T) {
 func TestLifecycle_StateFileMissing_Unavailable(t *testing.T) {
 	admin := &lifecycleAdminFake{err: &core.AgentUnavailableError{
 		Name:   "ops-agent",
+		Kind:   core.AgentUnavailableMissing,
 		Reason: "lifecycle state file missing; restore it before running",
 		Cause:  fmt.Errorf("open control/agents/ops-agent.json: %w", fs.ErrNotExist),
 	}}
@@ -333,7 +336,9 @@ func TestLifecycle_StateFileMissing_Unavailable(t *testing.T) {
 	env := decodeAuthEnvelope(t, rec)
 	require.Equal(t, codeAgentUnavailable, env.Code)
 	require.Contains(t, env.Message, "ops-agent")
-	require.Contains(t, env.Message, "lifecycle state file missing")
+	require.Contains(t, env.Message, "生命周期状态文件缺失", "用户可见文案必须是中文（R8 裁决 1）")
+	require.NotContains(t, rec.Body.String(), "lifecycle state file missing",
+		"英文 Reason 只进日志与审计，不得回显")
 	require.NotContains(t, rec.Body.String(), fs.ErrNotExist.Error(),
 		"底层原因只经 Unwrap 暴露，不得进入响应")
 }
@@ -344,6 +349,7 @@ func TestLifecycle_StateFileMissing_Unavailable(t *testing.T) {
 func TestLifecycle_StateFileCorrupt_Unavailable(t *testing.T) {
 	admin := &lifecycleAdminFake{err: &core.AgentUnavailableError{
 		Name:   "ops-agent",
+		Kind:   core.AgentUnavailableCorrupt,
 		Reason: "lifecycle state file corrupt; restore it before running",
 		Cause:  errors.New(`解析状态文件 "D:\\secret\\ops-agent.json" 失败`),
 	}}
@@ -354,7 +360,7 @@ func TestLifecycle_StateFileCorrupt_Unavailable(t *testing.T) {
 	require.Equal(t, http.StatusConflict, rec.Code)
 	env := decodeAuthEnvelope(t, rec)
 	require.Equal(t, codeAgentUnavailable, env.Code)
-	require.Contains(t, env.Message, "lifecycle state file corrupt")
+	require.Contains(t, env.Message, "生命周期状态文件损坏", "用户可见文案必须是中文（R8 裁决 1）")
 	require.NotContains(t, rec.Body.String(), "secret", "绝对路径不得进入失败文案")
 }
 
@@ -364,12 +370,18 @@ func TestLifecycle_StateFileCorrupt_Unavailable(t *testing.T) {
 // 逆改点：只看状态文件不看装载结果 → 「配置无效仍可启用」子例红。
 func TestLifecycle_Enable_InvalidConfig_Unavailable(t *testing.T) {
 	t.Run("names the loader reject reason", func(t *testing.T) {
-		const rejectReason = "frontmatter 无效：未知字段 temperature"
 		admin := &lifecycleAdminFake{record: lifecycleRecord(core.AgentActive)}
 		s := newTestServer(t, func(o *Options) {
 			o.AgentAdmin = admin
 			o.Agents = fakeAgents{entries: []core.AgentEntry{
-				{Name: "ops-agent", Registered: false, RejectReason: rejectReason},
+				{
+					Name:         "ops-agent",
+					Registered:   false,
+					RejectKind:   core.AgentRejectNameMismatch,
+					RejectDetail: "other-agent",
+					// 英文合并拒因只进日志：同一条目上挂着它也不得出现在界面文案里。
+					RejectReason: "name mismatch: other-agent",
+				},
 			}}
 		})
 
@@ -378,7 +390,8 @@ func TestLifecycle_Enable_InvalidConfig_Unavailable(t *testing.T) {
 		require.Equal(t, http.StatusConflict, rec.Code, "%s", rec.Body.String())
 		env := decodeAuthEnvelope(t, rec)
 		require.Equal(t, codeAgentUnavailable, env.Code)
-		require.Contains(t, env.Message, rejectReason)
+		require.Contains(t, env.Message, "目录名与 AGENT.md 的 name 不一致：other-agent")
+		require.NotContains(t, env.Message, "name mismatch", "英文拒因不得进入用户文案")
 		require.Empty(t, admin.transitions(), "配置无效的 Agent 不得触达状态迁移")
 	})
 

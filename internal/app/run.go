@@ -40,8 +40,13 @@ var Version = "dev"
 // 清单只有这一份，判据落在命令名上——装配层不猜意图，命令面也不会因为注册顺序不同
 // 而走到另一条路上。`serve` / `gateway` 自 US-9 起同属重路径（技术方案 §6.5）：两者都
 // 要全量装配，差别只在 HTTP 面与常驻形态。
-// One list, keyed by command name; serve and gateway are heavy since US-9.
-var heavyCommands = []string{"chat", "tool", "serve", "gateway"}
+//
+// `secrets` 自 US-12（T135）起重路径：四条子命令都建立在真库与真主密钥之上——`init`
+// 要统计当前托管依赖、`revoke-managed` 要写撤销行与操作行，`status` / `verify` 读的
+// 也是同一批凭据表。它因此与 `chat` / `tool` 同口径：取实例锁、走迁移，再执行命令；
+// 部署类命令（`revoke-managed` 明确要求服务已停止）与运行实例不并存，锁冲突即是该语义。
+// secrets is heavy since US-12: all four subcommands sit on the real database and key.
+var heavyCommands = []string{"chat", "tool", "serve", "gateway", "secrets"}
 
 // readStoreCommands 是需要**只读库句柄**的命令组：`session list` 要读会话数据，但它
 // **不是**重命令——不取锁、不做恢复、不写库（口径 23：别的实例持锁时也该能看清单）。
@@ -85,8 +90,14 @@ func Run(ctx context.Context, args []string) int {
 		Logger:                 logger,
 		Store:                  storageStore{},
 		Workspace:              workspacePort{},
-		// Agents 是写模式端口（create / delete 由实现侧取实例锁）——构造参数显式传递。
-		Agents: agentsPort{WorkDir: workDir, Logger: logger},
+		// Agents 是写模式端口（create / delete 在实现侧取实例锁、开关库、写操作行）——
+		// schema 目标版本与命令面同源，构造参数显式传递。
+		// The agents port owns the CLI write path; the schema target matches the command face.
+		Agents: agentsPort{
+			WorkDir:                workDir,
+			SupportedSchemaVersion: storage.SupportedSchemaVersion,
+			Logger:                 logger,
+		},
 	}
 
 	// 装配面在这里构造一次，两条路径共用（重路径接管句柄，只读路径只开一次只读库）。
@@ -123,6 +134,13 @@ func Run(ctx context.Context, args []string) int {
 		// 工具清单端口也只在这一次装配之后才有内容（`tool list` 走的就是这条路）。
 		// The tool-listing port also only has content after this assembly.
 		deps.Tools = rt.tools()
+		// secrets 服务面同样只在重路径装配中产出：命令面拿到的是投影端口，不直接
+		// 看见存储或解析器。缺件（理论上的装配缺口）交给命令面按「未装配」报错。
+		// The secrets service is likewise heavy-path-only; the command face gets the
+		// projected port, never the stores or the resolver.
+		if rt.secrets != nil {
+			deps.Secrets = secretsPort{service: rt.secrets, Logger: logger}
+		}
 		// serve / gateway 的信号上下文在这里**唯一一次**派生（约束 24）：`cmd.Context()`
 		// 即 runCtx，cli 不再自建 NotifyContext——两个信号源并存会让调度器的 watcher
 		// 只监听其中一个，停机宽限静默失效。装配阶段仍用原始 ctx（Ctrl-C 保持默认处置）；

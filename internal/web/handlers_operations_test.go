@@ -271,6 +271,8 @@ func TestOperations_DetailRedacted(t *testing.T) {
 		"version_no": 4,
 		"path": "agents/alpha/AGENT.md",
 		"files": ["agents/alpha/AGENT.md", "agents/alpha/memory/core.md"],
+		"before_revision": 3,
+		"after_revision": 4,
 		"token": "sk-secret-token",
 		"api_key": "sk-live-123",
 		"content": "用户原始请求正文",
@@ -303,6 +305,9 @@ func TestOperations_DetailRedacted(t *testing.T) {
 		require.Equal(t, float64(4), detail["version_no"])
 		require.Equal(t, "agents/alpha/AGENT.md", detail["path"])
 		require.Equal(t, []any{"agents/alpha/AGENT.md", "agents/alpha/memory/core.md"}, detail["files"])
+		// 网络白名单的恢复证据（run-and-errors §8）：三态判定需要修订号区间。
+		require.Equal(t, float64(3), detail["before_revision"])
+		require.Equal(t, float64(4), detail["after_revision"])
 
 		for _, key := range []string{"token", "api_key", "content", "absolute_path"} {
 			require.NotContains(t, detail, key, "未列入白名单的键必须被丢弃")
@@ -443,4 +448,162 @@ func TestOperations_MissingPort(t *testing.T) {
 	detail := serveAdmin(srv, adminRequest(http.MethodGet, "/api/v1/operations/op-1", ""))
 	require.Equal(t, http.StatusInternalServerError, detail.Code)
 	require.Equal(t, messageInternal, decodeRunEnvelope[any](t, detail).Message)
+}
+
+// TestOperations_ListProjectsNewActionGroups 覆盖 US-12 新动作组在列表视图里的
+// 逐字投影（模块卡 §3.2 handlers_operations_test.go 第 1/3 例）：action /
+// target_kind / target_id 是审计事实的自由文本，handler 不得按动作组过滤、改写
+// 或二次排序；四个新 target_kind 与 agent 的新动作必须同表出现。
+// 逆改点：按动作组过滤行 / 改写 target_kind / 二次排序 / 状态码被重写 → 红。
+func TestOperations_ListProjectsNewActionGroups(t *testing.T) {
+	created := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	records := []core.OperationRecord{
+		{OperationID: "op-01", Action: "agent.create", TargetKind: "agent", TargetID: "alpha", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created, FinishedAt: created.Add(time.Second)},
+		{OperationID: "op-02", Action: "agent.enable", TargetKind: "agent", TargetID: "alpha", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-03", Action: "agent.files.update", TargetKind: "agent", TargetID: "alpha", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-04", Action: "agent.copy", TargetKind: "agent", TargetID: "beta", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-05", Action: "agent.archive", TargetKind: "agent", TargetID: "alpha", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-06", Action: "agent.restore", TargetKind: "agent", TargetID: "alpha", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-07", Action: "model_connection.update", TargetKind: "model_connection", TargetID: "aux", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-08", Action: "mcp_server.publish", TargetKind: "mcp_server", TargetID: "files", Status: core.OperationUnknown, ResultCode: "", CreatedAt: created},
+		{OperationID: "op-09", Action: "skill.delete", TargetKind: "skill", TargetID: "docs", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-10", Action: "notify_channel.create", TargetKind: "notify_channel", TargetID: "alerts", Status: core.OperationSuccess, ResultCode: "OK", CreatedAt: created},
+		{OperationID: "op-11", Action: "model_connection.test", TargetKind: "model_connection", TargetID: "aux", Status: core.OperationFailed, ResultCode: "TIMEOUT", ErrorMessage: "模型连接测试超时", CreatedAt: created},
+	}
+	fake := &operationFake{listed: records}
+	srv := newOperationServer(t, fake)
+
+	rec := serveAdmin(srv, adminRequest(http.MethodGet, "/api/v1/operations?limit=200", ""))
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	env := decodeRunEnvelope[[]OperationView](t, rec)
+	require.Len(t, env.Data, len(records), "新动作组的操作行必须全部投影，不得按动作组过滤")
+	for index, want := range records {
+		got := env.Data[index]
+		require.Equal(t, want.OperationID, got.OperationID, "列表必须保持仓储的固定排序，位置 %d", index)
+		require.Equal(t, want.Action, got.Action, "动作字面量必须逐字投影")
+		require.Equal(t, want.TargetKind, got.TargetKind, "target_kind 必须逐字投影")
+		require.Equal(t, want.TargetID, got.TargetID)
+		require.Equal(t, string(want.Status), got.Status)
+		require.Equal(t, want.ResultCode, got.ResultCode)
+		require.Equal(t, want.ErrorMessage, got.ErrorMessage)
+	}
+	kinds := make(map[string]bool, len(env.Data))
+	for _, view := range env.Data {
+		kinds[view.TargetKind] = true
+	}
+	for _, kind := range []string{"model_connection", "mcp_server", "skill", "notify_channel"} {
+		require.True(t, kinds[kind], "新动作组的 target_kind 必须出现在列表中：%s", kind)
+	}
+	require.Empty(t, env.Data[1].FinishedAt, "未结束的时间零值必须渲染空串")
+}
+
+// TestOperations_FilterAcceptsNewTargetKinds 覆盖新动作组的过滤面（第 2/3 例）：
+// 四个新 target_kind 与带点的新动作字面量必须原样交给仓储——target_kind 是闭集
+// 且已含新组，action / target_id 是自由文本，web 层不改写、不裁剪。
+// 逆改点：新 kind 被判非法（400）/ 过滤被改写或部分丢弃 → 红。
+func TestOperations_FilterAcceptsNewTargetKinds(t *testing.T) {
+	cases := []struct {
+		kind   string
+		action string
+	}{
+		{"model_connection", "model_connection.update"},
+		{"mcp_server", "mcp_server.publish"},
+		{"skill", "skill.delete"},
+		{"notify_channel", "notify_channel.create"},
+		{"network_allowlist", "network_allowlist.update"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			fake := &operationFake{listed: []core.OperationRecord{}}
+			srv := newOperationServer(t, fake)
+
+			rec := serveAdmin(srv, adminRequest(http.MethodGet,
+				"/api/v1/operations?target_kind="+tc.kind+"&action="+tc.action+"&target_id=alpha&status=pending&limit=25", ""))
+
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.Equal(t, core.OperationFilter{
+				Action:     tc.action,
+				TargetKind: tc.kind,
+				TargetID:   "alpha",
+				Status:     "pending",
+				Limit:      25,
+			}, fake.lastFilter(t), "新动作组的过滤条件必须原样交给仓储")
+			require.Equal(t, 1, fake.listCallCount())
+		})
+	}
+}
+
+// TestOperations_DetailNewActionGroupsRedacted 覆盖新动作组的详情投影（第 3/3 例）：
+// 白名单是闭集（views.go 的 projectOperationDetailValue），US-12 新增的记账键
+// （forced / before_state / archive_id / index_write …）与命令 / 环境变量 /
+// 绝对路径一律不出站；白名单内的版本号与哈希照常投影。扩展白名单是**有意的
+// 契约变更**，必须先改白名单再改本用例，不得反向放宽。
+// 逆改点：整段 detail 出站 / 记账键被放行 / 敏感值泄漏 → 红。
+func TestOperations_DetailNewActionGroupsRedacted(t *testing.T) {
+	const (
+		candidate = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		previous  = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	)
+
+	t.Run("版本号与哈希照常投影，命令 / 环境变量 / 绝对路径丢弃", func(t *testing.T) {
+		fake := &operationFake{detail: core.OperationRecord{
+			OperationID: "op-mcp",
+			Action:      "mcp_server.update",
+			TargetKind:  "mcp_server",
+			TargetID:    "files",
+			Status:      core.OperationSuccess,
+			DetailJSON: []byte(`{
+				"version_no": 3,
+				"candidate_sha256": "` + candidate + `",
+				"previous_sha256": "` + previous + `",
+				"path": "mcp_servers.yaml",
+				"files": ["mcp_servers.yaml"],
+				"command": "npx",
+				"env": {"FILES_TOKEN": "sk-live-123"},
+				"transport": "stdio",
+				"absolute_path": "C:\\secret\\mcp.json"
+			}`),
+		}}
+		srv := newOperationServer(t, fake)
+
+		rec := serveAdmin(srv, adminRequest(http.MethodGet, "/api/v1/operations/op-mcp", ""))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		env := decodeRunEnvelope[OperationDetailView](t, rec)
+		require.Equal(t, float64(3), env.Data.Detail["version_no"])
+		require.Equal(t, candidate, env.Data.Detail["candidate_sha256"])
+		require.Equal(t, previous, env.Data.Detail["previous_sha256"])
+		require.Equal(t, "mcp_servers.yaml", env.Data.Detail["path"])
+		require.Equal(t, []any{"mcp_servers.yaml"}, env.Data.Detail["files"])
+		for _, key := range []string{"command", "env", "transport", "absolute_path"} {
+			require.NotContains(t, env.Data.Detail, key, "未列入白名单的键必须被丢弃")
+		}
+		body := rec.Body.String()
+		for _, leaked := range []string{"npx", "sk-live-123", "mcp.json"} {
+			require.NotContains(t, body, leaked, "敏感内容不得出现在响应体")
+		}
+	})
+
+	t.Run("归档与通知删除的记账键不投影", func(t *testing.T) {
+		fake := &operationFake{detail: core.OperationRecord{
+			OperationID: "op-notify",
+			Action:      "notify_channel.delete",
+			TargetKind:  "notify_channel",
+			TargetID:    "alerts",
+			Status:      core.OperationSuccess,
+			DetailJSON:  []byte(`{"forced":true,"before_state":"active","archive_id":"alpha-20261022-090000","index_write":"deferred","url":"${ALERT_URL}"}`),
+		}}
+		srv := newOperationServer(t, fake)
+
+		rec := serveAdmin(srv, adminRequest(http.MethodGet, "/api/v1/operations/op-notify", ""))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		env := decodeRunEnvelope[OperationDetailView](t, rec)
+		require.Empty(t, env.Data.Detail, "白名单闭集不包含 US-12 新增的记账键")
+		require.Equal(t, "notify_channel.delete", env.Data.Action)
+		require.Equal(t, "alerts", env.Data.TargetID)
+		body := rec.Body.String()
+		for _, leaked := range []string{"ALERT_URL", "alpha-20261022-090000", "before_state"} {
+			require.NotContains(t, body, leaked)
+		}
+	})
 }

@@ -269,6 +269,13 @@ func (s *stubLifecyclePort) Bootstrap(_ context.Context, agent, operationID stri
 	return core.LifecycleRecord{Agent: agent, State: core.AgentDisabled, Generation: 1, OperationID: operationID}, nil
 }
 
+func (s *stubLifecyclePort) BootstrapIdentity(_ context.Context, agent string, agentUID core.AgentUID, operationID string) (core.LifecycleRecord, error) {
+	s.calls = append(s.calls, "bootstrap_identity")
+	return core.LifecycleRecord{
+		Agent: agent, AgentUID: agentUID, State: core.AgentDisabled, Generation: 1, OperationID: operationID,
+	}, nil
+}
+
 func (s *stubLifecyclePort) Discard(_ context.Context, _, _ string) error {
 	s.calls = append(s.calls, "discard")
 	return nil
