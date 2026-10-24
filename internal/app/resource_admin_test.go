@@ -2458,9 +2458,11 @@ func TestMCPTest_NoProcessOnPreWriteFailure(t *testing.T) {
 // **预写之前**的 409，零操作行；预写之后的失败必须回填终态并带回 operation_id。
 // ---------------------------------------------------------------------------
 
-// unlockTreeOnCleanup 在清理阶段解除只读位：Windows 下 t.TempDir 的 RemoveAll 删不掉
-// 只读文件，而已发布技能版本目录按要求是 0o444 / 0o555。
-// unlockTreeOnCleanup clears read-only bits so temp-dir cleanup can remove them.
+// unlockTreeOnCleanup 在清理阶段解除只读位：已发布技能版本目录按要求是 0o444 / 0o555，
+// 而 t.TempDir 的 RemoveAll 两平台都会因此失败——Windows 删不掉只读属性为只读的文件，
+// Linux 的 0o555 目录不允许 unlink 其子项（CI 实测：TempDir RemoveAll permission denied）。
+// unlockTreeOnCleanup clears read-only bits so temp-dir cleanup can remove them on both
+// platforms (Windows read-only attributes; Linux 0o555 directories blocking unlink).
 func unlockTreeOnCleanup(t *testing.T, root string) {
 	t.Helper()
 	t.Cleanup(func() {

@@ -1519,6 +1519,7 @@ T052 收口后复核「已实现但当时因兄弟任务锚点缺位未翻转」
 | 2026-10-23 | 文档判卷首轮静默通过：`markdownlint-cli2.mjs`（非 bin 入口）对 `docs/Operations.md` 返回 0 issues，对故意非法的 `bad.md` 也返回 0 | 入口点错误——该文件不是 CLI；`package.json` 的 bin 是 `markdownlint-cli2-bin.mjs`，"零诊断"实为"没检查" | 负对照改用正确入口后报 `MD025/single-title`、EXIT=1；同一入口复判 `docs/Operations.md` 得 0 诊断 | 1 |
 | 2026-10-24 | R8R 收口 stage 首跑：`012-web-errors-zh` 报 `required test did not execute and pass: TestProblemMessages_ProjectsEachEntryAndNeverNil`；其余 53/54 check passed，`status=failed`、`exit=1`（报告 `.loop/runs/us12-stage-r8-closeout-full-2/report.json`） | 非实现缺陷——R8R-01 重写 `internal/web/errors_zh_test.go` 时删掉了该同名用例与两个 `TestProblemText_*` 前缀表用例；类型化断言已覆盖同一语义 | 恢复 `TestProblemMessages_ProjectsEachEntryAndNeverNil`（逐条目投影、空切片非 nil、中文文案），把两个因前缀表移除而失效的锚点替换为 `TestAgentRejectMessage_TypedKindsBecomeChinese` / `TestAgentRejectMessage_CoversEveryDefinedKind` / `TestEntryRejectMessage_IgnoresEnglishReason`（18 例表、15 类覆盖、英文不外泄）；stage approval 记录判据面变更；复跑 54/54 passed（§6） | 1 |
 | 2026-10-24 | 首跑被控制侧 `TaskStop` 终止后，acceptance 进程（pid 9776）仍存活并持 `.loop/lock`；第二跑 `exit=0` 报 `exclusive harness lock unavailable`，现场目录 `us12-stage-r8-closeout-lockconflict` 保留 | `TaskStop` 只停 shell 包装，`acceptance.114` 及其 `go.exe` 子进程未随 shell 退出 | 确认 9776 / 25424 / 6284 / 39388 / 41048 属同一进程树后逐个终止；`acceptance` / `go.exe` 清零、确认 pid 已死后删除陈旧锁；stage protect 追加 4 条 R8R 触及的既有文件（`stage_sha256` 更新为 `53a29314…`），在干净目录重跑 | 1 |
+| 2026-10-24 | US-12 收口后 CI（run 40071215899，`main` @ `84064ba`）`test` job 红：`test` / `test-integration` / `cover` 三目标同因失败——`TestWire_ResourceAdminPortWiring` 报 `TempDir RemoveAll cleanup: unlinkat …/versions/skills/wire-skill/<uid>/1/SKILL.md: permission denied`（Linux 专属；Windows 本地全绿，断言本身全过） | 非产品缺陷：技能已发布版本目录按约束 25 是 0o444 / 0o555，Linux 下只读目录（0o555）不允许 unlink 子项；wire 夹具未在清理阶段解除只读位（`resource_admin_test.go` 的既有 `unlockTreeOnCleanup` 只被资源写面用例调用） | `newWireFixture` 统一登记 `unlockTreeOnCleanup(t, workDir)`（只动测试清理，不改断言 / 阈值 / 判据面），并修正助手注释对两平台机制的描述；本地 `make check` EXIT=0，全量 stage 复跑 54/54（§7） | 1 |
 
 ## 3. 停止预算与计数
 
@@ -1845,3 +1846,33 @@ cd assets/console && npm test && npm run typecheck && npm run build
 - 441 条存量中文日志未就地转换，清单在 `docs/us/us12-r8-chinese-log-inventory.md`；不声称日志已全英文。
 - R8R 后二进制未重部署 8080（当前实例仍为 R7 的构建，schema 4）；`credentials.init` 仍待用户处置。
 - analyze 表的 A-1（SC-033 措辞）、A-5（模块卡测试文件名）、A-6（模块卡头部状态）记录为文档修正项，本轮未改冻结输入。
+
+## 7. 收口后 CI 修复轮（2026-10-24）
+
+### 7.1 现象与定位
+
+- CI run `40071215899`（push `main` @ `84064ba`）：`build（CGO_ENABLED=0 四平台交叉编译）` 与 `console` 绿，`test（默认 CGO…）` job 红。
+- 三个红目标同因：`test` / `test-integration` / `cover`；唯一失败用例 `TestWire_ResourceAdminPortWiring`。
+- 报错原文：`testing.go:1619: TempDir RemoveAll cleanup: unlinkat /tmp/TestWire_ResourceAdminPortWiring…/001/.basalt/versions/skills/wire-skill/<uid>/1/SKILL.md: permission denied`。
+- 用例断言全部通过；失败发生在 `t.TempDir()` 清理阶段，Linux 专属（Windows 本地与 `make check` 均绿）。
+- 现场证据：artifact `acceptance-evidence` → `ci-40071215899-1/{test,test-integration,cover}.log`。
+
+### 7.2 根因
+
+- 技能已发布版本目录按约束 25 置为只读：文件 0o444、目录 0o555（`internal/workspace/skill_admin.go`）。
+- Linux 的 unlink 需要**父目录**写权限，0o555 目录内的文件删不掉；Windows 则是只读属性挡住 `RemoveAll`。
+- 既有助手 `unlockTreeOnCleanup` 只被 `resource_admin_test.go` 的资源写面用例调用；wire 夹具（`newWireFixture`）从未登记，而 `TestWire_ResourceAdminPortWiring` 会经真实写路径发布技能版本。
+
+### 7.3 修复
+
+- `internal/app/wire_test.go`：`newWireFixture` 在 `workspace.Init` 后登记 `unlockTreeOnCleanup(t, workDir)`——cleanup 后注册先执行，早于 `t.TempDir` 的 RemoveAll，覆盖全部 wire 用例。
+- `internal/app/resource_admin_test.go`：修正助手注释，写明 Linux（0o555 目录阻断 unlink）与 Windows（只读属性）两平台机制。
+- 产品代码零变更；断言 / `required_tests` / 阈值 / stage / acceptance 一字未动（判据面无变更）。
+
+### 7.4 验证读数
+
+- 受影响用例：`go test -count=1 -run 'TestWire_ResourceAdminPortWiring|TestWire_NotifyAdminPortWiring' ./internal/app` → `ok`。
+- `make check` EXIT=0，七目标全绿，覆盖率判据全部达标（`internal/app` 75.01%，`check-coverage: 全部包达标`）。
+- 全量 stage 复跑 `us12-stage-ci-fix-1`：54/54 check passed，`passed_tests` 5330、`skipped_tests` 21、`status=passed`、`exit=0`；源码指纹 `887ef8d3…`、base `84064ba`、`dirty=true`；`stage_sha256 53a29314…` 与 `acceptance_sha256 686fd775…` 与 §6 一致（stage 文件未改）。
+- report sha256 `b32ea1fe…`；record sha256 `02471099…`。
+- **未验证**：Linux 侧行为只能由修复后的 CI run 复核（本机只有 Windows）；修复提交后以新 run 结论为准，若再红按同一口径继续定位，不调判据。

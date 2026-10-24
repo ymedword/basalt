@@ -72,6 +72,12 @@ func newWireFixture(t *testing.T) *wireFixture {
 	root := filepath.Join(workDir, workspaceDirName)
 	_, err := workspace.Init(root)
 	require.NoError(t, err, "工作区骨架是重路径的前置条件")
+	// 技能写面用例会在夹具里发布真实版本：已发布版本目录按约束 25 是只读的
+	// （文件 0o444、目录 0o555），临时目录清理必须先解除只读位——Linux 下 0o555
+	// 目录不允许 unlink 子项，Windows 下只读属性同样挡住 RemoveAll。夹具统一登记，
+	// 用例不需要各自处理（CI 在 Linux 上判红过：TempDir RemoveAll permission denied）。
+	// Published skill versions are read-only; unlock them before TempDir cleanup.
+	unlockTreeOnCleanup(t, workDir)
 
 	logs := &bytes.Buffer{}
 	f := &wireFixture{
