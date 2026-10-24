@@ -46,11 +46,9 @@ export const DURATION_MEASURED = false
 export function extractBasaltCommands(markdown) {
   return [...markdown.matchAll(/^\s*basalt\s+[^\r\n]+/gm)].map(match => match[0].trim())
 }
-export function assertQuickstartParity(readme, zhReadme) {
-  for (const [name, text] of [['README.md', readme], ['README.zh-CN.md', zhReadme]]) {
-    const block = text.match(/<!-- quickstart-commands:start -->([\s\S]*?)<!-- quickstart-commands:end -->/)
-    if (!block) throw new Error(`${name}: missing quickstart-commands block`)
-    if (JSON.stringify(extractBasaltCommands(block[1])) !== JSON.stringify(QUICKSTART_COMMANDS)) throw new Error(`${name}: quickstart command sequence drifted`)
-  }
+export function assertQuickstartParity(readme) {
+  const block = readme.match(/<!-- quickstart-commands:start -->([\s\S]*?)<!-- quickstart-commands:end -->/)
+  if (!block) throw new Error('README.md: missing quickstart-commands block')
+  if (JSON.stringify(extractBasaltCommands(block[1])) !== JSON.stringify(QUICKSTART_COMMANDS)) throw new Error('README.md: quickstart command sequence drifted')
   return true
 }

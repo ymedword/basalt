@@ -26,14 +26,13 @@ func TestPublicDocs_UseAgentFlag(t *testing.T) {
 		return string(data)
 	}
 	t.Run("public", func(t *testing.T) {
-		for _, name := range []string{"README.md", "README.zh-CN.md"} {
-			text := read(t, name)
-			if strings.Contains(text, "--profile") {
-				t.Fatalf("%s still documents --profile", name)
-			}
-			if !strings.Contains(text, "basalt chat --agent") {
-				t.Fatalf("%s does not document basalt chat --agent", name)
-			}
+		const name = "README.md"
+		text := read(t, name)
+		if strings.Contains(text, "--profile") {
+			t.Fatalf("%s still documents --profile", name)
+		}
+		if !strings.Contains(text, "basalt chat --agent") {
+			t.Fatalf("%s does not document basalt chat --agent", name)
 		}
 	})
 	t.Run("requirements-local", func(t *testing.T) {

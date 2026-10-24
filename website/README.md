@@ -18,11 +18,15 @@ The development URL includes `/basalt/`. Use `dev --host 127.0.0.1` for a loopba
 
 English pages live at the directory root; Chinese pages live under `zh/`. Maintain the four matching pages together. Navigation, footer destinations and language mappings come from `.vitepress/data/navigation.mjs`. Language switching preserves the current page, query and fragment; unknown pages return to the selected language's homepage.
 
-`.vitepress/data/quickstart.mjs` is the command source. The two root READMEs contain exactly one `quickstart-commands:start` / `quickstart-commands:end` marker pair. Update the source, both marked command sequences and both quickstart pages together. `content.test.mjs` extracts and compares all six commands; it also verifies prerequisites and lifecycle instructions. Do not add an independent command list to a Vue component. Keep `DURATION_MEASURED=false` until a complete tutorial has been timed; do not add estimated durations.
+`.vitepress/data/quickstart.mjs` is the command source. The root README is English only and contains exactly one `quickstart-commands:start` / `quickstart-commands:end` marker pair. Update the source, the marked README command sequence and both language versions of the website quickstart together. `content.test.mjs` extracts and compares all six commands; it also verifies prerequisites and lifecycle instructions. Do not add an independent command list to a Vue component. Keep `DURATION_MEASURED=false` until a complete tutorial has been timed; do not add estimated durations.
 
 `.vitepress/data/capabilities.mjs` separates six platform highlights from five implementation capabilities. Each item references existing implementation evidence. Do not present architecture goals as delivered features.
 
-The root READMEs introduce the product, explain its benefits, show one compact architecture image, and provide a runnable quickstart and task-oriented documentation links. Keep detailed architecture views in the architecture pages. Windows build instructions and the complete minimal configuration remain available in collapsible sections; the six canonical commands appear in three blocks inside the single marker pair.
+The root README introduces the product, explains its benefits, shows one compact architecture image, and provides a runnable quickstart and task-oriented documentation links. Its centered header reuses the fixed-color blue rock-column icon; the heading and surrounding text use GitHub's theme colors. It has no language selector; the linked website remains bilingual. Keep detailed architecture views in the architecture pages. Windows build instructions and the complete minimal configuration remain available in collapsible sections; the six canonical commands appear in three blocks inside the single marker pair.
+
+## Licensing
+
+The repository root holds the authoritative `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES`. `public/` contains byte-identical copies so the built site distributes the same license and third-party notices at its root; `content.test.mjs` checks the copies against the repository files. Update both locations together.
 
 ## Re-capture the local CLI demo
 

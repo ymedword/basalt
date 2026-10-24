@@ -1,14 +1,18 @@
+<!-- markdownlint-configure-file {"MD041":false,"MD033":{"allowed_elements":["a","details","div","img","summary"]}} -->
+
+<div align="center">
+
+<img src="website/public/brand/favicon.svg" width="48" height="52" alt="">
+
 # Basalt
 
-<!-- markdownlint-configure-file {"MD033":{"allowed_elements":["a","details","summary"]}} -->
+**A self-hosted Agent OS for enterprise teams.**
 
-[简体中文](README.zh-CN.md)
+Independent agents. Shared infrastructure.
 
-**Independent agents. Shared infrastructure.**
+[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)
 
-Basalt is a self-hosted Agent OS for enterprise teams. Define independent business agents through directories and declarative configuration, with their own models, tools, sessions and scoped memory. Share execution, connections, scheduling, storage and auditing across the platform.
-
-[Quick start](#quick-start) · [Documentation](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Issues](https://github.com/ymedword/basalt/issues)
+</div>
 
 ## Why Basalt
 
@@ -138,6 +142,10 @@ basalt session list
 | Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |
 
 The management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.
+
+## License
+
+Original Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.
 
 ## Feedback and contributions
 

@@ -238,6 +238,11 @@ jobs:
       - name: Cross-compile development harness for Windows
         run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /tmp/acceptance-windows.exe ./scripts/acceptance
 
+      # 上传产物必须随附许可与第三方声明，不等正式 Release 打包。
+      # Every uploaded binary artifact carries LICENSE, NOTICE and THIRD_PARTY_NOTICES.
+      - name: Stage license notices with binaries
+        run: cp LICENSE NOTICE THIRD_PARTY_NOTICES bin/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

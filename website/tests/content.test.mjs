@@ -9,7 +9,7 @@ import { isForbiddenPath } from '../scripts/check-links.mjs'
 import { replyFor } from '../demo/local-model.mjs'
 
 const root = new URL('../../', import.meta.url)
-export const CONTENT_FILES = ['README.md', 'README.zh-CN.md', ...ROUTES.flatMap(route => ['en', 'zh'].map(locale => `website${route[locale]}index.md`)), 'website/.vitepress/data/quickstart.mjs', 'website/demo/transcript.json', 'website/.vitepress/theme/components/CapabilityGrid.vue', 'website/.vitepress/theme/components/CliDemo.vue']
+export const CONTENT_FILES = ['README.md', ...ROUTES.flatMap(route => ['en', 'zh'].map(locale => `website${route[locale]}index.md`)), 'website/.vitepress/data/quickstart.mjs', 'website/demo/transcript.json', 'website/.vitepress/theme/components/CapabilityGrid.vue', 'website/.vitepress/theme/components/CliDemo.vue']
 export async function loadContentFiles() {
   return Object.fromEntries(await Promise.all(CONTENT_FILES.map(async file => [file, await readFile(new URL(file, root), 'utf8')])))
 }
@@ -21,7 +21,7 @@ export function checkPublicContent(files) {
   const report = (file, reason) => findings.push({ file, reason })
   for (const file of CONTENT_FILES) if (typeof files[file] !== 'string') report(file, 'missing-file')
   if (findings.length) return findings
-  try { assertQuickstartParity(files['README.md'], files['README.zh-CN.md']) } catch (error) { report('README', error.message) }
+  try { assertQuickstartParity(files['README.md']) } catch (error) { report('README', error.message) }
   const titles = new Set()
   const descriptions = new Set()
   const duration = /(?:\d+|[一二三四五六七八九十两]+|one|two|three|four|five|ten)\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?|milliseconds?|ms)\b|(?:\d+|[一二三四五六七八九十两]+|几)\s*(?:小时|分钟|毫秒|秒(?:钟)?)/i
@@ -59,10 +59,9 @@ export function checkPublicContent(files) {
     if (/supports distributed|supports vector|支持分布式|支持向量检索|自动生成技能/i.test(statement)) report(locale, 'future-capability-claim')
     for (const name of ['daily-report', 'file-review']) {
       if (!architecture.includes(name)) report(locale, `missing-agent-example-${name}`)
-      if (!files[locale === 'zh' ? 'README.zh-CN.md' : 'README.md'].includes(name)) report(locale, `missing-readme-agent-${name}`)
     }
   }
-  if (!files['README.md'].includes('[简体中文](README.zh-CN.md)') || !files['README.zh-CN.md'].includes('[English](README.md)')) report('README', 'missing-language-links')
+  for (const name of ['daily-report', 'file-review']) if (!files['README.md'].includes(name)) report('README', `missing-readme-agent-${name}`)
   for (const [file, text] of Object.entries(files).filter(([file]) => file.startsWith('README'))) {
     const diagrams = [...text.matchAll(/!\[[^\]]*\]\([^)]*diagrams\/[^/]+\/([^.)]+)\.svg\)/g)].map(match => match[1])
     if (JSON.stringify(diagrams) !== JSON.stringify(['system-architecture'])) report(file, 'readme-diagram-scope')
@@ -101,5 +100,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.equal(resolveFooter('en').length, 3)
     assert.equal(resolveFooter('zh').length, 3)
     assert.equal(resolveFooter('en').flatMap(group => group.links).length, 9)
+  })
+  // 站点分发包必须携带与仓库根一致的许可与第三方声明。
+  // The deployed site must carry the same license and notices as the repository root.
+  test('website notice copies match the repository notices', async () => {
+    for (const name of ['LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES']) {
+      assert.equal(await readFile(new URL(`website/public/${name}`, root), 'utf8'), await readFile(new URL(name, root), 'utf8'))
+    }
   })
 }
