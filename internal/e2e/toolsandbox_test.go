@@ -30,7 +30,7 @@ const (
 	deniedRulePort    = "出网目标端口不在默认档"
 	deniedGuidePort   = "当前版本不支持非默认端口（http 用 80、https 用 443，或省略端口）；没有配置键可以加。"
 	deniedRuleDomain  = "域名不在白名单"
-	deniedGuideDomain = "如需访问，请联系运维把该域名加入配置键 http.allowed_domains 并重启服务。"
+	deniedGuideDomain = "如需访问，请联系管理员在管理台「执行环境」页把该域名加入网络域名白名单，保存后立即生效，无需重启。"
 	deniedFixedLine   = "这是安全策略，请勿反复重试；"
 )
 

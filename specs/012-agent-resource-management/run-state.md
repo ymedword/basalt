@@ -1876,3 +1876,12 @@ cd assets/console && npm test && npm run typecheck && npm run build
 - 全量 stage 复跑 `us12-stage-ci-fix-1`：54/54 check passed，`passed_tests` 5330、`skipped_tests` 21、`status=passed`、`exit=0`；源码指纹 `887ef8d3…`、base `84064ba`、`dirty=true`；`stage_sha256 53a29314…` 与 `acceptance_sha256 686fd775…` 与 §6 一致（stage 文件未改）。
 - report sha256 `b32ea1fe…`；record sha256 `02471099…`。
 - **未验证**：Linux 侧行为只能由修复后的 CI run 复核（本机只有 Windows）；修复提交后以新 run 结论为准，若再红按同一口径继续定位，不调判据。
+
+### 7.5 第二层 CI 失败：current cumulative stage（2026-10-24）
+
+- 修复提交 `70e5f66` 的 CI run `40074574822`：acceptance 本体 `status=passed exit=0`（54/54），但随后的 **current cumulative stage**（`--stage harness/stages/current.json --stage-only`）判红，`015-backfill` exit=1。
+- 失败子例：`TestBackfill_ToolSandbox/sandbox_denied` 与 `/port_redaction`，报「输出缺少」域名档指引；实际输出为 R8 后的新文案。
+- 根因：`internal/e2e/toolsandbox_test.go` 的 `deniedGuideDomain` 仍写 US-5 时代的「配置键 `http.allowed_domains` 并重启服务」；R8 裁决 2 已把白名单改为管理台热生效，产品文案在 `internal/tool/policy.go`，且 `internal/tool/policy_hot_test.go` 明确「指引不得再要求重启」。属**随已批准接口适配**的陈旧期望，不是产品缺陷。
+- 处置：只更新该字面量常量到产品文案；断言结构（规则片段 + 固定安全行 + 指引句 + 目标域名）不变，未删断言、未放宽阈值。
+- 本地复核：`go test -count=1 -tags=e2e ./internal/e2e -run '^(TestBackfill_ToolSandbox)$'` → `ok`。
+- 本地整跑 cumulative stage（`current-local-fix-1`）：32/33 passed；`015-backfill` 仅剩 `TestBackfill_Web/listen_addr_override` 未过——本机 127.0.0.1:8080 有在跑的 Basalt 实例，命中该用例的「缺省地址不得由本进程监听」前置（CI 干净 runner 上同一子例通过）。判为**环境因素**，不改该用例；CI 复跑为最终判据。
