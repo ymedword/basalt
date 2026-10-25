@@ -377,7 +377,7 @@ func TestDocsReadOnly_RejectsSymlink(t *testing.T) {
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			t.Fatalf("建目录失败: %v", err)
 		}
-		_, err := resolveDocument(root, "link.md", fakeLstat)
+		_, _, err := resolveDocument(root, "link.md", fakeLstat)
 		if err == nil {
 			t.Fatal("lstat 报软链接时必须拒绝，实际放行")
 		}
@@ -420,6 +420,42 @@ func TestDocsReadOnly_RejectsSymlink(t *testing.T) {
 			t.Errorf("list_documents 不应跟随重解析点: %s", listText)
 		}
 	})
+}
+
+// TestDocsReadOnly_RejectsSwappedFile 锁定「检查后换文件」的防护（US-14 复核 F6）：
+// resolveDocument 的 lstat 与 readBounded 的 open 之间若被换成另一份文件，打开句柄的
+// fstat 与检查结果 os.SameFile 不一致，必须拒绝，而不是把替换后的内容读出去。
+// The check-then-open window must fail closed when the file identity changes.
+func TestDocsReadOnly_RejectsSwappedFile(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "doc.md")
+	replacement := filepath.Join(root, "other.md")
+	writeFile(t, original, "ORIGINAL\n")
+	writeFile(t, replacement, "TOPSECRET\n")
+
+	path, checked, err := resolveDocument(root, "doc.md", os.Lstat)
+	if err != nil {
+		t.Fatalf("解析正常文档失败: %v", err)
+	}
+	content, info, err := readBounded(path, "doc.md", checked)
+	if err != nil {
+		t.Fatalf("文件未被替换时必须能读: %v", err)
+	}
+	if string(content) != "ORIGINAL\n" {
+		t.Fatalf("读取内容 = %q，期望 ORIGINAL", content)
+	}
+	if !os.SameFile(checked, info) {
+		t.Fatal("未替换时打开句柄与检查结果必须是同一文件")
+	}
+
+	if err := os.Rename(replacement, original); err != nil {
+		t.Fatalf("替换文件失败: %v", err)
+	}
+	if _, _, err := readBounded(path, "doc.md", checked); err == nil {
+		t.Fatal("检查后文件被替换时必须拒绝，实际读取成功")
+	} else if !strings.Contains(err.Error(), "替换") {
+		t.Errorf("拒绝文案 = %q，期望点名“替换”", err.Error())
+	}
 }
 
 // createReparsePoint 在根目录内造一个指向根目录外的重解析点，返回链接名与机制。

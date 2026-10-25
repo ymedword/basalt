@@ -360,40 +360,34 @@ func (s *server) listDocuments() (string, error) {
 }
 
 func (s *server) readDocument(arguments json.RawMessage) (string, error) {
-	path, err := s.resolveArgument(arguments)
+	path, checked, err := s.resolveArgument(arguments)
 	if err != nil {
 		return "", err
 	}
-	content, err := readBounded(path)
+	display := s.displayPath(path)
+	content, _, err := readBounded(path, display, checked)
 	if err != nil {
 		return "", err
 	}
 	if !utf8.Valid(content) {
-		return "", fmt.Errorf("不是 UTF-8 文本: %s", path)
+		return "", fmt.Errorf("不是 UTF-8 文本: %s", display)
 	}
 	return string(content), nil
 }
 
 func (s *server) documentMetadata(arguments json.RawMessage) (string, error) {
-	path, err := s.resolveArgument(arguments)
+	path, checked, err := s.resolveArgument(arguments)
 	if err != nil {
 		return "", err
 	}
-	content, err := readBounded(path)
+	display := s.displayPath(path)
+	content, info, err := readBounded(path, display, checked)
 	if err != nil {
 		return "", err
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("读取文档元信息失败: %v", err)
 	}
 	digest := sha256.Sum256(content)
-	relative, err := filepath.Rel(s.root, path)
-	if err != nil {
-		return "", fmt.Errorf("计算相对路径失败: %v", err)
-	}
 	payload, err := json.Marshal(documentMetadata{
-		Path:       filepath.ToSlash(relative),
+		Path:       display,
 		Size:       info.Size(),
 		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
 		SHA256:     hex.EncodeToString(digest[:]),
@@ -404,14 +398,36 @@ func (s *server) documentMetadata(arguments json.RawMessage) (string, error) {
 	return string(payload), nil
 }
 
-// resolveArgument 解析 `{"path": "..."}` 并落到根目录内的绝对路径。
-func (s *server) resolveArgument(arguments json.RawMessage) (string, error) {
+// displayPath 只回相对根目录的路径：错误与元信息会发给 MCP 客户端，不能暴露
+// 服务器上的绝对路径。
+// displayPath returns a root-relative path so responses never leak absolute paths.
+func (s *server) displayPath(path string) string {
+	relative, err := filepath.Rel(s.root, path)
+	if err != nil {
+		return filepath.Base(path)
+	}
+	return filepath.ToSlash(relative)
+}
+
+// ioFailureDetail 去掉 OS 错误携带的绝对路径，只保留原因。
+// ioFailureDetail strips the absolute path an OS error carries, keeping the reason.
+func ioFailureDetail(err error) string {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err.Error()
+	}
+	return err.Error()
+}
+
+// resolveArgument 解析 `{"path": "..."}` 并落到根目录内的绝对路径，同时交出最终
+// 一段的 lstat 结果供读取阶段比对。
+func (s *server) resolveArgument(arguments json.RawMessage) (string, fs.FileInfo, error) {
 	var payload struct {
 		Path string `json:"path"`
 	}
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &payload); err != nil {
-			return "", fmt.Errorf("参数不是合法 JSON: %v", err)
+			return "", nil, fmt.Errorf("参数不是合法 JSON: %v", err)
 		}
 	}
 	return resolveDocument(s.root, payload.Path, os.Lstat)
@@ -421,56 +437,62 @@ func (s *server) resolveArgument(arguments json.RawMessage) (string, error) {
 // 盘符相对路径 / 任何 `..` 段 / 软链接，逐段 lstat 后才允许打开，且只允许普通文件。
 // 同时按 `/` 与 `\` 两种分隔符切段——在另一平台上写出的 `..\` 不能借平台差异绕过。
 // The single confinement gate: reject empty/NUL/absolute/volume-relative paths, any
-// `..` component and any symlink, then accept regular files only.
-func resolveDocument(root, requested string, lstat lstatFunc) (string, error) {
+// `..` component and any symlink, then accept regular files only. It also returns the
+// final component's lstat result so the reader can prove the opened file is the one
+// that was checked.
+func resolveDocument(root, requested string, lstat lstatFunc) (string, fs.FileInfo, error) {
 	trimmed := strings.TrimSpace(requested)
 	if trimmed == "" {
-		return "", errors.New("path 不能为空")
+		return "", nil, errors.New("path 不能为空")
 	}
 	if strings.ContainsRune(trimmed, 0) {
-		return "", errors.New("path 不得包含 NUL 字节")
+		return "", nil, errors.New("path 不得包含 NUL 字节")
 	}
 	if filepath.IsAbs(trimmed) || filepath.VolumeName(trimmed) != "" {
-		return "", fmt.Errorf("path 必须是相对根目录的路径，不得是绝对路径: %s", requested)
+		return "", nil, fmt.Errorf("path 必须是相对根目录的路径，不得是绝对路径: %s", requested)
 	}
 	for _, part := range splitPath(trimmed) {
 		if part == ".." {
-			return "", fmt.Errorf("path 不得包含 ..（越界拒绝）: %s", requested)
+			return "", nil, fmt.Errorf("path 不得包含 ..（越界拒绝）: %s", requested)
 		}
 		if runtime.GOOS == "windows" && strings.Contains(part, ":") {
 			// Windows 的备用数据流（`a.md:stream`）会让"普通文件"检查失真，直接拒绝。
-			return "", fmt.Errorf("path 不得包含冒号（Windows 备用数据流）: %s", requested)
+			return "", nil, fmt.Errorf("path 不得包含冒号（Windows 备用数据流）: %s", requested)
 		}
 	}
 	clean := filepath.Clean(trimmed)
 	if clean == "." || clean == string(filepath.Separator) {
-		return "", fmt.Errorf("path 必须指向一篇文档，而不是根目录: %s", requested)
+		return "", nil, fmt.Errorf("path 必须指向一篇文档，而不是根目录: %s", requested)
 	}
 
 	target := filepath.Join(root, clean)
 	parts := splitPath(clean)
 	current := root
+	var checked fs.FileInfo
 	for index, part := range parts {
 		current = filepath.Join(current, part)
 		last := index == len(parts)-1
 		info, err := lstat(current)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				return "", fmt.Errorf("文档不存在: %s", filepath.ToSlash(clean))
+				return "", nil, fmt.Errorf("文档不存在: %s", filepath.ToSlash(clean))
 			}
-			return "", fmt.Errorf("读取文档元信息失败: %v", err)
+			return "", nil, fmt.Errorf("读取文档元信息失败: %v", err)
 		}
 		if info.Mode()&fs.ModeSymlink != 0 {
-			return "", fmt.Errorf("path 不得指向软链接: %s", filepath.ToSlash(clean))
+			return "", nil, fmt.Errorf("path 不得指向软链接: %s", filepath.ToSlash(clean))
 		}
 		if !last && !info.IsDir() {
-			return "", fmt.Errorf("path 的某一层不是目录: %s", filepath.ToSlash(clean))
+			return "", nil, fmt.Errorf("path 的某一层不是目录: %s", filepath.ToSlash(clean))
 		}
 		if last && !info.Mode().IsRegular() {
-			return "", fmt.Errorf("只能读取普通文件: %s", filepath.ToSlash(clean))
+			return "", nil, fmt.Errorf("只能读取普通文件: %s", filepath.ToSlash(clean))
+		}
+		if last {
+			checked = info
 		}
 	}
-	return target, nil
+	return target, checked, nil
 }
 
 // splitPath 按两种分隔符切段并丢弃空段与 `.`，保证 `a//b` / `a\b` 得到同一组段。
@@ -487,19 +509,37 @@ func splitPath(path string) []string {
 }
 
 // readBounded 读取上限硬编码为 maxDocumentBytes：多读一个字节就能判断"超限"。
-func readBounded(path string) ([]byte, error) {
+// 打开后用句柄的 fstat 与解析阶段最后一次 lstat 的 FileInfo 做 os.SameFile 比对：
+// 检查与打开之间被换成另一份文件（TOCTOU）时拒绝，而不是把替换后的内容读出去；
+// 元信息也取打开句柄的读数，不再对路径二次 os.Stat。错误只回相对路径（display），
+// 不把服务器绝对路径发给 MCP 客户端。
+// readBounded re-checks the opened handle against the lstat'd FileInfo with
+// os.SameFile, closing the check-then-open window, and reports the opened file's info.
+// Errors carry the root-relative display path only.
+func readBounded(path, display string, checked fs.FileInfo) ([]byte, fs.FileInfo, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("打开文档失败: %v", err)
+		return nil, nil, fmt.Errorf("打开文档失败: %s（%s）", display, ioFailureDetail(err))
 	}
 	defer file.Close()
 
+	info, err := file.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取文档元信息失败: %s（%s）", display, ioFailureDetail(err))
+	}
+	if checked != nil && !os.SameFile(checked, info) {
+		return nil, nil, fmt.Errorf("文档在检查后被替换，拒绝读取: %s", display)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("只能读取普通文件: %s", display)
+	}
+
 	content, err := io.ReadAll(io.LimitReader(file, maxDocumentBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("读取文档失败: %v", err)
+		return nil, nil, fmt.Errorf("读取文档失败: %s（%s）", display, ioFailureDetail(err))
 	}
 	if len(content) > maxDocumentBytes {
-		return nil, fmt.Errorf("文档超过 %d 字节上限", maxDocumentBytes)
+		return nil, nil, fmt.Errorf("文档超过 %d 字节上限", maxDocumentBytes)
 	}
-	return content, nil
+	return content, info, nil
 }

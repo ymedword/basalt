@@ -568,7 +568,25 @@ var templateSecretPatterns = []struct {
 	{"AWS access key", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
 	{"Slack token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}`)},
 	{"私钥块", regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
-	{"URL 内嵌凭据", regexp.MustCompile(`https?://[^/\s:@]+:[^/\s@]+@`)},
+}
+
+// templateURLCredentialPattern 单独抓 URL 内嵌凭据，因为要按主机名过滤：RFC 2606 保留的
+// `example.com/.net/.org` 是文档占位域，指向它们的 `user:password@` 是"必须拒绝带凭据
+// 的 URL"这类反例夹具，不是可用的凭据。其余主机照旧判红，避免留下真正的泄漏盲区。
+// The URL-credential probe is separate so documentation hosts (RFC 2606) can be excluded;
+// those appear as rejection fixtures, while any other host still fails the scan.
+var templateURLCredentialPattern = regexp.MustCompile(`https?://[^/\s:@]+:[^/\s@]+@([^/\s:?#]+)`)
+
+// templateDocumentationHost 判断 URL 凭据是否指向文档占位域。
+// templateDocumentationHost reports whether the host is an RFC 2606 placeholder domain.
+func templateDocumentationHost(host string) bool {
+	lower := strings.ToLower(host)
+	for _, suffix := range []string{"example.com", "example.net", "example.org"} {
+		if lower == suffix || strings.HasSuffix(lower, "."+suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // templateScanSecrets 逐文件扫一遍模板目录，返回「相对路径：命中类别」（升序）。
@@ -597,6 +615,12 @@ func templateScanSecrets(t *testing.T, dir string) []string {
 			if probe.pattern.MatchString(text) {
 				findings = append(findings, filepath.ToSlash(rel)+"："+probe.label)
 			}
+		}
+		for _, match := range templateURLCredentialPattern.FindAllStringSubmatch(text, -1) {
+			if templateDocumentationHost(match[1]) {
+				continue
+			}
+			findings = append(findings, filepath.ToSlash(rel)+"：URL 内嵌凭据")
 		}
 		return nil
 	})

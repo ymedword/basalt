@@ -294,11 +294,14 @@ func classifyDialFailure(err error) (string, string) {
 }
 
 // classifyInitializeFailure 归类初始化阶段（spawn / initialize）的失败。判别顺序即
-// 判据强度：先认策略拒绝与 HTTP 状态（类型化），再认网络不可达（`*url.Error`），
-// 再认超时；进程始终没起来 → 启动阶段未归因；起来了但握手没过 → 握手失败。
+// 判据强度：先认策略拒绝与 HTTP 状态（类型化），再认超时，最后才认网络不可达
+// （`*url.Error`）；进程始终没起来 → 启动阶段未归因；起来了但握手没过 → 握手失败。
+// 超时必须排在 `*url.Error` 之前：`http.Client` 超时会把 `context.DeadlineExceeded`
+// 包在 `*url.Error` 里，先认外壳会把超时误报成 `http_unreachable`（C-07 / §2.4.3 的
+// 「超时 → timeout」判据）。
 // `budgetErr` 是握手预算的终态（必须在 cancel 之前取值）。
-// classifyInitializeFailure orders checks by evidence strength; budgetErr must be
-// captured before the budget is canceled.
+// classifyInitializeFailure orders checks by evidence strength with the deadline
+// before the *url.Error shell, since http.Client wraps deadline errors that way.
 func classifyInitializeFailure(err error, cmd *exec.Cmd, budgetErr error) (string, string) {
 	if errors.Is(err, core.ErrPolicyDenied) {
 		return mcpStagePreflight, mcpClassPolicyDenied
@@ -308,16 +311,16 @@ func classifyInitializeFailure(err error, cmd *exec.Cmd, budgetErr error) (strin
 		(statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
 		return mcpStageInitialize, mcpClassHTTPUnauthorized
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		return mcpStageInitialize, mcpClassHTTPUnreachable
-	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(budgetErr, context.DeadlineExceeded) {
 		// 子进程根本没起来时的超时属于启动阶段；否则是握手预算用完。
 		if cmd != nil && cmd.Process == nil {
 			return mcpStageSpawn, mcpClassTimeout
 		}
 		return mcpStageInitialize, mcpClassTimeout
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return mcpStageInitialize, mcpClassHTTPUnreachable
 	}
 	if cmd != nil && cmd.Process == nil {
 		// 命令传输存在、进程却没起来：按**结构化**证据归因（颗粒度文档 §2.4.3 第

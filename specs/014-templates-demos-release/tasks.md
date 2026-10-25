@@ -135,10 +135,10 @@
 - [x] T061 [US3] 修改 `Makefile`：新增 `example-tests`（`go -C examples/shared/mcp/docs-readonly test -count=1 ./...` + `python scripts/run-example-tests.py`）与 `e2e`（依赖 `build` + `example-tests`，导出 `BASALT_E2E_BINARY=$(CURDIR)/bin/basalt` 后跑 `go test -tags=e2e -count=1 ./internal/e2e`）；两者不加入 `check` / `acceptance` / `acceptance.json` / CI（check `e2e`）
 - [x] T062 [US3] 修改 `internal/e2e/harness_test.go` 的 `TestMain`：存在 `BASALT_E2E_BINARY` 时直接使用该绝对路径、重算 SHA-256、打印 `binary_source=candidate` / `binary_path` / `binary_sha256`，**不得**另行构建；缺失时保留现有 temp 构建回退并打印 `binary_source=temp`（供 `demo-fixtures` / `legacy-d1` / `template-quality` 直接 `go test -tags=e2e` 使用）。仅 `make e2e` / stage `e2e` 断言标记为 `candidate`；标记缺失或为 `temp` = 发布证据失败（模块卡 §6.11 第 7 条）（check `e2e`）
 - [x] T063 [US3] 新增 `internal/e2e/us14_release_test.go`：`TestReleaseE2E_Cancel`（Run `cancelled` + 无子进程残留 + 会话可继续）、`TestReleaseE2E_ToolTimeout`（工具审计 `failed` + `timeout`，Run 继续 `completed`，失败结果回填）、`TestReleaseE2E_HotReload`（运行中改写 `AGENT.md` 不影响本次、下一次取新正文）、`TestReleaseE2E_SevenScenarioMap`（七场景映射断言）；取消与超时**分开**写、分开 required（check `e2e`）
-- [ ] T064 [US3] 新增 `scripts/check-release-clean.sh`：要求 `git status --porcelain` 为空；`git archive HEAD` 到临时目录；在临时目录构建 / 门禁 / e2e；缺候选提交 / 脏工作区 = 失败（check `clean-checkout`）
+- [x] T064 [US3] 新增 `scripts/check-release-clean.sh`：要求 `git status --porcelain` 为空；`git archive HEAD` 到临时目录；在临时目录构建 / 门禁 / e2e；缺候选提交 / 脏工作区 = 失败（check `clean-checkout`）
 - [x] T065 [US3] 新增 `harness/stages/us14-release.json`：`inputs` / `protect` / `checks` / `tasks`；check 集含 `acceptance` / `e2e` / `mcp-admin` / `console-test` / `console-build` / `website-*` / `templates` / `example-tests` 与 §4.3 逐项命令；`protect` 按模块卡 §3.8 列表；不注册进 `current.json`，不进 CI，`external` 保持未授权（check `acceptance`）
-- [ ] T066 [US3] 产出发布证据（按 `harness/acceptance/records` / `reports` 既有约定）：版本 + commit + 实际执行的候选路径与 SHA-256（与分发文件逐字节一致）、`make acceptance` / `make e2e` 读数、七场景逐项、Windows + Linux 双平台走查、依赖与许可表（Go / Node / Python / MCP 包，版本与许可可溯源）、升级 / 恢复演练（Operations §5）；Linux 走查与外部项由用户环境执行，未执行即登记未验证（check `acceptance`）
-- [ ] T067 [US3] 如升级 / 恢复演练发现缺口，更新 `docs/Operations.md` 发布 / 升级 / 恢复说明；不改已批准流程语义（check `acceptance`）
+- [x] T066 [US3] 产出发布证据（按 `harness/acceptance/records` / `reports` 既有约定）：版本 + commit + 实际执行的候选路径与 SHA-256（与分发文件逐字节一致）、`make acceptance` / `make e2e` 读数、七场景逐项、Windows + Linux 双平台走查、依赖与许可表（Go / Node / Python / MCP 包，版本与许可可溯源）、升级 / 恢复演练（Operations §5）；Linux 走查与外部项由用户环境执行，未执行即登记未验证（check `acceptance`）
+- [x] T067 [US3] 如升级 / 恢复演练发现缺口，更新 `docs/Operations.md` 发布 / 升级 / 恢复说明；不改已批准流程语义（check `acceptance`）
 
 **Checkpoint**: 候选二进制七场景绿；`check-release-clean.sh` 通过；stage 全绿；双平台与许可 / 升级证据齐全；`v0.1.0` tag **由用户手动**。
 
@@ -146,7 +146,7 @@
 
 ## Phase 6: Polish & Cross-Cutting
 
-- [ ] T068 运行 `make check`、`make acceptance`、`make example-tests`、`make e2e` 与 `.\scripts\check-acceptance.ps1 --stage harness/stages/us14-release.json`，按 `quickstart.md` 逐节记录四态读数（通过 / 失败 / 跳过 / 未验证）并更新 run-state 未验证清单；同时核对 `git diff --stat -- go.mod go.sum docs/contracts/schema.sql harness/acceptance.json harness/stages/current.json .github/workflows/ci.yml` 为空（FR-025 零迁移 / 零依赖 / 不改门禁与 CI）
+- [x] T068 运行 `make check`、`make acceptance`、`make example-tests`、`make e2e` 与 `.\scripts\check-acceptance.ps1 --stage harness/stages/us14-release.json`，按 `quickstart.md` 逐节记录四态读数（通过 / 失败 / 跳过 / 未验证）并更新 run-state 未验证清单；同时核对 `git diff --stat -- go.mod go.sum docs/contracts/schema.sql harness/acceptance.json harness/stages/current.json .github/workflows/ci.yml` 为空（FR-025 零迁移 / 零依赖 / 不改门禁与 CI）
 - [x] T069 按 `quickstart.md` 做管理台人工走查（目录 / 预填 / 503 提示 / 诊断 / 测试详情 / 四轴文案），记录截图或文字证据；不得出现"已验证"徽章
 - [ ] T070 收口三件套（module-dev 步骤 7）：`/speckit-analyze` 复跑 → 独立复核（子代理）→ 七项证据 DoD + 变更总结四段；判据面变更逐路径核对；提交人工 review ② 包，等待用户决定
 

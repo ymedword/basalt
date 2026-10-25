@@ -143,3 +143,4 @@
 | 20261019T194329-real-us8-6.1-7b | 2026-10-19 | 015-real-feishu | backfill | ai | passed | [records/20261019T194329-real-us8-6.1-7b.json](records/20261019T194329-real-us8-6.1-7b.json) |
 | 20261019T194329-real-us9-6.2-5a | 2026-10-19 | 015-real-model | backfill | ai | passed | [records/20261019T194329-real-us9-6.2-5a.json](records/20261019T194329-real-us9-6.2-5a.json) |
 | 20261019T203742-current | 2026-10-19 | current-tree | rerun | ai | passed | [records/20261019T203742-current.json](records/20261019T203742-current.json) |
+| us14-release-gate-r2 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r2.json](records/us14-release-gate-r2.json) |

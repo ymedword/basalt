@@ -160,7 +160,7 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 
 持续 429 说明还有其他来源 / 脚本在连续失败——看 WARN 日志的来源归因（`来源进入认证限速` 一行标出 `source` 与 `retry_after_seconds`）。
 
-### 2.2 出网：三种流量分开看
+### 2.2 出网：按通道分开看
 
 | 流量 | 谁控制 | 受不受白名单 |
 | --- | --- | --- |
@@ -168,6 +168,8 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 | MCP http 传输的连接 | Basalt 发起 | **是**——连接前按当前生效白名单授权；收紧后不再允许的连接会被断开 |
 | 供应商模型调用（`providers[].base_url`） | 运维配置 | 否——模型连接的独立配置，端点由运维定，模型碰不到 |
 | MCP server 自己的网络行为（stdio 进程内） | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §4.3） |
+| 远程 MCP 下游（上游 server 再去连别的服务） | server 自己 | 否——上游连接受白名单约束，下游不受；不宣称统一约束 |
+| stdio 启动程序（`mcp_servers.yaml` 的 `command`） | Basalt 发起 | **是**（`shell.allowed_commands`）——启动前逐字比对，不在白名单则不启动 |
 
 企业若要求"模型调用也只能出内网"：把 `providers[].base_url` 指向内网网关（vLLM / 一方网关）即可，白名单不需要动。
 

@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1575,4 +1576,57 @@ func TestNewMCPCommand_MatchesLaunch(t *testing.T) {
 		require.NoError(t, cmd.Start(), "dialCommand 构造的命令必须可直接启动")
 		require.NoError(t, cmd.Wait())
 	})
+}
+
+// TestClassifyInitializeFailure_DeadlineBeforeURLShell 锁定「超时优先于 `*url.Error`
+// 外壳」的判别顺序（US-14 复核 F5）：`http.Client` 超时会把 `context.DeadlineExceeded`
+// 包进 `*url.Error`，先认外壳会把超时误报成 `http_unreachable`，与 §2.4.3
+// 「超时 → failed + timeout」的判据相悖。非超时的拨号失败仍归不可达。
+func TestClassifyInitializeFailure_DeadlineBeforeURLShell(t *testing.T) {
+	missing := exec.Command("basalt-classify-missing-binary")
+	cases := []struct {
+		name      string
+		err       error
+		cmd       *exec.Cmd
+		budgetErr error
+		wantStage string
+		wantClass string
+	}{
+		{
+			name:      "deadline_wrapped_in_url_error",
+			err:       &url.Error{Op: "Post", URL: "http://127.0.0.1:1/mcp", Err: context.DeadlineExceeded},
+			wantStage: mcpStageInitialize,
+			wantClass: mcpClassTimeout,
+		},
+		{
+			name:      "budget_deadline_with_dial_error",
+			err:       errors.New("dial tcp 127.0.0.1:1: connect: connection refused"),
+			budgetErr: context.DeadlineExceeded,
+			wantStage: mcpStageInitialize,
+			wantClass: mcpClassTimeout,
+		},
+		{
+			name:      "process_not_started_deadline",
+			err:       context.DeadlineExceeded,
+			cmd:       missing,
+			budgetErr: context.DeadlineExceeded,
+			wantStage: mcpStageSpawn,
+			wantClass: mcpClassTimeout,
+		},
+		{
+			name:      "plain_url_error_stays_unreachable",
+			err:       &url.Error{Op: "Post", URL: "http://127.0.0.1:1/mcp", Err: errors.New("connection refused")},
+			wantStage: mcpStageInitialize,
+			wantClass: mcpClassHTTPUnreachable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stage, class := classifyInitializeFailure(tc.err, tc.cmd, tc.budgetErr)
+			if stage != tc.wantStage || class != tc.wantClass {
+				t.Fatalf("classifyInitializeFailure() = (%s, %s)，期望 (%s, %s)",
+					stage, class, tc.wantStage, tc.wantClass)
+			}
+		})
+	}
 }

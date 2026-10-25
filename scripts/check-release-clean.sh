@@ -9,8 +9,9 @@
 # 判据（缺一即非零退出，**不降级为跳过**）：
 #   1. 工作区干净：`git status --porcelain` 必须为空；
 #   2. 临时树只含候选提交的已跟踪内容：`git worktree add --detach <tmp> HEAD` 检出，
-#      再用 `git archive HEAD` 解出第二份树，**逐文件比对**（内容 / 权限 / 相对路径）
-#      必须一致——这就是 C-18 要的「`git archive HEAD` 复现记录」的机器判据；
+#      再用 `git archive HEAD` 解出第二份树，以 `diff -r` **逐文件比对内容与相对路径**
+#      （`diff -r` 不比较权限位；两棵树同出自同一份 Git 树对象，可执行位由 Git 记录
+#      决定，不在本判据内）——这就是 C-18 要的「`git archive HEAD` 复现记录」的机器判据；
 #   3. 在临时树跑 `make acceptance`（full profile）与 `make e2e`。
 #
 # 为什么不是"只解档、不带 .git"：`scripts/acceptance` 的源码指纹要求工作树是 Git
