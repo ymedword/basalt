@@ -433,11 +433,20 @@ func TestDocsReadOnly_RejectsSwappedFile(t *testing.T) {
 	writeFile(t, original, "ORIGINAL\n")
 	writeFile(t, replacement, "TOPSECRET\n")
 
-	path, checked, err := resolveDocument(root, "doc.md", os.Lstat)
+	_, checked, err := resolveDocument(root, "doc.md", os.Lstat)
 	if err != nil {
 		t.Fatalf("解析正常文档失败: %v", err)
 	}
-	content, info, err := readBounded(path, "doc.md", checked)
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatalf("打开根目录失败: %v", err)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil {
+			t.Errorf("关闭根目录失败: %v", closeErr)
+		}
+	}()
+	content, info, err := readBounded(dir, "doc.md", checked)
 	if err != nil {
 		t.Fatalf("文件未被替换时必须能读: %v", err)
 	}
@@ -451,7 +460,7 @@ func TestDocsReadOnly_RejectsSwappedFile(t *testing.T) {
 	if err := os.Rename(replacement, original); err != nil {
 		t.Fatalf("替换文件失败: %v", err)
 	}
-	if _, _, err := readBounded(path, "doc.md", checked); err == nil {
+	if _, _, err := readBounded(dir, "doc.md", checked); err == nil {
 		t.Fatal("检查后文件被替换时必须拒绝，实际读取成功")
 	} else if !strings.Contains(err.Error(), "替换") {
 		t.Errorf("拒绝文案 = %q，期望点名“替换”", err.Error())

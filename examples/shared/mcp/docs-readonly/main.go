@@ -104,6 +104,12 @@ type documentMetadata struct {
 
 type server struct {
 	root string
+	// dir 是根目录的 os.Root 句柄：文档一律经它打开，越界（含软链接跳出去）在
+	// 文件系统层就被挡住，不依赖字符串前缀比较。resolveDocument 的手工逐段检查
+	// 仍在前面跑——它负责给出可读的拒绝文案，两层各自独立。
+	// dir is the os.Root handle every document open goes through, so containment
+	// is enforced by the filesystem rather than by comparing path prefixes.
+	dir *os.Root
 }
 
 func main() {
@@ -144,12 +150,15 @@ func resolveRoot(flagValue string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("根目录不可用 %s: %v", root, err)
 	}
-	info, err := os.Stat(resolved)
+	// os.OpenRoot 只接受目录（文件会报 not a directory），因此它同时完成了
+	// "存在 + 是目录 + 可打开"三件事；探测句柄用完即关，serve 会另开一个持有。
+	// OpenRoot doubles as the directory check; the probe handle is closed right away.
+	probe, err := os.OpenRoot(resolved)
 	if err != nil {
-		return "", fmt.Errorf("根目录不可用 %s: %v", root, err)
+		return "", fmt.Errorf("根目录不是可打开的目录 %s: %v", root, err)
 	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("根目录不是目录: %s", root)
+	if err := probe.Close(); err != nil {
+		return "", fmt.Errorf("关闭根目录探测句柄 %s: %v", root, err)
 	}
 	return resolved, nil
 }
@@ -158,8 +167,17 @@ func resolveRoot(flagValue string) (string, error) {
 // 坏行报 -32700 后继续服务。错误只写 stderr，stdout 只放协议响应。
 // One JSON message per line; notifications get no response and a bad line never
 // stops the loop. stdout carries protocol responses only.
-func serve(in io.Reader, out io.Writer, root string) error {
-	sv := &server{root: root}
+func serve(in io.Reader, out io.Writer, root string) (err error) {
+	dir, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("打开根目录 %s: %v", root, err)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("关闭根目录 %s: %v", root, closeErr)
+		}
+	}()
+	sv := &server{root: root, dir: dir}
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	encoder := json.NewEncoder(out)
@@ -367,7 +385,7 @@ func (s *server) readDocument(arguments json.RawMessage) (string, error) {
 		return "", err
 	}
 	display := s.displayPath(path)
-	content, _, err := readBounded(path, display, checked)
+	content, _, err := readBounded(s.dir, display, checked)
 	if err != nil {
 		return "", err
 	}
@@ -383,7 +401,7 @@ func (s *server) documentMetadata(arguments json.RawMessage) (string, error) {
 		return "", err
 	}
 	display := s.displayPath(path)
-	content, info, err := readBounded(path, display, checked)
+	content, info, err := readBounded(s.dir, display, checked)
 	if err != nil {
 		return "", err
 	}
@@ -518,8 +536,8 @@ func splitPath(path string) []string {
 // readBounded re-checks the opened handle against the lstat'd FileInfo with
 // os.SameFile, closing the check-then-open window, and reports the opened file's info.
 // Errors carry the root-relative display path only.
-func readBounded(path, display string, checked fs.FileInfo) ([]byte, fs.FileInfo, error) {
-	file, err := os.Open(path)
+func readBounded(dir *os.Root, display string, checked fs.FileInfo) ([]byte, fs.FileInfo, error) {
+	file, err := dir.Open(filepath.FromSlash(display))
 	if err != nil {
 		return nil, nil, fmt.Errorf("打开文档失败: %s（%s）", display, ioFailureDetail(err))
 	}

@@ -15,7 +15,8 @@ import "embed"
 // 注意：go:embed 跨不过嵌套 module——docs-readonly 因此并回主 module，源码才能
 // 随二进制发行；安装器导出它时会补一份最小 go.mod（2026-10-26 用户裁决）。
 // Assets holds the demo tree plus the shared scripts and the docs-readonly source.
-// go:embed cannot cross a nested module, so docs-readonly lives in the main module.
+// The go:embed directive cannot cross a nested module, so docs-readonly lives in
+// the main module.
 //
 //go:embed daily shared
 var Assets embed.FS

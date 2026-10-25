@@ -36,6 +36,17 @@ import (
 // generates the sample database and reports what the operator still has to do.
 const demoSkillsDirName = "skills"
 
+// 工作区内的落盘权限：目录 0o750 与 internal/workspace 的 dirPerm 同口径（企业私有
+// 数据不给"其他用户"留读取面）；文件 0o600 更紧一档——安装器不假设同机的别人需要
+// 读这些生成物（AGENT.md / 清单 / 样例库 / 导出源码）。
+// Workspace tree permissions: 0750 directories (same as internal/workspace) and
+// 0600 files, deliberately stricter than the bootstrap files.
+//
+// demoPythonProbe 是解释器探针的固定脚本：只打印主版本号，用来识破 Windows 上
+// "LookPath 成功但执行即退出"的 Microsoft Store 占位程序。
+// demoPythonProbe prints only the major version so the Store stub is detected.
+const demoPythonProbe = "import sqlite3, sys; print(sys.version_info[0])"
+
 // demoSpec 是一份 Demo 的安装描述：哪些 MCP server、哪些环境变量、要不要样例库。
 // demoSpec describes one bundled demo and what it needs to become runnable.
 type demoSpec struct {
@@ -396,13 +407,13 @@ func copyDemoTree(srcRoot, dstRoot string, force bool, skip map[string]bool) (st
 		}
 		target := filepath.Join(dstRoot, rel)
 		if entry.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o750)
 		}
 		data, readErr := fs.ReadFile(examples.Assets, p)
 		if readErr != nil {
 			return readErr
 		}
-		return os.WriteFile(target, data, 0o644)
+		return os.WriteFile(target, data, 0o600)
 	})
 	if err != nil {
 		return "", err
@@ -414,8 +425,28 @@ func copyDemoTree(srcRoot, dstRoot string, force bool, skip map[string]bool) (st
 // 让 Agent 装载期按「blank model」拒绝注册，正好表达「装好但等配置」。
 // blankDemoModel clears provider.model so the loader refuses to register the
 // agent until an operator fills it in.
-func blankDemoModel(agentFile string) error {
-	data, err := os.ReadFile(agentFile)
+func blankDemoModel(agentFile string) (err error) {
+	// 读写都经 os.Root 钉在 AGENT.md 所在目录内：目标是内嵌素材复制出来的固定文件，
+	// 路径由安装器拼出来，用根句柄把"只能是这个目录里的这个名字"写进代码而不是注释。
+	// Both the read and the write go through an os.Root on the agent directory.
+	dir, err := os.OpenRoot(filepath.Dir(agentFile))
+	if err != nil {
+		return fmt.Errorf("打开 %s 所在目录：%w", agentFile, err)
+	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("关闭 %s 所在目录：%w", agentFile, closeErr)
+		}
+	}()
+	name := filepath.Base(agentFile)
+	source, err := dir.Open(name)
+	if err != nil {
+		return fmt.Errorf("读取 %s：%w", agentFile, err)
+	}
+	data, err := io.ReadAll(source)
+	if closeErr := source.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
 	if err != nil {
 		return fmt.Errorf("读取 %s：%w", agentFile, err)
 	}
@@ -452,7 +483,21 @@ func blankDemoModel(agentFile string) error {
 	if !done {
 		return fmt.Errorf("%s 里找不到 provider.model 行", agentFile)
 	}
-	return os.WriteFile(agentFile, []byte(strings.Join(lines, "\n")), 0o644)
+	target, err := dir.OpenFile(name, os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("写入 %s：%w", agentFile, err)
+	}
+	if _, err := target.WriteString(strings.Join(lines, "\n")); err != nil {
+		closeErr := target.Close()
+		if closeErr != nil {
+			return fmt.Errorf("写入 %s：%w（关闭也失败：%v）", agentFile, err, closeErr)
+		}
+		return fmt.Errorf("写入 %s：%w", agentFile, err)
+	}
+	if err := target.Close(); err != nil {
+		return fmt.Errorf("写入 %s：%w", agentFile, err)
+	}
+	return nil
 }
 
 // installDemoSampleDB 用内嵌脚本生成只读样例库；缺 Python 时记 pending 而不失败。
@@ -468,7 +513,7 @@ func installDemoSampleDB(ctx context.Context, wsRoot string, force bool) (demoSa
 		return demoSampleDB{Path: dbPath, State: demoStatePending, Note: "未找到可用的 Python 3：" + err.Error()}, nil
 	}
 	scriptDir := filepath.Join(wsRoot, "demos", "scripts")
-	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+	if err := os.MkdirAll(scriptDir, 0o750); err != nil {
 		return demoSampleDB{}, fmt.Errorf("创建脚本目录 %s：%w", scriptDir, err)
 	}
 	scriptPath := filepath.Join(scriptDir, "make_sample_db.py")
@@ -476,10 +521,10 @@ func installDemoSampleDB(ctx context.Context, wsRoot string, force bool) (demoSa
 	if err != nil {
 		return demoSampleDB{}, fmt.Errorf("读取样例库脚本：%w", err)
 	}
-	if err := os.WriteFile(scriptPath, script, 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, script, 0o600); err != nil {
 		return demoSampleDB{}, fmt.Errorf("写出样例库脚本 %s：%w", scriptPath, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
 		return demoSampleDB{}, fmt.Errorf("创建样例目录 %s：%w", filepath.Dir(dbPath), err)
 	}
 	fixtures := filepath.Join(wsRoot, agentsDirName, "biz-daily", "fixtures")
@@ -492,6 +537,14 @@ func installDemoSampleDB(ctx context.Context, wsRoot string, force bool) (demoSa
 	if force {
 		args = append(args, "--force")
 	}
+	// #nosec G204 -- 豁免理由（用户 2026-10-26 裁决，沿用 2026-10-17 口径）：
+	// ① 可执行名是 findDemoPython 实跑探针通过的 LookPath 结果（候选只有
+	// python3 / python / py），argv 是安装器自己拼的脚本路径与内嵌夹具，不经 shell，
+	// `--demo` 只影响已校验的 Demo 名，没有把用户输入变成命令行的通道；
+	// ② G204 只接受常量实参，运行期的工作区路径静态不可见，无法用代码消除；
+	// ③ 改走 env 传参或动态分派只会把审计点藏起来，风险不变、可读性更差。
+	// #nosec G204 -- vetted interpreter plus installer-built argv, never via a shell;
+	// constant-only argv is impossible because workspace paths are runtime values.
 	output, runErr := exec.CommandContext(ctx, interpreter, args...).CombinedOutput()
 	if runErr != nil {
 		return demoSampleDB{
@@ -570,12 +623,12 @@ func installDemoSource(wsRoot string, force bool) (demoSourceAsset, error) {
 	}
 	gomodPath := filepath.Join(dir, "go.mod")
 	if state == demoStateInstalled {
-		if err := os.WriteFile(gomodPath, []byte(demoSourceGoModText), 0o644); err != nil {
+		if err := os.WriteFile(gomodPath, []byte(demoSourceGoModText), 0o600); err != nil {
 			return demoSourceAsset{}, fmt.Errorf("写出 %s：%w", gomodPath, err)
 		}
 	}
 	depsDir := filepath.Join(wsRoot, "demos", "deps")
-	if err := os.MkdirAll(depsDir, 0o755); err != nil {
+	if err := os.MkdirAll(depsDir, 0o750); err != nil {
 		return demoSourceAsset{}, fmt.Errorf("创建依赖目录 %s：%w", depsDir, err)
 	}
 	return demoSourceAsset{Path: dir, State: state, GoMod: gomodPath}, nil
@@ -609,10 +662,10 @@ func demoDBHubConfig(dbPath string) string {
 // writeDemoDBHubConfig writes the config file; wiring it up stays the operator's job.
 func writeDemoDBHubConfig(wsRoot, dbPath string) (string, error) {
 	target := filepath.Join(wsRoot, "demos", "mcp", "dbhub.toml")
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 		return "", fmt.Errorf("创建配置目录 %s：%w", filepath.Dir(target), err)
 	}
-	if err := os.WriteFile(target, []byte(demoDBHubConfig(dbPath)), 0o644); err != nil {
+	if err := os.WriteFile(target, []byte(demoDBHubConfig(dbPath)), 0o600); err != nil {
 		return "", fmt.Errorf("写出 DBHub 配置 %s：%w", target, err)
 	}
 	return target, nil
@@ -649,14 +702,17 @@ func describeSampleDBNote(output string) string {
 // actually run: on Windows `python` is often the Store stub, which LookPath finds
 // but which cannot execute.
 func findDemoPython(ctx context.Context) (string, error) {
-	probe := "import sqlite3, sys; print(sys.version_info[0])"
 	var failures []string
 	for _, name := range []string{"python3", "python", "py"} {
 		resolved, err := exec.LookPath(name)
 		if err != nil {
 			continue
 		}
-		output, probeErr := exec.CommandContext(ctx, resolved, "-c", probe).CombinedOutput()
+		// #nosec G204 -- 豁免理由（用户 2026-10-26 裁决）：可执行名来自本次
+		// LookPath，实参全是常量（-c + demoPythonProbe）；探针的目的正是判断这个
+		// 候选"能不能跑"，所以名字必然是运行期值，无法写成常量。
+		// #nosec G204 -- the name is this loop's LookPath result; all argv are constants.
+		output, probeErr := exec.CommandContext(ctx, resolved, "-c", demoPythonProbe).CombinedOutput()
 		if probeErr != nil {
 			failures = append(failures, fmt.Sprintf("%s 不可执行（%v）", resolved, probeErr))
 			continue
@@ -677,7 +733,7 @@ func findDemoPython(ctx context.Context) (string, error) {
 // writeDemoManifest writes the manifest to <workspace>/demos/install.json.
 func writeDemoManifest(wsRoot string, manifest demoManifest) error {
 	dir := filepath.Join(wsRoot, "demos")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("创建清单目录 %s：%w", dir, err)
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
@@ -686,7 +742,7 @@ func writeDemoManifest(wsRoot string, manifest demoManifest) error {
 	}
 	data = append(data, '\n')
 	target := filepath.Join(dir, "install.json")
-	if err := os.WriteFile(target, data, 0o644); err != nil {
+	if err := os.WriteFile(target, data, 0o600); err != nil {
 		return fmt.Errorf("写出安装清单 %s：%w", target, err)
 	}
 	return nil
