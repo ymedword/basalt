@@ -3,10 +3,11 @@ title: Documentation — Understand and use Basalt
 description: "What Basalt's Agent OS does, how independent agents share a runtime, current capabilities, guides and future direction."
 ---
 
-<!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script"]}} -->
+<!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script","TemplateTable"]}} -->
 
 <script setup>
 import { withBase } from 'vitepress'
+import TemplateTable from '../.vitepress/theme/components/TemplateTable.vue'
 </script>
 
 # Documentation
@@ -75,6 +76,22 @@ Start with the full project map, then use the compact summary or explore executi
 <a :href="withBase('/quickstart/#deploy')">Deployment entry point</a> · [Operations (GitHub)](https://github.com/ymedword/basalt/blob/main/docs/Operations.md)
 
 Management authentication, listening addresses, access policies, backups, upgrades and troubleshooting.
+
+## Templates & demos {#templates-demos}
+
+`examples/` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials and no delivery channels. Copy one into a workspace, then bind your own model, tools and channel; Basalt never imports an example and never widens the command allowlist on its own.
+
+<TemplateTable section="demos" />
+
+The eight templates cover weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six run from fixtures without credentials (tier A), one also needs the Playwright browser (tier A*), and one is a configuration recipe only (tier B). [The examples index](https://github.com/ymedword/basalt/blob/main/examples/README.md) lists every directory with its tier, dependencies and evidence status.
+
+<TemplateTable section="templates" />
+
+## MCP catalog {#mcp-catalog}
+
+The console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. "Add to configuration" prefills the form and never saves on its own. Saving, publishing or rolling back fails closed with a 503 and an operation ID when a referenced environment variable is missing or empty, and a recipe that has not been exercised on this machine says so. Reading the catalog starts no process, installs nothing and writes no record.
+
+<TemplateTable section="catalog" />
 
 ## Future direction {#roadmap}
 

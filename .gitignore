@@ -27,3 +27,9 @@ website/node_modules/
 website/.vitepress/dist/
 website/.vitepress/cache/
 website/.vitepress/.temp/
+
+# 示例运行产物与跨运行基线（每个 Demo 都在自己的目录下写 runs/<时间戳>/，
+# D1 / D4 另写 state/；由每次运行生成，不随仓库分发。2026-10-25 T068 前统一口径：
+# 原先只列 docs-diff / industry-brief 三条，本地跑其余 Demo 会凭空多出未跟踪文件。）
+examples/daily/*/runs/
+examples/daily/*/state/

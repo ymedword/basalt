@@ -26,6 +26,7 @@ import type {
   FileDraft,
   McpServerDetail,
   McpServerUpsert,
+  McpServerWrite,
   ModelConnectionUpsert,
   SkillDetail,
 } from '../api-admin'
@@ -50,6 +51,12 @@ export const ResourceForm = defineComponent({
     kind: { type: String as PropType<ResourceKind>, required: true },
     /** 非空 = 修改该资源（三类都以条件写提交新版本）；null = 新建。 */
     edit: { type: String as PropType<string | null>, default: null },
+    /**
+     * 新建时的预填载荷（当前只有 MCP 目录用它）：只给初始值，**不**触发保存，
+     * 也不改变提交流程——用户仍要自己点“创建并发布”。
+     * Prefill for a new MCP entry: initial values only; nothing is submitted.
+     */
+    prefill: { type: Object as PropType<McpServerWrite | null>, default: null },
   },
   emits: {
     created: (_view: unknown) => true,
@@ -114,11 +121,35 @@ export const ResourceForm = defineComponent({
     const noun = computed(() => KIND_NOUNS[props.kind])
     const heading = computed(() => (editing.value ? `修改${noun.value}` : `新建${noun.value}`))
 
+    /**
+     * 用目录配方填表：args 每行一个，env 逐条写成 `KEY=${VAR}`。这里只搬值，
+     * 不做校验也不提交——保存仍走原来的建版 + env 闸门。
+     * Applies a catalog recipe into the fields; it never submits.
+     */
+    function applyMcpPrefill(write: McpServerWrite): void {
+      name.value = write.name
+      transport.value = write.transport
+      command.value = write.command ?? ''
+      argsText.value = (write.args ?? []).join('\n')
+      url.value = write.url ?? ''
+      envText.value = Object.entries(write.env ?? {})
+        .map(([key, reference]) => `${key}=${reference}`)
+        .join('\n')
+      currentEnvKeys.value = []
+      clearEnv.value = false
+    }
+
     /** 修改入口依赖详情 ETag；三类资源都先 GET 详情再填表。 */
     // Edits always start from the detail GET, which is also the ETag source.
     onMounted(() => {
       if (props.edit !== null) {
         void loadEdit()
+        return
+      }
+      // 预填只在新建态生效：修改态以服务端真值为准，避免配方覆盖已有配置。
+      // Prefill applies to creation only; edits always start from server truth.
+      if (props.kind === 'mcp-servers' && props.prefill !== null) {
+        applyMcpPrefill(props.prefill)
       }
     })
 

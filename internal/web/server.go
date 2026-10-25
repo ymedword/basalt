@@ -127,6 +127,13 @@ type Options struct {
 	// orchestration that the write port does not carry.
 	ResourceStateService ResourceStateService
 
+	// MCPCatalog 是只读 MCP 目录端口（US-14 D-01）：构建期内嵌的静态快照，读取不启动
+	// 进程、不安装、不写配置。nil = 装配缺失，目录端点按固定 500 失败关闭——**不得**
+	// 用空目录充数（空数组会让页面显示"没有推荐配方"，与装配故障不可区分）。
+	// MCPCatalog is the read-only catalog port; nil fails closed with a fixed 500 rather
+	// than serving an empty catalog, which would be indistinguishable from a real gap.
+	MCPCatalog MCPCatalogReader
+
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
 	readTimeoutOverride  time.Duration

@@ -33,10 +33,17 @@ test('link fixtures accept valid base and anchors and reject broken or private t
   const file = path.join(distDir, 'index.html')
   await writeFile(file, '<a href="/basalt/quickstart/#deploy">Deploy</a>')
   assert.deepEqual(checkLinks({ distDir }), [])
+  // 模板表把 examples/ 作为公开目标链接到仓库；该路径允许，私有与工程路径仍拒绝。
+  // The template tables link examples/ back to the repository; that path is allowed, private
+  // and engineering paths are not.
+  await writeFile(file, '<a href="https://github.com/ymedword/basalt/tree/main/examples/daily/github-radar">Example</a>')
+  assert.deepEqual(checkLinks({ distDir }), [])
   for (const [ref, reason] of [
     ['/basalt/missing/', 'missing-target'], ['/basalt/quickstart/#absent', 'missing-anchor'],
     ['/quickstart/', 'missing-base'], ['/basalt/career/private.md', 'private-path'],
     ['https://github.com/ymedword/basalt/blob/main/docs/Requirements.md', 'private-path'],
+    ['https://github.com/ymedword/basalt/tree/main/docs/us/us14-templates-demos-release.md', 'private-path'],
+    ['https://github.com/ymedword/basalt/tree/main/examples/../career/private.md', 'private-path'],
     ['https://unapproved.invalid/', 'external-not-allowed'], ['', 'empty-link'],
     ['#', 'empty-link'], ['javascript:alert(1)', 'javascript-url']
   ]) {

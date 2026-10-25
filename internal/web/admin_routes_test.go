@@ -1,7 +1,7 @@
 package web
 
 // 本文件是 US-12 写面路由表与条件写中间件的判卷（颗粒度文档 §3.2.1
-// admin_routes_test.go，7 例，check `012-web-etag-routes`）：35 条新端点逐条在表、
+// admin_routes_test.go，7 例，check `012-web-etag-routes`）：37 条新端点逐条在表、
 // 全部受保护、11 条条件写恰为契约指定集合；`version_id` 只接受十进制正整数；
 // 缺凭据一律 401、错误方法落 404 兜底；条件写缺 / 弱 / 通配 / 非法 If-Match 一律
 // 412 且处理函数零调用；认证先于 If-Match；每条受保护项恰过一次闸门。
@@ -82,10 +82,12 @@ func wantAdminRouteKeys() []string {
 		"PUT /api/v1/model-connections/{name}",
 		"DELETE /api/v1/model-connections/{name}",
 		"POST /api/v1/model-connections/{name}/test",
+		"GET /api/v1/catalog/mcp",
 		"POST /api/v1/mcp-servers",
 		"PUT /api/v1/mcp-servers/{name}",
 		"DELETE /api/v1/mcp-servers/{name}",
 		"POST /api/v1/mcp-servers/{name}/test",
+		"GET /api/v1/mcp-servers/{name}/diagnostics",
 		"POST /api/v1/skills",
 		"POST /api/v1/skills/import",
 		"PUT /api/v1/skills/{name}",
@@ -126,14 +128,14 @@ func wantConditionalRouteKeys() []string {
 	}
 }
 
-// TestAdminRoutes_TableCoversContractSurface：写面路由表恰好覆盖契约的 35 条端点，
+// TestAdminRoutes_TableCoversContractSurface：写面路由表恰好覆盖契约的 37 条端点，
 // 无重复、无公开行、方法显式、条件写恰为 11 条；`adminRoutes()` 逐行标记受保护并
 // 带上处理函数（占位也必须是显式函数，不允许空挂）。
 // 逆改点：漏登记 / 多登记 / 把任一行改成公开 / 条件写集合漂移 → 对应断言红。
 func TestAdminRoutes_TableCoversContractSurface(t *testing.T) {
 	s := newTestServer(t, nil)
 	specs := s.adminRouteSpecs()
-	require.Len(t, specs, 35)
+	require.Len(t, specs, 37)
 
 	got := make(map[string]adminRouteSpec, len(specs))
 	for _, spec := range specs {
@@ -398,7 +400,7 @@ func TestAdminRoutes_SaveFaceBindingCodes(t *testing.T) {
 	}
 }
 
-// TestAdminRoutes_NonConditionalRowsSkipIfMatch：24 条非条件写 / 只读行不套
+// TestAdminRoutes_NonConditionalRowsSkipIfMatch：26 条非条件写 / 只读行不套
 // If-Match 中间件——无请求头时进入处理函数（占位回 500），绝不回 412。
 // 逆改点：把条件写中间件误套到整个写面 → 对应行变 412，本用例红。
 func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
@@ -417,7 +419,7 @@ func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
 		require.NotEqual(t, http.StatusPreconditionFailed, rec.Code, "%s 不要求 If-Match", adminRouteKey(spec))
 		require.NotEqual(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code, "%s", adminRouteKey(spec))
 	}
-	require.Equal(t, 24, checked)
+	require.Equal(t, 26, checked)
 }
 
 // TestAdminRoutes_AuthPrecedesIfMatch：认证在条件写中间件之外——缺凭据时无论
@@ -456,7 +458,7 @@ func TestAdminRoutes_AuthPrecedesIfMatch(t *testing.T) {
 	require.NotEqual(t, http.StatusPreconditionFailed, rec.Code, "非条件写行忽略 If-Match")
 }
 
-// TestAdminRoutes_EveryRowEntersGuardOnce：35 条新端点一条不落地经中央认证包装，
+// TestAdminRoutes_EveryRowEntersGuardOnce：37 条新端点一条不落地经中央认证包装，
 // 且每条请求恰过一次闸门——与主路由表 `TestAuth_RouteMatrix` 同一口径，提前在
 // 写面表上锁定挂载方式，避免 T016 合并时出现"表里有、注册漏"的第二套路径。
 // 逆改点：某行绕过 s.admin 直接挂处理函数 → 计数少于行数，本用例红。

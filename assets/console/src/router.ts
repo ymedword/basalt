@@ -1,10 +1,11 @@
 // History API 自实现路由（约束 41，UI-R2 扩展批准）：US-11 的十二条路径 + US-12 的
 // 五条新路径（`agents/new`、`agents/:name/config`、`resources/:kind/:id`、`archived`、
-// `workspace`）+ 会话详情深链（`agents/:name/sessions/:id`，R7）+ 404 视图，不引入
-// 第三方路由库；静态段先于动态段。popstate 恢复视图，未知路径渲染 404；离开守卫承载
-// 「未保存编辑离开前确认」。
+// `workspace`）+ 会话详情深链（`agents/:name/sessions/:id`，R7）+ US-14 的 MCP 目录
+// （`catalog/mcp`）+ 404 视图，不引入第三方路由库；静态段先于动态段。popstate 恢复
+// 视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
 // A hand-written History API router: twelve US-11 paths, the five US-12 paths, the R7
-// session deep link, and the 404 view, matching static segments before dynamic ones.
+// session deep link, the US-14 catalog, and the 404 view, matching static segments
+// before dynamic ones.
 
 /** 管理台路径前缀；服务端对 /console/* 非静态资源一律回退 index.html。 */
 export const CONSOLE_BASE = '/console'
@@ -21,6 +22,7 @@ export type RouteName =
   | 'run-detail'
   | 'resources'
   | 'resource-detail'
+  | 'catalog-mcp'
   | 'archived'
   | 'workspace'
   | 'operations'
@@ -79,6 +81,10 @@ const ROUTES: readonly RoutePattern[] = [
   { name: 'run-detail', segments: ['runs', ':id'] },
   { name: 'resources', segments: ['resources', ':kind'] },
   { name: 'resource-detail', segments: ['resources', ':kind', ':id'] },
+  // MCP 目录（US-14）：控制台内部路由，**不是**公开站点路由；两段静态路径，
+  // 与 `resources/:kind` 段数相同但首段不同，互不遮蔽。
+  // The in-console MCP catalog; never a public site route.
+  { name: 'catalog-mcp', segments: ['catalog', 'mcp'] },
   { name: 'archived', segments: ['archived'] },
   { name: 'workspace', segments: ['workspace'] },
   { name: 'operations', segments: ['operations'] },
@@ -251,6 +257,12 @@ export function resourceHref(kind: ResourceKind): string {
 // Resource detail (versions, edit, delete); list names link straight to it.
 export function resourceDetailHref(kind: ResourceKind, id: string): string {
   return `${CONSOLE_BASE}/resources/${kind}/${encodeURIComponent(id)}`
+}
+
+/** MCP 目录页（只读配方库）：控制台内部路由，不进公开站点。 */
+// The in-console MCP catalog page; it is never part of the public site.
+export function mcpCatalogHref(): string {
+  return `${CONSOLE_BASE}/catalog/mcp`
 }
 
 type RouteListener = (match: RouteMatch) => void

@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -298,6 +300,133 @@ func TestNotifyMode_MidRunChangeKeepsFrozen(t *testing.T) {
 	require.Empty(t, blocked, "Run 终态释放冻结")
 
 	require.True(t, strings.HasPrefix(string(first), "rs_"), "渠道身份带资源前缀")
+}
+
+// writeAgentWithDeliverTo 落一份"声明 notify + 一条带 deliver_to 的定时任务"的 AGENT.md：
+// 颗粒度文档 §4.5.9 要判的是"任务配了系统代投时，本 Run 不再向模型暴露 notify"。
+// 工具声明里故意留一件内置工具（read_file）——去掉的必须**只有** notify，而不是把工具面
+// 整个清空（那样断言就成了空集对空集的假绿）。
+// The agent declares notify plus one builtin tool, and one schedule with deliver_to; the
+// judged fact is that only notify disappears from the model-facing tool set.
+func (f *wireFixture) writeAgentWithDeliverTo(t *testing.T, name string,
+	tools []string, channelUID core.ResourceUID,
+) string {
+	t.Helper()
+
+	uid, ok := f.providerUID("probe")
+	require.True(t, ok, "夹具配置里必须有 probe")
+	const taskID = "demo-daily"
+
+	dir := filepath.Join(f.root, agentsDirName, name)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	declared := "tools:\n"
+	for _, toolName := range tools {
+		declared += "  - " + toolName + "\n"
+	}
+	content := "---\n" +
+		"name: " + name + "\n" +
+		"description: 代投探针\n" +
+		"provider:\n  name: probe\n  model: probe-model\n" +
+		declared +
+		bindingsBlock([]core.ResourceBinding{{Name: "probe", UID: uid}}, nil) +
+		"schedules:\n" +
+		"  - id: " + taskID + "\n" +
+		"    cron: \"0 0 9 * * *\"\n" +
+		"    zone: UTC\n" +
+		"    message: 生成日报\n" +
+		"    deliver_to: " + string(channelUID) + "\n" +
+		"---\n\n你是「" + name + "」。\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte(content), 0o644))
+	f.agents = append(f.agents, name)
+	return taskID
+}
+
+// seedNotifyChannel 经真实操作预写与真实渠道仓储落一条共享渠道：投递在运行期按 UID
+// 复核资格，所以行必须在 RunNow 之前存在；装载期只校验 deliver_to 的形态、不读库。
+// seedNotifyChannel writes one shared channel through the real stores so the run-time
+// eligibility lookup resolves it.
+func (f *wireFixture) seedNotifyChannel(t *testing.T, rt *heavyRuntime, name string,
+	uid core.ResourceUID,
+) {
+	t.Helper()
+
+	ctx := context.Background()
+	opID := core.NewOperationID(baselineClock())
+	require.NoError(t, rt.ops.BeginOperation(ctx, core.OperationRecord{
+		OperationID:  opID,
+		Action:       core.ActionNotifyChannelCreate,
+		TargetKind:   core.TargetKindNotifyChannel,
+		TargetID:     name,
+		ActorSubject: resourceActor().Subject,
+		AuthMethod:   resourceActor().Method,
+		Source:       resourceActor().Source,
+		Status:       core.OperationPending,
+		CreatedAt:    baselineClock(),
+	}))
+	require.NoError(t, rt.notifyAdminStore.Create(ctx, core.NotifyChannel{
+		ResourceUID: uid,
+		Name:        name,
+		Type:        "webhook",
+		URL:         "https://example.com/hook",
+		URLHost:     "example.com",
+		Scope:       core.ScopeShared,
+		OperationID: opID,
+	}))
+	require.NoError(t, rt.ops.FinishOperation(ctx, opID, core.OperationSuccess,
+		lifecycleResultOK, "", []byte(`{}`), baselineClock()))
+}
+
+// TestNotifyMode_DeliverToRemovesNotify —— 颗粒度文档 §4.5.9：`deliver_to` 的 Run 由系统
+// 代投接管——模型请求里没有 `notify`（其余声明工具仍在）、工具派生账零行、调度账恰好
+// 一条（发送被空出网规则拒绝 → 终态 failed；判据是"行存在且已收尾"，不是发送成败）。
+// 真实渠道 + 真实投递服务 + 真实调度器，一次 Run 走完整条链。
+// A scheduled run with deliver_to never offers notify to the model, writes no tool-level
+// delivery rows, and settles exactly one system-delivery row.
+func TestNotifyMode_DeliverToRemovesNotify(t *testing.T) {
+	fx := newWireFixture(t)
+	tools := []string{"notify", "read_file"}
+	fx.override = &scriptedProviderClient{replies: []core.ChatResponse{{Content: "日报已生成"}}}
+
+	uid, err := core.NewResourceUID()
+	require.NoError(t, err)
+	const agentName = "reporter"
+	taskID := fx.writeAgentWithDeliverTo(t, agentName, tools, uid)
+
+	rt := fx.assemble(t)
+	fx.seedNotifyChannel(t, rt, "ops", uid)
+
+	ctx := context.Background()
+	require.NoError(t, rt.scheduler.Start(ctx), "调度器启动先对账出任务行")
+	req, res, err := rt.scheduler.RunNow(ctx, taskID)
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
+	require.True(t, req.SuppressNotify, "配了 deliver_to 的 Run 由系统代投接管通知")
+
+	scripted, ok := fx.override.(*scriptedProviderClient)
+	require.True(t, ok)
+	requests := scripted.requests()
+	require.NotEmpty(t, requests, "空工具面的 Run 也要真实调用一次模型")
+	names := make([]string, 0, len(requests[0].Tools))
+	for _, spec := range requests[0].Tools {
+		names = append(names, spec.Name)
+	}
+	require.NotContains(t, names, "notify", "系统代投的 Run 不得向模型暴露 notify")
+	require.Contains(t, names, "read_file", "只删 notify，其余声明工具照旧提供")
+
+	read := openRead(t, fx.dbPath())
+	require.Zero(t, countRows(t, read, `SELECT count(*) FROM notify_deliveries`),
+		"模型没有 notify 工具可调，工具派生账零行")
+
+	require.Equal(t, 1, countRows(t, read, `SELECT count(*) FROM schedule_deliveries`),
+		"一次运行恰好一条系统代投记录")
+	delivery, err := storage.NewDeliveryStore(rt.db).Get(ctx, res.RunID)
+	require.NoError(t, err)
+	require.Equal(t, taskID, delivery.TaskID)
+	require.Equal(t, agentName, delivery.Agent)
+	require.Equal(t, "ops", delivery.ChannelName)
+	require.NotEqual(t, core.DeliveryPending, delivery.Status, "预写行必须收尾")
+	require.Equal(t, core.DeliveryFailed, delivery.Status,
+		"夹具没有配置 http.allowed_domains，发送被白名单拒绝（未出网）")
 }
 
 // allowAllNotifyPolicy 只服务于本文件的本地投递用例：生产白名单拒绝 IP 字面量与非常规

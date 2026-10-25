@@ -429,6 +429,29 @@ export interface SkillView {
   referenced_by: string[]
 }
 
+/**
+ * 工具来源里的一跳：赢家来源是 `builtin` 或某个 MCP server 名（无法确定时为
+ * `unknown`）；跳过原因只有两个 code，不返回自由文本（契约 McpToolSkip）。
+ * One skipped tool: the winning source plus one fixed reason code.
+ */
+export interface McpToolSkip {
+  name: string
+  winner_source: string
+  reason: 'duplicate_name' | 'invalid_tool'
+}
+
+/**
+ * 一个 server 的注册投影（契约 McpToolDisposition）：offered 是它对注册池提出的
+ * 工具数，accepted 是注册成功的数；恒有 `offered === accepted + skipped.length`。
+ * 它**不**改变 `McpServerView.tools` 的语义——后者仍是 offered 名单。
+ * The registration outcome; it never redefines a server's offered tool list.
+ */
+export interface McpToolDisposition {
+  offered: number
+  accepted: number
+  skipped: McpToolSkip[]
+}
+
 export interface McpServerView {
   name: string
   transport: 'stdio' | 'http'
@@ -437,12 +460,131 @@ export interface McpServerView {
   /** 只回变量名，不返回值。 */
   env_keys: string[]
   connected: boolean
+  /** 该 server 提供的工具名（offered）；被谁抢走看 `tool_disposition`。 */
   tools: string[]
   published_version_id: number
   published_version_no: number
   applied_version_id: number
   applied_version_no: number
   pending_restart: boolean
+  /** 未连接或未知时为 null——不拿"没有结果"冒充"全部注册成功"。 */
+  tool_disposition: McpToolDisposition | null
+}
+
+/** 目录 warnings 固定集合（契约 McpCatalogEntry.warnings，七个 code，与诊断集合各自独立）。 */
+export type MCPCatalogWarning =
+  | 'read_only_tool_face_required'
+  | 'server_write_capability'
+  | 'write_tool_name_collision'
+  | 'browser_required'
+  | 'sqlite_sample_only'
+  | 'package_entry_unverified'
+  | 'stdio_child_egress_unconstrained'
+
+/**
+ * 一条 env 占位声明（契约 McpCatalogEnv）：只有键名与 `${KEY}` 占位符，**没有值**。
+ * 它是"该填哪个变量"的提示，不是凭据；保存时由服务端 env 闸门核对真实进程环境。
+ * One env placeholder declaration; it never carries a value.
+ */
+export interface MCPCatalogEnv {
+  key: string
+  placeholder: string
+  required: boolean
+  description: string
+}
+
+/**
+ * 一条可复制的 server 配方（契约 McpCatalogEntry）：`command` 与 `url` 按
+ * `transport` 二选一，另一侧为空串；`args` 里的 `<...>` 只是编辑标记，不是运行时
+ * 变量；`verified=false` 时 `verified_at` 与 `verified_platforms` 为空，且
+ * `verification_note` 写清待实测项。
+ * One copyable recipe; the verified quartet keeps measured apart from not yet measured.
+ */
+export interface MCPCatalogEntry {
+  id: string
+  display_name: string
+  summary: string
+  category: string
+  transport: 'stdio' | 'http'
+  command: string
+  args: string[]
+  url: string
+  env: MCPCatalogEnv[]
+  requires: string[]
+  source_url: string
+  verified: boolean
+  verification_note: string
+  /** RFC 3339；`verified=false` 时为空串。 */
+  verified_at: string
+  verified_platforms: ('windows' | 'linux' | 'darwin')[]
+  warnings: MCPCatalogWarning[]
+}
+
+/** 整份只读目录（契约 McpCatalog）：`items` 由服务端按 `id` 升序给出，页面不重排。 */
+export interface MCPCatalog {
+  version: number
+  items: MCPCatalogEntry[]
+}
+
+/**
+ * 命令定位三态（契约 McpCommandDiagnosis.state）：`unconfirmed` **不是**失败，只是
+ * 按现行启动构造无法确定；测试仍会真实尝试，分类由真实错误给出。
+ * The three-state lookup verdict; unconfirmed never blocks a test attempt.
+ */
+export type McpCommandState = 'located' | 'not_found' | 'unconfirmed'
+
+/** 定位原因的固定集合（契约 McpCommandDiagnosis.reason）。 */
+export type McpCommandReason =
+  | 'lookpath'
+  | 'absolute'
+  | 'not_found'
+  | 'relative_path'
+  | 'script'
+  | 'permission'
+  | 'unknown'
+
+export interface McpCommandDiagnosis {
+  state: McpCommandState
+  /** 仅 `located` 时非空。 */
+  path: string
+  reason: McpCommandReason
+}
+
+/** 单个环境变量是否就绪；只回布尔，不回值（契约 McpEnvDiagnosis）。 */
+export interface McpEnvDiagnosis {
+  key: string
+  set: boolean
+}
+
+/** 诊断 warnings 固定集合（契约 McpServerDiagnosis.warnings，六个 code）。 */
+export type McpDiagnosticWarning =
+  | 'stdio_child_egress_unconstrained'
+  | 'remote_mcp_downstream_unconstrained'
+  | 'args_placeholders_not_resolved'
+  | 'package_entry_unverified'
+  | 'http_auth_header_unsupported'
+  | 'env_gate_process_local'
+
+/**
+ * MCP server 只读诊断（契约 McpServerDiagnosis）：命令三态、env 就绪布尔、固定
+ * warnings 与检查时间。**不含** `connected`——诊断不预测连接结果，页面据此分轴
+ * 展示，不把诊断结论当成测试结论。
+ * The read-only diagnosis; it deliberately carries no connected flag.
+ */
+export interface McpServerDiagnostics {
+  name: string
+  transport: 'stdio' | 'http'
+  published_version_id: number
+  applied_version_id: number
+  /** 只由 published != applied 且 published != 0 决定，与 connected 无关。 */
+  pending_restart: boolean
+  /** stdio 为对象；http 为 null。 */
+  command: McpCommandDiagnosis | null
+  /** 按 key 升序；只回布尔。 */
+  env: McpEnvDiagnosis[]
+  warnings: McpDiagnosticWarning[]
+  /** RFC 3339 UTC。 */
+  checked_at: string
 }
 
 export interface ModelConnectionView {

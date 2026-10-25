@@ -693,6 +693,10 @@ func (*fakeResourceAdminService) TestMCPServer(context.Context, core.Actor, stri
 	return core.ResourceTestResult{}, nil
 }
 
+func (*fakeResourceAdminService) DiagnoseMCPServer(context.Context, core.Actor, string) (core.MCPServerDiagnosis, error) {
+	return core.MCPServerDiagnosis{}, nil
+}
+
 // fakeNotifyAdminService 是通知渠道写面端口的零值桩。
 // fakeNotifyAdminService is the zero-value notify write stub.
 type fakeNotifyAdminService struct{}

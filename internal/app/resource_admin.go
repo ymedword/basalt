@@ -258,6 +258,12 @@ type ResourceAdminDeps struct {
 	// 装配不保留投影——历史仍在管理操作台账，测试照常执行。
 	// ConnectionTests is the last-test projection; a nil port only skips the projection.
 	ConnectionTests core.ResourceConnectionTestStore
+	// DiagnoseMCP 是 MCP 只读依赖诊断的命令定位面（契约 C-04）：装配层绑定与启动共用的
+	// `tool.NewMCPCommand` 构造器，诊断不自己另写一套路径解析。nil 时诊断把命令答成
+	// `unconfirmed / unknown` 并留 WARN——装配缺失不得伪装成"已就绪"。
+	// DiagnoseMCP is the stat-only command locator shared with launch; nil degrades to
+	// unconfirmed with a warning rather than faking a positive verdict.
+	DiagnoseMCP func(core.MCPServerConfig) core.MCPCommandDiagnosis
 }
 
 // ResourceAdmin 是公共资源写面的编排实现；字段全部私有，构造后不再变化。
@@ -279,6 +285,7 @@ type ResourceAdmin struct {
 	bindings         NotifyBindingReferrer
 	archives         ArchiveLister
 	connectionTests  core.ResourceConnectionTestStore
+	diagnoseMCP      func(core.MCPServerConfig) core.MCPCommandDiagnosis
 	logger           *slog.Logger
 	now              func() time.Time
 	publishVersion   func(ctx context.Context, v core.ResourceVersion, applied bool, operationID string, now time.Time) (core.ResourceVersion, error)
@@ -377,6 +384,7 @@ func NewResourceAdmin(deps ResourceAdminDeps) *ResourceAdmin {
 		bindings:         deps.Bindings,
 		archives:         deps.Archives,
 		connectionTests:  deps.ConnectionTests,
+		diagnoseMCP:      deps.DiagnoseMCP,
 		logger:           logger,
 		now:              now,
 		publishVersion:   publishVersion,
@@ -986,6 +994,13 @@ func (s *ResourceAdmin) UpsertMCPServer(ctx context.Context, actor core.Actor, r
 			Message: fmt.Sprintf("MCP server %s 已存在", req.Name),
 			Data:    map[string]any{"operation_id": operationID},
 		}
+	}
+
+	// env 闸门（模块卡 §2.3 图 2-2）：预写之后、**第一次写文件之前**证明当前进程环境
+	// 满足这条条目的 `${VAR}` 引用。失败只留一条 failed/NOT_CONFIGURED 行，文件 / 版本 /
+	// 指针零变化；错误与 detail 只点名 server / 键 / 变量，不含值。
+	if err := validateMCPEntryEnv(entryRaw, os.LookupEnv); err != nil {
+		return core.ResourceVersion{}, s.rejectMCPEnvGate(ctx, operationID, "保存所需环境变量未配置", err)
 	}
 
 	if err := workspace.CommitMCPServersDefinition(definitionPath, candidate); err != nil {
@@ -1694,6 +1709,14 @@ func (s *ResourceAdmin) Publish(ctx context.Context, actor core.Actor, req core.
 		return core.ResourcePublishResult{Version: target, PendingRestart: pendingRestart}, nil
 	}
 
+	// env 闸门（模块卡 §2.3 图 2-2）：幂等分支已在上面短路，这里校验的是**目标版本**
+	// 条目（回滚同样走这里）——当前进程环境不满足就拒绝，且不改文件 / 指针 / 版本。
+	if req.Kind == core.ResourceMCPServer {
+		if err := validateMCPEntryEnv([]byte(target.DefinitionYAML), os.LookupEnv); err != nil {
+			return core.ResourcePublishResult{}, s.rejectMCPEnvGate(ctx, operationID, "发布所需环境变量未配置", err)
+		}
+	}
+
 	if !bytes.Equal(candidate, original) {
 		if err := commitDefinition(definitionPath, candidate); err != nil {
 			s.logger.Error("写入资源定义失败", "kind", string(req.Kind), "resource", req.ID, "operation_id", operationID, "error", err)
@@ -2132,9 +2155,14 @@ func (s *ResourceAdmin) TestMCPServer(ctx context.Context, actor core.Actor, nam
 		AuthMethod:   actor.Method,
 		Source:       actor.Source,
 		RequestHash:  mcpServerTestHash(name),
-		Status:       core.OperationPending,
-		DetailJSON:   []byte("{}"),
-		CreatedAt:    now,
+		// 被测版本在**预写之前**固定：页面以 `requested_version_id` 为权威被测版本，
+		// 只在响应里带版本的话，刷新后读操作详情就不知道测的是哪一版（D-03）。
+		// The tested version is pinned before the prewrite; the operation row is the
+		// authoritative record the page reads after a refresh.
+		RequestedVersionID: pointer.PublishedVersionID,
+		Status:             core.OperationPending,
+		DetailJSON:         []byte("{}"),
+		CreatedAt:          now,
 	}
 	if err := s.operations.BeginOperation(ctx, record); err != nil {
 		s.logger.Error("MCP server 测试预写操作失败，拒绝执行", "resource", name, "error", err)
@@ -2147,14 +2175,18 @@ func (s *ResourceAdmin) TestMCPServer(ctx context.Context, actor core.Actor, nam
 	// Published env values are still ${VAR} placeholders; resolve them before connecting.
 	resolved, resolveErr := resolveMCPEnv([]core.MCPServerConfig{cfg}, os.LookupEnv)
 	if resolveErr != nil {
-		detail, marshalErr := json.Marshal(modelTestOperationDetail{
+		detail, marshalErr := json.Marshal(mcpTestOperationDetail{
+			Tools:        []string{},
 			ErrorCode:    resourceResultNotConfigured,
 			ErrorMessage: resolveErr.Error(),
+			Stage:        mcpGateStagePreflight,
+			FailureClass: mcpGateClassEnvMissing,
 		})
 		if marshalErr != nil {
 			detail = nil
 		}
 		s.finish(ctx, operationID, core.OperationFailed, resourceResultNotConfigured, "测试所需环境变量未配置", detail)
+		// 503 不返回测试结果对象：页面用 operation_id 拉操作详情读 stage / failure_class。
 		return core.ResourceTestResult{}, &core.AdminError{
 			Kind:    core.ErrProviderNotConfigured,
 			Message: resolveErr.Error(),
@@ -2164,19 +2196,18 @@ func (s *ResourceAdmin) TestMCPServer(ctx context.Context, actor core.Actor, nam
 	cfg = resolved[0]
 
 	result := s.supervisor.Test(ctx, cfg)
-	detail := modelTestOperationDetail{
-		OK:           result.OK,
-		LatencyMS:    result.LatencyMS,
-		ErrorCode:    result.ErrorCode,
-		ErrorMessage: result.ErrorMessage,
-	}
-	payload, marshalErr := json.Marshal(detail)
+	// 响应里的 operation_id / 被测版本与操作行同源：页面并发测试后按 operation_id 串行。
+	result.OperationID = operationID
+	result.TestedVersionID = pointer.PublishedVersionID
+
+	payload, marshalErr := json.Marshal(mcpTestOperationDetailOf(result))
 	if marshalErr != nil {
 		payload = nil
 	}
 	if result.ErrorCode == resourceResultTimeout {
 		s.finish(ctx, operationID, core.OperationFailed, resourceResultTimeout, "MCP server 连接测试超时", payload)
-		return result, &core.AdminError{
+		// 504 同样不返回结果对象（D-03）：超时的 stage / class 只在操作详情里。
+		return core.ResourceTestResult{}, &core.AdminError{
 			Kind:    context.DeadlineExceeded,
 			Message: fmt.Sprintf("MCP server 连接测试超时（%s）", defaultMCPTestTimeout),
 			Data:    map[string]any{"operation_id": operationID},
@@ -3752,4 +3783,40 @@ type modelTestOperationDetail struct {
 	Model        string `json:"model,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
+}
+
+// mcpTestOperationDetail 是 `mcp_server.test` 操作详情的**固定七字段**（契约 D-07）：
+// 一律不用 omitempty——成功时 `error_code` / `error_message` / `failure_class` 必须是
+// 空串而不是缺键，`tools` 必须存在（空列表写 `[]`）。页面按"字段是否齐全"区分
+// 完整记录与历史记录；缺字段的旧行不得被推断成通过。
+// mcpTestOperationDetail is the fixed seven-field detail of an MCP connection test;
+// every key is always present so the page can tell a complete row from a legacy one.
+type mcpTestOperationDetail struct {
+	OK           bool     `json:"ok"`
+	LatencyMS    int64    `json:"latency_ms"`
+	Tools        []string `json:"tools"`
+	ErrorCode    string   `json:"error_code"`
+	ErrorMessage string   `json:"error_message"`
+	Stage        string   `json:"stage"`
+	FailureClass string   `json:"failure_class"`
+}
+
+// mcpTestOperationDetailOf 把测试结果投影成 D-07 固定字段；工具清单为空时写空切片
+// （`null` 与"字段缺失"在页面上不可区分，两者都不允许）。
+// mcpTestOperationDetailOf projects the result into the fixed D-07 shape, with an
+// empty (never nil) tool list.
+func mcpTestOperationDetailOf(result core.ResourceTestResult) mcpTestOperationDetail {
+	tools := result.Tools
+	if tools == nil {
+		tools = []string{}
+	}
+	return mcpTestOperationDetail{
+		OK:           result.OK,
+		LatencyMS:    result.LatencyMS,
+		Tools:        tools,
+		ErrorCode:    result.ErrorCode,
+		ErrorMessage: result.ErrorMessage,
+		Stage:        result.Stage,
+		FailureClass: result.FailureClass,
+	}
 }

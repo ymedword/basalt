@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Basalt REST API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalDesign.md)§6.2 冲突时以技术方案为准。
 
@@ -19,7 +19,7 @@ info:
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
     - **数据库目标版本**：`schema_version=2`（US-11 / US-12 追加资源版本、Run 资源引用、管理操作审计与生命周期索引）
-    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 新增路径同样以本文件为准
+    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 新增路径同样以本文件为准
 servers:
   - url: http://127.0.0.1:8080/api/v1
     description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr 并配置 admin token
@@ -630,6 +630,35 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /catalog/mcp:
+    get:
+      tags: [resources]
+      summary: 读 MCP 目录（只读配方集合）
+      description: |
+        内置只读目录，随二进制嵌入、启动时解析一次；请求期不重读文件、不访问网络。
+        **只读**：不启动进程、不安装、不写配置、不发布、不写管理操作行、不改 `mcp_servers.yaml`。
+        `items` 按 `id` 升序；`url` 空串表示 stdio，`command` 空串表示 http；`source_url` 必须是 https；
+        `verified=false` 时 `verification_note` 非空且 `verified_at` / `verified_platforms` 为空。
+        `warnings` 只回本契约枚举的 code，不返回自由文本。目录是静态集合，没有 404。
+      responses:
+        '200':
+          description: 目录全部条目（静态集合，无分页、无排序参数）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpCatalog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: 目录未装配（`Options.MCPCatalog` 缺失，业务码 `INTERNAL`）；不得用空目录充数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
   /mcp-servers:
     get:
       tags: [resources]
@@ -674,6 +703,14 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '503':
+          description: |
+            env 占位引用的环境变量缺失或为空（业务码 `NOT_CONFIGURED`）：先预写 `pending` 管理操作再拒绝，
+            `data.operation_id` 必填且操作行已置 `failed`；文件、版本与发布指针零变化；错误只点名 server / 键 /
+            变量名，不含值。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   /mcp-servers/{name}:
     parameters:
@@ -731,6 +768,14 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '503':
+          description: |
+            env 占位引用的环境变量缺失或为空（业务码 `NOT_CONFIGURED`）：预写 `pending` 管理操作后再拒绝，
+            `data.operation_id` 必填且操作行已置 `failed`；不新建版本、不改发布指针；错误只点名 server / 键 /
+            变量名，不含值。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
     delete:
       tags: [resources]
       summary: 删除 MCP server
@@ -748,6 +793,42 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
+
+  /mcp-servers/{name}/diagnostics:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: MCP server 只读诊断
+      description: |
+        回答“按实际启动方式能否定位、环境变量是否就绪、是否待重启、有哪些已知边界”。
+        **只读**：不启动进程、不连接、不写管理操作行、不改 applied / published。
+        命令三态 `located` / `not_found` / `unconfirmed` 与 `reason` 组合固定（逐态列举见 schema enum）；
+        `not_applicable` 只用于内部映射，不出现 JSON。`command` 对 http 传输为 `null`。
+        `env` 按 `key` 升序，只回布尔，不回值；判据与运行时 env 解析一致（存在且非空为 true）。
+        `pending_restart` 只由 `published_version_id != applied_version_id && published_version_id != 0` 决定，与
+        `connected` 无关。诊断与测试不互相预判：`unconfirmed` 不阻塞测试尝试。
+      responses:
+        '200':
+          description: 诊断结果（分轴：命令 / env / 重启 / warnings）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerDiagnosis' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: 未配置或已删除（业务码 `NOT_FOUND`，沿用既有信封错误码，不新增 `RESOURCE_NOT_FOUND`）；不返回诊断对象
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   /mcp-servers/{name}/test:
     parameters:
@@ -775,7 +856,21 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '504': { $ref: '#/components/responses/Timeout' }
+        '503':
+          description: |
+            env 占位引用的环境变量缺失或为空（业务码 `NOT_CONFIGURED`）：预写 `pending` 管理操作、置 `failed`
+            后返回，`data.operation_id` 必填；**不返回测试结果对象**——页面用 `operation_id` 查 `OperationDetail`
+            读 `detail.stage` / `detail.failure_class`。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '504':
+          description: |
+            工具发现超时（业务码 `TIMEOUT`）：操作行记 `failed`，`data.operation_id` 必填；
+            **不返回测试结果对象**——页面用 `operation_id` 查 `OperationDetail` 读 `detail.failure_class=timeout`。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   # ==========================================================
   # 公共资源版本、发布与引用
@@ -874,6 +969,14 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '503':
+          description: |
+            仅 `kind=mcp_server`：env 占位引用的环境变量缺失或为空（业务码 `NOT_CONFIGURED`）：预写 `pending`
+            管理操作后再拒绝，`data.operation_id` 必填且操作行已置 `failed`；不新建版本、不改发布指针。
+            幂等发布（无变更）在闸门之前短路，不因瞬时环境缺失被拒，也不宣称环境已满足。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   /resources/{kind}/{name}/credential/revoke:
     parameters:
@@ -2334,6 +2437,145 @@ components:
         applied_version_id: { type: integer }
         applied_version_no: { type: integer }
         pending_restart: { type: boolean, description: 已发布但运行中的进程仍是旧版本 }
+        tool_disposition:
+          oneOf:
+            - $ref: '#/components/schemas/McpToolDisposition'
+            - type: "null"
+          description: |
+            实际注册结果（offer / accept / skip 与赢家）；未连接或未知时为 `null`。
+            `tools` 仍是该 server 提供的工具名（offered）；连接后 `accepted + len(skipped) = offered`
+            （允许 `invalid_tool` 跳过）。注册池的重名语义不变（内置赢家、WARN 不改）。
+
+    McpToolDisposition:
+      type: object
+      properties:
+        offered: { type: integer }
+        accepted: { type: integer }
+        skipped:
+          type: array
+          items: { $ref: '#/components/schemas/McpToolSkip' }
+
+    McpToolSkip:
+      type: object
+      properties:
+        name: { type: string }
+        winner_source:
+          type: string
+          description: '`builtin` 或具体 MCP server 名；无法确定（理论上不应发生）为 `unknown`，不得猜'
+        reason: { type: string, enum: [duplicate_name, invalid_tool] }
+
+    McpCatalog:
+      type: object
+      required: [version, items]
+      properties:
+        version: { type: integer, description: 目录 schema 版本（当前为 1） }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/McpCatalogEntry' }
+          description: 按 `id` 升序
+
+    McpCatalogEntry:
+      type: object
+      required: [id, display_name, summary, category, transport, command, args, url, env, requires, source_url, verified, verification_note, verified_at, verified_platforms, warnings]
+      properties:
+        id: { type: string, description: 唯一 kebab-case 标识 }
+        display_name: { type: string }
+        summary: { type: string }
+        category: { type: string }
+        transport: { type: string, enum: [stdio, http] }
+        command: { type: string, description: stdio 必填；http 为空串 }
+        args:
+          type: array
+          items: { type: string }
+          description: '可为空数组；`<...>` 只是编辑标记，不是运行时变量'
+        url: { type: string, description: 'http 必填且为绝对 URL；stdio 为空串' }
+        env:
+          type: array
+          items: { $ref: '#/components/schemas/McpCatalogEnv' }
+          description: 可为空数组
+        requires:
+          type: array
+          minItems: 1
+          items: { type: string }
+        source_url: { type: string, description: 必须为 https 来源 }
+        verified: { type: boolean }
+        verification_note: { type: string, description: '`verified=false` 时必须非空，写清待实测项' }
+        verified_at: { type: string, description: 'RFC 3339；`verified=false` 时为空串，`verified=true` 时非空' }
+        verified_platforms:
+          type: array
+          items: { type: string, enum: [windows, linux, darwin] }
+          description: '`verified=false` 时为空数组；不写 `all`'
+        warnings:
+          type: array
+          items:
+            type: string
+            enum:
+              - read_only_tool_face_required
+              - server_write_capability
+              - write_tool_name_collision
+              - browser_required
+              - sqlite_sample_only
+              - package_entry_unverified
+              - stdio_child_egress_unconstrained
+          description: 只回固定 code，不返回自由文本（与诊断 warnings 各自独立枚举）
+
+    McpCatalogEnv:
+      type: object
+      required: [key, placeholder, required, description]
+      properties:
+        key: { type: string }
+        placeholder:
+          type: string
+          pattern: '^\$\{[A-Za-z_][A-Za-z0-9_]*\}$'
+          description: 必须是 `${KEY}` 且与 `key` 一致
+        required: { type: boolean }
+        description: { type: string }
+
+    McpServerDiagnosis:
+      type: object
+      properties:
+        name: { type: string }
+        transport: { type: string, enum: [stdio, http] }
+        published_version_id: { type: integer }
+        applied_version_id: { type: integer }
+        pending_restart:
+          type: boolean
+          description: 只由 published != applied 且 published != 0 决定，与 connected 无关
+        command:
+          oneOf:
+            - $ref: '#/components/schemas/McpCommandDiagnosis'
+            - type: "null"
+          description: stdio 为对象；http 为 `null`
+        env:
+          type: array
+          items: { $ref: '#/components/schemas/McpEnvDiagnosis' }
+          description: 按 `key` 升序；只回布尔，不回值
+        warnings:
+          type: array
+          items:
+            type: string
+            enum:
+              - stdio_child_egress_unconstrained
+              - remote_mcp_downstream_unconstrained
+              - args_placeholders_not_resolved
+              - package_entry_unverified
+              - http_auth_header_unsupported
+              - env_gate_process_local
+          description: 只回固定 code，不返回自由文本（与目录 warnings 各自独立枚举）
+        checked_at: { type: string, format: date-time }
+
+    McpCommandDiagnosis:
+      type: object
+      properties:
+        state: { type: string, enum: [located, not_found, unconfirmed] }
+        path: { type: string, description: '仅 `located` 时非空；不返回命令原文以外的敏感内容' }
+        reason: { type: string, enum: [lookpath, absolute, not_found, relative_path, script, permission, unknown] }
+
+    McpEnvDiagnosis:
+      type: object
+      properties:
+        key: { type: string }
+        set: { type: boolean, description: 变量存在且非空为 true；未设置或空字符串为 false }
 
     SandboxView:
       type: object
@@ -2976,12 +3218,39 @@ components:
 
     McpServerTestResult:
       type: object
+      required: [tools, operation_id, tested_version_id, stage, failure_class]
       properties:
         ok: { type: boolean }
         latency_ms: { type: integer }
-        tools: { type: array, items: { type: string } }
+        tools:
+          type: array
+          items: { type: string }
+          description: '`tools/list` 的实名单；失败时可为空数组，但字段必须存在'
         error_code: { type: string }
         error_message: { type: string, description: 脱敏 }
+        operation_id: { type: string, description: 对应 `management_operations.operation_id` }
+        tested_version_id:
+          type: integer
+          description: '`0` 表示无法确定（历史 / 旧记录）；正常必须等于 `OperationDetail.requested_version_id`'
+        stage: { type: string, enum: [preflight, spawn, initialize, tools_list, complete] }
+        failure_class:
+          type: string
+          enum:
+            - ""
+            - command_not_found
+            - permission_denied
+            - policy_denied
+            - timeout
+            - http_unauthorized
+            - http_unreachable
+            - handshake_failed
+            - tools_list_failed
+            - env_missing
+            - dependency_unconfirmed
+          description: |
+            成功为空串。只在 200 响应里出现；503 / 504 不返回本对象，页面改用
+            `AdminError.Data.operation_id` 拉 `OperationDetail` 读 `detail.stage` / `detail.failure_class`。
+            分类只来自结构化失败，不解析 stderr / 日志。
 
     SkillFileView:
       type: object
@@ -3148,6 +3417,13 @@ components:
             request_hash: { type: string }
             requested_version_id: { type: integer }
             expected_etag: { type: string }
-            detail: { type: object, additionalProperties: true, description: 脱敏 detail_json }
+            detail:
+              type: object
+              additionalProperties: true
+              description: |
+                脱敏 detail_json。`mcp_server.test` 的固定字段为 `ok` / `latency_ms` / `tools` / `error_code` /
+                `error_message` / `stage` / `failure_class`；被测版本以 `requested_version_id` 为准，`detail`
+                不重复版本字段。旧记录可能缺 `tools` / `stage` / `failure_class`，页面显示“历史记录字段不全，
+                需重新测试”，不得据此推断通过。不得写入 env 值、命令原文、URL 凭据或 stderr。
             recovered_at: { type: string, description: 未恢复为空串 }
             verification: { type: string, enum: [not_required, applied, not_applied, indeterminate] }

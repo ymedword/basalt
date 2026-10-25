@@ -1419,8 +1419,11 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 		modelConnectionTestResultView(core.ResourceTestResult{
 			OK: true, LatencyMS: 12, Model: "gpt-test",
 		}))
+	// `stage` 自 US-14（D-03）起是契约枚举，成功路径恒为 `complete`；样例必须带上
+	// 合法取值，否则校验真正在判的是"空串算不算合法枚举"而不是视图字段名。
+	// The sample carries a valid stage because D-03 made it an enum.
 	requireViewMatchesSchema(t, doc, "McpServerTestResult",
-		mcpServerTestResultView(core.ResourceTestResult{OK: true, Tools: []string{"search"}}))
+		mcpServerTestResultView(core.ResourceTestResult{OK: true, Tools: []string{"search"}, Stage: "complete"}))
 	requireViewMatchesSchema(t, doc, "SkillValidateResult",
 		skillValidateResultView(core.SkillValidateResult{Valid: true}))
 

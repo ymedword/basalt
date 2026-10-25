@@ -1,0 +1,16 @@
+{
+  "table": "tickets",
+  "columns": ["row_id", "ticket_id", "created_at", "channel", "subject", "priority", "status"],
+  "rows": [
+    {"row_id": 1, "ticket_id": "TK-2001", "created_at": "2026-10-20 10:05", "channel": "app", "subject": "无法登录：验证码一直提示过期", "priority": "high", "status": "open"},
+    {"row_id": 2, "ticket_id": "TK-2002", "created_at": "2026-10-20 15:40", "channel": "web", "subject": "登录后立刻被登出，重试也不行", "priority": "normal", "status": "closed"},
+    {"row_id": 3, "ticket_id": "TK-2003", "created_at": "2026-10-21 09:15", "channel": "app", "subject": "支付时提示订单金额不一致", "priority": "high", "status": "open"},
+    {"row_id": 4, "ticket_id": "TK-2004", "created_at": "2026-10-21 14:02", "channel": "phone", "subject": "快递三天没更新，配送进度查不到", "priority": "normal", "status": "closed"},
+    {"row_id": 5, "ticket_id": "TK-2005", "created_at": "2026-10-22 08:31", "channel": "web", "subject": "换了手机号，登录密码不对", "priority": "high", "status": "open"},
+    {"row_id": 6, "ticket_id": "TK-2006", "created_at": "2026-10-22 17:48", "channel": "app", "subject": "退款申请三天还没到账", "priority": "high", "status": "open"},
+    {"row_id": 7, "ticket_id": "TK-2007", "created_at": "2026-10-23 11:20", "channel": "web", "subject": "APP 界面字体太小，建议支持调节", "priority": "low", "status": "closed"},
+    {"row_id": 8, "ticket_id": "TK-2008", "created_at": "2026-10-23 19:05", "channel": "phone", "subject": "配送地址改不了，下单后才发现", "priority": "normal", "status": "open"},
+    {"row_id": 9, "ticket_id": "TK-2009", "created_at": "2026-10-24 09:44", "channel": "app", "subject": "登录验证码收不到，导致支付一直失败", "priority": "normal", "status": "closed"},
+    {"row_id": 10, "ticket_id": "TK-2010", "created_at": "2026-10-24 16:30", "channel": "web", "subject": "支付成功但订单显示未付款", "priority": "urgent", "status": "open"}
+  ]
+}

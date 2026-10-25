@@ -1,15 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, access } from 'node:fs/promises'
+import { readFile, readdir, access } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 import { CAPABILITIES, CORE_CAPABILITIES, DIAGRAMS } from '../.vitepress/data/capabilities.mjs'
+import { CATALOG, DEMOS, TEMPLATES, TIERS } from '../.vitepress/data/templates.mjs'
 import { ROUTES, resolveFooter } from '../.vitepress/data/navigation.mjs'
 import { QUICKSTART_COMMANDS, DURATION_MEASURED, MINIMAL_CONFIG, TOKEN_GENERATION, PREREQUISITES, assertQuickstartParity, extractBasaltCommands } from '../.vitepress/data/quickstart.mjs'
 import { isForbiddenPath } from '../scripts/check-links.mjs'
 import { replyFor } from '../demo/local-model.mjs'
 
 const root = new URL('../../', import.meta.url)
-export const CONTENT_FILES = ['README.md', ...ROUTES.flatMap(route => ['en', 'zh'].map(locale => `website${route[locale]}index.md`)), 'website/.vitepress/data/quickstart.mjs', 'website/demo/transcript.json', 'website/.vitepress/theme/components/CapabilityGrid.vue', 'website/.vitepress/theme/components/CliDemo.vue']
+export const CONTENT_FILES = ['README.md', ...ROUTES.flatMap(route => ['en', 'zh'].map(locale => `website${route[locale]}index.md`)), 'website/.vitepress/data/quickstart.mjs', 'website/.vitepress/data/templates.mjs', 'website/demo/transcript.json', 'website/.vitepress/theme/components/CapabilityGrid.vue', 'website/.vitepress/theme/components/CliDemo.vue', 'website/.vitepress/theme/components/TemplateTable.vue']
 export async function loadContentFiles() {
   return Object.fromEntries(await Promise.all(CONTENT_FILES.map(async file => [file, await readFile(new URL(file, root), 'utf8')])))
 }
@@ -53,6 +54,9 @@ export function checkPublicContent(files) {
     if (!/session list[\s\S]{0,400}(?:共\s*\d+\s*个会话|未发现会话)/.test(quick)) report(locale, 'missing-session-output')
     const docs = files[`website${locale === 'zh' ? '/zh' : ''}/docs/index.md`]
     if (!/no site search|无站内搜索/.test(docs) || /<(?:input|button)[^>]*(?:search|搜索)/i.test(docs)) report(locale, 'search-contract')
+    for (const section of ['demos', 'templates', 'catalog']) {
+      if (!new RegExp(`<TemplateTable section="${section}"`).test(docs)) report(locale, `missing-template-table-${section}`)
+    }
     const architecture = files[`website${locale === 'zh' ? '/zh' : ''}/architecture/index.md`]
     for (const { id } of DIAGRAMS) if (!architecture.includes(`<DiagramFigure id="${id}"`)) report(locale, `missing-diagram-${id}`)
     const statement = architecture.split('{#current-scope}')[0]
@@ -86,6 +90,43 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.deepEqual(CORE_CAPABILITIES.map(item => item.id), ['provider', 'react', 'memory', 'tool', 'web'])
     for (const item of [...CAPABILITIES, ...CORE_CAPABILITIES]) { await access(new URL(item.evidence, root)); assert.ok(item.titleEn && item.titleZh && item.bodyEn && item.bodyZh) }
     for (const item of CAPABILITIES) { await access(new URL(`website/public${item.illustration}`, root)); assert.ok(item.altEn && item.altZh) }
+  })
+  // 模板表必须与仓库目录和内置目录数据逐条对应，不能靠手抄；档位与双语字段一起判。
+  // The public tables must correspond entry-for-entry to the repository sources.
+  test('template table matches examples directories and the bundled MCP catalog', async () => {
+    const agentDirectories = async directory => {
+      const names = []
+      for (const item of await readdir(new URL(directory, root), { withFileTypes: true })) {
+        if (!item.isDirectory()) continue
+        try { await access(new URL(`${directory}${item.name}/AGENT.md`, root)) } catch { continue }
+        names.push(item.name)
+      }
+      return names.sort()
+    }
+    assert.equal(DEMOS.length, 5)
+    assert.equal(TEMPLATES.length, 8)
+    assert.equal(CATALOG.length, 6)
+    assert.deepEqual(DEMOS.map(item => item.id).sort(), await agentDirectories('examples/daily/'))
+    assert.deepEqual(TEMPLATES.map(item => item.id).sort(), await agentDirectories('examples/templates/'))
+    const catalog = await readFile(new URL('internal/catalog/data/mcp_catalog.yaml', root), 'utf8')
+    assert.deepEqual(CATALOG.map(item => item.id).sort(), [...catalog.matchAll(/^\s*-\s+id:\s*(\S+)\s*$/gm)].map(match => match[1]).sort())
+    const entries = [...DEMOS, ...TEMPLATES]
+    assert.equal(new Set(DEMOS.map(item => item.id)).size, 5)
+    assert.equal(new Set(TEMPLATES.map(item => item.id)).size, 8)
+    assert.equal(new Set(CATALOG.map(item => item.id)).size, 6)
+    for (const item of entries) {
+      assert.equal(item.path, `examples/${item.path.split('/')[1]}/${item.id}/`, `${item.id}: path does not mirror its id`)
+      assert.ok(!isForbiddenPath(item.path, true), `${item.id}: forbidden path ${item.path}`)
+      await access(new URL(item.path, root))
+      for (const field of ['titleEn', 'titleZh', 'needsEn', 'needsZh']) assert.ok(item[field], `${item.id}: missing ${field}`)
+    }
+    for (const item of DEMOS) for (const field of ['bodyEn', 'bodyZh', 'evidenceEn', 'evidenceZh']) assert.ok(item[field], `${item.id}: missing ${field}`)
+    for (const item of TEMPLATES) for (const field of ['domainEn', 'domainZh']) assert.ok(item[field], `${item.id}: missing ${field}`)
+    for (const item of CATALOG) for (const field of ['nameEn', 'nameZh', 'summaryEn', 'summaryZh', 'needsEn', 'needsZh', 'limitEn', 'limitZh']) assert.ok(item[field], `${item.id}: missing ${field}`)
+    assert.deepEqual(TIERS.map(item => item.tier), ['A', 'A*', 'B'])
+    const tiers = TEMPLATES.map(item => item.tier)
+    for (const tier of tiers) assert.ok(TIERS.some(item => item.tier === tier), `undeclared tier ${tier}`)
+    assert.deepEqual([tiers.filter(tier => tier === 'A').length, tiers.filter(tier => tier === 'A*').length, tiers.filter(tier => tier === 'B').length], [6, 1, 1])
   })
   test('configuration, token methods and dependency scenarios are complete', () => {
     for (const marker of ['${BASALT_MODEL_KEY}', '${BASALT_ADMIN_TOKEN}', '127.0.0.1:8080', 'credential_mode: env']) assert.ok(MINIMAL_CONFIG.includes(marker))

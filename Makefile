@@ -14,9 +14,15 @@
 # 显式指定配方 shell：不同平台的 make 默认 shell 不一致，统一到 POSIX sh。
 SHELL := /bin/sh
 
-.PHONY: check fmt lint sec test test-integration cover build acceptance evals
+.PHONY: check fmt lint sec test test-integration cover build acceptance evals example-tests e2e
 
 check: fmt lint sec test test-integration cover build
+
+# 示例单测的解释器：本机 python / python3 是 Microsoft Store 占位符（运行即 exit 49、
+# 无输出），可用的解释器只有 py -3 启动器；其他平台用 `make example-tests PYTHON=python` 覆盖。
+# The interpreter for the example tests: on this machine python/python3 are Store stubs that
+# exit 49, so the launcher is the only usable default. Override with PYTHON=python elsewhere.
+PYTHON ?= py -3
 
 # Unified development acceptance: seven gates plus fixed behavior/injection evals.
 acceptance: ; sh scripts/check-acceptance.sh --profile full
@@ -46,4 +52,31 @@ cover: ; sh scripts/check-coverage.sh
 
 # 发布构建：单二进制纪律（CGO_ENABLED=0）；版本标识经 -X 注入入口包。
 # 配方里的 `$$(...)` 必须双写——单写会被 Make 当变量引用展开为空。
-build: ; CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$$(git describe --tags --always)" -o bin/basalt ./cmd/basalt
+#
+# 产物名按宿主补可执行后缀（`go env GOEXE`：Windows 为 .exe，其余为空）：Windows 的
+# os/exec 只按 PATHEXT 解析带扩展名的目标，无扩展名的 PE 文件会报
+# "executable file not found in %PATH%"——e2e 直接执行候选产物，故名字必须能被执行。
+# The artifact name carries the host executable suffix (go env GOEXE); os/exec on
+# Windows only resolves names with a PATHEXT extension.
+EXE ?= $(shell go env GOEXE)
+BIN ?= bin/basalt$(EXE)
+
+build: ; CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$$(git describe --tags --always)" -o $(BIN) ./cmd/basalt
+
+# 示例单测：嵌套 module 的 Go 测试 + 五个 Demo 的业务脚本（缺解释器 = 失败，不是跳过）。
+# 二者都**不**进 check / acceptance / acceptance.json / CI——它们是示例与发布期的独立入口。
+example-tests: ; go -C examples/shared/mcp/docs-readonly test -count=1 ./... && $(PYTHON) scripts/run-example-tests.py
+
+# 发布 e2e：候选二进制取自 build 的同一份产物（不另建），以绝对路径交给 TestMain。
+# `-json` 不可省：`go test` 在包通过且无 `-v` 时会吞掉包级 stdout，`binary_sha256=` /
+# `binary_source=candidate` 标记随之消失（实测：e2e 全绿但 stage 判「found 0」）。
+# -json is required: a passing package without -v swallows package stdout, including the marker.
+e2e: build example-tests
+	@log=$$(mktemp); \
+	if BASALT_E2E_BINARY=$(CURDIR)/$(BIN) go test -json -tags=e2e -count=1 ./internal/e2e > $$log 2>&1; then \
+		cat $$log; \
+		grep -q 'binary_source=candidate' $$log || { echo "e2e: binary_source=candidate missing (release evidence must run the built candidate)" >&2; rm -f $$log; exit 1; }; \
+	else \
+		code=$$?; cat $$log; rm -f $$log; exit $$code; \
+	fi; \
+	rm -f $$log

@@ -90,14 +90,18 @@ func testBootstrapStatusNoConfig(t *testing.T) {
 }
 
 // testBootstrapVersionInjection：构建期注入的版本必须由 `--version` 回显
-// （US-1 §6 Demo ④；TestMain 以 `-X main.version=us15-e2e` 构建）。
+// （US-1 §6 Demo ④）。期望值随被测二进制来源而定：临时构建是本包的 `-X
+// main.version=us15-e2e`；候选二进制是 `make build` 注入的 `git describe --tags
+// --always`（TestMain 的 expectedVersion）——断言语义不变，仍逐字核对注入值。
+// testBootstrapVersionInjection keeps the exact-stamp assertion; the expected value
+// follows the binary's source (injected constant vs. the build's git description).
 func testBootstrapVersionInjection(t *testing.T) {
 	h := newHarness(t)
 
 	res := h.run(t, nil, "--version")
 	requireExit(t, res, 0, "--version")
 	combined := res.Stdout + res.Stderr
-	requireContains(t, combined, buildVersion, "--version")
+	requireContains(t, combined, expectedVersion, "--version")
 	requireContains(t, combined, "basalt", "--version")
 }
 

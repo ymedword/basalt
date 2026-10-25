@@ -193,12 +193,53 @@ export interface McpServerUpsert {
   env?: Record<string, string>
 }
 
+/**
+ * 表单预填载荷：与写入体同形——目录“添加到配置”只是把配方摆进表单，提交仍由
+ * 用户点按钮，走同一条创建 / env 闸门 / 发布路径，没有第二套写入口。
+ * The prefill payload has the write shape; saving still goes through the one write path.
+ */
+export type McpServerWrite = McpServerUpsert
+
+/** 测试所处阶段（契约 McpServerTestResult.stage）：`complete` 也是成功的一种落点。 */
+export type McpTestStage = 'preflight' | 'spawn' | 'initialize' | 'tools_list' | 'complete'
+
+/**
+ * 失败分类（契约 McpServerTestResult.failure_class）：成功为空串。分类只来自结构化
+ * 失败，**不**解析 stderr / 日志。503 / 504 不返回本对象，页面改从操作详情读
+ * `detail.stage` / `detail.failure_class`。
+ * The fixed failure classes; success is the empty string.
+ */
+export type McpTestFailureClass =
+  | ''
+  | 'command_not_found'
+  | 'permission_denied'
+  | 'policy_denied'
+  | 'timeout'
+  | 'http_unauthorized'
+  | 'http_unreachable'
+  | 'handshake_failed'
+  | 'tools_list_failed'
+  | 'env_missing'
+  | 'dependency_unconfirmed'
+
+/**
+ * 一次 MCP 连接测试的记录（契约 McpServerTestResult）。`tools` 始终存在：空数组表示
+ * `tools/list` 成功但没有工具，**不是**失败；`tested_version_id=0` 表示无法确定。
+ * The test record; an empty tool list is success, and version id 0 means unknown.
+ */
 export interface McpServerTestResult {
   ok: boolean
   latency_ms: number
+  /** `tools/list` 的实名单；空数组 = 服务端未暴露工具，仍是 ok。 */
   tools: string[]
   error_code: string
   error_message: string
+  /** 对应 `management_operations.operation_id`，可跳到操作详情。 */
+  operation_id: string
+  /** 被测试的版本；0 表示无法确定（历史 / 旧记录）。 */
+  tested_version_id: number
+  stage: McpTestStage
+  failure_class: McpTestFailureClass
 }
 
 export interface SkillFileView {

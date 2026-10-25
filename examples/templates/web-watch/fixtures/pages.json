@@ -1,0 +1,33 @@
+{
+  "fixture_note": "录制的页面文本：域名、状态与变更日志内容均为虚构。pages 代替抓取，previous_snapshot 代替上一轮快照（每项是已归一化的行数组）。",
+  "pages": [
+    {
+      "url": "https://status.example.com/",
+      "name": "服务状态页",
+      "source": "http_get",
+      "http_status": "HTTP 200",
+      "body_text": "服务状态\nAPI 网关  正常\n\n任务队列  正常\n调度器    正常\n\n上次更新 2026-10-24\n"
+    },
+    {
+      "url": "https://docs.example.org/changelog",
+      "name": "文档变更日志",
+      "source": "browser_snapshot",
+      "browser_snapshot": "变更日志\n- 2026-10-18 新增诊断端点\n- 2026-10-22 控制台筛选修复\n- 2026-10-24 新增模板库\n- 2026-10-25 补充示例\n"
+    }
+  ],
+  "previous_snapshot": {
+    "https://status.example.com/": [
+      "服务状态",
+      "API 网关  正常",
+      "任务队列  正常",
+      "调度器    正常",
+      "上次更新 2026-10-24"
+    ],
+    "https://docs.example.org/changelog": [
+      "变更日志",
+      "- 2026-10-18 新增诊断端点",
+      "- 2026-10-21 修复控制台筛选",
+      "- 2026-10-24 新增模板库"
+    ]
+  }
+}

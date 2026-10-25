@@ -1,0 +1,65 @@
+{
+  "repo": "northwind-labs/mcp-bridge",
+  "total_count": 6,
+  "items": [
+    {
+      "number": 1,
+      "title": "fix: 调度器在夏令时切换时漏触发",
+      "state": "open",
+      "draft": false,
+      "created_at": "2026-10-24T00:00:00Z",
+      "updated_at": "2026-10-24T09:00:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/1"
+    },
+    {
+      "number": 2,
+      "title": "feat: 支持 MCP server 热加载",
+      "state": "open",
+      "draft": false,
+      "created_at": "2026-10-10T00:00:00Z",
+      "updated_at": "2026-10-24T10:00:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/2"
+    },
+    {
+      "number": 3,
+      "title": "wip: 实验性向量检索",
+      "state": "open",
+      "draft": true,
+      "created_at": "2026-10-01T00:00:00Z",
+      "updated_at": "2026-10-24T11:00:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/3"
+    },
+    {
+      "number": 4,
+      "title": "docs: 补充部署手册",
+      "state": "closed",
+      "draft": false,
+      "created_at": "2026-10-12T00:00:00Z",
+      "updated_at": "2026-10-24T12:00:00Z",
+      "merged_at": "2026-10-20T10:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/4"
+    },
+    {
+      "number": 5,
+      "title": "refactor: 拆分任务仓储",
+      "state": "closed",
+      "draft": false,
+      "created_at": "2026-10-05T00:00:00Z",
+      "updated_at": "2026-10-24T13:00:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/5"
+    },
+    {
+      "number": 6,
+      "title": "chore: 依赖升级",
+      "state": "closed",
+      "draft": false,
+      "created_at": "2026-09-28T00:00:00Z",
+      "updated_at": "2026-10-24T14:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/pull/6"
+    }
+  ]
+}

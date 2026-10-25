@@ -49,6 +49,8 @@ type fakeResources struct {
 	mcpServers   []McpServerView
 	mcpServer    McpServerView
 	mcpETag      string
+	mcpArgs      []string
+	mcpURL       string
 	mcpListErr   error
 	mcpErr       error
 	modelConns   []ModelConnectionView
@@ -70,7 +72,7 @@ func (f fakeResources) MCPServers(context.Context) ([]McpServerView, error) {
 }
 
 func (f fakeResources) McpServer(context.Context, string) (McpServerDetail, error) {
-	return McpServerDetail{View: f.mcpServer, ETag: f.mcpETag}, f.mcpErr
+	return McpServerDetail{View: f.mcpServer, ETag: f.mcpETag, Args: f.mcpArgs, URL: f.mcpURL}, f.mcpErr
 }
 
 func (f fakeResources) ModelConnections(context.Context) ([]ModelConnectionView, error) {
@@ -218,21 +220,30 @@ func TestResources_ListMCPServers(t *testing.T) {
 }
 
 // TestResources_GetMCPServer 覆盖 MCP 详情与 ETag 响应头（人工 review ② F3）：
-// 头值来自端口返回的内部结构，**只经响应头出站**——响应体仍是逐字 McpServerView，
-// 不得出现 etag 公开字段；无发布版本（未入账的配置项）时端口给空串，此时不设头。
-// 逆改点：不设头 / 把 etag 塞进响应体 / 空 ETag 也设头 → 三条断言各自红。
+// 响应体按契约 `McpServerDetail` 输出视图 + `args` / `url`（2026-10-25 US-14 走查
+// 裁决：此前只回视图，详情页“修改”表单读 `args` 崩溃）；头值来自端口返回的内部
+// 结构，**只经响应头出站**，不得出现 etag 公开字段；无发布版本（未入账的配置项）
+// 时端口给空串，此时不设头。
+// 逆改点：不设头 / 把 etag 塞进响应体 / 空 ETag 也设头 / 丢 args、url → 各自红。
 func TestResources_GetMCPServer(t *testing.T) {
 	view := sampleMcpServerView()
 	etag := `"sha256:` + resourceHashA + `"`
 	s := newTestServer(t, func(o *Options) {
-		o.Resources = fakeResources{mcpServer: view, mcpETag: etag}
+		o.Resources = fakeResources{
+			mcpServer: view,
+			mcpETag:   etag,
+			mcpArgs:   []string{"--root", "docs"},
+			mcpURL:    "",
+		}
 	})
 	rec := serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/mcp-servers/files", ""))
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, etag, rec.Header().Get("ETag"), "契约在详情声明了 ETag 头，必须从内部结构设置")
 
-	env := decodeResourcesEnvelope[McpServerView](t, rec)
-	require.Equal(t, view, env.Data, "响应体必须是逐字 McpServerView")
+	env := decodeResourcesEnvelope[McpServerDetailView](t, rec)
+	require.Equal(t, view, env.Data.McpServerView, "详情体必须在视图之上扩展，字段逐字保真")
+	require.Equal(t, []string{"--root", "docs"}, env.Data.Args, "契约 McpServerDetail 必须回 args")
+	require.Equal(t, "", env.Data.URL, "stdio 传输的 url 为空串")
 	require.NotContains(t, rec.Body.String(), resourceHashA, "ETag 只经响应头出站，不得进响应体")
 	require.NotContains(t, rec.Body.String(), `"etag"`, "不得为凑头新增契约外字段")
 	require.NotContains(t, env.Data.EnvKeys, "MCP_TOKEN=secret")
@@ -243,6 +254,9 @@ func TestResources_GetMCPServer(t *testing.T) {
 	rec = serveAdmin(bare, adminRequest(http.MethodGet, "/api/v1/mcp-servers/bare", ""))
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Empty(t, rec.Header().Get("ETag"), "无发布版本时不得伪造 ETag 头")
+	bareEnv := decodeResourcesEnvelope[McpServerDetailView](t, rec)
+	require.NotNil(t, bareEnv.Data.Args, "无发布版本时 args 出站为 []，不得是 null")
+	require.Empty(t, bareEnv.Data.Args)
 }
 
 // TestResources_ListModelConnections 覆盖模型连接列表：只回环境变量引用名，
@@ -481,7 +495,9 @@ func TestResources_ViewShapesMatchContract(t *testing.T) {
 		detail string
 	}{
 		{"技能详情", "/api/v1/skills/pdf-extract", "SkillView", "SkillDetail"},
-		{"MCP 详情", "/api/v1/mcp-servers/files", "McpServerView", "McpServerDetail"},
+		// MCP 详情按契约回视图 + args / url（2026-10-25 US-14 走查裁决），字段集即
+		// McpServerDetail——McpServerView 只钉列表。
+		{"MCP 详情", "/api/v1/mcp-servers/files", "McpServerDetail", "McpServerDetail"},
 		// 契约的模型连接详情直接复用 ModelConnectionView，没有独立 Detail schema。
 		{"模型连接详情", "/api/v1/model-connections/openai", "ModelConnectionView", ""},
 	}

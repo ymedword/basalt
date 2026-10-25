@@ -50,6 +50,14 @@ type mcpTestEnv struct {
 	blockConnect   bool
 	toolNames      []string
 	lastSpecs      []core.MCPServerConfig
+
+	// US-14：结构化失败（D-05）与"没有 ConnectDetailed 的实现"两个注入位。
+	// US-14 injection points: one structured failure and a connector without
+	// ConnectDetailed (the fallback branch).
+	failStage       string
+	failClass       string
+	failDeadline    bool
+	legacyConnector bool
 }
 
 // newMCPEnv 装配默认夹具：只有 `allowed-mcp` 命令与 `mcp.example.com` 域名被放行。
@@ -115,7 +123,37 @@ func (env *mcpTestEnv) newConnector() mcpConnector {
 	fake := &supervisorFakeConnector{env: env}
 	env.connectors = append(env.connectors, fake)
 	env.created++
+	if env.legacyConnector {
+		// 只满足 `mcpConnector`：用来判"没有 ConnectDetailed 时的回退分类"。
+		// Satisfies only mcpConnector, exercising the Connect fallback.
+		return legacyMCPConnector{fake: fake}
+	}
 	return fake
+}
+
+// setConnectFailure 让假连接器的 `ConnectDetailed` 报告一条结构化失败（stage × class）。
+// setConnectFailure injects one structured connect failure (stage × class).
+func (env *mcpTestEnv) setConnectFailure(stage, class string) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	env.failStage = stage
+	env.failClass = class
+}
+
+// setConnectFailureDeadline 让结构化失败与 ctx 终止同时发生（超时路径取失败发生的阶段）。
+// setConnectFailureDeadline makes the structured failure arrive together with ctx end.
+func (env *mcpTestEnv) setConnectFailureDeadline(deadline bool) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	env.failDeadline = deadline
+}
+
+// setLegacyConnector 让 newConnector 返回**没有** `ConnectDetailed` 的实现。
+// setLegacyConnector makes newConnector return an implementation without ConnectDetailed.
+func (env *mcpTestEnv) setLegacyConnector(legacy bool) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	env.legacyConnector = legacy
 }
 
 // setConnectErr 注入连接失败。
@@ -268,6 +306,53 @@ func (f *supervisorFakeConnector) Connect(ctx context.Context, specs []core.MCPS
 	}
 	return conns, nil
 }
+
+// ConnectDetailed 是 `mcpDetailedConnector` 的假实现（US-14，契约 D-05）：注入结构化
+// 失败时直接返回那一条（deadline 变体同时以 ctx 终止收尾）；其余情况复用 `Connect` 的
+// 同一套模拟，只是没有失败项——真实池在没有可证明的失败时也不编造分类。
+// ConnectDetailed is the fake's structured-failure path; without an injection it
+// delegates to Connect and reports no failure items.
+func (f *supervisorFakeConnector) ConnectDetailed(ctx context.Context, specs []core.MCPServerConfig,
+) ([]tool.MCPConnection, []tool.MCPConnectFailure, error) {
+	f.env.mu.Lock()
+	stage, class, deadline := f.env.failStage, f.env.failClass, f.env.failDeadline
+	f.env.mu.Unlock()
+
+	if class != "" {
+		failure := tool.MCPConnectFailure{Server: specs[0].Name, Stage: stage, Class: class}
+		if deadline {
+			<-ctx.Done()
+			return nil, []tool.MCPConnectFailure{failure}, ctx.Err()
+		}
+		f.env.mu.Lock()
+		f.env.events = append(f.env.events, "connect:"+specs[0].Name)
+		for _, spec := range specs {
+			if mcpTransport(spec.Transport) == mcpTransportStdio {
+				f.env.processStarted = true
+			}
+		}
+		f.env.lastSpecs = slices.Clone(specs)
+		f.env.mu.Unlock()
+		return nil, []tool.MCPConnectFailure{failure}, nil
+	}
+	conns, err := f.Connect(ctx, specs)
+	return conns, nil, err
+}
+
+// legacyMCPConnector 只实现 `mcpConnector`（刻意**不**暴露 `ConnectDetailed`）：判回退
+// 分支用的是"能力断言失败"这一真实条件，而不是给假实现加开关。
+// legacyMCPConnector deliberately hides ConnectDetailed so the fallback branch is real.
+type legacyMCPConnector struct{ fake *supervisorFakeConnector }
+
+// Connect 转发到内部假连接器。
+// Connect delegates to the wrapped fake.
+func (l legacyMCPConnector) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]tool.MCPConnection, error) {
+	return l.fake.Connect(ctx, specs)
+}
+
+// Close 转发到内部假连接器。
+// Close delegates to the wrapped fake.
+func (l legacyMCPConnector) Close() error { return l.fake.Close() }
 
 // Close 记录关闭次数：supervisor 的停止 / 失败清理 / 测试收尾都以它判卷。
 // Close records the call; stop, failure cleanup and test teardown all judge on it.

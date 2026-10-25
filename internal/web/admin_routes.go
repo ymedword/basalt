@@ -10,10 +10,12 @@ package web
 // This file is the single route enumeration for the US-12 admin surface and the
 // conditional-write middleware. Every row is protected; the middleware checks the
 // If-Match shape only, while the service layer compares it inside the write lock.
-// 表内三十五行全部指向已落地的 handler——占位函数在最后一条 handler 任务（工作区浏览）
-// 落地时删除，没有"装配未完成"的中间态残留。R8 追加第 35 行（出网域名白名单条件写）。
-// All thirty-five rows point at landed handlers; the placeholder was removed with the
-// last handler task, so no "unassembled" state survives.
+// 表内三十七行全部指向已落地的 handler——占位函数在最后一条 handler 任务（工作区浏览）
+// 落地时删除，没有"装配未完成"的中间态残留。R8 追加第 35 行（出网域名白名单条件写）；
+// US-14 追加第 36 / 37 行（只读目录与只读诊断，均为 GET、无条件写）。
+// All thirty-seven rows point at landed handlers; the placeholder was removed with the
+// last handler task, so no "unassembled" state survives. US-14 adds the two read-only
+// catalog / diagnosis rows.
 
 import (
 	"context"
@@ -44,9 +46,9 @@ type adminRouteSpec struct {
 	handler     AdminHandler
 }
 
-// adminRouteSpecs 返回全部新增端点的静态描述（35 条：Agent 9 / 资源 19 / 通知 4 /
+// adminRouteSpecs 返回全部新增端点的静态描述（37 条：Agent 9 / 资源 21 / 通知 4 /
 // 工作区 2 / 执行环境 1）。顺序按契约 §3.7.1 排列，便于逐行对号；**不**依赖 map 遍历。
-// adminRouteSpecs enumerates all 35 new endpoints in contract order.
+// adminRouteSpecs enumerates all 37 new endpoints in contract order.
 func (s *Server) adminRouteSpecs() []adminRouteSpec {
 	return []adminRouteSpec{
 		// —— Agent 写面（handlers_admin_agents.go / handlers_admin_archived.go）——
@@ -78,6 +80,10 @@ func (s *Server) adminRouteSpecs() []adminRouteSpec {
 		{method: http.MethodPost, pattern: "/api/v1/model-connections/{name}/test", handler: s.handleAdminTestModelConnection},
 
 		// —— MCP server（handlers_admin_resources.go）——
+		// 只读目录排在 MCP server 写面之前：它不属于任何一条资源，读的是构建期快照，
+		// 既无 If-Match 也不写操作行（契约 D-01）。
+		// The read-only catalog is not a resource: it reads the build-time snapshot.
+		{method: http.MethodGet, pattern: "/api/v1/catalog/mcp", handler: s.handleAdminMCPCatalog},
 		{method: http.MethodPost, pattern: "/api/v1/mcp-servers", handler: s.handleAdminCreateMCPServer},
 		{
 			method: http.MethodPut, pattern: "/api/v1/mcp-servers/{name}", conditional: true,
@@ -88,6 +94,9 @@ func (s *Server) adminRouteSpecs() []adminRouteSpec {
 			currentETag: s.resourceCurrentETag(core.ResourceMCPServer), handler: s.handleAdminDeleteMCPServer,
 		},
 		{method: http.MethodPost, pattern: "/api/v1/mcp-servers/{name}/test", handler: s.handleAdminTestMCPServer},
+		// 只读诊断与测试并列但互不替代：诊断不连接、不写操作行，也不预判测试结论（D-02）。
+		// Diagnosis sits beside the test route and shares no code path with it.
+		{method: http.MethodGet, pattern: "/api/v1/mcp-servers/{name}/diagnostics", handler: s.handleAdminMCPDiagnostics},
 
 		// —— 技能（handlers_admin_resources.go；POST 创建 / 导入按契约只回 SkillView）——
 		{method: http.MethodPost, pattern: "/api/v1/skills", handler: s.handleAdminCreateSkill},

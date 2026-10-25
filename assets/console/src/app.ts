@@ -12,6 +12,7 @@ import { AgentDetailView } from './views/agent-detail'
 import { AgentsNewView } from './views/agents-new'
 import { AgentsView } from './views/agents'
 import { ArchivedAgentsView } from './views/archived-agents'
+import { CatalogView } from './views/catalog'
 import { LoginView } from './views/login'
 import { NotFoundView } from './views/not-found'
 import { OperationsView } from './views/operations'
@@ -31,6 +32,7 @@ const VIEWS: Record<RouteName, Component> = {
   'agent-session': SessionDetailView,
   runs: RunsView, 'run-detail': RunDetailView,
   resources: ResourcesView, 'resource-detail': ResourceDetailView,
+  'catalog-mcp': CatalogView,
   archived: ArchivedAgentsView, workspace: WorkspaceBrowserView,
   operations: OperationsView, 'not-found': NotFoundView,
   tools: ToolsView, memory: GlobalMemoryView, notifications: NotificationsView, sandbox: SandboxView,
@@ -57,13 +59,17 @@ const TITLES: Record<RouteName, string> = {
   overview: '系统总览', login: '连接工作区', agents: 'Agents', 'agents-new': '新建 Agent',
   'agent-detail': 'Agent 工作区', 'agent-config': 'Agent 配置', 'agent-session': '会话详情',
   runs: '运行列表', 'run-detail': '运行详情',
-  resources: '资源库', 'resource-detail': '资源详情', archived: '已归档 Agents', workspace: '工作区文件',
+  resources: '资源库', 'resource-detail': '资源详情', 'catalog-mcp': 'MCP 目录',
+  archived: '已归档 Agents', workspace: '工作区文件',
   operations: '管理操作', 'not-found': '页面不存在',
   tools: '工具与 MCP', memory: '全局记忆', notifications: '通知渠道', sandbox: '执行环境',
 }
 function currentLocation(): string { return window.location.pathname + window.location.search }
 function navActive(item: NavItem, match: RouteMatch): boolean {
   if (item.label === '工具与 MCP' && match.name === 'resources' && match.params.kind === 'mcp-servers') return true
+  // 目录页是“工具与 MCP”的第三视图（列表 / 可用工具 / 目录），侧栏仍高亮同一项，
+  // 不为它新开一级导航。 The catalog is a third view under the same nav item.
+  if (item.label === '工具与 MCP' && match.name === 'catalog-mcp') return true
   return item.names?.includes(match.name) ?? item.href === match.path
 }
 

@@ -6,8 +6,17 @@
 // a confirmation step before revoking, and UID-based reference evidence gaps.
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ModelConnectionView, ProfileView } from '../src/api'
-import type { ResourceReferencesView, ResourceVersionView } from '../src/api-admin'
+import type {
+  ModelConnectionView,
+  OperationDetail,
+  OperationView,
+  ProfileView,
+} from '../src/api'
+import type {
+  McpServerDetail,
+  ResourceReferencesView,
+  ResourceVersionView,
+} from '../src/api-admin'
 import { createConsoleApp } from '../src/app'
 
 const CONFIG_ETAG = `"sha256:${'a'.repeat(64)}"`
@@ -177,6 +186,11 @@ function clickButton(label: string): Promise<void> {
 
 function writeCalls(fragment: string): RecordedCall[] {
   return calls.filter((call) => call.method === 'POST' && call.path.includes(fragment))
+}
+
+/** 页面上所有结论徽章的文本；禁用词只判徽章，不判解释性句子。 */
+function badgeTexts(): string[] {
+  return wrapper!.findAll('.badge').map((item) => item.text())
 }
 
 /** 定义列表里某个术语对应的值（dt / dd 成对且按文档顺序对齐）。 */
@@ -551,5 +565,336 @@ describe('resource detail scope and credential cards', () => {
     expect(rereadAfterLastWrite()).toBe(true)
     expect(definitionValue('最近实测')).toContain('成功')
     expect(definitionValue('最近实测')).not.toContain('从未测试')
+  })
+})
+
+// --- US-14：MCP 详情四轴 ---------------------------------------------------
+// 配置 / 连接 / 上次测试 / 依赖诊断四条轴各看各的证据；测试记录以管理操作台账
+// 为准，历史记录缺字段或没有被测版本时不得推断通过。
+// US-14 MCP axes: config / connection / last test / diagnosis stay separate; the
+// operation ledger is authoritative and legacy records never imply a pass.
+const OP_ID = 'op_01J8Z6YQ4M2S3T7V9W0X1Y2Z3C'
+const TESTED_AT = '2026-10-24T09:30:00Z'
+
+function mcpServerView(overrides: Partial<McpServerDetail> = {}): McpServerDetail {
+  return {
+    name: 'files',
+    transport: 'stdio',
+    command: 'npx',
+    args: [],
+    url: '',
+    env_keys: ['TOKEN'],
+    connected: true,
+    tools: ['read_file', 'write_file'],
+    published_version_id: 2,
+    published_version_no: 2,
+    applied_version_id: 2,
+    applied_version_no: 2,
+    pending_restart: false,
+    tool_disposition: {
+      offered: 2,
+      accepted: 1,
+      skipped: [{ name: 'read_file', winner_source: 'builtin', reason: 'duplicate_name' }],
+    },
+    ...overrides,
+  }
+}
+
+function mcpVersion(versionId: number, versionNo: number): ResourceVersionView {
+  return {
+    ...versionView(),
+    version_id: versionId,
+    version_no: versionNo,
+    resource_kind: 'mcp_server',
+    resource_id: 'files',
+  }
+}
+
+function operationView(): OperationView {
+  return {
+    operation_id: OP_ID,
+    action: 'mcp_server.test',
+    target_kind: 'mcp_server',
+    target_id: 'files',
+    actor_subject: 'admin',
+    auth_method: 'bearer',
+    source: '127.0.0.1',
+    status: 'success',
+    result_code: 'OK',
+    error_message: '',
+    created_at: TESTED_AT,
+    finished_at: TESTED_AT,
+  }
+}
+
+const PASSING_DETAIL: Record<string, unknown> = {
+  ok: true,
+  latency_ms: 42,
+  tools: ['read_file'],
+  error_code: '',
+  error_message: '',
+  stage: 'complete',
+  failure_class: '',
+}
+
+/** 操作详情缺省为一次针对 v2 的成功测试；`detail` 整体替换（不做字段合并）。 */
+function operationDetailOf(overrides: Partial<OperationDetail> = {}): OperationDetail {
+  return {
+    ...operationView(),
+    request_hash: `sha256:${'c'.repeat(64)}`,
+    requested_version_id: 2,
+    expected_etag: CONFIG_ETAG,
+    detail: { ...PASSING_DETAIL },
+    recovered_at: '',
+    verification: 'not_required',
+    ...overrides,
+  }
+}
+
+function mcpDiagnosis(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: 'files',
+    transport: 'stdio',
+    published_version_id: 2,
+    applied_version_id: 2,
+    pending_restart: false,
+    command: { state: 'located', path: 'npx', reason: 'lookpath' },
+    env: [{ key: 'TOKEN', set: true }],
+    warnings: [],
+    checked_at: TESTED_AT,
+    ...overrides,
+  }
+}
+
+interface McpRouteOverrides {
+  readonly view?: Partial<McpServerDetail>
+  readonly diagnosis?: Record<string, unknown>
+  readonly operation?: Partial<OperationDetail>
+  readonly versions?: ResourceVersionView[]
+}
+
+/** MCP 详情页的全部只读路由；未列出的路径按空对象返回。 */
+function mcpRoutes(overrides: McpRouteOverrides = {}): (call: RecordedCall) => Reply {
+  return (call) => {
+    if (call.path.endsWith('/info')) {
+      return { data: { version: 'test', uptime_seconds: 1, agents: 1, tools: 0, mcp_servers: 1, providers: [] } }
+    }
+    if (call.path === '/api/v1/mcp-servers/files') {
+      return { data: mcpServerView(overrides.view), etag: CONFIG_ETAG }
+    }
+    if (call.path === '/api/v1/resources/mcp_server/files/versions') {
+      return { data: overrides.versions ?? [mcpVersion(2, 2), mcpVersion(3, 3)] }
+    }
+    if (call.path === '/api/v1/resources/mcp_server/files/references') {
+      return {
+        data: {
+          kind: 'mcp_server',
+          id: 'files',
+          resource_uid: UID,
+          published_version_id: 2,
+          agents: [],
+          bound_agents: [],
+          active_runs: [],
+        },
+      }
+    }
+    if (call.path === '/api/v1/mcp-servers/files/diagnostics') {
+      return { data: mcpDiagnosis(overrides.diagnosis) }
+    }
+    if (call.path.startsWith('/api/v1/operations?')) {
+      return { data: [operationView()] }
+    }
+    if (call.path === `/api/v1/operations/${OP_ID}`) {
+      return { data: operationDetailOf(overrides.operation) }
+    }
+    return {}
+  }
+}
+
+/** 登录后直达 MCP 服务详情。 */
+async function openMcpDetail(): Promise<void> {
+  window.history.replaceState(
+    null,
+    '',
+    `/console/login?next=${encodeURIComponent('/console/resources/mcp-servers/files')}`,
+  )
+  wrapper = mount(createConsoleApp(), { attachTo: document.body })
+  await flushPromises()
+  await wrapper.find('#console-token').setValue('test-console-token')
+  await wrapper.find('.login-form').trigger('submit')
+  await flushPromises()
+}
+
+describe('MCP detail axes', () => {
+  it('renders config, connection, last test and diagnosis as separate lines', async () => {
+    setupFetch(
+      mcpRoutes({
+        view: {
+          connected: true,
+          pending_restart: true,
+          published_version_id: 3,
+          published_version_no: 3,
+          applied_version_id: 2,
+          applied_version_no: 2,
+        },
+        diagnosis: { command: { state: 'unconfirmed', path: '', reason: 'script' } },
+        operation: { requested_version_id: 3 },
+      }),
+    )
+    await openMcpDetail()
+
+    // 配置轴：发布已前移、运行仍是旧版本；连接轴照样可以“已连接”——两轴不互斥。
+    expect(definitionValue('配置')).toContain('已发布未应用（待重启）')
+    expect(definitionValue('连接')).toContain('已连接')
+    expect(definitionValue('待重启')).toContain('需重启')
+    // 测试轴：诊断 unconfirmed 不改变测试结论；通过针对的是发布版本 v3。
+    expect(definitionValue('上次测试')).toContain('连接测试通过')
+    expect(definitionValue('上次测试')).toContain('v3')
+    expect(definitionValue('依赖诊断')).toContain('命令无法确认')
+    // 工具来源与 tools 语义分开：tools 仍是 offered，跳过项点名赢家。
+    expect(definitionValue('工具（已提供）')).toContain('read_file')
+    expect(definitionValue('工具注册')).toContain('已提供 2，已注册 1')
+    expect(definitionValue('工具注册')).toContain('read_file：被 builtin 抢先（重名）')
+    // 操作详情可展开，且明确 success 不是测试结论。
+    expect(wrapper!.text()).toContain(`管理操作详情（${OP_ID}）`)
+    expect(wrapper!.text()).toContain('操作状态 success 只表示管理动作执行完毕')
+    // 禁用词只约束结论徽章；解释性句子不在其列。
+    expect(badgeTexts()).not.toContain('已验证')
+  })
+
+  it('keeps an unconfirmed diagnosis from predicting a failing test', async () => {
+    setupFetch(
+      mcpRoutes({
+        diagnosis: { command: { state: 'unconfirmed', path: '', reason: 'script' } },
+        operation: {
+          detail: {
+            ok: false,
+            latency_ms: 5,
+            tools: [],
+            error_code: 'START_FAILED',
+            error_message: '启动失败',
+            stage: 'spawn',
+            failure_class: 'command_not_found',
+          },
+        },
+      }),
+    )
+    await openMcpDetail()
+
+    const axis = definitionValue('上次测试')
+    expect(axis).toContain('连接测试失败')
+    expect(axis).toContain('启动 / 找不到启动程序')
+    expect(axis).toContain('针对 v2')
+    expect(definitionValue('依赖诊断')).toContain('命令无法确认')
+    expect(wrapper!.text()).toContain('失败时先看「依赖诊断」')
+    expect(wrapper!.text()).toContain('诊断结论不预判测试')
+    expect(wrapper!.text()).toContain('找不到启动程序')
+  })
+
+  it('never infers a pass from a record without a tested version', async () => {
+    setupFetch(mcpRoutes({ operation: { requested_version_id: 0 } }))
+    await openMcpDetail()
+
+    expect(definitionValue('上次测试')).toContain('历史记录无被测版本')
+    expect(definitionValue('上次测试')).toContain('需重新测试')
+    // 汇总行与徽章都不得出现“通过”；操作记录里的“不代表连接测试通过”是解释句。
+    expect(definitionValue('上次测试')).not.toContain('连接测试通过')
+    expect(badgeTexts()).not.toContain('连接测试通过')
+    expect(wrapper!.text()).toContain('按未通过处理，请重新测试')
+  })
+
+  it('never infers a pass from a legacy record missing D-03 fields', async () => {
+    setupFetch(
+      mcpRoutes({
+        operation: { detail: { ok: true, latency_ms: 9, tools: ['read_file'] } },
+      }),
+    )
+    await openMcpDetail()
+
+    expect(definitionValue('上次测试')).toContain('历史记录字段不全')
+    expect(definitionValue('上次测试')).toContain('不推断通过')
+    expect(wrapper!.text()).toContain('这条历史记录早于测试记录补强')
+    expect(definitionValue('上次测试')).not.toContain('连接测试通过')
+    expect(badgeTexts()).not.toContain('连接测试通过')
+  })
+
+  it('marks a passing test of an older version as stale, not as a current pass', async () => {
+    setupFetch(
+      mcpRoutes({
+        view: { published_version_id: 3, published_version_no: 3 },
+        operation: { requested_version_id: 2 },
+      }),
+    )
+    await openMcpDetail()
+
+    const axis = definitionValue('上次测试')
+    expect(axis).toContain('通过（版本已过期）')
+    expect(axis).toContain('测试针对 v2')
+    expect(axis).toContain('当前发布 v3')
+    expect(axis).toContain('需重测')
+  })
+
+  it('shows the diagnosis details without values and marks pending restart in its own row', async () => {
+    setupFetch(
+      mcpRoutes({
+        diagnosis: {
+          command: { state: 'not_found', path: '', reason: 'not_found' },
+          env: [
+            { key: 'TOKEN', set: false },
+            { key: 'REGION', set: true },
+          ],
+          warnings: ['env_gate_process_local'],
+        },
+      }),
+    )
+    await openMcpDetail()
+
+    const text = wrapper!.text()
+    expect(text).toContain('命令未找到')
+    expect(text).toContain('明确不存在')
+    expect(text).toContain('TOKEN：未设置')
+    expect(text).toContain('REGION：已设置')
+    // 诊断只回布尔，不回值：未设置的键不得被渲染成“已设置”。
+    expect(text).not.toContain('TOKEN：已设置')
+    expect(text).toContain('env 闸门只核对本进程环境，不核对子进程实际环境')
+    expect(text).toContain('诊断不启动进程、不连接、不写操作行')
+  })
+
+  it('does not render an unconfigured server as disconnected', async () => {
+    setupFetch((call) => {
+      if (call.path.endsWith('/info')) {
+        return { data: { version: 'test', uptime_seconds: 1, agents: 1, tools: 0, mcp_servers: 1, providers: [] } }
+      }
+      if (call.path === '/api/v1/mcp-servers') {
+        return {
+          data: [
+            mcpServerView({
+              connected: false,
+              published_version_id: 0,
+              published_version_no: 0,
+              applied_version_id: 0,
+              applied_version_no: 0,
+              tools: [],
+              tool_disposition: null,
+            }),
+          ],
+        }
+      }
+      return {}
+    })
+    window.history.replaceState(
+      null,
+      '',
+      `/console/login?next=${encodeURIComponent('/console/resources/mcp-servers')}`,
+    )
+    wrapper = mount(createConsoleApp(), { attachTo: document.body })
+    await flushPromises()
+    await wrapper.find('#console-token').setValue('test-console-token')
+    await wrapper.find('.login-form').trigger('submit')
+    await flushPromises()
+
+    const table = wrapper!.find('.mcp-table').text()
+    expect(table).not.toContain('未连接')
+    expect(table).toContain('—')
   })
 })

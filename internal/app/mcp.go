@@ -36,6 +36,10 @@ type mcpRuntime struct {
 	// When set, connection state is read live from the supervisor snapshot; conns only
 	// serves fixtures without a supervisor.
 	supervisor *MCPSupervisor
+	// dispositions 是装配期写一次的工具来源表（D-06）；nil 表示本次装配没有来源表，
+	// 视图按"未知"处理（`tool_disposition: null`），不伪造空对象。
+	// dispositions is the assembly-time source table; nil means unknown, never an empty object.
+	dispositions *mcpDispositionTable
 }
 
 // newMCPRuntime 复制两份输入后持有——装配期的切片后续即使被改写也不影响这句话柄。
@@ -110,6 +114,25 @@ func (m *mcpRuntime) Tools(name string) []string {
 		}
 	}
 	return tools
+}
+
+// ToolDisposition 返回该 server 的工具来源投影（D-06）；未连接 / 未知 / 没有来源表
+// 一律 nil——视图据此输出 `null`。已连接但一个工具都没提供时返回零计数对象：这是
+// "已注册 0 个"的事实（D-06：连接后 offered = len(tools)），不是未知。
+// ToolDisposition returns nil for unconnected or unknown servers. A connected server
+// that offered no tools gets a zero-count object, not null: connected implies
+// offered == len(tools), and null has no counts to compare.
+func (m *mcpRuntime) ToolDisposition(name string) *core.MCPToolDisposition {
+	if m == nil || m.dispositions == nil {
+		return nil
+	}
+	if !slices.Contains(m.ConnectedNames(), name) {
+		return nil
+	}
+	if disposition := m.dispositions.view(name); disposition != nil {
+		return disposition
+	}
+	return &core.MCPToolDisposition{Skipped: []core.MCPToolSkip{}}
 }
 
 // AppliedVersion 返回 supervisor 侧记录的已应用版本；没有 supervisor 或尚未接管时

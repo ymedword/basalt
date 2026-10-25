@@ -216,6 +216,7 @@ function mcpDetailOf(envKeys: string[]): Record<string, unknown> {
     applied_version_id: 1,
     applied_version_no: 1,
     pending_restart: false,
+    tool_disposition: { offered: 1, accepted: 1, skipped: [] },
   }
 }
 
@@ -1276,6 +1277,22 @@ describe('resource edits', () => {
       }
       if (call.method === 'GET' && call.path === '/api/v1/resources/mcp_server/files/versions') {
         return { data: [] }
+      }
+      // 详情页新增的只读诊断轴（US-14）：不启动进程，只回三态与 env 布尔。
+      if (call.method === 'GET' && call.path === '/api/v1/mcp-servers/files/diagnostics') {
+        return {
+          data: {
+            name: 'files',
+            transport: 'stdio',
+            published_version_id: 1,
+            applied_version_id: 1,
+            pending_restart: false,
+            command: { state: 'located', path: 'npx', reason: 'lookpath' },
+            env: envKeys.map((key) => ({ key, set: true })),
+            warnings: [],
+            checked_at: '2026-10-22T12:00:00Z',
+          },
+        }
       }
       if (call.method === 'GET' && call.path === '/api/v1/resources/mcp_server/files/references') {
         return {

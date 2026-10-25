@@ -1,0 +1,151 @@
+# Basalt 内置 MCP 目录（version 1）。
+# 只读、随二进制嵌入：条目是"怎么配"的配方，不是运行配置。
+# `args` 里的 `<...>` 只是给用户的编辑标记，运行时不会被替换；目录不会安装任何包。
+# 条目按 id 升序；verified=false 表示配方尚未实测，verification_note 写清待验证项。
+version: 1
+items:
+  - id: brave-search
+    display_name: Brave Search
+    summary: 通过 Brave Search API 检索网页与新闻，适合做每日信息雷达的检索段。
+    category: 搜索 / 信息检索
+    transport: stdio
+    command: node
+    args:
+      - "<absolute-path-to-brave-search-mcp-server-entry>"
+    url: ""
+    env:
+      - key: BRAVE_API_KEY
+        placeholder: "${BRAVE_API_KEY}"
+        required: true
+        description: Brave Search API key（检索权限即可）。
+    requires:
+      - Brave Search API key
+      - Node.js 20+ 与 brave-search-mcp-server 包入口
+    source_url: https://github.com/brave/brave-search-mcp-server
+    verified: false
+    verification_note: 命令、包入口路径、工具名与代表性检索调用待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - package_entry_unverified
+      - stdio_child_egress_unconstrained
+
+  - id: dbhub
+    display_name: DBHub
+    summary: 用只读 SQLite 样例库做统计查询，适合每日报表与盘点类业务。
+    category: 数据 / 数据库
+    transport: stdio
+    command: node
+    args:
+      - "<absolute-path-to-dbhub-entry>"
+      - "--transport"
+      - "stdio"
+      - "--dsn"
+      - "sqlite:///<absolute-path-to-sample.db>"
+      - "--readonly"
+    url: ""
+    env: []
+    requires:
+      - Node.js 20+ 与 dbhub 包入口
+      - 样例 SQLite 文件的绝对路径
+    source_url: https://github.com/bytebase/dbhub
+    verified: false
+    verification_note: 命令、包入口路径、DSN 形态与只读工具名待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - package_entry_unverified
+      - sqlite_sample_only
+
+  - id: fetch
+    display_name: Fetch
+    summary: 抓取指定 URL 的正文并转成文本，适合给检索结果补正文。
+    category: 网络 / 内容抓取
+    transport: stdio
+    command: python
+    args:
+      - "-m"
+      - "mcp_server_fetch"
+    url: ""
+    env: []
+    requires:
+      - Python 3.10+ 与 mcp-server-fetch 包
+    source_url: https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+    verified: false
+    verification_note: 包版本、工具名与代表性抓取调用待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - package_entry_unverified
+      - stdio_child_egress_unconstrained
+
+  - id: filesystem-readonly
+    display_name: Filesystem（只读）
+    summary: 只读访问一个受控目录，适合做文档差异与资料汇总。
+    category: 文件 / 只读资料
+    transport: stdio
+    command: node
+    args:
+      - "<absolute-path-to-filesystem-mcp-entry>"
+      - "<allowed-root>"
+    url: ""
+    env: []
+    requires:
+      - Node.js 20+ 与 @modelcontextprotocol/server-filesystem 入口
+      - 允许访问的根目录绝对路径
+    source_url: https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+    verified: false
+    verification_note: 包入口路径、允许根目录与只读工具名待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - read_only_tool_face_required
+      - server_write_capability
+      - write_tool_name_collision
+
+  - id: github
+    display_name: GitHub
+    summary: 读取仓库、Issue 与文件内容，适合做开源项目雷达与周报。
+    category: 开源生态 / 软件研发
+    transport: stdio
+    command: github-mcp-server
+    args:
+      - "stdio"
+    url: ""
+    env:
+      - key: GITHUB_PERSONAL_ACCESS_TOKEN
+        placeholder: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+        required: true
+        description: 只读细粒度 PAT。
+    requires:
+      - GitHub 只读细粒度 PAT
+      - github-mcp-server 二进制在 PATH 上
+    source_url: https://github.com/github/github-mcp-server
+    verified: false
+    verification_note: 命令、参数、版本、只读工具名与代表性调用待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - read_only_tool_face_required
+
+  - id: playwright
+    display_name: Playwright
+    summary: 用真实浏览器访问需要脚本渲染的页面，适合做网页变更监控。
+    category: 浏览器 / 端到端
+    transport: stdio
+    command: node
+    args:
+      - "<absolute-path-to-playwright-mcp-entry>"
+    url: ""
+    env: []
+    requires:
+      - Node.js 20+ 与 @playwright/mcp 入口
+      - 本机可用浏览器
+    source_url: https://github.com/microsoft/playwright-mcp
+    verified: false
+    verification_note: 包入口路径、浏览器依赖与工具名待实测。
+    verified_at: ""
+    verified_platforms: []
+    warnings:
+      - package_entry_unverified
+      - browser_required

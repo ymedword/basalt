@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 
@@ -21,6 +22,10 @@ const (
 	mcpHelperEnv = "BASALT_MCP_HELPER"
 	// mcpPageSizeEnv 让集成层把分页压到每页 1 件（不改代码即可验证游标链路）。
 	mcpPageSizeEnv = "BASALT_MCP_PAGE_SIZE"
+	// mcpSpecEnv 指向一份 JSON 规格文件：工具名 / 描述 / 每次调用返回的结果都在文件里。
+	// 每次 `tools/call` 重新读文件，父进程改写文件即可换行为（Demo 夹具用它模拟不同
+	// 轮次的搜索结果），不必重启进程。
+	mcpSpecEnv = "BASALT_MCP_HELPER_SPEC"
 )
 
 // MCPTestTool 是一件可编程的测试工具：名 / 描述 / schema / 处理函数原样进 server。
@@ -124,12 +129,121 @@ func StandardMCPTools() []MCPTestTool {
 	}
 }
 
+// MCPSpecTool 是规格文件里的一件工具：名字与描述进 tools/list，`result` 原样作为
+// 文本内容返回；`error` 非空时返回 IsError 结果（模拟服务端报错）。
+// MCPSpecTool is one tool in the spec file: name and description feed tools/list,
+// result is returned verbatim as text content, and a non-empty error yields an
+// IsError result.
+type MCPSpecTool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Schema      any    `json:"schema,omitempty"`
+	Result      string `json:"result,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// MCPSpec 是规格文件的顶层结构。
+// MCPSpec is the top-level shape of the spec file.
+type MCPSpec struct {
+	Tools []MCPSpecTool `json:"tools"`
+}
+
+// specTools 把规格文件编译成可注册的工具集：每次 `tools/call` 重新读文件，按工具名
+// 取当前结果——父进程改写文件就在下一轮生效。
+// specTools compiles the spec file into tools whose results are re-read on every
+// call, so a rewrite by the parent takes effect on the next round.
+func specTools(path string) ([]MCPTestTool, error) {
+	spec, err := readMCPSpec(path)
+	if err != nil {
+		return nil, err
+	}
+	tools := make([]MCPTestTool, 0, len(spec.Tools))
+	for _, entry := range spec.Tools {
+		name := entry.Name
+		schema := entry.Schema
+		if schema == nil {
+			schema = map[string]any{"type": "object"}
+		}
+		tools = append(tools, MCPTestTool{
+			Name:        entry.Name,
+			Description: entry.Description,
+			Schema:      schema,
+			Handler: func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return specResult(path, name), nil
+			},
+		})
+	}
+	return tools, nil
+}
+
+// readMCPSpec 读并解析规格文件——读取范围经 os.Root 钉在规格文件所在目录。
+// readMCPSpec reads and decodes the spec file, scoping the read through os.Root
+// to the directory the file lives in.
+//
+// 与 internal/cli 的 readConfigFile 同一口径：路径来自父进程环境变量，裸
+// os.ReadFile(path) 会被静态扫描判 G304/G703（CWE-22 文件包含），而抑制手段
+// （#nosec）默认禁用。以父目录为 root 读取既消除该判定，又把"跳到目录之外的
+// 软连接"挡在门外（fail-closed）。
+// Same rule as readConfigFile: a read through the parent directory is both
+// gate-clean and fail-closed, without a suppression comment.
+func readMCPSpec(path string) (MCPSpec, error) {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return MCPSpec{}, err
+	}
+	defer root.Close()
+
+	raw, err := root.ReadFile(filepath.Base(path))
+	if err != nil {
+		return MCPSpec{}, err
+	}
+	var spec MCPSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return MCPSpec{}, err
+	}
+	return spec, nil
+}
+
+// specResult 按工具名取本次调用的结果；读文件失败或工具已从规格里消失都按 IsError
+// 返回（不静默），让夹具能看到"规格写坏了"而不是等到业务断言才失配。
+// specResult resolves the current result for one tool; unreadable specs and missing
+// tools come back as IsError results instead of being silently dropped.
+func specResult(path, name string) *mcp.CallToolResult {
+	spec, err := readMCPSpec(path)
+	if err != nil {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: "spec read failed: " + err.Error()}},
+		}
+	}
+	for _, entry := range spec.Tools {
+		if entry.Name != name {
+			continue
+		}
+		if entry.Error != "" {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{Text: entry.Error}},
+			}
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: entry.Result}},
+		}
+	}
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: "spec: tool " + name + " not found"}},
+	}
+}
+
 // RunMCPHelper 是集成层的子进程入口：父进程用测试二进制自举（`-test.run=
 // ^TestMCPHelperProcess$`）拉起自己并设 `BASALT_MCP_HELPER=1`，子进程在本函数里
 // 以 stdio 传输服务标准工具集，直到父进程关闭 stdin。未设置该环境变量时（默认层
-// 顶层运行）**跳过**——它是入口，不是用例。
+// 顶层运行）**跳过**——它是入口，不是用例。设置了 `BASALT_MCP_HELPER_SPEC` 时改为
+// 服务规格文件里的工具集（不混入标准工具集），供需要自定义工具名的夹具使用。
 // RunMCPHelper serves the standard tool set over stdio in the helper subprocess; it
-// skips when the helper environment variable is absent.
+// skips when the helper environment variable is absent. When BASALT_MCP_HELPER_SPEC
+// is set it serves the spec file's tool set instead.
 func RunMCPHelper(t *testing.T) {
 	t.Helper()
 	if os.Getenv(mcpHelperEnv) == "" {
@@ -143,11 +257,19 @@ func RunMCPHelper(t *testing.T) {
 		}
 		pageSize = n
 	}
+	tools := StandardMCPTools()
+	if specPath := os.Getenv(mcpSpecEnv); specPath != "" {
+		spec, err := specTools(specPath)
+		if err != nil {
+			t.Fatalf("读 MCP 规格文件失败: %v", err)
+		}
+		tools = spec
+	}
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "basalt-mcp-helper", Version: "v1"},
 		&mcp.ServerOptions{PageSize: pageSize},
 	)
-	for _, tool := range StandardMCPTools() {
+	for _, tool := range tools {
 		server.AddTool(&mcp.Tool{
 			Name:        tool.Name,
 			Description: tool.Description,

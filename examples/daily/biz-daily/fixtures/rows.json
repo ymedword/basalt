@@ -1,0 +1,30 @@
+{
+  "table": "orders",
+  "columns": ["row_id", "order_id", "order_date", "region", "channel", "amount", "status", "note"],
+  "rows": [
+    {"row_id": 1, "order_id": "SO-1001", "order_date": "2026-10-01", "region": "华东", "channel": "直营", "amount": 1200.0, "status": "paid", "note": "首单"},
+    {"row_id": 2, "order_id": "SO-1002", "order_date": "2026-10-01", "region": "华北", "channel": "电商", "amount": 800.5, "status": "paid", "note": ""},
+    {"row_id": 3, "order_id": "SO-1003", "order_date": "2026-10-02", "region": "华南", "channel": "经销", "amount": 2450.0, "status": "paid", "note": ""},
+    {"row_id": 4, "order_id": "SO-1004", "order_date": "2026-10-02", "region": "华东", "channel": "电商", "amount": 320.0, "status": "refunded", "note": "七天无理由"},
+    {"row_id": 5, "order_id": "SO-1005", "order_date": "2026-10-03", "region": "华北", "channel": "直营", "amount": "N/A", "status": "paid", "note": "金额由外部系统回填，尚未同步"},
+    {"row_id": 6, "order_id": "SO-1006", "order_date": "2026-10-03", "region": "西南", "channel": "经销", "amount": 990.0, "status": "pending", "note": ""},
+    {"row_id": 7, "order_id": "SO-1007", "order_date": "2026-10-04", "region": null, "channel": "电商", "amount": 1500.0, "status": "paid", "note": "大区字段缺失"},
+    {"row_id": 8, "order_id": "SO-1008", "order_date": "2026-10-04", "region": "华东", "channel": "直营", "amount": 760.0, "status": "paid", "note": ""},
+    {"row_id": 9, "order_id": "SO-1003", "order_date": "2026-10-05", "region": "华南", "channel": "经销", "amount": 2600.0, "status": "paid", "note": "重复导入：同一单号第二次进入"},
+    {"row_id": 10, "order_id": "SO-1010", "order_date": "2026-10-05", "region": "华北", "channel": "电商", "amount": 410.0, "status": "refunded", "note": ""},
+    {"row_id": 11, "order_id": "SO-1011", "order_date": "2026-10-06", "region": "华南", "channel": "直营", "amount": -300.0, "status": "paid", "note": "金额为负数"},
+    {"row_id": 12, "order_id": "SO-1012", "order_date": "2026-10-06", "region": "华东", "channel": "经销", "status": "paid", "note": "金额字段整列缺失"},
+    {"row_id": 13, "order_id": "SO-1013", "order_date": "2026-10-07", "region": "西南", "channel": "电商", "amount": 680.0, "status": "paid", "note": ""},
+    {"row_id": 14, "order_id": "SO-1014", "order_date": "2026-10-07", "region": "华北", "channel": "直营", "amount": 1230.0, "status": "paid", "note": ""},
+    {"row_id": 15, "order_id": "SO-1015", "order_date": "2026-10-08", "region": "华东", "channel": "电商", "amount": 540.0, "status": "pending", "note": ""},
+    {"row_id": 16, "order_id": "SO-1016", "order_date": "2026-10-08", "region": "华南", "channel": "直营", "amount": 870.0, "status": "cancelled", "note": "状态不在约定枚举内"},
+    {"row_id": 17, "order_id": "SO-1017", "order_date": "2026-10-09", "region": "华北", "channel": "经销", "amount": 1490.0, "status": "paid", "note": ""},
+    {"row_id": 18, "order_id": "SO-1018", "order_date": "2026-10-09", "region": "西南", "channel": "电商", "amount": 300.0, "status": "", "note": "状态空串"},
+    {"row_id": 19, "order_id": "SO-1019", "order_date": "2026-10-10", "region": "华东", "channel": "直营", "amount": 2100.0, "status": "paid", "note": ""},
+    {"row_id": 20, "order_id": "SO-1002", "order_date": "2026-10-10", "region": "华北", "channel": "电商", "amount": 950.0, "status": "paid", "note": "重复导入：金额与首次不同"},
+    {"row_id": 21, "order_id": "SO-1021", "order_date": "2026-10-11", "region": "华南", "channel": "电商", "amount": 460.0, "status": "refunded", "note": ""},
+    {"row_id": 22, "order_id": "SO-1022", "order_date": "2026-13-40", "region": "西南", "channel": "直营", "amount": 770.0, "status": "paid", "note": "日期非法"},
+    {"row_id": 23, "order_id": "SO-1023", "order_date": "2026-10-12", "region": "华北", "channel": "电商", "amount": 1180.0, "status": "paid", "note": ""},
+    {"row_id": 24, "order_id": "SO-1024", "order_date": "2026-10-12", "region": "华东", "channel": "经销", "amount": 640.0, "status": "pending", "note": ""}
+  ]
+}

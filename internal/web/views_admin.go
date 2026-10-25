@@ -364,25 +364,38 @@ func notifyChannelTestResultView(r core.NotifyChannelTestResult) NotifyChannelTe
 }
 
 // McpServerTestResultView 是契约 McpServerTestResult：结果与工具发现清单，均脱敏；
-// 空工具清单输出 `[]`。
-// McpServerTestResultView is the redacted MCP test result with discovered tools.
+// 空工具清单输出 `[]`（空清单是**成功**，不得改写成 `tools_list_failed`）。
+// `operation_id` / `tested_version_id` / `stage` / `failure_class` 是 US-14 追加的四段
+// 证据（D-03）：被测试的版本、失败发生在哪一阶段、按哪一类失败——页面据此把"模型说
+// 通了"与"真的通了"分开。`stage` / `failure_class` 的取值集合是契约闭集，本层只投影。
+// McpServerTestResultView is the redacted MCP test result. The four added fields are the
+// D-03 evidence: which version was tested, at which stage it failed and how it is
+// classified. Empty tools means success, never tools_list_failed.
 type McpServerTestResultView struct {
-	OK           bool     `json:"ok"`
-	LatencyMS    int64    `json:"latency_ms"`
-	Tools        []string `json:"tools"`
-	ErrorCode    string   `json:"error_code"`
-	ErrorMessage string   `json:"error_message"`
+	OK              bool     `json:"ok"`
+	LatencyMS       int64    `json:"latency_ms"`
+	Tools           []string `json:"tools"`
+	ErrorCode       string   `json:"error_code"`
+	ErrorMessage    string   `json:"error_message"`
+	OperationID     string   `json:"operation_id"`
+	TestedVersionID int64    `json:"tested_version_id"`
+	Stage           string   `json:"stage"`
+	FailureClass    string   `json:"failure_class"`
 }
 
 // mcpServerTestResultView 投影 MCP 测试结果。
 // mcpServerTestResultView projects the MCP test result.
 func mcpServerTestResultView(r core.ResourceTestResult) McpServerTestResultView {
 	return McpServerTestResultView{
-		OK:           r.OK,
-		LatencyMS:    r.LatencyMS,
-		Tools:        stringSlice(r.Tools),
-		ErrorCode:    r.ErrorCode,
-		ErrorMessage: r.ErrorMessage,
+		OK:              r.OK,
+		LatencyMS:       r.LatencyMS,
+		Tools:           stringSlice(r.Tools),
+		ErrorCode:       r.ErrorCode,
+		ErrorMessage:    r.ErrorMessage,
+		OperationID:     r.OperationID,
+		TestedVersionID: r.TestedVersionID,
+		Stage:           r.Stage,
+		FailureClass:    r.FailureClass,
 	}
 }
 

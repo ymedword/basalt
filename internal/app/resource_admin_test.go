@@ -100,6 +100,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/testutil"
+	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -135,6 +136,20 @@ func resourceActor() core.Actor {
 // TestMain prepares the sentinel variable; a failed setup exits 1 rather than letting
 // cases pass for the wrong reason.
 func TestMain(m *testing.M) {
+	// 诊断哨兵：诊断用例把测试二进制自己当命令、并把 `diagSentinelArgPrefix<path>`
+	// 作为唯一参数——若实现真的启动了子进程，子进程走到这里写下哨兵文件就退出，
+	// 用例据此断言"文件从未出现"。正常跑测试时没有参数会命中这个前缀。
+	// The diagnosis sentinel: a spawned child writes the marker file and exits, so the
+	// test can prove no process was ever started.
+	for _, arg := range os.Args[1:] {
+		if path, found := strings.CutPrefix(arg, diagSentinelArgPrefix); found {
+			if err := os.WriteFile(path, []byte("started"), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "写诊断哨兵失败: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+	}
 	for name, value := range map[string]string{
 		resourceTestKeyEnv: resourceTestKeySentinel,
 		mcpTestTokenEnv:    mcpTestTokenSentinel,
@@ -248,6 +263,11 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 		Logger:         logger,
 		Now:            baselineClock,
 		PublishVersion: env.publishVersion,
+		// 诊断构造器与启动共用 `tool.NewMCPCommand`（C-04）：夹具按 wire 的装配口径
+		// 绑定 root 与 envPassthrough，诊断用例因此走真实构造路径而不是近似解析。
+		DiagnoseMCP: func(spec core.MCPServerConfig) core.MCPCommandDiagnosis {
+			return diagnoseMCPCommand(spec, env.root, nil)
+		},
 	}
 	for _, m := range mutate {
 		m(&deps)
@@ -2367,8 +2387,12 @@ func TestMCPTest_ResolvesEnvBeforeConnect(t *testing.T) {
 // TestMCPTest_MissingEnvNotConfigured fails before dialing and keeps the operation id.
 func TestMCPTest_MissingEnvNotConfigured(t *testing.T) {
 	// t.Setenv 与 t.Parallel 互斥：本用例需要显式控制一个未配置变量。
+	// US-14 起保存期有 env 闸门（FR5，见 mcp_env_test.go）：变量缺失的条目已无法保存，
+	// 因此本用例在保存**之后**把变量置空——模拟"保存时满足、测试时进程环境已不满足"
+	// （重启漏配变量）的真实形态。测试端点的判据（不拨号、failed/NOT_CONFIGURED、
+	// 503 + operation_id、点名变量、不回显占位）逐条不变。
 	const missingEnv = "BASALT_US12_MISSING_TOKEN"
-	t.Setenv(missingEnv, "")
+	t.Setenv(missingEnv, "present-when-saved")
 
 	mcpEnv := newMCPEnv(t)
 	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
@@ -2381,6 +2405,7 @@ func TestMCPTest_MissingEnvNotConfigured(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	t.Setenv(missingEnv, "")
 	_, err = env.admin.TestMCPServer(context.Background(), resourceActor(), "fs")
 	require.Error(t, err)
 	require.ErrorIs(t, err, core.ErrProviderNotConfigured)
@@ -2449,6 +2474,351 @@ func TestMCPTest_NoProcessOnPreWriteFailure(t *testing.T) {
 	require.False(t, mcpEnv.startedProcess())
 	require.Equal(t, rowsBefore, env.operationCount())
 	require.Equal(t, v1.ID, env.pointerOf(core.ResourceMCPServer, "fs").PublishedVersionID)
+}
+
+// mcpTestDetailProbe 是 D-07 固定字段的**测试侧**投影：刻意不复用实现里的 detail 类型，
+// 实现漏写某个字段就表现为零值读数（断言红），而不是编译错误。
+// The probe mirrors contract D-07 independently so a missing field shows as a reading.
+type mcpTestDetailProbe struct {
+	OK           bool     `json:"ok"`
+	LatencyMS    int64    `json:"latency_ms"`
+	Tools        []string `json:"tools"`
+	ErrorCode    string   `json:"error_code"`
+	ErrorMessage string   `json:"error_message"`
+	Stage        string   `json:"stage"`
+	FailureClass string   `json:"failure_class"`
+}
+
+// mcpTestDetailOf 解出一条测试操作的 detail（D-07 对象）。
+// mcpTestDetailOf decodes one test operation's detail.
+func mcpTestDetailOf(t *testing.T, row core.OperationRecord) mcpTestDetailProbe {
+	t.Helper()
+	var probe mcpTestDetailProbe
+	require.NoError(t, json.Unmarshal(row.DetailJSON, &probe), "detail_json 必须是对象：%s", row.DetailJSON)
+	return probe
+}
+
+// mcpTestDetailKeys 返回 detail 的顶层键集（判"字段始终存在"用的是键，不是长度——`nil`
+// 与 `[]` 的 len 都是 0，只看长度会把缺字段误判成合法空列表）。
+// mcpTestDetailKeys returns the top-level keys so "field always present" is judged on
+// presence rather than length (nil and [] share len 0).
+func mcpTestDetailKeys(t *testing.T, row core.OperationRecord) map[string]json.RawMessage {
+	t.Helper()
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(row.DetailJSON, &raw), "detail_json 必须是对象：%s", row.DetailJSON)
+	return raw
+}
+
+// mcpTestPagePass 是 §2.4.2 的页面通过判据（测试侧独立实现）：`detail.ok` 为真、
+// 被测版本等于当前发布版本、且被测版本非零；操作 `status` **不参与**判定——success
+// 只表示管理动作执行完毕并留下结论。
+// mcpTestPagePass mirrors the §2.4.2 page predicate; operation status never participates.
+func mcpTestPagePass(detail mcpTestDetailProbe, requestedVersionID, publishedVersionID int64) bool {
+	return detail.OK && requestedVersionID == publishedVersionID && requestedVersionID != 0
+}
+
+// TestMCPTest_RecordsVersionAndTools：模块卡 §4.5.6 逐字落地——成功测试返回
+// operation_id / tested_version_id，操作行记**被测试的版本**，detail 写 tools、
+// stage=complete、失败分类为空。逆改点：只写 ok/latency、或操作行不记
+// requested_version_id → 红。
+// TestMCPTest_RecordsVersionAndTools pins the tested version and the tool list.
+func TestMCPTest_RecordsVersionAndTools(t *testing.T) {
+	t.Parallel()
+	mcpEnv := newMCPEnv(t)
+	mcpEnv.setToolNames("echo")
+	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	env.createMCPStdio(t, "demo", "allowed-mcp")
+	ptr := env.pointerOf(core.ResourceMCPServer, "demo")
+
+	result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+	require.NoError(t, err, "测试应成功")
+	require.NotEmpty(t, result.OperationID, "响应必须带 operation_id")
+	require.Equal(t, ptr.PublishedVersionID, result.TestedVersionID, "响应必须带被测版本")
+	require.True(t, result.OK)
+	require.Equal(t, "complete", result.Stage)
+	require.Empty(t, result.FailureClass)
+
+	rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+	require.Len(t, rows, 1)
+	require.Equal(t, result.OperationID, rows[0].OperationID)
+	require.Equal(t, ptr.PublishedVersionID, rows[0].RequestedVersionID, "操作行必须记被测版本")
+	require.Equal(t, core.OperationSuccess, rows[0].Status)
+	require.Equal(t, lifecycleResultOK, rows[0].ResultCode)
+
+	detail := mcpTestDetailOf(t, rows[0])
+	require.True(t, detail.OK)
+	require.Equal(t, []string{"echo"}, detail.Tools, "detail 必须写 tools")
+	require.Equal(t, "complete", detail.Stage, "成功 stage 必须是 complete")
+	require.Empty(t, detail.FailureClass)
+	require.True(t, mcpTestPagePass(detail, rows[0].RequestedVersionID, ptr.PublishedVersionID))
+}
+
+// TestMCPTest_FailureClassification：模块卡 §4.5.7——supervisor 自己判定的两条分支
+// （策略拒绝 = 200 + ok=false，超时 = 504 + failed/TIMEOUT），另加结构化失败的
+// stage × class 透传与"没有 ConnectDetailed 时回退 dependency_unconfirmed"。
+// 连接池自己的 10 个 class 由 `internal/tool` 的表驱动用例覆盖，这里只判装配层的映射。
+// TestMCPTest_FailureClassification pins the classification rows the assembly owns.
+func TestMCPTest_FailureClassification(t *testing.T) {
+	t.Parallel()
+
+	t.Run("policy_denied", func(t *testing.T) {
+		t.Parallel()
+		mcpEnv := newMCPEnv(t) // 白名单只有 allowed-mcp
+		env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+		env.createMCPStdio(t, "demo", "other-mcp")
+
+		result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+		require.NoError(t, err, "策略拒绝是 200，不是错误")
+		require.False(t, result.OK)
+		require.Equal(t, "preflight", result.Stage)
+		require.Equal(t, "policy_denied", result.FailureClass)
+
+		rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+		require.Len(t, rows, 1)
+		require.Equal(t, core.OperationSuccess, rows[0].Status, "策略拒绝必须记 success")
+		require.Equal(t, lifecycleResultOK, rows[0].ResultCode)
+
+		detail := mcpTestDetailOf(t, rows[0])
+		require.False(t, detail.OK)
+		require.Equal(t, "preflight", detail.Stage)
+		require.Equal(t, "policy_denied", detail.FailureClass)
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		t.Parallel()
+		mcpEnv := newMCPEnv(t)
+		mcpEnv.setBlockConnect(true)
+		mcpEnv.supervisor.deps.TestTimeout = 50 * time.Millisecond
+		env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+		env.createMCPStdio(t, "demo", "allowed-mcp")
+
+		result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+		require.ErrorIs(t, err, context.DeadlineExceeded, "超时必须映射 504")
+		require.Equal(t, core.ResourceTestResult{}, result, "504 不返回测试结果对象")
+
+		rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+		require.Len(t, rows, 1)
+		require.Equal(t, core.OperationFailed, rows[0].Status, "超时必须记 failed")
+		require.Equal(t, resourceResultTimeout, rows[0].ResultCode)
+
+		detail := mcpTestDetailOf(t, rows[0])
+		require.False(t, detail.OK)
+		require.Equal(t, "spawn", detail.Stage, "无结构化失败时超时 stage 退到 spawn")
+		require.Equal(t, "timeout", detail.FailureClass)
+		require.Equal(t, ptrOrZero(env, "demo"), rows[0].RequestedVersionID, "超时行同样记被测版本")
+	})
+
+	t.Run("structured_failure_passthrough", func(t *testing.T) {
+		t.Parallel()
+		mcpEnv := newMCPEnv(t)
+		mcpEnv.setConnectFailure("spawn", "command_not_found")
+		env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+		env.createMCPStdio(t, "demo", "allowed-mcp")
+
+		result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+		require.NoError(t, err, "连接失败是 200 + ok=false，不是 5xx")
+		require.False(t, result.OK)
+		require.Equal(t, "spawn", result.Stage, "stage 必须来自结构化失败")
+		require.Equal(t, "command_not_found", result.FailureClass)
+		require.Equal(t, mcpResultConnectFailed, result.ErrorCode)
+
+		rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+		require.Len(t, rows, 1)
+		require.Equal(t, core.OperationSuccess, rows[0].Status)
+		require.Equal(t, lifecycleResultOK, rows[0].ResultCode)
+		detail := mcpTestDetailOf(t, rows[0])
+		require.Equal(t, "spawn", detail.Stage)
+		require.Equal(t, "command_not_found", detail.FailureClass)
+	})
+
+	t.Run("timeout_takes_stage_from_failure", func(t *testing.T) {
+		t.Parallel()
+		mcpEnv := newMCPEnv(t)
+		mcpEnv.setConnectFailure("initialize", "handshake_failed")
+		mcpEnv.setConnectFailureDeadline(true)
+		env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+		env.createMCPStdio(t, "demo", "allowed-mcp")
+
+		_, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+
+		rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+		require.Len(t, rows, 1)
+		require.Equal(t, core.OperationFailed, rows[0].Status)
+		detail := mcpTestDetailOf(t, rows[0])
+		require.Equal(t, "initialize", detail.Stage, "超时 stage 取第一条结构化失败")
+		require.Equal(t, "timeout", detail.FailureClass, "分类仍是 timeout")
+	})
+
+	t.Run("legacy_connector_fallback", func(t *testing.T) {
+		t.Parallel()
+		mcpEnv := newMCPEnv(t)
+		mcpEnv.setLegacyConnector(true)
+		mcpEnv.setConnectErr(errors.New("boom"))
+		env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+		env.createMCPStdio(t, "demo", "allowed-mcp")
+
+		result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+		require.NoError(t, err)
+		require.False(t, result.OK)
+		require.Equal(t, "spawn", result.Stage)
+		require.Equal(t, "dependency_unconfirmed", result.FailureClass,
+			"没有结构化失败就不猜分类（D-05 / C-06）")
+	})
+}
+
+// TestMCPTest_EmptyToolList：模块卡 §4.5.13——`tools/list` 成功但为空记 ok=true、
+// `tools` 是**存在**的空数组、无失败分类；不得改写成 `tools_list_failed`。
+// 逆改点：把空列表判成失败、或省略 tools 字段 → 红。
+// TestMCPTest_EmptyToolList forbids turning an empty tool list into a failure.
+func TestMCPTest_EmptyToolList(t *testing.T) {
+	t.Parallel()
+	mcpEnv := newMCPEnv(t)
+	mcpEnv.setToolNames() // 连接成功，但 tools/list 为空
+	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	env.createMCPStdio(t, "demo", "allowed-mcp")
+
+	result, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+	require.NoError(t, err, "协议成功不应报错")
+	require.True(t, result.OK)
+	require.Empty(t, result.Tools)
+
+	rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+	require.Len(t, rows, 1)
+	detail := mcpTestDetailOf(t, rows[0])
+	require.True(t, detail.OK)
+	require.Empty(t, detail.Tools, "空列表是合法读数，不是失败分类")
+	require.Empty(t, detail.FailureClass)
+	require.Equal(t, "complete", detail.Stage)
+
+	keys := mcpTestDetailKeys(t, rows[0])
+	require.Contains(t, keys, "tools", "tools 字段必须存在")
+	require.JSONEq(t, "[]", string(keys["tools"]), "空列表必须是 []，不是 null")
+}
+
+// TestMCPTest_LegacyOperationNotPass：§2.4.2 的"历史无版本"行——预写形态的操作行
+// （`requested_version_id` 为空、`ok=true`）**不得**被判为通过；新记录必须能通过。
+// 逆改点：页面判据只看 `ok`、或预写不写被测版本 → 红（新旧两条都过 / 都不过）。
+// TestMCPTest_LegacyOperationNotPass keeps version-less history from passing the page.
+func TestMCPTest_LegacyOperationNotPass(t *testing.T) {
+	t.Parallel()
+	mcpEnv := newMCPEnv(t)
+	mcpEnv.setToolNames("echo")
+	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	published := env.createMCPStdio(t, "demo", "allowed-mcp")
+
+	// ① 历史行：US-14 之前的预写形态（没有被测版本），结论 ok=true。
+	actor := resourceActor()
+	legacyID := core.NewOperationID(baselineClock())
+	require.NoError(t, env.ops.BeginOperation(context.Background(), core.OperationRecord{
+		OperationID:  legacyID,
+		Action:       core.ActionMCPServerTest,
+		TargetKind:   core.TargetKindMCPServer,
+		TargetID:     "demo",
+		ActorSubject: actor.Subject,
+		AuthMethod:   actor.Method,
+		Source:       actor.Source,
+		RequestHash:  mcpServerTestHash("demo"),
+		Status:       core.OperationPending,
+		DetailJSON:   []byte("{}"),
+		CreatedAt:    baselineClock(),
+	}))
+	require.NoError(t, env.ops.FinishOperation(context.Background(), legacyID, core.OperationSuccess,
+		lifecycleResultOK, "", []byte(`{"ok":true,"latency_ms":1,"tools":[]}`), baselineClock()))
+
+	legacy, err := env.ops.GetOperation(context.Background(), legacyID)
+	require.NoError(t, err)
+	require.Zero(t, legacy.RequestedVersionID, "历史行没有被测版本")
+	require.False(t, mcpTestPagePass(mcpTestDetailOf(t, legacy), legacy.RequestedVersionID,
+		published.ID), "没有被测版本的历史记录不得判通过")
+
+	// ② 新记录：同一个判据必须能通过——否则"不通过"不是判别力，只是常量。
+	_, err = env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+	require.NoError(t, err)
+	rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+	require.Len(t, rows, 2)
+	var fresh core.OperationRecord
+	for _, row := range rows {
+		if row.OperationID != legacyID {
+			fresh = row
+		}
+	}
+	require.NotZero(t, fresh.OperationID, "必须能找到本次测试的行")
+	require.Equal(t, published.ID, fresh.RequestedVersionID, "新记录必须带被测版本")
+	require.True(t, mcpTestPagePass(mcpTestDetailOf(t, fresh), fresh.RequestedVersionID, published.ID),
+		"新记录必须能通过页面判据")
+}
+
+// TestMCPTest_UnconfirmedEntryStillAttempts：模块卡 §4.5.13——诊断 `unconfirmed`
+// （含分隔符的相对入口）**不得**预判测试结论：测试仍必须真实尝试并连接。
+// 判据取"连接器创建 + 进程启动"：一次性测试路径不经过 `OnConnected`，卡片示例里的
+// `connectedCount()` 在该路径上恒为 0，等价证据是"真的发起了连接"。
+// 逆改点：诊断分支直接返回 ok=false / 跳过连接 → createdCount=0 → 红。
+// TestMCPTest_UnconfirmedEntryStillAttempts proves diagnosis never pre-judges a test.
+func TestMCPTest_UnconfirmedEntryStillAttempts(t *testing.T) {
+	t.Parallel()
+	// 含分隔符的相对入口：不启动进程无法证明能否定位，诊断只能给 unconfirmed。
+	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{
+		Root:            t.TempDir(),
+		AllowedCommands: []string{"./mcp-helper"},
+	})
+	mcpEnv := newMCPEnvWithPolicy(t, policy)
+	mcpEnv.setToolNames("echo")
+	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	env.createMCPStdio(t, "demo", "./mcp-helper")
+
+	diag, err := env.admin.DiagnoseMCPServer(context.Background(), resourceActor(), "demo")
+	require.NoError(t, err)
+	require.NotNil(t, diag.Command)
+	require.Equal(t, "unconfirmed", diag.Command.State)
+
+	_, err = env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+	require.NoError(t, err, "测试应真实尝试并成功")
+	require.Equal(t, 1, mcpEnv.createdCount(), "诊断 unconfirmed 时测试仍必须创建连接器")
+	require.True(t, mcpEnv.startedProcess(), "诊断 unconfirmed 时测试仍必须真实发起连接")
+
+	rows := env.listOperations(core.OperationFilter{Action: core.ActionMCPServerTest})
+	require.Len(t, rows, 1)
+	detail := mcpTestDetailOf(t, rows[0])
+	require.True(t, detail.OK, "诊断 unconfirmed 不得预判 ok=false")
+	require.Equal(t, "complete", detail.Stage)
+	require.Empty(t, detail.FailureClass, "实际成功的测试不得带失败分类")
+}
+
+// TestMCPTest_NoOperationOnPrewriteFailure：模块卡 §4.5.12——预写失败 → 拒绝执行、
+// 不留操作行、不创建连接器、不启动子进程。卡片里的 `beginFailStore` 按"实现后以实际
+// 签名为准"的约定复用既有的 `failingBeginStore`（注入位相同：预写返回错误）。
+// 逆改点：先 supervisor.Test 再 BeginOperation → 连接器计数 / 进程标记变真 → 红。
+// TestMCPTest_NoOperationOnPrewriteFailure keeps the pre-write gate ahead of any side
+// effect.
+func TestMCPTest_NoOperationOnPrewriteFailure(t *testing.T) {
+	t.Parallel()
+	mcpEnv := newMCPEnv(t)
+	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	v1 := env.createMCPStdio(t, "demo", "allowed-mcp")
+	before := env.operationCount()
+
+	env.admin.operations = failingBeginStore{OperationStore: env.ops, err: errBeginRefused}
+
+	_, err := env.admin.TestMCPServer(context.Background(), resourceActor(), "demo")
+	require.Error(t, err, "预写失败必须拒绝执行")
+	require.Contains(t, err.Error(), "预写管理操作失败")
+
+	require.Equal(t, before, env.operationCount(), "预写失败不得留下操作行")
+	require.Zero(t, mcpEnv.createdCount(), "预写失败不得创建连接器")
+	require.False(t, mcpEnv.startedProcess(), "预写失败不得启动子进程")
+	require.Zero(t, mcpEnv.closedCount(), "没有连接就没有连接可收尾")
+	require.Equal(t, v1.ID, env.pointerOf(core.ResourceMCPServer, "demo").PublishedVersionID)
+}
+
+// ptrOrZero 取当前发布版本号；指针缺失返回 0（只用于断言里的期望值）。
+// ptrOrZero reads the published version id, or 0 when there is no pointer.
+func ptrOrZero(env *resourceEnv, name string) int64 {
+	ptr, err := env.store.Pointer(context.Background(), core.ResourceMCPServer, name)
+	if err != nil {
+		return 0
+	}
+	return ptr.PublishedVersionID
 }
 
 // ---------------------------------------------------------------------------

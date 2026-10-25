@@ -799,21 +799,22 @@ func (v *resourceViews) MCPServers(ctx context.Context) ([]web.McpServerView, er
 	slices.Sort(names)
 	views := make([]web.McpServerView, 0, len(names))
 	for _, name := range names {
-		view, _, err := v.mcpServerView(ctx, name)
+		projection, err := v.projectMCPServer(ctx, name)
 		if err != nil {
 			return nil, err
 		}
-		views = append(views, view)
+		views = append(views, projection.view)
 	}
 	return views, nil
 }
 
 // McpServer 返回单个 MCP server：既无指针也不在配置名单 → `core.ErrResourceNotFound`。
-// ETag 取**发布版本** content_hash 的内容 ETag（人工 review ② F3）：数据以页面展示的
-// 当前定义为准，且只经响应头出站——公开视图里没有该字段；无指针（未入账的配置项）
-// 时为空串。响应体因此与列表项完全同形。
-// McpServer returns one server; the internal ETag is derived from the published
-// version's content hash and leaves the process only as a response header.
+// ETag 取**发布版本** content_hash 的内容 ETag（人工 review ② F3），只经响应头出站；
+// `args` / `url` 取自同一发布定义，按契约 `McpServerDetail` 进详情响应体，供编辑
+// 表单预填（2026-10-25 US-14 走查裁决）。无指针（未入账的配置项）时 ETag 为空串、
+// 两个字段取零值，**不伪造**。
+// McpServer returns one server: the published definition supplies args/url for the
+// detail body, while the ETag leaves the process only as a response header.
 func (v *resourceViews) McpServer(ctx context.Context, name string) (web.McpServerDetail, error) {
 	_, found, err := v.optionalPointer(ctx, core.ResourceMCPServer, name)
 	if err != nil {
@@ -822,42 +823,62 @@ func (v *resourceViews) McpServer(ctx context.Context, name string) (web.McpServ
 	if !found && !slices.Contains(v.configuredMCPNames(), name) {
 		return web.McpServerDetail{}, fmt.Errorf("%w: mcp_server/%s", core.ErrResourceNotFound, name)
 	}
-	view, etag, err := v.mcpServerView(ctx, name)
+	projection, err := v.projectMCPServer(ctx, name)
 	if err != nil {
 		return web.McpServerDetail{}, err
 	}
-	return web.McpServerDetail{View: view, ETag: etag}, nil
+	detail := web.McpServerDetail{View: projection.view, ETag: projection.etag}
+	if projection.definition != nil {
+		detail.Args = projection.definition.Args
+		detail.URL = projection.definition.URL
+	}
+	return detail, nil
 }
 
-// mcpServerView 投影一个 MCP server：定义字段取**发布**版本（页面展示"当前定义"，
-// 未生效由 pending_restart 表达）；连接与工具名取运行期；无指针时版本字段全零，
-// **不伪造**版本号。env 只出键名（约束 35）。第二个返回值是详情端点专用 ETag：
-// 由发布版本 content_hash 生成；无指针时为空串。
-// mcpServerView projects one server: definition fields come from the published version,
-// connectivity from the runtime, and a missing pointer yields zero version fields. The
-// second result is the detail-only ETag; it is empty when no version is recorded.
-func (v *resourceViews) mcpServerView(ctx context.Context, name string) (web.McpServerView, string, error) {
+// mcpServerProjection 汇总 MCP server 的一次投影：公开视图、详情专用 ETag 与发布
+// 定义。`args` / `url` 只进详情响应体（契约 McpServerDetail），**不**进列表视图。
+// mcpServerProjection bundles the view, the detail-only ETag and the published
+// definition; args/url reach the detail body only.
+type mcpServerProjection struct {
+	view       web.McpServerView
+	etag       string
+	definition *resourceMCPDefinition
+}
+
+// projectMCPServer 投影一个 MCP server：定义字段取**发布**版本（页面展示"当前定义"，
+// 未生效由 pending_restart 表达）；连接与工具名取运行期；无指针时版本字段全零、
+// definition 为 nil，**不伪造**版本号。env 只出键名（约束 35）；ETag 由发布版本
+// 内容生成，无指针时为空串。详情端点据此补齐 `args` / `url`（2026-10-25 走查裁决）。
+// projectMCPServer projects one server: definition fields come from the published
+// version, connectivity from the runtime; a missing pointer leaves zero fields and a
+// nil definition. The ETag is derived from the published version.
+func (v *resourceViews) projectMCPServer(ctx context.Context, name string) (mcpServerProjection, error) {
 	view := web.McpServerView{
 		Name:      name,
 		Transport: mcpTransportStdio,
 		EnvKeys:   []string{},
-		Tools:     v.mcpTools(name),
-		Connected: slices.Contains(v.connectedMCPNames(), name),
+		// `Tools` 保持 offered 语义（注册前 server 声明的全量名单，D-06）；被谁抢走、
+		// 为什么跳过由 `ToolDisposition` 单独表达，不在这里过滤——否则页面无法区分
+		// "server 没提供"与"提供了但没赢"。
+		// Tools stays offered-only; the registration outcome lives in ToolDisposition.
+		Tools:           v.mcpTools(name),
+		Connected:       slices.Contains(v.connectedMCPNames(), name),
+		ToolDisposition: web.MCPToolDispositionViewOf(v.mcp.ToolDisposition(name)),
 	}
 	ptr, found, err := v.optionalPointer(ctx, core.ResourceMCPServer, name)
 	if err != nil {
-		return web.McpServerView{}, "", err
+		return mcpServerProjection{}, err
 	}
 	if !found {
-		return view, "", nil
+		return mcpServerProjection{view: view}, nil
 	}
 	version, err := v.versionOf(ctx, core.ResourceMCPServer, name, ptr.PublishedVersionID)
 	if err != nil {
-		return web.McpServerView{}, "", err
+		return mcpServerProjection{}, err
 	}
 	definition, err := parseMCPDefinition(name, version.DefinitionYAML)
 	if err != nil {
-		return web.McpServerView{}, "", err
+		return mcpServerProjection{}, err
 	}
 	view.Transport = mcpTransport(definition.Transport)
 	view.Command = mcpExecutable(definition.Command)
@@ -868,16 +889,16 @@ func (v *resourceViews) mcpServerView(ctx context.Context, name string) (web.Mcp
 	if ptr.AppliedVersionID != nil {
 		applied, err := v.versionOf(ctx, core.ResourceMCPServer, name, *ptr.AppliedVersionID)
 		if err != nil {
-			return web.McpServerView{}, "", err
+			return mcpServerProjection{}, err
 		}
 		view.AppliedVersionNo = applied.VersionNo
 	}
 	view.PendingRestart = mcpRestartPending(ptr)
 	etag, err := publishedResourceETag(ctx, v.credentials, ptr, version)
 	if err != nil {
-		return web.McpServerView{}, "", err
+		return mcpServerProjection{}, err
 	}
-	return view, etag, nil
+	return mcpServerProjection{view: view, etag: etag, definition: &definition}, nil
 }
 
 // ModelConnections 列出未删除的模型连接指针；顺序取 `ListPointers` 升序。
@@ -1148,6 +1169,8 @@ type resourceMCPDefinition struct {
 	Name      string            `yaml:"name"`
 	Transport string            `yaml:"transport"`
 	Command   string            `yaml:"command"`
+	Args      []string          `yaml:"args"`
+	URL       string            `yaml:"url"`
 	Env       map[string]string `yaml:"env"`
 }
 

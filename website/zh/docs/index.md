@@ -3,10 +3,11 @@ title: 文档 — 理解与使用 Basalt
 description: 理解 Basalt 的 Agent OS 定位、独立 Agent 与共享底座、当前能力、使用入口和未来方向。
 ---
 
-<!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script"]}} -->
+<!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script","TemplateTable"]}} -->
 
 <script setup>
 import { withBase } from 'vitepress'
+import TemplateTable from '../../.vitepress/theme/components/TemplateTable.vue'
 </script>
 
 # 文档
@@ -75,6 +76,22 @@ Basalt 用一个 Go 应用承接后两个层次。模型提出动作，运行时
 <a :href="withBase('/zh/quickstart/#deploy')">部署入口</a> · [运维手册（GitHub）](https://github.com/ymedword/basalt/blob/main/docs/Operations.md)
 
 管理认证、监听、访问策略、备份、升级和排障。
+
+## 模板与 Demo {#templates-demos}
+
+`examples/` 自带五个每日 Agent 与八个模板。每个目录都是可复制的便携基线：不含实例 ID、不含凭据，也不含投递渠道。复制到自己的工作区后，再绑定模型、工具与通知渠道；Basalt 不会自动导入示例，也不会自动放宽命令白名单。
+
+<TemplateTable section="demos" />
+
+八个模板覆盖天气、arXiv、政策页面、工单、入职文档、依赖、网页变更与创业融资。其中六个无需凭据即可用夹具复跑（A 档），一个另需 Playwright 浏览器（A* 档），一个只提供配置配方（B 档）。[示例索引](https://github.com/ymedword/basalt/blob/main/examples/README.md)列出每个目录的档位、依赖与证据状态。
+
+<TemplateTable section="templates" />
+
+## MCP 目录 {#mcp-catalog}
+
+管理台的 MCP 目录列出六条配方：GitHub、Brave Search、Fetch、Playwright、Filesystem（只读）与 DBHub。“添加到配置”只预填表单，不会自动保存。保存、发布或回滚时，若引用的环境变量缺失或为空，请求按 fail-closed 拒绝（503 与操作 ID），配置文件与发布指针都不变；尚未在本机实测的配方会如实标注。读取目录不启动进程、不安装任何包，也不写操作记录。
+
+<TemplateTable section="catalog" />
 
 ## 未来方向 {#roadmap}
 

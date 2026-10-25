@@ -1,0 +1,49 @@
+{
+  "total_count": 6,
+  "incomplete_results": false,
+  "items": [
+    {
+      "full_name": "orbitworks/fleet-scheduler",
+      "description": "面向多团队定时任务的轻量调度器，带错过触发点的补偿策略",
+      "stargazers_count": 1240,
+      "pushed_at": "2026-10-24T18:20:00Z",
+      "html_url": "https://github.com/orbitworks/fleet-scheduler",
+      "readme_url": "https://raw.githubusercontent.com/orbitworks/fleet-scheduler/trunk/README.md"
+    },
+    {
+      "full_name": "northwind-labs/mcp-bridge",
+      "description": "把本地命令行工具包装成 MCP server 的小型桥接层",
+      "stargazers_count": 860,
+      "pushed_at": "2026-10-24T09:05:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge"
+    },
+    {
+      "full_name": "riverbed/agent-kit",
+      "description": "Agent 工具调用的测试夹具与回放工具集",
+      "stargazers_count": 512,
+      "pushed_at": "2026-10-23T22:41:00Z",
+      "html_url": "https://github.com/riverbed/agent-kit"
+    },
+    {
+      "full_name": "harbor-analytics/queue-lens",
+      "description": "只读观测任务队列积压与重试的轻量看板",
+      "stargazers_count": 233,
+      "pushed_at": "2026-10-23T13:12:00Z",
+      "html_url": "https://github.com/harbor-analytics/queue-lens"
+    },
+    {
+      "full_name": "kite-systems/otel-spans",
+      "description": "把 Agent 每轮调用映射成 OpenTelemetry span 的示例",
+      "stargazers_count": 118,
+      "pushed_at": "2026-10-22T07:30:00Z",
+      "html_url": "https://github.com/kite-systems/otel-spans"
+    },
+    {
+      "full_name": "lumen-labs/tiny-loader",
+      "description": "把一个目录的文本文件批量载入上下文的小工具",
+      "stargazers_count": 47,
+      "pushed_at": "2026-10-21T16:45:00Z",
+      "html_url": "https://github.com/lumen-labs/tiny-loader"
+    }
+  ]
+}

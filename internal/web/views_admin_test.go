@@ -304,7 +304,12 @@ func TestAdminViews_EmptyCollections(t *testing.T) {
 
 	mcp := viewJSON(t, mcpServerTestResultView(core.ResourceTestResult{OK: true, LatencyMS: 12}))
 	require.Equal(t, []any{}, mcp["tools"])
-	requireKeys(t, mcp, "ok", "latency_ms", "tools", "error_code", "error_message")
+	// US-14（D-03）追加四键：operation_id / tested_version_id / stage / failure_class。
+	// 零值也是合法取值（成功时 stage=complete、failure_class 为空串），因此它们**始终**
+	// 出现，不做 omitempty。
+	// D-03 adds four fields; their zero values are meaningful, so they always appear.
+	requireKeys(t, mcp, "ok", "latency_ms", "tools", "error_code", "error_message",
+		"operation_id", "tested_version_id", "stage", "failure_class")
 
 	model := viewJSON(t, modelConnectionTestResultView(core.ResourceTestResult{OK: true}))
 	requireKeys(t, model, "ok", "latency_ms", "model", "error_code", "error_message")

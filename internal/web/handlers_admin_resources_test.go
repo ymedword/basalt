@@ -53,6 +53,7 @@ type fakeResourceAdminService struct {
 	versionDetailFn         func(ctx context.Context, versionID int64) (core.ResourceVersionDetail, error)
 	testModelConnectionFn   func(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 	testMCPServerFn         func(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
+	diagnoseMCPServerFn     func(ctx context.Context, actor core.Actor, name string) (core.MCPServerDiagnosis, error)
 	createSkillFn           func(ctx context.Context, actor core.Actor, write SkillCreateWrite) (SkillDetailView, error)
 	importSkillFn           func(ctx context.Context, actor core.Actor, write SkillImportWrite) (SkillDetailView, error)
 	updateSkillFn           func(ctx context.Context, actor core.Actor, name string, write SkillUpdateWrite, ifMatch string) (SkillDetailView, error)
@@ -171,6 +172,15 @@ func (f *fakeResourceAdminService) TestMCPServer(ctx context.Context, actor core
 		return core.ResourceTestResult{}, errFakeResourceAdminUnused
 	}
 	return f.testMCPServerFn(ctx, actor, name)
+}
+
+// DiagnoseMCPServer 委托只读诊断的注入行为（US-14 D-02）：未设置即"意外调用"，
+// 因此诊断用例只要拿到 200 就证明它没有顺手走测试路径。
+func (f *fakeResourceAdminService) DiagnoseMCPServer(ctx context.Context, actor core.Actor, name string) (core.MCPServerDiagnosis, error) {
+	if f.diagnoseMCPServerFn == nil {
+		return core.MCPServerDiagnosis{}, errFakeResourceAdminUnused
+	}
+	return f.diagnoseMCPServerFn(ctx, actor, name)
 }
 
 // operationLedger 是管理操作台账的替身：只有适配器替身在"成功路径"写入一行，

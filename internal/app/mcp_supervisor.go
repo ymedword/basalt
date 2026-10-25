@@ -48,6 +48,20 @@ const (
 	// mcpTransportHTTP 是 http 传输的解析字面量（stdio 复用 resources.go 的同名字面量）。
 	// The http transport literal; stdio reuses the constant declared in resources.go.
 	mcpTransportHTTP = "http"
+
+	// 测试记录的 stage / failure_class 里由**装配层**判定的固定字面量（契约 D-05）：
+	// 连接池只产出 spawn / initialize / tools_list，`complete` 与 `preflight` 之外的
+	// `env_missing` 分别由本文件与 env 闸门判定。分类只来自结构化失败或本文件的确定
+	// 分支，**不**解析 stderr / 日志文案（C-06）。
+	// Fixed stage/class literals the assembly layer decides; never parsed from output.
+	mcpTestStageComplete = "complete"
+	mcpTestStageSpawn    = "spawn"
+	// mcpTestClassTimeout 来自预算到点（含父 ctx 取消折成的超时）；连接池把单 server 的
+	// 预算超时吸收成 `class=timeout` 的失败项时同样落这里。
+	mcpTestClassTimeout = "timeout"
+	// mcpTestClassDependencyUnconfirmed 是"失败但无法归因"的唯一出口：不得把"没有成功
+	// 连接"推断成"未安装"。
+	mcpTestClassDependencyUnconfirmed = "dependency_unconfirmed"
 )
 
 // MCPAuditEvent 是一条 MCP 授权 / 连接审计事件（固定键，结构化日志同形）。它不是
@@ -390,17 +404,54 @@ func (s *MCPSupervisor) Close() error {
 	return errors.Join(errs...)
 }
 
+// mcpDetailedConnector 是连接池的结构化失败能力（D-05 / C-06）：实现它时按 server 逐个
+// 拿到 `stage` / `class`；只有 `Connect` 的旧实现（含测试假连接器）走回退分支。`Connect`
+// 的启动语义保持不变——启动路径不因这条测试接缝改变。
+// mcpDetailedConnector is the structured-failure capability; connectors that only
+// implement Connect keep working through the fallback.
+type mcpDetailedConnector interface {
+	ConnectDetailed(ctx context.Context, specs []core.MCPServerConfig) ([]tool.MCPConnection, []tool.MCPConnectFailure, error)
+}
+
+// connectDetailed 走结构化失败通道；连接器没有该能力时退回 `Connect`，并把"零连接但
+// 没有错误"标成 `dependency_unconfirmed`——那是连接池吸收了单 server 失败的结果，
+// 没有结构化信息就不猜分类（C-06：不得把"没有成功连接"统一推断为"未安装"）。
+// connectDetailed prefers ConnectDetailed and falls back to Connect with an
+// unconfirmed classification when the connector cannot report structured failures.
+func connectDetailed(ctx context.Context, connector mcpConnector, specs []core.MCPServerConfig,
+) ([]tool.MCPConnection, []tool.MCPConnectFailure, error) {
+	if detailed, ok := connector.(mcpDetailedConnector); ok {
+		return detailed.ConnectDetailed(ctx, specs)
+	}
+	conns, err := connector.Connect(ctx, specs)
+	if err == nil && len(conns) == 0 {
+		return conns, []tool.MCPConnectFailure{{
+			Server: specs[0].Name,
+			Stage:  mcpTestStageSpawn,
+			Class:  mcpTestClassDependencyUnconfirmed,
+		}}, nil
+	}
+	return conns, nil, err
+}
+
 // Test 按**给定配置**（调用方取已发布版本）建立一次性连接：先过策略与审计，再在固定
 // 15 秒预算内连接并发现工具；结束（成功 / 失败 / 超时）一律关闭连接，stdio 的进程树由
 // 连接池在 Close 内清理。**不**创建 Run、**不**写 `llm_calls`、**不**改变 applied 或状态。
+// 结论带 `stage` / `failure_class`（D-05）：分类只来自结构化失败与本文件的确定分支。
 // Test opens a one-off connection under the fixed budget, never touching applied or
-// creating a run.
+// creating a run; the verdict carries the D-05 stage and failure class.
 func (s *MCPSupervisor) Test(ctx context.Context, cfg core.MCPServerConfig) core.ResourceTestResult {
 	if err := validateSupervisorConfig(cfg); err != nil {
-		return core.ResourceTestResult{OK: false, ErrorCode: mcpResultConnectFailed, ErrorMessage: mcpStatusConnectFailed}
+		return core.ResourceTestResult{
+			OK: false, ErrorCode: mcpResultConnectFailed, ErrorMessage: mcpStatusConnectFailed,
+			Stage: mcpTestStageSpawn, FailureClass: mcpTestClassDependencyUnconfirmed,
+		}
 	}
 	if err := s.authorize(ctx, "mcp.test", cfg, 0); err != nil {
-		return core.ResourceTestResult{OK: false, ErrorCode: mcpResultPolicyDenied, ErrorMessage: mcpStatusPolicyDenied}
+		return core.ResourceTestResult{
+			OK: false, ErrorCode: mcpResultPolicyDenied, ErrorMessage: mcpStatusPolicyDenied,
+			Stage: mcpGateStagePreflight, FailureClass: mcpResultPolicyDenied,
+		}
 	}
 
 	timeout := s.deps.TestTimeout
@@ -412,7 +463,7 @@ func (s *MCPSupervisor) Test(ctx context.Context, cfg core.MCPServerConfig) core
 	defer cancel()
 
 	started := time.Now()
-	conns, err := connector.Connect(testCtx, []core.MCPServerConfig{cfg})
+	conns, failures, err := connectDetailed(testCtx, connector, []core.MCPServerConfig{cfg})
 	latency := time.Since(started).Milliseconds()
 	// 收尾与分支无关：一次性连接不留给任何人（含超时 / 失败）。
 	if closeErr := connector.Close(); closeErr != nil {
@@ -420,21 +471,36 @@ func (s *MCPSupervisor) Test(ctx context.Context, cfg core.MCPServerConfig) core
 	}
 
 	if err != nil || len(conns) == 0 {
-		if err == nil {
-			err = errors.New(mcpStatusConnectFailed)
+		stage, class := mcpTestStageSpawn, mcpTestClassDependencyUnconfirmed
+		if len(failures) > 0 {
+			if failures[0].Stage != "" {
+				stage = failures[0].Stage
+			}
+			if failures[0].Class != "" {
+				class = failures[0].Class
+			}
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || testCtx.Err() != nil {
+		// 超时的判定要同时看两处：整体预算到点（err / testCtx），以及连接池把单 server
+		// 预算超时吸收成 `class=timeout` 的失败项（此时 err 仍为 nil）。
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+			testCtx.Err() != nil || class == mcpTestClassTimeout {
 			return core.ResourceTestResult{
 				OK: false, LatencyMS: latency,
 				ErrorCode: resourceResultTimeout, ErrorMessage: "测试超时",
+				Stage: stage, FailureClass: mcpTestClassTimeout,
 			}
 		}
 		return core.ResourceTestResult{
 			OK: false, LatencyMS: latency,
 			ErrorCode: mcpResultConnectFailed, ErrorMessage: mcpStatusConnectFailed,
+			Stage: stage, FailureClass: class,
 		}
 	}
-	return core.ResourceTestResult{OK: true, LatencyMS: latency, Tools: toolNamesOf(conns)}
+	// `tools/list` 成功但为空是合法读数（ok=true、tools=[]）：不得改写成 tools_list_failed。
+	return core.ResourceTestResult{
+		OK: true, LatencyMS: latency, Tools: toolNamesOf(conns),
+		Stage: mcpTestStageComplete,
+	}
 }
 
 // Status 返回一次性拷贝；工具名切片同样复制，调用方改动不影响内部状态。

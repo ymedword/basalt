@@ -1,0 +1,9 @@
+# 依赖清单：每行「生态 包名 版本」，空白分隔；生态只认 npm / PyPI。
+# 文件内容为示例数据，包名真实但版本与漏洞编号均为虚构，用于离线复跑。
+npm lodash 4.17.20
+npm axios 1.6.0
+PyPI requests 2.31.0
+PyPI pyyaml 6.0.1
+npm express 4.18.2
+PyPI flask 3.0.0
+npm dotenv

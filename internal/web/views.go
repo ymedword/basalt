@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -993,6 +994,203 @@ type McpServerView struct {
 	AppliedVersionID   int64    `json:"applied_version_id"`
 	AppliedVersionNo   int      `json:"applied_version_no"`
 	PendingRestart     bool     `json:"pending_restart"`
+	// ToolDisposition 是实际注册结果（D-06）：未连接或未知时为 nil，出站成显式 `null`。
+	// 它**不**改变 `Tools` 的语义——后者始终是该 server 提供的工具名（offered）。
+	// 注册池的重名语义（内置赢家、WARN）不变，这里只投影结果。
+	// ToolDisposition projects the registration outcome; it never changes Tools, which
+	// stays the server's offered list.
+	ToolDisposition *MCPToolDispositionView `json:"tool_disposition"`
+}
+
+// McpServerDetailView 是 GET /mcp-servers/{name} 的响应体（契约 McpServerDetail）：
+// 在 `McpServerView` 之上追加 `args` / `url`，供详情页表单预填；env 仍只出键名，
+// ETag 仍只经响应头出站（**不**进响应体）。列表端点维持 `McpServerView` 不变。
+// McpServerDetailView is the contract detail body: the view plus args/url for the edit
+// form. env values and the ETag never enter the body; the list shape stays unchanged.
+type McpServerDetailView struct {
+	McpServerView
+	Args []string `json:"args"`
+	URL  string   `json:"url"`
+}
+
+// MCPToolDispositionView 是契约 McpToolDisposition：offer / accept / skip 三个计数。
+// 算术不变式 `offered == accepted + len(skipped)` 由装配层保证，本层只投影。
+// MCPToolDispositionView is the contract shape of a server's registration outcome.
+type MCPToolDispositionView struct {
+	Offered  int               `json:"offered"`
+	Accepted int               `json:"accepted"`
+	Skipped  []MCPToolSkipView `json:"skipped"`
+}
+
+// MCPToolSkipView 是一条被跳过的工具：赢家来源与固定跳过原因。
+// MCPToolSkipView names the winning source and one fixed skip reason.
+type MCPToolSkipView struct {
+	Name         string `json:"name"`
+	WinnerSource string `json:"winner_source"`
+	Reason       string `json:"reason"`
+}
+
+// MCPToolDispositionViewOf 投影注册结果；nil 保持 nil（出站 `null`）。导出版本供 app
+// 层投影 `McpServerView` 时复用，避免两处各写一份映射（与 ConnectionTestViewOf 同源）。
+// MCPToolDispositionViewOf projects the disposition; nil stays nil. The app layer reuses
+// it so the mapping exists in exactly one place.
+func MCPToolDispositionViewOf(d *core.MCPToolDisposition) *MCPToolDispositionView {
+	if d == nil {
+		return nil
+	}
+	skipped := make([]MCPToolSkipView, 0, len(d.Skipped))
+	for _, skip := range d.Skipped {
+		skipped = append(skipped, MCPToolSkipView{
+			Name:         skip.Name,
+			WinnerSource: skip.WinnerSource,
+			Reason:       skip.Reason,
+		})
+	}
+	return &MCPToolDispositionView{Offered: d.Offered, Accepted: d.Accepted, Skipped: skipped}
+}
+
+// MCPCatalogView 是契约 McpCatalog：目录 schema 版本 + 条目（已按 id 升序）。
+// MCPCatalogView is the contract shape of the whole catalog.
+type MCPCatalogView struct {
+	Version int                   `json:"version"`
+	Items   []MCPCatalogEntryView `json:"items"`
+}
+
+// MCPCatalogEntryView 是一条复制用配方（契约 McpCatalogEntry）：十六个字段逐字对齐。
+// Args 里的 `<...>` 只是编辑标记；Command / URL 按 Transport 二选一，另一侧为空串。
+// MCPCatalogEntryView is one copyable recipe with the contract's sixteen fields.
+type MCPCatalogEntryView struct {
+	ID                string              `json:"id"`
+	DisplayName       string              `json:"display_name"`
+	Summary           string              `json:"summary"`
+	Category          string              `json:"category"`
+	Transport         string              `json:"transport"`
+	Command           string              `json:"command"`
+	Args              []string            `json:"args"`
+	URL               string              `json:"url"`
+	Env               []MCPCatalogEnvView `json:"env"`
+	Requires          []string            `json:"requires"`
+	SourceURL         string              `json:"source_url"`
+	Verified          bool                `json:"verified"`
+	VerificationNote  string              `json:"verification_note"`
+	VerifiedAt        string              `json:"verified_at"`
+	VerifiedPlatforms []string            `json:"verified_platforms"`
+	Warnings          []string            `json:"warnings"`
+}
+
+// MCPCatalogEnvView 是一条 env 占位声明：只有键名与 `${KEY}` 占位符，**没有值**。
+// MCPCatalogEnvView declares one env placeholder and never carries a value.
+type MCPCatalogEnvView struct {
+	Key         string `json:"key"`
+	Placeholder string `json:"placeholder"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+}
+
+// McpServerDiagnosticsView 是契约 McpServerDiagnosis（D-02）：命令三态、env 就绪布尔、
+// 固定 warnings 与检查时间。它**不**含 `connected`——连接状态属于运行期视图，诊断
+// 不预测连接结果（诊断与测试互不预判，FR12）。`Command` 为 nil 时出站 `null`（http）。
+// McpServerDiagnosticsView is the contract diagnosis shape; it carries no connected
+// flag because diagnosis never predicts a test outcome.
+type McpServerDiagnosticsView struct {
+	Name               string                   `json:"name"`
+	Transport          string                   `json:"transport"`
+	PublishedVersionID int64                    `json:"published_version_id"`
+	AppliedVersionID   int64                    `json:"applied_version_id"`
+	PendingRestart     bool                     `json:"pending_restart"`
+	Command            *McpCommandDiagnosisView `json:"command"`
+	Env                []McpEnvDiagnosisView    `json:"env"`
+	Warnings           []string                 `json:"warnings"`
+	CheckedAt          string                   `json:"checked_at"`
+}
+
+// McpCommandDiagnosisView 是命令定位三态：`unconfirmed` **不是**失败，只是按现行启动
+// 构造无法确定；测试仍会真实尝试（D-02 / FR12）。
+// McpCommandDiagnosisView is the three-state lookup verdict; unconfirmed is not a failure.
+type McpCommandDiagnosisView struct {
+	State  string `json:"state"`
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+// McpEnvDiagnosisView 只回布尔：变量存在且非空为 true。
+// McpEnvDiagnosisView reports presence only.
+type McpEnvDiagnosisView struct {
+	Key string `json:"key"`
+	Set bool   `json:"set"`
+}
+
+// mcpCatalogView 投影只读目录快照：数组字段一律非 nil（空目录出站 `[]`），条目顺序
+// 保持解析层的 id 升序——视图层**不**重排，否则"按 id 升序"会在两处各有一套规则。
+// mcpCatalogView projects the snapshot, keeping the parser's id order untouched.
+func mcpCatalogView(cat core.MCPCatalog) MCPCatalogView {
+	items := make([]MCPCatalogEntryView, 0, len(cat.Items))
+	for _, entry := range cat.Items {
+		items = append(items, mcpCatalogEntryView(entry))
+	}
+	return MCPCatalogView{Version: cat.Version, Items: items}
+}
+
+// mcpCatalogEntryView 投影一条配方：`env` / `args` / `requires` / `verified_platforms` /
+// `warnings` 空时出站 `[]`（契约要求数组，`null` 会判成缺字段）。
+// mcpCatalogEntryView keeps every array field non-nil.
+func mcpCatalogEntryView(entry core.MCPCatalogEntry) MCPCatalogEntryView {
+	env := make([]MCPCatalogEnvView, 0, len(entry.Env))
+	for _, placeholder := range entry.Env {
+		env = append(env, MCPCatalogEnvView{
+			Key:         placeholder.Key,
+			Placeholder: placeholder.Placeholder,
+			Required:    placeholder.Required,
+			Description: placeholder.Description,
+		})
+	}
+	return MCPCatalogEntryView{
+		ID:                entry.ID,
+		DisplayName:       entry.DisplayName,
+		Summary:           entry.Summary,
+		Category:          entry.Category,
+		Transport:         entry.Transport,
+		Command:           entry.Command,
+		Args:              stringSlice(entry.Args),
+		URL:               entry.URL,
+		Env:               env,
+		Requires:          stringSlice(entry.Requires),
+		SourceURL:         entry.SourceURL,
+		Verified:          entry.Verified,
+		VerificationNote:  entry.VerificationNote,
+		VerifiedAt:        entry.VerifiedAt,
+		VerifiedPlatforms: stringSlice(entry.VerifiedPlatforms),
+		Warnings:          stringSlice(entry.Warnings),
+	}
+}
+
+// mcpServerDiagnosticsView 投影一次诊断：`command` 为 nil 时出站 `null`（http 传输），
+// `env` / `warnings` 空时出站 `[]`，`checked_at` 走 formatTime（RFC3339 UTC）。
+// mcpServerDiagnosticsView projects one diagnosis; command stays nil for http.
+func mcpServerDiagnosticsView(diag core.MCPServerDiagnosis) McpServerDiagnosticsView {
+	env := make([]McpEnvDiagnosisView, 0, len(diag.Env))
+	for _, entry := range diag.Env {
+		env = append(env, McpEnvDiagnosisView{Key: entry.Key, Set: entry.Set})
+	}
+	var command *McpCommandDiagnosisView
+	if diag.Command != nil {
+		command = &McpCommandDiagnosisView{
+			State:  diag.Command.State,
+			Path:   diag.Command.Path,
+			Reason: diag.Command.Reason,
+		}
+	}
+	return McpServerDiagnosticsView{
+		Name:               diag.Name,
+		Transport:          diag.Transport,
+		PublishedVersionID: diag.PublishedVersionID,
+		AppliedVersionID:   diag.AppliedVersionID,
+		PendingRestart:     diag.PendingRestart,
+		Command:            command,
+		Env:                env,
+		Warnings:           stringSlice(diag.Warnings),
+		CheckedAt:          formatTime(diag.CheckedAt),
+	}
 }
 
 // 需重启四段的出口（约束 29）：MCP 定义由 mcpPendingRestart 投影；沙箱白名单与
@@ -1139,8 +1337,117 @@ func projectOperationDetailValue(key string, value any) (any, bool) {
 			paths = append(paths, path)
 		}
 		return paths, true
+	// —— `mcp_server.test` 的固定七键（契约 D-07）——
+	// 成功时 `error_code` / `error_message` / `failure_class` 是**空串**而不是缺键，
+	// `tools` 必须存在（空清单出站 `[]`）；版本以 `OperationDetail.requested_version_id`
+	// 为唯一载体，因此 `version` / `tested_version_id` 这类键永远不投影——同一个事实
+	// 只留一条路径，页面才不会拿到两个可能不一致的版本号。
+	// The fixed seven fields of an MCP connection test (D-07). Version-bearing keys are
+	// deliberately absent: requested_version_id is the single carrier.
+	case "ok":
+		flag, ok := value.(bool)
+		if !ok {
+			return nil, false
+		}
+		return flag, true
+	case "latency_ms":
+		return detailInteger(value)
+	case "tools":
+		list, ok := value.([]any)
+		if !ok {
+			return nil, false
+		}
+		names := make([]string, 0, len(list))
+		for _, item := range list {
+			name, ok := item.(string)
+			if !ok || !isOperationToolName(name) {
+				return nil, false
+			}
+			names = append(names, name)
+		}
+		return names, true
+	case "stage":
+		stage, ok := value.(string)
+		if !ok || !isMCPTestStage(stage) {
+			return nil, false
+		}
+		return stage, true
+	case "failure_class":
+		class, ok := value.(string)
+		if !ok || !isMCPTestFailureClass(class) {
+			return nil, false
+		}
+		return class, true
+	case "error_code", "error_message":
+		return detailText(value)
 	default:
 		return nil, false
+	}
+}
+
+// maxOperationDetailText 是详情纯文本字段的长度上限（按字符计）：错误文案来自外部
+// 进程，不保证干净；超长与含控制字符一律整键丢弃，宁可少给一行证据也不把原始
+// stderr 搬进审计详情。
+// maxOperationDetailText bounds detail text fields; over-long or control-bearing text is
+// dropped rather than carried into the audit detail.
+const maxOperationDetailText = 2000
+
+// detailText 只接受可出站的纯文本：非字符串、含控制字符或超长一律整键丢弃。
+// detailText accepts plain text only: wrong type, control characters or over-long text
+// drop the whole key.
+func detailText(value any) (any, bool) {
+	text, ok := value.(string)
+	if !ok || len([]rune(text)) > maxOperationDetailText {
+		return nil, false
+	}
+	for _, char := range text {
+		if unicode.IsControl(char) {
+			return nil, false
+		}
+	}
+	return text, true
+}
+
+// isOperationToolName 判一个工具名：非空、无空白与控制字符、长度有界。工具名**不是**
+// 路径，因此不套 `isRelativeOperationPath`——那会把 `github.list_issues` 之类的合法
+// 名字判成非法。
+// isOperationToolName accepts a non-empty, bounded name without whitespace or control
+// characters; tool names are not paths, so the path rule must not be reused here.
+func isOperationToolName(name string) bool {
+	if name == "" || len([]rune(name)) > 128 {
+		return false
+	}
+	for _, char := range name {
+		if unicode.IsControl(char) || unicode.IsSpace(char) {
+			return false
+		}
+	}
+	return true
+}
+
+// isMCPTestStage 判契约 D-03 的 stage 闭集。
+// isMCPTestStage accepts exactly the contract's stage enum.
+func isMCPTestStage(stage string) bool {
+	switch stage {
+	case "preflight", "spawn", "initialize", "tools_list", "complete":
+		return true
+	default:
+		return false
+	}
+}
+
+// isMCPTestFailureClass 判契约 D-03 的 failure_class 闭集。空串是**合法取值**（成功），
+// 不是"缺键"——它与缺字段在页面上必须可区分。
+// isMCPTestFailureClass accepts the contract's closed set; the empty string is a valid
+// value meaning success, not a missing key.
+func isMCPTestFailureClass(class string) bool {
+	switch class {
+	case "", "command_not_found", "permission_denied", "policy_denied", "timeout",
+		"http_unauthorized", "http_unreachable", "handshake_failed", "tools_list_failed",
+		"env_missing", "dependency_unconfirmed":
+		return true
+	default:
+		return false
 	}
 }
 

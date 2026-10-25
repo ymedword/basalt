@@ -1,7 +1,7 @@
 package web
 
 // 本文件是管理写面的**端口**声明（颗粒度文档 §3.1.8）：`admin_routes` 与各写面
-// handler 只依赖这里的五个接口，不触达 `internal/app` 的具体实现。响应形状的归属
+// handler 只依赖这里的接口，不触达 `internal/app` 的具体实现。响应形状的归属
 // 分两类：`views_admin.go` 能独立投影的（版本行、引用、测试结果、归档记录、Agent
 // 文件集合）端口就返回 `core` 类型，由 web 层投影；需要把指针、版本、运行时状态
 // 或工作副本正文拼在一起才能成立的（模型连接 / MCP / 技能详情、工作区浏览），
@@ -104,6 +104,23 @@ type ResourceAdminService interface {
 	References(ctx context.Context, kind core.ResourceKind, id string) (core.ResourceReferences, error)
 	TestModelConnection(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 	TestMCPServer(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
+
+	// DiagnoseMCPServer 给出**只读**诊断结论（D-02）：命令三态、env 就绪布尔与已知边界。
+	// 它不建立连接、不写操作行、不触达测试路径——诊断与测试互不预判（FR12），因此
+	// 不复用 TestMCPServer。返回 `core` 记录，投影在 web 层完成。
+	// DiagnoseMCPServer is the read-only diagnosis (D-02): it connects to nothing, writes
+	// no operation row and never reuses the test path.
+	DiagnoseMCPServer(ctx context.Context, actor core.Actor, name string) (core.MCPServerDiagnosis, error)
+}
+
+// MCPCatalogReader 是只读 MCP 目录端口（D-01）：目录是构建期内嵌的静态快照，读取
+// 不启动进程、不安装、不写配置、不写操作行。它单独成接口而不是并进
+// `ResourceAdminService`——目录不是资源写面的一部分，混进去会让"写面端口"这个词
+// 失真，也让只读页面被迫依赖一整组写方法。
+// MCPCatalogReader is the read-only catalog port; it stays separate from the write port
+// so a read-only page never depends on the write surface.
+type MCPCatalogReader interface {
+	ListMCPCatalog(ctx context.Context) (core.MCPCatalog, error)
 }
 
 // NotifyAdminService 是通知渠道写面端口：读取仍走 US-11 的只读服务，本接口

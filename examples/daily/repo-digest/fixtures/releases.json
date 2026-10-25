@@ -1,0 +1,49 @@
+{
+  "repo": "northwind-labs/mcp-bridge",
+  "total_count": 4,
+  "items": [
+    {
+      "id": 1001,
+      "tag_name": "v0.4.0",
+      "name": "v0.4.0 稳定版",
+      "draft": false,
+      "prerelease": false,
+      "created_at": "2026-10-23T07:00:00Z",
+      "published_at": "2026-10-23T07:00:00Z",
+      "updated_at": "2026-10-24T08:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/releases/tag/v0.4.0"
+    },
+    {
+      "id": 1002,
+      "tag_name": "v0.5.0-rc.1",
+      "name": "v0.5.0 候选",
+      "draft": false,
+      "prerelease": true,
+      "created_at": "2026-10-24T09:00:00Z",
+      "published_at": "2026-10-24T09:00:00Z",
+      "updated_at": "2026-10-24T09:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/releases/tag/v0.5.0-rc.1"
+    },
+    {
+      "id": 1003,
+      "tag_name": "v0.5.0",
+      "name": "v0.5.0 发布草稿",
+      "draft": true,
+      "prerelease": false,
+      "created_at": "2026-10-24T10:00:00Z",
+      "published_at": null,
+      "updated_at": "2026-10-24T10:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/releases/tag/v0.5.0"
+    },
+    {
+      "id": 1004,
+      "tag_name": "v0.3.2",
+      "name": "v0.3.2 补丁",
+      "draft": false,
+      "prerelease": false,
+      "created_at": "2026-10-22T00:00:00Z",
+      "updated_at": "2026-10-24T11:00:00Z",
+      "html_url": "https://github.com/northwind-labs/mcp-bridge/releases/tag/v0.3.2"
+    }
+  ]
+}

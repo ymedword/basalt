@@ -154,7 +154,13 @@ type ResourceBoundAgent struct {
 
 // ResourceTestResult 是模型连接 / MCP 连接测试的脱敏结果。ErrorCode 只放固定短语，
 // ErrorMessage 不得含凭证与 URL 原文。
-// ResourceTestResult is the redacted result of a connection test.
+// US-14 起 MCP 测试追加四字段（契约 D-03）：OperationID 指向预写的那条管理操作行，
+// TestedVersionID 是实际被测版本（0 = 无法确定），Stage / FailureClass 是结构化进度与
+// 分类——成功时 FailureClass 为空串，空工具清单仍是成功（tools_list 阶段走完）。
+// 模型连接测试不使用后三个字段，保持零值。
+// ResourceTestResult is the redacted result of a connection test. Since US-14 the MCP
+// test also reports its operation id, tested version, stage and structured failure
+// class; model-connection tests leave those zero, and an empty tool list is success.
 type ResourceTestResult struct {
 	OK           bool
 	LatencyMS    int64
@@ -162,6 +168,12 @@ type ResourceTestResult struct {
 	Tools        []string
 	ErrorCode    string
 	ErrorMessage string
+	// —— US-14 追加（契约 D-03）；空串 / 0 是合法值，零值语义与既有字段一致 ——
+	// Added by US-14 (contract D-03); zero values are meaningful, not "absent".
+	OperationID     string
+	TestedVersionID int64
+	Stage           string
+	FailureClass    string
 }
 
 // ResourceVersionDetail 是 GET /resource-versions/{version_id} 的服务层返回：

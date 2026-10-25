@@ -1,0 +1,75 @@
+{
+  "fixture_note": "固定输入样本：域名、公告编号与哈希均为虚构，仅用于离线复跑对比规则。",
+  "sources": [
+    {"name": "示例监管机构", "url": "https://notices.example.gov/regulations"},
+    {"name": "示例标准组织", "url": "https://standards.example.org/updates"}
+  ],
+  "previous": [
+    {
+      "id": "REG-2026-041",
+      "source": "示例监管机构",
+      "title": "数据出境安全评估申报口径",
+      "url": "https://notices.example.gov/regulations/REG-2026-041",
+      "published_at": "2026-09-30",
+      "content_sha256": "9c8358358c8da4f7c309e8885e5a93f6e155b66130e2f72cbd39cbc7b529a4a0"
+    },
+    {
+      "id": "REG-2026-042",
+      "source": "示例监管机构",
+      "title": "关键信息基础设施运维外包备案指引",
+      "url": "https://notices.example.gov/regulations/REG-2026-042",
+      "published_at": "2026-10-08",
+      "content_sha256": "fdcafcd6b3a00f8e86325dd11983d6a48a194fb6c998a6850a366417ec61ba37"
+    },
+    {
+      "id": "STD-2026-017",
+      "source": "示例标准组织",
+      "title": "日志留存格式规范（草案）",
+      "url": "https://standards.example.org/updates/STD-2026-017",
+      "published_at": "2026-10-11",
+      "content_sha256": "6fddcd07615a912c685bd4929c928e1f135c3a02f45ff43cb3813921c96f2dd8"
+    },
+    {
+      "id": "STD-2026-018",
+      "source": "示例标准组织",
+      "title": "Agent 系统审计接口约定（征求意见稿）",
+      "url": "https://standards.example.org/updates/STD-2026-018",
+      "published_at": "2026-10-15",
+      "content_sha256": "55d3bf73418db16d4cf120f3ea432e2fdf24c965b1913ca7e019ed586663fd1b"
+    }
+  ],
+  "current": [
+    {
+      "id": "REG-2026-041",
+      "source": "示例监管机构",
+      "title": "数据出境安全评估申报口径",
+      "url": "https://notices.example.gov/regulations/REG-2026-041",
+      "published_at": "2026-09-30",
+      "content_sha256": "9c8358358c8da4f7c309e8885e5a93f6e155b66130e2f72cbd39cbc7b529a4a0"
+    },
+    {
+      "id": "REG-2026-042",
+      "source": "示例监管机构",
+      "title": "关键信息基础设施运维外包备案指引",
+      "url": "https://notices.example.gov/regulations/REG-2026-042",
+      "published_at": "2026-10-08",
+      "content_sha256": "d620b73c6e2b091bb959b41994def6333b9fbf77b3321f6743b64fd8a2dd4833"
+    },
+    {
+      "id": "STD-2026-018",
+      "source": "示例标准组织",
+      "title": "Agent 系统审计接口约定（征求意见稿）",
+      "url": "https://standards.example.org/updates/STD-2026-018",
+      "published_at": "2026-10-15",
+      "content_sha256": "55d3bf73418db16d4cf120f3ea432e2fdf24c965b1913ca7e019ed586663fd1b"
+    },
+    {
+      "id": "STD-2026-019",
+      "source": "示例标准组织",
+      "title": "模型调用留痕最小字段集",
+      "url": "https://standards.example.org/updates/STD-2026-019",
+      "published_at": "2026-10-24",
+      "content_sha256": "62942d0a0c6c5e0c9dfc88ace2624f2fe0fe15780ee6c5db39461976da262b51"
+    }
+  ]
+}

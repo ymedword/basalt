@@ -1,6 +1,7 @@
 package tool_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -148,4 +149,34 @@ func TestRegistry_SatisfiesCoreToolResolver(t *testing.T) {
 	specs := resolver.Specs([]string{"read_file"})
 	require.Len(t, specs, 1)
 	require.Equal(t, "read_file", specs[0].Name)
+}
+
+// TestRegistry_DuplicateSemanticsUnchanged 是 US-14 的守点：新增"工具来源"视图
+// （offered / accepted / skipped）后，注册池的重名语义必须原样保留——拒绝、保留
+// 原注册（先注册者 = 内置赢家）、WARN 文案与键名不变。判别力：把注册池改成
+// "后到覆盖"或顺手改 WARN 文案 → 本用例红；工具来源只描述装配事实，不得反向
+// 修改注册池判据。
+// TestRegistry_DuplicateSemanticsUnchanged pins the duplicate semantics while the
+// disposition view is added: refused, original kept, warning text unchanged.
+func TestRegistry_DuplicateSemanticsUnchanged(t *testing.T) {
+	var logs bytes.Buffer
+	registry := tool.NewRegistry(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	builtin := newStubTool("read_file")
+	require.NoError(t, registry.Register(builtin), "内置工具先注册")
+
+	err := registry.Register(newStubTool("read_file"))
+	require.Error(t, err, "同名 MCP 工具必须被拒绝")
+	require.Contains(t, err.Error(), "工具重名：read_file 已在注册池内")
+
+	got, ok := registry.Resolve("read_file")
+	require.True(t, ok)
+	require.Same(t, builtin, got, "内置赢家：被拒的同名工具不得顶掉原注册")
+	require.Equal(t, []string{"read_file"}, registry.Names(), "被拒的注册不得进池")
+
+	output := logs.String()
+	require.Contains(t, output, "level=WARN")
+	require.Contains(t, output, "msg=拒绝重复注册的工具")
+	require.Contains(t, output, "tool=read_file")
+	require.Contains(t, output, "error=\"工具重名：read_file 已在注册池内\"")
 }

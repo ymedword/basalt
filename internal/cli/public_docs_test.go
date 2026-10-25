@@ -35,6 +35,49 @@ func TestPublicDocs_UseAgentFlag(t *testing.T) {
 			t.Fatalf("%s does not document basalt chat --agent", name)
 		}
 	})
+	// readme-examples：README 的四个公开增量区块必须存在，且 examples/ 链接指向真实文件。
+	// readme-examples: the four public additions exist and the examples link resolves.
+	t.Run("readme-examples", func(t *testing.T) {
+		const name = "README.md"
+		text := read(t, name)
+		for _, heading := range []string{"## Templates & demos", "## MCP catalog", "## Run a demo", "## What is verified"} {
+			if !strings.Contains(text, heading) {
+				t.Fatalf("%s is missing section %q", name, heading)
+			}
+		}
+		if !strings.Contains(text, "](examples/README.md)") {
+			t.Fatalf("%s does not link examples/README.md", name)
+		}
+		if _, err := os.Stat(filepath.Join(root, "examples", "README.md")); err != nil {
+			t.Fatalf("examples/README.md is not readable: %v", err)
+		}
+	})
+	// readme-private-links：README 是公开面，不得链接私有正文、过程目录与本地约定文件。
+	// readme-private-links: the public README must not link private documents or local-only files.
+	t.Run("readme-private-links", func(t *testing.T) {
+		const name = "README.md"
+		text := read(t, name)
+		for _, target := range []string{
+			"career/", "specs/", "harness/", "docs/us/", "docs/interview/", ".specify/", ".claude/",
+			"CLAUDE.md", "CLAUDE.local.md", ".gitmessage",
+		} {
+			for _, prefix := range []string{"](" + target, "](./" + target} {
+				if strings.Contains(text, prefix) {
+					t.Fatalf("%s links to private path %s", name, target)
+				}
+			}
+		}
+		for _, doc := range []string{
+			"Requirements.md", "TechnicalDesign.md", "DevelopmentLoop.md",
+			"IndustrySurvey.md", "Roadmap.md", "Compatibility.md",
+		} {
+			for _, prefix := range []string{"](" + doc, "](./" + doc, "](docs/" + doc, "](./docs/" + doc} {
+				if strings.Contains(text, prefix) {
+					t.Fatalf("%s links to private document %s", name, doc)
+				}
+			}
+		}
+	})
 	t.Run("requirements-local", func(t *testing.T) {
 		name := filepath.Join("docs", "Requirements.md")
 		if _, err := os.Stat(filepath.Join(root, name)); errors.Is(err, os.ErrNotExist) {

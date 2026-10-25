@@ -15,15 +15,18 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// McpServerDetail 是 MCP 详情端口的**内部**返回结构（人工 review ② F3）：契约在详情
-// 上声明了 ETag 响应头，但 `McpServerView` 没有该公开字段——ETag 只经响应头出站，
-// 响应体仍是逐字的 `McpServerView`。**不得**把 ETag 塞进公开视图凑头，也不得为本头
-// 新增契约外响应字段。
-// McpServerDetail carries the detail view plus a header-only ETag. The ETag never
-// enters the public body, which stays a verbatim McpServerView.
+// McpServerDetail 是 MCP 详情端口的**内部**返回结构（人工 review ② F3）：携带响应体
+// 需要的 `args` / `url`（契约 McpServerDetail）与只经响应头的 ETag。`McpServerView`
+// 本身没有 ETag 公开字段——**不得**把 ETag 塞进公开视图凑头，也不得新增契约外字段。
+// 2026-10-25 US-14 走查裁决：详情响应体按契约补齐 `args` / `url`（此前实现只回
+// 视图，导致详情页“修改”表单读 `args` 崩溃）。
+// McpServerDetail carries the body fields required by the contract (args/url) plus the
+// header-only ETag. The ETag never enters the public body.
 type McpServerDetail struct {
 	View McpServerView
 	ETag string
+	Args []string
+	URL  string
 }
 
 // ResourceReader 是资源只读面的消费方端口（模块卡 §3.1.8 的固定签名）：列表与详情
@@ -127,11 +130,11 @@ func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request, ac
 }
 
 // handleGetMCPServer 返回单个 MCP server 详情并设置 ETag 响应头（契约 GET
-// /mcp-servers/{name}；人工 review ② F3）：头值来自端口返回的内部结构，响应体仍是
-// 逐字 `McpServerView`——ETag **不得**作为公开字段出站。无发布版本（未入账的配置项）
-// 时 ETag 为空串，此时不设头，与技能 / 模型连接同一口径。
-// handleGetMCPServer sets the contract-declared ETag header from the port's internal
-// detail struct; the response body remains a verbatim McpServerView.
+// /mcp-servers/{name}；人工 review ② F3）：头值来自端口返回的内部结构，响应体按
+// 契约 `McpServerDetail` 输出视图 + `args` / `url`——ETag **不得**作为公开字段出站。
+// 无发布版本（未入账的配置项）时 ETag 为空串，此时不设头，与技能 / 模型连接同一口径。
+// handleGetMCPServer writes the contract detail body (view + args/url) and sets the
+// ETag header from the port's internal struct; the ETag never enters the body.
 func (s *Server) handleGetMCPServer(w http.ResponseWriter, r *http.Request, actor core.Actor) {
 	if !s.resourcesBound(w) {
 		return
@@ -145,7 +148,11 @@ func (s *Server) handleGetMCPServer(w http.ResponseWriter, r *http.Request, acto
 	if detail.ETag != "" {
 		w.Header().Set("ETag", detail.ETag)
 	}
-	s.writeOK(w, detail.View)
+	s.writeOK(w, McpServerDetailView{
+		McpServerView: detail.View,
+		Args:          nonNilStrings(detail.Args),
+		URL:           detail.URL,
+	})
 }
 
 // handleListModelConnections 返回模型连接列表：只回 `${ENV_VAR}` 引用名。

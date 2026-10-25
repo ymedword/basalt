@@ -16,7 +16,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -47,6 +49,40 @@ type MCPConnection struct {
 	Server string
 	Tools  []core.Tool
 }
+
+// MCPConnectFailure 是一条 server 的**结构化**连接失败（契约 D-05）：`Stage` 说明
+// 失败发生在哪一步，`Class` 说明属于哪一类可证明的失败。`Err` 只供日志与内部分类，
+// 视图**不得**暴露原文（可能含路径与凭据）。
+// MCPConnectFailure is one structured connect failure; Err is for logs only.
+type MCPConnectFailure struct {
+	Server string
+	Stage  string
+	Class  string
+	Err    error
+}
+
+// 阶段与分类的固定字面量逐字对齐契约 D-05（`complete` 与 `env_missing` 由装配层判定，
+// 连接池不产生）。
+// Stage and class literals mirror contract D-05; complete and env_missing are decided
+// by the assembly layer, never by the pool.
+const (
+	mcpStagePreflight  = "preflight"
+	mcpStageSpawn      = "spawn"
+	mcpStageInitialize = "initialize"
+	mcpStageToolsList  = "tools_list"
+)
+
+const (
+	mcpClassCommandNotFound       = "command_not_found"
+	mcpClassPermissionDenied      = "permission_denied"
+	mcpClassPolicyDenied          = "policy_denied"
+	mcpClassTimeout               = "timeout"
+	mcpClassHTTPUnauthorized      = "http_unauthorized"
+	mcpClassHTTPUnreachable       = "http_unreachable"
+	mcpClassHandshakeFailed       = "handshake_failed"
+	mcpClassToolsListFailed       = "tools_list_failed"
+	mcpClassDependencyUnconfirmed = "dependency_unconfirmed"
+)
 
 // MCPPoolOptions 是连接池的构造参数；`ConnectTimeout` 为零值取 30 秒缺省，
 // `Version` 进客户端实现标识，`Root` 是子进程工作目录（工作区根，约束 18）。
@@ -111,6 +147,9 @@ func NewMCPPool(opts MCPPoolOptions) *MCPPool {
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
+			// 非 2xx 在传输层变成可判别错误：SDK 对 401 / 403 只回字符串，
+			// 按文案分类会让改一句话就漂移（契约 D-05 禁止解析错误文案）。
+			Transport: mcpStatusTransport{base: http.DefaultTransport},
 		},
 	}
 	pool.dial = pool.dialTransport
@@ -119,16 +158,30 @@ func NewMCPPool(opts MCPPoolOptions) *MCPPool {
 
 // Connect 逐 server 串行连接并列出工具，按 specs 顺序返回连接结果。失败吸收（约束 28）：
 // dial / initialize / 列工具任一步失败只影响当前 server——WARN 固定键点名 + 关闭半截会话 +
-// 继续下一个；**只有整体 ctx 取消 / 截止**才作为池级错误返回（启动不中断）。
+// 继续下一个；**只有整体 ctx 取消 / 截止**才作为池级错误返回（启动不中断）。内部委托
+// `ConnectDetailed`，只丢弃结构化失败清单——启动语义与旧实现逐条一致。
 // Connect dials, initializes and lists tools per spec; per-server failures are absorbed
 // into a fixed-key warning and the loop continues. Only outer cancellation/deadline is an
-// error.
+// error. It delegates to ConnectDetailed and drops the structured failures.
 func (p *MCPPool) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]MCPConnection, error) {
+	conns, _, err := p.ConnectDetailed(ctx, specs)
+	return conns, err
+}
+
+// ConnectDetailed 与 `Connect` 同一套拨号 / 初始化 / 列工具流程，另把每条失败的
+// server 记成 `MCPConnectFailure`（stage + class，契约 D-05）。分类只来自**结构化**
+// 失败类型与进程状态，**不**解析 stderr / 日志文案。池级错误（外层取消 / 截止）仍是
+// 第三个返回值：此刻尚未归因的 server 不写失败项——否则取消会被伪装成一条 server 失败。
+// ConnectDetailed runs the same pipeline as Connect and also reports each failed server
+// as a structured failure. Classification reads only typed errors and process state;
+// outer cancellation returns a pool-level error without inventing a server failure.
+func (p *MCPPool) ConnectDetailed(ctx context.Context, specs []core.MCPServerConfig) ([]MCPConnection, []MCPConnectFailure, error) {
 	conns := make([]MCPConnection, 0, len(specs))
+	failures := make([]MCPConnectFailure, 0, len(specs))
 	for _, spec := range specs {
 		// 取消 / 截止是池级信号：后面不必再看（也已无预算可言）。
 		if err := ctx.Err(); err != nil {
-			return conns, err
+			return conns, failures, err
 		}
 		transport, err := p.dial(spec)
 		cmd := commandOfTransport(transport)
@@ -145,13 +198,17 @@ func (p *MCPPool) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]
 				"reason", "启动失败", "detail", safeErrorSummary(err))
 			// 取消 / 截止可能发生在拨号期间：失败已吸收，但池级信号不得跟着被吞。
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return conns, ctxErr
+				return conns, failures, ctxErr
 			}
+			stage, class := classifyDialFailure(err)
+			failures = append(failures, MCPConnectFailure{Server: spec.Name, Stage: stage, Class: class, Err: err})
 			continue
 		}
 		// 预算只罩下面两步；到点之前会话已建立、子进程已存活。
 		cctx, cancel := context.WithTimeout(ctx, p.connectTimeout)
 		session, err := p.client.Connect(cctx, transport, nil)
+		// 预算先取后放：cancel 之后 cctx.Err() 恒为非 nil，会把真实分类抹平成超时。
+		budgetErr := cctx.Err()
 		if err != nil {
 			cancel()
 			// SDK 在 Connect 失败路径已关闭连接（传输失败时根本没有进程），这里只兜底
@@ -165,11 +222,14 @@ func (p *MCPPool) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]
 				"reason", "初始化失败", "detail", safeErrorSummary(err))
 			// 父 ctx 已取消 / 截止 → 池级错误；只有预算单独到点（父 ctx 未结束）才跳过。
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return conns, ctxErr
+				return conns, failures, ctxErr
 			}
+			stage, class := classifyInitializeFailure(err, cmd, budgetErr)
+			failures = append(failures, MCPConnectFailure{Server: spec.Name, Stage: stage, Class: class, Err: err})
 			continue
 		}
 		tools, err := listAllTools(cctx, session)
+		budgetErr = cctx.Err()
 		if err != nil {
 			// 先整树、再关会话：Windows 上父进程一死，子进程关系即消失（见 closePooledSession）。
 			closeErr := closePooledSession(session, cmd)
@@ -181,8 +241,15 @@ func (p *MCPPool) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]
 			p.logger.Warn("MCP server 未连接——已跳过", "server", spec.Name,
 				"reason", "列工具失败", "detail", safeErrorSummary(err))
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return conns, ctxErr
+				return conns, failures, ctxErr
 			}
+			class := mcpClassToolsListFailed
+			if errors.Is(budgetErr, context.DeadlineExceeded) {
+				class = mcpClassTimeout
+			}
+			failures = append(failures, MCPConnectFailure{
+				Server: spec.Name, Stage: mcpStageToolsList, Class: class, Err: err,
+			})
 			continue
 		}
 		cancel()
@@ -200,9 +267,149 @@ func (p *MCPPool) Connect(ctx context.Context, specs []core.MCPServerConfig) ([]
 	// 最后一次成功连接的收尾也可能与父 ctx 取消同刻发生：失败分支都查过，成功路径
 	// 仍要复核一次，否则整体取消会被"最后一个 server 连接成功"掩盖。
 	if err := ctx.Err(); err != nil {
-		return conns, err
+		return conns, failures, err
 	}
-	return conns, nil
+	return conns, failures, nil
+}
+
+// classifyDialFailure 归类拨号阶段（preflight / spawn）的失败：策略拒绝来自预检，
+// 其余只看错误类型——**不**看文案。`fs.ErrNotExist` 刻意不归为"命令不存在"：
+// 带分隔符的相对入口也可能只是工作目录不在了，无法证明的东西一律 unconfirmed
+// （契约 C-06 的"不得把没有成功连接统一推断为未安装"）。
+// classifyDialFailure maps dial-stage errors by type only. fs.ErrNotExist stays
+// unconfirmed because a missing cwd is indistinguishable from a missing binary here.
+func classifyDialFailure(err error) (string, string) {
+	switch {
+	case errors.Is(err, core.ErrPolicyDenied):
+		return mcpStagePreflight, mcpClassPolicyDenied
+	case errors.Is(err, exec.ErrNotFound):
+		return mcpStageSpawn, mcpClassCommandNotFound
+	case errors.Is(err, fs.ErrPermission):
+		return mcpStageSpawn, mcpClassPermissionDenied
+	case errors.Is(err, context.DeadlineExceeded):
+		return mcpStageSpawn, mcpClassTimeout
+	default:
+		return mcpStageSpawn, mcpClassDependencyUnconfirmed
+	}
+}
+
+// classifyInitializeFailure 归类初始化阶段（spawn / initialize）的失败。判别顺序即
+// 判据强度：先认策略拒绝与 HTTP 状态（类型化），再认网络不可达（`*url.Error`），
+// 再认超时；进程始终没起来 → 启动阶段未归因；起来了但握手没过 → 握手失败。
+// `budgetErr` 是握手预算的终态（必须在 cancel 之前取值）。
+// classifyInitializeFailure orders checks by evidence strength; budgetErr must be
+// captured before the budget is canceled.
+func classifyInitializeFailure(err error, cmd *exec.Cmd, budgetErr error) (string, string) {
+	if errors.Is(err, core.ErrPolicyDenied) {
+		return mcpStagePreflight, mcpClassPolicyDenied
+	}
+	var statusErr *mcpHTTPStatusError
+	if errors.As(err, &statusErr) &&
+		(statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+		return mcpStageInitialize, mcpClassHTTPUnauthorized
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return mcpStageInitialize, mcpClassHTTPUnreachable
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(budgetErr, context.DeadlineExceeded) {
+		// 子进程根本没起来时的超时属于启动阶段；否则是握手预算用完。
+		if cmd != nil && cmd.Process == nil {
+			return mcpStageSpawn, mcpClassTimeout
+		}
+		return mcpStageInitialize, mcpClassTimeout
+	}
+	if cmd != nil && cmd.Process == nil {
+		// 命令传输存在、进程却没起来：按**结构化**证据归因（颗粒度文档 §2.4.3 第
+		// 668–670 行）。LookPath 失败（`exec.ErrNotFound`）确定是命令不存在；`ENOENT`
+		// 还要亲眼看住命令文件缺失——同一错误码也可能是工作目录或 shebang 解释器
+		// 缺失（Linux 上同码）；权限错误按权限不足。仍无法归因才落 unconfirmed，
+		// 不猜"未安装"（契约 C-06）。
+		// Child never started: attribute from typed evidence only; ENOENT additionally
+		// requires observing the command file missing (cwd / shebang interpreter can
+		// produce the same errno), otherwise stay unconfirmed.
+		switch {
+		case errors.Is(err, exec.ErrNotFound):
+			return mcpStageSpawn, mcpClassCommandNotFound
+		case errors.Is(err, fs.ErrNotExist) && commandFileMissing(cmd):
+			return mcpStageSpawn, mcpClassCommandNotFound
+		case errors.Is(err, fs.ErrPermission):
+			return mcpStageSpawn, mcpClassPermissionDenied
+		}
+		return mcpStageSpawn, mcpClassDependencyUnconfirmed
+	}
+	return mcpStageInitialize, mcpClassHandshakeFailed
+}
+
+// commandFileMissing 判断启动失败是否可归因到「命令文件本身不存在」：`fs.ErrNotExist`
+// 在子进程未起来时并不专属于命令文件——工作目录不存在（Linux 上 chdir 与 execve 同报
+// ENOENT）、shebang 解释器缺失、文件在 LookPath 之后被删都可能给出同一错误码。只有
+// 命令文件经 `os.Stat` 确认不存在、且工作目录确实存在时才敢报 `command_not_found`；
+// 其余一律交回调用方落 `dependency_unconfirmed`。相对入口按子进程的工作目录（`cmd.Dir`）
+// 解析——父进程的 cwd 不是它的 cwd。
+// commandFileMissing reports whether the missing path is provably the command file:
+// ENOENT alone is ambiguous, so the file must stat as non-existent while the child's
+// working directory exists. Relative entries resolve against cmd.Dir, not the parent cwd.
+func commandFileMissing(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Path == "" {
+		return false
+	}
+	if cmd.Dir != "" {
+		if _, err := os.Stat(cmd.Dir); err != nil {
+			// 工作目录本身不可用（缺失 / 无权限）：错误无法归因到命令文件。
+			return false
+		}
+	}
+	path := cmd.Path
+	if !filepath.IsAbs(path) && cmd.Dir != "" {
+		path = filepath.Join(cmd.Dir, path)
+	}
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// mcpHTTPStatusError 把 streamable HTTP 的非 2xx 响应变成**可判别**类型：SDK 对
+// 401 / 403 只返回字符串，类型化后才满足"分类不解析错误文案"的硬边界。
+// mcpHTTPStatusError makes non-2xx responses typeable so classification never parses
+// error strings.
+type mcpHTTPStatusError struct {
+	Status int
+}
+
+// Error 只写状态码与标准短语；不携带响应体（可能含服务端细节）。
+// Error reports the status code and standard phrase only.
+func (e *mcpHTTPStatusError) Error() string {
+	return fmt.Sprintf("MCP HTTP 响应状态异常: %d %s", e.Status, http.StatusText(e.Status))
+}
+
+// mcpStatusTransport 在传输层拦非 2xx：响应体读完关闭（不参与协议解析，也不泄漏
+// 连接），再返回类型化错误。`base` 为空时用 `http.DefaultTransport`。
+// mcpStatusTransport turns non-2xx responses into typed errors and closes the body.
+type mcpStatusTransport struct {
+	base http.RoundTripper
+}
+
+// RoundTrip 透传 2xx，非 2xx 返回 `*mcpHTTPStatusError`。
+// RoundTrip passes 2xx through and returns a typed error otherwise.
+func (t mcpStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return resp, nil
+	}
+	// 非 2xx 的正文对协议层没有价值，按 RoundTripper 契约关闭；关闭本身失败时
+	// 与状态错误合并上报，不静默丢弃。
+	statusErr := &mcpHTTPStatusError{Status: resp.StatusCode}
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		return nil, errors.Join(statusErr, closeErr)
+	}
+	return nil, statusErr
 }
 
 // safeErrorSummary 把连接期错误映射到**固定短语集**（约束 28）：命令名 / server 消息 /
@@ -291,25 +498,36 @@ func commandOfTransport(transport mcp.Transport) *exec.Cmd {
 	return commandTransport.Command
 }
 
-// dialCommand 构造真实子进程传输：`Command` 是**单个可执行名**，参数只从 `Args` 逐项
+// NewMCPCommand 构造一次 stdio 启动的 `*exec.Cmd`，是**启动与诊断共用的唯一构造器**
+// （契约 C-04）：诊断只读 `cmd.Err` / `cmd.Path` / `os.Stat`，绝不 `Start`；`dialCommand`
+// 也经它构造，两处字段永远同源。`Command` 是**单个可执行名**，参数只从 `Args` 逐项
 // 原样进入 argv（约束 8——命令与参数已在解析层分开，本层**不得**再按空白拆分，
 // 否则解析层的严格校验会被运行时悄悄绕过）；`exec.Command` 而不是
 // `exec.CommandContext`——进程生命周期不绑握手预算（约束 27）；工作目录 = 工作区根，
 // 环境 = 白名单透传 + 配置声明（约束 17 / 18）。
-// dialCommand builds the real subprocess transport. Command is one executable name and
-// Args enter argv one-for-one; this layer never splits on whitespace. The process is
-// not bound to any context.
-func (p *MCPPool) dialCommand(spec core.MCPServerConfig) (mcp.Transport, error) {
+// NewMCPCommand builds the stdio *exec.Cmd shared by launch and diagnosis. Command is
+// one executable name and Args enter argv one-for-one; nothing here starts a process.
+func NewMCPCommand(spec core.MCPServerConfig, root string, envPassthrough []string) (*exec.Cmd, error) {
 	command := strings.TrimSpace(spec.Command)
 	if command == "" {
 		return nil, errors.New("command 为空")
 	}
 	// #nosec G204 -- 豁免理由：① argv 只来自管理员登记的 mcp_servers.yaml（受信配置面，加载期已拒绝式校验；command = 单可执行名、args 逐项直执），不经 shell，配置字面量不能变成可注入命令行；② G204 只接受常量实参，配置驱动 argv 静态不可见，无法用代码消除（陷阱 #56）；③ 消除它只能改走 os.StartProcess 或手工拼 exec.Cmd（掩盖审计点、偏离颗粒度文档 §2.3 的 exec.Command 决定），二者都更差（用户 2026-10-17 裁决）。
 	cmd := exec.Command(command, spec.Args...)
-	cmd.Dir = p.root
-	cmd.Env = mergeChildEnv(p.envPassthrough, spec.Env)
+	cmd.Dir = root
+	cmd.Env = mergeChildEnv(envPassthrough, spec.Env)
 	// Unix 上先把子进程放进独立进程组，停止时才能按组回收整棵树（约束 19 / 22）。
 	configureMCPChildProcess(cmd)
+	return cmd, nil
+}
+
+// dialCommand 用共享构造器建出命令后包成命令传输——**不复制**构造逻辑（契约 C-04）。
+// dialCommand wraps the shared constructor; it never duplicates the construction.
+func (p *MCPPool) dialCommand(spec core.MCPServerConfig) (mcp.Transport, error) {
+	cmd, err := NewMCPCommand(spec, p.root, p.envPassthrough)
+	if err != nil {
+		return nil, err
+	}
 	return &mcp.CommandTransport{Command: cmd}, nil
 }
 

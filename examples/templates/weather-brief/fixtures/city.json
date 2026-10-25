@@ -1,0 +1,23 @@
+{
+  "fixture_note": "固定响应样本，内容虚构，仅用于离线复跑模板规则；不是任何真实城市的天气读数。",
+  "city": "上海",
+  "latitude": 31.2304,
+  "longitude": 121.4737,
+  "preference": {
+    "source": "缺省偏好",
+    "umbrella_mm": 0.5,
+    "heat_c": 32.0,
+    "unit": "celsius"
+  },
+  "forecast": {
+    "latitude": 31.2304,
+    "longitude": 121.4737,
+    "timezone": "Asia/Shanghai",
+    "daily": {
+      "time": ["2026-10-25", "2026-10-26", "2026-10-27"],
+      "temperature_2m_max": [24.1, 27.6, 33.2],
+      "temperature_2m_min": [18.3, 20.4, 26.8],
+      "precipitation_sum": [0.0, 6.4, 0.2]
+    }
+  }
+}

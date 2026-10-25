@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 固定响应样本，内容虚构（标题与摘要均为占位），仅用于离线复跑模板规则。 -->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>arXiv Query: search_query=cat:cs.AI</title>
+  <id>http://arxiv.org/api/fixture</id>
+  <updated>2026-10-24T09:20:00Z</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">6</opensearch:totalResults>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10001v1</id>
+    <updated>2026-10-24T09:12:00Z</updated>
+    <published>2026-10-24T09:12:00Z</published>
+    <title>Tool-Call Trajectories as a First-Class Audit Unit</title>
+    <summary>We describe how a tool invocation log can be replayed as a trajectory with stable identifiers and explicit failure classes.</summary>
+    <author><name>Ada Fixture</name></author>
+    <category term="cs.AI"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10002v2</id>
+    <updated>2026-10-23T16:40:00Z</updated>
+    <published>2026-10-20T08:00:00Z</published>
+    <title>Sandboxed Shell Access for Small Agent Runtimes</title>
+    <summary>A note on argv-based command policy for single-binary agent servers.</summary>
+    <author><name>Bo Fixture</name></author>
+    <author><name>Chen Fixture</name></author>
+    <category term="cs.AI"/>
+    <category term="cs.CR"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10003v1</id>
+    <updated>2026-10-22T23:05:00Z</updated>
+    <published>2026-10-22T23:05:00Z</published>
+    <title>Memory Baselines for Daily Diff Agents</title>
+    <summary>Storing a content hash per document as the memory baseline instead of the document text.</summary>
+    <author><name>Dana Fixture</name></author>
+    <category term="cs.AI"/>
+    <category term="cs.SE"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10004v1</id>
+    <updated>2026-10-21T20:00:00Z</updated>
+    <published>2026-10-18T10:00:00Z</published>
+    <title>Prompt Caching for Scheduled Batch Agents</title>
+    <summary>Evaluating cache windows against a fixed daily schedule.</summary>
+    <author><name>Eli Fixture</name></author>
+    <category term="cs.AI"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10005v1</id>
+    <updated>2026-10-21T11:30:00Z</updated>
+    <published>2026-10-19T12:00:00Z</published>
+    <title>Deterministic Fixtures for Agent Evaluation</title>
+    <summary>On keeping fixture bytes stable so that a replay is comparable across machines.</summary>
+    <author><name>Fay Fixture</name></author>
+    <category term="cs.AI"/>
+    <category term="cs.SE"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2610.10006v1</id>
+    <updated>not-a-timestamp</updated>
+    <published>2026-10-23T06:00:00Z</published>
+    <title>Unparseable Timestamp Example</title>
+    <summary>Fixture entry whose updated field is deliberately invalid to exercise the "待确认" path.</summary>
+    <author><name>Gus Fixture</name></author>
+    <category term="cs.AI"/>
+  </entry>
+</feed>

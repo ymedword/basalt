@@ -22,6 +22,11 @@ import (
 	"slices"
 	"time"
 
+	// 别名：本文件里 `catalog` 是运行期模型目录的局部变量（providerCatalog），
+	// 只读 MCP 目录用 `mcpcat` 以免两件事共用一个标识符。
+	// Aliased: `catalog` below is the runtime provider catalog, a different thing.
+	mcpcat "github.com/ymedword/basalt/internal/catalog"
+
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/memory"
@@ -327,6 +332,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		AllowedDomains:  cfg.HTTP.AllowedDomains,
 	})
 	registry := tool.NewRegistry(logger)
+	// 工具来源表（US-14 D-06）与注册池**同生共死**：注册池只存 `core.Tool`，来源与跳过
+	// 原因是装配期事实，因此在这里建表、在内置注册与 `OnConnected` 两处登记，最后挂到
+	// `mcpRT` 上供视图读取。表只写装配期，运行期只读——不改注册池的重名语义。
+	// The disposition table is built beside the registry and filled at both registration
+	// sites; it records assembly facts only and never changes duplicate semantics.
+	dispositions := newMCPDispositionTable()
 	// 受控本地执行器在**本 US 首次接线**（US-4 交付了实现与用例、零生产调用点）：shell 工具
 	// 持有的是 `core.CommandRunner` 接口，具体实现在这里一处选定（宪法 VI）。装配上限接
 	// `budget.max_output_bytes` 而**不是** 0——传 0 会让读取侧恒用 256 KB 缺省，配置收紧的
@@ -368,6 +379,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
 		}
+		// 内置先注册即先占名（D-06）：同名 MCP 工具随后注册必然失败，赢家来源一处可查，
+		// 不必从注册池反推。
+		// Builtins register first and therefore own their names; the table records the win.
+		dispositions.recordBuiltin(t.Name())
 	}
 	// 注册池必须与**声明名集**（`declaredToolNames`）逐名一致：轻路径（`profile list` /
 	// `profile show`）不建注册池，Agent 的装载判定拿的就是那份声明——两者漂移会让同一份
@@ -410,6 +425,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			err = errors.Join(err, mcpSupervisor.Close())
 		}
 		return nil, abortRuntime(err, db, lock)
+	}
+
+	// MCP 目录是**编译期内嵌快照**（D-01）：一次解析、全进程共享——请求期不重读文件、
+	// 不联网、不启动进程。解析失败是发布缺陷，按装配失败关闭：**不得**用空目录充数，
+	// 那会让页面显示"一条配方都没有"而不是"这版制品坏了"。
+	// The catalog is a build-time snapshot parsed once here; a parse failure is a release
+	// defect and aborts startup instead of silently serving an empty catalog.
+	mcpCatalogSnapshot, err := mcpcat.Builtin()
+	if err != nil {
+		return fail(fmt.Errorf("解析 MCP 目录快照: %w", err))
 	}
 
 	// ⑥ 注册池名字集喂装载器：workspace **不得**反向 import tool，名字在装配期一次导出
@@ -627,7 +652,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		OnConnected: func(conns []tool.MCPConnection) {
 			for _, conn := range conns {
 				for _, t := range conn.Tools {
-					if regErr := registry.Register(t); regErr != nil {
+					regErr := registry.Register(t)
+					// 每条 offered 工具都进来源表：注册成功记赢家，重名记跳过并写明赢家
+					// 来源（D-06）。注册池自身的行为一个字都不改——失败照旧跳过。
+					// Every offered tool is recorded; the registry's own semantics stay.
+					dispositions.recordMCP(conn.Server, t.Name(), regErr)
+					if regErr != nil {
 						continue
 					}
 				}
@@ -666,6 +696,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return fail(fmt.Errorf("启动 MCP supervisor: %w", err))
 	}
 	mcpRT := newMCPRuntimeFromSupervisor(mcpSupervisor, mcpPublishedConfigs(publishedMCP))
+	// 来源表挂在运行期句柄上（视图经 `mcpRT.ToolDisposition` 读）：supervisor 的
+	// `OnConnected` 已在上面写完本表，此处只做一次引用交付，不复制。
+	// The table is handed to the runtime handle once; the view reads it through there.
+	mcpRT.dispositions = dispositions
 
 	// 第二遍装载 = 注册表的构建来源（约束 18 / T032）：装载器在目录之后重建，Provider
 	// 名集取**已发布版本**的键（`catalogProviderNames` 显式枚举、升序），不再读
@@ -908,7 +942,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Gate:             resourceGate,
 		Catalog:          catalogStore,
 		Supervisor:       mcpSupervisor,
-		Credentials:      credentials,
+		// 诊断的命令定位面与启动**共用**构造器（C-04）：root 与 env passthrough 必须与
+		// supervisor 连接时是同一份值，否则同一条配置在诊断与启动两条路上给出不同结论。
+		// The diagnosis locator mirrors launch: same root, same env passthrough.
+		DiagnoseMCP: func(spec core.MCPServerConfig) core.MCPCommandDiagnosis {
+			return diagnoseMCPCommand(spec, root, cfg.Shell.EnvPassthrough)
+		},
+		Credentials: credentials,
 		// 发布编排经同一份解析器做凭据写 / 绑定检查（保存前的"能不能解"、发布前的目标
 		// 绑定比对），主密钥路径与启动校验因此只有一处来源。
 		// Publishing reuses the assembly's resolver for credential checks.
@@ -1028,6 +1068,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		notifyAdmin:      notifyAdmin,
 		channelRead:      channelRead,
 		catalogStore:     catalogStore,
+		// 目录快照在重路径开头解析一次（见 `mcpcat.Builtin` 处）：保留端口实例让
+		// `webOptions` 逐字段投影，管理台读到的就是这份快照，请求期零解析。
+		// The parsed catalog snapshot travels as a port so webOptions can project it.
+		mcpCatalog: &mcpCatalogPort{catalog: mcpCatalogSnapshot},
 		// 写面的 web 端口在这里**一次装配**：Agent 端口 8 个方法已齐，作者配置取命令面
 		// 已装载的那一份（命令层装载一次、装配层冻结）；资源端口 13 个方法全部转调本
 		// 实例——MCP 与技能方法族先后由 T048 / T053 接上，本 US 不再有失败关闭桩；
@@ -1446,6 +1490,13 @@ type heavyRuntime struct {
 	// 也不与写面共享锁或存储。
 	// workspaceBrowse is the one read-only workspace browser; the web port projects it.
 	workspaceBrowse *WorkspaceBrowse
+
+	// mcpCatalog 是只读 MCP 目录端口（US-14 D-01）：包着装配期解析好的那份快照，
+	// 请求期零解析、零文件读、零进程。nil 表示本次装配没有目录（轻路径），此时
+	// `webOptions` **不**注入——目录端点按固定 500 装配缺失失败关闭。
+	// mcpCatalog wraps the snapshot parsed at assembly; nil means "not assembled", and
+	// webOptions leaves the port unset so the endpoint fails closed with a fixed 500.
+	mcpCatalog *mcpCatalogPort
 
 	// catalogStore 是运行期目录的原子持有者：资源发布在此替换，T032 之后准入与模型
 	// 调用从这里读取——保留句柄让装配面可核"写面和读面确实是同一个持有者"。

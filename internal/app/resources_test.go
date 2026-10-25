@@ -742,10 +742,16 @@ func TestRunResources_ResourceViewsBlockDefinition(t *testing.T) {
 	mcp := "  - name: files\n" +
 		"    transport: stdio\n" +
 		"    command: npx\n" +
+		"    args: [\"--root\", \"docs\"]\n" +
 		"    env:\n" +
 		"      FS_TOKEN: ${FS_TOKEN}\n"
 	mcpVersion := env.seedVersion(t, core.ResourceMCPServer, "files", mcp, "", "")
 	env.publish(t, core.ResourceMCPServer, "files", mcpVersion.ID, true)
+	remote := "  - name: remote\n" +
+		"    transport: http\n" +
+		"    url: https://mcp.example.test/sse\n"
+	remoteVersion := env.seedVersion(t, core.ResourceMCPServer, "remote", remote, "", "")
+	env.publish(t, core.ResourceMCPServer, "remote", remoteVersion.ID, true)
 
 	views := NewResourceViews(env.versions, env.lifecycle, newMCPRuntime(nil, nil), env.credentials, ResourceViewDeps{})
 
@@ -762,6 +768,14 @@ func TestRunResources_ResourceViewsBlockDefinition(t *testing.T) {
 	require.Equal(t, "npx", detail.View.Command)
 	require.Equal(t, []string{"FS_TOKEN"}, detail.View.EnvKeys)
 	require.Equal(t, mcpVersion.ID, detail.View.PublishedVersionID)
+	// 2026-10-25 US-14 走查裁决：详情按契约 McpServerDetail 回 args / url（块式列表形态
+	// 同样可解析），供详情页“修改”表单预填；列表视图仍不含这两个字段。
+	require.Equal(t, []string{"--root", "docs"}, detail.Args)
+	require.Empty(t, detail.URL, "stdio 传输的 url 为空")
+	remoteDetail, err := views.McpServer(ctx, "remote")
+	require.NoError(t, err)
+	require.Equal(t, "https://mcp.example.test/sse", remoteDetail.URL)
+	require.Empty(t, remoteDetail.Args)
 }
 
 // TestRunResources_ResourceViewsRedactCredentials 覆盖只读视图的凭证红线（约束 35）：
@@ -805,6 +819,15 @@ func TestRunResources_ResourceViewsRedactCredentials(t *testing.T) {
 		require.NotContains(t, body, "plaintext-secret")
 		require.NotContains(t, body, "--token")
 	}
+
+	// 详情多回 args / url（契约 McpServerDetail），红线不变：参数只取 `args:` 声明，
+	// 命令原文里的参数不入详情；env 值仍不出站。
+	detail, err := env.views.McpServer(ctx, "web")
+	require.NoError(t, err)
+	require.Equal(t, "npx", detail.View.Command, "详情同样只回可执行名")
+	require.Empty(t, detail.Args, "定义没有 args 声明时不得凭空造参数")
+	require.Empty(t, detail.URL)
+	require.Equal(t, []string{"MCP_TOKEN", "OTHER"}, detail.View.EnvKeys)
 }
 
 // TestRunResources_ResourceViewsPendingRestartAndReferencedBy 覆盖需重启标记与未释放

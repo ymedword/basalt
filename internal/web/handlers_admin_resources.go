@@ -269,6 +269,46 @@ func (s *Server) handleAdminTestMCPServer(w http.ResponseWriter, r *http.Request
 	s.writeOK(w, mcpServerTestResultView(result))
 }
 
+// handleAdminMCPCatalog 处理 `GET /catalog/mcp`（契约 D-01）：只读投影内嵌目录快照。
+// 目录在构建期解析一次，请求期不读工作区、不启动进程、不写操作行，因此不需要 actor
+// 参与任何判定。缺端口是**装配错误**，回固定 500 而不是空目录——空数组会让页面显示
+// "没有推荐配方"，与装配故障不可区分。
+// handleAdminMCPCatalog serves the embedded read-only catalog. A missing port is an
+// assembly error, never an empty catalog, which the page could not tell apart.
+func (s *Server) handleAdminMCPCatalog(w http.ResponseWriter, r *http.Request, _ core.Actor) {
+	if s.opts.MCPCatalog == nil {
+		s.writeAdminPortMissing(w, "MCPCatalog", "GET /catalog/mcp")
+		return
+	}
+	snapshot, err := s.opts.MCPCatalog.ListMCPCatalog(r.Context())
+	if err != nil {
+		s.logger().Error("读取 MCP 目录失败", "error", err)
+		s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
+		return
+	}
+	s.writeOK(w, mcpCatalogView(snapshot))
+}
+
+// handleAdminMCPDiagnostics 处理 `GET /mcp-servers/{name}/diagnostics`（契约 D-02）：
+// 只读诊断。它不建立连接、不写操作行，也**不**预判测试结果——诊断给出 `unconfirmed`
+// 时测试仍须真实尝试，分类由真实错误给出（FR12）。名称不存在走
+// `writeResourceAdminError` 的既有 NOT_FOUND 映射，**不**另造诊断专用码。
+// handleAdminMCPDiagnostics serves the read-only diagnosis and reuses the existing
+// NOT_FOUND mapping; it never predicts a test outcome.
+func (s *Server) handleAdminMCPDiagnostics(w http.ResponseWriter, r *http.Request, actor core.Actor) {
+	name := r.PathValue("name")
+	if s.opts.ResourceAdminService == nil {
+		s.writeAdminPortMissing(w, "ResourceAdminService", "GET /mcp-servers/{name}/diagnostics")
+		return
+	}
+	diagnosis, err := s.opts.ResourceAdminService.DiagnoseMCPServer(r.Context(), actor, name)
+	if err != nil {
+		s.writeResourceAdminError(w, err, name, "诊断 MCP server")
+		return
+	}
+	s.writeOK(w, mcpServerDiagnosticsView(diagnosis))
+}
+
 // handleAdminCreateSkill 处理 `POST /skills`：创建骨架并发布 version 1。响应按契约
 // 只回 `SkillView`（`openapi.yaml` 的 data 是 SkillView，文件清单只在详情端点给）；
 // 名字规则、骨架正文与同名 409 都在适配器内判定，本层不落盘、不补写编排。

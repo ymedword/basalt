@@ -1,0 +1,78 @@
+{
+  "queries": [
+    {
+      "query": "enterprise AI agent platform observability 2026",
+      "results": [
+        {
+          "title": "企业级 Agent 平台的审计与可观测设计（2026 版）",
+          "url": "https://example.com/reports/agent-platform-observability-2026",
+          "description": "一份面向金融与能源行业的调研：把审计、追踪与预算控制列为自托管 Agent 平台的三个硬门槛。",
+          "page_age": "2026-10-23T00:00:00"
+        },
+        {
+          "title": "自托管 Agent 运行时：从单机到多节点的取舍",
+          "url": "https://example.com/blog/self-hosted-agent-runtime",
+          "description": "讨论单二进制交付与多节点调度之间的成本、故障恢复与一致性代价。",
+          "page_age": "2026-10-21T00:00:00"
+        },
+        {
+          "title": "企业 Agent 采用率调查：审计留痕成为首要门槛",
+          "url": "https://example.com/news/enterprise-agent-adoption",
+          "description": "面向 240 家企业的问卷摘要，覆盖采用率、预算与合规关注点。",
+          "page_age": "2026-10-19T00:00:00"
+        },
+        {
+          "title": "审计链路设计：预写记录与终态更新",
+          "url": "https://example.com/analysis/audit-trail-design",
+          "description": "拆解 fail-closed 审计的实现：先落 pending、再发调用、返回后更新终态。",
+          "page_age": "2026-10-18T00:00:00"
+        }
+      ]
+    },
+    {
+      "query": "AI agent runtime self-hosted audit trail",
+      "results": [
+        {
+          "title": "企业级 Agent 平台的审计与可观测设计（2026 版）",
+          "url": "https://example.com/reports/agent-platform-observability-2026",
+          "description": "同一份调研在英文检索里再次命中。",
+          "page_age": "2026-10-23T00:00:00"
+        },
+        {
+          "title": "工具沙箱的四种模式与适用边界",
+          "url": "https://example.com/guides/tool-sandbox-patterns",
+          "description": "白名单、容器、只读投影与外部执行器四种模式的能力边界对照。",
+          "page_age": "2026-10-17T00:00:00"
+        },
+        {
+          "title": "Agent OS 选型对比：托管、自托管与混合",
+          "url": "https://example.com/vendor/agent-os-comparison",
+          "description": "厂商视角的对比表，缺少发布日期，需按「未确认」处理。"
+        }
+      ]
+    },
+    {
+      "query": "agent tool sandbox enterprise deployment",
+      "results": [
+        {
+          "title": "自托管 Agent 运行时：从单机到多节点的取舍",
+          "url": "https://example.com/blog/self-hosted-agent-runtime",
+          "description": "同一篇文章在第三个查询里再次命中。",
+          "page_age": "2026-10-21T00:00:00"
+        },
+        {
+          "title": "运行时成本控制：按调用计量与预算熔断",
+          "url": "https://example.com/blog/runtime-cost-controls",
+          "description": "按 Run 计量、按调用方配额与预算熔断的三种实现路径。",
+          "page_age": "2026-10-20T00:00:00"
+        },
+        {
+          "title": "一次沙箱逃逸复盘：配置错误的三种形态",
+          "url": "https://example.com/news/sandbox-incident-review",
+          "description": "复盘文章，正文需要登录后才能访问，本 Run 未抓取。",
+          "page_age": "2026-10-16T00:00:00"
+        }
+      ]
+    }
+  ]
+}

@@ -380,6 +380,27 @@ func agentFileSet(view AgentFilesView) web.AgentFileSet {
 	}
 }
 
+// mcpCatalogPort 把装配期解析好的只读 MCP 目录快照适配成 `web.MCPCatalogReader`
+// （US-14 D-01）。它只有一份内存数据：请求期不重读文件、不联网、不启动进程、不写
+// 操作行——目录是"配方建议"，不是运行配置。解析与校验已在装配期完成，因此这里也
+// 没有"读失败"的分支；快照一旦不可解析，启动就已经失败关闭。
+// 调用方**不得**改写返回值里的切片：`Items` 是共享快照，视图层只做投影。
+// mcpCatalogPort serves the snapshot parsed at assembly. Callers must not mutate the
+// returned slices: the items are shared and the view layer only projects them.
+type mcpCatalogPort struct {
+	catalog core.MCPCatalog
+}
+
+// 编译期断言：目录端口形状一旦变化，在这里先红。
+// Compile-time assertion: the catalog port shape is fixed at this line.
+var _ web.MCPCatalogReader = mcpCatalogPort{}
+
+// ListMCPCatalog 返回整份快照（已按 id 升序，排序由解析层保证，本层不再排序）。
+// ListMCPCatalog returns the whole snapshot; ordering is already guaranteed upstream.
+func (p mcpCatalogPort) ListMCPCatalog(context.Context) (core.MCPCatalog, error) {
+	return p.catalog, nil
+}
+
 // resourceAdminPort 把 `*ResourceAdmin` 适配成 `web.ResourceAdminService`（`writeServices.resourceAdmin`
 // 的唯一实现，§3.1.8 第 2 个端口）。全部方法只做形状投影与转调：`Versions`
 // 把版本行补上指针状态与撤回来源（与 `VersionDetail` 同一派生口径，**不**在 web 层
@@ -395,8 +416,8 @@ type resourceAdminPort struct {
 	read web.ResourceReader
 }
 
-// 编译期断言：13 个方法一旦与端口形状对不上，在这里先红（与 agentAdminPort 同一纪律）。
-// Compile-time assertion: all thirteen methods must match the consumer-side port.
+// 编译期断言：15 个方法一旦与端口形状对不上，在这里先红（与 agentAdminPort 同一纪律）。
+// Compile-time assertion: all fifteen methods must match the consumer-side port.
 var _ web.ResourceAdminService = resourceAdminPort{}
 
 // UpsertModelConnection 把线上请求投影成编排层请求：空 `ifMatch` 表示创建（POST），
@@ -606,6 +627,15 @@ func (p resourceAdminPort) TestModelConnection(ctx context.Context, actor core.A
 // TestMCPServer forwards the one-shot connection test against the published version.
 func (p resourceAdminPort) TestMCPServer(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error) {
 	return p.admin.TestMCPServer(ctx, actor, name)
+}
+
+// DiagnoseMCPServer 转调只读诊断（US-14 D-02）；本层不做任何补写或缓存——诊断的
+// "零进程、零操作行"由编排层保证，适配器只转手。
+// DiagnoseMCPServer forwards the read-only diagnosis untouched.
+func (p resourceAdminPort) DiagnoseMCPServer(ctx context.Context, actor core.Actor,
+	name string,
+) (core.MCPServerDiagnosis, error) {
+	return p.admin.DiagnoseMCPServer(ctx, actor, name)
 }
 
 // notifyAdminPort 把 `*NotifyAdmin` 适配成 `web.NotifyAdminService`（`writeServices.notifyAdmin`
@@ -863,6 +893,15 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, a.nowOr())
 	}
 	opts.Sampler = web.NewSampler(a.nowOr())
+
+	// 只读 MCP 目录与的写路径**无关**（它是快照，不是资源写面的一部分），因此在这道
+	// 依赖完整性闸门之前注入：写面缺件不应连带把目录页打成 500。裸 nil 指针装进接口会
+	// 变成"非 nil 接口 + nil 接收者"（与下方 scheduler 同一纪律），所以显式判空。
+	// The read-only catalog is independent of the write surface, so it is projected
+	// before the completeness gate; a nil pointer must not become a non-nil interface.
+	if rt.mcpCatalog != nil {
+		opts.MCPCatalog = rt.mcpCatalog
+	}
 
 	// AgentAdmin 需要完整写路径（编辑器 → 快照 / 操作 / 注册表 / 调度 + 装载期校验器）。
 	// 缺任一依赖时不装配：内容端点按 500 拒绝比"写了一半再失败"安全。

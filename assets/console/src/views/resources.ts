@@ -9,7 +9,7 @@ import { ResourceForm } from '../components/resource-form'
 import { DataTable, Notice, shortHash } from '../components/ui'
 import type { TableRow } from '../components/ui'
 import type { ResourceKind } from '../router'
-import { resourceDetailHref } from '../router'
+import { mcpCatalogHref, resourceDetailHref } from '../router'
 import {
   AVAILABILITY_LABELS,
   availabilityTone,
@@ -29,7 +29,8 @@ const KIND_LABELS: Record<ResourceKind, string> = {
 
 const KIND_NOTES: Record<ResourceKind, string> = {
   skills: '工作区已发布的技能。Agent 通过配置引用，运行使用准入时固定的版本。',
-  'mcp-servers': '查看 MCP 服务的连接状态、工具与已应用版本。这里只展示环境变量键名。',
+  'mcp-servers':
+    '查看 MCP 服务的连接状态、工具与已应用版本。这里只展示环境变量键名；连接状态不是连接测试结果，测试与诊断在详情页分轴显示。',
   'model-connections':
     '列表只列名称、默认模型、使用范围与本地配置就绪；地址、凭据、版本、所有者与配置引用 Agent 都在详情页。本地配置就绪不代表已实测连通——实测结果与时间单独记录，两种信息不互相冒充。',
 }
@@ -118,7 +119,10 @@ export const ResourcesView = defineComponent({
             item.transport,
             item.command,
             item.env_keys.length === 0 ? '无' : item.env_keys.join('、'),
-            item.connected ? '已连接' : '未连接',
+            // 未配置就是“—”：不把“没配置过”渲染成“连不上”。列表只有连接与工具
+            // 两列事实；连接测试结果与诊断在详情页分轴显示，不在此合并。
+            // Unconfigured is "—", never "disconnected"; test results stay on detail.
+            item.published_version_id === 0 ? '—' : item.connected ? '已连接' : '未连接',
             item.tools.length === 0 ? '无' : item.tools.join('、'),
             `v${item.published_version_no}`,
             `v${item.applied_version_no}`,
@@ -189,7 +193,14 @@ export const ResourcesView = defineComponent({
           'RESOURCES / ' + (kind === 'skills' ? '05' : kind === 'mcp-servers' ? '04' : '03'),
           kind === 'mcp-servers' ? '工具与 MCP' : KIND_LABELS[kind],
           KIND_NOTES[kind],
-          h('button', { type: 'button', class: 'primary', onClick: openForm }, '新建'),
+          // MCP 服务页多一个“目录”入口：配方库只读，选一条再回来新建。
+          // The MCP page also links to the read-only recipe catalog.
+          h('div', { class: 'form-actions' }, [
+            kind === 'mcp-servers'
+              ? h('a', { class: 'button', href: mcpCatalogHref() }, 'MCP 目录')
+              : null,
+            h('button', { type: 'button', class: 'primary', onClick: openForm }, '新建'),
+          ]),
         ),
         ...content,
         h(

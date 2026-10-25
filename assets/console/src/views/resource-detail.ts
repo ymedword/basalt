@@ -1,23 +1,30 @@
 // 资源详情视图（/console/resources/:kind/:id）：版本列表 / 版本详情、发布 /
 // 撤回（用旧版本内容创建新版本）、删除、引用面板与一次性连接测试；
-// R4 追加模型连接的范围卡片（共享 ⇄ 专属）与托管凭据卡片（撤销确认）。
+// R4 追加模型连接的范围卡片（共享 ⇄ 专属）与托管凭据卡片（撤销确认）；
+// US-14 追加 MCP 四轴（配置 / 连接 / 上次测试 / 依赖诊断）与操作详情展开。
 // 条件写一律使用详情 GET 返回的响应头 ETag；412 重新读取 ETag 与版本列表并
 // **保留**已选版本；409 / 400 展示服务端固定文案与点名；写成功后重新 GET。
 // Resource detail: versions, publish/revert, delete, references and one-shot
 // connection tests, plus the R4 scope and managed-credential cards. Conditional
 // writes use the detail GET's ETag; a 412 re-reads the ETag while keeping the
 // selected version. No optimistic updates.
-import { computed, defineComponent, h, ref, watch } from 'vue'
+import { computed, defineComponent, h, onMounted, ref, watch } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import { ApiError, errorMessage, resourceErrorCopy } from '../api'
 import type {
   ConnectionTestView,
+  McpCommandReason,
+  McpCommandState,
+  McpDiagnosticWarning,
+  McpServerDiagnostics,
   McpServerView,
   ModelConnectionView,
+  OperationDetail,
   ResourceScope,
   SkillView,
 } from '../api'
 import { adminApi } from '../api-admin'
+import { catalogApi } from '../api-catalog'
 import type {
   AdminResourceKind,
   McpServerTestResult,
@@ -42,14 +49,16 @@ import {
   shortHash,
 } from '../components/ui'
 import type { TableRow } from '../components/ui'
-import { resourceHref } from '../router'
+import { CONSOLE_BASE, resourceHref } from '../router'
 import type { ResourceKind } from '../router'
 import {
   AVAILABILITY_LABELS,
+  OPERATION_STATUS_LABELS,
   availabilityTone,
   badge,
   definitions,
   identifier,
+  operationStatusTone,
   pageHeading,
   section,
   useLoader,
@@ -73,6 +82,72 @@ const ADMIN_KINDS: Record<ResourceKind, AdminResourceKind> = {
   skills: 'skill',
   'mcp-servers': 'mcp_server',
   'model-connections': 'model_connection',
+}
+
+// --- MCP 诊断与测试记录的固定码表 -------------------------------------------
+// 诊断命令三态 / 原因、测试阶段 / 失败分类都是契约固定集合；码表外原样显示，
+// 不编造解释。文案只此一处，新增码必须同时改契约与这里。
+// Fixed vocabularies for diagnosis and test records; unknown codes stay verbatim.
+const COMMAND_STATE_LABELS: Record<McpCommandState, string> = {
+  located: '命令已定位',
+  not_found: '命令未找到',
+  unconfirmed: '命令无法确认',
+}
+
+const COMMAND_STATE_TONES: Record<McpCommandState, 'ok' | 'bad' | 'warn'> = {
+  located: 'ok',
+  not_found: 'bad',
+  unconfirmed: 'warn',
+}
+
+const COMMAND_REASON_LABELS: Record<McpCommandReason, string> = {
+  lookpath: '在 PATH 中解析到',
+  absolute: '绝对路径且文件存在',
+  not_found: '明确不存在',
+  relative_path: '含分隔符的相对路径，需实际启动才能确认',
+  script: '脚本入口（.cmd / .bat），需实际启动才能确认',
+  permission: '权限不足',
+  unknown: '原因未知',
+}
+
+const TEST_STAGE_LABELS: Record<string, string> = {
+  preflight: '预检',
+  spawn: '启动',
+  initialize: '握手',
+  tools_list: '工具列表',
+  complete: '完成',
+}
+
+const TEST_FAILURE_LABELS: Record<string, string> = {
+  command_not_found: '找不到启动程序',
+  permission_denied: '权限不足',
+  policy_denied: '策略拒绝',
+  timeout: '超时',
+  http_unauthorized: 'HTTP 401 / 403',
+  http_unreachable: 'HTTP 不可达',
+  handshake_failed: '握手失败',
+  tools_list_failed: '工具列表失败',
+  env_missing: '环境变量缺失',
+  dependency_unconfirmed: '依赖未确认（无法归因）',
+}
+
+/** 诊断 warnings 六个 code（D-10 诊断集合，与目录集合各自固定、不合并）。 */
+const DIAGNOSTIC_WARNING_LABELS: Record<McpDiagnosticWarning, string> = {
+  stdio_child_egress_unconstrained: 'stdio 子进程的出网不受本仓网络策略约束',
+  remote_mcp_downstream_unconstrained: '远程 MCP 的下游调用不受本仓网络策略约束',
+  args_placeholders_not_resolved: 'args 中的 ${VAR} 不会被替换',
+  package_entry_unverified: '包入口未实测，能否启动以连接测试结果为准',
+  http_auth_header_unsupported: '本版本不支持 HTTP 认证头',
+  env_gate_process_local: 'env 闸门只核对本进程环境，不核对子进程实际环境',
+}
+
+/** 测试阶段 / 失败分类的展示文案；空串表示无（成功）。 */
+function stageText(stage: string): string {
+  return stage === '' ? '—' : (TEST_STAGE_LABELS[stage] ?? stage)
+}
+
+function failureText(failure: string): string {
+  return failure === '' ? '—' : (TEST_FAILURE_LABELS[failure] ?? failure)
 }
 
 interface DetailState {
@@ -112,8 +187,45 @@ export const ResourceDetailView = defineComponent({
     const versions = useLoader(() => client.listResourceVersions(adminKind, id))
     const references = useLoader(() => client.getResourceReferences(adminKind, id))
 
+    // --- MCP 两条只读轴：依赖诊断与最近一次测试 ---------------------------
+    // 诊断不启动进程、不写操作行；最近一次测试以管理操作台账为权威——列表视图
+    // 没有被测版本，必须再读 `/operations/{operation_id}` 的详情。
+    // Two read-only MCP axes: diagnosis never spawns or writes; the last test's
+    // authoritative record is the operation detail (the list omits the version).
+    const catalog = catalogApi(props.ctx.api)
+
+    const diagnosis = useLoader<McpServerDiagnostics | null>(
+      () => (kind === 'mcp-servers' ? catalog.getMCPDiagnostics(id) : Promise.resolve(null)),
+      false,
+    )
+
+    async function loadLastTest(): Promise<OperationDetail | null> {
+      if (kind !== 'mcp-servers') {
+        return null
+      }
+      const recent = await props.ctx.api.listOperations({
+        action: 'mcp_server.test',
+        target_kind: 'mcp_server',
+        target_id: id,
+        limit: 20,
+      })
+      const latest = recent[0]
+      return latest === undefined ? null : props.ctx.api.getOperation(latest.operation_id)
+    }
+
+    const lastTest = useLoader(loadLastTest, false)
+
+    onMounted(() => {
+      if (kind === 'mcp-servers') {
+        void diagnosis.reload()
+        void lastTest.reload()
+      }
+    })
+
     async function reloadAll(): Promise<void> {
-      await Promise.all([detail.reload(), versions.reload(), references.reload()])
+      const axes: Promise<void>[] =
+        kind === 'mcp-servers' ? [diagnosis.reload(), lastTest.reload()] : []
+      await Promise.all([detail.reload(), versions.reload(), references.reload(), ...axes])
     }
 
     // --- 范围与托管凭据（仅模型连接有这两项）------------------------------
@@ -427,7 +539,13 @@ export const ResourceDetailView = defineComponent({
           return
         }
         if (kind === 'mcp-servers') {
-          testResult.value = await client.testMcpServer(id)
+          try {
+            testResult.value = await client.testMcpServer(id)
+          } finally {
+            // 200 与 503 / 504 都会留下操作行（预写失败除外）：无论成败都按台账
+            // 重读“上次测试”轴，阶段 / 分类以 OperationDetail 为准。
+            await lastTest.reload()
+          }
         }
       } catch (caught) {
         showFailure(caught)
@@ -646,6 +764,178 @@ export const ResourceDetailView = defineComponent({
       return section('凭据管理', children)
     }
 
+    // --- MCP 四轴 ---------------------------------------------------------
+    /** 操作详情里的值都是 unknown：只按类型取值，缺失一律回退，不猜。 */
+    function detailText(detail: Record<string, unknown>, key: string): string {
+      const value = detail[key]
+      return typeof value === 'string' ? value : ''
+    }
+
+    function detailTools(detail: Record<string, unknown>): string[] | null {
+      const value = detail['tools']
+      return Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string')
+        : null
+    }
+
+    /** 旧记录可能早于 D-03：缺任一关键字段即视为“字段不全”，不得判通过。 */
+    function testRecordComplete(detail: Record<string, unknown>): boolean {
+      return 'ok' in detail && 'tools' in detail && 'stage' in detail && 'failure_class' in detail
+    }
+
+    /** 版本 ID → 版本号；列表未读到或查不到时保留内部 ID，不猜序号。 */
+    function versionLabel(versionId: number): string {
+      if (versionId === 0) {
+        return '—'
+      }
+      const list = versions.data.value ?? []
+      const match = list.find((entry) => entry.version_id === versionId)
+      return match === undefined ? `版本 ID ${versionId}` : `v${match.version_no}`
+    }
+
+    /** 配置轴：published == 0 未配置；published != applied 待重启；否则已应用。 */
+    function mcpConfigAxis(item: McpServerView): VNodeChild {
+      if (item.published_version_id === 0) {
+        return badge('未配置', 'muted')
+      }
+      if (item.pending_restart) {
+        return h('span', {}, [
+          badge('已发布未应用（待重启）', 'warn'),
+          h('span', { class: 'muted small' }, ` · 发布 v${item.published_version_no}，运行 v${item.applied_version_no}`),
+        ])
+      }
+      return h('span', {}, [
+        badge('已应用', 'ok'),
+        h('span', { class: 'muted small' }, ` · v${item.applied_version_no}`),
+      ])
+    }
+
+    /** 连接轴：未配置一律“—”，不把“没配置过”说成“连不上”。 */
+    function mcpConnectionAxis(item: McpServerView): VNodeChild {
+      if (item.published_version_id === 0) {
+        return h('span', { class: 'muted' }, '—')
+      }
+      return item.connected ? badge('已连接', 'ok') : badge('未连接', 'bad')
+    }
+
+    /**
+     * 测试轴：最近一次 `mcp_server.test` 的 OperationDetail。
+     * 通过判据只认 `ok=true && requested_version_id == published_version_id != 0`；
+     * 操作 `status` 不参与。历史记录缺字段 / 无被测版本时只提示重测，不推断通过。
+     */
+    function mcpTestAxis(item: McpServerView): VNodeChild {
+      if (lastTest.error.value !== '') {
+        return h('span', { class: 'muted' }, `读取失败：${lastTest.error.value}`)
+      }
+      const op = lastTest.data.value
+      if (op === null) {
+        return h('span', { class: 'muted' }, lastTest.loading.value ? '读取中…' : '未测试')
+      }
+      const detail = op.detail ?? {}
+      const time = formatTimestamp(op.created_at)
+      if (op.requested_version_id === 0) {
+        return h('span', {}, [
+          badge('历史记录无被测版本', 'muted'),
+          h('span', { class: 'muted small' }, ` · ${time} · 需重新测试`),
+        ])
+      }
+      if (!testRecordComplete(detail)) {
+        return h('span', {}, [
+          badge('历史记录字段不全', 'muted'),
+          h('span', { class: 'muted small' }, ` · ${time} · 需重新测试，不推断通过`),
+        ])
+      }
+      const tested = versionLabel(op.requested_version_id)
+      if (detail['ok'] !== true) {
+        return h('span', {}, [
+          badge('连接测试失败', 'bad'),
+          h('span', { class: 'muted small' }, ` · ${stageText(detailText(detail, 'stage'))} / ${failureText(detailText(detail, 'failure_class'))} · 针对 ${tested} · ${time}`),
+        ])
+      }
+      const tools = detailTools(detail) ?? []
+      const exposed = tools.length === 0 ? '；服务端未暴露工具' : ''
+      if (op.requested_version_id !== item.published_version_id) {
+        const prefix = item.pending_restart ? '运行中仍是旧版本；' : ''
+        return h('span', {}, [
+          badge('通过（版本已过期）', 'warn'),
+          h('span', { class: 'muted small' }, ` · ${prefix}测试针对 ${tested}，当前发布 ${item.published_version_id === 0 ? '未配置' : `v${item.published_version_no}`}，需重测`),
+        ])
+      }
+      if (!item.connected) {
+        return h('span', {}, [
+          badge('上次测试通过', 'muted'),
+          h('span', { class: 'muted small' }, ` · ${tested}，${time}，工具 ${tools.length} 个${exposed}；当前未连接`),
+        ])
+      }
+      return h('span', {}, [
+        badge('连接测试通过', 'ok'),
+        h('span', { class: 'muted small' }, ` · ${tested}，${time}，工具 ${tools.length} 个${exposed}`),
+      ])
+    }
+
+    /** 诊断轴：命令三态 + env 布尔，只写结论，不改写连接或测试轴。 */
+    function mcpDiagnosisAxis(): VNodeChild {
+      if (diagnosis.error.value !== '') {
+        return h('span', { class: 'muted' }, `读取失败：${diagnosis.error.value}`)
+      }
+      const info = diagnosis.data.value
+      if (info === null) {
+        return h('span', { class: 'muted' }, diagnosis.loading.value ? '读取中…' : '—')
+      }
+      const parts: VNodeChild[] = []
+      if (info.transport === 'stdio' && info.command !== null) {
+        parts.push(badge(COMMAND_STATE_LABELS[info.command.state], COMMAND_STATE_TONES[info.command.state]))
+      } else if (info.transport === 'stdio') {
+        parts.push(badge('命令未检查', 'muted'))
+      } else {
+        parts.push(badge('HTTP 传输', 'muted'))
+      }
+      const missing = info.env.filter((entry) => !entry.set).map((entry) => entry.key)
+      if (info.env.length === 0) {
+        parts.push(h('span', { class: 'muted small' }, ' · 无环境变量键'))
+      } else if (missing.length === 0) {
+        parts.push(h('span', { class: 'muted small' }, ` · 环境变量键全部就绪（${info.env.length} 个）`))
+      } else {
+        parts.push(h('span', { class: 'muted small' }, ` · 未就绪：${missing.join('、')}`))
+      }
+      if (info.warnings.length > 0) {
+        parts.push(h('span', { class: 'muted small' }, ` · 已知边界 ${info.warnings.length} 条`))
+      }
+      return h('span', {}, parts)
+    }
+
+    /**
+     * 工具来源（D-06）：`tools` 是 offered；被谁抢走看 tool_disposition。
+     * 未连接时视图给 null——不拿“没有结果”冒充“全部注册成功”。
+     */
+    function renderToolDisposition(item: McpServerView): VNodeChild {
+      const disposition = item.tool_disposition
+      if (disposition === null) {
+        return h(
+          'span',
+          { class: 'muted' },
+          item.published_version_id === 0 ? '—' : '未连接，暂无注册记录',
+        )
+      }
+      const children: VNodeChild[] = [`已提供 ${disposition.offered}，已注册 ${disposition.accepted}`]
+      if (disposition.skipped.length > 0) {
+        children.push(
+          h(
+            'ul',
+            { class: 'problems' },
+            disposition.skipped.map((skip) =>
+              h(
+                'li',
+                { key: skip.name },
+                `${skip.name}：被 ${skip.winner_source} 抢先（${skip.reason === 'duplicate_name' ? '重名' : '工具定义无效'}）`,
+              ),
+            ),
+          ),
+        )
+      }
+      return h('span', {}, children)
+    }
+
     function renderMcpSummary(item: McpServerView, etag: string): VNode {
       return h('div', {}, [
         definitions([
@@ -653,12 +943,21 @@ export const ResourceDetailView = defineComponent({
           ['传输', item.transport],
           ['可执行名', identifier(item.command)],
           ['环境变量键', item.env_keys.length === 0 ? '无' : item.env_keys.join('、')],
-          ['连接', item.connected ? badge('已连接', 'ok') : badge('未连接', 'bad')],
-          ['工具', item.tools.length === 0 ? '无' : item.tools.join('、')],
-          ['发布版本', `v${item.published_version_no}`],
-          ['已应用', `v${item.applied_version_no}`],
-          ['待重启', item.pending_restart ? badge('需重启', 'warn') : '否'],
+          // 四条轴各看各的证据，不合并成单一“已验证”结论。
+          // Four axes, four pieces of evidence; no single "verified" verdict.
+          ['配置', mcpConfigAxis(item)],
+          ['连接', mcpConnectionAxis(item)],
+          ['上次测试', mcpTestAxis(item)],
+          ['依赖诊断', mcpDiagnosisAxis()],
+          ['待重启', item.pending_restart ? badge('需重启（发布版本尚未生效）', 'warn') : '否'],
+          ['工具（已提供）', item.tools.length === 0 ? '无' : item.tools.join('、')],
+          ['工具注册', renderToolDisposition(item)],
         ]),
+        h(
+          'p',
+          { class: 'muted small' },
+          '四条轴互不预判：配置看版本指针，连接看 supervisor 快照，上次测试看最近一次管理操作，诊断来自不启动进程的只读检查。',
+        ),
         h('details', { class: 'technical-details' }, [
           h('summary', '技术细节'),
           definitions([
@@ -836,7 +1135,212 @@ export const ResourceDetailView = defineComponent({
       ])
     }
 
+    /**
+     * 操作详情（`/operations/{operation_id}`）：管理动作的完整记录。
+     * 操作 status=success 只表示动作执行完毕，不代表连接测试通过。
+     * The full operation record; its `success` status is not a test verdict.
+     */
+    function renderOperationFacts(op: OperationDetail): VNode {
+      return h('details', { class: 'technical-details' }, [
+        h('summary', `管理操作详情（${op.operation_id}）`),
+        definitions([
+          ['动作', h('code', op.action)],
+          ['目标', `${op.target_kind} · ${op.target_id}`],
+          ['状态', badge(OPERATION_STATUS_LABELS[op.status], operationStatusTone(op.status))],
+          ['结果码', op.result_code === '' ? '—' : op.result_code],
+          ['错误信息', op.error_message === '' ? '—' : op.error_message],
+          ['被测版本 ID（requested_version_id）', String(op.requested_version_id)],
+          ['创建时间', formatTimestamp(op.created_at)],
+          ['结束时间', formatTimestamp(op.finished_at)],
+        ]),
+        h(
+          'p',
+          { class: 'muted small' },
+          '操作状态 success 只表示管理动作执行完毕并留下结论，不代表连接测试通过；通过判据是 ok=true 且被测版本等于当前发布版本。',
+        ),
+        h('p', { class: 'muted small' }, [
+          h('a', { href: `${CONSOLE_BASE}/operations` }, '在管理操作中查看全部记录'),
+        ]),
+      ])
+    }
+
+    /**
+     * MCP 连接测试详情：以最近一次 `mcp_server.test` 的操作详情为准（被测版本
+     * 唯一权威）；本轮响应只在台账读取失败时兜底，并明确标注缺口。
+     * The last test's operation detail is authoritative; this session's response
+     * is only a labelled fallback when the ledger read failed.
+     */
+    function renderMcpTestDetail(): VNodeChild {
+      const op = lastTest.data.value
+      const response = testResult.value as McpServerTestResult | null
+      if (op === null && response === null) {
+        if (lastTest.error.value === '') {
+          return null
+        }
+        return section('连接测试', [
+          h(Notice, { tone: 'error', text: `读取最近的测试记录失败：${lastTest.error.value}` }),
+        ])
+      }
+      const children: VNodeChild[] = []
+      if (op !== null) {
+        const detail = op.detail ?? {}
+        // 没有被测版本就没有通过判据：即使 detail.ok 为 true 也不写成“通过”。
+        // Without a tested version there is no pass criterion, `ok` notwithstanding.
+        const versionless = op.requested_version_id === 0
+        const pairs: Array<readonly [string, VNodeChild]> = [
+          [
+            '被测版本',
+            versionless
+              ? '历史记录无被测版本（需重新测试）'
+              : versionLabel(op.requested_version_id),
+          ],
+          ['测试时间', formatTimestamp(op.created_at)],
+        ]
+        if (versionless) {
+          pairs.push(['结论', badge('历史记录无被测版本', 'muted')])
+        } else if (testRecordComplete(detail)) {
+          const tools = detailTools(detail) ?? []
+          const latency = detail['latency_ms']
+          pairs.push(
+            ['结论', detail['ok'] === true ? badge('连接测试通过', 'ok') : badge('连接测试失败', 'bad')],
+            ['耗时', typeof latency === 'number' ? `${latency} ms` : '—'],
+            ['发现工具', tools.length === 0 ? '无（服务端未暴露工具）' : tools.join('、')],
+            ['阶段', stageText(detailText(detail, 'stage'))],
+            ['失败分类', failureText(detailText(detail, 'failure_class'))],
+            ['错误码', identifier(detailText(detail, 'error_code') === '' ? '—' : detailText(detail, 'error_code'))],
+            ['错误信息', detailText(detail, 'error_message') === '' ? '—' : detailText(detail, 'error_message')],
+          )
+        } else {
+          pairs.push(['结论', badge('历史记录字段不全', 'muted')])
+        }
+        children.push(definitions(pairs))
+        if (versionless) {
+          children.push(
+            h(
+              'p',
+              { class: 'muted small' },
+              '这条记录没有被测版本，无法判断它测的是不是当前发布的版本：按未通过处理，请重新测试。',
+            ),
+          )
+        } else if (!testRecordComplete(detail)) {
+          children.push(
+            h(
+              'p',
+              { class: 'muted small' },
+              '这条历史记录早于测试记录补强，缺少工具 / 阶段 / 失败分类：不能据此判断通过，请重新测试。',
+            ),
+          )
+        } else if (detail['ok'] !== true) {
+          children.push(
+            h(
+              'p',
+              { class: 'muted small' },
+              '失败时先看「依赖诊断」：命令能否定位、环境变量是否就绪、是否应先重启；诊断结论不预判测试。',
+            ),
+          )
+        }
+        children.push(renderOperationFacts(op))
+      } else if (response !== null) {
+        children.push(
+          definitions([
+            ['结论', response.ok ? badge('连接测试通过', 'ok') : badge('连接测试失败', 'bad')],
+            ['被测版本', versionLabel(response.tested_version_id)],
+            ['测试时间', '—'],
+            ['耗时', `${response.latency_ms} ms`],
+            ['发现工具', response.tools.length === 0 ? '无（服务端未暴露工具）' : response.tools.join('、')],
+            ['阶段', stageText(response.stage)],
+            ['失败分类', failureText(response.failure_class)],
+            ['管理操作', h('code', response.operation_id)],
+          ]),
+          h(
+            'p',
+            { class: 'muted small' },
+            '未能从管理操作台账读到本次测试的记录：以上来自本次响应；刷新后以台账为准。',
+          ),
+        )
+      }
+      return section('连接测试', children)
+    }
+
+    /**
+     * 依赖诊断区块：只读、不启动进程、不写操作行。
+     * 命令可定位不代表依赖包已安装，env 已设置也不代表凭据有效。
+     */
+    function renderDiagnosisSection(): VNodeChild {
+      if (kind !== 'mcp-servers') {
+        return null
+      }
+      const info = diagnosis.data.value
+      const children: VNodeChild[] = []
+      if (diagnosis.error.value !== '') {
+        children.push(h(Notice, { tone: 'error', text: `依赖诊断读取失败：${diagnosis.error.value}` }))
+      }
+      if (info !== null) {
+        const command = info.command
+        const commandValue: VNodeChild =
+          command === null
+            ? '—（HTTP 传输不检查本地命令）'
+            : h('span', {}, [
+                badge(COMMAND_STATE_LABELS[command.state], COMMAND_STATE_TONES[command.state]),
+                h('span', { class: 'muted small' }, ` · ${COMMAND_REASON_LABELS[command.reason]}`),
+                command.path === '' ? null : h('span', { class: 'muted small' }, ` · ${command.path}`),
+              ])
+        children.push(
+          definitions([
+            ['传输', info.transport],
+            ['检查时间', formatTimestamp(info.checked_at)],
+            ['命令定位', commandValue],
+            [
+              '环境变量',
+              info.env.length === 0
+                ? '无'
+                : info.env.map((entry) => `${entry.key}：${entry.set ? '已设置' : '未设置'}`).join('；'),
+            ],
+            [
+              '已知边界',
+              info.warnings.length === 0
+                ? '无'
+                : h(
+                    'ul',
+                    { class: 'problems' },
+                    info.warnings.map((code) =>
+                      h('li', { key: code }, DIAGNOSTIC_WARNING_LABELS[code] ?? `未知边界（${code}）`),
+                    ),
+                  ),
+            ],
+          ]),
+        )
+        children.push(
+          h(
+            'p',
+            { class: 'muted small' },
+            `配置：${info.published_version_id === 0 ? '未配置' : info.pending_restart ? '已发布未应用（待重启）' : '已应用'}。` +
+              '诊断不启动进程、不连接、不写操作行：命令可定位不代表依赖包已安装，环境变量已设置也不代表凭据有效。',
+          ),
+        )
+      }
+      children.push(
+        h('div', { class: 'form-actions' }, [
+          h(
+            'button',
+            {
+              type: 'button',
+              disabled: diagnosis.loading.value,
+              onClick: () => {
+                void diagnosis.reload()
+              },
+            },
+            diagnosis.loading.value ? '检查中…' : '重新诊断',
+          ),
+        ]),
+      )
+      return section('依赖诊断', children)
+    }
+
     function renderTestResult(): VNodeChild {
+      if (kind === 'mcp-servers') {
+        return renderMcpTestDetail()
+      }
       const result = testResult.value
       if (result === null && testReference.value === 'unknown') {
         return null
@@ -1015,6 +1519,7 @@ export const ResourceDetailView = defineComponent({
       )
 
       children.push(renderTestResult())
+      children.push(renderDiagnosisSection())
 
       // 三类资源都可以在详情页修改：表单自己 GET 详情取 ETag，保存后整页重读。
       // All three kinds are editable here; the form GETs its own ETag.

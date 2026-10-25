@@ -46,18 +46,35 @@ const (
 	// defaultRunTimeout bounds one-shot commands; long-lived processes carry their own.
 	defaultRunTimeout = 120 * time.Second
 
+	// candidateBinaryEnv / candidateSHA256Env 是发布档与被测二进制的两个接缝（模块卡
+	// §4.3 `e2e` / §6.11 第 7 条）：前者给出候选二进制的绝对路径，后者可选、用于交叉
+	// 核对重算出的 SHA-256。两者都只由 `make e2e` 导出，测试代码不另造变量。
+	// The two seams between the release build and the binary under test: the absolute
+	// candidate path and an optional hash for cross-checking.
+	candidateBinaryEnv = "BASALT_E2E_BINARY"
+	candidateSHA256Env = "BASALT_E2E_SHA256"
+
+	// binarySourceCandidate 表示被测二进制是外部候选产物（发布证据的唯一合法来源）；
+	// binarySourceTemp 表示本包临时构建（开发手跑），不得作为发布证据。
+	// candidate marks an external release candidate; temp marks the package's own build.
+	binarySourceCandidate = "candidate"
+	binarySourceTemp      = "temp"
+
 	// readinessPoll 是 waitHTTP 的轮询间隔——回环上起停，25ms 足够细。
 	// readinessPoll is the readiness polling interval.
 	readinessPoll = 25 * time.Millisecond
 )
 
-// binaryPath 与 binarySHA256 由 TestMain 构建一次后写入；测试进程内只读。
-// 被测二进制的哈希是回填记录 code.tested_binary_sha256 的唯一来源。
-// binaryPath and binarySHA256 are written once by TestMain and read-only afterwards;
-// the hash is the sole source of the record's tested_binary_sha256.
+// binaryPath / binarySHA256 / binarySource / expectedVersion 由 TestMain 决定一次后写入；
+// 测试进程内只读。被测二进制的哈希是回填记录 code.tested_binary_sha256 的唯一来源；
+// expectedVersion 是本次二进制 `--version` 必须回显的构建标记。
+// binaryPath, binarySHA256, binarySource and expectedVersion are settled once by TestMain
+// and read-only afterwards; the hash is the sole source of tested_binary_sha256.
 var (
-	binaryPath   string
-	binarySHA256 string
+	binaryPath      string
+	binarySHA256    string
+	binarySource    string
+	expectedVersion string
 )
 
 // TestMain 构建被测二进制并打印唯一一条 `binary_sha256=` 标记。
@@ -84,31 +101,111 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "e2e: 定位仓库根失败: %v\n", err)
 		os.Exit(1)
 	}
-	dir, err := os.MkdirTemp("", "basalt-e2e-build-*")
+	path, source, sum, cleanup, err := resolveBinaryUnderTest(root)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: 创建构建目录失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "e2e: 解析被测二进制失败: %v\n", err)
 		os.Exit(1)
 	}
-	path, err := buildBinary(root, dir)
+	stamp, err := expectedVersionFor(root, source)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: 构建被测二进制失败: %v\n", err)
-		os.RemoveAll(dir)
+		cleanup()
+		fmt.Fprintf(os.Stderr, "e2e: %v\n", err)
 		os.Exit(1)
 	}
-	sum, err := fileSHA256(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: 计算被测二进制哈希失败: %v\n", err)
-		os.RemoveAll(dir)
-		os.Exit(1)
-	}
-	binaryPath, binarySHA256 = path, sum
-	// 标记打在测试框架输出之前：一次运行恰好一条，供回填记录引用。
-	// The marker precedes all test output: exactly one per run, referenced by records.
+	binaryPath, binarySource, binarySHA256, expectedVersion = path, source, sum, stamp
+	// 标记打在测试框架输出之前：一次运行各恰好一条，供回填记录与 stage 判卷引用。
+	// The markers precede all test output: exactly one of each per run.
+	fmt.Printf("binary_source=%s\n", source)
+	fmt.Printf("binary_path=%s\n", path)
 	fmt.Printf("binary_sha256=%s\n", sum)
 
 	code := m.Run()
-	os.RemoveAll(dir)
+	cleanup()
 	os.Exit(code)
+}
+
+// resolveBinaryUnderTest 决定被测二进制：`BASALT_E2E_BINARY` 存在时**直接使用该文件、
+// 不另行构建**；缺失时回退到本包临时构建。返回值里的 cleanup 只回收临时构建目录，
+// 候选分支为空操作（候选文件归调用方，测试不得删它）。
+// resolveBinaryUnderTest prefers the candidate named by BASALT_E2E_BINARY and never
+// rebuilds it; without the variable it falls back to the package's own temporary build.
+// The cleanup only reclaims the temporary build directory.
+func resolveBinaryUnderTest(root string) (path, source, sum string, cleanup func(), err error) {
+	if candidate := os.Getenv(candidateBinaryEnv); candidate != "" {
+		path, sum, err = checkCandidateBinary(candidate)
+		if err != nil {
+			return "", "", "", nil, err
+		}
+		return path, binarySourceCandidate, sum, func() {}, nil
+	}
+
+	dir, err := os.MkdirTemp("", "basalt-e2e-build-*")
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("创建构建目录: %w", err)
+	}
+	path, err = buildBinary(root, dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", "", "", nil, fmt.Errorf("构建被测二进制: %w", err)
+	}
+	sum, err = fileSHA256(path)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", "", "", nil, fmt.Errorf("计算被测二进制哈希: %w", err)
+	}
+	return path, binarySourceTemp, sum, func() { os.RemoveAll(dir) }, nil
+}
+
+// checkCandidateBinary 校验候选二进制并**重算**它的 SHA-256：路径必须是绝对路径、
+// 目标是普通文件；设置了 `BASALT_E2E_SHA256` 时还必须与重算值一致。缺文件、非绝对
+// 路径、哈希不符一律失败——发布证据不允许"大致对得上"。
+// checkCandidateBinary validates the candidate and recomputes its SHA-256; a missing
+// file, a relative path or a hash mismatch is a hard failure, never a warning.
+func checkCandidateBinary(candidate string) (path, sum string, err error) {
+	if !filepath.IsAbs(candidate) {
+		return "", "", fmt.Errorf("%s 必须是绝对路径（实际 %q）", candidateBinaryEnv, candidate)
+	}
+	info, err := os.Stat(candidate)
+	if err != nil {
+		return "", "", fmt.Errorf("候选二进制不可用（%s）: %w", candidate, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("候选二进制不是普通文件（%s 的模式 %s）", candidate, info.Mode())
+	}
+	sum, err = fileSHA256(candidate)
+	if err != nil {
+		return "", "", fmt.Errorf("计算候选二进制哈希: %w", err)
+	}
+	if want := os.Getenv(candidateSHA256Env); want != "" && !strings.EqualFold(want, sum) {
+		return "", "", fmt.Errorf("候选二进制哈希不符：%s 声明 %s，实际 %s", candidateSHA256Env, want, sum)
+	}
+	return candidate, sum, nil
+}
+
+// expectedVersionFor 决定 `--version` 必须回显的构建标记。临时构建是本包注入的
+// `buildVersion`；候选二进制由 `make build` 按 `git describe --tags --always` 注入，
+// 因此期望值取同一份 git 描述——解析不出来即失败（不跳过断言，也不放宽为"非空即可"）。
+// expectedVersionFor derives the version stamp `--version` must echo: the injected
+// constant for a temporary build, the checkout's `git describe` for a candidate. When
+// the description cannot be resolved the run fails closed instead of skipping.
+func expectedVersionFor(root, source string) (string, error) {
+	if source != binarySourceCandidate {
+		return buildVersion, nil
+	}
+	cmd := exec.Command("git", "describe", "--tags", "--always")
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("候选二进制的版本标记无法核对（git describe --tags --always）: %w（%s）",
+			err, strings.TrimSpace(stderr.String()))
+	}
+	stamp := strings.TrimSpace(string(out))
+	if stamp == "" {
+		return "", errors.New("候选二进制的版本标记为空：git describe --tags --always 没有输出")
+	}
+	return stamp, nil
 }
 
 // listMode 报告当前是否是 `go test -list` 的只读列名模式。

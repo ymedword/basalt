@@ -13,7 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1097,4 +1101,478 @@ func treeBeatSize(t *testing.T, path string) int64 {
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	return info.Size()
+}
+
+// —— US-14：结构化连接失败与命令构造同源（契约 D-05 / C-06）——
+// Structured connect failures (contract D-05 / C-06) and the shared command constructor.
+
+// toolsListFailureModes 是"握手成功、`tools/list` 失败"的两种注入方式：直接报错让分类
+// 落在 `tools_list_failed`；丢弃请求让握手预算到点，分类落在 `timeout`。
+// Two ways to fail exactly at tools/list: an immediate write error and a dropped request
+// that only the handshake budget can end.
+const (
+	toolsListWriteFailure = "write"
+	toolsListDropRequest  = "drop"
+)
+
+// toolsListFailingTransport 包一层真实传输：握手照常完成，只拦 `tools/list` 的请求。
+// toolsListFailingTransport wraps a real transport and intercepts only tools/list.
+type toolsListFailingTransport struct {
+	inner mcp.Transport
+	mode  string
+}
+
+// Connect 先建真实连接，再把写入侧换成拦截版。
+// Connect builds the real connection and wraps its write side.
+func (t *toolsListFailingTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.inner.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &toolsListFailingConn{Connection: conn, mode: t.mode}, nil
+}
+
+// toolsListFailingConn 只改写 `tools/list` 的写入，其余读写原样转发。
+// toolsListFailingConn only rewrites the tools/list write; everything else passes through.
+type toolsListFailingConn struct {
+	mcp.Connection
+	mode string
+}
+
+// Write 对 `tools/list` 请求按模式失败或丢弃，其余消息原样转发。
+// Write fails or drops the tools/list request according to the mode.
+func (c *toolsListFailingConn) Write(ctx context.Context, msg jsonrpc.Message) error {
+	if req, ok := msg.(*jsonrpc.Request); ok && req.Method == "tools/list" {
+		if c.mode == toolsListWriteFailure {
+			return errors.New("tools/list boom")
+		}
+		return nil // 丢弃请求：server 永远不回包，只能由握手预算收场
+	}
+	return c.Connection.Write(ctx, msg)
+}
+
+// healthyTransport 造一对能完成握手并暴露标准工具集的进程内传输。
+// healthyTransport builds an in-memory pair serving the standard tool set.
+func healthyTransport(t *testing.T) mcp.Transport {
+	t.Helper()
+	return testutil.NewInMemoryMCPPair(t, 0, testutil.StandardMCPTools()...)
+}
+
+// closedPortURL 返回一个已关闭端口的 http 地址：拨号成功、请求必然不可达。
+// closedPortURL returns an http URL whose port was just closed, so the request cannot
+// reach anything.
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	return "http://" + addr
+}
+
+// statusServerURL 起一个对所有请求返回给定状态码的测试服务器。
+// statusServerURL serves the given status code for every request.
+func statusServerURL(t *testing.T, status int) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+// TestMCPPool_ConnectDetailed：表驱动覆盖契约 D-05 的每个可证明类别与阶段——策略拒绝 /
+// 找不到命令 / 权限 / 启动不可归因 / 启动超时 / 握手失败 / HTTP 401 / 403 / 不可达 /
+// tools_list 失败 / 握手超时 / tools_list 超时。判别力：任何"没有成功连接就是未安装"
+// 的推断都会让 wantClass 断言红；任何按错误文案分类的写法在改文案后同样红。
+// TestMCPPool_ConnectDetailed covers every provable stage × class pair from contract
+// D-05. Any "no connection means not installed" inference turns wantClass red.
+func TestMCPPool_ConnectDetailed(t *testing.T) {
+	handshakeFailure := func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+		t.Helper()
+		return func(core.MCPServerConfig) (mcp.Transport, error) {
+			return &initializeFailingTransport{conn: &initializeFailingConn{}}, nil
+		}
+	}
+	blockingHandshake := func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+		t.Helper()
+		return func(core.MCPServerConfig) (mcp.Transport, error) {
+			// 不睡在 onConnect 里：那会在检查 ctx 之前先耗掉墙钟；让传输阻塞在
+			// ctx.Done() 上，预算到点即为被测行为。
+			return &handshakeBlockingTransport{onConnect: func() {}}, nil
+		}
+	}
+	toolsListFailing := func(t *testing.T, mode string) func(core.MCPServerConfig) (mcp.Transport, error) {
+		t.Helper()
+		inner := healthyTransport(t)
+		return func(core.MCPServerConfig) (mcp.Transport, error) {
+			return &toolsListFailingTransport{inner: inner, mode: mode}, nil
+		}
+	}
+
+	cases := []struct {
+		name      string
+		spec      core.MCPServerConfig
+		timeout   time.Duration
+		dial      func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error)
+		wantStage string
+		wantClass string
+	}{
+		{
+			name: "策略拒绝",
+			spec: core.MCPServerConfig{Name: "denied", Command: "blocked-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return func(core.MCPServerConfig) (mcp.Transport, error) {
+					return nil, fmt.Errorf("%w: 域名未在放行清单", core.ErrPolicyDenied)
+				}
+			},
+			wantStage: "preflight",
+			wantClass: "policy_denied",
+		},
+		{
+			name: "找不到命令",
+			spec: core.MCPServerConfig{Name: "ghost", Command: "ghost-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return func(core.MCPServerConfig) (mcp.Transport, error) {
+					return nil, &exec.Error{Name: "ghost-mcp", Err: exec.ErrNotFound}
+				}
+			},
+			wantStage: "spawn",
+			wantClass: "command_not_found",
+		},
+		{
+			name: "权限不足",
+			spec: core.MCPServerConfig{Name: "locked", Command: "locked-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return func(core.MCPServerConfig) (mcp.Transport, error) {
+					return nil, &fs.PathError{Op: "fork/exec", Path: "/opt/basalt/probe", Err: fs.ErrPermission}
+				}
+			},
+			wantStage: "spawn",
+			wantClass: "permission_denied",
+		},
+		{
+			name: "启动失败不可归因",
+			spec: core.MCPServerConfig{Name: "unknown", Command: "unknown-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return func(core.MCPServerConfig) (mcp.Transport, error) {
+					return nil, errors.New("no such package: probe")
+				}
+			},
+			wantStage: "spawn",
+			wantClass: "dependency_unconfirmed",
+		},
+		{
+			name: "启动超时",
+			spec: core.MCPServerConfig{Name: "slow-start", Command: "slow-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return func(core.MCPServerConfig) (mcp.Transport, error) {
+					return nil, fmt.Errorf("dial: %w", context.DeadlineExceeded)
+				}
+			},
+			wantStage: "spawn",
+			wantClass: "timeout",
+		},
+		{
+			name:      "握手失败",
+			spec:      core.MCPServerConfig{Name: "half", Command: "half-mcp"},
+			dial:      handshakeFailure,
+			wantStage: "initialize",
+			wantClass: "handshake_failed",
+		},
+		{
+			name:      "HTTP 401",
+			spec:      core.MCPServerConfig{Name: "remote", Transport: "http"},
+			dial:      nil, // 真实 http 传输：URL 在子测试里填入
+			wantStage: "initialize",
+			wantClass: "http_unauthorized",
+		},
+		{
+			name:      "HTTP 403",
+			spec:      core.MCPServerConfig{Name: "remote", Transport: "http"},
+			dial:      nil,
+			wantStage: "initialize",
+			wantClass: "http_unauthorized",
+		},
+		{
+			name:      "HTTP 不可达",
+			spec:      core.MCPServerConfig{Name: "down", Transport: "http"},
+			dial:      nil,
+			wantStage: "initialize",
+			wantClass: "http_unreachable",
+		},
+		{
+			name: "tools_list 失败",
+			spec: core.MCPServerConfig{Name: "listing", Command: "list-mcp"},
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return toolsListFailing(t, toolsListWriteFailure)
+			},
+			wantStage: "tools_list",
+			wantClass: "tools_list_failed",
+		},
+		{
+			name:    "握手超时",
+			spec:    core.MCPServerConfig{Name: "stuck", Command: "stuck-mcp"},
+			timeout: 50 * time.Millisecond,
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return blockingHandshake(t)
+			},
+			wantStage: "initialize",
+			wantClass: "timeout",
+		},
+		{
+			name:    "tools_list 超时",
+			spec:    core.MCPServerConfig{Name: "listing-slow", Command: "list-mcp"},
+			timeout: 80 * time.Millisecond,
+			dial: func(t *testing.T) func(core.MCPServerConfig) (mcp.Transport, error) {
+				return toolsListFailing(t, toolsListDropRequest)
+			},
+			wantStage: "tools_list",
+			wantClass: "timeout",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, logs := captureLogger(t)
+			pool := NewMCPPool(MCPPoolOptions{Logger: logger, Root: t.TempDir(), ConnectTimeout: tc.timeout})
+			if tc.dial != nil {
+				pool.dial = tc.dial(t)
+			}
+			t.Cleanup(func() { require.NoError(t, pool.Close()) })
+
+			spec := tc.spec
+			switch tc.wantClass {
+			case "http_unauthorized":
+				status := http.StatusUnauthorized
+				if tc.name == "HTTP 403" {
+					status = http.StatusForbidden
+				}
+				spec.URL = statusServerURL(t, status)
+			case "http_unreachable":
+				spec.URL = closedPortURL(t)
+			}
+
+			conns, failures, err := pool.ConnectDetailed(context.Background(), []core.MCPServerConfig{spec})
+			require.NoError(t, err, "单 server 失败不是池级错误")
+			require.Empty(t, conns)
+			require.Len(t, failures, 1)
+			failure := failures[0]
+			require.Equal(t, spec.Name, failure.Server)
+			require.Equal(t, tc.wantStage, failure.Stage, "stage 必须按真实失败点归类")
+			require.Equal(t, tc.wantClass, failure.Class)
+			require.Error(t, failure.Err, "原始错误保留给日志与内部分类")
+			require.Contains(t, logs.String(), "MCP server 未连接——已跳过")
+		})
+	}
+
+	// 真实 stdio 启动失败：上表的错误全部注入在 dial 接缝，真实 `cmd.Start()` 失败
+	// 从未被断言——US-14 走查实测 ghost server 落成 dependency_unconfirmed，与颗粒度
+	// 文档 §2.4.3「启动程序不存在 → command_not_found」不符（缺陷来源）。这里走**默认**
+	// dial（真实 CommandTransport + 真实 Start 错误），按类型断言归因。
+	// Real Start() failures: the table above injects errors at the dial seam, so the true
+	// stdio start path was never asserted. Default dial only — the error must classify by
+	// its real type (card §2.4.3: missing program → command_not_found).
+	t.Run("真实启动失败按错误类型归类", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			command string
+		}{
+			// 裸名走 LookPath，失败即 `*exec.Error{Err: exec.ErrNotFound}`。
+			{name: "裸命令名不存在", command: "basalt-mcp-probe-not-installed"},
+			// 绝对路径不走 LookPath，Start 返回 `*fs.PathError{Err: fs.ErrNotExist}`。
+			{name: "绝对路径不存在", command: filepath.Join(t.TempDir(), "definitely-missing-mcp")},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				pool := NewMCPPool(MCPPoolOptions{Logger: slog.New(slog.DiscardHandler), Root: t.TempDir()})
+				t.Cleanup(func() { require.NoError(t, pool.Close()) })
+
+				conns, failures, err := pool.ConnectDetailed(context.Background(),
+					[]core.MCPServerConfig{{Name: "ghost", Command: tc.command}})
+				require.NoError(t, err, "单 server 启动失败不是池级错误")
+				require.Empty(t, conns)
+				require.Len(t, failures, 1)
+				require.Equal(t, "spawn", failures[0].Stage, "进程没起来就是启动阶段")
+				require.Equal(t, "command_not_found", failures[0].Class,
+					"真实的「程序不存在」必须按结构化错误归因，不得落成 dependency_unconfirmed")
+			})
+		}
+	})
+
+	t.Run("成功时不产生失败项", func(t *testing.T) {
+		pool := NewMCPPool(MCPPoolOptions{Logger: slog.New(slog.DiscardHandler), Root: t.TempDir()})
+		pool.dial = func(core.MCPServerConfig) (mcp.Transport, error) { return healthyTransport(t), nil }
+		t.Cleanup(func() { require.NoError(t, pool.Close()) })
+
+		conns, failures, err := pool.ConnectDetailed(context.Background(),
+			[]core.MCPServerConfig{{Name: "good", Command: "good-mcp"}})
+		require.NoError(t, err)
+		require.Empty(t, failures)
+		require.Len(t, conns, 1)
+		require.Len(t, conns[0].Tools, 3)
+	})
+
+	t.Run("失败逐 server 独立", func(t *testing.T) {
+		healthy := healthyTransport(t)
+		pool := NewMCPPool(MCPPoolOptions{Logger: slog.New(slog.DiscardHandler), Root: t.TempDir()})
+		pool.dial = func(spec core.MCPServerConfig) (mcp.Transport, error) {
+			if spec.Name == "broken" {
+				return nil, &exec.Error{Name: "ghost-mcp", Err: exec.ErrNotFound}
+			}
+			return healthy, nil
+		}
+		t.Cleanup(func() { require.NoError(t, pool.Close()) })
+
+		conns, failures, err := pool.ConnectDetailed(context.Background(), []core.MCPServerConfig{
+			{Name: "broken", Command: "ghost-mcp"},
+			{Name: "good", Command: "good-mcp"},
+		})
+		require.NoError(t, err)
+		require.Len(t, conns, 1)
+		require.Equal(t, "good", conns[0].Server)
+		require.Len(t, failures, 1)
+		require.Equal(t, "broken", failures[0].Server)
+		require.Equal(t, "command_not_found", failures[0].Class)
+	})
+
+	t.Run("父 ctx 取消是池级错误", func(t *testing.T) {
+		pool := NewMCPPool(MCPPoolOptions{Logger: slog.New(slog.DiscardHandler), Root: t.TempDir()})
+		pool.dial = func(core.MCPServerConfig) (mcp.Transport, error) {
+			return nil, errors.New("dial must not run under a canceled context")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		conns, failures, err := pool.ConnectDetailed(ctx, []core.MCPServerConfig{{Name: "s", Command: "unused"}})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, conns)
+		require.Empty(t, failures, "池级取消不得伪造单个 server 的失败分类")
+	})
+}
+
+// TestMCPPool_Connect_LegacySemantics：`Connect` 的启动语义不随 `ConnectDetailed` 引入而
+// 改变——单 server 失败被吸收、固定键 WARN、其余连接照常返回；返回的连接必须等于
+// `ConnectDetailed` 的成功子集。判别力：把 Connect 改成"遇错即返回"→ NoError 断言红。
+// TestMCPPool_Connect_LegacySemantics pins the launch semantics: single-server failures
+// stay absorbed with a fixed-key warning, and Connect returns the detailed successes.
+func TestMCPPool_Connect_LegacySemantics(t *testing.T) {
+	newPool := func(t *testing.T) *MCPPool {
+		t.Helper()
+		logger, _ := captureLogger(t)
+		pool := NewMCPPool(MCPPoolOptions{Logger: logger, Root: t.TempDir(), Version: "test"})
+		healthy := healthyTransport(t)
+		pool.dial = func(spec core.MCPServerConfig) (mcp.Transport, error) {
+			if spec.Name == "broken" {
+				return nil, &exec.Error{Name: "ghost-mcp", Err: exec.ErrNotFound}
+			}
+			return healthy, nil
+		}
+		t.Cleanup(func() { require.NoError(t, pool.Close()) })
+		return pool
+	}
+	specs := []core.MCPServerConfig{
+		{Name: "broken", Command: "ghost-mcp"},
+		{Name: "good", Command: "good-mcp"},
+	}
+
+	logger, logs := captureLogger(t)
+	legacy := NewMCPPool(MCPPoolOptions{Logger: logger, Root: t.TempDir(), Version: "test"})
+	healthy := healthyTransport(t)
+	legacy.dial = func(spec core.MCPServerConfig) (mcp.Transport, error) {
+		if spec.Name == "broken" {
+			return nil, &exec.Error{Name: "ghost-mcp", Err: exec.ErrNotFound}
+		}
+		return healthy, nil
+	}
+	t.Cleanup(func() { require.NoError(t, legacy.Close()) })
+
+	conns, err := legacy.Connect(context.Background(), specs)
+	require.NoError(t, err, "单 server 失败必须被吸收")
+	require.Len(t, conns, 1)
+	require.Equal(t, "good", conns[0].Server)
+	require.Len(t, conns[0].Tools, 3)
+
+	output := logs.String()
+	require.Contains(t, output, "MCP server 未连接——已跳过")
+	require.Contains(t, output, "server=broken")
+	require.Contains(t, output, "reason=启动失败")
+	require.Contains(t, output, "detail=可执行文件不存在")
+	require.NotContains(t, output, "ghost-mcp", "命令原文不得进入日志")
+
+	detailed, failures, err := newPool(t).ConnectDetailed(context.Background(), specs)
+	require.NoError(t, err)
+	require.Len(t, detailed, 1)
+	require.Equal(t, conns[0].Server, detailed[0].Server, "Connect 返回的必须是 ConnectDetailed 的成功子集")
+	require.Len(t, failures, 1)
+	require.Equal(t, "broken", failures[0].Server)
+	require.Equal(t, "spawn", failures[0].Stage)
+	require.Equal(t, "command_not_found", failures[0].Class)
+}
+
+// TestNewMCPCommand_MatchesLaunch：诊断与启动共用同一构造器——`NewMCPCommand` 与
+// `dialCommand` 产出的 `exec.Cmd` 在决定启动的每个字段上一致（Path / Args / Dir / Env），
+// 且构造阶段都不启动进程；空命令两边一致拒绝。判别力：任一侧复制出第二套构造逻辑并
+// 改动任一字段 → 等值断言红。
+// TestNewMCPCommand_MatchesLaunch pins the shared constructor: every launch-determining
+// field matches between NewMCPCommand and dialCommand, and neither starts a process.
+func TestNewMCPCommand_MatchesLaunch(t *testing.T) {
+	t.Setenv("MCP_CMD_PROBE_PASS", "pass-value")
+	t.Setenv("MCP_CMD_PROBE_OVERRIDE", "pass-override")
+	root := t.TempDir()
+	passthrough := []string{"MCP_CMD_PROBE_PASS", "MCP_CMD_PROBE_OVERRIDE", "MCP_CMD_PROBE_MISSING"}
+	spec := core.MCPServerConfig{
+		Name:    "probe",
+		Command: "probe-mcp",
+		Args:    []string{"--stdio", "arg with space"},
+		Env: map[string]string{
+			"MCP_CMD_PROBE_OVERRIDE": "declared-override",
+			"PROBE_TOKEN":            "${PROBE_TOKEN}",
+		},
+	}
+
+	built, err := NewMCPCommand(spec, root, passthrough)
+	require.NoError(t, err)
+	require.Nil(t, built.Process, "NewMCPCommand 只构造、不启动")
+
+	pool := NewMCPPool(MCPPoolOptions{Root: root, EnvPassthrough: passthrough})
+	transport, err := pool.dialCommand(spec)
+	require.NoError(t, err)
+	commandTransport, ok := transport.(*mcp.CommandTransport)
+	require.True(t, ok)
+	launched := commandTransport.Command
+
+	require.Equal(t, built.Path, launched.Path, "解析后的可执行路径必须一致")
+	require.Equal(t, built.Args, launched.Args, "argv 必须逐项一致")
+	require.Equal(t, root, launched.Dir, "工作目录 = 工作区根")
+	require.Equal(t, built.Env, launched.Env, "子进程环境必须一致")
+	require.Nil(t, launched.Process, "dialCommand 同样只构造、不启动")
+	require.Nil(t, launched.Cancel, "exec.Command 创建——进程不绑任何预算")
+
+	for _, command := range []string{"", "   ", "\t"} {
+		_, err := NewMCPCommand(core.MCPServerConfig{Name: "empty", Command: command}, root, passthrough)
+		require.Error(t, err, "空白 command 必须拒绝：%q", command)
+		require.Contains(t, err.Error(), "command 为空")
+		_, dialErr := pool.dialCommand(core.MCPServerConfig{Name: "empty", Command: command})
+		require.Error(t, dialErr, "dialCommand 必须复用同一拒绝逻辑：%q", command)
+		require.Contains(t, dialErr.Error(), "command 为空")
+	}
+
+	t.Run("构造出的命令可直接启动", func(t *testing.T) {
+		// 以测试二进制自身作为被测命令：Start 成功即证明 dialCommand 交出的对象可执行。
+		self := core.MCPServerConfig{
+			Name:    "self",
+			Command: os.Args[0],
+			Args:    []string{"-test.run=^$"},
+		}
+		pool := NewMCPPool(MCPPoolOptions{
+			Root:           t.TempDir(),
+			EnvPassthrough: []string{"PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "HOME"},
+		})
+		transport, err := pool.dialCommand(self)
+		require.NoError(t, err)
+		cmd := transport.(*mcp.CommandTransport).Command
+		require.NoError(t, cmd.Start(), "dialCommand 构造的命令必须可直接启动")
+		require.NoError(t, cmd.Wait())
+	})
 }
