@@ -41,6 +41,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/testutil"
 )
 
@@ -75,6 +76,12 @@ const (
 	demoDBHubSpecEnv  = "BASALT_E2E_DBHUBS_SPEC"
 	demoBraveSpecEnv  = "BASALT_E2E_BRAVE_SPEC"
 	demoFetchSpecEnv  = "BASALT_E2E_FETCH_SPEC"
+
+	// demoDeliveryTimeout 等系统代投离开 pending 的上限：发送自带 15s ctx，
+	// 再留一倍余量给落库。超限即判失败——pending 不退说明发送这一轮没有收尾，
+	// 不是「再等久一点就好」。
+	// demoDeliveryTimeout bounds the wait for a delivery row to leave pending.
+	demoDeliveryTimeout = 30 * time.Second
 )
 
 // demoPython 找出一个可用的 Python 3 解释器，返回**绝对路径**。
@@ -816,6 +823,43 @@ func demoDeliveryStatus(t *testing.T, h *harness, runID string) string {
 		return ""
 	}
 	return status
+}
+
+// waitDeliveryStatus 等一次 Run 的系统代投行落到期望终态，等不到即判失败。
+// waitDeliveryStatus blocks until the delivery row of one run reaches the wanted state.
+//
+// 为什么必须等：调度器先写执行行终态（`finishRun`），再发投递（`settleDelivery`），
+// 而 `waitCronRun` 只看任务的 last_status。两者之间有一个窗口——窗口内投递行还是
+// pending、接收端还没收到字节。此前直接读接收端计数，就是在赌这个窗口恰好关闭；
+// 在负载高的整包 e2e 里赌输过一次（gate r3：industry_brief 收到 0 次投递）。
+// The scheduler flips the execution row before it sends, so a reader that returns as
+// soon as last_status=completed can still observe an unsent delivery.
+func waitDeliveryStatus(t *testing.T, h *harness, runID, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	logged := false
+	for {
+		last := demoDeliveryStatus(t, h, runID)
+		if last == want {
+			return
+		}
+		// 窗口真的出现过才打这条：它是「这次等待不是空转」的当场证据，
+		// 平时（投递早已落库）一行都不留。
+		// Logged once, and only when the caller actually had to wait.
+		if !logged && last != "" && last != want {
+			t.Logf("Run %s 的代投行首次读数 %q（期望 %q），继续等终态", runID, last, want)
+			logged = true
+		}
+		// 已离开 pending 却不是期望值：立即失败，别把误判拖成超时（诊断信息更有用）。
+		if last != "" && last != string(core.DeliveryPending) {
+			t.Fatalf("Run %s 的系统代投状态 = %q，期望 %q", runID, last, want)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("等待 Run %s 的系统代投状态 = %q 超时（%s），最后一次读数 %q",
+				runID, want, timeout, last)
+		}
+		time.Sleep(readinessPoll)
+	}
 }
 
 // demoFixture 是一整套五 Demo 夹具：一个工作区、一台假模型、一个 80 端口接收端。
@@ -2238,6 +2282,8 @@ func testDemoRepoDigest(t *testing.T) {
 		t.Fatalf("首轮工具调用 %d 次，期望 11 次（剧本写死）", evidence.ToolCalls)
 	}
 	// 零 notify + 一条代投：D2 的通知走系统代投，模型一次都没调 notify。
+	// 代投是运行收尾之后的独立一步，先等投递行落终态再数接收端（见 waitDeliveryStatus）。
+	waitDeliveryStatus(t, f.h, firstRun, "sent", demoDeliveryTimeout)
 	f.requireNotifyCount(t, firstRun, 0, 1)
 	if status := demoDeliveryStatus(t, f.h, firstRun); status != "sent" {
 		t.Fatalf("D2 的系统代投状态 = %q，期望 sent", status)
@@ -2276,6 +2322,7 @@ func testDemoRepoDigest(t *testing.T) {
 		t.Fatalf("第二轮终态 = %s / %s，期望 completed / manual",
 			secondEvidence.Status, secondEvidence.Trigger)
 	}
+	waitDeliveryStatus(t, f.h, second.RunID, "sent", demoDeliveryTimeout)
 	f.requireNotifyCount(t, second.RunID, 0, 2)
 	if status := demoDeliveryStatus(t, f.h, second.RunID); status != "sent" {
 		t.Fatalf("第二轮的系统代投状态 = %q，期望 sent", status)
@@ -4235,6 +4282,8 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 		t.Fatalf("工具调用 %d 次，期望 15 次（3 检索 + 6 抓取 + 3 写 + 2 脚本 + 1 读）",
 			evidence.ToolCalls)
 	}
+	// D5 同样走系统代投：先等投递行落终态，再数接收端（见 waitDeliveryStatus）。
+	waitDeliveryStatus(t, f.h, runID, "sent", demoDeliveryTimeout)
 	f.requireNotifyCount(t, runID, 0, check.notifyTotal)
 	if status := demoDeliveryStatus(t, f.h, runID); status != "sent" {
 		t.Fatalf("系统代投状态 = %q，期望 sent", status)
