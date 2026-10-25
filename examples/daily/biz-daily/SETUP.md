@@ -37,8 +37,24 @@ python examples/shared/scripts/make_sample_db.py \
 
 ## 4. 配置 DBHub MCP server
 
-编辑 `<workspace>/.basalt/mcp_servers.yaml`，加入一条（字段与 MCP 目录条目 `dbhub`
-一致，`verified: false`）：
+先装固定版本：`npm install @bytebase/dbhub@1.5.0`（本 Demo 按 **1.5.0 实测**对齐）。
+
+`dbhub` 1.5.0 已**移除** `--readonly` 参数（传了会直接启动失败）；只读与限行必须
+写在配置文件里。新建 `dbhub.toml`（示例库路径换成你本机的绝对路径）：
+
+```toml
+[[sources]]
+id = "default"
+dsn = "sqlite:///<absolute-path-to-sample.db>"
+
+[[tools]]
+name = "execute_sql"
+source = "default"
+readonly = true
+max_rows = 500
+```
+
+再编辑 `<workspace>/.basalt/mcp_servers.yaml`，加入一条：
 
 ```yaml
 servers:
@@ -49,25 +65,25 @@ servers:
       - "<absolute-path-to-dbhub-entry>"
       - "--transport"
       - "stdio"
-      - "--dsn"
-      - "sqlite:///<absolute-path-to-sample.db>"
-      - "--readonly"
+      - "--config"
+      - "<absolute-path-to-dbhub.toml>"
 ```
 
 - `name` 必须与 `AGENT.md` 的 `mcp_servers: [dbhub]` 逐字一致。
 - `node` 必须是 `shell.allowed_commands` 里的字面量：stdio MCP 启动前同样要过命令
   授权（`mcp server skipped: dbhub` 就是没放行）。若把 `command` 写成 node 的绝对
   路径，`allowed_commands` 也要写同一个绝对路径（白名单按整串逐字比对）。
-- `<absolute-path-to-dbhub-entry>` 是 dbhub 包的入口文件路径（`npx` 安装后的
-  `.../dbhub/dist/index.js` 一类）；**本仓库未实测**。先自己装好包，再把真实路径
-  填进去。
+- `<absolute-path-to-dbhub-entry>` 是包内入口文件：`npm install @bytebase/dbhub@1.5.0`
+  之后是 `<node_modules>/@bytebase/dbhub/dist/index.js`。
+- `<absolute-path-to-dbhub.toml>` 是上一步的配置文件**绝对路径**。
+- `[[tools]]` 里只列 `execute_sql`，服务端就**只暴露这一个工具**（实测 `tools/list`
+  = `["execute_sql"]`）——`AGENT.md` 的 `tools:` 不要写 `list_tables` /
+  `search_objects`，否则会以 `tool not registered` 拒绝注册。
+- 只读是**服务端强制**：`UPDATE` / `DELETE` 会被拒绝并返回
+  `{"success": false, "code": "READONLY_VIOLATION"}`（2026-10-26 实测），不是靠提示词
+  约束。换库或改配置后可以手工验一次。
 - DSN 用 `sqlite:///` 前缀加**绝对路径**（Windows 常见写法
-  `sqlite:///D:/basalt-samples/biz-sample.db`）；三斜杠形态与 Windows 路径写法
-  **未实测**，连不上先查这一项。
-- `--readonly` 让 DBHub 以只读方式打开，不写样例库。
-- 连接后核对一次工具名：目录里写的 `run_query` / `list_tables` 是候选名，若加载报
-  `tool not registered`，按实际 `tools/list` 改 `AGENT.md` 的 `tools:`，**不要**改
-  脚本。
+  `sqlite:///D:/basalt-samples/biz-sample.db`）。
 
 ## 5. 环境变量
 
@@ -155,7 +171,7 @@ sqlite3 <workspace>/.basalt/basalt.db \
   "SELECT task_id, trigger, status FROM task_executions WHERE run_id='<run_id>';"
 
 # 3 候选产物哈希：脚本 stdout 的 report.sha256
-# 4 run_id 与工具调用（必须看到 run_query 的成功行——「DBHub 未被实际调用」判不通过）
+# 4 run_id 与工具调用（必须看到 execute_sql 的成功行——「DBHub 未被实际调用」判不通过）
 sqlite3 <workspace>/.basalt/basalt.db \
   "SELECT tool_name, status, error_kind FROM tool_invocations WHERE run_id='<run_id>' ORDER BY id;"
 sqlite3 <workspace>/.basalt/basalt.db \
@@ -171,7 +187,7 @@ sqlite3 <workspace>/.basalt/basalt.db \
 
 判据：
 
-- `tool_invocations` 里必须有 `run_query` 的成功调用（这是「DBHub 实际调用」的证据）；
+- `tool_invocations` 里必须有 `execute_sql` 的成功调用（这是「DBHub 实际调用」的证据）；
 - 两条计数都必须为 **0**——D3 零通知，出现任何 `notify` 调用或代投行即判不通过；
 - `daily.json` 的四类计数与指标必须能按 README 复算对上；数字对不上就是**不通过**，
   不要用「Run completed」代替业务断言。

@@ -59,6 +59,30 @@ servers:
 - 连接后核对一次工具名：目录里写的 `brave_web_search` / `fetch` 是候选名，若加载报
   `tool not registered`，按实际 `tools/list` 改 `AGENT.md` 的 `tools:`，**不要**改脚本。
 
+### 拿一个 Brave Search API key（官方流程 + 费用）
+
+1. 打开 <https://brave.com/search/api/>，登录并订阅 **Search** 计划——这个 MCP server
+   用的是 Search（`Answers` 是另一个产品）。订阅需要绑卡。
+2. 到 <https://api-dashboard.search.brave.com/app/keys> 生成 API key（只显示一次，
+   当场用）。
+3. 费用（2026-02 起改为按量计费）：每月含 5 美元额度，搜索约 5 美元 / 1,000 次请求，
+   折合约 1,000 次/月落在额度内；额度不结转，用完且没开自动续费时请求会被拒。
+   **官方订阅页在本机不可达（2026-10-26），以上未逐字复核**——下单前自己看一眼当前价。
+4. 网络前提（实测）：2026-10-26 从本机发起时，`brave.com`、`api.search.brave.com`、
+   `api-dashboard.search.brave.com` 三个域名的 HTTPS 连接全部失败（curl 25 秒超时，
+   退出码 28）。订阅、生成 key、Demo 调用都要访问这几个域名——先解决网络，否则 key
+   有了也调不通。
+5. key 只放进程环境 `BRAVE_API_KEY`；`mcp_servers.yaml` 只写 `${BRAVE_API_KEY}`。
+   这个 MCP server 也支持 `BRAVE_API_KEY_FILE`，但 Basalt 的 env 闸门认的是环境变量。
+6. 验证：
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' -H "X-Subscription-Token: $BRAVE_API_KEY" \
+     "https://api.search.brave.com/res/v1/web/search?q=test"
+   ```
+
+   期望 `200`；再在管理台点「测试」看 `ok=true`。
+
 ## 4. 环境变量
 
 | 变量 | 值 |

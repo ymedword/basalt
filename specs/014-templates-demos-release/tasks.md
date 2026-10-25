@@ -148,7 +148,7 @@
 
 - [x] T068 运行 `make check`、`make acceptance`、`make example-tests`、`make e2e` 与 `.\scripts\check-acceptance.ps1 --stage harness/stages/us14-release.json`，按 `quickstart.md` 逐节记录四态读数（通过 / 失败 / 跳过 / 未验证）并更新 run-state 未验证清单；同时核对 `git diff --stat -- go.mod go.sum docs/contracts/schema.sql harness/acceptance.json harness/stages/current.json .github/workflows/ci.yml` 为空（FR-025 零迁移 / 零依赖 / 不改门禁与 CI）
 - [x] T069 按 `quickstart.md` 做管理台人工走查（目录 / 预填 / 503 提示 / 诊断 / 测试详情 / 四轴文案），记录截图或文字证据；不得出现"已验证"徽章
-- [ ] T070 收口三件套（module-dev 步骤 7）：`/speckit-analyze` 复跑 → 独立复核（子代理）→ 七项证据 DoD + 变更总结四段；判据面变更逐路径核对；提交人工 review ② 包，等待用户决定
+- [x] T070 收口三件套（module-dev 步骤 7）：`/speckit-analyze` 复跑 → 独立复核（子代理）→ 七项证据 DoD + 变更总结四段；判据面变更逐路径核对；提交人工 review ② 包，等待用户决定
 
 ---
 
@@ -231,3 +231,12 @@
 - 任务 ID 按执行顺序；勾选由控制侧验收后更新，实现者不得自行勾选。
 - 所有测试函数名英文；中文验收点以注释保留（模块卡原文逐条对号）。
 - `go.mod` / `go.sum` / `schema.sql` / `harness/acceptance.json` / 既有 stage / CI 不在允许修改面。
+
+## Phase 7: 已批准范围变更（2026-10-26）——内嵌 Demo 安装器与 DBHub 1.5.0 对齐
+
+用户 2026-10-26 裁决：Basalt 默认附带五个 Demo 素材，通过独立安装命令按需准备；现有 DBHub 配方按实测 1.5.0 一并修正。追加任务不改既有勾选与编号。
+
+- [ ] T071 [US2] 交付内嵌素材与独立安装命令：`examples/embed.go`（`//go:embed daily shared`）、`internal/cli/demo.go`、`internal/cli/demo_test.go`、`internal/cli/root.go` 注册 `demo install`；在目标工作区写 Demo 目录、`<ws>/demos/install.json` 清单、`<ws>/demos/mcp/dbhub.toml`（`[[sources]]` 指样例库 + `[[tools]] name="execute_sql" readonly=true max_rows=500`）、可直接粘贴的 `mcp_servers.yaml` 片段与逐项待配置提示；两个 GitHub Demo 共用一份 GitHub MCP；`basalt init` 职责不变、模型留空、Demo 停用、安装器不接收也不回显凭据（check `acceptance`）
+- [ ] T072 [US2] 按实测 DBHub 1.5.0 对齐配方与夹具：`examples/daily/biz-daily/**`、`examples/templates/ticket-insights/**`、`internal/catalog/data/mcp_catalog.yaml`（dbhub 改 `--transport stdio` + `--config`，移除已不存在的 `--readonly`；github 增 `--read-only`）、`internal/e2e/us14_demos_test.go` 的 `execute_sql` 夹具与 `demoDBHubEnvelope`、`internal/e2e/us14_templates_test.go` 的 `templateCandidateFaces["dbhub"] = {"execute_sql"}`；只读由服务端实际拒绝写操作验证，业务断言强度不变（check `mcp-catalog` / `demo-fixtures` / `template-quality`）
+- [ ] T073 [US2] 交付凭据获取指引：`examples/README.md` 的 Credentials 节与 github-radar / repo-digest / industry-brief 的 SETUP（官方创建入口、最小只读权限、有效期、套餐或费用要求、`${ENV_VAR}` 本机配置与验证命令、不可达环境的实测声明）；不落盘任何凭据值（check `script-tests`）
+- [ ] T074 [US3] 变更后重跑受影响目标并完整重跑 stage 出 r5（`harness/acceptance/records/us14-release-gate-r5.json` 与 `records/reports/us14-release-gate-r5.json`），逐项四态记录；在 run-state §2.2 登记 DBHub 判据面变更（check `demo-fixtures` / `template-quality` / `e2e` / `acceptance` / `clean-checkout`）

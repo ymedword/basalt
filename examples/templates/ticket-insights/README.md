@@ -22,7 +22,7 @@
 | 项 | 值 |
 | --- | --- |
 | 内置 `tools:` 声明 | `read_file`、`write_file` |
-| MCP 工具名 | `run_query`、`list_tables`（**候选**，以 DBHub 实际 `tools/list` 为准，未实测） |
+| MCP 工具名 | `execute_sql`（按 `@bytebase/dbhub` 1.5.0 实测面对齐：只读配置下只暴露这一个工具） |
 | `skills:` 声明 | `ticket-insights`（实体在本目录 `skills/ticket-insights/SKILL.md`） |
 | `mcp_servers:` 声明 | `dbhub`（stdio，配置见下） |
 | 出网域名 | 无——只读本地 SQLite，不访问网络 |
@@ -33,20 +33,34 @@
 **dbhub 配置要点**（`mcp_servers.yaml` 里一条，命令以你本机实际入口为准）：
 
 ```yaml
-dbhub:
-  transport: stdio
-  command: node
-  args:
-    - "<DBHub 入口绝对路径>"
-    - "--transport"
-    - "stdio"
-    - "--dsn"
-    - "sqlite:///<样例库绝对路径>"
-    - "--readonly"
+servers:
+  - name: dbhub
+    transport: stdio
+    command: node
+    args:
+      - "<DBHub 入口绝对路径>"
+      - "--transport"
+      - "stdio"
+      - "--config"
+      - "<dbhub.toml 绝对路径>"
 ```
 
-`--readonly` 是**档位 A 的前提**：没有它，server 侧仍有写能力，只读只靠 Agent
-`tools:` 声明保证，证据不足。
+```toml
+# dbhub.toml（@bytebase/dbhub 1.5.0：--readonly 参数已被移除，只读写在这里）
+[[sources]]
+id = "default"
+dsn = "sqlite:///<样例库绝对路径>"
+
+[[tools]]
+name = "execute_sql"
+source = "default"
+readonly = true
+max_rows = 500
+```
+
+`[[tools]]` 的 `readonly = true` 是**档位 A 的前提**：没有它，server 侧仍有写能力，
+只读只靠 Agent `tools:` 声明保证，证据不足。实测（2026-10-26，1.5.0）`UPDATE` /
+`DELETE` 返回 `{"success": false, "code": "READONLY_VIOLATION"}`，不写库。
 
 ## 文件范围
 
@@ -69,7 +83,7 @@ dbhub:
 | 依赖 | 说明 |
 | --- | --- |
 | Basalt 实例 | 提供文件工具、MCP 客户端池与调度 |
-| DBHub | Node 24.22.0 + DBHub 发布包（包名与版本**本仓库未核实**，安装前按 npm registry 与官方文档确认）；由它提供 `run_query` / `list_tables` |
+| DBHub | Node 20+ + `@bytebase/dbhub@1.5.0`（本模板按该版本实测面对齐）；由它提供 `execute_sql` |
 | 样例库 | `py -3 examples/shared/scripts/make_sample_db.py --schema …/fixtures/schema.sql --rows …/fixtures/rows.json --out <路径>/tickets.db --force`；`.db` 不提交 |
 | 技能实体 | 复制 `skills/ticket-insights/` 到 `.basalt/skills/ticket-insights/`，否则声明名无实体、整只 Agent 不注册 |
 | 模型连接 | `provider.name: local-model` 是占位，导入后绑定 |
@@ -97,7 +111,7 @@ server `tools/list` 的子集（以 DBHub 实际清单为准，未实测）；�
 - 关键词表是固定小表（登录 / 支付 / 配送），新业务类目要改 `SKILL.md` 的表并重跑
   夹具，属于判据变更；
 - 只统计计数与未关闭清单，不算时长、不算 SLA、不跟历史趋势——没有历史库可支撑；
-- 单表固定结构：换库（例如换成 MySQL）要同时改 `--dsn` 与 `AGENT.md` 的固定 SQL；
+- 单表固定结构：换库（例如换成 MySQL）要同时改 `dbhub.toml` 的 `dsn` 与 `AGENT.md` 的固定 SQL；
 - DBHub 的包入口路径与工具名都在本仓库**未实测**，首次接入请以实际 `tools/list`
   为准并回填 `AGENT.md` 与本节；
 - 本 Agent 声明了 MCP server：`dbhub` 没配好或连不上时，**整只 Agent 不注册**

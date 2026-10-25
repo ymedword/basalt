@@ -115,16 +115,17 @@ var templateCatalog = []templateCase{
 	},
 }
 
-// templateCandidateFaces 是四家第三方 server 的**候选**工具面：名字抄自各模板 README
-// 的「MCP 工具名」行（README 已标明「候选 / 以实际 tools/list 为准 / 未实测」）。
-// 真实 server 在本机未授权实连，因此这里判的是「模板声明 ⊆ README 记录 + 夹具复现的
-// 候选面」；真实面核实后改这张表即可——那是判据面变更，按 EngineeringStandards §2 裁决。
+// templateCandidateFaces 是第三方 server 的工具面：`dbhub` 一行是 2026-10-26 的实测结果
+// （@bytebase/dbhub 1.5.0：只读配置下只暴露 execute_sql；见 examples 里该 Demo 的实测
+// 记录），其余三家仍是模板 README 记录的**候选名**（README 已标「未实测」）。
+// 这里判的是「模板声明 ⊆ README 记录 + 夹具复现的面」；再改这张表（例如真实连到 brave）
+// 仍是判据面变更，按 EngineeringStandards §2 裁决。
 // templateCandidateFaces holds the candidate faces quoted from the template READMEs;
 // the real third-party servers are not authorized for a live connection here.
 var templateCandidateFaces = map[string][]string{
 	"brave-search": {"brave_web_search"},
 	"fetch":        {"fetch"},
-	"dbhub":        {"run_query", "list_tables"},
+	"dbhub":        {"execute_sql"},
 	"playwright":   {"browser_navigate", "browser_snapshot"},
 }
 

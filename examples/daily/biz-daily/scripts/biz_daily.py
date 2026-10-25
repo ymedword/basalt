@@ -178,15 +178,52 @@ def parse_order_date(value: str) -> bool:
         return False
 
 
+def unwrap_dbhub_envelope(payload: dict) -> dict:
+    """把 DBHub `execute_sql` 的真实返回解到「单条语句结果」。
+
+    真实返回（@bytebase/dbhub 1.5.0 实测，2026-10-26）：
+        {"success": true,
+         "data": {"statements": [{"sql": "...", "rows": [...], "count": 3}],
+                  "source_id": "default"}}
+    只读拒绝（同样实测）：
+        {"success": false, "error": "Read-only mode is enabled. ...",
+         "code": "READONLY_VIOLATION"}
+
+    为什么要在这里解：模型拿到的是这段文本，本脚本是「数字的唯一来源」——让模型
+    自己挑 `rows` 等于让它改结构，判据就不再可复核。
+    """
+    if payload.get("success") is False:
+        code = text_of(payload.get("code") or "")
+        message = text_of(payload.get("error") or "")
+        raise ScriptError(f"查询失败（{code or '服务端未给码'}）：{message or '服务端未给原因'}")
+    data = payload.get("data")
+    if not isinstance(data, dict) or "statements" not in data:
+        return payload
+    statements = data["statements"]
+    if not isinstance(statements, list) or len(statements) != 1:
+        count = len(statements) if isinstance(statements, list) else 0
+        raise ScriptError(f"execute_sql 应只返回一条语句的结果，实际 {count} 条")
+    statement = statements[0]
+    if not isinstance(statement, dict):
+        raise ScriptError(f"statements[0] 不是对象，实际 {type(statement).__name__}")
+    return statement
+
+
 def normalize_payload(payload: object) -> list[object]:
-    """接受裸数组，或 `{"rows": [...]}` / `{"items": [...]}` 形态的查询结果。"""
+    """接受裸数组、`{"rows": [...]}` / `{"items": [...]}`，或 DBHub `execute_sql` 的
+    真实返回（`{"success": true, "data": {"statements": [{"rows": [...]}]}}`）。"""
+    if isinstance(payload, dict):
+        payload = unwrap_dbhub_envelope(payload)
     if isinstance(payload, dict):
         for key in ("rows", "items"):
             if key in payload:
                 payload = payload[key]
                 break
         else:
-            raise ScriptError('查询结果必须是行数组，或 {"rows": [...]} / {"items": [...]} 形态的列表响应')
+            raise ScriptError(
+                '查询结果必须是行数组，或 {"rows": [...]} / {"items": [...]}，'
+                '或 DBHub execute_sql 的 {"success": true, "data": {"statements": [...]}} 形态'
+            )
     if not isinstance(payload, list):
         raise ScriptError(f"查询结果必须是数组，实际 {type(payload).__name__}")
     for index, row in enumerate(payload, start=1):

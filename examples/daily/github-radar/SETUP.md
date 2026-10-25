@@ -24,15 +24,48 @@ servers:
     command: github-mcp-server
     args:
       - "stdio"
+      - "--read-only"
     env:
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
 ```
 
 - `name` 必须与 `AGENT.md` 的 `mcp_servers: [github]` 逐字一致。
+- `--read-only` 让服务端只提供读工具（缺它时 `tools/list` 里会出现写工具；`AGENT.md`
+  的 `tools:` 没声明它们，但没必要把攻击面留在那儿）。
 - `github-mcp-server` 的安装方式与版本**未实测**（目录 `verified: false`）。它是 Go 二进制，
   需要自己在 PATH 上放好；装好后先跑 `github-mcp-server --help` 确认参数形态。
 - `env` 的值只写 `${VAR}` 占位：保存 / 发布时若变量缺失或为空，Basalt 会 **fail-closed**
   拒绝写入并返回 503 + `operation_id`（不会把占位符写成字面量）。
+
+### 拿一个只读 PAT（GitHub 官方流程，2026-10-26 核对）
+
+1. 打开 <https://github.com/settings/personal-access-tokens/new>；管理台里的路径是
+   Settings → Developer settings → Personal access tokens → Fine-grained tokens →
+   Generate new token。
+2. **Resource owner** 选你本人（组织仓库要组织批准）；**Repository access** 选
+   **Public repositories**——公开仓库只读，不用逐个挑仓库。D1 只读公开仓库的元数据与文件内容，
+   公开数据不需要额外权限；要读私有仓库再加 `Contents: read` / `Issues: read` /
+   `Pull requests: read`（`Metadata: read` 由 GitHub 强制附带）。
+3. **Expiration** 选够用就好：表单默认 30 天，可设 1–366 天；「无期限」也能选，但
+   组织 / 企业设了最长有效期策略时会被拦。
+4. 生成后**只在本机**放进启动 Basalt 的那个进程环境：
+   `export GITHUB_PERSONAL_ACCESS_TOKEN=...`。配置里永远只有
+   `${GITHUB_PERSONAL_ACCESS_TOKEN}` 占位——不要把值写进 `mcp_servers.yaml`、
+   `AGENT.md`、脚本或任何提交记录。
+5. 服务端也设成只读：`args` 里加 `--read-only`（Docker 用 `GITHUB_READ_ONLY=1`），
+   写工具就不会出现在 `tools/list` 里；想要更小的面再加
+   `--toolsets repos,issues,pull_requests`。这是**服务端**的约束，与 token 权限无关，
+   两层都要有。
+6. 验证：
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' \
+     -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" \
+     https://api.github.com/rate_limit
+   ```
+
+   打印 `200` 即通；再在管理台点该 server 的「测试」，看到 `ok=true` 与工具清单即可。
+   `401` 说明 token 过期或被吊销——先换 token，再查别的。
 
 ## 3. 环境变量
 

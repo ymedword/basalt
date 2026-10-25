@@ -40,17 +40,16 @@ items:
       - "<absolute-path-to-dbhub-entry>"
       - "--transport"
       - "stdio"
-      - "--dsn"
-      - "sqlite:///<absolute-path-to-sample.db>"
-      - "--readonly"
+      - "--config"
+      - "<absolute-path-to-dbhub.toml>"
     url: ""
     env: []
     requires:
-      - Node.js 20+ 与 dbhub 包入口
-      - 样例 SQLite 文件的绝对路径
+      - Node.js 20+ 与 @bytebase/dbhub 1.5.0（入口在 node_modules/@bytebase/dbhub/dist/index.js）
+      - 一份 dbhub.toml：[[sources]] 指向 SQLite 绝对路径，[[tools]] 里把 execute_sql 设 readonly = true
     source_url: https://github.com/bytebase/dbhub
     verified: false
-    verification_note: 命令、包入口路径、DSN 形态与只读工具名待实测。
+    verification_note: 2026-10-26 Windows 实测（@bytebase/dbhub 1.5.0）：--readonly 参数已被移除，改 dbhub.toml 的 [[tools]] 后 tools/list 只报 execute_sql；UPDATE / DELETE 返回 READONLY_VIOLATION。控制台预填仍是占位路径，未走发布流程实测。
     verified_at: ""
     verified_platforms: []
     warnings:
@@ -111,6 +110,7 @@ items:
     command: github-mcp-server
     args:
       - "stdio"
+      - "--read-only"
     url: ""
     env:
       - key: GITHUB_PERSONAL_ACCESS_TOKEN
@@ -118,8 +118,9 @@ items:
         required: true
         description: 只读细粒度 PAT。
     requires:
-      - GitHub 只读细粒度 PAT
+      - GitHub 只读细粒度 PAT（公开仓库只读即可，默认 30 天到期）
       - github-mcp-server 二进制在 PATH 上
+      - args 里的 --read-only 让服务端只报读工具（可再加 --toolsets 缩小工具面）
     source_url: https://github.com/github/github-mcp-server
     verified: false
     verification_note: 命令、参数、版本、只读工具名与代表性调用待实测。

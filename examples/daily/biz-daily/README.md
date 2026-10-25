@@ -28,8 +28,7 @@
 
 | 工具 | 来源 | 用途 |
 | --- | --- | --- |
-| `run_query` | DBHub MCP（`dbhub`） | 执行固定 SQL，取 `orders` 明细 |
-| `list_tables` | DBHub MCP（`dbhub`） | 连库自检：确认 `orders` 表存在 |
+| `execute_sql` | DBHub MCP（`dbhub`，`@bytebase/dbhub` 1.5.0） | 连库自检与固定 SQL，取 `orders` 明细 |
 | `read_file` | 内置 | 读脚本产物 `daily.json` |
 | `write_file` | 内置 | 落盘查询结果 `orders.json`、写 `daily.md` |
 | `shell` | 内置 | 运行 `scripts/biz_daily.py`（解释器受 `shell.interpreters` 约束） |
@@ -37,9 +36,17 @@
 `AGENT.md` 的声明与上表一致；`notify` **不在**声明里——基线 `notify_mode: none`，
 工具面也不会补。`shell` 同样是必需项：脚本跑不起来就没有可信数字。
 
-**MCP 工具名未实测**：`run_query` / `list_tables` 按 DBHub 公开工具名填写（MCP
-目录条目 `dbhub` 的 `verified: false`）。连接后若加载报 `tool not registered: <name>`，
-按实际 `tools/list` 改 `tools:` 声明，**不要**改脚本。
+**工具面按实测对齐（2026-10-26，`@bytebase/dbhub` 1.5.0，Windows）**：
+
+- `dbhub.toml` 的 `[[tools]]` 只列 `execute_sql` 时，`tools/list` **只报这一个工具**；
+  `search_objects` / `list_tables` 均不存在。入参只有一个键：`{"sql": "..."}`。
+- 调用成功时结果是 MCP 文本块，内容为
+  `{"success": true, "data": {"statements": [{"sql": "...", "rows": [...], "count": N}],
+  "source_id": "default"}}`；脚本按这个结构解包（也接受裸数组与 `{"rows": [...]}`）。
+- 只读由配置强制：`UPDATE` / `DELETE` 返回
+  `{"success": false, "code": "READONLY_VIOLATION"}`，不写库。
+- 目录条目 `dbhub` 的 `verified` 仍为 `false`：验证时间 / 平台字段在本 US 未登记，
+  真实证据以本节实测记录与 `SETUP.md` 为准。
 
 ## 内置域名白名单
 
@@ -88,7 +95,7 @@ node <absolute-path-to-dbhub-entry> --transport stdio \
 
 | 路径 | 谁写 | 说明 |
 | --- | --- | --- |
-| `orders.json`（Agent 根目录） | 模型（`write_file`） | `run_query` 响应**原样**落盘，**不得**改字段、改数字、改顺序 |
+| `orders.json`（Agent 根目录） | 模型（`write_file`） | `execute_sql` 返回的**整段** JSON 原样落盘（含 `success` / `data.statements`），**不得**改字段、改数字、改顺序 |
 | `runs/<时间戳>/daily.json` | 脚本（原子替换） | 机器可读结果；父目录由脚本创建 |
 | `runs/<时间戳>/daily.md` | 模型（`write_file`） | 日报正文，数字全部取自 `daily.json` |
 | `scripts/` | 只读区 | 模型改不动脚本；这是「数字由脚本算」的前提 |
@@ -177,13 +184,16 @@ python scripts/biz_daily.py --orders orders.json
 
 | 参数 | 必填 | 缺省 | 说明 |
 | --- | --- | --- | --- |
-| `--orders` | 是 | — | `run_query` 响应的落盘 JSON |
+| `--orders` | 是 | — | `execute_sql` 响应的落盘 JSON |
 | `--output` | 否 | `runs/<YYYYMMDDTHHMMSS>/daily.json` | 报告路径；父目录自动创建 |
 | `--now` | 否 | 本机当前时间 | 运行时钟，**必须带时区偏移**；显式给出可复跑 |
 | `--max-examples` | 否 | `5` | 每类异常最多展示的明细条数（`0` = 只计数不列明细） |
 
-**输入**：裸数组，或 `{"rows": [...]}` / `{"items": [...]}` 形态。任何输入不合规 →
-**非零退出，一个字节都不写**（连输出父目录都不创建）。
+**输入**：DBHub `execute_sql` 的真实返回
+`{"success": true, "data": {"statements": [{"rows": [...], ...}]}}`，或更朴素的裸数组、
+`{"rows": [...]}` / `{"items": [...]}`。`{"success": false, ...}`（如 `READONLY_VIOLATION`）
+与多语句结果都按**错误**处理，不折算成「零行」。任何输入不合规 → **非零退出，一个
+字节都不写**（连输出父目录都不创建）。
 
 **输出 `daily.json` 字段**：
 
@@ -284,14 +294,14 @@ python scripts/biz_daily.py --orders fixtures/rows.json \
 | 夹具可复跑 | **已验证** | `scripts/test_biz_daily.py` 19 个用例全绿（`Ran 19 tests … OK`）；同一夹具两次重跑 `daily.json` 哈希一致 |
 | 三类异常逐类计数 | **已验证** | 夹具断言 `{valid:15, missing:3, duplicate:2, invalid:4}` 与互斥不变量；三处逆改探针（缺失补 0 / 取消去重 / 静默截断）分别变红 |
 | 样例库生成 | **已验证** | `make_sample_db.py` 生成 24 行；SQL 直查确认三类异常都在库里；重复生成逐字节一致（同一机器） |
-| 真实 DBHub + Node 实跑 | **未验证** | 外部依赖未授权；包入口、`--readonly`、工具名均未实测 |
+| 真实 DBHub + Node 实跑 | **已验证（本机）** | 2026-10-26：`@bytebase/dbhub` 1.5.0 + 真实模型跑通一轮（24 行 → 15 有效 / 3 缺失 / 2 重复 / 4 非法）；工具面与只读拒绝见「工具清单」节实测记录 |
 | 自动触发 / 人工补跑 | **未验证** | 需要真实实例；本轮只交夹具与脚本证据 |
 | 零通知 | **配置固定，运行未取证** | `notify_mode: none` 且工具面无 `notify`；`schedule_deliveries` 为 0 的行为需按 `SETUP.md` 在实例上核对 |
 
 ## 已知限制
 
-- **DBHub 工具名未实测**：`run_query` / `list_tables` 按公开文档填写；首次连接后按
-  `tools/list` 核对一次。
+- **DBHub 版本被钉死**：只读与限行只由 `dbhub.toml` 的 `[[tools]]` 生效（1.5.0 已移除
+  `--readonly` 参数）；换版本要先按 `SETUP.md` 重核 `tools/list` 与拒绝语义。
 - **样例库是桩数据**：24 行固定数据用于复现三类异常；换成真实业务库时，SQL 与脚本
   字段约定要同步改，脚本的必填字段 / 状态枚举是固定的。
 - **不做跨行修复建议**：重复单号只告警并保留首次出现，不判断哪一行「才是对的」；

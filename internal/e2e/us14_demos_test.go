@@ -1036,9 +1036,12 @@ func (f *demoFixture) writeSpecs(t *testing.T) {
 		{Name: "list_issues", Description: "列 Issue", Schema: objectSchema("owner", "repo", "state"), Result: `{"items":[]}`},
 		{Name: "list_releases", Description: "列 Release", Schema: objectSchema("owner", "repo"), Result: `{"items":[]}`},
 	})
+	// DBHub 面按 @bytebase/dbhub 1.5.0 实测对齐：只读配置下只暴露 `execute_sql`，
+	// 结果是一段文本 JSON（success / data.statements），与真实 server 同形。
+	// The DBHub face mirrors the measured 1.5.0 server: a single execute_sql tool whose
+	// text content is the real envelope shape.
 	f.writeSpec(t, demoDBHubSpecEnv, []testutil.MCPSpecTool{
-		{Name: "run_query", Description: "执行只读 SQL", Schema: objectSchema("sql"), Result: `{"rows":[]}`},
-		{Name: "list_tables", Description: "列表清单", Schema: objectSchema(), Result: `{"tables":["orders"]}`},
+		{Name: "execute_sql", Description: "执行只读 SQL", Schema: objectSchema("sql"), Result: `{"success":true,"data":{"statements":[{"sql":"","rows":[],"count":0}],"source_id":"default"}}`},
 	})
 	f.writeSpec(t, demoBraveSpecEnv, []testutil.MCPSpecTool{
 		{Name: "brave_web_search", Description: "网页检索", Schema: objectSchema("query", "count"), Result: `{"web":{"results":[]}}`},
@@ -2352,9 +2355,13 @@ const (
 	// d3SQL is the fixed SQL from AGENT.md step 2, verbatim.
 	d3SQL = "SELECT row_id, order_id, order_date, region, channel, amount, status, note\n" +
 		"FROM orders ORDER BY row_id;"
-	// d3FixtureHash 是固定输入 `fixtures/rows.json` 的 sha256（实测）。
-	// d3FixtureHash pins the shipped orders fixture digest.
-	d3FixtureHash = "d64d446df5c4ccf4044fc01999ab05e71de37a0f97cff817d439ac7d4f6cfaf6"
+	// d3InputHash 是模型实际写进 `orders.json` 的字节的 sha256（实测）：内容不再是
+	// 裸 `{"rows":[...]}`，而是 `execute_sql` 的返回信封（`success` / `data.statements`），
+	// 与 @bytebase/dbhub 1.5.0 的实测形状一致；里面的行仍是 `fixtures/rows.json` 的
+	// 同一批，所以业务读数（15/3/2/4、净额 10700.50）保持不变。
+	// d3InputHash pins the exact bytes written to orders.json: the dbhub result
+	// envelope now, wrapping the same fixture rows.
+	d3InputHash = "84f64efe4c5122f178c376a6a28fcd4c2155c83045e4d0e0ea32b1c0a47467b9"
 )
 
 // demoBizExample 是一行「需人工确认」明细（缺失与非法值共用外形）。
@@ -2523,6 +2530,36 @@ func d3DailyReport(out demoBizOut) string {
 	return b.String()
 }
 
+// demoDBHubEnvelope 把固定行集包进 @bytebase/dbhub 1.5.0 的实测返回形态：
+// 模型拿到的工具文本就是这段 JSON（success / data.statements[0].rows），
+// 脚本按同一形态解包——夹具与真实 server 同形，判据才有意义。
+// demoDBHubEnvelope wraps fixture rows in the measured dbhub 1.5.0 result envelope.
+func demoDBHubEnvelope(t *testing.T, sql, rowsJSON string) string {
+	t.Helper()
+	var payload struct {
+		Rows []json.RawMessage `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(rowsJSON), &payload); err != nil {
+		t.Fatalf("解析固定输入行集失败: %v", err)
+	}
+	envelope := map[string]any{
+		"success": true,
+		"data": map[string]any{
+			"statements": []any{map[string]any{
+				"sql":   sql,
+				"rows":  payload.Rows,
+				"count": len(payload.Rows),
+			}},
+			"source_id": "default",
+		},
+	}
+	out, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("编码 dbhub 返回信封失败: %v", err)
+	}
+	return string(out)
+}
+
 // d3Steps 组装一次 D3 运行：连库自检 → 固定 SQL → 原样落盘 → 跑脚本 → 读产物 →
 // 写日报 → 以日报正文收尾。工具面没有 notify（零通知是 D3 的口径）。
 // d3Steps builds one D3 run; the notify tool is absent by design.
@@ -2537,19 +2574,21 @@ func d3Steps(f *demoFixture, runTag string) []demoStep {
 	return []demoStep{
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			d.requireNoTool("notify", "D3 基线 notify_mode: none，工具面不该有 notify（零通知口径）")
-			return demoCall(next(1, "list-tables"), "list_tables", map[string]any{})
+			return demoCall(next(1, "sqlite-master"), "execute_sql", map[string]any{
+				"sql": "SELECT name FROM sqlite_master WHERE type='table';",
+			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "list_tables", "第 1 步应是连库自检，实际 %q", name)
-			return demoCall(next(2, "run-query"), "run_query", map[string]any{"sql": d3SQL})
+			d.must(name == "execute_sql", "第 1 步应是连库自检，实际 %q", name)
+			return demoCall(next(2, "fixed-sql"), "execute_sql", map[string]any{"sql": d3SQL})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "run_query", "第 2 步应是固定 SQL，实际 %q", name)
+			d.must(name == "execute_sql", "第 2 步应是固定 SQL，实际 %q", name)
 			return demoCall(next(3, "write-orders"), "write_file", map[string]any{
 				"path":    "orders.json",
-				"content": d.lastToolTexts("run_query", 1)[0],
+				"content": d.lastToolTexts("execute_sql", 1)[0],
 			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
@@ -2668,9 +2707,11 @@ func d3RequireNumbers(t *testing.T, out demoBizOut) {
 // testDemoBizDaily covers D3 end to end.
 func testDemoBizDaily(t *testing.T) {
 	f := newDemoFixture(t)
-	f.setToolResult(t, demoDBHubSpecEnv, "list_tables", `{"tables":["orders"]}`)
-	f.setToolResult(t, demoDBHubSpecEnv, "run_query",
-		f.fixtureJSON(t, "examples/daily/biz-daily/fixtures/rows.json"))
+	// 连库自检与固定 SQL 走同一个工具：DBHub 1.5.0 只读面就一个 execute_sql，
+	// 自检靠语句本身区分。返回值按实测信封包住固定行集。
+	// Both steps share execute_sql (the only tool the measured read-only face exposes).
+	f.setToolResult(t, demoDBHubSpecEnv, "execute_sql",
+		demoDBHubEnvelope(t, d3SQL, f.fixtureJSON(t, "examples/daily/biz-daily/fixtures/rows.json")))
 	modelUID := f.modelUID(t)
 	auto := time.Now().Add(15 * time.Second).In(demoCST())
 	dir := f.installAgent(t, "biz-daily", demoOptions{
@@ -2706,9 +2747,9 @@ func testDemoBizDaily(t *testing.T) {
 		}
 	}
 	d3RequireNumbers(t, first)
-	if first.Input.SHA256 != d3FixtureHash {
+	if first.Input.SHA256 != d3InputHash {
 		t.Fatalf("输入哈希 %s 与固定输入的实测值 %s 不一致（输入被改过？）",
-			first.Input.SHA256, d3FixtureHash)
+			first.Input.SHA256, d3InputHash)
 	}
 	requireDigestOnDisk(t, dir, first.Input, "D3 输入")
 	requireDigestOnDisk(t, dir, summary.Report, "D3 报告")
@@ -2751,7 +2792,7 @@ func testDemoBizDaily(t *testing.T) {
 	second := f.runScheduleNowOnce(t, taskID)
 	secondOut := decodeD3Artifact(t, demoToolResults(t, f.h, second.RunID, "read_file")[0])
 	d3RequireNumbers(t, secondOut)
-	if secondOut.Input.SHA256 != d3FixtureHash {
+	if secondOut.Input.SHA256 != d3InputHash {
 		t.Fatalf("第二轮输入哈希 %s 与固定输入不一致", secondOut.Input.SHA256)
 	}
 	f.requireNotifyCount(t, second.RunID, 0, 0)

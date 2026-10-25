@@ -133,6 +133,7 @@
 - **FR-023**: 公开材料 MUST 只做增量：README（英文单语）与官网 MUST 增加模板与 Demo、MCP 目录、运行示例、验证状态区块，MUST NOT 新增一级路由或链接私有路径；US-13 收口前 MUST NOT 修改其交付物。
 - **FR-024**: 四份权威正文与公开运维手册的相关小节 MUST 与实现同步（新五场景、目录 / 诊断 / 测试记录 / 工具来源、示例依赖与出网边界、文件量重估），且 MUST NOT 借此改写历史 US 的已验收证据。
 - **FR-025**: 本 US MUST 保持零 schema 迁移、零新增 Go 依赖坐标、零新增 npm 生产依赖；MUST NOT 把发布 e2e 加入既有门禁或 CI，MUST NOT 修改既有 stage。
+- **FR-026**: 发行包 MUST 内嵌五个 Demo 的素材，并 MUST 提供独立安装命令（`basalt demo install`）按需在目标工作区准备 Agent、技能、脚本、样例数据与固定版本的 MCP 依赖；两个 GitHub Demo MUST 共用同一份 GitHub MCP。安装器 MUST 保留 `basalt init` 的既有职责不变，MUST NOT 写模型配置或凭据，Demo MUST 保持停用、安装后逐项列出待配置项；MUST NOT 自动改动权限；权限变更 MUST 要求用户显式确认。安装器 MUST 交付按官方流程编写的凭据获取指引（GitHub PAT 与 Brave Search API key：最小只读权限、有效期、套餐或费用要求、本机配置与验证方式），且凭据 MUST 只由用户在本机输入、安装器 MUST NOT 接收、回显或落盘任何凭据值。目录与 Demo 中的 MCP 配方 MUST 与实测版本一致（DBHub 1.5.0 只读经 `dbhub.toml` 的 `[[tools]]` 表达、`--readonly` 不再使用），只读 MUST 由服务端实际拒绝写操作来验证，MUST NOT 只靠提示词限制。
 
 ### Key Entities
 

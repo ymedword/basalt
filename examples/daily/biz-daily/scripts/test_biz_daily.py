@@ -158,6 +158,44 @@ class BizDailyTest(unittest.TestCase):
         with self.assertRaises(ScriptError):  # 逆改点：静默补默认值 → 红
             run({"bad": "shape"})
 
+    def test_dbhub_envelope_is_unwrapped(self):
+        # 真实返回形态（@bytebase/dbhub 1.5.0 实测 2026-10-26）：模型原样落盘整段
+        # content 文本，脚本自己解到 statements[0].rows——不让模型挑结构。
+        envelope = {
+            "success": True,
+            "data": {
+                "statements": [{"sql": "SELECT ...", "rows": load_fixture(), "count": 24}],
+                "source_id": "default",
+            },
+        }
+        out = run(envelope)
+        self.assertEqual(out["quality"]["counts"]["valid"], 15)
+        self.assertEqual(out["quality"]["counts"]["missing"], 3)
+
+    def test_dbhub_readonly_violation_raises(self):
+        # 写操作被 dbhub 以 READONLY_VIOLATION 拒绝时，脚本必须报错退出，
+        # 不得把「零行」当成本次结果（逆改点：忽略 success=false → 红）。
+        envelope = {
+            "success": False,
+            "error": "Read-only mode is enabled. Only the following SQL operations are allowed: select, with, explain, pragma",
+            "code": "READONLY_VIOLATION",
+        }
+        with self.assertRaises(ScriptError) as caught:
+            run(envelope)
+        self.assertIn("READONLY_VIOLATION", str(caught.exception))
+
+    def test_dbhub_multiple_statements_raise(self):
+        envelope = {
+            "success": True,
+            "data": {
+                "statements": [{"rows": load_fixture()}, {"rows": []}],
+                "source_id": "default",
+            },
+        }
+        with self.assertRaises(ScriptError) as caught:
+            run(envelope)
+        self.assertIn("一条语句", str(caught.exception))
+
     def test_non_object_row_raises(self):
         with self.assertRaises(ScriptError):
             run(["not-a-row"])

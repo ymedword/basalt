@@ -491,6 +491,43 @@
 
 **复核者列出的未覆盖面中与本轮相关的三条**：① URL 豁免的用户裁决仍缺（§2.2 #13）；② 完整 stage / `clean-checkout` 未执行（即 F-12）；③ `os.SameFile` / `os.Rename` 的替换测试只在本机 Windows 通过，Linux 未验证（已进 §4 未验证清单）。
 
+### 2.1.1 补充读数：候选提交 `57784fe` 上的双平台走查重跑（2026-10-26，非 stage 判卷）
+
+**为什么重跑**：gate r4 钉在 `57784fe`，而此前的升级 / 恢复演练与 Linux 走查绑的是 `11ef243` 的 `fb022a01…` / `3de73e44…`。`git diff 11ef243 57784fe` 实测改动面 = `internal/tool/mcp.go`（`classifyInitializeFailure` 的 deadline 分支前移，19 行）、`examples/shared/mcp/docs-readonly/main.go`（112 行）、`scripts/check-release-clean.sh`（5 行）与各自测试——都是产品面改动，旧二进制证据不能代表发布候选。
+
+#### Windows（`deploy/basalt.exe` = `bin-new/basalt.exe`，sha256 `946a6b801f78ec15a75119aa57995d6101280de2c9f82b6d31227ac70b435a99`，`basalt version 57784fe`）
+
+- **升级 §5.1 六步**：停 → 备份 → 换二进制（旧文件留作 `deploy/basalt.bak-prev`，sha256 `857c8de2846fc3ec74f2539357f82c7ae28a135877d9e75deb9831876a168eba`，`basalt version e2e285f-pre-us14`）→ 起服 → 验证 → 观察。
+- **备份时点读数**：`backup-20261025T1932` 10 个文件（`basalt.db` `24ec4e41aab327258ae16cc4bc8291564b844944d4163394a1603c96c6d9239a`、`basalt.yaml` `1573953c…`、无 WAL / SHM）；计数 `{"messages":2,"runs":1,"runs_completed":1,"llm_calls":1,"llm_calls_success":1,"tool_invocations":0,"management_operations":3,"scheduled_tasks":0,"notify_channels":0,"sqlite_master_tables":30,"schema_version":5}`。旧二进制在换二进制前读过新数据：`status` / `session list` / `profile list` 全 exit 0。
+- **换后起服**：`health=200`、`/console/=200`；**无迁移**（日志逐字 `v3 迁移：库已是目标版本，跳过` `schema_version=5`）；`status` 汇总全部通过（schema v5、29 张表）、`session list` `cli-1c5aafb256301130` 2 条、`profile list` 1 个（`registered=true`）、`tool list` **10 件**。
+- **chat #2**：exit 0，回复 `drill-ok: 演练实例已连通（假模型，非真实模型）`；计数 `messages 4 / runs 2 / runs_completed 2 / llm_calls 2 / llm_calls_success 2 / tool_invocations 0 / management_operations 3`，库 `4a470380d65dec199574bd1eb3d2857d99b7d0764b14106cb7bf61e8987d8572`；假模型日志 2 行，第 2 次请求带 4 条消息（历史确实跨进程落库读回）。
+- **实例锁（候选二进制，逐字）**：`serve` 持锁时 `chat` exit 1 —— `取得实例锁: 工作区实例锁已被占用：pid=3640，开始于 2026-10-25T19:36:55Z——另一个活实例正在运行，写模式命令拒绝启动（服务在跑时请改用 REST / 管理台）`。
+- **中文控制台**：`status` / `profile list` / `session list` / `chat` 输出均为中文（Git Bash 里显示为乱码属终端编码，不是程序输出问题）。
+- **MCP 目录（14A 端点）**：`GET /api/v1/catalog/mcp` 无 auth **401** / 带 auth **200** / 6 条、按 id 升序（`brave-search`、`dbhub`、`fetch`、`filesystem-readonly`、`github`、`playwright`），字段集 = `args,category,command,display_name,env,id,requires,source_url,summary,transport,url,verification_note,verified,verified_at,verified_platforms,warnings`。
+
+#### 恢复演练 §4.3（CLI 路径：全程不起 `serve`）
+
+- 独立目录 `restore-check/`：`cp -a` 备份的 `.basalt` + `basalt.yaml`；恢复后库 sha256 仍 `24ec4e41…`（与备份逐字节一致）、`basalt.yaml` diff 为空。
+- **三隔离**：① `scheduled_tasks=0` 且备份的 `AGENT.md` 无 `schedules` 键；② `notify_channels=0` 且环境无任何 notify / webhook / feishu / lark 变量（未覆盖也未 unset，纯粹不存在）；③ `network_domain_policy` = `('http.allowed_domains','',1,1792956662609,'')`——**空白名单**（最严格收口；配置键不生效，以库为准）。
+- **五判据**：`status` 汇总全部通过 / `session list` 2 条 / `profile list` 1 个 / `tool list` 10 件 / `chat` exit 0 走完整链路并回复同一句。**审计增量**：`messages 2→4`、`runs 1→2`、`llm_calls 1→2`（`management_operations` 仍 3）；跑完 chat 的库 `889a15aea68deb002375053bae2c130b8259353301970dbdce65fd415ed35782`。
+- **旧二进制读恢复副本**：`status` / `session list` / `profile list` 全 exit 0，且**未改动库**（执行前后 hash 都是 `24ec4e41…`）——回滚可读得到证。
+- **三个互不相同的库哈希**：live `4a470380…`、备份 / 恢复副本 `24ec4e41…`、恢复副本跑完 chat `889a15ae…`。
+
+#### Linux（WSL2 Ubuntu，kernel 6.6.114.1-microsoft-standard-WSL2，python3 3.14.4）
+
+- **同一发布 argv 交叉编译**：`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=57784fe" -o basalt-linux-amd64 ./cmd/basalt` → sha256 `0c62c6573eb0d4dfbbba1ade333ebf5c82478298e678551e0263ded2d6a8d58a`（ELF 64-bit LSB，statically linked，stripped），`basalt version 57784fe`。
+- **回环**：假模型 Linux 侧 `127.0.0.1:18470`，实例 `127.0.0.1:18471`，`http.allowed_domains: []`。
+- **序列**：`init`（11 项 / schema v5）→ `serve` → `health=200` / `/console/=200` / `catalog` 401→200（6 条、同 id 升序）→ `POST /agents`（带 `model`）→ `enable` → 停服 → `status` 全部通过 / `profile list` 1 个（provider `drill-fake` / 模型 `drill-model`）/ `tool list` 10 件 / `chat` exit 0 / `session list` `cli-b3bbc22b4a2ec58f` 2 条。
+- **启用代数**：首次 `expected_generation=0` → **409 CONFLICT**，`expected_generation=1` → **200**（`ag_F6YK24Z5EGXXRZ5A6204KXSTVE`，`generation=2`），与 Windows 同形。
+- **落库**：`messages 2 / runs 1 / runs_completed 1 / llm_calls 1（success 1）/ tool_invocations 0 / management_operations 3（system.baseline_v2 + agent.create + agent.enable）/ scheduled_tasks 0 / notify_channels 0 / 30 表 / schema v5`；库 `86218c4eb2fd35982a053621a311c404a3a7189ce093bf07427c7359e913cbcc`。
+- **零外呼**：假模型请求日志恰好 1 行（`model=drill-model`、`messages=2`）；策略行空 → 除回环外没有任何通道被打开。
+
+**顺带补验（此前只在本机 Windows 验过）**：`examples/shared/mcp/docs-readonly` 嵌套 module 在 **Linux** 上跑通——`go test -count=1 -v ./...` → 8 个顶层用例 + 2 个子用例全 PASS、零 SKIP，含 `TestDocsReadOnly_RejectsSwappedFile`（`os.SameFile` / `os.Rename` 替换守卫）与 `TestDocsReadOnly_RejectsSymlink/real_filesystem`，`ok … 0.004s`。**环境事实**：WSL 自带 go 1.26.0，低于该 module 的 `go 1.27`，故经 `GOPROXY=https://goproxy.cn` 由 `GOTOOLCHAIN=auto` 拉取 go1.27.0 执行（Windows 本仓构建仍用 toolchain go1.27.2）。
+
+**新增观察（不是缺陷，已记 C-050）**：创建后**立即**启用会在注册表快照刷新前返回 404。探针（仓库外 `race_probe.py`，200 ms 轮询）读数：t+77 ms → 404、t+280 ms → 404、t+483 ms → 409 CONFLICT，与 `internal/workspace/watcher.go:32` 的 `watcherDebounce = 300 * time.Millisecond` 吻合。控制台有人工延迟，走查脚本必须自带「404 重试 / 409 读代数重试」。
+
+**本轮未覆盖、不据此宣称通过**：14A 的 `diagnostics` / `test` 端点（需先有已发布 MCP server，两平台走查均未构造）；14B 五 Demo 的真实自动触发与八模板夹具复跑（外部服务零授权）；浏览器交互走查（沿用 T069 轮读数，不在本轮重跑）；真实 `.cmd` / GitHub / Brave / Fetch / Playwright / DBHub 行为。
+
 ### 2.2 判据面变更记录（实施期间，只追加）
 
 | # | 日期 | 文件 / 用例 | 旧形态 | 新形态 | 依据（已审输入） | 断言面变化 |
@@ -517,6 +554,7 @@
 | 18 | 2026-10-26 | `internal/e2e/us14_examples_test.go` / `TestMCPEgress_Documentation` + `docs/Operations.md` §2.2 | 只查 §2.2 的 4 个行标签、全节「白名单」与「管不到 / 不受」；`shell.allowed_commands` 只查全文出现 | 六行走廊逐行判第三列极性（是 / 否 前缀），启动行另须点名 `shell.allowed_commands`；Operations §2.2 补「远程 MCP 下游」「stdio 启动程序」两行，标题改「按通道分开看」 | 复核 F-02 / F-03 / F-04 / F-11；模块卡 §2.8.3 七行表与 C-20 | **判据加强**：4 行 → 6 行、极性逐行判，方向写反必红；Operations 增两行属文档补齐，不改已批准范围 |
 | 19 | 2026-10-26 | §2.2 #13 的收窄（URL 内嵌凭据对 RFC 2606 文档域豁免） | #13 记录状态为「**待用户裁决**」 | **用户裁决：采纳豁免**；stage `approval` 同步记为已裁决（`example.com` / `example.net` / `example.org` 及子域豁免，其他主机仍命中） | 用户 2026-10-26 在 US-14 收口对话中明确选择「采纳豁免」 | **无新增判据变化**：#13 所述收窄即最终形态；非占位主机由植入样本 `user:secret@intranet.corp` 持续证明必红 |
 | 20 | 2026-10-26 | `internal/e2e/us14_demos_test.go` / `testDemoRepoDigest`（两处）与 `d5RequireRun`（一处）的代投计数 | 运行收尾后**读一次**就断言：`demoDeliveryStatus` 必须已经是 `sent`、接收端累计数必须等于期望 | 先调 `waitDeliveryStatus(t, h, runID, "sent", 30s)` 等代投行离开 `pending`，**再**跑原样的 `requireNotifyCount` + 原样的 `demoDeliveryStatus == "sent"` 断言（原断言一行未删） | 失败台账 #23：调度器 `finishRun` → `settleDelivery` 有窗口，`waitCronRun` 的判据只到 `last_status`；本地 3 轮 D5 命中 1 次首读 `pending`（gate r3 即在此窗口误判） | **判据零削弱**：期望值与终态集合一字未改，仍要求「恰好 1 条代投、状态 `sent`、接收端恰好 N 条」；改动只把「读一次」换成「有界等终态再读」，且 `failed` / `unknown` / `skipped` 仍立即判红（比超时更早、读数更具体）。属同步缺陷修复 + 等价重构，不是阈值放宽 |
+| 21 | 2026-10-26 | `internal/e2e/us14_demos_test.go`（D3 `execute_sql` 夹具与 `demoDBHubEnvelope`）、`internal/e2e/us14_templates_test.go`（`templateCandidateFaces["dbhub"]`）、`examples/daily/biz-daily/**`、`examples/templates/ticket-insights/**`、`internal/catalog/data/mcp_catalog.yaml` | D3 夹具按旧配方假想：`execute_sql` 返回自由文本统计结果；dbhub 只读工具面记“候选未测”；素材与目录配方写 `--readonly`（该版本已移除） | 按 2026-10-26 本机实测 @bytebase/dbhub 1.5.0 对齐：`tools/list` 只报 `execute_sql`（入参 `{sql}`）；成功返回 `{"success":true,"data":{"statements":[{sql,rows,count}],"source_id":"default"}}`；写操作返回 `isError=true` + `code=READONLY_VIOLATION`。夹具改为该信封（`demoDBHubEnvelope` 由固定行集构造），`templateCandidateFaces["dbhub"] = {"execute_sql"}` 记已测；素材 / 配方改 `--transport stdio --config`，只读由 `dbhub.toml` 的 `[[tools]] readonly=true max_rows=500` 表达 | 用户 2026-10-26 裁决（`AskUserQuestion`）：“批准现在一并修正，固定使用已实测的 DBHub 1.5.0……不只替换工具名，还要按真实 tools/list 和调用结果对齐参数、返回结构；只读模式使用该版本实际支持的 dbhub.toml 配置，并验证写操作确实被拒绝，不能仅靠提示词限制。” | **判据面变更**：D3 夹具由自由文本改为真实信封；`d3FixtureHash` 更名 `d3InputHash` 并按实测重钉 `84f64efe…`；业务断言（15 / 3 / 2 / 4、净额 10700.50、零通知）与只读拒绝断言一字未删；模板候选面 dbhub 由“候选”升为“已测”，brave / fetch / playwright 仍为候选。依据为本机真实调用证据（2026-10-26），非提示词推断 |
 
 > 该变更不是删断言或放宽阈值（断言逐字保留），而是把前置形态调整到已批准接口允许的唯一路径；旧形态在新契约下已不可达。
 
@@ -544,20 +582,24 @@
 - e2e 热加载 / 取消 / 工具超时新测试**未实现**；`make e2e` / `us14-release` stage **未创建**。——**已验证（2026-10-25）**：`internal/e2e/us14_release_test.go` 四条落地，`make e2e` 在 `accept-20261025T035216.740018600` 中 passed（236883 ms，81 条具名用例），热加载 / 取消 / 工具超时三条另有逆改红态（同报告补充读数）；`harness/stages/us14-release.json` 已创建并加载为 `us14-release-r1`。
 - 管理台**浏览器走查**（目录页 / 预填交互 / 503 后打开操作详情 / 诊断不启动进程 / `.cmd` 未确认 / `pending_restart` 与连接状态并存 / `tool_disposition` 内置赢家 / 空工具清单）——**已验证（2026-10-25）**：用户裁决的验证方式 = 浏览器自动化实跑（真实实例 `ws2`），setup 7/7、phase 1 14/14、phase 2 5/5，三段 `console_errors` 均为 `[]`；19 张截图（`shots/01-overview.png` … `19-ghost-applied-unconnected.png`）与三份 `result-*.json` 见 §2.1「T069 浏览器走查」补充读数；同轮发现并修复两处实现缺陷（失败台账 #20 / #21，均有逐字红态）。**纯主观视觉评价**记「用户裁决免验，不阻断收口」，**不**记为人工验证通过；**仍不构成通过、单列**：诊断点击瞬间的进程树人工旁证（自动化只取点击前后子进程集合差）、真实 `.cmd` 与真实 GitHub / Brave / Fetch / Playwright / DBHub 行为（走查用同名假 server，外部服务未授权）。
 
-- **`docs-readonly` 的文件替换守卫只在 Windows 验证（2026-10-26，复核未覆盖面）**：`TestDocsReadOnly_RejectsSwappedFile` 依赖 `os.Rename` 覆盖已打开文件与 `os.SameFile` 的身份比对，本机 Windows passed；Linux / macOS 未执行。是否在 Linux 上补跑由 review ② 决定（WSL 可跑嵌套 module 测试）。
+- **`docs-readonly` 的文件替换守卫——平台覆盖**（2026-10-26 复核未覆盖面）：`TestDocsReadOnly_RejectsSwappedFile` 依赖 `os.Rename` 覆盖已打开文件与 `os.SameFile` 的身份比对，本机 Windows passed。**已验证（2026-10-26）**：在 WSL2 Ubuntu 上跑该嵌套 module 全量用例 → 8 个顶层 + 2 个子用例全 PASS、零 SKIP，`TestDocsReadOnly_RejectsSwappedFile` 与 `TestDocsReadOnly_RejectsSymlink/real_filesystem` 均在内（读数见 §2.1.1）；macOS 仍未执行。
 - **`-tags=e2e` 的文件不在 `make lint` 判卷面（2026-10-26，判卷面事实）**：`make lint` 的 staticcheck 不带构建标签，`internal/e2e` 里带 `//go:build e2e` 的文件因此从静态检查中整体缺席；本轮用 `GOFLAGS=-tags=e2e staticcheck -checks=inherit,ST1000,…` 单独扫了一次，报出 22 处既有 `U1000`（未使用的测试助手，`fixtures_test.go` / `harness_test.go` / `us14_demos_test.go` 的旧函数），**本轮新增的 `waitDeliveryStatus` 不在其中**。未动这些旧助手（不属本 US 改动面）。是否把 e2e 标签纳入门禁属判据面提案，留 review ② 裁决。
 - **候选提交后重跑，取代上文两处 dirty 哈希（2026-10-26）**：Windows 候选 = `bin/basalt.exe` `fb022a01d94e155a3c4682527827e715c9d7829b7dba906b40ba1402d10d909f`（20,377,600 B，`basalt version 11ef243`），升级 / 恢复演练已在该文件上重跑（§2.1「候选提交后重跑」）；Linux = `3de73e446486dc0bc8ce4a9b9d5648c9c1b933dd0be5182e0660b2a6f5e6a847`（20,050,080 B，`basalt version 11ef243`），WSL2 走查已重跑（同节）；`34406c4f…` / `da3bb7f9…` 两个 dirty 戳哈希作废，不得写入发布记录。
+- **再取代：发布候选 = `57784fe`（2026-10-26，gate r4 所在提交）**：Windows 候选 `946a6b801f78ec15a75119aa57995d6101280de2c9f82b6d31227ac70b435a99`（`deploy/basalt.exe`，`basalt version 57784fe`，与 gate r4 记录里的 `tested_binary_sha256` 同一文件）、Linux 交叉编译 `0c62c6573eb0d4dfbbba1ade333ebf5c82478298e678551e0263ded2d6a8d58a`（ELF 64-bit LSB、静态链接、stripped）。升级 / 恢复演练与 WSL2 走查**都已在这两个文件上重跑**，读数见 §2.1.1；`fb022a01…` / `3de73e44…` 随 `11ef243` 一并作废，发布记录只引用 `946a6b80…` / `0c62c657…`。
 
 - **发布证据链**（`clean-checkout` 真实验收、发布记录与依赖许可表、双平台走查、`v0.1.0` tag）**等待用户提交候选提交**——**部分验证（2026-10-25）**：全量 stage `accept-20261025T134558.780851700` 的 37 项中 36 项 passed（公共十项 + 本 stage 二十六项，读数见 §2.1「T068 全量 stage」），`clean-checkout` 在 245 ms 内以 `clean-checkout: 工作区不干净——发布证据只能绑定已提交的候选提交` 退出，属脚本设计上的预期红、**不**构成 T064 通过；工作区干净路径的机制已在 `e2e285f` 克隆上验证（§2.1「T064 轮」），但克隆不是候选提交，不作发布证据。T064 / T066 / T067 / T068 / T070 在用户提交后于候选提交上重跑。——**不依赖提交的那一半已完成（2026-10-25）**：依赖与许可表（Go 24 行 + Node / Python / 自研素材 / MCP 六条状态）、升级与恢复演练（Operations §5.1 六步 + §5.2 回滚前置 + §4.3 三隔离五判据）、双平台走查（Windows 演练 + 浏览器自动化、Linux WSL2 全链路）三项读数见 §2.1 三块补充读数；**仍阻塞在用户提交后**：T064 真实 `clean-checkout`、T066 发布记录（版本 + commit + 候选路径 / SHA-256 须与分发产物同一文件，且 `+dirty` 戳与两个二进制哈希都要重算）、T067 条件式文档更新、T068 绿态全量 stage、T070 收口三件套与 review ② 包。**临时资源归属**：`%LOCALAPPDATA%/Temp/t66drill/`（演练工作区、假模型、备份 / 恢复副本、许可扫描产物）与 `%LOCALAPPDATA%/Temp/t66linux/`（Linux 二进制与两份脚本 / 日志）+ WSL `~/t66linux-walk` 全部在仓库外，**保留到候选提交后的重跑与收口，收口前整体删除**；仓库内零临时探针（T056 / T063 探针均建在 Temp 且已删）。**——候选提交后已完成（2026-10-26）**：全量 stage `us14-release-gate-r2` 37/37 passed（`clean-checkout` 1203.5 s passed，commit `11ef243`，dirty=false）；发布记录已发布（`records/us14-release-gate-r2.json` + `records/reports/us14-release-gate-r2.json` + `ledger.md` 一行），发布后 `--task T066` 复跑 passed；T064 / T066 / T067 / T068 四态读数见 §2.1 两条补充读数。**仍为未验证**：T060 全部真实外部实跑（零授权）、`v0.1.0` tag（用户手动）、review ② 人工决定。**临时物已清理（2026-10-26）**：`%LOCALAPPDATA%/Temp/t66drill/`、`t66drill2/`、`t66linux/`、`us14-closeout/`、两份 US-14 临时日志与 WSL `~/t66linux-walk`（20 M）已整体删除，仓库外无残留；证据读数已固化在 §2.1 / §2.2，删除不影响复核。
 
 ## 5. 收口结论
 
-**待人工 review ②**（2026-10-26 第二次更新）。AI 侧进展与未完成项：
+**待人工 review ②**（2026-10-26 第三次更新）。AI 侧进展与未完成项：
 
 - 首轮独立复核 = 带条件通过（条件 F1）；F1–F6 已逐条处置并留绿态 / 逆改红态读数（§2.1「收口独立复核 F1–F6 处置」）。
 - **第二轮独立复核（修复闭环）= 阻断**（F-01–F-13）。除 F-12（需新候选提交后的全量 gate 记录）与 F-13（转 errata）外均已处置，逐条读数见 §2.1「第二轮独立复核（修复闭环）」。
 - **用户裁决（2026-10-26）**：① §2.2 #13 的判据收窄（RFC 2606 文档域豁免）**采纳**（记 §2.2 #19，stage `approval` 同步）；② **授权第二个本地候选提交**，并在该提交上重跑全量 stage（r3），发布 r3 记录取代 r2（r2 保留为历史行）。授权仅限本仓 `git commit`；push / tag / 部署仍归用户。
 - **gate r3 结果（2026-10-26）**：36/37 passed，`e2e` exit=2——`TestUS14Demos_Fixture/industry_brief` 的接收端计数在代投落库前读了一次（失败台账 #23），是测试同步缺陷而非实现缺陷；判定窗口真实存在（本地 3 轮命中 1 次首读 `pending`）。修法 = D2 / D5 三处计数前加有界等待（§2.2 #20），**断言值一字未改**；复跑 `--task T038` passed（7 条子测试全 PASS）。r3 报告与日志保留在 `.loop/runs/us14-release-gate-r3/`，**不发布记录**。
-- **未完成的收口前置**：① **第三个本地候选提交**（含 #23 修复）与全量 gate r4（预计 ~55 min），发布 r4 记录取代 r2 / r3；② 重建双平台候选二进制与 SHA-256（在 r4 候选提交上）；③ 七项 DoD 与四段变更总结在 r4 绿态后写；④ 模块卡 errata（F-13：§2.8.4 的 `TestExamples_NoSecrets`、§4.4 缺两条测试映射）随 review ② 包提交，由用户决定是否出 R4。
-- **仍为未验证**：T060 全部真实外部实跑（零授权）、五个 Demo 真实自动触发 / 八模板夹具复跑（外部依赖）、`v0.1.0` tag（用户手动）、纯主观视觉（用户裁决免验，不阻断收口）、Linux 上 `os.SameFile` / `os.Rename` 的替换行为（只在本机 Windows 验过）。
+- **gate r4 结果与发布（2026-10-26，用户授权第三个本地候选提交）**：候选提交 `57784fe`，全量 stage **37/37 passed**，`dirty=false`，`tested_binary_sha256=946a6b80…`，`source_fingerprint=a32bb07e…`，起止 `2026-10-25T18:28:35Z → 19:24:49Z`。记录已按 `harness/acceptance/records/README.md` 发布：`records/us14-release-gate-r4.json`（`5b085a19…`）+ `records/reports/us14-release-gate-r4.json`（`05f1bbf7…`，与记录 `evidence.report_sha256` 及 `.loop/runs/us14-release-gate-r4/report.json` 逐字节相同）+ `ledger.md` 追加一行（日期取 UTC `2026-10-25`，与 `finished_at` 对齐）；发布后 `--task T066` 复跑 = `fmt` + `release-records` passed，证明 `TestRecords_PublishedConform` / `TestRecords_NoSecretsOrAbsolutePaths` 对本次发布判绿。
+- **双平台候选二进制已在 r4 候选上重建（2026-10-26）**：Windows `946a6b80…`（与记录里的 `tested_binary_sha256` 同一文件）、Linux `0c62c657…`；升级 / 恢复演练与 WSL2 走查在这两个文件上重跑完毕，读数见 §2.1.1。
+- **收口前置剩余项**：③ **已完成（2026-10-26）**——七项 DoD（逐项四态 + 本轮读数）与四段变更总结已在本轮对话输出（module-dev 步骤 7 不另开文件）；④ 模块卡 errata（F-13：§2.8.4 的 `TestExamples_NoSecrets`、§4.4 缺两条测试映射）随 review ② 包提交，由用户决定是否出 R4。
+- **临时资源已清空（2026-10-26，收口前）**：`$LOCALAPPDATA/Temp/t66drill3/`（演练工作区 / 假模型与 `requests.jsonl` / 备份与恢复副本 / 双平台二进制 / token / `race_probe.py`）、`$LOCALAPPDATA/Temp/us14-validate-rec.py`、`$LOCALAPPDATA/Temp/us14-commit-msg-3.txt`、WSL `/tmp/us14-linux-drill/`（测试假模型进程 pid 535 先停后删）全部删除，逐项复查不存在；仓库根无遗留构建产物。
+- **仍为未验证**：T060 全部真实外部实跑（零授权）、五个 Demo 真实自动触发 / 八模板夹具复跑（外部依赖）、`v0.1.0` tag（用户手动）、纯主观视觉（用户裁决免验，不阻断收口）、macOS 上 `os.SameFile` / `os.Rename` 的替换行为（Windows 与 Linux 均已验，macOS 未跑）。
 - 未收到人工决定前，本段不得写成人工接受；commit / push / tag 仍归用户。

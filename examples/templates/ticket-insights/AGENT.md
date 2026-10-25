@@ -10,8 +10,7 @@ provider:
   name: local-model
   model: 请在此填写模型名
 tools:
-  - run_query
-  - list_tables
+  - execute_sql
   - read_file
   - write_file
 mcp_servers:
@@ -37,11 +36,13 @@ schedules:
 分类口径由 `ticket-insights` 技能规定（固定关键词表 + 固定匹配顺序）；**不得**自己
 发明类别、**不得**按情绪或紧急程度重排、**不得**替业务下结论。
 
-1. **连库自检**：用 `list_tables` 确认样例库里有 `tickets` 表。MCP 工具名以服务端
-   `tools/list` 为准（候选名 `run_query` / `list_tables`，**未实测**，以实际连接
-   结果为准）；连不上按第 7 步处理，**不得**改用别的数据源。
+1. **连库自检**：调用 DBHub 的唯一工具 `execute_sql`（入参只有 `sql` 一个键），
+   执行 `{"sql": "SELECT name FROM sqlite_master WHERE type='table';"}`，确认结果里
+   有 `tickets` 表。工具名与本模板按 `@bytebase/dbhub` 1.5.0 的实测面对齐（只读配置
+   下只暴露 `execute_sql`，没有 `list_tables` / `search_objects`）；连不上按第 7 步
+   处理，**不得**改用别的数据源。
 
-2. **取明细**：用 `run_query` 执行下面这条**固定 SQL**，一个字都不要改（不加
+2. **取明细**：用 `execute_sql` 执行下面这条**固定 SQL**，一个字都不要改（不加
    `WHERE`、不换列序、不限行）：
 
    ```sql
@@ -68,8 +69,8 @@ schedules:
    确认字段来源。
 
 7. **失败处理**：
-   - `list_tables` / `run_query` 失败 → 报告只写失败段（错误原文 + 观测时间），
-     不写分类结论，不重试超过一次；
+   - `execute_sql` 失败（含被只读配置拒绝的 `READONLY_VIOLATION`）→ 报告只写失败段
+     （错误原文 + 观测时间），不写分类结论，不重试超过一次；
    - 查询成功但 0 行 → 分类表四类全写 0，并写明「本次没有工单」，**不得**补造；
    - 落盘的 `tickets.json` 与查询结果不一致（行数对不上）→ 重新落盘一次，仍不一致
      就在失败段写明，不按残缺数据出结论。

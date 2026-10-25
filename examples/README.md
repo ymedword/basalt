@@ -74,6 +74,34 @@ MCP servers are separate processes. Their network access is decided by each serv
 
 A manual run is recorded with `trigger=manual`. It is evidence of a working agent, but it is not evidence that the schedule fired on its own.
 
+## Credentials
+
+Two demos need a key of their own. Neither key ships here, and `basalt demo install` never accepts one: it writes only `${VAR}` placeholders, and Basalt's configuration gate refuses to save a server whose referenced variable is missing or empty. The full walk-through for each demo lives in its `SETUP.md`, so a copied workspace stays self-contained; this section is the shared summary.
+
+### GitHub personal access token
+
+Used by `daily/github-radar` and `daily/repo-digest`.
+
+1. Open <https://github.com/settings/personal-access-tokens/new> (Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token).
+2. Resource owner: your account (an organization may require approval). Repository access: **Public repositories** — read-only over any public repository, with no per-repository selection. Both demos read public metadata, file contents, issues, pull requests and releases; public data needs no extra permission. Add `Contents: read` / `Issues: read` / `Pull requests: read` only if you point them at private repositories (`Metadata: read` is attached by GitHub).
+3. Expiration: the form defaults to 30 days and accepts 1–366; "no expiration" is allowed but an organization or enterprise maximum-lifetime policy can block it.
+4. Keep the value in the environment of the Basalt process only (`export GITHUB_PERSONAL_ACCESS_TOKEN=...`). Never in `mcp_servers.yaml`, `AGENT.md`, a script or a commit.
+5. Start `github-mcp-server` with `--read-only` (`GITHUB_READ_ONLY=1` in Docker), so write tools are never offered, and optionally `--toolsets repos,issues,pull_requests`. That is a server-side limit and a separate layer from the token scope; use both.
+6. Verify: `curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" https://api.github.com/rate_limit` prints `200`. A `401` means the token expired or was revoked.
+
+The token itself is free; there is no plan to buy.
+
+### Brave Search API key
+
+Used by `daily/industry-brief`.
+
+1. Subscribe to the **Search** plan at <https://brave.com/search/api/> — the MCP server uses Search, while `Answers` is a different product. A credit card is required.
+2. Generate the key at <https://api-dashboard.search.brave.com/app/keys>; it is shown once.
+3. Cost, as of the February 2026 move to metered billing: $5 of monthly credit included, search at roughly $5 per 1,000 requests — about 1,000 queries per month inside the credit. Unused credit does not roll over, and requests are rejected once it is spent unless auto-reload is enabled. **Not re-checked on the vendor page** — `brave.com`, `api.search.brave.com` and `api-dashboard.search.brave.com` were all unreachable from the machine used for this repository on 2026-10-26 (connection timeouts), so confirm the current price before subscribing.
+4. That same network finding is a precondition for the demo: subscribing, generating the key and calling the API all need those hosts to resolve and connect.
+5. Keep the value in `BRAVE_API_KEY` in the Basalt process environment; `mcp_servers.yaml` holds `${BRAVE_API_KEY}` only. The server also accepts `BRAVE_API_KEY_FILE`, but Basalt's environment gate reads the variable.
+6. Verify: `curl -s -o /dev/null -w '%{http_code}\n' -H "X-Subscription-Token: $BRAVE_API_KEY" "https://api.search.brave.com/res/v1/web/search?q=test"` returns `200`.
+
 ## What is verified, and what is not
 
 Two kinds of claims appear in this directory, and they are not interchangeable:

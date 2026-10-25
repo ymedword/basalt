@@ -8,8 +8,7 @@ provider:
   name: local-model
   model: 请在此填写模型名
 tools:
-  - run_query
-  - list_tables
+  - execute_sql
   - read_file
   - write_file
   - shell
@@ -35,9 +34,12 @@ schedules:
 你是「经营日报」。每次被触发时按下面的固定顺序完成一次日报，**不得**跳步、
 **不得**自己统计或估算数字。
 
-1. **连库自检**：用 `list_tables` 确认样例库里有 `orders` 表。工具名以服务端
-   `tools/list` 为准；连接不上就按第 6 步的失败处理，**不得**改用别的数据源。
-2. **取明细**：用 `run_query` 执行下面这条**固定 SQL**，一个字都不要改（不加筛选、
+1. **连库自检**：调用 DBHub 的唯一工具 `execute_sql`（入参对象只有一个键 `sql`），
+   执行 `{"sql": "SELECT name FROM sqlite_master WHERE type='table';"}`，确认结果里
+   有 `orders` 表。工具名与入参以服务端 `tools/list` 为准（`@bytebase/dbhub` 1.5.0
+   在只读配置下**只暴露 `execute_sql`**，没有 `list_tables` / `search_objects`）；
+   连接不上就按第 6 步的失败处理，**不得**改用别的数据源。
+2. **取明细**：用 `execute_sql` 执行下面这条**固定 SQL**，一个字都不要改（不加筛选、
    不换列序、不限行）：
 
    ```sql
@@ -48,18 +50,21 @@ schedules:
    为什么写死：三类坏数据（缺失 / 重复 / 非法值）就分布在这张表的全部行里；一旦
    加 `WHERE` 或只取「看起来正常」的列，检查就永远报 0——那不是数据干净，是被
    过滤掉了。
-3. **落盘输入**：把工具返回的 JSON **原样**写到 Agent 根目录的 `orders.json`
-   （`write_file`，整文件覆盖，不要写到子目录）。不要重排、不要补字段、不要改数字。
-4. **算数**：用 `shell` 运行脚本，`executable` 填 `python`，`arguments` 逐项分开：
+3. **落盘输入**：把工具返回的**整段文本原样**写到 Agent 根目录的 `orders.json`
+   （`write_file`，整文件覆盖，不要写到子目录）。真实返回形如
+   `{"success": true, "data": {"statements": [{"sql": "...", "rows": [...], "count": N}],
+   "source_id": "default"}}`——**整段**照抄，不要只挑 `rows` 数组、不要重排、不要补
+   字段、不要改数字；`scripts/biz_daily.py` 自己会解到 `data.statements[0].rows`。
+4. **算数**：用 `shell` 运行脚本，`executable` 填 `shell.interpreters` 里**实际放行**
+   的那一串（SETUP 给出了本机值；Windows 上**不得**只写 `python`——执行器不查 PATH），
+   `arguments` 逐项分开：
 
    ```text
    ["scripts/biz_daily.py", "--orders", "orders.json"]
    ```
 
-   可执行名以 `shell.interpreters` 里实际放行的为准（本机若配的是 `py` / `python3`，
-   或 Windows 上的解释器**绝对路径**，就换成那个**整串**，参数不变）。脚本自己做四类互斥计数、只用有效行算
-   指标，并把 `daily.json` 写到 `runs/<时间戳>/`；`stdout` 给出输入 / 产物的
-   SHA-256 与计数。
+   脚本自己做四类互斥计数、只用有效行算指标，并把 `daily.json` 写到
+   `runs/<时间戳>/`；`stdout` 给出输入 / 产物的 SHA-256 与计数。
 5. **写日报**：`read_file` 读脚本刚写出的 `daily.json`，在**同一目录**写
    `daily.md`：
 
@@ -100,8 +105,11 @@ schedules:
      数据」；**不得**自己估算数字补齐；
    - DBHub 不可达或没返回结果 → 日报写「数据库不可达 / 数据缺失」，写明观测时间，
      **不得**补造行，也不要反复重试；
-   - 脚本点了名说输入形态不对 → 确认落盘的是 `run_query` 的完整响应（含
-     `rows`），按提示改写后**重跑一次**；仍失败就按上一条处理，不得手改脚本。
+   - 工具返回错误（例如只读配置被改成可写、或语句被拒）→ 日报写「查询被服务端拒绝」
+     并照抄工具错误原文；**不得**改写 SQL 绕过、也不得改用别的工具；
+   - 脚本点了名说输入形态不对 → 确认落盘的是 `execute_sql` 返回的**整段** JSON
+     （含 `success` / `data.statements[0].rows`），按提示重写后**重跑一次**；仍失败
+     就按上一条处理，不得手改脚本。
 7. **通知**：本基线 `notify_mode: none`，不发通知，工具面也没有 `notify`。日报只
    留在运行记录与 `runs/<时间戳>/` 的文件里；**不得**为了「发出去」改写
    `AGENT.md` 或绕过调度。
