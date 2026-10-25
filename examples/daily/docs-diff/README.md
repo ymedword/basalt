@@ -8,8 +8,8 @@
 「两次读取是否同源」的一致性检查，不参与差异判定；换台机器、换个目录、改 JSON 缩进
 都不会改变报告结论。差异由 Python 脚本算，模型只负责取数、解释与写报告。
 
-> 档位：Demo（不是模板）。**业务脚本 22 个单测 / 夹具 / `docs-readonly` 嵌套 module
-> 单测 / 真实 MCP → 脚本三轮链路（本机 Windows）已验证**；**真实模型驱动的完整 Agent
+> 档位：Demo（不是模板）。**业务脚本 22 个单测 / 夹具 / `docs-readonly` 单测 / 真实
+> MCP → 脚本三轮链路（本机 Windows）已验证**；**真实模型驱动的完整 Agent
 > Run 未验证**（本轮无模型授权）；**真实通知接收未验证**；**自动触发 / 人工补跑未在
 > 该实例取证**。证据档位见文末。
 
@@ -60,11 +60,15 @@ server 的**能力边界**保证，而不是只靠 Agent 的 `tools:` 声明。
 
 ## 启动程序与版本
 
-MCP 目录里没有这条配方（自研素材，随仓库交付），`SETUP.md` 第 3 节现场构建：
+MCP 目录里没有这条配方（自研素材，随仓库交付）。`basalt demo install --demo docs-diff`
+会把源码导出到 `<工作区>/.basalt/demos/src/docs-readonly` 并打印构建命令：
 
 ```sh
-go -C examples/shared/mcp/docs-readonly build -o <absolute-path-to-docs-readonly-binary> .
+go -C <工作区>/.basalt/demos/src/docs-readonly build -o <absolute-path-to-docs-readonly-binary> .
 ```
+
+导出目录自带安装器生成的最小 `go.mod`；从源码检出构建时改用
+`go build ./examples/shared/mcp/docs-readonly`。
 
 - `serverVersion` 是 `0.1.0`，`initialize` 回显 `2024-11-05`；
 - 已实测（本机 Windows）：`initialize` → `tools/list` → `tools/call` 全链路通过，
@@ -84,12 +88,13 @@ go -C examples/shared/mcp/docs-readonly build -o <absolute-path-to-docs-readonly
 | 依赖 | 版本 | 用途 |
 | --- | --- | --- |
 | Python | 3.12（标准库即可） | 运行 `scripts/docs_diff.py`（`shell.interpreters`） |
-| Go | 1.27.2（构建版本） | 构建 `examples/shared/mcp/docs-readonly`（独立嵌套 module，零依赖） |
+| Go | 1.27.2（构建版本） | 构建 `examples/shared/mcp/docs-readonly`（主 module 内、零第三方依赖；安装器导出源码时生成 `go.mod`） |
 | Basalt | v0.1.0 | 运行底座（调度、MCP、记忆、审计） |
 
 脚本零第三方依赖：`docs_diff.py` 只用 `argparse` / `hashlib` / `json` / `os` / `sys` /
-`tempfile` / `datetime` / `pathlib`。`docs-readonly` 是纯标准库 Go 程序（独立
-`go.mod`，根 `go test ./...` 不包含它，需用 `go -C` 单独跑）。
+`tempfile` / `datetime` / `pathlib`。`docs-readonly` 是纯标准库 Go 程序（主 module 内
+`package main`，随根 `go test ./...` 与 `make example-tests` 一起测；导出目录里的
+`go.mod` 由安装器生成）。
 
 ## 读写文件范围
 

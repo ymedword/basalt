@@ -3,7 +3,7 @@ package main
 // docs-readonly 的协议 / 越界 / 只读测试（颗粒度文档 §3.9 / §4.3 `docs-readonly-tests`）。
 // 全部直接驱动 `serve(in, out, root)`，不启动子进程：本 module 零依赖，可用
 // `go -C examples/shared/mcp/docs-readonly test -count=1 ./...` 单独运行，
-// 根 `go test ./...` 不覆盖它（嵌套 module）。
+// 根 `go test ./...` 覆盖它（2026-10-26 并回主 module；仍不被产品二进制导入）。
 // Every test drives serve(in, out, root) in-process; no child processes are started.
 
 import (

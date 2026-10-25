@@ -79,13 +79,13 @@ npm --prefix assets/console run build
 
 ## 2. 14B：示例 / 模板 / 只读 MCP
 
-### 2.1 嵌套 module 测试
+### 2.1 docs-readonly 单测
 
 ```sh
-go -C examples/shared/mcp/docs-readonly test -count=1 ./...
+go test -count=1 ./examples/shared/mcp/docs-readonly
 ```
 
-**预期**：`ok`；越界 / 绝对路径 / 软链接 / 写操作被拒绝，`initialize` / `tools/list` / `tools/call` 三件工具行为符合 README。根 `go test ./...` **不覆盖**它。
+**预期**：`ok`；越界 / 绝对路径 / 软链接 / 写操作被拒绝，`initialize` / `tools/list` / `tools/call` 三件工具行为符合 README。它在主 module 内，根 `go test ./...` 同样覆盖；stage 另用 `-run ^TestDocsReadOnly_` 固定命名用例。
 
 ### 2.2 示例脚本测试
 
@@ -131,7 +131,7 @@ make e2e
 
 **预期**：
 
-- `example-tests` = 嵌套 module 测试 + `scripts/run-example-tests.py`，全绿。
+- `example-tests` = docs-readonly 单测 + `scripts/run-example-tests.py`，全绿。
 - `e2e` = `build` + `example-tests` + `BASALT_E2E_BINARY=$(CURDIR)/bin/basalt go test -json -tags=e2e -count=1 ./internal/e2e`；测试输出含 `binary_source=candidate` 与 `binary_sha256`，且哈希与 `bin/basalt` 一致。`make e2e` **必须**导出该变量；标记缺失或为 `temp` = 发布证据失败（直接 `go test -tags=e2e` 允许 temp 回退，但不得作为发布证据，见 §2.3）。
 - 七场景逐项绿：工具闭环 / 越权 / 取消 / 工具超时 / 崩溃恢复 / 409 / 热加载 / Web·调度·通知（取消与工具超时是**两个**用例：取消 → Run `cancelled` + 无子进程残留；超时 → 工具审计 `failed` + `timeout` + Run `completed` 且失败结果回填）。
 

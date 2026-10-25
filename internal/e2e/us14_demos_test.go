@@ -992,7 +992,7 @@ func (f *demoFixture) config() string {
 // demoQuote single-quotes a YAML scalar so backslashes stay literal.
 func demoQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 
-// buildDocsReadOnlyBinary 构建只读 MCP server（嵌套 module，纯标准库）。D4 夹具与模板
+// buildDocsReadOnlyBinary 构建只读 MCP server（主 module 内，纯标准库）。D4 夹具与模板
 // 闸门共用这一份构建代码——两处各写一遍必然漂移，而它判的是同一个交付物。
 // 构建失败即判红：它是仓库交付物，不是可跳过的前置。
 // buildDocsReadOnlyBinary builds the shipped read-only MCP server; both the demo
@@ -1005,9 +1005,8 @@ func buildDocsReadOnlyBinary(t *testing.T, repo string) string {
 		name += ".exe"
 	}
 	target := filepath.Join(t.TempDir(), name)
-	moduleDir := filepath.Join(repo, "examples", "shared", "mcp", "docs-readonly")
-	cmd := exec.Command("go", "build", "-trimpath", "-o", target, ".")
-	cmd.Dir = moduleDir
+	cmd := exec.Command("go", "build", "-trimpath", "-o", target, "./examples/shared/mcp/docs-readonly")
+	cmd.Dir = repo
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

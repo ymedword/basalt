@@ -59,7 +59,7 @@ servers:
    Settings → Developer settings → Personal access tokens → Fine-grained tokens →
    Generate new token。
 2. **Resource owner** 选你本人（组织仓库要组织批准）；**Repository access** 选
-   **Public repositories**——公开仓库只读，不用逐个挑仓库。D4 只读公开仓库的 Pull Request / Issue / Release 计数，
+   **Public repositories**——公开仓库只读，不用逐个挑仓库。D2 只读公开仓库的 Pull Request / Issue / Release 计数，
    公开数据不需要额外权限；要读私有仓库再加 `Contents: read` / `Issues: read` /
    `Pull requests: read`（`Metadata: read` 由 GitHub 强制附带）。
 3. **Expiration** 选够用就好：表单默认 30 天，可设 1–366 天；「无期限」也能选，但

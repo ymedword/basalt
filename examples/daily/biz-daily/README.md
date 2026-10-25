@@ -66,16 +66,33 @@ DBHub 是独立的 Node 子进程，理论上它自己可以出网（本配方�
 
 ```text
 node <absolute-path-to-dbhub-entry> --transport stdio \
-  --dsn sqlite:///<absolute-path-to-sample.db> --readonly
+  --config <absolute-path-to-dbhub.toml>
+```
+
+`dbhub.toml` 同时给出 DSN 与只读工具面（完整片段见 `SETUP.md` 第 2 节）：
+
+```toml
+[[sources]]
+id = "default"
+dsn = "sqlite:///<absolute-path-to-sample.db>"
+
+[[tools]]
+name = "execute_sql"
+source = "default"
+readonly = true
+max_rows = 500
 ```
 
 - `node` 必须在 `shell.allowed_commands` 里——stdio MCP 的启动同样要过命令授权；
-- 包入口路径、`--readonly` 行为、DSN 三斜杠形态与工具名**均未实测**；
-- Node.js 版本要求（20+）来自 dbhub 包说明，**未在本机验证**。
+- 1.5.0 **没有** `--readonly` 参数：只读与限行只由 `dbhub.toml` 的 `[[tools]]` 表达，
+  传旧参数会直接启动失败；
+- 上面的命令、`dbhub.toml` 形态、`execute_sql` 入参与返回结构、以及
+  `READONLY_VIOLATION` 拒绝都是 **2026-10-26 实测**（Windows + Node + DBHub 1.5.0）；
+- Node.js 版本要求（20+）来自 dbhub 包说明；本机实测版本记录在 `SETUP.md`。
 
 ## 凭据
 
-**无**。样例库是本地文件，DBHub 以 `--readonly` 打开；不需要任何令牌或密码。
+**无**。样例库是本地文件，DBHub 按 `dbhub.toml` 的只读工具面打开；不需要任何令牌或密码。
 `SETUP.md` 里也不会出现明文凭据。
 
 ## 依赖与固定版本
@@ -291,7 +308,7 @@ python scripts/biz_daily.py --orders fixtures/rows.json \
 
 | 档位 | 结论 | 依据 |
 | --- | --- | --- |
-| 夹具可复跑 | **已验证** | `scripts/test_biz_daily.py` 19 个用例全绿（`Ran 19 tests … OK`）；同一夹具两次重跑 `daily.json` 哈希一致 |
+| 夹具可复跑 | **已验证** | `scripts/test_biz_daily.py` 22 个用例全绿（`Ran 22 tests … OK`）；同一夹具两次重跑 `daily.json` 哈希一致 |
 | 三类异常逐类计数 | **已验证** | 夹具断言 `{valid:15, missing:3, duplicate:2, invalid:4}` 与互斥不变量；三处逆改探针（缺失补 0 / 取消去重 / 静默截断）分别变红 |
 | 样例库生成 | **已验证** | `make_sample_db.py` 生成 24 行；SQL 直查确认三类异常都在库里；重复生成逐字节一致（同一机器） |
 | 真实 DBHub + Node 实跑 | **已验证（本机）** | 2026-10-26：`@bytebase/dbhub` 1.5.0 + 真实模型跑通一轮（24 行 → 15 有效 / 3 缺失 / 2 重复 / 4 非法）；工具面与只读拒绝见「工具清单」节实测记录 |

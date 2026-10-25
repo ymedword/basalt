@@ -92,16 +92,16 @@ max_rows = 500
 
 **档位：A（全量）**——完整 Agent 目录 + 技能 + 夹具 + 固定期望结果 + 本 README；
 可装载；声明的内置工具全部是已注册内置工具；技能声明有实体；声明的 MCP 工具是目标
-server `tools/list` 的子集（以 DBHub 实际清单为准，未实测）；无凭据可复跑。
+server `tools/list` 的子集（DBHub 1.5.0 实测 `tools/list` 只报 `execute_sql`，2026-10-26）；无凭据可复跑。
 
 ## 证据状态
 
 | 证据 | 状态 |
 | --- | --- |
 | 可装载、内置工具可解析、技能有实体 | 仓内 `TestTemplates_LoadAndTools` 覆盖（e2e tag） |
-| MCP 工具名是 DBHub `tools/list` 的子集 | **未实测**——验收用记录下来的 `tools/list` 夹具判定；真实 DBHub 未实连 |
+| MCP 工具名是 DBHub `tools/list` 的子集 | **已验证（本机，2026-10-26）**：DBHub 1.5.0 的 `tools/list` 只报 `execute_sql`；验收另用记录下来的 `tools/list` 夹具判定 |
 | 夹具复跑（分类计数与期望结果） | 仓内夹具 + 人工按 `AGENT.md`「夹具复跑」走一遍 |
-| 真实 DBHub 实连 | **未验证**——需要你本机装 DBHub 并生成样例库 |
+| 真实 DBHub 实连 | **部分已验证（本机，2026-10-26）**：连接、`tools/list` 与只读拒绝按真实调用核实；本模板的固定 SQL 尚未在真实 DBHub 上整轮回放 |
 | 真实模型 Run | **未验证**——需要你自己绑定模型连接 |
 
 ## 已知限制
@@ -112,8 +112,8 @@ server `tools/list` 的子集（以 DBHub 实际清单为准，未实测）；�
   夹具，属于判据变更；
 - 只统计计数与未关闭清单，不算时长、不算 SLA、不跟历史趋势——没有历史库可支撑；
 - 单表固定结构：换库（例如换成 MySQL）要同时改 `dbhub.toml` 的 `dsn` 与 `AGENT.md` 的固定 SQL；
-- DBHub 的包入口路径与工具名都在本仓库**未实测**，首次接入请以实际 `tools/list`
-  为准并回填 `AGENT.md` 与本节；
+- DBHub 的**包入口路径因机器而异**（模板只能写占位）：首次接入按实际路径填写，
+  并用 `tools/list` 核对工具名；工具面已按 1.5.0 实测对齐（仅 `execute_sql`）；
 - 本 Agent 声明了 MCP server：`dbhub` 没配好或连不上时，**整只 Agent 不注册**
   （加载期校验第 6 条，WARN `mcp server skipped: dbhub`），不是「少了几个工具还能跑」。
 

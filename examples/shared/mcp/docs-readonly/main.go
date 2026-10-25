@@ -1,5 +1,7 @@
 // Package main 是 examples 用的最小只读 MCP server（颗粒度文档 §3.9 / J-03 / Q-03）：
-// 纯标准库、零依赖、独立嵌套 module（根 `go test ./...` 不覆盖它）。它只做三件事——
+// 纯标准库、零依赖；2026-10-26 起并回主 module（go:embed 跨不过嵌套 module，
+// 而发行包必须能把源码交给用户），因此随根 `go test ./...` 一起测试，但它不被
+// 产品二进制导入，运行时仍是独立 MCP 进程。它只做三件事——
 // 列目录、读正文、给元信息；所有路径都在根目录内按段 lstat 解析，拒绝 `..` /
 // 绝对路径 / 软链接，本进程不提供也不执行任何写操作。
 // Package main is the minimal read-only MCP server used by the examples: stdlib only,

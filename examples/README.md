@@ -57,7 +57,7 @@ MCP servers are separate processes. Their network access is decided by each serv
    cp -r examples/daily/github-radar .basalt/agents/github-radar
    ```
 
-2. Read that directory's `SETUP.md` and fill in what it lists — usually the model name, the model connection, the notification channel and the MCP server path or environment variable. Credentials stay in environment variables; every placeholder in the configuration is `${VAR}`.
+2. Read that directory's `SETUP.md` and fill in what it lists — usually the model name, the model connection, the notification channel and the MCP server path or environment variable. Credentials stay in environment variables; the configuration references them as `${VAR}` placeholders only, never as values.
 3. Add the MCP server command to your workspace's command allowlist yourself. The examples declare what they need; they never widen the allowlist for you.
 4. Start the management server and enable the agent:
 
@@ -76,7 +76,7 @@ A manual run is recorded with `trigger=manual`. It is evidence of a working agen
 
 ## Credentials
 
-Two demos need a key of their own. Neither key ships here, and `basalt demo install` never accepts one: it writes only `${VAR}` placeholders, and Basalt's configuration gate refuses to save a server whose referenced variable is missing or empty. The full walk-through for each demo lives in its `SETUP.md`, so a copied workspace stays self-contained; this section is the shared summary.
+Two demos need a key of their own. Neither key ships here, and `basalt demo install` never accepts or writes one: the snippets it prints reference `${VAR}` only, and Basalt's configuration gate refuses to save a server whose referenced variable is missing or empty. The full walk-through for each demo lives in its `SETUP.md`, so a copied workspace stays self-contained; this section is the shared summary.
 
 ### GitHub personal access token
 
@@ -109,7 +109,7 @@ Two kinds of claims appear in this directory, and they are not interchangeable:
 | Claim | Meaning | Where it is checked |
 | --- | --- | --- |
 | Fixture replay | The directory loads, its declared tools resolve, and the script produces the expected business result from fixed input | `make example-tests`, and the release end-to-end suite |
-| Real external run | The same flow against the real service (GitHub, Brave, Fetch, Playwright, DBHub, a real model, a real notification receiver) | Not run in this repository's acceptance. Those credentials are not provided, so the claim stays **unverified** |
+| Real external run | The same flow against the real service (GitHub, Brave, Fetch, Playwright, DBHub, a real model, a real notification receiver) | Not part of this repository's automated acceptance. DBHub 1.5.0 was exercised by hand on Windows (tool discovery plus a write rejected with `READONLY_VIOLATION`); GitHub, Brave, Fetch, Playwright, real models and real notification receivers stay **unverified** — those credentials were not provided |
 
 "Connects successfully" is neither of the above. A successful connection only proves that the server started and answered `tools/list`.
 
@@ -117,7 +117,7 @@ Two kinds of claims appear in this directory, and they are not interchangeable:
 
 | Path | What it is |
 | --- | --- |
-| [shared/mcp/docs-readonly/](shared/mcp/docs-readonly/) | Minimal read-only MCP server: `list_documents`, `read_document`, `document_metadata`. Standard library only, its own Go module, no write tools at all |
+| [shared/mcp/docs-readonly/](shared/mcp/docs-readonly/) | Minimal read-only MCP server: `list_documents`, `read_document`, `document_metadata`. Standard library only, a `main` package in this module (never imported by the product binary), no write tools at all. `basalt demo install` exports the source into the workspace with a generated `go.mod` so it builds on its own |
 | [shared/fixtures/docs/](shared/fixtures/docs/) | Fictional handbook pages used as the read-only root by `docs-diff` and `onboarding-buddy` |
 | [shared/scripts/make_sample_db.py](shared/scripts/make_sample_db.py) | Builds the SQLite sample database from a schema file and a rows file; the `.db` itself is generated, never committed |
 

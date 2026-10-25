@@ -74,11 +74,13 @@
   - 提供导入脚本自动合并：绕过 `schedule_write` / 内容 ETag 等写入门；
   - 把示例做成"只能看"的文档：无法证明可复跑。
 
-## R-09 `docs-readonly` 用独立嵌套 module + 纯标准库
+## R-09 `docs-readonly` 用纯标准库 + 主 module 内 `package main`（2026-10-26 改裁）
 
-- **Decision**: `examples/shared/mcp/docs-readonly/` 自带 `go.mod`，只实现 `initialize` / `tools/list` / `tools/call` 三件只读工具，拒绝越界、绝对路径、软链接与写操作；根 `go test ./...` 不覆盖它，由 `go -C … test ./...` 单独运行。
-- **Rationale**: 独立 module 让它既是"可复制素材"又不污染产品依赖图；纯标准库保证零依赖、可离线构建。官方 Filesystem MCP 进程具备写能力，只有"工具面只读"，不能支撑 D4 的只读断言（模块卡 §2.5.2）。
+- **Decision**: `examples/shared/mcp/docs-readonly/` 是主 module 内的 `package main`，只实现 `initialize` / `tools/list` / `tools/call` 三件只读工具，拒绝越界、绝对路径、软链接与写操作；不被产品二进制导入，随根 `go test ./...` 测试；安装器把源码导出到 `<ws>/demos/src/docs-readonly` 并生成最小 `go.mod`（`module basalt-docs-readonly` + `go 1.27`），导出目录可独立构建。
+- **Rationale**: 发布契约是单二进制，源码必须能经 `go:embed` 随二进制发行——实测 `go:embed` **跨不过嵌套 module**（2026-10-25 读数：`go list -f '{{range .EmbedFiles}}{{println .}}{{end}}' ./examples` 共 42 个文件、`docs-readonly` 占 0 个；并回主 module 后同一命令为 44 个，含 `shared/mcp/docs-readonly/main.go` 与 `main_test.go`），2026-10-26 用户裁决并回主 module；纯标准库保证零第三方依赖、可离线构建；不被产品导入保证依赖方向不倒挂。官方 Filesystem MCP 进程具备写能力，只有"工具面只读"，不能支撑 D4 的只读断言（模块卡 §2.5.2）。
 - **Alternatives considered**:
+  - 独立嵌套 module（2026-10-25 初版决定，2026-10-26 撤回）：`go:embed` 不含它，安装器只能打印一个无人创建的路径；
+  - 维护第二份源码副本供扩展：两处源码会漂移，违反单一事实源；
   - 用官方 Filesystem MCP：写能力无法在本项目内证明被禁用；
   - Python 实现：需要解释器依赖，且与"最小素材"不符；
   - 做进产品 `internal/`：把示例升格为产品内建 server，超出范围。

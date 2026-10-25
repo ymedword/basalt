@@ -326,3 +326,150 @@ func TestDemoInstall_GeneratesSampleDBWhenInterpreterAvailable(t *testing.T) {
 	require.NoError(t, statErr)
 	require.Positive(t, info.Size())
 }
+
+// TestDemoInstall_ExportsDocsReadOnlySource 断言自研 MCP 源码真的落到工作区、带上
+// 可独立构建的最小 go.mod，且报告里的构建命令指向实际路径（不是打印一个不存在的目录）。
+// TestDemoInstall_ExportsDocsReadOnlySource proves the source export and its go.mod.
+func TestDemoInstall_ExportsDocsReadOnlySource(t *testing.T) {
+	dir := initDemoWorkspace(t)
+
+	stdout, err := runDemoInstallCmd(t, dir, "--demo", "docs-diff")
+	require.NoError(t, err)
+
+	wsRoot := filepath.Join(dir, workspaceDirName)
+	srcDir := filepath.Join(wsRoot, "demos", "src", "docs-readonly")
+	for _, name := range []string{"main.go", "main_test.go", "go.mod"} {
+		_, statErr := os.Stat(filepath.Join(srcDir, name))
+		require.NoError(t, statErr, "导出目录缺少 %s", name)
+	}
+	gomod, readErr := os.ReadFile(filepath.Join(srcDir, "go.mod"))
+	require.NoError(t, readErr)
+	require.Contains(t, string(gomod), "module basalt-docs-readonly")
+	require.Contains(t, string(gomod), "go 1.27")
+	// 最小 go.mod：不得夹带 require —— 一旦导出物引入第三方坐标，独立构建就不再
+	// 是"纯标准库、可离线"，这条断言防止将来悄悄加依赖。
+	// Minimal means no requires: the exported build must stay stdlib-only and offline.
+	require.NotContains(t, string(gomod), "require", "导出目录的 go.mod 必须零第三方依赖")
+
+	// 逐字节比对：导出物必须与仓库里那一份源码完全相同（单一事实源，不是再写一遍）。
+	for _, name := range []string{"main.go", "main_test.go"} {
+		want, readErr := os.ReadFile(filepath.Join("..", "..", "examples", "shared", "mcp", "docs-readonly", name))
+		require.NoError(t, readErr, "读取仓库源码 %s 失败", name)
+		got, readErr := os.ReadFile(filepath.Join(srcDir, name))
+		require.NoError(t, readErr)
+		require.Equal(t, want, got, "导出物 %s 与仓库源码不一致（出现了第二份副本？）", name)
+	}
+
+	depsDir := filepath.Join(wsRoot, "demos", "deps")
+	info, statErr := os.Stat(depsDir)
+	require.NoError(t, statErr, "依赖目录未创建")
+	require.True(t, info.IsDir())
+
+	manifest := readDemoManifest(t, dir)
+	require.NotNil(t, manifest.DocsReadOnly)
+	require.Equal(t, demoStateInstalled, manifest.DocsReadOnly.State)
+	require.Equal(t, srcDir, manifest.DocsReadOnly.Path)
+
+	require.Contains(t, stdout, srcDir)
+	buildCmd := "go -C " + srcDir + " build -o " + filepath.Join(depsDir, "docs-readonly.exe") + " ."
+	require.Contains(t, stdout, buildCmd, "报告里的构建命令必须按实际路径渲染")
+}
+
+// TestDemoInstall_ReportsKeptSourceWithoutGoMod 断言保留态的报告不说谎：没有 --force 时
+// 不重写既有目录；若那里原本没有 go.mod，报告必须点名"未写"，不能宣称"已生成"——
+// 否则用户会按一行注定失败的构建命令操作。
+// TestDemoInstall_ReportsKeptSourceWithoutGoMod makes the kept-state report truthful.
+func TestDemoInstall_ReportsKeptSourceWithoutGoMod(t *testing.T) {
+	dir := initDemoWorkspace(t)
+	_, err := runDemoInstallCmd(t, dir, "--demo", "docs-diff")
+	require.NoError(t, err)
+
+	wsRoot := filepath.Join(dir, workspaceDirName)
+	srcDir := filepath.Join(wsRoot, "demos", "src", "docs-readonly")
+	require.NoError(t, os.Remove(filepath.Join(srcDir, "go.mod")), "前置：删掉上一次导出的 go.mod")
+
+	stdout, err := runDemoInstallCmd(t, dir, "--demo", "docs-diff")
+	require.NoError(t, err)
+
+	manifest := readDemoManifest(t, dir)
+	require.NotNil(t, manifest.DocsReadOnly)
+	require.Equal(t, demoStateKept, manifest.DocsReadOnly.State)
+
+	_, statErr := os.Stat(filepath.Join(srcDir, "go.mod"))
+	require.True(t, os.IsNotExist(statErr), "无 --force 时不得替用户补写 go.mod")
+
+	require.Contains(t, stdout, "保留原目录，未写 go.mod")
+	require.NotContains(t, stdout, "docs-readonly 源码 "+srcDir+"（已存在，保留，已生成 go.mod）",
+		"保留态不得声称已生成 go.mod")
+}
+
+// TestDemoInstall_KeepsSkillsOutOfAgentDirs 断言 Agent 目录不含 skills/ 副本：
+// 技能只装到 <workspace>/skills，否则加载器会打 WARN 并忽略 Agent 内的那份。
+// TestDemoInstall_KeepsSkillsOutOfAgentDirs keeps a single skill copy in the workspace.
+func TestDemoInstall_KeepsSkillsOutOfAgentDirs(t *testing.T) {
+	dir := initDemoWorkspace(t)
+
+	_, err := runDemoInstallCmd(t, dir, "--demo", "repo-digest")
+	require.NoError(t, err)
+
+	wsRoot := filepath.Join(dir, workspaceDirName)
+	spec := findDemoSpec(t, "repo-digest")
+	require.NotEmpty(t, spec.Skill, "repo-digest 应声明技能")
+
+	_, statErr := os.Stat(filepath.Join(wsRoot, agentsDirName, spec.Name, "skills"))
+	require.True(t, os.IsNotExist(statErr), "%s 的 Agent 目录里仍有 skills/ 副本", spec.Name)
+	_, skillErr := os.Stat(filepath.Join(wsRoot, demoSkillsDirName, spec.Skill))
+	require.NoError(t, skillErr, "技能 %s 未装到 %s", spec.Skill, demoSkillsDirName)
+}
+
+// TestDemoInstall_DoesNotTouchExistingConfig 断言已有的 basalt.yaml / mcp_servers.yaml
+// 逐字节不变：安装器不改配置、不改权限，接入由用户显式确认后自行完成。
+// TestDemoInstall_DoesNotTouchExistingConfig pins byte equality of operator config.
+func TestDemoInstall_DoesNotTouchExistingConfig(t *testing.T) {
+	dir := initDemoWorkspace(t)
+	wsRoot := filepath.Join(dir, workspaceDirName)
+
+	configs := map[string]string{
+		"basalt.yaml":      "shell:\n  allowed_commands:\n    - node\n",
+		"mcp_servers.yaml": "servers:\n  - name: keep-me\n    transport: stdio\n    command: node\n",
+	}
+	for name, body := range configs {
+		require.NoError(t, os.WriteFile(filepath.Join(wsRoot, name), []byte(body), 0o644))
+	}
+
+	_, err := runDemoInstallCmd(t, dir)
+	require.NoError(t, err)
+
+	for name, body := range configs {
+		data, readErr := os.ReadFile(filepath.Join(wsRoot, name))
+		require.NoError(t, readErr)
+		require.Equal(t, body, string(data), "%s 被安装器改写了", name)
+	}
+}
+
+// TestDemoInstall_CredentialHintUsesSelectedDemo 断言凭据提示指向本次真正安装的
+// Demo 的 SETUP，而不是写死某个未选中的 Demo。
+// TestDemoInstall_CredentialHintUsesSelectedDemo points the hint at the chosen demo.
+func TestDemoInstall_CredentialHintUsesSelectedDemo(t *testing.T) {
+	dir := initDemoWorkspace(t)
+
+	stdout, err := runDemoInstallCmd(t, dir, "--demo", "repo-digest")
+	require.NoError(t, err)
+
+	wsRoot := filepath.Join(dir, workspaceDirName)
+	require.Contains(t, stdout, filepath.Join(wsRoot, agentsDirName, "repo-digest", "SETUP.md"))
+	require.NotContains(t, stdout, filepath.Join(wsRoot, agentsDirName, "github-radar", "SETUP.md"))
+}
+
+// findDemoSpec 按名字取安装描述，取不到直接判失败。
+// findDemoSpec returns the demo spec by name or fails the test.
+func findDemoSpec(t *testing.T, name string) demoSpec {
+	t.Helper()
+	for _, spec := range demoSpecs {
+		if spec.Name == name {
+			return spec
+		}
+	}
+	t.Fatalf("未找到 Demo %s", name)
+	return demoSpec{}
+}

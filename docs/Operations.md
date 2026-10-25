@@ -23,7 +23,7 @@
 | --- | --- | --- |
 | Python 3 | 用 `shell` 工具跑 `scripts/*.py` 的 Agent（五个每日 Demo 与部分模板的脚本） | 该工具调用失败（`runtime_error`）。⚠ 走 `shell` 的解释器**必须**先登记进 `shell.interpreters`（受控脚本通道：只接受 `[<脚本路径>, <参数…>]` 形态、脚本须落在该 Agent `scripts/` 或技能库内）——**不得**为图省事放宽解释器白名单，那等于引入任意代码执行（见 [contracts/agent-md.md](contracts/agent-md.md) §5.2） |
 | Node.js / `npx` | 用 `npx` 通道拉起的社区 MCP server（首批配方中的 `brave-search` / `fetch` / `playwright` / `dbhub` / `filesystem-readonly`） | MCP server 连不上 → 它的工具不注册 → **声明该工具的 Agent 整只不注册**（WARN 点名） |
-| Go 工具链 | **构建**仓库与共享只读 MCP server `examples/shared/mcp/docs-readonly`（独立嵌套 module）；运行发布二进制与已构建的 server 不需要 | 仓库无法编译；`docs-readonly` 构建失败 → D4 与 `onboarding-buddy` 模板的 server 不可用（依赖它的 Agent 整只不注册） |
+| Go 工具链 | **构建**仓库与共享只读 MCP server `examples/shared/mcp/docs-readonly`（主 module 内 `package main`；安装器导出源码并生成 `go.mod` 后可在工作区独立构建）；运行发布二进制与已构建的 server 不需要 | 仓库无法编译；`docs-readonly` 构建失败 → D4 与 `onboarding-buddy` 模板的 server 不可用（依赖它的 Agent 整只不注册） |
 | 宿主机 `sqlite3` CLI | **仅在线备份**需要（§4.2），不参与运行 | 退化为离线备份（停机拷贝，一样可靠，只是要停机窗口） |
 
 **不得**把"某 Agent 需要 Python"写成"Basalt 需要 Python"——部署说明与验收口径以本表为准。
@@ -603,7 +603,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 | D1 `github-radar` | Python 3（`shell` 受控通道）、GitHub MCP | GitHub API（MCP 取候选仓库，`http_get` 读 README） | `GITHUB_PERSONAL_ACCESS_TOKEN`（`${ENV_VAR}` 引用） |
 | D2 `repo-digest` | Python 3、GitHub MCP | GitHub API | 同上 |
 | D3 `biz-daily` | Python 3、DBHub（Node） | 无（本地 SQLite 文件，库由生成器产出） | 无（只读 SQLite 样例） |
-| D4 `docs-diff` | 自研 `docs-readonly`（Go 构建，独立嵌套 module） | 无（只读本地资料目录） | 无 |
+| D4 `docs-diff` | 自研 `docs-readonly`（Go 构建；主 module 内，安装器导出源码后 `go build`） | 无（只读本地资料目录） | 无 |
 | D5 `industry-brief` | Brave Search MCP、Fetch MCP | Brave API、目标网页 | `BRAVE_API_KEY`（`${ENV_VAR}` 引用） |
 | 八模板 | 依各自 README 的「依赖」节：内置 `http_get` 为主；DBHub / Playwright / Brave / Fetch / `docs-readonly` 按模板声明 | 依各自 README 的「工具与域名」节 | 仅 `funding-watch` 需 Brave key；其余无凭据 |
 

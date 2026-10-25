@@ -63,9 +63,9 @@ BIN ?= bin/basalt$(EXE)
 
 build: ; CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$$(git describe --tags --always)" -o $(BIN) ./cmd/basalt
 
-# 示例单测：嵌套 module 的 Go 测试 + 五个 Demo 的业务脚本（缺解释器 = 失败，不是跳过）。
+# 示例单测：docs-readonly 的 Go 测试（主 module 内）+ 五个 Demo 的业务脚本（缺解释器 = 失败，不是跳过）。
 # 二者都**不**进 check / acceptance / acceptance.json / CI——它们是示例与发布期的独立入口。
-example-tests: ; go -C examples/shared/mcp/docs-readonly test -count=1 ./... && $(PYTHON) scripts/run-example-tests.py
+example-tests: ; go test -count=1 ./examples/shared/mcp/docs-readonly && $(PYTHON) scripts/run-example-tests.py
 
 # 发布 e2e：候选二进制取自 build 的同一份产物（不另建），以绝对路径交给 TestMain。
 # `-json` 不可省：`go test` 在包通过且无 `-v` 时会吞掉包级 stdout，`binary_sha256=` /

@@ -21,12 +21,21 @@ Demo 的技能——声明名无实体时整只 Agent 不注册。
 
 ## 3. 构建并放置只读 MCP server
 
-`docs-readonly` 是本仓库自研素材（独立嵌套 module，纯标准库、零依赖），不在 MCP
-目录里，需要现场构建：
+`docs-readonly` 是本仓库自研素材（主 module 内 `package main`，纯标准库、零第三方依赖），
+不在 MCP 目录里，需要现场构建。它的源码随 `basalt demo install` 导出到工作区：
 
 ```sh
-go -C examples/shared/mcp/docs-readonly build -o D:/basalt-samples/docs-readonly.exe .
+basalt demo install --demo docs-diff
 ```
+
+安装报告会打印一条**按你本机路径渲染**的构建命令，直接照抄执行即可：
+
+```sh
+go -C <工作区>/.basalt/demos/src/docs-readonly build -o D:/basalt-samples/docs-readonly.exe .
+```
+
+导出的目录带安装器生成的最小 `go.mod`（`module basalt-docs-readonly`），可以独立构建；
+从源码检出构建时，`go build ./examples/shared/mcp/docs-readonly` 也可用。
 
 再准备只读根（用共享夹具复制一份，**不要**让 Agent 直接指向仓库里的目录）：
 

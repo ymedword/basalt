@@ -22,7 +22,7 @@ US-14 把 Basalt 从"能跑一个 Agent 的底座"推进到"能被复制、能�
 4. **测试记录只追加字段**：`ResourceTestResult` 追加 `OperationID` / `TestedVersionID` / `Stage` / `FailureClass`；`internal/tool` 新增 `ConnectDetailed` 返回结构化失败（`MCPConnectFailure`），`Connect` 行为与旧语义不变；`MCPSupervisor.Test` 有详细结果时使用，否则回退 `Connect` 并标 `dependency_unconfirmed`；操作状态语义按 D-03 / D-05 固定（连接失败 / 策略拒绝 = success + ok=false；超时 = failed + 504；env 缺失 = failed + 503；预写失败不执行、不留行、不启动子进程）。
 5. **工具来源在装配层记录**：`mcpDispositionTable` 在内置工具注册与 MCP `OnConnected` 注册处记录 offered / accepted / skipped（赢家来源 + 原因）；`internal/tool/registry.go` 注册语义与重名 WARN 不变；`McpServerView.Tools` 保持 offered 语义。
 6. **示例是可移植基线**：`examples/**` 不含实例 UID / 明文凭据 / 明文密钥，基线 `notify_mode: none`；导入后按每份 `SETUP.md` 覆盖模型绑定、服务名、渠道 UID、`deliver_to` 与解释器路径；固定输入在 `fixtures/`，运行时状态 `state/` 不提交。
-7. **只读 MCP 素材独立成 module**：`examples/shared/mcp/docs-readonly/` 是纯标准库嵌套 module（`initialize` / `tools/list` / `tools/call`，拒绝越界 / 绝对路径 / 软链接 / 写操作），根 `go test ./...` 不覆盖它，由 `go -C … test ./...` 与发布 e2e 单独构建。
+7. **只读 MCP 素材在主 module 内、源码随单二进制发行**：`examples/shared/mcp/docs-readonly/` 是主 module 内的 `package main`（纯标准库、零第三方依赖；`initialize` / `tools/list` / `tools/call`，拒绝越界 / 绝对路径 / 软链接 / 写操作），**不被产品二进制导入**，随根 `go test ./...` 测试；2026-10-26 用户裁决：`go:embed` 跨不过嵌套 module，故并回主 module，由安装器把源码导出到工作区并生成最小 `go.mod`（`module basalt-docs-readonly` + `go 1.27`），导出目录可独立构建；发布 e2e 仍单独 `go build`。
 8. **示例测试堵零发现**：`scripts/run-example-tests.py` 按固定目录清单逐目录跑 `unittest discover`，解析 `Ran N tests` 并断言每目录 ≥3；0 发现 / 低于下限 / 非零退出 = 失败；缺 Python = 失败。
 9. **发布 e2e 绑定候选制品**：`internal/e2e/harness_test.go` 的 `TestMain` 识别 `BASALT_E2E_BINARY`，导出绝对路径、重算 SHA-256、打印 `binary_source=candidate`；`make e2e` = `build` + `example-tests` + `go test -tags=e2e`，与 `make check` / `acceptance.json` / CI 分离；七场景中取消（Run 落 `cancelled`）与工具自身超时（审计 `failed` + `timeout`、Run 继续）**分两个用例写、分开 required**。
 10. **公开材料只增量**：README 英文单语，加 Templates & demos / MCP catalog / Run a demo / What is verified 四节；官网只在既有 Docs 索引加区块、复用 `templates.mjs` 数据模块；不新增一级路由、不链接私有路径；US-13 review ② 未完成前不改其交付物。
@@ -31,13 +31,13 @@ US-14 把 Basalt 从"能跑一个 Agent 的底座"推进到"能被复制、能�
 
 ## Technical Context
 
-**Language/Version**: Go 1.27.2 构建版本（`go.mod` 的 `go` 行是**最低版本要求** `go 1.27`，准确版本由 `toolchain` 与 CI 固定）；管理台与站点为既有构建期工具链（Node 24.22.0、Vue 3 + Vite + TypeScript + Vitest、VitePress 1.6.4），不进 `go.mod`、不进发布二进制；示例业务脚本为 Python 标准库（本机 Python 3.12，`python` 可能是商店存根，本地复核用 `py`）；`docs-readonly` 为纯标准库嵌套 Go module。
+**Language/Version**: Go 1.27.2 构建版本（`go.mod` 的 `go` 行是**最低版本要求** `go 1.27`，准确版本由 `toolchain` 与 CI 固定）；管理台与站点为既有构建期工具链（Node 24.22.0、Vue 3 + Vite + TypeScript + Vitest、VitePress 1.6.4），不进 `go.mod`、不进发布二进制；示例业务脚本为 Python 标准库（本机 Python 3.12，`python` 可能是商店存根，本地复核用 `py`）；`docs-readonly` 为主 module 内的 `package main`、纯标准库（2026-10-26 裁决：`go:embed` 跨不过嵌套 module）。
 
 **Primary Dependencies**: Go 侧**零新增坐标**——`go.mod` / `go.sum` 不改；新增生产代码只用既有标准库、`goccy/go-yaml`、MCP SDK 与包内既有设施。控制台与站点使用既有 `package-lock.json` 依赖，**零新增 npm 生产依赖**。示例与 `docs-readonly` 只用 Python / Go 标准库。
 
 **Storage**: **零 schema 迁移**——复用既有 `admin_operations` / `resource_versions` / 资源指针 / `runs` / `llm_calls` / `tool_invocations` / `schedule_deliveries` 等表；目录为编译期内嵌数据，诊断与测试结果走既有操作 detail / 资源版本字段；Demo 产物与 `state/` 落在工作区文件系统（不提交）。
 
-**Testing**: 四层——① Go 单测：`internal/catalog`、`internal/app`（`TestMCPEnvGate*` / `TestMCPDiagnostics*` / `TestMCPTest*` / `TestMCPToolDisposition*` / `TestRegistry_DuplicateSemanticsUnchanged`）、`internal/tool`（`TestMCPPool_ConnectDetailed*` / `TestNewMCPCommand_MatchesLaunch`）、`internal/web`（`TestMCP*` 契约 / handler）；② 控制台：`npm --prefix assets/console test` + `npm --prefix assets/console run build`（重建 `dist` 并核对 `integrity.json`）；③ 示例：`go -C examples/shared/mcp/docs-readonly test -count=1 ./...` + `python scripts/run-example-tests.py`（逐目录 `Ran N tests` ≥3）；④ 发布 e2e：`make e2e`（`//go:build e2e`、候选二进制绝对路径 + SHA-256、`binary_source=candidate`、`-count=1`），七场景 + 五 Demo 夹具 + 八模板质量 + 遗产回归；站点测试与检查沿用 US-13（`npm --prefix website test|build|check`）。`make check` / `scripts/check-acceptance.*` **不调用** Node / npm / Python。
+**Testing**: 四层——① Go 单测：`internal/catalog`、`internal/app`（`TestMCPEnvGate*` / `TestMCPDiagnostics*` / `TestMCPTest*` / `TestMCPToolDisposition*` / `TestRegistry_DuplicateSemanticsUnchanged`）、`internal/tool`（`TestMCPPool_ConnectDetailed*` / `TestNewMCPCommand_MatchesLaunch`）、`internal/web`（`TestMCP*` 契约 / handler）；② 控制台：`npm --prefix assets/console test` + `npm --prefix assets/console run build`（重建 `dist` 并核对 `integrity.json`）；③ 示例：`go test -count=1 ./examples/shared/mcp/docs-readonly` + `python scripts/run-example-tests.py`（逐目录 `Ran N tests` ≥3）；④ 发布 e2e：`make e2e`（`//go:build e2e`、候选二进制绝对路径 + SHA-256、`binary_source=candidate`、`-count=1`），七场景 + 五 Demo 夹具 + 八模板质量 + 遗产回归；站点测试与检查沿用 US-13（`npm --prefix website test|build|check`）。`make check` / `scripts/check-acceptance.*` **不调用** Node / npm / Python。
 
 **Target Platform**: 开发机 Windows 11 + Git Bash；发布候选为 `CGO_ENABLED=0` 单文件；14C **Windows 与 Linux 两个平台均必验**（Windows 锁 / 中文控制台 / 进程树取消；Linux 同一候选二进制同一组必跑命令）；管理台面向现代浏览器；官网为静态站点（本 US 不部署）。
 
@@ -57,7 +57,7 @@ US-14 把 Basalt 从"能跑一个 Agent 的底座"推进到"能被复制、能�
 
 | 原则 / 约束 | 本模块落地判据 | 结论 |
 | --- | --- | --- |
-| I 自实现 ReAct 循环 | `go.mod` 零新增坐标；示例与模板只消费既有循环，不改循环体；`docs-readonly` 是独立素材 module，不是框架 | 通过 |
+| I 自实现 ReAct 循环 | `go.mod` 零新增坐标；示例与模板只消费既有循环，不改循环体；`docs-readonly` 是主 module 内的独立素材包（`package main`），不是框架 | 通过 |
 | II LLM 客户端只做协议调用 / 单一消息仓储 | 不改 LLM 客户端与消息追加路径；Demo 走既有 `AgentService` / `ReActLoop` 链路 | 通过 |
 | III Provider 显式映射 | 不改 Provider 目录 / 准入 / 路由；Demo 的模型绑定由 SETUP 交给既有管理面 | 通过 |
 | IV 一个目录 = 一个 Agent / 声明式技能绑定 | 五 Demo 与八模板各是一个 Agent 目录；技能只由 `AGENT.md` frontmatter `skills:` 声明；不引入软连接、不新增 `use_skill`；`repo-digest` 的 L1/L2/L3 走既有渐进披露 | 通过 |
@@ -163,7 +163,7 @@ examples/
 ├── templates/{weather-brief,arxiv-tracker,policy-watch,ticket-insights,onboarding-buddy,dependency-watch,web-watch,funding-watch}/
 │   └── AGENT.md / README.md / fixtures/**（部分含 skills/）
 └── shared/
-    ├── mcp/docs-readonly/{go.mod,main.go,main_test.go,README.md}   # 嵌套 module
+    ├── mcp/docs-readonly/{main.go,main_test.go}                   # 主 module 内 package main（安装器导出时补 go.mod）
     ├── fixtures/docs/**
     └── scripts/make_sample_db.py
 
@@ -183,7 +183,7 @@ website/docs/index.md / website/zh/docs/index.md        # 修改：区块增量�
 website/tests/content.test.mjs / scripts/check-links.mjs# 修改：模板表 / examples 链接（review ② 后）
 ```
 
-**Structure Decision**: 14A 只加一个新包 `internal/catalog`（纯数据 + 解析，无 I/O），其余改动落在既有包；`core` 只加纯类型，`app` 负责装配与来源记录，`web` 只消费端口，`tool.Registry` 不动。14B 完全在 `examples/` 内，含一个独立嵌套 module，根 module 的测试只通过 `internal/e2e` 读取示例（`go test ./...` 不覆盖嵌套 module）。14C 只加脚本、Makefile 目标、e2e 测试文件与 stage，不改既有 stage / CI / `acceptance.json`。管理台与站点继续走各自既有构建链，产物不进 Go module。
+**Structure Decision**: 14A 只加一个新包 `internal/catalog`（纯数据 + 解析，无 I/O），其余改动落在既有包；`core` 只加纯类型，`app` 负责装配与来源记录，`web` 只消费端口，`tool.Registry` 不动。14B 完全在 `examples/` 内；`docs-readonly` 是主 module 内的 `package main`（无自己的 `go.mod`，2026-10-26 裁决），随根 `go test ./...` 测试但不被产品二进制导入；安装器（`internal/cli`，2026-10-26 追加授权）内嵌素材并导出源码。14C 只加脚本、Makefile 目标、e2e 测试文件与 stage，不改既有 stage / CI / `acceptance.json`。管理台与站点继续走各自既有构建链，产物不进 Go module。
 
 ## Complexity Tracking
 

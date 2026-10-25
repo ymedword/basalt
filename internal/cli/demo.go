@@ -74,8 +74,10 @@ type mcpDep struct {
 // mcpDeps is the pinned dependency table; both GitHub demos share one entry.
 var mcpDeps = []mcpDep{
 	{
-		ID: "docs-readonly", Kind: "go-build", Package: "docs-readonly", Version: "随仓库源码构建",
-		Install:   "go -C .basalt/demos/src/docs-readonly build -o ../../../docs-readonly.exe .",
+		// Install 是模板：安装器把源码导出到工作区后，用实际路径渲染构建命令。
+		// Install is a template; the real workspace paths are filled in at report time.
+		ID: "docs-readonly", Kind: "go-build", Package: "docs-readonly", Version: "随本仓库源码（纯标准库）",
+		Install:   "go -C %s build -o %s .",
 		Entry:     "docs-readonly.exe",
 		SourceURL: "examples/shared/mcp/docs-readonly",
 	},
@@ -108,27 +110,28 @@ var mcpDeps = []mcpDep{
 }
 
 // demoCredentialHint 是一条凭据的获取指引：最小权限、有效期 / 费用口径，以及工作区里
-// 讲完整步骤的那份 SETUP。安装器只打印指引，永远不接收、不回显凭据值。
-// demoCredentialHint points at the doc that carries the full acquisition steps; the
-// installer never accepts or echoes a credential value.
+// 讲完整步骤的那份 SETUP 的节号。安装器只打印指引，永远不接收、不回显凭据值。
+// demoCredentialHint points at the section of the installed SETUP that carries the
+// full acquisition steps; the installer never accepts or echoes a credential value.
 type demoCredentialHint struct {
-	Key  string
-	Need string
-	Doc  string
+	Key     string
+	Need    string
+	Section string
 }
 
-// demoCredentialHints 按环境变量名索引：只打印本次选中 Demo 真正用到的那几条。
-// demoCredentialHints is keyed by env var; only selected demos contribute entries.
+// demoCredentialHints 按环境变量名索引：只打印本次选中 Demo 真正用到的那几条，
+// SETUP 路径取自实际选中的 Demo（不再写死某个 Demo 名）。
+// demoCredentialHints is keyed by env var; the SETUP path comes from the selected demo.
 var demoCredentialHints = map[string]demoCredentialHint{
 	"GITHUB_PERSONAL_ACCESS_TOKEN": {
-		Key:  "GITHUB_PERSONAL_ACCESS_TOKEN",
-		Need: "细粒度 PAT：Repository access 选 Public repositories（公开只读即可），默认 30 天到期；启动 github-mcp-server 时加 --read-only",
-		Doc:  "github-radar/SETUP.md 第 2 节",
+		Key:     "GITHUB_PERSONAL_ACCESS_TOKEN",
+		Need:    "细粒度 PAT：Repository access 选 Public repositories（公开只读即可），默认 30 天到期；启动 github-mcp-server 时加 --read-only",
+		Section: "第 2 节",
 	},
 	"BRAVE_API_KEY": {
-		Key:  "BRAVE_API_KEY",
-		Need: "Brave Search API 的 Search 计划（按量计费，每月含额度）；本机 2026-10-26 无法访问 brave.com 域名",
-		Doc:  "industry-brief/SETUP.md 第 3 节",
+		Key:     "BRAVE_API_KEY",
+		Need:    "Brave Search API 的 Search 计划（按量计费，额度以官方定价页为准）；本机 2026-10-26 无法访问 brave.com 域名",
+		Section: "第 3 节",
 	},
 }
 
@@ -150,6 +153,15 @@ type demoManifest struct {
 	Demos         []demoManifestItem `json:"demos"`
 	SampleDB      *demoSampleDB      `json:"sample_db,omitempty"`
 	DBHubConfig   string             `json:"dbhub_config,omitempty"`
+	DocsReadOnly  *demoSourceAsset   `json:"docs_readonly,omitempty"`
+}
+
+// demoSourceAsset 记录随安装导出的自研 MCP 源码（路径 + 状态 + 生成的 go.mod）。
+// demoSourceAsset records the exported docs-readonly source and its generated go.mod.
+type demoSourceAsset struct {
+	Path  string `json:"path"`
+	State string `json:"state"`
+	GoMod string `json:"go_mod,omitempty"`
 }
 
 // demoManifestItem 是单个 Demo 的安装结果；State 描述 Agent 目录，SkillState 单独
@@ -254,6 +266,14 @@ func runDemoInstall(ctx context.Context, out io.Writer, deps Deps, opts demoInst
 		manifest.DBHubConfig = configPath
 	}
 
+	if needsDemoSource(selected) {
+		source, err := installDemoSource(wsRoot, opts.Force)
+		if err != nil {
+			return err
+		}
+		manifest.DocsReadOnly = &source
+	}
+
 	if err := writeDemoManifest(wsRoot, manifest); err != nil {
 		return err
 	}
@@ -299,15 +319,17 @@ func demoNames() []string {
 	return names
 }
 
-// installDemoBundle 复制一份 Demo 的 Agent 目录（含技能），并把模型留空。
-// installDemoBundle copies one demo's agent directory (and skill) and blanks the model.
+// installDemoBundle 复制一份 Demo 的 Agent 目录（技能另装到 <workspace>/skills），
+// 并把模型留空；Agent 目录里的 skills/ 是内嵌素材的组织方式，不复制进工作区。
+// installDemoBundle copies one demo's agent directory (skills go to <workspace>/skills
+// separately) and blanks the model.
 func installDemoBundle(spec demoSpec, wsRoot string, force bool) (demoManifestItem, error) {
 	item := demoManifestItem{
 		Name:     spec.Name,
 		AgentDir: filepath.Join(wsRoot, agentsDirName, spec.Name),
 		Pending:  demoPendingItems(spec),
 	}
-	state, err := copyDemoTree(path.Join("daily", spec.Name), item.AgentDir, force)
+	state, err := copyDemoTree(path.Join("daily", spec.Name), item.AgentDir, force, map[string]bool{"skills": true})
 	if err != nil {
 		return demoManifestItem{}, fmt.Errorf("安装 %s：%w", spec.Name, err)
 	}
@@ -321,7 +343,7 @@ func installDemoBundle(spec demoSpec, wsRoot string, force bool) (demoManifestIt
 		return item, nil
 	}
 	item.SkillDir = filepath.Join(wsRoot, demoSkillsDirName, spec.Skill)
-	skillState, err := copyDemoTree(path.Join("daily", spec.Name, "skills", spec.Skill), item.SkillDir, force)
+	skillState, err := copyDemoTree(path.Join("daily", spec.Name, "skills", spec.Skill), item.SkillDir, force, nil)
 	if err != nil {
 		return demoManifestItem{}, fmt.Errorf("安装 %s 技能：%w", spec.Name, err)
 	}
@@ -343,8 +365,11 @@ func demoPendingItems(spec demoSpec) []string {
 }
 
 // copyDemoTree 从内嵌素材复制一棵子树；目标已存在且不覆盖时返回 kept。
+// skip 是目标根下一级的目录名黑名单——Agent 目录里的 skills/ 由安装器单独装到
+// <workspace>/skills，复制进 Agent 目录只会让加载器打 WARN 并留下重复副本。
 // copyDemoTree copies one embedded subtree; an existing target is kept unless forced.
-func copyDemoTree(srcRoot, dstRoot string, force bool) (string, error) {
+// Names in skip are dropped from the first level below the root.
+func copyDemoTree(srcRoot, dstRoot string, force bool, skip map[string]bool) (string, error) {
 	if _, err := os.Stat(dstRoot); err == nil {
 		if !force {
 			return demoStateKept, nil
@@ -362,6 +387,12 @@ func copyDemoTree(srcRoot, dstRoot string, force bool) (string, error) {
 		rel, relErr := filepath.Rel(filepath.FromSlash(srcRoot), filepath.FromSlash(p))
 		if relErr != nil {
 			return relErr
+		}
+		if first := firstPathElement(rel); first != "" && skip[first] {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		target := filepath.Join(dstRoot, rel)
 		if entry.IsDir() {
@@ -489,6 +520,67 @@ func needsDemoSample(selected []demoSpec) bool {
 	return false
 }
 
+// firstPathElement 取相对路径的第一段（根自身返回空串），用于跳过指定子目录。
+// firstPathElement returns the first segment of a relative path ("" for the root).
+func firstPathElement(rel string) string {
+	slash := filepath.ToSlash(rel)
+	if slash == "." {
+		return ""
+	}
+	if idx := strings.IndexByte(slash, '/'); idx >= 0 {
+		return slash[:idx]
+	}
+	return slash
+}
+
+// demoSrcDir 是自研 MCP 源码在工作区里的固定落点（报告、构建命令与安装共用一份来源）。
+// demoSrcDir is the single source of the exported docs-readonly source location.
+func demoSrcDir(wsRoot string) string {
+	return filepath.Join(wsRoot, "demos", "src", "docs-readonly")
+}
+
+// needsDemoSource 报告本次选择里是否有 Demo 依赖 docs-readonly。
+// needsDemoSource reports whether the selection needs the docs-readonly source.
+func needsDemoSource(selected []demoSpec) bool {
+	for _, spec := range selected {
+		for _, server := range spec.MCPServers {
+			if server == "docs-readonly" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// demoSourceGoModText 是导出目录里的最小 go.mod：源码并回主 module 后自身不再带
+// go.mod，导出时补一份，保住 `go -C <dir> build .` 的独立构建体验。
+// demoSourceGoModText restores a minimal go.mod so the exported directory builds standalone.
+const demoSourceGoModText = `module basalt-docs-readonly
+
+go 1.27
+`
+
+// installDemoSource 把内嵌的 docs-readonly 源码导出到工作区，并补一份最小 go.mod。
+// installDemoSource exports the embedded source and writes the minimal go.mod.
+func installDemoSource(wsRoot string, force bool) (demoSourceAsset, error) {
+	dir := demoSrcDir(wsRoot)
+	state, err := copyDemoTree("shared/mcp/docs-readonly", dir, force, nil)
+	if err != nil {
+		return demoSourceAsset{}, fmt.Errorf("导出 docs-readonly 源码：%w", err)
+	}
+	gomodPath := filepath.Join(dir, "go.mod")
+	if state == demoStateInstalled {
+		if err := os.WriteFile(gomodPath, []byte(demoSourceGoModText), 0o644); err != nil {
+			return demoSourceAsset{}, fmt.Errorf("写出 %s：%w", gomodPath, err)
+		}
+	}
+	depsDir := filepath.Join(wsRoot, "demos", "deps")
+	if err := os.MkdirAll(depsDir, 0o755); err != nil {
+		return demoSourceAsset{}, fmt.Errorf("创建依赖目录 %s：%w", depsDir, err)
+	}
+	return demoSourceAsset{Path: dir, State: state, GoMod: gomodPath}, nil
+}
+
 // demoDBHubConfigText 是配置正文模板（%s 处填 DSN）：1.5.0 的只读面与行数上限只能
 // 写在配置里，`--readonly` 启动参数在该版本已被移除（2026-10-26 实测）。
 // demoDBHubConfigText is the config body; %s is the DSN literal.
@@ -614,6 +706,9 @@ func writeDemoPlan(out io.Writer, wsRoot string, selected []demoSpec) {
 		fmt.Fprintf(out, "  %s → %s\n", "样例库", demoDBHubSamplePath(wsRoot))
 		fmt.Fprintf(out, "  %s → %s\n", "DBHub 只读配置", filepath.Join(wsRoot, "demos", "mcp", "dbhub.toml"))
 	}
+	if needsDemoSource(selected) {
+		fmt.Fprintf(out, "  %s → %s（含生成的 go.mod）\n", "docs-readonly 源码", demoSrcDir(wsRoot))
+	}
 	fmt.Fprintf(out, "  %s → %s\n", "安装清单", filepath.Join(wsRoot, "demos", "install.json"))
 }
 
@@ -652,6 +747,10 @@ func writeDemoReport(out io.Writer, wsRoot string, selected []demoSpec, manifest
 	if manifest.DBHubConfig != "" {
 		fmt.Fprintln(out, "DBHub 配置 "+manifest.DBHubConfig+"（只读 + max_rows=500，dsn 指向样例库）")
 	}
+	if manifest.DocsReadOnly != nil {
+		fmt.Fprintln(out, "docs-readonly 源码 "+manifest.DocsReadOnly.Path+"（"+
+			demoStateLabel(manifest.DocsReadOnly.State)+"，"+docsReadOnlyGoModNote(*manifest.DocsReadOnly)+"）")
+	}
 	fmt.Fprintln(out, "待配置（逐项做完才会注册 / 运行）：")
 	for _, item := range manifest.Demos {
 		fmt.Fprintf(out, "  %s\n", item.Name)
@@ -663,6 +762,21 @@ func writeDemoReport(out io.Writer, wsRoot string, selected []demoSpec, manifest
 	writeDemoMCPHint(out, wsRoot, selected, manifest)
 	writeDemoCredentialHints(out, wsRoot, selected)
 	writeDemoPermissionHint(out)
+}
+
+// docsReadOnlyGoModNote 按实际状态报告 go.mod：只有本次新建（installed）才写入了
+// 最小 go.mod；保留既有目录（kept）时不改用户文件，因此不能声称"已生成"——若旧目录
+// 本就没有 go.mod，报告里的构建命令会失败，必须当场说清。
+// docsReadOnlyGoModNote reports the go.mod fact per state: only a fresh export writes
+// one, so a kept directory must not claim "generated" when the file may be absent.
+func docsReadOnlyGoModNote(asset demoSourceAsset) string {
+	if asset.State == demoStateInstalled {
+		return "已生成 go.mod"
+	}
+	if _, err := os.Stat(asset.GoMod); err == nil {
+		return "保留原目录，复用其中已有的 go.mod"
+	}
+	return "保留原目录，未写 go.mod；构建前需自行补一份（module basalt-docs-readonly + go 1.27）"
 }
 
 // writeDemoDepTable 打印固定版本依赖与安装命令；命令只打印，不执行。
@@ -680,7 +794,13 @@ func writeDemoDepTable(out io.Writer, wsRoot string, selected []demoSpec) {
 			continue
 		}
 		fmt.Fprintf(out, "  %s %s（%s）\n", dep.ID, dep.Version, dep.SourceURL)
-		fmt.Fprintf(out, "    %s\n", dep.Install)
+		command := dep.Install
+		if dep.Kind == "go-build" {
+			// go-build 的命令里带两个 %s：源码目录与产物路径（都按实际工作区渲染）。
+			command = fmt.Sprintf(dep.Install, demoSrcDir(wsRoot),
+				filepath.Join(wsRoot, "demos", "deps", dep.Entry))
+		}
+		fmt.Fprintf(out, "    %s\n", command)
 		fmt.Fprintf(out, "    入口：%s\n", dep.Entry)
 	}
 	fmt.Fprintf(out, "  依赖目录建议：%s\n", filepath.Join(wsRoot, "demos", "deps"))
@@ -746,7 +866,8 @@ func writeDemoCredentialHints(out io.Writer, wsRoot string, selected []demoSpec)
 			}
 			fmt.Fprintln(out, "  "+hint.Key)
 			fmt.Fprintln(out, "    "+hint.Need)
-			fmt.Fprintln(out, "    步骤："+filepath.Join(wsRoot, agentsDirName, hint.Doc))
+			setupPath := filepath.Join(wsRoot, agentsDirName, spec.Name, "SETUP.md")
+			fmt.Fprintln(out, "    步骤："+setupPath+" "+hint.Section)
 		}
 	}
 }

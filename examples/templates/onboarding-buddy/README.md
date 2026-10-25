@@ -65,7 +65,7 @@ docs-readonly:
 | 依赖 | 说明 |
 | --- | --- |
 | Basalt 实例 | 提供文件工具、记忆工具、MCP 客户端池与调度 |
-| `docs-readonly` | 仓内 `examples/shared/mcp/docs-readonly`（独立嵌套 Go module，纯标准库、零依赖）；`go build` 后指到你的资料库根目录 |
+| `docs-readonly` | 仓内 `examples/shared/mcp/docs-readonly`（主 module 内 `package main`，纯标准库、零第三方依赖；`basalt demo install` 导出源码并生成 `go.mod`）；`go build` 后指到你的资料库根目录 |
 | 技能实体 | 复制 `skills/onboarding/` 到 `.basalt/skills/onboarding/`，否则声明名无实体、整只 Agent 不注册 |
 | 模型连接 | `provider.name: local-model` 是占位，导入后绑定 |
 

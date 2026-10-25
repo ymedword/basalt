@@ -11,8 +11,11 @@ package examples
 import "embed"
 
 // Assets 是示例树：daily/ 下五份每日 Demo（含脚本、夹具、技能），shared/ 下
-// 共享脚本（样例库生成器）与自研只读 MCP server 源码（嵌套 module）。
+// 共享脚本（样例库生成器）与自研只读 MCP server 源码。
+// 注意：go:embed 跨不过嵌套 module——docs-readonly 因此并回主 module，源码才能
+// 随二进制发行；安装器导出它时会补一份最小 go.mod（2026-10-26 用户裁决）。
 // Assets holds the demo tree plus the shared scripts and the docs-readonly source.
+// go:embed cannot cross a nested module, so docs-readonly lives in the main module.
 //
 //go:embed daily shared
 var Assets embed.FS
