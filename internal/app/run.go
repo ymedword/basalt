@@ -82,8 +82,9 @@ func Run(ctx context.Context, args []string) int {
 	// 名册，二者都不在才是新实例——存量无配置实例不得被当成新实例放宽策略。
 	// The new-instance check and first-run config generation must precede the load, or the
 	// first process would still run on defaults until restarted.
+	serveInit := needsServeInit(args)
 	bootstrap := instanceBootstrapReport{}
-	if needsServeInit(args) {
+	if serveInit {
 		// 配置尚未装载，日志出口还没档位可选：失败用缺省档记一次，错误绝不静默吞掉。
 		report, bootErr := ensureNewInstanceConfig(workDir, programRuntimeRoot())
 		if bootErr != nil {
@@ -107,6 +108,15 @@ func Run(ctx context.Context, args []string) int {
 			fields = append(fields, "budget_max_iterations", 30, "max_concurrent_runs", 32)
 		}
 		logger.Info("新实例：最小配置与实例名册已就绪", fields...)
+	} else if serveInit {
+		if _, statErr := os.Stat(configPath); errors.Is(statErr, fs.ErrNotExist) {
+			// 存量实例缺配置：**不**补生成（没有名册就不猜私有目录），也不替它放宽策略；
+			// 必填项缺失会在装配时拒绝启动。这里的告警是"为什么拒"的那半句——只点名事实，
+			// 不让运维从"配置校验失败"倒推本工作区其实是一个存量实例。
+			// An existing workspace without a config is never bootstrapped; say so before the
+			// mandatory-item refusal, so the refusal cannot be mistaken for a broken new instance.
+			logger.Warn("存量实例：工作区已有数据库或实例名册，但没有配置文件——不补生成，缺失的必填项会让启动失败")
+		}
 	}
 
 	// 出网受控拨号在**任何客户端构造之前**装配（14D §2.2.2 / D12）：此后本进程内造的
