@@ -145,3 +145,4 @@
 | 20261019T203742-current | 2026-10-19 | current-tree | rerun | ai | passed | [records/20261019T203742-current.json](records/20261019T203742-current.json) |
 | us14-release-gate-r2 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r2.json](records/us14-release-gate-r2.json) |
 | us14-release-gate-r4 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r4.json](records/us14-release-gate-r4.json) |
+| us14-release-gate-r5 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r5.json](records/us14-release-gate-r5.json) |
