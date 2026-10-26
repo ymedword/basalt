@@ -392,6 +392,7 @@ func (s *InstanceSecretsService) Init(ctx context.Context, actor core.Actor) (In
 //   - 有初始化记录 / 有托管密文 / 有来源不可证明的发布残留 → 走既有恢复规则，**不得**
 //     生成第二把密钥（`establishKeyPath` 与判定表各自拒绝，覆盖同一事实）；
 //   - 已就绪直接返回；待 adopt 只补记录；审计归因到发起保存的管理员，不冒充启动流程。
+//
 // EnsureForManagedWrite folds the first managed save on a legacy instance into one
 // audited flow; it never mints over a record, ciphertext or unprovable residue.
 func (s *InstanceSecretsService) EnsureForManagedWrite(ctx context.Context, actor core.Actor) error {

@@ -59,9 +59,9 @@ const (
 // 组件的版本——版本在发行布局里，标记只回答"这个名字由本安装器写过"。
 // The marker records which agents and entries the installer already wrote.
 type builtinOpenBoxState struct {
-	SchemaVersion   int      `json:"schema_version"`
-	InstalledAt     string   `json:"installed_at,omitempty"`
-	AgentsInstalled bool     `json:"agents_installed"`
+	SchemaVersion   int    `json:"schema_version"`
+	InstalledAt     string `json:"installed_at,omitempty"`
+	AgentsInstalled bool   `json:"agents_installed"`
 	// AgentsSkipped 记录"这个存量实例的 Agent 不归安装器管"。没有它时，回填写下的
 	// 标记（AgentsInstalled=false）会让下一次启动把五个内置 Agent 补装进老工作区——
 	// 升级一次就多出五只 Agent 是明确禁止的副作用。
