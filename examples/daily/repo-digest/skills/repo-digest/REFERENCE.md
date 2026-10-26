@@ -12,14 +12,24 @@
 | --- | --- | --- | --- |
 | PR | `number` | `updated_at`、`state` | `created_at`、`draft`、`merged_at` |
 | Issue | `number` | `updated_at`、`state` | `created_at`、`comments` |
-| Release | `id`（无则 `number`） | `updated_at` | `draft`、`prerelease`、`published_at` |
+| Release | `id`（无则 `number`） | `updated_at`（键缺失时用 `published_at`） | `draft`、`prerelease`、`published_at` |
 
-- `updated_at` **必须带时区偏移**（`...Z` 或 `+08:00`）。无时区的时间无法与游标
+- 时间字段**必须带时区偏移**（`...Z` 或 `+08:00`）。无时区的时间无法与游标
   比较，按「无法确认」处理。
+- 真实 GitHub 的 release 对象没有 `updated_at`（MCP `list_releases` 的字段枚举里
+  也没有），发布事件的唯一时间锚是 `published_at`。因此 Release 的游标时间 =
+  `updated_at`（存在时）→ 键缺失则 `published_at`。**键存在但解析失败**仍是坏行
+  （进 `held_back`，不拿发布时间掩盖脏值）；草稿且没有 `published_at` 没有可比较的
+  时间，同样进 `held_back`。
 - 身份或 `updated_at` 读不出来的条目：**不处理**，进 `held_back`，并且挡住游标。
 - 业务字段缺失或类型不对：条目照常计入，同时进 `unconfirmed`，**不猜默认值**。
 - 「键缺失」与「显式 `null`」是两件事：`merged_at` 键缺失 → 待确认；
   `merged_at: null` → 关闭未合并。
+- 实测 github-mcp-server 2.0.3：Issue 列表的 `state` 是大写 GraphQL 枚举
+  （`OPEN` / `CLOSED`），脚本按大小写不敏感归一化后再分桶；PR 列表本来就是小写。
+- 同一版本实测：Issue 的 `comments` 在 0 条评论时**省略该键**。脚本不把缺失当 0，
+  这类条目进 `unconfirmed`（`field: comments`），并且**不会**触发 `unanswered_open`。
+  这是有意的保守口径——要恢复该信号需要换用能返回 0 的字段 / 工具。
 
 ## 2. 分桶
 
@@ -35,7 +45,7 @@
 | Release | `published` | 非草稿且 `published_at` 可解析 |
 | Release | `prerelease` | 同上且 `prerelease=true` |
 | Release | `unpublished` | 非草稿且 `published_at` 显式为 `null` |
-| Release | `unknown` | `published_at` 键缺失或不可解析 |
+| Release | `unknown` | 非草稿且 `published_at` 不可解析；键缺失且无 `updated_at` 时整条进 `held_back`，不进此桶 |
 
 `counts.with_unconfirmed_fields` 统计「已计入但至少有 1 个待确认字段」的条目数，
 它不参与分桶求和（`sum(桶) = processed` 恒成立，`with_unconfirmed_fields` 另算）。
@@ -59,8 +69,9 @@
 {"schema_version": 1, "sources": {"pull_requests": null, "issues": null, "releases": null}}
 ```
 
-- 只有 `updated_at > 上次游标` 的条目算「新」（`is_new`）。首跑游标为 `null`，
-  全部算新。
+- 只有时间游标 `> 上次游标` 的条目算「新」（`is_new`）。时间游标对 PR / Issue 是
+  `updated_at`，对 Release 是 `updated_at`（键缺失时用 `published_at`）。首跑游标为
+  `null`，全部算新。
 - **游标只前进到已处理项**：
   - 没有受阻项 → 取已处理条目的最大 `updated_at`；
   - 有受阻项但时间可读 → 取**严格小于**受阻项最早时间的最大已处理时间（相等不行：

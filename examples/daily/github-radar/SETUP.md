@@ -102,29 +102,36 @@ D1 用**模型 `notify`**（Run 内调用），不是 `deliver_to` 系统代投�
 
 ## 6. 放开 shell（脚本通道）
 
-`shell` 工具只执行白名单里的可执行名，解释器还必须走受控通道。编辑 `basalt.yaml`：
+`shell` 工具只执行白名单里的可执行名，**整串逐字比对**（Windows 不查 PATH、不补
+`.exe` / `.cmd` 后缀）。示例脚本走 `shell`，两条前提都要满足：解释器整串登记进
+`shell.allowed_commands`，且 `AGENT.md` 里写的可执行名与它是**同一串**。
+
+安装器已经替你做了一半：`basalt demo install`（或首次启动的开箱安装）把 `AGENT.md`
+里的 `{{BASALT_PYTHON}}` 替换成本机解释器的绝对路径——**随包运行时优先**，即
+`<程序目录>/runtime/python/python.exe`；Linux / macOS 是
+`<程序目录>/runtime/python/bin/python3`。新实例的模板把同一串写进
+`shell.allowed_commands`，已有实例按下面补齐即可：
 
 ```yaml
 shell:
   allowed_commands:
-    - python                # 与 interpreters / AGENT.md 用同一串（Windows 见下方提示）
-    - github-mcp-server     # MCP server 的 command 也必须放行
-  interpreters:
-    - python                # 解释器：argv 必须是 [脚本路径, 参数…]，脚本须在本 Agent scripts/ 内
-  env_passthrough: []       # 脚本不需要额外环境变量
+    - "D:/basalt/bin/runtime/python/python.exe"   # 与 AGENT.md 里的可执行名逐字一致
+    - "D:/basalt/bin/runtime/mcp/.../xxx.exe"     # 用到的 MCP server 的 command 同样要放行
+  env_passthrough: []                             # 脚本不需要额外环境变量
 ```
 
-- **Windows 本机必须写解释器的绝对路径**（已实测）：受控执行器把 `interpreters` 里的
-  整串**原样**交给 `CreateProcess`（`lpApplicationName`），既不查 PATH、也不补
-  `.exe` / `.cmd` 后缀——写 `python`、`python.exe`、`py` 都只会得到
-  `The system cannot find the file specified`。请写 python.org 安装的绝对路径
-  （如 `C:/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`），
-  并把 `allowed_commands` 与 `AGENT.md` 第 4 步的可执行名同步成**同一串**（白名单按
-  整串逐字比对）。Linux / macOS 上执行器走 `exec.Command`（查 PATH），裸名可用。
+- 分隔符自己统一：`D:/…/python.exe` 与 `D:\…\python.exe` 不算同一串；
+- `shell.interpreters` 是**可选的更严通道**：登记后只允许
+  `argv = [<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的 `scripts/` 内，
+  `-c` / `-m` 这类内联代码一律拒。示例脚本都满足，建议一并登记；不登记也能跑
+  （`allowed_commands` 放行即可），只是 shell 面更宽；
+- `bash` / `sh` **不得**放行；
+- `AGENT.md` 里若仍是字面量 `{{BASALT_PYTHON}}`（安装时没找到解释器），把它换成你登记的
+  同一串；**不得**改猜 `python` / `py` 之类的名字——整串不命中就是 `sandbox_denied`；
 - 同一份 `basalt.yaml` 的 `budget:` 段也要动：`budget.max_iterations` 缺省 **10**，
   而本 Demo 的 `AGENT.md` 声明 `settings.max_iterations: 12`——Profile 只能**收紧**
   运维上限、**不得**放大（契约 `run-and-errors.md` §6），不调这一项 Run 会在第 10 轮
-  落 `limit_reached`。在该段把 `max_iterations` 调到不小于 12。
+  落 `limit_reached`。
 
 ## 7. 重启
 
@@ -186,6 +193,6 @@ sqlite3 <workspace>/.basalt/basalt.db \
 | --- | --- |
 | Agent 没注册 | 启动 WARN：`name mismatch` / `provider version missing` / `tool not registered` / `mcp server skipped: github` |
 | 保存 MCP 配置返回 503 | `GITHUB_PERSONAL_ACCESS_TOKEN` 未设置或为空；用响应里的 `operation_id` 查操作详情 |
-| `shell` 返回 `sandbox_denied` | `shell.allowed_commands` / `shell.interpreters` 未放行，或脚本不在 `scripts/` 下 |
+| `shell` 返回 `sandbox_denied` | 解释器整串没进 `shell.allowed_commands`（或与 `AGENT.md` 里不是同一串）；登记了 `shell.interpreters` 时还要求脚本在 `scripts/` 下 |
 | 脚本非零退出 | `stderr` 原文会被回填给模型；按 `README.md` 的「失败样例」判定，不要改写脚本绕过 |
 | `http_get` 返回 `sandbox_denied` | 域名白名单缺 `raw.githubusercontent.com` / `github.com`；在管理台「执行环境」页添加 |

@@ -150,6 +150,14 @@ class GithubRadarTest(unittest.TestCase):
         with self.assertRaises(ScriptError):
             run_script(input=[{"full_name": "a/b", "stars": 1}], state={})
 
+    def test_missing_pushed_at_falls_back_to_updated_at(self):
+        # 实测 github-mcp-server 2.0.3 的 search_repositories 默认不返回 pushed_at，
+        # 只有 updated_at；脚本自己兜底，模型不需要手填。
+        out = run_script(input=[{"full_name": "a/b", "stars": 1,
+                                 "updated_at": "2026-10-24T10:00:00Z"}], state={})
+        self.assertEqual(out["items"][0]["pushed_at"], "2026-10-24T10:00:00Z")
+        # 逆改点：只认 pushed_at → 真实搜索结果全部被拒 → 红
+
     def test_cli_writes_report_then_state_and_leaves_nothing_on_failure(self):
         with tempfile.TemporaryDirectory() as raw:
             workdir = Path(raw)

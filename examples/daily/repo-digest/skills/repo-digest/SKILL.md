@@ -21,9 +21,9 @@ description: 仓库日报技能——PR / Issue / Release 三源计数口径、�
 
 | 名称 | 含义 |
 | --- | --- |
-| `new` | 晚于游标（`updated_at > 上次游标`）的条目数；首跑没有游标，全部算新 |
+| `new` | 晚于游标（Release 用 `updated_at`，键缺失时用 `published_at`）的条目数；首跑没有游标，全部算新 |
 | `processed` | 本次真正计入统计的条目数；恒等式 `processed + len(held_back) = new` |
-| `held_back` | 连身份（编号）或更新时间都读不出来的条目：不计入统计，并且**挡住游标** |
+| `held_back` | 连身份（编号）或时间游标（`updated_at`，Release 键缺失时用 `published_at`）都读不出来的条目：不计入统计，并且**挡住游标** |
 | `with_unconfirmed_fields` | 已计入统计、但有业务字段无法确认的条目数 |
 | `followups` | 按固定规则筛出的待跟进项（见第四节） |
 | `unconfirmed` | 缺字段或字段解析失败的条目：`field` + `reason`（`missing` / `unparseable`） |
@@ -40,7 +40,7 @@ description: 仓库日报技能——PR / Issue / Release 三源计数口径、�
 | Release | `published` / `prerelease` / `draft` / `unpublished` / `unknown` |
 
 `unknown` = 关键字段读不出来（例如 closed PR 没有 `merged_at` 键、非草稿 release
-没有 `published_at` 键）。看到 `unknown` 就去 `unconfirmed` 找对应条目，
+的 `published_at` 不可解析）。看到 `unknown` 就去 `unconfirmed` 找对应条目，
 **不得**把它并进相邻的桶里凑整。
 
 ## 三、日报排版（`digest.md`）
@@ -87,7 +87,7 @@ description: 仓库日报技能——PR / Issue / Release 三源计数口径、�
 
 - 脚本非零退出：日报只写「失败」段——`stderr` 原文 + 「本次未产生可信数据」；
   **不得**自己估算数字补齐。
-- `held_back` 非空：日报末尾补一行「本次有 N 条未计入（原因：<reason>），游标未
+- `held_back` 非空：日报末尾补一行「本次有 N 条未计入（原因：`<reason>`），游标未
   越过它们」，下一轮会重读到。
 - 某个 MCP 工具缺失：写「该来源不可用」，其余来源照常出数。
 

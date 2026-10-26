@@ -44,6 +44,19 @@ schedules:
    报告了什么」只能来自记忆，**不得**用对话历史代替记忆，也**不得**跳过这一步。
 2. **列文档**：用 `list_documents`（无参数）取只读库清单。返回 JSON 数组，每项
    `{path, size, modified_at}`：路径以 `/` 分隔、按路径升序、时间是 UTC（`Z` 结尾）。
+
+   **库根校验（在调用任何 `document_metadata` 之前，必做）**：只看清单就能判断
+   docs-readonly 有没有指对库。出现下面任一情况，**立刻停**，不要逐份取元信息
+   （每份一次调用，很快把工具预算烧光，run 会被记成「工具调用次数超限」）：
+   - 清单里有工作区文件：`AGENTS.md`、`basalt.yaml`、`mcp_servers.yaml`、
+     `basalt.db`、`memory/MEMORY.md`；
+   - 文档数超过 **20**。
+
+   两种情况都说明 server 的库根是整个工作区（启动参数缺 `-root`）。处理：在 Agent
+   根目录写 `docs-diff-failed-<YYYYMMDD>.md`，写明「只读库根未指向样例文档库，
+   docs-readonly 缺 `-root`」+ 本次观测时间 + 清单条数与前几个路径，然后结束本次
+   Run；**不得**继续取元信息、**不得**自己读目录，也**不得**把工作区文件当成文档
+   差异上报。补上 `-root`（SETUP 第 6 节）后下次运行自会正常。
 3. **逐份取元信息**：对**清单里的每一份**文档调用 `document_metadata`（参数
    `{"path": "<该路径>"}`），得到 `{path, size, modified_at, sha256}`。一份都不能少、
    也不能多——脚本会把「清单有、元信息没有」和「元信息多出清单外」都当成错误（那说明
@@ -52,14 +65,16 @@ schedules:
    - `documents.json`：`list_documents` 返回的 JSON **原样**（数组，顺序不变）；
    - `metadata.json`：`{"documents": [<每次 document_metadata 的结果，逐个原样>]}`。
    不要重排、不要补字段、不要改数字。
-5. **算差异**：用 `shell` 运行脚本，`executable` 填 `python`，`arguments` 逐项分开：
+5. **算差异**：用 `shell` 运行脚本，`executable` 填 `{{BASALT_PYTHON}}`，`arguments` 逐项分开：
 
    ```text
    ["scripts/docs_diff.py", "--documents", "documents.json", "--metadata", "metadata.json", "--state", "state/baseline.json"]
    ```
 
-   可执行名以 `shell.interpreters` 里实际放行的为准（本机若配的是 `py` / `python3`，
-   或 Windows 上的解释器**绝对路径**，就换成那个**整串**，参数不变）。脚本自己做内容哈希对比、维护基线、原子写输出，`stdout`
+   上一行的可执行名由安装器替换成本机解释器的**绝对路径**，与 `shell.allowed_commands`
+   里登记的是同一串。若那里仍是带花括号的占位符（安装时没找到解释器），按 SETUP 第 6 节
+   登记本机解释器，再把这一行换成同一串；**不得**改猜 `python` / `py` 之类的名字（整串不
+   命中就是 `sandbox_denied`）。脚本自己做内容哈希对比、维护基线、原子写输出，`stdout`
    给出 JSON：`mode` / `baseline_missing` / `changes_detected` / `counts` / `sets` /
    `report.path` / `report.sha256` / `state.sha256` / `message`。
 6. **读差异结果**：`read_file` 读 `stdout.report.path` 指向的 `changes.json`。它是本次

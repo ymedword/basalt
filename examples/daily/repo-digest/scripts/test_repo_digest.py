@@ -248,6 +248,47 @@ class RepoDigestTest(unittest.TestCase):
         )
         # 逆改点：草稿 release 计入 published → 红
 
+    def test_release_without_updated_at_uses_published_at(self):
+        # 真实 GitHub 的 release 对象没有 `updated_at`（MCP `list_releases` 的
+        # 字段清单里也没有），发布事件的唯一时间锚是 `published_at`。
+        item = {k: v for k, v in release(1005, updated="2026-10-24T08:00:00Z",
+                                         published="2026-10-24T09:00:00Z").items()
+                if k != "updated_at"}
+        result = run_digest(
+            pull_requests=[], releases=[item],
+            cursor={"schema_version": repo_digest.SCHEMA_VERSION, "sources": {"releases": PREV}},
+        )
+        report = result["report"]
+        self.assertEqual(report["sources"]["releases"]["processed"], 1)
+        self.assertEqual(report["sources"]["releases"]["held_back"], [])
+        self.assertEqual(report["cursor"]["next"]["releases"], "2026-10-24T09:00:00+00:00")
+        # 逆改点：release 只认 `updated_at` → 真实 GitHub 的 release 全部被拒 → 红
+
+    def test_release_with_unparseable_updated_at_is_held_back(self):
+        item = release(1006, updated="not-a-timestamp", published="2026-10-24T09:00:00Z")
+        report = run_digest(pull_requests=[], releases=[item])["report"]
+        self.assertEqual(report["sources"]["releases"]["processed"], 0)
+        self.assertEqual(
+            report["sources"]["releases"]["held_back"],
+            [{"number": 1006, "field": "updated_at", "reason": "unparseable", "updated_at": None}],
+        )
+        # 逆改点：解析失败也退回 published_at → 脏值被发布时间掩盖 → 红
+
+    def test_state_case_is_normalized(self):
+        # 实测 github-mcp-server 2.0.3：Issue 的 state 是大写 GraphQL 枚举（OPEN），
+        # PR 是小写。大小写不改变语义，必须归一化后再分桶。
+        result = run_digest(
+            pull_requests=[pr(7, updated="2026-10-24T09:00:00Z", state="OPEN")],
+            issues=[issue(17, updated="2026-10-24T09:30:00Z", state="CLOSED")],
+        )
+        report = result["report"]
+        self.assertEqual(report["sources"]["pull_requests"]["counts"],
+                         {"open": 1, "with_unconfirmed_fields": 0})
+        self.assertEqual(report["sources"]["issues"]["counts"],
+                         {"closed": 1, "with_unconfirmed_fields": 0})
+        self.assertEqual(report["unconfirmed"], [])
+        # 逆改点：只认小写 state → 真实 Issue 全部落 unknown → 红
+
     def test_issue_without_comments_is_unconfirmed(self):
         report = run_digest(pull_requests=[], issues=[issue(15, updated="2026-10-24T13:30:00Z", comments=None)])["report"]
         self.assertEqual(report["sources"]["issues"]["counts"], {"open": 1, "with_unconfirmed_fields": 1})

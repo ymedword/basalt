@@ -58,7 +58,7 @@ func TestAgents_ListsFiveBuiltinsInInstallOrder(t *testing.T) {
 // 模型字段一律留空、技能装到 `<ws>/skills` 而不是 Agent 目录里。
 func TestInstall_CreatesBlankModelTreesAndSkills(t *testing.T) {
 	ws := t.TempDir()
-	results, err := Install(ws, false)
+	results, err := Install(ws, false, "")
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -92,11 +92,80 @@ func TestInstall_CreatesBlankModelTreesAndSkills(t *testing.T) {
 	}
 }
 
+// TestInstall_SubstitutesInterpreterForFreshAndKept 判解释器占位符的两条路径：新装时与
+// 留空模型同一次写入替换；保留态只替换占位符、不动用户填好的模型绑定（旧版本装出来的
+// 目录升级后也要对齐，否则示例脚本一直 `sandbox_denied`）。
+func TestInstall_SubstitutesInterpreterForFreshAndKept(t *testing.T) {
+	ws := t.TempDir()
+	interp := filepath.Join(t.TempDir(), "python.exe")
+	if _, err := Install(ws, false, interp); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	for _, spec := range Agents() {
+		agentFile := filepath.Join(ws, agentsDirName, spec.Name, agentDefinitionFile)
+		raw, err := os.ReadFile(agentFile)
+		if err != nil {
+			t.Fatalf("读 %s: %v", agentFile, err)
+		}
+		if strings.Contains(string(raw), PythonPlaceholder) {
+			t.Errorf("%s 仍含未替换的占位符", spec.Name)
+		}
+		if !strings.Contains(string(raw), interp) {
+			t.Errorf("%s 没有写入解释器 %q", spec.Name, interp)
+		}
+	}
+
+	// 模拟旧版本装出来的保留态：占位符还在，模型已由用户填好。
+	agentFile := filepath.Join(ws, agentsDirName, "docs-diff", agentDefinitionFile)
+	raw, err := os.ReadFile(agentFile)
+	if err != nil {
+		t.Fatalf("读 %s: %v", agentFile, err)
+	}
+	stale := strings.ReplaceAll(string(raw), interp, PythonPlaceholder)
+	stale = strings.Replace(stale, `  model: ""`, "  model: 用户填的模型", 1)
+	if err := os.WriteFile(agentFile, []byte(stale), 0o600); err != nil {
+		t.Fatalf("写回保留态: %v", err)
+	}
+	results, err := Install(ws, false, interp)
+	if err != nil {
+		t.Fatalf("二次 Install: %v", err)
+	}
+	if state := findResult(t, results, "docs-diff").State; state != StateKept {
+		t.Fatalf("已存在目录状态 = %q，期望 %q", state, StateKept)
+	}
+	raw, err = os.ReadFile(agentFile)
+	if err != nil {
+		t.Fatalf("读 %s: %v", agentFile, err)
+	}
+	if strings.Contains(string(raw), PythonPlaceholder) {
+		t.Error("保留态的占位符没有被替换")
+	}
+	if !strings.Contains(string(raw), "  model: 用户填的模型") {
+		t.Error("保留态的模型绑定被改动")
+	}
+
+	if _, err := Install(t.TempDir(), false, "python"); err == nil {
+		t.Fatal("相对路径解释器应被拒绝")
+	}
+}
+
+// TestResolveAgentPython_SkipsMissingFile 判文件不存在时静默跳过：保留态目录里没有
+// AGENT.md（用户自己删了）不该让整轮安装失败。
+func TestResolveAgentPython_SkipsMissingFile(t *testing.T) {
+	interp := filepath.Join(t.TempDir(), "python.exe")
+	if err := ResolveAgentPython(filepath.Join(t.TempDir(), "AGENT.md"), interp); err != nil {
+		t.Fatalf("文件不存在时应跳过，实际 %v", err)
+	}
+	if err := ResolveAgentPython(filepath.Join(t.TempDir(), "AGENT.md"), ""); err != nil {
+		t.Fatalf("空解释器应跳过，实际 %v", err)
+	}
+}
+
 // TestInstall_KeepsExistingAndForceRewrites 判幂等口径：已存在的定义逐字节保留；只有
 // force 才重写，且重写后的模型字段仍是空串。
 func TestInstall_KeepsExistingAndForceRewrites(t *testing.T) {
 	ws := t.TempDir()
-	if _, err := Install(ws, false); err != nil {
+	if _, err := Install(ws, false, ""); err != nil {
 		t.Fatalf("首次 Install: %v", err)
 	}
 	agentFile := filepath.Join(ws, agentsDirName, "docs-diff", agentDefinitionFile)
@@ -105,7 +174,7 @@ func TestInstall_KeepsExistingAndForceRewrites(t *testing.T) {
 		t.Fatalf("写自定义定义: %v", err)
 	}
 
-	results, err := Install(ws, false)
+	results, err := Install(ws, false, "")
 	if err != nil {
 		t.Fatalf("二次 Install: %v", err)
 	}
@@ -120,7 +189,7 @@ func TestInstall_KeepsExistingAndForceRewrites(t *testing.T) {
 		t.Fatalf("非 force 安装改写了已存在的定义：%q", raw)
 	}
 
-	results, err = Install(ws, true)
+	results, err = Install(ws, true, "")
 	if err != nil {
 		t.Fatalf("force Install: %v", err)
 	}
@@ -256,6 +325,7 @@ func TestBlankModel_MissingFile(t *testing.T) {
 func TestEntries_CommandAndPlaceholderShapes(t *testing.T) {
 	paths := Paths{
 		DocsReadOnly: `C:\app\runtime\docs-readonly.exe`,
+		DocsRoot:     `C:\ws\samples\docs`,
 		Node:         `C:\app\runtime\node\node.exe`,
 		DBHubEntry:   `C:\app\runtime\dbhub\dist\index.js`,
 		DBHubConfig:  `C:\ws\demos\mcp\dbhub.toml`,
@@ -269,6 +339,17 @@ func TestEntries_CommandAndPlaceholderShapes(t *testing.T) {
 	}
 	if free[0].Name != "docs-readonly" || free[0].Command != paths.DocsReadOnly || len(free[0].Env) != 0 {
 		t.Errorf("docs-readonly 条目形态不符：%+v", free[0])
+	}
+	// 缺 `-root` 时 server 落在进程当前目录——真实实例上就是整个工作区，生成物会被
+	// 当成文档（2026-10-27 docs-diff「迭代上限」的根因）。根目录必须显式写进参数。
+	// Without -root the server lists the whole workspace; the root must be explicit.
+	if want := []string{"-root", paths.DocsRoot}; strings.Join(free[0].Args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("docs-readonly 参数 = %v，期望 %v", free[0].Args, want)
+	}
+	// 调用方没算出根目录时（老单元测试 / 半截装配）保持升级前的形态，不凭空吐一个裸 -root。
+	// A caller without a root keeps the pre-upgrade shape instead of a bare -root.
+	if legacy := CredentialFreeEntries(Paths{DocsReadOnly: paths.DocsReadOnly}); len(legacy[0].Args) != 0 {
+		t.Errorf("没有根目录时不应写出 -root：%v", legacy[0].Args)
 	}
 	if free[1].Name != "dbhub" || free[1].Command != paths.Node {
 		t.Errorf("dbhub 条目形态不符：%+v", free[1])

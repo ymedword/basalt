@@ -84,6 +84,14 @@ const connections = [
 let wrapper: ReturnType<typeof mount> | undefined
 
 /**
+ * 用户实测（2026-10-27）里的可执行名形态：很长的 Windows 绝对路径。裸文本在定宽表
+ * 里没有断行点，会溢出压到相邻列；列表必须按标识渲染（省略号 + 悬停全值）。
+ * The long absolute command users hit in the field; it must render as an identifier.
+ */
+const GITHUB_COMMAND =
+  'D:\\code\\basalt\\bin\\runtime\\mcp\\github-mcp-server\\2.0.3\\github-mcp-server.exe'
+
+/**
  * MCP 列表夹具：一条未发布（不判断凭据），一条四档槽位齐全且带一个未声明槽位。
  * One unpublished entry (nothing to judge) and one covering every slot state plus an
  * undeclared slot.
@@ -108,7 +116,7 @@ const mcpServers: McpServerView[] = [
   {
     name: 'github',
     transport: 'stdio',
-    command: 'npx',
+    command: GITHUB_COMMAND,
     env_keys: ['GITHUB_PAT', 'MISSING_KEY', 'REVOKED_KEY', 'UNDECLARED_KEY'],
     header_keys: [],
     credential_keys: [
@@ -248,6 +256,13 @@ describe('MCP credential column', () => {
 
     // 已发布：四档按固定顺序计数；未声明来源会让下一次保存被拒，单独标红。
     const cells = rows[1]!.findAll('td')
+    // 可执行名是长绝对路径：走自己的列宽并以标识渲染（悬停可读全值），
+    // 不是会溢出压列的裸文本。
+    expect(cells[2]!.classes()).toContain('col-command')
+    const commandCell = cells[2]!.find('code.cell-id')
+    expect(commandCell.exists()).toBe(true)
+    expect(commandCell.attributes('title')).toBe(GITHUB_COMMAND)
+    expect(commandCell.text()).toBe(GITHUB_COMMAND)
     // 请求头名与 env 键同一列；stdio 没有请求头，列里就是 env 键。
     expect(cells[3]!.text()).toBe('GITHUB_PAT、MISSING_KEY、REVOKED_KEY、UNDECLARED_KEY')
     expect(

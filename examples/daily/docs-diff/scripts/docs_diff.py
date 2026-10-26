@@ -47,6 +47,14 @@ from pathlib import Path
 AGENT_NAME = "docs-diff"
 SCHEMA_VERSION = 1
 
+# MAX_DOCUMENTS 是「演示库」的份数上限，不是产品限制。每份文档最多两次工具调用
+# （document_metadata + 可能的 read_document），缺省预算 budget.max_tool_calls = 50、
+# 固定步骤约 10 次，所以 20 份是仍能跑完的上限；超过它说明库根不是样例文档库
+# （没传 -root 时落在进程当前目录 = 整个工作区），继续算只会把预算烧光。
+# MAX_DOCUMENTS caps the demo library, not the product: the default tool budget (50 calls)
+# fits ~20 docs at two calls each plus the fixed steps.
+MAX_DOCUMENTS = 20
+
 # STATUS_BASELINE 只在首跑出现：它表示"这一份被记进了基线"，与"新增"是两回事。
 # STATUS_BASELINE only appears on the first run: recorded into the baseline, not "added".
 STATUS_BASELINE = "baseline"
@@ -190,6 +198,7 @@ def _check_modified_at(value, *, source, path):
 def parse_snapshot(payload):
     """解析 `list_documents` 的结果：path → {size, modified_at}。"""
     entries = entries_of(payload, what="list_documents 结果")
+    check_library_root([item.get("path") for item in entries if isinstance(item, dict)])
     snapshot = {}
     for index, item in enumerate(entries, start=1):
         if not isinstance(item, dict):
@@ -202,6 +211,33 @@ def parse_snapshot(payload):
             "modified_at": _check_modified_at(item.get("modified_at"), source="list_documents", path=path),
         }
     return snapshot
+
+
+def check_library_root(paths):
+    """拒绝"根没指向只读文档库"的清单：像工作区、或份数超过演示上限。
+
+    只读 MCP server 不传 `-root` 时落在进程当前目录——真实实例上那就是整个工作区，
+    `agents/`、`versions/`、`skills/` 这些生成物都会被算成文档。这个判据放在**任何
+    逐份调用之前**：每份文档要一次 `document_metadata`，36 份就把工具预算烧完
+    （2026-10-27 实测：50 次调用上限用尽、run 记 limit_reached），而真正的问题是配置，
+    不是文档太多。
+    """
+    # 只认 Basalt 工作区**独有**的文件；通用目录名（docs/、logs/、skills/）不认，
+    # 免得把用户自己的文档库误判成工作区。
+    # Only Basalt-workspace-only files count; generic folder names would misfire on real libraries.
+    workspace_markers = ("AGENTS.md", "basalt.yaml", "mcp_servers.yaml", "basalt.db", "memory/MEMORY.md")
+    for path in paths:
+        if isinstance(path, str) and path in workspace_markers:
+            raise ScriptError(
+                f"文档清单里出现工作区文件（{path}）：只读库根疑似指向整个工作区——"
+                "给 docs-readonly 的 args 补 -root <样例文档库绝对路径> 后重跑；本次拒绝计算"
+            )
+    if len(paths) > MAX_DOCUMENTS:
+        raise ScriptError(
+            f"文档数 {len(paths)} 超过演示上限 {MAX_DOCUMENTS}（每份要一次元信息调用）："
+            "只读库根疑似指向整个工作区——给 docs-readonly 的 args 补 -root <样例文档库"
+            "绝对路径> 后重跑，或把库裁到演示范围内；本次拒绝计算"
+        )
 
 
 def parse_metadata(payload):

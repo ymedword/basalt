@@ -166,6 +166,13 @@ describe('notify channels', () => {
     ])
     await flushPromises()
 
+    // 定宽表：渠道名与 UID 是有明确宽度的标识列（用户实测曾被压成竖排）。
+    // The table is fixed-layout so the identifier columns keep their width.
+    expect(wrapper!.find('.notify-table').exists()).toBe(true)
+    const firstRow = wrapper!.findAll('tbody tr')[0]!
+    expect(firstRow.findAll('td')[0]!.classes()).toContain('col-name')
+    expect(firstRow.findAll('td')[1]!.classes()).toContain('col-uid')
+    expect(firstRow.findAll('td')[1]!.text()).toBe(CHANNEL_UID.slice(0, 8) + '…')
     // 表头的 th 也带列类名（DataTable 的既有行为），只取数据行。
     // DataTable tags header cells with the same column class, so scope to tbody.
     const hosts = wrapper!.findAll('tbody .col-host').map((cell) => cell.text())
@@ -186,6 +193,32 @@ describe('notify channels', () => {
     expect(wrapper!.text()).not.toContain('/services/')
   })
 
+  it('offers only real channel types and keeps an out-of-list current value selectable', async () => {
+    // 服务端只列飞书（webhook 是地址形态，不是渠道类型——用户裁决 2026-10-27）；
+    // 既有 webhook 渠道仍要能打开编辑：当前值不在表里时补一项，不得把它改坏。
+    mountChannels((call) => {
+      if (call.method === 'GET' && call.path === TYPES_PATH) {
+        return envelope(200, 'OK', 'success', ['feishu'])
+      }
+      return undefined
+    }, [channelView({ name: 'legacy-hook', description: '' })])
+    await flushPromises()
+
+    expect(wrapper!.findAll('#notify-type option').map((option) => option.text())).toEqual([
+      '请选择类型',
+      '飞书',
+    ])
+
+    await button('编辑').trigger('click')
+    await flushPromises()
+    // 当前值不在可选表里时补在表头（下拉仍显示原类型），其余选项按服务端顺序。
+    expect(wrapper!.findAll('#notify-type option').map((option) => option.text())).toEqual([
+      'webhook',
+      '飞书',
+    ])
+    expect(inputValue('#notify-type')).toBe('webhook')
+  })
+
   it('defaults to a managed address and submits it with the shared scope', async () => {
     const calls = mountChannels((call) => {
       if (call.method === 'GET' && call.path === TYPES_PATH) {
@@ -198,10 +231,10 @@ describe('notify channels', () => {
     })
     await flushPromises()
 
-    // 类型下拉按服务端返回的顺序渲染，组件不自行排序或枚举。
+    // 类型下拉按服务端返回的顺序渲染，组件不自行排序或枚举；已知类型显示中文标签。
     expect(wrapper!.findAll('#notify-type option').map((option) => option.text())).toEqual([
       '请选择类型',
-      'feishu',
+      '飞书',
       'webhook',
     ])
     // 默认托管：地址是密码框，直接录完整值；env 只是高级方式。
@@ -535,7 +568,7 @@ describe('notify channels', () => {
     expect(uids.map((cell) => cell.text())).toEqual(['rs_01J8Z…', 'rs_01J8Z…', 'rs_01J8Z…'])
     expect(uids[0]?.attributes('title')).toBe(CHANNEL_UID)
 
-    expect(wrapper!.findAll('tbody .col-short').map((cell) => cell.text())).toEqual([
+    expect(wrapper!.findAll('tbody .col-scope').map((cell) => cell.text())).toEqual([
       '专属', '共享', '共享',
     ])
     // 名称 1 / UID 2 / 类型 3 / 说明 4 / 目标服务 5 / 范围 6 / 所有者 7。

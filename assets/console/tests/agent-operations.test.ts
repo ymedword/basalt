@@ -680,6 +680,89 @@ describe('unified agent config tab', () => {
     expect(wrapper!.text()).toContain('已保存')
   })
 
+  it('re-reads the readiness panels after a successful save', async () => {
+    // 用户实测（2026-10-27）：在「配置」里实时配好模型连接并保存后，页头的「需要你
+    // 提供 → 模型连接」仍是旧读数，必须退出工作区再进来才变成「就绪」。保存成功即
+    // 由子组件点名、父级重读——不需要用户重进页面。
+    // A successful save must refresh the host's readiness panels immediately.
+    let readinessReads = 0
+    const route: Route = (call) => {
+      if (call.method === 'GET' && call.path === '/api/v1/agents/writer/readiness') {
+        readinessReads += 1
+        const ready = readinessReads > 1
+        return {
+          data: {
+            agent: 'writer',
+            ready,
+            pending: ready
+              ? []
+              : [{
+                  kind: 'model_connection',
+                  item: 'model_connection/default',
+                  detail: '未绑定模型连接。',
+                  fix: '/console/resources/model-connections',
+                }],
+            notices: [],
+          },
+        }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/agents/writer/config') {
+        return { data: agentConfigOf(), etag: ETAG_A }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/tools') {
+        return {
+          data: [
+            { name: 'save_memory', description: '保存记忆', source: 'builtin' },
+            { name: 'recall_memory', description: '检索记忆', source: 'builtin' },
+          ],
+        }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/skills') {
+        return { data: [] }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/mcp-servers') {
+        return { data: [] }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/model-connections') {
+        return {
+          data: [{
+            name: 'demo', resource_uid: UID_DEMO, base_url: 'https://api.example.com',
+            default_model: 'demo-model', credential_mode: 'env', credential_state: 'active',
+            scope: 'shared', owner_agent: '', published_version_id: 1, published_version_no: 1,
+          }],
+        }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/notify-channels') {
+        return { data: [] }
+      }
+      if (call.method === 'GET' && call.path === '/api/v1/agents/writer/content') {
+        return { data: { content: '---\nname: writer\n---\n你是作者。', etag: ETAG_A } }
+      }
+      if (call.method === 'PUT' && call.path === '/api/v1/agents/writer/content') {
+        return { data: filesViewOf('writer') }
+      }
+      return undefined
+    }
+    profilesData = [profileOf('writer', 'active', ['save_memory', 'legacy_tool'], ['legacy_skill'])]
+    await signIn(route)
+    await visit('/console/agents/writer')
+    await flushPromises()
+
+    expect(readinessReads).toBe(1)
+    expect(wrapper!.text()).toContain('未绑定模型连接。')
+
+    await button('配置').trigger('click')
+    await flushPromises()
+    await checkRowInput('recall_memory').setValue(true)
+    await button('保存配置').trigger('click')
+    await flushPromises()
+
+    // 保存成功即重读：阻断项消失、同一条目变成「就绪」，页面不必重进。
+    expect(readinessReads).toBe(2)
+    expect(wrapper!.text()).not.toContain('未绑定模型连接。')
+    expect(wrapper!.text()).toContain('就绪')
+  })
+
   it('does not rewrite notify_channels when only tools changed', async () => {
     // 未改动通知渠道时不得发送 notify_channels: []——否则每次保存工具/技能都会
     // 把“未声明 = 不限制”悄悄改成空声明（对服务端等价，但会制造无谓变更）。

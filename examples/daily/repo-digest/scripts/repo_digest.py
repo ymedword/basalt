@@ -192,12 +192,40 @@ def _updated_at_of(item):
     return parsed
 
 
+def _release_updated_at(item):
+    """release 的游标时间：`updated_at` 优先，**键缺失**时退回 `published_at`。
+
+    GitHub 的 release 对象没有 `updated_at`（MCP 的 `list_releases` 字段清单里也
+    没有），发布 / 预发布事件只能以 `published_at` 为时间锚。键存在但解析不了仍是
+    坏行（不拿发布时间掩盖脏值）；草稿且没有发布时间 = 没有可比较的时间，进
+    `held_back`。
+    Release cursor time: `updated_at` when present, otherwise `published_at`; a
+    present-but-unparseable value or a draft without a publish time is held back.
+    """
+    value = field(item, "updated_at")
+    if value is MISSING:
+        published = parse_timestamp(field(item, "published_at"))
+        if published is None:
+            raise ItemError("updated_at", "missing")
+        return published
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise ItemError("updated_at", _missing_reason(value))
+    return parsed
+
+
 def _state_of(item, notes):
+    # 实测 github-mcp-server 2.0.3：Issue 列表的 `state` 是 GraphQL 枚举大写
+    # （`OPEN` / `CLOSED`），PR 列表是小写。大小写不改变语义，统一归一化后判定；
+    # 其余取值仍是坏值，进 `unconfirmed`。
+    # Measured on github-mcp-server 2.0.3: issue states arrive as uppercase GraphQL
+    # enums, PR states lowercase. Case is normalized; anything else stays invalid.
     value = text_of(item, "state")
-    if value not in ("open", "closed"):
+    normalized = value.lower() if value else ""
+    if normalized not in ("open", "closed"):
         notes.flag("state", "missing_or_invalid")
         return None
-    return value
+    return normalized
 
 
 def _created_at_of(item, notes):
@@ -302,7 +330,7 @@ def normalize_release(item, *, now, stale_days, long_open_days):
     notes = Notes()
     # release 的身份是 `id`（没有 `number`）；报告里统一放在 `number` 键上。
     number = _identity_of(item, ("id", "number"))
-    updated_at = _updated_at_of(item)
+    updated_at = _release_updated_at(item)
     draft = _bool_of(item, "draft", notes)
     prerelease = _bool_of(item, "prerelease", notes)
 

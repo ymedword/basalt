@@ -1391,7 +1391,13 @@ func TestWire_NotifyAdminPortWiring(t *testing.T) {
 	require.NotNil(t, rt.notifyAdmin, "T058 之后通知写面必须由装配层构造")
 	require.Equal(t, fx.root, rt.notifyAdmin.root, "删除闸门扫描根必须是工作区根")
 	require.Equal(t, notifyTypeNames(), rt.notifyAdmin.types,
-		"写面类型表必须与 GET /notify-channels/types 同一有序切片")
+		"写面类型表必须是适配器注册表本身（webhook 仍可写入，既有渠道不被卡死）")
+	// 页面可选表是注册表的子集：下拉里出现过的类型必须写侧接受，反之不成立
+	// （webhook 是地址形态、不出现在下拉里）。用户裁决 2026-10-27。
+	// The console list is a subset of the write-side registry, never a second truth.
+	for _, name := range notifyConsoleTypes() {
+		require.Contains(t, rt.notifyAdmin.types, name, "下拉里的类型必须写侧接受")
+	}
 	require.NotNil(t, rt.notifyAdmin.operations, "操作台账必须是装配实例")
 
 	port := rt.writeServices.notifyAdmin

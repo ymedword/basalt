@@ -55,16 +55,18 @@ schedules:
    `{"success": true, "data": {"statements": [{"sql": "...", "rows": [...], "count": N}],
    "source_id": "default"}}`——**整段**照抄，不要只挑 `rows` 数组、不要重排、不要补
    字段、不要改数字；`scripts/biz_daily.py` 自己会解到 `data.statements[0].rows`。
-4. **算数**：用 `shell` 运行脚本，`executable` 填 `shell.interpreters` 里**实际放行**
-   的那一串（SETUP 给出了本机值；Windows 上**不得**只写 `python`——执行器不查 PATH），
-   `arguments` 逐项分开：
+4. **算数**：用 `shell` 运行脚本，`executable` 填 `{{BASALT_PYTHON}}`，`arguments`
+   逐项分开：
 
    ```text
    ["scripts/biz_daily.py", "--orders", "orders.json"]
    ```
 
-   脚本自己做四类互斥计数、只用有效行算指标，并把 `daily.json` 写到
-   `runs/<时间戳>/`；`stdout` 给出输入 / 产物的 SHA-256 与计数。
+   上一行的可执行名由安装器替换成本机解释器的**绝对路径**，与 `shell.allowed_commands`
+   里登记的是同一串。若那里仍是带花括号的占位符（安装时没找到解释器），按 SETUP 第 6 节
+   登记本机解释器，再把这一行换成同一串；**不得**改猜 `python` / `py` 之类的名字（整串不
+   命中就是 `sandbox_denied`）。脚本自己做四类互斥计数、只用有效行算指标，并把
+   `daily.json` 写到 `runs/<时间戳>/`；`stdout` 给出输入 / 产物的 SHA-256 与计数。
 5. **写日报**：`read_file` 读脚本刚写出的 `daily.json`，在**同一目录**写
    `daily.md`：
 

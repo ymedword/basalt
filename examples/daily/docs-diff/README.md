@@ -39,7 +39,7 @@
 | `save_memory` | 内置 | 每次运行追加一条 `docs-diff 基线 …` 记忆 |
 | `read_file` | 内置 | 读脚本产物 `changes.json` |
 | `write_file` | 内置 | 落盘 `documents.json` / `metadata.json` / `changes.md` |
-| `shell` | 内置 | 运行 `scripts/docs_diff.py`（解释器受 `shell.interpreters` 约束） |
+| `shell` | 内置 | 运行 `scripts/docs_diff.py`（解释器是 `AGENT.md` 里已替换的绝对路径，须在 `shell.allowed_commands` 里整串登记） |
 
 `AGENT.md` 的声明与上表一致；`notify` **不在**声明里——基线 `notify_mode: none`，
 工具面也不会补。`SETUP.md` 第 7 节开启通知后，保存响应里的 `changes.tools_added`
@@ -87,7 +87,7 @@ go -C <工作区>/.basalt/demos/src/docs-readonly build -o <absolute-path-to-doc
 
 | 依赖 | 版本 | 用途 |
 | --- | --- | --- |
-| Python | 3.12（标准库即可） | 运行 `scripts/docs_diff.py`（`shell.interpreters`） |
+| Python | 3.12（标准库即可） | 运行 `scripts/docs_diff.py`（绝对路径登记在 `shell.allowed_commands`） |
 | Go | 1.27.2（构建版本） | 构建 `examples/shared/mcp/docs-readonly`（主 module 内、零第三方依赖；安装器导出源码时生成 `go.mod`） |
 | Basalt | v0.1.0 | 运行底座（调度、MCP、记忆、审计） |
 

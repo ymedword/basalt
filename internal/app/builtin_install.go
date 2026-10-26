@@ -95,6 +95,7 @@ type builtinOpenBoxReport struct {
 	MCPPresent      []string
 	Missing         []string
 	SampleDB        builtin.SampleDB
+	DocsLibrary     builtin.DocsLibrary
 	DBHubConfig     string
 	// Backfilled 表示本次运行服务的是存量实例：只回填组件已就位的 MCP 条目，
 	// Agent 与安装标记的 Agent 段都不动。
@@ -207,7 +208,18 @@ func prepareBuiltinOpenBox(ctx context.Context, deps builtinOpenBoxDeps) (builti
 	}
 
 	if !state.AgentsInstalled && !state.AgentsSkipped {
-		results, err := builtin.Install(deps.WorkspaceRoot, false)
+		// 示例脚本的解释器：随包运行时优先（配置模板登记的就是这一串），源码检出才回落
+		// 到 PATH。找不到不算安装失败——Agent 仍需人工填模型，脚本步骤保留占位符即可。
+		// The interpreter is resolved before the copy: the placeholder is substituted in
+		// the same write pass that blanks the model.
+		interpreter := ""
+		if resolved, resolveErr := builtin.ResolvePython(ctx, deps.RuntimeRoot); resolveErr == nil {
+			interpreter = resolved
+		} else {
+			logger.Warn("未找到示例脚本解释器：内置 Agent 的 AGENT.md 保留占位符",
+				"reason", resolveErr)
+		}
+		results, err := builtin.Install(deps.WorkspaceRoot, false, interpreter)
 		if err != nil {
 			return report, err
 		}
@@ -253,6 +265,16 @@ func prepareBuiltinOpenBox(ctx context.Context, deps builtinOpenBoxDeps) (builti
 			}
 			report.DBHubConfig = configPath
 		}
+	}
+
+	// 样例只读文档库：只读 server 的 `-root` 指向它，`docs-diff` 才有稳定的文档集合。
+	// 存量实例仅在 server 组件已就位时准备，否则这份库用不上。
+	if !requireComponents || componentPresent(paths.DocsReadOnly) {
+		library, libraryErr := builtin.EnsureDocsLibrary(deps.WorkspaceRoot, false)
+		if libraryErr != nil {
+			return report, libraryErr
+		}
+		report.DocsLibrary = library
 	}
 
 	entries := builtin.CredentialFreeEntries(paths)
@@ -303,7 +325,7 @@ func prepareBuiltinOpenBox(ctx context.Context, deps builtinOpenBoxDeps) (builti
 	logger.Info("内置安装器完成",
 		"agents_installed", len(report.AgentsInstalled), "agents_kept", len(report.AgentsKept),
 		"mcp_written", report.MCPWritten, "sample_db", report.SampleDB.State,
-		"backfilled", report.Backfilled)
+		"docs_library", report.DocsLibrary.State, "backfilled", report.Backfilled)
 	return report, nil
 }
 
@@ -398,15 +420,17 @@ func builtinRuntimePaths(runtimeRoot, wsRoot string) builtin.Paths {
 		for _, candidate := range candidates {
 			paths = append(paths, filepath.Join(base, candidate))
 		}
-		return firstExisting(paths...)
+		return builtin.FirstExisting(paths...)
 	}
 	nodeRoot := filepath.Join(runtimeRoot, "node")
-	pythonRoot := filepath.Join(runtimeRoot, "python")
 	return builtin.Paths{
 		DocsReadOnly: componentEntry("docs-readonly", "docs-readonly"+suffix, "docs-readonly"),
+		// 只读 server 的根目录钉在样例文档库：不传 `-root` 时它落在进程当前目录，
+		// 真实实例上就是整个工作区（生成物也算文档）。
+		DocsRoot: builtin.SampleDocsPath(wsRoot),
 		// Node 的两种发行形态：Windows 包放 `runtime/node/node.exe`，官方 Unix tarball 是
 		// `bin/node`；`node`（无扩展名）留给手工摊平的安装方式。
-		Node: firstExisting(
+		Node: builtin.FirstExisting(
 			filepath.Join(nodeRoot, "node"+suffix),
 			filepath.Join(nodeRoot, "bin", "node"),
 			filepath.Join(nodeRoot, "node"),
@@ -414,35 +438,12 @@ func builtinRuntimePaths(runtimeRoot, wsRoot string) builtin.Paths {
 		DBHubEntry:  componentEntry("dbhub", filepath.Join("node_modules", "@bytebase", "dbhub", "dist", "index.js")),
 		DBHubConfig: builtin.DBHubConfigPath(wsRoot),
 		GitHub:      componentEntry("github-mcp-server", "github-mcp-server"+suffix, "github-mcp-server"),
-		// Python 与 Fetch 同属随包布局：Windows 发行包放 `runtime/python/python.exe`，
-		// Unix 包（官方 tarball 展开或 python-build-standalone）是 `bin/python3`。
-		Python: firstExisting(
-			filepath.Join(pythonRoot, "python"+suffix),
-			filepath.Join(pythonRoot, "bin", "python3"),
-			filepath.Join(pythonRoot, "bin", "python"),
-			filepath.Join(pythonRoot, "python"),
-		),
+		// Python 的发行布局由 internal/builtin 统一定义：示例 AGENT.md 的解释器占位符与
+		// 这里的配置登记必须是同一串，两处各算一份迟早对不上。
+		Python: builtin.RuntimePython(runtimeRoot),
 		// fetch 的启动脚本落在版本目录里：依赖轴按 `mcp/fetch/<版本>/` 认出组件。
 		Fetch: componentEntry("fetch", "run_fetch.py"),
 	}
-}
-
-// firstExisting 返回第一个存在的候选；都不存在时返回第一个（空输入返回空串）。
-// 配置因此只取决于发行布局，不取决于本机恰好装了什么。
-// firstExisting returns the first candidate that exists, else the first candidate.
-func firstExisting(candidates ...string) string {
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	return candidates[0]
 }
 
 // missingBuiltinComponents 返回启动路径不在盘上的组件名；只用于日志点名，**不**改变

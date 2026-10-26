@@ -39,7 +39,7 @@
 | `fetch` | `fetch` MCP（外部，**候选名**） | 逐 URL 抓正文（成功给正文，失败给报错） |
 | `read_file` | 内置 | 读脚本产物 `brief.json` |
 | `write_file` | 内置 | 落盘 `search.json` / `pages.json` / `brief.md` |
-| `shell` | 内置 | 运行 `scripts/industry_brief.py`（解释器受 `shell.interpreters` 约束） |
+| `shell` | 内置 | 运行 `scripts/industry_brief.py`（解释器是 `AGENT.md` 里已替换的绝对路径，须在 `shell.allowed_commands` 里整串登记） |
 
 `AGENT.md` 的声明与上表一致；`notify` **不在**声明里——基线 `notify_mode: none`，
 投递由 `deliver_to` 系统代投承担（见「通知路径」）。`shell` 是必需项：脚本跑不起来

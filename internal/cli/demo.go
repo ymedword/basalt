@@ -139,9 +139,23 @@ type demoManifest struct {
 	SchemaVersion int                `json:"schema_version"`
 	InstalledAt   string             `json:"installed_at"`
 	Demos         []demoManifestItem `json:"demos"`
-	SampleDB      *demoSampleDB      `json:"sample_db,omitempty"`
-	DBHubConfig   string             `json:"dbhub_config,omitempty"`
-	DocsReadOnly  *demoSourceAsset   `json:"docs_readonly,omitempty"`
+	// Interpreter 是写进 AGENT.md 脚本步骤的解释器绝对路径（没找到时为空，占位符保留）；
+	// InterpreterNote 记录没找到的原因，报告据此给出可执行的下一步。
+	// Interpreter is the absolute interpreter path substituted into AGENT.md; the note
+	// explains why it is empty when resolution failed.
+	Interpreter     string           `json:"interpreter,omitempty"`
+	InterpreterNote string           `json:"interpreter_note,omitempty"`
+	SampleDB        *demoSampleDB    `json:"sample_db,omitempty"`
+	DBHubConfig     string           `json:"dbhub_config,omitempty"`
+	DocsLibrary     *demoDocsLibrary `json:"docs_library,omitempty"`
+	DocsReadOnly    *demoSourceAsset `json:"docs_readonly,omitempty"`
+}
+
+// demoDocsLibrary 记录样例只读文档库的安装结果（`docs-diff` 的输入）。
+// demoDocsLibrary records the sample read-only document library.
+type demoDocsLibrary struct {
+	Path  string `json:"path"`
+	State string `json:"state"`
 }
 
 // demoSourceAsset 记录随安装导出的自研 MCP 源码（路径 + 状态 + 生成的 go.mod）。
@@ -228,9 +242,20 @@ func runDemoInstall(ctx context.Context, out io.Writer, deps Deps, opts demoInst
 		return nil
 	}
 
-	manifest := demoManifest{SchemaVersion: 1, InstalledAt: time.Now().UTC().Format(time.RFC3339)}
+	// 示例脚本的解释器：随包运行时优先（配置模板登记的就是这一串），源码检出回落 PATH。
+	// 找不到也不算安装失败——Agent 仍需人工填模型；报告把"缺解释器"如实列为待配置。
+	// The interpreter is resolved once and substituted into every installed AGENT.md.
+	interpreter, interpreterErr := resolveDemoInterpreter(ctx)
+	if interpreterErr != nil {
+		interpreter = ""
+	}
+
+	manifest := demoManifest{
+		SchemaVersion: 1, InstalledAt: time.Now().UTC().Format(time.RFC3339),
+		Interpreter: interpreter, InterpreterNote: demoInterpreterNote(interpreterErr),
+	}
 	for _, spec := range selected {
-		item, err := installDemoBundle(spec, wsRoot, opts.Force)
+		item, err := installDemoBundle(spec, wsRoot, opts.Force, interpreter)
 		if err != nil {
 			return err
 		}
@@ -254,6 +279,14 @@ func runDemoInstall(ctx context.Context, out io.Writer, deps Deps, opts demoInst
 			return err
 		}
 		manifest.DBHubConfig = configPath
+	}
+
+	if needsDemoDocs(selected) {
+		library, err := installDemoDocsLibrary(wsRoot, opts.Force)
+		if err != nil {
+			return err
+		}
+		manifest.DocsLibrary = &library
 	}
 
 	if needsDemoSource(selected) {
@@ -310,10 +343,11 @@ func demoNames() []string {
 }
 
 // installDemoBundle 复制一份 Demo 的 Agent 目录（技能另装到 <workspace>/skills），
-// 并把模型留空；Agent 目录里的 skills/ 是内嵌素材的组织方式，不复制进工作区。
+// 把模型留空，并在解释器已知时替换 AGENT.md 的脚本占位符；Agent 目录里的 skills/
+// 是内嵌素材的组织方式，不复制进工作区。
 // installDemoBundle copies one demo's agent directory (skills go to <workspace>/skills
-// separately) and blanks the model.
-func installDemoBundle(spec demoSpec, wsRoot string, force bool) (demoManifestItem, error) {
+// separately), blanks the model and substitutes the script interpreter placeholder.
+func installDemoBundle(spec demoSpec, wsRoot string, force bool, interpreter string) (demoManifestItem, error) {
 	item := demoManifestItem{
 		Name:     spec.Name,
 		AgentDir: filepath.Join(wsRoot, agentsDirName, spec.Name),
@@ -324,10 +358,15 @@ func installDemoBundle(spec demoSpec, wsRoot string, force bool) (demoManifestIt
 		return demoManifestItem{}, fmt.Errorf("安装 %s：%w", spec.Name, err)
 	}
 	item.State = state
+	agentFile := filepath.Join(item.AgentDir, "AGENT.md")
 	if state == demoStateInstalled {
-		if err := blankDemoModel(filepath.Join(item.AgentDir, "AGENT.md")); err != nil {
+		if err := blankDemoModel(agentFile); err != nil {
 			return demoManifestItem{}, fmt.Errorf("安装 %s：%w", spec.Name, err)
 		}
+	}
+	// 保留态同样对齐解释器占位符（只动占位符，不碰用户填好的模型绑定）。
+	if err := builtin.ResolveAgentPython(agentFile, interpreter); err != nil {
+		return demoManifestItem{}, fmt.Errorf("安装 %s：%w", spec.Name, err)
 	}
 	if spec.Skill == "" {
 		return item, nil
@@ -397,6 +436,48 @@ func needsDemoSample(selected []demoSpec) bool {
 		}
 	}
 	return false
+}
+
+// needsDemoDocs 报告本次选择里是否有需要样例只读文档库的 Demo。
+// needsDemoDocs reports whether the selection needs the sample document library.
+func needsDemoDocs(selected []demoSpec) bool {
+	for _, spec := range selected {
+		if spec.NeedsDocs {
+			return true
+		}
+	}
+	return false
+}
+
+// installDemoDocsLibrary 把共享夹具文档装成样例只读库（`docs-diff` 的输入）：
+// 路径与内置只读 server 的 `-root` 取自同一处定义。
+// installDemoDocsLibrary installs the sample read-only document library.
+func installDemoDocsLibrary(wsRoot string, force bool) (demoDocsLibrary, error) {
+	library, err := builtin.EnsureDocsLibrary(wsRoot, force)
+	if err != nil {
+		return demoDocsLibrary{}, err
+	}
+	return demoDocsLibrary{Path: library.Path, State: library.State}, nil
+}
+
+// resolveDemoInterpreter 取示例脚本用的解释器：随包运行时优先（配置模板登记的正是这一
+// 串），源码检出才回落 PATH。取不到自身可执行文件路径时按"没有随包运行时"处理。
+// resolveDemoInterpreter prefers the bundled runtime and falls back to PATH.
+func resolveDemoInterpreter(ctx context.Context) (string, error) {
+	runtimeRoot := ""
+	if executable, err := os.Executable(); err == nil {
+		runtimeRoot = filepath.Join(filepath.Dir(executable), "runtime")
+	}
+	return builtin.ResolvePython(ctx, runtimeRoot)
+}
+
+// demoInterpreterNote 把解释器探测失败翻成报告里的一句话；成功时为空。
+// demoInterpreterNote renders the resolution failure for the report.
+func demoInterpreterNote(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // demoSrcDir 是自研 MCP 源码在工作区里的固定落点（报告、构建命令与安装共用一份来源）。
@@ -503,6 +584,9 @@ func writeDemoPlan(out io.Writer, wsRoot string, selected []demoSpec) {
 		fmt.Fprintf(out, "  %s → %s\n", "样例库", demoDBHubSamplePath(wsRoot))
 		fmt.Fprintf(out, "  %s → %s\n", "DBHub 只读配置", filepath.Join(wsRoot, "demos", "mcp", "dbhub.toml"))
 	}
+	if needsDemoDocs(selected) {
+		fmt.Fprintf(out, "  %s → %s\n", "样例文档库", builtin.SampleDocsPath(wsRoot))
+	}
 	if needsDemoSource(selected) {
 		fmt.Fprintf(out, "  %s → %s（含生成的 go.mod）\n", "docs-readonly 源码", demoSrcDir(wsRoot))
 	}
@@ -548,6 +632,11 @@ func writeDemoReport(out io.Writer, wsRoot string, selected []demoSpec, manifest
 		fmt.Fprintln(out, "docs-readonly 源码 "+manifest.DocsReadOnly.Path+"（"+
 			demoStateLabel(manifest.DocsReadOnly.State)+"，"+docsReadOnlyGoModNote(*manifest.DocsReadOnly)+"）")
 	}
+	if manifest.DocsLibrary != nil {
+		fmt.Fprintf(out, "样例文档库 %s：%s（内置 docs-readonly 的 -root 指向这里）\n",
+			manifest.DocsLibrary.Path, demoStateLabel(manifest.DocsLibrary.State))
+	}
+	writeDemoInterpreterLine(out, manifest)
 	fmt.Fprintln(out, "待配置（逐项做完才会注册 / 运行）：")
 	for _, item := range manifest.Demos {
 		fmt.Fprintf(out, "  %s\n", item.Name)
@@ -559,6 +648,22 @@ func writeDemoReport(out io.Writer, wsRoot string, selected []demoSpec, manifest
 	writeDemoMCPHint(out, wsRoot, selected, manifest)
 	writeDemoCredentialHints(out, wsRoot, selected)
 	writeDemoPermissionHint(out)
+}
+
+// writeDemoInterpreterLine 报告示例脚本的解释器：写入的是什么、以及找不到时下一步做什么。
+// 这台机器上"找到"不等于"已放行"——报告必须把登记动作单独说清，否则脚本仍会被拒。
+// writeDemoInterpreterLine reports the substituted interpreter and the pending grant.
+func writeDemoInterpreterLine(out io.Writer, manifest demoManifest) {
+	if manifest.Interpreter != "" {
+		fmt.Fprintf(out, "解释器 %s（已写进 AGENT.md 的脚本步骤；需整串登记进 shell.allowed_commands）\n",
+			manifest.Interpreter)
+		return
+	}
+	fmt.Fprintln(out, "解释器 未找到：脚本类 Demo 的 AGENT.md 保留 "+builtin.PythonPlaceholder+"——"+
+		"按 SETUP 第 6 节登记本机解释器后，把该占位符替换成同一串")
+	if manifest.InterpreterNote != "" {
+		fmt.Fprintf(out, "  原因：%s\n", firstLine(manifest.InterpreterNote))
+	}
 }
 
 // docsReadOnlyGoModNote 按实际状态报告 go.mod：只有本次新建（installed）才写入了
@@ -673,8 +778,8 @@ func writeDemoCredentialHints(out io.Writer, wsRoot string, selected []demoSpec)
 // writeDemoPermissionHint prints the permission changes that need consent.
 func writeDemoPermissionHint(out io.Writer) {
 	fmt.Fprintln(out, "权限变更（需你确认后自行写入 basalt.yaml；本命令不改任何配置）：")
-	fmt.Fprintln(out, "  shell.allowed_commands：把实际解释器与 MCP 命令整串写进去（Windows 不查 PATH）")
-	fmt.Fprintln(out, "  shell.interpreters：把解释器整串再写一遍，脚本限定在 agents/<name>/scripts 内")
+	fmt.Fprintln(out, "  shell.allowed_commands：把上面的解释器路径与 MCP 命令**整串**写进去（Windows 不查 PATH、不补后缀）")
+	fmt.Fprintln(out, "  shell.interpreters：把同一串再登记一次即启用受控通道（argv 必须是 [脚本, 参数…]，脚本须在 agents/<name>/scripts 内）")
 	fmt.Fprintln(out, "  凭据只从进程环境读取（${VAR} 占位），不要写进任何文件")
 }
 

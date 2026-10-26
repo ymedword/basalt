@@ -178,13 +178,17 @@ export const ResourcesView = defineComponent({
       return {
         headers: ['名称', '传输', '可执行名', '占位符键', '凭据', '连接', '工具', '发布版本', '已应用', '待重启'],
         tableClass: 'mcp-table',
-        columnClasses: ['col-name', 'col-short', 'col-name', 'col-keys', 'col-state', 'col-state', 'col-keys', 'col-number', 'col-number', 'col-state'],
+        columnClasses: ['col-name', 'col-short', 'col-command', 'col-keys', 'col-state', 'col-state', 'col-keys', 'col-number', 'col-number', 'col-state'],
         rows: data.map((item) => ({
           key: item.name,
           cells: [
             identifier(item.name, resourceDetailHref('mcp-servers', item.name)),
             item.transport,
-            item.command,
+            // 可执行名可能是很长的绝对路径：与标识列同一渲染（省略号 + 悬停全值），
+            // 直接输出原文会在定宽表里溢出、压到相邻列（用户实测 2026-10-27）。
+            // Commands can be long absolute paths, so they render as an identifier
+            // (ellipsis plus title) instead of raw text overflowing its column.
+            item.command === '' ? '—' : identifier(item.command),
             // env 键与请求头名共用同一名字空间（契约保证不交叉），列表一并列出。
             // Env keys and header names are one namespace; the list shows both.
             [...item.env_keys, ...item.header_keys].length === 0

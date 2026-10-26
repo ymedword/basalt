@@ -116,6 +116,11 @@ export const AgentConfigPage = defineComponent({
   },
   emits: {
     'dirty-change': (dirty: boolean) => typeof dirty === 'boolean',
+    // 保存成功（表单或原文）后通知宿主重读配置相关的读数（就绪 / 计划配置 / 资源
+    // 候选）。内嵌页签的父级看不到子组件的 loader，只能由子组件在写后点名；否则
+    // 用户必须退出工作区再进来才能看到「模型连接：就绪」（用户实测 2026-10-27）。
+    // Emitted after a successful save so the embedded host can re-read readiness.
+    saved: () => true,
   },
   setup(props, { emit }) {
     const name = props.params.name ?? ''
@@ -2062,6 +2067,10 @@ export const AgentConfigPage = defineComponent({
         const updated = await api.updateAgentContent(name, { changes }, etag.value)
         // 重新读取（不是乐观更新）：表单回到服务端真值，绑定与正文一并刷新。
         await Promise.all([config.reload(), candidates.reload(), content.reload()])
+        // 宿主（内嵌页签）的就绪 / 计划配置读数也过期了：写成功才点名重读，
+        // 失败与本地拦截不触发。
+        // Only a successful write tells the embedded host to re-read readiness.
+        emit('saved')
         emptyBodyArmed.value = false
         // 关系变化随保存结果回显（系统自动增删只可能是 notify）；不在这里重算推断。
         const applied = systemToolChange(updated.changes)
@@ -2118,6 +2127,7 @@ export const AgentConfigPage = defineComponent({
         etag.value = updated.etag
         rawNotice.value = '已保存原文；表单已从服务端重新读取。' + systemToolChange(updated.changes)
         await Promise.all([config.reload(), candidates.reload(), content.reload()])
+        emit('saved')
       } catch (caught) {
         if (caught instanceof ApiError && caught.status === 412) {
           rawError.value = 'AGENT.md 已被他人修改，本次保存没有写入；请先重新读取，再基于新内容修改'

@@ -90,7 +90,7 @@ schedules:
    - 同一个 URL 只出现一次，最多写第 4 步选中的 10 个；`pages.json` 里**不得**出现
      `search.json` 之外的 URL（脚本会以「混入了别的 Run？」拒收）；没抓的 URL 不进
      本文件，留给第 8 步的线索表。
-6. **算来源表**：用 `shell` 运行脚本，`executable` 填 `python`，`arguments` 逐项分开：
+6. **算来源表**：用 `shell` 运行脚本，`executable` 填 `{{BASALT_PYTHON}}`，`arguments` 逐项分开：
 
    ```text
    ["scripts/industry_brief.py",
@@ -99,8 +99,10 @@ schedules:
     "--topic", "<本轮主题>"]
    ```
 
-   可执行名以 `shell.interpreters` 里实际放行的为准（本机若配的是 `py` / `python3`，
-   或 Windows 上的解释器**绝对路径**，就换成那个**整串**，参数不变）。**不传
+   上一行的可执行名由安装器替换成本机解释器的**绝对路径**，与 `shell.allowed_commands`
+   里登记的是同一串。若那里仍是带花括号的占位符（安装时没找到解释器），按 SETUP 第 6 节
+   登记本机解释器，再把这一行换成同一串；**不得**改猜 `python` / `py` 之类的名字（整串不
+   命中就是 `sandbox_denied`）。**不传
    `--now`**：脚本取本机真实时钟（秒级）作为本轮 `observed_at`，也是默认产物目录
    `runs/<t0>/` 的来源——时间只由脚本记录，你不推算、不手填。
    `--output` 省略时产物是 `runs/<t0>/brief.json`。`stdout` 给出 JSON：

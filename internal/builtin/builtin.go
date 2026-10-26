@@ -60,6 +60,10 @@ type Agent struct {
 	EnvKeys     []string
 	Skill       string
 	NeedsSample bool
+	// NeedsDocs 表示该 Agent 的输入是样例只读文档库（`docs-diff`）：安装器把库装到
+	// `samples/docs`，内置只读 server 的 `-root` 指向那里。
+	// NeedsDocs marks the agent whose input is the sample read-only document library.
+	NeedsDocs bool
 }
 
 // agents 是五个内置 Agent 的唯一清单（顺序即安装顺序，也是报告的打印顺序）。
@@ -71,7 +75,7 @@ type Agent struct {
 // Fetch MCP server and no longer requires BRAVE_API_KEY.
 var agents = []Agent{
 	{Name: "biz-daily", Title: "业务数据体检", MCPServers: []string{"dbhub"}, NeedsSample: true},
-	{Name: "docs-diff", Title: "文档变更", MCPServers: []string{"docs-readonly"}},
+	{Name: "docs-diff", Title: "文档变更", MCPServers: []string{"docs-readonly"}, NeedsDocs: true},
 	{
 		Name: "github-radar", Title: "GitHub 星标雷达", MCPServers: []string{"github"},
 		EnvKeys: []string{"GITHUB_PERSONAL_ACCESS_TOKEN"},
@@ -107,11 +111,13 @@ type AgentResult struct {
 // Install 把五只 Agent（与技能）装进工作区：缺失的重建、已存在的逐字节保留。
 // 新建的 Agent 目录**清空模型**——空模型让装载期按「blank model」拒绝注册，正好表达
 // 「装好但等配置」；状态文件由随后执行的启动基线写成 `disabled`（Bootstrap）。
+// interpreter 非空时把 AGENT.md 里的 {{BASALT_PYTHON}} 替换成该绝对路径；为空则保留
+// 占位符（安装时没找到解释器），由 SETUP 指引运维自行登记。
 //
-// Install copies the missing agent trees and skills and blanks the model of every
-// freshly created definition. Lifecycle state is written by the startup baseline
-// that runs right after, so install itself never claims an agent is enabled.
-func Install(wsRoot string, force bool) ([]AgentResult, error) {
+// Install copies the missing agent trees and skills, blanks the model of every freshly
+// created definition and, when an interpreter is known, substitutes the script
+// placeholder. Lifecycle state is written by the startup baseline right after.
+func Install(wsRoot string, force bool, interpreter string) ([]AgentResult, error) {
 	results := make([]AgentResult, 0, len(agents))
 	for _, spec := range agents {
 		target := filepath.Join(wsRoot, agentsDirName, spec.Name)
@@ -119,10 +125,17 @@ func Install(wsRoot string, force bool) ([]AgentResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("安装 %s：%w", spec.Name, err)
 		}
+		agentFile := filepath.Join(target, agentDefinitionFile)
 		if state == StateInstalled {
-			if err := BlankModel(filepath.Join(target, agentDefinitionFile)); err != nil {
+			if err := BlankModel(agentFile); err != nil {
 				return nil, fmt.Errorf("安装 %s：%w", spec.Name, err)
 			}
+		}
+		// 保留态也要对齐占位符（只动这一处）：旧版本装出来的目录可能还是 `python` 占位，
+		// 升级后第一次安装就该把它们替换成与白名单同一串的绝对路径。
+		// Kept installs get only the placeholder aligned; their model bindings stay intact.
+		if err := ResolveAgentPython(agentFile, interpreter); err != nil {
+			return nil, fmt.Errorf("安装 %s：%w", spec.Name, err)
 		}
 		result := AgentResult{Name: spec.Name, State: state, Skill: spec.Skill}
 		if spec.Skill != "" {
@@ -210,7 +223,16 @@ func BlankModel(agentFile string) (err error) {
 	lines := strings.Split(string(raw), "\n")
 	done, inProvider := false, false
 	for i, line := range lines {
-		trimmed := strings.TrimRight(line, "\r")
+		// 行尾的 `\r` 单独留下：素材在 Windows 检出上是 CRLF，替换整行时只该改内容，
+		// 不该把这一行变成 LF——否则装出来的 AGENT.md 是混合行尾（逐字节保真用例会红，
+		// 真实实例上 diff 也会漂）。
+		// Keep the CR: replacing the line's content must not rewrite its line ending.
+		eol := ""
+		trimmed := line
+		if strings.HasSuffix(trimmed, "\r") {
+			eol = "\r"
+			trimmed = strings.TrimSuffix(trimmed, "\r")
+		}
 		if trimmed == "provider:" {
 			inProvider = true
 			continue
@@ -219,7 +241,7 @@ func BlankModel(agentFile string) (err error) {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "  model:") {
-			lines[i] = `  model: ""`
+			lines[i] = `  model: ""` + eol
 			done = true
 			break
 		}

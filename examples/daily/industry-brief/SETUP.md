@@ -45,7 +45,7 @@ servers:
   授权（出现 `mcp server skipped: fetch` 就是没放行）。若把 `command` 写成绝对路径，
   `allowed_commands` 也要写同一个绝对路径（整串比对）；
 - `fetch` 的 `-m` 是**服务端自己的入口方式**，不走 `shell` 工具的解释器通道——
-  `shell.interpreters` 管不到 MCP 启动，`shell.allowed_commands` 才管；
+  `shell.allowed_commands` 管 MCP 启动，`shell.interpreters` 管不到；
 - Windows 本机提示：Microsoft Store 的 `python` 是占位程序。要么把 python.org 装的
   Python 放在 PATH 前面（`command` 仍是 `python`），要么把 `command` 改成实际名字
   （如 `py`）并让 `shell.allowed_commands` 同步——两处必须同一串；
@@ -118,39 +118,36 @@ Run 成功后自动发到渠道，按下面三步（顺序不能换）：
 
 ## 7. 放开 shell（脚本通道）
 
-`shell` 工具只放行白名单里的可执行名，解释器还必须走受控通道。编辑 `basalt.yaml`：
+`shell` 工具只执行白名单里的可执行名，**整串逐字比对**（Windows 不查 PATH、不补
+`.exe` / `.cmd` 后缀）。示例脚本走 `shell`，两条前提都要满足：解释器整串登记进
+`shell.allowed_commands`，且 `AGENT.md` 里写的可执行名与它是**同一串**。
+
+安装器已经替你做了一半：`basalt demo install`（或首次启动的开箱安装）把 `AGENT.md`
+里的 `{{BASALT_PYTHON}}` 替换成本机解释器的绝对路径——**随包运行时优先**，即
+`<程序目录>/runtime/python/python.exe`；Linux / macOS 是
+`<程序目录>/runtime/python/bin/python3`。新实例的模板把同一串写进
+`shell.allowed_commands`，已有实例按下面补齐即可：
 
 ```yaml
 shell:
   allowed_commands:
-    - python               # fetch MCP 的 command（与 mcp_servers.yaml 逐字一致）
-  interpreters:
-    - python               # 解释器整串；Windows 写绝对路径，见下方提示
-  env_passthrough: []      # 脚本不需要额外环境变量
+    - "D:/basalt/bin/runtime/python/python.exe"   # 与 AGENT.md 里的可执行名逐字一致
+    - "D:/basalt/bin/runtime/mcp/.../xxx.exe"     # 用到的 MCP server 的 command 同样要放行
+  env_passthrough: []                             # 脚本不需要额外环境变量
 ```
 
-- 解释器通道的 argv 必须是 `[<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的
-  `scripts/` 内——`-c` / `-m` 这类内联代码一律拒；`scripts/` 对模型只读。
-- `bash` / `sh` **不得**放行。
-- **Windows 本机必须写解释器的绝对路径**（已实测）：受控执行器把 `interpreters` 里的
-  整串**原样**交给 `CreateProcess`（`lpApplicationName`），既不查 PATH、也不补
-  `.exe` / `.cmd` 后缀——写 `python`、`python.exe`、`py` 都只会得到
-  `The system cannot find the file specified`。请写 python.org 安装的绝对路径
-  （如 `C:/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`），
-  并把 `AGENT.md` 第 6 步的可执行名同步成**同一串**（白名单按整串逐字比对）。
-  上面 `allowed_commands` 里的 `python` 是 **fetch MCP 的 `command`**（走
-  `exec.Command` 查 PATH，可用裸名），与解释器那一串各判各的；若把 `command` 换成
-  绝对路径，`allowed_commands` 也要同步。
-  Linux / macOS 上执行器同样走 `exec.Command`，裸名可用。
+- 分隔符自己统一：`D:/…/python.exe` 与 `D:\…\python.exe` 不算同一串；
+- `shell.interpreters` 是**可选的更严通道**：登记后只允许
+  `argv = [<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的 `scripts/` 内，
+  `-c` / `-m` 这类内联代码一律拒。示例脚本都满足，建议一并登记；不登记也能跑
+  （`allowed_commands` 放行即可），只是 shell 面更宽；
+- `bash` / `sh` **不得**放行；
+- `AGENT.md` 里若仍是字面量 `{{BASALT_PYTHON}}`（安装时没找到解释器），把它换成你登记的
+  同一串；**不得**改猜 `python` / `py` 之类的名字——整串不命中就是 `sandbox_denied`；
 - 同一份 `basalt.yaml` 的 `budget:` 段也要动：`budget.max_iterations` 缺省 **10**，
   而本 Demo 的 `AGENT.md` 声明 `settings.max_iterations: 30`——Profile 只能**收紧**
   运维上限、**不得**放大（契约 `run-and-errors.md` §6），不调这一项 Run 会在第 10 轮
-  落 `limit_reached`。在该段把 `max_iterations` 调到不小于 30。
-- `budget.context_tokens` 同样要调大：真实检索一轮（三条查询 × 10 条结果 + 抓正文 +
-  写 `pages.json`）的工具结果可到 **100KB 量级**，缺省 **32768** 会在第二轮或「写
-  `pages.json`」那一轮判「上下文超限」（2026-10-27 实测，96K 仍不够）。按模型窗口
-  调到能容纳整轮（如 deepseek-chat 128K → `131072`）；报错原文会点名
-  `budget.context_tokens`，见到它先调这一项，不要删结果或改脚本。
+  落 `limit_reached`。
 
 ## 8. 重启
 
@@ -245,7 +242,7 @@ sqlite3 <workspace>/.basalt/basalt.db \
 | 自检报「引用了未抓正文的 URL」 | 结论引用了线索；改成已抓来源的事实或删掉，再跑一次自检 |
 | 自检报「没有任何 `[来源: <url>]` 标注」 | 结论没标来源；只在确实无来源时才允许全篇无引用 |
 | 脚本报「不在检索结果里」 | `pages.json` 混进了别的 Run 的页面；只抓本轮 `search.json` 里的 URL |
-| `shell` 返回 `sandbox_denied` | `shell.interpreters` 未放行，或脚本不在 `scripts/` 下，或 `arguments[0]` 以 `-` 开头 |
+| `shell` 返回 `sandbox_denied` | 解释器整串没进 `shell.allowed_commands`（或与 `AGENT.md` 里不是同一串）；登记了 `shell.interpreters` 时，还要求脚本在 `scripts/` 下、`arguments[0]` 不以 `-` 开头 |
 | 简报里日期全是「未确认」 | `web_search` 结果的 `date` 缺失；**不得**手补日期，只能如实写「未确认」 |
 | `schedule_deliveries` 没有行 | 任务没配 `deliver_to`，或该轮 Run 未成功（应记 `skipped`）；先看 `runs` 表的终态 |
 | `runs/` 出现在 `git status` | 不应提交：`.gitignore` 已忽略 `examples/daily/industry-brief/runs/` |

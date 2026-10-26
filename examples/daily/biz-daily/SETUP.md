@@ -112,32 +112,36 @@ D3 是**零通知** Demo：`notify_mode: none`、`notify_channels: []`、任务�
 
 ## 8. 放开 shell（脚本通道）
 
-`shell` 工具只放行白名单里的可执行名，解释器还必须走受控通道。编辑 `basalt.yaml`：
+`shell` 工具只执行白名单里的可执行名，**整串逐字比对**（Windows 不查 PATH、不补
+`.exe` / `.cmd` 后缀）。示例脚本走 `shell`，两条前提都要满足：解释器整串登记进
+`shell.allowed_commands`，且 `AGENT.md` 里写的可执行名与它是**同一串**。
+
+安装器已经替你做了一半：`basalt demo install`（或首次启动的开箱安装）把 `AGENT.md`
+里的 `{{BASALT_PYTHON}}` 替换成本机解释器的绝对路径——**随包运行时优先**，即
+`<程序目录>/runtime/python/python.exe`；Linux / macOS 是
+`<程序目录>/runtime/python/bin/python3`。新实例的模板把同一串写进
+`shell.allowed_commands`，已有实例按下面补齐即可：
 
 ```yaml
 shell:
   allowed_commands:
-    - node                 # MCP server 的 command 也要过命令授权
-  interpreters:
-    - python               # 解释器整串；Windows 写绝对路径，见下方提示
-  env_passthrough: []      # 脚本不需要额外环境变量
+    - "D:/basalt/bin/runtime/python/python.exe"   # 与 AGENT.md 里的可执行名逐字一致
+    - "D:/basalt/bin/runtime/mcp/.../xxx.exe"     # 用到的 MCP server 的 command 同样要放行
+  env_passthrough: []                             # 脚本不需要额外环境变量
 ```
 
-- 解释器通道的 argv 必须是 `[<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的
-  `scripts/` 内——`-c` / `-m` 这类内联代码一律拒；`scripts/` 对模型只读。
-- `bash` / `sh` **不得**放行。
-- **Windows 本机必须写解释器的绝对路径**（已实测）：受控执行器把 `interpreters` 里的
-  整串**原样**交给 `CreateProcess`（`lpApplicationName`），既不查 PATH、也不补
-  `.exe` / `.cmd` 后缀——写 `python`、`python.exe`、`py` 都只会得到
-  `The system cannot find the file specified`。请写 python.org 安装的绝对路径
-  （如 `C:/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`），
-  并把 `AGENT.md` 第 4 步的可执行名同步成**同一串**（白名单按整串逐字比对）。
-  MCP 的 `command: node`（§4）走的是另一条通道（`exec.Command` 查 PATH），不受此限。
-  Linux / macOS 上执行器同样走 `exec.Command`，裸名可用。
+- 分隔符自己统一：`D:/…/python.exe` 与 `D:\…\python.exe` 不算同一串；
+- `shell.interpreters` 是**可选的更严通道**：登记后只允许
+  `argv = [<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的 `scripts/` 内，
+  `-c` / `-m` 这类内联代码一律拒。示例脚本都满足，建议一并登记；不登记也能跑
+  （`allowed_commands` 放行即可），只是 shell 面更宽；
+- `bash` / `sh` **不得**放行；
+- `AGENT.md` 里若仍是字面量 `{{BASALT_PYTHON}}`（安装时没找到解释器），把它换成你登记的
+  同一串；**不得**改猜 `python` / `py` 之类的名字——整串不命中就是 `sandbox_denied`；
 - 同一份 `basalt.yaml` 的 `budget:` 段也要动：`budget.max_iterations` 缺省 **10**，
   而本 Demo 的 `AGENT.md` 声明 `settings.max_iterations: 12`——Profile 只能**收紧**
   运维上限、**不得**放大（契约 `run-and-errors.md` §6），不调这一项 Run 会在第 10 轮
-  落 `limit_reached`。在该段把 `max_iterations` 调到不小于 12。
+  落 `limit_reached`。
 
 ## 9. 重启
 
@@ -202,7 +206,7 @@ sqlite3 <workspace>/.basalt/basalt.db \
 | Agent 没注册 | 启动 WARN：`tool not registered` / `mcp server skipped: dbhub` |
 | DBHub 连不上 | 「MCP server → 诊断」看命令定位与环境变量；再看 `--dsn` 三斜杠与 `.db` 绝对路径；`node` 是否在 `allowed_commands` |
 | 诊断说 `unconfirmed` | 不代表一定失败：点「测试」真实连接一次，结论只看测试结果与失败分类 |
-| `shell` 返回 `sandbox_denied` | `shell.interpreters` 未放行，或脚本不在 `scripts/` 下，或 `arguments[0]` 以 `-` 开头 |
+| `shell` 返回 `sandbox_denied` | 解释器整串没进 `shell.allowed_commands`（或与 `AGENT.md` 里不是同一串）；登记了 `shell.interpreters` 时，还要求脚本在 `scripts/` 下、`arguments[0]` 不以 `-` 开头 |
 | 脚本非零退出 | `stderr` 原文会被回填给模型；按 `README.md` 的「失败样例」判定，不要改写脚本绕过 |
 | 日报写「数据库不可达 / 数据缺失」 | DBHub 调用失败或返回为空；查 `tool_invocations` 对应行的 `error_kind`，不要靠重跑刷结果 |
 | 指标是空的但库里有行 | 看 `daily.json` 的 `quality.counts`：可能全部行都进了缺失 / 重复 / 非法值，`computed=false` 时金额本就该是 `null` |

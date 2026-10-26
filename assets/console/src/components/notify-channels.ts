@@ -30,6 +30,20 @@ import type { TableRow, Tone } from './ui'
 /** 与写侧同一口径的精确占位：`${VAR}` 独占整个值，前后不得有其他字符。 */
 const ENV_PLACEHOLDER = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/
 
+/**
+ * 类型显示名：服务端只回原始键（`feishu`），中文标签由页面负责；没登记的键原样
+ * 显示——服务端新增类型时页面不因缺标签而渲染空白。
+ * Server types are raw keys; this map only localizes known ones and falls back to
+ * the raw key so a new server-side type never renders blank.
+ */
+const NOTIFY_TYPE_LABELS: Readonly<Record<string, string>> = { feishu: '飞书' }
+
+/** 类型键 → 显示名（未知键原样返回）。 */
+// Type key to display label; unknown keys pass through unchanged.
+function notifyTypeLabel(type: string): string {
+  return NOTIFY_TYPE_LABELS[type] ?? type
+}
+
 /** 环境变量名：页面把裸名补成 `${VAR}`，与模型连接的输入口径一致。 */
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 
@@ -610,7 +624,7 @@ export const NotifyChannels = defineComponent({
           typesError.value === '' ? '类型（读取中）' : '类型',
           () => type.value,
           (next) => (type.value = next),
-          { placeholder: '例如 webhook' },
+          { placeholder: '例如 feishu' },
         )
       }
       const options = [...types.value]
@@ -622,7 +636,7 @@ export const NotifyChannels = defineComponent({
         choices.push(h('option', { value: '' }, '请选择类型'))
       }
       for (const item of options) {
-        choices.push(h('option', { key: item, value: item }, item))
+        choices.push(h('option', { key: item, value: item }, notifyTypeLabel(item)))
       }
       return h('label', { class: 'field', for: 'notify-type' }, [
         h('span', '类型'),
@@ -779,7 +793,11 @@ export const NotifyChannels = defineComponent({
       return props.channels.map((channel) => ({
         key: channel.name,
         cells: [
-          h('code', { class: 'notify-channel-name' }, channel.name),
+          // 渠道名与 UID 都是定长标识：省略号 + 悬停全值，绝不让标识竖排断行
+          // （用户实测 2026-10-27：自动布局把这两列压成竖排）。markup 与视图层的
+          // `identifier()` 同形（`.cell-id`），组件不为一行 h() 反向依赖 views/shared。
+          // Names and UIDs render as `.cell-id` so they never wrap vertically.
+          h('code', { class: 'cell-id', title: channel.name }, channel.name),
           h('code', { title: channel.resource_uid }, channel.resource_uid.slice(0, 8) + '…'),
           channel.type,
           channel.description === '' ? '—' : channel.description,
@@ -1030,8 +1048,12 @@ export const NotifyChannels = defineComponent({
           ],
           rows: channelRows(),
           empty: '还没有配置通知渠道',
+          // 定宽表：标识列（渠道 / UID）与操作列必须有明确宽度，自动布局在 12 列
+          // 争宽时会把它们压成竖排（用户实测 2026-10-27）。
+          // Fixed layout keeps the identifier columns readable instead of wrapping.
+          tableClass: 'notify-table',
           columnClasses: [
-            '', 'col-uid', '', '', 'col-host', 'col-short', 'col-name',
+            'col-name', 'col-uid', 'col-short', 'col-desc', 'col-host', 'col-scope', 'col-name',
             'col-keys', 'col-address', 'col-state', 'col-refs', 'col-actions',
           ],
         }),

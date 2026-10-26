@@ -62,9 +62,9 @@ func (s *Server) notifyReferences(ctx context.Context, names []string) (map[stri
 	return s.opts.NotifyReferences.NotifyReferences(ctx, names)
 }
 
-// handleNotifyTypes 处理 `GET /api/v1/notify-channels/types`：返回装配层登记的类型名，
-// 顺序由装配层固定（有序表）；空注册表输出 `[]`。
-// handleNotifyTypes serves the assembled type names in their fixed order.
+// handleNotifyTypes 处理 `GET /api/v1/notify-channels/types`：返回页面可选的渠道类型
+// （装配层投影，当前只有飞书），顺序由装配层固定；空表输出 `[]`。
+// handleNotifyTypes serves the console-selectable types in their fixed order.
 func (s *Server) handleNotifyTypes(w http.ResponseWriter, _ *http.Request, _ core.Actor) {
 	s.writeOK(w, nonNilStrings(s.opts.NotifyTypes))
 }

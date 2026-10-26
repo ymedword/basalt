@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/examples"
+	"github.com/ymedword/basalt/internal/builtin"
 )
 
 // runDemoInstallCmd 在给定工作目录上执行一次 `basalt demo install`，返回合并输出与错误。
@@ -95,9 +96,11 @@ func TestDemoInstall_InstallsAllDemosAndManifest(t *testing.T) {
 	require.Contains(t, stdout, filepath.Join(dir, workspaceDirName, "demos", "install.json"))
 }
 
-// TestDemoInstall_BlankModelOnlyTouchesOneLine 断言安装器只改 provider.model 一行，
-// 其余正文逐字保真——素材是已审交付物，安装不得顺手改写。
-// TestDemoInstall_BlankModelOnlyTouchesOneLine pins the edit to exactly one line.
+// TestDemoInstall_BlankModelOnlyTouchesOneLine 断言安装器只改两处：`provider.model`
+// 一行与解释器占位符（找到解释器时），其余正文逐字保真——素材是已审交付物，安装不得
+// 顺手改写。
+// TestDemoInstall_BlankModelOnlyTouchesOneLine pins the edit to the model line and the
+// interpreter placeholder, nothing else.
 func TestDemoInstall_BlankModelOnlyTouchesOneLine(t *testing.T) {
 	dir := initDemoWorkspace(t)
 
@@ -109,9 +112,44 @@ func TestDemoInstall_BlankModelOnlyTouchesOneLine(t *testing.T) {
 	want := strings.Replace(string(source), "  model: 请在此填写模型名", `  model: ""`, 1)
 	require.NotEqual(t, string(source), want, "素材里没有待清空的模型行——本用例的前提已变")
 
+	// 本机找得到解释器时，占位符被替换成清单里记的同一串；找不到时原样保留并给出提示。
+	manifest := readDemoManifest(t, dir)
+	if manifest.Interpreter != "" {
+		want = strings.ReplaceAll(want, builtin.PythonPlaceholder, manifest.Interpreter)
+		require.NotContains(t, want, builtin.PythonPlaceholder)
+	}
+
 	got, err := os.ReadFile(filepath.Join(dir, workspaceDirName, agentsDirName, "biz-daily", "AGENT.md"))
 	require.NoError(t, err)
 	require.Equal(t, want, string(got))
+}
+
+// TestDemoInstall_InstallsSampleDocsLibrary 断言 docs-diff 的输入随安装就位：
+// `<ws>/samples/docs` 有四份夹具文档，清单记下库路径；只装别的 Demo 时不铺这份库。
+// TestDemoInstall_InstallsSampleDocsLibrary pins the docs-diff input library.
+func TestDemoInstall_InstallsSampleDocsLibrary(t *testing.T) {
+	dir := initDemoWorkspace(t)
+
+	stdout, err := runDemoInstallCmd(t, dir, "--demo", "docs-diff")
+	require.NoError(t, err)
+
+	manifest := readDemoManifest(t, dir)
+	require.NotNil(t, manifest.DocsLibrary, "docs-diff 安装清单缺少样例文档库")
+	libraryDir := filepath.Join(dir, workspaceDirName, "samples", "docs")
+	require.Equal(t, libraryDir, manifest.DocsLibrary.Path)
+	require.Equal(t, demoStateInstalled, manifest.DocsLibrary.State)
+	for _, name := range []string{"handbook.md", "security-basics.md", "tooling.md", filepath.Join("teams", "data-access.md")} {
+		_, statErr := os.Stat(filepath.Join(libraryDir, name))
+		require.NoError(t, statErr, "样例文档缺失：%s", name)
+	}
+	require.Contains(t, stdout, "样例文档库")
+
+	// 只装不依赖只读文档库的 Demo 时不铺这份库。
+	other := initDemoWorkspace(t)
+	_, err = runDemoInstallCmd(t, other, "--demo", "github-radar")
+	require.NoError(t, err)
+	_, statErr := os.Stat(filepath.Join(other, workspaceDirName, "samples", "docs"))
+	require.True(t, os.IsNotExist(statErr), "无关 Demo 不应安装样例文档库")
 }
 
 // TestDemoInstall_KeepsExistingWithoutForce 断言重复安装保留用户改动：没有 --force

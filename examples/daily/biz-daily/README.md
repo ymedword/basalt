@@ -31,7 +31,7 @@
 | `execute_sql` | DBHub MCP（`dbhub`，`@bytebase/dbhub` 1.5.0） | 连库自检与固定 SQL，取 `orders` 明细 |
 | `read_file` | 内置 | 读脚本产物 `daily.json` |
 | `write_file` | 内置 | 落盘查询结果 `orders.json`、写 `daily.md` |
-| `shell` | 内置 | 运行 `scripts/biz_daily.py`（解释器受 `shell.interpreters` 约束） |
+| `shell` | 内置 | 运行 `scripts/biz_daily.py`（解释器是 `AGENT.md` 里已替换的绝对路径，须在 `shell.allowed_commands` 里整串登记） |
 
 `AGENT.md` 的声明与上表一致；`notify` **不在**声明里——基线 `notify_mode: none`，
 工具面也不会补。`shell` 同样是必需项：脚本跑不起来就没有可信数字。
@@ -99,7 +99,7 @@ max_rows = 500
 
 | 依赖 | 版本 | 用途 |
 | --- | --- | --- |
-| Python | 3.12（标准库即可） | 运行 `scripts/biz_daily.py` 与 `examples/shared/scripts/make_sample_db.py`（`shell.interpreters`） |
+| Python | 3.12（标准库即可） | 运行 `scripts/biz_daily.py` 与 `examples/shared/scripts/make_sample_db.py`（绝对路径登记在 `shell.allowed_commands`） |
 | Node.js + `dbhub` 包 | 20+ / 待实测 | 只读 SQLite 查询（stdio MCP） |
 | SQLite | 由 Python 标准库 `sqlite3` 提供 | 样例库文件格式 |
 | Basalt | v0.1.0 | 运行底座（调度、MCP、审计） |

@@ -4,8 +4,8 @@
 跨次去重、星差、窗口裁剪**全部由脚本计算**，模型只负责挑主题、解释和写报告；
 首跑没有基线就明说没有基线，不编造增长率。
 
-> 档位：Demo（不是模板）。**夹具可复跑**已交付；**真实 GitHub MCP 实跑未验证**——
-> 本轮没有授权 GitHub PAT。证据档位见文末。
+> 档位：Demo（不是模板）。**夹具可复跑已验证**；**真实 GitHub MCP + PAT 实跑已验证**
+> （2026-10-27 本机，github-mcp-server 2.0.3）。证据档位见文末。
 
 ## 业务目标
 
@@ -23,16 +23,20 @@
 | `get_file_contents` | GitHub MCP（`github`） | 取 README 等文件的 `download_url` |
 | `http_get` | 内置 | 按 `download_url` 读 README 正文 |
 | `write_file` / `read_file` | 内置 | 落盘搜索结果、读脚本产物 |
-| `shell` | 内置 | 运行 `scripts/github_radar.py`（解释器受 `shell.interpreters` 约束） |
+| `shell` | 内置 | 运行 `scripts/github_radar.py`（解释器是 `AGENT.md` 里已替换的绝对路径，须在 `shell.allowed_commands` 里整串登记） |
 | `notify` | 内置（受控装配） | **基线不装配**：`notify_mode: none`。SETUP 切到 `allowlist` 后由保存路径自动补上 |
 
 `AGENT.md` 里的声明与上表一致。`shell` 不在最初的候选清单里，但没有它脚本跑不起来——
 图 2-8 的主链写的就是 `shell: python scripts/github_radar.py`，这里按主链落地。
 
-**MCP 工具名未实测**：`search_repositories` / `get_file_contents` 按官方
-`github-mcp-server` 的公开工具名填写（MCP 目录条目 `github` 的 `verified: false`）。
-连接后若加载报 `tool not registered: <name>`，按实际 `tools/list` 改 `tools:` 声明，
-**不要**改脚本。
+**MCP 工具名已实测**：`search_repositories` / `get_file_contents` 与本机
+`github-mcp-server 2.0.3` 的 `tools/list` 一致（2026-10-27 实测；MCP 目录条目 `github`
+的 `verified` 字段保持目录口径，不随单机实跑改写）。换版本后若加载报
+`tool not registered: <name>`，按实际 `tools/list` 改 `tools:` 声明，**不要**改脚本。
+
+**搜索结果字段已实测**：默认精简输出**不含 `pushed_at`**，只有 `updated_at`；
+`search_repositories` 也不接受 `fields` 参数。所以活动时间由脚本在 `pushed_at` 缺失时
+用 `updated_at` 兜底，模型**不得**手补字段（见「脚本输入 / 输出契约」）。
 
 ## 内置域名白名单
 
@@ -54,8 +58,11 @@
 ## 启动程序与版本
 
 目录条目 `github` 的配方：`github-mcp-server stdio`（Go 二进制，在 PATH 上），
-环境变量 `GITHUB_PERSONAL_ACCESS_TOKEN`。命令、参数、版本、只读工具名与代表性调用
-**均未实测**（`verified: false`）。
+环境变量 `GITHUB_PERSONAL_ACCESS_TOKEN`。
+
+本机实测（2026-10-27，Windows）：`github-mcp-server 2.0.3`，参数 `stdio --read-only`，
+凭据走 `GITHUB_PERSONAL_ACCESS_TOKEN`，`tools/list` 含本 Demo 声明的两个工具。目录条目
+`github` 仍标 `verified: false`——目录的 `verified` 是**全平台复核口径**，不因单机实跑改写。
 
 ## 凭据
 
@@ -67,7 +74,7 @@
 
 | 依赖 | 版本 | 用途 |
 | --- | --- | --- |
-| Python | 3.12（标准库即可） | 运行 `scripts/github_radar.py`（`shell.interpreters`） |
+| Python | 3.12（标准库即可） | 运行 `scripts/github_radar.py`（绝对路径登记在 `shell.allowed_commands`） |
 | `github-mcp-server` | 待实测 | GitHub 只读访问 |
 | Basalt | v0.1.0 | 运行底座 |
 
@@ -106,6 +113,8 @@ MCP 搜索结果一致（`{"total_count", "incomplete_results", "items": [...]}`
    `observed`——第二次运行才轮得到它出星差。
 2. `orbitworks/fleet-scheduler` 带 `readme_url`，且分支是 `trunk` 而不是 `main`：
    提醒你不要假设默认分支，URL 一律取 MCP 响应的 `download_url`。
+3. 夹具里每条**显式带 `pushed_at`**，而真实响应通常只有 `updated_at`——夹具因此不必
+   依赖兜底分支；兜底本身由单测 `test_missing_pushed_at_falls_back_to_updated_at` 覆盖。
 
 固定输入哈希（sha256）：`7117da7bc7ebf3c2a286399e93ce1e4c79bc069d1730df65648580b15a1455b2`。
 
@@ -125,10 +134,13 @@ python scripts/github_radar.py --input github_search.json --state state/seen.jso
 | `--window-days` | 否 | `30` | 去重窗口；窗口内已推荐的不再推荐。`0` = 不抑制 |
 
 **输入**（模型写）：裸数组，或 `{"items": [...]}` 形态。每条必填 `full_name`
-（`owner/repo`）、`stars`（或 `stargazers_count`）、`pushed_at`（ISO 8601）；
-可选 `html_url`（缺省按 `https://github.com/<full_name>` 推导）、`description`、
-`readme_url`（必须是 http(s) 地址，取自 MCP 的 `download_url`）。同一响应内重复的
-`full_name` 合并为一条，保留星数较高的。任何字段不合规 → **非零退出**，一个字节都不写。
+（`owner/repo`）、`stars`（或 `stargazers_count`）、活动时间（ISO 8601）——取
+`pushed_at`，**键缺失或为 null 时用 `updated_at` 兜底**（实测 github-mcp-server
+2.0.3 的 `search_repositories` 默认精简输出只有 `updated_at`；兜底由脚本做，模型
+不补字段）；可选 `html_url`（缺省按 `https://github.com/<full_name>` 推导）、
+`description`、`readme_url`（必须是 http(s) 地址，取自 MCP 的 `download_url`）。同一
+响应内重复的 `full_name` 合并为一条，保留星数较高的。任何字段不合规 → **非零退出**，
+一个字节都不写。`pushed_at` 存在但解析不了时**不**用 `updated_at` 掩盖，直接判坏行。
 
 **输出 `report.json`**：
 
@@ -179,7 +191,7 @@ python scripts/github_radar.py --input fixtures/search.json \
 
 | 场景 | 期望行为 |
 | --- | --- |
-| 输入不是数组 / 缺 `pushed_at` / `stars` 为负 | 脚本非零退出（`exit 1`），`stderr` 给可读原因；**不写**报告与状态 |
+| 输入不是数组 / `pushed_at` 与 `updated_at` 都没有或不可解析 / `stars` 为负 | 脚本非零退出（`exit 1`），`stderr` 给可读原因；**不写**报告与状态 |
 | 状态文件被手改成非法 JSON | 脚本非零退出；不写任何文件（不猜、不重建） |
 | GitHub MCP 不可达（无输出可落盘） | **不运行脚本**；`report.md` 写「来源不可达 / 数据缺失」+ 观测时间，不补造条目 |
 | 首跑 | 报告写「首次运行，无基线，不计算星差」，**不得**写「增长」 |
@@ -190,14 +202,16 @@ python scripts/github_radar.py --input fixtures/search.json \
 
 | 档位 | 结论 | 依据 |
 | --- | --- | --- |
-| 夹具可复跑 | **已验证** | `scripts/test_github_radar.py` 9 个用例；`TestUS14Demos_Fixture/github` 用同一夹具复跑 |
-| 真实 GitHub MCP + PAT 实跑 | **未验证** | 外部授权未提供；真实工具名、只读模式与代表性调用均未实测 |
-| 通知送达 | **未验证**（基线零通知） | `notify_mode: none`；切到 `allowlist` 后的送达需真实接收方 |
+| 夹具可复跑 | **已验证** | `scripts/test_github_radar.py` 10 个用例；`TestUS14Demos_Fixture/github` 用同一夹具复跑 |
+| 真实 GitHub MCP + PAT 实跑 | **已验证（2026-10-27 本机实跑，github-mcp-server 2.0.3）** | 30 条搜索结果**原样**落盘（无 `pushed_at`，脚本用 `updated_at` 兜底）→ 脚本退出 0；候选 28 / 去重 5 / 裁剪 18 / 推荐 5，星差由上一轮基线算出 |
+| 通知送达 | **已验证（演示实例，`deliver_to` 代投）** | 投递记录 `status=sent`、HTTP 200、飞书 `code=0`；仓库基线 `notify_mode: none` 仍为零通知 |
 
 ## 已知限制
 
-- **MCP 工具名未实测**：`tools:` 里两个 GitHub 工具按公开文档填写；首次连接后按
-  `tools/list` 核对一次。
+- **活动时间来自 `updated_at`**：`search_repositories` 默认精简输出不返回 `pushed_at`，
+  脚本用 `updated_at` 兜底。两者语义相近但不相等（`pushed_at` 只随推送变化）；需要严格
+  的推送时间时，要换能返回真实 `pushed_at` 的查询方式（`minimal_output: false` 的完整
+  对象可达数 KB/条，会撞上 `write_file` 入参上限），本 Demo 未做。
 - **`observed` 不淘汰**：只裁剪 `recommended`。长期运行后状态文件随「见过的仓库数」
   增长；需要收敛时手工归档 `state/seen.json`（脚本会按新状态重新建立基线）。
 - **不判断相关性**：脚本只算数，仓库是否真与主题相关取决于搜索查询串与模型解释。

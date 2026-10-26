@@ -30,7 +30,7 @@ schedules:
   - id: daily-digest
     cron: "0 45 8 * * *"
     zone: Asia/Shanghai
-    message: "汇总 northwind-labs/mcp-bridge 今天的 PR / Issue / Release 变化，给出待跟进与待确认清单"
+    message: "汇总 github/github-mcp-server 今天的 PR / Issue / Release 变化，给出待跟进与待确认清单"
 ---
 
 # 仓库日报
@@ -48,10 +48,23 @@ schedules:
    消息里那个仓库（`owner/repo`）的列表，每份取最近更新的一页即可。工具名以服务端
    `tools/list` 为准；某个工具不存在时，在日报里写明「该来源不可用」，**不得**用别的
    数据替代。
+
+   真实仓库的一页列表可达数百 KB，整段塞进下一次 `write_file` 会被入参上限截断
+   （报「入参不是合法 JSON」）。因此每个工具都传 `perPage: 10` 与 `fields`，只取
+   脚本要用的字段：
+
+   - `list_pull_requests`：`fields` = `["number", "title", "html_url", "state", "draft", "merged_at", "created_at", "updated_at"]`
+   - `list_issues`：`fields` = `["number", "title", "state", "comments", "created_at", "updated_at"]`
+   - `list_releases`：`fields` = `["id", "tag_name", "name", "html_url", "published_at", "prerelease", "draft"]`
+
+   `list_releases` 的字段清单里**没有** `updated_at`——release 的时间锚是
+   `published_at`，脚本已按此处理；不要自己补一个 `updated_at`，也不要因此把该来源
+   判成不可用。`fields` 必须是服务端枚举里存在的名字；被服务端拒绝时以它返回的错误
+   为准写进日报，不得改猜字段名。
 3. **落盘原始输入**：把三份工具返回的 JSON **原样**写到 Agent 根目录的
    `pull_requests.json`、`issues.json`、`releases.json`（`write_file`）。不要重排、
    不要补字段、不要改数字；根目录只接受整文件覆盖写，不要写到子目录。
-4. **算数**：用 `shell` 运行脚本，`executable` 填 `python`，`arguments` 逐项分开：
+4. **算数**：用 `shell` 运行脚本，`executable` 填 `{{BASALT_PYTHON}}`，`arguments` 逐项分开：
 
    ```text
    ["scripts/repo_digest.py",
@@ -61,8 +74,10 @@ schedules:
     "--state", "state/cursor.json"]
    ```
 
-   可执行名以 `shell.interpreters` 里实际放行的为准（本机若配的是 `py` / `python3`，
-   或 Windows 上的解释器**绝对路径**，就换成那个**整串**，参数不变）。脚本自己算计数、待跟进与待确认，推进
+   上一行的可执行名由安装器替换成本机解释器的**绝对路径**，与 `shell.allowed_commands`
+   里登记的是同一串。若那里仍是带花括号的占位符（安装时没找到解释器），按 SETUP 第 6 节
+   登记本机解释器，再把这一行换成同一串；**不得**改猜 `python` / `py` 之类的名字（整串不
+   命中就是 `sandbox_denied`）。脚本自己算计数、待跟进与待确认，推进
    游标，并把 `digest.json` 写到 `runs/<时间戳>/`；`stdout` 给出输入 / 产物 / 状态
    的 SHA-256 与计数。
 5. **写日报**：`read_file` 读脚本刚写出的 `digest.json`，在**同一目录**写

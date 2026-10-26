@@ -66,6 +66,11 @@ type Paths struct {
 	// DocsReadOnly 是自研只读 MCP server 的可执行件绝对路径（完整包随包发布）。
 	// DocsReadOnly is the absolute path of the bundled read-only MCP server.
 	DocsReadOnly string
+	// DocsRoot 是只读 server 的 `-root`（样例文档库的绝对路径）。必须显式给：缺省时
+	// server 落在进程当前目录——真实实例上那就是整个工作区，生成物会被当成文档。
+	// DocsRoot pins the read-only server root; the fallback is the process working
+	// directory, where generated workspace files would count as documents.
+	DocsRoot string
 	// Node 是 Node 运行时；DBHub 与其它 npm 组件都经它启动。
 	// Node is the Node runtime used to launch npm-based components.
 	Node string
@@ -117,8 +122,15 @@ func (e Entry) config() core.MCPServerConfig {
 // CredentialFreeEntries returns the three entries that need no credential. The commands
 // are the expected runtime-layout paths, so a missing component never changes the file.
 func CredentialFreeEntries(paths Paths) []Entry {
+	// `-root` 只在调用方算出了根目录时写出：老调用方（与单元测试）不写这一项时，
+	// 渲染结果与升级前逐字节相同，不会凭空改动已有条目的形态。
+	// The root argument is emitted only when the caller knows it.
+	docs := Entry{Name: "docs-readonly", Command: paths.DocsReadOnly}
+	if paths.DocsRoot != "" {
+		docs.Args = []string{"-root", paths.DocsRoot}
+	}
 	return []Entry{
-		{Name: "docs-readonly", Command: paths.DocsReadOnly},
+		docs,
 		{
 			Name:    "dbhub",
 			Command: paths.Node,

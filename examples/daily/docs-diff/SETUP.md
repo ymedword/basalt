@@ -19,56 +19,53 @@ D4 不用技能：`AGENT.md` 没有 `skills:` 声明，`.basalt/skills/` 下也�
 目录。差异口径直接写在 `AGENT.md` 的步骤与报告模板里。不要为了「凑齐结构」复制别的
 Demo 的技能——声明名无实体时整只 Agent 不注册。
 
-## 3. 构建并放置只读 MCP server
+## 3. 放置只读 MCP server 与样例文档库
 
-`docs-readonly` 是本仓库自研素材（主 module 内 `package main`，纯标准库、零第三方依赖），
-不在 MCP 目录里，需要现场构建。它的源码随 `basalt demo install` 导出到工作区：
+`docs-readonly` 是本仓库自研素材（纯标准库、零第三方依赖），两条路取其一：
 
-```sh
-basalt demo install --demo docs-diff
-```
+- **发行版二进制**：随包运行时已带 `<程序目录>/runtime/mcp/docs-readonly/<版本>/docs-readonly.exe`，
+  不用构建；
+- **源码检出**：`basalt demo install --demo docs-diff` 会把源码导出到
+  `<workspace>/.basalt/demos/src/docs-readonly`（带最小 `go.mod`），按安装报告打印的命令
+  构建一次即可；`go build ./examples/shared/mcp/docs-readonly` 同效。
 
-安装报告会打印一条**按你本机路径渲染**的构建命令，直接照抄执行即可：
+样例文档库（`docs-diff` 的输入）由安装器复制到
+`<workspace>/.basalt/samples/docs`（共享夹具四份文档，`basalt demo install` 与首次启动的
+开箱安装都会准备）。要点：
 
-```sh
-go -C <工作区>/.basalt/demos/src/docs-readonly build -o D:/basalt-samples/docs-readonly.exe .
-```
-
-导出的目录带安装器生成的最小 `go.mod`（`module basalt-docs-readonly`），可以独立构建；
-从源码检出构建时，`go build ./examples/shared/mcp/docs-readonly` 也可用。
-
-再准备只读根（用共享夹具复制一份，**不要**让 Agent 直接指向仓库里的目录）：
-
-```sh
-cp -r examples/shared/fixtures/docs D:/basalt-samples/docs
-```
-
-- 二进制的绝对路径后面要原样写进 `mcp_servers.yaml` 与 `shell.allowed_commands`；
+- 二进制的绝对路径要原样写进 `mcp_servers.yaml` 与 `shell.allowed_commands`；
 - 复制只改 `modified_at`、不改内容哈希——脚本判定只看哈希，结论不受影响；
 - 想用自己公司的文档：把 Markdown 放进只读根即可（`list_documents` 只列 `.md`，
-  最多 1000 份，单文件上限 1 MiB，必须是 UTF-8）。**先脱敏**。
+  最多 1000 份，单文件上限 1 MiB，必须是 UTF-8）。**先脱敏**；库超过 **20 份**会被
+  脚本按「库根疑似指向整个工作区」拒收（每份要一次元信息调用，演示预算放不下）。
 
 ## 4. 配置只读 MCP server
 
-编辑 `<workspace>/.basalt/mcp_servers.yaml`，加入一条：
+**新实例**的开箱安装器已经写好这条（`-root` 指向 `<workspace>/.basalt/samples/docs`），
+不用再动。**已有实例**要么没有这条、要么是早期版本写的**缺 `-root`** 的形态——安装器
+只追加、不改旧条目（改配置等于悄悄动你的定义），必须显式修：
+
+管理台「MCP server → docs-readonly → 编辑」，或改 `<workspace>/.basalt/mcp_servers.yaml`
+后重启（走管理台会留下发布版本与操作记录，推荐）：
 
 ```yaml
 servers:
   - name: docs-readonly
     transport: stdio
-    command: "D:/basalt-samples/docs-readonly.exe"
+    command: "<程序目录>/runtime/mcp/docs-readonly/<版本>/docs-readonly.exe"
     args:
       - "-root"
-      - "D:/basalt-samples/docs"
+      - "<workspace>/.basalt/samples/docs"
 ```
 
 - `name` 必须与 `AGENT.md` 的 `mcp_servers: [docs-readonly]` 逐字一致；
 - `command` 必须是**绝对路径**，且**逐字**出现在 `shell.allowed_commands` 里——
   stdio MCP 启动同样要过命令授权（按整串比对，`D:/…` 与 `D:\…` 不算同一个）。
   出现 `mcp server skipped: docs-readonly` 就是没放行；
-- `args` 里的 `-root` 用**绝对路径**。不传时 server 取 `$DOCS_READONLY_ROOT`，再缺省
-  为进程当前目录——缺省会指到 Basalt 的工作目录，`list_documents` 只会返回空数组
-  或无关文件；
+- `args` 里的 `-root` 用**绝对路径**，缺了它就落在进程当前目录（= 整个工作区）：
+  `list_documents` 会把 `AGENTS.md`、`agents/`、`versions/` 都算成文档，随后每份一次
+  `document_metadata` 把工具预算烧光，run 以 `limit_reached`（工具调用次数超限）收尾。
+  `AGENT.md` 第 2 步与脚本都会先验库根：出现工作区文件或超过 20 份就停；
 - 根目录不可用（不存在 / 不是目录）时 server 直接 `exit 2`，启动日志会有明确一行。
 
 ## 5. 环境变量
@@ -104,31 +101,36 @@ fail-closed（503 + `operation_id`），假占位只会让保存直接失败。
 
 ## 8. 放开 shell（脚本通道）
 
-`shell` 工具只放行白名单里的可执行名，解释器还必须走受控通道。编辑 `basalt.yaml`：
+`shell` 工具只执行白名单里的可执行名，**整串逐字比对**（Windows 不查 PATH、不补
+`.exe` / `.cmd` 后缀）。示例脚本走 `shell`，两条前提都要满足：解释器整串登记进
+`shell.allowed_commands`，且 `AGENT.md` 里写的可执行名与它是**同一串**。
+
+安装器已经替你做了一半：`basalt demo install`（或首次启动的开箱安装）把 `AGENT.md`
+里的 `{{BASALT_PYTHON}}` 替换成本机解释器的绝对路径——**随包运行时优先**，即
+`<程序目录>/runtime/python/python.exe`；Linux / macOS 是
+`<程序目录>/runtime/python/bin/python3`。新实例的模板把同一串写进
+`shell.allowed_commands`，已有实例按下面补齐即可：
 
 ```yaml
 shell:
   allowed_commands:
-    - "D:/basalt-samples/docs-readonly.exe"   # 与 mcp_servers.yaml 的 command 逐字一致
-  interpreters:
-    - python               # 解释器整串；Windows 写绝对路径，见下方提示
-  env_passthrough: []      # 脚本不需要额外环境变量
+    - "D:/basalt/bin/runtime/python/python.exe"   # 与 AGENT.md 里的可执行名逐字一致
+    - "D:/basalt/bin/runtime/mcp/.../xxx.exe"     # 用到的 MCP server 的 command 同样要放行
+  env_passthrough: []                             # 脚本不需要额外环境变量
 ```
 
-- 解释器通道的 argv 必须是 `[<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的
-  `scripts/` 内——`-c` / `-m` 这类内联代码一律拒；`scripts/` 对模型只读；
+- 分隔符自己统一：`D:/…/python.exe` 与 `D:\…\python.exe` 不算同一串；
+- `shell.interpreters` 是**可选的更严通道**：登记后只允许
+  `argv = [<脚本路径>, <参数…>]`，脚本真实路径必须落在该 Agent 的 `scripts/` 内，
+  `-c` / `-m` 这类内联代码一律拒。示例脚本都满足，建议一并登记；不登记也能跑
+  （`allowed_commands` 放行即可），只是 shell 面更宽；
 - `bash` / `sh` **不得**放行；
-- **Windows 本机必须写解释器的绝对路径**（已实测）：受控执行器把 `interpreters` 里的
-  整串**原样**交给 `CreateProcess`（`lpApplicationName`），既不查 PATH、也不补
-  `.exe` / `.cmd` 后缀——写 `python`、`python.exe`、`py` 都只会得到
-  `The system cannot find the file specified`。请写 python.org 安装的绝对路径
-  （如 `C:/Users/<you>/AppData/Local/Programs/Python/Python312/python.exe`），
-  并把 `AGENT.md` 第 5 步的可执行名同步成**同一串**（白名单按整串逐字比对）。
-  Linux / macOS 上执行器走 `exec.Command`（查 PATH），裸名可用。
+- `AGENT.md` 里若仍是字面量 `{{BASALT_PYTHON}}`（安装时没找到解释器），把它换成你登记的
+  同一串；**不得**改猜 `python` / `py` 之类的名字——整串不命中就是 `sandbox_denied`；
 - 同一份 `basalt.yaml` 的 `budget:` 段也要动：`budget.max_iterations` 缺省 **10**，
   而本 Demo 的 `AGENT.md` 声明 `settings.max_iterations: 20`——Profile 只能**收紧**
   运维上限、**不得**放大（契约 `run-and-errors.md` §6），不调这一项 Run 会在第 10 轮
-  落 `limit_reached`。在该段把 `max_iterations` 调到不小于 20。
+  落 `limit_reached`。
 
 ## 9. 重启
 
@@ -214,7 +216,7 @@ sqlite3 <workspace>/.basalt/basalt.db \
 | MCP 启动即退出 | `-root` 目录不存在或不是目录（server `exit 2`）；`command` 是否与 `allowed_commands` **逐字**相同 |
 | `list_documents` 返回空数组 | 根目录指错了：检查 `-root` 绝对路径；只列 `.md`，非 Markdown 不算 |
 | 诊断说 `unconfirmed` | 不代表一定失败：点「测试」真实连接一次，结论只看测试结果与失败分类 |
-| `shell` 返回 `sandbox_denied` | `shell.interpreters` 未放行，或脚本不在 `scripts/` 下，或 `arguments[0]` 以 `-` 开头 |
+| `shell` 返回 `sandbox_denied` | 解释器整串没进 `shell.allowed_commands`（或与 `AGENT.md` 里不是同一串）；登记了 `shell.interpreters` 时，还要求脚本在 `scripts/` 下、`arguments[0]` 不以 `-` 开头 |
 | 脚本报 `metadata 缺少文档的元信息` | 没对每份文档调用 `document_metadata`，或聚合时漏项 → 整轮重取后重跑 |
 | 脚本报 `size` / `modified_at` 不一致 | 两次读取之间文档变了（有人正在改库）→ 整轮重取；不要把两次快照拼在一起 |
 | 报告写「无历史记忆（首次运行）」但上一轮跑过 | `recall_memory` 的 `query` 不是 `docs-diff`；或上一轮 `save_memory` 写成了 `scope: CORE`（核心区**不参与检索**） |

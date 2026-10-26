@@ -126,11 +126,12 @@ type Options struct {
 	// state (not a read error); a nil port fails closed instead of faking 200.
 	InstanceSecrets InstanceSecretsService
 
-	// Notify 是通知渠道的只读注册表（§3.1.29）；NotifyTypes 是装配层显式注册的有序
-	// 类型名（单一真值，US-12 写面复用同一映射表）。Notify 为 nil 时列表端点按 500
+	// Notify 是通知渠道的只读注册表（§3.1.29）；NotifyTypes 是页面下拉的**可选项**
+	// 投影（当前只有飞书；webhook 是地址形态，仍在写侧校验表里但不在页面上提供）。
+	// 两者都来自装配层的同一张适配器映射表。Notify 为 nil 时列表端点按 500
 	// INTERNAL 拒绝——缺端口是装配错误，不是空列表。
-	// Notify is the read-only channel registry; NotifyTypes is the assembly layer's
-	// single ordered type list.
+	// Notify is the read-only channel registry; NotifyTypes is the console's
+	// selectable projection of the same adapter registry.
 	Notify      core.NotifyChannelReader
 	NotifyTypes []string
 

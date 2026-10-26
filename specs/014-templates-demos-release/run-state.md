@@ -1615,3 +1615,102 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 - 带 PAT 的 `github` 条目在本轮**完整包**上的连接读数：两个包验证实例都没有提供 PAT（7.6.1）；带 PAT 的通路读数来自 8080 演示实例（存量实例就地重启，非新包首启）与 7.6.2 的历史轮。
 - 真实模型业务轮没有在本轮产物上复跑：`lzne2c` 是 §7.3 的读数，早于 `fbfc7c4`。
 - Windows r5 → r6 包的文件差量（20,096 → 19,356）无法逐文件归因（r5 期 Windows zip 已被覆盖）；Linux 两轮条目清单已验证全等（7.6.1）。
+
+### 7.8 review ② 人工验证发现的三类缺陷与五个 Demo 的实跑回归（2026-10-27）
+
+用户 2026-10-27 在演示实例（`D:\code\basalt-demo`，127.0.0.1:8080）上又报了七条：五个 Demo 里只有 industry-brief 与 docs-diff 的定时任务成功；docs-diff 显示「达到迭代上限」；github-radar 等三只失败；MCP 列表 `github` 显示「未声明来源 ×1」；通知渠道新建表单类型有「飞书 / webhook」两项；MCP 页长命令文字压到相邻列；「已配置渠道」表 渠道 / UUID 列太窄；Agent 工作区模型连接保存后不刷新为「就绪」。全部按「原因 + 改动位置」「自动测试」「真实实例读数」「未验证项」四类证据处置如下。
+
+#### 7.8.1 三只 Demo 失败：解释器整串不命中（主因）
+
+**原因**：受控执行器把 `executable` 与 `shell.allowed_commands` / `shell.interpreters` **整串逐字**比对（`internal/tool/policy.go` 的 `checkShellCommand`），不查 PATH、不补 `.exe` / `.cmd` 后缀。示例 `AGENT.md` 里写的是裸名 `python`，而各实例 `basalt.yaml` 登记的是本机解释器绝对路径——两串永不相等，`shell` 每次都被判 `sandbox_denied`，脚本一次没跑过。三只失败 Demo 的 Run 里都能看到该拒绝；industry-brief 不用脚本、docs-diff 在演示实例上另行修好，所以只有它们成功。
+
+**改动位置**：
+
+| 位置 | 内容 |
+| --- | --- |
+| `internal/builtin/python.go`（新增） | 解释器唯一解析入口：`PythonPlaceholder = "{{BASALT_PYTHON}}"`、`ResolvePython`（随包运行时优先，随包候选存在但跑不起来就报错、不静默回落宿主）、`SubstitutePython`（只替换占位符，空 / 相对路径拒绝）、`ResolveAgentPython`（保留态也对齐占位符） |
+| `internal/builtin/builtin.go` | `Install(wsRoot, force, interpreter)` 统一装五只 Agent；新建清模型、保留态只对齐占位符；`BlankModel` 保留行尾 `\r`（见 7.8.7） |
+| `internal/app/builtin_install.go` | 装配期先 `ResolvePython` 再安装，安装报告与启动日志带 `interpreter` / `docs_library` 读数 |
+| 五份 `AGENT.md` / `SETUP.md` | `executable` 一律写 `{{BASALT_PYTHON}}`；SETUP 第 6 节改为「占位符未替换时如何登记」 |
+
+**自动测试**：`internal/builtin` 单测覆盖占位符替换幂等、空 / 相对路径拒绝、保留态对齐；`internal/cli` 的 `demo install` 用例同步改签名；`TestDemoInstall_BlankModelOnlyTouchesOneLine` 验证只动一行且行尾不变。
+
+**真实实例读数**：演示实例重建后五只 Agent 的 `AGENT.md` 均替换为本机绝对路径，`shell.allowed_commands` 同一串；五个定时任务实跑见 7.8.6。
+
+#### 7.8.2 docs-diff「达到迭代上限」：只读库根指向了整个工作区
+
+**原因**：内置 `docs-readonly` MCP 条目没带 `-root`，server 的库根回落到**进程当前目录**（= 工作区）。`list_documents` 于是返回 36 份（`agents/`、`versions/`、`skills/` 等生成物都算文档），模型按指令逐份调 `document_metadata`，每份一次调用——50 次工具预算在元信息阶段就用尽，Run 记 `limit_reached`，显示成「达到迭代上限」。**不是模型打转，是配置把库根指错了**。
+
+**改动位置**：`internal/builtin/mcp.go` 的 `CredentialFreeEntries` 给 `docs-readonly` 永远带 `-root <workspace>/samples/docs`；`internal/builtin/docs.go`（新增）首次启动把 `shared/fixtures/docs` 装到 `samples/docs`；脚本侧加第二道闸 `check_library_root`（`examples/daily/docs-diff/scripts/docs_diff.py`）：清单里出现工作区独有文件（`AGENTS.md` / `basalt.yaml` / `mcp_servers.yaml` / `basalt.db` / `memory/MEMORY.md`）或文档数 > 20 → 非零退出并点名「补 `-root`」，在任何逐份调用之前拒绝计算；`AGENT.md` 同步加「库根校验（必做）」步骤。
+
+**自动测试**：`examples/daily/docs-diff/scripts/test_docs_diff.py` 25 个用例（含工作区标记、超限两份新失败样例）；`internal/builtin` 断言 `docs-readonly` 条目的 args 带 `-root`；安装用例断言样例库落位。
+
+**真实实例读数**：修前 Run 的调用读数 36 份清单 → 50 次用尽（`limit_reached`）；修后 `scheduler-1793054645170-q6rsxx`：4 份文档、12 次调用、`completed`、投递 `sent`（HTTP 200 / 飞书 `code=0`）。
+
+#### 7.8.3 github-radar / repo-digest：真实 GitHub MCP 返回形状与夹具不同
+
+**原因**（三条，均在本机 `github-mcp-server 2.0.3` 上实测）：
+
+1. `search_repositories` 默认精简输出**只有 `updated_at`，没有 `pushed_at`**，也不接受 `fields` 参数。脚本把 `pushed_at` 当必填 → 真实搜索结果全被判坏行。此前一次「成功」的落盘里 30/30 条 `pushed_at == updated_at`——是模型按旧指令手补的字段，**属伪造**；AGENT.md 原来只写「原样落盘」，堵不住这一手。
+2. `list_releases` 的对象**没有 `updated_at`**，时间锚只能是 `published_at`；`list_issues` 的 `state` 是 GraphQL 枚举**大写**（`OPEN` / `CLOSED`），`comments` 为 0 时整键省略。
+3. 真实一页列表可达数百 KB，整段塞给下一次 `write_file` 会超入参上限（报「入参不是合法 JSON」）；必须 `perPage: 10` + `fields` 只取脚本要用的键。
+
+**改动位置**：
+
+| 位置 | 内容 |
+| --- | --- |
+| `examples/daily/github-radar/scripts/github_radar.py` + 单测 | `pushed_at` 键缺失或 null 时用 `updated_at` 兜底；`pushed_at` 存在但解析不了仍是坏行（不掩盖）；新用例 `test_missing_pushed_at_falls_back_to_updated_at` |
+| `examples/daily/github-radar/AGENT.md` | 每次调用显式 `perPage: 10`；明确「只返回 `updated_at`，不要自己补 `pushed_at`」；多次检索按顺序拼 `items`、条目本身不得增删改 |
+| `examples/daily/repo-digest/scripts/repo_digest.py` + 单测 | release 游标 `_release_updated_at`：`updated_at` 缺失退回 `published_at`，存在但解析不了仍是坏行；`state` 大小写归一化（其余取值仍判坏） |
+| `examples/daily/repo-digest/AGENT.md` | 三工具各给 `fields` 清单与 `perPage: 10`；声明 `list_releases` 没有 `updated_at`（锚是 `published_at`），`fields` 被服务端拒绝时以其错误为准 |
+| 两份 `README.md` | 证据档位更新为「真实 GitHub MCP + PAT 实跑已验证（2026-10-27 本机，github-mcp-server 2.0.3）」；补 `updated_at` / `pushed_at` 语义差异与 `minimal_output: false` 体积问题的已知限制 |
+
+**真实实例读数**：github-radar `scheduler-1793054527281-evjh06`（7 迭代 / 8 调用）：30 条原始搜索结果**原样**落盘（无 `pushed_at`）→ 脚本用 `updated_at` 兜底、退出 0；候选 28 / 去重 5 / 裁剪 18 / 推荐 5，星差由上一轮基线算出；repo-digest `scheduler-1793054259920-lrqgxl`（6/10）三来源列表齐全、cursor 推进、`completed`。两条投递均 `sent`（HTTP 200 / 飞书 `code=0`）。
+
+#### 7.8.4 MCP 列表「未声明来源 ×1」：管理读面漏传凭据服务（装配缺陷，已修）
+
+**原因**：控制台的未声明计数 = 「有 env 键、但视图里没有对应 `credential_keys`」。`wireManagementPorts` 构造管理读面时写的是 `MCPCredentials: rt.mcpCredentials`，而 `heavyRuntime` 此前**没有这个字段**——凭据服务只在写端口注入过。于是读面 `credential_keys` 恒为空，已声明的槽位也被前端算成「未声明来源 ×N」。**写路径其实认得该槽位**（保存闸门对未声明槽位直接 400），所以这是装配 / 展示缺口，不是实例状态，也不是安装器缺陷：14D 起启动装配本就会为每个未声明槽位补记 `mode=env`（`internal/app/mcp.go:305-313`）。
+
+**改动位置**：`internal/app/wire.go` 给 `heavyRuntime` 增加 `mcpCredentials *MCPCredentialService`，并在 `newRuntime` 注入同一实例；`internal/app/web.go` 的 `wireManagementPorts` 用它喂 `ResourceViewDeps.MCPCredentials`，注释写明「读面与写面必须同一实例」。
+
+**真实实例证据**（演示库 `.basalt/basalt.db` 探针，只读）：`mcp_credential_sources` 1 行（`GITHUB_PERSONAL_ACCESS_TOKEN` / `env` / `revision=1`），其 `operation_id=op-1793030025034-o4rerw` 在 `management_operations` 里 **0 行**——启动补记的合成操作号（`core.NewOperationID`），不是管理保存。**行存在而页面仍标未声明**，正好定位缺口在读面。修复后重启，`GET /api/v1/mcp-servers` 报 `slots=[("GITHUB_PERSONAL_ACCESS_TOKEN", "env")]`，徽章消失。
+
+**自动测试**：`TestManagementPorts_MCPReadProjectionSeesCredentialSlots`（`internal/app/web_test.go:821`）——经 `webOptions` + `MCPServers` 断言读面带 `credential_keys`；逆改点写明：`ResourceViewDeps` 去掉 `MCPCredentials` → 用例红。
+
+**未验证**：徽章的视觉消失属 review ② 人工确认（服务端投影已是 `env`）。
+
+#### 7.8.5 控制台四处（通知类型 / 命令列错位 / 渠道列宽 / 就绪刷新）
+
+| 缺陷 | 原因 | 改动位置 | 测试 |
+| --- | --- | --- | --- |
+| 新建渠道类型出现「webhook」 | 写契约仍接受历史类型 `webhook`，控制台直接渲染服务端全量枚举 | `internal/app/web.go` 新增 `notifyConsoleTypes()`：**展示投影**去掉 `webhook`，写校验 `notifyTypeNames()` 保持原样；控制台 `NOTIFY_TYPE_LABELS` 只映射 `feishu`，未识别 / 历史值原样显示（保留编辑能力） | `TestNotifyConsoleTypes_OnlyRealChannelTypes`（展示 = `["feishu"]`，可写 = `["feishu","webhook"]`） |
+| MCP 页长命令压到相邻列 | 命令列无固定宽度、长路径不换行 | `resources.ts`：空命令显示 `—`、其余走 `identifier()`；`workspace.css` `.col-command{width:240px}` | `resource-list.test.ts` |
+| 「已配置渠道」渠道 / UUID 列太窄 | 表格自动布局把宽列挤扁 | `notify-channels.ts` 用 `.cell-id`、`tableClass: 'notify-table'` + 列宽；`workspace.css` `.notify-table{table-layout:fixed;min-width:1668px}` | `notify-channels.test.ts` |
+| 模型连接保存后不刷新 | 保存成功没有向上冒泡「已保存」，工作区不重读就绪 | `agent-config.ts` 两条保存路径都 emit `saved`；`agent-detail.ts` `onSaved` → `Promise.all([profiles.reload(), readiness.reload(), agentMcps.reload(), scheduleConfig.reload()])` | `agent-operations.test.ts` |
+
+**读数**：控制台 286 个 Vitest 用例通过、`npm run build` 通过（`vue-tsc --noEmit` + vite + integrity）。**未验证**：四处视觉与点击交互属 review ② 人工验收。
+
+#### 7.8.6 五个 Demo 在演示实例上的实跑回归（同一进程，全部手动触发）
+
+| Demo | run_id | 迭代 / 调用 | 结果与业务读数 | 投递 |
+| --- | --- | --- | --- | --- |
+| repo-digest | `scheduler-1793054259920-lrqgxl` | 6 / 10 | `completed`；PR / Issue / Release 三来源齐全，cursor 推进，待跟进 / 待确认按脚本计数 | `sent`，HTTP 200，飞书 `code=0` |
+| github-radar | `scheduler-1793054527281-evjh06` | 7 / 8 | `completed`；30 条原始结果无 `pushed_at`，候选 28 / 去重 5 / 裁剪 18 / 推荐 5 | 同上 |
+| biz-daily | `scheduler-1793054629495-6mnmoj` | 7 / 6 | `completed`；四类互斥计数，指标只用有效行 | 同上 |
+| docs-diff | `scheduler-1793054645170-q6rsxx` | 8 / 12 | `completed`；4 份文档、12 次调用（修前烧穿 50 次） | 同上 |
+| industry-brief | `scheduler-1793054678992-fedl2k` | 10 / 19 | `completed`；来源表齐全；4 条外呼失败如实记「线索 / 失败」，未编造正文 | 同上 |
+
+演示实例数据修复（用户 2026-10-27 明确选择「备份后解归档 + 清失败消息」）：三个被归档的调度会话在归档后 cron `skipped`、手动触发 400，先备份 `backups/basalt-predemo-repair-20261027.db` 再解归档并清失败消息。**产品缺口**：归档调度会话目前没有受支持的恢复入口（只能改库），已记入已知限制。github-radar 状态与输入落盘各留一份修前备份（`state/seen.before-pushed-at-fix-20261027.json`、`github_search.before-pushed-at-fix-20261027.json`）。
+
+#### 7.8.7 本轮自身引入的两个回归（如实记录）
+
+1. **`BlankModel` 丢行尾**：素材在 Windows 检出上是 CRLF，替换整行时把 `\r` 一起丢了 → 装出来的 `AGENT.md` 混合行尾，`TestDemoInstall_BlankModelOnlyTouchesOneLine` 红（diff 看起来「一样」）。修法：拆出行尾、只替换内容（`builtin.go`），用例转绿。
+2. **新文件首版过不了 `sec`**：`python.go` 被 gosec 判 G101（常量名像凭据）、G703 / G304（taint 读写）。修法：常量改名 `PythonPlaceholder`、读写改 `os.OpenRoot` + `dir.ReadFile` / `dir.OpenFile`（与 `BlankModel` 同口径），`gosec -quiet ./internal/builtin/...` 退出 0。
+
+**自动测试汇总**（本轮）：示例脚本 5 个目录 102 个用例（github-radar 10 / repo-digest 16 / biz-daily 22 / docs-diff 25 / industry-brief 29），docs-readonly 嵌套 module 通过；控制台 286 用例 + 构建；Go 全量门禁读数见 §7.9。
+
+**未验证项**：
+
+- UI 四处的视觉 / 点击（review ② 人工）；通知下拉对存量 `webhook` 渠道的编辑路径只在单测覆盖，未在实例上点验。
+- 真实模型业务轮只在演示实例（存量实例就地重启）上跑过；新装实例首启后立即跑五 Demo 尚未复跑。
+- `python` 作为 `shell.allowed_commands` 条目仍意味着放行该解释器执行任意脚本；本 US 的收紧通道是 `shell.interpreters`（更窄），示例只登记绝对路径，产品级白名单策略未变。

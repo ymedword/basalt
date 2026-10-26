@@ -2498,8 +2498,8 @@ paths:
   /notify-channels/types:
     get:
       tags: [notify]
-      summary: 列已装配的渠道类型
-      description: 类型支持集只有**一份真值**（装配层显式映射表）；此端点同时供页面下拉框与写侧校验。
+      summary: 列页面可选的渠道类型
+      description: 返回页面下拉框的**可选项**投影（当前只有 `feishu`——`webhook` 是地址形态而不是渠道类型，不对新建渠道暴露）；写侧校验仍接受适配器注册表里的全部类型，既有 `webhook` 渠道照常编辑与发送。类型支持集只有**一份真值**（装配层显式映射表）。
       responses:
         '200':
           description: 类型列表

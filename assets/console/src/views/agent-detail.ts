@@ -1188,6 +1188,18 @@ export const AgentDetailView = defineComponent({
           onDirtyChange: (value: boolean) => {
             configDirty.value = value
           },
+          // 配置保存成功后重读本页的所有配置派生读数：就绪三段面板、MCP 列表与计划
+          // 配置都来自保存前的那次读取。此前不重读，用户必须退出工作区再进来才看到
+          // 「模型连接：就绪」（用户实测 2026-10-27）。
+          // Re-read every config-derived panel after a successful save.
+          onSaved: () => {
+            void Promise.all([
+              profiles.reload(),
+              readiness.reload(),
+              agentMcps.reload(),
+              scheduleConfig.reload(),
+            ])
+          },
         }),
       ])
     }

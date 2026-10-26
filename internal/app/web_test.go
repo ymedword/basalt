@@ -31,6 +31,11 @@ package app
 //	T15 `TestWritePorts_ProjectedIdentically`——槽里的适配器逐字段同一实例投影
 //	T16 `TestWritePorts_IndependentOfContentEditor`——写面端口与 US-11 内容编辑器互不顶替
 //
+// 14D 收口后用户实测两缺陷（2026-10-27）：
+//
+//	T17 `TestManagementPorts_MCPReadProjectionSeesCredentialSlots`——读面与写面共用凭据服务
+//	T18 `TestNotifyConsoleTypes_OnlyRealChannelTypes`——下拉只列真实渠道类型（飞书）
+//
 // 全部离线：不访问真实网络与真实模型；T5 的 provider 卡在首次 Chat 上制造准入窗口。
 // Every case is offline; T5 parks the first run inside Chat to hold the admission window.
 
@@ -805,6 +810,75 @@ func TestWritePorts_FailClosedWithoutAdapters(t *testing.T) {
 	require.Nil(t, opts.ResourceAdminService)
 	require.Nil(t, opts.NotifyAdminService)
 	require.Nil(t, opts.WorkspaceService)
+}
+
+// TestManagementPorts_MCPReadProjectionSeesCredentialSlots：管理读面的 MCP 列表必须
+// 带上逐槽位的 `credential_keys`——读端口与写端口共用**同一** MCP 凭据服务（14D 回归，
+// 用户 review ② 实测缺陷：页面上 github 被标「未声明来源 ×1」，而写路径其实认得
+// 那个槽位）。漏传 `MCPCredentials` 时视图只回空集合，前端按「槽位没来源」上红标。
+// 逆改点：wireManagementPorts 的 ResourceViewDeps 去掉 MCPCredentials → 本用例红。
+// 中文用例名：管理读面能看到已声明的 MCP 凭据槽位。
+func TestManagementPorts_MCPReadProjectionSeesCredentialSlots(t *testing.T) {
+	t.Parallel()
+	env := newRunResourcesEnv(t)
+	ctx := context.Background()
+
+	version := env.seedVersion(t, core.ResourceMCPServer, "github",
+		mcpDefinition("github", "github-mcp-server", "GITHUB_PERSONAL_ACCESS_TOKEN"), "", "")
+	env.publish(t, core.ResourceMCPServer, "github", version.ID, true)
+
+	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
+		Credentials:   storage.NewCredentialStore(env.db),
+		Sources:       storage.NewMCPCredentialSourceStore(env.db),
+		WorkspaceRoot: env.root,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	definition, err := parseMCPDefinition("github", version.DefinitionYAML)
+	require.NoError(t, err)
+	added, err := mcpCredentials.BackfillEnvSources(ctx, "github", version.ResourceUID, core.MCPServerConfig{
+		Name:      "github",
+		Transport: definition.Transport,
+		Command:   definition.Command,
+		Args:      definition.Args,
+		URL:       definition.URL,
+		Env:       definition.Env,
+		Headers:   definition.Headers,
+	}, env.opID, baselineClock())
+	require.NoError(t, err)
+	require.Equal(t, 1, added, "启动回填必须为文件里声明的槽位记下 env 来源")
+
+	opts := (&App{}).webOptions(&heavyRuntime{
+		cfg:            &cli.Config{},
+		root:           env.root,
+		db:             env.db,
+		versions:       env.versions,
+		lifecycle:      env.lifecycle,
+		credentials:    env.credentials,
+		mcpCredentials: mcpCredentials,
+	})
+	require.NotNil(t, opts.Resources, "版本与生命周期齐备时资源读面必须装配")
+
+	servers, err := opts.Resources.MCPServers(ctx)
+	require.NoError(t, err)
+	require.Len(t, servers, 1)
+	require.Equal(t, []string{"GITHUB_PERSONAL_ACCESS_TOKEN"}, servers[0].EnvKeys)
+	require.Len(t, servers[0].CredentialKeys, 1, "读端口必须与写端口读同一份来源声明")
+	require.Equal(t, "GITHUB_PERSONAL_ACCESS_TOKEN", servers[0].CredentialKeys[0].Key)
+	require.Equal(t, string(core.CredentialModeEnv), servers[0].CredentialKeys[0].Mode)
+}
+
+// TestNotifyConsoleTypes_OnlyRealChannelTypes：新建渠道下拉只提供**真实渠道类型**
+// （飞书）；`webhook` 是地址形态，仍留在写侧注册表里，既有 webhook 渠道照常编辑、
+// 测试与发送。用户裁决 2026-10-27。
+// 逆改点：notifyConsoleTypes 退回 notifyTypeNames → 第一条红；从注册表删掉 webhook
+// → 第二条红（既有渠道的写路径会被卡死）。
+// 中文用例名：通知类型下拉只列真实渠道类型。
+func TestNotifyConsoleTypes_OnlyRealChannelTypes(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, []string{"feishu"}, notifyConsoleTypes(), "页面只提供飞书")
+	require.Equal(t, []string{"feishu", "webhook"}, notifyTypeNames(),
+		"写侧注册表仍保留 webhook，不得因页面投影删类型")
 }
 
 // TestWritePorts_ProjectedIdentically：槽里放什么，`web.Options` 就得到什么——四个

@@ -8,7 +8,8 @@
 
 覆盖：首跑只记基线不编造变更、无变化仍出报告、新增 / 修改 / 删除三集合、内容哈希
 相等 / 不等（含同字节数的内容变化）、四类计数不变量、空根、两份快照不同源的五种拒收、
-基线版本与形态拒收、CLI 失败零写入、报告路径无关（可复现）。
+基线版本与形态拒收、库根校验（工作区文件 / 超过演示上限）、CLI 失败零写入、
+报告路径无关（可复现）。
 
 单测直接读 `../fixtures/docs/a.md` / `b.md` 的**真实字节**：夹具与断言不得各自漂移。
 The tests hash the shipped fixture bytes instead of copying them inline, and `-B` keeps
@@ -193,6 +194,24 @@ class DocsDiffTest(unittest.TestCase):
         self.assertTrue(report["changes_detected"])
         self.assertEqual(report["sets"]["deleted"], ["a.md", "b.md"])
         self.assertIn("删除 2", report["message"])
+
+    def test_workspace_marker_in_listing_is_refused(self):
+        # 逆改点：docs-readonly 没传 -root → 清单里出现工作区文件，仍逐份取元信息。
+        pairs = [("a.md", fixture("a.md")), ("AGENTS.md", b"# workspace\n")]
+        documents, metadata = snapshot(pairs)
+        with self.assertRaisesRegex(ScriptError, "只读库根疑似指向整个工作区"):
+            docs_diff.diff_documents(documents, metadata, None, now=NOW)
+
+    def test_oversized_listing_is_refused_before_any_metadata(self):
+        pairs = [(f"doc-{index:02d}.md", b"x") for index in range(docs_diff.MAX_DOCUMENTS + 1)]
+        documents, metadata = snapshot(pairs)
+        with self.assertRaisesRegex(ScriptError, "超过演示上限"):
+            docs_diff.diff_documents(documents, metadata, None, now=NOW)
+
+    def test_demo_sized_library_is_accepted(self):
+        pairs = [(f"doc-{index:02d}.md", b"x") for index in range(docs_diff.MAX_DOCUMENTS)]
+        result = run(pairs)
+        self.assertEqual(result["report"]["mode"], "baseline_created")
 
     def test_metadata_missing_entry_is_refused(self):
         documents = [entry("a.md", fixture("a.md")), entry("b.md", fixture("b.md"))]

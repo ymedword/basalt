@@ -38,21 +38,28 @@ schedules:
 
 1. **检索**：用 `search_repositories` 查找最近 30 天有推送的仓库，查询串包含
    `pushed:>=<本次运行日期，YYYY-MM-DD>`，主题取「agent」「mcp」「scheduler」等
-   与本轮消息相关的关键词，每个主题最多 10 条。
+   与本轮消息相关的关键词，**每次调用都显式传 `perPage: 10`**（整页可达数百 KB，
+   超出入参上限会让 `write_file` 报「入参不是合法 JSON」）。
+   实测 `search_repositories`（github-mcp-server 2.0.3 默认精简输出）只返回
+   `updated_at`，**不返回 `pushed_at`**；脚本会在 `pushed_at` 缺失时用 `updated_at`
+   兜底，所以你**不要**自己补 `pushed_at`、也不要把 `updated_at` 改名。
 2. **落盘输入**：把工具返回的原始 JSON **原样**写到 Agent 目录下的
    `github_search.json`（`write_file`）。不要手工重排、不要补字段、不要改数字。
+   多次检索时把各次的 `items` 数组按顺序拼成一个数组写入，**条目本身不得增删改**。
 3. **取 README（可选）**：需要看某个仓库的 README 时，先用 `get_file_contents`
    拿到该文件的 `download_url`，再用 `http_get` 读这个地址；把 `download_url`
    **原样**填进对应条目的 `readme_url` 字段。**不得**假设默认分支是 `main`，
    **不得**手拼 `raw.githubusercontent.com` 地址。
-4. **算数**：用 `shell` 运行脚本，`executable` 填 `python`，`arguments` 逐项分开：
+4. **算数**：用 `shell` 运行脚本，`executable` 填 `{{BASALT_PYTHON}}`，`arguments` 逐项分开：
 
    ```text
    ["scripts/github_radar.py", "--input", "github_search.json", "--state", "state/seen.json"]
    ```
 
-   可执行名以 `shell.interpreters` 里实际放行的为准（本机若配的是 `py` / `python3`，
-   或 Windows 上的解释器**绝对路径**，就换成那个**整串**，参数不变）。脚本自己算去重、星差与裁剪，并把
+   上一行的可执行名由安装器替换成本机解释器的**绝对路径**，与 `shell.allowed_commands`
+   里登记的是同一串。若那里仍是带花括号的占位符（安装时没找到解释器），按 SETUP 第 6 节
+   登记本机解释器，再把这一行换成同一串；**不得**改猜 `python` / `py` 之类的名字（整串不
+   命中就是 `sandbox_denied`）。脚本自己算去重、星差与裁剪，并把
    `report.json` 写到 `runs/<时间戳>/`；
    `stdout` 里的 JSON 给出报告路径、输入 / 产物 / 状态的 SHA-256 与计数。
 5. **写报告**：`read_file` 读脚本刚写出的 `report.json`，在**同一目录**写

@@ -7,8 +7,9 @@
 `read_file` 取、L3 参考按需再取）、**缺字段标「待确认」而不是猜**、**游标只前进到
 已处理项**。
 
-> 档位：Demo（不是模板）。**夹具可复跑已验证**；**真实 GitHub MCP + PAT 实跑未验证**
-> （本轮无外部授权）；**`deliver_to` 实际送达未验证**（无真实接收方）。证据档位见文末。
+> 档位：Demo（不是模板）。**夹具可复跑已验证**；**真实 GitHub MCP + PAT 实跑已验证**
+> （2026-10-27 本机，github-mcp-server 2.0.3）；**`deliver_to` 实际送达未验证**
+> （无真实接收方）。证据档位见文末。
 
 ## 业务目标
 
@@ -28,14 +29,15 @@
 | `list_releases` | GitHub MCP（`github`） | 取 Release 列表 |
 | `read_file` | 内置 | 读技能 L2/L3、读脚本产物 |
 | `write_file` | 内置 | 落盘三份原始响应、写 `digest.md` |
-| `shell` | 内置 | 运行 `scripts/repo_digest.py`（解释器受 `shell.interpreters` 约束） |
+| `shell` | 内置 | 运行 `scripts/repo_digest.py`（解释器是 `AGENT.md` 里已替换的绝对路径，须在 `shell.allowed_commands` 里整串登记） |
 
 `AGENT.md` 的声明与上表一致；`notify` **不在**声明里——基线 `notify_mode: none`，
 装配面也不会补。`shell` 同样是必需项：脚本跑不起来就没有可信数字（模块卡 §2.3）。
 
-**MCP 工具名未实测**：三个名字按官方 `github-mcp-server` 的公开工具名填写（MCP 目录
-条目 `github` 的 `verified: false`，与 D1 同一份配方）。连接后若加载报
-`tool not registered: <name>`，按实际 `tools/list` 改 `tools:` 声明，**不要**改脚本。
+**MCP 工具名已实测**：三个名字与本机 `github-mcp-server 2.0.3` 的 `tools/list` 一致
+（2026-10-27 实测；MCP 目录条目 `github` 的 `verified` 字段保持目录口径，不随单次实跑改写）。
+若换版本后加载报 `tool not registered: <name>`，按实际 `tools/list` 改 `tools:` 声明，
+**不要**改脚本。
 
 ## 技能：L1 / L2 / L3
 
@@ -87,7 +89,7 @@ Basalt 的域名白名单约束。Basalt 只约束自己发出的 HTTP 请求，
 
 | 依赖 | 版本 | 用途 |
 | --- | --- | --- |
-| Python | 3.12（标准库即可） | 运行 `scripts/repo_digest.py`（`shell.interpreters`） |
+| Python | 3.12（标准库即可） | 运行 `scripts/repo_digest.py`（绝对路径登记在 `shell.allowed_commands`） |
 | `github-mcp-server` | 待实测 | GitHub 只读访问 |
 | Basalt | v0.1.0 | 运行底座（技能发布、调度、`deliver_to`） |
 
@@ -139,7 +141,18 @@ Basalt 的域名白名单约束。Basalt 只约束自己发出的 HTTP 请求，
 ## 固定输入
 
 `fixtures/` 三份**虚构**数据（仓库 `northwind-labs/mcp-bridge`，不含真实项目、账号或
-凭据），形态与 GitHub 列表响应一致（`{"total_count", "items": [...]}`）。
+凭据），形态与 GitHub 列表响应一致（`{"total_count", "items": [...]}`）。夹具**永远**
+是虚构仓库：单测的期望计数、哈希与它们是绑定的，换成真实仓库就不可复跑。
+
+**实际跑的时候默认目标是真实公开仓库 `github/github-mcp-server`**（`AGENT.md` 的
+`daily-digest` 触发消息），因为 MCP 的 `list_pull_requests` 只认真实 `owner/repo`——
+夹具里的虚构仓库在真实 GitHub 上不存在，查了只会是 404 / 空列表。换成自己的仓库：
+改 `schedules[0].message` 里的 `owner/repo`，重启后生效；不要把真实仓库写回夹具。
+
+真实列表响应远大于夹具：`AGENT.md` 第 2 步要求每个列表工具传 `perPage: 10` 与
+`fields`（只取脚本要用的字段），否则整段响应写进 `write_file` 会被入参上限截断
+（报「入参不是合法 JSON」）。另外，真实 release 对象**没有** `updated_at`，脚本的
+时间锚是 `published_at`；夹具为固定读数显式带了 `updated_at`，两种形态脚本都接受。
 
 刻意的设计（每条对应一条判据）：
 
@@ -151,7 +164,9 @@ Basalt 的域名白名单约束。Basalt 只约束自己发出的 HTTP 请求，
 4. **Issue #15 没有 `comments` 键** → 待确认，**不得**按 0 评论处理（否则会误判
    `unanswered_open`）。
 5. **Release #1003 是草稿且 `published_at: null`** → 进 `draft`（不是待确认）；
-   **Release #1004 非草稿但没有 `published_at` 键** → 进 `unknown` + 待确认。
+   **Release #1004 非草稿但没有 `published_at` 键** → 进 `unknown` + 待确认。夹具显式
+   带 `updated_at`（真实 release 对象没有，脚本用 `published_at` 兜底），所以这两条
+   的判定由 `updated_at` 定；草稿且两个时间都没时，整条进 `held_back` 并挡住游标。
 
 固定输入哈希（sha256）：
 
@@ -177,7 +192,8 @@ python scripts/repo_digest.py --pull-requests pull_requests.json \
 | `--stale-days` | 否 | `7` | PR / Issue 待跟进阈值 |
 | `--long-open-days` | 否 | `30` | Issue 长期未关阈值 |
 
-**输入**：裸数组，或 `{"items": [...]}` 形态。身份与 `updated_at`（必须带时区）
+**输入**：裸数组，或 `{"items": [...]}` 形态。身份与时间游标（PR / Issue 用
+`updated_at`，Release 用 `updated_at`、键缺失时用 `published_at`；都必须带时区）
 读不出来的条目不计入、挡住游标；业务字段（`merged_at` / `comments` / `published_at`
 等）缺失或不可解析 → 条目照算，同时进 `unconfirmed`。任何输入或状态不合规 →
 **非零退出，一个字节都不写**。
@@ -257,17 +273,21 @@ python scripts/repo_digest.py --pull-requests fixtures/pull_requests.json \
 
 | 档位 | 结论 | 依据 |
 | --- | --- | --- |
-| 夹具可复跑 | **已验证** | `scripts/test_repo_digest.py` 13 个用例；同一夹具两次重跑产物哈希一致 |
+| 夹具可复跑 | **已验证** | `scripts/test_repo_digest.py` 16 个用例；同一夹具两次重跑产物哈希一致 |
 | 技能 L1/L2/L3 读取 | **夹具用例覆盖** | `digest.json` 与技能文档逐条对应；L1 卡片断言与 `read_file` 审计在 `TestUS14Demos_Fixture/repo_digest`（需要真实模型，本轮未跑） |
-| 真实 GitHub MCP + PAT 实跑 | **未验证** | 外部授权未提供；工具名、只读模式与代表性调用均未实测 |
+| 真实 GitHub MCP + PAT 实跑 | **已验证（2026-10-27 本机实跑，github-mcp-server 2.0.3）** | 三份列表落盘、脚本退出 0，PR 10 / Issue 10 / Release 10 计入；`comments` 省略语义与 `state` 大小写见「已知限制」 |
 | `deliver_to` 实际送达 | **未验证** | 需要真实通知接收方；基线不带 `deliver_to`，`sent` 未取得 |
 
 ## 已知限制
 
-- **MCP 工具名未实测**：三个 GitHub 工具按公开文档填写；首次连接后按 `tools/list`
-  核对一次。
+- **实测的服务端形状**（github-mcp-server 2.0.3）：Issue 列表的 `state` 是大写
+  GraphQL 枚举（`OPEN` / `CLOSED`），脚本已做大小写归一化；Issue 的 `comments` 在
+  0 条评论时**省略该键**。脚本坚持「缺失 ≠ 0」，所以这些 Issue 会进「待确认」，
+  `unanswered_open` 对它们不会触发——宁可少报，也不猜 0。要恢复这个信号，需要换用
+  能返回 0 的字段或工具（本 Demo 未做）。
 - **同一页数据**：脚本只处理模型落盘的那一页；GitHub 分页更早的条目不在本次范围，
-  必要时在 `AGENT.md` 里改成多页拉取（脚本不负责翻页）。
+  必要时在 `AGENT.md` 里改成多页拉取（脚本不负责翻页）。真实仓库一页可达数百 KB，
+  所以 `AGENT.md` 用 `perPage: 10` + `fields` 控制落盘体量。
 - **受阻项导致的重复**：见「游标与宁可重复」一节——同源更晚的条目可能被重复计入
   一次，日报会写明条数。
 - **不判断优先级**：脚本只按固定规则筛待跟进，哪件更急仍由人读日报判断。

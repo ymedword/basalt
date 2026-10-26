@@ -1286,6 +1286,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		secrets:           secrets,
 		instanceSecrets:   instanceSecrets,
 		mcpRT:             mcpRT,
+		mcpCredentials:    mcpCredentials,
 		skills:            skills,
 		agentAdmin:        agentAdmin,
 		projection:        projection,
@@ -1702,9 +1703,15 @@ type heavyRuntime struct {
 
 	// mcpRT 是已发布 MCP 定义的只读运行期句柄（配置与连接两份名单）；skills 是技能库
 	// 句柄——准入解析、基线发布与发布版本快照共用同一实例。
-	// mcpRT and skills are the runtime handles shared by admission and the baseline.
-	mcpRT  *mcpRuntime
-	skills *workspace.SkillLibrary
+	// mcpRT 之外的 mcpCredentials 是逐槽位凭据状态服务：启动回填、写面与**管理读面**
+	// 必须读同一实例，否则列表页的 `credential_keys` 恒为空、声明过的槽位被误判成
+	// 「未声明来源」。此前只在写端口注入，读端口漏传，正是这个症状的成因。
+	// mcpRT and skills are the runtime handles shared by admission and the baseline;
+	// mcpCredentials is the one per-slot credential status service both the write and
+	// the read ports must share.
+	mcpRT          *mcpRuntime
+	mcpCredentials *MCPCredentialService
+	skills         *workspace.SkillLibrary
 
 	// agentAdmin 是 Agent 写面的编排实现（US-12）：构造一次、全进程共享。它持有与准入
 	// 同一把 Agent 级锁表、同一份生命周期存储与资源仓储；web 端口适配器

@@ -180,7 +180,10 @@ button { white-space: nowrap; }
 .data-table th.col-action, .data-table td.col-action { position: sticky; right: 0; z-index: 1; background: var(--surface); box-shadow: -1px 0 0 var(--line); }
 .data-table th.col-action { z-index: 2; background: #eeece3; }
 .data-table tbody tr:hover td.col-action { background: linear-gradient(var(--accent-wash), var(--accent-wash)), var(--surface); }
-.data-table .col-keys { width: 194px; }
+.data-table .col-keys { width: 194px; overflow-wrap: anywhere; }
+/* 可执行名是路径：定宽 + 省略号由 .cell-id 负责，宽度只保证标题下能读到一段。 */
+/* Commands get their own column width; .cell-id supplies the ellipsis. */
+.data-table .col-command { width: 240px; }
 .data-table .col-hash { width: 150px; white-space: nowrap; }
 .data-table .col-tool { width: 220px; white-space: nowrap; }
 .data-table .col-source { width: 110px; white-space: nowrap; }
@@ -195,6 +198,18 @@ a.cell-id { font: 12px/1.7 var(--font-mono); }
 .tools-table { table-layout: fixed; min-width: 640px; }
 .models-table { table-layout: fixed; min-width: 1070px; }
 .mcp-table { table-layout: fixed; min-width: 1220px; }
+/* 通知渠道表 12 列：标识列与操作列必须有明确宽度，否则自动布局会把渠道 / UID
+   压成竖排、按钮溢出到相邻列。列宽合计 1668px，表格在容器内横向滚动。
+   The notify table needs explicit widths for its identifier and action columns. */
+.notify-table { table-layout: fixed; min-width: 1668px; }
+.notify-table .col-uid { width: 92px; white-space: nowrap; }
+.notify-table .col-scope { width: 92px; white-space: nowrap; }
+.notify-table .col-desc { width: 150px; }
+.notify-table .col-host { width: 168px; }
+.notify-table .col-address { width: 124px; }
+.notify-table .col-refs { width: 156px; }
+.notify-table .col-actions { width: 190px; }
+.notify-table .col-actions .form-actions { flex-wrap: wrap; }
 .skills-table { table-layout: fixed; min-width: 850px; }
 .filters { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; padding: 18px 0 22px; border: solid var(--line); border-width: 1px 0; border-radius: 0; background: transparent; margin-bottom: 16px; }
 .filters label { flex: 1 1 145px; min-width: 0; font-size: 11px; }

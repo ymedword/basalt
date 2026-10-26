@@ -259,7 +259,9 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// The admin read face wraps the very same send-path repository.
 		Notify: newNotifyChannelReadPort(storage.NewNotifyChannelRepo(rt.db), rt.credentials, rt.versions,
 			notifyReadDeps{ConnectionTests: rt.connectionTests}),
-		NotifyTypes: notifyTypeNames(),
+		// 下拉只提供真正的渠道类型（飞书）；webhook 仍在写侧校验表里，见 notifyConsoleTypes。
+		// The dropdown offers channel types only; webhook stays valid on the write side.
+		NotifyTypes: notifyConsoleTypes(),
 		// 反向引用与删除闸门同源：扫描活动与归档 AGENT.md 的整词提及。
 		// Reverse references share the delete gate's document scan.
 		NotifyReferences: notifyReferencePort{root: rt.root},
@@ -1019,8 +1021,15 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		opts.Operations = rt.ops
 	}
 	if rt.versions != nil && rt.lifecycle != nil {
+		// MCPCredentials 与写端口是**同一实例**：列表页的「凭据」列读的就是下一次保存会
+		// 走的逐槽位判定。漏传会让 `credential_keys` 恒为空，声明过的槽位在页面上被误标
+		// 成「未声明来源 ×N」。
+		// Sources the read projection from the same credential service the write port uses.
 		opts.Resources = NewResourceViews(rt.versions, rt.lifecycle, rt.mcpRT, rt.credentials,
-			ResourceViewDeps{ConnectionTests: rt.connectionTests})
+			ResourceViewDeps{
+				ConnectionTests: rt.connectionTests,
+				MCPCredentials:  rt.mcpCredentials,
+			})
 	}
 	if rt.db != nil && rt.runs != nil && rt.versions != nil {
 		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, a.nowOr())
@@ -1199,11 +1208,29 @@ func sandboxConfigView(cfg *cli.Config) web.SandboxConfig {
 }
 
 // notifyTypeNames 取装配层显式注册的渠道类型名（`newNotifyAdapters` 的键集），
-// 排序后作为 `/notify-channels/types` 的固定顺序——**一处真值**：US-12 的写侧
-// 校验必须复用同一张映射表，不得另建类型清单。
+// 排序后作为写侧校验的类型表——**一处真值**：US-12 的写侧校验必须复用同一张映射表，
+// 不得另建类型清单。
 // notifyTypeNames returns the sorted key set of the single adapter registry.
 func notifyTypeNames() []string {
 	return slices.Sorted(maps.Keys(newNotifyAdapters()))
+}
+
+// notifyConsoleTypes 是管理台「新建渠道」下拉的**可选项**投影（用户裁决 2026-10-27）：
+// `webhook` 是一种地址形态而不是渠道类型（真实接入的只有飞书），因此不出现在可选表里。
+// 它仍留在适配器注册表与写侧校验（`notifyTypeNames`）中：既有 webhook 渠道照常编辑、
+// 测试与发送，前端对不在表内的当前值会补一项，不会把渠道改坏。
+// notifyConsoleTypes hides address-shaped adapters from the console dropdown; the
+// registry and write validation keep accepting them.
+func notifyConsoleTypes() []string {
+	hidden := map[string]bool{"webhook": true}
+	names := notifyTypeNames()
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if !hidden[name] {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // webBudget 把配置的预算段映射成运行预算（约束 35）——与 `cli.chatBudget` 同一口径：

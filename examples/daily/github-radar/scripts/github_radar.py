@@ -149,9 +149,17 @@ def normalize_item(raw: object, index: int) -> dict:
     if isinstance(stars, bool) or not isinstance(stars, int) or stars < 0:
         raise ScriptError(f"{name}: stars 必须是非负整数，实际 {stars!r}")
 
+    # `pushed_at` 是脚本首选的活动时间；实测 github-mcp-server 2.0.3 的
+    # `search_repositories` 默认（minimal_output）只返回 `updated_at`，不返回
+    # `pushed_at`。键缺失或显式 null 时用 `updated_at` 兜底——同一类活动锚，由脚本
+    # 统一处理，模型**不得**手填或改名。键存在但解析不了仍是坏行，不拿另一个时间掩盖。
+    # github-mcp-server 2.0.3's default search omits pushed_at; fall back to
+    # updated_at when the key is missing/null, but never mask an unparseable value.
     pushed_at = raw.get("pushed_at")
+    if pushed_at is None:
+        pushed_at = raw.get("updated_at")
     if not isinstance(pushed_at, str) or parse_timestamp(pushed_at) is None:
-        raise ScriptError(f"{name}: pushed_at 必须是 ISO 8601 时间戳，实际 {pushed_at!r}")
+        raise ScriptError(f"{name}: pushed_at（或兜底 updated_at）必须是 ISO 8601 时间戳，实际 {pushed_at!r}")
 
     url = raw.get("html_url")
     if url is None:
