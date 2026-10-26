@@ -18,17 +18,30 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
+
+// resetOutboundGuard 在用例结束时卸掉进程级守门器（14D T104）：`Run` 会安装它，而
+// 包内测试共用一个进程——后面的用例若还拿受控客户端连本机假服务，会被受保护地址规则
+// 拒掉。生产进程只有一个 `Run`，不存在"卸掉"这条路径。
+// The guard is process-wide; tests calling Run reset it so later cases keep the
+// bare-test-double transport. A production process has exactly one Run.
+func resetOutboundGuard(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { tool.SetNetGuard(nil) })
+}
 
 // TestRun_ExitCodes 验收点（文档用例名同名）：装配骨架是退出码的唯一出口——
 // 成功 0、失败 1，原因由文案区分而不是靠不同退出码堆叠。
 func TestRun_ExitCodes(t *testing.T) {
 	t.Run("成功路径返回 0", func(t *testing.T) {
+		resetOutboundGuard(t)
 		require.Equal(t, 0, Run(context.Background(), []string{"--version"}))
 	})
 
 	t.Run("失败路径返回 1", func(t *testing.T) {
+		resetOutboundGuard(t)
 		require.Equal(t, 1, Run(context.Background(), []string{"no-such-command"}))
 	})
 }
@@ -318,7 +331,7 @@ func TestStartupOrder_PublishedBeforeRegistry(t *testing.T) {
 
 	steps := logSteps(t, fx.logs.String())
 	require.Equal(t, []string{
-		"lock", "open", "migrate", "recover", "baseline", "recovery",
+		"lock", "open", "migrate", "secrets", "recover", "baseline", "recovery",
 		"reconcile", "catalog", "registry",
 	}, steps, "对账必须先于运行目录与注册表（约束 18 的次序即正确性）")
 

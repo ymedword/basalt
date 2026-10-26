@@ -236,16 +236,89 @@
 
 用户 2026-10-26 裁决：Basalt 默认附带五个 Demo 素材，通过独立安装命令按需准备；现有 DBHub 配方按实测 1.5.0 一并修正。追加任务不改既有勾选与编号。
 
-- [ ] T071 [US2] 交付内嵌素材与独立安装命令：`examples/embed.go`（`//go:embed daily shared`）、`internal/cli/demo.go`、`internal/cli/demo_test.go`、`internal/cli/root.go` 注册 `demo install`；在目标工作区写 Demo 目录、`<ws>/demos/install.json` 清单、`<ws>/demos/mcp/dbhub.toml`（`[[sources]]` 指样例库 + `[[tools]] name="execute_sql" readonly=true max_rows=500`）、可直接粘贴的 `mcp_servers.yaml` 片段与逐项待配置提示；两个 GitHub Demo 共用一份 GitHub MCP；`basalt init` 职责不变、模型留空、Demo 停用、安装器不接收也不回显凭据（check `acceptance`）
-- [ ] T072 [US2] 按实测 DBHub 1.5.0 对齐配方与夹具：`examples/daily/biz-daily/**`、`examples/templates/ticket-insights/**`、`internal/catalog/data/mcp_catalog.yaml`（dbhub 改 `--transport stdio` + `--config`，移除已不存在的 `--readonly`；github 增 `--read-only`）、`internal/e2e/us14_demos_test.go` 的 `execute_sql` 夹具与 `demoDBHubEnvelope`、`internal/e2e/us14_templates_test.go` 的 `templateCandidateFaces["dbhub"] = {"execute_sql"}`；只读由服务端实际拒绝写操作验证，业务断言强度不变（check `mcp-catalog` / `demo-fixtures` / `template-quality`）
-- [ ] T073 [US2] 交付凭据获取指引：`examples/README.md` 的 Credentials 节与 github-radar / repo-digest / industry-brief 的 SETUP（官方创建入口、最小只读权限、有效期、套餐或费用要求、`${ENV_VAR}` 本机配置与验证命令、不可达环境的实测声明）；不落盘任何凭据值（check `script-tests`）
-- [ ] T074 [US3] 变更后重跑受影响目标并完整重跑 stage 出 r5（`harness/acceptance/records/us14-release-gate-r5.json` 与 `records/reports/us14-release-gate-r5.json`），逐项四态记录；在 run-state §2.2 登记 DBHub 判据面变更（check `demo-fixtures` / `template-quality` / `e2e` / `acceptance` / `clean-checkout`）
+- [x] T071 [US2] 交付内嵌素材与独立安装命令：`examples/embed.go`（`//go:embed daily shared`）、`internal/cli/demo.go`、`internal/cli/demo_test.go`、`internal/cli/root.go` 注册 `demo install`；在目标工作区写 Demo 目录、`<ws>/demos/install.json` 清单、`<ws>/demos/mcp/dbhub.toml`（`[[sources]]` 指样例库 + `[[tools]] name="execute_sql" readonly=true max_rows=500`）、可直接粘贴的 `mcp_servers.yaml` 片段与逐项待配置提示；两个 GitHub Demo 共用一份 GitHub MCP；`basalt init` 职责不变、模型留空、Demo 停用、安装器不接收也不回显凭据（check `acceptance`）
+- [x] T072 [US2] 按实测 DBHub 1.5.0 对齐配方与夹具：`examples/daily/biz-daily/**`、`examples/templates/ticket-insights/**`、`internal/catalog/data/mcp_catalog.yaml`（dbhub 改 `--transport stdio` + `--config`，移除已不存在的 `--readonly`；github 增 `--read-only`）、`internal/e2e/us14_demos_test.go` 的 `execute_sql` 夹具与 `demoDBHubEnvelope`、`internal/e2e/us14_templates_test.go` 的 `templateCandidateFaces["dbhub"] = {"execute_sql"}`；只读由服务端实际拒绝写操作验证，业务断言强度不变（check `mcp-catalog` / `demo-fixtures` / `template-quality`）
+- [x] T073 [US2] 交付凭据获取指引：`examples/README.md` 的 Credentials 节与 github-radar / repo-digest / industry-brief 的 SETUP（官方创建入口、最小只读权限、有效期、套餐或费用要求、`${ENV_VAR}` 本机配置与验证命令、不可达环境的实测声明）；不落盘任何凭据值（check `script-tests`）
+- [x] T074 [US3] 变更后重跑受影响目标并完整重跑 stage 出 r5（`harness/acceptance/records/us14-release-gate-r5.json` 与 `records/reports/us14-release-gate-r5.json`），逐项四态记录；在 run-state §2.2 登记 DBHub 判据面变更（check `demo-fixtures` / `template-quality` / `e2e` / `acceptance` / `clean-checkout`）
 
 ## Phase 8: 源码单一事实源与制品级安装验收（2026-10-26 第二轮裁决）
 
 用户 2026-10-26 追加裁决：`go:embed` 跨不过嵌套 module，`docs-readonly` 并回主 module；安装器必须实际导出源码并保留独立构建体验；新增制品级验收。追加任务不改既有勾选与编号；T071 / T074 正文里的 `acceptance` 为早期 check 名（该 check 已于 2026-10-25 因独占锁移除），实际映射以 stage 的 `demo-installer` / `stage-lint` / `release-records` 为准。
 
-- [ ] T075 [US2] `docs-readonly` 并回主 module 并保持源码单一事实源：删除 `examples/shared/mcp/docs-readonly/go.mod`，`//go:embed daily shared` 覆盖其源码；安装器把源码导出到 `<ws>/demos/src/docs-readonly` 并生成最小 `go.mod`（`module basalt-docs-readonly` + `go 1.27`）与 `deps/` 目录；`examples/embed.go`、`Makefile` 的 `example-tests`、`internal/e2e/us14_demos_test.go` 的 `go build` 随主 module 调整；素材仍纯标准库、零第三方依赖、不被产品二进制导入、仍作为独立 MCP 进程运行（check `docs-readonly-tests` / `demo-installer` / `go-build`）
-- [ ] T076 [US2] 增加安装器回归断言：源码导出与生成的 `go.mod` 内容、`<ws>/demos/deps` 目录、报告中的实际路径与按路径渲染的构建命令、Agent 目录内不再有 `skills/` 副本而 `<ws>/skills/<skill>` 存在、既有 `basalt.yaml` / `mcp_servers.yaml` 逐字节不变、凭据提示指向本次选中 Demo 的 SETUP（check `demo-installer`）
-- [ ] T077 [US3] 增加制品级验收 `internal/e2e/us14_demo_install_test.go`：只用构建后的二进制与已声明的 Go 工具链，在临时工作区执行 `basalt init` → `basalt demo install --demo docs-diff`，按报告打印的命令原样构建导出源码，再用真实 MCP 客户端完成连接、工具发现（三件套）与一次 `read_document` 正文读取（check `demo-fixtures` / `e2e`）
-- [ ] T078 [US2] 同步判定口径与事实：`spec.md` FR-018 / FR-019 + SC-013；模块卡 C-16 / §3.1.8 / §3.10 / §5.3 / §6.10（J-11 / J-12）与 Q-03；`plan.md` / `research.md` / `quickstart.md`；仓库正文 Requirements / TechnicalDesign / Operations / DevelopmentLoop；`examples/**` 文档（biz-daily / docs-diff / ticket-insights / onboarding-buddy / repo-digest / examples/README）；删除全部 `--readonly` 与"嵌套 module"旧口径并保留实测声明（check `docs-consistency` / `mcp-catalog` / `demo-fixtures` / `template-quality`）
+- [x] T075 [US2] `docs-readonly` 并回主 module 并保持源码单一事实源：删除 `examples/shared/mcp/docs-readonly/go.mod`，`//go:embed daily shared` 覆盖其源码；安装器把源码导出到 `<ws>/demos/src/docs-readonly` 并生成最小 `go.mod`（`module basalt-docs-readonly` + `go 1.27`）与 `deps/` 目录；`examples/embed.go`、`Makefile` 的 `example-tests`、`internal/e2e/us14_demos_test.go` 的 `go build` 随主 module 调整；素材仍纯标准库、零第三方依赖、不被产品二进制导入、仍作为独立 MCP 进程运行（check `docs-readonly-tests` / `demo-installer` / `go-build`）
+- [x] T076 [US2] 增加安装器回归断言：源码导出与生成的 `go.mod` 内容、`<ws>/demos/deps` 目录、报告中的实际路径与按路径渲染的构建命令、Agent 目录内不再有 `skills/` 副本而 `<ws>/skills/<skill>` 存在、既有 `basalt.yaml` / `mcp_servers.yaml` 逐字节不变、凭据提示指向本次选中 Demo 的 SETUP（check `demo-installer`）
+- [x] T077 [US3] 增加制品级验收 `internal/e2e/us14_demo_install_test.go`：只用构建后的二进制与已声明的 Go 工具链，在临时工作区执行 `basalt init` → `basalt demo install --demo docs-diff`，按报告打印的命令原样构建导出源码，再用真实 MCP 客户端完成连接、工具发现（三件套）与一次 `read_document` 正文读取（check `demo-fixtures` / `e2e`）
+- [x] T078 [US2] 同步判定口径与事实：`spec.md` FR-018 / FR-019 + SC-013；模块卡 C-16 / §3.1.8 / §3.10 / §5.3 / §6.10（J-11 / J-12）与 Q-03；`plan.md` / `research.md` / `quickstart.md`；仓库正文 Requirements / TechnicalDesign / Operations / DevelopmentLoop；`examples/**` 文档（biz-daily / docs-diff / ticket-insights / onboarding-buddy / repo-digest / examples/README）；删除全部 `--readonly` 与"嵌套 module"旧口径并保留实测声明（check `docs-consistency` / `mcp-catalog` / `demo-fixtures` / `template-quality`）
+
+## Phase 9: 14D-1 实例加密初始化、首次入口与访问密码（P1 + P2）
+
+2026-10-26 用户显式范围增量。追加任务不改既有勾选与 T001–T078 编号；判据见 `spec.md` 的 14D 段（FR-027–FR-031、FR-044；A1–A12、F1–F9）与模块卡 `docs/us/us-draft-openbox.md`。
+
+- [x] T079 [US4] 建迁移 `0006_execution_policy_and_mcp_credentials.sql`：重建 `credentials`（`owner_kind` 加 `mcp_server`、新增 `binding_key`、唯一约束改 `(owner_kind, owner_uid, binding_key)`），新建 `execution_policy` / `network_exceptions` / `instance_secrets` / `mcp_credential_sources`；`SUPPORTED_SCHEMA_VERSION` 5 → 6；同步 `docs/contracts/schema.sql`（`PRAGMA user_version = 6`）（check `schema-v6`）
+- [x] T080 [US4] 迁移测试：v5 夹具库升级到 v6 后表结构、索引与数据行数不变，`owner_kind` 新 CHECK 生效，重复执行幂等（check `schema-v6`）
+- [x] T081 [US4] `internal/storage` 的 `NetworkDomainPolicyStore` 改为按 `policy_scope` 读写（`Load` / `Seed` / `Update` 加 scope 参数），既有 `http.allowed_domains` 行迁移后行为不变（check `schema-v6`）
+- [x] T082 [US4] `docs/contracts/openapi.yaml` 落 9 个新端点与 4 处扩展，新枚举 `execution_profile` / `secret_state` / `credential_key_state` / `credential_source` / `mcpserver_dependency` / `apply_outcome` / `apply_failure_class`（check `contracts-14d`）
+- [x] T083 [US4] `docs/contracts/run-and-errors.md` 落新错误码 `SECRETS_RECOVERY_REQUIRED` / `EXECUTION_PROFILE_MISMATCH` / `MCP_APPLY_FAILED` / `MCP_APPLY_SUPERSEDED`（409）与动作 `network_denylist.update` / 目标类型 `network_denylist`（check `contracts-14d`）
+- [x] T084 [US4] 契约测试：新枚举与 Go 字面量一一对应，`schema.sql` 与迁移后的实际结构一致（check `contracts-14d`）
+- [x] T085 [US4] 新增 `internal/app/instance_secrets.go`：三态状态机 `uninitialized` / `ready` / `recovery_required`，`instance_secrets` 记录读写，审计预写（check `secrets-init`）
+- [x] T086 [US4] 原子密钥发布：受限目录 → 临时链接 `O_CREAT|O_EXCL` → `os.Link` 发布 → unlink 临时 → 完整 `LoadMasterKey` 读回；不支持硬链接的文件系统退化为 `O_EXCL` 直写；失败回滚到未初始化（check `secrets-init`）
+- [x] T087 [US4] 初始化残留恢复：实例锁内按「`<final>` 缺失 / `nlink == 1` / `nlink > 1` 且 `SameFile` / 其余」四分支处理，只有可证明来源的临时链接被清理，否则 `SECRETS_RECOVERY_REQUIRED` 且不删文件、不放宽 `nlink > 1` 检查（check `secrets-init`）
+- [x] T088 [US4] 平台权限先于写入：Unix `MkdirAll` → `Chmod 0700` → stat 读回；Windows `CreateDirectory` + `SECURITY_ATTRIBUTES`（受限 DACL 创建即生效）→ `GetNamedSecurityInfo` 读回；校验通过前不创建任何文件（check `secrets-init`）
+- [ ] T089 [US4] 新实例判定与首次配置生成：`<工作区>/.basalt/basalt.db` 与 `instance.json` 均不存在才视为新实例；在 `cli.LoadConfig` **之前**生成最小可用 `basalt.yaml`（`budget.max_iterations ≥ 30`），已存在则一字节不改；存量无配置实例不生成（check `secrets-init`）
+- [x] T090 [US4] 访问密码文件来源：`mode: token` 省略 `token` 时读 `<实例私有目录>/admin-token`（与主密钥分文件、同目录保护）；三来源全缺 → 启动失败点名，禁止回落 `local_trust`；非 TTY 只输出路径、交互式仅首次显示值（check `admin-login`）
+- [x] T091 [US4] `basalt secrets init|status|verify|revoke-managed` 与初始化提示接入既有 CLI；`auto_init: false` 保持纯 env 实例（check `secrets-init`）
+- [x] T092 [US4] 测试 A1–A12：首次生成、缺文件 / `key_id` 不符、并发唯一胜出、记录写失败后 adopt、存量不自动、无记录有密文、拒绝覆盖、双实例隔离、发布残留、来源不可证明、权限先于写入（check `secrets-init`）
+- [x] T093 [US4] 测试 F1–F9：401 与 `next`、正确 / 错误密码、四件文案、无持久会话、无默认密码常量、密码文件来源、非 TTY 不打印值、交互仅一次、文件与主密钥分离（check `admin-login`）
+
+## Phase 10: 14D-2 MCP 凭据来源与受控 apply（P3）
+
+- [x] T094 [US5] `mcp_credential_sources` 存储与 `credentials.binding_key` 接线：每个占位符独立版本与撤销；保存请求加 `credentials: [{key, value, mode}]`，响应只回 `credential_keys: [{key, mode, state, last4}]`（check `mcp-credential`）
+- [x] T095 [US5] 来源显式解析：`managed` 缺失 / 已撤销 / 解密失败时**不读**进程环境，`env` 只读环境；普通编辑不清除已托管值；空串拒绝（check `mcp-credential`）
+- [x] T096 [US5] env 闸门扩展：`http.headers` 的 `${VAR}` 与 `env` 同一闸门（503 + `operation_id`、零写入）；`args` 含 `${` 的新增 / 修改 400 拒绝并点名位置，存量条目诊断报 `args_placeholders_not_resolved`（check `mcp-credential`）
+- [x] T097 [US5] 认证头装配与传输安全：`Authorization` → `Bearer <value>`、其它头原样、不推断不去重；跨主机重定向丢弃认证头；响应 / 日志 / 审计无值（check `mcp-credential`）
+- [x] T098 [US5] 撤销即时生效：撤销后调用拒绝发出（不是发出后 401），回收关联 stdio 进程树 / HTTP 会话，不等 `apply`；运行记录标明使用了已撤销版本（check `mcp-apply`）
+- [x] T099 [US5] `POST /api/v1/mcp-servers/{name}/apply`：预写 pending 审计、`If-Match`、单 server 重建、排空窗口、失败保持 `applied`、并发记 `superseded`（409）并撤回候选注册与连接（check `mcp-apply`）
+- [x] T100 [US5] 诊断新增 `dependency` 轴（`ready` / `missing` / `version_mismatch`）与 `references` 轴（引用该 server 的 Agent），不启动进程、不写操作行（check `mcp-credential`）
+- [x] T101 [US5] 测试 B1–B8：无明文、按键版本、撤销不回落、编辑保托管、headers 闸门、args 拒绝、来源显式、Bearer 装配（check `mcp-credential`）
+- [x] T102 [US5] 测试 C1–C8：只换目标、失败保 `applied`、排空、旧 Run 快照、预检拒绝、`superseded`、CAS 回滚、撤销即时（check `mcp-apply`）
+
+## Phase 11: 14D-3 执行环境两档、基础防护、禁止域名与例外（P4）
+
+- [x] T103 [US5] `execution_policy` 存储与装配：`profile` / `revision` / `operation_id`；YAML 只作种子，运行期以库为准；`PUT /api/v1/execution-policy` 带 `If-Match` 与预写审计（check `execution-profile`）
+- [x] T104 [US5] 新增 `internal/tool/netguard.go`：解析 → 分类 → 固定实拨地址；双栈任一受保护段即拒；`Host` / SNI 保持原域名；不跨目标复用；3xx 不跟随；忽略代理环境变量；`http.proxy` 时固定代理并标注目标由代理解析（check `execution-profile`）
+- [x] T105 [US5] 基础防护四项在两档一致：DNS 解析结果校验、连接固定、忽略代理环境变量、shell 名称集合（`zsh` / `dash` / `ksh` / `fish` / `csh` / `tcsh` / `busybox` / `powershell` / `pwsh` / `cmd` 的全路径与带扩展名形式一律拒，`Policy` 与 `Runner` 两层都判）（check `execution-profile`）
+- [x] T106 [US5] 两档授权差异：`standard` 放行未命中禁止域名的公网域名，`strict` 只放行白名单；程序目录放行需清单登记 + 真实路径在 `runtime/**` + 保护状态生效三项同时满足；`.cmd` / `.bat` 不按扩展名豁免（check `execution-profile`）
+- [x] T107 [US5] 禁止域名与网络例外：`http.denied_domains` 复用 `network_domain_policy` 第二行，`*.example.com` 不匹配裸域名，保存后下一次判定即生效；例外 `note` 必填、写审计、删除立即失效；云元数据地址即使加例外也拒（check `execution-profile`）
+- [x] T108 [US5] 存量迁移：v5 → v6 一律 `strict`（含白名单为空），生成两组待确认项（解析到受保护地址段的白名单条目、命中新 shell 名称的命令条目），逐条「加例外」/「保持拒绝」写审计，未确认不放行（check `execution-profile`）
+- [x] T109 [US5] 测试 D1–D12：标准档基线、授权等价、程序目录三条件、写面拒绝、例外表、迁移、shell 集合、两档一致、`.cmd` 不豁免、禁止域名、存量待确认、受控拨号（check `execution-profile`）
+- [x] T110 [US5] `GET /api/v1/sandbox` 扩展 `execution_profile` 与 `denied_domains`（值、来源、修订号、ETag）；`PUT /api/v1/sandbox/denied-domains` 与 `GET|POST|DELETE /api/v1/network-exceptions` 落地（check `execution-profile`）
+
+## Phase 12: 14D-4 五个内置 Agent 与完整包（P5）
+
+- [x] T111 [US4] 五个内置 Agent 目录与 `AGENT.md`（`biz-daily` / `docs-diff` / `github-radar` / `industry-brief` / `repo-digest`，与 `examples/daily/` 目录名逐字一致）：停用状态、技能声明式绑定、预算声明，目录内无凭据；`industry-brief` 的工具声明为 `web_search` + Fetch（见 Phase 14）（check `builtin-agent`）
+- [x] T112 [US4] 安装器自动发布免凭据 MCP：`docs-readonly` 与 DBHub 在干净安装后已写入并发布；需要凭据的 GitHub **不预写**（Brave 不再被任一内置 Agent 使用，见 Phase 14 与 §2.5.4 裁决）（check `builtin-agent`）
+- [x] T113 [US4] 凭据就绪后由系统写入并发布对应 MCP 条目，用户不需要手动添加；无关 Agent 不受影响（check `builtin-agent`）
+- [x] T114 [US4] 启用门禁与预算兼容：缺模型连接或所需凭据 → 启用被拒并给出待补项与跳转，通知渠道缺失不阻止；`settings.max_iterations` 超实例上限只点名不改配置；计划可能超出并发上限时提示（check `builtin-agent`）
+- [x] T115 [US4] 启动隔离：缺一个凭据或一个 server 连不上时 `serve` 仍成功，该 Agent / server 显示未就绪，其余照常（check `builtin-agent`）
+- [x] T116 [US4] 测试 E1–E10：五 Agent 停用、自动发布、隔离、夹具端到端、停用不排期、缺配置阻止启用、新实例预算预设、预算兼容、配置本次生效、存量无配置不放宽（check `builtin-agent`）
+- [x] T117 [US4] 完整包构建与 Windows 实际安装验证：解压 → 首次启动 → 登录 → 依赖就位，体积实测并记录（check `full-package`）
+- [x] T118 [US4] 完整包 WSL2 Ubuntu 实际安装验证：必须运行 Linux 产物，并在 Linux 文件系统内验证权限 / 锁 / 进程行为（check `full-package`）
+
+## Phase 13: 14D 页面收口与文档同步（P6 + P7）
+
+- [x] T119 [US5] 执行环境页：档位切换、禁止域名、例外表、两组待确认项（check `console-test` / `console-build`）
+- [x] T120 [US5] MCP 六轴与凭据表单：托管 / env 来源选择、状态与尾号、撤销、apply 与在途结果（check `console-test` / `console-build`）
+- [x] T121 [US4] Agent 三段视图与实例加密两行；登录页四件文案固定（check `console-test` / `console-build` / `admin-login`）
+- [x] T122 [US4] O1 升级影响清单：用可复现 v5 夹具覆盖迁移，真实实例升级前跑只读检查并输出影响清单，逐条受控确认；**不得**改当前实例凑证据（check `docs-consistency`）
+- [x] T123 [US4] 事实同步：`docs/Requirements.md`、`docs/TechnicalDesign.md`、`docs/Operations.md`、`docs/Compatibility.md` 与实现一致（含新端点、枚举、错误码、`secrets` 子命令、两档、访问密码文件、出网边界）（check `docs-consistency`）
+- [x] T124 [US4] 14D 收口：`go run ./scripts/acceptance --lint-stages --stage harness/stages/us14-14d.json` 通过，按 stage 全量跑并写入 run-state；独立复核与未覆盖面清单；US-14 review ② 与 14D 证据**分开**记录（check `stage-lint`）
+
+## Phase 14: 14D-4 补充——行业简报搜索通道改 DeepSeek Search API（2026-10-26 用户裁决）
+
+取代 `spec.md` FR-014 中 D5 的搜索来源（FR-045）。其余四个 Agent 与通用 MCP 管理方案不变；14B 已交付的 D5 证据保留为历史。
+
+- [x] T125 [US4] 新增 `internal/tool/websearch.go`：DeepSeek 官方 Search API 客户端（纯 `net/http`，零新增 Go 坐标），`POST https://api.deepseek.com/v1/tools/search`，请求 `{query, count}` 且 `need_content=false`，结果映射 `title` / `url` / `snippet` / `summary` / `date` / `rerank_score` / `authority`；错误分类复用既有 `failure_class`，仅 408 / 429 / 5xx 有限重试（最多 2 次）；`docs/contracts/agent-md.md` 的内置工具清单加 `web_search`（check `web-search`）
+- [x] T126 [US4] 搜索凭据经**既有凭据解析服务**取该 Agent 绑定的 DeepSeek 模型连接，工具参数不接受密钥、不新增读取路径；一次搜索计一次工具调用，先写 `pending` 审计、返回后写终态；搜索失败时来源表留空、不编造（check `web-search`）
+- [x] T127 [US4] `industry-brief` 的 Agent 配置与 SETUP 改用 `web_search` + Fetch，移除 `BRAVE_API_KEY` 要求；`examples/daily/industry-brief/**`、`examples/README.md` 的凭据指引同步；Brave 目录配方与其余四个 Agent 不变（check `builtin-agent`）
+- [x] T128 [US4] 测试：成功解析字段、未配置 Brave 仍可运行、429 有限重试且计次、401 不重试、密钥不入日志 / 审计 / 响应、计入 `max_tool_calls`、失败不编造来源（check `web-search`）
+- [x] T129 [US4] 文档与事实同步：`examples/daily/industry-brief/README.md` 与 SETUP、`docs/Operations.md` 出网边界（`api.deepseek.com`）、14D 的 D5 口径；记录官方 schema 逐字段核对结果，核对前不写死契约字面量（check `docs-consistency`）

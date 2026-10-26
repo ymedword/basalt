@@ -97,6 +97,11 @@ type SandboxViolationError struct {
 	Rule     string // 段 1 规则：哪条策略拒的（白名单 / 保护规则 / 跨 Agent 授权…）
 	Target   string // 段 2 越界值：被拒的具体目标（路径 / 可执行名 / URL）
 	Guidance string // 段 4 放行指引：点名配置键 + 需重启
+	// Reason 是 `sandbox_denied` 的细分原因（14D 契约 `policy_denial_reason`）：只对
+	// 出网面四类填写，其余沙箱拒绝留空（空串 = 不细分，不是第五类）。
+	// Reason refines an outbound denial into the four contract reasons; other sandbox
+	// refusals leave it empty, which means "not subdivided" rather than a fifth value.
+	Reason PolicyDenialReason
 }
 
 // Error 拼出四段式文案（段 3 是固定句，不参与拼接决策）。
@@ -313,6 +318,13 @@ var (
 	// ErrPolicyRevisionConflict marks a lost revision CAS; the write fails closed and
 	// never overwrites the value that won.
 	ErrPolicyRevisionConflict = errors.New("policy revision conflict")
+
+	// ErrExecutionProfileMismatch 表示请求里的 `expected_profile`（客户端渲染确认框时
+	// 看到的档位）与库内当前档位不一致：`If-Match` 不能代替它——用户确认的是"从 X 切到
+	// Y"这个方向，方向已经不成立就必须停下。web 映射 409 `EXECUTION_PROFILE_MISMATCH`。
+	// ErrExecutionProfileMismatch stops a stale confirmation dialog from silently
+	// applying a direction the user never saw.
+	ErrExecutionProfileMismatch = errors.New("execution profile mismatch")
 )
 
 // AdminError 把管理写面分类与结构化 `data` 绑定：错误信封的 `data` 只承载契约固定

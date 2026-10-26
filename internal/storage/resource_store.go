@@ -180,6 +180,46 @@ func (s *ResourceStore) Publish(ctx context.Context, kind core.ResourceKind, res
 	return nil
 }
 
+// CASApplied 是受控重建（`mcp_server.apply`）的指针提交：只有在发布指针仍指向
+// `expectedPublished`、实际生效指针仍等于 `expectedApplied` 且资源未被删除时，才把
+// `applied_version_id` 推进到 `target`。三项期望值来自第 1 步冻结的读数——任何一个
+// 在此期间变了（publish / 另一代配置 / revoke / 删除），本次切换都必须丢弃（契约第 6 步）。
+//
+// 返回 `(false, nil)` 表示"期望不成立"而**不是**错误：调用方据此走 superseded 分支，
+// 与写失败（数据库层错误）区分开。
+// CASApplied commits the applied pointer only while all three expectations still hold.
+// A false result with a nil error means "expectation missed", not a storage failure.
+func (s *ResourceStore) CASApplied(ctx context.Context, kind core.ResourceKind, resourceID string,
+	expectedPublished, expectedApplied, target int64, operationID string, now time.Time,
+) (bool, error) {
+	if err := validateResourceKind(kind); err != nil {
+		return false, err
+	}
+	if resourceID == "" {
+		return false, errors.New("应用资源版本: resource_id 不能为空")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	result, err := s.db.write.ExecContext(ctx,
+		`UPDATE resource_pointers
+		    SET applied_version_id = ?, revision = revision + 1, updated_at = ?, operation_id = ?
+		  WHERE resource_kind = ? AND resource_id = ?
+		    AND published_version_id = ?
+		    AND COALESCE(applied_version_id, 0) = ?
+		    AND deleted_at IS NULL`,
+		target, now.UnixMilli(), operationID, string(kind), resourceID,
+		expectedPublished, expectedApplied)
+	if err != nil {
+		return false, fmt.Errorf("应用资源版本 %s/%s: %w", kind, resourceID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("应用资源版本 %s/%s: 读取影响行数: %w", kind, resourceID, err)
+	}
+	return affected == 1, nil
+}
+
 // PublishWithVersion 在**同一事务**内追加版本行、更新发布指针并回填操作终态
 // （US-12 的发布 / 撤回路径）：版本、指针与操作状态不会出现中间态。版本**总是**
 // 新插入一行（撤回 = 用旧内容建新版本）；指针写失败时版本行与终态一起回滚。

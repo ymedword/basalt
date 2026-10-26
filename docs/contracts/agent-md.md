@@ -94,7 +94,7 @@ schedules:
 | 1 | `name` 等于目录名 | WARN `name mismatch` |
 | 2 | `provider.name` 在**已发布 Provider 版本表**里（`resource_pointers` 有未删除的发布版本） | WARN `provider version missing: <name>` |
 | 3 | `provider.model` 非空白 | WARN `blank model` |
-| 4 | `tools` 里每个名字都能解析（内置 10 个 / MCP / 代码内注册） | WARN `tool not registered: <name>` |
+| 4 | `tools` 里每个名字都能解析（内置 11 个 / MCP / 代码内注册） | WARN `tool not registered: <name>` |
 | 5 | `skills` 里每个名字在技能库有实体（加载期），且存在**已发布版本**（注册装配期） | 无实体 → WARN `skill not found: <name>`；有实体但无已发布版本 → WARN `skill version missing: <name>[, <name>…]`（多个缺失名按升序、以逗号加空格连接，一条 WARN 点名该 Agent 的全部缺失技能） |
 | 6 | `mcp_servers` 里每个名字有**实际生效**的版本（待重启内容不算）且连接成功 | WARN `mcp server skipped: <name>` |
 | 7 | `bootstrap` 里每个文件存在 | WARN `bootstrap file missing` |
@@ -331,7 +331,7 @@ type ToolCall struct {
 
 ---
 
-## 5. 内置工具契约（10 个）
+## 5. 内置工具契约（11 个）
 
 工具名与参数名是**模型可见契约**：改字面量等于改调用方式。
 
@@ -476,6 +476,42 @@ type ToolCall struct {
 **作用域硬边界**：只能改**当前 Agent 自己**的 `schedules:` 段（身份取自运行时上下文，**不**来自入参）；无 Agent 上下文一律拒绝。改动经与页面编辑器、脚手架创建**同一道**注册写入门（先验后写），不另立解析路径。
 
 > 该工具属于 Basalt v0.1 的任务管理能力：只修改当前 Agent 的 `schedules:`，与页面编辑器共用写入校验。声明该工具但注册池没有它时，该 Agent 以 `tool not registered` 整只不注册。
+
+### 5.7 SearchTools（1 个）
+
+#### web_search
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `query` | string | 是 | 搜索词：1–128 个 Unicode 字符，**不得全为空白**（去空白后判）；支持官方查询运算符（`site:` / `-site:` / `lang:` / `after:` / `before:` 等），工具不解析、原样转发 |
+| `count` | int | 否 | 返回条数：1–50，**省略 = 10**（与官方缺省一致）；超出区间按 `invalid_input` 拒绝，不静默夹取 |
+
+返回：JSON 正文 `{"query": "<回显的查询原文>", "results": [...]}`，`results` **恒为数组**
+（无命中写 `[]`，不写 `null`）。每条结果**七个字段恒在**：`title` / `url` / `snippet` /
+`summary` / `date`（官方 `date` 为 `null` 时写空串，**不**补日期）/ `rerank_score` /
+`authority`（`-1` = 官方未给出）。
+失败：`invalid_input`（入参解码 / 取值不合规，**零外呼、零凭据解析**）/ `sandbox_denied`
+（目标域名未放行、或受控拨号在**建连之前**拒绝）/ `timeout`（请求或重发退避期间 ctx 结束）/
+`external_error`（非 2xx、响应超 1 MiB、响应解析失败、传输失败）。
+
+**凭据与判定（不得违反）**：
+
+- **凭据只经既有凭据解析服务**：取该 Agent **已绑定的模型连接**当前凭据（当前实现为
+  DeepSeek 连接的 Key），每次调用重新解析、**不缓存**；参数面**不接受**密钥，
+  **不得**新增第二条读取路径。凭据缺失 / 解析为空一律失败关闭。
+- **判定归 `core.Policy`**：动作类型为 HTTP 请求，目标恒为编译期常量端点
+  `https://api.deepseek.com/v1/tools/search`；**每次外呼各判一次**（重发也算一次）。
+  严格档需在域名白名单放行 `api.deepseek.com`；标准档按既有档位语义放行。
+- **请求体固定**：`{query, count, need_content: false}`——本工具只给摘要与链接，正文
+  由 `http_get` 或 Fetch 等抓取通道另取，工具不代抓、不返回正文。
+- **有界重试**：仅 408 / 429 / 5xx 重发，**最多 2 次**（三次尝试），退避 200 ms 起、
+  逐次翻倍且受 ctx 约束；401 / 402 / 403 / 404 及其余 4xx **不重试**。
+- **计次与审计**：一次 `web_search` 调用 = 一次工具调用 = **一条**审计行（重发不另计），
+  与其余内置工具共用 `pending` → 终态的两阶段写；结果进入 `max_output_bytes` 截断。
+
+> 本工具是 US-14 的 14D 增量（2026-10-26 裁决）。字段名与错误码的官方核对记录见
+> `specs/014-templates-demos-release/run-state.md`。官方限流口径以官方文档为准；
+> 契约不声明 QPS 数值。
 
 ---
 

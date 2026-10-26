@@ -302,15 +302,16 @@ func contractErrorCodes(t *testing.T) map[string]string {
 	return contract
 }
 
-// TestContract_ErrorCodes 逐个断言本包产生的 30 个错误码及其 HTTP 状态（§6.3 /
+// TestContract_ErrorCodes 逐个断言本包产生的 34 个错误码及其 HTTP 状态（§6.3 /
 // run-and-errors §8，含 LIMIT_REACHED 与 R4 的凭据 / 范围 / 绑定码，不含 OK），并把
 // envelope.go 的常量集合与契约表逐条对账（等价于模块卡 §6.3 行 2247 的 grep 判据）。
 // 判据面沿革（记录在 run-state）：T016 把 US-11 的集合扩到 18 个码；R4 修订把契约表
-// 扩到 30 行后，本用例同批扩到 30——对账口径（不得多、不得少、不得改字面量）**原样
+// 扩到 30 行后，本用例同批扩到 30；14D 契约把密钥三态 / 执行环境 / MCP 受控发布
+// 四行并入 §8 后扩到 34——对账口径（不得多、不得少、不得改字面量）**原样
 // 保留**，适配是扩大期望集合，不是删除断言。
 // 逆改点：新增一个未入契约的码常量 / 改错某个码字面量 / 从契约表删掉任一码 →
 // 表比对或常量比对红。
-// The 30 codes this package produces must equal the contract table both by literal
+// The 34 codes this package produces must equal the contract table both by literal
 // and by HTTP status; the constant set in envelope.go is reconciled the same way.
 func TestContract_ErrorCodes(t *testing.T) {
 	contract := contractErrorCodes(t)
@@ -345,6 +346,10 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeAgentCopyBlocked", codeAgentCopyBlocked, "409"},
 		{"codeResourceScopeInUse", codeResourceScopeInUse, "409"},
 		{"codeCredentialOwnerMismatch", codeCredentialOwnerMismatch, "409"},
+		{"codeSecretsRecoveryRequired", codeSecretsRecoveryRequired, "409"},
+		{"codeExecutionProfileMismatch", codeExecutionProfileMismatch, "409"},
+		{"codeMCPApplySuperseded", codeMCPApplySuperseded, "409"},
+		{"codeMCPApplyFailed", codeMCPApplyFailed, "500"},
 		{"codePreconditionFailed", codePreconditionFailed, "412"},
 		{"codeTooManyRuns", codeTooManyRuns, "429"},
 		{"codeAuthRateLimited", codeAuthRateLimited, "429"},
@@ -353,7 +358,7 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeCredentialUnavailable", codeCredentialUnavailable, "503"},
 		{"codeTimeout", codeTimeout, "504"},
 	}
-	require.Len(t, produced, 30, "本包产生契约 §8 的全部 30 个错误码（不含 OK）")
+	require.Len(t, produced, 34, "本包产生契约 §8 的全部 34 个错误码（不含 OK）")
 
 	byCode := make(map[string]string, len(produced))
 	byName := make(map[string]string, len(produced))
@@ -713,7 +718,8 @@ func TestOpenAPI_ManifestViewPropertiesMatchContract(t *testing.T) {
 
 // TestOpenAPI_McpServerViewPropertiesMatchContract 钉住 MCP 只读视图的字段集与契约
 // 完全一致，并验证 pending_restart=true 的载荷仍满足 schema（约束 29 / 约束 35）：
-// 视图只回可执行名与变量名，不回参数或环境变量值。
+// 视图只回可执行名与变量名，不回参数、环境变量值或凭据值（`credential_keys.last4`
+// 之外不出现任何凭据片段）。
 // 逆改点：漏 pending_restart、多回 args 或 env 值 → 属性集红。
 func TestOpenAPI_McpServerViewPropertiesMatchContract(t *testing.T) {
 	doc := readContractDoc(t, "openapi.yaml")
@@ -723,6 +729,8 @@ func TestOpenAPI_McpServerViewPropertiesMatchContract(t *testing.T) {
 		Transport:          "stdio",
 		Command:            "mcp-search",
 		EnvKeys:            []string{"SEARCH_TOKEN"},
+		HeaderKeys:         []string{},
+		CredentialKeys:     []McpCredentialKeyView{{Key: "SEARCH_TOKEN", Mode: "managed", State: "managed", Last4: "9f3c"}},
 		Connected:          true,
 		Tools:              []string{"search"},
 		PublishedVersionID: 22,
@@ -736,6 +744,7 @@ func TestOpenAPI_McpServerViewPropertiesMatchContract(t *testing.T) {
 	}
 	require.True(t, view.PendingRestart, "新版本已发布但进程仍用旧版本 → 需重启")
 	requireViewMatchesSchema(t, doc, "McpServerView", view)
+	requireViewMatchesSchema(t, doc, "McpCredentialKeyView", view.CredentialKeys[0])
 }
 
 // TestOpenAPI_McpPendingRestartDerived 钉住"需重启"的推导规则（注 18 / D-09）：
@@ -836,7 +845,8 @@ func TestOpenAPI_ViewEnumsMatchGoLiterals(t *testing.T) {
 		contractEnum(t, doc, "OperationView", "target_kind"),
 		acceptedBy([]string{
 			"", "agent", "schedule", "model_connection", "mcp_server", "skill", "notify_channel",
-			"network_allowlist", "system", "provider", "mcp", "schedule_trigger",
+			"network_allowlist", "network_denylist", "execution_policy", "network_exception", "system",
+			"provider", "mcp", "schedule_trigger",
 		}, validOperationTargetKind),
 		"OperationView.target_kind 的接受集合必须等于契约枚举")
 
@@ -975,7 +985,8 @@ func TestContract_PersistenceShapeNotSerialized(t *testing.T) {
 
 // TestContractAdmin_NewErrorCodes 是 T016 的必备锚点（check `012-web-etag-routes`）：
 // R3 阶段 US-12 **唯一**新增的码是 IMPORT_REJECTED，且在契约 §8 里是 400；R4 修订
-// 又把凭据 / 范围 / 绑定的十条并入契约表，本用例的常量数量随之到 30。两轮都遵守同
+// 又把凭据 / 范围 / 绑定的十条并入契约表，本用例的常量数量随之到 30；14D 契约再并入
+// 密钥三态 / 执行环境 / MCP 受控发布四行到 34。各轮都遵守同
 // 一条纪律：US-11 已产出的码 HTTP 状态不漂移（M6 的复用清单），envelope.go 的常量
 // 声明集合与契约表（OK 除外）**逐条**对上，不得出现未入契约的码，也不得少一条。
 // 逆改点：改 IMPORT_REJECTED 的状态 / 字面量 / 再加一个码常量 / 删契约行 → 红。
@@ -1021,7 +1032,7 @@ func TestContractAdmin_NewErrorCodes(t *testing.T) {
 	}
 	require.Equal(t, "OK", declared["codeOK"])
 	delete(declared, "codeOK")
-	require.Len(t, declared, 30, "R4 落地后错误码常量恰为契约 §8 的 30 个")
+	require.Len(t, declared, 34, "14D 契约落地后错误码常量恰为契约 §8 的 34 个")
 
 	declaredByCode := make(map[string]string, len(declared))
 	for _, code := range declared {

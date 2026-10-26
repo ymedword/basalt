@@ -210,6 +210,13 @@ type resourceEnv struct {
 	logger     *slog.Logger
 	logs       *bytes.Buffer
 
+	// 14D 起 MCP 保存必须显式声明每个占位符的来源；夹具因此也装配真实的凭据服务，
+	// 用例可直读来源声明与托管状态（T101 / B1–B8）。
+	// Since 14D every MCP placeholder needs an explicit source, so the fixture carries
+	// the real credential service.
+	mcpCredentials *MCPCredentialService
+	masterKeyFile  string
+
 	mu       sync.Mutex
 	failNext error
 }
@@ -235,19 +242,36 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 	})
 	logger, logs := newCapturedLogger()
 
+	// 主密钥放在工作区**之外**：`root` 同时是 MCP 定义文件的根（`ParseMCPServers(root)`），
+	// 密钥落在 `root/secrets` 会被 `LoadMasterKey` 按"不得放进工作区"拒绝——真实部署
+	// 也是这条纪律。第二份 `t.TempDir()` 与 `root` 同级，既不互相包含又不跨到别的用例。
+	// The master key lives outside the workspace root, mirroring production: root doubles
+	// as the definition root here, so the key sits in a sibling temp directory.
+	masterKeyFile := writeMasterKeyFile(t, t.TempDir(), "k_mcp", testMasterKey().Key)
+	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
+		Credentials:   storage.NewCredentialStore(db),
+		Sources:       storage.NewMCPCredentialSourceStore(db),
+		MasterKeyFile: masterKeyFile,
+		WorkspaceRoot: root,
+		Logger:        logger,
+	})
+	require.NoError(t, err)
+
 	env := &resourceEnv{
-		t:          t,
-		root:       root,
-		configPath: configPath,
-		dbPath:     dbPath,
-		db:         db,
-		store:      storage.NewResourceStore(db),
-		ops:        storage.NewManagementStore(db),
-		gate:       &core.ResourceGate{},
-		catalog:    catalog,
-		runtime:    resourceRuntime{catalog: catalog},
-		logger:     logger,
-		logs:       logs,
+		t:              t,
+		root:           root,
+		configPath:     configPath,
+		dbPath:         dbPath,
+		db:             db,
+		store:          storage.NewResourceStore(db),
+		ops:            storage.NewManagementStore(db),
+		gate:           &core.ResourceGate{},
+		catalog:        catalog,
+		runtime:        resourceRuntime{catalog: catalog},
+		logger:         logger,
+		logs:           logs,
+		mcpCredentials: mcpCredentials,
+		masterKeyFile:  masterKeyFile,
 	}
 
 	deps := ResourceAdminDeps{
@@ -268,6 +292,10 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 		DiagnoseMCP: func(spec core.MCPServerConfig) core.MCPCommandDiagnosis {
 			return diagnoseMCPCommand(spec, env.root, nil)
 		},
+		// 依赖轴锚在工作区下的 `runtime/`：夹具与 wire 用同一个探测实现，只是根目录取
+		// 测试自己的临时目录（用例要造组件，不能碰真实程序目录）。
+		MCPDependencies: mcpDependencyProbe{runtimeRoot: filepath.Join(root, "runtime")}.Diagnose,
+		MCPCredentials:  mcpCredentials,
 	}
 	for _, m := range mutate {
 		m(&deps)
@@ -2082,15 +2110,30 @@ func (e *resourceEnv) setApplied(t *testing.T, kind core.ResourceKind, name stri
 func (e *resourceEnv) createMCPStdio(t *testing.T, name, command string) core.ResourceVersion {
 	t.Helper()
 	version, err := e.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      name,
-		Transport: "stdio",
-		Command:   command,
-		Args:      []string{"--root", "./workspace"},
-		Env:       map[string]string{"MCP_TEST_TOKEN": "${MCP_TEST_TOKEN}"},
-		Create:    true,
+		Name:        name,
+		Transport:   "stdio",
+		Command:     command,
+		Args:        []string{"--root", "./workspace"},
+		Env:         map[string]string{"MCP_TEST_TOKEN": "${MCP_TEST_TOKEN}"},
+		Credentials: envOnlyCredentials(map[string]string{"MCP_TEST_TOKEN": "${MCP_TEST_TOKEN}"}),
+		Create:      true,
 	})
 	require.NoError(t, err)
 	return version
+}
+
+// envOnlyCredentials 是 14D「来源显式」的**机械适配**：把给定占位符全部声明成
+// `mode=env`（14D 之前进程环境是唯一来源）。判据面不变——这些用例断言的是闸门、诊断与
+// 测试行为，不是来源选择；裁决依据是 14D 设计 §2.3.3「未声明的槽位合并后仍无声明 →
+// 400」与冻结契约 `McpServerUpsert.credentials`。请求顺序不参与合并（按槽位名索引）。
+// envOnlyCredentials declares every placeholder as env, the only pre-14D source; the
+// assertions themselves are untouched. Order is irrelevant because Plan indexes by key.
+func envOnlyCredentials(env map[string]string) []MCPCredentialRequest {
+	decls := make([]MCPCredentialRequest, 0, len(env))
+	for key := range env {
+		decls = append(decls, MCPCredentialRequest{Key: key, Mode: "env"})
+	}
+	return decls
 }
 
 // withSupervisor 在资源写面夹具上装配 supervisor 实例。
@@ -2396,12 +2439,14 @@ func TestMCPTest_MissingEnvNotConfigured(t *testing.T) {
 
 	mcpEnv := newMCPEnv(t)
 	env := newResourceEnv(t, withSupervisor(mcpEnv.supervisor))
+	values := map[string]string{missingEnv: "${" + missingEnv + "}"}
 	_, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      "fs",
-		Transport: "stdio",
-		Command:   "allowed-mcp",
-		Env:       map[string]string{missingEnv: "${" + missingEnv + "}"},
-		Create:    true,
+		Name:        "fs",
+		Transport:   "stdio",
+		Command:     "allowed-mcp",
+		Env:         values,
+		Credentials: envOnlyCredentials(values),
+		Create:      true,
 	})
 	require.NoError(t, err)
 

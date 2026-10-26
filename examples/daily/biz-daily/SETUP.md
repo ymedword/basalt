@@ -82,8 +82,11 @@ servers:
 - 只读是**服务端强制**：`UPDATE` / `DELETE` 会被拒绝并返回
   `{"success": false, "code": "READONLY_VIOLATION"}`（2026-10-26 实测），不是靠提示词
   约束。换库或改配置后可以手工验一次。
-- DSN 用 `sqlite:///` 前缀加**绝对路径**（Windows 常见写法
-  `sqlite:///D:/basalt-samples/biz-sample.db`）。
+- DSN 用 `sqlite:///` 前缀加**绝对路径**，共三个斜杠：Windows 写
+  `sqlite:///D:/basalt-samples/biz-sample.db`，Linux / macOS 写
+  `sqlite:///home/you/biz-sample.db`。多写一个斜杠（`sqlite:////home/...`）会被
+  DBHub 解析成相对路径，连接时报 `unable to open database file`（WSL2 实测，
+  2026-10-27）。安装器生成的配置已按平台写对，手工改配置时注意不要加多。
 
 ## 5. 环境变量
 

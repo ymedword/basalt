@@ -167,18 +167,20 @@ func (t httpTool) Execute(ctx context.Context, env core.ToolEnv, input json.RawM
 	return executeHTTP(ctx, t.name, t.policy, t.doer, env, spec)
 }
 
-// newHTTPClient 是生产发送面——两条配置缺一不可（D-01）：
+// newHTTPClient 是生产发送面——两条配置缺一不可（D-01 / 14D §2.2.6）：
 // ① `CheckRedirect` 返回 `http.ErrUseLastResponse`：客户端**不**自行跟随重定向，3xx 原样
 // 交给逐跳循环（每一跳都要重新过判定——FR9）；
-// ② `Transport.Proxy` 恒 nil：`HTTP_PROXY` 一设就换出口，域名白名单形同虚设（FR17）。
+// ② 传输层来自 `guardedTransport()`：拨号先解析、再按受保护地址段分类、只拨已校验的
+// IP（`Host` / SNI 仍是原域名），且 `Transport.Proxy` 只认显式 `http.proxy`——`HTTP_PROXY`
+// 一设就换出口，域名白名单与地址校验一起形同虚设（FR17）。未装配守门器时退化为
+// "无代理的默认传输"，只可能出现在直构测试替身里。
 // 其余沿用 DefaultTransport 的默认值：本 US **不**关传输层对幂等请求的连接复用重发——
 // 该重发收敛在一次审计行之内，如实登记（注 10）。
-// The production send side: no client-side redirect following, no environment proxy.
+// The production send side: no client-side redirect following, explicit-only proxy, and
+// every dial goes through the guard so the validated address is the one actually dialed.
 func newHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
 	return &http.Client{
-		Transport: transport,
+		Transport: guardedTransport(),
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -399,6 +401,14 @@ func executeHTTP(
 			// 其余归外部系统错误，文案只出自产类别 + host（不回显 err 原文）。
 			if ctxErr := ctxPreferred(ctx, err); ctxErr != nil {
 				return core.Result{}, ctxErr
+			}
+			// 受控拨号在**建连之前**就拒了：这是策略拒绝，不是外部故障。原样上抛让执行器
+			// 记 `sandbox_denied`（四段式文案直接给模型）；**不得**包成 ExternalError——
+			// 那会让模型以为目标暂时不可达，从而对同一个被拒地址反复重试。
+			// A guard refusal is a policy decision, not an external failure.
+			var violation *core.SandboxViolationError
+			if errors.As(err, &violation) {
+				return core.Result{}, violation
 			}
 			return core.Result{}, &core.ExternalError{
 				Target: host,

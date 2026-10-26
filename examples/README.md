@@ -12,7 +12,7 @@ Nothing here is imported automatically, and nothing here widens an existing work
 | [daily/repo-digest/](daily/repo-digest/) | Pull request / issue / release counts with follow-up items, delivered by the schedule | GitHub MCP server + PAT | Fixture replay: counts, "to be confirmed" fields, cursor advance |
 | [daily/biz-daily/](daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite | Fixture replay: missing / duplicate / invalid rows counted separately |
 | [daily/docs-diff/](daily/docs-diff/) | Added / modified / deleted documents with a content hash each | Bundled `docs-readonly` MCP server | Fixture replay: three change sets, content hashes, first run without baseline, unchanged run still reports |
-| [daily/industry-brief/](daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Brave Search MCP + Fetch MCP | Fixture replay: unfetched URLs stay leads only; both MCP servers wired and invoked (release e2e) |
+| [daily/industry-brief/](daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in `web_search` (DeepSeek Search API) + Fetch MCP | Fixture replay: unfetched URLs stay leads only; the search and Fetch channels are both wired and invoked (release e2e) |
 
 Every agent writes a machine-readable result next to its report, so the numbers in the report can be re-computed from the JSON instead of being estimated by the model.
 
@@ -76,7 +76,9 @@ A manual run is recorded with `trigger=manual`. It is evidence of a working agen
 
 ## Credentials
 
-Two demos need a key of their own. Neither key ships here, and `basalt demo install` never accepts or writes one: the snippets it prints reference `${VAR}` only, and Basalt's configuration gate refuses to save a server whose referenced variable is missing or empty. The full walk-through for each demo lives in its `SETUP.md`, so a copied workspace stays self-contained; this section is the shared summary.
+Only one credential is required by the demos: a GitHub personal access token, shared by `daily/github-radar` and `daily/repo-digest`. It does not ship here, and `basalt demo install` never accepts or writes one: the snippets it prints reference `${VAR}` only, and Basalt's configuration gate refuses to save a server whose referenced variable is missing or empty. The full walk-through lives in each demo's `SETUP.md`, so a copied workspace stays self-contained; this section is the shared summary.
+
+`daily/industry-brief` needs **no key of its own**. Its search runs through the built-in `web_search` tool, which reuses the key of the DeepSeek model connection you bind to that agent, and its page bodies come from the Fetch MCP server. Under the `strict` execution profile, add `api.deepseek.com` to the network allowlist on the console's execution-environment page — `web_search` is one of Basalt's own outbound calls, so it is judged like `http_get`. The `funding-watch` template (tier B) still describes a Brave Search recipe and its own `BRAVE_API_KEY`; it is a configuration reference, not part of any demo's setup.
 
 ### GitHub personal access token
 
@@ -91,9 +93,9 @@ Used by `daily/github-radar` and `daily/repo-digest`.
 
 The token itself is free; there is no plan to buy.
 
-### Brave Search API key
+### Brave Search API key (optional; `funding-watch` template only)
 
-Used by `daily/industry-brief`.
+No demo uses this key. It is listed here because the tier B `funding-watch` template's recipe references `${BRAVE_API_KEY}`; that template's own README carries the checklist.
 
 1. Subscribe to the **Search** plan at <https://brave.com/search/api/> — the MCP server uses Search, while `Answers` is a different product. A credit card is required.
 2. Generate the key at <https://api-dashboard.search.brave.com/app/keys>; it is shown once.
@@ -109,7 +111,7 @@ Two kinds of claims appear in this directory, and they are not interchangeable:
 | Claim | Meaning | Where it is checked |
 | --- | --- | --- |
 | Fixture replay | The directory loads, its declared tools resolve, and the script produces the expected business result from fixed input | `make example-tests`, and the release end-to-end suite |
-| Real external run | The same flow against the real service (GitHub, Brave, Fetch, Playwright, DBHub, a real model, a real notification receiver) | Not part of this repository's automated acceptance. DBHub 1.5.0 was exercised by hand on Windows (tool discovery plus a write rejected with `READONLY_VIOLATION`); GitHub, Brave, Fetch, Playwright, real models and real notification receivers stay **unverified** — those credentials were not provided |
+| Real external run | The same flow against the real service (GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model, a real notification receiver) | Not part of this repository's automated acceptance. DBHub 1.5.0 was exercised by hand on Windows (tool discovery plus a write rejected with `READONLY_VIOLATION`); GitHub, DeepSeek Search, Brave, Fetch, Playwright, real models and real notification receivers stay **unverified** — those credentials were not provided |
 
 "Connects successfully" is neither of the above. A successful connection only proves that the server started and answered `tools/list`.
 

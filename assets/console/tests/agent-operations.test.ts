@@ -209,6 +209,8 @@ function mcpDetailOf(envKeys: string[]): Record<string, unknown> {
     args: [],
     url: '',
     env_keys: envKeys,
+    header_keys: [],
+    credential_keys: envKeys.map((key) => ({ key, mode: 'env', state: 'env', last4: '' })),
     connected: true,
     tools: ['read_file'],
     published_version_id: 1,
@@ -1289,6 +1291,8 @@ describe('resource edits', () => {
             pending_restart: false,
             command: { state: 'located', path: 'npx', reason: 'lookpath' },
             env: envKeys.map((key) => ({ key, set: true })),
+            dependency: null,
+            references: { count: 0, agents: [] },
             warnings: [],
             checked_at: '2026-10-22T12:00:00Z',
           },
@@ -1337,5 +1341,44 @@ describe('resource edits', () => {
     expect('env' in body).toBe(false)
     expect(writes[0]!.headers['If-Match']).toBe(ETAG_A)
     expect(wrapper!.find('.notice-info').text()).toContain('已保存并发布')
+  })
+})
+
+describe('agent readiness panels', () => {
+  it('renders the three panels from the readiness projection on the agent page', async () => {
+    profilesData = [profileOf('writer')]
+    await signIn((call) => {
+      if (call.path === '/api/v1/agents/writer/readiness') {
+        return {
+          data: {
+            agent: 'writer',
+            ready: false,
+            pending: [
+              {
+                kind: 'model_connection',
+                item: 'model_connection/default',
+                detail: '未绑定模型连接。',
+                fix: '/console/resources/model-connections',
+              },
+            ],
+            notices: [],
+          },
+        }
+      }
+      return undefined
+    })
+    await visit('/console/agents/writer')
+
+    // 三段固定顺序与标题：面板回答「离能跑还差什么」，不是另一张状态卡。
+    const text = wrapper!.text()
+    expect(text).toContain('需要你提供')
+    expect(text).toContain('系统已准备')
+    expect(text).toContain('未启用原因')
+    // 阻断项来自就绪视图，而不是页面自己推断。
+    expect(text).toContain('未绑定模型连接。')
+    expect(text).toContain('还差 1 项')
+    expect(text).toContain('模型与连接 →')
+    // 配置视图默认不可读：面板明说不可读或读取中，不冒充已准备。
+    expect(text).toContain('Agent 定义读取中或不可读，暂不能核对组件。')
   })
 })

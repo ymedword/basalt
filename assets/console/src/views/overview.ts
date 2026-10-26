@@ -4,8 +4,19 @@ import { computed, defineComponent, h } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import { Notice, formatBytes, formatTimestamp, formatUptime } from '../components/ui'
 import { brandMark } from '../components/brand'
+import {
+  CREDENTIAL_SUMMARY_TITLE,
+  INSTANCE_SECRETS_TITLE,
+  credentialSummaryText,
+  credentialSummaryTone,
+  instanceSecretsDetail,
+  instanceSecretsLabel,
+  instanceSecretsTone,
+  isInstanceSecretsView,
+  recoveryReasonText,
+} from '../instance-secrets'
 import { agentHref, resourceHref, runHref } from '../router'
-import { badge, RUN_STATUS_LABELS, useLoader, viewProps } from './shared'
+import { badge, definitions, RUN_STATUS_LABELS, useLoader, viewProps } from './shared'
 
 function metric(label: string, value: string, note: VNodeChild, accent = false): VNode {
   return h('div', { class: ['overview-metric', accent ? 'metric-accent' : ''] }, [
@@ -22,10 +33,88 @@ export const OverviewView = defineComponent({
     const agents = useLoader(() => api.listProfiles())
     const mcps = useLoader(() => api.listMcpServers())
     const recent = useLoader(() => api.listRuns({ limit: 5 }))
-    const loaders = [info, overview, sample, agents, mcps, recent]
+    // 实例加密状态与凭据汇总：只读投影，失败时卡片显示「状态待确认」，
+    // 不把读不到说成「未初始化」（两者对用户的含义完全不同）。
+    // The instance-secrets projection; a read failure is "unknown", never "uninitialized".
+    const secrets = useLoader(() => api.getInstanceSecrets())
+    const loaders = [info, overview, sample, agents, mcps, recent, secrets]
     const busy = computed(() => loaders.some(loader => loader.loading.value))
     const errors = computed(() => loaders.map(loader => loader.error.value).filter(Boolean))
     function refresh(): void { void Promise.all(loaders.map(loader => loader.reload())) }
+    /**
+     * 实例加密与连接凭据两行（设计 §2.6.5）：状态徽标在右，技术明细默认折叠。
+     * 读失败时两行都显示「待确认」——不把「读不到」写成「未初始化」。
+     * Two rows for the instance key and its credential summary; a failed read is
+     * reported as unknown, never as uninitialized.
+     */
+    function renderSecretsPanel(): VNode {
+      const view =
+        secrets.data.value !== null && isInstanceSecretsView(secrets.data.value)
+          ? secrets.data.value
+          : null
+      const failed = secrets.error.value !== ''
+      const stateBadge = failed
+        ? badge('状态待确认', 'muted')
+        : view === null
+          ? badge('读取中', 'muted')
+          : badge(instanceSecretsLabel(view), instanceSecretsTone(view))
+      // 说明句与模型连接表单共用（instanceSecretsDetail），两处口径不会漂移。
+      const stateDetail = failed
+        ? `读取失败：${secrets.error.value}`
+        : view === null
+          ? '正在读取实例状态…'
+          : instanceSecretsDetail(view)
+      const summaryBadge =
+        failed || view === null
+          ? badge('待确认', 'muted')
+          : badge(
+              credentialSummaryText(view.credential_summary),
+              credentialSummaryTone(view.credential_summary),
+            )
+      const rows: VNodeChild[] = [
+        h('div', { class: 'dependency-row' }, [
+          h('div', [h('strong', INSTANCE_SECRETS_TITLE), h('p', stateDetail)]),
+          stateBadge,
+        ]),
+        h('div', { class: 'dependency-row' }, [
+          h('div', [
+            h('strong', CREDENTIAL_SUMMARY_TITLE),
+            h('p', '托管与环境变量来源的凭据槽位；不包含调用方密钥。'),
+          ]),
+          summaryBadge,
+        ]),
+      ]
+      if (view !== null) {
+        rows.push(
+          h('details', { class: 'technical-details' }, [
+            h('summary', '查看详情'),
+            definitions([
+              ['状态', instanceSecretsLabel(view)],
+              ['key_id', view.key_id === '' ? '—' : h('code', {}, view.key_id)],
+              ['初始化时间', formatTimestamp(view.initialized_at)],
+              ['密钥文件', view.key_file === '' ? '—' : h('code', {}, view.key_file)],
+              [
+                '恢复原因',
+                view.recovery_reason === ''
+                  ? '—'
+                  : `${recoveryReasonText(view.recovery_reason)}（${view.recovery_reason}）`,
+              ],
+              [
+                '凭据槽位',
+                `托管 ${view.credential_summary.managed} / 已撤销 ${view.credential_summary.managed_revoked} / 环境变量 ${view.credential_summary.env} / 缺值 ${view.credential_summary.missing}`,
+              ],
+            ]),
+          ]),
+        )
+      }
+      return h('section', { class: 'overview-panel secrets-panel' }, [
+        h('div', { class: 'panel-heading' }, [
+          h('h2', '实例与凭据'),
+          h('span', { class: 'eyebrow' }, 'INSTANCE'),
+        ]),
+        ...rows,
+      ])
+    }
     return (): VNode => {
       const summary = overview.data.value
       const system = info.data.value
@@ -77,6 +166,7 @@ export const OverviewView = defineComponent({
             h('div', { class: 'dependency-row' }, [h('div', [h('strong', '管理面认证'), h('p', summary ? summary.auth.loopback_only ? '仅回环访问' : '允许远程访问' : '正在读取')]), h('span', { class: 'dependency-count' }, summary ? summary.auth.mode === 'token' ? 'Token' : '本机信任' : '—')]),
           ]),
         ]),
+        renderSecretsPanel(),
         h('section', { class: 'overview-panel process-panel' }, [
           h('div', { class: 'panel-heading' }, [h('h2', '进程读数'), h('span', { class: 'muted small' }, readings ? '采样于 ' + formatTimestamp(readings.sampled_at) : '尚未取得采样')]),
           h('div', { class: 'process-readings' }, [

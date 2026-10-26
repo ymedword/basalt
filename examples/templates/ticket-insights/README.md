@@ -58,6 +58,10 @@ readonly = true
 max_rows = 500
 ```
 
+`dsn` 的斜杠数固定为三个：Windows 写 `sqlite:///D:/...`，Linux / macOS 写
+`sqlite:///home/...`。多一个斜杠（`sqlite:////home/...`）会被 DBHub 解析成相对
+路径，报 `unable to open database file`（WSL2 实测，2026-10-27）。
+
 `[[tools]]` 的 `readonly = true` 是**档位 A 的前提**：没有它，server 侧仍有写能力，
 只读只靠 Agent `tools:` 声明保证，证据不足。实测（2026-10-26，1.5.0）`UPDATE` /
 `DELETE` 返回 `{"success": false, "code": "READONLY_VIOLATION"}`，不写库。

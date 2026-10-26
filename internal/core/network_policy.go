@@ -94,6 +94,23 @@ func validDomainEntry(entry string) bool {
 	return true
 }
 
+// DomainEntryMatches 判定一条规整域名条目是否匹配主机名：完整域名逐字比较；
+// `*.suffix` 只覆盖子域（**不**覆盖裸后缀本身）。匹配器只有这一份：白名单、禁止
+// 域名表、host 例外与 MCP 撤销复判都读它，四种语义不可能漂移。
+// DomainEntryMatches is the single domain matcher shared by the allowlist, the denylist,
+// host exceptions and MCP revocation: a `*.suffix` entry never covers the bare suffix.
+func DomainEntryMatches(entry, host string) bool {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	host = strings.ToLower(strings.TrimSpace(host))
+	if entry == "" || host == "" {
+		return false
+	}
+	if suffix, ok := strings.CutPrefix(entry, "*."); ok {
+		return strings.HasSuffix(host, "."+suffix)
+	}
+	return host == entry
+}
+
 // NetworkDomainETag 给出策略行的强 ETag（`"sha256:<64 位小写十六进制>"`，含双引号）。
 // 材料 = 修订号 + 换行 + 规整域名按行连接；**不**重新序列化对象再求值。
 // NetworkDomainETag renders the strong ETag over revision plus line-joined domains.
@@ -102,12 +119,15 @@ func NetworkDomainETag(policy NetworkDomainPolicy) string {
 	return `"sha256:` + hex.EncodeToString(sum[:]) + `"`
 }
 
-// PolicyScopes 是策略作用域的固定字面量：当前只有出网域名白名单一项。作用域是表主键
-// 的一部分，将来增加别的策略（如命令白名单）时不需要改表形态。
-// Policy scopes are fixed literals; only the outbound domain allowlist exists today.
+// PolicyScopes 是策略作用域的固定字面量：出网域名白名单与禁止域名表各占一行，
+// 共用 network_domain_policy 的单行表形态（作用域是表主键的一部分）。
+// Policy scopes are fixed literals; the allowlist and the denylist share the table.
 const (
 	// PolicyScopeHTTPDomains 是出网域名白名单的作用域（与配置键同名）。
 	PolicyScopeHTTPDomains = "http.allowed_domains"
+	// PolicyScopeHTTPDeniedDomains 是出网禁止域名表的作用域（与配置键同名）；
+	// 它复用同一张表与同一套修订号 / CAS 语义，两档执行策略都先查它。
+	PolicyScopeHTTPDeniedDomains = "http.denied_domains"
 )
 
 // 动作与目标类型字面量（run-and-errors.md §9.3 追加，R8 范围修订）。
@@ -119,12 +139,35 @@ const (
 	TargetKindNetworkAllowlist = "network_allowlist"
 )
 
+// 执行环境的动作与目标类型字面量（14D 增量，run-and-errors.md §9.3）：禁止域名表与
+// 白名单共用一行表与同一套 CAS，但审计动作名分开；档位与访问例外各有自己的动作与目标。
+// Execution-environment literals: the denylist shares the allowlist table but not its
+// action name, so the audit trail never conflates them.
+const (
+	// ActionNetworkDenylistUpdate 是修改出网禁止域名表。
+	ActionNetworkDenylistUpdate = "network_denylist.update"
+	// TargetKindNetworkDenylist 是禁止域名表目标；target_id 固定 PolicyScopeHTTPDeniedDomains。
+	TargetKindNetworkDenylist = "network_denylist"
+	// ActionExecutionPolicyUpdate 是切换执行档位。
+	ActionExecutionPolicyUpdate = "execution_policy.update"
+	// ActionExecutionPolicyConfirm 是升级迁移待确认项里「保持拒绝」的显式选择。
+	ActionExecutionPolicyConfirm = "execution_policy.confirm"
+	// TargetKindExecutionPolicy 是执行档位目标；target_id 固定 `global`。
+	TargetKindExecutionPolicy = "execution_policy"
+	// ActionNetworkExceptionCreate 是新增内网访问例外。
+	ActionNetworkExceptionCreate = "network_exception.create"
+	// ActionNetworkExceptionDelete 是删除内网访问例外。
+	ActionNetworkExceptionDelete = "network_exception.delete"
+	// TargetKindNetworkException 是访问例外目标；target_id 为例外标识。
+	TargetKindNetworkException = "network_exception"
+)
+
 // NetworkDomainPolicy 是一行权威策略：规整后的域名列表、单调递增的修订号与最近一次
 // 写入的脱敏操作者。`OperationID` 为空表示该行来自首次种子（不是管理写）。
 // Revision is the CAS fence used by conditional writes; an empty OperationID marks the
 // first-run seed rather than an admin write.
 type NetworkDomainPolicy struct {
-	Scope       string    // 固定 PolicyScopeHTTPDomains
+	Scope       string    // PolicyScopeHTTPDomains / PolicyScopeHTTPDeniedDomains
 	Domains     []string  // 规整形式：小写、去重、升序
 	Revision    int64     // 从 1 起，每次成功写入 +1
 	UpdatedAt   time.Time // 最近一次写入时间（种子 = 首次启动时间）
@@ -142,6 +185,10 @@ func (p NetworkDomainPolicy) Seeded() bool { return p.OperationID == "" }
 const (
 	NetworkAllowlistSourceConfigSeed = "config_seed"
 	NetworkAllowlistSourceDatabase   = "database"
+	// NetworkAllowlistSourceMigration 是版本迁移写入（如 `execution_policy` 升级一律 strict）。
+	NetworkAllowlistSourceMigration = "migration"
+	// NetworkAllowlistSourceInstanceInit 是实例初始化流程写入（如新建库的 `standard`）。
+	NetworkAllowlistSourceInstanceInit = "instance_init"
 )
 
 // Source 返回当前生效列表的来源：种子行（含尚未装载的零值）记 `config_seed`，
@@ -165,15 +212,17 @@ type NetworkAllowlistAdmin interface {
 }
 
 // NetworkDomainPolicyStore 是权威策略行的读写端口（消费方声明，storage 实现）。
-// `Seed` 只在表内无行时插入；`Update` 以期望修订号做 CAS，冲突时返回
-// `ErrPolicyRevisionConflict` 且零写入。
-// The store seeds once and updates under a revision CAS.
+// 三个方法都按 `policy_scope` 寻址：白名单与禁止域名表是同一张表的两行，各自
+// 独立修订号，互不影响。`Seed` 只在目标作用域无行时插入；`Update` 以期望修订号
+// 做 CAS，冲突时返回 `ErrPolicyRevisionConflict` 且零写入。
+// Every method is scoped: the allowlist and the denylist are two rows of one table,
+// each with its own revision counter.
 type NetworkDomainPolicyStore interface {
-	// Load 读取当前行；无行时 exists=false。
-	Load(ctx context.Context) (policy NetworkDomainPolicy, exists bool, err error)
-	// Seed 在无行时写入种子并返回落库行；已有行时原样返回既有行（幂等）。
-	Seed(ctx context.Context, domains []string, now time.Time) (NetworkDomainPolicy, error)
+	// Load 读取指定作用域的行；无行时 exists=false。
+	Load(ctx context.Context, scope string) (policy NetworkDomainPolicy, exists bool, err error)
+	// Seed 在目标作用域无行时写入种子并返回落库行；已有行时原样返回（幂等）。
+	Seed(ctx context.Context, scope string, domains []string, now time.Time) (NetworkDomainPolicy, error)
 	// Update 以 expectedRevision 做 CAS 更新；冲突返回 ErrPolicyRevisionConflict。
-	Update(ctx context.Context, domains []string, expectedRevision int64,
+	Update(ctx context.Context, scope string, domains []string, expectedRevision int64,
 		operationID string, actor string, now time.Time) (NetworkDomainPolicy, error)
 }

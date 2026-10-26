@@ -9,7 +9,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -54,6 +56,17 @@ func newMCPRuntime(specs []core.MCPServerConfig, conns []tool.MCPConnection) *mc
 // configured list stays the file-order snapshot captured at startup.
 func newMCPRuntimeFromSupervisor(supervisor *MCPSupervisor, specs []core.MCPServerConfig) *mcpRuntime {
 	return &mcpRuntime{specs: slices.Clone(specs), supervisor: supervisor}
+}
+
+// mcpRevokerOf 把句柄的 supervisor 投影成"按名回收连接"的回调；句柄或 supervisor 缺席
+// 时返回 nil（调用方据此跳过回收，而不是在只读装配里 panic）。
+// mcpRevokerOf projects the supervisor into a by-name teardown callback; nil means the
+// process has no MCP runtime to tear down.
+func mcpRevokerOf(runtime *mcpRuntime) func(ctx context.Context, name string) error {
+	if runtime == nil || runtime.supervisor == nil {
+		return nil
+	}
+	return runtime.supervisor.RevokeServer
 }
 
 // ConfiguredNames 返回已配置 server 名（文件序）——装载器据此判定"声明了不存在的 server"。
@@ -170,6 +183,45 @@ type mcpConnector interface {
 	Close() error
 }
 
+// mcpRegisterTools 把一个连接批次里的工具**按 server 分组整组登记**（14D）：先撤下该
+// server 此前的名字与来源条目，再按连接序 → 工具列表序登记。用整组替换而不是逐条登记，
+// 是因为重连 / 受控重建后的工具集可能变小：逐条登记会把上一次的名字留成孤儿，声明它们
+// 的 Agent 仍能解析到一个已经没有连接的实例。
+// 重名语义不变：注册池拒绝重复并保留原注册（内置赢家，约束 8 / D-06），来源表照实记
+// `duplicate_name` 与赢家来源。
+// mcpRegisterTools registers each connected server's tools as one owned set (replacing any
+// earlier set) so a shrink cannot leave orphan names behind; duplicates are still refused.
+func mcpRegisterTools(registry *tool.Registry, dispositions *mcpDispositionTable,
+	conns []tool.MCPConnection, logger *slog.Logger,
+) {
+	for _, conn := range conns {
+		dispositions.resetServer(conn.Server)
+		errs := registry.ReplaceOwner(conn.Server, conn.Tools)
+		for i, t := range conn.Tools {
+			dispositions.recordMCP(conn.Server, t.Name(), errs[i])
+		}
+		if logger != nil {
+			logger.Debug("MCP 工具组已登记", "server", conn.Server, "offered", len(conn.Tools))
+		}
+	}
+}
+
+// mcpReplaceTools 在受控重建的提交段里整组换掉一个 server 的注册池条目与来源条目：
+// 撤下该归属方此前的名字，再按给定顺序登记，重名照旧拒绝并保留原注册（内置赢家）。
+// 注册池与来源表必须成对更新——否则页面会看到"名字已换、来源还是旧的"。
+// mcpReplaceTools swaps one owner's registry entries and source records together; the
+// two must move as a pair or the view would show one generation's names with another's
+// provenance.
+func mcpReplaceTools(registry *tool.Registry, dispositions *mcpDispositionTable,
+	server string, tools []core.Tool,
+) {
+	dispositions.resetServer(server)
+	errs := registry.ReplaceOwner(server, tools)
+	for i, t := range tools {
+		dispositions.recordMCP(server, t.Name(), errs[i])
+	}
+}
+
 // mcpToolNames 按连接顺序收集工具名（server 文件序 → 工具列表序）：顺序本身是注册序的
 // 判据，重名由注册池按先到先得判定（内置优先）。
 // mcpToolNames lists the connected tool names in connection order.
@@ -185,13 +237,28 @@ func mcpToolNames(conns []tool.MCPConnection) []string {
 
 // publishedMCPServers 把**已发布版本**解析成 supervisor 的启动输入（图 A ⑧ / FR17）：
 // 先按配置文件序排（序即注册序判据），文件里已删但指针保留的 server 排在其后、按
-// resource_id 升序。任一条解析 / 校验 / 占位解析失败都返回错误（fail-closed）——运行
-// 对象只由已发布版本构建，**不**回退到配置文件内容。返回顺序即连接与注册顺序。
+// resource_id 升序。运行对象只由已发布版本构建，**不**回退到配置文件内容。返回顺序即
+// 连接与注册顺序。
+//
+// **启动隔离**（设计 §2.5.1 / 验收 E3，T115）：某一条的凭据当前取不到值（env 变量缺失 /
+// 为空、托管未录入 / 已撤销 / 版本非 active）只让**它自己**未就绪——跳过该 server、不建
+// 连接，其余照常启动；页面经资源视图看到它的槽位状态，引用它的 Agent 按装载规则显示
+// 未就绪。其余任何失败（读不到版本、版本归属 / 条目名不符、定义非法、槽位未声明来源、
+// 主密钥不可用、存储读取失败、密文归属不符）仍**失败关闭**：那是配置或实例完整性问题，
+// 跳过只会让坏数据伪装成"某条没配好"。
 // publishedMCPServers resolves published MCP versions into supervisor inputs, in
-// configuration order followed by pointer-only servers; any invalid entry fails closed.
+// configuration order followed by pointer-only servers. A server whose own credential is
+// currently unavailable is skipped (startup isolation, E3); every other failure still
+// aborts the assembly.
 func publishedMCPServers(ctx context.Context, store *storage.ResourceStore, fileOrder []string,
-	lookup func(string) (string, bool),
+	credentials mcpCredentialResolver, now func() time.Time, logger *slog.Logger,
 ) ([]core.PublishedMCPServer, error) {
+	if credentials == nil {
+		return nil, errors.New("解析已发布 MCP server: 本次装配没有 MCP 凭据面——来源无法按声明解析")
+	}
+	// 整趟补记共用一个启动操作号：它记录的是"实例启动时看到的事实"，不是一次管理写。
+	// One startup operation id covers the whole backfill pass.
+	backfillOperation := core.NewOperationID(now())
 	pointers, err := store.ListPointers(ctx, core.ResourceMCPServer)
 	if err != nil {
 		return nil, fmt.Errorf("读取已发布 MCP server 指针: %w", err)
@@ -235,16 +302,49 @@ func publishedMCPServers(ctx context.Context, store *storage.ResourceStore, file
 			return nil, fmt.Errorf("MCP server %s 的发布版本 %d 条目名 %q 与资源标识不一致",
 				pointer.ResourceID, version.ID, cfg.Name)
 		}
-		// 占位解析发生在**任何连接之前**（技术方案 §3.7）：解析不出来就不连接，错误里
-		// 只有 server / 键 / 变量名，没有值。
-		// Placeholder resolution happens before any connection; errors never carry values.
-		resolved, err := resolveMCPEnv([]core.MCPServerConfig{cfg}, lookup)
-		if err != nil {
+		// 来源补记（v5 → v6 的事实记录）：文件能表达的只有 `${VAR}`，所以由基线播种 /
+		// 升级而来的槽位在第一次启动时按事实记成 `env`；已有声明的槽位不动。这是**记录**
+		// 而不是回落——之后改成 managed 再撤销，仍然不会退回 env。
+		// The file can only express ${VAR}, so file-seeded and upgraded slots get their
+		// factual env source recorded once (idempotent); declared slots are untouched.
+		if _, err := credentials.BackfillEnvSources(ctx, pointer.ResourceID, pointer.ResourceUID,
+			cfg, backfillOperation, now()); err != nil {
 			return nil, err
 		}
-		servers = append(servers, core.PublishedMCPServer{VersionID: version.ID, Config: resolved[0]})
+		// 占位解析发生在**任何连接之前**（技术方案 §3.7）：只按声明的来源取值，
+		// `managed` 失败即失败、不回落 env；错误里只有 server / 槽位 / 变量名，没有值。
+		// Resolution happens before any connection and follows the declared source only.
+		values, err := credentials.Resolve(ctx, pointer.ResourceID, pointer.ResourceUID, cfg)
+		if err != nil {
+			// 启动隔离只放行"该 server 自己的凭据取不到值"这一类；其余仍失败关闭。
+			// 跳过 = 不建连接、不注册工具：不用占位符字面量起进程，也不把缺值带进运行期。
+			// Only this server's own missing credential is skipped; no process is started
+			// with literal placeholders, and every other failure still aborts the start.
+			if !mcpCredentialUnavailable(err) {
+				return nil, err
+			}
+			if logger != nil {
+				logger.Warn("MCP server 凭据不可用，本次启动跳过该 server（其余照常；页面显示未就绪）",
+					"server", pointer.ResourceID, "error", err)
+			}
+			continue
+		}
+		resolved := ApplyResolvedMCP(cfg, values)
+		ZeroMCPCredentialValues(values)
+		servers = append(servers, core.PublishedMCPServer{VersionID: version.ID, Config: resolved})
 	}
 	return servers, nil
+}
+
+// mcpCredentialResolver 是装配期需要的两个凭据动作：按声明来源解析，与补记来源事实。
+// `*MCPCredentialService` 是唯一实现。
+// mcpCredentialResolver is the assembly-time credential face; the service is its only
+// implementation.
+type mcpCredentialResolver interface {
+	Resolve(ctx context.Context, serverName string, serverUID core.ResourceUID,
+		cfg core.MCPServerConfig) (map[string]string, error)
+	BackfillEnvSources(ctx context.Context, serverName string, serverUID core.ResourceUID,
+		cfg core.MCPServerConfig, operationID string, at time.Time) (int, error)
 }
 
 // mcpPublishedConfigs 抽取配置（运行期句柄只要配置与文件序名集）。

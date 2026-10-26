@@ -120,6 +120,21 @@ func (s *ResourceAdmin) DiagnoseMCPServer(ctx context.Context, actor core.Actor,
 			"MCP server %s 的发布版本条目名 %q 与资源标识不一致", name, cfg.Name)
 	}
 
+	// 引用轴与 `/resources/{kind}/{id}/references` 同源：读失败就报错，不退回"没有
+	// 引用"——引用视图是删除闸门的排障证据，缺证据不得伪装成空集。
+	// The references axis shares the resource view's source; a read failure is an
+	// error, never an empty list.
+	references, err := s.agentReferences(core.ResourceMCPServer, name)
+	if err != nil {
+		return core.MCPServerDiagnosis{}, err
+	}
+	// 依赖轴只在装配了运行时探测面时回答：nil 表示"没有可核对的运行时目录"，视图
+	// 输出 `null`，不猜默认位置、也不把未登记组件答成就绪。
+	var dependency *core.MCPDependencyDiagnosis
+	if s.mcpDependencies != nil {
+		dependency = s.mcpDependencies(cfg)
+	}
+
 	transport := mcpTransport(cfg.Transport)
 	diagnosis := core.MCPServerDiagnosis{
 		Name:               name,
@@ -127,7 +142,9 @@ func (s *ResourceAdmin) DiagnoseMCPServer(ctx context.Context, actor core.Actor,
 		PublishedVersionID: pointer.PublishedVersionID,
 		AppliedVersionID:   derefVersionID(pointer.AppliedVersionID),
 		PendingRestart:     mcpRestartPending(pointer),
-		Env:                diagnoseMCPEnv(cfg.Env, os.LookupEnv),
+		Env:                diagnoseMCPEnv(cfg, os.LookupEnv),
+		Dependency:         dependency,
+		References:         core.MCPReferencesDiagnosis{Count: len(references), Agents: references},
 		Warnings:           mcpDiagnosisWarnings(cfg, transport),
 		CheckedAt:          s.now().UTC(),
 	}
@@ -150,18 +167,27 @@ func (s *ResourceAdmin) mcpCommandDiagnosis(cfg core.MCPServerConfig) core.MCPCo
 	return s.diagnoseMCP(cfg)
 }
 
-// diagnoseMCPEnv 只回"键是否就绪"的布尔，判据与装配期的 `resolveMCPEnv` 同口径：
-// 变量存在且非空为 true。按 key 升序输出（契约 D-02），不回值、不回占位表达式。
-// DiagnoseMCPEnv reports presence only, sorted by key, with no value ever included.
-func diagnoseMCPEnv(env map[string]string, lookup func(string) (string, bool)) []core.MCPEnvDiagnosis {
-	keys := make([]string, 0, len(env))
-	for key := range env {
+// diagnoseMCPEnv 只回"键是否就绪"的布尔，判据与装配期 / 保存闸门同口径（
+// `resolveMCPEnvSlot`）：读的是**占位符里的变量名**（`${VAR}` 的 `VAR`），不是 env 的
+// 键名——两者允许不同名，按键名查会答出与闸门相反的结论。按 key 升序输出（契约 D-02），
+// 不回值、不回占位表达式。
+// diagnoseMCPEnv reports presence only, sorted by key; it looks up the ${VAR} name,
+// exactly like the gate, because the key and the variable may differ.
+func diagnoseMCPEnv(cfg core.MCPServerConfig, lookup func(string) (string, bool)) []core.MCPEnvDiagnosis {
+	keys := make([]string, 0, len(cfg.Env))
+	for key := range cfg.Env {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
 	out := make([]core.MCPEnvDiagnosis, 0, len(keys))
 	for _, key := range keys {
-		value, found := lookup(key)
+		// 解析器只接受整值 `${VAR}`，`MCPSlotPlaceholder` 理论上恒成；万一存量文件
+		// 绕过了校验，退回键名查询而不是报"未就绪"或"就绪"这种未经证明的结论。
+		varName, ok := core.MCPSlotPlaceholder(cfg, key)
+		if !ok {
+			varName = key
+		}
+		value, found := lookup(varName)
 		out = append(out, core.MCPEnvDiagnosis{Key: key, Set: found && value != ""})
 	}
 	return out

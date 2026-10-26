@@ -1,8 +1,9 @@
 package web
 
-// 本文件是 US-12 写面路由表与条件写中间件的判卷（颗粒度文档 §3.2.1
-// admin_routes_test.go，7 例，check `012-web-etag-routes`）：37 条新端点逐条在表、
-// 全部受保护、11 条条件写恰为契约指定集合；`version_id` 只接受十进制正整数；
+// 本文件是写面路由表与条件写中间件的判卷（US-12 颗粒度文档 §3.2.1
+// admin_routes_test.go，7 例，check `012-web-etag-routes`）：US-12 的 37 条端点与
+// 后续按已批准契约追加的行逐条在表、全部受保护、条件写恰为契约指定集合
+// （14D 追加网络策略四条与实例加密两行，现为 48 条端点 / 14 条条件写）；`version_id` 只接受十进制正整数；
 // 缺凭据一律 401、错误方法落 404 兜底；条件写缺 / 弱 / 通配 / 非法 If-Match 一律
 // 412 且处理函数零调用；认证先于 If-Match；每条受保护项恰过一次闸门。
 // These tests pin the US-12 admin route table, the conditional-write middleware, and
@@ -73,6 +74,7 @@ func wantAdminRouteKeys() []string {
 		"POST /api/v1/agents/{name}/generate-files",
 		"POST /api/v1/agents/{name}/schedule-draft",
 		"GET /api/v1/agents/{name}/files",
+		"GET /api/v1/agents/{name}/readiness",
 		"POST /api/v1/agents/{name}/files",
 		"POST /api/v1/agents/{name}/copy",
 		"DELETE /api/v1/agents/{name}",
@@ -87,6 +89,7 @@ func wantAdminRouteKeys() []string {
 		"PUT /api/v1/mcp-servers/{name}",
 		"DELETE /api/v1/mcp-servers/{name}",
 		"POST /api/v1/mcp-servers/{name}/test",
+		"POST /api/v1/mcp-servers/{name}/apply",
 		"GET /api/v1/mcp-servers/{name}/diagnostics",
 		"POST /api/v1/skills",
 		"POST /api/v1/skills/import",
@@ -106,12 +109,21 @@ func wantAdminRouteKeys() []string {
 		"GET /api/v1/workspace/tree",
 		"GET /api/v1/workspace/file",
 		"PUT /api/v1/sandbox/network-domains",
+		"PUT /api/v1/sandbox/denied-domains",
+		"GET /api/v1/network-exceptions",
+		"POST /api/v1/network-exceptions",
+		"DELETE /api/v1/network-exceptions/{id}",
+		"GET /api/v1/execution-policy",
+		"PUT /api/v1/execution-policy",
+		"POST /api/v1/execution-policy/confirmations",
+		"GET /api/v1/instance/secrets",
+		"POST /api/v1/instance/secrets/init",
 	}
 }
 
-// wantConditionalRouteKeys 是 11 条条件写（修改 / 删除 / 发布 / Agent 多文件提交 /
-// 凭据撤销 / 范围切换 / 出网域名白名单）。
-// wantConditionalRouteKeys lists the eleven conditional-write rows.
+// wantConditionalRouteKeys 是 14 条条件写（修改 / 删除 / 发布 / Agent 多文件提交 /
+// 凭据撤销 / 范围切换 / 出网域名与禁止域名白名单 / 例外撤销 / 执行档位）。
+// wantConditionalRouteKeys lists the fourteen conditional-write rows.
 func wantConditionalRouteKeys() []string {
 	return []string{
 		"POST /api/v1/agents/{name}/files",
@@ -125,17 +137,20 @@ func wantConditionalRouteKeys() []string {
 		"POST /api/v1/resources/{kind}/{name}/credential/revoke",
 		"POST /api/v1/resources/{kind}/{name}/scope",
 		"PUT /api/v1/sandbox/network-domains",
+		"PUT /api/v1/sandbox/denied-domains",
+		"DELETE /api/v1/network-exceptions/{id}",
+		"PUT /api/v1/execution-policy",
 	}
 }
 
-// TestAdminRoutes_TableCoversContractSurface：写面路由表恰好覆盖契约的 37 条端点，
-// 无重复、无公开行、方法显式、条件写恰为 11 条；`adminRoutes()` 逐行标记受保护并
+// TestAdminRoutes_TableCoversContractSurface：写面路由表恰好覆盖契约的 48 条端点，
+// 无重复、无公开行、方法显式、条件写恰为 14 条；`adminRoutes()` 逐行标记受保护并
 // 带上处理函数（占位也必须是显式函数，不允许空挂）。
 // 逆改点：漏登记 / 多登记 / 把任一行改成公开 / 条件写集合漂移 → 对应断言红。
 func TestAdminRoutes_TableCoversContractSurface(t *testing.T) {
 	s := newTestServer(t, nil)
 	specs := s.adminRouteSpecs()
-	require.Len(t, specs, 37)
+	require.Len(t, specs, 48)
 
 	got := make(map[string]adminRouteSpec, len(specs))
 	for _, spec := range specs {
@@ -150,7 +165,7 @@ func TestAdminRoutes_TableCoversContractSurface(t *testing.T) {
 		slices.Sorted(maps.Keys(got)),
 	)
 
-	conditional := make([]string, 0, 11)
+	conditional := make([]string, 0, 14)
 	for _, spec := range specs {
 		if spec.conditional {
 			conditional = append(conditional, adminRouteKey(spec))
@@ -400,8 +415,10 @@ func TestAdminRoutes_SaveFaceBindingCodes(t *testing.T) {
 	}
 }
 
-// TestAdminRoutes_NonConditionalRowsSkipIfMatch：26 条非条件写 / 只读行不套
+// TestAdminRoutes_NonConditionalRowsSkipIfMatch：34 条非条件写 / 只读行不套
 // If-Match 中间件——无请求头时进入处理函数（占位回 500），绝不回 412。
+// 逐行断言本身是判据；总数只随已批准接口（14D 三条执行档位端点、四条网络策略端点
+// 与实例加密两行）机械增长。
 // 逆改点：把条件写中间件误套到整个写面 → 对应行变 412，本用例红。
 func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
 	s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
@@ -419,7 +436,7 @@ func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
 		require.NotEqual(t, http.StatusPreconditionFailed, rec.Code, "%s 不要求 If-Match", adminRouteKey(spec))
 		require.NotEqual(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code, "%s", adminRouteKey(spec))
 	}
-	require.Equal(t, 26, checked)
+	require.Equal(t, 34, checked)
 }
 
 // TestAdminRoutes_AuthPrecedesIfMatch：认证在条件写中间件之外——缺凭据时无论

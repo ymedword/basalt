@@ -4,7 +4,7 @@
 // Write-only credential input. The parent resets the bound value to '' after a save;
 // the page keeps only mode, state, version and last4. Stored secrets have no
 // read-back path: the component renders props only and never stores the value.
-import { computed, defineComponent, h } from 'vue'
+import { computed, defineComponent, h, ref } from 'vue'
 import type { PropType, VNode, VNodeChild } from 'vue'
 import type { CredentialMode, CredentialState } from '../api'
 import { StatusBadge } from './ui'
@@ -56,6 +56,35 @@ export const CredentialField = defineComponent({
     reference: { type: String, default: '' },
     /** 是否允许在这里切换模式（资源表单）；详情卡片只读时为 false。 */
     editableMode: { type: Boolean, default: false },
+    /**
+     * 实例加密服务未就绪时禁用「加密托管」选项（设计 §2.4.4 / §2.6.5）：
+     * 「环境变量」始终可用，降级路径不能一起被关掉。
+     * Disables the managed option while the instance key is not ready; the env
+     * source stays available so there is still a usable path.
+     */
+    managedDisabled: { type: Boolean, default: false },
+    /** 禁用「加密托管」的原因与修复动作；只在 managedDisabled 时展示。 */
+    // Why managed is disabled; shown only while managedDisabled is set.
+    managedReason: { type: String, default: '' },
+    /**
+     * 状态行的标题（例如模型连接的「当前 API 密钥」）：普通表单把「实例加密服务
+     * 是否就绪」与「这个凭据是否已保存」分成两行，标题负责区分两者。
+     * Optional title for the status line, so a page can separate "service ready"
+     * from "this credential saved".
+     */
+    statusTitle: { type: String, default: '' },
+    /**
+     * 是否把「凭据来源」收进「高级」折叠区：普通表单默认加密托管，环境变量是高级
+     * 部署选项，不该是每次录入都要做的选择；已用 env 的连接默认展开显示引用。
+     * Nests the source selector behind an advanced disclosure; env stays available.
+     */
+    advancedSource: { type: Boolean, default: false },
+    /**
+     * 是否显示值输入框。MCP 逐占位符卡片在「环境变量」来源下不在这里填写任何东西
+     * （引用写在定义里）——隐藏输入框比留一个会被忽略的框更诚实。
+     * Hides the value input where the source forbids a value (per-slot env mode).
+     */
+    valueVisible: { type: Boolean, default: true },
     disabled: { type: Boolean, default: false },
   },
   emits: {
@@ -64,6 +93,8 @@ export const CredentialField = defineComponent({
   },
   setup(props, { emit }) {
     const managed = computed(() => props.mode === 'managed')
+    // 高级折叠区的展开状态：已有 env 连接默认展开，让既有配置一眼可见。
+    const sourceOpen = ref(props.mode === 'env')
     const placeholder = computed(() => {
       if (props.placeholder !== '') {
         return props.placeholder
@@ -102,9 +133,18 @@ export const CredentialField = defineComponent({
 
     function modeSelect(): VNode {
       const choices: VNode[] = (['env', 'managed'] as const).map((mode) =>
-        h('option', { key: mode, value: mode }, CREDENTIAL_MODE_LABELS[mode]),
+        h(
+          'option',
+          {
+            key: mode,
+            value: mode,
+            // 只灰掉「加密托管」；环境变量来源永远可选。
+            disabled: mode === 'managed' && props.managedDisabled,
+          },
+          CREDENTIAL_MODE_LABELS[mode],
+        ),
       )
-      return h('label', { class: 'field', for: `${props.id}-mode` }, [
+      const children: VNodeChild[] = [
         h('span', '凭据来源'),
         h(
           'select',
@@ -118,37 +158,74 @@ export const CredentialField = defineComponent({
           },
           choices,
         ),
-      ])
+      ]
+      if (props.managedDisabled && props.managedReason !== '') {
+        children.push(h('span', { class: 'field-hint muted' }, props.managedReason))
+      }
+      return h('label', { class: 'field', for: `${props.id}-mode` }, children)
+    }
+
+    /** 「凭据来源」选择：普通表单收进「高级」折叠区，MCP 逐槽位卡片保持直接选择。 */
+    // The source selector; ordinary forms nest it behind an advanced disclosure.
+    function sourcePicker(): VNode {
+      if (!props.advancedSource) {
+        return modeSelect()
+      }
+      return h(
+        'details',
+        {
+          class: 'credential-advanced',
+          open: sourceOpen.value,
+          onToggle: (event: Event) => {
+            sourceOpen.value = (event.target as HTMLDetailsElement).open
+          },
+        },
+        [
+          h('summary', {}, `高级：凭据来源（${CREDENTIAL_MODE_LABELS[props.mode]}）`),
+          modeSelect(),
+        ],
+      )
     }
 
     function statusLine(): VNode {
-      // env 模式在契约里没有凭据状态（credential_state 恒为空串）：显示「未录入」
-      // 会把「有变量引用」说成「没配置」。env 分支只展示模式与引用。
-      // env has no credential state; only managed shows the state badge.
+      // 这一行只说「这个凭据是否已保存」；不重复模式名——普通表单默认就是加密
+      // 托管，来源只在高级折叠区里出现。env 在契约里没有凭据状态（恒为空串），
+      // 显示「未录入」会把「有变量引用」说成「没配置」，所以 env 分支只展示引用。
+      // The line says whether this credential is saved; the mode is not repeated
+      // because managed is the ordinary default. env has no credential state.
       const parts: VNodeChild[] = []
-      if (managed.value) {
-        parts.push(h(StatusBadge, { label: stateInfo.value.label, tone: stateInfo.value.tone }))
+      if (props.statusTitle !== '') {
+        parts.push(h('span', { class: 'credential-status-title' }, `${props.statusTitle}：`))
       }
-      parts.push(h('span', { class: 'credential-mode' }, CREDENTIAL_MODE_LABELS[props.mode]))
       if (managed.value) {
-        if (props.version > 0) {
-          parts.push(h('span', {}, `凭据版本 ${props.version}`))
-        }
-        if (props.last4 !== '') {
-          parts.push(h('code', { class: 'credential-last4' }, `尾号 ····${props.last4}`))
+        if (props.version === 0) {
+          parts.push(
+            h('span', { class: 'muted' }, props.statusTitle === '' ? `尚未保存${props.noun}` : '尚未保存'),
+          )
         } else {
-          parts.push(h('span', { class: 'muted' }, `尚无加密托管的${props.noun}`))
+          parts.push(h(StatusBadge, { label: stateInfo.value.label, tone: stateInfo.value.tone }))
+          const suffix =
+            props.last4 === ''
+              ? `版本 ${props.version}`
+              : `版本 ${props.version}，尾号 ····${props.last4}`
+          parts.push(h('span', {}, `已保存（${suffix}）`))
         }
-      } else if (props.reference !== '') {
-        parts.push(h('code', {}, props.reference))
+      } else {
+        parts.push(h('span', { class: 'credential-mode' }, CREDENTIAL_MODE_LABELS[props.mode]))
+        if (props.reference !== '') {
+          parts.push(h('code', {}, props.reference))
+        }
       }
       return h('p', { class: 'credential-status' }, parts)
     }
 
     return (): VNode => {
-      const children: VNodeChild[] = [valueInput()]
+      const children: VNodeChild[] = []
+      if (props.valueVisible) {
+        children.push(valueInput())
+      }
       if (props.editableMode) {
-        children.push(modeSelect())
+        children.push(sourcePicker())
       }
       children.push(statusLine(), h('p', { class: 'field-hint muted' }, hint.value))
       return h('div', { class: 'credential-field' }, children)

@@ -216,6 +216,14 @@ type RunEnv struct {
 	// start and frozen for the rest of it; an empty string means no memory at all.
 	memory string
 
+	// pinnedTools / pinnedSpecs 是准入时钉住的工具实例与规格（14D / C4）：注册池可能被
+	// 受控重建整组换掉，本次运行手里的仍是准入那一刻的实例。nil = 未钉（零值单测），
+	// 执行器与提示词构建回落到按名解析的既有路径。
+	// pinnedTools/pinnedSpecs are the instances and specs frozen at admission; nil means
+	// the run was not admitted through the pinning seam.
+	pinnedTools map[string]Tool
+	pinnedSpecs []ToolSpec
+
 	// notifyMode 是准入时冻结的通知模式；零值 = 未接三态解析，按兼容规则读作
 	// `all_eligible`（见 EffectiveNotifyMode）。
 	// notifyMode is the frozen notification mode; the zero value falls back to the
@@ -304,6 +312,12 @@ type ToolEnv struct {
 	// ToolInvocationID is the audit row id injected by the executor after the fail-closed
 	// pre-write; 0 means no audit row exists, so no delivery record is written.
 	ToolInvocationID int64
+	// Tools 是本次 Run 准入时**钉住的工具实例**（14D / C4）：执行器按名先查这里，未命中
+	// 才回落到注册池。nil = 未钉（零值单测 / 非 Run 直调），行为与加钉之前逐字相同。
+	// 它随 ToolEnv 显式传递——**不**进 context（宪法 VII）。
+	// Tools carries the pinned instances of this run; a nil map falls back to the
+	// registry exactly as before.
+	Tools map[string]Tool
 }
 
 // NewRunID 生成运行标识：`<渠道>-<毫秒时间戳>-<6 位 base36 小写>`（契约 §5）。
@@ -379,6 +393,10 @@ func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
 		RunBound:       true,
 		NotifyMode:     EffectiveNotifyMode(e.notifyMode, e.notifyChannels),
 		NotifyChannels: e.notifyChannels,
+		// 钉住的实例随运行环境交给执行器（14D / C4）：注册池后续被换掉也改不到本次运行。
+		// The pinned instances travel to the executor; a later registry swap cannot
+		// retarget this run.
+		Tools: e.pinnedTools,
 	}
 }
 

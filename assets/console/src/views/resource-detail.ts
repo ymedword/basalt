@@ -1,13 +1,15 @@
 // 资源详情视图（/console/resources/:kind/:id）：版本列表 / 版本详情、发布 /
 // 撤回（用旧版本内容创建新版本）、删除、引用面板与一次性连接测试；
 // R4 追加模型连接的范围卡片（共享 ⇄ 专属）与托管凭据卡片（撤销确认）；
-// US-14 追加 MCP 四轴（配置 / 连接 / 上次测试 / 依赖诊断）与操作详情展开。
+// US-14 追加 MCP 六轴（依赖 / 配置 / 连接 / 上次测试 / 工具 / 引用）、独立的
+// 「待重启」行、逐占位符凭据卡片（撤销）与受控应用（apply）面板。
 // 条件写一律使用详情 GET 返回的响应头 ETag；412 重新读取 ETag 与版本列表并
 // **保留**已选版本；409 / 400 展示服务端固定文案与点名；写成功后重新 GET。
 // Resource detail: versions, publish/revert, delete, references and one-shot
-// connection tests, plus the R4 scope and managed-credential cards. Conditional
-// writes use the detail GET's ETag; a 412 re-reads the ETag while keeping the
-// selected version. No optimistic updates.
+// connection tests, plus the scope and managed-credential cards and the six MCP
+// axes (dependency / config / connection / last test / tools / references) with
+// per-slot credentials and the controlled apply. Conditional writes use the
+// detail GET's ETag; a 412 re-reads the ETag while keeping the selected version.
 import { computed, defineComponent, h, onMounted, ref, watch } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import { ApiError, errorMessage, resourceErrorCopy } from '../api'
@@ -15,6 +17,9 @@ import type {
   ConnectionTestView,
   McpCommandReason,
   McpCommandState,
+  McpCredentialKeyState,
+  McpCredentialKeyView,
+  McpDependencyState,
   McpDiagnosticWarning,
   McpServerDiagnostics,
   McpServerView,
@@ -27,6 +32,8 @@ import { adminApi } from '../api-admin'
 import { catalogApi } from '../api-catalog'
 import type {
   AdminResourceKind,
+  McpServerApplyResult,
+  McpServerDetail,
   McpServerTestResult,
   ModelConnectionTestResult,
   ResourcePublishResult,
@@ -129,6 +136,35 @@ const TEST_FAILURE_LABELS: Record<string, string> = {
   tools_list_failed: '工具列表失败',
   env_missing: '环境变量缺失',
   dependency_unconfirmed: '依赖未确认（无法归因）',
+  // apply 的失败分类是测试枚举加一个 `drain_timeout`（契约 McpServerApplyResult）。
+  // Apply adds one class to the test enum: the drain window expired.
+  drain_timeout: '排空超时（旧连接未在窗口内结束）',
+}
+
+/** 运行时依赖三态（契约 McpDependencyDiagnosis.state）。 */
+const DEPENDENCY_STATE_LABELS: Readonly<
+  Record<McpDependencyState, { readonly label: string; readonly tone: 'ok' | 'bad' | 'warn' }>
+> = {
+  ready: { label: '依赖就位', tone: 'ok' },
+  missing: { label: '依赖缺失', tone: 'bad' },
+  version_mismatch: { label: '依赖版本不符', tone: 'warn' },
+}
+
+/** 占位符状态（契约 McpCredentialKeyView.state）：来源声明 + 托管值现状。 */
+const SLOT_STATE_LABELS: Readonly<
+  Record<McpCredentialKeyState, { readonly label: string; readonly tone: 'ok' | 'bad' | 'muted' | 'warn' }>
+> = {
+  managed: { label: '托管有效', tone: 'ok' },
+  managed_revoked: { label: '托管已撤销', tone: 'bad' },
+  missing: { label: '缺托管值', tone: 'warn' },
+  env: { label: '环境变量', tone: 'muted' },
+}
+
+/** 应用被谁取代（契约 McpServerApplyResult.superseded_by）。 */
+const SUPERSEDED_BY_LABELS: Readonly<Record<string, string>> = {
+  publish: '另一次发布推进了发布指针',
+  revoke: '凭据被撤销',
+  apply: '另一次应用先完成了切换',
 }
 
 /** 诊断 warnings 六个 code（D-10 诊断集合，与目录集合各自固定、不合并）。 */
@@ -148,6 +184,17 @@ function stageText(stage: string): string {
 
 function failureText(failure: string): string {
   return failure === '' ? '—' : (TEST_FAILURE_LABELS[failure] ?? failure)
+}
+
+/** 应用结果三态：只有 `applied` 真的切换了运行版本。 */
+function applyOutcomeBadge(outcome: string): VNode {
+  if (outcome === 'applied') {
+    return badge('已应用', 'ok')
+  }
+  if (outcome === 'superseded') {
+    return badge('被取代（未切换）', 'warn')
+  }
+  return badge('应用失败（未切换）', 'bad')
 }
 
 interface DetailState {
@@ -246,6 +293,15 @@ export const ResourceDetailView = defineComponent({
         return null
       }
       return state.view as ModelConnectionView
+    }
+
+    /** MCP 详情（含 args / url）：只在 MCP 详情页返回，其它类别为 null。 */
+    function mcpState(): McpServerDetail | null {
+      const state = detail.data.value
+      if (state === null || kind !== 'mcp-servers') {
+        return null
+      }
+      return state.view as McpServerDetail
     }
 
     watch(detail.data, (next) => {
@@ -355,6 +411,91 @@ export const ResourceDetailView = defineComponent({
       }
     }
 
+    /**
+     * 逐占位符撤销：只影响这一个槽位，其它占位符不动；撤销立即回收连接（不等
+     * 一次 apply），门先关死再回收，降级失败只记日志、不把撤销说成失败。
+     * A per-slot revocation is immediate: the gate closes first, the connection is
+     * reclaimed after, and other slots stay untouched.
+     */
+    async function confirmRevokeSlot(): Promise<void> {
+      const slot = slotRevoke.value
+      const ifMatch = currentEtag()
+      slotRevoke.value = null
+      if (busy.value || slot === null || ifMatch === null) {
+        return
+      }
+      resetFeedback()
+      const resourceUid = currentResourceUID()
+      if (resourceUid === '') {
+        error.value = '资源身份尚未读取，请刷新页面后再撤销'
+        return
+      }
+      busy.value = true
+      try {
+        const result = await client.revokeCredential(
+          'mcp_server',
+          id,
+          { resource_uid: resourceUid, confirm: true, binding_key: slot.key },
+          ifMatch,
+        )
+        notice.value =
+          `已撤销占位符 ${slot.key} 的 ${result.revoked_versions} 个凭据版本（撤销序号 ${result.revocation_epoch}）；` +
+          '连接已回收，其它占位符不受影响，重新录入会生成新版本。'
+        await reloadAll()
+      } catch (caught) {
+        await handleWriteFailure(caught)
+      } finally {
+        busy.value = false
+      }
+    }
+
+    // --- 受控应用（apply）：publish 之后再切换运行版本 --------------------
+    async function runApply(): Promise<void> {
+      const ifMatch = currentEtag()
+      applyOpen.value = false
+      if (busy.value || ifMatch === null) {
+        return
+      }
+      resetFeedback()
+      busy.value = true
+      try {
+        const result = await client.applyMcpServer(id, ifMatch)
+        applyResult.value = result
+        notice.value =
+          `已应用 ${versionLabel(result.applied_version_id)}；原运行版本 ${versionLabel(result.previous_version_id)}，` +
+          `排空截止 ${result.drain_deadline === '' ? '—' : formatTimestamp(result.drain_deadline)}（窗口 ${result.drain_timeout_seconds} 秒）。`
+        await reloadAll()
+      } catch (caught) {
+        await handleApplyFailure(caught)
+      } finally {
+        busy.value = false
+      }
+    }
+
+    /**
+     * 应用失败：412 走条件写的统一分支（重新读取、绝不自动重发）；其它失败按
+     * 信封展示固定文案，再用 `operation_id` 读一次操作详情——阶段 / 失败分类
+     * 只认台账，不猜。
+     * Apply failures re-read the operation row named by the envelope; nothing is resent.
+     */
+    async function handleApplyFailure(caught: unknown): Promise<void> {
+      if (caught instanceof ApiError && caught.status === 412) {
+        await handleWriteFailure(caught)
+        return
+      }
+      showFailure(caught)
+      const operationId = caught instanceof ApiError ? (caught.data?.operation_id ?? '') : ''
+      if (operationId !== '') {
+        try {
+          applyOperation.value = await props.ctx.api.getOperation(operationId)
+        } catch (readError) {
+          // 台账读不到就如实说缺口，主提示仍是信封文案。
+          error.value = `${error.value}（读取操作详情失败：${errorMessage(readError)}）`
+        }
+      }
+      await reloadAll()
+    }
+
     // --- 版本详情（不可变，412 不清空）------------------------------------
     const versionDetail = ref<ResourceVersionDetail | null>(null)
     const versionLoading = ref(false)
@@ -382,6 +523,13 @@ export const ResourceDetailView = defineComponent({
     const notice = ref('')
     const deleteOpen = ref(false)
     const testResult = ref<ModelConnectionTestResult | McpServerTestResult | null>(null)
+    // 受控应用（apply）：成功时记结果对象；失败时以操作台账为准再读一次详情，
+    // 页面不自行拼失败读数。`slotRevoke` 是逐占位符撤销的待确认对象。
+    // Controlled apply: the success result, or the operation row read back on failure.
+    const applyOpen = ref(false)
+    const applyResult = ref<McpServerApplyResult | null>(null)
+    const applyOperation = ref<OperationDetail | null>(null)
+    const slotRevoke = ref<McpCredentialKeyView | null>(null)
     // 引用解析与连接结果是两件事：503 = 环境变量未设置（测试未发出）；200 才说明
     // 服务进程读到了非空值，ok 只代表供应商是否接受这次调用。
     // Reference resolution is separate from call outcome: 503 means the variable was
@@ -396,6 +544,8 @@ export const ResourceDetailView = defineComponent({
       notice.value = ''
       testResult.value = null
       testReference.value = 'unknown'
+      applyResult.value = null
+      applyOperation.value = null
     }
 
     /**
@@ -764,6 +914,151 @@ export const ResourceDetailView = defineComponent({
       return section('凭据管理', children)
     }
 
+    /**
+     * 逐占位符凭据卡片（14D）：来源、状态、尾号与撤销入口。只列已声明的槽位；
+     * 没有来源声明的占位符单独列出并被标红——那是配置错误，不是“没有凭据”。
+     * Per-slot credentials; undeclared slots are listed as a configuration error.
+     */
+    function renderMcpCredentialSection(): VNodeChild {
+      const item = mcpState()
+      if (item === null) {
+        return null
+      }
+      if (item.published_version_id === 0) {
+        return section('占位符凭据', [
+          h('p', { class: 'muted' }, '尚未发布配置：保存并发布后，占位符的凭据来源与状态会在这里按槽位列出。'),
+        ])
+      }
+      const undeclared = undeclaredSlotKeys(item)
+      if (item.credential_keys.length === 0 && undeclared.length === 0) {
+        return section('占位符凭据', [
+          h('p', { class: 'muted' }, '已发布的定义没有 env 键或请求头占位符，不需要凭据。'),
+        ])
+      }
+      const rows: TableRow[] = [
+        ...item.credential_keys.map((slot) => {
+          const copy = SLOT_STATE_LABELS[slot.state]
+          return {
+            key: slot.key,
+            cells: [
+              identifier(slot.key),
+              CREDENTIAL_MODE_LABELS[slot.mode],
+              badge(copy.label, copy.tone),
+              slot.last4 === '' ? '—' : `····${slot.last4}`,
+              slot.mode === 'managed' && slot.state === 'managed'
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'danger',
+                      disabled: busy.value,
+                      onClick: () => {
+                        resetFeedback()
+                        slotRevoke.value = slot
+                      },
+                    },
+                    '撤销',
+                  )
+                : '—',
+            ],
+          }
+        }),
+        ...undeclared.map((key) => ({
+          key: `undeclared:${key}`,
+          cells: [identifier(key), badge('未声明来源', 'bad'), '—', '—', '—'],
+        })),
+      ]
+      const children: VNodeChild[] = [
+        h(DataTable, {
+          headers: ['占位符', '来源', '状态', '尾号', '操作'],
+          rows,
+          empty: '没有占位符',
+          tableClass: 'mcp-credentials-table',
+          columnClasses: ['col-name', 'col-short', 'col-state', 'col-short', 'col-action'],
+        }),
+        h(
+          'p',
+          { class: 'muted small' },
+          '「加密托管」由服务端主密钥加密保存；「环境变量」只保存 ${VAR} 引用，值由部署者注入进程环境。两种来源都不在页面上回显原值。',
+        ),
+        h(
+          'p',
+          { class: 'muted small' },
+          '撤销单个占位符立即生效：先关闭该 server 的门，再回收连接（不等一次「应用」）；旧版本永不复活，重新录入会生成新版本，其它占位符不受影响。',
+        ),
+      ]
+      if (undeclared.length > 0) {
+        children.push(
+          h(
+            'p',
+            { class: 'muted small' },
+            `未声明来源的占位符（${undeclared.join('、')}）来自 14D 之前的版本：下一次保存会要求逐个选择来源，不会按“有没有托管行”推断。`,
+          ),
+        )
+      }
+      return section('占位符凭据', children)
+    }
+
+    /**
+     * 受控应用结果（apply）：成功显示版本切换与排空窗口；失败显示操作台账里
+     * 的终态——页面不自己拼一条失败读数。
+     * The apply result panel; a failure reads back the operation row.
+     */
+    function renderApplySection(): VNodeChild {
+      if (kind !== 'mcp-servers') {
+        return null
+      }
+      const result = applyResult.value
+      const operation = applyOperation.value
+      if (result === null && operation === null) {
+        return null
+      }
+      const children: VNodeChild[] = []
+      if (result !== null) {
+        children.push(
+          definitions([
+            ['结果', applyOutcomeBadge(result.outcome)],
+            ['目标版本', versionLabel(result.target_version_id)],
+            ['应用后运行版本', versionLabel(result.applied_version_id)],
+            ['原运行版本', versionLabel(result.previous_version_id)],
+            ['排空截止', result.drain_deadline === '' ? '—' : formatTimestamp(result.drain_deadline)],
+            ['排空窗口', `${result.drain_timeout_seconds} 秒`],
+            ['失败分类', failureText(result.failure_class)],
+            [
+              '被谁取代',
+              result.superseded_by === ''
+                ? '—'
+                : (SUPERSEDED_BY_LABELS[result.superseded_by] ?? result.superseded_by),
+            ],
+            ['操作标识', identifier(result.operation_id)],
+          ]),
+        )
+      }
+      if (operation !== null) {
+        const detail = operation.detail ?? {}
+        const outcome = detailText(detail, 'outcome')
+        children.push(
+          definitions([
+            ['台账结论', outcome === '' ? '—' : applyOutcomeBadge(outcome)],
+            ['操作状态', badge(OPERATION_STATUS_LABELS[operation.status], operationStatusTone(operation.status))],
+            ['结果码', operation.result_code === '' ? '—' : operation.result_code],
+            ['错误信息', operation.error_message === '' ? '—' : operation.error_message],
+            ['失败分类', failureText(detailText(detail, 'failure_class'))],
+            ['排空截止', detailText(detail, 'drain_deadline') === '' ? '—' : formatTimestamp(detailText(detail, 'drain_deadline'))],
+          ]),
+          renderOperationFacts(operation),
+        )
+      }
+      children.push(
+        h(
+          'p',
+          { class: 'muted small' },
+          '应用只切换运行版本：失败或被并发写取代时运行中的版本保持不变，旧连接不会因为一次失败的应用而改用新配置。排空窗口内旧连接结束，之后才回收。',
+        ),
+      )
+      return section('受控应用', children)
+    }
+
     // --- MCP 四轴 ---------------------------------------------------------
     /** 操作详情里的值都是 unknown：只按类型取值，缺失一律回退，不猜。 */
     function detailText(detail: Record<string, unknown>, key: string): string {
@@ -793,27 +1088,95 @@ export const ResourceDetailView = defineComponent({
       return match === undefined ? `版本 ID ${versionId}` : `v${match.version_no}`
     }
 
-    /** 配置轴：published == 0 未配置；published != applied 待重启；否则已应用。 */
+    /** 诊断返回的 env 就绪布尔（只对 env 键）；诊断未读到或读取失败时返回 null。 */
+    function diagnosedEnv(): Map<string, boolean> | null {
+      const info = diagnosis.data.value
+      if (info === null) {
+        return null
+      }
+      const map = new Map<string, boolean>()
+      for (const entry of info.env) {
+        map.set(entry.key, entry.set)
+      }
+      return map
+    }
+
+    /** 已发布定义里的占位符键：env 键与请求头名共用同一名字空间（契约保证不交叉）。 */
+    function declaredSlotKeys(item: McpServerView): string[] {
+      return [...item.env_keys, ...item.header_keys].sort()
+    }
+
+    /** 没有来源声明的占位符：`credential_keys` 只列已声明的槽位，缺声明是配置错误。 */
+    function undeclaredSlotKeys(item: McpServerView): string[] {
+      const declared = new Set(item.credential_keys.map((slot) => slot.key))
+      return declaredSlotKeys(item).filter((key) => !declared.has(key))
+    }
+
+    /**
+     * 配置轴：条目校验 + 占位符就绪（契约三值：完整 / 缺凭据 / 校验失败）。
+     * 只按已读到的证据判定：托管缺失 / 已撤销、env 未设置（诊断回布尔）、
+     * 没有来源声明。诊断没读到时不猜 env 就绪，也不把“未核对”说成“完整”。
+     * The config axis keeps to the evidence at hand; unchecked env slots are never
+     * upgraded to "complete".
+     */
     function mcpConfigAxis(item: McpServerView): VNodeChild {
       if (item.published_version_id === 0) {
         return badge('未配置', 'muted')
       }
-      if (item.pending_restart) {
+      const undeclared = undeclaredSlotKeys(item)
+      if (undeclared.length > 0) {
         return h('span', {}, [
-          badge('已发布未应用（待重启）', 'warn'),
-          h('span', { class: 'muted small' }, ` · 发布 v${item.published_version_no}，运行 v${item.applied_version_no}`),
+          badge('校验失败', 'bad'),
+          h('span', { class: 'muted small' }, ` · 未声明来源：${undeclared.join('、')}（下次保存必须逐个选择来源）`),
+        ])
+      }
+      const envState = diagnosedEnv()
+      const blocked: string[] = []
+      for (const slot of item.credential_keys) {
+        if (slot.state === 'managed_revoked') {
+          blocked.push(`${slot.key}（托管已撤销）`)
+        } else if (slot.state === 'missing') {
+          blocked.push(`${slot.key}（缺托管值）`)
+        } else if (slot.state === 'env' && envState !== null && envState.get(slot.key) === false) {
+          blocked.push(`${slot.key}（环境变量未设置）`)
+        }
+      }
+      const headerEnvSlots = item.credential_keys.filter(
+        (slot) => slot.state === 'env' && item.header_keys.includes(slot.key),
+      )
+      const caveat =
+        headerEnvSlots.length === 0
+          ? ''
+          : '；请求头占位符的就绪以应用预检为准'
+      if (blocked.length > 0) {
+        return h('span', {}, [
+          badge('缺凭据', 'warn'),
+          h('span', { class: 'muted small' }, ` · 未就绪：${blocked.join('、')}${caveat}`),
         ])
       }
       return h('span', {}, [
-        badge('已应用', 'ok'),
-        h('span', { class: 'muted small' }, ` · v${item.applied_version_no}`),
+        badge('完整', 'ok'),
+        h('span', { class: 'muted small' }, ` · 已声明 ${item.credential_keys.length} 个占位符${caveat}`),
       ])
     }
 
-    /** 连接轴：未配置一律“—”，不把“没配置过”说成“连不上”。 */
+    /**
+     * 连接轴：未配置一律“—”，不把“没配置过”说成“连不上”；发布已前移而运行
+     * 仍是旧版本时是「待应用」——当前连接对应的是运行版本，不是发布版本。
+     * A published-but-unapplied version reports 待应用; the live connection still
+     * belongs to the applied version.
+     */
     function mcpConnectionAxis(item: McpServerView): VNodeChild {
       if (item.published_version_id === 0) {
         return h('span', { class: 'muted' }, '—')
+      }
+      if (item.pending_restart) {
+        const running =
+          item.applied_version_id === 0 ? '尚未应用过任何版本' : `运行 v${item.applied_version_no}`
+        return h('span', {}, [
+          badge('待应用', 'warn'),
+          h('span', { class: 'muted small' }, ` · ${running}，发布 v${item.published_version_no}；${item.connected ? '当前连接对应运行版本' : '当前没有活动连接'}`),
+        ])
       }
       return item.connected ? badge('已连接', 'ok') : badge('未连接', 'bad')
     }
@@ -873,8 +1236,14 @@ export const ResourceDetailView = defineComponent({
       ])
     }
 
-    /** 诊断轴：命令三态 + env 布尔，只写结论，不改写连接或测试轴。 */
-    function mcpDiagnosisAxis(): VNodeChild {
+    /**
+     * 依赖轴：运行时组件三态（就位 / 缺失 / 版本不符）+ 命令定位三态；
+     * 两者都来自不启动进程的只读检查。`dependency=null` 表示这条定义不指向
+     * 已登记的运行时组件——是「不适用」，不是「缺失」。
+     * The dependency axis is the runtime component plus command location; a null
+     * dependency means "not applicable", never "missing".
+     */
+    function mcpDependencyAxis(): VNodeChild {
       if (diagnosis.error.value !== '') {
         return h('span', { class: 'muted' }, `读取失败：${diagnosis.error.value}`)
       }
@@ -883,20 +1252,24 @@ export const ResourceDetailView = defineComponent({
         return h('span', { class: 'muted' }, diagnosis.loading.value ? '读取中…' : '—')
       }
       const parts: VNodeChild[] = []
+      const dependency = info.dependency
+      if (dependency === null) {
+        parts.push(badge('不适用', 'muted'))
+        parts.push(h('span', { class: 'muted small' }, ' · 命令与参数不指向已登记的运行时组件'))
+      } else {
+        const copy = DEPENDENCY_STATE_LABELS[dependency.state]
+        parts.push(badge(copy.label, copy.tone))
+        const expected = dependency.expected_version === '' ? '—' : dependency.expected_version
+        const found = dependency.found_version === '' ? '' : `，实际 ${dependency.found_version}`
+        parts.push(
+          h('span', { class: 'muted small' }, ` · ${dependency.component} 期望 ${expected}${found}`),
+        )
+      }
       if (info.transport === 'stdio' && info.command !== null) {
+        parts.push(h('span', { class: 'muted small' }, ' · '))
         parts.push(badge(COMMAND_STATE_LABELS[info.command.state], COMMAND_STATE_TONES[info.command.state]))
       } else if (info.transport === 'stdio') {
-        parts.push(badge('命令未检查', 'muted'))
-      } else {
-        parts.push(badge('HTTP 传输', 'muted'))
-      }
-      const missing = info.env.filter((entry) => !entry.set).map((entry) => entry.key)
-      if (info.env.length === 0) {
-        parts.push(h('span', { class: 'muted small' }, ' · 无环境变量键'))
-      } else if (missing.length === 0) {
-        parts.push(h('span', { class: 'muted small' }, ` · 环境变量键全部就绪（${info.env.length} 个）`))
-      } else {
-        parts.push(h('span', { class: 'muted small' }, ` · 未就绪：${missing.join('、')}`))
+        parts.push(h('span', { class: 'muted small' }, ' · 命令未检查'))
       }
       if (info.warnings.length > 0) {
         parts.push(h('span', { class: 'muted small' }, ` · 已知边界 ${info.warnings.length} 条`))
@@ -905,19 +1278,27 @@ export const ResourceDetailView = defineComponent({
     }
 
     /**
-     * 工具来源（D-06）：`tools` 是 offered；被谁抢走看 tool_disposition。
+     * 工具轴（D-06）：`tools` 是 offered；被谁抢走看 tool_disposition。
      * 未连接时视图给 null——不拿“没有结果”冒充“全部注册成功”。
+     * The tools axis merges the offered list with the registration outcome.
      */
-    function renderToolDisposition(item: McpServerView): VNodeChild {
+    function mcpToolsAxis(item: McpServerView): VNodeChild {
+      if (item.published_version_id === 0) {
+        return h('span', { class: 'muted' }, '—')
+      }
+      const offered = item.tools.length === 0 ? '无' : item.tools.join('、')
+      const offeredLine = `已提供 ${item.tools.length}：${offered}`
       const disposition = item.tool_disposition
       if (disposition === null) {
-        return h(
-          'span',
-          { class: 'muted' },
-          item.published_version_id === 0 ? '—' : '未连接，暂无注册记录',
-        )
+        return h('span', {}, [
+          offeredLine,
+          h('span', { class: 'muted small' }, ' · 未连接，暂无注册记录'),
+        ])
       }
-      const children: VNodeChild[] = [`已提供 ${disposition.offered}，已注册 ${disposition.accepted}`]
+      const children: VNodeChild[] = [
+        `已提供 ${disposition.offered}，已注册 ${disposition.accepted}`,
+        h('span', { class: 'muted small' }, ` · ${offered}`),
+      ]
       if (disposition.skipped.length > 0) {
         children.push(
           h(
@@ -936,27 +1317,57 @@ export const ResourceDetailView = defineComponent({
       return h('span', {}, children)
     }
 
-    function renderMcpSummary(item: McpServerView, etag: string): VNode {
+    /**
+     * 引用轴：与「引用与占用」同源（含已归档 Agent）——它就是删除闸门的阻断
+     * 依据；读取失败不伪装成“没有引用”。
+     * The references axis shares the delete gate's source, archived Agents included.
+     */
+    function mcpReferencesAxis(): VNodeChild {
+      if (references.error.value !== '') {
+        return h('span', { class: 'muted' }, `读取失败：${references.error.value}`)
+      }
+      const value = references.data.value
+      if (value === null) {
+        return h('span', { class: 'muted' }, references.loading.value ? '读取中…' : '—')
+      }
+      if (value.bound_agents.length === 0) {
+        return h('span', { class: 'muted' }, '无配置引用（删除不会被 Agent 配置引用阻断）')
+      }
+      const names: string[] = value.bound_agents.map(
+        (ref) => `${ref.agent}${ref.archived ? '（已归档）' : ''}`,
+      )
+      return h('span', {}, `被 ${names.length} 个 Agent 引用：${names.join('、')}`)
+    }
+
+    function renderMcpSummary(item: McpServerDetail, etag: string): VNode {
+      const endpoint: readonly [string, VNodeChild] =
+        item.transport === 'http'
+          ? ['URL', item.url === '' ? '—' : identifier(item.url)]
+          : ['可执行名', identifier(item.command)]
       return h('div', {}, [
         definitions([
           ['名称', identifier(item.name)],
           ['传输', item.transport],
-          ['可执行名', identifier(item.command)],
-          ['环境变量键', item.env_keys.length === 0 ? '无' : item.env_keys.join('、')],
-          // 四条轴各看各的证据，不合并成单一“已验证”结论。
-          // Four axes, four pieces of evidence; no single "verified" verdict.
+          endpoint,
+          // 六条轴各看各的证据，不合并成单一“已验证”结论；「待重启」单独一行。
+          // Six axes, six pieces of evidence; no single "verified" verdict.
+          ['依赖', mcpDependencyAxis()],
           ['配置', mcpConfigAxis(item)],
           ['连接', mcpConnectionAxis(item)],
           ['上次测试', mcpTestAxis(item)],
-          ['依赖诊断', mcpDiagnosisAxis()],
+          ['工具', mcpToolsAxis(item)],
+          ['引用', mcpReferencesAxis()],
           ['待重启', item.pending_restart ? badge('需重启（发布版本尚未生效）', 'warn') : '否'],
-          ['工具（已提供）', item.tools.length === 0 ? '无' : item.tools.join('、')],
-          ['工具注册', renderToolDisposition(item)],
         ]),
         h(
           'p',
           { class: 'muted small' },
-          '四条轴互不预判：配置看版本指针，连接看 supervisor 快照，上次测试看最近一次管理操作，诊断来自不启动进程的只读检查。',
+          '六条轴互不预判：依赖看运行时目录与命令定位，配置看占位符来源与就绪，连接看 supervisor 快照，上次测试看最近一次管理操作，工具看 tools/list 与来源表，引用看资源引用表（含已归档 Agent）。诊断不启动进程、不写操作行。',
+        ),
+        h(
+          'p',
+          { class: 'muted small' },
+          '保存（发布新版本）、连接测试（一次性握手）与「应用」（切换运行版本）是三件不同的事：任何一件成功都不代言另外两件，应用失败时运行中的版本保持不变。',
         ),
         h('details', { class: 'technical-details' }, [
           h('summary', '技术细节'),
@@ -994,7 +1405,7 @@ export const ResourceDetailView = defineComponent({
         return renderModelSummary(state.view as ModelConnectionView, state.etag)
       }
       if (kind === 'mcp-servers') {
-        return renderMcpSummary(state.view as McpServerView, state.etag)
+        return renderMcpSummary(state.view as McpServerDetail, state.etag)
       }
       return renderSkillSummary(state.view as SkillView, state.etag)
     }
@@ -1235,7 +1646,7 @@ export const ResourceDetailView = defineComponent({
             h(
               'p',
               { class: 'muted small' },
-              '失败时先看「依赖诊断」：命令能否定位、环境变量是否就绪、是否应先重启；诊断结论不预判测试。',
+              '失败时先看「依赖」轴：运行时组件是否就位、命令能否定位、环境变量是否就绪；诊断结论不预判测试。',
             ),
           )
         }
@@ -1455,6 +1866,25 @@ export const ResourceDetailView = defineComponent({
           ),
         )
       }
+      // 「应用」只在 MCP 且已有发布版本时出现：没有发布版本就没有可切换的目标。
+      // The apply action only exists for MCP servers with a published version.
+      const mcp = kind === 'mcp-servers' ? mcpState() : null
+      if (mcp !== null && mcp.published_version_id > 0) {
+        buttons.push(
+          h(
+            'button',
+            {
+              type: 'button',
+              disabled: busy.value,
+              onClick: () => {
+                resetFeedback()
+                applyOpen.value = true
+              },
+            },
+            '应用发布版本…',
+          ),
+        )
+      }
       buttons.push(
         h(
           'button',
@@ -1520,6 +1950,8 @@ export const ResourceDetailView = defineComponent({
 
       children.push(renderTestResult())
       children.push(renderDiagnosisSection())
+      children.push(renderMcpCredentialSection())
+      children.push(renderApplySection())
 
       // 三类资源都可以在详情页修改：表单自己 GET 详情取 ETag，保存后整页重读。
       // All three kinds are editable here; the form GETs its own ETag.
@@ -1565,6 +1997,37 @@ export const ResourceDetailView = defineComponent({
           },
           onCancel: () => {
             revokeOpen.value = false
+          },
+        }),
+        // 应用把运行版本切到发布指针：确认框写清方向与排空窗口，方向在确认时冻结。
+        h(ConfirmDialog, {
+          open: applyOpen.value,
+          title: '应用发布版本',
+          message: `将「${id}」的运行版本从 ${versionLabel(mcpState()?.applied_version_id ?? 0)} 切换到 ${versionLabel(mcpState()?.published_version_id ?? 0)}。旧连接在排空窗口（默认 30 秒）内结束后回收；窗口内仍有连接时记「排空超时」，运行版本保持切换结果不回滚。被并发的发布 / 撤销 / 应用取代时不切换。`,
+          confirmText: '应用',
+          busy: busy.value,
+          onConfirm: () => {
+            void runApply()
+          },
+          onCancel: () => {
+            applyOpen.value = false
+          },
+        }),
+        // 逐槽位撤销：不动其它占位符，不删除资源，不等待一次「应用」。
+        h(ConfirmDialog, {
+          open: slotRevoke.value !== null,
+          title: '撤销占位符凭据',
+          message:
+            slotRevoke.value === null
+              ? ''
+              : `撤销「${id}」的占位符 ${slotRevoke.value.key} 后，该槽位立即关闭并回收连接（不等一次应用）；旧版本永不复活，只能重新录入生成新版本，其它占位符不受影响。`,
+          confirmText: '撤销该占位符',
+          busy: busy.value,
+          onConfirm: () => {
+            void confirmRevokeSlot()
+          },
+          onCancel: () => {
+            slotRevoke.value = null
           },
         }),
       )

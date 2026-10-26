@@ -102,7 +102,7 @@ func (b *PromptBuilder) Build(env *RunEnv) (Prompt, error) {
 	p := Prompt{
 		System:  system, // 段 1 + 段 2（段 2 为空时不产生任何字符）
 		History: trimByTurns(sessionMessages(env), maxHistoryTurns(env)),
-		Tools:   b.toolSpecs(env.ToolSet), // 段 4；空池 → nil
+		Tools:   b.toolSpecs(env), // 段 4；空池 → nil
 	}
 
 	limit := contextLimit(env.Budget.ContextTokens)
@@ -116,14 +116,22 @@ func (b *PromptBuilder) Build(env *RunEnv) (Prompt, error) {
 	return p, nil
 }
 
-// toolSpecs 取本轮的段 4 工具定义：逐名经 ToolResolver.Specs 查表（不遍历、不推断），
-// `ToolSet` 为空 → nil（**空池**：请求体不带 tools 键）。
-// toolSpecs resolves segment-4 tool definitions by name; an empty pool yields nil.
-func (b *PromptBuilder) toolSpecs(names []string) []ToolSpec {
-	if len(names) == 0 || b.resolver == nil {
+// toolSpecs 取本轮的段 4 工具定义：准入时钉住的规格优先（14D / C4——同一次运行的
+// 提示词与实际调用的实例必须是同一代），未钉时才逐名经 ToolResolver.Specs 查表
+// （不遍历、不推断）。`ToolSet` 为空 → nil（**空池**：请求体不带 tools 键）。
+// toolSpecs prefers the admission-time pinned specs so the prompt and the instances
+// actually called stay the same generation; an empty pool yields nil.
+func (b *PromptBuilder) toolSpecs(env *RunEnv) []ToolSpec {
+	if len(env.ToolSet) == 0 {
 		return nil
 	}
-	return b.resolver.Specs(names)
+	if env.pinnedSpecs != nil {
+		return env.pinnedSpecs
+	}
+	if b.resolver == nil {
+		return nil
+	}
+	return b.resolver.Specs(env.ToolSet)
 }
 
 // sessionMessages 取会话历史（只读面）。

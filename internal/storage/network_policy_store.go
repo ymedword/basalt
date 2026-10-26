@@ -35,43 +35,60 @@ func NewNetworkPolicyStore(db *DB) *NetworkPolicyStore { return &NetworkPolicySt
 const policyColumns = `p.policy_scope, p.domains, p.revision, p.updated_at, p.operation_id,
 	COALESCE(op.actor_subject, '')`
 
-// Load 读取当前策略行；无行时 exists=false（调用方据此决定是否种子）。
-// Load reads the current row; exists=false when the table is still empty.
-func (s *NetworkPolicyStore) Load(ctx context.Context) (core.NetworkDomainPolicy, bool, error) {
+// validatePolicyScope 拒绝空作用域：作用域是行主键，空串会把"忘了传 scope"
+// 变成一行名为空串的幽灵数据。
+// validatePolicyScope refuses an empty scope so a missing argument cannot create a ghost row.
+func validatePolicyScope(scope string) error {
+	if scope == "" {
+		return errors.New("network domain policy: scope 不得为空")
+	}
+	return nil
+}
+
+// Load 读取指定作用域的当前策略行；无行时 exists=false（调用方据此决定是否种子）。
+// Load reads the row of one scope; exists=false when that scope still has no row.
+func (s *NetworkPolicyStore) Load(ctx context.Context, scope string) (core.NetworkDomainPolicy, bool, error) {
+	if err := validatePolicyScope(scope); err != nil {
+		return core.NetworkDomainPolicy{}, false, err
+	}
 	row := s.db.read.QueryRowContext(ctx,
 		`SELECT `+policyColumns+`
 		   FROM network_domain_policy p
 		   LEFT JOIN management_operations op ON op.operation_id = p.operation_id
-		  WHERE p.policy_scope = ?`, core.PolicyScopeHTTPDomains)
+		  WHERE p.policy_scope = ?`, scope)
 	policy, err := scanPolicy(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.NetworkDomainPolicy{}, false, nil
 	}
 	if err != nil {
-		return core.NetworkDomainPolicy{}, false, fmt.Errorf("load network domain policy: %w", err)
+		return core.NetworkDomainPolicy{}, false, fmt.Errorf("load network domain policy %q: %w", scope, err)
 	}
 	return policy, true, nil
 }
 
-// Seed 在无行时写入种子；已有行时原样返回既有行（幂等，**不**覆盖管理台写入的值）。
-// Seed inserts the config seed only when the table is empty; an existing row wins.
-func (s *NetworkPolicyStore) Seed(ctx context.Context, domains []string, now time.Time,
+// Seed 在目标作用域无行时写入种子；已有行时原样返回既有行（幂等，**不**覆盖管理台
+// 写入的值）。两个作用域各自独立：给禁止域名表种子不会动白名单那行。
+// Seed inserts the config seed only when that scope is empty; an existing row wins.
+func (s *NetworkPolicyStore) Seed(ctx context.Context, scope string, domains []string, now time.Time,
 ) (core.NetworkDomainPolicy, error) {
+	if err := validatePolicyScope(scope); err != nil {
+		return core.NetworkDomainPolicy{}, err
+	}
 	if _, err := s.db.write.ExecContext(ctx,
 		`INSERT INTO network_domain_policy
 		   (policy_scope, domains, revision, updated_at, operation_id)
 		 VALUES (?, ?, 1, ?, '')
 		 ON CONFLICT(policy_scope) DO NOTHING`,
-		core.PolicyScopeHTTPDomains, joinPolicyDomains(domains), now.UnixMilli()); err != nil {
-		return core.NetworkDomainPolicy{}, fmt.Errorf("seed network domain policy: %w", err)
+		scope, joinPolicyDomains(domains), now.UnixMilli()); err != nil {
+		return core.NetworkDomainPolicy{}, fmt.Errorf("seed network domain policy %q: %w", scope, err)
 	}
-	policy, exists, err := s.Load(ctx)
+	policy, exists, err := s.Load(ctx, scope)
 	if err != nil {
 		return core.NetworkDomainPolicy{}, err
 	}
 	if !exists {
 		// 插入成功却读不到：读池与写池指向同一文件，正常装配下不可达；仍如实报错。
-		return core.NetworkDomainPolicy{}, errors.New("network domain policy row missing after seeding")
+		return core.NetworkDomainPolicy{}, fmt.Errorf("network domain policy row %q missing after seeding", scope)
 	}
 	return policy, nil
 }
@@ -79,9 +96,12 @@ func (s *NetworkPolicyStore) Seed(ctx context.Context, domains []string, now tim
 // Update 以期望修订号做 CAS：落后 / 超前的期望值一律返回 `ErrPolicyRevisionConflict`
 // 且零写入。更新与回读在同一事务里完成，返回的行必然就是这次写入的结果。
 // Update applies a revision CAS and re-reads inside the same transaction.
-func (s *NetworkPolicyStore) Update(ctx context.Context, domains []string, expectedRevision int64,
+func (s *NetworkPolicyStore) Update(ctx context.Context, scope string, domains []string, expectedRevision int64,
 	operationID string, actor string, now time.Time,
 ) (core.NetworkDomainPolicy, error) {
+	if err := validatePolicyScope(scope); err != nil {
+		return core.NetworkDomainPolicy{}, err
+	}
 	if expectedRevision < 1 {
 		return core.NetworkDomainPolicy{}, fmt.Errorf("%w: expected revision %d is invalid",
 			core.ErrPolicyRevisionConflict, expectedRevision)
@@ -97,9 +117,9 @@ func (s *NetworkPolicyStore) Update(ctx context.Context, domains []string, expec
 		    SET domains = ?, revision = revision + 1, updated_at = ?, operation_id = ?
 		  WHERE policy_scope = ? AND revision = ?`,
 		joinPolicyDomains(domains), now.UnixMilli(), operationID,
-		core.PolicyScopeHTTPDomains, expectedRevision)
+		scope, expectedRevision)
 	if err != nil {
-		return core.NetworkDomainPolicy{}, fmt.Errorf("update network domain policy: %w", err)
+		return core.NetworkDomainPolicy{}, fmt.Errorf("update network domain policy %q: %w", scope, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
@@ -113,10 +133,10 @@ func (s *NetworkPolicyStore) Update(ctx context.Context, domains []string, expec
 		`SELECT `+policyColumns+`
 		   FROM network_domain_policy p
 		   LEFT JOIN management_operations op ON op.operation_id = p.operation_id
-		  WHERE p.policy_scope = ?`, core.PolicyScopeHTTPDomains)
+		  WHERE p.policy_scope = ?`, scope)
 	policy, err := scanPolicy(row.Scan)
 	if err != nil {
-		return core.NetworkDomainPolicy{}, fmt.Errorf("re-read network domain policy: %w", err)
+		return core.NetworkDomainPolicy{}, fmt.Errorf("re-read network domain policy %q: %w", scope, err)
 	}
 	// 操作者是本次调用的入参（刚写入的 operation_id 对应的审计行可能尚未提交完成读写
 	// 可见性差异），以入参为准，避免把空串投影给页面。

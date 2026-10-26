@@ -109,7 +109,10 @@ func testNotifySentinelRedaction(t *testing.T) {
 		})),
 		textResponse("脱敏读数完成"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL())+"http:\n  allowed_domains:\n    - other.example\n")
+	// 本用例判的是白名单拒绝本身：档位必须钉 strict——standard 下白名单不是外呼前置，
+	// 拒绝理由会变成基础防护或真实连接失败；新实例默认 standard（G1/G2）。
+	h.writeConfig(t, configWithProvider(fake.URL())+"http:\n  allowed_domains:\n    - other.example\n"+
+		"execution:\n  profile: strict\n")
 	h.writeAgent(t, "demo", agentFrontmatter("demo", []string{"notify"}), "凭证脱敏演示")
 	insertNotifyChannel(t, h, notifyChannelName, "webhook", "${"+notifyEnvRef+"}", "哨兵渠道")
 
@@ -199,7 +202,10 @@ func testNotifyDomainDenied(t *testing.T) {
 		})),
 		textResponse("域名拒绝完成"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL())+"http:\n  allowed_domains:\n    - other.example\n")
+	// 本用例判的是白名单拒绝本身：档位必须钉 strict——standard 下白名单不是外呼前置，
+	// 拒绝理由会变成基础防护或真实连接失败；新实例默认 standard（G1/G2）。
+	h.writeConfig(t, configWithProvider(fake.URL())+"http:\n  allowed_domains:\n    - other.example\n"+
+		"execution:\n  profile: strict\n")
 	h.writeAgent(t, "demo", agentFrontmatter("demo", []string{"notify"}), "域名拒绝演示")
 	insertNotifyChannel(t, h, notifyChannelName, "webhook", "${"+notifyEnvRef+"}", "域名渠道")
 

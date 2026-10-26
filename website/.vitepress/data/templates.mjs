@@ -63,10 +63,10 @@ export const DEMOS = [
     titleZh: '行业简报',
     bodyEn: 'Briefing with a source table of URL, title, date and access time.',
     bodyZh: '生成行业简报，并附 URL、标题、日期与访问时间组成的来源表。',
-    needsEn: 'Brave Search MCP and Fetch MCP',
-    needsZh: 'Brave Search MCP 与 Fetch MCP',
-    evidenceEn: 'Fixture replay: unfetched URLs stay leads only; both servers invoked',
-    evidenceZh: '夹具复跑：未抓正文的 URL 只作线索；两个 server 都被调用'
+    needsEn: 'Built-in web search (DeepSeek Search API) and Fetch MCP',
+    needsZh: '内置网页搜索（DeepSeek Search API）与 Fetch MCP',
+    evidenceEn: 'Fixture replay: unfetched URLs stay leads only; the search and Fetch channels are both invoked',
+    evidenceZh: '夹具复跑：未抓正文的 URL 只作线索；搜索与 Fetch 两条通道都被调用'
   }
 ]
 

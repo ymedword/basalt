@@ -24,14 +24,21 @@ import (
 // "先留痕再发出"在运行级同样成立。
 // Two rules: admission never queues, and evidence is written before the model is called.
 
-// defaultMaxConcurrentRuns 是实例级并发运行数的缺省上限（流程 A ①）。
-// defaultMaxConcurrentRuns is the default instance-level concurrency cap.
-const defaultMaxConcurrentRuns = 32
+// DefaultMaxConcurrentRuns 是实例级并发运行数的缺省上限（流程 A ①）。
+// 导出是因为管理台的就绪视图（14D / E8）要把"生效上限"与 Agent 的计划数对照，
+// 而缺省值必须与本包取同一份——两处各写一个 32 迟早对不上。
+// DefaultMaxConcurrentRuns is the default instance-level concurrency cap. It is exported
+// so the console's readiness view compares against the same default this package applies.
+const DefaultMaxConcurrentRuns = 32
 
 // 运行预算的缺省值（契约 §6）：调用方未填的项在这里补齐。
 // Default budget values (contract §6), applied when the caller leaves a field unset.
 const (
-	defaultMaxIterations = 10
+	// DefaultMaxIterations 是实例预算未配置时生效的迭代上限；导出理由同
+	// DefaultMaxConcurrentRuns（就绪视图的预算兼容检查）。
+	// DefaultMaxIterations is the effective iteration cap when the instance budget is
+	// unset; exported for the same readiness comparison.
+	DefaultMaxIterations = 10
 	defaultMaxToolCalls  = 50
 )
 
@@ -125,6 +132,11 @@ type ServiceOptions struct {
 	// RunSnapshots folds resolved resources into the run's frozen snapshot; it must be
 	// wired together with Resources.
 	RunSnapshots RunSnapshotBuilder
+	// ToolPins 是准入时钉住工具实例的解析面（14D / C4）：注册池可被受控重建整组换掉，
+	// 本次运行手里的实例由此固定。nil = 不钉（既有零值单测），执行器按名查注册池。
+	// ToolPins freezes this run's tool instances against a later controlled rebuild; a
+	// nil pinner keeps the pre-14D name lookup.
+	ToolPins ToolPinner
 }
 
 // AgentService 是唯一运行入口的实现：准入计数 + 一次运行的完整编排。
@@ -182,7 +194,7 @@ func NewAgentService(opts ServiceOptions) *AgentService {
 		opts.Now = time.Now
 	}
 	if opts.MaxConcurrent <= 0 {
-		opts.MaxConcurrent = defaultMaxConcurrentRuns
+		opts.MaxConcurrent = DefaultMaxConcurrentRuns
 	}
 	return &AgentService{
 		opts:       opts,
@@ -357,6 +369,13 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		// The mode and channel set are frozen at admission; tool calls never re-read the file.
 		notifyMode:     notifyMode,
 		notifyChannels: notifyChannels,
+	}
+	// 工具实例在准入时钉住（14D / C4）：此后对注册池的受控重建换不到本次运行手里这一组；
+	// 旧连接进入排空态，切换之后的新调用按"连接已重建"明确失败，不静默挂起、也不偷转。
+	// Tool instances are pinned at admission: a later rebuild cannot retarget this run,
+	// and calls on a draining link fail explicitly instead of being rerouted.
+	if s.opts.ToolPins != nil {
+		env.pinnedTools, env.pinnedSpecs = s.opts.ToolPins.Pin(toolSet)
 	}
 	if s.opts.Memory != nil {
 		text, err := s.opts.Memory.LoadEffective(ctx, req.Agent)
@@ -774,7 +793,7 @@ func (s *AgentService) Archive(ctx context.Context, sessionID string) error {
 // only. An explicit zero survives the loader on purpose and is honoured here.
 func mergeBudget(req Budget, profile *Profile) Budget {
 	if req.MaxIterations <= 0 {
-		req.MaxIterations = defaultMaxIterations
+		req.MaxIterations = DefaultMaxIterations
 	}
 	if req.MaxToolCalls <= 0 {
 		req.MaxToolCalls = defaultMaxToolCalls

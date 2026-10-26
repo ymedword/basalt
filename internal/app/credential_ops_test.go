@@ -675,7 +675,7 @@ func TestSecrets_InitRefusesWhenKeyExists(t *testing.T) {
 	before, err := os.ReadFile(f.keyPath)
 	require.NoError(t, err)
 
-	_, err = service.Init(ctx)
+	_, err = service.Init(ctx, core.Actor{})
 	require.Error(t, err)
 	require.ErrorIs(t, err, core.ErrCredentialUnavailable)
 	require.Contains(t, err.Error(), "已存在", "拒绝原因必须点名：文件已存在")
@@ -700,7 +700,7 @@ func TestSecrets_InitRefusesWithManagedDependency(t *testing.T) {
 	logs := &strings.Builder{}
 	service := newTestSecretsService(t, f, keyPath, logs)
 
-	_, err := service.Init(ctx)
+	_, err := service.Init(ctx, core.Actor{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "1 个托管模型连接", "拒绝原因必须点名托管依赖计数")
 	require.Contains(t, err.Error(), "1 个托管通知渠道", "托管渠道同样是拒绝条件")

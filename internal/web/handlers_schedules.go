@@ -11,8 +11,10 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/http"
+	"time"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -125,7 +127,7 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	runCtx, cancel := context.WithTimeout(r.Context(), s.opts.RunTimeout)
+	runCtx, cancel := context.WithTimeout(r.Context(), s.opts.ScheduleRunTimeout)
 	defer cancel()
 	started := s.now()
 	req, res, err := s.opts.Schedules.RunNow(runCtx, id)
@@ -137,7 +139,7 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			s.writeError(w, http.StatusGatewayTimeout, codeTimeout, "运行超过 60 秒时限")
+			s.writeError(w, http.StatusGatewayTimeout, codeTimeout, s.scheduleTimeoutMessage())
 			return
 		}
 		if errors.Is(err, core.ErrTaskBusy) {
@@ -152,6 +154,13 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeRunResult(r, w, res, req, started, s.now())
+}
+
+// scheduleTimeoutMessage 文案里点名实际生效的秒数：手动补跑用的是调度预算
+// （缺省 300s），照抄会话面的「60 秒」会让用户按错的时限排查。
+// The text names the effective limit instead of the session-face 60s.
+func (s *Server) scheduleTimeoutMessage() string {
+	return fmt.Sprintf("运行超过 %d 秒时限", int(s.opts.ScheduleRunTimeout/time.Second))
 }
 
 // writeScheduleError 映射管理端点（列表 / 启停 / 执行历史）的错误：未知 Agent

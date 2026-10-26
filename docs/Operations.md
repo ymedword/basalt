@@ -10,7 +10,7 @@
 
 ### 1.1 底座运行时：零外部依赖
 
-- `CGO_ENABLED=0` 静态二进制（linux/amd64、linux/arm64、windows、darwin 交叉编译），`scp` 一个文件 + `systemctl start` 即部署；目标机器**不需要** JVM / Node / Python / 包管理器
+- `CGO_ENABLED=0` 静态二进制（linux/amd64、linux/arm64、windows、darwin 交叉编译），`scp` 一个文件 + `systemctl start` 即部署；目标机器**不需要** JVM / Node / Python / 包管理器（完整发布包另附固定版本 Node / Python 供选配 Agent 使用，见 §1.3——同样不需要用户自行安装）
 - 数据自包含：全部状态在**当前工作目录的 `.basalt/`**（SQLite 库 + markdown 记忆 + Agent 目录 + 技能库 + 日志），无外部数据库、无消息队列、无缓存服务
 
 判据：目标机器上 `file ./basalt` 显示 `statically linked`（linux），且 `basalt status` 在没有网络、没有其他服务的机器上能跑出结果。
@@ -28,6 +28,28 @@
 
 **不得**把"某 Agent 需要 Python"写成"Basalt 需要 Python"——部署说明与验收口径以本表为准。
 
+### 1.3 完整发布包：随包固定版本组件
+
+完整发布包 = 产品二进制 + `runtime/`（固定版本的解释器与 MCP 组件）+ `LICENSES/`。底座本身仍是零外部依赖；包里附带的是上表"某些 Agent 选用"的解释器副本，装到目标机器后**不需要**再装 Node / Python，也**不需要** `npm` / `pip`：
+
+| 组件 | 包内路径（Windows 例） | 版本来源 |
+| --- | --- | --- |
+| Node.js | `runtime/node/` | 版本与来源固定在 `release/runtime-manifest.json` |
+| Python | `runtime/python/` | 同上 |
+| DBHub | `runtime/mcp/dbhub/` | `@bytebase/dbhub`，随包 `node_modules` |
+| GitHub MCP Server | `runtime/mcp/github-mcp-server/` | 官方 release 二进制 |
+| Fetch | `runtime/mcp/fetch/` | `mcp-server-fetch` 固定版本 |
+| docs-readonly | `runtime/mcp/docs-readonly/` | 本仓自研只读 MCP |
+
+要点：
+
+- **构建期出包，运行期不下载**：`go run ./scripts/release-package` 按清单逐组件核对版本，版本对不上就拒绝出包；产品进程不会在运行时下载或安装组件。
+- **组件存在 / 可用 / 执行授权是三件事**：文件在 `runtime/` 里只证明"存在"；"可用"看 MCP 是否真实连接；"执行授权"看 stdio 启动命令是否登记进 `shell.allowed_commands`（新实例初始化自动写入免凭据条目，存量实例由启动基线补齐已就绪项）。管理台「执行环境 → 运行环境」分列显示并提供「查看依赖」入口。
+- **缺件不静默补齐**：组件缺失时引用它的 MCP server 连不上，声明该 server 工具的 Agent 整只不注册（WARN 点名）；需要解压完整包或按清单补组件后重启。
+- **许可声明随包**：第三方文本在 `LICENSES/`（含 `THIRD-PARTY-NOTICES.md` 汇总）；产品许可见包根 `LICENSE`。
+
+首启验收（Windows 与 Linux 同一组动作）：解压 → `basalt serve` → 用访问密码登录 → 「执行环境 → 运行环境」核对组件存在 / 可用 / 执行授权 → 对已配置 MCP server 点「测试」看到 `stage=complete` 与工具清单。缺少用户个人凭据（如 `GITHUB_PERSONAL_ACCESS_TOKEN`）只显示待配置，不算包缺陷。
+
 ---
 
 ## 2. 监听与出网
@@ -38,13 +60,13 @@
 | --- | --- |
 | 配置键 | `http.addr`（`basalt.yaml`） |
 | 默认 | `127.0.0.1:8080`（只对本机开放） |
-| 管理认证 | `http.admin_auth.mode` **必填**：`token` / `local_trust`。未显式配置 → 拒绝启动 |
+| 管理认证 | `http.admin_auth.mode` **必填**：`token` / `local_trust`。未显式配置 → 拒绝启动。`token` 模式下 `http.admin_auth.token` 可省略——省略即读实例私有目录的 `admin-token` 文件（见 §2.1.1） |
 
-**必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并配置 `http.admin_auth.mode=token` 与 `http.admin_auth.token=${BASALT_ADMIN_TOKEN}`；token 未配置、解析为空或仍含 `${...}` → 拒绝启动。反向代理 / 隧道**不得**因上游连接是回环而绕过认证；`local_trust` 只在所有监听地址都是回环时允许，且只看**直接对端**，不看 `X-Forwarded-For` / `X-Real-IP`。
+**必须**：远程访问（多机联调 / 容器对外暴露）显式改 `http.addr`（容器内 `0.0.0.0:8080`），并配置 `http.admin_auth.mode=token`。访问密码的配置 / 环境变量 / 密码文件**三处都没有 → 拒绝启动**并点名三处，**不得**回落到 `local_trust`（那等于把管理面在无凭据状态下开放）。写了 `http.admin_auth.token` 键就必须解析出非空值——占位变量缺失、解析为空或残留 `${...}` 都在装载期拒绝，**不**悄悄改读密码文件。反向代理 / 隧道**不得**因上游连接是回环而绕过认证；`local_trust` 只在所有监听地址都是回环时允许，且只看**直接对端**，不看 `X-Forwarded-For` / `X-Real-IP`。
 
 症状与代价：改了 `0.0.0.0` 却不配 token、不做 TLS 与网络隔离 = 把"可调 Agent（含 `shell` 工具）"连同 bearer token 一起暴露在明文链路上。admin token 只是核心阶段的最低门槛，**没有**企业 SSO / 多租户 / RBAC（扩展阶段）；远程管理**必须**经 HTTPS 或明确的可信加密通道，TLS 终止与证书轮换由部署方负责。公开报道中已有大量 agent 管理端口暴露在公网导致会话与凭证泄漏的案例，不要把"能连上"当成"可以这样部署"。
 
-复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`；非回环部署在**不配置** `http.admin_auth.token` 时必须观察到启动失败（fail-closed），而不是"起来了但没人能进"。
+复核（可复制）：`ss -tlnp | grep 8080`——默认部署只应看到 `127.0.0.1:8080`；非回环部署在配置项、环境变量与 `admin-token` **三处都缺失**时必须观察到启动失败（fail-closed），而不是"起来了但没人能进"。新建实例首次 `serve` 会自动生成密码文件，要验这条失败路径，请在**副本工作区**里验证，不要先删生产实例的密码文件。
 
 #### 2.1.1 生成 token 与注入环境变量
 
@@ -67,6 +89,8 @@ http:
     token: ${BASALT_ADMIN_TOKEN}
 ```
 
+**第三来源：实例私有目录的 `admin-token` 文件**（与主密钥同目录、**分文件**——恢复语义不同：主密钥丢了要恢复或重录凭据，密码丢了重新生成即可）。`token` 键整体省略时，`serve` 读这个文件：内容按一行密码处理（去掉尾部空白，空文件不算有效来源）。新建实例首次 `serve` 自动生成 32 字节随机密码（base64url）并写入该文件（Linux `0600`）；**存量实例不自动生成**。提示纪律：非交互终端只打印文件路径，交互式只在生成那一刻显示一次值，密码本身**不得**进日志或错误文案。轮换 = 替换文件内容（或改配置里的占位环境变量）后重启进程。
+
 注入方式三选一（选与部署形态同生命周期的那种）：
 
 | 方式 | 做法 | 注意 |
@@ -75,7 +99,7 @@ http:
 | 容器 | `docker run --env-file /etc/basalt/basalt.env …` | 同主机有权限的进程能读到环境变量；隔离靠宿主机权限 |
 | 交互 shell（仅本机调试） | `export BASALT_ADMIN_TOKEN=<值>` | 换终端即丢失；生产不要用 |
 
-启动时校验（fail-closed，违反即**拒绝启动**并点名配置项）：占位符未配置、解析为空、仍含 `${...}`，或在 `basalt.yaml` 里直接写了明文 token。token 明文**不得**进入响应 / 日志 / 错误文案 / 管理审计；审计只记 `token:<sha256 前 16 位十六进制>`（§6）。
+启动时校验（fail-closed，违反即**拒绝启动**并点名配置项）：写了 `token` 键却占位符未配置、解析为空、仍含 `${...}`，或在 `basalt.yaml` 里直接写了明文 token；`token` 键省略时改按上文密码文件，**三处都没有**才拒绝启动。token 明文**不得**进入响应 / 日志 / 错误文案 / 管理审计；审计只记 `token:<sha256 前 16 位十六进制>`（§6）。
 
 #### 2.1.2 三种部署形态
 
@@ -162,14 +186,15 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 
 ### 2.2 出网：按通道分开看
 
-| 流量 | 谁控制 | 受不受白名单 |
+| 流量 | 谁控制 | 受不受出网策略 |
 | --- | --- | --- |
-| 工具出网（`http_get` / `http_post`）+ 通知投递（`notify`） | **模型**可控 | **是**——网络域名白名单（当前生效值）；scheme 固定 http/https（代码固定，配置放行不了） |
-| MCP http 传输的连接 | Basalt 发起 | **是**——连接前按当前生效白名单授权；收紧后不再允许的连接会被断开 |
+| 工具出网（`http_get` / `http_post`）+ 通知投递（`notify`） | **模型**可控 | **是**——按当前**执行档位**判定：`strict` 走网络域名白名单（或 `host` 类型访问例外），`standard` 走禁止域名表；两档都先拦禁止域名与受保护地址段；scheme 固定 http/https（代码固定，配置放行不了） |
+| 搜索出网（`web_search` → `https://api.deepseek.com/v1/tools/search`） | **模型**可控（查询词）；**目标端点由代码固定** | **是**——与上一行同一套判定，每次外呼各判一次（含 408 / 429 / 5xx 的有限重发）。`strict` 实例**必须**把 `api.deepseek.com` 加入网络域名白名单，否则每次搜索都判 `sandbox_denied`；`standard` 实例未命中禁止域名表即放行 |
+| MCP http 传输的连接 | Basalt 发起 | **是**——连接前按当前执行档位与同一套判定授权；`strict` 收紧白名单后不再允许的连接会被断开 |
 | 供应商模型调用（`providers[].base_url`） | 运维配置 | 否——模型连接的独立配置，端点由运维定，模型碰不到 |
-| MCP server 自己的网络行为（stdio 进程内） | server 自己 | 否——独立进程，白名单管不到（**有意接受**的边界，见技术方案 §4.3） |
-| 远程 MCP 下游（上游 server 再去连别的服务） | server 自己 | 否——上游连接受白名单约束，下游不受；不宣称统一约束 |
-| stdio 启动程序（`mcp_servers.yaml` 的 `command`） | Basalt 发起 | **是**（`shell.allowed_commands`）——启动前逐字比对，不在白名单则不启动 |
+| MCP server 自己的网络行为（stdio 进程内） | server 自己 | 否——独立进程，策略管不到（**有意接受**的边界，见技术方案 §4.3） |
+| 远程 MCP 下游（上游 server 再去连别的服务） | server 自己 | 否——上游连接受策略约束，下游不受；不宣称统一约束 |
+| stdio 启动程序（`mcp_servers.yaml` 的 `command`） | Basalt 发起 | **是**——启动前过命令授权：`strict` 逐字比对 `shell.allowed_commands`；`standard` 另放行安装清单内程序目录的可执行件 |
 
 企业若要求"模型调用也只能出内网"：把 `providers[].base_url` 指向内网网关（vLLM / 一方网关）即可，白名单不需要动。
 
@@ -182,9 +207,18 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 - 管理写与其他管理端点同一套认证；先校验（非法条目 400）、再比 `If-Match`（412）、再预写审计（`network_allowlist.update`）后落库。失败保留页面输入且**不得**显示成功；并发保存只有一方成功，另一方 409 需重新读取
 - **如实边界**：已发出的请求不能追溯撤回；放宽不自动重连、不补发此前被拒的请求；收紧后不再允许的 MCP http 长连接会断开（保留已应用版本事实），**不自动重连**
 
+**执行档位与出网基础防护（14D）**：
+
+- **两档**：`strict` 只放行上面的白名单（或一条 `host` 类型访问例外）；`standard` 放行未命中禁止域名表的公网域名，另放行安装清单内程序目录的可执行件（登记 + 真实路径在 `runtime/` + 只读保护生效三项同时满足）。权威源是库内 `execution_policy` 单行表；**存量实例升级一律 `strict`**，新实例初始化写 `standard`
+- **禁止域名表**（「执行环境 → 禁止域名」）：与白名单同一张表的第二行，**两档都先生效**——命中即拒，不再看白名单；读面在 `GET /api/v1/execution-policy` 的 `denied_domains`
+- **受保护地址段**（私有 / 回环 / 链路本地 / CGNAT / 云元数据）在建连前按 DNS 解析结果拒，只拨已校验的 IP；确需访问内网服务时登记**访问例外**（理由必填，进审计），删除后下一次判定即失效。云元数据地址即使加例外也拒
+- **端口档固定**：`http` 只认 80（或省略）、`https` 只认 443（或省略）；目标是 IP 字面量的请求直接拒——请用域名 + 例外
+- **拒绝细分**：运行记录与工具结果的 `policy_denial_reason` 为 `profile_denied` / `denied_domain` / `protected_address` / `exception_missing`，页面据此给出"该改哪一条"（改动目标见 §5.4）
+- **交互式 shell 名称**（`bash` / `sh` / `powershell` / `cmd` 等）两档都拒，命令白名单里写上也不放行
+
 **必须记住的生效时间差**：
 
-- **管理台热生效**：网络域名白名单（见上）
+- **管理台热生效**：网络域名白名单、禁止域名表、访问例外、执行档位切换（保存即按新规则判定；已发出的请求不能追溯撤回）
 - **改完需重启**：`shell.allowed_commands`、`shell.interpreters`、`shell.env_passthrough`、`sandbox.cross_agent_read`、`mcp_servers.yaml`、`http.addr`
 - **热加载（下一个 Run 生效）**：`.basalt/agents/` 下的 `AGENT.md` 与附属文件
 - **改环境变量也要重启**：`SSL_CERT_FILE` / `SSL_CERT_DIR` 一类只在进程启动时读一次（§2.3）
@@ -464,6 +498,59 @@ servers:
 旧技能目录同样收紧：含二进制文件或软链接的目录无法通过管理台发布，启动时以 WARN
 点名而不是静默跳过；**不得**为兼容旧目录放宽这些边界。
 
+#### 升级影响清单（受保护地址与 shell 名称）
+
+14D 起，执行档位迁移（`schema_version` 5 → 6）把存量实例落到 `strict`，并把两类存量条目列为**待确认项**：
+
+- `network_allowlist` 轴：出网白名单中解析到受保护地址段（私有 / 回环 / 链路本地 / CGNAT / 云元数据）的域名条目；
+- `shell_command` 轴：命令白名单中命中交互式 shell 名称（`bash`、`sh`、`powershell`、`cmd` 等）的条目。
+
+两类条目升级后**默认拒绝**。系统在升级后第一次启动就列出清单，**不**等到第一次运行失败才让人去猜原因。
+
+处置口径：
+
+- 两轴各自独立，不合并成一个"策略问题"列表；通配条目（`*.example.com`）不可解析，不列入，也不猜测。
+- 每个待确认项给两个显式动作，**不自动勾选、不默认放行**：
+  - 「加例外」→ `POST /api/v1/network-exceptions`（仅域名条目；写 `network_exception.create` 审计，放行理由必填）
+  - 「保持拒绝」→ `POST /api/v1/execution-policy/confirmations`（写 `execution_policy.confirm` 审计，**不改授权结论**）
+- shell 名称集合是能力上限声明，两档都不放行；该轴只有「保持拒绝」，它只记录"管理员逐条看过"，不改变拒绝结论。
+- 未确认的条目继续列出、继续拒绝；确认与例外都**不**推进档位修订号。解析失败（NODATA / 超时）的条目不计入待确认项。
+
+查看（只读，不写操作行、不改策略）：
+
+```bash
+curl -s -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" \
+  http://127.0.0.1:8080/api/v1/execution-policy | \
+  jq '.data.pending_confirmations'
+```
+
+返回值的形状（契约 `PendingPolicyConfirmation`，值为示意）：
+
+```json
+[
+  {
+    "id": "network_allowlist:intranet.example.com",
+    "axis": "network_allowlist",
+    "value": "intranet.example.com",
+    "reason": "protected_address",
+    "resolved_protected": ["10.20.30.40"]
+  },
+  {
+    "id": "shell_command:bash",
+    "axis": "shell_command",
+    "value": "bash",
+    "reason": "shell_name",
+    "resolved_protected": []
+  }
+]
+```
+
+管理台入口：执行环境页「待确认项」两组（`/console/settings/sandbox`）。
+
+升级前怎么跑：按 §5.1 的建议，先用备份在独立目录起一次新版做 dry run——`pending_confirmations` 是只读派生信息，在这个副本里把清单看过并确定每条怎么处置，再换生产目录的二进制。升级后的真实清单按当时的白名单与命令名重新派生；已处置的条目不再出现。**不得**为了让清单变短而改动当前实例的配置或数据。
+
+回退不受影响：仍按 §5.2「备份 + 旧二进制」。清单与处置记录都在库里，随备份一起恢复或丢弃。
+
 ### 5.5 本机重部署（Windows 开发 / 演示实例）
 
 **自动更新本机实例，不手工杀进程、不手工搬文件**。脚本 [scripts/redeploy-local.ps1](../scripts/redeploy-local.ps1) 在实例目录执行：
@@ -502,21 +589,23 @@ powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1 -Frontend 
 | 位置 | 规则 |
 | --- | --- |
 | `basalt.yaml` 的 `providers[].api_key` | 只允许 `${ENV_VAR}` 占位；启动按当前发布版本解析，未解析（`${` 残留）或为空 → **拒绝启动**并点名配置项 |
-| `basalt.yaml` 的 `http.admin_auth.token` | 只允许 `${ENV_VAR}` 占位（如 `${BASALT_ADMIN_TOKEN}`）；`token` 模式下未配置、解析为空或残留 `${` → **拒绝启动**。`local_trust` 模式不读该值，且只在全部监听地址为回环时允许 |
+| `basalt.yaml` 的 `http.admin_auth.token` | 只允许 `${ENV_VAR}` 占位（如 `${BASALT_ADMIN_TOKEN}`）；写了就必须解析出非空值——占位变量缺失、解析为空或残留 `${` → **拒绝启动**，**不**改读密码文件。`token` 键省略 → 读实例私有目录的 `admin-token`（新建实例首次 `serve` 自动生成）；三处都没有 → **拒绝启动**，不回落 `local_trust`（后者只在全部监听地址为回环时允许） |
 | 通知渠道（库表 `notify_channels.url`） | `env` 模式**只存 `${ENV_VAR}` 引用**；`managed` 模式 `url` 为空、密文在 `credential_versions`。发送时解析 / 解密，失败给点名原因的可读错误 |
+| MCP server 的 env / header 槽位（`mcp_servers[].env`） | **逐键**显式声明来源：`env` 读进程环境，`managed` 存密文（`credentials.binding_key` = 槽位名，唯一键为资源 + 槽位三元组）。保存 / 发布 / 回滚时逐槽取值一次，任一槽取不到 → 503 + `operation_id`，文件 / 版本 / 指针零变化；幂等发布（无变更）不再校验。运行期 `managed` 取不到即失败，**不**回落 env；撤销清空密文但保留声明，重新录入生成新版本 |
 | 管理台创建的模型连接 / 通知渠道 | 创建时未声明 `credential_mode` 只按 env 规则校验（普通值 → 400 `CREDENTIAL_MODE_REQUIRED`，不推断为 managed）。`managed` 的 Key / 地址是 **write-only**：响应只回 `credential_ref`、`credential_version`、`last4` 与 host；`credential_ref` 由服务端生成，请求体出现 → 400 `CREDENTIAL_REF_READ_ONLY` |
 | 作者模型（US-12 的生成能力） | 与 provider 同规则（env / managed 均可，推荐 env） |
 
 ### 6.1 托管凭据与主密钥
 
-- **生成**：32 字节随机值（`openssl rand -base64 32` 或等价命令），存成**工作区之外**的文件（如 `/etc/basalt/master.key`），经 `basalt.yaml` 的 `secrets.master_key_file` 指向；`key_id` 由配置给出，随密文一起记录。**不得**把主密钥放进工作区、仓库、容器镜像或环境变量以外的共享配置。
+- **生成**：由 `basalt secrets init`（或管理台「实例加密」的初始化按钮）生成 32 字节主密钥，写入 `secrets.master_key_file` 指向的**工作区之外**文件（如 `/etc/basalt/master.key`）；文件为 JSON `{"version":1,"key_id":"k_…","key":"<base64 32 字节>"}`，`key_id` 由初始化流程生成、随密文一起记录，**不是**配置项。新建实例（库与 `instance.json` 均为本次启动新建）在 `secrets.auto_init` 缺省 `true` 时由首次 `serve` 自动完成初始化；**已有实例绝不自动生成**——密钥缺失 / 损坏 / `key_id` 不符 / 来源不可证明一律进恢复态，等待显式修复。`auto_init: false` 显式声明纯 env 实例（此时可省略路径）。**不得**把主密钥放进工作区、仓库、容器镜像或共享配置。
 - **权限**：Linux `0600` 且属主为服务账户（`chown basalt:basalt`）；Windows 用 `icacls` 把主密钥**文件与父目录**都只授予服务账户、SYSTEM 与管理员组（`icacls <path> /inheritance:r /grant:r "<服务账户>:(R)" "NT AUTHORITY\\SYSTEM:(R)" "BUILTIN\\Administrators:(R)"`；目录带 `(OI)(CI)` 继承标志）。启动与每次使用前都会校验路径、格式与平台权限：Linux 按权限位（目录 0700 / 文件 0600），Windows 读取文件与父目录的实际 DACL——只允许当前进程用户、SYSTEM 与 Administrators 三类受托人，其他用户 / 组（含 `Users`、`Authenticated Users`、AppContainer 包 SID）、缺失或空的 DACL、无法读取的安全描述符一律拒绝并返回 `CREDENTIAL_UNAVAILABLE`。权限在校验之后被放宽，下一次读取会拒绝（不缓存校验结果）。`os.Chmod` 在 Windows 只切只读位，**不得**用它代替 `icacls`。
 - **按需加载**：主密钥**不常驻内存**——每次使用托管凭据时读取并校验（文件缺失 / 权限不符 / 长度不是 32 字节 / `key_id` 不匹配 / 解密失败），失败只影响本次调用（503 `CREDENTIAL_UNAVAILABLE`），**不**自动回退到 env 或旧版本。
 - **启动依赖**：先判定当前发布且被绑定的**托管**模型连接；只有它需要解密时才读取主密钥。纯 env 实例（含只配 env 的模型连接）**不因缺主密钥而启动失败**；通知渠道的托管凭据也不阻断启动，失败发生在发送时。
 - **备份与恢复**：主密钥与数据库**分开备份、分开存放**；恢复时必须是同一 `key_id` 与原密钥，否则所有托管凭据不可读。
 - **丢失的后果**：主密钥丢失 = 现有托管凭据**全部不可恢复**（只能逐个重新录入，生成新凭据版本）；不得尝试改写密文或猜测密钥，也不得把托管凭据静默降级为 env。
-- **撤销与替换**：撤销（`POST /resources/{kind}/{name}/credential/revoke`）**不需要读取主密钥**——它只把该凭据身份的全部版本置 `revoked` 并清空密文；重新录入生成新的 `version_no`，旧版本永不复活。Key 替换 = 新凭据版本，不动定义内容。
+- **撤销与替换**：撤销（`POST /resources/{kind}/{name}/credential/revoke`，MCP 必须带 `binding_key` 指定槽位）**不需要读取主密钥**——它只把该凭据身份的全部版本置 `revoked` 并清空密文；重新录入生成新的 `version_no`，旧版本永不复活。Key 替换 = 新凭据版本，不动定义内容。
 - **混合实例**：同一实例里 env 与 managed 可以并存；启动依赖只由**当前绑定的托管模型连接**决定，不能用「存在凭据行」推断。
+- **就绪视图（14D）**：`GET /api/v1/instance/secrets` 只读返回 `state`（`uninitialized` / `ready` / `recovery_required`）、`key_id`、`initialized_at`、`key_file`、`recovery_reason`（`missing` / `corrupt` / `key_id_mismatch` / `unprovable_provenance` / `unavailable`）与 `credential_summary`（`managed` / `managed_revoked` / `env` / `missing` 四档计数，MCP 槽位、模型连接、通知渠道合并统计）；不含密钥材料。`POST /api/v1/instance/secrets/init`（`{"confirm":true}`）只在「未初始化且无密文」时生成，`ready`、恢复态与纯 env 实例一律 **409 且零写入**——先按 `recovery_reason` 处理文件，不要指望重复初始化。
 
 红线段（day-one 硬约束，**不得**违反）：
 
@@ -547,12 +636,12 @@ ls -l /etc/basalt/master.key    # 期望：600，属主为服务账户；路径�
 
 | 命令 | 作用 | 拒绝 / 失败条件 |
 | --- | --- | --- |
-| `basalt secrets init` | 生成 32 字节主密钥写入 `secrets.master_key_file`，Linux 目录 `0700` / 文件 `0600`；Windows 上文件继承父目录 DACL（**部署前**先用 `icacls` 把父目录收成最小权限，否则自检按 §6.1 的 DACL 规则拒绝并删除刚建的文件） | 密钥文件**已存在**（绝不覆盖——覆盖即让现有密文永久不可解）；当前仍有托管凭据依赖（拒绝制造孤儿密文）。两种情况都**零写入** |
+| `basalt secrets init` | 生成 32 字节主密钥写入 `secrets.master_key_file`，Linux 目录 `0700` / 文件 `0600`；Windows 上文件继承父目录 DACL（**部署前**先用 `icacls` 把父目录收成最小权限，否则自检按 §6.1 的 DACL 规则拒绝并删除刚建的文件）。新建实例首次 `serve` 已自动初始化（`auto_init` 缺省 `true`），手动 init 只用于存量实例或关掉自动初始化的部署 | 密钥文件**已存在**（绝不覆盖——覆盖即让现有密文永久不可解；「有文件、缺初始化记录」由下次 `serve` 自动 adopt 补记，**不**生成第二把）；当前仍有托管凭据依赖（拒绝制造孤儿密文）。两种情况都**零写入** |
 | `basalt secrets status` | 只读报告：是否就绪、`key_id`、指纹、托管依赖计数（模型连接 / 通知渠道各几个） | 未初始化只影响文案，**不是**命令失败——这是部署状态，不是故障 |
 | `basalt secrets verify` | 逐条校验当前 `active` 的托管凭据能否在当前主密钥下解密、目标绑定是否仍与当前定义一致；只回检查与失败计数，明细在 WARN 日志（不含材料） | 失败条数 **> 0** 即非零退出（脚本可判卷）；超过 0 时先查主密钥路径 / 权限 / `key_id`，再决定是否 `revoke-managed` |
 | `basalt secrets revoke-managed --confirm` | 清空全部托管凭据密文、推进撤销纪元、为每条写管理操作行；**不**读取主密钥——服务停止、主密钥丢失时的销毁性恢复 | 缺 `--confirm` 时**零调用零副作用**；执行后旧版本**永不复活**，只能重新录入新凭据版本 |
 
-典型时序：全新实例 `secrets init` → 管理台录入托管凭据 → 日常 `secrets status`；升级或怀疑密钥问题时 `secrets verify`；主密钥确实无法恢复时才 `secrets revoke-managed --confirm`，之后逐个资源重新录入。**不得**把 `revoke-managed` 当常规轮换手段。
+典型时序：全新实例首次 `serve` 自动初始化（也可显式 `secrets init`）→ 管理台录入托管凭据 → 日常 `secrets status`；升级或怀疑密钥问题时 `secrets verify`；主密钥确实无法恢复时才 `secrets revoke-managed --confirm`，之后逐个资源重新录入。**不得**把 `revoke-managed` 当常规轮换手段。
 
 ### 6.3 一次性初始化导入（仓库外模板）
 
@@ -589,7 +678,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 五套每日场景 D1–D5 属于维护者发布验收流程（US-14 交付的 `examples/daily/` 素材）；场景定义见需求文档 §2.5 与技术方案 §8.1（维护者内部正文，不在公开站点）。本节只规定演练环境与凭证边界；环境未准备完时不能把规划命令或替身读数记成生产验证。
 
 - 每套场景在演练专用工作区运行，使用虚构数据、测试通知接收器及明确登记的凭证引用；恢复备份演练继续执行 §4.3 的停调度与副作用隔离。
-- 依赖逐项核对：D1 需要 GitHub MCP（PAT 未授权时只跑夹具）与 README 读取；D2 需要已登记技能 `repo-digest`；D3 需要 Python 与 DBHub 只读 SQLite（样例库由生成器产出）；D4 需要自研只读 MCP `docs-readonly` 与连续两次运行的基线；D5 需要 Brave Search + Fetch 两个 MCP 与 Brave key。缺失时明确失败，不补造结果；旧 D1 的本地 HTTP 三端点保留为**不调度**的独立回归夹具。
+- 依赖逐项核对：D1 需要 GitHub MCP（PAT 未授权时只跑夹具）与 README 读取；D2 需要已登记技能 `repo-digest`；D3 需要 Python 与 DBHub 只读 SQLite（样例库由生成器产出）；D4 需要自研只读 MCP `docs-readonly` 与连续两次运行的基线；D5 需要内置 `web_search` 的搜索凭据（复用该 Agent 绑定的 DeepSeek 模型连接）与 Fetch MCP——严格档实例另需在白名单放行 `api.deepseek.com`。缺失时明确失败，不补造结果；旧 D1 的本地 HTTP 三端点保留为**不调度**的独立回归夹具。
 - 核对工作区、时区、实际触发时刻（以固定起点计算的触发序列作对照，覆盖 DST 日）及 `task_executions` / Run 关联。演练可缩短计划，但保留原每日计划配置和现场读数；短周期或人工触发不能冒充完整每日验证。
 - 停机错过触发点不自动补跑；人工补跑单独记录 run_id。任务或通知结果不确定时先查审计，不盲目重试；通知没有端到端恰好一次承诺，重复执行可能产生重复消息。
 - 演练结束仅回收本轮拥有的服务、MCP 进程、端口和临时目录；确认记录中没有真实凭证，保留足够的脱敏证据供复验。
@@ -604,7 +693,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 | D2 `repo-digest` | Python 3、GitHub MCP | GitHub API | 同上 |
 | D3 `biz-daily` | Python 3、DBHub（Node） | 无（本地 SQLite 文件，库由生成器产出） | 无（只读 SQLite 样例） |
 | D4 `docs-diff` | 自研 `docs-readonly`（Go 构建；主 module 内，安装器导出源码后 `go build`） | 无（只读本地资料目录） | 无 |
-| D5 `industry-brief` | Brave Search MCP、Fetch MCP | Brave API、目标网页 | `BRAVE_API_KEY`（`${ENV_VAR}` 引用） |
+| D5 `industry-brief` | 内置 `web_search`、Fetch MCP | DeepSeek Search API（`api.deepseek.com`，受出网策略）、目标网页（由 Fetch 子进程抓取） | 无专用变量——搜索复用该 Agent 绑定的 DeepSeek 模型连接凭据（env 或托管） |
 | 八模板 | 依各自 README 的「依赖」节：内置 `http_get` 为主；DBHub / Playwright / Brave / Fetch / `docs-readonly` 按模板声明 | 依各自 README 的「工具与域名」节 | 仅 `funding-watch` 需 Brave key；其余无凭据 |
 
 - 复制素材不改变底座的出网策略：白名单与域名规则的配置主体仍是部署者（§2.2）；示例**不**自动放宽白名单、**不**自动导入 Agent。

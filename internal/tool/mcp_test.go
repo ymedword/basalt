@@ -1619,6 +1619,21 @@ func TestClassifyInitializeFailure_DeadlineBeforeURLShell(t *testing.T) {
 			wantStage: mcpStageInitialize,
 			wantClass: mcpClassHTTPUnreachable,
 		},
+		{
+			// 14D 受控拨号：拒绝发生在 `http.Client.Do` 内，必被 `*url.Error` 包住；
+			// 若不先认类型就会误报成 `http_unreachable`（D-13 / FR10）。
+			// Guard refusal arrives inside the *url.Error shell and must still read as
+			// policy_denied, not http_unreachable.
+			name: "guard_refusal_inside_url_error_is_policy_denied",
+			err: &url.Error{Op: "Post", URL: "https://metadata.example/mcp", Err: &core.SandboxViolationError{
+				Rule:     "network_denylist",
+				Target:   "metadata.example",
+				Guidance: "目标地址属于受保护网段，不得出网",
+				Reason:   core.DenialExceptionMissing,
+			}},
+			wantStage: mcpStageInitialize,
+			wantClass: mcpClassPolicyDenied,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

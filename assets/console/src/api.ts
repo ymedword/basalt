@@ -235,6 +235,40 @@ export interface AgentConfigView {
   binding_complete: boolean
 }
 
+/** 就绪条目分类（契约 AgentReadinessItem.kind）：前三个只出现在 `pending`。 */
+export type ReadinessKind =
+  | 'model_connection'
+  | 'credential'
+  | 'resource'
+  | 'notify_channel'
+  | 'budget'
+  | 'concurrency'
+
+/**
+ * 一条就绪条目。`fix` 是控制台跳转路径，没有对应页面时为空串——页面**不得**
+ * 伪造点不通的链接；`detail` 不含值、路径与库原文。
+ * One readiness item; an empty fix means no page exists, not a broken link.
+ */
+export interface AgentReadinessItem {
+  kind: ReadinessKind
+  /** 机器可认的名字（`model_connection/x` / `mcp_server/x#KEY`）；无名字项为空串。 */
+  item: string
+  detail: string
+  fix: string
+}
+
+/**
+ * 启用前置校验的只读投影（契约 AgentReadiness）：与 `POST /agents/{name}/enable`
+ * 共用同一份判定。`ready` 等价于 `pending` 为空；`notices` 只提示、不影响该值。
+ * The read-only readiness projection; pending blocks enable, notices only advise.
+ */
+export interface AgentReadinessView {
+  agent: string
+  ready: boolean
+  pending: AgentReadinessItem[]
+  notices: AgentReadinessItem[]
+}
+
 export interface SessionSummary {
   session_id: string
   profile_name: string
@@ -452,6 +486,34 @@ export interface McpToolDisposition {
   skipped: McpToolSkip[]
 }
 
+/**
+ * 一个凭据槽位的来源声明（契约 McpCredentialKeyView.mode）：**显式**给出，不按
+ * "托管行是否存在"推断；`env` 表示从进程环境读取，值永不入库。
+ * The declared source of one slot; it is explicit, never inferred.
+ */
+export type McpCredentialKeyMode = 'managed' | 'env'
+
+/**
+ * 槽位状态（契约 McpCredentialKeyView.state）：`managed` 有活动托管值；`managed_revoked`
+ * 已撤销且**不会**回落 env；`env` 声明走进程环境（就绪与否看诊断）；`missing` 声明
+ * 托管但当前没有可用值。未声明来源的槽位**不出现在** `credential_keys` 里。
+ * The slot state; undeclared slots are absent rather than guessed.
+ */
+export type McpCredentialKeyState = 'managed' | 'managed_revoked' | 'env' | 'missing'
+
+/**
+ * 槽位明细（契约 McpCredentialKeyView）：env 键与 http 头名共用同一名字空间。
+ * `last4` 只在有托管版本时回尾号，永不回完整值。
+ * One slot: the same name is the same slot across env keys and header names.
+ */
+export interface McpCredentialKeyView {
+  key: string
+  mode: McpCredentialKeyMode
+  state: McpCredentialKeyState
+  /** 仅 managed / managed_revoked 且已有版本时非空。 */
+  last4: string
+}
+
 export interface McpServerView {
   name: string
   transport: 'stdio' | 'http'
@@ -459,6 +521,10 @@ export interface McpServerView {
   command: string
   /** 只回变量名，不返回值。 */
   env_keys: string[]
+  /** http 传输的请求头名；只回名字，不返回值（stdio 为空数组）。 */
+  header_keys: string[]
+  /** 已声明来源的槽位，按 key 升序；未声明的槽位不出现在这里。 */
+  credential_keys: McpCredentialKeyView[]
   connected: boolean
   /** 该 server 提供的工具名（offered）；被谁抢走看 `tool_disposition`。 */
   tools: string[]
@@ -565,10 +631,36 @@ export type McpDiagnosticWarning =
   | 'http_auth_header_unsupported'
   | 'env_gate_process_local'
 
+/** 运行时依赖三态（契约 McpDependencyDiagnosis.state）。 */
+export type McpDependencyState = 'ready' | 'missing' | 'version_mismatch'
+
 /**
- * MCP server 只读诊断（契约 McpServerDiagnosis）：命令三态、env 就绪布尔、固定
- * warnings 与检查时间。**不含** `connected`——诊断不预测连接结果，页面据此分轴
- * 展示，不把诊断结论当成测试结论。
+ * 一条运行时依赖的就位情况（契约 McpDependencyDiagnosis）：`expected_version` 是
+ * 配方要求的版本，`found_version` 是实际读到的版本；任何一侧读不到就是空串，
+ * 不拿空串冒充"匹配"。
+ * One dependency verdict; an unreadable side stays empty rather than matching.
+ */
+export interface McpDependencyDiagnosis {
+  component: string
+  state: McpDependencyState
+  expected_version: string
+  found_version: string
+}
+
+/**
+ * 引用该 server 的 Agent（契约 McpReferencesDiagnosis）：含已归档 Agent——归档后
+ * 重新启用仍需这条连接，页面不能只报"无人引用"。
+ * Which agents reference the server, archived ones included.
+ */
+export interface McpReferencesDiagnosis {
+  count: number
+  agents: string[]
+}
+
+/**
+ * MCP server 只读诊断（契约 McpServerDiagnosis）：命令三态、env 就绪布尔、依赖与
+ * 引用、固定 warnings 与检查时间。**不含** `connected`——诊断不预测连接结果，页面
+ * 据此分轴展示，不把诊断结论当成测试结论。
  * The read-only diagnosis; it deliberately carries no connected flag.
  */
 export interface McpServerDiagnostics {
@@ -582,6 +674,10 @@ export interface McpServerDiagnostics {
   command: McpCommandDiagnosis | null
   /** 按 key 升序；只回布尔。 */
   env: McpEnvDiagnosis[]
+  /** 该 server 的运行时依赖；无依赖声明时为 null（不适用，不是缺失）。 */
+  dependency: McpDependencyDiagnosis | null
+  /** 引用该 server 的 Agent；含已归档。 */
+  references: McpReferencesDiagnosis
   warnings: McpDiagnosticWarning[]
   /** RFC 3339 UTC。 */
   checked_at: string
@@ -620,17 +716,71 @@ export interface ModelConnectionView {
   last_test: ConnectionTestView | null
 }
 
+/** 实例加密的托管凭据计数（契约 CredentialKeySummary）：四项恒为整数。 */
+export interface CredentialKeySummary {
+  /** 有活动托管值的占位符数（MCP 逐键 + 其它 owner）。 */
+  managed: number
+  /** 托管值已撤销、尚未重新录入的占位符数。 */
+  managed_revoked: number
+  /** 以环境变量取值且变量非空的占位符数。 */
+  env: number
+  /** 声明了但托管与 env 都取不到值的占位符数。 */
+  missing: number
+}
+
+/** 实例加密服务状态（契约 InstanceSecretsView.state）。 */
+export type InstanceSecretsState = 'uninitialized' | 'ready' | 'recovery_required'
+
+/** 恢复原因（契约 InstanceSecretsView.recovery_reason）；非恢复态为空串。 */
+export type InstanceSecretsReason =
+  | ''
+  | 'missing'
+  | 'corrupt'
+  | 'key_id_mismatch'
+  | 'unprovable_provenance'
+  | 'unavailable'
+  | 'key_path_missing'
+
+/**
+ * 实例加密服务的只读投影（14D）：**不含**密钥材料与指纹，只给 `key_file` 路径。
+ * 恢复态是状态而不是读错误——页面按 `state` 分支，不把 500 当作"未初始化"。
+ * Read-only instance encryption view; never carries key material or fingerprints.
+ */
+export interface InstanceSecretsView {
+  state: InstanceSecretsState
+  /** 仅 `ready` 时非空；页面可截断显示。 */
+  key_id: string
+  /** 初始化时间；未初始化为空串。 */
+  initialized_at: string
+  /** 主密钥文件路径（供备份指引）；纯 env 实例与未解析时为空串。 */
+  key_file: string
+  recovery_reason: InstanceSecretsReason
+  /**
+   * 此刻执行显式初始化是否会成功：存量无名册实例为 true，显式纯 env
+   * （`secrets.auto_init: false`）为 false。首次保存托管凭据的自动初始化不以此为前提。
+   * Whether an explicit init would succeed right now.
+   */
+  can_initialize: boolean
+  credential_summary: CredentialKeySummary
+}
+
+/** 执行档位（契约 ExecutionPolicyView.profile）：严格只放行显式白名单。 */
+export type ExecutionProfile = 'standard' | 'strict'
+
 /** 网络域名白名单的实际生效状态（契约 NetworkAllowlistView）。 */
 export interface NetworkAllowlistView {
   /** 条件写的 If-Match 唯一取值；尚未装载（revision 0）时为空串。 */
   etag: string
   /** 从 1 起，每次成功写入 +1；尚未装载为 0。 */
   revision: number
-  /** config_seed = 首次启动由配置写入；database = 来自管理台保存。 */
-  source: 'config_seed' | 'database'
+  /**
+   * config_seed = 首次启动由配置写入；database = 来自管理台保存；
+   * migration = 版本迁移写入（档位升级）；instance_init = 实例初始化写入。
+   */
+  source: 'config_seed' | 'database' | 'migration' | 'instance_init'
   /** 最近一次写入时间；零值渲染为空串。 */
   updated_at: string
-  /** 脱敏写入者（token:<指纹> / local_trust）；种子行为空串。 */
+  /** 脱敏写入者（token:<指纹> / local_trust）；种子 / 迁移 / 初始化行为空串。 */
   updated_by: string
 }
 
@@ -641,6 +791,82 @@ export interface SandboxView {
   /** 当前实际生效的域名；权威值在 `network_allowlist`，此字段只是同一份数据的列表投影。 */
   http_allowed_domains: string[]
   network_allowlist: NetworkAllowlistView
+  /** 当前执行档位的投影；权威源是 `GET /execution-policy`。 */
+  execution_profile: ExecutionProfile
+  /** 执行档位行的生效元数据（条件写的 ETag 来源与 `GET /execution-policy` 同值）。 */
+  execution_policy: NetworkAllowlistView
+  /** 当前实际生效的禁止域名；`[]` 表示没有禁止条目。 */
+  denied_domains: string[]
+  /** 禁止域名行的生效元数据；条件写用它的 ETag。 */
+  network_denylist: NetworkAllowlistView
+}
+
+/** 一条升级迁移待确认项（契约 PendingPolicyConfirmation）：只读扫描结果，不落库。 */
+export interface PendingPolicyConfirmation {
+  /** 稳定标识 `<axis>:<value>`；页面据此记住处置结果。 */
+  id: string
+  axis: 'network_allowlist' | 'shell_command'
+  /** 条目原文（域名或命令名）；不含凭据与参数。 */
+  value: string
+  reason: 'protected_address' | 'shell_name'
+  /** 仅 `network_allowlist` 轴：本次解析命中的受保护地址；其余为空数组。 */
+  resolved_protected: string[]
+}
+
+/**
+ * 执行档位与迁移待确认项（契约 ExecutionPolicyView）：权威源是 `execution_policy`
+ * 单行表，`basalt.yaml` 的 `execution.profile` 只在表内无行时作首次种子。
+ * The profile view; the single-row table is authoritative once seeded.
+ */
+export interface ExecutionPolicyView extends NetworkAllowlistView {
+  profile: ExecutionProfile
+  exceptions_count: number
+  /** 受保护地址段（两档相同，来自代码常量）；云元数据地址任何档位都不放行。 */
+  protected_addresses: string[]
+  /** 交互式 shell 名称集合（去扩展名比对）；命中即拒。 */
+  shell_names: string[]
+  /** 升级迁移的待确认项（只读扫描）：已加例外或已记录「保持拒绝」的不再列出。 */
+  pending_confirmations: PendingPolicyConfirmation[]
+}
+
+/** 内网访问例外（契约 NetworkExceptionView）：理由必填，删除即整行移除。 */
+export interface NetworkExceptionView {
+  /** `exc_` + 26 位 Crockford Base32。 */
+  exception_id: string
+  kind: 'host' | 'ip_port'
+  /** `host` 为主机名（可 `*.` 前缀）；`ip_port` 为 `IP:端口` 字面量。 */
+  value: string
+  note: string
+  revision: number
+  created_at: string
+  created_by: string
+  operation_id: string
+}
+
+/** 整份例外集合与集合 ETag（`DELETE` 的 `If-Match` 唯一取值来源）。 */
+export interface NetworkExceptionListView {
+  etag: string
+  exceptions: NetworkExceptionView[]
+}
+
+/** 新增例外的结果：新行与写入后整份集合的 ETag。 */
+export interface NetworkExceptionCreateResult {
+  etag: string
+  exception: NetworkExceptionView
+}
+
+export interface NetworkExceptionDeleteResult {
+  exception_id: string
+  etag: string
+  operation_id: string
+}
+
+/** 「保持拒绝」的处置结果；`already_recorded=true` 表示本次未新增审计行。 */
+export interface PolicyConfirmationResult {
+  id: string
+  decision: 'keep_denied'
+  operation_id: string
+  already_recorded: boolean
 }
 
 export interface ToolView {
@@ -963,6 +1189,16 @@ export class ApiClient {
     return this.#request<SandboxView>('GET', '/sandbox')
   }
 
+  /** 执行档位与迁移待确认项；只读扫描，不启动进程、不建连接。 */
+  getExecutionPolicy(): Promise<ExecutionPolicyView> {
+    return this.#request<ExecutionPolicyView>('GET', '/execution-policy')
+  }
+
+  /** 内网访问例外清单与集合 ETag（删除的条件写基准）。 */
+  listNetworkExceptions(): Promise<NetworkExceptionListView> {
+    return this.#request<NetworkExceptionListView>('GET', '/network-exceptions')
+  }
+
   getGlobalMemory(): Promise<MemoryView> {
     return this.#request<MemoryView>('GET', '/memory')
   }
@@ -1007,6 +1243,18 @@ export class ApiClient {
 
   getAgentMemory(name: string): Promise<MemoryView> {
     return this.#request<MemoryView>('GET', `/agents/${encodeURIComponent(name)}/memory`)
+  }
+
+  /**
+   * 启用前置校验的只读投影（14D）：`pending` 非空即不可启用，`notices` 只提示。
+   * 只读——不启动进程、不连接、不写操作行、不改配置。
+   * Read-only readiness projection; pending blocks enable, notices only advise.
+   */
+  getAgentReadiness(name: string): Promise<AgentReadinessView> {
+    return this.#request<AgentReadinessView>(
+      'GET',
+      `/agents/${encodeURIComponent(name)}/readiness`,
+    )
   }
 
   // --- 会话与运行 ---------------------------------------------------------
@@ -1087,6 +1335,15 @@ export class ApiClient {
 
   listModelConnections(): Promise<ModelConnectionView[]> {
     return this.#request<ModelConnectionView[]>('GET', '/model-connections')
+  }
+
+  /**
+   * 实例加密状态（14D）：恢复态是**状态**而不是读错误，页面按 `state` 分支；
+   * 端点装配缺失时服务端固定 500——此时如实显示不可读，不降级成"未初始化"。
+   * Instance encryption status; recovery_required is a state, not a read failure.
+   */
+  getInstanceSecrets(): Promise<InstanceSecretsView> {
+    return this.#request<InstanceSecretsView>('GET', '/instance/secrets')
   }
 
   // --- 定时与操作审计 -----------------------------------------------------

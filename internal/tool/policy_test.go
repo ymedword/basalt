@@ -398,6 +398,35 @@ func TestWhitelistPolicy_RefusesMultiWordExecutable(t *testing.T) {
 	requireRefused(t, f.policy, shellAction("git\tstatus"), "可执行名含空白")
 }
 
+// TestWhitelistPolicy_AllowsAllowlistedAbsolutePathWithSpaces 判 14D T117 的现场缺陷：
+// 完整包解压到含空格的程序目录（`Program Files\Basalt 0.1.0`）后，随包组件的 command 是
+// 含空格的**绝对路径**。多词分支必须先于白名单查询以免"参数拼进 executable"的旧形态
+// 蒙混过关，但绝对路径里的空白是路径本身的一部分：整串逐字登记即放行（执行侧不拆词、
+// 不经 shell）。**相对**多词串即便整串写进白名单也照旧拒——那不是可执行文件路径。
+// Acceptance point: an exact allowlist hit for an absolute path with spaces passes; every
+// relative multi-word string is still refused, allowlisted or not.
+func TestWhitelistPolicy_AllowsAllowlistedAbsolutePathWithSpaces(t *testing.T) {
+	programDir := filepath.Join(t.TempDir(), "Program Files", "Basalt 0.1.0")
+	bundled := filepath.Join(programDir, "runtime", "mcp", "docs-readonly", "1.0.0", "docs-readonly.exe")
+	unregistered := filepath.Join(programDir, "runtime", "node", "node.exe")
+	interpreter := filepath.Join(programDir, "runtime", "python", "python.exe")
+	f := newPolicyFixture(t, func(opts *tool.PolicyOptions) {
+		opts.AllowedCommands = []string{bundled, "git status"}
+		opts.Interpreters = []string{interpreter}
+	})
+
+	// ① 登记过：放行（命令与解释器两条登记面同一口径）。
+	requireAllowed(t, f.policy, shellAction(bundled))
+	requireAllowed(t, f.policy, shellAction(interpreter))
+	// ② 同目录下没登记的路径：仍是多词串拒绝——放行只认整串，不做前缀推断。
+	requireRefused(t, f.policy, shellAction(unregistered), "可执行名含空白")
+	// ③ 相对形态的多词串：写进白名单也不放行（旧形态不是可执行文件路径）。
+	requireRefused(t, f.policy, shellAction("git status"), "可执行名含空白")
+	// ④ 能力上限不因空格路径松动：含空格目录里的 shell 按基名拒，不走路径放行分支。
+	shellPath := filepath.Join(programDir, "cmd.exe")
+	requireRefused(t, f.policy, shellAction(shellPath), "交互式 shell")
+}
+
 // TestWhitelistPolicy_RefusesBashAndShHard 覆盖 F13：bash / sh **硬拒且无放行分支**——
 // 裸名、完整路径、带可执行后缀、`-c` 与 `script.sh` 形态一律拒；即便被写进白名单也拒
 // （放行它们等于把 shell 解释层请回来，`-c` 内联代码就此绕过 scripts/ 只读区）。

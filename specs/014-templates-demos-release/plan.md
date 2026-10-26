@@ -4,7 +4,7 @@
 
 **Input**: Feature specification from `/specs/014-templates-demos-release/spec.md`
 
-**Note**: 本 plan 由 `/speckit-plan`（经 `/module-dev 14` 步骤 4）生成；模块级细节以颗粒度文档 [docs/us/us14-templates-demos-release.md](../../docs/us/us14-templates-demos-release.md)（R3 定稿，2,289 行；R2 于 2026-10-25 经人工 review ① 通过，sha256 `ff6594655edc6f669488d744587d14b6d624c994c9bb2b47b2e58e068d284cc6`）§2 / §3 / §4 / §5 为准，冲突时以 [docs/TechnicalDesign.md](../../docs/TechnicalDesign.md) 为准；固定字面量以 [docs/contracts/](../../docs/contracts/) 为准。D-01–D-10 已冻结；本 plan 只做落位与验证映射，不引入模块卡外的新概念。
+**Note**: 本 plan 由 `/speckit-plan`（经 `/module-dev 14` 步骤 4）生成；模块级细节以颗粒度文档 [docs/us/us14-templates-demos-release.md](../../docs/us/us14-templates-demos-release.md)（R3 定稿，2,289 行；R2 于 2026-10-25 经人工 review ① 通过，sha256 `ff6594655edc6f669488d744587d14b6d624c994c9bb2b47b2e58e068d284cc6`；2026-10-26 经 T071–T078 的已批准裁决增补后为 **2,326 行 / sha256 `c3a1694c5b509da0cd0d7cffaf73adf1f3e35f726b6038181e1cec1e571d8a55`**）§2 / §3 / §4 / §5 为准，冲突时以 [docs/TechnicalDesign.md](../../docs/TechnicalDesign.md) 为准；固定字面量以 [docs/contracts/](../../docs/contracts/) 为准。D-01–D-10 已冻结；本 plan 只做落位与验证映射，不引入模块卡外的新概念。
 
 ## Summary
 
@@ -41,13 +41,13 @@ US-14 把 Basalt 从"能跑一个 Agent 的底座"推进到"能被复制、能�
 
 **Target Platform**: 开发机 Windows 11 + Git Bash；发布候选为 `CGO_ENABLED=0` 单文件；14C **Windows 与 Linux 两个平台均必验**（Windows 锁 / 中文控制台 / 进程树取消；Linux 同一候选二进制同一组必跑命令）；管理台面向现代浏览器；官网为静态站点（本 US 不部署）。
 
-**Project Type**: 单 Go module（`cmd/basalt` + `internal/`）+ 内嵌管理台静态资源 + 独立示例目录（含一个嵌套 Go module）+ 静态站点工程；不新增 Go 包之外的产品形态。
+**Project Type**: 单 Go module（`cmd/basalt` + `internal/` + 内嵌素材目录 `examples/`）+ 内嵌管理台静态资源 + 静态站点工程；`examples/shared/mcp/docs-readonly` 是主 module 内的 `package main`（2026-10-26 裁决，**无**自己的 `go.mod`）；不新增 Go 包之外的产品形态。
 
 **Performance Goals**: 无吞吐承诺；判据是**有界与可观察**——MCP 测试超时 15s（既有 `defaultMCPTestTimeout`），发布 e2e 工具超时场景 45s 内完成审计与 Run 收尾，取消后子进程树清理有时间上限；目录读取为内存快照、无 I/O 放大；不写未测量的耗时或规模数字。
 
 **Constraints**: **零迁移、零新增 Go / npm 生产依赖**；目录 / 诊断只读（零进程、零安装、零配置写、零操作行）；env 闸门 fail-closed 且错误不含值；诊断不预判测试、测试不解析 stderr；`make e2e` / `example-tests` 不进 `make check` / `acceptance.json` / CI；外部服务六项**全部未授权**（只做夹具并标未验证）；公开材料不链接私有路径；`v0.1.0` tag 由用户手动。
 
-**Scale/Scope**: 工作区约 **82–110 个文件**（14A 18–25、14B 55–72、14C 8–12，去重后合计；不承诺，按 tasks 逐文件计数）；五 Demo、八模板、六条目录配方、五个新 Go 生产文件 + 三个 core 类型文件、D-01–D-10 契约、七条发布 e2e 场景、一个 stage。真实外部实跑与双平台走查属人工 / 授权项，不计入文件量。
+**Scale/Scope**: 工作区约 **82–110 个文件**（14A 18–25、14B 55–72、14C 8–12，去重后合计；不承诺，按 tasks 逐文件计数）；五 Demo、八模板、六条目录配方、七个新 Go 生产文件（含 2026-10-26 追加的安装器 `internal/cli/demo.go` 与素材包 `examples/embed.go`）+ 三个 core 类型文件、D-01–D-10 契约、七条发布 e2e 场景、一个 stage。2026-10-26 追加裁决另引入 `internal/cli/demo_test.go`、`internal/e2e/us14_demo_install_test.go`、`internal/e2e/us14_examples_test.go`、`internal/testutil/mcpserver.go`；文件量仍以 tasks 逐文件计数为准，不在此处重估。真实外部实跑与双平台走查属人工 / 授权项，不计入文件量。
 
 **环境实测读数（2026-10-25，本轮当场命令）**: 分支 `014-templates-demos-release`；起始 commit `e2e285f`；工作区干净（仅 `?? specs/014-templates-demos-release/` 为本轮产物）；Go 1.27.3、Node 24.22.0（便携安装于 `%TEMP%`，本机 PATH 无 `node`）、Python 3.12；`GOPROXY=https://goproxy.cn`。**本轮未跑** `make check` / `make e2e` / 示例测试；相关项在实现后由 Claude 验收。
 
@@ -155,6 +155,7 @@ docs/DevelopmentLoop.md            # 修改：§4.5.2 / §5.3（私有）
 docs/Roadmap.md                    # 修改：§6 M0 US-14 行（私有）
 
 examples/
+├── embed.go                       # 新增（2026-10-26）：//go:embed daily shared（安装器素材，含 docs-readonly 源码）
 ├── README.md                      # 新增：总览 / 依赖 / 证据档位
 ├── daily/{github-radar,repo-digest,biz-daily,docs-diff,industry-brief}/
 │   ├── AGENT.md / README.md / SETUP.md
@@ -170,9 +171,14 @@ examples/
 scripts/run-example-tests.py       # 新增：逐目录 unittest + Ran N ≥3
 scripts/check-release-clean.sh     # 新增：干净检出构建 / 门禁 / e2e
 Makefile                           # 修改：example-tests / e2e
+internal/cli/                      # 新增（2026-10-26）：demo.go / demo_test.go（basalt demo install）
+internal/cli/root.go               # 修改：注册 demo 命令
+internal/testutil/mcpserver.go     # 新增：e2e 假 MCP server（BASALT_MCP_HELPER_SPEC）
 internal/e2e/us14_demos_test.go    # 新增：TestUS14Demos_Fixture / TestLegacyD1_HttpEndpoints
 internal/e2e/us14_release_test.go  # 新增：TestReleaseE2E_Cancel / _ToolTimeout / _HotReload / _SevenScenarioMap
 internal/e2e/us14_templates_test.go# 新增：TestTemplates_LoadAndTools / _TierEvidence
+internal/e2e/us14_demo_install_test.go # 新增（2026-10-26）：TestUS14DemoInstall_Artifact（制品级安装验收）
+internal/e2e/us14_examples_test.go # 新增（2026-10-26）：TestExamples_PortableBaseline / TestMCPEgress_Documentation
 internal/e2e/harness_test.go       # 修改：TestMain 候选二进制分支
 harness/stages/us14-release.json   # 新增：本 US 专属 stage（不注册进 current.json / CI）
 
@@ -183,7 +189,7 @@ website/docs/index.md / website/zh/docs/index.md        # 修改：区块增量�
 website/tests/content.test.mjs / scripts/check-links.mjs# 修改：模板表 / examples 链接（review ② 后）
 ```
 
-**Structure Decision**: 14A 只加一个新包 `internal/catalog`（纯数据 + 解析，无 I/O），其余改动落在既有包；`core` 只加纯类型，`app` 负责装配与来源记录，`web` 只消费端口，`tool.Registry` 不动。14B 完全在 `examples/` 内；`docs-readonly` 是主 module 内的 `package main`（无自己的 `go.mod`，2026-10-26 裁决），随根 `go test ./...` 测试但不被产品二进制导入；安装器（`internal/cli`，2026-10-26 追加授权）内嵌素材并导出源码。14C 只加脚本、Makefile 目标、e2e 测试文件与 stage，不改既有 stage / CI / `acceptance.json`。管理台与站点继续走各自既有构建链，产物不进 Go module。
+**Structure Decision**: 14A 只加一个新包 `internal/catalog`（纯数据 + 解析，无 I/O），其余改动落在既有包；`core` 只加纯类型，`app` 负责装配与来源记录，`web` 只消费端口，`tool.Registry` 不动。14B 主体在 `examples/` 内，2026-10-26 追加的安装器落 `internal/cli`、素材嵌入 `examples/embed.go`、e2e 夹具落 `internal/e2e` 与 `internal/testutil`；`docs-readonly` 是主 module 内的 `package main`（无自己的 `go.mod`，2026-10-26 裁决），随根 `go test ./...` 测试但不被产品二进制导入；安装器（`internal/cli`，2026-10-26 追加授权）内嵌素材并导出源码。14C 只加脚本、Makefile 目标、e2e 测试文件与 stage，不改既有 stage / CI / `acceptance.json`。管理台与站点继续走各自既有构建链，产物不进 Go module。
 
 ## Complexity Tracking
 
@@ -202,3 +208,86 @@ website/tests/content.test.mjs / scripts/check-links.mjs# 修改：模板表 / e
 - [research.md](./research.md)：关键技术决策与替代方案（目录内嵌与校验、诊断同源构造、env 闸门位置、测试记录字段、来源表位置、示例测试计数、候选二进制绑定、干净检出、公开增量）。
 - [data-model.md](./data-model.md)：目录 / 诊断 / 测试记录 / 工具来源 / Demo 证据 / 模板档位 / 发布证据的实体、字段与状态矩阵。
 - [quickstart.md](./quickstart.md)：可执行的验证向导（Go / 控制台 / 示例 / e2e / stage / 人工项 / 未授权边界）。
+
+---
+
+## 14D 增量：开箱即用增强（2026-10-26 用户显式范围调整；只追加）
+
+**性质**：本节只追加 14D 的技术基线与实施顺序。原 14A / 14B / 14C 的技术选型、判据面与实施结果**不变**；冲突时**仅限 14D 范围**以本节为准。设计正本见 [docs/us/us-draft-openbox.md](../../docs/us/us-draft-openbox.md)（1157 行，sha256 `39d9b048a1cd992152a1b6553d76febebdee06de91fecf642b284858df11cc60`），宪法 v4.0.0。
+
+### Technical Context（14D）
+
+| 项 | 取值 | 说明 |
+| --- | --- | --- |
+| 语言 / 构建 | Go 1.27.2（`go` 行仍是 `go 1.27` 最低要求） | 零新增 Go 依赖坐标；`golang.org/x/sys` 已是直接依赖（`go.mod:16`） |
+| 存储 | SQLite（`modernc.org/sqlite`），schema v5 → **v6** | 迁移 `0006_execution_policy_and_mcp_credentials.sql`，只追加 |
+| 加密 | 标准库 `crypto/aes` + `cipher.NewGCM`，主密钥 32 字节材料 | 文件是 JSON 封装，长度不固定 |
+| 平台 | Windows 原生 + WSL2 Ubuntu | 权限 / 锁实现分文件；Linux 侧必须跑 Linux 产物并在 Linux 文件系统验证 |
+| 前端 | 既有 Vue 3 + Vite + TypeScript + Vitest | 零新增生产依赖；重建 `assets/console/dist` |
+| 外部运行时 | Node / Python / MCP 包为**外部二进制**，不进仓库、不进 `go.mod` | 完整包内置；精简包按需下载 |
+| 并发 | 同步执行；实例初始化用实例锁串行化 | 不引入异步编排（原则 7） |
+
+### Constitution Check（14D）
+
+| 原则 / 约束 | 结论 | 依据 |
+| --- | --- | --- |
+| I 自实现 ReAct 循环 | 通过 | 不引入框架坐标；不接管循环 |
+| II LLM 客户端只做协议调用 | 通过 | 内置 Agent 走既有 `ReActLoop` 与单条消息仓储；不新增追加路径 |
+| III Provider 显式映射 | 通过 | 不改映射表装配与受控发布 |
+| IV 一目录 = 一 Agent；技能声明式绑定 | 通过 | 五个内置 Agent 各为独立目录；技能仍由 `AGENTS.md` 的 `skills:` 声明 |
+| V 审计 day-one fail-closed | 通过 | 新增管理动作（档位、禁止域名、例外、apply、实例初始化）全部预写 `pending` |
+| VI 授权与执行分离（两接口） | 通过 | `netguard` 是 `CommandRunner` / HTTP 传输的内部实现，**不新增对外接口**；调用方仍只依赖 `Policy` / `CommandRunner` |
+| VII 同步执行 + context 只承载取消 | 通过 | 排空窗口是同步等待 + `context` 截止；业务状态显式传递 |
+| VIII 单二进制纪律 | 通过 | `CGO_ENABLED=0` 发布构建；`-race` 单独命令；零新增 Go 坐标 |
+| IX 不用 ORM，手写 SQL | 通过 | v6 迁移只追加；`schema.sql` 幂等同步 |
+| X 五大能力优先，范围卡紧 | 通过 | 14D 属已确认增量，不扩到 OBS / CHAOS / 打包流水线 |
+| 架构约束 · 凭证与资源绑定纪律（v4.0.0） | 通过 | 第 14 条新例外只覆盖**用户启动的初始化流程**；Agent 运行时仍无主密钥路径 |
+| 架构约束 · 依赖方向与包结构 | 通过 | 新增代码落在 `internal/app` / `internal/tool` / `internal/storage` / `internal/web`；`core` 不反向依赖 |
+
+**结论**：无违反项，无需豁免。
+
+### 工作包与顺序
+
+```text
+P0（已完成，宪法 v4.0.0）
+  └─► P1（schema v6 + 契约）
+        ├─► P2（实例初始化）──► P3（MCP 凭据 / apply）──┐
+        └─► P4（执行环境两档）──────────────────────────┴─► P5（五个 Agent + 完整包）
+                                                              └─► P6（页面）──► P7（演练 / 文档 / 收口）
+```
+
+**顺序理由**：P1 的五张表是后续一切写入的前提；P2 先于 P3（没有主密钥无法落库 MCP 凭据）；P4 与 P2 可并行但必须先于 P5（内置 Agent 的 stdio MCP 依赖标准档，不必逐条填白名单）；P6 等后端字段定型后收口；P7 汇总演练与事实同步。
+
+### 代码落位
+
+| 包 | 新增 / 修改 | 说明 |
+| --- | --- | --- |
+| `internal/storage` | 新迁移 + `migrate.go` 版本号 | v6 五表；`network_domain_policy` 改按 scope 读写 |
+| `internal/app` | 新增 `instance_secrets.go`、`instance_config.go`、`execution_policy.go`、`mcp_apply.go`；改 `credential_ops.go` / `credential_crypto.go` / `mcp*.go` / `resource_admin.go` / `run.go` | 初始化、配置生成、档位装配、apply 编排 |
+| `internal/tool` | 新增 `netguard.go`、`websearch.go`；改 `policy.go` / `mcp.go` | 受控拨号、基础防护、认证头装配；`web_search` 内置工具（DeepSeek Search API） |
+| `internal/web` | 新端点与视图 | 9 个新端点 + 4 处扩展 |
+| `internal/cli` | `secrets` 子命令、首次启动提示 | 不自动 commit / 不联网 |
+| `assets/console` | 执行环境页、MCP 六轴、Agent 三段、实例加密两行、登录页文案 | 重建 `dist` |
+| `examples/` | 五个内置 Agent 与完整包素材 | 不含凭据、不自动导入 |
+| `docs/contracts/` | `schema.sql` / `openapi.yaml` / `run-and-errors.md`；`agent-md.md` 的**内置工具清单加 `web_search`** | 其余字段与语义不变 |
+
+### 判据面与 stage
+
+- **新增独立 stage**：`harness/stages/us14-14d.json`（不修改已绑定的 `us14-release.json` r5 证据）。
+- **check 组**：`schema-v6` / `secrets-init` / `admin-login` / `mcp-credential` / `mcp-apply` / `execution-profile` / `builtin-agent` / `full-package`，加既有 `go-build` / `contract-yaml` / `console-test` / `console-build` / `docs-consistency` / `stage-lint`。
+- **required_tests 是控制侧精确锚点**：实现名称必须一致，否则以追加方式扩展 stage 并记录理由，**不得**放宽或删除既有断言。
+- **三态分开记录**：自动化结果、人工走查（M1–M8）、未验证项分别登记；单平台读数不得代替双平台。
+
+### 风险与缓解
+
+| 风险 | 缓解 |
+| --- | --- |
+| 受控重建的在途排空与并发取代 | 排空窗口 + `superseded` 撤回 + 旧 Run 快照不改写（C3 / C4 / C6） |
+| 存量迁移误放宽 / 误封锁 | 一律 `strict` + 两组待确认项 + 逐条审计（D6 / D11） |
+| 严格档基础防护误伤内网 | 例外表 + 待确认清单 + 回退说明（D5 / M7） |
+| 完整包体积与供应链 | 启动时校验来源与摘要、随附第三方声明；体积实测（M5） |
+| 初始化中断留下半截状态 | `SameFile` 证明来源才清理；否则恢复态且不删文件（A10 / A11） |
+
+### 测试策略（14D）
+
+Go 单测按包（`internal/app` / `internal/tool` / `internal/storage` / `internal/web` / `internal/cli`）+ e2e 夹具（`//go:build e2e`，`TestUS14D_*`）+ 控制台 Vitest / 构建 + 文档一致性。外部服务（模型、GitHub、Brave、真实通知）仍**全部未授权**：只用夹具并标未验证。

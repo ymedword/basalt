@@ -11,7 +11,8 @@ import type { VNode, VNodeChild } from 'vue'
 import type { MCPCatalogEntry, MCPCatalogWarning, McpServerView } from '../api'
 import { catalogApi } from '../api-catalog'
 import type { McpServerWrite } from '../api-admin'
-import { ResourceForm } from '../components/resource-form'
+import type { McpApplyOutcome } from '../components/resource-form'
+import { ResourceForm, createdApplyNotice } from '../components/resource-form'
 import { DataTable, Notice } from '../components/ui'
 import type { TableRow } from '../components/ui'
 import { pageHeading, badge, definitions, identifier, section, useLoader, viewProps } from './shared'
@@ -87,6 +88,8 @@ export const CatalogView = defineComponent({
     const selectedId = ref('')
     const prefillEntry = ref<MCPCatalogEntry | null>(null)
     const formNotice = ref('')
+    // 已创建但应用没切换运行版本属 warn，不能挂在 info 上轻描淡写。
+    const formNoticeTone = ref<'info' | 'warn'>('info')
 
     const entries = computed<readonly MCPCatalogEntry[]>(() => catalog.data.value?.items ?? [])
 
@@ -142,6 +145,7 @@ export const CatalogView = defineComponent({
     function openPrefill(entry: MCPCatalogEntry): void {
       selectedId.value = entry.id
       prefillEntry.value = entry
+      formNoticeTone.value = 'info'
       formNotice.value = `已按配方“${entry.display_name}”预填新建表单；页面不会自动保存，请核对后点“创建并发布”。`
     }
 
@@ -149,13 +153,14 @@ export const CatalogView = defineComponent({
       prefillEntry.value = null
     }
 
-    function onCreated(): void {
+    function onCreated(_view: unknown, apply?: unknown): void {
       const entry = prefillEntry.value
       prefillEntry.value = null
-      formNotice.value =
-        entry === null
-          ? '已创建并发布；列表将从服务端重新读取。'
-          : `已创建并发布；MCP 连接在重启后生效。配方“${entry.display_name}”本身没有被修改。`
+      // 表单卸载后它自己的提示随之消失：保存 / 应用两段的结论在这里重说一遍。
+      const notice = createdApplyNotice(apply as McpApplyOutcome | null | undefined)
+      const recipe = entry === null ? '' : `配方“${entry.display_name}”本身没有被修改；`
+      formNotice.value = `${notice.text}${recipe}列表将从服务端重新读取。`
+      formNoticeTone.value = notice.tone
       void catalog.reload()
       void configured.reload()
     }
@@ -274,7 +279,9 @@ export const CatalogView = defineComponent({
           ? ['可执行名', identifier(entry.command)]
           : ['URL', identifier(entry.url)],
         ['参数（每行一个）', entry.args.length === 0 ? '无' : h('code', entry.args.join(' '))],
-        ['依赖', requiresText(entry)],
+        // 配方只写“需要什么”，不知道本机是否就位：标签里带前提，不让静态清单冒充读数。
+        // The recipe states requirements, never readiness.
+        ['依赖（配方要求）', requiresText(entry)],
         ['配方状态', recipeBadge(entry)],
         ['验证说明', entry.verification_note === '' ? '—' : entry.verification_note],
         ['验证时间', entry.verified_at === '' ? '—' : entry.verified_at],
@@ -289,6 +296,11 @@ export const CatalogView = defineComponent({
       const children: VNodeChild[] = [
         h('p', { class: 'muted' }, entry.summary),
         definitions(pairs),
+        h(
+          'p',
+          { class: 'muted small' },
+          '依赖是配方写明的运行时要求，不是就位状态：命令能否定位、组件版本是否匹配，以保存后详情页的「依赖」轴诊断为准。',
+        ),
       ]
       if (entry.env.length > 0) {
         children.push(
@@ -363,7 +375,7 @@ export const CatalogView = defineComponent({
         )
       }
       if (formNotice.value !== '') {
-        content.push(h(Notice, { tone: 'info', text: formNotice.value }))
+        content.push(h(Notice, { tone: formNoticeTone.value, text: formNotice.value }))
       }
       if (prefillEntry.value !== null) {
         content.push(

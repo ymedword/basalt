@@ -685,12 +685,21 @@ func fixtureUID(t *testing.T, prefix string) string {
 	return string(out)
 }
 
-// writeActiveLifecycleState 按契约字面量写 `.basalt/control/agents/<name>.json`：紧凑
+// writeActiveLifecycleState 写一份 enabled 形态的状态文件（active / 代数 2）。
+// writeActiveLifecycleState writes the active/generation-2 shape used by most fixtures.
+func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
+	t.Helper()
+	// 代数 2 = "基线写入（1）之后的一次启用"，与真实启停路径留下的形态一致。
+	h.writeLifecycleState(t, name, "active", 2)
+}
+
+// writeLifecycleState 按契约字面量写 `.basalt/control/agents/<name>.json`：紧凑
 // JSON、固定字段顺序、checksum = "sha256:" + 十六进制（对 checksum 置空后的整份字节取
 // sha256）。夹具直接按契约生成字节——本套件只测真实二进制，不 import internal 包来造状态。
+// 状态与代数由调用方给定：14D / E5 需要"新建即停用"（disabled / 代数 1）的初始形态。
 // The fixture speaks the contract's on-disk bytes literally: compact JSON in fixed field
 // order with the documented checksum, generated without importing internal packages.
-func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
+func (h *harness) writeLifecycleState(t *testing.T, name, state string, generation int64) {
 	t.Helper()
 
 	now := time.Now()
@@ -700,11 +709,10 @@ func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
 		SchemaVersion: 2,
 		Agent:         name,
 		AgentUID:      fixtureAgentUID(t),
-		State:         "active",
-		// 代数 2 = "基线写入（1）之后的一次启用"，与真实启停路径留下的形态一致。
-		Generation:  2,
-		UpdatedAt:   now.UnixMilli(),
-		OperationID: fmt.Sprintf("op-e2e-%s-%d", name, now.UnixNano()),
+		State:         state,
+		Generation:    generation,
+		UpdatedAt:     now.UnixMilli(),
+		OperationID:   fmt.Sprintf("op-e2e-%s-%d", name, now.UnixNano()),
 	}
 	unsigned, err := json.Marshal(record) // checksum 为空串，正与被哈希的形态一致
 	if err != nil {

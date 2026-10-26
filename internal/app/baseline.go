@@ -160,6 +160,21 @@ type RecoveryDeps struct {
 	// NetworkPolicy 是网络域名白名单仓储：恢复按修订号与候选域名哈希判定三态。
 	// NetworkPolicy backs the allowlist verdict; nil means indeterminate only.
 	NetworkPolicy core.NetworkDomainPolicyStore
+	// NetworkExceptions 是访问例外仓储：新增按 `exception_id` + `operation_id` 认领
+	// 行，删除按行是否仍在判定三态（契约 §9.4）。nil 只意味着该组判 unknown。
+	// NetworkExceptions backs the exception verdicts; nil means indeterminate only.
+	NetworkExceptions core.NetworkExceptionStore
+	// ExecutionPolicy 是执行档位单行表仓储：恢复按前后档位与修订号判定三态。档位行
+	// 没有"候选哈希"——一行表 + 修订号 CAS 本身就足以区分"这次写进去了"与"没有"。
+	// ExecutionPolicy backs the profile verdict; the row plus its revision fence is
+	// enough to tell "this write landed" from "it did not".
+	ExecutionPolicy core.ExecutionPolicyStore
+	// InstanceSecrets 是实例初始化记录仓储：`system.secrets_init` 的查证要读它。
+	// InstanceSecrets backs the secrets-init verdict; nil means indeterminate only.
+	InstanceSecrets *storage.InstanceSecretsStore
+	// MasterKeyFile 是主密钥文件路径：查证要走完整 `LoadMasterKey` 并核对链接数。
+	// MasterKeyFile is the key path the secrets-init verdict re-reads.
+	MasterKeyFile string
 }
 
 // SchemaVersionSource 回答库当前的 schema 版本（`*storage.DB` 满足）。
@@ -847,6 +862,20 @@ type operationDetail struct {
 	// "缺字段"区别于零值——缺字段即无法判定，不用 0 猜。
 	BeforeRevision *int64 `json:"before_revision"`
 	AfterRevision  *int64 `json:"after_revision"`
+	// 受控重建（`mcp_server.apply`，契约 §9.4）：本操作的目标版本与操作前的已应用版本。
+	// 查证只比对 `applied` 指针，**不重放** apply——候选连接与注册都是进程内的，
+	// 重启后自然消失。
+	TargetVersionID   *int64 `json:"target_version_id"`
+	PreviousVersionID *int64 `json:"previous_version_id"`
+	// 执行档位（`execution_policy.update`）：前后档位。与上面两组修订号共用字段，
+	// 档位名用指针区分"缺字段"（→ 无法判定）与空串。
+	BeforeProfile *string `json:"before_profile"`
+	AfterProfile  *string `json:"after_profile"`
+	// 网络访问例外（`network_exception.create` / `.delete`）：被放行的 kind 与 value。
+	// 查证先按 `exception_id` + `operation_id` 认领行，再用 `(kind, value)` 排除
+	// "已被别人占用 / 删除后重建"的混淆；缺字段同样只能用指针表达"无法判定"。
+	ExceptionKind  *string `json:"kind"`
+	ExceptionValue *string `json:"value"`
 }
 
 // decodeOperationDetail 解析 `detail_json`；空串 / 非法 JSON 都返回错误，由调用方
@@ -944,19 +973,41 @@ func verifyOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRe
 		return verifyScopeConversion(ctx, deps, op)
 	case actionBaselineV3:
 		return verifyBaselineV3(ctx, deps, op)
-	case core.ActionNetworkAllowlistUpdate:
+	case core.ActionNetworkAllowlistUpdate, core.ActionNetworkDenylistUpdate:
 		return verifyNetworkAllowlist(ctx, deps, op)
+	case core.ActionNetworkExceptionCreate:
+		return verifyNetworkExceptionCreate(ctx, deps, op)
+	case core.ActionNetworkExceptionDelete:
+		return verifyNetworkExceptionDelete(ctx, deps, op)
+	case core.ActionExecutionPolicyUpdate:
+		return verifyExecutionPolicy(ctx, deps, op)
+	case core.ActionMCPServerApply:
+		return verifyMCPApply(ctx, deps, op)
+	case core.ActionSystemSecretsInit:
+		return verifySecretsInitOperation(ctx, deps, op)
 	default:
 		return core.VerificationIndeterminate
 	}
 }
 
-// verifyNetworkAllowlist 按修订号与候选域名哈希判定白名单写入三态（R8.2.4 第 6 条）：
-// 当前修订 = after 且域名哈希一致 → applied；仍为 before → not_applied；其余
-// （含无行 / 读失败）→ indeterminate，**不重做**。
-// verifyNetworkAllowlist follows the revision-CAS verdicts for the allowlist write.
+// verifyNetworkAllowlist 按修订号与候选域名哈希判定域名表写入三态（R8.2.4 第 6 条
+// 与契约 §9.4）：当前修订 = after 且域名哈希一致 → applied；仍为 before →
+// not_applied；其余（含无行 / 读失败）→ indeterminate，**不重做**。白名单与禁止
+// 域名表共用本函数，作用域由 `target_kind` 唯一决定——两行共用一张表，按目标类型
+// 选错行就会拿另一份域名摘要去比，结论必然错。
+// verifyNetworkAllowlist follows the revision-CAS verdicts for both policy rows;
+// the scope is derived from target_kind alone.
 func verifyNetworkAllowlist(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
-	if deps.NetworkPolicy == nil || op.TargetKind != core.TargetKindNetworkAllowlist {
+	if deps.NetworkPolicy == nil {
+		return core.VerificationIndeterminate
+	}
+	var scope string
+	switch op.TargetKind {
+	case core.TargetKindNetworkAllowlist:
+		scope = core.PolicyScopeHTTPDomains
+	case core.TargetKindNetworkDenylist:
+		scope = core.PolicyScopeHTTPDeniedDomains
+	default:
 		return core.VerificationIndeterminate
 	}
 	detail, err := decodeOperationDetail(op.DetailJSON)
@@ -964,7 +1015,7 @@ func verifyNetworkAllowlist(ctx context.Context, deps RecoveryDeps, op core.Oper
 		detail.CandidateSHA256 == "" {
 		return core.VerificationIndeterminate
 	}
-	policy, exists, loadErr := deps.NetworkPolicy.Load(ctx)
+	policy, exists, loadErr := deps.NetworkPolicy.Load(ctx, scope)
 	if loadErr != nil || !exists {
 		return core.VerificationIndeterminate
 	}
@@ -977,6 +1028,154 @@ func verifyNetworkAllowlist(ctx context.Context, deps RecoveryDeps, op core.Oper
 	default:
 		return core.VerificationIndeterminate
 	}
+}
+
+// verifyNetworkExceptionCreate 按契约 §9.4 判定新增例外：目标行存在且
+// `operation_id` 一致 → applied；目标行不存在且同一 `(kind, value)` 也没有被别的
+// 操作占用 → not_applied（可证明未写入）；目标行属于别的操作、或同值已被占用、
+// 或读不出来 → indeterminate。**不**改写任何已有行。
+// verifyNetworkExceptionCreate claims the row by exception_id plus operation id; an
+// absent row is only proof of "not written" when no other operation took the value.
+func verifyNetworkExceptionCreate(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.NetworkExceptions == nil || op.TargetKind != core.TargetKindNetworkException {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeOperationDetail(op.DetailJSON)
+	if err != nil || detail.ExceptionKind == nil || detail.ExceptionValue == nil {
+		return core.VerificationIndeterminate
+	}
+	row, found, lookupErr := deps.NetworkExceptions.Lookup(ctx, op.TargetID)
+	if lookupErr != nil {
+		return core.VerificationIndeterminate
+	}
+	if found {
+		if row.OperationID == op.OperationID {
+			return core.VerificationApplied
+		}
+		return core.VerificationIndeterminate
+	}
+	// 目标行不在：再排除"同一 `(kind, value)` 已被别人登记"——那种情况下本次写入
+	// 必然失败，但失败原因不是"没执行"，不能直接判 not_applied。
+	// An occupied (kind, value) means this write lost the race; that is not the same
+	// as proving nothing happened, so the verdict stays unknown.
+	return exceptionValueVerdict(ctx, deps, *detail.ExceptionKind, *detail.ExceptionValue,
+		core.VerificationNotApplied)
+}
+
+// verifyNetworkExceptionDelete 按契约 §9.4 判定删除例外：目标行不存在且同一
+// `(kind, value)` 没有重新登记 → applied；目标行仍在且属于本操作 → not_applied；
+// 同值已被新行占用（删除后又重建）或读不出来 → indeterminate。**不**再删一次。
+// verifyNetworkExceptionDelete treats a vanished row as applied unless the same value
+// has reappeared under a different operation.
+func verifyNetworkExceptionDelete(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.NetworkExceptions == nil || op.TargetKind != core.TargetKindNetworkException {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeOperationDetail(op.DetailJSON)
+	if err != nil || detail.ExceptionKind == nil || detail.ExceptionValue == nil {
+		return core.VerificationIndeterminate
+	}
+	row, found, lookupErr := deps.NetworkExceptions.Lookup(ctx, op.TargetID)
+	if lookupErr != nil {
+		return core.VerificationIndeterminate
+	}
+	if found {
+		if row.OperationID != op.OperationID {
+			// 同标识却属于别的操作：行被改写的行为本仓写路径不存在，只能判 unknown。
+			return core.VerificationIndeterminate
+		}
+		return core.VerificationNotApplied
+	}
+	return exceptionValueVerdict(ctx, deps, *detail.ExceptionKind, *detail.ExceptionValue,
+		core.VerificationApplied)
+}
+
+// exceptionValueVerdict 在目标行不在时回答"同一 `(kind, value)` 是否被别的行占用"：
+// 占用 → indeterminate（无法区分"本次写入没发生"与"已被他人写入 / 删除后重建"）；
+// 未占用 → fallback（新增判 not_applied、删除判 applied）；读失败 → indeterminate。
+// exceptionValueVerdict resolves the same-value confusion when the row by id is gone.
+func exceptionValueVerdict(ctx context.Context, deps RecoveryDeps, kind, value, fallback string) string {
+	list, listErr := deps.NetworkExceptions.List(ctx)
+	if listErr != nil {
+		return core.VerificationIndeterminate
+	}
+	for _, item := range list {
+		if item.Kind == kind && item.Value == value {
+			return core.VerificationIndeterminate
+		}
+	}
+	return fallback
+}
+
+// verifyExecutionPolicy 按修订号与前后档位判定档位切换三态（契约 §9.4）：当前修订
+// = after 且档位 = after → applied；仍为 before 且档位 = before → not_applied；其余
+// （含无行 / 读失败 / 缺字段）→ indeterminate，**不重做**。档位切换是幂等的单行写，
+// 但重做会把"用户在崩溃前没等到的确认"当成一次新确认——恢复只判不写。
+// verifyExecutionPolicy reads the row back and compares both the revision fence and
+// the profile; recovery never replays the switch.
+func verifyExecutionPolicy(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.ExecutionPolicy == nil || op.TargetKind != core.TargetKindExecutionPolicy {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeOperationDetail(op.DetailJSON)
+	if err != nil || detail.BeforeRevision == nil || detail.AfterRevision == nil ||
+		detail.BeforeProfile == nil || detail.AfterProfile == nil {
+		return core.VerificationIndeterminate
+	}
+	policy, exists, loadErr := deps.ExecutionPolicy.Load(ctx)
+	if loadErr != nil || !exists {
+		return core.VerificationIndeterminate
+	}
+	switch {
+	case policy.Revision == *detail.AfterRevision && string(policy.Profile) == *detail.AfterProfile:
+		return core.VerificationApplied
+	case policy.Revision == *detail.BeforeRevision && string(policy.Profile) == *detail.BeforeProfile:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyMCPApply 按契约 §9.4 判定受控重建：`applied` 指针 = 目标版本 → applied；
+// = 操作前版本 → not_applied；第三版本 / 指针或版本行读不出 → indeterminate。
+// **不重放** apply——候选注册与候选连接是进程内的，重启后自然消失；重放会把
+// "已经失败过一次"的切换当成新请求再试一遍。`superseded` 的 pending 行同样只按
+// 指针判：指针仍是操作前版本即为 not_applied（取代者的结果由它自己的操作行记录）。
+// verifyMCPApply compares the applied pointer with the target and previous versions;
+// the apply itself is never replayed after a restart.
+func verifyMCPApply(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Resources == nil || op.TargetKind != core.TargetKindMCPServer {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeOperationDetail(op.DetailJSON)
+	if err != nil || detail.TargetVersionID == nil || detail.PreviousVersionID == nil {
+		return core.VerificationIndeterminate
+	}
+	// `apply` 的 `target_id` 是资源身份（`resource_uid`），不是名称：按 UID 寻址，
+	// 同名重建后旧操作行不会误指新实例。
+	uid, uidErr := core.ParseResourceUID(op.TargetID)
+	if uidErr != nil {
+		return core.VerificationIndeterminate
+	}
+	pointer, ptrErr := deps.Resources.PointerByUID(ctx, core.ResourceMCPServer, uid)
+	if ptrErr != nil || pointer.DeletedAt != nil || pointer.AppliedVersionID == nil {
+		return core.VerificationIndeterminate
+	}
+	applied := *pointer.AppliedVersionID
+	var verdict string
+	switch applied {
+	case *detail.TargetVersionID:
+		verdict = core.VerificationApplied
+	case *detail.PreviousVersionID:
+		verdict = core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+	if _, err := deps.Resources.VersionByID(ctx, applied); err != nil {
+		// 指针指向的版本行已不存在：字面对上了也不算查清。
+		return core.VerificationIndeterminate
+	}
+	return verdict
 }
 
 // verifyContentUpdate 按契约 §9.4 的三态判定内容写：磁盘哈希 = 目标哈希 → applied；
@@ -1526,8 +1725,12 @@ type credentialActionDetail struct {
 	VersionNo             int    `json:"version_no,omitempty"`
 	PreviousVersion       int    `json:"previous_version,omitempty"`
 	TargetBinding         string `json:"target_binding,omitempty"`
-	RevocationEpoch       int    `json:"revocation_epoch,omitempty"`
-	PreviousEpoch         int    `json:"previous_epoch,omitempty"`
+	// BindingKey 是 MCP 槽位名（env 键名或请求头名）：一个 server 可以有多个槽位，各自
+	// 独立版本与撤销，审计必须点名是哪一槽。其它类别省略该字段。
+	// BindingKey names the MCP slot; other credential kinds omit it.
+	BindingKey      string `json:"binding_key,omitempty"`
+	RevocationEpoch int    `json:"revocation_epoch,omitempty"`
+	PreviousEpoch   int    `json:"previous_epoch,omitempty"`
 	// AffectedEligibleAgents 是切到专属后不再收到该渠道的 Agent 名单（R4.5 的影响提示）：
 	// 与响应同源，落进操作记录供事后核对"当时告诉过谁"。空名单省略。
 	// AffectedEligibleAgents mirrors the response hint into the audit record.
@@ -1546,7 +1749,7 @@ func decodeCredentialActionDetail(op core.OperationRecord, uid core.ResourceUID)
 	if err := json.Unmarshal(op.DetailJSON, &detail); err != nil {
 		return credentialActionDetail{}, err
 	}
-	if _, err := core.ParseBindingKind(detail.Kind); err != nil {
+	if _, err := core.ParseCredentialOwnerKind(detail.Kind); err != nil {
 		return credentialActionDetail{}, err
 	}
 	if detail.ResourceUID != "" {

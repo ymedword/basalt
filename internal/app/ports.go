@@ -418,10 +418,10 @@ type secretsPort struct {
 	Logger  *slog.Logger
 }
 
-// Init 转调并投影结果。
-// Init forwards and projects the result.
+// Init 转调并投影结果；主体归因与 RevokeManaged 同源（命令面不自己编造身份）。
+// Init forwards and projects the result with the same CLI attribution as RevokeManaged.
 func (p secretsPort) Init(ctx context.Context) (cli.SecretsStatus, error) {
-	status, err := p.service.Init(ctx)
+	status, err := p.service.Init(ctx, cliWriteActor(p.Logger))
 	return cliSecretsStatus(status), err
 }
 
@@ -451,6 +451,8 @@ func (p secretsPort) RevokeManaged(ctx context.Context) (int, error) {
 func cliSecretsStatus(status SecretsStatus) cli.SecretsStatus {
 	return cli.SecretsStatus{
 		Initialized:             status.Initialized,
+		State:                   string(status.State),
+		Reason:                  string(status.Reason),
 		KeyID:                   status.KeyID,
 		Fingerprint:             status.Fingerprint,
 		ManagedModelConnections: status.ManagedModelConnections,
@@ -563,7 +565,12 @@ type Migrator interface {
 // 任何凭据材料（指纹是主密钥的公开标识，供运维比对，不是密钥派生出的可用秘密）。
 // SecretsStatus is the read-only secrets result; it never carries key material.
 type SecretsStatus struct {
-	Initialized             bool
+	Initialized bool
+	// State / Reason 是实例加密三态判定（T085）与恢复细分原因：`Initialized` 只说
+	// "密钥文件可读"，"这个实例的加密身份是不是可用的"由这两个字段回答。
+	// State and Reason carry the three-state verdict; Initialized only says the file reads.
+	State                   core.SecretState
+	Reason                  core.SecretRecoveryReason
 	KeyID                   string
 	Fingerprint             string
 	ManagedModelConnections int
@@ -583,7 +590,8 @@ type SecretsVerifyReport struct {
 // SecretsService backs the secrets subcommands; it never prints key material and offers
 // no automatic rotation.
 type SecretsService interface {
-	Init(ctx context.Context) (SecretsStatus, error)
+	// Init 的 actor 是初始化审计的归因：命令面传入 CLI 操作主体，页面传入管理员身份。
+	Init(ctx context.Context, actor core.Actor) (SecretsStatus, error)
 	Status(ctx context.Context) (SecretsStatus, error)
 	Verify(ctx context.Context) (SecretsVerifyReport, error)
 	RevokeManaged(ctx context.Context, actor core.Actor) (int, error)

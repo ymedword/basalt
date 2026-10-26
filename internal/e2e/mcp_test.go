@@ -210,28 +210,22 @@ func testMCPToolList(t *testing.T) {
 	}
 }
 
-// testMCPEnvNegative：`env` 占位与明文负向（U-2 第 6 项）。三种形态都必须拒绝启动：
-// 引用未设置的变量、引用空值、写明文值；错误点名 server / 键 / 变量，**不回显值**。
+// testMCPEnvNegative：`env` 占位的启动隔离与明文负向（U-2 第 6 项；14D §2.5.4 E3 修订）。
+// 引用未设置的变量、引用空值不再中止整个进程：只跳过该 server——不建连接、不注册工具、
+// 不拿占位符字面量起进程——其余 server 与内置工具照常，WARN 点名 server / 槽位 / 变量且
+// **不回显值**。明文 `env` 仍是失败关闭：那是配置面错误，不是"这条 server 自己的凭据
+// 当前取不到值"，不在启动隔离的放行范围内。
 func testMCPEnvNegative(t *testing.T) {
 	const missingVar = "BASALT_E2E_MCP_UNSET"
 	yamlBody := "servers:\n  - name: helper\n    command: " + mcpHelperCommand() +
 		"\n    env:\n      BASALT_MCP_HELPER: ${" + missingVar + "}\n"
 
 	cases := []struct {
-		name     string
-		env      []string
-		wantCopy string
+		name string
+		env  []string
 	}{
-		{
-			name:     "unset",
-			env:      fixtureEnv(),
-			wantCopy: "mcp_servers.yaml 的 server helper 的 env.BASALT_MCP_HELPER 引用的 " + missingVar + " 未设置或为空",
-		},
-		{
-			name:     "empty",
-			env:      append(fixtureEnv(), missingVar+"="),
-			wantCopy: "mcp_servers.yaml 的 server helper 的 env.BASALT_MCP_HELPER 引用的 " + missingVar + " 未设置或为空",
-		},
+		{name: "unset", env: fixtureEnv()},
+		{name: "empty", env: append(fixtureEnv(), missingVar+"=")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,10 +235,17 @@ func testMCPEnvNegative(t *testing.T) {
 			h.writeConfig(t, configWithProvider("http://127.0.0.1:1"))
 
 			res := h.run(t, tc.env, "tool", "list")
-			if res.ExitCode == 0 {
-				t.Fatalf("%s：未设置的占位必须拒绝启动\n%s", tc.name, res.Stdout+res.Stderr)
-			}
-			requireContains(t, res.Stdout+res.Stderr, tc.wantCopy, "占位解析失败的逐字文案")
+			requireExit(t, res, 0, tc.name+"：单个 server 凭据缺失只跳过该 server，不中止启动")
+			output := res.Stdout + res.Stderr
+			requireContains(t, output, "MCP server 凭据不可用，本次启动跳过该 server",
+				"启动隔离必须留下点明跳过事实的 WARN")
+			requireContains(t, output, "server=helper", "WARN 点名被跳过的 server")
+			requireContains(t, output, "槽位 BASALT_MCP_HELPER 引用的 "+missingVar+" 未设置或为空",
+				"WARN 点名槽位与变量名")
+			requireAbsent(t, output, "回显 text 参数",
+				"被跳过的 server 不得注册任何工具")
+			requireContains(t, output, "共 11 件工具",
+				"跳过一个 server 不得影响其余内置工具的装配")
 		})
 	}
 

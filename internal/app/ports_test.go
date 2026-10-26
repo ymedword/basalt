@@ -52,7 +52,7 @@ func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 29, "29 张表随 schema.sql（v5）建齐——v1 11 张 + US-11 新增 7 张 + US-12 新增 10 张 + v5 的 network_domain_policy")
+	require.Len(t, tables, 33, "33 张表随 schema.sql（v6）建齐——v1 11 张 + US-11 新增 7 张 + US-12 新增 10 张 + v5 的 network_domain_policy + v6 的四张")
 }
 
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**
@@ -582,17 +582,18 @@ func TestToolListerPort_ForwardsSpecsInRegistryOrder(t *testing.T) {
 	require.Equal(t, registry.Specs(registry.Names()), specs, "转调必须逐字段保真（描述与 schema 一并）")
 }
 
-// TestToolListerPort_HeavyAssemblyRegistersTenTools：重路径装配池**十件**——三件文件工具
+// TestToolListerPort_HeavyAssemblyRegistersElevenTools：重路径装配池**十一件**——三件文件工具
 // 加 `shell` / `http_get` / `http_post`（US-5）、`save_memory` / `recall_memory`（US-6/7 记忆对）、
-// US-8 的 `notify` 与 US-10 的 `manage_schedule`，且新件确实可解析（`Resolve` 命中），
-// 不再是"注册了名字、背后没有实体"的形态。（判据面变更 §3.5 #4：原名 `...NineTools`，
-// 精确集 9 → 10，断言只收紧、不删除。）
+// US-8 的 `notify`、US-10 的 `manage_schedule` 与 14D 的 `web_search`，且新件确实可解析
+// （`Resolve` 命中），不再是"注册了名字、背后没有实体"的形态。（判据面变更 §3.5 #4：
+// 原名 `...NineTools`，精确集 9 → 10；14D T125 再改名为 `...ElevenTools`，精确集 10 → 11，
+// 断言只收紧、不删除。）
 //
-// 名集是**恰好十件**而不是"至少包含"：装配池少一件（调度工具忘接）或多一件（误接线）
+// 名集是**恰好十一件**而不是"至少包含"：装配池少一件（搜索工具忘接）或多一件（误接线）
 // 都是装配故障，集合比较让两种都当场落红。
 // The pool is compared as an exact set: one tool short or one extra is an assembly
 // fault either way, and only the set comparison catches both.
-func TestToolListerPort_HeavyAssemblyRegistersTenTools(t *testing.T) {
+func TestToolListerPort_HeavyAssemblyRegistersElevenTools(t *testing.T) {
 	fx := newWireFixture(t)
 	rt := fx.assemble(t)
 
@@ -603,10 +604,10 @@ func TestToolListerPort_HeavyAssemblyRegistersTenTools(t *testing.T) {
 	}
 	require.Equal(t, []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-		"recall_memory", "save_memory", "shell", "write_file",
-	}, names, "装配池补到十件（三件文件工具 + shell / http_get / http_post + 两件记忆工具 + notify + manage_schedule）")
+		"recall_memory", "save_memory", "shell", "web_search", "write_file",
+	}, names, "装配池补到十一件（三件文件工具 + shell / http_get / http_post + 两件记忆工具 + notify + manage_schedule + web_search）")
 
-	for _, name := range []string{"shell", "http_get", "http_post", "save_memory", "recall_memory", "notify"} {
+	for _, name := range []string{"shell", "http_get", "http_post", "save_memory", "recall_memory", "notify", "web_search"} {
 		resolved, ok := rt.registry.Resolve(name)
 		require.True(t, ok, "工具必须在注册池内可解析：%s", name)
 		require.Equal(t, name, resolved.Name())

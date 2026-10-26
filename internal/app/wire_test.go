@@ -450,10 +450,13 @@ func (c *scriptedProviderClient) requests() []core.ChatRequest {
 	return append([]core.ChatRequest(nil), c.seen...)
 }
 
-// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的**九个**次序读数在日志里**按序**
+// TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的**十个**次序读数在日志里**按序**
 // 可见，且恢复完成的一条携带启动摘要的五个计数；装配失败时句柄不半开（锁被放回）。
 // 基线与管理面恢复各自是一条读数（图 A ③④）；US-12 追加对账 → 目录 → 注册表（图 A
 // ⑤⑥⑦）——定义对账先于运行目录与注册表，中间被别的步骤插队就是接线错了。
+// 14D T085 在迁移之后、恢复之前插入 `secrets`：它要读 `instance_secrets` 表（迁移之后
+// 才存在），而恢复扫描要按记录 + key_id 查证 `system.secrets_init`，必须看到初始化后的
+// 真实状态（恢复之后才初始化会让一条 pending 记录永远查不上）。
 func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 	fx := newWireFixture(t)
 
@@ -461,10 +464,10 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 
 	steps := logSteps(t, fx.logs.String())
 	require.Equal(t, []string{
-		"lock", "open", "migrate", "recover", "baseline", "recovery",
+		"lock", "open", "migrate", "secrets", "recover", "baseline", "recovery",
 		"reconcile", "catalog", "registry",
 	}, steps,
-		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 崩溃恢复 → 启动基线 → 管理面恢复 → 定义对账 → 运行目录 → 注册表（次序即正确性）")
+		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 实例加密 → 崩溃恢复 → 启动基线 → 管理面恢复 → 定义对账 → 运行目录 → 注册表（次序即正确性）")
 
 	recoverRec := findStep(t, fx.logs.String(), "recover")
 	for _, key := range []string{"unknowns", "repaired_groups", "closed_runs", "rolled_back", "rolled_forward"} {
@@ -666,6 +669,7 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 // TestWire_LightCommandTakesNoAssembly 是 T4：只读命令在**实例锁被持有**时照常可用，
 // 且整条路径不产生数据库写入（库文件从未出现）；同一把锁下重命令被拒且零写入。
 func TestWire_LightCommandTakesNoAssembly(t *testing.T) {
+	resetOutboundGuard(t)
 	fx := newWireFixture(t)
 	fx.writeAgent(t, "reader", "read_file")
 	t.Chdir(fx.workDir) // Run 以进程工作目录定位工作区
@@ -1538,7 +1542,7 @@ func TestWire_CredentialComponentsAssembled(t *testing.T) {
 	require.Zero(t, report.Checked, "没有托管身份就没有可查验的凭据")
 	require.Zero(t, report.Failed)
 
-	_, err = runtime.Secrets().Init(ctx)
+	_, err = runtime.Secrets().Init(ctx, core.Actor{Subject: "cli:test", Method: core.AuthMethodCLI, Source: "cli"})
 	require.ErrorIs(t, err, core.ErrCredentialUnavailable,
 		"纯 env 实例可以跳过 init：空路径按固定错误拒绝，不在默认位置凭空造密钥")
 	require.NoFileExists(t, filepath.Join(fx.workDir, "master.key"), "拒绝路径不得落盘")

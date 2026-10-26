@@ -61,7 +61,13 @@ func NewToolExecutor(resolver ToolResolver, audit ToolInvocationStore, logger *s
 // that no longer matches the frozen snapshot.
 func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []string, call ToolCall) Result {
 	// ① 工具名解析 + 运行时归属校验（两道，均在执行之前——不产生审计行、不终止 Run）。
-	tool, ok := e.resolver.Resolve(call.Name)
+	// 解析**先查准入时钉住的实例**（14D / C4）：受控重建换掉注册池后，在途 Run 继续用
+	// 它自己那一代实例，不会被悄悄转到新连接；未钉（零值单测 / 非 Run 直调）才查注册池。
+	// Pinned instances win so an apply can never retarget an in-flight run.
+	tool, ok := env.Tools[call.Name]
+	if !ok {
+		tool, ok = e.resolver.Resolve(call.Name)
+	}
 	if !ok {
 		// 契约既有字面量（与加载期门禁同一句）：工具名不在全局注册池。
 		return Result{Content: fmt.Sprintf("tool not registered: %s", call.Name)}

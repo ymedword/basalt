@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """行业 / 竞品简报的来源去重、可引用性判定与引用校验（颗粒度文档 §3.5 / §4.4 D5）。
 
-只用标准库。读模型落盘的两份 MCP 结果——Brave 检索（多次查询聚合）与 Fetch 抓取
-（逐 URL 正文）——算出来源表，把每个来源分成两类：
+只用标准库。读模型落盘的两份结果——搜索工具（`web_search` 或同类，多次查询聚合）
+与 Fetch 抓取（逐 URL 正文）——算出来源表，把每个来源分成两类：
 
 * `fetched`：有正文，`citable=true`，可以作结论来源；
 * `lead`：没有正文（没抓 / 抓失败 / 正文为空），`citable=false`，**只能列作线索**。
@@ -31,8 +31,8 @@
   都不写**（连输出父目录都不创建）。
 
 The script owns the source table and the citable / lead split. It never calls the
-network: the model saves Brave and Fetch results to JSON, and this script turns them
-into a brief, then optionally verifies that the written report cites only fetched
+network: the model saves search-tool and Fetch results to JSON, and this script turns
+them into a brief, then optionally verifies that the written report cites only fetched
 sources. Every count in the report is recomputable from the two input files.
 """
 
@@ -45,7 +45,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -54,6 +54,9 @@ SCHEMA_VERSION = 1
 STATUS_FETCHED = "fetched"
 STATUS_LEAD = "lead"
 EXCERPT_CHARS = 200
+# 显式 `--now` 允许的最大超前量：秒级时钟对齐误差不小，但推算出来的时钟动辄提前
+# 几十分钟到几小时——留 5 分钟容差，未来时间一律拒绝。
+FUTURE_TOLERANCE = timedelta(minutes=5)
 
 # `[来源: https://…]`（中英文冒号都接受）；URL 到右方括号或空白为止。
 CITATION_RE = re.compile(r"\[来源[:：]\s*(https?://[^\]\s]+)\s*\]")
@@ -103,11 +106,27 @@ def parse_timestamp(value):
 
 
 def parse_clock(value):
+    """省略 `--now` 时取本机当前时钟，**秒级**（去掉微秒）：模型要把 stdout 里的
+    `observed_at` 原样回传做自检，秒级才能逐字抄且两次调用逐字节相同。
+
+    显式给出的 `--now` **不得是未来时间**（容差 `FUTURE_TOLERANCE`）：运行时钟只能
+    记录本轮真实观测时间，模型推算出来的值会把「访问时间」写成未发生的时间点。回填
+    历史轮次（过去时间）仍然允许，可复跑口径不变。
+
+    The default clock keeps second precision so the value round-trips verbatim; an
+    explicit clock may not be in the future (past values stay allowed for replay).
+    """
     if value is None:
-        return datetime.now().astimezone()
+        return datetime.now().astimezone().replace(microsecond=0)
     parsed = parse_timestamp(value)
     if parsed is None:
         raise ScriptError(f"--now 必须是带时区偏移的 ISO 8601 时间：{value!r}")
+    ahead = (parsed - datetime.now().astimezone()).total_seconds()
+    if ahead > FUTURE_TOLERANCE.total_seconds():
+        raise ScriptError(
+            f"--now 晚于本机时钟约 {int(ahead // 60)} 分钟：运行时钟不能是未来时间；"
+            f"删掉 --now 重跑（脚本会记录本机时钟），或填本机当前时间"
+        )
     return parsed
 
 
@@ -179,12 +198,12 @@ def excerpt_of(text):
 
 
 def parse_search(payload):
-    """校验 Brave 检索结果，返回 `(entries, queries)`。空查询列表是合法的。"""
+    """校验搜索工具的结果，返回 `(entries, queries)`。空查询列表是合法的。"""
     if not isinstance(payload, dict):
-        raise ScriptError('Brave 检索结果必须是 {"queries": [...]} 形态的对象')
+        raise ScriptError('检索结果必须是 {"queries": [...]} 形态的对象')
     queries = payload.get("queries")
     if not isinstance(queries, list):
-        raise ScriptError('Brave 检索结果缺少 queries 数组')
+        raise ScriptError('检索结果缺少 queries 数组')
     entries = []
     query_texts = []
     for q_index, query in enumerate(queries, start=1):
@@ -380,7 +399,7 @@ def default_output(clock):
 def main(argv=None):
     force_utf8_stdio()
     parser = argparse.ArgumentParser(description="行业简报：来源去重、可引用性判定与报告引用校验")
-    parser.add_argument("--search", required=True, help='Brave 检索结果的落盘文件（{"queries": [...]}）')
+    parser.add_argument("--search", required=True, help='搜索工具结果的落盘文件（{"queries": [...]}）')
     parser.add_argument("--pages", required=True, help='Fetch 结果的落盘文件（{"pages": [...]}）')
     parser.add_argument("--output", help="brief.json 路径（缺省 runs/<时间戳>/brief.json）")
     parser.add_argument("--now", help="运行时钟 t0，必须带时区偏移；显式给出可复跑")
@@ -390,11 +409,16 @@ def main(argv=None):
 
     try:
         clock = parse_clock(args.now)
-        search = load_json(args.search, what="Brave 检索结果")
+        # 省略 `--now` 时只取一次时钟：产物目录与 observed_at 必须来自同一个值，
+        # 否则跨秒启动会让 runs/<t0>/ 与报告里的 observed_at 差一秒。
+        # With no --now the clock is sampled once and reused for both the path and
+        # the report, so the two can never disagree across a second boundary.
+        effective_now = args.now if args.now is not None else clock.isoformat()
+        search = load_json(args.search, what="检索结果")
         pages = load_json(args.pages, what="Fetch 抓取结果")
         if not isinstance(args.topic, str):
             raise ScriptError("--topic 必须是字符串")
-        brief = build_brief(search, pages, now=args.now, topic=args.topic.strip())
+        brief = build_brief(search, pages, now=effective_now, topic=args.topic.strip())
 
         output_path = Path(args.output) if args.output else default_output(clock)
         write_atomic(output_path, brief)

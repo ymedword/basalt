@@ -17,7 +17,7 @@ import (
 // seedAllowlistPolicy 写入种子行（revision 1，域名固定）。
 func seedAllowlistPolicy(t *testing.T, env *recoveryEnv, domains []string) {
 	t.Helper()
-	_, err := env.policy.Seed(context.Background(), domains, baselineClock())
+	_, err := env.policy.Seed(context.Background(), core.PolicyScopeHTTPDomains, domains, baselineClock())
 	require.NoError(t, err)
 }
 
@@ -51,7 +51,7 @@ func pendingAllowlistOperation(t *testing.T, env *recoveryEnv, detail []byte) st
 func TestNetworkAllowlistRecovery_AppliedWhenRevisionAndHashMatch(t *testing.T) {
 	env := newRecoveryEnv(t)
 	seedAllowlistPolicy(t, env, []string{"api.example.com"})
-	_, err := env.policy.Update(context.Background(), []string{"hooks.example.net"}, 1,
+	_, err := env.policy.Update(context.Background(), core.PolicyScopeHTTPDomains, []string{"hooks.example.net"}, 1,
 		"op-applied", "token:abc123", baselineClock())
 	require.NoError(t, err)
 
@@ -63,7 +63,7 @@ func TestNetworkAllowlistRecovery_AppliedWhenRevisionAndHashMatch(t *testing.T) 
 	require.Equal(t, core.VerificationApplied, op.Verification)
 	require.False(t, op.RecoveredAt.IsZero(), "恢复必须记录查证时间")
 
-	policy, _, err := env.deps.NetworkPolicy.Load(context.Background())
+	policy, _, err := env.deps.NetworkPolicy.Load(context.Background(), core.PolicyScopeHTTPDomains)
 	require.NoError(t, err)
 	require.Equal(t, []string{"hooks.example.net"}, policy.Domains, "恢复不得重做写入")
 	require.Equal(t, int64(2), policy.Revision)
@@ -83,7 +83,7 @@ func TestNetworkAllowlistRecovery_NotAppliedWhenRevisionStillBefore(t *testing.T
 	require.Equal(t, core.OperationFailed, op.Status)
 	require.Equal(t, core.VerificationNotApplied, op.Verification)
 
-	policy, _, err := env.deps.NetworkPolicy.Load(context.Background())
+	policy, _, err := env.deps.NetworkPolicy.Load(context.Background(), core.PolicyScopeHTTPDomains)
 	require.NoError(t, err)
 	require.Equal(t, []string{"api.example.com"}, policy.Domains, "未生效的变更不得被补写")
 	require.Equal(t, int64(1), policy.Revision)
@@ -101,7 +101,7 @@ func TestNetworkAllowlistRecovery_IndeterminateCases(t *testing.T) {
 			name: "revision neither before nor after",
 			setup: func(t *testing.T, env *recoveryEnv) []byte {
 				seedAllowlistPolicy(t, env, []string{"api.example.com"})
-				_, err := env.policy.Update(context.Background(), []string{"third.example.com"}, 1,
+				_, err := env.policy.Update(context.Background(), core.PolicyScopeHTTPDomains, []string{"third.example.com"}, 1,
 					"op-third", "token:abc123", baselineClock())
 				require.NoError(t, err)
 				return allowlistDetail(t, 1, 2, []string{"hooks.example.net"})

@@ -710,10 +710,12 @@ func TestConfig_AdminAuthRejectsInvalidTokens(t *testing.T) {
 			want:   []string{"http.admin_auth.token", "必须是 ${VAR} 形态的字符串", "int"},
 			noEcho: "123456",
 		},
-		{
-			name: "整键缺失",
-			want: []string{"http.admin_auth.token", "必填"},
-		},
+		// 14D T090 起"整键缺失"在装载层**合法**：第三来源是实例私有目录的
+		// `admin-token` 文件（装载层看不到文件系统）。拒绝改由装配层在开放监听之前
+		// 判定，见 internal/app 的 TestResolveAdminToken_* 与
+		// TestNewWebServer_RefusesInvalidAdminAuth 的"token 模式缺少凭据"。
+		// A missing token key is legal here since 14D T090; the refusal moved to the
+		// assembly layer, which can actually look at the instance file.
 	}
 
 	for _, tc := range cases {
@@ -1088,4 +1090,57 @@ func TestConfig_ProviderCredentialModeContradictions(t *testing.T) {
 			require.NotContains(t, err.Error(), "resolved-secret-value", "不得回显解析后的凭证值")
 		})
 	}
+}
+
+// TestConfig_HTTPProxyShape 覆盖 `http.proxy`（14D §2.2.2 / D12）：**唯一**认可的
+// 代理来源，空串 = 直连；写了就必须是 `http(s)://[userinfo@]host:port`，形态错了
+// 装载期拒绝——静默直连等于"以为走了代理、实际换了一个出口"。
+// 文案**不回显取值**：userinfo 里可能就是一份凭证。
+// TestConfig_HTTPProxyShape: the explicit proxy is the only accepted proxy source and
+// a malformed value refuses startup; messages never echo it.
+func TestConfig_HTTPProxyShape(t *testing.T) {
+	withProxy := func(value string) string {
+		return strings.Replace(baseConfig, "  addr: \"127.0.0.1:8080\"\n",
+			"  addr: \"127.0.0.1:8080\"\n  proxy: "+value+"\n", 1)
+	}
+	lookup := envLookup(map[string]string{"DEMO_KEY": "resolved", "DEMO_HOST": "api.internal"})
+
+	t.Run("absent_means_direct", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig), lookup)
+		require.NoError(t, err)
+		require.Empty(t, cfg.HTTP.Proxy)
+	})
+
+	for _, valid := range []string{
+		`"http://proxy.internal:3128"`,
+		`"https://user:pass@proxy.internal:8443"`,
+	} {
+		t.Run("accepts "+valid, func(t *testing.T) {
+			cfg, err := cli.LoadConfig(writeConfig(t, withProxy(valid)), lookup)
+			require.NoError(t, err)
+			require.Equal(t, strings.Trim(valid, `"`), cfg.HTTP.Proxy)
+		})
+	}
+
+	for _, invalid := range []string{
+		`"proxy.internal:3128"`,            // 缺 scheme
+		`"socks5://proxy.internal:1080"`,   // 方案不在闭集
+		`"http://proxy.internal"`,          // 缺端口（建连才失败的形态）
+		`"http://proxy.internal:3128/pac"`, // 带路径
+		`"http://proxy.internal:3128?a=b"`, // 带查询串
+		`"http://proxy.internal:3128#x"`,   // 带片段
+	} {
+		t.Run("rejects "+invalid, func(t *testing.T) {
+			_, err := cli.LoadConfig(writeConfig(t, withProxy(invalid)), lookup)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "http.proxy")
+		})
+	}
+
+	t.Run("refusal_never_echoes_credentials", func(t *testing.T) {
+		const secret = "proxy-secret-value"
+		_, err := cli.LoadConfig(writeConfig(t, withProxy(`"http://user:`+secret+`@proxy.internal/pac"`)), lookup)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), secret, "错误文案不得回显代理凭证")
+	})
 }

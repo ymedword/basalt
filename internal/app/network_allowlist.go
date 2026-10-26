@@ -23,16 +23,60 @@ import (
 	"github.com/ymedword/basalt/internal/tool"
 )
 
-// NetworkAllowlistDeps 是白名单服务的装配参数。Supervisor 可选：未装配时跳过撤销
+// NetworkAllowlistDeps 是域名策略服务的装配参数。Supervisor 可选：未装配时跳过撤销
 // （只读装配面）；Policy 必须与运行期消费者共用同一实例，否则"热生效"只改了副本。
-// The policy must be the very instance every consumer uses, or the swap changes nothing.
+// `Scope` 决定服务操作哪一行：空串 = 出网白名单，`http.denied_domains` = 禁止域名表。
+// 两行共用同一张表、同一套 ETag / CAS 语义与同一份通配匹配器，只在审计动作名、
+// 目标类型与生效字段上分开——**不**复制第二份条件写实现。
+// The policy must be the very instance every consumer uses, or the swap changes
+// nothing. Scope selects the row: empty means the allowlist; the denylist shares the
+// table, the conditional-write semantics and the matcher, and only the audit literals
+// and the live field differ.
 type NetworkAllowlistDeps struct {
+	Scope      string
 	Store      core.NetworkDomainPolicyStore
 	Operations core.OperationStore
 	Policy     *tool.WhitelistPolicy
 	Supervisor *MCPSupervisor
 	Logger     *slog.Logger
 	Now        func() time.Time
+}
+
+// scope 返回本次服务操作的作用域（空串按白名单处理）。
+// scope resolves the policy scope; the empty value is the allowlist.
+func (d NetworkAllowlistDeps) scope() string {
+	if d.Scope == "" {
+		return core.PolicyScopeHTTPDomains
+	}
+	return d.Scope
+}
+
+// action 是该作用域的审计动作名：白名单与禁止表**不**共用动作名。
+// action returns the scope's audit action; the two rows never share an action name.
+func (d NetworkAllowlistDeps) action() string {
+	if d.scope() == core.PolicyScopeHTTPDeniedDomains {
+		return core.ActionNetworkDenylistUpdate
+	}
+	return core.ActionNetworkAllowlistUpdate
+}
+
+// targetKind 是该作用域的审计目标类型。
+// targetKind returns the scope's audit target kind.
+func (d NetworkAllowlistDeps) targetKind() string {
+	if d.scope() == core.PolicyScopeHTTPDeniedDomains {
+		return core.TargetKindNetworkDenylist
+	}
+	return core.TargetKindNetworkAllowlist
+}
+
+// label 是面向运维的文案名：白名单说 allowlist，禁止表说 denylist。既有日志与
+// 错误文案对白名单**逐字保持**，不因共用实现而改名。
+// label names the scope in operator-facing text; the allowlist wording is frozen.
+func (d NetworkAllowlistDeps) label() string {
+	if d.scope() == core.PolicyScopeHTTPDeniedDomains {
+		return "denylist"
+	}
+	return "allowlist"
 }
 
 // NetworkAllowlist 持有当前生效的策略快照并与数据库保持同步；`mu` 把「读当前值 →
@@ -68,14 +112,16 @@ func NewNetworkAllowlist(deps NetworkAllowlistDeps) *NetworkAllowlist {
 // 改 YAML 不会覆盖管理台写入的值，重启也不会回退（R8.2.1 第 2 条）。
 // EnsureSeeded loads the authoritative row, seeding it from config exactly once.
 func (a *NetworkAllowlist) EnsureSeeded(ctx context.Context, configDomains []string) error {
-	policy, exists, err := a.deps.Store.Load(ctx)
+	scope := a.deps.scope()
+	policy, exists, err := a.deps.Store.Load(ctx, scope)
 	if err != nil {
 		return err
 	}
 	if exists {
 		a.apply(policy)
-		a.deps.Logger.Info("network domain allowlist loaded from database; config key ignored",
-			"source", "database", "revision", policy.Revision, "domains", len(policy.Domains))
+		a.deps.Logger.Info("network domain "+a.deps.label()+" loaded from database; config key ignored",
+			"scope", scope, "source", "database", "revision", policy.Revision,
+			"domains", len(policy.Domains))
 		return nil
 	}
 
@@ -83,13 +129,14 @@ func (a *NetworkAllowlist) EnsureSeeded(ctx context.Context, configDomains []str
 	if err != nil {
 		return err
 	}
-	seeded, err := a.deps.Store.Seed(ctx, seed, a.deps.Now())
+	seeded, err := a.deps.Store.Seed(ctx, scope, seed, a.deps.Now())
 	if err != nil {
 		return err
 	}
 	a.apply(seeded)
-	a.deps.Logger.Info("network domain allowlist seeded from config; database is authoritative from now on",
-		"source", "config_seed", "revision", seeded.Revision, "domains", len(seeded.Domains))
+	a.deps.Logger.Info("network domain "+a.deps.label()+" seeded from config; database is authoritative from now on",
+		"scope", scope, "source", "config_seed", "revision", seeded.Revision,
+		"domains", len(seeded.Domains))
 	return nil
 }
 
@@ -103,15 +150,15 @@ func (a *NetworkAllowlist) normalizeSeed(configDomains []string) ([]string, erro
 	for _, raw := range configDomains {
 		normalized, normErr := core.NormalizeDomainList([]string{raw})
 		if normErr != nil {
-			a.deps.Logger.Warn("dropping invalid network domain allowlist seed entry",
-				"entry", raw, "error", normErr)
+			a.deps.Logger.Warn("dropping invalid network domain "+a.deps.label()+" seed entry",
+				"scope", a.deps.scope(), "entry", raw, "error", normErr)
 			continue
 		}
 		cleaned = append(cleaned, normalized...)
 	}
 	seed, err := core.NormalizeDomainList(cleaned)
 	if err != nil {
-		return nil, fmt.Errorf("invalid network domain allowlist seed: %w", err)
+		return nil, fmt.Errorf("invalid network domain %s seed: %w", a.deps.label(), err)
 	}
 	return seed, nil
 }
@@ -142,12 +189,13 @@ func (a *NetworkAllowlist) Update(ctx context.Context, domains []string, ifMatch
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	scope := a.deps.scope()
 	current := a.Current()
 	if ifMatch != core.NetworkDomainETag(current) {
 		// 条件写不满足：412，零写入、零操作行（R8.2.4 第 2 条）。
 		return core.NetworkDomainPolicy{}, "", fmt.Errorf(
-			"%w: network domain allowlist If-Match does not match the current revision",
-			core.ErrPreconditionFailed)
+			"%w: network domain %s If-Match does not match the current revision",
+			core.ErrPreconditionFailed, a.deps.label())
 	}
 
 	now := a.deps.Now()
@@ -160,15 +208,15 @@ func (a *NetworkAllowlist) Update(ctx context.Context, domains []string, ifMatch
 	if marshalErr != nil {
 		// 结构只有整数与字符串，此分支不可达；仍不吞错误，按预写失败处理。
 		return core.NetworkDomainPolicy{}, "", fmt.Errorf(
-			"assemble network domain allowlist operation detail: %w", marshalErr)
+			"assemble network domain policy operation detail: %w", marshalErr)
 	}
 
 	operationID := core.NewOperationID(now)
 	record := core.OperationRecord{
 		OperationID:  operationID,
-		Action:       core.ActionNetworkAllowlistUpdate,
-		TargetKind:   core.TargetKindNetworkAllowlist,
-		TargetID:     core.PolicyScopeHTTPDomains,
+		Action:       a.deps.action(),
+		TargetKind:   a.deps.targetKind(),
+		TargetID:     scope,
 		ActorSubject: actor.Subject,
 		AuthMethod:   actor.Method,
 		Source:       actor.Source,
@@ -180,14 +228,14 @@ func (a *NetworkAllowlist) Update(ctx context.Context, domains []string, ifMatch
 	}
 	if beginErr := a.deps.Operations.BeginOperation(ctx, record); beginErr != nil {
 		// 预写失败 = 拒绝执行：策略行一个字节都没动（宪法 V）。
-		a.deps.Logger.Error("refusing network domain allowlist update: pre-write of operation record failed",
-			"error", beginErr)
+		a.deps.Logger.Error("refusing network domain "+a.deps.label()+" update: pre-write of operation record failed",
+			"scope", scope, "error", beginErr)
 		return core.NetworkDomainPolicy{}, "", fmt.Errorf(
-			"pre-write operation record failed; refusing to update network domain allowlist: %w",
-			beginErr)
+			"pre-write operation record failed; refusing to update network domain %s: %w",
+			a.deps.label(), beginErr)
 	}
 
-	policy, updateErr := a.deps.Store.Update(ctx, normalized, current.Revision,
+	policy, updateErr := a.deps.Store.Update(ctx, scope, normalized, current.Revision,
 		operationID, actor.Subject, now)
 	if updateErr != nil {
 		a.finish(ctx, operationID, core.OperationFailed, resultCodeFor(updateErr), updateErr,
@@ -206,8 +254,8 @@ func (a *NetworkAllowlist) Update(ctx context.Context, domains []string, ifMatch
 	a.apply(policy)
 	revoked := a.revokeMCPHTTP(a.deps.Policy)
 	if len(revoked) > 0 {
-		a.deps.Logger.Info("network domain allowlist tightened; revoked disallowed MCP http links",
-			"servers", revoked, "revision", policy.Revision)
+		a.deps.Logger.Info("network domain "+a.deps.label()+" tightened; revoked disallowed MCP http links",
+			"scope", scope, "servers", revoked, "revision", policy.Revision)
 	}
 	a.finish(ctx, operationID, core.OperationSuccess, "OK", nil, detailJSON)
 	return policy, operationID, nil
@@ -219,22 +267,29 @@ func (a *NetworkAllowlist) Update(ctx context.Context, domains []string, ifMatch
 // reloadAfterConflict converges the live snapshot after a CAS loss; a failed reload is
 // logged and never presented as a known current value.
 func (a *NetworkAllowlist) reloadAfterConflict(ctx context.Context) {
-	policy, exists, err := a.deps.Store.Load(ctx)
+	scope := a.deps.scope()
+	policy, exists, err := a.deps.Store.Load(ctx, scope)
 	if err != nil || !exists {
-		a.deps.Logger.Warn("failed to reload network domain allowlist after revision conflict",
-			"error", err, "row_present", exists)
+		a.deps.Logger.Warn("failed to reload network domain "+a.deps.label()+" after revision conflict",
+			"scope", scope, "error", err, "row_present", exists)
 		return
 	}
 	a.apply(policy)
 	revoked := a.revokeMCPHTTP(a.deps.Policy)
-	a.deps.Logger.Warn("network domain allowlist reloaded after revision conflict",
-		"revision", policy.Revision, "revoked_mcp_http", revoked)
+	a.deps.Logger.Warn("network domain "+a.deps.label()+" reloaded after revision conflict",
+		"scope", scope, "revision", policy.Revision, "revoked_mcp_http", revoked)
 }
 
 // apply 同时替换策略实例与生效快照：两处必须来自同一次写入，否则页面显示与判定会分叉。
-// apply swaps the policy instance and the live snapshot together.
+// 禁止域名表落在策略的 `denied` 快照上（两档都先于放行判定），白名单落在 `domains`。
+// apply swaps the policy instance and the live snapshot together; the denylist lands
+// on the separate denied snapshot so both profiles consult it before allowing.
 func (a *NetworkAllowlist) apply(policy core.NetworkDomainPolicy) {
-	a.deps.Policy.SetAllowedDomains(policy.Domains)
+	if a.deps.scope() == core.PolicyScopeHTTPDeniedDomains {
+		a.deps.Policy.SetDeniedDomains(policy.Domains)
+	} else {
+		a.deps.Policy.SetAllowedDomains(policy.Domains)
+	}
 	snapshot := policy
 	a.current.Store(&snapshot)
 }
@@ -262,7 +317,7 @@ func (a *NetworkAllowlist) finish(ctx context.Context, operationID string,
 	}
 	if err := a.deps.Operations.FinishOperation(context.WithoutCancel(ctx), operationID,
 		status, code, message, detail, a.deps.Now()); err != nil {
-		a.deps.Logger.Error("failed to record network domain allowlist operation outcome; left for startup recovery",
+		a.deps.Logger.Error("failed to record network domain "+a.deps.label()+" operation outcome; left for startup recovery",
 			"operation_id", operationID, "status", string(status), "error", err)
 	}
 }

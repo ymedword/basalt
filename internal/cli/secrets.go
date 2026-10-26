@@ -107,14 +107,25 @@ func runSecretsStatus(ctx context.Context, out io.Writer, deps Deps) error {
 		return err
 	}
 	if !status.Initialized {
+		// 恢复态在服务面就按部署错误上抛（不在这里落到"未初始化"，那会把缺钥匙说成
+		// 还没初始化）；走到这里的是真正的未初始化：纯 env，或尚未首次生成。
 		fmt.Fprintln(out, "主密钥：未初始化（纯 env 部署可跳过；托管凭据需先执行 secrets init）")
-	} else {
+	} else if status.State == "" || status.State == secretStateReady {
 		fmt.Fprintf(out, "主密钥：已就绪（key_id=%s fingerprint=%s）\n",
+			status.KeyID, status.Fingerprint)
+	} else {
+		// 密钥可读但缺初始化记录（待 adopt）：页面不谎报"就绪"，命令面同样点明。
+		fmt.Fprintf(out, "主密钥：密钥文件可用但缺初始化记录（待 adopt；key_id=%s fingerprint=%s）\n",
 			status.KeyID, status.Fingerprint)
 	}
 	writeManagedCounts(out, status)
 	return nil
 }
+
+// secretStateReady 与 core.SecretStateReady 同一字面量；命令面只做展示，不引入对
+// 装配层的依赖。
+// secretStateReady mirrors core's literal for display only.
+const secretStateReady = "ready"
 
 // newSecretsVerifyCommand 组装 secrets verify：只回计数；失败条数大于零即非零退出。
 // newSecretsVerifyCommand builds verify; a non-zero failure count is a command failure.

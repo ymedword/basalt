@@ -54,6 +54,7 @@ func TestRun_ServeStartsConfigWatcher(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)
+	resetOutboundGuard(t)
 	go func() { done <- Run(ctx, []string{"serve"}) }()
 
 	stopped := false

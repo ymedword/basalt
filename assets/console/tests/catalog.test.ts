@@ -5,7 +5,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import type { DOMWrapper } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { MCPCatalogEntry } from '../src/api'
+import type { MCPCatalogEntry, McpServerView } from '../src/api'
 import { createConsoleApp } from '../src/app'
 
 interface RecordedCall {
@@ -71,11 +71,15 @@ const BRAVE = entry({
 /** 目录按 id 升序（契约要求）；两套 warnings / 状态一字不差地展示给管理员。 */
 const CATALOG = { version: 1, items: [BRAVE, entry()] }
 
-function respond(status: number, message: string, data: unknown): Response {
+function respond(status: number, message: string, data: unknown, etag?: string): Response {
+  const headers = new Headers()
+  if (etag !== undefined) {
+    headers.set('ETag', etag)
+  }
   return {
     ok: status >= 200 && status < 300,
     status,
-    headers: new Headers(),
+    headers,
     json: async () => ({
       code: status < 300 ? 'OK' : 'INTERNAL',
       message,
@@ -88,8 +92,15 @@ function respond(status: number, message: string, data: unknown): Response {
 interface Stubs {
   /** 按路径返回的成功响应；未命中的 GET 回 `[]`。 */
   readonly ok?: Record<string, unknown>
+  /**
+   * 按「方法 路径」覆盖成功响应：同一路径的 GET 与 POST 返回值不同时必须用它
+   * （创建与列表共用 `/mcp-servers`）。
+   */
+  readonly route?: Record<string, unknown>
+  /** 按路径给成功响应加 ETag 头（读详情后立刻条件写要用）。 */
+  readonly etags?: Record<string, string>
   /** 按路径返回的失败响应。 */
-  readonly fail?: Record<string, { status: number; message: string }>
+  readonly fail?: Record<string, { status: number; message: string; code?: string }>
 }
 
 function setupFetch(stubs: Stubs = {}): void {
@@ -98,14 +109,19 @@ function setupFetch(stubs: Stubs = {}): void {
     'fetch',
     vi.fn(async (input: string, init?: RequestInit) => {
       const url = new URL(String(input), 'http://localhost')
+      const method = (init?.method ?? 'GET').toUpperCase()
       calls.push({
-        method: (init?.method ?? 'GET').toUpperCase(),
+        method,
         path: url.pathname,
         body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
       })
       const failed = stubs.fail?.[url.pathname]
       if (failed !== undefined) {
         return respond(failed.status, failed.message, null)
+      }
+      const routed = stubs.route?.[`${method} ${url.pathname}`]
+      if (routed !== undefined) {
+        return respond(200, '', routed, stubs.etags?.[url.pathname])
       }
       if (stubs.ok !== undefined && Object.hasOwn(stubs.ok, url.pathname)) {
         return respond(200, '', stubs.ok[url.pathname])
@@ -161,6 +177,37 @@ async function clickButton(scope: ButtonScope, label: string): Promise<void> {
 
 function writeCalls(): RecordedCall[] {
   return calls.filter((call) => call.method !== 'GET')
+}
+
+const APPLY_ETAG = `"sha256:${'c'.repeat(64)}"`
+
+/** 创建 / 详情共用的服务端视图；详情多 args 与 url（契约 McpServerDetail）。 */
+function mcpServerView(): McpServerView {
+  return {
+    name: 'github',
+    transport: 'stdio',
+    command: 'npx',
+    env_keys: ['GITHUB_PERSONAL_ACCESS_TOKEN'],
+    header_keys: [],
+    credential_keys: [
+      { key: 'GITHUB_PERSONAL_ACCESS_TOKEN', mode: 'managed', state: 'managed', last4: '9f2c' },
+    ],
+    connected: true,
+    tools: ['search'],
+    published_version_id: 1,
+    published_version_no: 1,
+    applied_version_id: 1,
+    applied_version_no: 1,
+    pending_restart: false,
+    tool_disposition: { offered: 1, accepted: 1, skipped: [] },
+  }
+}
+
+/** 预填 GitHub 配方并填好托管值，停在「创建并应用」之前。 */
+async function prefillWithValue(): Promise<void> {
+  await clickButton(rowOf('GitHub'), '添加到配置')
+  await flushPromises()
+  await wrapper!.find('#mcp-slot-GITHUB_PERSONAL_ACCESS_TOKEN').setValue('ghp_example_value')
 }
 
 afterEach(() => {
@@ -280,6 +327,19 @@ describe('MCP catalog view', () => {
     expect(writeCalls()).toHaveLength(0)
     expect(wrapper!.text()).toContain('页面不会自动保存')
 
+    // 14D：每个占位符一张来源卡片，默认「加密托管」；配方只给占位符，不预设来源。
+    const slotMode = wrapper!.find('#mcp-slot-GITHUB_PERSONAL_ACCESS_TOKEN-mode')
+    expect(slotMode.element).toHaveProperty('value', 'managed')
+    expect(wrapper!.text()).toContain('占位符 GITHUB_PERSONAL_ACCESS_TOKEN')
+
+    // 未填托管值时本地就拒绝，不发请求（托管没有值必然 503）。
+    await clickButton(wrapper!, '创建并发布')
+    await flushPromises()
+    expect(calls.filter((call) => call.method === 'POST' && call.path === '/api/v1/mcp-servers'))
+      .toHaveLength(0)
+    expect(wrapper!.text()).toContain('选择了「加密托管」但还没有值')
+
+    await wrapper!.find('#mcp-slot-GITHUB_PERSONAL_ACCESS_TOKEN').setValue('ghp_example_value')
     await clickButton(wrapper!, '创建并发布')
     await flushPromises()
 
@@ -291,6 +351,9 @@ describe('MCP catalog view', () => {
       command: 'npx',
       args: ['-y', '@modelcontextprotocol/server-github'],
       env: { GITHUB_PERSONAL_ACCESS_TOKEN: '${GITHUB_PAT}' },
+      credentials: [
+        { key: 'GITHUB_PERSONAL_ACCESS_TOKEN', mode: 'managed', value: 'ghp_example_value' },
+      ],
     })
     expect(wrapper!.text()).toContain('配方“GitHub”本身没有被修改')
   })
@@ -307,5 +370,85 @@ describe('MCP catalog view', () => {
     // 名单没读到就写“—”，不把读取失败说成“未配置”。
     expect(rowOf('GitHub').text()).toContain('—')
     expect(rowOf('GitHub').text()).not.toContain('未配置')
+  })
+
+  it('restates a successful save-and-apply after the form unmounts', async () => {
+    setupFetch({
+      ok: { '/api/v1/catalog/mcp': CATALOG, '/api/v1/mcp-servers': [] },
+      route: {
+        'POST /api/v1/mcp-servers': mcpServerView(),
+        'GET /api/v1/mcp-servers/github': {
+          ...mcpServerView(),
+          args: ['-y', '@modelcontextprotocol/server-github'],
+          url: '',
+        },
+        'POST /api/v1/mcp-servers/github/apply': {
+          outcome: 'applied',
+          applied_version_id: 2,
+          previous_version_id: 1,
+          target_version_id: 2,
+          drain_deadline: '2026-10-25T00:00:30Z',
+          drain_timeout_seconds: 30,
+          failure_class: '',
+          superseded_by: '',
+          operation_id: 'op-apply',
+        },
+      },
+      etags: { '/api/v1/mcp-servers/github': APPLY_ETAG },
+    })
+    await openCatalog()
+    await prefillWithValue()
+    await clickButton(wrapper!, '创建并应用')
+    await flushPromises()
+
+    // 表单卸载后它自己的提示随组件消失：结论必须由目录页重述。
+    expect(wrapper!.find('#resource-name').exists()).toBe(false)
+    const notice = wrapper!.find('.notice-info').text()
+    expect(notice).toContain('已创建、发布并应用')
+    expect(notice).toContain('运行版本已切换')
+    expect(notice).toContain('配方“GitHub”本身没有被修改')
+    expect(
+      calls.filter((call) => call.method === 'POST' && call.path.endsWith('/apply')),
+    ).toHaveLength(1)
+  })
+
+  it('keeps the save when apply is superseded and says the run version did not move', async () => {
+    setupFetch({
+      ok: { '/api/v1/catalog/mcp': CATALOG, '/api/v1/mcp-servers': [] },
+      route: {
+        'POST /api/v1/mcp-servers': mcpServerView(),
+        'GET /api/v1/mcp-servers/github': {
+          ...mcpServerView(),
+          args: ['-y', '@modelcontextprotocol/server-github'],
+          url: '',
+        },
+      },
+      etags: { '/api/v1/mcp-servers/github': APPLY_ETAG },
+      fail: {
+        '/api/v1/mcp-servers/github/apply': {
+          status: 409,
+          code: 'MCP_APPLY_SUPERSEDED',
+          message: '另一次发布推进了发布指针',
+        },
+      },
+    })
+    await openCatalog()
+    await prefillWithValue()
+    await clickButton(wrapper!, '创建并应用')
+    await flushPromises()
+
+    // 保存是成功的：创建只发一次、应用不自动重发。
+    expect(
+      calls.filter((call) => call.method === 'POST' && call.path === '/api/v1/mcp-servers'),
+    ).toHaveLength(1)
+    expect(
+      calls.filter((call) => call.method === 'POST' && call.path.endsWith('/apply')),
+    ).toHaveLength(1)
+    // 未切换运行版本按 warn 提示，并把“保存已生效”与“应用未完成”分开说。
+    const notice = wrapper!.find('.notice-warn').text()
+    expect(notice).toContain('已创建并发布')
+    expect(notice).toContain('「应用」未完成')
+    expect(notice).toContain('运行版本保持不变')
+    expect(notice).toContain('另一次发布推进了发布指针')
   })
 })

@@ -46,11 +46,20 @@ const credentialIDPrefix = "cred_"
 // CredentialOpsDeps 是凭据写面的装配输入；四个仓储缺一即拒绝装配。
 // CredentialOpsDeps wires the write surface; every store is required.
 type CredentialOpsDeps struct {
-	Operations    core.OperationStore
-	Credentials   *storage.CredentialStore
-	Resources     *storage.ResourceStore
-	Notify        *storage.NotifyAdminStore
+	Operations  core.OperationStore
+	Credentials *storage.CredentialStore
+	Resources   *storage.ResourceStore
+	Notify      *storage.NotifyAdminStore
+	// Instance 是实例加密三态与首次初始化的唯一实现（R2-1）：首次保存托管凭据时由
+	// `PrepareManagedWrite` 在同一次保存里完成必要初始化。nil 表示半截装配或测试，
+	// 此时退回「只校验主密钥可装载」的旧行为，不伪造一个能初始化的实例。
+	// Instance lets a first managed save initialize the instance; nil falls back to the
+	// plain loadability check.
+	Instance *InstanceSecretsService
+	// MasterKeyFile 是静态初值；KeyPath 是共享的生效路径（用户显式初始化后立即切换）。
+	// MasterKeyFile is the static seed; KeyPath is the live shared path when present.
 	MasterKeyFile string
+	KeyPath       *MasterKeyLocator
 	WorkspaceRoot string
 	Logger        *slog.Logger
 	Now           func() time.Time
@@ -80,18 +89,31 @@ func NewCredentialOps(deps CredentialOpsDeps) (*CredentialOps, error) {
 // CredentialSaveWriter is the subset the save endpoints need; saving never opens a new
 // endpoint, so the credential half still records its own `*.credential.write` action.
 type CredentialSaveWriter interface {
-	// Preflight 只确认主密钥此刻可装载；失败即 503，调用方**不得**继续写定义。
-	Preflight() error
+	// PrepareManagedWrite 让托管写入前置条件就绪：必要时在**同一次保存**里完成实例
+	// 初始化（可证明从未启用托管的存量实例），随后确认主密钥此刻可装载。失败即 503，
+	// 调用方**不得**继续写定义。
+	PrepareManagedWrite(ctx context.Context, actor core.Actor) error
 	Write(ctx context.Context, req CredentialWriteRequest) (CredentialWriteResult, error)
 }
 
-// Preflight 校验主密钥当前可装载（路径 / 权限 / 格式 / key_id），**不写任何行、
-// 不改任何状态**。保存路径在发布定义之前调用它：主密钥不可用是唯一能在写盘前发现的
-// 凭据失败，提前拦下可让「定义已发布、凭据没写成」的窗口只剩数据库错误。
-// Preflight only checks that the master key loads right now. Save paths call it before
-// publishing a definition so an unavailable key fails with zero writes.
-func (s *CredentialOps) Preflight() error {
-	key, err := LoadMasterKey(s.deps.MasterKeyFile, s.deps.WorkspaceRoot)
+// PrepareManagedWrite 是保存路径在写盘之前的唯一前置动作（R2-1）：
+//
+//  1. 实例加密尚未启用时，把「检查 → 建立实例身份与密钥路径 → 生成密钥与记录」并入
+//     这次受控保存——管理员只填 API Key 点保存，不需要先点「初始化」也不需要重启；
+//  2. 随后校验主密钥当前可装载（路径 / 权限 / 格式 / key_id）。主密钥不可用是唯一能
+//     在写盘前发现的凭据失败，提前拦下可让「定义已发布、凭据没写成」的窗口只剩数据库
+//     错误。
+//
+// 已经就绪的实例只做第 2 步，不写任何东西；恢复态与显式纯 env 部署在第 1 步就拒绝。
+// PrepareManagedWrite folds the first managed save into instance initialization and then
+// checks the key is loadable; an already-ready instance is a pure read.
+func (s *CredentialOps) PrepareManagedWrite(ctx context.Context, actor core.Actor) error {
+	if s.deps.Instance != nil {
+		if err := s.deps.Instance.EnsureForManagedWrite(ctx, actor); err != nil {
+			return err
+		}
+	}
+	key, err := LoadMasterKey(effectiveMasterKeyFile(s.deps.KeyPath, s.deps.MasterKeyFile), s.deps.WorkspaceRoot)
 	if err != nil {
 		// LoadMasterKey 已包装 ErrCredentialUnavailable（503）；原样上抛即可。
 		return err
@@ -248,6 +270,10 @@ type CredentialRevokeRequest struct {
 	Kind  core.BindingKind
 	Name  string
 	UID   core.ResourceUID
+	// BindingKey 是 `kind=mcp_server` 时的槽位名（env 键名或请求头名）：一个 server 可以
+	// 有多个槽位，各走独立版本与撤销。其它类别必须留空。
+	// BindingKey addresses the MCP slot; other kinds must leave it empty.
+	BindingKey string
 	// IfMatch 是调用方带来的条件写期望值：比较在调用方（`ResourceStateService`）的
 	// 资源锁内完成，本字段只落进操作行 `expected_etag` 供审计与查证，**不**在这里
 	// 二次判定——保存路径的子动作（`Write`）留空。
@@ -285,6 +311,9 @@ type credentialWritePlan struct {
 	uid  core.ResourceUID
 	mode core.CredentialMode
 	now  time.Time
+	// bindingKey 只在 MCP 上非空：一个 server 可以有多个槽位，各走独立的版本与撤销。
+	// bindingKey is the slot of an MCP credential; other kinds leave it empty.
+	bindingKey string
 	// expectedETag 只用于**撤销端点**的条件写审计（保存路径的子动作留空）。
 	// expectedETag is the conditional-write value recorded on a revoke operation row.
 	expectedETag string
@@ -353,11 +382,17 @@ func (s *CredentialOps) Revoke(ctx context.Context, req CredentialRevokeRequest)
 	if err != nil {
 		return CredentialRevokeResult{}, err
 	}
+	// MCP 的凭据按槽位寻址：`binding_key` 必填且必须合法，其它类别不得携带它——
+	// 多一个寻址维度就多一种"撤错对象"的可能。
+	bindingKey, err := credentialBindingKey(kind, req.BindingKey, action)
+	if err != nil {
+		return CredentialRevokeResult{}, err
+	}
 	target, err := s.readTarget(ctx, kind, name, uid)
 	if err != nil {
 		return CredentialRevokeResult{}, err
 	}
-	identity, err := s.deps.Credentials.CredentialByOwner(ctx, kind, uid)
+	identity, err := s.credentialIdentity(ctx, kind, uid, bindingKey)
 	if err != nil {
 		if errors.Is(err, core.ErrResourceNotFound) {
 			return CredentialRevokeResult{}, &core.InvalidInputError{
@@ -389,6 +424,7 @@ func (s *CredentialOps) Revoke(ctx context.Context, req CredentialRevokeRequest)
 	}
 	plan := credentialWritePlan{
 		kind: kind, name: name, uid: uid, mode: core.CredentialModeManaged, now: s.deps.Now(),
+		bindingKey:         bindingKey,
 		expectedETag:       req.IfMatch,
 		previousRevision:   target.revision,
 		revision:           revision,
@@ -406,20 +442,16 @@ func (s *CredentialOps) Revoke(ctx context.Context, req CredentialRevokeRequest)
 	return s.applyRevoke(ctx, req.Actor, plan)
 }
 
-// validateTarget 校验类别 / 名称 / 资源 UID 三件寻址输入；只接受两类带凭据的资源。
-// validateTarget accepts exactly the two credential-bearing resource kinds.
+// validateTarget 校验类别 / 名称 / 资源 UID 三件寻址输入；只接受带凭据的三类资源。
+// MCP server 另有 `binding_key`（槽位名）这一维寻址，由调用方单独校验。
+// validateTarget accepts the three credential owner kinds; MCP adds a binding key
+// that the caller validates separately.
 func (s *CredentialOps) validateTarget(kind core.BindingKind, name string,
 	uid core.ResourceUID, action string,
 ) (core.BindingKind, string, core.ResourceUID, error) {
-	parsed, err := core.ParseBindingKind(string(kind))
+	parsed, err := core.ParseCredentialOwnerKind(string(kind))
 	if err != nil {
 		return "", "", "", &core.InvalidInputError{Tool: action, Reason: err.Error()}
-	}
-	if parsed != core.BindingModelConnection && parsed != core.BindingNotifyChannel {
-		return "", "", "", &core.InvalidInputError{
-			Tool:   action,
-			Reason: fmt.Sprintf("资源类别 %q 不支持托管凭据", kind),
-		}
 	}
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
@@ -430,6 +462,41 @@ func (s *CredentialOps) validateTarget(kind core.BindingKind, name string,
 		return "", "", "", &core.InvalidInputError{Tool: action, Reason: err.Error()}
 	}
 	return parsed, trimmed, canonical, nil
+}
+
+// credentialBindingKey 归一化撤销请求的槽位维度：MCP 必填且必须是合法槽位名，其它
+// 类别必须留空（携带即 400——多一个寻址维度就多一种撤错对象的可能）。
+// credentialBindingKey requires a slot for MCP and forbids one elsewhere.
+func credentialBindingKey(kind core.BindingKind, raw, action string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if kind != core.BindingMCPServer {
+		if trimmed != "" {
+			return "", &core.InvalidInputError{
+				Tool:   action,
+				Reason: fmt.Sprintf("资源类别 %q 的凭据不按槽位寻址，不得携带 binding_key", kind),
+			}
+		}
+		return "", nil
+	}
+	key, ok := core.MCPBindingKey(trimmed)
+	if !ok {
+		return "", &core.InvalidInputError{
+			Tool:   action,
+			Reason: "撤销 MCP 凭据必须给出合法的槽位名（env 键名或请求头名）",
+		}
+	}
+	return key, nil
+}
+
+// credentialIdentity 按类别读托管身份：MCP 按 `(server, 槽位)`，其余按属主。
+// credentialIdentity reads the managed identity of one owner or one MCP slot.
+func (s *CredentialOps) credentialIdentity(ctx context.Context, kind core.BindingKind,
+	uid core.ResourceUID, bindingKey string,
+) (core.CredentialRecord, error) {
+	if kind == core.BindingMCPServer {
+		return s.deps.Credentials.CredentialByOwnerKey(ctx, kind, uid, bindingKey)
+	}
+	return s.deps.Credentials.CredentialByOwner(ctx, kind, uid)
 }
 
 // normaliseCredentialValue 按模式解释请求里的凭据字段：managed 拒绝 `${VAR}` 占位与
@@ -619,6 +686,21 @@ func (s *CredentialOps) readTarget(ctx context.Context, kind core.BindingKind, n
 			revision: channel.Revision,
 			deleted:  channel.DeletedAt != nil,
 		}, nil
+	case core.BindingMCPServer:
+		pointer, err := s.deps.Resources.PointerByUID(ctx, core.ResourceMCPServer, uid)
+		if err != nil {
+			return credentialTarget{}, fmt.Errorf("%w: MCP server %s 没有当前发布指针",
+				core.ErrResourceNotFound, name)
+		}
+		if pointer.ResourceID != name {
+			return credentialTarget{}, fmt.Errorf("%w: MCP server %s 当前指向 %s",
+				core.ErrResourceUIDMismatch, name, pointer.ResourceUID)
+		}
+		return credentialTarget{
+			revision:           pointer.Revision,
+			deleted:            pointer.DeletedAt != nil,
+			publishedVersionID: pointer.PublishedVersionID,
+		}, nil
 	default:
 		return credentialTarget{}, fmt.Errorf("%w: 资源类别 %q 不支持托管凭据",
 			core.ErrCredentialUnavailable, kind)
@@ -767,6 +849,11 @@ func (s *CredentialOps) bumpRevision(ctx context.Context, plan credentialWritePl
 		}
 		return s.deps.Notify.UpdateCredentialColumns(ctx, plan.uid, plan.mode, credentialID,
 			operationID)
+	case core.BindingMCPServer:
+		// MCP 的生效不走凭据写路径（受控重建是 `mcp_server.apply`），这里只推进发布
+		// 指针的 revision：撤销因此对下一次准入可见，不需要重启。
+		return s.deps.Resources.Publish(ctx, core.ResourceMCPServer, plan.name,
+			plan.publishedVersionID, false, operationID, plan.now)
 	default:
 		return fmt.Errorf("%w: 资源类别 %q 不支持托管凭据",
 			core.ErrCredentialUnavailable, plan.kind)
@@ -838,7 +925,7 @@ func (s *CredentialOps) log() *slog.Logger {
 // sealWrite 用主密钥给明文加密并填好候选版本行；主密钥每次重新装载、用完清零。
 // sealWrite seals the plaintext with a freshly loaded master key and zeroes it.
 func (s *CredentialOps) sealWrite(plan *credentialWritePlan, value []byte) error {
-	key, err := LoadMasterKey(s.deps.MasterKeyFile, s.deps.WorkspaceRoot)
+	key, err := LoadMasterKey(effectiveMasterKeyFile(s.deps.KeyPath, s.deps.MasterKeyFile), s.deps.WorkspaceRoot)
 	if err != nil {
 		return err
 	}
@@ -895,6 +982,7 @@ func (p credentialWritePlan) revokeDetail() credentialActionDetail {
 		VersionNo:        p.versionNo,
 		PreviousVersion:  p.previousVersion,
 		TargetBinding:    p.target,
+		BindingKey:       p.bindingKey,
 		RevocationEpoch:  p.identity.RevocationEpoch + 1,
 		PreviousEpoch:    p.identity.RevocationEpoch,
 	}
@@ -910,10 +998,14 @@ func credentialWriteAction(kind core.BindingKind) string {
 }
 
 func credentialRevokeAction(kind core.BindingKind) string {
-	if kind == core.BindingNotifyChannel {
+	switch kind {
+	case core.BindingNotifyChannel:
 		return actionNotifyChannelCredentialRevoke
+	case core.BindingMCPServer:
+		return core.ActionMCPServerCredentialRevoke
+	default:
+		return actionModelConnectionCredentialRevoke
 	}
-	return actionModelConnectionCredentialRevoke
 }
 
 // credentialWriteRequestHash / credentialRevokeRequestHash 摘要一次请求：材料只含类别、
@@ -928,7 +1020,7 @@ func credentialWriteRequestHash(plan credentialWritePlan) string {
 
 func credentialRevokeRequestHash(plan credentialWritePlan) string {
 	return agentRequestHash(strings.Join([]string{
-		string(plan.kind), plan.name, string(plan.uid), plan.credentialID,
+		string(plan.kind), plan.name, string(plan.uid), plan.credentialID, plan.bindingKey,
 	}, "\n"))
 }
 
@@ -983,11 +1075,20 @@ var _ SecretsService = (*secretsService)(nil)
 // 校验用的解析器与主密钥文件位置。缺任一必需依赖即拒绝构造。
 // SecretsServiceDeps wires the secrets surface; every required dependency is explicit.
 type SecretsServiceDeps struct {
-	Credentials   *storage.CredentialStore
-	Channels      NotifyChannelCatalog
-	Ops           *CredentialOps
-	Resolver      *credentialResolver
+	Credentials *storage.CredentialStore
+	Channels    NotifyChannelCatalog
+	Ops         *CredentialOps
+	Resolver    *credentialResolver
+	// Instance 是实例加密三态与首次初始化的唯一实现（T091）：`secrets init` 的**生成**
+	// 动作走它，命令面因此与启动路径共用同一套"先预写审计、排他发布、失败转 adopt"的
+	// 语义，不出现第二个生成入口。
+	// Instance is the one minting implementation shared with the startup path.
+	Instance *InstanceSecretsService
+	// MasterKeyFile 是静态初值；KeyPath 是共享的生效路径（实例在运行中完成显式
+	// 初始化后立即切换，命令面与页面读到同一事实）。
+	// MasterKeyFile is the static seed; KeyPath is the live shared path.
 	MasterKeyFile string
+	KeyPath       *MasterKeyLocator
 	WorkspaceRoot string
 	Logger        *slog.Logger
 }
@@ -996,6 +1097,12 @@ type SecretsServiceDeps struct {
 // secretsService is the only implementation of the secrets port.
 type secretsService struct {
 	deps SecretsServiceDeps
+}
+
+// masterKeyFile 返回本服务当前生效的主密钥路径。
+// masterKeyFile returns the currently effective key path.
+func (s *secretsService) masterKeyFile() string {
+	return effectiveMasterKeyFile(s.deps.KeyPath, s.deps.MasterKeyFile)
 }
 
 // NewSecretsService 组装 secrets 服务面；缺依赖即拒绝构造（不降级成"什么都没做"）。
@@ -1011,13 +1118,13 @@ func NewSecretsService(deps SecretsServiceDeps) (SecretsService, error) {
 // 密钥会让既有密文永久不可解），**再**看是否存在当前托管依赖（同样会变孤儿）。
 // 纯 env 部署可以不跑本命令；未配置 `secrets.master_key_file` 时显式拒绝。
 // Init mints the master key; an existing file or any current managed dependency refuses.
-func (s *secretsService) Init(ctx context.Context) (SecretsStatus, error) {
-	if strings.TrimSpace(s.deps.MasterKeyFile) == "" {
+func (s *secretsService) Init(ctx context.Context, actor core.Actor) (SecretsStatus, error) {
+	if strings.TrimSpace(s.masterKeyFile()) == "" {
 		return SecretsStatus{}, fmt.Errorf(
 			"%w: 未配置主密钥文件（secrets.master_key_file）——纯 env 部署可跳过 secrets init",
 			core.ErrCredentialUnavailable)
 	}
-	exists, err := masterKeyFileExists(s.deps.MasterKeyFile)
+	exists, err := masterKeyFileExists(s.masterKeyFile())
 	if err != nil {
 		return SecretsStatus{}, err
 	}
@@ -1035,23 +1142,21 @@ func (s *secretsService) Init(ctx context.Context) (SecretsStatus, error) {
 			"当前存在 %d 个托管模型连接凭据与 %d 个托管通知渠道：生成新主密钥会让既有密文永久不可解——先执行 secrets revoke-managed --confirm",
 			models, channels)
 	}
-	key, err := GenerateMasterKey()
+	if s.deps.Instance == nil {
+		// 装配缺口如实报：命令面不另走一条生成路径（那会绕开排他发布与审计预写）。
+		// A wiring gap is reported as such; there is no second minting path.
+		return SecretsStatus{}, errors.New("secrets 服务面装配缺少实例加密服务")
+	}
+	generated, err := s.deps.Instance.Init(ctx, actor)
 	if err != nil {
 		return SecretsStatus{}, err
 	}
-	defer key.Zero()
-	if err := WriteMasterKey(s.deps.MasterKeyFile, s.deps.WorkspaceRoot, key); err != nil {
-		return SecretsStatus{}, err
-	}
-	fingerprint, err := MasterKeyFingerprint(key)
-	if err != nil {
-		return SecretsStatus{}, err
-	}
-	s.logger().Info("主密钥已生成", "key_id", key.KeyID, "fingerprint", fingerprint)
 	return SecretsStatus{
 		Initialized:             true,
-		KeyID:                   key.KeyID,
-		Fingerprint:             fingerprint,
+		State:                   generated.Decision.State,
+		Reason:                  generated.Decision.Reason,
+		KeyID:                   generated.KeyID,
+		Fingerprint:             generated.Fingerprint,
 		ManagedModelConnections: models,
 		ManagedNotifyChannels:   channels,
 	}, nil
@@ -1067,10 +1172,38 @@ func (s *secretsService) Status(ctx context.Context) (SecretsStatus, error) {
 		return SecretsStatus{}, err
 	}
 	status := SecretsStatus{ManagedModelConnections: models, ManagedNotifyChannels: channels}
-	if strings.TrimSpace(s.deps.MasterKeyFile) == "" {
+	if strings.TrimSpace(s.masterKeyFile()) == "" {
+		// 未配置路径 = 纯 env 实例：三态是"未初始化"，命令面据此提示而不是报故障。
+		status.State = core.SecretStateUninitialized
 		return status, nil
 	}
-	key, err := LoadMasterKey(s.deps.MasterKeyFile, s.deps.WorkspaceRoot)
+	if s.deps.Instance != nil {
+		// 三态判定是**唯一**的状态来源（T085 / T091）：`Initialized` 保持既有语义
+		// （密钥文件可读），恢复态与待 adopt 由 State / Reason 表达。
+		// The decision table is the only source of the state; Initialized keeps its
+		// long-standing "key file is readable" meaning.
+		verdict, err := s.deps.Instance.Status(ctx)
+		if err != nil {
+			return SecretsStatus{}, err
+		}
+		status.State = verdict.Decision.State
+		status.Reason = verdict.Decision.Reason
+		switch verdict.Decision.Action {
+		case SecretsActionReady, SecretsActionAdopt:
+			status.Initialized = true
+			status.KeyID = verdict.KeyID
+			status.Fingerprint = verdict.Fingerprint
+			return status, nil
+		case SecretsActionRecover:
+			// 恢复态：如实上抛（命令面取非零退出码并打印原因），不静默报成"未初始化"。
+			return status, fmt.Errorf(
+				"%w: 主密钥处于恢复态（原因 %q）——不生成替代密钥、不回落 env；按 docs/Operations.md 的主密钥恢复步骤处置",
+				core.ErrCredentialUnavailable, verdict.Decision.Reason)
+		default:
+			return status, nil
+		}
+	}
+	key, err := LoadMasterKey(s.masterKeyFile(), s.deps.WorkspaceRoot)
 	if err != nil {
 		return SecretsStatus{}, err
 	}
@@ -1080,6 +1213,7 @@ func (s *secretsService) Status(ctx context.Context) (SecretsStatus, error) {
 		return SecretsStatus{}, err
 	}
 	status.Initialized = true
+	status.State = core.SecretStateReady
 	status.KeyID = key.KeyID
 	status.Fingerprint = fingerprint
 	return status, nil

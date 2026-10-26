@@ -21,6 +21,28 @@ const maxNotifyReceiptBytes = 64 * 1024
 // notifyContentType is the one fixed content type both adapters send.
 const notifyContentType = "application/json; charset=utf-8"
 
+// newNotifyHTTPClient 是**通知投递**的发送面，与沙箱工具刻意分开：
+//   - 不跟随重定向（与 `newHTTPClient` 同一条）；
+//   - 不读环境变量代理（与 `newHTTPClient` 同一条）；
+//   - 但**不**经受控拨号：通知目标是管理员经渠道配置显式绑定的接收端（企业内网
+//     的飞书网关、本机中转都可能是 `10/8` 或回环），不是模型在运行中挑选的 URL。
+//     受保护地址段的拒绝规则（14D §2.2.2）面向沙箱出站请求；把它套到通知上会让
+//     每一条内网 webhook 都要求一条访问例外，超出设计范围。目标域的授权仍由
+//     `Policy.Check` 在投递前判定，这里只负责把连接发出去。
+//
+// The notification send side stays off the sandbox guard on purpose: targets are
+// admin-bound channels, not model-chosen URLs. Policy still authorizes the domain.
+func newNotifyHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 // NotifyAdapter 是一次渠道投递的发送面；具体类型由装配层按 channel.Type 查表选定。
 // 工具内核只查表，不出现类型判断分支。
 // NotifyAdapter is the send face of one channel delivery; the assembly layer maps type
@@ -40,10 +62,11 @@ type WebhookNotifyAdapter struct{ doer httpDoer }
 // Compile-time assertions that both adapters satisfy the send face.
 var _ NotifyAdapter = (*WebhookNotifyAdapter)(nil)
 
-// NewWebhookNotifyAdapter 用既有生产客户端（不跟随重定向、不读环境代理）构造。
-// NewWebhookNotifyAdapter builds the production adapter on the shared client.
+// NewWebhookNotifyAdapter 用通知专用发送面（不跟随重定向、不读环境代理、不经沙箱
+// 地址守门器——见 `newNotifyHTTPClient`）构造。
+// NewWebhookNotifyAdapter builds the adapter on the notification-only client.
 func NewWebhookNotifyAdapter() *WebhookNotifyAdapter {
-	return newWebhookNotifyAdapter(newHTTPClient())
+	return newWebhookNotifyAdapter(newNotifyHTTPClient())
 }
 
 // newWebhookNotifyAdapter 是测试缝：注入伪 doer，不触网。
@@ -94,10 +117,11 @@ type FeishuNotifyAdapter struct{ doer httpDoer }
 // Compile-time assertion for the Feishu adapter.
 var _ NotifyAdapter = (*FeishuNotifyAdapter)(nil)
 
-// NewFeishuNotifyAdapter 用既有生产客户端（不跟随重定向、不读环境代理）构造。
-// NewFeishuNotifyAdapter builds the production adapter on the shared client.
+// NewFeishuNotifyAdapter 用通知专用发送面（不跟随重定向、不读环境代理、不经沙箱
+// 地址守门器——见 `newNotifyHTTPClient`）构造。
+// NewFeishuNotifyAdapter builds the adapter on the notification-only client.
 func NewFeishuNotifyAdapter() *FeishuNotifyAdapter {
-	return newFeishuNotifyAdapter(newHTTPClient())
+	return newFeishuNotifyAdapter(newNotifyHTTPClient())
 }
 
 // newFeishuNotifyAdapter 是测试缝：注入伪 doer，不触网。

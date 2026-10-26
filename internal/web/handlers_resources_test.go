@@ -102,10 +102,16 @@ func sampleSkillView() SkillView {
 
 func sampleMcpServerView() McpServerView {
 	return McpServerView{
-		Name:               "files",
-		Transport:          "stdio",
-		Command:            "npx",
-		EnvKeys:            []string{"MCP_HOME", "MCP_TOKEN"},
+		Name:      "files",
+		Transport: "stdio",
+		Command:   "npx",
+		EnvKeys:   []string{"MCP_HOME", "MCP_TOKEN"},
+		// 集合字段在载荷里必须是 `[]` 而不是 `null`；带内容的凭据键由
+		// TestOpenAPI_McpServerViewPropertiesMatchContract 单独钉住。
+		// Collection fields must render as `[]`; a populated credential key is pinned
+		// separately by the view-property contract test.
+		HeaderKeys:         []string{},
+		CredentialKeys:     []McpCredentialKeyView{},
 		Connected:          true,
 		Tools:              []string{"read", "write"},
 		PublishedVersionID: 3,

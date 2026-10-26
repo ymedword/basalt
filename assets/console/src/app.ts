@@ -5,6 +5,12 @@ import type { Component, VNode } from 'vue'
 import { ApiClient } from './api'
 import { ConsoleAuth } from './auth'
 import { brandMark } from './components/brand'
+import { Notice } from './components/ui'
+import {
+  INSTANCE_SECRETS_RECOVERY_BANNER,
+  instanceSecretsNeedsRecovery,
+  isInstanceSecretsView,
+} from './instance-secrets'
 import { CONSOLE_BASE, ConsoleRouter, loginPath, resourceHref } from './router'
 import type { RouteMatch, RouteName } from './router'
 import { AgentConfigPage } from './views/agent-config'
@@ -56,7 +62,7 @@ const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
   ] },
 ]
 const TITLES: Record<RouteName, string> = {
-  overview: '系统总览', login: '连接工作区', agents: 'Agents', 'agents-new': '新建 Agent',
+  overview: '系统总览', login: '登录管理台', agents: 'Agents', 'agents-new': '新建 Agent',
   'agent-detail': 'Agent 工作区', 'agent-config': 'Agent 配置', 'agent-session': '会话详情',
   runs: '运行列表', 'run-detail': '运行详情',
   resources: '资源库', 'resource-detail': '资源详情', 'catalog-mcp': 'MCP 目录',
@@ -88,11 +94,42 @@ export function createConsoleApp(): Component {
       const current = ref<RouteMatch | null>(router.current)
       const authenticated = ref(auth.authenticated)
       const menuOpen = ref(false)
+      // 实例主密钥的恢复态：全站横幅的唯一判据。只在登录状态变化、首次挂载与
+      // 表单初始化成功后重读，**不**随每次导航重复请求。
+      // The global recovery banner reads this flag; it refreshes on auth changes,
+      // first mount and after an in-console initialisation, not on every route.
+      const secretsRecovery = ref(false)
+      let secretsTicket = 0
+      async function checkInstanceSecrets(): Promise<void> {
+        if (!auth.authenticated) {
+          secretsRecovery.value = false
+          return
+        }
+        const ticket = ++secretsTicket
+        try {
+          const view = await api.getInstanceSecrets()
+          if (ticket !== secretsTicket) return
+          secretsRecovery.value = isInstanceSecretsView(view) && instanceSecretsNeedsRecovery(view)
+        } catch {
+          // 读不到不挂横幅：各页面已有自己的错误提示，这里不猜恢复态。
+          // A failed read never fabricates a recovery banner.
+          if (ticket === secretsTicket) secretsRecovery.value = false
+        }
+      }
+      const onSecretsChanged = (): void => { void checkInstanceSecrets() }
       const unsubscribeRoute = router.subscribe((match) => { current.value = match; menuOpen.value = false })
-      const unsubscribeAuth = auth.subscribe((snapshot) => { authenticated.value = snapshot.authenticated })
-      onUnmounted(() => { router.stop(); unsubscribeRoute(); unsubscribeAuth() })
+      const unsubscribeAuth = auth.subscribe((snapshot) => {
+        authenticated.value = snapshot.authenticated
+        void checkInstanceSecrets()
+      })
+      window.addEventListener('basalt:instance-secrets-changed', onSecretsChanged)
+      onUnmounted(() => {
+        router.stop(); unsubscribeRoute(); unsubscribeAuth()
+        window.removeEventListener('basalt:instance-secrets-changed', onSecretsChanged)
+      })
       onMounted(() => {
         router.start()
+        void checkInstanceSecrets()
         const match = current.value
         if (!authenticated.value && match !== null && match.name !== 'login' && match.name !== 'not-found') {
           router.navigate(loginPath(currentLocation()), { replace: true, force: true })
@@ -141,6 +178,12 @@ export function createConsoleApp(): Component {
               h('div', { class: 'topbar-breadcrumb' }, [h('span', '管理台'), h('span', { 'aria-hidden': 'true' }, '/'), h('strong', match.name === 'resources' ? resourceTitle : TITLES[match.name])]),
               h('div', { class: 'topbar-actions' }, [h('span', { class: 'topbar-label' }, 'SELF-HOSTED'), h('button', { type: 'button', class: 'link-button', onClick: logout }, '退出登录')]),
             ]) : null,
+            // 恢复态横幅常驻在顶栏之下、页面之上：这是跨页面的实例级故障，
+            // 不应该只有打开总览或模型连接页才看得到（设计 §2.6.1）。
+            // The recovery banner sits under the topbar on every authenticated page.
+            showChrome && secretsRecovery.value
+              ? h(Notice, { tone: 'error', text: INSTANCE_SECRETS_RECOVERY_BANNER })
+              : null,
             h('main', { class: 'console-main', id: 'console-main', tabindex: -1 }, [h(VIEWS[match.name], { key: match.name + ':' + match.path, ctx: context, params: match.params, query: match.query })]),
           ]),
         ])

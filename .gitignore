@@ -22,6 +22,12 @@ assets/console/node_modules/
 /.loop/
 /evals/results/
 
+# 发布打包输出（完整包 zip、报告与解压验证目录；由 scripts/release-package 生成）
+/dist/
+
+# Python 字节码缓存（示例脚本单测产生，不随仓库分发）
+__pycache__/
+
 # 官网仅在构建期使用；源图、锁文件和测试保留入库。
 website/node_modules/
 website/.vitepress/dist/

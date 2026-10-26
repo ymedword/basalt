@@ -105,6 +105,14 @@ type ResourceAdminService interface {
 	TestModelConnection(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 	TestMCPServer(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 
+	// ApplyMCPServer 受控地让一个已发布版本运行生效（14D）：`versionID` 为 0 表示当前
+	// `published_version_id`。保存、连接测试、运行生效是三件事，本方法只做第三件——
+	// 它不写定义文件、不生成版本，也不把一次测试说成一次切换。
+	// ApplyMCPServer makes one published version the applied one; zero means the current
+	// published version. It writes no definition and creates no version.
+	ApplyMCPServer(ctx context.Context, actor core.Actor, name, ifMatch string,
+		versionID int64) (core.MCPServerApplyResult, error)
+
 	// DiagnoseMCPServer 给出**只读**诊断结论（D-02）：命令三态、env 就绪布尔与已知边界。
 	// 它不建立连接、不写操作行、不触达测试路径——诊断与测试互不预判（FR12），因此
 	// 不复用 TestMCPServer。返回 `core` 记录，投影在 web 层完成。
@@ -285,6 +293,21 @@ type MCPServerWrite struct {
 	Args      []string          `json:"args"`
 	URL       string            `json:"url"`
 	Env       map[string]string `json:"env"`
+	// Headers 只对 http 传输有效：值必须是整值 `${VAR}`，头名即槽位名（契约
+	// `McpServerUpsert.headers`）。
+	Headers map[string]string `json:"headers"`
+	// Credentials 是逐槽位来源声明；省略的槽位沿用既有声明，合并后仍无声明 → 400。
+	// 值只在写请求里出现，**永不回读**。
+	Credentials []McpCredentialWrite `json:"credentials"`
+}
+
+// McpCredentialWrite 是契约 McpCredentialInput 的线上形状：`mode` 必填，`value` 只在
+// `managed` 时给（`*string` 区分"省略 = 沿用"与"给空串 = 非法值"）。
+// McpCredentialWrite is the wire shape of one per-slot declaration.
+type McpCredentialWrite struct {
+	Key   string  `json:"key"`
+	Mode  string  `json:"mode"`
+	Value *string `json:"value"`
 }
 
 // SkillCreateWrite 是契约 SkillCreate 的线上形状：名字 + 一句话描述。
@@ -340,7 +363,12 @@ type NotifyChannelWrite struct {
 // handler rejects anything else before the port is reached.
 type CredentialRevokeWrite struct {
 	ResourceUID string `json:"resource_uid"`
-	Confirm     bool   `json:"confirm"`
+	// BindingKey 只在 `kind=mcp_server` 时必填：撤销粒度是单个占位符（env 键名或请求
+	// 头名），同一 server 的其它占位符不受影响。其它类别携带它就是 400——多一个寻址
+	// 维度就多一种撤错对象的可能。
+	// BindingKey addresses the MCP slot and must be absent for every other kind.
+	BindingKey string `json:"binding_key"`
+	Confirm    bool   `json:"confirm"`
 }
 
 // ResourceScopeWrite 是契约 ResourceScopeRequest 的线上形状：`scope` 字面量与

@@ -192,9 +192,24 @@ const infoView = {
   providers: [],
 }
 
+/** 实例加密就绪视图：配置页内嵌的模型连接表单读它决定「加密托管」是否可选。 */
+// Instance-encryption ready view; it only gates the managed credential option.
+const instanceSecretsView = {
+  state: 'ready',
+  key_id: 'k_test000001',
+  initialized_at: '2026-10-20T08:00:00Z',
+  key_file: '/var/lib/basalt/secrets/instance.key',
+  recovery_reason: '',
+  can_initialize: false,
+  credential_summary: { managed: 0, managed_revoked: 0, env: 0, missing: 0 },
+}
+
 function baseReply(fixture: Fixture, call: RecordedCall): Reply | undefined {
   if (call.path.endsWith('/info')) {
     return { data: infoView }
+  }
+  if (call.path === '/api/v1/instance/secrets' && call.method === 'GET') {
+    return { data: instanceSecretsView }
   }
   if (call.path === '/api/v1/agents/writer/config' && call.method === 'GET') {
     return { data: fixture.config ?? configView(), etag: CONFIG_ETAG }

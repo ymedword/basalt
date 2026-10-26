@@ -82,4 +82,49 @@ describe('CredentialField', () => {
     await editable.find('#conn-key-mode').setValue('managed')
     expect(editable.emitted('update:mode')).toEqual([['managed']])
   })
+
+  it('separates the saved/not-saved line under an explicit status title', () => {
+    const empty = mount(CredentialField, {
+      props: { id: 'conn-key', mode: 'managed', statusTitle: '当前 API 密钥' },
+    })
+    expect(empty.text()).toContain('当前 API 密钥：')
+    expect(empty.text()).toContain('尚未保存')
+    // 状态行不重复模式名：普通表单默认就是加密托管。
+    expect(empty.text()).not.toContain('尚无加密托管')
+
+    const saved = mount(CredentialField, {
+      props: {
+        id: 'conn-key',
+        mode: 'managed',
+        statusTitle: '当前 API 密钥',
+        state: 'active',
+        version: 2,
+        last4: '9f2c',
+      },
+    })
+    expect(saved.text()).toContain('已保存（版本 2，尾号 ····9f2c）')
+    expect(saved.text()).toContain('有效')
+  })
+
+  it('nests the source selector behind an advanced disclosure for ordinary forms', () => {
+    const managed = mount(CredentialField, {
+      props: { id: 'conn-key', mode: 'managed', editableMode: true, advancedSource: true },
+    })
+    const details = managed.find('details.credential-advanced')
+    expect(details.exists()).toBe(true)
+    // 默认收起：普通录入不需要先选择凭据来源。
+    expect(details.attributes('open')).toBeUndefined()
+    expect(details.find('summary').text()).toBe('高级：凭据来源（加密托管）')
+    // 选择器仍在 DOM 里，可直接切换成环境变量。
+    expect(details.find('#conn-key-mode').exists()).toBe(true)
+
+    const env = mount(CredentialField, {
+      props: { id: 'conn-key', mode: 'env', editableMode: true, advancedSource: true },
+    })
+    // 既有 env 配置默认展开，引用一眼可见。
+    expect(env.find('details.credential-advanced').attributes('open')).toBeDefined()
+    expect(env.find('details.credential-advanced summary').text()).toBe(
+      '高级：凭据来源（环境变量）',
+    )
+  })
 })

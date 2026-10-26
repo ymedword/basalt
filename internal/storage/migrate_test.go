@@ -73,10 +73,11 @@ func tableNamesOf(t *testing.T, db *sql.DB) []string {
 	return names
 }
 
-// contractTables 是契约 schema.sql 建齐的 29 张用户表（v1 十一张 + v2 七张 +
-// v3 八张 + v4 两张 + v5 一张，排序后）。v4 两张 = schedule_deliveries /
-// resource_connection_tests；v5 一张 = network_domain_policy（出网域名白名单的唯一权威行）。
-// contractTables are the twenty-nine user tables of the v5 contract schema, sorted.
+// contractTables 是契约 schema.sql 建齐的 33 张用户表（v1 十一张 + v2 七张 +
+// v3 八张 + v4 两张 + v5 一张 + v6 四张，排序后）。v4 两张 = schedule_deliveries /
+// resource_connection_tests；v5 一张 = network_domain_policy（出网域名白名单的唯一权威行）；
+// v6 四张 = execution_policy / network_exceptions / instance_secrets / mcp_credential_sources。
+// contractTables are the thirty-three user tables of the v6 contract schema, sorted.
 var contractTables = []string{
 	"agent_archives",
 	"agent_lifecycle",
@@ -84,11 +85,15 @@ var contractTables = []string{
 	"config_snapshots",
 	"credential_versions",
 	"credentials",
+	"execution_policy",
+	"instance_secrets",
 	"llm_calls",
 	"management_operations",
+	"mcp_credential_sources",
 	"memory_entries",
 	"messages",
 	"network_domain_policy",
+	"network_exceptions",
 	"notify_channels",
 	"notify_deliveries",
 	"resource_connection_tests",
@@ -109,7 +114,7 @@ var contractTables = []string{
 	"tool_invocations",
 }
 
-// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 29 表 + 版本行 = target；
+// TestMigrate_NewDatabaseCreatesAllTables：新库建齐 33 表 + 版本行 = target；
 // 建表与版本行同一事务（颗粒度文档 §4.2 映射）。
 func TestMigrate_NewDatabaseCreatesAllTables(t *testing.T) {
 	db := openBare(t, filepath.Join(t.TempDir(), "basalt.db"))
@@ -329,10 +334,10 @@ func TestMigrate_VersionRowsRecordDescriptions(t *testing.T) {
 }
 
 // TestMigrate_SupportedVersionHasMigrationFile：支持版本与迁移文件名编号对齐——
-// 常量改动而忘记追加迁移文件时在此拦下（契约 v5 基线）。
+// 常量改动而忘记追加迁移文件时在此拦下（契约 v6 基线）。
 // The supported version must have its own migration file.
 func TestMigrate_SupportedVersionHasMigrationFile(t *testing.T) {
 	name, err := migrationFile(schemaFS, SupportedSchemaVersion)
 	require.NoError(t, err)
-	require.Equal(t, "migrations/0005_network_domain_policy.sql", name)
+	require.Equal(t, "migrations/0006_execution_policy_and_mcp_credentials.sql", name)
 }

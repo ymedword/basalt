@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "id": "docs-readonly",
+      "kind": "executable",
+      "version": "1.0.0",
+      "license": "Apache-2.0",
+      "source": "https://github.com/ymedword/basalt/tree/main/examples/shared/mcp/docs-readonly",
+      "paths": {
+        "windows": "mcp/docs-readonly/1.0.0/docs-readonly.exe",
+        "linux": "mcp/docs-readonly/1.0.0/docs-readonly"
+      },
+      "repo_licenses": [
+        "LICENSE"
+      ]
+    },
+    {
+      "id": "node",
+      "kind": "runtime",
+      "version": "24.22.0",
+      "license": "MIT",
+      "source": "https://nodejs.org/dist/v24.22.0/",
+      "paths": {
+        "windows": "node/node.exe",
+        "linux": "node/bin/node"
+      },
+      "version_check": {
+        "args": [
+          "--version"
+        ],
+        "expect": "v24.22.0"
+      },
+      "runtime_licenses": [
+        "node/LICENSE"
+      ]
+    },
+    {
+      "id": "python",
+      "kind": "runtime",
+      "version": "3.12.10",
+      "license": "PSF-2.0",
+      "source": "https://www.python.org/downloads/release/python-31210/",
+      "paths": {
+        "windows": "python/python.exe",
+        "linux": "python/bin/python3"
+      },
+      "version_check": {
+        "args": [
+          "--version"
+        ],
+        "expect": "Python 3.12.10"
+      },
+      "runtime_licenses": [
+        "python/LICENSE.txt"
+      ]
+    },
+    {
+      "id": "dbhub",
+      "kind": "node-package",
+      "version": "1.5.0",
+      "license": "MIT",
+      "source": "https://www.npmjs.com/package/@bytebase/dbhub/v/1.5.0",
+      "paths": {
+        "windows": "mcp/dbhub/1.5.0/node_modules/@bytebase/dbhub/dist/index.js",
+        "linux": "mcp/dbhub/1.5.0/node_modules/@bytebase/dbhub/dist/index.js"
+      },
+      "package_json": "mcp/dbhub/1.5.0/node_modules/@bytebase/dbhub/package.json",
+      "runtime_licenses": [
+        "mcp/dbhub/1.5.0/node_modules/@bytebase/dbhub/LICENSE"
+      ],
+      "scan": {
+        "kind": "node_modules",
+        "root": "mcp/dbhub/1.5.0/node_modules"
+      }
+    },
+    {
+      "id": "github-mcp-server",
+      "kind": "executable",
+      "version": "2.0.3",
+      "license": "MIT",
+      "source": "https://github.com/github/github-mcp-server/releases/tag/v2.0.3",
+      "paths": {
+        "windows": "mcp/github-mcp-server/2.0.3/github-mcp-server.exe",
+        "linux": "mcp/github-mcp-server/2.0.3/github-mcp-server"
+      },
+      "repo_licenses": [
+        "release/licenses/github-mcp-server-LICENSE.txt"
+      ]
+    },
+    {
+      "id": "fetch",
+      "kind": "python-package",
+      "version": "2026.10.24",
+      "license": "MIT",
+      "source": "https://pypi.org/project/mcp-server-fetch/2026.10.24/",
+      "paths": {
+        "windows": "mcp/fetch/2026.10.24/run_fetch.py",
+        "linux": "mcp/fetch/2026.10.24/run_fetch.py"
+      },
+      "runtime_licenses": [
+        "mcp/fetch/2026.10.24/site-packages/mcp_server_fetch-2026.10.24.dist-info/licenses/LICENSE"
+      ],
+      "scan": {
+        "kind": "dist-info",
+        "root": "mcp/fetch/2026.10.24/site-packages"
+      },
+      "package_name": "mcp-server-fetch"
+    }
+  ]
+}

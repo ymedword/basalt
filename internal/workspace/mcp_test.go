@@ -583,16 +583,25 @@ func TestParseMCPServers_RejectsUserinfoAndPlaintextTokenArgs(t *testing.T) {
 	require.Contains(t, err.Error(), "args[0]")
 	require.NotContains(t, err.Error(), secret)
 
+	// 14D 判据修订（设计 §2.3.2 args 口径表）：参数里的 `${VAR}` 不再解析——argv 对
+	// 同机进程可读，托管值进 argv 等于泄露。新增 / 修改条目一律拒绝并点名参数序号；
+	// 存量条目仍可加载（兼容路径），由诊断报 `args_placeholders_not_resolved`。
+	// 期望集合是**扩大**：非凭证参数照旧通过，两条占位参数从"通过"改为"拒绝"。
 	for _, args := range [][]string{
 		{"--token=${MCP_TOKEN}"},
 		{"--token", "${MCP_TOKEN}"},
-		{"--config=plain-value", "--verbose"},
 	} {
 		_, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
-			Name: "ok", Transport: "stdio", Command: "mcp", Args: args,
+			Name: "no", Transport: "stdio", Command: "mcp", Args: args,
 		})
-		require.NoError(t, err, "占位或非凭证参数必须通过：%v", args)
+		require.Error(t, err, "14D 起新增条目的 args 不得含 ${VAR} 占位：%v", args)
+		require.Contains(t, err.Error(), "args[")
+		require.NotContains(t, err.Error(), "MCP_TOKEN", "错误文案只点名序号，不回显占位符内容")
 	}
+	_, err = workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "ok", Transport: "stdio", Command: "mcp", Args: []string{"--config=plain-value", "--verbose"},
+	})
+	require.NoError(t, err, "非凭证参数必须照旧通过")
 }
 
 // TestParseMCPServers_LegacyCommandSplitWarns：既有文件的旧格式多词 command 按
@@ -649,6 +658,85 @@ servers:
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "同时给出 args 与多词 command")
+}
+
+// TestValidateMCPServerCandidate_AbsolutePathWithSpaces：绝对路径里的空格是**路径的
+// 一部分**，不是参数分隔——开箱设计要求程序目录可以含空格（设计 §4.1 第 1 步），而内置
+// 条目的命令恒为 `<程序目录>/runtime/...` 的绝对路径。拆分只认**正面证据**（整串是文件
+// 或首词是文件），路径不存在时按整串保留：依赖缺失必须是 connected=false 的可见状态
+// （启动隔离），不能在定义校验阶段变成启动失败。
+// Spaces inside an absolute path belong to the path. Splitting needs positive evidence,
+// so a missing component cannot turn into a validation error.
+func TestValidateMCPServerCandidate_AbsolutePathWithSpaces(t *testing.T) {
+	command := filepath.Join(t.TempDir(), "Program Files", "Basalt 0.1.0", "runtime",
+		"mcp", "docs-readonly", "1.0.0", "docs-readonly")
+	require.Contains(t, command, " ", "用例路径必须含空格")
+	if _, err := os.Stat(command); err == nil {
+		t.Fatalf("该用例要判「不依赖存在性」，路径不应存在：%s", command)
+	}
+
+	cfg, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "docs-readonly", Transport: "stdio", Command: command,
+	})
+	require.NoError(t, err)
+	require.Equal(t, command, cfg.Command, "绝对路径必须整串保留，不得按空白拆分")
+	require.Empty(t, cfg.Args)
+
+	// 带 args 同样成立：dbhub 就是「node 绝对路径 + 三个参数」的形态。
+	withArgs, err := workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "dbhub", Transport: "stdio", Command: command,
+		Args: []string{"--transport", "stdio"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"--transport", "stdio"}, withArgs.Args)
+
+	// 非绝对路径的多词 command 仍按原规则拒绝（约束 8 / 47）：放行的只是绝对路径。
+	_, err = workspace.ValidateMCPServerCandidate(core.MCPServerConfig{
+		Name: "glued", Transport: "stdio", Command: "runtime/my tools/npx -y server",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "必须是单个可执行名")
+}
+
+// TestParseMCPServers_LegacyAbsoluteMultiWordStillSplit：旧格式「整行命令写在 command
+// 里」的**读取兼容**不因绝对路径豁免而丢（约束 8 / Operations §5.4）——首词是已存在的
+// 可执行文件、整串不是文件时，读取路径按空白拆成 command + args。缺这条，存量绝对路径
+// 条目会从"能连"变成"策略拒绝"，而那正是本缺陷要修的反面。
+// The legacy command line still splits on the read path when the leading token is a
+// real file and the whole string is not.
+func TestParseMCPServers_LegacyAbsoluteMultiWordStillSplit(t *testing.T) {
+	root := t.TempDir()
+	// 旧格式表达不了"含空格的可执行路径 + 参数"（按空白一切两半就分不清），
+	// 这种形态必须用 args 字段——因此这里的首词不带空格。
+	helper := filepath.Join(root, "helper.exe")
+	require.NoError(t, os.WriteFile(helper, []byte{}, 0o600))
+	doc := "servers:\n  - name: helper\n    command: '" + helper + " -test.run=^TestMCPHelperProcess$'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(root, "mcp_servers.yaml"), []byte(doc), 0o600))
+
+	servers, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, servers, 1)
+	require.Equal(t, helper, servers[0].Command, "首词（含空格的绝对路径）是 command")
+	require.Equal(t, []string{"-test.run=^TestMCPHelperProcess$"}, servers[0].Args)
+}
+
+// TestParseMCPServers_SpaceyAbsolutePathNotSplit：整串是文件时**不拆**——解压到
+// `Program Files` 的程序目录就是这一形态；拆了会把 `C:\Program` 当可执行文件。
+// A whole-string file is a path with spaces and must not be split.
+func TestParseMCPServers_SpaceyAbsolutePathNotSplit(t *testing.T) {
+	root := t.TempDir()
+	programDir := filepath.Join(root, "Program Files", "Basalt 0.1.0", "runtime", "mcp")
+	require.NoError(t, os.MkdirAll(programDir, 0o750))
+	bundled := filepath.Join(programDir, "docs-readonly.exe")
+	require.NoError(t, os.WriteFile(bundled, []byte{}, 0o600))
+	doc := "servers:\n  - name: docs-readonly\n    command: '" + bundled + "'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(root, "mcp_servers.yaml"), []byte(doc), 0o600))
+
+	servers, err := workspace.ParseMCPServers(root)
+	require.NoError(t, err)
+	require.Len(t, servers, 1)
+	require.Equal(t, bundled, servers[0].Command, "整串是文件时必须原样保留")
+	require.Empty(t, servers[0].Args)
 }
 
 // TestParseMCPServers_StrictMultiWordCommandRejected：候选（严格路径）的多词 command

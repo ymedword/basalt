@@ -78,11 +78,17 @@ const (
 	ruleParentMissing         = "目标父目录不存在"
 	guidanceParentMissing     = "write_file 不自动创建父目录；请改在已存在的目录内写入。"
 	ruleMultiWord             = "可执行名含空白（多词串）"
-	guidanceMultiWord         = "executable 与 arguments 必须分开传（不经 shell 解释）：可执行名写单个可执行文件，参数走 arguments。"
+	guidanceMultiWord         = "executable 与 arguments 必须分开传（不经 shell 解释）：可执行名写单个可执行文件，参数走 arguments。绝对路径里的空格是路径的一部分——把它整串登记进 shell.allowed_commands（或 shell.interpreters）即可放行。"
 	ruleBashSh                = "bash / sh 不得放行"
 	guidanceBashSh            = "需要跑脚本请改用受控解释器通道（配置键 shell.interpreters，脚本须落在该 Agent 的 scripts/ 或技能库内）并重启服务。"
 	ruleCommandNotAllowed     = "可执行名不在白名单"
 	guidanceCommandNotAllowed = "如需放行，请联系运维把该可执行名加入配置键 shell.allowed_commands 并重启服务。"
+	// 交互式 shell 名称集合（14D）：`bash` / `sh` 沿用既有文案，其余新名称单独一句——
+	// 它们是**能力上限声明**，指引不能写成"加个配置键就能开"。
+	ruleShellName             = "交互式 shell 不得放行"
+	guidanceShellName         = "本产品不向模型提供交互式 shell（能力上限，代码常量）；需要跑脚本请改用受控解释器通道（配置键 shell.interpreters）。"
+	ruleProgramDirRefused     = "程序目录可执行件的自动放行条件未满足"
+	guidanceProgramDirRefused = "程序目录放行要求安装清单登记、真实路径位于 runtime/ 且只读保护生效三项同时满足；未满足时该可执行件按需显式登记（shell.allowed_commands）。"
 	ruleNotDomain             = "出网目标不是域名"
 	guidanceNotDomain         = "白名单按域名匹配，IP 字面量与无法解析的地址一律拒；没有配置键可以加。"
 	ruleScheme                = "出网 scheme 不被允许"
@@ -92,6 +98,9 @@ const (
 	// The allowlist is edited in the console and applied live; the guidance no longer
 	// tells anyone to edit config and restart.
 	guidanceDomainNotAllowed = "如需访问，请联系管理员在管理台「执行环境」页把该域名加入网络域名白名单，保存后立即生效，无需重启。"
+	// 禁止域名档（14D）：两档都先于放行判定，指引指向禁止域名表本身（不是白名单）。
+	ruleDeniedDomain     = "域名在禁止域名表中"
+	guidanceDeniedDomain = "该域名被管理员显式禁止出网（两档都先生效，白名单放行不了它）；如需恢复请联系管理员在管理台「执行环境」页调整禁止域名表。"
 	// 端口档（口径 15，2026-10-17 用户裁决冻结）：只允许 scheme 的默认端口；放行通道
 	// 归扩展阶段——指引**不得**指向域名白名单（它管 host、不管端口）。
 	ruleNonDefaultPort     = "出网目标端口不在默认档"
@@ -111,6 +120,15 @@ type PolicyOptions struct {
 	AllowedCommands []string // shell.allowed_commands：executable 整串逐字比对
 	Interpreters    []string // shell.interpreters：受控解释器通道（argv 形态由执行侧校验）
 	AllowedDomains  []string // http.allowed_domains：出网域名白名单（大小写不敏感）
+	// ProgramDirNames 是安装清单里登记的程序目录可执行名（标准档按名放行到执行侧，
+	// 真实路径 / 哈希 / 只读保护三项由 `LocalRunner.Run` 复核）。
+	// ProgramDirNames are the installation-manifest executable names; the standard
+	// profile admits them by name and the runner re-checks path, hash and protection.
+	ProgramDirNames []string
+	// ProgramDir 是程序目录根的绝对路径（真实路径）。文件写入在**两档**都拒——它不在
+	// 任何 Agent 的可写范围之内。
+	// ProgramDir is the program directory root; writes are refused in both profiles.
+	ProgramDir string
 }
 
 // WhitelistPolicy 是 v1 唯一的授权实现（技术方案 §4.3 授权矩阵 + §2.3 流程 F）：
@@ -120,14 +138,27 @@ type PolicyOptions struct {
 // is the only hot-swappable dimension; the other three stay construction-time snapshots.
 type WhitelistPolicy struct {
 	root            string
+	programDir      string
 	crossAgentRead  map[string]struct{}
 	allowedCommands map[string]struct{}
 	interpreters    map[string]struct{}
+	programDirs     map[string]struct{}
 	// domains 以原子指针持有整份规则快照：保存成功后一次 `Store` 即对**下一次判定**
 	// 生效，读方不加锁、也不会看到半份新规则。`nil` 表示空规则（全部拒绝）。
 	// domains holds an immutable rule snapshot behind an atomic pointer so a swap is
 	// visible to the very next check without locking or partial state.
 	domains atomic.Pointer[domainRules]
+	// denied 是禁止域名表的活快照（与白名单同一套匹配语法）。两档都先于放行判定。
+	// denied is the live denylist snapshot; both profiles consult it before allowing.
+	denied atomic.Pointer[domainRules]
+	// exceptions 是网络访问例外的活快照（删除后下一次判定即失效）。
+	// exceptions is the live network-exception snapshot.
+	exceptions atomic.Pointer[[]core.NetworkException]
+	// profile 是当前执行档位；零值（未装配）按 **strict** 处理——安全默认：不会因为
+	// 忘了设置档位而静默扩大授权。
+	// profile is the live execution profile; unset means strict so a missing assembly
+	// can never widen authorization by accident.
+	profile atomic.Pointer[core.ExecutionProfile]
 }
 
 // domainRules 是不可变的域名规则快照：条目已按小写、去首尾空白、去重、升序规整。
@@ -145,9 +176,11 @@ var _ core.Policy = (*WhitelistPolicy)(nil)
 func NewWhitelistPolicy(opts PolicyOptions) *WhitelistPolicy {
 	policy := &WhitelistPolicy{
 		root:            filepath.Clean(opts.Root),
+		programDir:      filepath.Clean(opts.ProgramDir),
 		crossAgentRead:  make(map[string]struct{}, len(opts.CrossAgentRead)),
 		allowedCommands: make(map[string]struct{}, len(opts.AllowedCommands)),
 		interpreters:    make(map[string]struct{}, len(opts.Interpreters)),
+		programDirs:     make(map[string]struct{}, len(opts.ProgramDirNames)),
 	}
 	for _, name := range opts.CrossAgentRead {
 		policy.crossAgentRead[name] = struct{}{}
@@ -158,15 +191,84 @@ func NewWhitelistPolicy(opts PolicyOptions) *WhitelistPolicy {
 	for _, name := range opts.Interpreters {
 		policy.interpreters[name] = struct{}{}
 	}
+	for _, name := range opts.ProgramDirNames {
+		if name == "" {
+			continue
+		}
+		// 清单里登记的是**文件名**：标准档按 basename 放行到执行侧，真实路径 / 哈希 /
+		// 只读保护三项由 `LocalRunner.Run` 复核。空名不进集合（否则等于放行一切）。
+		// Manifest entries are file names; an empty name never enters the set.
+		policy.programDirs[foldCase(name)] = struct{}{}
+	}
 	policy.SetAllowedDomains(opts.AllowedDomains)
+	policy.SetExecutionProfile(core.ProfileStrict)
 	return policy
 }
 
-// SetAllowedDomains 原子替换出网域名规则：调用方已做过严格校验与规整（服务层），
-// 这里再做一次幂等的宽松规整，保证手工装配（CLI / 测试）也能得到同一份形状。
-// 传入 `nil` 表示空规则——受此策略约束的出站请求全部拒绝。
-// SetAllowedDomains swaps the outbound rule snapshot atomically; nil means deny-all.
-func (p *WhitelistPolicy) SetAllowedDomains(domains []string) {
+// SetExecutionProfile 原子替换执行档位：落库成功后调用一次，**下一次**判定即按新档位。
+// 传入非法值时保持"严格档"（安全默认）并返回 false，由调用方决定是否记日志。
+// SetExecutionProfile swaps the live profile; an invalid value keeps strict.
+func (p *WhitelistPolicy) SetExecutionProfile(profile core.ExecutionProfile) bool {
+	valid := profile.Valid()
+	if !valid {
+		profile = core.ProfileStrict
+	}
+	stored := profile
+	p.profile.Store(&stored)
+	return valid
+}
+
+// ExecutionProfile 返回当前生效的档位；未装配（零值）按严格档算——档位缺失只会更窄，
+// 不会更宽。
+// ExecutionProfile returns the live profile; unset reads as strict.
+func (p *WhitelistPolicy) ExecutionProfile() core.ExecutionProfile {
+	if p == nil {
+		return core.ProfileStrict
+	}
+	profile := p.profile.Load()
+	if profile == nil || !profile.Valid() {
+		return core.ProfileStrict
+	}
+	return *profile
+}
+
+// SetDeniedDomains 原子替换禁止域名表：与白名单同一套规整与匹配语法，两档都先于放行判定。
+// SetDeniedDomains swaps the live denylist snapshot; both profiles consult it first.
+func (p *WhitelistPolicy) SetDeniedDomains(domains []string) {
+	p.denied.Store(newDomainRules(domains))
+}
+
+// DeniedDomains 返回当前禁止域名表的副本（供视图投影）。
+// DeniedDomains returns a copy of the live denylist for the view layer.
+func (p *WhitelistPolicy) DeniedDomains() []string {
+	rules := p.denied.Load()
+	if rules == nil {
+		return []string{}
+	}
+	return slices.Clone(rules.entries)
+}
+
+// SetNetworkExceptions 原子替换访问例外集合：删除后**下一次**判定即失效（拨号器每次读
+// 这份快照，不缓存）。
+// SetNetworkExceptions swaps the live exception list; dialling reads it per attempt.
+func (p *WhitelistPolicy) SetNetworkExceptions(exceptions []core.NetworkException) {
+	snapshot := slices.Clone(exceptions)
+	p.exceptions.Store(&snapshot)
+}
+
+// NetworkExceptions 返回当前例外集合的副本（供拨号器与视图投影）。
+// NetworkExceptions returns a copy of the live exceptions.
+func (p *WhitelistPolicy) NetworkExceptions() []core.NetworkException {
+	snapshot := p.exceptions.Load()
+	if snapshot == nil {
+		return nil
+	}
+	return slices.Clone(*snapshot)
+}
+
+// newDomainRules 规整一份域名列表为不可变快照（小写、去首尾空白、升序、去重）。
+// newDomainRules normalizes a list into an immutable snapshot.
+func newDomainRules(domains []string) *domainRules {
 	normalized := make([]string, 0, len(domains))
 	for _, entry := range domains {
 		entry = strings.ToLower(strings.TrimSpace(entry))
@@ -177,7 +279,31 @@ func (p *WhitelistPolicy) SetAllowedDomains(domains []string) {
 	}
 	slices.Sort(normalized)
 	normalized = slices.Compact(normalized)
-	p.domains.Store(&domainRules{entries: normalized})
+	return &domainRules{entries: normalized}
+}
+
+// rulesMatch 判定 hosts 快照里是否有条目匹配 host（匹配器只有 `core.DomainEntryMatches`
+// 一份——白名单 / 禁止表 / host 例外 / MCP 撤销复判共用）。
+// rulesMatch reports whether any snapshot entry matches the host.
+func rulesMatch(rules *domainRules, host string) bool {
+	if rules == nil {
+		return false
+	}
+	for _, entry := range rules.entries {
+		if core.DomainEntryMatches(entry, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetAllowedDomains 原子替换出网域名规则：调用方已做过严格校验与规整（服务层），
+// 这里再做一次幂等的宽松规整，保证手工装配（CLI / 测试）也能得到同一份形状。
+// 传入 `nil` 表示空规则——严格档下受此策略约束的出站请求全部拒绝。
+// SetAllowedDomains swaps the outbound rule snapshot atomically; nil means deny-all in
+// the strict profile.
+func (p *WhitelistPolicy) SetAllowedDomains(domains []string) {
+	p.domains.Store(newDomainRules(domains))
 }
 
 // AllowedDomains 返回当前生效规则的副本（供视图投影；调用方改动不影响内部快照）。
@@ -190,16 +316,59 @@ func (p *WhitelistPolicy) AllowedDomains() []string {
 	return slices.Clone(rules.entries)
 }
 
-// AllowsHost 只判出网规则的域名档：主机名是否在当前生效快照内。MCP http 长连接的
-// 撤销复判经它做——匹配器只有这一份，撤销与逐跳判定不可能分叉（通配 `*.suffix`
-// 只覆盖子域，不覆盖裸后缀）。scheme / 端口不是本方法的事。
-// AllowsHost judges the domain rule alone; MCP link revocation reuses this very
-// matcher so revocation and per-hop checks cannot drift apart.
+// AllowsHost 只判出网规则的域名面：主机名在当前档位下是否有出网授权。MCP http 长连接的
+// 撤销复判经它做——判定只有这一份，撤销与逐跳判定不可能分叉（通配 `*.suffix` 只覆盖
+// 子域，不覆盖裸后缀）。scheme / 端口不是本方法的事。
+// AllowsHost judges the domain face alone; MCP link revocation reuses this very
+// decision so revocation and per-hop checks cannot drift apart.
 func (p *WhitelistPolicy) AllowsHost(host string) bool {
 	if p == nil {
 		return false
 	}
-	return p.domainAllowed(host)
+	return p.hostAuthorized(host)
+}
+
+// hostAuthorized 是"这个主机名在**当前档位**下能否出网"的唯一判定：
+// 禁止域名表两档都先生效；标准档放行其余（受保护地址段由拨号器在解析后判，域名面
+// 管不到）；严格档要求命中白名单或一条 host 类型访问例外。
+// hostAuthorized is the single hostname-level verdict: the denylist binds both
+// profiles, standard admits the rest, strict needs an allowlist or host exception hit.
+func (p *WhitelistPolicy) hostAuthorized(host string) bool {
+	if p.deniedHost(host) {
+		return false
+	}
+	if p.ExecutionProfile() == core.ProfileStandard {
+		return true
+	}
+	return p.domainAllowed(host) || p.hostExcepted(host)
+}
+
+// deniedHost 判定主机名是否命中禁止域名表。
+// deniedHost reports a denylist hit.
+func (p *WhitelistPolicy) deniedHost(host string) bool {
+	if p == nil {
+		return false
+	}
+	return rulesMatch(p.denied.Load(), host)
+}
+
+// hostExcepted 判定是否有 `host` 类型访问例外覆盖该主机名（严格档等价于白名单条目）。
+// `ip_port` 例外不在域名面判定：它按解析结果匹配，由拨号器读同一份快照判。
+// hostExcepted matches a host-kind exception; ip_port exceptions bind at dial time.
+func (p *WhitelistPolicy) hostExcepted(host string) bool {
+	snapshot := p.exceptions.Load()
+	if snapshot == nil {
+		return false
+	}
+	for _, exception := range *snapshot {
+		if exception.Kind != core.NetworkExceptionKindHost {
+			continue
+		}
+		if core.DomainEntryMatches(exception.Value, host) {
+			return true
+		}
+	}
+	return false
 }
 
 // Check 判定一个动作是否放行；拒绝一律返回 `*core.SandboxViolationError`（四段式文案，
@@ -329,17 +498,46 @@ func (p *WhitelistPolicy) checkFileWrite(action core.Action, real, ownDir string
 	return nil
 }
 
-// checkShellCommand 落 §2.3 流程 F 的命令档：bash / sh **硬拒先行**（契约 §5.2 的
-// "不得放行"没有例外分支——先查白名单会让 `allowed_commands: [bash]` 这个配置错误变成放行），
-// 随后多词串拒、白名单整串逐字比对、解释器通道放行到执行侧。
-// The bash/sh hard refusal runs before any allow branch so that a misconfigured
-// allowlist can never open the shell back up.
+// checkShellCommand 落 §2.3 流程 F 的命令档：交互式 shell 名称集合**硬拒先行**（契约
+// §5.2 的"不得放行"没有例外分支——先查白名单会让 `allowed_commands: [bash]` 这个配置
+// 错误变成放行），随后多词串拒、白名单整串逐字比对、解释器通道放行到执行侧；标准档
+// 另放行安装清单内的程序目录可执行名（真实路径 / 哈希 / 只读保护由 `LocalRunner.Run`
+// 复核，未满足即拒）。
+// The shell-name ceiling runs before any allow branch, so a misconfigured allowlist can
+// never open an interactive shell back up. Standard additionally admits manifest names
+// to the execution side, which re-checks path, hash and read-only protection.
+// registeredCommand 判一条命令是否**整串逐字**登记在白名单或解释器集合里（两处都是
+// 显式登记面，含空格路径的放行口径因此只有一份）。
+// registeredCommand reports an exact match in either explicit registration set.
+func (p *WhitelistPolicy) registeredCommand(target string) bool {
+	if _, ok := p.allowedCommands[target]; ok {
+		return true
+	}
+	_, ok := p.interpreters[target]
+	return ok
+}
+
 func (p *WhitelistPolicy) checkShellCommand(action core.Action) error {
 	target := action.Target
 	if isBannedShell(target) {
 		return deny(ruleBashSh, target, guidanceBashSh)
 	}
+	// 其余交互式 shell 名称（zsh / cmd / powershell …）：能力上限，白名单与解释器通道
+	// 都不给它开口子。`bash` / `sh` 已在上面按既有文案拒，这里只管新增名称；按基名判，
+	// 所以**先于**下面的多词分支——绝对路径里的 shell 不会因为"含空格"被当成普通路径。
+	if core.IsShellName(target) {
+		return deny(ruleShellName, target, guidanceShellName)
+	}
 	if strings.ContainsAny(target, " \t") {
+		// 绝对路径里的空白是**路径本身的一部分**（`…\Program Files\Basalt 0.1.0\…`）：
+		// 执行侧从不按空白拆词、也不经 shell，整串逐字命中白名单 / 解释器集合的绝对路径
+		// 与无空格路径等价（14D §2.2.2 显式登记口径）。**相对形态**的多词串照旧先拒——
+		// 那是"把参数拼进 executable"的旧写法，写进白名单也不构成可执行文件路径。
+		// Whitespace inside an absolute path is part of the path: an exact allowlist hit
+		// is allowed; a relative multi-word string is still refused before the lookup.
+		if filepath.IsAbs(target) && p.registeredCommand(target) {
+			return nil
+		}
 		return deny(ruleMultiWord, target, guidanceMultiWord)
 	}
 	if _, ok := p.allowedCommands[target]; ok {
@@ -349,15 +547,22 @@ func (p *WhitelistPolicy) checkShellCommand(action core.Action) error {
 		// 放行**到执行侧**：argv 形态（`-c` 拒）与脚本真实路径越界由 LocalRunner 判。
 		return nil
 	}
+	if p.ExecutionProfile() == core.ProfileStandard {
+		if _, ok := p.programDirs[foldCase(filepath.Base(target))]; ok {
+			return nil
+		}
+	}
 	return deny(ruleCommandNotAllowed, target, guidanceCommandNotAllowed)
 }
 
 // checkHTTPRequest 落 §2.3 流程 F 的出网档：逐跳校验由调用方在每一跳发送前再次 Check；
 // 跳数上限 5 是调用方的代码常量（US-5 的 http 工具），本档只判"这一跳去哪"。
-// 判定序：解析 → scheme → hostname / IP 字面量 → **端口档（口径 15）** → 域名白名单；
-// 初始请求与每一次重定向同判（判定只此一处）。两处拒绝分支只回安全文案与 host，
+// 判定序：解析 → scheme → hostname / IP 字面量 → **禁止域名表（两档先生效）** →
+// **端口档（口径 15）** → 档位授权（标准档放行；严格档要白名单或 host 例外）。
+// 初始请求与每一次重定向同判（判定只此一处）。拒绝分支只回安全文案与 host，
 // **不得**回显 `action.Target` 原文（原文可能带 userinfo / query——§3.5 第 9 项）。
-// Per-hop judgement; the redirect hop cap lives with the http tools (US-5).
+// Per-hop judgement; the denylist binds both profiles before anything is allowed, and
+// the redirect hop cap lives with the http tools (US-5).
 func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 	u, err := url.Parse(action.Target)
 	if err != nil {
@@ -368,7 +573,8 @@ func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 		return deny(ruleScheme, u.Scheme, guidanceScheme)
 	}
 	host := u.Hostname()
-	// 白名单按域名匹配：IP 字面量目标直接拒（放行 IP 等于绕过白名单）。
+	// 出网按域名判定：IP 字面量目标直接拒（放行 IP 等于绕过域名表；访问受保护地址
+	// 请用域名 + 访问例外，`ip_port` 例外在拨号阶段按解析结果匹配）。
 	if host == "" {
 		return deny(ruleNotDomain, targetUnresolvable, guidanceNotDomain)
 	}
@@ -376,9 +582,13 @@ func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 		// 段 2 点名 IP 字面量本身——它不含 userinfo / query，回显它不泄漏任何东西。
 		return deny(ruleNotDomain, host, guidanceNotDomain)
 	}
+	// 禁止域名**先于**端口与授权：命中即拒，与档位、端口、白名单都无关（"禁止 > 允许"）。
+	if p.deniedHost(host) {
+		return denyWithReason(ruleDeniedDomain, host, guidanceDeniedDomain, core.DenialDeniedDomain)
+	}
 	// 端口档（口径 15，冻结）：`http` 配省略端口或显式 `:80`、`https` 配省略端口或显式
 	// `:443` 放行，其余组合（含交叉档 http:443 / https:80）一律拒——判定在 hostname 之后、
-	// 域名白名单之前：域名档管 host、端口档管端口，两档不互相顶替。
+	// 档位授权之前：域名档管 host、端口档管端口，两档不互相顶替。
 	if port := u.Port(); port != "" {
 		defaultPort, ok := defaultPortFor(u.Scheme)
 		if !ok || port != strconv.Itoa(defaultPort) {
@@ -386,8 +596,13 @@ func (p *WhitelistPolicy) checkHTTPRequest(action core.Action) error {
 			return deny(ruleNonDefaultPort, u.Host, guidanceNonDefaultPort)
 		}
 	}
-	if !p.domainAllowed(host) {
-		return deny(ruleDomainNotAllowed, host, guidanceDomainNotAllowed)
+	if p.ExecutionProfile() == core.ProfileStandard {
+		// 标准档：不在禁止域名表内即可（受保护地址段由拨号器在解析后判——域名面判不到）。
+		return nil
+	}
+	if !p.domainAllowed(host) && !p.hostExcepted(host) {
+		return denyWithReason(ruleDomainNotAllowed, host, guidanceDomainNotAllowed,
+			core.DenialProfileDenied)
 	}
 	return nil
 }
@@ -405,31 +620,14 @@ func defaultPortFor(scheme string) (int, bool) {
 	}
 }
 
-// domainAllowed 按域名匹配（大小写不敏感）：完整域名逐字比较；条目写成 `*.example.com`
-// （通配前缀）时匹配其子域——通配只放宽一个被明确写下的后缀，不做"包含即命中"的模糊匹配。
-// Domain matching is case-insensitive; a `*.suffix` entry covers subdomains only.
+// domainAllowed 判白名单命中。匹配器只有 `core.DomainEntryMatches` 一份（白名单、禁止
+// 域名表、host 例外与 MCP 撤销复判共用）：`*.suffix` 只覆盖子域，不做"包含即命中"。
+// domainAllowed reuses the single shared matcher so no face can drift apart.
 func (p *WhitelistPolicy) domainAllowed(host string) bool {
-	host = strings.ToLower(host)
-	rules := p.domains.Load()
-	if rules == nil {
+	if p == nil {
 		return false
 	}
-	for _, entry := range rules.entries {
-		entry = strings.ToLower(strings.TrimSpace(entry))
-		if entry == "" {
-			continue
-		}
-		if suffix, ok := strings.CutPrefix(entry, "*."); ok {
-			if strings.HasSuffix(host, "."+suffix) {
-				return true
-			}
-			continue
-		}
-		if host == entry {
-			return true
-		}
-	}
-	return false
+	return rulesMatch(p.domains.Load(), host)
 }
 
 // agentDir 定位 Agent 自有目录；名字不合法或为空（无 Agent 上下文）时返回空串——
@@ -574,4 +772,13 @@ func isBannedShell(target string) bool {
 // deny builds one refusal; the fixed third segment lives in core.
 func deny(rule, target, guidance string) error {
 	return &core.SandboxViolationError{Rule: rule, Target: target, Guidance: guidance}
+}
+
+// denyWithReason 组装一份**能解释"该改哪一条"**的沙箱拒绝：`error_kind` 仍是
+// `sandbox_denied`，`Reason` 只作细分（契约 §7.3 的四类）。不属于四类的拒绝（文件范围、
+// 命令形态、端口档…）用 `deny` 留空——空串表示"不细分"，不是第五类。
+// denyWithReason refines a denial with one of the four contract reasons; the other
+// refusals stay unrefined so an empty reason never reads as a fifth category.
+func denyWithReason(rule, target, guidance string, reason core.PolicyDenialReason) error {
+	return &core.SandboxViolationError{Rule: rule, Target: target, Guidance: guidance, Reason: reason}
 }

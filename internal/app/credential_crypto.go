@@ -106,16 +106,15 @@ func (a CredentialAAD) String() string {
 		credentialAADVersion, a.OwnerKind, a.OwnerUID, a.CredentialID, a.VersionNo, a.TargetBinding)
 }
 
-// Validate 校验六段的形状：类别与 UID 走领域解析，凭据 ID 走 Crockford 校验，
-// 版本号从 1 起，目标绑定是 64 位小写十六进制。
-// Validate checks every segment shape before it can reach the AEAD.
+// Validate 校验六段的形状：类别走凭据属主闭集（比可绑定类别多一个 `mcp_server`），
+// UID 走领域解析，凭据 ID 走 Crockford 校验，版本号从 1 起，目标绑定是 64 位小写
+// 十六进制。类别**不**复用 `ParseBindingKind`：MCP 占位符凭据是合法的属主，却不是
+// AGENT.md 可绑定资源，两者混用会逼着绑定面接受第三类。
+// Validate checks every segment shape before it can reach the AEAD; the owner kind uses
+// the credential-owner set rather than the two bindable kinds.
 func (a CredentialAAD) Validate() error {
-	kind, err := core.ParseBindingKind(string(a.OwnerKind))
-	if err != nil {
-		return fmt.Errorf("凭据 AAD 非法: %w", err)
-	}
-	if kind != a.OwnerKind {
-		return errors.New("凭据 AAD 非法: 绑定类别未规范化")
+	if !core.IsCredentialOwnerKind(a.OwnerKind) {
+		return fmt.Errorf("凭据 AAD 非法: 未知的属主类别 %q", a.OwnerKind)
 	}
 	uid, err := core.ParseResourceUID(string(a.OwnerUID))
 	if err != nil {
@@ -150,6 +149,27 @@ func CredentialTargetBinding(kind core.BindingKind, baseURL, fullURL string) (st
 		return "", errors.New("计算凭据目标绑定: 目标地址不得为空")
 	}
 	return binding.Hash(), nil
+}
+
+// MCPCredentialTargetBinding 计算 MCP 槽位凭据的目标绑定哈希：`server 资源 UID +
+// 槽位名`。两者一起绑死——密文既不能被搬到别的 server，也不能被搬到同一个 server 的
+// 另一个槽位（例如把读凭据贴进写凭据的槽位）。哈希里不含任何值、地址或路径。
+//
+// 不复用 `CredentialTargetBinding`：它按 `ParseBindingKind` 只认模型连接与通知渠道，
+// 且以"目标地址"为输入，而 MCP 槽位没有目标地址可绑。
+// MCPCredentialTargetBinding binds the ciphertext to one (server uid, slot) pair so it
+// can never be replayed on another server or another slot of the same server.
+func MCPCredentialTargetBinding(serverUID core.ResourceUID, bindingKey string) (string, error) {
+	uid, err := core.ParseResourceUID(string(serverUID))
+	if err != nil {
+		return "", fmt.Errorf("计算 MCP 凭据目标绑定: %w", err)
+	}
+	key, ok := core.MCPBindingKey(bindingKey)
+	if !ok {
+		return "", errors.New("计算 MCP 凭据目标绑定: 槽位名非法")
+	}
+	sum := sha256.Sum256([]byte(string(core.BindingMCPServer) + "|" + string(uid) + "|" + key))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // SealCredential 用主密钥加密明文并返回 nonce 与密文。每次调用都取新的随机 nonce：
@@ -433,18 +453,28 @@ func masterKeyFileExists(path string) (bool, error) {
 	return false, nil
 }
 
-// writeNewMasterKeyFile 以 O_EXCL 落盘固定 JSON 形态，写失败即删除半个文件。
-// writeNewMasterKeyFile writes the fixed JSON shape with O_EXCL and removes partial output.
-func writeNewMasterKeyFile(path string, key MasterKey) error {
+// renderMasterKeyDocument 渲染密钥文件的固定 JSON 形态（含行尾换行）。发布路径
+// （临时链接 + `os.Link`）与直写路径共用它，保证两条路径落盘的内容逐字节一致。
+// renderMasterKeyDocument renders the fixed JSON shape shared by both write paths.
+func renderMasterKeyDocument(key MasterKey) ([]byte, error) {
 	document, err := json.Marshal(masterKeyFile{
 		Version: masterKeyFileVersion,
 		KeyID:   key.KeyID,
 		Key:     base64.StdEncoding.EncodeToString(key.Key),
 	})
 	if err != nil {
-		return fmt.Errorf("%w: 序列化主密钥文件失败", core.ErrCredentialUnavailable)
+		return nil, fmt.Errorf("%w: 序列化主密钥文件失败", core.ErrCredentialUnavailable)
 	}
-	document = append(document, '\n')
+	return append(document, '\n'), nil
+}
+
+// writeNewMasterKeyFile 以 O_EXCL 落盘固定 JSON 形态，写失败即删除半个文件。
+// writeNewMasterKeyFile writes the fixed JSON shape with O_EXCL and removes partial output.
+func writeNewMasterKeyFile(path string, key MasterKey) error {
+	document, err := renderMasterKeyDocument(key)
+	if err != nil {
+		return err
+	}
 	// #nosec G304 -- 路径来自部署者配置（secrets.master_key_file），不是请求输入；调用方已
 	// 规范化、拒绝符号链接 / 硬链接并校验不在工作区内，O_EXCL 保证不覆盖既有文件。
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)

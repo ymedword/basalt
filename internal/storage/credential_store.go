@@ -31,7 +31,7 @@ import (
 // credentialColumns 是 credentials 的读取列序（scanCredential 按同一顺序扫描）。
 // credentialColumns is the read order of the credential identity table.
 // #nosec G101 -- SQL 列序常量，值不是凭据（变量名命中）。
-const credentialColumns = `credential_id, owner_kind, owner_uid, owner_name, state,
+const credentialColumns = `credential_id, owner_kind, owner_uid, binding_key, owner_name, state,
 	current_version, revocation_epoch, key_id, created_at, updated_at, operation_id`
 
 // credentialVersionColumns 是 credential_versions 的读取列序。
@@ -66,6 +66,10 @@ func (s *CredentialStore) Create(ctx context.Context, identity core.CredentialRe
 	defer func() { _ = tx.Rollback() }()
 
 	if err := insertCredentialTx(ctx, tx, identity); err != nil {
+		if isUniqueViolation(err) && identity.BindingKey != "" {
+			return fmt.Errorf("%w: 资源 %s 的占位符 %s 已有凭据",
+				core.ErrConflict, identity.OwnerUID, identity.BindingKey)
+		}
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: 资源 %s 已有凭据", core.ErrConflict, identity.OwnerUID)
 		}
@@ -315,11 +319,44 @@ func (s *CredentialStore) CredentialByOwner(ctx context.Context, kind core.Bindi
 		return core.CredentialRecord{}, err
 	}
 	row := s.db.read.QueryRowContext(ctx,
-		`SELECT `+credentialColumns+` FROM credentials WHERE owner_kind = ? AND owner_uid = ?`,
+		`SELECT `+credentialColumns+` FROM credentials
+		  WHERE owner_kind = ? AND owner_uid = ? AND binding_key = ''`,
 		string(kind), string(uid))
 	rec, err := scanCredential(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.CredentialRecord{}, fmt.Errorf("%w: 资源 %s 没有凭据", core.ErrResourceNotFound, uid)
+	}
+	if err != nil {
+		return core.CredentialRecord{}, fmt.Errorf("读取资源 %s 的凭据: %w", uid, err)
+	}
+	return rec, nil
+}
+
+// CredentialByOwnerKey 按 `(属主类别, 资源 UID, 绑定键)` 读一条凭据身份：MCP server 的
+// 每个占位符各一条，其余类别等价于 `CredentialByOwner`（绑定键恒为空串）。未命中 →
+// `core.ErrResourceNotFound`——调用方据此判定"该占位符还没有托管值"，**不得**借此
+// 回落进程环境。
+// CredentialByOwnerKey reads the identity of one (owner, binding key) pair; a miss means
+// "no managed value yet" and must never be read as "fall back to env".
+func (s *CredentialStore) CredentialByOwnerKey(ctx context.Context, kind core.BindingKind,
+	ownerUID core.ResourceUID, bindingKey string,
+) (core.CredentialRecord, error) {
+	normalizedKind, err := normalizeCredentialOwnerKind(kind, bindingKey)
+	if err != nil {
+		return core.CredentialRecord{}, err
+	}
+	uid, err := core.ParseResourceUID(string(ownerUID))
+	if err != nil {
+		return core.CredentialRecord{}, err
+	}
+	row := s.db.read.QueryRowContext(ctx,
+		`SELECT `+credentialColumns+` FROM credentials
+		  WHERE owner_kind = ? AND owner_uid = ? AND binding_key = ?`,
+		string(normalizedKind), string(uid), strings.TrimSpace(bindingKey))
+	rec, err := scanCredential(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.CredentialRecord{}, fmt.Errorf("%w: 资源 %s 的绑定键 %s 没有凭据",
+			core.ErrResourceNotFound, uid, strings.TrimSpace(bindingKey))
 	}
 	if err != nil {
 		return core.CredentialRecord{}, fmt.Errorf("读取资源 %s 的凭据: %w", uid, err)
@@ -468,12 +505,12 @@ func credentialByID(ctx context.Context, q queryer, credentialID string) (core.C
 func insertCredentialTx(ctx context.Context, ex sqlExecutor, rec core.CredentialRecord) error {
 	if _, err := ex.ExecContext(ctx,
 		`INSERT INTO credentials
-		   (credential_id, owner_kind, owner_uid, owner_name, state, current_version,
-		    revocation_epoch, key_id, created_at, updated_at, operation_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.ID, string(rec.OwnerKind), string(rec.OwnerUID), rec.OwnerName, string(rec.State),
-		rec.CurrentVersion, rec.RevocationEpoch, rec.KeyID, rec.CreatedAt, rec.UpdatedAt,
-		rec.OperationID); err != nil {
+		   (credential_id, owner_kind, owner_uid, binding_key, owner_name, state,
+		    current_version, revocation_epoch, key_id, created_at, updated_at, operation_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, string(rec.OwnerKind), string(rec.OwnerUID), rec.BindingKey, rec.OwnerName,
+		string(rec.State), rec.CurrentVersion, rec.RevocationEpoch, rec.KeyID, rec.CreatedAt,
+		rec.UpdatedAt, rec.OperationID); err != nil {
 		return fmt.Errorf("写入凭据 %s: %w", rec.ID, err)
 	}
 	return nil
@@ -503,7 +540,7 @@ func scanCredential(row interface{ Scan(...any) error }) (core.CredentialRecord,
 		ownerUID  string
 		state     string
 	)
-	err := row.Scan(&rec.ID, &ownerKind, &ownerUID, &rec.OwnerName, &state,
+	err := row.Scan(&rec.ID, &ownerKind, &ownerUID, &rec.BindingKey, &rec.OwnerName, &state,
 		&rec.CurrentVersion, &rec.RevocationEpoch, &rec.KeyID, &rec.CreatedAt,
 		&rec.UpdatedAt, &rec.OperationID)
 	if err != nil {
@@ -540,7 +577,7 @@ func normalizeCredentialPair(identity core.CredentialRecord, version core.Creden
 	if err := validateCredentialID(identity.ID); err != nil {
 		return core.CredentialRecord{}, core.CredentialVersionRecord{}, err
 	}
-	ownerKind, err := core.ParseBindingKind(string(identity.OwnerKind))
+	ownerKind, err := normalizeCredentialOwnerKind(identity.OwnerKind, identity.BindingKey)
 	if err != nil {
 		return core.CredentialRecord{}, core.CredentialVersionRecord{}, err
 	}
@@ -598,6 +635,31 @@ func normalizeCredentialPair(identity core.CredentialRecord, version core.Creden
 		return core.CredentialRecord{}, core.CredentialVersionRecord{}, err
 	}
 	return identity, version, nil
+}
+
+// normalizeCredentialOwnerKind 校验属主类别与绑定键的组合（与 schema 的 CHECK 同口径）：
+// `mcp_server` 必须有合法槽位名（env 键名或头名）作绑定键（一个 server 的多个槽位各自独立），其余
+// 属主类别必须为空串（"一个资源实例至多一条凭据"的语义因此原样保留）。两者错配一律
+// 在写库前拒绝，错误不回显绑定键原值——它可能是误贴进来的凭证。
+// normalizeCredentialOwnerKind enforces the owner-kind/binding-key pairing before the
+// schema CHECK sees it; the error never echoes the raw key, which may be a credential.
+func normalizeCredentialOwnerKind(kind core.BindingKind, bindingKey string) (core.BindingKind, error) {
+	if !core.IsCredentialOwnerKind(kind) {
+		return "", fmt.Errorf("%w: 未知的凭据属主类别 %q", core.ErrCredentialOwnerMismatch, kind)
+	}
+	key := strings.TrimSpace(bindingKey)
+	if kind == core.BindingMCPServer {
+		if _, ok := core.MCPBindingKey(key); !ok {
+			return "", fmt.Errorf("%w: mcp_server 凭据必须带合法槽位名（env 键名或头名）作 binding_key",
+				core.ErrCredentialOwnerMismatch)
+		}
+		return kind, nil
+	}
+	if key != "" {
+		return "", fmt.Errorf("%w: %s 凭据不得带 binding_key（一个实例至多一条凭据）",
+			core.ErrCredentialOwnerMismatch, kind)
+	}
+	return kind, nil
 }
 
 // normalizeCredentialVersion 校验版本行的形状：活动 / 在途版本必须有 12 字节 nonce 与

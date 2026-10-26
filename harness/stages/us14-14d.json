@@ -1,0 +1,729 @@
+{
+  "version": 1,
+  "id": "us14-14d-r1",
+  "approval": "Human review ① 2026-10-26 approved the US-14 incremental delivery 14D (user message: '这是我对 US-14 范围的显式增量调整，请记录批准依据，并同步修正草案 §8。原 US-14 的基线、候选、验收报告和历史结论保留。14D 单独记录新增范围、任务、验收和提交，不把新能力追认为旧验收内容。保护当前 US-14 尚未完成的收口现场；如实现会影响原候选验证，使用独立分支承载增量，集成后另留证据。'), the design baseline docs/us/us-draft-openbox.md (1157 lines, sha256 39d9b048a1cd992152a1b6553d76febebdee06de91fecf642b284858df11cc60), and constitution v4.0.0 (2026-10-26 revision of clauses 6 and 14, record in specs/014-templates-demos-release/run-state.md §6.1). This stage is a separate, additive execution mapping for 14D only: it does not modify, rebind or supersede harness/stages/us14-release.json (us14-release-r1/r5 evidence), and the original US-14 scope, checkboxes and historical records stay untouched. 14D is an increment label, not a new US number: no /us-register, no renumbering from US-16 on. Check ids map to the module card acceptance groups: schema-v6 covers FR-031 and the v5->v6 migration, secrets-init covers A1-A12, admin-login covers F1-F9, mcp-credential covers B1-B8, mcp-apply covers C1-C8, execution-profile covers D1-D12, builtin-agent covers E1-E10, full-package covers the automated half of M5, and docs-consistency covers FR-043. web-search covers FR-045 (user adjudication 2026-10-26): the industry-brief search moves from the Brave MCP to the built-in web_search tool calling the DeepSeek Search API with the agent's existing DeepSeek model credential; the call is explicitly not MCP evidence, BRAVE_API_KEY is no longer required, body retrieval stays on Fetch, and only 408/429/5xx may retry (max 2). REQUIRED_TESTS RECORDED FROM THE START (user correction 2026-10-26): every Go test check names its complete required_tests now, and a missing test fails rather than skips. The earlier draft deferred them to keep --lint-stages green; that was wrong because --lint-stages is only a read-only existence preflight, while the executor loader (scripts/acceptance/config.go:195) refuses a stage Go test check without named required_tests — the user reproduced it with `go run ./scripts/acceptance --stage harness/stages/us14-14d.json --task T079` -> 'schema-v6: stage Go test check requires named required_tests', exit status 2. So this stage is a deliberate red-state baseline: until the implementation lands, checks fail on missing test names and --lint-stages reports them; that red state is the intended evidence, never a reason to omit the assertion. Each task turns its checks green by landing exactly these names. Check argv is aligned to its required_tests set: admin-login adds ^TestInstanceSecrets_AdminTokenSeparateFile to its -run because that test lives in the instance-secrets file but judges the login password source; docs-consistency pairs TestPublicDocs_UseAgentFlag with TestDocs14D_FactsMatchImplementation. ADDITIVE REVISION 1 (2026-10-26, same approval): T081 gained the new policy-scope check (TestNetworkPolicyStore_ScopesIndependent) because schema-v6 only selects ^TestMigrate and would have left the two-scope read/write split unjudged; no existing check, assertion or task mapping was removed or weakened. required_tests are control-side exact anchors: implementation names must match or the stage is extended additively with a recorded rationale, never weakened. full-package only automates the Windows build-unpack-start-login smoke from the built candidate; the WSL2 Ubuntu install (M5) and every other manual item (M1-M8) stay human and unverified until actually executed, and a single-platform reading never substitutes for both. Real external services (model providers, GitHub PAT, Brave, real notification receivers, package registries for Node/Python runtimes) remain unauthorized: fixtures only, marked unverified. This stage is local-only because inputs include the private docs/us module card; it must not enter harness/stages/current.json or CI and grants no approval by itself. ADDITIVE REVISION 2 (2026-10-26, during T082): three tasks had no named anchor of their own and would have passed on another task's tests — T100 (McpServerDiagnosis dependency/references axes) had only the B1-B8 credential names, T103 (execution_policy storage plus PUT If-Match) had no storage anchor at all, and T110 (GET /sandbox extension plus denied-domains and network-exceptions endpoints) had no API anchor while TestSandbox_ViewShapeMatchesContract stayed unrequired. This revision only adds names and packages: mcp-credential gains TestMCPDiagnostics_DependencyAxis, TestMCPDiagnostics_ReferencesAxis and TestMCPContracts_DiagnosticsResponse with ^TestMCPDiagnostics|^TestMCPContracts_DiagnosticsResponse in its -run; execution-profile gains TestExecutionProfile_StorageIsRuntimeSource, TestExecutionProfile_UpdateCAS, TestExecutionProfile_DeniedDomainsAPI, TestExecutionProfile_NetworkExceptionsAPI and TestSandbox_ViewShapeMatchesContract, with ./internal/web added to its packages and ^TestSandbox_ViewShapeMatchesContract in its -run; T089 also maps to builtin-agent because its deliverable (new-instance detection and first-start config) is judged by E7/E9/E10 there. No existing check, required test, task mapping or assertion was removed or weakened; the anchors are red until the owning task lands, which is the intended evidence. Commit, push and tag remain the user's. ADDITIVE REVISION 3 (2026-10-26, during T110): two additive changes, no assertion removed or weakened. (a) The sandbox projection test TestSandbox_ExecutionProfileProjection was invisible to every check - the -run regex matched only ^TestSandbox_ViewShapeMatchesContract, so the test executed in the package suite but no check selected it; it is now in both -run and required_tests, which is what actually holds the execution_profile / execution_policy projection (live row wins with the shared ETag, revision 0 falls back to strict + config_seed + empty ETag). (b) D7's symlink-rename clause moved from a subtest of TestExecutionProfile_ShellNameSet to its own top-level TestExecutionProfile_ShellNameSymlink: creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows, and execute.go checkTests treats a skipped subtest of a required test as a failure, so an unprivileged platform held the whole D1-D12 family red for an environment reason. The clause and its assertions are unchanged and still run wherever symlinks can be created; on this machine the skip is recorded against the new top-level name in skipped_tests (the only entry in the execution-profile report) and is never counted as a pass. TestExecutionProfile_ShellNameSet still requires its two policy subtests and runner_refuses_before_spawn. Residual risk, stated plainly: without Developer Mode the symlink clause is unverified on this machine and must be re-read from a Linux run. ADDITIVE REVISION 4 (2026-10-26, T124 closeout): three checks were added because 14D's own stage had no anchor for three surfaces its changes actually touch - script-tests (the 24 industry-brief business-count cases: with the search endpoint a compile-time constant, D5's success-path counts can only be judged at script level, and the e2e run covers the refusal path), template-quality (the egress-boundary documentation test that caught the industry-brief README heading regression in the T124 make e2e run) and legacy-d1 (the http endpoint regression whose loopback probes now need ip_port access exceptions under basic protection). No existing check, required test, threshold, -run branch or task mapping was removed or relaxed; the three additions reuse the exact argv and required_tests already frozen in us14-release.json.\n\nADDITIVE REVISION 5 (2026-10-27, review-2 remediation): under the user ruling that public gates must be self-sufficient, the required inputs no longer include the private module card docs/us/us-draft-openbox.md and the four private design docs were removed from protect. A fresh clone must be able to load and run this stage; the fix was explicitly not allowed to delete checks or turn public mandatory items into silent skips, so every check, required test, argv and task mapping stays exactly as approved, and the module card remains recorded above as the design baseline. This supersedes only the private-input reason for staying local-only; the rest of that sentence stands: the stage grants no approval by itself, and whether it enters current.json or CI remains a separate decision.",
+  "inputs": [
+    "specs/014-templates-demos-release/spec.md",
+    "specs/014-templates-demos-release/plan.md",
+    "specs/014-templates-demos-release/tasks.md",
+    "harness/acceptance.json",
+    "docs/contracts/schema.sql",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/run-and-errors.md",
+    "docs/Operations.md",
+    "go.mod",
+    "go.sum",
+    "Makefile",
+    ".specify/memory/constitution.md"
+  ],
+  "protect": [
+    "internal",
+    "examples",
+    "assets/console/src",
+    "assets/console/dist",
+    "docs/contracts",
+    "docs/Operations.md",
+    "go.mod",
+    "go.sum",
+    "Makefile",
+    "harness/acceptance.json",
+    "scripts/check-acceptance.sh",
+    "scripts/check-acceptance.ps1",
+    ".github/workflows/ci.yml",
+    "harness/stages/us14-release.json",
+    "harness/stages/current.json",
+    ".specify/memory/constitution.md"
+  ],
+  "checks": [
+    {
+      "id": "go-build",
+      "args": [
+        "go",
+        "build",
+        "./..."
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "id": "contract-yaml",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "-run",
+        "^TestOpenAPI_ViewEnumsMatchGoLiterals$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestOpenAPI_ViewEnumsMatchGoLiterals"
+      ]
+    },
+    {
+      "id": "schema-v6",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestMigrate"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestMigrate_V5ToV6",
+        "TestMigrate_Idempotent",
+        "TestMigrate_KeepsRows"
+      ]
+    },
+    {
+      "id": "policy-scope",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/storage",
+        "-run",
+        "^TestNetworkPolicyStore"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestNetworkPolicyStore_ScopesIndependent"
+      ]
+    },
+    {
+      "id": "contracts-14d",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/web",
+        "./internal/storage",
+        "-run",
+        "^TestContracts14D"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestContracts14D_EnumsMatchGoLiterals",
+        "TestContracts14D_SchemaMatchesMigration"
+      ]
+    },
+    {
+      "id": "secrets-init",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^TestInstanceSecrets"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestInstanceSecrets_FirstStartGenerates",
+        "TestInstanceSecrets_MissingKeyRecoveryRequired",
+        "TestInstanceSecrets_KeyIDMismatch",
+        "TestInstanceSecrets_ConcurrentSingleWinner",
+        "TestInstanceSecrets_AdoptAfterRecordFailure",
+        "TestInstanceSecrets_ExistingInstanceNotAutoInit",
+        "TestInstanceSecrets_AdoptMatchesCiphertext",
+        "TestInstanceSecrets_RefusesOverwrite",
+        "TestInstanceSecrets_DistinctPerInstance",
+        "TestInstanceSecrets_RecoversPublicationResidue",
+        "TestInstanceSecrets_UnprovableProvenanceRecovery",
+        "TestInstanceSecrets_WindowsDACLBeforeWrite"
+      ]
+    },
+    {
+      "id": "admin-login",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "./internal/web",
+        "-run",
+        "^TestAdminToken|^TestAdminLogin|^TestInstanceSecrets_AdminTokenSeparateFile"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestAdminToken_Unauthenticated401",
+        "TestAdminToken_AcceptsInstanceFile",
+        "TestAdminToken_NoLocalTrustFallback",
+        "TestAdminToken_NonTTYNoValue",
+        "TestAdminToken_InteractiveOnce",
+        "TestAdminLogin_FixedCopy",
+        "TestInstanceSecrets_AdminTokenSeparateFile"
+      ]
+    },
+    {
+      "id": "mcp-credential",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "./internal/web",
+        "-run",
+        "^TestMCPCredential|^TestMCPDiagnostics|^TestMCPContracts_DiagnosticsResponse"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestMCPCredential_NoPlaintextAnywhere",
+        "TestMCPCredential_PerKeyVersions",
+        "TestMCPCredential_RevokeNoEnvFallback",
+        "TestMCPCredential_EditKeepsManagedValues",
+        "TestMCPCredential_HeaderEnvGate",
+        "TestMCPCredential_ArgsPlaceholderRejected",
+        "TestMCPCredential_SourceExplicit",
+        "TestMCPCredential_BearerAssembly",
+        "TestMCPDiagnostics_DependencyAxis",
+        "TestMCPDiagnostics_ReferencesAxis",
+        "TestMCPContracts_DiagnosticsResponse"
+      ]
+    },
+    {
+      "id": "mcp-apply",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/app",
+        "./internal/tool",
+        "-run",
+        "^TestMCPApply"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestMCPApply_OnlyTargetReplaced",
+        "TestMCPApply_FailureKeepsApplied",
+        "TestMCPApply_DrainWindow",
+        "TestMCPApply_OldRunSnapshotUnchanged",
+        "TestMCPApply_PreflightRefuses",
+        "TestMCPApply_SupersededByConcurrent",
+        "TestMCPApply_CASRollback",
+        "TestMCPApply_RevokeImmediate"
+      ]
+    },
+    {
+      "id": "execution-profile",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "./internal/app",
+        "./internal/storage",
+        "./internal/web",
+        "-run",
+        "^TestExecutionProfile|^TestNetGuard|^TestSandbox_ViewShapeMatchesContract|^TestSandbox_ExecutionProfileProjection"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestExecutionProfile_StandardBaseline",
+        "TestExecutionProfile_AuthorizationParity",
+        "TestExecutionProfile_ProgramDirRequiresThree",
+        "TestExecutionProfile_FileWriteDenied",
+        "TestExecutionProfile_NetworkException",
+        "TestExecutionProfile_MigrationStrict",
+        "TestExecutionProfile_ShellNameSet",
+        "TestExecutionProfile_BothProfilesSameBaseline",
+        "TestExecutionProfile_CmdBatNotExempt",
+        "TestExecutionProfile_DeniedDomain",
+        "TestExecutionProfile_WhitelistResolvedProtected",
+        "TestExecutionProfile_StorageIsRuntimeSource",
+        "TestExecutionProfile_UpdateCAS",
+        "TestExecutionProfile_DeniedDomainsAPI",
+        "TestExecutionProfile_NetworkExceptionsAPI",
+        "TestNetGuard_DialMatchesResolution",
+        "TestNetGuard_NoEnvProxy",
+        "TestSandbox_ViewShapeMatchesContract",
+        "TestSandbox_ExecutionProfileProjection"
+      ]
+    },
+    {
+      "id": "builtin-agent",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=e2e",
+        "-count=1",
+        "./internal/e2e",
+        "-run",
+        "^TestUS14D"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS14D_AgentsDisabledAfterInstall",
+        "TestUS14D_MCPAutoPublishedOnCredential",
+        "TestUS14D_StartupIsolation",
+        "TestUS14D_FixtureEndToEnd",
+        "TestUS14D_DisabledNotScheduled",
+        "TestUS14D_EnableBlockedWithoutConfig",
+        "TestUS14D_FreshInstanceBudgetPreset",
+        "TestUS14D_BudgetCompatNotices",
+        "TestUS14D_ConfigEffectiveThisStart",
+        "TestUS14D_ExistingNoConfigUntouched"
+      ]
+    },
+    {
+      "id": "full-package",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=e2e",
+        "-count=1",
+        "./internal/e2e",
+        "-run",
+        "^TestFullPackage"
+      ],
+      "timeout_seconds": 1800,
+      "required_tests": [
+        "TestFullPackage_WindowsInstallSmoke",
+        "TestFullPackage_ReportsMeasuredSize"
+      ]
+    },
+    {
+      "id": "web-search",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/tool",
+        "-run",
+        "^TestWebSearch"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestWebSearch_ParsesResults",
+        "TestWebSearch_RunsWithoutBraveEnv",
+        "TestWebSearch_Retry429Bounded",
+        "TestWebSearch_NoRetry401",
+        "TestWebSearch_NoSecretInAudit",
+        "TestWebSearch_CountsBudget",
+        "TestWebSearch_FailureLeavesNoSources"
+      ]
+    },
+    {
+      "id": "console-test",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "test"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "console-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "docs-consistency",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/cli",
+        "-run",
+        "^TestPublicDocs_|^TestDocs14D"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestPublicDocs_UseAgentFlag",
+        "TestDocs14D_FactsMatchImplementation"
+      ]
+    },
+    {
+      "id": "script-tests",
+      "args": [
+        "py",
+        "-3",
+        "scripts/run-example-tests.py"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "id": "template-quality",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=e2e",
+        "-count=1",
+        "./internal/e2e",
+        "-run",
+        "^(TestTemplates_.*|TestMCPEgress_Documentation)$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestTemplates_LoadAndTools",
+        "TestTemplates_TierEvidence",
+        "TestMCPEgress_Documentation"
+      ]
+    },
+    {
+      "id": "legacy-d1",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=e2e",
+        "-count=1",
+        "./internal/e2e",
+        "-run",
+        "^TestLegacyD1_HttpEndpoints$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestLegacyD1_HttpEndpoints"
+      ]
+    },
+    {
+      "id": "stage-lint",
+      "args": [
+        "go",
+        "run",
+        "./scripts/acceptance",
+        "--lint-stages",
+        "--stage",
+        "harness/stages/us14-14d.json"
+      ],
+      "timeout_seconds": 1800
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T079",
+      "checks": [
+        "schema-v6"
+      ]
+    },
+    {
+      "id": "T080",
+      "checks": [
+        "schema-v6"
+      ]
+    },
+    {
+      "id": "T081",
+      "checks": [
+        "schema-v6",
+        "policy-scope"
+      ]
+    },
+    {
+      "id": "T082",
+      "checks": [
+        "contracts-14d"
+      ]
+    },
+    {
+      "id": "T083",
+      "checks": [
+        "contracts-14d"
+      ]
+    },
+    {
+      "id": "T084",
+      "checks": [
+        "contracts-14d"
+      ]
+    },
+    {
+      "id": "T085",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T086",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T087",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T088",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T089",
+      "checks": [
+        "secrets-init",
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T090",
+      "checks": [
+        "admin-login"
+      ]
+    },
+    {
+      "id": "T091",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T092",
+      "checks": [
+        "secrets-init"
+      ]
+    },
+    {
+      "id": "T093",
+      "checks": [
+        "admin-login"
+      ]
+    },
+    {
+      "id": "T094",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T095",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T096",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T097",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T098",
+      "checks": [
+        "mcp-apply"
+      ]
+    },
+    {
+      "id": "T099",
+      "checks": [
+        "mcp-apply"
+      ]
+    },
+    {
+      "id": "T100",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T101",
+      "checks": [
+        "mcp-credential"
+      ]
+    },
+    {
+      "id": "T102",
+      "checks": [
+        "mcp-apply"
+      ]
+    },
+    {
+      "id": "T103",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T104",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T105",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T106",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T107",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T108",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T109",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T110",
+      "checks": [
+        "execution-profile"
+      ]
+    },
+    {
+      "id": "T111",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T112",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T113",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T114",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T115",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T116",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T117",
+      "checks": [
+        "full-package"
+      ]
+    },
+    {
+      "id": "T118",
+      "checks": [
+        "full-package"
+      ]
+    },
+    {
+      "id": "T119",
+      "checks": [
+        "console-test",
+        "console-build"
+      ]
+    },
+    {
+      "id": "T120",
+      "checks": [
+        "console-test",
+        "console-build"
+      ]
+    },
+    {
+      "id": "T121",
+      "checks": [
+        "console-test",
+        "console-build",
+        "admin-login"
+      ]
+    },
+    {
+      "id": "T122",
+      "checks": [
+        "docs-consistency"
+      ]
+    },
+    {
+      "id": "T123",
+      "checks": [
+        "docs-consistency"
+      ]
+    },
+    {
+      "id": "T124",
+      "checks": [
+        "stage-lint"
+      ]
+    },
+    {
+      "id": "T125",
+      "checks": [
+        "web-search"
+      ]
+    },
+    {
+      "id": "T126",
+      "checks": [
+        "web-search"
+      ]
+    },
+    {
+      "id": "T127",
+      "checks": [
+        "builtin-agent"
+      ]
+    },
+    {
+      "id": "T128",
+      "checks": [
+        "web-search"
+      ]
+    },
+    {
+      "id": "T129",
+      "checks": [
+        "docs-consistency"
+      ]
+    }
+  ]
+}

@@ -34,7 +34,17 @@ func TestServer_Defaults(t *testing.T) {
 	require.Equal(t, "127.0.0.1:8080", s.opts.Addr)
 	require.Equal(t, int64(defaultMaxRequestBytes), s.opts.MaxRequestBytes)
 	require.Equal(t, defaultRunTimeout, s.opts.RunTimeout)
+	require.Equal(t, defaultScheduleRunTimeout, s.opts.ScheduleRunTimeout)
 	require.Equal(t, defaultShutdownGrace, s.opts.ShutdownGrace)
+}
+
+// TestServer_ScheduleRunTimeout 覆盖手动补跑预算：缺省 300s、504 文案点名实际秒数。
+// 逆改点：补跑退回会话面的 60s → 第一个断言红；文案写死 60 → 第二个断言红。
+func TestServer_ScheduleRunTimeout(t *testing.T) {
+	s := newTestServer(t, nil)
+	require.Equal(t, 300*time.Second, s.opts.ScheduleRunTimeout,
+		"手动补跑必须与定时触发同预算")
+	require.Equal(t, "运行超过 300 秒时限", s.scheduleTimeoutMessage())
 }
 
 // TestServer_TimeoutsAndWriteBudget 逐字保留模块卡 R10（W11）。
@@ -53,9 +63,9 @@ func TestServer_TimeoutsAndWriteBudget(t *testing.T) {
 	require.Equal(t, 5*time.Second, srv.ReadHeaderTimeout)
 	require.Equal(t, 60*time.Second, srv.ReadTimeout)
 	require.Equal(t, 120*time.Second, srv.IdleTimeout)
-	require.Equal(t, 130*time.Second, srv.WriteTimeout)
-	require.Equal(t, readTimeout+s.opts.RunTimeout+writeMargin, srv.WriteTimeout,
-		"写超时必须等于 读超时 + 运行时限 + 收尾余量")
+	require.Equal(t, 370*time.Second, srv.WriteTimeout)
+	require.Equal(t, readTimeout+max(s.opts.RunTimeout, s.opts.ScheduleRunTimeout)+writeMargin, srv.WriteTimeout,
+		"写超时必须等于 读超时 + 最大运行时限 + 收尾余量")
 }
 
 // TestServer_GracefulShutdown 覆盖宽限期内的两阶段收尾（W11）：

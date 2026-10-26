@@ -46,14 +46,27 @@ const (
 // errSchedulerStarted reports a scheduler that was already started or stopped.
 var errSchedulerStarted = errors.New("scheduler: already started")
 
+// ScheduleGate 判定某个 Agent 当前是否允许被**定时**触发（14D / E5「启用才运行」）。
+// 返回 false 表示本轮不排期：不写执行行、不预写投递、不记撞锁、不发起运行。
+// 它只拦 cron 触发；管理面手动补跑不受影响——补跑是显式请求，准入失败按既有语义记
+// 一条 failed 执行行（US-10 / US-11 口径保持不变）。
+// ScheduleGate decides whether an agent may be triggered by cron right now. A false
+// answer skips the tick entirely; manual RunNow deliberately bypasses it.
+type ScheduleGate func(ctx context.Context, agent string) bool
+
 // SchedulerOptions 是调度器的全部装配输入（§3.1.2 逐字）。
 // SchedulerOptions is the full assembly input of the scheduler.
 type SchedulerOptions struct {
-	Store    TaskStore
-	Invoker  RunInvoker
-	Engine   CronEngine
-	Entries  []AgentEntry
-	CronSpec func(Schedule) (string, error) // workspace.CronSpec；唯一 CRON_TZ= 前缀出口
+	Store   TaskStore
+	Invoker RunInvoker
+	Engine  CronEngine
+	Entries []AgentEntry
+	// ScheduleGate 为 nil 时不设门（全部按任务定义的 enabled 列判定）；非 nil 时每轮
+	// cron 触发先问一次，false 即跳过。门在**每次触发**求值、不缓存，启停下一次触发
+	// 即生效。
+	// A nil gate disables the check; a non-nil gate is evaluated per tick, uncached.
+	ScheduleGate ScheduleGate
+	CronSpec     func(Schedule) (string, error) // workspace.CronSpec；唯一 CRON_TZ= 前缀出口
 	// Delivery 是系统代投端口（R7）；任务配置了 deliver_to 而这里为 nil 时，
 	// 该任务不发起运行并如实记失败——**不得**降级为"模型自己发通知"。
 	Delivery   ScheduleDelivery
@@ -69,16 +82,17 @@ type SchedulerOptions struct {
 // Scheduler keeps only registration facts in memory; runtime task state is always read
 // from the store.
 type Scheduler struct {
-	store      TaskStore
-	invoker    RunInvoker
-	engine     CronEngine
-	cronSpec   func(Schedule) (string, error)
-	delivery   ScheduleDelivery
-	budget     Budget
-	runTimeout time.Duration
-	stopGrace  time.Duration
-	logger     *slog.Logger
-	now        func() time.Time
+	store        TaskStore
+	invoker      RunInvoker
+	engine       CronEngine
+	scheduleGate ScheduleGate
+	cronSpec     func(Schedule) (string, error)
+	delivery     ScheduleDelivery
+	budget       Budget
+	runTimeout   time.Duration
+	stopGrace    time.Duration
+	logger       *slog.Logger
+	now          func() time.Time
 
 	// 构造期固化的只读快照（P-05）：registry 只当 Agent 注册表，definitions 仅供
 	// Start 对账；二者都不得回写，也不缓存运行期任务状态（约束 3）。
@@ -124,21 +138,22 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		definitions[entry.Name] = schedules
 	}
 	return &Scheduler{
-		store:       opts.Store,
-		invoker:     opts.Invoker,
-		engine:      opts.Engine,
-		cronSpec:    opts.CronSpec,
-		delivery:    opts.Delivery,
-		budget:      opts.Budget,
-		runTimeout:  opts.RunTimeout,
-		stopGrace:   opts.StopGrace,
-		logger:      opts.Logger,
-		now:         opts.Now,
-		registry:    registry,
-		definitions: definitions,
-		handles:     make(map[string]CronHandle),
-		gens:        make(map[string]uint64),
-		done:        make(chan struct{}),
+		store:        opts.Store,
+		invoker:      opts.Invoker,
+		engine:       opts.Engine,
+		scheduleGate: opts.ScheduleGate,
+		cronSpec:     opts.CronSpec,
+		delivery:     opts.Delivery,
+		budget:       opts.Budget,
+		runTimeout:   opts.RunTimeout,
+		stopGrace:    opts.StopGrace,
+		logger:       opts.Logger,
+		now:          opts.Now,
+		registry:     registry,
+		definitions:  definitions,
+		handles:      make(map[string]CronHandle),
+		gens:         make(map[string]uint64),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -305,6 +320,16 @@ func (s *Scheduler) fire(taskID string, gen uint64) {
 
 	task, baseCtx, ok := s.snapshotFireTask(taskID, gen)
 	if !ok {
+		return
+	}
+
+	// 14D / E5「启用才运行」：生命周期门在**任何落库动作之前**求值——关闭只能拦住
+	// 启动，拦不住真实执行时，观察窗口里会出现执行行与失败 Run，与设计冻结的
+	// 「disabled 状态下调度器不排期」直接冲突。门只看 cron；手动补跑不走这里。
+	// The lifecycle gate is evaluated before any write: a disabled agent must not even
+	// leave an execution row. Manual runs do not pass through fire.
+	if s.scheduleGate != nil && !s.scheduleGate(baseCtx, task.Agent) {
+		s.logger.Debug("Agent 未启用，本轮不排期", "task_id", taskID, "agent", task.Agent)
 		return
 	}
 

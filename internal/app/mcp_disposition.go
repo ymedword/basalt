@@ -11,6 +11,7 @@ package app
 import (
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -40,11 +41,14 @@ func mcpValidToolName(name string) bool {
 	return true
 }
 
-// mcpDispositionTable 是装配期一次写入、之后只读的来源表：`sources` 记每个已注册
-// 工具名的赢家来源（`builtin` 或 server 名），`byServer` 记每个 server 的计数与跳过
-// 明细。两者都只在装配期（单 goroutine 的连接回调）写入，运行期只读。
-// mcpDispositionTable is written once at assembly and only read afterwards.
+// mcpDispositionTable 是来源表：`sources` 记每个已注册工具名的赢家来源（`builtin` 或
+// server 名），`byServer` 记每个 server 的计数与跳过明细。装配期一次写入；14D 起受控
+// 重建（`mcp_server.apply`）会在运行期整组替换某个 server 的条目，因此读写都在 `mu` 内
+// ——页面读与 apply 写是并发的两条路径。
+// mcpDispositionTable is written at assembly and rewritten per server by a controlled
+// apply, so every access sits under mu.
 type mcpDispositionTable struct {
+	mu       sync.RWMutex
 	sources  map[string]string
 	byServer map[string]core.MCPToolDisposition
 }
@@ -62,9 +66,25 @@ func newMCPDispositionTable() *mcpDispositionTable {
 // 登记就是同名工具的赢家；已登记过的名字保持原样（同一内置名不会重复成功注册）。
 // recordBuiltin marks a registered builtin as the winner for its name.
 func (t *mcpDispositionTable) recordBuiltin(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if _, ok := t.sources[name]; !ok {
 		t.sources[name] = mcpDispositionBuiltin
 	}
+}
+
+// resetServer 撤下一个 server 的整组来源条目（受控重建前调用）：该 server 已登记为赢家
+// 的工具名交还出去，计数与跳过明细清零。别的归属方与内置的赢家不受影响。
+// resetServer withdraws one server's claims before its tool set is replaced.
+func (t *mcpDispositionTable) resetServer(server string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for name, winner := range t.sources {
+		if winner == server {
+			delete(t.sources, name)
+		}
+	}
+	delete(t.byServer, server)
 }
 
 // recordMCP 记一条 MCP 工具的注册结果：offered 恒 +1；空白名记 `invalid_tool`（不注册，
@@ -74,6 +94,8 @@ func (t *mcpDispositionTable) recordBuiltin(name string) {
 // recordMCP records one MCP tool: offered always grows; blank names and duplicate
 // rejections become skips; a success claims the name for its server.
 func (t *mcpDispositionTable) recordMCP(server, tool string, registerErr error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	entry, ok := t.byServer[server]
 	if !ok {
 		entry = core.MCPToolDisposition{Skipped: []core.MCPToolSkip{}}
@@ -109,10 +131,20 @@ func (t *mcpDispositionTable) recordMCP(server, tool string, registerErr error) 
 // 复制 `Skipped`，调用方改写返回值不会污染来源表。
 // view returns a defensive copy; an unknown server yields nil.
 func (t *mcpDispositionTable) view(server string) *core.MCPToolDisposition {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	entry, ok := t.byServer[server]
 	if !ok {
 		return nil
 	}
 	entry.Skipped = slices.Clone(entry.Skipped)
 	return &entry
+}
+
+// source 返回一个已注册工具名的赢家来源；未登记返回空串（调用方据此判"未知"）。
+// source reports the winning source of a registered tool name.
+func (t *mcpDispositionTable) source(name string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.sources[name]
 }

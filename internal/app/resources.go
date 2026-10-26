@@ -678,12 +678,13 @@ func (h mcpHandle) ServerName() string { return string(h) }
 // credential store is read only for the conditional ETag, and nil means no managed
 // credentials in this assembly.
 type resourceViews struct {
-	versions    *storage.ResourceStore
-	lifecycle   *workspace.LifecycleStore
-	mcp         *mcpRuntime
-	credentials *storage.CredentialStore
-	tests       core.ResourceConnectionTestStore
-	lookupEnv   func(string) (string, bool)
+	versions       *storage.ResourceStore
+	lifecycle      *workspace.LifecycleStore
+	mcp            *mcpRuntime
+	credentials    *storage.CredentialStore
+	mcpCredentials *MCPCredentialService
+	tests          core.ResourceConnectionTestStore
+	lookupEnv      func(string) (string, bool)
 }
 
 // ResourceViewDeps 是管理读面回答「本地就绪 / 上次实测」所需的两个可选来源（R7 范围
@@ -694,6 +695,10 @@ type resourceViews struct {
 type ResourceViewDeps struct {
 	ConnectionTests core.ResourceConnectionTestStore
 	LookupEnv       func(string) (string, bool)
+	// MCPCredentials 提供逐槽位的凭据来源与状态投影（契约 `McpCredentialKeyView`）。nil
+	// 表示本次装配没有凭据面：`credential_keys` 如实为空集合，**不**伪造状态。
+	// MCPCredentials supplies the per-slot credential projection; nil leaves it empty.
+	MCPCredentials *MCPCredentialService
 }
 
 // NewResourceViews 是图 A 中 `resourceViews` 的唯一构造点（卡片行 1632）。
@@ -707,7 +712,8 @@ func NewResourceViews(versions *storage.ResourceStore, lifecycle *workspace.Life
 	}
 	return &resourceViews{
 		versions: versions, lifecycle: lifecycle, mcp: mcp, credentials: credentials,
-		tests: deps.ConnectionTests, lookupEnv: lookupEnv,
+		mcpCredentials: deps.MCPCredentials,
+		tests:          deps.ConnectionTests, lookupEnv: lookupEnv,
 	}
 }
 
@@ -857,6 +863,12 @@ func (v *resourceViews) projectMCPServer(ctx context.Context, name string) (mcpS
 		Name:      name,
 		Transport: mcpTransportStdio,
 		EnvKeys:   []string{},
+		// 请求头只出名字、不出值；逐占位符的凭据来源与状态在凭据投影接入前如实为空集合
+		// （空集合输出 `[]`，不是 `null`）。
+		// Header names only; credential-key rows stay an empty array until the
+		// per-placeholder projection is wired.
+		HeaderKeys:     []string{},
+		CredentialKeys: []web.McpCredentialKeyView{},
 		// `Tools` 保持 offered 语义（注册前 server 声明的全量名单，D-06）；被谁抢走、
 		// 为什么跳过由 `ToolDisposition` 单独表达，不在这里过滤——否则页面无法区分
 		// "server 没提供"与"提供了但没赢"。
@@ -883,6 +895,23 @@ func (v *resourceViews) projectMCPServer(ctx context.Context, name string) (mcpS
 	view.Transport = mcpTransport(definition.Transport)
 	view.Command = mcpExecutable(definition.Command)
 	view.EnvKeys = sortedEnvKeys(definition.Env)
+	// 请求头同样只出名字；逐槽位的来源与状态取**声明的来源**，不按"有没有托管行"推断。
+	view.HeaderKeys = sortedEnvKeys(definition.Headers)
+	if v.mcpCredentials != nil {
+		statuses, statusErr := v.mcpCredentials.Statuses(ctx, ptr.ResourceUID, core.MCPServerConfig{
+			Name:      name,
+			Transport: definition.Transport,
+			Command:   definition.Command,
+			Args:      definition.Args,
+			URL:       definition.URL,
+			Env:       definition.Env,
+			Headers:   definition.Headers,
+		})
+		if statusErr != nil {
+			return mcpServerProjection{}, statusErr
+		}
+		view.CredentialKeys = mcpCredentialKeyViews(statuses)
+	}
 	view.PublishedVersionID = version.ID
 	view.PublishedVersionNo = version.VersionNo
 	view.AppliedVersionID = derefVersionID(ptr.AppliedVersionID)
@@ -1172,6 +1201,7 @@ type resourceMCPDefinition struct {
 	Args      []string          `yaml:"args"`
 	URL       string            `yaml:"url"`
 	Env       map[string]string `yaml:"env"`
+	Headers   map[string]string `yaml:"headers"`
 }
 
 // parseProviderDefinition 解析模型连接的发布定义原文；空原文或解析失败都报错
@@ -1212,6 +1242,22 @@ func parseMCPDefinition(id, raw string) (resourceMCPDefinition, error) {
 		definition = entries[0]
 	}
 	return definition, nil
+}
+
+// mcpCredentialKeyViews 把凭据状态投影成契约视图：顺序沿用 `MCPCredentialSlots` 的
+// 字典序，`last4` 之外不回任何凭据片段。nil 结果统一成空切片（JSON `[]`，不是 null）。
+// mcpCredentialKeyViews maps the statuses onto the contract view, never returning null.
+func mcpCredentialKeyViews(statuses []MCPCredentialStatus) []web.McpCredentialKeyView {
+	views := make([]web.McpCredentialKeyView, 0, len(statuses))
+	for _, status := range statuses {
+		views = append(views, web.McpCredentialKeyView{
+			Key:   status.Key,
+			Mode:  string(status.Mode),
+			State: string(status.State),
+			Last4: status.Last4,
+		})
+	}
+	return views
 }
 
 // mcpTransport 归一化传输方式：缺省按 v1 的唯一取值 stdio；其它取值原样投影，

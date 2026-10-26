@@ -71,13 +71,22 @@ func (s *Server) handleAdminUpdateNetworkDomains(w http.ResponseWriter, r *http.
 	s.writeOK(w, s.sandboxView())
 }
 
-// writeNetworkAllowlistError 把条件写失败映射为契约固定状态码：请求校验 400、
-// 条件不满足 412（带当前 ETag，页面据此重取）、修订号冲突 409（同样带 ETag 与
-// 操作标识）、其余 500。400 / 412 发生在预写之前，**没有**操作行，因此也不带
-// `operation_id`。
-// writeNetworkAllowlistError maps the conditional write's failures onto the fixed
-// status table; only failures after the pre-write carry an operation id.
+// writeNetworkAllowlistError 把白名单条件写失败交给共用映射表，只提供本表的公开
+// 文案与当前 ETag 端口（与禁止表同构，禁止另写一套状态码）。
+// writeNetworkAllowlistError delegates to the shared mapping with this row's text.
 func (s *Server) writeNetworkAllowlistError(w http.ResponseWriter, err error, operationID string) {
+	s.writeNetworkDomainPolicyError(w, err, operationID, s.opts.NetworkAllowlist, networkAllowlistStaleMessage)
+}
+
+// writeNetworkDomainPolicyError 是两张网络域名表（出网白名单 / 禁止表）共用的失败
+// 映射：请求校验 400、条件不满足 412（带当前 ETag）、修订号冲突 409（只带操作
+// 标识）、其余 500。两张表的写入语义逐条一致，映射**不得**分叉；调用方只替换公开
+// 文案与读取当前 ETag 的端口。
+// The shared failure mapping for both policy rows; callers only swap the public text
+// and the port that yields the current ETag.
+func (s *Server) writeNetworkDomainPolicyError(w http.ResponseWriter, err error, operationID string,
+	port core.NetworkAllowlistAdmin, staleMessage string,
+) {
 	var invalid *core.InvalidInputError
 	switch {
 	case errors.As(err, &invalid):
@@ -85,7 +94,7 @@ func (s *Server) writeNetworkAllowlistError(w http.ResponseWriter, err error, op
 		s.writeError(w, http.StatusBadRequest, codeBadRequest, invalid.Reason)
 	case errors.Is(err, core.ErrPreconditionFailed):
 		s.writeAdminDataError(w, http.StatusPreconditionFailed, codePreconditionFailed,
-			networkAllowlistStaleMessage, staleAllowlistError(s.opts.NetworkAllowlist.Current()))
+			staleMessage, staleAllowlistError(port.Current(), staleMessage))
 	case errors.Is(err, core.ErrPolicyRevisionConflict):
 		// 进程内互斥之后仍撞修订号：另一进程已写入。此时 `pending` 已写、必须带
 		// 操作标识（约束 1a）；但落败进程的内存快照可能仍落后于数据库，**不**承诺
@@ -93,9 +102,9 @@ func (s *Server) writeNetworkAllowlistError(w http.ResponseWriter, err error, op
 		// 页面重新 GET 即可拿到当前值。
 		// A CAS loser cannot vouch for the current ETag; only the operation id ships.
 		s.writeAdminDataError(w, http.StatusConflict, codeConflict,
-			networkAllowlistStaleMessage, staleAllowlistConflictError(operationID))
+			staleMessage, staleAllowlistConflictError(staleMessage, operationID))
 	default:
-		s.logger().Error("network domain allowlist conditional write failed",
+		s.logger().Error("network domain policy conditional write failed",
 			"error", err, "operation_id", operationID)
 		if operationID == "" {
 			s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
@@ -114,23 +123,23 @@ func (s *Server) writeNetworkAllowlistError(w http.ResponseWriter, err error, op
 // staleAllowlistConflictError 组装 409 的失败数据：只带操作标识，不带
 // `current_etag`——CAS 落败方无法保证自己的快照就是数据库当前值。
 // The 409 payload carries the operation id only, never a possibly stale ETag.
-func staleAllowlistConflictError(operationID string) error {
+func staleAllowlistConflictError(message, operationID string) error {
 	data := map[string]any{}
 	if operationID != "" {
 		data["operation_id"] = operationID
 	}
 	return &core.AdminError{
-		Kind: core.ErrPolicyRevisionConflict, Message: networkAllowlistStaleMessage, Data: data,
+		Kind: core.ErrPolicyRevisionConflict, Message: message, Data: data,
 	}
 }
 
 // staleAllowlistError 组装"当前 ETag（+ 可选操作标识）"的失败数据：页面按
 // `current_etag` 重排输入即可重试，**不**自动重发。
 // staleAllowlistError builds the stale-condition payload from the live snapshot.
-func staleAllowlistError(policy core.NetworkDomainPolicy, operationID ...string) error {
+func staleAllowlistError(policy core.NetworkDomainPolicy, message string, operationID ...string) error {
 	data := map[string]any{"current_etag": core.NetworkDomainETag(policy)}
 	if len(operationID) > 0 && operationID[0] != "" {
 		data["operation_id"] = operationID[0]
 	}
-	return &core.AdminError{Kind: core.ErrPreconditionFailed, Message: networkAllowlistStaleMessage, Data: data}
+	return &core.AdminError{Kind: core.ErrPreconditionFailed, Message: message, Data: data}
 }

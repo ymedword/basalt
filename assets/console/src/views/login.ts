@@ -43,7 +43,7 @@ export const LoginView = defineComponent({
     function submit(event: Event): void {
       event.preventDefault()
       if (token.value.trim() === '') {
-        error.value = '请输入管理 token'
+        error.value = '请输入访问密码'
         return
       }
       void signIn(() => {
@@ -62,10 +62,11 @@ export const LoginView = defineComponent({
         ]),
         h('section', { class: 'view view-login' }, [
         h('p', { class: 'eyebrow' }, 'WORKSPACE ACCESS'),
-        h('h1', '连接工作区'),
+        h('h1', '登录管理台'),
         h('p', { class: 'muted' }, '凭据只保存在当前页面内存；刷新或退出后需要重新输入。'),
+        h('p', { class: 'muted' }, '请输入部署者提供的访问密码'),
         h('form', { class: 'login-form', onSubmit: submit }, [
-          h('label', { for: 'console-token' }, '管理 token'),
+          h('label', { for: 'console-token' }, '访问密码'),
           h('input', {
             id: 'console-token',
             name: 'token',
@@ -79,7 +80,7 @@ export const LoginView = defineComponent({
           h(
             'button',
             { type: 'submit', class: 'primary', disabled: busy.value },
-            busy.value ? '校验中…' : '进入管理台 →',
+            busy.value ? '校验中…' : '登录',
           ),
         ]),
         h('div', { class: 'login-alt' }, [
@@ -100,17 +101,19 @@ export const LoginView = defineComponent({
         ]),
         h('details', { class: 'technical-details login-identity' }, [
           h('summary', '身份与权限说明'),
+          // 设计 §2.7 的固定口径：这是**共享访问密码**，页面不得把它说成个人账户、
+          // 角色或操作人隔离，也不使用「token / 密钥 / 管理员密码」这些词。
+          // Fixed shared-password disclosure (design §2.7); no account or role claim.
           h(
             'p',
             { class: 'muted small' },
-            '当前的「管理 token」是最小管理认证：它证明请求来自持有该凭据的管理者，不等同于个人账户，也不提供企业级身份治理。' +
-              '审计记录可以归因到这份管理凭据，但多人共用同一 token 时无法区分到具体的人。',
+            '当前为共享访问密码：持有同一密码的访问者具有相同的管理权限，系统不提供个人账户、角色或操作人隔离。',
           ),
           h(
             'p',
             { class: 'muted small' },
-            '后续规划：日常网页登录优先接入企业 SSO；自动化使用带用户或服务作用域的 API 密钥；模型厂商密钥仍属「模型连接」的凭据。' +
-              '三者用途不同，不得混用。管理员与成员会有不同权限，但可以共用一个登录入口；权限由后端按角色与资源范围校验，而不是只把按钮藏起来。',
+            '审计记录只能归因到这次访问所用的密码；多人共用同一密码时，无法区分到具体的人。' +
+              '后续规划：网页登录优先接入企业 SSO；自动化使用带作用域的 API 密钥；模型厂商凭据仍属「模型连接」，三者用途不同，不得混用。',
           ),
         ]),
         error.value === '' ? null : h(Notice, { tone: 'error', text: error.value }),

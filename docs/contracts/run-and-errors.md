@@ -346,7 +346,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 预算项 | 缺省值 | 超限行为 |
 | --- | --- | --- |
 | `MaxIterations` | 10（Profile 可覆盖） | `limit_reached` |
-| `RunTimeout` | 60 秒（REST 单次调用）/ 300 秒（定时任务） | `cancelled`，`Reason=超过运行时限` |
+| `RunTimeout` | 60 秒（REST 单次调用）/ 300 秒（定时任务与手动补跑 `POST /schedules/{id}/run`） | `cancelled`，`Reason=超过运行时限`；504 文案点名实际生效秒数 |
 | `ToolTimeout` | 30 秒（Profile 可覆盖） | 该次工具调用失败（`timeout`），**Run 继续**——模型看得到失败并能换个做法 |
 | `MaxToolCalls` | 50 | `limit_reached`，`Reason=工具调用次数超限`；本轮剩余调用逐个合成「未执行（工具调用次数超限）」（§4.4） |
 | `MaxOutputBytes` | 单工具输出 256 KB | 截断 + 标记 `truncated: true` 回填模型 |
@@ -416,6 +416,17 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `runtime_error` | 运行时错误 | 进程启动失败、编码错误 |
 | `unknown` | 无法归类 | 崩溃恢复时的 pending 行 |
 
+**`sandbox_denied` 的细分原因（14D 起）**：统一的"策略拒绝"无法解释"该改哪一条"，因此工具结果与运行记录另带 `policy_denial_reason`，取值固定四类：
+
+| `policy_denial_reason` | 触发 |
+| --- | --- |
+| `profile_denied` | 档位授权范围拒绝（`strict` 档下目标不在白名单等），与具体地址无关 |
+| `denied_domain` | 命中 `http.denied_domains`（两档都先生效，不再看白名单） |
+| `protected_address` | 解析结果落在受保护地址段（私有 / 回环 / 链路本地 / 云元数据） |
+| `exception_missing` | 该地址本可由访问例外放行，但当前没有生效例外 |
+
+四类互斥且必须可区分：`error_kind` 仍是 `sandbox_denied`（向外层分类不变），`policy_denial_reason` 只作细分；**不得**把四类压回一个字段值，也不得在运行记录里只留自由文本。
+
 ### 7.4 存什么、不存什么
 
 **存**：完整入参、完整结果（超 256 KB 截断并标记）、失败原文（截断到 4 KB）、耗时、轮次、模型与供应商、token 计量、配置快照版本。
@@ -455,6 +466,10 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 409 | `RESOURCE_SCOPE_IN_USE` | 共享转专属时仍被其他 Agent 绑定、活动 Run 或消息路由引用 | 点名全部引用者；不提供 force，不自动解绑 |
 | 409 | `RESOURCE_UID_MISMATCH` | 请求携带的 `resource_uid` 与该名称当前指针不一致 | 给出当前 UID（可公开部分）；不按名猜测 |
 | 409 | `CREDENTIAL_OWNER_MISMATCH` | 试图把凭据绑定到其他资源 UID，或借用其他资源的凭据 ID | 点名凭据与目标资源；不跨资源复用 |
+| 409 | `SECRETS_RECOVERY_REQUIRED` | 实例加密处于恢复态（密钥文件缺失 / 损坏 / `key_id` 与记录不符 / 发布残留来源不可证明），任何以密文为前提的操作被拒（含托管凭据解密、`POST /instance/secrets/init`） | 点名恢复态与恢复入口；**不**生成替代密钥、**不**回落 env、**不**删除来源不明的文件 |
+| 409 | `EXECUTION_PROFILE_MISMATCH` | `PUT /execution-policy` 的 `expected_profile` 与库内当前档位不一致 | 给出当前档位；零写入、零操作行；与修订号 CAS 的 `CONFLICT` 分开 |
+| 409 | `MCP_APPLY_SUPERSEDED` | `apply` 期间发生 publish / revoke / 另一次 `apply`，本次被取代 | 点名取代者配置的 `superseded_by`；候选注册与候选连接已撤回，`applied` 与旧连接不变 |
+| 500 | `MCP_APPLY_FAILED` | `apply` 在预检之后的启动 / 握手阶段失败，候选已可靠回收 | 点名 `failure_class` 与目标版本；`data.operation_id` 供查证；旧连接状态如实说明（含"旧连接也不合法"的情形） |
 | 409 | `AGENT_COPY_BLOCKED` | 复制源 Agent 引用了源 Agent 专属资源，且未提供显式映射 | 列出需要映射的资源名与类型；不产生副本 |
 | 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
 | 429 | `TOO_MANY_RUNS` | 实例级并发超限 | 给出当前上限 |
@@ -527,10 +542,17 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
   - `local_trust` → `actor_subject = local_trust`，语义为“未验证个人身份”
   - CLI → `actor_subject = cli:<本机用户>`；不冒充管理台登录身份
   - 迁移 → `actor_subject = migration`
-- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.test` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `system.baseline_v2` / `system.baseline_v3` / `network_allowlist.update`
-- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system` / `network_allowlist`
+- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.test` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `mcp_server.apply` / `mcp_server.credential.revoke` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `system.baseline_v2` / `system.baseline_v3` / `system.secrets_init` / `network_allowlist.update` / `network_denylist.update` / `network_exception.create` / `network_exception.delete` / `execution_policy.update` / `execution_policy.confirm`
+- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system` / `network_allowlist` / `network_denylist` / `network_exception` / `execution_policy`
 - 凭据与范围动作的 `target_id` = 资源 `resource_uid`（不是名称）；`detail_json` 只记资源名、`credential_id`、版本号、模式与状态，**不记明文 URL / 密钥 / 主密钥**。资源更新若同时改变凭据，按主操作写一条 `*.update`，不重复拆成两条互不相关的动作
 - `network_allowlist.update` 的 `target_id` = `policy_scope` 固定字面量 `http.allowed_domains`；`detail_json` 只记 `before_revision` / `after_revision` / `candidate_sha256`（规整域名按行连接的摘要），供启动恢复三态判定，不另存请求体
+- `network_denylist.update` 与上一条逐字同口径，`target_id` = `http.denied_domains`；白名单与禁止域名共用一张表但**不共用动作名**，读侧按 `target_kind` + `target_id` 就能区分两行
+- `network_exception.create` / `network_exception.delete` 的 `target_id` = `exception_id`；`detail_json` 记 `kind` / `value` / `note`（放行理由必填，属审计内容）与前后集合摘要，**不**记请求体其余字段
+- `execution_policy.update` 的 `target_id` = 固定字面量 `global`；`detail_json` 只记 `before_profile` / `after_profile` / `before_revision` / `after_revision`，**不**放待确认项正文
+- `execution_policy.confirm` 的 `target_id` = 待确认项 id（`<axis>:<value>`）；`detail_json` 只记 `axis` 与 `decision`，**不**记解析到的地址集合（它随时会变，落库只会制造陈旧证据）
+- `mcp_server.apply` 的 `target_id` = 资源 `resource_uid`；`detail_json` 固定键集为 `target_version_id` / `previous_version_id` / `applied_version_id` / `outcome` / `failure_class` / `superseded_by` / `drain_deadline`，**不**记 command / args / env / 头值
+- `mcp_server.credential.revoke` 的 `target_id` = 资源 `resource_uid`，`detail_json` 记 `binding_key`、被撤销的版本号、撤销前后 `revocation_epoch` 与状态；**不**记值、不记 `last4` 以外的任何片段
+- `system.secrets_init` 的 `target_id` = 固定字面量 `master_key`；`detail_json` 只记 `key_id`、`fingerprint`（可公开的密钥材料摘要）与 `recovered`（是否走了残留恢复），**不**记路径、不记密钥材料
 - 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）；通知渠道测试**也要写**（它会对外发送一条 `Basalt 连通性测试`），同样不产生 Run、不伪造模型工具调用
 - `agent.generate_files` 字面量保留，但该端点**不写**管理操作行（唯一写入是 LLM 调用审计）；实现**不得**据字面量补恢复行、伪造操作或把草稿当变更
 - 管理操作审计与模型 / 工具调用审计**互不混写**；同一请求不得既写 `management_operations` 又把变更伪装成一次 Run
@@ -547,11 +569,17 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `schedule.enable` / `schedule.disable` | `scheduled_tasks.enabled` 与 operation_id | 目标值已写 | 仍是旧值 | 行不存在或多行冲突 |
 | `model_connection.*` / `mcp_server.*` / `skill.*` | 定义文件 / 版本行 / 发布指针 / 删除标记 | 指针或删除标记指向候选版本 | 仍指向旧版本 / 未删除 | 文件与指针不一致 |
 | `notify_channel.*` | 行存在性与脱敏字段哈希 | 与候选一致 | 仍是旧值 / 不存在 | 行存在但字段被第三方改写 |
-| `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` | **四证**：`operation_id`、DB 提交事实（凭据行 / 版本行 / `revocation_epoch` / 资源 `revision`）、凭据版本号、目标绑定哈希 | 四证一致且全部指向候选终态 | 可证明未提交：旧状态完好且无候选版本行 | 任一证据缺失、彼此矛盾或只对上一部分 → `unknown`；**不得**重新加密、重放撤销或自动补写 |
+| `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `mcp_server.credential.revoke` | **四证**：`operation_id`、DB 提交事实（凭据行 / 版本行 / `revocation_epoch` / 资源 `revision`）、凭据版本号、目标绑定哈希（MCP 逐键撤销另含 `binding_key`） | 四证一致且全部指向候选终态 | 可证明未提交：旧状态完好且无候选版本行 | 任一证据缺失、彼此矛盾或只对上一部分 → `unknown`；**不得**重新加密、重放撤销或自动补写 |
 | `model_connection.test` / `mcp_server.test` / `notify_channel.test` | `detail_json` 是否已有完整结果 | 已有结果 | 未发出调用（可证明） | 无法区分是否已发出 → `unknown`，**不得重发**；通知测试即使成功也不补发第二条消息 |
 | `system.baseline_v2` | 各资源基线版本 / 指针 / 状态文件 | 全部完成 | 可证明未开始 | 部分完成 → 继续补齐缺失项（确定性幂等，不是重做已生效变更） |
 | `system.baseline_v3` | 活动区各 Agent 状态文件的 `schema_version` 与 `agent_uid`，以及 `agent_lifecycle` 镜像 | 全部为 schema 2 且 UID 合法、镜像一致 | 全部仍为 schema 1 / 无 UID（可证明未写入） | 部分升级、文件损坏或镜像与文件不一致 → `unknown`；**不得**给同一 Agent 补发第二个 UID |
-| `network_allowlist.update` | `network_domain_policy` 单行（`policy_scope = http.allowed_domains`）的 `revision` 与域名摘要，对照 `detail_json` 的 `before_revision` / `after_revision` / `candidate_sha256` | `revision = after_revision` 且摘要与 `candidate_sha256` 一致 | `revision = before_revision` | 行缺失、读库失败或 `revision` 是第三个值 → `unknown`；**不得**重放写入 |
+| `network_allowlist.update` / `network_denylist.update` | 对应 `network_domain_policy` 单行（`policy_scope` 分别为 `http.allowed_domains` / `http.denied_domains`）的 `revision` 与域名摘要，对照 `detail_json` 的 `before_revision` / `after_revision` / `candidate_sha256` | `revision = after_revision` 且摘要与 `candidate_sha256` 一致 | `revision = before_revision` | 行缺失、读库失败或 `revision` 是第三个值 → `unknown`；**不得**重放写入 |
+| `network_exception.create` | `network_exceptions` 行（按 `exception_id` + `operation_id`） | 行存在且 `operation_id` 一致 | 无该行（可证明未写入） | 行存在但 `operation_id` 不一致（同 `(kind, value)` 已被他人占用）→ `unknown`；**不得**改写已有行 |
+| `network_exception.delete` | 该 `exception_id` 是否仍存在，以及集合摘要 | 行已不存在 | 行仍在且内容未被改写 | 行不存在但同 `(kind, value)` 已出现 `operation_id` 不同的新行 → `unknown`；**不得**再删一次 |
+| `execution_policy.update` | `execution_policy` 单行（`policy_scope = 'global'`）的 `profile` 与 `revision`，对照 `detail_json` 的 `before_profile` / `after_profile` / `before_revision` / `after_revision` | `profile = after_profile` 且 `revision = after_revision` | `profile = before_profile` 且 `revision = before_revision` | 档位与修订号分别对上前 / 后两侧，或 `revision` 是第三个值 → `unknown`；**不得**重放 |
+| `execution_policy.confirm` | 只查证处置行本身：是否存在同一 `target_id` 且 `status = 'success'` 的 `execution_policy.confirm` 行 | 存在 `success` 行 | **不存在**（只有本 `pending` 行或无行） | 存在多个互相矛盾的处置行 → `unknown`。本动作没有"半个处置"：失败的复核按 fail-closed 记 `failed`，条目继续留在待确认列表，由人重做；**不得**把 `pending` 行补成 `success` |
+| `mcp_server.apply` | `applied` 指针（`applied_version_id`）与注册 epoch，对照 `detail_json` 的 `target_version_id` / `previous_version_id` | 指针 = `target_version_id` | 指针 = `previous_version_id` | 指针是第三个版本，或版本行已不存在 → `unknown`。候选注册与候选连接是进程内的，重启后自然消失；**不得**据 `pending` 行重放 `apply` |
+| `system.secrets_init` | `instance_secrets` 记录与密钥文件（走完整 `LoadMasterKey` + 来源可证明的残留恢复规则） | 记录存在、`key_id` 一致、文件校验通过且 `nlink` 已回到 1 | 记录不存在且可证明未创建任何文件（含临时链接） | 记录缺失但文件存在、或文件存在而来源不可证明 → `unknown` 并进恢复态；**不得**删除文件、**不得**生成第二把密钥 |
 
 - `applied` → `success`；`not_applied` → `failed`；其余 → `unknown`；写 `recovered_at` 与 `verification`
 - 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试；凭据动作**不得**重做加密、重新生成密文或补写凭据版本——四证不足时停在 `unknown`，由人核对后显式重做
@@ -569,6 +597,9 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - 条件写必须在同一写入闸门内“比较 + 写入”；先比较后写入之间不得插入第二次写
 - **资源条件 ETag** 覆盖的不只是定义内容：还包括 `resource_uid`、`scope` / `owner_agent_uid`、凭据版本与状态、撤销序号与 `revision`。仅替换 Key、撤销凭据或改变范围也必须使 ETag 变化，否则并发替换无法被发现。Agent 的 `content_etag` 不吸收资源变化（见 [agent-md.md](agent-md.md) §2.3）
 - 涉及资源身份的动作（范围转换、凭据撤销、删除）在 `If-Match` 之外还必须携带 `resource_uid`；与当前指针不一致 → `409 RESOURCE_UID_MISMATCH`，不按名称猜测目标
+- `PUT /execution-policy` 有两个前置条件且**都要满足**：`If-Match`（等价于修订号 CAS，不符 → 412）与 `expected_profile`（用户确认过的方向，不符 → 409 `EXECUTION_PROFILE_MISMATCH`）。两者不可互相替代——ETag 只证明"没人改过"，`expected_profile` 证明"用户看到的就是当前值"
+- 访问例外使用**集合 ETag**：`GET /network-exceptions` 返回的 `etag` 覆盖整份集合（按 `exception_id` 排序的规整摘要），`DELETE /network-exceptions/{id}` 的 `If-Match` 只能取这个值；空集合也有稳定 ETag。新增例外**不**要求 `If-Match`（它是追加而非覆盖），删除必须要求
+- `POST /execution-policy/confirmations` **不**需要 `If-Match`：它只追加一条处置记录，不修改 `execution_policy` 行、不推进修订号；重复处置按幂等返回，不新增审计行
 
 ### 9.6 资源版本、发布与引用
 

@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -127,6 +128,61 @@ func TestNewWebServer_OptionsProjection(t *testing.T) {
 		require.Zero(t, (&App{}).webOptions(rt).RunBudget.MaxOutputBytes,
 			"非正数不搬运——留在零值由运行入口补缺省")
 	})
+
+	t.Run("实例上限逐键投影，零值交给 NewServer 归一", func(t *testing.T) {
+		// 14D / E8：就绪视图要拿**生效**上限对照，投影只是搬运——缺省值由
+		// `web.NewServer` 补 core 的同一对常量，装配层不再抄一份 10 / 32。
+		rt := &heavyRuntime{cfg: &cli.Config{
+			Budget: cli.BudgetConfig{MaxIterations: 12},
+			Server: cli.ServerConfig{MaxConcurrentRuns: 4},
+		}}
+		require.Equal(t, web.InstanceLimits{MaxIterations: 12, MaxConcurrentRuns: 4},
+			(&App{}).webOptions(rt).InstanceLimits)
+
+		rt.cfg.Budget.MaxIterations = 0
+		rt.cfg.Server.MaxConcurrentRuns = 0
+		require.Equal(t, web.InstanceLimits{}, (&App{}).webOptions(rt).InstanceLimits,
+			"未配置就原样投影零值（归一在 web.NewServer，与运行面同源）")
+	})
+}
+
+// TestNewWebServer_PreparesAdminTokenBeforeBinding 判首启生成密码与绑定监听之间的次序：
+// 端口被占时首次启动照样失败，但密码文件必须已经落盘——否则重试时库与名册都在、不再
+// 算新实例，"三处都没有"只能靠人工写文件恢复（WSL2 实装首启踩到：旧实例占着 8080）。
+func TestNewWebServer_PreparesAdminTokenBeforeBinding(t *testing.T) {
+	f := newWireFixture(t)
+	// 三个平台的数据根环境变量一起指向临时目录：私有目录绝不落到真实用户目录。
+	dataRoot := t.TempDir()
+	t.Setenv("LOCALAPPDATA", dataRoot)
+	t.Setenv("XDG_DATA_HOME", dataRoot)
+	t.Setenv("HOME", dataRoot)
+
+	id, err := newInstanceID()
+	require.NoError(t, err)
+	markerPath := instanceMarkerPath(f.workDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(markerPath), 0o750))
+	raw, err := marshalInstanceMarker(instanceMarker{Version: instanceMarkerVersion, InstanceID: id})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(markerPath, raw, 0o644))
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = occupied.Close() }()
+
+	f.cfg.HTTP.Addr = occupied.Addr().String()
+	f.cfg.HTTP.AdminAuth = cli.AdminAuthConfig{Mode: adminAuthModeToken}
+	a := f.app()
+	a.freshInstance = true
+	rt := f.assemble(t)
+
+	_, err = a.newWebServer(rt)
+	require.Error(t, err, "端口被占时应拒绝启动")
+	require.Contains(t, err.Error(), "监听")
+
+	tokenPath, err := defaultAdminTokenFile(f.workDir)
+	require.NoError(t, err)
+	_, statErr := os.Stat(tokenPath)
+	require.NoError(t, statErr, "密码文件必须在绑定监听之前生成：%s", tokenPath)
 }
 
 // TestNewWebServer_RefusesInvalidAdminAuth 判启动期拒绝（FR1 / 约束 1）：配置不成形时
@@ -424,9 +480,9 @@ func TestNewToolCatalogPort_ClassificationAndOrder(t *testing.T) {
 	mcpTool := fakeTool{name: "mcp__fs__read"}
 	require.NoError(t, reg.Register(mcpTool))
 
-	port := newToolCatalogPort(reg, []tool.MCPConnection{
+	port := newToolCatalogPort(reg, newMCPRuntime(nil, []tool.MCPConnection{
 		{Server: "fs", Tools: []core.Tool{mcpTool}},
-	})
+	}))
 	got := port.Tools()
 
 	names := make([]string, len(got))
@@ -455,15 +511,16 @@ func (fakeTool) Execute(context.Context, core.ToolEnv, json.RawMessage) (core.Re
 }
 
 // TestDeclaredToolNames_IncludesManageSchedule 对应颗粒度文档 §3.2.2（约束 32）：
-// 十名声明清单**逐字对照**（判据面变更 §3.5 #4）。实现若漏登记 `manage_schedule`，
-// 轻路径会判它"池外"；若多列未注册名，重路径等值门禁会拒绝启动——两种漂移都在这里红。
-// The ten-name literal list is the only judge of the tenth tool's drift: the nine-name
+// 十一名声明清单**逐字对照**（判据面变更 §3.5 #4；14D T125 精确集 10 → 11）。实现若漏
+// 登记 `manage_schedule` 或 `web_search`，轻路径会判它"池外"；若多列未注册名，重路径
+// 等值门禁会拒绝启动——两种漂移都在这里红。
+// The eleven-name literal list is the only judge of the newest tools' drift: the nine-name
 // classification fixture above cannot see a missing or extra declaration (P-03).
 func TestDeclaredToolNames_IncludesManageSchedule(t *testing.T) {
 	require.Equal(t, []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-		"recall_memory", "save_memory", "shell", "write_file",
-	}, declaredToolNames, "声明名集必须与注册池十件逐字一致（排序序）")
+		"recall_memory", "save_memory", "shell", "web_search", "write_file",
+	}, declaredToolNames, "声明名集必须与注册池十一件逐字一致（排序序）")
 }
 
 // TestWebOptions_SchedulesWired 对应颗粒度文档 §3.2.2（§3.1.19 / 约束 21）：
@@ -695,6 +752,10 @@ func (*fakeResourceAdminService) TestMCPServer(context.Context, core.Actor, stri
 
 func (*fakeResourceAdminService) DiagnoseMCPServer(context.Context, core.Actor, string) (core.MCPServerDiagnosis, error) {
 	return core.MCPServerDiagnosis{}, nil
+}
+
+func (*fakeResourceAdminService) ApplyMCPServer(context.Context, core.Actor, string, string, int64) (core.MCPServerApplyResult, error) {
+	return core.MCPServerApplyResult{}, nil
 }
 
 // fakeNotifyAdminService 是通知渠道写面端口的零值桩。

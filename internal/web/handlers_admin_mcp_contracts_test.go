@@ -322,6 +322,16 @@ func TestMCPContracts_DiagnosticsResponse(t *testing.T) {
 						{Key: "GITHUB_PERSONAL_ACCESS_TOKEN", Set: true},
 						{Key: "GITHUB_HOST", Set: false},
 					},
+					Dependency: &core.MCPDependencyDiagnosis{
+						Component:       "github-mcp-server",
+						State:           core.MCPDependencyReady,
+						ExpectedVersion: "2.0.3",
+						FoundVersion:    "2.0.3",
+					},
+					References: core.MCPReferencesDiagnosis{
+						Count:  1,
+						Agents: []string{"repo-watch"},
+					},
 					Warnings:  []string{"stdio_child_egress_unconstrained"},
 					CheckedAt: time.Date(2026, 10, 25, 8, 0, 0, 0, time.UTC),
 				}, nil
@@ -340,6 +350,10 @@ func TestMCPContracts_DiagnosticsResponse(t *testing.T) {
 		for _, entry := range view.Env {
 			requireViewMatchesSchema(t, doc, "McpEnvDiagnosis", entry)
 		}
+		require.NotNil(t, view.Dependency, "已登记运行时组件必须给出依赖轴")
+		requireViewMatchesSchema(t, doc, "McpDependencyDiagnosis", *view.Dependency)
+		requireViewMatchesSchema(t, doc, "McpReferencesDiagnosis", view.References)
+		require.Equal(t, []string{"repo-watch"}, view.References.Agents)
 		require.Equal(t, "2026-10-25T08:00:00Z", view.CheckedAt, "checked_at 必须是 RFC3339 UTC")
 	})
 
@@ -353,6 +367,7 @@ func TestMCPContracts_DiagnosticsResponse(t *testing.T) {
 					AppliedVersionID:   2,
 					Command:            nil,
 					Env:                nil,
+					Dependency:         nil,
 					Warnings:           []string{"remote_mcp_downstream_unconstrained"},
 					CheckedAt:          time.Date(2026, 10, 25, 8, 0, 0, 0, time.UTC),
 				}, nil
@@ -366,8 +381,11 @@ func TestMCPContracts_DiagnosticsResponse(t *testing.T) {
 		require.NoError(t, json.Unmarshal(decodeMCPEnvelope(t, rec.Body.Bytes()), &view))
 		requireViewMatchesSchema(t, doc, "McpServerDiagnosis", view)
 		require.Nil(t, view.Command, "http 传输不得给命令诊断对象")
+		require.Nil(t, view.Dependency, "未登记运行时组件必须出站为 null，不得写成 missing")
 		require.NotNil(t, view.Env, "空 env 必须出站为 []")
 		require.Empty(t, view.Env)
+		require.NotNil(t, view.References.Agents, "空引用也必须出站为 []")
+		require.Zero(t, view.References.Count)
 	})
 }
 

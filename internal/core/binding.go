@@ -18,7 +18,38 @@ const (
 	BindingModelConnection BindingKind = "model_connection"
 	// BindingNotifyChannel 对应 `notify_channels[]`。
 	BindingNotifyChannel BindingKind = "notify_channel"
+	// BindingMCPServer 是 **MCP server 占位符凭据的属主类别**，不是可绑定资源：
+	// `credentials.owner_kind` 认它（v6 起），AGENT.md 的 `resource_bindings` 不认它。
+	// 因此 `ParseBindingKind` 仍然拒绝它，绑定分组也不因它扩第三类。
+	// BindingMCPServer is a credential owner kind only; it is not a bindable resource
+	// kind and ParseBindingKind still refuses it.
+	BindingMCPServer BindingKind = "mcp_server"
 )
+
+// IsCredentialOwnerKind 报告该类别能否作为凭据属主（`credentials.owner_kind` 的三值
+// 闭集，与 schema.sql 的 CHECK 逐字对齐）。
+// IsCredentialOwnerKind reports whether the kind may own a credential.
+func IsCredentialOwnerKind(kind BindingKind) bool {
+	switch kind {
+	case BindingModelConnection, BindingNotifyChannel, BindingMCPServer:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseCredentialOwnerKind 逐字解析**凭据属主**类别：比 `ParseBindingKind` 宽一档，
+// 认 `mcp_server`（它能持有凭据，但不是可绑定资源）。凭据写面与审计 detail 回放用它——
+// 用 `ParseBindingKind` 会把 MCP 撤销记录判成不可解码。
+// ParseCredentialOwnerKind accepts the three credential owner kinds, including
+// mcp_server, which is not a bindable resource kind.
+func ParseCredentialOwnerKind(raw string) (BindingKind, error) {
+	kind := BindingKind(raw)
+	if !IsCredentialOwnerKind(kind) {
+		return "", fmt.Errorf("%w: 未知的凭据属主类别 %q", ErrAgentResourceBindingInvalid, raw)
+	}
+	return kind, nil
+}
 
 // ParseBindingKind 逐字解析绑定类别；技能 / MCP / 未知值一律拒绝。
 // ParseBindingKind accepts exactly the two bound kinds; skills, MCP and unknown

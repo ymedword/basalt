@@ -16,6 +16,8 @@ import type {
   ApiClient,
   CredentialMode,
   CredentialState,
+  InstanceSecretsView,
+  McpCredentialKeyView,
   McpServerView,
   ModelConnectionView,
   ResourceScope,
@@ -24,16 +26,26 @@ import type {
 import { adminApi, problemsOf } from '../api-admin'
 import type {
   FileDraft,
+  McpCredentialInput,
+  McpServerApplyResult,
   McpServerDetail,
   McpServerUpsert,
   McpServerWrite,
   ModelConnectionUpsert,
   SkillDetail,
 } from '../api-admin'
+import {
+  INSTANCE_SECRETS_TITLE,
+  instanceSecretsDetail,
+  instanceSecretsLabel,
+  instanceSecretsTone,
+  isInstanceSecretsView,
+  recoveryReasonText,
+} from '../instance-secrets'
 import type { ResourceKind } from '../router'
 import { CredentialField } from './credential-field'
 import { ScopePicker } from './scope-picker'
-import { Notice } from './ui'
+import { ConfirmDialog, Notice, StatusBadge, formatTimestamp } from './ui'
 
 const KIND_NOUNS: Record<ResourceKind, string> = {
   skills: '技能',
@@ -43,6 +55,62 @@ const KIND_NOUNS: Record<ResourceKind, string> = {
 
 const ENV_PLACEHOLDER = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
+// 请求头名按 RFC 7230 token：服务端的严格渲染是唯一判据，这里只做即时提示。
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+/**
+ * 「保存并应用」的结果：保存永远先完成，应用失败只影响第二个动作。父页面据此
+ * 在提示里说清“已保存 / 应用是否切换”，不把两件事混成一句。
+ * Save-and-apply outcome: the save always lands first; the second argument only
+ * describes whether the run-version switch happened.
+ */
+export interface McpApplyOutcome {
+  readonly result: McpServerApplyResult | null
+  readonly error: string
+}
+
+/** 父页面重述的结论：文案 + 提示色调（未切换运行版本按 warn，不按 error）。 */
+export interface CreatedApplyNotice {
+  readonly text: string
+  readonly tone: 'info' | 'warn'
+}
+
+/**
+ * 新建结果的一句话结论。表单 emit 之后就被父页面卸载，它自己的提示随之消失，
+ * 所以结论必须由父页面重述。保存永远先成功——三种没切成功的话都以「已创建并
+ * 发布」开头；只有 `applied` 才说运行版本已切换。
+ * The save always lands; only `applied` moved the run version. Parents must restate
+ * this because the form unmounts as soon as it emits.
+ */
+export function createdApplyNotice(outcome: McpApplyOutcome | null | undefined): CreatedApplyNotice {
+  if (outcome === null || outcome === undefined) {
+    return { text: '已创建并发布。', tone: 'info' }
+  }
+  const result = outcome.result
+  if (result === null) {
+    return {
+      text: `已创建并发布，但「应用」未完成：${outcome.error}。保存的版本仍是新的，运行版本保持不变，可在资源详情页重试。`,
+      tone: 'warn',
+    }
+  }
+  if (result.outcome === 'applied') {
+    // 只有版本 ID，没有版本序号：不写成 vN，避免与列表的版本序号混用。
+    return {
+      text: `已创建、发布并应用：运行版本已切换（已应用版本 ID ${result.applied_version_id}，排空窗口 ${result.drain_timeout_seconds} 秒）。`,
+      tone: 'info',
+    }
+  }
+  return {
+    text: `已创建并发布，但应用结果为「${result.outcome}」：运行版本未切换，详情页可查操作记录。`,
+    tone: 'warn',
+  }
+}
+
+/** 一个占位符的来源草稿：来源显式选择，托管值 write-only。 */
+interface SlotDraft {
+  readonly mode: CredentialMode
+  readonly value: string
+}
 
 export const ResourceForm = defineComponent({
   name: 'ResourceForm',
@@ -59,8 +127,9 @@ export const ResourceForm = defineComponent({
     prefill: { type: Object as PropType<McpServerWrite | null>, default: null },
   },
   emits: {
-    created: (_view: unknown) => true,
-    saved: (_view: unknown) => true,
+    // 第二个参数只对 MCP 的「保存并应用」出现：结果或失败文案，供父页面分行说明。
+    created: (_view: unknown, _apply?: unknown) => true,
+    saved: (_view: unknown, _apply?: unknown) => true,
     cancel: () => true,
   },
   setup(props, { emit }) {
@@ -85,6 +154,97 @@ export const ResourceForm = defineComponent({
       envRef: string
     }>({ state: '', version: 0, last4: '', envRef: '' })
 
+    // 实例加密服务（设计 §2.4.4 / §2.6.5）：只读一次状态。只有**必然写不进去**的
+    // 状态才灰掉「加密托管」——恢复态与显式纯 env；未初始化的存量实例首次保存时由
+    // 服务端自动完成初始化，不构成禁用理由。读取失败**不**禁用：服务端仍是最终闸门。
+    // Only states that provably cannot accept a managed write disable the option; a
+    // legacy uninitialized instance initializes itself on first save.
+    const instanceSecrets = ref<InstanceSecretsView | null>(null)
+    const secretsReadError = ref('')
+    const secretsError = ref('')
+    const secretsNotice = ref('')
+    const secretsBusy = ref(false)
+    const secretsConfirmOpen = ref(false)
+
+    async function loadInstanceSecrets(): Promise<void> {
+      try {
+        const view = await props.api.getInstanceSecrets()
+        if (!isInstanceSecretsView(view)) {
+          instanceSecrets.value = null
+          secretsReadError.value = '实例加密状态返回了无法识别的响应'
+          return
+        }
+        instanceSecrets.value = view
+        secretsReadError.value = ''
+      } catch (caught) {
+        instanceSecrets.value = null
+        secretsReadError.value = errorMessage(caught)
+      }
+    }
+
+    /**
+     * 保存成功后复核实例加密状态：首次托管保存可能刚刚完成了实例初始化，徽标与
+     * 全站横幅要立即反映，不要求用户刷新页面或重启。
+     * The first managed save may have initialised the instance; refresh in place.
+     */
+    function refreshInstanceSecretsAfterSave(): void {
+      void loadInstanceSecrets().then(() => {
+        window.dispatchEvent(new Event('basalt:instance-secrets-changed'))
+      })
+    }
+
+    /** 初始化只对「未初始化」开放：已就绪不覆盖、恢复态不重建，两类拒绝都由服务端判。 */
+    // Initialisation is offered only while uninitialized; the server refuses the rest.
+    async function confirmInitSecrets(): Promise<void> {
+      if (secretsBusy.value) {
+        return
+      }
+      secretsBusy.value = true
+      secretsError.value = ''
+      try {
+        const view = await client.initInstanceSecrets()
+        if (!isInstanceSecretsView(view)) {
+          secretsError.value = '初始化已提交，但返回的实例状态无法识别；请刷新页面确认结果。'
+          return
+        }
+        instanceSecrets.value = view
+        secretsReadError.value = ''
+        secretsConfirmOpen.value = false
+        secretsNotice.value = `实例加密服务已初始化（key_id ${view.key_id}）；后续保存的托管凭据都用这把密钥加密。`
+        window.dispatchEvent(new Event('basalt:instance-secrets-changed'))
+      } catch (caught) {
+        // 409 也走这里：已就绪不覆盖、恢复态不重建——两类拒绝都不产生写入。
+        secretsError.value = errorMessage(caught)
+      } finally {
+        secretsBusy.value = false
+      }
+    }
+
+    const managedUnavailable = computed(() => {
+      const view = instanceSecrets.value
+      if (view === null) {
+        return false
+      }
+      // 未初始化只有在明确不能就地初始化（显式纯 env）时才禁用。
+      return (
+        view.state === 'recovery_required' ||
+        (view.state === 'uninitialized' && !view.can_initialize)
+      )
+    })
+    const managedReason = computed(() => {
+      const view = instanceSecrets.value
+      if (view === null) {
+        return ''
+      }
+      if (view.state === 'recovery_required') {
+        return `实例加密服务需要恢复（${recoveryReasonText(view.recovery_reason)}）：托管凭据无法解密，新的托管写入会被拒绝；请按 docs/Operations.md 恢复主密钥，或改用「环境变量」。`
+      }
+      if (view.state === 'uninitialized' && !view.can_initialize) {
+        return '此实例以纯环境变量方式部署（secrets.auto_init: false），不接受加密托管：请改用「环境变量」来源，或由部署者启用 secrets.master_key_file 后重启。'
+      }
+      return ''
+    })
+
     // 新建时的使用范围：共享是默认；选专属时才读取所有者候选（在世 Agent 名）。
     // Create-time scope; the owner list is fetched only when exclusive is chosen.
     const createScope = ref<ResourceScope>('shared')
@@ -99,9 +259,21 @@ export const ResourceForm = defineComponent({
     const argsText = ref('')
     const url = ref('')
     const envText = ref('')
-    // 详情只回键名：编辑已有映射时要求重输，或显式勾选清空。
+    const headersText = ref('')
+    // 详情只回键名：编辑已有映射时要求重输，或显式勾选清空。请求头同理——PUT 整条
+    // 替换，不重输就等于静默删掉已有头。
+    // The detail exposes key names only; the PUT replaces the whole entry, headers
+    // included, so an edit must re-enter them or clear them explicitly.
     const currentEnvKeys = ref<string[]>([])
+    const currentHeaderKeys = ref<string[]>([])
     const clearEnv = ref(false)
+    const clearHeaders = ref(false)
+    // 逐占位符来源（14D）：键是槽位名（env 键名或请求头名），值只在这里存在。
+    // 来源不靠“托管行是否存在”推断——每个槽位都要一个显式选择。
+    // Per-slot source drafts; the source is an explicit choice, never inferred.
+    const slotDrafts = ref<Record<string, SlotDraft>>({})
+    // 编辑态读到的槽位现状（来源 / 状态 / 尾号）；新建态为空。
+    const currentSlots = ref<McpCredentialKeyView[]>([])
 
     // --- 技能 -------------------------------------------------------------
     const skillMode = ref<'create' | 'import'>('create')
@@ -135,13 +307,26 @@ export const ResourceForm = defineComponent({
       envText.value = Object.entries(write.env ?? {})
         .map(([key, reference]) => `${key}=${reference}`)
         .join('\n')
+      headersText.value = Object.entries(write.headers ?? {})
+        .map(([key, reference]) => `${key}=${reference}`)
+        .join('\n')
       currentEnvKeys.value = []
+      currentHeaderKeys.value = []
+      currentSlots.value = []
+      // 配方不预设来源：新建时默认「加密托管」，由用户逐个确认或改成环境变量。
+      slotDrafts.value = {}
       clearEnv.value = false
+      clearHeaders.value = false
     }
 
     /** 修改入口依赖详情 ETag；三类资源都先 GET 详情再填表。 */
     // Edits always start from the detail GET, which is also the ETag source.
     onMounted(() => {
+      // 只有模型连接表单需要实例加密状态；技能与 MCP 不为此多发一次请求。
+      // Only the model-connection form reads the instance-key projection.
+      if (props.kind === 'model-connections') {
+        void loadInstanceSecrets()
+      }
       if (props.edit !== null) {
         void loadEdit()
         return
@@ -180,8 +365,8 @@ export const ResourceForm = defineComponent({
       }
     }
 
-    /** 用 MCP 详情填表；args 每行一个，env 只回键名、留空等待重输。 */
-    // MCP detail: args one per line; env values are never echoed back.
+    /** 用 MCP 详情填表；args 每行一个，env / headers 只回键名、留空等待重输。 */
+    // MCP detail: args one per line; env and header values are never echoed back.
     function applyMcpServer(view: McpServerDetail, etagValue: string): void {
       name.value = view.name
       transport.value = view.transport
@@ -189,8 +374,14 @@ export const ResourceForm = defineComponent({
       argsText.value = view.args.join('\n')
       url.value = view.url
       envText.value = ''
+      headersText.value = ''
       currentEnvKeys.value = [...view.env_keys]
+      currentHeaderKeys.value = [...view.header_keys]
+      // 已有声明沿用为草稿初值：保存时若默认成「加密托管」，会把 env 槽位改成托管。
+      currentSlots.value = [...view.credential_keys]
+      slotDrafts.value = {}
       clearEnv.value = false
+      clearHeaders.value = false
       etag.value = etagValue
     }
 
@@ -305,7 +496,7 @@ export const ResourceForm = defineComponent({
 
     // --- 提交 -------------------------------------------------------------
 
-    async function submit(): Promise<void> {
+    async function submit(wantApply = false): Promise<void> {
       if (busy.value) {
         return
       }
@@ -318,7 +509,7 @@ export const ResourceForm = defineComponent({
         await submitModelConnection()
         return
       }
-      await submitMcpServer()
+      await submitMcpServer(wantApply)
     }
 
     /**
@@ -413,12 +604,14 @@ export const ResourceForm = defineComponent({
           const view = await client.createModelConnection(body)
           credentialValue.value = ''
           notice.value = '已创建并发布；列表将从服务端重新读取。'
+          refreshInstanceSecretsAfterSave()
           emit('created', view)
           return
         }
         await client.updateModelConnection(current, body, etag.value)
         const view = await rereadModelConnection(current)
         notice.value = '已保存并发布；上面是重新读取的服务端真值。'
+        refreshInstanceSecretsAfterSave()
         emit('saved', view)
       } catch (caught) {
         const current = props.edit
@@ -439,20 +632,156 @@ export const ResourceForm = defineComponent({
         .filter((line) => line !== '')
     }
 
-    /** 逐行解析 `KEY=${VAR}`；不合法就在本地拒绝，不发出请求。 */
-    function collectEnv(): Record<string, string> | null {
-      const env: Record<string, string> = {}
-      for (const line of lines(envText.value)) {
+    /**
+     * 逐行解析 `KEY=${VAR}`（env 与 headers 同一形态）；不合法就在本地拒绝，不发请求。
+     * 错误文案不回显“值”以外的东西——它只可能是 `${VAR}`，不是秘密。
+     */
+    // Parses KEY=${VAR} mappings for either env keys or header names.
+    function collectMappings(
+      text: string,
+      label: string,
+      pattern: RegExp,
+      example: string,
+    ): Record<string, string> | null {
+      const out: Record<string, string> = {}
+      for (const line of lines(text)) {
         const separator = line.indexOf('=')
         const key = separator === -1 ? '' : line.slice(0, separator).trim()
         const value = separator === -1 ? '' : line.slice(separator + 1).trim()
-        if (!ENV_KEY.test(key) || !ENV_PLACEHOLDER.test(value)) {
-          error.value = `环境变量必须是 KEY=\${VAR} 的占位，例如 TOKEN=\${MCP_TOKEN}：${line}`
+        if (!pattern.test(key) || !ENV_PLACEHOLDER.test(value)) {
+          error.value = `${label}必须是 KEY=\${VAR} 的占位，例如 ${example}：${line}`
           return null
         }
-        env[key] = value
+        out[key] = value
       }
-      return env
+      return out
+    }
+
+    function collectEnv(): Record<string, string> | null {
+      return collectMappings(envText.value, '环境变量', ENV_KEY, 'TOKEN=${MCP_TOKEN}')
+    }
+
+    function collectHeaders(): Record<string, string> | null {
+      return collectMappings(headersText.value, '请求头', HEADER_NAME, 'Authorization=${MCP_TOKEN}')
+    }
+
+    /** 映射文本里的槽位名（宽松解析：只取能识别的行，错误留给提交时点名）。 */
+    function slotKeysOf(text: string, pattern: RegExp): string[] {
+      const keys: string[] = []
+      for (const line of lines(text)) {
+        const separator = line.indexOf('=')
+        const key = separator === -1 ? '' : line.slice(0, separator).trim()
+        if (pattern.test(key)) {
+          keys.push(key)
+        }
+      }
+      return keys
+    }
+
+    /**
+     * 本次保存声明的槽位：env 键名 + （http 的）请求头名，按字典序。
+     * 页面从映射文本推导槽位，不新增第二个声明入口；每个槽位下面单独选来源。
+     */
+    // The declared slots of this save, derived from the mapping text itself.
+    const declaredSlots = computed<readonly string[]>(() => {
+      const names = new Set(slotKeysOf(envText.value, ENV_KEY))
+      if (transport.value === 'http') {
+        for (const name of slotKeysOf(headersText.value, HEADER_NAME)) {
+          names.add(name)
+        }
+      }
+      return [...names].sort()
+    })
+
+    /** 一个槽位在定义文件里的 `${VAR}`（env 或 headers 谁有取谁）。 */
+    function slotReference(key: string): string {
+      for (const text of [envText.value, headersText.value]) {
+        for (const line of lines(text)) {
+          const separator = line.indexOf('=')
+          if (separator !== -1 && line.slice(0, separator).trim() === key) {
+            return line.slice(separator + 1).trim()
+          }
+        }
+      }
+      return ''
+    }
+
+    function currentSlot(key: string): McpCredentialKeyView | null {
+      return currentSlots.value.find((slot) => slot.key === key) ?? null
+    }
+
+    /**
+     * 草稿初值：已有声明以服务端为准（编辑时不把 env 槽位悄悄改成托管），
+     * 新槽位按设计默认「加密托管」。
+     * Existing declarations win in edit mode; new slots default to managed.
+     */
+    function slotDraft(key: string): SlotDraft {
+      const drafted = slotDrafts.value[key]
+      if (drafted !== undefined) {
+        return drafted
+      }
+      return { mode: currentSlot(key)?.mode ?? 'managed', value: '' }
+    }
+
+    function setSlotDraft(key: string, patch: Partial<SlotDraft>): void {
+      slotDrafts.value = { ...slotDrafts.value, [key]: { ...slotDraft(key), ...patch } }
+    }
+
+    /** 槽位现状 → CredentialField 的状态色调（env 不显示状态徽章）。 */
+    function slotCredentialState(key: string): CredentialState {
+      switch (currentSlot(key)?.state) {
+        case 'managed':
+          return 'active'
+        case 'managed_revoked':
+          return 'revoked'
+        default:
+          return ''
+      }
+    }
+
+    /**
+     * 逐槽位来源声明（契约 `credentials`）：managed 可带新值（省略 = 沿用），env
+     * 从不带值；没有旧值又没填值、或把仍有活动托管值的槽位改成 env，都在本地拒绝。
+     * 页面不猜来源，也不悄悄丢掉一个活动托管值。
+     * Builds the explicit per-slot declarations; local guards mirror the contract.
+     */
+    function mcpCredentialInputs(slots: readonly string[]): McpCredentialInput[] | null {
+      const inputs: McpCredentialInput[] = []
+      for (const key of slots) {
+        const draft = slotDraft(key)
+        const existing = currentSlot(key)
+        if (draft.mode === 'env') {
+          if (existing !== null && existing.state === 'managed') {
+            error.value =
+              `占位符 ${key} 仍有活动托管值：要改成「环境变量」请先在资源详情页撤销该占位符` +
+              '（撤销后不会回落到进程环境）'
+            return null
+          }
+          inputs.push({ key, mode: 'env' })
+          continue
+        }
+        const value = draft.value
+        if (value === '') {
+          if (existing === null || existing.state !== 'managed') {
+            error.value =
+              `占位符 ${key} 选择了「加密托管」但还没有值：请填写值，` +
+              '或把来源改成「环境变量」（要求进程环境里已有该变量）'
+            return null
+          }
+          inputs.push({ key, mode: 'managed' })
+          continue
+        }
+        if (value.trim() !== value) {
+          error.value = `占位符 ${key} 的凭据值首尾不得含空白`
+          return null
+        }
+        if (ENV_PLACEHOLDER.test(value)) {
+          error.value = `占位符 ${key} 选择「加密托管」时不接受 \${VAR} 占位：请粘贴完整的值`
+          return null
+        }
+        inputs.push({ key, mode: 'managed', value })
+      }
+      return inputs
     }
 
     function mcpServerBody(): McpServerUpsert | null {
@@ -497,13 +826,59 @@ export const ResourceForm = defineComponent({
           return null
         }
       }
+      let typedHeaders: Record<string, string> = {}
+      if (transport.value === 'http') {
+        const collected = collectHeaders()
+        if (collected === null) {
+          return null
+        }
+        typedHeaders = collected
+        const headerCount = Object.keys(typedHeaders).length
+        if (props.edit !== null && currentHeaderKeys.value.length > 0) {
+          if (headerCount === 0 && !clearHeaders.value) {
+            error.value =
+              `该服务已有请求头占位（${currentHeaderKeys.value.join('、')}），` +
+              '但页面拿不到它们的值。请重新填写头名=${VAR} 后保存，或勾选“清空请求头占位”。'
+            return null
+          }
+          if (headerCount > 0 && clearHeaders.value) {
+            error.value = '“清空请求头占位”与重新填写只能选一个'
+            return null
+          }
+        }
+        for (const name of Object.keys(typedHeaders)) {
+          if (name in typedEnv) {
+            error.value =
+              `占位符 ${name} 同时出现在环境变量与请求头里：同一个名字只能占一个槽位，请改名后重试`
+            return null
+          }
+        }
+      }
       if (typedCount > 0) {
         body.env = typedEnv
+      }
+      if (Object.keys(typedHeaders).length > 0) {
+        body.headers = typedHeaders
+      }
+      const slots = [...new Set([...Object.keys(typedEnv), ...Object.keys(typedHeaders)])].sort()
+      if (slots.length > 0) {
+        const credentials = mcpCredentialInputs(slots)
+        if (credentials === null) {
+          return null
+        }
+        body.credentials = credentials
       }
       return body
     }
 
-    async function submitMcpServer(): Promise<void> {
+    /**
+     * 保存（= 发布新版本），可选再立即「应用」一次。
+     *
+     * 保存与应用是两件事：保存成功后重新读取 ETag 再应用；应用失败**不改写**保存
+     * 结论，父页面通过第二个 emit 参数拿到结果并在提示里分开说。这里绝不自动重发。
+     * Save always lands first; apply is a second, conditional write on the fresh ETag.
+     */
+    async function submitMcpServer(wantApply: boolean): Promise<void> {
       const body = mcpServerBody()
       if (body === null) {
         return
@@ -511,22 +886,57 @@ export const ResourceForm = defineComponent({
       busy.value = true
       try {
         const current = props.edit
+        let view: McpServerView
+        let applyOutcome: McpApplyOutcome | null
         if (current === null) {
-          const view: McpServerView = await client.createMcpServer(body)
-          notice.value = '已保存并发布；MCP 连接在重启后生效（列表会标“需重启”）。'
-          emit('created', view)
-          return
+          view = await client.createMcpServer(body)
+          // 新建没有 ETag：重新读一次详情取当前指针，再作为应用的条件。
+          applyOutcome = wantApply ? await applyAfterSave(view.name) : null
+        } else {
+          await client.updateMcpServer(current, body, etag.value)
+          view = await rereadMcpServer(current)
+          applyOutcome = wantApply ? await applyAfterSave(current) : null
         }
-        await client.updateMcpServer(current, body, etag.value)
-        const view = await rereadMcpServer(current)
-        notice.value = '已保存并发布；MCP 连接在重启后生效（详情会标“需重启”）。'
-        emit('saved', view)
+        notice.value =
+          applyOutcome === null
+            ? '已保存并发布；MCP 连接在重启后生效（详情会标“待应用”）。'
+            : applyNotice(applyOutcome)
+        if (current === null) {
+          emit('created', view, applyOutcome)
+        } else {
+          emit('saved', view, applyOutcome)
+        }
       } catch (caught) {
         const current = props.edit
         await handleFailure(caught, current === null ? null : () => refreshEtag(current))
       } finally {
         busy.value = false
       }
+    }
+
+    /** 保存后重新读取详情（取当前 ETag）再应用；失败只回报，不重试。 */
+    async function applyAfterSave(name: string): Promise<McpApplyOutcome> {
+      try {
+        const detail = await client.getMcpServer(name)
+        etag.value = detail.etag
+        const result = await client.applyMcpServer(name, detail.etag)
+        return { result, error: '' }
+      } catch (caught) {
+        return { result: null, error: errorMessage(caught) }
+      }
+    }
+
+    /** 保存 + 应用两段的提示文案：成功说清切换了哪个版本，失败说清保存已生效。 */
+    function applyNotice(outcome: McpApplyOutcome): string {
+      const result = outcome.result
+      if (result === null) {
+        return `已保存并发布，但「应用」未完成：${outcome.error}。保存的版本仍是新的，运行版本保持不变；请到资源详情页重试。`
+      }
+      if (result.outcome === 'applied') {
+        // 这里只有版本 ID，没有版本序号：不把它写成 vN，避免和详情页的序号混用。
+        return `已保存、发布并应用：运行版本已切换（已应用版本 ID ${result.applied_version_id}），排空窗口 ${result.drain_timeout_seconds} 秒。`
+      }
+      return `已保存并发布，但应用结果为「${result.outcome}」：运行版本未切换，请到资源详情页查看操作记录。`
     }
 
     /** 修改态的文件清单：路径非空、不重复；正文原样提交（服务端做完整校验）。 */
@@ -665,10 +1075,126 @@ export const ResourceForm = defineComponent({
       ])
     }
 
+    /**
+     * 普通表单的第一行：实例加密服务状态。托管默认可用——未初始化的存量实例在
+     * 首次保存时自动完成初始化，所以普通流程里没有「请先初始化」这一步；主密钥
+     * 路径、初始化细节与手动入口都收进「高级：实例加密诊断」折叠区。
+     * First line of the ordinary form: the instance-key status. Managed is usable
+     * even before initialisation because the first save initialises the instance.
+     */
+    function renderInstanceSecretsStatus(): VNode {
+      const view = instanceSecrets.value
+      const parts: VNodeChild[] = [h('span', {}, INSTANCE_SECRETS_TITLE)]
+      if (view === null) {
+        parts.push(
+          h(StatusBadge, {
+            label: secretsReadError.value === '' ? '读取中' : '状态未知',
+            tone: 'muted',
+          }),
+        )
+      } else {
+        parts.push(
+          h(StatusBadge, { label: instanceSecretsLabel(view), tone: instanceSecretsTone(view) }),
+        )
+      }
+      const readFailed = view === null && secretsReadError.value !== ''
+      return h('div', {}, [
+        h('p', { class: 'credential-status' }, parts),
+        h(
+          'p',
+          { class: 'field-hint muted' },
+          readFailed
+            ? `读取实例加密状态失败：${secretsReadError.value}。保存时不因读取失败而拦下；服务端仍是最终闸门，不能写入会拒绝并说明原因。`
+            : view === null
+              ? '正在读取实例加密状态…'
+              : instanceSecretsDetail(view),
+        ),
+        view === null ? null : renderSecretsAdvanced(view),
+        secretsError.value === '' ? null : h(Notice, { tone: 'error', text: secretsError.value }),
+        secretsNotice.value === '' ? null : h(Notice, { tone: 'info', text: secretsNotice.value }),
+      ])
+    }
+
+    /**
+     * 「高级：实例加密诊断」：主密钥路径、key_id、初始化时间与手动初始化入口。
+     * 这些是管理诊断信息，不占据普通连接创建流程；恢复仍按 docs/Operations.md 处置。
+     * Advanced diagnostics: key path, key id, init time and the manual init action.
+     * Recovery still follows docs/Operations.md instead of a button here.
+     */
+    function renderSecretsAdvanced(view: InstanceSecretsView): VNode {
+      const rows: VNodeChild[] = [
+        h('p', {}, ['key_id：', view.key_id === '' ? '—' : h('code', {}, view.key_id)]),
+        h('p', {}, [
+          '初始化时间：',
+          view.initialized_at === '' ? '—' : formatTimestamp(view.initialized_at),
+        ]),
+        h('p', {}, [
+          '主密钥文件：',
+          view.key_file === '' ? '—' : h('code', {}, view.key_file),
+        ]),
+      ]
+      if (view.state === 'uninitialized') {
+        rows.push(
+          h(
+            'p',
+            { class: 'muted small' },
+            view.can_initialize
+              ? '尚未初始化：首次保存加密托管凭据时会自动完成；也可以在这里手动初始化。'
+              : '此实例不接受加密托管（secrets.auto_init: false 或未配置主密钥路径）；如需启用，由部署者完成配置后重启。',
+          ),
+        )
+      }
+      if (view.can_initialize) {
+        rows.push(
+          h(
+            'button',
+            {
+              type: 'button',
+              disabled: secretsBusy.value,
+              onClick: () => {
+                secretsConfirmOpen.value = true
+              },
+            },
+            secretsBusy.value ? '初始化中…' : '初始化实例加密',
+          ),
+        )
+      }
+      return h('details', { class: 'technical-details' }, [
+        h('summary', {}, '高级：实例加密诊断'),
+        ...rows,
+      ])
+    }
+
+    /** 初始化确认框：说清只做一次、失败不覆盖、备份要带密钥文件。 */
+    // Confirmation for initialisation: one-shot, never overwrites, back up the key file.
+    function renderSecretsDialog(): VNode {
+      return h(ConfirmDialog, {
+        open: secretsConfirmOpen.value,
+        title: '初始化实例加密',
+        message:
+          '初始化会在实例私有目录生成主密钥文件并登记 key_id。这是只做一次的动作：已就绪的实例不会被覆盖，恢复态也不会重建密钥。' +
+          '请确认主密钥文件会与工作区一起备份——只搬工作区会让托管凭据无法解密。',
+        confirmText: secretsBusy.value ? '初始化中…' : '初始化',
+        busy: secretsBusy.value,
+        onConfirm: () => {
+          void confirmInitSecrets()
+        },
+        onCancel: () => {
+          if (!secretsBusy.value) {
+            secretsConfirmOpen.value = false
+          }
+        },
+      })
+    }
+
     function modelCredentialField(): VNode {
       return h(CredentialField, {
         id: 'resource-api-key',
         label: editing.value ? 'API 密钥（留空 = 保留当前凭据）' : 'API 密钥',
+        // 两行分开：「实例加密服务」在上，「当前 API 密钥是否已保存」在这一行；
+        // 来源选择收进「高级」，默认就是加密托管。
+        statusTitle: '当前 API 密钥',
+        advancedSource: true,
         mode: credentialMode.value,
         state: editing.value ? currentCredential.value.state : '',
         version: editing.value ? currentCredential.value.version : 0,
@@ -677,6 +1203,8 @@ export const ResourceForm = defineComponent({
         value: credentialValue.value,
         editableMode: true,
         disabled: busy.value,
+        managedDisabled: managedUnavailable.value,
+        managedReason: managedReason.value,
         placeholder:
           credentialMode.value === 'managed'
             ? '粘贴完整的 API 密钥（保存后不回显原值）'
@@ -752,6 +1280,7 @@ export const ResourceForm = defineComponent({
           (next) => (defaultModel.value = next),
           { placeholder: '例如 gpt-4o-mini' },
         ),
+        renderInstanceSecretsStatus(),
         modelCredentialField(),
         ...createScopePicker(),
       ]
@@ -860,7 +1389,116 @@ export const ResourceForm = defineComponent({
           ]),
         )
       }
+      if (transport.value === 'http') {
+        fields.push(
+          h('label', { class: 'field', for: 'resource-headers' }, [
+            h('span', '请求头（每行 头名=${VAR}；Authorization 装配为 Bearer）'),
+            h('textarea', {
+              id: 'resource-headers',
+              class: 'editor',
+              rows: 3,
+              spellcheck: false,
+              disabled: clearHeaders.value,
+              value: headersText.value,
+              placeholder: 'Authorization=${MCP_TOKEN}',
+              onInput: (event: Event) => {
+                headersText.value = (event.target as HTMLTextAreaElement).value
+              },
+            }),
+          ]),
+        )
+        if (editing.value && currentHeaderKeys.value.length > 0) {
+          fields.push(
+            h(Notice, {
+              tone: 'warn',
+              text:
+                `该服务已有请求头占位（${currentHeaderKeys.value.join('、')}），` +
+                '页面拿不到它们的值。保存会整条替换这个服务：请重新填写头名=${VAR}，或勾选清空。',
+            }),
+            h('label', { class: 'check-row', for: 'resource-clear-headers' }, [
+              h('input', {
+                id: 'resource-clear-headers',
+                type: 'checkbox',
+                checked: clearHeaders.value,
+                onChange: (event: Event) => {
+                  const checked = (event.target as HTMLInputElement).checked
+                  clearHeaders.value = checked
+                  if (checked) {
+                    headersText.value = ''
+                  }
+                },
+              }),
+              h('span', '清空请求头占位（本次保存后该服务不再有请求头）'),
+            ]),
+          )
+        }
+      }
+      fields.push(...renderSlotSources())
       return fields
+    }
+
+    /**
+     * 逐占位符来源卡片（14D）：槽位来自上面的映射文本，每张卡只选「值从哪里来」。
+     * 「加密托管」在这里填值；「环境变量」不填值——定义里的 `${VAR}` 就是进程变量名。
+     * One card per declared slot; the card only chooses where the value comes from.
+     */
+    function renderSlotSources(): VNodeChild[] {
+      const slots = declaredSlots.value
+      if (slots.length === 0) {
+        return []
+      }
+      const cards: VNodeChild[] = [
+        h(
+          'p',
+          { class: 'muted small' },
+          '每个占位符都要显式选择来源：默认「加密托管」；「环境变量」不在这里填值，' +
+            '定义里的 ${VAR} 就是进程环境变量名。保存时会按选择逐个核对——托管没有值、' +
+            '环境变量未设置都会 fail-closed 拒绝写入。',
+        ),
+      ]
+      for (const key of slots) {
+        const draft = slotDraft(key)
+        const existing = currentSlot(key)
+        const reference = slotReference(key)
+        cards.push(
+          h(CredentialField, {
+            id: `mcp-slot-${key}`,
+            label: `占位符 ${key}`,
+            mode: draft.mode,
+            state: slotCredentialState(key),
+            last4: existing?.last4 ?? '',
+            reference: draft.mode === 'env' ? reference : '',
+            value: draft.value,
+            editableMode: true,
+            valueVisible: draft.mode === 'managed',
+            disabled: busy.value,
+            noun: '凭据',
+            placeholder: '粘贴完整的值（保存后不回显原值）',
+            hint:
+              draft.mode === 'managed'
+                ? '值由服务端主密钥加密保存；留空 = 沿用已有托管值（没有旧值时必须填写）。'
+                : `这里不填值：定义里的 ${reference === '' ? '${VAR}' : reference} 就是进程环境变量名，` +
+                  '保存时若该变量缺失会被拒绝（503）。',
+            'onUpdate:mode': (next: CredentialMode) => {
+              setSlotDraft(key, { mode: next })
+              error.value = ''
+              problems.value = []
+            },
+            'onUpdate:value': (next: string) => {
+              setSlotDraft(key, { value: next })
+            },
+          }),
+        )
+      }
+      return [sectionLike('占位符来源', cards)]
+    }
+
+    /** 表单内部的字段分组：与页面 section 同一视觉，但不带页面级标题层级。 */
+    function sectionLike(title: string, children: VNodeChild[]): VNode {
+      return h('div', { class: 'form-section slot-sources' }, [
+        h('h3', title),
+        ...children,
+      ])
     }
 
     function modeButton(mode: 'create' | 'import', label: string): VNode {
@@ -1063,6 +1701,9 @@ export const ResourceForm = defineComponent({
         children.push(h('p', { class: 'muted' }, '读取中…'))
       }
       children.push(...fields)
+      if (props.kind === 'model-connections') {
+        children.push(renderSecretsDialog())
+      }
       if (error.value !== '') {
         children.push(h(Notice, { tone: 'error', text: error.value }))
       }
@@ -1078,31 +1719,48 @@ export const ResourceForm = defineComponent({
       if (notice.value !== '') {
         children.push(h(Notice, { tone: 'info', text: notice.value }))
       }
-      children.push(
-        h('div', { class: 'form-actions' }, [
+      const buttons: VNodeChild[] = [
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'primary',
+            disabled: busy.value || loading.value,
+            onClick: () => {
+              void submit()
+            },
+          },
+          submitLabel(),
+        ),
+      ]
+      // MCP 的第二步动作：保存成功后立刻应用一次（仍走 If-Match 条件写）。
+      if (props.kind === 'mcp-servers') {
+        buttons.push(
           h(
             'button',
             {
               type: 'button',
-              class: 'primary',
               disabled: busy.value || loading.value,
               onClick: () => {
-                void submit()
+                void submit(true)
               },
             },
-            submitLabel(),
+            busy.value ? '提交中…' : editing.value ? '保存并应用' : '创建并应用',
           ),
-          h(
-            'button',
-            {
-              type: 'button',
-              disabled: busy.value,
-              onClick: () => emit('cancel'),
-            },
-            '取消',
-          ),
-        ]),
+        )
+      }
+      buttons.push(
+        h(
+          'button',
+          {
+            type: 'button',
+            disabled: busy.value,
+            onClick: () => emit('cancel'),
+          },
+          '取消',
+        ),
       )
+      children.push(h('div', { class: 'form-actions' }, buttons))
       if (props.kind !== 'skills') {
         children.push(
           h('p', { class: 'muted small' }, '保存即发布：定义文件与发布指针在同一提交边界内更新。'),

@@ -254,7 +254,7 @@ func (s *NotifyAdmin) Create(ctx context.Context, actor core.Actor,
 	channel.Scope = scope
 	channel.OwnerAgentUID = ownerUID
 	// 凭据段要落新密文时先预检主密钥：不可用 → 503，零行、零操作行。
-	if err := s.checkCredentialWriteReady(channel.Name, plan); err != nil {
+	if err := s.checkCredentialWriteReady(ctx, actor, channel.Name, plan); err != nil {
 		return core.NotifyChannel{}, err
 	}
 
@@ -374,7 +374,7 @@ func (s *NotifyAdmin) Update(ctx context.Context, actor core.Actor, name string,
 		// managed → env：地址列已是新的 `${VAR}` 占位，撤销托管后行上不得再挂凭据身份。
 		channel.CredentialID = ""
 	}
-	if err := s.checkCredentialWriteReady(name, plan); err != nil {
+	if err := s.checkCredentialWriteReady(ctx, actor, name, plan); err != nil {
 		return core.NotifyChannel{}, err
 	}
 
@@ -439,9 +439,13 @@ func (s *NotifyAdmin) requestedCreateScope(ctx context.Context, action, name, ra
 }
 
 // checkCredentialWriteReady 在写行 / 写盘之前确认凭据段可执行：需要写面而没有 → 503；
-// 要落新密文时先预检主密钥（不可用 → 503，零写入）。退役只改状态，不需要主密钥。
-// checkCredentialWriteReady gates the credential half before any write happens.
-func (s *NotifyAdmin) checkCredentialWriteReady(name string, plan credentialSavePlan) error {
+// 要落新密文时先让托管写入就绪（必要时完成实例初始化，再校验主密钥可装载；不可用 →
+// 503，零写入）。退役只改状态，不需要主密钥。
+// checkCredentialWriteReady gates the credential half before any write happens; a first
+// managed save may initialize the instance inside the same audited flow.
+func (s *NotifyAdmin) checkCredentialWriteReady(ctx context.Context, actor core.Actor,
+	name string, plan credentialSavePlan,
+) error {
 	if !plan.needsWrite() {
 		return nil
 	}
@@ -452,7 +456,7 @@ func (s *NotifyAdmin) checkCredentialWriteReady(name string, plan credentialSave
 	if plan.Value == nil {
 		return nil
 	}
-	return s.credentials.Preflight()
+	return s.credentials.PrepareManagedWrite(ctx, actor)
 }
 
 // Delete 删除一条渠道：存在性（404）与显式身份（409）都在预写之前；随后按**当前

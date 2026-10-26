@@ -151,6 +151,19 @@ type ToolResolver interface {
 	Specs(names []string) []ToolSpec
 }
 
+// ToolPinner 是准入时**钉住工具实例**的解析面（14D / C4）：注册池可以在运行期被受控
+// 重建（`mcp_server.apply`）整组换掉，但一次 Run 手里的工具实例必须在准入时固定——
+// 否则在途 Run 会被悄悄换到新连接，与"旧 Run 的快照不被改写"相悖。
+// 它是 `ToolResolver` 之外的**第二个**接口而不是给它加方法：按名解析与实例快照是两件
+// 事，只做前者的实现（既有测试替身）不必凭空实现后者。
+// ToolPinner pins tool instances at admission; a controlled apply may swap the registry,
+// and only a pinned set keeps an in-flight run on the connection it admitted with.
+type ToolPinner interface {
+	// Pin 按名取出一组工具实例与它们的规格（顺序同入参名字，未命中的名字跳过）。
+	// Pin snapshots instances and specs in the caller's name order, skipping misses.
+	Pin(names []string) (map[string]Tool, []ToolSpec)
+}
+
 // Policy 是授权判定接口（技术方案 §4.3 逐字）：回答"这个动作允许吗"，不负责"怎么做"。
 // 调用点在**工具内部**（文件工具只需 Policy，命令执行才需 CommandRunner）——调用方
 // 只依赖本接口，**不得**依赖 WhitelistPolicy 等具体实现。

@@ -17,6 +17,8 @@ import type { ResourceKind } from '../src/router'
 
 const MODEL_PATH = '/api/v1/model-connections'
 const PROFILES_PATH = '/api/v1/profiles'
+/** 14D：模型连接表单挂载时会读实例加密状态，决定「加密托管」是否可选。 */
+const SECRETS_PATH = '/api/v1/instance/secrets'
 
 const ETAG_V1 = `"sha256:${'1'.repeat(64)}"`
 const ETAG_V2 = `"sha256:${'2'.repeat(64)}"`
@@ -100,6 +102,26 @@ function modelView(baseUrl: string, etag: string): unknown {
   }
 }
 
+/** 实例加密就绪夹具：只影响「加密托管」是否可选，不含任何真实密钥材料。 */
+// Instance-encryption ready fixture; it only decides whether managed is selectable.
+function secretsReady(): unknown {
+  return {
+    state: 'ready',
+    key_id: 'k_test000001',
+    initialized_at: '2026-10-20T08:00:00Z',
+    key_file: '/var/lib/basalt/secrets/instance.key',
+    recovery_reason: '',
+    can_initialize: false,
+    credential_summary: { managed: 0, managed_revoked: 0, env: 0, missing: 0 },
+  }
+}
+
+/** 去掉挂载时的实例加密只读探测，只留本测试关心的资源读写请求。 */
+// Drops the mount-time instance-secrets read; resource reads/writes remain.
+function resourceCalls(calls: Call[]): Call[] {
+  return calls.filter((call) => !(call.method === 'GET' && call.path === SECRETS_PATH))
+}
+
 /** 记录每次请求并按 handler 返回；缺分支直接抛错，避免测试静默走空。 */
 function mountForm(
   handler: Handler,
@@ -120,7 +142,12 @@ function mountForm(
         body: typeof rawBody === 'string' ? JSON.parse(rawBody) : undefined,
       }
       calls.push(call)
-      const response = handler(call)
+      // 挂载时的实例加密探测默认用就绪夹具应答；用例可自行覆盖（未初始化 / 恢复态）。
+      // The mount-time secrets probe defaults to the ready fixture; cases may override it.
+      const response =
+        call.method === 'GET' && call.path === SECRETS_PATH
+          ? (handler(call) ?? envelope(200, 'OK', 'success', secretsReady()))
+          : handler(call)
       if (response === undefined) {
         throw new Error(`未预期的请求：${call.method} ${call.path}`)
       }
@@ -164,7 +191,7 @@ describe('resource form', () => {
     await button('创建并发布').trigger('click')
     await flushPromises()
 
-    expect(required(calls[0], '创建请求').body).toEqual({
+    expect(required(resourceCalls(calls)[0], '创建请求').body).toEqual({
       name: 'main',
       base_url: 'https://api.example.com/v1',
       default_model: 'm1',
@@ -173,7 +200,7 @@ describe('resource form', () => {
       scope: 'shared',
     })
     // 组件不重新 GET 列表、也不做乐观更新：列表由父页面写后重读。
-    expect(calls.filter((call) => call.method === 'GET')).toHaveLength(0)
+    expect(resourceCalls(calls).filter((call) => call.method === 'GET')).toHaveLength(0)
     const created = wrapper!.emitted('created')
     expect(created).toHaveLength(1)
     expect(required(created![0], 'created 事件')[0]).toMatchObject({ name: 'main' })
@@ -201,7 +228,7 @@ describe('resource form', () => {
     await button('创建并发布').trigger('click')
     await flushPromises()
 
-    expect(required(calls[0], '创建请求').body).toMatchObject({
+    expect(required(resourceCalls(calls)[0], '创建请求').body).toMatchObject({
       api_key: '${MAIN_KEY}',
       credential_mode: 'env',
       scope: 'shared',
@@ -254,7 +281,8 @@ describe('resource form', () => {
     await button('创建并发布').trigger('click')
     await flushPromises()
 
-    expect(calls).toHaveLength(0)
+    // 本地拒绝零资源请求（实例加密探测发生在挂载时，不属于本次交互）。
+    expect(resourceCalls(calls)).toHaveLength(0)
     expect(wrapper!.find('.notice-error').text()).toContain('「加密托管」来源不接受 ${VAR} 占位')
     expect(wrapper!.find('.notice-error').text()).not.toContain('MAIN_KEY')
     expect(inputValue('#resource-api-key')).toBe('${MAIN_KEY}')
@@ -273,7 +301,8 @@ describe('resource form', () => {
     await flushPromises()
 
     // 真实密钥不进入请求体、日志或页面文案（错误不回显输入）。
-    expect(calls).toHaveLength(0)
+    // 本地拒绝零资源请求（实例加密探测发生在挂载时，不属于本次交互）。
+    expect(resourceCalls(calls)).toHaveLength(0)
     expect(wrapper!.find('.notice-error').text()).toContain('「环境变量」来源只填写变量名')
     expect(wrapper!.find('.notice-error').text()).not.toContain('sk-plaintext')
     expect(inputValue('#resource-api-key')).toBe('sk-plaintext')
@@ -290,7 +319,8 @@ describe('resource form', () => {
     await button('创建并发布').trigger('click')
     await flushPromises()
 
-    expect(calls).toHaveLength(0)
+    // 本地拒绝零资源请求（实例加密探测发生在挂载时，不属于本次交互）。
+    expect(resourceCalls(calls)).toHaveLength(0)
     expect(wrapper!.find('.notice-error').text()).toContain('请填写完整的 API 密钥（加密托管）')
   })
 
@@ -383,7 +413,7 @@ describe('resource form', () => {
     await button('创建并发布').trigger('click')
     await flushPromises()
 
-    expect(required(calls[0], '创建请求').body).toMatchObject({ api_key: SECRET })
+    expect(required(resourceCalls(calls)[0], '创建请求').body).toMatchObject({ api_key: SECRET })
     expect(wrapper!.find('.notice-error').text()).toBe('字段 base_url 只接受 http / https')
     expect(wrapper!.findAll('.problems li').map((item) => item.text())).toEqual([
       'base_url 只接受 http / https',
@@ -439,6 +469,182 @@ describe('resource form', () => {
 
     expect(calls.filter((call) => call.method === 'PUT')).toHaveLength(0)
     expect(wrapper!.find('.notice-error').text()).toContain('切换凭据来源必须填写新值')
+  })
+
+  it('keeps managed usable on a legacy instance and initialises it on the first save', async () => {
+    const uninitialized = {
+      ...(secretsReady() as Record<string, unknown>),
+      state: 'uninitialized',
+      key_id: '',
+      initialized_at: '',
+      can_initialize: true,
+    }
+    let initialised = false
+    const calls = mountForm((call) => {
+      if (call.method === 'GET' && call.path === SECRETS_PATH) {
+        return envelope(
+          200,
+          'OK',
+          'success',
+          initialised ? secretsReady() : uninitialized,
+        )
+      }
+      if (call.method === 'POST' && call.path === `${SECRETS_PATH}/init`) {
+        initialised = true
+        return envelope(200, 'OK', 'success', secretsReady())
+      }
+      return undefined
+    }, 'model-connections')
+    await flushPromises()
+
+    // 存量实例：托管默认可用，不需要先点初始化；说明句给出「首次保存自动完成」。
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="managed"]').attributes('disabled'),
+    ).toBeUndefined()
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="env"]').attributes('disabled'),
+    ).toBeUndefined()
+    expect(wrapper!.text()).toContain('首次保存加密托管凭据时会自动完成初始化')
+    // 来源选择在「高级」折叠区里，普通表单不再要求先做这个选择。
+    expect(wrapper!.find('details.credential-advanced summary').text()).toContain('高级：凭据来源')
+    // 初始化入口只在高级诊断里，普通流程不出现「请先初始化」这一步。
+    const advanced = wrapper!.find('details.technical-details')
+    expect(advanced.find('summary').text()).toContain('高级：实例加密诊断')
+    expect(advanced.text()).toContain('也可以在这里手动初始化')
+
+    let changed = 0
+    const onChange = (): void => {
+      changed += 1
+    }
+    window.addEventListener('basalt:instance-secrets-changed', onChange)
+    await advanced.findAll('button').find((item) => item.text() === '初始化实例加密')!.trigger('click')
+    await flushPromises()
+    // 一次性动作：对话框必须写明只搬工作区会让托管凭据无法解密。
+    expect(wrapper!.find('.dialog').text()).toContain('只搬工作区会让托管凭据无法解密')
+    await wrapper!
+      .findAll('.dialog-actions button')
+      .find((item) => item.text() === '初始化')!
+      .trigger('click')
+    await flushPromises()
+    window.removeEventListener('basalt:instance-secrets-changed', onChange)
+
+    expect(required(calls.find((call) => call.method === 'POST'), '初始化请求').body).toEqual({
+      confirm: true,
+    })
+    // 初始化后无需刷新页面：状态就地翻成就绪，并通知全站横幅复核。
+    expect(changed).toBe(1)
+    expect(wrapper!.text()).toContain('实例加密服务已初始化')
+    expect(wrapper!.text()).toContain('主密钥已就绪')
+  })
+
+  it('saves a key on an uninitialised instance without an explicit init step', async () => {
+    // R2-1 主链路（页面侧）：存量实例 → 录入 API Key → 保存 → 状态就地翻成就绪。
+    const uninitialized = {
+      ...(secretsReady() as Record<string, unknown>),
+      state: 'uninitialized',
+      key_id: '',
+      initialized_at: '',
+      can_initialize: true,
+    }
+    let saved = false
+    const calls = mountForm((call) => {
+      if (call.method === 'GET' && call.path === SECRETS_PATH) {
+        return envelope(200, 'OK', 'success', saved ? secretsReady() : uninitialized)
+      }
+      if (call.method === 'POST' && call.path === MODEL_PATH) {
+        saved = true
+        return envelope(200, 'OK', 'success', modelView('https://api.example.com/v1', ETAG_V1), ETAG_V1)
+      }
+      return undefined
+    }, 'model-connections')
+    await flushPromises()
+
+    await wrapper!.find('#resource-name').setValue('main')
+    await wrapper!.find('#resource-base-url').setValue('https://api.example.com/v1')
+    await wrapper!.find('#resource-default-model').setValue('m1')
+    await wrapper!.find('#resource-api-key').setValue(SECRET)
+    await button('创建并发布').trigger('click')
+    await flushPromises()
+
+    expect(required(resourceCalls(calls)[0], '创建请求').body).toMatchObject({
+      api_key: SECRET,
+      credential_mode: 'managed',
+    })
+    // 保存后重新读取状态：不需要手动初始化，也没有额外点击。
+    expect(calls.filter((call) => call.method === 'POST' && call.path === `${SECRETS_PATH}/init`)).toHaveLength(0)
+    expect(wrapper!.text()).toContain('就绪（k_test…）')
+    expect(wrapper!.text()).toContain('主密钥已就绪')
+  })
+
+  it('disables managed only for an explicit pure-env deployment', async () => {
+    mountForm(() => {
+      return envelope(200, 'OK', 'success', {
+        ...(secretsReady() as Record<string, unknown>),
+        state: 'uninitialized',
+        key_id: '',
+        initialized_at: '',
+        can_initialize: false,
+      })
+    }, 'model-connections')
+    await flushPromises()
+
+    // 只有显式纯 env（can_initialize=false）才禁用托管；env 来源保持可用。
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="managed"]').attributes('disabled'),
+    ).toBeDefined()
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="env"]').attributes('disabled'),
+    ).toBeUndefined()
+    const text = wrapper!.text()
+    expect(text).toContain('此实例以纯环境变量方式部署（secrets.auto_init: false）；加密托管不可用。')
+    expect(text).toContain('不接受加密托管')
+    // 不能就地初始化时不提供初始化按钮。
+    expect(wrapper!.findAll('button').some((item) => item.text() === '初始化实例加密')).toBe(false)
+  })
+
+  it('disables the managed source in recovery and names the recovery guide', async () => {
+    mountForm(() => {
+      return envelope(200, 'OK', 'success', {
+        ...(secretsReady() as Record<string, unknown>),
+        state: 'recovery_required',
+        key_id: '',
+        recovery_reason: 'missing',
+        can_initialize: false,
+      })
+    }, 'model-connections')
+    await flushPromises()
+
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="managed"]').attributes('disabled'),
+    ).toBeDefined()
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="env"]').attributes('disabled'),
+    ).toBeUndefined()
+    const text = wrapper!.text()
+    expect(text).toContain('实例加密服务需要恢复（密钥文件不存在）')
+    expect(text).toContain('docs/Operations.md')
+    // 恢复态不提供「初始化」按钮：那是重建密钥，属恢复流程，不由表单发起。
+    expect(wrapper!.findAll('button').some((item) => item.text() === '初始化实例加密')).toBe(false)
+  })
+
+  it('keeps the managed source selectable when the status read fails', async () => {
+    mountForm((call) => {
+      if (call.path === SECRETS_PATH) {
+        throw new Error('secrets offline')
+      }
+      if (call.method === 'POST' && call.path === MODEL_PATH) {
+        return envelope(200, 'OK', 'success', modelView('https://api.example.com/v1', ETAG_V1), ETAG_V1)
+      }
+      return undefined
+    }, 'model-connections')
+    await flushPromises()
+
+    // 读不到状态不擅自禁用：服务端仍是最终闸门，页面只把不确定性说清楚。
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="managed"]').attributes('disabled'),
+    ).toBeUndefined()
+    expect(wrapper!.text()).toContain('读取实例加密状态失败')
+    expect(wrapper!.text()).toContain('服务端仍是最终闸门')
   })
 
   it('accepts a pasted placeholder in env mode and shows the current reference', async () => {

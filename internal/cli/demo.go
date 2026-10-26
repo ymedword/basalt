@@ -3,22 +3,18 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/ymedword/basalt/examples"
+	"github.com/ymedword/basalt/internal/builtin"
 )
 
 // demo 命令把仓库自带的五个每日 Demo 装进工作区：复制 Agent 目录与技能、生成
@@ -41,32 +37,13 @@ const demoSkillsDirName = "skills"
 // 读这些生成物（AGENT.md / 清单 / 样例库 / 导出源码）。
 // Workspace tree permissions: 0750 directories (same as internal/workspace) and
 // 0600 files, deliberately stricter than the bootstrap files.
-//
-// demoPythonProbe 是解释器探针的固定脚本：只打印主版本号，用来识破 Windows 上
-// "LookPath 成功但执行即退出"的 Microsoft Store 占位程序。
-// demoPythonProbe prints only the major version so the Store stub is detected.
-const demoPythonProbe = "import sqlite3, sys; print(sys.version_info[0])"
 
-// demoSpec 是一份 Demo 的安装描述：哪些 MCP server、哪些环境变量、要不要样例库。
-// demoSpec describes one bundled demo and what it needs to become runnable.
-type demoSpec struct {
-	Name        string
-	Title       string
-	MCPServers  []string
-	EnvKeys     []string
-	Skill       string
-	NeedsSample bool
-}
+// demoSpec / demoSpecs 直接取 internal/builtin 的清单：**五个内置 Agent 是哪五个、
+// 各要什么**只在那一处定义，`basalt demo install` 与启动期自动准备不存在第二份清单。
+// demoSpec / demoSpecs alias the single list owned by internal/builtin.
+type demoSpec = builtin.Agent
 
-// demoSpecs 是内置 Demo 的唯一清单（顺序即安装顺序，也是报告的打印顺序）。
-// demoSpecs is the single list of bundled demos; order drives install and report.
-var demoSpecs = []demoSpec{
-	{Name: "biz-daily", Title: "业务数据体检", MCPServers: []string{"dbhub"}, NeedsSample: true},
-	{Name: "docs-diff", Title: "文档变更", MCPServers: []string{"docs-readonly"}},
-	{Name: "github-radar", Title: "GitHub 星标雷达", MCPServers: []string{"github"}, EnvKeys: []string{"GITHUB_PERSONAL_ACCESS_TOKEN"}},
-	{Name: "industry-brief", Title: "行业简报", MCPServers: []string{"brave-search", "fetch"}, EnvKeys: []string{"BRAVE_API_KEY"}},
-	{Name: "repo-digest", Title: "代码仓库日报", MCPServers: []string{"github"}, EnvKeys: []string{"GITHUB_PERSONAL_ACCESS_TOKEN"}, Skill: "repo-digest"},
-}
+var demoSpecs = builtin.Agents()
 
 // mcpDep 是一条固定版本的 MCP 依赖（版本经 npm / GitHub Releases 实测，2026-10-26）。
 // mcpDep pins one MCP dependency; versions were measured on 2026-10-26.
@@ -194,11 +171,13 @@ type demoSampleDB struct {
 	Note  string `json:"note,omitempty"`
 }
 
-// 安装状态常量：新增、保留、待生成。
+// 安装状态常量：新增、保留、待生成。取值直接别名 internal/builtin——报告要比较的
+// 正是那边返回的字符串，两处各写一份字面量只会在某次改动后悄悄对不上。
+// The state constants alias internal/builtin so the report compares the same values.
 const (
-	demoStateInstalled = "installed"
-	demoStateKept      = "kept"
-	demoStatePending   = "pending"
+	demoStateInstalled = builtin.StateInstalled
+	demoStateKept      = builtin.StateKept
+	demoStatePending   = builtin.StatePending
 )
 
 // newDemoCommand 组装 demo 命令组；当前只交付 install。
@@ -379,187 +358,34 @@ func demoPendingItems(spec demoSpec) []string {
 // skip 是目标根下一级的目录名黑名单——Agent 目录里的 skills/ 由安装器单独装到
 // <workspace>/skills，复制进 Agent 目录只会让加载器打 WARN 并留下重复副本。
 // copyDemoTree copies one embedded subtree; an existing target is kept unless forced.
-// Names in skip are dropped from the first level below the root.
 func copyDemoTree(srcRoot, dstRoot string, force bool, skip map[string]bool) (string, error) {
-	if _, err := os.Stat(dstRoot); err == nil {
-		if !force {
-			return demoStateKept, nil
-		}
-		if err := os.RemoveAll(dstRoot); err != nil {
-			return "", fmt.Errorf("清理旧目录 %s：%w", dstRoot, err)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("检查目标 %s：%w", dstRoot, err)
-	}
-	err := fs.WalkDir(examples.Assets, srcRoot, func(p string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, relErr := filepath.Rel(filepath.FromSlash(srcRoot), filepath.FromSlash(p))
-		if relErr != nil {
-			return relErr
-		}
-		if first := firstPathElement(rel); first != "" && skip[first] {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		target := filepath.Join(dstRoot, rel)
-		if entry.IsDir() {
-			return os.MkdirAll(target, 0o750)
-		}
-		data, readErr := fs.ReadFile(examples.Assets, p)
-		if readErr != nil {
-			return readErr
-		}
-		return os.WriteFile(target, data, 0o600)
-	})
-	if err != nil {
-		return "", err
-	}
-	return demoStateInstalled, nil
+	return builtin.CopyTree(srcRoot, dstRoot, force, skip)
 }
 
 // blankDemoModel 把 frontmatter 里 provider 块的 model 值改成空字符串——空模型
 // 让 Agent 装载期按「blank model」拒绝注册，正好表达「装好但等配置」。
 // blankDemoModel clears provider.model so the loader refuses to register the
 // agent until an operator fills it in.
-func blankDemoModel(agentFile string) (err error) {
-	// 读写都经 os.Root 钉在 AGENT.md 所在目录内：目标是内嵌素材复制出来的固定文件，
-	// 路径由安装器拼出来，用根句柄把"只能是这个目录里的这个名字"写进代码而不是注释。
-	// Both the read and the write go through an os.Root on the agent directory.
-	dir, err := os.OpenRoot(filepath.Dir(agentFile))
-	if err != nil {
-		return fmt.Errorf("打开 %s 所在目录：%w", agentFile, err)
-	}
-	defer func() {
-		if closeErr := dir.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("关闭 %s 所在目录：%w", agentFile, closeErr)
-		}
-	}()
-	name := filepath.Base(agentFile)
-	source, err := dir.Open(name)
-	if err != nil {
-		return fmt.Errorf("读取 %s：%w", agentFile, err)
-	}
-	data, err := io.ReadAll(source)
-	if closeErr := source.Close(); err == nil && closeErr != nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("读取 %s：%w", agentFile, err)
-	}
-	lines := strings.Split(string(data), "\n")
-	inFrontmatter, inProvider, done := false, false, false
-	for i, line := range lines {
-		trimmed := strings.TrimRight(line, "\r")
-		if trimmed == "---" {
-			if inFrontmatter {
-				break
-			}
-			inFrontmatter = true
-			continue
-		}
-		if !inFrontmatter {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "provider:") {
-			inProvider = true
-			continue
-		}
-		if !inProvider {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "  model:") {
-			lines[i] = `  model: ""`
-			done = true
-			break
-		}
-		if !strings.HasPrefix(trimmed, "  ") {
-			break
-		}
-	}
-	if !done {
-		return fmt.Errorf("%s 里找不到 provider.model 行", agentFile)
-	}
-	target, err := dir.OpenFile(name, os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("写入 %s：%w", agentFile, err)
-	}
-	if _, err := target.WriteString(strings.Join(lines, "\n")); err != nil {
-		closeErr := target.Close()
-		if closeErr != nil {
-			return fmt.Errorf("写入 %s：%w（关闭也失败：%v）", agentFile, err, closeErr)
-		}
-		return fmt.Errorf("写入 %s：%w", agentFile, err)
-	}
-	if err := target.Close(); err != nil {
-		return fmt.Errorf("写入 %s：%w", agentFile, err)
-	}
-	return nil
+func blankDemoModel(agentFile string) error {
+	return builtin.BlankModel(agentFile)
 }
 
 // installDemoSampleDB 用内嵌脚本生成只读样例库；缺 Python 时记 pending 而不失败。
-// installDemoSampleDB generates the sample database; a missing interpreter is
-// reported as pending rather than aborting the whole install.
+// 生成细节（解释器探测、脚本、夹具路径）全在 internal/builtin：启动期自动准备走同一条。
+// installDemoSampleDB generates the sample database through the shared builtin helper;
+// a missing interpreter is reported as pending rather than aborting the whole install.
 func installDemoSampleDB(ctx context.Context, wsRoot string, force bool) (demoSampleDB, error) {
-	dbPath := demoDBHubSamplePath(wsRoot)
-	if _, err := os.Stat(dbPath); err == nil && !force {
-		return demoSampleDB{Path: dbPath, State: demoStateKept}, nil
-	}
-	interpreter, err := findDemoPython(ctx)
+	sample, err := builtin.EnsureSampleDB(ctx, wsRoot, force)
 	if err != nil {
-		return demoSampleDB{Path: dbPath, State: demoStatePending, Note: "未找到可用的 Python 3：" + err.Error()}, nil
+		return demoSampleDB{}, err
 	}
-	scriptDir := filepath.Join(wsRoot, "demos", "scripts")
-	if err := os.MkdirAll(scriptDir, 0o750); err != nil {
-		return demoSampleDB{}, fmt.Errorf("创建脚本目录 %s：%w", scriptDir, err)
-	}
-	scriptPath := filepath.Join(scriptDir, "make_sample_db.py")
-	script, err := fs.ReadFile(examples.Assets, "shared/scripts/make_sample_db.py")
-	if err != nil {
-		return demoSampleDB{}, fmt.Errorf("读取样例库脚本：%w", err)
-	}
-	if err := os.WriteFile(scriptPath, script, 0o600); err != nil {
-		return demoSampleDB{}, fmt.Errorf("写出样例库脚本 %s：%w", scriptPath, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
-		return demoSampleDB{}, fmt.Errorf("创建样例目录 %s：%w", filepath.Dir(dbPath), err)
-	}
-	fixtures := filepath.Join(wsRoot, agentsDirName, "biz-daily", "fixtures")
-	args := []string{
-		scriptPath,
-		"--schema", filepath.Join(fixtures, "schema.sql"),
-		"--rows", filepath.Join(fixtures, "rows.json"),
-		"--out", dbPath,
-	}
-	if force {
-		args = append(args, "--force")
-	}
-	// #nosec G204 -- 豁免理由（用户 2026-10-26 裁决，沿用 2026-10-17 口径）：
-	// ① 可执行名是 findDemoPython 实跑探针通过的 LookPath 结果（候选只有
-	// python3 / python / py），argv 是安装器自己拼的脚本路径与内嵌夹具，不经 shell，
-	// `--demo` 只影响已校验的 Demo 名，没有把用户输入变成命令行的通道；
-	// ② G204 只接受常量实参，运行期的工作区路径静态不可见，无法用代码消除；
-	// ③ 改走 env 传参或动态分派只会把审计点藏起来，风险不变、可读性更差。
-	// #nosec G204 -- vetted interpreter plus installer-built argv, never via a shell;
-	// constant-only argv is impossible because workspace paths are runtime values.
-	output, runErr := exec.CommandContext(ctx, interpreter, args...).CombinedOutput()
-	if runErr != nil {
-		return demoSampleDB{
-			Path:  dbPath,
-			State: demoStatePending,
-			Note:  fmt.Sprintf("生成失败（%v）：%s", runErr, strings.TrimSpace(string(output))),
-		}, nil
-	}
-	return demoSampleDB{Path: dbPath, State: demoStateInstalled, Note: describeSampleDBNote(string(output))}, nil
+	return demoSampleDB{Path: sample.Path, State: sample.State, Note: sample.Note}, nil
 }
 
 // demoDBHubSamplePath 是样例库的固定落点（生成、配置、报告共用一份来源）。
 // demoDBHubSamplePath is the single source of the sample database location.
 func demoDBHubSamplePath(wsRoot string) string {
-	return filepath.Join(wsRoot, "samples", "biz-sample.db")
+	return builtin.SampleDBPath(wsRoot)
 }
 
 // needsDemoSample 报告本次选择里是否有需要样例库的 Demo。
@@ -571,19 +397,6 @@ func needsDemoSample(selected []demoSpec) bool {
 		}
 	}
 	return false
-}
-
-// firstPathElement 取相对路径的第一段（根自身返回空串），用于跳过指定子目录。
-// firstPathElement returns the first segment of a relative path ("" for the root).
-func firstPathElement(rel string) string {
-	slash := filepath.ToSlash(rel)
-	if slash == "." {
-		return ""
-	}
-	if idx := strings.IndexByte(slash, '/'); idx >= 0 {
-		return slash[:idx]
-	}
-	return slash
 }
 
 // demoSrcDir 是自研 MCP 源码在工作区里的固定落点（报告、构建命令与安装共用一份来源）。
@@ -634,99 +447,27 @@ func installDemoSource(wsRoot string, force bool) (demoSourceAsset, error) {
 	return demoSourceAsset{Path: dir, State: state, GoMod: gomodPath}, nil
 }
 
-// demoDBHubConfigText 是配置正文模板（%s 处填 DSN）：1.5.0 的只读面与行数上限只能
-// 写在配置里，`--readonly` 启动参数在该版本已被移除（2026-10-26 实测）。
-// demoDBHubConfigText is the config body; %s is the DSN literal.
-const demoDBHubConfigText = `# @bytebase/dbhub 1.5.0 的只读配置（由 basalt demo install 生成）。
-# Read-only DBHub config generated by "basalt demo install".
-[[sources]]
-id = "default"
-dsn = %s
-
-[[tools]]
-name = "execute_sql"
-source = "default"
-readonly = true
-max_rows = 500
-`
-
-// demoDBHubConfig 按样例库路径渲染只读配置（DSN 用 sqlite:/// + 绝对路径）。
-// demoDBHubConfig renders the read-only config for the given sample database.
-func demoDBHubConfig(dbPath string) string {
-	dsn := "sqlite:///" + filepath.ToSlash(dbPath)
-	return fmt.Sprintf(demoDBHubConfigText, strconv.Quote(dsn))
-}
-
 // writeDemoDBHubConfig 把只读配置写到 <workspace>/demos/mcp/dbhub.toml。写它不等于
-// 接入：真正生效还要求用户把它写进 mcp_servers.yaml 的 --config。
-// writeDemoDBHubConfig writes the config file; wiring it up stays the operator's job.
+// 接入：本命令不改 mcp_servers.yaml，接入由用户确认（或首次启动的安装器代写）。
+// writeDemoDBHubConfig writes the config file; wiring it up is the installer's job.
 func writeDemoDBHubConfig(wsRoot, dbPath string) (string, error) {
-	target := filepath.Join(wsRoot, "demos", "mcp", "dbhub.toml")
+	target := builtin.DBHubConfigPath(wsRoot)
 	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 		return "", fmt.Errorf("创建配置目录 %s：%w", filepath.Dir(target), err)
 	}
-	if err := os.WriteFile(target, []byte(demoDBHubConfig(dbPath)), 0o600); err != nil {
+	if err := os.WriteFile(target, []byte(builtin.DBHubConfig(dbPath)), 0o600); err != nil {
 		return "", fmt.Errorf("写出 DBHub 配置 %s：%w", target, err)
 	}
 	return target, nil
-}
-
-// describeSampleDBNote 把生成器的 JSON 摘要压成一行事实（表名 / 行数 / 库哈希前
-// 12 位）；摘要不是 JSON 时原样保留——宁可不美化，也不编造读数。
-// describeSampleDBNote condenses the generator's JSON summary into one factual line.
-func describeSampleDBNote(output string) string {
-	var summary struct {
-		Table string `json:"table"`
-		Rows  struct {
-			Count int `json:"count"`
-		} `json:"rows"`
-		DB struct {
-			SHA256 string `json:"sha256"`
-		} `json:"db"`
-	}
-	if err := json.Unmarshal([]byte(output), &summary); err != nil {
-		return firstLine(strings.TrimSpace(output))
-	}
-	hash := summary.DB.SHA256
-	if len(hash) > 12 {
-		hash = hash[:12] + "…"
-	}
-	return fmt.Sprintf("%s 表 %d 行，库 sha256 %s", summary.Table, summary.Rows.Count, hash)
 }
 
 // findDemoPython 依次尝试 python3 / python / py——与 SETUP 里教用户的口径一致。
 // 命中的候选必须**跑一次探针**（版本号 3 且能 import sqlite3）：Windows 的
 // `python` 常是 Microsoft Store 的占位程序，LookPath 成功而执行即退出 9009——
 // 直接采信 LookPath 会把「没有解释器」误报成「脚本失败」。
-// findDemoPython probes the three documented names and requires each candidate to
-// actually run: on Windows `python` is often the Store stub, which LookPath finds
-// but which cannot execute.
+// findDemoPython probes the three documented names and requires each candidate to run.
 func findDemoPython(ctx context.Context) (string, error) {
-	var failures []string
-	for _, name := range []string{"python3", "python", "py"} {
-		resolved, err := exec.LookPath(name)
-		if err != nil {
-			continue
-		}
-		// #nosec G204 -- 豁免理由（用户 2026-10-26 裁决）：可执行名来自本次
-		// LookPath，实参全是常量（-c + demoPythonProbe）；探针的目的正是判断这个
-		// 候选"能不能跑"，所以名字必然是运行期值，无法写成常量。
-		// #nosec G204 -- the name is this loop's LookPath result; all argv are constants.
-		output, probeErr := exec.CommandContext(ctx, resolved, "-c", demoPythonProbe).CombinedOutput()
-		if probeErr != nil {
-			failures = append(failures, fmt.Sprintf("%s 不可执行（%v）", resolved, probeErr))
-			continue
-		}
-		if strings.TrimSpace(string(output)) != "3" {
-			failures = append(failures, fmt.Sprintf("%s 不是 Python 3", resolved))
-			continue
-		}
-		return resolved, nil
-	}
-	if len(failures) == 0 {
-		return "", errors.New("PATH 里没有 python3 / python / py")
-	}
-	return "", errors.New(strings.Join(failures, "；"))
+	return builtin.FindPython(ctx)
 }
 
 // writeDemoManifest 把安装清单写到 <workspace>/demos/install.json（覆盖写）。
@@ -953,8 +694,5 @@ func demoStateLabel(state string) string {
 // firstLine 取多行输出的第一行（样例库脚本会打印 JSON 摘要）。
 // firstLine keeps the first line of a multi-line tool output.
 func firstLine(text string) string {
-	if idx := strings.IndexByte(text, '\n'); idx >= 0 {
-		return text[:idx]
-	}
-	return text
+	return builtin.FirstLine(text)
 }

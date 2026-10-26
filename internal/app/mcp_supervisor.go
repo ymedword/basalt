@@ -100,13 +100,19 @@ type MCPServerStatus struct {
 // TestTimeout are the assembly/test seams. OnConnected publishes the connected tool
 // adapters to the assembly layer; one-off Test connections never trigger it.
 type MCPSupervisorDeps struct {
-	Policy         core.Policy
-	Gate           *core.ResourceGate
-	Logger         *slog.Logger
-	Now            func() time.Time
-	Audit          func(MCPAuditEvent)
-	MarkApplied    func(ctx context.Context, name string, versionID int64) error
-	OnConnected    func(conns []tool.MCPConnection)
+	Policy      core.Policy
+	Gate        *core.ResourceGate
+	Logger      *slog.Logger
+	Now         func() time.Time
+	Audit       func(MCPAuditEvent)
+	MarkApplied func(ctx context.Context, name string, versionID int64) error
+	OnConnected func(conns []tool.MCPConnection)
+	// ReplaceTools 在受控重建的提交段（gate 写锁 + entry.mu 内）整组换掉某个 server 在
+	// 注册池里的工具实例与来源表条目。它是 `Replace` 唯一的注册接缝：换池与 CAS 必须在
+	// 同一段临界区里发生，否则新 Run 可能看到"指针已换、工具还是旧的"（C1 / C4）。
+	// ReplaceTools is the single registration seam of a controlled apply; it runs in the
+	// same critical section as the CAS so no run sees a half-switched tool set.
+	ReplaceTools   func(server string, tools []core.Tool)
 	NewConnector   func() mcpConnector
 	TestTimeout    time.Duration
 	Root           string
@@ -130,9 +136,13 @@ type MCPSupervisor struct {
 // mcpServerEntry holds one server's state; epoch invalidates a connect superseded while
 // waiting for the gate.
 type mcpServerEntry struct {
-	mu     sync.Mutex
-	epoch  uint64
-	conn   mcpConnector
+	mu    sync.Mutex
+	epoch uint64
+	conn  mcpConnector
+	// link 是当前这代连接的门（14D）：受控重建与撤销靠它把"新调用拒绝、在途调用覆盖到"
+	// 落到这一代的具体工具实例上。没有连接时为 nil。
+	// link gates this generation's calls; nil while no connection is installed.
+	link   *mcpLink
 	status MCPServerStatus
 	// httpHost 是已建立 http 连接的目标主机（小写；stdio 为空）。撤销判定只看它：
 	// `status` 里没有 URL（约束 23 的脱敏面），而白名单收紧后必须能按 host 重新判定。
@@ -205,12 +215,19 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 		return fmt.Errorf("%w: %w", core.ErrPolicyDenied, err)
 	}
 
-	// 重启语义：旧连接先收（仍在启动 / 连接期，锁是单独持有的，不涉及 gate）。
+	// 重启语义：旧连接先收（仍在启动 / 连接期，锁是单独持有的，不涉及 gate）。启停路径
+	// 不做排空——它换的是**整个进程的生命周期**，旧代工具随连接一起作废，先封门再关闭，
+	// 让仍在池里的旧实例拿到明确拒绝而不是静默写进已关闭的管道。
+	// Start seals the old generation's gate before closing it; only apply drains.
 	if entry.conn != nil {
+		if entry.link != nil {
+			entry.link.seal(mcpLinkClosedReason)
+		}
 		if err := entry.conn.Close(); err != nil {
 			s.deps.Logger.Error("关闭旧 MCP 连接失败", "server", cfg.Name, "detail", mcpErrorSummary(err))
 		}
 		entry.conn = nil
+		entry.link = nil
 	}
 
 	connector := s.newConnector()
@@ -235,7 +252,13 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 		return err
 	}
 
+	// 这一代连接的门在这里挂上：连接结果里的工具全部换成过门的包装实例，注册池与视图
+	// 此后拿到的都是它们——受控重建时封门即可覆盖到每一个已发出的调用。
+	// The generation gate is created here and every adapter is wrapped behind it.
+	link := newMCPLink(cfg.Name)
+	conns = mcpWrapConnections(link, conns)
 	entry.conn = connector
+	entry.link = link
 	// 只记 http 目标主机供白名单收紧后重新判定（R8.2.3）；stdio 留空。
 	// Only the http host is remembered for later revocation; stdio leaves it empty.
 	entry.httpHost = ""
@@ -258,7 +281,7 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 	// connection closed, and a superseded connect never publishes tools.
 	applied, applyErr := s.markApplied(ctx, entry, epoch, published)
 	if applyErr != nil {
-		s.abandonApply(entry, epoch, connector, cfg)
+		s.abandonApply(entry, epoch, connector, link, cfg)
 		return applyErr
 	}
 	if !applied {
@@ -282,18 +305,22 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 // abandonApply fails the connection closed when applied cannot be recorded, keeping
 // the previous applied version.
 func (s *MCPSupervisor) abandonApply(entry *mcpServerEntry, epoch uint64,
-	connector mcpConnector, cfg core.MCPServerConfig,
+	connector mcpConnector, link *mcpLink, cfg core.MCPServerConfig,
 ) {
 	entry.mu.Lock()
 	stillOurs := entry.epoch == epoch
 	if stillOurs {
 		entry.conn = nil
+		entry.link = nil
 		entry.status.Connected = false
 		entry.status.Tools = nil
 		entry.status.Error = mcpStatusApplyFailed
 	}
 	entry.mu.Unlock()
 	if stillOurs {
+		if link != nil {
+			link.seal(mcpLinkClosedReason)
+		}
 		if closeErr := connector.Close(); closeErr != nil {
 			s.deps.Logger.Error("关闭 applied 落库失败的 MCP 连接失败", "server", cfg.Name,
 				"detail", mcpErrorSummary(closeErr))
@@ -315,11 +342,16 @@ func (s *MCPSupervisor) Stop(ctx context.Context, name string) error {
 	entry.mu.Lock()
 	entry.epoch++
 	conn := entry.conn
+	link := entry.link
 	entry.conn = nil
+	entry.link = nil
 	entry.httpHost = ""
 	entry.status.Connected = false
 	entry.status.Tools = nil
 	entry.mu.Unlock()
+	if link != nil {
+		link.seal(mcpLinkClosedReason)
+	}
 	if conn == nil {
 		return nil
 	}
@@ -352,15 +384,21 @@ func (s *MCPSupervisor) RevokeDisallowedHTTP(stillAllowed func(host string) bool
 		}
 		entry.epoch++
 		conn := entry.conn
+		link := entry.link
 		name := entry.status.Name
 		host := entry.httpHost
 		entry.conn = nil
+		entry.link = nil
 		entry.httpHost = ""
 		entry.status.Connected = false
 		entry.status.Tools = nil
 		entry.status.Error = mcpStatusAllowlistRevoked
 		entry.mu.Unlock()
 
+		if link != nil {
+			// 白名单收紧与凭据撤销同属"策略先行"：门立刻关死，之后的调用拒绝发出。
+			link.seal(mcpStatusAllowlistRevoked)
+		}
 		if closeErr := conn.Close(); closeErr != nil {
 			// 关闭失败只记 ERROR：策略已持久化，数据库是权威（R8.2.4 第 7 条）。
 			s.deps.Logger.Error("failed to close revoked MCP http link; policy is already in effect",

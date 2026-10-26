@@ -1,11 +1,15 @@
 // US-12 资源列表回归（R7 收敛）：模型连接列表只留选择连接需要的四列——名称 /
 // 默认模型 / 范围 / 本地就绪；UID、地址、凭据、版本、所有者与引用者都在详情页。
 // 列表不含任何密钥、地址或 UID 回显载体；本地就绪与实测结果是两件事。
+// 14D 增量：MCP 列表的「凭据」列按契约四档汇总槽位状态，未声明来源单独标红；
+// 列表不写尾号，也不把「未发布」判成「缺值」。
 // R7: the list keeps only name, default model, scope and local readiness. Address,
 // credentials, versions, owner and referencers live on the detail page; readiness is
-// never presented as a recorded test.
+// never presented as a recorded test. 14D adds an MCP credential column that groups
+// slots by their four contract states and never shows a tail.
 import { mount, flushPromises } from '@vue/test-utils'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { McpServerView } from '../src/api'
 import { createConsoleApp } from '../src/app'
 
 interface Call {
@@ -78,6 +82,50 @@ const connections = [
 ]
 
 let wrapper: ReturnType<typeof mount> | undefined
+
+/**
+ * MCP 列表夹具：一条未发布（不判断凭据），一条四档槽位齐全且带一个未声明槽位。
+ * One unpublished entry (nothing to judge) and one covering every slot state plus an
+ * undeclared slot.
+ */
+const mcpServers: McpServerView[] = [
+  {
+    name: 'draft',
+    transport: 'stdio',
+    command: 'draft-mcp',
+    env_keys: [],
+    header_keys: [],
+    credential_keys: [],
+    connected: false,
+    tools: [],
+    published_version_id: 0,
+    published_version_no: 0,
+    applied_version_id: 0,
+    applied_version_no: 0,
+    pending_restart: false,
+    tool_disposition: null,
+  },
+  {
+    name: 'github',
+    transport: 'stdio',
+    command: 'npx',
+    env_keys: ['GITHUB_PAT', 'MISSING_KEY', 'REVOKED_KEY', 'UNDECLARED_KEY'],
+    header_keys: [],
+    credential_keys: [
+      { key: 'GITHUB_PAT', mode: 'managed', state: 'managed', last4: '9f2c' },
+      { key: 'MISSING_KEY', mode: 'managed', state: 'missing', last4: '' },
+      { key: 'REVOKED_KEY', mode: 'managed', state: 'managed_revoked', last4: '12ab' },
+    ],
+    connected: true,
+    tools: ['search_repositories'],
+    published_version_id: 3,
+    published_version_no: 3,
+    applied_version_id: 2,
+    applied_version_no: 2,
+    pending_restart: true,
+    tool_disposition: { offered: 1, accepted: 1, skipped: [] },
+  },
+]
 
 function toResponse(data: unknown): Response {
   return {
@@ -165,5 +213,54 @@ describe('model connection list', () => {
     const note = wrapper!.find('.page-description').text()
     expect(note).toContain('本地配置就绪不代表已实测连通')
     expect(note).toContain('实测结果与时间单独记录')
+  })
+})
+
+describe('MCP credential column', () => {
+  async function openMcpList(): Promise<void> {
+    await signIn((call) => (call.path === '/api/v1/mcp-servers' ? mcpServers : undefined))
+    await visit('/console/resources/mcp-servers')
+  }
+
+  it('groups slots by contract state and counts undeclared ones separately', async () => {
+    await openMcpList()
+
+    const headers = wrapper!.findAll('.mcp-table thead th').map((cell) => cell.text())
+    expect(headers).toEqual([
+      '名称',
+      '传输',
+      '可执行名',
+      '占位符键',
+      '凭据',
+      '连接',
+      '工具',
+      '发布版本',
+      '已应用',
+      '待重启',
+    ])
+
+    const rows = wrapper!.findAll('.mcp-table tbody tr')
+    expect(rows).toHaveLength(2)
+
+    // 未发布：不判断凭据（既不写“无”，也不写“缺值”）。
+    const draftCells = rows[0]!.findAll('td')
+    expect(draftCells[4]!.text()).toBe('—')
+
+    // 已发布：四档按固定顺序计数；未声明来源会让下一次保存被拒，单独标红。
+    const cells = rows[1]!.findAll('td')
+    // 请求头名与 env 键同一列；stdio 没有请求头，列里就是 env 键。
+    expect(cells[3]!.text()).toBe('GITHUB_PAT、MISSING_KEY、REVOKED_KEY、UNDECLARED_KEY')
+    expect(
+      cells[4]!.findAll('.badge').map((item) => item.text()),
+    ).toEqual(['托管有效', '缺托管值', '托管已撤销', '未声明来源 ×1'])
+  })
+
+  it('never renders a credential tail or a value in the list', async () => {
+    await openMcpList()
+    const text = wrapper!.text()
+    // 尾号与任何值形态都不进列表；逐槽位明细与撤销入口只在详情页。
+    expect(text).not.toContain('9f2c')
+    expect(text).not.toContain('12ab')
+    expect(text).not.toContain('····')
   })
 })

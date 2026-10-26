@@ -66,7 +66,7 @@ func testBootstrapInitIdempotent(t *testing.T) {
 	requireExit(t, second, 0, "init 二次")
 	requireContains(t, second.Stdout, "新建：（无）", "init 二次")
 	requireContains(t, second.Stdout, "保留（", "init 二次")
-	requireContains(t, second.Stdout, "已存在，零写（schema v5）", "init 二次")
+	requireContains(t, second.Stdout, "已存在，零写（schema v6）", "init 二次")
 
 	for _, rel := range files {
 		path := filepath.Join(h.Root, ".basalt", filepath.FromSlash(rel))
@@ -77,14 +77,14 @@ func testBootstrapInitIdempotent(t *testing.T) {
 }
 
 // testBootstrapStatusNoConfig：无配置文件时 `status` 仍 exit 0，且明示「未发现配置」。
-// 判据（US-1 §6 Demo ③）：库、schema 版本、29 张表就绪，汇总全部通过。
+// 判据（US-1 §6 Demo ③）：库、schema 版本、33 张表就绪，汇总全部通过。
 func testBootstrapStatusNoConfig(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
 
 	res := h.run(t, nil, "status")
 	requireExit(t, res, 0, "status 无配置")
-	for _, want := range []string{"未发现配置", "schema v5", "29 张表", "汇总：全部通过"} {
+	for _, want := range []string{"未发现配置", "schema v6", "33 张表", "汇总：全部通过"} {
 		requireContains(t, res.Stdout, want, "status 无配置")
 	}
 }
@@ -510,8 +510,8 @@ func testBootstrapCLIImportGraph(t *testing.T) {
 	requireContains(t, string(run), "Agents: agentsPort{", "agentsPort 注入")
 }
 
-// testBootstrapToolList：`tool list` 冒烟——十件内置工具（US-5 §6.1 第 4 项；US-6 §6.1
-// 第 11 项记录历史读数八件的差异，以现行件数为判据）。
+// testBootstrapToolList：`tool list` 冒烟——十一件内置工具（US-5 §6.1 第 4 项；US-6 §6.1
+// 第 11 项记录历史读数八件的差异，以现行件数为判据；14D T125 增 web_search 至 11 件）。
 func testBootstrapToolList(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
@@ -519,10 +519,10 @@ func testBootstrapToolList(t *testing.T) {
 
 	res := h.run(t, fixtureEnv(), "tool", "list")
 	requireExit(t, res, 0, "tool list")
-	requireContains(t, res.Stdout, "共 10 件工具", "tool list")
+	requireContains(t, res.Stdout, "共 11 件工具", "tool list")
 	for _, name := range []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify",
-		"read_file", "recall_memory", "save_memory", "shell", "write_file",
+		"read_file", "recall_memory", "save_memory", "shell", "web_search", "write_file",
 	} {
 		requireContains(t, res.Stdout, name+"：", "tool list "+name)
 	}

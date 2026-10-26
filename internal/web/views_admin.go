@@ -242,12 +242,14 @@ func resourcePublishResultView(req core.ResourcePublishRequest, result core.Reso
 // `credential_ref` 是**服务端生成**的凭据身份引用，不携带任何凭据材料。
 // `credential_state` 在成功路径上恒为 `revoked`（契约枚举只有这一个值）；
 // `revoked_versions` 是撤销后该身份的全部版本数（活跃版本永远是 0）。
+// `binding_key` 只在 MCP server 的逐占位符撤销里非空（14D 增量），其它 owner 恒为空串。
 // `ETag` 只进响应头：契约的 CredentialRevokeResult 没有 etag 字段（与 scope 结果
 // 不同），因此用 `json:"-"` 承载，响应体不重复。
 // CredentialRevokeView is the contract's revoke result. ETag is header-only because
 // the contract schema has no etag field on this one.
 type CredentialRevokeView struct {
 	ResourceUID     string `json:"resource_uid"`
+	BindingKey      string `json:"binding_key"`
 	CredentialRef   string `json:"credential_ref"`
 	CredentialState string `json:"credential_state"`
 	RevokedVersions int    `json:"revoked_versions"`
@@ -596,29 +598,30 @@ const (
 // 其余键——定义正文、凭证、内部路径——**不得**经由本结构出站。
 // ErrorDataView is the whitelisted failure payload: the four string arrays, the
 // current ETag of a conditional write, the operation id of a post-pending failure,
-// and the current resource uid of a uid mismatch; definition bodies and credentials
-// have no carrier here.
+// the current resource uid of a uid mismatch, and the live execution profile of a
+// direction mismatch; definition bodies and credentials have no carrier here.
 // 四个数组用指针区分"未携带"（nil，字段省略）与"携带空数组"（非 nil 空切片，
-// 输出 `[]`）——`omitempty` 会把空切片也省略掉，契约不允许。`current_etag` 与
-// `operation_id` 同理：空串视为未携带。
+// 输出 `[]`）——`omitempty` 会把空切片也省略掉，契约不允许。`current_etag` /
+// `operation_id` / `current_profile` 同理：空串视为未携带。
 // Pointer fields distinguish "absent" from "present but empty"; omitempty alone would
 // drop an empty array, which the contract requires to render as [].
 type ErrorDataView struct {
-	Agents      *[]string `json:"agents,omitempty"`
-	ActiveRuns  *[]string `json:"active_runs,omitempty"`
-	RunIDs      *[]string `json:"run_ids,omitempty"`
-	Problems    *[]string `json:"problems,omitempty"`
-	CurrentETag *string   `json:"current_etag,omitempty"`
-	OperationID *string   `json:"operation_id,omitempty"`
-	ResourceUID *string   `json:"resource_uid,omitempty"`
+	Agents         *[]string `json:"agents,omitempty"`
+	ActiveRuns     *[]string `json:"active_runs,omitempty"`
+	RunIDs         *[]string `json:"run_ids,omitempty"`
+	Problems       *[]string `json:"problems,omitempty"`
+	CurrentETag    *string   `json:"current_etag,omitempty"`
+	OperationID    *string   `json:"operation_id,omitempty"`
+	ResourceUID    *string   `json:"resource_uid,omitempty"`
+	CurrentProfile *string   `json:"current_profile,omitempty"`
 }
 
-// errorDataView 从 `core.AdminError` 的 data 里只取四个固定数组、`current_etag`
-// 与 `operation_id`；值与契约形状不符的同名键（非 []string / 非非空字符串）按
-// "没有该键"处理——宁可不给，也不出站未知形状。第二个返回值为真表示至少带了一个
-// 白名单字段——空数组也算携带（输出 `[]`），空串 ETag / 操作标识不算。
-// errorDataView extracts only the four contract-fixed arrays, the current ETag and
-// the operation id; anything else is dropped.
+// errorDataView 从 `core.AdminError` 的 data 里只取四个固定数组、`current_etag`、
+// `operation_id`、`resource_uid` 与 `current_profile`；值与契约形状不符的同名键
+// （非 []string / 非非空字符串）按"没有该键"处理——宁可不给，也不出站未知形状。
+// 第二个返回值为真表示至少带了一个白名单字段——空数组也算携带（输出 `[]`），
+// 空串 ETag / 操作标识 / 档位不算。
+// errorDataView extracts only the whitelisted keys; anything else is dropped.
 func errorDataView(err error) (ErrorDataView, bool) {
 	raw := core.AdminErrorData(err)
 	if len(raw) == 0 {
@@ -640,6 +643,9 @@ func errorDataView(err error) (ErrorDataView, bool) {
 	}
 	if etag, ok := raw["current_etag"].(string); ok && etag != "" {
 		view.CurrentETag, present = &etag, true
+	}
+	if profile, ok := raw["current_profile"].(string); ok && profile != "" {
+		view.CurrentProfile, present = &profile, true
 	}
 	if operationID, ok := raw["operation_id"].(string); ok && operationID != "" {
 		view.OperationID, present = &operationID, true

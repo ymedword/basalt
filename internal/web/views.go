@@ -78,6 +78,32 @@ type ProfileView struct {
 	Problems       []string           `json:"problems"`
 }
 
+// AgentReadinessView 是 `GET /agents/{name}/readiness` 的响应体（14D / E6 / E8）：
+// 回答"这只 Agent 离能跑还差什么"。pending 非空即**不可启用**（缺模型连接 / 缺凭据 /
+// 资源未发布）；notices 只提示、**不**阻止启用（通知渠道缺失、预算被实例压住、
+// 计划可能超并发）。两组分开是契约口径：把它们混淆，页面就会把"可选"渲染成"必须"。
+// AgentReadinessView answers what still blocks this agent from running. A non-empty
+// pending list means enable must be refused; notices never block.
+type AgentReadinessView struct {
+	Agent   string               `json:"agent"`
+	Ready   bool                 `json:"ready"`
+	Pending []AgentReadinessItem `json:"pending"`
+	Notices []AgentReadinessItem `json:"notices"`
+}
+
+// AgentReadinessItem 是一项待补 / 提示：kind 是闭集字面量，item 是机器可认的名字
+// （`model_connection/openai` / `mcp_server/github#TOKEN` / `skill/pdf-extract`），
+// detail 是一句中文原因，fix 是控制台跳转路径（没有对应页面时为空串——**不**伪造
+// 一个点不通的链接）。
+// AgentReadinessItem carries one blocked or advisory item; an empty fix means there is
+// no console page for it, never a link that goes nowhere.
+type AgentReadinessItem struct {
+	Kind   string `json:"kind"`
+	Item   string `json:"item"`
+	Detail string `json:"detail"`
+	Fix    string `json:"fix"`
+}
+
 // ToolView 是 /tools 的元素；Source 枚举 builtin | mcp | code。
 // ToolView is one /tools element; Source is builtin, mcp, or code.
 type ToolView struct {
@@ -112,6 +138,29 @@ type SandboxView struct {
 	// config_seed | database，`updated_by` 是脱敏 actor（种子为空串）。
 	// NetworkAllowlist carries the live metadata of the managed outbound allowlist.
 	NetworkAllowlist NetworkAllowlistView `json:"network_allowlist"`
+
+	// ExecutionProfile 是**实际生效**的执行档位（不是配置副本）：权威源是
+	// `execution_policy` 单行表，此处只是投影；未装配档位端口时记 `strict`——那是
+	// 策略实例在"没有权威行"时的实际判定档位（档位缺失只会更窄），不是猜测。
+	// ExecutionProfile mirrors the live profile; strict is what the policy instance
+	// actually enforces when no authoritative row is loaded.
+	ExecutionProfile string `json:"execution_profile"`
+
+	// ExecutionPolicy 是档位行的生效元数据（`etag` / `revision` / `source` /
+	// `updated_at` / `updated_by`，与 `network_allowlist` 同形）。修订号 0 = 没有可
+	// 条件写的权威行，此时 `etag` 为空串。档位切换走 `PUT /execution-policy`。
+	// ExecutionPolicy carries the profile row's metadata, same shape as the allowlist.
+	ExecutionPolicy NetworkAllowlistView `json:"execution_policy"`
+
+	// DeniedDomains 是当前生效的禁止域名表（14D / D-10）：与白名单同一套语法与通配
+	// 语义，**两档都先于放行判定**；`[]` 表示没有禁止条目。来源与修订号以
+	// `network_denylist` 为准（显式空数组与"未配置"在本字段上不可区分）。
+	// DeniedDomains is the live denylist; both profiles consult it before allowing.
+	DeniedDomains []string `json:"denied_domains"`
+
+	// NetworkDenylist 是禁止域名表的生效元数据（与 `network_allowlist` 同形）。
+	// NetworkDenylist carries the denylist row's metadata, same shape as the allowlist.
+	NetworkDenylist NetworkAllowlistView `json:"network_denylist"`
 }
 
 // NetworkAllowlistView 是 `network_allowlist` 的固定投影；`updated_at` 零值渲染为
@@ -123,6 +172,46 @@ type NetworkAllowlistView struct {
 	Source    string `json:"source"`
 	UpdatedAt string `json:"updated_at"`
 	UpdatedBy string `json:"updated_by"`
+}
+
+// ExecutionPolicyView 是 `GET/PUT /execution-policy` 的响应体（契约
+// components.schemas.ExecutionPolicyView）：内嵌 `NetworkAllowlistView` 给出强 ETag /
+// 修订号 / 来源 / 最近写入，再叠加档位、例外条数、受保护地址段、shell 名称集合与
+// 待确认项。嵌入字段按 JSON 提升展开，线上形状与契约的 `allOf` 逐字一致。
+// ExecutionPolicyView embeds the metadata projection and adds the profile literals;
+// the embedded fields flatten exactly as the contract's allOf requires.
+type ExecutionPolicyView struct {
+	NetworkAllowlistView
+	Profile              string                          `json:"profile"`
+	ExceptionsCount      int                             `json:"exceptions_count"`
+	ProtectedAddresses   []string                        `json:"protected_addresses"`
+	ShellNames           []string                        `json:"shell_names"`
+	PendingConfirmations []PendingPolicyConfirmationView `json:"pending_confirmations"`
+}
+
+// PendingPolicyConfirmationView 是一条升级迁移待确认项（契约
+// components.schemas.PendingPolicyConfirmation）：`resolved_protected` 只对
+// `network_allowlist` 轴非空，其余输出 `[]`（约束 34）。
+// PendingPolicyConfirmationView is one read-only pending item; the address list is
+// empty outside the network axis.
+type PendingPolicyConfirmationView struct {
+	ID                string   `json:"id"`
+	Axis              string   `json:"axis"`
+	Value             string   `json:"value"`
+	Reason            string   `json:"reason"`
+	ResolvedProtected []string `json:"resolved_protected"`
+}
+
+// PolicyConfirmationResultView 是 `POST /execution-policy/confirmations` 的响应体
+// （契约 components.schemas.PolicyConfirmationResult）。`already_recorded=true` 时
+// `operation_id` 是此前那条处置行的标识，本次未新增审计行。
+// PolicyConfirmationResultView reports the recorded decision; a repeated submission
+// returns the existing operation id and writes no new audit row.
+type PolicyConfirmationResultView struct {
+	ID              string `json:"id"`
+	Decision        string `json:"decision"`
+	OperationID     string `json:"operation_id"`
+	AlreadyRecorded bool   `json:"already_recorded"`
 }
 
 // ConnectionTestView 是资源「最后一次连接测试」的脱敏投影（契约
@@ -478,6 +567,14 @@ func sandboxView(cfg SandboxConfig) SandboxView {
 		ShellInterpreters:    nonNilStrings(cfg.ShellInterpreters),
 		HTTPAllowedDomains:   nonNilStrings(cfg.HTTPAllowedDomains),
 		NetworkAllowlist:     NetworkAllowlistView{Source: core.NetworkAllowlistSourceConfigSeed},
+		// 档位的只读缝与白名单同一口径：没有可条件写的权威行（修订号 0、ETag 空），
+		// 档位记 `strict` —— 策略实例在没有权威行时就是这么判的。**不**在这里编造
+		// 迁移 / 实例初始化来源。
+		// The read-only seam mirrors the allowlist one: no writable row, strict enforcement.
+		ExecutionProfile: string(core.ProfileStrict),
+		ExecutionPolicy:  NetworkAllowlistView{Source: core.NetworkAllowlistSourceConfigSeed},
+		DeniedDomains:    []string{},
+		NetworkDenylist:  NetworkAllowlistView{Source: core.NetworkAllowlistSourceConfigSeed},
 	}
 }
 
@@ -489,12 +586,48 @@ func sandboxView(cfg SandboxConfig) SandboxView {
 // and an empty ETag, which truthfully means "no authoritative row to write against".
 func (s *Server) sandboxView() SandboxView {
 	view := sandboxView(s.opts.Sandbox)
-	if s.opts.NetworkAllowlist == nil {
-		return view
+	if s.opts.NetworkAllowlist != nil {
+		policy := s.opts.NetworkAllowlist.Current()
+		view.HTTPAllowedDomains = nonNilStrings(policy.Domains)
+		view.NetworkAllowlist = networkAllowlistView(policy)
 	}
-	policy := s.opts.NetworkAllowlist.Current()
-	view.HTTPAllowedDomains = nonNilStrings(policy.Domains)
-	view.NetworkAllowlist = networkAllowlistView(policy)
+	if s.opts.NetworkDenylist != nil {
+		// 禁止表与白名单同形：`denied_domains` 是生效值，`network_denylist` 给条件写
+		// 所需的 ETag / 修订号。两档都先看禁止表，页面必须能读到同一份。
+		policy := s.opts.NetworkDenylist.Current()
+		view.DeniedDomains = nonNilStrings(policy.Domains)
+		view.NetworkDenylist = networkAllowlistView(policy)
+	}
+	if s.opts.ExecutionPolicy != nil {
+		// 档位行已装载才覆盖只读缝的兜底值：未装载（修订号 0）时保持 `strict` +
+		// `config_seed` + 空 ETag，如实表示"没有可条件写的权威行"——用空档位冒充
+		// 当前值会直接违反契约的枚举。
+		// Only a loaded row overrides the seam fallback; an unseeded row keeps the
+		// truthfully empty metadata and the enforcement default.
+		if policy := s.opts.ExecutionPolicy.Current(); policy.Revision > 0 {
+			view.ExecutionProfile = string(policy.Profile)
+			view.ExecutionPolicy = executionPolicyMetadata(policy)
+		}
+	}
+	return view
+}
+
+// executionPolicyMetadata 把档位行投影为五键元数据（与 `network_allowlist` 同形）：
+// ETag 规则与 `GET /execution-policy` 共用同一份，页面两处看到的强 ETag 不会分叉。
+// executionPolicyMetadata projects the profile row; the ETag rule is shared with
+// GET /execution-policy so both surfaces present the same strong validator.
+func executionPolicyMetadata(policy core.ExecutionPolicy) NetworkAllowlistView {
+	view := NetworkAllowlistView{
+		Revision:  policy.Revision,
+		Source:    policy.Source(),
+		UpdatedBy: policy.UpdatedBy,
+	}
+	if policy.Revision > 0 {
+		view.ETag = core.ExecutionPolicyETag(policy)
+	}
+	if !policy.UpdatedAt.IsZero() {
+		view.UpdatedAt = policy.UpdatedAt.UTC().Format(time.RFC3339)
+	}
 	return view
 }
 
@@ -1000,6 +1133,23 @@ type McpServerView struct {
 	// ToolDisposition projects the registration outcome; it never changes Tools, which
 	// stays the server's offered list.
 	ToolDisposition *MCPToolDispositionView `json:"tool_disposition"`
+	// HeaderKeys 是 http 传输已配置的请求头名：只回名字，永不回值。
+	// HeaderKeys lists configured request-header names; values never leave the process.
+	HeaderKeys []string `json:"header_keys"`
+	// CredentialKeys 是逐占位符的凭据来源与状态（14D 增量）：不含值，未连接时同样给出
+	// ——来源声明与连接无关。
+	// CredentialKeys projects each placeholder's source and state; it never carries values.
+	CredentialKeys []McpCredentialKeyView `json:"credential_keys"`
+}
+
+// McpCredentialKeyView 是契约 McpCredentialKeyView：占位符的来源与状态。`last4` 之外
+// **不**回任何凭据片段；`state=managed_revoked` 表示已撤销且未重录，**不**回落 env。
+// McpCredentialKeyView is the contract projection of one placeholder's credential state.
+type McpCredentialKeyView struct {
+	Key   string `json:"key"`
+	Mode  string `json:"mode"`
+	State string `json:"state"`
+	Last4 string `json:"last4"`
 }
 
 // McpServerDetailView 是 GET /mcp-servers/{name} 的响应体（契约 McpServerDetail）：
@@ -1011,6 +1161,31 @@ type McpServerDetailView struct {
 	McpServerView
 	Args []string `json:"args"`
 	URL  string   `json:"url"`
+}
+
+// MCPServerApplyWrite 是 `POST /mcp-servers/{name}/apply` 的请求体（契约
+// `McpServerApplyRequest`）：只有一个可选的目标版本。`0` / 省略 = 当前
+// `published_version_id`——没有"草稿"分支，所以这里也没有布尔或状态字段。
+// MCPServerApplyWrite is the optional request body; zero means the published version.
+type MCPServerApplyWrite struct {
+	VersionID int64 `json:"version_id"`
+}
+
+// McpServerApplyResultView 是 `POST /mcp-servers/{name}/apply` 的 200 响应体（契约
+// `McpServerApplyResult`）：结果对象 + 切换后的 `server` 视图。`server` 只在成功时出现
+// ——失败响应不带结果对象，页面按 `operation_id` 查操作详情。
+// McpServerApplyResultView is the 200 body: the result object plus the switched view.
+type McpServerApplyResultView struct {
+	Outcome             string         `json:"outcome"`
+	OperationID         string         `json:"operation_id"`
+	TargetVersionID     int64          `json:"target_version_id"`
+	PreviousVersionID   int64          `json:"previous_version_id"`
+	AppliedVersionID    int64          `json:"applied_version_id"`
+	DrainDeadline       string         `json:"drain_deadline"`
+	DrainTimeoutSeconds int            `json:"drain_timeout_seconds"`
+	FailureClass        string         `json:"failure_class"`
+	SupersededBy        string         `json:"superseded_by"`
+	Server              *McpServerView `json:"server,omitempty"`
 }
 
 // MCPToolDispositionView 是契约 McpToolDisposition：offer / accept / skip 三个计数。
@@ -1088,20 +1263,42 @@ type MCPCatalogEnvView struct {
 }
 
 // McpServerDiagnosticsView 是契约 McpServerDiagnosis（D-02）：命令三态、env 就绪布尔、
-// 固定 warnings 与检查时间。它**不**含 `connected`——连接状态属于运行期视图，诊断
-// 不预测连接结果（诊断与测试互不预判，FR12）。`Command` 为 nil 时出站 `null`（http）。
+// 运行时依赖轴、引用轴、固定 warnings 与检查时间。它**不**含 `connected`——连接状态
+// 属于运行期视图，诊断不预测连接结果（诊断与测试互不预判，FR12）。`Command` 与
+// `Dependency` 为 nil 时出站 `null`（http / 未登记运行时组件）。
 // McpServerDiagnosticsView is the contract diagnosis shape; it carries no connected
 // flag because diagnosis never predicts a test outcome.
 type McpServerDiagnosticsView struct {
-	Name               string                   `json:"name"`
-	Transport          string                   `json:"transport"`
-	PublishedVersionID int64                    `json:"published_version_id"`
-	AppliedVersionID   int64                    `json:"applied_version_id"`
-	PendingRestart     bool                     `json:"pending_restart"`
-	Command            *McpCommandDiagnosisView `json:"command"`
-	Env                []McpEnvDiagnosisView    `json:"env"`
-	Warnings           []string                 `json:"warnings"`
-	CheckedAt          string                   `json:"checked_at"`
+	Name               string                      `json:"name"`
+	Transport          string                      `json:"transport"`
+	PublishedVersionID int64                       `json:"published_version_id"`
+	AppliedVersionID   int64                       `json:"applied_version_id"`
+	PendingRestart     bool                        `json:"pending_restart"`
+	Command            *McpCommandDiagnosisView    `json:"command"`
+	Env                []McpEnvDiagnosisView       `json:"env"`
+	Dependency         *McpDependencyDiagnosisView `json:"dependency"`
+	References         McpReferencesDiagnosisView  `json:"references"`
+	Warnings           []string                    `json:"warnings"`
+	CheckedAt          string                      `json:"checked_at"`
+}
+
+// McpDependencyDiagnosisView 是运行时依赖轴：组件名 + 三态 + 期望 / 实测版本（目录名，
+// 不是执行版本——读版本不启动进程）。
+// McpDependencyDiagnosisView is the dependency axis; versions come from the directory
+// name, never from executing anything.
+type McpDependencyDiagnosisView struct {
+	Component       string `json:"component"`
+	State           string `json:"state"`
+	ExpectedVersion string `json:"expected_version"`
+	FoundVersion    string `json:"found_version"`
+}
+
+// McpReferencesDiagnosisView 是引用轴：`agents` 恒为数组（空时 `[]`），与
+// `/resources/{kind}/{id}/references` 同源。
+// McpReferencesDiagnosisView always emits an array for agents.
+type McpReferencesDiagnosisView struct {
+	Count  int      `json:"count"`
+	Agents []string `json:"agents"`
 }
 
 // McpCommandDiagnosisView 是命令定位三态：`unconfirmed` **不是**失败，只是按现行启动
@@ -1164,9 +1361,10 @@ func mcpCatalogEntryView(entry core.MCPCatalogEntry) MCPCatalogEntryView {
 	}
 }
 
-// mcpServerDiagnosticsView 投影一次诊断：`command` 为 nil 时出站 `null`（http 传输），
-// `env` / `warnings` 空时出站 `[]`，`checked_at` 走 formatTime（RFC3339 UTC）。
-// mcpServerDiagnosticsView projects one diagnosis; command stays nil for http.
+// mcpServerDiagnosticsView 投影一次诊断：`command` / `dependency` 为 nil 时出站
+// `null`（http 传输 / 未登记运行时组件），`env` / `warnings` / `references.agents`
+// 空时出站 `[]`，`checked_at` 走 formatTime（RFC3339 UTC）。
+// mcpServerDiagnosticsView projects one diagnosis; nil axes stay null, arrays stay [].
 func mcpServerDiagnosticsView(diag core.MCPServerDiagnosis) McpServerDiagnosticsView {
 	env := make([]McpEnvDiagnosisView, 0, len(diag.Env))
 	for _, entry := range diag.Env {
@@ -1180,6 +1378,15 @@ func mcpServerDiagnosticsView(diag core.MCPServerDiagnosis) McpServerDiagnostics
 			Reason: diag.Command.Reason,
 		}
 	}
+	var dependency *McpDependencyDiagnosisView
+	if diag.Dependency != nil {
+		dependency = &McpDependencyDiagnosisView{
+			Component:       diag.Dependency.Component,
+			State:           string(diag.Dependency.State),
+			ExpectedVersion: diag.Dependency.ExpectedVersion,
+			FoundVersion:    diag.Dependency.FoundVersion,
+		}
+	}
 	return McpServerDiagnosticsView{
 		Name:               diag.Name,
 		Transport:          diag.Transport,
@@ -1188,8 +1395,13 @@ func mcpServerDiagnosticsView(diag core.MCPServerDiagnosis) McpServerDiagnostics
 		PendingRestart:     diag.PendingRestart,
 		Command:            command,
 		Env:                env,
-		Warnings:           stringSlice(diag.Warnings),
-		CheckedAt:          formatTime(diag.CheckedAt),
+		Dependency:         dependency,
+		References: McpReferencesDiagnosisView{
+			Count:  diag.References.Count,
+			Agents: stringSlice(diag.References.Agents),
+		},
+		Warnings:  stringSlice(diag.Warnings),
+		CheckedAt: formatTime(diag.CheckedAt),
 	}
 }
 

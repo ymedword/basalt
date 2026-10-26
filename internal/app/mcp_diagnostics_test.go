@@ -35,6 +35,9 @@ const (
 	// diagSecondEnv 是 env 布尔用例的第二个键：它已就绪，另一个键在保存后被清空——
 	// 这样"只回布尔、按 key 升序"才有判别力。
 	diagSecondEnv = "MCP_DIAG_READY"
+	// diagAliasKey 是"键名与占位变量名不同"的 env 键：它本身不设值，引用的是
+	// 已就绪的 diagSecondEnv——诊断必须按占位符里的变量名回答，与保存闸门同口径。
+	diagAliasKey = "MCP_DIAG_ALIAS"
 )
 
 // saveDiagnosedMCPEntry 经真实写路径保存并发布一条 stdio 条目（新建即发布，applied
@@ -50,12 +53,13 @@ func saveDiagnosedMCPEntry(t *testing.T, env *resourceEnv, name, command string,
 		values[key] = value
 	}
 	version, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      name,
-		Transport: "stdio",
-		Command:   command,
-		Args:      args,
-		Env:       values,
-		Create:    true,
+		Name:        name,
+		Transport:   "stdio",
+		Command:     command,
+		Args:        args,
+		Env:         values,
+		Credentials: envOnlyCredentials(values),
+		Create:      true,
 	})
 	require.NoError(t, err)
 	return version
@@ -278,8 +282,13 @@ func TestMCPDiagnostics_EnvSetBoolean(t *testing.T) {
 	// 改进程环境（t.Setenv），不能并行。
 	env := newResourceEnv(t)
 	t.Setenv(diagSecondEnv, mcpEnvSecretSentinel)
+	t.Setenv(diagAliasKey, "")
 	saveDiagnosedMCPEntry(t, env, "demo", "allowed-mcp", nil, map[string]string{
 		diagSecondEnv: "${" + diagSecondEnv + "}",
+	})
+	// 键名与占位变量名不同名：诊断读的是占位符里的变量名（与保存闸门同一口径）。
+	saveDiagnosedMCPEntry(t, env, "alias", "allowed-mcp", nil, map[string]string{
+		diagAliasKey: "${" + diagSecondEnv + "}",
 	})
 	t.Setenv(mcpTestTokenEnv, "") // 保存之后才清空：诊断看的是当下
 
@@ -288,6 +297,10 @@ func TestMCPDiagnostics_EnvSetBoolean(t *testing.T) {
 		{Key: diagSecondEnv, Set: true},
 		{Key: mcpTestTokenEnv, Set: false},
 	}, diagnosis.Env, "env 诊断按 key 升序、空值记为未就绪")
+
+	alias := diagnoseMCP(t, env, "alias")
+	require.Contains(t, alias.Env, core.MCPEnvDiagnosis{Key: diagAliasKey, Set: true},
+		"env 诊断读占位符里的变量名，而不是 env 键名（否则与保存闸门结论相反）")
 
 	raw, err := json.Marshal(diagnosis)
 	require.NoError(t, err)
@@ -328,6 +341,142 @@ func TestMCPDiagnostics_PendingRestartIndependent(t *testing.T) {
 	require.Equal(t, version.ID, second.AppliedVersionID)
 	requireMCPPointerUnchanged(t, env, "demo", before)
 	require.Len(t, env.versionsOfKind(core.ResourceMCPServer, "demo"), 1, "诊断不得追加版本")
+}
+
+// writeRuntimeComponent 在夹具的运行时目录下造一个已登记组件的入口文件，返回该入口的
+// 绝对路径（按设计 §2.1 的 `<程序目录>/runtime/mcp/<component>/<version>/…` 布局）。
+// writeRuntimeComponent lays out one registered component entry under the fixture's
+// runtime root, mirroring the program-directory layout.
+func writeRuntimeComponent(t *testing.T, env *resourceEnv, component, version string) string {
+	t.Helper()
+	entry := filepath.Join(env.root, "runtime", "mcp", component, version,
+		"node_modules", component, "dist", "index.js")
+	require.NoError(t, os.MkdirAll(filepath.Dir(entry), 0o755))
+	require.NoError(t, os.WriteFile(entry, []byte("// runtime component stub\n"), 0o600))
+	return entry
+}
+
+// TestMCPDiagnostics_DependencyAxis 判依赖轴（设计 §2.3.4 / 契约 D-02）：只按运行时目录
+// 与版本清单判定，三态各自可复现——入口在且版本相符 → ready；入口不在 → missing（且
+// found_version 留空，不把"没装"报成"版本不符"）；目录版本与清单不符 → version_mismatch
+// 并给出目录版本；未登记组件（自定义命令、宿主解释器、未登记目录名）→ null，**不是**
+// "缺失"、更不是"就绪"。
+// 逆改点：把未登记组件答成 ready / missing；执行 `node --version` 之类取版本（会启动
+// 进程，哨兵用例同时会红）；版本不符时不报 found_version → 对应断言红。
+func TestMCPDiagnostics_DependencyAxis(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ready", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		entry := writeRuntimeComponent(t, env, "dbhub", "1.5.0")
+		saveDiagnosedMCPEntry(t, env, "db", "node", []string{entry, "--transport", "stdio"}, nil)
+
+		diagnosis := diagnoseMCP(t, env, "db")
+		require.NotNil(t, diagnosis.Dependency, "已登记组件必须给出依赖轴")
+		require.Equal(t, "dbhub", diagnosis.Dependency.Component)
+		require.Equal(t, core.MCPDependencyReady, diagnosis.Dependency.State)
+		require.Equal(t, "1.5.0", diagnosis.Dependency.ExpectedVersion)
+		require.Equal(t, "1.5.0", diagnosis.Dependency.FoundVersion)
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		entry := filepath.Join(env.root, "runtime", "mcp", "dbhub", "1.5.0",
+			"node_modules", "dbhub", "dist", "index.js")
+		saveDiagnosedMCPEntry(t, env, "db", "node", []string{entry}, nil)
+
+		diagnosis := diagnoseMCP(t, env, "db")
+		require.NotNil(t, diagnosis.Dependency)
+		require.Equal(t, core.MCPDependencyMissing, diagnosis.Dependency.State)
+		require.Equal(t, "1.5.0", diagnosis.Dependency.ExpectedVersion)
+		require.Empty(t, diagnosis.Dependency.FoundVersion, "missing 不得报出实测版本")
+	})
+
+	t.Run("version_mismatch", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		entry := writeRuntimeComponent(t, env, "dbhub", "1.6.0")
+		saveDiagnosedMCPEntry(t, env, "db", "node", []string{entry}, nil)
+
+		diagnosis := diagnoseMCP(t, env, "db")
+		require.NotNil(t, diagnosis.Dependency)
+		require.Equal(t, core.MCPDependencyVersionMismatch, diagnosis.Dependency.State)
+		require.Equal(t, "1.5.0", diagnosis.Dependency.ExpectedVersion)
+		require.Equal(t, "1.6.0", diagnosis.Dependency.FoundVersion)
+	})
+
+	t.Run("host-interpreter", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		saveDiagnosedMCPEntry(t, env, "custom", "node", []string{"bundle/index.js"}, nil)
+
+		diagnosis := diagnoseMCP(t, env, "custom")
+		require.Nil(t, diagnosis.Dependency, "宿主解释器未登记：输出 null 而不是 missing")
+	})
+
+	t.Run("unregistered-directory", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		// 运行时目录里出现未登记目录名：没有可核对的版本基准，按未登记处理。
+		entry := writeRuntimeComponent(t, env, "playwright", "1.0.0")
+		saveDiagnosedMCPEntry(t, env, "custom", "node", []string{entry}, nil)
+
+		diagnosis := diagnoseMCP(t, env, "custom")
+		require.Nil(t, diagnosis.Dependency, "未登记组件必须输出 null，不是 missing")
+	})
+}
+
+// TestMCPDiagnostics_ReferencesAxis 判引用轴（契约 D-02 / McpReferencesDiagnosis）：与
+// `/resources/{kind}/{id}/references` 同源——活动 Agent 与归档 Agent 联合、去重后升序，
+// count 等于名单长度；无关 Agent 不计入。引用读取失败必须让诊断失败，不得答成空名单。
+// 逆改点：自己另算一套引用（例如只看 `mcp_servers.yaml`）、漏掉归档 Agent、把 count
+// 写成常数 → 对应断言红。
+func TestMCPDiagnostics_ReferencesAxis(t *testing.T) {
+	t.Parallel()
+	env := newResourceEnv(t, func(d *ResourceAdminDeps) {
+		d.Agents = func() ([]core.AgentEntry, error) {
+			return []core.AgentEntry{
+				{
+					Name:       "daily-brief",
+					Registered: true,
+					Profile:    &core.Profile{Name: "daily-brief", MCPServers: []string{"radar"}},
+				},
+				{
+					Name:       "unrelated",
+					Registered: true,
+					Profile:    &core.Profile{Name: "unrelated", MCPServers: []string{"other"}},
+				},
+			}, nil
+		}
+	})
+	saveDiagnosedMCPEntry(t, env, "radar", "allowed-mcp", nil, nil)
+	env.writeArchivedAgent(t, "old-20260101-000000", `---
+name: old
+mcp_servers:
+  - radar
+---
+`)
+
+	diagnosis := diagnoseMCP(t, env, "radar")
+	require.Equal(t, []string{"archive:old-20260101-000000", "daily-brief"}, diagnosis.References.Agents)
+	require.Equal(t, len(diagnosis.References.Agents), diagnosis.References.Count)
+
+	raw, err := json.Marshal(diagnosis)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"references"`)
+
+	t.Run("无引用时输出空数组", func(t *testing.T) {
+		t.Parallel()
+		env := newResourceEnv(t)
+		saveDiagnosedMCPEntry(t, env, "solo", "allowed-mcp", nil, nil)
+
+		diagnosis := diagnoseMCP(t, env, "solo")
+		require.Equal(t, 0, diagnosis.References.Count)
+		require.NotNil(t, diagnosis.References.Agents, "空名单也必须是数组而不是 nil")
+		require.Empty(t, diagnosis.References.Agents)
+	})
 }
 
 // TestMCPDiagnostics_NoProcessNoOperation：诊断不得启动子进程。命令指向测试二进制自身

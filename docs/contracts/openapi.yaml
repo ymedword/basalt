@@ -872,6 +872,89 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope' }
 
+  /mcp-servers/{name}/apply:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [resources]
+      summary: 受控应用已发布版本（只重建这一个 server）
+      description: |
+        把已发布版本切换为**运行生效**版本，不重启整站：其它 server 的连接与调度不受影响。
+        保存、连接测试、运行生效是三件不同的事——保存即发布（写定义文件 + 生成版本 + 推进指针），
+        `POST /test` 只做一次性握手，只有本端点改变运行状态；三者分别留证，任一成功都不代言另外两个。
+
+        算法（顺序固定，任一步失败按对应分支收口）：
+
+        1. 目标版本 = 显式 `version_id`；省略 → 资源当前 `published_version_id`。指针无行 = 资源不存在（404），没有"草稿"分支；
+        2. **冻结**本次应用的两个版本号（定义版本 + 每个占位符的凭据版本）并写进操作行 `detail`；
+        3. 就绪预检：依赖定位、每个占位符按其**声明来源**可取（fail-closed，先于任何进程）；
+        4. 先授权（用冻结版本内容过 Policy / 命令授权）、后建连；
+        5. 建新连接时旧连接仍在服务；
+        6. 并发校验：期间若有 publish / revoke / 另一次 apply 改变了指针或任一冻结版本 → 丢弃本次切换：
+           撤回候选工具注册、关闭候选连接，`applied` 不变，操作记 `superseded`；
+        7. 注册新工具集（暂存区构建 + 加锁一次提交，epoch 递增）→ CAS 切换 `applied_version_id`
+           （必须仍等于第 1 步读到的值；失败走第 6 步同一段回滚）→ 旧 epoch 进入排空态
+           （窗口默认 30 秒，到点强制关闭）→ 关闭旧连接；
+        8. 新连接失败 → 关闭新连接，`applied` 不变，操作记 `failed` + 失败分类。旧连接**仅当仍然合法**
+           才保留：若本次冻结版本含已撤销凭据，旧连接一并关闭并把 `applied` 标 stale——不得因为 apply
+           失败就把撤销"顺延"下去。
+
+        `If-Match` 必须等于该资源的条件 ETag（缺失 / 弱 ETag / `*` → 412 零写入、零操作行）。
+        预写之后的失败一律置 failed 并回 `data.operation_id`；`detail_json` 与成功响应同形
+        （`McpServerApplyResult` 去掉 `server`），不放命令原文、URL 凭据或 env 值。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McpServerApplyRequest' }
+      responses:
+        '200':
+          description: 应用成功（`outcome=applied`）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/McpServerApplyResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 授权拒绝（业务码 `FORBIDDEN`，先于建连；失败分类 `policy_denied`）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            被并发写取代（业务码 `MCP_APPLY_SUPERSEDED`）：候选工具注册已撤回、候选连接已关闭，
+            `applied` 与旧连接不变；`data.operation_id` 必填，页面据此查 `OperationDetail.detail`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: |
+            建连或注册失败、且失败在预检之后（业务码 `MCP_APPLY_FAILED`）：`applied` 不变，
+            `data.operation_id` 必填；失败分类以 `OperationDetail.detail.failure_class` 为准
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '503':
+          description: |
+            预检拒绝（未启动任何进程）：依赖缺失 → `NOT_CONFIGURED`（点名组件与期望版本）；占位符按声明来源
+            取不到值 → `NOT_CONFIGURED`（点名 server / 键 / 环境变量名，不含值）或 `CREDENTIAL_UNAVAILABLE`；
+            实例无可用主密钥 → `SECRETS_RECOVERY_REQUIRED`。`data.operation_id` 必填（预检在预写之后）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
   # ==========================================================
   # 公共资源版本、发布与引用
   # ==========================================================
@@ -980,7 +1063,7 @@ paths:
 
   /resources/{kind}/{name}/credential/revoke:
     parameters:
-      - $ref: '#/components/parameters/CredentialResourceKind'
+      - $ref: '#/components/parameters/CredentialOwnerKind'
       - name: name
         in: path
         required: true
@@ -995,6 +1078,11 @@ paths:
         env 模式的资源没有托管凭据，调用返回 400。请求体必须带 `resource_uid` 与 `confirm: true`，
         `If-Match` 必须匹配资源条件 ETag；`resource_uid` 与凭据 owner 不符（借用其他资源的凭据 ID）→
         409 `CREDENTIAL_OWNER_MISMATCH`，不跨资源复用。
+
+        `kind=mcp_server` 时**必须**带 `binding_key`，只撤销那一个占位符，并把该 server 的连接按失效态
+        受控回收（stdio 关进程树、HTTP 关会话）——**不等下一次 apply**；进程可能已持有原环境变量，留着它
+        等于"撤了还在用"。撤销是终态：同一占位符此后**不回落**进程环境，重新录入才生成新版本。已发出的
+        外部操作无法追溯撤回，只在运行记录里标明该调用用的是已撤销的凭据版本。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -1218,6 +1306,363 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  # ==========================================================
+  # 执行环境（档位 / 禁止域名 / 访问例外）
+  # ==========================================================
+  /execution-policy:
+    get:
+      tags: [console]
+      summary: 读执行档位与迁移待确认项
+      description: |
+        返回当前生效的执行档位（`standard` / `strict`）与生效元数据（强 ETag / 修订号 / 来源 /
+        最近写入），并给出升级迁移的两组**待确认项**。权威源是单行表 `execution_policy`；
+        `basalt.yaml` 的 `execution.profile` 只在表内无行时作首次种子。
+
+        待确认项来自只读扫描：① 出网白名单中**解析到受保护地址段**的条目；② 命令白名单中
+        **命中交互式 shell 名称集合**的条目。页面据此给「加例外」/「保持拒绝」两个显式动作
+        （分别写 `network_exception.create` 与 `execution_policy.confirm` 审计行）。已登记例外、
+        或已记录 `deny` 选择的条目不再列出——**未确认不放行**：受保护地址段与 shell 名称默认拒绝，
+        不因"管理员没看"而改变。域名解析失败（NODATA / 超时）的条目不计入待确认项，也不猜测。
+
+        **只读**：不启动进程、不建网络连接、不写管理操作行、不改策略。
+      responses:
+        '200':
+          description: 当前档位、生效元数据与待确认项
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ExecutionPolicyView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [console]
+      summary: 切换执行档位（条件写，立即生效）
+      description: |
+        `standard` ⇄ `strict`。保存成功后**下一次**授权判定即按新档位执行，无需重启；在途 Run 与
+        已建立的连接不追溯撤回。两档共享同一套基础防护（DNS 解析校验、连接目标固定、忽略环境变量
+        代理、shell 名称集合），差异只在授权范围：`standard` 放行未命中禁止域名的公网域名与安装
+        清单内的程序目录可执行件，`strict` 只放行显式白名单。本端点**不**顺带修改白名单、禁止域名
+        或访问例外——一次写入只表达一次档位变更。
+
+        `expected_profile` 是确认方向的一部分：页面确认框写的是"从 X 切到 Y"，客户端必须把渲染时
+        看到的档位放进 `expected_profile`；与库内当前档位不一致 → 409 `EXECUTION_PROFILE_MISMATCH`
+        且零写入、零操作行（不得用陈旧对话框静默执行一个用户没确认过的方向）。
+
+        `If-Match` 必须等于 `GET /execution-policy` 的强 ETag（缺失 / 弱 ETag / `*` → 412 零写入、
+        零操作行）。写入按修订号做 CAS，并发落败 → 409 零写入；预写 `pending` 之后的失败一律置
+        failed 并回 `data.operation_id`。管理动作记为 `execution_policy.update`，`target_id` 固定
+        `global`，`detail_json` 只放前后档位与修订号（不放待确认项正文）。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionPolicyWrite' }
+      responses:
+        '200':
+          description: 保存后的实际生效状态（重新读出，不是回显请求体）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ExecutionPolicyView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            `expected_profile` 与库内当前档位不一致（业务码 `EXECUTION_PROFILE_MISMATCH`），或修订号
+            CAS 落败（业务码 `CONFLICT`）。两种情况都零写入；`data.operation_id` 只在预写之后失败时出现
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /execution-policy/confirmations:
+    post:
+      tags: [console]
+      summary: 记录一条迁移待确认项的「保持拒绝」处置
+      description: |
+        `GET /execution-policy` 的每个待确认项给两个显式动作，**不自动勾选、不默认放行**：
+
+        - 「加例外」→ `POST /network-exceptions`（写 `network_exception.create`）
+        - 「保持拒绝」→ 本端点（写 `execution_policy.confirm`）
+
+        本端点只记录处置，**不改授权结论**：受保护地址段与 shell 名称本来就默认拒绝，这条记录的作用是
+        让该项不再出现在待确认列表里，证明管理员逐条看过。因此它**不**修改 `execution_policy` 行、
+        不推进修订号，**不需要** `If-Match`；`pending_confirmations` 是只读派生信息，不参与
+        `ExecutionPolicyView` 的强 ETag。
+
+        重复记录同一条（已存在的 `success` 行）返回 200 且 `already_recorded: true`，不重复写审计行。
+        `id` 不在当前待确认集合内（已加例外、或扫描条件不再成立）→ 400 点名该标识；**不**按
+        `id` 猜条目、**不**为未知标识留记录。
+
+        预写 `pending` 管理操作行是硬前置：预写失败 → 500 且不记录任何处置。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyConfirmationWrite' }
+      responses:
+        '200':
+          description: 处置结果；`already_recorded=true` 表示此前已记录且本次未新增审计行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PolicyConfirmationResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /sandbox/denied-domains:
+    put:
+      tags: [console]
+      summary: 保存禁止域名表（条件写，立即生效）
+      description: |
+        禁止域名与出网白名单共用 `network_domain_policy` 的两行（`policy_scope = http.denied_domains`），
+        语法与白名单完全相同（去空白、小写、去重、升序；`*.example.com` **不**匹配 `example.com`
+        本身）。**两档都先生效**：命中即拒，不再看白名单；`domains: []` 是合法值（没有禁止条目）。
+
+        其余语义与 `PUT /sandbox/network-domains` 逐条一致：`If-Match` 必填，缺失 / 弱 ETag / `*`
+        → 412 零写入；非法条目 → 400 并点名第一处；陈旧 ETag → 412 且 `data.current_etag` 给出当前值；
+        修订号 CAS 落败 → 409 零写入；校验与前置条件失败**不留**管理操作行；预写 `pending` 之后的
+        失败一律置 failed 并回 `data.operation_id`。管理动作记为 `network_denylist.update`，
+        `target_id` 为固定字面量 `http.denied_domains`。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkDomainsWrite' }
+      responses:
+        '200':
+          description: 保存后的实际生效状态（重新读出）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SandboxView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /network-exceptions:
+    get:
+      tags: [console]
+      summary: 列内网访问例外
+      description: |
+        例外只管**网络**：文件由目录边界决定、命令由白名单 / 安装清单决定，不在这里开口子。
+        `standard` 下用于放行受保护地址段；`strict` 下等价于一条白名单条目，另可放行受保护地址段。
+        云元数据地址（`169.254.169.254` / `fd00:ec2::254`）**任何档位都不放行**，也不能登记为例外。
+
+        响应 `etag` 是整份例外集合的强 ETag（按 `kind` + `value` 排序后摘要），是
+        `DELETE /network-exceptions/{id}` 的 `If-Match` 唯一取值来源。列表稳定排序（`kind` 升序、
+        `value` 升序）。
+      responses:
+        '200':
+          description: 例外清单与集合 ETag
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/NetworkExceptionListView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [console]
+      summary: 新增访问例外（理由必填）
+      description: |
+        `note` 必填且不能全是空白——放行必须带理由，理由进审计。`kind=host` 收主机名（与出网白名单
+        同一套规整与通配语法）；`kind=ip_port` 收 `IP:端口` 字面量。同一 `(kind, value)` 重复登记 →
+        409 `CONFLICT`（不覆盖既有理由）。云元数据地址 → 400 并点名该地址永不放行。
+
+        写入先预写 `pending` 管理操作（动作 `network_exception.create`，`target_kind`
+        `network_exception`，`target_id` 为例外标识）；预写失败即拒绝执行且不留行。预写之后的失败
+        置 failed 并回 `data.operation_id`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkExceptionCreate' }
+      responses:
+        '200':
+          description: 新建的例外（含 `operation_id`）与新的集合 ETag
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [etag, exception]
+                        properties:
+                          etag: { type: string, description: 写入后整份集合的强 ETag }
+                          exception: { $ref: '#/components/schemas/NetworkExceptionView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /network-exceptions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^exc_[0-9A-HJKMNP-TV-Z]{26}$' }
+        description: 例外标识（`exc_` + 26 位 Crockford Base32）
+    delete:
+      tags: [console]
+      summary: 删除访问例外（条件写）
+      description: |
+        删除后**立即**失效：下一次授权判定不再放行该地址，在途连接与请求不追溯撤回。`If-Match` 必须
+        等于 `GET /network-exceptions` 的集合 ETag——保证删的是"看过的那一份集合"；缺失或过期 → 412
+        零写入、零操作行。例外不存在 → 404。管理动作记 `network_exception.delete`，`target_id` 为该
+        例外标识；预写之后的失败置 failed 并回 `data.operation_id`。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          description: 删除结果与新的集合 ETag
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/NetworkExceptionDeleteResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500':
+          description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  # ==========================================================
+  # 实例加密（主密钥状态与显式初始化）
+  # ==========================================================
+  /instance/secrets:
+    get:
+      tags: [console]
+      summary: 实例加密状态与托管凭据小结
+      description: |
+        管理台「系统总览」的两行数据：① 实例加密服务状态；② 当前托管凭据按来源与状态计数。
+        状态由**三项联立**判定（初始化记录 / 密钥文件 / 现存托管密文），单看"文件在不在"不作结论：
+        `ready` 才回 `key_id`；`recovery_required` 时**不**回密钥材料、**不**生成替代密钥，只给固定
+        原因码与恢复指引；任何托管凭据操作随后返回 `SECRETS_RECOVERY_REQUIRED`。
+
+        响应**不含**密钥材料或指纹原文；`key_file` 只回路径（供备份指引）。**只读**：不创建目录、
+        不写文件、不写管理操作行。
+      responses:
+        '200':
+          description: 实例加密状态（两行）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/InstanceSecretsView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /instance/secrets/init:
+    post:
+      tags: [console]
+      summary: 显式初始化实例主密钥（存量实例）
+      description: |
+        给存量实例的一次性人类动作（等同 `basalt secrets init`）。新建实例首次启动已自动完成，此端点
+        只处理 `uninitialized` 的存量库；请求体必须带 `confirm: true`。
+
+        规则与自动初始化逐条相同：先建受限目录并**读回校验通过后才创建任何文件**；发布**不覆盖**既有
+        文件（`O_EXCL` / `os.Link`）；只清理能由 `os.SameFile` 证明来源的临时链接；全程只生成一把密钥。
+        预写 `pending` 管理操作（动作 `system.secrets_init`，`target_kind` `system`）之后再动手，
+        预写失败即拒绝执行。下列状态判定都在预写**之前**完成，因此 409 不留操作行：
+
+        - `ready` → 409 `CONFLICT`（已初始化，**不覆盖**）
+        - `recovery_required` → 409 `SECRETS_RECOVERY_REQUIRED`（**不生成替代密钥**；按恢复矩阵处置，
+          既有文件一个字节都不动）
+        - `uninitialized` → 初始化成功后 200，返回与 `GET /instance/secrets` 相同的投影
+        - 并发：实例锁 + `instance_secrets` 主键 + `O_EXCL` 三重保险，后到者读到已存在记录即放弃生成
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstanceSecretsInitRequest' }
+      responses:
+        '200':
+          description: 初始化后的状态（`state=ready`）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/InstanceSecretsView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            已初始化（业务码 `CONFLICT`，不覆盖），或实例处于恢复态（业务码 `SECRETS_RECOVERY_REQUIRED`，
+            不生成替代密钥）。两者都在预写之前判定：零写入、零操作行
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
         '500':
           description: 预写之后失败（业务码 `INTERNAL`，`data.operation_id` 供查证）
           content:
@@ -1774,6 +2219,43 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /agents/{name}/readiness:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [agents]
+      summary: 读 Agent 就绪视图（启用前置校验的只读投影）
+      description: |
+        回答"这只 Agent 离能跑还差什么"，与 `POST /agents/{name}/enable` 的前置校验**共用同一份判定**。
+        `pending` 非空即**不可启用**：缺模型连接、缺该 Agent 所需的服务凭据、资源引用没有已发布版本；
+        启用端点据此 409 `AGENT_UNAVAILABLE` 并逐项点名 + 给跳转。
+        `notices` 只提示、**不**阻止启用：通知渠道缺失（可选）、`settings.max_iterations` 被实例上限压住、
+        启用了计划的 Agent 数可能超过并发上限（`429 TOO_MANY_RUNS`）。点名**不**改任何一侧的配置。
+        本端点只读：不启动进程、不连接、不写操作行、不改配置；资源视图读不到 → 500，
+        **不**降级成"就绪"。
+      responses:
+        '200':
+          description: 就绪视图
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AgentReadiness' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: 资源视图不可读，就绪状态不可确认（业务码 `INTERNAL`）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
   /agents/{name}/copy:
     parameters:
       - name: name
@@ -2217,6 +2699,15 @@ components:
       required: true
       schema: { type: string, enum: [model_connection, notify_channel] }
       description: 范围与凭据动作只覆盖带使用范围的两类资源；通知渠道的 CRUD 仍走 `/notify-channels`。
+    CredentialOwnerKind:
+      name: kind
+      in: path
+      required: true
+      schema: { type: string, enum: [model_connection, notify_channel, mcp_server] }
+      description: |
+        凭据 owner 类型。比 `CredentialResourceKind` 多 `mcp_server`：MCP server 可以有逐占位符的托管凭据，
+        但没有 `shared` / `exclusive` 使用范围，因此只有撤销走这条 kind。`kind=mcp_server` 时请求体必须带
+        `binding_key`（撤销只作用于那一个占位符），`resource_uid` 仍是 server 的资源 UID。
 
   responses:
     OK:
@@ -2430,6 +2921,16 @@ components:
         transport: { type: string, enum: [stdio, http] }
         command: { type: string, description: 仅展示可执行名；参数不展示 }
         env_keys: { type: array, items: { type: string }, description: 只回变量名，不返回值 }
+        header_keys:
+          type: array
+          items: { type: string }
+          description: 仅 http；已配置的请求头名（只回名字，不返回值）
+        credential_keys:
+          type: array
+          items: { $ref: '#/components/schemas/McpCredentialKeyView' }
+          description: |
+            逐占位符的凭据来源与状态（按 `key` 升序，env 键与 header 名同列）。不含值；未连接时同样给出，
+            因为来源声明与连接无关。`managed` 永不回落 `env`
         connected: { type: boolean }
         tools: { type: array, items: { type: string } }
         published_version_id: { type: integer }
@@ -2445,6 +2946,41 @@ components:
             实际注册结果（offer / accept / skip 与赢家）；未连接或未知时为 `null`。
             `tools` 仍是该 server 提供的工具名（offered）；连接后 `accepted + len(skipped) = offered`
             （允许 `invalid_tool` 跳过）。注册池的重名语义不变（内置赢家、WARN 不改）。
+
+    McpCredentialKeyView:
+      type: object
+      required: [key, mode, state, last4]
+      properties:
+        key: { type: string, description: '占位符名：`env` 的键名或 `headers` 的头名' }
+        mode:
+          type: string
+          enum: [managed, env]
+          description: 该占位符声明的来源；无来源声明的占位符保存时即被拒绝，因此不会出现在列表里
+        state:
+          type: string
+          enum: [managed, managed_revoked, env, missing]
+          description: |
+            `managed` = 有活动托管值；`managed_revoked` = 托管值已撤销且未重录，**不回落 env**；
+            `env` = 声明走进程环境（不表示该变量此刻存在，存在性看诊断的 `env` 轴）；
+            `missing` = 声明 `managed` 但没有任何可用版本。解析失败时连接 / apply 按失败分类收口，不静默降级
+        last4:
+          type: string
+          description: '仅 `managed` / `managed_revoked` 且已有版本时回末 4 位，其余为空串；**永不**回完整值'
+
+    McpCredentialInput:
+      type: object
+      required: [key, mode]
+      properties:
+        key:
+          type: string
+          description: '占位符名：`env` 的键名或 `headers` 的头名（同名即同一占位符，跨两者重名 → 400）'
+        mode: { type: string, enum: [managed, env], description: 必填——来源不靠"托管行是否存在"推断 }
+        value:
+          type: string
+          description: |
+            只在写请求里出现，**永不回读**，不进日志 / 审计 / 模型上下文。`mode=managed` 且给出 → 生成新凭据
+            版本（旧版本 superseded，撤销纪元不复位）；`mode=managed` 且省略 → 保留该键已有托管值（普通编辑
+            不清凭据）；没有旧值又省略 → 400；`mode=env` 时出现 → 400（改来源须先显式清空）
 
     McpToolDisposition:
       type: object
@@ -2549,7 +3085,17 @@ components:
         env:
           type: array
           items: { $ref: '#/components/schemas/McpEnvDiagnosis' }
-          description: 按 `key` 升序；只回布尔，不回值
+          description: |
+            按 `key` 升序；只回布尔，不回值。本轴只覆盖 stdio 的 `env` 键——http 的 `headers` 占位符
+            不在本轴，其就绪性由 `McpServerView.credential_keys` 与 apply 预检判定
+        dependency:
+          oneOf:
+            - $ref: '#/components/schemas/McpDependencyDiagnosis'
+            - type: "null"
+          description: |
+            运行时依赖轴（Node / Python / DBHub 等）。无运行时组件登记的自定义条目为 `null`（不是"缺失"）；
+            只检测不安装、不启动任何进程
+        references: { $ref: '#/components/schemas/McpReferencesDiagnosis' }
         warnings:
           type: array
           items:
@@ -2577,6 +3123,25 @@ components:
         key: { type: string }
         set: { type: boolean, description: 变量存在且非空为 true；未设置或空字符串为 false }
 
+    McpDependencyDiagnosis:
+      type: object
+      required: [component, state, expected_version, found_version]
+      properties:
+        component: { type: string, description: '运行时组件名（如 node / python / dbhub）；不返回绝对路径或命令原文' }
+        state: { type: string, enum: [ready, missing, version_mismatch] }
+        expected_version: { type: string, description: 未登记期望版本时为空串 }
+        found_version: { type: string, description: '`missing` 时为空串；`version_mismatch` 时给出实测版本' }
+
+    McpReferencesDiagnosis:
+      type: object
+      required: [count, agents]
+      properties:
+        count: { type: integer }
+        agents:
+          type: array
+          items: { type: string }
+          description: '引用该 server 的 Agent 名（升序，含归档 Agent）；与 `/resources/{kind}/{id}/references` 同源'
+
     SandboxView:
       type: object
       properties:
@@ -2591,6 +3156,18 @@ components:
           items: { type: string }
           description: '当前实际生效的出网域名白名单（不是启动配置副本）：`[]` 表示受此策略约束的出站请求全部拒绝'
         network_allowlist: { $ref: '#/components/schemas/NetworkAllowlistView' }
+        execution_profile:
+          type: string
+          enum: [standard, strict]
+          description: 当前生效的执行档位；权威源是 `execution_policy`（见 `GET /execution-policy`），此处只是投影
+        execution_policy: { $ref: '#/components/schemas/NetworkAllowlistView' }
+        denied_domains:
+          type: array
+          items: { type: string }
+          description: |
+            当前实际生效的禁止域名（与白名单同一套语法）。**两档都先于放行判定**：命中即拒；
+            `[]` 表示没有禁止条目。显式空数组与"未配置"在本字段上不可区分，来源以 `network_denylist` 为准
+        network_denylist: { $ref: '#/components/schemas/NetworkAllowlistView' }
 
     NetworkAllowlistView:
       type: object
@@ -2601,10 +3178,13 @@ components:
         revision: { type: integer, description: 从 1 起，每次成功写入 +1；尚未装载为 0 }
         source:
           type: string
-          enum: [config_seed, database]
-          description: 'config_seed = 首次启动由配置种子写入；database = 来自管理台写入'
+          enum: [config_seed, database, migration, instance_init]
+          description: |
+            `config_seed` = 首次启动由配置种子写入（仅出网白名单 / 禁止域名）；`database` = 管理台写入；
+            `migration` = 版本迁移写入（如 `execution_policy` 升级一律 strict）；`instance_init` = 实例初始化
+            流程写入（如新建库的 `standard`）。出网白名单与禁止域名只会出现前两种取值
         updated_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "最近一次写入时间；零值渲染为空串（US-9 惯例）" }
-        updated_by: { type: string, description: '脱敏写入者（token:<指纹> / local_trust）；种子行为空串' }
+        updated_by: { type: string, description: '脱敏写入者（token:<指纹> / local_trust）；种子 / 迁移 / 初始化行为空串' }
 
     NetworkDomainsWrite:
       type: object
@@ -2617,6 +3197,171 @@ components:
           description: |
             完整替换列表（不是增量）。条目为主机名或 `*.` 前缀的通配（只覆盖子域，不覆盖裸后缀）；
             不接受 scheme / 端口 / 路径 / userinfo / IP。显式空数组 = 清空并拒绝全部受控出站请求。
+
+    ExecutionPolicyView:
+      allOf:
+        - $ref: '#/components/schemas/NetworkAllowlistView'
+        - type: object
+          required: [profile, exceptions_count, protected_addresses, shell_names, pending_confirmations]
+          properties:
+            profile: { type: string, enum: [standard, strict], description: 当前生效的执行档位 }
+            exceptions_count: { type: integer, description: 当前生效的内网访问例外条数 }
+            protected_addresses:
+              type: array
+              items: { type: string }
+              description: |
+                受保护地址段（两档相同，来自代码常量而非配置）。只作展示：告诉管理员哪些地址默认拒绝、
+                以及页面为何出现待确认项。云元数据地址单列，任何档位与例外都不放行
+            shell_names:
+              type: array
+              items: { type: string }
+              description: 交互式 shell 名称集合（去扩展名比对）。命中即拒，是**能力上限声明**，不是行为识别
+            pending_confirmations:
+              type: array
+              items: { $ref: '#/components/schemas/PendingPolicyConfirmation' }
+              description: |
+                升级迁移的待确认项（只读扫描结果，不落库）：出网白名单中解析到受保护地址段的条目、命令白名单中
+                命中新增 shell 名称的条目。已加例外、或已记录「保持拒绝」的条目不再列出
+
+    ExecutionPolicyWrite:
+      type: object
+      required: [profile, expected_profile]
+      properties:
+        profile: { type: string, enum: [standard, strict], description: 目标档位 }
+        expected_profile:
+          type: string
+          enum: [standard, strict]
+          description: |
+            客户端渲染确认框时看到的当前档位。与库内不一致 → 409 `EXECUTION_PROFILE_MISMATCH`（零写入）。
+            用途是保证"用户确认的变化方向"仍然成立；`If-Match` 不能代替它（两者都必须满足）
+
+    PendingPolicyConfirmation:
+      type: object
+      required: [id, axis, value, reason, resolved_protected]
+      properties:
+        id: { type: string, description: '稳定标识（`<axis>:<value>`）；页面据此记住处置结果' }
+        axis: { type: string, enum: [network_allowlist, shell_command] }
+        value: { type: string, description: '条目原文（域名或命令名）；不含凭据与参数' }
+        reason: { type: string, enum: [protected_address, shell_name] }
+        resolved_protected:
+          type: array
+          items: { type: string }
+          description: |
+            仅 `network_allowlist` 轴：本次解析命中的受保护地址；其余为空数组。解析失败（NODATA / 超时）的
+            条目不计入待确认项，也不猜测
+
+    PolicyConfirmationWrite:
+      type: object
+      required: [id, decision]
+      properties:
+        id:
+          type: string
+          description: '`GET /execution-policy` 返回的待确认项 id（`<axis>:<value>`）'
+        decision:
+          type: string
+          enum: [keep_denied]
+          description: |
+            「保持拒绝」。当前是唯一取值：放行动作走 `POST /network-exceptions`，另写
+            `network_exception.create`——一次写入只表达一个目的，不用本端点顺带建例外。其它取值 → 400
+
+    PolicyConfirmationResult:
+      type: object
+      required: [id, decision, operation_id, already_recorded]
+      properties:
+        id: { type: string, description: 处置的待确认项 id }
+        decision: { type: string, enum: [keep_denied] }
+        operation_id: { type: string, description: '本次处置的管理操作标识；`already_recorded=true` 时为已有行的标识' }
+        already_recorded:
+          type: boolean
+          description: 此前已记录过同一条处置（返回 200，不新增审计行）
+
+    NetworkExceptionListView:
+      type: object
+      required: [etag, exceptions]
+      properties:
+        etag:
+          type: string
+          description: '整份例外集合的强 ETag（排序后摘要），`DELETE` 的 `If-Match` 唯一取值来源；空集合同样有稳定 ETag'
+        exceptions:
+          type: array
+          items: { $ref: '#/components/schemas/NetworkExceptionView' }
+
+    NetworkExceptionView:
+      type: object
+      required: [exception_id, kind, value, note, revision, created_at, created_by, operation_id]
+      properties:
+        exception_id: { type: string, description: '`exc_` + 26 位 Crockford Base32' }
+        kind: { type: string, enum: [host, ip_port] }
+        value: { type: string, description: '`host` 为主机名（可 `*.` 前缀）；`ip_port` 为 `IP:端口` 字面量' }
+        note: { type: string, description: 必填理由；同一理由进管理审计 }
+        revision: { type: integer, description: 行版本，创建为 1；删除即整行移除，不保留历史行 }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string, description: '脱敏操作者（token:<指纹> / local_trust）；审计行缺失时为空串' }
+        operation_id: { type: string, description: 创建该例外的管理操作标识 }
+
+    NetworkExceptionCreate:
+      type: object
+      required: [kind, value, note]
+      properties:
+        kind: { type: string, enum: [host, ip_port] }
+        value: { type: string }
+        note: { type: string, minLength: 1, maxLength: 500, description: 必填且不能全是空白 }
+
+    NetworkExceptionDeleteResult:
+      type: object
+      required: [exception_id, etag, operation_id]
+      properties:
+        exception_id: { type: string }
+        etag: { type: string, description: 删除后整份集合的强 ETag }
+        operation_id: { type: string }
+
+    InstanceSecretsView:
+      type: object
+      required: [state, key_id, initialized_at, key_file, recovery_reason, can_initialize, credential_summary]
+      properties:
+        state:
+          type: string
+          enum: [uninitialized, ready, recovery_required]
+          description: |
+            `uninitialized` = 无初始化记录、无密钥文件、无托管密文；`ready` = 记录与密钥一致且可读；
+            `recovery_required` = 记录存在但密钥缺失 / 损坏 / `key_id` 不符，或存在无法证明来源的密钥文件。
+            `recovery_required` 下任何托管凭据操作返回 `SECRETS_RECOVERY_REQUIRED`，且**不生成替代密钥**
+        key_id:
+          type: string
+          description: '仅 `ready` 时非空；不含密钥材料与指纹。页面可截断显示'
+        initialized_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: 未初始化为空串 }
+        key_file: { type: string, description: '密钥文件路径（供备份指引）；不含密钥材料，未解析出时为空串' }
+        recovery_reason:
+          type: string
+          enum: ["", missing, corrupt, key_id_mismatch, unprovable_provenance, unavailable, key_path_missing]
+          description: |
+            仅 `recovery_required` 时非空：`missing` 文件不在；`corrupt` 格式 / 权限 / nlink 校验失败；
+            `key_id_mismatch` 与 `instance_secrets` 不符；`unprovable_provenance` 存在无法用 `os.SameFile`
+            证明来源的密钥文件；`unavailable` 库或文件系统读取失败（此时只报"无法判定"，不猜具体原因）；
+            `key_path_missing` 有初始化记录（或托管密文）但当前解析不出主密钥路径（实例名册 / `secrets` 配置缺失）。
+            缺少 `secrets` 段本身**不**表示纯环境变量部署；纯 env 只由显式 `secrets.auto_init: false` 表达
+        can_initialize:
+          type: boolean
+          description: |
+            此刻执行 `POST /instance/secrets/init` 是否会成功：判定允许**且**已有路径或能在本次动作里
+            建立实例身份与路径。页面据此显示初始化按钮；存量无名册实例为 true，显式纯 env（`auto_init: false`）为 false。
+            首次保存托管凭据时的必要初始化由保存动作自动完成，不以此字段为前提
+        credential_summary: { $ref: '#/components/schemas/CredentialKeySummary' }
+
+    CredentialKeySummary:
+      type: object
+      required: [managed, managed_revoked, env, missing]
+      properties:
+        managed: { type: integer, description: 有活动托管值的占位符数（MCP 逐键 + 其它 owner） }
+        managed_revoked: { type: integer }
+        env: { type: integer }
+        missing: { type: integer }
+
+    InstanceSecretsInitRequest:
+      type: object
+      required: [confirm]
+      properties:
+        confirm: { type: boolean, enum: [true], description: 必须显式为 true }
 
     FileDraft:
       type: object
@@ -3090,6 +3835,35 @@ components:
         valid: { type: boolean, description: 状态文件是否存在且校验和正确 }
         lifecycle_error: { type: string, description: 状态文件缺失或损坏时的点名原因 }
 
+    AgentReadiness:
+      type: object
+      required: [agent, ready, pending, notices]
+      properties:
+        agent: { type: string }
+        ready: { type: boolean, description: '等价于 `pending` 为空；`notices` 不影响该值' }
+        pending:
+          type: array
+          description: 阻断项：非空即不可启用
+          items: { $ref: '#/components/schemas/AgentReadinessItem' }
+        notices:
+          type: array
+          description: 提示项：只点名，不阻止启用
+          items: { $ref: '#/components/schemas/AgentReadinessItem' }
+
+    AgentReadinessItem:
+      type: object
+      required: [kind, item, detail, fix]
+      properties:
+        kind:
+          type: string
+          enum: [model_connection, credential, resource, notify_channel, budget, concurrency]
+          description: '闭集；前三个只出现在 `pending`，后三个只出现在 `notices`'
+        item:
+          type: string
+          description: '机器可认的名字（`model_connection/x` / `mcp_server/x#KEY` / `skill/x` / 配置键）；装载拒因等无名字项为空串'
+        detail: { type: string, description: 一句中文原因；不含值、路径与库原文 }
+        fix: { type: string, description: '控制台跳转路径（如 `/console/resources/mcp-servers`）；没有对应页面时为空串，不伪造点不通的链接' }
+
     AgentLifecycleTransition:
       type: object
       required: [expected_state, expected_generation]
@@ -3209,12 +3983,34 @@ components:
         name: { type: string }
         transport: { type: string, enum: [stdio, http] }
         command: { type: string, description: stdio 必填 }
-        args: { type: array, items: { type: string } }
+        args:
+          type: array
+          items: { type: string }
+          description: |
+            stdio 参数。**新增 / 修改时出现 `${` 一律 400**（点名第几个参数），零写入、零操作行、不发布——
+            秘密不进命令行参数，本轮不解析 `args` 占位符。存量条目已含占位符仍可加载，诊断持续报
+            `args_placeholders_not_resolved`
         url: { type: string, description: http 必填 }
         env:
           type: object
           additionalProperties: { type: string }
-          description: 值只能是 `${ENV_VAR}`；明文凭证 → 400
+          description: 值只能是整值 `${ENV_VAR}`（不拼接）；明文凭证 → 400；键名即占位符名
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            仅 http。值只能是整值 `${VAR}`（不拼接、不做前缀推导）；头名受 RFC 7230 token 约束，
+            `Host` / `Content-Length` / `Transfer-Encoding` 等由客户端接管的头禁止配置；头名
+            `Authorization` 装配为 `Authorization: Bearer <value>`，其它头名原样装配；跨主机重定向丢弃
+            认证头。只在内存里拼接：不写日志、不进审计 detail、不进模型上下文，不回读
+        credentials:
+          type: array
+          items: { $ref: '#/components/schemas/McpCredentialInput' }
+          description: |
+            逐占位符显式选择来源（`managed` / `env`），与执行档位无关；只对本次 `env` / `headers` 里出现的
+            占位符生效（其余键沿用既有声明）。省略某键的条目 = 沿用既有来源声明；合并后仍有占位符没有来源
+            声明 → 400 并点名该键（**不**隐式按 `env` 推断）。`managed` 模式下未取到值（无版本 / 已撤销 /
+            解密失败）→ 503，预写后置 failed，文件 / 发布指针 / 版本都不变（fail-closed）
 
     McpServerTestResult:
       type: object
@@ -3251,6 +4047,57 @@ components:
             成功为空串。只在 200 响应里出现；503 / 504 不返回本对象，页面改用
             `AdminError.Data.operation_id` 拉 `OperationDetail` 读 `detail.stage` / `detail.failure_class`。
             分类只来自结构化失败，不解析 stderr / 日志。
+
+    McpServerApplyRequest:
+      type: object
+      properties:
+        version_id:
+          type: integer
+          description: '目标版本；`0` / 省略 = 当前 `published_version_id`（保存即发布，没有草稿分支）'
+
+    McpServerApplyResult:
+      type: object
+      required: [outcome, operation_id, target_version_id, previous_version_id, drain_timeout_seconds]
+      properties:
+        outcome:
+          type: string
+          enum: [applied, superseded, failed]
+          description: |
+            200 只会是 `applied`；`superseded` / `failed` 以 409 / 500 返回，但同一形状会写进操作行
+            `detail`（去掉 `server`），页面按 `operation_id` 查证。审计 detail 的固定字段即本对象去掉
+            `server` 后的键集
+        applied_version_id: { type: integer, description: 切换后运行生效的版本；`superseded` / `failed` 时保持不变 }
+        previous_version_id: { type: integer, description: 切换前的 applied 版本；未曾应用为 0 }
+        target_version_id: { type: integer, description: 本次冻结的目标版本（第 1 步读到的值） }
+        drain_deadline:
+          type: string
+          description: '旧连接排空窗口截止时刻（RFC 3339，UTC）；窗口内旧连接继续服务已发出的调用。`superseded` / `failed` 为空串'
+        drain_timeout_seconds: { type: integer, description: '排空窗口长度（默认 30）；窗口到点强制关闭旧连接' }
+        failure_class:
+          type: string
+          enum:
+            - ""
+            - command_not_found
+            - permission_denied
+            - policy_denied
+            - timeout
+            - http_unauthorized
+            - http_unreachable
+            - handshake_failed
+            - tools_list_failed
+            - env_missing
+            - dependency_unconfirmed
+            - drain_timeout
+          description: |
+            `apply_failure_class`：复用测试的 `failure_class` 全部取值并追加 `drain_timeout`。非空只在
+            `outcome=failed`，或 `outcome=applied` 但旧连接未在窗口内自然排空（`drain_timeout`）时出现；
+            `superseded` 为空串（不是失败，是被更新的写取代）
+        superseded_by:
+          type: string
+          enum: ["", publish, revoke, apply]
+          description: 仅 `outcome=superseded` 时非空：本次切换是被哪类并发写取代的
+        operation_id: { type: string, description: 对应 `management_operations.operation_id` }
+        server: { $ref: '#/components/schemas/McpServerView' }
 
     SkillFileView:
       type: object
@@ -3343,11 +4190,17 @@ components:
       properties:
         resource_uid: { type: string, description: 必须等于当前指针 UID；不一致 → 409 RESOURCE_UID_MISMATCH }
         confirm: { type: boolean, enum: [true], description: 必须显式为 true }
+        binding_key:
+          type: string
+          description: |
+            `kind=mcp_server` 时**必填**（占位符名，env 键或 header 名；缺失 → 400）；其它 kind 出现 → 400。
+            撤销粒度是单个占位符：同一 server 的其它占位符不受影响
 
     CredentialRevokeResult:
       type: object
       properties:
         resource_uid: { type: string }
+        binding_key: { type: string, description: 仅 `kind=mcp_server` 时非空（被撤销的占位符名）；其它 kind 为空串 }
         credential_ref: { type: string }
         credential_state: { type: string, enum: [revoked] }
         revoked_versions: { type: integer }
@@ -3398,7 +4251,7 @@ components:
       properties:
         operation_id: { type: string }
         action: { type: string }
-        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, system] }
+        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system] }
         target_id: { type: string }
         actor_subject: { type: string }
         auth_method: { type: string, enum: [bearer, local_trust, cli, migration] }
@@ -3424,6 +4277,11 @@ components:
                 脱敏 detail_json。`mcp_server.test` 的固定字段为 `ok` / `latency_ms` / `tools` / `error_code` /
                 `error_message` / `stage` / `failure_class`；被测版本以 `requested_version_id` 为准，`detail`
                 不重复版本字段。旧记录可能缺 `tools` / `stage` / `failure_class`，页面显示“历史记录字段不全，
-                需重新测试”，不得据此推断通过。不得写入 env 值、命令原文、URL 凭据或 stderr。
+                需重新测试”，不得据此推断通过。`mcp_server.apply` 的固定字段为
+                `McpServerApplyResult` 去掉 `server` 后的键集（含冻结的 `target_version_id` 与失败分类）；
+                `execution_policy.update` 为 `before_profile` / `after_profile` / `before_revision` /
+                `after_revision`；`network_allowlist.update` 与 `network_denylist.update` 为
+                `before_revision` / `after_revision` / `candidate_sha256`。不得写入 env 值、命令原文、
+                URL 凭据、stderr 或凭据末位以外的任何凭据片段。
             recovered_at: { type: string, description: 未恢复为空串 }
             verification: { type: string, enum: [not_required, applied, not_applied, indeterminate] }

@@ -106,6 +106,35 @@ func TestSandbox_SeedMetadata(t *testing.T) {
 	require.Zero(t, view.Data.NetworkAllowlist.Revision)
 }
 
+// TestSandbox_ExecutionProfileProjection —— `execution_profile` 与 `execution_policy`
+// 投影的是档位行的**生效**状态：档位取行上的值，五键元数据与 `GET /execution-policy`
+// 同一份 ETag 材料（页面两处看到的强 ETag 不得分叉）；没有权威行时退回只读缝——
+// `strict`（策略实例的实际判定档位）+ `config_seed` + 修订号 0 + 空 ETag。
+// 逆改点：ETag 自己另算 / 未装载时编造迁移来源 / 空档位出站 → 红。
+func TestSandbox_ExecutionProfileProjection(t *testing.T) {
+	policy := seededExecutionPolicy() // standard / revision 3 / op-seed → database
+	s := newTestServer(t, func(o *Options) { o.ExecutionPolicy = &fakeExecutionPolicy{policy: policy} })
+	env := decodeResourcesEnvelope[SandboxView](t,
+		serveAdmin(s, adminRequest(http.MethodGet, "/api/v1/sandbox", "")))
+
+	require.Equal(t, string(core.ProfileStandard), env.Data.ExecutionProfile)
+	require.Equal(t, core.ExecutionPolicyETag(policy), env.Data.ExecutionPolicy.ETag,
+		"ETag 与 GET /execution-policy 必须是同一份材料")
+	require.Equal(t, int64(3), env.Data.ExecutionPolicy.Revision)
+	require.Equal(t, core.NetworkAllowlistSourceDatabase, env.Data.ExecutionPolicy.Source)
+	require.Equal(t, "2026-10-26T09:15:00Z", env.Data.ExecutionPolicy.UpdatedAt)
+	require.Equal(t, "token:abc123", env.Data.ExecutionPolicy.UpdatedBy)
+
+	// 未装载（修订号 0）：不编造档位与来源，保持只读缝的兜底值。
+	unseeded := newTestServer(t, func(o *Options) { o.ExecutionPolicy = &fakeExecutionPolicy{} })
+	view := decodeResourcesEnvelope[SandboxView](t,
+		serveAdmin(unseeded, adminRequest(http.MethodGet, "/api/v1/sandbox", "")))
+	require.Equal(t, string(core.ProfileStrict), view.Data.ExecutionProfile)
+	require.Zero(t, view.Data.ExecutionPolicy.Revision)
+	require.Empty(t, view.Data.ExecutionPolicy.ETag)
+	require.Equal(t, core.NetworkAllowlistSourceConfigSeed, view.Data.ExecutionPolicy.Source)
+}
+
 // TestSandbox_NetworkDomainsConditionalWrite —— 成功的条件写：请求体原样交给服务层，
 // 成功后响应是**重新读出的**生效视图（域名、修订号、ETag 都来自新快照）。
 // 逆改点：响应回显请求体（乐观更新）→ 修订号 / ETag 断言红。

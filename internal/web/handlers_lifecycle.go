@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/ymedword/basalt/internal/core"
 )
@@ -128,25 +127,23 @@ func (s *Server) transitionAgent(w http.ResponseWriter, r *http.Request, actor c
 	s.writeOK(w, agentLifecycleView(rec))
 }
 
-// enableResourceRejection 返回启用前置校验的固定拒绝原因；空串表示通过。资源视图
-// 读不到 → 不可确认（resourceViewsProblem）；引用缺已发布版本 → 点名缺失项。
+// enableResourceRejection 返回启用前置校验的固定拒绝原因；空串表示通过。判定与
+// `GET /agents/{name}/readiness` 共用同一份评估器（`readiness.go`）——页面说"可启用"、
+// 按钮却 409 是这类功能最坏的假成功，两处各写一套判定迟早漂移。
+// 待补项逐项点名 + 跳转；资源视图读不到 → 不可确认（resourceViewsProblem）。
 // 两种情况都映射为 409 AGENT_UNAVAILABLE，底层错误只进 WARN 日志（约束 45）。
-// enableResourceRejection returns the fixed refusal reason ("" passes); the raw index
-// error stays in the WARN log.
+// enableResourceRejection shares the readiness evaluator with the read endpoint; the raw
+// index error stays in the WARN log.
 func (s *Server) enableResourceRejection(ctx context.Context, entry core.AgentEntry) string {
-	if entry.Profile == nil {
-		return enableRejectedReason
-	}
-	index, err := s.publishedResourceIndex(ctx)
+	view, err := s.agentReadiness(ctx, entry)
 	if err != nil {
 		s.logger().Warn("读取已发布资源视图失败，启用按不可确认处理", "agent", entry.Name, "error", err)
 		return resourceViewsProblem
 	}
-	missing := missingPublishedResources(entry, index)
-	if len(missing) == 0 {
+	if len(view.Pending) == 0 {
 		return ""
 	}
-	return missingPublishedPrefix + strings.Join(missing, "、")
+	return readinessPendingMessage(view.Pending)
 }
 
 // decodeLifecycleTransition 解析启停请求体：未知字段拒绝（管理写不接受拼错的键），

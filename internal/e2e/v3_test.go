@@ -162,24 +162,25 @@ func v3RewriteAddr(t *testing.T, h *harness, oldAddr, newAddr string) {
 	}
 }
 
-// requireFreshSchema 断言全新安装**直接**建出当前基线（v4）库：schema_version 只有
-// 一行且为 5、29 张用户表、且没有 `system.baseline_v3` 迁移操作行（迁移只属于真实的
-// v2→v3 升级）。R7 的 0004 只追加两表，不改本组断言的行为面。
-// requireFreshSchema pins a direct current-baseline install: one version row (4),
-// 29 tables, and no baseline_v3 migration op.
+// requireFreshSchema 断言全新安装**直接**建出当前基线（v6）库：schema_version 只有
+// 一行且为 6、33 张用户表、且没有 `system.baseline_v3` 迁移操作行（迁移只属于真实的
+// v2→v3 升级）。0004 追加两表、0005 追加一张、0006（14D）追加四张，总数与
+// internal/storage/migrate_test.go 的 contractTables 同口径。
+// requireFreshSchema pins a direct current-baseline install: one version row (6),
+// 33 tables, and no baseline_v3 migration op.
 func requireFreshSchema(t *testing.T, db *sql.DB, label string) {
 	t.Helper()
 	versions := queryRows(t, db, `SELECT version FROM schema_version ORDER BY version`)
 	if len(versions) != 1 {
 		t.Fatalf("%s：schema_version 应只有一行，实际 %d 行：%v", label, len(versions), versions)
 	}
-	if got, _ := versions[0]["version"].(int64); got != 5 {
-		t.Fatalf("%s：schema_version = %v，期望 5（全新安装直接建 v5）", label, versions[0]["version"])
+	if got, _ := versions[0]["version"].(int64); got != 6 {
+		t.Fatalf("%s：schema_version = %v，期望 6（全新安装直接建 v6）", label, versions[0]["version"])
 	}
 	tables := scalarInt(t, db,
 		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'`)
-	if tables != 29 {
-		t.Fatalf("%s：用户表 %d 张，期望 29（v1 十一张 + v2 七张 + v3 八张 + v4 两张 + v5 一张）", label, tables)
+	if tables != 33 {
+		t.Fatalf("%s：用户表 %d 张，期望 33（v1 十一张 + v2 七张 + v3 八张 + v4 两张 + v5 一张 + v6 四张）", label, tables)
 	}
 	if got := scalarInt(t, db,
 		`SELECT COUNT(*) FROM management_operations WHERE action = 'system.baseline_v3'`); got != 0 {

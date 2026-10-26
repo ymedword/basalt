@@ -22,6 +22,7 @@ import io
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import industry_brief
@@ -316,6 +317,61 @@ class IndustryBriefTest(unittest.TestCase):
             self.assertNotEqual(first.read_bytes(), third.read_bytes())
             self.assertEqual(json.loads(third.read_text(encoding="utf-8"))["observed_at"],
                              "2026-10-25T09:31:00+08:00")
+
+    def test_default_clock_is_second_precision_with_offset(self):
+        # 省略 --now 时取本机时钟：必须带时区偏移、且秒级（模型要把 stdout 的
+        # observed_at 原样回传，微秒会让两次调用不再逐字节相同）。
+        clock = industry_brief.parse_clock(None)
+        self.assertIsNotNone(clock.tzinfo)
+        self.assertEqual(clock.microsecond, 0)
+        self.assertEqual(industry_brief.parse_clock(clock.isoformat()), clock)
+
+    def test_future_now_is_refused(self):
+        # 实测模型编过一个比真实跑数时间晚两个多小时的 --now，把「访问时间」写成
+        # 了没发生的时间点。运行时钟只能是真实观测时间，未来时间一律拒收。
+        ahead = datetime.now().astimezone() + timedelta(hours=2)
+        with self.assertRaises(ScriptError) as ctx:
+            industry_brief.parse_clock(ahead.replace(microsecond=0).isoformat())
+        self.assertIn("晚于本机时钟", str(ctx.exception))
+
+    def test_now_within_tolerance_is_accepted(self):
+        # 5 分钟容差吸收设备间秒级对齐误差，容差内不拒收。
+        near = (datetime.now().astimezone() + timedelta(minutes=1)).replace(microsecond=0)
+        self.assertEqual(industry_brief.parse_clock(near.isoformat()), near)
+
+    def test_cli_refuses_future_now_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "future" / "brief.json"
+            future = (datetime.now().astimezone() + timedelta(hours=2)).replace(microsecond=0)
+            code, out, err = run_cli(fixture("search.json"), fixture("pages.json"),
+                                     root=root, output=output, now=future.isoformat())
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+            self.assertIn("晚于本机时钟", err)
+            self.assertFalse(output.exists())
+            self.assertFalse(output.parent.exists())
+
+    def test_default_output_directory_matches_observed_at(self):
+        # 省略 --now 时目录 runs/<t0>/ 与报告 observed_at 必须同源：main() 只采一次
+        # 时钟。两次采样跨秒时，目录名和报告里的时间会差一秒，用户按目录名对不上。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "search.json").write_text(
+                json.dumps(fixture("search.json"), ensure_ascii=False), encoding="utf-8")
+            (root / "pages.json").write_text(
+                json.dumps(fixture("pages.json"), ensure_ascii=False), encoding="utf-8")
+            argv = ["--search", "search.json", "--pages", "pages.json", "--topic", TOPIC]
+            out = io.StringIO()
+            with contextlib.chdir(root):
+                with contextlib.redirect_stdout(out):
+                    code = industry_brief.main(argv)
+                self.assertEqual(code, 0)
+                written = Path(json.loads(out.getvalue())["report"]["path"])
+                observed = json.loads(written.read_text(encoding="utf-8"))["observed_at"]
+            self.assertEqual(written.parent.name,
+                             datetime.fromisoformat(observed).strftime("%Y%m%dT%H%M%S"))
+            self.assertEqual(written.parent.parent.name, "runs")
 
 
 if __name__ == "__main__":

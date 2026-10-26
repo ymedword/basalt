@@ -10,17 +10,27 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
 const (
-	// mcpGateStagePreflight / mcpGateClassEnvMissing 是 D-05 枚举里本闸门只用到的两个
-	// 值：失败发生在任何进程 / 连接动作之前。
-	// The gate can only fail in the preflight stage, with the env_missing class.
-	mcpGateStagePreflight  = "preflight"
+	// mcpGateStagePreflight 是闸门唯一会失败的阶段：任何进程 / 连接动作之前。
+	// The gate can only fail in the preflight stage.
+	mcpGateStagePreflight = "preflight"
+	// mcpGateClassEnvMissing 是"声明读进程环境，变量未设置或为空"。
+	// mcpGateClassEnvMissing: an env-sourced slot whose variable is missing or empty.
 	mcpGateClassEnvMissing = "env_missing"
+	// mcpGateClassCredentialUnavailable 是"声明托管，但无值 / 已撤销 / 解密失败"。
+	// 它与 env 缺失同为 503，但原因不同——合报会把"撤了还在用"引向"去查环境变量"。
+	// 这两个字面量只属于保存闸门的 detail，**不**扩测试记录的 `failure_class` 枚举（D-05）：
+	// 那套码描述一次真实连接尝试，本结构描述"根本没到连接"。
+	// mcpGateClassCredentialUnavailable: a managed slot with no usable value. These
+	// literals belong to the save gate's detail only; the test-record enum is unchanged.
+	// #nosec G101 -- 闸门分类字面量，不是凭据（变量名命中）。
+	mcpGateClassCredentialUnavailable = "credential_unavailable"
 )
 
 // mcpEnvGateDetail 是闸门失败写进 `detail_json` 的**脱敏**结构：只有分类与"点名
@@ -33,18 +43,36 @@ type mcpEnvGateDetail struct {
 	ErrorMessage string `json:"error_message"`
 }
 
-// validateMCPEntryEnv 把候选条目的 `${VAR}` 占位按当前进程环境解析一遍：
-// 未设置与空值同档拒绝（与 `resolveMCPEnv` 同一判据），错误只点名 server / 键 / 变量名。
-// 条目本身不可解析时原样上抛——那是候选非法，调用方按 400 处理。
-// validateMCPEntryEnv resolves the entry's placeholders with the assembly-time rule;
-// missing and empty values are refused alike and the error never carries a value.
-func validateMCPEntryEnv(entryRaw []byte, lookup func(string) (string, bool)) error {
+// mcpGateFailureClassOf 把可用性失败归到闸门的两个分类。
+// mcpGateFailureClassOf maps an availability failure to the gate's two classes.
+func mcpGateFailureClassOf(cause error) string {
+	var envFailure mcpEnvSlotFailure
+	if errors.As(cause, &envFailure) {
+		return mcpGateClassEnvMissing
+	}
+	return mcpGateClassCredentialUnavailable
+}
+
+// validateMCPPublishedCredentials 把**已发布 / 回滚目标版本**的条目按声明的来源取值
+// 一遍（`env` 读进程环境，`managed` 解密托管库），拿到的明文立即清零：发布闸门只关心
+// "取得到 / 取不到"，不需要值本身。条目本身不可解析时原样上抛——那是候选非法，按 400。
+// It resolves the target version by declared source and discards the plaintext.
+func (s *ResourceAdmin) validateMCPPublishedCredentials(ctx context.Context, name string,
+	uid core.ResourceUID, entryRaw []byte,
+) error {
+	if s.mcpCredentials == nil {
+		return nil
+	}
 	cfg, err := workspace.ParseMCPServerBlock(entryRaw)
 	if err != nil {
 		return err
 	}
-	_, err = resolveMCPEnv([]core.MCPServerConfig{cfg}, lookup)
-	return err
+	values, err := s.mcpCredentials.Resolve(ctx, name, uid, cfg)
+	if err != nil {
+		return err
+	}
+	ZeroMCPCredentialValues(values)
+	return nil
 }
 
 // rejectMCPEnvGate 把闸门失败收敛为「failed 操作行 + 503 载体」：创建 / 修改 / 发布 /
@@ -58,7 +86,7 @@ func (s *ResourceAdmin) rejectMCPEnvGate(ctx context.Context, operationID, messa
 	payload, marshalErr := json.Marshal(mcpEnvGateDetail{
 		ErrorCode:    resourceResultNotConfigured,
 		Stage:        mcpGateStagePreflight,
-		FailureClass: mcpGateClassEnvMissing,
+		FailureClass: mcpGateFailureClassOf(cause),
 		ErrorMessage: cause.Error(),
 	})
 	if marshalErr != nil {

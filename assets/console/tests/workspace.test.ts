@@ -148,12 +148,20 @@ describe('workspace navigation', () => {
   })
 
   it('preserves full tool identifiers and explains the backend directory template', async () => {
+    const policyMeta = { etag: '"sha256:test"', revision: 1, source: 'instance_init', updated_at: '', updated_by: '' }
     await signIn(false, {
       '/api/v1/tools': [{ name: 'manage_schedule', description: '维护定时任务', source: 'builtin' }],
       '/api/v1/sandbox': {
         file_allowed_paths: ['.basalt/agents/<agent>/'], shell_allowed_commands: [], shell_interpreters: [],
         http_allowed_domains: [], network_allowlist: { etag: '"sha256:test"', revision: 1, source: 'config_seed', updated_at: '', updated_by: '' },
+        execution_profile: 'standard', execution_policy: policyMeta,
+        denied_domains: [], network_denylist: policyMeta,
       },
+      '/api/v1/execution-policy': {
+        ...policyMeta, profile: 'standard', exceptions_count: 0, protected_addresses: [], shell_names: [],
+        pending_confirmations: [],
+      },
+      '/api/v1/network-exceptions': { etag: '"sha256:test"', exceptions: [] },
     })
     await visit('/console/library/tools')
     expect(wrapper!.find('.col-tool .cell-id').attributes('title')).toBe('manage_schedule')
@@ -161,5 +169,68 @@ describe('workspace navigation', () => {
     await visit('/console/settings/sandbox')
     expect(wrapper!.find('.path-note').text()).toContain('按当前 Agent 名替换')
     expect(wrapper!.find('.policy-grid code').text()).toBe('.basalt/agents/<agent>/')
+  })
+})
+
+describe('instance secrets surfaces', () => {
+  /** 契约视图夹具：状态与汇总计数是页面唯一依赖的字段。 */
+  function secretsView(
+    state: 'ready' | 'uninitialized' | 'recovery_required',
+    reason = '',
+  ): unknown {
+    return {
+      state,
+      key_id: state === 'ready' ? 'k_7Q3M9X2P' : '',
+      initialized_at: state === 'ready' ? '2026-10-20T08:00:00Z' : '',
+      key_file: state === 'ready' ? '/var/lib/basalt/secrets/instance.key' : '',
+      recovery_reason: reason,
+      // 未初始化默认按「可就地初始化」给：普通流程不显示"请先初始化"。
+      can_initialize: state === 'uninitialized',
+      credential_summary: { managed: 3, managed_revoked: 0, env: 1, missing: 0 },
+    }
+  }
+
+  function alerts(): string {
+    return wrapper!.findAll('[role="alert"]').map((item) => item.text()).join('\n')
+  }
+
+  it('shows the instance encryption state and credential summary on the overview', async () => {
+    await signIn(false, { '/api/v1/instance/secrets': secretsView('ready') })
+    const text = wrapper!.text()
+    expect(text).toContain('实例与凭据')
+    expect(text).toContain('实例加密服务')
+    expect(text).toContain('就绪（k_7Q3M…）')
+    expect(text).toContain('当前连接凭据')
+    expect(text).toContain('3 个托管 / 1 个环境变量')
+    // 就绪态不挂恢复横幅。
+    expect(alerts()).not.toContain('实例主密钥需要恢复')
+  })
+
+  it('keeps the recovery banner on every authenticated page', async () => {
+    await signIn(false, {
+      '/api/v1/instance/secrets': secretsView('recovery_required', 'missing'),
+    })
+    expect(alerts()).toContain('实例主密钥需要恢复')
+    expect(alerts()).toContain('docs/Operations.md')
+    expect(alerts()).toContain('不要删除密钥文件')
+    await visit('/console/runs')
+    expect(alerts()).toContain('实例主密钥需要恢复')
+  })
+
+  it('does not claim readiness or raise the banner for an unrecognised payload', async () => {
+    await signIn(false, { '/api/v1/instance/secrets': [] })
+    expect(wrapper!.text()).toContain('待确认')
+    expect(wrapper!.text()).not.toContain('就绪（')
+    expect(alerts()).not.toContain('实例主密钥需要恢复')
+  })
+
+  it('states the shared access password and its limits on the login page', async () => {
+    setupFetch()
+    window.history.replaceState(null, '', '/console/login')
+    wrapper = mount(createConsoleApp(), { attachTo: document.body })
+    await flushPromises()
+    const text = wrapper.text()
+    expect(text).toContain('共享访问密码')
+    expect(text).toContain('系统不提供个人账户、角色或操作人隔离')
   })
 })

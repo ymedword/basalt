@@ -87,6 +87,17 @@ const (
 	codeCredentialOwnerMismatch = "CREDENTIAL_OWNER_MISMATCH" // 409 跨资源借用凭据
 	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
 	codeCredentialUnavailable = "CREDENTIAL_UNAVAILABLE" // 503 主密钥读不出密文
+
+	// 14D 新增（契约 run-and-errors §8 的密钥 / 执行环境 / MCP 发布行）。四个字面量与
+	// 状态都是契约冻结值：密钥三态恢复中 409、执行环境版本不匹配 409、MCP 受控发布
+	// 失败 500 与被后续发布取代 409。同样纪律——只加常量不加契约行 → 对账用例红。
+	// 14D additions: the secrets-recovery, execution-profile and MCP-apply rows of
+	// contract §8.
+	// #nosec G101 -- 契约错误码字面量，不是凭据（变量名命中）。
+	codeSecretsRecoveryRequired  = "SECRETS_RECOVERY_REQUIRED"  // 409 密钥三态非 ready，须先恢复
+	codeExecutionProfileMismatch = "EXECUTION_PROFILE_MISMATCH" // 409 If-Match 版本不匹配
+	codeMCPApplyFailed           = "MCP_APPLY_FAILED"           // 500 受控发布整体失败
+	codeMCPApplySuperseded       = "MCP_APPLY_SUPERSEDED"       // 409 发布已被后续版本取代
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自

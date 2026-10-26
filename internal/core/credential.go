@@ -105,12 +105,19 @@ func (s CredentialVersionState) CanTransitionTo(next CredentialVersionState) boo
 // CredentialRecord 是 `credentials` 的行视图：凭据身份（一个资源实例至多一条）、
 // 当前活动版本号与撤销纪元。`RevocationEpoch` 每次撤销 +1 并参与资源 ETag——
 // 已固定旧纪元的 Run 据此判出"凭据在途中被撤销"。
-// CredentialRecord is the row view of the credential identity; the epoch participates in
-// the resource ETag and lets a pinned run notice a revoke.
+//
+// 14D 起唯一键是 `(owner_kind, owner_uid, binding_key)`：`mcp_server` 一个 server 可以有
+// 多个占位符，各自独立版本与撤销，`BindingKey` 就是占位符名；其余三种 kind 固定空串，
+// 键空间不混用（schema CHECK 同口径）。模型连接 / 通知渠道"一个实例至多一条"的语义
+// 因此不变——它们的 `binding_key` 恒为 `”`。
+// CredentialRecord is the row view of the credential identity. Since 14D the uniqueness key
+// is (owner_kind, owner_uid, binding_key): one MCP server may hold one credential per
+// placeholder, while every other kind keeps the empty key and therefore one identity each.
 type CredentialRecord struct {
 	ID              string
 	OwnerKind       BindingKind
 	OwnerUID        ResourceUID
+	BindingKey      string // mcp_server：占位符名；其它 kind 固定空串
 	OwnerName       string
 	State           CredentialIdentityState
 	CurrentVersion  int

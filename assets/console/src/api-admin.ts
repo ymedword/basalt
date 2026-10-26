@@ -10,9 +10,16 @@ import type {
   AgentConfigView,
   AgentFilesView,
   CredentialMode,
+  ExecutionPolicyView,
+  ExecutionProfile,
+  InstanceSecretsView,
+  McpCredentialKeyMode,
   McpServerView,
   ModelConnectionView,
+  NetworkExceptionCreateResult,
+  NetworkExceptionDeleteResult,
   NotifyChannelView,
+  PolicyConfirmationResult,
   ResourceScope,
   SandboxView,
   SkillView,
@@ -115,16 +122,32 @@ export interface ModelConnectionUpsert {
 /** 带使用范围的资源种类（范围与凭据动作只覆盖这两类）。 */
 export type CredentialResourceKind = 'model_connection' | 'notify_channel'
 
+/**
+ * 凭据属主种类（契约 `CredentialOwnerKind`）：比 `CredentialResourceKind` 多
+ * `mcp_server`——MCP server 有逐占位符的托管凭据，但没有 shared / exclusive 范围，
+ * 因此只有撤销走这条 kind。
+ * Credential-owner kinds: an MCP server has per-slot credentials but no scope.
+ */
+export type CredentialOwnerKind = CredentialResourceKind | 'mcp_server'
+
 /** 撤销托管凭据：撤销整个凭据身份，旧版本永不复活。 */
 export interface CredentialRevokeRequest {
   /** 必须等于当前指针 UID；不一致 → 409 `RESOURCE_UID_MISMATCH`。 */
   resource_uid: string
   /** 必须显式为 true（契约 enum [true]）。 */
   confirm: true
+  /**
+   * 仅 `kind=mcp_server` 必填（占位符名，env 键或 header 名；缺失 → 400）；其它 kind
+   * 出现 → 400。撤销粒度是单个占位符，同一 server 的其它占位符不受影响。
+   * Required for MCP (one slot at a time); rejected for other kinds.
+   */
+  binding_key?: string
 }
 
 export interface CredentialRevokeResult {
   resource_uid: string
+  /** 仅 `kind=mcp_server` 时非空（被撤销的占位符名）；其它 kind 为空串。 */
+  binding_key: string
   credential_ref: string
   credential_state: 'revoked'
   revoked_versions: number
@@ -177,10 +200,31 @@ export interface NotifyChannelTestResult {
   detail: string
 }
 
+/** 新增内网访问例外的请求体（契约 NetworkExceptionCreate）：理由必填且不能全空白。 */
+export interface NetworkExceptionCreate {
+  kind: 'host' | 'ip_port'
+  value: string
+  note: string
+}
+
 export interface McpServerDetail extends McpServerView {
   args: string[]
   /** 仅 http 传输；凭证不得出现在 URL。 */
   url: string
+}
+
+/**
+ * 一个占位符的来源声明（契约 McpCredentialInput）：`mode` 必填——来源不靠"托管行
+ * 是否存在"推断。`value` 只往上走、永不回读：`managed` + 值 = 新版本；`managed` +
+ * 省略 = 保留已有托管值；没有旧值又省略 → 400；`env` 带值 → 400。
+ * One explicit source choice; a value only ever travels upward.
+ */
+export interface McpCredentialInput {
+  /** `env` 的键名或 `headers` 的头名；同名即同一占位符（跨两者重名 → 400）。 */
+  key: string
+  mode: McpCredentialKeyMode
+  /** write-only；不进日志 / 审计 / 模型上下文。 */
+  value?: string
 }
 
 export interface McpServerUpsert {
@@ -191,6 +235,18 @@ export interface McpServerUpsert {
   url?: string
   /** 值只能是 `${ENV_VAR}`；明文凭证由服务端 400 拒绝。 */
   env?: Record<string, string>
+  /**
+   * 仅 http。值只能是整值 `${VAR}`；`Authorization` 装配为 `Bearer <value>`，其它
+   * 头名原样装配，不做前缀推导。只在内存里拼接，不回读。
+   * HTTP headers; values are whole `${VAR}` placeholders only.
+   */
+  headers?: Record<string, string>
+  /**
+   * 逐占位符显式选择来源；只对本次 `env` / `headers` 出现的占位符生效。省略某键 =
+   * 沿用既有声明；合并后仍有占位符没有声明 → 400 点名该键（不隐式按 env 推断）。
+   * Per-slot source choices; undeclared slots are rejected, never inferred.
+   */
+  credentials?: McpCredentialInput[]
 }
 
 /**
@@ -240,6 +296,44 @@ export interface McpServerTestResult {
   tested_version_id: number
   stage: McpTestStage
   failure_class: McpTestFailureClass
+}
+
+/**
+ * 应用失败分类（契约 `McpServerApplyResult.failure_class`）：复用测试的全部取值并
+ * 追加 `drain_timeout`（旧连接没在窗口内自然排空）。成功且排空正常时为空串。
+ * Apply reuses the test classes and adds `drain_timeout`.
+ */
+export type McpApplyFailureClass = McpTestFailureClass | 'drain_timeout'
+
+/** 应用请求体（契约 McpServerApplyRequest）：`0` / 省略 = 当前已发布版本。 */
+export interface McpServerApplyRequest {
+  version_id?: number
+}
+
+/**
+ * 一次受控应用的结果（契约 McpServerApplyResult）。200 只会是 `applied`；
+ * `superseded` / `failed` 以 409 / 500 返回，但同一形状（去掉 `server`）会写进操作行
+ * `detail`，页面按 `operation_id` 查操作详情——所以失败分类可能只在详情里。
+ * One apply outcome; failure details live in the operation row as well.
+ */
+export interface McpServerApplyResult {
+  outcome: 'applied' | 'superseded' | 'failed'
+  /** 切换后运行生效的版本；`superseded` / `failed` 时保持不变。 */
+  applied_version_id: number
+  /** 切换前的 applied 版本；未曾应用为 0。 */
+  previous_version_id: number
+  /** 本次冻结的目标版本。 */
+  target_version_id: number
+  /** 旧连接排空截止（RFC 3339 UTC）；`superseded` / `failed` 为空串。 */
+  drain_deadline: string
+  /** 排空窗口长度（默认 30 秒）。 */
+  drain_timeout_seconds: number
+  failure_class: McpApplyFailureClass
+  /** 仅 `superseded` 时非空：被哪类并发写取代。 */
+  superseded_by: '' | 'publish' | 'revoke' | 'apply'
+  operation_id: string
+  /** 仅 200 响应带；409 / 500 的操作行 detail 没有这一项。 */
+  server?: McpServerView
 }
 
 export interface SkillFileView {
@@ -521,9 +615,14 @@ export class AdminApi {
     })
   }
 
-  /** 撤销托管凭据（全部版本）；重新录入是新版本，旧版本永不复活。 */
+  /**
+   * 撤销托管凭据（全部版本）；重新录入是新版本，旧版本永不复活。
+   * `kind=mcp_server` 时必须带 `binding_key`：只撤销那一个占位符，并按失效态回收该
+   * server 的连接——不等下一次 apply。
+   * MCP revocation is per slot and reclaims the live connection immediately.
+   */
   revokeCredential(
-    kind: CredentialResourceKind,
+    kind: CredentialOwnerKind,
     name: string,
     body: CredentialRevokeRequest,
     ifMatch: string,
@@ -589,6 +688,25 @@ export class AdminApi {
     return this.#client.request<McpServerTestResult>(
       'POST',
       `/mcp-servers/${encodeURIComponent(name)}/test`,
+    )
+  }
+
+  /**
+   * 受控应用：把已发布版本切成运行生效版本，只重建这一个 server。
+   * `If-Match` 必填（缺失 / 弱 ETag / `*` → 412 零写入零操作行）；`versionId`
+   * 省略 = 当前 `published_version_id`。保存、测试、应用是三件不同的事，互不代言。
+   * Conditional apply of the published version to the running connection.
+   */
+  applyMcpServer(
+    name: string,
+    ifMatch: string,
+    versionId = 0,
+  ): Promise<McpServerApplyResult> {
+    const body: McpServerApplyRequest = { version_id: versionId }
+    return this.#client.request<McpServerApplyResult>(
+      'POST',
+      `/mcp-servers/${encodeURIComponent(name)}/apply`,
+      { body, ifMatch },
     )
   }
 
@@ -748,6 +866,79 @@ export class AdminApi {
     return this.#client.request<SandboxView>('PUT', '/sandbox/network-domains', {
       body: { domains },
       ifMatch,
+    })
+  }
+
+  /**
+   * 保存禁止域名表（全量替换，两档都先生效）。与白名单同构：条件写必须带禁止表
+   * 当前生效的 ETag；成功返回重新读取的 SandboxView；`domains: []` 表示没有禁止条目。
+   */
+  updateDeniedDomains(domains: readonly string[], ifMatch: string): Promise<SandboxView> {
+    return this.#client.request<SandboxView>('PUT', '/sandbox/denied-domains', {
+      body: { domains },
+      ifMatch,
+    })
+  }
+
+  /**
+   * 切换执行档位：`If-Match` 之外必须给出渲染确认框时看到的档位（`expectedProfile`）。
+   * 库内档位与之不一致 → 409 `EXECUTION_PROFILE_MISMATCH`，零写入；页面不自动重试。
+   * The confirmed direction is part of the write, so a stale dialog cannot be replayed.
+   */
+  updateExecutionPolicy(
+    profile: ExecutionProfile,
+    expectedProfile: ExecutionProfile,
+    ifMatch: string,
+  ): Promise<ExecutionPolicyView> {
+    return this.#client.request<ExecutionPolicyView>('PUT', '/execution-policy', {
+      body: { profile, expected_profile: expectedProfile },
+      ifMatch,
+    })
+  }
+
+  /**
+   * 记录一条待确认项的「保持拒绝」。它不改授权结论、不需要 If-Match；放行动作走
+   * `createNetworkException`，一次写入只表达一个目的。
+   */
+  confirmPolicyDenial(id: string): Promise<PolicyConfirmationResult> {
+    return this.#client.request<PolicyConfirmationResult>(
+      'POST',
+      '/execution-policy/confirmations',
+      { body: { id, decision: 'keep_denied' } },
+    )
+  }
+
+  /** 新增内网访问例外：理由必填；重复登记 → 409（不覆盖既有理由）。 */
+  createNetworkException(body: NetworkExceptionCreate): Promise<NetworkExceptionCreateResult> {
+    return this.#client.request<NetworkExceptionCreateResult>('POST', '/network-exceptions', {
+      body,
+    })
+  }
+
+  /**
+   * 删除例外：`If-Match` 必须是 `GET /network-exceptions` 的集合 ETag——保证删的是
+   * 页面看过的那一份集合；陈旧 ETag → 412 零写入。
+   */
+  deleteNetworkException(
+    exceptionId: string,
+    ifMatch: string,
+  ): Promise<NetworkExceptionDeleteResult> {
+    return this.#client.request<NetworkExceptionDeleteResult>(
+      'DELETE',
+      `/network-exceptions/${encodeURIComponent(exceptionId)}`,
+      { ifMatch },
+    )
+  }
+
+  /**
+   * 显式初始化实例主密钥（14D）：只在 `uninitialized` 且可初始化时成功，`confirm`
+   * 必须字面为 true。已就绪 → 409 `CONFLICT`（**不覆盖**）；恢复态 → 409
+   * `SECRETS_RECOVERY_REQUIRED`（**不生成替代密钥**）；两种情况都零写入。
+   * Explicit instance-key init; ready and recovery states are refused with zero writes.
+   */
+  initInstanceSecrets(): Promise<InstanceSecretsView> {
+    return this.#client.request<InstanceSecretsView>('POST', '/instance/secrets/init', {
+      body: { confirm: true },
     })
   }
 

@@ -27,16 +27,21 @@ type Options struct {
 	Addr            string        // 空 → defaultAddr
 	MaxRequestBytes int64         // ≤0 → defaultMaxRequestBytes
 	RunTimeout      time.Duration // 0 → defaultRunTimeout
-	RunBudget       core.Budget   // REST / invoke 运行预算（约束 35）
-	ShutdownGrace   time.Duration // 0 → defaultShutdownGrace
-	Version         string        // /info.version
-	MemoryBackend   string        // markdown | sqlite（归一化后）
-	MCPConnected    int           // 已连接 MCP server 数（/info.mcp_servers）
-	Providers       []ProviderInfo
-	Logger          *slog.Logger     // nil → slog.Default()
-	Now             func() time.Time // nil → time.Now
-	StartedAt       time.Time        // /info uptime 起点；零值 → NewServer 时刻
-	Listener        net.Listener     // 测试接缝；nil → Run 内 net.Listen(Addr)
+	// ScheduleRunTimeout 是手动补跑（POST /schedules/{id}/run）的时限：该端点与定时
+	// 触发共用同一条执行链，预算也取定时运行的 300s（app 层注入同一常量），否则真实
+	// 业务 Demo 会在 60s 处被 HTTP 层截断而定时触发却能跑完。
+	// ScheduleRunTimeout caps the manual re-run endpoint at the scheduled budget.
+	ScheduleRunTimeout time.Duration // 0 → defaultScheduleRunTimeout
+	RunBudget          core.Budget   // REST / invoke 运行预算（约束 35）
+	ShutdownGrace      time.Duration // 0 → defaultShutdownGrace
+	Version            string        // /info.version
+	MemoryBackend      string        // markdown | sqlite（归一化后）
+	MCPConnected       int           // 已连接 MCP server 数（/info.mcp_servers）
+	Providers          []ProviderInfo
+	Logger             *slog.Logger     // nil → slog.Default()
+	Now                func() time.Time // nil → time.Now
+	StartedAt          time.Time        // /info uptime 起点；零值 → NewServer 时刻
+	Listener           net.Listener     // 测试接缝；nil → Run 内 net.Listen(Addr)
 
 	Runs      RunService
 	Sessions  SessionStore
@@ -89,6 +94,38 @@ type Options struct {
 	// read-only assembly seam and makes PUT fail closed with a fixed 500.
 	NetworkAllowlist core.NetworkAllowlistAdmin
 
+	// NetworkDenylist 是禁止域名表的管理端口（14D / D-10）：与白名单共用同一张
+	// `network_domain_policy` 表、同一套 ETag / CAS，但审计动作名分开
+	// （`network_denylist.update`）。nil = 装配缺失：`PUT /sandbox/denied-domains`
+	// 按固定 500 失败关闭，`GET /sandbox` 的 `denied_domains` 退回空集合。
+	// NetworkDenylist is the second row of the same policy table; a nil port fails
+	// closed with a fixed 500 rather than pretending the list is empty.
+	NetworkDenylist core.NetworkAllowlistAdmin
+
+	// NetworkExceptions 是内网访问例外的管理端口（14D / D-13）：列表与集合 ETag、
+	// 创建（理由必填）与删除（集合 ETag 条件写）。nil = 装配缺失，三个端点按固定
+	// 500 失败关闭——**不得**用空列表冒充"没有例外"。
+	// NetworkExceptions is the managed exception set; a nil port fails closed.
+	NetworkExceptions core.NetworkExceptionAdmin
+
+	// ExecutionPolicy 是执行档位的管理端口（14D）：读当前生效档位与升级待确认项、
+	// 执行带 `If-Match` + `expected_profile` 的条件写、记录「保持拒绝」处置。装配时
+	// 必须与运行期工具策略共用同一实例，否则"保存即生效"只改了副本。nil = 装配缺失，
+	// `/execution-policy` 的读写端点按固定 500 失败关闭——**不得**用默认档位冒充当前值。
+	// ExecutionPolicy is the managed profile port; it must share the live policy
+	// instance, and a nil port fails closed rather than pretending a default profile.
+	ExecutionPolicy core.ExecutionPolicyAdmin
+
+	// InstanceSecrets 是实例加密状态与显式初始化的端口（14D；契约
+	// `GET /instance/secrets` 与 `POST /instance/secrets/init`）：读状态、读四档
+	// 凭据计数之外只做一件事——在**未初始化**的存量实例上生成主密钥。装配必须接
+	// 实例加密服务的判定表本身（不是命令面的短路口径）：恢复态要作为状态报出，
+	// 不能变成读错误。nil = 装配缺失，两个端点按固定 500 失败关闭——**不得**把
+	// "没有端口"说成"未初始化"的 200。
+	// InstanceSecrets must be backed by the decision table itself, so recovery is a
+	// state (not a read error); a nil port fails closed instead of faking 200.
+	InstanceSecrets InstanceSecretsService
+
 	// Notify 是通知渠道的只读注册表（§3.1.29）；NotifyTypes 是装配层显式注册的有序
 	// 类型名（单一真值，US-12 写面复用同一映射表）。Notify 为 nil 时列表端点按 500
 	// INTERNAL 拒绝——缺端口是装配错误，不是空列表。
@@ -134,6 +171,14 @@ type Options struct {
 	// than serving an empty catalog, which would be indistinguishable from a real gap.
 	MCPCatalog MCPCatalogReader
 
+	// InstanceLimits 是实例级上限的**生效值**（14D / E8）：启用前的预算兼容检查拿它
+	// 与 Agent 声明的 `settings.max_iterations`、已排期计划数对照。装配层按配置与缺省
+	// 归一后给出；web 层不读配置文件、不自行猜缺省（`NewServer` 只在零值上补
+	// `core` 的同一对缺省常量）。
+	// InstanceLimits carries the effective instance caps; web never reads the config file
+	// and only fills zero fields from the same core defaults.
+	InstanceLimits InstanceLimits
+
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
 	readTimeoutOverride  time.Duration
@@ -148,6 +193,18 @@ type ProviderInfo struct {
 	Name       string
 	Models     []string
 	Configured bool
+}
+
+// InstanceLimits 是实例级上限的生效值（14D / E8）：预算兼容检查的唯一输入。
+// 零值字段在 `NewServer` 里补 `core.DefaultMaxIterations` / `core.DefaultMaxConcurrentRuns`
+// ——与运行面同一对常量，**不得**在这里另写一份数字。
+// InstanceLimits is the single input of the budget compatibility check; zero fields fall
+// back to the same core defaults the run path uses.
+type InstanceLimits struct {
+	// MaxIterations 是实例 `budget.max_iterations` 的生效值。
+	MaxIterations int
+	// MaxConcurrentRuns 是实例 `server.max_concurrent_runs` 的生效值。
+	MaxConcurrentRuns int
 }
 
 // SandboxConfig 是 `/sandbox` 的投影输入（§3.1.28）：四类白名单。`FileAllowedPaths`
@@ -278,12 +335,15 @@ const (
 	defaultAddr            = "127.0.0.1:8080"
 	defaultMaxRequestBytes = 1 << 20
 	defaultRunTimeout      = 60 * time.Second
-	defaultShutdownGrace   = 70 * time.Second
-	readHeaderTimeout      = 5 * time.Second
-	readTimeout            = 60 * time.Second
-	idleTimeout            = 120 * time.Second
-	writeMargin            = 10 * time.Second // 写预算余量（约束 18）
-	drainTimeout           = 5 * time.Second  // 停机后等 handler 收敛的上限（约束 20）
+	// defaultScheduleRunTimeout 与 app.scheduleRunTimeout 同值（300s）：手动补跑走
+	// 同一条调度执行链，预算不得比定时触发更紧。
+	defaultScheduleRunTimeout = 300 * time.Second
+	defaultShutdownGrace      = 70 * time.Second
+	readHeaderTimeout         = 5 * time.Second
+	readTimeout               = 60 * time.Second
+	idleTimeout               = 120 * time.Second
+	writeMargin               = 10 * time.Second // 写预算余量（约束 18）
+	drainTimeout              = 5 * time.Second  // 停机后等 handler 收敛的上限（约束 20）
 )
 
 // denyMessage 是跨源写被拒绝时的固定公开文案（约束 21）。
@@ -307,6 +367,9 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.RunTimeout <= 0 {
 		opts.RunTimeout = defaultRunTimeout
 	}
+	if opts.ScheduleRunTimeout <= 0 {
+		opts.ScheduleRunTimeout = defaultScheduleRunTimeout
+	}
 	if opts.ShutdownGrace <= 0 {
 		opts.ShutdownGrace = defaultShutdownGrace
 	}
@@ -321,6 +384,15 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	if opts.Sampler == nil {
 		opts.Sampler = NewSampler(opts.Now)
+	}
+	// 实例上限的零值补 core 的同一对缺省常量：装配层漏投影时，就绪视图仍然与运行面
+	// 的生效值一致，而不是把"没配置"读成 0（那会让每个 Agent 都显示被压住）。
+	// Zero limits fall back to the same core defaults the run path applies.
+	if opts.InstanceLimits.MaxIterations <= 0 {
+		opts.InstanceLimits.MaxIterations = core.DefaultMaxIterations
+	}
+	if opts.InstanceLimits.MaxConcurrentRuns <= 0 {
+		opts.InstanceLimits.MaxConcurrentRuns = core.DefaultMaxConcurrentRuns
 	}
 	if opts.Runs == nil || opts.Sessions == nil || opts.Agents == nil ||
 		opts.Tools == nil || opts.Memory == nil {
@@ -528,11 +600,11 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodGet, pattern: "/console", visibility: routePublic, handler: s.console.ServeHTTP},
 		{method: http.MethodGet, pattern: "/console/{path...}", visibility: routePublic, handler: s.console.ServeHTTP},
 	}
-	// US-12 写面 30 条由 admin_routes.go 唯一枚举（§3.7.1）：逐行标记受保护，
-	// 条件写在认证之后套 If-Match。并入点固定在兜底之前——兜底必须仍是最后一行，
-	// 否则未匹配路径会先撞上兜底以外的行。
-	// The US-12 admin rows join before the method-agnostic fallback, which must stay
-	// last; the rows themselves are enumerated only in admin_routes.go.
+	// US-12 起的写面行（现 48 条）由 admin_routes.go 唯一枚举（§3.7.1）：逐行标记
+	// 受保护，条件写在认证之后套 If-Match。并入点固定在兜底之前——兜底必须仍是
+	// 最后一行，否则未匹配路径会先撞上兜底以外的行。
+	// The admin rows join before the method-agnostic fallback, which must stay last;
+	// the rows themselves are enumerated only in admin_routes.go.
 	rows = append(rows, s.adminRoutes()...)
 	// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
 	// 不暴露 ServeMux 的纯文本 404 与自动 405。
@@ -640,14 +712,15 @@ func (s *Server) waitInflight(limit time.Duration) bool {
 	}
 }
 
-// writeTimeout 派生写预算：读超时 + 运行时限 + 余量（约束 18）。写 deadline 覆盖
+// writeTimeout 派生写预算：读超时 + 运行时限 + 余量（约束 18），运行时限取两档中
+// 较大的一个（手动补跑允许 300s，写预算必须跟着覆盖它）。写 deadline 覆盖
 // 「读 body + 运行 + 写响应」全段，只比运行时限大不能证明预算充足。
 // writeTimeout derives the write budget from read timeout, run timeout, and margin.
 func (s *Server) writeTimeout() time.Duration {
 	if s.opts.writeTimeoutOverride > 0 {
 		return s.opts.writeTimeoutOverride
 	}
-	return s.readTimeoutValue() + s.opts.RunTimeout + s.writeMarginValue()
+	return s.readTimeoutValue() + max(s.opts.RunTimeout, s.opts.ScheduleRunTimeout) + s.writeMarginValue()
 }
 
 // readTimeoutValue / writeMarginValue 支持测试接缝；生产装配恒为固定常量。

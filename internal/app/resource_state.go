@@ -68,8 +68,13 @@ type ResourceStateDeps struct {
 	// 提交，提示不该把它变成失败。
 	// Agents supplies the registry snapshot for the impact hint; a failure degrades it.
 	Agents func() ([]core.AgentEntry, error)
-	Logger *slog.Logger
-	Now    func() time.Time
+	// MCPRevoker 在 MCP 槽位凭据撤销后立即回收该 server 的连接（14D C8）。nil = 本进程
+	// 没有 MCP 运行时（只读装配 / 单元测试），撤销照常记账，只是没有连接可回收。
+	// MCPRevoker tears down the server's connection after an MCP slot revoke; nil means
+	// there is no MCP runtime in this process.
+	MCPRevoker func(ctx context.Context, name string) error
+	Logger     *slog.Logger
+	Now        func() time.Time
 }
 
 // ResourceStateService 是两个状态动作的编排实现；字段构造后不再变化。
@@ -96,12 +101,15 @@ func NewResourceStateService(deps ResourceStateDeps) (*ResourceStateService, err
 }
 
 // CredentialRevokeCommand 是一次撤销的线上请求（`resource_uid` 必填、`confirm` 必须为
-// true、`If-Match` 是中间件已校验过形状的强 ETag 原件）。
-// CredentialRevokeCommand is one revoke request; the If-Match shape was checked upstream.
+// true、`If-Match` 是中间件已校验过形状的强 ETag 原件）。`BindingKey` 只在
+// `kind=mcp_server` 时必填：MCP 的托管凭据按槽位寻址，一个 server 可以有多个槽位。
+// CredentialRevokeCommand is one revoke request; BindingKey addresses the MCP slot.
+
 type CredentialRevokeCommand struct {
 	Kind        string
 	Name        string
 	ResourceUID string
+	BindingKey  string
 	Confirm     bool
 	IfMatch     string
 }
@@ -110,7 +118,10 @@ type CredentialRevokeCommand struct {
 // `CredentialRevokeResult` 没有 etag 字段）。
 // CredentialRevokeOutcome carries the post-revoke facts; ETag is header-only.
 type CredentialRevokeOutcome struct {
-	ResourceUID     core.ResourceUID
+	ResourceUID core.ResourceUID
+	// BindingKey 是本次撤销的槽位名（仅 `kind=mcp_server` 非空）：撤销的粒度是单个
+	// 占位符，回执必须点名它，否则页面无法判断"撤的是哪一个"。
+	BindingKey      string
 	CredentialID    string
 	RevocationEpoch int
 	RevokedVersions int
@@ -205,18 +216,32 @@ func (s *ResourceStateService) RevokeCredential(ctx context.Context, actor core.
 	}
 
 	result, err := s.deps.CredentialOps.Revoke(ctx, CredentialRevokeRequest{
-		Actor:   actor,
-		Kind:    core.BindingKind(kind),
-		Name:    name,
-		UID:     state.uid,
-		IfMatch: cmd.IfMatch,
+		Actor:      actor,
+		Kind:       core.BindingKind(kind),
+		Name:       name,
+		UID:        state.uid,
+		BindingKey: cmd.BindingKey,
+		IfMatch:    cmd.IfMatch,
 	})
 	if err != nil {
 		return CredentialRevokeOutcome{}, err
 	}
 
+	// MCP 撤销**立即**生效（C8）：不等一次 `apply`。门先关死（之后的调用拒绝发出，而不
+	// 是发出去再收 401），连接随后回收。凭据事实已经提交，因此回收失败只记 ERROR、不把
+	// 撤销说成失败——拒绝面已经由封门保证；进程残留要能被排障看见。
+	// An MCP revocation takes effect immediately: the gate closes before the connection,
+	// and a close failure never turns the committed revocation into a failure.
+	if kind == core.ResourceMCPServer && s.deps.MCPRevoker != nil {
+		if revokeErr := s.deps.MCPRevoker(ctx, name); revokeErr != nil {
+			s.log().Error("MCP 凭据已撤销，但回收连接失败（门已关闭，调用不会再发出）",
+				"resource", name, "operation_id", result.OperationID, "error", revokeErr)
+		}
+	}
+
 	out := CredentialRevokeOutcome{
 		ResourceUID:     state.uid,
+		BindingKey:      strings.TrimSpace(cmd.BindingKey),
 		CredentialID:    result.CredentialID,
 		RevocationEpoch: result.RevocationEpoch,
 		OperationID:     result.OperationID,
@@ -235,6 +260,14 @@ func (s *ResourceStateService) ConvertScope(ctx context.Context, actor core.Acto
 	kind, err := stateKind(cmd.Kind, resourceStateTool)
 	if err != nil {
 		return ResourceScopeOutcome{}, err
+	}
+	if kind == core.ResourceMCPServer {
+		// MCP server 可持有托管凭据，但使用范围切换不在本期范围：与其把动作写成
+		// `model_connection.scope` 留下一条错的审计行，不如在预写之前明确拒绝。
+		return ResourceScopeOutcome{}, &core.InvalidInputError{
+			Tool:   resourceStateTool,
+			Reason: "MCP server 不支持使用范围切换（只支持凭据撤销）",
+		}
 	}
 	action := scopeAction(core.BindingKind(kind))
 	name, err := stateName(cmd.Name, action)
@@ -348,15 +381,17 @@ func (s *ResourceStateService) ConvertScope(ctx context.Context, actor core.Acto
 	return out, nil
 }
 
-// stateKind 解析路径里的资源类别：只接受带使用范围 / 托管凭据的两类。
-// stateKind accepts exactly the two scope and credential bearing kinds.
+// stateKind 解析路径里的资源类别：接受**凭据属主**三类（`mcp_server` 自 v6 起能持有
+// 托管凭据，因此撤销面必须认它）。它比绑定类别宽一档，但仍不等于"任意资源"。
+// `mcp_server` 只在本文件的撤销分支可用；使用范围切换的闭集仍是两类，由调用方再判。
+// stateKind accepts the three credential owner kinds; the scope surface still refuses MCP.
 func stateKind(raw, action string) (core.ResourceKind, error) {
 	raw = strings.TrimSpace(raw)
-	kind, err := core.ParseBindingKind(raw)
+	kind, err := core.ParseCredentialOwnerKind(raw)
 	if err != nil {
 		return "", &core.InvalidInputError{
 			Tool:   action,
-			Reason: "资源类别只接受 model_connection / notify_channel，收到 " + raw,
+			Reason: "资源类别只接受 model_connection / notify_channel / mcp_server，收到 " + raw,
 		}
 	}
 	return core.ResourceKind(kind), nil
@@ -407,7 +442,9 @@ func (s *ResourceStateService) loadState(ctx context.Context, kind core.Resource
 	name, action string,
 ) (resourceStateRow, error) {
 	switch kind {
-	case core.ResourceModelConnection:
+	case core.ResourceModelConnection, core.ResourceMCPServer:
+		// 两类共用同一配方：指针 + 资源写面的条件 ETag（MCP 的 ETag 由定义版本、凭据摘要
+		// 与 scope / revision 共同决定，与 GET 单条读的是同一个值）。
 		pointer, err := s.deps.Resources.Pointer(ctx, kind, name)
 		if errors.Is(err, core.ErrResourceNotFound) {
 			return resourceStateRow{}, fmt.Errorf("%w: %s %s", core.ErrResourceNotFound, kind, name)
@@ -439,7 +476,7 @@ func (s *ResourceStateService) loadState(ctx context.Context, kind core.Resource
 	default:
 		return resourceStateRow{}, &core.InvalidInputError{
 			Tool:   action,
-			Reason: "资源类别只接受 model_connection / notify_channel",
+			Reason: "资源类别只接受 model_connection / notify_channel / mcp_server",
 		}
 	}
 }

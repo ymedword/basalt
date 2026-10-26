@@ -983,6 +983,38 @@ func TestScheduler_Fire_ReadsTaskFromStore(t *testing.T) {
 	})
 }
 
+// TestScheduler_Fire_ScheduleGateSkipsInactiveAgent 覆盖 14D / E5「启用才运行」：
+// 门拒绝时本轮不排期——不写执行行、不记撞锁、不发起运行；门在每次触发重新求值，
+// 状态翻转后下一次触发即生效。手动补跑**不走**门（显式请求的既有语义不变）。
+// 逆改点：把门挪到 StartExecution 之后，或让门同时拦住 RunNow → 断言红。
+// The gate suppresses a cron tick before any write and never blocks a manual run.
+func TestScheduler_Fire_ScheduleGateSkipsInactiveAgent(t *testing.T) {
+	var active atomic.Bool
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
+		opts.ScheduleGate = func(context.Context, string) bool { return active.Load() }
+	})
+	f.start(t)
+
+	// 停用窗口：连续两个触发点都不得留下任何痕迹。
+	f.fire(t, schedTaskID)
+	f.fire(t, schedTaskID)
+	require.Zero(t, f.invoker.calls.Load(), "门拒绝时不得发起运行")
+	require.Empty(t, f.store.snapshotStarted(), "门拒绝时不得写执行行")
+	require.Empty(t, f.store.snapshotSkipped(), "门拒绝不是撞锁，不得写跳过行")
+	f.logs.requireRecord(t, slog.LevelDebug, "Agent 未启用，本轮不排期")
+
+	// 手动补跑不受门影响：显式请求仍走同一条执行链。
+	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
+	require.NoError(t, err, "手动补跑不得被生命周期门拦住")
+	require.EqualValues(t, 1, f.invoker.calls.Load())
+
+	// 启用后下一次触发即恢复（门不缓存）。
+	active.Store(true)
+	f.fire(t, schedTaskID)
+	require.EqualValues(t, 2, f.invoker.calls.Load())
+	require.Len(t, f.store.snapshotStarted(), 2, "手动补跑与启用后的触发各写一条执行行")
+}
+
 // TestScheduler_Fire_FailureMapping 覆盖 R8：failed / cancelled 都收尾为 failed。
 func TestScheduler_Fire_FailureMapping(t *testing.T) {
 	cases := []struct {

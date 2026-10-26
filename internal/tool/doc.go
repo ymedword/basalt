@@ -3,9 +3,9 @@
 // controlled command execution and the built-in file tools.
 //
 // 本包当前交付：注册表（显式注册、重名拒绝、名字集顺序稳定）、白名单授权（Policy
-// 的 v1 实现）、受控命令执行器（CommandRunner 的 v1 实现及平台半边）与十件内置
+// 的 v1 实现）、受控命令执行器（CommandRunner 的 v1 实现及平台半边）与十一件内置
 // 工具：read_file / write_file / list_dir、shell、http_get / http_post、
-// save_memory / recall_memory、notify 与 manage_schedule（第 10 件）。调度写入同样
+// save_memory / recall_memory、notify、manage_schedule 与 web_search（第 11 件）。调度写入同样
 // 经过工作区写闸门（`AgentLoader.ApplySchedule`，唯一写入路径）——本包只做入参
 // 校验与分派，不自行落盘。
 //

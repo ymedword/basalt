@@ -45,11 +45,15 @@ var (
 // CredentialResolverDeps carries the read-only dependencies; the master key is loaded
 // on every resolution and never held here.
 type CredentialResolverDeps struct {
-	Credentials   *storage.CredentialStore
-	Resources     *storage.ResourceStore
-	Notify        *storage.NotifyAdminStore
-	Bindings      *storage.BindingStore
+	Credentials *storage.CredentialStore
+	Resources   *storage.ResourceStore
+	Notify      *storage.NotifyAdminStore
+	Bindings    *storage.BindingStore
+	// MasterKeyFile 是静态初值；KeyPath 是进程内共享的生效路径（用户显式初始化后
+	// 立即切换）。有 KeyPath 时以它为准。
+	// MasterKeyFile is the static seed; KeyPath is the live shared path when present.
 	MasterKeyFile string
+	KeyPath       *MasterKeyLocator
 	WorkspaceRoot string
 	Logger        *slog.Logger
 }
@@ -431,7 +435,7 @@ func (r *credentialResolver) openManaged(ctx context.Context, kind core.BindingK
 		return nil, core.CredentialVersionRecord{}, fmt.Errorf("%w: 凭据 %s 的当前版本不可读",
 			core.ErrCredentialUnavailable, identity.ID)
 	}
-	masterKey, err := LoadMasterKey(r.deps.MasterKeyFile, r.deps.WorkspaceRoot)
+	masterKey, err := LoadMasterKey(effectiveMasterKeyFile(r.deps.KeyPath, r.deps.MasterKeyFile), r.deps.WorkspaceRoot)
 	if err != nil {
 		return nil, core.CredentialVersionRecord{}, err
 	}

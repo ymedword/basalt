@@ -30,16 +30,29 @@ import (
 // ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
 // entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
-	HTTP      HTTPConfig        `yaml:"http"`
-	Server    ServerConfig      `yaml:"server"`
-	Log       LogConfig         `yaml:"log"`
-	Providers []ProviderConfig  `yaml:"providers"`
-	Budget    BudgetConfig      `yaml:"budget"`
-	Sandbox   SandboxConfig     `yaml:"sandbox"`
-	Shell     ShellConfig       `yaml:"shell"`
-	Memory    MemoryConfig      `yaml:"memory"`
-	Secrets   SecretsConfig     `yaml:"secrets"`
+	HTTP      HTTPConfig       `yaml:"http"`
+	Server    ServerConfig     `yaml:"server"`
+	Log       LogConfig        `yaml:"log"`
+	Providers []ProviderConfig `yaml:"providers"`
+	Budget    BudgetConfig     `yaml:"budget"`
+	Sandbox   SandboxConfig    `yaml:"sandbox"`
+	Shell     ShellConfig      `yaml:"shell"`
+	Memory    MemoryConfig     `yaml:"memory"`
+	Secrets   SecretsConfig    `yaml:"secrets"`
+	// Execution 是执行档位段（`execution`，14D）：**只作首次种子**——落库之后以库为准，
+	// 改这里不会覆盖管理台写入的值（与 `http.allowed_domains` 同一口径）。
+	// The execution section seeds the profile once; the database is authoritative after.
+	Execution ExecutionConfig   `yaml:"execution"`
 	Author    core.AuthorConfig `yaml:"-"`
+}
+
+// ExecutionConfig 是执行档位段（`execution`，14D）。
+// ExecutionConfig is the `execution` section (14D).
+type ExecutionConfig struct {
+	// Profile 是首次种子档位（standard / strict）；空 = 新库按 standard、存量库由迁移写
+	// strict。运行期切档只经管理台（`PUT /api/v1/execution-policy`）。
+	// Profile seeds a fresh instance; runtime changes go through the console only.
+	Profile string `yaml:"profile"`
 }
 
 // SecretsConfig 是托管凭据的部署段（`secrets` 段，颗粒度文档 §3.3）：段内只承载
@@ -52,10 +65,24 @@ type Config struct {
 // and a lexical outside-workspace check); LoadMasterKey re-validates boundary, links
 // and permissions at every use.
 type SecretsConfig struct {
-	// MasterKeyFile 是主密钥文件路径（必须在工作区外）。空 = 未配置：纯 env 实例
-	// 可以没有它，托管写入与启动必需校验会以固定原因拒绝。
-	// MasterKeyFile is the master-key path outside the workspace; empty means unconfigured.
+	// MasterKeyFile 是主密钥文件路径（必须在工作区外）。空 = 按实例名册推导缺省路径；
+	// 没有名册的存量实例不做推导（不猜旧路径），仍按"纯 env 实例"对待。
+	// MasterKeyFile is the master-key path outside the workspace; empty means "derive the
+	// default from the instance roster", and a roster-less instance stays pure-env.
 	MasterKeyFile string `yaml:"master_key_file"`
+
+	// AutoInit 是"允许新实例首次启动自动生成主密钥"的开关（缺省 true，14D T091）。
+	// 用指针是为了区分"没写"（缺省开）与"显式 false"（纯 env / 离线只读部署：
+	// 不生成密钥，也不推导缺省路径）。
+	// AutoInit defaults to true; an explicit false keeps a pure-env instance and also
+	// disables the default-path derivation.
+	AutoInit *bool `yaml:"auto_init"`
+}
+
+// AutoInitEnabled 返回生效的 auto_init：未写 = true。
+// AutoInitEnabled reports the effective auto_init; unset means true.
+func (s SecretsConfig) AutoInitEnabled() bool {
+	return s.AutoInit == nil || *s.AutoInit
 }
 
 // HTTPConfig 是服务段的监听与请求体上限（字面量出处 docs/contracts/openapi.yaml）。
@@ -75,6 +102,20 @@ type HTTPConfig struct {
 	// 配置键的形状一变，运维侧就得改文件）。
 	// AllowedDomains is the outbound domain allowlist, consumed by US-5's network tools.
 	AllowedDomains []string `yaml:"allowed_domains"`
+
+	// DeniedDomains 是出网禁止域名表（14D）：**只作首次种子**，落库之后以库为准。
+	// 两档执行策略都先查它——命中即拒，白名单放行不了。
+	// DeniedDomains seeds the denylist once; both profiles consult it before allowing.
+	DeniedDomains []string `yaml:"denied_domains"`
+
+	// Proxy 是显式出网代理（`http.proxy`，14D）：**空 = 直连**。环境变量
+	// `HTTP_PROXY` / `HTTPS_PROXY` 在任何情况下都不读——环境变量代理会让"校验过的
+	// 地址"与"实际连上的地址"分离，受保护地址段的判定因此形同虚设。
+	// 配了代理时固定的是**代理地址**，目标域名由代理解析：本进程的网络防护仍校验
+	// 代理主机，但目标地址不由本进程固定（页面在同一处标注这一点）。
+	// Proxy is the only accepted proxy source; environment proxies are never read.
+	// When set, the guard pins the proxy host and the proxy resolves the target.
+	Proxy string `yaml:"proxy"`
 
 	// AdminAuth 是管理面认证配置（`http.admin_auth` 段；键名逐字取自
 	// docs/contracts/run-and-errors.md §9.1）。装载层只校验"配置本身是否成形"，
@@ -523,6 +564,23 @@ func validateConfig(cfg *Config) error {
 	if err := validateAdminAuth(cfg.HTTP.AdminAuth); err != nil {
 		return err
 	}
+	// execution.profile：空 = 首次种子按新 / 存量实例各自决定，合法；写了就必须是契约
+	// 闭集内的值——拼错档名时静默落缺省等于换了一档授权，必须拒绝启动。
+	// A misspelled profile would silently change the authorization scope, so it is refused.
+	if profile := strings.TrimSpace(cfg.Execution.Profile); profile != "" {
+		parsed := core.ExecutionProfile(profile)
+		if !parsed.Valid() {
+			return fmt.Errorf("配置项 execution.profile 取值非法（%s）——只允许 standard 或 strict", profile)
+		}
+		cfg.Execution.Profile = string(parsed)
+	}
+	// http.proxy：**唯一**认可的代理来源（环境变量代理一律不读，14D §2.2.2）。
+	// 形态错了拒绝启动，不静默直连——静默直连等于"以为走了代理、实际换了一个出口"。
+	// A malformed proxy refuses startup; falling back to direct would silently change
+	// the egress path.
+	if err := validateHTTPProxy(cfg.HTTP.Proxy); err != nil {
+		return err
+	}
 
 	// seen 记条目名 → **首次出现**的下标：重名拒绝要同时点名两条，只报后一条会让
 	// 用户不知道跟谁撞了。
@@ -594,9 +652,18 @@ func validateSecretsSection(tree map[string]any, cfg SecretsConfig, configPath s
 	if _, present := tree["secrets"]; !present {
 		return nil
 	}
-	if strings.TrimSpace(cfg.MasterKeyFile) == "" {
+	if strings.TrimSpace(cfg.MasterKeyFile) == "" && cfg.AutoInitEnabled() {
+		// 半截的 secrets 段仍然拒绝：省略路径只在 `auto_init: false`（显式纯 env）
+		// 时才是有意的，否则多半是漏写——那种"看着配过、其实没配"的现场必须报出来。
+		// A path-less section is legal only with an explicit auto_init: false; otherwise
+		// it reads as "configured" while meaning nothing.
 		return fmt.Errorf(
-			"必填配置项 secrets.master_key_file 缺失——写了 secrets 段就必须给出主密钥文件路径；不托管凭据的实例请整段省略")
+			"必填配置项 secrets.master_key_file 缺失——写了 secrets 段就必须给出主密钥文件路径，" +
+				"或用 auto_init: false 显式声明纯 env 实例；不托管凭据的实例请整段省略")
+	}
+	if strings.TrimSpace(cfg.MasterKeyFile) == "" {
+		// 纯 env 显式声明：没有路径可做边界判定。
+		return nil
 	}
 
 	root := filepath.Dir(configPath)
@@ -653,13 +720,11 @@ func validateAdminAuth(auth AdminAuthConfig) error {
 		return fmt.Errorf(
 			"配置项 http.admin_auth.mode 取值非法（%s）——只允许 token / local_trust", auth.Mode)
 	}
-	if auth.Mode == "token" && auth.Token == "" {
-		// 明文 token 在 resolveTree / resolveString 已拒绝；这里拦的是"整个键没写"——
-		// 键不存在时凭证路径根本不会被走到，只能在此补判。
-		// Plaintext is rejected upstream; this catches the key being absent entirely.
-		return fmt.Errorf(
-			"必填配置项 http.admin_auth.token 缺失——token 模式必须提供 ${VAR} 占位并经环境变量注入")
-	}
+	// token 模式**允许省略** token：第三来源是实例私有目录的 `admin-token` 文件
+	// （14D T090，颗粒度文档 §2.4.3）。"三处都没有"由装配层在开放监听之前判定并以
+	// 起点名报错——装载层看不到文件系统，在这里补判会把合法的密码文件部署判死。
+	// Token may be omitted: the instance file is the third source. The "all three
+	// missing" verdict lives in the assembly layer, which can actually see the file.
 	if err := validateAdminAllowedHosts(auth.AllowedHosts); err != nil {
 		return err
 	}
@@ -809,6 +874,42 @@ func validateProviderBaseURL(raw string, i int) error {
 		// 路径里的 `%23` 是合法编码，不含字面 `#`，不连坐。
 		return fmt.Errorf(
 			"配置项 providers[%d].base_url 只支持 scheme + host + path（不支持的成分: fragment）", i)
+	}
+	return nil
+}
+
+// validateHTTPProxy 校验 `http.proxy` 的形态：`http(s)://[userinfo@]host:port`，
+// 不带路径 / 查询 / 片段；空串合法（= 直连）。这是**唯一**认可的代理来源——环境变量
+// `HTTP_PROXY` / `HTTPS_PROXY` 在任何情况下都不读（14D §2.2.2：环境变量代理会让
+// "校验过的地址"与"实际连上的地址"分离）。
+// validateHTTPProxy checks the explicit proxy shape; empty means direct egress.
+//
+// 形态错了拒绝启动，不静默直连：静默直连等于"以为走了代理、实际换了一个出口"。
+// 文案**不携带取值**——代理 URL 的 userinfo 可能是一份凭证，回显整条 URL 等于把
+// 凭证写进日志与终端。
+// A malformed proxy refuses startup; messages never echo the value, whose userinfo may
+// carry credentials.
+func validateHTTPProxy(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("配置项 http.proxy 无法解析——需要 http(s)://[userinfo@]host:port 形态（取值不回显：可能含凭证）")
+	}
+	switch {
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		return fmt.Errorf("配置项 http.proxy 只接受 http 与 https 方案（取值不回显：可能含凭证）")
+	case parsed.Host == "":
+		return fmt.Errorf("配置项 http.proxy 缺少主机——需要 http(s)://[userinfo@]host:port")
+	case parsed.Port() == "":
+		return fmt.Errorf("配置项 http.proxy 必须显式给端口——缺端口会在建连时才失败，装载期就拒绝")
+	case parsed.Path != "" && parsed.Path != "/":
+		return fmt.Errorf("配置项 http.proxy 不得带路径——代理只由 scheme、主机与端口定位（取值不回显：可能含凭证）")
+	case parsed.RawQuery != "" || parsed.ForceQuery:
+		return fmt.Errorf("配置项 http.proxy 不得带查询串（取值不回显：可能含凭证）")
+	case parsed.Fragment != "" || strings.Contains(raw, "#"):
+		return fmt.Errorf("配置项 http.proxy 不得带片段（取值不回显：可能含凭证）")
 	}
 	return nil
 }

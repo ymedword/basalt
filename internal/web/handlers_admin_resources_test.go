@@ -54,6 +54,7 @@ type fakeResourceAdminService struct {
 	testModelConnectionFn   func(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 	testMCPServerFn         func(ctx context.Context, actor core.Actor, name string) (core.ResourceTestResult, error)
 	diagnoseMCPServerFn     func(ctx context.Context, actor core.Actor, name string) (core.MCPServerDiagnosis, error)
+	applyMCPServerFn        func(ctx context.Context, actor core.Actor, name, ifMatch string, versionID int64) (core.MCPServerApplyResult, error)
 	createSkillFn           func(ctx context.Context, actor core.Actor, write SkillCreateWrite) (SkillDetailView, error)
 	importSkillFn           func(ctx context.Context, actor core.Actor, write SkillImportWrite) (SkillDetailView, error)
 	updateSkillFn           func(ctx context.Context, actor core.Actor, name string, write SkillUpdateWrite, ifMatch string) (SkillDetailView, error)
@@ -181,6 +182,15 @@ func (f *fakeResourceAdminService) DiagnoseMCPServer(ctx context.Context, actor 
 		return core.MCPServerDiagnosis{}, errFakeResourceAdminUnused
 	}
 	return f.diagnoseMCPServerFn(ctx, actor, name)
+}
+
+// ApplyMCPServer 委托受控发布的注入行为（14D）：未设置即"意外调用"，apply 用例
+// 因此可以同时断言"没被旁路调用"。
+func (f *fakeResourceAdminService) ApplyMCPServer(ctx context.Context, actor core.Actor, name, ifMatch string, versionID int64) (core.MCPServerApplyResult, error) {
+	if f.applyMCPServerFn == nil {
+		return core.MCPServerApplyResult{}, errFakeResourceAdminUnused
+	}
+	return f.applyMCPServerFn(ctx, actor, name, ifMatch, versionID)
 }
 
 // operationLedger 是管理操作台账的替身：只有适配器替身在"成功路径"写入一行，

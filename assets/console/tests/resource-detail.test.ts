@@ -584,6 +584,8 @@ function mcpServerView(overrides: Partial<McpServerDetail> = {}): McpServerDetai
     args: [],
     url: '',
     env_keys: ['TOKEN'],
+    header_keys: [],
+    credential_keys: [{ key: 'TOKEN', mode: 'env', state: 'env', last4: '' }],
     connected: true,
     tools: ['read_file', 'write_file'],
     published_version_id: 2,
@@ -660,6 +662,9 @@ function mcpDiagnosis(overrides: Record<string, unknown> = {}): Record<string, u
     pending_restart: false,
     command: { state: 'located', path: 'npx', reason: 'lookpath' },
     env: [{ key: 'TOKEN', set: true }],
+    // 默认命令不指向已登记运行时组件：依赖轴显示「不适用」，不是「缺失」。
+    dependency: null,
+    references: { count: 0, agents: [] },
     warnings: [],
     checked_at: TESTED_AT,
     ...overrides,
@@ -743,18 +748,24 @@ describe('MCP detail axes', () => {
     )
     await openMcpDetail()
 
-    // 配置轴：发布已前移、运行仍是旧版本；连接轴照样可以“已连接”——两轴不互斥。
-    expect(definitionValue('配置')).toContain('已发布未应用（待重启）')
-    expect(definitionValue('连接')).toContain('已连接')
+    // 配置轴只看占位符来源与就绪：TOKEN 由环境变量提供且诊断读到已设置，判「完整」。
+    // 发布已前移、运行仍是旧版本，是连接轴上的「待应用」，不是配置失败。
+    expect(definitionValue('配置')).toContain('完整')
+    expect(definitionValue('连接')).toContain('待应用')
+    expect(definitionValue('连接')).toContain('运行 v2，发布 v3')
     expect(definitionValue('待重启')).toContain('需重启')
     // 测试轴：诊断 unconfirmed 不改变测试结论；通过针对的是发布版本 v3。
     expect(definitionValue('上次测试')).toContain('连接测试通过')
     expect(definitionValue('上次测试')).toContain('v3')
-    expect(definitionValue('依赖诊断')).toContain('命令无法确认')
+    // 依赖轴：null 只是「不适用」，命令三态另列；不能写成「依赖缺失」。
+    expect(definitionValue('依赖')).toContain('不适用')
+    expect(definitionValue('依赖')).not.toContain('依赖缺失')
+    expect(definitionValue('依赖')).toContain('命令无法确认')
     // 工具来源与 tools 语义分开：tools 仍是 offered，跳过项点名赢家。
-    expect(definitionValue('工具（已提供）')).toContain('read_file')
-    expect(definitionValue('工具注册')).toContain('已提供 2，已注册 1')
-    expect(definitionValue('工具注册')).toContain('read_file：被 builtin 抢先（重名）')
+    expect(definitionValue('工具')).toContain('已提供 2，已注册 1')
+    expect(definitionValue('工具')).toContain('read_file：被 builtin 抢先（重名）')
+    // 引用轴与「引用与占用」同源：没有绑定 Agent 就不阻断删除。
+    expect(definitionValue('引用')).toContain('无配置引用')
     // 操作详情可展开，且明确 success 不是测试结论。
     expect(wrapper!.text()).toContain(`管理操作详情（${OP_ID}）`)
     expect(wrapper!.text()).toContain('操作状态 success 只表示管理动作执行完毕')
@@ -785,8 +796,8 @@ describe('MCP detail axes', () => {
     expect(axis).toContain('连接测试失败')
     expect(axis).toContain('启动 / 找不到启动程序')
     expect(axis).toContain('针对 v2')
-    expect(definitionValue('依赖诊断')).toContain('命令无法确认')
-    expect(wrapper!.text()).toContain('失败时先看「依赖诊断」')
+    expect(definitionValue('依赖')).toContain('命令无法确认')
+    expect(wrapper!.text()).toContain('失败时先看「依赖」轴')
     expect(wrapper!.text()).toContain('诊断结论不预判测试')
     expect(wrapper!.text()).toContain('找不到启动程序')
   })
@@ -896,5 +907,210 @@ describe('MCP detail axes', () => {
     const table = wrapper!.find('.mcp-table').text()
     expect(table).not.toContain('未连接')
     expect(table).toContain('—')
+  })
+})
+
+describe('MCP credential slots and apply', () => {
+  it('names every blocked slot on the config axis and never claims completeness', async () => {
+    setupFetch(
+      mcpRoutes({
+        view: {
+          env_keys: ['TOKEN', 'REGION'],
+          header_keys: ['X-API-Key'],
+          credential_keys: [
+            { key: 'REGION', mode: 'managed', state: 'managed_revoked', last4: '12ab' },
+            { key: 'TOKEN', mode: 'env', state: 'env', last4: '' },
+            { key: 'X-API-Key', mode: 'env', state: 'env', last4: '' },
+          ],
+        },
+        diagnosis: {
+          env: [
+            { key: 'TOKEN', set: false },
+            { key: 'REGION', set: true },
+          ],
+        },
+      }),
+    )
+    await openMcpDetail()
+
+    const axis = definitionValue('配置')
+    expect(axis).toContain('缺凭据')
+    expect(axis).toContain('TOKEN（环境变量未设置）')
+    expect(axis).toContain('REGION（托管已撤销）')
+    // 请求头占位符不在 env 诊断里：不假装「完整」，指明以应用预检为准。
+    expect(axis).toContain('请求头占位符的就绪以应用预检为准')
+    expect(axis).not.toContain('完整')
+  })
+
+  it('treats a declared placeholder without a source choice as a validation failure', async () => {
+    setupFetch(
+      mcpRoutes({
+        view: {
+          env_keys: ['TOKEN', 'OLD'],
+          credential_keys: [{ key: 'TOKEN', mode: 'env', state: 'env', last4: '' }],
+        },
+      }),
+    )
+    await openMcpDetail()
+
+    // 未声明来源是配置错误，不是“没有凭据”：它比就绪判定更靠前，单独点名。
+    const axis = definitionValue('配置')
+    expect(axis).toContain('校验失败')
+    expect(axis).toContain('未声明来源')
+    expect(axis).toContain('OLD')
+    expect(axis).not.toContain('完整')
+    // 凭据卡片把未声明的槽位单列，而不是当作已声明但缺值。
+    const table = wrapper!.find('.mcp-credentials-table').text()
+    expect(table).toContain('OLD')
+    expect(table).toContain('未声明来源')
+  })
+
+  it('lists each slot with source, state and last4, and revokes one placeholder at a time', async () => {
+    setupFetch((call) => {
+      if (
+        call.method === 'POST' &&
+        call.path === '/api/v1/resources/mcp_server/files/credential/revoke'
+      ) {
+        return {
+          data: {
+            resource_uid: UID,
+            binding_key: 'TOKEN',
+            credential_ref: 'cred-1',
+            credential_state: 'revoked',
+            revoked_versions: 2,
+            revocation_epoch: 5,
+          },
+        }
+      }
+      return mcpRoutes({
+        view: {
+          env_keys: ['TOKEN', 'REGION'],
+          credential_keys: [
+            { key: 'TOKEN', mode: 'managed', state: 'managed', last4: '9f2c' },
+            { key: 'REGION', mode: 'env', state: 'env', last4: '' },
+          ],
+        },
+      })(call)
+    })
+    await openMcpDetail()
+
+    const table = wrapper!.find('.mcp-credentials-table').text()
+    expect(table).toContain('TOKEN')
+    expect(table).toContain('····9f2c')
+    expect(table).toContain('托管有效')
+    expect(table).toContain('环境变量')
+    // env 来源没有“撤销”入口：撤销的是托管值，不是环境变量。
+    const revokeButtons = wrapper!
+      .findAll('.mcp-credentials-table button')
+      .filter((button) => button.text() === '撤销')
+    expect(revokeButtons).toHaveLength(1)
+
+    await revokeButtons[0]!.trigger('click')
+    const dialog = wrapper!.find('.dialog')
+    expect(dialog.text()).toContain('TOKEN')
+    expect(dialog.text()).toContain('立即关闭并回收连接')
+    await dialog.find('button.primary').trigger('click')
+    await flushPromises()
+
+    const posts = calls.filter(
+      (call) => call.method === 'POST' && call.path.endsWith('/credential/revoke'),
+    )
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.ifMatch).toBe(CONFIG_ETAG)
+    expect(posts[0]!.body).toEqual({ resource_uid: UID, confirm: true, binding_key: 'TOKEN' })
+    expect(wrapper!.text()).toContain('已撤销占位符 TOKEN')
+  })
+
+  it('applies the published version with If-Match and reports the switch', async () => {
+    setupFetch((call) => {
+      if (call.method === 'POST' && call.path === '/api/v1/mcp-servers/files/apply') {
+        return {
+          data: {
+            outcome: 'applied',
+            applied_version_id: 3,
+            previous_version_id: 2,
+            target_version_id: 3,
+            drain_deadline: '2026-10-24T09:30:30Z',
+            drain_timeout_seconds: 30,
+            failure_class: '',
+            superseded_by: '',
+            operation_id: OP_ID,
+          },
+        }
+      }
+      return mcpRoutes({ view: { published_version_id: 3, published_version_no: 3 } })(call)
+    })
+    await openMcpDetail()
+
+    await clickButton('应用发布版本…')
+    expect(wrapper!.find('.dialog').text()).toContain('切换到 v3')
+    await wrapper!.find('.dialog button.primary').trigger('click')
+    await flushPromises()
+
+    const posts = calls.filter(
+      (call) => call.method === 'POST' && call.path === '/api/v1/mcp-servers/files/apply',
+    )
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.ifMatch).toBe(CONFIG_ETAG)
+    expect(posts[0]!.body).toEqual({ version_id: 0 })
+    const section = wrapper!.find('.view-resource-detail').text()
+    expect(section).toContain('受控应用')
+    expect(section).toContain('已应用')
+    expect(section).toContain('排空窗口')
+  })
+
+  it('reads the operation row on a superseded apply and never resends', async () => {
+    setupFetch((call) => {
+      if (call.method === 'POST' && call.path === '/api/v1/mcp-servers/files/apply') {
+        return {
+          status: 409,
+          code: 'MCP_APPLY_SUPERSEDED',
+          message: '另一次发布推进了发布指针',
+          data: {
+            operation_id: OP_ID,
+            outcome: 'superseded',
+            superseded_by: 'publish',
+            applied_version_id: 2,
+            previous_version_id: 2,
+            target_version_id: 3,
+            drain_deadline: '',
+            drain_timeout_seconds: 30,
+            failure_class: '',
+          },
+        }
+      }
+      return mcpRoutes({
+        view: { published_version_id: 3, published_version_no: 3 },
+        operation: {
+          action: 'mcp_server.apply',
+          detail: {
+            outcome: 'superseded',
+            applied_version_id: 2,
+            previous_version_id: 2,
+            target_version_id: 3,
+            drain_deadline: '',
+            drain_timeout_seconds: 30,
+            failure_class: '',
+            superseded_by: 'publish',
+            operation_id: OP_ID,
+          },
+        },
+      })(call)
+    })
+    await openMcpDetail()
+
+    await clickButton('应用发布版本…')
+    await wrapper!.find('.dialog button.primary').trigger('click')
+    await flushPromises()
+
+    // 只有一次写：412 / 409 都不自动重发。
+    expect(
+      calls.filter((call) => call.method === 'POST' && call.path.endsWith('/apply')),
+    ).toHaveLength(1)
+    // 失败读数只认操作台账：被 publish 取代，运行版本不变。
+    const text = wrapper!.find('.view-resource-detail').text()
+    expect(text).toContain('被取代（未切换）')
+    expect(text).toContain('另一次发布推进了发布指针')
+    expect(text).toContain('操作状态')
   })
 })

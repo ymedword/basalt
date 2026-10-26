@@ -37,24 +37,42 @@ const (
 // newScheduler builds the scheduler; core.NewScheduler snapshots Entries at construction,
 // so later mutations of the caller's slice cannot change definitions.
 func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entries []core.AgentEntry,
-	delivery core.ScheduleDelivery, cfg *cli.Config, logger *slog.Logger,
+	delivery core.ScheduleDelivery, gate core.ScheduleGate, cfg *cli.Config, logger *slog.Logger,
 ) *core.Scheduler {
 	if logger == nil {
 		logger = a.loggerOr()
 	}
 	return core.NewScheduler(core.SchedulerOptions{
-		Store:      store,
-		Invoker:    invoker,
-		Engine:     cronadapter.New(logger),
-		Entries:    entries,
-		CronSpec:   workspace.CronSpec,
-		Delivery:   delivery,
-		Budget:     webBudget(cfg),
-		RunTimeout: scheduleRunTimeout,
-		StopGrace:  scheduleStopGrace,
-		Logger:     logger,
-		Now:        a.nowOr(),
+		Store:        store,
+		Invoker:      invoker,
+		Engine:       cronadapter.New(logger),
+		Entries:      entries,
+		ScheduleGate: gate,
+		CronSpec:     workspace.CronSpec,
+		Delivery:     delivery,
+		Budget:       webBudget(cfg),
+		RunTimeout:   scheduleRunTimeout,
+		StopGrace:    scheduleStopGrace,
+		Logger:       logger,
+		Now:          a.nowOr(),
 	})
+}
+
+// lifecycleScheduleGate 把「生命周期状态是否为 active」接成调度门的默认实现
+// （14D / E5「启用才运行」；设计 §2.5.1 的硬约束）。状态**每次触发都重读状态文件**，
+// 不缓存：启用 / 停用在下一次到点即生效，与准入路径读同一份文件、同一套校验。
+// 读不到、校验失败、文件不存在一律返回 false（失败关闭）——门的作用是少跑而不是
+// 多跑，读不出来时宁可跳过本轮，也不得把损坏状态读成 active。
+// The gate re-reads the lifecycle file on every tick and fails closed: an unreadable or
+// invalid state never counts as active.
+func lifecycleScheduleGate(lifecycle *workspace.LifecycleStore) core.ScheduleGate {
+	if lifecycle == nil {
+		return nil
+	}
+	return func(ctx context.Context, agent string) bool {
+		rec, exists, err := lifecycle.Read(ctx, agent)
+		return err == nil && exists && rec.State == core.AgentActive
+	}
 }
 
 // needsSchedules 只对 serve / gateway 为真（约束 20）：其余重命令不构造运行期调度，

@@ -40,6 +40,11 @@ const (
 	// The transport literals mirror the parser; only legacy files may omit them.
 	mcpTransportStdio = "stdio"
 	mcpTransportHTTP  = "http"
+	// mcpAuthHeaderName / mcpBearerPrefix 是认证头的**唯一**装配规则：只有
+	// `Authorization` 加 `Bearer ` 前缀，其它头原样（设计 §3.2 认证头装配表）。
+	// The single auth-header rule: only Authorization is prefixed with Bearer.
+	mcpAuthHeaderName = "Authorization"
+	mcpBearerPrefix   = "Bearer "
 )
 
 // MCPConnection 是一条 server 的连接结果：server 名 + 已适配为 `core.Tool` 的工具列表
@@ -142,15 +147,7 @@ func NewMCPPool(opts MCPPoolOptions) *MCPPool {
 			Name:    mcpClientName,
 			Version: opts.Version,
 		}, nil),
-		httpClient: &http.Client{
-			// 3xx 原样返回给协议层，由它按失败处理；不得跟随后再判白名单。
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			// 非 2xx 在传输层变成可判别错误：SDK 对 401 / 403 只回字符串，
-			// 按文案分类会让改一句话就漂移（契约 D-05 禁止解析错误文案）。
-			Transport: mcpStatusTransport{base: http.DefaultTransport},
-		},
+		httpClient: newMCPHTTPClient(nil),
 	}
 	pool.dial = pool.dialTransport
 	return pool
@@ -306,6 +303,15 @@ func classifyInitializeFailure(err error, cmd *exec.Cmd, budgetErr error) (strin
 	if errors.Is(err, core.ErrPolicyDenied) {
 		return mcpStagePreflight, mcpClassPolicyDenied
 	}
+	// 受控拨号（14D）在建连之前拒了目标地址：这是**策略拒绝**，不是网络不可达。
+	// 必须排在 `*url.Error` 之前——`http.Client.Do` 把拨号错误包在 `*url.Error` 里，
+	// 先认外壳会把拒绝误报成 `http_unreachable`（D-13 / FR10：`policy_denied` 不得
+	// 降级为网络故障，否则页面会引导管理员去查网络，而真正要改的是例外清单）。
+	// Guard refusal at dial: a policy denial, never http_unreachable. This check must
+	// precede the *url.Error shell for the same reason as the deadline check below.
+	if core.IsSandboxViolation(err) {
+		return mcpStageInitialize, mcpClassPolicyDenied
+	}
 	var statusErr *mcpHTTPStatusError
 	if errors.As(err, &statusErr) &&
 		(statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
@@ -386,8 +392,10 @@ func (e *mcpHTTPStatusError) Error() string {
 }
 
 // mcpStatusTransport 在传输层拦非 2xx：响应体读完关闭（不参与协议解析，也不泄漏
-// 连接），再返回类型化错误。`base` 为空时用 `http.DefaultTransport`。
-// mcpStatusTransport turns non-2xx responses into typed errors and closes the body.
+// 连接），再返回类型化错误。`base` 为空时退化为受控传输（**不**用裸
+// `http.DefaultTransport`——它会读环境变量代理，绕开地址校验）。
+// mcpStatusTransport turns non-2xx responses into typed errors and closes the body;
+// an empty base degrades to the guarded transport, never to the env-proxy default.
 type mcpStatusTransport struct {
 	base http.RoundTripper
 }
@@ -397,7 +405,7 @@ type mcpStatusTransport struct {
 func (t mcpStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.base
 	if base == nil {
-		base = http.DefaultTransport
+		base = guardedTransport()
 	}
 	resp, err := base.RoundTrip(req)
 	if err != nil {
@@ -413,6 +421,61 @@ func (t mcpStatusTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return nil, errors.Join(statusErr, closeErr)
 	}
 	return nil, statusErr
+}
+
+// mcpHeaderTransport 把**已解析**的槽位值装进每个出站请求。装配规则只有一条，且只写在
+// 这里：`Authorization` 加 `Bearer ` 前缀，其它头名原样——不推断前缀（不因为名字像就
+// 加 `Token `）、不去重、也不因为调用方已设同名头就跳过。
+//
+// 跨主机不携带：本池的客户端 `CheckRedirect` 一律返回 `http.ErrUseLastResponse`
+// （3xx 交给协议层按失败处理），因此请求根本不会被发往另一个主机——连接头不存在
+// "跟着重定向走到别处"的路径。这条与策略层的域名判定互补，不是替代。
+// mcpHeaderTransport injects the resolved slot values into every outbound request:
+// Authorization gets the Bearer prefix, everything else is verbatim. Redirects are never
+// followed, so a credential can never travel to a different host.
+type mcpHeaderTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+// RoundTrip 在请求副本上装头后交给内层；请求对象本身不被修改。
+// RoundTrip injects headers into a request copy; the original is left untouched.
+func (t mcpHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = guardedTransport()
+	}
+	clone := req.Clone(req.Context())
+	for name, value := range t.headers {
+		if strings.EqualFold(name, mcpAuthHeaderName) {
+			clone.Header.Set(mcpAuthHeaderName, mcpBearerPrefix+value)
+			continue
+		}
+		clone.Header.Set(name, value)
+	}
+	return base.RoundTrip(clone)
+}
+
+// newMCPHTTPClient 造一个不跟随重定向、非 2xx 类型化的客户端；`headers` 非空时在同一
+// 链路上加一层认证头注入。每个 server 一份：连接池**不跨目标复用**，拨号一律走受控
+// 守门器（解析 → 分类 → 只拨已校验的 IP；代理只认显式 `http.proxy`）。未装配守门器时
+// 退化为"无代理的默认传输"，只可能出现在直构测试替身里。
+// newMCPHTTPClient builds a per-server client: redirects off, non-2xx typed, headers
+// injected on the wire, and every dial routed through the guard.
+func newMCPHTTPClient(headers map[string]string) *http.Client {
+	var base http.RoundTripper = guardedTransport()
+	if len(headers) > 0 {
+		base = mcpHeaderTransport{base: base, headers: headers}
+	}
+	return &http.Client{
+		// 3xx 原样返回给协议层，由它按失败处理；不得跟随后再判白名单。
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		// 非 2xx 在传输层变成可判别错误：SDK 对 401 / 403 只回字符串，
+		// 按文案分类会让改一句话就漂移（契约 D-05 禁止解析错误文案）。
+		Transport: mcpStatusTransport{base: base},
+	}
 }
 
 // safeErrorSummary 把连接期错误映射到**固定短语集**（约束 28）：命令名 / server 消息 /
@@ -574,9 +637,16 @@ func (p *MCPPool) dialHTTP(spec core.MCPServerConfig) (mcp.Transport, error) {
 	if parsed.User != nil {
 		return nil, errors.New("url 不得包含 userinfo")
 	}
+	// 头值随 server 不同，因此按本次 spec 造客户端；`p.httpClient` 只服务无头的条目
+	// （以及测试注入 `dial` 时保持同一形状）。
+	// Headers differ per server, so each HTTP server gets its own client.
+	client := p.httpClient
+	if len(spec.Headers) > 0 {
+		client = newMCPHTTPClient(spec.Headers)
+	}
 	return &mcp.StreamableClientTransport{
 		Endpoint:   parsed.String(),
-		HTTPClient: p.httpClient,
+		HTTPClient: client,
 		// 连接失败不重试：握手预算（测试端点 15 秒 / 启动 30 秒）已界定一次尝试，
 		// 后台退避重连会把失败判定拖到预算之外。负值按 SDK 口径关闭重试。
 		MaxRetries: -1,

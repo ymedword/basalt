@@ -57,9 +57,10 @@ func normalizeLevel(c check) check {
 	return c
 }
 
-// TestStages_CurrentCoversHistorical 历史 check 不被静默丢失，US-8 替代项必须显式登记。
-// TestStages_CurrentCoversHistorical keeps every historical check present and makes the
-// US-8 replacement explicit through superseded_checks.
+// TestStages_CurrentCoversHistorical 历史 check 不被静默丢失；替代项（US-8 / US-10）必须
+// 显式登记在 superseded_checks，且旧 ID 不得照抄进现行 stage。
+// TestStages_CurrentCoversHistorical keeps every historical check present and makes each
+// replacement explicit through superseded_checks.
 func TestStages_CurrentCoversHistorical(t *testing.T) {
 	root := stageTestRoot(t)
 	current := readStageForTest(t, root, "harness/stages/current.json")
@@ -78,14 +79,19 @@ func TestStages_CurrentCoversHistorical(t *testing.T) {
 		}
 	}
 
-	require.Equal(t, map[string]string{"008-ports-nine": "008-ports-ten"}, current.SupersededChecks,
-		"current.json must register exactly the explicit US-8 replacement")
-	require.Contains(t, currentByID, "008-ports-ten")
+	// 替代关系是**显式清单**：每加一条都必须改这里并留下依据，不靠"字段碰巧相同"。
+	// 现有两条：US-8 的九件（14D 起工具集为十一件）与 US-10 的十件（同一断言）。
+	require.Equal(t,
+		map[string]string{"008-ports-nine": "008-ports-eleven", "010-app-tools": "010-app-tools-eleven"},
+		current.SupersededChecks,
+		"current.json must register exactly the explicit US-8 and US-10 replacements")
+	require.Contains(t, currentByID, "008-ports-eleven")
 }
 
 // TestStages_CurrentMatchesHistorical 非替代项与历史定义逐字段相等；替代项只校验替代目标与测试名。
 // TestStages_CurrentMatchesHistorical requires field-by-field equality for every
-// non-superseded check; a superseded entry only binds its replacement and test name.
+// non-superseded check; a superseded entry only binds its replacement, which must
+// carry exactly the required_tests pinned for it in pinnedRequiredTests.
 func TestStages_CurrentMatchesHistorical(t *testing.T) {
 	root := stageTestRoot(t)
 	current := readStageForTest(t, root, "harness/stages/current.json")
@@ -98,8 +104,12 @@ func TestStages_CurrentMatchesHistorical(t *testing.T) {
 			if superseded {
 				got, ok := currentByID[replacement]
 				require.True(t, ok, "%s: replacement %s is missing", rel, replacement)
-				require.Equal(t, []string{"TestToolListerPort_HeavyAssemblyRegistersTenTools"}, got.RequiredTests,
-					"%s: replacement %s must bind exactly the current test", rel, replacement)
+				// 替代项不再逐字段继承历史定义，但它必须逐字绑定钉住的测试名集合——
+				// 没有钉子就没有替代，防止替代成为"想怎么改就怎么改"的后门。
+				want, pinned := pinnedRequiredTests[replacement]
+				require.True(t, pinned, "%s: replacement %s has no pinned required_tests", rel, replacement)
+				require.Equal(t, want, got.RequiredTests,
+					"%s: replacement %s must bind exactly its pinned tests", rel, replacement)
 				require.Equal(t, "source", checkLevel(got))
 				continue
 			}
@@ -125,7 +135,8 @@ func TestStages_HistoricalFilesPinned(t *testing.T) {
 }
 
 // pinnedStageCheck 是 015-* 与 US-8 替代项的静态定义期望表。
-// pinnedStageCheck is the static expectation table for the 015-* checks and 008-ports-ten.
+// pinnedStageCheck is the static expectation table for the 015-* checks and the two
+// supersession targets (008-ports-eleven, 010-app-tools-eleven).
 type pinnedStageCheck struct {
 	stage   string
 	id      string
@@ -199,9 +210,20 @@ var pinnedStageChecks = []pinnedStageCheck{
 	},
 	{
 		stage:   "harness/stages/current.json",
-		id:      "008-ports-ten",
-		args:    []string{"go", "test", "-json", "-count=1", "./internal/app", "-run", "^TestToolListerPort_HeavyAssemblyRegistersTenTools$"},
+		id:      "008-ports-eleven",
+		args:    []string{"go", "test", "-json", "-count=1", "./internal/app", "-run", "^TestToolListerPort_HeavyAssemblyRegistersElevenTools$"},
 		timeout: 300,
+		level:   "source",
+	},
+	{
+		stage: "harness/stages/current.json",
+		id:    "010-app-tools-eleven",
+		args: []string{
+			"go", "test", "-json", "-count=1", "-run",
+			"^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersElevenTools)$",
+			"./internal/app",
+		},
+		timeout: 120,
 		level:   "source",
 	},
 }
@@ -249,12 +271,18 @@ var pinnedRequiredTests = map[string][]string{
 		"TestRepoInvariants_TestOnlyDependencyNotLinked",
 		"TestRepoInvariants_CIRunDirsUnique",
 	},
-	"015-e2e-vet":   nil,
-	"008-ports-ten": {"TestToolListerPort_HeavyAssemblyRegistersTenTools"},
+	"015-e2e-vet":      nil,
+	"008-ports-eleven": {"TestToolListerPort_HeavyAssemblyRegistersElevenTools"},
+	"010-app-tools-eleven": {
+		"TestDeclaredToolNames_IncludesManageSchedule",
+		"TestWebOptions_SchedulesWired",
+		"TestRun_HeavyCommandSplit",
+		"TestToolListerPort_HeavyAssemblyRegistersElevenTools",
+	},
 }
 
-// TestStages_PinsUS15Checks 钉住八个 015-* check 与 US-8 替代项的 argv / 超时 / 层级，
-// 以及可静态列举的 required_tests，防止新 check 被静默删项、去标签或改命令行。
+// TestStages_PinsUS15Checks 钉住八个 015-* check 与两个替代项（US-8 / US-10）的 argv /
+// 超时 / 层级，以及可静态列举的 required_tests，防止新 check 被静默删项、去标签或改命令行。
 // 该测试在 us15-linux / us15-slow / us15-real 三个 stage 落地后才转绿（T035 / T047）。
 // TestStages_PinsUS15Checks pins argv, timeout and level for the eight 015-* checks and
 // the US-8 replacement, plus the statically enumerated required_tests. It turns green

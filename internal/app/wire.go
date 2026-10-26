@@ -101,6 +101,13 @@ type App struct {
 	// to start.
 	cfgErr error
 
+	// freshInstance 表示本次启动前库与实例名册都不存在（T089 的唯一口径）。它只由
+	// Run 在 `cli.LoadConfig` **之前**判定一次并带下来：名册一旦写盘，下一次启动就不再
+	// 是新实例——自动初始化（主密钥、访问密码）因此**不会**为存量实例补做。
+	// freshInstance is decided once before the configuration is loaded, so automatic
+	// initialization can never apply to an established instance.
+	freshInstance bool
+
 	// providerOverride 是模型客户端的**进程内替身**（评测基座的默认后端；生产路径恒 nil）。
 	// 非 nil 时它替掉每个配置名的真实客户端，但**仍套在路由 + 两阶段审计之内**——评测跑的是
 	// 与生产同一条审计链，"用量读数"因此不是另一套统计口径。
@@ -118,6 +125,11 @@ type App struct {
 	// 函数即可驱动取消传播，**不向进程发真实信号**。
 	// notifyContext is the signal-wiring seam; nil falls back to signal.NotifyContext.
 	notifyContext func(context.Context, ...os.Signal) (context.Context, context.CancelFunc)
+
+	// builtinRuntime 是内置组件运行时根目录的**进程内接缝**（生产恒空串 = 按程序目录现算）。
+	// 用例注入临时目录即可走完整个开箱安装路径，不必先造一份真实的发行布局。
+	// builtinRuntime overrides the runtime root; empty means the program directory's.
+	builtinRuntime string
 }
 
 // wsRoot 返回工作区根的绝对路径。
@@ -144,6 +156,15 @@ func (a *App) nowOr() func() time.Time {
 		return time.Now
 	}
 	return a.now
+}
+
+// builtinRuntimeRootOr 返回本次装配用的运行时根：注入值优先，否则按程序目录现算。
+// builtinRuntimeRootOr prefers the injected runtime root and falls back to the program dir.
+func (a *App) builtinRuntimeRootOr() string {
+	if a.builtinRuntime != "" {
+		return a.builtinRuntime
+	}
+	return programRuntimeRoot()
 }
 
 // newRuntime 按固定次序装配一次重路径运行期；返回的句柄归调用方所有，**必须** Close（释放
@@ -213,6 +234,15 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// networkPolicy is the single authoritative allowlist row shared by seeding, the
 	// conditional write and startup recovery.
 	networkPolicy := storage.NewNetworkPolicyStore(db)
+	// networkExceptionStore 是网络访问例外的唯一读写面（schema v6）：启动装载、管理写
+	// 与恢复查证读的是同一批行。
+	// One instance backs the startup load, the admin writes and recovery.
+	networkExceptionStore := storage.NewNetworkExceptionStore(db)
+	// executionPolicyStore 是执行档位单行表（schema v6）的同一实例：启动装载 / 种子、
+	// 运行期条件写、启动恢复查证读的都是它——恢复判"生效 / 未生效"读的必须是写路径
+	// 写进去的那一行。
+	// One instance backs seeding, the conditional write and the startup verification.
+	executionPolicyStore := storage.NewExecutionPolicyStore(db)
 
 	// ③ 显式迁移：升级是持锁重命令的**显式动作**，不做任何"顺手改库"。六步编排是唯一
 	// 的迁移路径（准入 → 状态文件 → SQL 单事务 → 身份回填 → 绑定回填 → 投影重建）：
@@ -236,18 +266,69 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	}
 	logger.Info("重路径：schema 迁移完成", "step", stepMigrate, "schema_version", a.supportedVersion)
 
+	// 网络访问例外在迁移之后、工具装配之前装载进进程级快照（14D §2.2.6）：守门器在
+	// `Run` 里已经装好，这里喂给它"哪些受保护地址经显式授权放行"。读失败保留空快照
+	// （受保护地址一律拒），不阻断启动——启动失败比少放行代价大，且失败是安全方向。
+	// The exception snapshot is fed to the guard before any tool client is built.
+	refreshNetworkExceptions(ctx, networkExceptionStore, logger)
+
 	// 凭据五件（解析器 / 守卫 / Run 检查点 / 写面 / secrets 服务）在迁移之后、工具注册
 	// 之前一次装配：通知工具、运行目录构建、准入固定与 CLI 的 secrets 子命令消费的都是
 	// 这一组实例。解析器只拿主密钥**路径**，密钥本身每次解析时重新读取（不常驻内存）。
 	// The five credential components are wired once after migration and before the tools;
 	// the resolver holds only the key path — the key is re-read on every resolution.
-	masterKeyFile := cfg.Secrets.MasterKeyFile
+	// 主密钥路径按"显式配置 → 实例名册推导的缺省路径 → 不配置"三级解析（T089 / §2.4.3）：
+	// 没有名册的存量实例不猜旧路径，`auto_init: false` 连缺省路径也不推导。
+	// The key path is explicit, or derived from the roster, or absent — a roster-less
+	// instance never gets a guessed path.
+	masterKeyFile, err := resolveMasterKeyFile(cfg, a.workDir)
+	if err != nil {
+		return nil, abortRuntime(fmt.Errorf("解析主密钥路径: %w", err), db, lock)
+	}
+	// 路径用**一个共享持有者**贯穿五个凭据组件：用户在工作区管理台显式初始化存量
+	// 实例后，模型连接 / MCP 凭据 / 通知渠道在同一进程内看到新路径，不必重启。
+	// One shared holder threads the path through all five credential components.
+	masterKeyPath := NewMasterKeyLocator(masterKeyFile)
+	instanceSecretsStore := storage.NewInstanceSecretsStore(db)
+	instanceSecrets, err := NewInstanceSecretsService(InstanceSecretsDeps{
+		Store:         instanceSecretsStore,
+		Operations:    ops,
+		MasterKeyFile: masterKeyFile,
+		KeyPath:       masterKeyPath,
+		WorkDir:       a.workDir,
+		WorkspaceRoot: root,
+		AutoInit:      cfg.Secrets.AutoInitEnabled(),
+		FreshInstance: a.freshInstance,
+		Logger:        logger,
+		Now:           a.nowOr(),
+	})
+	if err != nil {
+		return nil, abortRuntime(err, db, lock)
+	}
+	// 加密三态判定与首次初始化在**同一把实例锁内**先走一遍（T085 / T087）：可证明的新实例
+	// 在这里生成主密钥；恢复态只记录、不生成替代密钥，也**不**阻断启动（管理面显示
+	// 「恢复中」，托管凭据按失败关闭）。
+	// The three-state verdict and the first-run mint happen inside the instance lock;
+	// the recovery state is reported but never blocks startup.
+	secretsStatus, err := instanceSecrets.Ensure(ctx)
+	if err != nil {
+		return nil, abortRuntime(fmt.Errorf("实例加密初始化: %w", err), db, lock)
+	}
+	logger.Info("实例加密：三态判定完成", "step", "secrets",
+		"state", secretsStatus.Decision.State, "reason", secretsStatus.Decision.Reason,
+		"action", secretsStatus.Decision.Action, "key_id", secretsStatus.KeyID)
+	if secretsStatus.Decision.State == core.SecretStateRecoveryRequired {
+		logger.Warn("实例加密：主密钥处于恢复态——不生成替代密钥、不回落 env，托管凭据将失败关闭",
+			"reason", secretsStatus.Decision.Reason)
+	}
+
 	resolver, err := newCredentialResolver(CredentialResolverDeps{
 		Credentials:   credentials,
 		Resources:     versions,
 		Notify:        notifyAdminStore,
 		Bindings:      bindingStore,
 		MasterKeyFile: masterKeyFile,
+		KeyPath:       masterKeyPath,
 		WorkspaceRoot: root,
 		Logger:        logger,
 	})
@@ -265,12 +346,29 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	if err != nil {
 		return nil, abortRuntime(err, db, lock)
 	}
+	// MCP 逐槽位凭据的来源与状态（14D / 设计 §2.3.2）：写面、解析面与视图投影共用
+	// 同一个实例，主密钥路径与启动校验因此只有一处来源。
+	// The per-slot MCP credential surface is built once and shared by the admin, the
+	// resolver and the console projection.
+	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
+		Credentials:   credentials,
+		Sources:       storage.NewMCPCredentialSourceStore(db),
+		MasterKeyFile: masterKeyFile,
+		KeyPath:       masterKeyPath,
+		WorkspaceRoot: root,
+		Logger:        logger,
+	})
+	if err != nil {
+		return nil, abortRuntime(err, db, lock)
+	}
 	credentialOps, err := NewCredentialOps(CredentialOpsDeps{
 		Operations:    ops,
 		Credentials:   credentials,
 		Resources:     versions,
 		Notify:        notifyAdminStore,
+		Instance:      instanceSecrets,
 		MasterKeyFile: masterKeyFile,
+		KeyPath:       masterKeyPath,
 		WorkspaceRoot: root,
 		Logger:        logger,
 		Now:           a.nowOr(),
@@ -283,7 +381,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Channels:      channels,
 		Ops:           credentialOps,
 		Resolver:      resolver,
+		Instance:      instanceSecrets,
 		MasterKeyFile: masterKeyFile,
+		KeyPath:       masterKeyPath,
 		WorkspaceRoot: root,
 		Logger:        logger,
 	})
@@ -324,6 +424,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 
 	// ⑤ 授权判定与工具注册池：策略先建（工具持有的是**接口**，具体实现在装配处一处选定）；
 	// 池是**全局**的——同一实例的注册池服务所有 Agent，声明的名字与之比对（宪法 IV）。
+	// 程序目录三项条件（14D §2.2.2）的清单**产者**是安装器（US-17 拟）：本增量只落
+	// 判定面与装配槽位，**不**自行发明清单文件格式。清单为空时自动放行面恒不成立——
+	// 程序目录里的可执行件一律要显式登记（`shell.allowed_commands`），fail-closed
+	// 而不是"先放了再说"。
+	// The installation manifest is produced by the installer in a later increment; an
+	// empty manifest means no auto-admission, so runtime executables need an explicit
+	// registration. This assembly intentionally invents no manifest file format.
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{
 		Root:            root,
 		CrossAgentRead:  cfg.Sandbox.CrossAgentRead,
@@ -349,17 +456,27 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		EnvPassthrough: cfg.Shell.EnvPassthrough,
 		Interpreters:   cfg.Shell.Interpreters,
 		MaxOutputBytes: outputBudget(cfg),
+		// ProgramDir / ProgramManifest 与上面的策略清单同源，同样等安装器交付；
+		// 留空即"没有自动放行面"（三项条件恒不成立）。
+		// ProgramDir and ProgramManifest come from the same installer-produced source;
+		// left empty, the three-condition admission never fires.
 	})
-	// 十件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 +
-	// US-8 的 notify + US-10 的 manage_schedule（技能调用工具永久禁；US-7 的 MCP 各件在
-	// 等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。`manage_schedule` 的编辑后端在
-	// runtime（loader / scheduler）之后才存在，这里先建**两段绑定**的槽位，装配完成后
-	// 由下方 `Bind` 接入生产适配器（颗粒度文档 §3.1.8 图 E）。write_file 的构造期 Agent
-	// 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，"判定的那个 Agent"与"写入的
-	// 那棵树"同源由运行环境保证。
-	// Ten tools: the file trio, US-5's shell/HTTP trio, the memory pair, notify, and
-	// manage_schedule — whose editor is bound in two stages once the runtime exists.
+	// 十一件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 +
+	// US-8 的 notify + US-10 的 manage_schedule + 14D 的 web_search（技能调用工具永久禁；
+	// US-7 的 MCP 各件在等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。`manage_schedule`
+	// 的编辑后端与 `web_search` 的凭据解析面都在 runtime / 注册表之后才存在，这里先建
+	// **两段绑定**的槽位，装配完成后由下方 `Bind` 接入生产适配器（颗粒度文档 §3.1.8 图 E）。
+	// write_file 的构造期 Agent 目录留空：每次调用的 `ToolEnv.AgentDir` 才是写入根，
+	// "判定的那个 Agent"与"写入的那棵树"同源由运行环境保证。
+	// Eleven tools: the file trio, the shell/HTTP trio, the memory pair, notify,
+	// manage_schedule, and web_search — the last two bound in two stages.
 	scheduleSlot := tool.NewScheduleEditorSlot()
+	// web_search 的搜索键取该 Agent 绑定的模型连接（14D §2.5.4）：解析面需要 Agent
+	// 注册表按名查 provider，而注册表在工具注册之后才构建——同样走两段绑定，调用前未
+	// 绑定即失败关闭（不猜默认连接）。
+	// The search key resolves through the agent's bound model connection; the registry
+	// arrives after tool registration, so the slot is bound below.
+	webSearchSlot := newWebSearchCredentialSlot(versions, resolver)
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -375,6 +492,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		newNotifyTool(channels, policy, resolver,
 			notifyDeliveryRecorder{store: storage.NewNotifyDeliveryStore(db), logger: logger}),
 		tool.NewManageScheduleTool(scheduleSlot),
+		tool.NewWebSearchTool(policy, webSearchSlot),
 	} {
 		if err := registry.Register(t); err != nil {
 			return nil, abortRuntime(fmt.Errorf("注册工具: %w", err), db, lock)
@@ -394,6 +512,27 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil, abortRuntime(fmt.Errorf(
 			"注册池与声明名集不一致——声明 %v、实际注册 %v（重 / 轻两条路会给出相反的注册判定）",
 			declaredToolNames, got), db, lock)
+	}
+
+	// 开箱即用安装（14D T111–T113）：新实例首次启动时把五个内置 Agent、样例库与免凭据的
+	// MCP 条目就位；凭据就绪时补写需要凭据的条目。**必须排在下面第一次解析文件之前**——
+	// 写下的条目正是由紧随其后的启动基线发布，本次启动即生效（不需要用户重启）。
+	// 存量实例与安装标记损坏时本段直接返回（见 builtin_install.go 的纪律）。
+	// The open-box installer runs before the first parse so the baseline publishes what it
+	// wrote in this very start.
+	openBoxReport, err := prepareBuiltinOpenBox(ctx, builtinOpenBoxDeps{
+		WorkspaceRoot: root,
+		RuntimeRoot:   a.builtinRuntimeRootOr(),
+		Fresh:         a.freshInstance,
+		LookupEnv:     os.LookupEnv,
+		Now:           a.nowOr(),
+		Logger:        logger,
+	})
+	if err != nil {
+		return nil, abortRuntime(fmt.Errorf("准备内置 Agent 与 MCP 条目: %w", err), db, lock)
+	}
+	if openBoxReport.Skipped != "" {
+		logger.Info("内置安装器跳过", "reason", openBoxReport.Skipped)
 	}
 
 	// MCP 配置解析在等值门禁**之后**（约束 9），但**不再在这里连接**：连接生命周期自
@@ -420,6 +559,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// The allowlist service seeds before the supervisor connects, then reaches the web
 	// management surface.
 	var networkAllowlist *NetworkAllowlist
+	// networkDenylist 是同一张表的第二行（14D），与白名单服务共用条件写实现；
+	// networkExceptions 是访问例外的管理服务，三处消费面由它的 apply 一次替换。
+	// The denylist shares the conditional-write implementation; the exception service
+	// swaps all three faces of the exception set at once.
+	var networkDenylist *NetworkAllowlist
+	var networkExceptions *NetworkExceptionService
+	// executionPolicy 同样保留在本作用域：档位要在 supervisor 连接**之前**装载，否则
+	// MCP http 连接会按构造函数的缺省档位判定，而不是库里的权威值。
+	// The profile must be loaded before the supervisor connects for the same reason.
+	var executionPolicy *ExecutionPolicyService
 	fail := func(err error) (*heavyRuntime, error) {
 		if mcpSupervisor != nil {
 			err = errors.Join(err, mcpSupervisor.Close())
@@ -544,6 +693,14 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Schema:      db,
 		// 出网白名单的三态查证读同一张权威表（R8.2.4 第 6 条）。
 		NetworkPolicy: networkPolicy,
+		// 访问例外的三态查证读同一张 `network_exceptions` 表（契约 §9.4）。
+		NetworkExceptions: networkExceptionStore,
+		// 执行档位的三态查证读同一行表（14D）：档位与修订号都要对上才算 applied。
+		ExecutionPolicy: executionPolicyStore,
+		// 实例初始化记录与主密钥路径：`system.secrets_init` 的恢复查证按记录 + key_id
+		// + 完整读回判定 applied / not_applied / indeterminate（契约 §9.4）。
+		InstanceSecrets: instanceSecretsStore,
+		MasterKeyFile:   masterKeyFile,
 	}); err != nil {
 		return fail(err)
 	}
@@ -633,7 +790,11 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 放在注册表之前；按图体与约束 21 执行（T049 D 项已登记）。
 	// The supervisor applies published versions before the registry pass, as constraint 21
 	// requires; figure A's body order wins over its title (recorded for T049).
-	publishedMCP, err := publishedMCPServers(ctx, versions, fileServers, os.LookupEnv)
+	// MCP 凭据按**声明来源**解析（14D / 设计 §2.3.3）：装配期先把文件播种 / 升级而来的
+	// 槽位事实补记成 `env`，再逐槽位取值——`managed` 取不到即失败，**不**回落进程环境。
+	// Slots are resolved by declared source; file-seeded ones get their env fact recorded
+	// first, and a managed slot that cannot be read fails closed.
+	publishedMCP, err := publishedMCPServers(ctx, versions, fileServers, mcpCredentials, a.nowOr(), logger)
 	if err != nil {
 		return fail(fmt.Errorf("解析已发布 MCP server: %w", err))
 	}
@@ -648,22 +809,21 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			return markMCPApplied(markCtx, versions, name, versionID, a.nowOr())
 		},
 		// 工具适配器随连接一起进入注册池与视图；注册序 = 配置顺序 → 工具列表序，重名
-		// keep-first（内置优先，约束 8），其余工具照常注册。
+		// keep-first（内置优先，约束 8），其余工具照常注册。登记一律**带归属**：受控重建
+		// 要靠归属把整组工具换掉（`ReplaceTools`），不带归属就会在换组时留下孤儿名字。
 		OnConnected: func(conns []tool.MCPConnection) {
-			for _, conn := range conns {
-				for _, t := range conn.Tools {
-					regErr := registry.Register(t)
-					// 每条 offered 工具都进来源表：注册成功记赢家，重名记跳过并写明赢家
-					// 来源（D-06）。注册池自身的行为一个字都不改——失败照旧跳过。
-					// Every offered tool is recorded; the registry's own semantics stay.
-					dispositions.recordMCP(conn.Server, t.Name(), regErr)
-					if regErr != nil {
-						continue
-					}
-				}
-			}
+			mcpRegisterTools(registry, dispositions, conns, logger)
 			mcpConns = append(mcpConns, conns...)
 			logger.Debug("MCP 工具进入注册池", "tools", mcpToolNames(conns))
+		},
+		// 受控重建的提交段（在 supervisor 的 gate 写锁 + entry.mu 内执行）：注册池与来源
+		// 表同时换组。旧 Run 的快照不被改写——它钉的是工具实例，连接由旧代排空态负责
+		// 明确失败（C4）；这里只保证"下一次准入看到的是新的一整组"。
+		// ReplaceTools swaps one server's whole tool set inside the commit section; a live
+		// run's pinned instances are untouched and settle on the draining link.
+		ReplaceTools: func(server string, tools []core.Tool) {
+			mcpReplaceTools(registry, dispositions, server, tools)
+			logger.Info("MCP 工具集已整组替换", "server", server, "tools", len(tools))
 		},
 		Root:           root,
 		EnvPassthrough: cfg.Shell.EnvPassthrough,
@@ -691,6 +851,54 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	})
 	if err := networkAllowlist.EnsureSeeded(ctx, cfg.HTTP.AllowedDomains); err != nil {
 		return fail(fmt.Errorf("装载网络域名白名单: %w", err))
+	}
+	// 禁止域名表是同一张 `network_domain_policy` 的第二行（14D §2.2.5）：同一个策略
+	// 实例、同一套 ETag / CAS，只在审计动作名与生效字段上分开。配置键 `http.denied_domains`
+	// 同样只作首次种子；装载顺序同样先于 supervisor 连接——第一批判定就要按禁止表拒。
+	// The denylist is the second row of the same table, loaded before any judgement.
+	networkDenylist = NewNetworkAllowlist(NetworkAllowlistDeps{
+		Scope:      core.PolicyScopeHTTPDeniedDomains,
+		Store:      networkPolicy,
+		Operations: ops,
+		Policy:     policy,
+		Supervisor: mcpSupervisor,
+		Logger:     logger,
+		Now:        a.nowOr(),
+	})
+	if err := networkDenylist.EnsureSeeded(ctx, cfg.HTTP.DeniedDomains); err != nil {
+		return fail(fmt.Errorf("装载网络禁止域名表: %w", err))
+	}
+	// 访问例外与运行期策略、守门器快照同源（14D §2.2.6）：服务在这里把库里已装载的
+	// 集合复制到策略实例与视图快照上（守门器快照在迁移之后已由 `refreshNetworkExceptions`
+	// 装过一份）。读失败不阻断启动：保留守门器已有快照并只记 WARN（失败是安全方向）。
+	// The exception service mirrors the authoritative set onto the policy instance and
+	// the view; a failed read keeps the guard snapshot and only warns.
+	networkExceptions = NewNetworkExceptionService(NetworkExceptionDeps{
+		Store:      networkExceptionStore,
+		Operations: ops,
+		Policy:     policy,
+		Logger:     logger,
+		Now:        a.nowOr(),
+	})
+	if err := networkExceptions.EnsureLoaded(ctx); err != nil {
+		logger.Warn("装载网络访问例外失败——保留守门器已有快照（受保护地址仍按原集合判定）",
+			"error", err)
+	}
+	// 执行档位与**同一个**策略实例绑定（14D）：装配顺序上排在 supervisor 连接之前，
+	// 让第一批判定（含 MCP http 连接）就按库里的权威档位；`execution.profile` 只在
+	// 表内无行时作首次种子，落库之后修改配置不再覆盖管理台的写入。
+	// The profile binds to the very policy instance and loads before the supervisor
+	// connects; the config key only seeds a row-less database.
+	executionPolicy = NewExecutionPolicyService(ExecutionPolicyDeps{
+		Store:         executionPolicyStore,
+		Operations:    ops,
+		Policy:        policy,
+		ShellCommands: cfg.Shell.AllowedCommands,
+		Logger:        logger,
+		Now:           a.nowOr(),
+	})
+	if err := executionPolicy.EnsureSeeded(ctx, cfg.Execution.Profile); err != nil {
+		return fail(fmt.Errorf("装载执行档位: %w", err))
 	}
 	if err := mcpSupervisor.ApplyPublished(ctx, publishedMCP); err != nil {
 		return fail(fmt.Errorf("启动 MCP supervisor: %w", err))
@@ -746,6 +954,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// it is the single read face for the console, admission and the scheduler.
 	agents := newAgentRegistry(root, entries, logger)
 	logger.Info("重路径：Agent 注册表建立", "step", stepRegistry, "agents", len(entries))
+	// web_search 的两段绑定在此收口：注册表就位后才能按 Agent 名查 provider（14D §2.5.4）。
+	// The second binding stage lands once the registry exists.
+	webSearchSlot.Bind(agents)
 	sessions := storage.NewSessionStore(db)
 	invocations := storage.NewToolInvocationRepo(db)
 	llmCalls := storage.NewLLMCallRepo(db)
@@ -835,7 +1046,8 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		agents,
 		logger,
 	)
-	scheduler := a.newScheduler(storage.NewTaskStore(db), service, agents.Entries(), delivery, cfg, logger)
+	scheduler := a.newScheduler(storage.NewTaskStore(db), service, agents.Entries(), delivery,
+		lifecycleScheduleGate(lifecycle), cfg, logger)
 	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
 	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
 	// 适配器同时保留在运行期上：配置热加载的调度联动必须走**同一实例**（约束 39 的
@@ -948,7 +1160,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		DiagnoseMCP: func(spec core.MCPServerConfig) core.MCPCommandDiagnosis {
 			return diagnoseMCPCommand(spec, root, cfg.Shell.EnvPassthrough)
 		},
-		Credentials: credentials,
+		// 依赖轴按**程序目录**下的 `runtime/` 与版本清单判定（14D / 设计 §2.3.4）：
+		// 只 stat、不启动进程；未登记组件输出 null。
+		MCPDependencies: newProgramMCPDependencyProbe().Diagnose,
+		Credentials:     credentials,
+		// MCP 逐槽位托管凭据的声明 / 可用性 / 写入面（14D）。
+		MCPCredentials: mcpCredentials,
 		// 发布编排经同一份解析器做凭据写 / 绑定检查（保存前的"能不能解"、发布前的目标
 		// 绑定比对），主密钥路径与启动校验因此只有一处来源。
 		// Publishing reuses the assembly's resolver for credential checks.
@@ -1026,8 +1243,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		CredentialOps: credentialOps,
 		Channels:      channelRead,
 		Agents:        func() ([]core.AgentEntry, error) { return agents.Entries(), nil },
-		Logger:        logger,
-		Now:           now,
+		// MCP 槽位凭据一旦撤销，连接必须**立即**回收（14D C8）：撤销不等一次 apply，
+		// 也不靠下一次重启。supervisor 缺席时保持 nil——撤销照常记账，只是没有连接可回收。
+		// A revoked MCP slot tears its connection down now, not at the next apply.
+		MCPRevoker: mcpRevokerOf(mcpRT),
+		Logger:     logger,
+		Now:        now,
 	})
 	if err != nil {
 		return nil, abortRuntime(err, db, lock)
@@ -1036,38 +1257,42 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpRT.ConnectedNames()))
 	return &heavyRuntime{
-		lock:             lock,
-		db:               db,
-		service:          service,
-		runs:             runs,
-		sessions:         sessions,
-		invocations:      invocations,
-		llmCalls:         llmCalls,
-		registry:         registry,
-		mcpSupervisor:    mcpSupervisor,
-		networkAllowlist: networkAllowlist,
-		scheduler:        scheduler,
-		scheduleSlot:     scheduleSlot,
-		scheduleEditor:   scheduleEditor,
-		agents:           agents,
-		agentGate:        agentGate,
-		lifecycle:        lifecycle,
-		resourceGate:     resourceGate,
-		versions:         versions,
-		ops:              ops,
-		credentials:      credentials,
-		connectionTests:  connectionTests,
-		notifyAdminStore: notifyAdminStore,
-		resolver:         resolver,
-		secrets:          secrets,
-		mcpRT:            mcpRT,
-		skills:           skills,
-		agentAdmin:       agentAdmin,
-		projection:       projection,
-		resourceAdmin:    resourceAdmin,
-		notifyAdmin:      notifyAdmin,
-		channelRead:      channelRead,
-		catalogStore:     catalogStore,
+		lock:              lock,
+		db:                db,
+		service:           service,
+		runs:              runs,
+		sessions:          sessions,
+		invocations:       invocations,
+		llmCalls:          llmCalls,
+		registry:          registry,
+		mcpSupervisor:     mcpSupervisor,
+		networkAllowlist:  networkAllowlist,
+		networkDenylist:   networkDenylist,
+		networkExceptions: networkExceptions,
+		execPolicy:        executionPolicy,
+		scheduler:         scheduler,
+		scheduleSlot:      scheduleSlot,
+		scheduleEditor:    scheduleEditor,
+		agents:            agents,
+		agentGate:         agentGate,
+		lifecycle:         lifecycle,
+		resourceGate:      resourceGate,
+		versions:          versions,
+		ops:               ops,
+		credentials:       credentials,
+		connectionTests:   connectionTests,
+		notifyAdminStore:  notifyAdminStore,
+		resolver:          resolver,
+		secrets:           secrets,
+		instanceSecrets:   instanceSecrets,
+		mcpRT:             mcpRT,
+		skills:            skills,
+		agentAdmin:        agentAdmin,
+		projection:        projection,
+		resourceAdmin:     resourceAdmin,
+		notifyAdmin:       notifyAdmin,
+		channelRead:       channelRead,
+		catalogStore:      catalogStore,
 		// 目录快照在重路径开头解析一次（见 `mcpcat.Builtin` 处）：保留端口实例让
 		// `webOptions` 逐字段投影，管理台读到的就是这份快照，请求期零解析。
 		// The parsed catalog snapshot travels as a port so webOptions can project it.
@@ -1083,7 +1308,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			agentAdmin: agentAdminPort{admin: agentAdmin, author: cfg.Author},
 			resourceAdmin: resourceAdminPort{
 				admin: resourceAdmin,
-				read:  NewResourceViews(versions, lifecycle, mcpRT, credentials, ResourceViewDeps{ConnectionTests: connectionTests}),
+				read: NewResourceViews(versions, lifecycle, mcpRT, credentials, ResourceViewDeps{
+					ConnectionTests: connectionTests,
+					MCPCredentials:  mcpCredentials,
+				}),
 			},
 			notifyAdmin:   notifyAdminPort{admin: notifyAdmin, read: channelRead},
 			workspace:     workspaceBrowsePort{browse: workspaceBrowse},
@@ -1212,7 +1440,7 @@ func authorAppliedMCPServers(ctx context.Context, versions *storage.ResourceStor
 
 // declaredToolNames 是装配层注册池的**声明名集**（颗粒度文档 US-4 §2.4 注 4：名字在装配期
 // 一次导出——`workspace` 不反向 import `tool`，装载器只认这份字符串清单）。两个消费面读的是
-// 同一份：① 重路径在注册完十件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
+// 同一份：① 重路径在注册完十一件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
 // （`profile list` / `profile show` 经 `agentsPort`）不建注册池，直接拿它当池做装载判定
 // （池外工具名 → 整只不注册，宪法 IV）。两条路因此对同一份 AGENT.md 给出同一个结论。
 // 顺序 = `tool.Registry.Names()` 的排序序（比较逐名且保序）——**不得**按主题分组重排。
@@ -1221,7 +1449,7 @@ func authorAppliedMCPServers(ctx context.Context, versions *storage.ResourceStor
 // order matches Registry.Names(), which is sorted.
 var declaredToolNames = []string{
 	"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-	"recall_memory", "save_memory", "shell", "write_file",
+	"recall_memory", "save_memory", "shell", "web_search", "write_file",
 }
 
 // providerNameUnion 返回"配置文件名字 ∪ 未删除发布指针名字"的并集（去重、升序），只服务
@@ -1377,6 +1605,21 @@ type heavyRuntime struct {
 	// networkAllowlist is the managed allowlist shared with the live policy instance.
 	networkAllowlist *NetworkAllowlist
 
+	// networkDenylist 是禁止域名表的管理服务（14D；同一张表的第二行）：`GET /sandbox`
+	// 的 `denied_domains` 与 `PUT /sandbox/denied-domains` 读写的就是这一行。
+	// networkDenylist is the second row of the same policy table.
+	networkDenylist *NetworkAllowlist
+
+	// networkExceptions 是访问例外的管理服务：`/network-exceptions` 的读写与守门器
+	// 快照共用同一份集合。
+	// networkExceptions is the managed exception set shared with the dial guard.
+	networkExceptions *NetworkExceptionService
+
+	// execPolicy 是执行档位的管理服务（`/execution-policy`）：与运行期策略同一实例，
+	// 切换成功即对**下一次**授权判定生效；在途 Run 与已建立连接不追溯撤回。
+	// execPolicy is the managed profile service bound to the very live policy.
+	execPolicy *ExecutionPolicyService
+
 	// scheduler 是运行期调度器（重路径始终构造，chat / tool 不 Start）。停机时**最先**
 	// 停它：Stop 可耗满 70s 宽限，必须在库关闭之前收尾在途运行（约束 22）。
 	// The scheduler is always constructed; Stop runs first so in-flight runs finish
@@ -1447,6 +1690,15 @@ type heavyRuntime struct {
 	// the package seam.
 	resolver *credentialResolver
 	secrets  SecretsService
+
+	// instanceSecrets 是实例主密钥的判定表与显式初始化服务（14D）：启动时的
+	// `Ensure` 与命令面 `secrets` 子命令、web 面 `GET/POST /instance/secrets` 读的都是
+	// **同一判定**，页面报出的状态就是下一次启动会采取的动作。保留句柄让 `webOptions`
+	// 投影这个实例本身——命令面的 Status 在未配置主密钥路径时会短路成错误，web 面
+	// 需要的是状态，不是错误。
+	// instanceSecrets is the same decision table Ensure and the secrets subcommands use;
+	// the web port projects this instance itself because the CLI Status short-circuits.
+	instanceSecrets *InstanceSecretsService
 
 	// mcpRT 是已发布 MCP 定义的只读运行期句柄（配置与连接两份名单）；skills 是技能库
 	// 句柄——准入解析、基线发布与发布版本快照共用同一实例。

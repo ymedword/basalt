@@ -34,6 +34,9 @@ const (
 	messageModelConnectionBody = "请求体不是合法的模型连接请求"
 	// messageMCPServerBody 是 MCP server 请求体不是合法 JSON / 含未知字段时的文案。
 	messageMCPServerBody = "请求体不是合法的 MCP server 请求"
+	// messageMCPApplyBody 是受控发布请求体不合法时的文案（空 body 合法，见
+	// `decodeAdminOptionalBody`）。
+	messageMCPApplyBody = "请求体不是合法的受控发布请求"
 	// messageSkillCreateBody 是技能创建请求体不是合法 JSON / 含未知字段时的文案。
 	messageSkillCreateBody = "请求体不是合法的技能创建请求"
 	// messageSkillImportBody 是技能导入请求体不是合法 JSON / 含未知字段时的文案。
@@ -267,6 +270,110 @@ func (s *Server) handleAdminTestMCPServer(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.writeOK(w, mcpServerTestResultView(result))
+}
+
+// handleAdminApplyMCPServer 处理 `POST /mcp-servers/{name}/apply`（14D 受控发布）。
+// 权限边界与顺序：先过 `If-Match`（缺失 / 弱 ETag / `*` → 412，零写入、零操作行），
+// 再交给适配器；请求体可省略，`version_id=0` 表示当前发布版本。
+//
+// 三档失败出口各自独立，**不**互相代言：预检拒绝 503（未启动任何进程）、策略拒绝 403
+// （先于建连）、被并发写取代 409、建连 / 注册失败 500。四者都在 `pending` 之后，因此
+// 信封都带 `data.operation_id`。
+// handleAdminApplyMCPServer enforces the conditional header first, then forwards to the
+// adapter; the four failure faces stay distinct and all carry the operation id.
+func (s *Server) handleAdminApplyMCPServer(w http.ResponseWriter, r *http.Request, actor core.Actor) {
+	name := r.PathValue("name")
+	if s.opts.ResourceAdminService == nil {
+		s.writeAdminPortMissing(w, "ResourceAdminService", "POST /mcp-servers/{name}/apply")
+		return
+	}
+	var body MCPServerApplyWrite
+	if err := s.decodeAdminOptionalBody(w, r, &body, messageMCPApplyBody); err != nil {
+		s.writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+		return
+	}
+	ifMatch, ok := parseIfMatch(r.Header.Get("If-Match"))
+	if !ok {
+		s.writeError(w, http.StatusPreconditionFailed, codePreconditionFailed, messageIfMatchRequired)
+		return
+	}
+	result, err := s.opts.ResourceAdminService.ApplyMCPServer(r.Context(), actor, name, ifMatch, body.VersionID)
+	if err != nil {
+		// 403 在这里单独认领：`writeResourceAdminError` 是资源写面的通用映射，策略拒绝
+		// 此前只出现在运行准入面，不把新语义塞进那张表。
+		if errors.Is(err, core.ErrPolicyDenied) {
+			s.writeAdminDataError(w, http.StatusForbidden, codeForbidden,
+				adminMessageOr(err, "受控发布被策略拒绝"), err)
+			return
+		}
+		s.writeResourceAdminError(w, err, name, "受控发布 MCP server")
+		return
+	}
+	s.writeOK(w, s.mcpApplyResultView(r.Context(), name, result))
+}
+
+// decodeAdminOptionalBody 与 `decodeAdminWriteBody` 的唯一区别：**空请求体**是合法的
+// （`POST /apply` 的 body 为 `required: false`）。其余规则逐字相同——未知字段、超限与
+// 多段 JSON 一律 400，避免"多给了字段却被静默忽略"。
+// The only difference from decodeAdminWriteBody: an empty body is legal here.
+func (s *Server) decodeAdminOptionalBody(w http.ResponseWriter, r *http.Request, dst any, message string) error {
+	if r.Body == nil {
+		return nil
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			// 空 body：契约允许。`{}` 与"完全不写"同义。
+			return nil
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("请求体超过 %d 字节上限", s.opts.MaxRequestBytes)
+		}
+		return errors.New(message)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("请求体超过 %d 字节上限", s.opts.MaxRequestBytes)
+		}
+		return errors.New(message)
+	}
+	return nil
+}
+
+// mcpApplyResultView 在结果对象上挂切换后的 server 视图。视图读取失败**不得**把一次
+// 成功的切换说成失败（与通知渠道写后回显同一条纪律）：记 WARN，响应里省掉 `server`，
+// 页面随后重新 GET 即可。
+// mcpApplyResultView attaches the post-switch view; a read failure only drops the field.
+func (s *Server) mcpApplyResultView(ctx context.Context, name string,
+	result core.MCPServerApplyResult,
+) McpServerApplyResultView {
+	view := McpServerApplyResultView{
+		Outcome:             string(result.Outcome),
+		OperationID:         result.OperationID,
+		TargetVersionID:     result.TargetVersionID,
+		PreviousVersionID:   result.PreviousVersionID,
+		AppliedVersionID:    result.AppliedVersionID,
+		DrainDeadline:       result.DrainDeadline,
+		DrainTimeoutSeconds: result.DrainTimeoutSeconds,
+		FailureClass:        result.FailureClass,
+		SupersededBy:        string(result.SupersededBy),
+	}
+	if s.opts.Resources == nil {
+		return view
+	}
+	detail, err := s.opts.Resources.McpServer(ctx, name)
+	if err != nil {
+		s.logger().Warn("受控发布成功但读取 server 视图失败，响应省略 server",
+			"resource", name, "error", err)
+		return view
+	}
+	server := detail.View
+	view.Server = &server
+	return view
 }
 
 // handleAdminMCPCatalog 处理 `GET /catalog/mcp`（契约 D-01）：只读投影内嵌目录快照。
@@ -650,6 +757,10 @@ func (s *Server) writeBindingError(w http.ResponseWriter, err error) bool {
 //   - core.ErrPreconditionFailed → 412 PRECONDITION_FAILED + `data.current_etag`
 //   - core.ErrResourceUIDMismatch → 409 RESOURCE_UID_MISMATCH + `data.resource_uid`
 //     （当前指针身份；缺失或与当前指针不一致都走这里，不按名称猜目标）
+//   - core.ErrMCPApplySuperseded → 409 MCP_APPLY_SUPERSEDED（受控发布被并发写取代，
+//     `applied` 与旧连接不变；`data.operation_id` 必填）
+//   - core.ErrMCPApplyFailed → 500 MCP_APPLY_FAILED（预检之后的建连 / 注册失败；
+//     `applied` 不变，失败分类以操作详情的 `detail.failure_class` 为准）
 //   - core.ErrConflict → 409 CONFLICT（同名资源、文件分歧、状态冲突）
 //   - core.ErrProviderNotConfigured → 503 NOT_CONFIGURED（点名变量名，不回显值）
 //   - context.DeadlineExceeded → 504 TIMEOUT
@@ -694,6 +805,18 @@ func (s *Server) writeResourceAdminError(w http.ResponseWriter, err error, resou
 	if errors.Is(err, core.ErrResourceUIDMismatch) {
 		s.writeAdminDataError(w, http.StatusConflict, codeResourceUIDMismatch,
 			adminMessageOr(err, messageResourceUIDMismatch), err)
+		return
+	}
+	// 受控发布的两条出口（14D）：`superseded` 是"没被做到"而不是"做坏了"，因此给
+	// 409；`failed` 是预检之后仍失败，给 500。两者都带 operation_id，页面据此查 detail。
+	if errors.Is(err, core.ErrMCPApplySuperseded) {
+		s.writeAdminDataError(w, http.StatusConflict, codeMCPApplySuperseded,
+			adminMessageOr(err, "MCP 受控发布被并发写取代，本次未切换"), err)
+		return
+	}
+	if errors.Is(err, core.ErrMCPApplyFailed) {
+		s.writeAdminDataError(w, http.StatusInternalServerError, codeMCPApplyFailed,
+			adminMessageOr(err, "MCP 受控发布失败，运行中的版本未改变"), err)
 		return
 	}
 	if errors.Is(err, core.ErrConflict) {

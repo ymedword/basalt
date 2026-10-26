@@ -830,19 +830,19 @@ func (failingRunRefReferrer) UnreleasedRunsByChannel(context.Context, core.Resou
 // The managed save path keeps the address in ciphertext only; these tests pin the
 // ordering (preflight, row, credential) and the zero-write failure paths.
 
-// credentialRecorder 是 `CredentialSaveWriter` 的替身：记录预检次数与每次写入的类别 /
-// 名称 / UID / 模式 / 明文副本；预检可注入失败。
+// credentialRecorder 是 `CredentialSaveWriter` 的替身：记录托管写入就绪检查的次数与
+// 每次写入的类别 / 名称 / UID / 模式 / 明文副本；就绪检查可注入失败。
 // credentialRecorder records what the save path hands to the credential writer and can
-// fail the preflight on demand.
+// fail the readiness check on demand.
 type credentialRecorder struct {
 	preflight    int
 	preflightErr error
 	writes       []CredentialWriteRequest
 }
 
-// Preflight 记录一次预检并返回注入的错误。
-// Preflight counts one check and returns the injected error.
-func (r *credentialRecorder) Preflight() error {
+// PrepareManagedWrite 记录一次就绪检查并返回注入的错误。
+// PrepareManagedWrite counts one readiness check and returns the injected error.
+func (r *credentialRecorder) PrepareManagedWrite(context.Context, core.Actor) error {
 	r.preflight++
 	return r.preflightErr
 }

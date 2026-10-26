@@ -4,12 +4,14 @@
 --   需求文档§3.4、§6.6 等处出现同名字段时以本文档为准；这几份文档的其余内容（架构、行为、验收）
 --   仍以 docs/TechnicalDesign.md 为最权威。字段名与状态字面量**不得**在别处另立第二份定义。
 -- 文档状态：待验证设计草案（冻结条件：五链路原型验证通过 + 真实模型调用往返，见 DevelopmentLoop.md§5.2）。
--- 目标 schema_version：5（v1 已发布；v2 = US-11 / US-12 的资源版本、发布指针、Run 资源引用、
+-- 目标 schema_version：6（v1 已发布；v2 = US-11 / US-12 的资源版本、发布指针、Run 资源引用、
 --   管理操作审计、Agent 生命周期索引与归档索引；v3 = US-12 范围修订的 UID 级资源身份与墓碑、
 --   使用范围、托管凭据与凭据版本、Agent 资源绑定投影、通知 Run 引用与发送明细；v4 = US-12 R7 的
---   定时任务系统代投与资源连接测试最后结果；v5 = US-12 R8 的网络域名白名单权威表）。
+--   定时任务系统代投与资源连接测试最后结果；v5 = US-12 R8 的网络域名白名单权威表；v6 = US-14 14D 的
+--   执行档位、访问例外、实例密钥初始化记录、MCP 每键凭据来源）。
 --   v2 只追加新表 / 新索引；v3 追加新表与新列，并**重建** resource_versions / notify_channels 两张表
---   （SQLite 不能就地改唯一键 / 主键与 CHECK 约束）；v4 / v5 只追加新表 / 新列 / 新索引，不重建任何表。
+--   （SQLite 不能就地改唯一键 / 主键与 CHECK 约束）；v4 / v5 只追加新表 / 新列 / 新索引；v6 追加四张
+--   新表并**重建** credentials（owner_kind 加 mcp_server、新增 binding_key、唯一键改三元组）。
 -- 迁移纪律：
 --   1. 建表一律用 IF NOT EXISTS（幂等）；结构变更 = 新增受控前向 SQL + 递增 schema_version，禁止 ORM 自动 DDL
 --   2. 新旧库判定以 schema_version 表**是否存在**为准：不存在 = 新库（全量建表）；存在 = 旧库（按当前
@@ -28,6 +30,10 @@
 
 -- 连接级设置的示例（脚本自身单连接执行时有效）；装配侧逐连接设置，见迁移纪律 6
 PRAGMA foreign_keys = ON;
+
+-- 本文档声明的目标结构版本；与 storage.SupportedSchemaVersion 必须一致（契约测试判卷）。
+-- 权威版本记录仍是 schema_version 表：本 PRAGMA 只是让契约文件自述，不参与迁移判定。
+PRAGMA user_version = 6;
 
 -- ============================================================
 -- 版本与迁移
@@ -368,6 +374,91 @@ CREATE TABLE IF NOT EXISTS network_domain_policy (
 );
 
 -- ============================================================
+-- 执行档位（v6 新增；YAML 只作种子，运行期以库为准）
+-- ============================================================
+-- 单行表（`policy_scope` 固定 `global`）。`standard` 放行未命中禁止域名的公网域名；
+-- `strict` 只放行白名单。两档共用同一套基础防护（DNS 解析校验、连接固定、忽略代理
+-- 环境变量、shell 名称集合），差异只在授权范围。
+-- v5 → v6 迁移一律写 `strict`（不看白名单内容、空白名单也不放宽）；只有实例初始化
+-- 流程创建的新库写 `standard` —— "存量实例静默扩大授权"在结构上不可能发生。
+-- `revision` 是条件写（If-Match → 412）的 CAS 依据；`operation_id` 指向产生该修订的
+-- 管理操作，迁移种子记 `system.migrate_v6`。
+
+CREATE TABLE IF NOT EXISTS execution_policy (
+    policy_scope TEXT PRIMARY KEY,            -- 固定 global
+    profile      TEXT    NOT NULL,            -- standard / strict
+    revision     INTEGER NOT NULL,            -- 从 1 起，每次成功写入 +1
+    updated_at   INTEGER NOT NULL,            -- 最近一次写入时间（Unix 毫秒，UTC）
+    operation_id TEXT    NOT NULL DEFAULT '', -- 产生该修订的管理操作
+    CHECK (policy_scope = 'global'),
+    CHECK (profile IN ('standard', 'strict')),
+    CHECK (revision >= 1)
+);
+
+-- ============================================================
+-- 网络访问例外（v6 新增；仅网络，不含文件与命令授权）
+-- ============================================================
+-- 例外用于放行**受保护地址段**（回环、私网、链路本地、云元数据等）：两档入口相同、
+-- 语义不同——`standard` 用它放行受保护地址，`strict` 等价于一条白名单条目并另可放行
+-- 受保护地址。`note` 必填：放行必须带理由，并与 `operation_id` 一起进管理审计。
+-- 云元数据地址（`169.254.169.254` / `fd00:ec2::254`）**即使加例外也拒**，判定在运行时。
+-- 删除后下一次判定即失效；同一 `(kind, value)` 只允许一条。
+
+CREATE TABLE IF NOT EXISTS network_exceptions (
+    exception_id TEXT PRIMARY KEY,            -- exc_ + 26 位 Crockford Base32（ULID 形态）
+    kind         TEXT    NOT NULL,            -- host / ip_port
+    value        TEXT    NOT NULL,            -- 规范化主机名或 ip:port
+    note         TEXT    NOT NULL,            -- 必填理由
+    revision     INTEGER NOT NULL,            -- 从 1 起，每次修改 +1
+    created_at   INTEGER NOT NULL,
+    operation_id TEXT    NOT NULL,
+    UNIQUE (kind, value),
+    CHECK (kind IN ('host', 'ip_port')),
+    CHECK (note <> ''),
+    CHECK (revision >= 1)
+);
+
+-- ============================================================
+-- 实例密钥初始化记录（v6 新增；与 schema_version 解耦）
+-- ============================================================
+-- 单行表（`scope` 固定 `master_key`）。选独立表而不是复用 schema_version：迁移版本
+-- 与密钥身份是两件事，混用会让"回滚库版本"误伤密钥判定。
+-- `key_id` 是主密钥文件内标识的权威副本；`fingerprint` 是可公开比对的密钥材料摘要
+-- （sha256 十六进制小写），用于在不解密的前提下核对"这把密钥是不是这个实例的那把"。
+-- 记录存在但密钥文件缺失 / 损坏 / `key_id` 不符 → 进恢复态，**不得**据此生成新密钥。
+
+CREATE TABLE IF NOT EXISTS instance_secrets (
+    scope          TEXT PRIMARY KEY,          -- 固定 master_key
+    key_id         TEXT    NOT NULL,
+    fingerprint    TEXT    NOT NULL,
+    initialized_at INTEGER NOT NULL,
+    operation_id   TEXT    NOT NULL,
+    CHECK (scope = 'master_key')
+);
+
+-- ============================================================
+-- MCP 每键凭据来源（v6 新增；来源必须显式记录）
+-- ============================================================
+-- 一个 MCP server 的每个占位符（env 键或 header 名）独立记来源与修订。
+-- 靠"托管凭据行是否存在"推断来源会让撤销变成隐式回落 env：显式记录后，`managed`
+-- 缺失 / 已撤销 / 解密失败时**不读**进程环境，只有 `env` 才读。
+-- v5 存量配置在升级后由启动编排按文件事实补记 `mode=env`（MCP server 定义不在库里，
+-- SQL 无法枚举占位符）；这是"记录当前真实来源"，不是运行时回落。
+
+CREATE TABLE IF NOT EXISTS mcp_credential_sources (
+    server_uid   TEXT    NOT NULL,            -- MCP server 的资源 UID
+    binding_key  TEXT    NOT NULL,            -- 占位符名（env 键或 header 名）
+    mode         TEXT    NOT NULL,            -- managed / env
+    revision     INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    operation_id TEXT    NOT NULL,
+    PRIMARY KEY (server_uid, binding_key),
+    CHECK (mode IN ('managed', 'env')),
+    CHECK (revision >= 1),
+    CHECK (binding_key <> '')
+);
+
+-- ============================================================
 -- 长期记忆（sqlite 档载体；markdown 档不用此表）
 -- ============================================================
 -- scope 语义：agent = Agent 层；global = 全局回退层（agent_name 为 NULL）。
@@ -499,6 +590,7 @@ CREATE INDEX IF NOT EXISTS idx_resource_pointers_uid
 -- 托管凭据身份与不可变凭据版本（v3 新增）
 -- ============================================================
 -- 一个资源 UID 一个**托管**凭据身份（env 模式没有凭据身份；env 的引用就是定义里的 `${VAR}`）。
+-- v6 起 MCP server 按 `(owner_uid, binding_key)` 每占位符一条身份，各自独立版本与撤销。
 -- owner_name 只用于展示，可能被同名新 UID 复用；owner_uid 才是身份。
 --   - state：active / revoked / retired（资源删除或 managed→env 切换时置 retired，版本仍可解密供在途使用）
 --   - current_version：当前活动凭据版本号；revocation_epoch 每次撤销 +1，参与资源 ETag
@@ -507,8 +599,9 @@ CREATE INDEX IF NOT EXISTS idx_resource_pointers_uid
 
 CREATE TABLE IF NOT EXISTS credentials (
     credential_id    TEXT PRIMARY KEY,            -- cred_ + 26 位 Crockford Base32（ULID 形态）
-    owner_kind       TEXT    NOT NULL,            -- model_connection / notify_channel
+    owner_kind       TEXT    NOT NULL,            -- model_connection / notify_channel / mcp_server
     owner_uid        TEXT    NOT NULL,            -- 资源 UID
+    binding_key      TEXT    NOT NULL DEFAULT '', -- MCP 占位符名；其它 kind 固定空串（v6 新增）
     owner_name       TEXT    NOT NULL,            -- 展示用名称
     state            TEXT    NOT NULL,            -- active / revoked / retired
     current_version  INTEGER NOT NULL,            -- 当前活动凭据版本号
@@ -517,10 +610,14 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     operation_id     TEXT    NOT NULL REFERENCES management_operations(operation_id),
-    UNIQUE (owner_kind, owner_uid),
-    CHECK (owner_kind IN ('model_connection', 'notify_channel')),
+    UNIQUE (owner_kind, owner_uid, binding_key),
+    CHECK (owner_kind IN ('model_connection', 'notify_channel', 'mcp_server')),
     CHECK (state IN ('active', 'revoked', 'retired')),
-    CHECK (current_version >= 1)
+    CHECK (current_version >= 1),
+    CHECK (
+        (owner_kind = 'mcp_server' AND binding_key <> '')
+        OR (owner_kind <> 'mcp_server' AND binding_key = '')
+    )
 );
 
 -- 不可变版本：目标绑定、密文与 nonce 都在版本上。
@@ -791,3 +888,24 @@ CREATE INDEX IF NOT EXISTS idx_agent_archives_restorable
 -- 5. 全部完成 → 操作置 success，detail_json 记计数与逐条限制；任一步失败 → 操作置 failed，拒绝启动。
 -- 6. 迁移完成后（schema_version = 3）：状态文件退回 v1 或活动记录缺 agent_uid → 拒绝启动并点名，
 --    **不得**在运行期静默补发 UID；新安装由本文件全量 DDL 直接建到 v3，不执行上述回填。
+
+-- ============================================================
+-- 增量迁移 v6（旧库 5 → 6）
+-- ============================================================
+-- 1. SQL 迁移文件：internal/storage/migrations/0006_execution_policy_and_mcp_credentials.sql。
+--    迁移器在事务外 `PRAGMA foreign_keys=OFF`，单事务内完成 DDL 与重建，
+--    `PRAGMA foreign_key_check` 通过才提交；任一步失败 → 整事务回滚，schema_version 保持 5。
+-- 2. 内容：
+--    a. 重建 credentials：`owner_kind` CHECK 加 `mcp_server`、新增 `binding_key`、唯一键改
+--       `(owner_kind, owner_uid, binding_key)`，**保留原 credential_id**（版本与引用不换号）；
+--       非 mcp_server 行 `binding_key` 一律空串（CHECK 强制）；
+--    b. 新建 execution_policy 并**写入 `strict`** 种子行（`system.migrate_v6`）——不根据白名单
+--       内容反推，空白名单也不放宽；只有实例初始化流程创建的新库写 `standard`；
+--    c. 新建 network_exceptions / instance_secrets / mcp_credential_sources，均不预置行。
+-- 3. 迁移之后、开放服务之前由启动编排完成两件事（不在 SQL 里做，因为事实源在文件不在库）：
+--    a. MCP 凭据来源补记：`mcp_servers.yaml` 中**已存在的每个占位符**按事实写
+--       `mcp_credential_sources(mode=env)` 并留迁移记录；这是"记录当前真实来源"，不是运行时
+--       回落——之后若改为 `managed` 再撤销，仍然不会退回 `env`；
+--    b. 存量待确认项：白名单中解析到受保护地址段的条目、命中新增 shell 名称的命令条目，
+--       逐条给「加例外」/「保持拒绝」两个显式动作并写审计，未确认前一律保持拒绝。
+-- 4. 本迁移不新增任何授权、不改写已发布迁移（0002–0005 只追加）。

@@ -21,10 +21,13 @@ import (
 // v4 = US-12 R7：定时任务系统代投（deliver_to / schedule_deliveries）与资源连接
 // 测试最后结果（resource_connection_tests）。
 // v5 = US-12 R8：网络域名白名单的唯一权威源（network_domain_policy 单行表）。
+// v6 = US-14 14D：执行档位（execution_policy）、访问例外（network_exceptions）、实例
+// 密钥初始化记录（instance_secrets）、MCP 每键凭据来源（mcp_credential_sources），
+// 并**重建** credentials（owner_kind 加 mcp_server、新增 binding_key、唯一键改三元组）。
 // SupportedSchemaVersion is the schema version this binary targets; it is the
 // first version-record anchor and the production value of the target parameter
 // threaded through OpenWritable, Bootstrap, OpenReadOnly and Migrate.
-const SupportedSchemaVersion = 5
+const SupportedSchemaVersion = 6
 
 // schemaFileName 是建表脚本在 fs.FS 里的路径——契约文件的嵌入副本。
 // schemaFileName is the path of the schema script inside the injected fs.FS.

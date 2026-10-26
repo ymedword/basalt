@@ -152,6 +152,13 @@ type SecretsStatus struct {
 	// Initialized reports whether the master key is present and loadable.
 	Initialized bool
 
+	// State / Reason 是实例加密三态（uninitialized / ready / recovery_required）与
+	// 恢复细分原因（missing / corrupt / key_id_mismatch / unprovable_provenance /
+	// unavailable）；空串表示"未判定"。命令面据此打印恢复态，不把它说成"未初始化"。
+	// State / Reason carry the three-state verdict and its recovery reason.
+	State  string
+	Reason string
+
 	// KeyID / Fingerprint 是主密钥的公开标识与比对值。
 	// KeyID / Fingerprint are the key's public identifiers.
 	KeyID       string

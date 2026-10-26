@@ -138,8 +138,14 @@ type MCPServerRequest struct {
 	Args      []string
 	URL       string
 	Env       map[string]string
-	Create    bool
-	IfMatch   string
+	// Headers 是 http 传输的请求头（值只能是整值 `${VAR}`，键名即槽位名）；仅 14D 起的
+	// 新增能力，stdio 传输带 headers 由严格渲染拒绝。
+	Headers map[string]string
+	// Credentials 是逐槽位来源声明（契约 `McpServerUpsert.credentials`）：只对本次
+	// env / headers 里出现的槽位生效，省略的键沿用既有声明；合并后仍无声明的槽位 → 400。
+	Credentials []MCPCredentialRequest
+	Create      bool
+	IfMatch     string
 }
 
 // SkillCreateRequest 是一次技能骨架创建（`POST /skills`）：只给名字与一句话描述，
@@ -264,6 +270,16 @@ type ResourceAdminDeps struct {
 	// DiagnoseMCP is the stat-only command locator shared with launch; nil degrades to
 	// unconfirmed with a warning rather than faking a positive verdict.
 	DiagnoseMCP func(core.MCPServerConfig) core.MCPCommandDiagnosis
+	// MCPDependencies 是 MCP 诊断的运行时依赖轴（14D / 设计 §2.3.4）：按程序目录下的
+	// `runtime/` 与版本清单判定组件就位 / 缺失 / 版本不符，不启动进程。nil 时该轴输出
+	// `null`——没有可核对的运行时目录时不猜位置、也不把未登记组件答成就绪。
+	// MCPDependencies is the read-only runtime dependency axis; nil projects null.
+	MCPDependencies func(core.MCPServerConfig) *core.MCPDependencyDiagnosis
+	// MCPCredentials 是 MCP 逐槽位托管凭据的写面与解析面（14D / 设计 §2.3.2）。nil 表示
+	// 本次装配没有托管凭据能力：带槽位的 MCP 保存一律拒绝（fail-closed），不猜来源。
+	// MCPCredentials is the per-slot MCP credential surface; a nil service refuses every
+	// save that declares slots instead of guessing a source.
+	MCPCredentials *MCPCredentialService
 }
 
 // ResourceAdmin 是公共资源写面的编排实现；字段全部私有，构造后不再变化。
@@ -286,6 +302,8 @@ type ResourceAdmin struct {
 	archives         ArchiveLister
 	connectionTests  core.ResourceConnectionTestStore
 	diagnoseMCP      func(core.MCPServerConfig) core.MCPCommandDiagnosis
+	mcpDependencies  func(core.MCPServerConfig) *core.MCPDependencyDiagnosis
+	mcpCredentials   *MCPCredentialService
 	logger           *slog.Logger
 	now              func() time.Time
 	publishVersion   func(ctx context.Context, v core.ResourceVersion, applied bool, operationID string, now time.Time) (core.ResourceVersion, error)
@@ -385,6 +403,8 @@ func NewResourceAdmin(deps ResourceAdminDeps) *ResourceAdmin {
 		archives:         deps.Archives,
 		connectionTests:  deps.ConnectionTests,
 		diagnoseMCP:      deps.DiagnoseMCP,
+		mcpDependencies:  deps.MCPDependencies,
+		mcpCredentials:   deps.MCPCredentials,
 		logger:           logger,
 		now:              now,
 		publishVersion:   publishVersion,
@@ -398,7 +418,7 @@ func NewResourceAdmin(deps ResourceAdminDeps) *ResourceAdmin {
 //
 //	静态校验 → 资源锁 →（更新：指针 404 / If-Match 412 / 空 api_key 继承 / 范围只读）→
 //	模式与凭据值解析 → 文件锁 → 重读 →（更新：分歧闸门 409 / 新建：块内重名）→ 块编辑 +
-//	整份候选校验 + 环境占位解析与客户端构造（全部在预写之前）→（托管写：主密钥预检）→
+//	整份候选校验 + 环境占位解析与客户端构造（全部在预写之前）→（托管写：实例初始化 + 主密钥预检）→
 //	预写 pending →（新建重名：409 + 操作 failed）→ 原子写 → gate 写锁内同事务写版本 /
 //	指针 / 终态 → 目录原子替换 →（创建专属：范围转换）→（托管写：凭据写入）→ 逆序释放。
 //
@@ -616,7 +636,9 @@ func (s *ResourceAdmin) UpsertModelConnection(ctx context.Context, actor core.Ac
 				"模型连接 " + req.Name + ": 本次装配没有凭据写面，拒绝保存托管凭据")
 		}
 		if plan.Value != nil {
-			if err := s.credentialWriter.Preflight(); err != nil {
+			// 首次托管保存会在这一步完成必要的实例初始化（R2-1），随后才校验密钥可装载；
+			// 两步都失败关闭，且都发生在定义写盘之前。
+			if err := s.credentialWriter.PrepareManagedWrite(ctx, actor); err != nil {
 				return core.ResourceVersion{}, err
 			}
 		}
@@ -843,16 +865,19 @@ func (s *ResourceAdmin) UpsertMCPServer(ctx context.Context, actor core.Actor, r
 		return core.ResourceVersion{}, &core.InvalidInputError{Tool: action, Reason: err.Error()}
 	}
 
-	rendered, err := workspace.RenderMCPServerEntry(core.MCPServerConfig{
+	cfg := core.MCPServerConfig{
 		Name:      req.Name,
 		Transport: req.Transport,
 		Command:   req.Command,
 		Args:      req.Args,
 		URL:       req.URL,
 		Env:       req.Env,
-	})
+		Headers:   req.Headers,
+	}
+	rendered, err := workspace.RenderMCPServerEntry(cfg)
 	if err != nil {
-		// 候选非法 → 400 点名字段，预写之前返回：零写入、零操作行。
+		// 候选非法 → 400 点名字段，预写之前返回：零写入、零操作行。严格渲染同时是
+		// `args` 占位与请求头形态的唯一判据（14D：`args` 出现 `${` 一律 400）。
 		return core.ResourceVersion{}, &core.InvalidInputError{Tool: action, Reason: err.Error()}
 	}
 
@@ -896,6 +921,25 @@ func (s *ResourceAdmin) UpsertMCPServer(ctx context.Context, actor core.Actor, r
 		}
 		if req.IfMatch != current {
 			return core.ResourceVersion{}, preconditionError(current)
+		}
+	}
+
+	// 凭据声明层校验（14D / 设计 §2.3.2）：把请求里的逐槽声明与既有来源合并。全部 400
+	// 都在预写之前返回——请求本身不合法的保存零写入、零操作行。重名（409）不再校验。
+	// Declaration-layer checks run before the pending row; only availability (503) is
+	// deferred to Prepare, which the frozen contract places after the pre-write.
+	var credentialPlan mcpCredentialPlan
+	if !duplicate {
+		if s.mcpCredentials == nil {
+			if len(cfg.Env)+len(cfg.Headers) > 0 {
+				return core.ResourceVersion{}, credentialUnavailableError(
+					"MCP server " + req.Name + ": 本次装配没有 MCP 凭据面，拒绝保存带凭据槽位的条目")
+			}
+		} else {
+			credentialPlan, err = s.mcpCredentials.Plan(ctx, req.Name, uid, cfg, req.Credentials)
+			if err != nil {
+				return core.ResourceVersion{}, err
+			}
 		}
 	}
 
@@ -996,11 +1040,25 @@ func (s *ResourceAdmin) UpsertMCPServer(ctx context.Context, actor core.Actor, r
 		}
 	}
 
-	// env 闸门（模块卡 §2.3 图 2-2）：预写之后、**第一次写文件之前**证明当前进程环境
-	// 满足这条条目的 `${VAR}` 引用。失败只留一条 failed/NOT_CONFIGURED 行，文件 / 版本 /
-	// 指针零变化；错误与 detail 只点名 server / 键 / 变量，不含值。
-	if err := validateMCPEntryEnv(entryRaw, os.LookupEnv); err != nil {
-		return core.ResourceVersion{}, s.rejectMCPEnvGate(ctx, operationID, "保存所需环境变量未配置", err)
+	// 凭据可用性闸门（14D / 模块卡 §2.3 图 2-2）：预写之后、**第一次写文件之前**按声明的
+	// 来源逐槽位取值——`env` 与 `http.headers` 同一闸门（变量未设置与空值同档拒绝），
+	// `managed` 无值 / 已撤销 / 解密失败同样拒绝。失败只留一条 failed/NOT_CONFIGURED 行，
+	// 文件 / 版本 / 指针零变化；错误与 detail 只点名 server / 槽位 / 变量，不含值。
+	//
+	// 写入先于定义落盘：宁可留孤儿凭据行，也不发布"声明托管却取不到值"的配置。
+	// Availability is proven per declared source before the first definition write; the
+	// credential write precedes the definition commit for the same fail-closed reason.
+	if len(credentialPlan.steps) > 0 {
+		prepared, prepareErr := s.mcpCredentials.Prepare(ctx, req.Name, uid, cfg, credentialPlan)
+		if prepareErr != nil {
+			return core.ResourceVersion{}, s.rejectMCPEnvGate(ctx, operationID, "保存所需凭据未就绪", prepareErr)
+		}
+		if applyErr := s.mcpCredentials.Apply(ctx, req.Name, uid, prepared, operationID, now); applyErr != nil {
+			s.logger.Error("写入 MCP 托管凭据失败，拒绝发布定义",
+				"resource", req.Name, "operation_id", operationID, "error", applyErr)
+			s.finish(ctx, operationID, core.OperationFailed, lifecycleResultInternal, "写入 MCP 托管凭据失败")
+			return core.ResourceVersion{}, operationFailedError(operationID, "写入 MCP 托管凭据失败")
+		}
 	}
 
 	if err := workspace.CommitMCPServersDefinition(definitionPath, candidate); err != nil {
@@ -1709,11 +1767,12 @@ func (s *ResourceAdmin) Publish(ctx context.Context, actor core.Actor, req core.
 		return core.ResourcePublishResult{Version: target, PendingRestart: pendingRestart}, nil
 	}
 
-	// env 闸门（模块卡 §2.3 图 2-2）：幂等分支已在上面短路，这里校验的是**目标版本**
-	// 条目（回滚同样走这里）——当前进程环境不满足就拒绝，且不改文件 / 指针 / 版本。
+	// 凭据闸门（模块卡 §2.3 图 2-2）：幂等分支已在上面短路，这里校验的是**目标版本**
+	// 条目（回滚同样走这里）——按声明的来源取不到值就拒绝，且不改文件 / 指针 / 版本。
 	if req.Kind == core.ResourceMCPServer {
-		if err := validateMCPEntryEnv([]byte(target.DefinitionYAML), os.LookupEnv); err != nil {
-			return core.ResourcePublishResult{}, s.rejectMCPEnvGate(ctx, operationID, "发布所需环境变量未配置", err)
+		if err := s.validateMCPPublishedCredentials(ctx, req.ID, uid,
+			[]byte(target.DefinitionYAML)); err != nil {
+			return core.ResourcePublishResult{}, s.rejectMCPEnvGate(ctx, operationID, "发布所需凭据未就绪", err)
 		}
 	}
 
@@ -2169,31 +2228,36 @@ func (s *ResourceAdmin) TestMCPServer(ctx context.Context, actor core.Actor, nam
 		return core.ResourceTestResult{}, fmt.Errorf("预写管理操作失败: %w", err)
 	}
 
-	// 已发布版本里的 env 值仍是 `${VAR}` 占位：连接前必须解析成终值，否则子进程会收到
-	// 字面占位。解析失败与模型连接测试同口径——pending 已写，置 failed + 503 并返回
-	// operation_id；错误里只有 server / 键 / 变量名，不含值（约束 7 / 22）。
-	// Published env values are still ${VAR} placeholders; resolve them before connecting.
-	resolved, resolveErr := resolveMCPEnv([]core.MCPServerConfig{cfg}, os.LookupEnv)
-	if resolveErr != nil {
-		detail, marshalErr := json.Marshal(mcpTestOperationDetail{
-			Tools:        []string{},
-			ErrorCode:    resourceResultNotConfigured,
-			ErrorMessage: resolveErr.Error(),
-			Stage:        mcpGateStagePreflight,
-			FailureClass: mcpGateClassEnvMissing,
-		})
-		if marshalErr != nil {
-			detail = nil
+	// 已发布版本里的槽位值仍是 `${VAR}` 占位：连接前必须按**声明的来源**取到终值，否则
+	// 子进程会收到字面占位、或宣告托管却拿进程环境顶替。取不到值与模型连接测试同口径——
+	// pending 已写，置 failed + 503 并返回 operation_id；错误里只有 server / 槽位 / 变量名，
+	// 不含值（约束 7 / 22）。
+	// Slots are resolved by declared source before connecting; a miss is a 503 after the
+	// pending row, and the error never carries a value.
+	if s.mcpCredentials != nil {
+		values, resolveErr := s.mcpCredentials.Resolve(ctx, name, pointer.ResourceUID, cfg)
+		if resolveErr != nil {
+			detail, marshalErr := json.Marshal(mcpTestOperationDetail{
+				Tools:        []string{},
+				ErrorCode:    resourceResultNotConfigured,
+				ErrorMessage: resolveErr.Error(),
+				Stage:        mcpGateStagePreflight,
+				FailureClass: mcpGateFailureClassOf(resolveErr),
+			})
+			if marshalErr != nil {
+				detail = nil
+			}
+			s.finish(ctx, operationID, core.OperationFailed, resourceResultNotConfigured, "测试所需凭据未就绪", detail)
+			// 503 不返回测试结果对象：页面用 operation_id 拉操作详情读 stage / failure_class。
+			return core.ResourceTestResult{}, &core.AdminError{
+				Kind:    core.ErrProviderNotConfigured,
+				Message: resolveErr.Error(),
+				Data:    map[string]any{"operation_id": operationID},
+			}
 		}
-		s.finish(ctx, operationID, core.OperationFailed, resourceResultNotConfigured, "测试所需环境变量未配置", detail)
-		// 503 不返回测试结果对象：页面用 operation_id 拉操作详情读 stage / failure_class。
-		return core.ResourceTestResult{}, &core.AdminError{
-			Kind:    core.ErrProviderNotConfigured,
-			Message: resolveErr.Error(),
-			Data:    map[string]any{"operation_id": operationID},
-		}
+		cfg = ApplyResolvedMCP(cfg, values)
+		ZeroMCPCredentialValues(values)
 	}
-	cfg = resolved[0]
 
 	result := s.supervisor.Test(ctx, cfg)
 	// 响应里的 operation_id / 被测版本与操作行同源：页面并发测试后按 operation_id 串行。
@@ -3328,23 +3392,42 @@ func (s *ResourceAdmin) mcpServersPath() string {
 	return filepath.Join(s.root, mcpServersFileName)
 }
 
-// mcpServerRequestHash 摘要一次 MCP 写请求：动作、标识、传输与公开字段；env 只含
-// 键与占位（占位本身就是请求内容），排序后拼接以保证同一请求摘要稳定。
-// mcpServerRequestHash digests one MCP write request with sorted env placeholders.
+// mcpServerRequestHash 摘要一次 MCP 写请求：动作、标识、传输与公开字段；env / headers
+// 只含键与占位（占位本身就是请求内容），凭据声明只含 `槽位=来源`——**值不进摘要**，
+// 它既不落盘也不该出现在任何可比的材料里。排序后拼接以保证同一请求摘要稳定。
+// mcpServerRequestHash digests one MCP write request; credential values never enter it.
 func mcpServerRequestHash(action string, req MCPServerRequest) string {
-	keys := make([]string, 0, len(req.Env))
-	for key := range req.Env {
+	return agentRequestHash(strings.Join([]string{
+		action, req.Name, req.Transport, req.Command,
+		strings.Join(req.Args, "\x00"), req.URL,
+		hashMCPPairs(req.Env), hashMCPPairs(req.Headers), hashMCPCredentialDecls(req.Credentials),
+	}, "\n"))
+}
+
+// hashMCPPairs 把一张键值表按键排序成稳定片段（占位符值不是秘密材料）。
+// hashMCPPairs renders one key/value map as a stable fragment.
+func hashMCPPairs(pairs map[string]string) string {
+	keys := make([]string, 0, len(pairs))
+	for key := range pairs {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
-	env := make([]string, 0, len(keys))
+	rendered := make([]string, 0, len(keys))
 	for _, key := range keys {
-		env = append(env, key+"="+req.Env[key])
+		rendered = append(rendered, key+"="+pairs[key])
 	}
-	return agentRequestHash(strings.Join([]string{
-		action, req.Name, req.Transport, req.Command,
-		strings.Join(req.Args, "\x00"), req.URL, strings.Join(env, "\x00"),
-	}, "\n"))
+	return strings.Join(rendered, "\x00")
+}
+
+// hashMCPCredentialDecls 把凭据声明按槽位排序成 `槽位=来源` 片段。
+// hashMCPCredentialDecls renders declarations as sorted `slot=mode` pairs.
+func hashMCPCredentialDecls(decls []MCPCredentialRequest) string {
+	rendered := make([]string, 0, len(decls))
+	for _, decl := range decls {
+		rendered = append(rendered, decl.Key+"="+decl.Mode)
+	}
+	slices.Sort(rendered)
+	return strings.Join(rendered, "\x00")
 }
 
 // mcpServerTestHash 摘要一次 MCP 测试请求：测试没有请求体，材料只有资源标识。

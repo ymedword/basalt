@@ -545,7 +545,7 @@ func TestSchedules_RunTimeout(t *testing.T) {
 	t.Run("deadline error maps to 504", func(t *testing.T) {
 		svc := &fakeScheduleService{waitDeadline: true, runErr: context.DeadlineExceeded}
 		srv := newTestServer(t, func(o *Options) {
-			o.RunTimeout = 10 * time.Millisecond
+			o.ScheduleRunTimeout = 10 * time.Millisecond
 			o.Schedules = svc
 		})
 
@@ -563,7 +563,7 @@ func TestSchedules_RunTimeout(t *testing.T) {
 			runRes:       core.RunResult{RunID: "run-timeout", Status: core.StatusCompleted},
 		}
 		srv := newTestServer(t, func(o *Options) {
-			o.RunTimeout = 10 * time.Millisecond
+			o.ScheduleRunTimeout = 10 * time.Millisecond
 			o.Schedules = svc
 		})
 

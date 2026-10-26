@@ -1295,7 +1295,7 @@ func testWebToolCatalog(t *testing.T) {
 	wantNames := []string{
 		"blob", "boom", "echo", "http_get", "http_post", "list_dir",
 		"manage_schedule", "notify", "read_file", "recall_memory",
-		"save_memory", "shell", "write_file",
+		"save_memory", "shell", "web_search", "write_file",
 	}
 	if len(tools) != len(wantNames) {
 		t.Fatalf("/tools 应有 %d 项，实际 %d 项：%v\nserve 输出：\n%s",

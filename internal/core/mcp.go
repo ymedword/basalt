@@ -23,6 +23,13 @@ type MCPServerConfig struct {
 	Args      []string          // stdio：参数分开保存（与 command 分离）
 	URL       string            // http：无 userinfo 的绝对 URL
 	Env       map[string]string // env（键 = 子进程变量名；值两阶段：占位 → 终值）
+	// Headers 是 `transport: http` 的可选请求头（14D）。文件中值固定是整值 `${VAR}`
+	// 占位；经装配层解析后才是真实值。认证方式由**头名**决定（`Authorization` →
+	// `Bearer <value>`，其它头名原样），不做前缀推断——`Headers` 的值在两种阶段都
+	// **不得**进入日志、审计 detail 或模型上下文。
+	// Headers are the optional request headers of an http entry; values are whole-value
+	// ${VAR} placeholders in the file and resolved values only after assembly.
+	Headers map[string]string
 }
 
 // PublishedMCPServer 把解析后的配置与明确的已发布版本绑定；supervisor 只消费该

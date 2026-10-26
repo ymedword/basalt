@@ -19,6 +19,10 @@ http:
   allowed_domains: []         # 出网域名白名单的**首次种子**（大小写不敏感）：只在数据库 network_domain_policy 无行时写入；
                               # 之后权威源是数据库，请在管理台「执行环境」编辑（保存即生效、无需重启）。改本键不覆盖已保存值。
                               # 消费者：http_get / http_post、通知投递、MCP http 连接；边界见 docs/Operations.md §2.2
+  proxy: ""                   # 显式出网代理（`http.proxy`）——**唯一**认可的代理来源：`HTTP_PROXY` / `HTTPS_PROXY`
+                              # 在任何情况下都不读（环境变量代理会让"校验过的地址"与"实际连上的地址"分离）。
+                              # 空 = 直连；写了必须是 `http(s)://[userinfo@]host:port`，形态错了拒绝启动（不静默直连）。
+                              # 经代理出网时固定的是**代理地址**，目标由代理解析——目标地址不由本进程固定。
   # 管理面认证（键名出处 docs/contracts/run-and-errors.md §9.1）：serve 启动时必填；
   # chat / tool / session 等不开放 HTTP 管理面的命令不要求本段。
   admin_auth:

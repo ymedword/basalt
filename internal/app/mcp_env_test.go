@@ -81,11 +81,12 @@ func TestMCPEnvGate_CreateMissingEnvNoWrite(t *testing.T) {
 
 	before := env.readMCPConfig()
 	_, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      "demo",
-		Transport: "stdio",
-		Command:   "mcp-helper",
-		Env:       map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"},
-		Create:    true,
+		Name:        "demo",
+		Transport:   "stdio",
+		Command:     "mcp-helper",
+		Env:         map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"},
+		Credentials: envOnlyCredentials(map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"}),
+		Create:      true,
 	})
 	var adminErr *core.AdminError
 	require.ErrorAs(t, err, &adminErr)
@@ -120,11 +121,12 @@ func TestMCPEnvGate_UpdateMissingEnvNoWrite(t *testing.T) {
 	beforePointer := env.mcpPointer(t, "demo")
 
 	_, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      "demo",
-		Transport: "stdio",
-		Command:   "other-mcp",
-		Env:       map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"},
-		IfMatch:   env.currentETagOf(t, core.ResourceMCPServer, "demo"),
+		Name:        "demo",
+		Transport:   "stdio",
+		Command:     "other-mcp",
+		Env:         map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"},
+		Credentials: envOnlyCredentials(map[string]string{mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}"}),
+		IfMatch:     env.currentETagOf(t, core.ResourceMCPServer, "demo"),
 	})
 	var adminErr *core.AdminError
 	require.ErrorAs(t, err, &adminErr)
@@ -189,11 +191,12 @@ func TestMCPEnvGate_RollbackMissingEnvNoWrite(t *testing.T) {
 	t.Setenv(mcpSecondTokenEnv, "second-token-present")
 
 	v2, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      "demo",
-		Transport: "stdio",
-		Command:   "other-mcp",
-		Env:       map[string]string{mcpSecondTokenEnv: "${" + mcpSecondTokenEnv + "}"},
-		IfMatch:   env.currentETagOf(t, core.ResourceMCPServer, "demo"),
+		Name:        "demo",
+		Transport:   "stdio",
+		Command:     "other-mcp",
+		Env:         map[string]string{mcpSecondTokenEnv: "${" + mcpSecondTokenEnv + "}"},
+		Credentials: envOnlyCredentials(map[string]string{mcpSecondTokenEnv: "${" + mcpSecondTokenEnv + "}"}),
+		IfMatch:     env.currentETagOf(t, core.ResourceMCPServer, "demo"),
 	})
 	require.NoError(t, err)
 	require.Equal(t, 2, v2.VersionNo)
@@ -276,15 +279,17 @@ func TestMCPEnvGate_ErrorOmitsValues(t *testing.T) {
 	t.Setenv(mcpTestTokenEnv, mcpEnvSecretSentinel)
 	t.Setenv(mcpAbsentTokenEnv, "")
 
+	values := map[string]string{
+		mcpTestTokenEnv:   "${" + mcpTestTokenEnv + "}",
+		mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}",
+	}
 	_, err := env.admin.UpsertMCPServer(context.Background(), resourceActor(), MCPServerRequest{
-		Name:      "demo",
-		Transport: "stdio",
-		Command:   "mcp-helper",
-		Env: map[string]string{
-			mcpTestTokenEnv:   "${" + mcpTestTokenEnv + "}",
-			mcpAbsentTokenEnv: "${" + mcpAbsentTokenEnv + "}",
-		},
-		Create: true,
+		Name:        "demo",
+		Transport:   "stdio",
+		Command:     "mcp-helper",
+		Env:         values,
+		Credentials: envOnlyCredentials(values),
+		Create:      true,
 	})
 	var adminErr *core.AdminError
 	require.ErrorAs(t, err, &adminErr)

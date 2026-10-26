@@ -18,6 +18,7 @@ import type {
 } from '../api'
 import { adminApi } from '../api-admin'
 import type { CredentialResourceKind, ResourceMapping, ScheduleDraftView } from '../api-admin'
+import { AgentReadinessPanels } from '../components/agent-readiness'
 import {
   CodeBlock,
   ConfirmDialog,
@@ -89,6 +90,15 @@ export const AgentDetailView = defineComponent({
     const profile = computed<ProfileView | null>(
       () => profiles.data.value?.find((item) => item.name === name) ?? null,
     )
+
+    // 三段面板的事实来源（设计 §2.5.1）：就绪投影、MCP 版本、服务版本与 Agent 目录。
+    // 都是只读；任一读取失败只让对应行显示「不可读」，不合并成一条假结论。
+    // Read-only inputs for the three readiness panels; a failed read marks only its
+    // own row as unavailable instead of collapsing into a single fake verdict.
+    const readiness = useLoader(() => api.getAgentReadiness(name))
+    const agentMcps = useLoader(() => api.listMcpServers())
+    const agentInfo = useLoader(() => api.getInfo())
+    const agentTree = useLoader(() => admin.getWorkspaceTree(name))
 
     // 复制 / 恢复的写响应先于注册表刷新返回：到达页在约 5 秒内有界重试。
     // 重试期间不显示「未找到」，否则刚创建或刚恢复的 Agent 会被瞬时误报；
@@ -263,7 +273,10 @@ export const AgentDetailView = defineComponent({
     // The delivery target is a channel UID from the Agent's own declarations; setting
     // one hands sending to the system and suppresses notify inside that run.
     const scheduleDeliverTo = ref('')
-    const scheduleConfig = useLoader(() => admin.getAgentConfig(name), false)
+    // 立即读取：页头的三段面板用 fields.mcp_servers 与 provider，定时页签继续复用
+    // 同一份结果，不重复请求。ensureDeliveryChoices 在已读到时仍是空操作。
+    // Loaded eagerly for the readiness panels; the schedules tab reuses the same read.
+    const scheduleConfig = useLoader(() => admin.getAgentConfig(name))
     const scheduleChannels = useLoader(() => api.listNotifyChannels(), false)
 
     interface DeliveryChoice {
@@ -274,7 +287,10 @@ export const AgentDetailView = defineComponent({
     /** 已声明、已绑定、当前对本人有资格且未删除的通知渠道；其余一律不可选。 */
     // Only declared, bound, eligible and non-deleted notify channels are offered.
     const deliveryChoices = computed<DeliveryChoice[]>(() => {
-      const references = scheduleConfig.data.value?.data.references ?? []
+      // 响应可能来自测试桩或旧服务端：多一层可选链，读不到就按"没有声明"处理，
+      // 保存仍由服务端按声明校验。
+      // One extra optional hop so a malformed payload reads as "no declarations".
+      const references = scheduleConfig.data.value?.data?.references ?? []
       const channels = new Map(
         (scheduleChannels.data.value ?? []).map((item) => [item.resource_uid, item]),
       )
@@ -1980,6 +1996,22 @@ export const AgentDetailView = defineComponent({
                   { class: 'problems' },
                   current.problems.map((problem) => h('li', { key: problem }, problem)),
                 ),
+            // 三段面板与 problems 并存（设计 §2.5.1）：problems 继续显示通用问题，
+            // 这三段只回答「离能跑还差什么」，阻断与提示分开。
+            // The three panels coexist with the generic problems list; blockers and
+            // advisories stay on separate rows.
+            h(AgentReadinessPanels, {
+              readiness: readiness.data.value,
+              readinessError: readiness.error.value,
+              config: scheduleConfig.data.value?.data ?? null,
+              configError: scheduleConfig.error.value,
+              mcps: agentMcps.data.value,
+              info: agentInfo.data.value,
+              infoError: agentInfo.error.value,
+              entries: agentTree.data.value,
+              entriesError: agentTree.error.value,
+              lifecycle: current.lifecycle.state,
+            }),
             // 模板占位符是普通文本：能通过校验、能注册，但每次运行都会在模型
             // 调用处失败。这里提前点名，而不是等用户发起会话后才看到失败。
             // The template placeholder passes validation and registers, but every run

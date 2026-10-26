@@ -165,7 +165,7 @@
       ]
     },
     {
-      "id": "008-ports-ten",
+      "id": "008-ports-eleven",
       "args": [
         "go",
         "test",
@@ -173,11 +173,11 @@
         "-count=1",
         "./internal/app",
         "-run",
-        "^TestToolListerPort_HeavyAssemblyRegistersTenTools$"
+        "^TestToolListerPort_HeavyAssemblyRegistersElevenTools$"
       ],
       "timeout_seconds": 300,
       "required_tests": [
-        "TestToolListerPort_HeavyAssemblyRegistersTenTools"
+        "TestToolListerPort_HeavyAssemblyRegistersElevenTools"
       ]
     },
     {
@@ -684,14 +684,14 @@
       ]
     },
     {
-      "id": "010-app-tools",
+      "id": "010-app-tools-eleven",
       "args": [
         "go",
         "test",
         "-json",
         "-count=1",
         "-run",
-        "^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersTenTools)$",
+        "^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersElevenTools)$",
         "./internal/app"
       ],
       "timeout_seconds": 120,
@@ -699,7 +699,7 @@
         "TestDeclaredToolNames_IncludesManageSchedule",
         "TestWebOptions_SchedulesWired",
         "TestRun_HeavyCommandSplit",
-        "TestToolListerPort_HeavyAssemblyRegistersTenTools"
+        "TestToolListerPort_HeavyAssemblyRegistersElevenTools"
       ]
     },
     {
@@ -943,7 +943,7 @@
         "008-tool-notify",
         "008-tool-notify-adapters",
         "008-app-notify",
-        "008-ports-ten"
+        "008-ports-eleven"
       ]
     },
     {
@@ -973,7 +973,7 @@
         "010-web-schedules",
         "010-web-contract-schema",
         "010-app-schedule",
-        "010-app-tools",
+        "010-app-tools-eleven",
         "010-app-crossentry",
         "010-race"
       ]
@@ -989,6 +989,7 @@
     }
   ],
   "superseded_checks": {
-    "008-ports-nine": "008-ports-ten"
+    "008-ports-nine": "008-ports-eleven",
+    "010-app-tools": "010-app-tools-eleven"
   }
 }

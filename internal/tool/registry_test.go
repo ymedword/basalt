@@ -180,3 +180,53 @@ func TestRegistry_DuplicateSemanticsUnchanged(t *testing.T) {
 	require.Contains(t, output, "tool=read_file")
 	require.Contains(t, output, "error=\"工具重名：read_file 已在注册池内\"")
 }
+
+// TestRegistry_ReplaceOwnerSwapsOnlyItsOwnSet：14D 受控重建的整组替换——撤下的是**该
+// 归属方**此前的名字，内置与其它归属方不动；重名仍按原语义拒绝（positional 错误报在
+// 对应下标），空集合把归属方的名字全部撤下。失败/重建路径全靠这条"先撤后登"，否则旧
+// 名字会以孤儿身份留在池里、声明名与实体对不上。
+// TestRegistry_ReplaceOwnerSwapsOnlyItsOwnSet pins the whole-set swap used by a
+// controlled apply: only that owner's names move, duplicates stay refused, and an empty
+// set withdraws every name the owner held.
+func TestRegistry_ReplaceOwnerSwapsOnlyItsOwnSet(t *testing.T) {
+	registry := newRegistry(t)
+
+	alphaRead := newStubTool("alpha_read")
+	alphaWrite := newStubTool("alpha_write")
+	errs := registry.ReplaceOwner("alpha", []core.Tool{alphaRead, alphaWrite})
+	require.Equal(t, []error{nil, nil}, errs)
+	require.Equal(t, []string{"alpha_read", "alpha_write"}, registry.Names())
+
+	betaRead := newStubTool("beta_read")
+	require.Equal(t, []error{nil}, registry.ReplaceOwner("beta", []core.Tool{betaRead}))
+
+	// 整组替换：alpha 的旧名字全部撤下，新名字登记，beta 不受影响。
+	alphaNext := newStubTool("alpha_next")
+	require.Equal(t, []error{nil}, registry.ReplaceOwner("alpha", []core.Tool{alphaNext}))
+	require.Equal(t, []string{"alpha_next", "beta_read"}, registry.Names(), "Names 保持排序")
+	_, ok := registry.Resolve("alpha_read")
+	require.False(t, ok, "归属方此前登记的名字必须撤下")
+	_, ok = registry.Resolve("alpha_write")
+	require.False(t, ok)
+	got, ok := registry.Resolve("beta_read")
+	require.True(t, ok)
+	require.Same(t, betaRead, got, "其它归属方的实例不得被替换")
+
+	// 重名仍拒绝并保留原注册：内置先注册即是赢家。
+	builtin := newStubTool("shared")
+	require.NoError(t, registry.Register(builtin))
+	clash := newStubTool("shared")
+	fresh := newStubTool("alpha_fresh")
+	errs = registry.ReplaceOwner("alpha", []core.Tool{clash, fresh})
+	require.Error(t, errs[0], "重名拒绝报在对应下标")
+	require.NoError(t, errs[1])
+	winner, ok := registry.Resolve("shared")
+	require.True(t, ok)
+	require.Same(t, builtin, winner, "内置赢家：整组替换不得顶掉原注册")
+	_, ok = registry.Resolve("alpha_fresh")
+	require.True(t, ok)
+
+	// 空集合 = 撤下该归属方全部名字（被拒的共享名从未登记，撤回不影响内置）。
+	require.Empty(t, registry.ReplaceOwner("alpha", nil))
+	require.Equal(t, []string{"beta_read", "shared"}, registry.Names())
+}

@@ -46,22 +46,32 @@ func hardLinkCount(path string, _ os.FileInfo) (uint64, bool) {
 	return uint64(data.NumberOfLinks), true
 }
 
-// checkKeyPermissions 读取文件与父目录的 DACL 并逐条判卷（见文件头）。
-// checkKeyPermissions validates the DACL of the key file and its parent directory.
-func checkKeyPermissions(dirPath, filePath string) error {
+// allowedKeyTrustees 返回"当前用户 + SYSTEM + Administrators"三个受托人：实例私钥
+// 目录与主密钥文件共用同一份白名单。
+// allowedKeyTrustees returns the three permitted trustees of the instance-private dir.
+func allowedKeyTrustees() ([]*windows.SID, error) {
 	userSID, err := currentProcessUserSID()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
 	if err != nil {
-		return fmt.Errorf("%w: 无法构造 SYSTEM 的 SID: %v", core.ErrCredentialUnavailable, err)
+		return nil, fmt.Errorf("%w: 无法构造 SYSTEM 的 SID: %v", core.ErrCredentialUnavailable, err)
 	}
 	adminsSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 	if err != nil {
-		return fmt.Errorf("%w: 无法构造 Administrators 的 SID: %v", core.ErrCredentialUnavailable, err)
+		return nil, fmt.Errorf("%w: 无法构造 Administrators 的 SID: %v", core.ErrCredentialUnavailable, err)
 	}
-	allowed := []*windows.SID{userSID, systemSID, adminsSID}
+	return []*windows.SID{userSID, systemSID, adminsSID}, nil
+}
+
+// checkKeyPermissions 读取文件与父目录的 DACL 并逐条判卷（见文件头）。
+// checkKeyPermissions validates the DACL of the key file and its parent directory.
+func checkKeyPermissions(dirPath, filePath string) error {
+	allowed, err := allowedKeyTrustees()
+	if err != nil {
+		return err
+	}
 	for _, target := range []struct{ path, label string }{
 		{filePath, "主密钥文件"},
 		{dirPath, "主密钥目录"},

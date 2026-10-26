@@ -12,14 +12,16 @@ package e2e
 //   - §2.5.1：R0 旧 D1 的三端点（200 / 500 / 不可达）+ 一次通知汇总，**不调度**，
 //     不计入五 Demo。
 //
-// 外部服务边界：真实 GitHub / Brave / Fetch / DBHub / Playwright 与本机之外的接收方
-// **全部未授权**。夹具因此只用三类替身，且都在同一条进程面之后：MCP 规格 helper
-// （`testutil.RunMCPHelper` 的规格文件模式，每次 `tools/call` 重读）、自建的回环 80
-// 端口接收端（出网策略只放行 scheme 默认端口），以及真实构建的 `docs-readonly`
-// （D4 的自研只读 server，不是替身）。替身替换的是**外部服务**，脚本、AGENT.md、
-// 技能、MCP 定义与调度链路都是仓库里的真货。
+// 外部服务边界：真实 GitHub / Fetch / DBHub / Playwright、DeepSeek Search API 与本机
+// 之外的接收方**全部未授权**。夹具因此只用三类替身，且都在同一条进程面之后：MCP 规格
+// helper（`testutil.RunMCPHelper` 的规格文件模式，每次 `tools/call` 重读）、自建的回环
+// 80 端口接收端（出网策略只放行 scheme 默认端口），以及真实构建的 `docs-readonly`
+// （D4 的自研只读 server，不是替身）。检索没有替身可换——`web_search` 的端点是编译期
+// 常量，所以 D5 把该域名写进禁止域名表，判的正是「检索不可达时来源表留空、不编造」。
+// 替身替换的是**外部服务**，脚本、AGENT.md、技能、MCP 定义与调度链路都是仓库里的真货。
 // The real external services are not authorized for this machine, so the fixtures stand in
-// for them only; the scripts, definitions, skills and scheduling path are the shipped ones.
+// for them only. The search endpoint has no stand-in (it is a compile-time constant), so D5
+// pins it in the denylist and judges the unreachable-search contract instead.
 
 import (
 	"encoding/json"
@@ -70,11 +72,12 @@ const (
 	// `.invalid` never resolves, so the DNS failure path is deterministic.
 	demoUnreachableURL = "http://demo-unreachable.invalid/feed"
 
-	// 四个 MCP 规格文件的变量名：`${VAR}` 占位进 mcp_servers.yaml，值由夹具注入。
-	// The four spec-file variables referenced from mcp_servers.yaml.
+	// 三个 MCP 规格文件的变量名：`${VAR}` 占位进 mcp_servers.yaml，值由夹具注入。
+	// 检索不再走 MCP（14D §2.5.4 改内置 `web_search`），所以没有 Brave 的规格位。
+	// The three spec-file variables referenced from mcp_servers.yaml; search is no longer
+	// an MCP server, so there is no Brave slot.
 	demoGitHubSpecEnv = "BASALT_E2E_GITHUB_SPEC"
 	demoDBHubSpecEnv  = "BASALT_E2E_DBHUBS_SPEC"
-	demoBraveSpecEnv  = "BASALT_E2E_BRAVE_SPEC"
 	demoFetchSpecEnv  = "BASALT_E2E_FETCH_SPEC"
 
 	// demoDeliveryTimeout 等系统代投离开 pending 的上限：发送自带 15s ctx，
@@ -883,26 +886,49 @@ type demoFixture struct {
 	recv     *demoReceiver
 	specs    map[string]string
 	env      []string
+	// installed 为 true 时五只 Demo 由**真实安装器**（`basalt demo install`）落盘，
+	// installAgent 只确认目录在、再改写夹具负责的字段——E4 判的正是这一份。
+	// installed selects the real installer as the source of the five demos; installAgent
+	// then only checks the directory and rewrites the fixture-owned fields.
+	installed bool
 }
 
-// newDemoFixture 装配夹具并落好配置、Provider 基线、渠道行与四份 MCP 规格资产。
+// newDemoFixture 装配夹具并落好配置、Provider 基线、渠道行与四份 MCP 规格资产；
+// 五只 Demo 由夹具自己复制（14B 的 `demo-fixtures` 口径）。
 // newDemoFixture assembles the fixture and lands the config, the provider baseline,
 // the channel row and the four MCP spec files.
 func newDemoFixture(t *testing.T) *demoFixture {
+	t.Helper()
+	return newDemoFixtureMode(t, false)
+}
+
+// newInstalledDemoFixture 与前者唯一的差别是五只 Demo 走 `basalt demo install`：
+// E4「夹具端到端」要判的是**装出来的那一份**能不能跑，而不是测试复制的那一份。
+// newInstalledDemoFixture differs only in installing the five demos through the real
+// command, which is exactly what E4 is about.
+func newInstalledDemoFixture(t *testing.T) *demoFixture {
+	t.Helper()
+	return newDemoFixtureMode(t, true)
+}
+
+// newDemoFixtureMode 是两个入口共用的装配：installed 决定 Demo 的来源。
+// newDemoFixtureMode is the shared assembly; installed picks where the demos come from.
+func newDemoFixtureMode(t *testing.T, installed bool) *demoFixture {
 	t.Helper()
 	repo, err := repoRoot()
 	if err != nil {
 		t.Fatalf("定位仓库根失败: %v", err)
 	}
 	f := &demoFixture{
-		t:      t,
-		h:      newHarness(t),
-		repo:   repo,
-		addr:   freeLoopbackAddr(t),
-		python: demoPython(t),
-		model:  newDemoModel(t),
-		recv:   startDemoReceiver(t),
-		specs:  map[string]string{},
+		t:         t,
+		h:         newHarness(t),
+		repo:      repo,
+		addr:      freeLoopbackAddr(t),
+		python:    demoPython(t),
+		model:     newDemoModel(t),
+		recv:      startDemoReceiver(t),
+		specs:     map[string]string{},
+		installed: installed,
 	}
 	f.docs = buildDocsReadOnlyBinary(t, f.repo)
 	f.docsRoot = filepath.Join(t.TempDir(), "docs")
@@ -911,7 +937,6 @@ func newDemoFixture(t *testing.T) *demoFixture {
 	for key, name := range map[string]string{
 		demoGitHubSpecEnv: "github",
 		demoDBHubSpecEnv:  "dbhub",
-		demoBraveSpecEnv:  "brave",
 		demoFetchSpecEnv:  "fetch",
 	} {
 		f.specs[key] = filepath.Join(specDir, name+".json")
@@ -926,7 +951,6 @@ func newDemoFixture(t *testing.T) *demoFixture {
 		"PYTHONIOENCODING=utf-8",
 		demoGitHubSpecEnv+"="+f.specs[demoGitHubSpecEnv],
 		demoDBHubSpecEnv+"="+f.specs[demoDBHubSpecEnv],
-		demoBraveSpecEnv+"="+f.specs[demoBraveSpecEnv],
 		demoFetchSpecEnv+"="+f.specs[demoFetchSpecEnv],
 	)
 	// 先跑 `basalt init`：迁移会扫 `.basalt/agents`，目录不存在时重路径装配直接失败
@@ -934,6 +958,14 @@ func newDemoFixture(t *testing.T) *demoFixture {
 	// `basalt init` runs first: the v3 migration scans the agents directory and refuses to
 	// assemble without it, exactly as an operator's first step would.
 	requireExit(t, f.h.run(t, f.env, "init"), 0, "工作区初始化")
+	if installed {
+		// 运维的第二步：把五只内置 Demo 装进工作区（模型留空、凭据不落盘）。
+		// 安装器只写素材，不写模型 / 凭据——所以后面的字段改写仍由夹具做。
+		// The operator's second step: install the five bundled demos. The installer
+		// writes assets only, so the fixture still owns the model and binding fields.
+		requireExit(t, f.h.run(t, f.env, "demo", "install"), 0, "内置 Demo 安装")
+		f.requireInstallArtifacts(t)
+	}
 	// 四家 MCP server 一次落齐：五 Demo 的定义都声明了 MCP 工具，任何一家缺定义都会让
 	// Agent 因「工具未注册」整只不注册——这不是夹具可以按需省略的部分。
 	// All four servers land at once: every demo declares MCP tools, and a missing server
@@ -943,6 +975,71 @@ func newDemoFixture(t *testing.T) *demoFixture {
 	f.h.publishBeforeSnapshot(t, f.env)
 	insertNotifyChannel(t, f.h, demoNotifyName, "webhook", "${"+demoNotifyEnvRef+"}", "演示接收端")
 	return f
+}
+
+// installedDemoNames 是安装器应落下的五只内置 Demo，顺序即清单断言顺序。
+// installedDemoNames lists the five bundled demos the installer must land.
+var installedDemoNames = []string{
+	"github-radar", "repo-digest", "biz-daily", "docs-diff", "industry-brief",
+}
+
+// requireInstallArtifacts 是 E4 相对 14B 夹具唯一新增的读数，且只读一次、必须早于任何
+// 字段改写：安装清单记满五条、五份 AGENT.md 的模型字段留空等运维填写、docs-readonly
+// 源码已导出。夹具之后改写模型 / 渠道 / 绑定，正是建立在这一份之上。
+// requireInstallArtifacts reads the installer's artifacts once, before the fixture
+// rewrites any field: the manifest, the five blank-model agent dirs and the exported
+// docs-readonly source.
+func (f *demoFixture) requireInstallArtifacts(t *testing.T) {
+	t.Helper()
+	manifestPath := filepath.Join(f.h.Root, ".basalt", "demos", "install.json")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("安装器没有留下安装清单 %s：%v", manifestPath, err)
+	}
+	var manifest struct {
+		Demos []struct {
+			Name  string `json:"name"`
+			State string `json:"state"`
+		} `json:"demos"`
+		DocsReadOnly *struct {
+			Path  string `json:"path"`
+			State string `json:"state"`
+		} `json:"docs_readonly"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("安装清单不是合法 JSON：%v\n%s", err, raw)
+	}
+	if len(manifest.Demos) != len(installedDemoNames) {
+		t.Fatalf("安装清单应记录 %d 只 Demo，实际 %d：\n%s", len(installedDemoNames), len(manifest.Demos), raw)
+	}
+	for _, name := range installedDemoNames {
+		found := false
+		for _, item := range manifest.Demos {
+			if item.Name != name {
+				continue
+			}
+			found = true
+			// 全新工作区里每条都应是新建；kept 只属于重装场景。
+			// A fresh workspace installs every demo; kept belongs to re-installs.
+			if item.State != "installed" {
+				t.Errorf("%s 的安装状态应为 installed（全新工作区），实际 %q", name, item.State)
+			}
+		}
+		if !found {
+			t.Errorf("安装清单没有记录 %s", name)
+		}
+		agentMD := filepath.Join(f.h.Root, ".basalt", "agents", name, "AGENT.md")
+		text, err := os.ReadFile(agentMD)
+		if err != nil {
+			t.Fatalf("安装器没有落下 %s/AGENT.md：%v", name, err)
+		}
+		if !strings.Contains(string(text), `  model: ""`) {
+			t.Errorf("%s 的模型字段应留空等运维填写，实际：\n%s", name, text)
+		}
+	}
+	if manifest.DocsReadOnly == nil || manifest.DocsReadOnly.Path == "" {
+		t.Error("安装清单应记录 docs-readonly 源码导出（D4 的可执行名靠它构建），实际为空")
+	}
 }
 
 // config 落 basalt.yaml：一家指向假模型的 provider、管理面认证、接收端白名单、
@@ -960,6 +1057,14 @@ func (f *demoFixture) config() string {
 	b.WriteString("  allowed_domains:\n")
 	b.WriteString("    - localhost\n")
 	b.WriteString("    - demo-unreachable.invalid\n")
+	// 禁止域名表（14D）：D5 的检索走内置 `web_search`，端点是**编译期常量**
+	// `https://api.deepseek.com/v1/tools/search`，产品没有、也不该有测试专用的端点覆盖。
+	// 把该域名钉进禁止域名表（真实产品能力，两档都先生效）让检索在**出网判定**处确定
+	// 地失败：本机不做真实计费外呼，E11 判的正是「搜索不可达时来源表留空、不编造」。
+	// The denylist pins the search host so the run fails deterministically at the policy
+	// gate; the fixture never makes a real billed search call.
+	b.WriteString("  denied_domains:\n")
+	b.WriteString("    - api.deepseek.com\n")
 	b.WriteString(adminAuthSection())
 	// 五个 Demo 在 AGENT.md 里声明了 settings.max_iterations（12 / 12 / 12 / 20 / 30），
 	// 而 Profile 只能**收紧**运维上限（契约 §6）：缺省 10 会让 D1 之外的剧本在中途
@@ -1041,9 +1146,6 @@ func (f *demoFixture) writeSpecs(t *testing.T) {
 	// text content is the real envelope shape.
 	f.writeSpec(t, demoDBHubSpecEnv, []testutil.MCPSpecTool{
 		{Name: "execute_sql", Description: "执行只读 SQL", Schema: objectSchema("sql"), Result: `{"success":true,"data":{"statements":[{"sql":"","rows":[],"count":0}],"source_id":"default"}}`},
-	})
-	f.writeSpec(t, demoBraveSpecEnv, []testutil.MCPSpecTool{
-		{Name: "brave_web_search", Description: "网页检索", Schema: objectSchema("query", "count"), Result: `{"web":{"results":[]}}`},
 	})
 	f.writeSpec(t, demoFetchSpecEnv, []testutil.MCPSpecTool{
 		{Name: "fetch", Description: "抓取网页正文", Schema: objectSchema("url"), Result: ""},
@@ -1127,9 +1229,9 @@ func (f *demoFixture) fixtureJSON(t *testing.T, rel string) string {
 }
 
 // writeMCPServers 落 mcp_servers.yaml：四家 stdio server。三家走规格 helper
-// （外部服务的替身），docs-readonly 是仓库自研的真 server。
-// writeMCPServers writes mcp_servers.yaml: three spec-helper stand-ins plus the real
-// docs-readonly server.
+// （外部服务的替身：GitHub / DBHub / Fetch），docs-readonly 是仓库自研的真 server。
+// writeMCPServers writes mcp_servers.yaml: three spec-helper stand-ins (GitHub, DBHub,
+// Fetch) plus the real docs-readonly server.
 func (f *demoFixture) writeMCPServers(t *testing.T) {
 	t.Helper()
 	docsDir := f.docsRoot
@@ -1149,7 +1251,6 @@ func (f *demoFixture) writeMCPServers(t *testing.T) {
 	b.WriteString("servers:\n")
 	b.WriteString(specServer("github", demoGitHubSpecEnv))
 	b.WriteString(specServer("dbhub", demoDBHubSpecEnv))
-	b.WriteString(specServer("brave-search", demoBraveSpecEnv))
 	b.WriteString(specServer("fetch", demoFetchSpecEnv))
 	b.WriteString("  - name: docs-readonly\n")
 	b.WriteString("    transport: stdio\n")
@@ -1265,14 +1366,27 @@ func (f *demoFixture) installAgent(t *testing.T, source string, opts demoOptions
 	t.Helper()
 	src := filepath.Join(f.repo, "examples", "daily", source)
 	dir := filepath.Join(f.h.Root, ".basalt", "agents", source)
-	copyTree(t, src, dir)
+	// 安装器路径下目录已经在了：夹具只确认它真的落下，绝不替安装器补一份。
+	// Under the installer path the directory must already be there; the fixture never
+	// fills in for the installer.
+	modelOld := "  model: 请在此填写模型名"
+	if f.installed {
+		if _, err := os.Stat(filepath.Join(dir, "AGENT.md")); err != nil {
+			t.Fatalf("安装器没有落下 %s/AGENT.md：%v", source, err)
+		}
+		// 安装器把模型清成空串（`model: ""`），等运维填写——这正是 E1 判的形态。
+		// The installer blanks the model; filling it is the operator's job.
+		modelOld = `  model: ""`
+	} else {
+		copyTree(t, src, dir)
+	}
 	path := filepath.Join(dir, "AGENT.md")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读 %s/AGENT.md 失败: %v", source, err)
 	}
 	front, body := splitDemoFrontmatter(t, string(raw))
-	front = demoReplace(t, front, "  model: 请在此填写模型名", "  model: "+demoModelName)
+	front = demoReplace(t, front, modelOld, "  model: "+demoModelName)
 	front = demoReplace(t, front, `    cron: "`+opts.cronOld+`"`,
 		`    cron: "`+cronAt(opts.cronAt)+`"`)
 	if opts.notify {
@@ -1740,23 +1854,35 @@ func d1FailureSteps(f *demoFixture, observedAt, runTag string) []demoStep {
 	}
 }
 
+// demoFixtureFor 是五套场景共用的夹具构造器：14B 用测试自带的复制（`newDemoFixture`），
+// E4 用真实安装器（`newInstalledDemoFixture`）——剧本与断言只有一份，来源不同。
+// demoFixtureFor is the fixture constructor the five scenarios share; only the source of
+// the demo directories differs between the two entry points.
+type demoFixtureFor func(*testing.T) *demoFixture
+
+// runDemoScenarios 按五只 Demo 各自的业务断言各跑一遍。
+// runDemoScenarios runs the five business scenarios once each.
+func runDemoScenarios(t *testing.T, makeFixture demoFixtureFor) {
+	t.Run("github", func(t *testing.T) { testDemoGithubRadar(t, makeFixture) })
+	t.Run("repo_digest", func(t *testing.T) { testDemoRepoDigest(t, makeFixture) })
+	t.Run("biz_daily", func(t *testing.T) { testDemoBizDaily(t, makeFixture) })
+	t.Run("docs_diff", func(t *testing.T) { testDemoDocsDiff(t, makeFixture) })
+	t.Run("industry_brief", func(t *testing.T) { testDemoIndustryBrief(t, makeFixture) })
+}
+
 // TestUS14Demos_Fixture 是五 Demo 的进程级验收（模块卡 §4.3 的 `demo-fixtures`）。
 // 五个子测试各自覆盖：自动触发与人工补跑、业务断言、空 / 无变化 / 失败三类形态、
 // 六段证据与通知计数。
 // TestUS14Demos_Fixture is the process-level acceptance of the five demos.
 func TestUS14Demos_Fixture(t *testing.T) {
-	t.Run("github", testDemoGithubRadar)
-	t.Run("repo_digest", testDemoRepoDigest)
-	t.Run("biz_daily", testDemoBizDaily)
-	t.Run("docs_diff", testDemoDocsDiff)
-	t.Run("industry_brief", testDemoIndustryBrief)
+	runDemoScenarios(t, newDemoFixture)
 }
 
 // testDemoGithubRadar 覆盖 D1：首跑无基线不出星差、第二次去重并算出差值、空输入
 // 不编造、依赖失败写失败报告。
 // testDemoGithubRadar covers D1 end to end.
-func testDemoGithubRadar(t *testing.T) {
-	f := newDemoFixture(t)
+func testDemoGithubRadar(t *testing.T, makeFixture demoFixtureFor) {
+	f := makeFixture(t)
 	f.setToolResult(t, demoGitHubSpecEnv, "search_repositories", f.d1Fixture(t))
 	modelUID, channelUID := f.modelUID(t), f.channelUID(t)
 	base := time.Now()
@@ -2176,8 +2302,8 @@ func d2DigestReport(raw string) (string, error) {
 // testDemoRepoDigest 覆盖 D2：L1 卡片只给路径（L2 / L3 由模型自取）、系统按 deliver_to
 // 代投且工具面没有 notify、自动触发与人工补跑、以及「本次无新增」这一空形态。
 // testDemoRepoDigest covers D2 end to end.
-func testDemoRepoDigest(t *testing.T) {
-	f := newDemoFixture(t)
+func testDemoRepoDigest(t *testing.T, makeFixture demoFixtureFor) {
+	f := makeFixture(t)
 	for _, source := range []string{"pull_requests", "issues", "releases"} {
 		f.setToolResult(t, demoGitHubSpecEnv, "list_"+source,
 			f.fixtureJSON(t, "examples/daily/repo-digest/fixtures/"+source+".json"))
@@ -2704,8 +2830,8 @@ func d3RequireNumbers(t *testing.T, out demoBizOut) {
 // testDemoBizDaily 覆盖 D3：固定 SQL 的全表取数、四类互斥计数、只用有效行算指标、
 // **零通知**，以及自动触发与人工补跑给出同一组数字。
 // testDemoBizDaily covers D3 end to end.
-func testDemoBizDaily(t *testing.T) {
-	f := newDemoFixture(t)
+func testDemoBizDaily(t *testing.T, makeFixture demoFixtureFor) {
+	f := makeFixture(t)
 	// 连库自检与固定 SQL 走同一个工具：DBHub 1.5.0 只读面就一个 execute_sql，
 	// 自检靠语句本身区分。返回值按实测信封包住固定行集。
 	// Both steps share execute_sql (the only tool the measured read-only face exposes).
@@ -3389,8 +3515,8 @@ func d4RequireRecords(t *testing.T, root string, report demoDocReport) {
 // testDemoDocsDiff 覆盖 D4 的三轮：首跑记基线（不判定新增）→ 无变化 → 真实增 / 改 /
 // 删后判出三集合与全量哈希；第二轮与第三轮之间清空会话消息，跨轮基线**只能**来自记忆。
 // testDemoDocsDiff covers D4 across three runs separated by a wiped session.
-func testDemoDocsDiff(t *testing.T) {
-	f := newDemoFixture(t)
+func testDemoDocsDiff(t *testing.T, makeFixture demoFixtureFor) {
+	f := makeFixture(t)
 	modelUID, channelUID := f.modelUID(t), f.channelUID(t)
 	base := time.Now()
 	auto := base.Add(15 * time.Second).In(demoCST())
@@ -3604,111 +3730,43 @@ func demoDocSection(body, begin, end string) string {
 }
 
 // ============================================================
-// D5 industry-brief：Brave + Fetch 双 MCP + 来源表 + 引用自检
+// D5 industry-brief：内置 web_search + Fetch 双通道 + 来源表 + 引用自检
 // ============================================================
 
 const (
-	// d5Now 是本轮固定的运行时钟：`--now` 同时决定 observed_at、访问时间与产物目录
-	// （runs/<t0>/），固定它才能对 brief.json 做逐字节哈希判据。
+	// d5Now 是本轮固定的运行时钟：`--now` 同时决定 observed_at 与产物目录（runs/<t0>/），
+	// 固定它才能对 brief.json 做逐字节哈希判据。
 	// d5Now pins the run clock so brief.json is byte-for-byte reproducible.
 	d5Now   = "2026-10-25T09:30:00+08:00"
 	d5Topic = "企业级 AI Agent 平台"
-	// d5BriefHash 是固定输入 + 固定时钟下 brief.json 的实测值：来源合并、正文哈希、
-	// excerpt 与访问时间任何一处变了都会变——六段证据里的「候选产物哈希」。
-	// d5BriefHash is the measured artifact hash for the shipped fixed inputs.
-	d5BriefHash = "86dbe1dd26960353a2b890aab0d4ec585d30ef3d59349923081c96847f2db170"
-	// d5SearchHash / d5PagesHash 是模型落盘的两份输入快照的实测值（固定输入重排后）。
-	// d5SearchHash / d5PagesHash are the measured input-snapshot hashes.
-	d5SearchHash = "f8d220f66969c7a7d61c240971c41adc2688dbad814742baedf2b85d1265c67e"
-	d5PagesHash  = "87d7d0251ee716cb8e89bf544d30c1506468caac3bb4f4ffc07cc46f02a8b92c"
-	// d5Message 是脚本对这份固定输入的结论句（守恒关系的自然语言版）。
-	// d5Message is the script's conclusion line for these fixed inputs.
-	d5Message = "本次检索 3 个查询，命中 10 条结果（去重 2 条），来源 8 个：已抓正文 5 个、仅线索 3 个"
-	// d5FailReason 是 404 页面的报错原文：脚本原样写进 failures 与 note。
-	// d5FailReason is the verbatim fetch error the script records.
-	d5FailReason = "HTTP 404 Not Found"
+	// d5DeniedRule / d5DeniedHost 是禁止域名表命中的拒绝原文（规则名 + 目标 host）。
+	// 判据字面量取自产品文案（internal/tool/policy.go 的 ruleDeniedDomain），不是测试自造的
+	// 话术——E11「搜索失败时来源表留空、不编造」判的正是这一条真实拒绝。
+	// d5DeniedRule / d5DeniedHost are the product's own denial literals, not test prose.
+	d5DeniedRule = "域名在禁止域名表中"
+	d5DeniedHost = "api.deepseek.com"
+	// d5EmptySearch / d5EmptyPages 是「检索不可达」下模型落盘的两份输入快照：没有一条查询
+	// 跑成，也就没有 URL 可抓。空数组不是省略——脚本要求两份输入都存在。
+	// d5EmptySearch / d5EmptyPages are the two input snapshots of the unreachable-search run.
+	d5EmptySearch = `{"queries":[]}`
+	d5EmptyPages  = `{"pages":[]}`
+	// d5SearchHash / d5PagesHash / d5BriefHash 是上面两份快照与产出 brief.json 的实测哈希
+	// （固定时钟 + 固定主题）：六段证据里的「输入快照哈希」与「候选产物哈希」。
+	// The measured hashes of the two snapshots and of brief.json.
+	d5SearchHash = "002a0e3a6fb2a71647744ca79f6ab6c7aaa5d149d4b4275986bc054ad0207aa0"
+	d5PagesHash  = "c17412ca99e15f83b085916c9b4034a957c41f56ba565a072b1aac6d65edd1bd"
+	d5BriefHash  = "ce1024997deea7f3d399ffb3b34d1e644a3fb50cd63e397f43f21a640028915e"
+	// d5Message 是脚本对零来源输入的结论句：E11「不编造」判的就是这一句由脚本给出、
+	// 模型不参与生成。
+	// d5Message is the script's conclusion line for the zero-source input.
+	d5Message = "本次未获取到来源：不产出任何结论（不编造）"
+	// d5Unreachable 是简报「失败」段对检索不可达的记法（AGENT.md 第 10 步的原文）。
+	// d5Unreachable is the failure note AGENT.md step 10 requires.
+	d5Unreachable = "检索不可达 / 数据缺失"
 )
 
-// d5Citable / d5Lead 是脚本按 URL 升序给出的两组来源：顺序本身就是判据
-// （merge_sources 只按 URL 排序，不按命中顺序）。
-// d5Citable / d5Lead are the two URL-sorted source sets the script must produce.
-var (
-	d5Citable = []string{
-		"https://example.com/analysis/audit-trail-design",
-		"https://example.com/blog/runtime-cost-controls",
-		"https://example.com/blog/self-hosted-agent-runtime",
-		"https://example.com/guides/tool-sandbox-patterns",
-		"https://example.com/reports/agent-platform-observability-2026",
-	}
-	d5Lead = []string{
-		"https://example.com/news/enterprise-agent-adoption",
-		"https://example.com/news/sandbox-incident-review",
-		"https://example.com/vendor/agent-os-comparison",
-	}
-)
-
-// demoBriefResult / demoBriefQuery / demoBriefPage 是 fixtures/ 两份固定输入的解码外形。
-// demoBriefResult, demoBriefQuery and demoBriefPage decode the two shipped fixtures.
-type demoBriefResult struct {
-	Title       string `json:"title"`
-	URL         string `json:"url"`
-	Description string `json:"description"`
-	PageAge     string `json:"page_age,omitempty"`
-}
-
-type demoBriefQuery struct {
-	Query   string            `json:"query"`
-	Results []demoBriefResult `json:"results"`
-}
-
-type demoBriefPage struct {
-	URL     string `json:"url"`
-	Status  int    `json:"status"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Error   string `json:"error"`
-}
-
-// demoBriefPlan 是一轮 D5 的全部固定输入：三条查询的结果 + 六份抓取结果。
-// demoBriefPlan is one D5 run's fixed input.
-type demoBriefPlan struct {
-	Queries []demoBriefQuery
-	Pages   []demoBriefPage
-}
-
-// demoBriefEnvelope 是 Brave 工具结果的真实外形：结果数组包在 `web` 下。
-// demoBriefEnvelope is the Brave result shape: the array sits under `web`.
-type demoBriefEnvelope struct {
-	Web struct {
-		Results []demoBriefResult `json:"results"`
-	} `json:"web"`
-}
-
-// demoBriefEnvelopeRaw 用原始字节接住结果数组——落盘时必须原样，不重新排版。
-// demoBriefEnvelopeRaw keeps each result's raw bytes so writes stay verbatim.
-type demoBriefEnvelopeRaw struct {
-	Web struct {
-		Results []json.RawMessage `json:"results"`
-	} `json:"web"`
-}
-
-// demoBriefQueryFile / demoBriefPageFile 是模型要落盘的两份输入的编码外形。
-// demoBriefQueryFile / demoBriefPageFile encode the two snapshot files the model writes.
-type demoBriefQueryFile struct {
-	Query   string            `json:"query"`
-	Results []json.RawMessage `json:"results"`
-}
-
-type demoBriefPageFile struct {
-	URL     string `json:"url"`
-	Status  int    `json:"status"`
-	Title   string `json:"title,omitempty"`
-	Content string `json:"content"`
-	Error   string `json:"error,omitempty"`
-}
-
-// demoBriefCounts 是脚本 stdout 与 brief.json 共用的计数段。
-// demoBriefCounts is the counts block shared by stdout and brief.json.
+// demoBriefCounts 是脚本 stdout 与 brief.json 共用的计数段（零来源下**全零**）。
+// demoBriefCounts is the counts block shared by stdout and brief.json; all zero here.
 type demoBriefCounts struct {
 	Queries       int `json:"queries"`
 	Results       int `json:"results"`
@@ -3720,15 +3778,15 @@ type demoBriefCounts struct {
 	MissingDates  int `json:"missing_dates"`
 }
 
-// demoBriefFailure 是一条抓取失败记录（脚本只留 URL 与原因原文）。
-// demoBriefFailure is one recorded fetch failure.
+// demoBriefFailure 是一条抓取失败记录（本判例里一条都不该有）。
+// demoBriefFailure is one recorded fetch failure; this scenario must produce none.
 type demoBriefFailure struct {
 	URL    string `json:"url"`
 	Reason string `json:"reason"`
 }
 
-// demoBriefSource 是 brief.json 里一条来源记录：`published_at` / `accessed_at` 可能为 null。
-// demoBriefSource is one brief.json source record; the two timestamps may be null.
+// demoBriefSource 是 brief.json 里一条来源记录；本判例里一条都不该有。
+// demoBriefSource is one brief.json source record; this scenario must produce none.
 type demoBriefSource struct {
 	URL         string  `json:"url"`
 	Title       string  `json:"title"`
@@ -3770,253 +3828,46 @@ type demoBriefOut struct {
 	VerifiedReport string                `json:"verified_report"`
 }
 
-// demoBriefFixture 读仓库里的两份固定输入并核对条数（3 条查询 / 6 份抓取）。
-// demoBriefFixture loads the shipped fixed inputs and checks their size.
-func demoBriefFixture(t *testing.T, f *demoFixture) demoBriefPlan {
-	t.Helper()
-	var search struct {
-		Queries []demoBriefQuery `json:"queries"`
-	}
-	if err := json.Unmarshal([]byte(f.fixtureJSON(t,
-		"examples/daily/industry-brief/fixtures/search.json")), &search); err != nil {
-		t.Fatalf("解析 D5 检索固定输入失败: %v", err)
-	}
-	var pages struct {
-		Pages []demoBriefPage `json:"pages"`
-	}
-	if err := json.Unmarshal([]byte(f.fixtureJSON(t,
-		"examples/daily/industry-brief/fixtures/pages.json")), &pages); err != nil {
-		t.Fatalf("解析 D5 抓取固定输入失败: %v", err)
-	}
-	if len(search.Queries) != 3 || len(pages.Pages) != 6 {
-		t.Fatalf("D5 固定输入 = %d 条查询 / %d 份抓取，期望 3 / 6",
-			len(search.Queries), len(pages.Pages))
-	}
-	return demoBriefPlan{Queries: search.Queries, Pages: pages.Pages}
-}
-
-// setToolResultStep 在剧本里改写 MCP 规格的当前结果（下一次 `tools/call` 生效）。
-// 剧本跑在假模型的处理 goroutine 上，不能走 t.Fatalf，错误一律交给 failf。
-// 规格文件用同目录临时文件 + rename 替换：helper 子进程每次都重读它，不能读到半截。
-// setToolResultStep rewrites one tool's result from inside a scripted turn; the
-// replacement is atomic because the helper re-reads the spec on every call.
-func (f *demoFixture) setToolResultStep(d *demoTurn, key, name, result string) {
-	d.t.Helper()
-	raw, err := os.ReadFile(f.specs[key])
-	if err != nil {
-		d.failf("读 MCP 规格 %s 失败: %v", key, err)
-	}
-	var spec testutil.MCPSpec
-	if err := json.Unmarshal(raw, &spec); err != nil {
-		d.failf("解析 MCP 规格 %s 失败: %v", key, err)
-	}
-	found := false
-	for i := range spec.Tools {
-		if spec.Tools[i].Name == name {
-			spec.Tools[i].Result = result
-			spec.Tools[i].Error = ""
-			found = true
-		}
-	}
-	if !found {
-		d.failf("MCP 规格 %s 里没有工具 %s", key, name)
-	}
-	out, err := json.Marshal(spec)
-	if err != nil {
-		d.failf("编码 MCP 规格 %s 失败: %v", key, err)
-	}
-	tmp := f.specs[key] + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
-		d.failf("写 MCP 规格 %s 失败: %v", key, err)
-	}
-	if err := os.Rename(tmp, f.specs[key]); err != nil {
-		d.failf("替换 MCP 规格 %s 失败: %v", key, err)
-	}
-}
-
-// d5BraveText 渲染一次 Brave 检索的工具结果（结果数组包在 `web` 下，与真实返回同形）。
-// d5BraveText renders one Brave tool result with the real `web.results` envelope.
-func d5BraveText(d *demoTurn, results []demoBriefResult) string {
-	d.t.Helper()
-	var env demoBriefEnvelope
-	env.Web.Results = results
-	raw, err := json.Marshal(env)
-	if err != nil {
-		d.failf("编码 Brave 结果失败: %v", err)
-	}
-	return string(raw)
-}
-
-// d5ResultsOf 从一次 Brave 结果里取出结果数组的原始字节（AGENT 第 2 步：原样保留）。
-// d5ResultsOf extracts the raw result objects from one Brave tool result.
-func d5ResultsOf(d *demoTurn, text string) []json.RawMessage {
-	d.t.Helper()
-	var env demoBriefEnvelopeRaw
-	if err := json.Unmarshal([]byte(text), &env); err != nil {
-		d.failf("Brave 工具结果不是 JSON: %v（原文 %s）", err, text)
-	}
-	if len(env.Web.Results) == 0 {
-		d.failf("Brave 工具结果里没有 web.results：%s", text)
-	}
-	return env.Web.Results
-}
-
-// d5SearchContent 组装 search.json：查询原文 + 工具给回的结果数组（原样，不重排）。
-// d5SearchContent assembles search.json from the three Brave results.
-func d5SearchContent(d *demoTurn, plan demoBriefPlan) string {
-	d.t.Helper()
-	results := d.lastToolTexts("brave_web_search", len(plan.Queries))
-	files := make([]demoBriefQueryFile, 0, len(plan.Queries))
-	for i, query := range plan.Queries {
-		files = append(files, demoBriefQueryFile{
-			Query:   query.Query,
-			Results: d5ResultsOf(d, results[i]),
-		})
-	}
-	raw, err := json.Marshal(struct {
-		Queries []demoBriefQueryFile `json:"queries"`
-	}{Queries: files})
-	if err != nil {
-		d.failf("编码 search.json 失败: %v", err)
-	}
-	return string(raw)
-}
-
-// d5PagesContent 组装 pages.json：成功页交正文原文，失败页交报错原文并留空正文。
-// 传回来的正文必须与固定输入逐字相同——它决定 brief.json 里的 content_sha256。
-// d5PagesContent assembles pages.json; the bodies must match the fixture verbatim.
-func d5PagesContent(d *demoTurn, plan demoBriefPlan) string {
-	d.t.Helper()
-	texts := d.lastToolTexts("fetch", len(plan.Pages))
-	files := make([]demoBriefPageFile, 0, len(plan.Pages))
-	for i, page := range plan.Pages {
-		entry := demoBriefPageFile{URL: page.URL, Status: page.Status, Title: page.Title}
-		if page.Status == 200 {
-			entry.Content = texts[i]
-			d.must(entry.Content == page.Content,
-				"第 %d 个 URL（%s）的正文与固定输入不一致——工具面改写了正文", i+1, page.URL)
-		} else {
-			entry.Error = texts[i]
-			d.must(entry.Error == page.Error,
-				"第 %d 个 URL（%s）的报错原文 = %q，期望 %q", i+1, page.URL, entry.Error, page.Error)
-		}
-		files = append(files, entry)
-	}
-	raw, err := json.Marshal(struct {
-		Pages []demoBriefPageFile `json:"pages"`
-	}{Pages: files})
-	if err != nil {
-		d.failf("编码 pages.json 失败: %v", err)
-	}
-	return string(raw)
-}
-
-// decodeD5Report 解 read_file 读回来的 brief.json（第 7 步：它才是来源事实源）。
-// decodeD5Report decodes the brief.json body read back by the model.
+// decodeD5Report 解 read_file 读回来的 brief.json（第 5 步：它才是来源事实源）。
+// 零来源是本判例的**预期**——所以这里判"确实一条都没有"，而不是"至少一条"。
+// decodeD5Report decodes the brief.json the model reads back; zero sources is expected.
 func decodeD5Report(d *demoTurn, body string) demoBriefReport {
 	d.t.Helper()
 	var rep demoBriefReport
 	if err := json.Unmarshal([]byte(body), &rep); err != nil {
 		d.failf("brief.json 不是预期 JSON: %v（原文 %s）", err, body)
 	}
-	if len(rep.Sources) == 0 {
-		d.failf("brief.json 没有 sources——来源表无从渲染")
+	if len(rep.Sources) != 0 || len(rep.CitableURLs) != 0 || len(rep.LeadURLs) != 0 {
+		d.failf("检索不可达时 brief.json 不得有来源（%d 条）/ 可引用（%d）/ 线索（%d）",
+			len(rep.Sources), len(rep.CitableURLs), len(rep.LeadURLs))
 	}
 	return rep
 }
 
-// demoBriefDate 把可空的发布日期写成「未确认」（AGENT 第 7 步：不得补造日期）。
-// demoBriefDate renders a nullable published_at as 未确认.
-func demoBriefDate(value *string) string {
-	if value == nil || *value == "" {
-		return "未确认"
-	}
-	return *value
-}
-
-// demoBriefPtr 把可空字符串写成占位符（线索没有访问时间）。
-// demoBriefPtr renders a nullable string with a placeholder.
-func demoBriefPtr(value *string) string {
-	if value == nil || *value == "" {
-		return "—"
-	}
-	return *value
-}
-
-// demoBriefShort 取 excerpt 的第一句（结论逐条一行，不整段复制正文）。
-// demoBriefShort takes the first sentence of the excerpt.
-func demoBriefShort(excerpt string) string {
-	runes := []rune(excerpt)
-	for i, r := range runes {
-		if r == '。' && i < 80 {
-			return string(runes[:i+1])
-		}
-	}
-	if len(runes) > 80 {
-		return string(runes[:80]) + "…"
-	}
-	return excerpt
-}
-
-// d5BriefMarkdown 按 AGENT.md 第 8 步的模板渲染简报：结论逐条带 `[来源: <url>]`，
-// 来源表只列已抓正文的、线索表只列没抓 / 抓失败的，失败段原样抄报错原文。
-// d5BriefMarkdown renders brief.md from brief.json following the AGENT.md template.
-func d5BriefMarkdown(rep demoBriefReport, plan demoBriefPlan) string {
+// d5EmptyBrief 按 AGENT.md 第 8 / 10 步的零来源分支渲染简报：只有结论句与失败说明，
+// 没有任何引用、也没有任何 URL——「不编造」在正文上同样成立。
+// d5EmptyBrief renders the zero-source brief: the script's conclusion line plus the failure
+// note, with no citation and no URL at all.
+func d5EmptyBrief(rep demoBriefReport) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# 行业简报 · %s · %s\n\n", rep.Topic, rep.ObservedAt)
 	fmt.Fprintf(&b, "结论：%s\n\n", rep.Message)
-	b.WriteString("## 结论\n")
-	for _, source := range rep.Sources {
-		if !source.Citable {
-			continue
-		}
-		fmt.Fprintf(&b, "- %s：%s [来源: %s]\n",
-			source.Title, demoBriefShort(source.Excerpt), source.URL)
-	}
-	b.WriteString("\n## 来源表\n")
-	b.WriteString("| # | URL | 标题 | 发布日期 | 访问时间 |\n")
-	b.WriteString("| --- | --- | --- | --- | --- |\n")
-	index := 0
-	for _, source := range rep.Sources {
-		if source.Status != "fetched" {
-			continue
-		}
-		index++
-		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s |\n", index, source.URL, source.Title,
-			demoBriefDate(source.PublishedAt), demoBriefPtr(source.AccessedAt))
-	}
-	b.WriteString("\n## 线索（未抓正文，仅作线索，不得作为结论来源）\n")
-	b.WriteString("| # | URL | 标题 | 发布日期 | 说明 |\n")
-	b.WriteString("| --- | --- | --- | --- | --- |\n")
-	index = 0
-	for _, source := range rep.Sources {
-		if source.Status == "fetched" {
-			continue
-		}
-		index++
-		fmt.Fprintf(&b, "| %d | %s | %s | %s | %s |\n", index, source.URL, source.Title,
-			demoBriefDate(source.PublishedAt), source.Note)
-	}
-	b.WriteString("\n## 检索覆盖\n")
-	for _, query := range plan.Queries {
-		fmt.Fprintf(&b, "- %s\n", query.Query)
-	}
-	b.WriteString("\n## 失败\n")
-	if len(rep.Failures) == 0 {
-		b.WriteString("无\n")
-		return b.String()
-	}
-	for _, failure := range rep.Failures {
-		fmt.Fprintf(&b, "- %s：%s（本次未抓到的来源只作线索）\n", failure.URL, failure.Reason)
-	}
+	b.WriteString("## 失败\n")
+	fmt.Fprintf(&b, "- %s：web_search 被安全策略拒绝（%s：%s），观测时间 %s；本次未抓取任何正文\n",
+		d5Unreachable, d5DeniedRule, d5DeniedHost, rep.ObservedAt)
 	return b.String()
 }
 
-// d5Steps 组装一次 D5 运行：三条 Brave 查询 → 落盘 search.json → 六次 Fetch（其中一条
-// 返回 404）→ 落盘 pages.json → 跑脚本 → 读 brief.json → 写 brief.md → 引用自检 →
-// 以简报正文收尾（系统按 deliver_to 代投这条正文）。
-// d5Steps builds one D5 run; the closing text is the brief the system delivers.
-func d5Steps(f *demoFixture, plan demoBriefPlan, runTag string) []demoStep {
+// d5Steps 组装一次 D5 运行：**一次**检索（禁止域名表在出网判定处拒绝，检索没有跑成）→
+// 如实落盘空检索结果 → 空抓取结果 → 跑脚本 → 读来源表 → 按零来源分支写简报 →
+// 引用自检 → 以简报正文收尾（系统按 deliver_to 代投这条正文）。
+//
+// 为什么只有一次检索：AGENT.md 第 10 步对「搜索调用失败」的要求是如实记录、不反复重试
+// （工具内部已按上限重试过）；判定在**取凭据与外呼之前**，所以这一轮既没有网络 I/O，
+// 也没有碰任何凭据材料。
+// d5Steps builds one D5 run; the single search is refused before any credential work or
+// outbound call, and the closing text is the brief the system delivers.
+func d5Steps(f *demoFixture, runTag string) []demoStep {
 	var (
 		out       demoBriefOut
 		briefBody string
@@ -4034,111 +3885,80 @@ func d5Steps(f *demoFixture, plan demoBriefPlan, runTag string) []demoStep {
 			"--topic", d5Topic,
 		}
 	}
-	steps := []demoStep{
+	return []demoStep{
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			d.requireNoTool("notify", "D5 基线 notify_mode: none，投递由系统按 deliver_to 代发")
-			f.setToolResultStep(d, demoBraveSpecEnv, "brave_web_search",
-				d5BraveText(d, plan.Queries[0].Results))
-			return demoCall(next(1, "search-1"), "brave_web_search",
-				map[string]any{"query": plan.Queries[0].Query, "count": "5"})
+			return demoCall(next(1, "search"), "web_search", map[string]any{
+				"query": d5Topic,
+				"count": 10,
+			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "brave_web_search", "第 1 步应是检索，实际 %q", name)
-			f.setToolResultStep(d, demoBraveSpecEnv, "brave_web_search",
-				d5BraveText(d, plan.Queries[1].Results))
-			return demoCall(next(2, "search-2"), "brave_web_search",
-				map[string]any{"query": plan.Queries[1].Query, "count": "5"})
-		},
-		func(d *demoTurn) testutil.FakeOpenAIResponse {
-			name, _ := d.lastTool()
-			d.must(name == "brave_web_search", "第 2 步应是检索，实际 %q", name)
-			f.setToolResultStep(d, demoBraveSpecEnv, "brave_web_search",
-				d5BraveText(d, plan.Queries[2].Results))
-			return demoCall(next(3, "search-3"), "brave_web_search",
-				map[string]any{"query": plan.Queries[2].Query, "count": "5"})
-		},
-		func(d *demoTurn) testutil.FakeOpenAIResponse {
-			name, _ := d.lastTool()
-			d.must(name == "brave_web_search", "第 3 步应是检索，实际 %q", name)
-			return demoCall(next(4, "write-search"), "write_file", map[string]any{
+			d.must(name == "web_search", "第 1 步应是内置检索，实际 %q", name)
+			text := d.lastToolText()
+			d.must(strings.Contains(text, d5DeniedRule) && strings.Contains(text, d5DeniedHost),
+				"检索结果应是禁止域名表的拒绝原文（%s：%s），实际 %q", d5DeniedRule, d5DeniedHost, text)
+			// 检索没有跑成：如实记「一条查询都没有」，不把三条查询写成"没命中"。
+			return demoCall(next(2, "write-search"), "write_file", map[string]any{
 				"path":    "search.json",
-				"content": d5SearchContent(d, plan),
+				"content": d5EmptySearch,
 			})
 		},
-	}
-	// 六次抓取：每个 URL 的结果在下一次 `tools/call` 生效；404 那条交回报错原文。
-	for i, page := range plan.Pages {
-		want := "fetch"
-		if i == 0 {
-			want = "write_file"
-		}
-		steps = append(steps, func(d *demoTurn) testutil.FakeOpenAIResponse {
-			name, _ := d.lastTool()
-			d.must(name == want, "第 %d 次抓取前的调用应是 %s，实际 %q", i+1, want, name)
-			result := page.Content
-			if page.Status != 200 {
-				result = page.Error
-			}
-			d.must(result != "", "固定输入第 %d 条（%s）没有正文 / 报错原文", i+1, page.URL)
-			f.setToolResultStep(d, demoFetchSpecEnv, "fetch", result)
-			return demoCall(next(5+i, "fetch"), "fetch", map[string]any{"url": page.URL})
-		})
-	}
-	steps = append(steps,
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "fetch", "第 6 次抓取后应是 fetch，实际 %q", name)
-			return demoCall(next(11, "write-pages"), "write_file", map[string]any{
+			d.must(name == "write_file", "第 2 步应是落盘检索结果，实际 %q", name)
+			// 没有 URL 就没有抓取；但 pages.json 仍要写——脚本要求两份输入都存在。
+			return demoCall(next(3, "write-pages"), "write_file", map[string]any{
 				"path":    "pages.json",
-				"content": d5PagesContent(d, plan),
+				"content": d5EmptyPages,
 			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "write_file", "第 11 步应是落盘抓取结果，实际 %q", name)
-			return demoCall(next(12, "build"), "shell", map[string]any{
+			d.must(name == "write_file", "第 3 步应是落盘抓取结果，实际 %q", name)
+			// 零来源是脚本的合法输出：结论句由脚本算，模型只转述。
+			return demoCall(next(4, "build"), "shell", map[string]any{
 				"executable": f.python,
 				"arguments":  scriptArgs(),
 			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "shell", "第 12 步应是脚本，实际 %q", name)
+			d.must(name == "shell", "第 4 步应是脚本，实际 %q", name)
 			out = decodeD5(d, d.lastToolText())
 			d.must(out.Report.Path != "", "脚本没有给出简报路径")
-			return demoCall(next(13, "read-brief"), "read_file",
+			return demoCall(next(5, "read-brief"), "read_file",
 				map[string]any{"path": out.Report.Path})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "read_file", "第 13 步应是读来源表，实际 %q", name)
+			d.must(name == "read_file", "第 5 步应是读来源表，实际 %q", name)
 			rep := decodeD5Report(d, d.lastToolText())
 			briefPath = filepath.ToSlash(filepath.Dir(out.Report.Path)) + "/brief.md"
-			briefBody = d5BriefMarkdown(rep, plan)
-			return demoCall(next(14, "write-brief"), "write_file", map[string]any{
+			briefBody = d5EmptyBrief(rep)
+			return demoCall(next(6, "write-brief"), "write_file", map[string]any{
 				"path":    briefPath,
 				"content": briefBody,
 			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "write_file", "第 14 步应是写简报，实际 %q", name)
-			d.must(briefBody != "" && briefPath != "", "简报正文 / 路径为空——第 14 步没渲染成功")
-			// 同一个 --now / --topic 再加 --verify-report：脚本重写同一份 brief.json 后自检引用。
+			d.must(name == "write_file", "第 6 步应是写简报，实际 %q", name)
+			d.must(briefBody != "" && briefPath != "", "简报正文 / 路径为空——第 6 步没渲染成功")
+			// 同一个 --now / --topic 再加 --verify-report：零来源下没有引用可查，自检照样要过。
 			args := append(scriptArgs(), "--verify-report", briefPath)
-			return demoCall(next(15, "verify"), "shell", map[string]any{
+			return demoCall(next(7, "verify"), "shell", map[string]any{
 				"executable": f.python,
 				"arguments":  args,
 			})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()
-			d.must(name == "shell", "第 15 步应是引用自检，实际 %q", name)
+			d.must(name == "shell", "第 7 步应是引用自检，实际 %q", name)
 			return demoFinal(briefBody)
 		},
-	)
-	return steps
+	}
 }
 
 // decodeD5 解 D5 的 shell 结果（生成轮与自检轮共用同一外形）。
@@ -4165,56 +3985,23 @@ func demoShellExit(t *testing.T, result string) int {
 	return code
 }
 
-// d5TableRows 数一张 markdown 表的数据行（去掉表头与分隔行）。
-// d5TableRows counts a markdown table's data rows.
-func d5TableRows(section string) int {
-	rows := 0
-	for _, line := range strings.Split(section, "\n") {
-		if strings.HasPrefix(line, "| ") {
-			rows++
-		}
-	}
-	if rows < 2 {
-		return 0
-	}
-	return rows - 2
-}
-
-// d5LineWith 返回第一行含 needle 的文本（表格行断言用）。
-// d5LineWith returns the first line containing the needle.
-func d5LineWith(body, needle string) string {
-	for _, line := range strings.Split(body, "\n") {
-		if strings.Contains(line, needle) {
-			return line
-		}
-	}
-	return ""
-}
-
-// d5RequireCounts 断言脚本给出的业务读数：计数、守恒关系对应的结论句与两组来源。
-// 自动与人工两轮共用同一份判据——对不上就是固定输入或脚本变了。
-// d5RequireCounts asserts the business readings shared by both D5 runs.
-func d5RequireCounts(t *testing.T, out demoBriefOut) {
+// d5RequireZeroSources 断言「检索不可达」下的业务读数：四项计数全零、结论句是脚本的
+// 零来源原文、两组来源集合为空。自动与人工两轮共用同一份判据。
+// d5RequireZeroSources asserts the business readings of the unreachable-search run.
+func d5RequireZeroSources(t *testing.T, out demoBriefOut) {
 	t.Helper()
 	if out.Agent != "industry-brief" || out.ObservedAt != d5Now || out.Topic != d5Topic {
 		t.Fatalf("脚本抬头 = %q / %q / %q，期望 industry-brief / %s / %s",
 			out.Agent, out.ObservedAt, out.Topic, d5Now, d5Topic)
 	}
-	want := demoBriefCounts{
-		Queries: 3, Results: 10, Sources: 8, Duplicates: 2,
-		Fetched: 5, Leads: 3, FetchFailures: 1, MissingDates: 1,
-	}
-	if out.Counts != want {
-		t.Fatalf("计数 = %#v，期望 %#v", out.Counts, want)
+	if out.Counts != (demoBriefCounts{}) {
+		t.Fatalf("零来源下的计数必须全零，实际 %#v", out.Counts)
 	}
 	if out.Message != d5Message {
 		t.Fatalf("结论句 = %q，期望 %q", out.Message, d5Message)
 	}
-	if !slices.Equal(out.CitableURLs, d5Citable) {
-		t.Fatalf("可引用集合 = %v，期望 %v", out.CitableURLs, d5Citable)
-	}
-	if !slices.Equal(out.LeadURLs, d5Lead) {
-		t.Fatalf("线索集合 = %v，期望 %v", out.LeadURLs, d5Lead)
+	if len(out.CitableURLs) != 0 || len(out.LeadURLs) != 0 {
+		t.Fatalf("零来源下不得有可引用 / 线索集合：%v / %v", out.CitableURLs, out.LeadURLs)
 	}
 }
 
@@ -4226,8 +4013,8 @@ type d5RunCheck struct {
 	notifyTotal  int
 }
 
-// d5RequireRun 判一轮 D5：脚本读数、两份输入快照与产物的哈希、引用自检、简报内容、
-// 六段证据与系统代投。两轮共用——它们只该在 trigger 与投递序号上不同。
+// d5RequireRun 判一轮 D5：脚本读数、两份输入快照与产物的哈希、引用自检、简报正文、
+// 六段证据（含故障读数）与系统代投。两轮共用——它们只该在 trigger 与投递序号上不同。
 // d5RequireRun asserts one D5 run end to end.
 func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCheck) {
 	t.Helper()
@@ -4241,7 +4028,7 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 		}
 	}
 	out := decodeD5(t, results[0])
-	d5RequireCounts(t, out)
+	d5RequireZeroSources(t, out)
 	if out.VerifiedReport != "" {
 		t.Fatalf("生成轮的 verified_report 应为空，实际 %q", out.VerifiedReport)
 	}
@@ -4257,6 +4044,7 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 	requireDigestOnDisk(t, dir, out.Report, "D5 简报")
 
 	// 自检轮：同输入同 --now ⇒ 重写后的 brief.json 逐字节相同；回报的是简报路径本身。
+	// 零来源下没有引用可查，自检照样通过（`counts.sources = 0` 不要求标注）。
 	verified := decodeD5(t, results[1])
 	briefPath := filepath.ToSlash(filepath.Dir(out.Report.Path)) + "/brief.md"
 	if verified.VerifiedReport != briefPath {
@@ -4271,46 +4059,33 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 	for _, want := range []string{
 		"# 行业简报 · " + d5Topic + " · " + d5Now,
 		"结论：" + d5Message,
-		"本次未抓到的来源只作线索",
+		d5Unreachable,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("简报缺少 %q：\n%s", want, body)
 		}
 	}
-	for _, url := range d5Citable {
-		if !strings.Contains(body, "[来源: "+url+"]") {
-			t.Fatalf("简报缺少对已抓来源 %s 的引用：\n%s", url, body)
-		}
+	// 「不编造」的正文判据：零来源的简报里不得出现引用标注，也不得出现任何 URL——
+	// 凭记忆补一个来源，最典型的形态就是把 URL 写进正文。
+	if strings.Contains(body, "[来源:") {
+		t.Fatalf("零来源的简报不得带引用标注：\n%s", body)
 	}
-	for _, url := range d5Lead {
-		if strings.Contains(body, "[来源: "+url+"]") {
-			t.Fatalf("简报把线索 %s 当成了引用来源：\n%s", url, body)
-		}
+	if strings.Contains(body, "http://") || strings.Contains(body, "https://") {
+		t.Fatalf("零来源的简报不得出现 URL（凭记忆补造来源的典型形态）：\n%s", body)
 	}
-	sourceSection := demoDocSection(body, "## 来源表", "## 线索（未抓正文，仅作线索，不得作为结论来源）")
-	if rows := d5TableRows(sourceSection); rows != len(d5Citable) {
-		t.Fatalf("来源表 %d 行，期望 %d 行：\n%s", rows, len(d5Citable), body)
+
+	// 检索确实走**内置工具**而不是 MCP：一次 web_search、零次 fetch（没有检索结果就没有
+	// 可抓的 URL）。那一次调用在出网判定处被拒，库里的原文就是产品文案。
+	searchCalls := demoToolResults(t, f.h, runID, "web_search")
+	if len(searchCalls) != 1 {
+		t.Fatalf("web_search 调用 %d 次，期望 1 次（检索不可达后不反复重试）", len(searchCalls))
 	}
-	leadSection := demoDocSection(body, "## 线索（未抓正文，仅作线索，不得作为结论来源）", "## 检索覆盖")
-	if rows := d5TableRows(leadSection); rows != len(d5Lead) {
-		t.Fatalf("线索表 %d 行，期望 %d 行：\n%s", rows, len(d5Lead), body)
+	if !strings.Contains(searchCalls[0], d5DeniedRule) ||
+		!strings.Contains(searchCalls[0], d5DeniedHost) {
+		t.Fatalf("web_search 的工具结果应是禁止域名表的拒绝原文，实际 %q", searchCalls[0])
 	}
-	for _, url := range append(append([]string{}, d5Citable...), d5Lead...) {
-		if !strings.Contains(body, "| "+url+" |") {
-			t.Fatalf("简报表格缺少来源 %s：\n%s", url, body)
-		}
-	}
-	// 缺发布日期的来源写「未确认」；抓取失败的来源把报错原文抄进说明列。
-	if line := d5LineWith(body, d5Lead[2]); !strings.Contains(line, "未确认") {
-		t.Fatalf("缺发布日期的来源必须写「未确认」，实际 %q", line)
-	}
-	if line := d5LineWith(body, d5Lead[0]); !strings.Contains(line, "抓取失败："+d5FailReason) {
-		t.Fatalf("抓取失败的来源说明列应抄报错原文，实际 %q", line)
-	}
-	for _, failure := range []string{d5Lead[0], d5FailReason} {
-		if !strings.Contains(body, failure) {
-			t.Fatalf("简报「失败」段缺少 %q：\n%s", failure, body)
-		}
+	if fetches := demoToolResults(t, f.h, runID, "fetch"); len(fetches) != 0 {
+		t.Fatalf("没有检索结果时不得抓取，实际 %d 次 fetch", len(fetches))
 	}
 
 	evidence := readDemoEvidence(t, f.h, runID)
@@ -4318,9 +4093,14 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 		t.Fatalf("终态 = %s / %s，期望 completed / %s",
 			evidence.Status, evidence.Trigger, check.trigger)
 	}
-	if evidence.ToolCalls != 15 {
-		t.Fatalf("工具调用 %d 次，期望 15 次（3 检索 + 6 抓取 + 3 写 + 2 脚本 + 1 读）",
-			evidence.ToolCalls)
+	// 工具调用 7 次：1 检索 + 3 写（两份输入 + 简报）+ 2 脚本 + 1 读来源表。
+	if evidence.ToolCalls != 7 {
+		t.Fatalf("工具调用 %d 次，期望 7 次（1 检索 + 3 写 + 2 脚本 + 1 读）", evidence.ToolCalls)
+	}
+	// 六段证据的「故障读数」：恰好一行失败的工具调用，就是那次被拒的检索——
+	// 工具失败不终止 Run，Run 仍以 completed 收尾。
+	if evidence.Failed != 1 {
+		t.Fatalf("失败的工具调用 %d 行，期望 1 行（被拒的检索）", evidence.Failed)
 	}
 	// D5 同样走系统代投：先等投递行落终态，再数接收端（见 waitDeliveryStatus）。
 	waitDeliveryStatus(t, f.h, runID, "sent", demoDeliveryTimeout)
@@ -4341,13 +4121,20 @@ func d5RequireRun(t *testing.T, f *demoFixture, dir, runID string, check d5RunCh
 	}
 }
 
-// testDemoIndustryBrief 覆盖 D5：Brave 三条查询 + Fetch 六次抓取（含一条 404）、
-// 跨查询去重、可引用 / 线索分野、缺日期写「未确认」、未抓正文只作线索、引用自检通过，
-// 以及自动触发与人工补跑在固定时钟下给出同一份产物。
-// testDemoIndustryBrief covers D5 end to end.
-func testDemoIndustryBrief(t *testing.T) {
-	f := newDemoFixture(t)
-	plan := demoBriefFixture(t, f)
+// testDemoIndustryBrief 覆盖 D5：检索走**内置** `web_search`（不是 MCP，也不需要
+// `BRAVE_API_KEY`），目标域名在禁止域名表里 ⇒ 判定在取凭据与外呼之前就拒绝；零来源
+// 分支如实留空、不编造来源与日期，引用自检照样通过；自动触发与人工补跑在固定时钟下
+// 给出同一份产物。
+//
+// 端点是编译期常量（`https://api.deepseek.com/v1/tools/search`），产品没有、也不该有
+// 测试专用的端点覆盖，因此本机只走**失败路径**：检索成功后的来源表、去重与引用判定由
+// 脚本单测（`make example-tests` 的 industry-brief 目录）与工具单测（`TestWebSearch_*`）
+// 覆盖，E11 判的是失败一侧——「来源表留空、不编造」。
+// testDemoIndustryBrief covers D5 end to end. The search endpoint is a compile-time
+// constant with no test seam, so the process-level run exercises the refusal path: the
+// success path lives in the script and tool unit tests.
+func testDemoIndustryBrief(t *testing.T, makeFixture demoFixtureFor) {
+	f := makeFixture(t)
 	modelUID, channelUID := f.modelUID(t), f.channelUID(t)
 	auto := time.Now().Add(15 * time.Second).In(demoCST())
 	// 与 D2 同理：D5 也是系统代投，绑定里不出现渠道。
@@ -4360,7 +4147,7 @@ func testDemoIndustryBrief(t *testing.T) {
 	})
 	const taskID = "daily-industry-brief"
 
-	f.model.beginRun(dir, d5Steps(f, plan, "a")...)
+	f.model.beginRun(dir, d5Steps(f, "a")...)
 	serve := f.serve(t)
 	defer serve.stop(t)
 
@@ -4369,7 +4156,7 @@ func testDemoIndustryBrief(t *testing.T) {
 	d5RequireRun(t, f, dir, firstRun, d5RunCheck{trigger: "cron", deliverIndex: 0, notifyTotal: 1})
 
 	// —— 第二次：人工补跑（固定输入 + 固定时钟 ⇒ 逐字节同一份产物） ——
-	f.model.beginRun(dir, d5Steps(f, plan, "b")...)
+	f.model.beginRun(dir, d5Steps(f, "b")...)
 	second := f.runScheduleNowOnce(t, taskID)
 	d5RequireRun(t, f, dir, second.RunID,
 		d5RunCheck{trigger: "manual", deliverIndex: 1, notifyTotal: 2})
@@ -4446,11 +4233,35 @@ func legacySummary(d *demoTurn) string {
 	return b.String()
 }
 
+// insertNetworkException 直接落一行访问例外（夹具；管理面写路径由 14D 自己的测试判定）。
+// 例外按 (kind, value) 唯一，理由是必填列——这里给固定夹具理由。
+// insertNetworkException seeds one exception row for fixtures; the admin write path is
+// judged by its own tests.
+func insertNetworkException(t *testing.T, h *harness, kind, value, note string) {
+	t.Helper()
+	id, err := core.NewNetworkExceptionID()
+	if err != nil {
+		t.Fatalf("生成例外标识失败: %v", err)
+	}
+	db := openDB(t, h.dbPath())
+	if _, err := db.Exec(
+		`INSERT INTO network_exceptions(exception_id, kind, value, note, revision, created_at, operation_id)
+		 VALUES (?, ?, ?, ?, 1, ?, 'op-e2e-fixture-exception')`,
+		id, kind, value, note, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("插入访问例外失败: %v", err)
+	}
+}
+
 // TestLegacyD1_HttpEndpoints 是 R0 旧 D1 的回归：`http_get` 对 200 / 500 / 不可达三种
 // 端点给出可区分的读数，再由一次 `notify` 汇总。**不调度**、不计入五 Demo。
+// 200 / 500 两个端点在回环 `:80`（受保护地址）：按 14D 基础防护，探针必须先登记
+// `ip_port` 例外，否则拒绝会发生在读写数之前（那不是本用例要判的东西）。
 // TestLegacyD1_HttpEndpoints covers the legacy D1 endpoint readings; it never schedules.
 func TestLegacyD1_HttpEndpoints(t *testing.T) {
 	f := newDemoFixture(t)
+	// 回环是受保护地址：放行需要精确到 IP:端口 的例外（无通配）。
+	insertNetworkException(t, f.h, core.NetworkExceptionKindIPPort, "127.0.0.1:80", "旧 D1 回环走查")
+	insertNetworkException(t, f.h, core.NetworkExceptionKindIPPort, "[::1]:80", "旧 D1 回环走查（IPv6）")
 	modelUID, channelUID := f.modelUID(t), f.channelUID(t)
 	dir := f.installAgent(t, "github-radar", demoOptions{
 		notify:     true,
@@ -4489,23 +4300,30 @@ func TestLegacyD1_HttpEndpoints(t *testing.T) {
 	if body := toolResultContent(t, stringValue(t, rows[0], "result_json")); !strings.Contains(body, "HTTP 200") {
 		t.Fatalf("200 端点结果应是 2xx 读数，实际 %q", body)
 	}
-	// 三档读数的判据（模块卡 §2.5.1）：4xx/5xx 与 DNS 失败都归 `external_error`，
-	// 文案分别是 `HTTP <code>：<host>` 与 `DNS 解析失败：<target>`。
-	// Both the 5xx reading and the DNS failure classify as external_error.
-	for i, want := range []struct{ fragment string }{
-		{"HTTP 500：localhost"},
-		{"DNS 解析失败"},
-	} {
-		row := rows[i+1]
-		if status, _ := row["status"].(string); status != "failed" {
-			t.Fatalf("第 %d 次 http_get 状态 = %q，期望 failed", i+2, status)
-		}
-		if kind, _ := row["error_kind"].(string); kind != "external_error" {
-			t.Fatalf("第 %d 次 http_get error_kind = %q，期望 external_error", i+2, kind)
-		}
-		message, _ := row["error_message"].(string)
-		if !strings.Contains(message, want.fragment) {
-			t.Fatalf("第 %d 次 http_get 失败原文应含 %q，实际 %q", i+2, want.fragment, message)
+	// 5xx 读数（模块卡 §2.5.1）：外部错误，文案 `HTTP <code>：<host>`。
+	if status, _ := rows[1]["status"].(string); status != "failed" {
+		t.Fatalf("第 2 次 http_get 状态 = %q，期望 failed", status)
+	}
+	if kind, _ := rows[1]["error_kind"].(string); kind != "external_error" {
+		t.Fatalf("第 2 次 http_get error_kind = %q，期望 external_error", kind)
+	}
+	if message, _ := rows[1]["error_message"].(string); !strings.Contains(message, "HTTP 500：localhost") {
+		t.Fatalf("第 2 次 http_get 失败原文应含 %q，实际 %q", "HTTP 500：localhost", message)
+	}
+	// 不可解析的域名读数（14D §2.5.4 基础防护，2026-10-26 口径）：解析发生在**建连之前**，
+	// 解析失败即拒且与被禁止不作区分，因此这一档是**策略拒绝**而不是外部错误——
+	// `sandbox_denied` + `目标域名无法解析：<target>`。三档仍可区分（200 / 5xx / 策略拒绝）。
+	// Resolution happens before dialling, so an unresolvable host is a policy refusal.
+	if status, _ := rows[2]["status"].(string); status != "failed" {
+		t.Fatalf("第 3 次 http_get 状态 = %q，期望 failed", status)
+	}
+	if kind, _ := rows[2]["error_kind"].(string); kind != "sandbox_denied" {
+		t.Fatalf("第 3 次 http_get error_kind = %q，期望 sandbox_denied（解析失败先于建连被拒）", kind)
+	}
+	message, _ := rows[2]["error_message"].(string)
+	for _, want := range []string{"目标域名无法解析", "demo-unreachable.invalid"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("第 3 次 http_get 失败原文应含 %q，实际 %q", want, message)
 		}
 	}
 	if got := f.recv.count(demoReplyPath); got != 1 {

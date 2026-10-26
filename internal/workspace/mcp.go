@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -208,10 +209,10 @@ func ParseMCPServerBlock(raw []byte) (core.MCPServerConfig, error) {
 }
 
 // RenderMCPServerEntry 渲染单条 MCP 条目为定义文件里的块式列表项：键序固定
-// `name` / `transport` / `command` / `args` / `url` / `env`，缩进两格（与
-// RenderProviderEntry 同一排版）。只输出该传输形态的字段——stdio 不出 url、http
-// 不出 command / args，避免"再读一次会不会变成另一条配置"的歧义。env 值在这里
-// 恒为精确 `${VAR}` 占位（候选校验已保证），**不**解析环境变量。
+// `name` / `transport` / `command` / `args` / `url` / `headers` / `env`，缩进两格
+// （与 RenderProviderEntry 同一排版）。只输出该传输形态的字段——stdio 不出 url /
+// headers、http 不出 command / args，避免"再读一次会不会变成另一条配置"的歧义。
+// env 与 headers 的值在这里恒为精确 `${VAR}` 占位（候选校验已保证），**不**解析环境变量。
 // RenderMCPServerEntry renders one entry in the fixed key order with the field set of
 // its transport; env values stay exact ${VAR} placeholders.
 func RenderMCPServerEntry(cfg core.MCPServerConfig) ([]byte, error) {
@@ -233,6 +234,17 @@ func RenderMCPServerEntry(cfg core.MCPServerConfig) ([]byte, error) {
 		}
 	case mcpTransportHTTP:
 		b.WriteString("    url: " + renderYAMLScalar(normalized.URL) + "\n")
+		if len(normalized.Headers) > 0 {
+			names := make([]string, 0, len(normalized.Headers))
+			for name := range normalized.Headers {
+				names = append(names, name)
+			}
+			slices.Sort(names)
+			b.WriteString("    headers:\n")
+			for _, name := range names {
+				b.WriteString("      " + renderYAMLScalar(name) + ": " + renderYAMLScalar(normalized.Headers[name]) + "\n")
+			}
+		}
 	}
 	if len(normalized.Env) > 0 {
 		keys := make([]string, 0, len(normalized.Env))
@@ -297,17 +309,42 @@ func mcpConfigFromEntry(entry map[string]any, index int) (core.MCPServerConfig, 
 			cfg.Env[key] = placeholder
 		}
 	}
+	if value, hasHeaders := entry["headers"]; hasHeaders && value != nil {
+		headerMap, ok := value.(map[string]any)
+		if !ok {
+			return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 headers 必须是映射", mcpServersFile, name)
+		}
+		cfg.Headers = make(map[string]string, len(headerMap))
+		for key, rawValue := range headerMap {
+			placeholder, ok := rawValue.(string)
+			if !ok {
+				// 与 env 同口径：错误只点名头名，**永不回显**取值——它可能正是凭证。
+				return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 headers.%s 必须是整值 ${VAR} 占位（明文凭证不得入库）", mcpServersFile, name, key)
+			}
+			cfg.Headers[key] = placeholder
+		}
+	}
 	return cfg, nil
 }
 
 // normalizeMCPServer 是文件读取与候选校验共用的语义校验核心（约束 8）：
-// 传输分支的必填 / 互斥、command 单可执行名、args 凭证、env 精确占位。
+// 传输分支的必填 / 互斥、command 单可执行名、args 凭证、env 与 headers 精确占位。
 // `index >= 0` 表示来自文件条目（错误文案带 servers[i]）；`prefix` 是错误文案的
-// 来源前缀。allowLegacy 只影响多词 command：兼容路径按首个空白拆分并 WARN，
-// 严格路径直接拒绝。
+// 来源前缀。allowLegacy 影响两处旧格式处置：多词 command 按首个空白拆分并 WARN、
+// `args` 里的 `${` 占位仍可加载；严格路径两处都直接拒绝。
 // normalizeMCPServer is the shared validation core. allowLegacy only affects a
 // multi-word command: the legacy path splits it with a WARN, the strict path
 // rejects it and points at the args field.
+// existingFile 判一条路径是否**已存在且是普通文件**：只作多词 command 的正面证据
+// （"整串是路径"还是"旧格式命令行"），不构成任何放行判据——不存在时调用方一律按路径
+// 整串保留，安全方向不变。
+// existingFile is positive-only evidence for the multi-word disambiguation; it never
+// authorizes anything, and absence keeps the whole string as one path.
+func existingFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 func normalizeMCPServer(cfg core.MCPServerConfig, index int, prefix string, allowLegacy bool) (core.MCPServerConfig, error) {
 	name := cfg.Name
 	if strings.TrimSpace(name) == "" {
@@ -337,21 +374,40 @@ func normalizeMCPServer(cfg core.MCPServerConfig, index int, prefix string, allo
 		if urlText != "" {
 			return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 是 stdio 传输，不得给出 url", prefix, name)
 		}
+		if len(cfg.Headers) > 0 {
+			return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 是 stdio 传输，不得给出 headers（只有 http 才装配请求头）", prefix, name)
+		}
 		if command == "" {
 			return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 缺少 command", prefix, name)
 		}
 		if fields := strings.Fields(command); len(fields) > 1 {
-			if len(args) > 0 {
-				return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 同时给出 args 与多词 command——参数只能保留在一处", prefix, name)
+			// 两件事同时成立：**绝对路径里的空格是路径的一部分**（设计 §4.1 第 1 步
+			// 「解压到程序目录（路径可含空格）」；子进程经 `exec.Command` 启动、不经
+			// shell，整串就是一个 argv[0]），而**旧格式「整行命令写在 command 里」的
+			// 读取兼容**（约束 8 / Operations §5.4）不能丢。
+			// 判据只认**正面证据**：整串是一个已存在的文件 → 路径；否则首词是已存在的
+			// 文件、整串不是 → 旧格式，按空白拆分（仅读取兼容面 `allowLegacy`）。其余
+			// 一律按路径整串保留——依赖缺失必须是 connected=false 的可见状态（启动隔离），
+			// 不能在定义校验阶段变成启动失败；严格面（管理面候选）因此不做任何拆分。
+			// Positive evidence only: a whole-string file is a path; a leading-token file
+			// with a non-file whole string is the legacy command line. Everything else is
+			// kept as one path, so a missing component stays a visible connected=false.
+			absolute := filepath.IsAbs(command)
+			legacyForm := !absolute ||
+				(allowLegacy && !existingFile(command) && existingFile(fields[0]))
+			if legacyForm {
+				if len(args) > 0 {
+					return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 同时给出 args 与多词 command——参数只能保留在一处", prefix, name)
+				}
+				if !allowLegacy {
+					return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 command 必须是单个可执行名——请把参数移入 args 字段", prefix, name)
+				}
+				command, args = fields[0], fields[1:]
+				// 只记可执行名与参数个数：旧格式 command 可能夹带明文凭证，**不得**整体回显。
+				// Log argv[0] and the arg count only; the legacy command may embed a credential.
+				slog.Default().Warn("MCP 旧格式多词 command 已按空白拆分——请迁移到 args 字段",
+					"file", prefix, "server", name, "command", command, "args", len(args))
 			}
-			if !allowLegacy {
-				return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 command 必须是单个可执行名——请把参数移入 args 字段", prefix, name)
-			}
-			command, args = fields[0], fields[1:]
-			// 只记可执行名与参数个数：旧格式 command 可能夹带明文凭证，**不得**整体回显。
-			// Log argv[0] and the arg count only; the legacy command may embed a credential.
-			slog.Default().Warn("MCP 旧格式多词 command 已按空白拆分——请迁移到 args 字段",
-				"file", prefix, "server", name, "command", command, "args", len(args))
 		}
 	case mcpTransportHTTP:
 		if command != "" {
@@ -368,8 +424,22 @@ func normalizeMCPServer(cfg core.MCPServerConfig, index int, prefix string, allo
 		}
 	}
 
+	headers, err := validateMCPHeaders(cfg.Headers)
+	if err != nil {
+		return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 %w", prefix, name, err)
+	}
 	if err := validateMCPArgs(args); err != nil {
 		return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 %w", prefix, name, err)
+	}
+	if !allowLegacy {
+		// args 不解析占位（14D 边界）：argv 对同机进程可读，托管值进 argv 等于泄露。
+		// 新增 / 修改条目出现 `${` 一律拒绝并点名第几个参数；存量条目仍可加载，
+		// 由诊断持续报 `args_placeholders_not_resolved`，页面标明"按字面量传给子进程"。
+		// A new or edited entry may not carry ${ in args: argv is readable by any local
+		// process. Legacy entries still load and are diagnosed instead.
+		if err := rejectMCPArgsPlaceholders(args); err != nil {
+			return core.MCPServerConfig{}, fmt.Errorf("%s 的 server %s 的 %w", prefix, name, err)
+		}
 	}
 	for key, placeholder := range cfg.Env {
 		if _, ok := core.EnvPlaceholderName(placeholder); !ok {
@@ -384,6 +454,7 @@ func normalizeMCPServer(cfg core.MCPServerConfig, index int, prefix string, allo
 		Args:      args,
 		URL:       urlText,
 		Env:       cfg.Env,
+		Headers:   headers,
 	}, nil
 }
 
@@ -447,6 +518,93 @@ func validateMCPArgs(args []string) error {
 		}
 	}
 	return nil
+}
+
+// rejectMCPArgsPlaceholders 拒绝参数里的 `${` 占位（严格路径）：参数不解析占位，
+// 密文进 argv 等于对同机进程公开。错误点名第几个参数，**不回显**参数内容。
+// rejectMCPArgsPlaceholders refuses ${ in args on the strict path, naming the index
+// and never echoing the argument.
+func rejectMCPArgsPlaceholders(args []string) error {
+	for i, arg := range args {
+		if strings.Contains(arg, "${") {
+			return fmt.Errorf("args[%d] 含 ${VAR} 占位——参数不解析占位（argv 对本机进程可读），秘密只能进 env 与 headers", i)
+		}
+	}
+	return nil
+}
+
+// mcpForbiddenHeaders 是由 HTTP 客户端接管的头：配置它们会与传输层冲突（Host 被
+// 路由覆盖、Content-Length 与实际正文不符），请求要么失败要么变成走私面，一律拒绝。
+// mcpForbiddenHeaders lists client-managed headers that would conflict with the
+// transport layer.
+var mcpForbiddenHeaders = map[string]bool{
+	"host":              true,
+	"content-length":    true,
+	"transfer-encoding": true,
+	"connection":        true,
+	"keep-alive":        true,
+	"proxy-connection":  true,
+	"upgrade":           true,
+	"trailer":           true,
+	"te":                true,
+}
+
+// validateMCPHeaders 校验并规范化 http 请求头（14D）：头名是 RFC 7230 token、不得是
+// 客户端接管的头、大小写不敏感地唯一；取值必须是**整值** `${VAR}`——不拼接、不写字面量、
+// 不做前缀推断（见下方 Bearer 装配）。错误只点名头名，**不回显**取值。
+// validateMCPHeaders checks header names as RFC 7230 tokens, rejects client-managed
+// names, enforces case-insensitive uniqueness and requires whole-value ${VAR}; error
+// text names the header and never echoes the value.
+func validateMCPHeaders(headers map[string]string) (map[string]string, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	out := make(map[string]string, len(headers))
+	seen := make(map[string]string, len(headers))
+	for _, rawName := range names {
+		name := strings.TrimSpace(rawName)
+		if !isHTTPHeaderToken(name) {
+			return nil, fmt.Errorf("headers 的头名 %q 不是合法的 HTTP 头名", name)
+		}
+		lower := strings.ToLower(name)
+		if mcpForbiddenHeaders[lower] {
+			return nil, fmt.Errorf("headers 不得配置由客户端接管的头 %s", name)
+		}
+		if first, duplicate := seen[lower]; duplicate {
+			return nil, fmt.Errorf("headers 的 %s 与 %s 只差大小写——HTTP 头名不区分大小写，只能声明一个", first, name)
+		}
+		seen[lower] = name
+		value := headers[rawName]
+		if _, ok := core.EnvPlaceholderName(value); !ok {
+			return nil, fmt.Errorf("headers 的 %s 必须是整值 ${VAR} 占位（不拼接字面量、不写明文）", name)
+		}
+		out[name] = value
+	}
+	return out, nil
+}
+
+// isHTTPHeaderToken 按 RFC 7230 的 token 规则校验头名（tchar 集合）。
+// isHTTPHeaderToken validates a header name against the RFC 7230 token rule.
+func isHTTPHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	const tchar = "!#$%&'*+-.^_`|~"
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.ContainsRune(tchar, rune(c)):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // mcpServerNames 取配置列表的 server 名序列（保持配置序——装载器规则 4/6 按声明序

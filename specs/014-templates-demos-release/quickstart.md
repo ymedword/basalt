@@ -118,7 +118,7 @@ npm --prefix website run build
 npm --prefix website run check
 ```
 
-**预期**：模板表与 `templates.mjs` 数据一致；`check-links` 接受 `examples/` 链接、拒绝私有路径；站点构建成功。README 英文四节与站点数据同源。US-13 review ② 未完成时**跳过本节并登记未验证**，不得改其交付物。
+**预期**：模板表与 `templates.mjs` 数据一致；`check-links` 接受 `examples/` 链接、拒绝私有路径；站点构建成功。README 英文四节与站点数据同源。US-13 review ② 已于 2026-10-25 解除（[run-state §1.4](./run-state.md)）；本节按 US-13 冻结面执行，收口以文件哈希核对 SC-011。
 
 ## 3. 14C：发布收尾
 
@@ -145,11 +145,13 @@ make e2e
 sh scripts/check-release-clean.sh
 ```
 
-**预期**：stage 全 check 通过（含 `mcp-*`、`demo-fixtures`、`template-quality`、`docs-readonly-tests`、`script-tests`、`e2e`、`console-*`、`website-*`、`acceptance`、`clean-checkout`）；`check-release-clean.sh` 要求 `git status --porcelain` 为空，`git archive HEAD` 到临时目录后构建 / 门禁 / e2e 全绿。全量验收另有 `make acceptance`（`make check` 的超集 + 固定评测）。
+**预期**：stage 全 check 通过（含 `mcp-*`、`demo-fixtures`、`demo-installer`、`template-quality`、`docs-readonly-tests`、`script-tests`、`e2e`、`console-*`、`website-*`、`docs-consistency`、`stage-lint`、`release-records`、`clean-checkout`；`acceptance` 包装检查已于 2026-10-25 移除，见 [run-state §2.2 #10](./run-state.md)）；`check-release-clean.sh` 要求 `git status --porcelain` 为空，`git archive HEAD` 到临时目录后构建 / 门禁 / e2e 全绿。全量验收另有 `make acceptance`（`make check` 的超集 + 固定评测），由 stage 整体运行作为严格超集执行。
 
 ### 3.3 发布证据
 
 按 [data-model.md](./data-model.md) §7 汇总：版本（`v0.1.0`，tag 由**用户**手动）/ commit / 候选路径 + SHA-256 / 七场景逐项 / Windows + Linux 双平台走查 / 依赖与许可表（Go / Node / Python / MCP 包）/ 升级·恢复演练。**双平台缺一 = 未完成**。
+
+**候选绑定（同一条 commit）**：上述每一项证据都**必须**绑定同一条发布候选 commit 与从该 commit 构建的二进制——报告 `subject` / 记录 `tested_binary_sha256` / 双平台走查 / 升级·恢复演练四者指向的 commit 与二进制哈希必须一致。旧候选上的读数按 [run-state §2.1.1](./run-state.md) 的口径**不得**代表新候选；候选 commit 变更后，受影响读数**必须**重跑或在 run-state 未验证清单显式登记为未验证。
 
 ## 4. 边界与失败语义
 

@@ -77,9 +77,47 @@ func Run(ctx context.Context, args []string) int {
 		return 1
 	}
 
+	// 新实例判定与首次配置生成**必须**排在 `cli.LoadConfig` 之前（T089）：排在后面会
+	// 出现"文件写对了、首个进程仍用缺省预算"，用户必须重启一次才生效。判定只看库与
+	// 名册，二者都不在才是新实例——存量无配置实例不得被当成新实例放宽策略。
+	// The new-instance check and first-run config generation must precede the load, or the
+	// first process would still run on defaults until restarted.
+	bootstrap := instanceBootstrapReport{}
+	if needsServeInit(args) {
+		// 配置尚未装载，日志出口还没档位可选：失败用缺省档记一次，错误绝不静默吞掉。
+		report, bootErr := ensureNewInstanceConfig(workDir, programRuntimeRoot())
+		if bootErr != nil {
+			NewLogger(nil).Error("新实例首次初始化失败", "error", bootErr)
+			return 1
+		}
+		bootstrap = report
+	}
+
 	configPath := filepath.Join(workDir, configFileName)
 	cfg, cfgErr := cli.LoadConfig(configPath, os.LookupEnv)
 	logger := bootstrapLogger(cfg, cfgErr, configPath)
+	if bootstrap.Fresh {
+		// 只报**本次真的做了什么**：配置已存在时不得声称"写了 30 轮预算"。
+		// Report only what actually happened; an existing config is never rewritten.
+		fields := []any{
+			"config_created", bootstrap.ConfigCreated,
+			"marker_created", bootstrap.MarkerCreated, "instance_id", bootstrap.InstanceID,
+		}
+		if bootstrap.ConfigCreated {
+			fields = append(fields, "budget_max_iterations", 30, "max_concurrent_runs", 32)
+		}
+		logger.Info("新实例：最小配置与实例名册已就绪", fields...)
+	}
+
+	// 出网受控拨号在**任何客户端构造之前**装配（14D §2.2.2 / D12）：此后本进程内造的
+	// 出站客户端都经它拨号——先解析、再按受保护地址段分类、只拨已校验的 IP；代理只认
+	// 显式 `http.proxy`，环境变量代理一律不读。装配失败（代理形态非法）拒绝启动：
+	// 静默直连等于"以为走了代理、实际换了一个出口"。
+	// The outbound guard is installed before any client exists; a bad proxy refuses startup.
+	if guardErr := installOutboundGuard(cfg, logger); guardErr != nil {
+		logger.Error("出网受控拨号装配失败", "error", guardErr)
+		return 1
+	}
 
 	// Store / Workspace / Agents 是装配层注入的适配器（ports.go）：命令面只认自己
 	// 声明的端口，storage / workspace 的实现细节不越过这道接缝。
@@ -108,6 +146,7 @@ func Run(ctx context.Context, args []string) int {
 		logger:           logger,
 		cfg:              cfg,
 		cfgErr:           cfgErr,
+		freshInstance:    bootstrap.Fresh,
 	}
 
 	// serve 的启动前兜底：工作区骨架先建齐再装配（技术方案 §3.1.1）。幂等——二次启动

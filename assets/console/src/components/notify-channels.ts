@@ -853,6 +853,9 @@ export const NotifyChannels = defineComponent({
         id: 'notify-url',
         noun: '地址',
         label: editingNow ? 'Webhook 地址（留空 = 保留当前地址）' : 'Webhook 地址',
+        // 与模型连接同一口径：默认加密托管，来源选择收进「高级」。
+        statusTitle: '当前地址',
+        advancedSource: true,
         mode: credentialMode.value,
         state: editingNow && target !== null ? target.credential_state : '',
         version: editingNow && target !== null ? target.credential_version : 0,

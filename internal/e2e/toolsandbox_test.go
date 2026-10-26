@@ -71,7 +71,9 @@ func testToolSandboxDenied(t *testing.T) {
 		})),
 		textResponse("四档拒绝均已收到"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	// 第 4 档判的是白名单拒绝，必须钉 strict：standard 下白名单不是外呼前置，
+	// 拒绝理由会落到基础防护（DNS / 保留地址）；新实例默认 standard（G1/G2）。
+	h.writeConfig(t, configWithProvider(fake.URL())+"execution:\n  profile: strict\n")
 	h.writeAgent(t, "demo",
 		agentFrontmatter("demo", []string{"shell", "write_file", "http_get"}), "沙箱四档演示")
 
@@ -215,7 +217,10 @@ func testToolSandboxProcessTree(t *testing.T) {
 func testToolSandboxPortRedaction(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
-	const secretURL = "https://user:secret@example.com:8443/x?token=abc123"
+	// 口令用唯一哨兵而不是裸 `secret`：14D 的实例加密日志有 `step=secrets` 字段，
+	// 裸词会把无关字段判成回显；唯一串只可能来自这条 URL（判据因此更强，不是放宽）。
+	const secretSentinel = "port-e2e-secret-4d1c"
+	const secretURL = "https://user:" + secretSentinel + "@example.com:8443/x?token=abc123"
 	fake := newFakeModel(t,
 		toolCallResponse("call-port-redact", "http_get", mustJSON(map[string]any{"url": secretURL})),
 		toolCallResponse("call-default-port", "http_get", mustJSON(map[string]any{
@@ -229,7 +234,9 @@ func testToolSandboxPortRedaction(t *testing.T) {
 		})),
 		textResponse("端口与脱敏抽验完成"),
 	)
-	h.writeConfig(t, configWithProvider(fake.URL()))
+	// ④ 判"默认端口放行到域名档"，必须钉 strict：standard 下白名单不是外呼前置，
+	// 这一档会变成真实外呼；新实例默认 standard（G1/G2）。
+	h.writeConfig(t, configWithProvider(fake.URL())+"execution:\n  profile: strict\n")
 	h.writeAgent(t, "demo", agentFrontmatter("demo", []string{"http_get"}), "端口档演示")
 
 	res := h.run(t, fixtureEnv(), "chat", "--agent", "demo", "--message", "逐档试端口")
@@ -252,7 +259,7 @@ func testToolSandboxPortRedaction(t *testing.T) {
 	requireContains(t, results[0], deniedGuidePort, "非默认端口指引")
 	requireAbsent(t, results[0], "http.allowed_domains", "端口档指引不得指向域名白名单")
 	// ③ 拒绝文案零回显 userinfo / query。
-	for _, secret := range []string{"secret", "abc123"} {
+	for _, secret := range []string{secretSentinel, "abc123"} {
 		requireAbsent(t, results[0], secret, "拒绝文案不得回显 userinfo / query")
 	}
 	// ④ 显式默认端口 `https:443` 放行到域名档（证明端口档先于域名档且默认档通过）。
@@ -267,12 +274,12 @@ func testToolSandboxPortRedaction(t *testing.T) {
 	rows := queryRows(t, db, `SELECT error_message FROM tool_invocations ORDER BY id`)
 	message, _ := rows[0]["error_message"].(string)
 	requireContains(t, message, "example.com:8443", "审计 error_message 段 2")
-	for _, secret := range []string{"secret", "abc123"} {
+	for _, secret := range []string{secretSentinel, "abc123"} {
 		requireAbsent(t, message, secret, "审计 error_message 不得回显 userinfo / query")
 	}
 
 	// 日志面零回显（stdout 与 stderr 一起扫）。
-	for _, secret := range []string{"secret", "abc123"} {
+	for _, secret := range []string{secretSentinel, "abc123"} {
 		requireAbsent(t, res.Stdout+res.Stderr, secret, "进程输出不得回显 userinfo / query")
 	}
 }

@@ -154,7 +154,7 @@ func TestStatus_ReadyWithoutConfig(t *testing.T) {
 	require.Contains(t, run.stdout, "存储：就绪")
 	require.Contains(t, run.stdout, fmt.Sprintf("schema v%d", storage.SupportedSchemaVersion),
 		"目标版本以 storage.SupportedSchemaVersion 为准（US-12 R7 起 v4）")
-	require.Contains(t, run.stdout, "29 张表", "就绪时报版本 + 表清点（v1 11 张 + v2 7 张 + v3 8 张 + v4 2 张 + v5 1 张）")
+	require.Contains(t, run.stdout, "33 张表", "就绪时报版本 + 表清点（v1 11 张 + v2 7 张 + v3 8 张 + v4 2 张 + v5 1 张 + v6 4 张）")
 	require.Contains(t, run.stdout, "汇总：全部通过")
 
 	require.NotContains(t, run.logs, "level=ERROR", "全部通过时不得有 ERROR 日志；logs=%s", run.logs)

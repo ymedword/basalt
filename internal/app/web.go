@@ -15,6 +15,7 @@ import (
 	"maps"
 	"math"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -36,10 +37,11 @@ import (
 const defaultListenAddr = "127.0.0.1:8080"
 
 // newWebServer 把重路径装配态适配成 web.Options、创建监听并构造 HTTP 服务（图 A ⑥）：
-// **先绑定监听，再用真实地址校验管理认证配置**——缺 mode / 非法 mode / token 模式
-// 缺凭据 / local_trust 绑定非回环，都在交出端口之前拒绝启动（约束 1 / 3 / 4）。
-// newWebServer binds the listener first, then validates the management-auth
-// configuration against the real address before any request can be served.
+// 密码来源先解析（首启生成不能因为端口被占而丢失），**再绑定监听、用真实地址校验管理
+// 认证配置**——缺 mode / 非法 mode / token 模式缺凭据 / local_trust 绑定非回环，都在
+// 交出端口之前拒绝启动（约束 1 / 3 / 4）。
+// newWebServer resolves the token source first, then binds the listener and validates
+// the management-auth configuration against the real address before serving.
 //
 // 配置一律读 `rt.cfg`（newRuntime 解出的**生效值**，绝不为 nil）——**不读**可能为 nil
 // 的 `App.cfg`：配置缺失时重路径用的是 `&cli.Config{}`，两处读法的差异正是"配置了
@@ -50,6 +52,20 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 	if rt == nil {
 		return nil, fmt.Errorf("HTTP 面装配失败：重路径运行期为空")
 	}
+	// 访问密码的第三个来源（T090）在**绑定监听之前**解析：`mode: token` 且配置没给
+	// token 时，从实例私有目录的 admin-token 读取，只有新实例首次启动才生成。首启生成
+	// 不能等到端口就绪——端口被占（另一个 HTTP 服务、上一次没退干净的实例）会让首次
+	// 启动失败，而重试时库与名册都已存在、不再算新实例，密码就再也没有机会生成。
+	// 三处都没有时**不**回落 local_trust——校验失败即拒绝启动，与配置缺 token 同一处
+	// 拒绝点（校验本身仍在绑定之后，用真实地址判 Host 三元组）。
+	// The token file is resolved before binding: a first start that loses the port must
+	// not lose the one chance to mint the password, or the retry has no new-instance
+	// verdict left and only a hand-written file can recover it.
+	token, tokenErr := a.resolveAdminToken(rt.cfg)
+	if tokenErr != nil {
+		return nil, fmt.Errorf("管理认证配置校验失败: %w", tokenErr)
+	}
+
 	addr := listenAddr(rt.cfg)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -63,6 +79,9 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 	opts.Listener = ln
 
 	authCfg := adminAuthConfig(rt.cfg, bound)
+	if token.Source != "" {
+		authCfg.Token = token.Token
+	}
 	if err := web.ValidateAdminAuth(authCfg, []string{bound}); err != nil {
 		closeListener(logger, ln)
 		return nil, fmt.Errorf("管理认证配置校验失败: %w", err)
@@ -79,6 +98,9 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 		closeListener(logger, ln)
 		return nil, err
 	}
+	// 生成提示放在服务构造成功之后：只有真的能开服务，才值得把密码出示一次。
+	// The one-time hint comes after the server exists, so a failed start prints nothing.
+	announceAdminToken(os.Stdout, token, isInteractiveWriter(os.Stdout))
 	return srv, nil
 }
 
@@ -176,9 +198,13 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 	opts := web.Options{
 		Addr:            cfg.HTTP.Addr,
 		MaxRequestBytes: cfg.HTTP.MaxRequestBytes,
-		RunBudget:       webBudget(cfg),
-		Version:         Version,
-		MemoryBackend:   memoryBackendName(cfg),
+		// 手动补跑与定时触发共用同一条执行链，预算取同一个常量（scheduleRunTimeout）：
+		// 两处写死不同数字时，同一个任务定时能跑完、手动点一下却在 60s 处被截断。
+		// The manual re-run shares the scheduled budget through one constant.
+		ScheduleRunTimeout: scheduleRunTimeout,
+		RunBudget:          webBudget(cfg),
+		Version:            Version,
+		MemoryBackend:      memoryBackendName(cfg),
 		// MCP 连接数取**真实连接结果**（约束 25）：配置了几个与连上几个是两回事。
 		// The connected count comes from the actual connections, not from configuration.
 		MCPConnected: len(rt.mcpConns),
@@ -192,7 +218,7 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		Runs:     NewRunService(rt.service, rt.runs),
 		Sessions: rt.sessions,
 		Agents:   agentProfilesPort{registry: rt.agents, entries: rt.entries},
-		Tools:    newToolCatalogPort(rt.registry, rt.mcpConns),
+		Tools:    newToolCatalogPort(rt.registry, rt.mcpRT),
 		Memory:   rt.mem,
 		// Schedules 在重路径中**恒非 nil**（约束 21）：chat / tool 只是不 Start，
 		// 调度器本身始终构造，四个 /schedules 端点因此不会因模式而缺端口。
@@ -209,6 +235,25 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 实例，保存成功即热生效；`http.allowed_domains` 因此不再只来源于配置投影。
 		// The managed allowlist port is the very instance the live policy uses.
 		NetworkAllowlist: rt.networkAllowlist,
+		// 禁止域名表（14D）：同一张表的第二行、同一套条件写；页面 `denied_domains`
+		// 与 `network_denylist` 读它，保存成功即对下一次判定生效。
+		// The denylist row and its conditional write share the same implementation.
+		NetworkDenylist: rt.networkDenylist,
+		// 访问例外（14D）：列表与集合 ETag、创建 / 删除。服务与守门器快照同源，
+		// 删除后下一次拨号即失效。
+		// The exception set is shared with the dial guard; deletion binds immediately.
+		NetworkExceptions: rt.networkExceptions,
+		// 执行档位端口（14D D-03）：与运行期策略实例同源，`PUT /execution-policy`
+		// 保存成功即改下一次判定；读端点另外给出两组待确认项（只读扫描）。
+		// The profile port shares the live policy instance; the read endpoint also
+		// carries the two read-only pending axes.
+		ExecutionPolicy: rt.execPolicy,
+		// 实例加密端口（14D / E9）：投影**启动 `Ensure` 判定表本身**的实例——页面报出
+		// 的状态就是下一次启动会采取的动作。这里刻意不接命令面的 `Status`（未配置主
+		// 密钥路径时它短路成错误），恢复态因此是状态而**不是**读失败。
+		// The instance-encryption port projects the very decision table Ensure uses; the
+		// command-surface Status is not reused because it short-circuits to an error.
+		InstanceSecrets: instanceSecretsPortOf(rt.instanceSecrets),
 		// 管理读面 = 发送读面 + 属主名 / 凭据状态 / 条件 ETag 三件事（notify_read.go）。
 		// 写后下一发即可见：两者共用同一个零缓存仓储实例。
 		// The admin read face wraps the very same send-path repository.
@@ -223,6 +268,15 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 也不依赖 Node——单二进制复制到目标机后页面照常打开。
 		// The console artifact is embedded at compile time; no disk or Node at runtime.
 		Console: assets.Console(),
+		// 实例上限投影（14D / E8）：就绪视图要把 Agent 声明的 `settings.max_iterations`
+		// 与**生效上限**对照、把计划数与会**实际拦截**的并发上限对照。0 值原样交给
+		// `web.NewServer` 补 core 的同一对缺省常量——装配层**不**在这里再抄一份 32 / 10。
+		// Instance limits are projected as configured; the zero value is normalized by
+		// web.NewServer against the same core defaults the run path uses.
+		InstanceLimits: web.InstanceLimits{
+			MaxIterations:     cfg.Budget.MaxIterations,
+			MaxConcurrentRuns: cfg.Server.MaxConcurrentRuns,
+		},
 	}
 	a.wireManagementPorts(&opts, rt)
 	wireWritePorts(&opts, rt)
@@ -457,15 +511,21 @@ func (p resourceAdminPort) UpsertModelConnection(ctx context.Context, actor core
 func (p resourceAdminPort) UpsertMCPServer(ctx context.Context, actor core.Actor,
 	write web.MCPServerWrite, ifMatch string,
 ) (web.McpServerView, error) {
+	credentials := make([]MCPCredentialRequest, len(write.Credentials))
+	for i, decl := range write.Credentials {
+		credentials[i] = MCPCredentialRequest{Key: decl.Key, Mode: decl.Mode, Value: decl.Value}
+	}
 	version, err := p.admin.UpsertMCPServer(ctx, actor, MCPServerRequest{
-		Name:      write.Name,
-		Transport: write.Transport,
-		Command:   write.Command,
-		Args:      write.Args,
-		URL:       write.URL,
-		Env:       write.Env,
-		Create:    ifMatch == "",
-		IfMatch:   ifMatch,
+		Name:        write.Name,
+		Transport:   write.Transport,
+		Command:     write.Command,
+		Args:        write.Args,
+		URL:         write.URL,
+		Env:         write.Env,
+		Headers:     write.Headers,
+		Credentials: credentials,
+		Create:      ifMatch == "",
+		IfMatch:     ifMatch,
 	})
 	if err != nil {
 		return web.McpServerView{}, err
@@ -629,6 +689,14 @@ func (p resourceAdminPort) TestMCPServer(ctx context.Context, actor core.Actor, 
 	return p.admin.TestMCPServer(ctx, actor, name)
 }
 
+// ApplyMCPServer 转调受控发布（14D）；预写、冻结、预检与回滚都在编排层，本层只转手。
+// ApplyMCPServer forwards the controlled apply; every guarantee lives in the orchestrator.
+func (p resourceAdminPort) ApplyMCPServer(ctx context.Context, actor core.Actor, name, ifMatch string,
+	versionID int64,
+) (core.MCPServerApplyResult, error) {
+	return p.admin.ApplyMCPServer(ctx, actor, name, ifMatch, versionID)
+}
+
 // DiagnoseMCPServer 转调只读诊断（US-14 D-02）；本层不做任何补写或缓存——诊断的
 // "零进程、零操作行"由编排层保证，适配器只转手。
 // DiagnoseMCPServer forwards the read-only diagnosis untouched.
@@ -774,6 +842,7 @@ func (p resourceStatePort) RevokeCredential(ctx context.Context, actor core.Acto
 		Kind:        kind,
 		Name:        name,
 		ResourceUID: write.ResourceUID,
+		BindingKey:  write.BindingKey,
 		Confirm:     write.Confirm,
 		IfMatch:     ifMatch,
 	})
@@ -782,6 +851,7 @@ func (p resourceStatePort) RevokeCredential(ctx context.Context, actor core.Acto
 	}
 	return web.CredentialRevokeView{
 		ResourceUID:     string(out.ResourceUID),
+		BindingKey:      out.BindingKey,
 		CredentialRef:   out.CredentialID,
 		CredentialState: string(core.CredentialIdentityRevoked),
 		RevokedVersions: out.RevokedVersions,
@@ -865,6 +935,69 @@ func (p workspaceBrowsePort) File(ctx context.Context, path string) (web.Workspa
 		Size:      file.Size,
 		Truncated: false,
 	}, nil
+}
+
+// instanceSecretsPort 把 `*InstanceSecretsService` 适配成 `web.InstanceSecretsService`
+// （14D / E9）：只做形状投影，判定的语义全在服务层。
+//
+// 两处不是手误、而是**必须**的差异：
+//   - `CanInitialize` 直接取服务层的完整前置条件（判定允许 **且** 已有路径或能在
+//     本次动作里建立身份与路径）。存量无名册实例因此**可以**从页面初始化；显式
+//     `auto_init: false` 的纯 env 部署仍是 false，处理器在**预写之前**给出 409。
+//   - `Init` 的第二个返回值取 `SecretsInitError.OperationID`：只有预写之后的失败才
+//     带标识，处理器据此决定 500 是否携带 `data.operation_id`；预写之前的拒绝
+//     （ErrCredentialUnavailable 等）保持空串，因而不会出现"有标识却没有操作行"。
+//
+// instanceSecretsPort is shape-only. CanInitialize is the service's full precondition,
+// and the Init operation id comes only from SecretsInitError.
+type instanceSecretsPort struct {
+	service *InstanceSecretsService
+}
+
+// 编译期断言：两方法一旦与端口形状对不上，在这里先红。
+// Compile-time assertion: both methods must match the consumer-side port.
+var _ web.InstanceSecretsService = instanceSecretsPort{}
+
+// instanceSecretsPortOf 把可空的装配产物投影成端口：服务缺席时返回 nil 接口
+// （不是带 nil 指针的非 nil 接口——那会让处理器的缺端口判定失效）。
+// instanceSecretsPortOf returns a nil interface when the service is absent.
+func instanceSecretsPortOf(service *InstanceSecretsService) web.InstanceSecretsService {
+	if service == nil {
+		return nil
+	}
+	return instanceSecretsPort{service: service}
+}
+
+// Status 投影判定结论、公开密钥身份与三件只读事实；不含指纹与密钥材料。
+// Status projects the verdict and the public identity summary, never key material.
+func (p instanceSecretsPort) Status(ctx context.Context) (web.InstanceSecretsStatus, error) {
+	status, err := p.service.Status(ctx)
+	if err != nil {
+		return web.InstanceSecretsStatus{}, err
+	}
+	return web.InstanceSecretsStatus{
+		State:         string(status.Decision.State),
+		Reason:        string(status.Decision.Reason),
+		KeyID:         status.KeyID,
+		KeyFile:       status.KeyFile,
+		InitializedAt: status.InitializedAt,
+		CanInitialize: status.CanInitialize,
+	}, nil
+}
+
+// Init 转调显式初始化，并把预写之后的失败标识交还 web 层。
+// Init forwards the explicit initialization and surfaces the post-pre-write id.
+func (p instanceSecretsPort) Init(ctx context.Context, actor core.Actor) (string, error) {
+	// 成功时标识不需要回传：响应体是重新读出的投影，操作标识只服务于失败查证。
+	// The operation id only matters on failure; success returns the re-read projection.
+	if _, err := p.service.Init(ctx, actor); err != nil {
+		var initErr *SecretsInitError
+		if errors.As(err, &initErr) {
+			return initErr.OperationID, initErr
+		}
+		return "", err
+	}
+	return "", nil
 }
 
 // wireManagementPorts 装配管理面七个端口（模块卡 §3.1.15 的 webOptions 行）：Registry /
@@ -1191,26 +1324,35 @@ func (p agentProfilesPort) Profiles() []core.AgentEntry {
 
 // toolCatalogPort 把注册池与 MCP 连接结果适配成工具清单（约束 27）：顺序 =
 // `Registry.Names()`（排序序），来源判定 builtin 集 → builtin、MCP 连接池 → mcp、
-// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（十件内置的唯一声明），
+// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（十一件内置的唯一声明），
 // 另写一份名单必然漂移。
-// toolCatalogPort adapts the registry plus MCP connections; the builtin set is the
-// single declared name set, so a second hand-maintained list can never drift.
+// 14D 起来源优先取**运行期来源表**（受控重建会整组换掉某个 server 的工具名，装配期
+// 快照会过期）；没有来源表时退回连接快照扫描——两条路径的判定口径一致。
+// The source is read from the live disposition table (an apply rewrites it); the static
+// connection scan remains the fallback for fixtures without a source table.
 type toolCatalogPort struct {
-	registry *tool.Registry
-	mcp      []tool.MCPConnection
-	builtin  map[string]struct{}
+	registry     *tool.Registry
+	mcp          []tool.MCPConnection
+	dispositions *mcpDispositionTable
+	builtin      map[string]struct{}
 }
 
-// newToolCatalogPort 从注册池与连接结果构建清单端口；builtin 集在构造期一次成型
-// （数据来源是本包的声明名集，不读注册池——"注册了"不等于"内置"）。
+// newToolCatalogPort 从注册池与运行期句柄构建清单端口；builtin 集在构造期一次成型
+// （数据来源是本包的声明名集，不读注册池——"注册了"不等于"内置"）。runtime 可为
+// nil（只读装配的用例），此时来源退回连接快照。
 // newToolCatalogPort builds the catalog port; the builtin set comes from the declared
 // names, not from the registry (registered is not the same as builtin).
-func newToolCatalogPort(registry *tool.Registry, mcp []tool.MCPConnection) toolCatalogPort {
+func newToolCatalogPort(registry *tool.Registry, runtime *mcpRuntime) toolCatalogPort {
 	builtin := make(map[string]struct{}, len(declaredToolNames))
 	for _, name := range declaredToolNames {
 		builtin[name] = struct{}{}
 	}
-	return toolCatalogPort{registry: registry, mcp: mcp, builtin: builtin}
+	port := toolCatalogPort{registry: registry, builtin: builtin}
+	if runtime != nil {
+		port.mcp = runtime.conns
+		port.dispositions = runtime.dispositions
+	}
+	return port
 }
 
 // Tools 按注册表顺序投影工具清单，来源按约束 27 分类。
@@ -1219,22 +1361,33 @@ func (p toolCatalogPort) Tools() []web.ToolDescriptor {
 	if p.registry == nil {
 		return []web.ToolDescriptor{}
 	}
-	mcpNames := make(map[string]struct{})
-	for _, conn := range p.mcp {
-		for _, t := range conn.Tools {
-			mcpNames[t.Name()] = struct{}{}
-		}
-	}
 	specs := p.registry.Specs(p.registry.Names())
 	out := make([]web.ToolDescriptor, 0, len(specs))
 	for _, spec := range specs {
-		source := "code"
-		if _, ok := p.builtin[spec.Name]; ok {
-			source = "builtin"
-		} else if _, ok := mcpNames[spec.Name]; ok {
-			source = "mcp"
-		}
-		out = append(out, web.ToolDescriptor{Spec: spec, Source: source})
+		out = append(out, web.ToolDescriptor{Spec: spec, Source: p.source(spec.Name)})
 	}
 	return out
+}
+
+// source 判一个已注册工具名的来源：内置声明集优先（内置赢家即使在来源表里被同名
+// MCP 工具标注过也必须显示 builtin），其次来源表的赢家，最后退回连接快照扫描。
+// source decides one name's source; the declared builtin set wins outright.
+func (p toolCatalogPort) source(name string) string {
+	if _, ok := p.builtin[name]; ok {
+		return "builtin"
+	}
+	if p.dispositions != nil {
+		if winner := p.dispositions.source(name); winner != "" && winner != mcpDispositionBuiltin {
+			return "mcp"
+		}
+		return "code"
+	}
+	for _, conn := range p.mcp {
+		for _, t := range conn.Tools {
+			if t.Name() == name {
+				return "mcp"
+			}
+		}
+	}
+	return "code"
 }

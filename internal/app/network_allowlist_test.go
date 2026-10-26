@@ -141,7 +141,7 @@ func TestNetworkAllowlist_SeedOverLimitRefusesStart(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid network domain allowlist seed")
 
-	_, exists, loadErr := env.store.Load(context.Background())
+	_, exists, loadErr := env.store.Load(context.Background(), core.PolicyScopeHTTPDomains)
 	require.NoError(t, loadErr)
 	require.False(t, exists, "拒绝启动时不得留下半份种子")
 }
@@ -247,7 +247,7 @@ type failingPolicyStore struct {
 	err error
 }
 
-func (s failingPolicyStore) Update(context.Context, []string, int64, string, string, time.Time,
+func (s failingPolicyStore) Update(context.Context, string, []string, int64, string, string, time.Time,
 ) (core.NetworkDomainPolicy, error) {
 	return core.NetworkDomainPolicy{}, s.err
 }
@@ -298,7 +298,7 @@ func TestNetworkAllowlist_RevisionConflictReloadsAuthoritativeRow(t *testing.T) 
 	stale := core.NetworkDomainETag(env.service.Current())
 
 	// 模拟另一进程先写：数据库推进到 revision 2，本进程快照仍停在 1。
-	other, err := env.store.Update(context.Background(), []string{"other.example.com"},
+	other, err := env.store.Update(context.Background(), core.PolicyScopeHTTPDomains, []string{"other.example.com"},
 		1, "op-other", "other-process", allowlistClock())
 	require.NoError(t, err)
 	require.Equal(t, int64(2), other.Revision)

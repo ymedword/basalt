@@ -177,3 +177,64 @@
 - 发布 e2e 与示例测试不进入既有门禁与 CI；它们是发布前的人工触发步骤。
 - 首批目录只收录六条 stdio 配方；远程认证、凭据 DSN 与 `args` 占位符解析都留到后续 US，不作为本 US 的隐含期望。
 - 管理台新增页面与示例内文档用中文；根 `README` 英文单语、官网双语结构不变——本 US 不引入界面国际化层。
+
+---
+
+## 14D 增量：开箱即用增强（2026-10-26 用户显式范围调整；只追加）
+
+**批准依据**：用户 2026-10-26 消息「四、US 归属：采用 US-14 增量交付，不打乱后续编号」原文——「这是我对 US-14 范围的显式增量调整，请记录批准依据，并同步修正草案 §8。原 US-14 的基线、候选、验收报告和历史结论保留。14D 单独记录新增范围、任务、验收和提交，不把新能力追认为旧验收内容。」设计基线见 `docs/us/us-draft-openbox.md`（1157 行，sha256 `39d9b048a1cd992152a1b6553d76febebdee06de91fecf642b284858df11cc60`），宪法依据为 v4.0.0（2026-10-26 修订第 6 / 14 条，见 `run-state.md` §6.1）。
+
+**裁决顺序**：本节与上文冲突时**仅限 14D 增量范围**以本节为准。原 14A / 14B / 14C 的范围、判据面、任务勾选与历史证据**不变**；FR-025 的「零 schema 迁移」由 FR-031 取代，其余子句（零新增 Go 依赖坐标、零新增 npm 生产依赖、不动既有门禁与 CI、不改既有 stage）继续有效；FR-014 中 D5 的「Brave + Fetch 双 MCP」搜索来源由 **FR-045** 取代（2026-10-26 用户裁决），14B 已交付的 D5 证据保留为历史，不追认成 14D 验收。
+
+### User Story 4 - 干净安装后开箱即用 (Priority: P1)
+
+管理员解压完整包、首次 `serve` 即得到可登录的实例：主密钥自动初始化、最小可用 `basalt.yaml` 生成并在**本次进程**生效、访问密码可从实例私有文件读取；五个内置 Agent 已在目录中但默认停用，免凭据的 MCP 已发布，缺凭据的那条只显示待补项而不阻断启动。
+
+**Independent Test**: 在空目录用候选二进制首次 `serve`，验证密钥记录与文件、`key_id`、权限、`budget.max_iterations ≥ 30`、登录可用、五 Agent `disabled`、两个免凭据 MCP 已发布；再验证存量实例不被放宽（A1–A12、E1–E10、F1–F9）。
+
+### User Story 5 - 管理员受控管理 MCP 凭据与执行环境 (Priority: P2)
+
+管理员在页面托管 MCP 凭据（按 `binding_key` 独立版本、可撤销且撤销即刻生效）、对单个 server 触发受控重建并观察在途调用排空；执行环境在标准档与严格档之间切换，禁止域名与内网例外均为受审计的管理动作。
+
+**Independent Test**: 写入 / 替换 / 撤销凭据并断言无明文、不回落 env；`apply` 只替换目标 server 且 `superseded` / 失败均不改 `applied`；两档基础防护一致、授权范围不同；禁止域名保存后下一次判定即生效（B1–B8、C1–C8、D1–D12）。
+
+### Functional Requirements（14D，续编号）
+
+- **FR-027**: 新建实例（`.basalt/basalt.db` 与 `.basalt/instance.json` 均不存在）首次启动 MUST 自动初始化主密钥并写 `instance_secrets` 的 `master_key` 记录；存量实例 MUST NOT 自动初始化，只能经显式初始化端点或 `basalt secrets init`。密钥已存在时 MUST NOT 覆盖；存量密钥缺失 / 损坏 / `key_id` 不匹配 MUST 进入 `recovery_required` 并返回 `SECRETS_RECOVERY_REQUIRED`，MUST NOT 生成替代密钥。
+- **FR-028**: 密钥发布 MUST 先建受限目录并**读回校验通过后才创建任何文件**（Windows 用 `CreateDirectory` + `SECURITY_ATTRIBUTES` 使 DACL 在创建时生效）；发布 MUST 不覆盖既有文件（`O_EXCL` / `os.Link`）；初始化中断后 MUST 只清理能由 `os.SameFile` 证明来源的临时链接，无法证明时进入恢复态且 MUST NOT 删除既有文件、MUST NOT 放宽 `nlink > 1` 检查（A10 / A11 / A12）。
+- **FR-029**: 仅当目标是**真正的新实例**且 `basalt.yaml` 不存在时，系统 MUST 生成最小可用配置（含 `budget.max_iterations ≥ 30`）；文件已存在时 MUST 一字节不改；生成的配置 MUST 在**本次启动**生效（生成早于配置装载）；已有数据库但无配置文件的实例 MUST NOT 生成配置（E7 / E9 / E10）。
+- **FR-030**: `http.admin_auth.mode: token` 且省略 `token` 时 MUST 从实例私有目录的 `admin-token` 读取（与主密钥**分文件**、同一受限目录、同级权限校验）；三处来源（配置占位 / 环境变量 / 密码文件）全缺时 MUST 启动失败并点名缺失项，MUST NOT 回落 `local_trust`；非交互运行 MUST 只输出路径不输出值，交互式 ONLY 首次显示一次；仓库与文档 MUST NOT 含任何默认访问密码（F5–F9）。该密码是**实例引导凭据**，不属于宪法第 1 条「资源凭据两种模式」的管辖对象；它仍受 F5–F9 的限权、不落库、不进日志与诊断导出的约束。
+- **FR-031**: schema MUST 升级到 v6（迁移 `0006_execution_policy_and_mcp_credentials.sql`，只追加）：`credentials` 重建（`owner_kind` 加 `mcp_server`、新增 `binding_key`、唯一约束改三元组）、新建 `execution_policy` / `network_exceptions` / `instance_secrets` / `mcp_credential_sources`；禁止域名 MUST 复用 `network_domain_policy` 的第二行 `policy_scope`，存储层 MUST 改为按 scope 读写。v5 库升级后 MUST 结构正确、数据不丢（A6 / D6）。
+- **FR-032**: MCP 凭据来源 MUST 显式记录在 `mcp_credential_sources`（`managed` / `env`，按 `(server_uid, binding_key)`）；声明 `managed` 而托管值缺失 / 已撤销 / 解密失败时 MUST NOT 读进程环境，声明 `env` 时 MUST 只读进程环境；普通编辑 MUST NOT 清除已托管值；撤销 MUST 立即使该键不可用并把 `ciphertext` 置 NULL，MUST NOT 回落环境变量（B1–B4 / B7）。
+- **FR-033**: `http.headers` 的 `${VAR}` MUST 与 `env` 走同一闸门（缺失时 503 + `operation_id`、文件零变化）；`args` 中出现 `${` 的**新增 / 修改** MUST 按配置校验失败拒绝（400、点名参数位置、零写入零操作行），存量条目仍可加载并由诊断报 `args_placeholders_not_resolved`；认证头装配 MUST 为 `Authorization` → `Bearer <value>`、其它头名原样，MUST NOT 推断前缀或去重；跨主机重定向 MUST 丢弃认证头（B5 / B6 / B8）。
+- **FR-034**: MCP `apply` MUST 只重建目标 server 的连接；失败时 `applied_version_id` MUST 不变；切换 MUST 有排空窗口且到期未完成的调用 MUST 回填明确失败原因；旧 Run 的工具快照 MUST NOT 被改写，切换后旧 Run 的新调用 MUST 明确失败而非偷转到新连接；并发 publish / revoke / apply MUST 记 `superseded`（409 `MCP_APPLY_SUPERSEDED`）并撤回候选注册与连接；撤销凭据后引用它的调用 MUST 拒绝发出并回收关联进程，不等 `apply`（C1–C8）。
+- **FR-035**: 执行环境 MUST 有 `standard` / `strict` 两档（`execution_policy` 落库，YAML 只作种子）；两档 MUST 共享同一套基础防护（DNS 解析结果校验、连接固定、忽略代理环境变量、shell 名称集合）；`standard` 放行未命中禁止域名的公网域名，`strict` 只放行白名单；程序目录放行 MUST 同时满足清单登记、真实路径在 `runtime/**`、保护状态生效三项；`.cmd` / `.bat` MUST NOT 按扩展名豁免（D1–D9 / D12）。
+- **FR-036**: 禁止域名 MUST 两档均先于放行判定，`*.example.com` MUST NOT 匹配裸 `example.com`，保存后 MUST 下一次判定即生效；内网例外 MUST 带非空 `note`、写审计、可删除且删除后立即失效；云元数据地址 MUST 即使加例外也拒绝（D5 / D10）。
+- **FR-037**: 受控拨号 MUST 使解析结果与实拨地址一致、双栈任一落在受保护段即拒、`Host` 与 TLS SNI 保持原域名、连接不跨目标复用、3xx 不跟随、解析失败即拒；配置 `http.proxy` 时固定的是代理地址且页面 MUST 标注目标由代理解析（D12）。
+- **FR-038**: v5 → v6 迁移 MUST 一律落 `strict`（含白名单为空的情况）；升级后页面 MUST 列出「白名单中解析到受保护地址段的条目」与「命中新增 shell 名称的命令条目」两组待确认项，逐条可选「加例外」/「保持拒绝」并写审计，未确认 MUST NOT 自动放行（D6 / D11 / M7）。
+- **FR-039**: 干净安装 MUST 交付五个内置 Agent 目录且生命周期为 `disabled`；不需要凭据的 MCP（`docs-readonly`、DBHub）MUST 已写入并发布，需要凭据的两条 MUST NOT 预写；凭据就绪后 MUST 由系统写入并发布对应条目，用户 MUST NOT 需要手动添加 MCP；缺一个凭据或一个 server 连不上 MUST NOT 阻断 `serve` 启动（E1–E3）。
+- **FR-040**: `disabled` 状态下调度器 MUST NOT 排期，启用后到点 MUST 产生一次 Run；缺必需模型连接或该 Agent 所需凭据时启用 MUST 被拒并给出待补项与跳转，通知渠道缺失 MUST NOT 阻止启用；Agent `settings.max_iterations` 超过实例上限时页面 MUST 点名但 MUST NOT 改用户配置（E5 / E6 / E8）。
+- **FR-041**: 完整包 MUST 在本轮声明支持的平台（Windows 原生 + WSL2 Ubuntu）实际安装并跑通：解压 → 首次启动 → 登录 → 依赖就位；体积 MUST 实测而非估算；发布流水线与签名仍归 US-17（拟），本 US MUST NOT 声称已完成正式打包（M5）。
+- **FR-042**: 管理台 MUST 交付执行环境页（档位、禁止域名、例外、待确认项）、MCP 六轴（含 `dependency` 与 `references`）与凭据表单、Agent 三段视图、实例加密两行状态；登录页四件文案 MUST 固定为「登录管理台」/「访问密码」/「请输入部署者提供的访问密码」/「登录」（F3 / M6）。
+- **FR-043**: 四份权威正文与 `docs/Operations.md` MUST 同步为与实现一致（新端点、新枚举、新错误码、`secrets` 子命令、执行环境两档、访问密码文件、示例依赖与出网边界）；`docs/Compatibility.md` MUST 记录 14D 迁移与历史对照。
+- **FR-044**: 14D MUST 保持零新增 Go 依赖坐标、零新增 npm 生产依赖、零新增 MCP server 实现（除既有 `docs-readonly`）；MUST NOT 联网安装运行时组件到仓库；`CGO_ENABLED=0` 与 `-race` 分属不同命令的纪律不变。
+- **FR-045**:（2026-10-26 用户裁决，取代 FR-014 中 D5 的搜索来源）`industry-brief` 的搜索 MUST 改为内置工具 `web_search` 调用 DeepSeek 官方 Search API（`POST https://api.deepseek.com/v1/tools/search`），MUST NOT 再要求 `BRAVE_API_KEY`，MUST NOT 把该调用包装成 MCP server 或算作 MCP 验证；正文抓取 MUST 继续沿用 Fetch；凭据 MUST 复用该 Agent 已绑定的 DeepSeek 模型连接并经既有凭据解析服务取得，工具参数 MUST NOT 接受密钥、MUST NOT 新增第二个凭据读取路径；一次搜索 MUST 计一次工具调用并先写 `pending` 审计；仅 408 / 429 / 5xx 可有限重试（最多 2 次），401 / 402 / 403 MUST 直接失败并分类；搜索失败时来源表 MUST 留空、MUST NOT 用模型记忆补造来源。官方 JSON 字段名与错误码在实施前 MUST 逐字段核对，未核实前 MUST NOT 写死契约字面量。
+
+### Success Criteria（14D，续编号）
+
+- **SC-014**: 空目录首次启动后，首个进程内实际生效的 `budget.max_iterations` ≥ 30，且 `instance_secrets` 有一条 `master_key` 记录、密钥文件权限校验通过——不需要用户重启或手工建文件。
+- **SC-015**: 存量实例零放宽：已有数据库但无配置文件的目录启动后不生成 `basalt.yaml`；无密钥且无托管密文的存量库保持 `uninitialized` 且不生成密钥。
+- **SC-016**: MCP 凭据全生命周期可核对：写入 / 替换 / 撤销后，`mcp_servers.yaml`、日志、审计、API 响应与模型上下文中出现的凭据值次数均为 0。
+- **SC-017**: 一次 `apply` 触发的连接替换数恰好为 1；失败与 `superseded` 两种结果下 `applied_version_id` 与旧连接的可用性均不变。
+- **SC-018**: 同一组输入在两档得到相同的四项基础防护结论，且标准档对公网域名放行、严格档拒绝未加白名单的域名——差异只在授权范围。
+- **SC-019**: 干净安装后五个 Agent 目录全部存在且为 `disabled`，免凭据的两个 MCP 已发布，需要凭据的两条未写入；启用缺失配置的那一个被拒并给出待补项。
+- **SC-020**: 完整包在 Windows 与 WSL2 Ubuntu 各完成一次真实安装并跑通首次启动与登录；缺任一平台即未完成。
+- **SC-021**: 未配置 `BRAVE_API_KEY` 的实例上，`industry-brief` 仍能通过 `web_search` 取得带 URL 的真实搜索结果并由 Fetch 取正文；审计里每次搜索都可回溯到一次工具调用，来源表中未取到正文的 URL 全部标为线索而非摘要。
+
+### 14D 边界（不做）
+
+- 不做 OBS 统一诊断底座 / CHAOS 故障注入 / 自动演练；不新增 US、不动 US-16 起拟编号。
+- 不做发布流水线、签名、安装包升级器（US-17 拟）；本 US 只验「这一次的包能不能装上跑起来」。
+- 不做企业 SSO / RBAC / 多租户 / 调用方配额；不做远程 MCP 认证头 OAuth、Notion 等远程 MCP 接入。
+- 不做向量记忆 / Agent 协作 / 容器沙箱 / 分布式；不做 `args` 中的 `${VAR}` 凭据解析。
+- 不自动导入示例、不自动放宽白名单、不自动改用户配置；`v0.1.0` tag 仍由用户手动执行。

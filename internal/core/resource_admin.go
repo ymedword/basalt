@@ -53,6 +53,13 @@ const (
 	ActionMCPServerTest = "mcp_server.test"
 	// ActionMCPServerPublish 是发布 MCP server 版本。
 	ActionMCPServerPublish = "mcp_server.publish"
+	// ActionMCPServerApply 是受控重建单个 MCP server（14D；契约 §9.1 字面量）。
+	// 保存即发布，apply 是**另一件事**：它才改变运行期连接。
+	ActionMCPServerApply = "mcp_server.apply"
+	// ActionMCPServerCredentialRevoke 是撤销某个 MCP 占位符的托管凭据（14D）。
+	// target_id 是服务器资源 UID，detail 带 binding_key；撤销即失效，不等下一次 apply。
+	// #nosec G101 -- 操作契约名（动作标识），不是凭据（变量名命中）。
+	ActionMCPServerCredentialRevoke = "mcp_server.credential.revoke"
 
 	// ActionSkillCreate 是创建技能。
 	ActionSkillCreate = "skill.create"

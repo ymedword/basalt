@@ -233,6 +233,28 @@ a.cell-id { font: 12px/1.7 var(--font-mono); }
 .login-alt { margin-top: 26px; }
 .login-alt p { font-size: 12px; }
 .login-alt button { font-size: 12px; }
+/* Agent 三段面板（14D §2.5.1）：窄屏自动叠成一列，行内文字允许换行。 */
+.ready-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 16px; margin-top: 16px; }
+.ready-grid > .card { margin: 0 0 16px; }
+.ready-rows { list-style: none; margin: 0; padding: 0; }
+.ready-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line-soft); }
+.ready-row strong { font-size: 13px; font-weight: 550; }
+.ready-row p { font-size: 12px; color: var(--muted); margin: 3px 0 0; overflow-wrap: anywhere; }
+.ready-side { display: flex; flex: none; flex-direction: column; align-items: flex-end; gap: 4px; }
+.ready-fix { font-size: 12px; white-space: nowrap; }
+/* 执行环境 · 运行环境：组件是否存在 / 能否实际连接 / stdio 命令是否已登记，三类事实分列。 */
+.runtime-table { table-layout: fixed; min-width: 880px; }
+.data-table .col-runtime { width: 236px; }
+.runtime-component { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.runtime-component strong { font-size: 13px; font-weight: 550; }
+.runtime-component .small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-blockers { margin-top: 18px; padding: 14px 16px; border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: var(--radius-sm); background: var(--warn-wash); }
+.runtime-blockers h3 { font-size: 13px; margin: 0 0 6px; }
+.runtime-blockers li { font-size: 12.5px; line-height: 1.8; }
+/* 严格模式空配置警告：提示与两个配置入口排在同一行内换行。 */
+.strict-empty-warning { display: flex; flex-wrap: wrap; gap: 2px 6px; align-items: baseline; }
+.strict-empty-warning a { white-space: nowrap; }
+.advanced-note { margin-top: 0; }
 @media (max-width: 1180px) {
   .console-main { padding: 30px 28px 60px; }
   .console-topbar { padding: 0 28px; }

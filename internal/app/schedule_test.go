@@ -433,7 +433,7 @@ func newScheduleTestScheduler(t *testing.T, cfg *cli.Config, entries []core.Agen
 		logger: slog.Default(),
 		now:    func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
 	}
-	sched := a.newScheduler(store, invoker, entries, nil, cfg, slog.Default())
+	sched := a.newScheduler(store, invoker, entries, nil, nil, cfg, slog.Default())
 	return sched, invoker, store
 }
 

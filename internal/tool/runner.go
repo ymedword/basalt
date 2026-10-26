@@ -7,9 +7,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -54,18 +56,34 @@ type RunnerOptions struct {
 	EnvPassthrough []string // shell.env_passthrough：透传给子进程的父进程变量名
 	Interpreters   []string // shell.interpreters：受控解释器通道（形态与脚本范围由本包校验）
 	MaxOutputBytes int      // budget.max_output_bytes：装配期上限；非正值按缺省 256 KB
+	// ProgramDir 是 `<程序目录>` 根（真实路径）。程序目录可执行件的三项条件（14D
+	// §2.2.2）都以它为基准：真实路径落在 `<ProgramDir>/runtime/**`、清单登记、保护生效。
+	// 空值表示本实例没有程序目录（`go run` 的临时二进制）——三项条件恒不成立，这些
+	// 可执行件只能走显式登记。
+	// ProgramDir anchors the three-condition admission for program-directory executables.
+	ProgramDir string
+	// ProgramManifest 是安装清单的登记项（仅在保护状态生效时装载）。空清单意味着
+	// "没有自动放行面"：程序目录里的任何东西都要显式登记才能跑（fail-closed）。
+	// ProgramManifest is the installation manifest; an empty manifest admits nothing.
+	ProgramManifest []ProgramDirEntry
 }
 
 // LocalRunner 是 v1 唯一的受控执行实现（技术方案 §4.3 授权矩阵的**执行侧**）：
 // 授权已由 `WhitelistPolicy` 判过，本层只管"怎么跑"——环境白名单、整树终止、读取中
-// 限流、解释器形态校验。它不做失败分类：非零退出码与输出原样交给调用方。
+// 限流、解释器形态校验、程序目录三项条件复核。它不做失败分类：非零退出码与输出原样
+// 交给调用方。
 // The only guarded execution implementation in v1; authorization has already been decided
 // by the policy layer, so this layer owns only *how* the command runs.
 type LocalRunner struct {
 	root           string
 	envPassthrough []string
 	interpreters   map[string]struct{}
-	maxOutputBytes int // 装配期上限（非正值按缺省）；逐 Run 收窄经 effectiveMaxOutputBytes
+	maxOutputBytes int                    // 装配期上限（非正值按缺省）；逐 Run 收窄经 effectiveMaxOutputBytes
+	programRuntime string                 // `<ProgramDir>/runtime`（空 = 未装配程序目录）
+	programPaths   map[string]string      // 相对 runtime 的折叠路径（`/` 分隔）→ SHA-256
+	programNames   map[string]struct{}    // 清单声明的可执行基名（折叠）——用于识别"按名进来的"
+	programHashes  map[string]programHash // 内容哈希缓存（按真实路径）
+	programMu      sync.Mutex             // 保护哈希缓存的并发读
 }
 
 // 编译期断言：调用方只依赖 `core.CommandRunner`，换实现只动装配处（宪法 VI）。
@@ -80,12 +98,25 @@ func NewLocalRunner(opts RunnerOptions) *LocalRunner {
 	for _, name := range opts.Interpreters {
 		interpreters[name] = struct{}{}
 	}
-	return &LocalRunner{
+	runner := &LocalRunner{
 		root:           filepath.Clean(opts.Root),
 		envPassthrough: slices.Clone(opts.EnvPassthrough),
 		interpreters:   interpreters,
 		maxOutputBytes: opts.MaxOutputBytes,
+		programPaths:   make(map[string]string, len(opts.ProgramManifest)),
+		programNames:   make(map[string]struct{}, len(opts.ProgramManifest)),
+		programHashes:  make(map[string]programHash),
 	}
+	if opts.ProgramDir != "" {
+		runner.programRuntime = filepath.Join(filepath.Clean(opts.ProgramDir), programRuntimeDirName)
+	}
+	for _, entry := range opts.ProgramManifest {
+		key := foldCase(toSlashPath(entry.Path))
+		runner.programPaths[key] = strings.ToLower(entry.SHA256)
+		base := filepath.Base(filepath.FromSlash(entry.Path))
+		runner.programNames[foldCase(strings.TrimSuffix(base, filepath.Ext(base)))] = struct{}{}
+	}
+	return runner
 }
 
 // effectiveMaxOutputBytes 算**本次执行**的读取侧上限：min(装配值、逐命令正值、256 KB 硬上限)。
@@ -109,6 +140,12 @@ func (r *LocalRunner) effectiveMaxOutputBytes(cmd core.Command) int {
 // 退出码连同合并后的输出一并交给调用方判读（失败分类归工具层）。
 // Run executes one guarded command; a non-zero exit code is a result, not an error.
 func (r *LocalRunner) Run(ctx context.Context, cmd core.Command) (core.CommandResult, error) {
+	if err := r.checkShellName(cmd); err != nil {
+		return core.CommandResult{}, err
+	}
+	if err := r.checkProgramDir(cmd); err != nil {
+		return core.CommandResult{}, err
+	}
 	if err := r.checkInterpreter(cmd); err != nil {
 		return core.CommandResult{}, err
 	}
@@ -329,6 +366,42 @@ func (r *LocalRunner) checkInterpreter(cmd core.Command) error {
 		}
 	}
 	return deny(ruleScriptOutside, script, guidanceScriptOutside)
+}
+
+// checkShellName 是**执行侧**的同一道能力上限（14D §2.2.5 / D7）：授权面按命令名字面判过
+// 之后，这里再按**解析后的真实路径**判一次。两层都判不是重复——授权面防的是配置错误
+// （`allowed_commands: [bash]`），执行面防的是"名字换了马甲"：`helper -> /bin/zsh` 这种软链接
+// 在字面比对下是完全不同的名字，只有投影到真实路径才看得见 basename 仍是 shell。
+// The execution-side half of the same ceiling: after literal authorization, judge the
+// resolved real path, because a symlink named `helper` is a different name literally.
+func (r *LocalRunner) checkShellName(cmd core.Command) error {
+	if core.IsShellName(cmd.Executable) {
+		return deny(ruleShellName, cmd.Executable, guidanceShellName)
+	}
+	// 只用**解析成功**的结果判：解析不出来时 spawn 同样会失败，让执行错误如实归因，
+	// 不把"没找到"改写成"策略拒绝"（契约 C-06 的同一口径）。
+	// Judge only a resolved path; an unresolvable one fails at spawn and is attributed there.
+	if real, err := r.resolveExecutable(cmd); err == nil && core.IsShellName(real) {
+		return deny(ruleShellName, cmd.Executable, guidanceShellName)
+	}
+	return nil
+}
+
+// resolveExecutable 取子进程**实际会执行**的路径：裸名走 PATH 查找（Unix `exec.Command`
+// 与 Windows `CreateProcess` 都按 PATH 找），带分隔符的相对入口按**子进程**工作目录解析，
+// 最后投影到真实路径。投影失败原样上抛，由调用方决定是否据此拒绝。
+// resolveExecutable returns the path the child will actually run, resolved to its real
+// target; relative entries resolve against the child's working directory, not ours.
+func (r *LocalRunner) resolveExecutable(cmd core.Command) (string, error) {
+	exe := cmd.Executable
+	if !strings.ContainsAny(exe, `/\`) {
+		found, err := exec.LookPath(exe)
+		if err != nil {
+			return "", err
+		}
+		exe = found
+	}
+	return resolveRealPath(cmd.Dir, exe)
 }
 
 // scriptRoots 是受控脚本的两处允许区：当前 Agent 的 scripts/（有 Agent 上下文时）与
