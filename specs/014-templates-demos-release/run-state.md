@@ -1804,3 +1804,42 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 - **人工验收范围**：8080 演示实例上的界面与功能（五个 Demo、MCP 目录 / 诊断 / 测试、渠道与工作区修复）由用户亲自点验，结论为无遗留问题、无新增改动要求。
 - **未验证项保持原状**：§7.9 列出的完整包模型业务、真实外部数据、`clean-checkout` 仅 Windows 等仍按「未验证」记录，不因收口改写成通过。
 - **收口后状态**：工作区干净；演示实例继续运行最终候选二进制（PID 41568）；本 US 的后续动作只剩用户侧推送 / 合回 `main` 与打 `v0.1.0` tag（tag 归用户）。
+
+### 7.12 收口后 CI 红：两处 Linux 专有缺陷的修复与证据重绑定（2026-10-27）
+
+**起点**：`afc6090` 推送后两个 CI run（`main` 与 US 分支）均红。工件读数：
+
+- `sec` 步骤 gosec `G115 (CWE-190)`：`internal/app/instance_secrets_perm_test_unix.go:26` 的 `require.Equal(t, uint32(os.Getuid()), stat.Uid)`（Confidence MEDIUM / Severity HIGH）。
+- `test` 步骤：`--- FAIL: TestInstanceSecrets_RecoversPublicationResidue (0.24s)`，`instance_secrets_test.go:424` expected `"ready"` actual `"recovery_required"`；`FAIL github.com/ymedword/basalt/internal/app 127.608s`，其余包全过。
+
+**根因（已验证）**：`recoverPublishResidue` 分支 3 在 unlink 临时链接后，用 unlink **之前**的 `FileInfo` 快照复查链接数。Unix 分支的 `hardLinkCount` 按传入 `FileInfo` 读 `syscall.Stat_t.Nlink`（快照里仍是 2），Windows 分支忽略入参、按路径重新读（1）——同一 helper 两平台语义分叉，Linux 上把可证明来源的残留判成 `errPublishResidueUnprovable`，进恢复态。Windows 本地 r7/r8/r9 全绿看不见它：`//go:build !windows` 文件不参与 Windows 上的编译、gosec 与用例。修复为计数前重新 stat（分支 3 契约原文即「重新 stat 期望 `nlink == 1`」）；gosec 命中改 `require.EqualValues`，等值断言强度不变。未删断言、未放宽阈值、未改判据面。
+
+**复现与验证（WSL2 Ubuntu；源码 = 与 Windows 工作区同一两文件）**：
+
+- 修复前：`TestInstanceSecrets_RecoversPublicationResidue` 红，读数与 CI 逐字相同（expected `ready` / actual `recovery_required`，`instance_secrets_test.go:424`）。
+- 修复后：`go test ./internal/app -run 'TestInstanceSecrets_'` ok；`go test ./internal/app` ok（16.083s）；按 CI 同法构建的 gosec v2.29.0（`go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0` 后 `go build`）在 Linux 全树 `gosec -quiet ./...` 退出码 0。
+- Windows：`go test ./internal/app -run 'TestInstanceSecrets_'` 全过；`gofumpt -w` 后 `gofmt -l` 无输出。
+
+**修复提交**：`e678674`（`fix(app): re-stat the master key before re-checking its link count`；两文件 +14/−2）。
+
+**门禁历史（均绑定 `e678674`、`dirty=false`）**：
+
+| 轮次 | 阶段 | 结果 | 说明 |
+| --- | --- | --- | --- |
+| r10a | 14D | error（23/30 后中断） | `console-test exit=2 executable unavailable: npm`——后台 shell 未带便携 Node；红态报告原样保留在 `.loop/runs/us14-14d-gate-r10a/` |
+| r10b | 14D | passed 30/30 | 带便携 Node（node v24.22.0 / npm 11.19.1）重跑 |
+| r10 | 发布 | passed 38/38 | 含 `e2e` / `e2e-required` / `clean-checkout`；12:41→13:48（本地），约 67 分钟 |
+
+**绑定核对**（record `us14-release-gate-r10`）：`base_commit=e6786744772d…`、`dirty=false`、`source_fingerprint=eaba541c673b…`、`tested_binary_sha256=fcacd922c892…`（与仓库 `bin/basalt.exe` 同一文件）、`report_sha256=8302356032eb…`、`criteria.inputs` 11 条公开路径、`finished_at=2026-10-27T05:48:33Z`。记录与报告已发布至 `harness/acceptance/records/us14-release-gate-r10.json` 与 `records/reports/` 同名文件；台账追加一行 `us14-release-gate-r10`；`go test ./scripts/acceptance -run 'TestRecords_|TestLedger_|TestStages_' -count=1` 通过。r9 记录（绑定 `52015b4`）与 §7.6.3 / §7.9 保留为历史，不改写。
+
+**演示实例**：`bin/basalt-demo.exe` 从 `e678674` 的干净 worktree 按 `make build` 同一 argv 重建，SHA-256 `fcacd922…`（与 `bin/basalt.exe` 相同）。首次重建在工作区带未提交证据文件时进行，VCS 戳记令哈希为 `153314d3…`，作废并从干净 worktree 重来。`run-demo.sh` 就地重启存量实例 `inst_18aa96b0197a8565`：日志 `内置安装器完成 agents_installed=0 … sample_db=kept docs_library=kept backfilled=false`、`execution profile loaded from database … profile=standard source=database revision=4`、`重路径装配完成 agents=5 … mcp_connected=4`、`启动恢复完成 recovered=0`。读数：PID 22108、监听 `127.0.0.1:8080`；认证未带凭据 401 / 带凭据 200；`/console/` 200；MCP 4/4 `connected=true`、`pending_restart=false`，工具数 dbhub 1 / docs-readonly 3 / fetch 1 / github 27；`execution_profile=standard`、白名单四条；五条调度下次均在 2026-10-28（08:30 / 08:45 / 09:00 / 09:15 / 09:30）。凭证仍只在 `.env.local`，未打印、未落盘。
+
+**不重跑双平台完整包走查（用户 2026-10-27 同意）**：§7.6.3 的包与走查绑定 `52015b4`。本次源码增量为两文件：Unix 分支的残留恢复只在存在 `.link` 残留时触发，干净首启 / adopt 路径不经过；Windows 分支行为逐字不变（原本就按路径重读）。因此**不**声称 `e678674` 有完整包走查证据；若打 `v0.1.0` 时要求包证据与最终提交同绑定，需另跑一次打包走查（本轮未执行）。
+
+**未验证 / 保持**：
+
+- 最终提交 `e678674` 的双平台完整包重建与走查（以上增量分析代替，未执行）；
+- `e678674` 的 CI 绿度（本记录写于推送前）；
+- §7.9 未验证清单的其余各项保持原状。
+
+**临时物**：`.loop/runs/us14-14d-gate-r10a/`（红态）与 `us14-14d-gate-r10b/`、`.loop/runs/us14-release-gate-r10/` 保留为过程证据；临时 worktree 与构建中间文件已删除。
