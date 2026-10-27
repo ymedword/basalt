@@ -147,3 +147,4 @@
 | us14-release-gate-r4 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r4.json](records/us14-release-gate-r4.json) |
 | us14-release-gate-r5 | 2026-10-25 | us14-release-r1 | original | ai | passed | [records/us14-release-gate-r5.json](records/us14-release-gate-r5.json) |
 | us14-release-gate-r6 | 2026-10-26 | us14-release-r1 | rerun | ai | passed | [records/us14-release-gate-r6.json](records/us14-release-gate-r6.json) |
+| us14-release-gate-r9 | 2026-10-27 | us14-release-r1 | rerun | ai | passed | [records/us14-release-gate-r9.json](records/us14-release-gate-r9.json) |

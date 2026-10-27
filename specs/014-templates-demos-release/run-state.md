@@ -1582,6 +1582,44 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 
 **8080 演示实例恢复（上一轮）**：停止验证实例后，将 `bin/basalt-demo.exe` 替换为本次构建产物（SHA-256 `fead23ad…`，与 Windows 包内二进制同一文件），`run-demo.sh` 重启后 PID 35644、监听 127.0.0.1:8080；`mcp_connected=4`，调度下次 `2026-10-27T09:30:00.000+08:00`；认证 401/200、`/console/` 200、四台 MCP 工具数 1/3/1/27、`pending_restart=false`。运行中的产品即本轮验证产物；凭证仍只在 `.env.local`，仓库、示例、测试与本记录均无其值。
 
+#### 7.6.3 双平台走查复跑绑定最终提交 `52015b4`（2026-10-27，取代 7.6.1）
+
+**为什么重跑**：7.6.1 的两个包绑定 `fbfc7c4`，候选提交在其后改动了示例脚本、控制台产物与内置安装内容（`79b0106` / `52015b4`），包内 `examples/`、控制台 `dist`、`docs-readonly` 导出源码都会变。本节把双平台完整包走查重跑到最终提交；7.6.1 的读数与哈希保留为历史，不改写。
+
+| 平台 | 二进制 SHA-256 | 二进制字节 | 包 SHA-256 | 包字节 | 文件数 | 许可文件数 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Windows amd64 | `217a3090110569e713f4f94f79930ec6924d7a7bf2c66097d61332067bf5cd03` | 21,730,816 | `da58871c5d3ac5a043b826a6c2ff1a9881de9dd4a329b097910ab79a858b16df` | 138,424,174 | 19,356 | 313 |
+| Linux amd64 | `33e027929cf36bcc7002fab70feff6189fdab8eb510666a6ea41d96026d086a3` | 21,389,472 | `7a14d925da29682941a77243e211dc717e4203cc67ce31b9c2f4505d1f3d89bb` | 218,115,532 | 27,174 | 303 |
+
+两个二进制 `--version` 均输出 `basalt version 52015b4`。口径同 7.6.1：文件数取打包报告 `file_count`（不含目录）——Windows zip 条目 22,756、Linux 31,434，差额是目录条目。Windows 包构建前删除了 `bin/runtime` 下 Demo 运行生成的 114 个 `__pycache__` 目录，包内 `__pycache__` / `.pyc` 为 0。
+
+**Windows 走查**（解压目录 `D:\code\pkg-verify-win-r9\basalt-0.1.0`）：
+
+| 步骤 | 读数 |
+| --- | --- |
+| 首次启动 | `instance_id=inst_13ee296e6608fe3f`；`agents_installed=5 mcp_written=[docs-readonly dbhub fetch] sample_db=installed docs_library=installed backfilled=false`；`profile=standard source=instance_init revision=1` |
+| 登录 | 未带凭据 401、带凭据 200、`/console/` 200（口令取自实例目录 `admin-token`，内容未打印） |
+| 组件定位与授权 | 三条诊断 `command.state=located` / `dependency.state=ready`（1.0.0 / 1.5.0 / 2026.10.24）、`pending_restart=false`；`execution_profile=standard`，白名单四条运行时整串路径；包内 `node --version`=v24.22.0、`python --version`=Python 3.12.10、`docs-readonly.exe` 4,667,904 B、`github-mcp-server.exe` 36,159,488 B 在位 |
+| MCP 连接与工具发现 | 3/3 `connected=true`、`pending_restart=false`，工具数 3 / 1 / 1；三台 `disposition` 均 `offered=accepted` |
+
+**WSL2 Ubuntu 走查**（解压目录 `~/pkg-verify-linux-r9/basalt-0.1.0`，默认 `127.0.0.1:8080`）：
+
+| 步骤 | 读数 |
+| --- | --- |
+| 首次启动 | `config_created=true marker_created=true instance_id=inst_49f1d3077e3b93fb budget_max_iterations=30 max_concurrent_runs=32`；`agents_installed=5 mcp_written=[docs-readonly dbhub fetch] sample_db=installed docs_library=installed backfilled=false`；`profile=standard source=instance_init revision=1`；`schema_version=6` |
+| 登录 | 未带凭据 401、带凭据 200、`/console/` 200（口令文件 `~/.local/share/basalt/instances/inst_49f1d3077e3b93fb/admin-token`，内容未打印） |
+| 组件定位与授权 | 三条诊断 `located` + `ready`（版本同上）、`pending_restart=false`；`execution_profile=standard`，白名单四条运行时整串路径；包内 `node --version`=v24.22.0、`python3 --version`=Python 3.12.10、`docs-readonly` 4,541,558 B、`github-mcp-server` 29,311,136 B（`--version` → 2.0.3） |
+| MCP 连接与工具发现 | 3/3 `connected=true`、`pending_restart=false`，工具数 3 / 1 / 1；日志 `mcp_connected=3` |
+| Agent 注册 | `provider: local-model` 未配置 → 五条 `Agent 未注册 reason="provider not registered: local-model"`（与 7.6.1 同口径：完整包实例不配模型，属预期） |
+
+**端口冲突登记（诚实记录）**：Linux 首启时 `127.0.0.1:8080` 仍被上一轮（7.6.1）的验证实例占用（pid 549861，03:21 启动，cwd `~/pkg-verify-linux-r6/basalt-0.1.0`）——上一轮收尾没有停它。初始化已完成但 HTTP 面绑定失败退出（日志逐字 `监听 127.0.0.1:8080: listen tcp 127.0.0.1:8080: bind: address already in use`）；确认 cwd 后 `kill`，端口释放，重新启动同一实例（`created=[]`、`kept=[agents skills memory logs archive sessions AGENTS.md SOUL.md USER.md mcp_servers.yaml memory/MEMORY.md]`、`mcp_written=[] sample_db=kept docs_library=kept`）。属我的清理遗漏，不是产品缺陷；走查结束已停实例，`ss` 与 `pgrep` 复核 8080 空闲、无 `basalt serve` 残留。
+
+**Linux `docs-readonly` 二进制来源差异（登记）**：Linux `runtime/` 复用 `~/basalt-linux/runtime`，其中 `docs-readonly` 构建于 2026-10-27 01:41，4,541,558 B（SHA-256 `b7424aef…`），与 7.6.1 包内的 4,541,510 B（SHA-256 `55a1c94b…`）不是同一文件。源码 `examples/shared/mcp/docs-readonly` 自 `fbfc7c4` 起未变；在候选源码树上 `-trimpath`（不带 `-s -w`）重建得 4,541,534 B，与两者都只差 24 字节级——差异来自构建元数据（是否带 VCS 信息等），不是源码差异。三份二进制都在包内运行、`tools=3`、诊断 `ready`。Windows 侧 `docs-readonly.exe` 4,667,904 B 与 7.6.1 同尺寸。
+
+**包外补充动作**：① Linux `docs-readonly` 仍由同一源码 `CGO_ENABLED=0` 构建后放入 `runtime/`（见上条）；② 两个包的 `runtime/python/LICENSE.txt` 都在位（python-build-standalone `install_only` 不带该文本，沿用已补的 PSF 文本）；两包许可文件数仍为 313 / 303（node / python 发行包内许可文件数不同），均含 `LICENSES/THIRD-PARTY-NOTICES.md` 与 8 个许可目录。
+
+**四档分开**：代码存在 = 上表哈希；配置已写入 = 首启生成的 `basalt.yaml` 四条运行时白名单 + `mcp_servers.yaml` 三条服务；连接成功 = 启动日志与 MCP 视图 `connected=true` + 工具清单；业务运行成功 = **本轮未跑模型业务**（完整包实例只验开箱链路；Demo 业务轮证据见 §7.3 与 §7.8，均在演示实例上执行）。
+
 ### 7.7 review ② 返工后的门禁复跑（2026-10-27）
 
 **红态起点**：`.loop/runs/accept-20261026T182828.497476500`（base `f8b5724`、`dirty=false`、`run_status=failed`，30 项检查里 `fmt` / `builtin-agent` / `script-tests` 三项红，finished `2026-10-26T18:59:26Z`）。逐项归因：
@@ -1714,3 +1752,46 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 - UI 四处的视觉 / 点击（review ② 人工）；通知下拉对存量 `webhook` 渠道的编辑路径只在单测覆盖，未在实例上点验。
 - 真实模型业务轮只在演示实例（存量实例就地重启）上跑过；新装实例首启后立即跑五 Demo 尚未复跑。
 - `python` 作为 `shell.allowed_commands` 条目仍意味着放行该解释器执行任意脚本；本 US 的收紧通道是 `shell.interpreters`（更窄），示例只登记绝对路径，产品级白名单策略未变。
+
+### 7.9 门禁复跑绑定最终提交（2026-10-27）
+
+**提交序列**：`79b0106`（五个 Demo 真实 MCP 输出 + 控制台四处，`make check` 七目标全绿后提交）→ `52015b4`（docs-diff 库根标记元组去掉实例配置文件名字面量）。旧证据（r5 / `57784fe`、r6 / `fbfc7c4`）一律未改写。
+
+**红态与归因（逐轮保留）**：
+
+| 轮次 | 绑定 | 红项 | 实际原因 | 处置 |
+| --- | --- | --- | --- | --- |
+| `us14-14d-gate-r7` | `79b0106` | `builtin-agent` | 15 份 `examples/daily/**/*.md` 在**工作区磁盘**上是 CRLF，而入库 blob 与干净检出都是 LF（`text=auto eol=lf` 归一化让 `git status` 看不见这个差异，e2e 夹具读的是磁盘字节） | 15 个文件转回 LF；blob 未变（转后 `git add` 暂存区为空、状态干净），因此**不需要**新提交 |
+| 同上 | 同上 | `full-package` | `TestFullPackage_WindowsInstallSmoke` 要求 `127.0.0.1:8080` 空闲（新实例模板写死该地址），演示实例正占用 | 停演示实例；两个阶段跑完后用新候选重建并重启（见 §7.10） |
+| 同上 | 同上 | `console-test` | 检查进程找不到 `npm`：本机无系统 Node，便携 Node 24.22.0 在 `%TEMP%\node24\node-v24.22.0-win-x64` | PATH 前置该目录；该检查 exit=2 中止了其后 5 项（`docs-consistency` / `script-tests` / `template-quality` / `legacy-d1` / `stage-lint` 未跑） |
+| `us14-14d-gate-r8` | `79b0106` | 0（30/30） | — | 保留为 14D 阶段的通过记录 |
+| `us14-release-gate-r8` | `79b0106` | `e2e` | `TestExamples_PortableBaseline` 判红：便携基线判据（`internal/e2e/us14_examples_test.go` 的 `exampleImportForbiddenTokens`）不允许示例脚本出现实例配置文件名，而 `docs_diff.py` 的工作区标记元组列了该文件名——脚本只读清单、从不写它，但判据刻意按字面判（脚本提该文件名可能是自动导入 / 改白名单入口） | 修复提交 `52015b4`：标记元组去掉该文件名（`AGENTS.md` / `basalt.yaml` / `basalt.db` / `memory/MEMORY.md` 仍在，判别力不靠单个样例），单测改为逐标记覆盖，`AGENT.md` 的库根校验清单同步；**e2e 判据本身未改**。该轮在 `e2e` 判红后被我中止，未产生后续检查读数 |
+| `us14-14d-gate-r9`（首次启动） | `52015b4` | 启动即 exit=2 | 中止 r8 时遗留 `.loop/lock`（`pid=42808 started=2026-10-27T00:16:49Z`）；确认无 `acceptance` / `go` 进程后按提示移除 | 直接重启为下表 r9 |
+
+**通过读数（同一提交 `52015b4ea783a75f6129956d92794392e0dc8722`，两轮都在干净工作区启动）**：
+
+| 门禁 | run_id | 检查数 | 结果 | 记录位置 |
+| --- | --- | --- | --- | --- |
+| 14D 阶段 | `us14-14d-gate-r9` | 30 | `run_status=passed`、0 项红 | `.loop/runs/us14-14d-gate-r9/` |
+| 发布阶段 | `us14-release-gate-r9` | 38 | `run_status=passed`、0 项红（含 `e2e` / `e2e-required` / `clean-checkout`） | 已发布：`harness/acceptance/records/us14-release-gate-r9.json` |
+
+**发布与执行绑定核对**：`record.code.base_commit=52015b4ea783…`、`dirty=false`、`source_fingerprint=7ff397e3…`、`tested_binary_sha256=b82478b7ab1248…`；`evidence.report_sha256=31ea22abf30bc5…` 与报告文件哈希一致（发布副本 `records/reports/us14-release-gate-r9.json` 逐字节相同）；`criteria.inputs` 11 条全部是公开路径；记录文件 `records/us14-release-gate-r9.json` 自身 SHA-256 `41a70c57299a…`。台账追加 `us14-release-gate-r9` 一行（2026-10-27，与记录 `finished_at` 同日）；`go test ./scripts/acceptance -run 'TestRecords_|TestLedger_|TestStages_' -count=1` 通过。本节的证据提交排在这两轮之后，父提交仍是 `52015b4`，不改动被测源码。
+
+**耗时读数（本机，非达标线）**：14D 阶段 `r9` 约 48 分钟（含 `cover` 约 25 分钟：`go test -coverprofile` 串行 + 22,407 行 profile 的逐行校验每行一次 `grep` 进程）；发布阶段 `r9` 约 70 分钟（`e2e` 7 分钟 + `clean-checkout` 在 `git worktree` 临时树重跑 full profile 与 `make e2e` 约 40 分钟）。
+
+**完整包走查**：同一提交 `52015b4` 的 Windows 与 WSL2 完整包已重新构建并走查，双平台二进制 `--version` 均为 `basalt version 52015b4`，包哈希、文件数、首启 / 登录 / 诊断 / MCP 读数见 §7.6.3（取代 §7.6.1 的 `fbfc7c4` 绑定；7.6.1 保留为历史）。
+
+**未验证（本轮）**：
+
+- 浏览器交互走查与 review ② 人工项，不由自动证据替代；
+- 完整包实例未跑模型业务（`provider: local-model` 未配置，五条 Agent 未注册属预期）；Demo 业务轮证据只在演示实例（存量实例就地重启）上取得；
+- 真实 GitHub PAT / Brave / Fetch 外部数据未在完整包实例复跑：`github` 条目只在进程环境带 PAT 时由内置安装器写入，两个验证实例都没有提供凭据（包内 `github-mcp-server` 二进制在位并已实跑 `--version`）；
+- `clean-checkout` 只在本机 Windows 上执行过（Linux 侧只做完整包走查）；
+- `us14-14d-gate-r9` 的运行目录在 `.loop/runs/`（过程证据），未发布为 `harness/acceptance/records/` 正式记录。
+
+### 7.10 演示实例按最终候选重建并重启（2026-10-27）
+
+- **候选二进制**：`bin/basalt-demo.exe` 由 `52015b4` 工作树构建（`CGO_ENABLED=0`、`-trimpath -ldflags "-s -w -X main.version=52015b4"`），21,730,816 B，SHA-256 `217a3090110569e713f4f94f79930ec6924d7a7bf2c66097d61332067bf5cd03`——与 §7.6.3 的 Windows 完整包内 `basalt.exe` 是**同一文件**；`--version` 输出 `basalt version 52015b4`。
+- **启动方式**：`run-demo.sh`（source `.env.local`；凭证未打印、未落盘到记录）。存量实例就地重启：`created=[] kept=[agents skills memory logs archive sessions AGENTS.md SOUL.md USER.md mcp_servers.yaml memory/MEMORY.md]`、`启动恢复完成 recovered=0`、`投递恢复完成 recovered=0`。
+- **读数**：PID 41568，监听 `127.0.0.1:8080`；`mcp_connected=4`（dbhub 1 / docs-readonly 3 / fetch 1 / github 27），四台 `pending_restart=false`；认证未带凭据 401 / 带凭据 200、`/console/` 200；`execution_profile=standard`（白名单 4 条运行时整串路径）；agents=5 全部注册；五条调度已装载，下次运行落在 `2026-10-28` 08:30–09:30。
+- **清理**：本轮排查留在实例根目录的临时文件（`*.tmp`、`last-*.txt`、`err.txt`、0 字节 `basalt.db` 探针产物）已删除；`serve-*.log` 运行日志保留。备份库 `backups/basalt-predemo-repair-20261027.db` 保留。
