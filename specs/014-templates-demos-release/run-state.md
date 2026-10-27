@@ -1839,7 +1839,7 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 **未验证 / 保持**：
 
 - 最终提交 `e678674` 的双平台完整包重建与走查（以上增量分析代替，未执行）；
-- `e678674` 的 CI 绿度（本记录写于推送前）；
+- `e678674` 的 CI 绿度：**已验证（2026-10-27）**——推送 `85979e8` 触发的 CI run [40457822013](https://github.com/ymedword/basalt/actions/runs/40457822013) 结论 `success`（`85979e8` 相对 `e678674` 只改证据文档，被测源码相同）；
 - §7.9 未验证清单的其余各项保持原状。
 
 **临时物**：`.loop/runs/us14-14d-gate-r10a/`（红态）与 `us14-14d-gate-r10b/`、`.loop/runs/us14-release-gate-r10/` 保留为过程证据；临时 worktree 与构建中间文件已删除。
