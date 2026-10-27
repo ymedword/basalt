@@ -23,5 +23,7 @@ func requireDirectoryRestricted(t *testing.T, dir string) {
 	require.Zero(t, info.Mode().Perm()&0o077, "私有目录不得对组 / 其他用户开放")
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	require.True(t, ok)
-	require.Equal(t, uint32(os.Getuid()), stat.Uid)
+	// 不做显式 int→uint32 转换：gosec G115 按潜在负值溢出判红（Linux CI 实测）。
+	// EqualValues 比较时按等值类型转换，断言强度不变。
+	require.EqualValues(t, os.Getuid(), stat.Uid)
 }

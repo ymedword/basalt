@@ -202,7 +202,17 @@ func recoverPublishResidue(finalPath, workspaceRoot string) (bool, error) {
 	if rmErr := os.Remove(tmpPath); rmErr != nil {
 		return false, fmt.Errorf("清理主密钥临时链接失败: %w", rmErr)
 	}
-	after, known := hardLinkCount(finalPath, finalInfo)
+	// 必须重新 stat：`finalInfo` 是 unlink 之前的快照，Unix 分支按传入的 FileInfo 读
+	// `Nlink`，复用快照会一直读到 2（Windows 分支按路径重读、恰好没暴露）——两平台
+	// 判定就此分叉，Linux 上表现为把可证明的残留误判成不可证明。契约本就是"重新 stat
+	// 期望 nlink == 1"，这里真的重读。
+	// Re-stat after unlinking: the Unix branch reads Nlink from the given FileInfo, so
+	// reusing the pre-unlink snapshot reads a stale 2 and misclassifies provable residue.
+	afterInfo, statErr := os.Lstat(finalPath)
+	if statErr != nil {
+		return false, errPublishResidueUnprovable
+	}
+	after, known := hardLinkCount(finalPath, afterInfo)
 	if !known || after != 1 {
 		return false, errPublishResidueUnprovable
 	}
