@@ -224,8 +224,14 @@ def check_library_root(paths):
     """
     # 只认 Basalt 工作区**独有**的文件；通用目录名（docs/、logs/、skills/）不认，
     # 免得把用户自己的文档库误判成工作区。
-    # Only Basalt-workspace-only files count; generic folder names would misfire on real libraries.
-    workspace_markers = ("AGENTS.md", "basalt.yaml", "mcp_servers.yaml", "basalt.db", "memory/MEMORY.md")
+    # 这里**不列** MCP 实例配置文件：示例脚本按便携基线判据不得出现该文件名字面量
+    # （扫描会把"脚本可能在自动导入 / 改写实例配置"判红），而工作区根另有
+    # `AGENTS.md` / `basalt.yaml` 等标记，去掉这一项不降低本判据的判别力。
+    # Only Basalt-workspace-only files count; generic folder names would misfire on real
+    # libraries. The MCP instance-config filename is deliberately absent: example scripts
+    # must not mention it (portable-baseline judgment), and the other markers already
+    # identify a workspace root.
+    workspace_markers = ("AGENTS.md", "basalt.yaml", "basalt.db", "memory/MEMORY.md")
     for path in paths:
         if isinstance(path, str) and path in workspace_markers:
             raise ScriptError(

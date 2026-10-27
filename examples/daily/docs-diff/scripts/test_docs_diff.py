@@ -197,10 +197,14 @@ class DocsDiffTest(unittest.TestCase):
 
     def test_workspace_marker_in_listing_is_refused(self):
         # 逆改点：docs-readonly 没传 -root → 清单里出现工作区文件，仍逐份取元信息。
-        pairs = [("a.md", fixture("a.md")), ("AGENTS.md", b"# workspace\n")]
-        documents, metadata = snapshot(pairs)
-        with self.assertRaisesRegex(ScriptError, "只读库根疑似指向整个工作区"):
-            docs_diff.diff_documents(documents, metadata, None, now=NOW)
+        # 每个仍受检的标记各来一遍：去掉 MCP 实例配置文件名之后，判别力不能靠
+        # 单个样例撑着。
+        for marker in ("AGENTS.md", "basalt.yaml", "basalt.db", "memory/MEMORY.md"):
+            with self.subTest(marker=marker):
+                pairs = [("a.md", fixture("a.md")), (marker, b"# workspace\n")]
+                documents, metadata = snapshot(pairs)
+                with self.assertRaisesRegex(ScriptError, "只读库根疑似指向整个工作区"):
+                    docs_diff.diff_documents(documents, metadata, None, now=NOW)
 
     def test_oversized_listing_is_refused_before_any_metadata(self):
         pairs = [(f"doc-{index:02d}.md", b"x") for index in range(docs_diff.MAX_DOCUMENTS + 1)]

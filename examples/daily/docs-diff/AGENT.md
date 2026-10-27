@@ -48,8 +48,8 @@ schedules:
    **库根校验（在调用任何 `document_metadata` 之前，必做）**：只看清单就能判断
    docs-readonly 有没有指对库。出现下面任一情况，**立刻停**，不要逐份取元信息
    （每份一次调用，很快把工具预算烧光，run 会被记成「工具调用次数超限」）：
-   - 清单里有工作区文件：`AGENTS.md`、`basalt.yaml`、`mcp_servers.yaml`、
-     `basalt.db`、`memory/MEMORY.md`；
+   - 清单里有工作区文件：`AGENTS.md`、`basalt.yaml`、`basalt.db`、
+     `memory/MEMORY.md`；
    - 文档数超过 **20**。
 
    两种情况都说明 server 的库根是整个工作区（启动参数缺 `-root`）。处理：在 Agent
