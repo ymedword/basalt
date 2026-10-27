@@ -1795,3 +1795,12 @@ Windows 侧复发同一 command（`-run '^TestFullPackage'`）→ `ok 9.936s`（
 - **启动方式**：`run-demo.sh`（source `.env.local`；凭证未打印、未落盘到记录）。存量实例就地重启：`created=[] kept=[agents skills memory logs archive sessions AGENTS.md SOUL.md USER.md mcp_servers.yaml memory/MEMORY.md]`、`启动恢复完成 recovered=0`、`投递恢复完成 recovered=0`。
 - **读数**：PID 41568，监听 `127.0.0.1:8080`；`mcp_connected=4`（dbhub 1 / docs-readonly 3 / fetch 1 / github 27），四台 `pending_restart=false`；认证未带凭据 401 / 带凭据 200、`/console/` 200；`execution_profile=standard`（白名单 4 条运行时整串路径）；agents=5 全部注册；五条调度已装载，下次运行落在 `2026-10-28` 08:30–09:30。
 - **清理**：本轮排查留在实例根目录的临时文件（`*.tmp`、`last-*.txt`、`err.txt`、0 字节 `basalt.db` 探针产物）已删除；`serve-*.log` 运行日志保留。备份库 `backups/basalt-predemo-repair-20261027.db` 保留。
+
+### 7.11 人工 review ② 通过，US-14 收口（2026-10-27）
+
+**用户决定（原话）**：「review 2 我人工验收没问题了，us-14可以完全收口了，没有其他需要改动的地方了」；随后指令「记得提交推送」。据此记录 US-14 收口结论，不再改源码 / 契约 / 判据面。
+
+- **所验版本**：最终候选提交 `52015b4`（两阶段门禁与双平台包走查的绑定，见 §7.6.3 / §7.9）与证据提交 `cb96da4`（父提交即 `52015b4`，未改被测源码）；演示实例 `bin/basalt-demo.exe` 与该提交的 Windows 包内 `basalt.exe` 同一文件（`217a3090…`）。
+- **人工验收范围**：8080 演示实例上的界面与功能（五个 Demo、MCP 目录 / 诊断 / 测试、渠道与工作区修复）由用户亲自点验，结论为无遗留问题、无新增改动要求。
+- **未验证项保持原状**：§7.9 列出的完整包模型业务、真实外部数据、`clean-checkout` 仅 Windows 等仍按「未验证」记录，不因收口改写成通过。
+- **收口后状态**：工作区干净；演示实例继续运行最终候选二进制（PID 41568）；本 US 的后续动作只剩用户侧推送 / 合回 `main` 与打 `v0.1.0` tag（tag 归用户）。
