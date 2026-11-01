@@ -8633,6 +8633,8 @@ US-16 保持**未收口**；`main` 未动。
 | `41303214098` | `fix/ci-stage-build-scope` @ `092e1cd` | 5/5 job success |
 | `41305923229` | `main` @ `092e1cd` | 5/5 job success（test / postgres / console / build / website） |
 | `41308302166` | `Publish website`（workflow_run） | success，36s |
+| `41308603818` | `main` @ `a2746ed`（即本段所在的记账提交） | 5/5 job success |
+| `41311007087` | `Publish website` @ `a2746ed` | success |
 
 - **判据下沉到 check，不只看 job 绿**：取 `acceptance-evidence` 工件后核
   `current-41303214098-1/report.json` —— `base_commit=092e1cd1d1743c435e474f1c66adfbbfcaa9756d`、
