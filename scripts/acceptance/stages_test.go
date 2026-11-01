@@ -57,6 +57,54 @@ func normalizeLevel(c check) check {
 	return c
 }
 
+// integrationTaggedChecks 是**显式清单**：只有这七个现行 check 允许携带
+// `-tags=integration`。US-16 把 internal/app 的测试文件迁进集成构建面后，这些 check 的
+// required_tests 在默认构建面不再可见，加标签是让 `go test -list` 重新看得到它们。
+// 放宽的**只有"构建范围"这一个维度**——比较时把该标志从两侧剥离，其余字段仍逐字比对；
+// 清单之外的 check 带该标志即判红。扩充清单必须留下依据，不靠"碰巧一样"。
+// integrationTaggedChecks lists the only current checks allowed to carry the integration
+// build tag. Only the build scope is relaxed; every other field is still compared verbatim.
+var integrationTaggedChecks = map[string]bool{
+	"008-app-notify":       true,
+	"008-ports-eleven":     true,
+	"009-app-web":          true,
+	"010-app-schedule":     true,
+	"010-app-tools-eleven": true,
+	"010-app-crossentry":   true,
+	"010-race":             true,
+}
+
+// countArg 数某个 argv 元素在参数里出现的次数。重复出现必须能数出来——剥离式比对会让
+// 它"看不见"，而看不见的重复同样是配置错误。
+// countArg counts occurrences of an argv element; stripping would hide duplicates.
+func countArg(args []string, want string) int {
+	n := 0
+	for _, a := range args {
+		if a == want {
+			n++
+		}
+	}
+	return n
+}
+
+// withoutIntegrationTag 剥掉 `-tags=integration`，让"构建范围"以外的字段照旧逐字比对。
+// withoutIntegrationTag strips the integration build tag so the remaining fields still
+// compare verbatim.
+func withoutIntegrationTag(c check) check {
+	args := make([]string, 0, len(c.Args))
+	for _, a := range c.Args {
+		if a == "-tags=integration" {
+			continue
+		}
+		args = append(args, a)
+	}
+	if len(args) == len(c.Args) {
+		return c
+	}
+	c.Args = args
+	return c
+}
+
 // TestStages_CurrentCoversHistorical 历史 check 不被静默丢失；替代项（US-8 / US-10）必须
 // 显式登记在 superseded_checks，且旧 ID 不得照抄进现行 stage。
 // TestStages_CurrentCoversHistorical keeps every historical check present and makes each
@@ -86,6 +134,31 @@ func TestStages_CurrentCoversHistorical(t *testing.T) {
 		current.SupersededChecks,
 		"current.json must register exactly the explicit US-8 and US-10 replacements")
 	require.Contains(t, currentByID, "008-ports-eleven")
+
+	// 构建标签同样是显式清单（US-16 起）：清单内的 check 才可带 `-tags=integration`，
+	// 清单外一律不得带——否则等于绕过逐字段比对，把任意 check 静默挪进集成构建面。
+	require.Equal(t, []string{
+		"008-app-notify", "008-ports-eleven", "009-app-web", "010-app-crossentry",
+		"010-app-schedule", "010-app-tools-eleven", "010-race",
+	}, slices.Sorted(maps.Keys(integrationTaggedChecks)),
+		"the integration-tag allowlist must stay explicit; a new entry needs its own decision record")
+	for id := range integrationTaggedChecks {
+		require.Contains(t, currentByID, id,
+			"allowlisted check %s is missing from current.json; drop the stale allowlist entry", id)
+	}
+	for _, c := range current.Checks {
+		n := countArg(c.Args, "-tags=integration")
+		if n == 0 {
+			continue
+		}
+		require.True(t, integrationTaggedChecks[c.ID],
+			"check %s carries -tags=integration without an explicit allowlist entry", c.ID)
+		// 恰好出现一次：`withoutIntegrationTag` 会把**全部**出现一并剥掉，重复写等于从
+		// 逐字段比对里整段消失；而 `go test` 只认最后一个 `-tags`，重复写还会让"这个
+		// check 到底在哪个构建面上跑"说不清。
+		require.Equal(t, 1, n,
+			"check %s carries -tags=integration %d times; the build scope must be stated exactly once", c.ID, n)
+	}
 }
 
 // TestStages_CurrentMatchesHistorical 非替代项与历史定义逐字段相等；替代项只校验替代目标与测试名。
@@ -115,7 +188,14 @@ func TestStages_CurrentMatchesHistorical(t *testing.T) {
 			}
 			got, ok := currentByID[old.ID]
 			require.True(t, ok, "%s: historical check %s missing from current.json", rel, old.ID)
-			require.Equal(t, normalizeLevel(old), normalizeLevel(got),
+			want := normalizeLevel(old)
+			have := normalizeLevel(got)
+			if integrationTaggedChecks[old.ID] {
+				require.Contains(t, got.Args, "-tags=integration",
+					"%s: %s is on the integration allowlist but lost the build tag", rel, old.ID)
+				have = withoutIntegrationTag(have)
+			}
+			require.Equal(t, want, have,
 				"%s: %s drifted from its historical definition", rel, old.ID)
 		}
 	}
@@ -211,7 +291,7 @@ var pinnedStageChecks = []pinnedStageCheck{
 	{
 		stage:   "harness/stages/current.json",
 		id:      "008-ports-eleven",
-		args:    []string{"go", "test", "-json", "-count=1", "./internal/app", "-run", "^TestToolListerPort_HeavyAssemblyRegistersElevenTools$"},
+		args:    []string{"go", "test", "-json", "-count=1", "-tags=integration", "./internal/app", "-run", "^TestToolListerPort_HeavyAssemblyRegistersElevenTools$"},
 		timeout: 300,
 		level:   "source",
 	},
@@ -219,7 +299,7 @@ var pinnedStageChecks = []pinnedStageCheck{
 		stage: "harness/stages/current.json",
 		id:    "010-app-tools-eleven",
 		args: []string{
-			"go", "test", "-json", "-count=1", "-run",
+			"go", "test", "-json", "-count=1", "-tags=integration", "-run",
 			"^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersElevenTools)$",
 			"./internal/app",
 		},

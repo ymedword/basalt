@@ -154,6 +154,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "./internal/app",
         "-run",
         "^(TestNewNotifyAdapters_|TestAgentsPort_LightPathAcceptsNotifyDeclaration$)"
@@ -171,6 +172,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "./internal/app",
         "-run",
         "^TestToolListerPort_HeavyAssemblyRegistersElevenTools$"
@@ -368,6 +370,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "./internal/app",
         "-run",
         "^(TestNewWebServer_|TestWebProviders_|TestNewToolCatalogPort_|TestEnsureWorkspaceForServe|TestNeedsServer|TestNewRuntime_MaxConcurrentRuns|TestRun_HeavyCommandSplit|TestRunWithRuntime_)"
@@ -660,6 +663,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "-run",
         "^(TestNeedsSchedules|TestNewScheduler_|TestScheduleEditorAdapter_|TestRun_Schedule|TestHeavyRuntime_CloseStopsSchedulerFirst|TestScheduleStartExitCode_|TestNewRuntime_ServiceHasSessionGate|TestApp_SignalContextUsesInjectedNotifier)",
         "./internal/app"
@@ -690,6 +694,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "-run",
         "^(TestDeclaredToolNames_IncludesManageSchedule|TestWebOptions_SchedulesWired|TestRun_HeavyCommandSplit|TestToolListerPort_HeavyAssemblyRegistersElevenTools)$",
         "./internal/app"
@@ -709,6 +714,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "-run",
         "^TestCrossEntry_",
         "./internal/app"
@@ -727,6 +733,7 @@
         "-race",
         "-json",
         "-count=1",
+        "-tags=integration",
         "./internal/core",
         "./internal/adapters/cron",
         "./internal/storage",

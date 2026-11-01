@@ -8469,3 +8469,143 @@ US-16 保持**未收口**；`main` 未动。
   代码、契约、需求、技术方案与本文件同步。
 - 三项**未验证**随收口保留在本文件：最终树全量验收、首启配置路径、远端 CI。
   其中前两项的依据见本轮裁决记录，**不得**在后续表述成已通过。
+
+## R173 · CI 红态修复：stage 构建标签与 MCP 进程收尸竞态（2026-11-01）
+
+### ·1 现象与定位
+
+- **两次独立故障，不是一次**。`41280964346`（`af6cfc4`）死在 step 6 Unified acceptance：
+  test job 的 pgvector / pg_trgm service 容器没有 `CREATE EXTENSION`，pgtemp 对扩展 schema
+  查询返回空集即 fail-closed——已由 `b57835a` 修复，HEAD 上该步绿。
+- `41291700626` / `41291730705` / `41291765822` / `41291780199`（`ce15606` / `e6c85cf`）
+  死在 **step 8 Lint stage definitions**，四次运行的 ERROR 集合逐字节一致：**36 行、30 个
+  测试名、7 个 check**（`010-app-schedule` 15、`009-app-web` 8、`010-race` 4、
+  `010-app-tools-eleven` 4、`010-app-crossentry` 2、`008-app-notify` 2、`008-ports-eleven` 1）。
+- 根因：`af6cfc4` 给 `internal/app` 的 73 个测试文件加了 `//go:build integration`，
+  这些 `required_tests` 在默认构建面不再可见；stage 的检查命令没有 `-tags=integration`，
+  `go test -list` 看不到它们，lint 判 missing。
+- step 9 / 10 / 12 因为 step 8 先死，从未在 HEAD 上执行过。
+
+### ·2 处置（三处，缺一不可）
+
+| # | 改动 | 依据 |
+| --- | --- | --- |
+| 1 | `harness/stages/current.json` 七个 check 的 args 各加 `-tags=integration` | 恢复这些 check 的可列举性与可执行性；判据集合一名未删、一参未改 |
+| 2 | `scripts/acceptance/stages_test.go`：新增显式白名单 `integrationTaggedChecks` + 比较时只剥离该标志 + 两条 US-15 argv 钉子同步 | 见 ·3 判据面披露 |
+| 3 | `internal/tool`：`mcp.go` 新增 `processDone`，三处 `cmd.ProcessState != nil` 改为 `cmd.Process.Signal(syscall.Signal(0))` 探测 | 见 ·4 竞态 |
+
+- **竞态是既有缺陷，不是本次改动引入**：`cmd.ProcessState` 的三处读取由 `84064ba`
+  （US-12）引入。此前没有任何门禁同时开着 `-race` 与 `-tags=integration`，所以它从未被执行到；
+  本次把标签加到整包 `010-race` 后 `TestMCPIntegration_ServerDiesMidCall` 必红地暴露了它。
+- 修法可对源码溯源：项目锁定的 go1.27.3 toolchain 中，Unix 侧 `Process.signal` 取
+  `sigMu` 读锁、`Wait` 取写锁后再置位（`src/os/exec.go:54`、`exec_unix.go:53-56,101`）；
+  Windows 侧 `handleTransientAcquire` 读的是原子状态量（`exec.go:167`）。
+  `exec.Cmd.ProcessState` 是裸字段，跨 goroutine 读必然竞态。
+
+### ·3 判据面变更披露（需用户裁决，已于 2026-11-01 获准）
+
+- **变更点**：`TestStages_CurrentMatchesHistorical` 与非被替代的历史 check 做**逐字段**比较，
+  args 包含在内；历史 stage 文件由 `TestStages_HistoricalFilesPinned` 按 SHA-256 冻结，
+  不可改。因此"加 `-tags=integration`"必然被判漂移。若不改这个守卫，只提交改动 1 会把红态
+  从 step 8 挪到 step 7（`go test -race -cover ./...` 覆盖 `scripts/acceptance`）。
+- **放开范围**：只放开"构建范围"一个维度——仅在 check 命中显式白名单时剥离
+  `-tags=integration` 再比较，其余字段仍逐字比对；同时反向钉死——白名单之外的 check
+  带该标志即判红，白名单本身也是精确集合断言。三条红态反证均实测（见 ·5）。
+- **未改动**：`pinnedRequiredTests`、`superseded_checks`、`TestStages_HistoricalFilesPinned`
+  与三个历史 stage 文件一字节未动。
+- `TestStages_PinsUS15Checks` 的两条 argv 钉子（`008-ports-eleven` / `010-app-tools-eleven`）
+  同步加入 `-tags=integration`——钉子仍是逐字比较，只是接受的新字面量写进了钉子本身。
+
+### ·4 实测读数（本轮当场，WSL + 真 PostgreSQL，工作树 `e6c85cf` + 未提交改动）
+
+- 红态（改前）：`internal/tool` 在 `-race -tags=integration` 下
+  `WARNING: DATA RACE` @ `mcp.go:546` + `--- FAIL: TestMCPIntegration_ServerDiesMidCall`。
+- 绿态（改后）：WSL unix 半边 `ok 20.623s`；**Windows 半边 `ok 29.877s`**（两条都是真跑）。
+- 三条守卫红态反证（探针后 `current.json` 已复原，sha256 前后一致 `19ec8171…`）：
+  - 清单外 check 带标签 → `check 015-invariants carries -tags=integration without an explicit allowlist entry`
+  - 清单内 check 丢标签 → `008-app-notify is on the integration allowlist but lost the build tag`
+  - 清单内 check 改别的字段 → `008-app-notify drifted from its historical definition`
+- `go test -count=1 ./scripts/acceptance/` → `ok 12.080s`
+- `--lint-stages --stage harness/stages/current.json` → `EXIT=0`，**0 ERROR**、474 WARN、`stage lint: ok`
+- stage 验收（`--stage-only --task <T>`，证据在 `.loop/runs/cifix-*`）：
+  us8 7/7、us9 9/9、us10 **13/13**、us15 **4/4**，四个总 `exit=0`。
+  - `010-race`：**259412 ms / 4755 条通过**，超时 900 s（3.5 倍余量）；
+    这也是"整包集成面塞进 `-race` 会不会超时"的实测回答。
+  - `015-acceptance-infra`：20422 ms / 91 条通过（此前 exit=1）。
+- `make check` 七目标：**`MAKE_CHECK_EXIT=0`**，0 条 `^FAIL`、0 条 `DATA RACE`、124 条 `ok`；
+  `check-format: gofmt / gofumpt 均干净`；`govulncheck: No vulnerabilities found`；
+  `check-coverage: 全部包达标`；`CGO_ENABLED=0 go build … -o bin/basalt` 成功。
+
+### ·5 未验证与边界（不得表述成已通过）
+
+- **远端 CI 未跑**：改动尚未提交，ubuntu-latest 上的 step 8–12 一次都没执行过。
+  本地证据全部来自 WSL（Linux）+ 真 PG，与 CI 同族但不同环境。
+- **Publish website 未验证**：红 CI 期间两次 workflow_run 被 skipped，线上站点仍停在
+  `60dd2c5`；修复合并后应自行恢复，按用户 2026-11-01 决定不做额外处理。
+- **`010-race` 的本地执行门槛变了**：加标签后该 check 的 7 个包会编译并执行集成面，
+  本地执行 `harness/stages/current.json` 现在需要 `BASALT_TEST_PG_DSN`；此前不需要。
+- `internal/tool` 的竞态修复落在 **US-16 的模块卡范围之外**，属用户 2026-11-01 明确批准
+  的三件套之一；未走模块卡修订流程。
+- 本次未触碰：演示实例（8080，pid 37372）、实例数据、任何凭据。
+
+### ·6 更正 R173 ·2 / ·4 的 Windows 说明，并补"标签恰好一次"守卫（2026-11-01，提交前）
+
+- **更正对象**：·2 与 ·4 把 `Signal(0)` 探测写成"Windows 侧读 `handleTransientAcquire` 的原子
+  状态量，因此是跨 goroutine 观察已收尸的入口"。这句话只对 Unix 成立，**Windows 半句是错的**，
+  按台账纪律不改旧行、在此更正。
+- **Windows 的真实形状**（实测 + 源码双证）：`Process.signal` 在 Windows 上**根本不处理信号 0**
+  ——`statusReleased` 映射成 `syscall.EINVAL`，其余一律落到 `syscall.EWINDOWS`；而 handle 型进程的
+  `wait()` 结束时置的是 `statusReleased`（不是 `statusDone`，为兼容二次 Wait）
+  （go1.27.3 `os/exec_windows.go:55-78`、`os/exec.go:29-40,160-185`）。实测读数
+  （windows/amd64 go1.27.3，仓库外临时探针目录，用毕即删）：
+
+  ```text
+  alive        err=not supported by windows   ErrProcessDone=false EINVAL=false EWINDOWS=true
+  after-wait   err=invalid argument           ErrProcessDone=false EINVAL=true  EWINDOWS=false
+  after-wait-2 err=invalid argument           ErrProcessDone=false EINVAL=true  EWINDOWS=false
+  ```
+
+- **后果**：照抄 Unix 写法会让 `processDone` 在 Windows 上**恒为 false**——清理路径对已收尸的 PID
+  白跑一次 `taskkill`，再把它的失败当真实清理错误上报（`closePooledSession` 会把 `killErr` 并进
+  返回值）。这不是措辞问题，是实现缺陷。
+- **处置**：`processDone` 只保留跨平台判据（禁止读 `exec.Cmd.ProcessState`，原因见 mcp.go 注释），
+  探测下沉为两份 `processReaped`：Unix 认 `os.ErrProcessDone`，Windows 认 `syscall.EINVAL`
+  （并保留 `os.ErrProcessDone` 兜底）。新增 windows-only 用例
+  `TestMCPProcess_ProcessDone_AfterWait` 钉住该形状——标准库改映射时它立刻变红。
+- **顺带更正一处计数**：·2 写「三处 `cmd.ProcessState != nil`」，实际是**四处**——三处前置守卫
+  加 taskkill 失败后的那一处复核（`mcp_process_windows.go` 的 `:28` 与 `:37` 各一处）。
+- **同时补齐**：用户指出的"验收标签恰好出现一次"守卫。`withoutIntegrationTag` 会剥掉**全部**出现，
+  重复写入因此从逐字段比对里整段消失；且 `go test` 只认最后一个 `-tags`，重复写让构建范围说不清。
+  新增 `countArg` 计数并在 `TestStages_CurrentCoversHistorical` 中断言恰好 1 次。
+- **判别力实测**（三条红态，逐字文案；探针后 `current.json` 已复原，sha256 前后一致
+  `19ec8171ed9bf93b…`）：
+  - 重复标签 → `check 008-app-notify carries -tags=integration 2 times; the build scope must be stated exactly once`
+    （同在重复态下 `TestStages_CurrentMatchesHistorical` **仍然通过**——正是这次补守卫的理由）
+  - 非白名单 check 带标签 → `check 015-invariants carries -tags=integration without an explicit allowlist entry`
+  - 白名单 check 丢标签 → `harness/stages/us8-notify-r1.json: 008-app-notify is on the integration allowlist but lost the build tag`
+- **本轮当场读数**：`go build ./...` 退出 0；`go test -count=1 ./internal/tool/` ok 4.171s；
+  `go test -race -count=1 -tags=integration -run TestMCPIntegration_ServerDiesMidCall ./internal/tool/`
+  **ok 2.204s PASS**（Windows 半边，语义改动后**重跑**——旧证据只覆盖改坏的实现，不能顶替）；
+  `go test -count=1 -run TestMCPProcess_ProcessDone_AfterWait ./internal/tool/` PASS；
+  `go test -count=1 ./scripts/acceptance/` ok 8.785s；`go vet -tags=integration` 退出 0；
+  `staticcheck -tags=integration -checks=…` 退出 0；`gosec -quiet -tags=integration ./internal/tool/` 退出 0；
+  `gofumpt -l` 对两个包无输出。
+- **未验证（提交前状态）**：本轮改动之后**没有**重跑全量 `make check`（只跑了受影响的包与
+  守卫用例）；远端 CI 仍未在本改动上执行过。
+
+### ·7 提交前最终读数（2026-11-01）
+
+- **最终工作树读数**（·6 之后又改了 `processReaped` 注释、白名单存在性守卫与用例，故重取）：
+  `go vet -tags=integration ./internal/tool/ ./scripts/acceptance/` 退出 0；
+  `go test -count=1 -run TestMCPProcess_ProcessDone_AfterWait ./internal/tool/` PASS；
+  `go test -race -count=1 ./scripts/acceptance/` **ok 39.930s**（即 CI step 7 的跑法，
+  在白名单存在性守卫加入**之后**执行）。
+- **白名单存在性守卫**：·6 只记了"标签恰好一次"与三条红态；另加的一条是白名单条目对应的
+  check 必须真的在 `current.json` 里——否则一条过期白名单会让"清单外的 check 带标签"这条
+  判断对不存在的对象空转。判别力实测（第四条红态，逐字文案）：
+  把 `999-bogus` 同时登记进白名单与期望集合、`current.json` 不动 →
+  `allowlisted check 999-bogus is missing from current.json; drop the stale allowlist entry`。
+  探针后 `scripts/acceptance/stages_test.go` 复原为 sha256 `92ff015bbe05507a…`，
+  `harness/stages/current.json` 仍为 `19ec8171ed9bf93b…`，与探针前一致。
+- **仍未验证**：全量 `make check` 未在最终工作树上重跑（上一轮全绿只代表更早的工作树）；
+  远端 CI 此刻仍未执行过本改动。

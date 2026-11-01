@@ -543,13 +543,28 @@ func closePooledSession(session *mcp.ClientSession, cmd *exec.Cmd) error {
 // 注入传输）或进程已被收尸时是空操作。
 // killTreeAfterFailure best-effort kills the stdio child tree and reports whether it did.
 func killTreeAfterFailure(cmd *exec.Cmd) (bool, error) {
-	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+	if cmd == nil || cmd.Process == nil || processDone(cmd) {
 		return false, nil
 	}
 	if err := killMCPProcessTree(cmd); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// processDone 判断 stdio 子进程是否已被 Wait 收尸。**不得**改回读 `exec.Cmd.ProcessState`：
+// 该字段由 SDK 侧 `Cmd.Wait` 的 goroutine 写入，从这里跨 goroutine 读构成 data race
+// （`go test -race -tags=integration -run TestMCPIntegration_ServerDiesMidCall` 可复现）。
+// `os.Process` 的完成状态由它自己同步（Unix 走 `sigMu`，Windows 走原子状态量），因此只能经
+// `Signal` 观测——但**"已收尸"在两个平台上不是同一个错误**：Unix 是 `os.ErrProcessDone`，
+// Windows 是 `syscall.EINVAL`。平台差异与实测读数写在 processReaped 的两份实现里，
+// 本函数只保留跨平台判据，**不得**在任一平台半边之外重新内联探测表达式。
+// processDone reports whether the stdio child has already been reaped. Never read
+// exec.Cmd.ProcessState here: the SDK's Cmd.Wait writes it. Completion is observable only
+// through Signal, and "reaped" is a different error on each platform, so the probe itself
+// lives in processReaped.
+func processDone(cmd *exec.Cmd) bool {
+	return processReaped(cmd.Process)
 }
 
 // commandOfTransport 从拨号结果里取出本地子进程句柄；非命令传输（http / 测试注入）

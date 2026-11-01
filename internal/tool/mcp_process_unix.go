@@ -10,6 +10,7 @@ package tool
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -21,11 +22,21 @@ func configureMCPChildProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// processReaped 用信号 0 探测进程是否已被 Wait 收尸：信号 0 不投递任何信号，只做存在性
+// 检查。Unix 侧 `Process.signal` 在 `Wait` 置位后返回 `os.ErrProcessDone`（pidfd 路径直接读
+// 完成状态；PID 路径把 `kill(pid, 0)` 的 ESRCH 转成同一错误）。僵尸态（已退出、未收尸）
+// **不算**——`kill` 仍成功，说明进程组里可能还有后代要清。
+// processReaped probes with signal 0; on Unix Process.signal reports os.ErrProcessDone once
+// Wait has marked the process done (pidfd state, or ESRCH from kill(pid, 0)).
+func processReaped(p *os.Process) bool {
+	return errors.Is(p.Signal(syscall.Signal(0)), os.ErrProcessDone)
+}
+
 // killMCPProcessTree 对整个进程组发 SIGKILL；组已不存在（ESRCH）按"没有可清理的对象"
 // 放行——进程组在组长退出后仍对其存活成员有效，因此这一调用不依赖父进程存活。
 // killMCPProcessTree SIGKILLs the whole group and tolerates an already-empty group.
 func killMCPProcessTree(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+	if cmd == nil || cmd.Process == nil || processDone(cmd) {
 		return nil
 	}
 	pid := cmd.Process.Pid
