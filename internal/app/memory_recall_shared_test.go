@@ -1,8 +1,14 @@
 package app
 
-// 本文件是 review ② D-4 的**计数、配额与审计**判据：共享记忆让一次 `recall_memory`
+// 本文件是 review ② D-4 的**计数与审计**判据：共享记忆让一次 `recall_memory`
 // 触发**两次** embedding（每层一次），两次都必须各自走 `embedding_calls` 的两阶段
 // 预写；权限撤销与预写失败都要在**花掉 embedding 之前**拦住。
+//
+// 配额口径**不**在本文件断言：查询侧 embedding token 只落 `embedding_calls`，召回路径
+// 上没有任何调用方配额端口（`memory_recall.go` / `audited_embedder.go` 均不引用
+// limiter），"不计入配额"目前是结构事实而非测试断言——技术方案 §3.5.2 已按此写明，
+// 不得据此宣称"配额已被用例验证"。
+// The quota rule is structural here (no limiter on the recall path), not asserted.
 //
 // 为什么这一层要单独判：工具层只看得见"调了几次召回端口"，看不见每次召回背后的
 // 模型调用与钱。共享模式把模型调用翻倍，若只在工具层判，翻倍这件事在测试里不可见——

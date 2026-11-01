@@ -150,14 +150,35 @@ schedules:
 你是周报助手。
 `
 
+// Note: 夹具**必须自带 settings 块**——`editorContent` 没有 settings 段，用它只能证明
+// "新写一块"，证不出"同块里的其它设置没被改掉"（review ② D-1/D-5 的缺口）。
+// The fixture must carry an existing settings block; otherwise the test cannot show
+// that sibling settings survive the edit.
+const editorContentWithSettings = `---
+name: writer
+description: "旧描述"
+settings:
+  max_iterations: 8
+  max_history_turns: 20
+identity:
+  agent_name: "周报助手"
+  prompt: "你是周报助手。"
+---
+
+你是周报助手。
+`
+
 func TestAgentContentChanges_GlobalMemoryChoicePreservesDefinition(t *testing.T) {
 	enabled := true
-	updated, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+	updated, err := ApplyChanges([]byte(editorContentWithSettings), core.AgentContentChanges{
 		Settings: &core.AgentSettingsChanges{IncludeGlobalMemory: &enabled},
 	})
 	require.NoError(t, err)
 	require.Contains(t, string(updated), "include_global_memory: true")
+	require.Contains(t, string(updated), "max_iterations: 8", "同块中的其它设置不得被改写")
+	require.Contains(t, string(updated), "max_history_turns: 20", "同块中的其它设置不得被改写")
 	require.Contains(t, string(updated), "你是周报助手。")
+
 	disabled := false
 	updated, err = ApplyChanges(updated, core.AgentContentChanges{
 		Settings: &core.AgentSettingsChanges{IncludeGlobalMemory: &disabled},
@@ -165,6 +186,18 @@ func TestAgentContentChanges_GlobalMemoryChoicePreservesDefinition(t *testing.T)
 	require.NoError(t, err)
 	require.Contains(t, string(updated), "include_global_memory: false")
 	require.NotContains(t, string(updated), "include_global_memory: true")
+	require.Contains(t, string(updated), "max_iterations: 8", "改写取值同样不得动其它键")
+	require.Contains(t, string(updated), "max_history_turns: 20", "改写取值同样不得动其它键")
+	require.Contains(t, string(updated), "你是周报助手。")
+
+	cleared, err := ApplyChanges(updated, core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{ClearIncludeGlobalMemory: true},
+	})
+	require.NoError(t, err)
+	require.NotContains(t, string(cleared), "include_global_memory", "清除只删该行")
+	require.Contains(t, string(cleared), "max_iterations: 8", "清除不得连带删掉同块的其它键")
+	require.Contains(t, string(cleared), "max_history_turns: 20", "清除不得连带删掉同块的其它键")
+	require.Contains(t, string(cleared), "你是周报助手。")
 }
 
 // TestAgentContentPatch_ClearIncludeGlobalMemory：`include_global_memory: null` 必须

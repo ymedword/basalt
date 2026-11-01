@@ -383,6 +383,25 @@ describe('agent config page', () => {
   // 选回「沿用旧规则」必须发**显式 null**（服务端据此删掉该行）。发 false 会让文件里
   // 写着 false 而页面显示"沿用旧规则"——两者的注入行为不同，页面就成了假象。
   // 同时判「沿用旧规则」这一项**可选**：它是 disabled 时用户点过 true 就再也回不去。
+  // 「仅使用本 Agent 记忆」必须发字面的 false，而不是 null——发 null 会回到兼容回退
+  // （本 Agent 层为空时读全局层），两个选项的实际注入行为不同，页面不能把二者写成一个。
+  // 对应 D-5「三种选项都要能从页面真正存回去」。
+  it('saves an explicit false choice as false, not as the legacy null', async () => {
+    setupFetch({ config: configView({ fields: fields({
+      settings: { max_iterations: 8, max_history_turns: 20, include_global_memory: true },
+    }) }) }, (call) => {
+      if (call.path === '/api/v1/agents/writer/content' && call.method === 'PUT') return savedAgent()
+      return undefined
+    })
+    await openConfig()
+    const select = found('#config-global-memory')
+    expect((select.element as HTMLSelectElement).value).toBe('true')
+    await select.setValue('false')
+    await buttonOf('保存配置').trigger('click')
+    await flushPromises()
+    expect(contentCalls()[0]!.ifMatch).toBe(CONFIG_ETAG)
+    expect(contentCalls()[0]!.body).toEqual({ changes: { settings: { include_global_memory: false } } })
+  })
   it('returns to the legacy rule by sending an explicit null, not false', async () => {
     setupFetch({ config: configView({ fields: fields({
       settings: { max_iterations: 8, max_history_turns: 20, include_global_memory: true },

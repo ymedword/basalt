@@ -104,7 +104,7 @@ type MemoryReader interface {
 	// **不得**因此回退去注全局层的核心区（颗粒度文档 §6.2 口径 1 / 2）。
 	//
 	// `principal` 是本次 Run 的实际身份，**读任何一层之前**都要复核：身份有效 →
-	// `agent:invoke:<agent>` scope → 调用方 Key 的**当前**状态（撤销即拒）。未声明
+	// `agents:invoke:<agent>` scope → 调用方 Key 的**当前**状态（撤销即拒）。未声明
 	// `include_global_memory` 不是权限旁路——配置只决定读哪几层，不决定能不能读。
 	// 没有 Agent 上下文（读全局层本身）时只允许本地管理员。
 	// LoadEffective returns the effective layer's core text; layers never stack, and a

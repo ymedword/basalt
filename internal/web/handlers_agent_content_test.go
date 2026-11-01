@@ -855,6 +855,39 @@ func TestAgentContent_GlobalMemoryChoiceUsesConditionalWrite(t *testing.T) {
 	require.Contains(t, string(readAgentDoc(t, env.root, contentAgentName)), "include_global_memory: true")
 }
 
+// TestAgentContent_IncludeGlobalMemoryClearIsConditional：回「沿用旧规则」= PATCH 显式
+// `null`，删除该行；它与写值走同一条 ETag 条件写——过期 ETag 被拒**且不清除**，当前
+// ETag 才真正把键从文件里删掉。这条用例补的正是 D-5「清除字段也要保持并发保护」的
+// HTTP 面证据（补丁层用例只证明文件最终形态，不证明并发闸门）。
+// 逆改点：清除分支绕开 ETag 比较、或把 `null` 当成 `false` 写入 → 过期 ETag 断言或
+// 「键已消失」断言变红。
+// 验收点：D-5；C-52。
+func TestAgentContent_IncludeGlobalMemoryClearIsConditional(t *testing.T) {
+	env := newContentEnv(t)
+	staleETag := currentETag(t, env)
+
+	set := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"settings":{"include_global_memory":true}}}`, staleETag))
+	require.Equal(t, http.StatusOK, set.Code, set.Body.String())
+	require.Contains(t, string(readAgentDoc(t, env.root, contentAgentName)), "include_global_memory: true")
+
+	current := currentETag(t, env)
+	require.NotEqual(t, staleETag, current, "写入后 ETag 必须变化，否则本用例判不出并发闸门")
+
+	rejected := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"settings":{"include_global_memory":null}}}`, staleETag))
+	require.Equal(t, http.StatusPreconditionFailed, rejected.Code, rejected.Body.String())
+	require.Contains(t, string(readAgentDoc(t, env.root, contentAgentName)), "include_global_memory: true",
+		"过期 ETag 的清除不得生效")
+
+	cleared := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"settings":{"include_global_memory":null}}}`, current))
+	require.Equal(t, http.StatusOK, cleared.Code, cleared.Body.String())
+	doc := string(readAgentDoc(t, env.root, contentAgentName))
+	require.NotContains(t, doc, "include_global_memory", "清除后该键必须从文件里消失，而不是写成 false")
+	require.Contains(t, doc, "你是周报助手。", "清除只删该行，不动正文")
+}
+
 func TestAgentContent_KnowledgeDeclarationsUseConditionalWrite(t *testing.T) {
 	env := newContentEnv(t)
 	etag := currentETag(t, env)

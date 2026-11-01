@@ -8257,3 +8257,172 @@ R165 ·3 写"验收途中源码被改"。核对证据后**该定性不成立**�
   （`harness/acceptance.json` 未改），故判据面无变更、无需裁决。
 - 但源码指纹会变（`ci.yml` 是 tracked 文件），因此按用户第 1 条：在最终树上重跑全量验收并重新绑定指纹。
 - 未验证清单不翻转任何行；US-16 仍**未收口**。
+
+## R170 · review ② 前最终候选：全量验收 90/90 + 外部层重绑 + 8080 换新二进制（2026-11-01）
+
+### ·1 最终候选（编译产物）
+
+- 在 D-1～D-7 改动全部落地后的树上执行 `make build`（`CGO_ENABLED=0 -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always)"`）：
+  `bin/basalt.exe` sha256 `f124e0d8704e2336dae379d77bc0112f300f25dfe1e38065c9fcdae21530f81b`，
+  `basalt --version` 回显 `basalt version b57835a`。
+- 必须重建的原因：上一版 `dfe97908…` 构建于 14:30，而最后三个测试文件 15:11 才改完——旧二进制不能代表最终候选。
+  这正是用户第 1 条"对最终候选重新执行受影响门禁及规定的全量验收，重新绑定源码指纹和二进制"的对象。
+
+### ·2 全量验收（90 项）
+
+| 项 | 读数 |
+| --- | --- |
+| run id | `accept-20261101T071309.672953532` |
+| 报告 | `.loop/runs/accept-20261101T071309.672953532/report.json` |
+| 源码指纹 | `79a20924416c915eecbc623db1e6786cfd7ef38f2c16ca2fdda340ed8ae87c72` |
+| 基线 commit / 脏树 | `b57835a60f82a10390e9d418dd488be50c052d5b` / `dirty=true`（差异即本批未提交改动） |
+| 被测二进制（linux） | `4ac40cd389808b790b8c1941f0c399efc7f407c7ace6acb34752f949305a7ca1` |
+| 平台 / 工具链 | WSL + `dev-env/scripts/with-postgres.sh`；Go 1.27.3 |
+| 结果 | `status=passed`、`exit_code=0`；**90 项：通过 90 / 失败 0 / 跳过 0 / 未验证 0** |
+| 窗口 | 4791.4 s（79.9 min）。冷缓存下逐项均慢于 R166（46 min），无卡死、无超时 |
+
+### ·3 外部真实服务复验（在最终候选上重绑）
+
+- 命令（Windows + Git Bash；凭据只经进程环境注入，全程只打印变量名与长度）：
+  `sh scripts/check-acceptance.sh --stage harness/stages/us16-real.json --stage-only --authorization-ref user-2026-10-27-us16-external --authorization-scope '<模块卡 §4.6 原文>'`
+- **第一次尝试失败，如实入账**：`accept-20261101T083730.566885300` 6/7 通过，
+  `TestUS16External_GitHubMcpReadOnly` 逐字报
+  `找不到内置 github-mcp-server 组件（C:\Users\76562\AppData\Local\Temp\basalt-e2e-build-2340364904\runtime\mcp\github-mcp-server\2.0.3 …）`。
+  根因（已验证）：本轮未设 `BASALT_E2E_BINARY`，harness 回退到临时构建（`binary_source=temp`），
+  临时目录没有随包 `runtime/`。**不是产品缺陷，也没有放宽任何判据**；补该环境变量后重跑。
+- **有效读数**：`accept-20261101T083831.206285100`
+  - `status=passed`、`exit_code=0`、**7/7 用例通过**、`binary_source=candidate`、
+    `binary_path=D:\code\basalt\bin\basalt.exe`、`tested_binary_sha256=f124e0d8…`
+  - 源码指纹 `9d1aed69a2a9e3341d59c4e556a20340caac1a71a92585366d123479da07b3d1`
+    （`stage-only` 作用域，与全量 `79a20924…` 不同口径，两者不可互相替代）
+  - `base_commit=b57835a`、`dirty=true`
+- 逐项实际调用（日志原文）：
+
+  | 用例 | 读数 |
+  | --- | --- |
+  | `EmbeddingIngest` | `model=text-embedding-v4 dimensions=512 chunks=1 embedding_calls=1` |
+  | `EmbeddingQuery` | 命中 `doc_SZRV90Y5… / kver_X3QV6JA1…` |
+  | `DeepSeekChat` | `llm_calls=1 累计=1`；`run=web-1793522320132-rfh347`；`run_reservations=1 chat_reservations=1` |
+  | `IndustryBriefSearch` | `llm_calls=4 累计=5`；`results=5 usable=5 fetch_attempts=1 fetch_bytes=18750` |
+  | `GitHubMcpReadOnly` | `llm_calls=2 累计=7`；`component=github-mcp-server.exe tool=list_commits repo=ymedword/basalt head=60dd2c5 tools=27` |
+  | `FeishuNotify` | `target=https://open.feishu.cn deliveries=1` |
+  | `FiveAgentsInventory` | 五个 Demo 的 `defined / lifecycle / deps / creds / config / assets` 均 `true`；`business=未验证` |
+
+- 用量对照授权 scope：embedding 2 次、DeepSeek 7 次 LLM 调用（1 会话 / 4 检索 / 2 只读工具）、
+  飞书 1 条、GitHub 只读 1 个工具调用；未超 "≤2 chats / ≤2 messages / 只读"。
+
+### ·4 演示实例换成最终候选并起 8080
+
+- 旧进程 pid 38308 停止 → 装入 `f124e0d8…` → 新进程 pid 37372；`http://127.0.0.1:8080/console` 返回 200。
+- 启动读数：`schema_version=5`、`实例加密 state=ready`、`崩溃恢复 unknowns=0 / repaired_groups=0`、
+  `工作区残留 rolled_back=0 rolled_forward=0`、`Agent 注册表建立 agents=6`、`mcp_connected=4`、工具表 43 个。
+- 五个 Demo：`GET /api/v1/agents/{name}/readiness` 全部 `ready=true` 且 `issues` 为空
+  （`github-radar` / `repo-digest` / `biz-daily` / `docs-diff` / `industry-brief`）。
+- 管理台：`GET /console/` 200，引用 `index-CeVivASU.js`；从**服务端**取回该 bundle（376610 B），
+  确认含 `沿用旧规则（未明确设置）` 与 `每次共享检索会多发一次 embedding`——页面已是 D-5 / D-4 之后的三选项版本。
+- D-1 升级安全（存量实例实测）：五个 Demo 的 `AGENT.md` **都不含** `include_global_memory`，
+  走"未声明 = 兼容回退"，升级未改变其注入内容；`walkthrough-guide` 的 `include_global_memory: true`
+  是走查时用户显式保存的值，重启后仍在。
+
+### ·5 首启配置路径（仍未验证，按原样记录）
+
+- 每次启动都出现同一条 WARN：`首次初始化未完成：配置与实例名册已在盘上，管理面访问密码尚未生成——本次启动继续完成`
+  （`instance_id=inst_3d21b3138d89e734`）。本实例走 `BASALT_ADMIN_TOKEN` 的 token 姿态
+  （`管理认证姿态已确定 posture=token`），没有走"首启生成管理口令"这条路径。
+- 与 R166 ·3 同一读数、同一结论：**不当作通过**，仍留在未验证清单。
+  真正的新建实例首启由 `us16-first-start-retry` / `us16-first-start-retry-e2e` 在 90 项里覆盖（本轮通过）。
+
+### ·6 失败台账（只追加）
+
+| 日期 | 问题 | 假设 | 结果 | 同题计数 |
+| --- | --- | --- | --- | --- |
+| 2026-11-01 | `accept-20261101T083730` 的 `us16-external` 6/7，`GitHubMcpReadOnly` 报缺 `runtime/mcp/github-mcp-server/2.0.3` | 缺 `BASALT_E2E_BINARY`，harness 用了临时构建 | 证实（`binary_source=temp`）；补变量后 7/7 | 1 |
+
+### ·7 未验证清单更新（只翻转已验证的行）
+
+- 最终候选全量验收 + 演示实例重建：**未验证 → 已验证**（2026-11-01，证据见 ·2 / ·4）。
+- 真实凭据有限验证：保持**已验证**（R168 翻转；本轮在最终候选上复验 7/7，读数见 ·3）。
+- 首启配置路径（本实例）：仍**未验证**（见 ·5）。
+- 跨文档去重端到端、知识库「内容变化 → 新建版本行」与「文档软删后重新摄取」的真演练、
+  T008a–d 与 T008c 的规模读数：仍**未验证**（裁决权在用户）。
+- D-1～D-7 review ② 归档：**待提交**（本轮之后）。
+
+### ·8 下一步
+
+汇总 D-1～D-7 的改动点 / 测试证据 / 剩余限制 / 契约与判据面变更 → 提交 review ②。
+US-16 保持**未收口**；`main` 未动。
+
+## R171 · review ② 两项契约条目的裁决与落地（2026-11-01）
+
+用户对 R170 提交的两条契约变更给出裁决：D-50（采纳）与 D-51（接受方向、文案重写）。
+本段记录裁决内容、落地范围与复核读数。
+
+### ·1 D-50：`agent-md.md` 空层行为 — **采纳**
+
+- 裁决原文要点：某层无内容时不输出该层标题或空小节；三态配置、权限校验与空层行为的测试**保留**；
+  收口记录写明这是对**既有行为的补充明确**，不是新增行为。
+- 落地：`docs/contracts/agent-md.md:71` 的措辞按此保留（R170 已写入），本轮未再改动。
+- **这是补充明确，不是行为变更**：`internal/memory` 的 `LoadLayers` 一直按"空层不渲染标题"实现，
+  测试 `TestMemory_IncludeGlobalMemoryTrueSectionOrderAndHeadingOmission` 的
+  「只有全局层」「只有 Agent 层」两个子用例断言的正是 `NotContains(..., "## Agent 记忆")` /
+  `NotContains(..., "## 全局记忆")`。契约此前只是没把这句写出来。
+- 测试保留核对（本轮复跑，`go test -count=1 -run 'TestMemory_(…7 例…)' ./internal/memory/`）：`ok 0.266s`。
+
+### ·2 D-51：运行来源条目的审计表述 — 按四条重写
+
+用户明确否决两种写法：「审计逐字节一致」与「两次运行的事件集合一致、差异只在 `channel` 与 `trigger` 两列」。
+
+**代码事实核对**（本轮实测，作为改写的依据）：
+
+| 事实 | 证据 |
+| --- | --- |
+| `runs` 一行一 Run，`channel` / `trigger` / `run_id` / `started_at` / `finished_at` / `iterations` / `tool_calls` 逐 Run 记录 | `docs/contracts/schema.sql:93-107`；`internal/storage/run_store.go:315-329` / `:229-275` |
+| `run_id` 格式 `<channel>-<unix_millis>-<随机6位>`，渠道前缀不同 → 两次 Run 的 `run_id` **必然**不同 | `internal/core/run.go:374-376` |
+| 时间戳是墙钟读数，**不**由结构保证不同（同毫秒可能重合）→ 只能写"可以不同"，不得写"必然不同" | 同上 + `internal/core/service.go:304,572` |
+| `llm_calls` 每轮一次调用一行（另有一次 `round=0` 的压缩摘要行）；行数随实际轮次变化 | `internal/core/loop.go:229,281,304-306`；`internal/provider/service.go:78-130` |
+| `tool_invocations` 零到多行，由模型实际请求决定，与入口渠道无关 | `internal/core/tool_exec.go:259-281`；`docs/contracts/schema.sql:170-184` |
+| 权限按**每次 Run** 的准入状态判定，不按来源 | `run_resource_manifests.agent_lifecycle_state`、`run_credential_refs`（`docs/contracts/schema.sql:673-717`） |
+| `config_hash` 内容寻址、**不含时间**，配置不变时两次 Run 相同 | `internal/core/snapshot.go:29-36,50-70` |
+
+**改写点（四条逐一对应）**：
+
+1. `docs/contracts/run-and-errors.md:361` — 来源只取自服务端构造的 `RunRequest.Channel` + `Trigger`，用户消息不能伪造（原文保留，未放宽）。
+2. `:362` — 来源不是权限隔离或强制执行**机制**，也不是"本次一定是定时任务"的证据。
+3. `:363` — 判定权限的是**本次 Run 的身份与授权状态**；相同配置与相同授权条件下适用同一套工具、策略与预算规则；撤销或授权不足时两种来源**同样**被拒。
+4. `:364` — 审计用**一致的结构与记录规则**如实记录各次实际行为，**不要求**两次 Run 的审计内容相同；`run_id` 必然不同，时间戳与实际调用可以不同。
+5. `:365` — 来源不计入 `ConfigSnapshot` / `config_hash`（原文保留）。
+
+**同源过强表述一并清除**（探针扫出，全部改成第 3、4 条口径）：
+
+| 文件 | 原表述 | 处置 |
+| --- | --- | --- |
+| `docs/TechnicalDesign.md:549` | "不改变工具授权、配额、审计或准入结论" | 改为"不改变工具的**适用规则**、配额规则、审计的**记录规则**或准入结论"，并补"实际放行按各次 Run 的身份与授权状态判断" |
+| `docs/Requirements.md:289` | "不改变授权、配额与审计" | 同上口径 |
+| `docs/Requirements.md:151` | "同一 Agent 在两种来源下工具面一致" | 改为"相同配置与相同授权条件下适用同一套工具与策略规则" |
+| `docs/contracts/agent-md.md:73` | "两种来源下工具面完全相同" | 同上 |
+| `docs/us/us16-knowledge-memory-history.md:487`（C-53） | "工具池、Policy、预算与审计…逐字节一致" | 改为 D-51 的 3、4 条口径 |
+
+全库复扫 `工具池、Policy` / `工具面完全相同` / `工具面一致` / `事件集合与字段结构` / `不改变工具授权、配额、审计`：**零命中**。
+
+### ·3 测试面：**无需调整，也没有任何断言被放宽**
+
+- 全库不存在"两次 Run 的审计记录相同"的断言——探针逐文件核过 Go / TS 全部测试，只有**逐 Run** 断言
+  （如 `internal/e2e/recovery_test.go` 对单次 Run 查 `tool_invocations`）。
+- 也不存在"两种来源工具池相等"的断言；`TestPrompt_RunOriginByChannel` 只比 `Prompt.System`，
+  从不检查 tools 数组。
+- 判据面**零变更**：本轮只改文档措辞，没有改任何测试文件、没有删断言、没有新增跳过。
+- 复跑读数：`./internal/core/` `ok 2.405s`、`./internal/builtin/` `ok 1.902s`、
+  `./internal/memory/` `ok 7.184s`、`./internal/app/` `ok 34.062s`。
+
+### ·4 取证口径（用户裁决：直接合入）
+
+- R170 的 90/90 全量验收绑定指纹 `79a20924…`（基线 `b57835a`，`dirty=true`）。
+- 本轮相对那棵树的 tracked 差异**只有** `docs/contracts/run-and-errors.md`（外加 `agent-md.md` 同一处措辞），
+  且全库无任何代码 / 测试 / 脚本解析这两份文档（`grep -rl "run-and-errors.md"` 只命中 `.loop/` 运行记录，已被 gitignore）。
+- 用户裁决按「直接合入」执行：**不重跑** 90 项全量验收，也**不重跑**七目标门禁；
+  该口径与差异范围一并记在此处，**不得**被后续表述成"最终树已重新跑过全量验收"。
+
+### ·5 状态
+
+- review ②：用户 2026-11-01 口头确认「人工自查通过，可以合入了」。
+- US-16 收口、提交、推送、合回 `main`：见 R172。

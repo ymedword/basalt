@@ -310,7 +310,10 @@ func TestMemoryEmbedderAdapter_ForwardsBatch(t *testing.T) {
 	batch, err := adapter.Embed(context.Background(), []string{"a", "b"})
 	require.NoError(t, err)
 	require.Len(t, batch.Vectors, 2, "向量与输入一一对应")
-	require.Equal(t, int64(7), batch.PromptTokens, "Token 数必须透传（配额结算用）")
+	// Token 数只落到 `embedding_calls` 的用量列；查询侧 embedding token **不**计入
+	// 调用方配额与用量报表（技术方案 §3.5.2 的共享召回计数口径），故这里判的是
+	// "不丢字段"，不是"已结算"。
+	require.Equal(t, int64(7), batch.PromptTokens, "Token 数必须逐字段透传，不得在适配层丢弃或置换")
 	require.Equal(t, 2, batch.Dimensions)
 	require.Equal(t, "embed-test", batch.Model)
 }

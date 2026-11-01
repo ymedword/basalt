@@ -24,7 +24,7 @@ description: "Task list for US-16 知识库、语义记忆与历史使用（B）
 - [ ] T008 编写实验脚本 `scripts/exp/adr06_embedding_eval.go`（ADR-06 固定查询集 + 小语料 + recall@k / nDCG@10 / 延迟 / 费用采集），读数写入 `research.md` 并冻结 `vector(n)`
 - [ ] T008a `scripts/exp/index_path_eval.go`：**D-06 / D-07**——精确扫描基线 vs HNSW、`simple` + `pg_trgm` 中文关键词对照；过滤条件导致召回不达标时不启用 ANN；读数写入 `research.md`
 - [ ] T008b `scripts/exp/compaction_param_eval.go`：**D-24**——先定任务集与判据（保留关键事实 / 切点合法 / 成本可接受），再测触发比例 / 保留组数 / 摘要预算
-- [ ] T008c `scripts/exp/migration_scale_drill.sh`：**D-27**——逐级放大演练，记录行数 / dump 字节 / WAL 峰值，冻结单事务规模上限与超限指引
+- [ ] T008c `scripts/exp/migration_scale_drill.sh`：**D-27**——逐级放大演练，记录行数 / dump 字节 / WAL 峰值，给出**本机观察读数与适用限制**及超限处置指引（**不冻结容量上限**；review ② D-2 裁决 2026-11-01）
 - [ ] T008d `scripts/exp/wait_and_ingress_eval.go`：**D-29** 等待上限（对齐一次 Run 准入超时，实测 `pg_xact_status`）与 **D-30** 三类入口 QPS / burst
 
 ## Phase 2: Foundational（阻塞所有故事）
@@ -267,7 +267,7 @@ D-05 / D-06 / D-07 已冻结（vector(512) / cosine / 索引代际 1 = 精确扫
 T008 已被 T004 / T108 的冻结取代（脚本留作复现，不再是前置）
 T008a（D-06 / D-07 复核）→ 只影响是否启用 ANN（本 US 不启用），不阻塞实现
 T008b（D-24）→ T083 / T084 / T085 的触发比例、保留组数与摘要预算
-T008c（D-27）→ T063 的单事务规模上限，并作为 T008b 演练的前提
+T008c（D-27）→ T063 的单事务演练读数与超限处置指引，并作为 T008b 演练的前提
 T008d（D-29 / D-30）→ T021 / T126 的等待上限与三类入口 QPS / burst、T095a 的保留期与采样率
 未冻结参数：相关任务**不得**写死数值，只能从配置读入并显式标「待冻结」，冻结后补读数来源
 ```
