@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 serve 启动顺序的端到端回归（颗粒度文档 §3.3 行 22 / 图 A ⑧–⑩、
@@ -19,6 +21,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 )
 
 // TestRun_ServeStartsConfigWatcher：`basalt serve` 启动后修改 AGENT.md，`/profiles`
@@ -36,7 +40,14 @@ func TestRun_ServeStartsConfigWatcher(t *testing.T) {
 	require.NoError(t, ln.Close())
 
 	t.Setenv("BASALT_SERVE_WATCH_KEY", "watch-sentinel-not-a-secret")
-	config := "http:\n" +
+	// 运行期存储只有 PostgreSQL：serve 缺 DSN 即拒绝启动（D-01），所以本用例给隔离
+	// schema 的 DSN——配置文件里仍只写占位，真值经进程环境注入。
+	// PostgreSQL is the only runtime store, so serve needs a DSN; it still travels as a
+	// placeholder resolved from the process environment.
+	t.Setenv("BASALT_SERVE_WATCH_DSN", pgtest.NewTestSchema(t))
+	config := "database:\n" +
+		"  dsn: ${BASALT_SERVE_WATCH_DSN}\n" +
+		"http:\n" +
 		"  addr: " + addr + "\n" +
 		"  admin_auth:\n" +
 		"    mode: local_trust\n" +
@@ -44,7 +55,7 @@ func TestRun_ServeStartsConfigWatcher(t *testing.T) {
 		"  - name: fake\n" +
 		"    base_url: http://127.0.0.1:1/v1\n" +
 		"    api_key: ${BASALT_SERVE_WATCH_KEY}\n" +
-		"    default_model: fake-model\n"
+		"    default_model: fake-model\n" + serveTestIngress
 	require.NoError(t, os.WriteFile(filepath.Join(workDir, configFileName), []byte(config), 0o644))
 
 	agentDir := filepath.Join(workDir, workspaceDirName, "agents", "demo")

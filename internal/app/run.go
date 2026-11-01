@@ -14,6 +14,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // Version 是构建期注入的版本标识的交接点。
@@ -41,12 +42,27 @@ var Version = "dev"
 // 而走到另一条路上。`serve` / `gateway` 自 US-9 起同属重路径（技术方案 §6.5）：两者都
 // 要全量装配，差别只在 HTTP 面与常驻形态。
 //
-// `secrets` 自 US-12（T135）起重路径：四条子命令都建立在真库与真主密钥之上——`init`
+// `secrets` 自 US-12（T135）起重路径：在线子命令都建立在真库与真主密钥之上——`init`
 // 要统计当前托管依赖、`revoke-managed` 要写撤销行与操作行，`status` / `verify` 读的
 // 也是同一批凭据表。它因此与 `chat` / `tool` 同口径：取实例锁、走迁移，再执行命令；
 // 部署类命令（`revoke-managed` 明确要求服务已停止）与运行实例不并存，锁冲突即是该语义。
-// secrets is heavy since US-12: all four subcommands sit on the real database and key.
+// secrets is heavy since US-12: the online subcommands sit on the real database and key.
+//
+// **例外**是 US-16 的两条离线命令（`recover-record` / `adopt-legacy`，见下方
+// offlineSecretsCommands）：它们与 `Secrets` 端口分开，正是为了不经这里的装配。
+// The two offline secrets commands are the exception; see offlineSecretsCommands below.
 var heavyCommands = []string{"chat", "tool", "serve", "gateway", "secrets"}
+
+// offlineSecretsCommands 是 `secrets` 组里**必须**绕开重路径的子命令：`recover-record`
+// 与 `adopt-legacy` 各自持自己的工作区锁、自己打开备份 / 隔离副本，属于离线手工流程
+// （§2.12.0a / §2.12.0b / §3.1.8b / §3.1.8c）。走重路径会把库迁移、`Ensure` 自动 adopt
+// 与 `ApplyPublished` 的 MCP 启动带进来——那正是这两条命令存在要避免的行为；而且重路径
+// 已持实例锁，命令自己的取锁会直接 `workspace_busy`。
+// offlineSecretsCommands must never assemble the runtime: each holds its own workspace
+// lock and opens its own backup / isolated copy. The heavy path would migrate, adopt and
+// start MCP servers — exactly what these offline procedures exist to avoid — and its
+// lock would make the command's own acquisition fail as workspace_busy.
+var offlineSecretsCommands = []string{"recover-record", "adopt-legacy"}
 
 // readStoreCommands 是需要**只读库句柄**的命令组：`session list` 要读会话数据，但它
 // **不是**重命令——不取锁、不做恢复、不写库（口径 23：别的实例持锁时也该能看清单）。
@@ -77,6 +93,20 @@ func Run(ctx context.Context, args []string) int {
 		return 1
 	}
 
+	// 启动验证窗口（T143 / §2.12.0b 步骤 7）在**任何装配之前**分流：它不跑 serve 的
+	// 兜底初始化（会写工作区）、不取锁、不迁移、不启 MCP / 调度 / 配置监听。把它排在
+	// 后面再加开关，等于让"窗口内禁写入"依赖一串 flag 判断——这里让它成为结构性事实。
+	// The startup verification window branches off before any assembly, so "no writes,
+	// no MCP, no scheduler" is structural rather than a set of flags.
+	if windowOpts, matched, parseErr := parseVerificationWindowArgs(args); matched {
+		if parseErr != nil {
+			NewLogger(nil).Error("验证窗口参数无效", "error", parseErr)
+			return cli.ExitStatusOf(parseErr)
+		}
+		windowOpts.Workspace = filepath.Join(workDir, workspaceDirName)
+		return runVerificationWindowMode(ctx, workDir, windowOpts)
+	}
+
 	// 新实例判定与首次配置生成**必须**排在 `cli.LoadConfig` 之前（T089）：排在后面会
 	// 出现"文件写对了、首个进程仍用缺省预算"，用户必须重启一次才生效。判定只看库与
 	// 名册，二者都不在才是新实例——存量无配置实例不得被当成新实例放宽策略。
@@ -102,6 +132,7 @@ func Run(ctx context.Context, args []string) int {
 		// Report only what actually happened; an existing config is never rewritten.
 		fields := []any{
 			"config_created", bootstrap.ConfigCreated,
+			"provisioning_recorded", bootstrap.ProvisioningRecorded,
 			"marker_created", bootstrap.MarkerCreated, "instance_id", bootstrap.InstanceID,
 		}
 		if bootstrap.ConfigCreated {
@@ -116,6 +147,20 @@ func Run(ctx context.Context, args []string) int {
 			// An existing workspace without a config is never bootstrapped; say so before the
 			// mandatory-item refusal, so the refusal cannot be mistaken for a broken new instance.
 			logger.Warn("存量实例：工作区已有数据库或实例名册，但没有配置文件——不补生成，缺失的必填项会让启动失败")
+		}
+		// 上次首次启动中断（配置与名册已在盘上、密码还没发放）：如实说明本次是**续做**，
+		// 而不是新实例——数据库连不上、DSN 没修好时这句话就是"为什么还会失败"的那半句。
+		// A previous first start was interrupted; say that this run resumes it.
+		if pending, instanceID, _ := adminTokenProvisioningPending(workDir); pending {
+			logger.Warn("首次初始化未完成：配置与实例名册已在盘上，管理面访问密码尚未生成——本次启动继续完成；"+
+				"数据库仍不可用时失败不会改写任何既有文件", "instance_id", instanceID)
+		}
+	}
+
+	if serveInit && (cfgErr == nil || errors.Is(cfgErr, fs.ErrNotExist)) {
+		if ingressErr := cli.ValidateServeIngress(cfg); ingressErr != nil {
+			logger.Error("服务启动前的入口限流配置不完整，请在 basalt.yaml 中设置后重试", "error", ingressErr)
+			return 1
 		}
 	}
 
@@ -134,25 +179,56 @@ func Run(ctx context.Context, args []string) int {
 	// The adapters are injected here; the command surface only sees its own ports.
 	deps := cli.Deps{
 		WorkDir:                workDir,
-		SupportedSchemaVersion: storage.SupportedSchemaVersion,
-		Logger:                 logger,
-		Store:                  storageStore{},
-		Workspace:              workspacePort{},
+		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+		// init 引导的是 SQLite 源谱系（v6）：与运行期 PG 谱系（v1）分开传，混用会写出
+		// "v6 schema + v1 版本行"的库，db export 随即拒绝（T078 实测）。
+		// init provisions the SQLite source lineage; it is a different constant.
+		SourceSchemaVersion: storage.SupportedSchemaVersion,
+		Logger:              logger,
+		Store:               storageStore{},
+		Workspace:           workspacePort{},
 		// Agents 是写模式端口（create / delete 在实现侧取实例锁、开关库、写操作行）——
 		// schema 目标版本与命令面同源，构造参数显式传递。
 		// The agents port owns the CLI write path; the schema target matches the command face.
 		Agents: agentsPort{
 			WorkDir:                workDir,
-			SupportedSchemaVersion: storage.SupportedSchemaVersion,
+			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+			Database:               databaseConfig(cfg),
 			Logger:                 logger,
 		},
+		// PostgreSQL 迁移端口与库、锁、运行期资源都无关（每次调用自建并释放连接池），
+		// 因此两条路径都安全带上：`db migrate` 是建库前置，不能要求先有运行期装配。
+		// The migration port holds no runtime resources, so both paths carry it: the
+		// database must be creatable before any runtime assembly exists.
+		DatabaseMigrator: postgresMigratorPort{},
+		// 迁移链路端口（export / seal / import / verify / switch）：与迁移端口同理无状态，
+		// 每次调用自建句柄。导出只读 SQLite 快照，导入 / 复核 / 切换才打开 PostgreSQL。
+		// The migration-chain port, stateless like the migrator: export reads the SQLite
+		// snapshot offline, while import/verify/switch open PostgreSQL.
+		Migration: migrationPort{Logger: logger},
+		// 实例采纳端口（`instance adopt`）：只碰旧 SQLite 工作区与名册，零外呼、不装配
+		// 运行期——与迁移链路同理无状态，两条路径都安全带上。
+		// The adoption port touches only the legacy SQLite workspace and the roster; it
+		// is stateless and therefore safe on both paths.
+		InstanceAdopt: instanceAdoptPort{Logger: logger},
+		// 两条**离线手工流程**的端口（`secrets recover-record` / `secrets adopt-legacy`）：
+		// 它们与 `Secrets` 分开正是为了不经重路径装配——恢复与受控升级只许离线发生，
+		// 任何"顺手装配一下运行期"的路径都会把库迁移、自动 adopt 与 MCP 启动带进来。
+		// The two offline ports stay off the heavy path on purpose: assembling the
+		// runtime here is exactly what these procedures must never do.
+		SecretsRecovery:    secretsRecoverPort{Logger: logger},
+		LegacySecretsAdopt: legacyAdoptPort{Logger: logger},
+		// 交接核对端口（`db verify --handoff`）：只读副本的 SQLite 库、名册、密钥文件与
+		// 同级配置，零外呼、不装配运行期——与上面两个离线端口同一条理由，两条路径都安全带上。
+		// The handoff gate is read-only and offline, so it is wired on every path.
+		Handoff: handoffVerifyPort{Logger: logger},
 	}
 
 	// 装配面在这里构造一次，两条路径共用（重路径接管句柄，只读路径只开一次只读库）。
 	// The assembly face is built once and shared by both paths.
 	a := &App{
 		workDir:          workDir,
-		supportedVersion: storage.SupportedSchemaVersion,
+		supportedVersion: postgres.SupportedSchemaVersion,
 		logger:           logger,
 		cfg:              cfg,
 		cfgErr:           cfgErr,
@@ -224,7 +300,7 @@ func Run(ctx context.Context, args []string) int {
 			// 走运行期保留的**同一份**编辑适配器（私有 claim 基线随热加载增减，约束 39）。
 			// The config watcher starts after the scheduler and before the HTTP face opens;
 			// the scheduler seam is the very adapter retained on the runtime.
-			watcher, watchErr := startServeWatcher(runCtx, rt.root, rt.agents, rt.loader, rt.skills, rt.versions, rt.scheduleEditor, logger)
+			watcher, watchErr := startServeWatcher(runCtx, rt.root, rt.agents, rt.loader, rt.skills, rt.versions, rt.collections, rt.scheduleEditor, logger)
 			if watchErr != nil {
 				logger.Error("配置监听启动失败", "error", watchErr)
 				if closeErr := rt.Close(); closeErr != nil {
@@ -254,7 +330,9 @@ func Run(ctx context.Context, args []string) int {
 			return executeRoot(runCtx, args, deps)
 		}); execErr != nil {
 			logger.Error("命令执行失败", "error", execErr)
-			return 1
+			// 四档退出码只对显式声明者生效（§3.1.8b / §3.1.8c）；其余命令仍是 1。
+			// Only errors that declare a status deviate from the historical 1.
+			return cli.ExitStatusOf(execErr)
 		}
 		return 0
 	} else if needsReadStore(args) {
@@ -271,13 +349,13 @@ func Run(ctx context.Context, args []string) int {
 				logger.Error("只读库句柄释放失败", "error", closeErr)
 			}
 		}()
-		deps.SessionLister = sessionListerPort{store: storage.NewSessionStore(read)}
+		deps.SessionLister = sessionListerPort{store: postgres.NewSessionStore(read)}
 	}
 
 	if err := executeRoot(ctx, args, deps); err != nil {
 		// cobra 已把可读文案写到标准错误；这里补结构化日志，失败路径两轨都在。
 		logger.Error("命令执行失败", "error", err)
-		return 1
+		return cli.ExitStatusOf(err)
 	}
 	return 0
 }
@@ -304,7 +382,36 @@ func executeRoot(ctx context.Context, args []string, deps cli.Deps) error {
 // the one case that would need this judgement revisited.
 func needsRuntime(args []string) bool {
 	name, ok := commandName(args)
-	return ok && slices.Contains(heavyCommands, name)
+	if !ok || !slices.Contains(heavyCommands, name) {
+		return false
+	}
+	// `secrets` 组整体重，但两条离线命令必须绕开装配（见 offlineSecretsCommands）：
+	// 判据落在 `secrets` 之后的**下一个非选项参数**上；没有子命令时仍是重命令。
+	// The group is heavy, but its two offline commands opt out by their subcommand name.
+	if name == "secrets" {
+		if sub, found := nextPositional(args, name); found && slices.Contains(offlineSecretsCommands, sub) {
+			return false
+		}
+	}
+	return true
+}
+
+// nextPositional 取 `command` 之后的下一个非选项参数（子命令名）。`command` 之前的选项与
+// 它们的值不参与判定：本项目没有带值的全局选项（needsRuntime 的注释同口径）。
+// nextPositional returns the first non-option argument after the given command name.
+func nextPositional(args []string, command string) (string, bool) {
+	seen := false
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if !seen {
+			seen = arg == command
+			continue
+		}
+		return arg, true
+	}
+	return "", false
 }
 
 // needsReadStore 判定这次调用是否需要一条只读库句柄（轻路径里的 `session list`）。

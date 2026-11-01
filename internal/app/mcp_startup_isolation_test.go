@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 14D / T115「启动隔离」的判卷（设计 §2.5.1 末段；验收 E3）：
@@ -22,7 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // isolatedServerNames 抽取本次装配实际放行的 server 名（按返回顺序）。
@@ -129,8 +131,8 @@ func TestPublishedMCPServers_MasterKeyFailureStillFailsClosed(t *testing.T) {
 	// 同一个库、同一批来源声明，只把主密钥位置换成不存在的那份：其它条件不变，
 	// 失败只可能来自主密钥。
 	broken, err := NewMCPCredentialService(MCPCredentialServiceDeps{
-		Credentials:   storage.NewCredentialStore(env.db),
-		Sources:       storage.NewMCPCredentialSourceStore(env.db),
+		Credentials:   postgres.NewCredentialStore(env.db),
+		Sources:       postgres.NewMCPCredentialSourceStore(env.db),
 		MasterKeyFile: filepath.Join(t.TempDir(), "missing-master.key"),
 		WorkspaceRoot: env.root,
 		Logger:        env.logger,

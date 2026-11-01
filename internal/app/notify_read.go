@@ -2,7 +2,7 @@ package app
 
 // 本文件是通知渠道的**管理读面**适配器（`web.Options.Notify` 的装配实现）。
 //
-// 发送路径的只读仓储（`storage.NotifyChannelRepo`）只关心"这一发要发给谁"，行里的
+// 发送路径的只读仓储（`postgres.NotifyChannelRepo`）只关心"这一发要发给谁"，行里的
 // `credential_mode` / `scope` / `revision` 已经够用；管理台还要回答四件它答不了的事：
 // 属主 Agent 的名字、凭据身份状态与尾号、地址可用性（由 web 按模式判定）、以及
 // 条件写要用的 ETag。这四项需要凭据仓储与生命周期索引，只有装配层（`internal/app`）
@@ -28,7 +28,7 @@ import (
 	"strings"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // notifyChannelETagVersion 是渠道条件 ETag 规整串的版本前缀：字段集变化必须换版本
@@ -42,8 +42,8 @@ const notifyChannelETagVersion = "basalt/notify-channel-etag/v1"
 // notifyChannelReadPort enriches the shared read repository with the admin-only facts.
 type notifyChannelReadPort struct {
 	channels    core.NotifyChannelReader
-	credentials *storage.CredentialStore
-	agents      *storage.ResourceStore
+	credentials *postgres.CredentialStore
+	agents      *postgres.ResourceStore
 	tests       core.ResourceConnectionTestStore
 	lookupEnv   func(string) (string, bool)
 }
@@ -64,7 +64,7 @@ var _ core.NotifyChannelReader = (*notifyChannelReadPort)(nil)
 // newNotifyChannelReadPort 组装管理读面；`agents` 只用于属主名反查。
 // newNotifyChannelReadPort wires the admin read face; agents is only used for name lookup.
 func newNotifyChannelReadPort(channels core.NotifyChannelReader,
-	credentials *storage.CredentialStore, agents *storage.ResourceStore, deps notifyReadDeps,
+	credentials *postgres.CredentialStore, agents *postgres.ResourceStore, deps notifyReadDeps,
 ) *notifyChannelReadPort {
 	lookupEnv := deps.LookupEnv
 	if lookupEnv == nil {

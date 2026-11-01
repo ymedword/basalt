@@ -30,7 +30,7 @@ import (
 	"strings"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // 编译期断言：本类型就是端口声明的检查点实现。
@@ -40,7 +40,7 @@ var _ CredentialGuard = (*credentialGuard)(nil)
 // CredentialGuardDeps 是检查点的只读依赖。
 // CredentialGuardDeps carries the guard's read-only dependencies.
 type CredentialGuardDeps struct {
-	Credentials *storage.CredentialStore
+	Credentials *postgres.CredentialStore
 	Logger      *slog.Logger
 }
 
@@ -133,7 +133,7 @@ type RunCredentialCheckpoint interface {
 	CheckRun(ctx context.Context, runID string) error
 }
 
-// RunCredentialPinStore 是检查点读固定版本的只读面（`*storage.RunCredentialStore`）。
+// RunCredentialPinStore 是检查点读固定版本的只读面（`*postgres.RunCredentialStore`）。
 // RunCredentialPinStore is the read-only side of run_credential_refs.
 type RunCredentialPinStore interface {
 	Pins(ctx context.Context, runID string) ([]core.RunCredentialRef, error)

@@ -1,11 +1,15 @@
 // History API 自实现路由（约束 41，UI-R2 扩展批准）：US-11 的十二条路径 + US-12 的
 // 五条新路径（`agents/new`、`agents/:name/config`、`resources/:kind/:id`、`archived`、
 // `workspace`）+ 会话详情深链（`agents/:name/sessions/:id`，R7）+ US-14 的 MCP 目录
-// （`catalog/mcp`）+ 404 视图，不引入第三方路由库；静态段先于动态段。popstate 恢复
-// 视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
+// （`catalog/mcp`）+ US-16 的调用方列表与详情（`callers`、`callers/:id`）、知识库
+// 集合 / 文档详情（`knowledge`、`knowledge/:collectionId`、`knowledge/documents/:id`）
+// 与诊断事件页（`diagnostics`）、历史回查页（`history`）+ 404 视图，不引入第三方
+// 路由库；静态段先于动态段。
+// popstate 恢复视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
 // A hand-written History API router: twelve US-11 paths, the five US-12 paths, the R7
-// session deep link, the US-14 catalog, and the 404 view, matching static segments
-// before dynamic ones.
+// session deep link, the US-14 catalog, the US-16 pages (callers, knowledge,
+// diagnostics, history), and the 404 view, matching static segments before dynamic
+// ones.
 
 /** 管理台路径前缀；服务端对 /console/* 非静态资源一律回退 index.html。 */
 export const CONSOLE_BASE = '/console'
@@ -30,6 +34,13 @@ export type RouteName =
   | 'memory'
   | 'notifications'
   | 'sandbox'
+  | 'callers'
+  | 'caller-detail'
+  | 'knowledge'
+  | 'knowledge-collection'
+  | 'document-detail'
+  | 'diagnostics'
+  | 'history'
   | 'not-found'
 
 /** `/console/resources/:kind` 的固定三值。 */
@@ -92,6 +103,25 @@ const ROUTES: readonly RoutePattern[] = [
   { name: 'memory', segments: ['library', 'memory'] },
   { name: 'notifications', segments: ['settings', 'notifications'] },
   { name: 'sandbox', segments: ['settings', 'sandbox'] },
+  // 调用方管理（US-16 / T026a）：列表与详情两段路由；详情按 `caller_id` 深链，
+  // 刷新与分享都回到同一调用方。
+  // Caller admin: the list and the per-caller deep link.
+  { name: 'callers', segments: ['callers'] },
+  { name: 'caller-detail', segments: ['callers', ':id'] },
+  // 知识库（US-16 / T043）：集合列表、集合详情与文档详情。文档详情是**三段**路径
+  // （`knowledge/documents/:id`），与两段的集合详情段数不同，互不遮蔽；集合标识由
+  // 服务端生成（`col_` 前缀），不会与静态段 `documents` 撞名。
+  // Knowledge: the collection list, a collection, and a document. The document page
+  // has one more segment than a collection page, so neither pattern shadows the other.
+  { name: 'knowledge', segments: ['knowledge'] },
+  { name: 'knowledge-collection', segments: ['knowledge', ':collectionId'] },
+  { name: 'document-detail', segments: ['knowledge', 'documents', ':id'] },
+  // 诊断事件（US-16 / T098）：单段静态路径，深链查询串承载四类关联标识之一。
+  // Diagnostics: one static segment; the deep link carries one of the four anchors.
+  { name: 'diagnostics', segments: ['diagnostics'] },
+  // 历史回查（US-16 / T057）：单段静态路径；会话详情页以 `?session_id=` 深链进来。
+  // History: one static segment; the session page deep-links with `?session_id=`.
+  { name: 'history', segments: ['history'] },
 ]
 
 function isResourceKind(value: string): value is ResourceKind {
@@ -263,6 +293,51 @@ export function resourceDetailHref(kind: ResourceKind, id: string): string {
 // The in-console MCP catalog page; it is never part of the public site.
 export function mcpCatalogHref(): string {
   return `${CONSOLE_BASE}/catalog/mcp`
+}
+
+/** 调用方列表。 */
+export function callersHref(): string {
+  return `${CONSOLE_BASE}/callers`
+}
+
+/** 调用方详情：按 caller_id 深链。 */
+export function callerHref(callerId: string): string {
+  return `${CONSOLE_BASE}/callers/${encodeURIComponent(callerId)}`
+}
+
+/** 诊断事件页；关联标识经查询串给出，走最短路深链。 */
+// The diagnostics page; the anchor rides in the query string.
+export function diagnosticsHref(anchor?: readonly [key: string, value: string]): string {
+  const path = `${CONSOLE_BASE}/diagnostics`
+  return anchor === undefined ? path : `${path}?${anchor[0]}=${encodeURIComponent(anchor[1])}`
+}
+
+/** 历史回查页；会话详情页带 `session_id` 深链进来，关键词仍由用户给出。 */
+// The history page; the session page deep-links it with session_id.
+export function historyHref(seed?: readonly [key: string, value: string]): string {
+  const path = `${CONSOLE_BASE}/history`
+  return seed === undefined ? path : `${path}?${seed[0]}=${encodeURIComponent(seed[1])}`
+}
+
+/** 知识库集合列表。 */
+export function knowledgeHref(): string {
+  return `${CONSOLE_BASE}/knowledge`
+}
+
+/** 集合详情：按 collection_id 深链。 */
+export function collectionHref(collectionId: string): string {
+  return `${CONSOLE_BASE}/knowledge/${encodeURIComponent(collectionId)}`
+}
+
+/**
+ * 文档详情：契约**没有**单文档读取端点，`collection` 查询参数只用于面包屑与返回
+ * 链接；缺省时页面仍按 document_id 工作。
+ * The document page carries its collection in the query only for navigation; the
+ * contract has no single-document read.
+ */
+export function documentHref(documentId: string, collectionId = ''): string {
+  const path = `${CONSOLE_BASE}/knowledge/documents/${encodeURIComponent(documentId)}`
+  return collectionId === '' ? path : `${path}?collection=${encodeURIComponent(collectionId)}`
 }
 
 type RouteListener = (match: RouteMatch) => void

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `internal/app/resource_admin.go` 的验收面（颗粒度文档 §3.2.1：app 的
@@ -80,7 +82,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,7 +99,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/testutil"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -199,10 +201,10 @@ type resourceEnv struct {
 	t          *testing.T
 	root       string
 	configPath string
-	dbPath     string
-	db         *storage.DB
-	store      *storage.ResourceStore
-	ops        *storage.ManagementStore
+	dsn        string
+	db         *postgres.DB
+	store      *postgres.ResourceStore
+	ops        *postgres.ManagementStore
 	gate       *core.ResourceGate
 	catalog    *providerCatalogStore
 	runtime    resourceRuntime
@@ -230,8 +232,8 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 	configPath := filepath.Join(root, "basalt.yaml")
 	require.NoError(t, os.WriteFile(configPath, []byte(initialResourceConfig), 0o600))
 
-	dbPath := filepath.Join(root, "basalt.db")
-	db, err := storage.OpenWritable(context.Background(), dbPath, storage.SupportedSchemaVersion)
+	dsn := pgtest.NewTestSchema(t)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
@@ -249,8 +251,8 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 	// as the definition root here, so the key sits in a sibling temp directory.
 	masterKeyFile := writeMasterKeyFile(t, t.TempDir(), "k_mcp", testMasterKey().Key)
 	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
-		Credentials:   storage.NewCredentialStore(db),
-		Sources:       storage.NewMCPCredentialSourceStore(db),
+		Credentials:   postgres.NewCredentialStore(db),
+		Sources:       postgres.NewMCPCredentialSourceStore(db),
 		MasterKeyFile: masterKeyFile,
 		WorkspaceRoot: root,
 		Logger:        logger,
@@ -261,10 +263,10 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 		t:              t,
 		root:           root,
 		configPath:     configPath,
-		dbPath:         dbPath,
+		dsn:            dsn,
 		db:             db,
-		store:          storage.NewResourceStore(db),
-		ops:            storage.NewManagementStore(db),
+		store:          postgres.NewResourceStore(db),
+		ops:            postgres.NewManagementStore(db),
 		gate:           &core.ResourceGate{},
 		catalog:        catalog,
 		runtime:        resourceRuntime{catalog: catalog},
@@ -1065,7 +1067,7 @@ func TestModelConnection_TestWritesOperation(t *testing.T) {
 	require.Len(t, env.versionsOf("main"), 1, "测试不得新增版本")
 	require.Equal(t, v1.ID, env.pointer("main").PublishedVersionID)
 	require.NotNil(t, env.runtime.Provider("main"))
-	require.Zero(t, authorRowCount(t, env.dbPath, "llm_calls"), "测试不是 Run，不得写模型调用审计")
+	require.Zero(t, authorRowCount(t, env.db, "llm_calls"), "测试不是 Run，不得写模型调用审计")
 }
 
 // TestModelConnection_TestFailureIsSuccessOperation：外部调用失败（连接 / 非 2xx）
@@ -1097,7 +1099,7 @@ func TestModelConnection_TestFailureIsSuccessOperation(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rows[0].DetailJSON, &detail))
 	require.False(t, detail.OK)
 	require.Equal(t, string(core.ErrorKindExternalError), detail.ErrorCode)
-	require.Zero(t, authorRowCount(t, env.dbPath, "llm_calls"))
+	require.Zero(t, authorRowCount(t, env.db, "llm_calls"))
 }
 
 // TestModelConnection_TestTimeout504：固定超时到期 → 504 分类、操作 failed +
@@ -1178,14 +1180,14 @@ func (e *resourceEnv) currentETagOf(t *testing.T, kind core.ResourceKind, name s
 // seedRunReference inserts a real run row plus one resource reference.
 func (e *resourceEnv) seedRunReference(t *testing.T, runID string, version core.ResourceVersion, released bool) {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.ToSlash(e.dbPath))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
 	ctx := context.Background()
-	_, err = db.ExecContext(ctx,
-		`INSERT INTO runs (run_id, agent, channel, user_id, trigger, status, iterations, tool_calls, started_at)
-		 VALUES (?, 'writer', 'cli', 'tester', 'user', 'running', 0, 0, ?)`,
+	// 归属三条（caller_id / authorizing_kind / actor）在 PostgreSQL 是 NOT NULL +
+	// CHECK 列：裸插必须补齐，按内置管理员形态实现——引用闸门只看 run_id。
+	_, err := e.db.ExecContext(ctx,
+		`INSERT INTO runs (run_id, agent, channel, user_id, trigger, status, iterations, tool_calls,
+		                   started_at, caller_id, authorizing_kind, actor)
+		 VALUES ($1, 'writer', 'cli', 'tester', 'user', 'running', 0, 0, $2,
+		         'local-admin', 'admin-builtin', 'caller')`,
 		runID, baselineClock().UnixMilli())
 	require.NoError(t, err)
 
@@ -1193,9 +1195,9 @@ func (e *resourceEnv) seedRunReference(t *testing.T, runID string, version core.
 	if released {
 		releasedAt = baselineClock().UnixMilli()
 	}
-	_, err = db.ExecContext(ctx,
+	_, err = e.db.ExecContext(ctx,
 		`INSERT INTO run_resource_refs (run_id, resource_kind, resource_id, version_id, content_hash, released_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		runID, string(version.Kind), version.ResourceID, version.ID, version.ContentHash, releasedAt)
 	require.NoError(t, err)
 }
@@ -1737,12 +1739,8 @@ func TestResourceDelete_UnsupportedKind(t *testing.T) {
 // redaction gate has plaintext to reject; the normal write path refuses such input.
 func (e *resourceEnv) corruptVersionDefinition(t *testing.T, versionID int64, definition string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.ToSlash(e.dbPath))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
-	_, err = db.ExecContext(context.Background(),
-		`UPDATE resource_versions SET definition_yaml = ? WHERE id = ?`, definition, versionID)
+	_, err := e.db.ExecContext(context.Background(),
+		`UPDATE resource_versions SET definition_yaml = $1 WHERE id = $2`, definition, versionID)
 	require.NoError(t, err)
 }
 
@@ -1766,21 +1764,16 @@ func (e *resourceEnv) seedSkillVersion(t *testing.T, name, manifestJSON string) 
 		CreatedAt:    baselineClock(),
 	}))
 
-	db, err := sql.Open("sqlite", filepath.ToSlash(e.dbPath))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
-	res, err := db.ExecContext(ctx,
+	var id int64
+	require.NoError(t, e.db.QueryRowContext(ctx,
 		`INSERT INTO resource_versions
 		   (resource_kind, resource_uid, resource_id, version_no, content_hash, definition_yaml,
 		    manifest_json, storage_path, created_at, operation_id)
-		 VALUES ('skill', ?, ?, 1, ?, NULL, ?, ?, ?, ?)`,
+		 VALUES ('skill', $1, $2, 1, $3, NULL, $4, $5, $6, $7)
+		 RETURNING id`,
 		string(fixtureResourceUID(t, core.ResourceSkill, name)), name,
 		strings.Repeat("f", 64), manifestJSON, "skills/.versions/"+name+"/1",
-		baselineClock().UnixMilli(), opID)
-	require.NoError(t, err)
-	id, err := res.LastInsertId()
-	require.NoError(t, err)
+		baselineClock().UnixMilli(), opID).Scan(&id))
 	return core.ResourceVersion{
 		ID: id, Kind: core.ResourceSkill, ResourceUID: fixtureResourceUID(t, core.ResourceSkill, name),
 		ResourceID: name, VersionNo: 1,
@@ -2096,9 +2089,8 @@ func (e *resourceEnv) versionsOfKind(kind core.ResourceKind, name string) []core
 // setApplied rewrites the applied pointer to simulate a previous successful connect.
 func (e *resourceEnv) setApplied(t *testing.T, kind core.ResourceKind, name string, versionID int64) {
 	t.Helper()
-	db := openRead(t, e.dbPath)
-	_, err := db.ExecContext(context.Background(),
-		`UPDATE resource_pointers SET applied_version_id = ? WHERE resource_kind = ? AND resource_id = ?`,
+	_, err := e.db.ExecContext(context.Background(),
+		`UPDATE resource_pointers SET applied_version_id = $1 WHERE resource_kind = $2 AND resource_id = $3`,
 		versionID, string(kind), name)
 	require.NoError(t, err)
 }
@@ -2396,8 +2388,8 @@ func TestMCPTest_EndpointNoRunNoLLMCall(t *testing.T) {
 	require.Equal(t, 1, mcpEnv.closedCount(), "一次性连接必须收尾")
 	require.True(t, mcpEnv.startedProcess())
 
-	require.Zero(t, authorRowCount(t, env.dbPath, "runs"), "测试不是 Run")
-	require.Zero(t, authorRowCount(t, env.dbPath, "llm_calls"), "测试不写模型调用审计")
+	require.Zero(t, authorRowCount(t, env.db, "runs"), "测试不是 Run")
+	require.Zero(t, authorRowCount(t, env.db, "llm_calls"), "测试不写模型调用审计")
 
 	ptr := env.pointerOf(core.ResourceMCPServer, "fs")
 	require.Equal(t, v1.ID, ptr.PublishedVersionID)
@@ -3050,6 +3042,10 @@ func TestResourceAdmin_SkillImportPublishes(t *testing.T) {
 		paths[i] = file.Path
 	}
 	require.Equal(t, []string{"SKILL.md", "docs/guide.md"}, paths, "清单必须按 path 升序")
+	// 描述取**写入后的 SKILL.md frontmatter**：导入请求不带描述字段，视图若留空，
+	// 页面保存成功当刻就把描述清掉了，刷新后才回来。逆改点：回到 `plan.description`
+	// → 本断言拿到空串，红。
+	require.Equal(t, "日志查询", detail.Description, "导入结果必须给出 SKILL.md 里的描述")
 	require.Equal(t, guide, env.workCopyFile(t, "logger", "docs/guide.md"))
 	require.Equal(t, guide, env.versionFile(t, "logger", 1, "docs/guide.md"))
 
@@ -3098,6 +3094,7 @@ func TestResourceAdmin_SkillUpdateFullReplacement(t *testing.T) {
 	require.Equal(t, 2, second.VersionNo)
 	require.NotEqual(t, first.ContentHash, second.ContentHash)
 	require.Len(t, second.Files, 1, "全量替换后只剩列出的文件")
+	require.Equal(t, "日志查询 v2", second.Description, "更新结果必须给出新 SKILL.md 里的描述")
 
 	_, statErr := os.Stat(filepath.Join(env.root, "skills", "logger", "docs"))
 	require.ErrorIs(t, statErr, fs.ErrNotExist, "未列出的旧文件必须随旧树消失")
@@ -3493,8 +3490,8 @@ func recoveryDepsForResource(env *resourceEnv) RecoveryDeps {
 		Root:       env.root,
 		ConfigPath: env.configPath,
 		Skills:     workspace.NewSkillLibrary(env.root),
-		Archives:   storage.NewAgentAdminStore(env.db),
-		Notify:     storage.NewNotifyAdminStore(env.db),
+		Archives:   postgres.NewAgentAdminStore(env.db),
+		Notify:     postgres.NewNotifyAdminStore(env.db),
 	}
 }
 

@@ -92,17 +92,22 @@ type SessionStatusStore interface {
 // ServiceOptions is the assembly surface of the run entry point; every dependency is an
 // explicit field, including the clock.
 type ServiceOptions struct {
-	Agents        AgentSource          // Agent 装载面（是否存在 / 目录 / 运行级快照）
-	Client        ProviderClient       // 唯一的模型调用入口（实现为 ProviderService：路由 + 两阶段审计在其内）
-	Messages      MessageStore         // 会话历史写透（无状态调用也可为 nil）
-	Runs          RunStore             // 运行账本
-	Snapshots     SnapshotStore        // 配置快照落库
-	Audit         ToolInvocationReader // 半截组补齐的分类依据（只读；可为 nil → 一律走"无行"分支）
-	Memory        MemoryReader         // 记忆读取端口（可空：nil = 段 2 恒空，行为与无记忆逐字节相同）
-	Loop          *ReActLoop           // 自实现的循环本体
-	Logger        *slog.Logger         // 为空 → 进程缺省日志器
-	Now           func() time.Time     // 时钟注入；为空 → time.Now
-	MaxConcurrent int                  // 实例级并发运行上限；<=0 → 32
+	Agents    AgentSource          // Agent 装载面（是否存在 / 目录 / 运行级快照）
+	Client    ProviderClient       // 唯一的模型调用入口（实现为 ProviderService：路由 + 两阶段审计在其内）
+	Messages  MessageStore         // 会话历史写透（无状态调用也可为 nil）
+	Runs      RunStore             // 运行账本
+	Snapshots SnapshotStore        // 配置快照落库
+	Audit     ToolInvocationReader // 半截组补齐的分类依据（只读；可为 nil → 一律走"无行"分支）
+	Memory    MemoryReader         // 记忆读取端口（可空：nil = 段 2 恒空，行为与无记忆逐字节相同）
+	// Knowledge 是 Run 侧知识链路端口（V-6：检索 / 轮内复核 / 引用复核）。
+	// nil = 未接线知识库：不检索、注入面恒空、行为与接线前逐字节相同。
+	// Knowledge is the run-side knowledge port. Nil keeps the pre-wiring behavior byte for
+	// byte: no retrieval, empty injection.
+	Knowledge     KnowledgeRunSource
+	Loop          *ReActLoop       // 自实现的循环本体
+	Logger        *slog.Logger     // 为空 → 进程缺省日志器
+	Now           func() time.Time // 时钟注入；为空 → time.Now
+	MaxConcurrent int              // 实例级并发运行上限；<=0 → 32
 	// Sessions 是会话状态端口（归档 / 缺失判定）；生产装配必须由 wire.go 单点传入。
 	// nil = 不做会话门禁（仅既有零值单测），此时 Archive 返回 *SessionGateUnavailableError，
 	// 不得 nil 解引用。
@@ -137,6 +142,12 @@ type ServiceOptions struct {
 	// ToolPins freezes this run's tool instances against a later controlled rebuild; a
 	// nil pinner keeps the pre-14D name lookup.
 	ToolPins ToolPinner
+	// RunQuota 是 Run 级任务次数端口（图 6 [5] 的 `ClassRun` 一支，N-01）：在全部准入
+	// 通过之后、业务执行之前预留并结算 1 次。nil = 不记账（既有零值单测与轻装配），
+	// 行为与接线前逐字节相同；生产装配由 wire.go 单点接上。
+	// RunQuota charges one task per admitted run before any business write; nil keeps the
+	// pre-wiring behaviour byte for byte.
+	RunQuota RunQuota
 }
 
 // AgentService 是唯一运行入口的实现：准入计数 + 一次运行的完整编排。
@@ -210,6 +221,15 @@ func NewAgentService(opts ServiceOptions) *AgentService {
 // Run runs one run. A function-level error means a caller-side problem only; everything
 // else shows up in the result status.
 func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+	// ⓪ 身份准入（设计 §3.1.0 / P-04）：零值或非法 Principal 在**任何副作用之前**以
+	// `ErrUnauthorized` 拒绝——不排队、不落痕迹，也**不得**补成内置管理员再继续
+	// （"零值即管理员"正是 C-28 要关掉的那条提权路径）。
+	// The identity gate precedes every side effect: a missing or invalid principal is
+	// rejected with ErrUnauthorized and never defaulted to the built-in admin.
+	if !req.Principal.Valid() {
+		return RunResult{}, fmt.Errorf("%w: run request carries no valid principal", ErrUnauthorized)
+	}
+
 	// ① 准入：未知 Agent → 会话锁 → 实例计数（顺序即错误优先级），三道都**不排队**。
 	entry, ok := s.lookupAgent(req.Agent)
 	if !ok {
@@ -322,6 +342,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			ProfileName:  req.Agent,
 			Channel:      req.Channel,
 			UserID:       req.UserID,
+			CallerID:     req.Principal.CallerID,
 			CreatedAt:    now,
 			LastActiveAt: now,
 		}); err != nil {
@@ -363,8 +384,12 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		Budget:    mergeBudget(req.Budget, snap.Profile),
 		ToolSet:   toolSet,
 		llmClient: llmClient,
-		agentDir:  s.opts.Agents.Dir(req.Agent),
-		skillDirs: boundSkillDirs(resolved),
+		// 摘要客户端与对话客户端来自准入的**同一张固定映射表**（原则 III）：压缩接线
+		// 只拿这一份，不按名字重新解析；未接资源时为零值，压缩装配据此拒绝。
+		// The summary client comes from the same frozen map as the chat client.
+		summaryClient: resolved.SummaryProvider,
+		agentDir:      s.opts.Agents.Dir(req.Agent),
+		skillDirs:     boundSkillDirs(resolved),
 		// 模式与渠道集合随 Run 准入冻结，工具调用只读这一份副本（改文件不影响在途运行）。
 		// The mode and channel set are frozen at admission; tool calls never re-read the file.
 		notifyMode:     notifyMode,
@@ -377,8 +402,21 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if s.opts.ToolPins != nil {
 		env.pinnedTools, env.pinnedSpecs = s.opts.ToolPins.Pin(toolSet)
 	}
+	if s.opts.Memory == nil && snap.Profile.Settings.IncludeGlobalMemory != nil {
+		return RunResult{RunID: runID, Status: StatusFailed, Reason: "记忆分层读取未装配", ConfigHash: snap.Hash}, nil
+	}
 	if s.opts.Memory != nil {
-		text, err := s.opts.Memory.LoadEffective(ctx, req.Agent)
+		var text string
+		var err error
+		if snap.Profile.Settings.IncludeGlobalMemory != nil {
+			layered, ok := s.opts.Memory.(LayeredMemoryReader)
+			if !ok {
+				return RunResult{RunID: runID, Status: StatusFailed, Reason: "记忆分层读取未装配", ConfigHash: snap.Hash}, nil
+			}
+			text, err = layered.LoadLayers(ctx, req.Agent, req.Principal, *snap.Profile.Settings.IncludeGlobalMemory)
+		} else {
+			text, err = s.opts.Memory.LoadEffective(ctx, req.Principal, req.Agent)
+		}
 		if err != nil {
 			// 读取失败 = 拒绝启动（与段一读取失败同口径：零 LLM 调用、零工具执行），
 			// 形状沿用既有 StatusFailed——不另立一套失败形态。
@@ -387,18 +425,42 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		env.memory = text
 	}
 
+	// ⑤″ Run 级任务次数（N-01）：预留与结算一起做，且都在**业务执行之前**——账本行、
+	// 用户消息与循环都是可审计的执行痕迹，被任务配额拒绝的 Run 一条都不该留下。
+	// 拒绝经函数级 error 上抛（与 [3] 并发名额 / [4] 会话门禁同一形态），web 入口据
+	// 哨兵映射 429 `QUOTA_EXHAUSTED`。
+	// 计时点选在会话 / 快照落库之后：那些步骤失败时 Run 本就没执行，不该先扣任务；
+	// 选在 StartRun 之前：任务次数是准入成本，不是运行结果——先跑后扣会给并发窗口
+	// 留出超额放行的口子（与"零值即不限量"同一个失败方向）。
+	// 记下的预留标识写进账本行，与 `quota_reservations` 对得上（契约列
+	// `runs.reservation_id`）；适配层没预留时（内置管理员不限量）为空。
+	// The task charge is admission cost, not an execution result: it is reserved and
+	// settled before the ledger row, and a refusal leaves no trace at all.
+	if s.opts.RunQuota != nil {
+		charged, qerr := s.opts.RunQuota.ChargeRun(ctx, RunQuotaRequest{
+			Principal: req.Principal,
+			RunID:     runID,
+		})
+		if qerr != nil {
+			return RunResult{}, qerr
+		}
+		req.ReservationID = charged.ReservationID
+	}
+
 	// ⑤ 预写账本行（status=running）+ 资源清单 + 引用，同一事务（约束 18）：**写失败 →
 	// 直接 error**——账本不落下就不开跑。未接线时清单为零值，仓储只写运行行（读作"未记录"）。
 	if s.opts.Runs != nil {
 		if err := s.opts.Runs.StartRun(ctx, RunRecord{
-			RunID:      runID,
-			SessionID:  req.SessionID,
-			Agent:      req.Agent,
-			Channel:    req.Channel,
-			UserID:     req.UserID,
-			Trigger:    req.Trigger,
-			ConfigHash: snap.Hash,
-			StartedAt:  now,
+			RunID:         runID,
+			SessionID:     req.SessionID,
+			Agent:         req.Agent,
+			Channel:       req.Channel,
+			UserID:        req.UserID,
+			Principal:     req.Principal,
+			ReservationID: req.ReservationID,
+			Trigger:       req.Trigger,
+			ConfigHash:    snap.Hash,
+			StartedAt:     now,
 		}, manifest); err != nil {
 			return RunResult{}, fmt.Errorf("start run ledger row: %w", err)
 		}
@@ -420,10 +482,69 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		}), nil
 	}
 
-	// ⑦ 循环（error 恒 nil：运行期失败归 Status）。循环拿 `runCtx`——取消信号从这里进入
-	// 传播链（轮首 / 调用后 / 每次工具前 / 组返回后四处检查，循环自行判终态）。
-	res, _ := s.opts.Loop.run(runCtx, runID, env)
+	// ⑥½ 知识注入（V-6）：检索发生在账本行与用户消息之后——装配记录与诊断事件都拿
+	// `run_id` 作关联主锚点；查询词就是本 Run 的用户消息。注入面**运行级冻结**（每轮
+	// 组装不重读载体），但权限不冻结：循环在每轮组装前复核片段（见 `KnowledgeRunSource`）。
+	// 错误分流与记忆读取同口径（上文 ④）：**存储违约 → 拒绝启动**（零模型调用、零工具
+	// 执行）；无权限 / 无声明集合是合法状态，由适配器收成"空注入 + nil error"。
+	// The injection is retrieved after the ledger row and user message so records can anchor
+	// on the run id. Storage failures refuse the run before any model call; "no permission /
+	// nothing declared" is a legal empty injection, not an error.
+	if s.opts.Knowledge != nil {
+		env.knowledgeSource = s.opts.Knowledge
+		injection, kerr := s.opts.Knowledge.RetrieveForRun(runCtx, KnowledgeRunRequest{
+			Principal: req.Principal,
+			RunID:     runID,
+			Agent:     req.Agent,
+			Query:     req.Message,
+			Budget:    KnowledgeBudget(env.Budget.ContextTokens),
+		})
+		if kerr != nil {
+			// 取消优先：检索横跨一次外部调用（查询向量化）与两次 SQL，期间的取消 /
+			// 截止不是"知识库故障"——按循环的同一口径记 cancelled，不写成 failed。
+			// Cancellation wins over failure: an aborted retrieval is a cancelled run, not
+			// a knowledge failure.
+			if ctxErr := runCtx.Err(); ctxErr != nil {
+				return s.finish(ctx, runID, env, env.cancelled(ctxErr, 0, 0)), nil
+			}
+			return s.finish(ctx, runID, env, RunResult{
+				Status: StatusFailed, Reason: kerr.Error(), ConfigHash: snap.Hash,
+			}), nil
+		}
+		env.knowledge = injection
+	}
+
+	// ⑦ 循环。`error` **不全是**函数级错误：运行期失败与取消仍归 `Status`（契约 §2），
+	// 但**准入期拒绝**——配额预留被拒（图 6 [5]）——由循环原样上抛，这里先收口账本再走
+	// 错误通道返回零值 `RunResult`（`run-and-errors.md` §2 / §4 对两类拒绝的形态）。
+	// 循环拿 `runCtx`：取消信号从这里进入传播链（轮首 / 调用后 / 每次工具前 / 组返回后）。
+	// The loop's error is normally nil; an admission-class refusal (stage [5]) is the
+	// exception and travels up after the ledger is closed as failed.
+	res, loopErr := s.opts.Loop.run(runCtx, runID, env)
+	if loopErr != nil {
+		// 账本已经写了 running 行（⑤）：**不得**留成 running 等恢复扫描误判，
+		// 先落 failed 终态，再按错误通道返回。
+		s.finish(ctx, runID, env, RunResult{Status: StatusFailed, Reason: loopErr.Error()})
+		return RunResult{}, loopErr
+	}
 	res.RunID = runID // RunEnv 的字段字不含 RunID（契约 §1.1），由运行入口填
+
+	// ⑦½ 引用复核（V-6）：答案产出后拿**本次实际进入上下文的片段**（循环收窄后的最终
+	// 注入面，不是重新检索的结果）与答案里的引用标记对账。计数只进诊断事件与日志（不含
+	// 正文）；复核本身失败是诊断面故障，**不得**把一次已经成功的运行改判失败。
+	// Citation review runs against the chunks that actually entered the final context; a
+	// review failure never turns a successful run into a failed one.
+	if res.Status == StatusCompleted && s.opts.Knowledge != nil && !env.knowledge.Empty() {
+		if _, aerr := s.opts.Knowledge.ResolveAnswer(ctx, KnowledgeAnswerRequest{
+			Principal: req.Principal,
+			RunID:     runID,
+			Answer:    res.FinalText,
+			Chunks:    env.knowledge.Chunks,
+		}); aerr != nil {
+			s.opts.Logger.Warn("引用复核未完成——答案照常返回",
+				"run_id", runID, "op", "citation_resolve", "error", aerr)
+		}
+	}
 
 	// ⑧⑨ 终态落库后返回——落库失败**不覆盖**已得结果（记 ERROR，行留 running 待恢复扫描收尾）。
 	return s.finish(ctx, runID, env, res), nil

@@ -177,7 +177,7 @@ function defaultReply(call: Call): Reply {
     return { data: profilesData }
   }
   if (call.path.endsWith('/memory')) {
-    return { data: { scope: 'global', agent: '', backend: 'markdown', core: '', archive: '' } }
+    return { data: { scope: 'global', agent: '', backend: 'postgres', core: '', archive: '' } }
   }
   return { data: [] }
 }

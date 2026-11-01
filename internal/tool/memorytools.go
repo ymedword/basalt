@@ -34,8 +34,17 @@ import (
 // Inline schemas; the required array is the only source the executor reads, and scope is
 // deliberately optional because omitting it means the archive.
 const (
-	saveMemoryInputSchema   = `{"type":"object","properties":{"content":{"type":"string","description":"要记住的内容（纯文本；写入前会去掉首尾空白）"},"scope":{"type":"string","enum":["CORE","ARCHIVAL"],"description":"落哪个区：CORE = 核心区（每轮完整注入系统提示词，受配额限制），ARCHIVAL = 归档区（缺省；按关键词召回）"}},"required":["content"]}`
-	recallMemoryInputSchema = `{"type":"object","properties":{"query":{"type":"string","description":"检索词：单个关键词，对归档区条目按整串子串匹配（区分大小写）"}},"required":["query"]}`
+	saveMemoryInputSchema   = `{"type":"object","properties":{"content":{"type":"string","description":"要记住的内容（纯文本；写入前会去掉首尾空白）"},"scope":{"type":"string","enum":["CORE","ARCHIVAL"],"description":"落哪个区：CORE = 核心区（每轮完整注入系统提示词，受配额限制），ARCHIVAL = 归档区（缺省；不自动注入，由 recall_memory 召回，缺省语义检索）"}},"required":["content"]}`
+	recallMemoryInputSchema = `{"type":"object","properties":{"query":{"type":"string","description":"检索文本：语义模式（缺省）送 embedding 在归档区做向量召回，返回名次与来源；keyword 模式按整串子串匹配（区分大小写）"},"mode":{"type":"string","enum":["semantic","keyword"],"description":"召回模式：省略 = semantic（语义召回）；keyword = 旧的整串子串行为（不分词、不扩展、不向量化）"}},"required":["query"]}`
+)
+
+// recallModeSemantic / recallModeKeyword 是 `recall_memory` 的两种召回模式字面量（P-07）。
+// 取值与 `memory.RecallMode*` 逐字同源，但**本包不得 import memory**（依赖方向），
+// 因此在这里声明一份：两面由测试同时钉住（本包判枚举、memory 包判行为），漂移即红。
+// The two recall mode literals, mirrored locally because tool cannot import memory.
+const (
+	recallModeSemantic = "semantic"
+	recallModeKeyword  = "keyword"
 )
 
 // recallNoMatchContent 是召回未命中的结果文案——**不是错误**（口径 10）：模型要能区分
@@ -67,7 +76,7 @@ func (t *SaveMemoryTool) Name() string { return "save_memory" }
 // Description 是给模型看的能力说明。
 // Description is the model-facing summary.
 func (t *SaveMemoryTool) Description() string {
-	return "记住一条长期记忆，跨对话保留（缺省落归档区，用 recall_memory 按关键词取回；scope=CORE 落核心区，每轮完整注入系统提示词并受配额限制）"
+	return "记住一条长期记忆，跨对话保留（缺省落归档区，用 recall_memory 召回——缺省语义检索；scope=CORE 落核心区，每轮完整注入系统提示词并受配额限制）"
 }
 
 // InputSchema 返回内联 Schema（测试按参数面判卷）。
@@ -106,20 +115,31 @@ func (t *SaveMemoryTool) Execute(ctx context.Context, env core.ToolEnv, input js
 	}, nil
 }
 
-// RecallMemoryTool 是 recall_memory：按关键词从归档区取回条目。核心区**不参与检索**
+// RecallMemoryTool 是 recall_memory：从归档区召回条目。核心区**不参与检索**
 // （它每轮已完整注入），故本工具没有分区参数。
-// RecallMemoryTool searches the archive; the core region is injected whole every round
-// and therefore never searched.
+//
+// 两条召回路（P-07 / A-08）：**缺省是语义召回**（`mode` 省略 = 语义，命中带名次与来源），
+// 显式 `mode=keyword` 走旧的整串子串路径（渲染逐字节保留旧行为）。两条路都在触碰载体
+// **之前**判一次 `env.Principal.Valid()`——身份由 Run 准入注入，零值不得补成管理员；
+// 语义路的权限判定由载体按**每次调用**重做（冻结内容不冻结权限，C-11）。
+// RecallMemoryTool recalls from the archive: semantic by default, keyword on request. Both
+// paths check the injected principal before touching the store.
 type RecallMemoryTool struct {
+	// store 是 keyword 模式的兼容载体（旧行为逐字保留；markdown 之类的旧档也能用）。
 	store core.LongTermMemoryStore
+	// recaller 是语义模式的召回端口；nil = 语义路径未装配（装配层两段绑定，见 wire）。
+	recaller MemoryRecaller
 }
 
 var _ core.Tool = (*RecallMemoryTool)(nil)
 
-// NewRecallMemoryTool 装配 recall_memory：只接受记忆载体接口——不接 Policy（注 3）。
-// NewRecallMemoryTool wires recall_memory against the memory store alone.
-func NewRecallMemoryTool(store core.LongTermMemoryStore) *RecallMemoryTool {
-	return &RecallMemoryTool{store: store}
+// NewRecallMemoryTool 装配 recall_memory：关键词路只接记忆载体、语义路只接召回端口
+// ——都不接 Policy（注 3）。`recaller` 允许为 nil（语义路径未装配），此时语义请求按
+// 失败关闭给可执行的 `invalid_input`，**不**静默降级成关键词。
+// NewRecallMemoryTool wires both recall paths; a nil recaller fails closed on semantic
+// requests instead of silently degrading.
+func NewRecallMemoryTool(store core.LongTermMemoryStore, recaller MemoryRecaller) *RecallMemoryTool {
+	return &RecallMemoryTool{store: store, recaller: recaller}
 }
 
 // Name 是工具名——与 AGENT.md 的 `tools:` 声明、注册池逐字比对。
@@ -129,7 +149,7 @@ func (t *RecallMemoryTool) Name() string { return "recall_memory" }
 // Description 是给模型看的能力说明。
 // Description is the model-facing summary.
 func (t *RecallMemoryTool) Description() string {
-	return "从归档区按关键词取回记忆条目（整串子串匹配、区分大小写；核心记忆每轮已完整注入，不需要检索）"
+	return "从归档区召回记忆条目（缺省语义召回，命中带名次与来源；mode=keyword 按整串子串匹配、区分大小写；核心记忆每轮已完整注入，不需要检索）"
 }
 
 // InputSchema 返回内联 Schema（测试按参数面判卷）。
@@ -138,10 +158,11 @@ func (t *RecallMemoryTool) InputSchema() json.RawMessage {
 	return json.RawMessage(recallMemoryInputSchema)
 }
 
-// Execute 取回记忆：解码 → 规范化 → 判空 → 检索。**零命中是成功**：返回 `(无匹配条目)`
-// 而不是 `not_found` / `runtime_error`（口径 10）——把"没有"报成"失败"会让模型反复重试。
-// A no-hit search succeeds with an explicit copy, so the model never retries a correct
-// "nothing matched" as if it were a failure.
+// Execute 取回记忆：解码 → 规范化 → 判空 → 解析模式 → 判身份 → 分派。**零命中是成功**：
+// 返回 `(无匹配条目)` 而不是 `not_found` / `runtime_error`（口径 10）——把"没有"报成
+// "失败"会让模型反复重试。
+// A no-hit search succeeds with an explicit copy; the principal is checked before either
+// path touches a carrier, and an unknown mode is refused before any dispatch.
 func (t *RecallMemoryTool) Execute(ctx context.Context, env core.ToolEnv, input json.RawMessage) (core.Result, error) {
 	args, err := decodeRecallMemoryInput(t.Name(), input)
 	if err != nil {
@@ -151,14 +172,204 @@ func (t *RecallMemoryTool) Execute(ctx context.Context, env core.ToolEnv, input 
 	if err := args.check(t.Name()); err != nil {
 		return core.Result{}, err
 	}
-	hits, err := t.store.RecallByKeyword(ctx, memoryScopeOf(env), args.Query)
+	mode, err := args.mode(t.Name())
+	if err != nil {
+		return core.Result{}, err
+	}
+	// 身份闸门（P-07 / C-28）：两种模式同一道——keyword 模式的载体没有权限面，若这里
+	// 不判，"零值身份"就会在兼容路径上悄悄可用。零值**不得**补成管理员。
+	// One identity gate for both modes: the legacy carrier has no permission surface of
+	// its own, so the zero value must be refused here rather than defaulted.
+	if !env.Principal.Valid() {
+		return core.Result{}, fmt.Errorf("%w: %s 缺少可用的调用方身份", core.ErrUnauthorized, t.Name())
+	}
+	if env.AgentName != "" && !env.Principal.HasAgentScope(env.AgentName) {
+		return core.Result{}, core.ErrForbidden
+	}
+	if env.ShareGlobalMemory && env.AgentName != "" {
+		return t.recallShared(ctx, env, args.Query, mode)
+	}
+	if mode == recallModeKeyword {
+		return t.recallKeyword(ctx, env, args.Query)
+	}
+	return t.recallSemantic(ctx, env, args.Query)
+}
+
+// 共享召回的两个层名（渲染标题与失败文案共用一份字面量）。
+// The two layer names shared by the block headings and the failure copy.
+const (
+	sharedLayerAgent  = "Agent 记忆"
+	sharedLayerGlobal = "全局记忆"
+	blockHeading      = "## "
+)
+
+// recallShared 是 `include_global_memory = true` 时的召回：**分层块**输出。
+//
+// 为什么按层分块、层内各自从 1 编号（D-4 裁决，判据面变更）：两层由载体各自检索、
+// 语义模式下各自一次 embedding，从未放在一起排序。跨层连续编号会读成一个不存在的
+// 统一名次——文档再多解释也补不回来，所以序号只在层内有效，层与层之间靠标题分开。
+// 层序固定 Agent 层 → 全局层（与注入面 `## 全局记忆` 在前、`## Agent 记忆` 在后的
+// 拼接顺序**不同**：注入面是前缀叠加、召回面是逐层检索，两者不互相套用）。
+//
+// 任一层失败即整次失败：不返回另一层的部分命中——半份召回会让模型以为"那一层没有"。
+// 跨层重复正文只保留**先读到**的 Agent 层那一份（Agent 层的表述更具体）。
+// Shared recall renders one block per layer with per-layer numbering: the layers are
+// retrieved and embedded independently and were never jointly ranked. Any layer failure
+// fails the whole call rather than returning a partial hit list.
+func (t *RecallMemoryTool) recallShared(ctx context.Context, env core.ToolEnv, query, mode string) (core.Result, error) {
+	if t.recaller == nil {
+		return core.Result{}, t.sharedUnavailable()
+	}
+	layers := []struct {
+		scope core.Scope
+		name  string
+	}{
+		{scope: core.Scope{Agent: env.AgentName}, name: sharedLayerAgent},
+		{scope: core.GlobalScope, name: sharedLayerGlobal},
+	}
+	seen := map[string]struct{}{}
+	blocks := make([]string, 0, len(layers))
+	for _, layer := range layers {
+		hits, err := t.recaller.RecallArchive(ctx, MemoryRecallRequest{Principal: env.Principal, AuthorizationAgent: env.AgentName, Scope: layer.scope, Query: query, Mode: mode})
+		if err != nil {
+			if errors.Is(err, ErrRecallUnavailable) {
+				return core.Result{}, t.sharedUnavailable()
+			}
+			// 缺口点名**是哪一层**：不分层的文案会让模型以为整个召回都不可用，而实际
+			// 上换关键词仍能检索——错误信息必须指向可执行的下一步。
+			if errors.Is(err, ErrRecallIndexNotReady) {
+				return core.Result{}, t.sharedIndexNotReady(layer.name)
+			}
+			return core.Result{}, err
+		}
+		lines := make([]string, 0, len(hits))
+		for _, hit := range hits {
+			if _, ok := seen[hit.Content]; ok {
+				continue
+			}
+			seen[hit.Content] = struct{}{}
+			if hit.Source == "" {
+				lines = append(lines, fmt.Sprintf("%d. %s", len(lines)+1, hit.Content))
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%d. [%s] %s", len(lines)+1, hit.Source, hit.Content))
+		}
+		if len(lines) == 0 {
+			continue
+		}
+		blocks = append(blocks, blockHeading+layer.name+"\n"+strings.Join(lines, "\n\n"))
+	}
+	if len(blocks) == 0 {
+		return core.Result{Content: recallNoMatchContent}, nil
+	}
+	return core.Result{Content: strings.Join(blocks, "\n\n")}, nil
+}
+
+// recallKeyword 是旧路径逐字保留：整串子串、区分大小写、按写入顺序以空行分隔（口径 11）。
+// The legacy keyword path, preserved verbatim.
+func (t *RecallMemoryTool) recallKeyword(ctx context.Context, env core.ToolEnv, query string) (core.Result, error) {
+	hits, err := t.store.RecallByKeyword(ctx, memoryScopeOf(env), query)
 	if err != nil {
 		return core.Result{}, err
 	}
 	if len(hits) == 0 {
 		return core.Result{Content: recallNoMatchContent}, nil
 	}
-	return core.Result{Content: strings.Join(hits, "\n\n")}, nil // 条目原文按写入顺序、空行分隔（口径 11）
+	return core.Result{Content: strings.Join(hits, "\n\n")}, nil
+}
+
+// recallSemantic 走召回端口：命中渲染成 `名次. [来源] 正文`，条目之间空行分隔（A-08
+// 「带名次与来源」）。来源为空时不渲染方括号——旧载体合成的条目没有来源列，渲染一个
+// `[]` 会让模型以为这是缺失的数据。
+// Semantic hits render as `rank. [source] content`, one block per entry.
+func (t *RecallMemoryTool) recallSemantic(ctx context.Context, env core.ToolEnv, query string) (core.Result, error) {
+	if t.recaller == nil {
+		return core.Result{}, t.semanticUnavailable()
+	}
+	hits, err := t.recaller.RecallArchive(ctx, MemoryRecallRequest{
+		Principal: env.Principal,
+		Scope:     memoryScopeOf(env),
+		Query:     query,
+		Mode:      recallModeSemantic,
+	})
+	if err != nil {
+		if errors.Is(err, ErrRecallUnavailable) {
+			return core.Result{}, t.semanticUnavailable()
+		}
+		// 索引缺口不是"没有匹配"（V-5）：显式提示并给可执行的下一步。**不得**落到
+		// 下方的 `recallNoMatchContent`——那会让一次索引故障看起来像一次正常空结果。
+		// A vector gap must not be rendered as the no-match placeholder.
+		if errors.Is(err, ErrRecallIndexNotReady) {
+			return core.Result{}, t.indexNotReady()
+		}
+		return core.Result{}, err
+	}
+	if len(hits) == 0 {
+		return core.Result{Content: recallNoMatchContent}, nil
+	}
+	lines := make([]string, 0, len(hits))
+	for i, hit := range hits {
+		rank := hit.Rank
+		if rank <= 0 {
+			rank = i + 1
+		}
+		if hit.Source == "" {
+			lines = append(lines, fmt.Sprintf("%d. %s", rank, hit.Content))
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s", rank, hit.Source, hit.Content))
+	}
+	return core.Result{Content: strings.Join(lines, "\n\n")}, nil
+}
+
+// semanticUnavailable 是**可自我纠正**的失败文案（口径 18）：点名缺什么、给出下一步
+// （改用 keyword），而不是一句"内部故障"。装配故障不静默降级成关键词——降级会让
+// "检索变弱"看起来像"没有更多内容"。
+// The actionable refusal for an unassembled semantic path; never a silent fallback.
+func (t *RecallMemoryTool) semanticUnavailable() error {
+	return &core.InvalidInputError{
+		Tool: t.Name(),
+		Reason: "语义召回未装配（缺语义记忆载体或 embedding 连接）——改用 mode=keyword 按关键词检索，" +
+			"或请管理员完成 embedding 装配后重试",
+	}
+}
+
+// sharedUnavailable 是共享模式装配缺失的失败文案：**不**把 `mode=keyword` 当下一步
+// ——共享模式下两层都经同一召回端口读，关键词模式同样走不通，写一句做不到的建议只会
+// 让模型反复重试。
+// The shared-mode refusal names the assembly gap and deliberately omits the keyword hint,
+// which cannot work on this path.
+func (t *RecallMemoryTool) sharedUnavailable() error {
+	return &core.InvalidInputError{
+		Tool: t.Name(),
+		Reason: "共享记忆召回未装配（缺语义记忆载体或 embedding 连接）：本次调用需要依次检索 Agent 层与全局层，" +
+			"两层都经该端口读取。共享模式下的关键词检索同样走这条端口，换 mode 不能绕开；" +
+			"请管理员完成装配后重试",
+	}
+}
+
+// sharedIndexNotReady 是共享模式索引缺口的失败文案（V-5）：**点名缺口的层**，并保留
+// 「改用 mode=keyword」这条真能走的下一步——关键词路径不需要向量，与装配缺失不同。
+// The shared-mode vector gap names the layer and keeps the keyword hint, which does work.
+func (t *RecallMemoryTool) sharedIndexNotReady(layer string) error {
+	return &core.InvalidInputError{
+		Tool: t.Name(),
+		Reason: fmt.Sprintf("记忆向量索引未就绪：%s层有生效归档记忆尚未建立当前代际的向量，"+
+			"本次共享召回**不能**下「无匹配」结论。可改用 mode=keyword 检索（该模式不走向量），"+
+			"或等待索引回填完成后重试", layer),
+	}
+}
+
+// indexNotReady 是**可自我纠正**的失败文案（V-5）：索引缺口不是"没有匹配"，也不是
+// 装配缺失——它意味着"这次召回不能下无匹配结论"。给出两条可执行的下一步（改用关键词、
+// 等回填完成后重试），而不是一句内部故障。
+// The actionable refusal for a vector gap; never the no-match placeholder.
+func (t *RecallMemoryTool) indexNotReady() error {
+	return &core.InvalidInputError{
+		Tool: t.Name(),
+		Reason: "记忆向量索引未就绪：本层有生效归档记忆尚未建立当前代际的向量，" +
+			"本次语义召回**不能**下「无匹配」结论。可改用 mode=keyword 检索，或等待索引回填完成后重试",
+	}
 }
 
 // saveMemoryInput 是 save_memory 的入参形态。Scope 用**指针**接：省略与显式 `null` 都解成
@@ -218,10 +429,14 @@ func (a saveMemoryInput) section(toolName string) (core.Section, error) {
 	}
 }
 
-// recallMemoryInput 是 recall_memory 的入参形态：只有一个检索词（核心区不参与检索）。
-// recallMemoryInput carries the single keyword; the core region is never searched.
+// recallMemoryInput 是 recall_memory 的入参形态：检索词 + 可选召回模式（核心区不参与检索）。
+// Mode 用**指针**接：省略与显式 `null` 同档（缺省语义），而 `""` 是非法取值必须报错——
+// 与 `save_memory.scope` 同一形态（口径 9 的两态）。
+// recallMemoryInput carries the query and the optional mode; a pointer keeps an omitted
+// key and an explicit null on the same default while an empty string stays illegal.
 type recallMemoryInput struct {
-	Query string `json:"query"`
+	Query string  `json:"query"`
+	Mode  *string `json:"mode"`
 }
 
 // decodeRecallMemoryInput 解出 recall_memory 入参（失败同上归 invalid_input）。
@@ -235,6 +450,25 @@ func decodeRecallMemoryInput(toolName string, input json.RawMessage) (recallMemo
 		}
 	}
 	return args, nil
+}
+
+// mode 解析召回模式：省略 / `null` → 语义；`semantic` / `keyword` 逐字接受；其余
+// （含 `""`、`Semantic`、`KEYWORD`）→ 非法。**严格区分大小写**、不给别名——取值集合
+// 是契约字面量（A-08），静默收下一个"差不多"的写法会让模型学到一个不存在的取值。
+// mode resolves the recall mode verbatim and case-sensitively; omission means semantic.
+func (a recallMemoryInput) mode(toolName string) (string, error) {
+	if a.Mode == nil {
+		return recallModeSemantic, nil
+	}
+	switch *a.Mode {
+	case recallModeSemantic, recallModeKeyword:
+		return *a.Mode, nil
+	default:
+		return "", &core.InvalidInputError{
+			Tool:   toolName,
+			Reason: fmt.Sprintf("%s 的 mode 取值非法：%q（只能是 semantic 或 keyword，区分大小写；省略即 semantic）", toolName, *a.Mode),
+		}
+	}
 }
 
 // check 判**规范化后**的 query 非空：空串在实现侧会匹配上每一条（`strings.Contains` 的

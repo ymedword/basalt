@@ -30,6 +30,7 @@ import type {
   ToolView,
 } from '../api'
 import { adminApi, problemsOf } from '../api-admin'
+import { KnowledgeApi } from '../api-knowledge'
 import type { ModelConnectionUpsert, NotifyChannelUpsert, WorkspaceEntry } from '../api-admin'
 import { splitAgentBody } from '../agent-body'
 import { BindingList } from '../components/binding-list'
@@ -128,6 +129,7 @@ export const AgentConfigPage = defineComponent({
     const admin = adminApi(api)
     const config = useLoader(() => admin.getAgentConfig(name))
     const content = useLoader(() => api.getAgentContent(name))
+    const knowledgeCatalog = useLoader(() => new KnowledgeApi(api).listCollections())
     const candidates = useLoader(async () => {
       const [models, channels] = await Promise.all([
         api.listModelConnections(),
@@ -180,6 +182,8 @@ export const AgentConfigPage = defineComponent({
     const notifyPicks = ref<Record<string, string>>({})
     const maxIterationsText = ref('')
     const maxHistoryTurnsText = ref('')
+    const globalMemoryChoice = ref('legacy')
+    const knowledgeNames = ref<string[]>([])
 
     // --- 选择器状态 ----------------------------------------------------------
     const providerQuery = ref('')
@@ -302,6 +306,8 @@ export const AgentConfigPage = defineComponent({
       notifyPicks.value = picks
       maxIterationsText.value = String(fields.settings.max_iterations)
       maxHistoryTurnsText.value = String(fields.settings.max_history_turns)
+      globalMemoryChoice.value = fields.settings.include_global_memory === undefined ? 'legacy' : String(fields.settings.include_global_memory)
+      knowledgeNames.value = (fields.knowledge ?? []).map((item) => item.name)
       // 服务端是唯一真值：任何一次重新读取都丢弃本地待保存内容，避免页面“记住”旧状态。
       emptyBodyArmed.value = false
     }
@@ -1933,6 +1939,24 @@ export const AgentConfigPage = defineComponent({
       ) {
         changes.settings = { ...(changes.settings ?? {}), max_history_turns: maxHistoryTurns }
       }
+
+      // 选回「沿用旧规则」要发**显式 null**（清除该行），不是发 false：false 是另一种
+      // 语义（只用 Agent 层，永不回退全局层），拿它顶替会让页面显示"沿用旧规则"、文件
+      // 里却写着 false，下次注入行为与用户看到的不一致。
+      // 'legacy' 会发 null 让服务端删掉该行；只有真的变了才发，避免每次保存重写声明块。
+      const currentGlobalMemory = fields.settings.include_global_memory === undefined
+        ? 'legacy'
+        : String(fields.settings.include_global_memory)
+      if (globalMemoryChoice.value !== currentGlobalMemory) {
+        const chosen: boolean | null = globalMemoryChoice.value === 'legacy'
+          ? null
+          : globalMemoryChoice.value === 'true'
+        changes.settings = { ...(changes.settings ?? {}), include_global_memory: chosen }
+      }
+
+      if (Array.isArray(fields.knowledge) && !sameList(knowledgeNames.value, fields.knowledge.map((item) => item.name))) {
+        changes.knowledge = knowledgeNames.value.map((name) => ({ name, access: 'read' }))
+      }
       // 绑定显式提交（服务端不补绑、不按名猜 UID）；整块替换，孤儿绑定不参与。
       // 无变化时不发 bindings，避免每次保存都重排声明块。
       const bindings = desiredBindings()
@@ -2001,6 +2025,14 @@ export const AgentConfigPage = defineComponent({
         return true
       }
       if (integerDraftDiffers(maxHistoryTurnsText.value, fields.settings.max_history_turns)) {
+        return true
+      }
+
+      if (globalMemoryChoice.value !== (fields.settings.include_global_memory === undefined ? 'legacy' : String(fields.settings.include_global_memory))) {
+        return true
+      }
+
+      if (Array.isArray(fields.knowledge) && !sameList(knowledgeNames.value, fields.knowledge.map((item) => item.name))) {
         return true
       }
       const bindings = desiredBindings()
@@ -2331,10 +2363,51 @@ export const AgentConfigPage = defineComponent({
 
     // --- 渲染 ---------------------------------------------------------------
 
+    function knowledgeSection(): VNodeChild[] {
+      const rows = knowledgeCatalog.data.value
+      const supported = Array.isArray(config.data.value?.data.fields.knowledge)
+      const content: VNodeChild[] = [h('p', { class: 'muted' }, '选择本 Agent 可使用的知识库；实际检索仍受调用方权限与项目范围约束。跨项目同名时无法唯一解析，请先处理重名。')]
+      if (!supported) content.push(h(Notice, { tone: 'warn', text: '当前服务未提供知识声明读模型，暂不能编辑。' }))
+      if (knowledgeCatalog.error.value) content.push(h(Notice, { tone: 'error', text: '知识库列表读取失败，暂不能修改绑定。' }))
+      if (rows === null) return content
+      const counts = new Map<string, number>()
+      for (const row of rows) counts.set(row.name, (counts.get(row.name) ?? 0) + 1)
+      for (const name of knowledgeNames.value.filter((item) => !counts.has(item))) counts.set(name, 0)
+      if (counts.size === 0) content.push(h('p', { class: 'muted' }, '还没有知识库。'))
+      for (const [name, count] of counts) {
+        const selected = knowledgeNames.value.includes(name)
+        content.push(h('label', { class: 'field', key: name }, [
+          h('input', { type: 'checkbox', checked: selected, disabled: !supported || (count !== 1 && !selected),
+            onChange: (event: Event) => {
+              knowledgeNames.value = (event.target as HTMLInputElement).checked
+                ? [...knowledgeNames.value, name] : knowledgeNames.value.filter((item) => item !== name)
+            } }),
+          h('span', `${name}${count > 1 ? '（同名，请先处理）' : count === 0 ? '（不可用，可移除）' : ''}`),
+        ]))
+      }
+      return content
+    }
+
     function advancedSection(): VNode {
       return section('高级设置', [
         ...bootstrapSection(),
         h('h3', { class: 'subheading' }, '执行设置'),
+        h('label', { class: 'field', for: 'config-global-memory' }, [
+          h('span', '全局记忆使用范围'),
+          h('select', { id: 'config-global-memory', value: globalMemoryChoice.value,
+            onChange: (event: Event) => { globalMemoryChoice.value = (event.target as HTMLSelectElement).value } }, [
+            h('option', { value: 'legacy' }, '沿用旧规则（未明确设置）'),
+            h('option', { value: 'true' }, '使用全局和本 Agent 记忆'),
+            h('option', { value: 'false' }, '仅使用本 Agent 记忆'),
+          ]),
+          // 「沿用旧规则」必须可选：选回它会删除该行（发显式 null），否则用户点过 true
+          // 就再也回不到未声明。三者的实际效果写在提示里，避免把 false 当成"默认"。
+          h('span', { class: 'field-hint muted' },
+            '沿用旧规则 = 文件里不写该键：本 Agent 有记忆就只用自己的，没有再回退全局层，两层不叠加。' +
+            '选「使用全局和本 Agent 记忆」后，两层的条目会一起注入，共享记忆的检索也会读两层——' +
+            '授权使用该 Agent 的调用方可能读到全局记忆，且每次共享检索会多发一次 embedding（模型调用与费用随之增加）。' +
+            '保存后下次运行生效。'),
+        ]),
         textField(
           'config-max-iterations',
           '最大迭代次数',
@@ -2634,6 +2707,7 @@ export const AgentConfigPage = defineComponent({
           ...toolsSubsection(),
           ...skillsSubsection(),
         ]),
+        section('知识库', knowledgeSection()),
         section('MCP', [
           h(
             'p',

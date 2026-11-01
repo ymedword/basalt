@@ -46,7 +46,8 @@ import (
 	"github.com/ymedword/basalt/internal/app"
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtemp"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -62,9 +63,11 @@ const (
 	agentsDirName    = "agents"
 	agentFileName    = "AGENT.md"
 	configFileName   = "basalt.yaml"
-	// databaseFileName 是工作区库文件名（与装配层 `databaseFileName` 同值；此处按
-	// 字面量引用，不反向依赖装配层）。夹具只读它一次，用来取发布指针的 UID。
-	databaseFileName = "basalt.db"
+
+	// evalSchemaPrefix 是每个用例一次性 schema 的名字前缀（含冒烟残留一眼可认）：
+	// 评测的写入全部落在隔离 schema 里，收尾整库回收。
+	// evalSchemaPrefix marks the per-case throwaway schema in the test database.
+	evalSchemaPrefix = "basalt_evals_"
 
 	// probeProviderName 是 fake 档临时配置里的供应商名。用例的 AGENT.md 声明它，
 	// 路由查表因此仍是一次真实查表（宪法 III 的显式映射在评测里一步不少）。
@@ -817,10 +820,31 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 		return cr
 	}
 
+	// US-16 起运行期存储只有 PostgreSQL（D-01）：每个用例建一个一次性 schema，写入
+	// （会话 / 运行 / 审计 / 读数）全部落在里面，收尾整库回收。连接串**只在内存里**
+	// 交给装配——不写配置文件、不进结果文件（它含测试库口令）。
+	// Since US-16 the runtime stores into PostgreSQL only: every case gets a throwaway
+	// schema and the DSN travels in memory, never through a file.
+	schema, err := pgtemp.New(ctx, evalSchemaPrefix)
+	if err != nil {
+		cr.Error = fmt.Sprintf("准备隔离库失败：%v", err)
+		return cr
+	}
+	defer func() {
+		// 回收独立于用例上下文（它可能已被取消），并让回收先于池关闭之后的任何清理；
+		// dropping after the runtime closes keeps the teardown order explicit.
+		dropCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if dropErr := schema.Drop(dropCtx); dropErr != nil {
+			logger.Warn("评测隔离库回收失败", "case", ec.ID, "schema", schema.Name, "detail", dropErr)
+		}
+	}()
+
 	opts := app.Options{
 		WorkDir:                workDir,
-		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
 		Logger:                 logger,
+		DatabaseDSN:            schema.DSN,
 	}
 	if ec.Provider == "" {
 		opts.ProviderClient = newScriptedClient(ec.Script)
@@ -874,6 +898,11 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 	defer cancel()
 
 	req := core.RunRequest{
+		// 评测夹具跑在进程内、等价于运维自己的终端（与 CLI 同一入口）：
+		// 身份显式取自 CLI 管理构造器，**不得**留零值（C-28）。
+		// The eval harness runs in-process like the operator's own terminal, so it
+		// uses the explicit admin-cli principal rather than a zero value.
+		Principal: core.LocalAdminCLIPrincipal(),
 		Agent:     ec.Fixture.Agent,
 		SessionID: cr.SessionID,
 		Message:   ec.Message,
@@ -935,19 +964,19 @@ func declareFixtureBindings(ctx context.Context, workDir string, ec evalCase, op
 		return fmt.Errorf("读取夹具 Agent 定义：%w", err)
 	}
 
-	db, err := storage.OpenReadOnly(ctx, filepath.Join(wsRoot, databaseFileName), storage.SupportedSchemaVersion)
+	db, err := postgres.OpenReadOnly(ctx, postgres.Config{DSN: opts.DatabaseDSN})
 	if err != nil {
-		return fmt.Errorf("只读打开夹具库：%w", err)
+		return fmt.Errorf("只读打开隔离库：%w", err)
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("关闭夹具库：%w", closeErr))
+			err = errors.Join(err, fmt.Errorf("关闭隔离库：%w", closeErr))
 		}
 	}()
 
 	bindings := core.ResourceBindings{}
 	if name := view.Profile.Provider.Name; name != "" {
-		pointer, err := storage.NewResourceStore(db).Pointer(ctx, core.ResourceModelConnection, name)
+		pointer, err := postgres.NewResourceStore(db).Pointer(ctx, core.ResourceModelConnection, name)
 		if err != nil {
 			return fmt.Errorf("读模型连接 %s 的发布指针：%w", name, err)
 		}
@@ -955,7 +984,7 @@ func declareFixtureBindings(ctx context.Context, workDir string, ec evalCase, op
 			core.ResourceBinding{Name: name, UID: pointer.ResourceUID})
 	}
 	for _, name := range view.Profile.NotifyChannels {
-		channel, err := storage.NewNotifyAdminStore(db).Get(ctx, name)
+		channel, err := postgres.NewNotifyAdminStore(db).Get(ctx, name)
 		if err != nil {
 			return fmt.Errorf("读通知渠道 %s 的身份：%w", name, err)
 		}

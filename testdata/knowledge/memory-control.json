@@ -1,0 +1,122 @@
+{
+  "dataset": "us16-memory-control",
+  "version": 1,
+  "label_status": "ai_adjudicated_not_human",
+  "source": "AI 依 2026-10-27 用户授权标注：三臂定义逐字取自设计卡 §4.5 记忆实验行（无长期记忆 / 普通 Top-K / 受控记忆），条目状态与分层口径取自 internal/memory 的记忆契约（state / valid_to / scope），不是人工标注。",
+  "budget_tokens": 60,
+  "principal": {
+    "caller_id": "caller_eval_memory",
+    "key_id": "key_eval_memory",
+    "project": "team-a",
+    "scopes": ["agents:invoke:support"]
+  },
+  "entries": [
+    {
+      "id": "mem-support-core-shift",
+      "scope": "support",
+      "section": "core",
+      "state": "active",
+      "content": "值班交接时间为每天 09:00（UTC+8）。",
+      "rationale": "核心区生效条目：Run 冻结文本的来源（图 5），受控臂必须在所有查询里注入它。"
+    },
+    {
+      "id": "mem-support-tz-old",
+      "scope": "support",
+      "section": "archive",
+      "state": "superseded",
+      "content": "值班时区按 UTC 结算，日志时间戳统一用 UTC。",
+      "rationale": "被替代的旧事实：普通 Top-K 只按相似度排，会把它一起注入；受控臂必须排除。"
+    },
+    {
+      "id": "mem-support-tz-new",
+      "scope": "support",
+      "section": "archive",
+      "state": "active",
+      "supersedes_id": "mem-support-tz-old",
+      "content": "值班时区自 2026-10 起改为 UTC+8，日志时间戳同步调整。",
+      "rationale": "替代后的生效条目：纠正锚点——正确臂只注入它，普通 Top-K 会被旧条稀释。"
+    },
+    {
+      "id": "mem-support-roster-old",
+      "scope": "support",
+      "section": "archive",
+      "state": "active",
+      "valid_to": "2026-01-01T00:00:00Z",
+      "content": "旧版值班表为 3 班轮换。",
+      "rationale": "已过 valid_to 的条目：状态仍是 active，但召回必须按时间过滤（到期不删行）。"
+    },
+    {
+      "id": "mem-support-roster",
+      "scope": "support",
+      "section": "archive",
+      "state": "active",
+      "content": "现行值班表为 4 班轮换，每班 6 小时。",
+      "rationale": "现行生效条目：过期类查询的正确答案。"
+    },
+    {
+      "id": "mem-support-subsidy-candidate",
+      "scope": "support",
+      "section": "archive",
+      "state": "candidate",
+      "content": "候选项：值班补贴按 1.5 倍发放。",
+      "rationale": "未确认候选：候选不参与召回（C-21），普通 Top-K 会把它当事实注入。"
+    },
+    {
+      "id": "mem-billing-close",
+      "scope": "billing",
+      "section": "archive",
+      "state": "active",
+      "content": "结算批号 BX-7 由 billing 每日 02:00 生成。",
+      "rationale": "另一 Agent 分层的条目：support 身份的调用方无 agents:invoke:billing，注入即为越权泄漏（红线）。"
+    },
+    {
+      "id": "mem-global-core-sources",
+      "scope": "",
+      "section": "core",
+      "state": "active",
+      "content": "全局口径：所有 Agent 的报告必须标注数据来源。",
+      "rationale": "全局层核心区：support 层有核心文本时生效层是 support 自己（不回退），受控臂不得把全局核心区叠进来。"
+    }
+  ],
+  "queries": [
+    {
+      "id": "q-core-shift",
+      "kind": "core_freeze",
+      "query": "值班交接时间定在几点？",
+      "answer_points": ["09:00"],
+      "rationale": "只靠核心区冻结文本即可答；检验受控臂的 Freeze 注入面。"
+    },
+    {
+      "id": "q-correction",
+      "kind": "correction",
+      "query": "值班时区现在按哪个时区结算？",
+      "answer_points": ["UTC+8"],
+      "stale_markers": ["按 UTC 结算"],
+      "rationale": "纠正类：新条必须进上下文、旧条不得进；stale_marker 是旧条正文的逐字片段。"
+    },
+    {
+      "id": "q-expiry",
+      "kind": "expiry",
+      "query": "现行值班表怎么轮换？",
+      "answer_points": ["4 班轮换"],
+      "stale_markers": ["3 班轮换"],
+      "rationale": "过期类：valid_to 已过的条目必须被召回过滤掉。"
+    },
+    {
+      "id": "q-subsidy",
+      "kind": "candidate",
+      "query": "值班补贴按几倍发放？",
+      "answer_points": [],
+      "stale_markers": ["1.5 倍"],
+      "rationale": "候选类：没有已确认事实可答，任何注入都是把未确认候选当事实。"
+    },
+    {
+      "id": "q-permission",
+      "kind": "permission",
+      "query": "结算批号是什么？",
+      "answer_points": [],
+      "leak_markers": ["BX-7"],
+      "rationale": "越权类：support 身份不得读到 billing 分层；该查询没有任何合法答案。"
+    }
+  ]
+}

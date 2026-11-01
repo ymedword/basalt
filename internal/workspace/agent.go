@@ -342,6 +342,13 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 			kind = core.AgentRejectInvalidResourceBindings
 			detail = "块结构非法"
 		}
+		// `knowledge:` 结构非法走自己的类别（规则 12）：与资源绑定分开点名，
+		// 页面才能把修复动作指到正确的块上。
+		// A malformed knowledge block is named by its own kind so the console points at it.
+		if errors.Is(err, core.ErrAgentKnowledgeBindingInvalid) {
+			kind = core.AgentRejectInvalidKnowledge
+			detail = "块结构非法"
+		}
 		return entry, reject{kind: kind, detail: detail}
 	}
 	entry.Profile = profile // 解析成功即有 Profile（即使校验未过——供 list / show 展示声明面）
@@ -728,11 +735,20 @@ func parseFrontmatter(raw []byte) (*core.Profile, []string, error) {
 	if err != nil {
 		return nil, warns, err
 	}
+	// `knowledge:` 同走严格结构校验（knowledge_bindings.go，规则 12）：声明即绑定，
+	// 结构非法就整只不注册。名字有没有实体是注册闸门的事（需要查库），解析期不判。
+	// The knowledge block gets the same strict structural check; entity existence is the
+	// registration gate's job because it needs a database read.
+	knowledge, err := parseKnowledgeFront(front)
+	if err != nil {
+		return nil, warns, err
+	}
 	profile := intoProfile(dto)
 	// 字面量合法性不在解析期判：规则 10 与绑定完整性分别由加载期与保存期判定，
 	// 解析器只负责把声明原样带出来（`invalid notify_mode` 是加载期 WARN）。
 	profile.NotifyMode = core.NotifyMode(dto.NotifyMode)
 	profile.ResourceBindings = bindings
+	profile.Knowledge = knowledge
 	return profile, warns, nil
 }
 
@@ -968,6 +984,9 @@ var frontmatterKnownKeys = map[string]keySpec{
 		"model_connection": {items: map[string]keySpec{"name": {}, "uid": {}}},
 		"notify_channel":   {items: map[string]keySpec{"name": {}, "uid": {}}},
 	}},
+	// knowledge 是知识集合的声明（结构见 knowledge_bindings.go，规则 12）。
+	// knowledge declares the bound collections; its shape is checked by rule 12.
+	"knowledge": {items: map[string]keySpec{"name": {}, "access": {}}},
 	"identity": {children: map[string]keySpec{
 		"agent_name": {},
 		"prompt":     {},
@@ -978,8 +997,9 @@ var frontmatterKnownKeys = map[string]keySpec{
 		"temperature": {},
 	}},
 	"settings": {children: map[string]keySpec{
-		"max_iterations":    {},
-		"max_history_turns": {},
+		"max_iterations":        {},
+		"max_history_turns":     {},
+		"include_global_memory": {},
 	}},
 	"channels": {items: map[string]keySpec{
 		"name":   {},
@@ -1045,6 +1065,7 @@ func intoProfile(dto frontmatterDTO) *core.Profile {
 	if dto.Settings.MaxHistoryTurns != nil {
 		settings.MaxHistoryTurns = *dto.Settings.MaxHistoryTurns
 	}
+	settings.IncludeGlobalMemory = dto.Settings.IncludeGlobalMemory
 
 	schedules := make([]core.Schedule, 0, len(dto.Schedules))
 	for _, s := range dto.Schedules {
@@ -1135,8 +1156,9 @@ type channelDTO struct {
 }
 
 type settingsDTO struct {
-	MaxIterations   *int `yaml:"max_iterations"`
-	MaxHistoryTurns *int `yaml:"max_history_turns"`
+	MaxIterations       *int  `yaml:"max_iterations"`
+	MaxHistoryTurns     *int  `yaml:"max_history_turns"`
+	IncludeGlobalMemory *bool `yaml:"include_global_memory"`
 }
 
 type scheduleDTO struct {

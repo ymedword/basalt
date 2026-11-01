@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷网络域名白名单的管理服务（US-12 R8 裁决 2 / R8.2.1–R8.2.4）：首次种子与
@@ -11,23 +13,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
 // allowlistEnv 是白名单服务的共享夹具：真库 + 真管理操作仓储 + 真策略实例。
 type allowlistEnv struct {
 	service *NetworkAllowlist
-	store   *storage.NetworkPolicyStore
-	ops     *storage.ManagementStore
-	db      *storage.DB
+	store   *postgres.NetworkPolicyStore
+	ops     *postgres.ManagementStore
+	db      *postgres.DB
 	policy  *tool.WhitelistPolicy
 	logs    *bytes.Buffer
 }
@@ -38,13 +40,10 @@ func allowlistClock() time.Time { return time.Date(2026, 10, 24, 8, 30, 0, 0, ti
 // newAllowlistEnv 装配夹具；`mutate` 可替换 store / operations / supervisor。
 func newAllowlistEnv(t *testing.T, mutate func(*NetworkAllowlistDeps)) *allowlistEnv {
 	t.Helper()
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(t.TempDir(), "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	store := storage.NewNetworkPolicyStore(db)
-	ops := storage.NewManagementStore(db)
+	store := postgres.NewNetworkPolicyStore(db)
+	ops := postgres.NewManagementStore(db)
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{Root: t.TempDir()})
 	logger, logs := newCapturedLogger()
 
@@ -173,8 +172,9 @@ func TestNetworkAllowlist_UpdateHotAppliesAndAudits(t *testing.T) {
 	require.Equal(t, etag, rec.ExpectedETag)
 	require.Equal(t, core.OperationSuccess, rec.Status)
 	require.Equal(t, "OK", rec.ResultCode)
-	require.Contains(t, string(rec.DetailJSON), `"before_revision":1`)
-	require.Contains(t, string(rec.DetailJSON), `"after_revision":2`)
+	detail := detailMap(t, rec.DetailJSON)
+	require.Equal(t, float64(1), detail["before_revision"])
+	require.Equal(t, float64(2), detail["after_revision"])
 	require.NotContains(t, string(rec.DetailJSON), "hooks.example.net",
 		"detail 只放修订号与摘要，不放域名清单")
 }

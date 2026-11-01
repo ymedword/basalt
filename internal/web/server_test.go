@@ -1008,6 +1008,17 @@ func (c *countingAuth) Wrap(next AdminHandler) http.Handler {
 	})
 }
 
+// WrapPrincipal 与 Wrap 同口径计数：业务行同样必须过闸门，公开与兜底不过。
+// WrapPrincipal counts exactly like Wrap, so business rows stay behind the gate too.
+func (c *countingAuth) WrapPrincipal(next PrincipalHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.calls++
+		c.mu.Unlock()
+		next(w, r, core.LocalAdminPrincipal())
+	})
+}
+
 func (c *countingAuth) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

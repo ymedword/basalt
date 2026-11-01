@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是实例首次初始化与加密三态的判卷（14D T092；模块卡验收 A1–A12）。
@@ -21,12 +23,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // instanceSecretsFixture 把服务面接在既有资源夹具上：同一个库、同一个工作区，
@@ -36,7 +40,7 @@ import (
 type instanceSecretsFixture struct {
 	*resolverFixture
 	service *InstanceSecretsService
-	store   *storage.InstanceSecretsStore
+	store   *postgres.InstanceSecretsStore
 	keyPath string
 	keyDir  string
 }
@@ -49,7 +53,7 @@ func newInstanceSecretsFixture(t *testing.T) *instanceSecretsFixture {
 	env := newResolverFixture(t)
 	instanceRoot := filepath.Join(t.TempDir(), "instance")
 	keyPath := filepath.Join(instanceRoot, "master.key")
-	store := storage.NewInstanceSecretsStore(env.db)
+	store := postgres.NewInstanceSecretsStore(env.db)
 	service, err := NewInstanceSecretsService(InstanceSecretsDeps{
 		Store:         store,
 		Operations:    env.ops,
@@ -72,7 +76,7 @@ func newInstanceSecretsFixture(t *testing.T) *instanceSecretsFixture {
 
 // record 读当前初始化记录（未命中即失败——多数用例需要它存在）。
 // record loads the instance record; a miss fails the test.
-func (f *instanceSecretsFixture) record(t *testing.T) storage.InstanceSecretRecord {
+func (f *instanceSecretsFixture) record(t *testing.T) postgres.InstanceSecretRecord {
 	t.Helper()
 	record, exists, err := f.store.Load(context.Background(), core.InstanceSecretScopeMasterKey)
 	require.NoError(t, err)
@@ -308,14 +312,16 @@ func TestInstanceSecrets_ExistingInstanceNotAutoInit(t *testing.T) {
 	require.Empty(t, f.secretsInitOps(t))
 }
 
-// TestInstanceSecrets_AdoptMatchesCiphertext 覆盖 A7：无记录但既有密钥又有密文时
-// 必须真解一遍——解得开才 adopt，解不开就是恢复态，且**不**写记录。
-// 逆改点：只校验路径与权限就 adopt → 全部托管凭据永久不可用而页面显示就绪。
+// TestInstanceSecrets_AdoptMatchesCiphertext 覆盖 A7 与 D-40：无记录但既有密钥
+// 又有密文时**一律**恢复态——解不开当然不 adopt（A7 原判据），解得开也不再 adopt
+// （D-40，2026-10-27 裁决：能解不等于来源可信），两种情况都**不**写记录。
+// 逆改点：把"密钥能解开现存密文"当来源证明去 adopt → 无主来源被采纳成原生身份，
+// 事后与真正的丢记录无法区分（第一子例红）。
 func TestInstanceSecrets_AdoptMatchesCiphertext(t *testing.T) {
 	target, err := CredentialTargetBinding(core.BindingModelConnection, "https://api.example.com/v1", "")
 	require.NoError(t, err)
 
-	t.Run("密钥解得开现有密文则 adopt", func(t *testing.T) {
+	t.Run("密钥解得开现有密文也不 adopt", func(t *testing.T) {
 		f := newInstanceSecretsFixture(t)
 		f.seedSealedCredential(t, core.ResourceModelConnection, "alpha", target, "sk-alpha-plaintext")
 		require.NoError(t, prepareSecretDirectory(f.keyDir))
@@ -323,8 +329,12 @@ func TestInstanceSecrets_AdoptMatchesCiphertext(t *testing.T) {
 
 		status, err := f.service.Ensure(context.Background())
 		require.NoError(t, err)
-		require.Equal(t, core.SecretStateReady, status.Decision.State)
-		require.Equal(t, f.key.KeyID, f.record(t).KeyID)
+		require.Equal(t, core.SecretStateRecoveryRequired, status.Decision.State,
+			"D-40：即使这把钥匙能解开全部密文，也不得自动 adopt")
+		require.Equal(t, core.SecretRecoveryUnprovableProvenance, status.Decision.Reason)
+		_, exists, loadErr := f.store.Load(context.Background(), core.InstanceSecretScopeMasterKey)
+		require.NoError(t, loadErr)
+		require.False(t, exists, "D-40：无记录 + 有密文时启动不得补写记录")
 	})
 
 	t.Run("密钥解不开现有密文则进恢复态", func(t *testing.T) {
@@ -349,6 +359,231 @@ func TestInstanceSecrets_AdoptMatchesCiphertext(t *testing.T) {
 		require.NoError(t, loadErr)
 		require.False(t, exists, "试解失败不得留下初始化记录")
 	})
+}
+
+// secretsRecordCount 报告实例主密钥初始化记录是否存在：本模块只有 `master_key`
+// 一个 scope，因此"有记录"即 1、无记录即 0。
+// secretsRecordCount reports whether the master-key record exists (1 or 0).
+func (f *instanceSecretsFixture) secretsRecordCount(t *testing.T) int {
+	t.Helper()
+	_, exists, err := f.store.Load(context.Background(), core.InstanceSecretScopeMasterKey)
+	require.NoError(t, err)
+	if !exists {
+		return 0
+	}
+	return 1
+}
+
+// auditHas 报告该 action 是否已经写下操作行（预写 `pending` 也算写过）。
+// auditHas reports whether any operation row carries that action.
+func (f *instanceSecretsFixture) auditHas(t *testing.T, action string) bool {
+	t.Helper()
+	rows, err := f.ops.ListOperations(context.Background(), core.OperationFilter{Action: action, Limit: 20})
+	require.NoError(t, err)
+	return len(rows) > 0
+}
+
+// TestInstanceSecrets_NoRecordWithCiphertextStaysRecovery 覆盖 D-40（2026-10-27 裁决）：
+// 无初始化记录 + 有托管密文 ⇒ `recovery_required` / `unprovable_provenance`，
+// **密钥能解开也不 adopt**；`Ensure` / `Init` / `EnsureForManagedWrite` / `Adopt`
+// 四个入口一律零写入（无记录、无操作行、无新密钥、密钥文件字节不变）。
+//
+// 覆盖的逆改点（每条对应一种真实事故）：
+//   - `EvaluateSecrets` 在"密钥可解"时返回 adopt → decryptable 子例的状态 / 原因 /
+//     动作 / `CanInitialize` 四条断言同时红（无主来源被采纳成原生身份）；
+//   - `Ensure` 在守卫之后仍补写 → 记录数 0 → 1 且出现 `system.secrets_init`；
+//   - `Init` / `EnsureForManagedWrite` / `Adopt` 未被恢复态拦住 → 三个拒绝断言红；
+//   - 恢复态顺手生成替代密钥 → 密钥文件出现（missing_key 子例红）；
+//   - 恢复态重写 / 替换盘上的密钥 → 字节比对红（present 子例红）。
+//
+// 文档原文（颗粒度文档 §4.2 R30）：三子例
+// `{"decryptable_key", true, true}` / `{"undecryptable_key", true, false}` /
+// `{"missing_key", false, false}`，注释「D-40 的核心：能解开也不再 adopt」。
+func TestInstanceSecrets_NoRecordWithCiphertextStaysRecovery(t *testing.T) {
+	target, err := CredentialTargetBinding(core.BindingModelConnection, "https://api.example.com/v1", "")
+	require.NoError(t, err)
+
+	cases := []struct {
+		name     string
+		present  bool
+		verified bool
+	}{
+		{"decryptable_key", true, true}, // D-40 的核心：能解开也不再 adopt
+		{"undecryptable_key", true, false},
+		{"missing_key", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 判定表本体是纯函数：状态 / 原因 / 动作 / 能否初始化只由事实决定。
+			got := EvaluateSecrets(SecretsFacts{
+				Configured:          true,
+				AutoInit:            true,
+				KeyPresent:          tc.present,
+				KeyID:               "key-1",
+				ManagedCiphertexts:  3,
+				CiphertextsVerified: tc.verified,
+			})
+			require.Equal(t, core.SecretStateRecoveryRequired, got.State)
+			require.Equal(t, core.SecretRecoveryUnprovableProvenance, got.Reason)
+			require.Equal(t, SecretsActionRecover, got.Action)
+			require.False(t, got.CanInitialize())
+
+			// 四条入口接在同一份事实上：有密文、无记录。
+			ctx := context.Background()
+			f := newInstanceSecretsFixture(t)
+			f.seedSealedCredential(t, core.ResourceModelConnection, "model-default", target,
+				"sk-test-representative")
+			var keyBefore []byte
+			if tc.present {
+				require.NoError(t, prepareSecretDirectory(f.keyDir))
+				keyID, keyBytes := f.key.KeyID, f.key.Key
+				if !tc.verified {
+					// 只换 key_id 不够：材料一起换，"解不开"才是真的。
+					stranger := testMasterKey()
+					stranger.KeyID = "k_stranger00000000000000001"
+					for index := range stranger.Key {
+						stranger.Key[index] = byte(255 - index)
+					}
+					keyID, keyBytes = stranger.KeyID, stranger.Key
+				}
+				writeMasterKeyFile(t, f.keyDir, keyID, keyBytes)
+				before, readErr := os.ReadFile(f.keyPath)
+				require.NoError(t, readErr)
+				keyBefore = before
+			}
+
+			status, err := f.service.Ensure(ctx)
+			require.NoError(t, err, "恢复态是状态返回，不是启动错误")
+			require.Equal(t, core.SecretStateRecoveryRequired, status.Decision.State)
+			require.Equal(t, 0, f.secretsRecordCount(t), "启动不得补写记录")
+			require.False(t, f.auditHas(t, core.ActionSystemSecretsInit), "启动不得写初始化审计")
+			if tc.present {
+				after, readErr := os.ReadFile(f.keyPath)
+				require.NoError(t, readErr)
+				require.Equal(t, keyBefore, after, "恢复态不得重写或替换密钥文件")
+			} else {
+				_, statErr := os.Lstat(f.keyPath)
+				require.ErrorIs(t, statErr, os.ErrNotExist, "恢复态不得生成新密钥")
+			}
+
+			require.Error(t, f.service.EnsureForManagedWrite(ctx, managedWriteActor()))
+			_, err = f.service.Init(ctx, managedWriteActor())
+			require.ErrorIs(t, err, core.ErrCredentialUnavailable)
+			_, err = f.service.Adopt(ctx)
+			require.Error(t, err)
+			require.Equal(t, 0, f.secretsRecordCount(t), "拒绝路径一律零写入")
+			require.Empty(t, f.secretsInitOps(t), "拒绝路径不得留下任何操作行")
+		})
+	}
+}
+
+// TestInstanceSecrets_TrustedRecordAndKeyReady 是 D-40 的误伤守卫：初始化记录在、
+// 密钥与之一致（key_id / 指纹）、现存密文全可解时，判定必须是 `ready`——不得因为
+// "实例里还有托管密文"就被推回恢复态（那会让合法实例升级后起不来）。启动既不补写
+// 记录、不刷新记录时间、不新增初始化操作行，也不改写密钥文件。
+//
+// 覆盖的逆改点（每条对应一种真实事故）：
+//   - D-40 的守卫漏掉 `facts.Record == nil` 前置（写成"有密文就恢复态"）→ 状态 /
+//     原因 / 动作三条断言同时红（就绪实例被判恢复态，线上表现为升级后无法启动）；
+//   - 就绪分支仍补写记录 / 把 `initialized_at` 刷新成启动时刻 → 记录数与时间断言红；
+//   - 记录里的指纹与密钥不一致（或干脆不写）→ 指纹断言红（管理台的比对值不可信）；
+//   - 就绪路径重写密钥文件 → 字节比对红。
+//
+// 文档原文（颗粒度文档 §4.2 R30 守卫收紧误伤案例 1）："有记录 + 匹配密钥 + 密文全可解
+// 仍被拒 → 合法实例无法启动"，断言 `ready`、记录不改、`secrets verify` 全通过。
+// `secrets verify` 的 CLI 层（VerifyCredentials）由 TestSecretsVerify_* 覆盖；本用例用
+// 它的同一原语 verifySealedCredentials 判"全可解"，避免在批次间重复实现验证器。
+// TestInstanceSecrets_TrustedRecordAndKeyReady keeps a trusted, ready instance ready:
+// D-40 only applies to the record-less branch.
+func TestInstanceSecrets_TrustedRecordAndKeyReady(t *testing.T) {
+	ctx := context.Background()
+	f := newInstanceSecretsFixture(t)
+
+	// 可信三件套：可回溯的初始化操作行 + 与之对应的记录 + 盘上那把密钥。
+	fingerprint, err := MasterKeyFingerprint(f.key)
+	require.NoError(t, err)
+	initializedAt := baselineClock().Add(-72 * time.Hour)
+	opID := core.NewOperationID(initializedAt)
+	require.NoError(t, f.ops.BeginOperation(ctx, core.OperationRecord{
+		OperationID:  opID,
+		Action:       core.ActionSystemSecretsInit,
+		TargetKind:   core.TargetKindSystem,
+		TargetID:     core.InstanceTargetMasterKey,
+		ActorSubject: core.ActorSubjectMigration,
+		AuthMethod:   core.AuthMethodMigration,
+		Source:       core.AuthMethodMigration,
+		Status:       core.OperationPending,
+		CreatedAt:    initializedAt,
+	}))
+	require.NoError(t, f.ops.FinishOperation(ctx, opID,
+		core.OperationSuccess, "", "", nil, initializedAt))
+	writeMasterKeyFile(t, f.keyDir, f.key.KeyID, f.key.Key)
+	require.NoError(t, f.store.Insert(ctx, postgres.InstanceSecretRecord{
+		Scope:         core.InstanceSecretScopeMasterKey,
+		KeyID:         f.key.KeyID,
+		Fingerprint:   fingerprint,
+		InitializedAt: initializedAt,
+		OperationID:   opID,
+	}))
+
+	target, err := CredentialTargetBinding(core.BindingModelConnection, "https://api.example.com/v1", "")
+	require.NoError(t, err)
+	f.seedSealedCredential(t, core.ResourceModelConnection, "model-default", target,
+		"sk-test-representative")
+	keyBefore, err := os.ReadFile(f.keyPath)
+	require.NoError(t, err)
+
+	status, err := f.service.Ensure(ctx)
+	require.NoError(t, err)
+	require.Equal(t, core.SecretStateReady, status.Decision.State, "D-40 只作用于无记录分支")
+	require.Equal(t, core.SecretRecoveryNone, status.Decision.Reason)
+	require.Equal(t, SecretsActionReady, status.Decision.Action)
+	require.False(t, status.CanInitialize, "就绪实例不得允许再初始化")
+	require.Equal(t, f.key.KeyID, status.KeyID)
+	require.Equal(t, fingerprint, status.Fingerprint)
+	require.Equal(t, 1, status.ManagedCiphertexts)
+	require.Equal(t, 1, f.secretsRecordCount(t), "有记录分支不得补写")
+
+	record := f.record(t)
+	require.Equal(t, f.key.KeyID, record.KeyID)
+	require.Equal(t, fingerprint, record.Fingerprint)
+	require.Equal(t, initializedAt.UnixMilli(), record.InitializedAt.UnixMilli(),
+		"记录时间不得被启动刷新")
+	require.Equal(t, opID, record.OperationID, "记录来源不得被改写")
+
+	rows := f.secretsInitOps(t)
+	require.Len(t, rows, 1, "启动不得新增初始化操作行")
+	require.Equal(t, core.OperationSuccess, rows[0].Status)
+	require.Equal(t, opID, rows[0].OperationID)
+
+	after, err := os.ReadFile(f.keyPath)
+	require.NoError(t, err)
+	require.Equal(t, keyBefore, after, "就绪路径不得重写密钥文件")
+
+	// "密文全可解"用与 secrets verify 同一个原语判：解不开的条数必须为 0。
+	sealed, err := f.store.SealedCredentials(ctx)
+	require.NoError(t, err)
+	require.Len(t, sealed, 1)
+	// 同一原语判"全可解"：adopt-legacy / 启动校验用的都是 verifySealedCredentials。
+	sealedRows := make([]storage.SealedCredential, len(sealed))
+	for index, item := range sealed {
+		sealedRows[index] = storage.SealedCredential{
+			CredentialID:  item.CredentialID,
+			OwnerKind:     item.OwnerKind,
+			OwnerUID:      item.OwnerUID,
+			VersionNo:     item.VersionNo,
+			KeyID:         item.KeyID,
+			TargetBinding: item.TargetBinding,
+			Nonce:         item.Nonce,
+			Ciphertext:    item.Ciphertext,
+		}
+	}
+	key, err := LoadMasterKey(f.keyPath, f.root)
+	require.NoError(t, err)
+	defer key.Zero()
+	unreadable, first, err := verifySealedCredentials(key, sealedRows)
+	require.NoError(t, err)
+	require.Zero(t, unreadable, "全部密文必须可解，第一条失败：%s", first)
 }
 
 // TestInstanceSecrets_RefusesOverwrite 覆盖 A8：已就绪的实例拒绝再生成，发布路径
@@ -524,7 +759,7 @@ func TestInstanceSecretsPort_StatusProjection(t *testing.T) {
 	t.Run("pure env instance is not initializable", func(t *testing.T) {
 		env := newResolverFixture(t)
 		service, err := NewInstanceSecretsService(InstanceSecretsDeps{
-			Store:         storage.NewInstanceSecretsStore(env.db),
+			Store:         postgres.NewInstanceSecretsStore(env.db),
 			Operations:    env.ops,
 			WorkspaceRoot: env.root,
 			AutoInit:      true,
@@ -556,7 +791,7 @@ func TestInstanceSecretsPort_InitSurfacesOperationID(t *testing.T) {
 
 	env := newResolverFixture(t)
 	service, err := NewInstanceSecretsService(InstanceSecretsDeps{
-		Store:         storage.NewInstanceSecretsStore(env.db),
+		Store:         postgres.NewInstanceSecretsStore(env.db),
 		Operations:    env.ops,
 		MasterKeyFile: filepath.Join(blocking, "instance", "master.key"),
 		WorkspaceRoot: env.root,

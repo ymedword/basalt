@@ -165,6 +165,11 @@ func (r *chatRunner) handle(ctx context.Context, msg channel.Message) (channel.R
 	// ③ 唯一运行入口。调用方问题（请求非法 / Agent 不存在 / 同会话忙 / 实例数超限）走 error
 	// ——如实上抛、循环收场、进程非零退出；运行期失败在 res.Status 里（契约 §1.2）。
 	res, err := r.deps.RunService.Run(runCtx, core.RunRequest{
+		// 进程内 CLI 是运维自己的终端：身份走 CLI 管理入口（Actor=admin-cli），
+		// 归属固定 local-admin——**不得**用零值或按渠道反推（C-28 / C-32）。
+		// The CLI session is local administration; its principal comes from the
+		// explicit admin-cli constructor, never from a zero value.
+		Principal: core.LocalAdminCLIPrincipal(),
 		Agent:     r.agent,
 		SessionID: sessionID,
 		Message:   msg.Text,

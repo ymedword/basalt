@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Basalt REST API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     Basalt（Go 实现的 Agent OS）的静态 REST 契约。与 [技术方案](../TechnicalDesign.md)§6.2 冲突时以技术方案为准。
 
@@ -18,8 +18,9 @@ info:
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - **数据库目标版本**：`schema_version=2`（US-11 / US-12 追加资源版本、Run 资源引用、管理操作审计与生命周期索引）
-    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 新增路径同样以本文件为准
+    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=5`**（US-16 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
+    - **两类凭据不可互换**（US-16）：管理面只接受 admin token（或 `local_trust`），业务面接受调用方 API Key。`callers:admin` / `diagnostics:read` 只随内置 `local-admin` 生效，**不**发给 caller key；caller key 也无法表达管理员 Kind
+    - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 / US-16 新增路径同样以本文件为准
 servers:
   - url: http://127.0.0.1:8080/api/v1
     description: 默认监听（本机）与统一前缀；远程部署需在 basalt.yaml 显式改 http.addr 并配置 admin token
@@ -45,6 +46,16 @@ tags:
     description: 通知渠道 CRUD
   - name: workspace
     description: 工作区只读浏览
+  - name: knowledge
+    description: 知识库（集合 / 文档 / 版本 / 摄取 / 检索 / 来源视图）
+  - name: history
+    description: 历史回查（检索只回指针，精确读取才回原文）
+  - name: callers
+    description: 调用方身份、Key 与配额（管理面；caller key 一律拒绝）
+  - name: diagnostics
+    description: 诊断事件读取（管理面；caller key 一律拒绝）
+  - name: compaction
+    description: 会话压缩只读视图（派生视图，不提供手动触发）
 
 paths:
   # ==========================================================
@@ -168,7 +179,15 @@ paths:
     get:
       tags: [core]
       summary: 查长期记忆（全局层）
-      description: 全局回退层（`.basalt/memory/MEMORY.md`）。Agent 层记忆走 `/agents/{name}/memory`。
+      description: >-
+        全局层记忆，读自 PostgreSQL `memory_entries` 的 `scope=global` 行，按「核心记忆 / 归档记忆」两分区渲染。
+        **本端点只是渲染投影**：它只含 `active` 正文、没有主键与状态；管理台要查看 / 纠正 / 删除条目走
+        `GET /memory/entries`（结构化读模型，六态全集 + 主键）。
+        写入路径有三条，互不替代：运行中无 Agent 身份的 `save_memory(scope=CORE)`；管理台显式提议
+        `POST /memory/proposals`（落 `candidate`，必须再 `POST /memory/entries/{id}/confirm` 才进注入面）；
+        `recall_memory` 只召回、不写入。**Run 结束不自动抽取记忆**。
+        `.basalt/memory/MEMORY.md` 不是运行期载体，只是迁移时的一次性只读导入来源。
+        Agent 层记忆走 `/agents/{name}/memory`。
       responses:
         '200':
           description: 长期记忆内容
@@ -184,9 +203,19 @@ paths:
   /sessions:
     post:
       tags: [core]
-      summary: 创建会话
+      summary: 创建会话（业务面）
       description: |
+        需要 `sessions:write`，计入 `IngressRun` 入口桶。该组合已属于别的调用方时按"不存在"回答（404，
+        不借出他人会话的元数据）。
+
+        本端点**不启动 Run**：只创建 / 取回会话行，因此没有调用方并发名额与实例容量判定——
+        `CALLER_CONCURRENCY_LIMITED` / `QUOTA_EXHAUSTED` / `TOO_MANY_RUNS` 都不会出现，
+        429 只可能是入口速率或认证失败限速（见 `IngressRateLimited`）。
         参数校验失败（含 `agent` 缺失 / `null`）返回 400，**不创建、不修改**任何会话。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
       requestBody:
         required: true
         content:
@@ -210,10 +239,24 @@ paths:
                     properties:
                       data: { $ref: '#/components/schemas/SessionSummary' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
     get:
       tags: [console]
-      summary: 列会话（管理台）
+      summary: 列会话（业务面）
+      description: |
+        需要 `sessions:read`，计入 `IngressRead` 入口桶。无参数 = 当前身份可见的全部会话（含归档行，
+        各自带 `status`）；`status` 只接受 `active` / `archived`，其他取值 → 400，不得退化成"不过滤"。
+
+        caller key 调用时**强制**按 `sessions.caller_id` 过滤——契约没有 `caller_id` 参数，"看谁的"
+        只由身份决定，不由请求决定；admin token 可跨调用方，迁移前旧会话 `caller_id` 为空，因此
+        只允许 admin token 读取，**不得**把空值匹配到任意调用方。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
       parameters:
         - name: agent
           in: query
@@ -234,6 +277,15 @@ paths:
                       data:
                         type: array
                         items: { $ref: '#/components/schemas/SessionSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+        '500':
+          description: 会话列表不可读（存储失败或端口未装配，业务码 `INTERNAL`）；不得用空列表充数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
 
   /sessions/{id}:
     parameters:
@@ -279,9 +331,16 @@ paths:
       tags: [core]
       summary: 发消息（触发一次 Run）
       description: |
+        需要 `sessions:write`，计入 `IngressRun` 入口桶。会话属于别的调用方与不存在**共用同一个 404**
+        （不声明"存在但无权"，避免把会话存在性当探测面）。
+
         同步等待 Run 完成。**达迭代上限不算服务故障**：HTTP 仍为 200，`data.status = limit_reached`
         并附部分结果（见 contracts/run-and-errors.md §1.3）。
         请求体总上限 `http.max_request_bytes`（缺省 1 MiB，超限在解析前 400）；单条消息另有 ≤ 32 KB 的入口上限。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
       requestBody:
         required: true
         content:
@@ -303,9 +362,11 @@ paths:
                     properties:
                       data: { $ref: '#/components/schemas/RunView' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/SessionBusy' }
-        '429': { $ref: '#/components/responses/TooManyRuns' }
+        '429': { $ref: '#/components/responses/RunLimited' }
         '504': { $ref: '#/components/responses/Timeout' }
 
   /agents/{name}/invoke:
@@ -317,7 +378,13 @@ paths:
     post:
       tags: [core]
       summary: 无状态调用 Agent
-      description: 不落会话历史（`session_id` 为空），仍落 Run 与审计。超时 60 秒 → 504。
+      description: |
+        需要 `agents:invoke:<name>`（按路径参数逐字组装；无匹配 → 403），计入 `IngressRun` 入口桶。
+        不落会话历史（`session_id` 为空），仍落 Run 与审计。超时 60 秒 → 504。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
       requestBody:
         required: true
         content:
@@ -339,8 +406,10 @@ paths:
                     properties:
                       data: { $ref: '#/components/schemas/RunView' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '429': { $ref: '#/components/responses/TooManyRuns' }
+        '429': { $ref: '#/components/responses/RunLimited' }
         '504': { $ref: '#/components/responses/Timeout' }
 
   /agents/{name}/memory:
@@ -352,7 +421,9 @@ paths:
     get:
       tags: [console]
       summary: 查某个 Agent 的长期记忆（Agent 层）
-      description: 返回 Agent 层内容；为空时返回空而非回退全局层（回退发生在提示词组装时，不发生在查询时）。
+      description: >-
+        返回 Agent 层内容；为空时返回空而非回退全局层（回退发生在提示词组装时，不发生在查询时）。
+        带主键与状态的条目读模型见 `GET /agents/{name}/memory/entries`。
       responses:
         '200':
           description: Agent 层记忆
@@ -365,6 +436,237 @@ paths:
                     properties:
                       data: { $ref: '#/components/schemas/MemoryView' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # US-16 记忆管理（管理面，裁决 A）——结构化读模型 + 四个写动作
+  # 七条路由只接受 admin token / local_trust；caller key 一律拒绝。
+  # 写动作按宪法第 5 条先写 `pending` 管理审计再动目标，预写失败 → 500 且零改动。
+  # 条目正文**不进**审计（`detail_json` 只带 sha256）与日志（只带条目标识与状态）。
+  # ==========================================================
+  /memory/entries:
+    get:
+      tags: [console]
+      summary: 列全局层记忆条目（结构化读模型）
+      description: |
+        读自 `memory_entries` 的 `scope=global` 行，**六态全集**（`candidate` / `active` / `superseded` /
+        `corrected` / `deleted` / `conflicted`），主键倒序，缺省窗口 200 条。与 `GET /memory` 的分工：
+        本端点带主键与状态，页面据此确认 / 纠正 / 删除；渲染投影只含 `active` 正文。
+        `state` 查询参数接受六态字面量之一；其他取值 400，**不**静默返回空列表。
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [candidate, active, superseded, corrected, deleted, conflicted] }
+      responses:
+        '200':
+          description: 全局层条目列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryListView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /memory/proposals:
+    post:
+      tags: [console]
+      summary: 显式提议一条全局层记忆（落 candidate）
+      description: |
+        先校验分区（`core` / `archive`，空串按 `archive`）与正文（去空白后非空）——**校验失败不留操作行**；
+        再预写 `pending` 管理审计，预写失败 → 500 且**不写入**。新增行恒为 `candidate`：
+        提议本身**不进**注入面，也不参与召回，必须再经 `POST /memory/entries/{id}/confirm` 晋升。
+        同源（分层 + 分区 + 正文）已有 `candidate` / `active` 条目时**不新增行**，回执 `merged=true`、给出既有
+        `entry_id`，`state` 取该行的真实状态（合并进 active 记忆时为 `active`，不伪造成候选）。
+        **Run 结束不自动抽取记忆**——本端点是唯一的用户可达提议入口。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemoryProposalWrite' }
+      responses:
+        '200':
+          description: 提议回执
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /agents/{name}/memory/entries:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [console]
+      summary: 列某个 Agent 的记忆条目（结构化读模型）
+      description: >-
+        与 `GET /agents/{name}/memory` 同一分层，返回六态全集与主键，不回退全局层。
+        Agent 未注册 → 404。`state` 查询参数语义同 `GET /memory/entries`。
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [candidate, active, superseded, corrected, deleted, conflicted] }
+      responses:
+        '200':
+          description: Agent 层条目列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryListView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /agents/{name}/memory/proposals:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [console]
+      summary: 显式提议一条 Agent 层记忆（落 candidate）
+      description: 语义与 `POST /memory/proposals` 逐条一致，分层为 Agent 层；Agent 未注册 → 404。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemoryProposalWrite' }
+      responses:
+        '200':
+          description: 提议回执
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /memory/entries/{id}/confirm:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+    post:
+      tags: [console]
+      summary: 确认候选（唯一晋升路径）
+      description: |
+        `candidate` → `active`，本次操作是条目进入注入面与召回面的**唯一**用户可达路径。
+        目标不存在 → 404（预读发生在留痕之前，不产生操作行）；目标已不是 `candidate` → 409 `CONFLICT`，
+        **不**自动重放、**不**静默改写成其他状态。预写失败 → 500 且零改动。
+        路径标识不是十进制正整数同样按 404，避免"标识格式对不对"成为存在性探针。
+      responses:
+        '200':
+          description: 确认回执
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /memory/entries/{id}/correct:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+    post:
+      tags: [console]
+      summary: 纠正一条记忆（新条替代旧条）
+      description: |
+        新条继承目标条的分层与分区（请求体**没有**作用域字段）。目标仍是 `active` 时：新条 `active`，
+        旧条转 `corrected`，回执 `entry_id` 为新条、`replaced_id` 为旧条，两行在**同一个**事务里落定。
+        目标已不在有效态时：新条落 `conflicted` 待人工裁决，回执 `state` 如实给出——页面**不得**把
+        这种情况渲染成"已纠正"。正文去空白后为空 → 400。目标不存在 → 404；预写失败 → 500 且零改动。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemoryCorrectionWrite' }
+      responses:
+        '200':
+          description: 纠正回执
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /memory/entries/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64, minimum: 1 }
+    delete:
+      tags: [console]
+      summary: 软删一条记忆（立即不可召回）
+      description: |
+        **软删**：行、来源与审计保留，状态转 `deleted`，下一次召回起不再返回该条；派生内容（已冻结注入文本、
+        既有会话）不追溯改写。重复删除幂等（回执仍是 `deleted`）。**不提供**物理删除——审计要留得下来。
+        目标不存在 → 404；预写失败 → 500 且零改动。
+      responses:
+        '200':
+          description: 删除回执
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   # ==========================================================
   # 运行（Run）
@@ -533,11 +835,14 @@ paths:
         schema: { type: string }
     get:
       tags: [resources]
-      summary: 查技能详情
-      description: 返回当前发布版本与完整文件清单；不返回已撤销版本。
+      summary: 查技能摘要
+      description: |
+        返回当前发布版本的**摘要**（`SkillView`，**不含** `files[].content`）；不返回已撤销版本。
+        业务读面刻意不开放文件正文——只凭摘要或旧清单做全量替换会静默覆盖他人改动，
+        因此完整文件清单只在管理面 `GET /admin/skills/{name}/edit` 提供，两边不共用一个响应类型。
       responses:
         '200':
-          description: 技能详情
+          description: 技能摘要（不含文件正文）
           content:
             application/json:
               schema:
@@ -545,7 +850,7 @@ paths:
                   - $ref: '#/components/schemas/Envelope'
                   - type: object
                     properties:
-                      data: { $ref: '#/components/schemas/SkillDetail' }
+                      data: { $ref: '#/components/schemas/SkillView' }
           headers:
             ETag:
               schema: { type: string }
@@ -629,6 +934,49 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/skills/{name}/edit:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [resources]
+      summary: 读技能完整文件清单（管理面编辑用）
+      description: |
+        返回**当前发布版本**的全部文件正文（含 `files[].content`）并带 `ETag`。`PUT /skills/{name}`
+        是**全量替换**的条件写，编辑页必须先取到完整清单再提交——只凭摘要或旧清单提交会静默覆盖
+        他人改动，因此正文只在管理面开放，业务读面 `GET /skills/{name}` 仍只回 `SkillView`。
+
+        `?summary=true` 只回 `SkillView`（不含 `files`），供同一路径复用；两种变体都带 `ETag`。
+        只读：不写管理操作行。
+      parameters:
+        - name: summary
+          in: query
+          required: false
+          schema: { type: boolean, default: false, description: '`true` 只回 `SkillView`，不含文件正文' }
+      responses:
+        '200':
+          description: 技能详情（含文件正文）或摘要
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        anyOf:
+                          - $ref: '#/components/schemas/SkillDetail'
+                          - $ref: '#/components/schemas/SkillView'
+          headers:
+            ETag:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /catalog/mcp:
     get:
@@ -1193,7 +1541,7 @@ paths:
           schema: { type: string }
         - name: target_kind
           in: query
-          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, system] }
+          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection] }
         - name: target_id
           in: query
           schema: { type: string }
@@ -2651,6 +2999,997 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  # ==========================================================
+  # US-16：知识库（knowledge）
+  # 说明：本组端点对 caller key 与 admin token 同时开放（`knowledge:read` / `knowledge:write`），
+  #       每次请求都按该 Principal 重查集合 ACL；被拒资料只计数，不回显标题、ID 与片段。
+  # ==========================================================
+  /collections:
+    get:
+      tags: [knowledge]
+      summary: 列集合（管理台）
+      description: |
+        管理面只读列表，固定按 `name` 升序（**不得**提供排序参数）。软删集合默认不返回。
+      parameters:
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: include_deleted
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 集合列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CollectionSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [knowledge]
+      summary: 建集合
+      description: |
+        需要 `knowledge:write`。同一 `project` 下活动集合同名 → 409 `CONFLICT`（软删行不算活动）。
+        集合名非法 → 400 `BAD_REQUEST`，零写入。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CollectionCreateRequest' }
+      responses:
+        '200':
+          description: 已创建的集合
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CollectionSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+
+  /collections/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: collection_id }
+    delete:
+      tags: [knowledge]
+      summary: 软删集合
+      description: |
+        需要 `knowledge:write`。软删 `deleted_at`，集合内文档随即退出检索与来源视图；
+        **不**物理删除行，**不**级联改历史消息与其引用。重复删除幂等（返回既有 `deleted_at`）。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+
+  /collections/{id}/documents:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: collection_id }
+    get:
+      tags: [knowledge]
+      summary: 列集合内文档
+      description: |
+        需要 `knowledge:read`。固定按 `source_path` 升序；`deleted_at` 非空的文档默认不返回。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      parameters:
+        - name: include_deleted
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 文档列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/DocumentSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+    post:
+      tags: [knowledge]
+      summary: 摄取文档（按工作区路径）
+      description: |
+        需要 `knowledge:write`，计入 `IngressIngest` 入口桶。请求体只给**工作区允许根内**的相对路径：
+        越界、扩展名不是 `.md` / `.txt`、超大小上限或 UTF-8 解码失败 → 400 `BAD_REQUEST`，零写入、零外部调用。
+
+        同 collection 内已存在 `content_hash` 相同的 active 版本 → **不重复建版本**，直接返回该版本并置
+        `deduplicated=true`。否则新建版本（`status=pending`）与摄取作业，同步执行解析 / 切块 / 分批 embedding /
+        校验 / 激活；**唯一生效点**是 `status=active`——失败时 `status=failed` 并给 `error_kind`，
+        旧 active 版本继续服务。
+
+        每次 embedding 批次先写 `embedding_calls(pending)` 再发请求（fail-closed）；预写失败即中止，不发出调用。
+
+        摄取端口缺失或 embedding 相关配置不完整 → 503 `NOT_CONFIGURED`，在读取正文与任何写入**之前**返回。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentIngestRequest' }
+      responses:
+        '200':
+          description: 摄取结果（含 `active` / `failed` 两种终态）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/IngestResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressLimited' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
+
+  /documents/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: document_id }
+    delete:
+      tags: [knowledge]
+      summary: 软删文档
+      description: |
+        需要 `knowledge:write`。软删后该文档全部版本退出检索；**不**改写历史消息，**不**删除
+        `message_evidence_refs`——历史引用在读面按当前删除状态标注为失效。重复删除幂等。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      responses:
+        '200': { $ref: '#/components/responses/OK' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+
+  /documents/{id}/versions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: document_id }
+    get:
+      tags: [knowledge]
+      summary: 列文档版本
+      description: |
+        需要 `knowledge:read`。固定按 `created_at` 倒序。版本状态取值见 `DocumentVersionSummary.status`；
+        `failed` 版本**不得**被检索看到，重试**必须**新建版本行。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      responses:
+        '200':
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/DocumentVersionSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+
+  /documents/{id}/reindex:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: document_id }
+    post:
+      tags: [knowledge]
+      summary: 重建索引（新建版本行）
+      description: |
+        需要 `knowledge:write`，计入 `IngressIngest` 入口桶。**新建**版本行重跑解析 / 切块 / embedding，
+        **不覆盖**旧版本行；旧 active 版本在新版本通过校验前继续服务。
+        摄取端口缺失或 embedding 相关配置不完整 → 503 `NOT_CONFIGURED`，在读取正文与任何写入**之前**返回。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      responses:
+        '200':
+          description: 摄取结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/IngestResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/IngressLimited' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
+
+  /search:
+    post:
+      tags: [knowledge]
+      summary: 混合检索（只回片段与指针）
+      description: |
+        需要 `knowledge:read`，计入 `IngressRead` 入口桶。可见范围 = Agent 声明集合 ∩ 调用方项目 ∩ 当前 ACL；
+        删除 / 过期 / 越权的资料在**两条检索路径的 SQL 内**先行剔除，被拒元素只进 `denied_count`，
+        **不得**出现在命中、日志标题或诊断 `attrs` 中。
+
+        `hits[]` 是**指针 + 片段**，**不带** `content_hash`——命中结果**不得**直接当作引用依据；
+        引用必须走 `POST /sources/view` 精确读取后再判可定位与支持结论。两路皆失败 → 503 `NOT_CONFIGURED`
+        并给 `reason_code`；单路失败降级为另一路并把原因写进 `degraded_reason`（不静默）。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: 检索结果
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/IngressLimited' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
+
+  /sources/view:
+    post:
+      tags: [knowledge]
+      summary: 来源视图（按 EvidenceRef 精确读取）
+      description: |
+        需要 `knowledge:read`，计入 `IngressRead` 入口桶。按 `ref`（资料版本 + 位置 + 范围）**精确读取**，
+        **不经过相似度**；每次按当前 Principal 重查 ACL / 删除 / 版本——两个调用方读同一 `ref` 可以有不同结果。
+
+        `validity.valid=false` 时（`revoked` / `deleted` / `version_changed` / `not_found`）正文、事实与摘要
+        一律为空，**不得**用新版本正文冒充旧引用。截断必须显式标注 `truncated=true` 并给 `next_cursor`。
+
+        身份是请求上下文里的 Principal，**不在**请求体内（身份不藏在 body 里）。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SourceViewRequest' }
+      responses:
+        '200':
+          description: 来源视图
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SourceViewResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+
+  # ==========================================================
+  # US-16：知识库管理面写入（admin/knowledge）
+  # 四条都需要管理员身份（根级 bearerAuth / localTrust），caller key 一律拒绝；
+  # 都不走业务面入口限流桶（管理面另有认证限速）。
+  # ==========================================================
+  /admin/knowledge/uploads:
+    post:
+      tags: [knowledge]
+      summary: 把上传文件落到工作区 `uploads/`
+      description: |
+        只接受**单层文件名**（不接受任何路径分隔符）、`.md` / `.txt` 扩展名、UTF-8 文本且不含 NUL，
+        长度不超过 `knowledge.max_document_bytes`；越界一律 400。
+
+        落盘与摄取是**两次操作**：本端点只保存文件并返回相对路径，随后由
+        `POST /collections/{id}/documents` 以该路径发起摄取——摄取失败不回滚已保存的文件。
+        先预写 `pending` 管理操作行（`knowledge_document.upload`），预写失败 → 500 且不落盘；
+        同名文件**不覆盖**（`O_EXCL` 语义）→ 409。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, content]
+              properties:
+                name: { type: string, description: 单层文件名，`.md` / `.txt` }
+                content: { type: string, description: UTF-8 文本 }
+      responses:
+        '200':
+          description: 已保存文件的相对路径
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [path]
+                        properties:
+                          path: { type: string, description: '固定前缀 `uploads/`' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/knowledge/collections/{id}/description:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: collection_id }
+    put:
+      tags: [knowledge]
+      summary: 更新集合简介（乐观并发）
+      description: |
+        简介是**用户维护的元数据**，与文档内容无关。并发用请求体里的 `expected_revision` 表达，
+        **不用** `If-Match`：集合不是版本化资源，其修订号独立于资源 ETag 语义。
+
+        `expected_revision` 与当前 `description_revision` 不等 → 412，零写入；成功后修订号 +1 并回新值。
+        两个字段都必填（缺任意一个即 400），空简介合法。
+
+        长度按 **Unicode 字符**（rune）计，上限 2000；超限或非法 UTF-8 → 400，零写入。
+        `maxLength` 在 JSON Schema 里按码点计，与 rune 口径一致。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description, expected_revision]
+              properties:
+                description: { type: string, maxLength: 2000 }
+                expected_revision: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: 新修订号
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [description_revision]
+                        properties:
+                          description_revision: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/knowledge/documents/{id}/ingest-attempts:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: document_id }
+    get:
+      tags: [knowledge]
+      summary: 读文档的摄取处理记录
+      description: |
+        按文档列出每次摄取的尝试（`job_id` / `version_id` / 尝试序号 / 阶段 / 状态 / 错误分类 / 起止时间），
+        主键倒序。窗口有上限，超出时 `truncated=true`——**不得**把截断当成"没有更多记录"。
+        只读：不写管理操作行。
+      responses:
+        '200':
+          description: 处理记录
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [items, truncated]
+                        properties:
+                          items:
+                            type: array
+                            items:
+                              type: object
+                              required: [job_id, version_id, attempt, stage, status, started_at, finished_at]
+                              properties:
+                                job_id: { type: string }
+                                version_id: { type: string }
+                                attempt: { type: integer, minimum: 1 }
+                                stage: { type: string }
+                                status: { type: string }
+                                error_kind: { type: string }
+                                started_at: { type: string }
+                                finished_at: { type: string, description: 未结束时为空串 }
+                          truncated: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/knowledge/historical-source:
+    post:
+      tags: [knowledge]
+      summary: 读取历史版本正文（仅管理员）
+      description: |
+        与 `POST /sources/view` 分工：那条走**当前** Principal 的 ACL，历史版本一律判失效、正文为空；
+        本端点专门读取**已被取代但仍留档**的版本正文，供管理员核对"当时版本"。
+
+        三重一致性校验缺一不可：`result.version_id` 等于请求的 `version_id`、`content_hash` 等于请求的
+        `content_hash`、且该版本确为 `superseded` 且失效原因恰为 `version_changed`；任一不符 → 409，
+        **不得**用新版本正文冒充旧引用。预算固定 2048 token，超出时 `truncated=true` 并给 `next_cursor`。
+        只读：不写管理操作行。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ref]
+              properties:
+                ref:
+                  description: |
+                    与 `EvidenceRef` 同形，但 **`content_hash` 在此必填**：本端点要做"版本 + 哈希 +
+                    已失效原因"的三重一致性校验，缺哈希就无从比对，只能 400（**不**回退成"按版本号信"）。
+                  allOf:
+                    - $ref: '#/components/schemas/EvidenceRef'
+                    - type: object
+                      required: [content_hash]
+                cursor: { type: string, description: 上一页返回的 `next_cursor`；省略即第一页 }
+      responses:
+        '200':
+          description: 历史版本正文
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [version_id, content_hash, text, truncated, historical]
+                        properties:
+                          version_id: { type: string }
+                          content_hash: { type: string }
+                          text: { type: string }
+                          truncated: { type: boolean }
+                          next_cursor: { type: string }
+                          historical: { type: boolean, description: 恒为 `true` }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ==========================================================
+  # US-16：历史回查（history）
+  # 检索只回指针；只有精确读取才回原文。跨调用方一律 404（不是 403，避免暴露他人会话存在）。
+  # ==========================================================
+  /history/search:
+    get:
+      tags: [history]
+      summary: 历史关键词检索（只回指针）
+      description: |
+        需要 `sessions:read`，计入 `IngressRead` 入口桶。首批走关键词 / trigram；结果是指针 + 片段，
+        **不是**引用（片段**不得**当作引用依据，引用走 `POST /sources/view`）。
+
+        caller key 调用时强制按 `sessions.caller_id` 过滤；admin token 可跨调用方，`caller_id` 参数
+        只对 admin token 生效，caller key 传了他人 `caller_id` → 403 `FORBIDDEN`。
+        迁移前旧会话 `caller_id` 为空：只允许 admin token 读取，**不得**把空值匹配到任意调用方。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, description: 关键词（非空；空串 → 400） }
+        - name: agent
+          in: query
+          schema: { type: string }
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: caller_id
+          in: query
+          schema: { type: string, description: 仅 admin token 有效 }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: 命中指针列表（固定按时间倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/HistorySearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+        '500':
+          description: 检索不可用（存储失败或端口未装配，业务码 `INTERNAL`）；不得降级成 200 + 空命中
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  /sessions/{session_id}/messages/{message_id}:
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: message_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [history]
+      summary: 精确读取单条消息（回原文）
+      description: |
+        需要 `sessions:read`，计入 `IngressRead` 入口桶。按消息主键精确读取，**不经过检索**；
+        重查当前 ACL 与删除 / 保留状态。跨调用方 → 404 `NOT_FOUND`（不是 403）；
+        消息不存在 → 404；被保留策略删除 → 410 `GONE`。
+
+        消息携带的 `evidence_refs` 按资料**当前** ACL / 删除 / 版本逐个校验并标注 `valid` / `reason`；
+        **不**从正文反推引用，**不**改写已发送消息。无状态 Run 的临时标识（`msg/<run_id>/<pos>`）
+        在 `messages` 表无对应行 → 404。
+      security:
+        - callerKey: []
+        - bearerAuth: []
+        - localTrust: []
+      responses:
+        '200':
+          description: 消息原文与元数据
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MessageDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/IngressRateLimited' }
+        '500':
+          description: 原文或引用状态不可确认（存储失败、判定违约或端口未装配，业务码 `INTERNAL`）；不得把未知状态写成 `valid`
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope' }
+
+  # ==========================================================
+  # US-16：调用方身份、Key 与配额（callers）—— **管理面**
+  # 这一组只接受 admin token / local_trust；caller key 一律 401/403（`callers:admin` 不发给 caller key）。
+  # Key 明文只在签发 / 轮换响应出现一次；其余任何响应、日志、审计、诊断都不得出现。
+  # ==========================================================
+  /callers:
+    get:
+      tags: [callers]
+      summary: 列调用方
+      description: 固定按 `caller_id` 升序；`local-admin` 恒在列表内。
+      responses:
+        '200':
+          description: 调用方列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CallerSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [callers]
+      summary: 建调用方
+      description: |
+        先写 `pending` 管理审计再执行；预写失败 → 500 `INTERNAL` 且**不**创建。
+        `caller_id` 缺省由服务端生成（`cal_` + 26 位 Crockford Base32）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CallerCreateRequest' }
+      responses:
+        '200':
+          description: 已创建的调用方
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CallerSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /callers/{id}/keys:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: caller_id }
+    post:
+      tags: [callers]
+      summary: 签发 Key（明文只回一次）
+      description: |
+        先校验 scope（未知 scope、空 scope、管理面 scope `diagnostics:read` / `callers:admin` 一律
+        400 `INVALID_SCOPE`，**不留** pending 操作），再预写 `pending` 管理审计，预写失败**不得**签发。
+
+        `key` 明文**只在本次响应出现一次**；服务端只存 `key_hash` 与 `key_prefix`，
+        客户端丢失只能吊销重发。响应**不得**回显在审计、日志或诊断中。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CallerKeyIssueRequest' }
+      responses:
+        '200':
+          description: 已签发（含一次性明文）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/IssuedKey' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /callers/{id}/keys/{key_id}/revoke:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: caller_id }
+      - name: key_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [callers]
+      summary: 吊销 Key
+      description: |
+        **不**改动任何定时任务的 `authorizing_key_id`：受影响任务在下次触发时按 `owner_unauthorized`
+        fail-closed（审计写 `owner_caller_id` / `authorizing_key_id` / `actor` / `owner_reason`）。
+        重复吊销幂等。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, description: 写入管理审计；不得含凭据 }
+      responses:
+        '200':
+          description: 已吊销的 Key（不含明文）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CallerKeySummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /callers/{id}/usage:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: caller_id }
+    get:
+      tags: [callers]
+      summary: 查周期用量与限额
+      description: |
+        返回当前（或指定）周期的限额、已用、已预留与 `overage`。`overage > 0` 表示已发生且不可回滚的超限，
+        新预留会一直 429 `QUOTA_EXHAUSTED` 直到管理员核对清零。`pending` 预留继续占额度，**不**按零计量。
+      parameters:
+        - name: period_start
+          in: query
+          schema: { type: string, format: date-time, description: 缺省为当前周期起点 }
+      responses:
+        '200':
+          description: 周期用量
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CallerUsageView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /callers/{id}/reservations/{reservation_id}/reconcile:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: caller_id }
+      - name: reservation_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [callers]
+      summary: 核对未知结局的预留
+      description: |
+        只由管理面发起，写管理审计。把 `pending` 预留收敛为 `committed`（给 `actual`）或 `released`（给理由）；
+        `actual` 大于 `amount` 时记 `overage`，**不**截断、**不**回滚已发生的调用。
+        非 `pending` 的预留 → 409 `CONFLICT`（不得二次结算）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationReconcileRequest' }
+      responses:
+        '200':
+          description: 收敛后的预留
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ReservationView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /callers/{id}/usage/clear-overage:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, description: caller_id }
+    post:
+      tags: [callers]
+      summary: 核对并清零 overage
+      description: |
+        `reason` **必填**且写入管理审计。只清零 `overage`，**不改** `used` / `reserved`，
+        也不删除任何预留行。清零后该周期的新预留恢复正常。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClearOverageRequest' }
+      responses:
+        '200':
+          description: 清零后的周期用量
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CallerUsageView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==========================================================
+  # US-16：诊断读取（diagnostics）—— **管理面**
+  # 诊断可丢弃、审计 fail-closed，两者不互相替代。证据缺口必须显式表达，不得用空集冒充"一切正常"：
+  # 全量采样下的空结果用 `missing=true`；采样率 < 1 时的空结果用 `sampled_out=true`（二者互斥）。
+  # ==========================================================
+  /diagnostics:
+    get:
+      tags: [diagnostics]
+      summary: 按关联标识读取诊断事件
+      description: |
+        管理面只读；caller key 一律拒绝（`diagnostics:read` 只随 admin token 的内置 `local-admin` 生效）。
+        必须给出**至少一个主锚点**（`run_id` / `request_id` / `operation_id` / `ingest_job_id` / `session_id`），
+        否则 400 `BAD_REQUEST`——不允许无条件全表扫。`task_id` 只是过滤限定符，单独给出不构成主锚点。
+        `request_id` 由**可信服务端路径**生成（请求进入即分配）或校验：形状为 1～64 位字母、数字与 `. _ : -`，
+        不符即 400 且**不回显**提交值；它可单独作锚点，用于定位「Run 账本尚未创建就被准入拒绝」的事件
+        （此时没有 `run_id`）。关联不到的记录不计入结果。
+
+        `session_id` 经 `runs.session_id` 关联；关联不到的记录**不**计入结果。
+        固定按 `occurred_at` 升序（局部有序，**不设**跨节点全局序号）。
+
+        结果为空时按采样率区分证据缺口：全量采样（`SampleRate = 1`）下"空"就是**没有记录** →
+        `missing=true`；采样率 < 1 时"空"无法区分"本来没有"与"被采样丢光" → `missing=false` 且
+        `sampled_out=true`。有记录时两者都为 false——三种状态**不得**混为一谈。
+      parameters:
+        - name: run_id
+          in: query
+          schema: { type: string }
+        - name: request_id
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[A-Za-z0-9._:-]+$'
+            description: 服务端生成的追踪标识，可单独作主锚点；形状不符 → 400，且不回显提交值
+        - name: task_id
+          in: query
+          schema: { type: string, description: 调度限定符；单独给出不构成主锚点 → 400 }
+        - name: operation_id
+          in: query
+          schema: { type: string }
+        - name: ingest_job_id
+          in: query
+          schema: { type: string }
+        - name: session_id
+          in: query
+          schema: { type: string, description: 经 runs.session_id 关联 }
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/DiagnosticKind' }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: 诊断事件与证据缺口标记
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/DiagnosticsResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ==========================================================
+  # US-16：会话压缩只读视图（compaction）
+  # 派生视图：只展示本 US 能读到的事实，**不提供**手动触发，也**不**把摘要当消息或引用。
+  # ==========================================================
+  /compactions:
+    get:
+      tags: [compaction]
+      summary: 读取压缩链（只读派生视图）
+      description: |
+        管理面只读。`session_id` 与 `run_id` **恰给一个**（都给或都不给 → 400）。
+        只返回**当前 `chain_epoch`** 的链，按 `(chain_epoch, created_at)` 升序；`stale` / `failed` 条目
+        一并返回并带 `reason_code`（失败必须显示降级原因）。
+
+        `summary` 是派生视图，**不得**被当作消息原文或引用依据；引用摘要内容必须回 `POST /sources/view`
+        按 `included_refs` 逐个校验。
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: run_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: 压缩链
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/CompactionView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2667,6 +4006,20 @@ components:
         仅 `http.admin_auth.mode=local_trust` 且直连来源为回环地址时可用，值必须为 `1`。
         `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 不能证明回环；反向代理或隧道不得绕过认证。
         同时校验 Host 与 Origin（或 Sec-Fetch-Site），防 DNS rebinding / CSRF。
+    callerKey:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <调用方 API Key>`（US-16）。调用方业务凭据，与管理面凭据**分属两个命名空间**：
+
+        - caller key 只能构造 `Principal{Kind: PrincipalCaller}`；它**无法**表达管理员 Kind
+          （`PrincipalLocalAdmin` 只由 admin token 或进程内 CLI 显式构造，`caller_keys` 表里根本存不下该 Kind）
+        - 服务端只存 `key_hash`（SHA-256）与 `key_prefix`；明文**只在签发 / 轮换响应出现一次**，
+          日志、审计、诊断、导出与错误文案**不得**出现有效凭据
+        - 缺失 / 无效 / 已撤销 / 已过期一律 401 `UNAUTHORIZED`，**不区分**具体原因（避免成为探测面）
+        - 每个已认证业务请求先过入口限流（`IngressRun` / `IngressIngest` / `IngressRead`）；admin token
+          请求**不进入**任何调用方桶
+        - 明文格式（前缀、长度）由实现决定，契约只约束"不可恢复、只回显一次"
   parameters:
     IfMatch:
       name: If-Match
@@ -2741,7 +4094,9 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     NotConfigured:
-      description: 能力未配置（文案点名配置键，一次 LLM 调用都不会发出）
+      description: |
+        能力未配置或装配缺端口（业务码 `NOT_CONFIGURED`）：文案点名配置键，且在读取正文 /
+        发出任何外部调用**之前**返回——不得退化成默认值或空结果。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -2751,17 +4106,40 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     Unauthorized:
-      description: 未认证（管理凭据缺失或无效，含 local_trust 模式未带本机信任头；业务码 `UNAUTHORIZED`）
+      description: |
+        未认证（业务码 `UNAUTHORIZED`）。401 **不区分**凭据缺失与无效（避免成为探测面）：
+
+        - **管理面**：`token` 模式只认 admin token；`local_trust` 模式只认本机信任三元组
+          （回环对端 + 无任何转发头 + `X-Basalt-Local-Trust: 1`）。有效调用方 Key 打管理面是 403，不是 401
+        - **业务面**：调用方 Key 或 admin token；`local_trust` 模式下不带凭据时仅当本机信任三元组成立
+          才映射为内置管理员，**坏凭据不因对端回环而升级**
+
+        凭据失败按来源计数：同一来源反复失败会先被 429 `AUTH_RATE_LIMITED` 挡住（见 `IngressRateLimited`）。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     Forbidden:
-      description: 已认证但操作不允许（业务码 `FORBIDDEN`；回环本机信任不满足来源 / Host / Origin 校验）
+      description: |
+        操作不允许（业务码 `FORBIDDEN`），或请求在凭据判定**之前**就被来源守卫拒绝：
+
+        - **业务面作用域不足**：固定文案「调用方无权执行该操作」，**不**点名缺哪个 scope
+        - **有效调用方 Key 调管理端点**：两条凭据面都不接受它，响应不回显凭据内容
+        - **Host / Origin 不在白名单**：先于凭据判定，未认证请求同样得到 403
+        - **`local_trust` 模式的本机信任三元组不成立**：对端非回环 / 带任何转发头 / 缺信任头
+
+        403 **不**解释命中哪条规则。Host / Origin 拒绝不消耗认证失败预算，本机信任拒绝计入。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     Conflict:
       description: 状态冲突（同名存在 / 生命周期 generation 或 expected_state 不匹配 / Agent 忙碌，业务码 `CONFLICT`、`AGENT_BUSY` 等）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    InternalError:
+      description: |
+        服务端失败（业务码 `INTERNAL`）：存储不可读、端口未装配或管理审计预写失败。底层原因只进日志，
+        **不**回显堆栈、绝对路径或凭据；`pending` 之后的失败另带 `operation_id` 供查证。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -2771,7 +4149,70 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     AuthRateLimited:
-      description: 认证失败次数超限（业务码 `AUTH_RATE_LIMITED`）
+      description: 认证失败次数超限（业务码 `AUTH_RATE_LIMITED`）；未认证请求也可能得到它
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    IngressRateLimited:
+      description: |
+        业务端点只可能给出这两种 429 之一（按判定顺序）：
+
+        - `AUTH_RATE_LIMITED`——同一来源 60 秒内认证失败次数超限，在凭据判定**之前**给出，
+          此时请求还没有身份；`Retry-After` 给到限速窗口结束
+        - `CALLER_RATE_LIMITED`——`IngressRun` / `IngressIngest` / `IngressRead` 入口桶（QPS / 突发）超限；
+          `Retry-After` 给剩余秒数
+
+        两种码**不得**合并（一个是凭据在反复失败，一个是调用方太快）。被拒请求**零占用**：
+        不取运行槽位、不产生配额预留、不写审计业务行；内置管理员不进入任何调用方桶。
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议重试等待秒数（`AUTH_RATE_LIMITED` 为到窗口结束）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    IngressLimited:
+      description: |
+        计入 `IngressRun` / `IngressIngest` / `IngressRead` 入口限流或配额的端点，四种 429 之一：
+
+        - `AUTH_RATE_LIMITED`——同一来源认证失败次数超限，在凭据判定**之前**给出；`Retry-After` 给到窗口结束
+        - `CALLER_RATE_LIMITED`——入口桶（QPS / 突发）超限，`Retry-After` 给剩余秒数
+        - `CALLER_CONCURRENCY_LIMITED`——调用方并发名额已满（Run 级）
+        - `QUOTA_EXHAUSTED`——周期 / 容量配额不足，或该周期 `overage > 0` 尚未核对清零；
+          `Retry-After` 给到下一周期起点的秒数
+
+        四者**不得**合并成同一个码（排障要能区分"凭据在失败"、"太快"与"额度用完"）；被拒请求**零占用**。
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议重试等待秒数（`QUOTA_EXHAUSTED` 为到下一周期起点）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    RunLimited:
+      description: |
+        Run 触发端点（`POST /sessions/{id}/messages`、`POST /agents/{name}/invoke`）可给出的五种 429，
+        按准入顺序互斥出现，**不得**合并成一个码：
+
+        - `AUTH_RATE_LIMITED`——同一来源认证失败次数超限，在凭据判定**之前**给出，此时请求还没有身份；
+          `Retry-After` 给到窗口结束
+        - `CALLER_RATE_LIMITED`——`IngressRun` 入口桶（QPS / 突发）超限；`Retry-After` 给剩余秒数
+        - `CALLER_CONCURRENCY_LIMITED`——调用方并发 Run 名额已满（内置管理员不占调用方名额）
+        - `QUOTA_EXHAUSTED`——周期 / 容量配额不足，或该周期 `overage > 0` 尚未核对清零
+        - `TOO_MANY_RUNS`——实例级并发 Run 上限，与调用方名额是两个独立闸门
+
+        `CALLER_CONCURRENCY_LIMITED` 在会话串行 / 实例容量判定（409 `SESSION_BUSY` 与 `TOO_MANY_RUNS`
+        是同一段）**之前**给出；`QUOTA_EXHAUSTED` 在这两段之后。被拒请求**零占用**：
+        不取运行槽位、不产生配额预留、不写审计业务行。
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议重试等待秒数（`AUTH_RATE_LIMITED` / `CALLER_RATE_LIMITED` / `QUOTA_EXHAUSTED` 携带）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Envelope' }
+    Gone:
+      description: 目标已被保留策略删除（业务码 `GONE`）；4xx 中只有它与 404 出现在读取路径
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -2840,9 +4281,60 @@ components:
       properties:
         scope: { type: string, enum: [global, agent] }
         agent: { type: string, description: scope=agent 时给出 }
-        backend: { type: string, enum: [markdown, sqlite] }
+        backend: { type: string, enum: [postgres], description: '运行时唯一记忆载体（D-18）；markdown / sqlite 载体已退役，只作一次性只读导入来源' }
         core: { type: string }
         archive: { type: string }
+
+    MemoryEntryView:
+      type: object
+      properties:
+        entry_id: { type: integer, format: int64, minimum: 1 }
+        scope: { type: string, enum: [global, agent] }
+        agent: { type: string, description: 'scope=agent 时给出；全局层为空串' }
+        section: { type: string, enum: [core, archive] }
+        state:
+          type: string
+          enum: [candidate, active, superseded, corrected, deleted, conflicted]
+          description: '六态全集：读模型不做状态裁剪；到期不是状态，由 valid_to 表达'
+        content: { type: string, description: 条目正文（管理面读模型；审计与日志均不落正文） }
+        source: { type: string, enum: [save_memory, explicit_propose, legacy_import, migration] }
+        supersedes_id: { type: integer, format: int64, description: '0 = 无（纠正 / 替代链上的上一条）' }
+        created_at: { type: string, format: date-time }
+
+    MemoryEntryListView:
+      type: object
+      properties:
+        scope: { type: string, enum: [global, agent] }
+        agent: { type: string, description: 全局层为空串 }
+        entries:
+          type: array
+          description: 空集合输出 `[]`，不输出 null
+          items: { $ref: '#/components/schemas/MemoryEntryView' }
+
+    MemoryEntryReceipt:
+      type: object
+      description: 四个写动作的统一回执；页面据此只刷新受影响的行
+      properties:
+        entry_id: { type: integer, format: int64, description: '提议 / 纠正给出结果行；确认 / 删除给出目标行' }
+        state: { type: string, enum: [candidate, active, corrected, deleted, conflicted] }
+        replaced_id: { type: integer, format: int64, description: '仅纠正是旧条主键；其余为 0' }
+        merged: { type: boolean, description: '仅提议有意义：命中同源去重 = true（未新增行，entry_id 为既有条目）' }
+
+    MemoryProposalWrite:
+      type: object
+      required: [content]
+      additionalProperties: false
+      properties:
+        section: { type: string, enum: [core, archive], description: '缺省（空串）按 archive 落——候选不进注入面' }
+        content: { type: string, description: 去空白后不得为空 }
+
+    MemoryCorrectionWrite:
+      type: object
+      required: [content]
+      additionalProperties: false
+      properties:
+        content: { type: string, description: 去空白后不得为空；分层与分区继承目标条 }
+
 
     SessionSummary:
       type: object
@@ -3336,9 +4828,11 @@ components:
           enum: ["", missing, corrupt, key_id_mismatch, unprovable_provenance, unavailable, key_path_missing]
           description: |
             仅 `recovery_required` 时非空：`missing` 文件不在；`corrupt` 格式 / 权限 / nlink 校验失败；
-            `key_id_mismatch` 与 `instance_secrets` 不符；`unprovable_provenance` 存在无法用 `os.SameFile`
-            证明来源的密钥文件；`unavailable` 库或文件系统读取失败（此时只报"无法判定"，不猜具体原因）；
-            `key_path_missing` 有初始化记录（或托管密文）但当前解析不出主密钥路径（实例名册 / `secrets` 配置缺失）。
+            `key_id_mismatch` 与 `instance_secrets` 不符；`unprovable_provenance` 密钥材料来源不可证明——
+            密钥文件无法用 `os.SameFile` 证明来源，**或**无初始化记录但已存在托管密文（密钥能否解开
+            现存密文不构成来源证明，D-40）；`unavailable` 库或文件系统读取失败（此时只报"无法判定"，
+            不猜具体原因）；`key_path_missing` 有初始化记录但当前解析不出主密钥路径（实例名册 /
+            `secrets` 配置缺失）。
             缺少 `secrets` 段本身**不**表示纯环境变量部署；纯 env 只由显式 `secrets.auto_init: false` 表达
         can_initialize:
           type: boolean
@@ -3765,6 +5259,9 @@ components:
           properties:
             max_iterations: { type: integer }
             max_history_turns: { type: integer }
+            include_global_memory:
+              type: [boolean, 'null']
+              description: '记忆注入层选择，**声明上的四态**：省略字段 = 不修改；`true` = 全局层与 Agent 层合并注入（`## 全局记忆` 在前、`## Agent 记忆` 在后，按条目正文去重，注入期两次读层）；`false` = 只注 Agent 层、永不回退全局层；`null` = **清除该行**，文件回到未声明。未声明时运行期走兼容回退——Agent 层有内容只注 Agent 层，为空才回退全局层，两层不叠加（与升级前逐字节一致）。`null` 与 `false` 语义不同：前者是"沿用旧规则"，后者是"只要 Agent 层"，实现不得互相替代。同一补丁里同时写值与 `null` → 400 `EDIT_UNSUPPORTED`；该行本来不存在时 `null` 是幂等 no-op。'
         schedules:
           type: array
           items:
@@ -4251,7 +5748,7 @@ components:
       properties:
         operation_id: { type: string }
         action: { type: string }
-        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system] }
+        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection] }
         target_id: { type: string }
         actor_subject: { type: string }
         auth_method: { type: string, enum: [bearer, local_trust, cli, migration] }
@@ -4285,3 +5782,594 @@ components:
                 URL 凭据、stderr 或凭据末位以外的任何凭据片段。
             recovered_at: { type: string, description: 未恢复为空串 }
             verification: { type: string, enum: [not_required, applied, not_applied, indeterminate] }
+
+    # ==========================================================
+    # US-16：知识库
+    # ==========================================================
+    CollectionSummary:
+      type: object
+      required: [collection_id, name, project, description, description_revision, declared_agents, created_at, deleted_at]
+      properties:
+        collection_id: { type: string, description: '`col_` + 26 位 Crockford Base32' }
+        name: { type: string, description: 同一 project 内活动集合唯一 }
+        project: { type: string, description: 缺省空串（全局） }
+        description:
+          type: string
+          description: 用户维护的集合简介；未编辑时为空串（**不是** null）。写入走 `PUT /admin/knowledge/collections/{id}/description`
+        description_revision:
+          type: integer
+          description: 简介修订号（乐观并发令牌）；未编辑过为 `0`，每次成功写入 +1
+        declared_agents:
+          type: array
+          items: { type: string }
+          description: 在 `AGENT.md` 的 `knowledge:` 块声明本集合的 Agent 名（只读投影，用于删除前自查；删除集合**不**因仍被声明而拒绝）
+        document_count: { type: integer, description: 未删除文档数 }
+        created_at: { type: string, format: date-time }
+        deleted_at: { type: string, description: 软删时间；未删除为空串 }
+
+    CollectionCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        project: { type: string, default: '' }
+
+    DocumentSummary:
+      type: object
+      required: [document_id, collection_id, source_path, content_hash, created_at, updated_at]
+      properties:
+        document_id: { type: string, description: '`doc_` + 26 位 Crockford Base32' }
+        collection_id: { type: string }
+        source_path: { type: string, description: 工作区允许根内的相对路径 }
+        content_hash: { type: string, description: 最新版本原始字节的 sha256（64 位小写十六进制） }
+        latest_version_id: { type: string, description: 尚无版本为空串 }
+        latest_status: { $ref: '#/components/schemas/DocumentVersionStatus' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        deleted_at: { type: string, description: 软删时间；未删除为空串 }
+
+    DocumentVersionStatus:
+      type: string
+      enum: [pending, indexed, active, superseded, retired, failed]
+      description: |
+        文档版本状态机：`pending → indexed → active → superseded`；删除 / 撤权 → `retired`；
+        任一步失败 → `failed`。**只有 `active` 参与检索**；`superseded` / `retired` 仅保留回溯与引用失效判定；
+        `failed` 不得被检索看到，重试必须新建版本行。
+
+    DocumentIngestRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: 工作区允许根内的相对路径；仅 `.md` / `.txt`；越界或超上限 → 400
+
+    IngestResult:
+      type: object
+      required: [document_id, version_id, ingest_job_id, status]
+      properties:
+        document_id: { type: string }
+        version_id: { type: string }
+        ingest_job_id: { type: string }
+        status: { $ref: '#/components/schemas/DocumentVersionStatus' }
+        deduplicated:
+          type: boolean
+          description: 同 collection 已有同 `content_hash` 的 active 版本时为 true（不新建版本）
+        chunk_count: { type: integer, description: 无版本时为 0 }
+        generation: { type: integer, description: 写入的索引代际；未写向量为 0 }
+        error_kind:
+          type: string
+          description: |
+            仅 `failed` 时非空：`path_rejected` / `decode_failed` / `parser_failed` / `chunker_failed` /
+            `embed_failed` / `verify_failed`。文案由 UI 映射。
+
+    DocumentVersionSummary:
+      type: object
+      required: [version_id, document_id, revision, content_hash, status, created_at]
+      properties:
+        version_id: { type: string }
+        document_id: { type: string }
+        revision:
+          type: integer
+          description: |
+            同一文档内的版本序号，从 1 起单调递增；**不是**全局序号，也不做跨文档比较。
+            重建产生新版本行时取「当前最大 revision + 1」，因此失败重试后的序号可能跳号。
+            Per-document version ordinal, monotonic within one document only.
+        content_hash: { type: string }
+        status: { $ref: '#/components/schemas/DocumentVersionStatus' }
+        parser_version: { type: string }
+        chunker_version: { type: string }
+        generation: { type: integer }
+        error_kind: { type: string, description: 仅 `failed` 时非空 }
+        created_at: { type: string, format: date-time }
+        activated_at: { type: string, description: 未激活为空串 }
+
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string, description: 非空；空串 → 400 }
+        collections:
+          type: array
+          items: { type: string }
+          description: 显式集合范围；缺省按 Agent 声明（未给 agent 且未给 collections → 400，不做全库检索）
+        agent:
+          type: string
+          description: 按该 Agent 的 `AGENT.md` 集合声明解析可见范围
+        top_k: { type: integer, minimum: 1, maximum: 50, default: 10 }
+        budget_tokens: { type: integer, minimum: 1, description: 结果切片的 Token 预算上限 }
+
+    SearchHit:
+      type: object
+      required: [chunk_id, document_id, version_id, collection_id, rank, score, snippet]
+      properties:
+        chunk_id: { type: string }
+        document_id: { type: string }
+        version_id: { type: string }
+        collection_id: { type: string }
+        source_path: { type: string }
+        heading_path: { type: string }
+        rank: { type: integer, description: 融合后的名次，从 1 起 }
+        score: { type: number, description: 融合分数；不同路径的异质分数不直接相加 }
+        snippet: { type: string, description: 片段；**不是**引用依据，引用须走 `POST /sources/view` }
+      description: |
+        **刻意不含 `content_hash`**：检索命中没有内容哈希，因此在签名层面就不可能充当引用依据
+        （`ResolveCitations` 只接受精确读取的结果）。片段**不得**写进历史 / 知识摘要当作原文。
+
+    SearchResult:
+      type: object
+      required: [hits, denied_count, strategy]
+      properties:
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+        denied_count:
+          type: integer
+          description: 因 ACL / 删除 / 项目不匹配被剔除的候选数——**只给计数**，不含标题、ID 或片段
+        strategy:
+          type: string
+          enum: [keyword, vector, hybrid, hybrid_rerank]
+        degraded_reason:
+          type: string
+          description: |
+            非空表示单路降级：`vector_unavailable` / `keyword_unavailable` / `rerank_timeout`。
+            **不得**静默降级——降级必须让调用方看见。
+        generation: { type: integer, description: 本次查询使用的索引代际 }
+
+    EvidenceRef:
+      type: object
+      required: [id, version_id]
+      properties:
+        id: { type: string, description: 文档 / 资料 ID；空值非法 }
+        version_id: { type: string, description: 版本 ID；空值非法 }
+        content_hash: { type: string, description: 该版本原始内容的 sha256；用于"可定位"判定 }
+      description: |
+        **不含正文**。资料引用就是本类型（`knowledge.EvidenceRef` 是 `core.EvidenceRef` 的类型别名）。
+        版本 ID 是引用的一部分：**不得**用新原文冒充旧引用。
+
+    EvidenceRange:
+      type: object
+      properties:
+        start: { type: integer, minimum: 0, description: 字符偏移（含） }
+        end: { type: integer, minimum: 0, description: 字符偏移（不含） }
+      description: 范围必须落在该版本原文范围内；越界 → 400（不静默截断到边界）。
+
+    SourceViewRequest:
+      type: object
+      required: [ref]
+      properties:
+        ref: { $ref: '#/components/schemas/EvidenceRef' }
+        range: { $ref: '#/components/schemas/EvidenceRange' }
+        budget_tokens: { type: integer, minimum: 1, description: 单次返回的 Token 上限 }
+        cursor: { type: string, description: 上一页返回的 `next_cursor` }
+        include_facts: { type: boolean, default: false }
+        include_summary: { type: boolean, default: false }
+      description: |
+        **不放 Principal**：身份只从请求上下文取，不藏在请求体里（零值 Principal 直接 401，不读任何正文）。
+
+    ValidityView:
+      type: object
+      required: [valid, reason]
+      properties:
+        valid: { type: boolean }
+        reason:
+          type: string
+          enum: ["", revoked, deleted, version_changed, not_found]
+          description: "`valid=true` 时为空串；四个取值与 `compaction.Validity` 同源"
+      description: 按**当前** ACL / 删除 / 版本重查的结论；两个调用方读同一 `ref` 可以有不同结果。
+
+    SourceFact:
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string }
+        value: { type: string, description: 已脱敏的结构化事实；不得含凭证或完整 URL }
+
+    SourceSummary:
+      type: object
+      properties:
+        document_title: { type: string }
+        heading_path: { type: string }
+        section_summary: { type: string, description: 来源 / 章节摘要；**不含**任务进度 }
+      description: 摘要只描述来源本身；把任务进度混进来会让调用方误以为摘要是任务状态。
+
+    SourceViewResult:
+      type: object
+      required: [ref, validity, text, truncated]
+      properties:
+        ref: { $ref: '#/components/schemas/EvidenceRef' }
+        validity: { $ref: '#/components/schemas/ValidityView' }
+        version_id: { type: string, description: 实际读取的版本（可能因 `version_changed` 而不同于请求） }
+        content_hash: { type: string, description: 实际读取内容的 sha256；`validity.valid=false` 时为空串 }
+        text: { type: string, description: "`validity.valid=false` 时为空串" }
+        range: { $ref: '#/components/schemas/EvidenceRange' }
+        truncated: { type: boolean, description: 截断必须显式标注，不得让调用方以为是全文 }
+        next_cursor: { type: string, description: 无下一页为空串 }
+        conversion: { type: string, description: 转换策略标识（如按段落 / 按字符窗口） }
+        parent_refs:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceRef' }
+          description: 父引用（章节 → 全文等）；空数组表示顶层
+        facts:
+          type: array
+          items: { $ref: '#/components/schemas/SourceFact' }
+          description: 仅在 `include_facts=true` 时返回
+        summary: { $ref: '#/components/schemas/SourceSummary' }
+
+    # ==========================================================
+    # US-16：历史回查
+    # ==========================================================
+    HistoryHit:
+      type: object
+      required: [message_id, session_id, run_id, role, snippet, created_at]
+      properties:
+        message_id: { type: string }
+        session_id: { type: string }
+        run_id: { type: string }
+        role: { type: string, enum: [user, assistant, tool, system] }
+        snippet: { type: string, description: 命中片段；**不是**引用依据 }
+        score: { type: number }
+        created_at: { type: string, format: date-time }
+      description: 命中只回指针与片段；点开必须走精确读取（`GET /sessions/{session_id}/messages/{message_id}`）。
+
+    HistorySearchResult:
+      type: object
+      required: [hits]
+      properties:
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryHit' }
+        truncated:
+          type: boolean
+          default: false
+          description: |
+            命中数超过本页上限（`limit`，缺省 50、上限 200）时为 true——本页**不是**全部。
+            契约**没有**游标参数：收窄条件（`from` / `to` / `session_id` / `agent`）或提高 `limit` 重新检索，
+            同一查询重复调用返回同一批结果。
+            超预算**不得**静默截断（§2.10.4 / 设计 §4 `TestHistory_SearchBudgetTruncationMarked`）。
+            可选字段（默认 false），旧响应不带该字段时按"未截断"解释。
+
+    MessageEvidenceRefView:
+      type: object
+      required: [ref, validity]
+      properties:
+        ref: { $ref: '#/components/schemas/EvidenceRef' }
+        validity: { $ref: '#/components/schemas/ValidityView' }
+
+    MessageDetail:
+      type: object
+      required: [message_id, session_id, run_id, seq, role, content, created_at, truncated]
+      properties:
+        message_id: { type: string }
+        session_id: { type: string }
+        run_id: { type: string }
+        seq: { type: integer }
+        role: { type: string, enum: [user, assistant, tool, system] }
+        content: { type: string, description: 原文；工具结果可能已按上限截断 }
+        truncated: { type: boolean, description: 原文被截断时为 true（重查保留策略后判定） }
+        tool_call_id: { type: string }
+        created_at: { type: string, format: date-time }
+        evidence_refs:
+          type: array
+          items: { $ref: '#/components/schemas/MessageEvidenceRefView' }
+          description: 该消息携带的来源引用，逐个按**当前** ACL / 删除 / 版本标注；不反推、不改写已发送消息
+      description: |
+        历史消息是 Run 的记录，**不因资料撤权而删除**；撤权只让对应 `evidence_refs` 标为失效。
+        无状态 Run 的临时标识 `msg/<run_id>/<pos>` 在 `messages` 表无对应行 → 404。
+
+    # ==========================================================
+    # US-16：调用方与配额
+    # ==========================================================
+    CallerSummary:
+      type: object
+      required: [caller_id, kind, name, status, created_at]
+      properties:
+        caller_id: { type: string, description: '`cal_` + 26 位 Crockford Base32；内置为 `local-admin`' }
+        kind: { type: string, enum: [builtin, external] }
+        name: { type: string }
+        project: { type: string }
+        status: { type: string, enum: [active, disabled], description: disabled 后该调用方全部 Key 认证失败 }
+        created_at: { type: string, format: date-time }
+        key_count: { type: integer, description: 未吊销 Key 数 }
+
+    CallerCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        caller_id: { type: string, description: 缺省由服务端生成；显式给出时不得与既有冲突 }
+        name: { type: string }
+        project: { type: string, default: '' }
+        limits: { $ref: '#/components/schemas/CallerLimitView' }
+
+    CallerLimitView:
+      type: object
+      properties:
+        qps: { type: number, description: '入口 QPS 覆盖（numeric(10,3)，可小数）：按 Run / Ingest / Read 三类入口分别生效，生效值取 min(类别预算, 本值)；0 = 该列不覆盖（沿用类别预算），不是「不限流」' }
+        burst: { type: integer, description: '入口突发额度覆盖：生效值取 min(类别预算, 本值)；0 = 该列不覆盖（沿用类别预算）。qps 与 burst 两列独立判断，覆盖只收紧不放宽' }
+        max_concurrent: { type: integer, description: 并发 Run 名额 }
+        tasks_per_period: { type: integer }
+        tokens_per_period: { type: integer }
+        ingest_bytes_per_period: { type: integer }
+        period: { type: string, enum: [day, month] }
+        timezone: { type: string, default: UTC, description: 周期按该时区本地 00:00 起算 }
+      description: 缺配置即拒绝启动或拒绝签发，**不得**在代码里写默认数字冒充已配置。
+
+    CallerKeyIssueRequest:
+      type: object
+      required: [scopes]
+      properties:
+        scopes:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/CallerScope' }
+          description: 空数组、未知 scope、管理面 scope → 400 `INVALID_SCOPE`，且不留 pending 操作
+        expires_at: { type: string, format: date-time, description: 缺省不过期 }
+
+    CallerScope:
+      type: string
+      description: |
+        scope 字面量（固定枚举，运行期校验）：
+
+        - `sessions:read`——读自己的会话历史；跨调用方一律 404
+        - `sessions:write`——建会话、发消息 / 发起 Run、取消自己的 Run
+        - `knowledge:read`——检索、来源视图、文档 / 版本列表（仍受集合 ACL 二次过滤）
+        - `knowledge:write`——建集合 / 文档、删除、重建索引（仍受集合 ACL 与审计约束）
+        - `agents:invoke:<name>`——调用指定 Agent；无匹配 scope → 403；`agents:invoke:*` **只允许** admin 发放
+        - `diagnostics:read` / `callers:admin`——**仅**随 admin token 的内置 `local-admin` 生效，
+          **不得**出现在 `caller_keys`（签发时 400 `INVALID_SCOPE`）
+      pattern: '^(sessions:(read|write)|knowledge:(read|write)|agents:invoke:(\*|[A-Za-z0-9._-]+)|diagnostics:read|callers:admin)$'
+
+    CallerKeySummary:
+      type: object
+      required: [key_id, caller_id, key_prefix, scopes, status, created_at]
+      properties:
+        key_id: { type: string, description: '`key_` + 26 位 Crockford Base32' }
+        caller_id: { type: string }
+        key_prefix: { type: string, description: 明文非敏感前缀，仅用于人工识别；**不是**凭据 }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/CallerScope' }
+        status: { type: string, enum: [active, revoked, expired] }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, description: 不过期为空串 }
+        revoked_at: { type: string, description: 未吊销为空串 }
+
+    IssuedKey:
+      allOf:
+        - $ref: '#/components/schemas/CallerKeySummary'
+        - type: object
+          required: [key]
+          properties:
+            key:
+              type: string
+              description: |
+                **一次性明文**，只在签发 / 轮换响应出现这一次；服务端只存 `key_hash`。
+                客户端丢失只能吊销重发。**不得**回显到日志、审计、诊断或导出。
+          description: 本响应之外任何地方出现 `key` 字段都视为契约违规。
+
+    UsageLine:
+      type: object
+      required: [kind, used, reserved, overage]
+      properties:
+        kind: { type: string, enum: [run, chat, compaction, ingest, rerank, embedding_tokens, ingest_bytes] }
+        used: { type: integer }
+        reserved: { type: integer, description: '`pending` 预留继续占额度；**不**按零计量' }
+        overage: { type: integer, description: 已发生且不可回滚的超限；> 0 时新预留一律 429 }
+
+    CallerUsageView:
+      type: object
+      required: [caller_id, period_start, period_end, timezone, limits, usage]
+      properties:
+        caller_id: { type: string }
+        period_start: { type: string, format: date-time, description: 该周期起点（按 timezone 本地 00:00） }
+        period_end: { type: string, format: date-time }
+        timezone: { type: string }
+        limits: { $ref: '#/components/schemas/CallerLimitView' }
+        usage:
+          type: array
+          items: { $ref: '#/components/schemas/UsageLine' }
+        pending_reservations:
+          type: integer
+          description: 结局未知、必须由管理员 `reconcile` 的预留数（**不**自动释放）
+
+    ReservationView:
+      type: object
+      required: [reservation_id, caller_id, class, period_start, amount, status]
+      properties:
+        reservation_id: { type: string }
+        caller_id: { type: string }
+        idempotency_key: { type: string }
+        class: { type: string, enum: [run, chat, compaction, ingest, rerank] }
+        run_id: { type: string }
+        ingest_job_id: { type: string }
+        period_start: { type: string, format: date-time }
+        amount: { type: integer, description: 预留量 }
+        actual: { type: integer, description: 实际用量；`committed` 前为空 }
+        status: { type: string, enum: [pending, committed, released, reconciled] }
+        reason: { type: string, description: 释放 / 核对理由 }
+        created_at: { type: string, format: date-time }
+      description: |
+        跨周期：`period_start` 是**创建时**的周期，`commit` / `release` / `reconcile` 总是更新该周期的行，
+        **不**按当前时间重算周期。状态只允许 `pending → committed / released / reconciled`。
+
+    ReservationReconcileRequest:
+      type: object
+      required: [outcome, reason]
+      properties:
+        outcome: { type: string, enum: [committed, released] }
+        actual:
+          type: integer
+          minimum: 0
+          description: '`outcome=committed` 时必填；大于 `amount` 时记 `overage`，不截断、不回滚调用'
+        reason: { type: string, description: 必填；写入管理审计，不得含凭据 }
+
+    ClearOverageRequest:
+      type: object
+      required: [reason]
+      properties:
+        period_start: { type: string, format: date-time, description: 缺省为当前周期起点 }
+        reason: { type: string, description: 必填；写入管理审计，不得含凭据 }
+
+    # ==========================================================
+    # US-16：诊断
+    # ==========================================================
+    DiagnosticKind:
+      type: string
+      enum:
+        - ingest_stage
+        - index_switch
+        - retrieval
+        - assembly
+        - embedding
+        - llm_call
+        - tool_call
+        - permission_decision
+        - quota_decision
+        - migration
+
+    DiagnosticReasonCode:
+      type: string
+      enum:
+        - vector_unavailable
+        - keyword_unavailable
+        - rerank_timeout
+        - permission_denied
+        - budget_trimmed
+        - history_trimmed
+        - no_answer
+        - citation_unresolved
+        - chunker_failed
+        - embed_failed
+        - index_failed
+        - quota_exhausted
+        - rate_limited
+        - key_revoked
+        - migration_verify_failed
+        - llm_call_failed
+        - concurrency_limited
+      description: 稳定枚举；面向人的文案由 UI 映射，**不得**把自由文本写进 `reason_code`。
+
+    DiagnosticEventView:
+      type: object
+      required: [event_id, schema_version, kind, occurred_at, seq, correlation]
+      properties:
+        event_id: { type: string, description: '`ev_` + 26 位 Crockford Base32（ULID 形态，含 48 位毫秒时间前缀，大写载荷）；全局唯一' }
+        schema_version: { type: integer, description: v0 固定 0；演进只增字段 }
+        kind: { $ref: '#/components/schemas/DiagnosticKind' }
+        occurred_at: { type: string, format: date-time, description: 'RFC3339 UTC，毫秒精度；内部存储为 int64 Unix 毫秒（线格式仍是字符串，避免精度丢失）' }
+        correlation:
+          type: object
+          required: [request_id, run_id, task_id, operation_id, ingest_job_id]
+          properties:
+            request_id: { type: string }
+            run_id: { type: string }
+            task_id: { type: string, description: 只是调度限定符，**不得单独**作为主锚点 }
+            operation_id: { type: string }
+            ingest_job_id: { type: string }
+          description: 主锚点至少一个（`request_id` / `run_id` / `operation_id` / `ingest_job_id`）
+        actor: { type: string, enum: ["", caller, scheduler, recovery, admin-cli] }
+        step_id: { type: string }
+        attempt_id: { type: string, description: 重试尝试标识；**不**使用全局序号 }
+        parent_step_id: { type: string }
+        seq: { type: integer, description: 同 correlation 内本地自增，**仅局部有序** }
+        reason_code: { $ref: '#/components/schemas/DiagnosticReasonCode' }
+        decision: { type: string, description: '`allow` / `deny` / `trim` / `degrade` 等' }
+        attrs:
+          type: object
+          additionalProperties: true
+          description: |
+            按 `kind` 的白名单键。**不得**含正文、凭证、完整 URL（`url` 只存 `scheme://host`）。
+            归属与授权来源用 `owner_caller_id` / `authorizing_kind` / `actor`；**不得**在这里冒充管理员。
+        audit_ref:
+          type: object
+          properties:
+            table: { type: string, enum: [llm_calls, tool_invocations, embedding_calls] }
+            id: { type: string }
+          description: 只引用审计行，**不替代**审计
+
+    DiagnosticsResult:
+      type: object
+      required: [events, missing]
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/DiagnosticEventView' }
+        missing:
+          type: boolean
+          description: |
+            **全量采样**（`SampleRate = 1`）下结果为空时为 true——显式表达"证据缺口"，
+            **不得**用空集冒充"一切正常"。采样率 < 1 时无法区分"本来没有"与"被采样丢光"，
+            此时 `missing=false`、改用 `sampled_out=true`（二者互斥；有记录时都为 false）。
+        sampled_out: { type: boolean, description: '结果为空且采样率 < 1 时为 true——此时无法区分"本来没有"与"被采样丢光"；全量采样下的空结果用 `missing` 表达缺口（二者互斥）' }
+        retention_days: { type: integer, description: 本实例的诊断保留期（配置值，不是承诺） }
+
+    # ==========================================================
+    # US-16：会话压缩只读视图
+    # ==========================================================
+    CompactionSummaryView:
+      type: object
+      required: [compaction_id, summary, truncated]
+      properties:
+        compaction_id: { type: string }
+        summary: { type: string, description: 摘要正文；**派生视图**，不得当消息原文或引用依据 }
+        truncated: { type: boolean }
+
+    CompactionView:
+      type: object
+      required: [compaction_id, chain_epoch, covered_from_message_id, cut_message_id, first_kept_message_id, status, created_at]
+      properties:
+        compaction_id: { type: string }
+        scope_session_id: { type: string }
+        scope_run_id: { type: string }
+        chain_epoch: { type: integer, minimum: 1, description: 链代次；重建新根 = 当前最大 + 1 }
+        parent_compaction_id: { type: string, description: 根条目为空串 }
+        trigger_run_id: { type: string }
+        attempt_id: { type: string }
+        covered_from_message_id: { type: string }
+        cut_message_id: { type: string }
+        first_kept_message_id: { type: string }
+        strategy_version: { type: string }
+        prompt_version: { type: string }
+        model: { type: string }
+        tokens_before: { type: integer }
+        tokens_after: { type: integer }
+        status: { type: string, enum: [committed, failed, stale] }
+        reason_code: { type: string, description: 失败 / 失效原因（`compaction_timeout` 等） }
+        source_refs:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceRef' }
+          description: |
+            **审计集**：生成时涉及的**全部**引用（含此后失效、含被剔除的）。
+            只证明"这条摘要曾涉及什么"，**不**参与注入判定。
+        included_refs:
+          type: array
+          items: { $ref: '#/components/schemas/EvidenceRef' }
+          description: |
+            **当前依赖集**：正文里真正含其原文的来源。注入资格只看它 + 链资格。
+            失效校验用这个集合，**不得**用审计集冒充。
+        created_at: { type: string, format: date-time }
+        stale_at: { type: string, description: 未失效为空串 }
+        summary_view: { $ref: '#/components/schemas/CompactionSummaryView' }
+      description: |
+        只读派生视图。**不提供**手动触发；压缩失败显示降级原因。
+        `source_refs` 与 `included_refs` 两个集合**不得**合并展示成一个布尔。

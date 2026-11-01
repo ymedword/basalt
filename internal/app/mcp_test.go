@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 US-7 装配面凭证解析的关键回归（颗粒度文档 §3.2 的 app/mcp_test.go 一例）。

@@ -102,9 +102,22 @@ type MemoryReader interface {
 	// LoadEffective 返回生效层的核心区文本：有 Agent 上下文且该层有内容 → Agent 层，
 	// 否则全局层（两层**不叠加**）。该层只有归档条目时返回空文本——层非空即生效层，
 	// **不得**因此回退去注全局层的核心区（颗粒度文档 §6.2 口径 1 / 2）。
+	//
+	// `principal` 是本次 Run 的实际身份，**读任何一层之前**都要复核：身份有效 →
+	// `agent:invoke:<agent>` scope → 调用方 Key 的**当前**状态（撤销即拒）。未声明
+	// `include_global_memory` 不是权限旁路——配置只决定读哪几层，不决定能不能读。
+	// 没有 Agent 上下文（读全局层本身）时只允许本地管理员。
 	// LoadEffective returns the effective layer's core text; layers never stack, and a
 	// layer holding only archived entries yields an empty string rather than a fallback.
-	LoadEffective(ctx context.Context, agent string) (string, error)
+	// Every read is re-authorized (identity, agent scope, live key state); dropping the
+	// setting is not an authorization bypass.
+	LoadEffective(ctx context.Context, principal Principal, agent string) (string, error)
+}
+
+// LayeredMemoryReader is used only when an Agent explicitly chooses whether to
+// share global memory. Legacy configurations retain the original reader.
+type LayeredMemoryReader interface {
+	LoadLayers(ctx context.Context, agent string, principal Principal, includeGlobal bool) (string, error)
 }
 
 // MemoryQuotaError 是超配额的**类型化**拒绝：调用方按类型判（errors.As），**不得**比对

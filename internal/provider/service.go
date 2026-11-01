@@ -91,7 +91,10 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	if err != nil {
 		s.logger.Error("审计预写失败——拒绝发出该次调用（fail-closed）", "provider", req.Provider,
 			"model", req.Model, "run_id", req.RunID, "error", err)
-		return core.ChatResponse{}, err
+		// 双 `%w`：`core.ErrAuditWrite` 是"确定未发出"的判定锚点（配额结算据此归还预留，
+		// C-29），底层仓储错误同时保留——排障要看得到真正的原因。
+		// Two %w verbs keep both the sentinel and the underlying store error reachable.
+		return core.ChatResponse{}, fmt.Errorf("%w: %w", core.ErrAuditWrite, err)
 	}
 
 	// 4. 发出：一次调用、不重试、不 fallback（技术方案 §2.4.3）。
@@ -150,6 +153,20 @@ func (s *ProviderService) Pinned(name string) (*ProviderService, bool) {
 		store:   s.store,
 		logger:  s.logger,
 	}, true
+}
+
+// SummaryPinned 返回某个 Provider 的**裸协议客户端**，只服务会话压缩的摘要调用
+// （C-25）。理由与 `catalogProviderRouter.SummaryPinned` 逐字相同：摘要不是对话轮，
+// 它自己的 `purpose='compaction'` 审计与配额由压缩接线在发出之前完成。
+// 本方法**不**发放给运行时：`RunRuntime.Provider` 仍然只发 `Pinned` 的审计视图。
+// SummaryPinned exposes the raw client for the summary call only; the runtime still
+// only ever receives the audited pinned view.
+func (s *ProviderService) SummaryPinned(name string) (core.ProviderClient, bool) {
+	client, ok := s.clients[name]
+	if !ok {
+		return nil, false
+	}
+	return client, true
 }
 
 // resolveModel 解析生效模型：请求模型 > 供应商缺省模型；都空则返回空串（调用方据此拒绝）。

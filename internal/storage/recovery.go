@@ -368,7 +368,11 @@ func repairRunGroups(ctx context.Context, db *sql.DB, logger *slog.Logger, runID
 				// 写入与正常运行路径**共用同一份语句**（含 `seq` 分配与计数列递增）——
 				// 两处各写一份同义 SQL 就会有第二处漂移点。
 				m := core.Message{Role: core.RoleTool, Content: content, ToolCallID: call.ID}
-				if err := appendMessage(ctx, conn, g.sessionID, g.runID, m, now); err != nil {
+				// 恢复路径不产出装配记录，标识虽取回也不使用——但**不得**因此吞掉
+				// 「拿不到标识」的错误：那说明行本身不完整。
+				// Recovery emits no assembly record, yet the id is still read so a missing
+				// one surfaces as an error instead of an incomplete row.
+				if _, err := appendMessage(ctx, conn, g.sessionID, g.runID, m, now); err != nil {
 					return err
 				}
 			}

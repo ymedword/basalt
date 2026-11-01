@@ -83,10 +83,22 @@ func newInstanceID() (string, error) {
 // readInstanceMarker reads and validates the roster; a malformed roster is an error,
 // never a fallback to defaults.
 func readInstanceMarker(workDir string) (instanceMarker, bool, error) {
-	path := instanceMarkerPath(workDir)
-	// 读经工作目录根句柄：目录名与文件名都是常量，工作目录为空串时同样在这里失败关闭。
-	// The read goes through a root handle on the working directory, so an empty one fails closed.
-	root, rootErr := os.OpenRoot(workDir)
+	return readInstanceMarkerAt(filepath.Join(workDir, workspaceDirName))
+}
+
+// readInstanceMarkerAt 读**工作区根**下的名册（`<WorkDir>/.basalt/instance.json`）。
+//
+// 与 `readInstanceMarker` 共用同一份校验而不是各写一套：`db export` 已经拿着工作区根
+// （`--workspace` / `<WorkDir>/.basalt` 的解析结果），让它直接调这个函数，经 `WorkDir`
+// 再拼一次路径只会多出一条可能漂移的路径口径。工作区目录不存在与名册不存在同样返回
+// `(zero, false, nil)`——"没有名册"是存量实例的正常状态，不是读取失败。
+// readInstanceMarkerAt reads the roster from the workspace root itself, sharing every
+// validation rule with readInstanceMarker instead of keeping a second copy.
+func readInstanceMarkerAt(rootDir string) (instanceMarker, bool, error) {
+	path := filepath.Join(rootDir, instanceMarkerFileName)
+	// 读经工作区根句柄：文件名是常量，根目录为空串时同样在这里失败关闭。
+	// The read goes through a root handle on the workspace root, so an empty one fails closed.
+	root, rootErr := os.OpenRoot(rootDir)
 	if errors.Is(rootErr, fs.ErrNotExist) {
 		return instanceMarker{}, false, nil
 	}
@@ -94,29 +106,41 @@ func readInstanceMarker(workDir string) (instanceMarker, bool, error) {
 		return instanceMarker{}, false, fmt.Errorf("读取实例名册 %s: %w", path, rootErr)
 	}
 	defer func() { _ = root.Close() }()
-	raw, err := root.ReadFile(filepath.Join(workspaceDirName, instanceMarkerFileName))
+	raw, err := root.ReadFile(instanceMarkerFileName)
 	if errors.Is(err, fs.ErrNotExist) {
 		return instanceMarker{}, false, nil
 	}
 	if err != nil {
 		return instanceMarker{}, false, fmt.Errorf("读取实例名册 %s: %w", path, err)
 	}
-	var marker instanceMarker
-	if err := json.Unmarshal(raw, &marker); err != nil {
-		return instanceMarker{}, false, fmt.Errorf(
-			"实例名册 %s 不是合法 JSON——按失败处理，请人工核对或从备份恢复: %w", path, err)
-	}
-	if marker.Version > instanceMarkerVersion {
-		return instanceMarker{}, false, fmt.Errorf(
-			"实例名册 %s 的版本为 %d，高于本二进制支持的 %d——请升级程序，不要手工改版本号",
-			path, marker.Version, instanceMarkerVersion)
-	}
-	if !instanceIDPattern.MatchString(marker.InstanceID) {
-		return instanceMarker{}, false, fmt.Errorf(
-			"实例名册 %s 的 instance_id 形态非法——要求 inst_ 加 16 位十六进制，请人工核对",
-			path)
+	marker, parseErr := parseInstanceMarker(raw)
+	if parseErr != nil {
+		return instanceMarker{}, false, fmt.Errorf("实例名册 %s：%w", path, parseErr)
 	}
 	return marker, true, nil
+}
+
+// parseInstanceMarker 校验名册**字节**：合法 JSON、版本不高于本二进制、标识形态合法。
+// 校验只写这一份——读盘（`readInstanceMarkerAt`）与读备份（`secrets recover-record`）
+// 共用它，两处各写一套正是"备份里的坏名册被放行"的来源。
+// parseInstanceMarker is the single validation both the on-disk read and the backup
+// restore go through.
+func parseInstanceMarker(raw []byte) (instanceMarker, error) {
+	var marker instanceMarker
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		return instanceMarker{}, fmt.Errorf(
+			"不是合法 JSON——按失败处理，请人工核对或从备份恢复: %w", err)
+	}
+	if marker.Version > instanceMarkerVersion {
+		return instanceMarker{}, fmt.Errorf(
+			"版本为 %d，高于本二进制支持的 %d——请升级程序，不要手工改版本号",
+			marker.Version, instanceMarkerVersion)
+	}
+	if !instanceIDPattern.MatchString(marker.InstanceID) {
+		return instanceMarker{}, fmt.Errorf(
+			"instance_id 形态非法——要求 inst_ 加 16 位十六进制，请人工核对")
+	}
+	return marker, nil
 }
 
 // instanceDataRoot 返回当前用户的数据根目录：Windows 取 `%LOCALAPPDATA%`，
@@ -149,6 +173,22 @@ func instanceDataRoot() (string, error) {
 			"——请在 secrets.master_key_file 显式给出主密钥路径")
 }
 
+// instancePrivateDirForID 按**已知的**实例标识推导私有目录。它只服务两类调用方：首次
+// 初始化在建名册之前写进度记录（标识是本进程刚生成的），以及按名册已读到的标识取路径。
+// 标识会被拼进目录名，因此**先校验再使用**——形态非法即拒绝，不做清洗。
+// instancePrivateDirForID derives the private directory from an id already known; the id
+// is shape-checked first because it becomes a path segment.
+func instancePrivateDirForID(id string) (string, error) {
+	if !instanceIDPattern.MatchString(id) {
+		return "", fmt.Errorf("实例标识形态非法——要求 inst_ 加 16 位十六进制，拒绝拼路径")
+	}
+	root, err := instanceDataRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, instanceDataDirName, instancesDirName, id), nil
+}
+
 // defaultInstancePrivateDir 按名册推导实例私有目录；没有名册即返回
 // `errInstanceIdentityMissing`（存量实例不猜路径）。
 // defaultInstancePrivateDir derives the private directory from the roster only.
@@ -160,11 +200,7 @@ func defaultInstancePrivateDir(workDir string) (string, error) {
 	if !present {
 		return "", errInstanceIdentityMissing
 	}
-	root, err := instanceDataRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, instanceDataDirName, instancesDirName, marker.InstanceID), nil
+	return instancePrivateDirForID(marker.InstanceID)
 }
 
 // defaultMasterKeyFile 返回缺省主密钥路径（私有目录下的 master.key）。

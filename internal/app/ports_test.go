@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 import (
@@ -13,8 +15,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/testutil"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -26,9 +31,13 @@ import (
 // The adapters are the only seam between the implementation packages and the
 // command surface; TestRun_ExitCodes never reaches them, so they are judged here.
 
-// TestStorageStore_BootstrapThenOpenReadOnly 端口往返：引导创建 → 二跑报 Kept →
-// 只读打开读到版本与表清点（status 节 3 消费的就是这三个方法）。
-func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
+// TestStorageStore_BootstrapLegacySQLite 端口往返：引导创建 → 二跑报 Kept。引导仍是
+// **旧 SQLite 谱系**（v6 冻结为迁移源，供 `basalt init` 与离线导出使用，见 run-state
+// R69 ·5 #6 待裁决）；运行期只读视图走 PostgreSQL，两者后端不同，故拆成两个用例。
+// 判据原样保留：首次真创建、二跑 Kept 且不迁移，表集合随 schema.sql 建齐。
+// The bootstrap port still drives the frozen SQLite lineage; the runtime read view is
+// PostgreSQL, so the two halves are judged separately.
+func TestStorageStore_BootstrapLegacySQLite(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(testutil.TempWorkspace(t), "basalt.db")
 
@@ -42,21 +51,44 @@ func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, created, "二跑必须报 Kept（created=false）")
 
-	view, err := store.OpenReadOnly(ctx, path, storage.SupportedSchemaVersion)
+	view, err := storage.OpenReadOnly(ctx, path, storage.SupportedSchemaVersion)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, view.Close()) })
 
 	version, err := view.SchemaVersion(ctx)
 	require.NoError(t, err)
-	require.Equal(t, storage.SupportedSchemaVersion, version)
+	require.Equal(t, storage.SupportedSchemaVersion, version, "二跑不得迁移旧库")
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
 	require.Len(t, tables, 33, "33 张表随 schema.sql（v6）建齐——v1 11 张 + US-11 新增 7 张 + US-12 新增 10 张 + v5 的 network_domain_policy + v6 的四张")
 }
 
+// TestStorageStore_OpenReadOnlyPostgres 端口往返：只读打开读到版本与表清点
+// （status 节 3 消费的就是 `SchemaVersion` / `TableNames`）。只读会话**不迁移**：
+// 视图建在夹具已迁移的隔离 schema 上，读数直接来自装配路径写下的那份谱系。
+// 逆改点：OpenReadOnly 改回"顺手迁移" → 版本断言在未迁移 schema 上仍绿但契约被破坏，
+// 故另判"只读会话不得写入"由 OpenReadOnly 自身的选择性测试承担（postgres 包内）。
+// The read-only port reports the version and table inventory of the runtime backend.
+func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
+	ctx := context.Background()
+	fx := pgtest.NewFixture(t)
+
+	view, err := storageStore{}.OpenReadOnly(ctx, cli.DatabaseConfig{DSN: fx.DSN})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, view.Close()) })
+
+	version, err := view.SchemaVersion(ctx)
+	require.NoError(t, err)
+	require.Equal(t, postgres.SupportedSchemaVersion, version)
+
+	tables, err := view.TableNames(ctx)
+	require.NoError(t, err)
+	require.Len(t, tables, 52, "契约 v1 恰好 52 张表（与 postgres 包的迁移用例同一口径）")
+}
+
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**
-// 返回真正的 nil 接口——`*storage.DB` 装箱进接口会把 nil 变成"非空接口 + 空指针"，
+// 返回真正的 nil 接口——`*postgres.DB` 装箱进接口会把 nil 变成"非空接口 + 空指针"，
 // 上层的 `err != nil` 判据随之失效。
 //
 // 判据刻意用 `view == nil` 而不是 require.Nil：后者走 reflect 判空，对 typed-nil
@@ -64,10 +96,11 @@ func TestStorageStore_BootstrapThenOpenReadOnly(t *testing.T) {
 // The assertion is `view == nil` on purpose: require.Nil passes for a typed nil.
 func TestStorageStore_OpenReadOnlyErrorReturnsNilView(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(testutil.TempWorkspace(t), "missing.db")
-
-	view, err := storageStore{}.OpenReadOnly(ctx, path, storage.SupportedSchemaVersion)
-	require.ErrorIs(t, err, core.ErrDatabaseMissing)
+	// 空 DSN 在拨号之前就被拒绝（装载层保证运行期不会出现，这里取最省的一条失败路径）。
+	// 错误类别随后端改变："库文件不存在"（SQLite）在 PostgreSQL 下不成立，改为
+	// "连接串必须解析为实际值"——typed-nil 判据本身不变。
+	view, err := storageStore{}.OpenReadOnly(ctx, cli.DatabaseConfig{})
+	require.ErrorContains(t, err, "连接串为空")
 	require.True(t, view == nil, "错误路径必须返回 nil 接口（typed-nil 陷阱）；got %#v", view)
 }
 
@@ -194,10 +227,12 @@ func TestAgentsPort_CreateAndDeleteReachWorkspace(t *testing.T) {
 	require.NoError(t, err)
 
 	// 排障线是 DEBUG 档（prod 默认关闭），这里的 handler 必须显式开 Debug 才看得见。
+	// `Database` 段与 `newCLIPortForTest` 同源：端口一旦写，就要真有 PostgreSQL 可写。
 	var logs bytes.Buffer
 	port := agentsPort{
 		WorkDir:                workDir,
-		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+		Database:               cli.DatabaseConfig{DSN: pgtest.NewTestSchema(t)},
 		Logger:                 slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 
@@ -237,7 +272,11 @@ func TestAgentsPort_CreateAndDeleteReachWorkspace(t *testing.T) {
 
 // newCLIPortForTest 造本文件四个 CLI 写路径用例共用的端口与工作区骨架。
 // newCLIPortForTest builds the shared port and workspace skeleton for the CLI-path tests.
-func newCLIPortForTest(t *testing.T) (agentsPort, string, *bytes.Buffer) {
+//
+// 端口的 `Database` 段是隔离 schema 的 DSN（只经内存传递，不落盘）：写路径因此真的
+// 打到 PostgreSQL，判卷读数再由 `cliProfileAdminForTest` 用同一 DSN 重建管理面取得。
+// The port's Database section is the isolated-schema DSN, handed over in memory only.
+func newCLIPortForTest(t *testing.T) (agentsPort, string, string, *bytes.Buffer) {
 	t.Helper()
 
 	workDir := testutil.TempWorkspace(t)
@@ -245,32 +284,33 @@ func newCLIPortForTest(t *testing.T) (agentsPort, string, *bytes.Buffer) {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
+	dsn := pgtest.NewTestSchema(t)
 	var logs bytes.Buffer
 	port := agentsPort{
 		WorkDir:                workDir,
-		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+		Database:               cli.DatabaseConfig{DSN: dsn},
 		Logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
 	}
-	return port, root, &logs
+	return port, root, dsn, &logs
 }
 
 // cliProfileAdminForTest 在端口释放实例锁之后按同一装配口径重建管理面：`Archived` 与
 // `Restore` 因此走的是 HTTP 端点背后的同一实现，不是测试自造的第二条路径。
 // cliProfileAdminForTest rebuilds the same management surface the HTTP handlers use.
-func cliProfileAdminForTest(t *testing.T, root string, logger *slog.Logger) *AgentAdmin {
+func cliProfileAdminForTest(t *testing.T, root, dsn string, logger *slog.Logger) *AgentAdmin {
 	t.Helper()
 
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(root, databaseFileName), storage.SupportedSchemaVersion)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	return NewAgentAdmin(AgentAdminDeps{
 		Root:       root,
 		Lifecycle:  workspace.NewLifecycleStore(root, time.Now),
-		Index:      storage.NewResourceStore(db),
-		Operations: storage.NewManagementStore(db),
-		Archives:   storage.NewAgentAdminStore(db),
+		Index:      postgres.NewResourceStore(db),
+		Operations: postgres.NewManagementStore(db),
+		Archives:   postgres.NewAgentAdminStore(db),
 		Logger:     logger,
 		Now:        time.Now,
 	})
@@ -285,7 +325,7 @@ func cliProfileAdminForTest(t *testing.T, root string, logger *slog.Logger) *Age
 // file and an index row, and the template honours the passed provider order.
 func TestCLIProfileCreate_WritesManagementOperation(t *testing.T) {
 	ctx := context.Background()
-	port, root, _ := newCLIPortForTest(t)
+	port, root, dsn, _ := newCLIPortForTest(t)
 
 	created, err := port.Create(root, "cli-agent", []string{"deepseek", "spare"})
 	require.NoError(t, err)
@@ -305,11 +345,11 @@ func TestCLIProfileCreate_WritesManagementOperation(t *testing.T) {
 	require.Contains(t, string(content), "name: deepseek", "模板 provider 取配置列表首项")
 
 	// 操作行：pending → success，动作 / 目标 / 主体 / 认证方式逐字（契约 §9.3）。
-	db := openRead(t, filepath.Join(root, databaseFileName))
+	db := openRead(t, dsn)
 	var action, targetKind, targetID, subject, method, source, status, resultCode string
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT action, target_kind, target_id, actor_subject, auth_method, source, status, result_code
-		   FROM management_operations WHERE operation_id = ?`, rec.OperationID).
+		   FROM management_operations WHERE operation_id = $1`, rec.OperationID).
 		Scan(&action, &targetKind, &targetID, &subject, &method, &source, &status, &resultCode))
 	require.Equal(t, core.ActionAgentCreate, action)
 	require.Equal(t, targetKindAgent, targetKind)
@@ -323,16 +363,19 @@ func TestCLIProfileCreate_WritesManagementOperation(t *testing.T) {
 	require.Equal(t, lifecycleResultOK, resultCode)
 
 	// 生命周期索引落库（可重建视图；失败不回滚写，但正常路径必须写成功）。
+	// `valid` 在 PostgreSQL 里是 boolean 列：扫描目标必须是 bool（SQLite 时代的 0/1 整数
+	// 断言在这里直接报 Scan 转换错误）。
+	// valid is a boolean column, so the scan target is a Go bool.
 	var indexOP string
-	var valid int
+	var valid bool
 	require.NoError(t, db.QueryRowContext(ctx,
-		`SELECT operation_id, valid FROM agent_lifecycle WHERE agent_name = ?`, "cli-agent").
+		`SELECT operation_id, valid FROM agent_lifecycle WHERE agent_name = $1`, "cli-agent").
 		Scan(&indexOP, &valid))
 	require.Equal(t, rec.OperationID, indexOP)
-	require.Equal(t, 1, valid)
+	require.True(t, valid)
 
 	require.Equal(t, 1, countRows(t, db,
-		`SELECT COUNT(*) FROM management_operations WHERE target_id = ?`, "cli-agent"),
+		`SELECT COUNT(*) FROM management_operations WHERE target_id = $1`, "cli-agent"),
 		"一次创建只写一行操作记录")
 }
 
@@ -344,7 +387,7 @@ func TestCLIProfileCreate_WritesManagementOperation(t *testing.T) {
 // directory; the injected instant drives the archive id.
 func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 	ctx := context.Background()
-	port, root, _ := newCLIPortForTest(t)
+	port, root, dsn, _ := newCLIPortForTest(t)
 
 	_, err := port.Create(root, "cli-agent", []string{"deepseek"})
 	require.NoError(t, err)
@@ -356,14 +399,13 @@ func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(root, "agents", "cli-agent"))
 	require.FileExists(t, filepath.Join(root, "archive", "cli-agent-20261016-093000", "AGENT.md"))
 
-	dbPath := filepath.Join(root, databaseFileName)
-	db := openRead(t, dbPath)
+	db := openRead(t, dsn)
 
 	var operationID, agentName, contentHash, manifest string
 	var archivedAt int64
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT operation_id, agent_name, archived_at, content_hash, manifest_json
-		   FROM agent_archives WHERE archive_id = ?`, "cli-agent-20261016-093000").
+		   FROM agent_archives WHERE archive_id = $1`, "cli-agent-20261016-093000").
 		Scan(&operationID, &agentName, &archivedAt, &contentHash, &manifest))
 	require.Equal(t, "cli-agent", agentName)
 	require.Equal(t, now.UnixMilli(), archivedAt, "归档时间以注入时刻为准")
@@ -373,7 +415,7 @@ func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 	var status, subject, method, source string
 	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT status, actor_subject, auth_method, source
-		   FROM management_operations WHERE operation_id = ?`, operationID).
+		   FROM management_operations WHERE operation_id = $1`, operationID).
 		Scan(&status, &subject, &method, &source))
 	require.Equal(t, string(core.OperationSuccess), status)
 	require.True(t, strings.HasPrefix(subject, core.ActorSubjectCLIPrefix), "actor_subject：%s", subject)
@@ -381,7 +423,7 @@ func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 	require.Equal(t, cliOperationSource, source)
 
 	// `/archived-agents` 可见：与 HTTP 端点调用同一个方法（AgentAdmin.Archived）。
-	admin := cliProfileAdminForTest(t, root, port.logger())
+	admin := cliProfileAdminForTest(t, root, dsn, port.logger())
 	rows, err := admin.Archived(ctx)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
@@ -397,7 +439,7 @@ func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 		"归档副本保留，仅归档行标记 restored_at")
 	require.Equal(t, 1, countRows(t, db,
 		`SELECT COUNT(*) FROM agent_archives
-		  WHERE archive_id = ? AND restored_at IS NOT NULL AND restored_agent_name = ?`,
+		  WHERE archive_id = $1 AND restored_at IS NOT NULL AND restored_agent_name = $2`,
 		"cli-agent-20261016-093000", "cli-agent"))
 
 	rec, exists, err := workspace.NewLifecycleStore(root, time.Now).Read(ctx, "cli-agent")
@@ -414,7 +456,7 @@ func TestCLIProfileDelete_WritesArchiveRow(t *testing.T) {
 // Acceptance point: the web archive port lists a row written by the CLI delete path.
 func TestArchivedList_IncludesCLIArchive(t *testing.T) {
 	ctx := context.Background()
-	port, root, _ := newCLIPortForTest(t)
+	port, root, dsn, _ := newCLIPortForTest(t)
 
 	_, err := port.Create(root, "cli-archive-agent", []string{"deepseek"})
 	require.NoError(t, err)
@@ -426,7 +468,7 @@ func TestArchivedList_IncludesCLIArchive(t *testing.T) {
 
 	// 与 HTTP 端点背后是同一个实现：`agentAdminPort` 是 `web.AgentAdminService` 的唯一适配器。
 	// The same implementation behind the HTTP endpoint: the sole web port adapter.
-	admin := cliProfileAdminForTest(t, root, port.logger())
+	admin := cliProfileAdminForTest(t, root, dsn, port.logger())
 	webPort := agentAdminPort{admin: admin}
 	rows, err := webPort.Archived(ctx)
 	require.NoError(t, err)
@@ -437,12 +479,17 @@ func TestArchivedList_IncludesCLIArchive(t *testing.T) {
 }
 
 // TestAgentsPort_WritePathReleasesLockOnFailure（卡 §3.2.2 CLI 写路径行）：失败路径同样
-// 关闭库、释放锁——同名再建的纯请求校验失败先于预写（零操作行），随后测试自己取锁成功、
-// 库文件可改名（Windows 上句柄未关会被占用），再接一次归档仍成功。
-// Acceptance point: a failed write closes the database and releases the lock, and a
+// 关闭库、释放锁——同名再建的纯请求校验失败先于预写（零操作行），随后测试自己取锁成功，
+// 再接一次归档仍成功。
+//
+// 判据面变更（US-16 / T014）：原用例以"库文件可改名"判"写路径失败后句柄已关闭"（Windows
+// 上打开的文件改不了名）。PostgreSQL 下没有文件句柄可探测，该探针**没有等价物**；保留的
+// 两个判据（实例锁可重取、归档照常走完且操作行只有一行）仍能判出"半截状态"。裁决与
+// 对应关系记入 run-state 未验证清单。
+// Acceptance point: a failed write releases the lock, leaves no half-open state, and a
 // pre-write validation failure leaves no second operation row.
 func TestAgentsPort_WritePathReleasesLockOnFailure(t *testing.T) {
-	port, root, _ := newCLIPortForTest(t)
+	port, root, dsn, _ := newCLIPortForTest(t)
 
 	_, err := port.Create(root, "locked-agent", nil)
 	require.NoError(t, err)
@@ -457,21 +504,14 @@ func TestAgentsPort_WritePathReleasesLockOnFailure(t *testing.T) {
 	require.NoError(t, err, "写路径失败后实例锁必须已释放")
 	require.NoError(t, lock.Release())
 
-	// 库句柄必须已关闭：Windows 上改名被打开的文件会失败；POSIX 下该操作恒成功，
-	// 因而不作为 POSIX 平台的判据。
-	dbPath := filepath.Join(root, databaseFileName)
-	moved := dbPath + ".closed-probe"
-	require.NoError(t, os.Rename(dbPath, moved), "写路径失败后库句柄必须已关闭")
-	require.NoError(t, os.Rename(moved, dbPath))
-
 	// 前一次失败没有留下第二套互斥或半截状态：归档照常走完。
 	archived, err := port.Delete(root, "locked-agent", time.Date(2026, 10, 16, 9, 30, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, "archive/locked-agent-20261016-093000", archived)
 
-	db := openRead(t, dbPath)
+	db := openRead(t, dsn)
 	require.Equal(t, 1, countRows(t, db,
-		`SELECT COUNT(*) FROM management_operations WHERE action = ? AND target_id = ?`,
+		`SELECT COUNT(*) FROM management_operations WHERE action = $1 AND target_id = $2`,
 		core.ActionAgentCreate, "locked-agent"),
 		"同名再建的校验失败先于预写，只能有首次创建那一行")
 }
@@ -500,14 +540,19 @@ provider:
 	require.NoError(t, err)
 	defer func() { require.NoError(t, lock.Release()) }()
 
-	port := agentsPort{WorkDir: workDir} // 刻意不设 schema 版本：读面不得依赖写路径配置
+	// 空的隔离 schema 就是"库还没建"的 PostgreSQL 读数：读面拿得到 DSN，但不得去迁移建表。
+	// An empty isolated schema is the PostgreSQL readout of "no database was created".
+	dsn := pgtest.NewTestSchema(t)
+	port := agentsPort{WorkDir: workDir, Database: cli.DatabaseConfig{DSN: dsn}}
 
 	entries, err := port.List(root, []string{"deepseek"})
 	require.NoError(t, err, "读面不得取实例锁")
 	require.Len(t, entries, 1)
 	require.True(t, entries[0].Registered, "读面零写入：%s", entries[0].RejectReason)
 
-	require.NoFileExists(t, filepath.Join(root, databaseFileName), "轻路径不得创建数据库")
+	tables, err := openRead(t, dsn).TableNames(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, tables, "轻路径不得建表（等价于 SQLite 时代的「不得创建数据库」）")
 	require.NoDirExists(t, filepath.Join(root, "control", "agents"), "轻路径不得写生命周期状态")
 }
 

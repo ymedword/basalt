@@ -119,10 +119,14 @@ func TestMCPCredentialSourceStore_BackfillOnlyFillsUndeclared(t *testing.T) {
 		OperationID: "op-managed",
 	}, policyNow))
 
-	added, err := store.BackfillEnvSources(ctx, sourceStoreUID,
+	report, err := store.BackfillEnvSources(ctx, sourceStoreUID,
 		[]string{"GITHUB_PERSONAL_ACCESS_TOKEN", "BRAVE_API_KEY"}, "system.backfill", policyNow)
 	require.NoError(t, err)
-	require.Equal(t, 1, added, "只补记没有声明的槽位")
+	require.Equal(t, []string{"BRAVE_API_KEY"}, report.Filled, "只补记没有声明的槽位")
+	require.Empty(t, report.Skipped)
+	require.Empty(t, report.Conflict)
+	require.Equal(t, []string{"GITHUB_PERSONAL_ACCESS_TOKEN"}, report.ConfigDrift,
+		"文件声明了槽位、库里却是 managed：按配置漂移上报，不改既有行")
 
 	declared, ok, err := store.Get(ctx, sourceStoreUID, "GITHUB_PERSONAL_ACCESS_TOKEN")
 	require.NoError(t, err)
@@ -140,7 +144,88 @@ func TestMCPCredentialSourceStore_BackfillOnlyFillsUndeclared(t *testing.T) {
 	again, err := store.BackfillEnvSources(ctx, sourceStoreUID,
 		[]string{"GITHUB_PERSONAL_ACCESS_TOKEN", "BRAVE_API_KEY"}, "system.backfill", policyNow)
 	require.NoError(t, err)
-	require.Equal(t, 0, again, "补记是幂等的")
+	require.Equal(t, 0, again.FilledCount(), "补记是幂等的")
+	require.Equal(t, []string{"BRAVE_API_KEY"}, again.Skipped, "重跑时既有 env 行走 skipped")
+}
+
+// TestMCP_BackfillReportsMissingAndDrift —— 设计 §2.16.1 ②：报告必须按槽位分四类列出，
+// **不得**只报一个总数。缺行 → filled；既有 env（导入带过来的）→ skipped；文件声明了
+// 槽位而库里是 managed → config_drift；conflict 是闭集外模式的防御分支，schema CHECK
+// 下不可达，正常数据里必须为空。
+// 逆改点：报告退化成只返回 filled 计数 → skipped / config_drift 断言红；把 managed
+// 既有行并进 skipped → 配置漂移被掩盖，config_drift 断言红。
+// TestMCP_BackfillReportsMissingAndDrift pins the four-way per-slot report.
+func TestMCP_BackfillReportsMissingAndDrift(t *testing.T) {
+	store, _ := newSourceStore(t)
+	ctx := context.Background()
+
+	// ALREADY_ENV 模拟迁移带入的 env 行：操作号是导入期的那一次，不是本次补记。
+	require.NoError(t, store.Upsert(ctx, core.MCPCredentialSource{
+		ServerUID:   sourceStoreUID,
+		BindingKey:  "ALREADY_ENV",
+		Mode:        core.CredentialModeEnv,
+		OperationID: "migration.import.v6",
+	}, policyNow.Add(-24*time.Hour)))
+	// MANAGED_SLOT 在已发布定义里声明（文件只能表达 `${VAR}`），库里却是托管。
+	require.NoError(t, store.Upsert(ctx, core.MCPCredentialSource{
+		ServerUID:   sourceStoreUID,
+		BindingKey:  "MANAGED_SLOT",
+		Mode:        core.CredentialModeManaged,
+		OperationID: "op-managed",
+	}, policyNow))
+
+	report, err := store.BackfillEnvSources(ctx, sourceStoreUID,
+		[]string{"ALREADY_ENV", "MANAGED_SLOT", "FRESH_SLOT"}, "system.backfill", policyNow)
+	require.NoError(t, err)
+	require.Equal(t, []string{"FRESH_SLOT"}, report.Filled, "缺行才补")
+	require.Equal(t, []string{"ALREADY_ENV"}, report.Skipped, "既有 env 行不动")
+	require.Equal(t, []string{"MANAGED_SLOT"}, report.ConfigDrift, "配置漂移要单独可见")
+	require.Empty(t, report.Conflict, "闭集外模式在 schema CHECK 下不可达")
+	require.Equal(t, 1, report.FilledCount())
+	require.Equal(t, 3,
+		len(report.Filled)+len(report.Skipped)+len(report.Conflict)+len(report.ConfigDrift),
+		"每个槽位恰好落一个分类——不得漏报")
+
+	// "分类出来"还要"没被动过"：managed 既有行必须原样保留（模式、操作号、版本都不变），
+	// 否则报告说 config_drift、库里却已被覆写成 env —— 漂移就被自己的补记抹平了。
+	managed, found, err := store.Get(ctx, sourceStoreUID, "MANAGED_SLOT")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, core.CredentialModeManaged, managed.Mode, "managed 行不得被降级成 env")
+	require.Equal(t, "op-managed", managed.OperationID, "既有行的操作号不得被补记覆盖")
+	require.Equal(t, 1, managed.Revision, "既有行不得因补记加版本")
+}
+
+// TestMCP_BackfillDoesNotOverwriteMigratedEnvSource —— 设计 §2.16.1 ①：导入带进来的
+// env 来源行（含迁移期的 operation_id 与 updated_at）逐字段保留，补记不得 UPDATE。
+// 逆改点：把 INSERT ... DO NOTHING 改成 upsert → operation_id / revision 被改写，本用例红。
+// TestMCP_BackfillDoesNotOverwriteMigratedEnvSource keeps migrated env rows verbatim.
+func TestMCP_BackfillDoesNotOverwriteMigratedEnvSource(t *testing.T) {
+	store, _ := newSourceStore(t)
+	ctx := context.Background()
+	migratedAt := policyNow.Add(-24 * time.Hour)
+	require.NoError(t, store.Upsert(ctx, core.MCPCredentialSource{
+		ServerUID:   sourceStoreUID,
+		BindingKey:  "MIGRATED_TOKEN",
+		Mode:        core.CredentialModeEnv,
+		OperationID: "migration.import.v6",
+	}, migratedAt))
+	before, ok, err := store.Get(ctx, sourceStoreUID, "MIGRATED_TOKEN")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	report, err := store.BackfillEnvSources(ctx, sourceStoreUID,
+		[]string{"MIGRATED_TOKEN"}, "system.backfill", policyNow)
+	require.NoError(t, err)
+	require.Empty(t, report.Filled, "既有行不算补记")
+	require.Equal(t, []string{"MIGRATED_TOKEN"}, report.Skipped)
+
+	after, ok, err := store.Get(ctx, sourceStoreUID, "MIGRATED_TOKEN")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, before, after, "导入带入的 env 来源行逐字段不变")
+	require.Equal(t, "migration.import.v6", after.OperationID, "补记不得改写来源行的操作号")
+	require.Equal(t, 1, after.Revision)
 }
 
 // TestMCPCredentialSourceStore_BackfillRejectsInvalidInput —— 非法 UID / 空操作号在写入
@@ -156,11 +241,12 @@ func TestMCPCredentialSourceStore_BackfillRejectsInvalidInput(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "operation_id 不能为空")
 
-	added, err := store.BackfillEnvSources(ctx, sourceStoreUID,
+	report, err := store.BackfillEnvSources(ctx, sourceStoreUID,
 		[]string{"BRAVE_API_KEY", "BAD KEY", "FETCH_TOKEN"}, "op-x", policyNow)
 	require.Error(t, err, "非法槽位名不得静默跳过")
 	require.Contains(t, err.Error(), "非法槽位名")
-	require.Equal(t, 1, added, "错误前的补记条数如实返回")
+	require.Equal(t, 1, report.FilledCount(), "错误前的补记条数如实返回")
+	require.Equal(t, []string{"BRAVE_API_KEY"}, report.Filled)
 
 	listed, err := store.List(ctx, sourceStoreUID)
 	require.NoError(t, err)

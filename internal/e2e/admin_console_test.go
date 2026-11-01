@@ -388,13 +388,13 @@ func TestAdminConsoleE2E_FullFlow(t *testing.T) {
 		t.Fatalf("恢复后 restored_agent_name = %q，期望 reporter", row.RestoredAgentName)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if got := scalarInt(t, db, "SELECT COUNT(*) FROM runs WHERE agent = 'reporter' AND status = 'completed'"); got != 1 {
 		t.Fatalf("已完成的 reporter 运行数 = %d，期望 1", got)
 	}
 	for _, action := range []string{"agent.create", "agent.enable", "agent.archive", "agent.restore"} {
 		if got := scalarInt(t, db,
-			"SELECT COUNT(*) FROM management_operations WHERE action = ? AND target_id = 'reporter' AND status = 'success'",
+			"SELECT COUNT(*) FROM management_operations WHERE action = $1 AND target_id = 'reporter' AND status = 'success'",
 			action); got != 1 {
 			t.Fatalf("动作 %s 的 success 操作行数 = %d，期望 1", action, got)
 		}
@@ -479,7 +479,7 @@ func TestAdminConsoleE2E_CreateCopyArchivedDefaults(t *testing.T) {
 		t.Fatalf("异名恢复后 restored_agent_name = %q，期望 revived", row.RestoredAgentName)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if got := scalarInt(t, db,
 		"SELECT COUNT(*) FROM management_operations WHERE action = 'agent.copy' AND target_id = 'copycat' AND status = 'success'"); got != 1 {
 		t.Fatalf("agent.copy 的 success 操作行数 = %d，期望 1", got)

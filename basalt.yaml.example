@@ -6,11 +6,59 @@
 # 凭证红线：本文件不出现任何明文凭证。两种显式模式——
 #   env     ：只允许 `${ENV_VAR}` 占位；变量不存在 / 解析后为空 / 替换后仍残留 `${` / 写成明文，
 #             四种情形一律拒绝启动并点名配置键；
-#   managed ：管理台录入，密文存 SQLite，主密钥在工作区之外（见 secrets 段）。本文件只出现服务端
+#   managed ：管理台录入，密文存数据库（PostgreSQL），主密钥在工作区之外（见 secrets 段）。本文件只出现服务端
 #             写入的 `credential_mode: managed` 与只读 `credential_ref: cred_...`，不出现 Key 或完整 URL。
 # Sample configuration; copy to `basalt.yaml`. No plaintext credentials ever appear here:
 # env mode uses ${ENV_VAR} placeholders (unresolved/empty/plaintext rejected at load time);
-# managed mode stores ciphertext in SQLite and only a server-written `credential_ref` in this file.
+# managed mode stores ciphertext in the PostgreSQL database and only a server-written `credential_ref` in this file.
+
+# 存储段：PostgreSQL 16/17（必需）——运行期唯一后端。缺 DSN / 连不上 / 缺扩展一律拒绝
+# 启动，**不**回退 SQLite（出处 docs/Operations.md §1.2）。部署侧先建库并安装扩展
+# vector（≥ 0.8，需 hnsw.iterative_scan 能力）与 pg_trgm；应用**不**自动 CREATE EXTENSION。
+# dsn 支持 `${ENV_VAR}`：变量未设置或替换后残留 `${` 拒绝装载；解析为空时由 serve /
+# db migrate / db import / db verify --target / db switch 启动即拒绝。日志与 /info 不回显本值。
+database:
+  dsn: ${BASALT_DATABASE_DSN}   # postgres://user:password@host:5432/dbname?sslmode=disable
+  # 可选（0 / 缺省交消费方取值）：max_conns / min_conns /
+  # connect_timeout_seconds / statement_timeout_seconds / lock_timeout_seconds
+
+# 知识库栈（US-16）：向量化 / 切分 / 检索三段。整段省略即用实现缺省；
+# 写了"不可能成立"的取值（负数、越界比例、只配一半）一律拒绝启动并点名配置键。
+# Knowledge stack: embedding, chunking and retrieval; omission means the documented
+# defaults and impossible values refuse startup with the offending key named.
+
+# 向量化段：凭证不在这里——`model_connection` 复用已发布的模型连接（providers 里的
+# name），基址与凭证全部沿用，不新立凭据类。
+# **条件必填**：model_connection 为空 = 语义路径关闭（检索降级为关键词，诊断记
+# `vector_unavailable`）；一旦写了连接，model 与 dimensions 必须同时给出，缺一拒绝启动。
+embedding:
+  model_connection: ""       # 空 = 不启用向量；填 providers 里的 name 才走语义检索
+  # model: text-embedding-v4 # 写了 model_connection 即必填
+  # dimensions: 512          # 写了 model_connection 即必填；必须等于冻结列宽 512（D-05），
+  #                          # 其它值在启动固定代际 / 摄取时失败关闭
+  # batch_size: 32           # 缺省 32（单次 embedding 的文本条数上限）
+  # timeout_seconds: 30      # 缺省 30（单批超时，秒）
+
+# 知识库段：单文件上限、可摄取扩展名与切分参数（切分 version 随条目落库）。
+knowledge:
+  max_document_bytes: 20971520     # 缺省 20 MiB；超限的文档拒绝摄取
+  allowed_extensions: [.md, .txt]  # 缺省 .md/.txt；写了即白名单，大小写不敏感
+  chunk:
+    max_tokens: 400                # 缺省 400（切分窗口，按 token 计）
+    overlap_tokens: 60             # 缺省 60；必须小于 max_tokens，否则切分无法前进
+    version: v1                    # 缺省 v1；换策略即换版本，旧条目保持可读
+
+# 检索段：融合参数（RRF）与重排开关。
+retrieval:
+  top_k: 8            # 缺省 8（最终命中数）
+  candidate_k: 40     # 缺省 40（单路候选数，不会被取到小于 top_k）
+  rrf_k: 60           # 缺省 60（RRF 平滑参数）
+  ef_search: 0        # 契约声明键，本版本未接线：当前无 HNSW 索引，向量路走精确扫描，
+                      # 写非零不会生效（不静默改变检索行为）
+  rerank:
+    enabled: false    # 缺省 false；本版本重排未交付，写 true 会在装配期失败关闭
+    # timeout_seconds: 10        # enabled: true 时生效
+    # model_connection: qwen     # enabled: true 时必填（重排使用的已发布连接名）
 
 # 服务段：监听地址与请求体上限（安全默认：只听本机，远程访问必须显式改）
 http:
@@ -41,6 +89,33 @@ http:
 server:
   max_concurrent_runs: 32     # 实例并发运行上限；缺省/0 = 32，超出返回 429（准入不是限流）
 
+# 调用方接入段（US-16）：三类业务入口的**每调用方**内存令牌桶。
+# ⚠ `callers.ingress` 的**六项在 `basalt serve` 启动前校验**（`ValidateServeIngress`）：
+#   缺任一项或取值 ≤ 0 → **服务拒绝启动**并点名缺项（不是运行期 429）。
+#   维护命令（`db export` / `db import` 等）不需要这六项，旧配置仍可装载。
+#   运行期语义：超预算的请求返回 429 CALLER_RATE_LIMITED；管理端点（admin token）
+#   不进任何桶。阈值（D-30）尚未随容量实测冻结，因此本样例**不预填数字**——按实测
+#   填好三类值后取消注释。重启后计数清零，只丢突发额度，不丢审计与配额。
+callers:
+  local_admin:
+    # 缺省 true：内置管理员不写配额预留行（并发名额、超时与审计照常约束）。
+    # ⚠ 改成 false 之前先写 `caller_limits` 行：`seedBuiltinCaller` 只建 callers 行、
+    #   不建限额行，缺行按失败关闭——内置管理员自己的 Run / 消耗调用会被 429
+    #   QUOTA_EXHAUSTED 拒绝（不是"限流"，是配额）。
+    unlimited: true
+  # unauthenticated_qps: <N>  # 契约声明键，本版本未接线：业务路由先经认证，
+                            # 未鉴权请求不进限流器
+  # ingress:
+  #   run:    { qps: <N>, burst: <M> }   # Run / Chat / 会话写
+  #   ingest: { qps: <N>, burst: <M> }   # 上传与摄取触发
+  #   read:   { qps: <N>, burst: <M> }   # 历史 / 来源 / 列表等读端点
+
+# 诊断事件段（US-16）：采样与保留期。**审计不受本节影响**——诊断可采样、可丢弃，
+# 审计记录始终全量落库（fail-closed）。
+diagnostics:
+  retention_days: 7           # 缺省 7 天；超期清理不阻塞业务；负数拒绝启动
+  sample_rate: 1.0            # 缺省 1.0（全采）；0 = 不采（只剩审计）；取值须在 0–1
+
 # 托管凭据的主密钥（US-12 范围修订；出处 docs/Operations.md §6.1）。
 # 主密钥是 AES-256-GCM 的 32 字节密钥，单独存放且路径必须在工作区之外；
 # 本文件只写路径——密钥内容不得写进 basalt.yaml、环境变量或工作区任何文件。
@@ -59,7 +134,7 @@ log:
 # 每条连接的凭证二选一（`credential_mode` 显式声明，不按值的形态推断）：
 #   env     —— 本文件写 `api_key: ${VAR}`；显式 `credential_mode: env` 或省略（省略只按 env 规则：
 #              非 `${VAR}` 的非空值 → 400 CREDENTIAL_MODE_REQUIRED，不隐式转 managed）；
-#   managed —— 管理台录入，密文存 SQLite；服务端在本文件写 `credential_mode: managed` 与只读
+#   managed —— 管理台录入，密文存数据库（PostgreSQL）；服务端在本文件写 `credential_mode: managed` 与只读
 #              `credential_ref: cred_...`，`api_key` 不再出现；客户请求体出现 `credential_ref` → 400。
 # 使用范围（`shared` / `exclusive` + 所有者 Agent）不写在本文件：
 # 由管理面 `POST /resources/model_connection/{name}/scope` 存入数据库，运行时资格 = 共享 ∪ 本人专属。
@@ -85,6 +160,22 @@ budget:
   max_output_bytes: 262144  # 单工具输出 256 KB（读取中截断）
   context_tokens: 32768     # 上下文 token 硬上限
 
+# 会话压缩段（US-16）：超长会话是否主动摘要。
+# 关闭（缺省）时行为与升级前一致——不压缩，超限走整组裁剪或显式拒绝。
+# 打开必须给全八个配套键（D-24：装载层不预填阈值，数值由容量实验冻结），
+# 缺任一即拒绝启动并**一次列全**缺失键，避免部署者反复重启试错。
+compaction:
+  enabled: false                      # 缺省 false
+  # 以下八个键仅在 enabled: true 时必填：
+  # trigger_ratio: <0<r<1>            # 主动压缩触发比例（投影超过 r × 可用输入即触发）
+  # keep_recent_groups: <N>           # 保留最近完整工具组数
+  # summary_max_tokens: <N>           # 摘要调用**自身**的输出上限（与下一条分开）
+  # output_reserve_tokens: <N>        # 本轮回复预留，参与投影判定
+  # safety_margin_ratio: <0<=r<1>     # 估算误差缓冲，同时收紧触发线与压缩后准入线
+  # timeout_seconds: <N>              # 摘要调用超时，与 Run 取消共用 ctx
+  # prompt_version: <v>               # 摘要模板版本，进条目与装配记录
+  # strategy_version: <v>             # 切点 / 预算策略版本，进条目与装配记录
+
 # 沙箱白名单（WhitelistPolicy 的配置入口；逐项以 docs/TechnicalDesign.md §4.3 为准）
 sandbox:
   cross_agent_read: []      # 允许读取的其它 Agent 名；缺省空 = 一个都不许
@@ -93,9 +184,11 @@ shell:
   interpreters: []          # 解释器受控通道：只接受 [脚本路径, 参数…] 形态
   env_passthrough: [PATH, HOME, LANG, TZ]  # 子进程不继承完整环境，只透传这些
 
-# 记忆后端：markdown（缺省）/ sqlite / mem0——换后端只改这一行
-memory:
-  backend: markdown
+# 记忆载体：运行时唯一载体为 PostgreSQL（D-18），没有后端开关。
+# 旧的 `memory.backend`（markdown / sqlite）已退役——**写它即拒绝启动**（不静默忽略）。
+# 迁移：删去该键 → 旧 SQLite 记忆随 `basalt db import` 进 PG → 旧 markdown 记忆
+# （memory/MEMORY.md 与 memory/agents/<name>/MEMORY.md）由 `basalt db switch` 一次性
+# 只读导入、逐条对账；原文件保留作回退层（D-22）。
 
 # 作者模型段（US-12）：管理台「一句话生成 Agent 文件」的单次草稿调用。
 # 删除整段即关闭一句话生成（作者功能关闭）；保留段但省略 provider / model 时启动

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "id": "us16-real",
+  "approval": "Human review ① 2026-10-27 passed for module card docs/us/us16-knowledge-memory-history.md (sha256 71136344add5e57631fe1bdc3599d63b80243ab7927d61178ec3c2e3045b665d) under the user's standing authorization of 2026-10-27 to let Claude conduct the US-16 technical review (recorded as delegated review, never as the user's line-by-line review). Derived from module card §4.6 by module-dev step 6.1; the stage grants no approval by itself, never enters current.json or CI, and runs only at closeout under the authorized ref user-2026-10-27-us16-external. External checks require runtime --authorization-ref and --authorization-scope: when BASALT_EXTERNAL_AUTH_REF / BASALT_EXTERNAL_AUTH_SCOPE are unset the call site passes no flags and the runner exits 2, sends nothing and writes no record (C-15).",
+  "inputs": [
+    "docs/us/us16-knowledge-memory-history.md",
+    "specs/016-knowledge-memory-history/spec.md",
+    "specs/016-knowledge-memory-history/plan.md",
+    "specs/016-knowledge-memory-history/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "harness/stages/us16-real.json"
+  ],
+  "checks": [
+    {
+      "id": "us16-external",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e real",
+        "./internal/e2e",
+        "-run",
+        "^TestUS16External_"
+      ],
+      "timeout_seconds": 1800,
+      "required_tests": [
+        "TestUS16External_EmbeddingIngest",
+        "TestUS16External_EmbeddingQuery",
+        "TestUS16External_DeepSeekChat",
+        "TestUS16External_IndustryBriefSearch",
+        "TestUS16External_GitHubMcpReadOnly",
+        "TestUS16External_FeishuNotify",
+        "TestUS16External_FiveAgentsInventory"
+      ],
+      "level": "external"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "us16",
+      "checks": [
+        "us16-external"
+      ]
+    }
+  ]
+}

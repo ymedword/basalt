@@ -119,6 +119,7 @@
         "test",
         "-json",
         "-count=1",
+        "-tags=integration",
         "./internal/app",
         "-run",
         "^TestInstanceSecrets"
@@ -131,7 +132,7 @@
         "TestInstanceSecrets_ConcurrentSingleWinner",
         "TestInstanceSecrets_AdoptAfterRecordFailure",
         "TestInstanceSecrets_ExistingInstanceNotAutoInit",
-        "TestInstanceSecrets_AdoptMatchesCiphertext",
+        "TestInstanceSecrets_NoRecordWithCiphertextStaysRecovery",
         "TestInstanceSecrets_RefusesOverwrite",
         "TestInstanceSecrets_DistinctPerInstance",
         "TestInstanceSecrets_RecoversPublicationResidue",

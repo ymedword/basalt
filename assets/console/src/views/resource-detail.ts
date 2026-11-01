@@ -224,7 +224,7 @@ export const ResourceDetailView = defineComponent({
           return { view: detail.data, etag: detail.etag }
         }
         case 'skills': {
-          const detail = await client.getSkill(id)
+          const detail = await client.getSkillForEdit(id)
           return { view: detail.data, etag: detail.etag }
         }
       }
@@ -1384,10 +1384,10 @@ export const ResourceDetailView = defineComponent({
       return h('div', {}, [
         definitions([
           ['名称', identifier(item.name)],
-          ['描述', item.description === '' ? '—' : item.description],
+          ['描述', item.description === '' ? '未填写简介' : item.description],
           ['当前版本', `v${item.version_no}`],
           ['文件数', String(item.file_count)],
-          ['配置引用 Agent', item.referenced_by.length === 0 ? '无' : item.referenced_by.join('、')],
+          ['运行占用（Run ID）', item.referenced_by.length === 0 ? '无' : item.referenced_by.join('、')],
         ]),
         h('details', { class: 'technical-details' }, [
           h('summary', '技术细节'),
@@ -1496,6 +1496,16 @@ export const ResourceDetailView = defineComponent({
       const value = references.data.value
       if (value === null) {
         return references.loading.value ? h('p', { class: 'muted' }, '加载中…') : null
+      }
+      if (kind === 'skills') {
+        return h('div', {}, [
+          definitions([
+            ['声明或可能引用的 Agent', value.agents.length === 0 ? '无' : value.agents.join('、')],
+            ['运行占用（Run ID）', value.active_runs.length === 0 ? '无' : value.active_runs.join('、')],
+          ]),
+          h('p', { class: 'muted small' },
+            '按 Agent 定义中的技能声明检查；定义无法解析时也会列为可能引用。此处不表示 Agent 已注册或正在运行。'),
+        ])
       }
       return h('div', {}, [
         definitions([

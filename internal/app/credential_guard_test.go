@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖模型调用前的凭据检查点（模块卡 R4.8 / T131、FR-078）：
@@ -143,9 +145,9 @@ func TestCredentialGuard_RejectsBlankCiphertext(t *testing.T) {
 	f, guard, credID := newGuardFixture(t)
 	// "未撤销却没有密文"在库层面就被 CHECK 约束禁止（revoked 才允许 NULL）；
 	// 检查点里的密文判定因此是纵深防御，不是可复现路径。
-	raw := openRawWrite(t, f.dbPath)
+	raw := openRawWrite(t, f.dsn)
 	_, err := raw.ExecContext(ctx,
-		`UPDATE credential_versions SET ciphertext = NULL WHERE credential_id = ? AND version_no = 1`,
+		`UPDATE credential_versions SET ciphertext = NULL WHERE credential_id = $1 AND version_no = 1`,
 		credID)
 	require.Error(t, err, "schema 必须拒绝 active 版本没有密文")
 	require.NoError(t, guard.Check(ctx, guardRef(credID)))

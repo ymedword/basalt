@@ -3,12 +3,17 @@
 package e2e
 
 // 本文件是进程级回填的编排层（模块卡 §3.1.1）：构建一次真实二进制，然后用临时工作
-// 目录、显式环境变量与标准流驱动它。断言只读三处——进程输出、退出码、工作区里的
-// SQLite 库——不调用任何包内函数。
-// This file is the orchestration layer for the process-level backfill: it builds the
-// real binary once and drives it through a temporary work directory, explicit
-// environment variables and the standard streams. Assertions read three surfaces
-// only: process output, exit code, and the SQLite database inside the workspace.
+// 目录、显式环境变量与标准流驱动它。断言读三处——进程输出、退出码、判卷侧数据库连接
+// ——不调用任何包内函数。
+//
+// US-16 起运行期存储只有 PostgreSQL：每个 `newHarness` 在测试库上建一个**隔离 schema**
+// （`pgtemp`），DSN 只经进程环境交给被测二进制与判卷连接，**不落盘**；配置里只写
+// `${BASALT_E2E_DSN}` 占位（明文 DSN 会被装载层拒绝）。工作区里的 SQLite 文件仍是
+// `init` 的**源谱系**产物（v6，`db export` / 迁移演练的输入），不是运行期库——只有
+// 专门判源库形态的用例才读它（`openSQLite`）。
+// Since US-16 the runtime store is PostgreSQL only: every harness owns one isolated
+// schema, its DSN travels through the environment only, and the workspace SQLite file is
+// the bootstrap *source* lineage that only source-shape cases read.
 
 import (
 	"bytes"
@@ -21,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -32,7 +38,10 @@ import (
 	"testing"
 	"time"
 
-	// 判卷侧走裸连接读库（与 internal/app 的既有先例同一手法）。
+	// 判卷侧走裸连接读库（与 internal/app 的既有先例同一手法）：运行期读 PG，源谱系
+	// 形态用例读工作区 SQLite。
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtemp"
 	_ "modernc.org/sqlite"
 )
 
@@ -63,6 +72,16 @@ const (
 	// readinessPoll 是 waitHTTP 的轮询间隔——回环上起停，25ms 足够细。
 	// readinessPoll is the readiness polling interval.
 	readinessPoll = 25 * time.Millisecond
+
+	// dsnEnv 是判卷 schema 连接串交给被测进程的通道之一（配置里只有占位符）；
+	// 名字以 `_DSN` 结尾，`secretEnvKey` 因此把它登记成需要脱敏的值。
+	// dsnEnv is one channel that carries the fixture DSN into the child process.
+	dsnEnv = "BASALT_E2E_DSN"
+
+	// generatedDSNEnv 是新实例**生成模板**里 `database.dsn` 逐字引用的变量名：夹具写出
+	// 的配置引用 dsnEnv，产品自己生成的配置引用这个名字，两者都指向本用例的隔离 schema。
+	// generatedDSNEnv is the variable name the generated template references verbatim.
+	generatedDSNEnv = "BASALT_DATABASE_DSN"
 )
 
 // binaryPath / binarySHA256 / binarySource / expectedVersion 由 TestMain 决定一次后写入；
@@ -284,9 +303,21 @@ type harness struct {
 	Binary       string // 被测二进制绝对路径
 	BinarySHA256 string // 构建后计算，TestMain 打印 `binary_sha256=` 供回填记录引用
 
+	// Schema 是本用例独占的隔离 schema（`pgtemp`）：`DSN` 的 search_path 钉在它上面，
+	// 用例之间的库对象因此互不可见。回收由 `newHarness` 注册，进程清理先于 drop。
+	// Schema is the per-case isolated schema; its DSN pins search_path to it.
+	Schema pgtemp.Schema
+
 	runTimeout time.Duration
 	mu         sync.Mutex
 	secrets    []string
+	// verdictDB 是判卷侧连接池（`openDB` 惰性建一次）：与 `mu` 同锁，因为两者都在
+	// 测试主协程上用，锁只是为了让"惰性建池"这件事没有第二份解释。
+	// verdictDB caches the verdict-side pool; it is created lazily under the same mutex.
+	verdictDB *sql.DB
+	// storeReady 记住本用例的运行期 schema 已被 `ensureStore` 迁到当前版本。
+	// storeReady records that ensureStore already migrated this case's schema.
+	storeReady bool
 
 	// notifyChannels 是夹具登记的通知渠道（`insertNotifyChannel` 写入）：重命令启动前
 	// 补给声明 `notify` 工具的 Agent——R4 起 Run 只冻结定义里声明过的渠道。
@@ -308,12 +339,40 @@ func newHarness(t *testing.T) *harness {
 	if binaryPath == "" {
 		t.Fatal("被测二进制未构建——TestMain 未运行或构建失败")
 	}
-	return &harness{
+	schema := newIsolatedSchema(t)
+	h := &harness{
 		Root:         t.TempDir(),
 		Binary:       binaryPath,
 		BinarySHA256: binarySHA256,
+		Schema:       schema,
 		runTimeout:   defaultRunTimeout,
 	}
+	// 回收次序：Cleanup 后进先出——进程都杀完之后才 drop schema，否则 DROP 会撞上
+	// 仍持有的连接。drop 失败判红（残留 schema 会让下一轮的"空库"前提失真）。
+	// LIFO cleanup: every process is killed before the schema is dropped; a failed drop
+	// fails the test, since leftovers would poison the next run's "empty schema" premise.
+	t.Cleanup(func() {
+		if err := schema.Drop(context.Background()); err != nil {
+			t.Errorf("回收隔离 schema %s 失败: %v", schema.Name, err)
+		}
+	})
+	return h
+}
+
+// newIsolatedSchema 在测试库上建一个隔离 schema；缺 DSN 时直接判红并给出排查路径
+// （D-01：缺省即失败，不跳过——跳过会让"整套 e2e 变红"退化成"整套 e2e 不跑"）。
+// newIsolatedSchema provisions one isolated schema; a missing DSN fails closed.
+func newIsolatedSchema(t *testing.T) pgtemp.Schema {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	schema, err := pgtemp.New(ctx, "basalt_e2e_")
+	if err != nil {
+		t.Fatalf("建隔离 schema 失败（e2e 运行期存储只有 PostgreSQL，D-01：缺 %s 即失败、不跳过）: %v\n"+
+			"本地：启动 dev-env 测试库并经 dev-env/scripts/with-postgres.sh 运行；CI：使用 postgres service 注入的 DSN",
+			pgtemp.TestDSNEnv, err)
+	}
+	return schema
 }
 
 // timeout 返回短命命令的时限；用例可经 setRunTimeout 放大（慢速场景）。
@@ -342,7 +401,7 @@ func (h *harness) setRunTimeout(d time.Duration) {
 // Variables not overridden are inherited unchanged; credential overrides live only
 // in the child environment and memory.
 func (h *harness) environ(extra []string) []string {
-	merged := make(map[string]string, len(os.Environ())+len(extra))
+	merged := make(map[string]string, len(os.Environ())+len(extra)+1)
 	for _, kv := range os.Environ() {
 		key, value, ok := strings.Cut(kv, "=")
 		if !ok {
@@ -350,6 +409,19 @@ func (h *harness) environ(extra []string) []string {
 		}
 		merged[key] = value
 	}
+	// 判卷 schema 的连接串在**每次**调用都覆盖：它是本用例的隔离前提，绝不能被开发机
+	// 继承来的同名变量（或残留配置）顶替。真值只在这里进子进程环境，不落盘。
+	// The fixture DSN is always overwritten here: it is this case's isolation premise and
+	// must never be replaced by an inherited variable.
+	merged[dsnEnv] = h.Schema.DSN
+	h.registerSecret(dsnEnv, h.Schema.DSN)
+	// 新实例生成的模板引用的是 `BASALT_DATABASE_DSN`（不是夹具自己写的 `dsnEnv`）：
+	// 两个名字都指向本用例的隔离 schema，生成配置因此与夹具写出的配置落到同一个库上。
+	// 需要"DSN 未提供"读数的用例在 extra 里传同名项覆盖（extra 永远后写）。
+	// The generated template names BASALT_DATABASE_DSN; both names point at the same
+	// isolated schema, and an extra override always wins.
+	merged[generatedDSNEnv] = h.Schema.DSN
+	h.registerSecret(generatedDSNEnv, h.Schema.DSN)
 	for _, kv := range extra {
 		key, value, ok := strings.Cut(kv, "=")
 		if !ok {
@@ -366,11 +438,11 @@ func (h *harness) environ(extra []string) []string {
 	return out
 }
 
-// secretEnvKey 认定需要脱敏的变量名：凭证键与 URL（webhook 地址按凭证对待，
-// 证据里只允许出现 scheme://host）。
+// secretEnvKey 认定需要脱敏的变量名：凭证键、URL（webhook 地址按凭证对待，证据里只
+// 允许出现 scheme://host）与连接串（`_DSN`——测试库口令就写在里面）。
 // secretEnvKey names the variables whose values must never reach diagnostics:
-// credential keys and URLs (webhook addresses are treated as credentials).
-var secretEnvKey = regexp.MustCompile(`(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD|_URL)$`)
+// credential keys, URLs, and DSNs (the test password rides in the connection string).
+var secretEnvKey = regexp.MustCompile(`(?i)(_KEY|_TOKEN|_SECRET|_PASSWORD|_URL|_DSN)$`)
 
 func (h *harness) registerSecret(key, value string) {
 	if value == "" || !secretEnvKey.MatchString(key) {
@@ -573,12 +645,19 @@ func (p *process) waitHTTP(t *testing.T, url string, timeout time.Duration) {
 	t.Fatalf("等待 %s 就绪超时（%s，最后一次错误 %v）\n%s", url, timeout, lastErr, p.output())
 }
 
-// writeConfig 落一份 basalt.yaml（与 .basalt/ 同级）。
-// writeConfig writes basalt.yaml next to the workspace directory.
+// writeConfig 落一份 basalt.yaml（与 .basalt/ 同级）。`database.dsn` 由夹具统一注入，
+// 而且只写 `${VAR}` 占位——装载层拒绝明文 DSN，真值经 `environ` 走进程环境。
+// writeConfig writes basalt.yaml; the fixture injects database.dsn as a placeholder, and
+// the resolved value reaches the child only through the environment.
 func (h *harness) writeConfig(t *testing.T, body string) {
 	t.Helper()
 	path := filepath.Join(h.Root, "basalt.yaml")
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	content := "database:\n  dsn: ${" + dsnEnv + "}\n" + body
+	// 常规夹具显式提供限流预算；专门测试 callers 的夹具保留自己的配置与判据。
+	if !strings.Contains(body, "callers:") {
+		content += "\ncallers:\n  ingress:\n    run: {qps: 50, burst: 50}\n    ingest: {qps: 50, burst: 50}\n    read: {qps: 50, burst: 50}\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("写配置 %s 失败: %v", path, err)
 	}
 }
@@ -744,44 +823,135 @@ func (h *harness) writeLifecycleState(t *testing.T, name, state string, generati
 // at; without it the v3 index write fails its foreign key and admission refuses.
 func (h *harness) seedLifecycleOperation(t *testing.T, operationID, agent string, atMillis int64) {
 	t.Helper()
-	if _, err := os.Stat(h.dbPath()); errors.Is(err, os.ErrNotExist) {
-		return
-	} else if err != nil {
-		t.Fatalf("检查库文件 %s 失败: %v", h.dbPath(), err)
-	}
-	db := openDB(t, h.dbPath())
+	// 先确保运行期 schema 已迁到当前版本：SQLite 谱系里 `init` 建完了表，这里直接写；
+	// PostgreSQL 谱系的建表是独立一步，夹具在写行前补跑 `db migrate`（见 `ensureStore`）。
+	// The runtime schema is migrated first: init no longer creates the runtime tables.
+	h.ensureStore(t)
+	db := h.openDB(t)
 	if _, err := db.Exec(
-		`INSERT OR IGNORE INTO management_operations
+		`INSERT INTO management_operations
 		   (operation_id, action, target_kind, target_id, actor_subject, auth_method,
 		    source, status, result_code, created_at, finished_at)
-		 VALUES (?, 'agent.enable', 'agent', ?, 'cli:e2e-fixture', 'cli', 'cli',
-		         'success', 'OK', ?, ?)`,
-		operationID, agent, atMillis, atMillis); err != nil {
+		 VALUES ($1, 'agent.enable', 'agent', $2, 'cli:e2e-fixture', 'cli', 'cli',
+		         'success', 'OK', $3, $3)
+		 ON CONFLICT (operation_id) DO NOTHING`,
+		operationID, agent, atMillis); err != nil {
 		t.Fatalf("补启用操作行 %s（Agent %s）失败: %v", operationID, agent, err)
 	}
 }
 
-// dbPath 返回工作区里的库文件路径。
-// dbPath returns the database file inside the workspace.
+// dbPath 返回工作区里的**源谱系**库文件路径（`init` 建出的 SQLite v6，不是运行期库）。
+// dbPath returns the bootstrap source-lineage file, not the runtime database.
 func (h *harness) dbPath() string {
 	return filepath.Join(h.Root, ".basalt", "basalt.db")
 }
 
-// openDB 打开一条判卷侧连接；关闭失败也要判红（吞错会让临时目录清理掩盖问题）。
-// openDB opens a verdict-side connection; a close failure fails the test too.
-func openDB(t *testing.T, path string) *sql.DB {
+// openDB 打开判卷侧的运行期连接（本用例的隔离 schema）；关闭失败也要判红。同一夹具
+// 复用同一条连接池——它只在本 schema 内可见，重复开池没有额外隔离收益。
+// openDB opens (and caches) the verdict-side connection to this case's isolated runtime
+// schema; a close failure fails the test too.
+func (h *harness) openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.ToSlash(path))
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.verdictDB == nil {
+		h.verdictDB = openPG(t, h.Schema.DSN)
+	}
+	return h.verdictDB
+}
+
+// openPG 打开一条连到指定 DSN 的判卷侧连接；连接串只经内存传递，不进错误文案。
+// openPG opens a verdict-side connection; the DSN itself never reaches a message.
+func openPG(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		t.Fatalf("打开库 %s 失败: %v", path, err)
+		t.Fatalf("打开运行期库失败: %v", err)
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
-		t.Fatalf("连接库 %s 失败: %v", path, err)
+		t.Fatalf("连接运行期库失败（%s）: %v", pgtemp.TestDSNEnv, err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
-			t.Errorf("关闭库 %s 失败: %v", path, err)
+			t.Errorf("关闭运行期连接失败: %v", err)
+		}
+	})
+	return db
+}
+
+// ensureStore 把本用例的隔离 schema 迁到当前版本，供"**先造库内状态、再启动重命令**"的
+// 用例保持原有写法。SQLite 谱系里 `init` 自己就建表，夹具因此能在任何重命令之前直写
+// 库内行；PostgreSQL 谱系的建表是运维的第二步（`basalt db migrate`，`status` 的修复
+// 提示点名的正是它），夹具必须在写行之前补这一步，否则 `to_regclass` 查不到表、
+// 补的行落空，启动基线就会因外键缺行而丢掉 Agent 身份，准入随之拒绝。
+//
+// 迁移要读 `database.dsn`：临时写一份只含该段（占位符形态，真值经进程环境注入）的
+// 配置，迁完把调用方原来的配置文件逐字节还原——**不得**留下夹具写过的配置内容。
+// ensureStore migrates this case's schema first, the PG counterpart of init's DDL; the
+// caller's config file is restored byte for byte afterwards.
+func (h *harness) ensureStore(t *testing.T) {
+	t.Helper()
+	h.mu.Lock()
+	ready := h.storeReady
+	h.mu.Unlock()
+	if ready {
+		return
+	}
+
+	var present sql.NullString
+	if err := h.openDB(t).QueryRow(`SELECT to_regclass('schema_version')::text`).Scan(&present); err != nil {
+		t.Fatalf("检查运行期 schema 失败: %v", err)
+	}
+	if present.Valid && present.String != "" {
+		h.mu.Lock()
+		h.storeReady = true
+		h.mu.Unlock()
+		return
+	}
+
+	cfgPath := filepath.Join(h.Root, "basalt.yaml")
+	saved, readErr := os.ReadFile(cfgPath)
+	if readErr != nil && !errors.Is(readErr, fs.ErrNotExist) {
+		t.Fatalf("读取配置 %s 失败: %v", cfgPath, readErr)
+	}
+	if err := os.WriteFile(cfgPath, []byte("database:\n  dsn: ${"+dsnEnv+"}\n"), 0o600); err != nil {
+		t.Fatalf("写迁移用配置失败: %v", err)
+	}
+	res := h.run(t, nil, "db", "migrate")
+	// 无论迁移成败都先还原配置：失败信息里不该夹带夹具的临时写入。
+	// The caller's config is restored either way, so failures never leak fixture state.
+	if readErr != nil {
+		if err := os.Remove(cfgPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("移除迁移用配置失败: %v", err)
+		}
+	} else if err := os.WriteFile(cfgPath, saved, 0o600); err != nil {
+		t.Fatalf("还原配置 %s 失败: %v", cfgPath, err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("运行期 schema 迁移失败（db migrate）：退出码 = %d\nstdout:\n%s\nstderr:\n%s",
+			res.ExitCode, h.redact(res.Stdout), h.redact(res.Stderr))
+	}
+	h.mu.Lock()
+	h.storeReady = true
+	h.mu.Unlock()
+}
+
+// openSQLite 打开工作区里的**源谱系**库文件（v6）：只有判源库形态的用例用它。
+// openSQLite opens the bootstrap source-lineage file; only source-shape cases use it.
+func openSQLite(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.ToSlash(path))
+	if err != nil {
+		t.Fatalf("打开源库 %s 失败: %v", path, err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		t.Fatalf("连接源库 %s 失败: %v", path, err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("关闭源库 %s 失败: %v", path, err)
 		}
 	})
 	return db
@@ -1298,14 +1468,11 @@ func (h *harness) fixtureChannels() []fixtureChannel {
 // modelConnectionUID reads the published pointer identity of one model connection.
 func (h *harness) modelConnectionUID(t *testing.T, name string) (string, bool) {
 	t.Helper()
-	if _, err := os.Stat(h.dbPath()); err != nil {
-		return "", false
-	}
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	var uid string
 	err := db.QueryRow(
 		`SELECT resource_uid FROM resource_pointers
-		  WHERE resource_kind = 'model_connection' AND resource_id = ? AND deleted_at IS NULL`,
+		  WHERE resource_kind = 'model_connection' AND resource_id = $1 AND deleted_at IS NULL`,
 		name).Scan(&uid)
 	if err != nil || uid == "" {
 		return "", false

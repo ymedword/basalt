@@ -469,7 +469,10 @@ func TestProviderService_CanceledCallTerminalWriteFailurePreservesCancelChain(t 
 		finishFailingStore{fx.repo}, // 预写真写、终态必失败
 		&logs)
 
-	go func() { <-fakeP.Started(1); cancel() }()
+	// 先取信号通道再启动 goroutine：Started(1) 惰性建通道，若 Chat 先进入
+	// 就查不到通道、不关信号，测试会永久等待（覆盖插桩下已实测触发）。
+	started := fakeP.Started(1)
+	go func() { <-started; cancel() }()
 	_, err := svc.Chat(ctx, core.ChatRequest{Provider: "fake", RunID: "run-test", Round: 1})
 
 	require.ErrorIs(t, err, context.Canceled, "终态写失败不得覆盖取消错误链")
@@ -494,8 +497,10 @@ func TestProviderService_CancelDuringCallRecordsTimeoutKind(t *testing.T) {
 	defer cancel()
 	svc, fx, fakeP := newServiceWithRepo(t, testutil.FakeStep{Block: true})
 
+	// 先取信号通道再启动 goroutine；Started(1) 惰性建通道，晚取会漏掉已进入的调用。
+	started := fakeP.Started(1)
 	go func() {
-		<-fakeP.Started(1) // 调用确已进入（此时预写必然已完成）
+		<-started // 调用确已进入（此时预写必然已完成）
 		cancel()
 	}()
 	_, err := svc.Chat(ctx, core.ChatRequest{Provider: "fake", RunID: "run-test", Round: 1})

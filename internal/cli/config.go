@@ -30,15 +30,28 @@ import (
 // ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
 // entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
-	HTTP      HTTPConfig       `yaml:"http"`
-	Server    ServerConfig     `yaml:"server"`
-	Log       LogConfig        `yaml:"log"`
-	Providers []ProviderConfig `yaml:"providers"`
-	Budget    BudgetConfig     `yaml:"budget"`
-	Sandbox   SandboxConfig    `yaml:"sandbox"`
-	Shell     ShellConfig      `yaml:"shell"`
-	Memory    MemoryConfig     `yaml:"memory"`
-	Secrets   SecretsConfig    `yaml:"secrets"`
+	// 服务入口需要区分键缺失与显式零值；不属于可序列化配置。
+	ingressMissing []string         `yaml:"-"`
+	HTTP           HTTPConfig       `yaml:"http"`
+	Server         ServerConfig     `yaml:"server"`
+	Log            LogConfig        `yaml:"log"`
+	Providers      []ProviderConfig `yaml:"providers"`
+	Budget         BudgetConfig     `yaml:"budget"`
+	Sandbox        SandboxConfig    `yaml:"sandbox"`
+	Shell          ShellConfig      `yaml:"shell"`
+	Memory         MemoryConfig     `yaml:"memory"`
+	Secrets        SecretsConfig    `yaml:"secrets"`
+	// US-16 的七段（§3.3 的 43 个键）：装载层只做类型化解析与「取值不可能成立」
+	// 的判定；缺省与必填按子命令分流（dsn）或按消费方落位时判（§3.1.9 / D-24）。
+	// The seven US-16 sections: parsing and impossible-value checks only; defaults
+	// and requiredness belong to the consumer or the subcommand gate.
+	Database    DatabaseConfig    `yaml:"database"`
+	Embedding   EmbeddingConfig   `yaml:"embedding"`
+	Knowledge   KnowledgeConfig   `yaml:"knowledge"`
+	Retrieval   RetrievalConfig   `yaml:"retrieval"`
+	Callers     CallersConfig     `yaml:"callers"`
+	Diagnostics DiagnosticsConfig `yaml:"diagnostics"`
+	Compaction  CompactionConfig  `yaml:"compaction"`
 	// Execution 是执行档位段（`execution`，14D）：**只作首次种子**——落库之后以库为准，
 	// 改这里不会覆盖管理台写入的值（与 `http.allowed_domains` 同一口径）。
 	// The execution section seeds the profile once; the database is authoritative after.
@@ -257,19 +270,286 @@ type BudgetConfig struct {
 	ContextTokens  int   `yaml:"context_tokens"`
 }
 
-// MemoryConfig 是长期记忆的配置面（`memory` 段，US-6 落位）。
-// MemoryConfig is the memory section, landed by US-6.
+// MemoryConfig 是长期记忆的配置面（`memory` 段，US-6 落位；US-16 起整段退役）。
+// MemoryConfig is the memory section; it is retired as of US-16.
 //
-// 只有一个键：载体档位。取值域只有两档，由 validateConfig 判卷（fail-closed）；
-// 空串（不写 memory 段 / 写了段省略 backend 两条路径）在装载期**就地归一到 markdown**
-// ——缺省只有一个来源，下游读到的一定是两档之一，不必各自再写一遍缺省分支。
-// The only key is the carrier backend; the empty value is normalized to the default
-// at load time so downstream code never re-decides what "unset" means.
+// 本段**没有合法键**：运行时长期记忆唯一载体为 PostgreSQL（D-18），载体档位不再可配。
+// 保留结构体只是为了让 `memory.backend` 能被解码到可判错的形态——是否出现由
+// `validateUS16Sections` 对原始树判（存在即拒绝启动），而不是靠解码器静默吞掉。
+// No key is legal here any more: the runtime carrier is PostgreSQL only, and the
+// validator refuses the retired key from the raw tree.
 type MemoryConfig struct {
-	// Backend 取 markdown（缺省，人可读可手改）/ sqlite（可并发可查询）；
-	// 其余取值（含 mem0）拒绝启动并点名键与取值。
-	// Backend is markdown (default) or sqlite; anything else fails closed.
+	// Backend **已退役**（D-18）：运行时长期记忆唯一载体为 PostgreSQL，字段只为让
+	// `memory.backend` 能被解码到可判错的形态——键一出现，`validateUS16Sections`
+	// 就在校验期拒绝启动。校验通过时它恒为空串，任何代码**不得**再按它分流。
+	// Backend is retired: the field exists only so the key decodes to something the
+	// validator can refuse. After validation it is always empty.
 	Backend string `yaml:"backend"`
+}
+
+// DatabaseConfig 是 PostgreSQL 连接段（`database`，US-16 §3.3）。
+// DatabaseConfig is the PostgreSQL connection section (US-16 §3.3).
+//
+// **本段不写缺省数字**：装载层只判「取值不可能成立」（负数），缺省取值归消费方
+// ——连接池参数由 `internal/storage/postgres` 决定；`dsn` 的必填性按**子命令**
+// 分流（§3.1.9）：`db export` / `db verify --dump|--handoff` 离线可用、不要求
+// DSN，`serve` / `db migrate` / `db import` / `db verify --target` / `db switch`
+// 启动即 fail-closed。
+// No defaults live here: the loader only rejects impossible values and the
+// consumer owns defaults. DSN requiredness is per-subcommand, not global.
+type DatabaseConfig struct {
+	// DSN 支持 `${ENV_VAR}`：变量缺失或解析后残留 `${` 由装载层拒绝（resolveString）；
+	// 解析为空是合法装载结果，由要求 DSN 的子命令在启动时拒绝。日志与 `/info`
+	// **不得**回显本值（它通常带口令）。
+	// The DSN supports ${ENV_VAR}; unresolved placeholders are refused at load time,
+	// while the empty value is refused by the subcommands that require a database.
+	DSN string `yaml:"dsn"`
+
+	// MaxConns / MinConns 是连接池上限与空闲保底；两者都不得为负，
+	// min > max 同样不可能成立，一并拒绝。
+	// Pool bounds; negatives and min > max are impossible and refused.
+	MaxConns int `yaml:"max_conns"`
+	MinConns int `yaml:"min_conns"`
+
+	// ConnectTimeoutSeconds / StatementTimeoutSeconds / LockTimeoutSeconds 分属
+	// 建连、每条语句（逐连接设置）与锁等待上限；负数拒绝，0 交消费方取缺省。
+	// Per-connection timeouts; negatives are refused, zero defers to the consumer.
+	ConnectTimeoutSeconds   int `yaml:"connect_timeout_seconds"`
+	StatementTimeoutSeconds int `yaml:"statement_timeout_seconds"`
+	LockTimeoutSeconds      int `yaml:"lock_timeout_seconds"`
+}
+
+// EmbeddingConfig 是向量化段（`embedding`，US-16 §3.3）：凭据不在这里——
+// `model_connection` 复用 `model-connections` 的目标与凭据，不新立凭据类。
+// EmbeddingConfig is the embedding section; credentials come from the referenced
+// model connection rather than a second credential class.
+//
+// **条件必填**：`model_connection` 为空时本段是空操作（语义路径降级为关键词并在
+// `/info` 与诊断事件里标 `vector_unavailable`），一旦写了连接，`model` 与
+// `dimensions` 就必须给出——只配一半等于"以为开了语义检索、实际没开"。
+// Empty model_connection disables the semantic path explicitly; a written
+// connection requires model and dimensions.
+type EmbeddingConfig struct {
+	// ModelConnection 是 `model-connections` 里的连接名（沿用既有凭据面）。
+	// ModelConnection names an existing model connection.
+	ModelConnection string `yaml:"model_connection"`
+
+	// Model 是模型 id（如 `text-embedding-v4`），连接非空时必填。
+	// Model is the embedding model id; required when the connection is set.
+	Model string `yaml:"model"`
+
+	// Dimensions 是向量维度，连接非空时必填；启动时还要与 active 代际比对
+	// （由 `internal/knowledge` 判定，装载层只判正数）。
+	// Dimensions is required with a connection; the generation comparison runs at
+	// startup in internal/knowledge, not here.
+	Dimensions int `yaml:"dimensions"`
+
+	// BatchSize / TimeoutSeconds 是单批上限与单批超时；负数拒绝。
+	// Batch size and per-batch timeout; negatives are refused.
+	BatchSize      int `yaml:"batch_size"`
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+}
+
+// KnowledgeConfig 是知识库段（`knowledge`，US-16 §3.3）。
+// KnowledgeConfig is the knowledge section (US-16 §3.3).
+type KnowledgeConfig struct {
+	// MaxDocumentBytes 是单文件上限；负数拒绝。
+	// MaxDocumentBytes caps one document; negatives are refused.
+	MaxDocumentBytes int64 `yaml:"max_document_bytes"`
+
+	// AllowedExtensions 是首批可摄取类型（带点，如 `.md`）；空表示一个都不放行，
+	// 由摄取侧判"无白名单 = 全拒"，装载层不替它决定。
+	// AllowedExtensions lists ingestible types; empty means nothing is accepted,
+	// which the ingest path enforces rather than the loader.
+	AllowedExtensions []string `yaml:"allowed_extensions"`
+
+	// Chunk 是切分参数；`version` 进 `kb_versions` 行与装配记录，**不是**可选补充。
+	// Chunk carries the split parameters; version is recorded, not optional.
+	Chunk ChunkConfig `yaml:"chunk"`
+}
+
+// ChunkConfig 是切分参数段（`knowledge.chunk`，US-16 §3.3）。
+// ChunkConfig is the chunking section.
+type ChunkConfig struct {
+	// MaxTokens / OverlapTokens 是切分窗口与相邻重叠；负数拒绝。
+	// Window size and overlap; negatives are refused.
+	MaxTokens     int `yaml:"max_tokens"`
+	OverlapTokens int `yaml:"overlap_tokens"`
+
+	// Version 是切分策略版本（如 `v1`），随条目落库，换策略即换版本。
+	// Version is the split-strategy version recorded with every chunk.
+	Version string `yaml:"version"`
+}
+
+// RetrievalConfig 是检索段（`retrieval`，US-16 §3.3）。
+// RetrievalConfig is the retrieval section (US-16 §3.3).
+type RetrievalConfig struct {
+	// TopK / CandidateK 是最终返回与候选集规模；负数拒绝。
+	// Final and candidate widths; negatives are refused.
+	TopK       int `yaml:"top_k"`
+	CandidateK int `yaml:"candidate_k"`
+
+	// RRFK 是倒数排名融合的平滑参数；负数拒绝。
+	// RRFK is the reciprocal-rank-fusion constant; negatives are refused.
+	RRFK int `yaml:"rrf_k"`
+
+	// Rerank 是重排子段（缺省关闭）。
+	// Rerank is the rerank sub-section, off by default.
+	Rerank RerankConfig `yaml:"rerank"`
+
+	// EFSearch 是 HNSW 查询期参数（索引启用时生效）；负数拒绝。
+	// EFSearch is the HNSW query-time parameter; negatives are refused.
+	EFSearch int `yaml:"ef_search"`
+}
+
+// RerankConfig 是重排子段（`retrieval.rerank`，US-16 §3.3）。
+// RerankConfig is the rerank sub-section.
+type RerankConfig struct {
+	// Enabled 缺省 false；启用时 `model_connection` 必填（装载期判），
+	// 超时降级留痕由检索侧负责。
+	// Off by default; enabling it requires a model connection.
+	Enabled bool `yaml:"enabled"`
+
+	// TimeoutSeconds 是重排调用超时；负数拒绝。
+	// TimeoutSeconds bounds one rerank call; negatives are refused.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+
+	// ModelConnection 是重排使用的既有模型连接名。
+	// ModelConnection names an existing model connection.
+	ModelConnection string `yaml:"model_connection"`
+}
+
+// CallersConfig 是调用方接入段（`callers`，US-16 §3.3）。
+// CallersConfig is the caller-ingress section (US-16 §3.3).
+//
+// 三组键的**必填**在消费方落位时判（限流器接线）：本段只承载取值与「不可能成立」
+// 的判定，装载层**不**给阈值预填缺省——静默缺省等于悄悄换了一套限额。
+// Requiredness of these keys is enforced when the limiter lands; the loader never
+// fills a threshold default.
+type CallersConfig struct {
+	// UnauthenticatedQPS 是未鉴权入口的独立保护（每个来源每秒请求数）；负数拒绝。
+	// UnauthenticatedQPS protects the unauthenticated ingress; negatives are refused.
+	UnauthenticatedQPS int `yaml:"unauthenticated_qps"`
+
+	// LocalAdmin 是内置调用方的限额段。
+	// LocalAdmin is the built-in caller's budget.
+	LocalAdmin LocalAdminConfig `yaml:"local_admin"`
+
+	// Ingress 是三类入口的令牌桶参数。
+	// Ingress carries the three ingress classes' token buckets.
+	Ingress IngressConfig `yaml:"ingress"`
+}
+
+// LocalAdminConfig 是内置调用方段（`callers.local_admin`，US-16 §3.3）。
+// LocalAdminConfig is the built-in caller section.
+type LocalAdminConfig struct {
+	// Unlimited 缺省 true（本机回环部署）；非回环部署建议显式 false。
+	// 用指针是为了区分「没写」（缺省开）与「显式 false」——与 secrets.auto_init
+	// 同一套口径。
+	// Unlimited defaults to true; the pointer separates unset from an explicit false.
+	Unlimited *bool `yaml:"unlimited"`
+}
+
+// UnlimitedEnabled 返回生效的 unlimited：未写 = true。
+// UnlimitedEnabled reports the effective unlimited flag; unset means true.
+func (c LocalAdminConfig) UnlimitedEnabled() bool {
+	return c.Unlimited == nil || *c.Unlimited
+}
+
+// IngressConfig 是三类入口的限额段（`callers.ingress`，US-16 §3.3）。
+// IngressConfig holds the three ingress classes' budgets.
+type IngressConfig struct {
+	// Run 覆盖 Run / Chat / 会话写三条路径。
+	// Run covers the run, chat and session-write paths.
+	Run IngressBudgetConfig `yaml:"run"`
+
+	// Ingest 覆盖上传与摄取触发。
+	// Ingest covers upload and ingest triggering.
+	Ingest IngressBudgetConfig `yaml:"ingest"`
+
+	// Read 覆盖历史 / 来源 / 列表读端点。
+	// Read covers history, source and list reads.
+	Read IngressBudgetConfig `yaml:"read"`
+}
+
+// IngressBudgetConfig 是单个入口类的令牌桶参数（qps / burst）。
+// IngressBudgetConfig is one ingress class's token bucket.
+type IngressBudgetConfig struct {
+	// QPS 是每调用方稳态速率；Burst 是突发额度。两者都不得为负。
+	// QPS is the steady rate per caller and Burst the burst allowance; neither may
+	// be negative.
+	QPS   int `yaml:"qps"`
+	Burst int `yaml:"burst"`
+}
+
+// DiagnosticsConfig 是诊断事件段（`diagnostics`，US-16 §3.3）。
+// DiagnosticsConfig is the diagnostics section (US-16 §3.3).
+type DiagnosticsConfig struct {
+	// RetentionDays 是诊断事件保留期；超期清理不阻塞业务（D-17）。负数拒绝。
+	// RetentionDays bounds diagnostic retention; negatives are refused.
+	RetentionDays int `yaml:"retention_days"`
+
+	// SampleRate 是采样率（0–1）；**审计不受它影响**。指针区分「没写」（缺省 1.0）
+	// 与「显式 0」（不采样）。
+	// SampleRate is the sampling ratio and never affects audit; the pointer
+	// separates unset from an explicit zero.
+	SampleRate *float64 `yaml:"sample_rate"`
+}
+
+// SampleRateOrDefault 返回生效的采样率：未写 = 1.0。
+// SampleRateOrDefault reports the effective sample rate; unset means 1.0.
+func (d DiagnosticsConfig) SampleRateOrDefault() float64 {
+	if d.SampleRate == nil {
+		return 1
+	}
+	return *d.SampleRate
+}
+
+// CompactionConfig 是会话压缩段（`compaction`，US-16 §3.3）。
+// CompactionConfig is the compaction section (US-16 §3.3).
+//
+// `enabled` 缺省 false（存量配置升级后行为与现状一致）；显式 true 时其余八个键
+// **全部必填**，缺任一即启动拒绝且**一次列全**（D-24：不在代码里预填阈值数字）。
+// Enabled defaults to false; turning it on makes every other key required, and the
+// error lists all missing keys at once.
+type CompactionConfig struct {
+	// Enabled 开关；false 时行为等同现状（不压缩，超限走整组裁剪或显式拒绝）。
+	// Enabled switches compaction on; false keeps the pre-US-16 behavior.
+	Enabled bool `yaml:"enabled"`
+
+	// TriggerRatio 是主动压缩触发比例（`0 < r < 1`）：投影超过
+	// `r × usable_input` 即触发。
+	// TriggerRatio is the proactive trigger ratio, strictly between 0 and 1.
+	TriggerRatio float64 `yaml:"trigger_ratio"`
+
+	// KeepRecentGroups 是保留最近完整工具组数。
+	// KeepRecentGroups is how many recent complete tool groups stay intact.
+	KeepRecentGroups int `yaml:"keep_recent_groups"`
+
+	// SummaryMaxTokens 是**摘要调用自身**的输出上限（max_tokens），
+	// 与 output_reserve_tokens 分开：前者是摘要请求的参数，后者进投影判定。
+	// SummaryMaxTokens caps the summary call's own output.
+	SummaryMaxTokens int `yaml:"summary_max_tokens"`
+
+	// OutputReserveTokens 是**本轮回复**的预留，参与 `projected` 判定。
+	// OutputReserveTokens reserves room for this round's reply.
+	OutputReserveTokens int `yaml:"output_reserve_tokens"`
+
+	// SafetyMarginRatio 是估算误差缓冲：`safety_margin = ceil(ratio × limit)`，
+	// 同时收紧触发线与压缩后准入线。
+	// SafetyMarginRatio buffers estimator error on both the trigger and the
+	// post-compaction admission line.
+	SafetyMarginRatio float64 `yaml:"safety_margin_ratio"`
+
+	// TimeoutSeconds 是摘要调用超时；与 Run 取消共用 ctx。
+	// TimeoutSeconds bounds one summary call.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+
+	// PromptVersion / StrategyVersion 是模板与策略版本，进条目与装配记录；
+	// 变更即新版本，旧条目保持可读。
+	// PromptVersion and StrategyVersion are recorded with every entry.
+	PromptVersion   string `yaml:"prompt_version"`
+	StrategyVersion string `yaml:"strategy_version"`
 }
 
 // 凭证键路径：providers[i].api_key 与管理面 token（http.admin_auth.token）走同一套
@@ -287,18 +567,6 @@ var (
 	validLogLevels  = map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	validLogFormats = map[string]bool{"text": true, "json": true}
 )
-
-// defaultMemoryBackend 是 memory.backend 的唯一缺省档（约束 18：不写 memory 段
-// 与省略 backend 两条路径读到同一个值）。同址声明缺省值与取值域——两者是同一份
-// 契约的两面，分开写会漂移。
-// defaultMemoryBackend and validMemoryBackends are declared together: the default
-// and the domain are two faces of one contract.
-const defaultMemoryBackend = "markdown"
-
-// validMemoryBackends 是载体档位的取值域——两档之外（mem0 / 任意未知取值）一律
-// 拒绝启动：静默降级会让「我配了 mem0」悄悄变成「记忆写进了文件」，载体形态与
-// 运维预期分叉。
-var validMemoryBackends = map[string]bool{"markdown": true, "sqlite": true}
 
 // 管理认证模式的两档取值（docs/contracts/run-and-errors.md §9.1）——取值域外一律
 // 拒绝启动：未知模式既不是 token 也不是本机信任，放行等于"认证配置被静默忽略"。
@@ -355,6 +623,7 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 	if err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
+	cfg.ingressMissing = missingKeyPaths(resolvedMap, ingressRequiredKeys...)
 	// secrets 段的"段形状"要在解码之后单独判：整段缺失与"写了段但没给路径"在
 	// 结构体里都是空串，只有原始树能区分两者（T136）。
 	// The secrets section is checked against the raw tree: after decoding, "section
@@ -362,10 +631,53 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 	if err := validateSecretsSection(resolvedMap, cfg.Secrets, path); err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
+	// US-16 七段要先于 validateConfig 判：退役键（`storage.backend` / `memory.backend`）
+	// 的判据是「原始树里写没写」，解码之后的取值面看不出来。
+	// The US-16 sections are checked against the raw tree: a retired key's presence is
+	// invisible once decoded.
+	if err := validateUS16Sections(resolvedMap, cfg); err != nil {
+		return nil, fmt.Errorf("配置 %s: %w", path, err)
+	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+var ingressRequiredKeys = []string{
+	"callers.ingress.run.qps", "callers.ingress.run.burst",
+	"callers.ingress.ingest.qps", "callers.ingress.ingest.burst",
+	"callers.ingress.read.qps", "callers.ingress.read.burst",
+}
+
+// ValidateServeIngress 对服务入口要求六项显式正值；维护命令仍能装载旧配置。
+func ValidateServeIngress(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("服务启动需要配置文件及入口限流项: %s", strings.Join(ingressRequiredKeys, ", "))
+	}
+	if len(cfg.ingressMissing) > 0 {
+		return fmt.Errorf("服务启动缺少配置项: %s", strings.Join(cfg.ingressMissing, ", "))
+	}
+	var invalid []string
+	for _, item := range []struct {
+		name  string
+		value int
+	}{
+		{ingressRequiredKeys[0], cfg.Callers.Ingress.Run.QPS},
+		{ingressRequiredKeys[1], cfg.Callers.Ingress.Run.Burst},
+		{ingressRequiredKeys[2], cfg.Callers.Ingress.Ingest.QPS},
+		{ingressRequiredKeys[3], cfg.Callers.Ingress.Ingest.Burst},
+		{ingressRequiredKeys[4], cfg.Callers.Ingress.Read.QPS},
+		{ingressRequiredKeys[5], cfg.Callers.Ingress.Read.Burst},
+	} {
+		if item.value <= 0 {
+			invalid = append(invalid, item.name)
+		}
+	}
+	if len(invalid) > 0 {
+		return fmt.Errorf("服务启动要求下列配置项大于零: %s", strings.Join(invalid, ", "))
+	}
+	return nil
 }
 
 // readConfigFile 读取配置文件内容——读取范围经 os.Root 钉在配置文件所在目录。
@@ -545,19 +857,10 @@ func validateConfig(cfg *Config) error {
 	if cfg.Log.Format != "" && !validLogFormats[cfg.Log.Format] {
 		return fmt.Errorf("配置项 log.format 取值非法（%s）——只允许 text / json", cfg.Log.Format)
 	}
-	// memory.backend：**先归一后判域**——空串（不写 memory 段 / 写了段省略 backend）
-	// 是合法输入，在此就地写回缺省档：缺省只有一个来源，装配层读到的一定是两档之一
-	// （那里的 default 分支因此只是纵深防御，不是日常路径）。
-	if cfg.Memory.Backend == "" {
-		cfg.Memory.Backend = defaultMemoryBackend
-	}
-	if !validMemoryBackends[cfg.Memory.Backend] {
-		// 取值域外 fail-closed（约束 18）：mem0 载体延后实现（Compatibility §4 #2），
-		// 未知取值同样拒绝——**不得**静默降级到 markdown，否则载体形态与运维预期分叉。
-		return fmt.Errorf(
-			"配置项 memory.backend 取值非法（%s）——只允许 markdown（缺省）或 sqlite；mem0 载体尚未实现，未知取值一律拒绝启动，不静默降级",
-			cfg.Memory.Backend)
-	}
+	// memory.backend 的退役判定在 `validateUS16Sections`（判原始树里键是否出现），
+	// 这里**不**再做取值归一：那个键现在一个合法取值都没有。
+	// The retirement check lives in validateUS16Sections; there is no value left to
+	// normalize here.
 	// 管理认证段：缺席合法（轻命令不开 HTTP 管理面），半截配置不合法——见 validateAdminAuth。
 	// The admin-auth section may be absent for light commands; a partial section is
 	// never legal.
@@ -630,6 +933,263 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateUS16Sections 校验 US-16 七段的取值域与**条件必填**（§3.3 / D-24）。
+// validateUS16Sections checks the US-16 sections' value domains and conditional
+// requiredness.
+//
+// 为什么用原始树判「缺失」而不是结构体：解码后「没写」与「写了零值」不可区分
+// （`trigger_ratio: 0` 与不写都是 0），而两者的处置完全不同——前者是缺键（**一次
+// 列全**），后者是非法取值（点名该键）。`secrets` 段同款理由。
+// The raw tree separates "absent" from "written as zero", which the decoded struct
+// cannot; the two need different messages.
+//
+// 判据边界：本函数**不**判 `database.dsn` 的必填（按子命令分流，§3.1.9）也**不**
+// 预填任何缺省阈值（缺省归消费方）；它只判「不可能成立」的取值与「开了开关却缺
+// 配套键」两类。
+// Scope: no DSN requiredness (per-subcommand) and no default filling; only
+// impossible values and switch-driven requiredness.
+func validateUS16Sections(tree map[string]any, cfg *Config) error {
+	// storage.backend 是**不存在的键**（图 1：运行时存储唯一后端为 PostgreSQL，
+	// D-01 不切换、不回退）。解码器对未知键静默忽略，留着它被无声吞掉，等于把
+	// 「我写了切换开关」变成「看起来生效了」——因此存在即拒绝启动，而不是忽略。
+	// There is no storage.backend key: its presence is a configuration error, not a
+	// silently ignored unknown key (D-01: one runtime backend, no switch, no fallback).
+	if _, present := lookupKeyPath(tree, "storage.backend"); present {
+		return fmt.Errorf(
+			"配置项 storage.backend 不得出现——运行时存储唯一后端为 PostgreSQL（D-01）：" +
+				"本版本没有存储后端开关，存在该键即拒绝启动，不静默忽略、不回退 SQLite")
+	}
+
+	// memory.backend 与 storage.backend 同一形态（D-18 / §3.3）：markdown / sqlite 两档
+	// 已退役，运行时长期记忆唯一载体为 PostgreSQL。留着这个键被解码器静默吞掉，等于把
+	// 「我指定了载体」变成「看起来生效了」——所以存在即拒绝启动，并给出可执行的迁移路径。
+	// There is no memory.backend key any more: its presence is refused with the migration
+	// path, never silently ignored.
+	if _, present := lookupKeyPath(tree, "memory.backend"); present {
+		return fmt.Errorf(
+			"配置项 memory.backend 不得出现——运行时长期记忆唯一载体为 PostgreSQL（D-18）：" +
+				"markdown / sqlite 两档已退役，存在该键即拒绝启动，不静默忽略。" +
+				"迁移路径：从配置删去该键 → 旧 SQLite 记忆随 `basalt db import` 进 PG → " +
+				"旧 markdown 记忆（memory/MEMORY.md 与 memory/agents/<name>/MEMORY.md）由 " +
+				"`basalt db switch` 一次性只读导入并逐条对账；原文件保留作回退层（D-22）")
+	}
+
+	// 负数一次列全（七段合扫）：负值是「取值不可能成立」，与缺键同属部署者要
+	// 一次改完的错——按段逐个报会让同一份配置反复重启。
+	// All negatives are collected across the seven sections in one pass.
+	if err := rejectNegative(
+		"database.max_conns", cfg.Database.MaxConns,
+		"database.min_conns", cfg.Database.MinConns,
+		"database.connect_timeout_seconds", cfg.Database.ConnectTimeoutSeconds,
+		"database.statement_timeout_seconds", cfg.Database.StatementTimeoutSeconds,
+		"database.lock_timeout_seconds", cfg.Database.LockTimeoutSeconds,
+		"embedding.dimensions", cfg.Embedding.Dimensions,
+		"embedding.batch_size", cfg.Embedding.BatchSize,
+		"embedding.timeout_seconds", cfg.Embedding.TimeoutSeconds,
+		"knowledge.max_document_bytes", int(cfg.Knowledge.MaxDocumentBytes),
+		"knowledge.chunk.max_tokens", cfg.Knowledge.Chunk.MaxTokens,
+		"knowledge.chunk.overlap_tokens", cfg.Knowledge.Chunk.OverlapTokens,
+		"retrieval.top_k", cfg.Retrieval.TopK,
+		"retrieval.candidate_k", cfg.Retrieval.CandidateK,
+		"retrieval.rrf_k", cfg.Retrieval.RRFK,
+		"retrieval.ef_search", cfg.Retrieval.EFSearch,
+		"retrieval.rerank.timeout_seconds", cfg.Retrieval.Rerank.TimeoutSeconds,
+		"callers.unauthenticated_qps", cfg.Callers.UnauthenticatedQPS,
+		"callers.ingress.run.qps", cfg.Callers.Ingress.Run.QPS,
+		"callers.ingress.run.burst", cfg.Callers.Ingress.Run.Burst,
+		"callers.ingress.ingest.qps", cfg.Callers.Ingress.Ingest.QPS,
+		"callers.ingress.ingest.burst", cfg.Callers.Ingress.Ingest.Burst,
+		"callers.ingress.read.qps", cfg.Callers.Ingress.Read.QPS,
+		"callers.ingress.read.burst", cfg.Callers.Ingress.Read.Burst,
+		"diagnostics.retention_days", cfg.Diagnostics.RetentionDays,
+		"compaction.keep_recent_groups", cfg.Compaction.KeepRecentGroups,
+		"compaction.summary_max_tokens", cfg.Compaction.SummaryMaxTokens,
+		"compaction.output_reserve_tokens", cfg.Compaction.OutputReserveTokens,
+		"compaction.timeout_seconds", cfg.Compaction.TimeoutSeconds,
+	); err != nil {
+		return err
+	}
+
+	// database：min > max 不可能成立。0 表示「未配置」，由连接池取缺省——
+	// 装载层不替它决定。
+	if cfg.Database.MaxConns > 0 && cfg.Database.MinConns > cfg.Database.MaxConns {
+		return fmt.Errorf(
+			"配置项 database.min_conns（%d）大于 database.max_conns（%d）——空闲保底不可能超过池上限",
+			cfg.Database.MinConns, cfg.Database.MaxConns)
+	}
+
+	// embedding：条件必填——只写连接不写模型 / 维度，等于「以为开了语义检索、
+	// 实际没开」，必须拒绝；三段都写了则由启动期与 active 代际比对维度。
+	// 语义路径的降级（vector_unavailable）只在 model_connection 为空时发生。
+	if cfg.Embedding.ModelConnection != "" {
+		missing := missingKeyPaths(tree, "embedding.model", "embedding.dimensions")
+		if len(missing) > 0 {
+			return fmt.Errorf(
+				"配置项 %s 缺失——写了 embedding.model_connection 就必须同时给出模型 id 与维度"+
+					"（只配一半会让语义检索看起来已启用，实际没有）",
+				strings.Join(missing, "、"))
+		}
+		if cfg.Embedding.Model == "" {
+			return fmt.Errorf("配置项 embedding.model 不得为空——写了 embedding.model_connection 就必须点名模型 id")
+		}
+		if cfg.Embedding.Dimensions <= 0 {
+			return fmt.Errorf("配置项 embedding.dimensions 必须为正数（当前 %d）——向量维度不可能为 0", cfg.Embedding.Dimensions)
+		}
+	}
+
+	// knowledge：重叠不得吃掉整个窗口（overlap >= max_tokens 时切分无法前进）。
+	if cfg.Knowledge.Chunk.MaxTokens > 0 && cfg.Knowledge.Chunk.OverlapTokens >= cfg.Knowledge.Chunk.MaxTokens {
+		return fmt.Errorf(
+			"配置项 knowledge.chunk.overlap_tokens（%d）不得大于或等于 knowledge.chunk.max_tokens（%d）——重叠吃掉整个窗口时切分无法前进",
+			cfg.Knowledge.Chunk.OverlapTokens, cfg.Knowledge.Chunk.MaxTokens)
+	}
+
+	// retrieval：重排开关打开就必须点名连接（否则启用即失败，却报在调用时
+	// 而不是启动时）。
+	if cfg.Retrieval.Rerank.Enabled && strings.TrimSpace(cfg.Retrieval.Rerank.ModelConnection) == "" {
+		return fmt.Errorf(
+			"配置项 retrieval.rerank.model_connection 缺失——retrieval.rerank.enabled: true 时必须点名重排使用的模型连接")
+	}
+
+	// diagnostics：采样率是概率，越界即拒绝（**审计不受它影响**，因此采样率写错
+	// 不得静默夹到边界上）。阈值本身由 D-30 实测冻结，装载层不预填。
+	if cfg.Diagnostics.SampleRate != nil {
+		rate := *cfg.Diagnostics.SampleRate
+		if rate < 0 || rate > 1 {
+			return fmt.Errorf("配置项 diagnostics.sample_rate 取值非法（%v）——采样率必须落在 0–1 之间", rate)
+		}
+	}
+
+	return validateCompactionSection(tree, cfg.Compaction)
+}
+
+// validateCompactionSection 校验压缩段：开关关闭时只判已写取值的合法性，
+// 打开时八个配套键**全部必填并一次列全**（D-24）。
+// validateCompactionSection checks the compaction section: with the switch off only
+// written values are validated; with it on every companion key is required and all
+// missing ones are listed at once.
+func validateCompactionSection(tree map[string]any, cfg CompactionConfig) error {
+	// 比例键无论在开关哪一档都要判：写了越界值说明配置本身有错，等打开时
+	// 才报只会把问题推迟到切换开关的那一刻。
+	if _, present := lookupKeyPath(tree, "compaction.trigger_ratio"); present {
+		if cfg.TriggerRatio <= 0 || cfg.TriggerRatio >= 1 {
+			return fmt.Errorf(
+				"配置项 compaction.trigger_ratio 取值非法（%v）——触发比例必须严格落在 0 与 1 之间", cfg.TriggerRatio)
+		}
+	}
+	if _, present := lookupKeyPath(tree, "compaction.safety_margin_ratio"); present {
+		if cfg.SafetyMarginRatio < 0 || cfg.SafetyMarginRatio >= 1 {
+			return fmt.Errorf(
+				"配置项 compaction.safety_margin_ratio 取值非法（%v）——误差缓冲比例必须落在 0（含）与 1（不含）之间，否则可用输入被扣成非正数",
+				cfg.SafetyMarginRatio)
+		}
+	}
+
+	if !cfg.Enabled {
+		return nil
+	}
+	// 开关打开：D-24 要求阈值显式给出，缺任一即拒绝启动，且**一次列全**——
+	// 逐键试错会让部署者反复重启。
+	required := []string{
+		"compaction.trigger_ratio",
+		"compaction.keep_recent_groups",
+		"compaction.summary_max_tokens",
+		"compaction.output_reserve_tokens",
+		"compaction.safety_margin_ratio",
+		"compaction.timeout_seconds",
+		"compaction.prompt_version",
+		"compaction.strategy_version",
+	}
+	missing := missingKeyPaths(tree, required...)
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"配置项 %s 缺失——compaction.enabled: true 时这八个键全部必填（D-24：装载层不预填阈值），请补齐后重启",
+			strings.Join(missing, "、"))
+	}
+	if cfg.TriggerRatio <= 0 || cfg.TriggerRatio >= 1 {
+		return fmt.Errorf(
+			"配置项 compaction.trigger_ratio 取值非法（%v）——触发比例必须严格落在 0 与 1 之间", cfg.TriggerRatio)
+	}
+	if cfg.SafetyMarginRatio < 0 || cfg.SafetyMarginRatio >= 1 {
+		return fmt.Errorf(
+			"配置项 compaction.safety_margin_ratio 取值非法（%v）——误差缓冲比例必须落在 0（含）与 1（不含）之间",
+			cfg.SafetyMarginRatio)
+	}
+	if strings.TrimSpace(cfg.PromptVersion) == "" {
+		return fmt.Errorf("配置项 compaction.prompt_version 不得为空——摘要模板版本要进条目与装配记录")
+	}
+	if strings.TrimSpace(cfg.StrategyVersion) == "" {
+		return fmt.Errorf("配置项 compaction.strategy_version 不得为空——切点 / 预算策略版本要进条目与装配记录")
+	}
+	return nil
+}
+
+// rejectNegative 按「键名, 取值」成对入参收集负数，**一次列全**——负数不是
+// 「配置风格问题」，而是取值不可能成立，逐个报会让部署者反复重启。
+// rejectNegative collects every negative pair and reports them in one message.
+func rejectNegative(pairs ...any) error {
+	if len(pairs)%2 != 0 {
+		return errors.New("内部错误：rejectNegative 需要成对的键名与取值")
+	}
+	var bad []string
+	// 上界写 `i+1 < len(pairs)`：偶数长度在入口已判过，两种写法等价；这种写法让
+	// "成对读取"在静态扫描里也是自明的（gosec G602 的索引上界判据认它）。
+	for i := 0; i+1 < len(pairs); i += 2 {
+		name, _ := pairs[i].(string)
+		value := toInt64(pairs[i+1])
+		if value < 0 {
+			bad = append(bad, fmt.Sprintf("%s=%d", name, value))
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return fmt.Errorf("配置项取值不得为负：%s——这些是计数 / 时长 / 容量，负数不可能成立", strings.Join(bad, "、"))
+}
+
+// toInt64 把 rejectNegative 收到的整型取值统一成 int64；非整型返回 0
+// （类型错误已由解码器拒绝，走到这里的只可能是 int / int64）。
+// toInt64 normalizes the integer kinds rejectNegative accepts.
+func toInt64(value any) int64 {
+	switch v := value.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	}
+	return 0
+}
+
+// lookupKeyPath 按「段.键」路径在原始树里取值；路径每一层都必须是映射。
+// lookupKeyPath reads a dotted path from the raw tree.
+func lookupKeyPath(tree map[string]any, path string) (any, bool) {
+	var node any = tree
+	for _, segment := range strings.Split(path, ".") {
+		m, ok := node.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		child, present := m[segment]
+		if !present {
+			return nil, false
+		}
+		node = child
+	}
+	return node, true
+}
+
+// missingKeyPaths 返回树里不存在的路径，保持入参顺序——调用方据此一次列全。
+// missingKeyPaths returns the absent paths in input order.
+func missingKeyPaths(tree map[string]any, paths ...string) []string {
+	var missing []string
+	for _, path := range paths {
+		if _, present := lookupKeyPath(tree, path); !present {
+			missing = append(missing, path)
+		}
+	}
+	return missing
 }
 
 // validateSecretsSection 校验 `secrets` 段的装载期形状（T136）。
@@ -1017,6 +1577,26 @@ func resolveString(raw, path string, lookupEnv func(string) (string, bool)) (any
 		return nil, fmt.Errorf("配置项 %s 解析为空——凭证不得为空值", path)
 	}
 	return resolved, nil
+}
+
+// ResolveEnvPlaceholder 用装载层**同一实现**展开单个字符串里的 `${VAR}` 占位。
+//
+// 只给"不装载整份配置、但必须与在线装载同口径解读占位"的离线命令用
+// （`db verify --handoff` 读 `secrets.master_key_file`）：另写一份展开逻辑就会让
+// 离线核对与在线行为的差异变成第二套语义。
+// ResolveEnvPlaceholder expands `${VAR}` through the very same loader routine so
+// offline checks cannot drift from online configuration semantics.
+func ResolveEnvPlaceholder(raw, path string, lookupEnv func(string) (string, bool)) (string, error) {
+	resolved, err := resolveString(raw, path, lookupEnv)
+	if err != nil {
+		return "", err
+	}
+	text, ok := resolved.(string)
+	if !ok {
+		// resolveString 对字符串输入只会返回字符串；这里是编译期契约的运行时兜底。
+		return "", fmt.Errorf("配置项 %s 解析结果不是字符串（类型 %s）", path, nodeTypeName(resolved))
+	}
+	return text, nil
 }
 
 // nodeTypeName 给出节点类型名供错误文案使用——只报类型（%T 的代码事实），

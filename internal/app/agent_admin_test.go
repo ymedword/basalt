@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `internal/app/agent_admin.go` 的验收面（颗粒度文档 §3.2.1：内部 app 的
@@ -36,7 +38,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -53,7 +54,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -81,10 +83,10 @@ func (c *agentAdminChatter) Chat(_ context.Context, req core.ChatRequest) (core.
 type agentAdminEnv struct {
 	admin     *AgentAdmin
 	deps      AgentAdminDeps
-	db        *storage.DB
+	db        *postgres.DB
 	root      string
-	ops       *storage.ManagementStore
-	versions  *storage.ResourceStore
+	ops       *postgres.ManagementStore
+	versions  *postgres.ResourceStore
 	lifecycle *workspace.LifecycleStore
 	gate      *core.AgentGate
 	logs      *bytes.Buffer
@@ -128,13 +130,10 @@ func newAgentAdminEnvRaw(t *testing.T, now func() time.Time) *agentAdminEnv {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(root, databaseFileName), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	ops := storage.NewManagementStore(db)
-	versions := storage.NewResourceStore(db)
+	ops := postgres.NewManagementStore(db)
+	versions := postgres.NewResourceStore(db)
 	gate := core.NewAgentGate()
 	lifecycle := workspace.NewLifecycleStore(root, now)
 	logger, logs := newCapturedLogger()
@@ -153,9 +152,9 @@ func newAgentAdminEnvRaw(t *testing.T, now func() time.Time) *agentAdminEnv {
 		// The exclusivity sources and the projection are wired for real, mirroring the
 		// production assembly so a missing rebuild cannot hide behind a fake.
 		Resources:   versions,
-		NotifyAdmin: storage.NewNotifyAdminStore(db),
-		Projection: NewBindingProjection(storage.NewBindingStore(db), versions,
-			storage.NewAgentAdminStore(db), root, logger, now),
+		NotifyAdmin: postgres.NewNotifyAdminStore(db),
+		Projection: NewBindingProjection(postgres.NewBindingStore(db), versions,
+			postgres.NewAgentAdminStore(db), postgres.NewKnowledgeCatalogStore(db), root, logger, now),
 		PublishedProviders: func(context.Context) ([]workspace.ProviderEntry, error) {
 			return agentAdminPublishedProviders(), nil
 		},
@@ -263,7 +262,7 @@ func (env *agentAdminEnv) makeExclusive(t *testing.T, name string, uid core.Reso
 	owner core.AgentUID,
 ) {
 	t.Helper()
-	_, err := env.versions.ConvertScope(context.Background(), storage.ScopeConversion{
+	_, err := env.versions.ConvertScope(context.Background(), postgres.ScopeConversion{
 		Kind:          core.ResourceModelConnection,
 		Name:          name,
 		ExpectUID:     uid,
@@ -1121,7 +1120,7 @@ func newAgentEnv(t *testing.T, name string) *archiveEnv {
 	base.deps.Registry = registry
 	base.deps.Scheduler = scheduler
 	base.deps.RunCanceller = canceller
-	base.deps.Archives = storage.NewAgentAdminStore(base.db)
+	base.deps.Archives = postgres.NewAgentAdminStore(base.db)
 	base.deps.Operations = defaultingActorStore{OperationStore: base.ops}
 	base.deps.BusyWait = time.Millisecond
 	base.build()
@@ -1406,7 +1405,7 @@ func newCopyMappingEnv(t *testing.T) *copyMappingEnv {
 
 // mustBindings 读一个身份的投影行；读取失败直接判失败。
 // mustBindings reads one identity's projection rows.
-func mustBindings(t *testing.T, store *storage.BindingStore, uid core.AgentUID) []core.AgentResourceBinding {
+func mustBindings(t *testing.T, store *postgres.BindingStore, uid core.AgentUID) []core.AgentResourceBinding {
 	t.Helper()
 	rows, err := store.Bindings(context.Background(), uid)
 	require.NoError(t, err)
@@ -1479,13 +1478,13 @@ func TestAgentCopy_ExclusiveBindingRequiresMapping(t *testing.T) {
 		require.NoError(t, readErr)
 		require.True(t, exists)
 		require.NotEqual(t, env.sourceUID, targetRec.AgentUID, "副本必须拿到新身份")
-		rows := mustBindings(t, storage.NewBindingStore(env.db), targetRec.AgentUID)
+		rows := mustBindings(t, postgres.NewBindingStore(env.db), targetRec.AgentUID)
 		require.Len(t, rows, 1)
 		require.Equal(t, core.BindingModelConnection, rows[0].Kind)
 		require.Equal(t, "reporter-copy", rows[0].AgentName)
 		require.Equal(t, "beta", rows[0].RefName)
 		require.Equal(t, env.shared.ResourceUID, rows[0].ResourceUID)
-		require.Empty(t, mustBindings(t, storage.NewBindingStore(env.db), env.sourceUID),
+		require.Empty(t, mustBindings(t, postgres.NewBindingStore(env.db), env.sourceUID),
 			"副本的投影不得写到源身份上")
 	})
 
@@ -1554,7 +1553,7 @@ func TestAgentAdmin_WriteActionsRebuildBindingProjection(t *testing.T) {
 	t.Parallel()
 	env := newCopyMappingEnv(t)
 	ctx := context.Background()
-	store := storage.NewBindingStore(env.db)
+	store := postgres.NewBindingStore(env.db)
 
 	// 归档：清空投影后归档，行必须按归档副本重建回来（身份不变）。
 	require.NoError(t, store.Clear(ctx, env.sourceUID))
@@ -1896,8 +1895,8 @@ func recoveryDepsForAgentAdmin(env *agentAdminEnv) RecoveryDeps {
 		ConfigPath: filepath.Join(env.root, configFileName),
 		Skills:     workspace.NewSkillLibrary(env.root),
 		Gate:       env.gate,
-		Archives:   storage.NewAgentAdminStore(env.db),
-		Notify:     storage.NewNotifyAdminStore(env.db),
+		Archives:   postgres.NewAgentAdminStore(env.db),
+		Notify:     postgres.NewNotifyAdminStore(env.db),
 	}
 }
 
@@ -2040,19 +2039,10 @@ func TestRecoverAdmin_ActionMatrix(t *testing.T) {
 		archived, err := workspace.ArchiveAgentDir(env.root, "writer", baselineClock())
 		require.NoError(t, err)
 
-		// 防御分支：生产的归档行与终态同事务，pending 行本不该命中本分支；这里用裸连接
-		// 直接落行（与既有判卷先例同一手法），验证"行 + 清单哈希"这条最强判据。
-		raw, openErr := sql.Open("sqlite", filepath.ToSlash(filepath.Join(env.root, databaseFileName)))
-		require.NoError(t, openErr)
-		t.Cleanup(func() { require.NoError(t, raw.Close()) })
-		_, insertErr := raw.ExecContext(ctx,
-			`INSERT INTO agent_archives
-			   (archive_id, agent_name, archived_at, content_hash, manifest_json, operation_id)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			archived.ArchiveID, "writer", baselineClock().UnixMilli(),
-			archived.ContentHash, archived.ManifestJSON, opID)
-		require.NoError(t, insertErr)
-
+		// 先落 pending 行：`agent_archives.operation_id` 有外键指向管理操作，
+		// PostgreSQL 始终强制（SQLite 时代靠关闭 pragma 才允许先插行后建操作）。
+		// 生产顺序本来就是"预写 pending → 做事 → 回填终态"，这里保持同一顺序。
+		// The pending row must exist first: PostgreSQL always enforces the FK.
 		beginPendingOperation(t, env.ops, core.OperationRecord{
 			OperationID: opID, Action: core.ActionAgentArchive,
 			TargetKind: targetKindAgent, TargetID: "writer",
@@ -2060,6 +2050,16 @@ func TestRecoverAdmin_ActionMatrix(t *testing.T) {
 				BeforeState: string(core.AgentActive),
 			}),
 		})
+
+		// 防御分支：生产的归档行与终态同事务，pending 行本不该命中本分支；这里用裸连接
+		// 直接落行（与既有判卷先例同一手法），验证"行 + 清单哈希"这条最强判据。
+		_, insertErr := env.db.ExecContext(ctx,
+			`INSERT INTO agent_archives
+			   (archive_id, agent_name, archived_at, content_hash, manifest_json, operation_id)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			archived.ArchiveID, "writer", baselineClock().UnixMilli(),
+			archived.ContentHash, archived.ManifestJSON, opID)
+		require.NoError(t, insertErr)
 		require.NoError(t, recoverPendingOperations(ctx, recoveryDepsForAgentAdmin(env.agentAdminEnv)))
 
 		op := getOperation(t, env.ops, opID)

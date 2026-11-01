@@ -12,7 +12,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -121,7 +121,7 @@ type managedCredentialSource interface {
 // newProviderCatalogFromPublished builds the explicit name-to-client table from published
 // model-connection versions only. With an override it never constructs a real client,
 // never issues a request, never reads the environment and never decrypts.
-func newProviderCatalogFromPublished(ctx context.Context, store *storage.ResourceStore,
+func newProviderCatalogFromPublished(ctx context.Context, store *postgres.ResourceStore,
 	override core.ProviderClient, logger *slog.Logger, credentials managedCredentialSource,
 ) (*providerCatalog, error) {
 	return newProviderCatalogFromPublishedExcept(ctx, store, override, logger, "", credentials)
@@ -136,7 +136,7 @@ func newProviderCatalogFromPublished(ctx context.Context, store *storage.Resourc
 // newProviderCatalogFromPublishedExcept is the same construction path with one published
 // pointer skipped before any entry or credential resolution, so a deleted provider's own
 // missing credential can never block its deletion.
-func newProviderCatalogFromPublishedExcept(ctx context.Context, store *storage.ResourceStore,
+func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.ResourceStore,
 	override core.ProviderClient, logger *slog.Logger, skipResourceID string,
 	credentials managedCredentialSource,
 ) (*providerCatalog, error) {
@@ -226,7 +226,7 @@ func catalogAPIKey(ctx context.Context, pointer core.ResourcePointer,
 // 供托管凭据按**发布版本**解析（准入固定语义）。
 // publishedProviderEntry resolves one published version into exactly one entry and
 // fails closed on any identity or shape mismatch.
-func publishedProviderEntry(ctx context.Context, store *storage.ResourceStore,
+func publishedProviderEntry(ctx context.Context, store *postgres.ResourceStore,
 	pointer core.ResourcePointer,
 ) (workspace.ProviderEntry, core.ResourceVersion, error) {
 	var entry workspace.ProviderEntry
@@ -354,7 +354,7 @@ func (s *providerCatalogStore) Store(catalog *providerCatalog) {
 // rebuild 按已发布版本重建目录，成功才替换：构建失败返回错误并**保留旧表**——这是
 // 「构建失败保留旧表」的结构判据（`TestProviderCatalog_BuildFailureKeepsOld`）。
 // rebuild replaces the catalog only when the build succeeds.
-func (s *providerCatalogStore) rebuild(ctx context.Context, store *storage.ResourceStore,
+func (s *providerCatalogStore) rebuild(ctx context.Context, store *postgres.ResourceStore,
 	override core.ProviderClient, logger *slog.Logger, credentials managedCredentialSource,
 ) error {
 	catalog, err := newProviderCatalogFromPublished(ctx, store, override, logger, credentials)
@@ -462,6 +462,22 @@ func (r *catalogProviderRouter) Pinned(name string) (*provider.ProviderService, 
 	}
 	return provider.NewProviderService(
 		map[string]core.ProviderClient{name: client}, models, r.store, r.logger), true
+}
+
+// SummaryPinned 返回当前快照里某个 Provider 的**裸协议客户端**，只服务会话压缩的
+// 摘要调用（`pinnedProviderService.SummaryPinned` 的唯一生产实现）：发布换表对新准入
+// 立即生效，已准入的 Run 用的是 `ResolvedResources` 里冻结的那一份。
+// SummaryPinned returns the raw client for the summary call against the current snapshot.
+func (r *catalogProviderRouter) SummaryPinned(name string) (core.ProviderClient, bool) {
+	snapshot := r.catalog.Load()
+	if snapshot == nil {
+		return nil, false
+	}
+	client, ok := snapshot.clients[name]
+	if !ok {
+		return nil, false
+	}
+	return client, true
 }
 
 // Chat 把一次模型调用路由到**调用发生那一刻**的目录快照。目录里没有该名字时的行为与

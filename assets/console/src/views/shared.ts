@@ -37,6 +37,13 @@ export interface LoaderState<T> {
   readonly error: Ref<string>
   readonly loading: Ref<boolean>
   reload(): Promise<void>
+  /**
+   * 丢弃当前结果并让在途请求作废——查询类页面换条件前必须调用，
+   * 否则上一次查询的结果会与新条件 / 错误提示同时留在屏幕上。
+   * Drop the current result and invalidate in-flight requests; query pages call this
+   * before changing conditions so stale rows never sit next to a new error.
+   */
+  reset(): void
 }
 
 /**
@@ -69,13 +76,20 @@ export function useLoader<T>(load: () => Promise<T>, immediate = true): LoaderSt
     }
   }
 
+  function reset(): void {
+    generation++
+    data.value = null
+    error.value = ''
+    loading.value = false
+  }
+
   if (immediate) {
     onMounted(() => {
       void reload()
     })
   }
 
-  return { data, error, loading, reload }
+  return { data, error, loading, reload, reset }
 }
 
 /** 轮询基线（20 秒）、退避上限（5 分钟）与可见性 / 聚焦去重窗口。 */

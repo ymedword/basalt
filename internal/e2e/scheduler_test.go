@@ -79,7 +79,7 @@ func testSchedulerCronFire(t *testing.T) {
 	waitScheduleStatus(t, addr, "demo-1", "completed", 30*time.Second)
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	runs := queryRows(t, db, `SELECT run_id, session_id, agent, channel, trigger, status FROM runs`)
 	if len(runs) != 1 {
 		t.Fatalf("runs 应有 1 行，实际 %d 行：%v", len(runs), runs)
@@ -150,7 +150,7 @@ func testSchedulerCronFire(t *testing.T) {
 		t.Fatal("scheduled_tasks.last_run_at 为空：触发必须留下运行痕迹")
 	}
 
-	users := queryRows(t, db, `SELECT content FROM messages WHERE session_id = ? AND role = 'user'`, sessionID)
+	users := queryRows(t, db, `SELECT content FROM messages WHERE session_id = $1 AND role = 'user'`, sessionID)
 	if len(users) != 1 {
 		t.Fatalf("调度器会话应有 1 条用户消息，实际 %d 条：%v", len(users), users)
 	}
@@ -204,7 +204,7 @@ func testSchedulerManualRun(t *testing.T) {
 	requireContains(t, run.FinalText, "手动补跑完成", "手动补跑最终回答")
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	executions := queryRows(t, db, `SELECT run_id, status, trigger, finished_at FROM task_executions`)
 	if len(executions) != 1 {
 		t.Fatalf("task_executions 应有 1 行，实际 %d 行：%v", len(executions), executions)
@@ -296,7 +296,7 @@ func testSchedulerTwoTables(t *testing.T) {
 	}
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	tasks := queryRows(t, db, `SELECT last_status, last_run_at FROM scheduled_tasks WHERE task_id = 'demo-1'`)
 	if len(tasks) != 1 {
 		t.Fatalf("scheduled_tasks 应有 demo-1 一行，实际 %d 行：%v", len(tasks), tasks)
@@ -380,7 +380,7 @@ func testSchedulerAgentSelfManage(t *testing.T) {
 	requireToolResultContains(t, reqs[1], "已保存定时任务：self-added", "确认文案回给模型")
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT task_id, agent_name, enabled FROM scheduled_tasks`)
 	if len(rows) != 1 {
 		t.Fatalf("scheduled_tasks 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -391,8 +391,8 @@ func testSchedulerAgentSelfManage(t *testing.T) {
 	if got := stringValue(t, rows[0], "agent_name"); got != "demo" {
 		t.Fatalf("scheduled_tasks.agent_name = %q，期望 demo", got)
 	}
-	if got := intValue(t, rows[0], "enabled"); got != 1 {
-		t.Fatalf("scheduled_tasks.enabled = %d，期望 1", got)
+	if got := boolValue(t, rows[0], "enabled"); !got {
+		t.Fatalf("scheduled_tasks.enabled = %v，期望 true", got)
 	}
 	requireToolAudit(t, db, "manage_schedule", "success", "", 1)
 }
@@ -450,7 +450,7 @@ func testSchedulerAgentOtherDenied(t *testing.T) {
 	requireScheduleIDs(t, addr, "shared", "拒绝后任务列表不变")
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "manage_schedule", "failed", "invalid_input", 1)
 	audit := queryRows(t, db, `SELECT error_message FROM tool_invocations WHERE tool_name = 'manage_schedule'`)
 	requireContains(t, stringValue(t, audit[0], "error_message"), "属于 Agent demo-a", "审计错误原文点名归属")
@@ -488,7 +488,7 @@ func testSchedulerZoneShanghai(t *testing.T) {
 	waitScheduleStatus(t, addr, "demo-1", "completed", 30*time.Second)
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	tasks := queryRows(t, db, `SELECT zone, last_status FROM scheduled_tasks WHERE task_id = 'demo-1'`)
 	if len(tasks) != 1 {
 		t.Fatalf("scheduled_tasks 应有 demo-1 一行，实际 %d 行：%v", len(tasks), tasks)
@@ -548,7 +548,7 @@ func testSchedulerChatNoTrigger(t *testing.T) {
 		t.Fatalf("chat 进程不应触发定时任务：\n%s", output)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM task_executions`); n != 0 {
 		t.Fatalf("chat 期间不得产生执行行，实际 %d 条", n)
 	}
@@ -602,7 +602,7 @@ func testSchedulerConcurrentMutex(t *testing.T) {
 	waitScheduleStatus(t, addr, "demo-1", "completed", 60*time.Second)
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	executions := queryRows(t, db, `SELECT task_id, run_id, status, trigger FROM task_executions`)
 	if len(executions) != 1 {
 		t.Fatalf("被拒的并发请求不得留执行行：task_executions 应有 1 行，实际 %d 行：%v",
@@ -625,6 +625,12 @@ func testSchedulerConcurrentMutex(t *testing.T) {
 // testSchedulerArchiveMeetsCron：归档与到点相撞（US-10 §6.2 第 13 项）。
 // 阶段 A 用一次手动补跑拿到派生会话 id；阶段 B 先在途归档被 409 拒绝，运行结束后归档成功；
 // 随后 cron 到点被跳过（执行行 skipped、run_id 为空、无新 Run），手动补跑返回 400。
+//
+// 时序注意：跳过文案由 classifyRun 在**任务锁内**打印，终态写与锁释放都在它之后——
+// 「看到文案」不等于「本轮已收尾」。紧接文案的手动补跑若落在尾部窗口，会得到
+// 409 SESSION_BUSY（「该任务上一轮尚未结束」），这正是 US-10 §6.2 第 11 项冻结的
+// 并发语义，不是失败。归档拒绝的判定点是**上一轮收尾后的第一次应答**
+// （runScheduleNowWhenIdle）；全量 e2e r1 的 400→409 就是落在这个窗口里。
 // testSchedulerArchiveMeetsCron walks the archive-vs-cron collision end to end.
 func testSchedulerArchiveMeetsCron(t *testing.T) {
 	h := newHarness(t)
@@ -640,7 +646,7 @@ func testSchedulerArchiveMeetsCron(t *testing.T) {
 	requireWebStatus(t, runScheduleNow(t, addrA, "demo-1"), http.StatusOK, "OK", "", "预热补跑")
 	pA.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	sessions := queryRows(t, db, `SELECT session_id FROM sessions WHERE channel = 'scheduler'`)
 	if len(sessions) != 1 {
 		t.Fatalf("预热后应有 1 个调度器会话，实际 %d 个：%v", len(sessions), sessions)
@@ -680,11 +686,11 @@ func testSchedulerArchiveMeetsCron(t *testing.T) {
 	requireWebStatus(t, webArchive(t, addrB, sessionID), http.StatusOK, "OK", "", "运行结束后归档")
 
 	pB.waitOutput(t, archivedSkipMessage, 60*time.Second)
-	requireWebStatus(t, runScheduleNow(t, addrB, "demo-1"), http.StatusBadRequest, "BAD_REQUEST",
+	requireWebStatus(t, runScheduleNowWhenIdle(t, addrB, "demo-1", 30*time.Second), http.StatusBadRequest, "BAD_REQUEST",
 		sessionArchivedMessage, "归档后手动补跑")
 	pB.stop(t)
 
-	sessions = queryRows(t, db, `SELECT status, archived_at FROM sessions WHERE session_id = ?`, sessionID)
+	sessions = queryRows(t, db, `SELECT status, archived_at FROM sessions WHERE session_id = $1`, sessionID)
 	if len(sessions) != 1 {
 		t.Fatalf("会话应仍在库中（归档不物理删除），实际 %d 行：%v", len(sessions), sessions)
 	}
@@ -764,14 +770,14 @@ func testSchedulerCrossAgentTaskID(t *testing.T) {
 	setScheduleEnabled(t, addrA, "shared", false)
 	pA.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	before := queryRows(t, db,
 		`SELECT agent_name, enabled, last_run_at, last_status, retired_at FROM scheduled_tasks WHERE task_id = 'shared'`)
 	if len(before) != 1 {
 		t.Fatalf("scheduled_tasks 应有 shared 一行，实际 %d 行：%v", len(before), before)
 	}
-	if got := intValue(t, before[0], "enabled"); got != 0 {
-		t.Fatalf("shared.enabled = %d，期望 0（已停用）", got)
+	if got := boolValue(t, before[0], "enabled"); got {
+		t.Fatalf("shared.enabled = %v，期望 false（已停用）", got)
 	}
 	runAt := intValue(t, before[0], "last_run_at")
 	execBefore := scalarInt(t, db, `SELECT COUNT(*) FROM task_executions`)
@@ -798,8 +804,8 @@ func testSchedulerCrossAgentTaskID(t *testing.T) {
 	if got := stringValue(t, retired[0], "agent_name"); got != "demo-a" {
 		t.Fatalf("退休后归属 = %q，期望仍绑定 demo-a", got)
 	}
-	if got := intValue(t, retired[0], "enabled"); got != 0 {
-		t.Fatalf("退休不得翻转 enabled：= %d，期望 0", got)
+	if got := boolValue(t, retired[0], "enabled"); got {
+		t.Fatalf("退休不得翻转 enabled：= %v，期望 false", got)
 	}
 	if got := intValue(t, retired[0], "last_run_at"); got != runAt {
 		t.Fatalf("退休不得改 last_run_at：= %d，期望 %d", got, runAt)
@@ -834,8 +840,8 @@ func testSchedulerCrossAgentTaskID(t *testing.T) {
 	if got := stringValue(t, after[0], "agent_name"); got != "demo-a" {
 		t.Fatalf("启动失败后归属 = %q，期望仍为 demo-a", got)
 	}
-	if got := intValue(t, after[0], "enabled"); got != 0 {
-		t.Fatalf("启动失败后 enabled = %d，期望保持 0", got)
+	if got := boolValue(t, after[0], "enabled"); got {
+		t.Fatalf("启动失败后 enabled = %v，期望保持 false", got)
 	}
 	if got := intValue(t, after[0], "last_run_at"); got != runAt {
 		t.Fatalf("启动失败后 last_run_at = %d，期望保持 %d", got, runAt)
@@ -916,6 +922,29 @@ func listExecutions(t *testing.T, addr, id string) []executionEntry {
 func runScheduleNow(t *testing.T, addr, id string) *webResponse {
 	t.Helper()
 	return webRequest(t, addr, http.MethodPost, "/api/v1/schedules/"+id+"/run", "", nil)
+}
+
+// runScheduleNowWhenIdle 在有界时间内重发手动补跑，直到不再返回 409 SESSION_BUSY。
+// 上一轮的跳过文案是在任务锁内打印的，终态行写入与锁释放都在文案之后；紧接文案的补跑
+// 落在尾部窗口时，409「该任务上一轮尚未结束」是 US-10 §6.2 第 11 项冻结的并发语义，
+// 判「归档拒绝」必须等上一轮收尾。除 409 SESSION_BUSY 外的任何应答立即返回，由调用方
+// 按冻结文案断言；超时仍未收尾直接判红——**不得**把持续 409 当通过。
+// runScheduleNowWhenIdle retries the manual run until the previous round finished;
+// only the frozen 409 SESSION_BUSY is tolerated, and a timeout is a failure.
+func runScheduleNowWhenIdle(t *testing.T, addr, id string, timeout time.Duration) *webResponse {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		resp := runScheduleNow(t, addr, id)
+		if resp.Status != http.StatusConflict || resp.Env.Code != "SESSION_BUSY" {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待任务 %s 的上一轮收尾超时（%s）：补跑始终返回 409 SESSION_BUSY（信封 %s）",
+				id, timeout, resp.Raw)
+		}
+		time.Sleep(readinessPoll)
+	}
 }
 
 // waitScheduleStatus 轮询管理读面直到任务的 last_status 等于期望值；超时附最后一次读数。

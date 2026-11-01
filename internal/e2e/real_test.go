@@ -288,7 +288,7 @@ func testRealProviderCall(t *testing.T) {
 	requireRealExit(t, h, res, 0, "真实 provider 调用")
 	requireRealContains(t, h, res.Stdout, marker, "真实回答必须包含校验码")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	accountRealModelCalls(t, llm, db, "provider_call")
 }
 
@@ -308,7 +308,7 @@ func testRealMultiturn(t *testing.T) {
 	requireRealExit(t, h, res, 0, "真实多轮对话")
 	requireRealContains(t, h, res.Stdout, "4312", "第二轮必须复述第一轮的数字")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 2 {
 		t.Fatalf("runs 应有 2 行，实际 %d 行", n)
 	}
@@ -336,7 +336,7 @@ func testRealChatTool(t *testing.T) {
 	requireRealExit(t, h, res, 0, "真实工具调用")
 	requireRealContains(t, h, res.Stdout, marker, "回答必须带上工具读到的标记")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "read_file", "success", "", 1)
 	accountRealModelCalls(t, llm, db, "chat_tool")
 }
@@ -361,13 +361,13 @@ func testRealWeatherTool(t *testing.T) {
 		t.Fatal("回环天气服务未收到任何请求：模型没有真正调用 http_get")
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "http_get", "success", "", 1)
 	accountRealModelCalls(t, llm, db, "weather_tool")
 }
 
 // testRealMemorySave：真实模型调 save_memory 写 CORE，重启后新进程读注入（US-6 演示 2
-// 的模型半）。判据：MEMORY.md 落盘标记、审计成功、新进程复述该标记。
+// 的模型半）。判据：库内核心行带标记（D-18 起唯一运行载体）、审计成功、新进程复述该标记。
 // testRealMemorySave persists a core memory through a real model call and recalls it.
 func testRealMemorySave(t *testing.T) {
 	const marker = "真实模型记忆-7c1e"
@@ -382,15 +382,20 @@ func testRealMemorySave(t *testing.T) {
 		"请调用 save_memory 工具：content 设为「"+marker+"」，scope 设为 CORE；然后回复「已保存」。")
 	requireRealExit(t, h, first, 0, "真实记忆写入")
 
-	text := readText(t, memoryPath(h, "demo"))
-	requireRealContains(t, h, text, marker, "核心记忆必须落盘")
+	db := h.openDB(t)
+	memory := queryRows(t, db,
+		`SELECT content FROM memory_entries
+		  WHERE scope = 'agent' AND agent_name = 'demo' AND section = 'core' AND state = 'active'`)
+	if len(memory) != 1 {
+		t.Fatalf("核心记忆应有 1 行，实际 %d 行：%v", len(memory), memory)
+	}
+	requireRealContains(t, h, stringValue(t, memory[0], "content"), marker, "核心记忆必须入库（D-18）")
 
 	second := h.run(t, realEnv(llm), "chat", "--agent", "demo", "--message",
 		"请把我核心记忆里那条内容原样复述一遍。")
 	requireRealExit(t, h, second, 0, "真实记忆读取")
 	requireRealContains(t, h, second.Stdout, "7c1e", "新进程必须读到注入的核心记忆")
 
-	db := openDB(t, h.dbPath())
 	requireToolAudit(t, db, "save_memory", "success", "", 1)
 	accountRealModelCalls(t, llm, db, "memory_save")
 }
@@ -416,7 +421,7 @@ func testRealMCPTool(t *testing.T) {
 	requireRealContains(t, h, res.Stderr, "mcp_connected=1", "启动摘要按实际连接数")
 	requireRealContains(t, h, res.Stdout, "913a", "回答必须带上 MCP 回显标记")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT tool_name, status FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -451,7 +456,7 @@ func testRealSchedulerFire(t *testing.T) {
 	waitScheduleStatus(t, addr, "demo-1", "completed", 60*time.Second)
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	runs := queryRows(t, db, `SELECT trigger, status FROM runs`)
 	if len(runs) != 1 {
 		t.Fatalf("runs 应有 1 行，实际 %d 行：%v", len(runs), runs)
@@ -504,7 +509,7 @@ func testRealSchedulerManageSelf(t *testing.T) {
 	requireRealContains(t, h, string(agentFile(t, h, "demo")), `- id: "self-added"`,
 		"AGENT.md 必须写回任务 id")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT task_id, agent_name FROM scheduled_tasks`)
 	if len(rows) != 1 {
 		t.Fatalf("scheduled_tasks 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -551,7 +556,7 @@ func testRealSchedulerManageOtherDenied(t *testing.T) {
 		t.Fatalf("demo-b 的 AGENT.md 被改动：\n--- 之前 ---\n%s\n--- 之后 ---\n%s", want, got)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "manage_schedule", "failed", "invalid_input", 1)
 	audit := queryRows(t, db, `SELECT error_message FROM tool_invocations WHERE tool_name = 'manage_schedule'`)
 	requireContains(t, stringValue(t, audit[0], "error_message"), "属于 Agent demo-a", "审计点名归属")
@@ -580,7 +585,7 @@ func testRealRestartSession(t *testing.T) {
 	requireRealExit(t, h, second, 0, "重启后对话")
 	requireRealContains(t, h, second.Stdout, "5821", "重启后必须复述此前的数字")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 2 {
 		t.Fatalf("runs 应有 2 行，实际 %d 行", n)
 	}
@@ -619,7 +624,7 @@ func testRealWebInvokeTool(t *testing.T) {
 	if hits := service.hits.Load(); hits == 0 {
 		t.Fatal("回环天气服务未收到任何请求：模型没有真正调用 http_get")
 	}
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "http_get", "success", "", 1)
 	accountRealModelCalls(t, llm, db, "web_invoke_tool")
 }
@@ -658,7 +663,7 @@ func testRealFeishuSend(t *testing.T) {
 	requireAbsent(t, res.Stdout+res.Stderr, token, "进程输出不得回显 webhook 令牌")
 	requireAbsentInWorkspace(t, h.Root, token, "webhook 令牌不得落盘到工作区")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "notify", "success", "", 1)
 	audit := queryRows(t, db, `SELECT error_message FROM tool_invocations WHERE tool_name = 'notify'`)
 	if message, ok := audit[0]["error_message"].(string); ok {
@@ -707,7 +712,7 @@ func testRealFeishuRedaction(t *testing.T) {
 	requireAbsent(t, res.Stdout+res.Stderr, token, "进程输出不得回显 webhook 令牌")
 	requireAbsentInWorkspace(t, h.Root, token, "webhook 令牌不得落盘到工作区")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status, error_kind, error_message FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)

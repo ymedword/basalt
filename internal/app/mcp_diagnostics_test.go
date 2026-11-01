@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是颗粒度文档 §4.3 与约束 C-04 的验收面：MCP server 只读依赖诊断回答"当前这条

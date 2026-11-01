@@ -24,8 +24,10 @@ export const CREDENTIAL_SUMMARY_TITLE = '当前连接凭据'
  * recovery guide and forbids the two costliest missteps.
  */
 export const INSTANCE_SECRETS_RECOVERY_BANNER =
-  '实例主密钥需要恢复：托管凭据当前无法解密，相关调用会被拒绝。' +
-  '请按 docs/Operations.md 的主密钥恢复步骤处置；不要删除密钥文件，也不要重新初始化。'
+  '实例主密钥需要恢复：托管凭据当前不可用，相关调用会被拒绝。' +
+  '记录与密钥不自洽时，密钥能解开密文也不代表可用。' +
+  '请先备份实例密钥文件与数据库，再按 docs/Operations.md 的主密钥恢复步骤离线处置（网页不提供一键修复）；' +
+  '不要删除密钥文件，也不要重新初始化。'
 
 /** 恢复原因的固定文案（契约 InstanceSecretsReason 七值）。 */
 // Fixed Chinese text for each recovery reason; the wire values stay unchanged.
@@ -33,7 +35,7 @@ const RECOVERY_REASON_LABELS: Readonly<Record<string, string>> = {
   missing: '密钥文件不存在',
   corrupt: '密钥文件损坏或校验失败',
   key_id_mismatch: '密钥与初始化记录不符',
-  unprovable_provenance: '存在无法证明来源的密钥文件',
+  unprovable_provenance: '存在无法证明来源的密钥文件，或无记录但已存在托管密文',
   unavailable: '无法判定（读取失败）',
   key_path_missing: '主密钥路径缺失',
 }
@@ -104,7 +106,7 @@ export function instanceSecretsDetail(view: InstanceSecretsView): string {
         ? '尚未初始化；首次保存加密托管凭据时会自动完成初始化。'
         : '此实例以纯环境变量方式部署（secrets.auto_init: false）；加密托管不可用。'
     case 'recovery_required':
-      return '托管凭据当前无法解密；按 docs/Operations.md 恢复主密钥。'
+      return '托管凭据当前不可用；先备份实例密钥文件与数据库，再按 docs/Operations.md §6.4 用 secrets recover-record 离线恢复；schema 3～5 存量副本按 §6.5 用 secrets adopt-legacy 升级。网页不提供一键修复。'
     default:
       return '状态未知；以实例接口返回为准。'
   }

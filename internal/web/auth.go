@@ -84,7 +84,19 @@ type authGuard struct {
 	limiter   *authLimiter
 	logger    *slog.Logger
 	now       func() time.Time
+
+	// principals 是调用方 Key 解析端口（T025）：nil 表示本实例还未装配 Key 存储，
+	// 此时业务面的 caller key 一律认证失败、管理面也识别不出"有效 caller key"。
+	// nil means caller keys cannot authenticate at all—never a promotion to admin.
+	principals PrincipalAuthenticator
 }
+
+// 认证面标签：只用于拒绝日志的行首文案，不进入响应（响应面文案与状态码固定）。
+// Surface labels shape the WARN line only; the response surface stays fixed.
+const (
+	surfaceManagement = "management"
+	surfaceBusiness   = "business"
+)
 
 // authFailure 是一次认证拒绝的内部描述：rule 只进日志（约束 45 允许日志详细），
 // status / code / message 才是响应面——401 与 403 的文案不得随规则变化。
@@ -184,43 +196,55 @@ func (g *authGuard) Wrap(next adminHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := requestIDFrom(r.Context())
 		source := sourceOf(r, g.proxies)
-		if !g.hostAllowed(r.Host) {
-			g.reject(w, requestID, r, source, authFailure{
-				rule: "host", status: http.StatusForbidden,
-				code: codeForbidden, message: messageForbidden,
-			})
-			return
-		}
-		if !g.originAllowed(r.Header.Get("Origin")) {
-			g.reject(w, requestID, r, source, authFailure{
-				rule: "origin", status: http.StatusForbidden,
-				code: codeForbidden, message: messageForbidden,
-			})
-			return
-		}
-		limitKey := authLimitKey(source)
-		// 429 先于凭据校验（约束 7）：被限速的来源即使带正确 token 也不再进入
-		// token 比较，避免"试探一次、看一次响应"的暴力通道。
-		// The 429 gate precedes the credential check, so a limited source never
-		// reaches the token comparison even with a valid credential.
-		if retryAfter, limited := g.limiter.blocked(limitKey); limited {
-			g.reject(w, requestID, r, source, authFailure{
-				rule: "rate_limited", status: http.StatusTooManyRequests,
-				code: codeAuthRateLimited, message: messageAuthRateLimited,
-				retryAfter: retryAfter,
-			})
+		limitKey, ok := g.gate(w, r, requestID, source, surfaceManagement)
+		if !ok {
 			return
 		}
 		actor, failure := g.authenticate(r, source)
 		if failure != nil {
 			g.recordFailure(requestID, source, limitKey, *failure)
-			g.reject(w, requestID, r, source, *failure)
+			g.reject(w, requestID, r, source, surfaceManagement, *failure)
 			return
 		}
 		// 成功认证**不**调用 limiter.Reset：窗口只在到期时清零（约束 7）。
 		// A successful authentication never resets the window.
 		next(w, r, actor)
 	})
+}
+
+// gate 执行两个认证面共用的三道前置判定：Host → Origin → 429 来源限速。任一不
+// 通过时已经写好响应，返回 ok=false；全部通过时把限速键交给调用方记账。
+// 429 先于凭据校验（约束 7）：被限速的来源即使带正确 token 也不再进入凭据比较，
+// 避免"试探一次、看一次响应"的暴力通道。
+// gate runs the three checks both surfaces share; the 429 gate precedes the
+// credential check so a limited source never reaches the comparison.
+func (g *authGuard) gate(
+	w http.ResponseWriter, r *http.Request, requestID, source, surface string,
+) (string, bool) {
+	if !g.hostAllowed(r.Host) {
+		g.reject(w, requestID, r, source, surface, authFailure{
+			rule: "host", status: http.StatusForbidden,
+			code: codeForbidden, message: messageForbidden,
+		})
+		return "", false
+	}
+	if !g.originAllowed(r.Header.Get("Origin")) {
+		g.reject(w, requestID, r, source, surface, authFailure{
+			rule: "origin", status: http.StatusForbidden,
+			code: codeForbidden, message: messageForbidden,
+		})
+		return "", false
+	}
+	limitKey := authLimitKey(source)
+	if retryAfter, limited := g.limiter.blocked(limitKey); limited {
+		g.reject(w, requestID, r, source, surface, authFailure{
+			rule: "rate_limited", status: http.StatusTooManyRequests,
+			code: codeAuthRateLimited, message: messageAuthRateLimited,
+			retryAfter: retryAfter,
+		})
+		return "", false
+	}
+	return limitKey, true
 }
 
 // recordFailure 记录计入配额的认证失败；来源刚进入限速时补一条 WARN——下一次
@@ -269,6 +293,17 @@ func (g *authGuard) authenticateToken(r *http.Request, source string) (core.Acto
 	}
 	sum := sha256.Sum256([]byte(token))
 	if subtle.ConstantTimeCompare(sum[:], g.tokenHash[:]) != 1 {
+		// 有效 caller key 打管理面 → 403（契约 §8）：两面凭据不互换，但也不能把
+		// "拿错了面"报成凭据无效。这次拒绝**不**计入失败配额——凭据本身有效，
+		// 计数会让调用方把自己锁进 429。
+		// A valid caller key on the management surface is 403, not 401, and it is not
+		// counted as a credential failure.
+		if g.validCallerKey(r.Context(), token) {
+			return core.Actor{}, &authFailure{
+				rule: "caller_key_on_management", status: http.StatusForbidden,
+				code: codeForbidden, message: messageForbidden,
+			}
+		}
 		return core.Actor{}, &authFailure{
 			rule: "credential_invalid", status: http.StatusUnauthorized,
 			code: codeUnauthorized, message: messageUnauthorized, counted: true,
@@ -337,8 +372,17 @@ func (g *authGuard) originAllowed(raw string) bool {
 // 日志字段经 safeLogValue 投影：转发头是外部输入，不得伪造日志行。
 // One WARN line carries the rule, source, and tracing id; the response body stays
 // fixed. External inputs are projected before logging.
-func (g *authGuard) reject(w http.ResponseWriter, requestID string, r *http.Request, source string, failure authFailure) {
-	g.logger.Warn("管理面请求被拒绝",
+func (g *authGuard) reject(
+	w http.ResponseWriter, requestID string, r *http.Request, source, surface string, failure authFailure,
+) {
+	message := "管理面请求被拒绝"
+	if surface == surfaceBusiness {
+		// 业务面拒绝另起一行文案：两面共用同一个限速器与字段，但排障时必须能一眼
+		// 分清是哪个面的拒绝。
+		// The business surface logs its own line so the two surfaces stay separable.
+		message = "业务面请求被拒绝"
+	}
+	g.logger.Warn(message,
 		"request_id", requestID,
 		"method", r.Method,
 		"path", safeLogValue(r.URL.Path),

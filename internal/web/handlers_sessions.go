@@ -15,8 +15,10 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/ymedword/basalt/internal/callers"
 	"github.com/ymedword/basalt/internal/core"
 )
 
@@ -34,9 +36,11 @@ const (
 // handleCreateSession 派生 id 后按 (channel,user_id,agent) 建行；新建时 rec.Status
 // 显式置 active（契约 SessionSummary.status 枚举），不依赖 SQLite DEFAULT 的回读。
 // 参数校验失败（agent 缺失 / null）在创建之前返回 400：零创建、零修改。
-// handleCreateSession derives the session id, validates before any write, and is
-// idempotent for the same tuple.
-func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+// `caller_id` 写入 `principal.CallerID`（C-28）；命中**他人**已存在的会话统一 404
+// ——既不能把自己的会话名让给别人，也不泄露该会话是否存在。
+// handleCreateSession derives the session id, writes the owner, and answers 404 for a
+// session owned by another caller.
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, principal core.Principal) {
 	var body struct {
 		Agent   *string `json:"agent"`
 		Channel *string `json:"channel"`
@@ -70,6 +74,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ProfileName:  *body.Agent,
 		Channel:      channel,
 		UserID:       userID,
+		CallerID:     principal.CallerID,
 		Status:       statusActive,
 		CreatedAt:    now,
 		LastActiveAt: now,
@@ -79,7 +84,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		s.writeStoreError(w, err, rec.ID)
 		return
 	}
+	if !principalOwnsSession(principal, got) {
+		// 同一 (channel,user_id,agent) 已属于别的调用方：按"不存在"回答，**不得**
+		// 返回该行摘要（那样等于把他人会话的元数据借给新调用方）。
+		// A row owned by someone else is reported as missing, never summarised.
+		s.writeError(w, http.StatusNotFound, codeNotFound, "未找到会话："+rec.ID)
+		return
+	}
 	s.writeOK(w, sessionSummaryView(got))
+}
+
+// principalOwnsSession 判定身份能否访问该会话：内置管理员恒真；调用方必须与
+// `sessions.caller_id` 逐字相等。空归属（迁移遗留 / 管理面创建）**不**对调用方
+// 放行——缺失归属按"不是你的"处理，而不是按"无主"处理（C-28）。
+// principalOwnsSession admits the admin and the exact owner only; a missing owner is
+// treated as someone else's, never as unowned.
+func principalOwnsSession(principal core.Principal, rec core.SessionRecord) bool {
+	if principal.Kind == core.PrincipalLocalAdmin {
+		return true
+	}
+	return rec.CallerID != "" && rec.CallerID == principal.CallerID
 }
 
 // handleGetSession 返回会话摘要 + 最近 100 条消息（按 seq 升序）；归档会话照读。
@@ -146,7 +170,7 @@ func (s *Server) writeStoreError(w http.ResponseWriter, err error, sessionID str
 // AgentService 内（宪法 II / V）。
 // handlePostMessage validates, reads the session, runs, and maps; admission and
 // archiving are decided by the service, and a disconnected client gets no response.
-func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, principal core.Principal) {
 	id := r.PathValue("id")
 	var body struct {
 		Message *string `json:"message"`
@@ -165,10 +189,17 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 读面只取 ProfileName / UserID；未命中 → 既有 404 文案。
+	// 读面只取 ProfileName / UserID；未命中 → 既有 404 文案。归属校验**先于**任何
+	// 运行副作用：跨调用方与"不存在"共用同一 404，不泄露会话存在（C-28）。
+	// The ownership check runs before any run side effect and shares the 404 shape with
+	// a missing session.
 	rec, err := s.opts.Sessions.GetSession(r.Context(), id)
 	if err != nil {
 		s.writeStoreError(w, err, id)
+		return
+	}
+	if !principalOwnsSession(principal, rec) {
+		s.writeError(w, http.StatusNotFound, codeNotFound, "未找到会话："+id)
 		return
 	}
 
@@ -176,6 +207,10 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	started := s.now()
 	req := core.RunRequest{
+		// 身份由业务认证中间件显式传入（T025）：**不得**在这里补默认值，也不得
+		// 放进 context（宪法 VII / C-28）。
+		// The principal is the middleware's explicit parameter, never a default here.
+		Principal:              principal,
 		Agent:                  rec.ProfileName,
 		SessionID:              id,
 		Message:                *body.Message,
@@ -183,6 +218,11 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		UserID:                 rec.UserID,
 		Budget:                 s.opts.RunBudget,
 		RequireExistingSession: true,
+		// 服务端生成的追踪标识（A-F2 / C-F02）：Run 准入在账本创建之前拒绝时，
+		// 管理端只能靠它定位事件。来源是 recoverMiddleware 注入的 context 值，
+		// **不读**客户端请求头（否则调用方可伪造关联）。
+		// The server-generated tracing id, never taken from a client header.
+		RequestID: requestIDFrom(r.Context()),
 	}
 	res, err := s.opts.Runs.Run(runCtx, req)
 	if r.Context().Err() != nil {
@@ -229,7 +269,7 @@ func (s *Server) handleArchiveSession(w http.ResponseWriter, r *http.Request) {
 // handleInvoke 是无状态调用：不建会话、不追加消息、无 409（无会话可锁，只有 429）；
 // 响应 session_id 为空串，运行记录与审计照写（约束 10）。
 // handleInvoke is the stateless run: no session row, no message writes, no 409.
-func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request, principal core.Principal) {
 	name := r.PathValue("name")
 	var body struct {
 		Message *string `json:"message"`
@@ -256,12 +296,16 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	started := s.now()
 	req := core.RunRequest{
+		Principal: principal, // 业务认证中间件显式传入（T025），不得补默认值
 		Agent:     name,
 		SessionID: "", // 无状态调用（契约 §1.1）
 		Message:   *body.Message,
 		Channel:   channelWeb,
 		UserID:    defaultUserID,
 		Budget:    s.opts.RunBudget,
+		// 同 handlePostMessage：服务端生成，不读客户端头（A-F2 / C-F02）。
+		// Same server-generated id as handlePostMessage.
+		RequestID: requestIDFrom(r.Context()),
 	}
 	res, err := s.opts.Runs.Run(runCtx, req)
 	if r.Context().Err() != nil {
@@ -323,12 +367,57 @@ func (s *Server) writeRunAdmissionError(w http.ResponseWriter, err error) bool {
 	return true
 }
 
+// writeQuotaExhausted 写 429 `QUOTA_EXHAUSTED`，并在错误带恢复时间时给 `Retry-After`
+// （契约 §8：周期额度不足给到下一周期起点）。限额为零、限额行缺失与 `overage > 0`
+// 未核对都没有日历上的恢复时间——等一个周期也不会恢复，靠管理员调额或核对，因此
+// **不发**头：给错方向的等待比不给更误导。
+// writeQuotaExhausted adds Retry-After only when the calendar holds a recovery instant.
+func (s *Server) writeQuotaExhausted(w http.ResponseWriter, err error) {
+	var quotaErr *callers.QuotaExhaustedError
+	if errors.As(err, &quotaErr) && !quotaErr.RetryAt.IsZero() {
+		if remaining := time.Until(quotaErr.RetryAt); remaining > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(remaining), 10))
+		}
+	}
+	s.writeError(w, http.StatusTooManyRequests, codeQuotaExhausted,
+		errorCodeMessage(codeQuotaExhausted, ""))
+}
+
 // writeRunError 把运行失败按类型映射为固定响应；未识别的失败只记日志、回固定 500。
 func (s *Server) writeRunError(w http.ResponseWriter, err error, runCtx context.Context) {
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		s.writeError(w, http.StatusGatewayTimeout, codeTimeout, "运行超过 60 秒时限")
 		return
 	}
+	// 认证失败的防御分支（C-F08）：正常路径由认证中间件与企业服务层拦截，能走到这里
+	// 说明服务层在"已认证请求"上又判了一次身份。只认哨兵 `core.ErrUnauthorized`——
+	// 按文案匹配会把内部错误误报成 401，也会让改一句文案就改变状态码（约束 22）。
+	// 排在两个调用方 429 之前：同一条 error 链同时命中时，身份问题先暴露（先修身份
+	// 才谈得上名额）。401 不带 `Retry-After`；日志只带 request_id，不带身份与凭据。
+	// The defensive identity branch matches the sentinel only and precedes the two
+	// caller 429s; the log carries request_id but never the identity or credentials.
+	if errors.Is(err, core.ErrUnauthorized) {
+		s.logger().Warn("运行入口认证失败", "request_id", requestIDFrom(runCtx))
+		s.writeError(w, http.StatusUnauthorized, codeUnauthorized, messageUnauthorized)
+		return
+	}
+	// 调用方准入的两个拒绝在运行入口**原样上抛**（[3] 见 `run_admission.go`，[5] 见
+	// `call_quota.go` 的文件头），契约把它们的码冻结成互不合并的 429（§8）：这里不
+	// 认领就只能落到末行的 500 INTERNAL，调用方分不清"该等名额"与"该等周期"。
+	// `ErrRateLimited` 不在此列——[2] 的入口速率由认证后的 HTTP 中间件承担，运行入口
+	// 的 error 链里不会出现它（C-35 的三段分工）。
+	// The two caller refusals surface unchanged from the run entry; the contract freezes
+	// them as separate 429 codes, so a 500 here would hide which one happened.
+	if errors.Is(err, callers.ErrConcurrencyLimited) {
+		s.writeError(w, http.StatusTooManyRequests, codeCallerConcurrencyLimited,
+			errorCodeMessage(codeCallerConcurrencyLimited, ""))
+		return
+	}
+	if errors.Is(err, callers.ErrQuotaExhausted) {
+		s.writeQuotaExhausted(w, err)
+		return
+	}
+
 	var archivedErr *core.SessionArchivedError
 	if errors.As(err, &archivedErr) {
 		s.writeError(w, http.StatusBadRequest, codeBadRequest, "会话已归档，不可追加消息")

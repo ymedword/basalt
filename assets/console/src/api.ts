@@ -117,7 +117,13 @@ export interface AgentContentChanges {
   notify_channels?: string[]
   /** 表单显式选择的绑定：服务端在同一写边界合并，不按名重解析 UID。 */
   bindings?: AgentContentBinding[]
-  settings?: { max_iterations?: number; max_history_turns?: number }
+  /** include_global_memory：true/false = 写入该行；null = 删除该行（回到未声明）；省略 = 不改。 */
+  settings?: {
+    max_iterations?: number
+    max_history_turns?: number
+    include_global_memory?: boolean | null
+  }
+  knowledge?: { name: string; access: 'read' }[]
   schedules?: Record<string, unknown>[]
 }
 
@@ -196,10 +202,11 @@ export interface AgentConfigFields {
   skills: string[]
   mcp_servers: string[]
   bootstrap: string[]
+  knowledge?: { name: string; access: 'read' }[] | null
   notify_mode: NotifyMode
   notify_channels: string[]
   resource_bindings: AgentConfigBindings
-  settings: { max_iterations: number; max_history_turns: number }
+  settings: { max_iterations: number; max_history_turns: number; include_global_memory?: boolean }
   schedules: AgentConfigSchedule[]
 }
 
@@ -367,9 +374,56 @@ export interface RunCancelResult {
 export interface MemoryView {
   scope: 'global' | 'agent'
   agent: string
-  backend: 'markdown' | 'sqlite'
+  /** 运行时唯一记忆载体（D-18）；markdown / sqlite 载体已退役。 */
+  backend: 'postgres'
   core: string
   archive: string
+}
+
+/**
+ * 记忆六态（契约 `schema.pg.sql` 的 CHECK 闭集）。**没有** expired：到期不是状态，
+ * 由 `valid_to` 表达——页面按状态过滤时不得把"到期"当第七态。
+ */
+export type MemoryEntryState =
+  | 'candidate'
+  | 'active'
+  | 'superseded'
+  | 'corrected'
+  | 'deleted'
+  | 'conflicted'
+
+/**
+ * 结构化读模型的一行：带主键与状态。没有主键页面就没有可确认 / 纠正 / 删除的对象，
+ * 没有状态就看不见候选与已删条目。它是**管理视图**，不是召回结果。
+ */
+export interface MemoryEntryView {
+  entry_id: number
+  scope: 'global' | 'agent'
+  /** scope=agent 时给出；全局层为空串。 */
+  agent: string
+  section: 'core' | 'archive'
+  state: MemoryEntryState
+  content: string
+  source: 'save_memory' | 'explicit_propose' | 'legacy_import' | 'migration'
+  /** 0 = 无（纠正 / 替代链上的上一条）。 */
+  supersedes_id: number
+  created_at: string
+}
+
+export interface MemoryEntryListView {
+  scope: 'global' | 'agent'
+  agent: string
+  entries: MemoryEntryView[]
+}
+
+/** 四个写动作的统一回执：页面据此只刷新受影响的行。 */
+export interface MemoryEntryReceipt {
+  entry_id: number
+  state: MemoryEntryState
+  /** 仅纠正是被替代的旧条主键；其余为 0。 */
+  replaced_id: number
+  /** 仅提议有意义：命中同源去重 = true（未新增行，entry_id 是既有条目）。 */
+  merged: boolean
 }
 
 export interface NotifyChannelView {
@@ -924,7 +978,16 @@ export type OperationTargetKind =
   | 'skill'
   | 'notify_channel'
   | 'network_allowlist'
+  | 'network_denylist'
+  | 'execution_policy'
+  | 'network_exception'
   | 'system'
+  | 'caller'
+  | 'instance'
+  | 'memory'
+  | 'knowledge_upload'
+  | 'knowledge_document'
+  | 'knowledge_collection'
 
 export interface OperationView {
   operation_id: string

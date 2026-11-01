@@ -32,7 +32,7 @@ const messageOperationUnknown = "操作结果未查证，需按独立操作契�
 // Fixed 400 texts for the three validated parameters; request values are not echoed.
 const (
 	badOperationStatusMessage = "status 取值非法（可选：pending / success / failed / unknown）"
-	badOperationKindMessage   = "target_kind 取值非法（可选：agent / schedule / model_connection / mcp_server / skill / notify_channel / network_allowlist / network_denylist / execution_policy / network_exception / system）"
+	badOperationKindMessage   = "target_kind 取值非法（可选：agent / schedule / model_connection / mcp_server / skill / notify_channel / network_allowlist / network_denylist / execution_policy / network_exception / system / caller / instance / memory / knowledge_upload / knowledge_document / knowledge_collection）"
 	badOperationLimitMessage  = "limit 必须是 1–200 之间的整数"
 )
 
@@ -84,13 +84,21 @@ func validOperationStatus(status string) bool {
 	}
 }
 
-// validOperationTargetKind 只接受契约 target_kind 的十一个枚举值；网络白名单 / 禁止域名 /
-// 执行档位 / 访问例外的写入行各自由同名动作产生，读侧必须能按同一字面量过滤。
-// validOperationTargetKind accepts exactly the eleven contract kind literals.
+// validOperationTargetKind 只接受契约 target_kind 的十七个枚举值；网络白名单 / 禁止域名 /
+// 执行档位 / 访问例外的写入行各自由同名动作产生，读侧必须能按同一字面量过滤；`caller`
+// 同理——`caller.*` 动作的 target_id 是 caller_id，过滤不到等于操作行不可检索；`instance`
+// 是离线采纳（`instance.adopt`）的目标类型，过滤不到等于采纳审计不可检索；`memory`
+// 是四个记忆动作的目标类型，过滤不到等于记忆的纠正 / 删除审计不可检索。
+//
+// 三个 `knowledge_*` 同理：上传 / 重建 / 集合简介各自写一条管理操作行，过滤不到就等于
+// 知识库的管理面审计不可检索——而审计可检索是宪法第 5 条的落地判据，不是可选装饰。
+// validOperationTargetKind accepts exactly the seventeen contract kind literals.
 func validOperationTargetKind(kind string) bool {
 	switch kind {
 	case "agent", "schedule", "model_connection", "mcp_server", "skill", "notify_channel",
-		"network_allowlist", "network_denylist", "execution_policy", "network_exception", "system":
+		"network_allowlist", "network_denylist", "execution_policy", "network_exception", "system",
+		"caller", "instance", "memory",
+		core.TargetKindKnowledgeUpload, core.TargetKindKnowledgeDocument, core.TargetKindKnowledgeCollection:
 		return true
 	default:
 		return false

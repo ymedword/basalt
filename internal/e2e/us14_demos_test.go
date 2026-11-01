@@ -715,17 +715,17 @@ type demoRunEvidence struct {
 // readDemoEvidence reads the run's terminal state and the notify/failure counts.
 func readDemoEvidence(t *testing.T, h *harness, runID string) demoRunEvidence {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	var out demoRunEvidence
 	if err := db.QueryRow(
-		`SELECT status, trigger, iterations, tool_calls FROM runs WHERE run_id = ?`, runID,
+		`SELECT status, trigger, iterations, tool_calls FROM runs WHERE run_id = $1`, runID,
 	).Scan(&out.Status, &out.Trigger, &out.Iterations, &out.ToolCalls); err != nil {
 		t.Fatalf("读 Run %s 失败: %v", runID, err)
 	}
 	out.Notify = scalarInt(t, db,
-		`SELECT COUNT(*) FROM tool_invocations WHERE run_id = ? AND tool_name = 'notify'`, runID)
+		`SELECT COUNT(*) FROM tool_invocations WHERE run_id = $1 AND tool_name = 'notify'`, runID)
 	out.Failed = scalarInt(t, db,
-		`SELECT COUNT(*) FROM tool_invocations WHERE run_id = ? AND status <> 'success'`, runID)
+		`SELECT COUNT(*) FROM tool_invocations WHERE run_id = $1 AND status <> 'success'`, runID)
 	return out
 }
 
@@ -740,10 +740,10 @@ func demoShellResults(t *testing.T, h *harness, runID string) []string {
 // demoToolResults returns each call's result body for one tool, in call order.
 func demoToolResults(t *testing.T, h *harness, runID, toolName string) []string {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT result_json FROM tool_invocations
-		  WHERE run_id = ? AND tool_name = ? ORDER BY id`, runID, toolName)
+		  WHERE run_id = $1 AND tool_name = $2 ORDER BY id`, runID, toolName)
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, toolResultContent(t, stringValue(t, row, "result_json")))
@@ -771,10 +771,10 @@ func toolResultContent(t *testing.T, raw string) string {
 // demoNotifyTexts returns the contents sent through the notify tool in one run.
 func demoNotifyTexts(t *testing.T, h *harness, runID string) []string {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT input_json FROM tool_invocations
-		  WHERE run_id = ? AND tool_name = 'notify' ORDER BY id`, runID)
+		  WHERE run_id = $1 AND tool_name = 'notify' ORDER BY id`, runID)
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
 		var input map[string]any
@@ -791,10 +791,10 @@ func demoNotifyTexts(t *testing.T, h *harness, runID string) []string {
 // demoExecution reads the task's latest execution row.
 func demoExecution(t *testing.T, h *harness, taskID string) (runID, trigger, status string) {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if err := db.QueryRow(
 		`SELECT COALESCE(run_id, ''), trigger, status FROM task_executions
-		  WHERE task_id = ? ORDER BY id DESC LIMIT 1`, taskID,
+		  WHERE task_id = $1 ORDER BY id DESC LIMIT 1`, taskID,
 	).Scan(&runID, &trigger, &status); err != nil {
 		t.Fatalf("读任务 %s 的执行历史失败: %v", taskID, err)
 	}
@@ -819,9 +819,9 @@ func demoDeliveryText(t *testing.T, body string) string {
 // demoDeliveryStatus reads the system delivery status of one run (empty when absent).
 func demoDeliveryStatus(t *testing.T, h *harness, runID string) string {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	var status string
-	err := db.QueryRow(`SELECT status FROM schedule_deliveries WHERE run_id = ?`, runID).Scan(&status)
+	err := db.QueryRow(`SELECT status FROM schedule_deliveries WHERE run_id = $1`, runID).Scan(&status)
 	if err != nil {
 		return ""
 	}
@@ -911,9 +911,27 @@ func newInstalledDemoFixture(t *testing.T) *demoFixture {
 	return newDemoFixtureMode(t, true)
 }
 
+// newDemoFixtureWithoutReceiver 是**不判通知投递**的用例入口：回环 `:80` 需要 bind
+// 特权，而没有投递判据的用例不该为了一个用不到的接收端把整条链路挡在权限上
+// （CI 与本地验收都以普通用户运行）。用它的用例**不得**读 `f.recv`。
+// newDemoFixtureWithoutReceiver skips the port-80 receiver for cases with no delivery
+// judgement; such cases must never read f.recv.
+func newDemoFixtureWithoutReceiver(t *testing.T) *demoFixture {
+	t.Helper()
+	return newDemoFixtureAssembly(t, false, false)
+}
+
 // newDemoFixtureMode 是两个入口共用的装配：installed 决定 Demo 的来源。
 // newDemoFixtureMode is the shared assembly; installed picks where the demos come from.
 func newDemoFixtureMode(t *testing.T, installed bool) *demoFixture {
+	t.Helper()
+	return newDemoFixtureAssembly(t, installed, true)
+}
+
+// newDemoFixtureAssembly 是三个入口共用的装配：installed 决定 Demo 的来源，
+// withReceiver 决定要不要绑回环 `:80`。
+// newDemoFixtureAssembly is the shared assembly behind all three entry points.
+func newDemoFixtureAssembly(t *testing.T, installed, withReceiver bool) *demoFixture {
 	t.Helper()
 	repo, err := repoRoot()
 	if err != nil {
@@ -926,9 +944,11 @@ func newDemoFixtureMode(t *testing.T, installed bool) *demoFixture {
 		addr:      freeLoopbackAddr(t),
 		python:    demoPython(t),
 		model:     newDemoModel(t),
-		recv:      startDemoReceiver(t),
 		specs:     map[string]string{},
 		installed: installed,
+	}
+	if withReceiver {
+		f.recv = startDemoReceiver(t)
 	}
 	f.docs = buildDocsReadOnlyBinary(t, f.repo)
 	f.docsRoot = filepath.Join(t.TempDir(), "docs")
@@ -1515,10 +1535,10 @@ func (f *demoFixture) requireNotifyCount(t *testing.T, runID string, want int, w
 // clearAgentMessages wipes one agent's session so the next run starts with zero history.
 func clearAgentMessages(t *testing.T, h *harness, agent string) {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if _, err := db.Exec(
 		`DELETE FROM messages
-		  WHERE session_id IN (SELECT session_id FROM sessions WHERE profile_name = ?)`,
+		  WHERE session_id IN (SELECT session_id FROM sessions WHERE profile_name = $1)`,
 		agent,
 	); err != nil {
 		t.Fatalf("清理 %s 的会话消息失败: %v", agent, err)
@@ -1526,7 +1546,7 @@ func clearAgentMessages(t *testing.T, h *harness, agent string) {
 	// 冗余计数跟着归零：只删消息不改计数，列表页会显示一个不存在的历史长度。
 	// The denormalized counter follows the rows it counts.
 	if _, err := db.Exec(
-		`UPDATE sessions SET message_count = 0 WHERE profile_name = ?`, agent,
+		`UPDATE sessions SET message_count = 0 WHERE profile_name = $1`, agent,
 	); err != nil {
 		t.Fatalf("重置 %s 的消息计数失败: %v", agent, err)
 	}
@@ -1536,10 +1556,10 @@ func clearAgentMessages(t *testing.T, h *harness, agent string) {
 // demoToolArgs returns every call's decoded arguments for one tool name.
 func demoToolArgs(t *testing.T, h *harness, runID, toolName string) []map[string]any {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT input_json FROM tool_invocations
-		  WHERE run_id = ? AND tool_name = ? ORDER BY id`, runID, toolName)
+		  WHERE run_id = $1 AND tool_name = $2 ORDER BY id`, runID, toolName)
 	out := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		var args map[string]any
@@ -1567,10 +1587,10 @@ func demoArgPaths(calls []map[string]any) []string {
 // demoToolPaths returns the path argument of each call to one tool in a run.
 func demoToolPaths(t *testing.T, h *harness, runID, toolName string) []string {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT input_json FROM tool_invocations
-		  WHERE run_id = ? AND tool_name = ? ORDER BY id`, runID, toolName)
+		  WHERE run_id = $1 AND tool_name = $2 ORDER BY id`, runID, toolName)
 	calls := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		var args map[string]any
@@ -4239,14 +4259,17 @@ func legacySummary(d *demoTurn) string {
 // judged by its own tests.
 func insertNetworkException(t *testing.T, h *harness, kind, value, note string) {
 	t.Helper()
+	// 写行前先确保运行期 schema 已迁移（见 ensureStore）：例外登记同样可能先于任何重命令。
+	// The runtime schema is migrated before the row is written; see ensureStore.
+	h.ensureStore(t)
 	id, err := core.NewNetworkExceptionID()
 	if err != nil {
 		t.Fatalf("生成例外标识失败: %v", err)
 	}
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if _, err := db.Exec(
 		`INSERT INTO network_exceptions(exception_id, kind, value, note, revision, created_at, operation_id)
-		 VALUES (?, ?, ?, ?, 1, ?, 'op-e2e-fixture-exception')`,
+		 VALUES ($1, $2, $3, $4, 1, $5, 'op-e2e-fixture-exception')`,
 		id, kind, value, note, time.Now().UnixMilli()); err != nil {
 		t.Fatalf("插入访问例外失败: %v", err)
 	}
@@ -4278,7 +4301,7 @@ func TestLegacyD1_HttpEndpoints(t *testing.T) {
 		t.Fatalf("剧本还剩 %d 步——Run 的轮次少于剧本", left)
 	}
 
-	db := openDB(t, f.h.dbPath())
+	db := f.h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT input_json, result_json, status, error_kind, error_message
 		   FROM tool_invocations WHERE tool_name = 'http_get' ORDER BY id`)

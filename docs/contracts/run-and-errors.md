@@ -337,6 +337,33 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 
 **RunID 生成规则**：`<channel>-<unix_millis>-<随机 6 位>`，全局唯一、可排序、可 grep。管理台"手动补跑"的 RunID 前缀仍为 `scheduler-`，靠 `runs.trigger` 列区分 `cron` / `manual`。
 
+### 5.1 运行来源段（模型可见，不是权限边界）
+
+每次 Run 的段一末尾**必须**追加一段固定的运行来源，供模型区分"即时对话"与"定时任务"：
+
+```text
+（段一正文）
+
+## 本次运行来源
+<下表对应的一句>
+```
+
+| Channel | Trigger | 追加的句子（逐字） |
+| --- | --- | --- |
+| `scheduler` | `cron` | `定时任务到期触发。请根据本次任务消息执行。` |
+| `scheduler` | `manual` | `用户手动运行了定时任务。请根据本次任务消息执行。` |
+| `scheduler` | 空 | `来自调度器，但触发方式未确认。请根据本次任务消息执行。` |
+| `web` / `cli` | 任意 | `来自用户或业务接口的即时请求。请根据本次消息的实际意图处理，不要仅因存在定时流程就自行执行它。` |
+| 其他（含 `admin`） | 任意 | **不追加任何字符**（连标题一起不出现，不是空小节） |
+
+**硬约束**：
+
+- 来源**必须**只取自服务端构造的 `RunRequest.Channel` + `Trigger`；**不得**从用户消息、会话行、请求头或模型输出推断——用户正文里写出同样的标题与句子只是普通文本。
+- 来源**不是**权限隔离或强制执行保证：同一 Agent 在两种来源下工具池、Policy、预算与审计逐字节一致；它不计入 `ConfigSnapshot` / `config_hash`，未映射渠道时提示词与旧版本逐字节相同。
+- 来源段拼接后计入段一的固定 token（`FixedParts.System`），因为它确实占模型上下文。
+
+违反时的症状与复核方式见 [技术方案 §3.3](../TechnicalDesign.md) 的运行来源段条目；实现判据为 `TestPrompt_RunOriginByChannel` / `TestPrompt_RunOriginOmittedForUnmappedChannel` / `TestPrompt_UserMessageCannotForgeRunOrigin`。
+
 ---
 
 ## 6. 执行预算与准入控制
@@ -456,6 +483,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 400 | `AGENT_RESOURCE_BINDING_MISSING` | 保存或准入时 `resource_bindings` 缺少对某个引用的绑定 | 点名缺失的 `{kind, name}`；不按名补绑 |
 | 400 | `AGENT_RESOURCE_BINDING_INVALID` | 绑定结构非法、UID 与当前发布指针不符、重复名或孤儿绑定 | 点名冲突字段；零写入 |
 | 400 | `CREDENTIAL_REVOKED` | 绑定的 Provider 凭据已撤销（保存时重新校验） | 点名资源与凭据状态；提示重新录入新值 |
+| 400 | `INVALID_SCOPE` | Key 发放 / 轮换时 scope 未知、为空，或属于管理面（`callers:admin` / `diagnostics:read`） | 点名非法 scope；零写入、零操作行，不留 `pending` |
 | 401 | `UNAUTHORIZED` | 管理凭据缺失或无效（token 模式或 local_trust 模式）；或 token 模式启动配置无效时的管理请求 | 不区分"没提供"与"提供错"，不回显 token |
 | 403 | `FORBIDDEN` | 跨源 / 来源被拒、Host 不在白名单、已认证但无权执行 | 说明被拒的边界；不回显内部路径 |
 | 404 | `NOT_FOUND` | Agent / 会话 / 渠道 / 资源 / 版本 / 归档不存在 | 点名查不到的名字 |
@@ -468,16 +496,30 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 409 | `CREDENTIAL_OWNER_MISMATCH` | 试图把凭据绑定到其他资源 UID，或借用其他资源的凭据 ID | 点名凭据与目标资源；不跨资源复用 |
 | 409 | `SECRETS_RECOVERY_REQUIRED` | 实例加密处于恢复态（密钥文件缺失 / 损坏 / `key_id` 与记录不符 / 发布残留来源不可证明），任何以密文为前提的操作被拒（含托管凭据解密、`POST /instance/secrets/init`） | 点名恢复态与恢复入口；**不**生成替代密钥、**不**回落 env、**不**删除来源不明的文件 |
 | 409 | `EXECUTION_PROFILE_MISMATCH` | `PUT /execution-policy` 的 `expected_profile` 与库内当前档位不一致 | 给出当前档位；零写入、零操作行；与修订号 CAS 的 `CONFLICT` 分开 |
+| 409 | `IDEMPOTENCY_CONFLICT` | 同一幂等键的再次请求与首次参数（`class` / `cost`）不一致 | 点名冲突参数；**不得**静默复用旧结果或新建第二行 |
 | 409 | `MCP_APPLY_SUPERSEDED` | `apply` 期间发生 publish / revoke / 另一次 `apply`，本次被取代 | 点名取代者配置的 `superseded_by`；候选注册与候选连接已撤回，`applied` 与旧连接不变 |
 | 500 | `MCP_APPLY_FAILED` | `apply` 在预检之后的启动 / 握手阶段失败，候选已可靠回收 | 点名 `failure_class` 与目标版本；`data.operation_id` 供查证；旧连接状态如实说明（含"旧连接也不合法"的情形） |
 | 409 | `AGENT_COPY_BLOCKED` | 复制源 Agent 引用了源 Agent 专属资源，且未提供显式映射 | 列出需要映射的资源名与类型；不产生副本 |
+| 410 | `GONE` | 目标已被保留策略 / 软删移除，**不再**可读（被裁剪的消息、已软删的文档与版本） | 说明已不可读与原因；不回显原文、标题或片段 |
 | 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
 | 429 | `TOO_MANY_RUNS` | 实例级并发超限 | 给出当前上限 |
-| 429 | `AUTH_RATE_LIMITED` | 同一来源管理认证失败次数超限 | 给出重试等待秒数 |
+| 429 | `AUTH_RATE_LIMITED` | 同一来源认证失败次数超限（管理面与业务面**共用**同一个来源限速器；业务面的凭据失败同样计数） | 给出重试等待秒数；先于凭据判定给出，此时请求还没有身份 |
+| 429 | `CALLER_RATE_LIMITED` | 调用方入口速率超限（每个已认证业务 HTTP 请求计一次，按 `IngressRun` / `IngressIngest` / `IngressRead` 分类） | 给 `Retry-After`；此时**尚未**进入并发与配额判定 |
+| 429 | `CALLER_CONCURRENCY_LIMITED` | 调用方并发 Run 名额用尽 | 给出当前上限；名额由**所有**退出路径归还 |
+| 429 | `QUOTA_EXHAUSTED` | 周期配额不足，或 `overage > 0` 期间拒绝新预留 | 给出恢复时间（下一周期起点）或管理员核对入口 |
 | 500 | `INTERNAL` | 未归类错误 | **不回显内部细节**（路径、堆栈、SQL） |
 | 503 | `NOT_CONFIGURED` | 能力未配置（作者模型缺失等） | **点名配置键** + 说明怎么配 |
 | 503 | `CREDENTIAL_UNAVAILABLE` | 托管凭据无法在当前主密钥下读取（文件缺失 / 权限不符 / 格式错误 / `key_id` 不匹配 / 解密失败） | 点名固定原因；说明 env 模式不受影响；不回显密钥材料 |
 | 504 | `TIMEOUT` | Run 超过调用方时限 | 给出时限值；Run 本身记为 `cancelled` |
+
+**US-16 准入类错误的判定顺序与合并禁区**（对应三段式 `Limiter`：`AdmitIngress` / `AdmitRun` / `AdmitCall`）：
+
+- 顺序固定：认证 → **入口速率** → 作用域与归属 → 调用方并发 → Run 准入 / 会话串行 → 配额预留 → 审计预写 → 真正调用（C-F03，2026-10-31 裁决：先限流、后作用域）。**不得**倒置：401 / 403 / 404 / 409 / 429 都是**纯准入判定**，失败时**不得**已发出任何外部调用，也**不得**留下未解释的预留（[5] 之后才需要 `Release`）。
+- **先限流的代价与收益**（同一裁决的判据面）：限流键 = ⟨调用方主体, 入口类别 `IngressRun` / `IngressIngest` / `IngressRead`⟩，与目标资源**无关**；管理凭据不进调用方桶；未认证请求在认证阶段即 401、不扣任何调用方的桶。作用域被拒的请求**扣自己的桶**——代价是调用方自伤，收益是无权调用方不能无限探测而不消耗任何名额。桶按调用方隔离：一个调用方耗尽不影响另一个，也不影响管理员。
+- **可观察差异（不得反转为存在性侧信道）**：同一调用方桶空后，无论请求是否越权、目标资源是否存在，都先得到**同形** 429 `CALLER_RATE_LIMITED`（带 `Retry-After`）；桶未空时，作用域不足回 403 `FORBIDDEN`（固定文案，不点名缺哪个 scope），跨调用方资源仍是 404 `NOT_FOUND`。三者判据分离，**不得**为了"少扣一次桶"把作用域判定提前。
+- 三个 429 **不得**合并为一个码：`CALLER_RATE_LIMITED`（每请求，HTTP 边界）、`CALLER_CONCURRENCY_LIMITED`（每 Run，一个名额）与 `QUOTA_EXHAUSTED`（每次真实消耗，周期额度）生命周期不同；`AUTH_RATE_LIMITED` 计的是**两个认证面共用**的同一来源认证失败（管理面与业务面都计数），它是凭据失败限速，**不得**当作调用方入口限流；`TOO_MANY_RUNS` 仍是实例级容量拒绝。
+- 调用方认证失败统一 401 `UNAUTHORIZED`，不区分"没带 Key / 无效 / 过期 / 已撤销"，不泄露 Key 是否存在。
+- 跨调用方访问他人会话 / 历史 → **404** `NOT_FOUND`（不是 403），不泄露资源存在性；管理端点收到 caller key → 403 `FORBIDDEN`。
 
 **错误文案纪律**：面向运维，点名"要改什么"；**不得**回显凭证、绝对路径、堆栈。沙箱拒绝的文案是**模型可见契约**（四段式，见技术方案 §4.3），与其他错误的读者不同——它的读者是模型，目的是让模型停止重试并告知人类。
 
@@ -528,7 +570,8 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 
 - 凭据缺失 / 无效：401 `UNAUTHORIZED`，响应不区分两种情形
 - 来源 / Host / Origin 被拒，或已认证但无权执行：403 `FORBIDDEN`
-- 同一来源 60 秒内失败 10 次：429 `AUTH_RATE_LIMITED`，`Retry-After` 给出剩余秒数；计数在进程内，重启清零
+- 同一来源 60 秒内失败 10 次：429 `AUTH_RATE_LIMITED`，`Retry-After` 给出剩余秒数；计数在进程内，重启清零。
+  管理面与业务面共用同一个来源限速器（凭据失败与 `local_trust` 的 403 计数；Host / Origin 的 403 在认证之前，不计数）
 - `/api/v1/health` 与静态页面壳可公开；其余管理数据读面与**所有可触发执行 / 修改的端点**（含 `POST /sessions`、`POST /sessions/{id}/messages`、`POST /agents/{name}/invoke`）一律认证
 
 ### 9.3 管理操作标识与审计
@@ -542,8 +585,10 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
   - `local_trust` → `actor_subject = local_trust`，语义为“未验证个人身份”
   - CLI → `actor_subject = cli:<本机用户>`；不冒充管理台登录身份
   - 迁移 → `actor_subject = migration`
-- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.test` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `mcp_server.apply` / `mcp_server.credential.revoke` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `system.baseline_v2` / `system.baseline_v3` / `system.secrets_init` / `network_allowlist.update` / `network_denylist.update` / `network_exception.create` / `network_exception.delete` / `execution_policy.update` / `execution_policy.confirm`
-- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system` / `network_allowlist` / `network_denylist` / `network_exception` / `execution_policy`
+- `action` 字面量（点号分隔，`<resource>.<verb>`）：`agent.create` / `agent.content.update` / `agent.files.update` / `agent.generate_files` / `agent.disable` / `agent.enable` / `agent.archive` / `agent.copy` / `agent.restore` / `schedule.enable` / `schedule.disable` / `model_connection.create` / `model_connection.update` / `model_connection.delete` / `model_connection.test` / `model_connection.publish` / `model_connection.credential.write` / `model_connection.credential.revoke` / `model_connection.scope` / `notify_channel.test` / `mcp_server.create` / `mcp_server.update` / `mcp_server.delete` / `mcp_server.test` / `mcp_server.publish` / `mcp_server.apply` / `mcp_server.credential.revoke` / `skill.create` / `skill.import` / `skill.update` / `skill.delete` / `skill.publish` / `notify_channel.create` / `notify_channel.update` / `notify_channel.delete` / `notify_channel.credential.write` / `notify_channel.credential.revoke` / `notify_channel.scope` / `system.baseline_v2` / `system.baseline_v3` / `system.secrets_init` / `network_allowlist.update` / `network_denylist.update` / `network_exception.create` / `network_exception.delete` / `execution_policy.update` / `execution_policy.confirm` / `caller.create` / `caller.key.issue` / `caller.key.revoke` / `caller.key.rotate` / `caller.limit.update` / `caller.reservation.reconcile` / `instance.adopt` / `memory.propose` / `memory.confirm` / `memory.correct` / `memory.delete` / `knowledge_document.upload` / `knowledge_document.reindex` / `knowledge_collection.description_update`
+- `target_kind` 字面量：`agent` / `schedule` / `model_connection` / `mcp_server` / `skill` / `notify_channel` / `system` / `network_allowlist` / `network_denylist` / `network_exception` / `execution_policy` / `caller` / `instance` / `memory` / `knowledge_upload` / `knowledge_document` / `knowledge_collection`
+- 三个 `knowledge_*` 动作的落点：`knowledge_document.upload` 的 `target_kind = knowledge_upload`、`target_id` = 源文件相对路径；`knowledge_document.reindex` 的 `target_kind = knowledge_document`、`target_id` = `document_id`；`knowledge_collection.description_update` 的 `target_kind = knowledge_collection`、`target_id` = `collection_id`。三者的 `detail_json` 只记标识、版本号与结果分类，**不**记文件正文、检索文本或片段内容
+- `caller.*` 动作的 `target_id` = `caller_id`（Key 是调用方的从属凭据，不是独立资源）；`detail_json` 只记 `key_id` / `key_prefix` / `scopes` / `expires_at_unix_ms`（0 = 不过期）/ 轮换的 `old_key_id` 与再绑定结果（`rebound_task_ids` / `left_bound[{task_id, reason}]`）以及吊销 `reason`。Key 明文**不得**出现在 `action` / `target_id` / `detail_json` / 错误原文的任一位置
 - 凭据与范围动作的 `target_id` = 资源 `resource_uid`（不是名称）；`detail_json` 只记资源名、`credential_id`、版本号、模式与状态，**不记明文 URL / 密钥 / 主密钥**。资源更新若同时改变凭据，按主操作写一条 `*.update`，不重复拆成两条互不相关的动作
 - `network_allowlist.update` 的 `target_id` = `policy_scope` 固定字面量 `http.allowed_domains`；`detail_json` 只记 `before_revision` / `after_revision` / `candidate_sha256`（规整域名按行连接的摘要），供启动恢复三态判定，不另存请求体
 - `network_denylist.update` 与上一条逐字同口径，`target_id` = `http.denied_domains`；白名单与禁止域名共用一张表但**不共用动作名**，读侧按 `target_kind` + `target_id` 就能区分两行
@@ -553,6 +598,8 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - `mcp_server.apply` 的 `target_id` = 资源 `resource_uid`；`detail_json` 固定键集为 `target_version_id` / `previous_version_id` / `applied_version_id` / `outcome` / `failure_class` / `superseded_by` / `drain_deadline`，**不**记 command / args / env / 头值
 - `mcp_server.credential.revoke` 的 `target_id` = 资源 `resource_uid`，`detail_json` 记 `binding_key`、被撤销的版本号、撤销前后 `revocation_epoch` 与状态；**不**记值、不记 `last4` 以外的任何片段
 - `system.secrets_init` 的 `target_id` = 固定字面量 `master_key`；`detail_json` 只记 `key_id`、`fingerprint`（可公开的密钥材料摘要）与 `recovered`（是否走了残留恢复），**不**记路径、不记密钥材料
+- `instance.adopt` 的 `target_kind` = `instance`，`target_id` = 固定字面量 `instance_identity`；`detail_json` 固定键集为 `candidate_instance_id` / `candidate_instance_id_sha256` / `case`（四判定编号 1～4）/ `key_path_persisted` / `key_path_config_key` / `managed_ciphertexts`。候选标识必须在**预写**时就写全，崩溃后只按它查证；**不**记密钥路径的值、密钥材料、密文或明文
+- 四个 `memory.*` 动作的 `target_kind` = `memory`，`target_id` 表达分层（全局层固定字面量 `global`，Agent 层 `agent:<name>`），条目主键只进 `detail_json`。`detail_json` 固定键集为 `entry_id` / `replaced_id` / `section` / `agent` / `state_before` / `state_after` / `content_sha256`；**正文不得**进 `detail_json`（记忆正文可能是用户隐私），只留规范化正文的 sha256。`memory.propose` 在预写时还拿不到新主键（领域层才分配），`entry_id` 允许为 0；命中去重时它是既有条目的主键，`state_after` 取该行的真实状态（新增行恒为 `candidate`；合并进 `active` 记忆时为 `active`，**不得**伪造成候选）
 - 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）；通知渠道测试**也要写**（它会对外发送一条 `Basalt 连通性测试`），同样不产生 Run、不伪造模型工具调用
 - `agent.generate_files` 字面量保留，但该端点**不写**管理操作行（唯一写入是 LLM 调用审计）；实现**不得**据字面量补恢复行、伪造操作或把草稿当变更
 - 管理操作审计与模型 / 工具调用审计**互不混写**；同一请求不得既写 `management_operations` 又把变更伪装成一次 Run
@@ -580,6 +627,8 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `execution_policy.confirm` | 只查证处置行本身：是否存在同一 `target_id` 且 `status = 'success'` 的 `execution_policy.confirm` 行 | 存在 `success` 行 | **不存在**（只有本 `pending` 行或无行） | 存在多个互相矛盾的处置行 → `unknown`。本动作没有"半个处置"：失败的复核按 fail-closed 记 `failed`，条目继续留在待确认列表，由人重做；**不得**把 `pending` 行补成 `success` |
 | `mcp_server.apply` | `applied` 指针（`applied_version_id`）与注册 epoch，对照 `detail_json` 的 `target_version_id` / `previous_version_id` | 指针 = `target_version_id` | 指针 = `previous_version_id` | 指针是第三个版本，或版本行已不存在 → `unknown`。候选注册与候选连接是进程内的，重启后自然消失；**不得**据 `pending` 行重放 `apply` |
 | `system.secrets_init` | `instance_secrets` 记录与密钥文件（走完整 `LoadMasterKey` + 来源可证明的残留恢复规则） | 记录存在、`key_id` 一致、文件校验通过且 `nlink` 已回到 1 | 记录不存在且可证明未创建任何文件（含临时链接） | 记录缺失但文件存在、或文件存在而来源不可证明 → `unknown` 并进恢复态；**不得**删除文件、**不得**生成第二把密钥 |
+| `instance.adopt` | 工作区名册 `instance.json` 的 `instance_id`，对照 `detail_json` 的 `candidate_instance_id`（该键缺省时才用 `candidate_instance_id_sha256`） | 名册存在且标识与候选逐字相等（或摘要相等） | 名册不存在（可证明未写入） | 名册存在但标识是第三个值、`detail_json` 解析失败、两个候选键都缺 → `unknown`。**不得**覆盖或补写已有名册，**不得**重做采纳 |
+| `memory.propose` / `memory.confirm` / `memory.correct` / `memory.delete` | `memory_entries` 行：按 `detail_json.entry_id` 读目标（提议预写时主键未知，改按同层同分区 + `content_sha256` 认领），对照 `state_before` / `state_after` / `content_sha256`；纠正按 `supersedes_id` = 目标 + 正文摘要认领新条 | 状态已到后态（确认 → `active`、删除 → `deleted`、纠正的旧条 → `corrected`，或新条 `supersedes_id` + 摘要对上） | 目标仍是 `state_before`；或提议在同层同分区找不到任何正文摘要相同的行（可证明未写入） | 目标存在但层 / 分区 / 正文摘要与 `detail_json` 不符；或提议找到同源行（合并**无法**归属本操作，不得据此判 `applied`）→ `unknown`。**不得**重放提议 / 确认 / 纠正 / 删除 |
 
 - `applied` → `success`；`not_applied` → `failed`；其余 → `unknown`；写 `recovered_at` 与 `verification`
 - 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试；凭据动作**不得**重做加密、重新生成密文或补写凭据版本——四证不足时停在 `unknown`，由人核对后显式重做
@@ -611,3 +660,39 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - 删除资源前必须检查**绑定**（AGENT.md `resource_bindings` 中的 UID，含归档 Agent）、定义名引用与活动 Run 引用：被引用 → 400 `BAD_REQUEST` 并点名引用者，**不提供 force**；通知渠道保留既有 `?force=true`，但不得自动强删。删除只置墓碑（`deleted_at` / 身份 `state='deleted'`），不物理删除历史
 - 版本回收只看 `run_resource_refs.released_at` 与发布指针：当前发布版本即使零 Run 也不得回收；历史引用行不删除。通知的 Run 冻结集合记录在 `run_notify_refs`（具体 `channel_uid`，无 `'*'` 通配），发送明细在 `notify_deliveries`（与 `tool_invocations` 一对一）
 - Run 资源清单缺失的历史 Run 标 `legacy_unrecorded`；**不得**用当前版本补造关联。Agent 生命周期状态文件 schema v2 的 `agent_uid` 是身份权威，`agent_lifecycle` 索引与 `agent_archives` 只做镜像，索引可重建
+
+---
+
+## 10. 调用方凭据与配额（US-16 起）
+
+### 10.1 两类凭据互不代换
+
+| 维度 | 管理面（既有） | 业务面（US-16 新增） |
+| --- | --- | --- |
+| 凭据 | admin token（或 `local_trust` 回环直连） | 调用方 API Key：`Authorization: Bearer <key>` |
+| 主体 | `core.LocalAdminPrincipal()` / `core.LocalAdminCLIPrincipal()`（`Kind=local-admin`） | `core.Principal{Kind=caller, CallerID, KeyID, Project, Scopes, Actor=caller}` |
+| 端点 | 管理端点（`/agents`、`/resources`、`/callers`、`/diagnostics` 等） | 业务端点（`/sessions`、`/search`、`/sources/view`、`/history/search` 等） |
+| 限流 | 管理认证失败计数 → 429 `AUTH_RATE_LIMITED` | 三类入口桶 → 429 `CALLER_RATE_LIMITED` |
+
+- 两类凭据**不可互换**：caller key 访问管理端点 → 403 `FORBIDDEN`；admin token 不以调用方身份参与调用方配额，其请求以内置 `local-admin`（`AuthorizingKind=admin-builtin`、无 `authorizing_key_id`）执行。
+- **零值 Principal 一律拒绝**（401）：**不得**把"没传身份"默认成管理员，也**不得**按请求体里的字段推断调用方。
+- `callers:admin` / `diagnostics:read` **只随** admin token 的内置 `local-admin` 生效，**不得**出现在 `caller_keys`；签发时给这两个 scope → 400 `INVALID_SCOPE`。
+- Key 只存 `key_hash`（SHA-256）与 `key_prefix`；明文只在签发 / 轮换响应出现一次。**不得**写进日志、审计、诊断、导出或错误文案。
+
+### 10.2 scope 字面量（固定枚举）
+
+固定为 `sessions:read` / `sessions:write` / `knowledge:read` / `knowledge:write` / `agents:invoke:<name>` / `agents:invoke:*`，以及仅管理面可用的 `diagnostics:read` / `callers:admin`。
+
+- 空 scope 的 Key **不得**签发；未知 scope 在签发 / 轮换时即 400 `INVALID_SCOPE`，零写入。
+- 端点未声明所需 scope 视为配置错误，启动自检失败（**不得**默认放行）。
+- `agents:invoke:<name>` 无匹配 → 403 `FORBIDDEN`；`agents:invoke:*` 只允许 admin 发放。
+- 归属与授权分开：`Principal.CallerID` 始终是任务归属方（配额记在它名下），`Principal.Actor` 只记录这次是谁执行（`caller` / `scheduler` / `recovery` / `admin-cli`）；`AuthorizingKind` 随任务持久化，**不得**运行时按"有没有 key_id"猜。
+
+### 10.3 预留（Reservation）生命周期
+
+- 状态只允许 `pending → committed / released / reconciled`；`pending` 继续占 `reserved`，**不**按零计量，也**不**由后台任务自动释放或自动结清。
+- `Reconcile` 只由管理面发起，必须给理由并写管理审计；判为已消耗时 `actual` 大于 `amount` 记 `overage`，**不**截断、**不**回滚已发生的调用。
+- `overage > 0` 期间拒绝一切新预留（429 `QUOTA_EXHAUSTED`），直到管理员通过 `POST /callers/{id}/usage/clear-overage` 填理由清零；清零**只**清 `overage`，不动 `used` / `reserved`，不删预留行。
+- 周期按 `caller_limits.timezone` 的本地 00:00 起算（缺省 UTC），`period_start` 存 Unix 毫秒 UTC；`Commit` / `Release` / `Reconcile` **总是**更新创建时那个周期的行，**不得**按当前时间重算。
+- 额度按 `CallerID` 计，**不按 `KeyID`**：同一调用方的多个 Key 共享额度，轮换 / 吊销单个 Key **不得**重置周期或清零用量。
+- 配额服务（PG）故障 → **拒绝新的受控消耗**（fail-closed），不放行；在途 reservation 保持 `pending`，恢复后核对。

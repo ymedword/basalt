@@ -18,7 +18,7 @@ import { withBase } from 'vitepress'
 - 预构建二进制：不需要额外语言工具链。
 - 源码构建：需要 Go，版本以 go.mod 的 toolchain 为准。
 - 兼容的模型端点、模型名与你自己的 API key。
-- SQLite 内嵌，无需单独部署数据库或缓存。
+- 可达的 PostgreSQL 16/17 实例（带 vector 扩展 / pgvector 与 pg_trgm）与一个 Basalt 数据库。这是部署前置：缺任一扩展运行期会拒绝启动，**不会**回退到内嵌存储。
 - Node 只用于管理台重建、官网构建和脚本化演示采集。教程 Agent 不需要外部解释器或 MCP 服务。
 
 已有二进制可直接将它加入 PATH；否则从当前源码构建。Go 构建版本以 go.mod 的 toolchain 和 CI 为准。
@@ -47,6 +47,8 @@ $env:PATH = "$PWD\bin;$env:PATH"
 在仓库根目录新建 basalt.yaml（不是放到 .basalt/ 内）。下例只配置一个模型连接，请把端点、模型名与环境变量改为自己的设置。
 
 ```yaml
+database:
+  dsn: ${BASALT_DATABASE_DSN}
 providers:
   - name: primary
     base_url: https://api.deepseek.com
@@ -60,11 +62,14 @@ http:
     token: ${BASALT_ADMIN_TOKEN}
 ```
 
-在同一个终端设置模型密钥，并用系统密码学随机源生成管理 token。将示例占位值换成自己的模型密钥，配置文件只保留环境变量引用。
+`database.dsn` 是必填项：变量未设置或 `${...}` 占位未解析都按空值处理，启动会以点名该键的错误拒绝。首次启动自动生成的配置里也是这行占位——它只保证键存在，**不**代表数据库已经准备好。
+
+在同一个终端设置数据库连接串与模型密钥，并用系统密码学随机源生成管理 token。将示例占位值换成自己的值，配置文件只保留环境变量引用。
 
 ### POSIX environment
 
 ```sh
+export BASALT_DATABASE_DSN="postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 export BASALT_MODEL_KEY="your-own-model-key"
 export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ```
@@ -72,6 +77,7 @@ export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ### PowerShell environment
 
 ```powershell
+$env:BASALT_DATABASE_DSN = "postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 $env:BASALT_MODEL_KEY = "your-own-model-key"
 $bytes = New-Object byte[] 32
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()

@@ -36,7 +36,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // credentialIDPrefix 是凭据标识的固定前缀（`core.ValidateCredentialID` 同口径）。
@@ -47,9 +47,9 @@ const credentialIDPrefix = "cred_"
 // CredentialOpsDeps wires the write surface; every store is required.
 type CredentialOpsDeps struct {
 	Operations  core.OperationStore
-	Credentials *storage.CredentialStore
-	Resources   *storage.ResourceStore
-	Notify      *storage.NotifyAdminStore
+	Credentials *postgres.CredentialStore
+	Resources   *postgres.ResourceStore
+	Notify      *postgres.NotifyAdminStore
 	// Instance 是实例加密三态与首次初始化的唯一实现（R2-1）：首次保存托管凭据时由
 	// `PrepareManagedWrite` 在同一次保存里完成必要初始化。nil 表示半截装配或测试，
 	// 此时退回「只校验主密钥可装载」的旧行为，不伪造一个能初始化的实例。
@@ -1075,7 +1075,7 @@ var _ SecretsService = (*secretsService)(nil)
 // 校验用的解析器与主密钥文件位置。缺任一必需依赖即拒绝构造。
 // SecretsServiceDeps wires the secrets surface; every required dependency is explicit.
 type SecretsServiceDeps struct {
-	Credentials *storage.CredentialStore
+	Credentials *postgres.CredentialStore
 	Channels    NotifyChannelCatalog
 	Ops         *CredentialOps
 	Resolver    *credentialResolver
@@ -1090,7 +1090,11 @@ type SecretsServiceDeps struct {
 	MasterKeyFile string
 	KeyPath       *MasterKeyLocator
 	WorkspaceRoot string
-	Logger        *slog.Logger
+	// Resources 是核验的"当前发布定义"读取面（T141）：统一核验要按当前发布资源重算
+	// 目标绑定，不能只信凭据行里的历史快照。
+	// Resources reads the published definitions the verify pass recomputes against.
+	Resources CredentialPublishedResources
+	Logger    *slog.Logger
 }
 
 // secretsService 是 `SecretsService` 的唯一实现。
@@ -1108,8 +1112,9 @@ func (s *secretsService) masterKeyFile() string {
 // NewSecretsService 组装 secrets 服务面；缺依赖即拒绝构造（不降级成"什么都没做"）。
 // NewSecretsService refuses to construct without its required dependencies.
 func NewSecretsService(deps SecretsServiceDeps) (SecretsService, error) {
-	if deps.Credentials == nil || deps.Channels == nil || deps.Ops == nil || deps.Resolver == nil {
-		return nil, errors.New("secrets 服务面装配缺少仓储、撤销编排或解析器依赖")
+	if deps.Credentials == nil || deps.Channels == nil || deps.Ops == nil ||
+		deps.Resolver == nil || deps.Resources == nil {
+		return nil, errors.New("secrets 服务面装配缺少仓储、撤销编排、解析器或发布资源依赖")
 	}
 	return &secretsService{deps: deps}, nil
 }
@@ -1219,24 +1224,44 @@ func (s *secretsService) Status(ctx context.Context) (SecretsStatus, error) {
 	return status, nil
 }
 
-// Verify 逐条校验**当前 active 的托管凭据**能否在当前主密钥下解密、目标绑定是否仍与
-// 当前定义一致，只回检查与失败计数；失败逐条记 WARN（点名资源与凭据 ID，不含材料）。
-// Verify checks every active managed credential and reports counts only.
+// Verify 执行统一核验（T141 / 模块卡 §2.12.1）：(a) 全部密文版本按 AAD 可解、
+// key_id 一致；(b) active 身份对当前发布资源、目标地址与 MCP `binding_key` 的核对。
+// 实现只有 `VerifyCredentials` 一处——`db verify --handoff` 复用同一份判定，本方法
+// 只负责把在线入口的数据读出来。
+// Verify is the online entry point of VerifyCredentials: it loads the rows and the
+// master key, and the judging itself lives in exactly one place.
 func (s *secretsService) Verify(ctx context.Context) (SecretsVerifyReport, error) {
-	active, err := s.deps.Credentials.ListActive(ctx)
+	identities, err := s.deps.Credentials.ListAll(ctx)
 	if err != nil {
 		return SecretsVerifyReport{}, fmt.Errorf("列举托管凭据: %w", err)
 	}
-	report := SecretsVerifyReport{Checked: len(active)}
-	for _, record := range active {
-		if verifyErr := s.deps.Resolver.verifyIdentity(ctx, record); verifyErr != nil {
-			report.Failed++
-			s.logger().Warn("secrets verify：凭据校验失败",
-				"kind", string(record.OwnerKind), "resource", record.OwnerName,
-				"credential", record.ID, "error", verifyErr)
-		}
+	versions, err := s.deps.Credentials.ListAllVersions(ctx)
+	if err != nil {
+		return SecretsVerifyReport{}, fmt.Errorf("列举凭据版本: %w", err)
 	}
-	return report, nil
+	channels, err := s.deps.Channels.ListNotifyChannels(ctx)
+	if err != nil {
+		return SecretsVerifyReport{}, fmt.Errorf("列举通知渠道: %w", err)
+	}
+	// 纯 env 实例没有密文可验，也就不该因为缺密钥文件而失败；存在密文才装载主密钥，
+	// 装载失败即整体失败（不把"读不到钥匙"降级成"某条凭据坏了"）。
+	var masterKey *MasterKey
+	if sealedCredentialVersions(groupCredentialVersions(versions)) > 0 {
+		loaded, loadErr := LoadMasterKey(s.masterKeyFile(), s.deps.WorkspaceRoot)
+		if loadErr != nil {
+			return SecretsVerifyReport{}, loadErr
+		}
+		defer loaded.Zero()
+		masterKey = &loaded
+	}
+	return VerifyCredentials(ctx, CredentialVerifyInput{
+		MasterKey:  masterKey,
+		Identities: identities,
+		Versions:   versions,
+		Published:  s.deps.Resources,
+		Channels:   channels,
+		Logger:     s.deps.Logger,
+	})
 }
 
 // RevokeManaged 在服务停止时撤销全部 active 托管凭据：逐个走 `CredentialOps.Revoke`

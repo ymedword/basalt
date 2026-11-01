@@ -149,7 +149,7 @@ func TestSessionStore_SeqIncrementsMonotonically(t *testing.T) {
 
 	roles := []string{core.RoleUser, core.RoleAssistant, core.RoleTool}
 	for i, role := range roles {
-		require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+		require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 			core.Message{Role: role, Content: fmt.Sprintf("第 %d 条", i+1)}))
 	}
 	rows := readMessageRows(t, db, storeSession)
@@ -159,7 +159,7 @@ func TestSessionStore_SeqIncrementsMonotonically(t *testing.T) {
 	}
 
 	// 第二批：编号接着走（`UNIQUE(session_id, seq)` 是这条纪律的判卷人）。
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleUser, Content: "第 4 条"}))
 	rows = readMessageRows(t, db, storeSession)
 	require.Len(t, rows, 4)
@@ -182,11 +182,11 @@ func TestSessionStore_RunIDLandsInColumn(t *testing.T) {
 	store := NewSessionStore(db)
 	seedStoreSession(t, store, storeSession, fixedMessageTime)
 
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleUser, Content: "读一下 notes.txt"}))
-	require.NoError(t, store.AppendMessage(ctx, storeSession, "",
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, "",
 		core.Message{Role: core.RoleAssistant, Content: "不属任何 Run 的一条"}))
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleTool, Content: "文件内容", ToolCallID: "c1"}))
 
 	rows := readMessageRows(t, db, storeSession)
@@ -217,8 +217,11 @@ func TestSessionStore_ReadsBackAcrossRestart(t *testing.T) {
 	require.NoError(t, err)
 	store := NewSessionStore(first)
 	seedStoreSession(t, store, storeSession, fixedMessageTime)
-	for _, m := range written {
-		require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun, m))
+	// 写入时领到的标识回填进夹具：读路径必须原样填回同一个 `messages.id`。
+	for i := range written {
+		id, appendErr := store.AppendMessage(ctx, storeSession, storeRun, written[i])
+		require.NoError(t, appendErr)
+		written[i].ID = id
 	}
 	require.NoError(t, first.Close())
 
@@ -255,12 +258,18 @@ func TestSessionStore_ToolRowsKeepCallIDAndReasoning(t *testing.T) {
 		},
 	}
 	tool := core.Message{Role: core.RoleTool, Content: "笔记正文", ToolCallID: "c1"}
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun, assistant))
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun, tool))
+	assistantID, err := store.AppendMessage(ctx, storeSession, storeRun, assistant)
+	require.NoError(t, err)
+	require.NotEmpty(t, assistantID, "写路径必须返回 messages.id")
+	assistant.ID = assistantID
+	toolID, err := store.AppendMessage(ctx, storeSession, storeRun, tool)
+	require.NoError(t, err)
+	tool.ID = toolID
 
 	loaded, err := store.Messages(ctx, storeSession)
 	require.NoError(t, err)
-	require.Equal(t, []core.Message{assistant, tool}, loaded, "身份字段逐字往返")
+	require.Equal(t, []core.Message{assistant, tool}, loaded, "身份字段逐字往返（含写回的消息标识）")
+	require.Equal(t, assistant.ID, loaded[0].ID, "读路径填回的标识与写路径返回的是同一个")
 
 	rows := readMessageRows(t, db, storeSession)
 	require.False(t, rows[0].Content.Valid, "带工具调用的 assistant 行 content 为空 → NULL")
@@ -292,7 +301,7 @@ func TestSessionStore_ProviderExtraRoundTripsWithUseNumber(t *testing.T) {
 	var extra map[string]any
 	require.NoError(t, dec.Decode(&extra))
 
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun, core.Message{
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun, core.Message{
 		Role:          core.RoleAssistant,
 		Content:       "带扩展字段的一条",
 		ProviderExtra: extra,
@@ -349,9 +358,9 @@ func TestSessionStore_UpsertSessionInsertsThenRefreshes(t *testing.T) {
 	require.False(t, row.ArchivedAt.Valid)
 
 	// 写入两条消息：冗余计数列跟着长（列表页据此免 count(*)）。
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleUser, Content: "第一条"}))
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleAssistant, Content: "第二条"}))
 	require.Equal(t, 2, readSessionRow(t, db, storeSession).MessageCount)
 
@@ -393,9 +402,9 @@ func TestSessionStore_ListSessionsOrdersByLastActive(t *testing.T) {
 	seedStoreSession(t, store, "cli-oldest0000000000", fixedMessageTime)
 	seedStoreSession(t, store, "cli-mid0000000000000", fixedMessageTime.Add(time.Hour))
 	seedStoreSession(t, store, "cli-newest0000000000", fixedMessageTime.Add(time.Hour))
-	require.NoError(t, store.AppendMessage(ctx, "cli-newest0000000000", storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, "cli-newest0000000000", storeRun,
 		core.Message{Role: core.RoleUser, Content: "一"}))
-	require.NoError(t, store.AppendMessage(ctx, "cli-newest0000000000", storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, "cli-newest0000000000", storeRun,
 		core.Message{Role: core.RoleAssistant, Content: "二"}))
 
 	sessions, err = store.ListSessions(ctx, core.SessionFilter{})
@@ -421,8 +430,9 @@ func TestSessionStore_StatelessCallWritesNoMessages(t *testing.T) {
 	db := openTempDB(t)
 	store := NewSessionStore(db)
 
-	err := store.AppendMessage(ctx, "", storeRun, core.Message{Role: core.RoleUser, Content: "无状态"})
+	id, err := store.AppendMessage(ctx, "", storeRun, core.Message{Role: core.RoleUser, Content: "无状态"})
 	require.Error(t, err, "空会话标识的消息写入必须拒绝（不得静默丢弃）")
+	require.Empty(t, id, "拒绝写入时没有标识可返回")
 	require.Contains(t, err.Error(), "空会话标识")
 
 	err = store.UpsertSession(ctx, core.SessionRecord{
@@ -442,7 +452,7 @@ func TestSessionStore_StatelessCallWritesNoMessages(t *testing.T) {
 
 	// 有状态会话的写入不受影响（拒绝只针对空标识）。
 	seedStoreSession(t, store, storeSession, fixedMessageTime)
-	require.NoError(t, store.AppendMessage(ctx, storeSession, storeRun,
+	require.NoError(t, appendMessageOK(ctx, store, storeSession, storeRun,
 		core.Message{Role: core.RoleUser, Content: "有状态"}))
 	require.Equal(t, 1, countMessageRows(t, db, storeSession))
 }
@@ -526,6 +536,27 @@ func TestSessionStore_ListSessionsFiltersByStatus(t *testing.T) {
 	require.Contains(t, err.Error(), "非法状态过滤")
 }
 
+// TestSessionStore_ListSessionsRejectsCallerFilter —— v6 谱系没有 `sessions.caller_id`，
+// 归属过滤在本实现里**必须**失败关闭：静默忽略会把全量列表当成"这个调用方的会话"
+// 返回，是本模块最严重的越权形态。
+// 逆改点：删掉 fail-closed 分支（或改成 `_ = filter.CallerID`）→ 本用例返回 3 行
+// 而非报错，两条断言同时红。
+// TestSessionStore_ListSessionsRejectsCallerFilter pins the fail-closed ownership
+// filter on the frozen SQLite lineage.
+func TestSessionStore_ListSessionsRejectsCallerFilter(t *testing.T) {
+	ctx := context.Background()
+	db := openTempDB(t)
+	store := NewSessionStore(db)
+
+	seedProfiledSession(t, store, "web-one", "demo", fixedMessageTime)
+	seedProfiledSession(t, store, "web-two", "demo", fixedMessageTime.Add(time.Hour))
+
+	got, err := store.ListSessions(ctx, core.SessionFilter{CallerID: "cal_1"})
+	require.Error(t, err, "SQLite 谱系不支持归属过滤，必须拒绝而不是返回全量")
+	require.Nil(t, got, "失败时不得带回任何行")
+	require.Contains(t, err.Error(), "不支持归属过滤")
+}
+
 // TestSessionStore_ListSessionsDerivesStatusFromArchivedAt —— 状态**只**从 `archived_at`
 // 派生，不读 `status` 列另造第二真值：两列人为矛盾时，以 `archived_at` 为准
 // （契约 SessionSummary 的口径）。
@@ -589,4 +620,14 @@ func TestSessionStore_ListSessionsUnfilteredKeepsExistingShape(t *testing.T) {
 		require.Contains(t, []string{"active", "archived"}, rec.Status,
 			"每一行都必须填派生状态（不得留空）")
 	}
+}
+
+// appendMessageOK 追加一条消息并只返回错误（`messages.id` 由需要它的用例单独断言）。
+// 生产签名返回 `(id, error)`，两个返回值不能直接塞进 `require.NoError` 的第二个参数，
+// 故以本包装收敛既有用例的"只关心成败"读法。
+// appendMessageOK wraps AppendMessage for the cases that only assert success; cases that
+// judge the returned id call the store method directly.
+func appendMessageOK(ctx context.Context, store *SessionStore, sessionID, runID string, m core.Message) error {
+	_, err := store.AppendMessage(ctx, sessionID, runID, m)
+	return err
 }

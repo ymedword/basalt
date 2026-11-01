@@ -4,7 +4,7 @@
 // Read-only resources. Model connections show the environment-variable reference
 // only; MCP entries show placeholder keys and credential states (never a tail).
 // Credential values never reach the page.
-import { defineComponent, h, ref } from 'vue'
+import { defineComponent, h, onBeforeUnmount, ref, watch } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import type {
   McpCredentialKeyState,
@@ -12,6 +12,7 @@ import type {
   ModelConnectionView,
   SkillView,
 } from '../api'
+import { adminApi } from '../api-admin'
 import type { McpApplyOutcome } from '../components/resource-form'
 import { ResourceForm, createdApplyNotice } from '../components/resource-form'
 import { DataTable, Notice, shortHash } from '../components/ui'
@@ -127,6 +128,37 @@ export const ResourcesView = defineComponent({
           return api.listModelConnections()
       }
     })
+    const skillDescriptions = ref<Record<string, string>>({})
+    let descriptionGeneration = 0
+    watch(listing.data, (rows) => {
+      const ticket = ++descriptionGeneration
+      skillDescriptions.value = {}
+      if (kind !== 'skills' || rows === null) return
+      const skills = rows as SkillView[]
+      const client = adminApi(api)
+      void (async () => {
+        // 限制并发，避免技能数量多时瞬间启动大量读取。
+        for (let offset = 0; offset < skills.length && ticket === descriptionGeneration; offset += 4) {
+          await Promise.all(skills.slice(offset, offset + 4).map(async (item) => {
+            try {
+              const summary = await client.getSkillSummary(item.name)
+              if (ticket !== descriptionGeneration) return
+              skillDescriptions.value = {
+                ...skillDescriptions.value,
+                [item.name]: summary.version_id !== item.version_id
+                  ? '版本已更新，请刷新'
+                  : summary.description || '未填写简介',
+              }
+            } catch {
+              if (ticket === descriptionGeneration) {
+                skillDescriptions.value = { ...skillDescriptions.value, [item.name]: '简介暂不可用' }
+              }
+            }
+          }))
+        }
+      })()
+    })
+    onBeforeUnmount(() => { descriptionGeneration++ })
 
     // 新建表单是列表页的展开式组件（不占新路由）；写入后由本页重新读取，
     // 表单本身不做乐观更新，也不维护第二份列表。
@@ -156,14 +188,14 @@ export const ResourcesView = defineComponent({
 
     function skillRows(data: SkillView[]): TableProps {
       return {
-        headers: ['技能', '描述', '版本', '文件数', '配置引用 Agent', '内容哈希'],
+        headers: ['技能', '描述', '版本', '文件数', '运行占用（Run ID）', '内容哈希'],
         tableClass: 'skills-table',
         columnClasses: ['col-name', '', 'col-number', 'col-number', 'col-name', 'col-hash'],
         rows: data.map((item) => ({
           key: item.name,
           cells: [
             identifier(item.name, resourceDetailHref('skills', item.name)),
-            item.description === '' ? '—' : item.description,
+            skillDescriptions.value[item.name] ?? '读取简介中…',
             `v${item.version_no}`,
             String(item.file_count),
             item.referenced_by.length === 0 ? '无' : item.referenced_by.join('、'),

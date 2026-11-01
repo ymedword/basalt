@@ -192,12 +192,12 @@ func TestReleaseE2E_Cancel(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
-	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs WHERE run_id = ? AND status = 'cancelled'`, runID); n != 1 {
+	db := h.openDB(t)
+	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs WHERE run_id = $1 AND status = 'cancelled'`, runID); n != 1 {
 		t.Fatalf("库内该 Run 应为 cancelled（1 行），实际 %d 行", n)
 	}
 	// 一次工具调用必须恰好一条结果消息：取消路径的补齐不得重复追加。
-	if n := scalarInt(t, db, `SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'tool'`, sess.SessionID); n != 1 {
+	if n := scalarInt(t, db, `SELECT COUNT(*) FROM messages WHERE session_id = $1 AND role = 'tool'`, sess.SessionID); n != 1 {
 		t.Fatalf("会话里的工具结果消息应恰好 1 条（半截组补齐后），实际 %d 条", n)
 	}
 }
@@ -229,7 +229,7 @@ func TestReleaseE2E_ToolTimeout(t *testing.T) {
 	runID := waitRunningRun(t, addr, sess.SessionID, 30*time.Second)
 
 	// 判据一：工具审计有界（45 秒）落终态——**不得只等 Run 收场**再读。
-	status, kind := waitToolAuditRow(t, h.dbPath(), runID, 45*time.Second)
+	status, kind := waitToolAuditRow(t, h, runID, 45*time.Second)
 	if status != "failed" || kind != "timeout" {
 		t.Fatalf("工具自身超时应落 failed + timeout，实际 %q + %q", status, kind)
 	}
@@ -254,15 +254,15 @@ func TestReleaseE2E_ToolTimeout(t *testing.T) {
 	requireHeartbeatStopped(t, heartbeat, "工具超时")
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
-	rows := queryRows(t, db, `SELECT status, error_kind FROM tool_invocations WHERE run_id = ?`, runID)
+	db := h.openDB(t)
+	rows := queryRows(t, db, `SELECT status, error_kind FROM tool_invocations WHERE run_id = $1`, runID)
 	if len(rows) != 1 {
 		t.Fatalf("该 Run 的工具审计应恰好 1 行，实际 %d 行：%v", len(rows), rows)
 	}
 	if rows[0]["status"] != "failed" || rows[0]["error_kind"] != "timeout" {
 		t.Fatalf("工具审计 = %v/%v，期望 failed/timeout", rows[0]["status"], rows[0]["error_kind"])
 	}
-	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs WHERE run_id = ? AND status = 'completed'`, runID); n != 1 {
+	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs WHERE run_id = $1 AND status = 'completed'`, runID); n != 1 {
 		t.Fatalf("库内该 Run 应为 completed（1 行），实际 %d 行", n)
 	}
 }
@@ -445,15 +445,15 @@ func requireHeartbeatStopped(t *testing.T, path, label string) {
 // 查询错误（含运行期库的瞬时忙）只在窗口内重试，超时后连最后一次错误一起报出。
 // waitToolAuditRow polls the run's first tool audit row until it leaves pending; query
 // errors are retried only inside the window and reported with the timeout.
-func waitToolAuditRow(t *testing.T, dbPath, runID string, timeout time.Duration) (string, string) {
+func waitToolAuditRow(t *testing.T, h *harness, runID string, timeout time.Duration) (string, string) {
 	t.Helper()
-	db := openDB(t, dbPath)
+	db := h.openDB(t)
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		var status, kind sql.NullString
 		err := db.QueryRow(
-			`SELECT status, error_kind FROM tool_invocations WHERE run_id = ? ORDER BY id LIMIT 1`,
+			`SELECT status, error_kind FROM tool_invocations WHERE run_id = $1 ORDER BY id LIMIT 1`,
 			runID).Scan(&status, &kind)
 		switch {
 		case err == nil && status.String != "pending":

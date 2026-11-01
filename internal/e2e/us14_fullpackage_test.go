@@ -347,15 +347,18 @@ func TestFullPackage_WindowsInstallSmoke(t *testing.T) {
 	}
 
 	// 安装目录就是程序目录：serve 以它为 cwd，工作区（`.basalt/`）与上游运行时
-	// （`runtime/`）都以它为准——与用户解压后双击运行的形态一致。
+	// （`runtime/`）都以它为准——与用户解压后双击运行的形态一致。`Schema` 不能省：
+	// 生成的配置只带 `database.dsn` 占位，真值经 `environ` 注入到本用例的隔离 schema。
 	h := &harness{
 		Root:         installDir,
 		Binary:       installBinary,
 		BinarySHA256: pkg.BinarySHA256,
+		Schema:       newIsolatedSchema(t),
 		runTimeout:   defaultRunTimeout,
 	}
 	us14dRequireFreePort(t, us14dDefaultAddr)
 	dataRoot := t.TempDir()
+	us14dPrepareIngress(t, h, dataRoot)
 	p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
 	waitHealthHTTP(t, p, us14dDefaultAddr, 120*time.Second)
 
@@ -450,10 +453,12 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 		t.Fatalf("解压后的二进制与打包前不一致：打包 %s，解出 %s", pkg.BinarySHA256[:12], sum[:12])
 	}
 
+	// 同上一处：生成的配置只带占位，DSN 经 `environ` 注入到本用例的隔离 schema。
 	h := &harness{
 		Root:         installDir,
 		Binary:       installBinary,
 		BinarySHA256: pkg.BinarySHA256,
+		Schema:       newIsolatedSchema(t),
 		runTimeout:   defaultRunTimeout,
 	}
 	us14dRequireFreePort(t, us14dDefaultAddr)
@@ -461,6 +466,7 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		t.Fatalf("创建数据根失败: %v", err)
 	}
+	us14dPrepareIngress(t, h, dataRoot)
 	p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
 	waitHealthHTTP(t, p, us14dDefaultAddr, 120*time.Second)
 

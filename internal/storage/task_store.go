@@ -69,6 +69,14 @@ func (s *TaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
 		rec.RetiredAt = unixMilliOrZero(retiredAt)
 		rec.CreatedAt = time.UnixMilli(createdAt).UTC()
 		rec.UpdatedAt = time.UnixMilli(updatedAt).UTC()
+		// SQLite 谱系没有归属 / 授权来源两列（v6 冻结）：本谱系里的任务只能由管理员
+		// 创建，读出时按迁移规则**显式**映射为 `local-admin` + `admin-builtin`
+		// （US-16 §3.4.3）。这不是"零值默认"——调度器只接受显式 kind，缺 kind
+		// 一条都构造不出身份；映射只发生在这个已知来源的遗留载体上。
+		// The frozen SQLite lineage has no ownership columns; every task in it was
+		// admin-created, so reads stamp the documented migration mapping explicitly.
+		rec.CallerID = core.LocalAdminCallerID
+		rec.AuthorizingKind = core.AuthorizingKindAdminBuiltin
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {

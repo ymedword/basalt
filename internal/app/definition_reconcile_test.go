@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `internal/app/definition_reconcile.go` 的验收面（颗粒度文档 §3.2.1：
@@ -48,7 +50,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -67,8 +70,8 @@ type reconcileEnv struct {
 	root       string
 	configPath string
 	mcpPath    string
-	store      *storage.ResourceStore
-	ops        *storage.ManagementStore
+	store      *postgres.ResourceStore
+	ops        *postgres.ManagementStore
 	skills     *workspace.SkillLibrary
 	gate       *core.ResourceGate
 	logger     *slog.Logger
@@ -92,10 +95,7 @@ func newReconcileEnv(t *testing.T) *reconcileEnv {
 	mcpPath := filepath.Join(root, mcpServersFileName)
 	require.NoError(t, os.WriteFile(mcpPath, []byte("# MCP 定义夹具\n"), 0o600))
 
-	dbPath := filepath.Join(root, "basalt.db")
-	db, err := storage.OpenWritable(context.Background(), dbPath, storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
 	logger, logs := newCapturedLogger()
 	return &reconcileEnv{
@@ -103,8 +103,8 @@ func newReconcileEnv(t *testing.T) *reconcileEnv {
 		root:       root,
 		configPath: configPath,
 		mcpPath:    mcpPath,
-		store:      storage.NewResourceStore(db),
-		ops:        storage.NewManagementStore(db),
+		store:      postgres.NewResourceStore(db),
+		ops:        postgres.NewManagementStore(db),
 		skills:     workspace.NewSkillLibrary(root),
 		gate:       &core.ResourceGate{},
 		logger:     logger,

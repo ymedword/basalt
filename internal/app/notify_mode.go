@@ -27,14 +27,14 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// NotifyChannelCatalog 是渠道注册表的只读面；`*storage.NotifyChannelRepo` 满足它。
+// NotifyChannelCatalog 是渠道注册表的只读面；`*postgres.NotifyChannelRepo` 满足它。
 // 返回集合已排除墓碑行，顺序按名称。
 // NotifyChannelCatalog is the read-only channel registry face (tombstones excluded).
 type NotifyChannelCatalog interface {
 	ListNotifyChannels(ctx context.Context) ([]core.NotifyChannel, error)
 }
 
-// NotifyBindingSource 读某 Agent 的绑定投影；`*storage.BindingStore` 满足它。
+// NotifyBindingSource 读某 Agent 的绑定投影；`*postgres.BindingStore` 满足它。
 // withoutBindings 不是"没有绑定"的同义词——读失败与没有行必须能区分，因此用 error。
 // NotifyBindingSource reads the binding projection; a read failure is not "no bindings".
 type NotifyBindingSource interface {

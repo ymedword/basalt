@@ -41,6 +41,11 @@ describe('instance secrets wording', () => {
     expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('docs/Operations.md')
     expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('不要删除密钥文件')
     expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('不要重新初始化')
+    // D-40：恢复前必须先备份；"密钥解得开"不等于可用；恢复是离线命令，无网页一键修复。
+    expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('备份')
+    expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('密钥能解开密文也不代表可用')
+    expect(INSTANCE_SECRETS_RECOVERY_BANNER).toContain('离线')
+    expect(INSTANCE_SECRETS_RECOVERY_BANNER).not.toContain('等待 adopt')
   })
 
   it('labels each state and shows only the key id prefix when ready', () => {
@@ -62,7 +67,9 @@ describe('instance secrets wording', () => {
     expect(recoveryReasonText('missing')).toBe('密钥文件不存在')
     expect(recoveryReasonText('corrupt')).toBe('密钥文件损坏或校验失败')
     expect(recoveryReasonText('key_id_mismatch')).toBe('密钥与初始化记录不符')
-    expect(recoveryReasonText('unprovable_provenance')).toBe('存在无法证明来源的密钥文件')
+    expect(recoveryReasonText('unprovable_provenance')).toBe(
+      '存在无法证明来源的密钥文件，或无记录但已存在托管密文',
+    )
     expect(recoveryReasonText('unavailable')).toBe('无法判定（读取失败）')
     expect(recoveryReasonText('key_path_missing')).toBe('主密钥路径缺失')
     expect(recoveryReasonText('something_new')).toBe('原因未知')
@@ -77,10 +84,14 @@ describe('instance secrets wording', () => {
     const pureEnv = view({ state: 'uninitialized', key_id: '', can_initialize: false })
     expect(instanceSecretsDetail(pureEnv)).toContain('纯环境变量方式部署')
     expect(instanceSecretsDetail(pureEnv)).toContain('加密托管不可用')
-    // 恢复态指向恢复文档，且不暗示重建密钥。
+    // 恢复态指向恢复文档，且不暗示重建密钥；D-40 要求备份先行并只给离线命令入口。
     const recovery = view({ state: 'recovery_required', recovery_reason: 'missing' })
     expect(instanceSecretsDetail(recovery)).toContain('docs/Operations.md')
     expect(instanceSecretsDetail(recovery)).not.toContain('重新初始化')
+    expect(instanceSecretsDetail(recovery)).toContain('备份')
+    expect(instanceSecretsDetail(recovery)).toContain('secrets recover-record')
+    expect(instanceSecretsDetail(recovery)).toContain('secrets adopt-legacy')
+    expect(instanceSecretsDetail(recovery)).not.toContain('等待 adopt')
   })
 
   it('tones readiness green, uninitialized amber and unknown red', () => {

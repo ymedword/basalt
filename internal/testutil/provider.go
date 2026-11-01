@@ -46,24 +46,31 @@ func NewFakeProvider(steps ...FakeStep) *FakeProvider {
 }
 
 // Chat 记录请求、关闭第 n 次调用的进入信号，然后按脚本回放；脚本用尽即报错（防用例少写一步而静默通过）。
-// Chat records the request, closes the start signal for this call, then replays the
-// script. Running past the end of the script is an error: a test that under-scripts
-// its fake should fail loudly rather than pass quietly.
+//
+// 信号通道**由 Chat 兜底创建**（`Started(n)` 可先可后）：只让 Started 建通道的话，
+// 用例把 `Started(1)` 放进 goroutine、而机器负载让 Chat 先跑，通道就永远没人关——
+// 测试挂到超时（2026-11-01 覆盖插桩下实测触发）。调用已发生再取通道同样拿得到
+// **已关闭**的通道，顺序不影响判据。
+// Chat creates the start signal if the test has not asked for it yet, so the call and
+// `Started(n)` may happen in either order; a call that already entered hands back an
+// already-closed channel instead of hanging the test until its timeout.
 func (f *FakeProvider) Chat(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
 	f.mu.Lock()
 	f.calls++
 	n := f.calls
 	f.reqs = append(f.reqs, req)
 	signal, ok := f.started[n]
+	if !ok {
+		signal = make(chan struct{})
+		f.started[n] = signal
+	}
 	var step FakeStep
 	if n <= len(f.steps) {
 		step = f.steps[n-1]
 	}
 	f.mu.Unlock()
 
-	if ok {
-		close(signal)
-	}
+	close(signal)
 	if n > len(f.steps) {
 		return core.ChatResponse{}, &unexpectedCallError{call: n, scripted: len(f.steps)}
 	}
@@ -98,10 +105,12 @@ func (f *FakeProvider) Requests() []core.ChatRequest {
 
 // Started 返回第 n 次调用（n 从 1 起）**进入时**关闭的信号通道——取消 / 并发用例的
 // 同步基元：测试等它而不是 time.Sleep（Sleep 会在"预写尚未完成"时取消，用例走成
-// 另一条分支；见 §4.3 的取消用例注释）。通道在首次请求时创建，可先于调用取用。
+// 另一条分支；见 §4.3 的取消用例注释）。可先于调用取用；调用已进入后再取，拿到的
+// 是**已关闭**的通道（由 Chat 兜底创建并关闭，见其注释）。
 // Started returns a channel closed when the nth call enters. Tests wait on it instead
 // of sleeping: a sleep may cancel the call before the audit pre-write finished and send
-// the case down the wrong branch.
+// the case down the wrong branch. Asking after the call has entered yields a
+// already-closed channel rather than one that never closes.
 func (f *FakeProvider) Started(n int) <-chan struct{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()

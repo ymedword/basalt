@@ -32,7 +32,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -45,7 +45,7 @@ type MessageRoutePort interface {
 }
 
 // AgentDirectory 解析 Agent 名 → 稳定身份与生命周期状态（索引是状态文件的可重建镜像）。
-// `*storage.ResourceStore` 满足本接口。
+// `*postgres.ResourceStore` 满足本接口。
 // AgentDirectory resolves an agent name to its identity and lifecycle state.
 type AgentDirectory interface {
 	AgentIdentity(ctx context.Context, agent string) (core.AgentUID, string, bool, error)
@@ -79,7 +79,7 @@ type ScopeResult struct {
 // ScopeService validates, resolves the target agent, scans definitions, gathers route
 // evidence and performs the atomic switch.
 type ScopeService struct {
-	Resources *storage.ResourceStore
+	Resources *postgres.ResourceStore
 	Agents    AgentDirectory
 	// WorkspaceRoot 是工作区根（`ScanAgentDocuments` 以它为界扫活动与归档定义）。
 	// 为空时转专属直接拒绝：证明不了"没人引用"就不得收缩。
@@ -119,7 +119,7 @@ func (s *ScopeService) Convert(ctx context.Context, req ScopeRequest) (ScopeResu
 		return ScopeResult{}, err
 	}
 
-	usage, err := s.Resources.ConvertScope(ctx, storage.ScopeConversion{
+	usage, err := s.Resources.ConvertScope(ctx, postgres.ScopeConversion{
 		Kind:          req.Kind,
 		Name:          req.Name,
 		ExpectUID:     req.ResourceUID,
@@ -406,7 +406,7 @@ func inUseError(req ScopeRequest, usage core.ScopeUsage) error {
 // usageRevision 在转换成功后重读指针拿到新的 revision（web 层据此算 ETag）。
 // 读失败不改变已提交的转换结果：返回 0，由调用方重新读取资源视图补齐。
 // usageRevision re-reads the pointer revision after a successful conversion.
-func usageRevision(ctx context.Context, resources *storage.ResourceStore,
+func usageRevision(ctx context.Context, resources *postgres.ResourceStore,
 	req ScopeRequest,
 ) int {
 	if req.Kind == core.ResourceNotifyChannel || resources == nil {

@@ -117,9 +117,62 @@ type ToolView struct {
 type MemoryView struct {
 	Scope   string `json:"scope"`   // global | agent
 	Agent   string `json:"agent"`   // 全局层为空串
-	Backend string `json:"backend"` // markdown | sqlite
+	Backend string `json:"backend"` // postgres（唯一值；MEMORY.md 只是迁移时的一次性只读导入来源）
 	Core    string `json:"core"`
 	Archive string `json:"archive"`
+}
+
+// MemoryEntryView 是**结构化**记忆条目（契约 MemoryEntryView）：与 MemoryView 的
+// `core` / `archive` 渲染文本并存——那份是注入面看到的两段，这份带主键与状态，页面
+// 才有可确认 / 可纠正 / 可删除的对象。`state` 覆盖六态全集（含 candidate / deleted），
+// **不是**召回面：召回只会看到 active。
+// MemoryEntryView is the structured entry shape; the rendered MemoryView rows coexist
+// with it rather than being replaced by it.
+type MemoryEntryView struct {
+	EntryID      int64  `json:"entry_id"`
+	Scope        string `json:"scope"`   // global | agent
+	Agent        string `json:"agent"`   // 全局层为空串
+	Section      string `json:"section"` // core | archive
+	State        string `json:"state"`
+	Content      string `json:"content"`
+	Source       string `json:"source"`
+	SupersedesID int64  `json:"supersedes_id"` // 0 = 无
+	CreatedAt    string `json:"created_at"`
+}
+
+// MemoryEntryListView 是两条结构化读端点的响应体：分层声明 + 条目数组（空集合输出
+// `[]`，**不**输出 null）。
+// MemoryEntryListView is the structured read response; an empty set is `[]`, not null.
+type MemoryEntryListView struct {
+	Scope   string            `json:"scope"`
+	Agent   string            `json:"agent"`
+	Entries []MemoryEntryView `json:"entries"`
+}
+
+// MemoryEntryReceipt 是四个写动作的统一回执：页面据此只刷新受影响的行。
+// `merged` 表示提议命中了同源去重、**没有**新增行；`replaced_id` 只对纠正有意义。
+// MemoryEntryReceipt is the shared write receipt; merged means the proposal joined an
+// existing row instead of creating one.
+type MemoryEntryReceipt struct {
+	EntryID    int64  `json:"entry_id"`
+	State      string `json:"state"`
+	ReplacedID int64  `json:"replaced_id"`
+	Merged     bool   `json:"merged"`
+}
+
+// MemoryProposalWrite 是显式提议的请求体：`section` 缺省（空串）按归档区落——候选
+// 不进注入面，即便提议的是核心区知识也必须先确认。
+// MemoryProposalWrite is the proposal body; an absent section means the archive.
+type MemoryProposalWrite struct {
+	Section string `json:"section"`
+	Content string `json:"content"`
+}
+
+// MemoryCorrectionWrite 是纠正的请求体：新条继承目标条的分层与分区，请求体里**没有**
+// 作用域字段——否则一次纠正就可能把内容搬到另一层。
+// MemoryCorrectionWrite carries only the new body; scope is inherited from the target.
+type MemoryCorrectionWrite struct {
+	Content string `json:"content"`
 }
 
 // SandboxView 是 /sandbox 的响应体（契约 components.schemas.SandboxView）：四类白名单

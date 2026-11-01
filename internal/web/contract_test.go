@@ -7,14 +7,18 @@ package web
 // type-based error mapping, and view field shapes.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +27,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/internal/callers"
+	"github.com/ymedword/basalt/internal/compaction"
 	"github.com/ymedword/basalt/internal/core"
 )
 
@@ -121,7 +127,18 @@ func TestContract_ErrorMappingByType(t *testing.T) {
 		{"准入：无资格", core.ErrResourceNotEligible, context.Background(), http.StatusConflict, codeResourceNotEligible},
 		{"准入：凭据已撤销", core.ErrCredentialRevoked, context.Background(), http.StatusConflict, codeCredentialRevoked},
 		{"准入：主密钥不可用", core.ErrCredentialUnavailable, context.Background(), http.StatusServiceUnavailable, codeCredentialUnavailable},
+		// 图 6 [3] / [5] 的调用方拒绝：两个码互不合并，也**不得**落到 500。
+		// The two caller refusals keep their own 429 codes instead of a 500.
+		{"调用方并发名额用尽", callers.ErrConcurrencyLimited, context.Background(), http.StatusTooManyRequests, codeCallerConcurrencyLimited},
+		{"调用方周期配额不足", callers.ErrQuotaExhausted, context.Background(), http.StatusTooManyRequests, codeQuotaExhausted},
+		// 401 只认 `core.ErrUnauthorized` 哨兵（C-F08）：正常路径由认证中间件拦截，
+		// 这里是服务层的防御分支——按文案匹配会把内部错误误报成身份问题。
+		// 401 matches the sentinel only; text is never an identity signal.
+		{"认证失败", core.ErrUnauthorized, context.Background(), http.StatusUnauthorized, codeUnauthorized},
+		{"认证失败（包装）", fmt.Errorf("运行入口: %w", core.ErrUnauthorized), context.Background(), http.StatusUnauthorized, codeUnauthorized},
+		{"认证与并发同链", errors.Join(core.ErrUnauthorized, callers.ErrConcurrencyLimited), context.Background(), http.StatusUnauthorized, codeUnauthorized},
 		{"运行超时", errors.New("deadline surfaced as error"), expired, http.StatusGatewayTimeout, codeTimeout},
+		{"超时优先于认证", core.ErrUnauthorized, expired, http.StatusGatewayTimeout, codeTimeout},
 		{"其他错误", errors.New("disk on fire"), context.Background(), http.StatusInternalServerError, codeInternal},
 	}
 	for _, tc := range runCases {
@@ -134,6 +151,23 @@ func TestContract_ErrorMappingByType(t *testing.T) {
 		})
 	}
 
+	// 401 分支的日志面（可观测性双轨）：WARN 带 request_id，**不带**身份与凭据。
+	// 逆改点：去掉 Warn → 本用例红；把身份写进日志字段 → 泄漏断言红。
+	// The 401 branch logs at WARN with the request id, never the identity.
+	t.Run("认证失败日志", func(t *testing.T) {
+		var buf bytes.Buffer
+		srv := newTestServer(t, func(o *Options) {
+			o.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+		})
+		ctx := context.WithValue(context.Background(), requestIDKey{}, "0123456789abcdef")
+		rec := httptest.NewRecorder()
+		srv.writeRunError(rec, core.ErrUnauthorized, ctx)
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
+		require.Contains(t, buf.String(), "level=WARN", "失败路径必须以 WARN 入日志")
+		require.Contains(t, buf.String(), "运行入口认证失败")
+		require.Contains(t, buf.String(), "request_id=0123456789abcdef", "WARN 必须带 request_id")
+	})
+
 	t.Run("仓储未命中", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		s.writeStoreError(rec, fs.ErrNotExist, "web-x")
@@ -141,6 +175,75 @@ func TestContract_ErrorMappingByType(t *testing.T) {
 		require.Contains(t, rec.Body.String(), `"code":"NOT_FOUND"`)
 		require.Contains(t, rec.Body.String(), "web-x", "404 回显会话标识")
 	})
+}
+
+// TestContract_RunErrorUnauthorizedNotTextMatched：401 只认哨兵——文案里出现
+// "unauthorized"、身份名、凭据片段既**不得**改变状态码，也**不得**回显到响应体。
+// 逆改点：把 `errors.Is(err, core.ErrUnauthorized)` 换成 `strings.Contains(err.Error(), "unauthorized")`
+// → 状态码从 500 变 401，本用例红。
+// 401 is sentinel-only: the copy, identity, and credential fragments in the text
+// never change the status code and never reach the response body.
+func TestContract_RunErrorUnauthorizedNotTextMatched(t *testing.T) {
+	s := newTestServer(t, nil)
+	err := errors.New("unauthorized caller=secret-caller session=secret-session credential=secret-credential")
+
+	rec := httptest.NewRecorder()
+	s.writeRunError(rec, err, context.Background())
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Contains(t, rec.Body.String(), `"code":"`+codeInternal+`"`)
+	for _, leaked := range []string{"secret-caller", "secret-session", "secret-credential"} {
+		require.NotContains(t, rec.Body.String(), leaked, "500 不得透出身份片段")
+	}
+}
+
+// TestContract_QuotaExhaustedRetryAfter：429 `QUOTA_EXHAUSTED` 只在错误带日历恢复
+// 时间时给 `Retry-After`（契约 §8：周期额度不足 → 下一周期起点）。限额为零、限额
+// 行缺失与 `overage > 0` 未核对都没有恢复时刻——给头会让调用方等一个不会带来恢复
+// 的时长，比不给更误导。
+// 逆改点：`writeQuotaExhausted` 不设头 → 有恢复时间的用例红；对零 / 过期 `RetryAt`
+// 也设头 → 无头用例红；用 `errors.Is` 之外的判定取不到 typed 错误 → 头断言红。
+func TestContract_QuotaExhaustedRetryAfter(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	t.Run("带恢复时间给 Retry-After", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		s.writeRunError(rec, &callers.QuotaExhaustedError{
+			Reason:  "周期额度不足",
+			RetryAt: time.Now().Add(90 * time.Second),
+		}, context.Background())
+		require.Equal(t, http.StatusTooManyRequests, rec.Code)
+		require.Contains(t, rec.Body.String(), `"code":"`+codeQuotaExhausted+`"`)
+		raw := rec.Header().Get("Retry-After")
+		require.NotEmpty(t, raw, "带日历恢复时间时必须给 Retry-After")
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		require.NoError(t, err, "Retry-After 取 delay-seconds 形态")
+		require.GreaterOrEqual(t, seconds, int64(85))
+		require.LessOrEqual(t, seconds, int64(90))
+	})
+
+	noRecovery := map[string]error{
+		"限额为零": &callers.QuotaExhaustedError{Reason: "周期限额为零"},
+		"裸哨兵":  callers.ErrQuotaExhausted,
+		"已过期":  &callers.QuotaExhaustedError{Reason: "周期额度不足", RetryAt: time.Now().Add(-time.Second)},
+	}
+	for name, err := range noRecovery {
+		rec := httptest.NewRecorder()
+		s.writeRunError(rec, err, context.Background())
+		require.Equal(t, http.StatusTooManyRequests, rec.Code, name)
+		require.Contains(t, rec.Body.String(), `"code":"`+codeQuotaExhausted+`"`, name)
+		require.Empty(t, rec.Header().Get("Retry-After"),
+			"%s：没有日历恢复时刻不得给头", name)
+	}
+
+	// 检索路径与运行入口共用同一出口：口径不同会让同一个码在两条路径上表现不一。
+	rec := httptest.NewRecorder()
+	s.writeHistorySearchError(rec, &callers.QuotaExhaustedError{
+		Reason:  "周期额度不足",
+		RetryAt: time.Now().Add(30 * time.Second),
+	}, "历史检索")
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.NotEmpty(t, rec.Header().Get("Retry-After"), "检索路径同口径给头")
 }
 
 // TestContract_ViewFieldShapes 验证视图字段形态（约束 34）：空集合输出 `[]`、
@@ -302,16 +405,17 @@ func contractErrorCodes(t *testing.T) map[string]string {
 	return contract
 }
 
-// TestContract_ErrorCodes 逐个断言本包产生的 34 个错误码及其 HTTP 状态（§6.3 /
+// TestContract_ErrorCodes 逐个断言本包产生的 40 个错误码及其 HTTP 状态（§6.3 /
 // run-and-errors §8，含 LIMIT_REACHED 与 R4 的凭据 / 范围 / 绑定码，不含 OK），并把
 // envelope.go 的常量集合与契约表逐条对账（等价于模块卡 §6.3 行 2247 的 grep 判据）。
 // 判据面沿革（记录在 run-state）：T016 把 US-11 的集合扩到 18 个码；R4 修订把契约表
 // 扩到 30 行后，本用例同批扩到 30；14D 契约把密钥三态 / 执行环境 / MCP 受控发布
-// 四行并入 §8 后扩到 34——对账口径（不得多、不得少、不得改字面量）**原样
-// 保留**，适配是扩大期望集合，不是删除断言。
+// 四行并入 §8 后扩到 34；US-16 的 D-42 契约冻结（2026-10-28）并入作用域 / 幂等 /
+// 已移除与三个调用方 429 共六行后扩到 40——对账口径（不得多、不得少、不得改
+// 字面量）**原样保留**，适配是扩大期望集合，不是删除断言。
 // 逆改点：新增一个未入契约的码常量 / 改错某个码字面量 / 从契约表删掉任一码 →
 // 表比对或常量比对红。
-// The 34 codes this package produces must equal the contract table both by literal
+// The 40 codes this package produces must equal the contract table both by literal
 // and by HTTP status; the constant set in envelope.go is reconciled the same way.
 func TestContract_ErrorCodes(t *testing.T) {
 	contract := contractErrorCodes(t)
@@ -335,6 +439,7 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeAgentResourceBindingMissing", codeAgentResourceBindingMissing, "400"},
 		{"codeAgentResourceBindingInvalid", codeAgentResourceBindingInvalid, "400"},
 		{"codeCredentialRevoked", codeCredentialRevoked, "400"},
+		{"codeInvalidScope", codeInvalidScope, "400"},
 		{"codeUnauthorized", codeUnauthorized, "401"},
 		{"codeForbidden", codeForbidden, "403"},
 		{"codeNotFound", codeNotFound, "404"},
@@ -348,17 +453,22 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeCredentialOwnerMismatch", codeCredentialOwnerMismatch, "409"},
 		{"codeSecretsRecoveryRequired", codeSecretsRecoveryRequired, "409"},
 		{"codeExecutionProfileMismatch", codeExecutionProfileMismatch, "409"},
+		{"codeIdempotencyConflict", codeIdempotencyConflict, "409"},
 		{"codeMCPApplySuperseded", codeMCPApplySuperseded, "409"},
+		{"codeGone", codeGone, "410"},
 		{"codeMCPApplyFailed", codeMCPApplyFailed, "500"},
 		{"codePreconditionFailed", codePreconditionFailed, "412"},
 		{"codeTooManyRuns", codeTooManyRuns, "429"},
 		{"codeAuthRateLimited", codeAuthRateLimited, "429"},
+		{"codeCallerRateLimited", codeCallerRateLimited, "429"},
+		{"codeCallerConcurrencyLimited", codeCallerConcurrencyLimited, "429"},
+		{"codeQuotaExhausted", codeQuotaExhausted, "429"},
 		{"codeInternal", codeInternal, "500"},
 		{"codeNotConfigured", codeNotConfigured, "503"},
 		{"codeCredentialUnavailable", codeCredentialUnavailable, "503"},
 		{"codeTimeout", codeTimeout, "504"},
 	}
-	require.Len(t, produced, 34, "本包产生契约 §8 的全部 34 个错误码（不含 OK）")
+	require.Len(t, produced, 40, "本包产生契约 §8 的全部 40 个错误码（不含 OK）")
 
 	byCode := make(map[string]string, len(produced))
 	byName := make(map[string]string, len(produced))
@@ -846,6 +956,8 @@ func TestOpenAPI_ViewEnumsMatchGoLiterals(t *testing.T) {
 		acceptedBy([]string{
 			"", "agent", "schedule", "model_connection", "mcp_server", "skill", "notify_channel",
 			"network_allowlist", "network_denylist", "execution_policy", "network_exception", "system",
+			"caller", "instance", "memory",
+			core.TargetKindKnowledgeUpload, core.TargetKindKnowledgeDocument, core.TargetKindKnowledgeCollection,
 			"provider", "mcp", "schedule_trigger",
 		}, validOperationTargetKind),
 		"OperationView.target_kind 的接受集合必须等于契约枚举")
@@ -986,7 +1098,8 @@ func TestContract_PersistenceShapeNotSerialized(t *testing.T) {
 // TestContractAdmin_NewErrorCodes 是 T016 的必备锚点（check `012-web-etag-routes`）：
 // R3 阶段 US-12 **唯一**新增的码是 IMPORT_REJECTED，且在契约 §8 里是 400；R4 修订
 // 又把凭据 / 范围 / 绑定的十条并入契约表，本用例的常量数量随之到 30；14D 契约再并入
-// 密钥三态 / 执行环境 / MCP 受控发布四行到 34。各轮都遵守同
+// 密钥三态 / 执行环境 / MCP 受控发布四行到 34；US-16 的 D-42 契约冻结（2026-10-28）
+// 再并入作用域 / 幂等 / 已移除与三个调用方 429 共六行到 40。各轮都遵守同
 // 一条纪律：US-11 已产出的码 HTTP 状态不漂移（M6 的复用清单），envelope.go 的常量
 // 声明集合与契约表（OK 除外）**逐条**对上，不得出现未入契约的码，也不得少一条。
 // 逆改点：改 IMPORT_REJECTED 的状态 / 字面量 / 再加一个码常量 / 删契约行 → 红。
@@ -1032,7 +1145,7 @@ func TestContractAdmin_NewErrorCodes(t *testing.T) {
 	}
 	require.Equal(t, "OK", declared["codeOK"])
 	delete(declared, "codeOK")
-	require.Len(t, declared, 34, "14D 契约落地后错误码常量恰为契约 §8 的 34 个")
+	require.Len(t, declared, 40, "US-16 契约落地后错误码常量恰为契约 §8 的 40 个")
 
 	declaredByCode := make(map[string]string, len(declared))
 	for _, code := range declared {
@@ -1045,7 +1158,7 @@ func TestContractAdmin_NewErrorCodes(t *testing.T) {
 		}
 	}
 	require.Equal(t, contractWithoutOK, declaredByCode,
-		"envelope.go 的码常量集合必须与契约 §8 一一对应（IMPORT_REJECTED 是唯一新增）")
+		"envelope.go 的码常量集合必须与契约 §8 一一对应（不得多、不得少、不得改字面量）")
 }
 
 // TestContractAdmin_AgentDraftView 钉住 D-02：草稿响应是 `AgentDraftView`
@@ -1354,6 +1467,110 @@ func TestContractAdmin_RouteTableMatchesOpenAPI(t *testing.T) {
 	}
 }
 
+// TestContractAdmin_BusinessRouteTableMatchesOpenAPI 钉住业务面 15 行与契约的认证 /
+// 授权声明逐条对应（V-4）：业务行的操作必须声明 callerKey / bearerAuth / localTrust
+// 三种安全方案以及 401 / 403 / 429 三种拒绝响应——根级 security 只有 bearerAuth /
+// localTrust，业务行**不得**靠继承根级蒙混。
+//
+// 429 的组件按端点**实际**能返回的码区分，不做"统一一个组件"：`POST /sessions` 不启动
+// Run，只可能返回认证失败限速与入口速率（`IngressRateLimited`）；两个 Run 触发端点还要
+// 返回调用方并发名额、周期配额与实例容量（`RunLimited` 五码）。机械套用同一个组件会让
+// 契约读出的拒绝集与实现不符——这正是 V-4 要修的那类缺陷。
+// 逆改点：删掉任一端点的 security / 401 / 403 / 429；把 `POST /sessions` 的 429 换成
+// `RunLimited`；把两个 Run 端点的 429 退回 `IngressRateLimited` / `TooManyRuns`；
+// `RunLimited` 少写任一业务码，或 `IngressRateLimited` 混入并发 / 配额 / 容量码 → 红。
+// 中文用例名：业务面路由表与 openapi 的认证 / 授权声明双向对账。
+func TestContractAdmin_BusinessRouteTableMatchesOpenAPI(t *testing.T) {
+	doc := readContractDoc(t, "openapi.yaml")
+	srv := newTestServer(t, nil)
+
+	// 三个 Run 触发端点与其余业务行的差别就在这里：写死期望值，避免"统一组件"式回退。
+	wantRun429 := map[string]string{
+		"POST /api/v1/sessions/{id}/messages": "RunLimited",
+		"POST /api/v1/agents/{name}/invoke":   "RunLimited",
+	}
+	seen := 0
+	for _, rt := range srv.routeTable() {
+		if rt.surface != surfaceRouteBusiness {
+			continue
+		}
+		seen++
+		name := rt.method + " " + rt.pattern
+		rel := strings.TrimPrefix(rt.pattern, "/api/v1")
+		op, ok := mustDig(t, doc, "paths", rel, strings.ToLower(rt.method)).(map[string]any)
+		require.Truef(t, ok, "openapi.yaml 缺少 %s 的操作", name)
+
+		// 安全方案必须是这三条**同时**声明：任何一条都不能靠根级默认补上。
+		security, ok := op["security"].([]any)
+		require.Truef(t, ok, "%s 必须声明 operation security（不得继承根级 bearerAuth / localTrust）", name)
+		schemes := map[string]bool{}
+		for _, entry := range security {
+			m, ok := entry.(map[string]any)
+			require.Truef(t, ok, "%s 的 security 项必须是映射", name)
+			for scheme := range m {
+				schemes[scheme] = true
+			}
+		}
+		require.Equalf(t, map[string]bool{"callerKey": true, "bearerAuth": true, "localTrust": true}, schemes,
+			"%s 必须同时声明 callerKey / bearerAuth / localTrust", name)
+
+		responses, ok := op["responses"].(map[string]any)
+		require.Truef(t, ok, "%s 必须声明 responses", name)
+		for _, status := range []string{"401", "403", "429"} {
+			require.Containsf(t, responses, status, "%s 必须声明 %s", name, status)
+		}
+
+		ref := responseRef(t, responses["429"])
+		if want, ok := wantRun429[name]; ok {
+			require.Equalf(t, want, ref, "%s 的 429 必须是 %s（含并发 / 配额 / 容量码）", name, want)
+		}
+		if name == "POST /api/v1/sessions" {
+			require.Equal(t, "IngressRateLimited", ref,
+				"POST /sessions 不启动 Run：429 只能是认证失败限速与入口速率，不得声明并发 / 配额 / 容量")
+		}
+	}
+	require.Equal(t, 15, seen, "业务面当前恰十五行（三条会话 / 调用行 + 九条知识库行 + 三条历史回查行）")
+
+	// 组件文本本身也要对得上：两个 429 组件的业务码集合是 V-4 的冻结内容。
+	// 断言的是**枚举条目形态**（`- \`CODE\`——说明`），不是"正文里出现过这个串"——
+	// 否则顺序说明段复述一次码名就能让删掉条目的逆改存活（M4 实测过）。
+	runLimited, ok := mustDig(t, doc, "components", "responses", "RunLimited", "description").(string)
+	require.True(t, ok)
+	for _, code := range []string{
+		"AUTH_RATE_LIMITED", "CALLER_RATE_LIMITED", "CALLER_CONCURRENCY_LIMITED",
+		"QUOTA_EXHAUSTED", "TOO_MANY_RUNS",
+	} {
+		require.Containsf(t, runLimited, "- `"+code+"`——", "RunLimited 必须把 %s 列为枚举条目", code)
+	}
+	ingressRateLimited, ok := mustDig(t, doc, "components", "responses", "IngressRateLimited", "description").(string)
+	require.True(t, ok)
+	require.Contains(t, ingressRateLimited, "- `AUTH_RATE_LIMITED`——",
+		"IngressRateLimited 必须把同来源认证失败限速列为枚举条目——未认证请求也可能得到 429")
+	require.Contains(t, ingressRateLimited, "- `CALLER_RATE_LIMITED`——",
+		"IngressRateLimited 必须把入口桶限速列为枚举条目")
+	for _, forbidden := range []string{"CALLER_CONCURRENCY_LIMITED", "QUOTA_EXHAUSTED", "TOO_MANY_RUNS"} {
+		require.NotContainsf(t, ingressRateLimited, forbidden,
+			"IngressRateLimited 只覆盖速率 / 认证失败，不得混入 %s（那是 Run 准入与容量拒绝）", forbidden)
+	}
+}
+
+// responseRef 取响应对象的组件名：`$ref` 指向 `#/components/responses/<name>` 时返回
+// `name`，其余形态返回空串（内联响应在契约里没有可对账的组件名）。
+// responseRef returns the component name of a `$ref` response, or "" for inline ones.
+func responseRef(t *testing.T, node any) string {
+	t.Helper()
+	m, ok := node.(map[string]any)
+	if !ok {
+		return ""
+	}
+	ref, _ := m["$ref"].(string)
+	const prefix = "#/components/responses/"
+	if !strings.HasPrefix(ref, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(ref, prefix)
+}
+
 // TestOpenAPI_AdminWriteViewsMatchContract 钉住 US-12 写面视图与契约字段的逐字
 // 一致（含 R4 新增的四项）：`ResourceVersionView.resource_uid`、
 // `ResourceReferencesView.bound_agents`、`AgentLifecycleView.agent_uid` /
@@ -1519,4 +1736,47 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 		ArchivedAt:  createdAt,
 		ContentHash: "sha256:abc",
 	}))
+}
+
+// TestOpenAPI_CompactionViewMatchesContract 钉住压缩只读视图与契约逐字一致（US-16 /
+// T089）：字段集**完全一致**（多投影一个持久化列 / 漏投影一个契约字段都红）、整对象
+// 过 schema、`status` 三字面量与领域常量逐字对齐，且最简形态（根条目 / 未失效 /
+// 空引用集合）仍出站全部字段。
+// 逆改点：把 `kind` 等持久化列直接序列化 / 漏 `summary_view` / 少 `stale_at` /
+// 改状态字面量 → 字段集或枚举断言红。
+// 中文用例名：压缩视图字段集与契约一致。
+func TestOpenAPI_CompactionViewMatchesContract(t *testing.T) {
+	doc := readContractDoc(t, "openapi.yaml")
+	createdAt := time.Date(2026, 10, 28, 9, 30, 0, 0, time.UTC)
+
+	full := compactionViews([]compaction.CompactionEntry{{
+		CompactionID: "cp-1", Scope: compaction.Scope{SessionID: "s-1"}, ChainEpoch: 2,
+		TriggerRunID: "run-9", AttemptID: "att-1",
+		CoveredFromMessageID: "1", CutMessageID: "40", FirstKeptMessageID: "41",
+		StrategyVersion: "tail-v1", PromptVersion: "summary-v1", Model: "mock-model",
+		TokensBefore: 12000, TokensAfter: 3000,
+		Status: compaction.StatusCommitted,
+		SourceRefs: []core.EvidenceRef{
+			{Kind: "knowledge", ID: "doc-1", VersionID: "v1", ContentHash: "sha256:a"},
+		},
+		IncludedRefs: []core.EvidenceRef{{Kind: "knowledge", ID: "doc-1", VersionID: "v1"}},
+		Summary:      "巡检结论摘要",
+		CreatedAt:    createdAt,
+	}})
+	require.Len(t, full, 1)
+	requireViewMatchesSchema(t, doc, "CompactionView", full[0])
+	requireViewMatchesSchema(t, doc, "CompactionSummaryView", full[0].SummaryView)
+
+	minimal := compactionViews([]compaction.CompactionEntry{{
+		CompactionID: "cp-2", Scope: compaction.Scope{RunID: "run-1"}, ChainEpoch: 1,
+		CoveredFromMessageID: "1", CutMessageID: "2", FirstKeptMessageID: "3",
+		Status: compaction.StatusFailed, ReasonCode: "compaction_timeout",
+		CreatedAt: createdAt,
+	}})
+	requireViewMatchesSchema(t, doc, "CompactionView", minimal[0])
+
+	require.ElementsMatch(t,
+		contractEnum(t, doc, "CompactionView", "status"),
+		[]string{compaction.StatusCommitted, compaction.StatusFailed, compaction.StatusStale},
+		"CompactionView.status 的三个字面量必须等于契约枚举")
 }

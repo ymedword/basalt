@@ -113,7 +113,10 @@ func instanceSecretsRecoveryText(reason string) string {
 	case core.SecretRecoveryKeyIDMismatch:
 		return "密钥与初始化记录不符"
 	case core.SecretRecoveryUnprovableProvenance:
-		return "存在无法证明来源的密钥文件"
+		// D-40 扩展了本码的触发面：除"密钥文件来源不可证明"外，还包括"无初始化记录
+		// 但已存在托管密文"——此时密钥能解开密文也不构成来源证明，文案必须把两种
+		// 触发面都说出来，否则操作者会以为换一把密钥就能继续。
+		return "存在无法证明来源的密钥文件，或无初始化记录但已存在托管密文（密钥能解开也不构成来源证明）"
 	case core.SecretRecoveryUnavailable:
 		return "无法判定（读取失败）"
 	case core.SecretRecoveryKeyPathMissing:

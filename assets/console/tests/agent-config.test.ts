@@ -211,6 +211,9 @@ function baseReply(fixture: Fixture, call: RecordedCall): Reply | undefined {
   if (call.path === '/api/v1/instance/secrets' && call.method === 'GET') {
     return { data: instanceSecretsView }
   }
+  if (call.path === '/api/v1/collections' && call.method === 'GET') {
+    return { data: [] }
+  }
   if (call.path === '/api/v1/agents/writer/config' && call.method === 'GET') {
     return { data: fixture.config ?? configView(), etag: CONFIG_ETAG }
   }
@@ -340,6 +343,65 @@ afterEach(() => {
 })
 
 describe('agent config page', () => {
+  it('saves an explicit knowledge declaration and refuses ambiguous names', async () => {
+    const config = configView()
+    config.fields.knowledge = []
+    setupFetch({ config }, (call) => {
+      if (call.path === '/api/v1/collections' && call.method === 'GET') return { data: [
+        { collection_id: 'a', name: '手册', project: '', created_at: '', deleted_at: '' },
+        { collection_id: 'b', name: '重名', project: 'one', created_at: '', deleted_at: '' },
+        { collection_id: 'c', name: '重名', project: 'two', created_at: '', deleted_at: '' },
+      ] }
+      if (call.path === '/api/v1/agents/writer/content' && call.method === 'PUT') return savedAgent()
+      return undefined
+    })
+    await openConfig()
+    const section = wrapper!.findAll('section').find((item) => item.text().includes('跨项目同名时无法唯一解析'))!
+    const options = section.findAll('label')
+    const selected = options.find((item) => item.text() === '手册')!
+    const ambiguous = options.find((item) => item.text().includes('重名（同名'))!
+    expect((ambiguous.find('input').element as HTMLInputElement).disabled).toBe(true)
+    await selected.find('input').setValue(true)
+    await buttonOf('保存配置').trigger('click')
+    await flushPromises()
+    expect(contentCalls()[0]!.body).toEqual({ changes: { knowledge: [{ name: '手册', access: 'read' }] } })
+    expect(contentCalls()[0]!.ifMatch).toBe(CONFIG_ETAG)
+  })
+  it('requires an explicit global-memory choice and saves it with the config ETag', async () => {
+    setupFetch({}, (call) => {
+      if (call.path === '/api/v1/agents/writer/content' && call.method === 'PUT') return savedAgent()
+      return undefined
+    })
+    await openConfig()
+    expect((found('#config-global-memory').element as HTMLSelectElement).value).toBe('legacy')
+    await found('#config-global-memory').setValue('true')
+    await buttonOf('保存配置').trigger('click')
+    await flushPromises()
+    expect(contentCalls()[0]!.ifMatch).toBe(CONFIG_ETAG)
+    expect(contentCalls()[0]!.body).toEqual({ changes: { settings: { include_global_memory: true } } })
+  })
+  // 选回「沿用旧规则」必须发**显式 null**（服务端据此删掉该行）。发 false 会让文件里
+  // 写着 false 而页面显示"沿用旧规则"——两者的注入行为不同，页面就成了假象。
+  // 同时判「沿用旧规则」这一项**可选**：它是 disabled 时用户点过 true 就再也回不去。
+  it('returns to the legacy rule by sending an explicit null, not false', async () => {
+    setupFetch({ config: configView({ fields: fields({
+      settings: { max_iterations: 8, max_history_turns: 20, include_global_memory: true },
+    }) }) }, (call) => {
+      if (call.path === '/api/v1/agents/writer/content' && call.method === 'PUT') return savedAgent()
+      return undefined
+    })
+    await openConfig()
+    const select = found('#config-global-memory')
+    expect((select.element as HTMLSelectElement).value).toBe('true')
+    const legacyOption = select.findAll('option').find((item) => (item.element as HTMLOptionElement).value === 'legacy')!
+    expect((legacyOption.element as HTMLOptionElement).disabled).toBe(false)
+
+    await select.setValue('legacy')
+    await buttonOf('保存配置').trigger('click')
+    await flushPromises()
+    expect(contentCalls()[0]!.ifMatch).toBe(CONFIG_ETAG)
+    expect(contentCalls()[0]!.body).toEqual({ changes: { settings: { include_global_memory: null } } })
+  })
   it('lists every published eligible connection and shows bindings read-only with management links', async () => {
     setupFetch({
       models: [

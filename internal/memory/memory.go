@@ -117,20 +117,134 @@ func (s *Service) Sections(ctx context.Context, scope core.Scope) (coreText, arc
 // 由 `coreSectionOf` 采集（它就是切区的地方）。
 // The injection-side over-quota path can only come from hand edits; coreSectionOf logs
 // the WARN and still returns the whole core region.
-func (s *Service) LoadEffective(ctx context.Context, agent string) (string, error) {
+func (s *Service) LoadEffective(ctx context.Context, principal core.Principal, agent string) (string, error) {
+	// 没有 Agent 上下文时读的**就是全局层本身**：没有 Agent scope 可判，凭据只剩
+	// "是不是本地管理员"这一档（与 `LoadLayers` 对空 Agent 的拒绝同一口径）。
+	// Without an agent context the read is the global layer itself; there is no agent
+	// scope to judge against, so only a local admin may read it.
+	if agent == "" {
+		if err := s.authorizeGlobal(ctx, principal); err != nil {
+			return "", err
+		}
+		text, err := s.backend.Load(ctx, core.GlobalScope)
+		if err != nil {
+			return "", err
+		}
+		return s.coreSectionOf(core.GlobalScope, text)
+	}
+
+	// 读取**先于**任何层判定完成复核：`include_global_memory` 决定读哪几层，不决定
+	// 能不能读（技术方案 §3.5.2「配置只决定读哪几层，不决定能不能读」）。这条对所有
+	// 取值一致——未声明不是鉴权旁路，撤销的 Key 在兼容路径上同样被拒。
+	// The check precedes the layer decision for every setting value; choosing layers never
+	// grants permission, and the legacy path is not an authorization bypass.
+	if err := s.authorizeRead(ctx, principal, agent); err != nil {
+		return "", err
+	}
+
 	scope := scopeOf(agent)
 	text, err := s.backend.Load(ctx, scope)
 	if err != nil {
 		return "", err
 	}
-	if !layerNonEmpty(text) {
-		scope = core.GlobalScope
-		text, err = s.backend.Load(ctx, scope)
-		if err != nil {
-			return "", err
+	if layerNonEmpty(text) {
+		return s.coreSectionOf(scope, text)
+	}
+
+	text, err = s.backend.Load(ctx, core.GlobalScope)
+	if err != nil {
+		return "", err
+	}
+	return s.coreSectionOf(core.GlobalScope, text)
+}
+
+// authorizeRead 是两条读取路径共用的前置复核：身份有效 → Agent scope → 调用方 Key 的
+// **当前**状态（撤销即拒）。**只此一处**——两条路径各写一遍，迟早有一边漏掉最后一项。
+// authorizeRead is the single pre-check both read paths share: valid principal, agent
+// scope, then the caller key's current status (a revoked key is refused immediately).
+func (s *Service) authorizeRead(ctx context.Context, principal core.Principal, agent string) error {
+	if !principal.Valid() {
+		return core.ErrUnauthorized
+	}
+	if agent == "" || !principal.HasAgentScope(agent) {
+		return core.ErrForbidden
+	}
+	if principal.Kind == core.PrincipalCaller {
+		checker, ok := s.backend.(MemoryAccessChecker)
+		if !ok {
+			return core.ErrForbidden
+		}
+		if err := checker.AuthorizeMemory(ctx, principal, agent); err != nil {
+			return err
 		}
 	}
-	return s.coreSectionOf(scope, text)
+	return nil
+}
+
+// authorizeGlobal 判"这一层是全局层"时的额外要求：只有本地管理员能读无 Agent 上下文的
+// 全局层；带 Agent 的调用方读全局层要经 `authorizeRead` 的 Agent scope 与 Key 复核。
+// authorizeGlobal requires a local admin for the agent-less global layer; an agent
+// caller already passed the scope and key checks in authorizeRead.
+func (s *Service) authorizeGlobal(ctx context.Context, principal core.Principal) error {
+	if !principal.Valid() {
+		return core.ErrUnauthorized
+	}
+	if principal.Kind == core.PrincipalLocalAdmin {
+		return nil
+	}
+	return core.ErrForbidden
+}
+
+// LoadLayers handles only an explicit per-Agent choice. It refuses invalid or
+// unauthorized principals and never silently changes the legacy fallback. An
+// over-budget combined prompt is rejected by the normal context budget gate.
+func (s *Service) LoadLayers(ctx context.Context, agent string, principal core.Principal, includeGlobal bool) (string, error) {
+	if err := s.authorizeRead(ctx, principal, agent); err != nil {
+		return "", err
+	}
+	localText, err := s.backend.Load(ctx, scopeOf(agent))
+	if err != nil {
+		return "", err
+	}
+	localEntries, _, err := parseSections(localText)
+	if err != nil {
+		return "", err
+	}
+	if !includeGlobal {
+		return s.coreSectionOf(scopeOf(agent), localText)
+	}
+	globalText, err := s.backend.Load(ctx, core.GlobalScope)
+	if err != nil {
+		return "", err
+	}
+	globalEntries, _, err := parseSections(globalText)
+	if err != nil {
+		return "", err
+	}
+	// 两个层各自判一次超配额：合并注入读的是同一批手工可编辑文本，合并本身不能
+	// 让任何一层失去告警（约束 11 注入侧的采集点见 warnCoreOverQuota）。
+	s.warnCoreOverQuota(scopeOf(agent), localEntries)
+	s.warnCoreOverQuota(core.GlobalScope, globalEntries)
+	seen := make(map[string]struct{}, len(localEntries))
+	for _, entry := range localEntries {
+		seen[entry] = struct{}{}
+	}
+	uniqueGlobal := make([]string, 0, len(globalEntries))
+	for _, entry := range globalEntries {
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		uniqueGlobal = append(uniqueGlobal, entry)
+	}
+	parts := make([]string, 0, 2)
+	if len(uniqueGlobal) > 0 {
+		parts = append(parts, renderSectionOrEmpty("## 全局记忆", uniqueGlobal))
+	}
+	if len(localEntries) > 0 {
+		parts = append(parts, renderSectionOrEmpty("## Agent 记忆", localEntries))
+	}
+	return strings.Join(parts, "\n\n"), nil
 }
 
 // scopeOf 把「有无 Agent 上下文」解析成作用域——**只此一处**。空串 = 全局层，是正常
@@ -200,6 +314,18 @@ func (s *Service) coreSectionOf(scope core.Scope, text string) (string, error) {
 	if len(coreEntries) == 0 {
 		return "", nil
 	}
+	s.warnCoreOverQuota(scope, coreEntries)
+	return renderSectionOrEmpty(sectionCoreTitle, coreEntries), nil
+}
+
+// warnCoreOverQuota 是注入期超配额的**唯一**采集点：单条 4096 与核心区总量 32768
+// 两条上限（FR-021 / FR-025）。两个装载入口都必须过它——`LoadEffective`（兼容回退）
+// 与 `LoadLayers` 的 `include_global_memory = true`（合并注入）读的是同一批手工可编辑
+// 的核心区，只采集其中一条路径等于给另一条留下**静默**超配额的口子：日志是这条路径
+// 唯一的留痕（无审计行），漏记就再也查不到了。
+// The one place the injection-side over-quota WARN is emitted; both load paths must
+// pass through it, otherwise the merge path silently loses the only trace of it.
+func (s *Service) warnCoreOverQuota(scope core.Scope, coreEntries []string) {
 	for i, entry := range coreEntries {
 		if len(entry) > core.MaxCoreEntryBytes {
 			s.logger.Warn("memory: 核心记忆单条超出写配额，仍完整注入",
@@ -215,7 +341,6 @@ func (s *Service) coreSectionOf(scope core.Scope, text string) (string, error) {
 			"bytes", total,
 			"limit", core.MaxCoreSectionBytes)
 	}
-	return renderSectionOrEmpty(sectionCoreTitle, coreEntries), nil
 }
 
 // renderSectionOrEmpty 渲染一个分区：空 → `""`；否则走既有 `renderSection`（标题 +

@@ -13,6 +13,8 @@ import {
   shortHash,
 } from '../components/ui'
 import { renderSafeText } from '../render'
+import { diagnosticsHref } from '../router'
+import { CompactionPanel } from './compaction'
 import {
   AGENT_STATE_LABELS,
   RUN_STATUS_LABELS,
@@ -117,7 +119,16 @@ export const RunDetailView = defineComponent({
 
     return (): VNode => {
       const content: VNodeChild[] = [
-        pageHeading('WORKSPACE / RUNS', '运行详情', '查看执行结果、触发来源与准入时固定的资源版本。'),
+        pageHeading(
+          'WORKSPACE / RUNS',
+          '运行详情',
+          '查看执行结果、触发来源与准入时固定的资源版本。',
+          // 诊断事件按 run_id 深链：运行内的模型 / 工具 / 权限 / 配额判定都在那里。
+          // Diagnostics deep-link by run_id; the run page owns the id, the page does the rest.
+          h('div', { class: 'form-actions' }, [
+            h('a', { class: 'button', href: diagnosticsHref(['run_id', runId]) }, '诊断事件'),
+          ]),
+        ),
         h('p', { class: 'back-link' }, [h('a', { href: '/console/runs' }, '← 返回运行列表')]),
       ]
 
@@ -146,6 +157,10 @@ export const RunDetailView = defineComponent({
             ['结束时间', formatTimestamp(detail.finished_at)],
             ['原因', detail.reason === '' ? '—' : detail.reason],
           ])]),
+          // 压缩记录（T089）：无状态 Run 的压缩条目按 run 范围存；会话范围的条目在
+          // 会话详情页看——两个范围各有自己的当前代次，合并列表不满足契约排序口径。
+          // Run-scope compactions only; session-scope entries live on the session page.
+          h(CompactionPanel, { ctx: props.ctx, runId }),
           section('最终文本', [
             detail.final_text === ''
               ? h('p', { class: 'muted' }, '该运行没有最终文本')

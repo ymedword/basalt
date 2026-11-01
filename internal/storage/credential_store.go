@@ -443,6 +443,62 @@ func (s *CredentialStore) ListActive(ctx context.Context) ([]core.CredentialReco
 	return out, nil
 }
 
+// ListAll 按 `(凭据 ID, 绑定键)` 升序列出**全部**身份行（含已撤销 / 已退役）：
+// `secrets verify` 的历史密文报告要按身份归位槽位名与状态，只看 active 会漏掉
+// 已撤销身份里残留的密文。只读，**不**带版本行与密文材料。
+// ListAll lists every identity row, revoked and retired included, in a stable order:
+// the history report must find leftover ciphertext under a revoked identity too.
+func (s *CredentialStore) ListAll(ctx context.Context) ([]core.CredentialRecord, error) {
+	rows, err := s.db.read.QueryContext(ctx,
+		`SELECT `+credentialColumns+` FROM credentials
+		  ORDER BY credential_id ASC, binding_key ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("列出全部凭据身份: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []core.CredentialRecord
+	for rows.Next() {
+		rec, scanErr := scanCredential(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("扫描凭据身份: %w", scanErr)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历凭据身份: %w", err)
+	}
+	return out, nil
+}
+
+// ListAllVersions 按 `(凭据 ID, 版本号)` 升序列出**全部**版本行（含密文材料）。
+// 只给核验面用：调用方必须立即清零解出的明文，且**不得**把本方法的返回值带进
+// 命令输出、日志或视图投影。
+// ListAllVersions lists every version row with its ciphertext for the verify face only;
+// the caller must zero any decrypted plaintext and never surface the rows.
+func (s *CredentialStore) ListAllVersions(ctx context.Context) ([]core.CredentialVersionRecord, error) {
+	rows, err := s.db.read.QueryContext(ctx,
+		`SELECT `+credentialVersionColumns+` FROM credential_versions
+		  ORDER BY credential_id ASC, version_no ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("列出全部凭据版本: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []core.CredentialVersionRecord
+	for rows.Next() {
+		rec, scanErr := scanCredentialVersion(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("扫描凭据版本: %w", scanErr)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历凭据版本: %w", err)
+	}
+	return out, nil
+}
+
 // RecordVersionCredential 记录"某发布版本发布时活动凭据是第几版"（**仅供审计**）。
 // 同一 `(version_id, credential_id)` 已记录时保持首次结论：发布版本不可变，快照也不重写。
 // 运行时授权**不读**这张表——Run 按准入固定的版本，通知按发送时当前 active 版本。

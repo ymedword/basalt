@@ -86,7 +86,7 @@ func TestAgentMemory_ReadsAgentLayer(t *testing.T) {
 	require.Equal(t, codeOK, env.Code)
 	require.Equal(t, memoryScopeAgent, env.Data.Scope)
 	require.Equal(t, "ops-agent", env.Data.Agent)
-	require.Equal(t, "markdown", env.Data.Backend)
+	require.Equal(t, "postgres", env.Data.Backend)
 	require.Equal(t, "# Core\nAGENT-CORE", env.Data.Core, "分区正文必须原样透传（含标题行）")
 	require.Equal(t, "## Archive\nAGENT-ARCH", env.Data.Archive)
 	require.Equal(t, []core.Scope{{Agent: "ops-agent"}}, mem.recordedScopes())

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷「收紧域名白名单后撤销已建立的 MCP http 连接」（US-12 R8.2.3 / R8.2.4）：

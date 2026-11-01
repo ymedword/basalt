@@ -811,14 +811,29 @@ func ApplyChanges(original []byte, changes core.AgentContentChanges) ([]byte, er
 		}
 	}
 	if changes.Settings != nil {
+		if changes.Settings.IncludeGlobalMemory != nil && changes.Settings.ClearIncludeGlobalMemory {
+			return nil, fmt.Errorf("%w: settings.include_global_memory 不能同时写值与清除", ErrEditUnsupported)
+		}
 		var leaves []patchLeaf
+		var removals []string
 		if changes.Settings.MaxIterations != nil {
 			leaves = append(leaves, patchLeaf{"max_iterations", strconv.Itoa(*changes.Settings.MaxIterations)})
 		}
 		if changes.Settings.MaxHistoryTurns != nil {
 			leaves = append(leaves, patchLeaf{"max_history_turns", strconv.Itoa(*changes.Settings.MaxHistoryTurns)})
 		}
-		if raw, err = patchMapField(raw, "settings", leaves, nil); err != nil {
+		if changes.Settings.IncludeGlobalMemory != nil {
+			leaves = append(leaves, patchLeaf{"include_global_memory", strconv.FormatBool(*changes.Settings.IncludeGlobalMemory)})
+		}
+		if changes.Settings.ClearIncludeGlobalMemory {
+			removals = append(removals, "include_global_memory")
+		}
+		if raw, err = patchMapField(raw, "settings", leaves, removals); err != nil {
+			return nil, err
+		}
+	}
+	if changes.Knowledge != nil {
+		if raw, err = patchKnowledgeField(raw, *changes.Knowledge); err != nil {
 			return nil, err
 		}
 	}
@@ -1335,7 +1350,7 @@ func knownChildKey(parent, child string) bool {
 	case "provider":
 		return child == "name" || child == "model" || child == "temperature"
 	case "settings":
-		return child == "max_iterations" || child == "max_history_turns"
+		return child == "max_iterations" || child == "max_history_turns" || child == "include_global_memory"
 	}
 	return false
 }
@@ -1420,6 +1435,62 @@ func patchSchedulesField(raw []byte, schedules []core.Schedule) ([]byte, error) 
 		}
 	}
 	return replaceSchedulesBlock(raw, schedules)
+}
+
+// patchKnowledgeField safely replaces the declared list, refusing styles where
+// rebuilding the block would discard comments or YAML semantics.
+func patchKnowledgeField(raw []byte, bindings []core.KnowledgeBinding) ([]byte, error) {
+	if err := core.ValidateKnowledgeBindings(bindings); err != nil {
+		return nil, err
+	}
+	f, err := parseFenced(raw)
+	if err != nil {
+		return nil, err
+	}
+	block, found, err := f.locateTopBlock("knowledge")
+	if err != nil {
+		return nil, err
+	}
+	var rendered strings.Builder
+	if len(bindings) == 0 {
+		rendered.WriteString("knowledge: []" + f.newline)
+	} else {
+		rendered.WriteString("knowledge:" + f.newline)
+		for _, binding := range bindings {
+			rendered.WriteString("  - name: " + yamlQuote(binding.Name) + f.newline)
+			rendered.WriteString("    access: " + yamlQuote(string(binding.Access)) + f.newline)
+		}
+	}
+	if !found {
+		f.insertLine(f.closing, rendered.String())
+		return f.bytes(), nil
+	}
+	if _, err := ParseKnowledgeBindings(raw); err != nil {
+		return nil, fmt.Errorf("%w: knowledge 原文无法解析", ErrEditUnsupported)
+	}
+	first := scheduleLineContent(f.lines[block.start])
+	rest := strings.TrimSpace(first[len("knowledge")+1:])
+	if rest != "" && rest != "[]" {
+		return nil, fmt.Errorf("%w: knowledge 不是块式列表", ErrEditUnsupported)
+	}
+	for i := block.start + 1; i < block.end; i++ {
+		line := scheduleLineContent(f.lines[i])
+		if strings.Contains(line, "\t") || hasUnquotedComment(line) {
+			return nil, fmt.Errorf("%w: knowledge 含注释或制表符", ErrEditUnsupported)
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "- name:") && !strings.HasPrefix(trimmed, "name:") && !strings.HasPrefix(trimmed, "access:") {
+			return nil, fmt.Errorf("%w: knowledge 列表格式不支持安全替换", ErrEditUnsupported)
+		}
+		_, value, _ := strings.Cut(trimmed, ":")
+		if hazard := yamlValueHazard(strings.TrimSpace(value)); hazard != "" {
+			return nil, fmt.Errorf("%w: knowledge %s", ErrEditUnsupported, hazard)
+		}
+	}
+	return f.replaceRange(block.start, block.end, rendered.String())
 }
 
 // renderStringSequence 渲染顶层字符串序列块：空列表用流式 `[]`（契约示例同形），
@@ -1671,6 +1742,26 @@ func verifyPatched(original, patched, bodyBefore []byte, changes core.AgentConte
 		if changes.Settings.MaxHistoryTurns != nil &&
 			(dto.Settings.MaxHistoryTurns == nil || *dto.Settings.MaxHistoryTurns != *changes.Settings.MaxHistoryTurns) {
 			return mismatch("settings.max_history_turns")
+		}
+		if changes.Settings.IncludeGlobalMemory != nil &&
+			(dto.Settings.IncludeGlobalMemory == nil || *dto.Settings.IncludeGlobalMemory != *changes.Settings.IncludeGlobalMemory) {
+			return mismatch("settings.include_global_memory")
+		}
+		// 清除的读回判据与写入相反：键**必须**已经不在，残留任何值都是没删干净。
+		if changes.Settings.ClearIncludeGlobalMemory && dto.Settings.IncludeGlobalMemory != nil {
+			return mismatch("settings.include_global_memory")
+		}
+	}
+	if changes.Knowledge != nil {
+		got, err := ParseKnowledgeBindings(patched)
+		if err != nil || len(got) != len(*changes.Knowledge) {
+			return mismatch("knowledge")
+		}
+		for i, item := range *changes.Knowledge {
+			access, err := core.ParseKnowledgeAccess(string(item.Access))
+			if err != nil || got[i].Name != strings.TrimSpace(item.Name) || got[i].Access != access {
+				return mismatch("knowledge")
+			}
 		}
 	}
 	if changes.Schedules != nil {

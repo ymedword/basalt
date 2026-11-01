@@ -24,6 +24,14 @@ const (
 	// BindingMCPServer is a credential owner kind only; it is not a bindable resource
 	// kind and ParseBindingKind still refuses it.
 	BindingMCPServer BindingKind = "mcp_server"
+	// BindingKnowledgeCollection 是**知识集合投影行**的类别字面量（D-19）：来源是
+	// AGENT.md 的 `knowledge:` 块，不是 `resource_bindings`。因此 `ParseBindingKind`
+	// 与 `IsCredentialOwnerKind` 都**不**认它——它既不能出现在绑定块里，也不能持有凭据；
+	// 它的 `resource_uid` 列存的是 `col_` 前缀的 `collection_id`，不是 `rs_` 资源身份，
+	// 所以按 UID 反查资源引用的闸门（`ReferencingAgents`）**不得**用它的值。
+	// BindingKnowledgeCollection is the projection-only kind for knowledge collections;
+	// it is neither a bindable resource kind nor a credential owner kind.
+	BindingKnowledgeCollection BindingKind = "knowledge_collection"
 )
 
 // IsCredentialOwnerKind 报告该类别能否作为凭据属主（`credentials.owner_kind` 的三值

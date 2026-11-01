@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是启动基线的验收面（颗粒度文档 §3.2.1：internal/app/baseline_test.go，16 例）。
@@ -12,11 +14,8 @@ package app
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,47 +28,18 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
-
-// baselineClock 是基线用例的固定时钟：操作标识、版本时间与状态文件都落在同一读数上，
-// 读数可复算。The fixed clock keeps every recorded timestamp reproducible.
-func baselineClock() time.Time {
-	return time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
-}
-
-// newCapturedLogger 返回写进缓冲区的 logger：WARN 是"待发布 / 已撤回 / 跳过"的唯一
-// 可判痕迹，必须能在用例里逐字断言。
-// newCapturedLogger captures log output so WARN-only outcomes stay assertable.
-func newCapturedLogger() (*slog.Logger, *bytes.Buffer) {
-	buf := &bytes.Buffer{}
-	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), buf
-}
-
-// sha256Hex 在用例侧独立计算摘要——期望值不调用被测实现。
-// sha256Hex computes the digest independently of the implementation under test.
-func sha256Hex(t *testing.T, raw []byte) string {
-	t.Helper()
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
-}
-
-// writeWorkspaceFile 在临时工作区里落一份文件（自动创建父目录）。
-func writeWorkspaceFile(t *testing.T, root, rel, content string) {
-	t.Helper()
-	full := filepath.Join(root, filepath.FromSlash(rel))
-	require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
-	require.NoError(t, os.WriteFile(full, []byte(content), 0o644))
-}
 
 // baselineEnv 是一套基线夹具：临时工作区 + 临时库 + 固定时钟 + captured logger。
 // 技能 weekly 是唯一实体（SKILL.md + 一份 L3），skills/draft 是无 SKILL.md 的非实体目录。
 type baselineEnv struct {
-	deps   BaselineDeps
-	root   string
-	dbPath string
-	logs   *bytes.Buffer
+	deps BaselineDeps
+	root string
+	dsn  string
+	logs *bytes.Buffer
 }
 
 // newBaselineEnv 建夹具：两个 Provider、一个 MCP、一个技能、一个 Agent。
@@ -85,19 +55,19 @@ func newBaselineEnv(t *testing.T) *baselineEnv {
 	writeWorkspaceFile(t, root, "skills/weekly/references/guide.md", "# 指南\n")
 	writeWorkspaceFile(t, root, "skills/draft/notes.md", "草稿\n")
 
-	dbPath := filepath.Join(root, databaseFileName)
-	db, err := storage.OpenWritable(context.Background(), dbPath, storage.SupportedSchemaVersion)
+	dsn := pgtest.NewTestSchema(t)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	logger, logs := newCapturedLogger()
 	env := &baselineEnv{
-		root:   root,
-		dbPath: dbPath,
-		logs:   logs,
+		root: root,
+		dsn:  dsn,
+		logs: logs,
 		deps: BaselineDeps{
-			Operations: storage.NewManagementStore(db),
-			Resources:  storage.NewResourceStore(db),
+			Operations: postgres.NewManagementStore(db),
+			Resources:  postgres.NewResourceStore(db),
 			Skills:     workspace.NewSkillLibrary(root),
 			Lifecycle:  workspace.NewLifecycleStore(root, baselineClock),
 			Providers: []ProviderDefinition{
@@ -380,7 +350,7 @@ func TestRunBaseline_ConcurrentStartup(t *testing.T) {
 	}
 	require.Len(t, winners, 1, "同一工作区并发启动只允许一方取得实例锁")
 
-	db := openRead(t, fx.dbPath())
+	db := openRead(t, fx.dsn)
 	require.Equal(t, 1, countRows(t, db,
 		`SELECT COUNT(*) FROM management_operations WHERE action = 'system.baseline_v2'`),
 		"基线只执行一次：失败方在取锁处止步，零写入")
@@ -402,15 +372,15 @@ func TestRunBaseline_NoWorkWritesNoOperation(t *testing.T) {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	dbPath := filepath.Join(root, databaseFileName)
-	db, err := storage.OpenWritable(context.Background(), dbPath, storage.SupportedSchemaVersion)
+	dsn := pgtest.NewTestSchema(t)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	logger, logs := newCapturedLogger()
 	deps := BaselineDeps{
-		Operations: storage.NewManagementStore(db),
-		Resources:  storage.NewResourceStore(db),
+		Operations: postgres.NewManagementStore(db),
+		Resources:  postgres.NewResourceStore(db),
 		Skills:     workspace.NewSkillLibrary(root),
 		Lifecycle:  workspace.NewLifecycleStore(root, baselineClock),
 		Logger:     logger,
@@ -418,7 +388,7 @@ func TestRunBaseline_NoWorkWritesNoOperation(t *testing.T) {
 	}
 	require.NoError(t, runBaseline(context.Background(), deps))
 
-	require.Zero(t, countRows(t, openRead(t, dbPath), `SELECT COUNT(*) FROM management_operations`),
+	require.Zero(t, countRows(t, openRead(t, dsn), `SELECT COUNT(*) FROM management_operations`),
 		"无活可做时不写操作行")
 	require.Contains(t, logs.String(), "无需补建")
 }
@@ -473,7 +443,7 @@ func TestRunBaseline_RefusesDuplicatePendingBaselines(t *testing.T) {
 	err := runBaseline(ctx, env.deps)
 	require.ErrorContains(t, err, "无法确定复用哪一条")
 	require.Len(t, baselineOperations(t, env.deps), 2, "拒绝启动时不追加操作行")
-	require.Zero(t, countRows(t, openRead(t, env.dbPath), `SELECT COUNT(*) FROM resource_versions`))
+	require.Zero(t, countRows(t, openRead(t, env.dsn), `SELECT COUNT(*) FROM resource_versions`))
 }
 
 // TestRunBaseline_RefusesCorruptAgentState：状态文件损坏 → 整个基线失败且零写入；
@@ -485,7 +455,7 @@ func TestRunBaseline_RefusesCorruptAgentState(t *testing.T) {
 	err := runBaseline(context.Background(), env.deps)
 	require.ErrorContains(t, err, "拒绝覆盖")
 
-	read := openRead(t, env.dbPath)
+	read := openRead(t, env.dsn)
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM management_operations`), "扫描失败时一行都不写")
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM resource_versions`))
 }
@@ -557,9 +527,9 @@ func TestRunBaseline_DoesNotResurrectDeletedPointer(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, runBaseline(ctx, env.deps))
 
-	read := openRead(t, env.dbPath)
-	_, err := read.ExecContext(ctx,
-		`UPDATE resource_pointers SET deleted_at = ? WHERE resource_kind = ? AND resource_id = ?`,
+	write := openRawWrite(t, env.dsn)
+	_, err := write.ExecContext(ctx,
+		`UPDATE resource_pointers SET deleted_at = $1 WHERE resource_kind = $2 AND resource_id = $3`,
 		baselineClock().UnixMilli(), string(core.ResourceModelConnection), "alpha")
 	require.NoError(t, err)
 
@@ -585,9 +555,9 @@ func TestRegistryEntries_SkillWithoutPublishedPointerIsNotRegistered(t *testing.
 	ctx := context.Background()
 	require.NoError(t, runBaseline(ctx, env.deps))
 
-	read := openRead(t, env.dbPath)
-	_, err := read.ExecContext(ctx,
-		`UPDATE resource_pointers SET deleted_at = ? WHERE resource_kind = ? AND resource_id = ?`,
+	write := openRawWrite(t, env.dsn)
+	_, err := write.ExecContext(ctx,
+		`UPDATE resource_pointers SET deleted_at = $1 WHERE resource_kind = $2 AND resource_id = $3`,
 		baselineClock().UnixMilli(), string(core.ResourceSkill), "weekly")
 	require.NoError(t, err)
 
@@ -645,9 +615,9 @@ func TestRunBaseline_CatchesUpAppliedPointerForMCP(t *testing.T) {
 	require.NoError(t, runBaseline(ctx, env.deps))
 	firstID := baselineOperations(t, env.deps)[0].OperationID
 
-	read := openRead(t, env.dbPath)
-	_, err := read.ExecContext(ctx,
-		`UPDATE resource_pointers SET applied_version_id = NULL WHERE resource_kind = ? AND resource_id = ?`,
+	write := openRawWrite(t, env.dsn)
+	_, err := write.ExecContext(ctx,
+		`UPDATE resource_pointers SET applied_version_id = NULL WHERE resource_kind = $1 AND resource_id = $2`,
 		string(core.ResourceMCPServer), "web")
 	require.NoError(t, err)
 
@@ -713,7 +683,7 @@ func TestRunBaseline_RefusesBeginOperationFailure(t *testing.T) {
 	err := runBaseline(context.Background(), env.deps)
 	require.ErrorContains(t, err, "拒绝执行")
 
-	read := openRead(t, env.dbPath)
+	read := openRead(t, env.dsn)
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM resource_versions`))
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM resource_pointers`))
 }

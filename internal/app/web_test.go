@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 US-9 装配层的验收面（颗粒度文档 §3.2 的 `internal/app/web_test.go` 六条），
@@ -57,7 +59,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 )
@@ -99,20 +101,22 @@ func TestNewWebServer_OptionsProjection(t *testing.T) {
 		}, opts.Providers)
 	})
 
-	t.Run("backend 归一化与真实 MCP 连接数", func(t *testing.T) {
+	t.Run("记忆载体恒为 postgres 与真实 MCP 连接数", func(t *testing.T) {
 		rt := &heavyRuntime{
-			cfg: &cli.Config{}, // memory.backend 为空 → 归一化为 markdown
+			cfg: &cli.Config{}, // 记忆段已退役：配置面没有载体可取
 			mcpConns: []tool.MCPConnection{
 				{Server: "fs", Tools: []core.Tool{fakeTool{name: "mcp__fs__read"}}},
 				{Server: "gh", Tools: []core.Tool{fakeTool{name: "mcp__gh__search"}}},
 			},
 		}
 		opts := (&App{}).webOptions(rt)
-		require.Equal(t, "markdown", opts.MemoryBackend)
+		require.Equal(t, "postgres", opts.MemoryBackend, "运行时唯一载体为 PostgreSQL（D-18）")
 		require.Equal(t, 2, opts.MCPConnected, "MCP 连接数取真实连接结果，不是配置条目数")
 
+		// 已退役的键即便被塞进内存结构也不得影响视图：按它分流就是复活载体开关。
 		rt.cfg.Memory.Backend = "sqlite"
-		require.Equal(t, "sqlite", (&App{}).webOptions(rt).MemoryBackend)
+		require.Equal(t, "postgres", (&App{}).webOptions(rt).MemoryBackend,
+			"Memory.Backend 不参与任何判定——装载期已拒绝该键")
 	})
 
 	t.Run("预算映射与越界值丢弃", func(t *testing.T) {
@@ -416,16 +420,28 @@ func TestNewRuntime_MaxConcurrentRuns(t *testing.T) {
 	first := make(chan error, 1)
 	go func() {
 		_, err := rt.service.Run(ctx, core.RunRequest{
-			Agent: "ops-agent", SessionID: "s1", Message: "hi", Channel: "web", UserID: "u",
+			Principal: core.LocalAdminPrincipal(),
+			Agent:     "ops-agent", SessionID: "s1", Message: "hi", Channel: "web", UserID: "u",
 		})
 		first <- err
 	}()
-	<-blocker.started // 第一个运行已准入并进入模型调用
+	// 第一个运行已准入并进入模型调用。窗口必须有界：无界等待会把"运行在到达模型
+	// 调用前就失败"变成整包挂死（goroutine 泄漏式死锁），失败原因随 `first` 一起丢失。
+	// The wait is bounded so an early run failure fails the test with its error instead
+	// of deadlocking the whole package.
+	select {
+	case <-blocker.started:
+	case err := <-first:
+		t.Fatalf("第一个运行未进入模型调用就结束：%v；装配日志：\n%s", err, f.logs.String())
+	case <-time.After(15 * time.Second):
+		t.Fatal("第一个运行未在 15s 内进入模型调用（准入或装配阻塞）")
+	}
 
 	second := make(chan error, 1)
 	go func() {
 		_, err := rt.service.Run(ctx, core.RunRequest{
-			Agent: "ops-agent", SessionID: "s2", Message: "hi", Channel: "web", UserID: "u",
+			Principal: core.LocalAdminPrincipal(),
+			Agent:     "ops-agent", SessionID: "s2", Message: "hi", Channel: "web", UserID: "u",
 		})
 		second <- err
 	}()
@@ -567,6 +583,10 @@ func TestRunService_WebOptionsManagementPortsWired(t *testing.T) {
 	require.NotNil(t, opts.Resources, "Resources 必须装配（六条只读资源路由）")
 	require.NotNil(t, opts.System, "System 必须装配（概览数据库侧读数）")
 	require.NotNil(t, opts.Sampler, "Sampler 按注入时钟构造")
+	// T014 的装配证据：调用方管理面三段存储（Key / 配额 / 管理操作）随运行期切 PG
+	// 一并注入——端口为 nil 时七个 `/callers` 端点按装配缺失固定 500（失败关闭）。
+	// T014 assembly evidence: the caller-admin port must be present, not fail closed.
+	require.NotNil(t, opts.Callers, "Callers 必须装配（`/callers` 七条端点不得按装配缺失 500）")
 
 	entries := opts.Registry.Entries()
 	require.Len(t, entries, 1)
@@ -576,7 +596,7 @@ func TestRunService_WebOptionsManagementPortsWired(t *testing.T) {
 	ctx := context.Background()
 	readings, err := opts.System.ReadOverview(ctx)
 	require.NoError(t, err, "概览读数走真实库，不得因缺端口失败")
-	require.Equal(t, storage.SupportedSchemaVersion, readings.SchemaVersion)
+	require.Equal(t, postgres.SupportedSchemaVersion, readings.SchemaVersion)
 	require.Zero(t, readings.RunsRunning, "空账本的运行中计数是真实读数 0")
 	require.Zero(t, readings.RunsLast24h)
 	require.Zero(t, readings.RunsFailedLast24h)
@@ -828,15 +848,15 @@ func TestManagementPorts_MCPReadProjectionSeesCredentialSlots(t *testing.T) {
 	env.publish(t, core.ResourceMCPServer, "github", version.ID, true)
 
 	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
-		Credentials:   storage.NewCredentialStore(env.db),
-		Sources:       storage.NewMCPCredentialSourceStore(env.db),
+		Credentials:   postgres.NewCredentialStore(env.db),
+		Sources:       postgres.NewMCPCredentialSourceStore(env.db),
 		WorkspaceRoot: env.root,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	require.NoError(t, err)
 	definition, err := parseMCPDefinition("github", version.DefinitionYAML)
 	require.NoError(t, err)
-	added, err := mcpCredentials.BackfillEnvSources(ctx, "github", version.ResourceUID, core.MCPServerConfig{
+	report, err := mcpCredentials.BackfillEnvSources(ctx, "github", version.ResourceUID, core.MCPServerConfig{
 		Name:      "github",
 		Transport: definition.Transport,
 		Command:   definition.Command,
@@ -846,7 +866,7 @@ func TestManagementPorts_MCPReadProjectionSeesCredentialSlots(t *testing.T) {
 		Headers:   definition.Headers,
 	}, env.opID, baselineClock())
 	require.NoError(t, err)
-	require.Equal(t, 1, added, "启动回填必须为文件里声明的槽位记下 env 来源")
+	require.Equal(t, 1, report.FilledCount(), "启动回填必须为文件里声明的槽位记下 env 来源")
 
 	opts := (&App{}).webOptions(&heavyRuntime{
 		cfg:            &cli.Config{},

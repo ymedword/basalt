@@ -109,7 +109,7 @@ func testToolSandboxDenied(t *testing.T) {
 		t.Fatalf("越界写入目标不应存在（err=%v）", err)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireAllToolAudits(t, db,
 		[]string{"shell", "write_file", "http_get", "http_get"}, "sandbox_denied")
 }
@@ -158,7 +158,7 @@ func testToolSandboxShell(t *testing.T) {
 		t.Fatalf("stdout 与 stderr 未保持写出的先后顺序：\n%s", content)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "shell", "success", "", 1)
 	rows := queryRows(t, db, `SELECT result_json FROM tool_invocations`)
 	if result, _ := rows[0]["result_json"].(string); !strings.Contains(result, "退出码：3") {
@@ -197,7 +197,7 @@ func testToolSandboxProcessTree(t *testing.T) {
 	}
 	requireToolResultContains(t, reqs[1], "context deadline exceeded", "截止错误必须回填给模型")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "shell", "failed", "timeout", 1)
 
 	// 孙进程在超时前必须真的写过心跳（否则用例退化成"什么都没起"）；整树回收后
@@ -269,7 +269,7 @@ func testToolSandboxPortRedaction(t *testing.T) {
 	requireContains(t, results[2], deniedRulePort, "http:443 交叉档")
 	requireContains(t, results[3], deniedRulePort, "https:80 交叉档")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireAllToolAudits(t, db, []string{"http_get", "http_get", "http_get", "http_get"}, "sandbox_denied")
 	rows := queryRows(t, db, `SELECT error_message FROM tool_invocations ORDER BY id`)
 	message, _ := rows[0]["error_message"].(string)

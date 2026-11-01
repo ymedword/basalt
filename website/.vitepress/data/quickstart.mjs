@@ -10,7 +10,9 @@ export const TOKEN_GENERATION = {
   posix: 'export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"',
   windows: '$bytes = New-Object byte[] 32\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)'
 }
-export const MINIMAL_CONFIG = `providers:
+export const MINIMAL_CONFIG = `database:
+  dsn: \${BASALT_DATABASE_DSN}
+providers:
   - name: primary
     base_url: https://api.deepseek.com
     credential_mode: env
@@ -25,7 +27,7 @@ export const PREREQUISITES = [
   { id: 'runtime', en: 'Prebuilt binary: no additional language tooling.', zh: '预构建二进制：不需要额外语言工具链。' },
   { id: 'source', en: 'Source build: Go, using the toolchain in go.mod.', zh: '源码构建：需要 Go，版本以 go.mod 的 toolchain 为准。' },
   { id: 'model', en: 'A compatible model endpoint, model name and your own API key.', zh: '兼容的模型端点、模型名与你自己的 API key。' },
-  { id: 'data', en: 'Embedded SQLite; no separately deployed database or cache.', zh: 'SQLite 内嵌，无需单独部署数据库或缓存。' },
+  { id: 'data', en: 'A reachable PostgreSQL 16/17 instance with the vector extension (pgvector) and pg_trgm, plus a database for Basalt; startup is refused if either is missing.', zh: '可达的 PostgreSQL 16/17 实例（带 vector 扩展 / pgvector 与 pg_trgm）与一个 Basalt 数据库；缺任一扩展会拒绝启动。' },
   { id: 'maintenance', en: 'Node is only needed to rebuild the console or site, or capture this scripted demo. The tutorial agent needs no external interpreter or MCP server.', zh: 'Node 只用于管理台重建、官网构建和脚本化演示采集。教程 Agent 不需要外部解释器或 MCP 服务。' }
 ]
 export const STEPS = [

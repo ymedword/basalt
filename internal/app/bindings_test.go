@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖绑定投影的重建面与准入校验面（颗粒度文档 R4.6 / T120）：
@@ -14,13 +16,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -70,10 +74,10 @@ func (s *stubCredentialCheck) CheckBinding(_ context.Context, kind core.Resource
 // bindingsEnv is the fixture shared by the projection and admission tests.
 type bindingsEnv struct {
 	root       string
-	db         *storage.DB
-	resources  *storage.ResourceStore
-	bindings   *storage.BindingStore
-	notify     *storage.NotifyAdminStore
+	db         *postgres.DB
+	resources  *postgres.ResourceStore
+	bindings   *postgres.BindingStore
+	notify     *postgres.NotifyAdminStore
 	archives   *stubArchiveLister
 	projection *BindingProjection
 	opID       string
@@ -90,12 +94,9 @@ func newBindingsEnv(t *testing.T) *bindingsEnv {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	db, err := storage.OpenWritable(ctx, filepath.Join(root, databaseFileName),
-		storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	ops := storage.NewManagementStore(db)
+	ops := postgres.NewManagementStore(db)
 	opID := core.NewOperationID(baselineClock())
 	require.NoError(t, ops.BeginOperation(ctx, core.OperationRecord{
 		OperationID:  opID,
@@ -109,7 +110,7 @@ func newBindingsEnv(t *testing.T) *bindingsEnv {
 		CreatedAt:    baselineClock(),
 	}))
 
-	resources := storage.NewResourceStore(db)
+	resources := postgres.NewResourceStore(db)
 	require.NoError(t, resources.PutLifecycleIndex(ctx, core.LifecycleRecord{
 		SchemaVersion: 2,
 		Agent:         "reporter",
@@ -124,16 +125,16 @@ func newBindingsEnv(t *testing.T) *bindingsEnv {
 	archives := &stubArchiveLister{}
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	bindingStore := storage.NewBindingStore(db)
+	bindingStore := postgres.NewBindingStore(db)
 
 	return &bindingsEnv{
 		root:      root,
 		db:        db,
 		resources: resources,
 		bindings:  bindingStore,
-		notify:    storage.NewNotifyAdminStore(db),
+		notify:    postgres.NewNotifyAdminStore(db),
 		archives:  archives,
-		projection: NewBindingProjection(bindingStore, resources, archives, root, logger,
+		projection: NewBindingProjection(bindingStore, resources, archives, postgres.NewKnowledgeCatalogStore(db), root, logger,
 			baselineClock),
 		opID: opID,
 		logs: logs,
@@ -210,6 +211,16 @@ func renderBindingGroup(entries []core.ResourceBinding) string {
 	out := "\n"
 	for _, entry := range entries {
 		out += "    - name: " + entry.Name + "\n      uid: " + string(entry.UID) + "\n"
+	}
+	return out
+}
+
+// knowledgeBlock 渲染一段 `knowledge:` 声明（access 缺省，闭集只认 read）。
+// knowledgeBlock renders a knowledge declaration block.
+func knowledgeBlock(collections ...string) string {
+	out := "knowledge:\n"
+	for _, name := range collections {
+		out += "  - name: " + name + "\n"
 	}
 	return out
 }
@@ -313,6 +324,62 @@ func TestBindingProjection_RebuildsFromAgentMD(t *testing.T) {
 	againRows, err := env.bindings.Bindings(ctx, bindingAgentUID)
 	require.NoError(t, err)
 	require.Equal(t, rows, againRows)
+}
+
+// TestBindingProjection_ProjectsKnowledgeCollections —— D-19 的"投影"一步：AGENT.md
+// 的 `knowledge:` 声明经集合目录解析成**稳定集合 ID** 后写入投影行（kind =
+// knowledge_collection，ref_name = 声明名，resource_uid = collection_id）。
+// 未解析的名字不写假行，只留 WARN——写一条猜出来的行等于把检索范围指到别的库；
+// 声明被删掉时旧投影行随之消失（整份替换，不是逐条补丁）。
+//
+// 逆改点：投影只写资源绑定、不写知识行 → 首条 Equal 红；未解析时写 name 当 id →
+// "不得把声明名当身份"断言红；重建改成增量追加 → 删除声明后的行数断言红。
+func TestBindingProjection_ProjectsKnowledgeCollections(t *testing.T) {
+	ctx := context.Background()
+	env := newBindingsEnv(t)
+	catalog := postgres.NewKnowledgeCatalogStore(env.db)
+	runbooks, err := catalog.CreateCollection(ctx, core.LocalAdminPrincipal(), "runbooks", "")
+	require.NoError(t, err)
+	faq, err := catalog.CreateCollection(ctx, core.LocalAdminPrincipal(), "faq", "")
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(runbooks.CollectionID, "col_"),
+		"集合的稳定身份是 collection_id，不是声明名")
+
+	// ghost 声明不存在：不进投影，留 WARN（注册闸门随后拒绝注册）。
+	env.writeAgentMD(t, "reporter", knowledgeBlock("runbooks", "faq", "ghost"))
+	report, err := env.projection.RebuildAll(ctx)
+	require.NoError(t, err)
+	require.Empty(t, report.Failures, "声明未解析是 Agent 级的注册问题，不是投影失败")
+
+	rows, err := env.bindings.Bindings(ctx, bindingAgentUID)
+	require.NoError(t, err)
+	require.Equal(t, []core.AgentResourceBinding{
+		{
+			AgentUID: bindingAgentUID, AgentName: "reporter", Kind: core.BindingKnowledgeCollection,
+			RefName: "faq", ResourceUID: core.ResourceUID(faq.CollectionID),
+			ContentHash: migrateV3ContentHash([]byte(agentMDWithBindings("reporter",
+				knowledgeBlock("runbooks", "faq", "ghost")))),
+			ProjectedAt: baselineClock().UnixMilli(),
+		},
+		{
+			AgentUID: bindingAgentUID, AgentName: "reporter", Kind: core.BindingKnowledgeCollection,
+			RefName: "runbooks", ResourceUID: core.ResourceUID(runbooks.CollectionID),
+			ContentHash: migrateV3ContentHash([]byte(agentMDWithBindings("reporter",
+				knowledgeBlock("runbooks", "faq", "ghost")))),
+			ProjectedAt: baselineClock().UnixMilli(),
+		},
+	}, rows, "投影行按 resource_kind、ref_name 排序；身份列必须是集合 ID")
+	require.Contains(t, env.logs.String(), "未解析到唯一活动集合", "未解析声明留 WARN")
+	require.Contains(t, env.logs.String(), "ghost")
+
+	// 删掉 runbooks 声明：旧行必须消失（整份替换）。
+	env.writeAgentMD(t, "reporter", knowledgeBlock("faq"))
+	_, err = env.projection.RebuildAll(ctx)
+	require.NoError(t, err)
+	rows, err = env.bindings.Bindings(ctx, bindingAgentUID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "faq", rows[0].RefName)
 }
 
 // TestBindingProjection_ErrorFailsClosed —— 投影不可信时（结构非法 / 身份无法证明）
@@ -619,7 +686,7 @@ func TestAgentConfigReader_ResolvesReferences(t *testing.T) {
 	reader := NewAgentConfigReader(AgentConfigDeps{
 		Root:       env.root,
 		Resources:  env.resources,
-		Identities: storage.NewIdentityStore(env.db),
+		Identities: postgres.NewIdentityStore(env.db),
 		Notify:     env.notify,
 		Lifecycle:  lifecycle,
 	})
@@ -744,7 +811,7 @@ func TestAgentConfigFields_DisplayName(t *testing.T) {
 func TestScheduleDeliveryTargets_SaveTimeEligibility(t *testing.T) {
 	ctx := context.Background()
 	env := newBindingsEnv(t)
-	channels := storage.NewNotifyChannelRepo(env.db)
+	channels := postgres.NewNotifyChannelRepo(env.db)
 	deps := BindingCheckDeps{NotifyChannels: channels}
 
 	sharedUID := env.seedNotifyChannel(t, "ops")
@@ -839,7 +906,7 @@ func TestSaveBindingCheck_IncludesDeliveryTargets(t *testing.T) {
 	check := SaveBindingCheck(nil, BindingCheckDeps{
 		Resources:      env.resources,
 		Notify:         env.notify,
-		NotifyChannels: storage.NewNotifyChannelRepo(env.db),
+		NotifyChannels: postgres.NewNotifyChannelRepo(env.db),
 	})
 	profile := &core.Profile{
 		Name:           "reporter",
@@ -858,4 +925,61 @@ func TestSaveBindingCheck_IncludesDeliveryTargets(t *testing.T) {
 
 	profile.Schedules[0].DeliverTo = string(notifyUID)
 	require.NoError(t, check(ctx, "reporter", profile))
+}
+
+// TestSaveBindingCheck_RejectsMissingKnowledgeCollection —— FR-009A 的保存期前置：
+// `knowledge:` 声明的名字在库里没有活动集合时，**保存就失败**并点名坏名字，而不是
+// 存进去之后让注册闸门把整只 Agent 摘掉（现象是"Agent 突然消失"）。
+// 中文验收点：声明即绑定的判定必须发生在写盘之前，且只点名未解析的名字。
+// 逆改点：删掉 SaveBindingCheck 里的 CheckKnowledgeDeclarations 调用 → 本用例红
+// （保存返回 nil）；让它把所有声明一律当未解析 → 第二个子例红。
+// TestSaveBindingCheck_RejectsMissingKnowledgeCollection pins the save-time gate: an
+// unresolved declared name fails the save and names only that name.
+func TestSaveBindingCheck_RejectsMissingKnowledgeCollection(t *testing.T) {
+	ctx := context.Background()
+	profile := &core.Profile{
+		Name: "reporter",
+		Knowledge: []core.KnowledgeBinding{
+			{Name: "runbooks", Access: core.KnowledgeAccessRead},
+			{Name: "ghost", Access: core.KnowledgeAccessRead},
+		},
+	}
+	check := SaveBindingCheck(nil, BindingCheckDeps{
+		Collections: fakeKnowledgeCollections{missing: map[string]struct{}{"ghost": {}}},
+	})
+
+	err := check(ctx, "reporter", profile)
+	require.Error(t, err, "声明的集合没有实体时必须拒绝保存")
+
+	var rejected *core.AgentDefinitionRejectedError
+	require.ErrorAs(t, err, &rejected)
+	require.Equal(t, core.AgentRejectKnowledgeCollectionMissing, rejected.Kind)
+	require.Contains(t, rejected.Detail, "ghost", "必须点名未解析的集合")
+	require.NotContains(t, rejected.Detail, "runbooks", "不得把已解析的名字一起点名")
+
+	t.Run("全部可解析时放行", func(t *testing.T) {
+		ok := SaveBindingCheck(nil, BindingCheckDeps{Collections: fakeKnowledgeCollections{}})
+		require.NoError(t, ok(ctx, "reporter", profile),
+			"名字都能解析时不得拦保存——过度拒绝会让正常声明被迫删掉")
+	})
+
+	t.Run("目录未装配时失败关闭", func(t *testing.T) {
+		bare := SaveBindingCheck(nil, BindingCheckDeps{})
+		require.NoError(t, bare(ctx, "reporter", &core.Profile{Name: "reporter"}),
+			"没有声明时不得因缺装配拒绝——CLI 等轻量装配面照常保存")
+		err := bare(ctx, "reporter", profile)
+		require.Error(t, err, "有声明却没有目录读口时必须失败关闭，不得当成'查不到就放行'")
+		require.Contains(t, err.Error(), "集合目录")
+	})
+
+	t.Run("目录读失败上抛", func(t *testing.T) {
+		broken := SaveBindingCheck(nil, BindingCheckDeps{
+			Collections: fakeKnowledgeCollections{err: errors.New("目录读取失败")},
+		})
+		err := broken(ctx, "reporter", profile)
+		require.Error(t, err)
+		var rejected *core.AgentDefinitionRejectedError
+		require.False(t, errors.As(err, &rejected),
+			"读失败不是'集合不存在'：不得映射成装载拒因，恢复方向不同")
+	})
 }

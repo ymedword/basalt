@@ -21,6 +21,7 @@ package app
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 
@@ -31,10 +32,17 @@ import (
 
 // hardLinkCount 用 GetFileInformationByHandle 读 NumberOfLinks。
 // hardLinkCount reads NumberOfLinks through GetFileInformationByHandle.
+//
+// 打开经所在目录的句柄（`os.Root`）：路径来自部署者配置或工作区自身，根限定既消除
+// 静态扫描的 G703，也不跟随越出目录的链接。
+// The open is scoped through a root handle on the file's own directory.
 func hardLinkCount(path string, _ os.FileInfo) (uint64, bool) {
-	// #nosec G304 -- 路径来自部署者配置（secrets.master_key_file），不是请求输入；
-	// 调用方已规范化、拒绝符号链接并校验不在工作区内，这里只读链接计数。
-	file, err := os.Open(path)
+	root, rootErr := os.OpenRoot(filepath.Dir(path))
+	if rootErr != nil {
+		return 0, false
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.Open(filepath.Base(path))
 	if err != nil {
 		return 0, false
 	}

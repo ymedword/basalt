@@ -44,6 +44,19 @@ var (
 	// routing never iterates and never falls back to a default.
 	ErrProviderNotConfigured = errors.New("provider is not configured")
 
+	// ErrAuditWrite 表示审计预写失败、调用**被拒绝发出**（宪法 V 的 fail-closed；
+	// 契约 §7.2「无行 = 确定没执行」）。调用方据此区分"确定未发出"与"发出后未知"：
+	// 前者可归还配额预留，后者必须保持 `pending`（C-29）。
+	// ErrAuditWrite marks a refused call whose pending audit row could not be written,
+	// so the call provably never went out.
+	//
+	// 文案取中文：它经 `RunResult.Reason` 出站（颗粒度文档 §4.4 断言 Reason 含"审计"），
+	// 与 `ProviderService` 其余发前拒绝的文案同一风格。哨兵身份不受影响——判定一律用
+	// `errors.Is`，不比字符串。
+	// The text is Chinese because it surfaces through RunResult.Reason; identity stays
+	// with errors.Is, never with string matching.
+	ErrAuditWrite = errors.New("审计预写失败——该次调用未发出")
+
 	// ErrAuthorModelUnavailable 表示作者模型调用已经发出但未得到可用结果（上游拒绝、
 	// 不可达或响应不可用）。US-12 R7（问题 8）：HTTP 层据此返回点名修复入口的 INTERNAL，
 	// 而不是笼统的"服务器内部错误"；原始原因只进日志与 `llm_calls` 审计，不回显。
@@ -60,6 +73,11 @@ var (
 	ErrAgentResourceBindingMissing = errors.New("agent resource binding is missing")
 	// ErrAgentResourceBindingInvalid 表示绑定结构非法、孤儿或 UID 与当前指针不符。
 	ErrAgentResourceBindingInvalid = errors.New("agent resource binding is invalid")
+	// ErrAgentKnowledgeBindingInvalid 表示 `knowledge:` 声明结构非法（非列表、缺名、
+	// 重名或权限取值不在闭集内）：加载期整只不注册，**不**按名补绑、**不**降级成默认权限。
+	// ErrAgentKnowledgeBindingInvalid marks a malformed knowledge declaration; the agent
+	// is not registered and no permission is ever defaulted from a bad literal.
+	ErrAgentKnowledgeBindingInvalid = errors.New("agent knowledge binding is invalid")
 	// ErrAgentResourceUnavailable 表示绑定的资源不存在、已删除或未发布。
 	ErrAgentResourceUnavailable = errors.New("agent resource is unavailable")
 	// ErrResourceNotEligible 表示资源不在该 Agent 的可用范围内（保存期 400 / 准入 409）。
@@ -141,6 +159,14 @@ type SessionBusyError struct {
 // Error 返回不带标点的消息。
 // Error renders the message without trailing punctuation.
 func (e *SessionBusyError) Error() string { return "session is busy: " + e.SessionID }
+
+// Unwrap 暴露分类哨兵：会话忙在 HTTP 语义上是**冲突**（web 已据本类型映射 409
+// CONFLICT/SESSION_BUSY），颗粒度文档 §4.4 的服务级用例因此以
+// `errors.Is(err, core.ErrConflict)` 判卷。沿 `AdminError.Unwrap` 的同一先例；
+// `Error()` 文案与 `errors.As(*SessionBusyError)` 都不受影响。
+// Unwrap exposes the classification sentinel: a busy session is a conflict in HTTP
+// terms, and the module card judges it with errors.Is(err, ErrConflict).
+func (e *SessionBusyError) Unwrap() error { return ErrConflict }
 
 // InstanceFullError 表示实例并发运行数已达上限——**调用方问题**：直接拒绝、**不排队**
 // （对外映射 429；US-9）。上限是实例级配置，不是单次运行的预算。
@@ -398,3 +424,18 @@ func (e *AgentBusyError) Unwrap() error {
 		Data:    data,
 	}
 }
+
+// —— US-16 身份哨兵（设计 §3.1.0；零值 Principal 与越权判定的包内锚点）——
+// US-16 identity sentinels: the in-package anchors for zero-value principals and
+// authorization failures.
+var (
+	// ErrUnauthorized 表示认证失败或身份不可用（含零值 Principal、构造失败）。
+	// ErrUnauthorized means authentication failed or the identity is unusable.
+	ErrUnauthorized = errors.New("identity is missing or unauthorized")
+
+	// ErrForbidden 表示身份有效但越权：scope 不足、归属不符、管理面越权。
+	// 它与 ErrUnauthorized 必须分开：换一把 Key 可能解决前者，零值身份重试无用。
+	// ErrForbidden means the identity is valid but lacks the authority; it stays
+	// distinct from ErrUnauthorized.
+	ErrForbidden = errors.New("identity is not permitted for this operation")
+)

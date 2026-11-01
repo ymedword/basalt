@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是凭据写面编排的判卷（模块卡 R4.8 / R4.9 / T132、T157）：
@@ -617,6 +619,7 @@ func newTestSecretsService(t *testing.T, f *credentialOpsFixture, keyPath string
 		Resolver:      f.resolver,
 		MasterKeyFile: keyPath,
 		WorkspaceRoot: f.root,
+		Resources:     f.versions,
 		Logger:        slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	require.NoError(t, err)

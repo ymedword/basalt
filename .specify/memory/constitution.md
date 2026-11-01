@@ -1,6 +1,45 @@
 <!--
 Sync Impact Report
 ==================
+版本变化：4.0.0 → 5.0.0（2026-10-27；US-16「知识库 / 语义记忆 / 历史检索」统一存储裁决）
+修改的原则：
+- VIII「单二进制纪律」→「单二进制交付与显式运行期依赖」：由「核心底座无需外部数据库」
+  改为「运行期必须配置 PostgreSQL（含 pgvector），启动时 fail-closed 校验；不得回退
+  SQLite / 本地文件 / 静默降级」；SQLite 降为一次性迁移来源与回退快照。单二进制交付、
+  CGO_ENABLED=0、-race 分离、依赖最小化不变。
+- IX「不用 ORM，手写 SQL」：标题与禁 ORM 实质不变；新增两套 schema 谱系口径——
+  SQLite 谱系保持 v6（不再新增迁移，`0002`–`0006` 与迁移文件哈希冻结，仅作迁移来源）、
+  PostgreSQL 谱系自 v1 起各自版本化；PG 迁移在前向事务内以 advisory lock 串行；
+  既有 repository 接口留在 `core`，新建有界上下文可在消费方包声明窄持久化端口，
+  由 `storage/postgres` 实现，领域包不得反向依赖适配层。
+修改的章节：
+- 架构约束 · 技术栈：持久化改为 PostgreSQL 16/17 + pgvector 0.8.x（运行权威）+
+  `jackc/pgx/v5` v5.11.0（`database/sql` stdlib）+ `pgvector/pgvector-go` v0.4.1；
+  `modernc.org/sqlite` 仅保留为迁移来源；记忆后端改为 PostgreSQL；Go 构建版本按
+  `go.mod` / CI 事实校正为 1.27.3（原 1.27.2 为版本语义说明中的陈旧读数）。
+新增章节：无
+删减章节：无
+版本判定：MAJOR——Governance 将「原则重新定义」列为 MAJOR；VIII 由「无需外部数据库」
+反转为「必须配置 PostgreSQL 并 fail-closed」，属规范语义反转。IX 的谱系口径是随
+统一存储裁决的必要澄清，不单独改变禁 ORM 与手写 SQL 的实质。
+授权与记录口径（2026-10-27）：本次修订依据用户明确授权「代行技术评审与裁决」执行，
+修订方向经用户确认；不代表用户逐条审阅。评审依据、差异与未验证项记录在
+`docs/us/us16-knowledge-memory-history.md` 的 review ① 记录与 §6.6 决策页。
+配套同步（实施前落地，不随本次宪法修订完成）：
+- docs/TechnicalDesign.md §1.3 / §3.5 / §5.3–§5.5 / §6.2.5–§6.2.6 / §7.1.2 / §8.2
+- docs/Requirements.md §4.4 / §5.4 / §6.6 / §7.1 / §7.2
+- docs/contracts/（`schema.pg.sql` 新增、`schema.sql` 头部、openapi、run-and-errors、
+  agent-md）；docs/Operations.md；docs/Compatibility.md
+- US-16 模块卡、spec / plan / tasks 与验收断言
+模板核对：constitution-template 经 resolve-template.ps1 解析成功；保留本仓十条原则 /
+架构约束 / 开发工作流 / 治理结构。
+待办：US-16 依赖坐标与契约字面量在实施前冻结；G0（US-15 人工 review ②）未完成，
+US-16 不登记、不实施；PG / 迁移 / 真实服务尚未实测。
+-->
+
+<!--
+Sync Impact Report
+==================
 版本变化：3.0.0 → 4.0.0（2026-10-26；US-14 增量交付 14D「开箱即用增强」：新实例主密钥初始化）
 修改的原则：无（I–X 未增删、未重新定义）
 修改的章节：
@@ -236,21 +275,21 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 - **复核方式（可验证）**：逐处审查业务代码中的 `context.WithValue`——只允许追踪标识；业务状态一律走显式类型化参数；grep 无包级可变状态存 Profile / Session；请求路径无自建 worker pool
 - **理由**：Go 无 ThreadLocal，"显式传递"的载体是类型化参数而不是 context
 
-### VIII. 单二进制纪律
+### VIII. 单二进制交付与显式运行期依赖
 
-**发布产物必须使用 CGO_ENABLED=0 构建，运行时代码和管理台静态资源随单 Go 二进制交付。核心底座无需外部数据库、缓存或消息队列；模型服务、显式配置的 MCP Server 及其运行环境属于按配置接入的业务能力，依赖条件应单独说明。竞态测试与发布构建分开执行；测试 job 可按 -race 要求启用 CGO。** 依赖最小化：**本表（架构约束 · 技术栈）与已批准计划（spec / plan / 模块执行颗粒度文档）内的依赖可直接落地**；表外的**新增第三方坐标或版本变更**先经用户确认。
+**发布产物必须使用 CGO_ENABLED=0 构建，运行时代码和管理台静态资源随单 Go 二进制交付。运行期外部依赖必须显式声明并在启动时 fail-closed 校验：目标部署必须配置 PostgreSQL（含 pgvector 扩展）；连接失败、schema 版本不符或扩展能力不足时拒绝启动，不得回退 SQLite、本地文件或静默降级。SQLite 仅作为既有实例的一次性迁移来源与回退快照，不再是运行期存储后端。** 模型服务、显式配置的 MCP Server 及其运行环境属于按配置接入的业务能力，依赖条件应单独说明。竞态测试与发布构建分开执行；测试 job 可按 -race 要求启用 CGO。依赖最小化：**本表（架构约束 · 技术栈）与已批准计划（spec / plan / 模块执行颗粒度文档）内的依赖可直接落地**；表外的**新增第三方坐标或版本变更**先经用户确认。
 
-- **违反时的症状**：交叉编译失败 / 目标机缺动态库；或 `-race` 与 `CGO_ENABLED=0` 互相打架
-- **复核方式（可验证）**：`CGO_ENABLED=0 go build` 通过；发布产物按**各目标平台**分别验证——Linux 用 `ldd` / `file` 断言静态，macOS / Windows 验证无额外依赖即可启动；`-race` 只在测试命令 / job 中启用
-- **理由**：交付形态是本项目的核心卖点；破例即是产品破位
+- **违反时的症状**：启动日志出现「回退 SQLite」「本地文件兜底」或静默降级；发布说明仍宣称「无需外部数据库」；`/info` 不显示存储后端与 schema 版本；扩展缺失或版本不符仍启动；`-race` 与 `CGO_ENABLED=0` 互相打架
+- **复核方式（可验证）**：`CGO_ENABLED=0 go build` 通过；发布产物按**各目标平台**分别验证——Linux 用 `ldd` / `file` 断言静态，macOS / Windows 验证无额外依赖即可启动；`TestStartup_FailsClosedWithoutPostgres`、`TestServe_DoesNotOpenSQLite` 通过；`/info` 显示后端与 schema 版本；`-race` 只在测试命令 / job 中启用；`docs/Operations.md` 部署前置段与发布说明逐句核对
+- **理由**：交付形态仍是本项目的核心卖点，但企业知识、权限、审计与多 Agent 共享需要统一存储与向量检索；运行期依赖必须显式化，不能以「无需外部数据库」掩盖部署前置，也不能在依赖缺失时静默降级
 
 ### IX. 不用 ORM，手写 SQL
 
-**不得引入 ORM，不得由 ORM 自动推断或修改数据库结构。允许启动时按 `schema_version` 执行已审查、版本化的显式 SQL 迁移；已发布迁移不得改写，只允许追加。** 建表用 schema 幂等脚本；repository 接口定义在 `core`、实现在 `storage`。
+**不得引入 ORM，不得由 ORM 自动推断或修改数据库结构。允许启动时按 `schema_version` 执行已审查、版本化的显式 SQL 迁移；已发布迁移不得改写，只允许追加。存储结构按谱系管理：SQLite 谱系保持 v6（不再新增迁移，`0002`–`0006` 与迁移文件哈希冻结），仅作迁移来源；PostgreSQL 谱系自 v1 起。每个谱系有独立幂等建表脚本与版本记录；PostgreSQL 迁移必须在前向事务内以 advisory lock 串行执行。** 既有 repository 接口保留在 `core`；新建有界上下文可在消费方包（如 `knowledge` / `callers` / `diagnostics`）声明窄持久化端口，由 `storage/postgres` 实现，领域包**不得**反向依赖适配层。SQLite 实现在 `storage`，PostgreSQL 实现在 `storage/postgres`。
 
-- **违反时的症状**：SQLite 迁移能力弱，ORM 自动迁移反复出坑；SQL 不可审计、不可优化
-- **复核方式（可验证）**：`go.mod` 无 ORM 坐标；建表与迁移只在显式 SQL 脚本与 `schema_version` 记录里——复核**必须**覆盖建表脚本**与升级迁移脚本**，并逐版审查 `schema_version` 记录
-- **理由**：显式 SQL 可审计、可优化；"只追加不改写"保证已发布版本的升级路径可推演
+- **违反时的症状**：SQLite 迁移能力弱，ORM 自动迁移反复出坑；SQL 不可审计、不可优化；旧 SQLite 迁移被编辑；两个谱系的版本号混用；启动时自动「修补」结构
+- **复核方式（可验证）**：`go.mod` 无 ORM 坐标；建表与迁移只在显式 SQL 脚本与 `schema_version` 记录里——复核**必须**覆盖建表脚本**与升级迁移脚本**，并逐版审查 `schema_version` 记录；迁移文件 LF 归一哈希钉住（含 `0006`）；`TestExport_RequiresSQLiteV6`、`TestPostgres_MigrateTakesAdvisoryLock` 通过
+- **理由**：显式 SQL 可审计、可优化；「只追加不改写」保证已发布版本的升级路径可推演；两套谱系各自版本化才能避免把 SQLite 版本号与 PostgreSQL 版本号混为一谈
 
 ### X. 五大能力优先，范围卡紧
 
@@ -266,23 +305,23 @@ Basalt 是用 Go 实现的面向企业场景的 Agent OS：自托管单 Go 二�
 
 | 组件 | 选型 |
 | --- | --- |
-| 语言 / 工具链 | Go 1.27.2（构建版本）；`go.mod` 的 `go` 行写最低版本要求 `go 1.27` |
+| 语言 / 工具链 | Go 1.27.3（构建版本，以 `go.mod` 的 `toolchain` 行与 CI 为准）；`go.mod` 的 `go` 行写最低版本要求 `go 1.27` |
 | 工程结构 | 单 Go module：`cmd/basalt` + `internal/` 分包（包数为起点，纪律在依赖方向与无环） |
 | CLI | `spf13/cobra` |
 | YAML / frontmatter | `goccy/go-yaml`（已定 U-3） |
 | LLM 客户端 | `sashabaranov/go-openai`（已定 U-4；只做协议调用） |
 | HTTP 服务 | 标准库 `net/http` + ServeMux 方法路由（已定 U-6） |
-| 持久化 | `modernc.org/sqlite`（纯 Go、无 CGO）+ `database/sql` |
+| 持久化 | PostgreSQL 16/17 + pgvector 0.8.x（运行权威）；`github.com/jackc/pgx/v5` v5.11.0 经 `database/sql` stdlib 使用；`github.com/pgvector/pgvector-go` v0.4.1；`modernc.org/sqlite` 仅保留为迁移来源 |
 | 调度 | `robfig/cron/v3`（6 段制式；每任务时区经 `CRON_TZ=` 前缀） |
 | MCP | `modelcontextprotocol/go-sdk`（已定 U-5） |
 | 文件监听 | `fsnotify` |
 | 日志 | 标准库 `log/slog`（JSON handler） |
 | 测试 | 标准库 `testing` + `testify` |
-| 记忆后端 | 核心阶段 markdown + sqlite 两档；mem0 接口预留（已定 U-8） |
+| 记忆后端 | PostgreSQL（`memory_entries` + `memory_embeddings`）；原 markdown / sqlite 载体退役为迁移来源；mem0 扩展档待重新评审（原 U-8 预留不自动生效） |
 
 （裁决明细与理由见技术方案 §1.2 与需求文档 §7.6；U-1~U-10 已于 2026-10-15 全部裁决。）
 
-**Go 版本语义**（Go 1.21 起，[官方工具链文档](https://go.dev/doc/toolchain)、[go 指令语义](https://go.dev/ref/mod#go-mod-file-go)）：`go` 行声明的是**最低版本要求**——低于它的工具链会被拒绝，**它不是准确版本锁定**；准确构建版本由 **`toolchain` 指令**（`toolchain go1.27.2`）与 **CI 工具链配置**（`actions/setup-go` 的 `go-version: 1.27.2`）共同表达。本地工具链低于 `toolchain` 行时按 `GOTOOLCHAIN=auto` 切换 / 下载，高于它则照用。**不得**把 1.27.2 表述为"`go.mod` 锁定"。
+**Go 版本语义**（Go 1.21 起，[官方工具链文档](https://go.dev/doc/toolchain)、[go 指令语义](https://go.dev/ref/mod#go-mod-file-go)）：`go` 行声明的是**最低版本要求**——低于它的工具链会被拒绝，**它不是准确版本锁定**；准确构建版本由 **`toolchain` 指令**（`toolchain go1.27.3`）与 **CI 工具链配置**（`actions/setup-go` 的 `go-version: 1.27.3`）共同表达。本地工具链低于 `toolchain` 行时按 `GOTOOLCHAIN=auto` 切换 / 下载，高于它则照用。**不得**把 1.27.3 表述为"`go.mod` 锁定"。
 
 ### 依赖方向与包结构纪律
 
@@ -372,4 +411,4 @@ Agent 定义是资源 UID 绑定的**唯一权威**；数据库绑定表是可�
 - 合规审查：每个 US 收口逐条自查十大原则与架构约束；`/speckit-analyze` 将宪法冲突判为 CRITICAL——**必须**调整 spec / plan / tasks，**不得**稀释原则
 - 文档纪律：四份权威文档各司其职，**不得**互相"修正"；有冲突先裁决（技术方案最权威）再动手
 
-**Version**: 4.0.0 | **Ratified**: 2026-10-15 | **Last Amended**: 2026-10-26
+**Version**: 5.0.0 | **Ratified**: 2026-10-15 | **Last Amended**: 2026-10-27

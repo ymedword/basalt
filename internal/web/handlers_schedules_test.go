@@ -394,6 +394,7 @@ func TestSchedules_Executions(t *testing.T) {
 // 逆改点：trigger 写死 api → manual 断言红；limit_reached 落成 OK → 错误码断言红。
 func TestSchedules_RunSuccess(t *testing.T) {
 	manualReq := core.RunRequest{
+		Principal: core.LocalAdminPrincipal(),
 		RunID:     "scheduler-26ab61a473f25490",
 		Agent:     "demo",
 		SessionID: "scheduler-26ab61a473f25490",

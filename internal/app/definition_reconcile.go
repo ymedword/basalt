@@ -33,7 +33,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -60,7 +60,7 @@ type ReconcileDeps struct {
 	// 与 ConfigPath 一样必填：缺了就静默跳过一整类资源，那正是对账最该避免的漏判。
 	// MCPServersPath is the absolute path of mcp_servers.yaml and is likewise required.
 	MCPServersPath string
-	Store          *storage.ResourceStore
+	Store          *postgres.ResourceStore
 	Operations     core.OperationStore
 	Skills         *workspace.SkillLibrary
 	Gate           *core.ResourceGate

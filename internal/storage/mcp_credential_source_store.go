@@ -69,27 +69,32 @@ func (s *MCPCredentialSourceStore) Upsert(ctx context.Context, source core.MCPCr
 // BackfillEnvSources 给**没有声明**的占位符补记 `mode = env`，已有声明一律不动
 // （`ON CONFLICT DO NOTHING`）。这是存量配置的一次性迁移：v5 的 MCP 凭据只有进程
 // 环境一条路，补记的是"当前真实来源"，不是运行时回落——补记之后改 managed 再撤销，
-// 仍然不会退回 env。返回实际补记的条数，供启动日志留证。
+// 仍然不会退回 env。
+//
+// 返回四分类报告（设计 §2.16.1 ②），**不只报一个总数**：既有 `env` 行记 `skipped`，
+// 既有 `managed` 行记 `config_drift`（文件只能表达 `${VAR}`，库里却是托管），
+// 闭集外的模式记 `conflict`（schema CHECK 下不可达的防御分支）。补记只接触槽位名，
+// **不**读取任何 env 变量值。
 // BackfillEnvSources records mode=env for placeholders that have no declaration yet,
-// never touching an explicit one. It records the current fact rather than allowing a
-// runtime fallback, and returns how many rows it added for the startup log.
+// never touching an explicit one, and reports filled / skipped / conflict / config_drift
+// per slot instead of a single total.
 func (s *MCPCredentialSourceStore) BackfillEnvSources(ctx context.Context,
 	serverUID core.ResourceUID, keys []string, operationID string, at time.Time,
-) (int, error) {
+) (core.MCPBackfillReport, error) {
 	if _, err := core.ParseResourceUID(string(serverUID)); err != nil {
-		return 0, err
+		return core.MCPBackfillReport{}, err
 	}
 	if operationID == "" {
-		return 0, errors.New("补记 MCP 凭据来源: operation_id 不能为空")
+		return core.MCPBackfillReport{}, errors.New("补记 MCP 凭据来源: operation_id 不能为空")
 	}
 	if at.IsZero() {
 		at = time.Now()
 	}
-	added := 0
+	report := core.MCPBackfillReport{}
 	for _, raw := range keys {
 		key, ok := core.MCPBindingKey(raw)
 		if !ok {
-			return added, fmt.Errorf("补记 MCP %s 的凭据来源: 非法槽位名（env 键名或头名）", serverUID)
+			return report, fmt.Errorf("补记 MCP %s 的凭据来源: 非法槽位名（env 键名或头名）", serverUID)
 		}
 		result, err := s.db.write.ExecContext(ctx,
 			`INSERT INTO mcp_credential_sources
@@ -98,13 +103,31 @@ func (s *MCPCredentialSourceStore) BackfillEnvSources(ctx context.Context,
 			 ON CONFLICT(server_uid, binding_key) DO NOTHING`,
 			string(serverUID), key, at.UnixMilli(), operationID)
 		if err != nil {
-			return added, fmt.Errorf("补记 MCP %s 的凭据来源 %s: %w", serverUID, key, err)
+			return report, fmt.Errorf("补记 MCP %s 的凭据来源 %s: %w", serverUID, key, err)
 		}
 		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
-			added++
+			report.Filled = append(report.Filled, key)
+			continue
+		}
+		existing, found, err := s.Get(ctx, serverUID, key)
+		if err != nil {
+			return report, fmt.Errorf("补记 MCP %s 的凭据来源 %s: 读既有声明: %w", serverUID, key, err)
+		}
+		if !found {
+			// DO NOTHING 却读不到行：并发删除或驱动异常——按冲突上报，不静默跳过。
+			report.Conflict = append(report.Conflict, key)
+			continue
+		}
+		switch existing.Mode {
+		case core.CredentialModeEnv:
+			report.Skipped = append(report.Skipped, key)
+		case core.CredentialModeManaged:
+			report.ConfigDrift = append(report.ConfigDrift, key)
+		default:
+			report.Conflict = append(report.Conflict, key)
 		}
 	}
-	return added, nil
+	return report, nil
 }
 
 // Get 读一条来源声明；没有声明 → `ok = false`（调用方按"要求显式选择"处理）。

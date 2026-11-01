@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是受控重建（`mcp_server.apply`）的验收用例 C1–C8（颗粒度文档 §4 冻结的八个
@@ -26,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -999,7 +1001,7 @@ func TestMCPApply_RevokeImmediate(t *testing.T) {
 		// 撤销短语（不是"发出后 401"的模糊错误），Run 记录据此可事后追溯。
 		// The run record marks the revoked credential: the real executor writes a failed
 		// audit row whose message is the fixed revoke phrase.
-		repo := storage.NewToolInvocationRepo(env.db)
+		repo := postgres.NewToolInvocationRepo(env.db)
 		executor := core.NewToolExecutor(env.registry, repo, slog.New(slog.DiscardHandler))
 		res := executor.Execute(ctx, core.ToolEnv{
 			RunID: "run-c8-revoked", SessionID: "sess-c8", RunBound: true,
@@ -1035,7 +1037,7 @@ func TestMCPApply_RevokeImmediate(t *testing.T) {
 			Admin:         env.admin,
 			Scopes:        &ScopeService{Resources: env.store, Agents: env.store, WorkspaceRoot: env.root, Now: baselineClock},
 			CredentialOps: env.revoker,
-			Channels: newNotifyChannelReadPort(storage.NewNotifyChannelRepo(env.db),
+			Channels: newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(env.db),
 				env.creds, env.store, notifyReadDeps{}),
 			Logger:     env.logger,
 			Now:        baselineClock,

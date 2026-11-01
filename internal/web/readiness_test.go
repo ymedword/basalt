@@ -308,13 +308,14 @@ func TestAgentReadiness_UnregisteredEntryReportsLoaderReason(t *testing.T) {
 func TestAgentReadiness_RejectFixRoutes(t *testing.T) {
 	configFix := "/console/agents/ops-agent/config"
 	cases := map[core.AgentRejectKind]string{
-		core.AgentRejectProviderNotRegistered: consoleModelConnsPath,
-		core.AgentRejectSkillNotFound:         consoleSkillsPath,
-		core.AgentRejectSkillVersionMissing:   consoleSkillsPath,
-		core.AgentRejectMCPServerSkipped:      consoleMCPServersPath,
-		core.AgentRejectBlankModel:            configFix,
-		core.AgentRejectNameMismatch:          configFix,
-		core.AgentRejectInvalidSchedule:       configFix,
+		core.AgentRejectProviderNotRegistered:      consoleModelConnsPath,
+		core.AgentRejectSkillNotFound:              consoleSkillsPath,
+		core.AgentRejectSkillVersionMissing:        consoleSkillsPath,
+		core.AgentRejectMCPServerSkipped:           consoleMCPServersPath,
+		core.AgentRejectKnowledgeCollectionMissing: consoleKnowledgePath,
+		core.AgentRejectBlankModel:                 configFix,
+		core.AgentRejectNameMismatch:               configFix,
+		core.AgentRejectInvalidSchedule:            configFix,
 	}
 	for kind, want := range cases {
 		t.Run(string(kind), func(t *testing.T) {

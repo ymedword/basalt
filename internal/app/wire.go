@@ -3,7 +3,7 @@ package app
 // 本文件是**唯一装配层**的重路径接线（技术方案 §6.1.2 轻 / 重两条路；颗粒度文档 §2.3 流程 D /
 // 口径 25）：重命令（本 US 是 `chat`——`serve` 归后续 US）在开跑之前，按**固定次序**把长生命
 // 周期资源接起来——取实例锁 → 写模式打开 → 显式迁移 → 崩溃恢复（账本六步 + 工作区残留第 ⑤ 步）
-// → 构建记忆门面（载体按 `memory.backend` 选，US-6）→ 建工具注册池 → 注册池名字集喂 Agent
+// → 构建记忆门面（载体恒为 PostgreSQL，D-18）→ 建工具注册池 → 注册池名字集喂 Agent
 // 装载器 → 构造运行入口。
 // This file wires the heavy path, the one place where an instance's long-lived resources
 // are assembled. The order is a correctness constraint rather than a style: the lock
@@ -27,10 +27,12 @@ import (
 	// Aliased: `catalog` below is the runtime provider catalog, a different thing.
 	mcpcat "github.com/ymedword/basalt/internal/catalog"
 
+	"github.com/ymedword/basalt/internal/callers"
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/diagnostics"
 	"github.com/ymedword/basalt/internal/memory"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -75,7 +77,7 @@ type App struct {
 	// workDir is the process working directory; the workspace is <workDir>/.basalt.
 	workDir string
 
-	// supportedVersion 是目标 schema 版本——生产传 storage.SupportedSchemaVersion，测试传
+	// supportedVersion 是目标 schema 版本——生产传 postgres.SupportedSchemaVersion，测试传
 	// 合成值以覆盖单版本期不可达的分支（与 cli.Deps 的同名字段同口径）。
 	// supportedVersion is the schema version this binary targets.
 	supportedVersion int
@@ -103,9 +105,13 @@ type App struct {
 
 	// freshInstance 表示本次启动前库与实例名册都不存在（T089 的唯一口径）。它只由
 	// Run 在 `cli.LoadConfig` **之前**判定一次并带下来：名册一旦写盘，下一次启动就不再
-	// 是新实例——自动初始化（主密钥、访问密码）因此**不会**为存量实例补做。
-	// freshInstance is decided once before the configuration is loaded, so automatic
-	// initialization can never apply to an established instance.
+	// 是新实例——主密钥的自动初始化因此**不会**为存量实例补做。
+	//
+	// 访问密码是例外的一半：首次初始化中断后（名册已写、密码未发放），重试靠实例私有
+	// 目录里的进度记录继续把密码做完（instance_provisioning.go）。它只续做**同一件**
+	// 未完成的事，不改写任何既有文件，也不补做已 minted 的密码。
+	// The admin password is the one thing a retry may still complete, and only while the
+	// provisioning record says pending.
 	freshInstance bool
 
 	// providerOverride 是模型客户端的**进程内替身**（评测基座的默认后端；生产路径恒 nil）。
@@ -135,10 +141,6 @@ type App struct {
 // wsRoot 返回工作区根的绝对路径。
 // wsRoot returns the absolute workspace root.
 func (a *App) wsRoot() string { return filepath.Join(a.workDir, workspaceDirName) }
-
-// dbPath 返回库文件路径。
-// dbPath returns the database file path.
-func (a *App) dbPath() string { return filepath.Join(a.wsRoot(), databaseFileName) }
 
 // loggerOr 保证日志出口永远可用（缺省档与 cli 侧同口径）。
 // loggerOr keeps the log outlet usable even when no logger was injected.
@@ -200,71 +202,60 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	}
 	logger.Info("重路径：实例锁已取得", "step", stepLock, "root", root)
 
-	// ② 写模式打开：库文件缺失即建（全量建表与版本行在同一事务内完成）。
-	db, err := storage.OpenWritable(ctx, a.dbPath(), a.supportedVersion)
+	// ② 打开 PostgreSQL：连接、扩展能力校验与建库 / 前向迁移都在 `postgres.Open` 内完成
+	// （advisory 锁保护）。失败即拒绝启动——**不回退** SQLite（D-01）；DSN 不进日志。
+	// The PostgreSQL handle is opened here; capability checks and the forward
+	// migration happen inside postgres.Open, and a failure aborts startup instead of
+	// falling back to SQLite. The DSN never reaches the log.
+	db, err := postgres.Open(ctx, postgresConfig(cfg.Database))
 	if err != nil {
-		return nil, abortRuntime(fmt.Errorf("写模式打开数据库: %w", err), nil, lock)
+		return nil, abortRuntime(fmt.Errorf("打开 PostgreSQL: %w", err), nil, lock)
 	}
-	logger.Info("重路径：数据库已写模式打开", "step", stepOpen, "path", a.dbPath())
+	logger.Info("重路径：PostgreSQL 已打开", "step", stepOpen,
+		"schema_version", postgres.SupportedSchemaVersion)
 
-	// 存储实例在迁移**之前**构造：v3 迁移的中间步骤要写操作台账、状态文件与绑定投影，
-	// 它们必须与之后所有消费面是**同一批**实例——迁移写下的行与运行期读到的行因此来自
-	// 同一个连接池。构造只持句柄、不读表，早于迁移不违反"先迁移后使用"。
-	// The stores are built before the migration because its middle steps write the
-	// operation ledger, state files and binding projection; every consumer must share
-	// these very instances. Constructing them only holds handles and reads nothing.
-	versions := storage.NewResourceStore(db)
-	credentials := storage.NewCredentialStore(db)
+	// 存储实例在打开之后一次构造：运行期所有消费面共享**同一批**实例，读到的行因此
+	// 来自同一个连接池。构造只持句柄、不读表。
+	// The stores are constructed once after the open so every consumer shares these
+	// very instances. Constructing them only holds handles and reads nothing.
+	versions := postgres.NewResourceStore(db)
+	credentials := postgres.NewCredentialStore(db)
 	// identities 是资源身份墓碑表：结构化配置读面按绑定 UID 现场查名称与删除事实。
 	// identities is the uid tombstone table read by the config view.
-	identities := storage.NewIdentityStore(db)
-	notifyAdminStore := storage.NewNotifyAdminStore(db)
-	bindingStore := storage.NewBindingStore(db)
-	archives := storage.NewAgentAdminStore(db)
-	ops := storage.NewManagementStore(db)
+	identities := postgres.NewIdentityStore(db)
+	notifyAdminStore := postgres.NewNotifyAdminStore(db)
+	bindingStore := postgres.NewBindingStore(db)
+	archives := postgres.NewAgentAdminStore(db)
+	ops := postgres.NewManagementStore(db)
 	lifecycle := workspace.NewLifecycleStore(root, a.nowOr())
-	channels := storage.NewNotifyChannelRepo(db)
+	channels := postgres.NewNotifyChannelRepo(db)
 	// connectionTests 是「最后一次连接测试」投影（R7 范围修订、schema v4）：模型连接与
 	// 通知渠道的测试写同一张表，管理读面与两个测试端点共用这一实例——页面读到的就是
 	// 上一次真实测试留下的行；历史明细仍在管理操作台账。
 	// The last-test projection shared by the two test endpoints and the admin read faces.
-	connectionTests := storage.NewConnectionTestStore(db)
+	connectionTests := postgres.NewConnectionTestStore(db)
 	// networkPolicy 是出网域名白名单的唯一权威行（schema v5）：启动种子、运行期条件写、
 	// 启动恢复查证共用同一实例（R8 裁决 2）。
 	// networkPolicy is the single authoritative allowlist row shared by seeding, the
 	// conditional write and startup recovery.
-	networkPolicy := storage.NewNetworkPolicyStore(db)
+	networkPolicy := postgres.NewNetworkPolicyStore(db)
 	// networkExceptionStore 是网络访问例外的唯一读写面（schema v6）：启动装载、管理写
 	// 与恢复查证读的是同一批行。
 	// One instance backs the startup load, the admin writes and recovery.
-	networkExceptionStore := storage.NewNetworkExceptionStore(db)
+	networkExceptionStore := postgres.NewNetworkExceptionStore(db)
 	// executionPolicyStore 是执行档位单行表（schema v6）的同一实例：启动装载 / 种子、
 	// 运行期条件写、启动恢复查证读的都是它——恢复判"生效 / 未生效"读的必须是写路径
 	// 写进去的那一行。
 	// One instance backs seeding, the conditional write and the startup verification.
-	executionPolicyStore := storage.NewExecutionPolicyStore(db)
+	executionPolicyStore := postgres.NewExecutionPolicyStore(db)
 
-	// ③ 显式迁移：升级是持锁重命令的**显式动作**，不做任何"顺手改库"。六步编排是唯一
-	// 的迁移路径（准入 → 状态文件 → SQL 单事务 → 身份回填 → 绑定回填 → 投影重建）：
-	// 库已是目标版本时返回零报告，不写操作行。
-	// The six-step orchestration is the only migration path; an up-to-date database is
-	// left untouched with no operation row.
-	migrator := NewMigrator(MigrateV3Deps{
-		DB:         db,
-		Operations: ops,
-		Lifecycle:  lifecycle,
-		Resources:  versions,
-		Notify:     notifyAdminStore,
-		Bindings:   bindingStore,
-		Root:       root,
-		Logger:     logger,
-		Now:        a.nowOr(),
-		Target:     a.supportedVersion,
-	})
-	if _, err = migrator.MigrateV3(ctx); err != nil {
-		return nil, abortRuntime(fmt.Errorf("迁移数据库: %w", err), db, lock)
-	}
-	logger.Info("重路径：schema 迁移完成", "step", stepMigrate, "schema_version", a.supportedVersion)
+	// ③ 迁移已在 `postgres.Open` 内完成（advisory 锁 + `schema_version` 前向推进）。
+	// 运行期**不再**调用 SQLite 谱系的 v3 六步编排——那条路径只保留给旧 SQLite 实例的
+	// 离线升级 / 导出（`basalt db` 子命令），不从 serve 触碰。
+	// The forward migration already ran inside postgres.Open; the SQLite-lineage v3
+	// orchestration is kept only for the offline upgrade/export path.
+	logger.Info("重路径：schema 版本已校验", "step", stepMigrate,
+		"schema_version", postgres.SupportedSchemaVersion)
 
 	// 网络访问例外在迁移之后、工具装配之前装载进进程级快照（14D §2.2.6）：守门器在
 	// `Run` 里已经装好，这里喂给它"哪些受保护地址经显式授权放行"。读失败保留空快照
@@ -289,7 +280,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 实例后，模型连接 / MCP 凭据 / 通知渠道在同一进程内看到新路径，不必重启。
 	// One shared holder threads the path through all five credential components.
 	masterKeyPath := NewMasterKeyLocator(masterKeyFile)
-	instanceSecretsStore := storage.NewInstanceSecretsStore(db)
+	instanceSecretsStore := postgres.NewInstanceSecretsStore(db)
 	instanceSecrets, err := NewInstanceSecretsService(InstanceSecretsDeps{
 		Store:         instanceSecretsStore,
 		Operations:    ops,
@@ -340,7 +331,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil, abortRuntime(err, db, lock)
 	}
 	checkpoint, err := NewRunCredentialCheckpoint(RunCredentialCheckpointDeps{
-		Pins:  storage.NewRunCredentialStore(db),
+		Pins:  postgres.NewRunCredentialStore(db),
 		Guard: guard,
 	})
 	if err != nil {
@@ -352,7 +343,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// resolver and the console projection.
 	mcpCredentials, err := NewMCPCredentialService(MCPCredentialServiceDeps{
 		Credentials:   credentials,
-		Sources:       storage.NewMCPCredentialSourceStore(db),
+		Sources:       postgres.NewMCPCredentialSourceStore(db),
 		MasterKeyFile: masterKeyFile,
 		KeyPath:       masterKeyPath,
 		WorkspaceRoot: root,
@@ -385,6 +376,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		MasterKeyFile: masterKeyFile,
 		KeyPath:       masterKeyPath,
 		WorkspaceRoot: root,
+		Resources:     versions,
 		Logger:        logger,
 	})
 	if err != nil {
@@ -407,13 +399,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		"closed_runs", report.ClosedRuns, "rolled_back", residue.RolledBack,
 		"rolled_forward", residue.RolledForward)
 
-	// 记忆门面（US-6，位置在 ④ 与 ⑤ 之间——颗粒度文档 §3.1）：载体按 `memory.backend` 在工作区
-	// 根 / 库句柄之上选一次，门面**一个实例喂两个消费面**——工具侧（写路径）与运行入口的段 2
-	// 注入（读路径）拿到的是同一个对象，作用域回退、per-scope 写锁与注入期 WARN 因此只有一份
-	// 实现（口径 25）。构建期**零落盘**：markdown 档的 MEMORY.md 在首次写入时才创建。
-	// The memory facade is built once and handed to both consumers, so the fallback, the
-	// per-scope lock and the injection-time warning live in exactly one implementation.
-	memBackend, err := memoryCarrier(cfg, db, root, a.nowOr())
+	// 记忆门面（US-6，位置在 ④ 与 ⑤ 之间——颗粒度文档 §3.1）：载体恒为 PostgreSQL
+	// （D-18），门面**一个实例喂两个消费面**——工具侧（写路径）与运行入口的段 2
+	// 注入（读路径）拿到的是同一个对象，作用域回退、per-scope 写锁与注入期 WARN 因此
+	// 只有一份实现（口径 25）。
+	// The memory facade is built once over PostgreSQL and handed to both consumers, so the
+	// fallback, the per-scope lock and the injection-time warning stay single-sourced.
+	memBackend, err := memoryCarrier(db, a.nowOr())
 	if err != nil {
 		return nil, abortRuntime(err, db, lock)
 	}
@@ -421,6 +413,22 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	if err != nil {
 		return nil, abortRuntime(fmt.Errorf("构建记忆门面: %w", err), db, lock)
 	}
+	// 记忆管理面（US-16 裁决 A / C-21）与门面**共用同一个载体实例**：管理面读到的
+	// 行就是 `save_memory` 写进去的那行，不存在两份数据。载体不满足窄端口时启动即失败
+	// ——管理面是核心能力，缺它不能用"空列表"顶替。
+	// The management surface shares the very carrier the facade writes through; a
+	// carrier without the narrow port aborts startup instead of degrading to an empty list.
+	memStore, ok := memBackend.(memory.MemoryStore)
+	if !ok {
+		return nil, abortRuntime(errors.New(
+			"记忆管理面：载体未实现窄持久化端口——拒绝启动，不降级为只读门面"), db, lock)
+	}
+	memAdmin := NewMemoryAdmin(MemoryAdminDeps{
+		Store:      memStore,
+		Operations: ops,
+		Logger:     logger,
+		Now:        a.nowOr(),
+	})
 
 	// ⑤ 授权判定与工具注册池：策略先建（工具持有的是**接口**，具体实现在装配处一处选定）；
 	// 池是**全局**的——同一实例的注册池服务所有 Agent，声明的名字与之比对（宪法 IV）。
@@ -477,6 +485,14 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// The search key resolves through the agent's bound model connection; the registry
 	// arrives after tool registration, so the slot is bound below.
 	webSearchSlot := newWebSearchCredentialSlot(versions, resolver)
+	// recall_memory 的语义路同样两段绑定（P-07）：embedding 客户端与语义载体都在知识库
+	// 装配之后才存在，槽位先建、`knowledgeWire` 就绪后 Bind；未绑定即失败关闭。
+	// The semantic recall face is two-stage bound for the same reason as web_search.
+	memoryRecallSlot := newMemoryRecallSlot()
+	// 记忆向量的写后补索引同样两段绑定（V-5）：槽位先建，知识库装配完成后 Bind 并做
+	// 一次启动期回填。未绑定（embedding 未配置）时补索引是 no-op，保存路径行为不变。
+	// The write-side index slot is bound with the knowledge wiring; unbound means no-op.
+	memoryIndexSlot := newMemoryIndexSlot(logger)
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -484,13 +500,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		tool.NewShellTool(policy, runner),
 		tool.NewHTTPGetTool(policy),
 		tool.NewHTTPPostTool(policy),
-		tool.NewSaveMemoryTool(memSvc),
-		tool.NewRecallMemoryTool(memSvc),
+		// save_memory 的工具侧拿到**带写后补索引**的门面（V-5）：Append 返回时 per-scope
+		// 写锁已释放，嵌入调用不在临界区内；保存失败不触发嵌入。
+		// The save tool sees the indexed facade; embedding runs after the write lock is out.
+		tool.NewSaveMemoryTool(&indexingCarrier{LongTermMemoryStore: memSvc, slot: memoryIndexSlot}),
+		tool.NewRecallMemoryTool(memSvc, memoryRecallSlot),
 		// 托管凭据解析面在此接线：通知按**逐次发送**解析当前版本（不像模型 Run 那样在
 		// 准入固定），解析失败即失败关闭，不回退明文；env 占位渠道不经此路。
 		// Managed notify credentials resolve per send; a failure is fail-closed.
 		newNotifyTool(channels, policy, resolver,
-			notifyDeliveryRecorder{store: storage.NewNotifyDeliveryStore(db), logger: logger}),
+			notifyDeliveryRecorder{store: postgres.NewNotifyDeliveryStore(db), logger: logger}),
 		tool.NewManageScheduleTool(scheduleSlot),
 		tool.NewWebSearchTool(policy, webSearchSlot),
 	} {
@@ -701,6 +720,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// + 完整读回判定 applied / not_applied / indeterminate（契约 §9.4）。
 		InstanceSecrets: instanceSecretsStore,
 		MasterKeyFile:   masterKeyFile,
+		// 记忆条目的只读查证面：与记忆门面 / 管理面共用同一个载体，`memory.*` 的
+		// pending 行按条目行状态与正文摘要判定三态（契约 §9.4）。
+		// The memory verdicts read the very carrier the write path uses.
+		Memory: memStore,
 	}); err != nil {
 		return fail(err)
 	}
@@ -734,7 +757,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// WARN、留给准入闸门按"可能引用"处理。
 	// The full projection rebuild belongs to the same startup stage as reconciliation; a
 	// scan failure aborts startup while per-agent failures stay fail-closed at the gate.
-	projection := NewBindingProjection(bindingStore, versions, archives, root, logger, a.nowOr())
+	// 知识集合目录只建一次（不带 I/O 的存储句柄），既供投影按名解析集合、又供注册闸门
+	// 与热加载判"名字有没有实体"、再供知识库装配复用——四处同一个实例，判定口径只有
+	// 一份。放在投影之前是因为投影重建是它的第一个消费者。
+	// The catalog store is created once, before the projection that resolves names through
+	// it, and reused by the registration gate, the watcher and the knowledge wiring.
+	knowledgeCatalogStore := postgres.NewKnowledgeCatalogStore(db)
+	projection := NewBindingProjection(bindingStore, versions, archives, knowledgeCatalogStore, root, logger, a.nowOr())
 	projectionReport, err := rebuildStartupBindings(ctx, projection, logger)
 	if err != nil {
 		return fail(err)
@@ -946,6 +975,15 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	if err != nil {
 		return fail(fmt.Errorf("注册装配: %w", err))
 	}
+	// 注册装配的知识集合过滤（D-19 / 契约 agent-md §2.1 规则 13）：声明的集合名必须
+	// 解析到**唯一活动集合**才注册。与技能分支同一纪律——读不到目录即拒绝启动，热加载
+	// 用同一个函数（`watcher.go`）。
+	// The knowledge-collection filter completes D-19 registration after the skill gate and
+	// before the registry; a failed lookup aborts startup exactly like the watcher.
+	entries, err = registryEntriesWithKnowledgeCollections(ctx, knowledgeCatalogStore, entries, logger)
+	if err != nil {
+		return fail(fmt.Errorf("注册装配: %w", err))
+	}
 
 	// ⑦ 不可变注册表（§3.1.20 / 图 A）：装载结果在恢复、对账与目录之后冻结成首版快照。
 	// 它是管理台列表、运行准入与调度器**共同**的读面——热加载之后以整份替换发布新版本，
@@ -957,24 +995,164 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// web_search 的两段绑定在此收口：注册表就位后才能按 Agent 名查 provider（14D §2.5.4）。
 	// The second binding stage lands once the registry exists.
 	webSearchSlot.Bind(agents)
-	sessions := storage.NewSessionStore(db)
-	invocations := storage.NewToolInvocationRepo(db)
-	llmCalls := storage.NewLLMCallRepo(db)
+	sessions := postgres.NewSessionStore(db)
+	invocations := postgres.NewToolInvocationRepo(db)
+	llmCalls := postgres.NewLLMCallRepo(db)
 	// 运行账本只建一次：AgentService 写、web.RunService 适配器读，同一实例保证
 	// "读到的"就是"写下的"（两条连接池之间的影子账本会让排障无从对齐）。
 	// One run store is shared by the writer (AgentService) and the reader (the web port).
-	runs := storage.NewRunStore(db)
+	runs := postgres.NewRunStore(db)
 	// 模型调用的唯一入口按**当前**目录路由（约束 16 / 17）：发布在 ResourceGate 写锁内
 	// 替换持有者后，下一个新 Run 与下一次作者调用立即读新表；在途 Run 拿的是准入时固定的
 	// `Pinned` 视图，不受影响。路由仍只查表，查不到即拒绝发出（宪法 III）。
 	// The one model entry point routes against the current catalog; admitted runs keep
 	// the pinned view captured at admission.
 	client := newCatalogProviderRouter(catalogStore, llmCalls, logger)
+	// 诊断两件（US-16 T095 / T097）：写入器进运行路径，读取器进管理面。配置非法在这里
+	// 拒绝启动；两个实例共用同一个存储适配器，读到的就是刚写下的那批事件。
+	// The diagnostics pair: the recorder joins the run path, the reader the console.
+	// An invalid configuration refuses startup instead of running with a reinterpretation.
+	diagRecorder, diagReader, err := newDiagnosticsPorts(cfg.Diagnostics, db, a.nowOr(), logger)
+	if err != nil {
+		return fail(err)
+	}
+	// 图 6 [3] / [5] 的**唯一**限制器实例（C-35）：运行入口（web 的 RunService）、
+	// 调度器与摘要调用共用同一份名额表与配额端口。分头 `callers.NewLimiter` 会让同一
+	// 调用方在 web 与后台各拿一份 `max_concurrent` 计数，上限形同虚设。
+	// 限额来源见 `concurrency_limits.go`（无行 / 0 → 实例级上限兜底，读失败失败关闭）。
+	// One limiter instance serves the run entry, the scheduler and compaction; two
+	// instances would hand the same caller two independent slot tables.
+	quotaStore := postgres.NewQuotaStore(db)
+	concurrencyLimit := newConcurrencyLimitCache(
+		quotaStore.MaxConcurrent, cfg.Server.MaxConcurrentRuns, a.nowOr())
+	concurrency, err := callers.NewMemoryConcurrency(concurrencyLimit.limit)
+	if err != nil {
+		return fail(fmt.Errorf("装配调用方并发名额表: %w", err))
+	}
+	runLimiter := callers.NewLimiter(callers.LimiterDeps{
+		Concurrency:         concurrency,
+		Quotas:              quotaStore,
+		LocalAdminUnlimited: cfg.Callers.LocalAdmin.UnlimitedEnabled(),
+	})
+	// 运行准入（取名额 / 归还 / panic 收口）只装配这一份，web 入口与调度器共用。
+	// The one admission object shared by the web entry and the scheduler.
+	admission := &runAdmission{limiter: runLimiter, logger: logger, diag: diagRecorder}
+	// 知识库与历史回查接线（US-16 T099 前置）：领域对象必须在压缩接线**之前**落地——
+	// 压缩的来源闸门要用知识库的有效性判定，而读面（来源视图 / 引用有效性）用的必须是
+	// **同一个** `SourceViewer`，两处判定才不可能分叉。embedding 未配置时装配照常成功，
+	// 语义路径按 §3.3 降级为关键词（摄取端回"未配置"而**不是**装配缺失）。
+	// 托管凭据来源传 `resolver`（与运行目录同一条解密路径），不是凭据存储。
+	// The knowledge and history wiring lands before the compaction gate so the very
+	// same SourceViewer serves both the read faces and the injection-time check.
+	knowledgeWire, err := newKnowledgeWiring(ctx, knowledgeWiringDeps{
+		Config:        cfg,
+		DB:            db,
+		WorkspaceRoot: root,
+		Resources:     versions,
+		Credentials:   resolver,
+		// 知识面走**同一个**限制器与诊断写入器，经包级适配器翻译（C-06：knowledge
+		// 不 import callers / diagnostics，值类型与哨兵由装配层桥接）。
+		// The knowledge faces share the one limiter and recorder through the adapters.
+		Quota:            newKnowledgeQuotaAdapter(runLimiter),
+		Diagnostics:      newKnowledgeDiagAdapter(diagRecorder, logger),
+		QuotaDiagnostics: newKnowledgeIngestQuotaAdapter(diagRecorder, logger),
+		// 检索授权按注册表快照读声明、按投影行读稳定 ID（D-19）。
+		// Retrieval authz reads declarations off this very registry snapshot.
+		Agents:  agents,
+		Catalog: knowledgeCatalogStore,
+		Logger:  logger,
+		Now:     a.nowOr(),
+	})
+	if err != nil {
+		return fail(err)
+	}
+	// recall_memory 语义路绑定（P-07）：embedding 客户端复用知识库栈的那一个；记忆载体
+	// 不满足窄持久化端口（markdown 档）或 embedding 未配置时**不绑定**——工具侧按
+	// `tool.ErrRecallUnavailable` 失败关闭，给出"改用 mode=keyword"的可执行文案，而不是
+	// 静默降级成关键词检索。绑定发生在运行期开跑之前，所以不存在"半绑"的窗口。
+	// Bind the semantic recall face; an unsupported carrier or missing embedder leaves it
+	// unbound so the tool fails closed with an actionable refusal.
+	if recaller := newSemanticRecaller(memBackend, memoryEmbedderOf(knowledgeWire.Embedder)); recaller != nil {
+		memoryRecallSlot.Bind(recaller)
+	}
+	// 记忆向量索引（V-5）：与语义召回共用同一个带审计的 embedding 客户端和同一个固定
+	// 代际；写后补索引由上面的工具侧出口触发，这里补一次**启动期回填**——旧记忆导入
+	// （`db switch` 只导行）与历史上写失败的缺口都在下一次正常启动时补齐。
+	// 回填失败**不阻断启动**：缺口保留（召回遇到空结果会显式报"索引未就绪"），下次
+	// 启动重试；日志两档都在（INFO 记读数、WARN 记失败）。
+	// The startup backfill closes gaps left by the read-only legacy import or earlier
+	// failures; it never blocks startup and is retried next time.
+	if indexer := newMemoryIndexer(memBackend, knowledgeWire, logger); indexer != nil {
+		memoryIndexSlot.Bind(indexer)
+		backfill, err := indexer.Backfill(ctx)
+		switch {
+		case err != nil:
+			logger.WarnContext(ctx, "记忆向量：启动期回填未完成，缺口保留到下次启动",
+				"generation", knowledgeWire.Generation, "indexed", backfill.Indexed,
+				"batches", backfill.Batches, "error", err)
+		case backfill.Indexed > 0:
+			logger.InfoContext(ctx, "记忆向量：启动期回填完成",
+				"generation", knowledgeWire.Generation, "indexed", backfill.Indexed,
+				"batches", backfill.Batches)
+		}
+	}
+	historyWire, err := newHistoryWiring(db, logger)
+	if err != nil {
+		return fail(err)
+	}
+	// 会话压缩接线（US-16 T090 / C-25）：来源闸门交给提示词构建器，压缩器按 Run 装配。
+	// 未启用时 `Assemble` 返回 nil、闸门为 nil，行为与接线前逐字一致；**启用却缺端口**
+	// （含来源校验器尚未接线）在这里拒绝启动，而不是运行期静默降级成"没有过滤 /
+	// 没有审计 / 没有配额"的压缩（C-26）。
+	// The compaction wiring: the injection-time gate goes to the builder, the per-run
+	// compactor to the loop. A half-wired switch refuses startup.
+	compactionStore := postgres.NewCompactionStore(db, logger)
+	compactionWire, err := newCompactionWiring(compactionWiringDeps{
+		Enabled:       cfg.Compaction.Enabled,
+		Policy:        compactionPolicyOf(cfg.Compaction),
+		OutputReserve: cfg.Compaction.OutputReserveTokens,
+		Messages:      compactionStore,
+		Store:         compactionStore,
+		// 来源校验器接的是知识库的**同一个** `SourceViewer`（经形状适配器）：压缩注入
+		// 前逐条判定引用是否仍可用，撤权 / 删除 / 版本变更都按冻结四值拒绝注入。
+		// 与知识面读面共用一个实例，判定口径不可能分叉；它**无论压缩开关与否**都要接上
+		// （`newCompactionWiring` 的规则），否则开关一开就是半套接线。R104 缺口由此关闭。
+		// The validity checker is the very SourceViewer the knowledge read faces use;
+		// it is wired regardless of the switch so a switch-on never runs half-wired.
+		Validity: knowledgeWire.Validity,
+		Audit:    llmCalls,
+		// 摘要调用走**同一个**限制器实例：入口限流器（web 面）只装 Buckets，压缩不借它，
+		// 但配额端口必须与对话调用同源——另建一个 Limiter 会让同一个 `Quotas` 端口出现
+		// 两个实例，审计与排障时说不清"哪一次预留是谁记的"。
+		// 幂等键末位是每次尝试的 `attempt_id`（C-29），与对话调用的键空间不重叠。
+		// The summary gate shares the one limiter so every reservation has a single owner.
+		Quota:       runLimiter,
+		Logger:      logger,
+		Now:         a.nowOr(),
+		Diagnostics: diagRecorder,
+	})
+	if err != nil {
+		return fail(err)
+	}
 	loop := core.NewReActLoop(
-		core.NewPromptBuilder(registry),
-		core.NewToolExecutor(registry, invocations, logger),
+		core.NewPromptBuilder(registry).WithSourceFilter(compactionWire.SourceFilter()),
+		// 工具诊断（V-8）：与模型调用装饰器共用同一个写入器——同一 Run 的
+		// `llm_call` / `tool_call` / `permission_decision` 因此落在同一条时间线上。
+		// 适配器在写入器为 nil 时返回 nil，执行器据此逐字保持未接诊断的行为。
+		// The tool diagnostics share the recorder with the model-call decorator.
+		core.NewToolExecutor(registry, invocations, logger).
+			WithDiagnostics(newToolDiagAdapter(diagRecorder, logger)),
 		logger,
-	)
+	).WithCompaction(compactionWire.OutputReserve(), compactionWire.Assemble).
+		// 图 6 [5]：对话调用的配额预留。与入口限流、摘要网关共用**同一个** `runLimiter`
+		// （C-35 的单实例裁决）——另建一个 Limiter 会让同一调用方出现两套账。
+		// Stage [5] shares the one limiter with the run entry and the summary gate.
+		WithCallQuota(&chatQuota{limiter: runLimiter, logger: logger, diag: diagRecorder}).
+		// 对话装配记录（V-7）：与检索装配共用知识库装配出来的那一个写入器。
+		// 写失败只 WARN（记录可丢弃），不改变 Run 的结局。
+		// The chat assembly records share the knowledge wiring's writer; a failed
+		// write only warns and never changes the run's outcome.
+		WithAssemblyRecorder(knowledgeWire.Assembly)
 	service := core.NewAgentService(core.ServiceOptions{
 		Agents: agents,
 		// 生命周期准入（图 F ③ / 约束 15）：状态文件端口与 Agent 级闸门传的是上面那一份
@@ -1001,6 +1179,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 			Credentials:    resolver,
 			CredentialPins: resolver,
 			Checkpoint:     checkpoint,
+			// 诊断生产端（T095）：运行路径每次模型调用成功后记一条 `llm_call`；写失败
+			// 只 WARN，Run 照常推进（诊断 fail-open，与审计的 fail-closed 分属两条轨）。
+			// The run-path producer; a failed write only warns and never blocks the run.
+			Diagnostics: diagRecorder,
 		}),
 		RunSnapshots: newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr()),
 		Client:       client,
@@ -1012,15 +1194,26 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// disable it, so the store is wired explicitly.
 		Sessions:  sessions,
 		Runs:      runs,
-		Snapshots: storage.NewSnapshotStore(db),
+		Snapshots: postgres.NewSnapshotStore(db),
 		Audit:     invocations,
 		Memory:    memSvc,
+		// Run 侧知识链路（V-6）：装配时检索并注入、每轮复核、答案后引用复核。
+		// 与 web 的检索端口共用同一个检索器 / 来源视图 / 索引代际。
+		// The run-side knowledge port shares the retriever, viewer and generation with
+		// the management search surface.
+		Knowledge: knowledgeWire.Run,
 		Loop:      loop,
 		Logger:    logger,
 		Now:       a.nowOr(),
 		// 并发上限接线（US-9 约束 31）：0 / 未配置由 core 落缺省 32，负数已在装载期拒绝。
 		// The cap is wired explicitly; zero falls back to core's single default.
 		MaxConcurrent: cfg.Server.MaxConcurrentRuns,
+		// Run 级任务次数（N-01 / 图 6 [5] 的 ClassRun 一支）：与 [3] 并发名额、[5] 对话
+		// 记账共用**同一个**限制器实例（C-35）——另建一个会让同一调用方在准入与记账
+		// 各拿一份限额视图，超额放行且诊断面对不上账。
+		// The run-level task count shares the one limiter; a second instance would fork
+		// the caller's limit view between admission and accounting.
+		RunQuota: newRunQuota(runLimiter, diagRecorder, logger),
 	})
 
 	// 调度器在重路径中**始终构造**（约束 21 / 图 A）：chat / tool 只是不 Start，
@@ -1040,14 +1233,30 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 注册表一起传入：运行前除范围资格外还要复核"目标在 Agent 声明的渠道内"
 	//（R7 的权限边界），注册表缺失时投递服务失败关闭。
 	delivery := newDeliveryService(
-		storage.NewDeliveryStore(db),
+		postgres.NewDeliveryStore(db),
 		deliverySender,
 		lifecycle,
 		agents,
 		logger,
 	)
-	scheduler := a.newScheduler(storage.NewTaskStore(db), service, agents.Entries(), delivery,
-		lifecycleScheduleGate(lifecycle), cfg, logger)
+	// 管理认证姿态由 web 面在监听成功后发布（T027 / §2.14），调度器先于此构造，故经
+	// 这个盒子迟绑定读取；未发布时按"尚未计算"处理，只有 `unavailable` 拒绝后台任务。
+	// caller-key 任务的 Key 复核端口（C-32）接 PostgreSQL `caller_keys`（T014）：按
+	// 任务行上的 `(caller_id, key_id)` 重读**那一把** Key 的状态、过期与 scope，
+	// 任何不成立都带原因码 fail-closed——不得改用同一调用方的其他 Key。
+	// The posture box is published later by the web face. The owner-key verifier reads
+	// the PostgreSQL key store; any failure keeps the task from running.
+	// 调度器同样占名额（图 6 [3]）：它没有 HTTP 入口、因此不经入口速率，但"后台任务
+	// 不占调用方并发"会让定时任务成为绕过上限的旁路。包装器只补取名额与归还，其余
+	// 语义（归属、生命周期闸门、Key 复核）仍由 core 与调度器负责。
+	// The scheduler takes a slot too: without the wrapper, scheduled tasks would bypass
+	// the per-caller concurrency limit entirely.
+	adminPosture := &postureBox{}
+	ownerKeys := core.OwnerKeyVerifier(callers.NewKeyVerifier(postgres.NewKeyStore(db)))
+	scheduler := a.newScheduler(postgres.NewTaskStore(db),
+		&admittedRunInvoker{inner: service, admission: admission},
+		agents.Entries(), delivery,
+		lifecycleScheduleGate(lifecycle), cfg, logger, ownerKeys, adminPosture)
 	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
 	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
 	// 适配器同时保留在运行期上：配置热加载的调度联动必须走**同一实例**（约束 39 的
@@ -1073,12 +1282,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return fail(err)
 	}
 	// 保存期绑定校验（内容条件写与多文件提交共用）：构造一次，闭包每次调用只查身份。
-	// One save-time binding check shared by the content editor and submit paths.
+	// 知识集合与注册闸门共用 `knowledgeWire.Collections` 这一个存储实例——两处判据
+	// 若各接一份，"保存时通过、注册时不注册"就会再次出现。
+	// One save-time binding check shared by the content editor and submit paths; the
+	// collection reader is the very store the registration gate consults.
 	saveBindings := SaveBindingCheck(lifecycle, BindingCheckDeps{
 		Resources:      versions,
 		Notify:         notifyAdminStore,
 		NotifyChannels: channels,
 		Credentials:    resolver,
+		Collections:    knowledgeWire.Collections,
 	})
 	agentAdmin := NewAgentAdmin(AgentAdminDeps{
 		Root:       root,
@@ -1114,7 +1327,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 归档路径的存储与三个协作者（约束 32）：HTTP 装配三件同时提供，归档行与操作终态
 		// 同事务落库；`WaitRuns` 的有界窗口由编排层的 `BusyWait` 给（零值 = 缺省 30 秒）。
 		// The archive store and its three collaborators are supplied together on the HTTP path.
-		Archives:     storage.NewAgentAdminStore(db),
+		Archives:     postgres.NewAgentAdminStore(db),
 		Registry:     agents,
 		Scheduler:    scheduleEditor,
 		RunCanceller: runCancellerAdapter{runs: runs, service: service},
@@ -1197,7 +1410,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Root:       root,
 		Store:      notifyAdminStore,
 		Bindings:   bindingStore,
-		RunRefs:    storage.NewNotifyDeliveryStore(db),
+		RunRefs:    postgres.NewNotifyDeliveryStore(db),
 		Operations: ops,
 		Types:      notifyTypeNames(),
 		Policy:     policy,
@@ -1225,7 +1438,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 凭据状态与条件 ETag。列表端点与写后回显用同一实例，页面读到的与下一发会用的一致。
 	// The channel admin read face wraps the same zero-cache repository the send path uses;
 	// the list endpoint and the post-write echo share this one instance.
-	channelRead := newNotifyChannelReadPort(storage.NewNotifyChannelRepo(db), credentials, versions,
+	channelRead := newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(db), credentials, versions,
 		notifyReadDeps{ConnectionTests: connectionTests})
 	// 资源状态动作编排（R4.4 / R4.8）：撤销与范围切换各缺一半——范围编排要求调用方
 	// 给出操作标识却不写操作行，撤销编排不识别条件写——因此组合层在这里补齐
@@ -1260,10 +1473,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		lock:              lock,
 		db:                db,
 		service:           service,
+		admission:         admission,
 		runs:              runs,
 		sessions:          sessions,
 		invocations:       invocations,
 		llmCalls:          llmCalls,
+		diagnostics:       diagReader,
+		diagRecorder:      diagRecorder,
 		registry:          registry,
 		mcpSupervisor:     mcpSupervisor,
 		networkAllowlist:  networkAllowlist,
@@ -1271,6 +1487,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		networkExceptions: networkExceptions,
 		execPolicy:        executionPolicy,
 		scheduler:         scheduler,
+		adminPosture:      adminPosture,
 		scheduleSlot:      scheduleSlot,
 		scheduleEditor:    scheduleEditor,
 		agents:            agents,
@@ -1294,6 +1511,14 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		notifyAdmin:       notifyAdmin,
 		channelRead:       channelRead,
 		catalogStore:      catalogStore,
+		// US-16 知识与历史两条链路的装配产物：web 的八个消费方端口由 `webOptions` 里的
+		// `wireKnowledgePorts` 逐槽位投影；压缩读面的链目录也在这里（与压缩写面同一个
+		// `CompactionStore` 实例，读到的就是刚写下的链）。
+		// The US-16 knowledge and history assembly products, projected in webOptions.
+		knowledge:       knowledgeWire,
+		collections:     knowledgeWire.Collections,
+		history:         historyWire,
+		compactionStore: compactionStore,
 		// 目录快照在重路径开头解析一次（见 `mcpcat.Builtin` 处）：保留端口实例让
 		// `webOptions` 逐字段投影，管理台读到的就是这份快照，请求期零解析。
 		// The parsed catalog snapshot travels as a port so webOptions can project it.
@@ -1331,6 +1556,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		cfg:             cfg,
 		entries:         entries,
 		mem:             memSvc,
+		memoryAdmin:     memAdmin,
 		mcpConns:        mcpConns,
 		root:            root,
 		loader:          loader,
@@ -1338,22 +1564,37 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	}, nil
 }
 
-// readStore 按**只读路径**打开库句柄：不取实例锁、不做崩溃恢复、不清理锁文件，`schema_version`
-// 的裁决发生在打开之前（`OpenReadOnly` 内）——轻路径里需要数据的命令（`session list`）用它。
-// readStore is the read-only path: no lock, no recovery, no lock-file cleanup, and the
-// schema version verdict happens before the database is opened.
-//
-// 与重路径的区别只有一句：**不打开写池**。因此它可以在别的实例持锁时使用（那正是只读命令
-// 存在的意义），也永远不可能顺手改库。
-// The only difference from the heavy path is that no write pool is opened.
-func (a *App) readStore(ctx context.Context) (*storage.DB, error) {
-	return storage.OpenReadOnly(ctx, a.dbPath(), a.supportedVersion)
+// readStore 按**只读路径**打开 PostgreSQL 句柄：不取实例锁、不做崩溃恢复、不清理锁文件，
+// 也**不建库 / 不迁移**——轻路径里需要数据的命令（`session list`）用它。缺 DSN 即报错，
+// 不回退 SQLite（D-01）。
+// readStore is the read-only path: no instance lock, no recovery, no lock-file cleanup
+// and no migration. A missing DSN is an error, never a silent SQLite fallback.
+func (a *App) readStore(ctx context.Context) (*postgres.DB, error) {
+	if a.cfg == nil {
+		return nil, errors.New("实例配置缺失：没有 database.dsn，只读命令无法连接 PostgreSQL")
+	}
+	db, err := postgres.OpenReadOnly(ctx, postgresConfig(a.cfg.Database))
+	if err != nil {
+		return nil, err
+	}
+	// 只读打开不迁移，所以初始化状态要自己探：版本表缺失 → ErrDatabaseMissing，与重路径
+	// "库不存在"同一语义（口径 23）。少了这一步，列表命令会对空 schema 返回空清单，把
+	// "还没初始化"伪装成"没有数据"。
+	// The read-only open never migrates, so the version probe is what distinguishes an
+	// uninitialised database from an empty one.
+	if _, err := db.SchemaVersion(ctx); err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%w（释放只读句柄失败: %v）", err, closeErr)
+		}
+		return nil, err
+	}
+	return db, nil
 }
 
 // abortRuntime 把失败与已取得资源的释放并成一条错误链——半开的句柄不回给调用方。`db` 为
 // nil 表示库还没打开（第二步之前失败），此时只放锁；锁非 nil 是本函数的调用前提。
 // abortRuntime folds a failure together with the release of whatever was already acquired.
-func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error {
+func abortRuntime(err error, db *postgres.DB, lock *workspace.InstanceLock) error {
 	if db != nil {
 		err = errors.Join(err, db.Close())
 	}
@@ -1371,7 +1612,7 @@ func abortRuntime(err error, db *storage.DB, lock *workspace.InstanceLock) error
 // ——归属、形态与名字一致性校验只有一份。
 // authorPublishedProviders lists published provider entries in the store's fixed order,
 // reusing the very resolver the runtime catalog uses.
-func authorPublishedProviders(ctx context.Context, versions *storage.ResourceStore) ([]workspace.ProviderEntry, error) {
+func authorPublishedProviders(ctx context.Context, versions *postgres.ResourceStore) ([]workspace.ProviderEntry, error) {
 	pointers, err := versions.ListPointers(ctx, core.ResourceModelConnection)
 	if err != nil {
 		return nil, fmt.Errorf("列出已发布模型连接: %w", err)
@@ -1399,7 +1640,7 @@ func authorPublishedProviders(ctx context.Context, versions *storage.ResourceSto
 // authorPublishedSkills 返回当前未撤回的技能发布指针名（升序）：提示词按传入顺序渲染，
 // 顺序稳定才可判卷；判定复用注册装配的同一函数（`publishedSkillNames` 自己复核撤回位）。
 // authorPublishedSkills returns the live skill names in ascending order.
-func authorPublishedSkills(ctx context.Context, versions *storage.ResourceStore) ([]string, error) {
+func authorPublishedSkills(ctx context.Context, versions *postgres.ResourceStore) ([]string, error) {
 	published, err := publishedSkillNames(ctx, versions)
 	if err != nil {
 		return nil, err
@@ -1417,7 +1658,7 @@ func authorPublishedSkills(ctx context.Context, versions *storage.ResourceStore)
 // 装配实际连上的名单里。两个条件任一不成立都不进提示词，草稿里的引用随后由同一份名单判卷。
 // authorAppliedMCPServers lists MCP servers that have an applied version and are connected
 // in this process — exactly the set admission can resolve.
-func authorAppliedMCPServers(ctx context.Context, versions *storage.ResourceStore, mcpRT *mcpRuntime) ([]string, error) {
+func authorAppliedMCPServers(ctx context.Context, versions *postgres.ResourceStore, mcpRT *mcpRuntime) ([]string, error) {
 	pointers, err := versions.ListPointers(ctx, core.ResourceMCPServer)
 	if err != nil {
 		return nil, fmt.Errorf("列出已发布 MCP server: %w", err)
@@ -1459,7 +1700,7 @@ var declaredToolNames = []string{
 // 注册结论都在对账之后按已发布版本重算（约束 18）。
 // providerNameUnion merges the configured and published provider names for the
 // pre-baseline load only; it never builds the runtime catalog.
-func providerNameUnion(ctx context.Context, versions *storage.ResourceStore, cfg *cli.Config) ([]string, error) {
+func providerNameUnion(ctx context.Context, versions *postgres.ResourceStore, cfg *cli.Config) ([]string, error) {
 	pointers, err := versions.ListPointers(ctx, core.ResourceModelConnection)
 	if err != nil {
 		return nil, fmt.Errorf("列出已发布模型连接: %w", err)
@@ -1525,29 +1766,23 @@ func outputBudget(cfg *cli.Config) int {
 	return 0
 }
 
-// memoryCarrier 按 `memory.backend` 选定记忆载体（颗粒度文档 §3.1 的装配行）：markdown 档建在
-// 工作区根之上（全部读写经根句柄，Agent 层目录与文件按需创建），sqlite 档复用重路径已打开的
-// 库句柄与**同一个时钟**（时间显式传入，载体内部不取 time.Now）。
+// memoryCarrier 返回运行期唯一的长期记忆载体：PostgreSQL（D-18 / D-22）。
 //
-// **空串归 markdown**：它只有两条来路——配置文件缺失 / 没有 memory 段的实例配置，以及测试夹具
-// 直接构造 `cli.Config`（不经过装载期校验）——两者都是"没配"而不是"配错"，缺省与装载期取同一档
-// （`cli.validateConfig` 已把空串就地写回该缺省，这里是同一条口径的第二处落点）。取值域外的取值
-// **再拒一次**：装配层不假设调用方一定走过装载期那道门（fail-closed 双保险，颗粒度文档 §3.5
-// 第 9 项）。
-// memoryCarrier picks the carrier named by memory.backend; an empty string means "not
-// configured" and lands on the documented default, while any value outside the two backends
-// is refused again here rather than silently degraded.
-func memoryCarrier(cfg *cli.Config, db *storage.DB, root string, now func() time.Time) (core.LongTermMemoryStore, error) {
-	switch cfg.Memory.Backend {
-	case "", "markdown":
-		return memory.NewMarkdownStore(root), nil
-	case "sqlite":
-		return storage.NewMemoryStore(db, now), nil
-	default:
+// 没有载体开关可读：`memory.backend` 已退役（装载期出现即拒绝启动），markdown 文件
+// 载体只剩一次性只读导入这一个用途（`db switch` 走 `memory.NewMarkdownLegacySource`），
+// 运行期**不得**回读工作区文件，也不得与 PG 双读（D-22）。
+//
+// 缺库句柄即拒绝启动：装配层不假设调用方一定走过装载期那道门（fail-closed 双保险，
+// 颗粒度文档 §3.5 第 9 项）——退回文件载体会让"库没接上"表现成"记忆还在，只是换了个
+// 地方"，而那个地方此后不再同步。
+// memoryCarrier returns the single runtime carrier: PostgreSQL. There is no switch to
+// read, and a missing handle is a refusal rather than a silent fall back to files.
+func memoryCarrier(db *postgres.DB, now func() time.Time) (core.LongTermMemoryStore, error) {
+	if db == nil {
 		return nil, fmt.Errorf(
-			"配置项 memory.backend 取值非法（%s）——只允许 markdown（缺省）或 sqlite；mem0 载体尚未实现，未知取值一律拒绝启动，不静默降级",
-			cfg.Memory.Backend)
+			"记忆载体：运行时唯一载体为 PostgreSQL（D-18），装配时缺库句柄——拒绝启动，不回退 markdown 文件")
 	}
+	return postgres.NewMemoryStore(db, now), nil
 }
 
 // heavyRuntime 是重路径运行期的资源句柄：实例锁、数据库、运行入口与三个只读消费面。
@@ -1562,26 +1797,44 @@ type heavyRuntime struct {
 	lock *workspace.InstanceLock
 
 	// db 是写模式打开的库句柄（读写两条池）。
-	db *storage.DB
+	db *postgres.DB
 
 	// service 是唯一运行入口。
 	service *core.AgentService
 
+	// admission 是图 6 [3] 的运行准入对象：调度器已用它包装运行入口，web 的
+	// RunService 适配器在 `webOptions` 里拿**同一份**——另建一份会让同一调用方在
+	// web 与后台各拿一份 `max_concurrent` 计数，上限形同虚设（C-35）。
+	// The same admission object the scheduler uses is handed to the web run entry.
+	admission *runAdmission
+
 	// runs 是运行账本的唯一实例：AgentService 写入、web.RunService 适配器读取，
 	// 保留句柄是为了让装配面可核"读面与写面确实是同一个仓储"。
 	// runs is the one run store shared by the writer and the web read port.
-	runs *storage.RunStore
+	runs *postgres.RunStore
 
 	// sessions 是会话仓储；命令面经只读端口消费它（`chat` 读回本轮消息、`session list`
 	// 列清单）——写路径只有 core 一条。
-	sessions *storage.SessionStore
+	sessions *postgres.SessionStore
 
 	// invocations / llmCalls 是两个审计仓储：装配期建好之后**同时**喂给循环（写路径）与
 	// 导出面（只读路径）。一份实现、两个消费面——读面另起一个实例会让"读到的"与"写下的"
 	// 隔着两条连接池，排障时说不清是不是同一个库。
 	// One implementation feeds both the write path (the loop) and the read face.
-	invocations *storage.ToolInvocationRepo
-	llmCalls    *storage.LLMCallRepo
+	invocations *postgres.ToolInvocationRepo
+	llmCalls    *postgres.LLMCallRepo
+
+	// diagnostics 是诊断事件的读面（`GET /api/v1/diagnostics`）。它与运行路径上的
+	// 写入器由同一次 `newDiagnosticsPorts` 构造、共用同一个存储适配器——读不到就说明
+	// 生产端没发，而不是"两套实例各写各的"。
+	// diagnostics is the read face of the very store the run path writes to.
+	diagnostics *diagnostics.Reader
+
+	// diagRecorder 是同一个写入器的**公开面**（V-8）：入口速率中间件经 web 的写端口
+	// 用它记 `quota_decision`。与运行路径共用同一个实例——两条来源的事件因此落进
+	// 同一个存储、可被同一个读端点按关联标识查回。
+	// The same recorder, exposed to the ingress middleware through the web write port.
+	diagRecorder diagnosticRecorder
 
 	// registry 是装配期构建的工具注册池（只读面）：`tool list` 要的"注册了什么"只存在于
 	// 这一次装配之后——池是内存对象，命令面经 `cli.ToolLister` 取它的**数据**。
@@ -1627,6 +1880,11 @@ type heavyRuntime struct {
 	// before the database closes.
 	scheduler *core.Scheduler
 
+	// adminPosture 是启动期管理认证姿态的发布盒（T027 / §2.14）：web 面在监听成功后
+	// 写入，调度器经它迟绑定读取——`unavailable` 时 admin-builtin 后台任务不再执行。
+	// adminPosture carries the startup posture from the web face to the scheduler.
+	adminPosture *postureBox
+
 	// scheduleSlot 是 `manage_schedule` 的两段绑定槽位（颗粒度文档 §3.1.17）：注册池
 	// 先于 runtime 构建，工具持槽、runtime 就绪后 Bind 生产适配器。保留句柄只为让装配
 	// 面可见"第 10 件工具确实完成绑定"，不把适配器暴露给任何消费方。
@@ -1670,20 +1928,20 @@ type heavyRuntime struct {
 	// versions / ops 是两个管理侧仓储：基线、管理恢复与准入解析共用同一实例，保留句柄
 	// 让装配面可核"只有这一份"（与 runs / sessions 的保留口径相同）。
 	// versions and ops are the resource and management stores shared across the assembly.
-	versions    *storage.ResourceStore
-	ops         *storage.ManagementStore
-	credentials *storage.CredentialStore
+	versions    *postgres.ResourceStore
+	ops         *postgres.ManagementStore
+	credentials *postgres.CredentialStore
 
 	// connectionTests 是资源「最后一次连接测试」投影：测试端点写入、管理读面读取，
 	// 保留句柄让装配面可核"写的与读的是同一张表"（历史仍在管理操作台账）。
 	// connectionTests is the last-test projection shared by the writers and readers.
-	connectionTests *storage.ConnectionTestStore
+	connectionTests *postgres.ConnectionTestStore
 
 	// notifyAdminStore 是通知渠道仓储：保存期绑定校验与通知写面读的是同一实例，
 	// 保留句柄让装配面可核"写面与校验看到的是同一份渠道真值"。
 	// notifyAdminStore is the one channel store shared by the write surface and the
 	// save-time binding check.
-	notifyAdminStore *storage.NotifyAdminStore
+	notifyAdminStore *postgres.NotifyAdminStore
 
 	// resolver / secrets 是凭据解析器与 secrets 子命令的装配产物：命令面经
 	// `Runtime.Secrets()` 取 `cli.SecretsService` 端口，解析器本身不再外露。
@@ -1788,9 +2046,32 @@ type heavyRuntime struct {
 	// mem is the one memory facade shared with the tool side.
 	mem *memory.Service
 
+	// memoryAdmin 是记忆管理面（结构化读模型 + 四个写动作）：与门面共用同一个存储
+	// 载体，启动恢复也用它查证 `memory.*` 的 pending 行。
+	// memoryAdmin shares the facade's carrier and backs the memory recovery verdicts.
+	memoryAdmin *MemoryAdmin
+
 	// mcpConns 是已连接的 MCP server 与工具（`/info` 的连接数与 `/tools` 的 mcp 来源）。
 	// mcpConns carries the connected MCP servers and their tools.
 	mcpConns []tool.MCPConnection
+
+	// knowledge / history 是 US-16 两条链路的装配产物（`wire_knowledge.go`）：
+	// `webOptions` 经 `wireKnowledgePorts` 逐槽位投影到 `web.Options`，缺件的槽位保持
+	// nil、对应路由按固定 500 失败关闭。knowledge 里同时带着压缩来源闸门要的校验器
+	// ——它与来源视图读面是**同一个** `SourceViewer`，所以判定口径只有一份。
+	// The US-16 assembly products projected field-by-field in webOptions; the same
+	// SourceViewer backs both the read faces and the compaction validity gate.
+	knowledge *knowledgeWiring
+	// collections 是知识集合目录的"名字 → 稳定 ID"读面：`serve` 的配置监听用它
+	// 判定声明过的集合是否还存在（D-19），与注册装配共用同一个存储实例。
+	// collections is the name-resolution face handed to the serve-time watcher.
+	collections KnowledgeCollectionSource
+	history     historyWiring
+
+	// compactionStore 是压缩链的读面（`GET /sessions/{id}/compactions`）：与压缩写面
+	// 共用同一个实例，页面读到的链就是刚追加的那条。
+	// compactionStore is the read face of the very chain the compactor appends to.
+	compactionStore *postgres.CompactionStore
 
 	// writeServices 是 US-12 写面适配器的装配槽（类型定义在 web.go）：尚未装配的端口保持
 	// nil，`webOptions` 逐字段投影到 `web.Options`，handler 对缺端口固定 500 失败关闭
@@ -1851,7 +2132,7 @@ func (r *heavyRuntime) tools() cli.ToolLister { return toolListerPort{registry: 
 // runCancellerAdapter adapts the run ledger and the run service to the archive port. It
 // signals only; the loop alone writes terminal states.
 type runCancellerAdapter struct {
-	runs    *storage.RunStore
+	runs    *postgres.RunStore
 	service *core.AgentService
 	// poll 是等待窗口内的轮询间隔；≤0 取 runCancellerPoll（测试注入小值只为缩短用例）。
 	// poll is the polling interval inside the bounded wait window.
@@ -1980,7 +2261,7 @@ type Options struct {
 	// WorkDir is required: an empty value silently resolves the workspace relatively.
 	WorkDir string
 
-	// SupportedSchemaVersion 是目标 schema 版本；生产传 storage.SupportedSchemaVersion。
+	// SupportedSchemaVersion 是目标 schema 版本；生产传 postgres.SupportedSchemaVersion。
 	// **必填且为正**——零值建出来的库没有任何版本行，后续每次打开都是版本裁决失败。
 	SupportedSchemaVersion int
 
@@ -1996,6 +2277,13 @@ type Options struct {
 	// A non-nil override replaces the real clients but stays inside the routing and audit
 	// service, so eval usage readings come from the production chain.
 	ProviderClient core.ProviderClient
+
+	// DatabaseDSN 覆盖配置文件里的 `database.dsn`（可选；评测基座的**存储隔离**）。评测
+	// 逐用例建一次性 schema，连接串只在内存里交给装配——不落盘、不进结果文件；真模型档
+	// 原样复制运维配置时也靠它把写入挡在实例库之外。空 = 用配置里的值。
+	// An in-memory DSN override for the eval base: each case runs in a throwaway schema
+	// and the DSN never reaches a file. Empty means "use the configured value".
+	DatabaseDSN string
 }
 
 // Runtime 是包外拿到的重路径运行期句柄：三个消费面 + 一个释放口。
@@ -2044,10 +2332,17 @@ func OpenRuntime(ctx context.Context, opts Options) (*Runtime, error) {
 		return nil, errors.New("OpenRuntime: WorkDir 必填（工作区根 = <WorkDir>/.basalt）")
 	}
 	if opts.SupportedSchemaVersion <= 0 {
-		return nil, errors.New("OpenRuntime: SupportedSchemaVersion 必须为正（生产传 storage.SupportedSchemaVersion）")
+		return nil, errors.New("OpenRuntime: SupportedSchemaVersion 必须为正（生产传 postgres.SupportedSchemaVersion）")
 	}
 	configPath := filepath.Join(opts.WorkDir, configFileName)
 	cfg, cfgErr := cli.LoadConfig(configPath, os.LookupEnv)
+	// 存储隔离在装载之后、装配之前生效：配置里的 `database.dsn` 缺省时**不**替它填默认
+	// （§3.1.9 按子命令分流），评测因此仍会拿到"未配置"这条 fail-closed 错误。
+	// The isolation override applies after loading and before assembly; a config without
+	// a DSN still fails closed when no override was supplied.
+	if cfgErr == nil && opts.DatabaseDSN != "" {
+		cfg.Database.DSN = opts.DatabaseDSN
+	}
 	a := &App{
 		workDir:          opts.WorkDir,
 		supportedVersion: opts.SupportedSchemaVersion,

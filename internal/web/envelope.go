@@ -98,6 +98,20 @@ const (
 	codeExecutionProfileMismatch = "EXECUTION_PROFILE_MISMATCH" // 409 If-Match 版本不匹配
 	codeMCPApplyFailed           = "MCP_APPLY_FAILED"           // 500 受控发布整体失败
 	codeMCPApplySuperseded       = "MCP_APPLY_SUPERSEDED"       // 409 发布已被后续版本取代
+
+	// US-16 新增（契约 run-and-errors §8 的调用方 / 历史行，D-42 于 2026-10-28 随契约
+	// 冻结）。六个字面量与状态都是契约固定值：Key 作用域非法 400、幂等键参数冲突 409、
+	// 目标已不可读（保留裁剪 / 软删）410、调用方入口速率 429、调用方并发名额 429、
+	// 周期配额 429。三个 429 **不得**合并成一个码，也**不得**复用 AUTH_RATE_LIMITED
+	// （那只计管理认证失败）；只加常量不加契约行 → 常量对账用例红。
+	// US-16 additions frozen with the contract on 2026-10-28 (D-42): the caller and
+	// history rows of §8, including three deliberately distinct 429 codes.
+	codeInvalidScope             = "INVALID_SCOPE"              // 400 Key 发放 / 轮换时作用域非法
+	codeIdempotencyConflict      = "IDEMPOTENCY_CONFLICT"       // 409 同一幂等键的再次请求参数不一致
+	codeGone                     = "GONE"                       // 410 已被保留策略 / 软删移除，不再可读
+	codeCallerRateLimited        = "CALLER_RATE_LIMITED"        // 429 调用方入口速率超限
+	codeCallerConcurrencyLimited = "CALLER_CONCURRENCY_LIMITED" // 429 调用方并发 Run 名额用尽
+	codeQuotaExhausted           = "QUOTA_EXHAUSTED"            // 429 周期配额不足
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自

@@ -3,17 +3,16 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os/user"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -29,18 +28,23 @@ import (
 // storageStore adapts the storage package to cli.Store.
 type storageStore struct{}
 
-// Bootstrap 转调引导入口。
-// Bootstrap forwards to the storage bootstrap entry.
+// Bootstrap 转调引导入口（旧 SQLite 谱系，供 `basalt init` 与离线导出使用；见 run-state
+// R69 ·5 #6 的待裁决项）。运行期后端**不**经这里打开。
+// Bootstrap forwards to the legacy SQLite bootstrap entry used by init and the offline
+// export path; the runtime backend is never opened here.
 func (storageStore) Bootstrap(ctx context.Context, path string, target int) (bool, error) {
 	return storage.Bootstrap(ctx, path, target)
 }
 
-// OpenReadOnly 转调只读打开，并把库句柄接到只读视图端口上。
-// OpenReadOnly forwards the read-only open and returns it as the view port.
-func (storageStore) OpenReadOnly(ctx context.Context, path string, target int) (cli.SchemaView, error) {
-	db, err := storage.OpenReadOnly(ctx, path, target)
+// OpenReadOnly 转调 PostgreSQL 的**诊断用只读**打开，并把库句柄接到只读视图端口上。
+// 与运行期的 `postgres.Open` 不同：它不校验扩展、不建库 / 迁移，会话固定只读
+// （`default_transaction_read_only=on`），因此 `basalt status` 依然"只校验、不改库"。
+// OpenReadOnly forwards to the diagnostic read-only open: no extension check, no
+// migration, and a read-only session — status still never writes.
+func (storageStore) OpenReadOnly(ctx context.Context, database cli.DatabaseConfig) (cli.SchemaView, error) {
+	db, err := postgres.OpenReadOnly(ctx, postgresConfig(database))
 	if err != nil {
-		// typed-nil 陷阱：*storage.DB 装箱进接口时**必须**在这一步显式判空——
+		// typed-nil 陷阱：*postgres.DB 装箱进接口时**必须**在这一步显式判空——
 		// 否则得到"非空接口 + 空指针"，上层的 err != nil 判据全部失效，nil 检查
 		// 形同虚设（实测形态：`if db == nil` 为 false 而方法调用 panic）。
 		// A typed nil boxed into the interface is non-nil, so the error path must
@@ -99,6 +103,12 @@ type agentsPort struct {
 	// SupportedSchemaVersion 是写路径打开 / 迁移数据库的目标版本（与装配层同源）。
 	// SupportedSchemaVersion is the target schema version for the write path.
 	SupportedSchemaVersion int
+
+	// Database 是运行期数据库配置（DSN 已由装载层解析 `${ENV_VAR}`）：写路径经它连接
+	// PostgreSQL，DSN 本身**不进日志**。
+	// Database carries the resolved runtime database configuration; the DSN never
+	// reaches the log.
+	Database cli.DatabaseConfig
 
 	// Logger 是装配层注入的日志器（带配置档位）；nil 时回落进程默认档。
 	// Logger is the injected logger; a nil falls back to the process default.
@@ -215,49 +225,33 @@ func (p agentsPort) withCLIAdmin(root string, now func() time.Time, providers []
 // cliAdminSession 是一次 CLI 写路径装配出来的库句柄与管理面。
 // cliAdminSession pairs the database handle with the assembled management surface.
 type cliAdminSession struct {
-	db    *storage.DB
+	db    *postgres.DB
 	admin *AgentAdmin
 }
 
-// openCLIAdmin 在已持有的实例锁内打开并迁移库，装配约束 27 / 32 需要的最小组件：
+// openCLIAdmin 在已持有的实例锁内打开 PostgreSQL，装配约束 27 / 32 需要的最小组件：
 // 管理操作仓储、生命周期状态文件、资源存储（生命周期索引）、Agent 写锁与归档仓储。
 // HTTP / MCP / 调度器 / 文件监视器**不**装配——CLI 写命令不服务请求也不跑定时任务，
 // 归档的注销 / 取消 / 等待因此以三项 nil 依赖表达（约束 32 的 CLI 分支）。
-// openCLIAdmin opens and migrates the database under the held lock and wires only the
-// components the CLI write path needs; the heavy runtime stays unbuilt.
+// openCLIAdmin opens PostgreSQL under the held lock and wires only the components the
+// CLI write path needs; the heavy runtime stays unbuilt.
 func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() time.Time,
 	providers []string,
 ) (*cliAdminSession, error) {
-	version := p.SupportedSchemaVersion
-	if version <= 0 {
+	if p.SupportedSchemaVersion <= 0 {
 		return nil, errors.New("CLI 写路径缺少 schema 目标版本（装配错误）")
 	}
-	db, err := storage.OpenWritable(ctx, filepath.Join(root, databaseFileName), version)
+	db, err := postgres.Open(ctx, postgresConfig(p.Database))
 	if err != nil {
 		return nil, err
 	}
-	// CLI 写路径与重路径用**同一条**迁移编排：v3 的六步（准入 → 状态文件 → SQL 单事务 →
-	// 身份回填 → 绑定回填 → 投影重建）在两条路上逐字节相同，另开一条 `db.Migrate` 捷径
-	// 会让"升级过的库"依命令不同而不同。库已是目标版本时返回零报告、不写操作行。
-	// The CLI write path runs the very same migration orchestration as the heavy path.
-	index := storage.NewResourceStore(db)
-	operations := storage.NewManagementStore(db)
+	// 建库与前向迁移已在 `postgres.Open` 内完成（advisory 锁 + 版本推进）；运行期**不再**
+	// 调用 SQLite 谱系的 v3 六步编排——那条路径只保留给旧 SQLite 实例的离线升级 / 导出。
+	// The forward migration already ran inside postgres.Open; the SQLite-lineage
+	// orchestration is kept only for the offline upgrade/export path.
+	index := postgres.NewResourceStore(db)
+	operations := postgres.NewManagementStore(db)
 	lifecycle := workspace.NewLifecycleStore(root, now)
-	migrator := NewMigrator(MigrateV3Deps{
-		DB:         db,
-		Operations: operations,
-		Lifecycle:  lifecycle,
-		Resources:  index,
-		Notify:     storage.NewNotifyAdminStore(db),
-		Bindings:   storage.NewBindingStore(db),
-		Root:       root,
-		Logger:     p.logger(),
-		Now:        now,
-		Target:     version,
-	})
-	if _, migrateErr := migrator.MigrateV3(ctx); migrateErr != nil {
-		return nil, errors.Join(fmt.Errorf("迁移数据库到版本 %d: %w", version, migrateErr), db.Close())
-	}
 
 	admin := NewAgentAdmin(AgentAdminDeps{
 		Root:       root,
@@ -265,7 +259,7 @@ func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() ti
 		Lifecycle:  lifecycle,
 		Index:      index,
 		Operations: operations,
-		Archives:   storage.NewAgentAdminStore(db),
+		Archives:   postgres.NewAgentAdminStore(db),
 		Logger:     p.logger(),
 		Now:        now,
 		// CLI 没有已发布目录快照：模板的 provider 顺序以命令层装载的配置列表为准。
@@ -366,11 +360,11 @@ func (p runServicePort) Run(ctx context.Context, req core.RunRequest) (core.RunR
 	return p.service.Run(ctx, req)
 }
 
-// sessionListerPort 把 storage.SessionStore 适配成 cli.SessionLister（**只读**端口：
+// sessionListerPort 把 postgres.SessionStore 适配成 cli.SessionLister（**只读**端口：
 // `session list` 与 `chat` 的历史读取，写路径不在这里——追加的唯一出口在 core）。
 // sessionListerPort adapts the session store to the read-only port.
 type sessionListerPort struct {
-	store *storage.SessionStore
+	store *postgres.SessionStore
 }
 
 // ListSessions 转调会话清单（排序与去重是实现侧的事，端口保序）。命令面没有过滤参数，
@@ -432,11 +426,14 @@ func (p secretsPort) Status(ctx context.Context) (cli.SecretsStatus, error) {
 	return cliSecretsStatus(status), err
 }
 
-// Verify 转调并投影结果。
-// Verify forwards and projects the result.
+// Verify 转调并投影结果（两组计数逐字段对应，命令面按非零项打印分类明细）。
+// Verify forwards and projects both count groups field by field.
 func (p secretsPort) Verify(ctx context.Context) (cli.SecretsVerifyReport, error) {
 	report, err := p.service.Verify(ctx)
-	return cli.SecretsVerifyReport{Checked: report.Checked, Failed: report.Failed}, err
+	if err != nil {
+		return cli.SecretsVerifyReport{}, err
+	}
+	return cliSecretsVerifyReport(report), nil
 }
 
 // RevokeManaged 转调并补上 CLI 操作主体（撤销要写管理操作行，必须可归因）。
@@ -460,13 +457,36 @@ func cliSecretsStatus(status SecretsStatus) cli.SecretsStatus {
 	}
 }
 
+// cliSecretsVerifyReport 把核验报告投影成命令面类型：两组计数逐字段对应，
+// 命令面按非零项打印分类明细（投影丢字段会让明细静默消失）。
+// cliSecretsVerifyReport projects both count groups field by field.
+func cliSecretsVerifyReport(report SecretsVerifyReport) cli.SecretsVerifyReport {
+	return cli.SecretsVerifyReport{
+		Checked:               report.Checked,
+		Failed:                report.Failed,
+		HistoricalOK:          report.HistoricalOK,
+		Revoked:               report.Revoked,
+		RevokedWithCiphertext: report.RevokedWithCiphertext,
+		MissingCiphertext:     report.MissingCiphertext,
+		KeyIDMismatch:         report.KeyIDMismatch,
+		AADMismatch:           report.AADMismatch,
+		CurrentChecked:        report.CurrentChecked,
+		CurrentFailed:         report.CurrentFailed,
+		TargetMismatch:        report.TargetMismatch,
+		BindingMissing:        report.BindingMissing,
+		KeyRevoked:            report.KeyRevoked,
+		EnvMissing:            report.EnvMissing,
+	}
+}
+
 // 编译期断言：端口形状与实现签名一旦对不上，在这里先红——不是在装配处报"缺方法"。
 // Compile-time assertions: the ports and the implementations must match here first.
 var (
-	_ cli.RunService    = runServicePort{}
-	_ cli.SessionLister = sessionListerPort{}
-	_ cli.ToolLister    = toolListerPort{}
-	_ cli.Secrets       = secretsPort{}
+	_ cli.RunService          = runServicePort{}
+	_ cli.SessionLister       = sessionListerPort{}
+	_ cli.ToolLister          = toolListerPort{}
+	_ cli.Secrets             = secretsPort{}
+	_ cli.HandoffVerification = handoffVerifyPort{}
 )
 
 // ============================================================
@@ -480,7 +500,7 @@ var (
 // names both sides; the assertions below fail the build the moment an implementation
 // drifts away from its port.
 
-// CredentialStore 是凭据身份 / 版本 / 资源版本关联的读写面（`storage.CredentialStore`
+// CredentialStore 是凭据身份 / 版本 / 资源版本关联的读写面（`postgres.CredentialStore`
 // 实现）：写入新身份、追加版本、撤销与退役、按身份或属主读取、记录资源版本解析到的
 // 凭据版本。读面**不返回**解密后的明文——解密归 `CredentialResolver`。
 // CredentialStore reads and writes credential identities and versions; it never returns
@@ -522,18 +542,21 @@ type CredentialGuard interface {
 	Check(ctx context.Context, ref core.RunCredentialRef) error
 }
 
-// BindingStore 是 `agent_resource_bindings` 投影的读写面（`storage.BindingStore` 实现）：
+// BindingStore 是 `agent_resource_bindings` 投影的读写面（`postgres.BindingStore` 实现）：
 // 权威永远是 `AGENT.md`，这里只重建 / 清空 / 读取投影与按资源 UID 反查引用者。
 // BindingStore rebuilds and reads the binding projection; AGENT.md stays authoritative.
 type BindingStore interface {
+	// Rebuild 的 `knowledge` 是 `knowledge:` 声明解析后的集合绑定（D-19）：与资源
+	// 绑定同批替换，投影因此不会出现"资源已换、集合还是旧的"的混合状态。
+	// knowledge travels with the same replace so the projection never mixes two versions.
 	Rebuild(ctx context.Context, agentUID core.AgentUID, agentName, contentHash string,
-		bindings core.ResourceBindings, at time.Time) error
+		bindings core.ResourceBindings, at time.Time, knowledge ...core.KnowledgeCollectionBinding) error
 	Clear(ctx context.Context, agentUID core.AgentUID) error
 	Bindings(ctx context.Context, agentUID core.AgentUID) ([]core.AgentResourceBinding, error)
 	ReferencingAgents(ctx context.Context, uid core.ResourceUID) ([]core.AgentResourceBinding, error)
 }
 
-// IdentityStore 是 `resource_identities` 的读写面（`storage.IdentityStore` 实现）：
+// IdentityStore 是 `resource_identities` 的读写面（`postgres.IdentityStore` 实现）：
 // UID 一次性分配、永不复用；删除只写墓碑，同名重建拿新 UID。
 // IdentityStore allocates immutable uids and tombstones identities; uids never return.
 type IdentityStore interface {
@@ -577,11 +600,30 @@ type SecretsStatus struct {
 	ManagedNotifyChannels   int
 }
 
-// SecretsVerifyReport 是 `secrets verify` 的计数结果：只回检查与失败条数，不回密钥。
-// SecretsVerifyReport counts checks and failures only.
+// SecretsVerifyReport 是统一凭据核验（`secrets verify` / `db verify --handoff`）的
+// 分类计数：只回计数与类别名，不回密钥、明文或密文。两组计数对应模块卡 §2.12.1 的
+// 两个报告对象，**不得**相加成一个"总数"对外表述。
+// SecretsVerifyReport counts the two report objects of §2.12.1; it never carries
+// credential material and the two groups are never merged into one number.
 type SecretsVerifyReport struct {
-	Checked int
-	Failed  int
+	// (a) 历史密文完整性（逐版本行）：`Checked` 数"应当可验证"的版本（密文在、
+	// 或密文缺失属异常）；正常撤销且确无密文的版本只计入 `Revoked`，不计 `Checked`。
+	Checked               int
+	Failed                int
+	HistoricalOK          int
+	Revoked               int
+	RevokedWithCiphertext int
+	MissingCiphertext     int
+	KeyIDMismatch         int
+	AADMismatch           int
+
+	// (b) 当前可用性（逐 active 身份）：四个原因码与 §2.12.1 逐字一致。
+	CurrentChecked int
+	CurrentFailed  int
+	TargetMismatch int
+	BindingMissing int
+	KeyRevoked     int
+	EnvMissing     int
 }
 
 // SecretsService 是 CLI `secrets` 子命令的服务面（T135 装配）：`init` 生成主密钥并设
@@ -602,8 +644,8 @@ type SecretsService interface {
 // Compile-time assertions: the four storage implementations must satisfy their ports
 // today; the scope port is satisfied by the existing concrete service.
 var (
-	_ CredentialStore = (*storage.CredentialStore)(nil)
-	_ IdentityStore   = (*storage.IdentityStore)(nil)
-	_ BindingStore    = (*storage.BindingStore)(nil)
+	_ CredentialStore = (*postgres.CredentialStore)(nil)
+	_ IdentityStore   = (*postgres.IdentityStore)(nil)
+	_ BindingStore    = (*postgres.BindingStore)(nil)
 	_ ScopeConversion = (*ScopeService)(nil)
 )

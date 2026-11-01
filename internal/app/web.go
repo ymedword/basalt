@@ -9,6 +9,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,9 +22,10 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/assets"
+	"github.com/ymedword/basalt/internal/callers"
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -82,16 +84,49 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 	if token.Source != "" {
 		authCfg.Token = token.Token
 	}
-	if err := web.ValidateAdminAuth(authCfg, []string{bound}); err != nil {
+	posture, err := web.ResolveAdminPosture(authCfg, []string{bound})
+	if err != nil {
 		closeListener(logger, ln)
 		return nil, fmt.Errorf("管理认证配置校验失败: %w", err)
 	}
-	guard, err := web.NewAuthGuard(authCfg, logger, a.nowOr())
+	// 管理能力姿态在真实监听地址确定后一次性算出（C-42 / §2.14）：token 与
+	// local_trust 都是合法启用态，local_trust **不是**"认证关闭"；日志只记姿态名，
+	// 不含凭据。调度器侧的 admin-builtin 检查在调度装配里消费这个值。
+	// The posture is fixed once the real listeners exist; only its name is logged.
+	logger.Info("管理认证姿态已确定", "posture", string(posture))
+	// 姿态随装配交给调度器（§2.14）：调度器早于本函数构造，经发布盒迟绑定读取。
+	// 只有 `unavailable` 会让 admin-builtin 后台任务转到 admin_auth_unavailable。
+	// The posture is published to the scheduler through the late-binding box.
+	rt.adminPosture.Set(posture)
+	// 调用方 Key 的解析端口（T025 / T014）：管理 token 指纹来自上面已解析的同一份
+	// 凭据；Key 存储接 PostgreSQL（运行期唯一后端，D-01）——查表只按指纹，调用方
+	// 停用按"未找到"处理，全部失败一律 401，**不**回落成管理员（失败关闭）。
+	// The caller-key port shares the resolved admin fingerprint and now reads the
+	// PostgreSQL key store; every lookup failure collapses to 401.
+	principals := callers.NewAuthenticator(postgres.NewKeyStore(rt.db), adminTokenFingerprint{token: token.Token})
+	guard, err := web.NewAuthGuardWithPrincipals(authCfg, logger, a.nowOr(), principals)
 	if err != nil {
 		closeListener(logger, ln)
 		return nil, fmt.Errorf("管理认证闸门装配失败: %w", err)
 	}
 	opts.AdminAuth = guard
+
+	// 入口速率端口（T126 / 图 6 [1]）：预算只来自 `callers.ingress.*`，装配期**不**
+	// 预填默认值。缺项在更上游就被 `cli.ValidateServeIngress` 挡下（服务拒绝启动），
+	// 因此这里拿到零预算只可能是调用方绕过该闸门——此时仍按零预算执行，非管理员业务
+	// 请求一律 429（失败关闭），不会退化成"没配就不限流"。admin token 请求不进桶
+	// （§3.1.5），管理操作与调度器因此不受这里影响；并发名额与配额仍由服务层的
+	// Limiter 方法承担（C-35 三段不合并）。
+	// The gate is built from callers.ingress.* with no defaults. Missing keys are
+	// rejected upstream by cli.ValidateServeIngress (serve refuses to start); a zero
+	// budget reaching this point still denies non-admin traffic instead of running
+	// unlimited.
+	ingressLimiter, err := newIngressLimiter(rt.cfg, rt.db, a.nowOr())
+	if err != nil {
+		closeListener(logger, ln)
+		return nil, fmt.Errorf("入口速率装配失败: %w", err)
+	}
+	opts.Ingress = ingressLimiter
 
 	srv, err := web.NewServer(opts)
 	if err != nil {
@@ -102,6 +137,25 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 	// The one-time hint comes after the server exists, so a failed start prints nothing.
 	announceAdminToken(os.Stdout, token, isInteractiveWriter(os.Stdout))
 	return srv, nil
+}
+
+// adminTokenFingerprint 是 `callers.AdminAuth` 的装配实现：把**已解析**的管理
+// token 折算成 SHA-256 指纹，供调用方认证路径做常量时间比对。空 token（local_trust
+// 模式不使用 token 形态）返回 configured=false——**不得**把空串当成有效管理凭据，
+// 也不得据此推断"管理认证已关闭"（管理能力姿态由 `core.AdminPosture` 表达）。
+// adminTokenFingerprint exposes the resolved admin token as a SHA-256 fingerprint; an
+// empty token means the token form is not in use, never an empty valid credential.
+type adminTokenFingerprint struct {
+	token string
+}
+
+// AdminTokenFingerprint 返回指纹与是否启用 token 形态。
+// AdminTokenFingerprint reports the digest and whether the token form is in use.
+func (a adminTokenFingerprint) AdminTokenFingerprint() ([sha256.Size]byte, bool) {
+	if a.token == "" {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256([]byte(a.token)), true
 }
 
 // listenAddr 取生效监听地址：空配置落回环缺省，绝不落到"全接口监听"。
@@ -215,16 +269,28 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 运行端口必须是适配器：web 需要账本读面（ListRuns / GetRun）与取消，方法集
 		// 比 *core.AgentService 多出三项；装配层组合、web 只依赖接口（§3.1.31）。
 		// The run port is the adapter; web never receives the bare AgentService.
-		Runs:     NewRunService(rt.service, rt.runs),
+		Runs:     NewRunService(rt.service, rt.runs, withRunAdmission(rt.admission)),
 		Sessions: rt.sessions,
 		Agents:   agentProfilesPort{registry: rt.agents, entries: rt.entries},
 		Tools:    newToolCatalogPort(rt.registry, rt.mcpRT),
 		Memory:   rt.mem,
+		// 结构化记忆读模型与四个写动作（C-21）：与渲染读面是两套读面，共用同一个载体。
+		// The structured read model and the four write actions share the same carrier as
+		// the rendered read face but are a separate surface.
+		MemoryAdmin: rt.memoryAdmin,
 		// Schedules 在重路径中**恒非 nil**（约束 21）：chat / tool 只是不 Start，
 		// 调度器本身始终构造，四个 /schedules 端点因此不会因模式而缺端口。
 		// The scheduler port is always present on the heavy path; only Start is
 		// deferred to serve / gateway.
 		Schedules: rt.scheduler,
+		// 调用方 / Key / 配额管理面（T026 端口）：直接注入 `*callers.CallerAdmin`，三段
+		// 存储同源（Key 表 / 配额表 / 管理操作表），七条端点不再按装配缺失 500。
+		// The caller-admin port is now assembled from the PostgreSQL stores.
+		Callers: callers.NewCallerAdmin(
+			postgres.NewKeyStore(rt.db),
+			postgres.NewQuotaStore(rt.db),
+			postgres.NewManagementStore(rt.db),
+		),
 
 		// 沙箱页与通知渠道页（§3.1.28 / §3.1.29）：白名单是配置面的**展示投影**，
 		// 渠道仓储只读且与发送路径共用同一实现——页面读到的就是下一发会用的。
@@ -257,7 +323,7 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 管理读面 = 发送读面 + 属主名 / 凭据状态 / 条件 ETag 三件事（notify_read.go）。
 		// 写后下一发即可见：两者共用同一个零缓存仓储实例。
 		// The admin read face wraps the very same send-path repository.
-		Notify: newNotifyChannelReadPort(storage.NewNotifyChannelRepo(rt.db), rt.credentials, rt.versions,
+		Notify: newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(rt.db), rt.credentials, rt.versions,
 			notifyReadDeps{ConnectionTests: rt.connectionTests}),
 		// 下拉只提供真正的渠道类型（飞书）；webhook 仍在写侧校验表里，见 notifyConsoleTypes。
 		// The dropdown offers channel types only; webhook stays valid on the write side.
@@ -279,10 +345,68 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 			MaxIterations:     cfg.Budget.MaxIterations,
 			MaxConcurrentRuns: cfg.Server.MaxConcurrentRuns,
 		},
+		// 诊断读取端口（US-16 T097）：与运行路径上的写入器共用同一个存储适配器。
+		// 只读、管理面——根 security 只有 bearerAuth / localTrust，调用方 Key 不适用。
+		// The read-only diagnostics port, backed by the store the run path writes to.
+		Diagnostics: rt.diagnostics,
+		// 写端口（V-8）：入口速率拒绝按 `request_id` 记一条 `quota_decision`。与运行
+		// 路径共用同一个写入器，两类来源的事件落进同一个存储。
+		// The write port used by the ingress middleware; the same recorder as the run path.
+		DiagnosticWriter: rt.diagRecorder,
 	}
 	a.wireManagementPorts(&opts, rt)
 	wireWritePorts(&opts, rt)
+	wireKnowledgePorts(&opts, rt)
 	return opts
+}
+
+// wireKnowledgePorts 把 US-16 的知识 / 历史 / 压缩读面端口逐个投影到 `web.Options`。
+// 与 `wireWritePorts` 同一纪律：**逐槽位判空**，缺件的槽位保持 nil、对应 handler 按
+// 固定 500 失败关闭。判空还挡住另一类事故——把一个裸 nil 指针装进接口会得到"非 nil
+// 接口 + nil 接收者"，handler 的 `== nil` 判据失效，于是恐慌而不是失败关闭。
+//
+// 三个知识槽位来自同一次装配（`wire_knowledge.go`）：`Source` 同时满足来源视图与
+// 引用有效性两个端口，装的是**同一个** `SourceViewer`——两个端口若各装一个实例，
+// "来源视图说看不到"与"有效性说有效"就会同时成立。
+// wireKnowledgePorts projects each US-16 port independently; a bare nil pointer is
+// never boxed into an interface, because that would defeat the handler's nil check.
+func wireKnowledgePorts(opts *web.Options, rt *heavyRuntime) {
+	if rt == nil {
+		return
+	}
+	if k := rt.knowledge; k != nil {
+		if k.Ingest != nil {
+			opts.KnowledgeIngest = k.Ingest
+		}
+		if k.Description != nil {
+			opts.KnowledgeDescription = k.Description
+		}
+		if k.IngestHistory != nil {
+			opts.KnowledgeIngestHistory = k.IngestHistory
+		}
+		if k.Upload != nil {
+			opts.KnowledgeUpload = k.Upload
+		}
+		if k.Search != nil {
+			opts.KnowledgeSearch = k.Search
+		}
+		if k.Source != nil {
+			opts.KnowledgeSource = k.Source
+			opts.EvidenceValidity = k.Source
+		}
+		if k.Catalog != nil {
+			opts.KnowledgeCatalog = k.Catalog
+		}
+	}
+	if rt.history.Search != nil {
+		opts.HistorySearch = rt.history.Search
+	}
+	if rt.history.Exact != nil {
+		opts.HistoryExactRead = rt.history.Exact
+	}
+	if rt.compactionStore != nil {
+		opts.CompactionChain = rt.compactionStore
+	}
 }
 
 // writeServices 是 US-12 写面适配器的装配槽：六个字段与 `web` 包的六组消费方接口
@@ -475,6 +599,16 @@ type resourceAdminPort struct {
 // 编译期断言：15 个方法一旦与端口形状对不上，在这里先红（与 agentAdminPort 同一纪律）。
 // Compile-time assertion: all fifteen methods must match the consumer-side port.
 var _ web.ResourceAdminService = resourceAdminPort{}
+
+// ReadSkillForEdit 只在管理认证之后投影已发布技能的完整文件清单。
+// ReadSkillForEdit projects the verified published file list for administrators.
+func (p resourceAdminPort) ReadSkillForEdit(ctx context.Context, name string) (web.SkillDetailView, error) {
+	detail, err := p.admin.ReadSkillForEdit(ctx, name)
+	if err != nil {
+		return web.SkillDetailView{}, err
+	}
+	return skillDetailView(detail), nil
+}
 
 // UpsertModelConnection 把线上请求投影成编排层请求：空 `ifMatch` 表示创建（POST），
 // 非空表示条件修改（PUT）；发布成功后按资源标识回读一次发布视图。
@@ -1062,7 +1196,7 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		Root:      rt.root,
 		Gate:      rt.agentGate,
 		Ops:       rt.ops,
-		Snapshots: storage.NewSnapshotStore(rt.db),
+		Snapshots: postgres.NewSnapshotStore(rt.db),
 		Registry:  rt.agents,
 		Scheduler: scheduler,
 		// 候选校验走装载器的同一道规则；调度占用基线取**当前**注册表快照——热加载
@@ -1076,8 +1210,9 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		ValidateBindings: SaveBindingCheck(rt.lifecycle, BindingCheckDeps{
 			Resources:      rt.versions,
 			Notify:         rt.notifyAdminStore,
-			NotifyChannels: storage.NewNotifyChannelRepo(rt.db),
+			NotifyChannels: postgres.NewNotifyChannelRepo(rt.db),
 			Credentials:    rt.resolver,
+			Collections:    rt.collections,
 		}),
 		// 受控工具装配（R7 / 宪法约束 11）：与准入读同一份渠道目录与同一份生命周期
 		// 状态文件；系统只会增删 `notify`，且变更随保存结果回显。
@@ -1105,9 +1240,9 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 // systemReader adapts the database and repositories behind the overview; any read
 // failure fails the whole reading instead of fabricating zeros.
 type systemReader struct {
-	db       *storage.DB
-	runs     *storage.RunStore
-	versions *storage.ResourceStore
+	db       *postgres.DB
+	runs     *postgres.RunStore
+	versions *postgres.ResourceStore
 	now      func() time.Time
 }
 
@@ -1117,7 +1252,7 @@ var _ web.SystemReader = systemReader{}
 
 // newSystemReader 组装概览读数适配器；now 为 nil 时退回 time.Now（生产恒传注入时钟）。
 // newSystemReader builds the overview reader; a nil clock falls back to time.Now.
-func newSystemReader(db *storage.DB, runs *storage.RunStore, versions *storage.ResourceStore, now func() time.Time) systemReader {
+func newSystemReader(db *postgres.DB, runs *postgres.RunStore, versions *postgres.ResourceStore, now func() time.Time) systemReader {
 	if now == nil {
 		now = time.Now
 	}
@@ -1253,6 +1388,56 @@ func webBudget(cfg *cli.Config) core.Budget {
 	return budget
 }
 
+// ingressLimitsOf 把 `callers.ingress.*` 原样投影成令牌桶预算（T126）：**不补缺省**，
+// 未配置即零预算，由 `NewRateBucket` 的零预算语义全拒（失败关闭）；负数留给
+// `NewRateBucket` 校验并按装配错误拒绝，本层不截断也不吞。cfg 为 nil → 全零预算。
+// ingressLimitsOf mirrors callers.ingress.* verbatim; nothing is defaulted here, so
+// an unconfigured deployment is denied rather than unlimited.
+func ingressLimitsOf(cfg *cli.Config) callers.IngressLimits {
+	if cfg == nil {
+		return callers.IngressLimits{}
+	}
+	return callers.IngressLimits{
+		Run:    callers.IngressBudget{QPS: float64(cfg.Callers.Ingress.Run.QPS), Burst: cfg.Callers.Ingress.Run.Burst},
+		Ingest: callers.IngressBudget{QPS: float64(cfg.Callers.Ingress.Ingest.QPS), Burst: cfg.Callers.Ingress.Ingest.Burst},
+		Read:   callers.IngressBudget{QPS: float64(cfg.Callers.Ingress.Read.QPS), Burst: cfg.Callers.Ingress.Read.Burst},
+	}
+}
+
+// newIngressLimiter 装配图 6 [1] 的判定器：类别预算来自 `callers.ingress.*`
+// （`ingressLimitsOf`，不补缺省），调用方覆盖来自 `caller_limits.qps/burst`
+// （C-F01，经 TTL 缓存投影，只收紧不放宽）。独立成函数是为了让装配形状**可测**：
+// `newWebServer` 与用例走同一段代码，覆盖不会因为漏传一个参数而静默失效——
+// 这两列在管理台与管理 API 里都对外提供，"配了不生效"正是 C-F01 要消灭的缺陷。
+// 读覆盖失败按错误上抛（中间件回 500 并记 WARN），不伪装成 429、也不退化成"没有
+// 覆盖"；管理面请求在中间件里直接放行、不进本判定器。
+// newIngressLimiter builds admission stage [2]: class budgets from callers.ingress.*
+// plus the per-caller override. It is a function so production and tests share the
+// exact wiring shape; override read failures surface as 500, never as 429.
+func newIngressLimiter(cfg *cli.Config, db *postgres.DB, now func() time.Time) (*callers.Limiter, error) {
+	return newIngressLimiterWith(cfg, postgres.NewQuotaStore(db).IngressBudget, now)
+}
+
+// newIngressLimiterWith 是 newIngressLimiter 的可测内层：读口以函数注入，单元用例
+// 不必起数据库即可判"覆盖端口有没有真的接进 `LimiterDeps`"。少接这个端口正是
+// C-F01 的原始缺陷形态，因此它必须有一条不依赖 PG 的红态。
+// newIngressLimiterWith takes the reader as a function so a unit test can pin the
+// dependency wiring without a database.
+func newIngressLimiterWith(cfg *cli.Config, read ingressLimitReader, now func() time.Time) (*callers.Limiter, error) {
+	buckets, err := callers.NewRateBucket(ingressLimitsOf(cfg), now)
+	if err != nil {
+		return nil, err
+	}
+	deps := callers.LimiterDeps{
+		Buckets:          buckets,
+		IngressOverrides: newIngressLimitCache(read, now),
+	}
+	if cfg != nil {
+		deps.LocalAdminUnlimited = cfg.Callers.LocalAdmin.UnlimitedEnabled()
+	}
+	return callers.NewLimiter(deps), nil
+}
+
 // ensureWorkspaceForServe 是 serve 的幂等兜底初始化（技术方案 §3.1.1）：`basalt init`
 // 不再是启动前的人工前置——serve 先建齐骨架再装配，二次启动逐字节不动既有文件。
 // ensureWorkspaceForServe makes `basalt init` unnecessary before serve; a second
@@ -1295,14 +1480,17 @@ func webProviders(cfg *cli.Config) []web.ProviderInfo {
 	return out
 }
 
-// memoryBackendName 归一化 memory.backend（约束 28）：空 → markdown。装载期已把空串
-// 写回缺省，这里是装配层读**直接构造的** Config 时的第二处同口径落点。
-// memoryBackendName normalizes an empty backend to markdown.
-func memoryBackendName(cfg *cli.Config) string {
-	if cfg == nil || cfg.Memory.Backend == "" {
-		return "markdown"
-	}
-	return cfg.Memory.Backend
+// memoryBackendPostgres 是 `/memory` 视图里 backend 字段的**唯一**取值（契约
+// `MemoryView.backend` 的枚举同样只有它）。
+// memoryBackendPostgres is the single value the contract allows for the view's backend.
+const memoryBackendPostgres = "postgres"
+
+// memoryBackendName 给出 `/memory` 视图的 backend：运行时唯一载体为 PostgreSQL（D-18）。
+// `memory.backend` 已退役（装载期出现即拒绝启动），这里没有取值可读，"空 → 缺省"的
+// 归一随载体开关一起退役。
+// memoryBackendName reports the single runtime backend; the retired config key is not read.
+func memoryBackendName(*cli.Config) string {
+	return memoryBackendPostgres
 }
 
 // agentProfilesPort 是 `/profiles` 的适配器（约束 39）：**已注册条目每次读都取自

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -85,19 +86,27 @@ func toolResultMsg(id, text string) Message {
 }
 
 // toolGroupHistory 造 `rounds` 轮"提问 + 工具调用 + 工具结果"，末尾再附一条**当前**提问。
-// 每轮 3 条消息——这正是"按轮数裁剪 ≠ 按条数裁剪"的判据来源。
+// 每轮 3 条消息——这正是"按轮数裁剪 ≠ 按条数裁剪"的判据来源。消息按生成次序带标识
+// `m1..mN`（真仓储的标识来自 `messages.id`；裁剪记录要求被丢弃消息带真实标识）。
 // toolGroupHistory builds n rounds of question + tool call + tool result, followed by the
 // current question; three messages per round is what makes round-based trimming testable.
+// Messages carry m1..mN ids because the trim record requires real identities.
 func toolGroupHistory(rounds int) []Message {
 	var out []Message
+	seq := 0 // 计数器而非 len(out)：同一次 append 的三个参数会先于 append 求值
+	next := func(m Message) Message {
+		seq++
+		m.ID = fmt.Sprintf("m%d", seq)
+		return m
+	}
 	for i := 1; i <= rounds; i++ {
 		out = append(out,
-			userMsg(fmt.Sprintf("u%d", i)),
-			toolCallMsg(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"f%d.txt"}`, i)),
-			toolResultMsg(fmt.Sprintf("c%d", i), fmt.Sprintf("t%d", i)),
+			next(userMsg(fmt.Sprintf("u%d", i))),
+			next(toolCallMsg(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"f%d.txt"}`, i))),
+			next(toolResultMsg(fmt.Sprintf("c%d", i), fmt.Sprintf("t%d", i))),
 		)
 	}
-	return append(out, userMsg(fmt.Sprintf("u%d", rounds+1)))
+	return append(out, next(userMsg(fmt.Sprintf("u%d", rounds+1))))
 }
 
 // orphanCalls 取历史里"没有结果消息"的工具调用（判定组是否被拆散）。
@@ -119,7 +128,7 @@ func TestPromptBuilder_FourSegmentsInOrder(t *testing.T) {
 	}}
 	env := promptEnv(testSectionOne, 20, []Message{userMsg("读一下 a.txt")}, []string{"read_file"})
 
-	p, err := NewPromptBuilder(resolver).Build(env)
+	p, _, err := NewPromptBuilder(resolver).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Equal(t, testSectionOne, p.System, "段 1 取快照正文；段 2 恒空——两段合成一个字段")
 	require.Len(t, p.History, 1, "段 3")
@@ -142,7 +151,7 @@ func TestPromptBuilder_EmptyToolPoolOmitsTools(t *testing.T) {
 	}}
 	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
 
-	p, err := NewPromptBuilder(resolver).Build(env)
+	p, _, err := NewPromptBuilder(resolver).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Nil(t, p.Tools, "空池 = nil（不是空切片：编码侧据 nil 省略键）")
 	require.Nil(t, env.llmEnv("cli-1-abc", 1, p).Tools, "出站同样不带")
@@ -160,7 +169,7 @@ func TestPromptBuilder_TrimsByTurnsNotByMessages(t *testing.T) {
 	require.Len(t, history, (rounds-1)*3+1, "夹具：每轮 3 条（提问 + 工具调用 + 工具结果）+ 当前提问")
 
 	env := promptEnv(testSectionOne, turns, history, nil)
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	// 25 条提问、保留最近 20 轮 → 从 u6 起：19 轮 × 3 条 + 当前提问 = 58 条。
 	require.Len(t, p.History, (turns-1)*3+1, "按轮保留 = 58 条；按条数保留只会剩 20 条")
@@ -179,7 +188,7 @@ func TestPromptBuilder_KeepsToolGroupsIntact(t *testing.T) {
 	limit := estimateTokens(want)
 	env.Budget.ContextTokens = limit + ReserveTokens // Build 的生效上限恰为 limit
 
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Equal(t, limit, estimateTokens(p), "裁剪恰好停在目标读数（多丢一条即低于它）")
 	require.Len(t, p.History, 4)
@@ -197,7 +206,7 @@ func TestPromptBuilder_TrimsByTokensGroupByGroup(t *testing.T) {
 	limit := estimateTokens(want)
 	env.Budget.ContextTokens = limit + ReserveTokens
 
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Len(t, p.History, 4, "u3 + 该组工具交互 + 当前提问")
 	require.Equal(t, "u3", p.History[0].Content, "跨轮继续丢：u1 + 组1 + u2 + 组2 之后才进预算")
@@ -215,10 +224,40 @@ func TestPromptBuilder_RejectsWhenUntrimmableExceedsBudget(t *testing.T) {
 	env := promptEnv(testSectionOne, 20, toolGroupHistory(3), []string{"read_file"})
 	env.Budget.ContextTokens = 1 // 生效上限 0，连不可裁部分都放不下
 
-	_, err := NewPromptBuilder(resolver).Build(env)
+	_, _, err := NewPromptBuilder(resolver).Build(context.Background(), env, ContextInputs{})
 	require.Error(t, err, "不可裁部分超限只有一个出路：拒绝启动")
 	require.Contains(t, err.Error(), "budget.context_tokens", "错误文本必须点名配置键")
 	require.Contains(t, err.Error(), "不可裁部分", "并说清超限的是哪一部分")
+}
+
+// TestPromptBuilder_MemoryIsUntrimmable 守"记忆属于不可裁部分，放不下就拒绝启动"：
+// 验收点（US-16 §3.1.11：全局层 + Agent 层合并后的记忆与单层走**同一份**上下文预算）——
+// 合并后的记忆只能让本次运行拒绝启动，**不得**被当成历史裁掉、也不得只裁一半。
+// 逆改点：把 `env.memory` 从 `fixedSystem` 挪进可裁的历史段，本用例立刻由红转绿。
+// Memory sits in the untrimmable share: an over-budget combined layer must refuse the run,
+// never be trimmed away like history.
+func TestPromptBuilder_MemoryIsUntrimmable(t *testing.T) {
+	memory := "## 全局记忆\n" + strings.Repeat("共享事实。", 300) +
+		"\n\n## Agent 记忆\n" + strings.Repeat("Agent 偏好。", 300)
+	env := promptEnv(testSectionOne, 20, nil, nil)
+	env.memory = memory
+
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.NoError(t, err, "预算充足时两层记忆原样进段 2")
+	require.Contains(t, p.System, "## 全局记忆")
+	require.Contains(t, p.System, "## Agent 记忆")
+
+	want := estimateTokens(p)
+	env.Budget.ContextTokens = want + ReserveTokens
+	_, _, err = NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.NoError(t, err, "恰好放得下时不得拒绝")
+
+	env.Budget.ContextTokens = want + ReserveTokens - 1
+	got, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.Error(t, err, "记忆放不下只有一个出路：拒绝启动")
+	require.Contains(t, err.Error(), "不可裁部分")
+	require.Contains(t, err.Error(), "budget.context_tokens", "错误文本必须点名配置键")
+	require.Equal(t, Prompt{}, got, "拒绝启动时不得返回被裁过的提示词")
 }
 
 // TestPromptBuilder_KeepsCurrentMessage 守"当前消息不可裁"：
@@ -230,7 +269,7 @@ func TestPromptBuilder_KeepsCurrentMessage(t *testing.T) {
 	want := Prompt{System: testSectionOne, History: msgs[len(msgs)-1:]}
 	env.Budget.ContextTokens = estimateTokens(want) + ReserveTokens
 
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Len(t, p.History, 1, "裁到底也留着当前消息")
 	require.Equal(t, "u4", p.History[0].Content)
@@ -246,7 +285,7 @@ func TestPromptBuilder_NeverTrimsSystemPrompt(t *testing.T) {
 	want := Prompt{System: long, History: msgs[len(msgs)-1:]}
 	env.Budget.ContextTokens = estimateTokens(want) + ReserveTokens
 
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Equal(t, long, p.System, "系统提示词逐字保留")
 	require.Len(t, p.History, 1, "被裁掉的是历史，不是系统提示词")
@@ -268,7 +307,7 @@ func TestPromptBuilder_NeverTrimsToolSpecs(t *testing.T) {
 	want := Prompt{System: testSectionOne, History: msgs[len(msgs)-1:], Tools: resolver.Specs(names)}
 	env.Budget.ContextTokens = estimateTokens(want) + ReserveTokens
 
-	p, err := NewPromptBuilder(resolver).Build(env)
+	p, _, err := NewPromptBuilder(resolver).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Len(t, p.Tools, 2, "工具定义不参与任何一级裁剪")
 	require.Equal(t, "read_file", p.Tools[0].Name, "保序：与 ToolSet 声明顺序一致")
@@ -377,7 +416,7 @@ func TestPromptBuilder_Build_InjectsMemorySegment(t *testing.T) {
 	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
 	env.memory = coreText
 
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Equal(t, testSectionOne+"\n\n"+coreText, p.System,
 		"段 2 拼接形态逐字：段一正文 + 两换行 + 核心区文本")
@@ -389,7 +428,7 @@ func TestPromptBuilder_Build_InjectsMemorySegment(t *testing.T) {
 func TestPromptBuilder_Build_EmptyMemoryIsByteIdenticalToSectionOne(t *testing.T) {
 	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
 	// 空记忆 = 注入位零值（不赋值即空串——与"没有记忆端口"同形）。
-	p, err := NewPromptBuilder(stubResolver{}).Build(env)
+	p, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
 	require.NoError(t, err)
 	require.Equal(t, testSectionOne, p.System, "空记忆不得在系统提示词里留下任何痕迹")
 }
@@ -402,7 +441,7 @@ func TestPromptBuilder_Build_MemoryCountsTowardTokenBudget(t *testing.T) {
 	// 对照组：小预算 + 无记忆 → 放行（该预算本身不构成超限）。
 	control := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
 	control.Budget = Budget{ContextTokens: 8192}
-	_, controlErr := NewPromptBuilder(stubResolver{}).Build(control)
+	_, _, controlErr := NewPromptBuilder(stubResolver{}).Build(context.Background(), control, ContextInputs{})
 	require.NoError(t, controlErr, "对照组：同预算、无记忆必须放行")
 
 	// 实验组：同一预算 + 超大幅核心区（estimateText 下远超 8192 − 1024 余量）→ 拒绝启动。
@@ -410,7 +449,149 @@ func TestPromptBuilder_Build_MemoryCountsTowardTokenBudget(t *testing.T) {
 	over.Budget = Budget{ContextTokens: 8192}
 	over.memory = strings.Repeat("- 偏好\n", 10000)
 
-	_, err := NewPromptBuilder(stubResolver{}).Build(over)
+	_, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), over, ContextInputs{})
 	require.Error(t, err, "段 2 计入 token 估算 → 超预算必须报错（不得静默截断）")
 	require.Contains(t, err.Error(), "budget.context_tokens", "错误文本必须点名配置键")
+}
+
+// TestPromptBuilder_Build_RecordsHistoryTrim 守"装配记录如实记裁剪"：
+// 验收点（§3.4.1 / C-31）——按组丢弃之后，记录里的组数、原因码、策略版本与前后读数
+// 全部来自本轮**真实**装配，不得写占位零值；本 US 未接线压缩，故 `decision` 必须是
+// `none` 而不是空串。
+// 逆改点：把 `DroppedGroups` 写死 0 → 行为断言红；`TokensBefore` 取自裁后读数 →
+// 前后读数相等，`Greater` 断言红；`Decision` 改回零值 → 末条断言红。
+func TestPromptBuilder_Build_RecordsHistoryTrim(t *testing.T) {
+	msgs := toolGroupHistory(3) // 3 组 + 当前提问
+	env := promptEnv(testSectionOne, 20, msgs, nil)
+	want := Prompt{System: testSectionOne, History: msgs[6:]} // 丢 u1 组与 u2 组
+	limit := estimateTokens(want)
+	env.Budget.ContextTokens = limit + ReserveTokens
+
+	p, rec, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.NoError(t, err)
+	require.Equal(t, 2, rec.HistoryTrim.DroppedGroups, "u1 组与 u2 组各计一个完整工具组")
+	require.Equal(t, HistoryTrimReasonGroupDropped, rec.HistoryTrim.ReasonCode, "本 US 唯一裁剪原因码")
+	require.Equal(t, trimStrategyVersion, rec.HistoryTrim.StrategyVersion, "策略版本随策略换字面量")
+	require.Equal(t, estimateTokens(p), rec.HistoryTrim.TokensAfter, "裁剪后读数即本轮真实装配")
+	require.Greater(t, rec.HistoryTrim.TokensBefore, rec.HistoryTrim.TokensAfter, "裁剪前必须高于裁剪后")
+	require.Equal(t, EstimateVersion, rec.EstimatorVersion, "记录里的估算器版本与常量同源")
+	require.Equal(t, env.Budget.ContextTokens, rec.Budget.ContextTokens, "生效预算如实入账")
+	require.Equal(t, ReserveTokens, rec.Budget.ProtocolReserve, "协议余量来自常量，不是配置键")
+	require.Zero(t, rec.Budget.OutputReserve, "输出预留未接线时是 0，不得拿协议余量顶替")
+	require.Equal(t, DecisionNone, rec.Compression.Decision, "未接线压缩：真实结论是 none，不是空串")
+	require.Empty(t, rec.Compression.CompactionID, "没有压缩就没有条目引用")
+	// 夹具 10 条（m1..m10）丢弃 m1..m6：首条被丢弃消息 m1、切点 = 最后一条被丢弃消息 m6。
+	// 逆改点：把标识写成固定串或留空 → 这两条断言红；用"位置推算"而非消息自身的 ID
+	// （如拿保留段首条反推）→ 断言同样红。
+	require.Equal(t, "m1", rec.HistoryTrim.FirstDroppedMessageID, "首条被丢弃消息的标识来自消息自身")
+	require.Equal(t, "m6", rec.HistoryTrim.CutMessageID, "切点 = 最后一条被丢弃消息的标识")
+	require.Empty(t, orphanCalls(p.History), "整组丢弃不得拆散工具组")
+}
+
+// TestPromptBuilder_Build_RefusesToTrimMessagesWithoutID 守"裁剪不得记录猜出来的标识"：
+// 验收点（US-16 裁决 2026-10-28）——被丢弃的消息没有 `Message.ID` 时 `Build` **必须**
+// 报错（fail-closed），而不是把空串或占位符写进装配记录。只**保留**的无标识消息不算
+// 违规：记录只引用被丢弃的两端。
+// 逆改点：把校验改成"空标识就写空串继续" → 本用例由 error 变成功，首条断言红。
+func TestPromptBuilder_Build_RefusesToTrimMessagesWithoutID(t *testing.T) {
+	msgs := toolGroupHistory(3)
+	for i := range msgs {
+		msgs[i].ID = "" // 模拟未经唯一追加路径的历史
+	}
+	env := promptEnv(testSectionOne, 20, msgs, nil)
+	want := Prompt{System: testSectionOne, History: msgs[6:]}
+	env.Budget.ContextTokens = estimateTokens(want) + ReserveTokens // 必然触发丢弃
+
+	_, rec, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.Error(t, err, "被丢弃的消息没有标识 → 拒绝装配，不猜、不留空")
+	require.Contains(t, err.Error(), "message_id", "错误文本必须点名缺的是什么")
+	var zero AssemblyRecord
+	require.Equal(t, zero, rec, "失败时不返回半成品记录")
+}
+
+// TestPromptBuilder_Build_RejectsUnverifiedSummary 守"未经注入前校验的摘要不得进 prompt"：
+// 验收点（§3.1.0 `PromptBuilder` 行 / C-26）——只有 `Validity == SummaryValid` 的摘要可以
+// 注入；零值（未校验）与 `SummaryStale` 一样**必须**拒绝，而不是当作"默认可注入"。
+// 判据面说明：接线前此处守的是"摘要 / 状态尚未接线时必须报错"（P-12）。T090 交付真实注入后，
+// 该断言被本用例取代——同一条 fail-closed 精神落在"未经校验"这道闸门上。
+// 逆改点：把 `Validity != SummaryValid` 改成只拒 `SummaryStale` → 零值断言红；
+// 整条校验删掉 → 前两条断言红；把校验写到"没有摘要就报错" → 对照组红。
+func TestPromptBuilder_Build_RejectsUnverifiedSummary(t *testing.T) {
+	builder := NewPromptBuilder(stubResolver{})
+	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+
+	for _, validity := range []SummaryValidity{"", SummaryStale} {
+		_, _, err := builder.Build(context.Background(), env, ContextInputs{
+			Summary: &CompactionSummary{CompactionID: "cmp-1", Validity: validity, Text: "摘要正文"},
+		})
+		require.ErrorIs(t, err, errSummaryNotInjectable, "Validity=%q 的摘要不得注入", validity)
+	}
+
+	_, _, err := builder.Build(context.Background(), env, ContextInputs{})
+	require.NoError(t, err, "对照组：两者都不带时同一环境必须放行（闸门接在输入上）")
+}
+
+// TestPromptBuilder_Build_InjectsStateAndSummary 守段序与两段真实注入：
+// 验收点（§3.1.0 段序）——系统 + 工具定义 → 记忆冻结 → 结构化状态 → 滚动摘要 → 最近
+// 完整工具组；两段都进 `System`（协议层只有一个 system 消息位），装配记录按同一顺序列出。
+// 逆改点：把状态或摘要拼在记忆之前 → 顺序断言红；只写 `System` 不记 `FinalSegments` →
+// 段落断言红（记录与 prompt 必须同源）。
+func TestPromptBuilder_Build_InjectsStateAndSummary(t *testing.T) {
+	builder := NewPromptBuilder(stubResolver{})
+	env := promptEnv(testSectionOne, 20, []Message{userMsg("你好")}, nil)
+	env.memory = "记忆核心区正文"
+
+	prompt, record, err := builder.Build(context.Background(), env, ContextInputs{
+		State: &StructuredState{
+			Goal:        "把日报写完",
+			Constraints: []ConstraintRef{{Text: "不要动生产库", MessageID: "m1"}},
+			OpenItems:   []OpenItem{{Text: "等值班确认", MessageID: "m2"}},
+			EvidenceRefs: []EvidenceRef{
+				{ID: "kb-state", VersionID: "v1"},
+			},
+		},
+		Summary: &CompactionSummary{
+			CompactionID: "cmp-1", Validity: SummaryValid, Text: "早前聊了报表口径",
+			IncludedRefs: []EvidenceRef{{ID: "kb-a", VersionID: "v1"}},
+			SourceRefs:   []EvidenceRef{{ID: "kb-audit", VersionID: "v1"}},
+		},
+	})
+	require.NoError(t, err)
+
+	memoryAt := strings.Index(prompt.System, "记忆核心区正文")
+	stateAt := strings.Index(prompt.System, "把日报写完")
+	summaryAt := strings.Index(prompt.System, "早前聊了报表口径")
+	require.Positive(t, memoryAt, "记忆段必须在")
+	require.Positive(t, stateAt, "状态段必须在")
+	require.Positive(t, summaryAt, "摘要段必须在")
+	require.Less(t, memoryAt, stateAt, "段序：记忆冻结 → 结构化状态")
+	require.Less(t, stateAt, summaryAt, "段序：结构化状态 → 滚动摘要")
+
+	ids := make([]string, 0, len(record.FinalSegments))
+	for _, seg := range record.FinalSegments {
+		ids = append(ids, seg.ID)
+	}
+	require.Equal(t, []string{segSystem, segMemory, segState, segSummary, segRecent}, ids,
+		"装配记录按同一段序列出本轮实际注入的段落")
+
+	// 来源集合只算实际注入的摘要依赖集与状态引用；摘要的审计集不参与（C-26）。
+	require.ElementsMatch(t, []EvidenceRef{
+		{ID: "kb-a", VersionID: "v1"}, {ID: "kb-state", VersionID: "v1"},
+	}, prompt.EvidenceRefs)
+}
+
+// TestPromptBuilder_Build_ExplicitEmptyRecentWins 守"显式空切片 ≠ nil"：
+// 验收点（§3.1.0 `ContextInputs.Recent`）——显式空切片表示"本次没有近期消息"，
+// **不得**回落到会话历史；nil 才回落。
+// 逆改点：把判空写成 `len(inputs.Recent) == 0` → 第二条断言红（回落成了会话历史）。
+func TestPromptBuilder_Build_ExplicitEmptyRecentWins(t *testing.T) {
+	env := promptEnv(testSectionOne, 20, toolGroupHistory(1), nil)
+
+	fallback, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{})
+	require.NoError(t, err)
+	require.NotEmpty(t, fallback.History, "nil 时回落会话历史")
+
+	empty, _, err := NewPromptBuilder(stubResolver{}).Build(context.Background(), env, ContextInputs{Recent: []Message{}})
+	require.NoError(t, err)
+	require.Empty(t, empty.History, "显式空切片表示没有近期消息，不得回落")
 }

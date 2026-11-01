@@ -1,0 +1,192 @@
+{
+  "format_version": 1,
+  "note": "IDSetSHA256 的 golden vector（§2.11.1）：输入 + 期望摘要。摘要由同一编码器算出后冻结，改动编码器必须先解释为什么旧摘要应当变化。",
+  "vectors": [
+    {
+      "name": "composite_int_text",
+      "key_columns": [
+        "agent_uid",
+        "resource_kind",
+        "ref_name"
+      ],
+      "rows": [
+        {
+          "agent_uid": {
+            "t": "i",
+            "v": "2"
+          },
+          "resource_kind": {
+            "t": "s",
+            "v": "skill"
+          },
+          "ref_name": {
+            "t": "s",
+            "v": "weekly"
+          }
+        },
+        {
+          "agent_uid": {
+            "t": "i",
+            "v": "1"
+          },
+          "resource_kind": {
+            "t": "s",
+            "v": "skill"
+          },
+          "ref_name": {
+            "t": "s",
+            "v": "daily"
+          }
+        },
+        {
+          "agent_uid": {
+            "t": "i",
+            "v": "10"
+          },
+          "resource_kind": {
+            "t": "s",
+            "v": "skill"
+          },
+          "ref_name": {
+            "t": "s",
+            "v": "daily"
+          }
+        }
+      ],
+      "id_set_sha256": "d8aa2158475959d86280440c26d8918a1ed5e61807bc2580aae78cda17afc58b"
+    },
+    {
+      "name": "composite_three",
+      "key_columns": [
+        "run_id",
+        "credential_id",
+        "resource_kind"
+      ],
+      "rows": [
+        {
+          "run_id": {
+            "t": "s",
+            "v": "run-2"
+          },
+          "credential_id": {
+            "t": "s",
+            "v": "cred-b"
+          },
+          "resource_kind": {
+            "t": "s",
+            "v": "provider"
+          }
+        },
+        {
+          "run_id": {
+            "t": "s",
+            "v": "run-1"
+          },
+          "credential_id": {
+            "t": "s",
+            "v": "cred-a"
+          },
+          "resource_kind": {
+            "t": "s",
+            "v": "provider"
+          }
+        }
+      ],
+      "id_set_sha256": "3f2418adf7e3bc99364ad1a67b24b44017d588b918fc9cd9738eb5a4b30ce566"
+    },
+    {
+      "name": "single_int",
+      "key_columns": [
+        "id"
+      ],
+      "rows": [
+        {
+          "id": {
+            "t": "i",
+            "v": "2"
+          }
+        },
+        {
+          "id": {
+            "t": "i",
+            "v": "10"
+          }
+        },
+        {
+          "id": {
+            "t": "i",
+            "v": "1"
+          }
+        }
+      ],
+      "id_set_sha256": "8b6291978e4e2207e87ffda9238edd15fa1c3adc8331f6111dea89a8bc90c31e"
+    },
+    {
+      "name": "null_and_empty_string_are_distinct",
+      "key_columns": [
+        "a",
+        "b"
+      ],
+      "rows": [
+        {
+          "a": {
+            "t": "s",
+            "v": ""
+          },
+          "b": {
+            "t": "s",
+            "v": "x"
+          }
+        },
+        {
+          "a": {
+            "t": "",
+            "v": ""
+          },
+          "b": {
+            "t": "s",
+            "v": "x"
+          }
+        },
+        {
+          "a": {
+            "t": "s",
+            "v": "null"
+          },
+          "b": {
+            "t": "s",
+            "v": "x"
+          }
+        }
+      ],
+      "id_set_sha256": "aa2c6f8680c9202f13c662c139d8b44fea71158329b2a6ee3744de26727f8654"
+    },
+    {
+      "name": "utf8_multibyte",
+      "key_columns": [
+        "name"
+      ],
+      "rows": [
+        {
+          "name": {
+            "t": "s",
+            "v": "技能-乙"
+          }
+        },
+        {
+          "name": {
+            "t": "s",
+            "v": "技能-甲"
+          }
+        },
+        {
+          "name": {
+            "t": "s",
+            "v": "skill-a"
+          }
+        }
+      ],
+      "id_set_sha256": "95cdf878273a6bcf9c3be555e3a3f4f2a06610ec48400b4c27ad08a24a3c34a4"
+    }
+  ]
+}

@@ -19,6 +19,19 @@ const (
 	AgentUIDPrefix = "ag_"
 	// ResourceUIDPrefix 是公共资源稳定身份的前缀。
 	ResourceUIDPrefix = "rs_"
+	// CallerKeyIDPrefix 是调用方 Key 标识的前缀（契约 `CallerKeySummary.key_id`
+	// 冻结为 `key_` + 26 位 Crockford Base32）。
+	// CallerKeyIDPrefix prefixes caller key ids; the contract freezes
+	// `key_` plus 26 Crockford Base32 characters.
+	CallerKeyIDPrefix = "key_"
+	// CallerIDPrefix 是调用方身份的前缀；契约 `CallerSummary.caller_id` 冻结为
+	// `cal_` + 26 位 Crockford Base32。DDL 的 `callers` 表注释同样写 `cal_`
+	// （不校验前缀，只是文档）；L-11 记录过的 `caller_` 笔误已随迁移副本同步修正
+	// （2026-10-30，失败台账「契约副本与迁移副本漂移」行）。
+	// CallerIDPrefix prefixes caller identities; the contract freezes
+	// `cal_` plus 26 Crockford Base32 characters. The DDL comment matches;
+	// the migration copy was synced on 2026-10-30 (run-state R144).
+	CallerIDPrefix = "cal_"
 	// uidPayloadLength 是 Crockford Base32 载荷长度（26 字符 = 130 位）。
 	uidPayloadLength = 26
 	// crockfordAlphabet 是 Crockford Base32 字符集：排除 I / L / O / U 四个易混字符。
@@ -82,6 +95,11 @@ var ErrInvalidAgentUID = errors.New("invalid agent uid")
 // ErrInvalidResourceUID reports a malformed resource UID.
 var ErrInvalidResourceUID = errors.New("invalid resource uid")
 
+// ErrInvalidCallerID 表示调用方身份格式不合法（管理面显式传入 `caller_id` 时
+// 必须校验，不能把任意字符串落库）。
+// ErrInvalidCallerID reports a malformed caller identity.
+var ErrInvalidCallerID = errors.New("invalid caller id")
+
 // NewAgentUID 生成一个新的 Agent 身份；随机源失败时返回错误，不回落到可预测值。
 // NewAgentUID returns a fresh agent UID; randomness failure is reported, never
 // replaced by a predictable fallback.
@@ -103,6 +121,19 @@ func NewResourceUID() (ResourceUID, error) {
 	return ResourceUID(uid), nil
 }
 
+// NewCallerKeyID 生成一个新的调用方 Key 标识（`key_` + 26 位 Crockford Base32）；
+// 随机源失败时返回错误，**不**回落到可预测值——Key 标识进审计与 Principal，
+// 猜得到的标识不可接受。与 NetworkExceptionID 同一条生成纪律。
+// NewCallerKeyID returns a fresh caller key id; randomness failure is reported rather
+// than replaced by a predictable fallback.
+func NewCallerKeyID() (string, error) { return newUID(CallerKeyIDPrefix) }
+
+// NewCallerID 生成一个新的调用方身份（`cal_` + 26 位 Crockford Base32）。
+// 与 Key 标识同一条纪律：随机源失败即报错，**不**回落到可预测值。
+// NewCallerID returns a fresh caller identity; randomness failure is reported rather
+// than replaced by a predictable fallback.
+func NewCallerID() (string, error) { return newUID(CallerIDPrefix) }
+
 // ParseAgentUID 校验并规范化一个 Agent 身份：接受小写输入，输出大写载荷的同值。
 // ParseAgentUID validates and canonicalizes an agent UID; lowercase input is accepted
 // and the returned value carries the canonical uppercase payload.
@@ -122,6 +153,19 @@ func ParseResourceUID(raw string) (ResourceUID, error) {
 		return "", fmt.Errorf("%w: %v", ErrInvalidResourceUID, err)
 	}
 	return ResourceUID(ResourceUIDPrefix + payload), nil
+}
+
+// ParseCallerID 校验并规范化一个调用方身份。契约把 `caller_id` 冻结为
+// `cal_` + 26 位 Crockford Base32，因此管理面显式传入的标识与生成路径走同一
+// 条校验，**不**接受自由字符串。
+// ParseCallerID validates and canonicalizes a caller identity; the contract freezes
+// `cal_` plus 26 Crockford characters, so explicit ids are checked like generated ones.
+func ParseCallerID(raw string) (string, error) {
+	payload, err := splitUID(raw, CallerIDPrefix)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidCallerID, err)
+	}
+	return CallerIDPrefix + payload, nil
 }
 
 // String 返回身份的字符串形态。

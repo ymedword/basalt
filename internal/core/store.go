@@ -21,9 +21,14 @@ import (
 // runID explicitly: Message carries no run field, yet recovery locates half-groups by
 // messages.run_id — without it recovery cannot decide anything.
 type MessageStore interface {
-	// AppendMessage 追加一条消息，`runID` 落 `run_id` 列（system 注入类可为空串 → 列写 NULL）。
-	// AppendMessage appends one message; an empty runID writes NULL into the run_id column.
-	AppendMessage(ctx context.Context, sessionID, runID string, m Message) error
+	// AppendMessage 追加一条消息，`runID` 落 `run_id` 列（system 注入类可为空串 → 列写 NULL），
+	// 并返回该行的持久化标识（`messages.id` 的十进制串）供调用方回填 `Message.ID`——
+	// 装配记录的 `FirstDroppedMessageID` / `CutMessageID` 要的是**真实**主键，不得事后猜。
+	// 实现**不得**在拿不到标识时返回空串加 nil：那种"看起来成功"的写入会让历史缺身份。
+	// AppendMessage appends one message and returns its persisted id (the messages.id
+	// decimal string) so the caller can stamp Message.ID. An empty id with a nil error is
+	// forbidden: that would leave history without identities while looking successful.
+	AppendMessage(ctx context.Context, sessionID, runID string, m Message) (string, error)
 
 	// Messages 按 `seq` 升序取回整个会话历史。
 	// Messages returns the full session history in ascending seq order.
@@ -229,10 +234,14 @@ type ToolInvocationView struct {
 // SessionRecord carries a session row: the read side feeds `session list`, the write
 // side inserts or refreshes the row.
 type SessionRecord struct {
-	ID           string // 由命令面按「渠道 + 用户 + Agent 画像」派生（契约 §5）
-	ProfileName  string
-	Channel      string
-	UserID       string
+	ID          string // 由命令面按「渠道 + 用户 + Agent 画像」派生（契约 §5）
+	ProfileName string
+	Channel     string
+	UserID      string
+	// CallerID 是会话归属调用方（`sessions.caller_id`）：空串写 NULL——迁移遗留的
+	// 无归属会话只允许管理面读取，**不得**用空串冒充某个调用方。
+	// CallerID is the owning caller; an empty value writes NULL (migration legacy).
+	CallerID     string
 	MessageCount int
 	CreatedAt    time.Time
 	LastActiveAt time.Time
@@ -243,14 +252,20 @@ type SessionRecord struct {
 	ArchivedAt *time.Time
 }
 
-// SessionFilter 是会话列表的过滤条件（模块卡 §3.1.26 / 约束 21）：只有 `agent` 与
-// `status` 两维，空字段 = 该维不过滤。`Status` 取 `active` / `archived`——**不是**
-// 任意字符串：调用方（HTTP 层）先校验取值，非法值不得落到 SQL。
-// SessionFilter narrows the session list by agent and status only; an empty field
-// filters nothing, and Status must be one of the two fixed literals.
+// SessionFilter 是会话列表的过滤条件（模块卡 §3.1.26 / 约束 21）：`agent` / `status`
+// 两维，空字段 = 该维不过滤。`Status` 取 `active` / `archived`——**不是**任意字符串：
+// 调用方（HTTP 层）先校验取值，非法值不得落到 SQL。
+//
+// `CallerID` 是**归属强制过滤**（US-16 / T056），与上面两维不同：它不是可选的收窄
+// 条件，而是"调用方只能看自己的行"这条越权边界的载体。空 = 不过滤，只有管理员 /
+// 命令面可以这样用；调用方身份在 web 层先判空再填，退化成全量即越权。
+// SessionFilter narrows the list by agent and status, where an empty field filters
+// nothing. CallerID is different: it carries the ownership boundary, and only the
+// admin or the CLI may leave it empty.
 type SessionFilter struct {
-	Agent  string // 画像名（sessions.profile_name 精确匹配）
-	Status string // active | archived
+	Agent    string // 画像名（sessions.profile_name 精确匹配）
+	Status   string // active | archived
+	CallerID string // 归属调用方；空 = 不过滤（仅管理员 / 命令面）
 }
 
 // RunRecord 是运行账本的**起始行载体**：只含开跑前可知的字段。
@@ -260,12 +275,19 @@ type SessionFilter struct {
 // Status is deliberately absent — the row starts as running and only FinishRun writes
 // a terminal state. An empty SessionID means a stateless run and writes NULL.
 type RunRecord struct {
-	RunID      string
-	SessionID  string
-	Agent      string
-	Channel    string
-	UserID     string
-	Trigger    Trigger // 落库触发方式：scheduler 显式填 cron / manual；空 = 由 storage 按 Channel 映射（cli→user / web→api / scheduler→cron / admin→manual）
-	ConfigHash string  // 本次运行使用的配置快照版本（关联 config_snapshots.hash）
-	StartedAt  time.Time
+	RunID     string
+	SessionID string
+	Agent     string
+	Channel   string
+	UserID    string
+	// Principal 是本次运行的调用方身份（必填）：`caller_id` / `authorizing_kind` /
+	// `key_id` / `actor` 四列都由它派生，**不另设**重复的 CallerID 字段（P-04）。
+	// Principal derives the four ownership columns; no duplicated CallerID field.
+	Principal Principal
+	// ReservationID 是准入预留标识（可空；`runs.reservation_id text`）。
+	// ReservationID is the optional quota reservation id.
+	ReservationID string
+	Trigger       Trigger // 落库触发方式：scheduler 显式填 cron / manual；空 = 由 storage 按 Channel 映射（cli→user / web→api / scheduler→cron / admin→manual）
+	ConfigHash    string  // 本次运行使用的配置快照版本（关联 config_snapshots.hash）
+	StartedAt     time.Time
 }

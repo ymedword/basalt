@@ -129,7 +129,7 @@ func testSignalGraceExhausted(t *testing.T) {
 	requireContains(t, p.combined(), "msg=stop", "调度器停机标记")
 
 	// ⑤ 终态落库：执行行 failed、无 started 残行、任务 last_status 同步。
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM task_executions WHERE status = 'started'`); n != 0 {
 		t.Fatalf("停机后仍有 %d 行 started 执行行：收尾必须用独立 ctx 写终态", n)
 	}
@@ -229,7 +229,7 @@ func testSignalOrder(t *testing.T) {
 	// SIGTERM 之后发出的 MCP 工具调用必须成功：工具结果进了第二次模型请求。
 	requireToolResultContains(t, reqs[1], signalEchoText, "SIGTERM 之后的 MCP 工具结果")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM task_executions WHERE status = 'started'`); n != 0 {
 		t.Fatalf("停机后仍有 %d 行 started 执行行", n)
 	}
@@ -332,7 +332,7 @@ func testSignalOrder(t *testing.T) {
 	}
 	requireContains(t, g.combined(), "msg=stop", "gateway 停机标记")
 
-	dbGateway := openDB(t, hGateway.dbPath())
+	dbGateway := hGateway.openDB(t)
 	if n := scalarInt(t, dbGateway, `SELECT COUNT(*) FROM task_executions WHERE status = 'started'`); n != 0 {
 		t.Fatalf("gateway 停机后仍有 %d 行 started 执行行", n)
 	}

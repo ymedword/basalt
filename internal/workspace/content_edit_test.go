@@ -150,6 +150,93 @@ schedules:
 你是周报助手。
 `
 
+func TestAgentContentChanges_GlobalMemoryChoicePreservesDefinition(t *testing.T) {
+	enabled := true
+	updated, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{IncludeGlobalMemory: &enabled},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(updated), "include_global_memory: true")
+	require.Contains(t, string(updated), "你是周报助手。")
+	disabled := false
+	updated, err = ApplyChanges(updated, core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{IncludeGlobalMemory: &disabled},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(updated), "include_global_memory: false")
+	require.NotContains(t, string(updated), "include_global_memory: true")
+}
+
+// TestAgentContentPatch_ClearIncludeGlobalMemory：`include_global_memory: null` 必须
+// 把该行**删掉**，让 Agent 回到"未声明"（沿用旧规则）。写 false 只是另一种语义
+// （只用 Agent 层），把 false 当"恢复旧规则"会让用户选了就再也回不去。
+// 逆改点：清除分支写成"置 false" → 断言 `NotContains(include_global_memory)` 红。
+// 验收点：D-5；C-52。
+func TestAgentContentPatch_ClearIncludeGlobalMemory(t *testing.T) {
+	enabled := true
+	written, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{IncludeGlobalMemory: &enabled},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(written), "include_global_memory: true")
+
+	cleared, err := ApplyChanges(written, core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{ClearIncludeGlobalMemory: true},
+	})
+	require.NoError(t, err)
+	require.NotContains(t, string(cleared), "include_global_memory",
+		"清除必须删掉整行，不能退化成 false")
+	require.Contains(t, string(cleared), "你是周报助手。", "正文逐字保留")
+	require.Contains(t, string(cleared), "schedules:", "同段的其他键不受影响")
+}
+
+// TestAgentContentPatch_IncludeGlobalMemoryValueAndNullRejected：同一补丁里既写值
+// 又清除是请求形状错误——不得让后写覆盖先写而静默选一个。
+// 逆改点：去掉互斥守卫 → 返回 nil 错误，红。
+// 验收点：D-5；C-52。
+func TestAgentContentPatch_IncludeGlobalMemoryValueAndNullRejected(t *testing.T) {
+	disabled := false
+	_, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{
+			IncludeGlobalMemory:      &disabled,
+			ClearIncludeGlobalMemory: true,
+		},
+	})
+	require.ErrorIs(t, err, ErrEditUnsupported)
+}
+
+// TestAgentContentPatch_ClearAbsentLineIsNoop：字段本来就不存在时清除是幂等 no-op
+// （不是错误）——页面对"已经是旧规则"的 Agent 再点一次"沿用旧规则"必须成功。
+// 逆改点：清除前不做存在性检查、直接报错 → 本用例红。
+// 验收点：D-5；C-52。
+func TestAgentContentPatch_ClearAbsentLineIsNoop(t *testing.T) {
+	require.NotContains(t, editorContent, "include_global_memory")
+	patched, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{
+		Settings: &core.AgentSettingsChanges{ClearIncludeGlobalMemory: true},
+	})
+	require.NoError(t, err)
+	require.Equal(t, editorContent, string(patched), "没有该键时逐字节不变")
+}
+
+func TestAgentContentChanges_KnowledgeDeclarations(t *testing.T) {
+	bindings := []core.KnowledgeBinding{{Name: "手册", Access: core.KnowledgeAccessRead}}
+	updated, err := ApplyChanges([]byte(editorContent), core.AgentContentChanges{Knowledge: &bindings})
+	require.NoError(t, err)
+	parsed, err := ParseKnowledgeBindings(updated)
+	require.NoError(t, err)
+	require.Equal(t, bindings, parsed)
+	require.Contains(t, string(updated), "你是周报助手。")
+	annotated := strings.Replace(string(updated), "  - name:", "  # 保留这条说明\n  - name:", 1)
+	_, err = ApplyChanges([]byte(annotated), core.AgentContentChanges{Knowledge: &bindings})
+	require.ErrorIs(t, err, ErrEditUnsupported)
+	empty := []core.KnowledgeBinding{}
+	updated, err = ApplyChanges(updated, core.AgentContentChanges{Knowledge: &empty})
+	require.NoError(t, err)
+	parsed, err = ParseKnowledgeBindings(updated)
+	require.NoError(t, err)
+	require.Empty(t, parsed)
+}
+
 // editorContentReplaced 是整份替换用例的目标内容：只改描述、模型、工具与任务文案。
 // editorContentReplaced is the whole-file replacement target.
 const editorContentReplaced = `---

@@ -58,6 +58,9 @@ function fixLabel(fix: string): string {
   if (fix === '/console/settings/notifications') {
     return '通知渠道'
   }
+  if (fix === '/console/knowledge') {
+    return '知识库'
+  }
   return '前往修复'
 }
 

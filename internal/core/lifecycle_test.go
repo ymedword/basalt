@@ -416,7 +416,8 @@ func TestAgentService_Lifecycle_AdmissionThreeEntryPoints(t *testing.T) {
 		{
 			name: "HTTP",
 			req: core.RunRequest{
-				Agent: loopAgentName, SessionID: "web-session", Message: "在吗",
+				Principal: core.LocalAdminPrincipal(),
+				Agent:     loopAgentName, SessionID: "web-session", Message: "在吗",
 				Channel: "web", UserID: "tester", Budget: h.budget,
 			},
 		},
@@ -427,7 +428,8 @@ func TestAgentService_Lifecycle_AdmissionThreeEntryPoints(t *testing.T) {
 		{
 			name: "调度器",
 			req: core.RunRequest{
-				Agent: loopAgentName, SessionID: core.DeriveSessionID("scheduler", "scheduler", loopAgentName),
+				Principal: core.LocalAdminPrincipal(),
+				Agent:     loopAgentName, SessionID: core.DeriveSessionID("scheduler", "scheduler", loopAgentName),
 				Message: "在吗", Channel: "scheduler", UserID: "scheduler",
 				Trigger: core.TriggerCron, Budget: h.budget,
 			},

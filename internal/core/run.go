@@ -35,8 +35,27 @@ const roleSystem = "system"
 // RunRequest 承载一次运行的全部输入（显式类型化参数，不放在 context 里——宪法 VII）。
 // RunRequest carries every input of one run as an explicit typed value.
 type RunRequest struct {
-	RunID     string  // 调用方指定；空 = 由 AgentService 生成（web / cli 保持空）
-	Agent     string  // Agent 名（Profile 解析的键）
+	// Principal 是本次运行的调用方身份（**必填**）：缺省或 `!Valid()` 时
+	// `AgentService.Run` 在**任何副作用之前**拒绝并发 `ErrUnauthorized`
+	// （设计 §3.1.0 / C-28 / C-32）。归属（CallerID）、授权来源与执行者都由它
+	// 显式携带——**不得**在运行期从渠道或配置反推，也**不得**用零值补成管理员。
+	// Principal is the mandatory caller identity; an invalid one is rejected with
+	// ErrUnauthorized before any side effect.
+	Principal Principal
+	// ReservationID 是配额预留标识（`quota_reservations.reservation_id`，契约
+	// `schema.pg.sql` 冻结为 text）；无预留时为空。类型以契约为准而不是设计卡的
+	// int64——固定字面量以 `docs/contracts/` 为权威。
+	// ReservationID references the quota reservation, or is empty when unreserved.
+	ReservationID string
+	RunID         string // 调用方指定；空 = 由 AgentService 生成（web / cli 保持空）
+	Agent         string // Agent 名（Profile 解析的键）
+	// RequestID 是**服务端生成**的请求追踪标识（web 的 recoverMiddleware 注入），
+	// 只用于诊断关联（A-F2 / C-F02）：Run 准入发生在 Run 账本创建之前，拒绝时
+	// 没有 run_id 可锚定，request_id 是这类"无 Run 拒绝"的唯一关联键。空串表示
+	// 调用路径没有 HTTP 请求（调度器 / CLI）——诊断层**不得**伪造锚点。
+	// RequestID is the server-generated tracing id; it anchors diagnostic events for
+	// admission denials, which happen before any run row exists. Empty on non-HTTP paths.
+	RequestID string
 	SessionID string  // 会话标识；无状态调用时为空
 	Message   string  // 用户消息
 	Channel   string  // 来源渠道：cli / web / scheduler / admin
@@ -203,7 +222,13 @@ type RunEnv struct {
 	// llmClient is the sole model-call entry: the pinned ProviderService view when
 	// resources are wired, the assembly-time global service otherwise.
 	llmClient ProviderClient
-	agentDir  string // Agent 目录绝对路径（ToolEnv.AgentDir）；空串 = 无 Agent 上下文
+	// summaryClient 是摘要调用专用的**裸协议客户端**（`ResolvedResources.SummaryProvider`，
+	// 准入时冻结）。它不经 `ProviderService` 的两阶段审计——摘要的审计由压缩接线的
+	// `SummaryCallGate` 用 `purpose='compaction'` 自行先写后发（C-25）。nil = 未接压缩。
+	// summaryClient is the raw client for the summary call, pinned at admission; the
+	// compaction gate owns its audit and quota, so it never goes through the chat view.
+	summaryClient ProviderClient
+	agentDir      string // Agent 目录绝对路径（ToolEnv.AgentDir）；空串 = 无 Agent 上下文
 	// skillDirs 是准入固定的技能发布目录（`ResolvedResources.SkillDirs` 的稳定快照）——
 	// 文件工具只在这里列出的版本目录内读；未接资源时为 nil，版本树整体不可读。
 	// skillDirs freezes the admitted skill version directories for the file tools.
@@ -215,6 +240,17 @@ type RunEnv struct {
 	// memory is the core-region text that takes effect for this run, read once at run
 	// start and frozen for the rest of it; an empty string means no memory at all.
 	memory string
+
+	// knowledge 是本次运行的知识注入面（检索一次、运行内不再重检；**权限不冻结**——
+	// 每轮组装前由循环按当前 ACL 复核并原地收窄）。`nil` = 没有片段，段不产生任何字符，
+	// 与未接线知识库的运行逐字节相同。正文只进提示词，**不进**日志 / 诊断 / 装配记录。
+	// knowledge is this run's injection payload; the text is frozen but the permission is
+	// not, and a nil payload adds no characters at all.
+	knowledge *KnowledgeInjection
+	// knowledgeSource 是注入面的装配层端口（检索 / 复核 / 引用解析）。nil = 未接线，
+	// 循环不做轮内复核（零值单测与未配置知识库的装配）。
+	// knowledgeSource backs retrieval, per-round revalidation and citation review.
+	knowledgeSource KnowledgeRunSource
 
 	// pinnedTools / pinnedSpecs 是准入时钉住的工具实例与规格（14D / C4）：注册池可能被
 	// 受控重建整组换掉，本次运行手里的仍是准入那一刻的实例。nil = 未钉（零值单测），
@@ -276,10 +312,20 @@ type Budget struct {
 // ToolEnv is the execution environment passed to every tool, built by the loop before each
 // call and passed by value.
 type ToolEnv struct {
-	RunID     string // 关联审计的 Run
-	SessionID string // 可为空（无状态调用）
-	AgentName string // 空串 = 无 Agent 上下文（如 CLI 顶层调用），**不是**异常
-	AgentDir  string // Agent 目录绝对路径；空串 = 无上下文
+	// ShareGlobalMemory is fixed by the Agent snapshot at run admission.
+	ShareGlobalMemory bool
+	RunID             string // 关联审计的 Run
+	SessionID         string // 可为空（无状态调用）
+	AgentName         string // 空串 = 无 Agent 上下文（如 CLI 顶层调用），**不是**异常
+	AgentDir          string // Agent 目录绝对路径；空串 = 无上下文
+	// Principal 是本次 Run 的**调用方身份**（准入时由 `RunEnv.ToolEnv` 从 `RunRequest`
+	// 原样注入，P-07）：归属（CallerID）与执行者（Actor）都随它显式传递，工具**不得**
+	// 从模型参数、Agent 名或包级状态反推，也**不得**用零值补成管理员。消费方（如
+	// `recall_memory`）必须在触碰载体之前按它判 `Valid()`——每次调用重判，不缓存结论
+	// （冻结内容不冻结权限，C-11）。
+	// Principal is the run's caller identity, injected server-side from the request at
+	// admission; consumers must re-check it per call and never default it to admin.
+	Principal Principal
 	// AgentUID 是本次运行的 Agent 稳定身份（准入时固定）；资源范围判定用 UID、不用名称。
 	AgentUID       AgentUID
 	Timeout        time.Duration // 本次调用生效的超时（工具默认 / Profile 覆盖 / 剩余预算三者取最小，见契约 §6）
@@ -339,6 +385,30 @@ func (b Budget) ToolCallsExhausted(n int) bool { return n >= b.MaxToolCalls }
 // client returns the single model-call entry point; the loop never audits by itself.
 func (e *RunEnv) client() ProviderClient { return e.llmClient }
 
+// ProviderClient 返回本次 Run 在准入时**冻结**的模型客户端（与循环发调用用的是同一个
+// 实例）。压缩的摘要调用必须走这张固定映射表——装配层据此构造 `Summarizer`，而不必
+// 按名字重新解析（原则 III）或经 `context` 传业务状态（原则 VII）。
+// 未装配（测试里的空运行环境）返回 nil，调用方必须自行拒绝。
+// ProviderClient exposes the client frozen at admission so the assembly layer can build
+// the summary caller against that very table.
+func (e *RunEnv) ProviderClient() ProviderClient { return e.llmClient }
+
+// SummaryProvider 返回摘要调用专用的裸协议客户端（准入时冻结，与 `ProviderClient`
+// 来自同一张映射表的同一条目）。**唯一允许的消费方是压缩接线**：它必须在发出之前写好
+// `purpose='compaction'` 的 pending 审计行并完成配额预留——本客户端自己不审计。
+// 未接压缩 / 未接线时返回 nil，装配层据此拒绝压缩（**不得**换用 `ProviderClient`
+// 顶替：那会写出 second purpose='chat' 审计行并绕过 C-25）。
+// SummaryProvider is the raw summary client; its only legal consumer is the compaction
+// wiring, which audits (purpose='compaction') and admits quota before emitting.
+func (e *RunEnv) SummaryProvider() ProviderClient { return e.summaryClient }
+
+// ProviderModel 返回本次 Run 冻结快照里的模型名。摘要策略的 `SummaryModel` 没有独立
+// 配置键，装配层按 Run 取它来填（模块卡"摘要默认复用该 Run 的 Provider 映射与模型"）——
+// 与 `llmEnv` 发给对话调用的是同一个模型名，不是按名字再猜供应商。
+// ProviderModel exposes the model name pinned in this run's snapshot; the compaction
+// policy's SummaryModel has no config key and is filled per run from here.
+func (e *RunEnv) ProviderModel() string { return e.providerRef().Model }
+
 // llmEnv 组装一次模型调用的完整入参：路由与审计关联组取自本运行环境（Provider 是快照
 // 冻结的名字，**只查表不推断**），协议内容组取自本轮组装好的提示词。
 // llmEnv assembles the complete input of one model call: routing and audit bindings from
@@ -379,11 +449,18 @@ func (e *RunEnv) assistantMessage(resp ChatResponse) Message {
 // ToolEnv builds the execution environment of one tool call. The run id is passed in
 // explicitly because the RunEnv field set has no room for it.
 func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
+	shareGlobal := e.Snapshot != nil && e.Snapshot.Profile != nil &&
+		e.Snapshot.Profile.Settings.IncludeGlobalMemory != nil && *e.Snapshot.Profile.Settings.IncludeGlobalMemory
 	return ToolEnv{
-		RunID:          runID,
-		SessionID:      e.Req.SessionID,
-		AgentName:      e.agentName(),
-		AgentDir:       e.agentDir,
+		ShareGlobalMemory: shareGlobal,
+		RunID:             runID,
+		SessionID:         e.Req.SessionID,
+		AgentName:         e.agentName(),
+		AgentDir:          e.agentDir,
+		// 调用方身份由服务端从本次 Run 的请求原样注入（P-07）：**不**从模型参数或 Agent
+		// 名称推断，也**不**在此补默认值——`RunRequest.Principal` 在准入时已强制 `Valid()`。
+		// The caller identity travels from the admitted request untouched.
+		Principal:      e.Req.Principal,
 		AgentUID:       e.AgentUID,
 		Timeout:        e.toolTimeout(ctx),
 		MaxOutputBytes: e.maxOutputBytes(),

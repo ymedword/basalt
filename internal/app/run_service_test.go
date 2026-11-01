@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是运行端口适配器的验收面（颗粒度文档 §3.2.1：internal/app/run_service_test.go，
@@ -11,7 +13,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -19,20 +20,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/web"
 )
 
 // newRunServiceFixture 建一个临时库 + 同一份账本仓储 + 适配器：读面与写面共用一个
 // 实例，正是生产装配的纪律（wire.go 只建一次 runs）。
 // newRunServiceFixture wires one store instance to both faces, mirroring production.
-func newRunServiceFixture(t *testing.T) (*storage.DB, *storage.RunStore, *runService) {
+func newRunServiceFixture(t *testing.T) (*postgres.DB, *postgres.RunStore, *runService) {
 	t.Helper()
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(t.TempDir(), "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	runs := storage.NewRunStore(db)
+	db := pgtest.NewTestDB(t)
+	runs := postgres.NewRunStore(db)
 	svc := core.NewAgentService(core.ServiceOptions{
 		Runs:   runs,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -45,14 +44,17 @@ func newRunServiceFixture(t *testing.T) (*storage.DB, *storage.RunStore, *runSer
 // seedRunServiceRow 预写一行运行账本；非 running 的目标状态在同一事务语义下经
 // FinishRun 写入（与生产路径同一个写入口）。
 // seedRunServiceRow pre-writes one ledger row and finishes it through the same entry.
-func seedRunServiceRow(t *testing.T, runs *storage.RunStore, runID, agent string,
+func seedRunServiceRow(t *testing.T, runs *postgres.RunStore, runID, agent string,
 	startedAt time.Time, status core.RunStatus,
 ) {
 	t.Helper()
 	ctx := context.Background()
 	// 零清单 = 装配未接线：只写运行行，读取面如实呈现"未记录"（约束 24）。
+	// PostgreSQL 的归属列（caller_id / authorizing_kind / actor）为 NOT NULL +
+	// CHECK，Run 必须携带有效 Principal——夹具按管理面身份建行，读面无归属断言。
 	require.NoError(t, runs.StartRun(ctx, core.RunRecord{
-		RunID: runID, Agent: agent, Channel: "web", UserID: "u-1", StartedAt: startedAt,
+		RunID: runID, Agent: agent, Channel: "web", UserID: "u-1",
+		Principal: core.LocalAdminPrincipal(), StartedAt: startedAt,
 	}, core.RunResourceManifest{}))
 	if status != core.StatusRunning {
 		require.NoError(t, runs.FinishRun(ctx, runID, status, "", 1, 0, startedAt.Add(time.Minute)))
@@ -85,7 +87,7 @@ func TestRunService_SatisfiesWebRunService(t *testing.T) {
 // Run must delegate: the zero-value service reports an unknown agent through core's error.
 func TestRunService_RunDelegatesToAgentService(t *testing.T) {
 	adapter := NewRunService(core.NewAgentService(core.ServiceOptions{}), nil)
-	res, err := adapter.Run(context.Background(), core.RunRequest{Agent: "ghost"})
+	res, err := adapter.Run(context.Background(), core.RunRequest{Principal: core.LocalAdminPrincipal(), Agent: "ghost"})
 	var notFound *core.AgentNotFoundError
 	require.ErrorAs(t, err, &notFound, "Run 必须原样返回 core 的准入错误")
 	require.Equal(t, "ghost", notFound.Name)

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,29 +47,41 @@ func NewSessionStore(db *DB) *SessionStore { return &SessionStore{db: db} }
 // 调用方以为消息落了库——那正是"内存里有、库里没有"的历史分叉。
 // An empty session id is refused rather than silently ignored: a silent no-op would let the
 // caller believe the message was persisted.
-func (s *SessionStore) AppendMessage(ctx context.Context, sessionID, runID string, m core.Message) error {
+// 返回值为 `messages.id` 的十进制串：调用方（`core.Session`）用它回填 `Message.ID`，
+// 装配记录与压缩条目据此指向**真实**行。事务提交失败时返回空串与错误——标识只有在
+// 行确实落下之后才成立。
+// The returned decimal string is the persisted messages.id; a failed transaction returns
+// an empty id because the identity only exists once the row is really there.
+func (s *SessionStore) AppendMessage(ctx context.Context, sessionID, runID string, m core.Message) (string, error) {
 	if sessionID == "" {
-		return errors.New("追加会话消息: 空会话标识——无状态会话只在内存，不落消息历史")
+		return "", errors.New("追加会话消息: 空会话标识——无状态会话只在内存，不落消息历史")
 	}
 	// 时间取本语句执行时刻：冻结签名（颗粒度文档 §3.1）里没有时间位，而 `created_at`
 	// 是 NOT NULL 的"这一时刻"。与 `ToolInvocationRepo.BeginInvocation` 同一手法、同一理由。
 	// The frozen signature carries no clock, so the row stamps the moment of the write —
 	// the same treatment BeginInvocation gives its started_at column.
-	return withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
-		return appendMessage(ctx, conn, sessionID, runID, m, time.Now())
+	var id string
+	err := withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
+		var err error
+		id, err = appendMessage(ctx, conn, sessionID, runID, m, time.Now())
+		return err
 	})
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // Messages 按 `seq` 升序取回整个会话历史（空会话标识 → 空历史，无历史即是无状态会话的
-// 正确答案，不是错误）。
-// Messages returns the whole session history in ascending seq order; an empty session id
-// yields an empty history.
+// 正确答案，不是错误）。每条都填 `Message.ID`（`messages.id` 的十进制串）。
+// Messages returns the whole session history in ascending seq order with Message.ID
+// filled; an empty session id yields an empty history.
 func (s *SessionStore) Messages(ctx context.Context, sessionID string) ([]core.Message, error) {
 	if sessionID == "" {
 		return nil, nil
 	}
 	rows, err := s.db.read.QueryContext(ctx,
-		`SELECT content, role, tool_calls, tool_call_id, reasoning_content, provider_extra
+		`SELECT id, content, role, tool_calls, tool_call_id, reasoning_content, provider_extra
 		   FROM messages WHERE session_id = ? ORDER BY seq`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("读会话历史（session_id=%s）: %w", sessionID, err)
@@ -76,8 +90,11 @@ func (s *SessionStore) Messages(ctx context.Context, sessionID string) ([]core.M
 
 	var out []core.Message
 	for rows.Next() {
-		var content, role, calls, callID, reasoning, extra sql.NullString
-		if err := rows.Scan(&content, &role, &calls, &callID, &reasoning, &extra); err != nil {
+		var (
+			id                                             int64
+			content, role, calls, callID, reasoning, extra sql.NullString
+		)
+		if err := rows.Scan(&id, &content, &role, &calls, &callID, &reasoning, &extra); err != nil {
 			return nil, fmt.Errorf("读会话历史（session_id=%s）: %w", sessionID, err)
 		}
 		parsedCalls, err := parseToolCalls(calls.String)
@@ -90,6 +107,7 @@ func (s *SessionStore) Messages(ctx context.Context, sessionID string) ([]core.M
 			return nil, fmt.Errorf("读会话历史（session_id=%s）: %w", sessionID, err)
 		}
 		out = append(out, core.Message{
+			ID:               strconv.FormatInt(id, 10),
 			Role:             role.String,
 			Content:          content.String,
 			ToolCalls:        parsedCalls,
@@ -194,7 +212,7 @@ func (s *SessionStore) ArchiveSession(ctx context.Context, id string, at time.Ti
 // included (the SQL runs DESC LIMIT and the slice is reversed in Go).
 func (s *SessionStore) MessagesTail(ctx context.Context, id string, limit int) ([]core.Message, error) {
 	rows, err := s.db.read.QueryContext(ctx,
-		`SELECT content, role, tool_calls, tool_call_id, reasoning_content,
+		`SELECT id, content, role, tool_calls, tool_call_id, reasoning_content,
 		        provider_extra, created_at
 		   FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`, id, limit)
 	if err != nil {
@@ -205,10 +223,11 @@ func (s *SessionStore) MessagesTail(ctx context.Context, id string, limit int) (
 	var out []core.Message
 	for rows.Next() {
 		var (
+			msgID                                          int64
 			content, role, calls, callID, reasoning, extra sql.NullString
 			createdAt                                      int64
 		)
-		if err := rows.Scan(&content, &role, &calls, &callID, &reasoning, &extra, &createdAt); err != nil {
+		if err := rows.Scan(&msgID, &content, &role, &calls, &callID, &reasoning, &extra, &createdAt); err != nil {
 			return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
 		}
 		parsedCalls, err := parseToolCalls(calls.String)
@@ -221,6 +240,7 @@ func (s *SessionStore) MessagesTail(ctx context.Context, id string, limit int) (
 			return nil, fmt.Errorf("读会话尾窗（session_id=%s）: %w", id, err)
 		}
 		out = append(out, core.Message{
+			ID:               strconv.FormatInt(msgID, 10),
 			Role:             role.String,
 			Content:          content.String,
 			ToolCalls:        parsedCalls,
@@ -297,6 +317,15 @@ const (
 )
 
 func (s *SessionStore) ListSessions(ctx context.Context, filter core.SessionFilter) ([]core.SessionRecord, error) {
+	if filter.CallerID != "" {
+		// 归属过滤是 US-16 / T056 才引入的读面，PostgreSQL 侧的 `sessions.caller_id`
+		// 在 SQLite v6 谱系里**不存在**（该列随 PG 谱系自 v1 起就有，SQLite 已冻结不再
+		// 追加迁移）。这里**必须**失败关闭：静默忽略过滤条件会把全量列表当成"这个
+		// 调用方的会话"返回，是本模块最严重的越权形态。
+		// The SQLite v6 lineage has no caller_id column and never gains one, so an
+		// ownership filter fails closed instead of silently listing everything.
+		return nil, fmt.Errorf("列出会话: SQLite v6 谱系不支持归属过滤（caller_id）")
+	}
 	var (
 		query string
 		args  []any
@@ -366,17 +395,27 @@ func (s *SessionStore) ListSessions(ctx context.Context, filter core.SessionFilt
 // 插入的行对本语句可见——多组补齐天然接着编号。`ex` 收执行面（`*sql.DB` / `*sql.Conn`）。
 // The seq subquery sees rows inserted earlier in the same transaction, so successive
 // repairs continue the numbering without any per-session cache.
-func appendMessage(ctx context.Context, ex sqlExecutor, sessionID, runID string, m core.Message, createdAt time.Time) error {
+func appendMessage(ctx context.Context, ex sqlExecutor, sessionID, runID string, m core.Message, createdAt time.Time) (string, error) {
+	// 正文先过可存储性清洗（与 `core.Session.AppendMessage` 同一份判据）：本函数是
+	// `messages` 表的唯一插入点，崩溃恢复在事务内直写消息、不经过会话类型——与 PostgreSQL
+	// 谱系同一口径，避免两个后端的消息正文在恢复路径上分叉。
+	// Same wash as the PostgreSQL lineage: one criterion for both backends' INSERT points.
+	core.SanitizeMessage(&m, func(field string, replaced int) {
+		slog.Default().Warn("消息正文含无法承载的字节，已替换为 U+FFFD",
+			"session_id", sessionID, "run_id", runID, "role", m.Role,
+			"tool_call_id", m.ToolCallID, "field", field, "replaced_bytes", replaced)
+	})
+
 	calls, err := encodeToolCallsJSON(m.ToolCalls)
 	if err != nil {
-		return err
+		return "", err
 	}
 	extra, err := encodeProviderExtra(m.ProviderExtra)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	if _, err := ex.ExecContext(ctx,
+	ins, err := ex.ExecContext(ctx,
 		`INSERT INTO messages
 		   (session_id, run_id, seq, role, content, tool_calls, tool_call_id, reasoning_content,
 		    provider_extra, created_at)
@@ -385,26 +424,35 @@ func appendMessage(ctx context.Context, ex sqlExecutor, sessionID, runID string,
 		sessionID, nullIfEmpty(runID), sessionID, m.Role, nullIfEmpty(m.Content),
 		nullIfEmpty(calls), nullIfEmpty(m.ToolCallID), nullIfEmpty(m.ReasoningContent),
 		nullIfEmpty(extra), createdAt.UnixMilli(),
-	); err != nil {
-		return fmt.Errorf("追加会话消息（session_id=%s, role=%s）: %w", sessionID, m.Role, err)
+	)
+	if err != nil {
+		return "", fmt.Errorf("追加会话消息（session_id=%s, role=%s）: %w", sessionID, m.Role, err)
+	}
+	// 新行的 `messages.id` 是这条消息的**身份**：装配记录与压缩条目都指向它。
+	// 拿不到就如实失败——没有标识的历史行无法被任何记录引用。
+	// The new row's messages.id is the message's identity; failing to read it back makes
+	// the row unreferenceable, so it is an error rather than an empty success.
+	id, err := ins.LastInsertId()
+	if err != nil {
+		return "", fmt.Errorf("读回会话消息标识（session_id=%s, role=%s）: %w", sessionID, m.Role, err)
 	}
 
 	res, err := ex.ExecContext(ctx,
 		`UPDATE sessions SET message_count = message_count + 1 WHERE session_id = ?`, sessionID)
 	if err != nil {
-		return fmt.Errorf("递增会话消息计数（session_id=%s）: %w", sessionID, err)
+		return "", fmt.Errorf("递增会话消息计数（session_id=%s）: %w", sessionID, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("确认会话消息计数写入（session_id=%s）: %w", sessionID, err)
+		return "", fmt.Errorf("确认会话消息计数写入（session_id=%s）: %w", sessionID, err)
 	}
 	if affected == 0 {
 		// 消息行已因外键保证有会话行；真走到这里说明口径被绕过，如实报错而不是让计数静默落后。
 		// The foreign key guarantees a session row exists; a miss means the invariant was
 		// bypassed and the counter would silently lag behind.
-		return fmt.Errorf("递增会话消息计数（session_id=%s）: 会话行不存在", sessionID)
+		return "", fmt.Errorf("递增会话消息计数（session_id=%s）: 会话行不存在", sessionID)
 	}
-	return nil
+	return strconv.FormatInt(id, 10), nil
 }
 
 // encodeToolCallsJSON 把工具调用编码成 `tool_calls` 列的 JSON 数组（DDL 注释里的

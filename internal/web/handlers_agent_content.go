@@ -80,9 +80,10 @@ type changesBody struct {
 	// Bindings 是 `resource_bindings` 的整块替换（契约 agent-md §2.3）：nil = 不改，
 	// 非 nil（含空数组）= 以该数组为唯一内容。服务端不按名补绑、不重新解析 UID。
 	// Bindings replaces the whole resource_bindings block; nil leaves it untouched.
-	Bindings  *[]bindingChangeBody `json:"bindings"`
-	Settings  *settingsChangesBody `json:"settings"`
-	Schedules *[]json.RawMessage   `json:"schedules"`
+	Bindings  *[]bindingChangeBody     `json:"bindings"`
+	Settings  *settingsChangesBody     `json:"settings"`
+	Knowledge *[]core.KnowledgeBinding `json:"knowledge"`
+	Schedules *[]json.RawMessage       `json:"schedules"`
 }
 
 // bindingChangeBody 是 `changes.bindings` 的一个元素（契约 agent-md §2.3）：
@@ -135,11 +136,36 @@ func (o *optionalFloatBody) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// optionalBoolBody 与 optionalFloatBody 同形：区分"字段未出现"（不修改）与"显式
+// null"（清除该键，回到未声明）。三态的 `include_global_memory` 需要它——只用 *bool
+// 时 null 和缺省都是 nil，"回到旧规则"根本表达不出来。
+// optionalBoolBody mirrors optionalFloatBody so an explicit null can mean "remove the
+// key" while an absent field still means "leave unchanged".
+type optionalBoolBody struct {
+	Set   bool
+	Value *bool
+}
+
+func (o *optionalBoolBody) UnmarshalJSON(raw []byte) error {
+	o.Set = true
+	if string(raw) == "null" {
+		o.Value = nil
+		return nil
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	o.Value = &value
+	return nil
+}
+
 // settingsChangesBody 是 settings 段补丁的线上形状。
 // settingsChangesBody is the wire shape of the settings patch.
 type settingsChangesBody struct {
-	MaxIterations   *int `json:"max_iterations"`
-	MaxHistoryTurns *int `json:"max_history_turns"`
+	MaxIterations       *int             `json:"max_iterations"`
+	MaxHistoryTurns     *int             `json:"max_history_turns"`
+	IncludeGlobalMemory optionalBoolBody `json:"include_global_memory"`
 }
 
 // handleGetAgentContent 读取 AGENT.md 原文与强 ETag：ETag 同时写响应头与
@@ -316,9 +342,16 @@ func (b *changesBody) toCore() (core.AgentContentChanges, error) {
 	}
 	if b.Settings != nil {
 		out.Settings = &core.AgentSettingsChanges{
-			MaxIterations:   b.Settings.MaxIterations,
-			MaxHistoryTurns: b.Settings.MaxHistoryTurns,
+			MaxIterations:       b.Settings.MaxIterations,
+			MaxHistoryTurns:     b.Settings.MaxHistoryTurns,
+			IncludeGlobalMemory: b.Settings.IncludeGlobalMemory.Value,
 		}
+		if b.Settings.IncludeGlobalMemory.Set {
+			out.Settings.ClearIncludeGlobalMemory = b.Settings.IncludeGlobalMemory.Value == nil
+		}
+	}
+	if b.Knowledge != nil {
+		out.Knowledge = b.Knowledge
 	}
 	if b.Schedules != nil {
 		items := make([]core.Schedule, 0, len(*b.Schedules))

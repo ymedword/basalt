@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是通知渠道写面的回归（颗粒度文档 §3.1.7 / 约束 38，check
@@ -21,7 +23,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -33,9 +36,9 @@ import (
 type notifyEnv struct {
 	t     *testing.T
 	root  string
-	db    *storage.DB
-	store *storage.NotifyAdminStore
-	ops   *storage.ManagementStore
+	db    *postgres.DB
+	store *postgres.NotifyAdminStore
+	ops   *postgres.ManagementStore
 	deps  NotifyAdminDeps
 	admin *NotifyAdmin
 	logs  *bytes.Buffer
@@ -61,25 +64,22 @@ func newNotifyEnv(t *testing.T, mutate ...func(*NotifyAdminDeps)) *notifyEnv {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(root, "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
 	logger, logs := newCapturedLogger()
 	env := &notifyEnv{
 		t:     t,
 		root:  root,
 		db:    db,
-		store: storage.NewNotifyAdminStore(db),
-		ops:   storage.NewManagementStore(db),
+		store: postgres.NewNotifyAdminStore(db),
+		ops:   postgres.NewManagementStore(db),
 		logs:  logs,
 	}
 	env.deps = NotifyAdminDeps{
 		Root:       root,
 		Store:      env.store,
-		Bindings:   storage.NewBindingStore(db),
-		RunRefs:    storage.NewNotifyDeliveryStore(db),
+		Bindings:   postgres.NewBindingStore(db),
+		RunRefs:    postgres.NewNotifyDeliveryStore(db),
 		Operations: env.ops,
 		Types:      notifyTypeNames(),
 		Policy: tool.NewWhitelistPolicy(tool.PolicyOptions{
@@ -168,7 +168,7 @@ func TestNotifyAdmin_CreateAndUpdate(t *testing.T) {
 	}
 	require.Equal(t, core.CredentialModeEnv, created.CredentialMode)
 
-	sent, err := storage.NewNotifyChannelRepo(env.db).ListNotifyChannels(context.Background())
+	sent, err := postgres.NewNotifyChannelRepo(env.db).ListNotifyChannels(context.Background())
 	require.NoError(t, err)
 	require.Len(t, sent, 1)
 	require.Equal(t, "${BASALT_TEST_OPS_HOOK}", sent[0].URL, "发送读面必须看到写面刚落下的同一行")
@@ -212,7 +212,7 @@ func TestNotifyAdmin_CreateWithoutURL(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, stored.URL, "空地址必须照存（暂不可发送是合法状态）")
 
-	sent, err := storage.NewNotifyChannelRepo(env.db).ListNotifyChannels(context.Background())
+	sent, err := postgres.NewNotifyChannelRepo(env.db).ListNotifyChannels(context.Background())
 	require.NoError(t, err)
 	require.Len(t, sent, 1)
 	require.Empty(t, sent[0].URL)
@@ -643,12 +643,12 @@ func freezeNotifyRef(t *testing.T, env *notifyEnv, runID string, agentUID core.A
 ) {
 	t.Helper()
 	startedAt := baselineClock()
-	require.NoError(t, storage.NewRunStore(env.db).StartRun(context.Background(),
+	require.NoError(t, postgres.NewRunStore(env.db).StartRun(context.Background(),
 		core.RunRecord{
 			RunID: runID, Agent: "billing-agent", Channel: "cli", UserID: "tester",
-			StartedAt: startedAt,
+			Principal: core.LocalAdminPrincipal(), StartedAt: startedAt,
 		}, core.RunResourceManifest{}))
-	require.NoError(t, storage.NewNotifyDeliveryStore(env.db).FreezeRef(context.Background(),
+	require.NoError(t, postgres.NewNotifyDeliveryStore(env.db).FreezeRef(context.Background(),
 		core.RunNotifyRef{
 			RunID: runID, AgentUID: agentUID,
 			ChannelUID: channel.ResourceUID, ChannelName: channel.Name,
@@ -670,7 +670,7 @@ func TestNotifyDelete_NamesReferrers(t *testing.T) {
 	// 证据一：绑定投影（不写 AGENT.md 正文，证明 UID 投影自身就能拦住删除）。
 	boundAgentUID, err := core.NewAgentUID()
 	require.NoError(t, err)
-	require.NoError(t, storage.NewBindingStore(env.db).Rebuild(context.Background(),
+	require.NoError(t, postgres.NewBindingStore(env.db).Rebuild(context.Background(),
 		boundAgentUID, "billing-agent", "sha256:fixture",
 		core.ResourceBindings{NotifyChannels: []core.ResourceBinding{
 			{Name: channel.Name, UID: channel.ResourceUID},
@@ -718,7 +718,7 @@ name: digest-agent
 
 	_, err = env.stored("ops")
 	require.NoError(t, err, "被引用的渠道不得被删除")
-	refs, err := storage.NewNotifyDeliveryStore(env.db).UnreleasedRunsByChannel(
+	refs, err := postgres.NewNotifyDeliveryStore(env.db).UnreleasedRunsByChannel(
 		context.Background(), channel.ResourceUID)
 	require.NoError(t, err)
 	require.Equal(t, []string{pendingRun}, refs, "拒绝删除不得释放冻结")
@@ -796,7 +796,7 @@ name: digest-agent
 		deletes := env.rows(core.ActionNotifyChannelDelete)
 		require.Len(t, deletes, 1)
 		require.Equal(t, core.OperationSuccess, deletes[0].Status)
-		require.Contains(t, string(deletes[0].DetailJSON), `"forced":true`)
+		require.Equal(t, true, detailMap(t, deletes[0].DetailJSON)["forced"])
 	})
 }
 
@@ -1054,7 +1054,7 @@ func TestNotifyAdmin_ManagedWriteFailClosed(t *testing.T) {
 func TestNotifyAdmin_CreateExclusiveScope(t *testing.T) {
 	ctx := context.Background()
 	env := newNotifyEnv(t)
-	versions := storage.NewResourceStore(env.db)
+	versions := postgres.NewResourceStore(env.db)
 	env.deps.Scopes = &ScopeService{
 		Resources: versions, Agents: versions, WorkspaceRoot: env.root, Now: baselineClock,
 	}

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷内网访问例外的管理服务（14D / D-13；契约 §9.4 的 `network_exception.*`
@@ -10,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,15 +19,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
 // exceptionEnv 是例外服务的共享夹具：真库 + 真管理操作仓储 + 真策略实例。
 type exceptionEnv struct {
 	service *NetworkExceptionService
-	store   *storage.NetworkExceptionStore
-	ops     *storage.ManagementStore
+	store   *postgres.NetworkExceptionStore
+	ops     *postgres.ManagementStore
 	policy  *tool.WhitelistPolicy
 	logs    *bytes.Buffer
 }
@@ -37,13 +39,10 @@ func exceptionClock() time.Time { return time.Date(2026, 10, 26, 9, 15, 0, 0, ti
 // newExceptionEnv 装配夹具；`mutate` 可替换 store / operations。
 func newExceptionEnv(t *testing.T, mutate func(*NetworkExceptionDeps)) *exceptionEnv {
 	t.Helper()
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(t.TempDir(), "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	store := storage.NewNetworkExceptionStore(db)
-	ops := storage.NewManagementStore(db)
+	store := postgres.NewNetworkExceptionStore(db)
+	ops := postgres.NewManagementStore(db)
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{Root: t.TempDir()})
 	logger, logs := newCapturedLogger()
 
@@ -150,8 +149,9 @@ func TestExecutionProfile_NetworkException(t *testing.T) {
 		require.Equal(t, "token:abc123", rec.ActorSubject)
 		require.Equal(t, core.OperationSuccess, rec.Status)
 		require.Equal(t, "OK", rec.ResultCode)
-		require.Contains(t, string(rec.DetailJSON), `"kind":"host"`)
-		require.Contains(t, string(rec.DetailJSON), `"value":"api.example.com"`)
+		detail := detailMap(t, rec.DetailJSON)
+		require.Equal(t, "host", detail["kind"])
+		require.Equal(t, "api.example.com", detail["value"])
 		require.Contains(t, string(rec.DetailJSON), "内网财务系统联调", "放行理由属审计内容")
 	})
 

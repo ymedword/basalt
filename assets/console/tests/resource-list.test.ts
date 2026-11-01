@@ -186,6 +186,27 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+describe('skill list', () => {
+  it('shows descriptions only from the matching published version and labels run references', async () => {
+    const base = { path: '', description: '', version_no: 1, content_hash: 'hash', etag: 'etag', file_count: 1, referenced_by: [] }
+    await signIn((call) => {
+      if (call.path === '/api/v1/skills') return [
+        { ...base, name: 'alpha', version_id: 1, referenced_by: ['run-123'] },
+        { ...base, name: 'beta', version_id: 1 },
+      ]
+      if (call.path === '/api/v1/admin/skills/alpha/edit') return { ...base, name: 'alpha', version_id: 1, description: '汇总仓库变化' }
+      if (call.path === '/api/v1/admin/skills/beta/edit') return { ...base, name: 'beta', version_id: 2, description: '新版简介' }
+      return undefined
+    })
+    await visit('/console/resources/skills')
+    expect(wrapper!.text()).toContain('汇总仓库变化')
+    expect(wrapper!.text()).toContain('版本已更新，请刷新')
+    expect(wrapper!.text()).not.toContain('新版简介')
+    expect(wrapper!.text()).toContain('运行占用（Run ID）')
+    expect(wrapper!.text()).toContain('run-123')
+  })
+})
+
 describe('model connection list', () => {
   it('lists only name, default model, scope and local readiness', async () => {
     await signIn((call) => (call.path === '/api/v1/model-connections' ? connections : undefined))

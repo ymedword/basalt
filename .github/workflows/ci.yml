@@ -1,10 +1,17 @@
 name: CI
 
 # job 按工具链边界拆分，不是"跑得快"：
-#   test    job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑全量门禁；
-#   console job —— Node 前端工具链（npm ci / test / build + 产物可复现）。**必须**独立成
-#                  job：Go 门禁不调用 Node / npm，本机没有 Node 时 `make check` 照常判卷；
-#   build   job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
+#   test     job —— 默认开 CGO（`-race` 需要 cgo 运行时与 C 编译器），跑**全量门禁**；
+#                   自 T125 / D-01 起 `test-integration`、`test-pg` 与 `cover` 缺 DSN 即失败，
+#                   故本 job 也带 PostgreSQL service——单元测试本身不读 DSN，外部引擎只
+#                   在这三个目标里出现。`test-pg`（T136）是引擎层唯一的 `-race` 面，包范围
+#                   是 `test-integration` 的子集但判据面不是，两者都保留；
+#   postgres job —— 独立的引擎判据：真实 PostgreSQL 17.11 + pgvector 0.8.7 服务容器，
+#                   先 fail-closed 断言扩展版本，同 job 内跑 `-tags=integration`；
+#                   镜像 tag 在两处写死且相同；
+#   console  job —— Node 前端工具链（npm ci / test / build + 产物可复现）。**必须**独立成
+#                   job：Go 门禁不调用 Node / npm，本机没有 Node 时 `make check` 照常判卷；
+#   build    job —— `CGO_ENABLED=0` 四平台交叉编译，验证单二进制承诺，**不得**跑 -race。
 # 参见 docs/DevelopmentLoop.md §2.2 的"三条实测纪律"；前端约束见模块卡约束 42。
 #
 # 触发面覆盖**所有分支**（`'**'` 只匹配分支、不匹配 tag）：US 分支一推即判卷，
@@ -21,10 +28,33 @@ permissions:
 
 jobs:
   test:
-    # 名称是 main 分支保护的必过检查（contexts 逐字匹配），**不得**改名。
+    # 名称是 main 分支保护的必过检查（contexts 逐字匹配），**不得**改名。名称里没列
+    # `test-pg` 是因为改名会挡住所有 PR，不是因为它不跑——它随 `--profile ci` 执行。
     # This exact name is a required status check on main; renaming it blocks every PR.
     name: test（默认 CGO：fmt / lint / sec / test / test-integration / cover）
     runs-on: ubuntu-latest
+    # T125 / D-01：`test-integration`、`test-pg` 与 `cover` 缺 BASALT_TEST_PG_DSN 即失败，
+    # 而本 job 跑全量门禁——service 因此是**判据前提**，不是可选加速。单元测试
+    # （`make test`）不读 DSN；引擎版本断言仍只在 postgres job 做（两处镜像 tag 相同）。
+    # The service is a precondition of this job's verdict (D-01), not an optimization.
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          # 一次性口令，只存活于本 job 的服务容器内，用完即弃——**不是**凭据，**不得**被
+          # 复用到任何真实实例；真实凭证一律 ${ENV_VAR} 注入，不落盘。
+          POSTGRES_USER: basalt
+          POSTGRES_PASSWORD: basalt_ci_only
+          POSTGRES_DB: basalt_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basalt -d basalt_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BASALT_TEST_PG_DSN: postgres://basalt:basalt_ci_only@127.0.0.1:5432/basalt_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -95,7 +125,7 @@ jobs:
         # 具名 PASS 事件是判据：退出码 0 也可能意味着 -run 没匹配到任何测试。
         # A named pass event is required; exit 0 alone can mean the filter matched nothing.
         run: |
-          docker run --rm -v "$PWD":/src -w /src golang:1.27.2 bash -c '
+          docker run --rm -v "$PWD":/src -w /src golang:1.27.3 bash -c '
             set -eo pipefail
             rm -rf /usr/share/zoneinfo "$(go env GOROOT)/lib/time/zoneinfo.zip"
             test ! -e /usr/share/zoneinfo && test ! -e "$(go env GOROOT)/lib/time/zoneinfo.zip"
@@ -103,6 +133,67 @@ jobs:
             grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_IsolatedEmbeddedFallback\"" /tmp/tz.json
             grep -q "\"Action\":\"pass\".*\"Test\":\"TestTZData_IsolatedControlWithoutImport\"" /tmp/tz.json
           '
+
+  postgres:
+    # 存储集成测试要连**带扩展的真实引擎**，不是内存替代：单元 job 不读 DSN，DSN 只在本 job 注入。
+    # 镜像按设计卡 §4.7 / D-04 实测读数冻结：`pgvector/pgvector:0.8.7-pg17` 内含
+    # PostgreSQL **17.11**（`PG_VERSION=17.11-1.pgdg12+2`）+ vector **0.8.7**；pg_trgm 1.6 随 PG contrib。
+    # tag **写死**：**不得** `latest`、**不得**浮动 tag、**不得**在本 job 现场构建镜像替代候选；
+    # digest 待 T008d 部署实测后补入（T113 / tasks.md R2.4 勘误 3）。
+    # 2026-10-28 核对读数（registry 清单 + 镜像 config，来源见 run-state §2.3 的 T113 行）：
+    #   索引 digest sha256:ac08538c…；amd64 清单 sha256:cd4ccfda…；镜像构建 2026-10-01。
+    name: postgres（PostgreSQL 17.11 + pgvector 0.8.7：-tags=integration）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          # 一次性口令，只存活于本 job 的服务容器内，用完即弃——**不是**凭据，**不得**被复用到
+          # 任何真实实例；真实凭证一律 ${ENV_VAR} 注入，不落盘。
+          POSTGRES_USER: basalt
+          POSTGRES_PASSWORD: basalt_ci_only
+          POSTGRES_DB: basalt_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basalt -d basalt_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BASALT_TEST_PG_DSN: postgres://basalt:basalt_ci_only@127.0.0.1:5432/basalt_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: true
+
+      # **扩展版本 fail-closed**：tag 只是命名，扩展版本才是判据——读数不符即判红，
+      # 不静默降级成"tag 对了就算过"。pg_trgm 与 vector 都显式建，不赌镜像预置。
+      - name: Assert engine version (PG 17.11 / vector 0.8.7 / pg_trgm 1.6)
+        run: |
+          set -euo pipefail
+          cid="${{ job.services.postgres.id }}"
+          docker exec "$cid" psql -v ON_ERROR_STOP=1 -U basalt -d basalt_test \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector' \
+            -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+          sv=$(docker exec "$cid" psql -tA -U basalt -d basalt_test -c 'SHOW server_version')
+          echo "server_version=$sv"
+          echo "$sv" | grep -Eq '^17\.11([ .]|$)'
+          ext=$(docker exec "$cid" psql -tA -U basalt -d basalt_test \
+            -c "SELECT extname || '=' || extversion FROM pg_extension WHERE extname IN ('vector','pg_trgm') ORDER BY extname")
+          echo "$ext"
+          echo "$ext" | grep -qx 'pg_trgm=1.6'
+          echo "$ext" | grep -qx 'vector=0.8.7'
+
+      # T125 裁决（2026-10-28，用户授权 Claude 代行技术评审与裁决）：acceptance 里
+      # 依赖 PG 的目标**留在 test job**，由其同款 service 提供 DSN；本 job 保留为独立的
+      # 引擎版本证据（上面的 fail-closed 断言）+ 集成套件运行位置。缺 DSN 时三处入口
+      # （Makefile / check-coverage.sh / 测试助手）各自失败，不得跳过换绿。
+      - name: Integration tests (real PostgreSQL)
+        run: go test -tags=integration -count=1 ./...
 
   console:
     # 前端构建期工具链独立成 job（约束 42）：Go job **不得**调用 Node / npm——

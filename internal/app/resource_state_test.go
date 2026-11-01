@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是资源状态动作（撤销托管凭据 / 切换使用范围）的判卷（模块卡 R4.4 / R4.8 / T139）：
@@ -26,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // resourceStateEnv 在解析器夹具之上装配两个状态动作：同一个工作区、同一份库句柄、
@@ -72,7 +74,7 @@ func newResourceStateEnv(t *testing.T,
 		WorkspaceRoot: base.root,
 		Now:           baselineClock,
 	}
-	env.channels = newNotifyChannelReadPort(storage.NewNotifyChannelRepo(base.db),
+	env.channels = newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(base.db),
 		base.credentials, base.versions, notifyReadDeps{})
 
 	deps := ResourceStateDeps{
@@ -119,7 +121,7 @@ func (e *resourceStateEnv) seedChannel(t *testing.T, name string, scope core.Res
 	t.Helper()
 	uid, err := core.NewResourceUID()
 	require.NoError(t, err)
-	require.NoError(t, storage.NewNotifyAdminStore(e.db).Create(context.Background(),
+	require.NoError(t, postgres.NewNotifyAdminStore(e.db).Create(context.Background(),
 		core.NotifyChannel{
 			ResourceUID:   uid,
 			Name:          name,
@@ -377,7 +379,7 @@ func TestResourceState_ScopeBlockedByBindingWritesFailedRow(t *testing.T) {
 	uid := connectionUID(t, "alpha")
 	otherUID, err := core.NewAgentUID()
 	require.NoError(t, err)
-	require.NoError(t, storage.NewBindingStore(env.db).Rebuild(ctx, otherUID, "writer",
+	require.NoError(t, postgres.NewBindingStore(env.db).Rebuild(ctx, otherUID, "writer",
 		"sha256:"+strings.Repeat("0", 64),
 		core.ResourceBindings{
 			ModelConnections: []core.ResourceBinding{{Name: "alpha", UID: uid}},

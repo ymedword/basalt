@@ -85,7 +85,7 @@ func testAgentLoopMultiturnIdentity(t *testing.T) {
 		t.Fatalf("第二轮当前消息 = %q，期望第二轮用户输入", got)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 2 {
 		t.Fatalf("runs 应有 2 行，实际 %d 行", n)
 	}
@@ -118,7 +118,7 @@ func testAgentLoopReadFile(t *testing.T) {
 	}
 	requireToolResultContains(t, reqs[1], "回填专用内容-7f3a", "文件内容必须回填给模型")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "read_file", "success", "", 1)
 }
 
@@ -151,7 +151,7 @@ func testAgentLoopSandboxDeniedAudit(t *testing.T) {
 		requireToolResultContains(t, reqs[1], want, "四段式拒绝必须回填给模型")
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "read_file", "failed", "sandbox_denied", 1)
 	rows := queryRows(t, db, `SELECT error_message FROM tool_invocations`)
 	if msg, _ := rows[0]["error_message"].(string); !strings.Contains(msg, "读取目标不在可读根之内") {
@@ -194,7 +194,7 @@ func testAgentLoopReasoningRoundtrip(t *testing.T) {
 		t.Fatalf("出站 tool_call_id 未原样回传：%v", toolCallIDs(t, reqs[1]))
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireLLMCallStatuses(t, db, []string{"success", "success"})
 }
 
@@ -231,7 +231,7 @@ func testAgentLoopInjectionDenied(t *testing.T) {
 	}
 	requireAbsent(t, requestText(t, reqs[1]), secret, "被拒读取的内容不得进入模型请求")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireToolAudit(t, db, "read_file", "failed", "sandbox_denied", 1)
 }
 
@@ -286,7 +286,7 @@ func testAgentLoopReasoningRequired(t *testing.T) {
 		t.Fatal("第二轮请求未带 reasoning_content——供应商侧应返回 400 而这里放行了")
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	requireLLMCallStatuses(t, db, []string{"success", "success"})
 }
 

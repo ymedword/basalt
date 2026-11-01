@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 import (
@@ -12,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/testutil"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -80,7 +82,7 @@ func notifySend(t *testing.T, channelType, url, input string) (core.Result, erro
 		ResourceUID: uid, Name: "ops-alert", Type: channelType, URL: url,
 		OperationID: "op_notify_send_fixture",
 	}))
-	toolInstance := newNotifyTool(storage.NewNotifyChannelRepo(env.db), env.deps.Policy, nil, nil)
+	toolInstance := newNotifyTool(postgres.NewNotifyChannelRepo(env.db), env.deps.Policy, nil, nil)
 	return toolInstance.Execute(context.Background(), core.ToolEnv{AgentName: "tester"},
 		json.RawMessage(input))
 }

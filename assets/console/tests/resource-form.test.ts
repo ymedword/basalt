@@ -172,6 +172,69 @@ function inputValue(selector: string): string {
 }
 
 describe('resource form', () => {
+  it('blocks skill edits when the server omits the file list', async () => {
+    const calls = mountForm((call) => {
+      if (call.method === 'GET' && call.path === '/api/v1/admin/skills/alpha/edit') {
+        return envelope(200, 'OK', 'success', { name: 'alpha', description: '', file_count: 2 }, ETAG_V1)
+      }
+      return undefined
+    }, 'skills', 'alpha')
+    await flushPromises()
+
+    expect(wrapper!.text()).toContain('技能文件清单未完整加载')
+    expect(wrapper!.text()).not.toContain("Cannot read properties of undefined")
+    expect((button('保存新版本').element as HTMLButtonElement).disabled).toBe(true)
+    await button('保存新版本').trigger('click')
+    expect(calls.filter((call) => call.method === 'PUT')).toHaveLength(0)
+  })
+
+  it('keeps a skill draft but blocks resubmission after a version conflict', async () => {
+    const calls = mountForm((call) => {
+      if (call.method === 'GET' && call.path === '/api/v1/admin/skills/alpha/edit') {
+        return envelope(200, 'OK', 'success', {
+          name: 'alpha', description: '', files: [{ path: 'SKILL.md', content: 'original' }],
+        }, ETAG_V1)
+      }
+      if (call.method === 'PUT' && call.path === '/api/v1/skills/alpha') {
+        return envelope(412, 'PRECONDITION_FAILED', 'ETag 不匹配')
+      }
+      return undefined
+    }, 'skills', 'alpha')
+    await flushPromises()
+    await wrapper!.find('textarea[aria-label="文件正文 SKILL.md"]').setValue('local draft')
+    await button('保存新版本').trigger('click')
+    await flushPromises()
+
+    expect(wrapper!.text()).toContain('技能已被他人修改')
+    expect((wrapper!.find('textarea[aria-label="文件正文 SKILL.md"]').element as HTMLTextAreaElement).value).toBe('local draft')
+    expect((button('保存新版本').element as HTMLButtonElement).disabled).toBe(true)
+    await button('保存新版本').trigger('click')
+    expect(calls.filter((call) => call.method === 'PUT')).toHaveLength(1)
+    expect(calls.filter((call) => call.method === 'GET')).toHaveLength(1)
+  })
+
+  it('reports a successful save separately from a failed refresh and blocks another save', async () => {
+    let reads = 0
+    const calls = mountForm((call) => {
+      if (call.method === 'GET' && call.path === '/api/v1/admin/skills/alpha/edit') {
+        reads++
+        return reads === 1
+          ? envelope(200, 'OK', 'success', { name: 'alpha', files: [{ path: 'SKILL.md', content: 'original' }] }, ETAG_V1)
+          : envelope(503, 'UNAVAILABLE', '暂不可用')
+      }
+      if (call.method === 'PUT' && call.path === '/api/v1/skills/alpha') {
+        return envelope(200, 'OK', 'success', { name: 'alpha' })
+      }
+      return undefined
+    }, 'skills', 'alpha')
+    await flushPromises()
+    await button('保存新版本').trigger('click')
+    await flushPromises()
+    expect(wrapper!.text()).toContain('技能已保存，但刷新文件清单失败')
+    expect((button('保存新版本').element as HTMLButtonElement).disabled).toBe(true)
+    expect(calls.filter((call) => call.method === 'PUT')).toHaveLength(1)
+  })
+
   it('creates a model connection with a managed key and the default shared scope', async () => {
     const calls = mountForm((call) => {
       if (call.method === 'POST' && call.path === MODEL_PATH) {
@@ -624,6 +687,26 @@ describe('resource form', () => {
     expect(text).toContain('实例加密服务需要恢复（密钥文件不存在）')
     expect(text).toContain('docs/Operations.md')
     // 恢复态不提供「初始化」按钮：那是重建密钥，属恢复流程，不由表单发起。
+    expect(wrapper!.findAll('button').some((item) => item.text() === '初始化实例加密')).toBe(false)
+  })
+
+  it('never offers initialisation in recovery even if the server reports it possible', async () => {
+    // D-40：恢复只能走离线命令（先备份 → secrets recover-record / adopt-legacy）。
+    // 即便服务端误报 can_initialize=true，页面也不得提供"一键重建"的入口。
+    mountForm(() => {
+      return envelope(200, 'OK', 'success', {
+        ...(secretsReady() as Record<string, unknown>),
+        state: 'recovery_required',
+        key_id: '',
+        recovery_reason: 'unprovable_provenance',
+        can_initialize: true,
+      })
+    }, 'model-connections')
+    await flushPromises()
+
+    expect(
+      wrapper!.find('#resource-api-key-mode option[value="managed"]').attributes('disabled'),
+    ).toBeDefined()
     expect(wrapper!.findAll('button').some((item) => item.text() === '初始化实例加密')).toBe(false)
   })
 

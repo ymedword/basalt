@@ -55,7 +55,6 @@ func newStatusCommand(deps Deps) *cobra.Command {
 // ERROR line per failed section.
 func runStatus(ctx context.Context, out io.Writer, deps Deps) error {
 	wsRoot := filepath.Join(deps.WorkDir, workspaceDirName)
-	dbPath := filepath.Join(wsRoot, databaseFileName)
 	configPath := filepath.Join(deps.WorkDir, configFileName)
 
 	fmt.Fprintf(out, "工作区 %s\n", wsRoot)
@@ -97,8 +96,8 @@ func runStatus(ctx context.Context, out io.Writer, deps Deps) error {
 			configPath, orDefault(cfg.Log.Level, "（缺省）"), orDefault(cfg.Log.Format, "（缺省）")))
 	}
 
-	// 节 3：存储——只读打开；各异常态各自点名，就绪时报版本与表清点。
-	if err := checkStorage(ctx, out, deps, dbPath); err != nil {
+	// 节 3：存储——PostgreSQL 只读打开；各异常态各自点名，就绪时报版本与表清点。
+	if err := checkStorage(ctx, out, deps, cfg); err != nil {
 		failed = append(failed, "存储")
 	}
 
@@ -111,47 +110,75 @@ func runStatus(ctx context.Context, out io.Writer, deps Deps) error {
 	return nil
 }
 
-// checkStorage 是节 3：只读打开库并清点版本与表；返回非 nil 表示本节判定为失败
-// （报告文案已写好，日志亦已落）。
+// storageBackend 是存储节的后端点名。**不**打印 DSN / 连接串——凭证与地址不出现在
+// 任何输出里（P-08）。
+// storageBackend names the backend without ever echoing the DSN.
+const storageBackend = "PostgreSQL"
+
+// checkStorage 是节 3：只读打开运行期后端并清点版本与表；返回非 nil 表示本节判定为
+// 失败（报告文案已写好，日志亦已落）。
 // checkStorage is section 3: a read-only open plus version and table inventory. A
 // non-nil return means the section failed and has already been reported.
-func checkStorage(ctx context.Context, out io.Writer, deps Deps, dbPath string) error {
-	db, err := deps.Store.OpenReadOnly(ctx, dbPath, deps.SupportedSchemaVersion)
-	switch {
-	case errors.Is(err, core.ErrDatabaseMissing):
-		return storageFailure(out, deps, "存储", dbPath,
-			"库未就绪——先运行 basalt init", err)
-	case errors.Is(err, core.ErrSchemaOutdated):
-		return storageFailure(out, deps, "存储", dbPath,
-			fmt.Sprintf("库版本旧于二进制——status 只校验、不迁移（%v）", err), err)
-	case errors.Is(err, core.ErrSchemaTooNew):
-		return storageFailure(out, deps, "存储", dbPath,
-			fmt.Sprintf("库版本高于二进制——请升级 basalt 二进制（%v）", err), err)
-	case errors.Is(err, core.ErrSchemaCorrupt):
-		// 版本表在、行没了——既非新库也非任何已知版本，不能靠"再跑一次 init"糊过去
-		// （init 对已存在的库是零写），只能人工判定：要点名库路径并让人做决定。
-		return storageFailure(out, deps, "存储", dbPath,
-			fmt.Sprintf("库已损坏——版本表在但无版本行，需人工判定，不要直接删库（%v）", err), err)
-	case err != nil:
-		return storageFailure(out, deps, "存储", dbPath, fmt.Sprintf("打开失败——%v", err), err)
+func checkStorage(ctx context.Context, out io.Writer, deps Deps, cfg *Config) error {
+	if cfg == nil || strings.TrimSpace(cfg.Database.DSN) == "" {
+		// 没有 DSN 就没有后端可诊断——这不是"库未就绪"，是配置缺失，先补配置。
+		return storageFailure(out, deps, "存储", storageBackend,
+			"未配置 database.dsn——先补 PostgreSQL 连接串（${ENV_VAR} 占位由装载层解析）",
+			errors.New("database.dsn 缺失"))
+	}
+	db, err := deps.Store.OpenReadOnly(ctx, cfg.Database)
+	if err != nil {
+		return storageFailure(out, deps, "存储", storageBackend,
+			fmt.Sprintf("打开失败——%v", err), err)
 	}
 
 	version, versionErr := db.SchemaVersion(ctx)
+	if versionErr != nil {
+		err := errors.Join(versionErr, db.Close())
+		switch {
+		case errors.Is(versionErr, core.ErrDatabaseMissing):
+			return storageFailure(out, deps, "存储", storageBackend,
+				"库未就绪——先运行 basalt db migrate 建库", err)
+		case errors.Is(versionErr, core.ErrSchemaCorrupt):
+			// 版本表在、行没了——既非新库也非任何已知版本，不能靠"再跑一次迁移"糊过去，
+			// 只能人工判定。
+			return storageFailure(out, deps, "存储", storageBackend,
+				fmt.Sprintf("库已损坏——版本表在但无版本行，需人工判定，不要直接删库（%v）", versionErr), err)
+		}
+		return storageFailure(out, deps, "存储", storageBackend,
+			fmt.Sprintf("读取版本失败——%v", versionErr), err)
+	}
 	tables, tablesErr := db.TableNames(ctx)
 	closeErr := db.Close()
-	if err := errors.Join(versionErr, tablesErr, closeErr); err != nil {
-		return storageFailure(out, deps, "存储", dbPath, fmt.Sprintf("读取失败——%v", err), err)
+	if err := errors.Join(tablesErr, closeErr); err != nil {
+		return storageFailure(out, deps, "存储", storageBackend, fmt.Sprintf("读取失败——%v", err), err)
 	}
 
-	writeSection(out, "存储", fmt.Sprintf("就绪（%s，schema v%d，%d 张表）", dbPath, version, len(tables)))
+	// 版本矩阵沿用原口径（旧 / 新 / 损坏三类各自点名）；status **只校验、不迁移**，
+	// 修复动作交给 `basalt db migrate` 或升级二进制。
+	switch {
+	case version < 1:
+		return storageFailure(out, deps, "存储", storageBackend,
+			fmt.Sprintf("库已损坏——schema_version 记录 %d 非法", version), core.ErrSchemaCorrupt)
+	case version > deps.SupportedSchemaVersion:
+		return storageFailure(out, deps, "存储", storageBackend,
+			fmt.Sprintf("库版本高于二进制——请升级 basalt 二进制（库 v%d > 二进制 v%d）",
+				version, deps.SupportedSchemaVersion), core.ErrSchemaTooNew)
+	case version < deps.SupportedSchemaVersion:
+		return storageFailure(out, deps, "存储", storageBackend,
+			fmt.Sprintf("库版本旧于二进制——先运行 basalt db migrate（库 v%d < 目标 v%d）",
+				version, deps.SupportedSchemaVersion), core.ErrSchemaOutdated)
+	}
+
+	writeSection(out, "存储", fmt.Sprintf("就绪（%s，schema v%d，%d 张表）", storageBackend, version, len(tables)))
 	return nil
 }
 
 // storageFailure 统一节 3 的失败三件套：报告文案、结构化 ERROR、返回错误。
 // storageFailure centralizes section 3's failure triple.
-func storageFailure(out io.Writer, deps Deps, section, path, detail string, err error) error {
+func storageFailure(out io.Writer, deps Deps, section, backend, detail string, err error) error {
 	writeSection(out, section, detail)
-	deps.Logger.Error("存储状态异常", "path", path, "error", err)
+	deps.Logger.Error("存储状态异常", "backend", backend, "error", err)
 	return err
 }
 

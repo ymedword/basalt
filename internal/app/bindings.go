@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -44,7 +44,7 @@ const (
 )
 
 // AgentIdentitySource 提供 Agent 名 → 稳定身份（生命周期状态文件的可重建镜像）。
-// `*storage.ResourceStore` 满足本接口。
+// `*postgres.ResourceStore` 满足本接口。
 // AgentIdentitySource answers "which stable identity belongs to this agent name".
 type AgentIdentitySource interface {
 	AgentIdentity(ctx context.Context, agent string) (core.AgentUID, string, bool, error)
@@ -54,6 +54,16 @@ type AgentIdentitySource interface {
 // ArchiveLister lists archive rows; archived agents take part in the rebuild too.
 type ArchiveLister interface {
 	ListArchives(ctx context.Context) ([]core.AgentArchiveRecord, error)
+}
+
+// KnowledgeCollectionSource 把知识集合的**声明名**解析成稳定集合 ID（D-19 的
+// "名字 → 身份"一步）。`*postgres.KnowledgeCatalogStore` 满足本接口。
+// 未解析名单（不存在 / 同名活行不唯一）原样返回，由调用方决定跳过与告警——
+// **不得**在这里猜一个集合，猜错等于把 Agent 的检索范围扩大或指到别人的库。
+// KnowledgeCollectionSource resolves declared collection names to stable ids; unresolved
+// names come back as-is and are never guessed.
+type KnowledgeCollectionSource interface {
+	CollectionIDsByName(ctx context.Context, names []string) (map[string]string, []string, error)
 }
 
 // ProjectionFailure 是一条投影失败记录：哪个 Agent、固定原因。
@@ -76,12 +86,18 @@ type ProjectionReport struct {
 // BindingProjection rebuilds the projection for one agent or for the whole workspace;
 // its failure set is safe for concurrent readers.
 type BindingProjection struct {
-	Bindings *storage.BindingStore
+	Bindings *postgres.BindingStore
 	Identity AgentIdentitySource
 	Archives ArchiveLister
-	Root     string
-	Logger   *slog.Logger
-	Now      func() time.Time
+	// Collections 解析 `knowledge:` 的声明名；nil 表示本进程没有集合目录来源——
+	// 此时声明一律按"无法解析"跳过（不写投影行、由注册闸门拒绝注册），**不得**
+	// 当成"没有声明"处理。
+	// A nil Collections source never means "no declarations"; every declared name simply
+	// stays unresolved.
+	Collections KnowledgeCollectionSource
+	Root        string
+	Logger      *slog.Logger
+	Now         func() time.Time
 
 	mu     sync.RWMutex
 	failed map[string]string
@@ -89,8 +105,9 @@ type BindingProjection struct {
 
 // NewBindingProjection 装配投影重建面；失败集合初始为空。
 // NewBindingProjection assembles the projector with an empty failure set.
-func NewBindingProjection(bindings *storage.BindingStore, identity AgentIdentitySource,
-	archives ArchiveLister, root string, logger *slog.Logger, now func() time.Time,
+func NewBindingProjection(bindings *postgres.BindingStore, identity AgentIdentitySource,
+	archives ArchiveLister, collections KnowledgeCollectionSource, root string, logger *slog.Logger,
+	now func() time.Time,
 ) *BindingProjection {
 	if now == nil {
 		now = time.Now
@@ -99,27 +116,31 @@ func NewBindingProjection(bindings *storage.BindingStore, identity AgentIdentity
 		logger = slog.Default()
 	}
 	return &BindingProjection{
-		Bindings: bindings,
-		Identity: identity,
-		Archives: archives,
-		Root:     root,
-		Logger:   logger,
-		Now:      now,
-		failed:   make(map[string]string, 4),
+		Bindings:    bindings,
+		Identity:    identity,
+		Archives:    archives,
+		Collections: collections,
+		Root:        root,
+		Logger:      logger,
+		Now:         now,
+		failed:      make(map[string]string, 4),
 	}
 }
 
 // RebuildAgent 用一个 Agent 的**已校验**定义重建投影（写面提交成功后调用）：
 // uid 为空直接拒绝——没有身份的投影无法归属，宁可留空也不写假行。
-// RebuildAgent rebuilds one agent's projection from validated bindings.
+// `knowledge` 是同一份定义解析并解析完身份的知识集合绑定；与资源绑定同批替换，
+// 免得"只更新资源绑定"的调用把知识行清空。
+// RebuildAgent rebuilds one agent's projection; knowledge rows travel with the same call
+// so a partially-specified rebuild cannot silently drop them.
 func (p *BindingProjection) RebuildAgent(ctx context.Context, agent string, uid core.AgentUID,
-	contentHash string, bindings core.ResourceBindings,
+	contentHash string, bindings core.ResourceBindings, knowledge ...core.KnowledgeCollectionBinding,
 ) error {
 	if uid == "" {
 		return fmt.Errorf("%w: Agent %s 没有稳定身份，无法重建绑定投影",
 			core.ErrAgentResourceBindingInvalid, agent)
 	}
-	if err := p.Bindings.Rebuild(ctx, uid, agent, contentHash, bindings, p.Now()); err != nil {
+	if err := p.Bindings.Rebuild(ctx, uid, agent, contentHash, bindings, p.Now(), knowledge...); err != nil {
 		return err
 	}
 	p.recordSuccess(agent)
@@ -136,6 +157,10 @@ func (p *BindingProjection) RebuildAgentDefinition(ctx context.Context, agent st
 	definition []byte,
 ) error {
 	bindings, parseErr := workspace.ParseResourceBindings(definition)
+	var declared []core.KnowledgeBinding
+	if parseErr == nil {
+		declared, parseErr = workspace.ParseKnowledgeBindings(definition)
+	}
 	if parseErr != nil {
 		if uid == "" {
 			// 没有身份就没有可清的空行：与 RebuildAll 同口径，记失败但不动投影。
@@ -148,7 +173,13 @@ func (p *BindingProjection) RebuildAgentDefinition(ctx context.Context, agent st
 		p.recordFailure(agent, projectionReasonInvalidBindings)
 		return nil
 	}
-	return p.RebuildAgent(ctx, agent, uid, migrateV3ContentHash(definition), bindings)
+	knowledge, err := p.resolveKnowledge(ctx, agent, declared)
+	if err != nil {
+		// 解析失败时不写空的知识行：那会把"查不到"变成"没有声明"，旧投影反而丢了。
+		// On a resolution failure nothing is written, so the previous rows survive.
+		return fmt.Errorf("重建 Agent %s 的知识集合绑定: %w", agent, err)
+	}
+	return p.RebuildAgent(ctx, agent, uid, migrateV3ContentHash(definition), bindings, knowledge...)
 }
 
 // RebuildAgentFromDisk 按活动区的定义文件重建一个 Agent 的绑定投影（写操作成功之后的
@@ -206,8 +237,36 @@ func (p *BindingProjection) RebuildAll(ctx context.Context) (ProjectionReport, e
 	p.failed = make(map[string]string, 4)
 	p.mu.Unlock()
 
+	// 解析与集合名解析都放在任何写库之前：单份定义不可解析只影响它自己（该 Agent
+	// 清空并记失败），但**库级**解析失败必须整体中止——带着未知的名单去写，会把
+	// "解析不出来"写成"没有绑定"，投影反而比不重建更不可信。
+	// Parsing (and one batched name resolution) happens before any write; a database-level
+	// failure aborts the whole rebuild instead of writing "unresolved" as "unbound".
+	type parsedDoc struct {
+		bindings core.ResourceBindings
+		declared []core.KnowledgeBinding
+		parseErr error
+	}
+	parsed := make([]parsedDoc, len(docs))
+	names := make([]string, 0, len(docs))
+	for i, doc := range docs {
+		bindings, parseErr := workspace.ParseResourceBindings([]byte(doc.Text))
+		var declared []core.KnowledgeBinding
+		if parseErr == nil {
+			declared, parseErr = workspace.ParseKnowledgeBindings([]byte(doc.Text))
+		}
+		parsed[i] = parsedDoc{bindings: bindings, declared: declared, parseErr: parseErr}
+		if parseErr == nil {
+			names = append(names, core.KnowledgeBindingNames(declared)...)
+		}
+	}
+	ids, err := p.collectionIDs(ctx, names)
+	if err != nil {
+		return ProjectionReport{}, fmt.Errorf("重建绑定投影：解析知识集合名: %w", err)
+	}
+
 	report := ProjectionReport{}
-	for _, doc := range docs {
+	for i, doc := range docs {
 		uid, reason := p.docIdentity(ctx, doc, archiveUIDs)
 		if reason != "" {
 			p.recordFailure(doc.Name, reason)
@@ -215,8 +274,7 @@ func (p *BindingProjection) RebuildAll(ctx context.Context) (ProjectionReport, e
 			continue
 		}
 
-		bindings, parseErr := workspace.ParseResourceBindings([]byte(doc.Text))
-		if parseErr != nil {
+		if parsed[i].parseErr != nil {
 			// 定义不可解析：投影清空 + 记错误，闸门按"可能引用"处理（fail-closed）。
 			if clearErr := p.Bindings.Clear(ctx, uid); clearErr != nil {
 				return report, fmt.Errorf("清空 Agent %s 的绑定投影: %w", doc.Name, clearErr)
@@ -229,13 +287,66 @@ func (p *BindingProjection) RebuildAll(ctx context.Context) (ProjectionReport, e
 			continue
 		}
 
+		knowledge := resolveKnowledgeBindings(doc.Name, parsed[i].declared, ids, p.Logger)
 		if err := p.Bindings.Rebuild(ctx, uid, doc.Name, migrateV3ContentHash([]byte(doc.Text)),
-			bindings, p.Now()); err != nil {
+			parsed[i].bindings, p.Now(), knowledge...); err != nil {
 			return report, fmt.Errorf("重建 Agent %s 的绑定投影: %w", doc.Name, err)
 		}
 		report.Rebuilt++
 	}
 	return report, nil
+}
+
+// collectionIDs 批量解析声明的集合名（跨全部文档一次查库）。空名单不查库；
+// 来源未装配时返回空表——声明一律留在"未解析"，由注册闸门拒绝注册。
+// collectionIDs resolves every declared name in one query; an absent source leaves all
+// names unresolved rather than pretending the agent declared nothing.
+func (p *BindingProjection) collectionIDs(ctx context.Context, names []string) (map[string]string, error) {
+	if len(names) == 0 || p.Collections == nil {
+		return nil, nil
+	}
+	ids, _, err := p.Collections.CollectionIDsByName(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// resolveKnowledge 解析单个 Agent 的声明（写路径用；全量重建走批量那一条）。
+// resolveKnowledge resolves one agent's declarations for the write path.
+func (p *BindingProjection) resolveKnowledge(ctx context.Context, agent string,
+	declared []core.KnowledgeBinding,
+) ([]core.KnowledgeCollectionBinding, error) {
+	if len(declared) == 0 {
+		return nil, nil
+	}
+	ids, err := p.collectionIDs(ctx, core.KnowledgeBindingNames(declared))
+	if err != nil {
+		return nil, err
+	}
+	return resolveKnowledgeBindings(agent, declared, ids, p.Logger), nil
+}
+
+// resolveKnowledgeBindings 把声明映射成"声明名 → 稳定集合 ID"：未解析到的名字**不**
+// 写投影行（写一条假行会让授权把范围指向错误的集合），只记 WARN——注册闸门随后按
+// 同一份声明判"集合缺失"并拒绝注册，两边读的名单来源相同。
+// resolveKnowledgeBindings drops unresolved names with a warning; the registration gate
+// reads the same declarations and is what actually blocks the agent.
+func resolveKnowledgeBindings(agent string, declared []core.KnowledgeBinding,
+	ids map[string]string, logger *slog.Logger,
+) []core.KnowledgeCollectionBinding {
+	out := make([]core.KnowledgeCollectionBinding, 0, len(declared))
+	for _, entry := range declared {
+		name := strings.TrimSpace(entry.Name)
+		id, ok := ids[name]
+		if !ok {
+			logger.Warn("知识集合声明未解析到唯一活动集合（不写投影行，注册闸门会拒绝注册）",
+				"agent", agent, "collection", name)
+			continue
+		}
+		out = append(out, core.KnowledgeCollectionBinding{Name: name, CollectionID: id})
+	}
+	return out
 }
 
 // ProjectionError 报告某 Agent 的投影是否不可信（真 = 调用方应回退定义文件扫描）。
@@ -338,13 +449,19 @@ type CredentialPinSource interface {
 // BindingCheckDeps 是准入绑定校验的只读依赖。
 // `NotifyChannels` 是**活跃**渠道目录（与发送路径同一个零缓存仓储，墓碑行不出现）：
 // 保存期校验定时任务的 `deliver_to` 用它按 UID 查目标；为 nil 时带目标的保存失败关闭。
+// `Collections` 是知识集合的"声明名 → 稳定 ID"读面（与注册闸门同一份存储实例）：
+// 保存期用它把 `knowledge:` 的坏名字挡在写盘之前；为 nil 时带声明的保存同样失败关闭
+// ——"查不到"不得被放行成"没问题"，否则保存成功、Agent 随后整只不注册。
 // BindingCheckDeps carries the read-only dependencies of the admission check; the
 // channel catalog lists active rows only and a nil catalog keeps targets failing closed.
+// The collection reader is the same store the registration gate uses, and a nil one
+// fails closed for declared knowledge instead of letting the agent vanish later.
 type BindingCheckDeps struct {
-	Resources      *storage.ResourceStore
-	Notify         *storage.NotifyAdminStore
+	Resources      *postgres.ResourceStore
+	Notify         *postgres.NotifyAdminStore
 	NotifyChannels core.NotifyChannelReader
 	Credentials    BindingCredentialCheck
+	Collections    KnowledgeCollectionSource
 }
 
 // BindingProblem 是一条可点名的绑定问题：类别、引用名、固定原因与哨兵。
@@ -607,7 +724,44 @@ func SaveBindingCheck(lifecycle *workspace.LifecycleStore, deps BindingCheckDeps
 		if err := CheckAgentBindings(ctx, deps, agent, agentUID, profile); err != nil {
 			return err
 		}
+		if err := CheckKnowledgeDeclarations(ctx, deps, profile); err != nil {
+			return err
+		}
 		return CheckScheduleDeliveryTargets(ctx, deps, agentUID, profile)
+	}
+}
+
+// CheckKnowledgeDeclarations 在保存期校验 `knowledge:` 的声明名（D-19 / FR-009A）：
+// 每个名字必须解析到唯一活动集合。未解析 → 拒绝保存并点名（与注册闸门同一份判据、
+// 同一个存储实例），**不**做部分放行——声明即绑定，缺实体的 Agent 整只不注册；让它在
+// 保存时失败，比"存进去了却从列表里消失"可执行得多。
+//
+// 准入路径**不**调用本函数：Agent 注册时声明已经被闸门判过一次，准入再查会让"集合被
+// 删掉"连带打停在跑链路；集合删除后的运行期表现由检索侧按"集合不可用"处理，与注册
+// 判定分开。
+// Save-time validation of declared knowledge names; admission deliberately does not
+// repeat it, so deleting a collection never trips the admission gate.
+func CheckKnowledgeDeclarations(ctx context.Context, deps BindingCheckDeps, profile *core.Profile) error {
+	if profile == nil || len(profile.Knowledge) == 0 {
+		return nil
+	}
+	names := core.KnowledgeBindingNames(profile.Knowledge)
+	if len(names) == 0 {
+		return nil
+	}
+	if deps.Collections == nil {
+		return fmt.Errorf("保存期知识集合校验缺少集合目录装配（Agent 声明了 %d 个集合）", len(names))
+	}
+	_, unresolved, err := deps.Collections.CollectionIDsByName(ctx, names)
+	if err != nil {
+		return fmt.Errorf("读取知识集合目录: %w", err)
+	}
+	if len(unresolved) == 0 {
+		return nil
+	}
+	return &core.AgentDefinitionRejectedError{
+		Kind:   core.AgentRejectKnowledgeCollectionMissing,
+		Detail: strings.Join(unresolved, "、"),
 	}
 }
 
@@ -618,10 +772,10 @@ func SaveBindingCheck(lifecycle *workspace.LifecycleStore, deps BindingCheckDeps
 // no operation store here because the surface never writes.
 type AgentConfigDeps struct {
 	Root        string
-	Resources   *storage.ResourceStore
-	Identities  *storage.IdentityStore
-	Notify      *storage.NotifyAdminStore
-	Credentials *storage.CredentialStore
+	Resources   *postgres.ResourceStore
+	Identities  *postgres.IdentityStore
+	Notify      *postgres.NotifyAdminStore
+	Credentials *postgres.CredentialStore
 	Lifecycle   *workspace.LifecycleStore
 }
 
@@ -896,6 +1050,7 @@ func agentConfigFields(profile *core.Profile) web.AgentConfigFieldsView {
 		}
 	}
 	return web.AgentConfigFieldsView{
+		Knowledge:   append([]core.KnowledgeBinding{}, profile.Knowledge...),
 		Name:        profile.Name,
 		Description: profile.Description,
 		DisplayName: profile.DisplayName,
@@ -919,8 +1074,9 @@ func agentConfigFields(profile *core.Profile) web.AgentConfigFieldsView {
 			NotifyChannels:   nonNilBindings(profile.ResourceBindings.NotifyChannels),
 		},
 		Settings: web.AgentConfigSettingsView{
-			MaxIterations:   profile.Settings.MaxIterations,
-			MaxHistoryTurns: profile.Settings.MaxHistoryTurns,
+			MaxIterations:       profile.Settings.MaxIterations,
+			MaxHistoryTurns:     profile.Settings.MaxHistoryTurns,
+			IncludeGlobalMemory: profile.Settings.IncludeGlobalMemory,
 		},
 		Schedules: schedules,
 	}

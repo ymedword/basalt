@@ -180,12 +180,29 @@ func TestOpenAIClient_HTTPErrorMapsToExternalError(t *testing.T) {
 
 // TestOpenAIClient_ContextCancelStopsCall：慢响应 + ctx 取消 → 立即返回，
 // `errors.Is(err, context.Canceled)` 成立（链未断）。
-// TestOpenAIClient_ContextCancelStopsCall keeps the cancellation chain intact.
+// 取消**确定落在请求在途时**（handler 已进入）：§R148 修掉的是一条死锁——原来的
+// `go func(){cancel()}()` 由调度决定时机，一旦晚于请求到达，handler 只等
+// `r.Context().Done()` 而**不读请求体**；net/http 只在请求体读尽后才启动后台读
+// （server.go `requestBodyRemains` → `registerOnHitEOF(startBackgroundRead)`），
+// 服务端于是永远观察不到断开，handler、`httptest.Server.Close` 与测试三方互等，
+// 直到 10 分钟全局超时。现在：先读尽请求体让断开可被观察，用 `entered` 握手把取消
+// 固定在在途阶段，并给「取消后不返回」加 10s 自限——回归会快速判红而不是挂死。
+// TestOpenAIClient_ContextCancelStopsCall keeps the cancellation chain intact for an
+// in-flight request; the handshake and the bounded wait keep a regression from hanging
+// the whole package until the global timeout.
 func TestOpenAIClient_ContextCancelStopsCall(t *testing.T) {
 	release := make(chan struct{})
+	entered := make(chan struct{})
 	srv := testutil.NewHTTPServer(t, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done() // 一直挂着，直到客户端取消
-		<-release
+		// 读尽请求体：不读体时 net/http 不会启动后台读，客户端断开就永远观察不到。
+		// Drain the body: without it net/http never starts the background read that
+		// observes the client going away.
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(entered)
+		select {
+		case <-r.Context().Done(): // 正常路径：客户端断开
+		case <-release: // 兜底：取消没被观察到时，清理阶段仍能放开处理器
+		}
 	}))
 	t.Cleanup(func() { close(release) })
 
@@ -193,13 +210,36 @@ func TestOpenAIClient_ContextCancelStopsCall(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { cancel() }()
+	defer cancel()
 
-	_, err = client.Chat(ctx, core.ChatRequest{Model: "m", Messages: []core.Message{{Role: "user", Content: "hi"}}})
-	require.ErrorIs(t, err, context.Canceled, "取消错误链必须保留")
+	type chatResult struct {
+		resp core.ChatResponse
+		err  error
+	}
+	done := make(chan chatResult, 1)
+	go func() {
+		resp, chatErr := client.Chat(ctx, core.ChatRequest{Model: "m", Messages: []core.Message{{Role: "user", Content: "hi"}}})
+		done <- chatResult{resp: resp, err: chatErr}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求在 5s 内没有到达服务器：取消语义无从判定")
+	}
+	cancel()
+
+	var out chatResult
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("取消后 10s 内没有返回：context 取消没有传播到在途请求")
+	}
+
+	require.ErrorIs(t, out.err, context.Canceled, "取消错误链必须保留")
 
 	var callErr *provider.CallError
-	require.ErrorAs(t, err, &callErr)
+	require.ErrorAs(t, out.err, &callErr)
 	require.Equal(t, core.ErrorKindTimeout, callErr.Kind, "取消归并记 timeout")
 	require.Zero(t, callErr.Status)
 }

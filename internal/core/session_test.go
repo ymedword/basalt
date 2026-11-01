@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -44,8 +45,10 @@ type sessionStore struct {
 	remainingDeadline []time.Duration // 每次写入时 ctx 的剩余时限；无 deadline 记 -1
 }
 
-// AppendMessage 记录一次写入；注入失败时**不写**（与真仓储同语义）。
-func (s *sessionStore) AppendMessage(ctx context.Context, sessionID, runID string, m core.Message) error {
+// AppendMessage 记录一次写入并分配递增标识（真仓储返回 `messages.id`，替身用
+// `s1, s2, …`：这样"写透后历史里带标识"这条判据在替身上同样成立）；注入失败时
+// **不写**（与真仓储同语义：失败不产生行，也就没有标识）。
+func (s *sessionStore) AppendMessage(ctx context.Context, sessionID, runID string, m core.Message) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -57,17 +60,19 @@ func (s *sessionStore) AppendMessage(ctx context.Context, sessionID, runID strin
 
 	if s.respectCtx {
 		if err := ctx.Err(); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if s.failNext != nil {
 		err := s.failNext
 		s.failNext = nil
-		return err
+		return "", err
 	}
+	id := fmt.Sprintf("s%d", len(s.history)+1)
+	m.ID = id
 	s.appended = append(s.appended, appendedMessage{sessionID: sessionID, runID: runID, msg: m})
 	s.history = append(s.history, m)
-	return nil
+	return id, nil
 }
 
 // Messages 取整段历史（升序副本）。
@@ -177,6 +182,69 @@ func TestSession_AppendMessageCarriesRunID(t *testing.T) {
 	require.Len(t, snapshot, 1)
 	snapshot[0].Content = "改内存"
 	require.Equal(t, "你好", sess.Messages()[0].Content, "Messages 返回副本，改不动会话状态")
+}
+
+// 中文验收点（US-16 裁决 2026-10-28）：会话消息的身份来自仓储返回的 `messages.id`——
+// 内存历史与写进仓储的那份**必须**是同一个标识；装配记录（`history_trim`）与压缩
+// 覆盖范围都靠它指向真实行。
+// Acceptance point: a persistent message carries exactly the id the store returned,
+// both in memory and in the stored copy.
+func TestSession_PersistentAppendUsesStoreID(t *testing.T) {
+	store := &sessionStore{}
+	sess := core.NewSession("cli-3f9a1c07b2d84e55", store, nil)
+	ctx := context.Background()
+
+	require.NoError(t, sess.AppendMessage(ctx, "run-1", core.Message{Role: core.RoleUser, Content: "一"}))
+	require.NoError(t, sess.AppendMessage(ctx, "run-1", core.Message{Role: core.RoleAssistant, Content: "二"}))
+
+	history := sess.Messages()
+	require.Equal(t, []string{"s1", "s2"}, []string{history[0].ID, history[1].ID},
+		"历史里的标识 = 仓储为这两次追加分配的身份")
+	appended := store.appendedMessages()
+	require.Equal(t, history[0].ID, appended[0].msg.ID, "写进仓储的那份同样带标识")
+	require.Equal(t, history[1].ID, appended[1].msg.ID)
+}
+
+// noIDStore 是**违反契约**的仓储替身：声称写入成功却给不出标识。
+// noIDStore violates the MessageStore contract: it reports success without an id.
+type noIDStore struct{ sessionStore }
+
+// AppendMessage 恒返回空标识（真仓储永远不会这样，本替身只为判卷拒绝路径）。
+func (s *noIDStore) AppendMessage(context.Context, string, string, core.Message) (string, error) {
+	return "", nil
+}
+
+// 中文验收点（US-16 裁决 2026-10-28）：仓储没给出标识 = 历史缺身份——`AppendMessage`
+// **必须**报错，且这条消息**不得**留在内存历史里（否则出现"内存有、库里有、但没人能
+// 指向它"的半成品行）。
+// Acceptance point: a store that yields no id must fail the append and leave no message
+// behind in memory.
+func TestSession_RefusesMessageWithoutID(t *testing.T) {
+	sess := core.NewSession("cli-3f9a1c07b2d84e55", &noIDStore{}, nil)
+
+	err := sess.AppendMessage(context.Background(), "run-1",
+		core.Message{Role: core.RoleUser, Content: "无身份"})
+	require.Error(t, err, "缺标识的历史必须拒绝，不得静默接受")
+	require.Contains(t, err.Error(), "消息标识", "错误文本必须点名缺的是什么")
+	require.Empty(t, sess.Messages(), "失败的消息不得进内存历史")
+}
+
+// 中文验收点（US-16 裁决 2026-10-28）：无状态会话按**追加位置**发临时标识
+// `msg/<runID>/<pos>`（pos 从 1 起，§3.1.11 冻结字面量）——同一 Run 内稳定，Run 结束
+// 后只作审计。
+// Acceptance point: stateless messages get msg/<runID>/<pos> ids starting at 1.
+func TestSession_StatelessIDsAreRunScoped(t *testing.T) {
+	sess := core.NewSession("", nil, nil)
+	ctx := context.Background()
+
+	require.NoError(t, sess.AppendMessage(ctx, "run-42", core.Message{Role: core.RoleUser, Content: "u"}))
+	require.NoError(t, sess.AppendMessage(ctx, "run-42", core.Message{Role: core.RoleAssistant, Content: "a"}))
+	require.NoError(t, sess.AppendMessage(ctx, "run-42", core.Message{Role: core.RoleTool, Content: "t", ToolCallID: "c1"}))
+
+	history := sess.Messages()
+	require.Equal(t, "msg/run-42/1", history[0].ID, "冻结字面量 msg/<runID>/<pos>，pos 从 1 起")
+	require.Equal(t, core.StatelessMessageID("run-42", 2), history[1].ID)
+	require.Equal(t, core.StatelessMessageID("run-42", 3), history[2].ID)
 }
 
 // 中文验收点（E2）：判据**只看消息**——某个调用有没有一条 `role=tool` 且 id 相同的

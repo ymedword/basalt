@@ -31,9 +31,10 @@ const (
 	missingPublishedPrefix  = "资源引用无已发布版本："
 )
 
-// defaultMemoryBackend 是归一化配置为空时的后端字面量（约束 28：空 → markdown）。
-// defaultMemoryBackend is the fallback backend literal when config is empty.
-const defaultMemoryBackend = "markdown"
+// defaultMemoryBackend 是 `/memory` 视图的后端字面量：运行时唯一载体为 PostgreSQL
+// （D-18，契约 `MemoryView.backend` 的枚举只有 postgres）。装配层注入的值缺省时代入。
+// defaultMemoryBackend is the single runtime backend literal (D-18).
+const defaultMemoryBackend = "postgres"
 
 // registeredAgent 按名字查装载结果；未注册（含被拒）返回 false。
 // 供 POST /sessions 与 POST /agents/{name}/invoke 共用。
@@ -224,7 +225,7 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMemory 只读全局层两分区（约束 28）：分区原样透传（含标题行、空分区为空串），
-// backend 取归一化配置；读取失败记 ERROR 并回固定 500 文案。
+// backend 恒为 postgres（D-18：配置面已无载体可读）；读取失败记 ERROR 并回固定 500 文案。
 // handleMemory serves the global layer's two partitions; read failures are 500.
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 	coreText, archiveText, err := s.opts.Memory.Sections(r.Context(), core.GlobalScope)

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是工具来源投影的验收面（模块卡 §4.5.8 / 契约 D-06 / 约束 C-07）：回答"这条工具

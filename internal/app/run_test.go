@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 import (
@@ -17,7 +19,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -68,6 +70,32 @@ func TestRun_HeavyCommandSplit(t *testing.T) {
 	require.True(t, needsRuntime([]string{"gateway"}), "gateway 是重命令（US-9：全量装配 + 常驻）")
 
 	require.False(t, needsRuntime([]string{"--version"}), "全是选项的调用没有命令名")
+}
+
+// TestRun_OfflineSecretsCommandsSkipHeavyPath 对应 §2.12.0b / §3.1.8b 的命令边界：
+// `secrets recover-record` 与 `secrets adopt-legacy` **不装配 runtime**（不迁移、不自动
+// adopt、不启 MCP），因此必须绕开重路径；同组的在线子命令仍走重路径。
+//
+// 逆改点：把 offlineSecretsCommands 清空、或让 needsRuntime 只看命令组名 → 两条离线命令
+// 的前两条断言红（演练里的表现是副本被 `newRuntime` 迁移 / 自动 adopt）；把在线子命令也
+// 加进豁免清单 → 后四条断言红。
+// Reverting the exemption turns the first two assertions red; over-widening it turns the
+// next four red.
+func TestRun_OfflineSecretsCommandsSkipHeavyPath(t *testing.T) {
+	require.False(t, needsRuntime([]string{"secrets", "adopt-legacy", "--workspace", "/copy/.basalt"}),
+		"adopt-legacy 只操作隔离副本，不得装配 runtime（§2.12.0b）")
+	require.False(t, needsRuntime([]string{"secrets", "recover-record", "--workspace", "/ws/.basalt"}),
+		"recover-record 自己持实例锁，重路径先取锁会让它 workspace_busy（§3.1.8b）")
+
+	// 选项夹在命令名与子命令之间也不影响判定。
+	require.False(t, needsRuntime([]string{"--verbose", "secrets", "adopt-legacy"}),
+		"子命令判定跳过选项位")
+
+	for _, online := range []string{"init", "status", "verify", "revoke-managed"} {
+		require.True(t, needsRuntime([]string{"secrets", online}),
+			"%s 建立在真库与真主密钥之上，仍走重路径", online)
+	}
+	require.True(t, needsRuntime([]string{"secrets"}), "没有子命令时仍是重命令（打印帮助）")
 }
 
 // TestRunWithRuntime_ReleasesAfterExec 对应颗粒度文档 R17（原文保留）：
@@ -426,7 +454,11 @@ func TestStartupReconcile_RemovalIgnored(t *testing.T) {
 	rt := seq.start()
 	v1 := probePointer(t, rt)
 
-	fx.cfg = &cli.Config{}
+	// 只清 providers 段：`database` 段不是"定义文件对账"的对象，它的 DSN 是重路径开库的
+	// 前置条件——整份零值会让重启在连库一步就失败，测不到删除语义。
+	// Only the providers list is emptied; the database section is what the heavy path
+	// needs to open at all and is not part of the definition reconciliation.
+	fx.cfg = &cli.Config{Database: cli.DatabaseConfig{DSN: fx.dsn}}
 	require.NoError(t, os.WriteFile(filepath.Join(fx.workDir, configFileName),
 		[]byte("# 运维手工删除了 providers 段（不被接受为删除）\n"), 0o644))
 	fx.logs.Reset()
@@ -483,7 +515,8 @@ func TestRunAdmission_PinsProviderVersion(t *testing.T) {
 	v2 := publishProbeVersionForTest(t, rt, "probe-model-v2")
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
-		Agent: "runner", SessionID: "pins-provider", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "runner", SessionID: "pins-provider", Message: "hi", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -518,7 +551,8 @@ func TestRunAdmission_PublishGateConsistent(t *testing.T) {
 	go func() {
 		close(started)
 		res, err := rt.service.Run(context.Background(), core.RunRequest{
-			Agent: "runner", SessionID: "publish-gate", Message: "hi", Channel: "cli",
+			Principal: core.LocalAdminPrincipal(),
+			Agent:     "runner", SessionID: "publish-gate", Message: "hi", Channel: "cli",
 		})
 		done <- runOutcome{res: res, err: err}
 	}()
@@ -569,7 +603,8 @@ func TestRunAdmission_RoutingFollowsPublishedCatalog(t *testing.T) {
 	rt.resourceGate.Unlock()
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
-		Agent: "runner", SessionID: "routing-follows-catalog", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "runner", SessionID: "routing-follows-catalog", Message: "hi", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -679,9 +714,9 @@ func TestRunRuntime_ReleaseAfterFinish(t *testing.T) {
 		RunResources: NewRunResources(rt.versions, catalog, client, rt.mcpRT, rt.skills, rt.resourceGate,
 			AdmissionDeps{
 				Identities:  rt.versions,
-				NotifyAdmin: storage.NewNotifyAdminStore(rt.db),
-				Channels:    storage.NewNotifyChannelRepo(rt.db),
-				Bindings:    storage.NewBindingStore(rt.db),
+				NotifyAdmin: postgres.NewNotifyAdminStore(rt.db),
+				Channels:    postgres.NewNotifyChannelRepo(rt.db),
+				Bindings:    postgres.NewBindingStore(rt.db),
 			}),
 		rec: rec,
 	}
@@ -695,7 +730,7 @@ func TestRunRuntime_ReleaseAfterFinish(t *testing.T) {
 		Client:       client,
 		Messages:     rt.sessions,
 		Runs:         &recordingRunStore{RunStore: rt.runs, rec: rec},
-		Snapshots:    storage.NewSnapshotStore(rt.db),
+		Snapshots:    postgres.NewSnapshotStore(rt.db),
 		Audit:        rt.invocations,
 		Memory:       rt.mem,
 		Loop:         loop,
@@ -709,7 +744,8 @@ func TestRunRuntime_ReleaseAfterFinish(t *testing.T) {
 	})
 
 	res, err := service.Run(context.Background(), core.RunRequest{
-		Agent: "runner", SessionID: "release-after-finish", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "runner", SessionID: "release-after-finish", Message: "hi", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -741,7 +777,7 @@ func seedNotifyChannel(t *testing.T, env *runResourcesEnv, name string) core.Res
 	t.Helper()
 	uid, err := core.NewResourceUID()
 	require.NoError(t, err)
-	require.NoError(t, storage.NewNotifyAdminStore(env.db).Create(context.Background(), core.NotifyChannel{
+	require.NoError(t, postgres.NewNotifyAdminStore(env.db).Create(context.Background(), core.NotifyChannel{
 		ResourceUID: uid,
 		Name:        name,
 		Type:        "webhook",

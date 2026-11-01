@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strconv"
 	"time"
 )
 
@@ -22,8 +23,40 @@ type Message struct {
 	ToolCallID       string         `json:"tool_call_id,omitempty"`
 	ReasoningContent string         `json:"reasoning_content,omitempty"`
 	ProviderExtra    map[string]any `json:"provider_extra,omitempty"`
+	// EvidenceRefs 是本条消息的**来源引用**（US-16）：`tool` 消息取该工具结果的引用、
+	// `assistant` 消息取本次模型调用实际输入的引用集合、`user` 消息不携带。它是**读面
+	// 注记**——不进协议、不进 `messages` 正文，持久化走 `message_evidence_refs`（同一追加
+	// 路径同事务写入，原则 II 不变）。
+	// EvidenceRefs is a read-side annotation for this message; it never enters the
+	// protocol or the messages body, and is persisted through message_evidence_refs.
+	EvidenceRefs []EvidenceRef `json:"-"`
+	// ID 是这条消息的**身份字面量**（US-16 装配记录与压缩条目共用）：会话范围 =
+	// `messages.id` 的十进制串（写路径取回、读路径填充）；无状态范围 =
+	// `StatelessMessageID(runID, pos)`（只在本次 Run 内有效）。出站请求**不带**它，
+	// 它只服务 `history_trim` 的 `FirstDroppedMessageID` / `CutMessageID` 与压缩覆盖范围。
+	// 空串 = 该消息没有可信身份——`Build` 在**丢弃**这类消息时 fail-closed，不猜、不留空。
+	// ID is the message's identity literal (messages.id as a decimal string, or the
+	// stateless msg/<runID>/<pos> form). Never sent to the provider; Build refuses to
+	// trim a message whose ID is unknown rather than record a guessed or empty value.
+	ID string `json:"-"`
 	// CreatedAt 是读面时间戳：Messages 不填，仅 MessagesTail 填充；协议序列化不含它。
 	CreatedAt time.Time `json:"-"`
+}
+
+// StatelessMessageID 返回无状态 Run 内一条消息的**临时标识**（§3.1.11 冻结字面量
+// `msg/<runID>/<pos>`，`pos` 从 1 起）。`Session` 的消息历史只追加、顺序不变，故同一
+// Run 内 `pos` 稳定；这类标识**不可**经历史精确读取解析（`messages` 表无对应行），
+// 也不得被当作消息主键。
+// StatelessMessageID returns the temporary id of a message inside a stateless run.
+// Positions are stable because a Session only appends; the id is never a row key.
+//
+// 定义放在 core 而不只在 `internal/compaction`：`Session` 是唯一的消息追加路径，
+// 它必须能给无状态消息分配同一个字面量；`compaction.StatelessMessageID` 委托到这里，
+// 两处不会各写一份而漂移。
+// It lives in core because Session — the one append path — must assign the same
+// literal; the compaction package delegates here so the two cannot drift apart.
+func StatelessMessageID(runID string, pos int) string {
+	return "msg/" + runID + "/" + strconv.Itoa(pos)
 }
 
 // ToolCall 是模型给出的工具调用请求：本 US 只透传，执行权归 US-4 的 ToolExecutor。
@@ -100,6 +133,27 @@ const (
 	LLMCallFailed LLMCallStatus = "failed"
 	// LLMCallUnknown 由恢复扫描写入（US-4）；本 US 不产生。
 	LLMCallUnknown LLMCallStatus = "unknown"
+)
+
+// LLMCallPurpose 是 llm_calls.purpose 的字面量集（契约 schema.sql 的 CHECK 逐字）。
+// 该列**不在** `LLMCall` 预写形态里：purpose 由存储层按调用种类固定写（与 status 由
+// 仓储写 'pending' 同一条理由），调用方无法传错，也不新增第二套写法。
+// 本 US 只产生 chat 与 compaction 两个值；其余三个是冻结词表的一部分，留给后续模块，
+// 不在这里增删。
+// LLMCallPurpose mirrors the frozen purpose CHECK. The pre-write shape deliberately has no
+// purpose field: the storage layer writes it per call kind, so callers cannot get it wrong.
+type LLMCallPurpose string
+
+const (
+	// LLMCallPurposeChat 是对话轮调用（`BeginCall` 固定写它）。
+	LLMCallPurposeChat LLMCallPurpose = "chat"
+	// LLMCallPurposeRerank / Summary / Embedding 属后续模块，本 US 不产生。
+	LLMCallPurposeRerank    LLMCallPurpose = "rerank"
+	LLMCallPurposeSummary   LLMCallPurpose = "summary"
+	LLMCallPurposeEmbedding LLMCallPurpose = "embedding"
+	// LLMCallPurposeCompaction 是会话压缩的摘要调用（`BeginCompactionCall` 固定写它）：
+	// 摘要不是对话轮，单独成值才能让"摘要花了多少钱"可被直接聚合（C-25）。
+	LLMCallPurposeCompaction LLMCallPurpose = "compaction"
 )
 
 // ErrorKind 是失败分类的八类字面量（契约 §7.3；R4 新增 notify_disabled）。

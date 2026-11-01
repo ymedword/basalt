@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `internal/app/providers.go` 的验收面：US-3 起的显式映射（宪法 III）在这里判卷，
@@ -16,11 +18,9 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -31,7 +31,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/testutil"
 )
 
@@ -94,15 +95,13 @@ func TestNewProviderService_ConfigToAuditRowChain(t *testing.T) {
 			`"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`,
 	})
 
-	path := filepath.Join(t.TempDir(), "basalt.db")
-	db, err := storage.OpenWritable(ctx, path, storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	fx := pgtest.NewFixture(t)
+	db := fx.DB
 
 	cfg := providersConfig(cli.ProviderConfig{
 		Name: "demo", BaseURL: srv.URL(), DefaultModel: "demo-model",
 	})
-	svc, err := newProviderService(cfg, storage.NewLLMCallRepo(db), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := newProviderService(cfg, postgres.NewLLMCallRepo(db), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 
 	resp, err := svc.Chat(ctx, core.ChatRequest{
@@ -112,9 +111,7 @@ func TestNewProviderService_ConfigToAuditRowChain(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "pong", resp.Content)
 
-	read, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, read.Close()) })
+	read := openRead(t, fx.DSN)
 
 	var (
 		status, model, runID string
@@ -140,7 +137,7 @@ func TestNewProviderService_ConfigToAuditRowChain(t *testing.T) {
 // providerCatalogFixture seeds a temp database with one pending operation reused as the
 // non-null foreign key of every seeded version.
 type providerCatalogFixture struct {
-	store *storage.ResourceStore
+	store *postgres.ResourceStore
 	opID  string
 }
 
@@ -148,12 +145,9 @@ func newProviderCatalogFixture(t *testing.T) *providerCatalogFixture {
 	t.Helper()
 
 	ctx := context.Background()
-	db, err := storage.OpenWritable(ctx, filepath.Join(t.TempDir(), "basalt.db"),
-		storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	ops := storage.NewManagementStore(db)
+	ops := postgres.NewManagementStore(db)
 	opID := core.NewOperationID(time.Now())
 	require.NoError(t, ops.BeginOperation(ctx, core.OperationRecord{
 		OperationID:  opID,
@@ -166,7 +160,7 @@ func newProviderCatalogFixture(t *testing.T) *providerCatalogFixture {
 		Status:       core.OperationPending,
 		CreatedAt:    time.Now(),
 	}))
-	return &providerCatalogFixture{store: storage.NewResourceStore(db), opID: opID}
+	return &providerCatalogFixture{store: postgres.NewResourceStore(db), opID: opID}
 }
 
 // publish 幂等写入一个 model_connection 版本并把发布指针指过去（内容哈希由定义原文派生）。

@@ -3,7 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,11 +12,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	// 损坏态夹具要用裸连接造"版本表在、版本行无"的库：驱动经副作用注册。
-	_ "modernc.org/sqlite"
-
 	"github.com/ymedword/basalt/internal/cli"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -30,25 +28,45 @@ type statusResult struct {
 	logs   string
 }
 
-// testStore / testWorkspace 是测试侧的两个端口适配器：转调真实现包（status 的
-// 三态诊断要真库才立得住），形态与装配层的适配器一致——端口的一个返回类型是
-// cli 定义的接口类型，实现包命名不了它，所以适配只能在消费侧发生。
-// Test-side adapters over the real implementations, shaped like the assembly
-// layer's: the port returns a cli-defined interface, so the adapter belongs to
-// the consumer side.
-type testStore struct{}
-
-func (testStore) Bootstrap(ctx context.Context, path string, target int) (bool, error) {
-	return storage.Bootstrap(ctx, path, target)
+// statusStore 是可脚本化的存储端口替身：`status` 节 3 只消费"版本 + 表清点"两个读数，
+// PostgreSQL 的真实打开与读取由装配层的集成用例判（cli 不 import 驱动）。命令面这里
+// 判的是状态矩阵、文案与接线，不需要数据库。
+// statusStore scripts the storage port: section 3 consumes only a version and a table
+// inventory, so the command-layer tests need no real database.
+type statusStore struct {
+	view cli.SchemaView
+	err  error
 }
 
-func (testStore) OpenReadOnly(ctx context.Context, path string, target int) (cli.SchemaView, error) {
-	db, err := storage.OpenReadOnly(ctx, path, target)
-	if err != nil {
-		// typed-nil：*storage.DB 装箱进接口前必须显式判空。
-		return nil, err
+func (statusStore) Bootstrap(context.Context, string, int) (bool, error) {
+	return false, errors.New("status 用例不得走 init 引导")
+}
+
+func (s statusStore) OpenReadOnly(context.Context, cli.DatabaseConfig) (cli.SchemaView, error) {
+	if s.err != nil {
+		return nil, s.err
 	}
-	return db, nil
+	return s.view, nil
+}
+
+// statusView 是 statusStore 交出的只读视图：各读数按用例脚本返回。
+// statusView is the scripted read-only view handed out by statusStore.
+type statusView struct {
+	version    int
+	tables     []string
+	versionErr error
+	tablesErr  error
+	closeErr   error
+	closed     bool
+}
+
+func (v *statusView) SchemaVersion(context.Context) (int, error) { return v.version, v.versionErr }
+
+func (v *statusView) TableNames(context.Context) ([]string, error) { return v.tables, v.tablesErr }
+
+func (v *statusView) Close() error {
+	v.closed = true
+	return v.closeErr
 }
 
 type testWorkspace struct{}
@@ -76,7 +94,7 @@ func (testWorkspace) Inspect(root string) ([]string, error) {
 // The real root command is exercised rather than an internal function, so the
 // three-section report, the exit-code path and the stderr wording are all under
 // test.
-func executeStatus(t *testing.T, workDir string, schemaVersion int) statusResult {
+func executeStatus(t *testing.T, workDir string, schemaVersion int, store cli.Store) statusResult {
 	t.Helper()
 
 	var logs bytes.Buffer
@@ -84,7 +102,7 @@ func executeStatus(t *testing.T, workDir string, schemaVersion int) statusResult
 		WorkDir:                workDir,
 		SupportedSchemaVersion: schemaVersion,
 		Logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
-		Store:                  testStore{},
+		Store:                  store,
 		Workspace:              testWorkspace{},
 	}
 
@@ -99,19 +117,21 @@ func executeStatus(t *testing.T, workDir string, schemaVersion int) statusResult
 	return statusResult{err: err, stdout: stdout.String(), stderr: stderr.String(), logs: logs.String()}
 }
 
-// initWorkspace 在 root 下铺一个**完整**工作区（骨架 + 库）——各用例只制造一个
-// 失败面，失败归属才唯一；基线不齐会让"配置无效"之类的断言混进别的失败原因。
-// initWorkspace lays down a complete workspace so each case isolates one failure.
-func initWorkspace(t *testing.T, root string, schemaVersion int) {
+// initWorkspace 在 root 下铺一个**完整**工作区骨架——各用例只制造一个失败面，
+// 失败归属才唯一。存储不再落工作区（运行期后端是外部 PostgreSQL），骨架之外没有
+// 库文件可铺；存储节的状态由 statusStore 按用例脚本给出。
+// initWorkspace lays down the workspace skeleton only; storage is external now.
+func initWorkspace(t *testing.T, root string) {
 	t.Helper()
 
-	wsRoot := filepath.Join(root, ".basalt")
-	_, err := workspace.Init(wsRoot)
-	require.NoError(t, err)
-
-	_, err = storage.Bootstrap(context.Background(), filepath.Join(wsRoot, "basalt.db"), schemaVersion)
+	_, err := workspace.Init(filepath.Join(root, ".basalt"))
 	require.NoError(t, err)
 }
+
+// statusDSN 是配置里合法的 PostgreSQL 连接串形态：status 只看它是否非空，
+// 打开动作由 statusStore 脚本承担，不会真的连出去。
+// statusDSN is a well-formed DSN; section 3 only checks non-emptiness here.
+const statusDSN = "postgres://basalt@127.0.0.1:5432/basalt"
 
 // writeInstanceConfig 把配置写到工作目录下的 basalt.yaml——status 节 2 读的就是
 // 这个位置（与工作区**同级**、不在 .basalt/ 内，Operations §6）。
@@ -124,40 +144,56 @@ func writeInstanceConfig(t *testing.T, workDir, content string) string {
 	return path
 }
 
-// corruptDatabase 造一个"schema_version 表在、版本行无"的库——损坏态夹具。
-// corruptDatabase builds the corrupt-state fixture: the version table with no row.
-func corruptDatabase(t *testing.T, path string) {
+// writeDatabaseConfig 写一份只含 `database` 段的合法配置——存储节因此有 DSN 可读。
+// writeDatabaseConfig writes a minimal valid configuration for section 3.
+func writeDatabaseConfig(t *testing.T, workDir string) {
 	t.Helper()
-
-	db, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
-	_, err = db.Exec(`CREATE TABLE schema_version (` +
-		`version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT NOT NULL)`)
-	require.NoError(t, err)
+	writeInstanceConfig(t, workDir, "database:\n  dsn: "+statusDSN+"\n")
 }
 
-// TestStatus_ReadyWithoutConfig 验收点（文档用例名同名）·验收 Demo 主路径：
-// init 之后**没有配置文件**也要 exit 0——节 2 报「未发现配置（路径明示）」但不计
-// 失败（评审修订 P2-5：允许无配置的诊断模式，无需配置准备步骤）。
-func TestStatus_ReadyWithoutConfig(t *testing.T) {
+// TestStatus_ReadyWithConfig ·验收 Demo 主路径：工作区齐备 + `database.dsn` 已配置
+// → 三节全部通过、exit 0；节 3 报后端、schema 版本与表清点，且视图被关闭。
+func TestStatus_ReadyWithConfig(t *testing.T) {
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
+	writeDatabaseConfig(t, root)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
-	require.NoError(t, run.err, "无配置不得计失败；stdout=%s", run.stdout)
+	target := postgres.SupportedSchemaVersion
+	view := &statusView{version: target, tables: []string{"sessions", "runs", "messages"}}
+	run := executeStatus(t, root, target, statusStore{view: view})
+	require.NoError(t, run.err, "全部通过时 exit 0；stdout=%s", run.stdout)
+
+	require.Contains(t, run.stdout, "工作区：就绪")
+	require.Contains(t, run.stdout, "配置：已装载")
+	require.Contains(t, run.stdout, fmt.Sprintf("存储：就绪（PostgreSQL，schema v%d，3 张表）", target))
+	require.Contains(t, run.stdout, "汇总：全部通过")
+	require.True(t, view.closed, "只读视图必须被关闭")
+
+	require.NotContains(t, run.logs, "level=ERROR", "全部通过时不得有 ERROR 日志；logs=%s", run.logs)
+}
+
+// TestStatus_NoConfigFailsStorageSection：**没有配置文件**时节 2 报「未发现配置」
+// 但不计失败；存储节没有 DSN 可读，如实报「未配置 database.dsn」并计失败。
+// US-16 起运行期后端是外部 PostgreSQL：workspace-only 的诊断无法声称存储就绪，
+// 也就不再把"无配置"当成全绿（P-01：`status` 改读 PG）。
+// Without a configuration the storage section cannot be judged at all, so the
+// command exits non-zero with an explicit missing-DSN message.
+func TestStatus_NoConfigFailsStorageSection(t *testing.T) {
+	root := t.TempDir()
+	initWorkspace(t, root)
+
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("无 DSN 时不得打开数据库")})
+	require.Error(t, run.err)
 
 	require.Contains(t, run.stdout, "工作区：就绪")
 	require.Contains(t, run.stdout, "未发现配置", "节 2 必须明示未发现配置")
 	require.Contains(t, run.stdout, filepath.Join(root, "basalt.yaml"), "未发现配置必须点名路径")
-	require.Contains(t, run.stdout, "存储：就绪")
-	require.Contains(t, run.stdout, fmt.Sprintf("schema v%d", storage.SupportedSchemaVersion),
-		"目标版本以 storage.SupportedSchemaVersion 为准（US-12 R7 起 v4）")
-	require.Contains(t, run.stdout, "33 张表", "就绪时报版本 + 表清点（v1 11 张 + v2 7 张 + v3 8 张 + v4 2 张 + v5 1 张 + v6 4 张）")
-	require.Contains(t, run.stdout, "汇总：全部通过")
+	require.Contains(t, run.stdout, "未配置 database.dsn", "存储节必须点名缺的键")
+	require.Contains(t, run.stdout, "汇总：1 节未通过（存储）")
+	require.NotContains(t, run.stdout, "无 DSN 时不得打开数据库", "缺 DSN 时根本不该尝试打开")
 
-	require.NotContains(t, run.logs, "level=ERROR", "全部通过时不得有 ERROR 日志；logs=%s", run.logs)
+	require.Contains(t, run.logs, "level=ERROR", "失败路径必须留痕（FR-006）；logs=%s", run.logs)
 }
 
 // TestStatus_UninitializedWorkspace 未初始化 → 可读提示（含"先跑 basalt init"）
@@ -165,12 +201,13 @@ func TestStatus_ReadyWithoutConfig(t *testing.T) {
 func TestStatus_UninitializedWorkspace(t *testing.T) {
 	root := t.TempDir()
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("工作区未初始化时不得打开数据库")})
 	require.Error(t, run.err)
 
 	require.Contains(t, run.stdout, "工作区：未初始化")
 	require.Contains(t, run.stdout, "basalt init")
-	require.Contains(t, run.stdout, "库未就绪", "节 1 失败不阻断节 3——两节各自点名")
+	require.Contains(t, run.stdout, "未配置 database.dsn", "节 1 失败不阻断节 3——两节各自点名")
 	require.Contains(t, run.stdout, "汇总：2 节未通过")
 
 	require.Contains(t, run.logs, "level=ERROR", "失败路径必须留痕（FR-006）；logs=%s", run.logs)
@@ -178,74 +215,72 @@ func TestStatus_UninitializedWorkspace(t *testing.T) {
 }
 
 // TestStatus_ConfigInvalidFails 配置存在但无效 → 计失败并点名路径与键；同一次
-// 报告里后续节照常给出结论（节内失败不阻断后续节）。
+// 报告里后续节照常给出结论（节内失败不阻断后续节）。配置装载失败意味着拿不到
+// `database.dsn`，存储节因此同样计失败——两节各自点名。
 func TestStatus_ConfigInvalidFails(t *testing.T) {
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
 	writeInstanceConfig(t, root, `providers:
   - name: demo
     api_key: plaintext-config-credential
 `)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("配置无效时不得打开数据库")})
 	require.Error(t, run.err)
 
 	require.Contains(t, run.stdout, "配置：无效")
 	require.Contains(t, run.stdout, "providers[0].api_key")
 	require.Contains(t, run.stdout, filepath.Join(root, "basalt.yaml"))
-	require.Contains(t, run.stdout, "存储：就绪", "节 2 失败不得阻断节 3")
-	require.Contains(t, run.stdout, "汇总：1 节未通过（配置）")
+	require.Contains(t, run.stdout, "未配置 database.dsn", "节 2 失败不得阻断节 3")
+	require.Contains(t, run.stdout, "汇总：2 节未通过（配置、存储）")
 
 	require.Contains(t, run.logs, "level=ERROR")
 	require.Contains(t, run.logs, "配置无效")
 }
 
 // TestStatus_SchemaStateFails 存储三态各自点名、各自计失败（§2.3 状态矩阵的
-// status 一列）：旧版本（经 Deps 注入支持版本 2 制造）/ 过高 / 损坏。
+// status 一列）：旧版本（经 Deps 注入更高的支持版本制造）/ 过高 / 损坏。
 func TestStatus_SchemaStateFails(t *testing.T) {
-	supported := storage.SupportedSchemaVersion
+	supported := postgres.SupportedSchemaVersion
 
 	cases := []struct {
 		name     string
-		prepare  func(t *testing.T, root string)
+		view     *statusView
 		depsVer  int
 		wantText []string
 	}{
 		{
-			name: "旧版本：库 v1 低于二进制支持的 v2",
-			prepare: func(t *testing.T, root string) {
-				initWorkspace(t, root, supported)
+			name:    "旧版本：库 v1 低于二进制支持的 v2",
+			view:    &statusView{version: supported},
+			depsVer: supported + 1,
+			wantText: []string{
+				"库版本旧于二进制", "先运行 basalt db migrate",
 			},
-			depsVer:  supported + 1,
-			wantText: []string{"库版本旧于二进制", "status 只校验、不迁移"},
 		},
 		{
-			name: "过高：库 v2 高于二进制支持的 v1",
-			prepare: func(t *testing.T, root string) {
-				initWorkspace(t, root, supported+1)
-			},
+			name:     "过高：库 v2 高于二进制支持的 v1",
+			view:     &statusView{version: supported + 1},
 			depsVer:  supported,
 			wantText: []string{"库版本高于二进制", "请升级 basalt 二进制"},
 		},
 		{
-			name: "损坏：版本表在但无版本行",
-			prepare: func(t *testing.T, root string) {
-				wsRoot := filepath.Join(root, ".basalt")
-				_, err := workspace.Init(wsRoot)
-				require.NoError(t, err)
-				corruptDatabase(t, filepath.Join(wsRoot, "basalt.db"))
+			name:    "损坏：版本表在但无版本行",
+			view:    &statusView{versionErr: core.ErrSchemaCorrupt},
+			depsVer: supported,
+			wantText: []string{
+				"库已损坏", "版本表在但无版本行", "需人工判定",
 			},
-			depsVer:  supported,
-			wantText: []string{"库已损坏", "无版本行", "需人工判定"},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			tc.prepare(t, root)
+			initWorkspace(t, root)
+			writeDatabaseConfig(t, root)
 
-			run := executeStatus(t, root, tc.depsVer)
+			run := executeStatus(t, root, tc.depsVer, statusStore{view: tc.view})
 			require.Error(t, run.err)
 			require.Contains(t, run.stdout, "存储：")
 			for _, want := range tc.wantText {
@@ -266,13 +301,14 @@ func TestStatus_NoCredentialLeakInOutputs(t *testing.T) {
 	const plaintext = "leak-probe-credential-3f9a2b"
 
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
 	writeInstanceConfig(t, root, `providers:
   - name: demo
     api_key: `+plaintext+`
 `)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("配置无效时不得打开数据库")})
 	require.Error(t, run.err)
 
 	require.NotContains(t, run.logs, plaintext, "logger 缓冲不得出现凭证值")
@@ -300,13 +336,14 @@ func TestStatus_SyntaxErrorDoesNotLeakCredential(t *testing.T) {
 	const secret = "sk-status-syntax-leak-3f9a2b"
 
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
 	writeInstanceConfig(t, root, `providers:
   - name: demo
     api_key: "`+secret+`
 `)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("配置无效时不得打开数据库")})
 	require.Error(t, run.err)
 
 	requireNoCredentialLeak(t, run, secret)
@@ -321,14 +358,15 @@ func TestStatus_TypeErrorDoesNotLeakResolvedCredential(t *testing.T) {
 	t.Setenv("PROBE_API_KEY", secret)
 
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
 	writeInstanceConfig(t, root, `providers:
   - name: demo
     api_key: ${PROBE_API_KEY}
     default_model: [oops]
 `)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("配置无效时不得打开数据库")})
 	require.Error(t, run.err)
 
 	requireNoCredentialLeak(t, run, secret)
@@ -344,13 +382,14 @@ func TestStatus_UndefinedAliasDoesNotLeakCredential(t *testing.T) {
 	const alias = "SENTINEL-ALIAS-3f9a2b"
 
 	root := t.TempDir()
-	initWorkspace(t, root, storage.SupportedSchemaVersion)
+	initWorkspace(t, root)
 	writeInstanceConfig(t, root, `providers:
   - name: demo
     api_key: *`+alias+`
 `)
 
-	run := executeStatus(t, root, storage.SupportedSchemaVersion)
+	run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+		statusStore{err: errors.New("配置无效时不得打开数据库")})
 	require.Error(t, run.err)
 
 	requireNoCredentialLeak(t, run, alias)
@@ -372,15 +411,17 @@ func TestStatus_NonStringCredentialFailsConfigSection(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			initWorkspace(t, root, storage.SupportedSchemaVersion)
+			initWorkspace(t, root)
 			writeInstanceConfig(t, root, "providers:\n  - name: demo\n    api_key: "+tc.value+"\n")
 
-			run := executeStatus(t, root, storage.SupportedSchemaVersion)
+			run := executeStatus(t, root, postgres.SupportedSchemaVersion,
+				statusStore{err: errors.New("配置无效时不得打开数据库")})
 			require.Error(t, run.err, "非字符串凭证必须判失败；stdout=%s", run.stdout)
 
 			require.Contains(t, run.stdout, "配置：无效")
 			require.Contains(t, run.stdout, "必须是 ${VAR} 形态的字符串")
-			require.Contains(t, run.stdout, "汇总：1 节未通过（配置）")
+			require.Contains(t, run.stdout, "汇总：2 节未通过（配置、存储）",
+				"配置无效拿不到 DSN，存储节同轮失败")
 			require.NotContains(t, run.stdout, tc.value, "不得回显原始值")
 			require.Contains(t, run.logs, "level=ERROR")
 		})

@@ -842,6 +842,32 @@ func TestAgentContent_PutPatch_Success(t *testing.T) {
 	require.Equal(t, "AGENT.md", view.Files[0].Path)
 }
 
+func TestAgentContent_GlobalMemoryChoiceUsesConditionalWrite(t *testing.T) {
+	env := newContentEnv(t)
+	etag := currentETag(t, env)
+	response := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"settings":{"include_global_memory":true}}}`, etag))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Contains(t, string(readAgentDoc(t, env.root, contentAgentName)), "include_global_memory: true")
+	response = serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"settings":{"include_global_memory":false}}}`, etag))
+	require.Equal(t, http.StatusPreconditionFailed, response.Code)
+	require.Contains(t, string(readAgentDoc(t, env.root, contentAgentName)), "include_global_memory: true")
+}
+
+func TestAgentContent_KnowledgeDeclarationsUseConditionalWrite(t *testing.T) {
+	env := newContentEnv(t)
+	etag := currentETag(t, env)
+	response := serveAdmin(env.server, contentPUT(contentAgentName,
+		`{"changes":{"knowledge":[{"name":"手册","access":"read"}]}}`, etag))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	definition := string(readAgentDoc(t, env.root, contentAgentName))
+	require.Contains(t, definition, `name: "手册"`)
+	response = serveAdmin(env.server, contentPUT(contentAgentName, `{"changes":{"knowledge":[]}}`, etag))
+	require.Equal(t, http.StatusPreconditionFailed, response.Code)
+	require.Equal(t, definition, string(readAgentDoc(t, env.root, contentAgentName)))
+}
+
 // TestAgentContentChanges_TemperatureTriState：温度补丁三态——省略 = 不修改，
 // 数字（含 0）= 写入，`null` = 清除（回到供应商缺省）。省略**不得**被读成清除。
 // 对应契约：agent-md §2.3 `changes.provider.temperature`。
@@ -893,6 +919,60 @@ func TestAgentContentChanges_TemperatureTriState(t *testing.T) {
 
 // ptrFloat 取浮点指针，仅供上表写字面量期望值。
 func ptrFloat(v float64) *float64 { return &v }
+
+// TestAgentContentChanges_IncludeGlobalMemoryTriState：`include_global_memory` 三态
+// 在线上形状上是**四种**输入——省略 = 不修改，true / false = 写入，`null` = 清除
+// （回到未声明）。省略被读成清除会让每次改别的字段都顺手删掉用户的记忆选择。
+// 逆改点：把 `Set` 判断去掉、直接用 `Value == nil` 判清除 → "omitted" 子用例红。
+// 验收点：D-5；C-52。
+func TestAgentContentChanges_IncludeGlobalMemoryTriState(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantClear bool
+		wantValue *bool
+	}{
+		{
+			name: "omitted leaves unchanged",
+			body: `{"changes":{"settings":{"max_iterations":5}}}`,
+		},
+		{
+			name:      "explicit null clears",
+			body:      `{"changes":{"settings":{"include_global_memory":null}}}`,
+			wantClear: true,
+		},
+		{
+			name:      "true sets value",
+			body:      `{"changes":{"settings":{"include_global_memory":true}}}`,
+			wantValue: ptrBool(true),
+		},
+		{
+			name:      "false sets value",
+			body:      `{"changes":{"settings":{"include_global_memory":false}}}`,
+			wantValue: ptrBool(false),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body contentUpdateBody
+			require.NoError(t, json.Unmarshal([]byte(tc.body), &body))
+			require.NotNil(t, body.Changes)
+			changes, err := body.Changes.toCore()
+			require.NoError(t, err)
+			require.NotNil(t, changes.Settings)
+			require.Equal(t, tc.wantClear, changes.Settings.ClearIncludeGlobalMemory)
+			if tc.wantValue == nil {
+				require.Nil(t, changes.Settings.IncludeGlobalMemory)
+				return
+			}
+			require.NotNil(t, changes.Settings.IncludeGlobalMemory)
+			require.Equal(t, *tc.wantValue, *changes.Settings.IncludeGlobalMemory)
+		})
+	}
+}
+
+// ptrBool 取布尔指针，仅供上表写字面量期望值。
+func ptrBool(v bool) *bool { return &v }
 
 // TestAgentContent_PutPatchEditUnsupported：目标值带行内注释时补丁拒绝执行，
 // 返回 400 `EDIT_UNSUPPORTED` 并提示改用整份原文；磁盘零写入、零操作行。

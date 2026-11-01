@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是泄露哨兵的 golden 扫描（模块卡 R4.8 / T137；宪法架构约束「凭据纪律」）：
@@ -30,7 +32,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // 哨兵值在**运行时拼接**：源码里不出现完整形态，扫描器因此不会命中自己。
@@ -73,26 +75,17 @@ func assertNoLeak(t *testing.T, what string, data []byte, forbidden []string) {
 }
 
 // scanDatabaseForLeaks 遍历库内**全部表全部列**并逐值扫描，返回扫描过的字符串 / 字节值
-// 个数（阳性对照用：0 说明扫描器没读到东西）。表名从 `sqlite_master` 现取、列由
-// `SELECT *` 现取——抄一份列清单的话，下一次迁移加出来的列会悄悄跑到扫描面之外。
+// 个数（阳性对照用：0 说明扫描器没读到东西）。表名从当前 schema 现取（`TableNames`，
+// 与 status 同一口径）、列由 `SELECT *` 现取——抄一份列清单的话，下一次迁移加出来的列
+// 会悄悄跑到扫描面之外。
 // The sweep enumerates tables and columns at run time so a future migration cannot
 // silently escape the scan.
-func scanDatabaseForLeaks(t *testing.T, path string, forbidden []string) int {
+func scanDatabaseForLeaks(t *testing.T, db *postgres.DB, forbidden []string) int {
 	t.Helper()
 	ctx := context.Background()
-	db := openRawWrite(t, path)
 
-	names, err := db.QueryContext(ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	tables, err := db.TableNames(ctx)
 	require.NoError(t, err)
-	var tables []string
-	for names.Next() {
-		var name string
-		require.NoError(t, names.Scan(&name))
-		tables = append(tables, name)
-	}
-	require.NoError(t, names.Err())
-	require.NoError(t, names.Close())
 	require.NotEmpty(t, tables, "库内必须能找到表（否则扫描器在空转）")
 
 	scanned := 0
@@ -310,25 +303,26 @@ func TestCredentialLeak_NoPlaintextInSurfaces(t *testing.T) {
 
 	//    落库面：清单与引用行在同一事务里写进 runs / run_resource_manifests /
 	//    run_credential_refs / run_notify_refs；下面的库扫描据此覆盖持久形态。
-	require.NoError(t, storage.NewRunStore(f.db).StartRun(ctx, core.RunRecord{
+	require.NoError(t, postgres.NewRunStore(f.db).StartRun(ctx, core.RunRecord{
 		RunID:     leakRunID,
 		Agent:     "writer",
 		Channel:   "cli",
 		UserID:    "leak-tester",
+		Principal: core.LocalAdminPrincipal(),
 		StartedAt: baselineClock(),
 	}, manifest))
 
-	rawDB := openRawWrite(t, f.dbPath)
+	rawDB := openRawWrite(t, f.dsn)
 	var pinned int
 	require.NoError(t, rawDB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM run_credential_refs WHERE run_id = ? AND credential_id = ?`,
+		`SELECT COUNT(*) FROM run_credential_refs WHERE run_id = $1 AND credential_id = $2`,
 		leakRunID, written.CredentialID).Scan(&pinned))
 	require.Equal(t, 1, pinned, "阳性对照：凭据固定行必须真的落库")
 
 	// ④ `detail_json` 面：预写详情真的写了凭据元数据，随后由库扫描一并覆盖。
 	var detailJSON string
 	require.NoError(t, rawDB.QueryRowContext(ctx,
-		`SELECT detail_json FROM management_operations WHERE operation_id = ?`,
+		`SELECT detail_json FROM management_operations WHERE operation_id = $1`,
 		written.OperationID).Scan(&detailJSON))
 	require.Contains(t, detailJSON, written.CredentialID,
 		"阳性对照：预写详情必须真的带凭据元数据")
@@ -379,7 +373,7 @@ func TestCredentialLeak_NoPlaintextInSurfaces(t *testing.T) {
 	require.NotEmpty(t, revoked.OperationID, "撤销必须留下可查证的操作标识")
 
 	// ⑧ 收尾扫描：库面（全部表全部列）、日志面、前端产物面。
-	scannedValues := scanDatabaseForLeaks(t, f.dbPath, forbidden)
+	scannedValues := scanDatabaseForLeaks(t, f.db, forbidden)
 	require.Greater(t, scannedValues, 100, "阳性对照：库扫描必须真的读到值")
 
 	//    日志面：写面**只在失败时**记 ERROR，成功路径的空缓冲是正常结果——所以先走一条真实

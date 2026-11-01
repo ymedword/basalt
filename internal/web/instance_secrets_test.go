@@ -335,7 +335,7 @@ func TestInstanceSecrets_InitConflicts(t *testing.T) {
 		{"missing", "密钥文件不存在"},
 		{"corrupt", "密钥文件损坏或校验失败"},
 		{"key_id_mismatch", "密钥与初始化记录不符"},
-		{"unprovable_provenance", "存在无法证明来源的密钥文件"},
+		{"unprovable_provenance", "存在无法证明来源的密钥文件，或无初始化记录但已存在托管密文（密钥能解开也不构成来源证明）"},
 		{"unavailable", "无法判定（读取失败）"},
 	}
 	for _, tc := range recovery {

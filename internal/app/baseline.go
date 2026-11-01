@@ -29,7 +29,8 @@ import (
 	"github.com/goccy/go-yaml/parser"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/memory"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -95,7 +96,7 @@ const (
 // BaselineDeps carries every dependency of the startup baseline; the clock is explicit.
 type BaselineDeps struct {
 	Operations core.OperationStore
-	Resources  *storage.ResourceStore
+	Resources  *postgres.ResourceStore
 	Skills     *workspace.SkillLibrary
 	Lifecycle  *workspace.LifecycleStore
 	Providers  []ProviderDefinition
@@ -122,7 +123,7 @@ type BaselineDeps struct {
 // instead of guessing, because an incomplete assembly is never proof of an outcome.
 type RecoveryDeps struct {
 	Operations core.OperationStore
-	Resources  *storage.ResourceStore
+	Resources  *postgres.ResourceStore
 	Lifecycle  *workspace.LifecycleStore
 	Editor     *workspace.AgentEditor
 	Registry   *agentRegistry
@@ -146,14 +147,14 @@ type RecoveryDeps struct {
 	Gate *core.AgentGate
 	// Archives 是归档行仓储：归档 / 恢复按 `operation_id` 与 `restored_at` 查证。
 	// Archives backs the archive and restore verdicts.
-	Archives *storage.AgentAdminStore
+	Archives *postgres.AgentAdminStore
 	// Notify 是通知渠道仓储：按行存在性与脱敏字段哈希查证。
 	// Notify backs the notify-channel verdicts.
-	Notify *storage.NotifyAdminStore
+	Notify *postgres.NotifyAdminStore
 	// Credentials 是凭据仓储：凭据动作的四证（提交事实 / 版本状态 / 目标绑定哈希）
 	// 由它回答；缺失时该组只能判 indeterminate。
 	// Credentials backs the credential-action evidence.
-	Credentials *storage.CredentialStore
+	Credentials *postgres.CredentialStore
 	// Schema 回答库当前 schema 版本：v3 迁移操作的完成判据之一是库已在目标版本。
 	// Schema answers the current schema version for the v3-migration verdict.
 	Schema SchemaVersionSource
@@ -171,10 +172,14 @@ type RecoveryDeps struct {
 	ExecutionPolicy core.ExecutionPolicyStore
 	// InstanceSecrets 是实例初始化记录仓储：`system.secrets_init` 的查证要读它。
 	// InstanceSecrets backs the secrets-init verdict; nil means indeterminate only.
-	InstanceSecrets *storage.InstanceSecretsStore
+	InstanceSecrets *postgres.InstanceSecretsStore
 	// MasterKeyFile 是主密钥文件路径：查证要走完整 `LoadMasterKey` 并核对链接数。
 	// MasterKeyFile is the key path the secrets-init verdict re-reads.
 	MasterKeyFile string
+	// Memory 是记忆条目的只读查证面（`memory.*` 四个动作）：恢复按条目行状态 / 正文
+	// 摘要判定三态。nil 只意味着该组判 unknown——记忆写面装配失败时启动本就拒绝。
+	// Memory backs the memory verdicts; nil means indeterminate only.
+	Memory memory.MemoryStore
 }
 
 // SchemaVersionSource 回答库当前的 schema 版本（`*storage.DB` 满足）。
@@ -985,9 +990,197 @@ func verifyOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRe
 		return verifyMCPApply(ctx, deps, op)
 	case core.ActionSystemSecretsInit:
 		return verifySecretsInitOperation(ctx, deps, op)
+	case core.ActionMemoryPropose, core.ActionMemoryConfirm,
+		core.ActionMemoryCorrect, core.ActionMemoryDelete:
+		return verifyMemoryOperation(ctx, deps, op)
 	default:
 		return core.VerificationIndeterminate
 	}
+}
+
+// memoryVerifyDetail 是恢复查证专用的一份 `detail_json` 解码：**用指针表达"缺字段"**。
+// 非指针版本会把缺失的 `agent` 读成全局层、把缺失的 `state_before` 读成空串，两者都会
+// 让查证在错误的层 / 错误的前态上给出结论——缺字段只能是 indeterminate。
+// The recovery-side decode uses pointers so a missing field can never masquerade as the
+// global layer or as an empty previous state.
+type memoryVerifyDetail struct {
+	EntryID       *int64  `json:"entry_id"`
+	Section       *string `json:"section"`
+	Agent         *string `json:"agent"`
+	StateBefore   *string `json:"state_before"`
+	ContentSHA256 string  `json:"content_sha256"`
+}
+
+// verifyMemoryOperation 按契约 §9.4 查证四个记忆动作：**条目行本身就是查证对象**。
+// 只有"后态已成立"才判 applied，"前态仍成立"才判 not_applied，其余（读库失败、条目
+// 消失、detail 读不懂、被第三方改到第三种状态）一律 indeterminate——`unknown` 留给
+// 人核对，**不得**重放一次提议 / 纠正 / 删除：重放纠正会再造一个版本，重放删除会
+// 把别人刚恢复的条目再删一次。
+// verifyMemoryOperation uses the entry row as the evidence; only "the target state now
+// holds" counts as applied, and a replay is never attempted.
+func verifyMemoryOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Memory == nil || op.TargetKind != core.TargetKindMemory {
+		return core.VerificationIndeterminate
+	}
+	detail, err := decodeMemoryVerifyDetail(op.DetailJSON)
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	if detail.Agent == nil || detail.Section == nil {
+		return core.VerificationIndeterminate
+	}
+	switch op.Action {
+	case core.ActionMemoryPropose:
+		return verifyMemoryPropose(ctx, deps, detail)
+	case core.ActionMemoryConfirm, core.ActionMemoryDelete:
+		return verifyMemoryEntryState(ctx, deps, op.Action, detail)
+	case core.ActionMemoryCorrect:
+		return verifyMemoryCorrect(ctx, deps, detail)
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyMemoryPropose 判定显式提议：预写时还不知道主键，因此按"同层同分区、正文摘要
+// 相同"认领条目。一条都没有 → 可证明未写入；有 → **不**能断定是本操作写的（提议本来
+// 就会合并进同源既有行），判 indeterminate。
+// verifyMemoryPropose: a matching row is not proof that this operation wrote it, since
+// proposals merge into same-source rows by design.
+func verifyMemoryPropose(ctx context.Context, deps RecoveryDeps, detail memoryVerifyDetail) string {
+	scope := core.Scope{Agent: *detail.Agent}
+	section := core.Section(*detail.Section)
+	if detail.EntryID != nil && *detail.EntryID > 0 {
+		return verifyMemoryEntryContent(ctx, deps, scope, section, *detail.EntryID, detail.ContentSHA256)
+	}
+	if detail.ContentSHA256 == "" {
+		return core.VerificationIndeterminate
+	}
+	entries, err := deps.Memory.ListEntries(ctx, memory.ListQuery{Scope: scope})
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	for _, entry := range entries {
+		if entry.Section != section {
+			continue
+		}
+		if memoryDigestHex(entry.Content) != detail.ContentSHA256 {
+			continue
+		}
+		return core.VerificationIndeterminate
+	}
+	return core.VerificationNotApplied
+}
+
+// verifyMemoryEntryContent 按主键 + 正文摘要认领**一行**：行在、层与分区一致、摘要
+// 一致且状态停在候选或有效 → applied；任一项对不上 → indeterminate。
+// verifyMemoryEntryContent claims one row by id plus body digest.
+func verifyMemoryEntryContent(ctx context.Context, deps RecoveryDeps, scope core.Scope,
+	section core.Section, entryID int64, wantSHA256 string,
+) string {
+	entry, found, err := deps.Memory.LoadEntry(ctx, entryID)
+	if err != nil || !found {
+		return core.VerificationIndeterminate
+	}
+	if entry.Scope != scope || entry.Section != section {
+		return core.VerificationIndeterminate
+	}
+	if wantSHA256 != "" && memoryDigestHex(entry.Content) != wantSHA256 {
+		return core.VerificationIndeterminate
+	}
+	if entry.State == memory.StateCandidate || entry.State == memory.StateActive {
+		return core.VerificationApplied
+	}
+	return core.VerificationIndeterminate
+}
+
+// verifyMemoryEntryState 判定确认与软删：后态已成立 → applied；仍停在前态 →
+// not_applied；第三种状态 → indeterminate。
+// verifyMemoryEntryState: terminal state now → applied, previous state → not applied.
+func verifyMemoryEntryState(ctx context.Context, deps RecoveryDeps, action string,
+	detail memoryVerifyDetail,
+) string {
+	if detail.EntryID == nil || detail.StateBefore == nil {
+		return core.VerificationIndeterminate
+	}
+	var want string
+	switch action {
+	case core.ActionMemoryConfirm:
+		want = memory.StateActive
+	case core.ActionMemoryDelete:
+		want = memory.StateDeleted
+	default:
+		return core.VerificationIndeterminate
+	}
+	entry, found, err := deps.Memory.LoadEntry(ctx, *detail.EntryID)
+	if err != nil || !found {
+		return core.VerificationIndeterminate
+	}
+	switch entry.State {
+	case want:
+		return core.VerificationApplied
+	case *detail.StateBefore:
+		return core.VerificationNotApplied
+	default:
+		return core.VerificationIndeterminate
+	}
+}
+
+// verifyMemoryCorrect 判定纠正：`ReplaceEntry` 把"插入新条 + 退役旧条"放在同一事务里，
+// 因此目标原先 active 时，只要目标已转 corrected 就证明整笔已提交；目标仍是 active
+// 则是未生效。目标原先不在有效态时，新条以 conflicted 落库并 `supersedes_id` 指向
+// 目标，只能按"指向目标 + 正文摘要一致"认领。
+// verifyMemoryCorrect relies on the atomic insert-and-retire transaction for the active
+// branch; the conflicted branch is claimed by supersedes_id plus the body digest.
+func verifyMemoryCorrect(ctx context.Context, deps RecoveryDeps, detail memoryVerifyDetail) string {
+	if detail.EntryID == nil || detail.StateBefore == nil {
+		return core.VerificationIndeterminate
+	}
+	target, found, err := deps.Memory.LoadEntry(ctx, *detail.EntryID)
+	if err != nil || !found {
+		return core.VerificationIndeterminate
+	}
+	if *detail.StateBefore == memory.StateActive {
+		switch target.State {
+		case memory.StateCorrected:
+			return core.VerificationApplied
+		case memory.StateActive:
+			return core.VerificationNotApplied
+		default:
+			return core.VerificationIndeterminate
+		}
+	}
+	if detail.ContentSHA256 == "" {
+		return core.VerificationIndeterminate
+	}
+	entries, err := deps.Memory.ListEntries(ctx,
+		memory.ListQuery{Scope: core.Scope{Agent: *detail.Agent}})
+	if err != nil {
+		return core.VerificationIndeterminate
+	}
+	for _, entry := range entries {
+		if entry.SupersedesID != *detail.EntryID {
+			continue
+		}
+		if memoryDigestHex(entry.Content) == detail.ContentSHA256 {
+			return core.VerificationApplied
+		}
+	}
+	return core.VerificationNotApplied
+}
+
+// decodeMemoryVerifyDetail 解析记忆动作的 `detail_json`；空串 / 非法 JSON 由调用方
+// 归结为 indeterminate（"读不懂"不是"没生效"）。
+// decodeMemoryVerifyDetail parses the memory detail; an unreadable detail is never
+// treated as "not applied".
+func decodeMemoryVerifyDetail(raw []byte) (memoryVerifyDetail, error) {
+	var detail memoryVerifyDetail
+	if len(raw) == 0 {
+		return detail, errors.New("detail_json 为空")
+	}
+	if err := json.Unmarshal(raw, &detail); err != nil {
+		return memoryVerifyDetail{}, err
+	}
+	return detail, nil
 }
 
 // verifyNetworkAllowlist 按修订号与候选域名哈希判定域名表写入三态（R8.2.4 第 6 条
@@ -2026,6 +2219,12 @@ func verifyScopeConversion(ctx context.Context, deps RecoveryDeps, op core.Opera
 // 文件都是 schema 2、UID 合法、索引镜像一致 → applied；库仍旧版且所有状态文件仍是
 // schema 1 / 无 UID → not_applied；部分升级、文件缺失或镜像不一致 → indeterminate。
 // **不得**给同一 Agent 补发第二个 UID。
+//
+// 版本比较用的是**运行期谱系**（PostgreSQL）的目标版本：`storage.SupportedSchemaVersion`
+// 是 SQLite 只读来源的冻结值（6），拿它比 PostgreSQL 的 `schema_version`（1）会让"库
+// 已就绪"永远判不成立——两谱系各自持有自己的目标版本（设计 P-11）。
+// The comparison targets the runtime lineage's own version: the frozen SQLite constant
+// must not be applied to a PostgreSQL schema_version, or "already migrated" can never hold.
 // verifyBaselineV3 judges the migration; a partial upgrade stays unknown.
 func verifyBaselineV3(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
 	if op.TargetKind != targetKindSystem || deps.Lifecycle == nil ||
@@ -2033,7 +2232,7 @@ func verifyBaselineV3(ctx context.Context, deps RecoveryDeps, op core.OperationR
 		return core.VerificationIndeterminate
 	}
 	targetVersion, err := deps.Schema.SchemaVersion(ctx)
-	if err != nil || targetVersion > storage.SupportedSchemaVersion {
+	if err != nil || targetVersion > postgres.SupportedSchemaVersion {
 		return core.VerificationIndeterminate
 	}
 	names, err := workspace.AgentNames(deps.Root)
@@ -2066,9 +2265,9 @@ func verifyBaselineV3(ctx context.Context, deps RecoveryDeps, op core.OperationR
 	}
 
 	switch {
-	case targetVersion == storage.SupportedSchemaVersion && legacy == 0:
+	case targetVersion == postgres.SupportedSchemaVersion && legacy == 0:
 		return core.VerificationApplied
-	case targetVersion < storage.SupportedSchemaVersion && upgraded == 0:
+	case targetVersion < postgres.SupportedSchemaVersion && upgraded == 0:
 		return core.VerificationNotApplied
 	default:
 		return core.VerificationIndeterminate
@@ -2156,7 +2355,7 @@ func agentDirPresent(root, name string) (bool, error) {
 
 // archiveRowForOperation 按 `operation_id` + Agent 名找归档行：归档行与终态同事务
 // （约束 37），pending 行命中只可能是崩溃窗口里的半成品，由调用方保守处理。
-func archiveRowForOperation(ctx context.Context, store *storage.AgentAdminStore,
+func archiveRowForOperation(ctx context.Context, store *postgres.AgentAdminStore,
 	op core.OperationRecord,
 ) (bool, core.AgentArchiveRecord, error) {
 	rows, err := store.ListArchives(ctx)

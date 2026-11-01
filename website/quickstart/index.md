@@ -18,7 +18,7 @@ Create an independent agent, configure and enable it in the local console, then 
 - Prebuilt binary: no additional language tooling.
 - Source build: Go, using the toolchain in go.mod.
 - A compatible model endpoint, model name and your own API key.
-- Embedded SQLite; no separately deployed database or cache.
+- A reachable PostgreSQL 16/17 instance with the vector extension (pgvector) and pg_trgm, plus a database for Basalt. This is a deployment prerequisite: the runtime refuses to start when either extension is missing and never falls back to an embedded store.
 - Node is only needed to rebuild the console or site, or capture this scripted demo. The tutorial agent needs no external interpreter or MCP server.
 
 Put an existing binary on PATH, or build from the current checkout. The Go build version follows the toolchain in go.mod and CI.
@@ -47,6 +47,8 @@ $env:PATH = "$PWD\bin;$env:PATH"
 Create basalt.yaml in the repository root, outside .basalt/. This minimal example declares one model connection. Use your own endpoint, model name and environment variable.
 
 ```yaml
+database:
+  dsn: ${BASALT_DATABASE_DSN}
 providers:
   - name: primary
     base_url: https://api.deepseek.com
@@ -60,11 +62,14 @@ http:
     token: ${BASALT_ADMIN_TOKEN}
 ```
 
-In the same terminal, set your model key and generate a management token with a system cryptographic random source. Replace the example key placeholder; keep only environment references in the configuration file.
+`database.dsn` is mandatory. An unset or unresolved `${...}` placeholder counts as an empty value and startup is refused with an error naming the key. The configuration that a fresh first start generates carries the same placeholder — it reserves the key, it does not provide a database.
+
+In the same terminal, set the database connection string, your model key, and generate a management token with a system cryptographic random source. Replace the example placeholders; keep only environment references in the configuration file.
 
 ### POSIX environment
 
 ```sh
+export BASALT_DATABASE_DSN="postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 export BASALT_MODEL_KEY="your-own-model-key"
 export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ```
@@ -72,6 +77,7 @@ export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ### PowerShell environment
 
 ```powershell
+$env:BASALT_DATABASE_DSN = "postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 $env:BASALT_MODEL_KEY = "your-own-model-key"
 $bytes = New-Object byte[] 32
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()

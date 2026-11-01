@@ -8,10 +8,42 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// dsnPlaceholder 只满足判卷脚本的「需要 DSN」前置闸门；合成树里没有集成用例，
+// 占位值不会被任何测试连接。
+// The placeholder only satisfies the script's DSN preflight; synthetic trees have no
+// integration tests, so nothing ever dials it.
+const dsnPlaceholder = "postgres://synthetic.invalid/basalt_test?sslmode=disable"
+
+// withoutEnv 返回去掉指定变量的环境副本。Windows 的变量名大小写不敏感，按不区分
+// 大小写比较——残余值会让「缺 DSN」用例变成假绿。
+// withoutEnv drops the named variables case-insensitively; a leftover value would turn
+// the missing-DSN case into a false green.
+func withoutEnv(env []string, names ...string) []string {
+	out := env[:0:0]
+	for _, entry := range env {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		drop := false
+		for _, name := range names {
+			if strings.EqualFold(key, name) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
 
 // 合成模块的 go.mod：无依赖，离线可构建/可测（自检不能反过来依赖网络）。
 const probeGoMod = "module example.com/probe\n\ngo 1.27\n"
@@ -29,10 +61,24 @@ func writeTree(t *testing.T, files map[string]string) string {
 }
 
 // runScript 以 `sh check-coverage.sh <args...>` 跑判卷脚本（cwd = 本包目录）。
-// 返回合并输出与错误——判据既看退出码，也看可读错误文案。
+// 返回合并输出与错误——判据既看退出码，也看可读错误文案。环境固定注入占位 DSN：
+// 合成树没有集成用例，但自生成 profile 的模式要求 DSN；缺 DSN 路径由
+// runScriptWithoutDSN 显式构造。
+// The placeholder DSN satisfies the preflight; the missing-DSN path is explicit.
 func runScript(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	cmd := exec.Command("sh", append([]string{"check-coverage.sh"}, args...)...)
+	cmd.Env = append(withoutEnv(os.Environ(), "BASALT_TEST_PG_DSN"), "BASALT_TEST_PG_DSN="+dsnPlaceholder)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// runScriptWithoutDSN 在**显式移除** BASALT_TEST_PG_DSN 的环境里跑判卷脚本——
+// 不依赖调用方恰好没设置，反方向（干净环境）也能复现。
+func runScriptWithoutDSN(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("sh", append([]string{"check-coverage.sh"}, args...)...)
+	cmd.Env = withoutEnv(os.Environ(), "BASALT_TEST_PG_DSN")
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -93,6 +139,37 @@ func TestCheckCoverage_AtThresholdPasses(t *testing.T) {
 	require.Contains(t, out, "ok")
 }
 
+// withPackage 把样例源码的 `package p` 行换成指定包名，其余逐字保留。
+// withPackage rewrites only the package clause so both probe packages share one body.
+func withPackage(name, src string) string {
+	return strings.Replace(src, "package p\n", "package "+name+"\n", 1)
+}
+
+// TestCheckCoverage_PostgresBaseNameUsesSeventyTier 锁定 `postgres` 档位：
+// `internal/storage/postgres` 的包基名是 `postgres`（不在 `internal/storage` 包内），
+// 必须落进 70% 档（US-16 §4.7 / T136 / T138）。同一棵树里放两个**内容相同、覆盖率
+// 同为 50%** 的包——`p` 通过、`postgres` 失败——证明档位只由包基名决定，不是别处
+// 凑巧达标或凑巧失败。
+// TestCheckCoverage_PostgresBaseNameUsesSeventyTier locks the 70% tier for the
+// `postgres` base name: two identically covered packages diverge, so the tier is
+// chosen by base name alone.
+func TestCheckCoverage_PostgresBaseNameUsesSeventyTier(t *testing.T) {
+	tree := writeTree(t, map[string]string{
+		"go.mod":             probeGoMod,
+		"p/p.go":             twoFuncs,
+		"p/p_test.go":        coverFFunc,
+		"postgres/q.go":      withPackage("postgres", twoFuncs),
+		"postgres/q_test.go": withPackage("postgres", coverFFunc),
+	})
+
+	out, err := runScript(t, "--tree", tree)
+	require.Error(t, err, "50%% 的 postgres 包必须按 70%% 档判失败: %s", out)
+	require.Contains(t, out, "example.com/probe/postgres")
+	require.Contains(t, out, "(< 70%)", "postgres 包必须落在 70% 档")
+	require.Contains(t, out, "example.com/probe/p")
+	require.Contains(t, out, "(>= 50%)", "同内容的 p 包仍在 50% 档")
+}
+
 // TestCheckCoverage_NoStatementsSkipped 判据 3：无可执行语句的包跳过——即便是
 // 无测试文件、0% 的形态，也不得判失败（无从测量）。
 func TestCheckCoverage_NoStatementsSkipped(t *testing.T) {
@@ -147,6 +224,24 @@ func TestAlwaysFails(t *testing.T) {
 	out, err := runScript(t, "--tree", tree)
 	require.Error(t, err, "测试失败必须传导为判卷失败: %s", out)
 	require.Contains(t, out, "go test 失败")
+}
+
+// TestCheckCoverage_MissingDSNFails 判据 7（D-01 / T125）：自生成 profile 的模式
+// 缺 BASALT_TEST_PG_DSN 必须**失败**并给出排查路径——不得先跑一遍测试、再靠
+// 「集成用例全跳过」的 profile 判绿。
+// A missing DSN fails before any test runs; the hint names the troubleshooting path.
+func TestCheckCoverage_MissingDSNFails(t *testing.T) {
+	tree := writeTree(t, map[string]string{
+		"go.mod":      probeGoMod,
+		"p/p.go":      twoFuncs,
+		"p/p_test.go": coverFFunc,
+	})
+
+	out, err := runScriptWithoutDSN(t, "--tree", tree)
+	require.Error(t, err, "缺 DSN 必须失败: %s", out)
+	require.Contains(t, out, "BASALT_TEST_PG_DSN")
+	require.Contains(t, out, "D-01")
+	require.Contains(t, out, "docs/DevelopmentLoop.md")
 }
 
 // writeProfile 把合成 profile 落到临时目录，返回路径——judge 的 --profile

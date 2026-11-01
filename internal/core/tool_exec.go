@@ -39,6 +39,9 @@ type ToolExecutor struct {
 	resolver ToolResolver
 	audit    ToolInvocationStore
 	logger   *slog.Logger
+	// diag 是工具诊断端口（V-8）；nil = 未接诊断，逐字保持接线前的行为。
+	// diag is the tool diagnostics port; nil means no events are emitted.
+	diag ToolDiagnosticRecorder
 }
 
 // NewToolExecutor 组装执行器；`logger` 为空时用进程缺省日志器。
@@ -48,6 +51,16 @@ func NewToolExecutor(resolver ToolResolver, audit ToolInvocationStore, logger *s
 		logger = slog.Default()
 	}
 	return &ToolExecutor{resolver: resolver, audit: audit, logger: logger}
+}
+
+// WithDiagnostics 接上工具诊断端口（V-8）；nil 等价于不接。链式写法与
+// `ReActLoop.WithCallQuota` 同一风格，既有构造点不需要改签名。
+// WithDiagnostics attaches the tool diagnostics port; nil means none.
+func (e *ToolExecutor) WithDiagnostics(diag ToolDiagnosticRecorder) *ToolExecutor {
+	if e != nil {
+		e.diag = diag
+	}
+	return e
 }
 
 // Execute 执行一次工具调用并返回可回填给模型的结果。
@@ -60,6 +73,17 @@ func NewToolExecutor(resolver ToolResolver, audit ToolInvocationStore, logger *s
 // The tool set is re-checked at runtime because load-time gating cannot catch a registry
 // that no longer matches the frozen snapshot.
 func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []string, call ToolCall) Result {
+	return e.ExecuteStep(ctx, env, toolSet, call, ToolStep{})
+}
+
+// ExecuteStep 与 `Execute` 相同，只是额外接收循环侧的步骤定位（V-8）：`StepID` 取轮次、
+// `Seq` 同轮同值。单独成方法而不是往 `ToolEnv` 加字段——`ToolEnv` 是**工具可见**的
+// 执行环境，诊断定位不属于工具的输入，加进去会让每个工具都看到一个它不该用的字段。
+// ExecuteStep is Execute plus the loop-side step locator; the locator stays out of the
+// tool-facing environment on purpose.
+func (e *ToolExecutor) ExecuteStep(
+	ctx context.Context, env ToolEnv, toolSet []string, call ToolCall, step ToolStep,
+) Result {
 	// ① 工具名解析 + 运行时归属校验（两道，均在执行之前——不产生审计行、不终止 Run）。
 	// 解析**先查准入时钉住的实例**（14D / C4）：受控重建换掉注册池后，在途 Run 继续用
 	// 它自己那一代实例，不会被悄悄转到新连接；未钉（零值单测 / 非 Run 直调）才查注册池。
@@ -70,6 +94,12 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 	}
 	if !ok {
 		// 契约既有字面量（与加载期门禁同一句）：工具名不在全局注册池。
+		// 诊断（V-8）：解析失败也是一次"模型要调用某工具但没调成"，按 `tool_call` 记
+		// `not_found`；没有审计行（执行从未启动），`audit_ref` 由适配器留空。
+		// A resolution miss is still a tool call that never ran; no audit row exists.
+		e.recordDiag(ctx, env, step, ToolDiagnostic{
+			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindNotFound,
+		})
 		return Result{Content: fmt.Sprintf("tool not registered: %s", call.Name)}
 	}
 	if !slices.Contains(toolSet, call.Name) {
@@ -84,17 +114,34 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 		e.logger.Warn("工具不在本 Agent 的工具集内，调用被拒绝",
 			"run_id", env.RunID, "session_id", env.SessionID, "tool", call.Name,
 			"reason", "not_in_tool_set", "detail", refusal.Error())
+		// 诊断（V-8）：这是**一次真实的授权判定**，按 `permission_decision` + deny 记，
+		// 与上面只有 WARN、没有审计行的处置互补——诊断让"模型试图越权"在排障面上可见，
+		// 且**不**替代审计（没有执行就没有审计行，这条事实不因有诊断而改变）。
+		// A refusal that never executed is a permission decision, not an audit row.
+		e.recordDiag(ctx, env, step, ToolDiagnostic{
+			Kind: ToolDiagnosticDenied, Tool: call.Name,
+		})
 		return Result{Content: refusal.Error()}
 	}
 
 	// ② 入参校验：json.Valid + 能解出**对象**。非法 → **仍写审计**（工具确实被调用了）。
 	if reason := checkToolInput(tool, call.Arguments); reason != "" {
-		return e.refuseInvalidInput(ctx, env, call, reason)
+		return e.refuseInvalidInput(ctx, env, step, call, reason)
 	}
 
 	// ③ 审计**先写 pending**；写失败 → 拒绝执行（fail-closed）+ 回填"审计不可用" → Run 继续。
+	// 诊断（V-8）**不**在这一路发事件：审计不可用本身没有可用的原因码，且这类故障的
+	// 留痕不得依赖可丢弃的诊断——两条拒绝分支（仓储未装配 / 预写失败）各自的 ERROR
+	// 日志是它的痕迹。
 	if e.audit == nil {
 		// 审计仓储没接上 = 装配错误：宁可拒执行也不留无痕调用（与 fail-closed 同源）。
+		// 这条分支**必须**留 ERROR：它不经过 `beginInvocation`，没有那一侧的日志兜底，
+		// 装配缺陷若只表现为回填文案，线上既无痕迹也无告警。
+		// A nil audit store is a wiring bug and never reaches beginInvocation; this line
+		// is its only trace.
+		e.logger.Error("工具执行被拒绝——审计仓储未装配（fail-closed）",
+			"run_id", env.RunID, "session_id", env.SessionID, "tool", call.Name,
+			"store", "tool_invocations", "op", "start")
 		return Result{Content: auditUnavailableText}
 	}
 	id, ok := e.beginInvocation(ctx, env, call)
@@ -142,9 +189,18 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 		Truncated: truncated,
 	})
 	e.finishInvocation(ctx, env, id, out)
+	// 诊断（V-8）：一次真实执行的结局，`audit_ref` 指向上面的行。即便终态回填失败，
+	// 这里记的仍是"调用发生过"——行的 pending 形态由恢复扫描回答，诊断不重复它的职责。
+	// The event records the execution's outcome and points at its audit row.
+	e.recordDiag(ctx, env, step, ToolDiagnostic{
+		Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: out.ErrorKind, AuditID: id,
+	})
 
-	// ⑧ 返回结果；**Run 不因工具失败而失败**。
-	return Result{Content: content, Retryable: res.Retryable}
+	// ⑧ 返回结果；**Run 不因工具失败而失败**。来源引用**必须**原样带出——
+	// 循环把它写进 tool 消息（C-26：来源依赖随转述传播），丢弃一处即断链。
+	// Step ⑧ must carry EvidenceRefs through: the loop writes them onto the tool
+	// message, and dropping them here breaks the C-26 provenance chain.
+	return Result{Content: content, Retryable: res.Retryable, EvidenceRefs: res.EvidenceRefs}
 }
 
 // refuseInvalidInput 为非法入参补一条 `failed` + `invalid_input` 审计行并回填失败文本（流程 D ②）。
@@ -153,21 +209,47 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 // refuseInvalidInput records a failed/invalid_input row and hands the reason back. A failed
 // pre-write here is only logged: fail-closed protects against unrecorded *execution*, and
 // nothing was ever going to execute.
-func (e *ToolExecutor) refuseInvalidInput(ctx context.Context, env ToolEnv, call ToolCall, reason string) Result {
+func (e *ToolExecutor) refuseInvalidInput(
+	ctx context.Context, env ToolEnv, step ToolStep, call ToolCall, reason string,
+) Result {
 	out := ToolInvocationResult{
 		Status:       LLMCallFailed,
 		ErrorMessage: reason,
 		ErrorKind:    ErrorKindInvalidInput,
 	}
 	if e.audit == nil {
+		e.recordDiag(ctx, env, step, ToolDiagnostic{
+			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput,
+		})
 		return Result{Content: reason}
 	}
 	id, ok := e.beginInvocation(ctx, env, call)
 	if !ok {
+		e.recordDiag(ctx, env, step, ToolDiagnostic{
+			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput,
+		})
 		return Result{Content: reason}
 	}
 	e.finishInvocation(ctx, env, id, out)
+	e.recordDiag(ctx, env, step, ToolDiagnostic{
+		Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput, AuditID: id,
+	})
 	return Result{Content: reason}
+}
+
+// recordDiag 补齐执行器不掌握的关联字段后交给端口（V-8）。三条短路：
+// 端口未接、**没有 Run 锚点**（非 Run 直调——诊断不得伪造关联）、执行器为零值。
+// 诊断从不返回错误：可丢弃是它的契约，判它失败会把排障面变成运行面。
+// recordDiag stamps the correlation the executor does not own and hands the event over;
+// it never reports failure because diagnostics are droppable by contract.
+func (e *ToolExecutor) recordDiag(ctx context.Context, env ToolEnv, step ToolStep, ev ToolDiagnostic) {
+	if e == nil || e.diag == nil || env.RunID == "" {
+		return
+	}
+	ev.RunID = env.RunID
+	ev.StepID = step.StepID
+	ev.Seq = step.Seq
+	e.diag.RecordToolDiagnostic(ctx, ev)
 }
 
 // beginInvocation 预写 `pending` 审计行（收尾上下文：取消不该把预写变成"写不进去"）；

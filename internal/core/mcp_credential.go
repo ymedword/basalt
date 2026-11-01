@@ -35,6 +35,31 @@ type MCPCredentialSource struct {
 	OperationID string
 }
 
+// MCPBackfillReport 是启动期来源补记（`BackfillEnvSources`）的四分类报告
+// （设计 §2.16.1 ②）：**不得**只报一个总数。
+//
+// 口径（槽位名按字典序进入对应列表）：
+//
+//	filled       — 该槽位没有来源行，本次补记为 `env`
+//	skipped      — 该槽位已有 `env` 声明，与当前定义一致，未改动
+//	conflict     — 该槽位有来源行，但模式不在 `env` / `managed` 闭集内（防御分支；
+//	               当前 schema CHECK 使它在真实库中不可达，保留以便新增模式时失败可见）
+//	config_drift — 该槽位在已发布定义里声明（文件只能表达 `${VAR}`），库里却是 `managed`
+//
+// 报告只含槽位名，不含任何 env 变量值——补记从不读取值。
+// MCPBackfillReport is the four-way classification of the startup source backfill:
+// filled / skipped / conflict / config_drift. It carries slot names only, never values.
+type MCPBackfillReport struct {
+	Filled      []string
+	Skipped     []string
+	Conflict    []string
+	ConfigDrift []string
+}
+
+// FilledCount 返回本次实际补记的槽位数（既有调用方只关心这个数的场合使用）。
+// FilledCount reports how many rows this backfill actually added.
+func (r MCPBackfillReport) FilledCount() int { return len(r.Filled) }
+
 // MCPCredentialKeyState 是槽位在资源视图里的来源状态（契约 `credential_key_state`）。
 // 四个字面量是冻结值：
 //

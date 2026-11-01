@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是通知渠道「测试连接」的判卷（US-12 R7 范围修订，check
@@ -17,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // withConnectivity 在基础夹具上补发送面与最后测试投影，并重建编排实例。
@@ -28,7 +30,7 @@ func withConnectivity(t *testing.T, sender NotifyTestSender,
 	t.Helper()
 	env := newNotifyEnv(t)
 	env.deps.TestSender = sender
-	env.deps.ConnectionTests = storage.NewConnectionTestStore(env.db)
+	env.deps.ConnectionTests = postgres.NewConnectionTestStore(env.db)
 	for _, m := range mutate {
 		m(&env.deps)
 	}
@@ -82,9 +84,9 @@ func (failingConnectionTestStore) ListConnectionTests(context.Context,
 
 // lastTest 读一条渠道的最后测试投影（不存在时返回零值与 false）。
 // lastTest returns the stored projection row for one channel uid.
-func lastTest(t *testing.T, db *storage.DB, uid core.ResourceUID) (core.ResourceConnectionTest, bool) {
+func lastTest(t *testing.T, db *postgres.DB, uid core.ResourceUID) (core.ResourceConnectionTest, bool) {
 	t.Helper()
-	rows, err := storage.NewConnectionTestStore(db).ListConnectionTests(
+	rows, err := postgres.NewConnectionTestStore(db).ListConnectionTests(
 		context.Background(), core.ResourceNotifyChannel)
 	require.NoError(t, err)
 	for _, row := range rows {

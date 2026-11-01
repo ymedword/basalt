@@ -25,7 +25,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
@@ -107,7 +107,7 @@ func outboundProxyURL(cfg *cli.Config) (*url.URL, error) {
 // refreshNetworkExceptions 从库里重载例外集合并整体替换快照。读失败只记 WARN 并保留
 // 旧快照（初始为空 = 受保护地址一律拒）：宁可少放行，也不猜一份宽集合。
 // refreshNetworkExceptions reloads the set; a read failure keeps the previous snapshot.
-func refreshNetworkExceptions(ctx context.Context, store *storage.NetworkExceptionStore, logger *slog.Logger) {
+func refreshNetworkExceptions(ctx context.Context, store *postgres.NetworkExceptionStore, logger *slog.Logger) {
 	list, err := store.List(ctx)
 	if err != nil {
 		logger.Warn("装载网络访问例外失败——保留上一份快照（受保护地址仍一律拒绝）", "error", err)

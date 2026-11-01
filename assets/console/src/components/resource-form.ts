@@ -237,7 +237,7 @@ export const ResourceForm = defineComponent({
         return ''
       }
       if (view.state === 'recovery_required') {
-        return `实例加密服务需要恢复（${recoveryReasonText(view.recovery_reason)}）：托管凭据无法解密，新的托管写入会被拒绝；请按 docs/Operations.md 恢复主密钥，或改用「环境变量」。`
+        return `实例加密服务需要恢复（${recoveryReasonText(view.recovery_reason)}）：托管凭据当前不可用，新的托管写入会被拒绝；请先备份实例密钥文件与数据库，再按 docs/Operations.md 恢复主密钥，或改用「环境变量」。`
       }
       if (view.state === 'uninitialized' && !view.can_initialize) {
         return '此实例以纯环境变量方式部署（secrets.auto_init: false），不接受加密托管：请改用「环境变量」来源，或由部署者启用 secrets.master_key_file 后重启。'
@@ -280,6 +280,9 @@ export const ResourceForm = defineComponent({
     const description = ref('')
     const importFiles = ref<FileDraft[]>([])
     const skillFiles = ref<FileDraft[]>([])
+    // 完整清单与 ETag 必须来自同一次读取；冲突后不能用旧草稿配新 ETag 覆盖他人。
+    // A file list and its ETag must come from the same read, including after a conflict.
+    const skillEditReady = ref(false)
 
     // --- 通用状态 ---------------------------------------------------------
     const etag = ref('')
@@ -345,6 +348,9 @@ export const ResourceForm = defineComponent({
       }
       loading.value = true
       error.value = ''
+      if (props.kind === 'skills') {
+        skillEditReady.value = false
+      }
       try {
         if (props.kind === 'model-connections') {
           const detail = await client.getModelConnection(current)
@@ -356,7 +362,7 @@ export const ResourceForm = defineComponent({
           applyMcpServer(detail.data, detail.etag)
           return
         }
-        const detail = await client.getSkill(current)
+        const detail = await client.getSkillForEdit(current)
         applySkill(detail.data, detail.etag)
       } catch (caught) {
         error.value = errorMessage(caught)
@@ -388,6 +394,11 @@ export const ResourceForm = defineComponent({
     /** 用技能详情填表：完整文件清单（含正文）可逐份编辑。 */
     // Skill detail: every file is editable text; the list is replaced as a whole.
     function applySkill(view: SkillDetail, etagValue: string): void {
+      if (!Array.isArray(view.files) || view.files.length === 0 ||
+        !view.files.every((file) => file !== null && typeof file === 'object' && typeof file.path === 'string' && typeof file.content === 'string') ||
+        !view.files.some((file) => file.path === 'SKILL.md') || etagValue === '') {
+        throw new Error('技能文件清单未完整加载，已禁止保存；请重新打开页面或联系管理员。')
+      }
       name.value = view.name
       description.value = view.description
       skillFiles.value = view.files.map((file) => ({
@@ -395,6 +406,7 @@ export const ResourceForm = defineComponent({
         content: file.content,
       }))
       etag.value = etagValue
+      skillEditReady.value = true
     }
 
     /**
@@ -435,7 +447,15 @@ export const ResourceForm = defineComponent({
       }
     }
 
-    /** 412 后的最小刷新：只前移 ETag，不覆盖用户已改的字段。 */
+    /**
+     * 412 后的最小刷新：只前移 ETag，不覆盖用户已改的字段。
+     *
+     * 技能**不在此列**：技能是整份文件清单的替换写，刷新 ETag 而不刷新正文，会让
+     * 下一次保存用新 ETag 覆盖掉别人刚发布的版本。技能 412 一律走
+     * `submitSkill` 的专用分支——关掉 `skillEditReady` 并要求重新打开页面。
+     * Skills are deliberately excluded: advancing the ETag without reloading the
+     * file list would let the next save clobber the version just published.
+     */
     async function refreshEtag(current: string): Promise<void> {
       switch (props.kind) {
         case 'model-connections':
@@ -443,9 +463,6 @@ export const ResourceForm = defineComponent({
           return
         case 'mcp-servers':
           etag.value = (await client.getMcpServer(current)).etag
-          return
-        case 'skills':
-          etag.value = (await client.getSkill(current)).etag
       }
     }
 
@@ -464,7 +481,7 @@ export const ResourceForm = defineComponent({
     }
 
     async function rereadSkill(current: string): Promise<SkillView> {
-      const detail = await client.getSkill(current)
+      const detail = await client.getSkillForEdit(current)
       applySkill(detail.data, detail.etag)
       return detail.data
     }
@@ -965,6 +982,10 @@ export const ResourceForm = defineComponent({
     }
 
     async function submitSkill(): Promise<void> {
+      if (props.edit !== null && !skillEditReady.value) {
+        error.value = '技能文件清单未完整加载或发生版本冲突，已禁止保存；请重新打开页面。'
+        return
+      }
       const trimmed = name.value.trim()
       if (trimmed === '') {
         error.value = '请填写技能名称'
@@ -975,9 +996,11 @@ export const ResourceForm = defineComponent({
         return
       }
       busy.value = true
+      let saved = false
       try {
         if (props.edit !== null && editingFiles !== null) {
           await client.updateSkill(props.edit, editingFiles, etag.value)
+          saved = true
           const view = await rereadSkill(props.edit)
           notice.value = '已保存并发布新版本；文件清单已从服务端重新读取。'
           emit('saved', view)
@@ -997,7 +1020,15 @@ export const ResourceForm = defineComponent({
         emit('created', view)
       } catch (caught) {
         const current = props.edit
-        await handleFailure(caught, current === null ? null : () => refreshEtag(current))
+        if (saved) {
+          skillEditReady.value = false
+          error.value = '技能已保存，但刷新文件清单失败。请重新打开页面确认最新版本，再继续编辑。'
+        } else if (current !== null && caught instanceof ApiError && caught.status === 412) {
+          skillEditReady.value = false
+          error.value = '技能已被他人修改，本次保存没有写入。请先复制当前修改，再重新打开页面查看最新文件。'
+        } else {
+          await handleFailure(caught, null)
+        }
       } finally {
         busy.value = false
       }
@@ -1144,7 +1175,11 @@ export const ResourceForm = defineComponent({
           ),
         )
       }
-      if (view.can_initialize) {
+      // 恢复态即使服务端回报可初始化也不提供按钮：D-40 下恢复只能走离线命令，
+      // 页面上的"初始化"在恢复态等于重建密钥（不可逆）。
+      // Never offer initialisation while in recovery, even if the server reports it
+      // as possible: under D-40 recovery is an offline, backup-first procedure.
+      if (view.can_initialize && view.state !== 'recovery_required') {
         rows.push(
           h(
             'button',
@@ -1542,7 +1577,9 @@ export const ResourceForm = defineComponent({
           text: '保存会用下面的完整文件清单创建一个新版本；上一版本保持不变，仍可在版本列表查看。',
         }),
       ]
-      if (skillFiles.value.length === 0) {
+      if (!skillEditReady.value && editing.value && skillFiles.value.length === 0) {
+        children.push(h('p', { class: 'muted' }, '文件清单未就绪，不能保存。'))
+      } else if (skillFiles.value.length === 0) {
         children.push(h('p', { class: 'muted' }, '该技能没有任何文件；至少要保留 SKILL.md'))
       } else {
         children.push(
@@ -1578,6 +1615,10 @@ export const ResourceForm = defineComponent({
                   rows: 8,
                   spellcheck: false,
                   value: file.content,
+                  // 保存 / 加载期间与同段的路径输入、移除按钮一起锁住：PUT 是全量替换，
+                  // 提交后若表单再从服务端真值回填，这期间敲进去的正文会无声消失，
+                  // 用户却以为已经存进去了。
+                  disabled: busy.value,
                   'aria-label': `文件正文 ${file.path === '' ? index + 1 : file.path}`,
                   onInput: (event: Event) => {
                     updateSkillFile(index, {
@@ -1725,7 +1766,7 @@ export const ResourceForm = defineComponent({
           {
             type: 'button',
             class: 'primary',
-            disabled: busy.value || loading.value,
+            disabled: busy.value || loading.value || (props.kind === 'skills' && editing.value && !skillEditReady.value),
             onClick: () => {
               void submit()
             },

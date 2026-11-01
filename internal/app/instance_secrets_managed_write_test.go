@@ -1,20 +1,26 @@
+//go:build integration
+
 package app
 
-// 本文件是 R2-1「首次保存托管凭据即完成实例初始化」的判卷：
+// 本文件是「托管凭据首次写入」这条链的判卷，判据面在 2026-10-29 按 H1 改过向：
 //
-//	存量实例（库在、名册不在、无初始化记录、无托管密文）→ 管理员在网页填写 API Key
-//	→ 点击保存 → 同一进程内完成必要初始化并加密写入 → 解析器随即解得开。
+//	**新实例**（库与名册都是本次新建）→ 管理员在网页填写 API Key → 点击保存 →
+//	完成初始化并加密写入 → 解析器随即解得开；
+//	**存量实例**（库在、名册不在）→ 同样的保存动作 → `roster_missing_requires_adopt`，
+//	零写入、零铸钥、零外呼——就地补一份名册会把"来源可证"换成"来源被重建"。
 //
 // 覆盖的**逆改点**（每条对应一种真实事故）：
-//   - 把"没有 secrets 段"当成纯环境变量部署 → 存量实例永远无法启用托管（A 分支红）；
-//   - 有初始化记录 / 有密文时仍然生成新密钥 → B / C 分支红（旧凭据永久不可解）；
-//   - 初始化后不更新共享 locator → 同一进程内的解析器仍指向空路径（D 分支红）；
+//   - 存量实例缺名册也照旧建名册 → `ExistingInstanceWithoutRosterRefusesManagedInit` 红
+//     （身份被就地重建，此后无法区分原装与补造）；
+//   - 为了"堵住"存量实例把新实例的自动初始化一起关掉 → `FreshInstanceStillAutoInitializes` 红
+//     （全新部署永远起不来，或管理员每次都要手工点一次）；
+//   - 有初始化记录 / 有密文时仍然生成新密钥 → 拒绝路径用例红（旧凭据永久不可解）；
+//   - 初始化后不更新共享 locator → 同一进程内的解析器仍指向空路径（解析用例红）；
 //   - 审计归因写死成启动流程 → 操作行 actor 断言红（高权限变更无法归因）。
 //
-// These tests pin the first-managed-save flow: a provably never-managed instance is
-// initialized inside the same audited admin action, the shared locator takes effect
-// immediately, and every state with a record, ciphertext or explicit pure-env setting
-// refuses without minting anything.
+// These tests pin the first-managed-write chain after the 2026-10-29 H1 change: only a
+// provably-new instance may establish a roster in place; an existing instance without
+// one is refused with a stable code and nothing is written.
 
 import (
 	"context"
@@ -28,7 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // managedWriteFixture 是一个"存量实例"：库与既发布资源都在，但实例名册、初始化记录、
@@ -45,7 +51,7 @@ type managedWriteFixture struct {
 	dataDir string
 	locator *MasterKeyLocator
 	secrets *InstanceSecretsService
-	store   *storage.InstanceSecretsStore
+	store   *postgres.InstanceSecretsStore
 	writer  *CredentialOps
 	logs    *strings.Builder
 }
@@ -65,7 +71,7 @@ func newManagedWriteFixture(t *testing.T, mutate func(*InstanceSecretsDeps)) *ma
 	workDir := t.TempDir()
 	locator := NewMasterKeyLocator("")
 	logs := &strings.Builder{}
-	store := storage.NewInstanceSecretsStore(env.db)
+	store := postgres.NewInstanceSecretsStore(env.db)
 	deps := InstanceSecretsDeps{
 		Store:         store,
 		Operations:    env.ops,
@@ -117,7 +123,7 @@ func (f *managedWriteFixture) resolverOnLocator(t *testing.T) *credentialResolve
 		Credentials:   f.credentials,
 		Resources:     f.versions,
 		Notify:        f.admission.NotifyAdmin,
-		Bindings:      storage.NewBindingStore(f.db),
+		Bindings:      postgres.NewBindingStore(f.db),
 		KeyPath:       f.locator,
 		WorkspaceRoot: f.root,
 	})
@@ -173,31 +179,88 @@ func managedWriteActor() core.Actor {
 	}
 }
 
-// TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance 是 R2-1 的主链路：
-// 存量实例 → 保存托管凭据 → 名册 / 密钥 / 记录在同一次受控动作里落地 → 同一进程的
-// 解析器立刻解得开 → 再保存一次是幂等的（不生成第二把密钥）。
-// TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance pins the whole chain.
-func TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance(t *testing.T) {
+// TestInstanceSecrets_ExistingInstanceWithoutRosterRefusesManagedInit 判 H1：存量实例
+// （库在、名册不在）既不能通过网页保存、也不能通过显式初始化就地建立身份。
+// 两条入口都必须给出稳定码 `roster_missing_requires_adopt`，并且零写入：名册不建、
+// 密钥不铸、记录不写、审计不落——拒绝发生在任何副作用之前。
+//
+// 本用例替换原 `TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance`：
+// 那条用例把"存量实例首次保存即就地初始化"当成正确行为，H1 判定它正是要被堵住的路径。
+// TestInstanceSecrets_ExistingInstanceWithoutRosterRefusesManagedInit pins the H1 refusal
+// on both entry points.
+func TestInstanceSecrets_ExistingInstanceWithoutRosterRefusesManagedInit(t *testing.T) {
 	ctx := context.Background()
-	f := newManagedWriteFixture(t, nil)
+
+	// requireRefused 断言拒绝三件套 + 零写入。
+	requireRefused := func(t *testing.T, f *managedWriteFixture, err error) {
+		t.Helper()
+		require.Error(t, err)
+		var refusal *secretsRefusal
+		require.ErrorAs(t, err, &refusal)
+		require.Equal(t, SecretsCodeRosterMissingRequiresAdopt, refusal.Code)
+		require.True(t, strings.HasPrefix(err.Error(), SecretsCodeRosterMissingRequiresAdopt+":"),
+			"错误文案必须以稳定码开头：%s", err)
+		require.ErrorIs(t, err, core.ErrCredentialUnavailable,
+			"管理面仍按 409 处理：码给运维，哨兵错误给调用链")
+		require.False(t, f.markerPresent(t), "拒绝路径不得建立名册")
+		require.Empty(t, f.locator.Path(), "拒绝路径不得让 locator 生效")
+		require.Empty(t, f.keyFilesUnder(t), "拒绝路径不得生成任何主密钥")
+		_, exists, loadErr := f.store.Load(ctx, core.InstanceSecretScopeMasterKey)
+		require.NoError(t, loadErr)
+		require.False(t, exists, "拒绝路径不得写初始化记录")
+		require.Empty(t, f.secretsInitRows(t), "拒绝路径不得写初始化审计")
+	}
+
+	t.Run("managed_write_is_refused", func(t *testing.T) {
+		f := newManagedWriteFixture(t, nil)
+		f.seedManagedModelConnection(t, "alpha", "https://api.example.com/v1")
+		require.False(t, f.markerPresent(t), "存量实例保存前没有名册")
+
+		requireRefused(t, f, f.writer.PrepareManagedWrite(ctx, managedWriteActor()))
+	})
+
+	t.Run("explicit_init_is_refused", func(t *testing.T) {
+		f := newManagedWriteFixture(t, nil)
+		require.False(t, f.markerPresent(t))
+
+		_, err := f.secrets.Init(ctx, managedWriteActor())
+		requireRefused(t, f, err)
+	})
+
+	t.Run("existing_roster_still_allowed", func(t *testing.T) {
+		// 反向保护：名册在的存量实例不能被这条门误伤——它走的是正常初始化路径。
+		f := newManagedWriteFixture(t, nil)
+		_, err := ensureInstanceMarker(f.workDir)
+		require.NoError(t, err)
+		require.True(t, f.markerPresent(t))
+
+		require.NoError(t, f.writer.PrepareManagedWrite(ctx, managedWriteActor()))
+		require.NotEmpty(t, f.locator.Path(), "名册在时初始化必须照常生效")
+		require.NotEmpty(t, f.keyFilesUnder(t))
+	})
+}
+
+// TestInstanceSecrets_FreshInstanceStillAutoInitializes 是新实例的反向保护：H1 的门只看
+// 存量实例，`FreshInstance=true`（库与名册都是本次新建）必须照旧在同一次受控动作里
+// 建名册、铸密钥、写记录、让 locator 立即生效——否则全新部署永远起不来。
+// TestInstanceSecrets_FreshInstanceStillAutoInitializes keeps new-instance auto-init intact.
+func TestInstanceSecrets_FreshInstanceStillAutoInitializes(t *testing.T) {
+	ctx := context.Background()
+	f := newManagedWriteFixture(t, func(deps *InstanceSecretsDeps) {
+		deps.FreshInstance = true
+	})
 	f.seedManagedModelConnection(t, "alpha", "https://api.example.com/v1")
 	uid := connectionUID(t, "alpha")
 	actor := managedWriteActor()
 
-	// 保存之前：名册不在、记录不在、路径为空——存量实例的真实形状。
-	require.False(t, f.markerPresent(t), "存量实例保存前没有名册")
-	_, exists, err := f.store.Load(ctx, core.InstanceSecretScopeMasterKey)
-	require.NoError(t, err)
-	require.False(t, exists, "存量实例保存前没有初始化记录")
-	require.Empty(t, f.locator.Path(), "存量实例启动时解析不出主密钥路径")
-	require.Empty(t, f.keyFilesUnder(t), "存量实例保存前没有主密钥文件")
+	require.False(t, f.markerPresent(t), "新实例在建名册之前同样没有名册")
+	require.Empty(t, f.keyFilesUnder(t))
 
-	// 网页保存的前置动作：检查 + 必要初始化（与模型连接保存路径调用同一入口）。
 	require.NoError(t, f.writer.PrepareManagedWrite(ctx, actor))
 
 	marker, present, err := readInstanceMarker(f.workDir)
 	require.NoError(t, err)
-	require.True(t, present, "保存动作必须为存量实例建立名册")
+	require.True(t, present, "新实例必须自动建立名册")
 	require.Regexp(t, `^inst_[0-9a-f]{16}$`, marker.InstanceID)
 
 	require.NotEmpty(t, f.locator.Path(), "初始化成功后共享 locator 必须立即生效")
@@ -228,7 +291,7 @@ func TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance(t *testing.T)
 		Name:  "alpha",
 		UID:   uid,
 		Mode:  core.CredentialModeManaged,
-		Value: []byte("sk-legacy-secret-1"),
+		Value: []byte("sk-fresh-secret-1"),
 	})
 	require.NoError(t, err)
 	require.True(t, result.Changed)
@@ -239,7 +302,7 @@ func TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance(t *testing.T)
 		Name: "alpha", ResourceUID: uid,
 	})
 	require.NoError(t, err)
-	require.Equal(t, "sk-legacy-secret-1", plaintext)
+	require.Equal(t, "sk-fresh-secret-1", plaintext)
 
 	// 第二次保存是幂等的：已有记录 + 密钥 → Prepare 只读，不再生成、不覆盖密钥。
 	before, err := os.ReadFile(keyPath)
@@ -249,7 +312,7 @@ func TestInstanceSecrets_FirstManagedSaveInitializesLegacyInstance(t *testing.T)
 	after, err := os.ReadFile(keyPath)
 	require.NoError(t, err)
 	require.Equal(t, before, after, "密钥文件不得被覆盖")
-	require.NotContains(t, f.logs.String(), "sk-legacy-secret-1", "日志不得出现明文")
+	require.NotContains(t, f.logs.String(), "sk-fresh-secret-1", "日志不得出现明文")
 }
 
 // TestInstanceSecrets_ManagedWriteRefusesNonProvableStates：三条拒绝路径——有记录但
@@ -261,7 +324,7 @@ func TestInstanceSecrets_ManagedWriteRefusesNonProvableStates(t *testing.T) {
 
 	t.Run("record without resolvable key path", func(t *testing.T) {
 		f := newManagedWriteFixture(t, nil)
-		require.NoError(t, f.store.Insert(ctx, storage.InstanceSecretRecord{
+		require.NoError(t, f.store.Insert(ctx, postgres.InstanceSecretRecord{
 			Scope:         core.InstanceSecretScopeMasterKey,
 			KeyID:         "mk-historic",
 			Fingerprint:   "fp-historic",

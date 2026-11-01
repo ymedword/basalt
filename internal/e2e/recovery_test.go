@@ -92,7 +92,7 @@ func testRestartRecoveryCrash(t *testing.T) {
 	p2.waitOutput(t, "启动恢复完成 recovered=1", 30*time.Second)
 	p2.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	runs := queryRows(t, db, `SELECT status, reason, finished_at FROM runs`)
 	if len(runs) != 1 {
 		t.Fatalf("runs 应有 1 行，实际 %d 行：%v", len(runs), runs)
@@ -187,7 +187,7 @@ func testRestartRecoverySessionHistory(t *testing.T) {
 		requireContains(t, history, want, "第二轮请求应带回上一进程的历史")
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM sessions`); n != 1 {
 		t.Fatalf("sessions 应有 1 行（同一派生会话），实际 %d 行", n)
 	}
@@ -229,7 +229,7 @@ func testRestartRecoveryServe(t *testing.T) {
 	p2.waitOutput(t, "崩溃恢复扫描完成 unknowns=0 repaired_groups=0 closed_runs=0", 30*time.Second)
 	p2.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM sessions`); n != 1 {
 		t.Fatalf("重启后会话应仍在（1 行），实际 %d 行", n)
 	}
@@ -279,7 +279,7 @@ func testRestartRecoveryReconcile(t *testing.T) {
 	requireScheduleIDs(t, addr2, "added,keep", "重启对账")
 	p2.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	keep := queryRows(t, db, `SELECT cron, enabled, retired_at FROM scheduled_tasks WHERE task_id = 'keep'`)
 	if len(keep) != 1 {
 		t.Fatalf("scheduled_tasks 应有 keep 一行，实际 %d 行：%v", len(keep), keep)
@@ -287,8 +287,8 @@ func testRestartRecoveryReconcile(t *testing.T) {
 	if got, _ := keep[0]["cron"].(string); got != changedCron {
 		t.Fatalf("keep.cron = %q，期望新定义 %q（文件定义为准）", got, changedCron)
 	}
-	if got := intValue(t, keep[0], "enabled"); got != 0 {
-		t.Fatalf("keep.enabled = %d，期望 0（enabled 以库为准，不随定义变化翻转）", got)
+	if got := boolValue(t, keep[0], "enabled"); got {
+		t.Fatalf("keep.enabled = %v，期望 false（enabled 以库为准，不随定义变化翻转）", got)
 	}
 	if keep[0]["retired_at"] != nil {
 		t.Fatalf("keep.retired_at = %v，期望 NULL（仍存在的任务不得退休）", keep[0]["retired_at"])
@@ -298,8 +298,8 @@ func testRestartRecoveryReconcile(t *testing.T) {
 	if len(added) != 1 {
 		t.Fatalf("scheduled_tasks 应有 added 一行，实际 %d 行：%v", len(added), added)
 	}
-	if got := intValue(t, added[0], "enabled"); got != 1 {
-		t.Fatalf("added.enabled = %d，期望 1（新任务默认启用）", got)
+	if got := boolValue(t, added[0], "enabled"); !got {
+		t.Fatalf("added.enabled = %v，期望 true（新任务默认启用）", got)
 	}
 	if added[0]["retired_at"] != nil {
 		t.Fatalf("added.retired_at = %v，期望 NULL", added[0]["retired_at"])
@@ -341,9 +341,9 @@ func testRestartRecoveryMissedFire(t *testing.T) {
 	waitHealthHTTP(t, p, addr, 30*time.Second)
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	backdated := time.Now().Add(-25 * time.Hour).UnixMilli()
-	if _, err := db.Exec(`UPDATE scheduled_tasks SET last_run_at = ? WHERE task_id = 'demo-1'`, backdated); err != nil {
+	if _, err := db.Exec(`UPDATE scheduled_tasks SET last_run_at = $1 WHERE task_id = 'demo-1'`, backdated); err != nil {
 		t.Fatalf("回拨 last_run_at 失败: %v", err)
 	}
 
@@ -495,13 +495,26 @@ func waitPathAppears(t *testing.T, path string, timeout time.Duration, diagnosti
 	t.Fatalf("等待 %s 出现超时（%s）%s", path, timeout, detail)
 }
 
-// intValue 读一行里的整数列（SQLite INTEGER 经驱动为 int64）。
+// intValue 读一行里的整数列（时间戳等 bigint 列经驱动为 int64）。
 // intValue reads an integer column from one row.
 func intValue(t *testing.T, row map[string]any, key string) int64 {
 	t.Helper()
 	value, ok := row[key].(int64)
 	if !ok {
 		t.Fatalf("%s 列不是整数：%#v", key, row[key])
+	}
+	return value
+}
+
+// boolValue 读一行里的布尔列。SQLite 谱系把 `scheduled_tasks.enabled` /
+// `agent_lifecycle.valid` 存成 0/1 的 INTEGER，PostgreSQL 谱系是真 boolean——
+// 同一判据（启用 / 停用的读数）按后端原生类型断言，不把 true 硬转成 1 再比。
+// boolValue reads a boolean column; the PG lineage stores real booleans, not 0/1.
+func boolValue(t *testing.T, row map[string]any, key string) bool {
+	t.Helper()
+	value, ok := row[key].(bool)
+	if !ok {
+		t.Fatalf("%s 列不是布尔值：%#v", key, row[key])
 	}
 	return value
 }

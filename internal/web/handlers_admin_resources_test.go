@@ -325,6 +325,17 @@ func (resourceAuth) Wrap(next AdminHandler) http.Handler {
 	})
 }
 
+// WrapPrincipal 是业务面的同一替身行为（T025 起 AdminAuth 两面共用一个端口）：
+// 本文件的用例只走管理面写路由，业务面的认证矩阵由 `middleware_business_auth_test.go`
+// 判卷，因此这里只满足接口并以内置管理员身份放行。
+// WrapPrincipal satisfies the business half of the port; the business matrix itself
+// is judged by middleware_business_auth_test.go.
+func (resourceAuth) WrapPrincipal(next PrincipalHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next(w, r, core.LocalAdminPrincipal())
+	})
+}
+
 // newAdminServer 装配一个认证可用、端口可注入的资源写面服务器，并给"模型连接
 // upsert / 发布 / 版本列表"装上默认行为：ETag 过期 → 412 且零副作用；成功则改写
 // 工作区并追加一行操作记录。用例可覆盖任一行为。

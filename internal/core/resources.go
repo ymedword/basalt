@@ -98,6 +98,21 @@ type ResolvedResources struct {
 	ProviderModel      string
 	ProviderCredential CredentialPin
 	Notify             NotifyManifest
+
+	// SummaryProvider 是会话压缩摘要调用专用的**裸协议客户端**，同样在准入时按
+	// `Provider` 固定（原则 III：摘要不得按名字重新解析、不得自动换供应商）。
+	//
+	// 为什么单独一份、为什么不走 `Provider` 那条审计视图：摘要不是对话轮，`ProviderService`
+	// 会以"round 必须 >= 1"拒绝，且它写出的审计行 `purpose='chat'`——与 C-25 要求的
+	// "一条调用一行 `purpose='compaction'`"冲突。因此本字段只交给压缩接线
+	// （`SummaryCallGate`）：它**先写** `purpose='compaction'` 的 `pending` 行、再走配额
+	// 预留、最后才用本客户端发出——审计与配额一样不绕过（宪法 V）。
+	// 未接压缩时为 nil，装配层据此判断"本次 Run 不压缩"，调用方必须自行拒绝空值。
+	//
+	// SummaryProvider is the raw protocol client for the compaction summary call, pinned at
+	// admission. It is deliberately not the audited view: a summary is not a chat round, so
+	// the gate pre-writes purpose='compaction' itself and quota-admits before emitting.
+	SummaryProvider ProviderClient
 }
 
 // CredentialPin 是准入时固定的凭据引用：模式、身份 / 版本（env 模式为空 / 0）与

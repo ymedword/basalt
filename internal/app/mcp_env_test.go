@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是颗粒度文档 §4.5.1–§4.5.3 的验收面：保存期 env 闸门（创建 / 修改 / 发布 /

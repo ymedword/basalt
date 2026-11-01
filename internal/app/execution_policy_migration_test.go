@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷存量升级（14D / D-11）：迁移行一律 `strict`（白名单为空也不放宽），启动后
@@ -21,7 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
@@ -209,7 +211,7 @@ func TestExecutionProfile_MigrationStrict(t *testing.T) {
 	require.Equal(t, core.TargetKindExecutionPolicy, row.TargetKind)
 	require.Equal(t, networkItem.ID, row.TargetID)
 	require.Equal(t, core.OperationSuccess, row.Status)
-	require.Contains(t, string(row.DetailJSON), `"axis":"network_allowlist"`)
+	require.Equal(t, "network_allowlist", detailMap(t, row.DetailJSON)["axis"])
 
 	pending, err = env.service.PendingConfirmations(ctx)
 	require.NoError(t, err)
@@ -219,7 +221,7 @@ func TestExecutionProfile_MigrationStrict(t *testing.T) {
 	// ⑤ 「加例外」同样写审计，且只放行被登记的那一条：legacy 可拨，intranet 仍拒。
 	logger, _ := newCapturedLogger()
 	exceptions := NewNetworkExceptionService(NetworkExceptionDeps{
-		Store:      storage.NewNetworkExceptionStore(env.db),
+		Store:      postgres.NewNetworkExceptionStore(env.db),
 		Operations: env.ops,
 		Policy:     env.policy,
 		Logger:     logger,
@@ -254,7 +256,7 @@ func TestExecutionProfile_MigrationStrict(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, core.ActionExecutionPolicyConfirm, shellRow.Action)
 	require.Equal(t, "shell_command:bash", shellRow.TargetID)
-	require.Contains(t, string(shellRow.DetailJSON), `"axis":"shell_command"`)
+	require.Equal(t, "shell_command", detailMap(t, shellRow.DetailJSON)["axis"])
 
 	pending, err = env.service.PendingConfirmations(ctx)
 	require.NoError(t, err)

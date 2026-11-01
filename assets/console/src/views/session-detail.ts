@@ -10,7 +10,8 @@ import { ApiError, errorMessage } from '../api'
 import type { MessageView, ProfileView, SessionDetail } from '../api'
 import { ConfirmDialog, Notice, formatTimestamp } from '../components/ui'
 import { renderSafeText } from '../render'
-import { agentConfigHref, agentHref, runHref, sessionHref } from '../router'
+import { agentConfigHref, agentHref, diagnosticsHref, historyHref, runHref, sessionHref } from '../router'
+import { CompactionPanel } from './compaction'
 import {
   badge,
   definitions,
@@ -302,6 +303,15 @@ export const SessionDetailView = defineComponent({
           'WORKSPACE / AGENTS / SESSION',
           '会话详情',
           '查看完整对话、刷新消息、继续对话或归档会话；本页可直接收藏或分享链接。',
+          // 历史回查带本会话作过滤条件；关键词仍在历史页由用户给出（检索必填）。
+          // The history page opens filtered to this session; the keyword stays user input.
+          h('div', { class: 'form-actions' }, [
+            h('a', { class: 'button', href: historyHref(['session_id', sessionId]) }, '历史回查'),
+            // 诊断按 session_id 深链：契约接受该锚点，但当前没有生产端写它，
+            // 诊断页会如实标注"暂无生产端"而不是假装查过。
+            // The diagnostics page labels anchors that have no producer today.
+            h('a', { class: 'button', href: diagnosticsHref(['session_id', sessionId]) }, '诊断事件'),
+          ]),
         ),
         h('p', { class: 'back-link' }, [
           h('a', { href: agentHref(agentName) }, `← 返回 ${agentName}`),
@@ -391,6 +401,9 @@ export const SessionDetailView = defineComponent({
               ['深链', h('code', { class: 'cell-id', title: window.location.origin + sessionHref(agentName, sessionId) }, window.location.origin + sessionHref(agentName, sessionId))],
             ]),
           ]),
+          // 压缩记录（T089）：会话范围的只读派生视图；本页不提供手动触发。
+          // The session-scope compaction panel; it never triggers a compaction.
+          h(CompactionPanel, { ctx: props.ctx, sessionId }),
           section('对话记录', [
             renderTranscript(detail),
             chatNotice.value === ''

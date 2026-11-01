@@ -54,7 +54,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -211,7 +211,7 @@ type ResourceAdminDeps struct {
 	// 名各建一条替身，不解析环境变量、不构造真实客户端（与启动装配同一份注入值）。
 	ProviderOverride core.ProviderClient
 	// Store 是版本 / 指针仓储（US-11 的同一份实现，**不**另建资源存储）。
-	Store *storage.ResourceStore
+	Store *postgres.ResourceStore
 	// Operations 是管理操作仓储：预写 pending、回填终态。
 	Operations core.OperationStore
 	// Gate 必须与运行准入共用同一个实例（约束 16）：发布持写锁、准入持读锁。
@@ -238,7 +238,7 @@ type ResourceAdminDeps struct {
 	// Credentials 是托管凭据仓储：条件 ETag 的凭据段（FR-081）与后续凭据写路径的
 	// 唯一读取点。nil 表示本次装配没有托管凭据（CLI 轻路径 / 半截夹具），此时 ETag
 	// 只有内容与身份段——生产装配必须传共享实例。
-	Credentials *storage.CredentialStore
+	Credentials *postgres.CredentialStore
 	// CredentialSource 是删除模型连接后按剩余已发布集合重建目录时的托管凭据解析面：
 	// 剩余条目里可能有 `credential_mode: managed`。nil 表示本次装配没有托管凭据能力，
 	// 遇到 managed 条目时重建失败关闭（目录不换、定义文件按身份检查回滚），不猜值。
@@ -289,12 +289,12 @@ type ResourceAdmin struct {
 	root             string
 	agents           func() ([]core.AgentEntry, error)
 	providerOverride core.ProviderClient
-	store            *storage.ResourceStore
+	store            *postgres.ResourceStore
 	operations       core.OperationStore
 	gate             *core.ResourceGate
 	catalog          *providerCatalogStore
 	supervisor       *MCPSupervisor
-	credentials      *storage.CredentialStore
+	credentials      *postgres.CredentialStore
 	credentialSource managedCredentialSource
 	credentialWriter CredentialSaveWriter
 	scopes           *ScopeService
@@ -1153,6 +1153,54 @@ func (s *ResourceAdmin) UpdateSkill(ctx context.Context, actor core.Actor, req S
 	})
 }
 
+// ReadSkillForEdit 读取同一发布快照的文件与 ETag，供管理面完整替换前编辑。
+// ReadSkillForEdit returns verified files and their matching published ETag.
+func (s *ResourceAdmin) ReadSkillForEdit(ctx context.Context, name string) (SkillDetail, error) {
+	unlock := s.resourceLocks.lock(resourceLockKey(core.ResourceSkill, name))
+	defer unlock()
+	pointer, err := s.activePointer(ctx, core.ResourceSkill, name)
+	if err != nil {
+		return SkillDetail{}, err
+	}
+	version, err := s.store.VersionByID(ctx, pointer.PublishedVersionID)
+	if err != nil {
+		return SkillDetail{}, fmt.Errorf("读取技能发布版本: %w", err)
+	}
+	snapshot, err := workspace.NewSkillLibrary(s.root).LoadPublished(ctx, name, version.VersionNo, version.StoragePath)
+	if err != nil {
+		return SkillDetail{}, fmt.Errorf("读取技能发布快照: %w", err)
+	}
+	if snapshot.ContentHash != version.ContentHash {
+		return SkillDetail{}, fmt.Errorf("技能发布快照与登记哈希不一致")
+	}
+	manifest, err := parseSkillManifest(name, version.ManifestJSON)
+	if err != nil {
+		return SkillDetail{}, err
+	}
+	if !slices.Equal(snapshot.Files, manifest) {
+		return SkillDetail{}, fmt.Errorf("技能发布快照与登记文件清单不一致")
+	}
+	rel, err := workspace.PublishedVersionRelDir(version.StoragePath)
+	if err != nil {
+		return SkillDetail{}, err
+	}
+	files, err := readSkillFiles(s.root, rel, manifest)
+	if err != nil {
+		return SkillDetail{}, err
+	}
+	var description string
+	for _, file := range files {
+		if file.Path != skillDefinitionFileName {
+			continue
+		}
+		description, err = workspace.SkillCardDescription(file.Content, name)
+		if err != nil {
+			return SkillDetail{}, fmt.Errorf("读取技能描述: %w", err)
+		}
+	}
+	return s.skillDetail(ctx, name, description, files, pointer, version)
+}
+
 // ValidateSkill 是 `POST /skills/{name}/validate` 的实现（约束 26）：与创建 / 导入 /
 // 更新**共用** `workspace.ValidateSkillDraft`，不落盘、不写操作行、不执行脚本。
 // 校验不通过以 `valid=false` + `problems` 返回 200——端点回答的是"这份候选能不能
@@ -1321,12 +1369,30 @@ func (s *ResourceAdmin) writeSkill(ctx context.Context, actor core.Actor, plan s
 	}
 	s.gate.Unlock()
 
+	// 描述取**本次写入的 SKILL.md**：创建时请求自带一份，导入 / 更新时只有文件里那一份。
+	// 只读面（`readSkillForEdit`）本来就是这么取的，写入面若沿用 `plan.description`，
+	// 同一次保存前后页面会先看到空描述、刷新后才出现——把"来源唯一"退化成"按调用方"。
+	description := plan.description
+	for _, file := range cand.Files {
+		if file.Path != skillDefinitionFileName {
+			continue
+		}
+		derived, descErr := workspace.SkillCardDescription(file.Content, plan.name)
+		if descErr != nil {
+			// 描述缺失不影响本次写入已提交的事实，只影响结果视图的一个展示字段：
+			// 记 WARN 并退回请求侧的值，不为此回滚，也不谎报失败。
+			s.logger.Warn("读取技能描述失败，结果视图退回请求值",
+				"skill", plan.name, "operation_id", operationID, "error", descErr)
+			break
+		}
+		description = derived
+	}
 	// 提交后重读指针：revision 已在发布事务里前进，结果视图的 ETag 必须按新指针组成。
 	publishedPtr, err := s.store.Pointer(ctx, core.ResourceSkill, plan.name)
 	if err != nil {
 		return SkillDetail{}, fmt.Errorf("读取技能 %s 的提交后指针: %w", plan.name, err)
 	}
-	return s.skillDetail(ctx, plan.name, plan.description, cand.Files, publishedPtr, version)
+	return s.skillDetail(ctx, plan.name, description, cand.Files, publishedPtr, version)
 }
 
 // skillWorkCopyState 在锁内重读工作副本并做分歧闸门（约束 35）：工作副本不存在 / 缺
@@ -1381,8 +1447,9 @@ func (s *ResourceAdmin) abortSkillWrite(ctx context.Context, operationID, name, 
 }
 
 // skillDetail 组装写操作的结果视图：path 与只读面同一口径；引用列表读仓储，读失败
-// 只记 WARN 并返回空列表（写入已成功，不因展示数据回滚）。`description` 在创建时有
-// 唯一来源（本次请求），导入 / 更新 / 发布留空——只读面受 I-60 约束也没有可达来源。
+// 只记 WARN 并返回空列表（写入已成功，不因展示数据回滚）。`description` 的唯一来源是
+// **写入后的 SKILL.md frontmatter**——两个调用点都从那里面取，创建 / 导入 / 更新因此
+// 给出同一个值，前后端不会出现"保存后描述先变空、刷新后才回来"。
 // skillDetail builds the write result; a reference-read failure degrades the display
 // only and never rolls the write back.
 func (s *ResourceAdmin) skillDetail(ctx context.Context, name, description string,

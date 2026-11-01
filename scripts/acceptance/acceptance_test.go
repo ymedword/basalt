@@ -426,6 +426,70 @@ func TestMainRun_ArgumentErrorsAndLock(t *testing.T) {
 	}
 }
 
+// TestMainRun_MissingPostgresDSNFailsBeforeRunning 验证 D-01 入口预检：所选 profile
+// 含 PostgreSQL 依赖目标（test-integration / cover）而 BASALT_TEST_PG_DSN 未设置时，
+// 必须在执行前退出 2 并给出排查路径——不得先跑一遍、再靠「全部跳过」判绿。
+// The D-01 preflight exits 2 with the hint before any check executes.
+func TestMainRun_MissingPostgresDSNFailsBeforeRunning(t *testing.T) {
+	root, cfg, _ := fixture(t)
+	t.Chdir(root)
+	require.NoError(t, os.MkdirAll("harness", 0o700))
+	cfg.Profiles["full"] = []string{"cover"}
+	cfg.Checks = append(cfg.Checks, check{ID: "cover", command: helperCommand(t, "pass")})
+	require.NoError(t, atomicJSON(filepath.Join(root, "harness/acceptance.json"), cfg))
+	t.Setenv("BASALT_TEST_PG_DSN", "")
+
+	var stderr strings.Builder
+	code := mainRun(context.Background(), []string{"--profile", "full", "--out", ".loop/runs/no-dsn"}, io.Discard, &stderr)
+	require.Equal(t, 2, code)
+	require.Contains(t, stderr.String(), "BASALT_TEST_PG_DSN")
+	require.Contains(t, stderr.String(), "DevelopmentLoop.md")
+	_, statErr := os.Stat(filepath.Join(root, ".loop/runs/no-dsn/report.json"))
+	require.ErrorIs(t, statErr, os.ErrNotExist, "预检失败不得留下报告，避免被当成一轮验收")
+}
+
+// TestMainRun_TestPGCheckRequiresDSN 锁定 T136 的预检覆盖：`test-pg` 只跑引擎包，
+// 但真实 PostgreSQL 对它是**判据前提**而非可选加速——只选它、缺 DSN 时同样必须在
+// 执行前退出 2。漏收这张表不会变假绿（底层测试助手仍 fail-closed），但会把"缺环境"
+// 从一条可读的入口错误降级成逐条用例失败。
+// The new test-pg check must join the D-01 preflight, not only the underlying helper.
+func TestMainRun_TestPGCheckRequiresDSN(t *testing.T) {
+	root, cfg, _ := fixture(t)
+	t.Chdir(root)
+	require.NoError(t, os.MkdirAll("harness", 0o700))
+	cfg.Profiles["pgonly"] = []string{"test-pg"}
+	cfg.Checks = append(cfg.Checks, check{ID: "test-pg", command: helperCommand(t, "pass")})
+	require.NoError(t, atomicJSON(filepath.Join(root, "harness/acceptance.json"), cfg))
+	t.Setenv("BASALT_TEST_PG_DSN", "")
+
+	var stderr strings.Builder
+	code := mainRun(context.Background(), []string{"--profile", "pgonly", "--out", ".loop/runs/pg-no-dsn"}, io.Discard, &stderr)
+	require.Equal(t, 2, code)
+	require.Contains(t, stderr.String(), "test-pg")
+	_, statErr := os.Stat(filepath.Join(root, ".loop/runs/pg-no-dsn/report.json"))
+	require.ErrorIs(t, statErr, os.ErrNotExist, "预检失败不得留下报告，避免被当成一轮验收")
+}
+
+// TestPostgresChecksAreCoveredByFullProfile 锁住"预检表 ↔ 公共清单"的一致性：每个
+// PG 依赖 check 都必须在 `harness/acceptance.json` 里真实存在，且被 `full` 与 `ci`
+// 同时选中。缺前者是空转（预检拦一个不存在的目标），缺后者是漏网（检查根本没跑，
+// 却因为预检表有它而显得"已覆盖"）。本用例读的是**仓库里那份**清单，不是夹具。
+// The preflight table and the shipped acceptance list must agree in both directions.
+func TestPostgresChecksAreCoveredByFullProfile(t *testing.T) {
+	var cfg configuration
+	require.NoError(t, readJSON(filepath.Join("..", "..", "harness", "acceptance.json"), &cfg))
+	byID := make(map[string]bool, len(cfg.Checks))
+	for _, c := range cfg.Checks {
+		byID[c.ID] = true
+	}
+	for _, name := range []string{"full", "ci"} {
+		for _, id := range postgresChecks {
+			require.True(t, byID[id], "预检表列了 %q，但公共清单没有这个 check", id)
+			require.Contains(t, cfg.Profiles[name], id, "%s profile 必须包含 PG 依赖检查 %q", name, id)
+		}
+	}
+}
+
 // TestMainRun_FullIncludesUnboundStageCheck 防止移除自动执行器后漏掉跨任务验收。
 // TestMainRun_FullIncludesUnboundStageCheck keeps cross-task checks in full acceptance.
 func TestMainRun_FullIncludesUnboundStageCheck(t *testing.T) {

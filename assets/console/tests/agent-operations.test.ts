@@ -247,7 +247,19 @@ function defaultReply(call: Call): Reply {
     return { data: profilesData }
   }
   if (call.path.endsWith('/memory')) {
-    return { data: { scope: 'global', agent: '', backend: 'markdown', core: '', archive: '' } }
+    return { data: { scope: 'global', agent: '', backend: 'postgres', core: '', archive: '' } }
+  }
+  // 记忆条目的读模型是独立端点（US-16 裁决 A）：渲染视图与条目列表分开取，
+  // 这一层不关心条目内容，给空列表即可；条目行为见 memory-entries.test.ts。
+  // The entry read model is its own endpoint; an empty list is enough here.
+  if (call.path.endsWith('/memory/entries')) {
+    return {
+      data: {
+        scope: call.path.startsWith('/api/v1/agents/') ? 'agent' : 'global',
+        agent: '',
+        entries: [],
+      },
+    }
   }
   return { data: [] }
 }
@@ -556,7 +568,7 @@ describe('agent session operations', () => {
   it('states that session history is not long-term memory', async () => {
     const route: Route = (call) => {
       if (call.method === 'GET' && call.path === '/api/v1/agents/writer/memory') {
-        return { data: { scope: 'agent', agent: 'writer', backend: 'markdown', core: '', archive: '' } }
+        return { data: { scope: 'agent', agent: 'writer', backend: 'postgres', core: '', archive: '' } }
       }
       return undefined
     }
@@ -573,8 +585,9 @@ describe('agent session operations', () => {
     // 会话消息自动保存，但保存的是对话历史，不是记忆条目；两层分开说清楚。
     expect(text).toContain('会话消息随每次运行自动保存为会话历史')
     expect(text).toContain('不会自动进入长期记忆')
-    expect(text).toContain('只有 Agent 在运行中调用 save_memory 才会写入')
-    // 可检索层是关键词召回，不是语义检索，也没有对话后的自动抽取。
+    expect(text).toContain('记忆可由 Agent 调用 save_memory 写入，也可在此页提议并确认')
+    // 可检索层靠 recall_memory 召回（缺省语义检索），也没有对话后的自动抽取。
+    expect(text).toContain('缺省是语义（向量）检索')
     expect(text).toContain('不会自动从对话里抽取内容')
     expect(text).not.toContain('自动形成长期记忆')
   })
@@ -1311,7 +1324,7 @@ describe('resource edits', () => {
   it('submits skill files with the detail ETag and re-reads the listing', async () => {
     let skillContent = '# 旧版'
     const route: Route = (call) => {
-      if (call.method === 'GET' && call.path === '/api/v1/skills/alpha') {
+      if (call.method === 'GET' && (call.path === '/api/v1/skills/alpha' || call.path === '/api/v1/admin/skills/alpha/edit')) {
         return { data: skillDetailOf(skillContent), etag: ETAG_A }
       }
       if (call.method === 'GET' && call.path === '/api/v1/resources/skill/alpha/versions') {
@@ -1324,9 +1337,9 @@ describe('resource edits', () => {
             id: 'alpha',
             resource_uid: 'rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A',
             published_version_id: 1,
-            agents: [],
+            agents: ['reader', 'archive:legacy'],
             bound_agents: [],
-            active_runs: [],
+            active_runs: ['run-123'],
           },
         }
       }
@@ -1341,6 +1354,12 @@ describe('resource edits', () => {
     await visit('/console/resources/skills/alpha')
 
     expect(wrapper!.find('.view-resource-detail').text()).toContain('修改技能')
+    expect(wrapper!.text()).toContain('alpha skill')
+    expect(wrapper!.text()).toContain('声明或可能引用的 Agent')
+    expect(wrapper!.text()).toContain('archive:legacy')
+    expect(wrapper!.text()).toContain('运行占用（Run ID）')
+    expect(wrapper!.text()).toContain('run-123')
+    expect(wrapper!.text()).not.toContain('文档提及 Agent（扫描）')
     const editor = wrapper!.find('textarea[aria-label="文件正文 SKILL.md"]')
     expect(editor.exists()).toBe(true)
     await editor.setValue('# 新版')

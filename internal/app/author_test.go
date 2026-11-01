@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `internal/app/author.go` 的验收面（US-12 T019 / 约束 29）：作者模型的
@@ -25,7 +27,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -132,40 +134,32 @@ func authorValidDraft(t *testing.T, name string) string {
 	)
 }
 
-// openAuthorDB 建一个迁移到当前版本的临时库。
-// openAuthorDB opens a migrated temp database.
-func openAuthorDB(t *testing.T) (*storage.DB, string) {
+// openAuthorDB 在隔离 schema 上开一个迁移到当前版本的临时库。
+// openAuthorDB opens a migrated throwaway database in an isolated schema.
+func openAuthorDB(t *testing.T) *postgres.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "basalt.db")
-	db, err := storage.OpenWritable(context.Background(), path, storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	return db, path
+	return pgtest.NewTestDB(t)
 }
 
-// authorRowCount 用裸连接数一张表的行数。
-// authorRowCount counts rows in one table over a bare connection.
-func authorRowCount(t *testing.T, path, table string) int {
+// authorRowCount 数一张表的行数（同一隔离 schema，独立连接）。
+// authorRowCount counts rows in one table over a separate connection.
+func authorRowCount(t *testing.T, db *postgres.DB, table string) int {
 	t.Helper()
-	read, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, read.Close()) })
-
 	var count int
-	require.NoError(t, read.QueryRow("SELECT COUNT(*) FROM "+table).Scan(&count))
+	require.NoError(t, db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+table).Scan(&count))
 	return count
 }
 
 // auditedAuthorService 用真 ProviderService（两阶段审计）包装替身客户端。
 // auditedAuthorService wraps a stub client in the real auditing provider service.
-func auditedAuthorService(t *testing.T, db *storage.DB, client core.ProviderClient,
+func auditedAuthorService(t *testing.T, db *postgres.DB, client core.ProviderClient,
 	deps authorServiceDeps,
 ) *AuthorService {
 	t.Helper()
 	deps.Chat = provider.NewProviderService(
 		map[string]core.ProviderClient{"alpha": client},
 		map[string]string{"alpha": "alpha-default"},
-		storage.NewLLMCallRepo(db),
+		postgres.NewLLMCallRepo(db),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	return newAuthorService(deps)
@@ -220,7 +214,7 @@ func TestAuthorService_NotConfigured503(t *testing.T) {
 // Provider / 模型逐字来自配置；draft 原样返回。
 func TestAuthorService_OnlyLLMCallAudit(t *testing.T) {
 	ctx := context.Background()
-	db, path := openAuthorDB(t)
+	db := openAuthorDB(t)
 
 	raw := authorValidDraft(t, "helper")
 	client := &authorRecordingClient{response: raw}
@@ -246,17 +240,13 @@ func TestAuthorService_OnlyLLMCallAudit(t *testing.T) {
 		require.Contains(t, req.Messages[0].Content, want, "提示词必须带上已发布资源候选")
 	}
 
-	read, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, read.Close()) })
-
-	require.Equal(t, 1, authorRowCount(t, path, "llm_calls"))
+	require.Equal(t, 1, authorRowCount(t, db, "llm_calls"))
 	var (
 		runID, providerName, model, status string
 		session                            sql.NullString
 		round                              int
 	)
-	require.NoError(t, read.QueryRowContext(ctx,
+	require.NoError(t, db.QueryRowContext(ctx,
 		`SELECT run_id, session_id, round, provider, model, status FROM llm_calls`).
 		Scan(&runID, &session, &round, &providerName, &model, &status))
 
@@ -270,24 +260,24 @@ func TestAuthorService_OnlyLLMCallAudit(t *testing.T) {
 
 // TestAuthorService_NoRunCreated —— 约束 29：作者调用不创建 Run。
 func TestAuthorService_NoRunCreated(t *testing.T) {
-	db, path := openAuthorDB(t)
+	db := openAuthorDB(t)
 	client := &authorRecordingClient{response: authorValidDraft(t, "helper")}
 	svc := auditedAuthorService(t, db, client, authorTestDeps(nil))
 
 	_, err := svc.Draft(context.Background(), "helper", "测试")
 	require.NoError(t, err)
-	require.Equal(t, 0, authorRowCount(t, path, "runs"), "作者调用不是 Run")
+	require.Equal(t, 0, authorRowCount(t, db, "runs"), "作者调用不是 Run")
 }
 
 // TestAuthorService_NoOperationRow —— 约束 29：作者调用不写 management_operations。
 func TestAuthorService_NoOperationRow(t *testing.T) {
-	db, path := openAuthorDB(t)
+	db := openAuthorDB(t)
 	client := &authorRecordingClient{response: authorValidDraft(t, "helper")}
 	svc := auditedAuthorService(t, db, client, authorTestDeps(nil))
 
 	_, err := svc.Draft(context.Background(), "helper", "测试")
 	require.NoError(t, err)
-	require.Equal(t, 0, authorRowCount(t, path, "management_operations"),
+	require.Equal(t, 0, authorRowCount(t, db, "management_operations"),
 		"generate-files 不产生管理操作行（契约注 3）")
 }
 
@@ -600,7 +590,7 @@ func TestAuthorService_DraftWithAnswers_PromptAndLimits(t *testing.T) {
 // the server-computed triggers.
 func TestAuthorService_ScheduleDraft(t *testing.T) {
 	ctx := context.Background()
-	db, path := openAuthorDB(t)
+	db := openAuthorDB(t)
 
 	client := &authorRecordingClient{response: `{"id":"daily-report","cron":"0 30 8 * * *","zone":"Asia/Shanghai","message":"生成每日运维日报"}`}
 	deps := authorTestDeps(nil)
@@ -625,9 +615,9 @@ func TestAuthorService_ScheduleDraft(t *testing.T) {
 	require.Equal(t, 1, req.Round)
 	require.Contains(t, req.Messages[0].Content, "每天 8:30 生成日报", "指令逐字进提示词")
 
-	require.Equal(t, 1, authorRowCount(t, path, "llm_calls"), "唯一写入是 llm_calls 审计行")
-	require.Equal(t, 0, authorRowCount(t, path, "management_operations"), "候选不写管理操作")
-	require.Equal(t, 0, authorRowCount(t, path, "runs"), "候选不是 Run")
+	require.Equal(t, 1, authorRowCount(t, db, "llm_calls"), "唯一写入是 llm_calls 审计行")
+	require.Equal(t, 0, authorRowCount(t, db, "management_operations"), "候选不写管理操作")
+	require.Equal(t, 0, authorRowCount(t, db, "runs"), "候选不是 Run")
 }
 
 // TestAuthorService_ScheduleDraftRejected —— R6.4：指令为空 / 超限在调用前拒绝；

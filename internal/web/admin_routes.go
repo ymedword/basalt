@@ -10,14 +10,21 @@ package web
 // This file is the single route enumeration for the US-12 admin surface and the
 // conditional-write middleware. Every row is protected; the middleware checks the
 // If-Match shape only, while the service layer compares it inside the write lock.
-// 表内四十八行全部指向已落地的 handler——占位函数在最后一条 handler 任务（工作区浏览）
+// 表内六十七行全部指向已落地的 handler——占位函数在最后一条 handler 任务（工作区浏览）
 // 落地时删除，没有"装配未完成"的中间态残留。R8 追加出网域名白名单条件写；
 // US-14 追加只读目录 / 只读诊断与执行档位三行（GET、条件写 PUT 与处置 POST），
 // 14D 追加就绪视图一行（`GET /agents/{name}/readiness`）与实例加密两行
-// （`GET /instance/secrets` 只读、`POST /instance/secrets/init` 显式初始化）。
-// All forty-eight rows point at landed handlers; the placeholder was removed with the
-// last handler task. US-14 adds the two read-only rows plus the profile trio, and 14D
-// adds the readiness row and the two instance-encryption rows.
+// （`GET /instance/secrets` 只读、`POST /instance/secrets/init` 显式初始化）；
+// US-16 追加调用方七行（`/callers` 组的列表、创建、签发、吊销、用量、核对与清零）
+// 与知识库管理四行（`PUT /admin/knowledge/collections/{id}/description`、
+// `POST /admin/knowledge/historical-source`、
+// `GET /admin/knowledge/documents/{id}/ingest-attempts`、`POST /admin/knowledge/uploads`）。
+// 行数以 `adminRouteSpecs` 实测为准；**改表必须同步本段与 `admin_routes_test.go` 头注的两处计数**。
+// All sixty-seven rows point at landed handlers; the placeholder was removed with the
+// last handler task. US-14 adds the two read-only rows plus the profile trio, 14D adds
+// the readiness and instance-encryption rows, and US-16 adds the seven caller rows and
+// the four knowledge-admin rows. Counts follow adminRouteSpecs as measured; a table
+// change MUST update the counts here and in the admin_routes_test.go header.
 
 import (
 	"context"
@@ -48,10 +55,13 @@ type adminRouteSpec struct {
 	handler     AdminHandler
 }
 
-// adminRouteSpecs 返回全部新增端点的静态描述（48 条：Agent 10 / 资源 21 / 通知 4 /
-// 工作区 2 / 执行环境 8 / MCP 目录 1 / 实例加密 2）。顺序按契约 §3.7.1 排列，
-// 便于逐行对号；**不**依赖 map 遍历。
-// adminRouteSpecs enumerates all 48 new endpoints in contract order.
+// adminRouteSpecs 返回全部新增端点的静态描述（67 条：Agent 10 / 资源 22 / 通知 4 /
+// 工作区 2 / 执行环境 8 / MCP 目录 1 / 实例加密 2 / 调用方 7 / 记忆管理 7 / 知识库 4）。
+// 顺序按契约 §3.7.1 排列，便于逐行对号；**不**依赖 map 遍历。计数以本表实测为准，
+// 判卷用 `len(specs)` 派生，测试里**不**另写死数字。
+// adminRouteSpecs enumerates all 67 new endpoints in contract order (Agent 10, resources
+// 22, notify 4, workspace 2, execution 8, MCP catalog 1, instance keys 2, callers 7,
+// memory 7, knowledge 4); tests derive the count from len(specs) instead of a literal.
 func (s *Server) adminRouteSpecs() []adminRouteSpec {
 	return []adminRouteSpec{
 		// —— Agent 写面（handlers_admin_agents.go / handlers_admin_archived.go）——
@@ -112,6 +122,7 @@ func (s *Server) adminRouteSpecs() []adminRouteSpec {
 		// —— 技能（handlers_admin_resources.go；POST 创建 / 导入按契约只回 SkillView）——
 		{method: http.MethodPost, pattern: "/api/v1/skills", handler: s.handleAdminCreateSkill},
 		{method: http.MethodPost, pattern: "/api/v1/skills/import", handler: s.handleAdminImportSkill},
+		{method: http.MethodGet, pattern: "/api/v1/admin/skills/{name}/edit", handler: s.handleAdminReadSkillForEdit},
 		{
 			method: http.MethodPut, pattern: "/api/v1/skills/{name}", conditional: true,
 			currentETag: s.resourceCurrentETag(core.ResourceSkill), handler: s.handleAdminUpdateSkill,
@@ -195,6 +206,49 @@ func (s *Server) adminRouteSpecs() []adminRouteSpec {
 		// any write; neither route takes If-Match (nothing to compare against).
 		{method: http.MethodGet, pattern: "/api/v1/instance/secrets", handler: s.handleInstanceSecrets},
 		{method: http.MethodPost, pattern: "/api/v1/instance/secrets/init", handler: s.handleAdminInitInstanceSecrets},
+
+		// —— 调用方身份、Key 与配额（handlers_callers.go；US-16 / T026）——
+		// 七个端点全部是管理面：只接受 admin token / local_trust，caller key 一律拒绝
+		// （`callers:admin` 不随 caller key 签发）。两条写端点各自预写 `pending` 管理
+		// 审计；吊销请求体可省略。轮换（`caller.key.rotate`）**没有** HTTP 端点——
+		// 契约未登记该路径，轮换只由服务层 `KeyIssuer.Rotate` 提供。
+		// The seven caller-admin rows; rotation intentionally has no HTTP endpoint
+		// because the contract does not register one.
+		{method: http.MethodGet, pattern: "/api/v1/callers", handler: s.handleAdminListCallers},
+		{method: http.MethodPost, pattern: "/api/v1/callers", handler: s.handleAdminCreateCaller},
+		{method: http.MethodPost, pattern: "/api/v1/callers/{id}/keys", handler: s.handleAdminIssueCallerKey},
+		{
+			method: http.MethodPost, pattern: "/api/v1/callers/{id}/keys/{key_id}/revoke",
+			handler: s.handleAdminRevokeCallerKey,
+		},
+		{method: http.MethodGet, pattern: "/api/v1/callers/{id}/usage", handler: s.handleAdminCallerUsage},
+		{
+			method: http.MethodPost, pattern: "/api/v1/callers/{id}/reservations/{reservation_id}/reconcile",
+			handler: s.handleAdminReconcileCallerReservation,
+		},
+		{
+			method: http.MethodPost, pattern: "/api/v1/callers/{id}/usage/clear-overage",
+			handler: s.handleAdminClearCallerOverage,
+		},
+
+		// —— 记忆管理面（handlers_admin_memory.go；US-16 裁决 A / C-21）——
+		// 两条结构化读 + 四个写动作共七行。写动作**没有** If-Match：记忆条目的状态
+		// 迁移本身就是它的条件（确认只对候选生效、纠正按旧条状态分流、软删幂等），
+		// 再加一层 ETag 只会让页面多读一次才能点一次。确认 / 纠正 / 删除按条目标识
+		// 定位，路径里因此**不带** Agent 段——分层由条目行决定，不由路径决定。
+		// The memory management rows. Writes take no If-Match: the state transition
+		// itself is the condition, and the entry row decides the layer, not the path.
+		{method: http.MethodGet, pattern: "/api/v1/memory/entries", handler: s.handleAdminListGlobalMemoryEntries},
+		{method: http.MethodPut, pattern: "/api/v1/admin/knowledge/collections/{id}/description", handler: s.handleAdminUpdateKnowledgeDescription},
+		{method: http.MethodPost, pattern: "/api/v1/admin/knowledge/historical-source", handler: s.handleAdminHistoricalKnowledgeSource},
+		{method: http.MethodGet, pattern: "/api/v1/admin/knowledge/documents/{id}/ingest-attempts", handler: s.handleAdminKnowledgeIngestAttempts},
+		{method: http.MethodPost, pattern: "/api/v1/admin/knowledge/uploads", handler: s.handleAdminKnowledgeUpload},
+		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/memory/entries", handler: s.handleAdminListAgentMemoryEntries},
+		{method: http.MethodPost, pattern: "/api/v1/memory/proposals", handler: s.handleAdminProposeGlobalMemory},
+		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/memory/proposals", handler: s.handleAdminProposeAgentMemory},
+		{method: http.MethodPost, pattern: "/api/v1/memory/entries/{id}/confirm", handler: s.handleAdminConfirmMemory},
+		{method: http.MethodPost, pattern: "/api/v1/memory/entries/{id}/correct", handler: s.handleAdminCorrectMemory},
+		{method: http.MethodDelete, pattern: "/api/v1/memory/entries/{id}", handler: s.handleAdminDeleteMemory},
 	}
 }
 

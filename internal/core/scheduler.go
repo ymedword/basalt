@@ -46,6 +46,20 @@ const (
 // errSchedulerStarted reports a scheduler that was already started or stopped.
 var errSchedulerStarted = errors.New("scheduler: already started")
 
+// schedulerOwnerUnauthorized 是任务执行授权不可用时的**固定**失败原因（C-32）：
+// 执行行的 error_message 与 Run 的 Reason 都写它——细节原因码（owner_reason）留给
+// 审计字段，不改写这条对外的稳定字面量。
+// schedulerOwnerUnauthorized is the fixed failure reason for an unusable execution
+// authorization; the detailed reason code belongs to the audit fields.
+const schedulerOwnerUnauthorized = "owner_unauthorized"
+
+// schedulerAdminAuthUnavailable 是 admin-builtin 任务在管理认证姿态为 `unavailable`
+// 时的**固定**失败原因（§2.14 判定表）。它与 owner_unauthorized 分开：前者是"这台
+// 实例根本没有管理认证能力"，后者是"原授权已经失效"——两者的处置不同。
+// schedulerAdminAuthUnavailable is the fixed failure reason for an admin-builtin task
+// when the startup admin posture is unavailable.
+const schedulerAdminAuthUnavailable = "admin_auth_unavailable"
+
 // ScheduleGate 判定某个 Agent 当前是否允许被**定时**触发（14D / E5「启用才运行」）。
 // 返回 false 表示本轮不排期：不写执行行、不预写投递、不记撞锁、不发起运行。
 // 它只拦 cron 触发；管理面手动补跑不受影响——补跑是显式请求，准入失败按既有语义记
@@ -54,6 +68,16 @@ var errSchedulerStarted = errors.New("scheduler: already started")
 // answer skips the tick entirely; manual RunNow deliberately bypasses it.
 type ScheduleGate func(ctx context.Context, agent string) bool
 
+// OwnerKeyVerifier 复核后台执行的原授权 Key 是否仍然成立（C-32 / 设计卡 §2.14）。
+// 实现必须按 `(caller_id, key_id)` 读**那一把** Key 的现值：状态、过期时间、当前
+// scope 与调用方状态；返回该 Key 当前的 scope 供 `OwnedPrincipal` 构造。失效时返回
+// 带 `OwnerReason` 的 `*PrincipalError`——**不得**退回空 scope 当"没有权限"，
+// 也**不得**换成同一调用方的其他 Key。
+// OwnerKeyVerifier re-reads the exact authorizing key bound to a background run.
+type OwnerKeyVerifier interface {
+	VerifyOwnerKey(ctx context.Context, callerID, keyID, agent string) ([]string, error)
+}
+
 // SchedulerOptions 是调度器的全部装配输入（§3.1.2 逐字）。
 // SchedulerOptions is the full assembly input of the scheduler.
 type SchedulerOptions struct {
@@ -61,6 +85,16 @@ type SchedulerOptions struct {
 	Invoker RunInvoker
 	Engine  CronEngine
 	Entries []AgentEntry
+	// OwnerKeys 是 caller-key 任务执行前的 Key 复核端口（C-32）。为 nil 时该来源一律
+	// fail-closed——无法证明授权仍在就不得出网。
+	// A nil OwnerKeys fails closed for caller-key tasks.
+	OwnerKeys OwnerKeyVerifier
+	// AdminPosture 迟绑定地读取启动期算出的管理认证姿态（§2.14）。web 面在监听成功后
+	// 才发布姿态，而调度器先于此构造，所以这里收的是取值函数而不是值；为 nil 或返回
+	// 未知值时按"尚未计算"处理，**只有** `unavailable` 拒绝 admin-builtin。
+	// AdminPosture is read late because the web face publishes it after the scheduler is
+	// built; only the unavailable posture rejects admin-builtin tasks.
+	AdminPosture func() AdminPosture
 	// ScheduleGate 为 nil 时不设门（全部按任务定义的 enabled 列判定）；非 nil 时每轮
 	// cron 触发先问一次，false 即跳过。门在**每次触发**求值、不缓存，启停下一次触发
 	// 即生效。
@@ -87,6 +121,8 @@ type Scheduler struct {
 	engine       CronEngine
 	scheduleGate ScheduleGate
 	cronSpec     func(Schedule) (string, error)
+	ownerKeys    OwnerKeyVerifier
+	adminPosture func() AdminPosture
 	delivery     ScheduleDelivery
 	budget       Budget
 	runTimeout   time.Duration
@@ -143,6 +179,8 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		engine:       opts.Engine,
 		scheduleGate: opts.ScheduleGate,
 		cronSpec:     opts.CronSpec,
+		ownerKeys:    opts.OwnerKeys,
+		adminPosture: opts.AdminPosture,
 		delivery:     opts.Delivery,
 		budget:       opts.Budget,
 		runTimeout:   opts.RunTimeout,
@@ -450,6 +488,25 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 			append(s.runAttrs(task, runID, trigger), "error", markErr)...)
 	}
 
+	// 执行授权先于一切外发动作（C-32）：归属取自任务行、执行者为 scheduler、授权来源按
+	// `authorizing_kind` 显式二分。任一不可满足即本轮不执行——执行行收尾 failed、
+	// Reason 固定 `owner_unauthorized`，不预写投递、不发起运行。
+	// Execution authorization is resolved before any outbound step; an unusable owner
+	// leaves a failed execution row and never reaches delivery or the model.
+	principal, authErr := s.taskPrincipal(ctx, task)
+	if authErr != nil {
+		reason := schedulerOwnerUnauthorized
+		if ownerReasonOf(authErr) == OwnerReasonAdminAuthUnavailable {
+			// 管理认证不可用不是"归属失效"：单独的原因码让运维分辨该修哪一侧。
+			// An unavailable admin posture is not a revoked owner; keep the codes apart.
+			reason = schedulerAdminAuthUnavailable
+		}
+		s.logger.Error("任务执行授权不可用，本轮不发起运行",
+			append(s.runAttrs(task, runID, trigger), "error", authErr, "owner_reason", ownerReasonOf(authErr))...)
+		s.finishRun(ctx, execID, task, runID, trigger, ExecutionFailed, reason, now)
+		return RunRequest{}, RunResult{RunID: runID, Status: StatusFailed, Reason: reason}, authErr
+	}
+
 	// R7：配置了系统代投的任务，运行前必须先落投递预写行并复核渠道资格；任一步失败
 	// 本轮不发起运行——没有记录就不投递，也不允许"先跑完再补记录"。
 	if task.DeliverTo != "" {
@@ -465,6 +522,8 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 	}
 
 	req = RunRequest{
+		// 身份按任务归属重建（C-32）：归属方不会被"是谁在执行"改写。
+		Principal: principal,
 		RunID:     runID,
 		Agent:     task.Agent,
 		SessionID: DeriveSessionID("scheduler", "scheduler", task.Agent),
@@ -482,6 +541,85 @@ func (s *Scheduler) scheduleRun(ctx context.Context, task TaskRecord, trigger Tr
 	s.finishRun(ctx, execID, task, runID, trigger, status, errMsg, now)
 	s.settleDelivery(ctx, task, deliveryIntent, deliveryPrepared, trigger, status, res)
 	return req, res, err
+}
+
+// taskPrincipal 按任务行重建后台执行身份（C-32）：归属恒为任务归属方，执行者固定
+// `scheduler`，授权来源按 `authorizing_kind` 显式二分——**不得**按"有没有 key_id"
+// 推断，**不得**把后台执行提升成管理员的"外部调用"身份。
+//
+//   - `admin-builtin`：走 `OwnedPrincipal(local-admin, admin-builtin, "", nil, scheduler)`；
+//     直接调 `LocalAdminPrincipal()` 会把 Actor 固定成 caller，审计便分不清调度与外部请求。
+//     启动期算出的管理认证姿态里 `token` 与 `local_trust` 都是**合法启用态**，只有
+//     `unavailable` 拒绝——把 `local_trust` 当成"管理认证关闭"会让本机模式下的旧任务
+//     集体停摆。
+//   - `caller-key`：执行前**必须**按 `(caller_id, key_id)` 重读**那一把** Key 并核对
+//     当前状态与 scope；端口未接线时无法证明授权仍在，一律 fail-closed——**不得**
+//     借用管理员、**不得**用同一调用方的其他 Key 顶替、也**不得**跳过校验继续出网。
+//
+// taskPrincipal rebuilds the background principal from the task row: admin-builtin is
+// refused only under an unavailable posture, and caller-key re-reads that exact key
+// through the verifier port.
+func (s *Scheduler) taskPrincipal(ctx context.Context, task TaskRecord) (Principal, error) {
+	switch task.AuthorizingKind {
+	case AuthorizingKindAdminBuiltin:
+		if s.adminPostureUnavailable() {
+			return Principal{}, &PrincipalError{
+				Reason: OwnerReasonAdminAuthUnavailable,
+				Detail: "startup admin posture is unavailable",
+			}
+		}
+		return OwnedPrincipal(task.CallerID, AuthorizingKindAdminBuiltin, "", nil, ActorScheduler)
+	case AuthorizingKindCallerKey:
+		if task.AuthorizingKeyID == "" {
+			return Principal{}, &PrincipalError{
+				Reason: OwnerReasonKeyMissing,
+				Detail: "caller-key task carries no authorizing key",
+			}
+		}
+		if s.ownerKeys == nil {
+			return Principal{}, &PrincipalError{
+				Reason: OwnerReasonKeyMissing,
+				Detail: "caller-key task requires the key verification port, which is not wired",
+			}
+		}
+		scopes, verifyErr := s.ownerKeys.VerifyOwnerKey(ctx, task.CallerID, task.AuthorizingKeyID, task.Agent)
+		if verifyErr != nil {
+			return Principal{}, verifyErr
+		}
+		return OwnedPrincipal(task.CallerID, AuthorizingKindCallerKey, task.AuthorizingKeyID, scopes, ActorScheduler)
+	case "":
+		return Principal{}, &PrincipalError{
+			Reason: OwnerReasonKindMismatch,
+			Detail: "task has no authorizing source",
+		}
+	default:
+		return Principal{}, &PrincipalError{
+			Reason: OwnerReasonKindMismatch,
+			Detail: "task carries an unknown authorizing kind",
+		}
+	}
+}
+
+// adminPostureUnavailable 只在启动期确实算出 `unavailable` 时为真。姿态源缺席或尚未
+// 发布（web 面还没算出来）都按"尚未计算"处理，**不得**当成不可用：调度器先于 web 面
+// 构造，把未知当不可用会让 gateway 与所有 admin-builtin 任务永久停摆。
+// adminPostureUnavailable is true only for a posture that was actually published as
+// unavailable; a missing or not-yet-published source is not treated as unavailable.
+func (s *Scheduler) adminPostureUnavailable() bool {
+	if s.adminPosture == nil {
+		return false
+	}
+	return s.adminPosture() == AdminPostureUnavailable
+}
+
+// ownerReasonOf 取出错误携带的原因码；没有结构化的 `*PrincipalError` 时返回空串。
+// ownerReasonOf extracts the structured owner reason, or "" when there is none.
+func ownerReasonOf(err error) OwnerReason {
+	var principalErr *PrincipalError
+	if errors.As(err, &principalErr) {
+		return principalErr.Reason
+	}
+	return ""
 }
 
 // prepareDelivery 校验代投目标并写 pending 行：投递服务未装配、UID 非法、渠道资格
@@ -832,11 +970,16 @@ func (s *Scheduler) commitAgentLocked(ctx context.Context, agent string, schedul
 	for _, schedule := range schedules {
 		derived[schedule.ID] = true
 		upserts = append(upserts, TaskRecord{
-			TaskID:  schedule.ID,
-			Agent:   agent,
-			Cron:    schedule.Cron,
-			Zone:    schedule.Zone,
-			Message: schedule.Message,
+			TaskID: schedule.ID,
+			Agent:  agent,
+			// AGENT.md 声明的任务由部署者（内置管理员）创建：归属与授权来源在定义
+			// 对齐时就固定为 `local-admin` + `admin-builtin`（C-32），执行期不得改写。
+			// Definition-derived tasks are admin-owned; ownership is fixed at apply time.
+			CallerID:        LocalAdminCallerID,
+			AuthorizingKind: AuthorizingKindAdminBuiltin,
+			Cron:            schedule.Cron,
+			Zone:            schedule.Zone,
+			Message:         schedule.Message,
 			// 代投目标随定义落库：它是任务在 AGENT.md 里声明的一部分（R7），
 			// 不随定义指纹参与变更提示，但**必须**写入库列——漏写会让每次对账
 			// 把已登记的目标清空，任务照常运行却再也不投递。

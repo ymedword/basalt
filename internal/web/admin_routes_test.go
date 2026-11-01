@@ -3,7 +3,8 @@ package web
 // 本文件是写面路由表与条件写中间件的判卷（US-12 颗粒度文档 §3.2.1
 // admin_routes_test.go，7 例，check `012-web-etag-routes`）：US-12 的 37 条端点与
 // 后续按已批准契约追加的行逐条在表、全部受保护、条件写恰为契约指定集合
-// （14D 追加网络策略四条与实例加密两行，现为 48 条端点 / 14 条条件写）；`version_id` 只接受十进制正整数；
+// （14D 追加网络策略四条与实例加密两行，US-16 追加调用方七条、记忆管理七条与知识库
+// 四条，现为 67 条端点 / 14 条条件写）；`version_id` 只接受十进制正整数；
 // 缺凭据一律 401、错误方法落 404 兜底；条件写缺 / 弱 / 通配 / 非法 If-Match 一律
 // 412 且处理函数零调用；认证先于 If-Match；每条受保护项恰过一次闸门。
 // These tests pin the US-12 admin route table, the conditional-write middleware, and
@@ -41,6 +42,8 @@ func concreteAdminPath(pattern string) string {
 		"{archive_id}", "ops-agent-20261016T093000Z",
 		"{version_id}", "7",
 		"{kind}", "skill",
+		"{reservation_id}", "qres_tasks_00000000000000000000000000",
+		"{key_id}", "key_00000000000000000000000000",
 		"{id}", "demo",
 		"{name}", "ops-agent",
 	).Replace(pattern)
@@ -93,6 +96,7 @@ func wantAdminRouteKeys() []string {
 		"GET /api/v1/mcp-servers/{name}/diagnostics",
 		"POST /api/v1/skills",
 		"POST /api/v1/skills/import",
+		"GET /api/v1/admin/skills/{name}/edit",
 		"PUT /api/v1/skills/{name}",
 		"DELETE /api/v1/skills/{name}",
 		"POST /api/v1/skills/{name}/validate",
@@ -118,6 +122,28 @@ func wantAdminRouteKeys() []string {
 		"POST /api/v1/execution-policy/confirmations",
 		"GET /api/v1/instance/secrets",
 		"POST /api/v1/instance/secrets/init",
+		// US-16 调用方组七条（契约 `/callers`）：轮换**不在**其中——契约没有该路径。
+		"GET /api/v1/callers",
+		"POST /api/v1/callers",
+		"POST /api/v1/callers/{id}/keys",
+		"POST /api/v1/callers/{id}/keys/{key_id}/revoke",
+		"GET /api/v1/callers/{id}/usage",
+		"POST /api/v1/callers/{id}/reservations/{reservation_id}/reconcile",
+		"POST /api/v1/callers/{id}/usage/clear-overage",
+		// 记忆管理面七条（US-16 裁决 A / C-21）：两条结构化读 + 提议两条 + 三个按
+		// 条目标识定位的写动作。渲染读面（`GET /memory` 与 `GET /agents/{name}/memory`）
+		// 早在主路由表，**不**重复登记。
+		"GET /api/v1/memory/entries",
+		"PUT /api/v1/admin/knowledge/collections/{id}/description",
+		"POST /api/v1/admin/knowledge/historical-source",
+		"GET /api/v1/admin/knowledge/documents/{id}/ingest-attempts",
+		"POST /api/v1/admin/knowledge/uploads",
+		"GET /api/v1/agents/{name}/memory/entries",
+		"POST /api/v1/memory/proposals",
+		"POST /api/v1/agents/{name}/memory/proposals",
+		"POST /api/v1/memory/entries/{id}/confirm",
+		"POST /api/v1/memory/entries/{id}/correct",
+		"DELETE /api/v1/memory/entries/{id}",
 	}
 }
 
@@ -143,14 +169,14 @@ func wantConditionalRouteKeys() []string {
 	}
 }
 
-// TestAdminRoutes_TableCoversContractSurface：写面路由表恰好覆盖契约的 48 条端点，
+// TestAdminRoutes_TableCoversContractSurface：写面路由表覆盖 66 条端点，
 // 无重复、无公开行、方法显式、条件写恰为 14 条；`adminRoutes()` 逐行标记受保护并
 // 带上处理函数（占位也必须是显式函数，不允许空挂）。
 // 逆改点：漏登记 / 多登记 / 把任一行改成公开 / 条件写集合漂移 → 对应断言红。
 func TestAdminRoutes_TableCoversContractSurface(t *testing.T) {
 	s := newTestServer(t, nil)
 	specs := s.adminRouteSpecs()
-	require.Len(t, specs, 48)
+	require.Len(t, specs, 67)
 
 	got := make(map[string]adminRouteSpec, len(specs))
 	for _, spec := range specs {
@@ -415,10 +441,10 @@ func TestAdminRoutes_SaveFaceBindingCodes(t *testing.T) {
 	}
 }
 
-// TestAdminRoutes_NonConditionalRowsSkipIfMatch：34 条非条件写 / 只读行不套
+// TestAdminRoutes_NonConditionalRowsSkipIfMatch：48 条非条件写 / 只读行不套
 // If-Match 中间件——无请求头时进入处理函数（占位回 500），绝不回 412。
-// 逐行断言本身是判据；总数只随已批准接口（14D 三条执行档位端点、四条网络策略端点
-// 与实例加密两行）机械增长。
+// 逐行断言本身是判据；总数只随已批准接口（14D 三条执行档位端点、四条网络策略端点、
+// 实例加密两行、US-16 调用方七条与记忆管理七条）机械增长。
 // 逆改点：把条件写中间件误套到整个写面 → 对应行变 412，本用例红。
 func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
 	s := newTestServer(t, func(o *Options) { o.AdminAuth = testAdminAuth(testToken) })
@@ -436,7 +462,7 @@ func TestAdminRoutes_NonConditionalRowsSkipIfMatch(t *testing.T) {
 		require.NotEqual(t, http.StatusPreconditionFailed, rec.Code, "%s 不要求 If-Match", adminRouteKey(spec))
 		require.NotEqual(t, codePreconditionFailed, decodeAuthEnvelope(t, rec).Code, "%s", adminRouteKey(spec))
 	}
-	require.Equal(t, 34, checked)
+	require.Equal(t, 53, checked)
 }
 
 // TestAdminRoutes_AuthPrecedesIfMatch：认证在条件写中间件之外——缺凭据时无论

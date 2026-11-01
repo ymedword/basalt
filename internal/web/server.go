@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ymedword/basalt/internal/callers"
 	"github.com/ymedword/basalt/internal/core"
 )
 
@@ -35,7 +36,7 @@ type Options struct {
 	RunBudget          core.Budget   // REST / invoke 运行预算（约束 35）
 	ShutdownGrace      time.Duration // 0 → defaultShutdownGrace
 	Version            string        // /info.version
-	MemoryBackend      string        // markdown | sqlite（归一化后）
+	MemoryBackend      string        // postgres（运行时唯一载体，D-18）
 	MCPConnected       int           // 已连接 MCP server 数（/info.mcp_servers）
 	Providers          []ProviderInfo
 	Logger             *slog.Logger     // nil → slog.Default()
@@ -50,12 +51,27 @@ type Options struct {
 	Memory    MemorySections
 	Schedules ScheduleService // 可选：nil 时四个 /schedules 端点按 500 返回（装配缺失是错误）
 
+	// MemoryAdmin 是**记忆管理面**的端口（US-16 裁决 A / C-21）：结构化读模型与四个
+	// 写动作（显式提议 / 确认 / 纠正 / 软删）。它与 `Memory` 是两套读面——`Memory`
+	// 返回注入面看到的两段渲染文本，本端口返回带主键与状态的条目。nil = 装配缺失：
+	// 七条记忆管理路由按固定 500 失败关闭，**不得**用空列表冒充"没有记忆"。
+	// MemoryAdmin backs the structured read model and the four explicit write actions;
+	// it is a second read face beside the rendered Memory port, not a replacement.
+	MemoryAdmin core.MemoryAdmin
+
 	// 管理面端口（US-11；全部由 app 层适配，web 只依赖 core 与标准库）。
 	// AdminAuth 是认证闸门：公开面闭集以外的路由一律经它取得 actor。
 	// 其余端口各自对应一类观测 / 管理路由；缺失端口的必需性随对应路由落地收紧。
 	// Management-surface ports, adapted by the app layer; each port gates one route
 	// family, and the requirement to supply it tightens as those routes land.
-	AdminAuth  AdminAuth
+	AdminAuth AdminAuth
+	// Ingress 是入口速率的消费方端口（T126 / 图 6 [1]）：认证之后、作用域判定与
+	// 处理函数之前对每个业务请求判一次（C-F03：先限流、后作用域）。admin token 请求不进任何调用方桶，管理面
+	// 路由与调度器也**不**经过这里。**装配认证闸门时必须同时提供**——缺省等于静默
+	// 不限流，`NewServer` 拒绝该组合；nil 只出现在 AdminAuth 也为 nil 的测试装配里。
+	// Ingress is the rate port for business requests; a real guard requires it so
+	// traffic can never run unlimited by omission.
+	Ingress    IngressGate
 	Registry   AgentRegistry
 	Lifecycle  core.LifecyclePort
 	AgentAdmin core.AgentAdmin
@@ -180,6 +196,63 @@ type Options struct {
 	// and only fills zero fields from the same core defaults.
 	InstanceLimits InstanceLimits
 
+	// Callers 是调用方 / Key / 配额管理面的端口（US-16 / T026）：七个 `/callers`
+	// 端点全部经它，装配层直接注入 `*callers.CallerAdmin`（结构化满足，不写适配器）。
+	// nil = 装配缺失，七个端点按固定 500 失败关闭——**不得**用空列表冒充"没有调用方"，
+	// 那会把装配故障显示成"一个调用方都没有"。
+	// Callers backs the seven caller-admin endpoints; a nil port fails closed rather
+	// than serving an empty list that looks like a real (empty) state.
+	Callers CallerAdminService
+
+	// 知识库四个端口（US-16 / T042；端口形状见 `ports_knowledge.go`）。
+	// Ingest / Search / Source 直接由 `*knowledge.Ingestor` / `*knowledge.Retriever` /
+	// `*knowledge.SourceViewer` 结构化满足；Catalog 由 app 层适配器实现（冻结设计
+	// 没有这三个只读列表的领域类型）。四个端口**互不替代**：缺一即那一族的端点
+	// 固定 500 失败关闭，**不得**用空列表或空命中冒充合法空状态。
+	// The four knowledge ports; each missing port fails its route family closed with
+	// a fixed 500 rather than faking an empty state.
+	KnowledgeIngest        KnowledgeIngest
+	KnowledgeSearch        KnowledgeSearch
+	KnowledgeSource        KnowledgeSource
+	KnowledgeCatalog       KnowledgeCatalog
+	KnowledgeDescription   KnowledgeDescriptionAdmin
+	KnowledgeIngestHistory KnowledgeIngestHistory
+	KnowledgeUpload        KnowledgeUpload
+
+	// 历史回查三个端口（US-16 / T056；端口形状见 `ports_history.go`）。
+	// Search / ExactRead 由 `*history.Searcher` / `*history.ExactReader` 结构化满足，
+	// Validity 由 `*knowledge.Validity`（`*knowledge.SourceViewer`）满足。三者**互不
+	// 替代**：缺一即对应端点固定 500 失败关闭——**不得**用空命中 / 空引用冒充合法空
+	// 状态（那会把装配故障显示成"查过了没有"）。`EvidenceValidity` 只在消息确实携带
+	// 引用时才会被调用：没有引用的消息不因该端口缺失而读取失败。
+	// The three history ports; each missing one fails its endpoint closed with a fixed
+	// 500. EvidenceValidity is only consulted when the message actually carries refs.
+	HistorySearch    HistorySearch
+	HistoryExactRead HistoryExactRead
+	EvidenceValidity EvidenceValidity
+
+	// 压缩只读视图端口（US-16 / T089；端口形状见 `ports_compaction.go`）：由
+	// `*postgres.CompactionStore` 的结构化方法满足。nil = 装配缺失，`GET /compactions`
+	// 固定 500 失败关闭——**不得**用空链冒充"从未压缩"（那会把装配故障显示成正常
+	// 空状态）。本端点只读，**不提供**手动触发。
+	// The read-only compaction port; nil fails the endpoint closed with a fixed 500.
+	CompactionChain CompactionChain
+
+	// 诊断读取端口（US-16 / T097；端口形状见 `ports_diagnostics.go`）：由
+	// `*diagnostics.Reader` 结构化满足。nil = 装配缺失，`GET /diagnostics` 固定 500
+	// 失败关闭——**不得**用空集冒充"没有记录"（空集在契约里带 `missing=true`，
+	// 是有含义的读数，装配故障不能借用它）。本端点只读，不写管理操作行。
+	// The read-only diagnostics port; a nil one fails the endpoint closed.
+	Diagnostics DiagnosticsReader
+
+	// DiagnosticWriter 是诊断事件的**写**端口（V-8）：入口速率拒绝按 `request_id`
+	// 记一条 `quota_decision`。**可空**——未接诊断的装配照常工作，只是拒绝不留事件。
+	// 与上面读端口的"缺失即 500"不同：读端点回答的是用户请求本身的记录，写端点是
+	// 旁路观测，缺它不改变任何判定结果。
+	// The optional diagnostics write port used by the ingress-rate middleware; a nil one
+	// only means denials leave no event, never that a request is handled differently.
+	DiagnosticWriter DiagnosticWriter
+
 	// 测试接缝（仅包内测试可设）：「慢 body + 长运行」用例在秒级内触达写预算边界；
 	// 「收尾不收敛」用例在毫秒级触达等待上限。生产装配不设置，一律走缺省值。
 	readTimeoutOverride  time.Duration
@@ -250,11 +323,20 @@ type NotifyReferenceReader interface {
 // context; it must never be invoked before authentication succeeds.
 type AdminHandler func(http.ResponseWriter, *http.Request, core.Actor)
 
-// AdminAuth 是管理面认证闸门的装配端口（实现在 auth.go）：公开面闭集以外的
-// 全部路由经 Wrap 包装，认证成功后以显式 actor 调用处理函数。
-// AdminAuth wraps every non-public route and hands the actor to the handler.
+// PrincipalHandler 是业务面处理函数的签名：身份以显式参数传入，**不得**写入
+// context（宪法 VII / C-06）；未通过认证时不得调用本函数。
+// PrincipalHandler receives the authenticated principal as an explicit parameter and
+// is never invoked before authentication succeeds.
+type PrincipalHandler func(http.ResponseWriter, *http.Request, core.Principal)
+
+// AdminAuth 是认证闸门的装配端口（实现在 auth.go 与 middleware_business_auth.go）：
+// 公开面闭集以外的路由按面分别经 Wrap（管理面，显式 actor）或 WrapPrincipal
+// （业务面，显式 principal）包装，认证成功后以参数调用处理函数。
+// AdminAuth wraps every non-public route by surface and hands the authenticated
+// identity to the handler as a parameter.
 type AdminAuth interface {
 	Wrap(next AdminHandler) http.Handler
+	WrapPrincipal(next PrincipalHandler) http.Handler
 }
 
 // AgentRegistry 是注册表快照的只读端口（实现在 internal/app）：Entries 返回按
@@ -399,6 +481,13 @@ func NewServer(opts Options) (*Server, error) {
 		opts.Tools == nil || opts.Memory == nil {
 		return nil, errors.New("web: 装配缺少必需端口（Runs / Sessions / Agents / Tools / Memory）")
 	}
+	// 认证闸门一旦装配，入口速率端口不得缺省：缺省等于静默不限流（T126）。测试装配
+	// （AdminAuth 为 nil）不受此限——此时业务处理函数拿到的是内置管理员，按 §3.1.5
+	// 不进任何调用方桶。
+	// A real guard without the rate port would silently run unlimited.
+	if opts.AdminAuth != nil && opts.Ingress == nil {
+		return nil, errors.New("web: 装配缺少入口速率端口（Ingress）——有认证闸门时必须同时提供速率判定")
+	}
 	if opts.Console == nil {
 		return nil, errors.New("web: 装配缺少管理台资源（Console）")
 	}
@@ -413,7 +502,52 @@ func NewServer(opts Options) (*Server, error) {
 		// 拒绝发生在读 body 之前：跨源请求零副作用（约束 21）。
 		s.writeError(w, http.StatusForbidden, codeBadRequest, denyMessage)
 	}))
+	// 认证面自检（默认拒绝）：业务行未声明作用域、或业务行挂了管理面 / 无身份
+	// 处理函数，都是装配错误——启动期暴露，而不是变成"这个端点没有作用域约束"。
+	// 入口速率自检（T126 / D-30）同样在启动期判卷：业务行漏映射、管理行误映射
+	// 都让装配失败，而不是在运行期按"不限流"放行。
+	// The surface and ingress self-checks both fail the assembly instead of running an
+	// unprotected or unthrottled row.
+	if err := checkRouteSurfaces(s.routeTable()); err != nil {
+		return nil, err
+	}
+	if err := checkRouteIngress(s.routeTable()); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// checkRouteSurfaces 是认证面的启动自检：业务行必须声明可识别的作用域并且恰好挂
+// 一个 `principalHandler`；管理行**不得**声明作用域，也不得挂业务处理函数。
+// 两条都是默认拒绝的落地——少写作用域等于放行，多挂处理函数等于绕开一面。
+// checkRouteSurfaces fails the startup when a business row names no scope or a
+// management row carries business metadata.
+func checkRouteSurfaces(rows []route) error {
+	for _, rt := range rows {
+		name := rt.method + " " + rt.pattern
+		if rt.surface == surfaceRouteBusiness {
+			if rt.visibility != routeProtected {
+				return fmt.Errorf("web: 业务面路由 %s 必须是受保护路由", name)
+			}
+			if rt.principalHandler == nil {
+				return fmt.Errorf("web: 业务面路由 %s 缺少 principalHandler", name)
+			}
+			if rt.handler != nil || rt.adminHandler != nil {
+				return fmt.Errorf("web: 业务面路由 %s 不得同时挂 handler / adminHandler", name)
+			}
+			if !rt.scope.declared() {
+				return fmt.Errorf("web: 业务面路由 %s 未声明已知作用域", name)
+			}
+			continue
+		}
+		if rt.principalHandler != nil {
+			return fmt.Errorf("web: 管理面路由 %s 不得挂业务面处理函数", name)
+		}
+		if rt.scope.declared() {
+			return fmt.Errorf("web: 管理面路由 %s 不得声明业务面作用域", name)
+		}
+	}
+	return nil
 }
 
 // Run 监听并服务，直到 ctx 取消后按五阶段协议收尾（约束 20）。**异常退出与信号
@@ -531,18 +665,39 @@ const (
 	routeFallback
 )
 
+// routeSurface 区分认证面：零值是管理面（既有全部行），业务面（`surfaceRouteBusiness`）
+// 要求调用方 Key 或 admin token，并在认证之后按 `scope` 做作用域判定。
+// routeSurface separates the two authentication faces; the zero value is management.
+type routeSurface int
+
+const (
+	// surfaceRouteBusiness 是业务面：接受调用方 Key 与 admin token。零值（管理面：
+	// 只接受 admin token）不设具名常量，避免声明后无人引用。
+	// surfaceRouteBusiness accepts caller keys and the admin token; the management
+	// face needs no named constant because it is the zero value.
+	surfaceRouteBusiness routeSurface = iota + 1
+)
+
 // route 是路由表的一行。兜底项方法为空串（方法无关）；其余项必须显式给出方法。
-// 处理函数二选一：`handler` 是既有不消费认证主体的处理函数；`adminHandler` 是
-// US-11 起需要 actor 的处理函数——认证成功的 actor 由 `s.admin` 直接传入，**不经**
-// context（宪法 VII / 约束 9）。两者恰一非 nil，路由表仍是唯一枚举。
-// A route row; the fallback row carries an empty method. Exactly one of handler and
-// adminHandler is set: adminHandler receives the authenticated actor as a parameter.
+// 处理函数恰一非 nil：`handler` 不消费身份；`adminHandler` 消费显式 actor（US-11）；
+// `principalHandler` 消费显式 principal（业务面，T025）——三者都**不经** context
+// （宪法 VII / 约束 9）。业务行**必须**声明 `scope`，管理行**不得**声明——未声明
+// 作用域的业务行在启动自检失败（默认拒绝）。
+// A route row; exactly one handler field is set, and business rows must declare a
+// scope or the startup self-check fails closed.
 type route struct {
-	method       string
-	pattern      string
-	visibility   routeVisibility
-	handler      http.HandlerFunc
-	adminHandler AdminHandler
+	method     string
+	pattern    string
+	visibility routeVisibility
+	surface    routeSurface
+	scope      requiredScope
+	// ingress 是业务行声明的入口类别（`callers.IngressRun` 等，T126）：业务行
+	// **必须**映射，管理行**不得**映射，由 `checkRouteIngress` 在启动期判卷（D-30）。
+	// Business rows must map to an ingress class; management rows must not.
+	ingress          callers.IngressClass
+	handler          http.HandlerFunc
+	adminHandler     AdminHandler
+	principalHandler PrincipalHandler
 }
 
 // routeTable 是端点集的唯一枚举：注册（routes）与认证遍历测试共用同一份表，
@@ -563,12 +718,30 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodGet, pattern: "/api/v1/profiles", visibility: routeProtected, handler: s.handleProfiles},
 		{method: http.MethodGet, pattern: "/api/v1/tools", visibility: routeProtected, handler: s.handleTools},
 		{method: http.MethodGet, pattern: "/api/v1/memory", visibility: routeProtected, handler: s.handleMemory},
-		{method: http.MethodPost, pattern: "/api/v1/sessions", visibility: routeProtected, handler: s.handleCreateSession},
-		{method: http.MethodGet, pattern: "/api/v1/sessions", visibility: routeProtected, adminHandler: s.handleListSessions},
+		// 业务面三行（T025 / C-28）：调用方 Key 与 admin token 都接受，作用域按行声明。
+		// 三行都是写路径，入口类别映射 `IngressRun`（T126）。会话列表与两条历史回查
+		// 行（`GET /sessions`、`/history/search`、精确读取）在 T056 一并翻为业务面，
+		// 由 `routes_history.go` 统一枚举并映射 `IngressRead`；知识库的读 / 摄取行在
+		// `routes_knowledge.go` 各自映射 `IngressRead` / `IngressIngest`。
+		// The three business rows accept both credential forms and map to IngressRun; the
+		// history read rows flipped in T056 and live in routes_history.go.
+		{
+			method: http.MethodPost, pattern: "/api/v1/sessions", visibility: routeProtected,
+			surface: surfaceRouteBusiness, scope: fixedScope(core.ScopeSessionsWrite),
+			ingress: callers.IngressRun, principalHandler: s.handleCreateSession,
+		},
 		{method: http.MethodGet, pattern: "/api/v1/sessions/{id}", visibility: routeProtected, handler: s.handleGetSession},
 		{method: http.MethodDelete, pattern: "/api/v1/sessions/{id}", visibility: routeProtected, handler: s.handleArchiveSession},
-		{method: http.MethodPost, pattern: "/api/v1/sessions/{id}/messages", visibility: routeProtected, handler: s.handlePostMessage},
-		{method: http.MethodPost, pattern: "/api/v1/agents/{name}/invoke", visibility: routeProtected, handler: s.handleInvoke},
+		{
+			method: http.MethodPost, pattern: "/api/v1/sessions/{id}/messages", visibility: routeProtected,
+			surface: surfaceRouteBusiness, scope: fixedScope(core.ScopeSessionsWrite),
+			ingress: callers.IngressRun, principalHandler: s.handlePostMessage,
+		},
+		{
+			method: http.MethodPost, pattern: "/api/v1/agents/{name}/invoke", visibility: routeProtected,
+			surface: surfaceRouteBusiness, scope: agentInvokeScope(),
+			ingress: callers.IngressRun, principalHandler: s.handleInvoke,
+		},
 		{method: http.MethodGet, pattern: "/api/v1/agents/{name}/memory", visibility: routeProtected, adminHandler: s.handleAgentMemory},
 		{method: http.MethodGet, pattern: "/api/v1/sandbox", visibility: routeProtected, adminHandler: s.handleSandbox},
 		{method: http.MethodGet, pattern: "/api/v1/notify-channels", visibility: routeProtected, adminHandler: s.handleListNotifyChannels},
@@ -583,6 +756,16 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodPost, pattern: "/api/v1/runs/{id}/cancel", visibility: routeProtected, adminHandler: s.handleCancelRun},
 		{method: http.MethodGet, pattern: "/api/v1/operations", visibility: routeProtected, adminHandler: s.handleListOperations},
 		{method: http.MethodGet, pattern: "/api/v1/operations/{id}", visibility: routeProtected, adminHandler: s.handleOperationDetail},
+		// 压缩链只读派生视图（T089）：管理面读行——契约根 security 只有 bearerAuth /
+		// localTrust，没有 callerKey，因此**不得**声明 scope / ingress（那会把它登记成
+		// 业务行并接受调用方 Key）。**不提供**手动触发；读取面不写管理操作审计。
+		// The read-only compaction row stays on the management face: no scope, no ingress.
+		{method: http.MethodGet, pattern: "/api/v1/compactions", visibility: routeProtected, adminHandler: s.handleListCompactions},
+		// 诊断事件只读查询（T097）：同样是管理面读行——契约根 security 只有 bearerAuth /
+		// localTrust，caller key 一律拒绝；声明 scope / ingress 会把它登记成业务行。
+		// 读取面不写管理操作审计，也不提供导出（导出归 US-16A（拟）OBS，R23 裁决 1）。
+		// The read-only diagnostics row; export is deliberately absent.
+		{method: http.MethodGet, pattern: "/api/v1/diagnostics", visibility: routeProtected, adminHandler: s.handleListDiagnostics},
 		{method: http.MethodGet, pattern: "/api/v1/system/overview", visibility: routeProtected, adminHandler: s.handleSystemOverview},
 		{method: http.MethodGet, pattern: "/api/v1/system/sample", visibility: routeProtected, adminHandler: s.handleSystemSample},
 		{method: http.MethodGet, pattern: "/api/v1/skills", visibility: routeProtected, adminHandler: s.handleListSkills},
@@ -606,6 +789,13 @@ func (s *Server) routeTable() []route {
 	// 最后一行，否则未匹配路径会先撞上兜底以外的行。
 	// The admin rows join before the method-agnostic fallback, which must stay last;
 	// the rows themselves are enumerated only in admin_routes.go.
+	// US-16 知识库十行同样在兜底之前并入（routes_knowledge.go）：一条管理面列表 +
+	// 九条业务面读写行。合并点保持"兜底恒为最后一行"这一唯一结构约束。
+	// The ten knowledge rows join here as well, so the fallback stays last.
+	rows = append(rows, s.knowledgeRoutes()...)
+	// 历史回查三行（T056 / routes_history.go）：会话列表 + 检索 + 精确读取，全部业务面。
+	// The three history read rows, all on the business surface.
+	rows = append(rows, s.historyRoutes()...)
 	rows = append(rows, s.adminRoutes()...)
 	// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
 	// 不暴露 ServeMux 的纯文本 404 与自动 405。
@@ -635,6 +825,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 // bypass it. Without AdminAuth (tests) an adminHandler receives the zero actor, and
 // the production assembly always supplies the guard.
 func (s *Server) routeHandler(rt route) http.Handler {
+	if rt.surface == surfaceRouteBusiness {
+		return s.business(rt)
+	}
 	plain := rt.handler
 	if plain == nil && rt.adminHandler != nil {
 		admin := rt.adminHandler
@@ -642,15 +835,71 @@ func (s *Server) routeHandler(rt route) http.Handler {
 			admin(w, r, core.Actor{})
 		}
 	}
+	// 可存储性守卫（US-16 走查发现）：只挂受保护行，且必须晚于认证——未认证请求
+	// 仍先拿 401，不因参数形状改变回答。公开面不读参数，兜底只回显路径，都不挂。
+	if rt.visibility == routeProtected {
+		plain = s.requireValidRequestText(plain)
+	}
 	if rt.visibility != routeProtected || s.opts.AdminAuth == nil {
 		return plain
 	}
 	if rt.adminHandler != nil {
-		return s.admin(rt.adminHandler)
+		// 需要显式 actor 的行：认证闸门包在外层，守卫在闸门内侧执行（同一顺序）。
+		admin := rt.adminHandler
+		return s.admin(func(w http.ResponseWriter, r *http.Request, actor core.Actor) {
+			if !s.requestTextValid(w, r) {
+				return
+			}
+			admin(w, r, actor)
+		})
 	}
 	return s.admin(func(w http.ResponseWriter, r *http.Request, _ core.Actor) {
 		plain(w, r)
 	})
+}
+
+// business 是业务面的显式 principal 入口：认证闸门解析身份 → 入口速率（图 6 [1]）
+// → 路由行声明的作用域判定（[3] 的前置）。顺序在 C-F03 裁决后调整为"先限流、后作用域"：
+// 限流键只由调用方与入口类别决定、与目标资源无关，先扣桶不新增存在性侧信道；反过来
+// "先判作用域"让无权调用方无限次探测而不消耗任何名额。代价是作用域被拒的请求也扣
+// 自己的桶（自伤，不波及其他调用方）。
+// Tests without AdminAuth keep the pre-T025 explicit-admin behavior (the handler gets
+// LocalAdminPrincipal, which is exempt from every caller-class bucket).
+func (s *Server) business(rt route) http.Handler {
+	check := func(w http.ResponseWriter, r *http.Request, principal core.Principal) {
+		// 图 6 [1] 入口速率（T126 / C-F03）：超限的请求不到作用域判定，更不到处理函数。
+		// 并发名额与配额仍在服务层（[3] / [5]），三段不合并。
+		// Ingress rate precedes the scope check; a rate-denied request never reaches
+		// the scope branch or the handler.
+		if !s.admitIngress(w, r, principal, rt.ingress) {
+			return
+		}
+		if !rt.scope.allows(principal, r) {
+			// 已认证但无权：403 固定文案，不解释缺哪个 scope（契约 §8）。
+			// Authenticated but unauthorized: a fixed 403 that names no scope.
+			s.logger().Warn("业务面作用域不足",
+				"request_id", requestIDFrom(r.Context()),
+				"method", r.Method,
+				"path", safeLogValue(r.URL.Path),
+				"caller_id", safeLogValue(principal.CallerID))
+			s.writeError(w, http.StatusForbidden, codeForbidden, messageScopeDenied)
+			return
+		}
+		// 可存储性守卫（US-16 走查发现）：排在上面的 401 / 429 / 403 之后，只改写
+		// "已通过准入、但参数含非法 UTF-8 或 NUL"这一类请求的回答（500 → 400）。
+		// The shape guard sits after the three admission refusals, so it can only turn
+		// a would-be 500 on malformed input into a 400.
+		if !s.requestTextValid(w, r) {
+			return
+		}
+		rt.principalHandler(w, r, principal)
+	}
+	if s.opts.AdminAuth == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			check(w, r, core.LocalAdminPrincipal())
+		})
+	}
+	return s.opts.AdminAuth.WrapPrincipal(check)
 }
 
 // admin 是约束 9 的显式 actor 入口：认证成功后 actor 以参数交给处理函数，**不得**

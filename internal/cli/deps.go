@@ -21,10 +21,18 @@ type Deps struct {
 	// WorkDir is the process working directory; the workspace is <WorkDir>/.basalt.
 	WorkDir string
 
-	// SupportedSchemaVersion 是二进制支持的目标 schema 版本；生产装配传
-	// storage.SupportedSchemaVersion，测试传合成值以覆盖单版本期不可达的分支。
-	// SupportedSchemaVersion is the schema version this binary targets.
+	// SupportedSchemaVersion 是**运行期谱系（PostgreSQL）**的目标 schema 版本；生产
+	// 装配传 postgres.SupportedSchemaVersion，测试传合成值以覆盖单版本期不可达的分支。
+	// SupportedSchemaVersion is the runtime (PostgreSQL) lineage's target version.
 	SupportedSchemaVersion int
+
+	// SourceSchemaVersion 是**SQLite 源谱系**的目标版本，只由 `init` 的引导建库使用。
+	// 两个谱系版本是不同常数（源 v6 / 运行期 v1）：混用会让新建工作区得到一份
+	// "v6 schema、v1 版本行"的库，`db export` 随即以"源库是 v1"拒绝（T078 演练实测）。
+	// 生产装配传 storage.SupportedSchemaVersion。
+	// SourceSchemaVersion is the SQLite source lineage's target version, used only by
+	// init; swapping it with the runtime lineage's version stamps v1 onto a v6 schema.
+	SourceSchemaVersion int
 
 	// Logger 是结构化日志器；测试注入带缓冲 handler 的实例以断言凭证不泄露与
 	// 失败路径留痕。
@@ -62,6 +70,43 @@ type Deps struct {
 	// （它要库、撤销编排与解析器），轻路径拿到 nil 即报缺件，不自造第二套读面。
 	// Secrets is only produced by the heavy-path assembly; a nil here is a wiring gap.
 	Secrets Secrets
+
+	// DatabaseMigrator 是 PostgreSQL 迁移端口（见 ports.go）：`db migrate` 经它建库 /
+	// 前向迁移。装配层常驻注入（它与库、锁、运行期资源都无关，轻路径也能安全带上）；
+	// 拿到 nil 即报缺件——命令面**不得**自己直连数据库补出第二条迁移路径。
+	// The PostgreSQL migration port, injected on every path; a nil is a wiring gap and
+	// never a reason for the command surface to open a database by itself.
+	DatabaseMigrator DatabaseMigrator
+
+	// Migration 是 `db export / import / verify / switch` 的端口（见 ports.go）。它与
+	// DatabaseMigrator 分开：迁移只碰 PG，导出还要读 SQLite 快照与资产树，两者的依赖面
+	// 不同；合成一个接口会让"只想跑 db migrate"的装配被迫带上整个迁移链路。
+	// 装配层**总是**注入（与 DatabaseMigrator 同理：导出不需要库，导入才需要）。
+	// Migration is the port behind export/import/verify/switch, kept apart from the
+	// migrator because the two have different dependency surfaces.
+	Migration DatabaseMigration
+
+	// InstanceAdopt 是 `instance adopt` 的端口（见 ports.go）。它与 Migration 分开：
+	// 采纳只碰旧 SQLite 工作区与名册，零外呼、不装配运行期；合成一个接口会让"只想采纳
+	// 身份"的路径被迫带上 PG 迁移链路。装配层总常驻注入（它不依赖库与运行期资源）。
+	// InstanceAdopt sits beside Migration: adoption touches only the legacy SQLite
+	// workspace and the roster, so it must not drag the PG migration chain along.
+	InstanceAdopt InstanceAdoption
+
+	// SecretsRecovery 与 LegacySecretsAdopt 是两条**离线**手工流程的端口（见 ports.go）：
+	// `secrets recover-record`（D-40 记录恢复）与 `secrets adopt-legacy`（schema 3～5 受控
+	// 升级）。它们与 Secrets 分开是正确的形态——离线流程不许经过重路径装配（那会迁移库、
+	// 自动 adopt 并启动全部已发布 MCP）；装配层常驻注入，拿到 nil 即报缺件。
+	// The two offline manual procedures: share no code path with the heavy runtime.
+	SecretsRecovery    SecretsRecovery
+	LegacySecretsAdopt LegacySecretsAdopt
+
+	// Handoff 是 `db verify --handoff` 的端口（见 ports.go）：只读核对迁移准备副本的
+	// 交接就绪，离线可用、不要求 DSN。它与 Migration 分开——交接核对只碰副本的
+	// SQLite 库、名册、密钥文件与同级配置，零外呼、不装配运行期；装配层常驻注入。
+	// The offline handoff gate sits beside Migration so a read-only roster/key/ciphertext
+	// check never drags the PG migration chain along.
+	Handoff HandoffVerification
 
 	// Tools 是工具注册池端口（见 ports.go）：`tool list` 经它取「注册了什么」这一份数据，
 	// 清单的顺序由实现侧给出、命令面零重排。只有重路径装配才构建过注册池，因此该端口

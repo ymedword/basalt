@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖准入资源解析与只读投影（模块卡 §3.1.32、§4.4 的 011-web-observability
@@ -12,7 +14,6 @@ package app
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -25,7 +26,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -36,11 +38,11 @@ import (
 // runResourcesEnv is the fixture for both resource adapters.
 type runResourcesEnv struct {
 	root        string
-	dbPath      string
-	db          *storage.DB
-	versions    *storage.ResourceStore
-	ops         *storage.ManagementStore
-	credentials *storage.CredentialStore
+	dsn         string
+	db          *postgres.DB
+	versions    *postgres.ResourceStore
+	ops         *postgres.ManagementStore
+	credentials *postgres.CredentialStore
 	providers   *providerCatalog
 	llm         *provider.ProviderService
 	mcp         *mcpRuntime
@@ -67,8 +69,8 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	dbPath := filepath.Join(root, databaseFileName)
-	db, err := storage.OpenWritable(context.Background(), dbPath, storage.SupportedSchemaVersion)
+	dsn := pgtest.NewTestSchema(t)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
@@ -82,18 +84,18 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 	// 准入固定的客户端是**带两阶段审计的路由视图**，不是目录里的裸协议客户端
 	// （人工 review ② 缺陷 2）：测试夹具也必须走生产那条构造。
 	llm := provider.NewProviderService(providers.clients, providers.models,
-		storage.NewLLMCallRepo(db), nil)
+		postgres.NewLLMCallRepo(db), nil)
 	mcp := newMCPRuntime(
 		[]core.MCPServerConfig{{Name: "web"}},
 		[]tool.MCPConnection{{Server: "web", Tools: []core.Tool{fakeTool{name: "web_search"}}}},
 	)
 
-	versions := storage.NewResourceStore(db)
+	versions := postgres.NewResourceStore(db)
 	skills := workspace.NewSkillLibrary(root)
 	lifecycle := workspace.NewLifecycleStore(root, baselineClock)
 	gate := &core.ResourceGate{}
 
-	ops := storage.NewManagementStore(db)
+	ops := postgres.NewManagementStore(db)
 	opID := core.NewOperationID(baselineClock())
 	require.NoError(t, ops.BeginOperation(context.Background(), core.OperationRecord{
 		OperationID:  opID,
@@ -124,19 +126,19 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 
 	admission := AdmissionDeps{
 		Identities:  versions,
-		NotifyAdmin: storage.NewNotifyAdminStore(db),
-		Channels:    storage.NewNotifyChannelRepo(db),
-		Bindings:    storage.NewBindingStore(db),
+		NotifyAdmin: postgres.NewNotifyAdminStore(db),
+		Channels:    postgres.NewNotifyChannelRepo(db),
+		Bindings:    postgres.NewBindingStore(db),
 	}
 
 	return &runResourcesEnv{
 		opID:        opID,
 		root:        root,
-		dbPath:      dbPath,
+		dsn:         dsn,
 		db:          db,
 		versions:    versions,
 		ops:         ops,
-		credentials: storage.NewCredentialStore(db),
+		credentials: postgres.NewCredentialStore(db),
 		providers:   providers,
 		llm:         llm,
 		mcp:         mcp,
@@ -144,7 +146,7 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 		lifecycle:   lifecycle,
 		gate:        gate,
 		resources:   NewRunResources(versions, providers, llm, mcp, skills, gate, admission),
-		views:       NewResourceViews(versions, lifecycle, mcp, storage.NewCredentialStore(db), ResourceViewDeps{}),
+		views:       NewResourceViews(versions, lifecycle, mcp, postgres.NewCredentialStore(db), ResourceViewDeps{}),
 		admission:   admission,
 	}
 }
@@ -274,13 +276,15 @@ func requireUnavailable(t *testing.T, err error, reason string) *core.ResourceUn
 	return unavailable
 }
 
-// openRawWrite 开一条不带 pragma 的裸连接（与 wire_test.go 的 openRead 同一手法）。
-// 只用于制造正常写入路径拒绝制造的库内状态。
-// openRawWrite opens a bare connection without the production pragmas; it exists only
-// to create row states the write path refuses to produce.
-func openRawWrite(t *testing.T, path string) *sql.DB {
+// openRawWrite 开一条**不带只读事务**的普通连接，只用于制造正常写入路径拒绝制造的
+// 库内状态。PostgreSQL 的外键与 CHECK 始终生效（没有 SQLite 那种可关 pragma），所以
+// 需要父行的用例必须先把父行建好——判据不变，只是不再借"约束被关掉"的便宜。
+// openRawWrite opens an ordinary read-write connection for row states the production
+// write path refuses to produce. PostgreSQL always enforces FKs and CHECKs (there is no
+// switchable pragma), so callers must create parent rows first.
+func openRawWrite(t *testing.T, dsn string) *postgres.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.ToSlash(path))
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return db
@@ -499,7 +503,7 @@ func TestRunResources_ResolveMissingSkillManifest(t *testing.T) {
 	t.Run("存储路径被清空", func(t *testing.T) {
 		seed(t, "bare", "[]", ".basalt/versions/skills/bare/1")
 		// 正常写入路径不允许空 storage_path（EnsureVersion 校验），只能改库制造。
-		raw := openRawWrite(t, env.dbPath)
+		raw := openRawWrite(t, env.dsn)
 		_, execErr := raw.ExecContext(context.Background(),
 			`UPDATE resource_versions SET storage_path = '' WHERE resource_kind = 'skill' AND resource_id = 'bare'`)
 		require.NoError(t, execErr)
@@ -857,11 +861,22 @@ func TestRunResources_ResourceViewsPendingRestartAndReferencedBy(t *testing.T) {
 	require.Equal(t, mcpV1.ID, servers[0].AppliedVersionID)
 	require.Equal(t, mcpV1.VersionNo, servers[0].AppliedVersionNo)
 
-	// 裸连接：foreign_keys 默认关闭，可写入尚未建 Run 行的引用（本用例只验读投影）。
-	raw := openRawWrite(t, env.dbPath)
+	// 引用行由准入门槛写入，正常路径没有"终态外"的插入口——用可写连接直接制造。
+	// PostgreSQL 的 `REFERENCES runs(run_id)` 始终生效（SQLite 那份测试靠关掉
+	// foreign_keys 绕过），因此先按最小必填列建两条 Run 行，再写引用；判据不变。
+	raw := openRawWrite(t, env.dsn)
+	seedRun := `INSERT INTO runs
+	    (run_id, agent, channel, user_id, trigger, status, iterations, tool_calls,
+	     started_at, caller_id, authorizing_kind, actor)
+	    VALUES ($1, 'writer', 'cli', 'tester', 'user', 'running', 0, 0, $2,
+	            'local-admin', 'admin-builtin', 'caller')`
+	_, err = raw.ExecContext(ctx, seedRun, "run-live", baselineClock().UnixMilli())
+	require.NoError(t, err)
+	_, err = raw.ExecContext(ctx, seedRun, "run-done", baselineClock().UnixMilli())
+	require.NoError(t, err)
 	insert := `INSERT INTO run_resource_refs
 	    (run_id, resource_kind, resource_id, version_id, content_hash, released_at)
-	    VALUES (?, ?, ?, ?, ?, ?)`
+	    VALUES ($1, $2, $3, $4, $5, $6)`
 	_, err = raw.ExecContext(ctx, insert, "run-live", string(core.ResourceModelConnection), "alpha",
 		provider.ID, provider.ContentHash, nil)
 	require.NoError(t, err)
@@ -1063,7 +1078,7 @@ func TestRunResources_SystemOverviewCountsPublishedPointers(t *testing.T) {
 		mcpDefinition("web", "npx", "MCP_TOKEN"), "", "")
 	env.publish(t, core.ResourceMCPServer, "web", webVersion.ID, true)
 
-	reader := newSystemReader(env.db, storage.NewRunStore(env.db), env.versions, baselineClock)
+	reader := newSystemReader(env.db, postgres.NewRunStore(env.db), env.versions, baselineClock)
 	readings, err := reader.ReadOverview(ctx)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, readings.ModelConnections)
@@ -1072,13 +1087,13 @@ func TestRunResources_SystemOverviewCountsPublishedPointers(t *testing.T) {
 	require.Zero(t, readings.RunsRunning, "空账本的运行计数是真实读数 0")
 	require.Zero(t, readings.RunsLast24h)
 	require.Zero(t, readings.RunsFailedLast24h)
-	require.Equal(t, storage.SupportedSchemaVersion, readings.SchemaVersion)
+	require.Equal(t, postgres.SupportedSchemaVersion, readings.SchemaVersion)
 
 	// 撤回（deleted_at 非空）的指针不计入——正常写路径在 US-11 不提供撤回，故用裸连接
 	// 制造这一库内状态（与文件头说明同一例外）。
-	raw := openRawWrite(t, env.dbPath)
+	raw := openRawWrite(t, env.dsn)
 	_, err = raw.ExecContext(ctx,
-		`UPDATE resource_pointers SET deleted_at = ? WHERE resource_kind = ? AND resource_id = ?`,
+		`UPDATE resource_pointers SET deleted_at = $1 WHERE resource_kind = $2 AND resource_id = $3`,
 		baselineClock().UnixMilli(), string(core.ResourceSkill), "draft")
 	require.NoError(t, err)
 
@@ -1108,7 +1123,7 @@ func TestRunResources_ProviderIsAuditedPinnedView(t *testing.T) {
 	require.True(t, ok)
 	require.NotNil(t, client)
 
-	read := openRead(t, env.dbPath)
+	read := openRead(t, env.dsn)
 	// 别的 provider 名：固定表里没有 → 预写之前拒绝（无审计行 = 确定没发出）。
 	_, err = client.Chat(ctx, core.ChatRequest{Provider: "beta", RunID: "run-pin-1", Round: 1})
 	require.ErrorIs(t, err, core.ErrProviderNotConfigured, "固定视图只认准入固定的 provider")
@@ -1159,7 +1174,7 @@ func (e *runResourcesEnv) seedCredential(t *testing.T, kind core.ResourceKind, n
 // seedManagedCredential 建第 1 个托管凭据版本；属主 UID 由调用方给出——夹具里既可能
 // 来自 `fixtureResourceUID`，也可能来自仓储实际分配的指针身份（跨写面用例）。
 // seedManagedCredential creates version 1 with a caller-supplied owner uid.
-func seedManagedCredential(t *testing.T, store *storage.CredentialStore, opID string,
+func seedManagedCredential(t *testing.T, store *postgres.CredentialStore, opID string,
 	kind core.ResourceKind, name string, uid core.ResourceUID, baseURL string,
 ) string {
 	t.Helper()
@@ -1325,7 +1340,7 @@ func TestResources_EtagIncludesScopeAndCredential(t *testing.T) {
 			State: core.AgentDisabled, Generation: 1,
 			UpdatedAt: baselineClock().UnixMilli(), OperationID: env.opID,
 		}, true, ""))
-		_, err = env.versions.ConvertScope(ctx, storage.ScopeConversion{
+		_, err = env.versions.ConvertScope(ctx, postgres.ScopeConversion{
 			Kind:          core.ResourceModelConnection,
 			Name:          "alpha",
 			ExpectUID:     fixtureResourceUID(t, core.ResourceModelConnection, "alpha"),
@@ -1439,7 +1454,7 @@ func TestResources_KeyChangeDoesNotBreakOtherAgentSave(t *testing.T) {
 	// 同库同工作区：已发布模型连接 + 托管凭据（属主身份取仓储实际分配的指针 UID）。
 	published := env.seedModel(t, "alpha")
 	opID := env.seedOperation(t)
-	credentials := storage.NewCredentialStore(env.db)
+	credentials := postgres.NewCredentialStore(env.db)
 	credID := seedManagedCredential(t, credentials, opID, core.ResourceModelConnection,
 		"alpha", published.ResourceUID, "https://api.example.com")
 	admin := NewResourceAdmin(ResourceAdminDeps{

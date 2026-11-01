@@ -58,19 +58,27 @@ var ErrTaskBusy = errors.New("scheduler: task busy")
 // TaskRecord 是 `scheduled_tasks` 的一行（装载后的运行时快照 + 启停状态 + 运行痕迹）。
 // TaskRecord is one scheduled_tasks row: the post-load runtime snapshot.
 type TaskRecord struct {
-	TaskID         string
-	Agent          string
-	Cron           string
-	Zone           string
-	Message        string
-	DeliverTo      string
-	Enabled        bool
-	DefinitionHash string
-	LastRunAt      time.Time
-	LastStatus     ExecutionStatus
-	RetiredAt      time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	TaskID  string
+	Agent   string
+	Cron    string
+	Zone    string
+	Message string
+	// CallerID / AuthorizingKind / AuthorizingKeyID 是任务归属与执行授权来源
+	// （`scheduled_tasks` 三列，C-32）：调度执行只能按它们重建 `OwnedPrincipal`，
+	// **不得**在执行期改写，也**不得**按有无 Key 反推 kind。
+	// The task's owner and authorizing source; scheduling rebuilds the principal from
+	// these three columns and never rewrites them at execution time.
+	CallerID         string
+	AuthorizingKind  AuthorizingKind
+	AuthorizingKeyID string
+	DeliverTo        string
+	Enabled          bool
+	DefinitionHash   string
+	LastRunAt        time.Time
+	LastStatus       ExecutionStatus
+	RetiredAt        time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // ExecutionRecord 是 `task_executions` 的一行（执行历史；无 Run 的终态行 RunID 为空）。

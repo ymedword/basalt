@@ -4,17 +4,20 @@ package app
 // `http.admin_auth.mode: token` 而 `token` 省略时，从实例私有目录的 `admin-token`
 // 读取；文件不存在时，**只有可证明的新实例**才生成一个并提示一次。
 //
-// 三条纪律：
+// 四条纪律：
 //   - 三处（配置文件 / 环境变量 / 密码文件）都没有 → 启动失败并点名三处，
 //     **不得**回落到 `local_trust`——那等于把管理面在无凭据状态下开放；
+//   - 自动生成只发生在"首次初始化还没做完"的实例上：`freshInstance`，或名册已落盘但
+//     初始化进度记录仍是 pending（中断后重试，见 instance_provisioning.go）。其余一律
+//     按已有凭据的实例失败关闭——不补发、不覆盖；
 //   - 密码文件与主密钥**分文件**（恢复语义不同：主密钥丢了要恢复或重录凭据，
 //     密码丢了重新生成即可），但共用同一个受限目录；
 //   - 密码**不得**进日志或错误文本：非交互终端只输出路径，交互式只在生成那一刻
 //     显示一次值。
 //
 // The token file is the third source of the management password; all three sources
-// missing is a startup failure, never a fallback to local_trust. The password itself
-// never reaches logs, and a non-interactive run only prints the path.
+// missing is a startup failure, never a fallback to local_trust. Minting happens only
+// for an unfinished first start, and the password never reaches logs.
 
 import (
 	"crypto/rand"
@@ -81,12 +84,30 @@ func (a *App) resolveAdminToken(cfg *cli.Config) (adminTokenResolution, error) {
 	token, readErr := readAdminTokenFile(path)
 	switch {
 	case readErr == nil:
+		// 盘上已有密码：它就是这个实例的密码，本次不改写。若进度记录还停在 pending
+		// （上次发放后、改写记录之前中断），顺手补记 minted——否则运维日后删掉密码文件
+		// 会被当成"首次初始化没做完"再发一把。
+		// A password already on disk is authoritative; a pending record is only a sign
+		// that the previous run died before flipping it.
+		a.markAdminTokenMinted()
 		return adminTokenResolution{Token: token, Path: path, Source: adminTokenSourceFile}, nil
 	case !errors.Is(readErr, fs.ErrNotExist):
 		return adminTokenResolution{}, readErr
 	}
 	if !a.freshInstance {
-		return adminTokenResolution{}, missingAdminTokenError(path)
+		// 中断后的重试：名册已落盘，本次启动不再算"新实例"。但初始化进度记录若仍是
+		// pending，就说明首次初始化确实没做完（DSN 没提供 / 数据库连不上 / 连上之后
+		// 初始化失败）——这一次机会**不得**因为一次中断永久丢失。记录缺失、状态已是
+		// minted、标识不符或读不懂，一律按"已有凭据的实例"失败关闭：不补发密码，
+		// 也不覆盖任何既有文件。
+		// A retry is not fresh, but a still-pending provisioning record proves the first
+		// start never finished; anything else fails closed.
+		pending, instanceID, reason := adminTokenProvisioningPending(a.workDir)
+		if !pending {
+			return adminTokenResolution{}, missingAdminTokenError(path)
+		}
+		a.loggerOr().Warn("首次初始化未完成：本次启动继续生成管理面访问密码（不覆盖既有配置、主密钥或密码文件）",
+			"instance_id", instanceID, "reason", reason)
 	}
 
 	token, err = generateAdminToken()
@@ -100,11 +121,25 @@ func (a *App) resolveAdminToken(cfg *cli.Config) (adminTokenResolution, error) {
 			if readErr != nil {
 				return adminTokenResolution{}, readErr
 			}
+			a.markAdminTokenMinted()
 			return adminTokenResolution{Token: existing, Path: path, Source: adminTokenSourceFile}, nil
 		}
 		return adminTokenResolution{}, err
 	}
+	a.markAdminTokenMinted()
 	return adminTokenResolution{Token: token, Path: path, Source: adminTokenSourceGenerated}, nil
+}
+
+// markAdminTokenMinted 在密码文件写好之后把进度记录流转为 minted。失败只告警：密码
+// 已经落盘，本次启动不该因为一次记账失败而失败；记录停在 pending 的最坏后果是"运维
+// 手工删掉密码文件后可能被补发一次"，而不是"密码丢失"。
+// markAdminTokenMinted flips the record after the password file exists; a failure only
+// warns, because the password is already on disk.
+func (a *App) markAdminTokenMinted() {
+	if err := completeAdminTokenProvisioning(a.workDir); err != nil {
+		a.loggerOr().Warn("首次初始化进度记录未能改写为已生成——管理面访问密码已就绪，不影响本次启动",
+			"error", err)
+	}
 }
 
 // missingAdminTokenError 是"三处都没有"的固定错误：点名配置键、环境变量与文件路径，

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是启动恢复的验收面（颗粒度文档 §3.2.1：internal/app/recovery_operations_test.go，
@@ -20,7 +22,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -29,11 +32,15 @@ import (
 // 全部落在同一临时工作区与同一库句柄上。
 type recoveryEnv struct {
 	deps        RecoveryDeps
-	store       *storage.ManagementStore
-	credentials *storage.CredentialStore
-	policy      *storage.NetworkPolicyStore
+	store       *postgres.ManagementStore
+	credentials *postgres.CredentialStore
+	policy      *postgres.NetworkPolicyStore
 	root        string
 	logs        *bytes.Buffer
+	// db 是判卷读面用的同一隔离句柄（SQLite 时代按库文件路径另开只读句柄，
+	// PostgreSQL 下隔离 schema 的连接串等价于那次的"同一个库"）。
+	// db is the verdict read handle on the same isolated schema.
+	db *postgres.DB
 }
 
 // newRecoveryEnv 建夹具；`Editor` 与 `Lifecycle` 都落在同一临时工作区上。
@@ -44,14 +51,11 @@ func newRecoveryEnv(t *testing.T) *recoveryEnv {
 	_, err := workspace.Init(root)
 	require.NoError(t, err)
 
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(root, databaseFileName), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	store := storage.NewManagementStore(db)
-	credentials := storage.NewCredentialStore(db)
-	policy := storage.NewNetworkPolicyStore(db)
+	store := postgres.NewManagementStore(db)
+	credentials := postgres.NewCredentialStore(db)
+	policy := postgres.NewNetworkPolicyStore(db)
 	logger, logs := newCapturedLogger()
 	return &recoveryEnv{
 		root:        root,
@@ -59,9 +63,10 @@ func newRecoveryEnv(t *testing.T) *recoveryEnv {
 		credentials: credentials,
 		policy:      policy,
 		logs:        logs,
+		db:          db,
 		deps: RecoveryDeps{
 			Operations: store,
-			Resources:  storage.NewResourceStore(db),
+			Resources:  postgres.NewResourceStore(db),
 			Lifecycle:  workspace.NewLifecycleStore(root, baselineClock),
 			Editor:     workspace.NewAgentEditor(workspace.AgentEditorDeps{Root: root}),
 			Logger:     logger,
@@ -71,8 +76,8 @@ func newRecoveryEnv(t *testing.T) *recoveryEnv {
 			ConfigPath:  filepath.Join(root, configFileName),
 			Skills:      workspace.NewSkillLibrary(root),
 			Gate:        core.NewAgentGate(),
-			Archives:    storage.NewAgentAdminStore(db),
-			Notify:      storage.NewNotifyAdminStore(db),
+			Archives:    postgres.NewAgentAdminStore(db),
+			Notify:      postgres.NewNotifyAdminStore(db),
 			Credentials: credentials,
 			Schema:      db,
 			// 网络域名白名单策略行：恢复按修订号 + 候选域名哈希判三态（R8.2.4）。
@@ -242,7 +247,12 @@ func TestRecoverPendingOperations_ContentUpdateIndeterminateKeepsDetail(t *testi
 	op := getOperation(t, env.store, operationID)
 	require.Equal(t, core.OperationUnknown, op.Status)
 	require.Equal(t, core.VerificationIndeterminate, op.Verification)
-	require.Equal(t, string(detail), string(op.DetailJSON), "unknown 必须保留查证依据")
+	// `detail_json` 在 PostgreSQL 下是 jsonb：读回时空白与键序被规范化，逐字节比对失效。
+	// 判据落在字段值上——两个哈希都必须原样保留（unknown 的查证依据不得被清掉）。
+	// jsonb normalises whitespace on read-back, so the verdict targets the field values.
+	kept := detailMap(t, op.DetailJSON)
+	require.Equal(t, sha256Hex(t, candidate), kept["candidate_sha256"], "unknown 必须保留候选哈希")
+	require.Equal(t, sha256Hex(t, previous), kept["previous_sha256"], "unknown 必须保留原哈希")
 	require.Contains(t, env.logs.String(), "无法判定")
 }
 
@@ -367,7 +377,7 @@ func TestRecoverPendingOperations_BaselineKeptUnknownWithoutRedo(t *testing.T) {
 	op := getOperation(t, env.store, operationID)
 	require.Equal(t, core.OperationUnknown, op.Status)
 	require.Equal(t, core.VerificationIndeterminate, op.Verification)
-	require.Equal(t, 1, countRows(t, openRead(t, filepath.Join(env.root, databaseFileName)),
+	require.Equal(t, 1, countRows(t, env.db,
 		`SELECT COUNT(*) FROM management_operations`), "只回填，不追加操作行")
 	versions, err := env.deps.Resources.Versions(context.Background(), core.ResourceSkill, "weekly")
 	require.NoError(t, err)
@@ -704,7 +714,7 @@ func TestRecoverPendingOperations_ScopeConversionApplied(t *testing.T) {
 			PreviousScope:    string(core.ScopeShared),
 		}),
 	})
-	_, err = env.deps.Resources.ConvertScope(ctx, storage.ScopeConversion{
+	_, err = env.deps.Resources.ConvertScope(ctx, postgres.ScopeConversion{
 		Kind:          core.ResourceModelConnection,
 		Name:          "primary",
 		ExpectUID:     ptr.ResourceUID,
@@ -769,7 +779,7 @@ func TestRecoverPendingOperations_ScopeConversionIndeterminate(t *testing.T) {
 	require.NoError(t, err)
 	otherOp := seedOperation(t, env, actionModelConnectionScope,
 		string(core.ResourceModelConnection), string(ptr.ResourceUID))
-	_, err = env.deps.Resources.ConvertScope(ctx, storage.ScopeConversion{
+	_, err = env.deps.Resources.ConvertScope(ctx, postgres.ScopeConversion{
 		Kind:          core.ResourceModelConnection,
 		Name:          "primary",
 		ExpectUID:     ptr.ResourceUID,
@@ -840,7 +850,7 @@ func TestRecoverPendingOperations_BaselineV3NotApplied(t *testing.T) {
 	ctx := context.Background()
 
 	seedLegacyStateFile(t, env.root, "writer")
-	env.deps.Schema = staticSchemaVersion(storage.SupportedSchemaVersion - 1)
+	env.deps.Schema = staticSchemaVersion(postgres.SupportedSchemaVersion - 1)
 
 	operationID := core.NewOperationID(baselineClock())
 	beginPendingOperation(t, env.store, core.OperationRecord{

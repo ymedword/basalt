@@ -14,7 +14,9 @@ import (
 )
 
 // memoryScopeAgent 是 Agent 层查询的固定 scope 字面量（契约 MemoryView.scope 枚举）。
-// memoryScopeAgent is the fixed agent-layer scope literal.
+// 全局层的同名常量在 `handlers_meta.go`（那条端点先落地），两处共用一份取值。
+// memoryScopeAgent is the fixed agent-layer scope literal; the global one lives beside
+// the /memory handler that introduced it.
 const memoryScopeAgent = "agent"
 
 // handleAgentMemory 处理 `GET /api/v1/agents/{name}/memory`：Agent 不存在或未注册

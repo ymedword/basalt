@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -105,6 +106,80 @@ func us14dPrivateEnv(dataRoot string, extra ...string) []string {
 		"GITHUB_PERSONAL_ACCESS_TOKEN=",
 	)
 	return append(env, extra...)
+}
+
+// us14dPrepareIngress checks the deliberately interrupted first start and supplies
+// explicit test-only limits before retrying. Production has no invented defaults.
+func us14dPrepareIngress(t *testing.T, h *harness, dataRoot string) string {
+	t.Helper()
+	result := h.run(t, us14dPrivateEnv(dataRoot), "serve")
+	output := h.redact(result.Stdout + result.Stderr)
+	if result.ExitCode == 0 || !strings.Contains(output, "provisioning_recorded=true") {
+		t.Fatalf("首次启动应记录初始化并因缺少入口限流而失败: exit=%d\n%s", result.ExitCode, output)
+	}
+	for _, key := range []string{"run.qps", "run.burst", "ingest.qps", "ingest.burst", "read.qps", "read.burst"} {
+		if !strings.Contains(output, "callers.ingress."+key) {
+			t.Fatalf("首次启动缺少配置提示 %s:\n%s", key, output)
+		}
+	}
+	instanceID := us14dInstanceID(t, h)
+	if _, err := os.Stat(us14dAdminTokenPath(dataRoot, instanceID)); !os.IsNotExist(err) {
+		t.Fatalf("限流配置缺失时不得发放管理密码: %v", err)
+	}
+	path := filepath.Join(h.Root, "basalt.yaml")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteString("\ncallers:\n  ingress:\n    run: {qps: 10, burst: 20}\n    ingest: {qps: 10, burst: 20}\n    read: {qps: 10, burst: 20}\n")
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("写入测试限流配置失败: write=%v close=%v", writeErr, closeErr)
+	}
+	return output
+}
+
+func TestUS14D_FirstStartRequiresIngressConfiguration(t *testing.T) {
+	h := newHarness(t)
+	dataRoot := t.TempDir()
+	us14dPrepareIngress(t, h, dataRoot)
+	instanceID := us14dInstanceID(t, h)
+	var record us14dProvisioningRecord
+	if err := json.Unmarshal([]byte(readText(t, us14dProvisioningPath(dataRoot, instanceID))), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.InstanceID != instanceID || record.AdminToken != "pending" {
+		t.Fatalf("缺少限流配置后的进度记录错误: %+v", record)
+	}
+}
+
+func TestUS14D_FirstStartResumesAfterIngressConfiguration(t *testing.T) {
+	h := newHarness(t)
+	dataRoot := t.TempDir()
+	us14dPrepareIngress(t, h, dataRoot)
+	instanceID := us14dInstanceID(t, h)
+	// 此测试使用随机端口，避免干扰已经运行的 8080 演示实例。
+	addr := freeLoopbackAddr(t)
+	path := filepath.Join(h.Root, "basalt.yaml")
+	content := readText(t, path)
+	changed := strings.Replace(content, "addr: "+us14dDefaultAddr, "addr: "+addr, 1)
+	if changed == content {
+		t.Fatal("生成的配置缺少默认监听地址")
+	}
+	if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
+	waitHealthHTTP(t, p, addr, 60*time.Second)
+	if got := us14dInstanceID(t, h); got != instanceID {
+		t.Fatalf("补齐配置后不得更换实例身份：之前 %s，之后 %s", instanceID, got)
+	}
+	token := us14dGeneratedAdminToken(t, dataRoot, instanceID)
+	us14dProfiles(t, addr, token)
+	if after := readText(t, path); after != changed {
+		t.Fatal("成功重试不得改写已填写的配置")
+	}
+	p.stop(t)
 }
 
 // us14dAuthHeader 返回一条只带管理面令牌的头（E9 用的是新实例自动生成的密码，
@@ -350,11 +425,33 @@ func us14dInstanceID(t *testing.T, h *harness) string {
 	return marker.InstanceID
 }
 
+// us14dAdminTokenPath 返回实例私有目录里的密码文件路径（与主密钥、进度记录同目录）。
+// us14dAdminTokenPath returns the admin-token path inside the instance private directory.
+func us14dAdminTokenPath(dataRoot, instanceID string) string {
+	return filepath.Join(dataRoot, "basalt", "instances", instanceID, "admin-token")
+}
+
+// us14dProvisioningPath 返回首次初始化进度记录的路径（2026-10-30 裁决引入的
+// `provisioning.json`：pending → minted 单向流转，证明首次启动还欠不欠一次密码发放）。
+// us14dProvisioningPath returns the provisioning record path the retry logic keys on.
+func us14dProvisioningPath(dataRoot, instanceID string) string {
+	return filepath.Join(dataRoot, "basalt", "instances", instanceID, "provisioning.json")
+}
+
+// us14dProvisioningRecord 是进度记录的判卷副本（app 侧写出的 JSON：版本 / 实例标识 /
+// 密码进度三样，不含任何凭据值）。
+// us14dProvisioningRecord mirrors the on-disk record: version, instance id, token state.
+type us14dProvisioningRecord struct {
+	Version    int    `json:"version"`
+	InstanceID string `json:"instance_id"`
+	AdminToken string `json:"admin_token"`
+}
+
 // us14dGeneratedAdminToken 读新实例自动生成的访问密码文件（实例私有目录，工作区之外）。
 // us14dGeneratedAdminToken reads the admin token the first start generated.
 func us14dGeneratedAdminToken(t *testing.T, dataRoot, instanceID string) string {
 	t.Helper()
-	path := filepath.Join(dataRoot, "basalt", "instances", instanceID, "admin-token")
+	path := us14dAdminTokenPath(dataRoot, instanceID)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读自动生成的访问密码 %s 失败: %v", path, err)
@@ -493,7 +590,7 @@ func TestUS14D_MCPAutoPublishedOnCredential(t *testing.T) {
 	us14dRequireSameBytes(t, h, before, "凭据补写不得改写已就位的定义")
 	second.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM management_operations WHERE action LIKE 'mcp_server.%'`); n != 0 {
 		t.Fatalf("安装器的补写不得留下 mcp_server.* 管理操作行，实际 %d 条（补写不是管理面保存路径）", n)
 	}
@@ -578,7 +675,7 @@ func TestUS14D_DisabledNotScheduled(t *testing.T) {
 	// 跨过至少两个 5 秒触发点：门若在写之后判定，这里就会留下执行行。
 	time.Sleep(11 * time.Second)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs WHERE agent = 'demo'`); n != 0 {
 		t.Fatalf("停用的 Agent 不得产生 Run，实际 %d 条", n)
 	}
@@ -684,6 +781,7 @@ func TestUS14D_FreshInstanceBudgetPreset(t *testing.T) {
 		// 模板把监听地址写死成 127.0.0.1:8080，且该键没有环境变量覆盖。
 		us14dRequireFreePort(t, us14dDefaultAddr)
 
+		firstOutput := us14dPrepareIngress(t, h, dataRoot)
 		p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
 		waitHealthHTTP(t, p, us14dDefaultAddr, 60*time.Second)
 
@@ -693,6 +791,10 @@ func TestUS14D_FreshInstanceBudgetPreset(t *testing.T) {
 			"mode: token",
 			"max_concurrent_runs: 32",
 			"max_iterations: 30",
+			// 运行期唯一存储是 PostgreSQL（D-01）：生成的配置必须带上连接段，且只写
+			// `${VAR}` 占位——没有这一段时首个进程连库都到不了，首次初始化必然中断。
+			"database:",
+			"dsn: ${" + generatedDSNEnv + "}",
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("生成的配置缺少 %q：\n%s", want, text)
@@ -720,7 +822,7 @@ func TestUS14D_FreshInstanceBudgetPreset(t *testing.T) {
 
 		us14dInstanceID(t, h)
 
-		combined := p.combined()
+		combined := firstOutput
 		if !strings.Contains(combined, "新实例：最小配置与实例名册已就绪") {
 			t.Fatalf("首次启动应记一条新实例初始化日志：\n%s", combined)
 		}
@@ -806,16 +908,14 @@ func TestUS14D_BudgetCompatNotices(t *testing.T) {
 	p.stop(t)
 }
 
-// TestUS14D_ConfigEffectiveThisStart（E9）判"生成的配置当次即生效"：全新实例第一次
-// 启动写出 30 轮预算、名册与访问密码，同一个进程里用那把自动生成的密码发布模型连接、
-// 运行期写入声明 40 轮的 Agent，就绪视图立刻点名"声明 40 超过实例上限 30"——不需要
-// 重启来让配置生效。
-// E9: the generated configuration takes effect in the very process that wrote it.
+// TestUS14D_ConfigEffectiveThisStart checks the generated budget on the first
+// successful start, after the user supplies the mandatory ingress limits.
 func TestUS14D_ConfigEffectiveThisStart(t *testing.T) {
 	h := newHarness(t)
 	dataRoot := t.TempDir()
 	us14dRequireFreePort(t, us14dDefaultAddr)
 
+	us14dPrepareIngress(t, h, dataRoot)
 	p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
 	waitHealthHTTP(t, p, us14dDefaultAddr, 60*time.Second)
 
@@ -863,9 +963,16 @@ func TestUS14D_ConfigEffectiveThisStart(t *testing.T) {
 }
 
 // TestUS14D_ExistingNoConfigUntouched（E10）判存量实例的 fail-closed：`init` 建过库但
-// 没有配置文件的工作区**不得**被当成新实例补生成——没有管理认证配置就拒绝启动，
-// 且不写配置、不写名册、不建实例私有目录（不猜旧路径）。
+// 没有配置文件的工作区**不得**被当成新实例补生成——启动必须失败，且不写配置、不写名册、
+// 不建实例私有目录（不猜旧路径）。
+//
+// 新的入口限流前置在打开数据库之前拒绝缺配置的实例；存量不自动生成配置与名册的
+// 原有保护仍保持，拒因从缺 DSN 改为缺少完整服务配置。
+// 管理认证缺口的拒绝语义仍由单元用例 `TestNewWebServer_RefusesInvalidAdminAuth` 判卷
+// （internal/app/web_test.go），本用例的守点收敛为"存量实例不被补生成 + 启动必须失败"。
 // E10: an established instance without a config refuses to start and writes nothing.
+// Since PG-only, the empty DSN is the first mandatory item, so the admin-auth refusal is
+// no longer reachable here; that refusal stays pinned at unit level.
 func TestUS14D_ExistingNoConfigUntouched(t *testing.T) {
 	h := newHarness(t)
 	dataRoot := t.TempDir()
@@ -881,9 +988,10 @@ func TestUS14D_ExistingNoConfigUntouched(t *testing.T) {
 	}
 	output := res.Stdout + res.Stderr
 	for _, want := range []string{
-		"管理认证配置校验失败",
-		"http.admin_auth.mode 缺失或非法",
+		// 存量实例告警与真正的拒因各一句：告警证明"没被当成新实例"，拒因证明 fail-closed。
 		"存量实例",
+		"服务启动需要配置文件",
+		"callers.ingress.run.qps",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("启动失败输出缺少 %q：\n%s", want, output)
@@ -899,6 +1007,167 @@ func TestUS14D_ExistingNoConfigUntouched(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataRoot, "basalt", "instances")); err == nil {
 		t.Fatalf("存量实例不得创建实例私有目录（%s）", filepath.Join(dataRoot, "basalt", "instances"))
 	}
+}
+
+// us14dRunInterruptedFirstStart 跑一次注定失败的首次 `serve`，并判"中断断点"处盘上
+// 该有什么、不该有什么：生成的配置（`database.dsn` 只写占位）、实例名册与 pending 进度
+// 记录三样都在；密码文件与主密钥都**不在**——它们排在可用的运行期之后。
+// 返回首次启动留下的配置字节与实例标识，供重试断言"既有的一字节不改、标识也不换"。
+// us14dRunInterruptedFirstStart runs the doomed first start and pins the on-disk state
+// at the interruption point: config + roster + pending record exist, credentials do not.
+func us14dRunInterruptedFirstStart(t *testing.T, h *harness, dataRoot string, env, want []string) (string, string) {
+	t.Helper()
+	us14dRequireFreePort(t, us14dDefaultAddr)
+	us14dPrepareIngress(t, h, dataRoot)
+
+	res := h.run(t, env, "serve")
+	if res.ExitCode == 0 {
+		t.Fatalf("首次启动在数据库不可用时必须拒绝启动，实际退出码 0\nstdout:\n%s\nstderr:\n%s",
+			h.redact(res.Stdout), h.redact(res.Stderr))
+	}
+	output := h.redact(res.Stdout + res.Stderr)
+	for _, fragment := range want {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("首次启动失败输出缺少 %q：\n%s", fragment, output)
+		}
+	}
+	if !strings.Contains(output, "首次初始化未完成") {
+		t.Fatalf("配置限流后重试应记录仍处于初始化续做：\n%s", output)
+	}
+
+	configBefore := readText(t, filepath.Join(h.Root, "basalt.yaml"))
+	if !strings.Contains(configBefore, "dsn: ${"+generatedDSNEnv+"}") {
+		t.Fatalf("生成的配置必须只写占位 dsn: ${%s}（明文 DSN 禁止落盘）：\n%s", generatedDSNEnv, configBefore)
+	}
+
+	instanceID := us14dInstanceID(t, h)
+	recordPath := us14dProvisioningPath(dataRoot, instanceID)
+	var record us14dProvisioningRecord
+	if err := json.Unmarshal([]byte(readText(t, recordPath)), &record); err != nil {
+		t.Fatalf("首次初始化进度记录 %s 不是合法 JSON: %v", recordPath, err)
+	}
+	if record.Version != 1 || record.InstanceID != instanceID || record.AdminToken != "pending" {
+		t.Fatalf("首次启动失败后进度记录 = %+v，期望 version=1 / instance_id=%s / admin_token=pending",
+			record, instanceID)
+	}
+
+	for _, path := range []string{
+		us14dAdminTokenPath(dataRoot, instanceID),
+		filepath.Join(dataRoot, "basalt", "instances", instanceID, "master.key"),
+	} {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("%s 先于可用的运行期出现——数据库没打开时不得发放密码，也不得初始化主密钥", path)
+		}
+	}
+	return configBefore, instanceID
+}
+
+// us14dRetryFirstStart 用修好的 DSN 重试首次启动，并判四件事：进程到健康检查；日志
+// 如实说明这是"首次初始化未完成、本次继续"；配置与实例标识一字节不改；中断时没发出的
+// 密码补发成功、可用于管理面，进度记录随之流转为 minted（此后不再补发）。
+// us14dRetryFirstStart resumes the first start with a working DSN and pins the four
+// outcomes of a safe retry.
+func us14dRetryFirstStart(t *testing.T, h *harness, env []string, dataRoot, configBefore, instanceID string) {
+	t.Helper()
+	us14dRequireFreePort(t, us14dDefaultAddr)
+
+	p := startGrouped(t, h, env, "serve")
+	waitHealthHTTP(t, p, us14dDefaultAddr, 60*time.Second)
+
+	combined := h.redact(p.combined())
+	if !strings.Contains(combined, "首次初始化未完成") {
+		t.Fatalf("重试启动应如实记录这是中断后的续做（缺这句话时排障会把续做误读成存量实例）：\n%s", combined)
+	}
+	if !strings.Contains(combined, "管理台访问密码已写入") {
+		t.Fatalf("重试必须把中断时没发出来的密码补发出去（非交互终端只提示文件路径）：\n%s", combined)
+	}
+
+	if after := readText(t, filepath.Join(h.Root, "basalt.yaml")); after != configBefore {
+		t.Fatalf("重试不得改写首次启动已经生成的配置：\n之前：\n%s\n之后：\n%s", configBefore, after)
+	}
+	if got := us14dInstanceID(t, h); got != instanceID {
+		t.Fatalf("重试不得更换实例标识：首次 %s，本次 %s", instanceID, got)
+	}
+
+	// 补发的密码就是这把：用它读管理面成功即证明它已生效（200 由 us14dProfiles 断言）。
+	token := us14dGeneratedAdminToken(t, dataRoot, instanceID)
+	us14dProfiles(t, us14dDefaultAddr, token)
+
+	recordPath := us14dProvisioningPath(dataRoot, instanceID)
+	var record us14dProvisioningRecord
+	if err := json.Unmarshal([]byte(readText(t, recordPath)), &record); err != nil {
+		t.Fatalf("首次初始化进度记录 %s 不是合法 JSON: %v", recordPath, err)
+	}
+	if record.AdminToken != "minted" {
+		t.Fatalf("密码发放之后进度记录必须流转为 minted（否则运维日后删掉密码文件会被补发第二把），实际 %q",
+			record.AdminToken)
+	}
+
+	p.stop(t)
+}
+
+// TestUS14D_FirstStartRetryAfterFailure 判首次启动中断后的恢复（2026-10-30 用户裁决）：
+// 首次 `serve` 在写完配置、名册与 pending 进度记录之后、发放访问密码之前失败时，用户
+// 修好配置或恢复数据库后重试**必须**能把这次启动做完——不得因为名册已落盘就永久失去
+// 那一次性的管理面访问密码；重试也不得改写配置、更换实例标识或覆盖任何既有文件。
+//
+// 三个子用例对应三类真实中断，失败断点各不相同：
+//
+//	DSN 未提供        生成的配置只有占位、环境变量为空 → 打开数据库时以"连接串为空"拒绝
+//	数据库不可达      DSN 指向没有监听的端口 → 连接阶段拒绝（connect_timeout=2 缩短等待）
+//	连接后初始化失败  库内 schema_version 高于本二进制支持 → 连上之后、建表之前拒绝
+//
+// 三个断点都排在管理面装配之前，因此首次尝试结束时密码文件与主密钥都不该存在；重试走
+// 同一条首次初始化路径，健康检查就绪、配置逐字节不变、进度记录流转为 minted。
+// E-retry: an interrupted first start resumes on retry; nothing already on disk is rewritten.
+func TestUS14D_FirstStartRetryAfterFailure(t *testing.T) {
+	t.Run("DSN 未提供", func(t *testing.T) {
+		h := newHarness(t)
+		dataRoot := t.TempDir()
+		configBefore, instanceID := us14dRunInterruptedFirstStart(t, h, dataRoot,
+			us14dPrivateEnv(dataRoot, generatedDSNEnv+"="),
+			[]string{"打开 PostgreSQL", "database.dsn", "PostgreSQL 连接串为空"})
+		us14dRetryFirstStart(t, h, us14dPrivateEnv(dataRoot), dataRoot, configBefore, instanceID)
+	})
+
+	t.Run("数据库不可达", func(t *testing.T) {
+		h := newHarness(t)
+		dataRoot := t.TempDir()
+		// freeLoopbackAddr 释放的端口没有监听者：连接阶段拒绝，口令类参数一概不需要。
+		dsn := "postgres://basalt@" + freeLoopbackAddr(t) + "/basalt?connect_timeout=2&sslmode=disable"
+		configBefore, instanceID := us14dRunInterruptedFirstStart(t, h, dataRoot,
+			us14dPrivateEnv(dataRoot, generatedDSNEnv+"="+dsn),
+			[]string{"打开 PostgreSQL", "连接 PostgreSQL 失败"})
+		us14dRetryFirstStart(t, h, us14dPrivateEnv(dataRoot), dataRoot, configBefore, instanceID)
+	})
+
+	t.Run("连接后初始化失败", func(t *testing.T) {
+		h := newHarness(t)
+		dataRoot := t.TempDir()
+		// 先把本用例的隔离 schema 建到当前版本（等价于运维已跑过 `db migrate`），再模拟
+		// "更新的库接给了旧二进制"：写入一条高于本二进制支持的版本记录。
+		// 版本号取自库内实测而不是写死——PG 谱系每升一版（US-16 起 v2）都写死会让本用例
+		// 与生产契约脱钩：写死 2 在 v2 库上直接撞主键，判的就不再是"未来版本"而是"重复行"。
+		h.ensureStore(t)
+		var current int
+		if err := h.openDB(t).QueryRow(`SELECT COALESCE(max(version), 0) FROM schema_version`).Scan(&current); err != nil {
+			t.Fatalf("读取当前 schema_version 失败: %v", err)
+		}
+		future := current + 1
+		if _, err := h.openDB(t).Exec(
+			`INSERT INTO schema_version (version, applied_at, description) VALUES ($1, 0, 'e2e future')`, future); err != nil {
+			t.Fatalf("写入高于本二进制的 schema_version 失败: %v", err)
+		}
+		configBefore, instanceID := us14dRunInterruptedFirstStart(t, h, dataRoot,
+			us14dPrivateEnv(dataRoot),
+			[]string{"打开 PostgreSQL", fmt.Sprintf("库版本 %d 高于二进制支持的 %d", future, current)})
+
+		// "恢复数据库" = 删掉那条越界版本记录（用户修好环境的等价动作），随后重试。
+		if _, err := h.openDB(t).Exec(`DELETE FROM schema_version WHERE version = $1`, future); err != nil {
+			t.Fatalf("恢复 schema_version 失败: %v", err)
+		}
+		us14dRetryFirstStart(t, h, us14dPrivateEnv(dataRoot), dataRoot, configBefore, instanceID)
+	})
 }
 
 // TestUS14D_FixtureEndToEnd（E4）判的是**装出来的那一份**：五只内置 Demo 由真实

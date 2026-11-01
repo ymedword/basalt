@@ -60,6 +60,11 @@ func TestBackfill_Web(t *testing.T) {
 	t.Run("listen_addr", testWebListenAddr)
 	t.Run("body_byte_limit", testWebBodyByteLimit)
 	t.Run("concurrency_cap", testWebConcurrencyCap)
+	// caller_concurrency_cap 是 US-16 新增的判据：调用方名额（图 6 [3]）在实例容量
+	// （[4]）之前，两条拒绝各持一个 429 码。它不给模块卡 §2.6.9 添行——本套件的
+	// 18 项历史人工项仍在，这一项判的是 US-16 冻结的新契约。
+	// caller_concurrency_cap is the US-16 addition: the caller slot gate keeps its own 429.
+	t.Run("caller_concurrency_cap", testWebCallerConcurrencyCap)
 	t.Run("session_409", testWebSessionConflict)
 	t.Run("archive_restart", testWebArchiveRestart)
 	t.Run("cross_origin", testWebCrossOrigin)
@@ -770,17 +775,62 @@ func testWebBodyByteLimit(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 2 {
 		t.Fatalf("越界消息不得产生运行：runs 应有 2 行，实际 %d 行", n)
 	}
 }
 
+// webConcurrencyCase 描述一次"第二个并发被 429 拒绝"的验收：拒绝点是哪一段闸门、
+// 期望的码与文案。
+// webConcurrencyCase pins which gate must refuse the second run and with which code.
+type webConcurrencyCase struct {
+	label   string
+	seed    func(t *testing.T, h *harness)
+	code    string
+	message string
+}
+
 // testWebConcurrencyCap：配置 1 时第二个并发运行得 429 并回显上限（§6.1 第 3 项）。
+//
+// 调用方名额（图 6 [3]）排在实例容量（[4]）之前，而内置调用方没有 `caller_limits`
+// 行时会回退到同一个实例上限：单调用方场景下 [3] 会先拒绝，本用例判的就不再是 [4]。
+// 夹具因此给内置调用方写一条**更宽**的名额（2），让实例上限成为唯一拒绝点；[3] 自己
+// 那条路径由紧随其后的 `caller_concurrency_cap` 判，两个码互不顶替。
 // testWebConcurrencyCap: with a cap of 1 the second concurrent run gets 429.
+// The caller slot gate precedes instance capacity, so the fixture widens the caller
+// limit to keep this case judging the instance gate.
 func testWebConcurrencyCap(t *testing.T) {
+	runWebConcurrencyScenario(t, webConcurrencyCase{
+		label:   "实例并发上限",
+		seed:    func(t *testing.T, h *harness) { seedCallerConcurrency(t, h, 2) },
+		code:    "TOO_MANY_RUNS",
+		message: "实例并发上限 1，请稍后重试",
+	})
+}
+
+// testWebCallerConcurrencyCap：调用方本来没有限额行 → 回退到实例上限 1，第二个并发
+// 由调用方名额 [3] 拒绝，码是 `CALLER_CONCURRENCY_LIMITED`（契约 §8：与实例级的
+// `TOO_MANY_RUNS` 分开，不得合并）。这条路径此前只到 500 INTERNAL——准入错误没有
+// 在运行入口被认领，判据当场把那个缺口判红。
+// testWebCallerConcurrencyCap: the caller slot gate keeps its own 429 code.
+func testWebCallerConcurrencyCap(t *testing.T) {
+	runWebConcurrencyScenario(t, webConcurrencyCase{
+		label:   "调用方并发上限",
+		seed:    func(t *testing.T, h *harness) {},
+		code:    "CALLER_CONCURRENCY_LIMITED",
+		message: "调用方并发运行名额已用尽，请等待运行结束后重试",
+	})
+}
+
+// runWebConcurrencyScenario 是两个并发 429 用例的共同体：占住唯一名额、发第二个
+// 请求、断言码与文案、放开第一个并确认它正常完成、确认拒绝没有留下运行行。
+// runWebConcurrencyScenario holds the shared body of the two concurrency refusals.
+func runWebConcurrencyScenario(t *testing.T, tc webConcurrencyCase) {
+	t.Helper()
 	h := newHarness(t)
 	initWorkspace(t, h)
+	tc.seed(t, h)
 	addr := freeLoopbackAddr(t)
 	model := newBarrierModel(t)
 	h.writeConfig(t, configWithAddr(model.URL(), addr)+"server:\n  max_concurrent_runs: 1\n")
@@ -800,25 +850,55 @@ func testWebConcurrencyCap(t *testing.T) {
 	model.waitCalls(t, 1, 30*time.Second)
 
 	second := webInvoke(t, addr, "ops-agent", "第二个并发")
-	requireWebStatus(t, second, http.StatusTooManyRequests, "TOO_MANY_RUNS",
-		"实例并发上限 1，请稍后重试", "第二并发")
+	if second.Status != http.StatusTooManyRequests {
+		// 429 是并发闸门的固定语义。拿不到时把服务端两路输出一起贴出来：500 既可能是
+		// 闸门判错，也可能是闸门之后的写入路径失败——只看信封分不出这两种。
+		// A non-429 dump includes both server streams; the envelope alone cannot tell
+		// a wrong gate from a failed write behind it.
+		t.Fatalf("%s：第二并发 HTTP = %d，期望 %d（信封 %s）\n%s",
+			tc.label, second.Status, http.StatusTooManyRequests, second.Raw, p.output())
+	}
+	requireWebStatus(t, second, http.StatusTooManyRequests, tc.code, tc.message, tc.label+"第二并发")
 	if second.HasData {
-		t.Fatalf("429 不应带 data：%s", second.Raw)
+		t.Fatalf("%s：429 不应带 data：%s", tc.label, second.Raw)
 	}
 
 	model.open()
-	resp := waitWebResult(t, first, 60*time.Second, "第一并发")
-	requireWebStatus(t, resp, http.StatusOK, "OK", "", "第一并发")
+	resp := waitWebResult(t, first, 60*time.Second, tc.label+"第一并发")
+	requireWebStatus(t, resp, http.StatusOK, "OK", "", tc.label+"第一并发")
 	var run webRun
-	decodeWebData(t, resp, &run, "第一并发")
+	decodeWebData(t, resp, &run, tc.label+"第一并发")
 	if run.Status != "completed" {
-		t.Fatalf("第一并发：status = %q，期望 completed", run.Status)
+		t.Fatalf("%s：第一并发 status = %q，期望 completed", tc.label, run.Status)
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 1 {
-		t.Fatalf("429 不得产生运行：runs 应有 1 行，实际 %d 行", n)
+		t.Fatalf("%s：429 不得产生运行：runs 应有 1 行，实际 %d 行", tc.label, n)
+	}
+}
+
+// seedCallerConcurrency 给内置调用方写一条并发名额：调用方闸门（图 6 [3]）的限额来源
+// 是 `caller_limits.max_concurrent`，没有行时装配层回退到实例上限——要让某个用例判
+// 实例容量（[4]）而不是调用方名额，就把 [3] 放宽到高于实例上限。
+//
+// 走 `db migrate` 建库（同 `ensureStore`）后再写行：`caller_limits.caller_id` 指向
+// `callers`，内置行由迁移补建，写行必须排在它之后。`qps` / `burst` / 周期列写 0
+// （= 不限），三档判据互不干扰。
+// seedCallerConcurrency widens the built-in caller's slot limit so a case can judge
+// instance capacity instead; zero keeps the other limit dimensions unlimited.
+func seedCallerConcurrency(t *testing.T, h *harness, maxConcurrent int) {
+	t.Helper()
+	h.ensureStore(t)
+	if _, err := h.openDB(t).Exec(
+		`INSERT INTO caller_limits
+		   (caller_id, qps, burst, max_concurrent, tasks_per_period, tokens_per_period,
+		    ingest_bytes_per_period, period, timezone, updated_at)
+		 VALUES ('local-admin', 0, 0, $1, 0, 0, 0, 'day', 'UTC', $2)
+		 ON CONFLICT (caller_id) DO UPDATE SET max_concurrent = EXCLUDED.max_concurrent`,
+		maxConcurrent, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("写内置调用方并发名额（%d）失败: %v", maxConcurrent, err)
 	}
 }
 
@@ -862,7 +942,7 @@ func testWebSessionConflict(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 1 {
 		t.Fatalf("409 不得产生运行：runs 应有 1 行，实际 %d 行", n)
 	}
@@ -913,8 +993,8 @@ func testWebArchiveRestart(t *testing.T) {
 
 	p2.stop(t)
 
-	db := openDB(t, h.dbPath())
-	rows := queryRows(t, db, `SELECT status, archived_at FROM sessions WHERE session_id = ?`, sess.SessionID)
+	db := h.openDB(t)
+	rows := queryRows(t, db, `SELECT status, archived_at FROM sessions WHERE session_id = $1`, sess.SessionID)
 	if len(rows) != 1 {
 		t.Fatalf("sessions 应有 1 行，实际 %d 行", len(rows))
 	}
@@ -988,7 +1068,7 @@ func testWebCrossOrigin(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 1 {
 		t.Fatalf("被拒的跨源写不得产生运行：runs 应有 1 行，实际 %d 行", n)
 	}
@@ -1047,7 +1127,7 @@ func testWebArchiveInflight(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 1 {
 		t.Fatalf("被拒的归档与追加都不得产生运行：runs 应有 1 行，实际 %d 行", n)
 	}
@@ -1131,8 +1211,8 @@ func testWebRedaction(t *testing.T) {
 	}
 	requireContains(t, out, "客户端已断开，未写响应", "客户端断开日志")
 
-	db := openDB(t, h.dbPath())
-	rows := queryRows(t, db, `SELECT status, reason FROM runs WHERE run_id = ?`, run.RunID)
+	db := h.openDB(t)
+	rows := queryRows(t, db, `SELECT status, reason FROM runs WHERE run_id = $1`, run.RunID)
 	if len(rows) != 1 {
 		t.Fatalf("失败运行应有 1 行 runs，实际 %d 行", len(rows))
 	}
@@ -1146,7 +1226,7 @@ func testWebRedaction(t *testing.T) {
 	// 设计口径（service.go:226）：落库失败不覆盖结果，行留 running 等下次启动的
 	// 崩溃恢复扫描收尾。两种落库时序都合法，但**不得**停在 running。
 	cancelledRows := queryRows(t, db,
-		`SELECT session_id, status FROM runs WHERE run_id <> ?`, run.RunID)
+		`SELECT session_id, status FROM runs WHERE run_id <> $1`, run.RunID)
 	if len(cancelledRows) != 1 {
 		t.Fatalf("取消运行应有 1 行 runs，实际 %d 行", len(cancelledRows))
 	}
@@ -1168,7 +1248,7 @@ func testWebRedaction(t *testing.T) {
 	waitHealthHTTP(t, p2, restartAddr, 30*time.Second)
 	p2.stop(t)
 
-	closed := queryRows(t, db, `SELECT status, finished_at FROM runs WHERE run_id <> ?`, run.RunID)
+	closed := queryRows(t, db, `SELECT status, finished_at FROM runs WHERE run_id <> $1`, run.RunID)
 	if len(closed) != 1 {
 		t.Fatalf("重启后取消运行应有 1 行 runs，实际 %d 行", len(closed))
 	}
@@ -1252,7 +1332,7 @@ func testWebReleaseOrder(t *testing.T) {
 	waitHealthHTTP(t, p3, thirdAddr, 30*time.Second)
 	p3.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status FROM runs`)
 	if len(rows) != 1 || rows[0]["status"] != "completed" {
 		t.Fatalf("在途运行应恰有一行 completed，实际 %v", rows)
@@ -1447,8 +1527,12 @@ func testWebBudgetLimit(t *testing.T) {
 
 	p2.stop(t)
 
-	db := openDB(t, h.dbPath())
-	rows := queryRows(t, db, `SELECT status, reason, iterations, tool_calls FROM runs ORDER BY rowid`)
+	db := h.openDB(t)
+	// 插入序按 `started_at`（毫秒）：PostgreSQL 的 `runs` 主键是 `run_id text`，没有
+	// SQLite 的 `rowid` 别名。两次运行是串行的，时间戳必然不同；`run_id` 只作同毫秒
+	// 的确定性兜底，不参与判据。
+	// Ordering uses started_at because the PG runs table has no rowid alias.
+	rows := queryRows(t, db, `SELECT status, reason, iterations, tool_calls FROM runs ORDER BY started_at, run_id`)
 	if len(rows) != 2 {
 		t.Fatalf("runs 应有 2 行，实际 %d 行：%v", len(rows), rows)
 	}
@@ -1593,7 +1677,7 @@ func testWebConcurrentConflict(t *testing.T) {
 	}
 
 	p.stop(t)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM runs`); n != 1 {
 		t.Fatalf("两次并发应只有一次运行入库，实际 %d 行", n)
 	}
@@ -1638,7 +1722,7 @@ func testWebStatelessInvoke(t *testing.T) {
 
 	p.stop(t)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM sessions`); n != 1 {
 		t.Fatalf("invoke 不得建会话：sessions 应有 1 行，实际 %d 行", n)
 	}

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 import (
@@ -17,7 +19,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -198,6 +201,7 @@ func TestNewRuntime_ServiceHasSessionGate(t *testing.T) {
 	require.NoError(t, rt.sessions.ArchiveSession(context.Background(), sessionID, now))
 
 	_, err := rt.service.Run(context.Background(), core.RunRequest{
+		Principal: core.LocalAdminPrincipal(),
 		Agent:     "reader",
 		SessionID: sessionID,
 		Message:   "归档后不应再运行",
@@ -219,15 +223,14 @@ func TestNewRuntime_ServiceHasSessionGate(t *testing.T) {
 // 之前 → ② 红；`lock.Release()` 提前到 MCP 关闭之前 → ③ 红。
 func TestHeavyRuntime_CloseStopsSchedulerFirst(t *testing.T) {
 	f := newWireFixture(t)
-	db, err := storage.OpenWritable(context.Background(), f.dbPath(), storage.SupportedSchemaVersion)
+	db, err := postgres.Open(context.Background(), postgres.Config{DSN: f.dsn})
 	require.NoError(t, err)
-	require.NoError(t, db.Migrate(context.Background(), storage.SupportedSchemaVersion))
 	t.Cleanup(func() { require.NoError(t, db.Close(), "重复关闭是幂等的") })
 
 	lock, err := workspace.AcquireInstanceLock(f.root)
 	require.NoError(t, err)
 
-	store := storage.NewTaskStore(db)
+	store := postgres.NewTaskStore(db)
 	engine := &orderProbeEngine{}
 	sched := core.NewScheduler(core.SchedulerOptions{
 		Store:      store,
@@ -409,14 +412,10 @@ func demoEntry(taskID string) core.AgentEntry {
 
 // openScheduleDB 打开一份临时库并显式迁移（与重路径同一开库口径，但不取实例锁）。
 // openScheduleDB opens a temporary database and migrates it explicitly.
-func openScheduleDB(t *testing.T) *storage.DB {
+func openScheduleDB(t *testing.T) *postgres.DB {
 	t.Helper()
 
-	db, err := storage.OpenWritable(context.Background(), filepath.Join(t.TempDir(), "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	require.NoError(t, db.Migrate(context.Background(), storage.SupportedSchemaVersion))
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	return db
+	return pgtest.NewTestDB(t)
 }
 
 // newScheduleTestScheduler 用真实仓储 + 真实 cron 引擎 + fake invoker 构造被测调度器。
@@ -427,13 +426,13 @@ func openScheduleDB(t *testing.T) *storage.DB {
 func newScheduleTestScheduler(t *testing.T, cfg *cli.Config, entries []core.AgentEntry) (*core.Scheduler, *scheduleTestInvoker, core.TaskStore) {
 	t.Helper()
 
-	store := storage.NewTaskStore(openScheduleDB(t))
+	store := postgres.NewTaskStore(openScheduleDB(t))
 	invoker := &scheduleTestInvoker{}
 	a := &App{
 		logger: slog.Default(),
 		now:    func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
 	}
-	sched := a.newScheduler(store, invoker, entries, nil, nil, cfg, slog.Default())
+	sched := a.newScheduler(store, invoker, entries, nil, nil, cfg, slog.Default(), nil, &postureBox{})
 	return sched, invoker, store
 }
 
@@ -535,7 +534,7 @@ func TestScheduleEditorAdapter_MapsRejectionToInvalidInput(t *testing.T) {
 func TestScheduleEditorAdapter_ReconcilesAfterWrite(t *testing.T) {
 	root := t.TempDir()
 	writeAgentFixture(t, root, "demo")
-	store := storage.NewTaskStore(openScheduleDB(t))
+	store := postgres.NewTaskStore(openScheduleDB(t))
 	adapter := newAdapterFixture(t, root, []core.AgentEntry{demoEntry("demo-1")}, store, true)
 
 	after, err := adapter.ApplySchedule(context.Background(), "demo", core.ScheduleSet,
@@ -686,10 +685,13 @@ func TestScheduleEditorAdapter_ConcurrentWithProfilesRead(t *testing.T) {
 func TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite(t *testing.T) {
 	root := t.TempDir()
 	before := writeAgentFixture(t, root, "demo")
-	store := storage.NewTaskStore(openScheduleDB(t))
+	store := postgres.NewTaskStore(openScheduleDB(t))
 	now := time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC)
 	require.NoError(t, store.ApplyAgentTasks(context.Background(), "other", []core.TaskRecord{{
 		TaskID: "shared", Cron: "*/5 * * * * *", Zone: "UTC", Message: "他家的任务",
+		// 归属三列（caller_id / authorizing_kind）为 NOT NULL + CHECK：与生产
+		// commitAgentLocked 同形态，按内置管理员建行。
+		CallerID: core.LocalAdminCallerID, AuthorizingKind: core.AuthorizingKindAdminBuiltin,
 	}}, nil, now))
 	adapter := newAdapterFixture(t, root, []core.AgentEntry{registeredEntry("demo")}, store, false)
 
@@ -711,7 +713,7 @@ func TestScheduleEditorAdapter_CrossOwnerConflict_NoWrite(t *testing.T) {
 // 逆改点：把退休实现成物理删除 → 行数断言红；退休翻转 enabled → 断言红。
 func TestAgentArchive_SchedulesRetiredNotDeleted(t *testing.T) {
 	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")},
-		storage.NewTaskStore(openScheduleDB(t)))
+		postgres.NewTaskStore(openScheduleDB(t)))
 
 	before := f.rowsFor(t, "demo")
 	require.Len(t, before, 1)
@@ -744,7 +746,7 @@ func TestAgentArchive_SchedulesRetiredNotDeleted(t *testing.T) {
 // IsInvalidInput 断言红。
 func TestAgentArchive_RollbackRestoresRetirement(t *testing.T) {
 	entries := []core.AgentEntry{demoEntry("demo-1"), registeredEntry("other")}
-	f := newArchiveScheduleFixture(t, entries, storage.NewTaskStore(openScheduleDB(t)))
+	f := newArchiveScheduleFixture(t, entries, postgres.NewTaskStore(openScheduleDB(t)))
 	schedules := entries[0].Profile.Schedules
 
 	require.NoError(t, f.adapter.SetRegistered("demo", false))
@@ -775,7 +777,7 @@ func TestAgentArchive_RollbackRestoresRetirement(t *testing.T) {
 // 逆改点：注销后再次登记 / 空定义对账清掉 retired_at → 断言红。
 func TestAgentRestore_DoesNotAutoEnableSchedules(t *testing.T) {
 	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")},
-		storage.NewTaskStore(openScheduleDB(t)))
+		postgres.NewTaskStore(openScheduleDB(t)))
 
 	require.NoError(t, f.adapter.SetRegistered("demo", false))
 	require.NoError(t, f.adapter.ReconcileAgent(context.Background(), "demo", nil))
@@ -842,7 +844,7 @@ func (s *gatedTaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, erro
 // 成功。反向：写入线程先落盘再等注销 → 文件断言红。
 // 逆改点：调度器委托移到锁外（旧实现）→ 写入在注销期间完成并改写文件，断言红。
 func TestAgentArchive_UnregisterSerializedWithScheduleWrite(t *testing.T) {
-	gated := newGatedTaskStore(storage.NewTaskStore(openScheduleDB(t)))
+	gated := newGatedTaskStore(postgres.NewTaskStore(openScheduleDB(t)))
 	f := newArchiveScheduleFixture(t, []core.AgentEntry{demoEntry("demo-1")}, gated)
 	before := readAgentFixture(t, f.root, "demo")
 
@@ -994,5 +996,42 @@ func newAdapterFixture(t *testing.T, root string, entries []core.AgentEntry, sto
 func openAdapterStore(t *testing.T) core.TaskStore {
 	t.Helper()
 
-	return storage.NewTaskStore(openScheduleDB(t))
+	return postgres.NewTaskStore(openScheduleDB(t))
+}
+
+// 本用例原在 registry_test.go（同步面）；它需要真实的 PostgreSQL 任务表（`newAdapterFixture`
+// 与 `openAdapterStore` 都在本文件），因此随测试拓扑迁移搬到集成文件——判据与逆改点不变。
+// Moved here from registry_test.go during the test-topology migration: the adapter needs a
+// real PostgreSQL task store, so the case belongs with the other adapter cases.
+// TestRegistrySync_AdapterKeepsClaimBaseline 覆盖约束 39 的装配面：热加载联动经
+// scheduleEditorAdapter 时，移出的 Agent 同时离开私有 claim 基线（否则它的旧任务
+// 会让 manage_schedule 误判跨 Agent 冲突）；加入只放开准入，claim 由随后的
+// ReconcileAgent 写入。
+// 逆改点：SetRegistered 不删 claims → 移出后基线仍在，断言红。
+func TestRegistrySync_AdapterKeepsClaimBaseline(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	entries := []core.AgentEntry{{
+		Name:       "demo",
+		Registered: true,
+		Profile: &core.Profile{Schedules: []core.Schedule{
+			{ID: "demo-1", Cron: "0 0 8 * * *", Zone: "UTC", Message: "每日巡检"},
+		}},
+	}}
+	adapter := newAdapterFixture(t, root, entries, openAdapterStore(t), false)
+
+	require.Len(t, adapter.claims["demo"], 1, "构造期从 entries 拷出基线")
+
+	next := []core.Schedule{{ID: "demo-2", Cron: "0 0 9 * * *", Zone: "UTC", Message: "早报"}}
+	require.NoError(t, adapter.ReconcileAgent(ctx, "demo", next))
+	require.Len(t, adapter.claims["demo"], 1)
+	require.Equal(t, "demo-2", adapter.claims["demo"][0].ID, "文件事实先行：基线先于调度器刷新")
+
+	require.NoError(t, adapter.SetRegistered("demo", false))
+	_, ok := adapter.claims["demo"]
+	require.False(t, ok, "移出的 Agent 必须离开 claim 基线")
+
+	require.NoError(t, adapter.SetRegistered("demo", true))
+	_, ok = adapter.claims["demo"]
+	require.False(t, ok, "加入只放开准入，claim 由 ReconcileAgent 写入")
 }

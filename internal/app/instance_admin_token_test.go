@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是管理面访问密码三来源的判卷（14D T093；模块卡验收 F2 / F5–F9）。
@@ -34,7 +36,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/web"
 )
 
@@ -332,7 +334,7 @@ func TestInstanceSecrets_AdminTokenSeparateFile(t *testing.T) {
 	require.NotContains(t, keyPath, env.root, "私有目录必须在工作区之外")
 	require.True(t, strings.HasPrefix(keyPath, dataRoot), "私有目录必须在用户数据根之下")
 
-	store := storage.NewInstanceSecretsStore(env.db)
+	store := postgres.NewInstanceSecretsStore(env.db)
 	newService := func() *InstanceSecretsService {
 		service, err := NewInstanceSecretsService(InstanceSecretsDeps{
 			Store:         store,

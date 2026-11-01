@@ -4,7 +4,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"io"
 	"log/slog"
 	"os"
@@ -20,7 +19,8 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 )
 
 // 本文件是 US-2 验收 Demo 的可判面（颗粒度文档 §4.1 集成层）：
@@ -80,12 +80,10 @@ func TestProviderService_RealCallWritesAudit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), realCallTimeout)
 	defer cancel()
 
-	path := filepath.Join(t.TempDir(), "basalt.db")
-	db, err := storage.OpenWritable(ctx, path, storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	fx := pgtest.NewFixture(t)
+	db := fx.DB
 
-	svc, err := newProviderService(cfg, storage.NewLLMCallRepo(db),
+	svc, err := newProviderService(cfg, postgres.NewLLMCallRepo(db),
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 
@@ -100,9 +98,7 @@ func TestProviderService_RealCallWritesAudit(t *testing.T) {
 	})
 	require.NoError(t, err, "真实调用必须成功（失败时先看库中审计行的 error_kind 与 error_message）")
 
-	read, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, read.Close()) })
+	read := openRead(t, fx.DSN)
 
 	var (
 		status, provider, model, errorKind string
@@ -141,10 +137,8 @@ func TestProviderService_UnreachableEndpointRecordsFailedAudit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), realCallTimeout)
 	defer cancel()
 
-	path := filepath.Join(t.TempDir(), "basalt.db")
-	db, err := storage.OpenWritable(ctx, path, storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	fx := pgtest.NewFixture(t)
+	db := fx.DB
 
 	// 直接构造配置（不经装载层）：本用例判的是调用与审计路径，凭证值在这里无意义
 	// （端点不可达，请求发不出去）。
@@ -155,7 +149,7 @@ func TestProviderService_UnreachableEndpointRecordsFailedAudit(t *testing.T) {
 		DefaultModel: "unreachable-model",
 	}}}
 
-	svc, err := newProviderService(cfg, storage.NewLLMCallRepo(db),
+	svc, err := newProviderService(cfg, postgres.NewLLMCallRepo(db),
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 
@@ -168,9 +162,7 @@ func TestProviderService_UnreachableEndpointRecordsFailedAudit(t *testing.T) {
 	require.Error(t, err, "不可达端点必须报错（一次调用、不重试）")
 	require.NotContains(t, err.Error(), unreachable, "错误文案不得携带请求 URL")
 
-	read, err := sql.Open("sqlite", filepath.ToSlash(path))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, read.Close()) })
+	read := openRead(t, fx.DSN)
 
 	var errorKind, errorMessage string
 	require.NoError(t, read.QueryRowContext(ctx,

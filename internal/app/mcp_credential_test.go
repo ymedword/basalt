@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 14D「MCP 逐槽位凭据」B1–B8 的判卷（设计 §2.3.2 / §3.2；颗粒度文档 §4.5.4）：
@@ -19,7 +21,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -36,7 +37,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/testutil"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -93,14 +94,14 @@ func mcpEnvSource(slot string) MCPCredentialRequest {
 func mcpPlaceholder(variable string) string { return "${" + variable + "}" }
 
 // mcpCredentialEnv 在资源夹具之上补出凭据写面与两个仓储句柄：B3 / B7 需要在真实的
-// 操作台账上撤销槽位、需要直读身份与版本行。仓储句柄与夹具共用同一个 `*storage.DB`。
+// 操作台账上撤销槽位、需要直读身份与版本行。仓储句柄与夹具共用同一个 `*postgres.DB`。
 // mcpCredentialEnv adds the credential write surface and direct store handles on top of
 // the resource fixture; every handle shares the fixture's single database.
 type mcpCredentialEnv struct {
 	*resourceEnv
 	revoker *CredentialOps
-	creds   *storage.CredentialStore
-	sources *storage.MCPCredentialSourceStore
+	creds   *postgres.CredentialStore
+	sources *postgres.MCPCredentialSourceStore
 }
 
 // newMCPCredentialEnv 装配夹具；撤销写面按 wire 的口径绑定真仓储与基线时钟。
@@ -110,12 +111,12 @@ type mcpCredentialEnv struct {
 func newMCPCredentialEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *mcpCredentialEnv {
 	t.Helper()
 	base := newResourceEnv(t, mutate...)
-	creds := storage.NewCredentialStore(base.db)
+	creds := postgres.NewCredentialStore(base.db)
 	revoker, err := NewCredentialOps(CredentialOpsDeps{
 		Operations:    base.ops,
 		Credentials:   creds,
 		Resources:     base.store,
-		Notify:        storage.NewNotifyAdminStore(base.db),
+		Notify:        postgres.NewNotifyAdminStore(base.db),
 		MasterKeyFile: base.masterKeyFile,
 		WorkspaceRoot: base.root,
 		Logger:        base.logger,
@@ -126,7 +127,7 @@ func newMCPCredentialEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *mcpC
 		resourceEnv: base,
 		revoker:     revoker,
 		creds:       creds,
-		sources:     storage.NewMCPCredentialSourceStore(base.db),
+		sources:     postgres.NewMCPCredentialSourceStore(base.db),
 	}
 }
 
@@ -741,11 +742,8 @@ func TestMCPCredential_SourceExplicit(t *testing.T) {
 		identity := env.identity(t, name, mcpCredAlphaEnv)
 
 		// 直接改坏密文（模拟磁盘损坏 / 跨主密钥的残留版本）：GCM 打开必然失败。
-		db, err := sql.Open("sqlite", filepath.ToSlash(env.dbPath))
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, db.Close()) })
-		_, err = db.ExecContext(context.Background(),
-			`UPDATE credential_versions SET ciphertext = ? WHERE credential_id = ? AND version_no = 1`,
+		_, err = env.db.ExecContext(context.Background(),
+			`UPDATE credential_versions SET ciphertext = $1 WHERE credential_id = $2 AND version_no = 1`,
 			[]byte("not-a-valid-ciphertext"), identity.ID)
 		require.NoError(t, err)
 
@@ -783,6 +781,60 @@ func TestMCPCredential_SourceExplicit(t *testing.T) {
 		require.Nil(t, values)
 		require.Contains(t, resolveErr.Error(), mcpCredAlphaEnv)
 	})
+}
+
+// TestMCP_BackfillNeverCopiesEnvValue —— 设计 §2.16.1 ③：补记只记录 `mode=env` 与槽位名，
+// **不得**读取、写入或记录进程环境变量的值。用例在进程环境里放一个明文哨兵，把存量
+// 条目还原成"文件声明了槽位、库里没有来源行"（14D 之前的状态），再跑一次真实补记，
+// 然后逐面核对：来源行、托管凭据表、已发布定义、操作日志都不出现哨兵值。
+// 逆改点：补记顺手把 `${VAR}` 解析成值写进 credentials / 定义 / 日志 → 对应断言红。
+// TestMCP_BackfillNeverCopiesEnvValue proves the backfill records the slot name only.
+func TestMCP_BackfillNeverCopiesEnvValue(t *testing.T) {
+	const sentinel = "backfill-sentinel-value-4f5g"
+	const name = "backfill-sentinel"
+	env := newMCPCredentialEnv(t)
+	ctx := context.Background()
+	t.Setenv(mcpCredAlphaEnv, sentinel)
+
+	_, err := env.admin.UpsertMCPServer(ctx, resourceActor(), MCPServerRequest{
+		Name:        name,
+		Transport:   "stdio",
+		Command:     "allowed-mcp",
+		Env:         map[string]string{mcpCredAlphaEnv: mcpPlaceholder(mcpCredAlphaEnv)},
+		Credentials: []MCPCredentialRequest{mcpEnvSource(mcpCredAlphaEnv)},
+		Create:      true,
+	})
+	require.NoError(t, err)
+	uid := env.uid(t, name)
+
+	// 还原存量状态：来源行不存在（迁移 / 升级前就是如此），补记必须重建它。
+	_, err = env.db.ExecContext(ctx,
+		`DELETE FROM mcp_credential_sources WHERE server_uid = $1`, string(uid))
+	require.NoError(t, err)
+
+	report, err := env.mcpCredentials.BackfillEnvSources(ctx, name, uid,
+		env.publishedConfig(t, name), "system.backfill", baselineClock())
+	require.NoError(t, err)
+	require.Equal(t, []string{mcpCredAlphaEnv}, report.Filled)
+
+	rows, err := env.sources.List(ctx, uid)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, core.CredentialModeEnv, rows[0].Mode)
+	require.Equal(t, "system.backfill", rows[0].OperationID)
+	require.NotContains(t, rows[0].BindingKey, sentinel, "槽位名是变量名，不是变量的值")
+
+	require.True(t, env.credentialRowHasNoIdentity(t, name, mcpCredAlphaEnv),
+		"补记不建托管身份，值不落库")
+
+	pointer := env.pointerOf(core.ResourceMCPServer, name)
+	version, err := env.store.VersionByID(ctx, pointer.PublishedVersionID)
+	require.NoError(t, err)
+	require.NotContains(t, version.DefinitionYAML, sentinel, "补记不得改写已发布定义")
+	require.Contains(t, version.DefinitionYAML, mcpPlaceholder(mcpCredAlphaEnv),
+		"定义里保留的是占位符，不是解析后的值")
+
+	require.NotContains(t, env.logs.String(), sentinel, "补记日志只记槽位名，不含值")
 }
 
 // mcpCredentialHTTPServer 起一个真实的 streamable HTTP MCP server，并把每个请求的请求头
@@ -909,4 +961,56 @@ func TestMCPCredential_BearerAssembly(t *testing.T) {
 	require.NotEmpty(t, env.logs.String(), "连接失败必须留一条 WARN")
 	require.NotContains(t, env.logs.String(), mcpCredHeaderToken)
 	require.NotContains(t, env.logs.String(), mcpCredNestedBearer)
+}
+
+// TestMCP_BackfillRestartHasNoSecondRow 守颗粒度文档 §4.3 `TestMCP_BackfillRestartHasNoSecondRow`：
+// 迁移 / 升级前存量的 MCP 条目没有来源行；启动期补记第一次写 `mode=env` 的一行，**重启
+// 再补记不得写第二行、不得推高修订号**。判据打在 `publishedMCPServers`——真正的启动装配
+// 入口，而不是只测仓储的 upsert。
+//
+// 逆改点：补记改成 `INSERT` 不做存在性判断（或把 skipped 也重写一遍）→ 第二次启动后
+// `List` 出两行 / 修订号变 2，断言红。
+func TestMCP_BackfillRestartHasNoSecondRow(t *testing.T) {
+	const name = "backfill-restart"
+	const varName = "MCP_RESTART_ENV_TOKEN"
+	env := newMCPCredentialEnv(t)
+	ctx := context.Background()
+	t.Setenv(varName, "restart-sentinel-value-not-a-secret")
+
+	_, err := env.admin.UpsertMCPServer(ctx, resourceActor(), MCPServerRequest{
+		Name:        name,
+		Transport:   "stdio",
+		Command:     "allowed-mcp",
+		Env:         map[string]string{varName: mcpPlaceholder(varName)},
+		Credentials: []MCPCredentialRequest{mcpEnvSource(varName)},
+		Create:      true,
+	})
+	require.NoError(t, err)
+	uid := env.uid(t, name)
+
+	// 还原成迁移 / 升级前的状态：定义声明了槽位，库里没有来源行。
+	_, err = env.db.ExecContext(ctx,
+		`DELETE FROM mcp_credential_sources WHERE server_uid = $1`, string(uid))
+	require.NoError(t, err)
+
+	var firstOperation string
+	for attempt := 1; attempt <= 2; attempt++ {
+		_, err := publishedMCPServers(ctx, env.store, []string{name}, env.mcpCredentials,
+			baselineClock, env.logger)
+		require.NoError(t, err, "第 %d 次启动装配必须成功", attempt)
+
+		rows, err := env.sources.List(ctx, uid)
+		require.NoError(t, err)
+		require.Len(t, rows, 1, "第 %d 次启动后仍只允许一行来源", attempt)
+		require.Equal(t, core.CredentialModeEnv, rows[0].Mode)
+		require.Equal(t, 1, rows[0].Revision, "重启补记不得推高修订号")
+		if attempt == 1 {
+			firstOperation = rows[0].OperationID
+			continue
+		}
+		require.Equal(t, firstOperation, rows[0].OperationID,
+			"第二次启动不得重写来源行——操作号变了就说明又写了一次")
+	}
+	require.NotContains(t, env.logs.String(), "restart-sentinel-value-not-a-secret",
+		"补记日志不得带凭据值")
 }

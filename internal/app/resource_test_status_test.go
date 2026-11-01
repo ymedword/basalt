@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是「最后一次连接测试」投影与「本地就绪」两个读数的判卷（US-12 R7 范围修订，
@@ -18,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/testutil"
 	"github.com/ymedword/basalt/internal/web"
 )
@@ -193,7 +195,7 @@ func TestResourceViews_AvailabilityIsLocalReadinessOnly(t *testing.T) {
 
 	newViews := func(lookup func(string) (string, bool), tests core.ResourceConnectionTestStore) web.ResourceReader {
 		return NewResourceViews(env.versions, env.lifecycle, env.mcp,
-			storage.NewCredentialStore(env.db), ResourceViewDeps{
+			postgres.NewCredentialStore(env.db), ResourceViewDeps{
 				ConnectionTests: tests,
 				LookupEnv:       lookup,
 			})
@@ -257,12 +259,12 @@ func TestNotifyChannelRead_AvailabilityAndLastTest(t *testing.T) {
 	// 创建可省略地址 = 渠道暂不可发送（empty URL 行）。
 	blankUID, err := core.NewResourceUID()
 	require.NoError(t, err)
-	require.NoError(t, storage.NewNotifyAdminStore(env.db).Create(ctx, core.NotifyChannel{
+	require.NoError(t, postgres.NewNotifyAdminStore(env.db).Create(ctx, core.NotifyChannel{
 		ResourceUID: blankUID, Name: "blank", Type: "webhook", OperationID: env.opID,
 	}))
 
 	recorder := &recordingTestStore{}
-	read := newNotifyChannelReadPort(storage.NewNotifyChannelRepo(env.db), env.credentials,
+	read := newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(env.db), env.credentials,
 		env.versions, notifyReadDeps{
 			ConnectionTests: recorder,
 			LookupEnv: func(name string) (string, bool) {
@@ -301,7 +303,7 @@ func TestNotifyChannelRead_AvailabilityAndLastTest(t *testing.T) {
 	require.Equal(t, baselineClock().UTC(), channel.LastTest.TestedAt)
 
 	// 环境变量缺失：本地配置不可用，但实测记录仍在（两条事实分开显示）。
-	missing := newNotifyChannelReadPort(storage.NewNotifyChannelRepo(env.db), env.credentials,
+	missing := newNotifyChannelReadPort(postgres.NewNotifyChannelRepo(env.db), env.credentials,
 		env.versions, notifyReadDeps{
 			ConnectionTests: recorder,
 			LookupEnv:       func(string) (string, bool) { return "", false },

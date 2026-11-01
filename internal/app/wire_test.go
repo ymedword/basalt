@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 import (
@@ -21,7 +23,9 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/memory"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -46,9 +50,15 @@ import (
 type wireFixture struct {
 	workDir string
 	root    string
-	cfg     *cli.Config
-	logs    *bytes.Buffer
-	logger  *slog.Logger
+
+	// dsn 是夹具独占的隔离 schema 连接串（含测试库口令，**只**经内存传递）：
+	// 实例配置与判卷只读句柄都指向它，用例之间互不可见。
+	// dsn points at the fixture's own isolated schema; it never touches a file.
+	dsn string
+
+	cfg    *cli.Config
+	logs   *bytes.Buffer
+	logger *slog.Logger
 
 	// agents 按写入次序记下夹具落过 AGENT.md 的名字：装配之后要经真实迁移入口把它们
 	// 从基线态启用（见 `enableAgents`）。
@@ -80,10 +90,16 @@ func newWireFixture(t *testing.T) *wireFixture {
 	unlockTreeOnCleanup(t, workDir)
 
 	logs := &bytes.Buffer{}
+	// 隔离 schema 只建**空库**（不迁移）：重路径自己完成建表，"轻路径不建库"仍有可判
+	// 读数——判的是隔离 schema 里有没有运行期表，而不是 SQLite 时代的"库文件从未出现"。
+	// The isolated schema starts empty; migration is the heavy path's own step.
+	dsn := pgtest.NewTestSchema(t)
 	f := &wireFixture{
 		workDir: workDir,
 		root:    root,
+		dsn:     dsn,
 		cfg: &cli.Config{
+			Database: cli.DatabaseConfig{DSN: dsn},
 			Providers: []cli.ProviderConfig{{
 				Name:         "probe",
 				BaseURL:      "http://127.0.0.1:1",
@@ -109,9 +125,15 @@ func newWireFixture(t *testing.T) *wireFixture {
 	return f
 }
 
-// dbPath 返回夹具工作区里的库文件路径（判"库已建 / 库未建"共用同一处）。
-func (f *wireFixture) dbPath() string {
-	return filepath.Join(f.root, databaseFileName)
+// migrated 判隔离 schema 里有没有运行期表：SQLite 时代的"库文件在 / 不在"读数，在
+// PostgreSQL 下对应"重路径建过 / 没建过表"。
+// migrated reports whether the isolated schema holds runtime tables yet.
+func (f *wireFixture) migrated(t *testing.T) bool {
+	t.Helper()
+	read := openRead(t, f.dsn)
+	tables, err := read.TableNames(context.Background())
+	require.NoError(t, err)
+	return len(tables) > 0
 }
 
 // providerUID 给出夹具配置里某个 Provider 名的**确定性**资源身份（`fixtureResourceUIDFor`，
@@ -150,12 +172,12 @@ func (f *wireFixture) seedPublishedProviders(t *testing.T) {
 	require.NoError(t, err, "种子版取的是配置里每个 provider 块的原文")
 	require.Len(t, definitions, len(expected), "配置条目与磁盘块必须逐条对上")
 
-	db, err := storage.OpenWritable(ctx, f.dbPath(), storage.SupportedSchemaVersion)
+	db, err := postgres.Open(ctx, postgres.Config{DSN: f.dsn})
 	require.NoError(t, err, "种子版必须能写模式打开库（缺库时由本步建出）")
 	defer func() { require.NoError(t, db.Close()) }()
 
-	versions := storage.NewResourceStore(db)
-	operations := storage.NewManagementStore(db)
+	versions := postgres.NewResourceStore(db)
+	operations := postgres.NewManagementStore(db)
 	for _, definition := range definitions {
 		if _, err := versions.Pointer(ctx, core.ResourceModelConnection, definition.Name); err == nil {
 			continue
@@ -324,7 +346,7 @@ func activateAgent(ctx context.Context, store *workspace.LifecycleStore, name st
 func (f *wireFixture) app() *App {
 	return &App{
 		workDir:          f.workDir,
-		supportedVersion: storage.SupportedSchemaVersion,
+		supportedVersion: postgres.SupportedSchemaVersion,
 		logger:           f.logger,
 		cfg:              f.cfg,
 		providerOverride: f.override,
@@ -369,20 +391,45 @@ func findStep(t *testing.T, logs, step string) map[string]any {
 	return nil
 }
 
-// openRead 开一条只读判卷连接（裸 sql.Open，与既有先例同一手法）。
-// openRead opens a read-only connection for the verdict queries.
-func openRead(t *testing.T, path string) *sql.DB {
+// dbQueryer 是判卷读面：`*postgres.DB` 与 `*sql.DB` 都满足（前者用于 PostgreSQL 夹具，
+// 后者留给 SQLite 谱系的迁移用例）。
+// dbQueryer is the verdict read face; both handle kinds satisfy it.
+type dbQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// openRead 开一条只读判卷句柄（同一隔离 schema；服务端钉死只读事务）。
+// openRead opens a read-only verdict handle on the same isolated schema.
+func openRead(t *testing.T, dsn string) *postgres.DB {
 	t.Helper()
 
-	db, err := sql.Open("sqlite", filepath.ToSlash(path))
+	db, err := postgres.OpenReadOnly(context.Background(), postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return db
 }
 
+// seedCallerLimit 给手工插入的调用方补上周期额度行。图 6 [5] 的账本在
+// `caller_limits` 缺行时按设计 fail-closed（`quotaStore.reservationPeriod`：缺行即
+// `ErrQuotaExhausted`，**不得**退化成不限量）；用例用裸 SQL 建 `callers` 行时没有
+// 走管理面那条"建调用方"链路，必须显式补这一行，否则第一次模型调用就被拒绝。
+// seedCallerLimit fills the period-limit row stage [5] requires; a bare callers row
+// inserted by a test carries no limits and is failed closed by design.
+func (f *wireFixture) seedCallerLimit(t *testing.T, callerID string) {
+	t.Helper()
+
+	_, err := openRawWrite(t, f.dsn).ExecContext(context.Background(), `
+		INSERT INTO caller_limits
+			(caller_id, qps, burst, max_concurrent, tasks_per_period, tokens_per_period,
+			 ingest_bytes_per_period, period, timezone, updated_at)
+		VALUES ($1, 0, 0, 0, 1000, 1000000, 1000000, 'day', 'UTC', $2)`,
+		callerID, time.Now().UnixMilli())
+	require.NoError(t, err, "限额行是 [5] 账本的前置：缺行按设计 fail-closed")
+}
+
 // countRows 数一行标量读数（判"零调用 / 一行快照"这类计数）。
 // countRows returns a single scalar count.
-func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
+func countRows(t *testing.T, db dbQueryer, query string, args ...any) int {
 	t.Helper()
 
 	var n int
@@ -397,25 +444,21 @@ func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
 func (f *wireFixture) writeInstanceConfig(t *testing.T) {
 	t.Helper()
 
-	f.writeInstanceConfigBackend(t, "")
-}
-
-// writeInstanceConfigBackend 同上，并可显式写一行 `memory.backend`——**换档只改这一行配置**
-// 是 FR-017 的原话，记忆用例因此都经"配置装载"这条真路取档位，而不是在 Go 结构里塞值。
-// 空 backend = 不写 memory 段（缺省档由 cli 的取值域判定）。
-// The memory cases switch carriers by this very configuration line, loaded from disk.
-func (f *wireFixture) writeInstanceConfigBackend(t *testing.T, memoryBackend string) {
-	t.Helper()
-
 	t.Setenv("BASALT_WIRE_KEY", "wire-sentinel-not-a-secret")
-	content := "providers:\n" +
+	// 磁盘配置里只写 `${VAR}` 占位（明文 DSN 被装载层拒绝），真值经进程环境注入：
+	// 走真实 `Run` 的命令只认磁盘配置，装配直连的用例则用内存里的同一份 `cfg`。
+	// The on-disk config keeps the DSN as a placeholder; its value travels via the
+	// process environment, never through a file.
+	t.Setenv("BASALT_WIRE_DSN", f.dsn)
+	content := "database:\n" +
+		"  dsn: ${BASALT_WIRE_DSN}\n" +
+		"providers:\n" +
 		"  - name: probe\n" +
 		"    base_url: http://127.0.0.1:1\n" +
 		"    api_key: ${BASALT_WIRE_KEY}\n" +
 		"    default_model: probe-model\n"
-	if memoryBackend != "" {
-		content += "memory:\n  backend: " + memoryBackend + "\n"
-	}
+	// 记忆段不写：`memory.backend` 已退役（D-18），写它反而是拒绝启动的配置。
+	// No memory section: the carrier key is retired and its presence refuses startup.
 	require.NoError(t, os.WriteFile(filepath.Join(f.workDir, configFileName), []byte(content), 0o644))
 }
 
@@ -474,7 +517,7 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 		require.Contains(t, recoverRec, key, "恢复完成的一条必须携带启动摘要（契约 §4.3.2 第 6 步）")
 	}
 
-	require.FileExists(t, fx.dbPath(), "重路径第二步写模式打开：库文件此时已存在")
+	require.True(t, fx.migrated(t), "重路径第二步写模式打开：隔离 schema 此时已有运行期表")
 
 	t.Run("Release 之后可再次装配", func(t *testing.T) {
 		require.NoError(t, rt.Close(), "释放失败不得静默")
@@ -487,7 +530,7 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 	t.Run("骨架缺失时点名 init", func(t *testing.T) {
 		bare := &App{
 			workDir:          t.TempDir(), // 空目录：没有 .basalt
-			supportedVersion: storage.SupportedSchemaVersion,
+			supportedVersion: postgres.SupportedSchemaVersion,
 			logger:           fx.logger,
 			cfg:              fx.cfg,
 		}
@@ -528,12 +571,14 @@ func TestWire_RegistryNamesReachAgentLoader(t *testing.T) {
 	budget := core.Budget{ContextTokens: 1}
 
 	_, err := rt.runService().Run(context.Background(), core.RunRequest{
-		Agent: "reader", SessionID: "wire-t2-ok", Message: "hi", Channel: "cli", Budget: budget,
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-t2-ok", Message: "hi", Channel: "cli", Budget: budget,
 	})
 	require.NoError(t, err, "声明池内工具的 Agent 必须注册成功——名字集没喂进装载器时这里会报 Agent 不存在")
 
 	_, err = rt.runService().Run(context.Background(), core.RunRequest{
-		Agent: "ghost", SessionID: "wire-t2-ghost", Message: "hi", Channel: "cli", Budget: budget,
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "ghost", SessionID: "wire-t2-ghost", Message: "hi", Channel: "cli", Budget: budget,
 	})
 	var notFound *core.AgentNotFoundError
 	require.ErrorAs(t, err, &notFound, "声明池外工具的 Agent 整只不注册")
@@ -552,7 +597,7 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 	rt := fx.assemble(t)
 
 	t.Run("RunService 到达 AgentService", func(t *testing.T) {
-		_, err := rt.runService().Run(context.Background(), core.RunRequest{Agent: "nobody"})
+		_, err := rt.runService().Run(context.Background(), core.RunRequest{Principal: core.LocalAdminPrincipal(), Agent: "nobody"})
 		var notFound *core.AgentNotFoundError
 		require.ErrorAs(t, err, &notFound,
 			"准入判定的错误类型只有真运行入口给得出——端口接错时会退化成别的形态")
@@ -565,7 +610,8 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 
 		// 一次运行（预算压到零模型调用）会先建会话行——存储面写入后，只读端口必须看得见。
 		_, err = rt.runService().Run(context.Background(), core.RunRequest{
-			Agent: "reader", SessionID: "wire-t3", Message: "hi", Channel: "cli",
+			Principal: core.LocalAdminPrincipal(),
+			Agent:     "reader", SessionID: "wire-t3", Message: "hi", Channel: "cli",
 			Budget: core.Budget{ContextTokens: 1},
 		})
 		require.NoError(t, err)
@@ -610,7 +656,7 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 
 		rt, err := OpenRuntime(context.Background(), Options{
 			WorkDir:                outside.workDir,
-			SupportedSchemaVersion: storage.SupportedSchemaVersion,
+			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
 			Logger:                 outside.logger,
 			ProviderClient:         fake,
 		})
@@ -620,7 +666,8 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 		outside.enableAgentsBesideRuntime(t)
 
 		res, err := rt.RunService().Run(context.Background(), core.RunRequest{
-			Agent: "reader", SessionID: "wire-open", Message: "读一下 notes.txt", Channel: "cli", UserID: "tester",
+			Principal: core.LocalAdminPrincipal(),
+			Agent:     "reader", SessionID: "wire-open", Message: "读一下 notes.txt", Channel: "cli", UserID: "tester",
 		})
 		require.NoError(t, err, "运行期失败体现在状态里；函数级 error 只报调用方问题")
 		require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -658,7 +705,7 @@ func TestWire_PortsReachRunEntryAndSessionStore(t *testing.T) {
 	})
 
 	t.Run("包外装配的入参缺一即拒", func(t *testing.T) {
-		_, err := OpenRuntime(context.Background(), Options{SupportedSchemaVersion: storage.SupportedSchemaVersion})
+		_, err := OpenRuntime(context.Background(), Options{SupportedSchemaVersion: postgres.SupportedSchemaVersion})
 		require.Error(t, err, "工作目录空值会让工作区落到相对路径——必须拒绝")
 
 		_, err = OpenRuntime(context.Background(), Options{WorkDir: t.TempDir()})
@@ -680,23 +727,23 @@ func TestWire_LightCommandTakesNoAssembly(t *testing.T) {
 
 	require.Equal(t, 0, Run(context.Background(), []string{"profile", "list"}),
 		"轻命令不取锁：锁被持有时必须照常可用（口径 23）")
-	require.NoFileExists(t, fx.dbPath(), "轻命令零装配：不得开数据库写入")
+	require.False(t, fx.migrated(t), "轻命令零装配：不得建出任何运行期表")
 
 	// session list 是轻命令里**需要数据**的那一条：只读打开一次。库不存在即如实报错
 	// （ErrDatabaseMissing），而**不是**顺手建一个空库——建库属重路径与 init 的动作。
 	require.Equal(t, 1, Run(context.Background(), []string{"session", "list"}),
 		"库不存在时只读路径如实报错")
-	require.NoFileExists(t, fx.dbPath(), "只读路径不建库：连一次写打开都没有")
+	require.False(t, fx.migrated(t), "只读路径不建库：连一次迁移都没有")
 
 	// 已初始化的实例（库在位）：持锁时照样能读——这正是"只读命令不取锁"的意义。
-	created, err := storage.OpenWritable(context.Background(), fx.dbPath(), storage.SupportedSchemaVersion)
+	created, err := postgres.Open(context.Background(), postgres.Config{DSN: fx.dsn})
 	require.NoError(t, err)
 	require.NoError(t, created.Close())
 
 	require.Equal(t, 0, Run(context.Background(), []string{"session", "list"}),
 		"只读命令在别的实例持锁时必须能读（口径 23 / FR-024）")
 
-	read := openRead(t, fx.dbPath())
+	read := openRead(t, fx.dsn)
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM sessions`), "只读路径一行都不写")
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM runs`))
 
@@ -714,12 +761,13 @@ func TestWire_SnapshotLandsBeforeTheRunStarts(t *testing.T) {
 
 	rt := fx.assemble(t)
 
-	read := openRead(t, fx.dbPath())
+	read := openRead(t, fx.dsn)
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM config_snapshots`),
 		"装配本身不冻结任何快照：快照是一次运行的事")
 
 	res, err := rt.runService().Run(context.Background(), core.RunRequest{
-		Agent: "reader", SessionID: "wire-t5", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-t5", Message: "hi", Channel: "cli",
 		Budget: core.Budget{ContextTokens: 1},
 	})
 	require.NoError(t, err, "运行期失败走 Status，不走函数级 error（契约 §1.2）")
@@ -783,7 +831,7 @@ func openWireRuntime(t *testing.T, fx *wireFixture, client core.ProviderClient) 
 	fx.seedPublishedProviders(t)
 	rt, err := OpenRuntime(context.Background(), Options{
 		WorkDir:                fx.workDir,
-		SupportedSchemaVersion: storage.SupportedSchemaVersion,
+		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
 		Logger:                 fx.logger,
 		ProviderClient:         client,
 	})
@@ -808,6 +856,37 @@ func systemMessage(t *testing.T, req core.ChatRequest) string {
 	return first.Content
 }
 
+// seedLegacyMemory 把一条核心记忆经**生产导入路径**（旧 markdown 载体 → `ImportLegacy`
+// → PostgreSQL）播种进夹具的隔离 schema：先落一份与工作区模板同构的旧载体，再按 `db switch`
+// 的装配方式跑导入。运行期唯一载体是 PostgreSQL（D-18），段 2 的判据因此必须建立在
+// "库里真的有条目"之上，而不是"磁盘上有个文件"。
+// seedLegacyMemory seeds one core entry through the very import path `db switch` uses.
+func seedLegacyMemory(t *testing.T, fx *wireFixture, entry string) {
+	t.Helper()
+
+	pkg := t.TempDir()
+	layers := filepath.Join(pkg, "memory")
+	require.NoError(t, os.MkdirAll(layers, 0o755))
+	content := "# 记忆\n\n## 核心记忆\n\n- " + entry + "\n\n## 归档记忆\n"
+	require.NoError(t, os.WriteFile(filepath.Join(layers, "MEMORY.md"), []byte(content), 0o644))
+
+	ctx := context.Background()
+	// `postgres.Open` 建库并前向迁移：导入写的是运行期同构的表，判卷侧不自己拼 DDL。
+	// Open migrates first, so the import targets exactly the runtime schema.
+	db, err := postgres.Open(ctx, postgres.Config{DSN: fx.dsn})
+	require.NoError(t, err, "导入前必须能在隔离 schema 上打开写句柄")
+	defer func() { require.NoError(t, db.Close()) }()
+
+	store := postgres.NewMemoryStore(db, time.Now)
+	report, err := memory.ImportLegacy(ctx,
+		memory.NewMarkdownLegacySource(pkg),
+		memory.NewSemanticStore(memory.SemanticDeps{Store: store}))
+	require.NoError(t, err, "旧载体导入必须成功——这就是 db switch 实际走的那条路")
+	require.Len(t, report.Imported, 1, "核心区那条必须真的写进目标库")
+	require.Empty(t, report.Unreadable, "写入路径上不得出现不可读条目")
+	require.Empty(t, report.Conflicts, "空库导入不该有冲突")
+}
+
 // appendCoreEntry 往 markdown 载体的核心区**手工**加一条条目，保留模板原有结构（文件标题
 // 在前、两分区标题齐备）——判据输入因此是人手编辑过的载体，不是夹具另造的一份文本。
 // appendCoreEntry edits the markdown carrier by hand while keeping the template's shape.
@@ -829,10 +908,9 @@ func appendCoreEntry(t *testing.T, path, entry string) {
 // 两次运行各用各的替身：第二次的入站请求**只可能**来自第二次运行，判据因此不靠调用次序去猜。
 // saveMemoryThenRestartAndRecall walks Demo two: a real tool write, a restart, and a second
 // run whose inbound system message is handed back.
-func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture, backend string) string {
+func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture) string {
 	t.Helper()
 
-	fx.writeInstanceConfigBackend(t, backend)
 	fx.writeAgent(t, "reader", "save_memory", "recall_memory")
 
 	// 第一跳：模型要写核心记忆；第二跳：确认（无工具调用 → 运行完成）。
@@ -850,7 +928,8 @@ func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture, backend strin
 
 	first := openWireRuntime(t, fx, writer)
 	res, err := first.RunService().Run(context.Background(), core.RunRequest{
-		Agent: "reader", SessionID: "wire-t029-a", Message: "以后回答简洁点", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-t029-a", Message: "以后回答简洁点", Channel: "cli",
 	})
 	require.NoError(t, err, "声明两件记忆工具的 Agent 必须注册成功——工具没进注册池时整只不注册")
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -860,7 +939,8 @@ func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture, backend strin
 	reader := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "好的"}}}
 	second := openWireRuntime(t, fx, reader)
 	res, err = second.RunService().Run(context.Background(), core.RunRequest{
-		Agent: "reader", SessionID: "wire-t029-b", Message: "继续", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-t029-b", Message: "继续", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -871,20 +951,26 @@ func saveMemoryThenRestartAndRecall(t *testing.T, fx *wireFixture, backend strin
 }
 
 // TestWire_MemorySegmentReachesModelRequest 是 T029 第 1 条：段 2 **端到端**进模型入站请求
-// 的 system 消息（约束 22）——人手写进全局层载体的核心条目，经"配置装载 → 装配 → 记忆门面
-// → 运行入口 → 提示词组装 → 出站请求"整条路出现在 system 里；该 Agent 层为空故走全局层回退
+// 的 system 消息（约束 22）——旧载体里的一条核心记忆，经"迁移导入 → 记忆门面 → 运行入口
+// → 提示词组装 → 出站请求"整条路出现在 system 里；该 Agent 层为空故走全局层回退
 // （FR-004 的装配面读数），而归档区**一个字都不进**（FR-009）。
+//
+// 播种改走迁移导入（`memory.ImportLegacy` + `NewMarkdownLegacySource`）而不是手改工作区
+// 文件：运行期唯一载体是 PostgreSQL（D-18），工作区里的 markdown 只在 `db switch` 那一次
+// 被读——用生产导入路径播种，判的正是"旧记忆迁过去之后运行期认不认"。
+// Seeding goes through the migration import so the case proves the migrated entry is what
+// the runtime serves; hand-editing the workspace file would prove nothing about the carrier.
 func TestWire_MemorySegmentReachesModelRequest(t *testing.T) {
 	fx := newWireFixture(t)
-	fx.writeInstanceConfig(t)
 	fx.writeAgent(t, "reader", "read_file")
-	appendCoreEntry(t, filepath.Join(fx.root, "memory", "MEMORY.md"), memoryEntry)
+	seedLegacyMemory(t, fx, memoryEntry)
 
 	fake := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "好"}}}
 	rt := openWireRuntime(t, fx, fake)
 
 	res, err := rt.RunService().Run(context.Background(), core.RunRequest{
-		Agent: "reader", SessionID: "wire-t029-inject", Message: "以后回答简洁点", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-t029-inject", Message: "以后回答简洁点", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
@@ -902,50 +988,46 @@ func TestWire_MemorySegmentReachesModelRequest(t *testing.T) {
 
 // TestWire_SaveMemoryThenSecondRunRecalls 是 T029 第 2 条：**Demo 二最小闭环**——真装配 +
 // 真记忆工具写一条核心记忆，关掉运行期（进程重启语义）后再装配、再跑，第二次运行的段 2
-// 含该条目。**两档各跑一次**：换档只改 `memory.backend` 一行配置（FR-017）。
+// 含该条目。载体只有 PostgreSQL 一条（D-18），"换档"不再存在，本用例只判唯一载体上的闭环。
 func TestWire_SaveMemoryThenSecondRunRecalls(t *testing.T) {
-	for _, backend := range []string{"markdown", "sqlite"} {
-		t.Run(backend, func(t *testing.T) {
-			fx := newWireFixture(t)
+	fx := newWireFixture(t)
 
-			system := saveMemoryThenRestartAndRecall(t, fx, backend)
+	system := saveMemoryThenRestartAndRecall(t, fx)
 
-			require.Contains(t, system, memoryEntry,
-				"第一次运行经真工具写下的核心记忆必须进第二次运行的段 2（Demo 二：跨进程重启仍然记得）")
-			require.Contains(t, system, "## 核心记忆")
-		})
-	}
+	require.Contains(t, system, memoryEntry,
+		"第一次运行经真工具写下的核心记忆必须进第二次运行的段 2（Demo 二：跨进程重启仍然记得）")
+	require.Contains(t, system, "## 核心记忆")
 }
 
-// TestWire_SqliteBackendLeavesWorkspaceFileUntouched 是 T029 第 3 条：sqlite 档的**载体
-// 隔离**——记忆落库，markdown 载体一个字节都不动、也不被读。两条负向判据把"换档只换读写面"
-// 钉在装配面上：
+// TestWire_RuntimeMemoryIgnoresMarkdownWorkspaceFile 是 T029 第 3 条在退役后的形态：**载体
+// 隔离**——运行期只认 PostgreSQL（D-18 / D-22），工作区里的 markdown 记忆文件既不读也不写，
+// 只在 `db switch` 那一次被当成导入来源。两条负向判据把它钉在装配面上：
 //
-//	① 写下的条目出现在第二次运行的段 2 → 写入真的发生了（否则下面的"文件没变"是空判）；
-//	② `memory/MEMORY.md` 逐字节不变，且人手写进去的那条**不得**进段 2——sqlite 档不读该文件，
+//	① 工具写下的条目出现在第二次运行的段 2 → 写入真的发生了（否则下面的"文件没变"是空判）；
+//	② `memory/MEMORY.md` 逐字节不变，且人手写进去的那条**不得**进段 2——运行期不读该文件，
 //	   Agent 层也不得顺手在 `memory/agents/` 下落文件。
-func TestWire_SqliteBackendLeavesWorkspaceFileUntouched(t *testing.T) {
+func TestWire_RuntimeMemoryIgnoresMarkdownWorkspaceFile(t *testing.T) {
 	fx := newWireFixture(t)
 
 	globalFile := filepath.Join(fx.root, "memory", "MEMORY.md")
-	const handwritten = "手写的一条：只在 markdown 档生效。"
+	const handwritten = "手写的一条：运行期不得从工作区文件读到它。"
 	appendCoreEntry(t, globalFile, handwritten)
 	before, err := os.ReadFile(globalFile)
 	require.NoError(t, err)
 
-	system := saveMemoryThenRestartAndRecall(t, fx, "sqlite")
+	system := saveMemoryThenRestartAndRecall(t, fx)
 
 	require.Contains(t, system, memoryEntry,
-		"sqlite 档的写入必须真的落到库里并生效——文件没变只有在写入发生过时才是证据")
+		"写入必须真的落到库里并生效——文件没变只有在写入发生过时才是证据")
 	require.NotContains(t, system, handwritten,
-		"sqlite 档不得回读 markdown 载体：换档换的是读写面，不是两档并读")
+		"运行期不得回读 markdown 载体：它在 D-22 里只是回退层与一次性导入来源")
 
 	after, err := os.ReadFile(globalFile)
 	require.NoError(t, err)
-	require.Equal(t, string(before), string(after), "sqlite 档一个字节都不写 markdown 载体")
+	require.Equal(t, string(before), string(after), "运行期一个字节都不写 markdown 载体")
 
 	require.NoFileExists(t, filepath.Join(fx.root, "memory", "agents", "reader", "MEMORY.md"),
-		"sqlite 档的 Agent 层写入落库，不得顺手在 memory/agents/ 下落文件")
+		"Agent 层写入落库，不得顺手在 memory/agents/ 下落文件")
 }
 
 // —— US-11 T020 追加四条：闸门 / 注册表 / 生命周期装配与关闭顺序（模块卡 §3.2.2，
@@ -1018,7 +1100,8 @@ func TestWire_RegistryIsSingleAdmissionSource(t *testing.T) {
 
 	rt.agents.Remove("reader")
 	_, err := rt.service.Run(ctx, core.RunRequest{
-		Agent: "reader", SessionID: "wire-registry-off", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-registry-off", Message: "hi", Channel: "cli",
 	})
 	var notFound *core.AgentNotFoundError
 	require.ErrorAs(t, err, &notFound, "注册表移除后，同一运行入口必须立即拒绝")
@@ -1026,7 +1109,8 @@ func TestWire_RegistryIsSingleAdmissionSource(t *testing.T) {
 
 	rt.agents.Replace("reader", entry)
 	_, err = rt.service.Run(ctx, core.RunRequest{
-		Agent: "reader", SessionID: "wire-registry-on", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-registry-on", Message: "hi", Channel: "cli",
 		Budget: core.Budget{ContextTokens: 1},
 	})
 	require.NoError(t, err, "放回注册表后立即放行——两处读的是同一份快照")
@@ -1059,21 +1143,23 @@ func TestWire_BaselineDisablesThenEnableAdmits(t *testing.T) {
 
 	ctx := context.Background()
 	_, err = rt.service.Run(ctx, core.RunRequest{
-		Agent: "reader", SessionID: "wire-lifecycle-off", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-lifecycle-off", Message: "hi", Channel: "cli",
 	})
 	var unavailable *core.AgentUnavailableError
 	require.ErrorAs(t, err, &unavailable, "停用的 Agent 在准入处被拒（失败关闭）")
 	require.Equal(t, core.AgentDisabled, unavailable.State)
 	require.Equal(t, "reader", unavailable.Name)
 
-	read := openRead(t, fx.dbPath())
+	read := openRead(t, fx.dsn)
 	require.Zero(t, countRows(t, read, `SELECT COUNT(*) FROM runs`),
 		"准入拒绝发生在任何写入之前：一次运行都不该留下账")
 
 	fx.enableAgents(t, rt)
 
 	res, err := rt.service.Run(ctx, core.RunRequest{
-		Agent: "reader", SessionID: "wire-lifecycle-on", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "reader", SessionID: "wire-lifecycle-on", Message: "hi", Channel: "cli",
 		Budget: core.Budget{ContextTokens: 1},
 	})
 	require.NoError(t, err, "启用之后同一入口放行")
@@ -1168,13 +1254,14 @@ func TestRunService_AssemblyWiresPublishedSnapshots(t *testing.T) {
 	require.NotNil(t, rt.skills, "技能库句柄必须由装配层保留（基线 / 准入 / 快照共用）")
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
-		Agent: "writer", SessionID: "wire-t056", Message: "hi", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "writer", SessionID: "wire-t056", Message: "hi", Channel: "cli",
 		Budget: core.Budget{ContextTokens: 1},
 	})
 	require.NoError(t, err, "运行期失败走 Status，不走函数级 error（契约 §1.2）")
 	require.Equal(t, core.StatusFailed, res.Status)
 
-	read := openRead(t, fx.dbPath())
+	read := openRead(t, fx.dsn)
 	var manifestJSON string
 	require.NoError(t, read.QueryRowContext(context.Background(),
 		`SELECT manifest_json FROM config_snapshots`).Scan(&manifestJSON))
@@ -1445,13 +1532,13 @@ func TestWire_NotifyAdminPortWiring(t *testing.T) {
 	require.NoError(t, port.Delete(ctx, resourceActor(), "wire-empty", string(created.ResourceUID), false))
 	require.NoError(t, port.Delete(ctx, resourceActor(), "wire-hook", string(placed.ResourceUID), false))
 
-	db := openRead(t, fx.dbPath())
+	db := openRead(t, fx.dsn)
 	require.Equal(t, 3, countRows(t, db,
-		"SELECT COUNT(*) FROM management_operations WHERE target_kind = ? AND target_id = ? AND status = ?",
+		"SELECT COUNT(*) FROM management_operations WHERE target_kind = $1 AND target_id = $2 AND status = $3",
 		core.TargetKindNotifyChannel, "wire-hook", string(core.OperationSuccess)),
 		"创建 + 更新 + 删除各留一行成功操作行（与资源写面同一张表）")
 	require.Equal(t, 2, countRows(t, db,
-		"SELECT COUNT(*) FROM management_operations WHERE target_kind = ? AND target_id = ? AND status = ?",
+		"SELECT COUNT(*) FROM management_operations WHERE target_kind = $1 AND target_id = $2 AND status = $3",
 		core.TargetKindNotifyChannel, "wire-empty", string(core.OperationSuccess)),
 		"创建 + 删除各留一行成功操作行")
 	// 删除只写墓碑（FR-073）：行保留供历史查询与审计回溯，活动行必须归零。判"删除发生了"
@@ -1459,10 +1546,10 @@ func TestWire_NotifyAdminPortWiring(t *testing.T) {
 	// Deletion tombstones the row (FR-073): the verdict reads the tombstone column, not
 	// the row count, which is constant under tombstone semantics.
 	require.Equal(t, 2, countRows(t, db,
-		"SELECT COUNT(*) FROM notify_channels WHERE name IN (?, ?) AND deleted_at IS NOT NULL",
+		"SELECT COUNT(*) FROM notify_channels WHERE name IN ($1, $2) AND deleted_at IS NOT NULL",
 		"wire-empty", "wire-hook"), "两次删除都必须真的写下墓碑")
 	require.Zero(t, countRows(t, db,
-		"SELECT COUNT(*) FROM notify_channels WHERE name IN (?, ?) AND deleted_at IS NULL",
+		"SELECT COUNT(*) FROM notify_channels WHERE name IN ($1, $2) AND deleted_at IS NULL",
 		"wire-empty", "wire-hook"), "删除后不得留下活动行")
 }
 
@@ -1554,19 +1641,23 @@ func TestWire_CredentialComponentsAssembled(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(fx.workDir, "master.key"), "拒绝路径不得落盘")
 }
 
-// TestWire_StartupRunsMigrationOrchestration（T134）：重路径的 ③ 必须走六步迁移编排，
-// 而不是直接调 `db.Migrate`。两条可观察判据：
+// TestWire_StartupRunsMigrationOrchestration（T134）：重路径的 ③ 已并入
+// `postgres.Open`（连接 → 扩展能力 → 前向迁移，同一把 advisory 锁），SQLite 谱系的 v3
+// 六步编排只为旧实例的离线升级 / 导出保留（`basalt db`），**不**从 serve 触碰。三条
+// 可观察判据：
 //
-//  1. 新库由 `OpenWritable` 直接建到目标版本 → 编排返回零报告，**不得**留下迁移操作行
-//     （每次启动都写一行 `system.baseline_v3` 会让操作台账被启动噪声淹没）；
-//  2. 骨架缺 `agents/` 时启动在**迁移**这一步失败——编排的入参校验要扫描 Agent 目录
-//     （绑定回填要按名单判身份连续性），只调 `db.Migrate` 的实现根本不看工作区。
+//  1. 新库由 `postgres.Open` 直接建到目标版本 → 操作台账里**不得**出现 `system.baseline_v3`
+//     行（每次启动都写一行会让台账被启动噪声淹没）；
+//  2. 骨架缺 `agents/` 时启动在 ④ 的**工作区残留判定**这一步失败——扫描 Agent 目录的是
+//     恢复步，不是迁移步（迁移已在 `postgres.Open` 内结束，不看工作区）；
+//  3. 同一失败现场里仍然零 `system.baseline_v3` 行——serve 不跑旧编排，判据 3 把"编排
+//     真的退回离线路径"钉在库侧，而不是只靠错误串。
 //
-// 逆改点：迁移块换回 `db.Migrate` → 判据 2 的启动会成功（随后由基线报错，错误串不含
-// 「扫描 Agent 目录」）→ 断言红；编排提前写操作行 → 判据 1 读数非零 → 断言红。
-// The startup step must run the six-step orchestration, not a bare db.Migrate: an
-// up-to-date database leaves no operation row, and a skeleton missing agents/ fails at
-// the migration step because the orchestration scans the agent directory.
+// 逆改点：serve 重新挂上 v3 编排 → 判据 1 / 3 读数非零 → 断言红；迁移块退回"先扫 Agent
+// 目录再开库"→ 判据 2 的错误串变成迁移归因 → 断言红。
+// Under PostgreSQL the startup's migration step lives inside postgres.Open; the SQLite
+// v3 orchestration is offline-only. A skeleton missing agents/ now fails in the recovery
+// step, and no baseline_v3 operation row is ever written by serve.
 func TestWire_StartupRunsMigrationOrchestration(t *testing.T) {
 	t.Run("新库不写迁移操作行", func(t *testing.T) {
 		fx := newWireFixture(t)
@@ -1574,22 +1665,29 @@ func TestWire_StartupRunsMigrationOrchestration(t *testing.T) {
 
 		version, err := rt.db.SchemaVersion(context.Background())
 		require.NoError(t, err)
-		require.Equal(t, storage.SupportedSchemaVersion, version, "启动后库必须停在目标版本")
+		require.Equal(t, postgres.SupportedSchemaVersion, version, "启动后库必须停在目标版本")
 
-		db := openRead(t, fx.dbPath())
+		db := openRead(t, fx.dsn)
 		require.Zero(t, countRows(t, db,
-			"SELECT COUNT(*) FROM management_operations WHERE action = ?", actionBaselineV3),
-			"库已是目标版本：编排返回零报告，不得写迁移操作行")
+			"SELECT COUNT(*) FROM management_operations WHERE action = $1", actionBaselineV3),
+			"库已是目标版本：不得写迁移操作行")
 	})
 
-	t.Run("缺 Agent 目录在迁移步失败", func(t *testing.T) {
+	t.Run("缺 Agent 目录在恢复步失败且不跑 v3 编排", func(t *testing.T) {
 		fx := newWireFixture(t)
 		require.NoError(t, os.RemoveAll(filepath.Join(fx.root, agentsDirName)))
 
 		_, err := fx.app().newRuntime(context.Background())
 		require.Error(t, err)
-		require.ErrorContains(t, err, "迁移数据库", "失败必须发生并归因到迁移这一步")
-		require.ErrorContains(t, err, "扫描 Agent 目录",
-			"只有六步编排会扫描 Agent 目录——错误串据此区分编排与裸 db.Migrate")
+		require.ErrorContains(t, err, "工作区残留判定",
+			"扫描 Agent 目录的是 ④ 恢复步：失败必须归因到那里")
+		require.ErrorContains(t, err, "打开 Agent 目录")
+
+		// 判据 3：失败发生前库已被 postgres.Open 建到目标版本，但操作台账里零 v3 行——
+		// serve 不经过旧编排这一点在库侧可判。
+		db := openRead(t, fx.dsn)
+		require.Zero(t, countRows(t, db,
+			"SELECT COUNT(*) FROM management_operations WHERE action = $1", actionBaselineV3),
+			"serve 不跑 SQLite 谱系的 v3 编排：操作台账不得出现迁移行")
 	})
 }

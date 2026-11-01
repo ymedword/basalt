@@ -11,6 +11,12 @@
 #      CGO 状态相反——两者分属不同目标 / job；
 #   3. build tag 隔离的测试默认不跑——`test-integration` 是**独立**目标，不能省。
 #
+# 环境依赖（D-01，US-16）：`test-integration` 与 `cover` 需要真实 PostgreSQL——缺
+# `BASALT_TEST_PG_DSN` 即失败（不跳过、不回退 SQLite），`make check` 因此整体依赖 PG；
+# `test` 保持纯单元，不读 DSN。
+# `test-integration` and `cover` require a real PostgreSQL (D-01): a missing
+# BASALT_TEST_PG_DSN fails the target instead of skipping it.
+#
 # 显式指定配方 shell：不同平台的 make 默认 shell 不一致，统一到 POSIX sh。
 SHELL := /bin/sh
 
@@ -36,7 +42,14 @@ evals: ; sh scripts/check-acceptance.sh --profile evals
 fmt: ; sh scripts/check-format.sh
 
 # 静态检查：判定集**显式指定**（命名与注释规范由门禁判卷），不得裸跑 staticcheck。
-lint: ; go vet ./... && staticcheck -checks=inherit,ST1000,ST1003,ST1016,ST1020,ST1021,ST1022 ./...
+# 装载**必须**带 `-tags=integration`：US-16 起 `internal/app` 的存储相关验收整体在集成层
+# （`//go:build integration`），不带 tag 时这些调用方不在编译集里，生产者（测试助手、
+# 接线构造器）会被判成 U1000「未使用」——门禁看上去在判、其实只判了半个代码库，
+# 与陷阱 56（平台分片文件集）同类。untagged 文件在两个编译集里都在，故本改动只增不减。
+# The analysis must load with `-tags=integration`: since US-16 the storage-facing
+# acceptance lives behind that tag, and without it the gate silently only sees half the
+# codebase (test helpers and wiring constructors read as unused).
+lint: ; go vet -tags=integration ./... && staticcheck -tags=integration -checks=inherit,ST1000,ST1003,ST1016,ST1020,ST1021,ST1022 ./...
 
 # 安全：gosec（安全扫描）+ govulncheck（依赖漏洞）——两者都必须零命中。
 sec: ; gosec -quiet ./... && govulncheck ./...
@@ -44,10 +57,14 @@ sec: ; gosec -quiet ./... && govulncheck ./...
 # 测试：-race 需要 CGO / C 编译器（与 build 目标的 CGO 状态相反，故分属不同目标）。
 test: ; go test -race -cover ./...
 
-# 集成冒烟：build tag 隔离的用例默认不执行，必须单列一步（本 US 空跑通过即绿）。
-test-integration: ; go test -tags=integration ./...
+# 集成冒烟：build tag 隔离的用例默认不执行，必须单列一步。缺 DSN 由前置闸门判失败，
+# 不让测试层"全部跳过"冒充通过。配方**保持 ASCII**（本机 make 按 ANSI 读 Makefile）。
+# A missing DSN fails the guard before any test runs; the recipe stays ASCII.
+test-integration: ; @test -n "$${BASALT_TEST_PG_DSN:-}" || { echo "test-integration: BASALT_TEST_PG_DSN is not set (fail-closed per D-01; skipping is not allowed). Start the dev-env test database and run through dev-env/scripts/with-postgres.sh; setup: docs/DevelopmentLoop.md section 10." >&2; exit 1; }; go test -tags=integration -count=1 ./...
 
 # 覆盖率底线：go test -cover 只打印百分比、不会因低于阈值而失败——由脚本按包判失败。
+# 判卷同时跑 `-tags=integration`（覆盖率口径含 PG 存储），故脚本自身也要求 DSN。
+# The judge also runs with -tags=integration, so it requires the DSN as well.
 cover: ; sh scripts/check-coverage.sh
 
 # 发布构建：单二进制纪律（CGO_ENABLED=0）；版本标识经 -X 注入入口包。

@@ -700,6 +700,7 @@ channels: []
 settings:
   max_iterations: 42
   max_history_turns: 7
+  include_global_memory: true
 schedules: []
 `, "正文占位")
 	writeFileInRoot(t, root, "AGENTS.md", "引导")
@@ -725,6 +726,8 @@ schedules: []
 	require.Empty(t, p.Channels, "显式 channels: [] 不得回落缺省 [{name: cli}]")
 	require.Equal(t, 42, p.Settings.MaxIterations)  // max_iterations（snake_case）
 	require.Equal(t, 7, p.Settings.MaxHistoryTurns) // max_history_turns（snake_case）
+	require.NotNil(t, p.Settings.IncludeGlobalMemory)
+	require.True(t, *p.Settings.IncludeGlobalMemory)
 	require.NotNil(t, p.Provider.Temperature, "显式 temperature: 0 与未声明不同")
 	require.Equal(t, 0.0, *p.Provider.Temperature)
 }

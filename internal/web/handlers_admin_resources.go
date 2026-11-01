@@ -416,11 +416,35 @@ func (s *Server) handleAdminMCPDiagnostics(w http.ResponseWriter, r *http.Reques
 	s.writeOK(w, mcpServerDiagnosticsView(diagnosis))
 }
 
-// handleAdminCreateSkill 处理 `POST /skills`：创建骨架并发布 version 1。响应按契约
-// 只回 `SkillView`（`openapi.yaml` 的 data 是 SkillView，文件清单只在详情端点给）；
-// 名字规则、骨架正文与同名 409 都在适配器内判定，本层不落盘、不补写编排。
-// handleAdminCreateSkill projects the SkillView the contract declares for POST /skills;
-// the skeleton body and the duplicate-name conflict stay in the adapter.
+// handleAdminReadSkillForEdit 仅向管理员返回完整文件，普通业务读取面不扩大权限。
+// handleAdminReadSkillForEdit keeps editable file contents behind the admin guard.
+func (s *Server) handleAdminReadSkillForEdit(w http.ResponseWriter, r *http.Request, _ core.Actor) {
+	reader, ok := s.opts.ResourceAdminService.(interface {
+		ReadSkillForEdit(context.Context, string) (SkillDetailView, error)
+	})
+	if !ok {
+		s.writeAdminPortMissing(w, "SkillEditReader", "GET /admin/skills/{name}/edit")
+		return
+	}
+	name := r.PathValue("name")
+	view, err := reader.ReadSkillForEdit(r.Context(), name)
+	if err != nil {
+		s.writeResourceAdminError(w, err, name, "读取技能文件")
+		return
+	}
+	w.Header().Set("ETag", view.ETag)
+	if view.ReferencedBy == nil {
+		view.ReferencedBy = []string{}
+	}
+	if r.URL.Query().Get("summary") == "true" {
+		s.writeOK(w, view.SkillView)
+		return
+	}
+	s.writeOK(w, nonNilSkillDetail(view))
+}
+
+// handleAdminCreateSkill 创建并发布技能骨架，响应只回 SkillView。
+// handleAdminCreateSkill creates the skeleton and returns its SkillView.
 func (s *Server) handleAdminCreateSkill(w http.ResponseWriter, r *http.Request, actor core.Actor) {
 	if s.opts.ResourceAdminService == nil {
 		s.writeAdminPortMissing(w, "ResourceAdminService", "POST /skills")

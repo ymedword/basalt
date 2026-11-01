@@ -281,6 +281,7 @@ type AgentContentChanges struct {
 	// NotifyMode patches the three-state notification intent; nil leaves it as is.
 	NotifyMode *NotifyMode
 	Settings   *AgentSettingsChanges
+	Knowledge  *[]KnowledgeBinding
 	Schedules  *[]Schedule
 }
 
@@ -307,10 +308,23 @@ type AgentProviderChanges struct {
 }
 
 // AgentSettingsChanges 是 settings 段的结构化补丁。
-// AgentSettingsChanges patches the settings block.
+// ClearIncludeGlobalMemory 与 IncludeGlobalMemory 互斥：true 表示**移除**
+// `include_global_memory` 行（回到"未声明"），线上由 `include_global_memory: null`
+// 表达；省略字段仍是"不修改"，不得用省略推断清除。
+//
+// 为什么必须能清除：该键是三态（未声明 = 沿用旧规则；false = 只用 Agent 层；
+// true = 两层合并），只写 true/false 的界面无法表达"回到旧规则"，用户一旦点过就
+// 再也回不去了。
+// AgentSettingsChanges patches the settings block. ClearIncludeGlobalMemory removes
+// the key so the agent returns to the legacy fallback; omitting it still means
+// "leave unchanged".
 type AgentSettingsChanges struct {
-	MaxIterations   *int
-	MaxHistoryTurns *int
+	MaxIterations       *int
+	MaxHistoryTurns     *int
+	IncludeGlobalMemory *bool
+	// ClearIncludeGlobalMemory 移除 settings.include_global_memory（与
+	// IncludeGlobalMemory 互斥）。
+	ClearIncludeGlobalMemory bool
 }
 
 // AgentLifecycleTransition 是启停请求的前置条件：期望状态与期望代数必须同时匹配，

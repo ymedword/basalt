@@ -3,6 +3,9 @@ package core
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
+	"unicode/utf8"
 )
 
 // 本文件是会话面（`RunEnv.Session` 的载体）：内存历史 + 写透仓储，外加半截工具组补齐
@@ -63,24 +66,132 @@ func (s *Session) Load(ctx context.Context) error {
 // Writes use the detached finish context: a cancellation must never masquerade as a
 // store failure, which would turn a cancelled run into a failed one.
 func (s *Session) AppendMessage(ctx context.Context, runID string, m Message) error {
+	// 正文先过「可存储性清洗」（见 SanitizeMessage）：外部工具结果里的 NUL 与
+	// 非法 UTF-8 不得让追加失败——失败会把整轮运行记成 failed，补齐路径也会在同一处
+	// 再失败一次（2026-10-31 走查实况：`SQLSTATE 22021` + `半截工具组补齐失败`）。
+	// The wash runs before both branches so memory-only sessions stay clean too.
+	SanitizeMessage(&m, func(field string, replaced int) {
+		s.warnReplacedText(runID, m.Role, m.ToolCallID, field, replaced)
+	})
 	if s.persistent() {
 		writeCtx, cancel := finishContext(ctx)
 		defer cancel()
-		if err := s.store.AppendMessage(writeCtx, s.sessionID, runID, m); err != nil {
+		id, err := s.store.AppendMessage(writeCtx, s.sessionID, runID, m)
+		if err != nil {
 			return err
 		}
+		// 仓储没给出标识 = 库里那行的身份不可知：装配记录会缺 message_id，
+		// 压缩覆盖范围也无从谈起。宁可让这次追加失败，也不留一条没有身份的历史。
+		// A store that yields no id leaves the message without an identity; refusing the
+		// append is safer than keeping a history row nobody can point at.
+		if id == "" {
+			return errors.New("追加会话消息: 仓储未返回消息标识——历史缺身份，装配记录将无法如实记账")
+		}
+		m.ID = id
+	} else {
+		// 无状态会话不落消息表：标识按本 Run 的追加位置生成（pos 从 1 起）。
+		// Stateless sessions never persist messages, so the id derives from the append position.
+		m.ID = StatelessMessageID(runID, len(s.messages)+1)
 	}
 	s.messages = append(s.messages, m)
 	return nil
 }
 
+// warnReplacedText 记一条「正文被清洗」的 WARN：只带定位字段与替换规模，**不得**
+// 带正文（正文可能含用户数据 / 外部页面内容）。会话标识在无状态会话里为空串，
+// 那正是"不落库"的如实读数。
+// warnReplacedText logs the wash with locating fields and a byte count only.
+func (s *Session) warnReplacedText(runID, role, toolCallID, field string, replaced int) {
+	slog.Default().Warn("消息正文含无法承载的字节，已替换为 U+FFFD",
+		"session_id", s.sessionID,
+		"run_id", runID,
+		"role", role,
+		"tool_call_id", toolCallID,
+		"field", field,
+		"replaced_bytes", replaced)
+}
+
+// SanitizeMessage 就地清洗一条消息的正文字段（`Content` / `ReasoningContent`），对每个
+// **被改写**的字段调用 warn（可为 nil）——warn 只收字段名与替换字节数，日志的定位字段由
+// 调用方补。清洗判据见 `sanitizeMessageText`。
+//
+// 导出是为了让**存储层的唯一插入点**（`messages` 表的 shared INSERT）复用同一份判据：
+// 崩溃恢复的半截组补齐在事务内直写消息、不经过本类型的追加方法，从审计行还原的外部
+// 结果同样可能带 NUL（2026-10-31 走查实况：启动恢复以 `SQLSTATE 22021` 失败，重路径
+// 装配失败、服务起不来）。清洗做在插入点 = 任何调用方都落不了坏字节。
+// Exported so the storage layer's single INSERT reuses this one criterion; recovery writes
+// inside its transaction without going through this session type.
+func SanitizeMessage(m *Message, warn func(field string, replaced int)) {
+	if text, replaced := sanitizeMessageText(m.Content); replaced > 0 {
+		m.Content = text
+		if warn != nil {
+			warn("content", replaced)
+		}
+	}
+	if text, replaced := sanitizeMessageText(m.ReasoningContent); replaced > 0 {
+		m.ReasoningContent = text
+		if warn != nil {
+			warn("reasoning_content", replaced)
+		}
+	}
+}
+
+// sanitizeMessageText 把消息正文里**存储与协议都无法承载**的字节替换成 U+FFFD，
+// 返回替换后的文本与被替换的字节数（0 = 原文未变）。两类字节：
+//
+//   - **NUL（0x00）**：PostgreSQL 的 `text` 列在任何编码下都不能存 0x00；
+//   - **非法 UTF-8 字节序列**：UTF8 编码的库要求参数是合法编码（`SQLSTATE 22021`）。
+//
+// 为什么替换而不是拒绝：这类字节来自**外部工具结果**（抓回的网页正文、MCP 回传），
+// 不是客户端请求形状——为它让整轮运行失败，等于让一个网页把 Agent 打死；模型协议
+// 同样只接受 UTF-8 文本。"宽容解码、把不可读处标成替换字符"与文件读取的口径一致
+// （docs/contracts/agent-md.md：非法字节以替换字符呈现，不因编码拒绝读取）。
+// 审计的 `tool_invocations.result_json` 保留原文（那是"工具实际返回了什么"的证据），
+// 本条只治理会话消息——内存历史与落库正文因此始终是同一份文本（单一追加路径）。
+// The wash is lossy on purpose and applies to every append; the audit copy stays
+// verbatim because it records what the tool actually returned.
+func sanitizeMessageText(text string) (string, int) {
+	// 快路径：绝大多数正文本来就干净（一次扫描）。
+	if utf8.ValidString(text) && !strings.Contains(text, "\x00") {
+		return text, 0
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	replaced := 0
+	for i := 0; i < len(text); {
+		if text[i] == 0x00 {
+			b.WriteRune(utf8.RuneError)
+			replaced++
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == utf8.RuneError && size == 1 {
+			// 非法字节：每个坏字节换一个替换字符（与 strings.ToValidUTF8 同口径）。
+			b.WriteRune(utf8.RuneError)
+			replaced++
+			i++
+			continue
+		}
+		b.WriteString(text[i : i+size])
+		i += size
+	}
+	return b.String(), replaced
+}
+
 // AppendToolResult 追加一条工具结果消息（由循环在工具执行后调用——**循环是唯一追加者**）。
 // AppendToolResult appends one tool result message; the loop is its only caller.
 func (s *Session) AppendToolResult(ctx context.Context, runID string, call ToolCall, r Result) error {
+	// 来源引用随 tool 消息同事务落 `message_evidence_refs`：它是"这条结果依赖哪些
+	// 知识库来源"的唯一载体，与 assistant 消息的引用集合共同构成压缩时的失效判定面
+	// （C-26：来源依赖必须随转述传播）。
+	// Evidence refs travel with the tool message into message_evidence_refs; together
+	// with the assistant's refs they form the invalidation surface for compaction.
 	return s.AppendMessage(ctx, runID, Message{
-		Role:       RoleTool,
-		Content:    r.Content,
-		ToolCallID: call.ID,
+		Role:         RoleTool,
+		Content:      r.Content,
+		ToolCallID:   call.ID,
+		EvidenceRefs: r.EvidenceRefs,
 	})
 }
 

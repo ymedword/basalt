@@ -1,0 +1,649 @@
+//go:build integration
+
+package postgres
+
+// 本文件是 runs 读侧面（详情 / 列表 / 概览计数 / 资源清单校验）在 PostgreSQL 谱系上的
+// 判卷，由 SQLite 谱系 `internal/storage/run_query_test.go` 逐条移植：测试函数名、断言、
+// 中文验收点注释与逆改点注释**原样保留**；只替换「库怎么来」与「原始 SQL 的方言」——
+//   - `openTempDB(t)` → `portTestDB(t)`（隔离 schema，读写同一句柄）；
+//   - `db.read` / `db.write` → `db.pool`；`?` → `$1..$n`；
+//   - `runs` 的归属 / 授权 / 执行者四列在 PG 上是 NOT NULL 且带 CHECK，夹具统一取内置
+//     管理员形态（local-admin / admin-builtin / 无 Key / admin-cli）；
+//   - `messages.session_id` 在 PG 上有外键（SQLite 恒开外键、PG 同样恒生效），故发消息前
+//     先建会话行；`INSERT OR IGNORE` 对应 `ON CONFLICT DO NOTHING`。
+//
+// 本文件不含 SQLite 特有行为（PRAGMA / 打开模式 / AUTOINCREMENT / 迁移脚本形态）的断言，
+// 故没有跳过项。查询面的判据面与 SQLite 谱系一致：固定排序与窗口、final_text 只按该 Run
+// 最近的 assistant 消息派生、历史 Run 的清单读取零写入、哈希不符即报错不降级。
+// Ported verbatim from the SQLite lineage; only the handle and the SQL dialect differ.
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/ymedword/basalt/internal/core"
+)
+
+// 读侧用例的夹具时刻：毫秒对齐（列存 Unix 毫秒，断言与读取都按毫秒比较）。
+// The frozen fixture clock of the read-side cases, aligned to milliseconds.
+var queryBase = time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
+
+// queryRun 是一行账本夹具：只列读侧关心的列，其余取固定值。
+// queryRun is one ledger fixture row covering the read-side columns.
+type queryRun struct {
+	runID      string
+	sessionID  string
+	agent      string
+	channel    string
+	trigger    string
+	status     string
+	reason     string
+	iterations int
+	toolCalls  int
+	configHash string
+	startedAt  time.Time
+	finishedAt time.Time // 零值 = NULL（运行中）
+}
+
+// seedQueryRun 直接落一行账本（读侧用例不经过写路径——写路径的单事务形态由 T019 守）。
+// PostgreSQL 谱系的 `runs` 多出归属 / 授权 / 执行者四列且带 CHECK：夹具固定走内置管理员
+// 形态（`local-admin` 由迁移 seed，`admin-builtin` 要求 caller_id 恰为该字面量）。
+// seedQueryRow inserts one ledger row directly; the write path is exercised elsewhere.
+func seedQueryRun(t *testing.T, db *DB, r queryRun) {
+	t.Helper()
+	if r.channel == "" {
+		r.channel = "cli"
+	}
+	if r.trigger == "" {
+		r.trigger = "user"
+	}
+	finishedAt := any(sql.NullInt64{})
+	if !r.finishedAt.IsZero() {
+		finishedAt = r.finishedAt.UnixMilli()
+	}
+	_, err := db.pool.ExecContext(context.Background(),
+		`INSERT INTO runs
+		   (run_id, session_id, agent, channel, user_id, trigger, status,
+		    reason, iterations, tool_calls, config_hash, started_at, finished_at,
+		    caller_id, authorizing_kind, key_id, actor)
+		 VALUES ($1, $2, $3, $4, 'u1', $5, $6, $7, $8, $9, $10, $11, $12,
+		         'local-admin', 'admin-builtin', NULL, 'admin-cli')`,
+		r.runID, nullIfEmpty(r.sessionID), r.agent, r.channel, r.trigger, r.status,
+		nullIfEmpty(r.reason), r.iterations, r.toolCalls, nullIfEmpty(r.configHash),
+		r.startedAt.UnixMilli(), finishedAt)
+	require.NoError(t, err)
+}
+
+// seedSession 建会话行：`messages.session_id` 在 PG 上有外键（恒生效），不先有会话行就
+// 插不进消息；重复调用是 no-op（主键冲突忽略）。
+// seedSession inserts the session row messages reference; repeat calls are no-ops.
+func seedSession(t *testing.T, db *DB, sessionID string) {
+	t.Helper()
+	_, err := db.pool.ExecContext(context.Background(),
+		`INSERT INTO sessions
+		   (session_id, profile_name, channel, user_id, created_at, last_active_at)
+		 VALUES ($1, 'assistant', 'cli', 'u1', $2, $2)
+		 ON CONFLICT (session_id) DO NOTHING`,
+		sessionID, queryBase.UnixMilli())
+	require.NoError(t, err)
+}
+
+// seedMessage 追加一条消息；assistant 行可带工具调用（可变参数，其余角色留空）。
+// `tool_calls` 列的形态与 schema 注释一致：`[{id,name,arguments}]`。
+// seedMessage appends one message; assistant rows may carry tool calls.
+func seedMessage(t *testing.T, db *DB, sessionID string, seq int64, role, content, runID string, calls ...core.ToolCall) {
+	t.Helper()
+	seedSession(t, db, sessionID)
+
+	var callsJSON any
+	if len(calls) > 0 {
+		raw, err := json.Marshal(calls)
+		require.NoError(t, err)
+		callsJSON = string(raw)
+	}
+	_, err := db.pool.ExecContext(context.Background(),
+		`INSERT INTO messages (session_id, run_id, seq, role, content, tool_calls, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		sessionID, nullIfEmpty(runID), seq, role, content, callsJSON, queryBase.UnixMilli())
+	require.NoError(t, err)
+}
+
+// sampleManifest 造一份完整清单（列表名刻意不排序——读路径不得重排，越序读回即证）。
+// sampleManifest builds a complete manifest; names stay unsorted on purpose.
+func sampleManifest() core.RunResourceManifest {
+	return core.RunResourceManifest{
+		FormatVersion:  1,
+		AgentLifecycle: "active",
+		Provider: core.ProviderVersionRef{
+			ResourceVersionRef: core.ResourceVersionRef{
+				Name: "deepseek", VersionID: 11, VersionNo: 2, ContentHash: "aaaaaaaa",
+			},
+		},
+		MCPServers: []core.ResourceVersionRef{
+			{Name: "zeta", VersionID: 12, VersionNo: 1, ContentHash: "bbbbbbbb"},
+			{Name: "alpha", VersionID: 13, VersionNo: 1, ContentHash: "cccccccc"},
+		},
+		Skills: []core.SkillVersionRef{{
+			ResourceVersionRef: core.ResourceVersionRef{
+				Name: "summarize", VersionID: 14, VersionNo: 1, ContentHash: "dddddddd",
+			},
+			Files: []core.FileHash{{Path: "SKILL.md", SHA256: "eeeeeeee", Size: 42}},
+		}},
+	}
+}
+
+// seedManifestRow 落一行清单（`hashOverride` 非空时故意写入错误哈希，供校验用例用）。
+// seedManifestRow inserts one manifest row; a non-empty override plants a wrong hash.
+func seedManifestRow(t *testing.T, db *DB, runID string, m core.RunResourceManifest, hashOverride string) {
+	t.Helper()
+	hash, err := core.HashManifest(m)
+	require.NoError(t, err)
+	m.Hash = hash
+	raw, err := core.MarshalManifest(m)
+	require.NoError(t, err)
+	stored := hash
+	if hashOverride != "" {
+		stored = hashOverride
+	}
+	_, err = db.pool.ExecContext(context.Background(),
+		`INSERT INTO run_resource_manifests
+		   (run_id, format_version, manifest_hash, agent_lifecycle_state, snapshot_json, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		runID, m.FormatVersion, stored, m.AgentLifecycle, string(raw), queryBase.UnixMilli())
+	require.NoError(t, err)
+}
+
+// seedRawManifestRow 直接写入任意清单字节：用于复现历史格式（v1 没有 v2 字段）与
+// 篡改场景。hash 必须与写入时的「hash 值置空」定义一致（testFixture 计算）。
+// seedRawManifestRow inserts raw manifest bytes so legacy shapes and tampering can be
+// reproduced without the current struct.
+func seedRawManifestRow(t *testing.T, db *DB, runID string, formatVersion int, hash, raw string) {
+	t.Helper()
+	_, err := db.pool.ExecContext(context.Background(),
+		`INSERT INTO run_resource_manifests
+		   (run_id, format_version, manifest_hash, agent_lifecycle_state, snapshot_json, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		runID, formatVersion, hash, "active", raw, queryBase.UnixMilli())
+	require.NoError(t, err)
+}
+
+// v1ManifestFixture 生成 US-12 之前的清单字节（没有 agent_uid / provider.model /
+// 凭据固定 / notify）与按写入方定义算出的哈希（hash 值置空后的 sha256）。
+// v1ManifestFixture reproduces the pre-v2 payload and the writer's hash definition.
+func v1ManifestFixture() (raw, hash string) {
+	const input = `{"format_version":1,"hash":"","agent_lifecycle_state":"active",` +
+		`"provider":{"name":"demo","version_id":1,"version_no":1,"content_hash":"abc"},` +
+		`"mcp_servers":[],"skills":[]}`
+	sum := sha256.Sum256([]byte(input))
+	hash = hex.EncodeToString(sum[:])
+	raw = strings.Replace(input, `"hash":""`, `"hash":"`+hash+`"`, 1)
+	return raw, hash
+}
+
+// countRowsIn 数某张表的行数（读侧"零写入"判据——只对测试里写死的表名调用）。
+// countRowsIn counts rows of a table named by a compile-time literal in the test.
+func countRowsIn(t *testing.T, db *DB, table string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.pool.QueryRowContext(context.Background(),
+		fmt.Sprintf("SELECT count(*) FROM %s", table)).Scan(&n))
+	return n
+}
+
+// 运行详情往返：账本起始行 + 终态列 + final_text + 清单哈希逐字段对号。
+// 对应文档用例：「详情」「参数矩阵（详情）」。
+
+func TestRunQuery_GetRunRoundTripsAllColumns(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	seedQueryRun(t, db, queryRun{
+		runID: "web-1776000000001-aaa111", sessionID: "web-sess-1", agent: "assistant",
+		channel: "web", trigger: "api", status: "completed", reason: "",
+		iterations: 3, toolCalls: 2, configHash: "cfg-hash-1",
+		startedAt: queryBase, finishedAt: queryBase.Add(4 * time.Second),
+	})
+
+	detail, err := store.GetRun(ctx, "web-1776000000001-aaa111")
+	require.NoError(t, err)
+	require.Equal(t, "web-1776000000001-aaa111", detail.RunID)
+	require.Equal(t, "web-sess-1", detail.SessionID)
+	require.Equal(t, "assistant", detail.Agent)
+	require.Equal(t, "web", detail.Channel)
+	require.Equal(t, core.Trigger("api"), detail.Trigger)
+	require.Equal(t, core.StatusCompleted, detail.Status)
+	require.Empty(t, detail.Reason)
+	require.Equal(t, 3, detail.Iterations)
+	require.Equal(t, 2, detail.ToolCalls)
+	require.Equal(t, "cfg-hash-1", detail.ConfigHash)
+	require.True(t, queryBase.Equal(detail.StartedAt))
+	require.True(t, queryBase.Add(4*time.Second).Equal(detail.FinishedAt))
+	require.Empty(t, detail.ManifestHash, "历史 Run 无清单 → 空哈希")
+	require.Nil(t, detail.ResourceManifest, "历史 Run 不回填清单")
+}
+
+// 无状态调用的 session_id 写 NULL——读回空串而不是 "null" 或错误。
+// 对应文档用例：「NULL 往返」。
+
+func TestRunQuery_GetRunStatelessRunHasEmptySession(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	seedQueryRun(t, db, queryRun{
+		runID: "cli-1776000000002-bbb222", agent: "assistant", status: "running",
+		startedAt: queryBase,
+	})
+
+	detail, err := store.GetRun(ctx, "cli-1776000000002-bbb222")
+	require.NoError(t, err)
+	require.Empty(t, detail.SessionID, "NULL 会话读回空串")
+	require.True(t, detail.FinishedAt.IsZero(), "未收口的行没有 finished_at")
+	require.Equal(t, core.StatusRunning, detail.Status)
+}
+
+// 不存在的 Run → 固定哨兵（web 映射 404），不是通用错误、也不是空行。
+// 对应文档用例：「未知运行 404」。
+
+func TestRunQuery_GetRunMissingReturnsErrRunNotFound(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	_, err := store.GetRun(ctx, "cli-1776000000099-zzz999")
+	require.ErrorIs(t, err, core.ErrRunNotFound)
+}
+
+// final_text 取最近一条 assistant 消息（按 seq），不取工具结果、不取更早草稿、
+// 也不取其后出现的 user 消息。对应文档用例：「取最近助手消息」。
+
+func TestRunQuery_FinalTextTakesLastAssistantMessage(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "cli-1776000000003-ccc333"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "cli-sess-1", agent: "assistant", status: "completed",
+		iterations: 2, toolCalls: 1, startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	seedMessage(t, db, "cli-sess-1", 1, "user", "帮我读文件", runID)
+	seedMessage(t, db, "cli-sess-1", 2, "assistant", "草稿回答", runID)
+	seedMessage(t, db, "cli-sess-1", 3, "assistant", "", runID,
+		core.ToolCall{ID: "c1", Name: "read_file"})
+	seedMessage(t, db, "cli-sess-1", 4, "tool", "文件内容", runID)
+	seedMessage(t, db, "cli-sess-1", 5, "assistant", "最终回答", runID)
+	seedMessage(t, db, "cli-sess-1", 6, "user", "追问", runID)
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Equal(t, "最终回答", detail.FinalText)
+}
+
+// 没有 assistant 消息（只有 user / tool）→ 空串，不拿工具结果冒充最终回答。
+// 对应文档用例：「无助手消息 → 空串」。
+
+func TestRunQuery_FinalTextEmptyWithoutAssistantMessage(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "cli-1776000000004-ddd444"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "cli-sess-2", agent: "assistant", status: "failed",
+		reason: "模型调用失败", startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	seedMessage(t, db, "cli-sess-2", 1, "user", "你好", runID)
+	seedMessage(t, db, "cli-sess-2", 2, "tool", "工具输出", runID)
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Empty(t, detail.FinalText)
+	require.Equal(t, "模型调用失败", detail.Reason, "reason 取账本行，不取消息")
+}
+
+// final_text 有 run_id 边界：同一会话里另一 Run 的助手消息不得混入。
+// 对应文档用例：「跨 Run 不串话」。
+
+func TestRunQuery_FinalTextScopedToRun(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const (
+		runOne = "cli-1776000000005-eee555"
+		runTwo = "cli-1776000000006-fff666"
+	)
+	seedQueryRun(t, db, queryRun{
+		runID: runOne, sessionID: "shared-sess", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: runTwo, sessionID: "shared-sess", agent: "assistant", status: "completed",
+		startedAt: queryBase.Add(time.Minute), finishedAt: queryBase.Add(time.Minute + time.Second),
+	})
+	seedMessage(t, db, "shared-sess", 1, "user", "第一问", runOne)
+	seedMessage(t, db, "shared-sess", 2, "assistant", "第一答", runOne)
+	seedMessage(t, db, "shared-sess", 3, "user", "第二问", runTwo)
+	seedMessage(t, db, "shared-sess", 4, "assistant", "第二答", runTwo)
+
+	one, err := store.GetRun(ctx, runOne)
+	require.NoError(t, err)
+	require.Equal(t, "第一答", one.FinalText)
+
+	two, err := store.GetRun(ctx, runTwo)
+	require.NoError(t, err)
+	require.Equal(t, "第二答", two.FinalText)
+}
+
+// 列表固定排序：started_at 降序；同一时刻按 run_id 降序（固定次序而非随机序）。
+// 对应文档用例：「固定排序」。
+
+func TestRunQuery_ListRunsFixedOrder(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	seedQueryRun(t, db, queryRun{
+		runID: "run-a", agent: "assistant", status: "completed",
+		startedAt: queryBase.Add(2 * time.Minute),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-b", agent: "assistant", status: "completed",
+		startedAt: queryBase.Add(2 * time.Minute), // 与 run-a 同时刻 → 比 run_id
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-c", agent: "assistant", status: "completed",
+		startedAt: queryBase.Add(time.Minute),
+	})
+
+	runs, err := store.ListRuns(ctx, core.RunFilter{})
+	require.NoError(t, err)
+	require.Len(t, runs, 3)
+	require.Equal(t, []string{"run-b", "run-a", "run-c"},
+		[]string{runs[0].RunID, runs[1].RunID, runs[2].RunID})
+}
+
+// 三个过滤参数的值谓词矩阵：单条件各自命中、三条件联合取交集、空过滤返回全部。
+// 对应文档用例：「参数矩阵」。
+
+func TestRunQuery_ListRunsFilterMatrix(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	seedQueryRun(t, db, queryRun{
+		runID: "r1", sessionID: "s1", agent: "alpha", status: "completed",
+		startedAt: queryBase.Add(4 * time.Minute),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "r2", sessionID: "s1", agent: "beta", status: "failed",
+		startedAt: queryBase.Add(3 * time.Minute),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "r3", sessionID: "s2", agent: "alpha", status: "failed",
+		startedAt: queryBase.Add(2 * time.Minute),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "r4", agent: "alpha", status: "running", startedAt: queryBase.Add(time.Minute),
+	})
+
+	cases := []struct {
+		name   string
+		filter core.RunFilter
+		want   []string
+	}{
+		{"无过滤取全部", core.RunFilter{}, []string{"r1", "r2", "r3", "r4"}},
+		{"按会话", core.RunFilter{SessionID: "s1"}, []string{"r1", "r2"}},
+		{"按 Agent", core.RunFilter{Agent: "alpha"}, []string{"r1", "r3", "r4"}},
+		{"按状态", core.RunFilter{Status: "failed"}, []string{"r2", "r3"}},
+		{"会话 + 状态交集", core.RunFilter{SessionID: "s1", Status: "failed"}, []string{"r2"}},
+		{"三条件交集", core.RunFilter{SessionID: "s2", Agent: "alpha", Status: "failed"}, []string{"r3"}},
+		{"无命中", core.RunFilter{Agent: "ghost"}, []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runs, err := store.ListRuns(ctx, tc.filter)
+			require.NoError(t, err)
+			got := make([]string, 0, len(runs))
+			for _, run := range runs {
+				got = append(got, run.RunID)
+			}
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// 窗口收敛：缺省 50、上限 200、非正数按缺省；显式小数原样生效。
+// 对应文档用例：「limit 矩阵」。
+
+func TestRunQuery_ListRunsClampsLimit(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const total = 205
+	for i := range total {
+		seedQueryRun(t, db, queryRun{
+			runID:     fmt.Sprintf("run-%03d", i),
+			agent:     "assistant",
+			status:    "completed",
+			startedAt: queryBase.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	cases := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{"零值按缺省 50", 0, defaultRunListLimit},
+		{"负数按缺省 50", -7, defaultRunListLimit},
+		{"显式 3", 3, 3},
+		{"上限 200", maxRunListLimit, maxRunListLimit},
+		{"超上限收敛到 200", total, maxRunListLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runs, err := store.ListRuns(ctx, core.RunFilter{Limit: tc.limit})
+			require.NoError(t, err)
+			require.Len(t, runs, tc.want)
+		})
+	}
+}
+
+// 详情加载准入清单：解析 snapshot_json、重算哈希与库内 manifest_hash 相等，
+// 列表路径只带哈希、不嵌完整清单。
+// 对应文档用例：「清单解析」「列表只带哈希」。
+
+func TestRunQuery_GetRunLoadsManifestAndVerifiesHash(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000007-ggg777"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-2", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	want := sampleManifest()
+	seedManifestRow(t, db, runID, want, "")
+	wantHash, err := core.HashManifest(want)
+	require.NoError(t, err)
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Equal(t, wantHash, detail.ManifestHash)
+	require.NotNil(t, detail.ResourceManifest)
+	require.Equal(t, want.Provider, detail.ResourceManifest.Provider)
+	require.Equal(t, want.MCPServers, detail.ResourceManifest.MCPServers,
+		"读路径不得重排清单顺序")
+	require.Equal(t, want.Skills, detail.ResourceManifest.Skills)
+
+	runs, err := store.ListRuns(ctx, core.RunFilter{})
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, wantHash, runs[0].ManifestHash, "列表带哈希")
+	require.Nil(t, runs[0].ResourceManifest, "列表不嵌完整清单")
+}
+
+// 历史 Run（无清单行）：详情返回 nil 清单、空哈希，且读操作对清单 / 引用表**零写入**。
+// 对应文档用例：「legacy 零写入」。
+
+func TestRunQuery_LegacyRunLeavesManifestAbsentAndWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "cli-1776000000008-hhh888"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "cli-sess-3", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Empty(t, detail.ManifestHash)
+	require.Nil(t, detail.ResourceManifest)
+
+	_, err = store.ListRuns(ctx, core.RunFilter{})
+	require.NoError(t, err)
+
+	require.Equal(t, 0, countRowsIn(t, db, "run_resource_manifests"), "历史 Run 不得回填清单")
+	require.Equal(t, 0, countRowsIn(t, db, "run_resource_refs"), "历史 Run 不得补造引用")
+}
+
+// 清单哈希不符 → 明确错误（不静默降级成 nil——那会把损坏伪装成历史 Run）。
+// 对应文档用例：「哈希校验失败」。
+
+func TestRunQuery_ManifestHashMismatchIsRejected(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000009-iii999"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-3", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	seedManifestRow(t, db, runID, sampleManifest(), "deadbeefdeadbeef")
+
+	detail, err := store.GetRun(ctx, runID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "清单哈希不一致")
+	require.False(t, errors.Is(err, core.ErrRunNotFound), "损坏不是不存在")
+	require.Empty(t, detail.RunID, "失败不返回半截详情")
+}
+
+// v1 清单（US-12 之前写入）按存储字节校验：结构体新增 v2 字段不得让历史行变成
+// 「损坏」。对应缺陷：历史 Run 详情 500（实测 13 条 v1 清单）。
+// 对应文档用例：「历史清单格式仍可读」。
+
+func TestRunQuery_GetRunVerifiesLegacyV1ManifestBytes(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000010-jjj000"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-4", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	raw, hash := v1ManifestFixture()
+	seedRawManifestRow(t, db, runID, 1, hash, raw)
+
+	detail, err := store.GetRun(ctx, runID)
+	require.NoError(t, err)
+	require.Equal(t, hash, detail.ManifestHash)
+	require.NotNil(t, detail.ResourceManifest)
+	require.Equal(t, 1, detail.ResourceManifest.FormatVersion)
+	require.Equal(t, "demo", detail.ResourceManifest.Provider.Name)
+	require.Empty(t, detail.ResourceManifest.AgentUID, "v1 没有 agent_uid")
+	require.Empty(t, detail.ResourceManifest.Notify.Mode, "v1 没有 notify")
+}
+
+// 清单内容被篡改（哈希列不变）→ 明确错误：校验回放存储字节，不因结构体演进而失效。
+// 对应文档用例：「篡改仍被发现」。
+
+func TestRunQuery_TamperedManifestBytesStillRejected(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+
+	const runID = "web-1776000000011-kkk111"
+	seedQueryRun(t, db, queryRun{
+		runID: runID, sessionID: "web-sess-5", agent: "assistant", status: "completed",
+		startedAt: queryBase, finishedAt: queryBase.Add(time.Second),
+	})
+	raw, hash := v1ManifestFixture()
+	tampered := strings.Replace(raw, `"name":"demo"`, `"name":"other"`, 1)
+	require.NotEqual(t, raw, tampered, "夹具必须真的改到字节")
+	seedRawManifestRow(t, db, runID, 1, hash, tampered)
+
+	_, err := store.GetRun(ctx, runID)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "清单哈希不一致")
+}
+
+// 概览计数：运行中不受时间窗限制；近 24 小时含端点（now-24h 那一刻算在窗内）；
+// 失败计数只覆盖窗口内的失败。对应模块卡 §4.4 的 011-storage-resources。
+// Overview counters: running is unwindowed, the 24h cutoff is inclusive, and the
+// failure counter only covers in-window failures.
+
+func TestRunQuery_CountRuns_WindowsAndStatuses(t *testing.T) {
+	db := portTestDB(t)
+	seedQueryRun(t, db, queryRun{
+		runID: "run-live", agent: "assistant", status: string(core.StatusRunning),
+		startedAt: queryBase.Add(-time.Hour),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-ok", agent: "assistant", status: string(core.StatusCompleted),
+		startedAt: queryBase.Add(-2 * time.Hour), finishedAt: queryBase.Add(-time.Hour),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-failed", agent: "assistant", status: string(core.StatusFailed),
+		startedAt: queryBase.Add(-3 * time.Hour), finishedAt: queryBase.Add(-2 * time.Hour),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-failed-edge", agent: "assistant", status: string(core.StatusFailed),
+		startedAt: queryBase.Add(-24 * time.Hour), finishedAt: queryBase.Add(-23 * time.Hour),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-failed-old", agent: "assistant", status: string(core.StatusFailed),
+		startedAt:  queryBase.Add(-24*time.Hour - time.Millisecond),
+		finishedAt: queryBase.Add(-23 * time.Hour),
+	})
+	seedQueryRun(t, db, queryRun{
+		runID: "run-ok-old", agent: "assistant", status: string(core.StatusCompleted),
+		startedAt: queryBase.Add(-48 * time.Hour), finishedAt: queryBase.Add(-47 * time.Hour),
+	})
+
+	running, last24h, failedLast24h, err := NewRunStore(db).CountRuns(context.Background(), queryBase)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, running, "运行中不受时间窗限制")
+	require.EqualValues(t, 4, last24h, "近 24 小时含 now-24h 端点")
+	require.EqualValues(t, 2, failedLast24h, "只数窗口内的失败")
+}
+
+// 空账本：三条计数都是真实的 0，不是"读不到"——查询必须成功。
+// An empty ledger yields three genuine zeros, not an error.
+
+func TestRunQuery_CountRuns_EmptyLedgerIsZero(t *testing.T) {
+	db := portTestDB(t)
+	running, last24h, failedLast24h, err := NewRunStore(db).CountRuns(context.Background(), queryBase)
+	require.NoError(t, err)
+	require.Zero(t, running)
+	require.Zero(t, last24h)
+	require.Zero(t, failedLast24h)
+}

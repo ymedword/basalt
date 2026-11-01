@@ -89,6 +89,66 @@ func TestFakeProvider_SignalsCallStartForDeterministicCancelSynchronization(t *t
 	require.Equal(t, ctx.Err(), context.Canceled)
 }
 
+// TestFakeProvider_StartedOrderDoesNotDecideWhetherTheSignalFires：信号通道的**取用顺序
+// 不决定信号是否发出**——先取（守卫写法）与后取（用例把 `Started(1)` 放进 goroutine）
+// 都必须成立。
+//
+// 逆改点：把 `Chat` 改回「只有通道已存在才 close」，子测「后取通道」收到的就是未关闭
+// 通道，用例挂死（2026-11-01 覆盖插桩下真实触发过一次 10 分钟超时）。判据用**非阻塞
+// 接收**，不靠 sleep / 时间窗。
+func TestFakeProvider_StartedOrderDoesNotDecideWhetherTheSignalFires(t *testing.T) {
+	t.Run("先取通道", func(t *testing.T) {
+		fake := NewFakeProvider(FakeStep{Response: core.ChatResponse{Content: "ok"}})
+		started := fake.Started(1)
+		select {
+		case <-started:
+			t.Fatalf("调用尚未进入，信号通道不得已关闭")
+		default:
+		}
+		_, err := fake.Chat(context.Background(), core.ChatRequest{Provider: "fake"})
+		require.NoError(t, err)
+		select {
+		case <-started:
+		default:
+			t.Fatalf("调用已进入，先取的信号通道仍未被关闭")
+		}
+	})
+
+	t.Run("后取通道", func(t *testing.T) {
+		fake := NewFakeProvider(FakeStep{Response: core.ChatResponse{Content: "ok"}})
+		_, err := fake.Chat(context.Background(), core.ChatRequest{Provider: "fake"})
+		require.NoError(t, err)
+		started := fake.Started(1)
+		select {
+		case <-started:
+		default:
+			t.Fatalf("Started(1) 在调用已进入后返回未关闭通道——把 Started 放进 goroutine 的用例会挂到超时")
+		}
+	})
+
+	// 后取第 1 次不得让第 2 次的通道提前关闭（每次调用各一条信号）。
+	t.Run("后取不串到下一次调用", func(t *testing.T) {
+		fake := NewFakeProvider(
+			FakeStep{Response: core.ChatResponse{Content: "a"}},
+			FakeStep{Response: core.ChatResponse{Content: "b"}},
+		)
+		started1 := fake.Started(1)
+		_, err := fake.Chat(context.Background(), core.ChatRequest{Provider: "fake"})
+		require.NoError(t, err)
+		<-started1
+
+		second := fake.Started(2)
+		select {
+		case <-second:
+			t.Fatalf("第二次调用尚未进入，它的信号通道不得已关闭")
+		default:
+		}
+		_, err = fake.Chat(context.Background(), core.ChatRequest{Provider: "fake"})
+		require.NoError(t, err)
+		<-second
+	})
+}
+
 // TestFakeOpenAIServer_RecordsRequestsAndServesCannedResponse：假服务本身必须先被判卷——
 // 按脚本回放 HTTP 状态与响应体，并记录收到的请求体（供逐键断言）。
 func TestFakeOpenAIServer_RecordsRequestsAndServesCannedResponse(t *testing.T) {

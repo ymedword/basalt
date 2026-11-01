@@ -79,7 +79,7 @@ func testMCPZeroCode(t *testing.T) {
 	}
 	requireToolResultContains(t, reqs[1], "零代码接入-回显", "模型收到的 echo 结果")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT tool_name, status FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -350,7 +350,7 @@ func testMCPRedaction(t *testing.T) {
 		requireAbsent(t, lastToolContent(reqs[1]), "cannot unmarshal", "工具结果不得回填原始协议文本")
 		requireAbsent(t, res.Stdout+res.Stderr, "cannot unmarshal", "原始协议错误不得进日志")
 
-		db := openDB(t, h.dbPath())
+		db := h.openDB(t)
 		rows := queryRows(t, db, `SELECT status, error_kind, error_message FROM tool_invocations ORDER BY id`)
 		if len(rows) != 1 {
 			t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -444,7 +444,7 @@ func testMCPConcurrency(t *testing.T) {
 		t.Fatalf("假服务应收到 %d 次请求（每笔两轮），实际 %d 次", workers*2, gotRequests)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db,
 		`SELECT tool_name, status, result_json FROM tool_invocations ORDER BY id`)
 	if len(rows) != workers {

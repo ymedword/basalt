@@ -130,6 +130,13 @@ func skillCardFields(raw []byte, fallbackName string) (name, description string,
 	return name, strings.TrimSpace(dto.Description), nil
 }
 
+// SkillCardDescription 使用与运行时技能卡相同的解析规则读取描述。
+// SkillCardDescription reads the description using the runtime skill-card parser.
+func SkillCardDescription(raw []byte, fallbackName string) (string, error) {
+	_, description, err := skillCardFields(raw, fallbackName)
+	return description, err
+}
+
 // missingSkill 按声明顺序找**第一个没有实体**的技能名（全有 → 空串）。规则 5 只判
 // 「有实体」：目录缺失、缺 SKILL.md、SKILL.md 是目录，三种都算没有实体。
 //

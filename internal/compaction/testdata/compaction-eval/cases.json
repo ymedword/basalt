@@ -1,0 +1,587 @@
+{
+  "dataset": "us16-compaction-arms",
+  "version": 1,
+  "label_status": "ai_adjudicated_not_human",
+  "source": "AI judgement under the user's 2026-10-27 delegation (用户授权 Claude 代行技术评审与裁决); not human-labelled, not model-measured",
+  "cases": [
+    {
+      "id": "goal-retention",
+      "kind": "goal",
+      "rationale": "目标保持：目标原话在早期消息里，最近组只保留交付物描述——用来暴露整组丢弃会丢掉目标",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "本轮目标：10 月 31 日前完成 Q3 财务对账，并把差异清单交给审计组。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到。我先确认对账口径，再开始核对。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-recon\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "对账口径：以 ERP 导出为准；单笔差异超过 100 元必须逐条列示。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的，我按上述口径继续核对。"
+        },
+        {
+          "role": "user",
+          "content": "差异清单要包含哪些字段？"
+        },
+        {
+          "role": "assistant",
+          "content": "包含单据号、金额、差异原因三项。"
+        },
+        {
+          "role": "user",
+          "content": "务必记住：交付物就是这份差异清单。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录，交付物为对账差异清单。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "10 月 31 日前完成 Q3 财务对账"
+        },
+        {
+          "message": 8,
+          "point": "交付物就是这份差异清单"
+        }
+      ]
+    },
+    {
+      "id": "constraint-negation",
+      "kind": "constraint_negation",
+      "rationale": "硬约束与否定条件：约束用否定句写成原话，保留段里只有复述——用来暴露摘要改写否定的风险",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "硬约束：不得修改生产库，只能读只读副本。"
+        },
+        {
+          "role": "assistant",
+          "content": "明白，我只走只读副本。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-db\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "只读副本连接已就绪（连接串已脱敏，不落日志）。"
+        },
+        {
+          "role": "user",
+          "content": "也别忘了不能导出客户手机号。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到，导出字段里剔除手机号。"
+        },
+        {
+          "role": "user",
+          "content": "再确认一次：不允许写操作。"
+        },
+        {
+          "role": "assistant",
+          "content": "确认：本轮不执行任何写操作。"
+        },
+        {
+          "role": "user",
+          "content": "还有：报告里的金额统一用万元。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录，金额统一万元。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "不得修改生产库"
+        },
+        {
+          "message": 8,
+          "point": "报告里的金额统一用万元"
+        }
+      ]
+    },
+    {
+      "id": "number-unit",
+      "kind": "number_unit",
+      "rationale": "数字 / 单位：阈值与最终口径都是数字表达式，摘要里出现任何换算都会失真",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "阈值是 5000 元或 3 天，先到者触发升级。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到，两个阈值取先到者。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-sla\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "历史工单：2026-09-12 触发过一次，金额 5230 元，历时 4 天。"
+        },
+        {
+          "role": "user",
+          "content": "把单位统一成元。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的，天数另按 72 小时口径标注。"
+        },
+        {
+          "role": "user",
+          "content": "继续保持。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "最终口径：5000 元 / 72 小时。"
+        },
+        {
+          "role": "assistant",
+          "content": "已按最终口径记录。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "5000 元或 3 天"
+        },
+        {
+          "message": 8,
+          "point": "5000 元 / 72 小时"
+        }
+      ]
+    },
+    {
+      "id": "open-items",
+      "kind": "open_items",
+      "rationale": "未决项：未决状态必须保持未决，保留段里只有一句复述——用来暴露「未决被写成已完成」的风险",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "目前还有两项未决：谁审批、什么时候上线。"
+        },
+        {
+          "role": "assistant",
+          "content": "先记下，等确认。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-ticket\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "工单字段回读：审批人与上线时间均为空值。"
+        },
+        {
+          "role": "user",
+          "content": "继续等。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "别再猜，未决就是未决。"
+        },
+        {
+          "role": "assistant",
+          "content": "明白，不会写成已完成。"
+        },
+        {
+          "role": "user",
+          "content": "上线时间仍未确定。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录为未确定。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "谁审批"
+        },
+        {
+          "message": 8,
+          "point": "上线时间仍未确定"
+        }
+      ]
+    },
+    {
+      "id": "version-change",
+      "kind": "version_change",
+      "rationale": "版本变化：旧版本作废、当前版本是新版本；两处版本字面量都必须可读",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "制度 V2 已作废，以 V3 为准。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到，改用 V3。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-policy\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "制度 V3 生效日期 2026-09-01，替代 V2。"
+        },
+        {
+          "role": "user",
+          "content": "引用处都要标版本。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的，引用一律带版本号。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "当前有效版本是 V3。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录，当前有效版本 V3。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "制度 V2 已作废"
+        },
+        {
+          "message": 8,
+          "point": "当前有效版本是 V3"
+        }
+      ]
+    },
+    {
+      "id": "revoked-source",
+      "kind": "revoked_source",
+      "rationale": "撤权 / 删除：覆盖段里有两条消息挂着同一个来源引用，该引用在压缩前被撤权——正文不得进摘要输入",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "先按召回 SOP 第 2 版执行。",
+          "source_refs": [
+            {
+              "id": "kn-sop",
+              "version_id": "v2"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kn-sop\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "召回 SOP 第 2 版正文：批次隔离 24 小时。",
+          "source_refs": [
+            {
+              "id": "kn-sop",
+              "version_id": "v2"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": "已读到 SOP 正文。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "进展如何？"
+        },
+        {
+          "role": "assistant",
+          "content": "正在核对批次。"
+        },
+        {
+          "role": "user",
+          "content": "结论先别下，等复核。"
+        },
+        {
+          "role": "assistant",
+          "content": "明白，先不给结论。"
+        }
+      ],
+      "revoke": [
+        {
+          "id": "kn-sop",
+          "version_id": "v2"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "召回 SOP 第 2 版"
+        },
+        {
+          "message": 8,
+          "point": "结论先别下，等复核"
+        }
+      ]
+    },
+    {
+      "id": "long-tool-output",
+      "kind": "long_tool_output",
+      "rationale": "超长工具输出：一条 1.5 KB 以上的巡检结果整段进入覆盖段，摘要输入必须仍可渲染",
+      "compactions": 1,
+      "messages": [
+        {
+          "role": "user",
+          "content": "把巡检结果整理成摘要。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-inspection\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "巡检明细（节点 A）：\n- 磁盘使用率 61%，阈值 80%\n- 内存使用率 72%，阈值 85%\n- CPU 峰值 43%，阈值 90%\n- 时钟偏移 12ms，阈值 100ms\n- 证书剩余 88 天，阈值 30 天\n- 队列积压 3 条，阈值 50 条\n- 重试率 0.4%，阈值 2%\n- 慢查询 2 条，阈值 10 条\n巡检明细（节点 B）：\n- 磁盘使用率 83%，阈值 80%（超限）\n- 内存使用率 68%，阈值 85%\n- CPU 峰值 51%，阈值 90%\n- 时钟偏移 9ms，阈值 100ms\n- 证书剩余 74 天，阈值 30 天\n- 队列积压 11 条，阈值 50 条\n- 重试率 0.7%，阈值 2%\n- 慢查询 4 条，阈值 10 条\n巡检明细（节点 C）：\n- 磁盘使用率 44%，阈值 80%\n- 内存使用率 59%，阈值 85%\n- CPU 峰值 38%，阈值 90%\n- 时钟偏移 15ms，阈值 100ms\n- 证书剩余 91 天，阈值 30 天\n- 队列积压 0 条，阈值 50 条\n- 重试率 0.2%，阈值 2%\n- 慢查询 1 条，阈值 10 条\n巡检结论：仅节点 B 磁盘超限，其余指标全部在阈值内。"
+        },
+        {
+          "role": "assistant",
+          "content": "读到了巡检结果，节点 B 磁盘超限。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "还剩多少？"
+        },
+        {
+          "role": "assistant",
+          "content": "还有三项没核。"
+        },
+        {
+          "role": "user",
+          "content": "汇总时保留异常项。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录，保留异常项。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "把巡检结果整理成摘要"
+        },
+        {
+          "message": 8,
+          "point": "汇总时保留异常项"
+        }
+      ]
+    },
+    {
+      "id": "sequential-compaction",
+      "kind": "sequential_compaction",
+      "rationale": "连续多次压缩：同一会话两段消息分属两次 Run，第二次压缩以第一份摘要为父链增量",
+      "compactions": 2,
+      "resume_at": 12,
+      "messages": [
+        {
+          "role": "user",
+          "content": "第一阶段：整理 9 月工单。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到，开始整理。"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "name": "source_view",
+              "arguments": "{\"source_id\":\"kb-tickets\"}"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "9 月工单共 42 条。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "第二阶段：核对金额。"
+        },
+        {
+          "role": "assistant",
+          "content": "收到，开始核对金额。"
+        },
+        {
+          "role": "user",
+          "content": "继续。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的。"
+        },
+        {
+          "role": "user",
+          "content": "第三阶段：输出报告。"
+        },
+        {
+          "role": "assistant",
+          "content": "明白，准备输出报告。"
+        },
+        {
+          "role": "user",
+          "content": "报告先给我看草稿。"
+        },
+        {
+          "role": "assistant",
+          "content": "好的，草稿稍后给出。"
+        },
+        {
+          "role": "user",
+          "content": "最终交付物是报告正文与附件。"
+        },
+        {
+          "role": "assistant",
+          "content": "已记录交付物。"
+        }
+      ],
+      "must_keep": [
+        {
+          "message": 0,
+          "point": "整理 9 月工单"
+        },
+        {
+          "message": 6,
+          "point": "核对金额"
+        },
+        {
+          "message": 10,
+          "point": "输出报告"
+        },
+        {
+          "message": 14,
+          "point": "最终交付物是报告正文与附件"
+        }
+      ]
+    }
+  ]
+}

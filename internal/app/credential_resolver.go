@@ -29,7 +29,7 @@ import (
 	"strings"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // 编译期断言：解析器同时满足凭据解析端口与准入的只读检查面。
@@ -45,10 +45,10 @@ var (
 // CredentialResolverDeps carries the read-only dependencies; the master key is loaded
 // on every resolution and never held here.
 type CredentialResolverDeps struct {
-	Credentials *storage.CredentialStore
-	Resources   *storage.ResourceStore
-	Notify      *storage.NotifyAdminStore
-	Bindings    *storage.BindingStore
+	Credentials *postgres.CredentialStore
+	Resources   *postgres.ResourceStore
+	Notify      *postgres.NotifyAdminStore
+	Bindings    *postgres.BindingStore
 	// MasterKeyFile 是静态初值；KeyPath 是进程内共享的生效路径（用户显式初始化后
 	// 立即切换）。有 KeyPath 时以它为准。
 	// MasterKeyFile is the static seed; KeyPath is the live shared path when present.
@@ -301,41 +301,12 @@ func (r *credentialResolver) VerifyStartup(ctx context.Context, activeAgents []s
 	return nil
 }
 
-// verifyIdentity 校验一条 active 身份能否在当前主密钥下解密，且（模型连接）目标绑定
-// 仍与当前发布定义一致。**只**供 `secrets verify` 计数使用：不返回材料，失败原因只
-// 点名资源与凭据 ID。
-// verifyIdentity checks one active identity for the secrets verify count; it never
-// returns decrypted material.
-func (r *credentialResolver) verifyIdentity(ctx context.Context, record core.CredentialRecord) error {
-	if record.State != core.CredentialIdentityActive {
-		return fmt.Errorf("%w: 凭据 %s 状态为 %s", core.ErrCredentialUnavailable, record.ID, record.State)
-	}
-	expectedTarget := ""
-	if record.OwnerKind == core.BindingModelConnection {
-		pointer, err := r.deps.Resources.PointerByUID(ctx, core.ResourceModelConnection, record.OwnerUID)
-		if err != nil {
-			return fmt.Errorf("%w: 模型连接 %s 没有当前发布指针", core.ErrAgentResourceUnavailable, record.OwnerName)
-		}
-		version, err := r.deps.Resources.VersionByID(ctx, pointer.PublishedVersionID)
-		if err != nil {
-			return fmt.Errorf("%w: 模型连接 %s 的发布版本不可读", core.ErrAgentResourceUnavailable, record.OwnerName)
-		}
-		definition, err := parseProviderDefinition(pointer.ResourceID, version.DefinitionYAML)
-		if err != nil {
-			return err
-		}
-		expectedTarget, err = CredentialTargetBinding(core.BindingModelConnection, definition.BaseURL, "")
-		if err != nil {
-			return err
-		}
-	}
-	plaintext, _, err := r.openManaged(ctx, record.OwnerKind, record.OwnerUID, expectedTarget)
-	if err != nil {
-		return err
-	}
-	zeroCredentialValue(plaintext)
-	return nil
-}
+// 说明：校验面（`secrets verify` 的计数口径）已按模块卡 §2.12.1 收敛到
+// `VerifyCredentials`（credential_verify.go）一处实现；本文件只保留运行时解析路径
+// （`openManaged` / `checkManagedState`）。原先只服务计数、且只遍历 active 身份的
+// `verifyIdentity` 已删除——它既漏掉历史密文版本，也查不到 MCP 槽位身份。
+// The verify-count helper used to live here; §2.12.1 moved the whole judging into
+// VerifyCredentials so the online and offline entry points cannot drift apart.
 
 // publishedVersion 取连接引用的发布版本：优先用调用方冻结的版本 ID，缺省时按名称
 // 查当前发布指针。版本必须确实属于该资源 UID——否则就是凭据被搬到别的资源上。

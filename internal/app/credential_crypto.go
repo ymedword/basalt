@@ -245,7 +245,16 @@ func LoadMasterKey(path, workspaceRoot string) (MasterKey, error) {
 		return MasterKey{}, err
 	}
 
-	info, err := os.Lstat(resolved)
+	// 同一目录句柄服务 lstat 与读取：路径来自部署者配置（`secrets.master_key_file`），
+	// 根限定让访问不可能落到该目录之外——与迁移 / 配置读取同一先例，且不依赖抑制注释。
+	// The parent-directory root serves both the lstat and the read.
+	keyRoot, rootErr := os.OpenRoot(filepath.Dir(resolved))
+	if rootErr != nil {
+		return MasterKey{}, fmt.Errorf("%w: 打开主密钥所在目录失败", core.ErrCredentialUnavailable)
+	}
+	defer func() { _ = keyRoot.Close() }()
+	keyName := filepath.Base(resolved)
+	info, err := keyRoot.Lstat(keyName)
 	if err != nil {
 		return MasterKey{}, fmt.Errorf("%w: 读取主密钥文件状态失败", core.ErrCredentialUnavailable)
 	}
@@ -266,9 +275,7 @@ func LoadMasterKey(path, workspaceRoot string) (MasterKey, error) {
 		return MasterKey{}, err
 	}
 
-	// #nosec G304 -- 路径来自部署者配置（secrets.master_key_file），不是请求输入；
-	// 且上面已校验绝对路径、链接、工作区边界与权限。
-	file, err := os.Open(resolved)
+	file, err := keyRoot.Open(keyName)
 	if err != nil {
 		return MasterKey{}, fmt.Errorf("%w: 打开主密钥文件失败", core.ErrCredentialUnavailable)
 	}

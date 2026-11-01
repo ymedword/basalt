@@ -48,6 +48,7 @@ const (
 	consoleMCPServerPath   = "/console/resources/mcp-servers/%s"
 	consoleSkillsPath      = "/console/resources/skills"
 	consoleNotifyPath      = "/console/settings/notifications"
+	consoleKnowledgePath   = "/console/knowledge"
 )
 
 // 固定中文原因文案：一行说明"差什么"，**不**回显英文库文案与路径（约束 45）。
@@ -136,6 +137,11 @@ func readinessFixForReject(kind core.AgentRejectKind, configFix string) string {
 		return consoleSkillsPath
 	case core.AgentRejectMCPServerSkipped:
 		return consoleMCPServersPath
+	case core.AgentRejectKnowledgeCollectionMissing:
+		// 集合声明指向的实体不存在：能修它的是知识库页（建集合或改名），不是
+		// Agent 配置文件本身——页面上的"去修"必须一步到位。
+		// The knowledge page is where the missing collection can actually be created.
+		return consoleKnowledgePath
 	default:
 		return configFix
 	}

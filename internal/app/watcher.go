@@ -41,24 +41,30 @@ type registrySync struct {
 	// 与启动装配共用同一个判定；查询失败保留旧注册表，不把"读不到"当成"都正常"。
 	// versions feeds the same registration judgement as startup assembly; a failed
 	// lookup keeps the old registry instead of defaulting to "everything published".
-	versions  skillPointerSource
-	scheduler ScheduleRegistry
-	logger    *slog.Logger
+	versions skillPointerSource
+	// collections 是知识集合目录（D-19）：与启动装配共用同一个"名字有没有实体"的
+	// 判定；查询失败保留旧注册表，不把"读不到"当成"集合都在"。
+	// collections feeds the same name-resolution judgement as startup assembly; a failed
+	// lookup keeps the old registry.
+	collections KnowledgeCollectionSource
+	scheduler   ScheduleRegistry
+	logger      *slog.Logger
 }
 
 // newRegistrySync 组装联动器；logger 为 nil 时用默认出口。
 // newRegistrySync wires the sync; a nil logger falls back to the default.
-func newRegistrySync(registry *agentRegistry, loader *workspace.AgentLoader, skills *workspace.SkillLibrary, versions skillPointerSource, scheduler ScheduleRegistry, logger *slog.Logger) *registrySync {
+func newRegistrySync(registry *agentRegistry, loader *workspace.AgentLoader, skills *workspace.SkillLibrary, versions skillPointerSource, collections KnowledgeCollectionSource, scheduler ScheduleRegistry, logger *slog.Logger) *registrySync {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &registrySync{
-		registry:  registry,
-		loader:    loader,
-		skills:    skills,
-		versions:  versions,
-		scheduler: scheduler,
-		logger:    logger,
+		registry:    registry,
+		loader:      loader,
+		skills:      skills,
+		versions:    versions,
+		collections: collections,
+		scheduler:   scheduler,
+		logger:      logger,
 	}
 }
 
@@ -81,12 +87,21 @@ func (s *registrySync) OnChange(ctx context.Context, cs workspace.ChangeSet) {
 		s.logger.Warn("读取技能发布指针失败，保留旧注册表", "error", err)
 		return
 	}
+	// 知识集合名同样每个窗口只解析一次（与技能发布指针同一纪律）：未解析名单是
+	// 本轮的判定输入，查询失败保留旧注册表而不是当成"集合都在"。
+	// Collection names are resolved once per window; a failed lookup keeps the old
+	// registry rather than assuming the collections exist.
+	unresolved, err := s.unresolvedCollections(ctx, entries)
+	if err != nil {
+		s.logger.Warn("读取知识集合目录失败，保留旧注册表", "error", err)
+		return
+	}
 	loaded := make(map[string]core.AgentEntry, len(entries))
 	for _, entry := range entries {
 		loaded[entry.Name] = entry
 	}
 	for _, name := range cs.Agents {
-		s.syncAgent(ctx, name, loaded, published)
+		s.syncAgent(ctx, name, loaded, published, unresolved)
 	}
 	for _, name := range cs.Skills {
 		s.syncSkill(name)
@@ -98,7 +113,7 @@ func (s *registrySync) OnChange(ctx context.Context, cs workspace.ChangeSet) {
 // 调度器同步（新增与修改走同一条路径，ReconcileAgent 幂等）。
 // syncAgent advances one agent: removal, keep-old on validation failure, retirement on
 // a missing skill publication, or replace.
-func (s *registrySync) syncAgent(ctx context.Context, name string, loaded map[string]core.AgentEntry, published map[string]struct{}) {
+func (s *registrySync) syncAgent(ctx context.Context, name string, loaded map[string]core.AgentEntry, published map[string]struct{}, unresolved map[string]struct{}) {
 	entry, ok := loaded[name]
 	if !ok {
 		s.removeAgent(name)
@@ -115,6 +130,13 @@ func (s *registrySync) syncAgent(ctx context.Context, name string, loaded map[st
 		// 不变量（约束 36 / FR-042）被破坏——即使旧条目曾经可用，也必须收回。
 		// Unlike a bad edit, this is a broken registration invariant: the agent is retired.
 		s.retireUnpublishedSkill(name, missing)
+		return
+	}
+	if missing := missingKnowledgeCollections(entry, unresolved); len(missing) > 0 {
+		// 集合被删除 / 改名后同一条纪律：声明指向不存在的实体时 Agent 不得继续带着
+		// 旧范围运行（投影里的行也会在下次重建时消失）。
+		// A declaration that no longer resolves retires the agent, same as a missing skill.
+		s.retireUnboundKnowledgeCollection(name, missing)
 		return
 	}
 
@@ -163,6 +185,47 @@ func (s *registrySync) retireUnpublishedSkill(name string, missing []string) {
 	s.logger.Warn("Agent 绑定技能无发布版本，退出注册表", "agent", name, "reason", reason)
 }
 
+// unresolvedCollections 解析本轮全部声明的集合名，返回**未解析**集合（不存在或同名
+// 不唯一）。目录来源未装配而有人声明了集合时返回错误：无法判定就不推进注册表。
+// unresolvedCollections resolves every declared name for this window; an absent source
+// with live declarations is an error, never an implicit "all present".
+func (s *registrySync) unresolvedCollections(ctx context.Context, entries []core.AgentEntry) (map[string]struct{}, error) {
+	names := declaredKnowledgeNames(entries)
+	if len(names) == 0 {
+		return nil, nil
+	}
+	if s.collections == nil {
+		return nil, errors.New("配置监听缺少知识集合目录来源")
+	}
+	_, unresolved, err := s.collections.CollectionIDsByName(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(unresolved))
+	for _, name := range unresolved {
+		out[name] = struct{}{}
+	}
+	return out, nil
+}
+
+// retireUnboundKnowledgeCollection 收回一个声明了不存在的知识集合的 Agent（D-19）：
+// 与目录删除 / 技能无发布同一收口——先移出注册表，再让调度器退休其任务，并点名
+// 缺失的集合。从未注册过的名字只留 WARN。
+// retireUnboundKnowledgeCollection retires an agent whose declared collections do not
+// resolve, in the same order as directory removal.
+func (s *registrySync) retireUnboundKnowledgeCollection(name string, missing []string) {
+	reason := knowledgeCollectionReject(missing)
+	if !s.registry.Exists(name) {
+		s.logger.Warn("Agent 声明的知识集合不存在或同名不唯一，不注册", "agent", name, "reason", reason)
+		return
+	}
+	s.registry.Remove(name)
+	if err := s.scheduler.SetRegistered(name, false); err != nil {
+		s.logger.Warn("调度器移出 Agent 失败，注册表已收回", "agent", name, "error", err)
+	}
+	s.logger.Warn("Agent 声明的知识集合不存在或同名不唯一，退出注册表", "agent", name, "reason", reason)
+}
+
 // syncSkill 只校验技能工作副本并留 WARN：US-11 不自动发布，注册表与技能版本指针
 // 都不动（注 9）；校验失败同样不推进任何状态。
 // syncSkill validates the work copy and logs the pending-release WARN only; US-11
@@ -194,14 +257,17 @@ func schedulesOf(entry core.AgentEntry) []core.Schedule {
 // 已启用而调度器不知道——比不监听更难查，因此在这里失败关闭。
 // startServeWatcher composes the serve-time watcher from explicit dependencies; a nil
 // scheduler seam fails closed because a half-wired reload is worse than none.
-func startServeWatcher(ctx context.Context, root string, registry *agentRegistry, loader *workspace.AgentLoader, skills *workspace.SkillLibrary, versions skillPointerSource, schedules ScheduleRegistry, logger *slog.Logger) (*workspace.Watcher, error) {
+func startServeWatcher(ctx context.Context, root string, registry *agentRegistry, loader *workspace.AgentLoader, skills *workspace.SkillLibrary, versions skillPointerSource, collections KnowledgeCollectionSource, schedules ScheduleRegistry, logger *slog.Logger) (*workspace.Watcher, error) {
 	if schedules == nil {
 		return nil, errors.New("配置监听缺少调度联动端口——拒绝在半联动状态下启动")
 	}
 	if versions == nil {
 		return nil, errors.New("配置监听缺少技能发布指针来源——拒绝在无法判定注册不变量时启动")
 	}
-	return startWatcher(ctx, root, newRegistrySync(registry, loader, skills, versions, schedules, logger), logger)
+	if collections == nil {
+		return nil, errors.New("配置监听缺少知识集合目录来源——拒绝在无法判定集合声明时启动")
+	}
+	return startWatcher(ctx, root, newRegistrySync(registry, loader, skills, versions, collections, schedules, logger), logger)
 }
 
 // startWatcher 建立监听并在后台消费事件直到 ctx 取消；返回的 Watcher 供调用方在

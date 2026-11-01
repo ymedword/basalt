@@ -146,8 +146,19 @@ func TestNetGuard_DialMatchesResolution(t *testing.T) {
 		_, err := guard.DialContext(context.Background(), "tcp", "public.example:443")
 		require.ErrorIs(t, err, stop, "拨号必须真的发生（由替身拒绝收尾）")
 		require.Equal(t, []string{"public.example"}, resolver.askedHosts(), "解析的是原域名")
-		require.Equal(t, []string{"203.0.113.10:443"}, recorder.dialed(),
-			"实拨地址必须是解析结果里的那一个 IP，不是域名（域名在拨号层无法解析自定义端口/替身）")
+		// 判据面变更（US-16 R147）：候选地址从"只拨第一个"改为"已校验地址错峰竞速"
+		// ——第一个地址不可达时补试下一个，实拨目标仍必须是已校验的 IP，不是域名。
+		// 依据：本机 IPv6 无路由、IPv4 179ms 可达（2026-10-31 实测），只拨一个地址
+		// 会把一次可用的出网判成外部故障。
+		dialed := recorder.dialed()
+		require.NotEmpty(t, dialed, "拨号必须真的发生（由替身拒绝收尾）")
+		require.Equal(t, "203.0.113.10:443", dialed[0], "首个候选 = 解析结果的第一个已校验 IP")
+		for _, target := range dialed {
+			host, _, err := net.SplitHostPort(target)
+			require.NoError(t, err)
+			require.Contains(t, []string{"203.0.113.10", "203.0.113.11"}, host,
+				"每次实拨都必须是已校验的 IP，不是域名（域名在拨号层无法解析自定义端口/替身）")
+		}
 	})
 
 	t.Run("any_protected_address_refuses_the_host", func(t *testing.T) {
@@ -406,4 +417,85 @@ func TestNetGuard_NoEnvProxy(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// TestNetGuard_FallsBackToTheNextValidatedAddress —— US-16 R147（2026-10-31 实测：
+// 本机 IPv6 无路由，不可达 IPv6 要 21 秒才报错，同域名 IPv4 只要 179 毫秒）：
+// 第一个已校验地址建连失败时，守门器必须改拨**下一个已校验**地址，而不是把一次
+// 可用的出网判成外部故障；第一个就成功时不得再拨其余（不无谓外连）。
+//
+// 逆改点：只拨 `classify` 返回的第一个地址 → "首地址失败"子用例红（第二个地址
+// 零拨号、DialContext 返回错误）；改成无条件全拨 → "首地址成功"子用例红。
+// TestNetGuard_FallsBackToTheNextValidatedAddress pins the staggered fallback.
+func TestNetGuard_FallsBackToTheNextValidatedAddress(t *testing.T) {
+	dualStack := &stubResolver{answers: map[string][]string{
+		"dual.example": {"2001:db8::10", "203.0.113.10"},
+	}}
+
+	t.Run("first_address_fails_second_succeeds", func(t *testing.T) {
+		var mu sync.Mutex
+		var dialed []string
+		failIPv6 := errors.New("ipv6 unreachable")
+		guard := NewNetGuard(NetGuardOptions{
+			Resolver: dualStack,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				mu.Lock()
+				dialed = append(dialed, address)
+				mu.Unlock()
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				if host == "2001:db8::10" {
+					return nil, failIPv6
+				}
+				client, _ := net.Pipe()
+				return client, nil
+			},
+		})
+
+		conn, err := guard.DialContext(context.Background(), "tcp", "dual.example:443")
+		require.NoError(t, err, "首地址不可达不得把整次出网判成失败")
+		require.NotNil(t, conn)
+		require.NoError(t, conn.Close())
+
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, []string{"[2001:db8::10]:443", "203.0.113.10:443"}, dialed,
+			"首地址失败后必须改拨下一个已校验地址")
+	})
+
+	t.Run("first_address_succeeds_others_not_dialed", func(t *testing.T) {
+		var mu sync.Mutex
+		var dialed []string
+		guard := NewNetGuard(NetGuardOptions{
+			Resolver: dualStack,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				mu.Lock()
+				dialed = append(dialed, address)
+				mu.Unlock()
+				client, _ := net.Pipe()
+				return client, nil
+			},
+		})
+
+		conn, err := guard.DialContext(context.Background(), "tcp", "dual.example:443")
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, []string{"[2001:db8::10]:443"}, dialed,
+			"首地址成功即停止，不向其余地址发起无谓连接")
+	})
+
+	t.Run("all_addresses_fail_returns_the_last_error", func(t *testing.T) {
+		stop := errors.New("test dial stop")
+		recorder := &recordingDial{fail: stop}
+		guard := NewNetGuard(NetGuardOptions{Resolver: dualStack, DialContext: recorder.DialContext})
+
+		_, err := guard.DialContext(context.Background(), "tcp", "dual.example:443")
+		require.ErrorIs(t, err, stop, "全部候选失败时按最后一个错误上抛")
+		require.NotEmpty(t, recorder.dialed())
+	})
 }

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是工作区只读浏览的回归（颗粒度文档 §3.1.7 / 约束 40、注 19，check

@@ -392,3 +392,18 @@ func databaseExists(path string) (bool, error) {
 	}
 	return true, nil
 }
+
+// HasTable 判定库内是否存在指定名字的用户表（只读）。旧谱系（schema 3～5）的行级
+// 事实只能这样判定：那些版本里 `instance_secrets` 整张表还不存在，"没有记录"与
+// "没有表"是同一件事，读侧必须能区分它与"读失败"。
+// HasTable reports whether a user table exists; the legacy lineage has no
+// instance_secrets table at all, and that absence must be distinguishable from a
+// read failure.
+func (db *DB) HasTable(ctx context.Context, name string) (bool, error) {
+	var count int
+	if err := db.read.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count); err != nil {
+		return false, fmt.Errorf("检查表 %s 是否存在: %w", name, err)
+	}
+	return count > 0, nil
+}

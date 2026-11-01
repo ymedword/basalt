@@ -40,9 +40,16 @@ type Profile struct {
 	// 权威，数据库投影可重建。不声明 = 零值（迁移前 Agent / 手工构造的条目）。
 	// ResourceBindings mirrors the frontmatter block; the file is authoritative.
 	ResourceBindings ResourceBindings
-	Channels         []Channel  // channels（未声明 → [{name: cli}]；显式 [] → 空）
-	Settings         Settings   // settings.*
-	Schedules        []Schedule // schedules（见 §3 契约）
+	// Knowledge 是 frontmatter 的 `knowledge:`（设计 D-19）：**声明即绑定**——集合名
+	// 在库里没有活动实体则该 Agent 整只不注册；检索期还要与调用方项目 / scope 取交集，
+	// 声明只缩小可见范围，**不得**扩大调用方权限。不声明 = 零值（不检索任何集合）。
+	// Knowledge is the declared knowledge-collection binding set; a missing entity keeps
+	// the whole agent unregistered, and retrieval intersects it with the caller's own
+	// authorization, so a declaration can only narrow what the caller may already see.
+	Knowledge []KnowledgeBinding
+	Channels  []Channel  // channels（未声明 → [{name: cli}]；显式 [] → 空）
+	Settings  Settings   // settings.*
+	Schedules []Schedule // schedules（见 §3 契约）
 }
 
 // Identity 是人格面：短名进提示词的外观，长提示词拼在系统提示词开头。
@@ -75,6 +82,9 @@ type Channel struct {
 type Settings struct {
 	MaxIterations   int // settings.max_iterations；缺省 10（显式 0 保留为 0）
 	MaxHistoryTurns int // settings.max_history_turns；缺省 20（显式 0 保留）
+	// nil preserves the legacy fallback; true explicitly shares global memory,
+	// false explicitly restricts the agent to its own memory.
+	IncludeGlobalMemory *bool
 }
 
 // Schedule 是 schedules[] 的一项；Zone 解析后必非空（缺省已填 "UTC"——不得回落进程本地时区）。
@@ -118,6 +128,12 @@ const (
 	AgentRejectInvalidNotifyChannels   AgentRejectKind = "invalid notify_channels"
 	AgentRejectInvalidNotifyMode       AgentRejectKind = "invalid notify_mode"
 	AgentRejectSkillVersionMissing     AgentRejectKind = "skill version missing"
+	// AgentRejectInvalidKnowledge 是 `knowledge:` 块结构非法（规则 12）：非列表、缺名、
+	// 重名或权限取值不在闭集内。
+	AgentRejectInvalidKnowledge AgentRejectKind = "invalid knowledge"
+	// AgentRejectKnowledgeCollectionMissing 是声明的集合名在库里**没有活动实体**
+	// （规则 13）：与技能发布闸门同形——声明即绑定，没有实体就整只不注册。
+	AgentRejectKnowledgeCollectionMissing AgentRejectKind = "knowledge collection missing"
 )
 
 // AgentDefinitionRejectedError 表示一份候选 AGENT.md 未通过装载期校验。Kind 决定

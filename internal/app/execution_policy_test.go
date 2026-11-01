@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷执行档位的管理服务（14D 设计 §2.2.1 / §2.2.3）：库是唯一权威源、配置只作
@@ -9,7 +11,6 @@ package app
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,16 +18,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
 // profileEnv 是档位服务的共享夹具：真库 + 真管理操作仓储 + 真策略实例。
 type profileEnv struct {
 	service *ExecutionPolicyService
-	store   *storage.ExecutionPolicyStore
-	ops     *storage.ManagementStore
-	db      *storage.DB
+	store   *postgres.ExecutionPolicyStore
+	ops     *postgres.ManagementStore
+	db      *postgres.DB
 	policy  *tool.WhitelistPolicy
 }
 
@@ -36,13 +38,10 @@ func profileClock() time.Time { return time.Date(2026, 10, 26, 9, 15, 0, 0, time
 // newProfileEnv 装配夹具；`mutate` 可替换 store / 解析器 / 命令白名单。
 func newProfileEnv(t *testing.T, mutate func(*ExecutionPolicyDeps)) *profileEnv {
 	t.Helper()
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(t.TempDir(), "basalt.db"), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	store := storage.NewExecutionPolicyStore(db)
-	ops := storage.NewManagementStore(db)
+	store := postgres.NewExecutionPolicyStore(db)
+	ops := postgres.NewManagementStore(db)
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{Root: t.TempDir()})
 	logger, _ := newCapturedLogger()
 
@@ -131,7 +130,7 @@ func TestExecutionProfile_StorageIsRuntimeSource(t *testing.T) {
 
 // conflictOnceStore 让第一次迁移冲突落败：模拟"另一进程在你读完 ETag 之后写了一次"。
 type conflictOnceStore struct {
-	*storage.ExecutionPolicyStore
+	*postgres.ExecutionPolicyStore
 	armed atomic.Bool
 }
 
@@ -147,7 +146,7 @@ func (s *conflictOnceStore) Update(ctx context.Context, profile core.ExecutionPr
 }
 
 // failingPreWriteOperations 让预写失败：服务**必须**拒绝执行且不留行。
-type failingPreWriteOperations struct{ *storage.ManagementStore }
+type failingPreWriteOperations struct{ *postgres.ManagementStore }
 
 // BeginOperation 恒失败（宪法 V：预写失败不得发出写入）。
 // BeginOperation always fails; the service must refuse to write.
@@ -238,8 +237,9 @@ func TestExecutionProfile_UpdateCAS(t *testing.T) {
 	require.Equal(t, core.TargetKindExecutionPolicy, row.TargetKind)
 	require.Equal(t, "global", row.TargetID)
 	require.Equal(t, core.OperationSuccess, row.Status)
-	require.Contains(t, string(row.DetailJSON), `"after_profile":"strict"`)
-	require.Contains(t, string(row.DetailJSON), `"after_revision":2`)
+	detail := detailMap(t, row.DetailJSON)
+	require.Equal(t, "strict", detail["after_profile"])
+	require.Equal(t, float64(2), detail["after_revision"])
 
 	// ⑦ 新 ETag 随之变化：页面的下一次条件写必须用新值。
 	require.NotEqual(t, standardETag, core.ExecutionPolicyETag(updated))

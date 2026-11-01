@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 `core.AgentAdmin` 组合适配器的验收面（颗粒度文档 §3.2.1：
@@ -22,7 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -47,9 +50,9 @@ provider:
 type agentConsoleEnv struct {
 	console   core.AgentAdmin
 	root      string
-	db        *storage.DB
-	ops       *storage.ManagementStore
-	versions  *storage.ResourceStore
+	db        *postgres.DB
+	ops       *postgres.ManagementStore
+	versions  *postgres.ResourceStore
 	lifecycle *workspace.LifecycleStore
 	gate      *core.AgentGate
 	logs      *bytes.Buffer
@@ -65,13 +68,10 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 	require.NoError(t, err)
 	writeWorkspaceFile(t, root, "agents/writer/AGENT.md", consoleAgentContent)
 
-	db, err := storage.OpenWritable(context.Background(),
-		filepath.Join(root, databaseFileName), storage.SupportedSchemaVersion)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	db := pgtest.NewTestDB(t)
 
-	ops := storage.NewManagementStore(db)
-	versions := storage.NewResourceStore(db)
+	ops := postgres.NewManagementStore(db)
+	versions := postgres.NewResourceStore(db)
 	gate := core.NewAgentGate()
 	lifecycle := workspace.NewLifecycleStore(root, baselineClock)
 	logger, logs := newCapturedLogger()
@@ -79,7 +79,7 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 		Root:      root,
 		Gate:      gate,
 		Ops:       ops,
-		Snapshots: storage.NewSnapshotStore(db),
+		Snapshots: postgres.NewSnapshotStore(db),
 		Registry:  &consoleRegistry{entries: map[string]core.AgentEntry{}},
 		Scheduler: consoleSchedules{},
 		Validate:  consoleValidator,
@@ -88,8 +88,8 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 	console := NewAgentConsole(AgentConsoleDeps{
 		// 内容写完之后按落盘文件重建绑定投影：夹具给真实现，判据才看得见"投影跟文件走"。
 		Root: root,
-		Projection: NewBindingProjection(storage.NewBindingStore(db), versions,
-			storage.NewAgentAdminStore(db), root, logger, baselineClock),
+		Projection: NewBindingProjection(postgres.NewBindingStore(db), versions,
+			postgres.NewAgentAdminStore(db), postgres.NewKnowledgeCatalogStore(db), root, logger, baselineClock),
 		Editor:     editor,
 		Lifecycle:  lifecycle,
 		Index:      versions,
@@ -279,7 +279,7 @@ func TestAgentConsole_UpdateContentRebuildsBindingProjection(t *testing.T) {
 		rec, exists, readErr := env.lifecycle.Read(context.Background(), "writer")
 		require.NoError(t, readErr)
 		require.True(t, exists)
-		store := storage.NewBindingStore(env.db)
+		store := postgres.NewBindingStore(env.db)
 		require.Empty(t, mustBindings(t, store, rec.AgentUID), "基线定义不带绑定块")
 
 		current, err := env.console.ReadContent(context.Background(), "writer")

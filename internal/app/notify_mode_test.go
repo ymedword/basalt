@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖通知意图三态（颗粒度文档 R4.7 / T122）：显式声明逐字校验、未声明按兼容
@@ -19,7 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
@@ -55,7 +57,7 @@ func (e *bindingsEnv) seedChannel(t *testing.T, name string, scope core.Resource
 // notifyDeps wires the catalog and the binding projection.
 func (e *bindingsEnv) notifyDeps() NotifyGrantDeps {
 	return NotifyGrantDeps{
-		Channels: storage.NewNotifyChannelRepo(e.db),
+		Channels: postgres.NewNotifyChannelRepo(e.db),
 		Bindings: e.bindings,
 	}
 }
@@ -262,13 +264,15 @@ func TestNotifyMode_MidRunChangeKeepsFrozen(t *testing.T) {
 	require.NoError(t, err)
 
 	runID := "run-notify-freeze"
-	runs := storage.NewRunStore(env.db)
+	runs := postgres.NewRunStore(env.db)
+	// 归属三列（caller_id / authorizing_kind / actor）在 PostgreSQL 是 NOT NULL +
+	// CHECK：Run 必须携带有效 Principal，夹具按内置管理员形态建行。
 	require.NoError(t, runs.StartRun(ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
-		StartedAt: baselineClock(),
+		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))
 
-	deliveries := storage.NewNotifyDeliveryStore(env.db)
+	deliveries := postgres.NewNotifyDeliveryStore(env.db)
 	frozen, err := deliveries.Refs(ctx, runID)
 	require.NoError(t, err)
 	require.Len(t, frozen, 1)
@@ -413,13 +417,13 @@ func TestNotifyMode_DeliverToRemovesNotify(t *testing.T) {
 	require.NotContains(t, names, "notify", "系统代投的 Run 不得向模型暴露 notify")
 	require.Contains(t, names, "read_file", "只删 notify，其余声明工具照旧提供")
 
-	read := openRead(t, fx.dbPath())
+	read := openRead(t, fx.dsn)
 	require.Zero(t, countRows(t, read, `SELECT count(*) FROM notify_deliveries`),
 		"模型没有 notify 工具可调，工具派生账零行")
 
 	require.Equal(t, 1, countRows(t, read, `SELECT count(*) FROM schedule_deliveries`),
 		"一次运行恰好一条系统代投记录")
-	delivery, err := storage.NewDeliveryStore(rt.db).Get(ctx, res.RunID)
+	delivery, err := postgres.NewDeliveryStore(rt.db).Get(ctx, res.RunID)
 	require.NoError(t, err)
 	require.Equal(t, taskID, delivery.TaskID)
 	require.Equal(t, agentName, delivery.Agent)
@@ -483,19 +487,19 @@ func TestNotifyDelivery_ExecutorWritesDerivedRow(t *testing.T) {
 		})
 	require.NoError(t, err)
 	runID := "webhook-1700000000100-delivery"
-	require.NoError(t, storage.NewRunStore(env.db).StartRun(ctx, core.RunRecord{
+	require.NoError(t, postgres.NewRunStore(env.db).StartRun(ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
-		StartedAt: baselineClock(),
+		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))
 
 	// 装配与生产一致：真实渠道仓储 + 真实投递记录器 + 真实执行器。
-	deliveryStore := storage.NewNotifyDeliveryStore(env.db)
-	notifyTool := newNotifyTool(storage.NewNotifyChannelRepo(env.db), allowAllNotifyPolicy{},
+	deliveryStore := postgres.NewNotifyDeliveryStore(env.db)
+	notifyTool := newNotifyTool(postgres.NewNotifyChannelRepo(env.db), allowAllNotifyPolicy{},
 		nil, notifyDeliveryRecorder{store: deliveryStore})
 	logger := slog.New(slog.DiscardHandler)
 	registry := tool.NewRegistry(logger)
 	require.NoError(t, registry.Register(notifyTool))
-	exec := core.NewToolExecutor(registry, storage.NewToolInvocationRepo(env.db), logger)
+	exec := core.NewToolExecutor(registry, postgres.NewToolInvocationRepo(env.db), logger)
 
 	res := exec.Execute(ctx, core.ToolEnv{
 		RunID:          runID,

@@ -2,8 +2,8 @@
   "version": 1,
   "profiles": {
     "task": ["fmt"],
-    "full": ["fmt", "lint", "sec", "test", "test-integration", "cover", "build", "eval-build", "behavior", "injection"],
-    "ci": ["fmt", "lint", "sec", "test", "test-integration", "cover", "build", "eval-build", "behavior", "injection"],
+    "full": ["fmt", "lint", "sec", "test", "test-integration", "test-pg", "cover", "build", "eval-build", "behavior", "injection"],
+    "ci": ["fmt", "lint", "sec", "test", "test-integration", "test-pg", "cover", "build", "eval-build", "behavior", "injection"],
     "evals": ["eval-build", "behavior", "injection"]
   },
   "checks": [
@@ -12,6 +12,7 @@
     {"id": "sec", "args": ["make", "sec"], "timeout_seconds": 600},
     {"id": "test", "args": ["go", "test", "-race", "-count=1", "-cover", "./..."], "timeout_seconds": 1200},
     {"id": "test-integration", "args": ["go", "test", "-tags=integration", "-count=1", "./..."], "timeout_seconds": 600},
+    {"id": "test-pg", "args": ["go", "test", "-tags=integration", "-race", "-count=1", "./internal/storage/postgres/..."], "timeout_seconds": 1200},
     {"id": "cover", "args": ["make", "cover"], "timeout_seconds": 1200},
     {"id": "build", "args": ["make", "build"], "timeout_seconds": 600},
     {"id": "eval-build", "args": ["go", "build", "-o", "{out}/evals.exe", "./evals"], "timeout_seconds": 300},

@@ -85,6 +85,13 @@ func TestAgentRejectMessage_TypedKindsBecomeChinese(t *testing.T) {
 		{core.AgentRejectInvalidNotifyMode, "", "通知模式声明非法"},
 		{core.AgentRejectInvalidTemperature, "4.2", "输出随机性（temperature）取值非法：4.2"},
 		{core.AgentRejectSkillVersionMissing, "reporter-help", "绑定的技能没有已发布版本：reporter-help"},
+		{core.AgentRejectInvalidKnowledge, "块结构非法", "知识库集合声明（knowledge）结构非法"},
+		{
+			core.AgentRejectKnowledgeCollectionMissing,
+			"runbooks、faq",
+			"声明的知识库集合不存在或同名不唯一：runbooks、faq（请先在「知识库」页建立同名集合，" +
+				"或改掉 AGENT.md 的 knowledge 声明名——声明缺失会让该 Agent 整只不注册）",
+		},
 		{
 			core.AgentRejectReadFailed,
 			"open /srv/basalt/agents/reporter/AGENT.md: no such file or directory",
@@ -143,6 +150,8 @@ func TestAgentRejectMessage_CoversEveryDefinedKind(t *testing.T) {
 		core.AgentRejectInvalidNotifyChannels,
 		core.AgentRejectInvalidNotifyMode,
 		core.AgentRejectSkillVersionMissing,
+		core.AgentRejectInvalidKnowledge,
+		core.AgentRejectKnowledgeCollectionMissing,
 	}
 	const fallback = "装载校验未通过（详情见服务端日志）"
 	seen := make(map[string]string, len(kinds))
@@ -235,4 +244,52 @@ func TestPublicRunReason_ChineseOnlyAndSafe(t *testing.T) {
 		require.NotContains(t, got, "/srv/")
 		require.NotContains(t, got, "sk-should-never-leak")
 	}
+}
+
+// TestErrorCodeMessage_NewCodesHaveFixedChineseCopy —— 契约 §8 本轮（US-16）新增的
+// 六个码各有固定中文模板：可填入点名细节，细节为空时不留悬空冒号或格式残留；六个
+// 文案互不相同（三个 429 尤其不得合并成同一句，否则调用方无法区分"该退避"与
+// "该等周期"）；文案里不出现未知码兜底。
+// 逆改点：删掉任一码的模板 → 该子例拿到"未知错误码"兜底而红；把三个 429 映射到
+// 同一模板 → 去重断言红。
+func TestErrorCodeMessage_NewCodesHaveFixedChineseCopy(t *testing.T) {
+	codes := []string{
+		codeInvalidScope,
+		codeIdempotencyConflict,
+		codeGone,
+		codeCallerRateLimited,
+		codeCallerConcurrencyLimited,
+		codeQuotaExhausted,
+	}
+	seen := make(map[string]string, len(codes))
+	for _, code := range codes {
+		withDetail := errorCodeMessage(code, "detail-pointer")
+		require.Contains(t, withDetail, "detail-pointer", "%s 的文案必须接受点名细节", code)
+		require.NotContains(t, withDetail, "%!"+"s(MISSING)", "%s 的模板不得漏 %%s 处理", code)
+		require.NotContains(t, withDetail, "未知错误码", "%s 必须是登记过的码", code)
+
+		without := errorCodeMessage(code, "")
+		require.NotEmpty(t, without)
+		require.NotContains(t, without, "%", "%s 无细节时不得残留模板占位", code)
+		require.NotContains(t, without, "未知错误码", "%s 必须是登记过的码", code)
+		if prior, exists := seen[without]; exists {
+			t.Fatalf("%s 与 %s 共用文案 %q，调用方无法区分", code, prior, without)
+		}
+		seen[without] = code
+	}
+}
+
+// TestErrorCodeMessage_UnknownCodeKeepsCode —— 未登记的码（拼写错误 / 尚未入契约的
+// 新码）不得回退成通用文案而丢失码字面量：兜底必须点名 `code`，且不把调用点给的
+// detail 拼进去（未知码的点名信息安全性无从判定，只进日志）；也不得顶替成既有的
+// 通用错误文案。
+// 逆改点：兜底改成 messageInternal / messageBusy 或任一固定文案 → Contains 断言红。
+func TestErrorCodeMessage_UnknownCodeKeepsCode(t *testing.T) {
+	const unknown = "NOT_A_CONTRACT_CODE"
+	message := errorCodeMessage(unknown, "detail-pointer")
+	require.Contains(t, message, unknown, "兜底文案必须保留 code 字面量")
+	require.NotContains(t, message, "detail-pointer", "未知码的 detail 不进界面")
+	require.NotEmpty(t, message)
+	require.NotEqual(t, messageInternal, message)
+	require.NotEqual(t, messageBusy, message)
 }

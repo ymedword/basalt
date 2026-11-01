@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖系统代投服务（US-12 R7）：预写 pending 行、运行前资格与**声明边界**复核、

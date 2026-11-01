@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -250,7 +250,7 @@ func mcpToolNames(conns []tool.MCPConnection) []string {
 // configuration order followed by pointer-only servers. A server whose own credential is
 // currently unavailable is skipped (startup isolation, E3); every other failure still
 // aborts the assembly.
-func publishedMCPServers(ctx context.Context, store *storage.ResourceStore, fileOrder []string,
+func publishedMCPServers(ctx context.Context, store *postgres.ResourceStore, fileOrder []string,
 	credentials mcpCredentialResolver, now func() time.Time, logger *slog.Logger,
 ) ([]core.PublishedMCPServer, error) {
 	if credentials == nil {
@@ -344,7 +344,7 @@ type mcpCredentialResolver interface {
 	Resolve(ctx context.Context, serverName string, serverUID core.ResourceUID,
 		cfg core.MCPServerConfig) (map[string]string, error)
 	BackfillEnvSources(ctx context.Context, serverName string, serverUID core.ResourceUID,
-		cfg core.MCPServerConfig, operationID string, at time.Time) (int, error)
+		cfg core.MCPServerConfig, operationID string, at time.Time) (core.MCPBackfillReport, error)
 }
 
 // mcpPublishedConfigs 抽取配置（运行期句柄只要配置与文件序名集）。
@@ -362,7 +362,7 @@ func mcpPublishedConfigs(servers []core.PublishedMCPServer) []core.MCPServerConf
 // 会如实为真（约束 21 的真值表）。server 已删除时无行可写，同样直接返回。
 // markMCPApplied records applied only while the pointer still names that version; a
 // newer publish must never be rolled back, and a deleted server has no row to update.
-func markMCPApplied(ctx context.Context, store *storage.ResourceStore, name string, versionID int64,
+func markMCPApplied(ctx context.Context, store *postgres.ResourceStore, name string, versionID int64,
 	now func() time.Time,
 ) error {
 	pointers, err := store.ListPointers(ctx, core.ResourceMCPServer)

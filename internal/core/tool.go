@@ -33,10 +33,22 @@ type Tool interface {
 	Execute(ctx context.Context, env ToolEnv, input json.RawMessage) (Result, error)
 }
 
-// Result 是一次工具执行的产出——**只有两个字段**（§6.1 冻结），故截断信息不进结构：
-// 截断标记追加在 Content 尾部（`TruncationMarker`），审计侧从标记判定 `truncated`。
-// Result has exactly two fields by design; truncation travels in the Content marker.
+// Result 是一次工具执行的产出。§6.1 冻结的是 `Content` / `Retryable` 两个字段的语义，
+// 故截断信息仍不进结构：截断标记追加在 Content 尾部（`TruncationMarker`），审计侧从
+// 标记判定 `truncated`。US-16 在此之上追加**一个**来源注记 `EvidenceRefs`（检索 / 来源
+// 视图随内容返回的引用），它随 tool 消息落 `message_evidence_refs`，不改变前两个字段的
+// 任何语义。
+// Result carries the frozen Content/Retryable pair plus one US-16 addition: EvidenceRefs,
+// the source references returned alongside the content; truncation still travels in the
+// Content marker, and the first two fields keep their exact semantics.
 type Result struct {
 	Content   string // 结果内容（回填给模型；失败信息也经这里回填——模型看不到结果就不会收敛）
 	Retryable bool   // 失败是否可重试（供模型参考）
+	// EvidenceRefs 是本次结果依赖的来源引用；无来源的工具留空（不是错误）。
+	// 与 `Message.EvidenceRefs` 同为**读面注记**：`json:"-"` 保证它不进任何协议 /
+	// 审计载荷，只经 `message_evidence_refs` 随消息同事务落库（§3.4.1）。
+	// EvidenceRefs lists the sources this result depends on; tools without sources
+	// leave it empty, which is not an error. It is a read-side annotation like its
+	// message counterpart: never serialized, only persisted via message_evidence_refs.
+	EvidenceRefs []EvidenceRef `json:"-"`
 }

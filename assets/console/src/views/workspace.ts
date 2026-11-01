@@ -15,6 +15,7 @@ import type {
 } from '../api'
 import { adminApi } from '../api-admin'
 import { catalogApi } from '../api-catalog'
+import { MemoryEntries } from '../components/memory-entries'
 import { NotifyChannels } from '../components/notify-channels'
 import { CodeBlock, ConfirmDialog, DataTable, Notice, StatusBadge, formatTimestamp } from '../components/ui'
 import type { Tone } from '../components/ui'
@@ -47,24 +48,28 @@ export const GlobalMemoryView = defineComponent({
   name: 'GlobalMemoryView', props: viewProps,
   setup(props) {
     const memory = useLoader(() => props.ctx.api.getGlobalMemory())
-    // 分区按行为命名（常驻 / 可检索）；文件里的标题固定为「核心记忆 / 归档记忆」，
-    // 两者是同一份数据，不是两套存储。
-    // Sections are named by behaviour; the file headings stay 核心记忆 / 归档记忆.
-    return () => page('全局记忆', '工作区独立维护的一层长期记忆：不是各 Agent 记忆的汇总，也不是会话历史。页面只读；Agent 自己的记忆在对应 Agent 详情中查看。', [
+    // 分区按行为命名（常驻 / 可检索）；服务端渲染的标题固定为「核心记忆 / 归档记忆」，
+    // 两者是同一份数据的两个分区，不是两套存储。
+    // Sections are named by behaviour; the rendered headings stay 核心记忆 / 归档记忆.
+    return () => page('全局记忆', '工作区独立维护的一层长期记忆：不是各 Agent 记忆的汇总，也不是会话历史。这里可以查看生效条目，也能按条目提议、确认、纠正与删除；实际使用范围由各 Agent 的配置决定。', [
       memory.error.value ? h(Notice, { tone: 'error', text: memory.error.value }) : null,
       memory.loading.value ? h('p', { class: 'loading' }, '正在读取全局记忆…') : null,
       memory.data.value === null ? null : h('div', { class: 'memory-columns' }, [
         section('常驻记忆', [
-          h('p', { class: 'muted small' }, '运行开始时整段注入系统提示词；每次运行只读一次，运行内不再变化。'),
+          h('p', { class: 'muted small' }, '当 Agent 配置允许使用这一层时，运行开始会读取常驻记忆；运行内已注入的内容不会中途改变。'),
           memory.data.value.core ? h(CodeBlock, { text: memory.data.value.core }) : h('p', { class: 'empty' }, '还没有全局常驻记忆。'),
         ]),
         section('可检索记忆', [
-          h('p', { class: 'muted small' }, '不自动进入上下文；模型需要时按关键词取回，整串子串匹配、区分大小写——是关键词检索，不是语义检索。'),
+          h('p', { class: 'muted small' }, '不自动进入上下文；模型需要时调用 recall_memory 取回，缺省是语义（向量）检索——只有显式传 mode=keyword 时才是整串子串匹配、区分大小写。'),
           memory.data.value.archive ? h(CodeBlock, { text: memory.data.value.archive }) : h('p', { class: 'empty' }, '还没有全局可检索记忆。'),
         ]),
       ]),
-      h('p', { class: 'muted small' }, '生效规则：有 Agent 上下文且该层任一分区有内容 → 用 Agent 层；否则回退到这一层。两层不叠加，Agent 层只有可检索条目时也不会回退。'),
-      h('p', { class: 'muted small' }, '写入只由记忆工具 save_memory 完成：只有 Agent 在运行中成功调用才会产生条目，不会从会话历史或所有对话里自动抽取。会话消息会自动保存为会话历史，但会话历史不会自动变成记忆条目。正常运行的 Agent 只写自己那一层，因此这里通常由维护者直接编辑 .basalt/memory/MEMORY.md（分区标题固定写作「核心记忆 / 归档记忆」）；控制台不提供写入。'),
+      h('p', { class: 'muted small' }, '每个 Agent 可在配置中选择是否同时使用全局记忆；未明确设置时沿用旧规则：Agent 层有内容时只使用该层，否则回退全局层。'),
+      h('p', { class: 'muted small' }, '上面两栏只含生效且未到期的全局条目；某次运行是否使用它们取决于 Agent 配置。全局条目可由本页提议并确认，或从旧工作区一次性导入；普通 Agent 调用 save_memory 时写入自己的层。会话结束不会自动抽取记忆。'),
+      section('按条管理', [
+        h('p', { class: 'muted small' }, '下面是这一层的条目记录：六态、来源、写入时间与可执行动作。这里的改动立即影响下一次运行；正在运行中的 Agent 不会中途改变已注入的内容。'),
+        h(MemoryEntries, { api: props.ctx.api, agent: '' }),
+      ]),
     ])
   },
 })

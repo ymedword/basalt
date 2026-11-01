@@ -27,7 +27,16 @@ const TARGET_KINDS: readonly OperationTargetKind[] = [
   'skill',
   'notify_channel',
   'network_allowlist',
+  'network_denylist',
+  'execution_policy',
+  'network_exception',
   'system',
+  'caller',
+  'instance',
+  'memory',
+  'knowledge_upload',
+  'knowledge_document',
+  'knowledge_collection',
 ]
 
 const TARGET_KIND_LABELS: Record<OperationTargetKind, string> = {
@@ -38,7 +47,16 @@ const TARGET_KIND_LABELS: Record<OperationTargetKind, string> = {
   skill: '技能',
   notify_channel: '通知渠道',
   network_allowlist: '网络白名单',
+  network_denylist: '网络禁止域名',
+  execution_policy: '执行档位',
+  network_exception: '访问例外',
   system: '系统',
+  caller: '调用方',
+  instance: '实例采纳',
+  memory: '记忆条目',
+  knowledge_upload: '知识库上传',
+  knowledge_document: '知识库文档',
+  knowledge_collection: '知识库集合',
 }
 
 const STATUSES: readonly OperationStatus[] = ['pending', 'success', 'failed', 'unknown']

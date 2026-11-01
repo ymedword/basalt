@@ -20,7 +20,7 @@ Independent agents. Shared infrastructure.
 - **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.
 - **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.
 - **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.
-- **Self-hosted operation** — A Go binary with an embedded console and SQLite; no Node or separate database service at runtime.
+- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the `vector` and `pg_trgm` extensions, which you run yourself; no Node service at runtime.
 
 For example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.
 
@@ -32,7 +32,7 @@ The current architecture is single-node, multi-agent hosting with logical Agent 
 
 ## Quick start
 
-For a source build, use Git and the Go toolchain declared in go.mod. You also need a compatible model endpoint, model name and API key. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.
+For a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the `vector` extension (pgvector) and `pg_trgm`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.
 
 ### 1. Build
 
@@ -66,6 +66,8 @@ Expand the minimal configuration below, create basalt.yaml in the current direct
 <summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>
 
 ```yaml
+database:
+  dsn: ${BASALT_DATABASE_DSN}
 providers:
   - name: primary
     base_url: https://api.deepseek.com
@@ -79,9 +81,12 @@ http:
     token: ${BASALT_ADMIN_TOKEN}
 ```
 
+`database.dsn` is mandatory: an unset or unresolved `${...}` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.
+
 #### POSIX environment
 
 ```sh
+export BASALT_DATABASE_DSN="postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 export BASALT_MODEL_KEY="your-own-model-key"
 export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ```
@@ -89,6 +94,7 @@ export BASALT_ADMIN_TOKEN="$(openssl rand -hex 32)"
 #### PowerShell environment
 
 ```powershell
+$env:BASALT_DATABASE_DSN = "postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable"
 $env:BASALT_MODEL_KEY = "your-own-model-key"
 $bytes = New-Object byte[] 32
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()

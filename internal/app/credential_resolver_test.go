@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖托管凭据的按需加载与启动依赖（模块卡 R4.8 / T130）：
@@ -18,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // resolverFixture 在 runResourcesEnv 之上补主密钥与解析器。
@@ -52,7 +54,7 @@ func newTestResolver(t *testing.T, env *runResourcesEnv, masterKeyPath string) *
 		Credentials:   env.credentials,
 		Resources:     env.versions,
 		Notify:        env.admission.NotifyAdmin,
-		Bindings:      storage.NewBindingStore(env.db),
+		Bindings:      postgres.NewBindingStore(env.db),
 		MasterKeyFile: masterKeyPath,
 		WorkspaceRoot: env.root,
 	})
@@ -162,7 +164,7 @@ func (f *resolverFixture) seedManagedChannel(t *testing.T, name, fullURL string)
 // project replaces the binding projection of one agent.
 func (f *resolverFixture) project(t *testing.T, agentUID core.AgentUID, agentName string, bindings core.ResourceBindings) {
 	t.Helper()
-	require.NoError(t, storage.NewBindingStore(f.db).Rebuild(context.Background(), agentUID, agentName,
+	require.NoError(t, postgres.NewBindingStore(f.db).Rebuild(context.Background(), agentUID, agentName,
 		strings.Repeat("c", 64), bindings, baselineClock()))
 }
 

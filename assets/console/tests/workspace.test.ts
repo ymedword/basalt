@@ -28,7 +28,12 @@ function setupFetch(profileFailure = false, responses: Record<string, unknown> =
     if (path.endsWith('/system/overview')) data = summary
     if (path.endsWith('/system/sample')) data = { sampled_at: '2026-10-21T13:00:00Z', cpu_percent: null, memory_rss_bytes: 1024, goroutines: 12, unavailable: ['cpu_percent'] }
     if (path.endsWith('/profiles')) data = profiles
-    if (path.endsWith('/memory')) data = { scope: 'global', agent: '', backend: 'markdown', core: 'shared memory', archive: '' }
+    if (path.endsWith('/memory')) data = { scope: 'global', agent: '', backend: 'postgres', core: 'shared memory', archive: '' }
+    // 记忆页同时挂载按条管理面板（US-16 裁决 A）：读模型单独一条端点，缺了它
+    // 面板拿不到 entries；这里给空列表，条目行为由 tests/memory-entries.test.ts 覆盖。
+    // The memory page also mounts the entry panel; its read model is a separate
+    // endpoint. Give it an empty list — row behaviour lives in its own test file.
+    if (path.endsWith('/memory/entries')) data = { scope: 'global', agent: '', entries: [] }
     if (Object.hasOwn(responses, path)) data = responses[path]
     return { ok: true, status: 200, headers: new Headers(), json: async () => ({ code: 'OK', message: '', data, timestamp: '2026-10-21T13:00:00Z' }) } as Response
   }))

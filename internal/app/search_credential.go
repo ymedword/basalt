@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
@@ -26,7 +26,7 @@ import (
 type webSearchCredentialSlot struct {
 	mu          sync.RWMutex
 	agents      core.AgentSource
-	versions    *storage.ResourceStore
+	versions    *postgres.ResourceStore
 	credentials managedCredentialSource
 }
 
@@ -36,7 +36,7 @@ var _ tool.WebSearchCredentialResolver = (*webSearchCredentialSlot)(nil)
 
 // newWebSearchCredentialSlot 建未绑定槽位（`versions` / `credentials` 装配期确定、之后只读）。
 // newWebSearchCredentialSlot builds the unbound slot.
-func newWebSearchCredentialSlot(versions *storage.ResourceStore, credentials managedCredentialSource) *webSearchCredentialSlot {
+func newWebSearchCredentialSlot(versions *postgres.ResourceStore, credentials managedCredentialSource) *webSearchCredentialSlot {
 	return &webSearchCredentialSlot{versions: versions, credentials: credentials}
 }
 

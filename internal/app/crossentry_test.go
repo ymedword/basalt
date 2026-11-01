@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件落 T040 的跨入口协调验收（颗粒度文档 §3.2.1 的 app/crossentry_test.go，
@@ -25,7 +27,7 @@ import (
 
 	"github.com/ymedword/basalt/assets"
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/web"
 )
@@ -85,8 +87,8 @@ func (e *capturingEngine) job(taskID string) (func(), bool) {
 // state creates one observable in-flight run window.
 type crossEntryEnv struct {
 	t        *testing.T
-	db       *storage.DB
-	sessions *storage.SessionStore
+	db       *postgres.DB
+	sessions *postgres.SessionStore
 	store    core.TaskStore
 	svc      *core.AgentService
 	sched    *core.Scheduler
@@ -122,8 +124,8 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 	}
 
 	db := openScheduleDB(t)
-	sessions := storage.NewSessionStore(db)
-	invocations := storage.NewToolInvocationRepo(db)
+	sessions := postgres.NewSessionStore(db)
+	invocations := postgres.NewToolInvocationRepo(db)
 	registry := tool.NewRegistry(logger)
 	loop := core.NewReActLoop(
 		core.NewPromptBuilder(registry),
@@ -135,7 +137,7 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 		t:        t,
 		db:       db,
 		sessions: sessions,
-		store:    storage.NewTaskStore(db),
+		store:    postgres.NewTaskStore(db),
 		engine:   newCapturingEngine(),
 		bodies:   make(map[*http.Response]string),
 		client:   &http.Client{Timeout: 30 * time.Second},
@@ -150,14 +152,14 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 
 	// 账本只建一次：AgentService 写、web 适配器读（与生产装配同一条纪律）。
 	// One store instance: AgentService writes, the web adapter reads.
-	runs := storage.NewRunStore(db)
+	runs := postgres.NewRunStore(db)
 	env.svc = core.NewAgentService(core.ServiceOptions{
 		Agents:        newAgentRegistry(root, entries, logger),
 		Client:        providerClientFunc(env.chat),
 		Messages:      sessions,
 		Sessions:      sessions,
 		Runs:          runs,
-		Snapshots:     storage.NewSnapshotStore(db),
+		Snapshots:     postgres.NewSnapshotStore(db),
 		Audit:         invocations,
 		Loop:          loop,
 		Logger:        logger,

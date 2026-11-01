@@ -446,8 +446,18 @@ func recoveredStatus(status RunStatus) ExecutionStatus {
 	}
 }
 
-// seedTask 预置一行任务定义（模拟库里既有定义）。
+// seedTask 预置一行任务定义（模拟库里既有定义）。SQLite 谱系只有管理员能建任务，
+// 读出时按迁移规则映射为 `local-admin` + `admin-builtin`——假仓储保持同一口径；
+// 需要考察归属失败的用例请显式覆盖这两个字段。
+// seedTask mirrors the legacy lineage mapping (admin-owned tasks); ownership-negative
+// tests must set the two fields explicitly.
 func (s *fakeTaskStore) seedTask(rec TaskRecord) {
+	if rec.CallerID == "" {
+		rec.CallerID = LocalAdminCallerID
+	}
+	if rec.AuthorizingKind == "" {
+		rec.AuthorizingKind = AuthorizingKindAdminBuiltin
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tasks[rec.TaskID] = rec

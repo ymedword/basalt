@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件判卷网络域名白名单写入的启动恢复（US-12 R8.2.4 第 6 条）：按 `detail_json`

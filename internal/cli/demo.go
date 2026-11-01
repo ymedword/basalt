@@ -215,7 +215,8 @@ func newDemoCommand(deps Deps) *cobra.Command {
 		},
 	}
 	install.Flags().StringSliceVar(&opts.Demos, "demo", nil, "只安装指定 Demo（可重复；缺省为全部五个）")
-	install.Flags().BoolVar(&opts.Force, "force", false, "覆盖已存在的 Agent 目录并重建样例库")
+	install.Flags().BoolVar(&opts.Force, "force", false,
+		"重建已存在的 Agent 目录与样例库：会**删除整个目录**（含同目录下的用户文件），不是只更新模板正文")
 	install.Flags().BoolVar(&opts.DryRun, "dry-run", false, "只打印安装计划，不写任何文件")
 	demo.AddCommand(install)
 	return demo
@@ -238,7 +239,12 @@ func runDemoInstall(ctx context.Context, out io.Writer, deps Deps, opts demoInst
 	}
 
 	if opts.DryRun {
-		writeDemoPlan(out, wsRoot, selected)
+		// 试运行也要解析解释器：三态比较要把 `{{BASALT_PYTHON}}` 替换成安装时会写进去的
+		// 那一串，否则"装过的目录"永远带着占位符差异，每次都报「已修改」。
+		// The dry run needs the same interpreter substitution the real install performs,
+		// otherwise every installed tree would look permanently modified.
+		interpreter, _ := resolveDemoInterpreter(ctx)
+		writeDemoPlan(out, wsRoot, selected, interpreter)
 		return nil
 	}
 
@@ -570,14 +576,29 @@ func writeDemoManifest(wsRoot string, manifest demoManifest) error {
 	return nil
 }
 
-// writeDemoPlan 是 --dry-run 的输出：只列将写入的路径，不碰磁盘。
-// writeDemoPlan prints the would-be writes for --dry-run.
-func writeDemoPlan(out io.Writer, wsRoot string, selected []demoSpec) {
+// 三态字面量：与 `internal/builtin` 的比较结果一一对应，报告与判据共用同一批字符串。
+// The three literals shared by the plan output and its regression test.
+const (
+	demoPlanStateNew       = "新建"
+	demoPlanStateIdentical = "一致"
+	demoPlanStateModified  = "已修改"
+)
+
+// writeDemoPlan 是 --dry-run 的输出：只列将写入的路径与「模板 vs 已装」的三态，
+// 不碰磁盘。三态是覆盖决策的依据——`modified` 只报告差异，安装仍会保留原目录；
+// 真要换成模板内容只能 `--force`，而它删的是**整个**目录。
+// writeDemoPlan prints the would-be writes and the three-way template drift; the
+// overwrite decision stays with the operator.
+func writeDemoPlan(out io.Writer, wsRoot string, selected []demoSpec, interpreter string) {
 	fmt.Fprintf(out, "试运行：工作区 %s\n", wsRoot)
 	for _, spec := range selected {
-		fmt.Fprintf(out, "  %s → %s\n", spec.Name, filepath.Join(wsRoot, agentsDirName, spec.Name))
+		agentDir := filepath.Join(wsRoot, agentsDirName, spec.Name)
+		fmt.Fprintf(out, "  %s → %s（%s）\n", spec.Name, agentDir,
+			demoPlanDrift("daily/"+spec.Name, agentDir, map[string]bool{"skills": true}, interpreter))
 		if spec.Skill != "" {
-			fmt.Fprintf(out, "  %s 技能 → %s\n", spec.Name, filepath.Join(wsRoot, demoSkillsDirName, spec.Skill))
+			skillDir := filepath.Join(wsRoot, demoSkillsDirName, spec.Skill)
+			fmt.Fprintf(out, "  %s 技能 → %s（%s）\n", spec.Name, skillDir,
+				demoPlanDrift(path.Join("daily", spec.Name, "skills", spec.Skill), skillDir, nil, interpreter))
 		}
 	}
 	if needsDemoSample(selected) {
@@ -591,6 +612,29 @@ func writeDemoPlan(out io.Writer, wsRoot string, selected []demoSpec) {
 		fmt.Fprintf(out, "  %s → %s（含生成的 go.mod）\n", "docs-readonly 源码", demoSrcDir(wsRoot))
 	}
 	fmt.Fprintf(out, "  %s → %s\n", "安装清单", filepath.Join(wsRoot, "demos", "install.json"))
+}
+
+// demoPlanDrift 把一次比较折成一行文案：新建 / 一致 / 已修改（附差异文件）。
+// 比较本身只读，出错时也降级成一句说明——试运行不该因为读不到某个文件就整条失败。
+// demoPlanDrift folds one comparison into the plan line; a read failure degrades to a
+// note rather than aborting the whole dry run.
+func demoPlanDrift(srcRoot, dstRoot string, skip map[string]bool, interpreter string) string {
+	comparison, err := builtin.CompareTree(srcRoot, dstRoot, skip, interpreter)
+	if err != nil {
+		return "无法比较：" + firstLine(err.Error())
+	}
+	switch comparison.State {
+	case builtin.TreeStateMissing:
+		return demoPlanStateNew
+	case builtin.TreeStateIdentical:
+		return demoPlanStateIdentical
+	default:
+		changed := append(append([]string(nil), comparison.Changed...), comparison.Missing...)
+		if len(changed) == 0 {
+			return demoPlanStateModified
+		}
+		return demoPlanStateModified + "：" + strings.Join(changed, "、")
+	}
 }
 
 // writeDemoReport 打印安装结果与逐项待办：模型、MCP、依赖、凭据、权限。

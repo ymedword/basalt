@@ -500,8 +500,9 @@ type AgentConfigView struct {
 // AgentConfigFieldsView mirrors the frontmatter keys; temperature keeps the explicit
 // zero apart from an absent value.
 type AgentConfigFieldsView struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Knowledge   []core.KnowledgeBinding `json:"knowledge"`
+	Name        string                  `json:"name"`
+	Description string                  `json:"description"`
 	// DisplayName 是 AGENT.md 的原文值（可为空串）；展示投影另做回退，不在这里补。
 	// DisplayName is the raw file value; list / detail views perform the fallback.
 	DisplayName      string                    `json:"display_name"`
@@ -544,8 +545,9 @@ type AgentConfigBindingsView struct {
 // AgentConfigSettingsView 是 settings 段：缺省值已在装载期填好（10 / 20）。
 // AgentConfigSettingsView carries the effective settings after load-time defaults.
 type AgentConfigSettingsView struct {
-	MaxIterations   int `json:"max_iterations"`
-	MaxHistoryTurns int `json:"max_history_turns"`
+	MaxIterations       int   `json:"max_iterations"`
+	MaxHistoryTurns     int   `json:"max_history_turns"`
+	IncludeGlobalMemory *bool `json:"include_global_memory,omitempty"`
 }
 
 // AgentConfigScheduleView 是一条定时声明（与 `schedules` 页签同一形状）。
@@ -594,12 +596,14 @@ const (
 // ErrorDataView 是失败信封 `data` 的白名单投影：只允许契约固定的四个字符串数组
 // （agents / active_runs / run_ids / problems）、条件写的当前 ETag（current_etag）、
 // `pending` 之后失败的 `operation_id`（约束 1a：失败行必须可经
-// `GET /operations/{id}` 追查）与 `RESOURCE_UID_MISMATCH` 的当前 `resource_uid`。
-// 其余键——定义正文、凭证、内部路径——**不得**经由本结构出站。
+// `GET /operations/{id}` 追查）、`RESOURCE_UID_MISMATCH` 的当前 `resource_uid` 与
+// `POST /search` 的稳定 `reason_code`（US-16）。其余键——定义正文、凭证、内部路径
+// ——**不得**经由本结构出站。
 // ErrorDataView is the whitelisted failure payload: the four string arrays, the
 // current ETag of a conditional write, the operation id of a post-pending failure,
-// the current resource uid of a uid mismatch, and the live execution profile of a
-// direction mismatch; definition bodies and credentials have no carrier here.
+// the current resource uid of a uid mismatch, the live execution profile of a
+// direction mismatch, and the contract's search reason code; definition bodies and
+// credentials have no carrier here.
 // 四个数组用指针区分"未携带"（nil，字段省略）与"携带空数组"（非 nil 空切片，
 // 输出 `[]`）——`omitempty` 会把空切片也省略掉，契约不允许。`current_etag` /
 // `operation_id` / `current_profile` 同理：空串视为未携带。
@@ -614,6 +618,11 @@ type ErrorDataView struct {
 	OperationID    *string   `json:"operation_id,omitempty"`
 	ResourceUID    *string   `json:"resource_uid,omitempty"`
 	CurrentProfile *string   `json:"current_profile,omitempty"`
+	// ReasonCode 是契约点名的稳定原因码（US-16：`POST /search` 两路皆失败时的
+	// `data.reason_code`），取值是冻结枚举而不是自由文本——调用方要能机判"哪一路
+	// 不可用"，所以它必须是结构字段，不能拼进 message。
+	// ReasonCode carries the contract's stable reason code for a failed search.
+	ReasonCode *string `json:"reason_code,omitempty"`
 }
 
 // errorDataView 从 `core.AdminError` 的 data 里只取四个固定数组、`current_etag`、
@@ -652,6 +661,9 @@ func errorDataView(err error) (ErrorDataView, bool) {
 	}
 	if uid, ok := raw["resource_uid"].(string); ok && uid != "" {
 		view.ResourceUID, present = &uid, true
+	}
+	if reason, ok := raw["reason_code"].(string); ok && reason != "" {
+		view.ReasonCode, present = &reason, true
 	}
 	if !present {
 		return ErrorDataView{}, false

@@ -101,6 +101,7 @@ func (h *loopHarness) assembleWith(maxConcurrent int, sessions core.SessionStatu
 		Snapshots:     store,
 		Audit:         h.audit,
 		Memory:        h.memory, // 随已批准接口适配（默认 nil = 段 2 恒空；判据不变）
+		RunQuota:      h.runQuota,
 		Loop:          core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
 		Logger:        logger,
 		Now:           func() time.Time { return h.now },
@@ -479,7 +480,7 @@ type failingMemoryReader struct {
 
 // LoadEffective 恒返回注入错误。
 // LoadEffective always returns the injected error.
-func (r failingMemoryReader) LoadEffective(context.Context, string) (string, error) {
+func (r failingMemoryReader) LoadEffective(context.Context, core.Principal, string) (string, error) {
 	return "", r.err
 }
 
@@ -513,6 +514,147 @@ func TestAgentService_InjectsCoreMemorySegment(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, baseline, empty.provider.request(0).Messages[0].Content,
 		"空记忆不得在系统提示词里留下任何痕迹")
+}
+
+type layeredReaderTest struct {
+	principal core.Principal
+	enabled   bool
+	text      string
+}
+
+func (*layeredReaderTest) LoadEffective(context.Context, core.Principal, string) (string, error) {
+	return "legacy", nil
+}
+
+func (r *layeredReaderTest) LoadLayers(_ context.Context, _ string, p core.Principal, enabled bool) (string, error) {
+	r.principal, r.enabled = p, enabled
+	if r.text != "" {
+		return r.text, nil
+	}
+	return "shared-and-local", nil
+}
+
+func TestAgentService_ExplicitMemoryLayersAreFrozenAndFailClosed(t *testing.T) {
+	enabled := true
+	reader := &layeredReaderTest{}
+	h := newLoopHarness(t, withMemory(reader))
+	h.agents.includeGlobalMemory = &enabled
+	h.provider.onCall(0, textResponse("好"))
+	result, err := h.service.Run(ctx, h.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, result.Status)
+	require.True(t, reader.enabled)
+	require.Equal(t, h.req("").Principal, reader.principal,
+		"合并注入路径拿到的就是本次 Run 的实际身份（不是零值、也不是补齐的管理员）")
+	require.Contains(t, h.provider.request(0).Messages[0].Content, "shared-and-local")
+
+	missing := newLoopHarness(t, withMemory(fakeMemoryReader{text: "legacy"}))
+	missing.agents.includeGlobalMemory = &enabled
+	result, err = missing.service.Run(ctx, missing.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusFailed, result.Status)
+	require.Zero(t, missing.provider.callCount())
+
+	oversized := newLoopHarness(t, withMemory(&layeredReaderTest{text: strings.Repeat("共享偏好", 20000)}))
+	oversized.agents.includeGlobalMemory = &enabled
+	oversized.budget.ContextTokens = 8192
+	result, err = oversized.service.Run(ctx, oversized.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusFailed, result.Status)
+	require.Contains(t, result.Reason, "budget.context_tokens")
+	require.Zero(t, oversized.provider.callCount())
+}
+
+// legacyRecorder 记录未声明路径收到的身份与 Agent 名：`include_global_memory` 缺省时
+// 门面拿到的必须是本次 Run 的**真实**身份——全局记忆回退要在门面里按它复核，传零值或
+// 补齐成管理员都会让"撤销的 Key 仍能读全局层"。
+// legacyRecorder records what the unset path hands to the facade: the run's own identity.
+type legacyRecorder struct {
+	principal core.Principal
+	agent     string
+	reads     int
+}
+
+func (r *legacyRecorder) LoadEffective(_ context.Context, p core.Principal, agent string) (string, error) {
+	r.principal, r.agent = p, agent
+	r.reads++
+	return "## 核心记忆\n\n- 旧偏好", nil
+}
+
+// TestAgentService_UnsetMemorySettingKeepsLegacyPath 守「未声明 = 沿用旧规则且不叠加」：
+// 配置缺省**不得**走分层读取（那会把全局层叠进来），但门面仍要拿到本次 Run 的身份。
+// 逆改点：把缺省分支改成 `IncludeGlobalMemory != nil` 之外的写法 / 传 `core.Principal{}`
+// 或 `core.LocalAdminPrincipal()` → 身份断言红；改走 `LoadLayers` → 内容断言红。
+// 验收点：C-52；review ② D-1。
+func TestAgentService_UnsetMemorySettingKeepsLegacyPath(t *testing.T) {
+	reader := &legacyRecorder{}
+	h := newLoopHarness(t, withMemory(reader))
+	h.provider.onCall(0, textResponse("好"))
+	req := h.req("你好")
+
+	result, err := h.service.Run(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, result.Status)
+	require.Equal(t, 1, reader.reads, "未声明路径走 LoadEffective，且整次运行只读一次")
+	require.Equal(t, req.Principal, reader.principal, "门面拿到本次 Run 的真实身份")
+	require.Equal(t, req.Agent, reader.agent)
+	require.Contains(t, h.provider.request(0).Messages[0].Content, "旧偏好")
+}
+
+// TestAgentService_MemorySettingFalseSelectsLayersNotLegacy 守「显式 false 与未声明是
+// 两条路」：`false` 必须走分层读取（永不回退），**不得**被当成缺省而复用旧规则。
+// 逆改点：把 `IncludeGlobalMemory != nil` 判成 `!= nil && *==true` → 落到 LoadEffective
+// → 内容变成 "legacy" → 红。
+// 验收点：C-52；review ② D-1。
+func TestAgentService_MemorySettingFalseSelectsLayersNotLegacy(t *testing.T) {
+	disabled := false
+	reader := &layeredReaderTest{}
+	h := newLoopHarness(t, withMemory(reader))
+	h.agents.includeGlobalMemory = &disabled
+	h.provider.onCall(0, textResponse("好"))
+
+	result, err := h.service.Run(ctx, h.req("你好"))
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, result.Status)
+	require.False(t, reader.enabled, "false 走分层读取且 includeGlobal=false")
+	require.Equal(t, core.LocalAdminCLIPrincipal(), reader.principal)
+	content := h.provider.request(0).Messages[0].Content
+	require.Contains(t, content, "shared-and-local")
+	require.NotContains(t, content, "legacy", "不得回落到未声明的兼容路径")
+}
+
+// TestAgentService_ShareGlobalMemoryFollowsTriState 守「三态决定共享召回」的接线面：
+// 每次工具调用拿到的 `ToolEnv.ShareGlobalMemory` 必须严格等于 Agent 设置三态的解——
+// 只有显式 `true` 才共享；**未声明**与 `false` 都不是共享（缺省**不得**被读成共享，
+// 否则升级后存量 Agent 的每次召回都多花一次 embedding）。
+// 逆改点：`RunEnv.ToolEnv` 把判据写成 `IncludeGlobalMemory != nil` → 未声明用例红；
+// 写成恒 `true` / 恒 `false` → 另外两条红；只读 `Profile.Settings` 的零值 → 显式两例红。
+// 验收点：C-52；review ② D-1/D-4。
+func TestAgentService_ShareGlobalMemoryFollowsTriState(t *testing.T) {
+	enabled, disabled := true, false
+	cases := []struct {
+		name  string
+		value *bool
+		want  bool
+	}{
+		{name: "未声明", value: nil, want: false},
+		{name: "显式 true", value: &enabled, want: true},
+		{name: "显式 false", value: &disabled, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newLoopHarness(t, withMemory(&layeredReaderTest{}))
+			h.agents.includeGlobalMemory = tc.value
+			h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":"AGENT.md"}`))
+			h.provider.onCall(1, textResponse("好"))
+
+			res, err := h.service.Run(ctx, h.req("读"))
+			require.NoError(t, err)
+			require.Equal(t, core.StatusCompleted, res.Status)
+			require.Equal(t, tc.want, h.tools.executedEnv().ShareGlobalMemory,
+				"ToolEnv.ShareGlobalMemory 必须严格等于三态的解，不得靠 != nil 推断")
+		})
+	}
 }
 
 // R2 —— 运行内冻结：整次运行只读一次记忆，第 2 轮不得看到"改后"文本（core 层）。
@@ -557,8 +699,8 @@ func TestAgentService_NilMemoryLeavesSegmentTwoEmpty(t *testing.T) {
 	res, err := h.service.Run(ctx, h.req("你好"))
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status)
-	require.Equal(t, sectionOneStatic, h.provider.request(0).Messages[0].Content,
-		"nil 端口 = 段 2 不产生任何文本（与 US-4 逐字节相同）")
+	require.Equal(t, sectionOneStatic+"\n\n"+instantRunOrigin, h.provider.request(0).Messages[0].Content,
+		"nil 端口 = 不产生记忆段，仅有快照与运行来源")
 }
 
 // R4b —— 注入后超上下文预算 → 拒绝启动、Reason 点名预算键、零 LLM（core 层）。
@@ -1457,6 +1599,40 @@ func TestAgentService_Resources_ToolEnvCarriesFrozenNotifyChannels(t *testing.T)
 		"资源接线后快照里的声明名不得进入运行面")
 	require.Equal(t, core.NotifyModeAllowlist, env.NotifyMode, "冻结模式随 UID 集合一起进入 ToolEnv")
 	require.True(t, env.RunBound, "运行内调用必须带 RunBound 标记：工具按 UID 判定而不是按名字")
+}
+
+// TestAgentService_Resources_ToolEnvCarriesAdmittedPrincipal（US-16 P-07 / C-11）：准入时
+// 接受的调用方身份必须**逐字段**进入每次工具调用的 ToolEnv——归属（CallerID / KeyID）与
+// 执行者（Actor）都随它显式传递，工具不得从模型入参、Agent 名或包级状态反推，也不得补成
+// 管理员。这里用**调度执行者**的调用方身份：若 `RunEnv.ToolEnv` 忘了注入、或把身份换回
+// 夹具默认的 CLI 管理员，本用例红。
+// The admitted principal (owner and actor) reaches every tool call verbatim.
+func TestAgentService_Resources_ToolEnvCarriesAdmittedPrincipal(t *testing.T) {
+	h := newLoopHarness(t)
+	h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":"AGENT.md"}`))
+	h.provider.onCall(1, textResponse("done"))
+	runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+	resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+	svc, _ := h.assembleWithResources(resources, &fakeSnapshotBuilder{})
+
+	caller, err := core.OwnedPrincipal(
+		"caller-core-test", core.AuthorizingKindCallerKey, "key-core-test",
+		[]string{core.AgentInvokeScopePrefix + loopAgentName}, core.ActorScheduler)
+	require.NoError(t, err)
+
+	req := h.req("读")
+	req.Principal = caller // 夹具默认是 CLI 管理员；这里换成真实调用方
+	res, err := svc.Run(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, core.StatusCompleted, res.Status)
+
+	env := h.tools.executedEnv()
+	require.Equal(t, caller, env.Principal,
+		"ToolEnv 携带的必须是准入那一份身份：归属与执行者逐字段相等，不得改写")
+	require.Equal(t, core.ActorScheduler, env.Principal.Actor,
+		"后台执行者标记必须保留（归属与执行者是两个字段，不得压成一个）")
+	require.NotEqual(t, core.LocalAdminCallerID, env.Principal.CallerID,
+		"调用方身份不得被补成内置管理员")
 }
 
 // TestAgentService_Resources_MissingPinnedClientFailsClosed：准入固定的映射表里没有该

@@ -11,14 +11,29 @@ import {
   instanceSecretsNeedsRecovery,
   isInstanceSecretsView,
 } from './instance-secrets'
-import { CONSOLE_BASE, ConsoleRouter, loginPath, resourceHref } from './router'
+import {
+  CONSOLE_BASE,
+  ConsoleRouter,
+  callersHref,
+  diagnosticsHref,
+  historyHref,
+  knowledgeHref,
+  loginPath,
+  resourceHref,
+} from './router'
 import type { RouteMatch, RouteName } from './router'
 import { AgentConfigPage } from './views/agent-config'
 import { AgentDetailView } from './views/agent-detail'
 import { AgentsNewView } from './views/agents-new'
 import { AgentsView } from './views/agents'
 import { ArchivedAgentsView } from './views/archived-agents'
+import { CallerDetailView } from './views/caller-detail'
+import { CallersView } from './views/callers'
 import { CatalogView } from './views/catalog'
+import { DiagnosticsView } from './views/diagnostics'
+import { DocumentDetailView } from './views/document-detail'
+import { HistoryView } from './views/history'
+import { KnowledgeView } from './views/knowledge'
 import { LoginView } from './views/login'
 import { NotFoundView } from './views/not-found'
 import { OperationsView } from './views/operations'
@@ -42,6 +57,10 @@ const VIEWS: Record<RouteName, Component> = {
   archived: ArchivedAgentsView, workspace: WorkspaceBrowserView,
   operations: OperationsView, 'not-found': NotFoundView,
   tools: ToolsView, memory: GlobalMemoryView, notifications: NotificationsView, sandbox: SandboxView,
+  callers: CallersView, 'caller-detail': CallerDetailView,
+  knowledge: KnowledgeView, 'knowledge-collection': KnowledgeView,
+  'document-detail': DocumentDetailView,
+  diagnostics: DiagnosticsView, history: HistoryView,
 }
 interface NavItem { label: string; href: string; code: string; names?: readonly RouteName[] }
 const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
@@ -53,12 +72,16 @@ const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
     { label: '模型与连接', href: resourceHref('model-connections'), code: '03' },
     { label: '工具与 MCP', href: CONSOLE_BASE + '/library/tools', code: '04', names: ['tools'] },
     { label: '技能', href: resourceHref('skills'), code: '05' },
-    { label: '全局记忆', href: CONSOLE_BASE + '/library/memory', code: '06', names: ['memory'] },
+    { label: '知识库', href: knowledgeHref(), code: '06', names: ['knowledge', 'knowledge-collection', 'document-detail'] },
+    { label: '全局记忆', href: CONSOLE_BASE + '/library/memory', code: '07', names: ['memory'] },
   ] },
   { label: '系统管理', items: [
-    { label: '通知渠道', href: CONSOLE_BASE + '/settings/notifications', code: '07', names: ['notifications'] },
-    { label: '执行环境', href: CONSOLE_BASE + '/settings/sandbox', code: '08', names: ['sandbox'] },
-    { label: '管理操作', href: CONSOLE_BASE + '/operations', code: '09', names: ['operations'] },
+    { label: '通知渠道', href: CONSOLE_BASE + '/settings/notifications', code: '08', names: ['notifications'] },
+    { label: '执行环境', href: CONSOLE_BASE + '/settings/sandbox', code: '09', names: ['sandbox'] },
+    { label: '管理操作', href: CONSOLE_BASE + '/operations', code: '10', names: ['operations'] },
+    { label: '调用方', href: callersHref(), code: '11', names: ['callers', 'caller-detail'] },
+    { label: '诊断事件', href: diagnosticsHref(), code: '12', names: ['diagnostics'] },
+    { label: '历史回查', href: historyHref(), code: '13', names: ['history'] },
   ] },
 ]
 const TITLES: Record<RouteName, string> = {
@@ -69,6 +92,9 @@ const TITLES: Record<RouteName, string> = {
   archived: '已归档 Agents', workspace: '工作区文件',
   operations: '管理操作', 'not-found': '页面不存在',
   tools: '工具与 MCP', memory: '全局记忆', notifications: '通知渠道', sandbox: '执行环境',
+  callers: '调用方', 'caller-detail': '调用方详情',
+  knowledge: '知识库', 'knowledge-collection': '知识库', 'document-detail': '文档详情',
+  diagnostics: '诊断事件', history: '历史回查',
 }
 function currentLocation(): string { return window.location.pathname + window.location.search }
 function navActive(item: NavItem, match: RouteMatch): boolean {

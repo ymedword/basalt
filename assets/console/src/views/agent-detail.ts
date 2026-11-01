@@ -19,6 +19,7 @@ import type {
 import { adminApi } from '../api-admin'
 import type { CredentialResourceKind, ResourceMapping, ScheduleDraftView } from '../api-admin'
 import { AgentReadinessPanels } from '../components/agent-readiness'
+import { MemoryEntries } from '../components/memory-entries'
 import {
   CodeBlock,
   ConfirmDialog,
@@ -1205,17 +1206,18 @@ export const AgentDetailView = defineComponent({
     }
 
     // 记忆展示按实际行为命名：常驻区每轮完整注入且不裁剪；可检索区只在
-    // recall_memory 关键词命中时进入上下文，不是语义检索、也不是自动抽取。
-    // 文件分区标题仍是契约固定的「核心记忆 / 归档记忆」，这里给出的是行为名。
-    // The memory view names the two partitions by behaviour; the file headings stay
-    // the contract literals 核心记忆 / 归档记忆.
+    // recall_memory 命中时进入上下文（缺省语义检索，mode=keyword 才是整串子串
+    // 匹配），也不会自动抽取。分区标题仍是契约固定的「核心记忆 / 归档记忆」。
+    // The memory view names the two partitions by behaviour; the headings stay the
+    // contract literals 核心记忆 / 归档记忆.
     function renderMemoryView(view: MemoryView): VNodeChild {
       const parts: VNodeChild[] = []
       parts.push(
         h(
           'p',
           { class: 'muted small' },
-          '本页只读：记忆的写入只经记忆工具 save_memory（运行中由 Agent 调用），页面不提供新增、修改或删除。',
+          '上面两栏是运行期实际使用的渲染结果；下面的「按条管理」可以查看六态条目、显式提议候选、确认、纠正与删除。' +
+            '使用边界：运行中是否调用 save_memory 由模型自行判断，不代表你每次都明确要求保存——需要可靠保留的内容请直接在本页提议并确认。',
         ),
       )
       parts.push(
@@ -1223,8 +1225,8 @@ export const AgentDetailView = defineComponent({
           h(
             'p',
             { class: 'muted small' },
-            '每次运行都会把这一整段完整注入系统提示词，不参与历史裁剪（文件分区标题为「核心记忆」）。' +
-              '写入来自 Agent 在运行中调用 save_memory 且 scope=CORE；控制台不提供写入，手工维护需编辑服务端记忆文件。',
+            '每次运行都会把这一整段完整注入系统提示词，不参与历史裁剪（分区标题为「核心记忆」）。' +
+              '写入来自 Agent 在运行中调用 save_memory 且 scope=CORE，或本页提议后确认；不会从对话里自动抽取。',
           ),
           view.core === ''
             ? h(
@@ -1240,8 +1242,9 @@ export const AgentDetailView = defineComponent({
           h(
             'p',
             { class: 'muted small' },
-            '不会自动注入上下文。Agent 调用 recall_memory 时按关键词匹配这一区，命中的条目才进入当次运行' +
-              '（文件分区标题为「归档记忆」）。不是语义检索，也不会自动从对话里抽取内容。',
+            '不会自动注入上下文。Agent 调用 recall_memory 时检索这一区：缺省是语义（向量）检索，' +
+              '显式传 mode=keyword 才是整串子串匹配（分区标题为「归档记忆」）。命中的条目才进入当次运行，' +
+              '也不会自动从对话里抽取内容。',
           ),
           view.archive === ''
             ? h(
@@ -1260,7 +1263,7 @@ export const AgentDetailView = defineComponent({
           tone: 'info',
           text:
             '会话消息随每次运行自动保存为会话历史（在「会话」页签查看），但那只代表对话记录本身：' +
-            '它不会自动进入长期记忆，也不会在对话结束后被抽取成记忆条目。长期记忆只有 Agent 在运行中调用 save_memory 才会写入。',
+            '它不会自动进入长期记忆，也不会在对话结束后被抽取成记忆条目。记忆可由 Agent 调用 save_memory 写入，也可在此页提议并确认。',
         }),
       )
       parts.push(
@@ -1268,9 +1271,19 @@ export const AgentDetailView = defineComponent({
           tone: 'info',
           text:
             view.scope === 'agent'
-              ? '此页只显示这个 Agent 自己的记忆层，不会回退到全局记忆。运行时若该层为空，提示词会使用工作区的全局记忆；两层不会叠加，因此页面为空不代表运行中没有可用记忆。'
+              ? '此页只显示该 Agent 的记忆。运行时可在“配置 → 高级设置”选择同时使用全局记忆或仅使用本 Agent 记忆；未明确设置时沿用原有回退规则。'
               : '全局记忆是工作区独立维护的一层，不是各 Agent 记忆的汇总。正常 Agent 运行只写自己的记忆层；只有不带 Agent 身份的运行才会写入这里。',
         }),
+      )
+      parts.push(
+        section('按条管理', [
+          h(
+            'p',
+            { class: 'muted small' },
+            '改这里的条目只影响这个 Agent 自己的记忆层；下一次运行才生效，正在运行中的会话不会中途改变已注入的内容。',
+          ),
+          h(MemoryEntries, { api: api, agent: view.agent }),
+        ]),
       )
       return h('div', { class: 'tab-panel' }, parts)
     }

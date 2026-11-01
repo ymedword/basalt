@@ -34,6 +34,12 @@ func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// adminPrincipal 是读取面用例的缺省身份：没有 Agent 上下文时读的就是全局层本身，
+// 这一档只允许本地管理员（US-16 D-1）；带 Agent 的用例用它同样通过 scope 与 Key 复核。
+// adminPrincipal is the default identity for read-side tests: the agent-less global layer
+// is readable only by a local admin, and the same identity passes the agent-scoped checks.
+func adminPrincipal() core.Principal { return core.LocalAdminPrincipal() }
+
 // captureWriter 是 R4a 的日志判卷面：captureLogger 写入、logs 取回。全包共一份——
 // 只有判 WARN 的那条用例需要留痕（其余用例走 testLogger 丢弃）；本包用例不并行，
 // 加锁防未来并行化时的数据竞争。每次构造清空：logs 只反映本次用例。
@@ -117,7 +123,7 @@ func TestService_LoadEffective_ReturnsCoreSectionOnly(t *testing.T) {
 	require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionCore, "- 每轮都要看的偏好"))
 	require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionArchive, "- 只在检索时露面的细节"))
 
-	got, err := svc.LoadEffective(ctx, "")
+	got, err := svc.LoadEffective(ctx, adminPrincipal(), "")
 	require.NoError(t, err)
 	require.Contains(t, got, "每轮都要看的偏好", "生效层 = 核心区")
 	require.NotContains(t, got, "只在检索时露面的细节", "归档区不进注入面")
@@ -150,7 +156,7 @@ func TestService_Sections_TwoPartitionsAndEmptyAsEmptyString(t *testing.T) {
 			require.Contains(t, archiveText, "只在检索时露面的细节")
 			require.NotContains(t, archiveText, "每轮都要看的偏好")
 
-			injection, err := svc.LoadEffective(ctx, "")
+			injection, err := svc.LoadEffective(ctx, adminPrincipal(), "")
 			require.NoError(t, err)
 			require.Equal(t, coreText, injection, "Sections 核心区必须与 LoadEffective 同源")
 		})
@@ -183,13 +189,13 @@ func TestService_LoadEffective_TwoLayerFallbackWithoutStacking(t *testing.T) {
 
 			// ① 全局层有内容、Agent 层空 → 生效层 = 全局层。
 			require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionCore, "- 全局偏好"))
-			got, err := svc.LoadEffective(ctx, "alice")
+			got, err := svc.LoadEffective(ctx, adminPrincipal(), "alice")
 			require.NoError(t, err)
 			require.Contains(t, got, "- 全局偏好")
 
 			// ② Agent 层有核心条目 → 只注 Agent 层，全局层不叠加。
 			require.NoError(t, svc.Append(ctx, agentScope, core.SectionCore, "- alice 偏好"))
-			got, err = svc.LoadEffective(ctx, "alice")
+			got, err = svc.LoadEffective(ctx, adminPrincipal(), "alice")
 			require.NoError(t, err)
 			require.Contains(t, got, "- alice 偏好")
 			require.NotContains(t, got, "- 全局偏好", "两层不叠加")
@@ -197,18 +203,18 @@ func TestService_LoadEffective_TwoLayerFallbackWithoutStacking(t *testing.T) {
 			// ③ 另一个 Agent 的层里**只有归档条目**：层非空 → 生效层仍是它自己这一层；
 			//    核心区切出为空（段 2 不产生文本），**不得**因此回退去注全局层核心区。
 			require.NoError(t, svc.Append(ctx, core.Scope{Agent: "bob"}, core.SectionArchive, "- bob 归档条目"))
-			got, err = svc.LoadEffective(ctx, "bob")
+			got, err = svc.LoadEffective(ctx, adminPrincipal(), "bob")
 			require.NoError(t, err)
 			require.Empty(t, got, "Agent 层只有归档区 → 段 2 空（层非空即生效层，不回退全局层核心区）")
 
 			// ④ 归档区不进注入面（口径 1）：alice 的归档条目同样不出现。
 			require.NoError(t, svc.Append(ctx, agentScope, core.SectionArchive, "- alice 归档条目"))
-			got, err = svc.LoadEffective(ctx, "alice")
+			got, err = svc.LoadEffective(ctx, adminPrincipal(), "alice")
 			require.NoError(t, err)
 			require.NotContains(t, got, "- alice 归档条目", "归档区不进系统提示词")
 
 			// ⑤ 无 Agent 上下文（空串）= 全局层，是正常取值不是异常。
-			got, err = svc.LoadEffective(ctx, "")
+			got, err = svc.LoadEffective(ctx, adminPrincipal(), "")
 			require.NoError(t, err)
 			require.Contains(t, got, "- 全局偏好")
 		})
@@ -258,14 +264,14 @@ func TestService_LoadEffective_ErrorTiersDoNotCollapse(t *testing.T) {
 	require.NoError(t, svc.Append(ctx, core.GlobalScope, core.SectionCore, "- 全局偏好"))
 
 	// ① 文件不存在 = 空层（**不是**失败）：生效层回退到全局层核心区。
-	got, err := svc.LoadEffective(ctx, "alice") // memory/agents/alice/MEMORY.md 尚不存在
+	got, err := svc.LoadEffective(ctx, adminPrincipal(), "alice") // memory/agents/alice/MEMORY.md 尚不存在
 	require.NoError(t, err, "文件不存在是正常取值，不是读取失败")
 	require.Contains(t, got, "- 全局偏好", "缺失档照常回退全局层")
 
 	// ② I/O 失败 = 读取失败：上抛，**不得**回退（注入面据此拒绝启动，约束 23）。
 	failing, err := memory.NewService(memory.Options{Backend: errorStore{err: fs.ErrPermission}, Logger: testLogger(t)})
 	require.NoError(t, err)
-	got, err = failing.LoadEffective(ctx, "alice")
+	got, err = failing.LoadEffective(ctx, adminPrincipal(), "alice")
 	require.Error(t, err, "I/O 失败必须上抛（不得当空层回退继续跑）")
 	require.Empty(t, got, "失败时不得返回任何可注入文本")
 
@@ -275,7 +281,7 @@ func TestService_LoadEffective_ErrorTiersDoNotCollapse(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(file), 0o750))
 	require.NoError(t, os.WriteFile(file, []byte(manual), 0o600))
 
-	got, err = svc.LoadEffective(ctx, "alice")
+	got, err = svc.LoadEffective(ctx, adminPrincipal(), "alice")
 	require.Error(t, err, "结构损坏拒绝使用（不得当空层回退去注全局层）")
 	require.Empty(t, got)
 	require.Contains(t, err.Error(), "归档记忆", "错误文案点名声称与症状（缺哪个标题）")
@@ -398,7 +404,7 @@ func TestOversizedManualMemory_WarnsAndInjectsFully(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "memory"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "memory", "MEMORY.md"), []byte(manual), 0o600))
 
-	got, err := svc.LoadEffective(ctx, "")
+	got, err := svc.LoadEffective(ctx, adminPrincipal(), "")
 	require.NoError(t, err)
 	require.Equal(t, "## 核心记忆\n\n"+strings.Join(entries, "\n\n"), got,
 		"注入面 = 核心区全文（不截断、不含文件标题、不含归档区）")
@@ -428,7 +434,7 @@ func TestService_LoadEffective_SingleOversizedManualEntryWarns(t *testing.T) {
 	manual := globalMemoryTitle + "\n\n## 核心记忆\n\n- " + oversized + "\n\n## 归档记忆\n"
 	require.NoError(t, os.WriteFile(file, []byte(manual), 0o600))
 
-	got, err := svc.LoadEffective(ctx, "")
+	got, err := svc.LoadEffective(ctx, adminPrincipal(), "")
 	require.NoError(t, err)
 	require.Equal(t, "## 核心记忆\n\n- "+oversized, got, "单条超配额仍完整注入（不截断）")
 
@@ -444,7 +450,7 @@ func TestService_LoadEffective_SingleOversizedManualEntryWarns(t *testing.T) {
 	require.NoError(t, os.WriteFile(file, []byte(manual), 0o600))
 	captureWriter.reset()
 
-	got, err = svc.LoadEffective(ctx, "")
+	got, err = svc.LoadEffective(ctx, adminPrincipal(), "")
 	require.NoError(t, err)
 	require.Equal(t, "## 核心记忆\n\n- "+exact, got)
 	require.NotContains(t, captureWriter.logs(t), "WARN", "恰等上限 == 放行，不告警")

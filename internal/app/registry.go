@@ -32,7 +32,7 @@ import (
 )
 
 // skillPointerSource 是注册装配读取技能发布指针的最小面：启动装配传入
-// `*storage.ResourceStore`，watcher 持有同一实现。查询失败**不得**当作"无指针"或
+// `*postgres.ResourceStore`，watcher 持有同一实现。查询失败**不得**当作"无指针"或
 // "全部已发布"——调用方按失败关闭处理（F-03 A）。
 // skillPointerSource is the minimal read face for skill publication pointers. A failed
 // lookup is never treated as "no pointers" or "everything published".
@@ -112,6 +112,104 @@ func registryEntriesWithSkillPublication(ctx context.Context, source skillPointe
 		adjusted[i].RejectDetail = strings.Join(missing, "、")
 		adjusted[i].RejectReason = skillPublicationReject(missing)
 		logger.Warn("Agent 绑定技能无发布版本，不注册",
+			"agent", adjusted[i].Name, "reason", adjusted[i].RejectReason)
+	}
+	return adjusted, nil
+}
+
+// knowledgeCollectionReject 是知识集合注册拒因的固定前缀，与 `agent-md.md` §2.1
+// 规则 13 的文案逐字一致：日志、页面与契约指向同一个词（与技能拒因同一纪律）。
+// knowledgeCollectionReject is the fixed reject prefix shared with the contract.
+func knowledgeCollectionReject(missing []string) string {
+	return "knowledge collection missing: " + strings.Join(missing, ", ")
+}
+
+// declaredKnowledgeNames 汇总所有条目声明的集合名（去重、保持首次出现序）：
+// 一次查库服务全部 Agent，名字与文档无关。
+// declaredKnowledgeNames unions every declared collection name so one query serves all.
+func declaredKnowledgeNames(entries []core.AgentEntry) []string {
+	seen := make(map[string]struct{}, len(entries))
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Profile == nil {
+			continue
+		}
+		for _, name := range core.KnowledgeBindingNames(entry.Profile.Knowledge) {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// missingKnowledgeCollections 返回条目声明、但名字没有解析到唯一活动集合的那些
+// （升序，便于日志与断言逐字比对）。条目没有 Profile 时由装载器负责拒绝，这里不判。
+// missingKnowledgeCollections lists the declared names that did not resolve (sorted).
+func missingKnowledgeCollections(entry core.AgentEntry, unresolved map[string]struct{}) []string {
+	if entry.Profile == nil || len(unresolved) == 0 {
+		return nil
+	}
+	var missing []string
+	for _, name := range core.KnowledgeBindingNames(entry.Profile.Knowledge) {
+		if _, ok := unresolved[name]; ok {
+			missing = append(missing, name)
+		}
+	}
+	slices.Sort(missing)
+	return missing
+}
+
+// registryEntriesWithKnowledgeCollections 在注册装配的出口执行 D-19 的集合闸门：
+// 声明了 `knowledge:` 却有名字解析不到**唯一活动集合**的 Agent 降级为未注册并点名
+// WARN（契约 §2.1 规则 13）。判定口径与投影、检索授权共用同一个目录查询：
+// "名字有没有实体"只有一处答案，三处读同一份结果。
+//
+// 查询失败上抛、启动失败关闭——**不得**把"读不到目录"默认成"集合都在"（否则一次
+// 数据库抖动就会让声明的 Agent 带着空范围启动，且没有任何痕迹）。
+// registryEntriesWithKnowledgeCollections demotes agents whose declared collections do
+// not resolve to exactly one live row; a failed lookup aborts startup.
+func registryEntriesWithKnowledgeCollections(ctx context.Context, source KnowledgeCollectionSource,
+	entries []core.AgentEntry, logger *slog.Logger,
+) ([]core.AgentEntry, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	names := declaredKnowledgeNames(entries)
+	if len(names) == 0 {
+		return entries, nil
+	}
+	if source == nil {
+		return nil, errors.New("注册装配缺少知识集合目录来源")
+	}
+	_, unresolved, err := source.CollectionIDsByName(ctx, names)
+	if err != nil {
+		return nil, fmt.Errorf("读取知识集合目录: %w", err)
+	}
+	if len(unresolved) == 0 {
+		return entries, nil
+	}
+	bad := make(map[string]struct{}, len(unresolved))
+	for _, name := range unresolved {
+		bad[name] = struct{}{}
+	}
+
+	adjusted := slices.Clone(entries)
+	for i := range adjusted {
+		if !adjusted[i].Registered {
+			continue
+		}
+		missing := missingKnowledgeCollections(adjusted[i], bad)
+		if len(missing) == 0 {
+			continue
+		}
+		adjusted[i].Registered = false
+		adjusted[i].RejectKind = core.AgentRejectKnowledgeCollectionMissing
+		adjusted[i].RejectDetail = strings.Join(missing, "、")
+		adjusted[i].RejectReason = knowledgeCollectionReject(missing)
+		logger.Warn("Agent 声明的知识集合不存在或同名不唯一，不注册",
 			"agent", adjusted[i].Name, "reason", adjusted[i].RejectReason)
 	}
 	return adjusted, nil

@@ -6,13 +6,16 @@ package app
 // 都不存在，才是新实例。库里已经有数据但它只是没写 YAML 的存量实例，**不得**当成新实例
 // 放宽预算或补生成密钥——那等于替运维改了上限、还替它造了一把新钥匙。
 //
-// 生成次序也是判据的一部分：配置先写、名册后写。这样"名册在、配置不在"只可能由异常
-// 中断造成，而"配置在、名册不在"会被下一次启动继续当作新实例补写名册——反向次序会让
-// 一次崩溃永久跳过一次配置生成。
+// 生成次序也是判据的一部分：配置先写、初始化进度记录次之、名册最后。这样"名册在、配置
+// 不在"只可能由异常中断造成，而"配置在、名册不在"会被下一次启动继续当作新实例补写名册；
+// 反向次序会让一次崩溃永久跳过一次配置生成。进度记录必须先于名册——名册一旦落盘，下一次
+// 启动就不再是"新实例"，中断后的重试只能靠这条记录继续把首次初始化做完（见
+// instance_provisioning.go）。
 //
 // The only definition of a new instance is that neither the database nor the roster
-// exists. The config is written before the roster, so a crash can never mark an
-// instance as established while its config was skipped.
+// exists. The config is written first, then the provisioning record, then the roster:
+// once the roster is on disk a restart is no longer "fresh", so the record — not the
+// roster vote — is what lets an interrupted first start finish its one-shot work.
 
 import (
 	"encoding/json"
@@ -26,12 +29,17 @@ import (
 	"github.com/ymedword/basalt/internal/builtin"
 )
 
-// instanceConfigTemplate 是新实例的最小可用配置（T089）。四处取值都有出处：
+// instanceConfigTemplate 是新实例的最小可用配置（T089）。五处取值都有出处：
 //   - `budget.max_iterations: 30` 覆盖五个内置 Agent 的最大需求（模块卡 §2.5.1 的预算
 //     兼容检查：核心缺省 10 会截断需要更多轮次的剧本）；
 //   - `server.max_concurrent_runs: 32` 与 core 缺省同值，写成显式是让运维看得见；
 //   - `http.admin_auth.mode: token` 且**不写** `token`：密码由实例私有目录的
 //     `admin-token` 提供（T090），明文凭据禁止落盘；
+//   - `database.dsn: ${BASALT_DATABASE_DSN}`：运行期唯一存储是 PostgreSQL（D-01），而
+//     `database.dsn` 是唯一无条件必填的新键（模块卡 §3.3）。模板只写**占位**、不写值：
+//     连接串通常带口令，明文禁止落盘；占位解析为空或变量缺失都由装载层拒绝启动，绝不
+//     回退 SQLite。生成的文件因此**不**等于"用户无需准备数据库"——部署前必须先备好
+//     PostgreSQL 并注入该环境变量（见 docs/Operations.md 的安装说明）。
 //   - `shell.allowed_commands` 登记随包运行时组件的发行布局路径：内置 MCP 条目的 command
 //     是绝对路径，而命令白名单整串逐字比对——不登记时两条免凭据条目会在 spawn 前被策略
 //     拒绝，开箱即用走不到"依赖就位"（14D §2.2.2 显式登记口径，清单产者属 US-17 拟）。
@@ -67,6 +75,25 @@ server:
   max_concurrent_runs: 32
 budget:
   max_iterations: 30
+# 运行期唯一存储是 PostgreSQL；连接串只写占位，真值由环境变量提供，禁止明文落盘。
+# The only runtime store is PostgreSQL; the DSN is a placeholder resolved from the
+# environment, never a literal.
+database:
+  dsn: ${BASALT_DATABASE_DSN}
+# 服务启动前需显式填写 callers.ingress.run、ingest、read 各自的 qps 与 burst。
+# 六项均须为正整数；请按部署容量设置，系统不预设未验证的限流值。
+# 取消下面的注释并填写数值，然后重新启动：
+# callers:
+#   ingress:
+#     run:
+#       qps:
+#       burst:
+#     ingest:
+#       qps:
+#       burst:
+#     read:
+#       qps:
+#       burst:
 `
 
 // shellAllowlistComment 解释白名单为什么带绝对路径、为什么生成时就写死。
@@ -89,9 +116,11 @@ type instanceBootstrapReport struct {
 	// Fresh 表示本次确实是新实例（库与名册都不存在）；生成失败时仍为 true——
 	// 调用方据此判断"要不要按新实例口径初始化加密身份"。
 	Fresh bool
-	// ConfigCreated / MarkerCreated 分别表示本次真的写出了对应文件。
-	ConfigCreated bool
-	MarkerCreated bool
+	// ConfigCreated / ProvisioningRecorded / MarkerCreated 分别表示本次真的写出了对应
+	// 文件。三者分开报：中断后的重试只补写缺的那一件，日志不得把没做的步骤说成做了。
+	ConfigCreated        bool
+	ProvisioningRecorded bool
+	MarkerCreated        bool
 	// InstanceID 是新生成的实例标识（ConfigCreated / MarkerCreated 为假时可能为空）。
 	InstanceID string
 }
@@ -150,11 +179,22 @@ func ensureNewInstanceConfig(workDir, runtimeRoot string) (instanceBootstrapRepo
 	}
 	report.ConfigCreated = created
 
-	// ② 名册后写：标识只在本进程真正写出时才有意义（EEXIST 说明别人已经写好）。
+	// ② 初始化进度记录：**必须先于名册**。名册一落盘，下一次启动就不再是"新实例"，
+	// 自动生成的管理面访问密码（只在首次初始化时发放一次）就只剩这条记录能证明
+	// "首次初始化确实还没做完"。写不出来就**不写名册**——让工作区保持"新实例"，
+	// 下一次启动重新走完整流程，而不是留下一个永远拿不到密码的半成品。
+	// The provisioning record precedes the roster: once the roster is written, a restart
+	// is no longer fresh, and only this record can prove the first start never finished.
 	id, err := newInstanceID()
 	if err != nil {
 		return report, err
 	}
+	if err := recordProvisioningPending(id); err != nil {
+		return report, fmt.Errorf("记录首次初始化进度: %w", err)
+	}
+	report.ProvisioningRecorded = true
+
+	// ③ 名册最后写：标识只在本进程真正写出时才有意义（EEXIST 说明别人已经写好）。
 	marker := instanceMarker{Version: instanceMarkerVersion, InstanceID: id}
 	raw, err := marshalInstanceMarker(marker)
 	if err != nil {
@@ -168,7 +208,11 @@ func ensureNewInstanceConfig(workDir, runtimeRoot string) (instanceBootstrapRepo
 	if created {
 		report.InstanceID = id
 	} else if winner, present, readErr := readInstanceMarker(workDir); readErr == nil && present {
-		// 另一个进程抢先写了名册：以**盘上的那个**为准（标识不可变）。
+		// 另一个进程抢先写了名册：以**盘上的那个**为准（标识不可变）。本进程为候选标识
+		// 写的那条进度记录留在私有目录里**不删**：它属于一个从未成为实例的随机标识，
+		// 除本文件外没有任何读者，删除反而是对一条我们不拥有其父目录的路径做破坏性操作。
+		// The loser's record for its losing id stays: nothing ever reads it, and deleting
+		// is a destructive operation we do not need.
 		report.InstanceID = winner.InstanceID
 	}
 	return report, nil

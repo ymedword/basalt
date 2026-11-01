@@ -36,7 +36,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // MCPCredentialRequest 是保存请求里的逐槽声明（契约 `McpCredentialInput`）：`key` 为槽位
@@ -101,8 +101,8 @@ type MCPCredentialService struct {
 // `Lookup` 缺省用 `os.LookupEnv`；用例注入替身，不为测试新增导出 API。
 // MCPCredentialServiceDeps carries the two stores and the (injectable) env lookup.
 type MCPCredentialServiceDeps struct {
-	Credentials *storage.CredentialStore
-	Sources     *storage.MCPCredentialSourceStore
+	Credentials *postgres.CredentialStore
+	Sources     *postgres.MCPCredentialSourceStore
 	// MasterKeyFile 是静态初值；KeyPath 是共享的生效路径（用户显式初始化后立即切换）。
 	// MasterKeyFile is the static seed; KeyPath is the live shared path when present.
 	MasterKeyFile string
@@ -816,23 +816,36 @@ func (s *MCPCredentialService) StillCurrent(ctx context.Context, serverUID core.
 // BackfillEnvSources 为存量 server 的每个槽位补记 `mode=env`：v5 只有进程环境一条路，
 // 这是**记录当前真实来源**，不是运行时回落——补记之后用户改成 managed 再撤销，仍然
 // 不会退回 env。已有声明的槽位不动（`ON CONFLICT DO NOTHING`）。
+//
+// 返回并记录四分类报告（filled / skipped / conflict / config_drift）：启动日志**不得**
+// 只报一个总数——`config_drift` 行意味着定义声明了槽位而库里是托管，管理者需要看见。
 // BackfillEnvSources records the v5 fact (process environment) for every slot lacking a
-// declaration; it is a one-time record, not a runtime fallback.
+// declaration; it is a one-time record, not a runtime fallback, and the four-way report
+// is logged so a config/DB mismatch is never invisible.
 func (s *MCPCredentialService) BackfillEnvSources(ctx context.Context, serverName string,
 	serverUID core.ResourceUID, cfg core.MCPServerConfig, operationID string, at time.Time,
-) (int, error) {
+) (core.MCPBackfillReport, error) {
 	slots, err := core.MCPCredentialSlots(cfg)
 	if err != nil {
-		return 0, fmt.Errorf("补记 MCP server %s 的凭据来源: %w", serverName, err)
+		return core.MCPBackfillReport{}, fmt.Errorf("补记 MCP server %s 的凭据来源: %w", serverName, err)
 	}
 	if len(slots) == 0 {
-		return 0, nil
+		return core.MCPBackfillReport{}, nil
 	}
-	added, err := s.deps.Sources.BackfillEnvSources(ctx, serverUID, slots, operationID, at)
+	report, err := s.deps.Sources.BackfillEnvSources(ctx, serverUID, slots, operationID, at)
 	if err != nil {
-		return added, fmt.Errorf("补记 MCP server %s 的凭据来源: %w", serverName, err)
+		return report, fmt.Errorf("补记 MCP server %s 的凭据来源: %w", serverName, err)
 	}
-	return added, nil
+	if s.deps.Logger != nil && (len(report.Filled) > 0 || len(report.ConfigDrift) > 0 || len(report.Conflict) > 0) {
+		// 只记槽位名与分类计数：补记从不读取 env 值，日志也不得出现值。
+		s.deps.Logger.Info("MCP 凭据来源补记报告（只记槽位名，不含值）",
+			"server", serverName,
+			"filled", report.Filled,
+			"skipped", report.Skipped,
+			"conflict", report.Conflict,
+			"config_drift", report.ConfigDrift)
+	}
+	return report, nil
 }
 
 // ZeroMCPCredentialValues 清零解析结果里的明文并清空映射（best-effort）。

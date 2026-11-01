@@ -82,7 +82,7 @@ func testNotifyChannelRegistration(t *testing.T) {
 		"重启后读到渠道行并解析出 ${VAR}")
 	requireAbsent(t, lastToolContent(reqs[3]), "不存在", "登记后不再查无")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status, error_kind FROM tool_invocations ORDER BY id`)
 	if len(rows) != 2 {
 		t.Fatalf("tool_invocations 应有 2 行，实际 %d 行：%v", len(rows), rows)
@@ -130,7 +130,7 @@ func testNotifySentinelRedaction(t *testing.T) {
 	requireAbsent(t, res.Stdout+res.Stderr, sentinel, "进程输出不得回显哨兵")
 	requireAbsentInWorkspace(t, h.Root, sentinel, "哨兵不得落盘到工作区")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status, error_kind, error_message FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -177,7 +177,7 @@ func testNotifyAgentDecl(t *testing.T) {
 	requireToolResultContains(t, reqs[1], "通知渠道 ops 不在本 Run 冻结的通知渠道集合内",
 		"工具调用落到执行器")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT tool_name, status, error_kind FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -222,7 +222,7 @@ func testNotifyDomainDenied(t *testing.T) {
 	requireAbsent(t, res.Stdout+res.Stderr, "连接失败", "拒绝先于外呼——不得出现传输失败")
 	requireAbsent(t, res.Stdout+res.Stderr, "DNS 解析失败", "拒绝先于外呼——不得出现 DNS 失败")
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status, error_kind, error_message FROM tool_invocations ORDER BY id`)
 	if len(rows) != 1 {
 		t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -271,7 +271,7 @@ func testNotifyEnvNegative(t *testing.T) {
 				"通知渠道 ops 引用的环境变量 ${"+notifyEnvRef+"} 未设置或为空", "点名占位变量")
 			requireAbsent(t, res.Stdout+res.Stderr, "连接失败", "缺少目标即零外呼")
 
-			db := openDB(t, h.dbPath())
+			db := h.openDB(t)
 			rows := queryRows(t, db, `SELECT error_kind, error_message FROM tool_invocations ORDER BY id`)
 			if len(rows) != 1 {
 				t.Fatalf("tool_invocations 应有 1 行，实际 %d 行：%v", len(rows), rows)
@@ -321,7 +321,7 @@ func testNotifyEffectTiming(t *testing.T) {
 		t.Fatalf("第二次最终文本 = %q，期望 时机二完成", second.FinalText)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT error_message FROM tool_invocations ORDER BY id`)
 	if len(rows) != 2 {
 		t.Fatalf("tool_invocations 应有 2 行，实际 %d 行：%v", len(rows), rows)
@@ -350,14 +350,17 @@ func startServeWithEnv(t *testing.T, h *harness, addr string, env []string) *pro
 // insertNotifyChannel inserts one channel row and registers it for fixture bindings.
 func insertNotifyChannel(t *testing.T, h *harness, name, typ, url, description string) {
 	t.Helper()
+	// 写行前先确保运行期 schema 已迁移：这条登记常发生在任何重命令之前（见 ensureStore）。
+	// The runtime schema is migrated before the row is written; see ensureStore.
+	h.ensureStore(t)
 	now := time.Now().UnixMilli()
 	uid := fixtureUID(t, "rs_")
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if _, err := db.Exec(
 		`INSERT INTO notify_channels(resource_uid, name, type, url, url_host,
 		        credential_mode, scope, owner_agent_uid, revision, description,
 		        created_at, updated_at, operation_id)
-		 VALUES (?, ?, ?, ?, '', 'env', 'shared', NULL, 1, ?, ?, ?, 'op-e2e-fixture-notify')`,
+		 VALUES ($1, $2, $3, $4, '', 'env', 'shared', NULL, 1, $5, $6, $7, 'op-e2e-fixture-notify')`,
 		uid, name, typ, url, description, now, now); err != nil {
 		t.Fatalf("插入渠道行失败: %v", err)
 	}
@@ -368,8 +371,8 @@ func insertNotifyChannel(t *testing.T, h *harness, name, typ, url, description s
 // updateNotifyChannelURL rewrites the channel URL in place.
 func updateNotifyChannelURL(t *testing.T, h *harness, name, url string) {
 	t.Helper()
-	db := openDB(t, h.dbPath())
-	result, err := db.Exec(`UPDATE notify_channels SET url = ? WHERE name = ?`, url, name)
+	db := h.openDB(t)
+	result, err := db.Exec(`UPDATE notify_channels SET url = $1 WHERE name = $2`, url, name)
 	if err != nil {
 		t.Fatalf("更新渠道行失败: %v", err)
 	}
@@ -386,9 +389,9 @@ func updateNotifyChannelURL(t *testing.T, h *harness, name, url string) {
 // notifyChannelRow reads back the channel type and URL.
 func notifyChannelRow(t *testing.T, h *harness, name string) (typ, url string) {
 	t.Helper()
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if err := db.QueryRow(
-		`SELECT type, url FROM notify_channels WHERE name = ?`, name,
+		`SELECT type, url FROM notify_channels WHERE name = $1`, name,
 	).Scan(&typ, &url); err != nil {
 		t.Fatalf("读取渠道行 %s 失败: %v", name, err)
 	}

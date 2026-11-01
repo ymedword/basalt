@@ -59,7 +59,10 @@ func runInit(ctx context.Context, out io.Writer, deps Deps) error {
 	}
 
 	dbPath := filepath.Join(wsRoot, databaseFileName)
-	dbCreated, err := deps.Store.Bootstrap(ctx, dbPath, deps.SupportedSchemaVersion)
+	// 引导建的是 **SQLite 源谱系** 的库（v6），不是运行期 PostgreSQL 谱系（v1）——两个
+	// 版本常数混用会把一份 v6 schema 标成 v1，`db export` 立刻拒绝导出（T078 实测）。
+	// The bootstrap builds the SQLite source lineage (v6), not the runtime PG lineage (v1).
+	dbCreated, err := deps.Store.Bootstrap(ctx, dbPath, deps.SourceSchemaVersion)
 	if err != nil {
 		return fmt.Errorf("初始化数据库 %s: %w", dbPath, err)
 	}
@@ -68,7 +71,7 @@ func runInit(ctx context.Context, out io.Writer, deps Deps) error {
 	fmt.Fprintf(out, "工作区 %s\n", wsRoot)
 	writeItems(out, "新建", created)
 	writeItems(out, "保留", kept)
-	fmt.Fprintf(out, "数据库 %s：%s（schema v%d）\n", dbPath, databaseOutcome(dbCreated), deps.SupportedSchemaVersion)
+	fmt.Fprintf(out, "数据库 %s：%s（schema v%d）\n", dbPath, databaseOutcome(dbCreated), deps.SourceSchemaVersion)
 	return nil
 }
 

@@ -94,7 +94,7 @@ func testSlowRunTimeout(t *testing.T) {
 
 	// 终态落库：执行行 failed + 契约原因字面量 + 收尾时间齐全；任务 last_status 同步。
 	// Terminal rows: failed execution with the contract reason and a finish time.
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM task_executions WHERE status = 'started'`); n != 0 {
 		t.Fatalf("超时后仍有 %d 行 started：终态写必须用独立清理 ctx", n)
 	}

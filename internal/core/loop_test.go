@@ -35,7 +35,10 @@ var ctx context.Context
 
 // sectionOneStatic 是假快照的段一正文（断言"段一取自快照、不重读盘"的锚点）。
 // sectionOneStatic is the fake snapshot's section-one text.
-const sectionOneStatic = "段一：你是 demo。"
+const (
+	sectionOneStatic = "段一：你是 demo。"
+	instantRunOrigin = "## 本次运行来源\n来自用户或业务接口的即时请求。请根据本次消息的实际意图处理，不要仅因存在定时流程就自行执行它。"
+)
 
 // loopSessionID 是 harness 的会话标识（形态与 §6.2 固定口径 1 的派生结果同构）。
 const loopSessionID = "cli-3f9a1c07b2d84e55"
@@ -65,7 +68,16 @@ type loopHarness struct {
 	tools    *spyTool
 	agents   *fakeAgentSource
 	logs     *bytes.Buffer
-	memory   core.MemoryReader // 记忆端口——**只能在构造期经 withMemory 置入**（nil = 无记忆端口）
+	memory   core.MemoryReader     // 记忆端口——**只能在构造期经 withMemory 置入**（nil = 无记忆端口）
+	assembly core.AssemblyRecorder // 装配记录端口——同样只能在构造期经 withAssemblyRecorder 置入
+	// runQuota 是 Run 级任务次数端口（N-01）——同样只能在构造期经 withRunQuota 置入
+	// （nil = 不记账，既有全部用例的默认）。
+	// runQuota is the run-level task-count port, injected at construction only.
+	runQuota core.RunQuota
+
+	// 压缩接线（V-7 判据需要"压缩已装配"的 Run）：两字段一并经 withCompaction 置入。
+	compactionReserve int
+	assembleCompactor func(*core.RunEnv) core.ContextCompactor
 
 	toolSet   []string
 	budget    core.Budget
@@ -89,6 +101,33 @@ type harnessOption func(*loopHarness)
 // leave the built service unchanged and the assertions would pass vacuously.
 func withMemory(r core.MemoryReader) harnessOption {
 	return func(h *loopHarness) { h.memory = r }
+}
+
+// withAssemblyRecorder 把装配记录端口**在构造期**置入循环（V-7）：构造之后再写
+// `h.assembly` 对已建好的循环无效，断言会恒空地"通过"。
+// withAssemblyRecorder injects the assembly recorder at construction time; injecting it
+// afterwards would leave the built loop untouched and the assertions vacuous.
+func withAssemblyRecorder(r core.AssemblyRecorder) harnessOption {
+	return func(h *loopHarness) { h.assembly = r }
+}
+
+// withRunQuota 把 Run 级任务次数端口**在构造期**置入（N-01）：构造之后再写
+// `h.runQuota` 对已建好的 service 无效，断言会恒空地"通过"。
+// withRunQuota injects the run-level task-count port at construction time.
+func withRunQuota(q core.RunQuota) harnessOption {
+	return func(h *loopHarness) { h.runQuota = q }
+}
+
+// withCompaction 把压缩接线**在构造期**置入循环（V-7 压缩结论透传判据用）：
+// `assemble` 按 Run 返回压缩器，`outputReserve` 取配置里的输出预留 token 数。
+// 不调用本选项 = 未接压缩，循环照旧报 `decision=none`。
+// withCompaction wires compaction at construction time; leaving it out keeps the
+// pre-wiring behaviour of `decision=none`.
+func withCompaction(outputReserve int, assemble func(*core.RunEnv) core.ContextCompactor) harnessOption {
+	return func(h *loopHarness) {
+		h.compactionReserve = outputReserve
+		h.assembleCompactor = assemble
+	}
 }
 
 // newLoopHarness 组装一套独立夹具（用例之间零共享状态）。
@@ -132,11 +171,13 @@ func newLoopHarness(t *testing.T, opts ...harnessOption) *loopHarness {
 		Snapshots: h.store,
 		Audit:     h.audit,
 		Memory:    h.memory,
+		RunQuota:  h.runQuota,
 		Loop: core.NewReActLoop(
 			core.NewPromptBuilder(h.registry),
 			core.NewToolExecutor(h.registry, h.audit, logger),
 			logger,
-		),
+		).WithCompaction(h.compactionReserve, h.assembleCompactor).
+			WithAssemblyRecorder(h.assembly),
 		Logger: logger,
 		Now:    func() time.Time { return h.now },
 	})
@@ -152,6 +193,8 @@ func newLoopHarness(t *testing.T, opts ...harnessOption) *loopHarness {
 // req builds one run request from the harness's current state.
 func (h *loopHarness) req(msg string) core.RunRequest {
 	return core.RunRequest{
+		// 循环夹具以 CLI 管理身份驱动（US-16 P-04：RunRequest.Principal 必填）
+		Principal: core.LocalAdminCLIPrincipal(),
 		Agent:     loopAgentName,
 		SessionID: h.sessionID,
 		Message:   msg,
@@ -175,7 +218,7 @@ type fakeMemoryReader struct {
 
 // LoadEffective 恒返回预置文本。
 // LoadEffective returns the scripted text.
-func (r fakeMemoryReader) LoadEffective(context.Context, string) (string, error) {
+func (r fakeMemoryReader) LoadEffective(context.Context, core.Principal, string) (string, error) {
 	return r.text, nil
 }
 
@@ -192,7 +235,7 @@ type scriptedMemoryReader struct {
 
 // LoadEffective 返回第 `reads` 次（0 起）脚本文本并计数。
 // LoadEffective returns the next scripted text and bumps the counter.
-func (r *scriptedMemoryReader) LoadEffective(context.Context, string) (string, error) {
+func (r *scriptedMemoryReader) LoadEffective(context.Context, core.Principal, string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	text := ""
@@ -365,19 +408,22 @@ func newFakeStore() *fakeStore {
 	}
 }
 
-// AppendMessage 追加一条消息（`sessionID` 为空 = 无状态会话，不落历史）。
-func (s *fakeStore) AppendMessage(_ context.Context, sessionID, runID string, m core.Message) error {
+// AppendMessage 追加一条消息并返回分配到的标识（`sessionID` 为空 = 无状态会话，
+// 不落历史、无标识）。标识按写入次序生成，测试据此断言会话历史确实带身份。
+func (s *fakeStore) AppendMessage(_ context.Context, sessionID, runID string, m core.Message) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if sessionID == "" {
-		return nil
+		return "", nil
 	}
 	if m.Role == core.RoleTool && s.failToolAppendOnce {
 		s.failToolAppendOnce = false
-		return errors.New("injected: message store unavailable")
+		return "", errors.New("injected: message store unavailable")
 	}
+	id := fmt.Sprintf("fake-%d", len(s.msgs[sessionID])+1)
+	m.ID = id
 	s.msgs[sessionID] = append(s.msgs[sessionID], storedMessage{msg: m, runID: runID})
-	return nil
+	return id, nil
 }
 
 // Messages 取整段会话历史（升序）。
@@ -798,8 +844,9 @@ func (s *spyTool) waitExited(t *testing.T, d time.Duration) {
 type fakeAgentSource struct {
 	h *loopHarness
 
-	failSnapshot error // 注入"任一清单文件读失败"
-	profileIter  int   // Profile.settings.max_iterations（0 表示用装载器缺省 10）
+	failSnapshot        error // 注入"任一清单文件读失败"
+	profileIter         int   // Profile.settings.max_iterations（0 表示用装载器缺省 10）
+	includeGlobalMemory *bool
 }
 
 // Lookup 取注册条目（只有一只注册 Agent）。
@@ -837,7 +884,7 @@ func (a *fakeAgentSource) Snapshot(_ context.Context, entry core.AgentEntry, _ t
 		Name:     name,
 		Provider: core.ProviderRef{Name: "fake", Model: "fake-model"},
 		Tools:    tools,
-		Settings: core.Settings{MaxIterations: iterations, MaxHistoryTurns: 20},
+		Settings: core.Settings{MaxIterations: iterations, MaxHistoryTurns: 20, IncludeGlobalMemory: a.includeGlobalMemory},
 	}
 	return &core.ConfigSnapshot{
 		AgentName:  name,
@@ -957,12 +1004,13 @@ func TestReActLoop_RebuildsPromptEveryRound(t *testing.T) {
 
 	first := h.provider.request(0)
 	require.Equal(t, "system", first.Messages[0].Role, "段 1 是系统提示词")
-	require.Equal(t, sectionOneStatic, first.Messages[0].Content, "段 1 正文取自快照（不重读盘）")
+	require.Equal(t, sectionOneStatic+"\n\n"+instantRunOrigin, first.Messages[0].Content, "段 1 保留快照正文并追加本次运行来源")
 	require.Equal(t, "读一下 notes.txt 并总结", first.Messages[len(first.Messages)-1].Content, "当前用户消息在末位")
 	require.Len(t, first.Tools, 1, "段 4 带本 Agent 的工具定义")
 	require.Equal(t, "read_file", first.Tools[0].Name)
 
 	second := h.provider.request(1)
+	require.Equal(t, first.Messages[0].Content, second.Messages[0].Content, "运行来源与快照在本次运行中不变化")
 	var found bool
 	for _, m := range second.Messages {
 		if m.Role == core.RoleTool && m.ToolCallID == "c1" {

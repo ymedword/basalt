@@ -95,6 +95,15 @@ func (f fixedActorAuth) Wrap(next AdminHandler) http.Handler {
 	})
 }
 
+// WrapPrincipal 满足 T025 起的双面端口：本文件的用例只走管理面路由，业务面身份
+// 固定为内置管理员（作用域恒通过），不改变按 actor 判定的管理面语义。
+// The fixtures only hit management rows; the business half stays admin.
+func (f fixedActorAuth) WrapPrincipal(next PrincipalHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next(w, r, core.LocalAdminPrincipal())
+	})
+}
+
 // seededExecutionPolicy 是夹具的固定档位行：修订号 3，来源按操作标识判为 database。
 // seededExecutionPolicy is the fixed row used by the endpoint fixtures.
 func seededExecutionPolicy() core.ExecutionPolicy {

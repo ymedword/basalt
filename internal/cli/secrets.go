@@ -24,11 +24,14 @@ import (
 func newSecretsCommand(deps Deps) *cobra.Command {
 	secrets := &cobra.Command{
 		Use:   "secrets",
-		Short: "主密钥与托管凭据运维（init / status / verify / revoke-managed）",
+		Short: "主密钥与托管凭据运维（init / status / verify / revoke-managed / recover-record / adopt-legacy）",
 		Long: "主密钥与托管凭据运维：init 生成主密钥（已有或存在托管依赖即拒绝）、\n" +
-			"status 报告就绪状态、verify 校验现有密文、revoke-managed 清空全部托管凭据。\n" +
-			"Manage the master key: mint once, report readiness, verify ciphertexts, and\n" +
-			"revoke every managed credential. No automatic rotation is offered.",
+			"status 报告就绪状态、verify 校验现有密文、revoke-managed 清空全部托管凭据；\n" +
+			"recover-record 从可信备份恢复初始化记录、adopt-legacy 在隔离副本上完成\n" +
+			"schema 3～5 的受控升级——后两条离线执行、零外呼。\n" +
+			"Manage the master key: mint once, report readiness, verify ciphertexts, revoke\n" +
+			"every managed credential, recover the record from a trusted backup, and adopt a\n" +
+			"legacy schema 3–5 copy offline. No automatic rotation is offered.",
 		// 与根命令 / provider / profile 组同一形态：可运行的父命令 + 显式未知命令分支
 		// （不可运行的父命令会让 cobra 把未知子命令按"请求帮助"处理并以 0 退出）。
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -43,6 +46,8 @@ func newSecretsCommand(deps Deps) *cobra.Command {
 		newSecretsStatusCommand(deps),
 		newSecretsVerifyCommand(deps),
 		newSecretsRevokeManagedCommand(deps),
+		newSecretsRecoverRecordCommand(deps),
+		newSecretsAdoptLegacyCommand(deps),
 	)
 	return secrets
 }
@@ -132,10 +137,11 @@ const secretStateReady = "ready"
 func newSecretsVerifyCommand(deps Deps) *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify",
-		Short: "逐条校验托管凭据能否在当前主密钥下解密（只回计数）",
-		Long: "逐条校验当前 active 的托管凭据：能否在当前主密钥下解密、目标绑定是否仍与\n" +
-			"当前定义一致。只回检查与失败条数，明细在结构化日志里（不含材料）。\n" +
-			"Verify every active managed credential; only counts are printed.",
+		Short: "校验历史密文与当前托管凭据（只回计数）",
+		Long: "两个报告对象：(a) 全部密文版本能否在当前主密钥下解密、key_id 是否一致；\n" +
+			"(b) 当前 active 凭据对已发布资源、目标地址与 MCP 槽位的核对。只回计数与\n" +
+			"类别，逐条原因在结构化日志里（不含材料）。\n" +
+			"Verify the sealed history and the current managed credentials; counts only.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSecretsVerify(cmd.Context(), cmd.OutOrStdout(), deps)
@@ -154,10 +160,27 @@ func runSecretsVerify(ctx context.Context, out io.Writer, deps Deps) error {
 		return err
 	}
 	fmt.Fprintf(out, "托管凭据检查 %d 条，失败 %d 条\n", report.Checked, report.Failed)
-	if report.Failed > 0 {
-		return fmt.Errorf("secrets verify：%d 条托管凭据校验失败（明细见 WARN 日志）", report.Failed)
+	writeSecretsVerifyBreakdown(out, report)
+	if failed := report.Failed + report.CurrentFailed; failed > 0 {
+		return fmt.Errorf("secrets verify：%d 条托管凭据校验失败（明细见 WARN 日志）", failed)
 	}
 	return nil
+}
+
+// writeSecretsVerifyBreakdown 只在有失败时补两行分类计数：判卷者第一眼就能区分
+// "历史密文坏了"与"当前凭据不可用"，不必先翻日志。只含计数与类别名，不含材料。
+// writeSecretsVerifyBreakdown prints the per-category counts only when something
+// failed, so the healthy path keeps its single line.
+func writeSecretsVerifyBreakdown(out io.Writer, report SecretsVerifyReport) {
+	if report.Failed+report.CurrentFailed == 0 {
+		return
+	}
+	fmt.Fprintf(out, "  历史密文：可解 %d / 已撤销 %d / 撤销仍留密文 %d / 密文缺失 %d / key_id 不匹配 %d / 无法解密 %d\n",
+		report.HistoricalOK, report.Revoked, report.RevokedWithCiphertext,
+		report.MissingCiphertext, report.KeyIDMismatch, report.AADMismatch)
+	fmt.Fprintf(out, "  当前可用性：检查 %d / 失败 %d（目标地址不一致 %d / 绑定缺失 %d / 当前版本不可用 %d / 环境变量缺失 %d）\n",
+		report.CurrentChecked, report.CurrentFailed, report.TargetMismatch,
+		report.BindingMissing, report.KeyRevoked, report.EnvMissing)
 }
 
 // newSecretsRevokeManagedCommand 组装 secrets revoke-managed：必须显式 --confirm。
@@ -212,4 +235,258 @@ func writeManagedCounts(out io.Writer, status SecretsStatus) {
 // errSecretsPortMissing keeps a wiring gap distinct from a deployment state.
 func errSecretsPortMissing() error {
 	return fmt.Errorf("secrets 服务未装配（需要主程序的重路径装配）——不提供降级读面")
+}
+
+// ─────────────────────── recover-record / adopt-legacy（离线手工流程） ───────────────────────
+//
+// 两条命令是**恢复与升级**的入口，不是运维日常：它们只在旧实例停止后、对着可信备份
+// 手工执行，因此命令面这一次承担了比其余子命令更多的输入判定——备份形态与外部锚点
+// 必须在调用端口**之前**判明，否则"备份看起来像什么就按什么处理"会把错误来源的记录
+// 写进本库（颗粒度文档 §3.1.8b / §3.1.8c、§2.12.0a 校验顺序 0～1）。
+// Both commands are manual recovery entries: shape and anchor are decided here, before
+// the port is called, so a wrong source can never reach the write.
+
+// recoverRecordOptions 是 `secrets recover-record` 的全部输入。
+// recoverRecordOptions carries every surface input of recover-record.
+type recoverRecordOptions struct {
+	// Workspace 是工作区根 `<WorkDir>/.basalt`。
+	Workspace string
+	// Backup 是可信备份目录。
+	Backup string
+	// ExpectBackupSHA256 是带外锚点（备份清单的字节哈希）。
+	ExpectBackupSHA256 string
+	// Confirm 是操作者的显式确认。
+	Confirm bool
+}
+
+// adoptLegacyOptions 是 `secrets adopt-legacy` 的全部输入。
+// adoptLegacyOptions carries every surface input of adopt-legacy.
+type adoptLegacyOptions struct {
+	// Workspace 是隔离副本的工作区根 `<copy-root>/.basalt`。
+	Workspace string
+	// Backup 是备份目录（含 backup.json）。
+	Backup string
+	// ExpectBackupSHA256 是备份清单的带外锚点。
+	ExpectBackupSHA256 string
+	// Source 是原实例的 `.basalt` 根（与 AttestSourceUnchanged 二选一）。
+	Source string
+	// AttestSourceUnchanged 是带外见证编号。
+	AttestSourceUnchanged string
+	// MasterKeyFile 是受控取钥的覆盖路径。
+	MasterKeyFile string
+	// ExpectKeySHA256 是覆盖取钥的锚点。
+	ExpectKeySHA256 string
+	// Confirm 是操作者的显式确认。
+	Confirm bool
+}
+
+// newSecretsRecoverRecordCommand 组装 secrets recover-record。
+// newSecretsRecoverRecordCommand builds the offline record-recovery subcommand.
+func newSecretsRecoverRecordCommand(deps Deps) *cobra.Command {
+	opts := recoverRecordOptions{}
+	cmd := &cobra.Command{
+		Use:   "recover-record",
+		Short: "从可信备份恢复主密钥初始化记录（离线；需要 --confirm）",
+		Long: "从**可信备份**恢复 `instance_secrets` 初始化记录（及缺失时的实例名册），\n" +
+			"用于 D-40 的恢复态：库里有托管密文、但初始化记录因崩溃 / 误删丢失。\n" +
+			"命令离线执行、零外呼：不装配运行期、不启动 MCP、不发通知、不调用模型。\n" +
+			"`--expect-backup-sha256` 必须来自备份时的带外记录——备份内自带的哈希\n" +
+			"不构成可信来源。不提供 --force / --overwrite / --new-key 一类开关。\n" +
+			"Restore the master-key record (and the roster when missing) from a trusted\n" +
+			"backup. Offline by construction; the external anchor is mandatory.",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSecretsRecoverRecord(cmd.Context(), cmd.OutOrStdout(), deps, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.Workspace, "workspace", "",
+		"工作区根 <WorkDir>/.basalt（必填）")
+	cmd.Flags().StringVar(&opts.Backup, "backup", "",
+		"可信备份目录（必填；按内容判定路线：manifest.json → A，basalt.db + instance.json → B）")
+	cmd.Flags().StringVar(&opts.ExpectBackupSHA256, "expect-backup-sha256", "",
+		"备份清单的带外 SHA-256 锚点（必填）")
+	cmd.Flags().BoolVar(&opts.Confirm, "confirm", false,
+		"显式确认执行（缺省即拒绝，无交互提示）")
+	return cmd
+}
+
+// newSecretsAdoptLegacyCommand 组装 secrets adopt-legacy。
+// newSecretsAdoptLegacyCommand builds the controlled legacy-upgrade subcommand.
+func newSecretsAdoptLegacyCommand(deps Deps) *cobra.Command {
+	opts := adoptLegacyOptions{}
+	cmd := &cobra.Command{
+		Use:   "adopt-legacy",
+		Short: "在隔离副本上完成 schema 3～5 的受控升级并写 attested_legacy 记录（离线）",
+		Long: "为 schema 3～5 的合法存量准备 `instance_secrets` 记录：只对**隔离副本**\n" +
+			"操作，校验外部锚点、备份清单、原密钥与全部密文连续、源端未漂移之后，\n" +
+			"把副本迁移到 v6 并写 1 条 `record_origin=attested_legacy` 记录。\n" +
+			"不装配运行期 / MCP / 调度 / HTTP / notifier / provider；不写名册、不改配置、\n" +
+			"不生成或复制主密钥、不改写或删除密文。不提供 --force / --new-key / --skip-*。\n" +
+			"Prepare a v6 record from a schema 3–5 copy, offline, with an external anchor.",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSecretsAdoptLegacy(cmd.Context(), cmd.OutOrStdout(), deps, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.Workspace, "workspace", "",
+		"隔离副本的工作区根 <copy-root>/.basalt（必填）")
+	cmd.Flags().StringVar(&opts.Backup, "backup", "",
+		"备份目录（必填；须含 backup.json 与清单列出的全部文件）")
+	cmd.Flags().StringVar(&opts.ExpectBackupSHA256, "expect-backup-sha256", "",
+		"backup.json 的带外 SHA-256 锚点（必填）")
+	cmd.Flags().StringVar(&opts.Source, "source", "",
+		"原实例的 .basalt 根（本地可读时必填，与 --attest-source-unchanged 二选一）")
+	cmd.Flags().StringVar(&opts.AttestSourceUnchanged, "attest-source-unchanged", "",
+		"源端未变更的带外见证编号（与 --source 二选一）")
+	cmd.Flags().StringVar(&opts.MasterKeyFile, "master-key-file", "",
+		"受控取钥的覆盖路径（副本主机读不到配置所指密钥时使用）")
+	cmd.Flags().StringVar(&opts.ExpectKeySHA256, "expect-key-sha256", "",
+		"覆盖取钥的 SHA-256 锚点（备份外副本必填）")
+	cmd.Flags().BoolVar(&opts.Confirm, "confirm", false,
+		"显式确认执行（缺省即拒绝，无交互提示）")
+	return cmd
+}
+
+// runSecretsRecoverRecord 执行记录恢复：命令面先判参数 / 形态 / 锚点，通过后才调用端口。
+// runSecretsRecoverRecord decides arguments, shape and anchor before touching the port.
+func runSecretsRecoverRecord(ctx context.Context, out io.Writer, deps Deps, opts recoverRecordOptions) error {
+	if deps.SecretsRecovery == nil {
+		return errOfflinePortMissing("secrets recover-record")
+	}
+	if !opts.Confirm {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --confirm：恢复记录会写入名册与初始化记录，必须显式确认（无交互提示）")
+	}
+	if opts.Workspace == "" {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --workspace：需要工作区根 <WorkDir>/.basalt")
+	}
+	if opts.Backup == "" {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --backup：需要可信备份目录")
+	}
+	kind, computed, err := verifiedBackupManifest(out, opts.Backup, opts.ExpectBackupSHA256,
+		classifyRecoverBackup,
+		"备份目录既不是导出包（manifest.json）也不是原生备份集（basalt.db + instance.json），拒绝猜测")
+	if err != nil {
+		return err
+	}
+
+	report, err := deps.SecretsRecovery.RecoverSecretsRecord(ctx, RecoverRecordRequest{
+		Workspace:      opts.Workspace,
+		Backup:         opts.Backup,
+		Kind:           kind,
+		ManifestSHA256: computed,
+		Confirm:        opts.Confirm,
+	})
+	if err != nil {
+		fmt.Fprintln(out, err.Error())
+		return err
+	}
+	writeRecoverRecordReport(out, opts, report)
+	return nil
+}
+
+// runSecretsAdoptLegacy 执行受控升级：命令面先判参数 / 见证 / 锚点，通过后才调用端口。
+// runSecretsAdoptLegacy decides arguments, witness and anchor before the port call.
+func runSecretsAdoptLegacy(ctx context.Context, out io.Writer, deps Deps, opts adoptLegacyOptions) error {
+	if deps.LegacySecretsAdopt == nil {
+		return errOfflinePortMissing("secrets adopt-legacy")
+	}
+	if !opts.Confirm {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --confirm：受控升级会迁移副本并写初始化记录，必须显式确认（无交互提示）")
+	}
+	if opts.Workspace == "" {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --workspace：需要隔离副本的工作区根 <copy-root>/.basalt")
+	}
+	if opts.Backup == "" {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --backup：需要含 backup.json 的备份目录")
+	}
+	hasSource := opts.Source != ""
+	hasAttestation := opts.AttestSourceUnchanged != ""
+	switch {
+	case hasSource && hasAttestation:
+		return refuseCommand(out, exitPrecondition,
+			"source_witness_conflict：--source 与 --attest-source-unchanged 只能选一个")
+	case !hasSource && !hasAttestation:
+		return refuseCommand(out, exitPrecondition,
+			"attestation_missing：本地可读时用 --source <original-ws>；源端不可读时必须给 --attest-source-unchanged <ticket-ref>")
+	}
+	if opts.ExpectKeySHA256 != "" && opts.MasterKeyFile == "" {
+		return refuseCommand(out, exitPrecondition,
+			"缺少 --master-key-file：--expect-key-sha256 只能用来给覆盖取钥做锚点")
+	}
+	_, computed, err := verifiedBackupManifest(out, opts.Backup, opts.ExpectBackupSHA256,
+		classifyLegacyBackup,
+		"备份目录里没有 backup.json——本命令只接受含清单的原生备份集，拒绝猜测；"+
+			"没有可用备份时只能保持恢复态（env-only 降级），破坏性重置 retire-managed 未批准，不得执行")
+	if err != nil {
+		return err
+	}
+
+	report, err := deps.LegacySecretsAdopt.AdoptLegacySecrets(ctx, AdoptLegacyRequest{
+		Workspace:             opts.Workspace,
+		Backup:                opts.Backup,
+		ManifestSHA256:        computed,
+		Source:                opts.Source,
+		AttestSourceUnchanged: opts.AttestSourceUnchanged,
+		MasterKeyFile:         opts.MasterKeyFile,
+		ExpectKeySHA256:       opts.ExpectKeySHA256,
+		Confirm:               opts.Confirm,
+	})
+	if err != nil {
+		fmt.Fprintln(out, err.Error())
+		return err
+	}
+	writeAdoptLegacyReport(out, report)
+	return nil
+}
+
+// writeRecoverRecordReport 只打印 §3.1.8b 允许的公开项：路径、两侧哈希、名册状态与
+// 哈希、记录 `key_id` / 指纹、校验计数、操作号与结束状态。密钥材料 / 密文 / 明文 /
+// 完整 `detail_json` 一律不出现。
+// writeRecoverRecordReport prints only the public fields §3.1.8b allows.
+func writeRecoverRecordReport(out io.Writer, opts recoverRecordOptions, r RecoverRecordResult) {
+	fmt.Fprintf(out, "命令结束状态：%s\n", r.FinalState)
+	fmt.Fprintf(out, "操作号：%s\n", r.OperationID)
+	fmt.Fprintf(out, "备份：kind=%s path=%s\n", r.Kind, r.BackupPath)
+	fmt.Fprintf(out, "备份清单哈希：expected=%s computed=%s\n", r.ExpectedSHA256, r.ComputedSHA256)
+	fmt.Fprintf(out, "工作区：%s\n", opts.Workspace)
+	fmt.Fprintf(out, "名册：恢复前存在=%t 本次恢复=%t sha256=%s\n",
+		r.RosterPresentBefore, r.RosterRestored, r.RosterSHA256)
+	fmt.Fprintf(out, "记录：key_id=%s fingerprint=%s\n", r.RecordKeyID, r.RecordFingerprint)
+	fmt.Fprintf(out, "校验计数：托管密文 %d 条、不可解 %d 条\n", r.Ciphertexts, r.CiphertextsUnreadable)
+	if r.InstanceID != "" {
+		fmt.Fprintf(out, "实例：%s\n", r.InstanceID)
+	}
+}
+
+// writeAdoptLegacyReport 只打印 §3.1.8c 允许的公开项：路径、清单两侧哈希、配置哈希
+// 四值、schema 前后、取钥来源与哈希、密钥公开摘要、密文条数、名册状态、源端见证与
+// 操作号。密钥材料 / 密文 / 明文 / 完整 `detail_json` 一律不出现。
+// writeAdoptLegacyReport prints only the public fields §3.1.8c allows.
+func writeAdoptLegacyReport(out io.Writer, r AdoptLegacyResult) {
+	fmt.Fprintf(out, "命令结束状态：%s\n", r.FinalState)
+	fmt.Fprintf(out, "操作号：%s\n", r.OperationID)
+	fmt.Fprintf(out, "副本：%s\n", r.Workspace)
+	fmt.Fprintf(out, "备份：%s\n", r.BackupPath)
+	fmt.Fprintf(out, "备份清单哈希：expected=%s computed=%s\n", r.ExpectedSHA256, r.ComputedSHA256)
+	fmt.Fprintf(out, "配置哈希：source=%s backup=%s copy=%s without_key_path=%s\n",
+		r.SourceConfigSHA256, r.BackupConfigSHA256, r.CopyConfigSHA256, r.ConfigWithoutKeyPathSHA256)
+	fmt.Fprintf(out, "schema：%d → %d\n", r.SchemaBefore, r.SchemaAfter)
+	fmt.Fprintf(out, "取钥：source=%s key_id=%s fingerprint=%s key_file_sha256=%s\n",
+		r.KeySource, r.KeyID, r.KeyFingerprint, r.KeyFileSHA256)
+	fmt.Fprintf(out, "密文：%d 条（迁移后逐字节复核）\n", r.Ciphertexts)
+	fmt.Fprintf(out, "名册：存在=%t（本命令不写名册）\n", r.RosterPresent)
+	fmt.Fprintf(out, "身份证据：%s\n", r.IdentityEvidence)
+	fmt.Fprintf(out, "源端见证：%s\n", r.SourceWitness)
+	fmt.Fprintf(out, "配置调整：false（覆盖取钥不改写配置）\n")
+	if r.InstanceID != "" {
+		fmt.Fprintf(out, "实例：%s\n", r.InstanceID)
+	}
 }

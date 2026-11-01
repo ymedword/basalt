@@ -39,14 +39,14 @@ const (
 	// consoleEchoArg travels over the MCP stdio channel and back.
 	consoleEchoArg = "回声-中文🚀"
 
-	// consoleMemory 是记忆条目的正文；落盘后再读文件逐字核对。
-	// consoleMemory is the memory entry body, verified byte-for-byte on disk.
+	// consoleMemory 是记忆条目的正文；落库后再读 PostgreSQL 逐字核对（D-18 起唯一运行载体）。
+	// consoleMemory is the memory entry body, verified byte-for-byte in PostgreSQL.
 	consoleMemory = "记忆-中文🚀：管道往返"
 )
 
 // TestBackfill_ConsolePipe：单顶层测试、不拆子测试（目录以 `Parent` 形式钉住）。
 // 判据：每段 stdout 逐字包含该段中文回答；模型侧收到各处中文原文；助手与用户消息
-// 在库里逐字一致；记忆文件落盘原文；全部输出无 U+FFFD 替换字符。
+// 在库里逐字一致；记忆条目在库里逐字一致；全部输出无 U+FFFD 替换字符。
 // TestBackfill_ConsolePipe is one top-level test (the catalog pins it as `Parent`).
 func TestBackfill_ConsolePipe(t *testing.T) {
 	// 甲段：argv → 模型请求；文件内容 → 模型请求；记忆落盘 → 文件；最终回答 → stdout。
@@ -87,7 +87,7 @@ func TestBackfill_ConsolePipe(t *testing.T) {
 	requireContains(t, results[1], "已记住（作用域：Agent 层 demo；分区：核心记忆）", "记忆确认（US-6）")
 
 	// 消息表按 UTF-8 原样落库：用户输入与助手回答都逐字相等。
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	users := queryRows(t, db, `SELECT content FROM messages WHERE role = 'user'`)
 	if len(users) != 1 {
 		t.Fatalf("用户消息应有 1 条，实际 %d 条：%v", len(users), users)
@@ -105,7 +105,16 @@ func TestBackfill_ConsolePipe(t *testing.T) {
 	if got := stringValue(t, assistants[0], "content"); got != consoleReply {
 		t.Fatalf("助手消息落库 = %q，期望逐字等于 %q", got, consoleReply)
 	}
-	requireContains(t, readText(t, memoryPath(h, "demo")), consoleMemory, "记忆条目落盘原文")
+	// 记忆条目按 UTF-8 原样落进唯一运行载体（D-18）；工作区不再有运行期记忆文件。
+	memory := queryRows(t, db,
+		`SELECT content FROM memory_entries
+		  WHERE scope = 'agent' AND agent_name = 'demo' AND section = 'core' AND state = 'active'`)
+	if len(memory) != 1 {
+		t.Fatalf("核心记忆应有 1 行，实际 %d 行：%v", len(memory), memory)
+	}
+	if got := stringValue(t, memory[0], "content"); got != consoleMemory {
+		t.Fatalf("核心记忆落库 = %q，期望逐字等于 %q", got, consoleMemory)
+	}
 
 	// 乙段：中文参数进子进程，子进程 stdout 原样回到模型请求（US-5）。
 	// Segment B sends the Chinese argument through a child process and back.

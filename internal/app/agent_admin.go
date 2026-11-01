@@ -32,7 +32,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/workspace"
 )
 
@@ -205,8 +205,8 @@ type AgentAdminDeps struct {
 	// 与准入检查用**同一批**存储：按绑定 UID 判范围，**不得**按名称猜。
 	// Resources and NotifyAdmin answer the copy-time exclusivity question from the same
 	// stores admission reads; the decision is made by binding UID, never by name.
-	Resources   *storage.ResourceStore
-	NotifyAdmin *storage.NotifyAdminStore
+	Resources   *postgres.ResourceStore
+	NotifyAdmin *postgres.NotifyAdminStore
 	// Projection 是绑定投影的重建面（R4.6）：创建 / 复制 / 恢复 / 归档成功之后按
 	// 定义文件重建该 Agent 的投影行。投影可重建，重建失败只记 ERROR——不把已生效的
 	// 写改写成失败（与索引写同一纪律）。
@@ -238,8 +238,8 @@ type AgentAdmin struct {
 	scheduler       ScheduleRegistry
 	canceller       RunCanceller
 	busyWait        time.Duration
-	resources       *storage.ResourceStore
-	notify          *storage.NotifyAdminStore
+	resources       *postgres.ResourceStore
+	notify          *postgres.NotifyAdminStore
 	projection      *BindingProjection
 }
 

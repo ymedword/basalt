@@ -15,6 +15,9 @@ import type {
   InstanceSecretsView,
   McpCredentialKeyMode,
   McpServerView,
+  MemoryEntryListView,
+  MemoryEntryReceipt,
+  MemoryEntryState,
   ModelConnectionView,
   NetworkExceptionCreateResult,
   NetworkExceptionDeleteResult,
@@ -430,6 +433,18 @@ export interface NotifyChannelUpsert {
   owner_agent?: string
 }
 
+export interface MemoryProposalWrite {
+  /** 省略（空）按归档区落——候选不进注入面，核心区也得先确认。 */
+  section?: 'core' | 'archive'
+  /** 去空白后不得为空；正文只进条目行与读模型，不进审计与日志。 */
+  content: string
+}
+
+export interface MemoryCorrectionWrite {
+  /** 纠正后的正文；分层与分区继承目标条。 */
+  content: string
+}
+
 export interface WorkspaceEntry {
   /** 相对 `.basalt/agents/` 的路径。 */
   path: string
@@ -454,6 +469,16 @@ export interface DetailWithEtag<T> {
 // ---------------------------------------------------------------------------
 // 端点
 // ---------------------------------------------------------------------------
+
+/** 记忆读模型路径：`agent` 空串 = 全局层，否则是该 Agent 那一层（与 `/agents/{name}/memory` 同族）。 */
+function memoryEntriesPath(agent: string): string {
+  return agent === '' ? '/memory/entries' : `/agents/${encodeURIComponent(agent)}/memory/entries`
+}
+
+/** 提议路径与读模型同族；不另造 `?scope=` 之类的新参数。 */
+function memoryProposalsPath(agent: string): string {
+  return agent === '' ? '/memory/proposals' : `/agents/${encodeURIComponent(agent)}/memory/proposals`
+}
 
 /**
  * AdminApi 是 US-12 写面的唯一入口：每个方法对应契约里的一个端点，名字与
@@ -724,6 +749,16 @@ export class AdminApi {
     return this.#readDetail<SkillDetail>(`/skills/${encodeURIComponent(name)}`)
   }
 
+  getSkillForEdit(name: string): Promise<DetailWithEtag<SkillDetail>> {
+    return this.#readDetail<SkillDetail>(`/admin/skills/${encodeURIComponent(name)}/edit`)
+  }
+
+  getSkillSummary(name: string): Promise<SkillView> {
+    return this.#client.request<SkillView>('GET', `/admin/skills/${encodeURIComponent(name)}/edit`, {
+      query: { summary: 'true' },
+    })
+  }
+
   updateSkill(name: string, files: FileDraft[], ifMatch: string): Promise<SkillDetail> {
     const body: SkillUpdate = { files }
     return this.#client.request<SkillDetail>('PUT', `/skills/${encodeURIComponent(name)}`, {
@@ -839,6 +874,50 @@ export class AdminApi {
     return this.#client.requestOK('DELETE', `/notify-channels/${encodeURIComponent(name)}`, {
       query,
     })
+  }
+
+  // --- 记忆管理面（显式提议 / 确认 / 纠正 / 软删）-------------------------
+  //
+  // 七条端点全部是管理面：读的是某一层的**全部状态**（候选与已删都在），写的是用户
+  // 显式动作。它们**不是**召回面——管理视图能看到的条目与其状态不代表任何业务调用方
+  // 或该 Agent 检索时能拿到同样的内容（召回只返回 active 且未到期的条目）。
+  // All seven endpoints are management-only; this surface is not a recall surface.
+
+  /** 结构化读模型；`agent` 空串 = 全局层，`state` 空串 = 六态全列。 */
+  listMemoryEntries(agent: string, state: MemoryEntryState | '' = ''): Promise<MemoryEntryListView> {
+    return this.#client.request<MemoryEntryListView>('GET', memoryEntriesPath(agent), {
+      query: state === '' ? undefined : { state },
+    })
+  }
+
+  /**
+   * 显式提议：新行恒为 `candidate`，确认才进注入面；命中同源 active 条目时回执
+   * `merged=true` 且 `state` 是该行真实状态（不伪造成候选）。
+   */
+  proposeMemory(agent: string, body: MemoryProposalWrite): Promise<MemoryEntryReceipt> {
+    return this.#client.request<MemoryEntryReceipt>('POST', memoryProposalsPath(agent), { body })
+  }
+
+  /** 确认候选（唯一晋升路径）；非候选目标由服务端 409，页面不自动重放。 */
+  confirmMemory(entryID: number): Promise<MemoryEntryReceipt> {
+    return this.#client.request<MemoryEntryReceipt>(
+      'POST',
+      `/memory/entries/${entryID}/confirm`,
+    )
+  }
+
+  /** 纠正：目标 active 时新条替旧条，否则新条落 conflicted（回执的 state 如实给）。 */
+  correctMemory(entryID: number, body: MemoryCorrectionWrite): Promise<MemoryEntryReceipt> {
+    return this.#client.request<MemoryEntryReceipt>(
+      'POST',
+      `/memory/entries/${entryID}/correct`,
+      { body },
+    )
+  }
+
+  /** 软删：行与审计保留、立即不可召回；重复删除按幂等返回成功。 */
+  deleteMemory(entryID: number): Promise<MemoryEntryReceipt> {
+    return this.#client.request<MemoryEntryReceipt>('DELETE', `/memory/entries/${entryID}`)
   }
 
   // --- 工作区（只读）------------------------------------------------------

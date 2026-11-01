@@ -43,7 +43,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // resourceStateTool 是请求形状错误（类别 / 名称 / UID / 范围 / confirm）的工具名：
@@ -54,8 +54,8 @@ const resourceStateTool = "resource.state"
 // ResourceStateDeps 是状态动作编排的装配输入；六个依赖缺一即拒绝装配。
 // ResourceStateDeps wires the state orchestrator; every dependency is required.
 type ResourceStateDeps struct {
-	Resources     *storage.ResourceStore
-	Credentials   *storage.CredentialStore
+	Resources     *postgres.ResourceStore
+	Credentials   *postgres.CredentialStore
 	Operations    core.OperationStore
 	Admin         *ResourceAdmin
 	Scopes        *ScopeService

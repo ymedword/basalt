@@ -466,72 +466,51 @@ func TestLoadConfig_AllowlistSectionsDefaultToEmpty(t *testing.T) {
 	require.Empty(t, cfg.Shell.EnvPassthrough)
 }
 
-// TestLoadConfig_MemoryBackendDefaultsToMarkdown 缺省档 = markdown（约束 18）：**不写
-// memory 段**与写了段但省略 backend 两条路径的读数**必须相同**——默认值只有一个来源，
-// 哪条路径给都判同一个值。
-//
-// 不写 memory 段时断言的是**缺省值**而不是「零值恰好等于 markdown」：留空 → 归一到
-// markdown 正是本用例判的东西（只判"没报错"的写法，把「宁可写成空字符串」的实现也放过）。
-// 逆改点：把缺省改成空串或 sqlite → 两条子例的分区断言红。
-func TestLoadConfig_MemoryBackendDefaultsToMarkdown(t *testing.T) {
-	for _, tc := range []struct{ name, tail string }{
-		{name: "不写 memory 段", tail: ""},
-		{name: "写了段但省略 backend", tail: "memory:\n  backend: \"\"\n"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := writeConfig(t, baseConfig+tc.tail)
-			cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
-				"DEMO_KEY":  "resolved-secret-value",
-				"DEMO_HOST": "api.internal",
-			}))
-			require.NoError(t, err, "记忆段是可选段：不配 = 用缺省档，不是错误")
-			require.Equal(t, "markdown", cfg.Memory.Backend,
-				"缺省档 = markdown（约束 18；零新增配置键——backend 是既有键）")
-		})
-	}
-}
-
-// TestLoadConfig_AcceptsSqliteBackend 取值域内的另一档：`sqlite` 原样落地（装载层只
-// 搬运、不加工——去哪找库文件是装配层的事，见 T036）；`${VAR}` 占位在**类型化之后**
-// 仍照常解析（配置面的占位纪律对 memory 段不因类型化而失效）。
-// 逆改点：把取值域写成只有 markdown 一种 → 显式 sqlite 被拒；类型化时漏掉占位解析路径
-// → 占位档读出字面 `${...}`。
-func TestLoadConfig_AcceptsSqliteBackend(t *testing.T) {
-	path := writeConfig(t, baseConfig+"memory:\n  backend: sqlite\n")
+// TestLoadConfig_MemorySectionAbsentLeavesBackendEmpty 不写 `memory` 段仍然合法
+// （记忆载体不再是配置面）：装载通过，且 `Memory.Backend` **恒为空串**——它不是
+// 「缺省档」，而是「这个键已经不存在」。下游谁按非空值分流，谁就是在复活已退役的
+// 载体开关（D-18）。
+// 逆改点：把空串在装载期归一成任何取值（markdown / sqlite / postgres）→ 本断言红；
+// 把 memory 段写成必填 → 第一段红。
+func TestLoadConfig_MemorySectionAbsentLeavesBackendEmpty(t *testing.T) {
+	path := writeConfig(t, baseConfig)
 	cfg, err := cli.LoadConfig(path, envLookup(map[string]string{
 		"DEMO_KEY":  "resolved-secret-value",
 		"DEMO_HOST": "api.internal",
 	}))
-	require.NoError(t, err, "sqlite 在取值域内（约束 18）")
-	require.Equal(t, "sqlite", cfg.Memory.Backend)
-
-	path = writeConfig(t, baseConfig+"memory:\n  backend: ${MEMORY_BACKEND}\n")
-	cfg, err = cli.LoadConfig(path, envLookup(map[string]string{
-		"DEMO_KEY":       "resolved-secret-value",
-		"DEMO_HOST":      "api.internal",
-		"MEMORY_BACKEND": "sqlite",
-	}))
-	require.NoError(t, err, "占位解析在类型化之后照常生效")
-	require.Equal(t, "sqlite", cfg.Memory.Backend)
+	require.NoError(t, err, "记忆段已退役：不写它不是错误")
+	require.Empty(t, cfg.Memory.Backend,
+		"Memory.Backend 在校验通过后恒为空串——字段只为让退役键可判错而存在")
 }
 
-// TestLoadConfig_RejectsUnknownMemoryBackend 取值域外 fail-closed（约束 18）：`mem0`
-// （接口预留、实现延后——需求 U-8）与一切未知取值**拒绝启动**，文案**点名键与取值**且
-// 给出可执行下一步；**不得**静默降级到 markdown——那会让「我配了 mem0」悄悄变成
-// 「记忆写进了文件」，载体形态与运维预期分叉。
-// 逆改点：把 default 分支改成回落 markdown → 三态全红（无错误）。
-func TestLoadConfig_RejectsUnknownMemoryBackend(t *testing.T) {
-	for _, backend := range []string{"mem0", "postgres", "MEMORY.DEFAULT"} {
-		t.Run(backend, func(t *testing.T) {
-			path := writeConfig(t, baseConfig+"memory:\n  backend: "+backend+"\n")
+// TestLoadConfig_RejectsRetiredMemoryBackend 退役键 fail-closed（D-18 / §3.3）：
+// `memory.backend` **存在即拒绝启动**，与取值无关——markdown / sqlite 是退役档，
+// 空串与未知取值（mem0）同样不许「看起来生效」。文案点名键、给迁移路径，不静默忽略。
+//
+// `${VAR}` 子例证占位解析发生在校验之前：解析后的值落进原始树，键的存在性判据因此
+// 对占位写法同样成立。
+// 逆改点：删掉 `validateUS16Sections` 的存在性块（回到"解码器静默吞掉"）→ 四态全红
+// （无错误）；把判据改成"取值不在旧取值域才拒绝" → 空串子例红。
+func TestLoadConfig_RejectsRetiredMemoryBackend(t *testing.T) {
+	for _, tc := range []struct{ name, tail string }{
+		{name: "markdown", tail: "memory:\n  backend: markdown\n"},
+		{name: "sqlite", tail: "memory:\n  backend: sqlite\n"},
+		{name: "空串", tail: "memory:\n  backend: \"\"\n"},
+		{name: "未知取值", tail: "memory:\n  backend: mem0\n"},
+		{name: "占位解析后落位", tail: "memory:\n  backend: ${MEMORY_BACKEND}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, baseConfig+tc.tail)
 			_, err := cli.LoadConfig(path, envLookup(map[string]string{
-				"DEMO_KEY":  "resolved-secret-value",
-				"DEMO_HOST": "api.internal",
+				"DEMO_KEY":       "resolved-secret-value",
+				"DEMO_HOST":      "api.internal",
+				"MEMORY_BACKEND": "sqlite",
 			}))
-			require.Error(t, err, "取值域外必须拒绝启动（不静默降级）：%s", backend)
-			require.Contains(t, err.Error(), "memory.backend", "拒绝文案必须点名配置键：%s", backend)
-			require.Contains(t, err.Error(), backend, "拒绝文案必须点名取值：%s", backend)
-			require.Contains(t, err.Error(), "markdown", "文案给出取值域（可执行下一步）：%s", backend)
+			require.Error(t, err, "退役键存在即拒绝启动（不静默忽略）：%s", tc.name)
+			require.Contains(t, err.Error(), "memory.backend", "拒绝文案必须点名配置键")
+			require.Contains(t, err.Error(), "PostgreSQL", "文案给出唯一载体（可执行下一步）")
+			require.Contains(t, err.Error(), "db switch", "文案给出旧 markdown 记忆的迁移入口")
+			require.Contains(t, err.Error(), "D-22", "文案说明原文件保留作回退层")
 		})
 	}
 }
@@ -1142,5 +1121,288 @@ func TestConfig_HTTPProxyShape(t *testing.T) {
 		_, err := cli.LoadConfig(writeConfig(t, withProxy(`"http://user:`+secret+`@proxy.internal/pac"`)), lookup)
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), secret, "错误文案不得回显代理凭证")
+	})
+}
+
+// us16BaseConfig 在 baseConfig 之上补齐 US-16 七段的全部键（§3.3）。
+// us16BaseConfig appends every US-16 key to baseConfig.
+//
+// 键面以 tasks.md 附录 R2.4 勘误 2 为准：`database` 三个超时键带 `_seconds` 后缀，
+// `knowledge` 5 键、`retrieval` 7 键，`local_admin.unlimited` 必须带 `callers.` 前缀。
+// The key set follows the R2.4 erratum: the `_seconds` suffixes, five knowledge keys,
+// seven retrieval keys, and the `callers.` prefix on local_admin.
+const us16BaseConfig = baseConfig + `database:
+  dsn: postgres://basalt:${PG_SECRET}@127.0.0.1:5432/basalt
+  max_conns: 10
+  min_conns: 1
+  connect_timeout_seconds: 10
+  statement_timeout_seconds: 30
+  lock_timeout_seconds: 5
+embedding:
+  model_connection: bailian
+  model: text-embedding-v4
+  dimensions: 512
+  batch_size: 32
+  timeout_seconds: 30
+knowledge:
+  max_document_bytes: 20971520
+  allowed_extensions:
+    - .md
+    - .txt
+  chunk:
+    max_tokens: 400
+    overlap_tokens: 60
+    version: v1
+retrieval:
+  top_k: 8
+  candidate_k: 40
+  rrf_k: 60
+  rerank:
+    enabled: false
+    timeout_seconds: 5
+    model_connection: ""
+  ef_search: 40
+callers:
+  unauthenticated_qps: 5
+  local_admin:
+    unlimited: false
+  ingress:
+    run:
+      qps: 4
+      burst: 8
+    ingest:
+      qps: 2
+      burst: 4
+    read:
+      qps: 20
+      burst: 40
+diagnostics:
+  retention_days: 7
+  sample_rate: 0.25
+compaction:
+  enabled: true
+  trigger_ratio: 0.8
+  keep_recent_groups: 3
+  summary_max_tokens: 800
+  output_reserve_tokens: 1024
+  safety_margin_ratio: 0.1
+  timeout_seconds: 30
+  prompt_version: v1
+  strategy_version: v1
+`
+
+// us16Env 是 us16BaseConfig 需要的环境变量（凭证与 DSN 口令都走占位）。
+// us16Env supplies the placeholders us16BaseConfig references.
+func us16Env() map[string]string {
+	return map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+		"PG_SECRET": "pg-secret-value",
+	}
+}
+
+// TestLoadConfig_ParsesUS16Sections 覆盖 §3.3 全部 43 键的类型化解析：每个键都
+// 落到自己的字段（漏一个键的表现是「配了却读不到」，不会报错）。
+// 逆改点：删掉任一 yaml 标签 / 字段 → 对应断言拿到零值（红）。
+func TestLoadConfig_ParsesUS16Sections(t *testing.T) {
+	cfg, err := cli.LoadConfig(writeConfig(t, us16BaseConfig), envLookup(us16Env()))
+	require.NoError(t, err)
+
+	require.Equal(t, "postgres://basalt:pg-secret-value@127.0.0.1:5432/basalt", cfg.Database.DSN,
+		"DSN 的 ${PG_SECRET} 必须解析后才交给消费方")
+	require.Equal(t, 10, cfg.Database.MaxConns)
+	require.Equal(t, 1, cfg.Database.MinConns)
+	require.Equal(t, 10, cfg.Database.ConnectTimeoutSeconds)
+	require.Equal(t, 30, cfg.Database.StatementTimeoutSeconds)
+	require.Equal(t, 5, cfg.Database.LockTimeoutSeconds)
+
+	require.Equal(t, "bailian", cfg.Embedding.ModelConnection)
+	require.Equal(t, "text-embedding-v4", cfg.Embedding.Model)
+	require.Equal(t, 512, cfg.Embedding.Dimensions)
+	require.Equal(t, 32, cfg.Embedding.BatchSize)
+	require.Equal(t, 30, cfg.Embedding.TimeoutSeconds)
+
+	require.EqualValues(t, 20971520, cfg.Knowledge.MaxDocumentBytes)
+	require.Equal(t, []string{".md", ".txt"}, cfg.Knowledge.AllowedExtensions)
+	require.Equal(t, 400, cfg.Knowledge.Chunk.MaxTokens)
+	require.Equal(t, 60, cfg.Knowledge.Chunk.OverlapTokens)
+	require.Equal(t, "v1", cfg.Knowledge.Chunk.Version)
+
+	require.Equal(t, 8, cfg.Retrieval.TopK)
+	require.Equal(t, 40, cfg.Retrieval.CandidateK)
+	require.Equal(t, 60, cfg.Retrieval.RRFK)
+	require.False(t, cfg.Retrieval.Rerank.Enabled)
+	require.Equal(t, 5, cfg.Retrieval.Rerank.TimeoutSeconds)
+	require.Empty(t, cfg.Retrieval.Rerank.ModelConnection)
+	require.Equal(t, 40, cfg.Retrieval.EFSearch)
+
+	require.Equal(t, 5, cfg.Callers.UnauthenticatedQPS)
+	require.False(t, cfg.Callers.LocalAdmin.UnlimitedEnabled(), "显式 false 必须被读到")
+	require.Equal(t, 4, cfg.Callers.Ingress.Run.QPS)
+	require.Equal(t, 8, cfg.Callers.Ingress.Run.Burst)
+	require.Equal(t, 2, cfg.Callers.Ingress.Ingest.QPS)
+	require.Equal(t, 4, cfg.Callers.Ingress.Ingest.Burst)
+	require.Equal(t, 20, cfg.Callers.Ingress.Read.QPS)
+	require.Equal(t, 40, cfg.Callers.Ingress.Read.Burst)
+
+	require.Equal(t, 7, cfg.Diagnostics.RetentionDays)
+	require.Equal(t, 0.25, cfg.Diagnostics.SampleRateOrDefault())
+
+	require.True(t, cfg.Compaction.Enabled)
+	require.Equal(t, 0.8, cfg.Compaction.TriggerRatio)
+	require.Equal(t, 3, cfg.Compaction.KeepRecentGroups)
+	require.Equal(t, 800, cfg.Compaction.SummaryMaxTokens)
+	require.Equal(t, 1024, cfg.Compaction.OutputReserveTokens)
+	require.Equal(t, 0.1, cfg.Compaction.SafetyMarginRatio)
+	require.Equal(t, 30, cfg.Compaction.TimeoutSeconds)
+	require.Equal(t, "v1", cfg.Compaction.PromptVersion)
+	require.Equal(t, "v1", cfg.Compaction.StrategyVersion)
+}
+
+// TestLoadConfig_US16DefaultsStayWithConsumers 判装载层**不预填**缺省：
+// `local_admin.unlimited` 未写 = true、`diagnostics.sample_rate` 未写 = 1.0 由
+// 访问器表达，其余数值字段保持零值（缺省归消费方，与 server.max_concurrent_runs
+// 同一口径）。
+// 逆改点：在装载层就地写死连接池缺省 → 零值断言变红。
+func TestLoadConfig_US16DefaultsStayWithConsumers(t *testing.T) {
+	cfg, err := cli.LoadConfig(writeConfig(t, baseConfig), envLookup(us16Env()))
+	require.NoError(t, err, "US-16 各段整体缺席是合法输入——必填按消费方 / 子命令分流")
+
+	require.True(t, cfg.Callers.LocalAdmin.UnlimitedEnabled(), "未写 = 缺省 true")
+	require.Equal(t, 1.0, cfg.Diagnostics.SampleRateOrDefault(), "未写 = 缺省 1.0")
+	require.Zero(t, cfg.Database.MaxConns, "装载层不预填连接池缺省")
+	require.Zero(t, cfg.Embedding.BatchSize, "装载层不预填批大小缺省")
+	require.False(t, cfg.Compaction.Enabled, "compaction 缺省关闭，升级后行为与现状一致")
+}
+
+// TestLoadConfig_CompactionEnabledListsAllMissingKeys：开关打开后八个配套键
+// **一次列全**（D-24）——逐个报错会让部署者反复重启。
+// 逆改点：把缺失收集换成「命中第一个就返回」→ 缺键数断言变红。
+func TestLoadConfig_CompactionEnabledListsAllMissingKeys(t *testing.T) {
+	path := writeConfig(t, baseConfig+"compaction:\n  enabled: true\n")
+	_, err := cli.LoadConfig(path, envLookup(us16Env()))
+	require.Error(t, err, "enabled: true 而阈值缺失必须拒绝启动")
+
+	for _, key := range []string{
+		"compaction.trigger_ratio",
+		"compaction.keep_recent_groups",
+		"compaction.summary_max_tokens",
+		"compaction.output_reserve_tokens",
+		"compaction.safety_margin_ratio",
+		"compaction.timeout_seconds",
+		"compaction.prompt_version",
+		"compaction.strategy_version",
+	} {
+		require.Contains(t, err.Error(), key, "缺失键必须一次列全：%s", key)
+	}
+}
+
+// TestLoadConfig_EmbeddingConnectionRequiresModelAndDimensions：只写连接不写
+// 模型 / 维度必须拒绝——否则「以为开了语义检索、实际没开」。
+// 逆改点：删掉条件必填分支 → 两个子用例都拿不到错误（红）。
+func TestLoadConfig_EmbeddingConnectionRequiresModelAndDimensions(t *testing.T) {
+	for name, section := range map[string]string{
+		"missing_model":      "embedding:\n  model_connection: bailian\n  dimensions: 512\n",
+		"missing_dimensions": "embedding:\n  model_connection: bailian\n  model: text-embedding-v4\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := cli.LoadConfig(writeConfig(t, baseConfig+section), envLookup(us16Env()))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "embedding.", "拒绝文案必须点名 embedding 段的具体键")
+		})
+	}
+
+	t.Run("empty_model_rejected", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"embedding:\n  model_connection: bailian\n  model: \"\"\n  dimensions: 512\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "embedding.model")
+	})
+}
+
+// TestLoadConfig_RerankEnabledRequiresModelConnection：重排开关打开必须点名连接；
+// 关闭时连接为空合法。
+// 逆改点：去掉条件必填 → 第一个子用例变绿（红）。
+func TestLoadConfig_RerankEnabledRequiresModelConnection(t *testing.T) {
+	t.Run("enabled_without_connection", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"retrieval:\n  rerank:\n    enabled: true\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "retrieval.rerank.model_connection")
+	})
+
+	t.Run("disabled_without_connection", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"retrieval:\n  rerank:\n    enabled: false\n"), envLookup(us16Env()))
+		require.NoError(t, err, "缺省关闭时连接为空是合法输入")
+	})
+}
+
+// TestLoadConfig_RejectsImpossibleUS16Values：负数、越界比例、越界采样率都是
+// 「不可能成立」的取值，装载期 fail-closed（负数一次列全）。
+// 逆改点：删掉 rejectNegative → 负值子用例全绿（红）。
+func TestLoadConfig_RejectsImpossibleUS16Values(t *testing.T) {
+	negative := map[string]string{
+		"database_pool":      "database:\n  max_conns: -1\n  min_conns: -1\n",
+		"callers_ingress":    "callers:\n  ingress:\n    run:\n      qps: -1\n",
+		"diagnostics_days":   "diagnostics:\n  retention_days: -1\n",
+		"knowledge_max":      "knowledge:\n  max_document_bytes: -1\n",
+		"compaction_timeout": "compaction:\n  timeout_seconds: -1\n",
+	}
+	for name, section := range negative {
+		t.Run("negative_"+name, func(t *testing.T) {
+			_, err := cli.LoadConfig(writeConfig(t, baseConfig+section), envLookup(us16Env()))
+			require.Error(t, err, "负数必须拒绝启动")
+			require.Contains(t, err.Error(), "不得为负")
+		})
+	}
+
+	t.Run("negative_lists_all_at_once", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"database:\n  max_conns: -1\ncallers:\n  unauthenticated_qps: -2\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "database.max_conns")
+		require.Contains(t, err.Error(), "callers.unauthenticated_qps", "负数也要一次列全")
+	})
+
+	t.Run("min_above_max", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"database:\n  max_conns: 4\n  min_conns: 8\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "database.min_conns")
+	})
+
+	for name, section := range map[string]string{
+		"trigger_ratio_zero":      "compaction:\n  trigger_ratio: 0\n",
+		"trigger_ratio_one":       "compaction:\n  trigger_ratio: 1\n",
+		"safety_margin_one":       "compaction:\n  safety_margin_ratio: 1\n",
+		"sample_rate_above_one":   "diagnostics:\n  sample_rate: 1.5\n",
+		"sample_rate_below_zero":  "diagnostics:\n  sample_rate: -0.1\n",
+		"overlap_swallows_window": "knowledge:\n  chunk:\n    max_tokens: 100\n    overlap_tokens: 100\n",
+	} {
+		t.Run("out_of_range_"+name, func(t *testing.T) {
+			_, err := cli.LoadConfig(writeConfig(t, baseConfig+section), envLookup(us16Env()))
+			require.Error(t, err, "越界取值必须拒绝启动")
+		})
+	}
+}
+
+// TestLoadConfig_ResolvesDSNPlaceholders：DSN 的 ${VAR} 由装载层解析；变量缺失
+// 与残留占位都拒绝启动，且**不回显** DSN 内容。
+// 逆改点：把 dsn 移出 resolveTree 的字符串分支 → 解析断言变红。
+func TestLoadConfig_ResolvesDSNPlaceholders(t *testing.T) {
+	t.Run("missing_variable_rejected", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"database:\n  dsn: postgres://u:${ABSENT_DSN_VAR}@127.0.0.1:5432/db\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "ABSENT_DSN_VAR")
+		require.NotContains(t, err.Error(), "postgres://", "拒绝文案不得回显 DSN 片段")
+	})
+
+	t.Run("residual_placeholder_rejected", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"database:\n  dsn: postgres://127.0.0.1:5432/${UNCLOSED\n"), envLookup(us16Env()))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "database.dsn")
 	})
 }

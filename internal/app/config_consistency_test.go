@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件钉住人工 review ② 复现的两条版本一致性缺陷（2026-10-21 退回项）：
@@ -101,7 +103,8 @@ func TestRun_SnapshotUsesValidatedRegistryConfig(t *testing.T) {
 	writeAgentWithProvider(t, f, "writer", "beta")
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
-		Agent: "writer", Message: "你好", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "writer", Message: "你好", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "合法切换后新 Run 必须用已发布配置跑完：%s", res.Reason)
@@ -112,10 +115,10 @@ func TestRun_SnapshotUsesValidatedRegistryConfig(t *testing.T) {
 	require.Equal(t, "alpha", requests[0].Provider,
 		"实际模型调用必须走注册表条目里的 Provider（磁盘已改成 beta，但该编辑未经发布）")
 
-	db := openRead(t, f.dbPath())
+	db := openRead(t, f.dsn)
 	var raw string
 	require.NoError(t, db.QueryRowContext(context.Background(),
-		`SELECT snapshot_json FROM run_resource_manifests WHERE run_id = ?`, res.RunID).Scan(&raw))
+		`SELECT snapshot_json FROM run_resource_manifests WHERE run_id = $1`, res.RunID).Scan(&raw))
 	var manifest core.RunResourceManifest
 	require.NoError(t, json.Unmarshal([]byte(raw), &manifest))
 	require.Equal(t, "alpha", manifest.Provider.Name,
@@ -123,7 +126,7 @@ func TestRun_SnapshotUsesValidatedRegistryConfig(t *testing.T) {
 
 	var recordedProvider string
 	require.NoError(t, db.QueryRowContext(context.Background(),
-		`SELECT provider FROM llm_calls WHERE run_id = ?`, res.RunID).Scan(&recordedProvider))
+		`SELECT provider FROM llm_calls WHERE run_id = $1`, res.RunID).Scan(&recordedProvider))
 	require.Equal(t, "alpha", recordedProvider, "审计行记录的 Provider 必须与实际调用一致")
 }
 
@@ -151,7 +154,8 @@ func TestRun_SnapshotKeepsPublishedConfigAfterRejectedDiskEdit(t *testing.T) {
 		filepath.Join(f.root, agentsDirName, "writer", "AGENT.md"), []byte(broken), 0o644))
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
-		Agent: "writer", Message: "你好", Channel: "cli",
+		Principal: core.LocalAdminPrincipal(),
+		Agent:     "writer", Message: "你好", Channel: "cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status,

@@ -28,6 +28,14 @@ func newServeCommand(deps Deps) *cobra.Command {
 		Short: "启动 HTTP 服务（/api/v1 核心 REST 端点）",
 		Long: "启动 HTTP 服务：默认监听 127.0.0.1:8080，暴露 /api/v1 下的核心 REST 端点。\n" +
 			"启动时幂等兜底初始化工作区，随后启动调度器；SIGINT / SIGTERM 触发五阶段优雅停机。\n" +
+			"\n" +
+			"验证窗口（迁移切换后核对用）：serve --verification-window [--asset-package <dir>]\n" +
+			"先跑离线门（身份 / 密钥 / 全部密文 / 配置 / 资产）与只读库探针，再起**只回环**的\n" +
+			"health / ready；不启调度、通知、MCP、模型与配置监听，也不写业务数据。该模式在装配层\n" +
+			"解析（internal/app），不经过常规装配路径。\n" +
+			"Verification window: the offline gate and a read-only database probe run first, then a\n" +
+			"loopback-only health/ready face opens; no scheduler, MCP, model, notification or config\n" +
+			"watcher is started. Parsed by the assembly layer, never by this command body.\n" +
 			"Start the HTTP service on 127.0.0.1:8080 by default; the scheduler starts with " +
 			"the process, and SIGINT / SIGTERM triggers the five-phase graceful shutdown.",
 		Args: cobra.NoArgs,

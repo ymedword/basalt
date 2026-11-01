@@ -212,7 +212,7 @@ func v3InsertNotifyChannel(t *testing.T, db *sql.DB, uid, name, url, description
 		`INSERT INTO notify_channels(resource_uid, name, type, url, url_host,
 		        credential_mode, scope, owner_agent_uid, revision, description,
 		        created_at, updated_at, operation_id)
-		 VALUES (?, ?, 'webhook', ?, '', 'env', 'shared', NULL, 1, ?, ?, ?, 'op-e2e-v3-notify')`,
+		 VALUES ($1, $2, 'webhook', $3, '', 'env', 'shared', NULL, 1, $4, $5, $6, 'op-e2e-v3-notify')`,
 		uid, name, url, description, now, now); err != nil {
 		t.Fatalf("登记通知渠道 %s 失败: %v", name, err)
 	}
@@ -244,7 +244,7 @@ func v3WaitLifecycleIndex(t *testing.T, db *sql.DB, name string) string {
 	for time.Now().Before(deadline) {
 		last = queryRows(t, db,
 			`SELECT agent_uid FROM agent_lifecycle
-			  WHERE agent_name = ? AND valid = 1 AND agent_uid <> ''`, name)
+			  WHERE agent_name = $1 AND valid AND agent_uid <> ''`, name)
 		if len(last) == 1 {
 			uid, _ := last[0]["agent_uid"].(string)
 			return uid
@@ -264,7 +264,7 @@ func v3WaitBinding(t *testing.T, db *sql.DB, agent, kind, refName, uid string) {
 	for time.Now().Before(deadline) {
 		if scalarInt(t, db,
 			`SELECT COUNT(*) FROM agent_resource_bindings
-			  WHERE agent_name = ? AND resource_kind = ? AND ref_name = ? AND resource_uid = ?`,
+			  WHERE agent_name = $1 AND resource_kind = $2 AND ref_name = $3 AND resource_uid = $4`,
 			agent, kind, refName, uid) >= 1 {
 			return
 		}
@@ -281,7 +281,7 @@ func v3WaitBindingGone(t *testing.T, db *sql.DB, agent, kind, uid string) {
 	for time.Now().Before(deadline) {
 		if scalarInt(t, db,
 			`SELECT COUNT(*) FROM agent_resource_bindings
-			  WHERE agent_name = ? AND resource_kind = ? AND resource_uid = ?`,
+			  WHERE agent_name = $1 AND resource_kind = $2 AND resource_uid = $3`,
 			agent, kind, uid) == 0 {
 			return
 		}
@@ -320,7 +320,10 @@ func v3HasProblem(problems []string, want string) bool {
 func TestV3E2E_MigrateAdmitNotify(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
-	db := openDB(t, h.dbPath())
+	// 这两个断言读的是 **init 产出的源谱系库**（`.basalt/basalt.db`，SQLite v6/33 表），
+	// 不是运行期库——运行期已经换成 PostgreSQL 隔离 schema，`sqlite_master` 与
+	// `schema_version = 6` 只对源库成立。判据本身逐字不变，只是换了正确的被断言对象。
+	db := openSQLite(t, h.dbPath())
 	requireFreshSchema(t, db, "init 之后")
 
 	model := newFakeModel(t,
@@ -364,7 +367,10 @@ func TestV3E2E_MigrateAdmitNotify(t *testing.T) {
 	// allowlist, so an unreachable channel can never be created through it. This test
 	// judges the send-time denial instead.
 	const channelUID = "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3E"
-	v3InsertNotifyChannel(t, db, channelUID, "ops", "${"+v3NotifyEnv+"}", "v3 通知渠道")
+	// 渠道行落在**运行期**存储（PostgreSQL 隔离 schema）：`db` 是 init 产出的源谱系
+	// SQLite 库，只用来判建库；服务端的渠道列表读的是运行期库，写错库就会读到空列表。
+	// The row goes to the runtime store; the source-lineage SQLite db only judges bootstrap.
+	v3InsertNotifyChannel(t, h.openDB(t), channelUID, "ops", "${"+v3NotifyEnv+"}", "v3 通知渠道")
 	channel := v3ReadNotifyChannel(t, addr, "ops")
 	if channel.ResourceUID != channelUID || channel.CredentialMode != "env" {
 		t.Fatalf("通知渠道读数：uid = %q、credential_mode = %q，期望 %q / env",
@@ -428,7 +434,9 @@ func TestV3E2E_MigrateAdmitNotify(t *testing.T) {
 	// The policy refusal renders scheme + host only, dropping the port.
 	requireToolResultContains(t, reqs[1], "出网目标不是域名：http://127.0.0.1",
 		"绑定解析出的渠道地址被出网策略拒绝")
-	requireToolAudit(t, db, "notify", "failed", "sandbox_denied", 1)
+	// 审计行同样在运行期存储（PostgreSQL）：`db` 是源谱系 SQLite，读不到这次运行。
+	// The audit row lives in the runtime store, not in the source-lineage SQLite.
+	requireToolAudit(t, h.openDB(t), "notify", "failed", "sandbox_denied", 1)
 }
 
 // TestV3E2E_CredentialLifecycle 覆盖托管凭据的完整生命周期：写入即密文落库（明文零落盘）
@@ -443,7 +451,7 @@ func TestV3E2E_CredentialLifecycle(t *testing.T) {
 	)
 	h := newHarness(t)
 	initWorkspace(t, h)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	keyPath := filepath.Join(t.TempDir(), "master.key")
 	tightenMasterKeyDirACL(t, filepath.Dir(keyPath))
 	model := newFakeModel(t,
@@ -601,7 +609,7 @@ func TestV3E2E_CredentialLifecycle(t *testing.T) {
 	// 库面判卷：身份同一、版本逐条、旧版本永不复活、撤销纪元只增不减。
 	identity := queryRows(t, db,
 		`SELECT credential_id, state, current_version, revocation_epoch
-		   FROM credentials WHERE owner_kind = 'model_connection' AND owner_uid = ?`,
+		   FROM credentials WHERE owner_kind = 'model_connection' AND owner_uid = $1`,
 		before.ResourceUID)
 	if len(identity) != 1 {
 		t.Fatalf("凭据身份应恰有 1 行，实际 %d 行：%v", len(identity), identity)
@@ -620,10 +628,13 @@ func TestV3E2E_CredentialLifecycle(t *testing.T) {
 		t.Fatalf("撤销纪元 = %v，期望 1（重新录入不重置、不回退）", row["revocation_epoch"])
 	}
 
+	// `ciphertext_absent` 用 CASE 投影成整数：PostgreSQL 的 `IS NULL` 是真 boolean，
+	// SQLite 给 0/1——判据要的是"有没有密文"，不是后端原生类型，所以两边都归一成 1/0。
+	// The projection yields 1/0 on both lineages; a bare IS NULL would be a PG boolean.
 	versions := queryRows(t, db,
 		`SELECT version_no, state, length(nonce) AS nonce_len,
-		        (ciphertext IS NULL) AS ciphertext_absent, last4
-		   FROM credential_versions WHERE credential_id = ? ORDER BY version_no`,
+		        CASE WHEN ciphertext IS NULL THEN 1 ELSE 0 END AS ciphertext_absent, last4
+		   FROM credential_versions WHERE credential_id = $1 ORDER BY version_no`,
 		before.CredentialRef)
 	if len(versions) != 2 {
 		t.Fatalf("凭据版本应有 2 行，实际 %d 行：%v", len(versions), versions)
@@ -677,7 +688,7 @@ func TestV3E2E_ScopeAndCopyMapping(t *testing.T) {
 	h.writeConfig(t, v3ServeConfig(addr, providers, ""))
 	startServe(t, h, addr)
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 
 	// aux 是已发布列表里字典序最靠前的一条：模板创建会绑定它（顺序固定，不遍历），
 	// 所以两个 Agent 天然共享同一条连接，范围闸门才有占用者。
@@ -739,7 +750,7 @@ func TestV3E2E_ScopeAndCopyMapping(t *testing.T) {
 	}
 	if got := scalarInt(t, db,
 		`SELECT COUNT(*) FROM management_operations
-		  WHERE operation_id = ? AND action = 'model_connection.scope' AND status = 'failed'`,
+		  WHERE operation_id = $1 AND action = 'model_connection.scope' AND status = 'failed'`,
 		*blocked.OperationID); got != 1 {
 		t.Fatalf("被拒的范围转换应留 1 条 failed 操作行，实际 %d 行", got)
 	}
@@ -852,7 +863,7 @@ func TestV3E2E_RuntimePublishThenBind(t *testing.T) {
 	)
 	h := newHarness(t)
 	initWorkspace(t, h)
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	keyPath := filepath.Join(t.TempDir(), "master.key")
 	tightenMasterKeyDirACL(t, filepath.Dir(keyPath))
 	model := newFakeModel(t, textResponse("运行期发布后绑定成功"))

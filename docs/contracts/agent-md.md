@@ -61,6 +61,19 @@ schedules:
 
 **一个目录 = 一个 Agent**：`.basalt/agents/<name>/` 内是 `AGENT.md` + 可选 `scripts/`、`REFERENCE.md`。目录名即 Agent 名，**必须**与 frontmatter 的 `name` 逐字一致（不一致整只不注册）。
 
+### 1.1 正文之后由系统追加的两段
+
+正文**不是**系统提示词的全部。运行时段一 = `AGENT.md` 正文（及 `bootstrap` 文件）+ 系统追加的两段，**按此顺序**、空段不留字符：
+
+| 追加内容 | 何时出现 | 作者要不要自己写 |
+| --- | --- | --- |
+| `## 本次运行来源` + 一句来源 | 渠道已映射时（`web` / `cli` / `scheduler`） | **不要**。正文里写同名标题只是普通文本，系统追加的那一份不受影响 |
+| 记忆段 | 该层级有生效记忆且本次装配允许注入时 | **不要**。记忆由 `memory` 工具与全局层维护；标题随装配模式变化（`settings.include_global_memory` 未声明时是 `## 核心记忆` 单段，显式 `true` 时是 `## 全局记忆` 与 `## Agent 记忆` 两块） |
+
+**正文里该写什么**：告诉模型"读到来源段之后怎么分支"。写清"即时请求按消息意图回应、不要仅因存在定时流程就自行执行整套业务"，并说明来源**不是**权限边界——两种来源下工具面完全相同。五份内置 Demo 的正文即为范例（`examples/daily/*/AGENT.md`），由 `TestBuiltinAgents_RunOriginGuidanceInBody` 守。
+
+来源段的逐字映射、未映射渠道的行为与"用户消息不得伪造来源"的约束见 [run-and-errors.md §5.1](run-and-errors.md)。
+
 ---
 
 ## 2. frontmatter 字段规范
@@ -83,8 +96,10 @@ schedules:
 | `notify_mode` | string | 否 | 未声明的兼容规则见下 | 通知意图三态：`none`（不发送）/ `all_eligible`（可使用全部有资格渠道）/ `allowlist`（仅限 `notify_channels` 列出的渠道）。`none` 与 `all_eligible` 时 `notify_channels` **必须**为空数组；`allowlist` 至少一个元素。**空数组不表示「禁用通知」**——禁用只能由 `notify_mode: none` 表达。Run 准入冻结模式与渠道 UID 集合，`notify` 工具按冻结值判定。未声明时的兼容读取：`notify_channels` 为空 / 缺省 → `all_eligible`；非空 → `allowlist`；解析结果不改写文件 |
 | `notify_channels` | []string | 否 | `[]` | `allowlist` 模式下的渠道名（= 全局通知渠道表的 `name`）。每个名字必须有资格且 `resource_bindings.notify_channel` 中有同名绑定；声明外的渠道按 `not_found` 失败并回填可用名。它只限制“能用哪些渠道”，**不**表示任务结束自动发送 |
 | `resource_bindings` | object | 否（准入必填） | `{}` | 资源绑定的**唯一权威**（AGENT.md 为源头，数据库只做投影）。结构见 §2.5：`model_connection[]` 与 `notify_channel[]`，元素为 `{name, uid}`。加载期不要求完整（模板占位符与旧 Agent 仍可加载）；**保存期与 Run 准入**要求与 `provider.name` / `notify_channels` 一一对应、UID 为当前发布指针、已发布、有资格。同名新资源不自动接管旧绑定 |
+| `knowledge` | []object | 否 | `[]` | 知识库集合声明，元素为 `{name, access}`：`name` 是集合名（非空、同 Agent 内不重复），`access` 缺省 `read`、闭集**只认** `read`（Agent 运行期永不得借声明拿到写权限）。**声明即绑定**：结构非法 → 整只不注册（规则 12）；名字没有唯一活动实体 → 整只不注册（规则 13）。声明**只收窄**检索范围，不能扩大调用方权限——完整链路见 §2.7 |
 | `settings.max_iterations` | int | 否 | 10 | ReAct 最大轮次；达上限 = `limit_reached`（见 [run-and-errors.md](run-and-errors.md) §2） |
 | `settings.max_history_turns` | int | 否 | 20 | 送进提示词的对话轮数上限 |
+| `settings.include_global_memory` | bool | 否 | **未声明**（= 兼容回退语义） | 记忆注入的层选择，**三态**而非布尔缺省：**未声明** = 兼容回退（Agent 层有内容则只注 Agent 层，为空才回退全局层，**两层不叠加**）；**`false`** = 只注 Agent 层，永不回退全局层；**`true`** = 全局层与 Agent 层**合并注入**（按条目正文去重后 `## 全局记忆` 在前、`## Agent 记忆` 在后）。缺省**不是** `false`——把未声明读成 `false` 会让存量 Agent 丢掉全局回退层 |
 | `schedules` | []object | 否 | `[]` | 定时任务（见 §3） |
 
 ### 2.1 加载期校验（任一不过 = 该 Agent 整只不注册 + 点名 WARN）
@@ -102,6 +117,8 @@ schedules:
 | 9 | `notify_channels` 的每个元素非空白 | WARN `invalid notify_channels` |
 | 10 | `notify_mode` 取值合法且组合成立（`none` / `all_eligible` 时 `notify_channels` 必须为空；`allowlist` 至少一个元素；未声明按兼容规则读取，不改写文件） | WARN `invalid notify_mode` |
 | 11 | `resource_bindings` 结构合法（对象；只允许 `model_connection` / `notify_channel` 两个已知键；元素为 `{name, uid}` 且均非空） | WARN `invalid resource_bindings` |
+| 12 | `knowledge` 结构合法（列表；元素只允许 `name` / `access` 两个键；`name` 非空且不重复；`access` 缺省或 `read`） | WARN `invalid knowledge` |
+| 13 | `knowledge` 里每个名字解析到**唯一活动集合**（注册装配期查 `kb_collections`，未软删且同名活行唯一） | WARN `knowledge collection missing: <name>[, <name>…]`（缺失名按升序、以逗号加空格连接）。与规则 5 同一分工：加载期只判结构，实体存在性在注册装配期判 |
 
 **加载期只判「当前可用 / 结构合法」**：名字能否解析、取值是否合法、结构是否完整。**绑定完整性不在加载期判**——模板占位符与旧 Agent 仍可加载（`resource_bindings` 可能为空或未覆盖全部引用）。每个引用恰有一条有效绑定、UID 是当前发布指针、已发布、有资格，属于**保存期与 Run 准入**判据（§2.3 / §2.5）；准入不通过只拒绝该 Agent 的新 Run 并点名，不把已加载的配置判成语法无效。
 
@@ -162,7 +179,8 @@ schedules:
 - 请求体二选一：
   - `{ "content": "<整份文件>" }`：整份替换；
   - `{ "changes": { ... } }`：只改已知 frontmatter 字段与正文的结构化 patch。服务端保留未改字段、正文与注释；无法在保留注释的前提下完成时返回 **400** `EDIT_UNSUPPORTED`，提示改用整份原文编辑。**不得**为了 patch 而整份重新生成、重排或丢注释。
-- `changes` 已知字段：`description`、`display_name`、`identity.agent_name`、`identity.prompt`、`body`、`provider.name`、`provider.model`、`provider.temperature`、`tools`、`skills`、`mcp_servers`、`notify_mode`、`notify_channels`、`settings.max_iterations`、`settings.max_history_turns`、`schedules`、`bootstrap`、`bindings`。未列出的键 → **400**（严格已知键；不静默忽略拼写错误）。
+- `changes` 已知字段：`description`、`display_name`、`identity.agent_name`、`identity.prompt`、`body`、`provider.name`、`provider.model`、`provider.temperature`、`tools`、`skills`、`mcp_servers`、`notify_mode`、`notify_channels`、`settings.max_iterations`、`settings.max_history_turns`、`settings.include_global_memory`、`schedules`、`bootstrap`、`bindings`。未列出的键 → **400**（严格已知键；不静默忽略拼写错误）。
+- `changes.settings.include_global_memory`：**四态**——缺省 = **不修改**（保持文件现状，未声明仍是未声明）；`true` / `false` = 写入该行；显式 `null` = **移除该行**，文件回到「未声明」。三种写入效果**互不等价**：未声明 = 沿用旧规则（Agent 层有内容只注 Agent 层，为空才回退全局层，两层不叠加）；`true` = 两层合并注入（`## 全局记忆` 在前、`## Agent 记忆` 在后，按条目去重）；`false` = 只注 Agent 层、永不回退。**不得**把 `null` 实现成写 `false`，也**不得**把缺省读成清除。同一补丁里 `null` 与布尔值同时出现 → **400** `EDIT_UNSUPPORTED`；该行本来不存在时 `null` 是空操作，ETag 不变。
 - `changes.display_name`：三态——缺省 = **不修改**；非空字符串（去空白后）= 写入该行；空串 = 移除该行，展示回退 `name`。移除只在字段存在时改动文件；字段本就不存在时是空操作，ETag 不变。值含控制字符或超过 64 字符 → **400**。
 - `changes.body`：缺省 = **不改正文**；给出字符串 = 整段替换正文；空串 = 清空正文（页面须二次确认）。**不得**用「未给 body」推断清空。
 - `changes.provider.temperature`：三态——缺省 = **不修改**；数字（含显式 `0`，0 是合法值） = 写入该值；显式 `null` = 移除 `provider.temperature` 行，回到供应商缺省。**不得**把缺省读成清除，也**不得**把 `null` 当作 `0`。移除只在字段存在时改动文件；字段本就不存在时该补丁是空操作，ETag 不变。
@@ -206,7 +224,7 @@ resource_bindings:
 | 元素 `name` | string | 资源当前名称；只用于展示与对照，**不**作为身份 |
 | 元素 `uid` | string | 稳定资源身份（`rs_` 前缀）；由服务端在创建资源时分配，**不得**手填、不得改写 |
 
-- **权威与投影**：`AGENT.md` frontmatter 是绑定唯一权威；SQLite `agent_resource_bindings` 是可重建投影，供列表与引用视图查询，不作为写入口。
+- **权威与投影**：`AGENT.md` frontmatter 是绑定唯一权威；`agent_resource_bindings`（运行期为 PostgreSQL，DDL 见 [schema.pg.sql](schema.pg.sql)）是可重建投影，供列表与引用视图查询，不作为写入口。知识集合绑定与资源绑定写在同一张投影表（`resource_kind = knowledge_collection`，见 §2.7）。
 - **身份优先于名称**：同名资源删除后重建会得到**新 `resource_uid`**，旧绑定继续指向旧 UID（墓碑可查），**不自动接管**新资源。要改用新资源必须显式重新选择并保存。
 - **不自动补绑**：迁移、复制、恢复、启动、Run 准入、原文保存都**不得**因为「名称当前能解析到某个资源」而写入或改写绑定。只有三个入口可以产生绑定：① 新建模板由服务端写入创建时选定的资源；② 表单显式选择（`changes.bindings`）；③ 原文显式写出。
 - **随配置流转**：复制、归档、恢复、导出携带绑定（UID 不变）；复制遇到源 Agent 专属资源时**阻断并点名**，要求显式映射（不提供「一键解除」），副本获得新 `agent_uid`，不复制源凭据。
@@ -228,6 +246,31 @@ resource_bindings:
 - **装载期**：以文件为准；不因通知意图回写文件。缺 `notify` 但 `notify_mode` 非 `none` 时按加载规则处理并在页面提示，下一次保存才装配。
 - **系统代投接管**：任务配置了 `deliver_to` 时，该轮 Run 在准入阶段固定 `notify_mode = none` 并从工具面剔除 `notify`（授权层仍兜底拒绝）；模型只返回正文，由系统在成功后发送。此规则**不**改写 `AGENT.md`。
 - **单一存储**：装配只改 `tools` 列表，不新建通知配置表；渠道权限边界仍由 `notify_mode` + `notify_channels` + `resource_bindings.notify_channel` 决定。
+
+### 2.7 知识库集合声明与绑定（`knowledge`）
+
+**四段链路，缺一不可**：
+
+```text
+AGENT.md `knowledge:` 声明
+        │  （声明即绑定：名字 + 只读权限，写不出集合 ID）
+        ▼
+注册闸门 —— 每个名字必须解析到唯一活动集合（规则 13）
+        │  解析不到 → 该 Agent 整只不注册，WARN 点名缺失集合
+        ▼
+投影 —— `agent_resource_bindings`（resource_kind = knowledge_collection）
+        │  ref_name = 声明名，resource_uid = 稳定集合 ID（`col_` 前缀）
+        ▼
+检索授权 —— 声明 ∩ 调用方项目 ∩ 调用方 scope
+           声明**只收窄**，调用方自己的判定先成立
+```
+
+- **声明不能扩大调用方权限**。Agent 声明给出的集合，仍必须通过调用方自身的 `knowledge:read` scope 与 `callers.project` 判定；显式集合与 Agent 同时给出时取**交集**。解析出集合、却一个都不可见 → 按越权拒绝（403，**不是**空结果）；Agent 没有可解析的声明 → 空范围（诚实地说"这个 Agent 看不到集合"，`denied_count` 记未解析数），不是拒绝。未注册的 Agent 在检索面上一律拒绝——名字打错与无权不可区分。
+- **稳定身份**：声明写的是名字，投影与授权用的是 `collection_id`（`col_` 前缀）。集合改名后旧声明解析不到 → 规则 13 拒注册；**不会**按名字重新绑定到另一个集合。
+- **同名活行不唯一即未解析**：集合名只在项目内唯一（`UNIQUE (project, name)`），跨项目同名时解析不出唯一身份，按"不存在"处理——宁可该 Agent 不注册，也不猜一个集合。
+- **软删按不存在**：已软删的集合与从未存在走同一条路径（注册闸门拒注册；检索授权计入被拒计数），不区分原因，避免泄露"曾经存在"。
+- **已知边界**：注册闸门在装配与热加载时判定；**运行中新建集合不会自动让已有 Agent 重新注册**——需要触碰该 Agent 的配置（保存或目录变更）触发一次热加载。集合被删除 / 改名会让已注册 Agent 在下一次热加载时被收回。
+- **不新增工具**：检索走既有 `POST /api/v1/search` 端点（`knowledge:read` scope，见 [openapi.yaml](openapi.yaml)），`knowledge:` 声明不产生新的工具名，也不授予写权限（写只属于摄取端 `knowledge:write`）。
 
 ---
 
@@ -427,19 +470,23 @@ type ToolCall struct {
 
 返回：写入确认（含作用域：Agent 层 / 全局层）。
 失败：`invalid_input`（scope 非法，合法取值仅 `CORE` / `ARCHIVAL`）/ `runtime_error`；**超配额返回可读拒绝**（单条 ≤ 4 KB、每 Agent 核心区 ≤ 32 KB），提示改写归档区。
-作用域：有 Agent 上下文 → 该 Agent 的 `memory/agents/<name>/MEMORY.md`；无上下文 → 全局 `memory/MEMORY.md`。
+作用域：有 Agent 上下文 → 该 Agent 层（`memory_entries.scope='agent'`、`agent_name=<name>`）；无上下文 → 全局层（`scope='global'`）。运行时唯一载体是 PostgreSQL `memory_entries`（[schema.pg.sql](schema.pg.sql)），`memory/agents/<name>/MEMORY.md` 与 `memory/MEMORY.md` **不再**是写入目标——Markdown 文件只在迁移时一次性只读导入（`source='legacy_import'`）。全局层没有 Agent 上下文才有写者（运行期）；管理面另有两个**显式**写入口——`POST /memory/proposals`（新建候选，需确认后才参与召回）与对已有条目的 `confirm` / `correct` / `delete`，见 [openapi.yaml](openapi.yaml) 的记忆管理端点。二者都不改变运行期写入路径：Agent 运行时仍然只经 `save_memory` 写自己那一层。
 
-> **两个 `scope` 不是一回事（防混淆，必须看清）**：本工具的 `scope` 参数取值是 `CORE` / `ARCHIVAL`，指的是**记忆分区**（落 `memory_entries.section` 列，值 `core` / `archive`）；而 `memory_entries.scope` **列**指的是**记忆分层**（`agent` / `global`）。二者是两条正交维度：分区由模型选，分层由运行时按上下文决定（有 Agent 上下文 = Agent 层，无 = 全局层）。列名以 [schema.sql](schema.sql) 为唯一事实源。
+> **两个 `scope` 不是一回事（防混淆，必须看清）**：本工具的 `scope` 参数取值是 `CORE` / `ARCHIVAL`，指的是**记忆分区**（落 `memory_entries.section` 列，值 `core` / `archive`）；而 `memory_entries.scope` **列**指的是**记忆分层**（`agent` / `global`）。二者是两条正交维度：分区由模型选，分层由运行时按上下文决定（有 Agent 上下文 = Agent 层，无 = 全局层）。运行期列名以 [schema.pg.sql](schema.pg.sql) 为唯一事实源（`scope` / `section` 与冻结的 SQLite [schema.sql](schema.sql) 同名，后者只作迁移来源）。
 
 #### recall_memory
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `query` | string | 是 | **单个关键词** |
+| `query` | string | 是 | 检索文本（规范化后不得为空）。`mode=semantic` 时作为语义查询；`mode=keyword` 时作为**单个关键词**做整串子串匹配 |
+| `mode` | string | 否 | `semantic` / `keyword`；**省略 = `semantic`**（P-07 契约变更，显式登记）。取值区分大小写、不给别名；其余取值（含空串）一律 `invalid_input` |
 
 返回：命中的归档区条目（核心区不参与检索——它每轮已完整注入）。
-失败：无命中返回成功 + 空结果（不报错）。
-**契约语义**：按整串 `contains` 匹配，**不分词、不扩展、不向量化**。命中条件是**连续子串**：条目原文里含该连续短语（条目写着 `SQLite 方案 评估`）**会命中**；几个词分散在条目各处、只是"都出现过"（该条分别含 `SQLite` 与 `评估`，但从不连排）**不会**自动组合命中——这是已知行为，不是缺陷。参数仍要求**单个关键词**。
+`mode=semantic` 的命中按名次逐条渲染 `名次. [来源] 正文`（来源为空时省略方括号，条目之间空行分隔）；`mode=keyword` 的渲染逐字保留旧行为（空行分隔、无编号）。
+失败：无命中返回成功 + 占位文案 `(无匹配条目)`（不报错）。`invalid_input`：`mode` 取值非法 / `query` 规范化后为空 / 语义路径未装配（缺语义载体或 embedding 连接——文案提示改用 `mode=keyword`，**不**静默降级）。`runtime_error`：调用方身份不可用（零值身份在触碰任何载体之前拒绝，见下）。
+**索引缺口 ≠ 无匹配（V-5）**：`mode=semantic` 下若本层存在生效归档记忆、但当前 embedding 代际尚无对应向量（未回填或回填失败），返回 `invalid_input` 并点名「记忆向量索引未就绪」，给出两条下一步（改用 `mode=keyword` / 等索引回填完成后重试）；**不得**落 `(无匹配条目)`，也**不得**与「语义路径未装配」共用文案——前者等回填、后者补装配。缺口由「保存成功后补索引」与「启动期回填」收敛；读路径**不得**顺手补索引。
+**身份来源（硬约束）**：本次调用的 `Principal` 由服务端从当前 Run 准入时的请求原样注入（`ToolEnv.Principal`），工具**不得**从模型入参、Agent 名或包级状态反推，**不得**把零值补成管理员；每次调用重新判定，不缓存结论（冻结内容不冻结权限）。
+**语义（`mode=keyword`）**：按整串 `contains` 匹配，**不分词、不扩展、不向量化**。命中条件是**连续子串**：条目原文里含该连续短语（条目写着 `SQLite 方案 评估`）**会命中**；几个词分散在条目各处、只是"都出现过"（该条分别含 `SQLite` 与 `评估`，但从不连排）**不会**自动组合命中——这是已知行为，不是缺陷。参数仍要求**单个关键词**。
 
 > **2026-10-17 澄清**：本节此前写作"传多词短语**必不命中**"，与 `contains` 语义不符（连续短语在 `strings.Contains` / `instr` 下必然命中）。语义以本段为准：**整串子串匹配、不分词不扩词**；连续短语能命中、分散词不自动组合。同一句在 [Compatibility.md](../Compatibility.md) §2.2、[DevelopmentLoop.md](../DevelopmentLoop.md) §7 陷阱 11、[Roadmap.md](../Roadmap.md) B 方向与 M2 已同步改写；渲染测试**不得**钉"多词必不命中"，改钉"连续短语命中 / 分散词不命中"两态。
 

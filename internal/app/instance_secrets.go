@@ -5,14 +5,16 @@ package app
 // 三条纪律：
 //   - 判定靠**三项联立**（初始化记录 / 密钥文件 / 现存托管密文），不看"文件在不在"。
 //     格式正确但内容错误的密钥会让全部托管凭据永久不可用，而页面却显示「就绪」——
-//     这是代价最大的一种假成功，adopt 因此必须在有密文时**真解一遍**；
+//     这是代价最大的一种假成功；
+//   - 无记录 + 有托管密文一律恢复态（D-40，2026-10-27 裁决）——**解得开也不 adopt**：
+//     能解开只说明密文可读，不构成来源证明；adopt 只在案例 4（无记录、无密文）可达；
 //   - 恢复态**不得**生成替代密钥、**不得**回落到 env、**不得**删除来源不明的文件；
-//   - 先写 `pending` 审计再生成，任一后续步骤失败都按判定表回到「未初始化 / 待 adopt」，
+//     先写 `pending` 审计再生成，任一后续步骤失败都按判定表回到「未初始化 / 待 adopt」，
 //     重试**不会**产生第二把密钥——发布是排他语义，第二次必然 EEXIST 并转入 adopt。
 //
 // The instance-secrets service decides the three-state verdict from three inputs
-// together, never from file existence alone, and refuses to mint a replacement key in
-// the recovery state.
+// together, never from file existence alone, never adopts over existing ciphertext
+// (D-40), and refuses to mint a replacement key in the recovery state.
 
 import (
 	"context"
@@ -25,8 +27,33 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
+
+// SecretsCodeRosterMissingRequiresAdopt 是「存量实例没有名册，拒绝就地建立新身份」的
+// 稳定码（§3.1.8 校验表 H1；D-15 已登记的提案字面量）。
+// SecretsCodeRosterMissingRequiresAdopt is the stable code for the H1 refusal.
+const SecretsCodeRosterMissingRequiresAdopt = "roster_missing_requires_adopt"
+
+// secretsRefusal 是带稳定码的服务层拒绝：`Error()` 以 `<code>: ` 开头（与离线命令面
+// 的 `offlineRefusal` 同一份渲染口径），`Unwrap()` 保留 `core.ErrCredentialUnavailable`
+// 使管理面仍按 409 处理——码给运维看，包装错误给调用链判类型。
+// secretsRefusal carries a stable code while staying unwrappable to the sentinel error.
+type secretsRefusal struct {
+	Code string
+	Err  error
+}
+
+// Error 渲染成 `code: 文案`；码在前是为了让日志与 CLI 输出可以直接按前缀取码。
+func (r *secretsRefusal) Error() string {
+	if r.Err == nil {
+		return r.Code
+	}
+	return r.Code + ": " + r.Err.Error()
+}
+
+// Unwrap 保留底层哨兵错误（`core.ErrCredentialUnavailable`）。
+func (r *secretsRefusal) Unwrap() error { return r.Err }
 
 // SecretsAction 是判定表给出的下一步动作。`await_init` 与 `create` 的区别只在
 // "谁发起"：`create` 由可证明的新实例在启动时自动完成，`await_init` 等人类动作。
@@ -63,9 +90,15 @@ func (d SecretsDecision) CanInitialize() bool {
 }
 
 // SecretsFacts 是判定表三项联立的输入事实。`ManagedCiphertexts`（有没有密文）与
-// `CiphertextsVerified`（这把钥匙能不能解开它）必须分开：把"没试过"当成"解得开"
-// 正是要防的假成功。
-// SecretsFacts separates "there is ciphertext" from "this key can open it".
+// `CiphertextsVerified`（这把钥匙能不能解开它）必须分开记录：**有没有**密文决定
+// 来源是否可证明，**解得开**只说明密文可读。
+//
+// D-40（2026-10-27 裁决）之后 `CiphertextsVerified` 不再影响判定——无记录 + 有密文
+// 一律恢复态，能解开也不 adopt；它保留为启动期读表失败的分类与诊断读数（
+// "读表失败 → unavailable" 与 "解不开 → unprovable_provenance" 仍要分开）。
+// SecretsFacts keeps "there is ciphertext" separate from "this key can open it": the
+// first decides provenance, the second only says the bytes are readable. Since D-40
+// decryptability never flips the verdict; the flag survives for error classification.
 type SecretsFacts struct {
 	// Configured 表示解析出了主密钥文件路径；未配置 = 纯 env 实例。
 	Configured bool
@@ -74,7 +107,7 @@ type SecretsFacts struct {
 	// AutoInit 是 `secrets.auto_init` 的生效值（缺省 true）。
 	AutoInit bool
 	// Record 是 `instance_secrets` 记录；nil 表示没有记录。
-	Record *storage.InstanceSecretRecord
+	Record *postgres.InstanceSecretRecord
 	// KeyPresent 表示密钥文件存在（存在但读不回来时 KeyErr 非空）。
 	KeyPresent bool
 	// KeyID 是解析成功的主密钥标识；KeyErr 非空时无意义。
@@ -83,7 +116,9 @@ type SecretsFacts struct {
 	KeyErr error
 	// ManagedCiphertexts 是现存托管密文的版本数。
 	ManagedCiphertexts int
-	// CiphertextsVerified 表示全部现存密文都用这把密钥解开了。
+	// CiphertextsVerified 表示全部现存密文都用这把密钥解开了。**不参与**判定：
+	// 解得开不等于来源可信（D-40），它只用于区分"读表失败"与"解不开"。
+	// CiphertextsVerified never flips the verdict; it only classifies read failures.
 	CiphertextsVerified bool
 	// CiphertextsErr 是试解路径本身的错误（读表失败），与"解不开"分开。
 	CiphertextsErr error
@@ -158,10 +193,16 @@ func EvaluateSecrets(facts SecretsFacts) SecretsDecision {
 	if facts.CiphertextsErr != nil {
 		return recoveryDecision(core.SecretRecoveryUnavailable)
 	}
-	if facts.ManagedCiphertexts > 0 && !facts.CiphertextsVerified {
+	// D-40（2026-10-27 裁决）：无记录 + 有托管密文一律恢复态——**能解开也不再 adopt**。
+	// "这把钥匙解得开"只证明密文可读，不证明它就是产生这些密文的那把；凭此补写记录
+	// 等于把无主来源采纳成原生身份，事后与真正的"记录丢失"再也分不开。
+	// D-40: a record-less instance with managed ciphertext is always in recovery, even
+	// when the current key opens every sealed version — decryptability is not provenance.
+	if facts.ManagedCiphertexts > 0 {
 		return recoveryDecision(core.SecretRecoveryUnprovableProvenance)
 	}
-	// 记录还没写：状态仍是"未初始化"（页面不谎报就绪），动作是 adopt。
+	// 案例 4（无记录、无密文）不受 D-40 影响：状态仍是"未初始化"（页面不谎报就绪），
+	// 动作是 adopt——盘上那把密钥是这类实例唯一的凭据来源。
 	return SecretsDecision{
 		State:  core.SecretStateUninitialized,
 		Reason: core.SecretRecoveryNone,
@@ -227,7 +268,7 @@ func (e *SecretsInitError) Unwrap() error { return e.Err }
 // InstanceSecretsDeps wires the instance-secrets surface; KeyPath is shared with the
 // credential components and WorkDir supplies the roster location for an explicit init.
 type InstanceSecretsDeps struct {
-	Store         *storage.InstanceSecretsStore
+	Store         *postgres.InstanceSecretsStore
 	Operations    core.OperationStore
 	MasterKeyFile string
 	KeyPath       *MasterKeyLocator
@@ -450,9 +491,10 @@ func (s *InstanceSecretsService) EnsureForManagedWrite(ctx context.Context, acto
 // 不得被显式关闭（那是纯 env 部署，按钮点不动是正确结果）。
 //
 // 建立的是**新**名册，所以推导出的私有目录此前不可能存在——不会覆盖既有密钥，也不会
-// 把旧密文变成孤儿。写入只在本进程内生效；重启后由名册推导，与本进程看到的是同一路径。
+// 把旧密文变成孤儿。**只有新实例**（`FreshInstance=true`，即库与名册都是本次新建）
+// 才允许就地建名册；存量实例缺名册一律 `roster_missing_requires_adopt`（H1）。
 // A brand-new roster makes the derived private directory provably fresh, so nothing is
-// overwritten; the locator carries the path to every credential component immediately.
+// overwritten; an existing instance without a roster is refused instead of rebuilt.
 func (s *InstanceSecretsService) establishKeyPath(status InstanceSecretsStatus) error {
 	if status.Decision.State == core.SecretStateRecoveryRequired {
 		return fmt.Errorf(
@@ -468,6 +510,30 @@ func (s *InstanceSecretsService) establishKeyPath(status InstanceSecretsStatus) 
 		return fmt.Errorf(
 			"%w: 当前实例状态为 %s（动作 %s），拒绝生成新密钥",
 			core.ErrCredentialUnavailable, status.Decision.State, status.Decision.Action)
+	}
+	// H1（§3.1.8 校验表）：存量实例（`FreshInstance=false`）没有名册时**不得**就地
+	// 建立身份。名册缺失只可能是被删或从未随迁移带过来，就地补一份会把"来源可证"
+	// 换成"来源被重建"——此后谁也无法区分这份身份是不是原装的。合法动作只有离线
+	// 的 `secrets adopt-legacy` / `secrets recover-record`（由备份提供身份）。
+	if !s.deps.FreshInstance {
+		// 路径口径与下面的 ensureInstanceMarker 必须一致：`WorkDir` 是工作区的**父目录**，
+		// 名册在 `<WorkDir>/.basalt/instance.json`。用 readInstanceMarkerAt（按工作区根读）
+		// 会去看 `<WorkDir>/instance.json`，结果是"名册在也判缺失"——存量实例 adopt
+		// 之后仍被永远拒绝，且可能误读父目录里同名的无关文件。
+		_, present, markerErr := readInstanceMarker(s.deps.WorkDir)
+		if markerErr != nil {
+			return fmt.Errorf("%w: 实例名册不可用（损坏 / 版本过高 / 标识非法）——不得在坏名册上补写: %v",
+				core.ErrCredentialUnavailable, markerErr)
+		}
+		if !present {
+			return &secretsRefusal{
+				Code: SecretsCodeRosterMissingRequiresAdopt,
+				Err: fmt.Errorf(
+					"%w: 存量实例没有实例名册——拒绝就地建立新身份（零写入、零铸钥）；"+
+						"请先用 secrets adopt-legacy 或 secrets recover-record 从备份恢复身份",
+					core.ErrCredentialUnavailable),
+			}
+		}
 	}
 	if _, err := ensureInstanceMarker(s.deps.WorkDir); err != nil {
 		return fmt.Errorf("%w: 建立实例标识: %v", core.ErrCredentialUnavailable, err)
@@ -552,7 +618,7 @@ func (s *InstanceSecretsService) create(ctx context.Context, residueRecovered bo
 	// 一个时间点写进记录、投影进返回值：页面显示的时间与库里的初始化时间同源。
 	// One timestamp feeds both the record and the returned projection.
 	initializedAt := s.now()
-	recordErr := s.deps.Store.Insert(ctx, storage.InstanceSecretRecord{
+	recordErr := s.deps.Store.Insert(ctx, postgres.InstanceSecretRecord{
 		Scope:         core.InstanceSecretScopeMasterKey,
 		KeyID:         key.KeyID,
 		Fingerprint:   fingerprint,
@@ -564,7 +630,7 @@ func (s *InstanceSecretsService) create(ctx context.Context, residueRecovered bo
 		// 删掉它才是真正的数据丢失面（外部可能已开始用它加密），而且会让重试必然换钥匙。
 		s.finishSecretsInit(ctx, opID, core.OperationFailed, "INTERNAL", recordErr.Error(),
 			secretsInitDetail{KeyID: key.KeyID, Fingerprint: fingerprint, Recovered: residueRecovered})
-		if errors.Is(recordErr, storage.ErrInstanceSecretExists) {
+		if errors.Is(recordErr, postgres.ErrInstanceSecretExists) {
 			// 并发竞争：别人已经写下记录。以记录为准重新判定（key_id 一致即就绪）。
 			return s.Status(ctx)
 		}
@@ -602,8 +668,10 @@ func (s *InstanceSecretsService) generateAndPublish(_ context.Context) (MasterKe
 }
 
 // adopt 为已存在的密钥补写初始化记录。写入前**已经**在 Status 里做过完整校验
-// （读回 + 有密文时逐条试解），这里只落记录。
-// adopt writes the missing record for a key that already passed full verification.
+// （读回），这里只落记录。D-40 之后它只覆盖案例 4（无记录、无密文）——
+// 有密文时判定表不会给出 adopt 动作。
+// adopt writes the missing record for a key that already passed verification; since
+// D-40 it is reachable only for a record-less instance with no managed ciphertext.
 func (s *InstanceSecretsService) adopt(ctx context.Context, residueRecovered bool,
 	actor core.Actor,
 ) (InstanceSecretsStatus, error) {
@@ -619,7 +687,7 @@ func (s *InstanceSecretsService) adopt(ctx context.Context, residueRecovered boo
 		return InstanceSecretsStatus{}, err
 	}
 	initializedAt := s.now()
-	insertErr := s.deps.Store.Insert(ctx, storage.InstanceSecretRecord{
+	insertErr := s.deps.Store.Insert(ctx, postgres.InstanceSecretRecord{
 		Scope:         core.InstanceSecretScopeMasterKey,
 		KeyID:         status.KeyID,
 		Fingerprint:   status.Fingerprint,
@@ -629,7 +697,7 @@ func (s *InstanceSecretsService) adopt(ctx context.Context, residueRecovered boo
 	if insertErr != nil {
 		s.finishSecretsInit(ctx, opID, core.OperationFailed, "INTERNAL", insertErr.Error(),
 			secretsInitDetail{KeyID: status.KeyID, Fingerprint: status.Fingerprint, Recovered: residueRecovered})
-		if errors.Is(insertErr, storage.ErrInstanceSecretExists) {
+		if errors.Is(insertErr, postgres.ErrInstanceSecretExists) {
 			return s.Status(ctx)
 		}
 		return InstanceSecretsStatus{}, &SecretsInitError{OperationID: opID, Err: insertErr}
@@ -683,6 +751,11 @@ func (s *InstanceSecretsService) gatherFacts(ctx context.Context) (SecretsFacts,
 	}
 	facts.KeyID = key.KeyID
 	if count > 0 {
+		// 试解**不**为判定服务（D-40 起有没有密文就够），只用来把"读表失败"
+		// （→ unavailable）与"解不开"分开，并给诊断留一份"这把钥匙打不开现存密文"
+		// 的读数。解开的明文当场清零，不落任何地方。
+		// The trial decryption no longer feeds the verdict; it only separates a storage
+		// read failure from "this key cannot open the sealed versions".
 		if verifyErr := s.verifySealedCredentials(ctx, key); verifyErr != nil {
 			if errors.Is(verifyErr, errSealedCredentialsUnreadable) {
 				facts.CiphertextsVerified = false

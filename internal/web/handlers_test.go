@@ -183,6 +183,9 @@ func (f *fakeSessionStore) ListSessions(_ context.Context, filter core.SessionFi
 		if filter.Status != "" && rec.Status != filter.Status {
 			continue
 		}
+		if filter.CallerID != "" && rec.CallerID != filter.CallerID {
+			continue
+		}
 		out = append(out, rec)
 	}
 	slices.SortFunc(out, func(a, b core.SessionRecord) int { return strings.Compare(a.ID, b.ID) })
@@ -220,16 +223,19 @@ func (f fakeMemory) Sections(context.Context, core.Scope) (string, string, error
 	return f.coreText, f.archiveText, f.err
 }
 
-// newTestServer 是 handler 级用例的统一装配：固定时钟 2026-10-18T12:00:00Z、
-// 丢弃日志、内存仓储；mutate 覆盖单个用例关心的端口。
-// newTestServer assembles a handler-level server with a fixed clock.
-func newTestServer(t *testing.T, mutate func(*Options)) *Server {
+// defaultTestOptions 是 handler 级用例的缺省装配：固定时钟 2026-10-18T12:00:00Z、
+// 丢弃日志、内存仓储。单独导出成函数的唯一动机是装配期判卷用例——它们要在构造
+// `NewServer` 之前逐字段篡改（如抽掉 Ingress），不能走 `newTestServer` 的
+// "必定成功" 路径。
+// defaultTestOptions is the default assembly; the startup-check tests mutate it
+// before calling NewServer, which newTestServer cannot express.
+func defaultTestOptions(t *testing.T) Options {
 	t.Helper()
-	opts := Options{
+	return Options{
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:           func() time.Time { return time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC) },
 		Version:       "test",
-		MemoryBackend: "markdown",
+		MemoryBackend: "postgres",
 		Runs:          &fakeRunService{result: core.RunResult{RunID: "run-1", Status: core.StatusCompleted}},
 		Sessions:      &fakeSessionStore{sessions: map[string]core.SessionRecord{}, messages: map[string][]core.Message{}},
 		Agents:        fakeAgents{entries: []core.AgentEntry{{Name: "ops-agent", Registered: true, Profile: &core.Profile{Name: "ops-agent"}}}},
@@ -243,7 +249,18 @@ func newTestServer(t *testing.T, mutate func(*Options)) *Server {
 		// 管理台产物走真实 go:embed：路由表与公开面断言测的就是要发布的那份壳。
 		// The real embedded artifact backs every handler test.
 		Console: assets.Console(),
+		// 入口速率缺省全放行（T126）：既有用例关心的是认证之后的路由行为，桶由
+		// TestIngressMiddleware_* 单独覆盖；NewServer 也要求有认证闸门时必须有速率端口。
+		// Tests that care about charging inject recordingIngress explicitly.
+		Ingress: allowAllIngress{},
 	}
+}
+
+// newTestServer 在缺省装配上应用单用例覆盖并构造服务器（装配错误直接用失败收尾）。
+// newTestServer applies the per-test mutations and builds the server.
+func newTestServer(t *testing.T, mutate func(*Options)) *Server {
+	t.Helper()
+	opts := defaultTestOptions(t)
 	if mutate != nil {
 		mutate(&opts)
 	}
@@ -680,7 +697,7 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 
 	t.Run("memory 两分区与 backend", func(t *testing.T) {
 		memSrv := newTestServer(t, func(o *Options) {
-			o.MemoryBackend = "sqlite"
+			o.MemoryBackend = "postgres"
 			o.Memory = fakeMemory{coreText: "## 核心记忆\n- a", archiveText: "## 归档记忆\n- b"}
 		})
 		rec := get(memSrv, "/api/v1/memory")
@@ -691,7 +708,7 @@ func TestMeta_ProfilesToolsMemory(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
 		require.Equal(t, "global", env.Data.Scope)
 		require.Empty(t, env.Data.Agent)
-		require.Equal(t, "sqlite", env.Data.Backend)
+		require.Equal(t, "postgres", env.Data.Backend)
 		require.Equal(t, "## 核心记忆\n- a", env.Data.Core)
 		require.Equal(t, "## 归档记忆\n- b", env.Data.Archive)
 	})

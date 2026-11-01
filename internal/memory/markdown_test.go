@@ -136,7 +136,7 @@ func TestMarkdownStore_AcceptsCRLFFromManualEdit(t *testing.T) {
 	// ② 注入面：核心区按条目重建为 LF 形态，空行留在条目正文内（不被当成条目分界）。
 	svc, err := memory.NewService(memory.Options{Backend: store, Logger: testLogger(t)})
 	require.NoError(t, err)
-	effective, err := svc.LoadEffective(ctx, "")
+	effective, err := svc.LoadEffective(ctx, adminPrincipal(), "")
 	require.NoError(t, err)
 	require.Equal(t,
 		"## 核心记忆\n\n- 第一行\n  第二行\n\n  空行后的续行\n\n- 第二条",

@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 US-7 装配面 MCP 接线的验收用例（颗粒度文档 §3.2 的 app/wire_mcp_test.go 七例，

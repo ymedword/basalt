@@ -5,7 +5,7 @@ package app
 //     运行时，任一绑定资源缺失或不一致 → `*core.ResourceUnavailableError`（失败关闭）；
 //   - `web.ResourceReader`：管理台只读面，只回发布状态、可执行名与环境变量键名。
 //
-// 两者读同一份 `storage.ResourceStore`，版本与运行时来自同一快照；**不得**退回工作
+// 两者读同一份 `postgres.ResourceStore`，版本与运行时来自同一快照；**不得**退回工作
 // 副本、**不得**补造空版本号（约束 35 / 36 / 37）。
 // This file adapts published resource versions to the run-admission port and the
 // read-only console reader. Both read the same store, pin versions and runtime from a
@@ -30,7 +30,7 @@ import (
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/web"
 	"github.com/ymedword/basalt/internal/workspace"
 )
@@ -80,6 +80,15 @@ const skillWorkCopyPrefix = ".basalt/skills/"
 // the two-phase audit, whatever the underlying implementation.
 type pinnedProviderService interface {
 	Pinned(name string) (*provider.ProviderService, bool)
+	// SummaryPinned 返回该 Provider 的**裸协议客户端**，只服务会话压缩的摘要调用
+	// （C-25）。摘要不是对话轮：`Pinned` 交出的视图会以"round 必须 >= 1"拒绝，且它写
+	// 出的审计行 `purpose='chat'`。审计与配额改由压缩接线的 `SummaryCallGate` 承担
+	// （先写 `purpose='compaction'` 的 pending 行、再 `AdmitCall(ClassCompaction)`），
+	// 因此这里交出的是**未经审计**的协议客户端——发放面只有 `ResolvedResources.SummaryProvider`
+	// 一个，运行时（`RunRuntime.Provider`）仍然**不得**发放裸客户端。
+	// SummaryPinned hands out the raw client for the summary call only; the compaction
+	// gate owns its audit and quota, and RunRuntime still never hands out raw clients.
+	SummaryPinned(name string) (core.ProviderClient, bool)
 }
 
 // runResources 是 `core.RunResources` 的唯一实现（§3.1.32 的固定形状）：字段逐字
@@ -87,7 +96,7 @@ type pinnedProviderService interface {
 // runResources is the single implementation of core.RunResources; the frozen field set
 // is kept verbatim even where a field is consumed by the next US.
 type runResources struct {
-	Versions *storage.ResourceStore
+	Versions *postgres.ResourceStore
 	// Providers 是装配期首次构建的目录快照，随运行期保留以便装配诊断；**准入与模型调用
 	// 不读它**——路由经 `LLM` 在准入读锁内取当前发布目录（T032），发布换表因此对新 Run
 	// 立即生效（约束 16 / 17）。
@@ -109,7 +118,7 @@ type runResources struct {
 	// The read-only dependencies of the v3 admission freeze; every one is injected by the
 	// assembly and nothing is inferred from a name.
 	Identities  AgentIdentitySource
-	NotifyAdmin *storage.NotifyAdminStore
+	NotifyAdmin *postgres.NotifyAdminStore
 	Channels    NotifyChannelCatalog
 	Bindings    NotifyBindingSource
 	Credentials BindingCredentialCheck
@@ -124,6 +133,12 @@ type runResources struct {
 	// Checkpoint re-checks the pinned credential version before every model call; nil is
 	// only legal when no managed credential can exist in this process.
 	Checkpoint RunCredentialCheckpoint
+
+	// Diagnostics 是运行路径上的诊断生产端（US-16 T095 / R23 裁决 3）：装饰器包在
+	// `providerClient` 交出视图的**最外层**，每次模型调用成功后记一条 `llm_call`。
+	// nil = 本进程不发诊断，运行行为与接线前逐字一致（诊断可丢弃，不是必需端口）。
+	// Diagnostics is the run-path producer; nil simply means no events are emitted.
+	Diagnostics diagnosticRecorder
 }
 
 // AdmissionDeps 是 v3 准入冻结所需的只读依赖集合（与 runResources 的字段一一对应）。
@@ -131,17 +146,20 @@ type runResources struct {
 // AdmissionDeps groups the read-only dependencies of the v3 admission freeze.
 type AdmissionDeps struct {
 	Identities     AgentIdentitySource
-	NotifyAdmin    *storage.NotifyAdminStore
+	NotifyAdmin    *postgres.NotifyAdminStore
 	Channels       NotifyChannelCatalog
 	Bindings       NotifyBindingSource
 	Credentials    BindingCredentialCheck
 	CredentialPins CredentialPinSource
 	Checkpoint     RunCredentialCheckpoint
+	// Diagnostics 是运行路径的诊断生产端（可为 nil：诊断可丢弃）。
+	// Diagnostics is the run-path producer and may be nil.
+	Diagnostics diagnosticRecorder
 }
 
 // NewRunResources 是准入解析端口的唯一构造点（图 A ⑥）。
 // NewRunResources is the only construction point of the admission port.
-func NewRunResources(versions *storage.ResourceStore, providers *providerCatalog,
+func NewRunResources(versions *postgres.ResourceStore, providers *providerCatalog,
 	llm pinnedProviderService, mcp *mcpRuntime, skills *workspace.SkillLibrary,
 	gate *core.ResourceGate, deps AdmissionDeps,
 ) core.RunResources {
@@ -160,6 +178,7 @@ func NewRunResources(versions *storage.ResourceStore, providers *providerCatalog
 
 		CredentialPins: deps.CredentialPins,
 		Checkpoint:     deps.Checkpoint,
+		Diagnostics:    deps.Diagnostics,
 	}
 }
 
@@ -226,6 +245,16 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 	}
 	resolved.Provider = versionRef(providerName, providerVersion)
 	runtime.providers[providerName] = client
+
+	// 摘要客户端同样在准入门内固定（原则 III）：与对话视图取自同一条目录条目，但
+	// 不套审计视图——摘要的 `purpose='compaction'` 审计由压缩接线自己先写后发。
+	// 取不到不在这里失败：压缩是否启用要到装配期才知道（`compaction.enabled`），
+	// 装配期对"启用了压缩但拿不到摘要客户端"做失败关闭，不把未启用的实例挡在门外。
+	// The summary client is pinned inside the same admission window; a miss is refused at
+	// assembly time instead, because compaction may simply be disabled.
+	if summary, ok := r.summaryProviderClient(providerName); ok {
+		resolved.SummaryProvider = summary
+	}
 
 	// ② 模型名与凭据固定（契约 ProviderVersionRef）：模型取 AGENT.md 冻结的那一个
 	// （运行实际发出的就是它），凭据按发布定义的模式固定；env 模式的目标绑定哈希由
@@ -368,10 +397,35 @@ func (r *runResources) providerClient(name string) (core.ProviderClient, bool) {
 	if !ok || pinned == nil {
 		return nil, false
 	}
-	if r.Checkpoint == nil {
-		return pinned, true
+	var client core.ProviderClient = pinned
+	if r.Checkpoint != nil {
+		client = &guardedProviderClient{inner: pinned, checkpoint: r.Checkpoint}
 	}
-	return &guardedProviderClient{inner: pinned, checkpoint: r.Checkpoint}, true
+	// 诊断装饰器套在最外层（R23 裁决 3）：它在凭据检查点**之后**才看到调用，因此被
+	// 检查点拒绝的那一发不会被记成一次成功的模型调用——记的是真正发出并返回的调用。
+	// The diagnostics decorator sits outside the checkpoint, so a call refused by a
+	// revoked credential is never recorded as a completed model call.
+	return newDiagnosticProviderClient(client, r.Diagnostics), true
+}
+
+// summaryProviderClient 取摘要调用用的**裸协议客户端**（C-25）：与 `providerClient`
+// 取的是同一条目录条目，区别只在是否套审计视图——摘要的审计是 `purpose='compaction'`，
+// 由压缩接线自己预写，不能借用 `ProviderService` 的对话审计（否则一行调用两行审计，
+// 或者写成 `purpose='chat'`）。凭据检查点照旧套在最外面：撤销在摘要调用上同样立即生效。
+// summaryProviderClient returns the raw client for the summary call; the checkpoint still
+// wraps it, so a revoked credential refuses the very next summary call.
+func (r *runResources) summaryProviderClient(name string) (core.ProviderClient, bool) {
+	if r.LLM == nil {
+		return nil, false
+	}
+	raw, ok := r.LLM.SummaryPinned(name)
+	if !ok || raw == nil {
+		return nil, false
+	}
+	if r.Checkpoint == nil {
+		return raw, true
+	}
+	return &guardedProviderClient{inner: raw, checkpoint: r.Checkpoint}, true
 }
 
 // guardedProviderClient 是交给运行时的模型调用面：每次调用先过 Run 凭据检查点
@@ -678,10 +732,10 @@ func (h mcpHandle) ServerName() string { return string(h) }
 // credential store is read only for the conditional ETag, and nil means no managed
 // credentials in this assembly.
 type resourceViews struct {
-	versions       *storage.ResourceStore
+	versions       *postgres.ResourceStore
 	lifecycle      *workspace.LifecycleStore
 	mcp            *mcpRuntime
-	credentials    *storage.CredentialStore
+	credentials    *postgres.CredentialStore
 	mcpCredentials *MCPCredentialService
 	tests          core.ResourceConnectionTestStore
 	lookupEnv      func(string) (string, bool)
@@ -703,8 +757,8 @@ type ResourceViewDeps struct {
 
 // NewResourceViews 是图 A 中 `resourceViews` 的唯一构造点（卡片行 1632）。
 // NewResourceViews is the only construction point of the console-side reader.
-func NewResourceViews(versions *storage.ResourceStore, lifecycle *workspace.LifecycleStore,
-	mcp *mcpRuntime, credentials *storage.CredentialStore, deps ResourceViewDeps,
+func NewResourceViews(versions *postgres.ResourceStore, lifecycle *workspace.LifecycleStore,
+	mcp *mcpRuntime, credentials *postgres.CredentialStore, deps ResourceViewDeps,
 ) web.ResourceReader {
 	lookupEnv := deps.LookupEnv
 	if lookupEnv == nil {
@@ -1084,7 +1138,7 @@ func (v *resourceViews) ownerAgentName(ctx context.Context, ptr core.ResourcePoi
 // 返回空串，专属范围必须解析出名字。`what` 只用于错误文案，指出是哪一行。
 // resolveOwnerAgentName is the one owner-name lookup shared by resource pointers and
 // notification channels; an exclusive owner that cannot be named is an error.
-func resolveOwnerAgentName(ctx context.Context, versions *storage.ResourceStore,
+func resolveOwnerAgentName(ctx context.Context, versions *postgres.ResourceStore,
 	scope core.ResourceScope, uid core.AgentUID, what string,
 ) (string, error) {
 	if scope != core.ScopeExclusive {
@@ -1375,7 +1429,7 @@ func credentialBindingKind(kind core.ResourceKind) (core.BindingKind, bool) {
 // 会让 ETag 静默退化成内容哈希，条件写就再次发现不了换 Key。
 // loadCredentialDigest returns nil when the resource has no credential identity and
 // reports read failures instead of degrading to a pure content hash.
-func loadCredentialDigest(ctx context.Context, creds *storage.CredentialStore,
+func loadCredentialDigest(ctx context.Context, creds *postgres.CredentialStore,
 	kind core.ResourceKind, uid core.ResourceUID,
 ) (*credentialDigest, error) {
 	owner, ok := credentialBindingKind(kind)
@@ -1422,7 +1476,7 @@ func loadCredentialDigest(ctx context.Context, creds *storage.CredentialStore,
 // publishedResourceETag 用一份已读的指针与版本行计算条件 ETag（按资源类别补凭据段）。
 // publishedResourceETag composes the conditional ETag from an already-read pointer
 // and version row.
-func publishedResourceETag(ctx context.Context, creds *storage.CredentialStore,
+func publishedResourceETag(ctx context.Context, creds *postgres.CredentialStore,
 	ptr core.ResourcePointer, version core.ResourceVersion,
 ) (string, error) {
 	digest, err := loadCredentialDigest(ctx, creds, ptr.Kind, ptr.ResourceUID)

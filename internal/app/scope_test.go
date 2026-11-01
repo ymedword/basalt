@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件覆盖范围转换编排（颗粒度文档 R4.4 / T121）：共享转专属前必须点名
@@ -18,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
 // stubRoutePort 是消息路由端口的替身：本轮产品里恒为空，测试用它验证阻断路径。
@@ -41,7 +43,7 @@ type scopeEnv struct {
 	*bindingsEnv
 	service *ScopeService
 	routes  *stubRoutePort
-	runs    *storage.RunStore
+	runs    *postgres.RunStore
 }
 
 // newScopeEnv 建夹具：reporter（启用）由绑定夹具写入，这里补 ops-bot（停用，可作属主）
@@ -69,7 +71,7 @@ func newScopeEnv(t *testing.T, routes *stubRoutePort) *scopeEnv {
 	return &scopeEnv{
 		bindingsEnv: base,
 		routes:      routes,
-		runs:        storage.NewRunStore(base.db),
+		runs:        postgres.NewRunStore(base.db),
 		service: &ScopeService{
 			Resources:     base.resources,
 			Agents:        base.resources,
@@ -156,7 +158,7 @@ func TestScopeConversion_BlockedByRun(t *testing.T) {
 	runID := "run-scope-1"
 	require.NoError(t, env.runs.StartRun(ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
-		StartedAt: baselineClock(),
+		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))
 
 	_, err = env.service.Convert(ctx, ScopeRequest{

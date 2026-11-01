@@ -9,7 +9,17 @@
 #     --profile <file>  以既有 coverage profile 为输入（自检注入合成输入用）
 #     --tree <dir>      模块树根；缺省 = 本脚本所在目录的上一级（仓库根）
 #
-# 阈值 / thresholds: core / tool / memory / storage >= 70%，其余 >= 50%。
+# 环境依赖 / environment: 自生成 profile 的模式带 `-tags=integration` 跑测试（覆盖率
+# 口径含 PostgreSQL 存储），因此要求 BASALT_TEST_PG_DSN；缺省即失败（D-01，不跳过）。
+# `--profile` 注入模式不跑测试，不要求 DSN。
+# Generating the profile runs `-tags=integration`, so BASALT_TEST_PG_DSN is required and
+# its absence is a failure (D-01); the injected-profile mode runs no tests.
+#
+# 阈值 / thresholds: core / tool / memory / storage / postgres >= 70%，其余 >= 50%。
+# `postgres` 是 `internal/storage/postgres` 的基名——它不在 `internal/storage` 包内
+# （两个谱系各自成包），基名匹配单列，否则它会落到 50% 档（US-16 §4.7 / T136 / T138）。
+# `postgres` here is the base name of `internal/storage/postgres`, which lives outside
+# the `internal/storage` package, so it needs its own entry in the 70% tier.
 #
 # 判据六类 / six verdicts:
 #   1) 低于阈值 -> 失败                2) 恰好达标（>=）-> 通过
@@ -57,7 +67,16 @@ if [ -n "$profile_arg" ]; then
 	[ -r "$profile_arg" ] || { echo "check-coverage: profile 不可读: $profile_arg" >&2; exit 2; }
 	cp "$profile_arg" "$profile" 2>/dev/null || { echo "check-coverage: profile 无法读取: $profile_arg" >&2; exit 2; }
 else
-	( cd "$tree" && go test -coverprofile="$profile" ./... ) || {
+	# 缺 DSN 在起跑前判失败：带 -tags=integration 的 go test 若让用例全部跳过，
+	# profile 只含单元测试，覆盖率会被静默低估甚至"达标"——这正是 D-01 禁止的假绿。
+	# Fail before the run: an all-skipped integration suite would silently produce a
+	# profile that under-counts (or even passes), which is the false green D-01 forbids.
+	[ -n "${BASALT_TEST_PG_DSN:-}" ] || {
+		echo "check-coverage: 未设置 BASALT_TEST_PG_DSN——覆盖率判卷带 -tags=integration，需要真实 PostgreSQL（D-01：缺省即失败，不跳过）" >&2
+		echo "check-coverage: 排查路径：本地启动 dev-env 测试库并经 dev-env/scripts/with-postgres.sh 运行；环境准备见 docs/DevelopmentLoop.md §10；CI 由 postgres service 注入 DSN" >&2
+		exit 1
+	}
+	( cd "$tree" && go test -tags=integration -count=1 -coverprofile="$profile" ./... ) || {
 		echo "check-coverage: go test 失败——覆盖率判据不成立（不得把测试失败当通过）" >&2
 		exit 1
 	}
@@ -80,21 +99,26 @@ case "$mode_line" in
 	;;
 esac
 
-# 逐行校验正文：第 1 行是 mode 头（上面已单独校验），自第 2 行起必须全部匹配记录
-# 格式。**不得**用 `tail -n +2 | while` 改法：管道会把循环放进子 shell，循环里的
-# `exit 1` 只退出子 shell，父进程照旧往下判卷，损坏输入反被静默放行。
-# Line 1 is the mode header (validated above); line 2 onward must match the record
-# grammar. The loop stays in the main shell so `exit 1` propagates.
-lineno=0
-while IFS= read -r line || [ -n "$line" ]; do
-	lineno=$((lineno + 1))
-	[ "$lineno" -gt 1 ] || continue
-	[ -n "$line" ] || continue # 容忍尾部空行；其余任何不匹配都是损坏输入
-	if ! printf '%s\n' "$line" | grep -Eq '^[^[:space:]]+:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+ [0-9]+ [0-9]+$'; then
-		echo "check-coverage: profile 正文记录损坏（第 $lineno 行；格式应为 <文件>:<行>.<列>,<行>.<列> <语句数> <命中次数>）: $profile" >&2
-		exit 1
-	fi
-done < "$profile"
+# 校验正文：第 1 行是 mode 头（上面已单独校验），自第 2 行起必须全部匹配记录
+# 格式，空行容忍（含尾部空行）。判定留在主 shell（**不得**用 `tail -n +2 | while`
+# 改法：管道把循环放进子 shell，`exit 1` 只退出子 shell，父进程照旧往下判卷，
+# 损坏输入反被静默放行），但校验本身**必须**是单次 awk 而不是逐行起 `grep` 进程
+# ——Windows 上每次进程创建约 30 ms，34k 行 profile 会空转十几分钟（2026-10-30
+# 实测判卷阶段 >15 min；改单次 awk 后 <1 s）。
+# One awk pass finds the first offending record; the verdict still exits from the
+# main shell. A per-line `grep` costs ~30 ms/row on Windows (measured 2026-10-30).
+bad_line=$(awk '
+NR == 1 { next }
+$0 == "" { next }
+$0 !~ /^[^[:space:]]+:[0-9]+\.[0-9]+,[0-9]+\.[0-9]+ [0-9]+ [0-9]+$/ { print NR; exit }
+' "$profile") || {
+	echo "check-coverage: profile 正文校验执行失败（awk 不可用或读取失败）: $profile" >&2
+	exit 1
+}
+if [ -n "$bad_line" ]; then
+	echo "check-coverage: profile 正文记录损坏（第 $bad_line 行；格式应为 <文件>:<行>.<列>,<行>.<列> <语句数> <命中次数>）: $profile" >&2
+	exit 1
+fi
 
 # 按包聚合 profile：包路径 = 源文件所在目录（Go 的一个包就是同目录的一批文件）。
 # 记录格式已在上一步逐行校验——聚合器不再做静默跳过 / 数值强转（那会把损坏输入
@@ -143,7 +167,7 @@ while IFS= read -r line; do
 	base=${import_path##*/}
 
 	case "$base" in
-	core | tool | memory | storage) threshold=70 ;;
+	core | tool | memory | storage | postgres) threshold=70 ;;
 	*) threshold=50 ;;
 	esac
 

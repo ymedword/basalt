@@ -103,7 +103,7 @@ func TestSessionStore_ArchiveIsIdempotent(t *testing.T) {
 		ID: "s1", ProfileName: "ops-agent", Channel: "web", UserID: "u",
 		CreatedAt: now, LastActiveAt: now,
 	}))
-	require.NoError(t, store.AppendMessage(ctx, "s1", "run-1",
+	require.NoError(t, appendMessageOK(ctx, store, "s1", "run-1",
 		core.Message{Role: "user", Content: "保留我"}))
 
 	first := now.Add(time.Minute)
@@ -140,9 +140,13 @@ func TestSessionStore_MessagesTailKeepsLatestInOrder(t *testing.T) {
 		ID: "s1", ProfileName: "ops-agent", Channel: "web", UserID: "u",
 		CreatedAt: now, LastActiveAt: now,
 	}))
+	ids := make([]string, 0, 120)
 	for i := 0; i < 120; i++ {
-		require.NoError(t, store.AppendMessage(ctx, "s1", "run-1",
-			core.Message{Role: "user", Content: fmt.Sprintf("m%03d", i)}))
+		id, err := store.AppendMessage(ctx, "s1", "run-1",
+			core.Message{Role: "user", Content: fmt.Sprintf("m%03d", i)})
+		require.NoError(t, err)
+		require.NotEmpty(t, id)
+		ids = append(ids, id)
 	}
 
 	tail, err := store.MessagesTail(ctx, "s1", 100)
@@ -151,4 +155,14 @@ func TestSessionStore_MessagesTailKeepsLatestInOrder(t *testing.T) {
 	require.Equal(t, "m020", tail[0].Content, "窗口从第 21 条开始（最近的 100 条）")
 	require.Equal(t, "m119", tail[99].Content)
 	require.False(t, tail[0].CreatedAt.IsZero(), "created_at 必须回填（契约 MessageView）")
+	// 尾窗同样填 `Message.ID`：装配记录与压缩条目按它定位真实消息行。
+	require.Equal(t, ids[20], tail[0].ID, "窗口首条带的是第 21 行的 messages.id")
+	require.Equal(t, ids[119], tail[99].ID)
+	seen := make(map[string]struct{}, len(tail))
+	for _, m := range tail {
+		require.NotEmpty(t, m.ID, "尾窗里不得有缺标识的消息")
+		_, dup := seen[m.ID]
+		require.False(t, dup, "标识重复 = 两行共用同一身份")
+		seen[m.ID] = struct{}{}
+	}
 }

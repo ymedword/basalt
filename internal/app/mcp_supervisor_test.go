@@ -1,3 +1,5 @@
+//go:build integration
+
 package app
 
 // 本文件是 MCP supervisor 的验收用例（颗粒度文档 §3.2 的 app/mcp_supervisor_test.go 十七例）。

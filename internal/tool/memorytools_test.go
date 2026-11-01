@@ -72,7 +72,11 @@ func (s *countingStore) RecallByKeyword(context.Context, core.Scope, string) ([]
 // 来源（FR-021——模型不得传 agent_name、工具不得从路径或包级状态反推）。空名 = 无 Agent
 // 上下文 → 全局层（正常取值，不是异常）。沿 US-5 fileToolFixture.toolEnv() / httpToolEnv()
 // 的"显式环境"形状。
-// The explicit per-call environment; the agent name is the only source of scope.
+//
+// `Principal` 是 P-07 起由 **Run 准入**注入的调用方身份（此处用调用方档）：归属
+// （CallerID）与执行者（Actor）分开，工具**不得**从 Agent 名推断任何一个。
+// The explicit per-call environment; the agent name is the only source of scope and the
+// principal is the one injected at admission, never derived from the agent name.
 func toolEnvWithAgent(name string) core.ToolEnv {
 	// 记忆工具不消费输出上限（截断是执行侧的事），这里按契约缺省给一个具体值即可。
 	return core.ToolEnv{
@@ -80,6 +84,21 @@ func toolEnvWithAgent(name string) core.ToolEnv {
 		SessionID:      "sess-memory-1",
 		AgentName:      name,
 		MaxOutputBytes: 256 * 1024,
+		Principal:      memoryTestPrincipal(),
+	}
+}
+
+// memoryTestPrincipal 是记忆工具用例的调用方身份：调用方档、归属与执行者分开——`CallerID`
+// 记归属，`Actor` 记这次执行。scope 取一个具名 Agent（`Valid()` 要求调用方至少持一个
+// 可识别 scope；通配 `agents:invoke:*` 是管理员专属，出现在调用方身份里会被 `Valid()` 拒）。
+// The caller principal used by the memory tool cases; scopes are always concrete names.
+func memoryTestPrincipal() core.Principal {
+	return core.Principal{
+		Kind:     core.PrincipalCaller,
+		CallerID: "caller-memory-test",
+		KeyID:    "key-memory-test",
+		Scopes:   []string{"agents:invoke:alice"},
+		Actor:    core.ActorCaller,
 	}
 }
 
@@ -116,6 +135,11 @@ func TestSaveMemoryTool_InputSchemaContract(t *testing.T) {
 	require.Equal(t, "save_memory", save.Name(), "工具名与 AGENT.md 的 tools: 声明、注册池逐字比对")
 	require.NotEmpty(t, save.Description(), "描述是给模型的能力说明，不得为空")
 
+	// 描述必须与召回的实际缺省一致：归档区不是"按关键词召回"（P-07 起缺省语义检索）。
+	// 逆改点：把描述改回"按关键词取回" → 两条断言红（模型会据此选错模式）。
+	require.Contains(t, save.Description(), "缺省语义检索", "改写后的召回缺省必须写进能力说明")
+	require.NotContains(t, save.Description(), "按关键词取回", "归档区的召回缺省已不是关键词")
+
 	spec := parseToolSchema(t, save)
 	require.Len(t, spec.Properties, 2, "参数面只有 content 与 scope")
 	require.Contains(t, spec.Properties, "content")
@@ -127,19 +151,23 @@ func TestSaveMemoryTool_InputSchemaContract(t *testing.T) {
 		"取值集合逐字（口径 9；顺序不判——JSON Schema 的 enum 无序）")
 }
 
-// TestRecallMemoryTool_InputSchemaContract 判 recall_memory 的参数面：只有一个必填的
-// query（单个关键词，契约 §5.4）——不得多出 scope / agent_name 之类的旁路。
-// 逆改点：给 query 加 `"required":[]` 或再添一个参数 → 对应断言红。
+// TestRecallMemoryTool_InputSchemaContract 判 recall_memory 的参数面：必填 query + 可选
+// `mode`（P-07 契约变更，显式登记：取值 `semantic` / `keyword`，省略 = 语义）——不得
+// 多出 scope / agent_name 之类的旁路。
+// 逆改点：给 query 加 `"required":[]`、删掉 mode 的枚举、或再添一个参数 → 对应断言红。
 func TestRecallMemoryTool_InputSchemaContract(t *testing.T) {
-	recall := tool.NewRecallMemoryTool(&countingStore{})
+	recall := tool.NewRecallMemoryTool(&countingStore{}, nil)
 	require.Equal(t, "recall_memory", recall.Name(), "工具名与 AGENT.md 的 tools: 声明、注册池逐字比对")
 	require.NotEmpty(t, recall.Description(), "描述是给模型的能力说明，不得为空")
+	require.Contains(t, recall.Description(), "缺省语义召回", "缺省模式必须写进能力说明（P-07）")
 
 	spec := parseToolSchema(t, recall)
-	require.Len(t, spec.Properties, 1, "参数面只有 query（核心区每轮已完整注入，检索不入参）")
+	require.Len(t, spec.Properties, 2, "参数面只有 query 与 mode（核心区每轮已完整注入，检索不入参）")
 	require.Contains(t, spec.Properties, "query")
 	require.Equal(t, "string", spec.Properties["query"].Type)
-	require.Equal(t, []string{"query"}, spec.Required, "query 必填（契约 §5.4）")
+	require.Equal(t, []string{"query"}, spec.Required, "query 必填、mode 可选（契约 §5.4）")
+	require.ElementsMatch(t, []string{"semantic", "keyword"}, spec.Properties["mode"].Enum,
+		"mode 取值集合逐字（P-07；省略即 semantic——缺省不靠枚举表达）")
 }
 
 // TestSaveMemoryTool_DefaultsScopeToArchival 判缺省档的**两态**：省略 scope 与显式
@@ -238,13 +266,17 @@ func TestMemoryDirIsolation(t *testing.T) {
 // 口径 10）：零命中 → **成功** + 占位文案 `(无匹配条目)`——不得映射成 `not_found` /
 // `runtime_error`（把"没有"报成"失败"会让模型反复重试一次正确的空结果）。命中档是同一条
 // 路径的对照面：条目原文按写入顺序以**空行**分隔（口径 11）。
+//
+// 两档都显式传 `mode=keyword`：P-07 起**省略 mode 是语义召回**（契约变更，显式登记），
+// 本用例判的是关键词兼容路径的渲染，故必须点名模式——缺省档由
+// `TestRecallMemoryTool_DefaultModeIsSemantic` 判。
 // 逆改点：零命中改成返回错误 → ① 的 `NoError` 红（口径 10 的判别力全在这一档）；
 // 命中渲染改成单换行 / 逗号分隔 → ② 的分隔断言红。
 func TestRecallMemoryTool_NoHitReturnsSuccessPlaceholder(t *testing.T) {
 	t.Run("零命中", func(t *testing.T) {
 		store := &countingStore{} // hits 缺省 nil = 零命中
-		res, err := tool.NewRecallMemoryTool(store).Execute(ctx, toolEnvWithAgent("alice"),
-			json.RawMessage(`{"query":"没有这条"}`))
+		res, err := tool.NewRecallMemoryTool(store, nil).Execute(ctx, toolEnvWithAgent("alice"),
+			json.RawMessage(`{"query":"没有这条","mode":"keyword"}`))
 		require.NoError(t, err, "未命中是成功取值，不是失败（口径 10）")
 		require.Equal(t, "(无匹配条目)", res.Content, "占位文案逐字（口径 11）")
 		require.Equal(t, 1, store.recalls, "零命中也要真的查过——否则「没有」不是检索的结论")
@@ -252,8 +284,8 @@ func TestRecallMemoryTool_NoHitReturnsSuccessPlaceholder(t *testing.T) {
 
 	t.Run("命中", func(t *testing.T) {
 		store := &countingStore{hits: []string{"第一条：成本评估", "第二条：成本复评"}}
-		res, err := tool.NewRecallMemoryTool(store).Execute(ctx, toolEnvWithAgent("alice"),
-			json.RawMessage(`{"query":"成本"}`))
+		res, err := tool.NewRecallMemoryTool(store, nil).Execute(ctx, toolEnvWithAgent("alice"),
+			json.RawMessage(`{"query":"成本","mode":"keyword"}`))
 		require.NoError(t, err)
 		require.Equal(t, "第一条：成本评估\n\n第二条：成本复评", res.Content,
 			"条目原文按写入顺序以**空行**分隔（口径 11）")
@@ -356,7 +388,7 @@ func TestMemoryTools_ConfirmationNamesScopeAndSection(t *testing.T) {
 func TestMemoryTools_RejectEmptyInputs(t *testing.T) {
 	store := &countingStore{} // 记录 Append / RecallByKeyword 调用次数的替身（外部测试包内自建）
 	save := tool.NewSaveMemoryTool(store)
-	recall := tool.NewRecallMemoryTool(store)
+	recall := tool.NewRecallMemoryTool(store, nil)
 
 	// 空串与纯空白四态：规范化后都为空 → 全部必须拒（只判 `== ""` 时后两条红）。
 	for _, in := range []string{`{"content":""}`, `{"content":"   \n\t "}`} {

@@ -47,6 +47,33 @@ func (f fakeSkillPointers) ListPointers(_ context.Context, kind core.ResourceKin
 	return pointers, nil
 }
 
+// fakeKnowledgeCollections 是知识集合目录替身（设计 D-19）：默认把每个名字解析成
+// `col_` + 名字；`missing` 里的名字按未解析返回（等同库里没有活动集合）；
+// `err` 非 nil 时模拟目录查询失败。
+// fakeKnowledgeCollections resolves every name to "col_"+name unless listed in missing;
+// a non-nil err simulates a failed catalog read.
+type fakeKnowledgeCollections struct {
+	missing map[string]struct{}
+	err     error
+}
+
+// CollectionIDsByName 实现 app.KnowledgeCollectionSource。
+func (f fakeKnowledgeCollections) CollectionIDsByName(_ context.Context, names []string) (map[string]string, []string, error) {
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	ids := make(map[string]string, len(names))
+	var unresolved []string
+	for _, name := range names {
+		if _, bad := f.missing[name]; bad {
+			unresolved = append(unresolved, name)
+			continue
+		}
+		ids[name] = "col_" + name
+	}
+	return ids, unresolved, nil
+}
+
 // registeredAgent 造一个注册成功的条目。
 // registeredAgent builds a registered entry.
 func registeredAgent(name string) core.AgentEntry {
@@ -337,6 +364,17 @@ func syncAgentMarkdownWithSkills(name, model string, skills ...string) string {
 		"schedules:", "skills: ["+strings.Join(skills, ", ")+"]\nschedules:", 1)
 }
 
+// syncAgentMarkdownWithKnowledge 在可装载夹具上追加 `knowledge:` 声明（块式列表，
+// access 全写 read——闭集只认 read）。
+// syncAgentMarkdownWithKnowledge appends a `knowledge:` block to the fixture.
+func syncAgentMarkdownWithKnowledge(name, model string, collections ...string) string {
+	block := "knowledge:\n"
+	for _, collection := range collections {
+		block += "  - name: " + collection + "\n    access: read\n"
+	}
+	return strings.Replace(syncAgentMarkdown(name, model), "schedules:", block+"schedules:", 1)
+}
+
 // fakeScheduleRegistry 记录注册集合与对账结果（装配层联动的调度器消费面）。
 // fakeScheduleRegistry records the registry surface the scheduler exposes.
 type fakeScheduleRegistry struct {
@@ -394,7 +432,7 @@ func newSyncFixture(t *testing.T) (*registrySync, *agentRegistry, *fakeScheduleR
 	require.NoError(t, err)
 	registry := newAgentRegistry(root, entries, logger)
 	scheduler := newFakeScheduleRegistry()
-	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, scheduler, logger)
+	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, fakeKnowledgeCollections{}, scheduler, logger)
 	return syncer, registry, scheduler, root
 }
 
@@ -434,7 +472,7 @@ func TestRegistrySync_KeepsOldEntryOnInvalidEdit(t *testing.T) {
 	require.Len(t, entries, 1)
 	registry := newAgentRegistry(root, entries, logger)
 	scheduler := newFakeScheduleRegistry()
-	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, scheduler, logger)
+	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, fakeKnowledgeCollections{}, scheduler, logger)
 
 	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md", "not: [valid")
 	syncer.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
@@ -499,7 +537,7 @@ func TestRegistrySync_SkillChangeLeavesRegistryUntouched(t *testing.T) {
 	require.NoError(t, err)
 	registry := newAgentRegistry(root, entries, logger)
 	scheduler := newFakeScheduleRegistry()
-	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, scheduler, logger)
+	syncer := newRegistrySync(registry, loader, workspace.NewSkillLibrary(root), fakeSkillPointers{}, fakeKnowledgeCollections{}, scheduler, logger)
 	before := registry.Entries()
 
 	syncer.OnChange(context.Background(), workspace.ChangeSet{Skills: []string{"digest"}})
@@ -532,7 +570,7 @@ func TestRegistrySync_RetiresAgentWithoutPublishedSkill(t *testing.T) {
 	registry := newAgentRegistry(root, entries, logger)
 	scheduler := newFakeScheduleRegistry()
 	skillLibrary := workspace.NewSkillLibrary(root)
-	syncer := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{}, scheduler, logger)
+	syncer := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{}, fakeKnowledgeCollections{}, scheduler, logger)
 	syncer.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
 
 	_, ok := registry.Lookup("alpha")
@@ -556,7 +594,7 @@ func TestRegistrySync_RetiresAgentWithoutPublishedSkill(t *testing.T) {
 	require.Contains(t, buf.String(), "skill version missing: fresh")
 
 	published := newRegistrySync(registry, loader, skillLibrary,
-		fakeSkillPointers{published: map[string]struct{}{"digest": {}}}, scheduler, logger)
+		fakeSkillPointers{published: map[string]struct{}{"digest": {}}}, fakeKnowledgeCollections{}, scheduler, logger)
 	published.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
 	added, ok := registry.Lookup("alpha")
 	require.True(t, ok, "发布指针存在时注册不变量满足")
@@ -577,13 +615,13 @@ func TestRegistrySync_PointerLookupFailureKeepsOldRegistry(t *testing.T) {
 	registry := newAgentRegistry(root, entries, logger)
 	scheduler := newFakeScheduleRegistry()
 	skillLibrary := workspace.NewSkillLibrary(root)
-	initial := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{}, scheduler, logger)
+	initial := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{}, fakeKnowledgeCollections{}, scheduler, logger)
 	initial.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
 	before, ok := registry.Lookup("alpha")
 	require.True(t, ok)
 
 	failing := newRegistrySync(registry, loader, skillLibrary,
-		fakeSkillPointers{err: errors.New("db unavailable")}, scheduler, logger)
+		fakeSkillPointers{err: errors.New("db unavailable")}, fakeKnowledgeCollections{}, scheduler, logger)
 	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md", syncAgentMarkdown("alpha", "model-v2"))
 	failing.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
 
@@ -594,6 +632,148 @@ func TestRegistrySync_PointerLookupFailureKeepsOldRegistry(t *testing.T) {
 	require.True(t, seen)
 	require.True(t, registered)
 	require.Contains(t, buf.String(), "读取技能发布指针失败")
+}
+
+// TestRegistryEntriesWithKnowledgeCollections_DemotesMissing —— D-19 的"注册闸门"
+// 一步：声明的集合名解析不到唯一活动实体时，该 Agent 降级为未注册并点名缺失项；
+// 没有声明的 Agent 不受影响，能解析的 Agent 保持注册。
+// 逆改点：闸门放行缺失声明 → Registered 断言红；RejectDetail 写成固定短语而非点名
+// → 缺失项断言红。
+func TestRegistryEntriesWithKnowledgeCollections_DemotesMissing(t *testing.T) {
+	logger, buf := newCapturedLogger()
+	entries := []core.AgentEntry{
+		{Name: "alpha", Registered: true, Profile: &core.Profile{Knowledge: []core.KnowledgeBinding{
+			{Name: "runbooks", Access: core.KnowledgeAccessRead},
+		}}},
+		{Name: "beta", Registered: true, Profile: &core.Profile{Knowledge: []core.KnowledgeBinding{
+			{Name: "faq", Access: core.KnowledgeAccessRead},
+		}}},
+		{Name: "gamma", Registered: true, Profile: &core.Profile{}},
+	}
+
+	adjusted, err := registryEntriesWithKnowledgeCollections(context.Background(),
+		fakeKnowledgeCollections{missing: map[string]struct{}{"runbooks": {}}}, entries, logger)
+	require.NoError(t, err)
+	require.Len(t, adjusted, 3)
+
+	require.False(t, adjusted[0].Registered, "缺失声明 → 整只不注册")
+	require.Equal(t, core.AgentRejectKnowledgeCollectionMissing, adjusted[0].RejectKind)
+	require.Equal(t, "runbooks", adjusted[0].RejectDetail, "拒因必须点名缺失的集合")
+	require.Contains(t, adjusted[0].RejectReason, "runbooks")
+	require.True(t, adjusted[1].Registered, "能解析的 Agent 保持注册")
+	require.True(t, adjusted[2].Registered, "没有声明的 Agent 不参与判定")
+	require.Contains(t, buf.String(), "runbooks")
+
+	// 入参不被就地改写：闸门返回新切片，装配方拿到的旧快照仍是旧值。
+	require.True(t, entries[0].Registered, "入参不得被就地修改")
+
+	// 全部解析成功时原样返回。
+	ok, err := registryEntriesWithKnowledgeCollections(context.Background(),
+		fakeKnowledgeCollections{}, entries, logger)
+	require.NoError(t, err)
+	require.True(t, ok[0].Registered)
+}
+
+// TestRegistryEntriesWithKnowledgeCollections_FailsClosed —— 有声明却缺目录来源是
+// 装配错误（不得默认"集合都在"）；目录查询失败同样上抛，启动失败关闭。
+func TestRegistryEntriesWithKnowledgeCollections_FailsClosed(t *testing.T) {
+	logger, _ := newCapturedLogger()
+	entries := []core.AgentEntry{
+		{Name: "alpha", Registered: true, Profile: &core.Profile{Knowledge: []core.KnowledgeBinding{
+			{Name: "runbooks", Access: core.KnowledgeAccessRead},
+		}}},
+	}
+
+	_, err := registryEntriesWithKnowledgeCollections(context.Background(), nil, entries, logger)
+	require.Error(t, err, "有声明但没有目录来源：不得当成集合都在")
+
+	_, err = registryEntriesWithKnowledgeCollections(context.Background(),
+		fakeKnowledgeCollections{err: errors.New("db unavailable")}, entries, logger)
+	require.ErrorContains(t, err, "db unavailable")
+
+	// 没有声明的装配不需要目录来源（US-1 起的旧装配不因本闸门无法启动）。
+	plain := []core.AgentEntry{{Name: "gamma", Registered: true, Profile: &core.Profile{}}}
+	got, err := registryEntriesWithKnowledgeCollections(context.Background(), nil, plain, logger)
+	require.NoError(t, err)
+	require.Equal(t, plain, got)
+}
+
+// TestRegistrySync_RetiresAgentWithoutKnowledgeCollection 覆盖 D-19 的热加载路径：
+// 运行中把声明的集合删掉（目录不再解析）→ Agent 退出注册表并让调度器退休任务，
+// WARN 点名缺失集合；目录恢复后同一 Agent 重新注册（正向对照）。
+// 逆改点：syncAgent 去掉 missingKnowledgeCollections 分支 → 第一条 Lookup 断言红。
+func TestRegistrySync_RetiresAgentWithoutKnowledgeCollection(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "agents"), 0o750))
+	logger, buf := newCapturedLogger()
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{Providers: []string{"fake"}, Logger: logger})
+	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md", syncAgentMarkdown("alpha", "model-v1"))
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	registry := newAgentRegistry(root, entries, logger)
+	scheduler := newFakeScheduleRegistry()
+	skillLibrary := workspace.NewSkillLibrary(root)
+	syncer := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{},
+		fakeKnowledgeCollections{}, scheduler, logger)
+	syncer.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
+	_, ok := registry.Lookup("alpha")
+	require.True(t, ok)
+
+	// 声明一个当前不存在的集合：本轮变更必须收回注册。
+	failing := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{},
+		fakeKnowledgeCollections{missing: map[string]struct{}{"runbooks": {}}}, scheduler, logger)
+	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md",
+		syncAgentMarkdownWithKnowledge("alpha", "model-v1", "runbooks"))
+	failing.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
+
+	_, ok = registry.Lookup("alpha")
+	require.False(t, ok, "声明的集合解析不到 → 退出注册表")
+	registered, seen := scheduler.isRegistered("alpha")
+	require.True(t, seen)
+	require.False(t, registered)
+	require.Contains(t, buf.String(), "knowledge collection missing: runbooks")
+
+	// 目录恢复（集合建出来了）：同一份文件重新注册成功。
+	recovered := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{},
+		fakeKnowledgeCollections{}, scheduler, logger)
+	recovered.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
+	added, ok := registry.Lookup("alpha")
+	require.True(t, ok, "集合恢复后重新注册")
+	require.Equal(t, "alpha", added.Name)
+	registered, _ = scheduler.isRegistered("alpha")
+	require.True(t, registered)
+}
+
+// TestRegistrySync_CollectionLookupFailureKeepsOldRegistry：目录查询失败与技能指针
+// 失败同一收口——保留旧注册表、不动调度器、WARN 点名原因。
+// 逆改点：OnChange 把查询错误当成"没有缺失"继续推进 → 注册表被推进，断言红。
+func TestRegistrySync_CollectionLookupFailureKeepsOldRegistry(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "agents"), 0o750))
+	logger, buf := newCapturedLogger()
+	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{Providers: []string{"fake"}, Logger: logger})
+	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md", syncAgentMarkdown("alpha", "model-v1"))
+	entries, err := loader.LoadAll(root)
+	require.NoError(t, err)
+	registry := newAgentRegistry(root, entries, logger)
+	scheduler := newFakeScheduleRegistry()
+	skillLibrary := workspace.NewSkillLibrary(root)
+	initial := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{},
+		fakeKnowledgeCollections{}, scheduler, logger)
+	initial.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
+	before, ok := registry.Lookup("alpha")
+	require.True(t, ok)
+
+	broken := newRegistrySync(registry, loader, skillLibrary, fakeSkillPointers{},
+		fakeKnowledgeCollections{err: errors.New("catalog unavailable")}, scheduler, logger)
+	writeWorkspaceFile(t, root, "agents/alpha/AGENT.md",
+		syncAgentMarkdownWithKnowledge("alpha", "model-v2", "runbooks"))
+	broken.OnChange(context.Background(), workspace.ChangeSet{Agents: []string{"alpha"}})
+
+	after, ok := registry.Lookup("alpha")
+	require.True(t, ok, "目录查询失败不得收回旧条目")
+	require.Equal(t, before, after, "目录查询失败保留旧注册表")
+	require.Contains(t, buf.String(), "读取知识集合目录失败")
 }
 
 // TestRegistrySync_ConcurrentChanges：不同 Agent 的变更集并发推进，注册表最终包含全部
@@ -681,39 +861,6 @@ func TestStartWatcher_StopsOnContextCancel(t *testing.T) {
 	after, ok := registry.Lookup("alpha")
 	require.True(t, ok)
 	require.Equal(t, before, after, "取消之后不得再换入新条目")
-}
-
-// TestRegistrySync_AdapterKeepsClaimBaseline 覆盖约束 39 的装配面：热加载联动经
-// scheduleEditorAdapter 时，移出的 Agent 同时离开私有 claim 基线（否则它的旧任务
-// 会让 manage_schedule 误判跨 Agent 冲突）；加入只放开准入，claim 由随后的
-// ReconcileAgent 写入。
-// 逆改点：SetRegistered 不删 claims → 移出后基线仍在，断言红。
-func TestRegistrySync_AdapterKeepsClaimBaseline(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	entries := []core.AgentEntry{{
-		Name:       "demo",
-		Registered: true,
-		Profile: &core.Profile{Schedules: []core.Schedule{
-			{ID: "demo-1", Cron: "0 0 8 * * *", Zone: "UTC", Message: "每日巡检"},
-		}},
-	}}
-	adapter := newAdapterFixture(t, root, entries, openAdapterStore(t), false)
-
-	require.Len(t, adapter.claims["demo"], 1, "构造期从 entries 拷出基线")
-
-	next := []core.Schedule{{ID: "demo-2", Cron: "0 0 9 * * *", Zone: "UTC", Message: "早报"}}
-	require.NoError(t, adapter.ReconcileAgent(ctx, "demo", next))
-	require.Len(t, adapter.claims["demo"], 1)
-	require.Equal(t, "demo-2", adapter.claims["demo"][0].ID, "文件事实先行：基线先于调度器刷新")
-
-	require.NoError(t, adapter.SetRegistered("demo", false))
-	_, ok := adapter.claims["demo"]
-	require.False(t, ok, "移出的 Agent 必须离开 claim 基线")
-
-	require.NoError(t, adapter.SetRegistered("demo", true))
-	_, ok = adapter.claims["demo"]
-	require.False(t, ok, "加入只放开准入，claim 由 ReconcileAgent 写入")
 }
 
 // TestRegistryEntries_MultipleMissingSkillsSortedJoin 覆盖 agent-md.md 规则 5 的固定

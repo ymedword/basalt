@@ -424,6 +424,36 @@ func TestRecovery_RestoresTerminalAuditResult(t *testing.T) {
 	require.Equal(t, invocationsBefore, countToolInvocations(t, db), "补齐只进消息、不进审计")
 }
 
+// ---- M4b ------------------------------------------------------------------
+
+// 中文验收点（US-16 人工走查发现，2026-10-31）：与 PostgreSQL 谱系同一份判据——恢复
+// 从审计行还原的正文带 NUL（JSON 里的 `\u0000` 转义还原成裸 0x00）时，清洗把坏字节
+// 换成 U+FFFD 后照常补齐；审计行保持原文。SQLite 的 TEXT 列不像 PostgreSQL 那样拒写，
+// 本用例在 SQLite 上守的是**判据一致**，防两个后端的恢复路径分叉。
+// 逆改点：去掉 `appendMessage` 里的清洗 → 正文按原始 NUL 落库，断言变红。
+func TestRecovery_RestoresAuditResultWithUnstorableBytes(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	seedRun(t, db, "run-1", "running")
+	seedMessage(t, db, recoverySession, 1, core.RoleAssistant, "", "run-1",
+		core.ToolCall{ID: "c1", Name: "fetch"})
+	seedToolInvocation(t, db, "run-1", "c1", "success", "正文\u0000尾部")
+
+	report, err := Recover(ctx, db, testLogger(t), fixedNow)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.RepairedGroups)
+
+	got := loadMessages(t, db, recoverySession)
+	require.Len(t, got, 2)
+	require.Equal(t, "正文�尾部", got[1].Content, "NUL 换成替换字符后照常落库")
+
+	var audit string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT result_json FROM tool_invocations WHERE run_id = ? AND tool_call_id = ?`,
+		"run-1", "c1").Scan(&audit))
+	require.Contains(t, audit, `\u0000`, "审计保持 JSON 里的原始转义，不被清洗改写")
+}
+
 // ---- M5 -------------------------------------------------------------------
 
 // 中文验收点（契约 §4.4 五分支第 3/4 行）：**无**审计行时按 Run 的状态分类——cancelled

@@ -32,12 +32,45 @@ const (
 	scheduleStopGrace = 70 * time.Second
 )
 
+// postureBox 是管理认证姿态的**迟绑定发布盒**：姿态由 web 面在监听成功后算出
+// （`web.ResolveAdminPosture`，T027），而调度器在更早的重路径装配里就已构造，两者
+// 之间没有别的交汇点。盒子只做一次写、多次读；未发布时读到空串，调度器按"尚未计算"
+// 处理而不是"不可用"——否则 gateway（不建 web 面）与所有 admin-builtin 任务会永久停摆。
+// The posture is published once by the web face, after the scheduler already exists.
+type postureBox struct {
+	mu      sync.RWMutex
+	posture core.AdminPosture
+}
+
+// Set 发布启动期算出的姿态；同一次启动内只应调用一次。
+// Set publishes the startup posture.
+func (b *postureBox) Set(posture core.AdminPosture) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.posture = posture
+}
+
+// Get 返回当前已发布的姿态；未发布时返回零值。
+// Get returns the published posture, or the zero value before publication.
+func (b *postureBox) Get() core.AdminPosture {
+	if b == nil {
+		return ""
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.posture
+}
+
 // newScheduler 构造调度器；Entries 由 core.NewScheduler 在构造时拷成私有快照，
 // 适配器与 web 只读面此后都不回写它（P-05 / 约束 3）。
 // newScheduler builds the scheduler; core.NewScheduler snapshots Entries at construction,
 // so later mutations of the caller's slice cannot change definitions.
 func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entries []core.AgentEntry,
 	delivery core.ScheduleDelivery, gate core.ScheduleGate, cfg *cli.Config, logger *slog.Logger,
+	ownerKeys core.OwnerKeyVerifier, posture *postureBox,
 ) *core.Scheduler {
 	if logger == nil {
 		logger = a.loggerOr()
@@ -49,6 +82,8 @@ func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entrie
 		Entries:      entries,
 		ScheduleGate: gate,
 		CronSpec:     workspace.CronSpec,
+		OwnerKeys:    ownerKeys,
+		AdminPosture: posture.Get,
 		Delivery:     delivery,
 		Budget:       webBudget(cfg),
 		RunTimeout:   scheduleRunTimeout,

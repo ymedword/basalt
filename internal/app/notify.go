@@ -5,7 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/ymedword/basalt/internal/core"
-	"github.com/ymedword/basalt/internal/storage"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 )
 
@@ -41,7 +41,7 @@ func newNotifyTool(channels core.NotifyChannelReader, policy core.Policy,
 // 已经完成，派生行写失败**不得**把结果改判为失败——模型据此重试就是重复推送。
 // notifyDeliveryRecorder logs a failed derived-record write instead of failing the send.
 type notifyDeliveryRecorder struct {
-	store  *storage.NotifyDeliveryStore
+	store  *postgres.NotifyDeliveryStore
 	logger *slog.Logger
 }
 

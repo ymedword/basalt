@@ -51,13 +51,17 @@ const (
 	// SecretRecoveryKeyIDMismatch 表示密钥文件的 key_id 与实例记录不符。
 	// #nosec G101 -- 原因码字面量，不是凭据（变量名命中）。
 	SecretRecoveryKeyIDMismatch SecretRecoveryReason = "key_id_mismatch"
-	// SecretRecoveryUnprovableProvenance 表示存在无法用 `os.SameFile` 证明来源的密钥文件。
+	// SecretRecoveryUnprovableProvenance 表示密钥材料的来源不可证明：密钥文件无法用
+	// `os.SameFile` 证明来源，或**无初始化记录却已存在托管密文**（D-40，2026-10-27
+	// 裁决）——后者即使当前密钥能解开全部密文也一样，解不开 / 解得开只是密文可读性，
+	// 不是来源证明。恢复只经可信备份中的原记录与原密钥（`secrets recover-record`）。
 	// #nosec G101 -- 原因码字面量，不是凭据（变量名命中）。
 	SecretRecoveryUnprovableProvenance SecretRecoveryReason = "unprovable_provenance"
 	// SecretRecoveryUnavailable 表示库或文件系统读取失败：只报"无法判定"。
 	SecretRecoveryUnavailable SecretRecoveryReason = "unavailable"
-	// SecretRecoveryKeyPathMissing 表示实例有初始化记录（或托管密文）但当前解析不出
-	// 主密钥路径：实例身份与密钥位置之间存在缺口（名册丢失、secrets 段被移除等）。
+	// SecretRecoveryKeyPathMissing 表示实例**有初始化记录**但当前解析不出主密钥路径：
+	// 实例身份与密钥位置之间存在缺口（名册丢失、secrets 段被移除等）。无记录 + 有托管
+	// 密文报 `unprovable_provenance` 而不是本码（D-40）。
 	// 它与 `missing`（路径已知、文件不在）分开报——恢复动作不同：先找回名册 / 配置，
 	// 而不是去某个已知目录找文件。**不**因为"这次没解析出路径"就当成新实例重新生成。
 	// The instance remembers a key that this process cannot locate; it is never a cue
@@ -91,4 +95,26 @@ const (
 	InstanceSecretScopeMasterKey = "master_key"
 	// InstanceTargetMasterKey 是 `system.secrets_init` 的 `target_id` 固定字面量。
 	InstanceTargetMasterKey = "master_key"
+	// ActionInstanceAdopt 是存量实例建立身份的离线动作：只写名册、不碰密钥与密文
+	// （US-16 T071；契约 run-and-errors.md §9.3）。
+	// ActionInstanceAdopt is the offline identity-adoption action: it writes the roster
+	// only and never touches the key or the sealed credentials.
+	ActionInstanceAdopt = "instance.adopt"
+	// TargetKindInstance 是实例身份类动作的目标类型；与资源类、`system` 类目标分开，
+	// 读侧据此区分。
+	// TargetKindInstance marks instance-identity operations, kept apart from resource and
+	// system targets so the read side can filter it.
+	TargetKindInstance = "instance"
+	// InstanceTargetIdentity 是 `instance.adopt` 的 `target_id` 固定字面量：采纳动作
+	// 改的是"这个工作区叫什么"，不是某把密钥、某个资源。
+	// InstanceTargetIdentity is the fixed target id of `instance.adopt`.
+	InstanceTargetIdentity = "instance_identity"
+	// ActionInstanceSecretsRecover 是 D-40 记录恢复的离线动作：从可信备份写回
+	// `master_key` 记录（及缺失时的名册），不碰密钥与密文（§3.1.8b）。
+	// ActionInstanceSecretsRecover is the offline record-recovery action.
+	ActionInstanceSecretsRecover = "instance.secrets_recover"
+	// ActionInstanceSecretsLegacyAdopt 是 schema 3～5 受控升级的离线动作：在隔离副本上
+	// 迁移并写 1 条 `attested_legacy` 记录（§3.1.8c）。
+	// ActionInstanceSecretsLegacyAdopt is the controlled legacy-upgrade action.
+	ActionInstanceSecretsLegacyAdopt = "instance.secrets_legacy_adopt"
 )

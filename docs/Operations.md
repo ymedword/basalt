@@ -8,14 +8,58 @@
 
 ## 1. 依赖条件
 
-### 1.1 底座运行时：零外部依赖
+### 1.1 底座运行时：单二进制 + PostgreSQL
 
-- `CGO_ENABLED=0` 静态二进制（linux/amd64、linux/arm64、windows、darwin 交叉编译），`scp` 一个文件 + `systemctl start` 即部署；目标机器**不需要** JVM / Node / Python / 包管理器（完整发布包另附固定版本 Node / Python 供选配 Agent 使用，见 §1.3——同样不需要用户自行安装）
-- 数据自包含：全部状态在**当前工作目录的 `.basalt/`**（SQLite 库 + markdown 记忆 + Agent 目录 + 技能库 + 日志），无外部数据库、无消息队列、无缓存服务
+- `CGO_ENABLED=0` 静态二进制（linux/amd64、linux/arm64、windows、darwin 交叉编译），`scp` 一个文件 + `systemctl start` 即部署；目标机器**不需要** JVM / Node / Python / 包管理器（完整发布包另附固定版本 Node / Python 供选配 Agent 使用，见 §1.4——同样不需要用户自行安装）
+- **运行期存储是外部 PostgreSQL（含 pgvector 扩展），这是部署前置，不是可选项**：会话 / 消息 / 运行审计 / 记忆 / 知识 / 调用方与配额全部在 PostgreSQL 里；连接失败、扩展缺失或 schema 版本不符时**拒绝启动**，**不**回退 SQLite
+- 工作区文件面仍在**当前工作目录的 `.basalt/`**（Agent 目录 + 技能库 + 技能版本快照 + 控制状态 + markdown 记忆档 + 日志）；这两块（PostgreSQL + 工作区）是**两个**备份对象，缺一不可
 
-判据：目标机器上 `file ./basalt` 显示 `statically linked`（linux），且 `basalt status` 在没有网络、没有其他服务的机器上能跑出结果。
+判据：目标机器上 `file ./basalt` 显示 `statically linked`（linux）；在一台**只有** PostgreSQL 的机器上（不装其他服务），配好 DSN 后 `basalt status` 能跑出结果；故意不给 DSN 时 `basalt serve` 以点名 `database.dsn` 的错误拒绝启动，且**不**尝试打开 SQLite。
 
-### 1.2 例外：某些 Agent 自己选用的解释器
+### 1.2 PostgreSQL 准备与 DSN 提供
+
+**版本与扩展**（2026-10-30 部署侧实测口径）：PostgreSQL **16 或 17**（实测组合：PostgreSQL 17.11 + pgvector 0.8.7 + pg_trgm 1.6，HNSW 索引与迭代扫描可用）。**两个扩展都是启动前置**：`vector`（≥ 0.8，且必须能探测到 `hnsw.iterative_scan` 能力）与 `pg_trgm`（关键词检索的三元组索引）。扩展由**部署者**安装（发行版包 `postgresql-17-pgvector` / 官方 `pgvector/pgvector:0.8.7-pg17-bookworm` 镜像均已带），启动时缺扩展或能力不足会以点名的错误拒绝启动——**不**会在运行中静默降级，应用也**不会**自动 `CREATE EXTENSION`。
+
+**建角色与建库**（最小权限；示例值按环境替换，密码不进文档也不要写进仓库）：
+
+```sql
+CREATE ROLE basalt LOGIN PASSWORD '<password>';
+CREATE DATABASE basalt OWNER basalt;
+\c basalt
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+**DSN 的两种提供方式**——`database.dsn` 是**无条件必填**的新配置键（运行期唯一后端就是 PostgreSQL）：
+
+| 方式 | 写法 | 适用 |
+| --- | --- | --- |
+| 环境变量（推荐） | `basalt.yaml` 里写 `database:\n  dsn: ${BASALT_DATABASE_DSN}`，部署环境导出该变量 | 密码不落配置文件；与 `basalt.yaml` 一起备份时也**不**带密钥材料 |
+| 字面量 | `basalt.yaml` 里直接写完整连接串 | 仅限本地 / 演示；此时 `basalt.yaml` 含密码，**不得**进版本库，备份按凭证对待 |
+
+连接串格式：URL（`postgres://user:pass@host:5432/basalt?sslmode=disable`）或 `key=value` 串（`host=… port=… user=… password=… dbname=… sslmode=…`）均可。
+
+> **模板里的占位符不是"已经配好"**：新实例首次启动生成的 `basalt.yaml` 带的是 `dsn: ${BASALT_DATABASE_DSN}` 这一行**占位**——它只保证配置键存在，**不**代表数据库已经准备好。占位未解析（环境变量未导出）与解析为空**同样按空值处理**，启动以「PostgreSQL 连接串为空——database.dsn 必须解析为实际值」拒绝；**不得**把"模板有占位符"理解为"用户无需准备数据库"。
+
+**首启前的可选预迁移**：`basalt db migrate` 按配置里的 DSN 把库带到当前 schema 版本（幂等）。`serve` 首次启动也会自己做迁移；数据库账号**没有 DDL 权限**时，预迁移是唯一路径——由具备建表权限的账号先跑一次 `db migrate`，再以受限账号 `serve`。
+
+**首次启动的四个阶段**（中断后各自的可观察信号，排障按此逐段核对）：
+
+| 阶段 | 做什么 | 成功信号 | 失败时的状态 |
+| --- | --- | --- | --- |
+| ① 配置生成 | 无 `basalt.yaml` / 实例名册时写最小配置模板、初始化进度记录（`provisioning.json`，`pending`）与实例名册，次序固定：**配置 → 记录 → 名册** | 日志 `新实例：最小配置与实例名册已就绪`，字段 `config_created=true provisioning_recorded=true marker_created=true` | 进度记录或名册写不出来 → 启动失败且**不**写名册（工作区仍算新实例；已生成的配置不重写）；修好后重跑走完整流程 |
+| ② 数据库连接 | 解析 DSN → 连接 → 校验扩展 → 迁移 → 校验 schema 版本 | 无告警，继续往下 | 失败以 `打开 PostgreSQL: …` 包装点名原因（连接串为空 / 连接失败 / 库版本高于二进制）；**已写入的配置与名册保留**，不会改写 |
+| ③ 密码就绪 | `http.admin_auth.mode: token` 且未显式配置 token 时，读实例私有目录的 `admin-token`；本次属于"首次初始化还没做完"时生成一次 | 非交互终端打印 `管理台访问密码已写入 <路径>`（**不**显示值）；交互式终端显示一次值 | 生成失败即启动失败；文件写成功但进度记录改写失败只告警（密码已可用） |
+| ④ 监听 | 起 HTTP 监听、装配管理台 | 监听日志 / `curl -fsS http://<listen>/healthz`（或管理台可登录） | 端口占用等在此阶段失败；②③ 已完成的文件保留，重跑不会重复发放 |
+
+**中断后重试的口径**（2026-10-30 用户裁决）：②③④ 任一阶段失败后，修好 DSN / 数据库 / 端口，重新 `basalt serve` 即可**续做**——启动日志会带 `首次初始化未完成：配置与实例名册已在盘上，管理面访问密码尚未生成——本次启动继续完成`，密码发放阶段还会带 `首次初始化未完成：本次启动继续生成管理面访问密码（不覆盖既有配置、主密钥或密码文件）`。四条边界：
+
+- 续做**只**发生在"初始化进度记录仍是 `pending`"的实例上；记录缺失、状态已是 `minted`、标识不符或读不懂，一律按"已有凭据的实例"失败关闭——不补发、不覆盖；
+- 续做**不**改写已生成的 `basalt.yaml`、实例名册与 `master.key`；已有 `admin-token` 文件时以盘上为准，**不**生成第二把；
+- 进度记录为 `minted` 之后，运维**手工删掉** `admin-token` 不会被静默补发（管理面密码的更换必须是显式动作）；确需重置密码时按 §6 的凭证操作执行，**不得**靠删文件或删库"重来"；
+- 恢复态**不得**通过重新生成主密钥或重建实例来绕过——那会让既有托管凭据全部不可读。
+
+### 1.3 例外：某些 Agent 自己选用的解释器
 
 下表依赖**不属于底座**，而是"某个 Agent 的选择"——只在那个 Agent 声明的能力被调用时才需要，缺了只影响它自己：
 
@@ -28,9 +72,9 @@
 
 **不得**把"某 Agent 需要 Python"写成"Basalt 需要 Python"——部署说明与验收口径以本表为准。
 
-### 1.3 完整发布包：随包固定版本组件
+### 1.4 完整发布包：随包固定版本组件
 
-完整发布包 = 产品二进制 + `runtime/`（固定版本的解释器与 MCP 组件）+ `LICENSES/`。底座本身仍是零外部依赖；包里附带的是上表"某些 Agent 选用"的解释器副本，装到目标机器后**不需要**再装 Node / Python，也**不需要** `npm` / `pip`：
+完整发布包 = 产品二进制 + `runtime/`（固定版本的解释器与 MCP 组件）+ `LICENSES/`。底座是**单 Go 二进制**，但运行期仍需 PostgreSQL（§1.1 的部署前置）；包里附带的是上表"某些 Agent 选用"的解释器副本，装到目标机器后**不需要**再装 Node / Python，也**不需要** `npm` / `pip`：
 
 | 组件 | 包内路径（Windows 例） | 版本来源 |
 | --- | --- | --- |
@@ -202,7 +246,7 @@ curl -v -H "Authorization: Bearer ${BASALT_ADMIN_TOKEN}" http://127.0.0.1:8080/a
 
 **网络域名白名单：唯一权威源在数据库，页面保存即生效**：
 
-- 权威源是 SQLite 的 `network_domain_policy` 单行。管理台「执行环境 → 网络域名白名单」保存后，**下一次**出站判定即按新规则，**无需重启**；页面显示实际生效的域名、修订号、ETag 与来源
+- 权威源是数据库（PostgreSQL）里 `network_domain_policy` 的单行。管理台「执行环境 → 网络域名白名单」保存后，**下一次**出站判定即按新规则，**无需重启**；页面显示实际生效的域名、修订号、ETag 与来源
 - `basalt.yaml` 的 `http.allowed_domains` **只在数据库还没有这一行时**作为首次种子（新装 / 空表）；既有实例改配置**不会**覆盖页面保存的值，重启也不回退。排查时先看管理台或 `GET /api/v1/sandbox`，不要只看配置文件
 - 管理写与其他管理端点同一套认证；先校验（非法条目 400）、再比 `If-Match`（412）、再预写审计（`network_allowlist.update`）后落库。失败保留页面输入且**不得**显示成功；并发保存只有一方成功，另一方 409 需重新读取
 - **如实边界**：已发出的请求不能追溯撤回；放宽不自动重连、不补发此前被拒的请求；收紧后不再允许的 MCP http 长连接会断开（保留已应用版本事实），**不自动重连**
@@ -267,13 +311,15 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 
 ## 4. 备份与恢复
 
+> **US-16 口径变更（2026-10-30）**：运行期存储已切换为 PostgreSQL，**库内容的备份现场是 `pg_dump`，不是 `.basalt/basalt.db`**；工作区文件面（Agent / 技能快照 / 控制状态 / markdown 记忆档 / 配置）与密钥材料是另外两个独立备份对象，三者时间点必须配对。**PostgreSQL 的完整备份 / 恢复程序见 §4.4**；SQLite v6 → PostgreSQL 的迁移、切换与回退见 §5.6 / §5.7。本节下文各条描述的是**文件面**——只按 §4.1～§4.3 备份 `.basalt/` 会漏掉全部会话 / 审计 / 知识数据，**不得**把本节当作完整备份程序。
+
 ### 4.1 备份什么
 
 `.basalt/` 整目录：
 
 | 内容 | 类别 | 丢了会怎样 |
 | --- | --- | --- |
-| `basalt.db`（+ `-wal` / `-shm`） | **不可再生** | 会话 / 消息 / 运行审计三表 + 管理操作审计 / 资源版本与发布指针 / Run 资源引用 / 记忆（sqlite 档）/ 定时状态全丢 |
+| `basalt.db`（+ `-wal` / `-shm`） | **SQLite 谱系遗留**：迁移到 PostgreSQL 之后只作回退快照，**不是**运行中的权威数据；权威库内容见上方口径变更说明 | 迁移**前**丢它 = 会话 / 消息 / 运行审计三表 + 管理操作审计 / 资源版本与发布指针 / Run 资源引用 / 记忆（sqlite 档）/ 定时状态全丢；迁移**后**丢它不影响运行，只失去回退窗口 |
 | `control/agents/*.json` | **不可再生** | Agent 生命周期状态（`active` / `disabled` / `archived`）丢失；DB 索引可由状态文件重建，反向不行。状态文件 schema 2 的 `agent_uid` 是 **Agent 身份**（绑定、专属资源、归档恢复按它关联），丢失后**不得**按同名猜回旧身份。缺失时该 Agent 拒绝新 Run（fail-closed），不会静默当作 `active` |
 | 技能不可变版本快照目录（`resource_versions.storage_path` 指向） | **不可再生** | 已发布技能版本的内容丢失；数据库里的清单与哈希还在，但无法还原文件。Run 冻结的资源清单指向这些版本 |
 | `agents/`、`skills/` | 配置（可重建，但重建成本高） | Agent 与技能全丢 |
@@ -383,16 +429,87 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 
 **不得**在原数据上做第一次恢复验证——验证本身可能覆盖要保的东西。
 
+### 4.4 PostgreSQL 运行期备份与恢复（US-16 起）
+
+运行期有**三个独立**的备份对象，缺一不可，时间点**必须配对**（同一个时间戳目录、同一次停机窗口）：
+
+| 对象 | 内容 | 备份手段 | 丢了会怎样 |
+| --- | --- | --- | --- |
+| 数据库 | 会话 / 消息 / Run 与调用审计 / 管理操作 / 资源版本与发布指针 / 记忆 / 知识库与文档 / 调用方与配额 / 压缩条目 / 诊断事件 | `pg_dump -Fc`（逻辑备份） | 全部业务数据与审计丢失 |
+| 工作区文件面 | `.basalt/`（`agents/` / `skills/` / 技能不可变版本快照 / `control/` / `memory/*.md` / `archive/` / 日志）+ 同级 `basalt.yaml` | 停服后整目录拷贝 | 定义源、生命周期状态、技能版本快照、markdown 记忆档丢失 |
+| 密钥材料 | 实例私有目录的 `master.key` 与 `admin-token`（与主密钥同目录、分文件；路径按名册的 `instance_id` 推导，Linux 缺省 `$XDG_DATA_HOME/basalt/instances/<instance_id>`，未设则 `~/.local/share/basalt/instances/<instance_id>`） | **单独受控备份**（ACL 保护的位置） | 有库无钥 = 托管凭据全部不可解（恢复态）；有钥无库 = 数据丢失 |
+
+四条纪律：
+
+- **主密钥材料不得进入数据库备份包、迁移导出包（`db export` 的 `package/`）或日志**——托管凭据的密文在库里，能解开它们的只有那把密钥；导出包泄露不等于凭证泄露，把密钥塞进去才会
+- `admin-token` 与主密钥**分开**保管：两者的丢失后果与恢复方式不同（密码丢了重新生成即可，主密钥丢了只能按 §6.4 恢复记录或重录凭据）
+- 备份目录收到部署者 ACL（Unix `0700`，文件 `0600`；Windows 不沿用继承的宽松 ACL）
+- 切换后 `.basalt/basalt.db` 只是**回退快照**，不再是运行中的权威数据；只备份它 = 漏掉全部业务数据
+
+**备份（Linux，停机窗口内）**：
+
+```bash
+systemctl stop basalt
+d=/backup/basalt-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$d"
+
+# 1. 数据库：逻辑备份（自定义格式，可选择性恢复）。连接参数走 ~/.pgpass 或受限 PGPASSFILE，
+#    **不得**把带密码的 DSN 写进命令行 / 脚本 / 报告（进程表与 shell 历史都会留痕）
+pg_dump -Fc -h 127.0.0.1 -U basalt -d basalt -f "$d/basalt.dump"
+
+# 2. 工作区文件面与配置（与库同一时间点）
+cp -a /opt/basalt/.basalt "$d/.basalt"
+cp /opt/basalt/basalt.yaml "$d/basalt.yaml"
+
+# 3. 密钥材料单独受控备份：从实例私有目录复制 master.key 与 admin-token，
+#    目标位置按部署者的受控保管方案（不是 $d 下的普通文件，也不与库备份同盘）
+#    示例：install -m 600 <私有目录>/master.key / secure-backup/basalt-<ts>/master.key
+
+systemctl start basalt
+```
+
+在线（不停机）只能做 `pg_dump`——一致性快照由数据库的 MVCC 保证。工作区文件面**必须**停机拷贝：运行中的 `runs/` 产物与 `state/*.json` 没有跨文件一致性保证。**不得**把在线库备份与另一个时间点的文件面拼成"一个备份集"。
+
+**恢复**：
+
+```bash
+systemctl stop basalt
+
+# 1. 建一个空库（不要覆盖正在使用的库）
+createdb -h 127.0.0.1 -U postgres -O basalt basalt_restore
+# 2. 还原数据库
+pg_restore -h 127.0.0.1 -U basalt -d basalt_restore --no-owner "$d/basalt.dump"
+# 3. 工作区与配置成套回滚（取同一次备份）
+mv /opt/basalt/.basalt /opt/basalt/.basalt.broken
+cp -a "$d/.basalt" /opt/basalt/.basalt
+cp "$d/basalt.yaml" /opt/basalt/basalt.yaml
+# 4. 密钥材料按受控流程放回实例私有目录（权限不变）
+systemctl start basalt
+```
+
+**恢复验证**（每次演习与每次真实恢复都要走完）：
+
+1. 先在独立库（如 `basalt_restore`）+ 独立工作区目录做恢复，`basalt.yaml` 指向该库、换端口起 `serve`——§4.3 的"演练隔离"三步同样适用（停调度、副作用调用指向测试目标、出网收口）
+2. `basalt status` —— 存储节报 `PostgreSQL，schema v1，N 张表`
+3. `basalt session list` —— 读到备份时点之前的既有会话（**读到 = 库真的恢复了**）
+4. `basalt profile list` —— Agent 数量与预期一致
+5. 核对 `storage_cutover` 行（切换过的实例）与 `assets.json` 逐项哈希（文件面）
+6. 主密钥就位后 `basalt secrets verify` 通过（托管凭据全部可解、绑定不变）——**没有**这一步，"库恢复了"只证明读表成功，没证明密文可用
+
+**恢复后仍缺主密钥**：实例处于 `recovery_required`（原因码见 §5.8.1），托管凭据 fail-closed；按 §6.4 从可信备份恢复初始化记录，或按 §6.5 处置 schema 3～5 存量。**不得**重新生成主密钥或重建实例来"修复"——那会让既有密文永久不可解。
+
 ---
 
 ## 5. 升级、回滚与停机
 
 ### 5.1 升级（受控前向迁移）
 
+> **US-16 起（2026-10-30）**：运行期存储是 PostgreSQL，升级 = 停服 → **按 §4.4 做三个对象的成套备份** → 换二进制 → 起服（启动时对 PostgreSQL 做内嵌版本化前向迁移；`basalt db migrate` 可预跑，幂等）。**SQLite 谱系冻结在 v6，只作迁移来源与回退快照，不再新增迁移**；SQLite v6 → PostgreSQL 的一次性迁移与切换见 §5.6。下文第 4 步之后的 v2～v5 迁移叙述是 **SQLite 谱系的历史记录**，保留供对账，不再是当前升级路径。
+
 顺序**必须**固定，且**从停服到二进制就位之间不得起服**：
 
 1. **停服**：`systemctl stop basalt`
-2. **备份，并保持停机**：按 §4.2 的离线步骤做（**跳过其中 `systemctl start` 那一行**）——升级前必做，这是回滚的唯一依托；备完不起服，直接接第 3 步
+2. **备份，并保持停机**：按 §4.4 做三个对象的成套备份（库 + 工作区文件面 + 密钥材料；旧 SQLite 实例另按 §4.2 留文件面快照），**跳过其中 `systemctl start` 那一行**——升级前必做，这是回滚的唯一依托；备完不起服，直接接第 3 步
 3. **换二进制**：旧版改名留底（`mv basalt basalt.bak-<旧版本>`）→ 放新二进制 → `chmod +x`
 4. **启动并迁移**：`systemctl start basalt`——启动时按 `schema_version` 应用增量 SQL（迁移脚本入库、随二进制发布；**已发布的迁移不得改写**，只许追加新版本）。迁移失败**必须**报错退出——**不得**带着半迁移的库继续跑。US-11 / US-12 的首次升级从 `schema_version=1` 前向到 **2**：新增管理操作审计、资源版本 / 指针 / 引用、Agent 生命周期索引与归档表，**不改既有表**；SQL 迁移后还要执行一次资源基线（为已有 Provider / MCP / 技能建立 v1 已发布版本、为已有 Agent 建立初始状态文件，初始状态 `disabled`）。US-12 范围修订把 **2 → 3**：新增 UID 级资源身份 / 墓碑、凭据与凭据版本、绑定投影、通知 Run 引用与发送明细，重建 `resource_versions` / `notify_channels`，给 `resource_pointers` / `run_resource_refs` / `agent_lifecycle` / `agent_archives` 加列；顺序固定为**状态文件先升级（分配 `agent_uid`、升为 schema 2）→ SQL 迁移 → 绑定回填**。两次迁移失败都拒绝启动、重跑必须幂等；v3 前必须确认**没有活动 Run**。US-12 R7 再把 **3 → 4**：新增 `schedule_deliveries`（每轮运行的系统代投权威记录，主键含运行标识），**只追加新表、不改既有表**；迁移失败同样拒绝启动、重跑幂等。US-12 R8 再把 **4 → 5**：新增 `network_domain_policy` 单行表（网络域名白名单的唯一权威源）；升级后表内无行，**首次启动**按 `basalt.yaml` 的 `http.allowed_domains` 写入种子，此后配置键不再读取、页面保存即热生效（§2.2）。三次迁移失败都拒绝启动、重跑必须幂等。升级到 v5 后旧二进制因 `schema_version` 高于自身支持版本而拒绝启动，回滚仍按 §5.2「备份 + 旧二进制」
 5. **验证**：`basalt status` → `basalt session list` → `GET /api/v1/health` → 跑一次真实调用（同 §4.3 判据的 1~5）
@@ -427,12 +544,12 @@ basalt session list      # 关键判据：能看到备份时点之前已有的�
 2. **取消并等待在跑 Run**：向所有在跑 Run 发出取消，**有界等待**其退出——等的是"审计与消息落库完成"，不是"让模型把话说完"
 3. **停 HTTP**：`http.Server.Shutdown`（拒新连接、等在途请求结束）
 4. **关 MCP**：关闭 MCP 客户端与其子进程（stdio server 的子进程不留给系统收割）
-5. **关库**：关闭 SQLite 连接（WAL 落盘、`busy_timeout` 不再有等待者）
+5. **关库**：关闭 PostgreSQL 连接池（在途事务已提交或回滚，不把半截事务留给服务端）
 6. **退出**——`.basalt/basalt.lock` 由**内核**释放（独占文件锁随进程消亡解锁）：**不得**写"退出前删锁文件"的收尾，那会在删除与下一个进程加锁之间制造竞态
 
 宽限：systemd 的 `TimeoutStopSec=` **必须大于**停机宽限（工具执行超时可达分钟级）。**不得**指望 `SIGKILL` 兜底——被强杀的进程留下 `running` Run 与 `pending` 审计行，下次启动要走恢复扫描收尾（能收敛，但白丢一次干净退出）。
 
-**工作目录就是工作区**（§1.1：状态全在"当前工作目录的 `.basalt/`"），因此 systemd 单元**必须**显式给 `WorkingDirectory=`：
+**工作目录就是工作区**（§1.1：文件面状态全在"当前工作目录的 `.basalt/`"，库数据在 PostgreSQL），因此 systemd 单元**必须**显式给 `WorkingDirectory=`：
 
 ```ini
 [Service]
@@ -568,12 +685,184 @@ powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1 -Frontend 
 | --- | --- |
 | 存活 | `GET /api/v1/health` 返回 `data.status=ok` |
 | 管理认证 | 带 `BASALT_ADMIN_TOKEN` 的 `GET /api/v1/system/overview` 返回 200；缺 token 时明确报 `Admin=unverified`，**不得**当成已验证 |
-| 构建标识 | `/api/v1/info` 的 `version`；`/system/overview` 的 `database.schema_version`（v4 起应为 4） |
+| 构建标识 | `/api/v1/info` 的 `version`；`/system/overview` 的 `database.schema_version`（PostgreSQL 谱系自 v1 起；SQLite 谱系另计，冻结在 6，两者**不得**互相套用） |
 | 前端资源 | 按 `assets/console/dist/integrity.json` 逐项取 `/console/` 与 `/console/assets/...`，SHA256 必须与清单一致；不一致即失败 |
 
 脚本**不改写**配置、工作区、数据库与主密钥，也**不**自动回滚：`schema_version` 是前向迁移，失败时保留 `bin/basalt.old` 与日志供人工按 §5.2 处置。前端资源哈希不符说明运行中的二进制不是当前 `dist`——加 `-Frontend` 重新构建后重跑。
 
 **Windows 启动解析陷阱（脚本已规避，手工启动同样适用）**：同目录若还留着 `bin\basalt.exe`，经 `cmd /c` 或只写无扩展名的 `bin\basalt` 启动时，CreateProcess 会按追加 `.exe` 的规则解析到 `basalt.exe`——结果是旧构建在跑、部署却报成功。演练实测：cmd 启动实际执行的是 `bin\basalt.exe`（schema 2、旧前端 0/3），改成 `Start-Process -FilePath <完整路径>` 直连后才落到新构建（schema 4、资源 3/3）。因此脚本用完整路径直接启动；手工启动也**必须**给完整路径，并用 `Get-CimInstance Win32_Process` 的 `ExecutablePath` 复核实际镜像。
+
+### 5.6 SQLite v6 → PostgreSQL 的一次性迁移与切换（US-16 起）
+
+已在 PostgreSQL 上的实例日常升级走 §5.1；本节只适用于**数据还在工作区 `basalt.db`** 的旧实例。迁移是一次性的：切过去之后 `basalt.db` 只作回退快照、不再写入，此后备份按 §4.4。
+
+#### 迁移前置
+
+- PostgreSQL 按 §1.2 建库；`vector`（0.8.x，启动要求 `hnsw.iterative_scan` 能力）与 `pg_trgm` 由部署者 `CREATE EXTENSION` 装好——应用**不**自动创建扩展。
+- `basalt.yaml` 的 `database.dsn` 写成 `${ENV_VAR}` 占位且能解析出非空值。占位残留、为空或变量缺失 → **拒绝启动 / 拒绝执行**，没有回退 SQLite 的分支。
+- 工作区有实例名册 `instance.json`。没有时 `db export` 直接拒绝（`instance_identity_missing`）——存量无名册实例先按 §6.5 跑 `basalt instance adopt`，**不得**把它当新实例自动生成，也**不得**手写一个 `instance_id`。
+
+**迁移包**：`db export` 的产物目录，含 `manifest.json`（批次号 / 源谱系版本 / 实例标识 / 快照摘要）、`assets.json`（工作区资产逐项哈希）、数据文件与 `review/`。格式 `format_version=1`、`source_schema_version=6`；字段带固定类型标签（`i` 整数 / `f` IEEE754 十六进制浮点 / `s` UTF-8 文本 / `b` base64 字节），NULL 无标签（JSON `null`）。包内**不含**主密钥与任何明文凭据：密文随库走，密钥按 §4.4 单独受控交接。
+
+**步骤**（顺序固定；第 1～3 步不碰目标库，第 4 步之后任一步失败都停在原地）
+
+1. **停机**：按 §5.3 停 `serve`，确认没有在跑的 Run、没有在途通知或摄取。停机窗口里只允许一个实例身份写入。
+2. **导出**（离线，不要求 DSN；命令取工作区实例锁，实例必须已停）：
+
+   ```bash
+   basalt db export --workspace /opt/basalt/.basalt --out /backup/us16-pkg
+   ```
+
+   有未归类文件时只产出**受限核查包**（命令非零退出、报告 `deliverable=false`）：按包内 `review/` 逐条处置后封包，再继续。
+
+   ```bash
+   basalt db export --seal /backup/us16-pkg --review-file /backup/us16-review.txt
+   ```
+
+   未封包的核查包**不得**导入：`db import` 与 `db switch` 都拒收。
+
+3. **复核包**（离线）：`basalt db verify --dump /backup/us16-pkg`
+4. **导入**（要求 DSN，单事务）：`basalt db import --dump /backup/us16-pkg`
+
+   - 目标必须是空库：业务表非空、已有 `storage_cutover` 行、或包处于 pending 复核状态 → 拒绝，不会导入半份数据。
+   - 导入**不含** `master.key`，也不改写密钥；`instance_secrets` 记录随包进库。
+   - **规模经验值来自本机演练，不是容量保证**（2026-11-01 读数与计量口径见 `specs/016-knowledge-memory-history/research.md` R-05）：导入把整表 dump 一次性读进内存，**那个 CLI 进程**的峰值 RSS 在演练夹具上约 **4.2–4.7 KiB/条**，同时写约 **3.5 × dump 字节**的 WAL（LSN 增量，不是稳态写入速率）。参考点：**100 万条消息 → 导入进程峰值 RSS 4,165,116 KiB（4.27 GB / 3.97 GiB）、WAL 4,729,189,056 B（4.73 GB / 4.40 GiB）、整窗 253 s**（PG 17.11，i7-12700，12 GiB 可用内存；表内 RSS 列单位是 **KiB**，WAL 与 dump 列是**字节**，换 GiB 按 1024³ 计）。这几条比值随**消息长度、索引配置、并发与 PG 参数**变化，**不得**按 `可用内存 ÷ 4.5 KiB` 之类的公式推算"能导多少条"；容量规划必须在目标机上用目标数据抽样重跑 `scripts/exp/migration_scale_drill.sh`。导入前确认 dump 所在分区剩余空间 ≥ 4 × dump 字节（WAL ≈ 3.5 × dump + 余量）。
+   - **资源不足怎么办**（三选一，**不得**改成部分提交）：耗时超维护窗口 → 扩大窗口（别只算导入，导出与两次校验同量级）；WAL / 磁盘不足 → 先扩分区再跑；内存不足 → 加内存，或**评估分区 / 分批多事务**——后者放弃"失败即空表"的单事务承诺，属产品与契约变更，必须走模块评审，运维现场**不得**用循环调用 `db import` 绕过。这类失败是安全失败：OOM 或任一校验失败都在单事务内整体回滚，目标库保持空业务表。
+
+5. **核对目标库**：`basalt db verify --dump /backup/us16-pkg --target`
+6. **交接核对**（离线，只读）：`basalt db verify --handoff <copy-root>/.basalt`
+
+   核对项：名册、`instance_secrets` 记录、密钥路径与权限、全部密文可解、目标配置。`<copy-root>/.basalt` 是**副本的工作区根**（与 `db export --workspace` 同一口径），同级的 `basalt.yaml` 是被核对的配置。密钥在原配置路径可用时，直接对本工作区跑这条命令也成立——它是只读的。
+
+7. **切换**：`basalt db switch --dump /backup/us16-pkg --workspace /opt/basalt/.basalt`
+
+   - 重跑三道门禁（包内资产 / dump 摘要 / 目标库）；再加第四道——源端自快照以来未漂移，漂移即 `source_changed_since_snapshot`。`--workspace` 因此是**必填**：缺省即拒绝（在调用端口之前、零写入），**不得**把没跑的判据说成通过。
+   - 通过后写 `storage_cutover` 行（`first_write_at` 留 NULL，留给首个业务事务）。**切换事实只认这一行**，不是"配置里改了 DSN"；同一导出批次不得切换两次。
+   - `db switch` **不**跑交接门禁、也不声称跑过——第 6 步必须先通过。
+   - 切换前**不要**起服：目标库在导入完成前接受请求，正是 C-39 禁止的"目标实例提前对外服务"。产品没有在启动时拦这一步（全新安装本来就没有 `storage_cutover` 行），这条是操作纪律。
+
+8. **验证窗口**（切换后、首个业务写入前）：从副本根执行。
+
+   ```bash
+   cd <copy-root>
+   basalt serve --verification-window --asset-package /backup/us16-pkg
+   ```
+
+   - 窗口在**任何装配之前**分流：不取实例锁、不迁移、不启动调度 / 通知 / MCP / 模型 / 配置监听，也**不**接受 Run 准入——"窗口内禁写入"是结构性的，不是一组开关。HTTP 面只回环，只有 `/api/v1/health` 与 `/api/v1/ready`。
+   - 离线门（身份 / 密钥 / 全部密文 / 配置 + 资产）通过后才开监听；不给 `--asset-package` 时报告明写"资产维度未核对"。核对完按 `SIGINT` / `SIGTERM` 结束窗口。
+   - 退出码非零时报告带稳定码：`assets_mismatch` / `database_unavailable` / `cutover_marker_missing` / `database_written` / `verification_window_incomplete` / `listener_not_loopback`；回退结论只有五值之一（`allowed` / `blocked:external_action` / `blocked:database_written` / `blocked:workspace_changed` / `blocked:unknown`），判定口径见 §5.7。
+   - 数据库维度读的是**真库**，不是"配置里没改"。开窗口前先读 `storage_cutover` 并给全部用户表拍行数基线：没有切换行 → `cutover_marker_missing`（拒绝，不把库当窗口对象）；读失败 → `database_unavailable`；`first_write_at` 已非空 → `database_written`（拒绝开监听）。窗口结束再读一次：`first_write_at` 由空转非空、或任一业务表行数变化，判**脏**；起止之间切换事实变了、或结束重读失败，判**无法证明**（`blocked:unknown`）。
+   - 窗口的行数对比只覆盖**窗口起止**——它不证明"切换之后、开窗口之前"没有写入；那段时间由 `db verify --dump … --target` 的导入基线发现（§5.7）。当前 `first_write_at` 只有经 `MarkFirstWrite` 的写路径会写，窗口的行数基线同时覆盖绕过它的写路径。
+   - **没有**离线版 `secrets verify`：在线 `secrets verify` 会装配运行期并启动 MCP，**不得**在此期间运行；密钥与密文的离线核对由第 6 步的 `db verify --handoff` 承担。
+
+9. **起正式服务**：`systemctl start basalt`。首个**成功业务事务**写入 `first_write_at`，回退窗口在这一刻关闭——之后只前滚（§5.7）。
+
+**切换后**：`basalt.db` 留在原处作回退快照、不再写入；后续备份按 §4.4。已发出的通知与外部写按清单对账并人工补偿——即使发生在 `first_write_at` 之前，它们也**不会**随回退撤销。
+
+### 5.7 切换后的回退边界（三维判据）
+
+`first_write_at` 只证明**数据库业务事务**已经写入；它不证明工作区文件有没有变、有没有发出通知或发生外部写。所以"`first_write_at` 还是 NULL"本身**不构成**可以无损回退的证据。
+
+| 时点 | 允许的动作 | 条件 / 代价 |
+| --- | --- | --- |
+| 导出 / 校验 / 导入失败，尚未切换 | **无损**回到旧实例 | 源库未被写；清掉目标库的导入残留即可重来 |
+| 切换后、首次成功业务写入前（回退窗口 R1） | 满足三维判据时**可以**回退 | 目标端可能已有非业务副作用（连接测试、通知试探、工作区文件变化），必须逐维证明 |
+| 首次成功业务写入后 | **只前滚** | 新数据只写在 PG；重启旧 SQLite 会丢数据，**不得**描述成无损回退 |
+| 切换后已发通知 / 已发生外部写 | 前滚 + 人工补偿 | 外部动作撤不回来；必须列出对象、时间与处置 |
+
+**三维判据**（每维三值：干净 / 脏 / 无法证明；三维全"干净"才允许自动回退）：
+
+| 维度 | 干净的条件 | 让它变脏的行为 |
+| --- | --- | --- |
+| 数据库业务写入 | `first_write_at IS NULL`，且各表行数 / ID 集 / 摘要与导入报告一致；除导入与切换行外没有新行；不可忽略的管理变更集合为空。**`memory_entries` 单列**：基线取「受控导入完成后」的实测行数，只有同时给出「导入前 / 导入条数 / 导入后实测」三个数且对账成立（导入前 + 导入条数 = 导入后实测）才作数；未申报、少行或证据与报告不符 → 判**脏 / 无法证明**，不得按干净处理 | 切换后跑过一次 Run / 摄取 / 记忆写入（`first_write_at` 已写）；表行数比导入报告多；已撤销或轮换过 Key / 凭据 |
+| 工作区文件 | `assets.json` 逐项哈希与切换时一致；没有新增 `runs/` 产物；`state/*.json` 未变 | 验证时触发了一次任务、写出 `runs/<ts>/report.md`；改了 `seen.json` / `baseline.json` / `cursor.json` |
+| 外部副作用 | 没有新的 `notify_deliveries` 行、没有外部写型 `tool_invocations`、没有已发出的通知 / 外部 API 调用 | 通知测试真的发到了群里；MCP 写工具改了外部系统；`web_search` 的计费调用已发出（费用撤不回，仍须登记） |
+
+**判定协议**：先冻结目标端写入（不启动 `serve`，或启动后立即停调度与 Run 准入）→ 逐维取证 → 三维全干净才自动回退，且回退入口先过 `first_write_at IS NULL`（非空即拒绝）→ 任一维"脏"或"无法证明"就停自动回退、转人工核查。**不得**因为"哪一维看起来不重要"就跳过。回退动作本身也留痕：`storage_cutover` 行保留不改写，另记回退报告。
+
+`serve --verification-window` 是这条协议的操作化：判定顺序固定为**外部 → 数据库 → 工作区**（外部副作用撤不回，先判它）；数据库维度 = `first_write_at` 读真库 + 窗口起止的行数对比，两者任一为脏即 `blocked:database_written`，起止读数不可比或读失败即 `blocked:unknown`。它判的是窗口那一段；切换与窗口之间的写入仍由导入基线（`db verify --target`）发现——三方判据各自覆盖不同的时间段，**不得**互相顶替。
+
+**写入二分**（哪些写入不关闭回退窗口）：只有可丢弃 / 可重放的维护写入在白名单里——`ensureSchema`、`db migrate`、`db import`、`db switch` 的切换行与**同一次受控旧记忆导入**（其行数经「导入前 + 导入条数 = 导入后实测」对账后才成为 `memory_entries` 基线，见上表）、启动期 `BackfillEnvSources` 补记、校验期任务 `enabled` 的临时开关（先记原值、验后恢复）。**不可忽略的管理变更**（Key 发放 / 撤销 / 轮换、配额调整、凭据与资源发布 / 回滚 / 删除、Agent 生命周期、通知渠道、执行策略与网络例外）集合非空即**不得**自动回退。来源不明或无法归类 → 按管理变更处理，不得当维护写入放行。
+
+### 5.8 启动失败排障（PostgreSQL 与恢复态）
+
+**启动失败一律拒绝，没有降级分支**：不重试成循环、不回退 SQLite、不自动建扩展、不自动补写主密钥记录。日志给出原因；能打开存储时 `basalt status` 报就绪状态与 schema 版本。
+
+| 症状（日志 / 命令输出） | 原因 | 处置 |
+| --- | --- | --- |
+| 未发现配置 / 配置无效 / `database.dsn 未配置` | 文件缺失、`${ENV_VAR}` 占位未解析、变量为空 | 补 `basalt.yaml` 与进程环境；**不得**把 DSN 明文写进配置或命令行 |
+| `连接 PostgreSQL 失败` | 服务未起、地址 / 端口 / 认证错、防火墙 | 按 §1.2 先用 `psql` 单独验一次连接；DSN 只经 `EnvironmentFile` 注入 |
+| 连接串无法解析 | 既不是 `postgres://` URL 也不是 `keyword=value` | 修正格式；应用会强制 `TimeZone=UTC` 与 `target_session_attrs=read-write` |
+| `扩展 vector 缺失` / `缺少所需能力 hnsw.iterative_scan` / `扩展 pg_trgm 缺失` | 扩展没装或版本太旧 | 部署者在目标库 `CREATE EXTENSION`（`vector` 升到 0.8.x）后重启；应用**不**自动创建 |
+| `库内有表但无 schema_version 表` / `schema_version 记录…非法` | 指向了别的库，或库被半建 | 核对 DSN 指向的库名；按 §4.4 恢复正确备份 |
+| `库版本 N 高于二进制支持的 M` | 用旧二进制打开了新库 | 换回匹配版本的二进制；**不得**手改 `schema_version` |
+| 启动 WARN + 管理台 `state=recovery_required` | 主密钥记录缺失 / 损坏 / 不符 / 来源不可证明 / 不可读 | 按 §5.8.1 的原因码处置；这不是"启动失败"——服务会继续起，但托管凭据写入 fail-closed |
+| 管理认证模式非法 | 配置里写了 `token` / `local_trust` 以外的模式，或 `token` 解析失败 | 显式 `token`（`${ENV_VAR}`），或全部监听地址为回环时用 `local_trust`；配置非法即拒绝启动——**没有**"关闭认证"这种模式 |
+| `服务启动缺少配置项: callers.ingress.…` / `服务启动要求下列配置项大于零: …` | 六项入口限流缺失或非正（US-16 起 `serve` 必填） | 按 §5.10 补齐三类 `qps` / `burst` 后重启；**不预填缺省**——这是预期 fail-closed，不是回归 |
+
+**诊断读取入口**：`GET /api/v1/diagnostics` 只对管理认证开放（调用方 API Key 一律拒），必须带至少一个主锚（`run_id` / `request_id` / `operation_id` / `ingest_job_id` / `session_id`）；`task_id` 只是限定符，不能单独定位（单给任务号等于全表扫，服务端 400）。返回里 `missing`（没有记录）与 `sampled_out`（有记录但被采样丢弃）是两回事——**不得**把 `sampled_out` 当成"没发生"。
+
+**能力覆盖（本版本事实）**：生产端只发 `retrieval` / `llm_call` / `tool_call` / `permission_decision` / `quota_decision` 五类事件；`operation_id` 与 `session_id` 两个主锚**暂无生产端**，按它们查必然是空结果。空结果只说明「这个锚点上没有记录」，不说明没发生——管理台对无生产端的锚点与事件种类直接标「暂无生产端」。完整覆盖属后续 OBS 模块。
+
+数据库状态与 schema 版本看 `basalt status` 与 `/api/v1/system/overview` 的 `database.status` / `database.schema_version`（`/api/v1/info` **不含**数据库字段）。
+
+#### 5.8.1 `recovery_required` 的五个原因码
+
+`GET /api/v1/instance/secrets` 与 `basalt secrets status` 给出 `state` 与 `recovery_reason`。恢复态不阻断整体启动，但托管凭据写入 fail-closed，`POST /api/v1/instance/secrets/init` 一律 409 且零写入。
+
+| 原因码 | 含义 | 处置 | 做不到时的结局 |
+| --- | --- | --- | --- |
+| `missing` | 配置指向的密钥文件不存在 | 从 §4.4 的受控备份把**同一把**密钥放回原路径（目录 0700 / 文件 0600） | 密钥确实丢失 → 现有托管凭据全部不可恢复 |
+| `corrupt` | 文件不是合法的 `{"version","key_id","key"}` | 同上，换回正确文件 | 同上 |
+| `key_id_mismatch` | 文件里的 `key_id` 与库内记录不符 | 找回落盘时的那把密钥；**不得**改记录迁就文件 | 同上 |
+| `unprovable_provenance` | 库里有托管密文但没有 `instance_secrets` 记录（升级 / 崩溃 / 误删），或记录与密钥来源无法证明 | v6 且未切换：按 §6.4 用**产于首次写记录之后**的可信备份 `secrets recover-record`；schema 3～5：按 §6.5 `secrets adopt-legacy` | 保持恢复态；只有经人工评审才可用 `secrets revoke-managed --confirm` 显式退役（§6.2）——那不是恢复 |
+| `unavailable` | 密钥文件读不了（权限 / DACL / 句柄） | 按 §6.1 修文件与父目录权限；校验结果不缓存，修好即可用 | 持续失败 = 托管凭据不可用 |
+
+**不得**做的三件事：重新生成主密钥"修复"、改写或删除密文、把托管凭据静默降级成 env。这三件都让原密文永久不可解，也不会让记录变得可证明。
+
+### 5.9 升级后的 Run 任务次数配额（`tasks_per_period`，US-16 起）
+
+**每次逻辑 Run 计 1 个任务次数**（`ClassRun`，幂等键 `run:<run_id>:admit`；在全部准入通过之后、`StartRun` 之前预留并立即结算）。这与 `qps` / `burst` 两列的零值语义（**0 = 不覆盖**，沿用 `callers.ingress.*` 类别预算；契约 `schema.pg.sql` 注释里的「0 = 不限」即指"不额外限制"）**不是一回事**，升级时最容易踩：
+
+| 情形 | 结果 |
+| --- | --- |
+| 调用方没有 `caller_limits` 行 | 新 Run 被拒（429 `QUOTA_EXHAUSTED`；响应体是固定码文案，内部原因「没有限额行」只用于排障，不回显） |
+| `tasks_per_period = 0`（DDL 缺省） | 同样被拒——**零表示不放行**，不是不限量 |
+| `tasks_per_period > 0` | 每个逻辑 Run 扣 1；按 `period` / `timezone` 的本地 00:00 重置 |
+| `local-admin`（内置管理员），`callers.local_admin.unlimited=true`（缺省） | 不受限，不产生预留行 |
+| `local-admin`，`callers.local_admin.unlimited=false` | **走正常预留**：`seedBuiltinCaller` 只建 `callers` 行、不建 `caller_limits` 行 → 内置管理员的 Run 与消耗调用一律 429 `QUOTA_EXHAUSTED`。要关掉不限量，必须同时给 `local-admin` 写一行 `caller_limits` 并填正数 |
+
+**升级动作**：本版本之前 `tasks_per_period` 没有运行期消费方，全 0 的行也无害；升级后**必须**为每个需要发起 Run 的调用方显式写入正数，否则它的 Run 会被一律拒绝。只有「永远不该跑」的调用方可以保持 0。
+
+限额只在**创建调用方**时随 `POST /api/v1/callers` 的 `limits` 块写入；契约目前**没有**更新限额的管理端点，已存在调用方要调整只能由运维直接改库（`UPDATE caller_limits SET tasks_per_period = … WHERE caller_id = …`）。任务次数在每次准入时现读，改库后无需重启。
+
+**失败与结算口径**：预留失败即拒绝，Run 不启动；结算失败（提交结果未知）**不释放**——预留继续占额度、Run 照常执行，由管理面 `reconcile` 收口（见 §9）。同一 `run_id` 重放只扣一次。
+
+### 5.10 入口限流六项（`callers.ingress.*`，US-16 起 `serve` 必填）
+
+三类业务入口各有一对 `qps` / `burst`，**六项在服务启动前校验**（`cli.ValidateServeIngress`）：
+
+```text
+callers:
+  ingress:
+    run:    { qps: <N>, burst: <M> }   # Run / Chat / 会话写
+    ingest: { qps: <N>, burst: <M> }   # 上传与摄取触发
+    read:   { qps: <N>, burst: <M> }   # 历史 / 来源 / 列表等读端点
+```
+
+| 情形 | 行为 |
+| --- | --- |
+| 六项齐全且都 > 0 | 正常启动；预算按**调用方**分别计量，超预算返回 429 `CALLER_RATE_LIMITED` |
+| 任一键缺失 | **拒绝启动**，日志点名缺项（`服务启动缺少配置项: callers.ingress.run.qps, …`） |
+| 任一键 ≤ 0 | **拒绝启动**，日志点名非法项（`服务启动要求下列配置项大于零: …`） |
+| 无配置文件 / `callers` 段整体缺失 | **拒绝启动**（提示需要配置文件及入口限流项） |
+| 维护命令（`basalt status` / `db export` / `db import` / `db verify` / `db switch` / `secrets …`） | **不校验**这六项——旧配置与切换期实例仍能用维护命令 |
+
+**为什么必填而不是给缺省**：缺省值等于替部署者决定容量上限，而这个上限必须来自该实例自己的压测（D-30 尚未冻结）。因此**不预填任何数字**：少了就拒绝启动，把一个"静默限错"的问题变成一个当场可见的启动失败。
+
+**首次启动 / 升级动作**：从旧版本配置升级时，`serve` 会因为缺这六项直接起不来——这是预期的 fail-closed，不是回归。按本实例容量实测补齐三类值后重启即可；`basalt.yaml.example` 的 `callers` 段有同一段模板（样例**不预填数字**）。
+
+**排障**：先看启动日志点名的键，补上再重启。若六项都在仍出现 429 `CALLER_RATE_LIMITED`，那是**运行期预算耗尽**而不是配置缺失——看 `Retry-After`、确认调用方身份（管理 token 不进任何桶），再决定是调高 `qps` / `burst` 还是压调用方速率。不要把它和 `AUTH_RATE_LIMITED`（管理面认证失败限速）或 `TOO_MANY_RUNS`（实例并发准入）混为一谈，见 §2.1.3。
 
 ---
 
@@ -632,7 +921,7 @@ ls -l /etc/basalt/master.key    # 期望：600，属主为服务账户；路径�
 
 ### 6.2 `basalt secrets` 命令组
 
-四条子命令共用一条纪律：**不自动轮换**、**只回公开标识**（`key_id` 与指纹，绝不回密钥、密文或渠道地址）、**撤销不解密**。纯 env 部署可以完全跳过本节。
+六条子命令共用一条纪律：**不自动轮换**、**只回公开标识**（`key_id` 与指纹，绝不回密钥、密文或渠道地址）、**撤销不解密**。其中 `recover-record` 与 `adopt-legacy` 是**离线**命令（不装配运行期、零外呼），其余四条属重命令。纯 env 部署可以完全跳过本节。
 
 | 命令 | 作用 | 拒绝 / 失败条件 |
 | --- | --- | --- |
@@ -640,8 +929,10 @@ ls -l /etc/basalt/master.key    # 期望：600，属主为服务账户；路径�
 | `basalt secrets status` | 只读报告：是否就绪、`key_id`、指纹、托管依赖计数（模型连接 / 通知渠道各几个） | 未初始化只影响文案，**不是**命令失败——这是部署状态，不是故障 |
 | `basalt secrets verify` | 逐条校验当前 `active` 的托管凭据能否在当前主密钥下解密、目标绑定是否仍与当前定义一致；只回检查与失败计数，明细在 WARN 日志（不含材料） | 失败条数 **> 0** 即非零退出（脚本可判卷）；超过 0 时先查主密钥路径 / 权限 / `key_id`，再决定是否 `revoke-managed` |
 | `basalt secrets revoke-managed --confirm` | 清空全部托管凭据密文、推进撤销纪元、为每条写管理操作行；**不**读取主密钥——服务停止、主密钥丢失时的销毁性恢复 | 缺 `--confirm` 时**零调用零副作用**；执行后旧版本**永不复活**，只能重新录入新凭据版本 |
+| `basalt secrets recover-record --backup <dir> --expect-backup-sha256 <hex> --confirm` | 从**产于首次写记录之后**的可信备份恢复 `master_key` 记录（名册缺失时逐字复制备份名册）；离线、零外呼 | 状态不是恢复态（`state_not_recovery`）、已有记录（`record_already_exists`）、锚点对不上（`backup_unverified`）等一律零写入；流程见 §6.4 |
+| `basalt secrets adopt-legacy --workspace <copy> --backup <dir> --expect-backup-sha256 <hex> (--source <dir> XOR --attest-source-unchanged <ref>) --confirm` | 在**隔离副本**上完成 schema 3～5 → v6 的受控升级，写 1 条 `record_origin=attested_legacy` 记录；离线、零外呼 | 只接受 schema 3～5 且备份中无 `instance_secrets` 表的存量（v6 的记录丢失走 `recover-record`）；源端漂移 / 锚点不足 / 配置越界修改一律拒绝；流程见 §6.5 |
 
-典型时序：全新实例首次 `serve` 自动初始化（也可显式 `secrets init`）→ 管理台录入托管凭据 → 日常 `secrets status`；升级或怀疑密钥问题时 `secrets verify`；主密钥确实无法恢复时才 `secrets revoke-managed --confirm`，之后逐个资源重新录入。**不得**把 `revoke-managed` 当常规轮换手段。
+典型时序：全新实例首次 `serve` 自动初始化（也可显式 `secrets init`）→ 管理台录入托管凭据 → 日常 `secrets status`；升级或怀疑密钥问题时 `secrets verify`；记录丢失进恢复态时按 §6.4 / §6.5 从可信备份恢复，**不得**指望重新初始化；只有人工评审确认原密文不可恢复，才用 `secrets revoke-managed --confirm` 显式退役，之后逐个资源重新录入。**不得**把 `revoke-managed` 当常规轮换手段，也**不得**把"重新生成主密钥"当成修复。
 
 ### 6.3 一次性初始化导入（仓库外模板）
 
@@ -673,6 +964,87 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 
 前置：托管写入要求 `secrets.master_key_file` 已配置且主密钥可读（§6.1）；主密钥缺失时按 503 `CREDENTIAL_UNAVAILABLE` 失败，脚本不改用 env 兜底。**通知渠道**还要求**当前生效**的网络域名白名单含目标 host（飞书为 `open.feishu.cn`，§2.2 的同一张白名单）：不在白名单时创建 / 更新返回 400 并点名 host（演练实测），先到管理台「执行环境」补上（保存即生效，无需重启）再导入。导入完成后模板里的明文应删除或转入部署者的密钥保管处——脚本不会自动删文件。admin token **不得**贴进对话或工单，只经进程环境或该模板传递。
 
+### 6.4 恢复主密钥记录：`basalt secrets recover-record`（D-40）
+
+**适用**：库里有托管密文，但 `instance_secrets` 的 `master_key` 记录丢失（升级 / 崩溃 / 误删），`state=recovery_required`、`recovery_reason=unprovable_provenance`。命令**离线**执行：不装配运行期、不启 MCP、不发通知、不调模型，零外呼。
+
+```bash
+basalt secrets recover-record \
+  --workspace /opt/basalt/.basalt \
+  --backup /backup/us16-trusted \
+  --expect-backup-sha256 <带外记录的十六进制> \
+  --confirm
+```
+
+前置（全部成立才执行，任一不成立即拒绝且零写入）：
+
+1. `serve` 已停，命令持 `<ws>/basalt.lock`。不接受在线触发，也没有对应的 HTTP 端点。
+2. 当前状态**正好**是恢复态：无 `master_key` 记录，且 `credential_versions.ciphertext IS NOT NULL` 计数 > 0。`ready` / `uninitialized` 与其他原因码一律拒绝（`state_not_recovery`）；记录已存在时先报 `record_already_exists`——重跑按幂等拒绝，而不是被拦成状态不符。
+3. 备份**产于该实例首次成功写入记录之后**：备份库里有 `scope='master_key'` 行，且其 `operation_id` 能在备份库的 `management_operations` 找到对应的成功操作行。产记录之前的备份**不是**可信来源（`backup_record_missing`）——补写只能是凭空重建。
+4. 原密钥已持久化在 `secrets.master_key_file` 指向的绝对路径。命令只读装载，不复制、不生成。
+5. `--expect-backup-sha256` 来自备份时留存的**带外**记录（变更单 / 交接单 / 离线台账）。备份自带的哈希只证明内容一致、不是来源证明；缺失或对不上即 `backup_unverified`。
+
+`--backup` 按内容判定路线，**恰好**命中一条，否则 `backup_invalid`：
+
+| 路线 | 内容 | 约束 |
+| --- | --- | --- |
+| A 导出包 | `manifest.json` + 含 `instance_secrets` 行的 dump | 当前名册的 `instance_id` 必须等于 `manifest.source_instance_id`；**只在当前名册存在时可用**——manifest 没有名册文件，拿它拼 `instance.json` 属于重建 |
+| B 原生备份集 | 一致性备份的 `basalt.db` + 同一备份集的 `instance.json` | `PRAGMA integrity_check` 通过。**名册缺失时只有这条路线可用**——备份名册是被恢复身份的唯一来源（逐字复制，不做规范化） |
+
+校验顺序固定（失败保持恢复态、零写入；报告只给类别与计数，不输出密钥材料 / 明文 / 密文）：外部锚点 `backup_unverified` → 名册二选一 `backup_identity_mismatch` / `backup_roster_missing` / `backup_roster_invalid` → 当前无记录 `record_already_exists` → 备份记录恰好一条且可回溯 `backup_record_missing` / `backup_record_invalid` → 原密钥与记录一致 `key_record_mismatch` / `key_unavailable` → 当前全部密文可解且 AAD 六段一致 `ciphertext_undecryptable` / `aad_mismatch` → active 凭据的 `target_binding` 与当前已发布资源一致 `binding_mismatch` → 当前库是备份的延续 `ciphertext_mismatch` → 名册缺失时的 token 来源 `admin_token_source_missing` → 审计预写成功 `audit_prewrite_failed`。
+
+写入顺序：**先名册（仅在缺失时）、再记录**，同一个 `instance.secrets_recover` 审计操作；`detail_json` 记备份类型与哈希、名册是否恢复及其哈希、`key_id` / 指纹与分类计数。中断后重跑按"名册逐字相等 / 记录已存在"判定——**不得**删掉已写名册"重新开始"，也不得把这一步写成 `ready`。
+
+成功后：用同一配置重启，确认 `state=ready`、`secrets verify` 通过、代表性托管凭据可解且绑定不变；第二次启动零写入。
+
+**边界**：
+
+- 只覆盖**切换前**（SQLite 为权威存储）。切到 PostgreSQL 之后没有本命令的恢复路径——受影响实例必须在 `db switch` 之前完成恢复或明确退役。
+- 只有产记录前的备份、或没有任何备份 → 实例**保持恢复态**，这就是命令的终态。人工处置只有两条：继续找产记录后的备份（同实例库备份 / 导出包 / 迁移前快照）重跑；或经人工评审显式 `revoke-managed --confirm`（§6.2）。后者是**破坏性操作**，**不是**恢复。
+- 回退旧二进制会重新启用自动补写——**不得**用回退规避这条裁决。
+- 没有 `--force` / `--overwrite` / `--new-key` 一类开关，不要找；也**不得**改写或删除密文、生成替代密钥来"修复"。
+
+### 6.5 schema 3～5 存量的受控升级：`secrets adopt-legacy` 与 `instance adopt`
+
+旧版（schema 3～5）**没有**安全的离线记录准备方式：`secrets` 是重命令，`serve` 会迁移、`Ensure` 会自动补写记录、启动时应用全部已发布 MCP。因此识别一律用**只读 SQL + 文件核对**，**不得**用旧 `serve` / `secrets status` / `secrets init` 去"试出"记录。
+
+**第 1 步：整实例备份 + 清单 + 外部锚点**。停 `serve`，把 `basalt.db`（连同 `-wal` / `-shm`）、`basalt.yaml`、整个工作区与密钥副本打成一套；目录里生成 `backup.json`：schema 版本、库 / WAL / SHM / 配置 / 名册的 SHA-256、`key_id` / 指纹、密文计数、`records_absent=true`、责任人与时间。把 `backup.json` 的字节级 SHA-256 记到**带外**（变更单 / 交接单 / 离线台账）——备份内的审计行与自哈希**不能**替代外部锚点。清单同时记 `source_config_sha256`（源端基线，只用于漂移检测）与 `backup_config_sha256`（两者必须相等）。
+
+**第 2 步：复制到另一路径的隔离副本**，再跑：
+
+```bash
+basalt secrets adopt-legacy \
+  --workspace <copy-root>/.basalt \
+  --backup <backup-dir> \
+  --expect-backup-sha256 <带外锚点> \
+  --source /opt/basalt/.basalt \
+  --confirm
+```
+
+源端本地不可读时用 `--attest-source-unchanged <见证编号>` 替代 `--source`（二选一）。命令只对副本操作：校验锚点 / 清单 / 副本一致 / 原密钥与全部密文 / 源端未漂移 / 名册，然后把副本迁移到 v6 并写 **1 条** `record_origin=attested_legacy` 记录。它**不**装配运行期，**不**写名册、**不**改配置、**不**生成或复制主密钥、**不**改写或删除密文；没有 `--force` / `--new-key` / `--skip-*`。
+
+- 密钥路径在副本主机不可达时，用 `--master-key-file` 受控读取：K1 = 备份内副本（哈希等于清单）；K2 = 备份外副本（必须同时给 `--expect-key-sha256` 锚点）。
+- 副本初始配置哈希与清单不符 → `backup_invalid`。
+- 原密钥绝对路径确实需要改时，**只能**在 `adopt-legacy` 成功之后、`instance adopt` 之前由部署者改副本同级的 `basalt.yaml`：在变更单里记原 / 目标哈希、原因、操作者、时间与审批编号，再以 `--config-change-ref` 运行 `instance adopt`。命令不代写配置；它重算 `config_without_key_path_sha256` 证明除密钥路径外没动别的键，越界修改即使有引用也以 `config_change_out_of_scope` 拒绝。改过的副本**不得**再称"与备份逐字一致"，`target_config_sha256` 也不得覆盖 `source_config_sha256`。
+- 源端在复制之后又变过 → `source_changed`：丢弃副本、重新备份。**不得**在部分迁移的副本上重试——从备份重新复制一份新副本。
+
+**第 3 步：无名册副本先补名册**。
+
+```bash
+basalt instance adopt --workspace <copy-root>/.basalt
+```
+
+离线执行、零外呼，**只写** `instance.json`：不写 `instance_secrets`、不铸密钥、不改库。名册就位后 `db export` / `db verify --handoff` / `db switch` 才可用（无名册时导出直接拒绝）。需要调整配置时加 `--config-change-ref`，语义同上。有册实例这一步只校验、不改写。
+
+**第 4 步：切换**。切换前**必须**完成 `instance adopt` 并核对：名册存在、`instance_id` 是新值、`db export` 不再报身份缺失、对导出的交接包跑 `db verify --handoff` 通过、当前配置哈希等于审计里的 `target_config_sha256`。然后把原工作区移到 `<ws>.pre-us16-<时间戳>` 留作回退、副本就位，按 §5.6 第 7～9 步切换，并在验证窗口内确认 `ready`。
+
+**失败与边界**：
+
+- 失败时按 §5.7 的三维判据决定能否回退；任一维脏或无法证明就停自动回退。原实例与备份保持可用。
+- **不得**就地迁移、**不得**在原库上运行、**不得**在部分迁移的副本上重试。
+- 无可用备份 / 原密钥丢失 → 只能保持恢复态，或转 env-only，或重建实例。备份 / 来源 / 锚点不足同样可能过不了这道流程，需进一步核查——**不得**因"能解密"就判定可启动。
+- `revoke-managed` 是破坏性操作、**不是**恢复；`instance.secrets_retire`（D-41 候选）**未批准、未实现**，本手册不提供该入口，也不要按任何资料臆造一个。
+
 ## 7. 每日 Demo 与隔离演练
 
 五套每日场景 D1–D5 属于维护者发布验收流程（US-14 交付的 `examples/daily/` 素材）；场景定义见需求文档 §2.5 与技术方案 §8.1（维护者内部正文，不在公开站点）。本节只规定演练环境与凭证边界；环境未准备完时不能把规划命令或替身读数记成生产验证。
@@ -685,7 +1057,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 
 ### 7.1 示例 / 模板依赖与出网边界
 
-`examples/` 下的五个 Demo 与八个模板是**可复制素材**，它们需要什么不等于 Basalt 需要什么（§1.1 / §1.2 口径不变）。复制某个素材前按本表核对：
+`examples/` 下的五个 Demo 与八个模板是**可复制素材**，它们需要什么不等于 Basalt 需要什么（§1.1 / §1.3 口径不变）。复制某个素材前按本表核对：
 
 | 素材 | 解释器 / 可执行 | 外部出网（按配置发送） | 凭据 |
 | --- | --- | --- | --- |
@@ -701,6 +1073,57 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 - 共享只读 MCP server `examples/shared/mcp/docs-readonly` 只对 `-root` 指定目录开放读取，拒绝越界 / 绝对路径 / 软链接，无写工具；它需要 Go 工具链**构建**，运行时是静态二进制、不再需要 Go。
 - 样例 SQLite 库由 `examples/shared/scripts/make_sample_db.py` 生成，不提交 `.db` 二进制；跨机器字节一致性不承诺，引用自己生成的库哈希。
 
+### 7.2 模板更新：仓库内置素材与实例内 Demo 数据的边界
+
+`examples/daily/**`（以及 `examples/shared/` 里被 Demo 引用的共享件）是**仓库内置模板**，随发布走版本控制；`basalt demo install` 只是把模板**复制**成实例数据。复制之后，实例工作区里的那一份就不再是模板：
+
+| 位置 | 属于什么 | 谁改它 | 更新时能不能被覆盖 |
+| --- | --- | --- | --- |
+| 仓库 `examples/daily/<demo>/**` | 仓库内置模板 | 维护者随发布更新 | 不涉及实例 |
+| `<workdir>/.basalt/agents/<demo>/**` | **实例数据**（含模型、绑定、正文） | 用户在管理台或编辑器里改 | **不得**静默覆盖 |
+| `<workdir>/.basalt/agents/<demo>/runs/`、`fixtures/`、`scripts/` | **实例数据**（运行产物与用户脚本） | 运行期与用户产生 | **不得**删除 |
+| `<workdir>/.basalt/demos/install.json` | 安装清单（实例记录） | 安装器写 | 由安装器维护 |
+
+**`--force` 不是更新路径**：它把选中的 Agent 目录**整个删掉再重建**（连 `runs/`、`fixtures/`、`scripts/` 和你改过的正文一起），命令自身的帮助文案就是这么写的。它只适合"我确认这个 Demo 里没有要留的东西"，用它升级等于静默覆盖用户修改。
+
+#### 四步更新（其他开发者可照做）
+
+1. **备份**——把实例目录整棵复制到**仓库外**的位置：
+
+   ```bash
+   cp -a <workdir>/.basalt/agents/github-radar /backup/2026-11-01-github-radar
+   ```
+
+   备份**不得**进仓库：里面可能有实例路径、运行结果与用户数据。要回填时把路径反过来复制即可（见第 4 步）。
+
+2. **冲突检测**——对同一个 Demo 跑试运行，只看三态，`--dry-run` **不写任何文件**：
+
+   ```bash
+   basalt demo install --dry-run --demo github-radar
+   ```
+
+   - `新建`：实例里还没有这个 Demo，直接正式安装即可；
+   - `一致`：已装目录与模板逐文件相同（比较时跳过 `skills/`，并把模板里的 `{{BASALT_PYTHON}}` 按本机实际解释器归一），没有要合并的；
+   - `已修改：<文件列表>`：这些文件与模板不同，列表还包含"模板有、实例缺"的文件。**正式安装会保留原目录**——三态只报告差异，不替你决定。
+
+3. **人工合并**——按第 2 步列出的文件名，把模板的改动**逐文件**搬进实例目录（模板内容看仓库的 `examples/daily/<demo>/`）。合并后的正文是"模板的变化 + 你的本地修改"两者并集，不是任何一份的副本。**不得**用 `--force` 代替这一步。
+
+4. **校验与回退**——再跑一次第 2 步的命令，确认剩下的差异都是你有意保留的；合并出错就从第 1 步的备份回填：
+
+   ```bash
+   rm -rf <workdir>/.basalt/agents/github-radar
+   cp -a /backup/2026-11-01-github-radar <workdir>/.basalt/agents/github-radar
+   ```
+
+#### 为什么不提供自动更新脚本（也不入库）
+
+模板与实例正文之间的差异是**语义差异**——用户可能改阈值、换模型、加步骤，机器无从判断哪一边该留下。自动合并可行的手段只有"整目录覆盖"，而那正是本节禁止的事。把更新脚本放进仓库还会把实例路径写进版本控制。所以仓库里只放模板，以及 `--dry-run` 这个**只读**的差异判据；真正的合并由人做。
+
+#### 两个已知限制（照实记录，不要绕）
+
+- **带 `--demo` 的部分安装会重写清单**：`install.json` 由本次选择重写，未被选中的 Demo 记录会从清单里消失（它们**目录还在**，只是清单不再列）。因此更新流程全程只用 `--dry-run`；要刷新清单就跑不带 `--demo` 的全量安装——前提是五个 Demo 的差异都已按上面的四步处理完，否则会触发第 3 步该避免的覆盖。
+- **共享件没有"保持原样"以外的合并语义**：`<workdir>/.basalt/demos/` 下的样例库、DBHub 只读配置与 `docs-readonly` 源码由安装器按清单重建，不是用户编辑对象；它们被 `--force` 重建时不会碰 `agents/` 下你没点名的 Demo。
+
 ## 8. 长期运行与发布前未决项
 
 下列策略必须在首次发布前明确并有实测读数；本次文档补充不代表已经实现自动清理、告警或资源限额。未决项由 US-14 发布清单承接，不能以默认值未说明的方式放行。
@@ -708,7 +1131,7 @@ powershell -NoProfile -File D:\code\basalt\scripts\import-credentials.ps1 `
 | 面 | 发布前需明确 | 需留证据 |
 | --- | --- | --- |
 | 数据保留 | 会话、三张审计表、任务执行历史、记忆表（`memory_entries`）、配置快照（`config_snapshots`）、文件记忆、日志和备份的保留期 / 大小 / 访问主体 | 正常增长、达到边界、清理后关联和消息组仍完整 |
-| 磁盘与 SQLite | WAL 增长、备份空间、磁盘满 / 只读 / 损坏时的拒绝行为；告警由谁执行 | 审计预写失败不发生外部动作；错误可读；恢复后可继续 |
+| 磁盘与 PostgreSQL | WAL / 表空间增长、`pg_dump` 备份空间、磁盘满 / 只读 / 连接耗尽时的拒绝行为；告警由谁执行 | 审计预写失败不发生外部动作；错误可读；恢复后可继续 |
 | 外部服务 | Provider / MCP / 通知的超时、限流、凭证轮换与出网边界 | 失败不泄露正文或凭证；取消和停机后资源可回收 |
 | 副作用 | HTTP 写与通知可能已成功但回执丢失；人工处理与幂等责任 | 不把 unknown 当作可安全重放；演练能定位对应 run_id |
 | 制品与平台 | 二进制与前端资源、平台 / 架构、版本、commit 和 sha256 | 用候选制品走真实控制台、进程树取消、锁、升级 / 恢复；制品变更后重验 |

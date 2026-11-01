@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 )
@@ -141,6 +142,16 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	// D-01（US-16 / T125）：test-integration 与 cover 的判据是「连真实 PostgreSQL 跑」，
+	// 缺 BASALT_TEST_PG_DSN 即失败。起跑前给出单行可读错误与排查路径——否则提示会被
+	// 埋在逐 check 日志里，且要等整套测试跑完才看得到。新增 PG 依赖 check 时同步本表。
+	// D-01: checks that need a real PostgreSQL fail when the DSN is missing; fail before
+	// the run so the hint is not buried in per-check logs.
+	if missingPostgresDSN(checks) {
+		fmt.Fprintln(stderr, "缺少 BASALT_TEST_PG_DSN：所选检查含 PostgreSQL 依赖目标（test-integration / test-pg / cover / behavior / injection），按 D-01 缺省即失败、不跳过。")
+		fmt.Fprintln(stderr, "排查路径：本地先启动 dev-env 测试库并经 dev-env/scripts/with-postgres.sh 运行（环境准备见 docs/DevelopmentLoop.md §10）；CI 由 postgres service 容器注入 DSN（.github/workflows/ci.yml）。")
+		return 2
+	}
 	scope := *profile
 	if *stageOnly {
 		scope = "stage-only"
@@ -184,6 +195,35 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	return code
+}
+
+// postgresChecks 是判据依赖真实 PostgreSQL 的 check ID。清单来自 harness/acceptance.json，
+// 与本文件的预检一一对应：新增同类 check 时两处一起改，漏改不会变成假绿——底层测试与
+// check-coverage.sh 仍各自 fail-closed。
+// postgresChecks lists the checks whose verdict needs a real PostgreSQL; a missed
+// update cannot turn green because the test helper and check-coverage.sh fail closed.
+//
+// `behavior` / `injection`（T014 起）：评测运行器为每个用例建隔离 schema，运行期
+// 只连 PostgreSQL（D-01）——缺 DSN 时用例会逐条失败而不是判绿，故并入同一张预检表。
+// The eval targets now isolate every case in a fresh PostgreSQL schema, so they need
+// the DSN too; without it, a readable preflight error beats per-case failures.
+//
+// `test-pg`（T136）：包范围是 `test-integration` 的子集，判据面不是——后者跑全仓
+// 带 `-tags=integration` 的用例但不开竞态检测，前者只跑存储引擎包却开 `-race`。
+// `make test` 的 `-race` 不带 integration 标签，引擎用例因此也不在其中。两份门禁
+// 都保留：引擎层的竞态面只由 `test-pg` 覆盖，删掉它不会让别的目标变红，只会让这条
+// 判据静默消失。
+// test-pg covers a subset of packages but is the only race-detector pass over the
+// storage engine; dropping it would silently remove that face, not turn anything red.
+var postgresChecks = []string{"test-integration", "test-pg", "cover", "behavior", "injection"}
+
+// missingPostgresDSN 判断所选 check 是否含 PG 依赖而 DSN 未设置。
+// It reports whether a PostgreSQL-dependent check was selected without a DSN.
+func missingPostgresDSN(checks []check) bool {
+	if os.Getenv("BASALT_TEST_PG_DSN") != "" {
+		return false
+	}
+	return slices.ContainsFunc(checks, func(c check) bool { return slices.Contains(postgresChecks, c.ID) })
 }
 
 func codeOrError(code int, err error) int {

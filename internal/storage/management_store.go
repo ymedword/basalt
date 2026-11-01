@@ -82,7 +82,7 @@ func (s *ManagementStore) BeginOperation(ctx context.Context, rec core.Operation
 		rec.OperationID, rec.Action, rec.TargetKind, rec.TargetID, rec.ActorSubject,
 		rec.AuthMethod, rec.Source, nullIfEmpty(rec.RequestHash),
 		nullIfZeroInt64(rec.RequestedVersionID), nullIfEmpty(rec.ExpectedETag),
-		detail, createdAt.UnixMilli())
+		detailTextParam(detail), createdAt.UnixMilli())
 	if err != nil {
 		return fmt.Errorf("预写管理操作 %s: %w", rec.OperationID, err)
 	}
@@ -141,7 +141,7 @@ func finishOperationTx(ctx context.Context, tx *sql.Tx, operationID string, stat
 		        detail_json = COALESCE(?, detail_json), finished_at = ?
 		  WHERE operation_id = ? AND status = 'pending'`,
 		string(status), nullIfEmpty(resultCode),
-		nullIfEmpty(truncateUTF8(errorMessage, maxErrorMessageBytes)), detailJSON,
+		nullIfEmpty(truncateUTF8(errorMessage, maxErrorMessageBytes)), detailTextParam(detailJSON),
 		now.UnixMilli(), operationID)
 	if err != nil {
 		return fmt.Errorf("回填管理操作 %s: %w", operationID, err)
@@ -197,7 +197,7 @@ func (s *ManagementStore) RecoverOperation(ctx context.Context, operationID stri
 		    SET status = ?, detail_json = COALESCE(?, detail_json), finished_at = ?,
 		        recovered_at = ?, verification = ?
 		  WHERE operation_id = ? AND status = 'pending'`,
-		string(status), detail, now.UnixMilli(), now.UnixMilli(), verification, operationID)
+		string(status), detailTextParam(detail), now.UnixMilli(), now.UnixMilli(), verification, operationID)
 	if err != nil {
 		return fmt.Errorf("恢复管理操作 %s: %w", operationID, err)
 	}
@@ -386,6 +386,20 @@ func scanOperation(row interface{ Scan(...any) error }) (core.OperationRecord, e
 	}
 	rec.Verification = verification.String
 	return rec, nil
+}
+
+// detailTextParam 把 detail_json 的字节投影按 **TEXT** 绑定：数据库驱动把 `[]byte`
+// 一律当 BLOB 存，而 DDL 声明的是 TEXT——BLOB 存储类本身读得出来，却会让迁移导出
+// 以「实际存储类 b 与声明的 s 不符」**拒绝**整包（T078 迁移演练实测：`instance adopt`
+// 写下的审计行）。nil 原样保留：`COALESCE(?, detail_json)` 只在拿到 SQL NULL 时保留
+// 预写投影，把 nil 变成 `""` 会写进空串。
+// detailTextParam binds the detail_json projection as TEXT; the driver would store
+// []byte as BLOB, and the export refuses a storage class that disagrees with the DDL.
+func detailTextParam(raw []byte) any {
+	if raw == nil {
+		return nil
+	}
+	return string(raw)
 }
 
 // normalizeDetailJSON 统一 detail_json 的持久形态：空输入存 `{}`（不存 NULL，schema

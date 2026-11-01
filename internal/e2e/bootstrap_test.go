@@ -76,16 +76,41 @@ func testBootstrapInitIdempotent(t *testing.T) {
 	}
 }
 
-// testBootstrapStatusNoConfig：无配置文件时 `status` 仍 exit 0，且明示「未发现配置」。
-// 判据（US-1 §6 Demo ③）：库、schema 版本、33 张表就绪，汇总全部通过。
+// testBootstrapStatusNoConfig：无配置文件时 `status` 仍出完整诊断，逐节如实报告。
+// 判据（US-1 §6 Demo ③，按 US-16 的存储切换重述）：节 2 报「未发现配置」并点名路径、
+// **不**计失败；节 3 因没有 `database.dsn` 计失败——运行期后端已是外部 PostgreSQL，
+// 纯工作区诊断不能声称存储就绪（与 `internal/cli/status_test.go` 的
+// `TestStatus_NoConfigFailsStorageSection` 同一口径）；退出码 1、汇总点名「存储」。
+//
+// **判据面变更（US-16 / e2e 迁移，2026-10-29）**：原断言是 exit 0 +
+// 「schema v6」「33 张表」「汇总：全部通过」——那是 SQLite 运行期时代的读数。
+// 库文件与表清点现在属 **init 产出的源谱系库**，由 `init_idempotent`（库文件存在 +
+// 「已存在，零写（schema v6）」）与 `TestV3E2E_MigrateAdmitNotify` 的
+// `requireFreshSchema`（v6 / 33 表）继续判；「汇总：全部通过」的验收点不放空——
+// 本节紧接着补上配置齐备后的就绪路径，逐字断言它。
+// testBootstrapStatusNoConfig keeps the no-config scenario under the PG backend and
+// adds the ready path so "汇总：全部通过" stays inside the judged surface.
 func testBootstrapStatusNoConfig(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
 
 	res := h.run(t, nil, "status")
-	requireExit(t, res, 0, "status 无配置")
-	for _, want := range []string{"未发现配置", "schema v6", "33 张表", "汇总：全部通过"} {
+	requireExit(t, res, 1, "status 无配置")
+	for _, want := range []string{"未发现配置", "未配置 database.dsn", "汇总：1 节未通过（存储）"} {
 		requireContains(t, res.Stdout, want, "status 无配置")
+	}
+
+	// 就绪路径：配置里只写 DSN 占位（真值经进程环境注入），先跑运维的第二步
+	// `db migrate` 建库（`status` 只校验、不迁移，缺库时它自己的提示就是这条命令），
+	// 三节随即全部通过。
+	// The ready path: DSN placeholder, then the operator's second step (db migrate), and
+	// every section turns green because status validates but never migrates.
+	h.writeConfig(t, "")
+	requireExit(t, h.run(t, fixtureEnv(), "db", "migrate"), 0, "db migrate")
+	ready := h.run(t, fixtureEnv(), "status")
+	requireExit(t, ready, 0, "status 有配置")
+	for _, want := range []string{"存储：就绪（PostgreSQL", "汇总：全部通过"} {
+		requireContains(t, ready.Stdout, want, "status 有配置")
 	}
 }
 
@@ -225,7 +250,7 @@ func leakedIn(text string) bool {
 
 // testBootstrapAssembly：US-1 / US-2 的装配确认（人工走查改为机器判据）。
 //
-//  1. 审计 SQL 只出现在 `internal/storage/`（全局不变量 3）；
+//  1. **产品代码**里的审计 SQL 只出现在 `internal/storage/`（全局不变量 3）；
 //  2. `internal/core` 不依赖任何非标准库包（`go list -deps`）；
 //  3. provider 映射由配置数组逐条构建，无「取第一个 / 遍历映射表挑一个」形态；
 //  4. `--help` 可用（US-4 §6.1 第 7 项的装配确认面）。
@@ -235,6 +260,16 @@ func testBootstrapAssembly(t *testing.T) {
 	// ① 审计 SQL 不外溢。先确认判定面本身有效（至少命中一处），再核对归属。
 	// 谓词按「动词 + 表名」两段拼接：本文件自身也躺在 internal/ 下，若源码里出现
 	// 连续字面量，扫描会命中自己（自匹配假红）。
+	//
+	// **判据面变更（US-16 / e2e 迁移，2026-10-29）**：扫描面从 `internal/**/*.go`
+	// 收窄为**产品代码**（跳过 `*_test.go`）。不变量的意图是"产品的审计写入只有一个
+	// 归属地"，而测试夹具要**造存量库**（`internal/dbmigrate` 的 export / rollback /
+	// example 三个测试直接 INSERT 审计表来搭源库与回放现场）——那是夹具数据，不是第二条
+	// 审计写入路径，把它判红只会逼人给测试加豁免注释。产品侧不受影响：
+	// `internal/dbmigrate` 的生产代码按表名动态拼 `INSERT INTO "<table>"`，不含任何
+	// 审计表字面量，真正落审计行的产品代码仍只在 `internal/storage/`。
+	// The scan now judges product code only: test fixtures legitimately INSERT audit rows
+	// to build legacy source databases, while shipping code still writes them in one place.
 	// The needles are assembled from two parts so this file cannot match itself.
 	auditSQL := []struct{ verb, table string }{
 		{"INTO ", "llm_calls"},
@@ -247,7 +282,7 @@ func testBootstrapAssembly(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || !strings.HasSuffix(path, ".go") {
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		data, readErr := os.ReadFile(path)
@@ -330,10 +365,13 @@ func testBootstrapProviderUnreachableAudit(t *testing.T) {
 		t.Fatalf("不可达端点应使 chat 非零退出\n%s%s", res.Stdout, res.Stderr)
 	}
 
-	db := openDB(t, h.dbPath())
+	db := h.openDB(t)
 	rows := queryRows(t, db, `SELECT status, error_kind FROM llm_calls ORDER BY id DESC LIMIT 1`)
 	if len(rows) != 1 {
-		t.Fatalf("llm_calls 应有 1 行终态审计，实际 %d 行", len(rows))
+		// 零行时把子进程两路输出贴出来：数据库面为空既可能是"没走到调用"，也可能是
+		// 装配在更早的环节就失败了——不贴输出只能看到一个数字。
+		t.Fatalf("llm_calls 应有 1 行终态审计，实际 %d 行\nstdout:\n%s\nstderr:\n%s",
+			len(rows), h.redact(res.Stdout), h.redact(res.Stderr))
 	}
 	status, _ := rows[0]["status"].(string)
 	if status != "failed" {
