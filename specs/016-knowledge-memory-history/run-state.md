@@ -8426,3 +8426,46 @@ US-16 保持**未收口**；`main` 未动。
 
 - review ②：用户 2026-11-01 口头确认「人工自查通过，可以合入了」。
 - US-16 收口、提交、推送、合回 `main`：见 R172。
+
+## R172 · US-16 收口与合入（2026-11-01）
+
+### ·1 提交
+
+- 提交 `ce15606` `fix(us16): close review round two on memory scope, migration readings and run origin`
+  — 11 个 tracked 文件，`+280 / −13`。
+- 提交树私有路径核对：`git ls-tree -r --name-only HEAD | grep -E "^(docs/interview/|career/|CLAUDE.local.md|dev-env/)"` **零命中**；
+  树内 1739 个文件。
+- 敏感内容扫描（staged diff 上查 `sk-` / `api_key=` / `password=` / `postgres://user:pass@` / `BASALT_TEST_PG_DSN=`）：**零命中**。
+
+### ·2 合入
+
+| 步骤 | 读数 |
+| --- | --- |
+| 推送 US 分支 | `af6cfc4..ce15606  016-knowledge-memory-history -> 016-knowledge-memory-history` |
+| 合入可行性 | `git merge-base --is-ancestor origin/main HEAD` → **FF 可行**（`main` = `origin/main` = `60dd2c5`） |
+| 合入方式 | `git merge --ff-only ce15606` —— 快进，**无合并提交**，历史保持线性 |
+| 推送 `main` | `60dd2c5..ce15606  main -> main`；推送后 `main` == `origin/main` == `ce15606` |
+
+### ·3 收口判据（四态）
+
+| 项 | 状态 | 依据 |
+| --- | --- | --- |
+| 全量验收 90/90 | **通过** | `accept-20261101T071309.672953532`，基线 `b57835a` |
+| 外部真实服务层 7/7 | **通过** | `accept-20261101T083831.206285100`，候选二进制 `f124e0d8…` |
+| 合并后代码门禁复跑 | **通过** | `internal/core` / `internal/builtin` / `internal/memory` / `internal/app` 全绿（R171 ·3） |
+| 本轮改动的最终树全量验收 | **未验证** | 用户裁决「直接合入」，未重跑 90 项；差异只有两份无解析者的契约文档（R171 ·4） |
+| 首启配置路径（本实例） | **未验证** | 本实例走 `BASALT_ADMIN_TOKEN` token 姿态，见 R170 ·5 |
+| 远端 CI（`ce15606`） | **待观察** | 推送后触发；`b57835a` 的 CI 修复在本轮之前从未在远端跑过 |
+
+### ·4 演示实例
+
+- 端口 8080 上的实例未受本次提交影响（进程 pid 37372，二进制 `f124e0d8…` 未重建）；
+  `GET /console/` 200，可供用户继续走查。
+- 实例数据、`.setup/` 与凭据均未触碰。
+
+### ·5 结论
+
+- **US-16 收口**：review ①（AI 代行，2026-10-27）、review ②（用户，2026-11-01「人工自查通过，可以合入了」）均已通过；
+  代码、契约、需求、技术方案与本文件同步。
+- 三项**未验证**随收口保留在本文件：最终树全量验收、首启配置路径、远端 CI。
+  其中前两项的依据见本轮裁决记录，**不得**在后续表述成已通过。
