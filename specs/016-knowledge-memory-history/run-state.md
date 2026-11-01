@@ -8118,3 +8118,142 @@ R165 ·3 写"验收途中源码被改"。核对证据后**该定性不成立**�
 ### ·5 下一步
 
 真凭据有限验证 → 汇总 D-1～D-7 的改动点 / 证据 / 剩余限制 → review ②。US-16 保持**未收口**。
+
+## R167 · US-16 提交并推送分支（2026-11-01）
+
+### ·1 本轮读数（四态）
+
+| 项 | 读数 |
+| --- | --- |
+| 提交 | `af6cfc4f3d4d1ac7bdf9eb32b3d510b9e2159cd1`（`feat: deliver us16 knowledge, semantic memory and history`） |
+| 规模 | 720 文件、+181036 / −2686；新增 459 / 修改 259 / 删除 1 / 重命名 1 |
+| 分支 | `016-knowledge-memory-history`，`-u` 推送成功；本地与远端 SHA 一致（均为 `af6cfc4`） |
+| `main` | 未动，仍为 `60dd2c5` |
+| 工作区 | 提交后干净 |
+
+### ·2 提交前的边界复核
+
+- 暂存集与提交树均不含 `dev-env/`、`career/`、`docs/interview/`、`CLAUDE.local.md`、`.clixml`、
+  `node_modules/`、`.backups/`——两轮 grep 均无输出。
+- 唯一删除项是 console 旧 bundle `index-BEefYxRc.js`，唯一重命名是 CSS bundle，
+  与 `integrity.json` 更新同批，属构建产物轮换。
+- 验收后（本地 14:05 起）除本文件外无源码改动，故提交的代码候选与受测树一致；
+  指纹 `7067997a…` 与提交树的差异仅为本记录本身（记录必然产生于验收之后）。
+
+### ·3 未验证清单更新
+
+- 本行不翻转任何未验证项；真实凭据有限验证仍为**未验证**。
+- `main` 合并与 review ② 均未发生——按用户第 4 条，必验项未完成前 US-16 保持**未收口**。
+
+### ·4 下一步
+
+真凭据有限验证 → 汇总 D-1～D-7 → review ②。
+
+## R168 · 真实凭据的有限验证：`us16-real` 外部层 7/7 通过（2026-11-01）
+
+### ·1 执行方式（授权与边界）
+
+- 命令：`sh scripts/check-acceptance.sh --stage harness/stages/us16-real.json --stage-only
+  --authorization-ref user-2026-10-27-us16-external --authorization-scope <模块卡 §4.6 原文>`
+- 环境经 `dev-env/scripts/Enter-DevEnv.ps1 -WithBailian` 注入 DSN 与 embedding 交接变量；
+  DeepSeek / 飞书 / GitHub 三个凭据从 `dev-env/secrets/*.clixml` 经 DPAPI 解到**进程环境**，
+  全程只打印变量名与长度，未输出任何值。
+- 被测二进制：`bin/basalt.exe`，由 `af6cfc4` 以 `CGO_ENABLED=0 -trimpath -ldflags "-s -w"` 重建，
+  sha256 `dfe979086fa7cd6ffe510a1517c176750597482823656970f4f104047799b745`，
+  `--version` 回显 `af6cfc4`。
+
+### ·2 本轮读数（四态）
+
+| 项 | 读数 |
+| --- | --- |
+| 报告 | `.loop/runs/accept-20261101T063107.781690300/report.json` |
+| 结果 | `status=passed`、`exit_code=0`、`duration_ms=22292` |
+| 绑定 | `base_commit=af6cfc4`、`tested_binary_sha256=dfe97908…`、源码指纹 `64400c69…`（`dirty=true`——差异是 R167 本文件的未提交改动，代码面未变） |
+| 用例 | 7/7 通过、0 跳过、0 失败 |
+
+逐用例实际发生的调用（日志原文摘录）：
+
+| 用例 | 读数 |
+| --- | --- |
+| `EmbeddingIngest` | `model=text-embedding-v4 dimensions=512 chunks=1 embedding_calls=1` |
+| `EmbeddingQuery` | 命中刚摄取的 `doc_VC6PH3… version=kver_DEK909…` |
+| `DeepSeekChat` | `llm_calls=1`；`run=web-1793514674343-hng42z`；配额预留 `run_reservations=1 chat_reservations=1` |
+| `IndustryBriefSearch` | `llm_calls=4`（累计 5）；`results=5 usable=5 fetch_attempts=1 fetch_bytes=18750` |
+| `GitHubMcpReadOnly` | `llm_calls=2`（累计 7）；`component=github-mcp-server.exe tool=list_commits repo=ymedword/basalt head=60dd2c5 tools=27` |
+| `FeishuNotify` | `target=https://open.feishu.cn deliveries=1` |
+| `FiveAgentsInventory` | 五个 Demo 的 `defined / lifecycle / deps / creds / config / assets` 均 `true`；`business=未验证`（该用例只做盘点，业务链路由 R1–R5 各自用例承担） |
+
+实际用量（对照授权 scope）：embedding 2 次、DeepSeek 7 次 LLM 调用（1 会话 / 4 检索 / 2 只读工具）、
+飞书 1 条消息、GitHub 只读 1 个工具调用；未超出 "≤2 chats / ≤2 messages / 只读" 的范围。
+
+### ·3 未验证清单更新（只翻转本行）
+
+- 真实凭据的有限验证：**未验证 → 已验证**（2026-11-01，证据见 ·2）。
+  口径限定：验证的是"凭据有效且外部链路可用"，不代表五个 Demo 的业务产出质量已被判定；
+  `FiveAgentsInventory` 自身对五项 Demo 的 `business` 明确记为**未验证**。
+
+### ·4 仍未验证（不因本节通过）
+
+- 跨文档去重端到端链路；知识库「内容变化 → 新建版本行」与「文档软删后重新摄取」的真实服务演练；
+  T008a–d 实验读数与 T008c 迁移规模上限（裁决权仍在用户）。
+
+### ·5 下一步（R168）
+
+汇总 D-1～D-7 的改动点 / 证据 / 剩余限制 / 契约与判据面变更 → 提交 review ②。US-16 保持**未收口**。
+
+## R169 · GitHub CI 失败诊断与修复：`test` job 未装扩展（2026-11-01）
+
+### ·1 现象与范围
+
+- 分支 `016-knowledge-memory-history` 推送后 CI run `41280964346` 判红；**只有 `test` job 失败**，
+  `postgres` / `console` / `build` / `website` 四个 job 全绿。
+- `test` job 内部逐目标（报告原文）：`fmt` / `lint` / `sec` / `test` / `build` / `eval-build` **通过**；
+  `test-integration`（exit=1）、`test-pg`（exit=1）、`cover`（exit=2）、`behavior`（exit=1）、
+  `injection`（exit=1）**失败**——恰好是 `postgresChecks` 的五个依赖库目标，无一例外。
+
+### ·2 根因（已验证，非推测）
+
+- 逐份日志的首错行完全同构：`读取扩展 vector 所在 schema: sql: no rows in result set`
+  （`test-integration.log` / `cover.log` / `test-pg.log` 的 `agent_admin_test.go:1919` 等；
+  `behavior.log` 的 `运行错误：准备隔离库失败：…`）。
+- 该文案出自 `internal/storage/postgres/pgtemp/pgtemp.go:100-108`：`New` 在
+  `for _, ext := range []string{"vector", "pg_trgm"}` 里调 `extensionSchema` 查 `pg_extension`，
+  查不到即 fail-closed 并回收刚建的 schema。
+- `evals` 的 `TestMainRun_IsolatesResults`（`evals/main_integration_test.go:23`，"运行器失败；stderr="）
+  是**同一根因**：它走真实装配跑评测用例，用例的准备阶段同样经 `pgtemp.New`。
+- 成因：`test` job 的 `pgvector/pgvector:0.8.7-pg17` service 只提供**扩展文件**，`CREATE EXTENSION`
+  从未执行；`postgres` job 有该步骤（`Assert engine version` 段内先建后判），`test` job 没有。
+  这是 US-16 把 `test-integration` / `test-pg` / `cover` / `behavior` / `injection` 迁到 PostgreSQL 后
+  新增的前置条件，此前未在 CI 上跑通过这条路径。
+
+### ·3 修复选择与依据
+
+- **不改 `pgtemp`**：它的 fail-closed 是设计（扩展缺失即拒绝起跑），改成自动 `CREATE EXTENSION`
+  会让"引擎能力不足"这一判据消失，且 `CREATE EXTENSION` 需要库级权限——把测试助手的语义放宽换绿态，
+  属于弱化判据，不做。
+- **在 `test` job 里显式建扩展**，与 `postgres` job 同一形态；但**只建不判版本**——引擎与扩展的
+  版本断言仍归 `postgres` job（`test` job 头部既有注释即此分工）。
+- 具体改动：`.github/workflows/ci.yml` 新增 `Provision extensions in the test database` 步骤
+  （`CREATE EXTENSION IF NOT EXISTS vector` / `pg_trgm`，随后回读 `pg_extension` 并用
+  `grep -qx` 逐条 fail-closed），置于 `Unified acceptance` 之前；job 头注释补一句
+  "service 只保证有引擎、不保证扩展已装"。
+
+### ·4 本机可验证项（四态）
+
+| 项 | 读数 |
+| --- | --- |
+| YAML 结构 | 用仓库依赖 `goccy/go-yaml` 解析：`jobs=5 test.steps=10 provision_at=3 acceptance_at=4`——解析通过，步骤位置在验收之前；**通过** |
+| 回读断言形态 | 在 dev-env 测试库（`server_version=17.11 (Debian 17.11-1.pgdg12+2)`）上跑**同一条**查询：`ext="pg_trgm\nvector"`，`grep -qx pg_trgm` / `grep -qx vector` 均成立；**通过** |
+| 扩展创建语句本身 | **未验证**——本机无 Docker，无法在 CI 的 service 容器里实跑；该语句与 `postgres` job 既有步骤逐字同形 |
+| 修复后 CI 全绿 | **未验证**——需推送后由远端 run 判定 |
+
+- 探针（`YAML 解析` / `回读查询`）建在 `.loop/yamlcheck` / `.loop/pgprobe`，`.loop/` 整体
+  gitignored、不进指纹；用毕删除。
+- 证据文件来自 `gh run download 41280964346`（`/tmp/ci-ev/ci-41280964346-1/`），只读核查。
+
+### ·5 判据面与候选影响
+
+- **候选二进制不变**：改的是 CI 工作流，不进编译单元；五个依赖库目标的**检查定义与断言一行未动**
+  （`harness/acceptance.json` 未改），故判据面无变更、无需裁决。
+- 但源码指纹会变（`ci.yml` 是 tracked 文件），因此按用户第 1 条：在最终树上重跑全量验收并重新绑定指纹。
+- 未验证清单不翻转任何行；US-16 仍**未收口**。

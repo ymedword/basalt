@@ -36,7 +36,11 @@ jobs:
     # T125 / D-01：`test-integration`、`test-pg` 与 `cover` 缺 BASALT_TEST_PG_DSN 即失败，
     # 而本 job 跑全量门禁——service 因此是**判据前提**，不是可选加速。单元测试
     # （`make test`）不读 DSN；引擎版本断言仍只在 postgres job 做（两处镜像 tag 相同）。
-    # The service is a precondition of this job's verdict (D-01), not an optimization.
+    # service 只保证"有引擎"，**不保证扩展已装**：pgtemp 每条用例都按扩展所在 schema 拼
+    # `search_path`，读不到 vector / pg_trgm 即 fail-closed，故本 job 在跑门禁前显式建扩展。
+    # The service is a precondition of this job's verdict (D-01), not an optimization;
+    # the extensions are provisioned explicitly below because the tag alone does not
+    # install them into basalt_test (pgtemp fails closed when they are absent).
     services:
       postgres:
         image: pgvector/pgvector:0.8.7-pg17
@@ -79,6 +83,27 @@ jobs:
           go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0
           go get golang.org/x/tools@v0.50.0
           go build -o "$(go env GOPATH)/bin/gosec" github.com/securego/gosec/v2/cmd/gosec
+
+      # 扩展**显式建**，不赌镜像预置：`pgvector/pgvector` 镜像只带扩展文件，装进
+      # `basalt_test` 仍需 CREATE EXTENSION。缺扩展时 pgtemp 在**每条**依赖库的用例上
+      # fail-closed（"读取扩展 vector 所在 schema: sql: no rows in result set"），
+      # 表现为 test-integration / test-pg / cover / behavior / injection 一并判红。
+      # 这里只建不判版本：引擎与扩展的版本断言仍归 postgres job（两处镜像 tag 相同）。
+      # Provision the extensions here: the image ships the extension files, not an
+      # installed extension. Version assertions stay in the postgres job.
+      - name: Provision extensions in the test database
+        run: |
+          set -euo pipefail
+          cid="${{ job.services.postgres.id }}"
+          docker exec "$cid" psql -v ON_ERROR_STOP=1 -U basalt -d basalt_test \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector' \
+            -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+          # 建完回读：ON_ERROR_STOP 只管语句级错误，扩展是否真装上以 pg_extension 为准。
+          ext=$(docker exec "$cid" psql -tA -U basalt -d basalt_test \
+            -c "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm') ORDER BY extname")
+          echo "$ext"
+          echo "$ext" | grep -qx 'pg_trgm'
+          echo "$ext" | grep -qx 'vector'
 
       - name: Unified acceptance (mandatory fake-model evals; explicit real-model skip)
         # 控制台输出也落盘：报告被中断/覆盖时，console 是唯一的逐条进度证据。
