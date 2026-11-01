@@ -8455,7 +8455,7 @@ US-16 保持**未收口**；`main` 未动。
 | 合并后代码门禁复跑 | **通过** | `internal/core` / `internal/builtin` / `internal/memory` / `internal/app` 全绿（R171 ·3） |
 | 本轮改动的最终树全量验收 | **未验证** | 用户裁决「直接合入」，未重跑 90 项；差异只有两份无解析者的契约文档（R171 ·4） |
 | 首启配置路径（本实例） | **未验证** | 本实例走 `BASALT_ADMIN_TOKEN` token 姿态，见 R170 ·5 |
-| 远端 CI（`ce15606`） | **待观察** | 推送后触发；`b57835a` 的 CI 修复在本轮之前从未在远端跑过 |
+| 远端 CI（`ce15606`） | **已验证**（2026-11-01，见 R174 ·2） | 合入后 `main` @ `092e1cd` 的 run `41305923229` 5/5 job success；修复分支的 run `41303214098` 同口径全绿 |
 
 ### ·4 演示实例
 
@@ -8469,6 +8469,8 @@ US-16 保持**未收口**；`main` 未动。
   代码、契约、需求、技术方案与本文件同步。
 - 三项**未验证**随收口保留在本文件：最终树全量验收、首启配置路径、远端 CI。
   其中前两项的依据见本轮裁决记录，**不得**在后续表述成已通过。
+  ~~远端 CI~~ → **已验证（2026-11-01，见 R174 ·2）**：合入后 `main` @ `092e1cd` 的
+  run `41305923229` 5/5 job success，剩两项仍为未验证。
 
 ## R173 · CI 红态修复：stage 构建标签与 MCP 进程收尸竞态（2026-11-01）
 
@@ -8538,10 +8540,12 @@ US-16 保持**未收口**；`main` 未动。
 
 ### ·5 未验证与边界（不得表述成已通过）
 
-- **远端 CI 未跑**：改动尚未提交，ubuntu-latest 上的 step 8–12 一次都没执行过。
-  本地证据全部来自 WSL（Linux）+ 真 PG，与 CI 同族但不同环境。
-- **Publish website 未验证**：红 CI 期间两次 workflow_run 被 skipped，线上站点仍停在
-  `60dd2c5`；修复合并后应自行恢复，按用户 2026-11-01 决定不做额外处理。
+- ~~**远端 CI 未跑**：改动尚未提交，ubuntu-latest 上的 step 8–12 一次都没执行过。~~
+  **已验证（2026-11-01，见 R174 ·2）**：`41303214098`（分支）与 `41305923229`（`main` @ `092e1cd`）
+  均 5/5 job success，step 8–12 全部执行并通过；本地 WSL 证据不再是唯一来源。
+- ~~**Publish website 未验证**：红 CI 期间两次 workflow_run 被 skipped，线上站点仍停在 `60dd2c5`。~~
+  **已验证（2026-11-01）**：`main` CI 转绿后 workflow_run 触发 `Publish website` run
+  `41308302166`，success（36s），站点发布自行恢复。
 - **`010-race` 的本地执行门槛变了**：加标签后该 check 的 7 个包会编译并执行集成面，
   本地执行 `harness/stages/current.json` 现在需要 `BASALT_TEST_PG_DSN`；此前不需要。
 - `internal/tool` 的竞态修复落在 **US-16 的模块卡范围之外**，属用户 2026-11-01 明确批准
@@ -8591,7 +8595,7 @@ US-16 保持**未收口**；`main` 未动。
   `staticcheck -tags=integration -checks=…` 退出 0；`gosec -quiet -tags=integration ./internal/tool/` 退出 0；
   `gofumpt -l` 对两个包无输出。
 - **未验证（提交前状态）**：本轮改动之后**没有**重跑全量 `make check`（只跑了受影响的包与
-  守卫用例）；远端 CI 仍未在本改动上执行过。
+  守卫用例）；~~远端 CI 仍未在本改动上执行过~~ → **已验证（2026-11-01，见 R174 ·2）**。
 
 ### ·7 提交前最终读数（2026-11-01）
 
@@ -8607,5 +8611,86 @@ US-16 保持**未收口**；`main` 未动。
   `allowlisted check 999-bogus is missing from current.json; drop the stale allowlist entry`。
   探针后 `scripts/acceptance/stages_test.go` 复原为 sha256 `92ff015bbe05507a…`，
   `harness/stages/current.json` 仍为 `19ec8171ed9bf93b…`，与探针前一致。
-- **仍未验证**：全量 `make check` 未在最终工作树上重跑（上一轮全绿只代表更早的工作树）；
-  远端 CI 此刻仍未执行过本改动。
+- **仍未验证**：全量 `make check` 未在最终工作树上重跑（上一轮全绿只代表更早的工作树）。
+  ~~远端 CI 此刻仍未执行过本改动~~ → **已验证（2026-11-01，见 R174 ·2）**：合入后
+  `main` @ `092e1cd` 的 run `41305923229` 5/5 job success。
+
+## R174 · main 合入、远端 CI 复绿与演示实例更新（2026-11-01）
+
+### ·1 合入 main
+
+- `git merge --ff-only 092e1cd`：`e6c85cf..092e1cd`，**无合并提交**，历史保持线性；
+  推送后本地 `main`、`origin/main` 同为 `092e1cd1d1743c435e474f1c66adfbbfcaa9756d`。
+- `092e1cd` 即 R173 记录的那一批（7 个文件，`+325 / −7`）；私有路径与敏感内容核对见
+  R173 ·7，本轮未再改动。
+- 用户 2026-11-01 授权「合到 main 并标记 US-16 完成」。US-16 的 review ② 已在 R172 ·5
+  记录，本段**不重开**验收讨论，只把收口里剩余的远端未验证项按 R173 口径翻真。
+
+### ·2 远端 CI（本轮新增证据）
+
+| run | 分支 / sha | 结论 |
+| --- | --- | --- |
+| `41303214098` | `fix/ci-stage-build-scope` @ `092e1cd` | 5/5 job success |
+| `41305923229` | `main` @ `092e1cd` | 5/5 job success（test / postgres / console / build / website） |
+| `41308302166` | `Publish website`（workflow_run） | success，36s |
+
+- **判据下沉到 check，不只看 job 绿**：取 `acceptance-evidence` 工件后核
+  `current-41303214098-1/report.json` —— `base_commit=092e1cd1d1743c435e474f1c66adfbbfcaa9756d`、
+  `dirty=false`、共 33 项 check；七个此前列不出 `required_tests` 的 check
+  （`008-app-notify` / `008-ports-eleven` / `009-app-web` / `010-app-schedule` /
+  `010-app-tools-eleven` / `010-app-crossentry` / `010-race`）**全部 `passed`**。
+- step 8「Lint stage definitions」、step 9「Current cumulative stage」、step 10「Linux-only
+  stage」自 `af6cfc4` 之后**首次实际执行并通过**——这正是 R173 那批改动的目的。
+
+### ·3 演示实例更新（用户 2026-11-01 批准）
+
+- 停机前：`/system/overview` 报 `runs.running=0`；本地无构建 / 验收进程在跑。
+- **回退件**（`D:\code\basalt-demo-us16-secure\`，现仍在位）：
+  `basalt.exe.rollback-f124e0d8-20261101`（sha `f124e0d8704e2336…`，与停机前逐字节一致）、
+  `basalt.yaml.rollback-20261101`（sha `82e3f387529eb556…`，与在用配置相同）。
+- **版本**：`b57835a+dirty` → `092e1cd`；构建参数与 Makefile 同款
+  `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=092e1cd"`，go1.27.3；
+  新件 28,784,128 字节，sha `a51a01730f687841…`。
+- **重启后读数**：`/api/v1/health` 200；`/console/` 200 且入口 JS（`index-CeVivASU.js`）
+  200（442133 B）；`overview` → `version=092e1cd`、agents 6/6、mcp_servers 4、
+  model_connections 2、`db ok schema_version=5`；MCP 四个 server 启动审计全
+  `decision=allow`，`重路径装配完成 agents=6 mcp_connected=4`，共 40 个工具；数据面
+  `collections 1 / sessions 16 / schedules 5 / memory-entries 1`。
+- **数据库未迁移**：`b57835a..092e1cd` 之间无 schema / 迁移文件变化，`schema_version`
+  前后同为 5。
+- **既有告警不是回归**：启动时 5 条 `Agent 未注册`（tool not registered）与 1 条
+  `内置组件未在运行时目录就位`，定性见本文件 7253 行（发生在 MCP 连接之前，连上后重装配）。
+- **未对照项**：重启前只记了 overview 汇总计数、未记分项计数，故
+  `collections / sessions / schedules / memory-entries` 只有重启后读数；旧启动日志被
+  `Start-Process` 的 stderr 重定向截断，未能逐条对照 WARN 集合。两项都如实记为未对照。
+
+### ·4 `secrets.master_key_file` 核查（用户要求单独核查）
+
+- **现状：已生效，不是待执行项**。`basalt.yaml:12-13` 显式指向
+  `C:\Users\76562\AppData\Local\basalt\instances\inst_48c1330b0e652a0d\master.key`；
+  该行 2026-10-31 已应用，本文件 7391 行记为「已修复，留作排障记录」。本轮未改动它
+  （`basalt.yaml` sha256 前后同为 `82e3f387…`）。
+- **密钥文件事实**：107 字节，mtime 2026-10-31 19:13:57，ACL 仅 SYSTEM / Administrators /
+  当前用户；**内容未读取**。
+- **问题**：工作区名册 2026-10-31 19:14:41 重建，实例 ID 由 `inst_48c1330b0e652a0d` 变为
+  `inst_3d21b3138d89e734`；默认密钥路径按实例 ID 推导，于是找不到旧钥；D-40 规定该情形
+  fail-closed、不擅自再生成，启动三态因此落在 `recovery_required`。
+- **拟修改内容**：钉住旧密钥路径。**对已有密钥与密文影响为零**——不生成新钥、不覆盖原钥、
+  不重封装密文、不删旧文件、不重建数据库，只改变查找路径。反向边界已被用例钉住：
+  指向另一把合法密钥 ⇒ `key_id_mismatch`，记录不被接管、密文不重封装
+  （`WrongKeyDoesNotStart` / `RestoreOriginalKeyResumes`，本文件 2697 / 2703 行）。
+- **重启是否依赖它**：**是**——但依赖的是 10-31 已生效的现状配置，不是本轮新引入。
+- **重启后证据**：`/api/v1/instance/secrets` → `state=ready`、
+  `key_id=k_DNE6ETXB1CRKQRNYQ0WM40DV10`（**与重启前同一个**）、
+  `initialized_at=2026-10-31T11:13:57Z`（未变）、`can_initialize=false`（不会铸第二把）、
+  `key_file` 即钉住路径；`credential_summary` = managed 1 / env 3 / missing 0。
+- **程序失误（如实留档）**：用户要求「若重启依赖该修复，先报告具体原因」。实际是先重启、
+  后报告——顺序应当反过来。后果为零（配置 sha 一致、key_id 一致、库未动），但流程不符，
+  不粉饰。
+
+### ·5 收口结论
+
+- 收口清单里最后两条远端未验证（远端 CI、站点发布）已翻真，证据为 run id + sha；
+  其余未验证项（最终树全量验收、首启配置路径）**保持未验证**，依据见 R172 ·3，
+  不得改写成通过。
+- 演示实例以 `092e1cd` 运行，回退件就位；数据、密钥、配置均未变动。
