@@ -52,6 +52,7 @@
 | 2026-11-03 | 独立复核 F7（文档）：compose 未设 `restart` 策略，宿主 / 守护进程重启后容器不自启，文档未登记 | 保持不加自动拉起，登记恢复命令与排障入口 | `docs/Operations.md` §8.2「日常停机与重启」补条目 | 1 |
 | 2026-11-03 | 独立复核 F8：`restore.sh` 中途失败会在目标项目留下已建卷 / 容器且无提示 | 失败路径必须给出可执行清理提示，成功路径不得误报 | EXIT trap 在未完成时打印 `docker compose -p <新项目> down -v` 提示；成功后置 `restore_done=1` | 1 |
 | 2026-11-03 | 独立复核 F10：记录 / 矩阵的未知 `kind` 会被归档核对与镜像核对同时跳过，篡改矩阵可静默过关 | 取值集合只允许 `""` / `image`，双向显式拒绝 | `VerifyImages` 与 `crossCheckRecord` 各自拒绝；新增 `TestUS18_Image_RejectsUnknownEvidenceKind` 覆盖两处 | 1 |
+| 2026-11-03 | 草稿 PR 首次 CI：`container` job 在「Pull pinned public base images」步骤红——`docker.io/library/alpine@sha256:7cb3c9…` 返回 `not found`（本机 e2e 全绿是因为镜像已在本地，CI 才是首次真实拉取） | 锁文件里两个 digest 已非上游现行值：本机守护进程使用 containerd 镜像存储（`overlayfs` / containerd snapshotter），镜像 ID 即 manifest digest，`RepoDigest == ID` 属正常现象（先前“合成引用”推断错误，已按此更正）。经两个独立 pull-through 镜像站按 tag 取到的 manifest 字节哈希与响应头一致且两站相同（alpine `ff7f0c72…`、pgvector `7d0a41…`），按 digest 请求均 200；旧值不在当前任何多架构索引中。本机无法直连 Docker Hub，拉取时只能经镜像缓存，缓存给出的旧 manifest 已在上游被替换 / 回收 | 锁文件、`Dockerfile` 的 `ARG BASE_IMAGE` 默认值、`compose.yaml`、`.env.example` 四处同步改为上游 digest（`alpine:3.23@sha256:ff7f0c72…`、`pgvector/pgvector:0.8.7-pg17-bookworm@sha256:7d0a41…`）；`go test ./scripts/releasekit ./cmd/basalt-verify` 通过。本机无法重跑镜像构建（Docker Hub 不可达、无 sudo 配置镜像代理），最终由 PR CI `container` job 复判。模块卡 §2.4 的字面 digest 由锁文件单一维护，卡片文本不改，以锁文件为准 | 1 |
 
 ## 3. 停止预算与计数
 

@@ -8,7 +8,7 @@
 # （CheckImageLock 判卷，漂移即红）。
 # The base digest is frozen in release/image-lock.json; releasekit overrides it via
 # --build-arg and this default must stay byte-identical to the lock file.
-ARG BASE_IMAGE=alpine:3.23@sha256:7cb3c9fcc4d88607122a45fa0da062e5644d8a1ee24e65b1591d8ce537c45e20
+ARG BASE_IMAGE=alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63
 FROM ${BASE_IMAGE}
 
 # ca-certificates 是产品运行期访问外部模型 / 工具的证书来源；busybox 的 wget 供

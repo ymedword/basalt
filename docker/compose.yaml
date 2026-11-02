@@ -47,7 +47,7 @@ services:
     # digest 与 release/image-lock.json 的 postgres 逐字一致（CheckImageLock 判卷）；
     # .env.example 的 BASALT_DB_IMAGE 是同一值的预取 / 核对副本。
     # Pinned to the lock file digest; BASALT_DB_IMAGE mirrors it for pre-pulling.
-    image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:13b6ffe9771a0a726168556a623b481a57e56fd390b4b8d7670a92ac8e7c126e
+    image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-basalt}
       POSTGRES_USER: ${POSTGRES_USER:-basalt}
