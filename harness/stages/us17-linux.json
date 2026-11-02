@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "id": "us17-linux",
+  "approval": "User review 1 passed 2026-11-02 (US-17 lean R6 module card). Implementation authorized to closeout.",
+  "inputs": [
+    "docs/us/us17-release-artifacts.md",
+    "specs/017-release-artifacts/spec.md",
+    "specs/017-release-artifacts/plan.md",
+    "specs/017-release-artifacts/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/e2e/us17_artifact_test.go",
+    "internal/e2e/us17_upgrade_test.go",
+    "internal/e2e/us17_repro_test.go"
+  ],
+  "checks": [
+    {
+      "id": "us17-artifact-linux",
+      "args": ["go", "test", "-json", "-tags=e2e", "-count=1", "-timeout=30m", "./internal/e2e", "-run", "^(TestUS17_Artifact_LinuxFull|TestUS17_Artifact_NoDevToolchain)$"],
+      "timeout_seconds": 1800,
+      "required_tests": ["TestUS17_Artifact_LinuxFull", "TestUS17_Artifact_NoDevToolchain"],
+      "level": "process"
+    },
+    {
+      "id": "us17-upgrade-linux",
+      "args": ["go", "test", "-json", "-tags=e2e", "-count=1", "-timeout=30m", "./internal/e2e", "-run", "^TestUS17_Upgrade_"],
+      "timeout_seconds": 1800,
+      "required_tests": [
+        "TestUS17_Upgrade_Success",
+        "TestUS17_Upgrade_FailureRecovery",
+        "TestUS17_Upgrade_FailureRecoveryNeedsRestore",
+        "TestUS17_Upgrade_MigrationPath"
+      ],
+      "level": "process"
+    },
+    {
+      "id": "us17-repro",
+      "args": ["go", "test", "-json", "-tags=e2e", "-count=1", "-timeout=20m", "./internal/e2e", "-run", "^TestUS17_Reproducible$"],
+      "timeout_seconds": 1200,
+      "required_tests": ["TestUS17_Reproducible"],
+      "level": "process"
+    }
+  ],
+  "tasks": [
+    {"id": "T017", "checks": ["us17-artifact-linux"]},
+    {"id": "T018", "checks": ["us17-artifact-linux"]},
+    {"id": "T015", "checks": ["us17-upgrade-linux"]},
+    {"id": "T019", "checks": ["us17-upgrade-linux"]},
+    {"id": "T020", "checks": ["us17-repro"]}
+  ]
+}

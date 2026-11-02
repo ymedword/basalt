@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "id": "us17-base",
+  "approval": "User review 1 passed 2026-11-02 (US-17 lean R6 module card). Implementation authorized to closeout.",
+  "inputs": [
+    "docs/us/us17-release-artifacts.md",
+    "specs/017-release-artifacts/spec.md",
+    "specs/017-release-artifacts/plan.md",
+    "specs/017-release-artifacts/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "scripts/releasekit/inputs_test.go",
+    "scripts/releasekit/package_test.go",
+    "scripts/releasekit/sign_test.go",
+    "scripts/releasekit/verify_test.go",
+    "scripts/releasekit/record_test.go",
+    "scripts/releasekit/sbom_test.go",
+    "scripts/releasekit/matrix_test.go",
+    "scripts/releasekit/workflow_test.go",
+    "scripts/releasekit/docs_test.go",
+    "scripts/privatebackup/backup_test.go",
+    "scripts/release-package/config_test.go"
+  ],
+  "checks": [
+    {
+      "id": "us17-unit",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "./scripts/privatebackup", "./scripts/release-package"],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS17_Version_RejectsDirty",
+        "TestUS17_Package_Manifest",
+        "TestUS17_Package_BinaryTierExcludesRuntime",
+        "TestUS17_Assemble_RequiresFullEvidence",
+        "TestUS17_PrivateSnapshot_RoundTrips",
+        "TestCheckReleaseBinaryForTarget_ReadsBuildInfo"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us17-race",
+      "args": ["go", "test", "-json", "-race", "-count=1", "./scripts/releasekit", "./scripts/privatebackup"],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS17_Package_Deterministic",
+        "TestUS17_Sign_RoundTrip",
+        "TestUS17_PrivateSnapshot_RoundTrips"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us17-sign-verify",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_(Sign|Verify)_"],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS17_Sign_RoundTrip",
+        "TestUS17_Sign_RejectsWrongKey",
+        "TestUS17_Verify_RejectsTampered",
+        "TestUS17_Verify_RejectsMissingSignature",
+        "TestUS17_Verify_UnsignedRehearsal"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us17-record",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_Record_"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_Record_SigningOrder", "TestUS17_Record_NoSecrets"],
+      "level": "source"
+    },
+    {
+      "id": "us17-package-safety",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_Package_(NoSecretsOrPrivatePaths|AllowsEnvMention|FullTierRefusesIncompleteRuntime)$"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_Package_NoSecretsOrPrivatePaths", "TestUS17_Package_AllowsEnvMention", "TestUS17_Package_FullTierRefusesIncompleteRuntime"],
+      "level": "source"
+    },
+    {
+      "id": "us17-sbom",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_SBOM_"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_SBOM_CoversFrontendAndRuntime", "TestUS17_SBOM_Deterministic"],
+      "level": "source"
+    },
+    {
+      "id": "us17-private-backup",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/privatebackup"],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS17_PrivateSnapshot_RoundTrips",
+        "TestUS17_PrivateSnapshot_IncludesExclude",
+        "TestUS17_PrivateSnapshot_RejectsSymlinkEscape"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us17-workflow",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_Workflow_"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_Workflow_NoPublish"],
+      "level": "source"
+    },
+    {
+      "id": "us17-docs",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_Docs_"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_Docs_CommandsMatchCLI"],
+      "level": "source"
+    },
+    {
+      "id": "us17-stage-lint",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS17_StageLint$"],
+      "timeout_seconds": 600,
+      "required_tests": ["TestUS17_StageLint"],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T001", "checks": ["us17-unit"]},
+    {"id": "T002", "checks": ["us17-unit"]},
+    {"id": "T003", "checks": ["us17-package-safety"]},
+    {"id": "T004", "checks": ["us17-sign-verify"]},
+    {"id": "T005", "checks": ["us17-record"]},
+    {"id": "T006", "checks": ["us17-sbom"]},
+    {"id": "T007", "checks": ["us17-unit"]},
+    {"id": "T008", "checks": ["us17-unit"]},
+    {"id": "T009", "checks": ["us17-sign-verify"]},
+    {"id": "T010", "checks": ["us17-docs"]},
+    {"id": "T011", "checks": ["us17-workflow"]},
+    {"id": "T012", "checks": ["us17-stage-lint"]},
+    {"id": "T013", "checks": ["us17-docs"]},
+    {"id": "T014", "checks": ["us17-docs"]},
+    {"id": "T016", "checks": ["us17-private-backup"]},
+    {"id": "T021", "checks": ["us17-docs"]},
+    {"id": "T022", "checks": ["us17-unit", "us17-race"]},
+    {"id": "T023", "checks": ["us17-stage-lint"]}
+  ]
+}

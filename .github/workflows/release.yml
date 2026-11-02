@@ -1,0 +1,95 @@
+name: release
+
+# 发布工作流只构建、打包并汇总候选制品；tag、push 与公开发布由用户执行。
+# The release workflow only builds and assembles candidates; tagging, pushing and
+# publishing remain user actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 X.Y.Z（不含 v 前缀）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows/amd64
+            tier: full
+          - os: ubuntu-latest
+            target: linux/amd64
+            tier: full
+          - os: ubuntu-24.04-arm
+            target: linux/arm64
+            tier: binary
+          - os: macos-14
+            target: darwin/arm64
+            tier: binary
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+      - name: Build and package
+        shell: bash
+        env:
+          GOPROXY: https://goproxy.cn
+        run: |
+          # 每次运行 / 重试独占目录：run id + attempt 由 Actions 注入，避免证据互相覆盖。
+          go run ./scripts/releasekit/cmd/releasekit build \
+            --repo . --version "${{ inputs.version }}" --mode rehearsal \
+            --target "${{ matrix.target }}" --tier "${{ matrix.tier }}" \
+            --out "dist/build-${{ matrix.os }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          binary="dist/build-${{ matrix.os }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/basalt"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then binary="$binary.exe"; fi
+          go run ./scripts/releasekit/cmd/releasekit package \
+            --repo . --version "${{ inputs.version }}" \
+            --binary "$binary" --target "${{ matrix.target }}" \
+            --tier "${{ matrix.tier }}" --runtime "release/runtime" \
+            --out "dist/artifacts-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ strategy.job-index }}
+          path: dist/artifacts-${{ github.run_id }}-${{ github.run_attempt }}/*
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+      - name: Assemble rehearsal release
+        shell: bash
+        env:
+          GOPROXY: https://goproxy.cn
+        run: |
+          # 发布说明写到 runner 临时目录：汇总要求工作区干净（git status 无输出），
+          # 落在仓库根会变成未跟踪文件，assemble 直接失败。
+          notes="$RUNNER_TEMP/basalt-notes-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.md"
+          sed "s/__VERSION__/${{ inputs.version }}/g" release/notes/TEMPLATE.md > "$notes"
+          go run ./scripts/releasekit/cmd/releasekit assemble \
+            --artifact-dir dist/artifacts --evidence-dir dist/evidence \
+            --version "${{ inputs.version }}" --mode rehearsal \
+            --notes "$notes" \
+            --out "dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          go run ./scripts/releasekit/cmd/releasekit verify \
+            --release-dir "dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-rehearsal
+          path: dist/release/${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}/*

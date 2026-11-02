@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "note": "直接依赖（go.mod 顶层 require）的许可标识，版本以 go.mod / go.sum 为准；release/licenses/ 只保存需要随发布分发的第三方许可证文本，完整文本以各依赖模块仓库的 LICENSE 为准。本文件不是许可合规结论。",
+  "dependencies": [
+    {
+      "module": "github.com/fsnotify/fsnotify",
+      "version": "v1.10.1",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "module": "github.com/goccy/go-yaml",
+      "version": "v1.19.2",
+      "license": "MIT"
+    },
+    {
+      "module": "github.com/jackc/pgx/v5",
+      "version": "v5.11.0",
+      "license": "MIT"
+    },
+    {
+      "module": "github.com/modelcontextprotocol/go-sdk",
+      "version": "v1.8.0",
+      "license": "MIT OR Apache-2.0"
+    },
+    {
+      "module": "github.com/robfig/cron/v3",
+      "version": "v3.0.1",
+      "license": "MIT"
+    },
+    {
+      "module": "github.com/santhosh-tekuri/jsonschema/v6",
+      "version": "v6.0.3",
+      "license": "Apache-2.0"
+    },
+    {
+      "module": "github.com/sashabaranov/go-openai",
+      "version": "v1.43.0",
+      "license": "Apache-2.0"
+    },
+    {
+      "module": "github.com/spf13/cobra",
+      "version": "v1.10.2",
+      "license": "Apache-2.0"
+    },
+    {
+      "module": "github.com/stretchr/testify",
+      "version": "v1.12.1",
+      "license": "MIT"
+    },
+    {
+      "module": "go.opentelemetry.io/proto/otlp",
+      "version": "v1.11.1",
+      "license": "Apache-2.0"
+    },
+    {
+      "module": "golang.org/x/sys",
+      "version": "v0.48.0",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "module": "google.golang.org/protobuf",
+      "version": "v1.36.12",
+      "license": "BSD-3-Clause"
+    },
+    {
+      "module": "modernc.org/sqlite",
+      "version": "v1.60.1",
+      "license": "BSD-3-Clause"
+    }
+  ]
+}

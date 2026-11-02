@@ -504,6 +504,8 @@ systemctl start basalt
 
 ### 5.1 升级（受控前向迁移）
 
+> **US-17 工具状态（2026-11-02）**：`releasekit upgrade` 是**受限入口**，尚未在真实宿主完成「停服 → 升级 → 启动 → 失败恢复」闭环验证；生产升级以本节人工步骤为准，**不得**把自动入口当作唯一或默认路径。自动入口只保留给首发前的真实宿主验证。
+>
 > **US-16 起（2026-10-30）**：运行期存储是 PostgreSQL，升级 = 停服 → **按 §4.4 做三个对象的成套备份** → 换二进制 → 起服（启动时对 PostgreSQL 做内嵌版本化前向迁移；`basalt db migrate` 可预跑，幂等）。**SQLite 谱系冻结在 v6，只作迁移来源与回退快照，不再新增迁移**；SQLite v6 → PostgreSQL 的一次性迁移与切换见 §5.6。下文第 4 步之后的 v2～v5 迁移叙述是 **SQLite 谱系的历史记录**，保留供对账，不再是当前升级路径。
 
 顺序**必须**固定，且**从停服到二进制就位之间不得起服**：
@@ -1240,6 +1242,37 @@ basalt instance adopt --workspace <copy-root>/.basalt
 | 制品与平台 | 二进制与前端资源、平台 / 架构、版本、commit 和 sha256 | 用候选制品走真实控制台、进程树取消、锁、升级 / 恢复；制品变更后重验 |
 
 业务指标默认用低基数维度（操作、结果类别、工具类型）；session_id、run_id、完整 URL、错误原文与凭证不作为指标标签。它们需要关联时放受控日志 / 审计，访问权限与保留期随数据策略一起确定。指标系统若尚未接入，保持为发布 / 扩展阶段设计，不声称已有 Prometheus 或追踪能力。
+
+### 8.1 发布物构建、校验与升级工具（US-17 起）
+
+发布工具是仓库内工具，不进入产品二进制：`scripts/releasekit`（库与 `go run ./scripts/releasekit/cmd/releasekit` 命令行）、`cmd/basalt-verify`（随发布目录分发的离线校验器）、`scripts/privatebackup`（私有资产快照）。
+
+| 命令 | 作用 |
+| --- | --- |
+| `make release-check` | 发布工具自检：打包确定性、签名顺序、凭据与私有路径扫描、SBOM、stage 映射 |
+| `make release-rehearsal VERSION=X.Y.Z` | 预演：只构建宿主目标（binary 档），**不签名**，产物落 `dist/rehearsal/`，不得上传 |
+| `make release-verify RELEASE_DIR=<目录> PUBLIC_KEY=<公钥文件>` | 对已下载目录做离线校验（哈希 + Ed25519，`--require-signature`） |
+| `make private-backup-test` | 私有资产快照的往返、排除清单与符号链接逃逸用例 |
+
+发布命令按顺序执行；正式发布缺任一前置即失败（工作区必须干净、工具链固定 go1.27.3、`final` 必须给 `--signing-key` / `--public-key`）：
+
+- `releasekit preflight --version X.Y.Z --tag vX.Y.Z --mode final --signing-key <私钥> --public-key <公钥>`：版本、tag、工具链、发布说明、输出目录与密钥前置检查。
+- `releasekit release --version X.Y.Z --target <os/arch> --tier full --runtime release/runtime --evidence-dir dist/evidence [--workspace <目录> --dsn <DSN> --old <上一版归档> --config <配置>]`：单目标完整流程——构建、打包、静态校验，匹配宿主时再做双构建比较、冒烟与升级探针，并把结论写成 `evidence-<os>-<arch>.json`。四平台各在对应宿主上跑一次，证据汇总后再 assemble；CI 只跑 build + package，不产出宿主证据。
+- `releasekit build`：固定 `CGO_ENABLED=0`、`-trimpath` 与版本注入构建单目标；full 档只能在匹配宿主构建。
+- `releasekit package`：确定性归档（固定时间戳、排序条目、规范权限）；`--format zip|tar.gz` 只接受与目标平台一致的取值。**full 档完整性是硬门禁**：`release/runtime-manifest.json` 声明的组件必须在 `--runtime` 下逐项存在，缺清单或缺任一组件即拒绝出包并列出缺项；组件未备齐时**不得**用 full 档名义出包，只能改用 `--tier binary`。
+- `releasekit assemble --artifact-dir <目录> --evidence-dir <目录> --version X.Y.Z --tag vX.Y.Z --mode final --out <空目录> --notes <md> --signing-key <私钥> --public-key <公钥>`：汇总四平台归档与证据，生成 SBOM / provenance / 支持矩阵 / 发布记录，并按 `release-record.json` → `SHA256SUMS` 的顺序签名；输出目录必须为空，失败会清理半成品。
+- `releasekit verify --release-dir <目录> --public-key <公钥> --require-signature`：离线校验；`repro --release-dir <目录>` 读取记录里的双构建结论，未比较或不一致即失败。
+- `releasekit upgrade --new <归档> --dsn <DSN> [--schema <name>] --workspace <目录> --config <配置> [--master-key <文件> --admin-token <文件>]`：**受限入口**，每次运行都会在 stderr 打印限制提示。它尚未在真实宿主完成升级／失败恢复闭环验证，**不得**作为生产升级的唯一或默认路径；生产升级按 §5.1 人工执行，失败恢复按 §5.2 / §4.4。工具在迁移失败时会尝试恢复库、工作区、配置与旧二进制（`basalt.old`），但该恢复分支同样未实测。主密钥 / admin token 只在显式给出路径时才备份与恢复——备份集里没有的东西不会被恢复，也不会静默回退到环境变量。
+
+**仅下载目录校验**：`basalt-verify-<version>-<os>-<arch>[.exe]`、`SHA256SUMS`（及 `.sig`）、`release-record.json`（及 `.sig`）随发布目录下载，无需源码和 Go。公钥**不在**发布目录里，由运维通过带外渠道取得并用绝对路径传入——信任锚不能和被测内容同源：
+
+```sh
+./basalt-verify-0.1.0-linux-amd64 --release-dir . --public-key /etc/basalt/release.pub --require-signature
+```
+
+**私有资产快照**：`privatebackup` 按 `.git/info/exclude` 打包私有路径，生成清单与哈希；恢复只写回快照内路径，越界或符号链接逃逸一律拒绝。快照**不得**提交、推送或随发布包分发。
+
+**当前验证状态（2026-11-02）**：本机只验证到宿主 binary 档与工具链自检；真实 full 制品、四平台宿主矩阵、升级／失败恢复实测、正式签名与仅下载目录的独立验证均**未完成**，登记在 `specs/017-release-artifacts/run-state.md` §4（U1–U7）并延期到首次正式发布前。预演产物（未签名 / `compiled-only`）**不得**当作正式发布物，也**不得**据此宣称某平台已实测。
 
 ## 9. 管理面写操作要点（US-12 起）
 

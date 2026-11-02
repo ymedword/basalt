@@ -220,6 +220,14 @@ func parseOptions(args []string) (options, error) {
 // 校验本机可运行的组件），且必须 `CGO_ENABLED=0`——发布纪律不能靠回忆保证。
 // checkReleaseBinary refuses a binary that is not a CGO-free build for this platform.
 func checkReleaseBinary(path string) error {
+	return CheckReleaseBinaryForTarget(path, runtime.GOOS, runtime.GOARCH)
+}
+
+// CheckReleaseBinaryForTarget 读取构建信息并核对目标平台与 CGO 关闭；
+// 抽成导出函数供发布工具的跨平台校验复用。
+// CheckReleaseBinaryForTarget reads build information and checks the target platform
+// and CGO-free build; it is exported for the release tool's cross-target checks.
+func CheckReleaseBinaryForTarget(path, goos, goarch string) error {
 	info, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("读取二进制构建信息 %s：%w", path, err)
@@ -228,11 +236,11 @@ func checkReleaseBinary(path string) error {
 	for _, setting := range info.Settings {
 		settings[setting.Key] = setting.Value
 	}
-	if got := settings["GOOS"]; got != runtime.GOOS {
-		return fmt.Errorf("二进制 GOOS=%q 与打包平台 %q 不一致——跨平台包必须在目标平台打包", got, runtime.GOOS)
+	if got := settings["GOOS"]; got != goos {
+		return fmt.Errorf("二进制 GOOS=%q 与打包平台 %q 不一致——跨平台包必须在目标平台打包", got, goos)
 	}
-	if got := settings["GOARCH"]; got != runtime.GOARCH {
-		return fmt.Errorf("二进制 GOARCH=%q 与打包架构 %q 不一致", got, runtime.GOARCH)
+	if got := settings["GOARCH"]; got != goarch {
+		return fmt.Errorf("二进制 GOARCH=%q 与打包架构 %q 不一致", got, goarch)
 	}
 	if got := settings["CGO_ENABLED"]; got != "0" {
 		return fmt.Errorf("二进制 CGO_ENABLED=%q，发布构建必须是 0", got)

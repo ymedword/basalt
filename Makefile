@@ -20,7 +20,7 @@
 # 显式指定配方 shell：不同平台的 make 默认 shell 不一致，统一到 POSIX sh。
 SHELL := /bin/sh
 
-.PHONY: check fmt lint sec test test-integration cover build acceptance evals example-tests e2e
+.PHONY: check fmt lint sec test test-integration cover build acceptance evals example-tests e2e release-check release-rehearsal release-verify private-backup-test
 
 check: fmt lint sec test test-integration cover build
 
@@ -100,3 +100,26 @@ e2e: build example-tests
 		code=$$?; cat $$log; rm -f $$log; exit $$code; \
 	fi; \
 	rm -f $$log
+
+# US-17 发布工具入口。命令与参数以 scripts/releasekit/cmd/releasekit 的 usage 为准；
+# 预演**不签名**，产物只能落在 dist/ 下，不得上传。配方保持 ASCII（本机 make 按 ANSI 读 Makefile）。
+# US-17 release entry points: the CLI usage is authoritative; rehearsals stay unsigned
+# and local. Recipes stay ASCII.
+HOSTOS ?= $(shell go env GOOS)
+HOSTARCH ?= $(shell go env GOARCH)
+ARCHIVE_EXT ?= $(if $(filter windows,$(HOSTOS)),.zip,.tar.gz)
+
+release-check: ; go test -count=1 ./scripts/releasekit ./scripts/privatebackup ./scripts/release-package
+
+release-rehearsal:
+	@test -n "$(VERSION)" || { echo "release-rehearsal: VERSION is required (e.g. VERSION=0.1.0)" >&2; exit 1; }
+	go run ./scripts/releasekit/cmd/releasekit preflight --repo . --version $(VERSION) --mode rehearsal
+	go run ./scripts/releasekit/cmd/releasekit build --repo . --version $(VERSION) --mode rehearsal --target $(HOSTOS)/$(HOSTARCH) --tier binary --out dist/rehearsal/build
+	go run ./scripts/releasekit/cmd/releasekit package --repo . --binary dist/rehearsal/build/basalt$(EXE) --version $(VERSION) --target $(HOSTOS)/$(HOSTARCH) --tier binary --out dist/rehearsal
+	go run ./scripts/releasekit/cmd/releasekit verify-package --archive dist/rehearsal/basalt-$(VERSION)-$(HOSTOS)-$(HOSTARCH)$(ARCHIVE_EXT) --version $(VERSION)
+
+release-verify:
+	@test -n "$(RELEASE_DIR)" -a -n "$(PUBLIC_KEY)" || { echo "release-verify: RELEASE_DIR and PUBLIC_KEY are required" >&2; exit 1; }
+	go run ./scripts/releasekit/cmd/releasekit verify --release-dir $(RELEASE_DIR) --public-key $(PUBLIC_KEY) --require-signature $(if $(TRUST_FILE),--trust $(TRUST_FILE),)
+
+private-backup-test: ; go test -count=1 ./scripts/privatebackup

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "id": "us17-aggregate",
+  "approval": "User review 1 passed 2026-11-02 (US-17 lean R6 module card). Implementation authorized to closeout.",
+  "inputs": [
+    "docs/us/us17-release-artifacts.md",
+    "specs/017-release-artifacts/spec.md",
+    "specs/017-release-artifacts/plan.md",
+    "specs/017-release-artifacts/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/e2e/us17_verify_test.go",
+    "scripts/check-release-clean.sh"
+  ],
+  "checks": [
+    {
+      "id": "us17-verify-download",
+      "args": ["go", "test", "-json", "-tags=e2e", "-count=1", "-timeout=20m", "./internal/e2e", "-run", "^TestUS17_VerifyDownload$"],
+      "timeout_seconds": 1200,
+      "required_tests": ["TestUS17_VerifyDownload"],
+      "level": "process"
+    },
+    {
+      "id": "us17-clean-checkout",
+      "args": ["sh", "scripts/check-release-clean.sh"],
+      "timeout_seconds": 3600,
+      "level": "process"
+    }
+  ],
+  "tasks": [
+    {"id": "T009", "checks": ["us17-verify-download"]},
+    {"id": "T017", "checks": ["us17-verify-download"]},
+    {"id": "T020", "checks": ["us17-verify-download"]},
+    {"id": "T024", "checks": ["us17-clean-checkout"]}
+  ]
+}

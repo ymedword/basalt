@@ -16,7 +16,10 @@ package e2e
 // the bootstrap *source* lineage that only source-shape cases read.
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -63,6 +66,11 @@ const (
 	candidateBinaryEnv = "BASALT_E2E_BINARY"
 	candidateSHA256Env = "BASALT_E2E_SHA256"
 
+	// US-17 的制品接缝：归档路径与版本号；只接受归档内的二进制，不临时构建。
+	// US-17 artifact seam: the archive path and version; only the archived binary runs.
+	artifactEnv        = "BASALT_E2E_ARTIFACT"
+	artifactVersionEnv = "BASALT_E2E_VERSION"
+
 	// binarySourceCandidate 表示被测二进制是外部候选产物（发布证据的唯一合法来源）；
 	// binarySourceTemp 表示本包临时构建（开发手跑），不得作为发布证据。
 	// candidate marks an external release candidate; temp marks the package's own build.
@@ -94,6 +102,10 @@ var (
 	binarySHA256    string
 	binarySource    string
 	expectedVersion string
+
+	// artifactVersionPattern 约束制品接缝的版本声明：发布版本是 X.Y.Z，不带 v 前缀。
+	// artifactVersionPattern constrains the artifact seam's version to X.Y.Z.
+	artifactVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 )
 
 // TestMain 构建被测二进制并打印唯一一条 `binary_sha256=` 标记。
@@ -110,6 +122,11 @@ var (
 func TestMain(m *testing.M) {
 	if mode, args, ok := shellHelperMode(); ok {
 		os.Exit(runShellHelper(mode, args))
+	}
+	// US-17 的 pg 工具替身：按可执行文件名分派，先于构建与 -test.list 短路执行。
+	// US-17's pg-tool stand-in dispatches on the executable name before any build.
+	if os.Getenv(pgToolEnv) != "" {
+		os.Exit(runPGToolHelper(os.Args[1:]))
 	}
 	if os.Getenv("BASALT_MCP_HELPER") != "" || listMode() {
 		os.Exit(m.Run())
@@ -150,6 +167,9 @@ func TestMain(m *testing.M) {
 // rebuilds it; without the variable it falls back to the package's own temporary build.
 // The cleanup only reclaims the temporary build directory.
 func resolveBinaryUnderTest(root string) (path, source, sum string, cleanup func(), err error) {
+	if archive := os.Getenv(artifactEnv); archive != "" {
+		return resolveArtifactBinary(archive)
+	}
 	if candidate := os.Getenv(candidateBinaryEnv); candidate != "" {
 		path, sum, err = checkCandidateBinary(candidate)
 		if err != nil {
@@ -201,6 +221,148 @@ func checkCandidateBinary(candidate string) (path, sum string, err error) {
 	return candidate, sum, nil
 }
 
+// resolveArtifactBinary 解压 BASALT_E2E_ARTIFACT 并返回归档内的二进制；不读取源码树、
+// 不临时构建，保证 e2e 判卷对象与待发布归档逐字节一致。
+// resolveArtifactBinary unpacks BASALT_E2E_ARTIFACT and returns the archived binary
+// without touching the source tree or building anything.
+func resolveArtifactBinary(archive string) (path, source, sum string, cleanup func(), err error) {
+	if !filepath.IsAbs(archive) {
+		return "", "", "", nil, fmt.Errorf("%s 必须是绝对路径（实际 %q）", artifactEnv, archive)
+	}
+	version := os.Getenv(artifactVersionEnv)
+	if version == "" {
+		return "", "", "", nil, fmt.Errorf("%s 未设置：必须声明归档版本", artifactVersionEnv)
+	}
+	if !artifactVersionPattern.MatchString(version) {
+		return "", "", "", nil, fmt.Errorf("%s 必须是 X.Y.Z（不带 v 前缀），实际 %q",
+			artifactVersionEnv, version)
+	}
+	// 归档哈希必须无条件声明：不给期望值就无法证明判卷对象就是候选归档（卡 §4.3.3）。
+	want := os.Getenv(candidateSHA256Env)
+	if want == "" {
+		return "", "", "", nil, fmt.Errorf("%s 未设置：必须声明候选归档的 SHA-256", candidateSHA256Env)
+	}
+	got, err := fileSHA256(archive)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	if !strings.EqualFold(got, want) {
+		return "", "", "", nil, fmt.Errorf("归档 %s 的 SHA-256 = %s，期望 %s（%s）",
+			filepath.Base(archive), got, want, candidateSHA256Env)
+	}
+	dir, err := os.MkdirTemp("", "basalt-e2e-artifact-*")
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	if err := extractArtifact(archive, dir); err != nil {
+		os.RemoveAll(dir)
+		return "", "", "", nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", "", "", nil, err
+	}
+	if len(entries) != 1 || !entries[0].IsDir() {
+		os.RemoveAll(dir)
+		return "", "", "", nil, fmt.Errorf("归档 %s 必须只有一个顶层目录", filepath.Base(archive))
+	}
+	name := "basalt"
+	if runtime.GOOS == "windows" {
+		name = "basalt.exe"
+	}
+	binary := filepath.Join(dir, entries[0].Name(), name)
+	info, err := os.Stat(binary)
+	if err != nil || !info.Mode().IsRegular() {
+		os.RemoveAll(dir)
+		return "", "", "", nil, fmt.Errorf("归档缺少可执行文件 %s：%v", name, err)
+	}
+	sum, err = fileSHA256(binary)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", "", "", nil, err
+	}
+	return binary, binarySourceCandidate, sum, func() { os.RemoveAll(dir) }, nil
+}
+
+func extractArtifact(archive, dir string) error {
+	if strings.HasSuffix(archive, ".zip") {
+		reader, err := zip.OpenReader(archive)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = reader.Close() }()
+		for _, file := range reader.File {
+			if file.FileInfo().IsDir() {
+				continue
+			}
+			source, err := file.Open()
+			if err != nil {
+				return err
+			}
+			err = writeExtractedFile(dir, file.Name, source, file.Mode())
+			_ = source.Close()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	file, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gzipReader.Close() }()
+	reader := tar.NewReader(gzipReader)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if header.Typeflag != tar.TypeReg {
+			return fmt.Errorf("归档条目 %s 不是普通文件", header.Name)
+		}
+		if err := writeExtractedFile(dir, header.Name, reader, header.FileInfo().Mode()); err != nil {
+			return err
+		}
+	}
+}
+
+func writeExtractedFile(root, name string, source io.Reader, mode os.FileMode) error {
+	target := filepath.Join(root, filepath.FromSlash(name))
+	base, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	absolute, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	if absolute != base && !strings.HasPrefix(absolute, base+string(os.PathSeparator)) {
+		return fmt.Errorf("归档条目 %s 逃逸出解压目录", name)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(file, source); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
 // expectedVersionFor 决定 `--version` 必须回显的构建标记。临时构建是本包注入的
 // `buildVersion`；候选二进制由 `make build` 按 `git describe --tags --always` 注入，
 // 因此期望值取同一份 git 描述——解析不出来即失败（不跳过断言，也不放宽为"非空即可"）。
@@ -208,6 +370,11 @@ func checkCandidateBinary(candidate string) (path, sum string, err error) {
 // constant for a temporary build, the checkout's `git describe` for a candidate. When
 // the description cannot be resolved the run fails closed instead of skipping.
 func expectedVersionFor(root, source string) (string, error) {
+	// 制品接缝自带版本声明：归档内的二进制回显的是发布版本，不是 `git describe`。
+	// The artifact seam declares its own version; the archived binary echoes the release.
+	if version := os.Getenv(artifactVersionEnv); version != "" {
+		return version, nil
+	}
 	if source != binarySourceCandidate {
 		return buildVersion, nil
 	}
