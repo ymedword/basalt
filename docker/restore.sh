@@ -40,15 +40,19 @@ fail() {
 project=${COMPOSE_PROJECT_NAME:-}
 [ -n "$project" ] || fail "必须显式设置 COMPOSE_PROJECT_NAME（备份来源项目），脚本不猜项目名"
 
-# 恢复中途失败会留下已创建的项目卷 / 容器，下次重跑会被“项目已有卷”挡住；
-# 失败时打印精确的清理命令，避免运维自己摸索。
-# A failed restore may leave volumes or containers behind, blocking the next attempt;
-# print the exact cleanup command instead of leaving the operator to guess.
+# 恢复中途失败会留下**本次运行**创建的卷 / 容器，下次重跑会被“项目已有卷”挡住；
+# 只在本次运行确实开始创建项目资源后打印清理命令。前置检查失败的路径（目标项目
+# 已有卷 / 容器、备份校验失败等）绝不提示 down -v——那会删掉别人的数据。
+# A failed restore may leave volumes or containers created by THIS run behind; print
+# the cleanup command only after this run started creating project resources. Precheck
+# refusals (an existing project, a bad checksum) never suggest `down -v`: that would
+# delete data the restore must not touch.
 restore_done=0
+created_project=0
 cleanup_hint() {
     status=$?
-    if [ "$restore_done" -ne 1 ] && [ "$status" -ne 0 ]; then
-        echo "basalt: 恢复未完成；项目 $new_project 可能已创建卷或容器。清理后重试：" >&2
+    if [ "$restore_done" -ne 1 ] && [ "$status" -ne 0 ] && [ "$created_project" -eq 1 ]; then
+        echo "basalt: 恢复未完成；本次运行已在项目 $new_project 创建卷或容器。清理后重试：" >&2
         echo "  docker compose -p $new_project down -v" >&2
     fi
 }
@@ -59,6 +63,9 @@ trap cleanup_hint EXIT
 
 if [ -n "$(docker volume ls --filter "label=com.docker.compose.project=$new_project" --format '{{.Name}}')" ]; then
     fail "项目 $new_project 已存在卷——恢复到全新项目名，不覆盖现有实例"
+fi
+if [ -n "$(docker ps -a --filter "label=com.docker.compose.project=$new_project" --format '{{.ID}}')" ]; then
+    fail "项目 $new_project 已存在容器——恢复到全新项目名，不覆盖现有实例"
 fi
 
 # COMPOSE_FILE 已设时交给 compose 自己解析（支持冒号分隔的多文件，容器 e2e 用它带
@@ -147,6 +154,11 @@ echo "basalt: 创建 $new_project 的卷与容器（不启动）"
 # unknown flag 拒绝（实测）。
 # `create` never starts containers; `--no-start` belongs to `up` and is rejected by
 # Compose v5.6.1 as an unknown flag.
+# 从这一行起项目资源由本次运行创建：前面两条前置检查已确认项目没有卷 / 容器，
+# 后续失败提示 down -v 只针对本次运行留下的资源。
+# From here on the project resources belong to this run: the prechecks above verified
+# the project has no volumes or containers, so a failure hint may name them.
+created_project=1
 restore_compose create >/dev/null
 
 container_id=$(restore_compose ps -a -q basalt | head -n 1)

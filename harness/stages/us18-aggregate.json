@@ -86,9 +86,9 @@
     },
     {
       "id": "us18-backup-restore",
-      "args": ["go", "test", "-json", "-count=1", "-timeout=30m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_(BackupRestore|UpgradeRollback)$"],
+      "args": ["go", "test", "-json", "-count=1", "-timeout=30m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_(BackupRestore|UpgradeRollback|RestoreRefusesExistingProject)$"],
       "timeout_seconds": 2100,
-      "required_tests": ["TestUS18_Compose_BackupRestore", "TestUS18_Compose_UpgradeRollback"],
+      "required_tests": ["TestUS18_Compose_BackupRestore", "TestUS18_Compose_UpgradeRollback", "TestUS18_Compose_RestoreRefusesExistingProject"],
       "level": "process"
     },
     {

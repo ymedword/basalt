@@ -87,3 +87,89 @@ func TestUS18_Image_BuildAndRecord(t *testing.T) {
 		t.Fatalf("同输入两次构建的记录不一致：\n第一次：\n%s\n第二次：\n%s", firstJSON, secondJSON)
 	}
 }
+
+// TestUS18_Image_PreExistingTagPreserved 是镜像 tag 隔离与清理归属保护的回归用例。
+// 修复前测试固定使用 basalt:0.0.1-linux-amd64：构建会覆盖宿主同名 tag，清理按 tag
+// 名直接删除，宿主原有镜像就此失去标签。现在测试版本每次运行随机（tag 唯一），
+// 清理前核对本次构建登记过的镜像 ID。判据：
+//  1. 宿主预先存在的 basalt:0.0.1-linux-amd64（连同其 ID）在本次构建与清理后原样保留；
+//  2. 登记 ID 与 tag 当前指向不一致时，删除被拒绝并说明原因；
+//  3. 阳性对照：归属一致时删除生效（清理不是空转）。
+//
+// TestUS18_Image_PreExistingTagPreserved guards tag isolation and ownership-checked
+// cleanup: a pre-existing basalt:0.0.1-linux-amd64 keeps its tag and ID, a mismatched
+// recorded ID refuses deletion, and a matching ID deletes normally.
+func TestUS18_Image_PreExistingTagPreserved(t *testing.T) {
+	us18RequireDocker(t)
+	root := us18RepoRoot(t)
+	lock := mustImageLock(t, root)
+	us18EnsureImage(t, lock.AppBase)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// 宿主“预先存在”的 tag：修复前的测试正是用这个名字覆盖 / 删除别人的镜像。
+	const preTag = "basalt:0.0.1-linux-amd64"
+	preID, existed := us18ImageID(ctx, preTag)
+	created := ""
+	if !existed {
+		if _, err := us18DockerOutput(ctx, "tag", lock.AppBase, preTag); err != nil {
+			t.Fatalf("准备预先存在的镜像 tag 失败: %v", err)
+		}
+		preID, existed = us18ImageID(ctx, preTag)
+		if !existed {
+			t.Fatalf("tag %s 创建后仍不存在", preTag)
+		}
+		created = preID
+		// 样本由本用例创建：断言全部完成后按归属删除，不给宿主留新 tag。
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cleanupCancel()
+			if _, _, err := us18RemoveImageTag(cleanupCtx, preTag, created); err != nil {
+				t.Errorf("清理用例创建的 tag %s 失败: %v", preTag, err)
+			}
+		})
+	}
+
+	// 走与其他用例相同的构建路径：tag 必须来自本次运行独有的版本。
+	record := us18BuildImageOnce(t, us18DefaultVersion, lock.AppBase)
+	if record.Tag == preTag {
+		t.Fatalf("测试镜像仍使用宿主可能已有的固定 tag %s", preTag)
+	}
+
+	// 归属保护：把预先存在的 tag 配上本次构建的 ID，删除必须被拒绝。
+	removed, note, err := us18RemoveImageTag(ctx, preTag, record.LocalID)
+	if err != nil {
+		t.Fatalf("归属不匹配不应报错: %v", err)
+	}
+	if removed {
+		t.Fatalf("tag %s 与登记 ID 不一致时仍被删除", preTag)
+	}
+	if note == "" {
+		t.Fatal("归属不一致时必须说明保留原因")
+	}
+	if got, ok := us18ImageID(ctx, preTag); !ok || got != preID {
+		t.Fatalf("预先存在的 tag %s 被改动：ID = %q（存在=%v），期望 %q", preTag, got, ok, preID)
+	}
+
+	// 阳性对照：只属于本用例的探针 tag，归属一致时删除生效。
+	probeTag := "us18-e2e-probe:" + us18DefaultVersion
+	if _, exists := us18ImageID(ctx, probeTag); exists {
+		t.Logf("探针 tag %s 已存在（非常规残留），跳过阳性对照", probeTag)
+		return
+	}
+	if _, err := us18DockerOutput(ctx, "tag", lock.AppBase, probeTag); err != nil {
+		t.Fatalf("创建探针 tag 失败: %v", err)
+	}
+	probeID, ok := us18ImageID(ctx, probeTag)
+	if !ok {
+		t.Fatalf("探针 tag %s 创建后不存在", probeTag)
+	}
+	removed, _, err = us18RemoveImageTag(ctx, probeTag, probeID)
+	if err != nil || !removed {
+		t.Fatalf("归属一致时删除应成功：removed=%v err=%v", removed, err)
+	}
+	if _, still := us18ImageID(ctx, probeTag); still {
+		t.Fatalf("归属一致删除后探针 tag %s 仍存在", probeTag)
+	}
+}

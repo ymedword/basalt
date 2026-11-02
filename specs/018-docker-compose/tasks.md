@@ -61,7 +61,7 @@
 - [x] T021 [US1] 在 `internal/e2e/us18_container_test.go` 落地 `TestUS18_Compose_ConfigRequiresSecrets`（A4）：缺 `BASALT_IMAGE`/任一 ingress → `compose config` 非零并点名；缺 secret → up 失败点名 `database_dsn`；ingress 置零 → `serve` 退出 1 且日志含 `服务启动要求下列配置项大于零`；全齐 → config 成功且输出不含口令
 - [x] T022 [US1] 落地 `TestUS18_Compose_AdminLogin`（A5）：`up -d --wait` 后 60 秒内可登录（SC-001）；正确 token 200、无/错 token 401、token 只从私有卷读出；断言容器内 `id -u == 10001`、根文件系统只读（写 `/` 失败）
 - [x] T023 [US1] 落地 `TestUS18_Compose_TaskAndKnowledge`（A6）：mock 模型完成一次 Run（`GET /api/v1/runs/{id}` 终态 `completed`、回复非空）；上传 `.md` → 摄取 → `POST /api/v1/search` 命中同一片段
-- [x] T024 [US1] 落地 `TestUS18_Cleanup_NoResidue`（A15）：项目名以 `us18-` 前缀 + 随机后缀；`down -v` 后按同一前缀核对容器 / 卷 / 网络 / 镜像四类残留为零；全程不对用户实例执行命令
+- [x] T024 [US1] 落地 `TestUS18_Cleanup_NoResidue`（A15）：项目名以 `us18-` 前缀 + 随机后缀；`down -v` 后按同一前缀核对容器 / 卷 / 网络 / 镜像四类残留为零；全程不对用户实例执行命令（外部 review 修复②后，镜像类改由（tag, LocalID）登记 + 归属核对删除，不再依赖 tag 前缀扫描；A15 四类判据不变，见 run-state 失败台账）
 
 **Checkpoint**: US1 独立可验收（A1、A3–A6、A15）；MVP 可演示
 
@@ -105,7 +105,7 @@
 **Independent Test**: 备份 → 全新项目恢复 → 旧 token / 旧知识 / `instance_id` 均可用，secret 权限正确
 
 - [x] T034 [P] [US4] 新建 `docker/backup.sh`：要求 root 或 `--user 0`；`stop basalt` → `pg_dump -Fc` → 打包 workspace/private 卷 → 复制 secrets（目录 0700、文件 0600）→ `SHA256SUMS` → `start`；失败不吞错；备份目录仅所有者可访问（FR-013）
-- [x] T035 [P] [US4] 新建 `docker/restore.sh`：要求 root 或 `--user 0`；恢复前先按 `SHA256SUMS` 校验四件套（不符即停止）；全新项目：建卷、校正属主 10001、解包、`pg_restore`、放 secrets 并重设 `root:root 0400` / `10001:10001 0400`、`up -d`；拒绝覆盖已有数据卷
+- [x] T035 [P] [US4] 新建 `docker/restore.sh`：要求 root 或 `--user 0`；恢复前先按 `SHA256SUMS` 校验四件套（不符即停止）；全新项目：建卷、校正属主 10001、解包、`pg_restore`、放 secrets 并重设 `root:root 0400` / `10001:10001 0400`、`up -d`；拒绝覆盖已有数据卷（外部 review 修复①：清理提示只在本次运行已创建项目资源后给出；新增回归 `TestUS18_Compose_RestoreRefusesExistingProject`，见 run-state 失败台账）
 - [x] T036 [US4] 落地 `TestUS18_Compose_BackupRestore`（A8）：四件套备份 → 新项目恢复 → 旧 token 200、旧知识命中、托管模型连接可用、`instance_id` 一致；恢复后 secret `stat` 符合规定
 
 **Checkpoint**: US4 独立通过；备份件不进入仓库或测试日志
@@ -147,12 +147,12 @@
 ## Phase 9: Polish & Cross-Cutting Concerns
 
 - [x] T047 定稿 `harness/stages/us18-*.json`：`required_tests` 与模块卡 §4.3 逐字一致；`us18-windows.json` 用 `wsl -d Ubuntu -- bash -lc` 包装；`us18-aggregate.json` 汇总并记录判别力映射
-- [ ] T048 在 `.github/workflows/ci.yml` 新增 `container` job（不改 `test` job）：匿名拉固定 digest、`make build`、`--stage-only` 跑 `us18-linux`、`--out` 与 artifact 上传、`if: always()` 按 `us18-ci-<run_id>-` 枚举项目并清理、断言四类残留为零
+- [x] T048 在 `.github/workflows/ci.yml` 新增 `container` job（不改 `test` job）：匿名拉固定 digest、`make build`、`--stage-only` 跑 `us18-linux`、`--out` 与 artifact 上传、`if: always()` 按 `us18-ci-<run_id>-` 枚举项目并清理、断言四类残留为零（PR #2 CI run 41521764079 / job 125539295588：6/6 检查、15 用例、0 跳过、零残留；证据见 run-state §5）
 - [x] T049 [P] 更新 `docs/Operations.md`：容器部署、secret 准备（含 9p 限制）、备份 / 恢复 / 升级 / 回退、故障排障；命令与 `docker/` 实际脚本一致
 - [x] T050 [P] 更新 `docs/TechnicalDesign.md` §7.2 / §8.2、`docs/Requirements.md` §6.3、`docs/Compatibility.md`、根 `README.md`：只补容器部署事实，不改产品契约与既有验收口径
 - [x] T051 全量门禁：`make check`、`make cover`、`go test -race`、`sh scripts/check-acceptance.sh`（含 `us18-base` 与 `us18-linux`）；逐目标四态记录，失败即修（本机 `make check` 与 11 项全量 profile 通过；`us18-linux` 由草稿 PR 的 `container` job 判卷，证据见 run-state §5）
-- [ ] T052 在 `018-docker-compose` 提交、推送并创建草稿 PR，跟进 CI；失败按失败台账修复；**不合并 main**
-- [ ] T053 准备人工走查实例与收口材料：启动实例、访问方式、简明验收步骤、测试 / CI 证据、已知限制；更新 `run-state.md` 未验证清单与收口结论为“待人工 review ②”
+- [x] T052 在 `018-docker-compose` 提交、推送并创建草稿 PR，跟进 CI；失败按失败台账修复；**不合并 main**（提交 `8b71421`＋digest 修正 `2891ece`；草稿 PR #2；run 41521764079 六 job 全绿。首次 CI 拉取失败按 F11 修复，push 重跑同步跟进）
+- [x] T053 准备人工走查实例与收口材料：启动实例、访问方式、简明验收步骤、测试 / CI 证据、已知限制；更新 `run-state.md` 未验证清单与收口结论为“待人工 review ②”（实例 `basalt-us18-demo` 运行于 127.0.0.1:8080；U-18-10 已按 CI 实跑登记；收口结论保持“待人工 review ②”，材料见交付说明）
 
 ---
 

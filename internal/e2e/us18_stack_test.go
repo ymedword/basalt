@@ -34,14 +34,11 @@ import (
 	"github.com/ymedword/basalt/scripts/releasekit"
 )
 
-// 容器 e2e 的固定事实：测试版本必须是合法 semver（BuildImage 的 ValidateVersion），
-// 端口是容器内监听端口，入口限流六项按「> 0」的启动前置条件给足。
-// Fixed container-e2e facts: legal semver test versions, the in-container port and
-// non-zero ingress values (serve refuses to start with any at zero).
+// 容器 e2e 的固定事实：入口限流六项按「> 0」的启动前置条件给足；测试版本见下方
+// 随机版本说明。
+// Fixed container-e2e facts: non-zero ingress values (serve refuses to start with any
+// at zero); test versions are random per run (see below).
 const (
-	us18DefaultVersion = "0.0.1"
-	us18UpgradeVersion = "0.0.2"
-
 	us18ProjectPrefixEnv = "BASALT_E2E_PROJECT_PREFIX"
 	us18RequireDockerEnv = "BASALT_E2E_REQUIRE_DOCKER"
 	us18KeepEnv          = "BASALT_US18_KEEP"
@@ -59,67 +56,163 @@ const (
 	us18FakeKey = "us18-fake-key-not-a-secret"
 )
 
-// us18Artifacts 记录本次进程构建过的镜像 tag 与临时目录；TestMain 只清理这些，
-// 绝不按固定 tag 名称删别人的镜像。
+// 测试版本每次运行随机生成合法 semver：releasekit 把镜像 tag 固定推导为
+// basalt:<version>-<linux>-<amd64>，版本唯一即 tag 唯一——测试因此不会覆盖宿主
+// 已有的同名镜像标签（例如正式发布留下的 basalt:0.0.1-linux-amd64）；清理也只删
+// 本次构建登记过 ID 的 tag。
+// Test versions are random valid semver per run: releasekit derives the tag
+// basalt:<version>-<os>-<arch>, so a unique version means a unique tag that cannot
+// shadow a host image, and cleanup deletes only tags whose recorded ID still matches.
+var (
+	us18VersionSeed    = us18NewVersionSeed()
+	us18DefaultVersion = us18VersionAt(0)
+	us18UpgradeVersion = us18VersionAt(1)
+)
+
+// us18NewVersionSeed 起随机种子：panic 即夹具环境不可用（与随机项目名同一口径）。
+// us18NewVersionSeed seeds the per-run version; a panic means the fixture host is
+// unusable, matching the random project-name helper.
+func us18NewVersionSeed() int {
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		panic("e2e us18: 读取随机源失败: " + err.Error())
+	}
+	return (int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])) % 800000000
+}
+
+// us18VersionAt 返回本次运行独有的 X.Y.Z；offset 区分同一次运行的不同版本。
+// us18VersionAt returns a per-run-unique X.Y.Z; offset separates versions of one run.
+func us18VersionAt(offset int) string {
+	return fmt.Sprintf("0.0.%d", 100000000+us18VersionSeed+offset)
+}
+
+// us18ImageTag 配对测试镜像 tag 与本次构建产出的局部 ID：清理时只有 tag 仍指向
+// 这个 ID（归属核对通过）才删除，避免删掉宿主后来指向别的镜像的同名 tag。
+// us18ImageTag pairs a test tag with the local ID this run produced; cleanup removes
+// the tag only while it still points at that ID.
+type us18ImageTag struct {
+	tag string
+	id  string
+}
+
+// us18Artifacts 记录本次进程构建过的镜像 tag 与临时目录；TestMain 只清理这些。
 // us18Artifacts records the image tags and temp dirs this process created; TestMain
-// removes only these, never anyone else's image sharing the fixed tag name.
+// removes only these.
 var us18Artifacts = struct {
 	mu   sync.Mutex
 	dirs []string
-	tags []string
+	tags []us18ImageTag
 }{}
 
-// us18RecordArtifact 登记一个需要清理的镜像 tag 或临时目录。
-// us18RecordArtifact registers one image tag or temp dir for cleanup.
-func us18RecordArtifact(dir, tag string) {
+// us18RecordDir 登记一个需要清理的临时目录。
+// us18RecordDir registers a temp dir for cleanup.
+func us18RecordDir(dir string) {
 	us18Artifacts.mu.Lock()
 	defer us18Artifacts.mu.Unlock()
 	if dir != "" {
 		us18Artifacts.dirs = append(us18Artifacts.dirs, dir)
 	}
+}
+
+// us18RecordImageTag 登记本次构建的镜像 tag 与其局部 ID（清理归属判据）。
+// us18RecordImageTag registers the tag and local ID of one build (the cleanup
+// ownership verdict).
+func us18RecordImageTag(tag, id string) {
+	us18Artifacts.mu.Lock()
+	defer us18Artifacts.mu.Unlock()
 	if tag != "" {
-		us18Artifacts.tags = append(us18Artifacts.tags, tag)
+		us18Artifacts.tags = append(us18Artifacts.tags, us18ImageTag{tag: tag, id: id})
 	}
 }
 
-// us18CleanupImages 由 TestMain 在 m.Run 之后调用：删除本次构建的镜像 tag 与临时
-// 目录，并用 `docker image inspect` 复检每个 tag 确已消失——残留即返回错误，由
-// TestMain 并入退出码（A15 的镜像类判据；固定 tag 不在项目名前缀扫描面内）。
+// us18CleanupImages 由 TestMain 在 m.Run 之后调用：按归属删除本次构建的镜像 tag
+// 与临时目录，并用 `docker image inspect` 复检每个 tag 确已消失——残留即返回错误，
+// 由 TestMain 并入退出码（A15 的镜像类判据）。
 // `BASALT_US18_KEEP=1` 时保留现场，便于人工排障。
-// us18CleanupImages removes the tags and temp dirs built by this run and re-checks with
-// `docker image inspect` that each tag is gone; any leftover is returned and folded into
-// TestMain's exit code (the image arm of A15, since the fixed tag is not project-prefixed).
+// us18CleanupImages removes the tags and temp dirs built by this run after an ownership
+// check and re-checks with `docker image inspect` that each tag is gone; any leftover is
+// returned and folded into TestMain's exit code (the image arm of A15).
 // BASALT_US18_KEEP=1 keeps the scene for debugging.
 func us18CleanupImages() error {
 	if os.Getenv(us18KeepEnv) == "1" {
 		return nil
 	}
 	us18Artifacts.mu.Lock()
-	defer us18Artifacts.mu.Unlock()
-	seen := make(map[string]struct{}, len(us18Artifacts.tags))
+	dirs := append([]string(nil), us18Artifacts.dirs...)
+	tags := append([]us18ImageTag(nil), us18Artifacts.tags...)
+	us18Artifacts.mu.Unlock()
+	// 同一 tag 可能被本进程构建多次（A1 两次构建）：以最后一次登记的 ID 为归属，
+	// 更早的镜像已被同 tag 覆盖，按“已不再指向该 ID”跳过。
+	// One tag may be built several times in one process (A1 builds twice): the last
+	// registered ID owns the tag; earlier images were already replaced.
+	last := make(map[string]string, len(tags))
+	for _, tag := range tags {
+		last[tag.tag] = tag.id
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	var failures []error
-	for _, tag := range us18Artifacts.tags {
-		if _, dup := seen[tag]; dup {
-			continue
-		}
-		seen[tag] = struct{}{}
-		if _, err := us18DockerOutput(ctx, "image", "rm", tag); err != nil {
-			// rm 报错可能只是标签已被删掉；是否存在以 inspect 的事实为准。
-			// The rm error may only mean the tag is already gone; inspect is the arbiter.
-			fmt.Fprintf(os.Stderr, "e2e: 清理镜像 %s 报错（继续核对是否仍存在）: %v\n", tag, err)
-		}
-		if _, err := us18DockerOutput(ctx, "image", "inspect", "--format", "{{.Id}}", tag); err == nil {
-			failures = append(failures, fmt.Errorf("镜像 %s 在清理后仍存在", tag))
+	for tag, id := range last {
+		removed, note, err := us18RemoveImageTag(ctx, tag, id)
+		switch {
+		case err != nil:
+			failures = append(failures, err)
+		case !removed && note != "":
+			fmt.Fprintf(os.Stderr, "e2e: %s\n", note)
 		}
 	}
-	for _, dir := range us18Artifacts.dirs {
+	for _, dir := range dirs {
 		if err := os.RemoveAll(dir); err != nil {
 			failures = append(failures, fmt.Errorf("清理临时目录 %s 失败: %w", dir, err))
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// us18ImageID 返回 tag 当前指向的镜像 ID；tag 不存在时 ok=false。
+// us18ImageID returns the image ID the tag currently points at; ok=false when the tag
+// does not exist.
+func us18ImageID(ctx context.Context, tag string) (string, bool) {
+	out, err := us18DockerOutput(ctx, "image", "inspect", "--format", "{{.Id}}", tag)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(out), true
+}
+
+// us18RemoveImageTag 按归属删除一个测试镜像 tag：先 inspect 当前 ID，只有与本次
+// 构建登记的 ID 一致才执行 `docker image rm`。返回值：
+//   - tag 已不存在 → removed=false, note="", err=nil；
+//   - 当前 ID 与登记不符 → removed=false, note=保留说明, err=nil（不删别人的镜像）；
+//   - 缺少登记 ID → err（没有归属证据就拒绝删除）；
+//   - 删除失败或删除后仍能 inspect 到 → err（A15 红态）。
+//
+// us18RemoveImageTag deletes a test tag only while it still points at the ID this run
+// built; a tag re-pointed by someone else is left untouched and explained.
+func us18RemoveImageTag(ctx context.Context, tag, expectedID string) (bool, string, error) {
+	if expectedID == "" {
+		return false, "", fmt.Errorf("镜像 %s 缺少登记 ID，拒绝删除（无法核对归属）", tag)
+	}
+	currentID, exists := us18ImageID(ctx, tag)
+	if !exists {
+		return false, "", nil
+	}
+	if currentID != expectedID {
+		return false, fmt.Sprintf("镜像 %s 现指向 %s，不是本次构建的 %s，保留不动",
+			tag, currentID, expectedID), nil
+	}
+	if _, err := us18DockerOutput(ctx, "image", "rm", tag); err != nil {
+		// rm 报错可能只是标签已被删掉；是否存在以 inspect 的事实为准。
+		// The rm error may only mean the tag is already gone; inspect is the arbiter.
+		if _, still := us18ImageID(ctx, tag); still {
+			return false, "", fmt.Errorf("删除测试镜像 %s 失败：%w", tag, err)
+		}
+		return true, "", nil
+	}
+	if _, still := us18ImageID(ctx, tag); still {
+		return false, "", fmt.Errorf("镜像 %s 在清理后仍存在", tag)
+	}
+	return true, "", nil
 }
 
 // us18RepoRoot 包装既有 repoRoot()（模块卡 §3.1 的 repoRoot(t) 与既有符号重名，
@@ -252,7 +345,7 @@ func us18BinaryFor(t *testing.T, version string) string {
 	if err != nil {
 		t.Fatalf("创建二进制输出目录失败: %v", err)
 	}
-	us18RecordArtifact(dir, "")
+	us18RecordDir(dir)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	result, err := releasekit.BuildTarget(ctx, releasekit.Inputs{
@@ -301,7 +394,7 @@ func us18BuildImageOnce(t *testing.T, version, baseRef string) releasekit.ImageR
 	if err != nil {
 		t.Fatalf("创建镜像产物目录失败: %v", err)
 	}
-	us18RecordArtifact(outDir, "")
+	us18RecordDir(outDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	record, err := releasekit.BuildImage(ctx, releasekit.ImageInputs{
@@ -319,7 +412,7 @@ func us18BuildImageOnce(t *testing.T, version, baseRef string) releasekit.ImageR
 	if err != nil {
 		t.Fatalf("构建镜像 %s 失败: %v", version, err)
 	}
-	us18RecordArtifact("", record.Tag)
+	us18RecordImageTag(record.Tag, record.LocalID)
 	return record
 }
 

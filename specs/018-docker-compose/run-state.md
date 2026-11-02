@@ -53,6 +53,9 @@
 | 2026-11-03 | 独立复核 F8：`restore.sh` 中途失败会在目标项目留下已建卷 / 容器且无提示 | 失败路径必须给出可执行清理提示，成功路径不得误报 | EXIT trap 在未完成时打印 `docker compose -p <新项目> down -v` 提示；成功后置 `restore_done=1` | 1 |
 | 2026-11-03 | 独立复核 F10：记录 / 矩阵的未知 `kind` 会被归档核对与镜像核对同时跳过，篡改矩阵可静默过关 | 取值集合只允许 `""` / `image`，双向显式拒绝 | `VerifyImages` 与 `crossCheckRecord` 各自拒绝；新增 `TestUS18_Image_RejectsUnknownEvidenceKind` 覆盖两处 | 1 |
 | 2026-11-03 | 草稿 PR 首次 CI：`container` job 在「Pull pinned public base images」步骤红——`docker.io/library/alpine@sha256:7cb3c9…` 返回 `not found`（本机 e2e 全绿是因为镜像已在本地，CI 才是首次真实拉取） | 锁文件里两个 digest 已非上游现行值：本机守护进程使用 containerd 镜像存储（`overlayfs` / containerd snapshotter），镜像 ID 即 manifest digest，`RepoDigest == ID` 属正常现象（先前“合成引用”推断错误，已按此更正）。经两个独立 pull-through 镜像站按 tag 取到的 manifest 字节哈希与响应头一致且两站相同（alpine `ff7f0c72…`、pgvector `7d0a41…`），按 digest 请求均 200；旧值不在当前任何多架构索引中。本机无法直连 Docker Hub，拉取时只能经镜像缓存，缓存给出的旧 manifest 已在上游被替换 / 回收 | 锁文件、`Dockerfile` 的 `ARG BASE_IMAGE` 默认值、`compose.yaml`、`.env.example` 四处同步改为上游 digest（`alpine:3.23@sha256:ff7f0c72…`、`pgvector/pgvector:0.8.7-pg17-bookworm@sha256:7d0a41…`）；`go test ./scripts/releasekit ./cmd/basalt-verify` 通过。本机无法重跑镜像构建（Docker Hub 不可达、无 sudo 配置镜像代理），最终由 PR CI `container` job 复判。模块卡 §2.4 的字面 digest 由锁文件单一维护，卡片文本不改，以锁文件为准 | 1 |
+| 2026-11-03 | 外部 review 发现①（HIGH）：`restore.sh` 的 EXIT trap 在前置检查**之前**注册，目标项目已有卷 / 容器的拒绝路径也会打印 `docker compose -p <项目> down -v`——提示删除的正是别人的数据 | 清理提示只应对**本次运行实际创建**的资源给出；前置检查拒绝时项目资源不属本次运行 | 引入 `created_project` 门：置 1 紧邻 `restore_compose create`（此前已确认项目无卷 / 容器）；顺带补容器前置检查（原只有卷检查）。新增回归 `TestUS18_Compose_RestoreRefusesExistingProject`：预置带 compose 标签的卷，断言非零退出、点名「已存在卷」、输出**不含** `down -v`、卷仍在。反向验证：临时去掉 `created_project` 门后该用例 FAIL 并复现危险提示，恢复后 PASS（0.58s） | 1 |
+| 2026-11-03 | 外部 review 发现②（HIGH）：容器 e2e 固定使用 `basalt:0.0.1-linux-amd64`，真实 `docker build` 会覆盖宿主同名 tag；清理按 tag 名 `docker image rm`，宿主原有镜像就此失去标签 | 测试侧隔离即可消除破坏面，不必改 releasekit 的 tag 推导与 `ValidateVersion`（用户明确不借此重构发布工具） | 三处：① 测试版本每次运行随机（`0.0.<100000000+seed+偏移>`，仍满足 `X.Y.Z`），tag 自然唯一；② 镜像登记改为（tag, LocalID）对，同一 tag 重复构建以最后登记的 ID 为准；③ 清理前 `docker image inspect` 核对现指向 ID 与登记一致，不一致保留不动并说明。新增回归 `TestUS18_Image_PreExistingTagPreserved`：预置 `basalt:0.0.1-linux-amd64`，断言构建不沿用该 tag、归属不匹配拒绝删除、预置 ID 原样保留、阳性对照（探针 tag 归属一致可删）。反向验证：把版本临时改回固定 0.0.1 后该用例 FAIL 并指名固定 tag，恢复后 PASS（21.68s） | 1 |
+| 2026-11-03 | 更正上表 2026-11-02 行「模块卡 §4.7 镜像 tag 项目前缀」的处置：当时以固定 tag 实施并登记偏离；修复发现②后改为**每次运行随机版本**的 tag | 归属保护（登记 ID 核对）取代前缀扫描承担清理正确性；tag 前缀在 `ValidateVersion` 的 `X.Y.Z` 约束下不可行，且前缀只解决“扫得到”，不解决“删得对” | 偏离性质变更：镜像类残留不再靠前缀扫描，而由（tag, LocalID）登记 + 归属核对承担；A15 容器 / 卷 / 网络判据不变，stage 的 `us18-image-build` 新增该回归于 `^TestUS18_Image_` 组内 | 2 |
 
 ## 3. 停止预算与计数
 
@@ -75,7 +78,7 @@
 | U-18-07 | 跨 schema 升级回退 | 只有一个版本 | 第二版本出现后 |
 | U-18-08 | 外部 PostgreSQL | 只测随附 PG | 提供外部库环境 |
 | U-18-09 | full 档镜像 | 运行期组件未备齐 | US-17 组件齐备后 |
-| U-18-10 | 部署 CI 宿主的 Docker / Compose 版本 | 首次 CI 实跑后登记 | `container` job 首次实跑 |
+| U-18-10 | 部署 CI 宿主的 Docker / Compose 版本 | **已验证（2026-11-02，run 41521764079 / job 125539295588）**：GitHub `ubuntu-latest` runner 为 Docker Engine 29.4.2（API 1.54）、containerd 2.4.2、runc 1.5.2、Docker Compose v5.1.3（`container` job 日志 step “Record runner Docker / Compose versions”） | 无（已登记） |
 | U-18-11 | WSL `/mnt/d`（9p/drvfs）上的 secret 属主 / 权限 | 文件系统忽略 chown/chmod；脚本会拒绝 | 改用 ext4 或 Docker 卷 |
 
 ## 5. 收口结论
@@ -93,6 +96,11 @@
 | us18-base（source：image-unit / docs） | `--stage-only --stage harness/stages/us18-base.json` | PASS，2/2 | `.loop/runs/us18-base/report.json`（18:47Z） |
 | us18-windows（process：6 检查 / 15 用例） | `--stage-only --stage harness/stages/us18-windows.json` | PASS，6/6，15 用例，0 跳过 | `.loop/runs/us18-windows-final/report.json`（19:00Z，指纹 `c00236b3…`） |
 | us18-aggregate（source＋process 同轮） | `--stage-only --stage harness/stages/us18-aggregate.json` | PASS，8/8 检查，34 用例，0 跳过，指纹 `f1f1ecbb…` | `.loop/runs/us18-aggregate/report.json`（2026-11-02T19:48Z；跑在 review 修复后的未提交树上，提交后的判卷见 PR CI） |
-| us18-linux（CI `container` job） | `.github/workflows/ci.yml` | 待草稿 PR 实跑 | PR CI |
+| us18-linux（CI `container` job） | `.github/workflows/ci.yml`（run 41521764079，job 125539295588） | PASS，6/6 检查，15 用例，0 跳过；按前缀清理并断言零残留 | `.loop/runs/us18-ci-41521764079-1/report.json`（CI artifact `container-evidence`，2026-11-02T20:51Z） |
+| 全量验收（CI `test` job，提交后判卷） | `.github/workflows/ci.yml`（run 41521764079，job 125539295329） | PASS，11/11，指纹 `51430a7e…`；stage lint、current-tree、us15-linux、tzdata 同 job 通过 | `.loop/runs/ci-41521764079-1/report.json`（CI artifact `acceptance-evidence` ID 13179856735，2026-11-02T20:56Z） |
+| 修复①定点回归（本地） | `go test -tags=e2e ./internal/e2e -run '^TestUS18_Compose_RestoreRefusesExistingProject$'`（WSL Ubuntu） | PASS（0.58s）；反向验证失败态已复现并回滚 | 本机实测 2026-11-03；提交后由 PR CI `container` job 的 `us18-backup-restore` 检查复判 |
+| 修复②定点回归（本地） | `go test -tags=e2e ./internal/e2e -run '^TestUS18_Image_'`（WSL Ubuntu，含 `BuildAndRecord` + `PreExistingTagPreserved`） | PASS（A1 31.11s，回归 14.24s）；反向验证失败态已复现并回滚 | 本机实测 2026-11-03；提交后由 PR CI `container` job 的 `us18-image-build` 检查复判 |
+| 修复后备份恢复组复跑（本地） | `go test -tags=e2e ./internal/e2e -run '^TestUS18_Compose_(BackupRestore\|UpgradeRollback\|RestoreRefusesExistingProject)$'` | PASS（62.29s / 72.92s / 0.55s） | 本机实测 2026-11-03 |
+| 格式与静态检查（修复后） | `sh scripts/check-format.sh`；`go vet -tags=e2e ./internal/e2e` | 均干净 / 退出 0 | 本机实测 2026-11-03 |
 
-说明：`us18-full` 跑在 F-02 清理断言改动之前；修复后的内容由 `us18-full-final`（`f1f1ecbb`）与 `us18-aggregate`（同指纹）两轮全量覆盖——前者覆盖 11 项 profile，后者覆盖 8 项 source/process 检查（34 用例）。`us18-aggregate`、`us18-full-final` 与 `make check` 均跑在未提交的 review 修复树上，指纹绑定当时内容；提交后的最终判卷以 PR CI 的 `test`（全量 profile）与 `container`（`us18-linux`）job 为准。
+说明：`us18-full` 跑在 F-02 清理断言改动之前；修复后的内容由 `us18-full-final`（`f1f1ecbb`）与 `us18-aggregate`（同指纹）两轮全量覆盖——前者覆盖 11 项 profile，后者覆盖 8 项 source/process 检查（34 用例）。`us18-aggregate`、`us18-full-final` 与 `make check` 均跑在未提交的 review 修复树上，指纹绑定当时内容。提交后的判卷由 PR #2 CI（commit `2891ece`，run 41521764079）完成：`container` job 的 `us18-linux` 阶段 6/6 与 `test` job 的全量 profile 11/11 均绿；同 SHA 的 push run 41521755007 六个 job 亦全绿。CI 指纹为 `51430a7e…`，与本地 `f1f1ecbb…` 不同是因为 digest 修正（F11，四处锁文件消费点）发生在本地全量运行之后、提交之前——两者各自绑定实际被判卷的树。`container` job 首次实跑记录 runner 环境：Docker Engine 29.4.2（API 1.54）、containerd 2.4.2、runc 1.5.2、Docker Compose v5.1.3。

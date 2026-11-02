@@ -12,6 +12,8 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -593,6 +595,76 @@ func TestUS18_Compose_UpgradeRollback(t *testing.T) {
 			t.Fatalf("回退后 %s 属主 / 权限 = %d:%d %o，期望 %d:%d %o",
 				want.name, uid, gid, mode.Perm(), want.uid, want.gid, want.mode)
 		}
+	}
+}
+
+// TestUS18_Compose_RestoreRefusesExistingProject 是恢复脚本前置检查的回归用例：
+// 目标项目已有卷时脚本拒绝恢复，并且**不得**建议对该项目执行 down -v——那会删掉
+// 已有数据。修复前 cleanup_hint 在任何非零退出都打印统一清理提示，包括这条拒绝路径。
+// TestUS18_Compose_RestoreRefusesExistingProject is the regression for the restore
+// precheck: refusing an existing project must not suggest `down -v`, which would
+// delete the data the refusal exists to protect.
+func TestUS18_Compose_RestoreRefusesExistingProject(t *testing.T) {
+	us18RequireDocker(t)
+	root := us18RepoRoot(t)
+	dir := us18StageAssets(t, root)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// 能通过校验和检查的备份目录：拒绝发生在放 secret / create 之前，不需要真备份。
+	backupDir := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatalf("创建备份目录失败: %v", err)
+	}
+	dump := []byte("us18-restore-precheck")
+	if err := os.WriteFile(filepath.Join(backupDir, "database.dump"), dump, 0o600); err != nil {
+		t.Fatalf("写备份文件失败: %v", err)
+	}
+	sum := sha256.Sum256(dump)
+	checksums := hex.EncodeToString(sum[:]) + "  database.dump\n"
+	if err := os.WriteFile(filepath.Join(backupDir, "SHA256SUMS"), []byte(checksums), 0o600); err != nil {
+		t.Fatalf("写校验和失败: %v", err)
+	}
+
+	// 伪造“已有数据”的目标项目：一个带 compose 项目标签的卷。
+	project := us18ProjectName("restore-precheck")
+	volume := project + "_database-data"
+	if out, err := us18DockerOutput(ctx, "volume", "create",
+		"--label", "com.docker.compose.project="+project,
+		"--label", "com.docker.compose.volume=database-data",
+		volume); err != nil {
+		t.Fatalf("创建已有项目卷失败: %v（%s）", err, strings.TrimSpace(out))
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+		_, _ = us18DockerOutput(cleanupCtx, "volume", "rm", volume)
+	})
+
+	cmd := exec.CommandContext(ctx, "sh", filepath.Join(dir, "restore.sh"), backupDir, project)
+	cmd.Dir = dir
+	cmd.Env = mergeEnv(os.Environ(), map[string]string{
+		"COMPOSE_PROJECT_NAME": project + "-source",
+		"COMPOSE_FILE":         filepath.Join(dir, "compose.yaml") + ":" + filepath.Join(dir, "compose.test.yaml"),
+	})
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("恢复到已有卷的项目必须被拒绝，实际退出 0：%s", buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "已存在卷") {
+		t.Fatalf("失败原因不是“项目已存在卷”前置检查：%s", us18Tail(out, 2000))
+	}
+	// 回归判据：拒绝路径不得提示对该项目执行 down -v。
+	if strings.Contains(out, "down -v") {
+		t.Fatalf("拒绝恢复已有项目时不得建议 down -v（会删掉已有数据）：%s", us18Tail(out, 2000))
+	}
+	// 数据卷仍在原处。
+	if _, err := us18DockerOutput(ctx, "volume", "inspect", "--format", "{{.Name}}", volume); err != nil {
+		t.Fatalf("拒绝恢复后已有卷不见了: %v", err)
 	}
 }
 
