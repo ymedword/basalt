@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "id": "us18-linux",
+  "approval": "User review 1 passed 2026-11-02 (US-18 R7/R8 module card). Implementation authorized; closeout awaits user review 2.",
+  "inputs": [
+    "specs/018-docker-compose/spec.md",
+    "specs/018-docker-compose/plan.md",
+    "specs/018-docker-compose/tasks.md",
+    "release/image-lock.json",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/e2e/us18_image_test.go",
+    "internal/e2e/us18_stack_test.go",
+    "internal/e2e/us18_fixture_test.go",
+    "internal/e2e/us18_container_test.go"
+  ],
+  "checks": [
+    {
+      "id": "us18-compose-config",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=5m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_ConfigRequiresSecrets$"],
+      "timeout_seconds": 600,
+      "required_tests": ["TestUS18_Compose_ConfigRequiresSecrets"],
+      "level": "process"
+    },
+    {
+      "id": "us18-image-build",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=20m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Image_"],
+      "timeout_seconds": 1500,
+      "required_tests": ["TestUS18_Image_BuildAndRecord"],
+      "level": "process"
+    },
+    {
+      "id": "us18-container-core",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=30m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_(AdminLogin|TaskAndKnowledge|RecreatePreservesIdentity|GracefulShutdown)$"],
+      "timeout_seconds": 2100,
+      "required_tests": [
+        "TestUS18_Compose_AdminLogin",
+        "TestUS18_Compose_TaskAndKnowledge",
+        "TestUS18_Compose_RecreatePreservesIdentity",
+        "TestUS18_Compose_GracefulShutdown"
+      ],
+      "level": "process"
+    },
+    {
+      "id": "us18-container-faults",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=30m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_(DatabaseUnavailable|WrongCredentials|VolumePermissions|SecretPermissions|RestartDoesNotRerun|SecondInstanceRejected)$"],
+      "timeout_seconds": 2100,
+      "required_tests": [
+        "TestUS18_Compose_DatabaseUnavailable",
+        "TestUS18_Compose_WrongCredentials",
+        "TestUS18_Compose_VolumePermissions",
+        "TestUS18_Compose_SecretPermissions",
+        "TestUS18_Compose_RestartDoesNotRerun",
+        "TestUS18_Compose_SecondInstanceRejected"
+      ],
+      "level": "process"
+    },
+    {
+      "id": "us18-backup-restore",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=30m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Compose_(BackupRestore|UpgradeRollback)$"],
+      "timeout_seconds": 2100,
+      "required_tests": ["TestUS18_Compose_BackupRestore", "TestUS18_Compose_UpgradeRollback"],
+      "level": "process"
+    },
+    {
+      "id": "us18-cleanup",
+      "args": ["go", "test", "-json", "-count=1", "-timeout=5m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Cleanup_NoResidue$"],
+      "timeout_seconds": 600,
+      "required_tests": ["TestUS18_Cleanup_NoResidue"],
+      "level": "process"
+    }
+  ],
+  "tasks": [
+    {"id": "T014", "checks": ["us18-image-build"]},
+    {"id": "T015", "checks": ["us18-image-build"]},
+    {"id": "T016", "checks": ["us18-image-build"]},
+    {"id": "T017", "checks": ["us18-image-build"]},
+    {"id": "T018", "checks": ["us18-compose-config"]},
+    {"id": "T019", "checks": ["us18-compose-config"]},
+    {"id": "T020", "checks": ["us18-compose-config"]},
+    {"id": "T021", "checks": ["us18-compose-config"]},
+    {"id": "T022", "checks": ["us18-container-core"]},
+    {"id": "T023", "checks": ["us18-container-core"]},
+    {"id": "T024", "checks": ["us18-cleanup"]},
+    {"id": "T025", "checks": ["us18-container-core"]},
+    {"id": "T026", "checks": ["us18-container-core"]},
+    {"id": "T027", "checks": ["us18-container-faults"]},
+    {"id": "T028", "checks": ["us18-container-faults"]},
+    {"id": "T029", "checks": ["us18-container-faults"]},
+    {"id": "T030", "checks": ["us18-container-faults"]},
+    {"id": "T031", "checks": ["us18-container-core"]},
+    {"id": "T032", "checks": ["us18-container-faults"]},
+    {"id": "T033", "checks": ["us18-container-faults"]},
+    {"id": "T034", "checks": ["us18-backup-restore"]},
+    {"id": "T035", "checks": ["us18-backup-restore"]},
+    {"id": "T036", "checks": ["us18-backup-restore"]},
+    {"id": "T037", "checks": ["us18-backup-restore"]},
+    {"id": "T038", "checks": ["us18-container-core"]}
+  ]
+}

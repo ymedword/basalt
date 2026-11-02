@@ -1,0 +1,97 @@
+# US-18 Run State：Docker／Compose 单实例部署
+
+> 1. 本文件是**过程状态，非设计工件**——speckit 命令不得把它当设计输入；
+> 2. 失败台账**只追加**：一行一次尝试，不改旧行；
+> 3. 唯一允许原地翻转的是未验证清单的「未验证 → 已验证」，翻转必须注日期与证据。
+
+## 1. 基线
+
+| 项 | 值 |
+| --- | --- |
+| 起始 commit | `09fce2446f37378cfd96c7365d299dad353cedf7`（`main`；US-17 收口记录） |
+| 分支 / worktree | `018-docker-compose` / `D:\code\basalt` |
+| 模块卡人审依据 | 用户 2026-11-02 回复「我确认 US18 R7 通过人工 review ①，授权你自动推进实施」（R7 文档；R8 为同轮授权的残留卷清理前缀修正） |
+| 模块卡 | `docs/us/us18-docker-compose.md`，R8，sha256 `02dcc37a4a4d13ee33339ef1306036aaff723760c51710d5be49c60a4f476b65`（R8 首轮 `fd2a26f5…`；按用户授权修正 §4.7 残留卷清理前缀后重算） |
+| spec | `specs/018-docker-compose/spec.md`，sha256 `0e457a7d8d145b7e9b218ca1fce841d2ae2a94bc1a8616365a0ab31d020ffde3`（clarify 后重算） |
+| plan | `specs/018-docker-compose/plan.md`，sha256 `5e533639f478f5acf5a80ccae8dad5550a243e059a464510fd235e5843362535`；配套 `research.md` `f5f0076e…`、`data-model.md` `f29cbd7a…`、`quickstart.md` `0a392879…` |
+| tasks（冻结时） | `specs/018-docker-compose/tasks.md`，53 项，sha256 `44829fbc513ad6bf419470d9bff79284a69e0ea650a65d328145a655e89efaf2`（analyze 前 `37120642…`；按分析补 SC-001 60s、备份目录 0700、恢复前校验和、旧目录兼容断言后重算）；AI 比对结论：交付物清单 §3.1–§3.3 逐项有任务（image.go / imagelock / record / matrix / verify / assemble / 两个 CLI / 5 个 docker 资产 / 6 个 e2e 文件 / 4 个 stage / ci job / 文档），22 个 `TestUS18_*` 全部映射到任务（A1 T014；A2 T013；A3 T013；A4 T021；A5 T022；A6 T023；A7 T026；A8 T036；A9 T027；A10 T028；A11 T029；A12 T031；A13 T032；A14 T033；A15 T024；A16 T037；A17 T030；Assemble/Verify/Flag/Docs 见 T045–T046），测试与实现同任务落地，无超出已审范围的新概念 |
+| 开跑时未提交改动 | `specs/018-docker-compose/`（本 US 派生工件）；`docs/us/REGISTRY.md` 已由 `/us-register 18` 追加 US-18 行（私有排除，不在 git 变更面） |
+| 允许触碰范围 | `scripts/releasekit/`、`cmd/basalt-verify/`、`internal/e2e/`、`docker/`、`release/image-lock.json`、`harness/stages/us18-*.json`、`.github/workflows/ci.yml`、`.gitignore`、`docs/Operations.md`、`docs/TechnicalDesign.md`、`docs/Requirements.md`、`docs/Compatibility.md`、`README.md`、`makefile` / `Makefile`（仅接线所需）、`specs/018-docker-compose/` |
+
+## 2. 失败台账
+
+| 日期 | 问题（测试名 / 首错位置 + 症状） | 假设 | 结果 | 同题计数 |
+| --- | --- | --- | --- | --- |
+| 2026-11-02 | T015 要求 `ARG BASE_IMAGE` 无默认值，但 A3 / `CheckImageLock` / T011 要求 Dockerfile 默认值与 `release/image-lock.json` 逐字一致 | 以 A3 与判卷代码为准保留默认值，T015 的字面例外按派生冲突记录 | Dockerfile 保留锁文件 digest 默认值；`CheckImageLock` 以此为比对面 | 1 |
+| 2026-11-02 | 模块卡 §4.7 要求测试镜像 tag 以项目前缀开头，但 `BuildImage` 的 tag 固定为 `basalt:<version>-<os>-<arch>` 且 `ValidateVersion` 只收 `X.Y.Z` | 测试版本固定为合法 semver、镜像由 e2e 清理显式删除，并在 run-state 记录偏离 | e2e 使用 `basalt:0.0.1-linux-amd64`；TestMain 结束后 `docker image rm`；A15 仍按项目前缀核对容器 / 卷 / 网络，镜像按固定 tag 单独断言 | 1 |
+| 2026-11-02 | 容器只发布随机宿主端口，而 `allowed_hosts` 模板固定 `127.0.0.1:8080`，U18-Q7 禁止新增配置键 | 测试请求显式携带 `Host: 127.0.0.1:8080`，拨号使用随机端口 | `composeStack.request` 设置 Host 头；被测实例无需改配置 | 1 |
+| 2026-11-02 | 容器内 provider `api_key` 必须是 `${VAR}` 占位，测试没有对应环境变量 | 在 `docker/compose.test.yaml` 增加测试专用 `BASALT_US18_FAKE_KEY`（`${…:?}`），e2e 恒设该值 | 只在测试 overlay 出现，生产 compose 不含该变量 | 1 |
+| 2026-11-02 | 卡片 §3.1 要求工作区不可写时在 `internal/cli` 启动前检查，但 CLI 层没有工作区路径上下文 | 在 `internal/app/run.go` 的 serve 初始化处加 fail-closed 可写检查（点名路径），T029 记录位置偏离 | 实现落 `internal/app`，行为判据不变 | 1 |
+| 2026-11-02 | 卡片 §3.1 列 `repoRoot(t *testing.T) string`，与既有 `repoRoot() (string, error)` 重名 | 复用既有函数，夹具包装成 `us18RepoRoot(t) string` | 不新增第二个符号 | 1 |
+| 2026-11-02 | `LoadImageRecords` 先查文件哈希再查平台重复，同平台两条记录共用文件名时报“哈希不符”而非“重复” | 平台重复判卷前置，再查文件哈希 | `TestUS18_Image_RecordFilesAndLoad` 绿；错误信息指向真实原因 | 1 |
+| 2026-11-02 | 镜像 SBOM 计算了 apk 许可证却未写进组件，`TestUS18_Image_SBOMIncludesOSPackages` 红 | `sbomComponent` 增加 `licenses` 字段并按 CycloneDX `{license:{name}}` 形态写出 | 测试绿；未知许可证仍写 `NOASSERTION` | 1 |
+| 2026-11-03 | `harness/stages/us18-{linux,windows,aggregate}.json` 的 protect 列了不存在的 `us18_faults_test.go` / `us18_backup_test.go` | 与模块卡 §4.3 对照，Compose 用例全部落在 `us18_container_test.go` | 三个 stage 的 protect 改为四个真实文件；CI 引用的 `us18-linux` 输入均为 git 跟踪面 | 1 |
+| 2026-11-03 | `us18SeedConfig` 调 `docker compose create --no-start`，WSL Compose v5.6.1 报 `unknown flag: --no-start`，A6 / A7 / A12 三条用例起栈即红 | `create` 本身不启动容器，`--no-start` 是 `up` 的旗标 | 改为 `compose create`；重跑该批用例（证据见 §5） | 1 |
+| 2026-11-03 | `go test ./scripts/acceptance -run TestStages_CIInputsGitVisible` 红：`specs/018-docker-compose/spec.md` 与 `release/image-lock.json` 尚未被 git 跟踪 | 本 US 尚未提交；stage 的 CI 输入在提交后进入跟踪面 | 待 T052 提交 / 推送后复跑该测试与 CI `container` job 再判 | 1 |
+| 2026-11-03 | A6 / A7（TaskAndKnowledge、RecreatePreservesIdentity）起栈后 `us18EnableAgent` 30s 超时：`POST /agents/worker/enable` 恒 409 CONFLICT，日志显示 `期望 disabled/0，当前 disabled/1`，重试仍发 `expected_generation=0` | `GET /agents/{name}/files` 的 lifecycle 按设计只投影 state / valid / lifecycle_error，generation 恒为零值（views.go `agentFilesView` 注释明示「不编造」）；夹具误把它当权威代数 | 新增 `us18AgentGeneration` 从 `/api/v1/profiles` 读生命周期代数，`us18BuildAgent` 与 409 重试分支改用它；断言不变（仍须 30s 内启用成功）。复跑：Recreate / GracefulShutdown PASS，A6 暴露下一层问题（见下条） | 2 |
+| 2026-11-03 | A6 `TaskAndKnowledge`：启用已通过，`us18Invoke` 的响应 `final_text` 正确，但 `GET /api/v1/runs/{id}` 的 `final_text` 为空 | 无状态 invoke 按设计只落 Run 与审计、**不**写消息（service.go「空 session_id → 仅内存」）；`final_text` 由该 Run 最新 assistant 消息派生（run_query.go `finalText`），无状态运行必然为空 | A6 改走会话入口：新增 `us18CreateSession` / `us18PostMessage`，创建会话后同步发消息再读账本；A6 判据（账本终态 completed、回复非空）不放宽，模型调用数与检索断言不变。复跑证据见 §5 | 2 |
+| 2026-11-03 | A13 `RestartDoesNotRerun` 等不到 `running`：模型发起的 `shell` 调用 `/bin/sleep` 被拒（日志 `sandbox_denied`「交互式 shell 不得放行：/bin/sleep」） | 镜像基础层是 Alpine，`sleep` 等 applet 都是 busybox 的软链；执行侧按**真实路径**命中 shell 名称集合（`runner.go` 的 realpath 判定），Run 立即走完而非停在 running | 挂起点改为 FIFO：`write_file` 对无读者的命名管道 `open(O_WRONLY)` 阻塞；模型步骤改 `write_file`，`us18BuildAgent` 声明 `write_file`，起栈后用一次性 root 容器 `mkfifo` 代理目录下的 `block.pipe`。判据（在途 Run、SIGKILL、`failed` / `unknown`、无重跑）逐条不变。复跑 PASS（40.05s） | 1 |
+| 2026-11-03 | A14 `SecondInstanceRejected` 日志断言恒空（实例锁行为本身正确：退出码 1、日志点名锁） | 容器的 slog 输出走 stderr，`docker logs` 把它留在 stderr；`us18DockerOutput` 成功时只回 stdout → 读到空串（非落盘竞态） | 新增 `us18DockerLogs` 合并两路输出并复跑；A14 PASS（30.70s） | 2 |
+| 2026-11-03 | A8 / A16 备份步骤红：宿主 `sha256sum: secrets/database_dsn: Permission denied`，`TempDir` 清理也被 0700 的 `secrets/` 挡住 | 脚本按卡片用一次性 `--user 0` 容器写归档与 secret 副本，产物归 root；脚本同时承诺「免宿主 root」，两者冲突 | `backup.sh` 在写 SHA256SUMS 前用一次性 root 容器把整份备份目录 `chown -R` 回调用者 `$(id -u):$(id -g)`；卡片判据（备份目录 0700、secret 副本 0600）不变 | 1 |
+| 2026-11-03 | A8 / A16 恢复步骤红：`invalid mount config for type "bind": bind source path does not exist: .../secrets/postgres_password` | Compose 的 file secret 是 bind mount，`create` 时就校验源文件存在；`restore.sh` 沿用卡片的「最后放 secret」顺序，必然晚于 `create` | secret 放置前移到 `create` 之前（用 `BASALT_IMAGE` 或源项目容器解析助手镜像），属恢复**步骤顺序**偏离卡片 §2.9，最终状态与属主 / 权限判据不变；顺带把 `create --no-start` 改成 `create`（同上条旗标问题）。复跑 A8 PASS（55.64s）、A16 PASS（68.90s） | 1 |
+| 2026-11-03 | T051 首跑 `make check` 的 `sec` 目标红：gosec（dev 版）新规则 G122 命中 `scripts/releasekit/image.go:636` 的 `os.Open(path)`——WalkDir 回调内按走查路径打开，判 symlink TOCTOU；既有 `#nosec G304` 不覆盖 G122 | 按门禁纪律修实现（不是加抑制）：改用 `os.OpenRoot(dir)` + `root.Open(rel)` 做 root-scoped 打开，把读取限制在暂存目录内 | gosec 全仓零命中（`GOSEC_EXIT=0`，输出为空）；`TestUS18_Image_*` 单测复跑 `ok`；`make check` 整体复跑（证据见 §5） | 1 |
+| 2026-11-03 | 续（上条之后）：`make check` 的 `test` 目标红，唯一失败 `TestStages_CIInputsGitVisible`——stage 的 inputs / protect 尚未进入 git 索引（本 US 未提交） | 与假设一致：测试用 `git ls-files --error-unmatch`，未跟踪即红；与代码缺陷无关 | `git add` 本 US 改动面后该测试复跑 PASS（0.49s）；随后整跑 `make check`，最终以提交后的门禁与 CI 复跑为准 | 1 |
+| 2026-11-03 | 更正 2026-11-02 行「A15 … 镜像按固定 tag 单独断言」：`cleanupResidue` 的镜像类按 `Repository:Tag` 含项目名子串计数，固定 tag `basalt:<version>-linux-amd64` 不在前缀面内，该维在 A15 中恒为 0（当时并未单独断言） | 模块卡 §4.7 要求测试 tag 带项目前缀，正是为了让镜像类可扫描；固定 tag 偏离的后果需要显式判据 | `us18CleanupImages` 每个 tag `docker image rm` 后用 `docker image inspect` 复检，仍存在即失败；`TestMain` 把清理失败并入退出码。A15 容器 / 卷 / 网络仍为实断言；镜像类由 TestMain 复检承担。复跑 `TestUS18_Image_BuildAndRecord` PASS（32.78s，清理后 `basalt:*` 计数 0）；全 stage 复跑见 §5 | 2 |
+| 2026-11-03 | T040 写 `AppendImageRows` 落 `types.go` / `matrix.go`，实际落 `scripts/releasekit/image.go`（与 `ImageRecord` / `BuildImage` 同文件） | 同包内位置选择，避免矩阵文件反向引用镜像记录类型；行为与判据不变 | 不改代码；位置偏离在此记录，`go test ./scripts/releasekit` 全绿 | 1 |
+| 2026-11-03 | 独立复核 F1（HIGH）：`restore.sh` 在 `set -u` 下引用从未赋值的 `$project`，`BASALT_IMAGE` 缺失时的助手镜像兜底分支从未可达（e2e 恒设 `BASALT_IMAGE`，故未暴露） | 项目名必须由调用方显式给出，脚本不猜 | 必填 `COMPOSE_PROJECT_NAME` 并在入口校验；兜底分支改为由该变量解析 | 1 |
+| 2026-11-03 | 独立复核 F2（MEDIUM）：`assemble` 没有 CLI 入口填充 `ImageRecord.Evidence`，矩阵镜像行 `tested` 分支只在单测可达，发布记录实际只能写 `not-tested` | 证据由发布编排显式给出，不在记录里静默补 | 新增可重复的 `--image-evidence`（必须与 `--image-record` 同用）；记录已带证据时只接受完全一致。新增 `TestUS18_Image_AssembleAppliesEvidence` / `RejectsConflictingEvidence`；`go test ./scripts/releasekit` PASS（40.994s） | 1 |
+| 2026-11-03 | 独立复核 F3（MEDIUM）：`restore.sh` 把备份 secret 复制进共享 `docker/secrets`，会把仍在运行的源实例凭据覆盖掉 | 目标 secret 已存在且与备份不同即拒绝，恢复目标必须是独立部署目录 | 脚本增加一次性 root 容器 `cmp` 比对；`docs/Operations.md` §8.2 同步恢复目录要求 | 1 |
+| 2026-11-03 | 独立复核 F4 + F9：`init-secrets.sh` 从环境变量读 `POSTGRES_DB` / `POSTGRES_USER`，而 `sudo` 会丢弃它们；拒绝覆盖的提示不含首启重试与轮换处置 | 从 secret 目录上一级的 `.env` 解析（环境变量优先），补齐库名 / 用户名字符集校验 | 与 `docs/Operations.md` §8.2 同步（一次性容器需 `-e`） | 1 |
+| 2026-11-03 | 独立复核 F5：`backup.sh` 对 `compose start basalt` 用恒真兜底，吞掉重启失败仍打印成功 | 备份制品与恢复运行分开判：制品有效但应用未起必须非零退出并给定位命令 | 重启后核对 running；失败非零退出；文档同步 | 1 |
+| 2026-11-03 | 独立复核 F6：CI 清理步骤在 `set -uo pipefail` 下枚举失败只得到空集，残留计数为 0——"没查成"会被读成"已清理" | 枚举失败必须让步骤失败 | 改 `set -euo pipefail`，四条枚举一律先落变量；只可经 PR CI 实跑验证（本地无 CI runner） | 1 |
+| 2026-11-03 | 独立复核 F7（文档）：compose 未设 `restart` 策略，宿主 / 守护进程重启后容器不自启，文档未登记 | 保持不加自动拉起，登记恢复命令与排障入口 | `docs/Operations.md` §8.2「日常停机与重启」补条目 | 1 |
+| 2026-11-03 | 独立复核 F8：`restore.sh` 中途失败会在目标项目留下已建卷 / 容器且无提示 | 失败路径必须给出可执行清理提示，成功路径不得误报 | EXIT trap 在未完成时打印 `docker compose -p <新项目> down -v` 提示；成功后置 `restore_done=1` | 1 |
+| 2026-11-03 | 独立复核 F10：记录 / 矩阵的未知 `kind` 会被归档核对与镜像核对同时跳过，篡改矩阵可静默过关 | 取值集合只允许 `""` / `image`，双向显式拒绝 | `VerifyImages` 与 `crossCheckRecord` 各自拒绝；新增 `TestUS18_Image_RejectsUnknownEvidenceKind` 覆盖两处 | 1 |
+
+## 3. 停止预算与计数
+
+| 项 | 默认 | 已用 |
+| --- | --- | --- |
+| 同一问题修复次数 | 3 | 0 |
+| 阶段总尝试 | 5 | 0 |
+| 会话中断恢复 | 不限 | 0 |
+
+## 4. 未验证清单
+
+| # | 项 | 原因 | 恢复条件 |
+| --- | --- | --- | --- |
+| U-18-01 | 镜像仓库登录 / 推送 | 未授权 | 用户授权并提供仓库 |
+| U-18-02 | linux/arm64 镜像 | 无 arm64 宿主 | 提供宿主或书面延期 |
+| U-18-03 | 漏洞扫描 | 无扫描器与漏洞库 | 提供扫描器与授权 |
+| U-18-04 | Docker Desktop / podman / rootless | 本机只有 WSL Docker Engine | 提供宿主 |
+| U-18-05 | OCI 签名 / SLSA | 首发动作，本 US 不做 | 用户授权后 |
+| U-18-06 | 镜像字节级复现 | 构建时间进入镜像配置 | 工具链支持后 |
+| U-18-07 | 跨 schema 升级回退 | 只有一个版本 | 第二版本出现后 |
+| U-18-08 | 外部 PostgreSQL | 只测随附 PG | 提供外部库环境 |
+| U-18-09 | full 档镜像 | 运行期组件未备齐 | US-17 组件齐备后 |
+| U-18-10 | 部署 CI 宿主的 Docker / Compose 版本 | 首次 CI 实跑后登记 | `container` job 首次实跑 |
+| U-18-11 | WSL `/mnt/d`（9p/drvfs）上的 secret 属主 / 权限 | 文件系统忽略 chown/chmod；脚本会拒绝 | 改用 ext4 或 Docker 卷 |
+
+## 5. 收口结论
+
+**状态：待人工 review ②**（AI 自动门禁、真实容器验收与部署 CI 按本节证据推进；绿态不代替用户验收，本节不自行写“已收口”。）
+
+### 5.1 本机门禁与验收
+
+| 项 | 命令 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 全量验收（11 项 profile） | `sh scripts/check-acceptance.sh`（WSL Ubuntu） | PASS，11/11，指纹 `d258b91d…` | `.loop/runs/us18-full/report.json`（2026-11-02T18:17Z） |
+| 全量验收复跑（F1–F10 修复后） | `bash dev-env/scripts/with-postgres.sh sh scripts/check-acceptance.sh`（WSL Ubuntu） | PASS，11/11，指纹 `f1f1ecbb…` | `.loop/runs/us18-full-final/report.json`（2026-11-02T19:57Z；与 `us18-aggregate` 同指纹） |
+| `make check` | `make check`（WSL Ubuntu） | PASS（退出码 0，覆盖率全绿） | `.loop/runs/us18-make-check.log`（2026-11-03，`MAKE_CHECK_EXIT=0`） |
+| `go test -race` | 含于全量 profile 的 `test` 检查（`go test -race -count=1 -cover ./...`）与 `make check` | PASS | 同上 |
+| us18-base（source：image-unit / docs） | `--stage-only --stage harness/stages/us18-base.json` | PASS，2/2 | `.loop/runs/us18-base/report.json`（18:47Z） |
+| us18-windows（process：6 检查 / 15 用例） | `--stage-only --stage harness/stages/us18-windows.json` | PASS，6/6，15 用例，0 跳过 | `.loop/runs/us18-windows-final/report.json`（19:00Z，指纹 `c00236b3…`） |
+| us18-aggregate（source＋process 同轮） | `--stage-only --stage harness/stages/us18-aggregate.json` | PASS，8/8 检查，34 用例，0 跳过，指纹 `f1f1ecbb…` | `.loop/runs/us18-aggregate/report.json`（2026-11-02T19:48Z；跑在 review 修复后的未提交树上，提交后的判卷见 PR CI） |
+| us18-linux（CI `container` job） | `.github/workflows/ci.yml` | 待草稿 PR 实跑 | PR CI |
+
+说明：`us18-full` 跑在 F-02 清理断言改动之前；修复后的内容由 `us18-full-final`（`f1f1ecbb`）与 `us18-aggregate`（同指纹）两轮全量覆盖——前者覆盖 11 项 profile，后者覆盖 8 项 source/process 检查（34 用例）。`us18-aggregate`、`us18-full-final` 与 `make check` 均跑在未提交的 review 修复树上，指纹绑定当时内容；提交后的最终判卷以 PR CI 的 `test`（全量 profile）与 `container`（`us18-linux`）job 为准。

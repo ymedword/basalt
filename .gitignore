@@ -39,3 +39,10 @@ website/.vitepress/.temp/
 # 原先只列 docs-diff / industry-brief 三条，本地跑其余 Demo 会凭空多出未跟踪文件。）
 examples/daily/*/runs/
 examples/daily/*/state/
+
+# Docker／Compose 部署（US-18）：secret 目录只保留占位文件，其余由 init-secrets.sh 生成。
+# 顺序不可反——先忽略全部，再放行占位文件。
+docker/secrets/*
+!docker/secrets/.gitkeep
+
+docker/.env

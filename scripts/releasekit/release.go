@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -170,6 +171,12 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 		}
 		pkgs[index].Archive = dst
 	}
+	// 镜像记录在写校验和之前读入、校验并复制 SBOM / provenance；记录与矩阵行
+	// 由本函数直接写入，不提供“汇总后再补字段”的第二条路径。
+	images, err := loadAndCopyImages(opts, pkgs)
+	if err != nil {
+		return err
+	}
 	for _, target := range DefaultTargets() {
 		if _, err := BuildVerifier(ctx, in.Repo, in.Version, target, opts.OutDir); err != nil {
 			return err
@@ -185,10 +192,17 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 	if err != nil {
 		return err
 	}
+	if len(images) > 0 {
+		matrix, err = AppendImageRows(matrix, images)
+		if err != nil {
+			return err
+		}
+	}
 	manifest, err := BuildReleaseManifest(in, pkgs)
 	if err != nil {
 		return err
 	}
+	manifest.Images = images
 	if err := CheckNotes(opts.NotesPath, in.Version); err != nil {
 		return err
 	}
@@ -214,6 +228,7 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 	}
 	record.SupportMatrixSHA256 = matrixSum
 	record.NotesSHA256 = notesSum
+	record.Images = images
 	manifest.Artifacts = record.Artifacts
 	if err := writeJSON(filepath.Join(opts.OutDir, "release-manifest.json"), manifest); err != nil {
 		return err
@@ -249,6 +264,55 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 		RequireSignature: in.Mode == ModeFinal,
 	})
 	return err
+}
+
+// loadAndCopyImages 读入镜像记录并把 SBOM / provenance 复制进发布目录；文件名
+// 在发布目录内必须唯一，重名即拒绝（不覆盖归档或另一条镜像的工件）。
+// loadAndCopyImages loads the image records and copies their SBOM / provenance into
+// the release directory; names must stay unique so nothing overwrites an archive or
+// another image's files.
+func loadAndCopyImages(opts AssembleOptions, pkgs []PackageResult) ([]ImageRecord, error) {
+	if len(opts.Images) == 0 {
+		return nil, nil
+	}
+	images, err := LoadImageRecords(opts.Images)
+	if err != nil {
+		return nil, err
+	}
+	// 验收证据由发布编排查询后显式给出；记录里已带证据时只允许完全一致，不做静默
+	// 覆盖（两条来源不同即是口径冲突，必须让人看见）。
+	// Acceptance evidence comes from the release orchestrator; when a record already
+	// carries evidence it must match exactly rather than being silently replaced.
+	if evidence := nonBlank(opts.ImageEvidence); len(evidence) > 0 {
+		for index := range images {
+			existing := nonBlank(images[index].Evidence)
+			if len(existing) > 0 {
+				if !slices.Equal(existing, evidence) {
+					return nil, fmt.Errorf("镜像 %s 的记录已带验收证据 %v，与 --image-evidence %v 冲突",
+						images[index].Tag, existing, evidence)
+				}
+				continue
+			}
+			images[index].Evidence = append([]string(nil), evidence...)
+		}
+	}
+	taken := make(map[string]string, len(pkgs)+2*len(images))
+	for _, pkg := range pkgs {
+		taken[pkg.Name] = "归档"
+	}
+	for index, image := range images {
+		sourceDir := filepath.Dir(opts.Images[index])
+		for _, name := range []string{image.SBOMPath, image.ProvenancePath} {
+			if previous, ok := taken[name]; ok {
+				return nil, fmt.Errorf("镜像文件 %s 与%s重名，发布目录里无法并存", name, previous)
+			}
+			taken[name] = "镜像 " + image.Tag
+			if err := copyFile(filepath.Join(sourceDir, name), filepath.Join(opts.OutDir, name), 0o644); err != nil {
+				return nil, fmt.Errorf("复制镜像文件 %s：%w", name, err)
+			}
+		}
+	}
+	return images, nil
 }
 
 // MarshalIndentJSON 供测试与 CLI 输出稳定 JSON。

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -250,6 +251,16 @@ func Run(ctx context.Context, args []string) int {
 			logger.Error("serve 兜底初始化失败", "error", initErr)
 			return 1
 		}
+		// 工作区可写性 fail-closed 检查（US-18 A11）：容器部署时卷属主错误、骨架目录
+		// 却已存在，`workspace.Init` 的 mkdir 全部成功——真正的失败会推迟到写配置、
+		// 迁移或上传，运维看到的是一个"启动成功、随后以无关形态失败"的实例。这里在
+		// 装配前实际写一次再删掉，失败立即退出并点名路径。
+		// Probe the workspace before assembly: with a wrong volume owner the skeleton
+		// already exists, so init succeeds and the first real write fails much later.
+		if probeErr := probeWorkspaceWritable(a.wsRoot()); probeErr != nil {
+			logger.Error("serve 启动前工作区不可写，拒绝启动", "error", probeErr)
+			return 1
+		}
 	}
 
 	if needsRuntime(args) {
@@ -483,6 +494,21 @@ func (a *App) signalContext(ctx context.Context) (context.Context, context.Cance
 func needsServeInit(args []string) bool {
 	name, ok := commandName(args)
 	return ok && name == "serve"
+}
+
+// probeWorkspaceWritable 是 serve 的写能力探针：在工作区根目录实际创建并删除一个
+// 临时文件。目录存在不等于可写（属主 / 只读挂载），路径从错误里原样带出。
+// probeWorkspaceWritable writes and removes one temp file: existing directories are
+// not necessarily writable, and the path travels back in the error.
+func probeWorkspaceWritable(root string) error {
+	file, err := os.CreateTemp(root, ".basalt-write-probe-*")
+	if err != nil {
+		return fmt.Errorf("工作区不可写 %s: %w", root, err)
+	}
+	name := file.Name()
+	closeErr := file.Close()
+	removeErr := os.Remove(name)
+	return errors.Join(closeErr, removeErr)
 }
 
 // runtimeCloser 是 runWithRuntime 需要的最小释放面（生产传 *heavyRuntime）。

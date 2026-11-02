@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "id": "us18-base",
+  "approval": "User review 1 passed 2026-11-02 (US-18 R7/R8 module card). Implementation authorized; closeout awaits user review 2.",
+  "inputs": [
+    "docs/us/us18-docker-compose.md",
+    "specs/018-docker-compose/spec.md",
+    "specs/018-docker-compose/plan.md",
+    "specs/018-docker-compose/tasks.md",
+    "release/image-lock.json",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "scripts/releasekit/image_test.go",
+    "scripts/releasekit/imagelock_test.go",
+    "scripts/releasekit/verify_test.go",
+    "scripts/releasekit/assemble_image_test.go",
+    "scripts/releasekit/docs_test.go",
+    "cmd/basalt-verify/main_test.go"
+  ],
+  "checks": [
+    {
+      "id": "us18-image-unit",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "./cmd/basalt-verify", "-run", "^TestUS18_(Image|Verify)_"],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS18_Image_RejectsPrivateKeyInContext",
+        "TestUS18_Image_LockMatchesSources",
+        "TestUS18_Image_RecordValidate",
+        "TestUS18_Image_AssembleBindsRecord",
+        "TestUS18_Verify_ImagesRecord",
+        "TestUS18_Verify_RequireImageDigestFlag"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us18-docs",
+      "args": ["go", "test", "-json", "-count=1", "./scripts/releasekit", "-run", "^TestUS(17|18)_Docs_"],
+      "timeout_seconds": 300,
+      "required_tests": ["TestUS17_Docs_CommandsMatchCLI", "TestUS18_Docs_ImageCommands"],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T001", "checks": ["us18-image-unit"]},
+    {"id": "T002", "checks": ["us18-image-unit"]},
+    {"id": "T003", "checks": ["us18-image-unit"]},
+    {"id": "T004", "checks": ["us18-image-unit"]},
+    {"id": "T005", "checks": ["us18-image-unit"]},
+    {"id": "T006", "checks": ["us18-image-unit"]},
+    {"id": "T007", "checks": ["us18-image-unit"]},
+    {"id": "T008", "checks": ["us18-image-unit"]},
+    {"id": "T009", "checks": ["us18-image-unit"]},
+    {"id": "T010", "checks": ["us18-image-unit"]},
+    {"id": "T011", "checks": ["us18-image-unit"]},
+    {"id": "T012", "checks": ["us18-image-unit"]},
+    {"id": "T013", "checks": ["us18-image-unit"]},
+    {"id": "T039", "checks": ["us18-image-unit"]},
+    {"id": "T040", "checks": ["us18-image-unit"]},
+    {"id": "T041", "checks": ["us18-image-unit"]},
+    {"id": "T042", "checks": ["us18-image-unit"]},
+    {"id": "T043", "checks": ["us18-image-unit"]},
+    {"id": "T044", "checks": ["us18-image-unit"]},
+    {"id": "T045", "checks": ["us18-image-unit"]},
+    {"id": "T046", "checks": ["us18-docs"]},
+    {"id": "T047", "checks": ["us18-image-unit", "us18-docs"]},
+    {"id": "T049", "checks": ["us18-docs"]},
+    {"id": "T050", "checks": ["us18-docs"]}
+  ]
+}

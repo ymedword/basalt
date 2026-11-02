@@ -34,6 +34,18 @@ The current architecture is single-node, multi-agent hosting with logical Agent 
 
 For a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the `vector` extension (pgvector) and `pg_trgm`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.
 
+### Run with Docker instead
+
+A single-instance Compose unit lives in [`docker/`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.
+
+```sh
+cp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits
+sudo sh docker/init-secrets.sh docker/secrets
+cd docker && docker compose -p basalt up -d --wait
+```
+
+The first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with `docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run `docker compose down -v` against a real instance: it deletes the volumes that hold the identity and the management token.
+
 ### 1. Build
 
 ```sh

@@ -1,0 +1,75 @@
+# Basalt 单实例编排：应用 + PostgreSQL/pgvector，三卷、两 secret、单副本。
+# 生产部署用 `docker compose up -d`；升级、备份与回退见 docs/Operations.md。
+# Single-instance orchestration: the app plus PostgreSQL/pgvector, three volumes and
+# two file secrets, one replica only.
+
+services:
+  basalt:
+    image: ${BASALT_IMAGE:?set BASALT_IMAGE to basalt:X.Y.Z@sha256:...}
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    working_dir: /data
+    stop_grace_period: 90s
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - workspace:/data
+      - private:/var/lib/basalt
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    secrets: [database_dsn]
+    environment:
+      XDG_DATA_HOME: /var/lib/basalt
+      HOME: /var/lib/basalt
+      BASALT_DATABASE_DSN_FILE: /run/secrets/database_dsn
+      # 六项入口限流由 .env 提供；产品不设默认（D-30），缺任一项在 compose config 即失败。
+      BASALT_INGRESS_RUN_QPS: ${BASALT_INGRESS_RUN_QPS:?set in .env}
+      BASALT_INGRESS_RUN_BURST: ${BASALT_INGRESS_RUN_BURST:?set in .env}
+      BASALT_INGRESS_INGEST_QPS: ${BASALT_INGRESS_INGEST_QPS:?set in .env}
+      BASALT_INGRESS_INGEST_BURST: ${BASALT_INGRESS_INGEST_BURST:?set in .env}
+      BASALT_INGRESS_READ_QPS: ${BASALT_INGRESS_READ_QPS:?set in .env}
+      BASALT_INGRESS_READ_BURST: ${BASALT_INGRESS_READ_BURST:?set in .env}
+    healthcheck:
+      # 只判存活：/api/v1/health 固定返回 {"status":"ok"}，数据库断开不会让它变红。
+      # Liveness only: the endpoint stays ok even when PostgreSQL goes away.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    ports:
+      - "${BASALT_HTTP_BIND:-127.0.0.1}:${BASALT_HTTP_PORT:-8080}:8080"
+
+  postgres:
+    # digest 与 release/image-lock.json 的 postgres 逐字一致（CheckImageLock 判卷）；
+    # .env.example 的 BASALT_DB_IMAGE 是同一值的预取 / 核对副本。
+    # Pinned to the lock file digest; BASALT_DB_IMAGE mirrors it for pre-pulling.
+    image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:13b6ffe9771a0a726168556a623b481a57e56fd390b4b8d7670a92ac8e7c126e
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-basalt}
+      POSTGRES_USER: ${POSTGRES_USER:-basalt}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - database-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-basalt} -d ${POSTGRES_DB:-basalt}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  database-data:
+  workspace:
+  private:
+
+secrets:
+  database_dsn:
+    file: ./secrets/database_dsn
+  postgres_password:
+    file: ./secrets/postgres_password

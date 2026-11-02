@@ -139,12 +139,16 @@ const (
 	StatusNotTested    = "not-tested"
 )
 
-// SupportRow 是支持矩阵的一行。
-// SupportRow is one row of the support matrix.
+// SupportRow 是支持矩阵的一行。Kind 为空表示归档行（旧记录语义不变），
+// image 表示镜像行；同平台归档与镜像按 (goos, goarch, kind) 三元组区分。
+// SupportRow is one row of the support matrix. An empty Kind keeps the archive-row
+// semantics of older records; Kind=image marks an image row, matched by
+// (goos, goarch, kind) instead of goos/goarch alone.
 type SupportRow struct {
 	GOOS   string   `json:"goos"`
 	GOARCH string   `json:"goarch"`
 	Tier   Tier     `json:"tier"`
+	Kind   string   `json:"kind,omitempty"`
 	Status string   `json:"status"`
 	Checks []string `json:"checks,omitempty"`
 	Reason string   `json:"reason,omitempty"`
@@ -206,6 +210,7 @@ type ReleaseRecord struct {
 	FinishedAt          time.Time        `json:"finished_at"`
 	Toolchain           Toolchain        `json:"toolchain"`
 	Artifacts           []ArtifactRecord `json:"artifacts"`
+	Images              []ImageRecord    `json:"images,omitempty"`
 	Evidence            []SupportRow     `json:"evidence"`
 	Signing             SigningInfo      `json:"signing"`
 	Reproducible        Reproducible     `json:"reproducible"`
@@ -223,14 +228,16 @@ type ReleaseManifest struct {
 	Mode      Mode             `json:"mode"`
 	Commit    string           `json:"commit"`
 	Artifacts []ArtifactRecord `json:"artifacts"`
+	Images    []ImageRecord    `json:"images,omitempty"`
 }
 
 // VerifyPolicy 控制校验严格程度。
 // VerifyPolicy controls verification strictness.
 type VerifyPolicy struct {
-	PublicKey        string `json:"public_key,omitempty"`
-	TrustFile        string `json:"trust_file,omitempty"`
-	RequireSignature bool   `json:"require_signature"`
+	PublicKey         string `json:"public_key,omitempty"`
+	TrustFile         string `json:"trust_file,omitempty"`
+	RequireSignature  bool   `json:"require_signature"`
+	RequireRepoDigest bool   `json:"require_repo_digest,omitempty"`
 }
 
 // VerifyReport 是一次校验的读数。
@@ -276,12 +283,25 @@ type ReleaseOptions struct {
 type AssembleOptions struct {
 	ArtifactDir string
 	EvidenceDir string
-	OutDir      string
-	NotesPath   string
-	SigningKey  string
-	PublicKey   string
-	TrustFile   string
-	Inputs      Inputs
+	// Images 是 image build 产出的 image-record.json 路径列表；assemble 在写校验和
+	// 之前读取、校验并复制镜像 SBOM / provenance，再把记录与矩阵镜像行一并签名。
+	// Images lists the image-record.json files produced by image build; assemble
+	// loads, validates and copies their SBOM / provenance before checksums are
+	// written, then signs the records and matrix rows together.
+	Images []string
+	// ImageEvidence 是本次发布实际执行过的镜像验收检查 ID（如 stage 的检查名）。
+	// 只有给出它，矩阵镜像行才能是 tested；不给出时按记录里的扫描状态写 not-tested
+	// 并注明原因，**不得**把“没扫描”写成“没测试”。
+	// ImageEvidence lists the image acceptance checks actually run for this release.
+	// Supplying it makes the matrix image row tested; without it the row stays
+	// not-tested with the record's scan reason.
+	ImageEvidence []string
+	OutDir        string
+	NotesPath     string
+	SigningKey    string
+	PublicKey     string
+	TrustFile     string
+	Inputs        Inputs
 }
 
 // Backup 是一次升级前的三对象备份。

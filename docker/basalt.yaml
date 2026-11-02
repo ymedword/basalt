@@ -1,0 +1,52 @@
+# Basalt 容器配置模板：首启播种到 /data/basalt.yaml，之后永不覆盖。
+# 这里是**部署示例值**，不是产品默认——产品本身不设 ingress 默认（D-30）。
+# Basalt container config template, seeded to /data/basalt.yaml on first boot and
+# never overwritten afterwards. These are deployment example values, not product
+# defaults.
+
+http:
+  # 容器内监听全部网卡，由 compose 的 ports 只发布到宿主回环。
+  # The process listens on all interfaces inside the container; compose publishes
+  # the port on the host loopback only.
+  addr: 0.0.0.0:8080
+  admin_auth:
+    # token 由实例私有目录（/var/lib/basalt）里的 admin-token 提供，不写进配置、
+    # 不写进环境变量。管理面密码首次启动自动生成，0600。
+    # The token comes from admin-token in the instance private directory; it is never
+    # written here or into the environment.
+    mode: token
+    # 缺省只对回环监听派生 Host 白名单，通配监听必须显式列出（D-10）。compose 默认
+    # 把 8080 发布到 127.0.0.1；**改宿主端口必须同步改这里**（U18-Q7，不新增配置键）。
+    # A wildcard bind never derives defaults, so the client-visible host:port is
+    # listed explicitly. Changing the published host port requires editing this list.
+    allowed_hosts:
+      - 127.0.0.1:8080
+      - localhost:8080
+    allowed_origins:
+      - http://127.0.0.1:8080
+      - http://localhost:8080
+
+server:
+  max_concurrent_runs: 32
+
+budget:
+  max_iterations: 30
+
+database:
+  # 由 entrypoint 从 /run/secrets/database_dsn 导出，只以 ${VAR} 占位出现。
+  # Exported by the entrypoint from the DSN secret file; only the placeholder appears.
+  dsn: ${BASALT_DATABASE_DSN}
+
+callers:
+  ingress:
+    # 六项入口限流必须在 .env 显式给出（产品不设默认）；缺任一项 serve 拒绝启动。
+    # All six ingress limits must come from .env; a missing one refuses startup.
+    run:
+      qps: ${BASALT_INGRESS_RUN_QPS}
+      burst: ${BASALT_INGRESS_RUN_BURST}
+    ingest:
+      qps: ${BASALT_INGRESS_INGEST_QPS}
+      burst: ${BASALT_INGRESS_INGEST_BURST}
+    read:
+      qps: ${BASALT_INGRESS_READ_QPS}
+      burst: ${BASALT_INGRESS_READ_BURST}

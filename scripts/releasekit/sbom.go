@@ -11,12 +11,25 @@ import (
 )
 
 type sbomComponent struct {
-	Type    string `json:"type"`
-	Group   string `json:"group,omitempty"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	PURL    string `json:"purl,omitempty"`
-	Scope   string `json:"scope,omitempty"`
+	Type     string        `json:"type"`
+	Group    string        `json:"group,omitempty"`
+	Name     string        `json:"name"`
+	Version  string        `json:"version"`
+	PURL     string        `json:"purl,omitempty"`
+	Scope    string        `json:"scope,omitempty"`
+	Licenses []sbomLicense `json:"licenses,omitempty"`
+}
+
+// sbomLicense 是 CycloneDX 的许可证条目形态；apk 包已知许可证按名写，未知写
+// NOASSERTION——不猜许可证。
+// sbomLicense is the CycloneDX license entry shape; known apk licenses are written
+// by name and unknown ones as NOASSERTION rather than guessed.
+type sbomLicense struct {
+	License sbomLicenseName `json:"license"`
+}
+
+type sbomLicenseName struct {
+	Name string `json:"name"`
 }
 
 type sbomDocument struct {

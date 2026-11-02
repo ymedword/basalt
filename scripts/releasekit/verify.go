@@ -63,6 +63,23 @@ func VerifyRelease(ctx context.Context, dir string, policy VerifyPolicy) (Verify
 	if err := crossCheckRecord(dir, record); err != nil {
 		return report, err
 	}
+	// 镜像行按 (goos, goarch, kind=image) 独立核对，不进入归档行循环；矩阵或记录
+	// 任一存在镜像内容时都必须逐条通过。
+	matrixBody, err := os.ReadFile(filepath.Join(dir, "support-matrix.json")) // #nosec G304 -- 发布文件路径
+	if err != nil {
+		return report, fmt.Errorf("读取 support-matrix.json：%w", err)
+	}
+	var matrix SupportMatrix
+	if err := json.Unmarshal(matrixBody, &matrix); err != nil {
+		return report, fmt.Errorf("解析 support-matrix.json：%w", err)
+	}
+	// 镜像文件已在 SHA256SUMS 的逐文件循环里核过哈希，这里只做记录与矩阵对账，
+	// 不把同一批文件名重复计入 VerifiedFiles。
+	if _, err := VerifyImages(dir, record, matrix, VerifyImageOptions{
+		RequireRepoDigest: policy.RequireRepoDigest,
+	}); err != nil {
+		return report, err
+	}
 	require := policy.RequireSignature
 	if require && strings.TrimSpace(policy.PublicKey) == "" {
 		return report, errors.New("要求签名时必须提供 --public-key")
@@ -132,6 +149,19 @@ func crossCheckRecord(dir string, record ReleaseRecord) error {
 		}
 	}
 	for _, row := range record.Evidence {
+		// kind 只允许空（归档行）与 image（镜像行）；别的取值会被两条核对路径同时
+		// 跳过，变成谁都不对账的静默行。
+		// Only "" (archive) and image are valid kinds; anything else would be skipped
+		// by both check paths and silently escape reconciliation.
+		switch row.Kind {
+		case "":
+		case kindImage:
+			// 镜像行由 VerifyImages 按镜像记录核对；同平台的归档 artifact 与归档证据
+			// 不能被镜像行借用，否则会得到错配的绿或红（red/green mismatch）。
+			continue
+		default:
+			return fmt.Errorf("记录证据行 %s/%s 的 kind %q 不在 \"\" / image 内", row.GOOS, row.GOARCH, row.Kind)
+		}
 		if row.Status != StatusTested {
 			continue
 		}

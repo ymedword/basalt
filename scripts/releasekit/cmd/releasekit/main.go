@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +42,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = runRecord(ctx, rest, stdout)
 	case "assemble":
 		err = runAssemble(ctx, rest, stdout)
+	case "image":
+		err = runImage(ctx, rest, stdout)
 	case "verify":
 		err = runVerify(ctx, rest, stdout)
 	case "repro":
@@ -77,8 +80,10 @@ func printUsage(out io.Writer) {
   releasekit release --repo . --version X.Y.Z --target linux/amd64 --tier full --runtime release/runtime [--workspace <dir> --dsn <dsn> --old <归档> --config <path>] --evidence-dir dist/evidence --out dist/artifacts
   releasekit verify-package --archive dist/artifacts/basalt-X.Y.Z-linux-amd64.tar.gz --version X.Y.Z [--target linux/amd64 --tier full]
   releasekit record --artifact-dir dist/artifacts --evidence-dir dist/evidence --version X.Y.Z --tag vX.Y.Z --mode rehearsal --out dist/record
-  releasekit assemble --artifact-dir dist/artifacts --evidence-dir dist/evidence --version X.Y.Z --tag vX.Y.Z --mode final --out dist/release/X.Y.Z --notes release/notes/X.Y.Z.md --signing-key <key> --public-key <pub>
-  releasekit verify --release-dir dist/release/X.Y.Z --public-key <pub> --require-signature
+  releasekit assemble --artifact-dir dist/artifacts --evidence-dir dist/evidence --version X.Y.Z --tag vX.Y.Z --mode final --out dist/release/X.Y.Z --notes release/notes/X.Y.Z.md --signing-key <key> --public-key <pub> [--image-record <image-record.json>]...
+  releasekit image build --repo . --version X.Y.Z --binary <path> --base-ref <name@sha256:…> [--dockerfile docker/Dockerfile --entrypoint docker/entrypoint.sh --config docker/basalt.yaml --out dist/images --record dist/images/image-record.json]
+  releasekit image verify --record dist/images/image-record.json [--require-local-image]
+  releasekit verify --release-dir dist/release/X.Y.Z --public-key <pub> --require-signature [--require-image-digest]
   releasekit repro --release-dir dist/release/X.Y.Z --public-key <pub>
   releasekit smoke --archive <archive> --version X.Y.Z --target goos/goarch [--tier full] [--workspace <dir> --dsn <dsn> --agent <name> --addr <host:port> --admin-token-env <VAR>] [--evidence-dir <dir>]
   releasekit upgrade --old <old-archive> --new <new-archive> --dsn <dsn> [--schema <name>] --workspace <dir> --config <path>
@@ -358,6 +363,17 @@ func runRecord(ctx context.Context, args []string, out io.Writer) error {
 	return nil
 }
 
+// stringList 收集可重复给出的 flag，如 assemble 的 --image-record。
+// stringList collects flags that may be repeated, such as assemble's --image-record.
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
 func runAssemble(ctx context.Context, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("assemble", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -372,8 +388,16 @@ func runAssemble(ctx context.Context, args []string, out io.Writer) error {
 	publicKey := flags.String("public-key", "", "Ed25519 公钥")
 	trust := flags.String("trust", "", "信任文件")
 	commit := flags.String("commit", "", "40 位提交号（缺省取 HEAD，并与仓库核对）")
+	var imageRecords stringList
+	flags.Var(&imageRecords, "image-record", "镜像记录路径（可重复）")
+	var imageEvidence stringList
+	flags.Var(&imageEvidence, "image-evidence", "镜像验收检查 ID（可重复；只写实际执行过的检查）")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	// 证据必须落在至少一条镜像记录上；没有镜像记录时单独给证据是无意义的。
+	if len(imageEvidence) > 0 && len(imageRecords) == 0 {
+		return errors.New("--image-evidence 必须与 --image-record 一起使用")
 	}
 	// 汇总也必须走与构建相同的输入冻结：脏工作区 / tag 不指向 HEAD / 版本非法都要拒绝，
 	// 否则记录里的 commit 与实际产物对不上。
@@ -392,13 +416,120 @@ func runAssemble(ctx context.Context, args []string, out io.Writer) error {
 		return err
 	}
 	if err := releasekit.AssembleRelease(ctx, releasekit.AssembleOptions{
-		ArtifactDir: *artifactDir, EvidenceDir: *evidenceDir, OutDir: *outDir,
+		ArtifactDir: *artifactDir, EvidenceDir: *evidenceDir, Images: imageRecords,
+		ImageEvidence: imageEvidence, OutDir: *outDir,
 		NotesPath: *notes, SigningKey: *signingKey, PublicKey: *publicKey,
 		TrustFile: *trust, Inputs: in,
 	}); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "release_dir=%s mode=%s verified=true\n", *outDir, in.Mode)
+	return nil
+}
+
+// runImage 处理镜像子命令：build 构建镜像并写记录，verify 按记录核对本地镜像与文件。
+// runImage handles the image subcommands: build creates the image and its record,
+// verify checks the local image and the recorded files against the record.
+func runImage(ctx context.Context, args []string, out io.Writer) error {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		return errors.New("用法：releasekit image build|verify …")
+	}
+	switch args[0] {
+	case "build":
+		return runImageBuild(ctx, args[1:], out)
+	case "verify":
+		return runImageVerify(ctx, args[1:], out)
+	default:
+		return fmt.Errorf("image 未知子命令 %q（支持 build / verify）", args[0])
+	}
+}
+
+func runImageBuild(ctx context.Context, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("image build", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	repo := flags.String("repo", ".", "仓库根")
+	version := flags.String("version", "", "版本 X.Y.Z")
+	binary := flags.String("binary", "", "linux/amd64 二进制")
+	baseRef := flags.String("base-ref", "", "基础镜像引用 name@sha256:…（必须与 release/image-lock.json 一致）")
+	dockerfile := flags.String("dockerfile", "docker/Dockerfile", "Dockerfile")
+	entrypoint := flags.String("entrypoint", "docker/entrypoint.sh", "entrypoint.sh")
+	configFile := flags.String("config", "docker/basalt.yaml", "basalt.yaml 模板")
+	outDir := flags.String("out", "dist/images", "镜像 SBOM / provenance / 记录输出目录")
+	recordPath := flags.String("record", "", "镜像记录路径（缺省 <out>/image-record.json）")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*baseRef) == "" {
+		return errors.New("--base-ref 必填：镜像必须以冻结的 digest 引用为基础（见 release/image-lock.json）")
+	}
+	record := *recordPath
+	if record == "" {
+		record = filepath.Join(*outDir, "image-record.json")
+	}
+	outAbs, err := filepath.Abs(*outDir)
+	if err != nil {
+		return err
+	}
+	recordAbs, err := filepath.Abs(record)
+	if err != nil {
+		return err
+	}
+	// 记录里的 SBOM / provenance 只写文件名，核对时相对记录所在目录解析；分放两处
+	// 会让“记录与其工件”的绑定关系在目录层面就断掉。
+	if filepath.Dir(recordAbs) != outAbs {
+		return fmt.Errorf("--record 必须与 --out 同目录（记录目录 %s，产物目录 %s）",
+			filepath.Dir(recordAbs), outAbs)
+	}
+	image, err := releasekit.BuildImage(ctx, releasekit.ImageInputs{
+		Repo: *repo, Version: *version,
+		Target: releasekit.Target{GOOS: "linux", GOARCH: "amd64", Tier: releasekit.TierBinary},
+		Binary: *binary, BaseRef: *baseRef,
+		Dockerfile: *dockerfile, Entrypoint: *entrypoint, ConfigFile: *configFile,
+		License: filepath.Join(*repo, "LICENSE"), OutDir: *outDir,
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeJSONFile(recordAbs, image); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "image=%s tag=%s local_id=%s record=%s\n", image.Name, image.Tag, image.LocalID, recordAbs)
+	return nil
+}
+
+func runImageVerify(ctx context.Context, args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("image verify", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	recordPath := flags.String("record", "", "镜像记录路径")
+	requireLocal := flags.Bool("require-local-image", false, "要求本地镜像存在且 ID 与记录一致")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*recordPath) == "" {
+		return errors.New("--record 必填")
+	}
+	body, err := os.ReadFile(*recordPath) // #nosec G304 -- 记录路径由调用方显式给出
+	if err != nil {
+		return err
+	}
+	var record releasekit.ImageRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		return fmt.Errorf("解析 %s：%w", *recordPath, err)
+	}
+	// 先核记录自洽与 SBOM / provenance 哈希，再核本地镜像；任何一步失败都意味着
+	// 记录不能代表当前镜像。
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	if err := releasekit.CheckImageRecordFiles(record, filepath.Dir(*recordPath)); err != nil {
+		return err
+	}
+	if _, err := releasekit.VerifyImage(ctx, record, releasekit.VerifyImageOptions{
+		RequireLocalImage: *requireLocal,
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "image=%s verified=true local_id=%s\n", record.Tag, record.LocalID)
 	return nil
 }
 
@@ -409,11 +540,13 @@ func runVerify(ctx context.Context, args []string, out io.Writer) error {
 	publicKey := flags.String("public-key", "", "Ed25519 公钥")
 	trust := flags.String("trust", "", "信任文件")
 	require := flags.Bool("require-signature", false, "要求签名")
+	requireImageDigest := flags.Bool("require-image-digest", false, "要求镜像记录带 repo_digest")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	report, err := releasekit.VerifyRelease(ctx, *releaseDir, releasekit.VerifyPolicy{
 		PublicKey: *publicKey, TrustFile: *trust, RequireSignature: *require,
+		RequireRepoDigest: *requireImageDigest,
 	})
 	if err != nil {
 		return err

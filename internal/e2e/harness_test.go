@@ -156,6 +156,14 @@ func TestMain(m *testing.M) {
 	fmt.Printf("binary_sha256=%s\n", sum)
 
 	code := m.Run()
+	// 镜像 / 临时目录残留是 A15 的红态：清理失败必须让整个 e2e 进程非零退出。
+	// Image or temp-dir residue is an A15 failure; cleanup failures must fail the run.
+	if err := us18CleanupImages(); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: 清理失败: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
 	cleanup()
 	os.Exit(code)
 }

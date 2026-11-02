@@ -1274,6 +1274,161 @@ basalt instance adopt --workspace <copy-root>/.basalt
 
 **当前验证状态（2026-11-02）**：本机只验证到宿主 binary 档与工具链自检；真实 full 制品、四平台宿主矩阵、升级／失败恢复实测、正式签名与仅下载目录的独立验证均**未完成**，登记在 `specs/017-release-artifacts/run-state.md` §4（U1–U7）并延期到首次正式发布前。预演产物（未签名 / `compiled-only`）**不得**当作正式发布物，也**不得**据此宣称某平台已实测。
 
+### 8.2 容器部署单元（Docker／Compose，US-18 起）
+
+本节给出官方 linux/amd64 binary 镜像与单实例 Compose 编排的使用面。容器只是既有服务的打包形态：启动顺序、备份恢复、停机与恢复语义与二进制部署完全一致（§1.2、§4.4、§5.1–§5.3）；**不**新增自动升级平台、多副本调度或第二套运行期存储。
+
+#### 组成与持久化布局
+
+| 资源 | 内容 | 持久化 |
+| --- | --- | --- |
+| `basalt` 容器 | 单个 Go 二进制 + 内嵌管理台 + 配置模板 / 许可证；`user 10001:10001`、只读根文件系统、`cap_drop ALL`、`no-new-privileges`、单副本；镜像内**没有** Node / Python / MCP 运行时，启动不下载依赖 | `workspace` 卷挂 `/data`（Agent 目录、技能库、`.basalt/` 名册与日志、首启播种的 `basalt.yaml`）；`private` 卷挂 `/var/lib/basalt`（`master.key` 与 `instances/<实例>/admin-token`） |
+| `postgres` 容器 | `pgvector/pgvector:0.8.7-pg17-bookworm`，digest 与 `release/image-lock.json` 逐字一致；首启由 `docker/initdb/10-extensions.sql` 建 `vector` / `pg_trgm` | `database-data` 卷挂 `/var/lib/postgresql/data` |
+| 宿主 secret | `docker/secrets/database_dsn`（10001:10001 0400）与 `docker/secrets/postgres_password`（0:0 0400），以文件方式挂载 | 宿主文件；不写进镜像、`.env` 或版本库 |
+
+发布签名私钥（`release-private.pem`）**不得**进入镜像、容器或构建上下文；`releasekit image build` 的构建上下文守卫按文件名与内容双重拒绝（`*.pem`、`secrets/`、`career/`、`release-keys`、`BEGIN PRIVATE KEY`）。
+
+容器重建（`docker compose up -d` 重新创建、换镜像）**不丢**实例身份与管理密码——名册与 `master.key` / `admin-token` 都在卷里；只有 `docker compose down -v` 会删除卷，**不得**对已部署实例执行。
+
+#### 首次部署
+
+```sh
+# 1. 部署参数：复制示例并逐项填写（镜像写「版本 + digest」、六项 ingress 按容量评估）
+cp docker/.env.example docker/.env
+
+# 2. 生成两把 secret 并复核属主 / 权限（无宿主 root 时用脚本头部注释里的一次性 root 容器写法）
+sudo sh docker/init-secrets.sh docker/secrets
+
+# 3. 预取固定 digest 的数据库镜像
+docker pull "$(sed -n 's/^BASALT_DB_IMAGE=//p' docker/.env)"
+
+# 4. 启动并等待健康检查
+cd docker
+docker compose -p basalt up -d --wait
+```
+
+- `.env` 由 `docker compose` 在**当前目录**自动读取，因此上例先 `cd docker`；在仓库根执行时改为 `docker compose --env-file docker/.env -f docker/compose.yaml …`（`docker/backup.sh` 与 `docker/restore.sh` 内部会自己调 `docker compose`，从 `docker/` 目录执行最省事）。
+- `init-secrets.sh` 生成前读取 secret 目录上一级的 `.env`（`POSTGRES_DB` / `POSTGRES_USER`，同名环境变量优先），让 DSN 里的库名 / 用户名与编排一致；都没有时回退 `basalt` / `basalt`。脚本**拒绝覆盖**已存在的 secret：首启失败要重来必须两个文件一起删，轮换必须两个一起换。用一次性 root 容器执行时容器看不到宿主 `.env`，必须显式传 `-e POSTGRES_DB=… -e POSTGRES_USER=…`（写法见脚本头部注释）。
+- 首次启动沿用 §1.2 的四个阶段：播种 `/data/basalt.yaml`（之后**永不覆盖**）、连接并迁移 PostgreSQL、生成管理台密码、监听。宿主端口默认只发布到回环（`BASALT_HTTP_BIND=127.0.0.1`）。
+- 管理台密码在实例私有目录，不打印在日志里；读取方式：
+
+```sh
+cd docker
+docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'
+```
+
+- 健康检查 `GET /api/v1/health` **只判存活**：数据库断开时它仍是 200，不能当“数据库就绪”用。数据库可用性看启动日志与业务接口（§1.2 阶段②）。
+
+#### 日常停机与重启
+
+- `docker compose stop` / `docker compose down`（不带 `-v`）走 SIGTERM，编排给 90 秒宽限（`stop_grace_period`），覆盖既有 70 秒在途 HTTP 宽限与调度器独立停止预算（§5.3）。
+- 编排**不设** compose `restart` 策略：宿主重启或 Docker 守护进程重启后容器不会自启，按 `cd docker && docker compose -p basalt up -d --wait` 拉起后再核对健康检查。进程崩溃同样不会由编排自动拉起；先看 `docker compose -p basalt logs basalt` 定位，再按 §5.8 排障。
+- 重启后数据保留、在途 Run 由恢复路径收口为失败 / 工具 `unknown`，**不**自动重跑；重启不重放已完成的外部副作用（§5.3、§5.8）。
+- 换宿主端口（`BASALT_HTTP_PORT`）必须同步修改 `/data/basalt.yaml` 的 `allowed_hosts` / `allowed_origins`；配置只在首启播种，之后不随模板更新（U18-Q7）。
+
+#### 备份与恢复
+
+四件套一致性备份 = 数据库 dump + 工作区卷 + 实例私有卷 + 宿主 secret，脚本顺带写 `SHA256SUMS` 并把应用拉回运行：
+
+```sh
+cd docker
+COMPOSE_PROJECT_NAME=basalt sh backup.sh /var/backups/basalt-20261102
+```
+
+- `COMPOSE_PROJECT_NAME` **必须**显式给出（与部署时的 `-p` 一致），脚本不猜项目名；应用容器必须已存在（镜像取自现有容器，保证与部署版本一致）。
+- 备份期间只停应用、数据库保持在线；需要读 0400 文件与 root 属主的动作都在一次性 `--user 0` 容器里完成，宿主用户有 docker 权限即可。
+- 密钥材料（`master.key` / `admin-token`）随 `private` 卷进入备份，备份目录按凭证对待（脚本把 secret 副本置 0600，目录 0700）。
+- 备份制品写完、但应用未能重新启动时，脚本以**非零**退出并提示用 `docker compose -p <项目> ps` 定位：备份本身仍有效，失败的是恢复运行这一步，不得当作备份失败重做（重做会覆盖同一目录）。
+
+恢复到**全新项目名**（新卷；覆盖现有实例不在脚本能力内）：
+
+```sh
+cd docker
+BASALT_HTTP_PORT=8081 COMPOSE_PROJECT_NAME=basalt \
+  sh restore.sh /var/backups/basalt-20261102 basalt-restored
+```
+
+脚本先 `sha256sum -c` 校验备份、拒绝已有卷的项目；按「放回 secret 并断言 `0:0:400` / `10001:10001:400` → 建卷与容器（不启动）→ 解包（保留归档属主）→ 起库并 `pg_restore` → 启动」执行——secret 必须**先于**容器创建就位：Compose 的文件 secret 是 bind mount，`create` 时就校验源文件存在。目标项目与源项目同时运行时必须给不同的 `BASALT_HTTP_PORT`（shell 环境优先于 `.env`）。
+
+- 恢复目标**必须**是独立部署目录：文件 secret 绑定在部署目录的 `secrets/` 下，脚本会先比对——目标 secret 已存在且与备份不同即拒绝（`不得覆盖仍在使用的部署目录`）。同一部署目录回滚（secret 相同）不受影响；用备份恢复出独立实例或迁到新宿主时，把 `docker/` 资产与 `.env` 复制到新目录，在该目录执行。
+- 恢复中途失败时脚本打印未完成提示与 `docker compose -p <新项目> down -v` 清理命令；清理后重试，只清理脚本自己创建的新项目卷。
+
+#### 升级与回退
+
+升级 = 新镜像 + 受控前向迁移；回退 = 恢复升级前备份 + 旧镜像（**不**提供跨 schema 降级迁移，见 §5.1 / §5.2）：
+
+```sh
+# 1. 升级前备份（保持停机点，与 §4.2 口径一致）
+cd docker
+COMPOSE_PROJECT_NAME=basalt sh backup.sh /var/backups/basalt-before-upgrade
+
+# 2. 构建 / 校验新镜像并取得 digest（见下节命令），把 .env 的 BASALT_IMAGE 换成
+#    basalt:<新版本>@sha256:<digest>
+
+# 3. 只重建应用容器；数据库卷不动，启动时执行前向迁移
+docker compose -p basalt up -d --wait
+```
+
+回退（旧镜像 + 升级前备份，恢复到新项目名后切换入口）：
+
+```sh
+cd docker
+BASALT_IMAGE=basalt:<旧版本>@sha256:<digest> BASALT_HTTP_PORT=8081 \
+  COMPOSE_PROJECT_NAME=basalt \
+  sh restore.sh /var/backups/basalt-before-upgrade basalt-rollback
+```
+
+**不得**只把镜像换回旧版本去打开已被新版迁移的库（§5.2 / §5.7）；跨版本回退必须数据库、工作区、私有卷、secret 成套回滚。
+
+#### 镜像构建、记录与发布目录校验
+
+镜像由发布工具构建，tag 规则 `<远程仓库名>:<版本>-linux-amd64`（本地预演 `repo=basalt`）；构建前先产出 linux/amd64、`CGO_ENABLED=0` 的二进制：
+
+```sh
+releasekit build --version X.Y.Z --tag vX.Y.Z --target linux/amd64 --out dist/build
+
+releasekit image build --repo . --version X.Y.Z \
+  --binary dist/build/basalt \
+  --base-ref alpine:3.23@sha256:<release/image-lock.json 的 app_base> \
+  --out dist/images --record dist/images/image-record.json
+
+releasekit image verify --record dist/images/image-record.json --require-local-image
+```
+
+- `--base-ref` 必须与 `release/image-lock.json` 的 `app_base` 逐字一致，漂移即失败；`docker/compose.yaml` 里 PostgreSQL 的 digest 字面量同样以锁文件为准（e2e 逐字判卷）。
+- `image-record.json` 记录 `local_id`、`base_digest`、SBOM / provenance 哈希与 scan 结论；任一步失败会删除已构建的本地镜像，不留下“无记录的镜像”。
+- 发布目录汇总时把镜像记录并入（矩阵追加 `kind=image` 行，与 `images[]` 一一对应），写入顺序在 `SHA256SUMS` 与签名**之前**：
+
+```sh
+releasekit assemble --image-record dist/images/image-record.json \
+  --image-evidence TestUS18_Image_BuildAndRecord \
+  --artifact-dir dist/build --evidence-dir dist/evidence \
+  --version X.Y.Z --tag vX.Y.Z --mode final --out dist/release/X.Y.Z \
+  --notes <发布说明.md> --signing-key <私钥> --public-key <公钥>
+```
+
+- `--image-evidence <检查 ID>`（可重复）只写**本次发布实际执行过**的镜像验收检查：给出后矩阵镜像行才是 `tested + 检查 ID`；不给则按记录的 scan 状态写 `not-tested` 并注明原因——没扫描**不得**被写成没测试。记录里已带验收证据时，命令行必须给出完全一致的集合，不一致即失败（不做静默覆盖）。
+- 仅下载目录校验时要求每条镜像记录带 `repo_digest`：
+
+```sh
+./basalt-verify-<version>-linux-amd64 --release-dir . \
+  --public-key /etc/basalt/release.pub --require-signature --require-image-digest
+```
+
+无镜像记录的旧发布目录**不**因 `--require-image-digest` 失败；一旦存在 `images[]` 或矩阵镜像行，就必须全部通过。
+
+#### 排障
+
+| 症状 | 原因与处理 |
+| --- | --- |
+| `docker compose config` 点名缺变量 | `.env` 缺 `BASALT_IMAGE` 或六项 ingress（产品不设默认，D-30） |
+| 应用容器 exit 78，点名 `/run/secrets/database_dsn` | secret 缺失 / 不可读 / 为空；确认 `docker/secrets` 两文件属主与权限，见本节首部 |
+| 读 DSN 报 `Permission denied` | `database_dsn` 属主不是 10001；WSL 的 9p / drvfs（`/mnt/*`）会静默忽略 `chown` / `chmod`——`init-secrets.sh` 的 stat 复核会非零退出，换 Linux 原生路径 |
+| 日志 `工作区不可写 /data` | workspace 卷内属主被改；把卷内属主改回 `10001:10001`，或从备份恢复 |
+| 日志 `打开 PostgreSQL: 连接 PostgreSQL 失败` | 数据库不可达或凭据不符；compose 已等 `postgres` 健康，再用 `docker compose logs postgres` 查 |
+| 健康检查绿但业务接口 500 | `/api/v1/health` 只判存活，不查库；按 §5.8 查启动 / 数据库错误 |
+| `服务启动要求下列配置项大于零` | 六项 ingress 中有 0 或空值 |
+
 ## 9. 管理面写操作要点（US-12 起）
 
 管理台（`/console/`）的写操作全部先写 `pending` 管理操作再动目标，可在「操作记录」里按 `operation_id` 查证终态。日常写操作有几条固定边界：

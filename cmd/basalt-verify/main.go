@@ -22,6 +22,8 @@ func run(ctx context.Context, args []string) int {
 	publicKey := flags.String("public-key", "basalt-release.pub", "Ed25519 公钥")
 	trust := flags.String("trust", "", "信任文件（可选）")
 	require := flags.Bool("require-signature", true, "要求签名")
+	requireImageDigest := flags.Bool("require-image-digest", false,
+		"要求发布记录里的镜像带 repo_digest（对外发布镜像时使用）")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -31,6 +33,7 @@ func run(ctx context.Context, args []string) int {
 	}
 	report, err := releasekit.VerifyRelease(ctx, *releaseDir, releasekit.VerifyPolicy{
 		PublicKey: *publicKey, TrustFile: *trust, RequireSignature: *require,
+		RequireRepoDigest: *requireImageDigest,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "basalt-verify:", err)

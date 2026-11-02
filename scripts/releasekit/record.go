@@ -58,7 +58,11 @@ func recordLimitations(mode Mode, rows []SupportRow) []string {
 		if row.Status == StatusTested {
 			continue
 		}
-		limitations = append(limitations, fmt.Sprintf("%s/%s 未实测：%s", row.GOOS, row.GOARCH, row.Reason))
+		platform := row.GOOS + "/" + row.GOARCH
+		if row.Kind != "" {
+			platform += "(" + row.Kind + ")"
+		}
+		limitations = append(limitations, fmt.Sprintf("%s 未实测：%s", platform, row.Reason))
 	}
 	limitations = append(limitations, "外部模型、真实 webhook 与通知渠道未由发布流程验证")
 	sort.Strings(limitations)
