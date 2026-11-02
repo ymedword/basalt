@@ -673,3 +673,11 @@
 - `E2E_TIMEOUT=20m make e2e`最终树通过：608.356s，`internal/e2e` ok，`binary_source=candidate`、`binary_sha256=394c00e33904dde53e58e92068178f029b9305f09cc9bb206bdd9786fb6343ad`（日志`.loop/e2e-final-20261102-b.log`；首轮失败日志`.loop/e2e-final-20261102.log`保留）。
 - `markdownlint`（Operations、specs/016a-observability全部md、run-state）0 issues；`git diff --check`干净。完整`--profile ci`验收（11项，与`full`同一清单）由本次提交后的CI执行并回填R081，不以历史full11冒充最终树结果。
 - 尚未验证：远端CI结果（R081回填）、真实外部OTLP后端、真实模型调用、生产容量与启用后的长期运行；独立浏览器画面验收仍not_run，用户已完成人工走查，不以DOM/API顶替。提交、推送、快进合并与CI跟踪按用户授权继续。
+
+### R081 Claude 收尾复核：提交、推送、快进合并与 CI（2026-11-02）
+
+- 最终提交`8e3ad5c4a1e9983ed90b093a9efef5d49f3ed3a4`（209文件，+25090/−254）已推送`016a-observability`；`main`由`a2746ede`快进到同一提交并推送，`origin/main`与本地一致。提交信息为英文Conventional Commits标题＋四段双语正文。提交树内无`CLAUDE*`、`docs/interview`、`career/`、`dev-env/`、`bin/`、`.loop/`及私有正文路径；新增行凭据模式扫描零命中。
+- CI run`41402434800`（push，8e3ad5c）5/5 job success，06:50:13–07:27:06 UTC（约36分53秒）：build 3分17秒、console 44秒、website 22秒、postgres 4分58秒、test 36分50秒。test覆盖`--profile ci` 11项（fmt / lint / sec / test / test-integration / test-pg / cover / build / eval-build / behavior / injection）。`Publish website` run`41406394558`由CI成功触发，deploy success。CI 11项不含e2e，e2e证据以R080的本地608.356s通过为准。
+- 演示实例在e2e后已重启（pid 23088，`127.0.0.1:8080`，`/api/v1/health`返回ok）；R080记录的两起e2e失败（8080被演示实例占用、Demo用例判据与R633阶段证据设计冲突）均在提交前修复并复跑通过。
+- 本条只记录收尾事实，不改写R073–R080。按US-16先例，本条文档提交留在`016a-observability`分支，不再合回`main`，避免仅文档改动再次触发整轮CI；`main`仍指向8e3ad5c。
+- 尚未验证（与本轮收尾一致）：真实外部OTLP后端、真实模型调用、生产容量与启用后的长期运行、独立浏览器画面验收（not_run，用户已完成人工走查）。
