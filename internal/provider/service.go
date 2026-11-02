@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -98,9 +99,14 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	}
 
 	// 4. 发出：一次调用、不重试、不 fallback（技术方案 §2.4.3）。
+	if req.Phases != nil {
+		req.Timing = &core.ModelTiming{}
+	}
 	start := time.Now()
 	resp, chatErr := client.Chat(ctx, req)
 	duration := time.Since(start)
+	// Publish only after the call duration is frozen; transport callbacks do no I/O.
+	defer s.recordTransportTiming(ctx, req, callID)
 
 	// 5. 终态回填：与预写共用同一把解耦上下文——被取消的调用同样要落终态，那是"为什么停了"
 	// 最需要证据的时刻（契约 §4.2）。
@@ -130,6 +136,20 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 		Duration:     duration,
 	})
 	return resp, chatErr
+}
+
+func (s *ProviderService) recordTransportTiming(ctx context.Context, req core.ChatRequest, callID int64) {
+	if req.Timing == nil {
+		return
+	}
+	for _, captured := range []*core.PhaseTiming{req.Timing.Wait, req.Timing.Read} {
+		if captured == nil {
+			continue
+		}
+		measurement := *captured
+		measurement.RunID, measurement.StepID, measurement.CallID = req.RunID, strconv.Itoa(req.Round), callID
+		core.RecordPhaseTiming(ctx, req.Phases, measurement)
+	}
 }
 
 // Pinned 返回某个 Provider 的**准入固定视图**（人工 review ② 缺陷 2）：路由表只含这一条，

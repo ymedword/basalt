@@ -24,15 +24,16 @@ import (
 
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/diagnostics"
+	"github.com/ymedword/basalt/internal/observability"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 )
 
-// newDiagnosticsPorts 构造诊断的写入器与读取器。返回的两个实例都由调用方持有：
+// newDiagnosticsPortsWithMetrics 构造诊断的写入器、读取器及可选指标回调。调用方持有实例：
 // 写入器进运行路径（`AdmissionDeps.Diagnostics`），读取器进管理面
 // （`web.Options.Diagnostics`）。
-// newDiagnosticsPorts builds the recorder (run path) and the reader (management surface).
-func newDiagnosticsPorts(cfg cli.DiagnosticsConfig, db *postgres.DB, now func() time.Time,
-	logger *slog.Logger,
+// newDiagnosticsPortsWithMetrics builds the recorder, reader and optional metric callback.
+func newDiagnosticsPortsWithMetrics(cfg cli.DiagnosticsConfig, db *postgres.DB, now func() time.Time,
+	logger *slog.Logger, metrics *observability.MetricsCollector,
 ) (*diagnostics.Recorder, *diagnostics.Reader, error) {
 	if db == nil {
 		// 重路径恒有库句柄；nil 只可能来自被绕过的装配。与 web 侧同一口径——
@@ -45,6 +46,7 @@ func newDiagnosticsPorts(cfg cli.DiagnosticsConfig, db *postgres.DB, now func() 
 	}
 	store := postgres.NewDiagnosticStore(db)
 	recorder := diagnostics.NewRecorder(diagnostics.RecorderOptions{
+		OnResult: diagnosticMetricResult(metrics),
 		Store:    store,
 		Sampler:  diagnostics.NewRateSampler(settings),
 		Redactor: diagnostics.NewWhitelistRedactor(),
@@ -53,4 +55,16 @@ func newDiagnosticsPorts(cfg cli.DiagnosticsConfig, db *postgres.DB, now func() 
 	})
 	reader := diagnostics.NewReader(store, settings, diagnostics.NewWhitelistRedactor())
 	return recorder, reader, nil
+}
+
+func diagnosticMetricResult(metrics *observability.MetricsCollector) func(diagnostics.Kind, string) {
+	if metrics == nil {
+		return nil
+	}
+	return func(kind diagnostics.Kind, result string) {
+		metrics.IncCounter("obs_diagnostic_events_total", map[string]string{"kind": string(kind), "result": result})
+		if result == "write_failed" {
+			metrics.IncCounter("obs_diagnostic_write_failures_total", map[string]string{"kind": string(kind)})
+		}
+	}
 }

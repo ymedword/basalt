@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -25,9 +26,13 @@ const cronTZPrefix = "CRON_TZ="
 // Engine 是 cron 引擎的 robfig 实现（core.CronEngine）。
 // Engine is the robfig-backed implementation of core.CronEngine.
 type Engine struct {
-	cron   *cron.Cron
-	parser cron.Parser
-	logger *slog.Logger
+	cron        *cron.Cron
+	parser      cron.Parser
+	logger      *slog.Logger
+	mu          sync.Mutex
+	running     bool
+	loopDone    chan struct{}
+	stopContext context.Context
 }
 
 // 编译期断言：Engine 满足消费方（core）声明的引擎接口。
@@ -40,11 +45,12 @@ var _ core.CronEngine = (*Engine)(nil)
 // time zones travel with each spec via the CRON_TZ= prefix.
 func New(logger *slog.Logger) *Engine {
 	p := newSixFieldParser()
-	return &Engine{
-		cron:   cron.New(cron.WithParser(p), cron.WithLogger(cronLogger{logger: logger})),
+	e := &Engine{
 		parser: p,
 		logger: logger,
 	}
+	e.cron = cron.New(cron.WithParser(p), cron.WithLogger(cronLogger{logger: logger, stopped: e.loopStopped}))
+	return e
 }
 
 // newSixFieldParser 构造 6 段解析器（秒 分 时 日 月 周）；引擎与不持有引擎的枚举
@@ -69,13 +75,69 @@ func (e *Engine) Add(spec string, job func()) (core.CronHandle, error) {
 	return &handle{engine: e, id: id}, nil
 }
 
-// Start 启动引擎调度循环（非阻塞）。
-// Start starts the engine's scheduling loop without blocking.
-func (e *Engine) Start() { e.cron.Start() }
+// Start 启动调度循环；重启先等待上一代循环退出，不等待上一代在途任务。
+// Start starts the loop; a concurrent restart first joins the previous loop, not its jobs.
+func (e *Engine) Start() {
+	for {
+		e.mu.Lock()
+		if e.running {
+			e.mu.Unlock()
+			return
+		}
+		if e.loopDone != nil {
+			select {
+			case <-e.loopDone:
+			default:
+				done := e.loopDone
+				e.mu.Unlock()
+				<-done
+				continue
+			}
+		}
+		e.loopDone = make(chan struct{})
+		e.stopContext = nil
+		e.running = true
+		// robfig Start synchronously publishes running before starting its goroutine.
+		e.cron.Start()
+		e.mu.Unlock()
+		return
+	}
+}
 
-// Stop 停止调度循环并返回"在途任务全部结束"时关闭的 ctx（robfig 语义）。
-// Stop stops the scheduling loop and returns a context closed once running jobs finish.
-func (e *Engine) Stop() context.Context { return e.cron.Stop() }
+// Stop 同时等待本代循环的最终回调与原 robfig 在途任务完成，重复调用共享完成信号。
+// Stop joins both the current loop's final callback and robfig's running-job completion.
+func (e *Engine) Stop() context.Context {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stopContext != nil {
+		return e.stopContext
+	}
+	stopped, cancel := context.WithCancel(context.Background())
+	if !e.running {
+		cancel()
+		return stopped
+	}
+	e.running = false
+	e.stopContext = stopped
+	loopDone := e.loopDone
+	jobs := e.cron.Stop()
+	go func() {
+		<-loopDone
+		<-jobs.Done()
+		cancel()
+	}()
+	return stopped
+}
+
+// loopStopped 确认本代循环；Start 在该屏障前不得发布下一代，旧回调不会确认新代。
+// loopStopped acknowledges this generation before Start can publish the next one.
+func (e *Engine) loopStopped() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.loopDone != nil {
+		close(e.loopDone)
+	}
+}
 
 // Occurrences 从 from 起循环 schedule.Next，最多 limit 个且不超过 to。
 // 解析失败返回空切片——调用方已在校验期拒绝非法 spec，这里只是防御。
@@ -134,12 +196,21 @@ func (h *handle) Stop() { h.engine.cron.Remove(h.id) }
 
 // cronLogger 把 robfig 的 Logger 接口接到 slog：错误进 error 字段，键值原样透传。
 // cronLogger adapts robfig's Logger interface onto slog.
-type cronLogger struct{ logger *slog.Logger }
+type cronLogger struct {
+	logger  *slog.Logger
+	stopped func()
+}
 
 // Info 透传常规消息。
 // Info forwards routine messages.
 func (l cronLogger) Info(msg string, keysAndValues ...any) {
 	l.logger.Info(msg, keysAndValues...)
+	// Pinned robfig v3.0.1's loop stops its timer, emits this callback, then returns.
+	// Its Stop context only joins jobs. Acknowledge after forwarding the real callback,
+	// including when slog filters it; never synthesize a replacement stop log.
+	if msg == "stop" && l.stopped != nil {
+		l.stopped()
+	}
 }
 
 // Error 透传错误，并以 error 字段携带错误值（字段纪律，EngineeringStandards §4）。

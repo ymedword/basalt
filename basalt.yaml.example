@@ -113,7 +113,7 @@ callers:
 # 诊断事件段（US-16）：采样与保留期。**审计不受本节影响**——诊断可采样、可丢弃，
 # 审计记录始终全量落库（fail-closed）。
 diagnostics:
-  retention_days: 7           # 缺省 7 天；超期清理不阻塞业务；负数拒绝启动
+  retention_days: 30          # 缺省30天；启用清理后超期回收；负数拒绝启动
   sample_rate: 1.0            # 缺省 1.0（全采）；0 = 不采（只剩审计）；取值须在 0–1
 
 # 托管凭据的主密钥（US-12 范围修订；出处 docs/Operations.md §6.1）。
@@ -197,3 +197,38 @@ author:
   provider: deepseek      # 必须是已发布模型连接的 name
   model: deepseek-chat    # 该连接下的模型名
   temperature: 0.2        # 可选，缺省 0.2，取值 [0,2]
+
+# US-16A：启动配置快照；没有热加载、按规则DSL或OBS写API。
+# 保留天数默认30天；清理默认关闭，示例不会自动删除数据或向外导出。
+observability:
+  enabled: true
+  retention:
+    cleanup_enabled: false
+    history_enabled: false    # 关联业务历史、日志与已验证备份清理；当前状态和未决记录保留
+    history_days: 30
+    diagnostic_events_days: 30
+    assembly_records_days: 30
+    alert_history_days: 30
+    export_history_days: 30
+    batch_size: 1000
+    max_batches_per_run: 20
+    interval: 1h
+  export:
+    enabled: false
+    endpoint: ""                     # 启用时改为 ${OTEL_EXPORTER_OTLP_ENDPOINT}；只支持http/https
+    protocol: http/protobuf           # 或http/json；每批单一信号
+    # headers: ${OTEL_EXPORTER_OTLP_HEADERS}  # 可省略；显式引用的变量须存在，值允许为空
+    batch_size: 256
+    timeout: 10s
+    max_attempts: 10
+    max_item_age: 24h
+    scan_overlap: 5m
+    safety_lag: 2m
+    reconcile_horizon: 24h
+    initial_backfill: 24h
+    scan_page_size: 500
+    lease_ttl: 5m
+    metrics_interval: 1m
+  alerts:
+    enabled: true
+    evaluation_interval: 1m

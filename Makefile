@@ -88,9 +88,12 @@ example-tests: ; go test -count=1 ./examples/shared/mcp/docs-readonly && $(PYTHO
 # `-json` 不可省：`go test` 在包通过且无 `-v` 时会吞掉包级 stdout，`binary_sha256=` /
 # `binary_source=candidate` 标记随之消失（实测：e2e 全绿但 stage 判「found 0」）。
 # -json is required: a passing package without -v swallows package stdout, including the marker.
+# Whole-package watchdog only; individual test deadlines and assertions are unchanged.
+E2E_TIMEOUT ?= 10m
+
 e2e: build example-tests
 	@log=$$(mktemp); \
-	if BASALT_E2E_BINARY=$(CURDIR)/$(BIN) go test -json -tags=e2e -count=1 ./internal/e2e > $$log 2>&1; then \
+	if BASALT_E2E_BINARY=$(CURDIR)/$(BIN) go test -json -tags=e2e -count=1 -timeout=$(E2E_TIMEOUT) ./internal/e2e > $$log 2>&1; then \
 		cat $$log; \
 		grep -q 'binary_source=candidate' $$log || { echo "e2e: binary_source=candidate missing (release evidence must run the built candidate)" >&2; rm -f $$log; exit 1; }; \
 	else \

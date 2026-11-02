@@ -5,6 +5,8 @@
 import { defineComponent, h, ref } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import type { RunDetail } from '../api'
+import { ObservabilityApi } from '../api-observability'
+import { runSummary } from '../observation-presentation'
 import {
   ConfirmDialog,
   DataTable,
@@ -13,7 +15,7 @@ import {
   shortHash,
 } from '../components/ui'
 import { renderSafeText } from '../render'
-import { diagnosticsHref } from '../router'
+import { diagnosticsHref, observabilityHref } from '../router'
 import { CompactionPanel } from './compaction'
 import {
   AGENT_STATE_LABELS,
@@ -35,6 +37,7 @@ export const RunDetailView = defineComponent({
     const runId = props.params.id ?? ''
     const api = props.ctx.api
     const run = useLoader(() => api.getRun(runId))
+    const diagnosis = useLoader(() => new ObservabilityApi(api).timeline({run_id: runId, limit: '200'}))
 
     const cancelOpen = ref(false)
     const cancelBusy = ref(false)
@@ -126,7 +129,8 @@ export const RunDetailView = defineComponent({
           // 诊断事件按 run_id 深链：运行内的模型 / 工具 / 权限 / 配额判定都在那里。
           // Diagnostics deep-link by run_id; the run page owns the id, the page does the rest.
           h('div', { class: 'form-actions' }, [
-            h('a', { class: 'button', href: diagnosticsHref(['run_id', runId]) }, '诊断事件'),
+            h('a', { class: 'button primary', href: observabilityHref('run', ['run_id', runId]) }, '排查此次运行'),
+            h('a', { class: 'button', href: diagnosticsHref(['run_id', runId]) }, '诊断明细'),
           ]),
         ),
         h('p', { class: 'back-link' }, [h('a', { href: '/console/runs' }, '← 返回运行列表')]),
@@ -147,6 +151,9 @@ export const RunDetailView = defineComponent({
             badge(RUN_STATUS_LABELS[detail.status], runStatusTone(detail.status)),
             h('span', { class: 'muted' }, ` ${detail.agent} · ${detail.trigger} · ${detail.channel}`),
           ]),
+          diagnosis.data.value && Array.isArray(diagnosis.data.value.entries) ? runSummary(diagnosis.data.value) : null,
+          diagnosis.error.value ? h(Notice, {tone: 'warn', text: '诊断摘要暂时无法读取；下方保留权威运行记录。'}) : null,
+          h('details', {class: 'obs-details'}, [h('summary', '运行标识与执行记录'),
           section('执行记录', [definitions([
             ['会话', identifier(detail.session_id)],
             ['迭代', String(detail.iterations)],
@@ -156,17 +163,17 @@ export const RunDetailView = defineComponent({
             ['开始时间', formatTimestamp(detail.started_at)],
             ['结束时间', formatTimestamp(detail.finished_at)],
             ['原因', detail.reason === '' ? '—' : detail.reason],
-          ])]),
+          ])])]),
           // 压缩记录（T089）：无状态 Run 的压缩条目按 run 范围存；会话范围的条目在
           // 会话详情页看——两个范围各有自己的当前代次，合并列表不满足契约排序口径。
           // Run-scope compactions only; session-scope entries live on the session page.
-          h(CompactionPanel, { ctx: props.ctx, runId }),
+          h('details', {class: 'obs-details'}, [h('summary', '归属于此 Run 的压缩记录'), h('p', {class: 'muted small'}, '会话范围的压缩记录在会话详情中查看；上下文诊断展示的是本轮装配引用的压缩状态。'), h(CompactionPanel, { ctx: props.ctx, runId })]),
           section('最终文本', [
             detail.final_text === ''
               ? h('p', { class: 'muted' }, '该运行没有最终文本')
               : h('div', { class: 'final-text' }, renderSafeText(detail.final_text)),
           ]),
-          renderManifest(detail),
+          h('details', {class: 'obs-details'}, [h('summary', '本次固定的资源版本'), renderManifest(detail)]),
         )
 
         if (detail.status === 'running') {

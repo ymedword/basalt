@@ -11,9 +11,9 @@ import "fmt"
 
 const (
 	// DefaultRetentionDays 是保留期的缺省值（`diagnostics.retention_days` 未写时生效）。
-	// 七天是**有界**的基础值：诊断表不得无界增长，长期保留策略归 OBS（US-16A（拟））。
+	// 三十天是基础值；启用保留策略后按该期限清理。
 	// DefaultRetentionDays is the bounded default; long-term retention belongs to OBS.
-	DefaultRetentionDays = 7
+	DefaultRetentionDays = 30
 
 	// DefaultSampleRate 是采样率的缺省值：1.0 = 全量保留，不丢事件。
 	// DefaultSampleRate keeps every event; sampling is an explicit operator choice.

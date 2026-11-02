@@ -2,23 +2,11 @@
 
 package app
 
-// 本文件守 C-37 / G2-17 的**双谱系注入**（US-16 §4 的
-// `TestApp_SupportedVersionInjectedPerBackend`）：`storage.SupportedSchemaVersion`（SQLite
-// 源谱系，6）与 `postgres.SupportedSchemaVersion`（运行期谱系，D-19 前向迁移 0002 +
-// R59 补列修复 0003 后为 3）各自版本化，装配层**按后端分别注入**——`init` / 旧库升级
-// 拿 6，运行期命令面拿 3。
-// 三个可判事实：
-//
-//  1. 两个常量**互不相等**（"统一成一个版本"会直接红）；
-//  2. `init` 建出的 SQLite 源库是 v6（不是 3）；
-//  3. `db migrate` 建出的 PG 库是 v3（不是 6），且同一二进制随后 `status` 把该库判为
-//     **与自身同版本**——`status` 比的正是装配注入的 `Deps.SupportedSchemaVersion`，
-//     注入成 6 就会得到"库 v3 < 目标 v6"并以 1 退出（C-37 症状"6 与 v3 直接比较"）。
-//
-// 版本数字随迁移链前移（v2 → v3 是 R59 补列修复，2026-10-31）；本文件判的是"按后端
-// 分别注入"，不是某个具体数字——数字断言只是让"有人偷偷统一"可判。
-// The two lineages are versioned separately and injected per backend: init/legacy upgrade
-// get 6, the runtime command face gets 3 (after the D-19 and R59 forward migrations).
+// 本文件守C-37/G2-17的双谱系注入。US-16A批准0006后PG与SQLite的数字恰好同为6，
+// 仍须各自版本化、按后端分别注入；数字不等已不能作为独立性的判据。
+// 实际init/db migrate/status链路、两后端表身份及VersionLineageOrigins的包来源检查共同防串用。
+// The independent lineages happen to share version six after the approved OBS migration.
+// Real backend operations, schema identity and origin checks continue to prevent cross-injection.
 
 import (
 	"context"
@@ -37,19 +25,17 @@ import (
 
 // TestApp_SupportedVersionInjectedPerBackend：整条链路上只出现一次版本交叉的机会
 // （装配层），所以每个断言都锚在"哪个后端拿到了哪个版本"上。
-// 逆改点：把 `cli.Deps.SupportedSchemaVersion` 换成 `storage.SupportedSchemaVersion`
-// （6）→ ③ 的 `status` 报"库版本旧于二进制（v3 < v6）"、退出码 1，断言红；
-// 把 `SourceSchemaVersion` 换成 PG 的 1 → `init` 建出的库是 v1，② 的 `OpenReadOnly`
-// 以 target=6 打开即报 `ErrSchemaOutdated`，断言红。
+// 逆改点：交换任一注入符号，VersionLineageOrigins即使在数字同6时也会红；
+// 将迁移/源库建错后端或版本，下面真实数据库往返与status仍会红。
 // Every assertion anchors on which backend received which version.
 func TestApp_SupportedVersionInjectedPerBackend(t *testing.T) {
-	// ① 两条谱系的数值本身：相等就说明有人把一条"统一"到了另一条上。
-	// The lineage constants themselves; equality would mean one was unified onto the other.
+	// ① 分别检查已批准版本；来源独立性由包符号与真实后端身份判定。
+	// Check each approved version; origin and schema identity prove backend separation.
 	// 运行期谱系自 v1 起；D-19（AGENT.md `knowledge:` 绑定）以**前向迁移**
 	// `0002_agent_binding_knowledge_kind.sql` 加宽 `resource_kind` 闭集并前移到 2；
 	// R59 的 `source_text` 补列修复以 `0003_knowledge_source_text_repair.sql` 前移到 3
 	// ——已发布的 0001 现场字面量保持逐字节不变（D-19 裁决 2026-10-30 / R59 2026-10-31）。
-	require.Equal(t, 5, postgres.SupportedSchemaVersion, "运行期 PostgreSQL 包含版本修订和集合简介两次前向迁移")
+	require.Equal(t, 7, postgres.SupportedSchemaVersion, "运行期PostgreSQL追加已批准的0006观测迁移")
 	require.Equal(t, 6, storage.SupportedSchemaVersion, "SQLite 源谱系保持 v6（导出 / 旧库升级来源）")
 
 	workDir := t.TempDir()
@@ -91,25 +77,31 @@ func TestApp_SupportedVersionInjectedPerBackend(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, storage.SupportedSchemaVersion, sqliteVersion,
 		"源库版本是 SQLite 谱系的 6")
-	require.NotEqual(t, postgres.SupportedSchemaVersion, sqliteVersion,
-		"不得把运行期谱系的 3 传给旧库升级 / 导出")
+	sqliteTables, err := sqliteDB.TableNames(ctx)
+	require.NoError(t, err)
+	for _, name := range []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"} {
+		require.NotContains(t, sqliteTables, name, "SQLite源谱系不包含PG观测表")
+	}
 	require.NoError(t, sqliteDB.Close())
 
-	// ③ `db migrate` 走运行期谱系：PG 库必须落 v3，而不是沿用 SQLite 的 6。
-	// db migrate provisions the runtime lineage: PG lands on v3, never the SQLite 6.
+	// ③ db migrate只迁移PG运行期谱系，OBS表不得进入SQLite源库。
+	// db migrate provisions PostgreSQL without adding OBS tables to the source lineage.
 	require.Equal(t, 0, Run(ctx, []string{"db", "migrate"}), "db migrate 必须建出运行期库")
 	pgDB, err := postgres.OpenReadOnly(ctx, postgres.Config{DSN: dsn})
 	require.NoError(t, err)
 	pgVersion, err := pgDB.SchemaVersion(ctx)
 	require.NoError(t, err)
-	require.Equal(t, postgres.SupportedSchemaVersion, pgVersion, "PG 谱系应迁到当前版本 v5")
-	require.NotEqual(t, storage.SupportedSchemaVersion, pgVersion,
-		"不得让 PG 迁移编号沿用 SQLite 的 v6")
+	require.Equal(t, postgres.SupportedSchemaVersion, pgVersion, "PG谱系应迁到当前版本v6")
+	pgTables, err := pgDB.TableNames(ctx)
+	require.NoError(t, err)
+	for _, name := range []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"} {
+		require.Contains(t, pgTables, name, "PG运行期按自身迁移拥有OBS表")
+	}
 	require.NoError(t, pgDB.Close())
 
 	// ④ 注入值直达命令面：`status` 拿 `Deps.SupportedSchemaVersion` 与库版本对照。
-	// 注入成 6 时这里必然是"库版本旧于二进制（v3 < v6）"，退出码 1。
+	// 版本比较仍必须使用运行期后端的注入值。
 	// The injected version reaches the command face: status compares it with the library.
 	require.Equal(t, 0, Run(ctx, []string{"status"}),
-		"status 必须把 PG 库判为与二进制同版本（注入的是 PG 谱系的 3）")
+		"status必须把PG库判为与二进制同版本（使用PG自身谱系）")
 }

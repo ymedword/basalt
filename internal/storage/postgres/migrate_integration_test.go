@@ -84,6 +84,8 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		3: "migrations/0003_knowledge_source_text_repair.sql",
 		4: "migrations/0004_knowledge_version_revision.sql",
 		5: "migrations/0005_knowledge_collection_description.sql",
+		6: "migrations/0006_observability.sql",
+		7: "migrations/0007_history_retention.sql",
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT version, description FROM schema_version ORDER BY version`)
 	require.NoError(t, err)
@@ -100,10 +102,11 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 
 	tables, err := tableNames(ctx, conn)
 	require.NoError(t, err)
-	require.Len(t, tables, 52, "契约 v1 恰好 52 张表")
+	require.Len(t, tables, 60, "契约 v1 的 52 张表、追加 OBS 的六张表与保留账本的两张表必须全部存在")
 	for _, name := range []string{
 		"callers", "sessions", "messages", "runs", "kb_chunks", "kb_chunk_embeddings",
 		"compaction_entries", "context_assembly_records", "diagnostic_events", "storage_cutover",
+		"history_retention_runs", "history_retention_rollups",
 	} {
 		require.Contains(t, tables, name)
 	}

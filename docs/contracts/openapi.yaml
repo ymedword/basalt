@@ -18,7 +18,7 @@ info:
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=5`**（US-16 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
+    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=7`**（US-16A 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
     - **两类凭据不可互换**（US-16）：管理面只接受 admin token（或 `local_trust`），业务面接受调用方 API Key。`callers:admin` / `diagnostics:read` 只随内置 `local-admin` 生效，**不**发给 caller key；caller key 也无法表达管理员 Kind
     - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 / US-16 新增路径同样以本文件为准
 servers:
@@ -56,6 +56,9 @@ tags:
     description: 诊断事件读取（管理面；caller key 一律拒绝）
   - name: compaction
     description: 会话压缩只读视图（派生视图，不提供手动触发）
+
+  - name: observability
+    description: US-16A 管理只读诊断、指标与派生账本
 
 paths:
   # ==========================================================
@@ -3990,6 +3993,520 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  # US-16A：七个管理只读端点
+  /observability/overview:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测overview"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。最多30天的派生总览。默认to=当前时间、from=to-24h；无样本失败率为null。异常组Top-N，超出组合汇入other_group并报告merged_groups；Run列表最多20条，不选代表Run。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "from"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "to"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "agent"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "limit"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            minimum: 1
+            maximum: 100
+            default: 100
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsOverview"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/timeline:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测timeline"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。六种关联标识恰给一个；task可独立查询真实调度执行。局部稳定展示顺序不是因果；先编号后过滤。来源读取失败为query_failed缺口，缺证据不表示正常。默认不加时间过滤；最多1000项并报告截断。未知历史kind/reason仍可读，技术详情含schema_version和隐藏字段数量。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "run_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "request_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 64
+            pattern: "^[A-Za-z0-9._:-]+$"
+        -
+          name: "task_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "operation_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "ingest_job_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "session_id"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+        -
+          name: "from"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "to"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "sources"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            description: "逗号分隔九个时间线来源；不接受metric_snapshot。"
+        -
+          name: "limit"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            minimum: 1
+            maximum: 1000
+            default: 200
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsTimeline"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/context:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测context"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。只读Run装配证据；不存在Run为404，缺装配为200并返回缺口。历史缺键/null不补零。仅允许候选身份可见，过滤候选只给混合计数；已装配不能证明模型使用，需核对输出。无正文或摘要。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "run_id"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            minLength: 1
+            maxLength: 256
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsContext"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/metrics:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测metrics"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。同一固定目录的本地派生读数；值不可用为null。进程累计重启归零，process_started_at说明范围；数据库滚动窗口为Gauge，重叠窗口不能相加。window字段单位为纳秒。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "window"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            enum:
+              - "5m"
+              - "15m"
+              - "1h"
+              - "24h"
+            default: "15m"
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsMetrics"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/alerts:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测alerts"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。读取已评估状态和最多30天转换；GET不评估、不写状态。默认时间窗24小时，limit=100。未评估/关闭/读取或写入评估失败不显示正常；resolved仅用于转换历史。三条未校准候选规则默认关闭。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "from"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "to"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "limit"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsAlerts"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/export:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测export"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。只读持久账本；endpoint/header仅显示是否配置。确认计数未知为null，不得补0；span/log_record/data_point分开。unknown_attempts表示此前结果未知、可能重复。覆盖双边界完整才表示成功扫描；早于覆盖起点未保证导出，延迟超过对账窗口也未保证。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters: []
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsExport"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+  /observability/cleanup:
+    get:
+      tags:
+        - "observability"
+      summary: "读取观测cleanup"
+      description: "管理面只读；有效caller key一律403；缺装配500，功能关闭503 NOT_CONFIGURED。未知/重复/空参数400，不回显输入。读取四组生效策略和最多30天窗口账本；GET不触发清理。默认limit=100。跳过且计数0可能表示本轮未枚举候选。窗口清理不能证明具体缺失行曾被删除。"
+      security:
+        -
+          bearerAuth: []
+        -
+          localTrust: []
+      parameters:
+        -
+          name: "from"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "to"
+          in: "query"
+          required: false
+          schema:
+            type: "string"
+            format: "date-time"
+        -
+          name: "limit"
+          in: "query"
+          required: false
+          schema:
+            type: "integer"
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: "只读观测结果；空、缺证据、不可用与未知分别表达"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  -
+                    "$ref": "#/components/schemas/Envelope"
+                  -
+                    type: "object"
+                    properties:
+                      data:
+                        "$ref": "#/components/schemas/ObsCleanup"
+                    required:
+                      - "data"
+        "400":
+          "$ref": "#/components/responses/BadRequest"
+        "401":
+          "$ref": "#/components/responses/Unauthorized"
+        "403":
+          "$ref": "#/components/responses/Forbidden"
+        "404":
+          "$ref": "#/components/responses/NotFound"
+        "500":
+          description: "读取失败，不返回data或底层错误"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+        "503":
+          description: "NOT_CONFIGURED：可观测功能关闭"
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Envelope"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -4218,6 +4735,1100 @@ components:
           schema: { $ref: '#/components/schemas/Envelope' }
 
   schemas:
+    ObsEvidenceGap:
+      type: "object"
+      additionalProperties: false
+      properties:
+        source:
+          type: "string"
+          enum:
+            - "runs"
+            - "task_executions"
+            - "management_operations"
+            - "kb_ingest_jobs"
+            - "embedding_calls"
+            - "llm_calls"
+            - "tool_invocations"
+            - "context_assembly_records"
+            - "diagnostic_events"
+        reason:
+          type: "string"
+          enum:
+            - "not_recorded"
+            - "sampled_out"
+            - "query_failed"
+            - "retention_window_cleaned"
+            - "not_supported"
+            - "unknown"
+        detail:
+          type: "string"
+      required:
+        - "source"
+        - "reason"
+        - "detail"
+    ObsAnchor:
+      type: "object"
+      additionalProperties: false
+      properties:
+        kind:
+          type: "string"
+          enum:
+            - "run"
+            - "request"
+            - "task"
+            - "operation"
+            - "ingest"
+            - "session"
+        value:
+          type: "string"
+      required:
+        - "kind"
+        - "value"
+    ObsTimelineEntry:
+      type: "object"
+      additionalProperties: false
+      properties:
+        schema_version:
+          type: "integer"
+        decision:
+          type: "string"
+        redacted_fields:
+          type: "integer"
+        display_step_id:
+          type: "string"
+        event_id:
+          type: "string"
+        source:
+          type: "string"
+          enum:
+            - "runs"
+            - "task_executions"
+            - "management_operations"
+            - "kb_ingest_jobs"
+            - "embedding_calls"
+            - "llm_calls"
+            - "tool_invocations"
+            - "context_assembly_records"
+            - "diagnostic_events"
+        source_id:
+          type: "string"
+        kind:
+          type: "string"
+        occurred_at:
+          type: "string"
+          format: "date-time"
+        ended_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        end_source:
+          type: "string"
+          enum:
+            - "recorded"
+            - "derived_recorded"
+            - "unknown"
+        status:
+          type: "string"
+        reason_code:
+          type: "string"
+        step_id:
+          type: "string"
+        attempt_id:
+          type: "string"
+        parent_step_id:
+          type: "string"
+        seq:
+          type: "integer"
+        audit_ref:
+          type: "string"
+        evidence:
+          type: "string"
+          enum:
+            - "direct"
+            - "needs_output_check"
+            - "insufficient"
+        attrs:
+          description: "白名单标量。实测阶段在既有 retrieval/assembly/llm_call 种类下成组提供 phase、phase_parent、phase_status、duration_ms、phase_end；阶段名与状态为封闭取值，结束时间为实际记录的 RFC3339，耗时来自单调时钟。非流式模型的首响应等待是 HTTP 首字节等待，不是首个 token；不补算历史瞬时事件。"
+          type: "object"
+          additionalProperties:
+            type:
+              - "string"
+              - "number"
+              - "boolean"
+      required:
+        - "redacted_fields"
+        - "display_step_id"
+        - "source"
+        - "source_id"
+        - "kind"
+        - "occurred_at"
+        - "ended_at"
+        - "end_source"
+        - "status"
+        - "evidence"
+        - "attrs"
+    ObsTimeline:
+      type: "object"
+      additionalProperties: false
+      properties:
+        anchor:
+          "$ref": "#/components/schemas/ObsAnchor"
+        entries:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsTimelineEntry"
+        gaps:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsEvidenceGap"
+        order_scope:
+          type: "string"
+          enum:
+            - "anchor-local"
+        truncated:
+          type: "boolean"
+        projected_at:
+          type: "string"
+          format: "date-time"
+      required:
+        - "anchor"
+        - "entries"
+        - "gaps"
+        - "order_scope"
+        - "truncated"
+        - "projected_at"
+    ObsReasonCount:
+      type: "object"
+      additionalProperties: false
+      properties:
+        reason:
+          type: "string"
+        count:
+          type: "integer"
+      required:
+        - "reason"
+        - "count"
+    ObsTaskGroup:
+      type: "object"
+      additionalProperties: false
+      properties:
+        agent:
+          type: "string"
+        window_start:
+          type: "string"
+          format: "date-time"
+        window_end:
+          type: "string"
+          format: "date-time"
+        failed:
+          type: "integer"
+        total:
+          type: "integer"
+        top_reasons:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsReasonCount"
+        run_ids:
+          type: "array"
+          items:
+            type: "string"
+      required:
+        - "agent"
+        - "window_start"
+        - "window_end"
+        - "failed"
+        - "total"
+        - "top_reasons"
+        - "run_ids"
+    ObsOverview:
+      type: "object"
+      additionalProperties: false
+      properties:
+        runs:
+          type: "integer"
+        failed:
+          type: "integer"
+        failed_ratio:
+          oneOf:
+            -
+              type: "number"
+            -
+              type: "null"
+        timeouts:
+          type: "integer"
+        tool_denials:
+          type: "integer"
+        missing_assembly:
+          type: "integer"
+        groups:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsTaskGroup"
+        truncated:
+          type: "boolean"
+        merged_groups:
+          type: "integer"
+        other_group:
+          oneOf:
+            -
+              "$ref": "#/components/schemas/ObsTaskGroup"
+            -
+              type: "null"
+      required:
+        - "runs"
+        - "failed"
+        - "failed_ratio"
+        - "timeouts"
+        - "tool_denials"
+        - "missing_assembly"
+        - "groups"
+        - "truncated"
+        - "merged_groups"
+        - "other_group"
+    ObsCandidate:
+      type: "object"
+      additionalProperties: false
+      properties:
+        chunk_id:
+          type: "string"
+        version_id:
+          type: "string"
+        content_hash:
+          type: "string"
+        token_estimate:
+          type: "integer"
+        retrieval_score:
+          type: "number"
+        rerank_score:
+          oneOf:
+            -
+              type: "number"
+            -
+              type: "null"
+        rank:
+          type: "integer"
+        decision:
+          type: "string"
+          enum:
+            - "kept"
+            - "rank_cut"
+            - "budget_drop"
+            - "not_recorded"
+        acl_decision:
+          type: "string"
+          enum:
+            - "allow"
+      required:
+        - "chunk_id"
+        - "version_id"
+        - "content_hash"
+        - "token_estimate"
+        - "retrieval_score"
+        - "rerank_score"
+        - "rank"
+        - "decision"
+        - "acl_decision"
+    ObsRetrieval:
+      type: "object"
+      additionalProperties: false
+      properties:
+        candidates:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsCandidate"
+        hits:
+          type: "array"
+          items:
+            type: "string"
+        reason_codes:
+          type: "array"
+          items:
+            type: "string"
+        top_k:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        candidate_k:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        budget_tokens:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        filtered_count:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        filtered_reason:
+          type: "string"
+        index_generation:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        evidence:
+          type: "object"
+          additionalProperties:
+            type: "string"
+            enum:
+              - "direct"
+              - "needs_output_check"
+              - "insufficient"
+        filtered_note:
+          type: "string"
+      required:
+        - "candidates"
+        - "hits"
+        - "reason_codes"
+        - "top_k"
+        - "candidate_k"
+        - "budget_tokens"
+        - "filtered_count"
+        - "filtered_reason"
+        - "index_generation"
+        - "evidence"
+        - "filtered_note"
+    ObsHistoryTrim:
+      type: "object"
+      additionalProperties: false
+      properties:
+        dropped_groups:
+          type: "integer"
+        first_dropped_message_id:
+          type: "string"
+        cut_message_id:
+          type: "string"
+        reason_code:
+          type: "string"
+        tokens_before:
+          type: "integer"
+        tokens_after:
+          type: "integer"
+        strategy_version:
+          type: "string"
+      required:
+        - "dropped_groups"
+        - "first_dropped_message_id"
+        - "cut_message_id"
+        - "reason_code"
+        - "tokens_before"
+        - "tokens_after"
+        - "strategy_version"
+    ObsCompression:
+      type: "object"
+      additionalProperties: false
+      properties:
+        enabled:
+          type: "boolean"
+        decision:
+          type: "string"
+          enum:
+            - "none"
+            - "compressed"
+            - "degraded"
+            - "rejected"
+        compaction_id:
+          type: "string"
+        covered_from_message_id:
+          type: "string"
+        cut_message_id:
+          type: "string"
+        first_kept_message_id:
+          type: "string"
+        tokens_before:
+          type: "integer"
+        tokens_after:
+          type: "integer"
+        reason_code:
+          type: "string"
+      required:
+        - "enabled"
+        - "decision"
+        - "compaction_id"
+        - "covered_from_message_id"
+        - "cut_message_id"
+        - "first_kept_message_id"
+        - "tokens_before"
+        - "tokens_after"
+        - "reason_code"
+    ObsBudget:
+      type: "object"
+      additionalProperties: false
+      properties:
+        context_tokens:
+          type: "integer"
+        protocol_reserve:
+          type: "integer"
+        output_reserve:
+          type: "integer"
+        estimator_version:
+          type: "string"
+      required:
+        - "context_tokens"
+        - "protocol_reserve"
+        - "output_reserve"
+        - "estimator_version"
+    ObsRound:
+      type: "object"
+      additionalProperties: false
+      properties:
+        step_id:
+          type: "string"
+        candidates:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsCandidate"
+        hits:
+          type: "array"
+          items:
+            type: "string"
+        history_trim:
+          oneOf:
+            -
+              "$ref": "#/components/schemas/ObsHistoryTrim"
+            -
+              type: "null"
+        compression:
+          oneOf:
+            -
+              "$ref": "#/components/schemas/ObsCompression"
+            -
+              type: "null"
+        reason_codes:
+          type: "array"
+          items:
+            type: "string"
+        budget:
+          oneOf:
+            -
+              "$ref": "#/components/schemas/ObsBudget"
+            -
+              type: "null"
+        final_segments:
+          type: "array"
+          items:
+            type: "string"
+        evidence:
+          type: "object"
+          additionalProperties:
+            type: "string"
+            enum:
+              - "direct"
+              - "needs_output_check"
+              - "insufficient"
+        note:
+          type: "string"
+      required:
+        - "step_id"
+        - "candidates"
+        - "hits"
+        - "history_trim"
+        - "compression"
+        - "reason_codes"
+        - "budget"
+        - "final_segments"
+        - "evidence"
+        - "note"
+    ObsAssembly:
+      type: "object"
+      additionalProperties: false
+      properties:
+        record_id:
+          type: "string"
+        purpose:
+          type: "string"
+        step_id:
+          type: "string"
+        reason_codes:
+          type: "array"
+          items:
+            type: "string"
+      required:
+        - "record_id"
+        - "purpose"
+        - "step_id"
+        - "reason_codes"
+    ObsContext:
+      type: "object"
+      additionalProperties: false
+      properties:
+        run_id:
+          type: "string"
+        retrieval:
+          oneOf:
+            -
+              "$ref": "#/components/schemas/ObsRetrieval"
+            -
+              type: "null"
+        rounds:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsRound"
+        other:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsAssembly"
+        gaps:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsEvidenceGap"
+        grade:
+          type: "string"
+          enum:
+            - "direct"
+            - "needs_output_check"
+            - "insufficient"
+      required:
+        - "run_id"
+        - "retrieval"
+        - "rounds"
+        - "other"
+        - "gaps"
+        - "grade"
+    ObsMetricSample:
+      type: "object"
+      additionalProperties: false
+      properties:
+        name:
+          type: "string"
+        type:
+          type: "string"
+          enum:
+            - "counter"
+            - "gauge"
+            - "histogram"
+        unit:
+          type: "string"
+        value:
+          oneOf:
+            -
+              type: "number"
+            -
+              type: "null"
+        window:
+          type: "integer"
+          description: "窗口纳秒；进程累计样本为0。数据库窗口样本不可相加。"
+        scope:
+          type: "string"
+          enum:
+            - "process"
+            - "database"
+        available:
+          type: "boolean"
+        reason:
+          type: "string"
+        labels:
+          type: "object"
+          additionalProperties:
+            type: "string"
+      required:
+        - "name"
+        - "type"
+        - "unit"
+        - "value"
+        - "window"
+        - "scope"
+        - "available"
+        - "reason"
+        - "labels"
+    ObsMetrics:
+      type: "object"
+      additionalProperties: false
+      properties:
+        samples:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsMetricSample"
+        collected_at:
+          type: "string"
+          format: "date-time"
+        process_started_at:
+          type: "string"
+          format: "date-time"
+      required:
+        - "samples"
+        - "collected_at"
+        - "process_started_at"
+    ObsAlertState:
+      type: "object"
+      additionalProperties: false
+      properties:
+        rule_id:
+          type: "string"
+        scope_key:
+          type: "string"
+        state:
+          type: "string"
+          enum:
+            - "inactive"
+            - "pending"
+            - "firing"
+            - "unknown"
+        since:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_eval_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        value:
+          type: "number"
+        reason:
+          type: "string"
+      required:
+        - "rule_id"
+        - "scope_key"
+        - "state"
+        - "since"
+        - "last_eval_at"
+        - "value"
+        - "reason"
+    ObsAlertRule:
+      type: "object"
+      additionalProperties: false
+      properties:
+        rule_id:
+          type: "string"
+        enabled:
+          type: "boolean"
+        window_seconds:
+          type: "integer"
+        for_seconds:
+          type: "integer"
+        states:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsAlertState"
+      required:
+        - "rule_id"
+        - "enabled"
+        - "window_seconds"
+        - "for_seconds"
+        - "states"
+    ObsAlertTransition:
+      type: "object"
+      additionalProperties: false
+      properties:
+        id:
+          type: "integer"
+        rule_id:
+          type: "string"
+        scope_key:
+          type: "string"
+        from_state:
+          type: "string"
+          enum:
+            - "inactive"
+            - "pending"
+            - "firing"
+            - "unknown"
+        to_state:
+          type: "string"
+          enum:
+            - "inactive"
+            - "pending"
+            - "firing"
+            - "resolved"
+            - "unknown"
+        value:
+          type: "number"
+        occurred_at:
+          type: "string"
+          format: "date-time"
+      required:
+        - "id"
+        - "rule_id"
+        - "scope_key"
+        - "from_state"
+        - "to_state"
+        - "value"
+        - "occurred_at"
+    ObsAlerts:
+      type: "object"
+      additionalProperties: false
+      properties:
+        enabled:
+          type: "boolean"
+        rules:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsAlertRule"
+        transitions:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsAlertTransition"
+        truncated:
+          type: "boolean"
+      required:
+        - "enabled"
+        - "rules"
+        - "transitions"
+        - "truncated"
+    ObsSourceCoverage:
+      type: "object"
+      additionalProperties: false
+      properties:
+        source:
+          type: "string"
+          enum:
+            - "runs"
+            - "task_executions"
+            - "management_operations"
+            - "kb_ingest_jobs"
+            - "embedding_calls"
+            - "llm_calls"
+            - "tool_invocations"
+            - "diagnostic_events"
+        coverage_kind:
+          type: "string"
+          enum:
+            - "terminal_time"
+            - "occurred_at"
+        covered_from:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        covered_through:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_attempt_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_success_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_reconcile_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+      required:
+        - "source"
+        - "coverage_kind"
+        - "covered_from"
+        - "covered_through"
+        - "last_attempt_at"
+        - "last_success_at"
+        - "last_reconcile_at"
+    ObsExport:
+      type: "object"
+      additionalProperties: false
+      properties:
+        enabled:
+          type: "boolean"
+        endpoint_configured:
+          type: "boolean"
+        headers_configured:
+          type: "boolean"
+        protocol:
+          type: "string"
+          enum:
+            - "http/protobuf"
+            - "http/json"
+        pending:
+          type: "integer"
+        inflight:
+          type: "integer"
+        retry:
+          type: "integer"
+        retry_attempts:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        next_retry_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        unconfirmed:
+          type: "integer"
+        failed_permanent:
+          type: "integer"
+        dropped:
+          type: "integer"
+        stale:
+          type: "integer"
+        unknown_attempts:
+          type: "integer"
+        oldest_pending_age_seconds:
+          type: "number"
+        last_scan_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_batch_id:
+          type: "string"
+        last_partial_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        last_record_unit:
+          type: "string"
+          enum:
+            - ""
+            - "span"
+            - "log_record"
+            - "data_point"
+        last_record_count:
+          type: "integer"
+        last_outcome:
+          type: "string"
+        last_http_status:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        last_accepted:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        last_rejected:
+          oneOf:
+            -
+              type: "integer"
+            -
+              type: "null"
+        last_warning:
+          type: "string"
+        last_error_kind:
+          type: "string"
+        sources:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsSourceCoverage"
+      required:
+        - "enabled"
+        - "endpoint_configured"
+        - "headers_configured"
+        - "protocol"
+        - "pending"
+        - "inflight"
+        - "retry"
+        - "retry_attempts"
+        - "next_retry_at"
+        - "unconfirmed"
+        - "failed_permanent"
+        - "dropped"
+        - "stale"
+        - "unknown_attempts"
+        - "oldest_pending_age_seconds"
+        - "last_scan_at"
+        - "last_batch_id"
+        - "last_partial_at"
+        - "last_record_unit"
+        - "last_record_count"
+        - "last_outcome"
+        - "last_http_status"
+        - "last_accepted"
+        - "last_rejected"
+        - "last_warning"
+        - "last_error_kind"
+        - "sources"
+    ObsRetentionPolicy:
+      type: "object"
+      additionalProperties: false
+      properties:
+        table:
+          type: "string"
+          enum:
+            - "diagnostic_events"
+            - "context_assembly_records"
+            - "alert_history"
+            - "export_history"
+        enabled:
+          type: "boolean"
+        retention_days:
+          type: "integer"
+        batch_size:
+          type: "integer"
+        max_batches:
+          type: "integer"
+        require_confirmed_export:
+          type: "boolean"
+      required:
+        - "table"
+        - "enabled"
+        - "retention_days"
+        - "batch_size"
+        - "max_batches"
+        - "require_confirmed_export"
+    ObsCleanupRun:
+      type: "object"
+      additionalProperties: false
+      properties:
+        cleanup_id:
+          type: "string"
+        table_kind:
+          type: "string"
+          enum:
+            - "diagnostic_events"
+            - "context_assembly_records"
+            - "alert_history"
+            - "export_history"
+        window_start:
+          type: "string"
+          format: "date-time"
+        window_end:
+          type: "string"
+          format: "date-time"
+        scan_covered_from:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        scan_covered_through:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+        deleted:
+          type: "integer"
+        skipped:
+          type: "integer"
+        skip_reason:
+          type: "string"
+        status:
+          type: "string"
+          enum:
+            - "succeeded"
+            - "failed"
+            - "skipped"
+        error_kind:
+          type: "string"
+        started_at:
+          type: "string"
+          format: "date-time"
+        finished_at:
+          oneOf:
+            -
+              type: "string"
+              format: "date-time"
+            -
+              type: "null"
+      required:
+        - "cleanup_id"
+        - "table_kind"
+        - "window_start"
+        - "window_end"
+        - "scan_covered_from"
+        - "scan_covered_through"
+        - "deleted"
+        - "skipped"
+        - "skip_reason"
+        - "status"
+        - "error_kind"
+        - "started_at"
+        - "finished_at"
+    ObsCleanup:
+      type: "object"
+      additionalProperties: false
+      properties:
+        files:
+          type: object
+          additionalProperties: false
+          properties:
+            enabled: {type: boolean}
+            days: {type: integer, minimum: 1, maximum: 365}
+            log_file_mib: {type: integer}
+            log_total_mib: {type: integer}
+            min_verified_backups: {type: integer}
+            last_run_at: {oneOf: [{type: string, format: date-time}, {type: "null"}]}
+            deleted_files: {type: integer, minimum: 0}
+            status: {type: string, enum: [not_run, succeeded, failed]}
+          required: [enabled, days, log_file_mib, log_total_mib, min_verified_backups, last_run_at, deleted_files, status]
+        history_enabled:
+          type: boolean
+        history_days:
+          type: integer
+          minimum: 1
+          maximum: 365
+        history:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              id: {type: string}
+              group: {type: string, enum: [sessions, runs, ingest, operations, maintenance]}
+              cutoff: {type: string, format: date-time}
+              at: {type: string, format: date-time}
+              deleted_groups: {type: integer, minimum: 0}
+              deleted_rows: {type: integer, minimum: 0}
+              protected_groups: {type: integer, minimum: 0}
+              status: {type: string, enum: [succeeded, failed]}
+              reason: {type: string}
+            required: [id, group, cutoff, at, deleted_groups, deleted_rows, protected_groups, status, reason]
+        enabled:
+          type: "boolean"
+        policies:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsRetentionPolicy"
+        runs:
+          type: "array"
+          items:
+            "$ref": "#/components/schemas/ObsCleanupRun"
+        truncated:
+          type: "boolean"
+      required:
+        - "enabled"
+        - "policies"
+        - "runs"
+        - "truncated"
     Envelope:
       type: object
       required: [code, message, timestamp]
@@ -4379,6 +5990,7 @@ components:
       type: object
       properties:
         run_id: { type: string }
+        request_id: { type: string, minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._:-]+$', description: 入口实际记录的请求标识；历史未记录时省略，不补造 }
         session_id: { type: string, description: 无状态调用时为空 }
         agent: { type: string }
         channel: { type: string }
@@ -6267,6 +7879,7 @@ components:
         - migration_verify_failed
         - llm_call_failed
         - concurrency_limited
+        - chunk_invalidated
       description: 稳定枚举；面向人的文案由 UI 映射，**不得**把自由文本写进 `reason_code`。
 
     DiagnosticEventView:

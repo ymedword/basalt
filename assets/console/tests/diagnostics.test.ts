@@ -142,6 +142,26 @@ afterEach(() => {
 })
 
 describe('diagnostics page', () => {
+  it('treats session lookup through recorded runs as an available anchor', async () => {
+    await signIn(call => call.path === '/api/v1/diagnostics' ? result() : undefined)
+    await visit('/console/diagnostics?session_id=recorded-session')
+    expect(diagnosticCalls()[0]?.query.get('session_id')).toBe('recorded-session')
+    expect(wrapper!.findAll('.filters option').some(n => n.text() === '会话 ID')).toBe(true)
+  })
+  it('keeps retrieval visibility filtering separate from tool permission refusal', async () => {
+    await signIn(call => call.path === '/api/v1/diagnostics' ? result({events: [{...deniedEvent, kind: 'retrieval', attrs: {count: 5}}, deniedEvent]}) : undefined)
+    await visit('/console/diagnostics?run_id=run-1')
+    const rows = wrapper!.findAll('tbody tr')
+    expect(rows[0]!.text()).toContain('已按访问范围筛选')
+    expect(rows[0]!.text()).toContain('混合过滤计数')
+    expect(rows[0]!.text()).not.toContain('权限拒绝')
+    expect(rows[1]!.text()).toContain('权限拒绝')
+  })
+
+  it('does not claim startup index switches without real anchors have production coverage', async () => {
+    await signIn(); await visit('/console/diagnostics')
+    expect(wrapper!.findAll('.filters option').some(n => n.text().includes('索引切换') && n.text().includes('暂无生产端'))).toBe(true)
+  })
   it('seeds the anchor from the deep link and renders events with pointers', async () => {
     await signIn((call) => (call.path === '/api/v1/diagnostics' ? result() : undefined))
     await visit(`/console/diagnostics?run_id=${RUN_ID}`)
@@ -241,7 +261,8 @@ describe('diagnostics page', () => {
     // 没有生产端的锚点 / 种类在选项上直接标注，避免"查空 = 没发生"的误读。
     const options = wrapper!.findAll('.filters option').map((node) => node.text())
     expect(options.some((text) => text.includes('管理操作 ID') && text.includes('暂无生产端'))).toBe(true)
-    expect(options.some((text) => text.includes('摄取阶段') && text.includes('暂无生产端'))).toBe(true)
+    expect(options.some((text) => text === '摄取阶段')).toBe(true)
+    expect(options.some((text) => text.includes('索引切换') && text.includes('暂无生产端'))).toBe(true)
     expect(options.some((text) => text === '模型调用')).toBe(true)
   })
 

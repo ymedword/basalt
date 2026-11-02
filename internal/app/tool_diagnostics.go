@@ -62,6 +62,9 @@ func (a *toolDiagAdapter) RecordToolDiagnostic(ctx context.Context, ev core.Tool
 		Seq:         ev.Seq,
 		Attrs:       map[string]any{"tool": ev.Tool},
 	}
+	if ev.ToolCallID != "" {
+		out.Attrs["tool_call_id"] = ev.ToolCallID
+	}
 	switch ev.Kind {
 	case core.ToolDiagnosticCall:
 		out.Kind = diagnostics.KindToolCall

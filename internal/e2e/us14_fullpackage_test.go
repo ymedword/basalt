@@ -21,6 +21,7 @@ package e2e
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"io"
 	"io/fs"
 	"net/http"
@@ -467,6 +468,19 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 		t.Fatalf("创建数据根失败: %v", err)
 	}
 	us14dPrepareIngress(t, h, dataRoot)
+	// 仅记录非敏感初始化状态，失败时可区分首启重试与普通注册延迟。
+	// Record only provisioning flags so a failed smoke can distinguish retry state from latency.
+	provisioningFiles, globErr := filepath.Glob(filepath.Join(dataRoot, "basalt", "instances", "*", "provisioning.json"))
+	if globErr == nil {
+		for _, file := range provisioningFiles {
+			var progress struct {
+				AdminToken string `json:"admin_token"`
+			}
+			if raw, readErr := os.ReadFile(file); readErr == nil && json.Unmarshal(raw, &progress) == nil {
+				t.Logf("before retry: provisioning_pending=%t", progress.AdminToken == "pending")
+			}
+		}
+	}
 	p := startGrouped(t, h, us14dPrivateEnv(dataRoot), "serve")
 	waitHealthHTTP(t, p, us14dDefaultAddr, 120*time.Second)
 
@@ -481,6 +495,25 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 	rows := us14dProfiles(t, us14dDefaultAddr, token)
 	for _, name := range us14dBuiltinAgentNames {
 		if _, ok := us14dFindProfile(rows, name); !ok {
+			var marker struct {
+				AgentsInstalled bool `json:"agents_installed"`
+				AgentsSkipped   bool `json:"agents_skipped"`
+			}
+			raw, markerErr := os.ReadFile(filepath.Join(installDir, ".basalt", "control", "builtin-openbox.json"))
+			if markerErr == nil && json.Unmarshal(raw, &marker) == nil {
+				t.Logf("openbox: agents_installed=%t agents_skipped=%t", marker.AgentsInstalled, marker.AgentsSkipped)
+			}
+			for _, builtinName := range us14dBuiltinAgentNames {
+				_, statErr := os.Stat(filepath.Join(installDir, ".basalt", "agents", builtinName, "AGENT.md"))
+				t.Logf("builtin file %s exists=%t", builtinName, statErr == nil)
+			}
+			time.Sleep(2 * time.Second)
+			later := us14dProfiles(t, us14dDefaultAddr, token)
+			names := make([]string, 0, len(later))
+			for _, row := range later {
+				names = append(names, row.Name)
+			}
+			t.Logf("profiles two seconds after the original failed observation: %v", names)
 			t.Fatalf("安装后 /profiles 缺少内置 Agent %s", name)
 		}
 	}
@@ -500,6 +533,12 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 
 	// Linux 专属 ①：实例私有目录 0700、主密钥与访问密码 0600（设计 §2.4.2 的 Unix 边）。
 	privateDir := filepath.Join(dataRoot, "basalt", "instances", instanceID)
+	// 本场景首次serve曾被入口校验拒绝，重试不是Fresh；按US-16公开契约显式初始化。
+	// This interrupted-start retry is not fresh; initialize through the approved explicit HTTP action.
+	if _, err := os.Stat(filepath.Join(privateDir, "master.key")); !os.IsNotExist(err) {
+		t.Fatalf("显式初始化前主密钥应不存在，实际 %v", err)
+	}
+	us14dInitializeRetrySecrets(t, us14dDefaultAddr, token)
 	us14dRequireMode(t, privateDir, 0o700, "实例私有目录")
 	us14dRequireMode(t, filepath.Join(privateDir, "master.key"), 0o600, "主密钥文件")
 	us14dRequireMode(t, filepath.Join(privateDir, "admin-token"), 0o600, "访问密码文件")
@@ -507,8 +546,11 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 	// Linux 专属 ②：实例锁互斥——同一工作区的第二个 serve 被拒，且不改配置文件。
 	second := exec.Command(installBinary, "serve")
 	second.Dir = installDir
-	second.Env = us14dPrivateEnv(dataRoot)
+	// 与首进程使用同一隔离DSN；否则配置拒绝会掩盖真正的实例锁判据。
+	// Preserve the same isolated database environment so the second process reaches the lock guard.
+	second.Env = h.environ(us14dPrivateEnv(dataRoot))
 	secondOut, secondErr := second.CombinedOutput()
+	secondOut = []byte(h.redact(string(secondOut)))
 	if secondErr == nil {
 		t.Fatalf("同一工作区的第二个 serve 应被实例锁拒绝，实际成功退出：\n%s", secondOut)
 	}
@@ -527,6 +569,31 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 
 	t.Logf("full-package-linux-install program_dir=%s binary_bytes=%d runtime_bytes=%d files=%d "+
 		"instance_id=%s", installDir, pkg.BinaryBytes, pkg.RuntimeBytes, pkg.FileCount, instanceID)
+}
+
+// us14dInitializeRetrySecrets 只在无密钥、无恢复态的中断重试夹具中执行现有显式初始化。
+// Exercise the existing explicit init contract without relaxing new-instance or recovery rules.
+func us14dInitializeRetrySecrets(t *testing.T, addr, token string) {
+	t.Helper()
+	type view struct {
+		State         string `json:"state"`
+		CanInitialize bool   `json:"can_initialize"`
+		KeyID         string `json:"key_id"`
+	}
+	resp := webRequest(t, addr, http.MethodGet, "/api/v1/instance/secrets", "", us14dAuthHeader(token))
+	var before view
+	requireWriteOK(t, resp, &before, "显式初始化前读取加密状态")
+	if before.State != "uninitialized" || !before.CanInitialize || before.KeyID != "" {
+		t.Fatalf("显式初始化前状态 = %s、can_initialize=%t、has_key_id=%t", before.State, before.CanInitialize, before.KeyID != "")
+	}
+	resp = webRequest(t, addr, http.MethodPost, "/api/v1/instance/secrets/init", `{"confirm":true}`, us14dAuthHeader(token))
+	requireWriteOK(t, resp, nil, "中断首启后显式初始化主密钥")
+	resp = webRequest(t, addr, http.MethodGet, "/api/v1/instance/secrets", "", us14dAuthHeader(token))
+	var after view
+	requireWriteOK(t, resp, &after, "显式初始化后读取加密状态")
+	if after.State != "ready" || after.CanInitialize || after.KeyID == "" {
+		t.Fatalf("显式初始化后状态 = %s、can_initialize=%t、has_key_id=%t", after.State, after.CanInitialize, after.KeyID != "")
+	}
 }
 
 // us14dRequireMode 断言路径的 Unix 权限位等于 want（只判 perm 三位，不看 setuid 等）。

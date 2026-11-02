@@ -97,7 +97,7 @@ func (e *ToolExecutor) ExecuteStep(
 		// 诊断（V-8）：解析失败也是一次"模型要调用某工具但没调成"，按 `tool_call` 记
 		// `not_found`；没有审计行（执行从未启动），`audit_ref` 由适配器留空。
 		// A resolution miss is still a tool call that never ran; no audit row exists.
-		e.recordDiag(ctx, env, step, ToolDiagnostic{
+		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindNotFound,
 		})
 		return Result{Content: fmt.Sprintf("tool not registered: %s", call.Name)}
@@ -118,7 +118,7 @@ func (e *ToolExecutor) ExecuteStep(
 		// 与上面只有 WARN、没有审计行的处置互补——诊断让"模型试图越权"在排障面上可见，
 		// 且**不**替代审计（没有执行就没有审计行，这条事实不因有诊断而改变）。
 		// A refusal that never executed is a permission decision, not an audit row.
-		e.recordDiag(ctx, env, step, ToolDiagnostic{
+		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticDenied, Tool: call.Name,
 		})
 		return Result{Content: refusal.Error()}
@@ -192,7 +192,7 @@ func (e *ToolExecutor) ExecuteStep(
 	// 诊断（V-8）：一次真实执行的结局，`audit_ref` 指向上面的行。即便终态回填失败，
 	// 这里记的仍是"调用发生过"——行的 pending 形态由恢复扫描回答，诊断不重复它的职责。
 	// The event records the execution's outcome and points at its audit row.
-	e.recordDiag(ctx, env, step, ToolDiagnostic{
+	e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 		Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: out.ErrorKind, AuditID: id,
 	})
 
@@ -218,20 +218,20 @@ func (e *ToolExecutor) refuseInvalidInput(
 		ErrorKind:    ErrorKindInvalidInput,
 	}
 	if e.audit == nil {
-		e.recordDiag(ctx, env, step, ToolDiagnostic{
+		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput,
 		})
 		return Result{Content: reason}
 	}
 	id, ok := e.beginInvocation(ctx, env, call)
 	if !ok {
-		e.recordDiag(ctx, env, step, ToolDiagnostic{
+		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput,
 		})
 		return Result{Content: reason}
 	}
 	e.finishInvocation(ctx, env, id, out)
-	e.recordDiag(ctx, env, step, ToolDiagnostic{
+	e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 		Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindInvalidInput, AuditID: id,
 	})
 	return Result{Content: reason}
@@ -242,11 +242,12 @@ func (e *ToolExecutor) refuseInvalidInput(
 // 诊断从不返回错误：可丢弃是它的契约，判它失败会把排障面变成运行面。
 // recordDiag stamps the correlation the executor does not own and hands the event over;
 // it never reports failure because diagnostics are droppable by contract.
-func (e *ToolExecutor) recordDiag(ctx context.Context, env ToolEnv, step ToolStep, ev ToolDiagnostic) {
+func (e *ToolExecutor) recordDiag(ctx context.Context, env ToolEnv, step ToolStep, toolCallID string, ev ToolDiagnostic) {
 	if e == nil || e.diag == nil || env.RunID == "" {
 		return
 	}
 	ev.RunID = env.RunID
+	ev.ToolCallID = toolCallID
 	ev.StepID = step.StepID
 	ev.Seq = step.Seq
 	e.diag.RecordToolDiagnostic(ctx, ev)

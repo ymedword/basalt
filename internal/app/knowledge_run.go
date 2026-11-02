@@ -48,6 +48,7 @@ var _ core.KnowledgeRunSource = (*knowledgeRunSource)(nil)
 // knowledgeRunSource shares the startup-pinned generation and the audited query
 // embedder with the management-side search adapter.
 type knowledgeRunSource struct {
+	phases     core.PhaseRecorder
 	retriever  *knowledge.Retriever
 	viewer     *knowledge.SourceViewer
 	embedder   knowledge.Embedder
@@ -82,6 +83,11 @@ func newKnowledgeRunSource(
 	}
 }
 
+func (s *knowledgeRunSource) withPhases(p core.PhaseRecorder) *knowledgeRunSource {
+	s.phases = p
+	return s
+}
+
 // RetrieveForRun 装配本次运行的知识注入面。
 //
 // 返回约定（与 `core.KnowledgeRunSource` 的注释同一口径）：
@@ -96,7 +102,7 @@ func newKnowledgeRunSource(
 // happens before round one and has no step to name.
 func (s *knowledgeRunSource) RetrieveForRun(ctx context.Context,
 	req core.KnowledgeRunRequest,
-) (*core.KnowledgeInjection, error) {
+) (injection *core.KnowledgeInjection, resultErr error) {
 	if !req.Principal.Valid() {
 		return nil, fmt.Errorf("%w: 知识检索身份不可用", core.ErrUnauthorized)
 	}
@@ -131,6 +137,10 @@ func (s *knowledgeRunSource) RetrieveForRun(ctx context.Context,
 		return s.benignRetrieveError(ctx, req, err)
 	}
 
+	if len(result.Hits) > 0 {
+		finishRead := core.BeginPhase(ctx, s.phases, core.PhaseSourceRead, core.PhaseKnowledge, req.RunID, "", 0)
+		defer func() { finishRead(resultErr) }()
+	}
 	chunks := make([]core.KnowledgeChunk, 0, len(result.Hits))
 	revoked, changed := 0, 0
 	for _, hit := range result.Hits {
@@ -194,7 +204,9 @@ func (s *knowledgeRunSource) embedQuery(ctx context.Context, req core.KnowledgeR
 	if s.embedder == nil || s.generation < 1 {
 		return nil, 0
 	}
+	finishEmbedding := core.BeginPhase(ctx, s.phases, core.PhaseQueryEmbedding, core.PhaseKnowledge, req.RunID, "", 0)
 	batch, err := s.embedder.Embed(ctx, []string{query})
+	finishEmbedding(err)
 	switch {
 	case err != nil:
 		if ctx.Err() != nil {
@@ -273,6 +285,12 @@ func (s *knowledgeRunSource) RevalidateChunks(ctx context.Context,
 		kept = append(kept, chunk)
 	}
 	if revoked > 0 || changed > 0 {
+		if s.diag != nil && req.RunID != "" {
+			s.diag.Record(ctx, knowledge.DiagnosticEvent{
+				RunID: req.RunID, Reason: knowledge.DiagnosticReasonChunkInvalidated, Decision: knowledge.DiagnosticDecisionTrim,
+				Attrs: map[string]any{"count": revoked + changed},
+			})
+		}
 		s.logger.WarnContext(ctx, "知识库：注入面片段已失效，自本轮起不再进入提示词",
 			"run_id", req.RunID, "revoked", revoked, "changed", changed, "kept", len(kept))
 	}

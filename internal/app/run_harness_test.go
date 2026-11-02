@@ -45,7 +45,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/callers"
+	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/diagnostics"
+	"github.com/ymedword/basalt/internal/observability"
 	providersvc "github.com/ymedword/basalt/internal/provider"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
@@ -107,9 +110,13 @@ var ctx = context.Background()
 // runHarness 是一次 R18 用例的完整对象图。
 // runHarness is the full object graph behind one R18 case.
 type runHarness struct {
-	t       *testing.T
-	db      *postgres.DB
-	service web.RunService
+	observation *Observability
+	diag        *diagnostics.Recorder
+	agents      *agentRegistry
+	registry    *tool.Registry
+	t           *testing.T
+	db          *postgres.DB
+	service     web.RunService
 	// invoker 是**调度器的运行入口**（`admittedRunInvoker`）：没有 HTTP 入口，
 	// 因此不扣入口速率，但要占名额。`fire` 走的就是这条生产路径。
 	// invoker is the scheduler-side run entry: a slot, never an ingress token.
@@ -147,6 +154,11 @@ type runHarness struct {
 // admission case identical. Wire runs once the registry exists so a case can plug the real
 // knowledge pipeline into the production AgentService.
 type runHarnessOptions struct {
+	// Observability只给OBS贯通场景启用同源生产诊断装饰器；既有夹具默认不变。
+	// Observability enables production diagnostic wiring only for observation scenarios.
+	Observability     bool
+	ObservationWiring func(*diagnostics.Recorder)
+	RequestedTool     string
 	// Knowledge 是 Agent 的 `knowledge:` 声明（进 `Profile.Knowledge`，驱动范围解析）。
 	Knowledge []core.KnowledgeBinding
 	// ExtraScopes 追加到调用方身份（`knowledge:read` 落在这里）。
@@ -216,14 +228,32 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 	h.audit = &togglableCallStore{inner: postgres.NewLLMCallRepo(db)}
 
 	// 路由表逐条构造（不遍历推断），模型表与审计仓储同源：与 wire.go 的装配形状一致。
+	var client core.ProviderClient = h.provider
+	if opts.Observability {
+		metrics := observability.NewMetricsCollector(postgres.NewObservabilityStore(db), time.Now)
+		var err error
+		h.diag, _, err = newDiagnosticsPortsWithMetrics(cli.DiagnosticsConfig{}, db, time.Now, logger, metrics)
+		require.NoError(t, err)
+		cfg := cli.DefaultObservabilityConfig()
+		h.observation, err = NewObservability(t.Context(), cfg, Deps{Store: postgres.NewObservabilityStore(db), Metrics: metrics, Diagnostics: h.diag, Clock: time.Now, Logger: logger})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, h.observation.Close()) })
+		client = newDiagnosticProviderClient(client, h.diag)
+		db.ObserveAuditWriteFailures(func() { metrics.IncCounter("obs_audit_write_failures_total", nil) })
+		if opts.ObservationWiring != nil {
+			opts.ObservationWiring(h.diag)
+		}
+	}
+	h.provider.toolName = opts.RequestedTool
 	routing := providersvc.NewProviderService(
-		map[string]core.ProviderClient{runHarnessProvider: h.provider},
+		map[string]core.ProviderClient{runHarnessProvider: client},
 		map[string]string{runHarnessProvider: runHarnessModel},
 		h.audit,
 		logger,
 	)
 
 	registry := tool.NewRegistry(logger)
+	h.registry = registry
 	require.NoError(t, registry.Register(h.tools), "夹具工具必须能注册")
 	invocations := postgres.NewToolInvocationRepo(db)
 
@@ -234,13 +264,14 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 	}
 	loop := core.NewReActLoop(
 		core.NewPromptBuilder(registry),
-		core.NewToolExecutor(registry, invocations, logger),
+		core.NewToolExecutor(registry, invocations, logger).WithDiagnostics(newToolDiagAdapter(h.diag, logger)),
 		logger,
 	).WithCallQuota(&chatQuota{
 		limiter: h.limiter,
 		// 注入位只改"预留多少"，不改变维度（`ClassChat` 恒记 Token）。
 		tokens: func(core.CallQuotaRequest) int64 { return runHarnessReserveTokens },
 		logger: logger,
+		diag:   h.diag,
 	}).WithAssemblyRecorder(assembly)
 
 	entries := []core.AgentEntry{{
@@ -254,6 +285,7 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 		},
 	}}
 	agents := newAgentRegistry(root, entries, logger)
+	h.agents = agents
 	// 账本读写用同一份仓储实例（生产装配的口径）：读面不得看到另一条连接池的影子。
 	runs := postgres.NewRunStore(db)
 	var runPort core.RunStore = runs
@@ -277,14 +309,14 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 		MaxConcurrent: 64,
 		// Run 级任务次数（N-01）：与 [3] / [5] 共用同一个限制器实例（C-35），
 		// 任务次数与对话 Token 因此读同一份限额行、落在同一张预留表上。
-		RunQuota: newRunQuota(h.limiter, nil, logger),
+		RunQuota: newRunQuota(h.limiter, h.diag, logger),
 	}
 	if opts.Wire != nil {
 		// Run 侧知识端口按需接线：未接线时 `Knowledge` 保持 nil，服务路径逐字节不变。
 		serviceOptions.Knowledge = opts.Wire(t, db, agents)
 	}
 	svc := core.NewAgentService(serviceOptions)
-	admission := &runAdmission{limiter: h.limiter, logger: logger}
+	admission := &runAdmission{limiter: h.limiter, logger: logger, diag: h.diag}
 	h.invoker = &admittedRunInvoker{inner: svc, admission: admission}
 	h.service = NewRunService(svc, runs, withRunAdmission(admission))
 
@@ -563,13 +595,14 @@ const (
 // `Router` 之外的一切仍走生产代码：路由、审计两阶段写、配额预留与结算都不在这里。
 // scriptedProvider only replaces the protocol call itself.
 type scriptedProvider struct {
-	mu      sync.Mutex
-	mode    string
-	text    string
-	rounds  int
-	toolMax int
-	callsN  int
-	hook    func(core.ChatRequest)
+	toolName string
+	mu       sync.Mutex
+	mode     string
+	text     string
+	rounds   int
+	toolMax  int
+	callsN   int
+	hook     func(core.ChatRequest)
 
 	firstCall chan struct{}
 	once      sync.Once
@@ -644,7 +677,7 @@ func (p *scriptedProvider) calls() int {
 func (p *scriptedProvider) Chat(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
 	p.mu.Lock()
 	p.callsN++
-	mode, text, round, toolMax, hook := p.mode, p.text, p.rounds, p.toolMax, p.hook
+	mode, text, round, toolMax, hook, toolName := p.mode, p.text, p.rounds, p.toolMax, p.hook, p.toolName
 	if mode == scriptModeToolCalls {
 		p.rounds++
 	}
@@ -664,10 +697,13 @@ func (p *scriptedProvider) Chat(ctx context.Context, req core.ChatRequest) (core
 		return core.ChatResponse{}, ctx.Err()
 	case scriptModeToolCalls:
 		if round < toolMax {
+			if toolName == "" {
+				toolName = runHarnessToolName
+			}
 			return core.ChatResponse{
 				ToolCalls: []core.ToolCall{{
 					ID:        fmt.Sprintf("call-%d", round+1),
-					Name:      runHarnessToolName,
+					Name:      toolName,
 					Arguments: "{}",
 				}},
 				Usage: runHarnessUsage(),

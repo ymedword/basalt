@@ -377,12 +377,12 @@ func insertRunRow(ctx context.Context, ex sqlExecutor, rec core.RunRecord, trigg
 		`INSERT INTO runs
 		   (run_id, session_id, agent, channel, user_id, trigger, status,
 		    reason, iterations, tool_calls, config_hash, started_at, finished_at,
-		    caller_id, authorizing_kind, key_id, reservation_id, actor)
+		    caller_id, authorizing_kind, key_id, reservation_id, actor, request_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 0, 0, $8, $9, NULL,
-		         $10, $11, $12, $13, $14)`,
+		         $10, $11, $12, $13, $14, $15)`,
 		rec.RunID, nullIfEmpty(rec.SessionID), rec.Agent, rec.Channel, rec.UserID,
 		trigger, string(core.StatusRunning), nullIfEmpty(rec.ConfigHash), rec.StartedAt.UnixMilli(),
-		callerID, authorizingKind, nullIfEmpty(keyID), nullIfEmpty(reservationID), actor)
+		callerID, authorizingKind, nullIfEmpty(keyID), nullIfEmpty(reservationID), actor, nullIfEmpty(rec.RequestID))
 	if err != nil {
 		return fmt.Errorf("预写运行账本行（run_id=%s）: %w", rec.RunID, err)
 	}

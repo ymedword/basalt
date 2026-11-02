@@ -40,6 +40,7 @@ export type RouteName =
   | 'knowledge-collection'
   | 'document-detail'
   | 'diagnostics'
+  | 'observability'
   | 'history'
   | 'not-found'
 
@@ -72,6 +73,7 @@ interface RoutePattern {
 
 const ROUTES: readonly RoutePattern[] = [
   { name: 'overview', segments: [] },
+  { name: 'observability', segments: ['observability'] },
   { name: 'login', segments: ['login'] },
   { name: 'agents', segments: ['agents'] },
   // 静态段 `agents/new` 必须排在动态段 `agents/:name` 之前：否则创建页会被当成
@@ -310,6 +312,14 @@ export function callerHref(callerId: string): string {
 export function diagnosticsHref(anchor?: readonly [key: string, value: string]): string {
   const path = `${CONSOLE_BASE}/diagnostics`
   return anchor === undefined ? path : `${path}?${anchor[0]}=${encodeURIComponent(anchor[1])}`
+}
+
+/** 可观测页的页签与关联标识均可刷新/分享，标识只放查询串。 */
+// Observation tabs and anchors survive refresh and sharing through query parameters.
+export function observabilityHref(view = 'overview', anchor?: readonly [key: string, value: string]): string {
+  const query = new URLSearchParams({view})
+  if (anchor !== undefined) query.set(anchor[0], anchor[1])
+  return `${CONSOLE_BASE}/observability?${query}`
 }
 
 /** 历史回查页；会话详情页带 `session_id` 深链进来，关键词仍由用户给出。 */

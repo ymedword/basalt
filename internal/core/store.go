@@ -275,7 +275,10 @@ type SessionFilter struct {
 // Status is deliberately absent — the row starts as running and only FinishRun writes
 // a terminal state. An empty SessionID means a stateless run and writes NULL.
 type RunRecord struct {
-	RunID     string
+	RunID string
+	// RequestID 只保留入口实际记录的请求标识；空值不补造历史关联。
+	// RequestID preserves a recorded ingress identity without inventing one.
+	RequestID string
 	SessionID string
 	Agent     string
 	Channel   string

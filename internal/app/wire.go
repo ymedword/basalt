@@ -32,6 +32,7 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/diagnostics"
 	"github.com/ymedword/basalt/internal/memory"
+	"github.com/ymedword/basalt/internal/observability"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/tool"
 	"github.com/ymedword/basalt/internal/workspace"
@@ -190,6 +191,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 拒绝启动——命令面自己还会就"无配置"提醒一次。
 		// A missing file yields the empty configuration: deny-by-default policy, no providers.
 		cfg = &cli.Config{}
+	}
+	observationConfig := cfg.Observability.Effective()
+	if err := cli.ValidateObservabilityConfig(observationConfig); err != nil {
+		return nil, err
+	}
+	if err := observationConfig.ValidateHistoryWindow(cfg.Diagnostics.RetentionDays); err != nil {
+		return nil, err
 	}
 
 	// ① 实例锁：**先于一切写入**。取不到（被活实例持有）即拒绝启动，且零写入。
@@ -1012,7 +1020,18 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 拒绝启动；两个实例共用同一个存储适配器，读到的就是刚写下的那批事件。
 	// The diagnostics pair: the recorder joins the run path, the reader the console.
 	// An invalid configuration refuses startup instead of running with a reinterpretation.
-	diagRecorder, diagReader, err := newDiagnosticsPorts(cfg.Diagnostics, db, a.nowOr(), logger)
+	observationStore := postgres.NewObservabilityStore(db).WithClock(a.nowOr())
+	var observationMetrics *observability.MetricsCollector
+	if *observationConfig.Enabled {
+		observationMetrics = observability.NewMetricsCollector(observationStore, a.nowOr())
+		db.ObserveAuditWriteFailures(func() { observationMetrics.IncCounter("obs_audit_write_failures_total", nil) })
+	}
+	diagRecorder, diagReader, err := newDiagnosticsPortsWithMetrics(cfg.Diagnostics, db, a.nowOr(), logger, observationMetrics)
+	if err != nil {
+		return fail(err)
+	}
+	sampleRate := cfg.Diagnostics.SampleRateOrDefault()
+	observation, err := NewObservability(ctx, observationConfig, Deps{Store: observationStore, Diagnostics: diagRecorder, Clock: a.nowOr(), Metrics: observationMetrics, SampleRate: &sampleRate, Logger: logger})
 	if err != nil {
 		return fail(err)
 	}
@@ -1045,6 +1064,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// The knowledge and history wiring lands before the compaction gate so the very
 	// same SourceViewer serves both the read faces and the injection-time check.
 	knowledgeWire, err := newKnowledgeWiring(ctx, knowledgeWiringDeps{
+		Events:        diagRecorder,
 		Config:        cfg,
 		DB:            db,
 		WorkspaceRoot: root,
@@ -1154,6 +1174,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// write only warns and never changes the run's outcome.
 		WithAssemblyRecorder(knowledgeWire.Assembly)
 	service := core.NewAgentService(core.ServiceOptions{
+		Phases: newPhaseAdapter(diagRecorder),
 		Agents: agents,
 		// 生命周期准入（图 F ③ / 约束 15）：状态文件端口与 Agent 级闸门传的是上面那一份
 		// 共享实例——准入在读锁内现场重读，启停迁移持写锁，两者因此互斥。nil 会让准入
@@ -1215,6 +1236,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// the caller's limit view between admission and accounting.
 		RunQuota: newRunQuota(runLimiter, diagRecorder, logger),
 	})
+
+	observation.History = postgres.NewHistoryRetentionStore(db, observationConfig.Export.Enabled)
+	observation.SessionGate = service
 
 	// 调度器在重路径中**始终构造**（约束 21 / 图 A）：chat / tool 只是不 Start，
 	// `webOptions.Schedules` 因此恒非 nil；启动接缝只认 serve / gateway（约束 20）。
@@ -1470,6 +1494,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpRT.ConnectedNames()))
 	return &heavyRuntime{
+		observability:     observation,
 		lock:              lock,
 		db:                db,
 		service:           service,
@@ -1793,6 +1818,7 @@ func memoryCarrier(db *postgres.DB, now func() time.Time) (core.LongTermMemorySt
 // 读代码时一眼能看出"这是内部接线"还是"这是包外拿到的句柄"。
 // The heavy prefix keeps the internal handle distinguishable from the exported Runtime.
 type heavyRuntime struct {
+	observability *Observability
 	// lock 是实例锁：进程存续期间持有（写模式的语义就是"这一进程是唯一写者"）。
 	lock *workspace.InstanceLock
 
@@ -2091,6 +2117,9 @@ type heavyRuntime struct {
 // Close releases in reverse order — watcher, scheduler, MCP pool, database, lock.
 func (r *heavyRuntime) Close() error {
 	var errs []error
+	if r.observability != nil {
+		errs = append(errs, r.observability.Close())
+	}
 	if r.watch != nil {
 		errs = append(errs, r.watch.Close())
 	}

@@ -39,6 +39,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/compaction"
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/diagnostics"
 	"github.com/ymedword/basalt/internal/history"
 	"github.com/ymedword/basalt/internal/knowledge"
 	"github.com/ymedword/basalt/internal/storage/postgres"
@@ -93,6 +94,7 @@ var (
 // 会让对应端口在运行期永久失败关闭，不如在启动期点名。
 // knowledgeWiringDeps carries every input of the knowledge assembly.
 type knowledgeWiringDeps struct {
+	Events *diagnostics.Recorder
 	// Config 是已装载的配置；nil 按全零处理（等价于"什么都没配"）。
 	Config *cli.Config
 	// DB 是已迁移的 PostgreSQL 句柄。
@@ -224,7 +226,7 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 	)
 	if client != nil {
 		manager := knowledge.NewGenerationManager(knowledge.GenerationDeps{
-			Store:  indexStore,
+			Store:  &diagnosticGenerationStore{GenerationStore: indexStore, recorder: deps.Events},
 			Logger: logger,
 			Now:    now,
 		})
@@ -266,14 +268,14 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 		chunkOverlapTokens(cfg.Knowledge.Chunk.OverlapTokens))
 
 	ingestor := knowledge.NewIngestor(knowledge.IngestorDeps{
-		Store:   knowledgeStore,
+		Store:   &diagnosticIngestStore{IngestStore: knowledgeStore, recorder: deps.Events},
 		Reader:  reader,
 		Chunker: chunker,
 		// Embedder 为 nil 时 `ready()` 首个条件即失败关闭——摄取端回"未配置"。
 		Embedder: embedder,
 		Vectors:  indexStore,
 		// 两阶段审计：预写 `pending` 失败则**不发出**调用（宪法第 5 条的调用面）。
-		Audit:            audit,
+		Audit:            &diagnosticIngestAudit{EmbeddingAudit: audit, recorder: deps.Events},
 		Quota:            deps.Quota,
 		QuotaDiagnostics: deps.QuotaDiagnostics,
 		Config: knowledge.IngestConfig{
@@ -295,6 +297,7 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 	// One assembly writer shared by the retrieval and chat purposes.
 	assembly := postgres.NewAssemblyStore(deps.DB, logger)
 	retriever := knowledge.NewRetriever(knowledge.RetrieverDeps{
+		Phases:  newPhaseAdapter(deps.Events),
 		Authz:   authz,
 		Keyword: postgres.NewKnowledgeKeywordSearcher(deps.DB),
 		Vectors: postgres.NewKnowledgeVectorSearcher(deps.DB),
@@ -343,7 +346,7 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 		// Run 侧复用同一个检索器（装配记录端口在位）、来源视图（精确读取）与带审计的
 		// 查询向量客户端；诊断端口与检索器同一份适配器——两处对原因码的理解不会分叉。
 		Run: newKnowledgeRunSource(retriever, viewer, queryEmbedder, generation,
-			deps.Diagnostics, logger),
+			deps.Diagnostics, logger).withPhases(newPhaseAdapter(deps.Events)),
 		// 对话装配记录（V-7）与检索装配共用同一个写入器：两条 purpose 写同一张表，
 		// 同源让"哪一轮注入了什么"与"检索召回了什么"能按 run_id 对齐。
 		Assembly: assembly,

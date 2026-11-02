@@ -263,6 +263,7 @@ type RetrievalConfig struct {
 // 在解析范围之前返回 `ErrRetrieverUnavailable`）。
 // RetrieverDeps carries the assembly dependencies; a missing port fails closed.
 type RetrieverDeps struct {
+	Phases core.PhaseRecorder
 	// Authz 是可见范围解析端口。
 	Authz Authz
 	// Keyword 是关键词路径端口。
@@ -284,6 +285,7 @@ type RetrieverDeps struct {
 // Retriever 执行同步混合检索：两路并行**不**允许（原则 VII 禁异步编排），顺序调用。
 // Retriever runs the two search paths sequentially; no async orchestration.
 type Retriever struct {
+	phases     core.PhaseRecorder
 	authz      Authz
 	keyword    KeywordSearcher
 	vectors    VectorSearcher
@@ -300,6 +302,7 @@ type Retriever struct {
 // NewRetriever assembles the retriever; a missing port fails closed at entry.
 func NewRetriever(deps RetrieverDeps) *Retriever {
 	retriever := &Retriever{
+		phases:   deps.Phases,
 		authz:    deps.Authz,
 		keyword:  deps.Keyword,
 		vectors:  deps.Vectors,
@@ -370,7 +373,8 @@ func (r *Retriever) Retrieve(ctx context.Context, req RetrieveRequest) (Retrieve
 		Purpose:          core.PurposeRetrieval,
 		Agent:            query.agent,
 		EstimatorVersion: core.EstimateVersion,
-		Candidates:       assemblyCandidates(outcome.merged),
+		Candidates:       assemblyCandidatesWithDecisions(outcome.merged, outcome.hits, r.topK(query.topK)),
+		Retrieval:        retrievalRecord(query, outcome, r.topK(query.topK), r.candidateK(query.candidateK)),
 		Hits:             hitIDs(outcome.hits),
 		Decisions:        outcome.decisions,
 		ReasonCodes:      outcome.reasons,
@@ -478,14 +482,22 @@ type retrievalOutcome struct {
 // 单路失败降级并留痕；两路皆失败才上抛（图 4 的"两路皆失败才失败"）。
 // run mirrors figure 4 step 1-6; one failing path degrades, both failing is an error.
 func (r *Retriever) run(ctx context.Context, q retrievalQuery) (retrievalOutcome, error) {
+	finishScope := core.BeginPhase(ctx, r.phases, core.PhaseScope, core.PhaseKnowledge, q.runID, q.stepID, 0)
 	scope, err := r.authz.Resolve(ctx, q.principal, q.agent, q.collections)
+	phaseErr := err
+	if errors.Is(err, core.ErrForbidden) || errors.Is(err, core.ErrUnauthorized) || errors.Is(err, ErrInvalidRequest) {
+		phaseErr = core.ErrPhaseSkipped
+	}
+	finishScope(phaseErr)
 	if err != nil {
 		return retrievalOutcome{}, err
 	}
 	candidateK := r.candidateK(q.candidateK)
 	outcome := retrievalOutcome{scope: scope}
 
+	finishKeyword := core.BeginPhase(ctx, r.phases, core.PhaseKeyword, core.PhaseKnowledge, q.runID, q.stepID, 0)
 	keywordHits, keywordDenied, keywordErr := r.keyword.Search(ctx, scope, q.text, candidateK)
+	finishKeyword(keywordErr)
 	keywordOK := keywordErr == nil
 	if !keywordOK {
 		r.degrade(ctx, q, DiagnosticReasonKeywordUnavailable, "keyword search path unavailable", keywordErr, nil)
@@ -526,6 +538,7 @@ func (r *Retriever) run(ctx context.Context, q retrievalQuery) (retrievalOutcome
 			map[string]any{"count": outcome.deniedCount})
 	}
 
+	finishFusion := core.BeginPhase(ctx, r.phases, core.PhaseFusion, core.PhaseKnowledge, q.runID, q.stepID, 0)
 	outcome.merged = mergeRRF(keywordHits, vectorHits, r.rrfK())
 	kept, dropped := fitBudget(outcome.merged, r.topK(q.topK), q.budget)
 	outcome.hits = kept
@@ -535,6 +548,7 @@ func (r *Retriever) run(ctx context.Context, q retrievalQuery) (retrievalOutcome
 		outcome.reasons = append(outcome.reasons, string(DiagnosticReasonBudgetTrimmed))
 		outcome.decisions = append(outcome.decisions, string(DiagnosticDecisionTrim))
 	}
+	finishFusion(nil)
 	return outcome, nil
 }
 
@@ -551,7 +565,10 @@ func (r *Retriever) searchVectors(ctx context.Context, scope Scope, q retrievalQ
 	case len(q.embedding) != VectorDimensions:
 		return nil, 0, fmt.Errorf("查询向量维度 %d 与冻结维度 %d 不符，向量路跳过", len(q.embedding), VectorDimensions)
 	}
-	return r.vectors.Search(ctx, scope, q.embedding, q.generation, k)
+	finish := core.BeginPhase(ctx, r.phases, core.PhaseVector, core.PhaseKnowledge, q.runID, q.stepID, 0)
+	hits, denied, err := r.vectors.Search(ctx, scope, q.embedding, q.generation, k)
+	finish(err)
+	return hits, denied, err
 }
 
 // degrade 写降级的两条轨：WARN 日志（排障要看得到）与诊断事件（有锚点时）。
@@ -847,6 +864,40 @@ func assemblyCandidates(hits []Hit) []core.AssemblyCandidate {
 		})
 	}
 	return out
+}
+
+// assemblyCandidatesWithDecisions 只为允许候选补真实排序/预算决定。
+// assemblyCandidatesWithDecisions distinguishes rank truncation from budget drops.
+func assemblyCandidatesWithDecisions(hits, kept []Hit, topK int) []core.AssemblyCandidate {
+	out := assemblyCandidates(hits)
+	keptIDs := make(map[string]bool, len(kept))
+	for _, hit := range kept {
+		keptIDs[hit.ChunkID] = true
+	}
+	for i := range out {
+		switch {
+		case i >= topK:
+			out[i].Decision = "rank_cut"
+		case keptIDs[out[i].ChunkID]:
+			out[i].Decision = "kept"
+		default:
+			out[i].Decision = "budget_drop"
+		}
+	}
+	return out
+}
+
+// retrievalRecord 只记录生效参数，缺失向量代际不编码为零。
+// retrievalRecord records effective parameters without inventing a generation.
+func retrievalRecord(q retrievalQuery, outcome retrievalOutcome, topK, candidateK int) *core.RetrievalRecord {
+	record := &core.RetrievalRecord{
+		TopK: topK, CandidateK: candidateK, BudgetTokens: q.budget,
+		FilteredCount: outcome.deniedCount, FilteredReason: "not_distinguished",
+	}
+	if outcome.generation > 0 {
+		record.IndexGeneration = new(outcome.generation)
+	}
+	return record
 }
 
 // hitIDs 取最终命中的片段标识（装配记录的 `hits` 只存标识）。

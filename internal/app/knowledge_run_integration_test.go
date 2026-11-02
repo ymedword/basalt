@@ -73,13 +73,19 @@ var errKnRunE2ESearchDown = errors.New("kn run e2e: injected search path failure
 
 // knRunE2EState 在装配期捕获测试要操作的组件：摄取器（材料入库与删除）与间谍端口。
 type knRunE2EState struct {
-	spy        *knRunSpy
-	ingestor   *knowledge.Ingestor
-	documentID string
+	events          *diagnostics.Recorder
+	retrievalConfig knowledge.RetrievalConfig
+	spy             *knRunSpy
+	ingestor        *knowledge.Ingestor
+	documentID      string
 }
 
 // knRunE2EOptions 是按用例定制的装配增量。
 type knRunE2EOptions struct {
+	Observability   bool
+	RetrievalConfig knowledge.RetrievalConfig
+	// ExtraBindings 仅为OBS混合过滤夹具追加声明，既有场景默认不变。
+	ExtraBindings []core.KnowledgeBinding
 	// WithReadScope 追加 `knowledge:read`（缺省 false = 只有 `sessions:write`）。
 	WithReadScope bool
 	// FailSearch 让关键词与向量两条路径都失败，走"存储违约 → 拒绝启动"分支。
@@ -100,16 +106,18 @@ type knRunE2E struct {
 func newKnRunE2E(t *testing.T, opts knRunE2EOptions) *knRunE2E {
 	t.Helper()
 
-	state := &knRunE2EState{spy: &knRunSpy{}}
+	state := &knRunE2EState{spy: &knRunSpy{}, retrievalConfig: opts.RetrievalConfig}
 	var scopes []string
 	if opts.WithReadScope {
 		scopes = []string{core.ScopeKnowledgeRead}
 	}
 	options := runHarnessOptions{
-		Knowledge: []core.KnowledgeBinding{{
+		Observability:     opts.Observability,
+		ObservationWiring: func(events *diagnostics.Recorder) { state.events = events },
+		Knowledge: append([]core.KnowledgeBinding{{
 			Name:   knRunE2ECollectionName,
 			Access: core.KnowledgeAccessRead,
-		}},
+		}}, opts.ExtraBindings...),
 		ExtraScopes: scopes,
 		Message:     knRunE2EQuery,
 		Wire: func(t *testing.T, db *postgres.DB, agents postgres.KnowledgeAgentSource) core.KnowledgeRunSource {
@@ -180,15 +188,19 @@ func knRunE2EWire(t *testing.T, db *postgres.DB, agents postgres.KnowledgeAgentS
 	// 诊断端口只建一份：检索器与运行级端口共用同一个适配器，两处对原因码的解释不会分叉。
 	// One diagnostic adapter shared by the retriever and the run-side port.
 	diag := newKnRunE2EDiagnostics(t, db, logger)
+	if state.events != nil {
+		diag = newKnowledgeDiagAdapter(state.events, logger)
+	}
+	events := diag.(*knowledgeDiagAdapter).recorder
 
 	// 摄取器：与生产装配同一组构造器，只有 embedding 提供方 / 配额 / embedding 审计是假件。
 	state.ingestor = knowledge.NewIngestor(knowledge.IngestorDeps{
-		Store:    store,
+		Store:    &diagnosticIngestStore{IngestStore: store, recorder: events},
 		Reader:   reader,
 		Chunker:  knowledge.NewTextChunker(200, 20),
 		Embedder: embedder,
 		Vectors:  indexer,
-		Audit:    knRunE2EAudit{},
+		Audit:    &diagnosticIngestAudit{EmbeddingAudit: knRunE2EAudit{}, recorder: events},
 		Quota:    knRunE2EQuota{},
 		Config: knowledge.IngestConfig{
 			Generation:          knRunE2EGeneration,
@@ -210,15 +222,26 @@ func knRunE2EWire(t *testing.T, db *postgres.DB, agents postgres.KnowledgeAgentS
 		vectors = knRunE2EFailingVectors{}
 	}
 
+	retrievalConfig := state.retrievalConfig
+	if retrievalConfig.TopK <= 0 {
+		retrievalConfig.TopK = 5
+	}
+	if retrievalConfig.CandidateK <= 0 {
+		retrievalConfig.CandidateK = 20
+	}
+	readClock := func() time.Time { return now }
+	if state.events != nil {
+		readClock = time.Now
+	}
 	retriever := knowledge.NewRetriever(knowledge.RetrieverDeps{
 		Authz:       postgres.NewKnowledgeAuthz(db, agents),
 		Keyword:     keyword,
 		Vectors:     vectors,
 		Assembly:    postgres.NewAssemblyStore(db, logger),
 		Diagnostics: diag,
-		Config:      knowledge.RetrievalConfig{TopK: 5, CandidateK: 20},
+		Config:      retrievalConfig,
 		Logger:      logger,
-		Now:         func() time.Time { return now },
+		Now:         readClock,
 	})
 	viewer := knowledge.NewSourceViewer(knowledge.SourceViewerDeps{
 		Reader: store,

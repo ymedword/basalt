@@ -28,6 +28,10 @@ import (
 // onto the frozen contract value.
 type DiagnosticReason string
 
+// DiagnosticReasonChunkInvalidated 表示轮内复核确实收窄了注入面，仅记录数量。
+// DiagnosticReasonChunkInvalidated records an actual injection narrowing by count only.
+const DiagnosticReasonChunkInvalidated DiagnosticReason = "chunk_invalidated"
+
 const (
 	// DiagnosticReasonVectorUnavailable 表示向量通道不可用（降级到关键词）。
 	// DiagnosticReasonVectorUnavailable marks the vector path being unavailable.

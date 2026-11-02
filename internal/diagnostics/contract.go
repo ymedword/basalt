@@ -137,6 +137,9 @@ const (
 	// 要等到下个配额周期，排障方向完全不同。
 	// ReasonConcurrencyLimited separates a full slot table from an exhausted period quota.
 	ReasonConcurrencyLimited ReasonCode = "concurrency_limited"
+	// ReasonChunkInvalidated 表示轮次间撤权/删除/换版导致注入范围收窄。
+	// ReasonChunkInvalidated records narrowed context after revalidation.
+	ReasonChunkInvalidated ReasonCode = "chunk_invalidated"
 )
 
 // allReasonCodes 是原因码契约枚举的完整取值集合（与 `allKinds` 同一条纪律）。
@@ -146,7 +149,7 @@ var allReasonCodes = []ReasonCode{
 	ReasonPermissionDenied, ReasonBudgetTrimmed, ReasonHistoryTrimmed, ReasonNoAnswer,
 	ReasonCitationUnresolved, ReasonChunkerFailed, ReasonEmbedFailed, ReasonIndexFailed,
 	ReasonQuotaExhausted, ReasonRateLimited, ReasonKeyRevoked, ReasonMigrationVerifyFailed,
-	ReasonLLMCallFailed, ReasonConcurrencyLimited,
+	ReasonLLMCallFailed, ReasonConcurrencyLimited, ReasonChunkInvalidated,
 }
 
 // Valid 报告原因码是否落在契约枚举内；空串表示未给出原因，按合法处理。

@@ -19,8 +19,10 @@ package diagnostics
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"io"
 	"log/slog"
-	"math/rand/v2"
 	"sync/atomic"
 	"time"
 )
@@ -52,10 +54,24 @@ type RateSampler struct {
 	roll   func() float64
 }
 
-// NewRateSampler 按生效配置构造采样器；随机源缺省用 `math/rand/v2`。
-// NewRateSampler builds the sampler; a nil roll falls back to the stdlib generator.
+// NewRateSampler 按生效配置构造采样器；随机源使用crypto/rand。
+// NewRateSampler builds the sampler with the cryptographic source.
 func NewRateSampler(config Config) *RateSampler {
-	return &RateSampler{config: config, roll: rand.Float64}
+	return &RateSampler{config: config, roll: sampleFraction}
+}
+
+// sampleFraction 生成[0,1)均匀样本；熵失败时丢弃可丢弃诊断，不传播业务错误。
+// sampleFraction samples uniformly in [0,1), dropping diagnostics if entropy fails.
+func sampleFraction() float64 {
+	return sampleFractionFrom(rand.Reader)
+}
+
+func sampleFractionFrom(reader io.Reader) float64 {
+	var raw [8]byte
+	if _, err := io.ReadFull(reader, raw[:]); err != nil {
+		return 1
+	}
+	return float64(binary.BigEndian.Uint64(raw[:])>>11) / (1 << 53)
 }
 
 // WithRoll 换掉随机源并返回自身（链式；只给用例与需要可复现的装配使用）。
@@ -87,6 +103,7 @@ type Recorder struct {
 	// sampledOut 统计被采样丢弃的条数（只作运行期读数，不落库）。
 	// sampledOut counts dropped events; it is a runtime reading, never persisted.
 	sampledOut *counter
+	onResult   func(Kind, string)
 }
 
 // RecorderOptions 是 `NewRecorder` 的显式依赖集。全部字段可空，空即取安全缺省：
@@ -94,6 +111,9 @@ type Recorder struct {
 // 无时钟 = 系统时钟；无日志器 = 进程缺省。
 // RecorderOptions is the explicit dependency set; every zero value has a safe default.
 type RecorderOptions struct {
+	// OnResult 只接收固定kind/result，用于进程指标；不返回业务错误。
+	// OnResult receives fixed kind/result values for process metrics, without an error channel.
+	OnResult func(Kind, string)
 	Store    EventStore
 	Sampler  Sampler
 	Redactor Redactor
@@ -113,6 +133,7 @@ func NewRecorder(opts RecorderOptions) *Recorder {
 		now:        opts.Now,
 		logger:     opts.Logger,
 		sampledOut: &counter{},
+		onResult:   opts.OnResult,
 	}
 	if recorder.now == nil {
 		recorder.now = time.Now
@@ -134,6 +155,7 @@ func (r *Recorder) Record(ctx context.Context, ev DiagnosticEvent) {
 	if ev.EventID == "" {
 		id, err := NewEventID(r.now())
 		if err != nil {
+			r.result(ev.Kind, "write_failed")
 			r.logger.Warn("诊断事件标识生成失败——事件已丢弃", "kind", string(ev.Kind), "error", err)
 			return
 		}
@@ -146,6 +168,7 @@ func (r *Recorder) Record(ctx context.Context, ev DiagnosticEvent) {
 		ev.OccurredAt = r.now().UTC().UnixMilli()
 	}
 	if err := ev.Validate(); err != nil {
+		r.result(ev.Kind, "write_failed")
 		r.logger.Warn("诊断事件形状非法——事件已丢弃", "kind", string(ev.Kind), "error", err)
 		return
 	}
@@ -153,14 +176,29 @@ func (r *Recorder) Record(ctx context.Context, ev DiagnosticEvent) {
 		// 采样丢弃是**正常路径**：不记 WARN，只计数（否则开启采样后日志自己成了噪声源）。
 		// A sampled-out event is a normal outcome: counted, never logged as a warning.
 		r.sampledOut.add(1)
+		r.result(ev.Kind, "sampled_out")
 		return
 	}
 	redacted := ev.Redacted(r.redactor)
 	if err := r.store.InsertEvent(ctx, redacted); err != nil {
+		r.result(ev.Kind, "write_failed")
 		// 诊断**可丢弃**：写失败不影响业务，也不重试（重试会在故障期放大压力）。
 		// Diagnostics are droppable: no retry, and the business path never learns of it.
 		r.logger.Warn("诊断事件写入失败——已丢弃", "event_id", redacted.EventID,
 			"kind", string(redacted.Kind), "error", err)
+		return
+	}
+	r.result(ev.Kind, "recorded")
+}
+
+func (r *Recorder) result(kind Kind, result string) {
+	if r.onResult != nil && kind.Valid() {
+		defer func() {
+			if recover() != nil {
+				r.logger.Warn("diagnostic metric callback failed", "kind", string(kind), "error_kind", "metric_callback_failed")
+			}
+		}()
+		r.onResult(kind, result)
 	}
 }
 

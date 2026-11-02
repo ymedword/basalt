@@ -173,14 +173,14 @@ func normalizePendingAuditRows(ctx context.Context, db *sql.DB, now time.Time) (
 	err := withTxOn(ctx, db, now, func(ctx context.Context, tx *sql.Tx) error {
 		total = 0
 		updated, err := normalizePendingRows(ctx, tx,
-			`UPDATE llm_calls SET status = $1, error_kind = $2 WHERE status = $3`)
+			`UPDATE llm_calls SET status = $1, error_kind = $2, recovered_at = $4 WHERE status = $3`, now)
 		if err != nil {
 			return fmt.Errorf("归一化 llm_calls 的 pending 行: %w", err)
 		}
 		total += updated
 
 		updated, err = normalizePendingRows(ctx, tx,
-			`UPDATE tool_invocations SET status = $1, error_kind = $2 WHERE status = $3`)
+			`UPDATE tool_invocations SET status = $1, error_kind = $2, recovered_at = $4 WHERE status = $3`, now)
 		if err != nil {
 			return fmt.Errorf("归一化 tool_invocations 的 pending 行: %w", err)
 		}
@@ -195,9 +195,9 @@ func normalizePendingAuditRows(ctx context.Context, db *sql.DB, now time.Time) (
 
 // normalizePendingRows 执行一条归一化语句并返回影响行数（两条语句共用，参数相同）。
 // Runs one normalization statement and reports the affected row count.
-func normalizePendingRows(ctx context.Context, ex sqlExecutor, stmt string) (int, error) {
+func normalizePendingRows(ctx context.Context, ex sqlExecutor, stmt string, now time.Time) (int, error) {
 	res, err := ex.ExecContext(ctx, stmt,
-		string(core.LLMCallUnknown), string(core.ErrorKindUnknown), string(core.LLMCallPending))
+		string(core.LLMCallUnknown), string(core.ErrorKindUnknown), string(core.LLMCallPending), now.UnixMilli())
 	if err != nil {
 		return 0, err
 	}

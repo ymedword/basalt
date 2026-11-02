@@ -10,6 +10,7 @@ package diagnostics
 import (
 	"net/url"
 	"strings"
+	"time"
 )
 
 // URLAttrKey 是唯一允许承载地址的 attrs 键；值只保留 `scheme://host`。
@@ -40,11 +41,13 @@ var commonAttrKeys = map[string]struct{}{
 // single decision are admitted, and each is scoped to the kind that produces it.
 var kindAttrKeys = map[Kind]map[string]struct{}{
 	KindToolCall: {
-		"tool":       {}, // 工具名（注册名，不是参数或结果）
-		"error_kind": {}, // 失败分类（core 的七类错误，成功时缺省）
+		"tool":         {}, // 工具名（注册名，不是参数或结果）
+		"tool_call_id": {}, // US-16A：模型实际返回的调用标识。
+		"error_kind":   {}, // 失败分类（core 的七类错误，成功时缺省）
 	},
 	KindPermissionDecision: {
-		"tool": {}, // 被拒的工具名
+		"tool":         {}, // 被拒的工具名
+		"tool_call_id": {}, // 有模型调用标识时保留，不补造。
 	},
 	KindQuotaDecision: {
 		"class": {}, // 配额类目：run / chat / compaction / ingest / read
@@ -94,6 +97,10 @@ func (*WhitelistRedactor) Redact(kind Kind, attrs map[string]any) map[string]any
 		if scalar, ok := scalarAttr(value); ok {
 			out[key] = scalar
 		}
+	}
+	if phase, ok := ReadPhase(kind, attrs); ok {
+		out["phase"], out["phase_parent"], out["phase_status"] = phase.Name, phase.Parent, phase.Status
+		out["duration_ms"], out["phase_end"] = phase.DurationMS, phase.End.UTC().Format(time.RFC3339Nano)
 	}
 	return out
 }

@@ -114,6 +114,7 @@ func (r *LLMCallRepo) beginPendingCall(ctx context.Context, purpose string, call
 		call.RunID, nullIfEmpty(call.SessionID), call.Round, call.Provider, call.Model,
 		string(core.LLMCallPending), nullIfEmpty(call.ConfigHash), createdAt.UnixMilli(), purpose).Scan(&id)
 	if err != nil {
+		r.db.noteAuditWriteFailure("llm_calls", "begin")
 		return 0, fmt.Errorf("预写审计行（provider=%s, purpose=%s）: %w", call.Provider, purpose, err)
 	}
 	return id, nil
@@ -137,6 +138,7 @@ func (r *LLMCallRepo) FinishCall(ctx context.Context, id int64, result core.LLMC
 		result.Duration.Milliseconds(), nullIfEmpty(truncateUTF8(result.ErrorMessage, maxErrorMessageBytes)),
 		nullIfEmpty(string(result.ErrorKind)), id, string(core.LLMCallPending))
 	if err != nil {
+		r.db.noteAuditWriteFailure("llm_calls", "finish")
 		return fmt.Errorf("回填审计行终态（id=%d）: %w", id, err)
 	}
 

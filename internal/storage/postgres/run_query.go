@@ -40,7 +40,7 @@ const (
 	// row yields an empty hash rather than an error.
 	runBaseColumns = `r.run_id, r.session_id, r.agent, r.channel, r.user_id, r.trigger,
 		       r.status, r.reason, r.iterations, r.tool_calls, r.config_hash,
-		       r.started_at, r.finished_at, COALESCE(m.manifest_hash, '')`
+		       r.started_at, r.finished_at, COALESCE(m.manifest_hash, ''), r.request_id`
 
 	// runFinalTextColumn 是**列表**的 final_text 派生列：该 Run 最近一条 assistant 消息
 	// （按 `seq` 倒序取一条），没有则空串。详情走 finalText 单查（注 16 允许两种形态）。
@@ -181,6 +181,7 @@ func scanRunDetail(row rowScanner, lastText *sql.NullString) (core.RunDetail, er
 	var (
 		detail    core.RunDetail
 		sessionID sql.NullString
+		requestID sql.NullString
 		trigger   string
 		status    string
 		reason    sql.NullString
@@ -191,7 +192,7 @@ func scanRunDetail(row rowScanner, lastText *sql.NullString) (core.RunDetail, er
 	dests := []any{
 		&detail.RunID, &sessionID, &detail.Agent, &detail.Channel, &detail.UserID, &trigger,
 		&status, &reason, &detail.Iterations, &detail.ToolCalls, &configHsh,
-		&startedAt, &finished, &detail.ManifestHash,
+		&startedAt, &finished, &detail.ManifestHash, &requestID,
 	}
 	if lastText != nil {
 		dests = append(dests, lastText)
@@ -202,6 +203,7 @@ func scanRunDetail(row rowScanner, lastText *sql.NullString) (core.RunDetail, er
 
 	// NULL 映射固定（契约注 18）：空会话 = 无状态调用；未收口的行没有 finished_at。
 	detail.SessionID = sessionID.String
+	detail.RequestID = requestID.String
 	detail.Trigger = core.Trigger(trigger)
 	detail.Status = core.RunStatus(status)
 	detail.Reason = reason.String

@@ -82,6 +82,7 @@ func (r *EmbeddingCallRepo) BeginEmbedding(ctx context.Context, jobID, model str
 		nullIfEmpty(jobID), model, r.dimensions, inputCount,
 		embeddingStatusPending, r.db.clock().UnixMilli()).Scan(&id)
 	if err != nil {
+		r.db.noteAuditWriteFailure("embedding_calls", "begin")
 		return "", fmt.Errorf("预写 embedding 审计行（ingest_job_id=%s, model=%s）: %w", jobID, model, err)
 	}
 	return strconv.FormatInt(id, 10), nil
@@ -113,6 +114,7 @@ func (r *EmbeddingCallRepo) FinishEmbedding(ctx context.Context, callID string, 
 		status, promptTokens, nullIfEmpty(string(kind)), r.db.clock().UnixMilli(),
 		id, embeddingStatusPending)
 	if err != nil {
+		r.db.noteAuditWriteFailure("embedding_calls", "finish")
 		return fmt.Errorf("回填 embedding 审计行终态（id=%d）: %w", id, err)
 	}
 

@@ -196,6 +196,8 @@ func (a *knowledgeDiagAdapter) drop(ctx context.Context, event knowledge.Diagnos
 // knowledgeReasonCode translates the reason code value by value.
 func knowledgeReasonCode(reason knowledge.DiagnosticReason) (diagnostics.ReasonCode, bool) {
 	switch reason {
+	case knowledge.DiagnosticReasonChunkInvalidated:
+		return diagnostics.ReasonChunkInvalidated, true
 	case knowledge.DiagnosticReasonVectorUnavailable:
 		return diagnostics.ReasonVectorUnavailable, true
 	case knowledge.DiagnosticReasonKeywordUnavailable:

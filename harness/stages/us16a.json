@@ -1,0 +1,1777 @@
+{
+  "version": 1,
+  "id": "us16a-r1",
+  "approval": "User review 1 passed 2026-11-01 (289be456 reviewed module card); subsequent explicit user authorization delegates recommended decisions and all implementation to Codex until final walkthrough. User explicitly fixes US-16A, reserving US-17. Local-only private module input. Derived spec/plan/tasks analyzed with zero CRITICAL. Input SHA256 {\"docs/us/us16a-observability.md\": \"f9dfb6e1ca618954c6e68911a9cf0d079a8936cf46045556f077326e3adc627d\", \"specs/016a-observability/plan.md\": \"f8d545f39a09865148dce1a76bff4142d481daf869f7930ad6b31679b0bcb634\", \"specs/016a-observability/spec.md\": \"efb273c261a88013dde84e4c7e0653dbf5af9c9d12632413150b344d69978862\", \"tasks_normalized\": \"1a5cd1f4f4ae393d36225d7d28df9d8b3c2e7b78c5c08dac05d47fbddb6c4006\"}. Initial missing required tests are expected red and must all land; no historical stage or assertion is weakened. Collector external check will be appended with actual authorized fixed-version command after spike, not counted as passed beforehand. Additive T004/T005 narrow checks bind migration and request correlation before later PG features land; global obs-pg requirements retained. Existing fresh-schema test only adds version 6 and six approved tables; v1 52-table lock and historical migration hashes unchanged. T028 adds ten affected US-16 regression commands with original required names preserved; integration loading is additive where historical argv omitted it. Historical stage and records remain byte-unchanged. Two narrowly reviewed G202 constant-SQL exceptions have real malicious-parameter PG tests; gate thresholds/config remain unchanged. x/net v0.60.0 replaces vulnerable v0.59.0 per official Go advisories, within delegated dependency decision scope. Approved PG0006 makes its version integer coincide with frozen SQLite v6. Two stale inventory/version tests preserve the original backend-separation semantics using legacy52+exactOBS6+total58, real init/migrate/status and both directionally mutated package-origin assertions. Independent review confirms no weakening. T028 full e2e exposed pre-existing watcher generation loss, interrupted bootstrap intent loss and stale demo/install fixtures. Delegated compatibility repairs preserve strict Fresh, existing marker schema and all prior assertions: add two regression checks; fixed fixture clock plus separate report outputs, explicit keyword retrieval and authenticated secret initialization, isolated DSN for second serve. All 37 prior checks and historical stages remain intact; failures and behavioral red/green evidence are retained. The full Linux/root e2e package reached Go default 600s without a named failure while the original 25s cron cases were progressing. Makefile adds E2E_TIMEOUT default10m; this run explicitly uses20m as a package-level execution budget only. All per-case timeouts,70s bounds,25s cron waits,assertions,selection and count remain unchanged. OBS stage timeouts unchanged. This is disclosed as execution-budget configuration adaptation for review2; the original default make e2e did not pass. The full package then exposed the original deliberate busy-port release_order assertion: real stop logging could outlive robfig job completion. Fixed only the existing cron adapter to join jobs and current-loop final callback, fence restart generations and preserve every old shutdown assertion and70s bound. Added a third recovery regression check (40 total). The earlier random-port attribution was corrected; cancelled rerun and partial native gates are preserved, never counted as passing. On 2026-11-02 the user approved 30-day related-history retention and the append-only 0007_history_retention.sql; the fresh-schema inventory now expects the two retention-ledger tables (total 60), superseding the earlier total-58 wording while the v1 52-table lock and 0001-0006 hashes remain unchanged.",
+  "inputs": [
+    "docs/us/us16a-observability.md",
+    "specs/016a-observability/spec.md",
+    "specs/016a-observability/plan.md",
+    "specs/016a-observability/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/observability/anchor_test.go",
+    "internal/observability/timeline_test.go",
+    "internal/storage/postgres/observability_migration_test.go",
+    "internal/storage/postgres/observability_store_test.go",
+    "internal/app/observability_knowledge_test.go",
+    "internal/knowledge/observability_test.go",
+    "internal/storage/postgres/observability_recovery_test.go",
+    "internal/observability/context_test.go",
+    "internal/observability/overview_test.go",
+    "internal/observability/metrics_test.go",
+    "internal/observability/alerts_test.go",
+    "internal/storage/postgres/observability_alerts_test.go",
+    "internal/storage/postgres/observability_metrics_test.go",
+    "internal/storage/postgres/observability_audit_test.go",
+    "internal/app/observability_audit_test.go",
+    "internal/app/observability_metrics_test.go",
+    "internal/storage/postgres/observability_export_test.go",
+    "internal/storage/postgres/observability_export_safety_test.go",
+    "internal/observability/export_result_test.go",
+    "internal/observability/scanner_test.go",
+    "internal/storage/postgres/observability_scan_test.go",
+    "internal/observability/mapping_test.go",
+    "internal/storage/postgres/observability_export_protocol_test.go",
+    "internal/observability/worker_test.go",
+    "internal/storage/postgres/observability_worker_test.go",
+    "internal/observability/metrics_export_test.go",
+    "internal/app/observability_otlp_test.go",
+    "internal/observability/retention_test.go",
+    "internal/storage/postgres/observability_retention_test.go",
+    "internal/cli/config_observability_test.go",
+    "internal/app/observability_test.go",
+    "internal/web/observability_lifecycle_test.go",
+    "internal/observability/redaction_test.go",
+    "internal/observability/read_boundary_test.go",
+    "internal/storage/postgres/observability_read_status_test.go",
+    "internal/web/handlers_observability_test.go",
+    "internal/web/contracts_observability_test.go",
+    "internal/app/observability_api_test.go",
+    "assets/console/tests/observability.test.ts",
+    "assets/console/tests/diagnostics.test.ts",
+    "internal/app/observability_scenarios_test.go",
+    "internal/app/observability_export_scenario_test.go",
+    "internal/app/run_harness_test.go",
+    "internal/app/knowledge_run_integration_test.go",
+    "internal/storage/postgres/observability_capacity_test.go",
+    "internal/app/observability_collector_test.go",
+    "internal/observability/read_metadata_test.go",
+    "internal/app/observability_legacy_api_test.go",
+    "internal/diagnostics/sampler_entropy_test.go",
+    "internal/storage/postgres/observability_sql_boundary_test.go",
+    "internal/app/observability_lineage_test.go",
+    "internal/app/ports_test.go",
+    "internal/app/supported_version_injection_test.go",
+    "internal/workspace/watcher_test.go",
+    "internal/workspace/watcher_recovery_test.go",
+    "internal/app/builtin_bootstrap_intent_test.go",
+    "internal/e2e/us14_demos_test.go",
+    "internal/e2e/us14_fullpackage_test.go",
+    "internal/adapters/cron/cron_test.go",
+    "internal/adapters/cron/stop_lifecycle_test.go"
+  ],
+  "checks": [
+    {
+      "id": "obs-bootstrap",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "./internal/observability",
+        "-run",
+        "^TestObservability_AnchorValidation$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservability_AnchorValidation"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-unit",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "-cover",
+        "./internal/observability",
+        "./internal/cli"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservability_AlertAuditEvidence",
+        "TestObservability_AlertToolDenialExcludesRetrieval",
+        "TestObservability_AlertTriggerRecovery",
+        "TestObservability_AlertUnknownOnStoreFailure",
+        "TestObservability_CleanedWindowAttribution",
+        "TestObservability_CleanupBatches",
+        "TestObservability_CleanupBeforeScanDoesNotDelete",
+        "TestObservability_CleanupDisabled",
+        "TestObservability_CleanupEnabledShortRetention",
+        "TestObservability_CleanupEvidenceGap",
+        "TestObservability_CleanupExportConflict",
+        "TestObservability_CleanupLedgerAtomic",
+        "TestObservability_CleanupNeverBackfilledNotDeleted",
+        "TestObservability_CleanupRequiresConfirmedExport",
+        "TestObservability_CleanupRestart",
+        "TestObservability_CleanupSkipsUncoveredWindow",
+        "TestObservability_ContextBudgetVsRankCut",
+        "TestObservability_ContextFilteredNoIdentity",
+        "TestObservability_ContextFilteredReasonNotDirect",
+        "TestObservability_ContextNeedsOutputCheck",
+        "TestObservability_DisplayStepIDsStable",
+        "TestObservability_ExportConfigRedacted",
+        "TestObservability_ExportCrashBeforeAckDuplicates",
+        "TestObservability_ExportDoesNotTouchBusiness",
+        "TestObservability_ExportLateCommitInsideCoverage",
+        "TestObservability_ExportLedgerIdempotent",
+        "TestObservability_ExportLegacyRecoveredRowUnrecorded",
+        "TestObservability_ExportLongRunEndsAfterWindow",
+        "TestObservability_ExportMixedSignalsSeparateBatches",
+        "TestObservability_ExportNeverBackfilledHistory",
+        "TestObservability_ExportPaginationInterrupted",
+        "TestObservability_ExportPartialInvalidCount",
+        "TestObservability_ExportPartialNoRetry",
+        "TestObservability_ExportPartialSuccessBatch",
+        "TestObservability_ExportPartialSuccessCrashBeforeAck",
+        "TestObservability_ExportPartialWarningNoReject",
+        "TestObservability_ExportPendingNotEnqueued",
+        "TestObservability_ExportRecoveredLLMCall",
+        "TestObservability_ExportRecoveredOperationTerminalTime",
+        "TestObservability_ExportRecoveredToolInvocation",
+        "TestObservability_ExportRedactionCanaries",
+        "TestObservability_ExportRetentionSkipsPending",
+        "TestObservability_ExportSameTimestampPages",
+        "TestObservability_ExportStaleStateHash",
+        "TestObservability_IngestNoDocumentTitle",
+        "TestObservability_MetricDuplicateSnapshotIdempotent",
+        "TestObservability_MetricLabelsBounded",
+        "TestObservability_MetricOverlappingWindowsNotSummed",
+        "TestObservability_MetricRestartSemantics",
+        "TestObservability_MetricSnapshotEnqueued",
+        "TestObservability_MetricSnapshotPartialSuccess",
+        "TestObservability_MetricUnavailableNotZero",
+        "TestObservability_MetricWindowGaugeNotDelta",
+        "TestObservability_MissingReasonsOnlyWhenProven",
+        "TestObservability_NoMessageBody",
+        "TestObservability_NoRawErrorMessages",
+        "TestObservability_OperationNoDetailJSON",
+        "TestObservability_RedactionCanaries",
+        "TestObservability_RedactionRunFields",
+        "TestObservability_SampledOutNotNormal",
+        "TestObservability_TimelineLocalOrder",
+        "TestObservability_TimelineTruncated",
+        "TestObservability_ExampleConfigMatchesDefaults",
+        "TestObservability_LocalTechnicalMetadata",
+        "TestObservability_LegacyDiagnosticEnumsRedacted",
+        "TestObservability_RecoveryMetadataPresence",
+        "TestObservability_RetrievalAssemblyEvidence",
+        "TestObservability_OverviewOtherRunsRecentFirst",
+        "TestObservability_ConfigUnsignedOverflow"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-pg",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability|TestRecovery_NormalizePendingSetsRecoveredAt)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservabilityMigration_Applies",
+        "TestObservabilityMigration_UpgradeFromV5",
+        "TestObservabilitySchema_Enums",
+        "TestObservabilityStore_BatchAttemptUnknownCounts",
+        "TestObservabilityStore_CleanupAtomic",
+        "TestObservabilityStore_ConcurrentEnqueue",
+        "TestObservabilityStore_ExportLedger",
+        "TestObservabilityStore_OutOfOrderCommit",
+        "TestObservabilityStore_PartialBatch",
+        "TestObservabilityStore_RequestIDBridge",
+        "TestObservabilityStore_ScanCoverageBounds",
+        "TestObservabilityStore_ScanCoverageCAS",
+        "TestObservabilityStore_TimelineQueries",
+        "TestObservability_MigrationForwardOnly",
+        "TestRecovery_NormalizePendingSetsRecoveredAt",
+        "TestObservabilityStore_ExportStatusAllTerminalCounts",
+        "TestObservabilityStore_CapacityDrill",
+        "TestObservabilityStore_ExportRetryMetadata",
+        "TestObservabilityStore_SQLBoundary"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-producers",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/app",
+        "./internal/knowledge",
+        "./internal/diagnostics",
+        "-run",
+        "^(TestKnowledgeRunE2E_FilteredCount|TestObservabilityProducer_|TestDiagnosticsEnum_|TestDiagnostics_UnknownEnumReadable)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestKnowledgeRunE2E_FilteredCountInactiveVersion",
+        "TestKnowledgeRunE2E_FilteredCountMixed",
+        "TestKnowledgeRunE2E_FilteredCountProjectMismatch",
+        "TestKnowledgeRunE2E_FilteredCountSoftDeleted"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-web",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/app",
+        "./internal/web",
+        "-run",
+        "^TestObservability_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservability_APIAnchorRequired",
+        "TestObservability_APIEmptyVsError",
+        "TestObservability_APINoCanary",
+        "TestObservability_AuditFailClosedUnchanged",
+        "TestObservability_DiagnosticWriteFailureDoesNotFailRun",
+        "TestObservability_NoBusinessStateInContext",
+        "TestObservability_PermissionCallerKeyRejected",
+        "TestObservability_WiringLifecycle",
+        "TestObservability_WorkerDoesNotExecuteBusiness",
+        "TestObservability_WorkerStopsOnCancel",
+        "TestObservability_APIContract",
+        "TestObservability_APICleanupHistoryUsesExecutionTime",
+        "TestObservability_APILegacyEnumsAfterV5Upgrade"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-scenarios",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/app",
+        "-run",
+        "^TestScenario_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestScenario_EmptyRetrieval",
+        "TestScenario_ExportFailureRecovery",
+        "TestScenario_ModelTimeout",
+        "TestScenario_NormalChain",
+        "TestScenario_PermissionAndBudget",
+        "TestScenario_ToolDenied"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-console-test",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "test"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "obs-console-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "obs-schema",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservabilityMigration_.*|TestObservabilitySchema_.*|TestObservability_MigrationForwardOnly)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservabilityMigration_UpgradeFromV5",
+        "TestObservabilityMigration_Applies",
+        "TestObservabilitySchema_Enums",
+        "TestObservability_MigrationForwardOnly"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-request",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "-run",
+        "^TestObservabilityStore_RequestIDBridge$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestObservabilityStore_RequestIDBridge"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-correlation",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/diagnostics",
+        "./internal/app",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservabilityProducer_ToolCallID.*|TestDiagnosticsEnum_.*|TestDiagnostics_UnknownEnumReadable)$"
+      ],
+      "required_tests": [
+        "TestObservabilityProducer_ToolCallID",
+        "TestObservabilityProducer_ToolCallIDRedaction",
+        "TestDiagnosticsEnum_MigrationMatchesCodeAndOpenAPI",
+        "TestDiagnostics_UnknownEnumReadable"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-recovery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "-run",
+        "^TestRecovery_NormalizePendingSetsRecoveredAt$"
+      ],
+      "required_tests": [
+        "TestRecovery_NormalizePendingSetsRecoveredAt"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-timeline",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/observability",
+        "-run",
+        "^TestObservability_(Timeline.*|DisplayStepIDsStable|MissingReasonsOnlyWhenProven|SampledOutNotNormal|CleanedWindowAttribution)$"
+      ],
+      "required_tests": [
+        "TestObservability_TimelineLocalOrder",
+        "TestObservability_DisplayStepIDsStable",
+        "TestObservability_TimelineTruncated",
+        "TestObservability_MissingReasonsOnlyWhenProven",
+        "TestObservability_SampledOutNotNormal",
+        "TestObservability_CleanedWindowAttribution"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-foundation",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "./internal/app",
+        "./internal/knowledge",
+        "-run",
+        "^(TestObservability(Store_(AssemblyPresence|TimelineQueries|FixedFailureReasons)|Producer_.*|_Timeline.*|_Display.*|_Missing.*|_Sampled.*|_Cleaned.*)|TestKnowledgeRunE2E_FilteredCount.*|TestRecovery_NormalizePendingSetsRecoveredAt)$"
+      ],
+      "required_tests": [
+        "TestObservabilityStore_AssemblyPresence",
+        "TestObservabilityStore_TimelineQueries",
+        "TestObservabilityProducer_IngestStages",
+        "TestObservabilityProducer_ChunkInvalidated",
+        "TestObservabilityProducer_IndexSwitchAnchors",
+        "TestObservabilityProducer_RetrievalDecisionsAndSummary",
+        "TestObservability_TimelineAnchors",
+        "TestObservability_TimelineLocalOrder",
+        "TestObservability_DisplayStepIDsStable",
+        "TestObservability_TimelineTruncated",
+        "TestObservability_MissingReasonsOnlyWhenProven",
+        "TestObservability_SampledOutNotNormal",
+        "TestObservability_CleanedWindowAttribution",
+        "TestKnowledgeRunE2E_FilteredCountProjectMismatch",
+        "TestKnowledgeRunE2E_FilteredCountSoftDeleted",
+        "TestKnowledgeRunE2E_FilteredCountInactiveVersion",
+        "TestKnowledgeRunE2E_FilteredCountMixed",
+        "TestRecovery_NormalizePendingSetsRecoveredAt",
+        "TestObservability_TimelineOverlappingRunsPrefix",
+        "TestObservability_TimelineAssemblyCleanupGap",
+        "TestObservabilityStore_FixedFailureReasons"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-context",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/observability",
+        "-run",
+        "^TestObservability_(Context.*|Overview.*)$"
+      ],
+      "required_tests": [
+        "TestObservability_ContextFilteredNoIdentity",
+        "TestObservability_ContextFilteredReasonNotDirect",
+        "TestObservability_ContextBudgetVsRankCut",
+        "TestObservability_ContextNeedsOutputCheck",
+        "TestObservability_ContextReadFailuresAndMissing",
+        "TestObservability_OverviewGroupsAndEmpty"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-health",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "./internal/app",
+        "-run",
+        "^(TestObservability_(Metric.*|Alert.*)|TestObservabilityStore_(MetricWindows|Alert.*|AuditFailureMetrics|AtomicManagementAuditFailureObserved)|TestObservabilityProducer_(DiagnosticMetricOutcomes|AuditFailureMetricsFailClosed|MetricCallbackPanicIsolated))$"
+      ],
+      "required_tests": [
+        "TestObservability_MetricLabelsBounded",
+        "TestObservability_MetricRestartSemantics",
+        "TestObservability_MetricWindowGaugeNotDelta",
+        "TestObservability_MetricUnavailableNotZero",
+        "TestObservability_AlertTriggerRecovery",
+        "TestObservability_AlertUnknownOnStoreFailure",
+        "TestObservability_AlertAuditEvidence",
+        "TestObservability_AlertToolDenialExcludesRetrieval",
+        "TestObservabilityStore_MetricWindows",
+        "TestObservabilityStore_AlertPersistence",
+        "TestObservabilityStore_AlertToolDenialSource",
+        "TestObservabilityStore_AuditFailureMetrics",
+        "TestObservabilityProducer_DiagnosticMetricOutcomes",
+        "TestObservabilityProducer_AuditFailureMetricsFailClosed",
+        "TestObservabilityProducer_MetricCallbackPanicIsolated",
+        "TestObservabilityStore_AtomicManagementAuditFailureObserved"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-audit-regression",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestResourceStore_|TestManagementStore_|TestAgentAdminStore_)"
+      ],
+      "required_tests": [
+        "TestAgentAdminStore_InsertArchiveFinishesOperation",
+        "TestManagementStore_FinishOperationWritesTerminalState",
+        "TestResourceStore_PublishUpsertsPointer"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-ledger",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/storage/postgres",
+        "./internal/observability",
+        "-run",
+        "^(TestObservabilityStore_ExportLedger|TestObservabilityStore_ConcurrentEnqueue|TestObservabilityStore_BatchAttemptUnknownCounts|TestObservabilityStore_PartialBatch|TestObservabilityStore_ExportLeaseFencing|TestObservabilityStore_ExportAckAtomic|TestObservability_SendResultClassification|TestObservabilityStore_ProtocolConflictNullCounts|TestObservabilityStore_BatchMembersAtomic)$"
+      ],
+      "required_tests": [
+        "TestObservabilityStore_ExportLedger",
+        "TestObservabilityStore_ConcurrentEnqueue",
+        "TestObservabilityStore_BatchAttemptUnknownCounts",
+        "TestObservabilityStore_PartialBatch",
+        "TestObservabilityStore_ExportLeaseFencing",
+        "TestObservabilityStore_ExportAckAtomic",
+        "TestObservability_SendResultClassification",
+        "TestObservabilityStore_ProtocolConflictNullCounts",
+        "TestObservabilityStore_BatchMembersAtomic"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-scan",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability_ExportLongRunEndsAfterWindow|TestObservability_ExportNeverBackfilledHistory|TestObservability_ExportLateCommitInsideCoverage|TestObservability_ExportPaginationInterrupted|TestObservability_ExportSameTimestampPages|TestObservabilityStore_ScanCoverageBounds|TestObservabilityStore_ScanCoverageCAS|TestObservabilityStore_OutOfOrderCommit|TestObservabilityStore_ScanSameTimestampPages|TestObservabilityStore_ScanPageFailureKeepsCoverage|TestObservabilityStore_ScanRecoveryUnknown|TestObservabilityStore_ScanRemainingSources)$"
+      ],
+      "required_tests": [
+        "TestObservability_ExportLongRunEndsAfterWindow",
+        "TestObservability_ExportNeverBackfilledHistory",
+        "TestObservability_ExportLateCommitInsideCoverage",
+        "TestObservability_ExportPaginationInterrupted",
+        "TestObservability_ExportSameTimestampPages",
+        "TestObservabilityStore_ScanCoverageBounds",
+        "TestObservabilityStore_ScanCoverageCAS",
+        "TestObservabilityStore_OutOfOrderCommit",
+        "TestObservabilityStore_ScanSameTimestampPages",
+        "TestObservabilityStore_ScanPageFailureKeepsCoverage",
+        "TestObservabilityStore_ScanRecoveryUnknown",
+        "TestObservabilityStore_ScanRemainingSources"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-map",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability_ExportRecoveredLLMCall|TestObservability_ExportRecoveredToolInvocation|TestObservability_ExportLegacyRecoveredRowUnrecorded|TestObservability_ExportEndProvenanceAndIDs|TestObservability_ExportMappingErrorIsolated|TestObservability_ExportRedactionCanaries|TestObservability_ExportUnknownWithRecordedToolEnd|TestObservability_ExportHashUsesAllowedFields|TestObservability_ExportAllSourceMappings|TestObservability_ExportMetricHistogramAndGauge|TestObservability_ExportMetricZeroSeedsPreserved|TestObservability_ExportRecoveredOperationTerminalTime|TestObservabilityStore_ScanRecoveryUnknown|TestRecovery_NormalizePendingSetsRecoveredAt|TestObservability_ExportIngestFailureClasses)$"
+      ],
+      "required_tests": [
+        "TestObservability_ExportRecoveredLLMCall",
+        "TestObservability_ExportRecoveredToolInvocation",
+        "TestObservability_ExportLegacyRecoveredRowUnrecorded",
+        "TestObservability_ExportEndProvenanceAndIDs",
+        "TestObservability_ExportMappingErrorIsolated",
+        "TestObservability_ExportRedactionCanaries",
+        "TestObservability_ExportUnknownWithRecordedToolEnd",
+        "TestObservability_ExportHashUsesAllowedFields",
+        "TestObservability_ExportAllSourceMappings",
+        "TestObservability_ExportMetricHistogramAndGauge",
+        "TestObservability_ExportMetricZeroSeedsPreserved",
+        "TestObservability_ExportRecoveredOperationTerminalTime",
+        "TestObservabilityStore_ScanRecoveryUnknown",
+        "TestRecovery_NormalizePendingSetsRecoveredAt",
+        "TestObservability_ExportIngestFailureClasses"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-worker",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability_ExportPartialSuccessBatch|TestObservability_ExportPartialNoRetry|TestObservability_ExportPartialWarningNoReject|TestObservability_ExportPartialInvalidCount|TestObservability_ExportCrashBeforeAckDuplicates|TestObservability_ExportPartialSuccessCrashBeforeAck|TestObservability_ExportStaleStateHash|TestObservability_ExportAttemptBeforeNetwork|TestObservability_ExportDoesNotTouchBusiness|TestObservability_ExportMixedSignalsSeparateBatches|TestObservability_ExportLedgerIdempotent|TestObservability_ExportRetryBudget|TestObservability_ExportReadFailureNotPermanent|TestObservability_ExportMappingFailureDoesNotBlockGoodItem|TestObservability_ExportPendingNotEnqueued|TestObservabilityStore_WorkerCrashAckWindow|TestObservabilityStore_WorkerThreeSignals)$"
+      ],
+      "required_tests": [
+        "TestObservability_ExportPartialSuccessBatch",
+        "TestObservability_ExportPartialNoRetry",
+        "TestObservability_ExportPartialWarningNoReject",
+        "TestObservability_ExportPartialInvalidCount",
+        "TestObservability_ExportCrashBeforeAckDuplicates",
+        "TestObservability_ExportPartialSuccessCrashBeforeAck",
+        "TestObservability_ExportStaleStateHash",
+        "TestObservability_ExportAttemptBeforeNetwork",
+        "TestObservability_ExportDoesNotTouchBusiness",
+        "TestObservability_ExportMixedSignalsSeparateBatches",
+        "TestObservability_ExportLedgerIdempotent",
+        "TestObservability_ExportRetryBudget",
+        "TestObservability_ExportReadFailureNotPermanent",
+        "TestObservability_ExportMappingFailureDoesNotBlockGoodItem",
+        "TestObservability_ExportPendingNotEnqueued",
+        "TestObservabilityStore_WorkerCrashAckWindow",
+        "TestObservabilityStore_WorkerThreeSignals"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-otlp",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/app",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability_MetricSnapshotEnqueued|TestObservability_MetricDuplicateSnapshotIdempotent|TestObservability_MetricEnqueueRetryKeepsOriginal|TestObservability_MetricSnapshotPartialSuccess|TestObservability_MetricOverlappingWindowsNotSummed|TestObservability_OTLPThreeSignalResponses|TestObservability_OTLPHTTPFailureClasses|TestObservability_OTLPBoundedResponse|TestObservability_OTLPConfigRejectsUnsafe|TestObservability_OTLPCumulativeAndWindowShapes|TestObservabilityStore_MetricSnapshotReplay|TestObservability_OTLPEnvironmentProxyIgnored)$"
+      ],
+      "required_tests": [
+        "TestObservability_MetricSnapshotEnqueued",
+        "TestObservability_MetricDuplicateSnapshotIdempotent",
+        "TestObservability_MetricEnqueueRetryKeepsOriginal",
+        "TestObservability_MetricSnapshotPartialSuccess",
+        "TestObservability_MetricOverlappingWindowsNotSummed",
+        "TestObservability_OTLPThreeSignalResponses",
+        "TestObservability_OTLPHTTPFailureClasses",
+        "TestObservability_OTLPBoundedResponse",
+        "TestObservability_OTLPConfigRejectsUnsafe",
+        "TestObservability_OTLPCumulativeAndWindowShapes",
+        "TestObservabilityStore_MetricSnapshotReplay",
+        "TestObservability_OTLPEnvironmentProxyIgnored"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-cleanup",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/observability",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestObservability_CleanupDisabled|TestObservability_CleanupBatches|TestObservability_CleanupSkipsUncoveredWindow|TestObservability_CleanupBeforeScanDoesNotDelete|TestObservability_CleanupNeverBackfilledNotDeleted|TestObservability_CleanupRestart|TestObservability_CleanupRequiresConfirmedExport|TestObservability_CleanupEnabledShortRetention|TestObservability_CleanupLedgerAtomic|TestObservability_CleanupExportConflict|TestObservability_ExportRetentionSkipsPending|TestObservability_CleanupEvidenceGap|TestObservabilityStore_CleanupAtomic|TestObservabilityStore_CleanupRequiresConfirmedExport|TestObservabilityStore_CleanupBeforeCoverage|TestObservabilityStore_CleanupSentWithUnresolved|TestObservabilityStore_CleanupPaginationProtectedRows|TestObservabilityStore_CleanupGlobalBacklog|TestObservabilityStore_CleanupAlertRecoveryEvidence|TestObservabilityStore_CleanupOtherGroups|TestObservabilityStore_AlertMetadataUnixEpoch|TestObservabilityStore_CleanupProgressAcrossRuns|TestObservabilityStore_CleanupBatchHistory|TestObservabilityStore_AlertPersistence)$"
+      ],
+      "required_tests": [
+        "TestObservability_CleanupDisabled",
+        "TestObservability_CleanupBatches",
+        "TestObservability_CleanupSkipsUncoveredWindow",
+        "TestObservability_CleanupBeforeScanDoesNotDelete",
+        "TestObservability_CleanupNeverBackfilledNotDeleted",
+        "TestObservability_CleanupRestart",
+        "TestObservability_CleanupRequiresConfirmedExport",
+        "TestObservability_CleanupEnabledShortRetention",
+        "TestObservability_CleanupLedgerAtomic",
+        "TestObservability_CleanupExportConflict",
+        "TestObservability_ExportRetentionSkipsPending",
+        "TestObservability_CleanupEvidenceGap",
+        "TestObservabilityStore_CleanupAtomic",
+        "TestObservabilityStore_CleanupRequiresConfirmedExport",
+        "TestObservabilityStore_CleanupBeforeCoverage",
+        "TestObservabilityStore_CleanupSentWithUnresolved",
+        "TestObservabilityStore_CleanupPaginationProtectedRows",
+        "TestObservabilityStore_CleanupGlobalBacklog",
+        "TestObservabilityStore_CleanupAlertRecoveryEvidence",
+        "TestObservabilityStore_CleanupOtherGroups",
+        "TestObservabilityStore_AlertMetadataUnixEpoch",
+        "TestObservabilityStore_CleanupProgressAcrossRuns",
+        "TestObservabilityStore_CleanupBatchHistory",
+        "TestObservabilityStore_AlertPersistence"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-wiring",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/app",
+        "./internal/web",
+        "./internal/cli",
+        "./internal/observability",
+        "-run",
+        "^(TestObservability_ConfigDefaults|TestObservability_ConfigExplicitAndSecrets|TestObservability_ConfigRejectsInvalid|TestObservability_ExportConfigRedacted|TestObservability_ConfigHeaderAndBounds|TestObservability_ConfigProtectsHistoryWindow|TestObservability_WiringLifecycle|TestObservability_WorkerStopsOnCancel|TestObservability_WorkerDoesNotExecuteBusiness|TestObservability_NoBusinessStateInContext|TestObservability_DiagnosticWriteFailureDoesNotFailRun|TestObservability_AuditFailClosedUnchanged|TestObservability_ProductionPortsShareCollector|TestObservability_ConfigurationFrozen|TestObservability_ClockMatchesWindow|TestObservability_ServerOwnsLifecycle|TestObservability_MetricWindowUsesCollectedAt|TestWire_HeavyPathStepsAppearInOrder|TestWire_PortsReachRunEntryAndSessionStore|TestWire_CloseReleasesInstanceLockLast)$"
+      ],
+      "required_tests": [
+        "TestObservability_ConfigDefaults",
+        "TestObservability_ConfigExplicitAndSecrets",
+        "TestObservability_ConfigRejectsInvalid",
+        "TestObservability_ExportConfigRedacted",
+        "TestObservability_ConfigHeaderAndBounds",
+        "TestObservability_ConfigProtectsHistoryWindow",
+        "TestObservability_WiringLifecycle",
+        "TestObservability_WorkerStopsOnCancel",
+        "TestObservability_WorkerDoesNotExecuteBusiness",
+        "TestObservability_NoBusinessStateInContext",
+        "TestObservability_DiagnosticWriteFailureDoesNotFailRun",
+        "TestObservability_AuditFailClosedUnchanged",
+        "TestObservability_ProductionPortsShareCollector",
+        "TestObservability_ConfigurationFrozen",
+        "TestObservability_ClockMatchesWindow",
+        "TestObservability_ServerOwnsLifecycle",
+        "TestObservability_MetricWindowUsesCollectedAt",
+        "TestWire_HeavyPathStepsAppearInOrder",
+        "TestWire_PortsReachRunEntryAndSessionStore",
+        "TestWire_CloseReleasesInstanceLockLast"
+      ],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "obs-collector",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration obscollector",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^TestCollector_US16AProductThreeSignals$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestCollector_US16AProductThreeSignals",
+        "TestCollector_US16AProductThreeSignals/protobuf",
+        "TestCollector_US16AProductThreeSignals/json"
+      ],
+      "level": "external"
+    },
+    {
+      "id": "obs-sampler",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/diagnostics",
+        "-run",
+        "^TestRateSampler_EntropyFailureDropsDiagnostic$"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestRateSampler_EntropyFailureDropsDiagnostic"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-core",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "-run",
+        "TestPrincipal_|TestOwnedPrincipal_|TestRunRequest_CarriesPrincipalExplicitly",
+        "./internal/core/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestPrincipal_ZeroValueIsInvalid",
+        "TestPrincipal_ZeroValueRejected",
+        "TestPrincipal_LocalAdminIsBuiltin",
+        "TestPrincipal_CallerShapeValidation",
+        "TestPrincipal_HasScopeAndAgentScope",
+        "TestOwnedPrincipal_KeepsCallerKeyOwner",
+        "TestOwnedPrincipal_AdminBuiltinKeepsActor",
+        "TestOwnedPrincipal_RejectsWithReason",
+        "TestOwnedPrincipal_CopiesScopes",
+        "TestRunRequest_CarriesPrincipalExplicitly"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-diagnostics",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "./internal/diagnostics/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestDiagnostics_ContractFields",
+        "TestDiagnostics_CorrelationRequiresMainAnchor",
+        "TestDiagnostics_EventValidate",
+        "TestDiagnostics_DeniedItemsLeakNoTitles",
+        "TestNewEventID_UlidLayout",
+        "TestNewEventID_UniqueWithinSameMillisecond",
+        "TestNewEventID_RejectsUnrepresentableTime",
+        "TestValidateEventID_Rejects",
+        "TestRedact_URLKeepsSchemeHostOnly",
+        "TestRedact_DropsUnknownNonScalarAndSensitiveKeys",
+        "TestRedact_SensitiveKeyFragments",
+        "TestRedact_IsIdempotentAndNeverMutates",
+        "TestRedact_NilRedactorStillRedacts",
+        "TestAuditRef_RoundTrip",
+        "TestDiagnostics_LeakScanEventPayload",
+        "TestDiagnostics_LeakScanAttrsWhitelist",
+        "TestDiagnostics_LeakScanAuditRef",
+        "TestDiagnostics_LeakScanReadPath",
+        "ExampleNewEventID"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-callers",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "./internal/callers/"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestAuthenticator_AdminTokenReturnsLocalAdminPrincipal",
+        "TestAuthenticator_AdminTokenNotConfiguredNeverGrantsAdmin",
+        "TestAuthenticator_CallerKeyResolvesPrincipal",
+        "TestAuthenticator_UsesFingerprintOnly",
+        "TestAuthenticator_ExpiryBoundary",
+        "TestAuthenticator_RejectsIndistinguishably",
+        "TestAuthenticator_NoAdminEnabledAccessor",
+        "TestParseScopeSet_ValidatesAndDeduplicates",
+        "TestKeySecret_FormatShape",
+        "TestKeyIssuerIssue_PersistsFingerprintAndPrefixOnly",
+        "TestKeyIssuerIssue_RecordsExpiryInMilliseconds",
+        "TestKeyIssuerIssue_RefusesWhenPreWriteFails",
+        "TestKeyIssuerIssue_AbortsOnEntropyFailure",
+        "TestKeyIssuerIssue_RefusesWithoutPorts",
+        "TestKeyIssuerIssue_RejectsEmptyCallerWithoutPending",
+        "TestKeyIssuerIssue_FinishFailureKeepsIssuedKey",
+        "TestKeyIssuerRevoke_LooksUpBeforePreWrite",
+        "TestKeyIssuerRevoke_IsIdempotentAndLeavesBindings",
+        "TestKeyIssuerRevoke_StoreFailureFinishesAsFailed",
+        "TestKeyIssuerRotate_RejectsCallerMismatch",
+        "TestKeyIssuerRotate_RequiresActiveOldKey",
+        "TestKeyIssuerRotate_PassesRebindOptionAndReportsLeftBound",
+        "TestKeyIssuerRotate_FailureFinishesAsFailed",
+        "TestRateBucket_BurstThenRefill",
+        "TestRateBucket_PerCallerAndClassIsolation",
+        "TestRateBucket_ZeroBudgetDeniesAll",
+        "TestRateBucket_ConcurrentAllowStaysWithinBurst",
+        "TestNewRateBucket_RejectsNegativeBudgets",
+        "TestAdmitIngress_ChargesOnceAndRejectsOverLimit",
+        "TestAdmitIngress_RejectsInvalidPrincipalBeforeBucket",
+        "TestAdmitIngress_UnknownClassAndMissingPortFailClosed",
+        "TestAdmitIngress_ContextCanceled",
+        "TestMemoryConcurrency_AcquireRespectsLimitAndRelease",
+        "TestMemoryConcurrency_IsolatesCallers",
+        "TestMemoryConcurrency_ZeroMissingAndNegativeLimits",
+        "TestMemoryConcurrency_CanceledAndTimedOutAcquireTakeNoSlot",
+        "TestMemoryConcurrency_ReleaseAtZeroDoesNotGoNegative",
+        "TestNewMemoryConcurrency_RejectsNilLimitSource",
+        "TestLimiterAdmitRun_TakesOneSlotPerRun",
+        "TestLimiterAdmitRun_RejectsInvalidPrincipalAndMissingPort",
+        "TestLimiterReleaseRun_IsIdempotent",
+        "TestLimiterReleaseRun_ReleasesUnderCanceledContextAndPanic",
+        "TestLimiterReleaseRun_RejectsZeroTicketAndCallerMismatch",
+        "TestLimiterAdmitIngress_DenialDoesNotTakeRunSlot",
+        "TestAuditWriter_BeginPreWritesPendingRecord",
+        "TestAuditWriter_BeginRefusesWhenStoreFails",
+        "TestAuditWriter_BeginRejectsUnmarshalableDetail",
+        "TestAuditWriter_FinishSurvivesCanceledRequest",
+        "TestAuditWriter_FinishKeepsTerminalRowOnUnmarshalableDetail",
+        "TestAuditWriter_FinishFailureDoesNotPropagate",
+        "TestQuota_ReservationStatusClosedSet",
+        "TestCallerAdmin_ListCallersReadsWithoutAudit",
+        "TestCallerAdmin_RevokeKeyReturnsTerminalRowAndFallsBackOnReadFailure",
+        "TestCallerAdmin_KindAndStatusClosedSets"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-web",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "./internal/web/"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestContract_ErrorCodes",
+        "TestContract_ErrorMappingByType",
+        "TestContract_RunErrorUnauthorizedNotTextMatched",
+        "TestContract_QuotaExhaustedRetryAfter",
+        "TestContractAdmin_NewErrorCodes",
+        "TestErrorCodeMessage_NewCodesHaveFixedChineseCopy",
+        "TestErrorCodeMessage_UnknownCodeKeepsCode",
+        "TestBusinessAuth_MissingCredentialIsUnauthorized",
+        "TestBusinessAuth_InvalidCredentialFailsClosed",
+        "TestBusinessAuth_AdminTokenMapsToLocalAdmin",
+        "TestBusinessAuth_CallerKeyReachesHandlers",
+        "TestBusinessAuth_ScopeDefaultDeny",
+        "TestBusinessAuth_CrossCallerSessionNotFound",
+        "TestBusinessAuth_CreateSessionCrossCallerNotFound",
+        "TestBusinessAuth_ManagementSurfaceRejectsCallerKey",
+        "TestBusinessAuth_LocalTrustModeStillRequiresCredential",
+        "TestBusinessAuth_RouteTableDeclaresScopes",
+        "TestIngressMiddleware_ChargesBusinessRequestOnce",
+        "TestIngressMiddleware_RateLimitedReturns429WithRetryAfter",
+        "TestIngressMiddleware_AdminTokenNeverCharged",
+        "TestIngressMiddleware_UnauthenticatedNeverCharged",
+        "TestIngressMiddleware_ScopeDeniedChargesCallerBucket",
+        "TestIngressMiddleware_RateLimitPrecedesScopeDenial",
+        "TestIngressMiddleware_CrossCallerBucketIsolation",
+        "TestIngressMiddleware_RateLimitDoesNotRevealResourceExistence",
+        "TestIngressMiddleware_GateErrorFailsClosed",
+        "TestIngressMiddleware_RealLimiterDeniesSecondBurstRequest",
+        "TestIngressDenial_RequestIDIsServerGenerated",
+        "TestDiagnostics_RequestIDAnchor",
+        "TestDiagnostics_RequestIDShapeDeniedWithoutEcho",
+        "TestDiagnostics_RequestIDEmptyIsNoAnchor",
+        "TestDiagnostics_AuthBoundaryNeverReachesPort",
+        "TestDiagnostics_EmptyPageUnderSamplingReportsSampledOut",
+        "TestIngressRoutes_BusinessRowsDeclareClass",
+        "TestIngressRoutes_MappingRequiredAtStartup",
+        "TestIngressServer_RequiresGateWithAuthGuard",
+        "TestAdminPosture_InvalidConfigFailsStartup",
+        "TestAdminPosture_TokenModeRequiresResolvedToken",
+        "TestHistory_SearchValidatesShapeBeforePort",
+        "TestHistory_SearchPassesQueryThroughPort",
+        "TestHistory_SearchMapsDomainErrors",
+        "TestHistory_SearchMissingPortFailsClosed",
+        "TestHistory_SearchResultShape",
+        "TestHistory_ReadMessageMapsDomainErrors",
+        "TestHistory_ReadMessageCrossCallerIsNotFoundNotForbidden",
+        "TestHistory_ReadMessageRequiresSessionsReadScope",
+        "TestHistory_ReadMessageAnnotatesEvidenceValidity",
+        "TestHistory_ReadMessageValidityDenialBecomesRevoked",
+        "TestHistory_ReadMessageValidityStoreViolationFailsClosed",
+        "TestHistory_ReadMessageWithoutRefsNeedsNoValidityPort",
+        "TestHistory_ReadMessageWithRefsNeedsValidityPort",
+        "TestHistory_ReadMessageMissingPortFailsClosed",
+        "TestSessions_QueryListForcedCallerFilter",
+        "TestSessions_QueryListAdminSpansCallers",
+        "TestSessions_QueryListOwnerlessCallerDenied",
+        "TestCompactions_RequiresExactlyOneScope",
+        "TestCompactions_LimitBoundsBeforePort",
+        "TestCompactions_MissingPortFailsClosed",
+        "TestCompactions_StoreErrorFailsClosed",
+        "TestCompactions_ProjectsCurrentChain",
+        "TestCompactions_EmptyChainIsExplicit",
+        "TestCompactions_ManagementSurfaceRejectsCallerKey",
+        "TestOpenAPI_CompactionViewMatchesContract",
+        "TestAgentRejectMessage_TypedKindsBecomeChinese",
+        "TestAgentRejectMessage_CoversEveryDefinedKind",
+        "TestAgentReadiness_RejectFixRoutes",
+        "TestContractAdmin_BusinessRouteTableMatchesOpenAPI",
+        "TestIngressDenial_RecordsRequestAnchoredEvent",
+        "TestIngressDenial_SkipsWithoutAnchorOrWriter",
+        "TestRequestText_RejectsUnstorableQueryAndPath",
+        "TestRequestText_ValidUTF8StillPasses",
+        "TestRequestText_AdminFaceRejectsAfterAuth",
+        "TestRequestText_RateLimitPrecedesShapeCheck",
+        "TestRequestText_ScopePrecedesShapeCheck",
+        "TestRequestText_PublicAndFallbackUntouched"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-wiring",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "./internal/app/..."
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestCompactionWiring_StatelessRunReadsRunHistory",
+        "TestCompactionWiring_BuildUsesBudgetSnapshot",
+        "TestCompactionWiring_FallbackFiltersRevokedSources",
+        "TestCompactionWiring_FilterUsesRunPrincipal",
+        "TestCompactionWiring_FilterRejectsZeroPrincipal",
+        "TestCompactionWiring_ConcurrentRunsKeepPrincipal",
+        "TestCompactionWiring_AssistantDerivedRefsPersisted",
+        "TestCompactionWiring_RevokedSourceNotSentAsToolOrParaphrase",
+        "TestCompactionWiring_AuditRefsDoNotPropagateToAssistant",
+        "TestDiagnostics_ReadRequiresAdminAuth",
+        "TestRegistryEntriesWithKnowledgeCollections_DemotesMissing",
+        "TestRegistryEntriesWithKnowledgeCollections_FailsClosed",
+        "TestRegistrySync_RetiresAgentWithoutKnowledgeCollection",
+        "TestRegistrySync_CollectionLookupFailureKeepsOldRegistry",
+        "TestDiagnosticProviderClient_LLMCallFailureCarriesReason",
+        "TestDiagnosticProviderClient_LLMCallSuccessHasNoReason",
+        "TestDiagnosticProviderClient_SkipsWithoutRunID",
+        "TestDiagnosticProviderClient_NilRecorderKeepsInnerClient",
+        "TestToolDiagAdapter_CallCarriesAuditReference",
+        "TestToolDiagAdapter_CallWithoutAuditRowHasNoReference",
+        "TestToolDiagAdapter_DeniedRecordsPermissionDecision",
+        "TestToolDiagAdapter_DropsUnknownShapeAndMissingAnchor",
+        "TestQuotaDecision_SplitsVerdictFromReason",
+        "TestChatQuota_RecordsVerdictOnTheCallPath",
+        "TestKnowledgeIngestQuotaAdapter_AllowAnchorsOnJob",
+        "TestKnowledgeIngestQuotaAdapter_DenyMapsReasons",
+        "TestKnowledgeIngestQuotaAdapter_DropsUnknownLiterals",
+        "TestNewKnowledgeIngestQuotaAdapter_NilWhenUnwired",
+        "TestIngressLimitCache_CachesUntilTTL",
+        "TestIngressLimitCache_ReadFailureIsNotCached",
+        "TestIngressLimitCache_MissingRowIsNoOverride",
+        "TestIngressLimitCache_UnconfiguredReaderFailsClosed",
+        "TestIngressLimitCache_ConcurrentOverridesAreSafe",
+        "TestCallerRateLimit_WiresOverrideIntoIngressAdmission",
+        "TestRunQuota_ChargesOneTaskUnderRunAdmitKey",
+        "TestRunQuota_ReserveFailurePassesSentinelThrough",
+        "TestRunQuota_UnlimitedAdminLeavesNoReservation",
+        "TestRunQuota_SettleUnknownKeepsReservationWithoutRelease",
+        "TestRunQuota_TerminalReservationFailsClosed",
+        "TestRunQuota_RecordsVerdict",
+        "TestRunQuota_NilLimiterIsNotWired",
+        "TestQuotaDecision_RequestAnchorFallback",
+        "TestRunAdmission_DenialRecordsRequestAnchoredEvent"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-pg",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-race",
+        "-tags=integration",
+        "./internal/storage/postgres/...",
+        "./internal/core/...",
+        "./internal/callers/...",
+        "./internal/memory/...",
+        "./internal/knowledge/...",
+        "./internal/history/...",
+        "./internal/web/...",
+        "./internal/app/..."
+      ],
+      "timeout_seconds": 1800,
+      "required_tests": [
+        "TestQuota_ReserveIsAtomicUnderConcurrency",
+        "TestQuota_MultipleCallsPerRunHaveDistinctKeys",
+        "TestQuota_IdempotentRetryNotDoubleCharged",
+        "TestQuota_IdempotencyKeyConflictRejected",
+        "TestQuota_CommitAfterPeriodRolloverUsesReservationPeriod",
+        "TestQuota_OverageBlocksNextReserve",
+        "TestQuota_ClearOverageResumesReserve",
+        "TestQuota_AuditFailureReleasesReservation",
+        "TestQuota_CrossCallerReservationRejected",
+        "TestQuota_MultiKeySharedAccountLimit",
+        "TestQuota_EmbeddingRetryAfterTimeoutGetsNewKey",
+        "TestQuota_LocalAdminUnlimitedNoReservation",
+        "TestQuota_StorageFailureRejectsNewRun",
+        "TestCallerRateLimit_AppliesPerCallerQPSFromLimitRow",
+        "TestRunQuota_LimitReachedRefusesNewTask",
+        "TestRunQuota_DuplicateRunRequestChargedOnce",
+        "TestRunQuota_CrashRecoverySettlesPendingWithoutBypass",
+        "TestRunQuota_ZeroLimitFailsClosed",
+        "TestTx_UnknownReservationCommitRefusesRun",
+        "TestAPIKey_NoPlaintextAtRestAndRevoke",
+        "TestPrincipal_ZeroValueRejected",
+        "TestScope_DefaultDeny",
+        "TestSession_CrossCallerNotFound",
+        "TestRun_CrossCallerSessionNotFound",
+        "TestManagement_RejectsCallerKey",
+        "TestKeyIssuer_RejectsAdminAndWildcardScopes",
+        "TestRun_CancelCrossCallerNotFound",
+        "TestHistory_ExactReadCrossCallerNotFound",
+        "TestAssembly_HistoryTrimRecordsDroppedGroups",
+        "TestAuthz_RefusesWhenNoCollectionVisible",
+        "TestAuthz_NarrowsToVisibleSubsetAndCountsDenied",
+        "TestAuthz_RefusesDisabledOrUnknownCaller",
+        "TestAuthz_RefusesCallerWithoutReadScope",
+        "TestAuthz_RefusesAgentOnlyRequest",
+        "TestAuthz_RefusesCollectionsOfAnotherProject",
+        "TestAuthz_RefusesInvalidPrincipalBeforeQuery",
+        "TestIndexVector_WriteConvergesOnRetry",
+        "TestIndexVector_WriteRefusesForeignChunks",
+        "TestIndexVector_WriteRefusesBadShape",
+        "TestIndexVector_ActivateRequiresCompleteVectors",
+        "TestIndexVector_ActivateSwitchesGeneration",
+        "TestIndexVector_RetireUsesBoundGeneration",
+        "TestIndexVector_RetireRefusesActiveGeneration",
+        "TestSourceView_SupersededVersionNotMasqueraded",
+        "TestSourceView_RequiresPrincipalAndScopesByCaller",
+        "TestHistorySearch_ResultsArePointersNotCitations",
+        "TestIngest_NewVersionInvisibleUntilIndexed",
+        "TestDiagnostics_WriteFailureDoesNotBlockRun",
+        "TestDiagnostics_MissingFlagWhenNoRecords",
+        "TestDiagnostics_ReadFiltersByCorrelation",
+        "TestAudit_WriteFailureBlocksCall",
+        "TestScheduler_ExecutionKeepsTaskOwner",
+        "TestRecovery_PreservesRunCaller",
+        "TestRecovery_RevokedOwnerFailsClosed",
+        "TestAudit_ActorDistinctFromOwner",
+        "TestRecovery_RevokedAuthorizingKeyNotSubstituted",
+        "TestScheduler_RevokedAuthorizingKeyFailsClosed",
+        "TestKeyRotation_RebindsEligibleScheduledTasks",
+        "TestKeyRotation_LeavesIneligibleTasksBoundToRevokedKey",
+        "TestScheduler_AdminBuiltinTaskRuns",
+        "TestScheduler_AdminBuiltinRunsUnderBothAuthModes",
+        "TestScheduler_LocalTrustNotTreatedAsDisabled",
+        "TestScheduler_AdminBuiltinRefusedWhenAdminUnavailable",
+        "TestScheduler_AdminBuiltForCallerBindsCallerKey",
+        "TestScheduler_CallerKeyTaskDoesNotBorrowAdmin",
+        "TestScheduler_LegacyMigratedTaskIsAdminBuiltin",
+        "TestAdminPosture_InvalidConfigFailsStartup",
+        "TestAdminPosture_TokenModeRequiresResolvedToken",
+        "TestRecovery_AdminBuiltinRunUsesAdminPrincipal",
+        "TestIngress_HTTPIngestRateLimited",
+        "TestIngress_InternalCallsDoNotRecharge",
+        "TestIngress_SchedulerBypassesIngressBucket",
+        "TestIngress_RateDeniedDoesNotTakeRunSlot",
+        "TestRunService_QuotaDeniedReleasesRunSlot",
+        "TestRunService_UnknownUsageReleasesRunSlot",
+        "TestRunService_SessionRejectedReleasesRunSlot",
+        "TestRunService_CancelReleasesRunSlot",
+        "TestRunService_PanicReleasesRunSlot",
+        "TestLimiter_MultipleCallsShareOneRunSlot",
+        "TestStartup_FailsClosedWithoutPostgres",
+        "TestApp_SupportedVersionInjectedPerBackend",
+        "TestPostgres_FreshSchemaIsV1",
+        "TestServe_RejectsStorageBackendSwitch",
+        "TestServe_DoesNotOpenSQLite",
+        "TestPostgres_MigrateTakesAdvisoryLock",
+        "TestMarkFirstWrite_RolledBackWithBusinessTx",
+        "TestMarkFirstWrite_ProvablyNotSentRetries",
+        "TestMarkFirstWrite_AckLostIsUnknown",
+        "TestMarkFirstWrite_OnlyCurrentCutover",
+        "TestMarkFirstWrite_UnixMillis",
+        "TestMarkFirstWrite_IdempotentAfterRestart",
+        "TestTx_ServerCommitErrorIsRolledBack",
+        "TestTx_CommitAckLostVerifyReadsCommittedRow",
+        "TestTx_VerifyBeforeCommitCompletesIsPending",
+        "TestTx_VerifyAbortedIsAbsent",
+        "TestTx_VerifyCommittedButRowMissingIsInconsistent",
+        "TestTx_VerifyReadsPrimaryOnly",
+        "TestTx_UnknownRetryDoesNotDuplicateBusinessRow",
+        "TestMemory_InjectionUsesLoadNotQuery",
+        "TestMemory_RunFrozenSnapshot",
+        "TestMemory_PermissionStillCheckedAfterFreeze",
+        "TestMemory_NoAutoProposeAtRunEnd",
+        "TestCompactionStore_SameCoverageRebuildAfterStale",
+        "TestCompactionStore_RecoveryReusesCommittedWithoutSummaryCall",
+        "TestMessageEvidence_WrittenInSameTransaction",
+        "TestCompactionStore_AppendSerializesPerScope",
+        "TestCompactionStore_RestartWithChangedCutWaitsThenRebases",
+        "TestCompactionStore_MarkStaleCascadesDescendants",
+        "TestCompactionStore_RebuildRootAfterStaleChain",
+        "TestCompactionStore_CommittedDescendantOfStaleIsNotHead",
+        "TestCompactionStore_MiddleStaleKeepsEpochOpen",
+        "TestPGTest_IsolationUnderParallel",
+        "TestPGTest_RejectsNonTestDatabase",
+        "TestPGTest_NoSQLiteOpened",
+        "TestAPIKey_CreateReturnsSecretOnce",
+        "TestEmbedding_RejectsDimensionMismatch",
+        "TestHistory_CrossCallerIsolation",
+        "TestHistory_SearchBudgetTruncationMarked",
+        "TestIndex_SwitchRequiresValidation",
+        "TestIndex_EnsureBootstrapsFirstGenerationOnEmptyDatabase",
+        "TestLogsAndAudit_RedactKey",
+        "TestMemory_CandidateNotRecalledUntilConfirmed",
+        "TestMemory_CoreQuotaBoundaries",
+        "TestMemory_CorrectionSupersedesAndPreventsRecall",
+        "TestMemory_ReadErrorTiers",
+        "TestMemory_SameScopeSerialized",
+        "TestMemory_TwoLayersDoNotStack",
+        "TestMemoryStore_AppendEnforcesCoreQuota",
+        "TestMemoryStore_AppendWritesLifecycleColumns",
+        "TestMemoryStore_FindEntryByContentPrefersLiveRow",
+        "TestMemoryStore_LoadAndRecallKeywordHideInactiveEntries",
+        "TestMemoryStore_RecallEntriesFailsClosedOnGenerationMismatch",
+        "TestMemoryStore_RecallEntriesPinsActiveGeneration",
+        "TestMemoryStore_RecallEntriesRequiresAgentScope",
+        "TestMemoryStore_RecallEntriesWithoutVectorFallsBackToKeyword",
+        "TestMemoryStore_RenderedTextIsParseableBySharedParser",
+        "TestMemoryStore_ReplaceEntryIsAtomic",
+        "TestMemoryStore_UpdateEntryStateOnlyMigratesState",
+        "TestPostgresSchemaFile_MatchesContract",
+        "TestPostgres_TimeColumnsAreUnixMillisUTC",
+        "TestQuota_PeriodBoundaryAndTimezone",
+        "TestQuota_ReserveBeforeModelCall",
+        "TestQuota_UnknownUsageStaysPending",
+        "TestRetrieval_DeletedVersionNotRecalled",
+        "TestRetrieval_SingleGenerationPerQuery",
+        "TestSourceView_DeniedAfterFreezeReturnsNoContent",
+        "TestSourceView_RangeOutOfBounds",
+        "TestSourceView_SummaryExcludesTaskProgress",
+        "TestCaller_UnauthorizedAndForbidden",
+        "TestKnowledgeStore_ActivateRefusesIncompleteArtifacts",
+        "TestKnowledgeStore_ActivateSupersedesPrevious",
+        "TestKnowledgeStore_FailVersionNeverTouchesActive",
+        "TestKnowledgeStore_KeywordSearchFiltersInsideSQL",
+        "TestKnowledgeStore_LoadVersionRebuildsTextAtAbsoluteOffsets",
+        "TestKnowledgeStore_LoadVersionReportsSoftDeletion",
+        "TestKnowledgeStore_SoftDeleteCollectionRetiresVersions",
+        "TestKnowledgeStore_SoftDeleteRetiresAndIsIdempotent",
+        "TestKnowledgeStore_SourceViewDeniesCrossProjectCaller",
+        "TestKnowledgeStore_SourceViewVerbatimAndRangeUseExactOffsets",
+        "TestKnowledgeStore_StartJobRefusesActiveVersion",
+        "TestKnowledgeStore_StartJobRefusesSecondAttemptWhileJobOpen",
+        "TestKnowledgeStore_StartJobRejectsDeletedCollection",
+        "TestKnowledgeStore_StartJobReusesVersionForSameHash",
+        "TestKnowledgeStore_StartJobRevivesSoftDeletedDocument",
+        "TestKnowledgeStore_VectorSearchPinsGeneration",
+        "TestKnowledgeStore_WriteChunksRequiresPending",
+        "TestKnowledgeStore_WriteChunksRewritesWithoutOrphans",
+        "TestKnowledge_CreateCollectionValidatesBeforeWriting",
+        "TestKnowledge_DeleteIsIdempotent",
+        "TestKnowledge_DocumentAndVersionListsProject",
+        "TestKnowledge_ErrorMappingBySentinels",
+        "TestKnowledge_IngestReturnsTerminalStatesAs200",
+        "TestKnowledge_ListCollectionsIsManagementFace",
+        "TestKnowledge_MissingPortsAnswerFixed500",
+        "TestKnowledge_SearchHitsNeverCarryContentHash",
+        "TestKnowledge_SearchUnavailableIs503WithReasonCode",
+        "TestKnowledge_SearchValidatesRequestShape",
+        "TestKnowledge_SourceViewInvalidClearsContent",
+        "TestKnowledge_SourceViewProjectsValidContent",
+        "TestKnowledge_SourceViewRequestShapeAndPortViolation",
+        "TestKnowledge_SourceViewAuthBoundary",
+        "TestSessionList_CallerFilterCombinations",
+        "TestSessionList_CallerNeverSeesLegacyRows",
+        "TestSessionList_CallerFilterKeepsFixedOrder",
+        "TestHistoryStore_SearchScopesToCaller",
+        "TestHistoryStore_SearchOrderAndLimit",
+        "TestHistoryStore_SearchSnippetIsBoundedWindow",
+        "TestHistoryStore_SearchNarrowsByFilters",
+        "TestHistoryStore_SearchRejectsUnscopedCaller",
+        "TestHistoryStore_ReadMessagesReturnsEvidenceRefs",
+        "TestHistoryStore_ReadMessagesCrossCallerIsNotFound",
+        "TestHistoryStore_ResolveSessionOwnership",
+        "TestAuthz_AgentDeclarationOnlyNarrows",
+        "TestAuthz_AgentDeclarationWithoutProjectionSeesNothing",
+        "TestBindingProjection_ProjectsKnowledgeCollections",
+        "TestBindingStore_RebuildProjectsKnowledgeCollections",
+        "TestKnowledgeCatalog_CollectionIDsByName",
+        "TestDiagnostics_ReadByRequestIDAfterAdmissionDenial",
+        "TestStartupVerification_ReadsRealCutoverMarker",
+        "TestMCP_BackfillReportsMissingAndDrift",
+        "TestMCP_BackfillDoesNotOverwriteMigratedEnvSource",
+        "TestMCP_BackfillRestartHasNoSecondRow",
+        "TestMCP_BackfillNeverCopiesEnvValue"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-knowledge-retrieve",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "-run",
+        "^(TestRetrieval_DeniedChunksNeverReachPrompt|TestRetrieval_FusesBothPathsByRank|TestRetrieval_VectorFailureDegradesToKeyword|TestRetrieval_KeywordFailureDegradesToVector|TestRetrieval_BothPathsFailingReturnsError|TestRetrieval_MissingEmbeddingSkipsVectorPath|TestRetrieval_WrongEmbeddingDimensionSkipsVectorPath|TestRetrieval_BudgetTrimDropsWholeChunks|TestRetrieval_TopKLimitsFinalHits|TestRetrieval_AssemblyRecordCarriesIdentifiersOnly|TestRetrieval_EmptyResultStillRecordsAssembly|TestRetrieval_AuditLogCarriesRunID|TestRetrieve_RejectsMissingRunID|TestRetrieve_RejectsEmptyQuery|TestRetrieve_RequiresKnowledgeReadScope|TestRetrieve_RejectsZeroPrincipal|TestRetriever_FailsClosedWhenRerankConfigured|TestRetriever_RequiresEveryPort|TestSearch_RequiresCollectionsOrAgent|TestSearch_WritesNoAssemblyRecordAndNeverFabricatesRun|TestKnowledge_EmptyResultInjectsNothing|TestKnowledge_RevokedBodyNeverReappears)$",
+        "./internal/knowledge/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestRetrieval_DeniedChunksNeverReachPrompt",
+        "TestRetrieval_FusesBothPathsByRank",
+        "TestRetrieval_VectorFailureDegradesToKeyword",
+        "TestRetrieval_KeywordFailureDegradesToVector",
+        "TestRetrieval_BothPathsFailingReturnsError",
+        "TestRetrieval_MissingEmbeddingSkipsVectorPath",
+        "TestRetrieval_WrongEmbeddingDimensionSkipsVectorPath",
+        "TestRetrieval_BudgetTrimDropsWholeChunks",
+        "TestRetrieval_TopKLimitsFinalHits",
+        "TestRetrieval_AssemblyRecordCarriesIdentifiersOnly",
+        "TestRetrieval_EmptyResultStillRecordsAssembly",
+        "TestRetrieval_AuditLogCarriesRunID",
+        "TestRetrieve_RejectsMissingRunID",
+        "TestRetrieve_RejectsEmptyQuery",
+        "TestRetrieve_RequiresKnowledgeReadScope",
+        "TestRetrieve_RejectsZeroPrincipal",
+        "TestRetriever_FailsClosedWhenRerankConfigured",
+        "TestRetriever_RequiresEveryPort",
+        "TestSearch_RequiresCollectionsOrAgent",
+        "TestSearch_WritesNoAssemblyRecordAndNeverFabricatesRun",
+        "TestKnowledge_EmptyResultInjectsNothing",
+        "TestKnowledge_RevokedBodyNeverReappears"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-knowledge-validity",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "-run",
+        "^(TestValidity_DeletedVersionIsNotValid|TestValidity_RequiresPrincipalAndReadScope|TestValidity_FailsClosedOnStoreViolation|TestRetrieval_DeletedVersionNotRecalled|TestRetrieval_SingleGenerationPerQuery)$",
+        "./internal/knowledge/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestValidity_DeletedVersionIsNotValid",
+        "TestValidity_RequiresPrincipalAndReadScope",
+        "TestValidity_FailsClosedOnStoreViolation",
+        "TestRetrieval_DeletedVersionNotRecalled",
+        "TestRetrieval_SingleGenerationPerQuery"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-knowledge-audit",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "-run",
+        "^(TestOperationAudit_RejectsZeroPrincipal|TestOperationAudit_RejectsUnknownOperation|TestOperationAudit_ReasonCodes|TestOperationAudit_SuccessCarriesFourFacts|TestOperationAudit_FailureWritesAuditAndLog|TestOperationAudit_TerminalWriteFailureIsError|TestOperationAudit_DetachedFromCancellation|TestOperationAudit_SuccessWithoutAuditRecordIsFlagged|TestOperationAudit_SanitizesExternalFields|TestIngest_AdmissionRejectionIsLogged|TestIngest_ForbiddenIsRejectedAndLogged|TestIngest_ZeroPrincipalLogsNoIdentity|TestIngest_DedupLogsVersionAsAuditRef|TestDelete_OperationIsAudited|TestReindex_OperationIsAudited)$",
+        "./internal/knowledge/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestOperationAudit_RejectsZeroPrincipal",
+        "TestOperationAudit_RejectsUnknownOperation",
+        "TestOperationAudit_ReasonCodes",
+        "TestOperationAudit_SuccessCarriesFourFacts",
+        "TestOperationAudit_FailureWritesAuditAndLog",
+        "TestOperationAudit_TerminalWriteFailureIsError",
+        "TestOperationAudit_DetachedFromCancellation",
+        "TestOperationAudit_SuccessWithoutAuditRecordIsFlagged",
+        "TestOperationAudit_SanitizesExternalFields",
+        "TestIngest_AdmissionRejectionIsLogged",
+        "TestIngest_ForbiddenIsRejectedAndLogged",
+        "TestIngest_ZeroPrincipalLogsNoIdentity",
+        "TestIngest_DedupLogsVersionAsAuditRef",
+        "TestDelete_OperationIsAudited",
+        "TestReindex_OperationIsAudited"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-us16-history",
+      "args": [
+        "go",
+        "test",
+        "-tags=integration",
+        "-json",
+        "-count=1",
+        "-race",
+        "-run",
+        "^(TestHistorySearch_ResultsArePointersNotCitations|TestHistorySearch_RejectsMalformedQuery|TestHistorySearch_StoreFailureAndContractViolationFailClosed|TestHistory_SearchBudgetTruncationMarked|TestHistory_SearchBudgetEmptyPageIsAnArray|TestHistory_SearchBudgetKeepsNewestFirst|TestHistory_CrossCallerIsolation|TestHistory_ForbiddenAliasesCore|TestHistory_ExactReadCrossCallerNotFound|TestHistory_ExactReadRejectsStatelessIdentifier|TestHistory_ExactReadStoreFailureAndContractViolationFailClosed)$",
+        "./internal/history/"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestHistorySearch_ResultsArePointersNotCitations",
+        "TestHistorySearch_RejectsMalformedQuery",
+        "TestHistorySearch_StoreFailureAndContractViolationFailClosed",
+        "TestHistory_SearchBudgetTruncationMarked",
+        "TestHistory_SearchBudgetEmptyPageIsAnArray",
+        "TestHistory_SearchBudgetKeepsNewestFirst",
+        "TestHistory_CrossCallerIsolation",
+        "TestHistory_ForbiddenAliasesCore",
+        "TestHistory_ExactReadCrossCallerNotFound",
+        "TestHistory_ExactReadRejectsStatelessIdentifier",
+        "TestHistory_ExactReadStoreFailureAndContractViolationFailClosed"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-lineage",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-tags=integration",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestStorageStore_OpenReadOnlyPostgres|TestApp_SupportedVersionInjectedPerBackend|TestObservability_VersionLineageOrigins)$"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [
+        "TestStorageStore_OpenReadOnlyPostgres",
+        "TestApp_SupportedVersionInjectedPerBackend",
+        "TestObservability_VersionLineageOrigins"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-workspace-recovery",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/workspace",
+        "-run",
+        "^(TestWatcher_DirectorySwapKeepsFileEvents|TestWatcher_RetriesTopologyRebuildWithoutNewEvent)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestWatcher_DirectorySwapKeepsFileEvents",
+        "TestWatcher_RetriesTopologyRebuildWithoutNewEvent"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-interrupted-bootstrap",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/app",
+        "-run",
+        "^(TestInstanceBootstrap_OpenBoxIntentPrecedesRoster|TestBuiltinOpenBoxIntent_PreservesExisting|TestBuiltinOpenBoxIntent_ConcurrentPublication|TestInstanceBootstrap_IntentFailureDoesNotPublishRoster|TestInstanceBootstrap_ExistingInstanceDoesNotRecreateIntent)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestInstanceBootstrap_OpenBoxIntentPrecedesRoster",
+        "TestBuiltinOpenBoxIntent_PreservesExisting",
+        "TestBuiltinOpenBoxIntent_ConcurrentPublication",
+        "TestInstanceBootstrap_IntentFailureDoesNotPublishRoster",
+        "TestInstanceBootstrap_ExistingInstanceDoesNotRecreateIntent"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "obs-regression-cron-loop-shutdown",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-race",
+        "-count=1",
+        "./internal/adapters/cron",
+        "-run",
+        "^(TestEngine_StopWaitsForLoopCompletion|TestEngine_StopBeforeStartAndRepeated|TestEngine_StopWithInfoFiltered|TestEngine_ConcurrentStopsJoinLoop|TestEngine_RestartWaitsForPreviousLoop|TestEngine_StopWaitsForJobs)$"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestEngine_StopWaitsForLoopCompletion",
+        "TestEngine_StopBeforeStartAndRepeated",
+        "TestEngine_StopWithInfoFiltered",
+        "TestEngine_ConcurrentStopsJoinLoop",
+        "TestEngine_RestartWaitsForPreviousLoop",
+        "TestEngine_StopWaitsForJobs"
+      ],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T002",
+      "checks": [
+        "obs-bootstrap"
+      ]
+    },
+    {
+      "id": "T003",
+      "checks": [
+        "obs-bootstrap"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "obs-schema"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "obs-request"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "obs-correlation"
+      ]
+    },
+    {
+      "id": "T007",
+      "checks": [
+        "obs-foundation"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "obs-foundation"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "obs-map",
+        "obs-scan",
+        "obs-ledger"
+      ]
+    },
+    {
+      "id": "T010",
+      "checks": [
+        "obs-foundation"
+      ]
+    },
+    {
+      "id": "T011",
+      "checks": [
+        "obs-foundation"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "obs-foundation",
+        "obs-context"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "obs-health",
+        "obs-audit-regression"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "obs-health",
+        "obs-audit-regression"
+      ]
+    },
+    {
+      "id": "T015",
+      "checks": [
+        "obs-ledger"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "obs-scan"
+      ]
+    },
+    {
+      "id": "T017",
+      "checks": [
+        "obs-map",
+        "obs-scan",
+        "obs-ledger"
+      ]
+    },
+    {
+      "id": "T018",
+      "checks": [
+        "obs-worker",
+        "obs-ledger",
+        "obs-map",
+        "obs-scan"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "obs-otlp",
+        "obs-worker",
+        "obs-ledger",
+        "obs-map",
+        "obs-scan"
+      ]
+    },
+    {
+      "id": "T020",
+      "checks": [
+        "obs-cleanup",
+        "obs-health",
+        "obs-worker",
+        "obs-ledger"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "obs-wiring",
+        "obs-health",
+        "obs-otlp",
+        "obs-cleanup"
+      ]
+    },
+    {
+      "id": "T022",
+      "checks": [
+        "obs-unit",
+        "obs-pg",
+        "obs-web"
+      ]
+    },
+    {
+      "id": "T023",
+      "checks": [
+        "obs-console-test",
+        "obs-console-build"
+      ]
+    },
+    {
+      "id": "T024",
+      "checks": [
+        "obs-scenarios",
+        "obs-producers",
+        "obs-console-test",
+        "obs-console-build"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "obs-unit",
+        "obs-pg",
+        "obs-web",
+        "obs-console-test",
+        "obs-console-build"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "obs-unit",
+        "obs-collector"
+      ]
+    },
+    {
+      "id": "T027",
+      "checks": [
+        "obs-unit",
+        "obs-pg",
+        "obs-web",
+        "obs-scenarios",
+        "obs-console-test",
+        "obs-console-build"
+      ]
+    },
+    {
+      "id": "T028",
+      "checks": [
+        "obs-bootstrap",
+        "obs-unit",
+        "obs-pg",
+        "obs-producers",
+        "obs-web",
+        "obs-scenarios",
+        "obs-console-test",
+        "obs-console-build",
+        "obs-collector",
+        "obs-sampler",
+        "obs-regression-us16-core",
+        "obs-regression-us16-diagnostics",
+        "obs-regression-us16-callers",
+        "obs-regression-us16-web",
+        "obs-regression-us16-wiring",
+        "obs-regression-us16-pg",
+        "obs-regression-us16-knowledge-retrieve",
+        "obs-regression-us16-knowledge-validity",
+        "obs-regression-us16-knowledge-audit",
+        "obs-regression-us16-history",
+        "obs-lineage",
+        "obs-regression-workspace-recovery",
+        "obs-regression-interrupted-bootstrap",
+        "obs-regression-cron-loop-shutdown"
+      ]
+    }
+  ]
+}

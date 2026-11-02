@@ -10,7 +10,7 @@ import { ApiError, errorMessage } from '../api'
 import type { MessageView, ProfileView, SessionDetail } from '../api'
 import { ConfirmDialog, Notice, formatTimestamp } from '../components/ui'
 import { renderSafeText } from '../render'
-import { agentConfigHref, agentHref, diagnosticsHref, historyHref, runHref, sessionHref } from '../router'
+import { agentConfigHref, agentHref, diagnosticsHref, historyHref, observabilityHref, runHref, sessionHref } from '../router'
 import { CompactionPanel } from './compaction'
 import {
   badge,
@@ -306,11 +306,12 @@ export const SessionDetailView = defineComponent({
           // 历史回查带本会话作过滤条件；关键词仍在历史页由用户给出（检索必填）。
           // The history page opens filtered to this session; the keyword stays user input.
           h('div', { class: 'form-actions' }, [
+            h('a', { class: 'button primary', href: observabilityHref('query', ['session_id', sessionId]) }, '运行排障'),
             h('a', { class: 'button', href: historyHref(['session_id', sessionId]) }, '历史回查'),
             // 诊断按 session_id 深链：契约接受该锚点，但当前没有生产端写它，
             // 诊断页会如实标注"暂无生产端"而不是假装查过。
             // The diagnostics page labels anchors that have no producer today.
-            h('a', { class: 'button', href: diagnosticsHref(['session_id', sessionId]) }, '诊断事件'),
+            h('a', { class: 'button', href: diagnosticsHref(['session_id', sessionId]) }, '诊断明细'),
           ]),
         ),
         h('p', { class: 'back-link' }, [

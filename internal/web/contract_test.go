@@ -646,6 +646,7 @@ func TestOpenAPI_RunViewPropertiesMatchContract(t *testing.T) {
 	doc := readContractDoc(t, "openapi.yaml")
 	finished := RunView{
 		RunID:        "run-1",
+		RequestID:    "request-1",
 		SessionID:    "sess-1",
 		Agent:        "alpha",
 		Channel:      "web",
@@ -749,7 +750,7 @@ func TestOpenAPI_RunDetailPropertiesMatchContract(t *testing.T) {
 	}
 	recorded := core.RunDetail{
 		RunRecord: core.RunRecord{
-			RunID: "run-1", SessionID: "sess-1", Agent: "alpha", Channel: "web",
+			RunID: "run-1", RequestID: "request-1", SessionID: "sess-1", Agent: "alpha", Channel: "web",
 			Trigger: core.TriggerCron, ConfigHash: "config-hash",
 			StartedAt: time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC),
 		},
@@ -772,6 +773,7 @@ func TestOpenAPI_RunDetailPropertiesMatchContract(t *testing.T) {
 		FinishedAt: time.Date(2026, 10, 20, 9, 0, 4, 0, time.UTC),
 	})
 	require.True(t, legacy.ResourceManifest.LegacyUnrecorded)
+	require.Empty(t, legacy.RequestID, "历史未记录的request_id不得补造")
 	raw, err := json.Marshal(legacy)
 	require.NoError(t, err)
 	var payload any

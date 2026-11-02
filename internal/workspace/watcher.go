@@ -67,11 +67,12 @@ type Watcher struct {
 	// incoming 接收"一条已归属的变更路径"，防抖循环是唯一消费者；fired 在每次回调
 	// 完成后非阻塞投递一次信号（容量 1，重复信号合并）。
 	// incoming feeds the debounce loop; fired signals one completed callback.
-	incoming chan string
-	fired    chan struct{}
-	done     chan struct{}
-	loopDone chan struct{}
-	stopOnce sync.Once
+	incoming     chan string
+	fired        chan struct{}
+	done         chan struct{}
+	loopDone     chan struct{}
+	stopOnce     sync.Once
+	newFSWatcher func() (*fsnotify.Watcher, error)
 }
 
 // NewWatcher 建立初始监听并启动防抖循环：白名单是 `agents/`、`agents/<name>/`、
@@ -91,16 +92,17 @@ func NewWatcher(root string, onChange func(ChangeSet), logger *slog.Logger) (*Wa
 		logger = slog.Default()
 	}
 	w := &Watcher{
-		root:     abs,
-		onChange: onChange,
-		logger:   logger,
-		debounce: watcherDebounce,
-		incoming: make(chan string, 64),
-		fired:    make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		loopDone: make(chan struct{}),
+		root:         abs,
+		onChange:     onChange,
+		logger:       logger,
+		debounce:     watcherDebounce,
+		incoming:     make(chan string, 64),
+		fired:        make(chan struct{}, 1),
+		done:         make(chan struct{}),
+		loopDone:     make(chan struct{}),
+		newFSWatcher: fsnotify.NewWatcher,
 	}
-	fsw, err := fsnotify.NewWatcher()
+	fsw, err := w.newFSWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("创建文件监听器: %w", err)
 	}
@@ -137,11 +139,15 @@ func (w *Watcher) Run(ctx context.Context) error {
 		if !w.watchEvents(ctx, fsw) {
 			return nil
 		}
-		if !w.sleep(ctx, watcherRetryDelay) {
-			return nil
-		}
-		if err := w.rebuild(); err != nil {
-			w.logger.Warn("重建文件监听器失败，继续退避", "error", err)
+		for {
+			if !w.sleep(ctx, watcherRetryDelay) {
+				return nil
+			}
+			if err := w.rebuild(); err != nil {
+				w.logger.Warn("重建文件监听器失败，继续退避", "error", err)
+				continue
+			}
+			break
 		}
 	}
 }
@@ -160,6 +166,20 @@ func (w *Watcher) watchEvents(ctx context.Context, fsw *fsnotify.Watcher) bool {
 				w.warnRebuild()
 				return true
 			}
+			if w.firstLevelTopologyEvent(ev) {
+				// Linux移动目录会撤掉旧inode的watch；新实例隔离延迟旧事件，不能只信路径缓存。
+				// A fresh watcher generation fences delayed events from the replaced directory inode.
+				w.queue(ev.Name)
+				if err := w.rebuild(); err != nil {
+					w.logger.Warn("目录变更后重建文件监听器失败", "error", err)
+					return true
+				}
+				fsw = w.current()
+				if fsw == nil {
+					return false
+				}
+				continue
+			}
 			w.handleEvent(ev)
 		case err, ok := <-fsw.Errors:
 			if !ok {
@@ -173,6 +193,17 @@ func (w *Watcher) watchEvents(ctx context.Context, fsw *fsnotify.Watcher) bool {
 			return true
 		}
 	}
+}
+
+// firstLevelTopologyEvent 只处理既有两层白名单的目录槽位变化，不监听工作区根或control。
+// Only topology changes in the existing first-level agent/skill slots rebuild watches.
+func (w *Watcher) firstLevelTopologyEvent(ev fsnotify.Event) bool {
+	rel, ok := w.relPath(ev.Name)
+	if !ok || !isFirstLevelDir(rel) || ev.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+		return false
+	}
+	_, _, ok = watchTarget(rel)
+	return ok
 }
 
 // warnRebuild 在监听通道被外部关闭时留 WARN；正常 Close 先关 done，不误报。
@@ -397,20 +428,46 @@ func (w *Watcher) addWatch(dir string) error {
 // 换出与关闭旧实例在锁外完成，关闭竞态下新实例直接丢弃。
 // rebuild replaces the watcher with a freshly scanned one; a concurrent Close wins.
 func (w *Watcher) rebuild() error {
-	nw, err := fsnotify.NewWatcher()
+	nw, err := w.newFSWatcher()
 	if err != nil {
 		return fmt.Errorf("重建文件监听器: %w", err)
 	}
 	added := make(map[string]struct{})
-	for _, dir := range w.watchDirs() {
+	add := func(dir string) error {
+		if _, ok := added[dir]; ok {
+			return nil
+		}
 		if err := nw.Add(dir); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				continue
+				return nil
 			}
-			_ = nw.Close()
 			return fmt.Errorf("重建监听目录 %s: %w", dir, err)
 		}
 		added[dir] = struct{}{}
+		return nil
+	}
+	// 先建立根监听再扫描子目录，跨扫描窗口的新目录仍有父目录事件可恢复。
+	// Watch both roots before scanning children so creation during the scan remains observable.
+	for _, name := range []string{"agents", "skills"} {
+		dir := filepath.Join(w.root, name)
+		info, statErr := os.Stat(dir)
+		if errors.Is(statErr, fs.ErrNotExist) || statErr == nil && !info.IsDir() {
+			continue
+		}
+		if statErr != nil {
+			_ = nw.Close()
+			return fmt.Errorf("检查监听根目录 %s: %w", dir, statErr)
+		}
+		if err := add(dir); err != nil {
+			_ = nw.Close()
+			return err
+		}
+	}
+	for _, dir := range w.watchDirs() {
+		if err := add(dir); err != nil {
+			_ = nw.Close()
+			return err
+		}
 	}
 
 	w.mu.Lock()
@@ -420,11 +477,31 @@ func (w *Watcher) rebuild() error {
 		return nil
 	}
 	old := w.fsw
+	refresh := make(map[string]struct{}, len(w.watched)+len(added))
+	for dir := range w.watched {
+		refresh[dir] = struct{}{}
+	}
+	for dir := range added {
+		refresh[dir] = struct{}{}
+	}
 	w.fsw = nw
 	w.watched = added
 	w.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
+	}
+	// 重绑监听不等于已重载：现存与已移除的名字都交回原防抖通道。
+	// Rebinding also schedules current and removed names through the existing reload path.
+	paths := make([]string, 0, len(refresh))
+	for dir := range refresh {
+		rel, ok := w.relPath(dir)
+		if _, _, target := watchTarget(rel); ok && target {
+			paths = append(paths, dir)
+		}
+	}
+	sort.Strings(paths)
+	for _, dir := range paths {
+		w.queue(dir)
 	}
 	return nil
 }

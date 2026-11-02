@@ -2211,6 +2211,10 @@ func d2Steps(f *demoFixture, runTag string) []demoStep {
 					"--issues", "issues.json",
 					"--releases", "releases.json",
 					"--state", "state/cursor.json",
+					// 固定夹具时钟与脚本单测一致，陈旧桶不随执行日期漂移。
+					// Match the script fixture clock so stale buckets do not drift with wall time.
+					"--now", "2026-10-25T08:45:00+08:00",
+					"--output", "runs/fixture-" + runTag + "/digest.json",
 				},
 			})
 		},
@@ -2448,6 +2452,10 @@ func testDemoRepoDigest(t *testing.T, makeFixture demoFixtureFor) {
 	f.model.beginRun(dir, d2Steps(f, "b")...)
 	second := f.runScheduleNowOnce(t, taskID)
 	secondOut := decodeD2(t, demoShellResults(t, f.h, second.RunID)[0])
+	if first.Report.Path == secondOut.Report.Path {
+		t.Fatal("D2 两轮必须保留独立报告，第二轮不得覆盖首轮证据")
+	}
+	requireDigestOnDisk(t, dir, first.Report, "D2 第二轮后首轮报告仍完整")
 	if secondOut.Message != "本次无新增：三个来源都没有晚于游标的新条目" {
 		t.Fatalf("第二轮结论句 = %q", secondOut.Message)
 	}
@@ -3349,7 +3357,9 @@ func d4Steps(f *demoFixture, runTag string, expectDocs, expectReads int) []demoS
 	steps := []demoStep{
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			d.requireTool("notify")
-			return demoCall(next("recall"), "recall_memory", map[string]any{"query": "docs-diff"})
+			// 本夹具核对本地历史基线，按US-16契约显式使用关键词模式。
+			// This fixture checks local history, so request keyword mode under the US-16 contract.
+			return demoCall(next("recall"), "recall_memory", map[string]any{"query": "docs-diff", "mode": "keyword"})
 		},
 		func(d *demoTurn) testutil.FakeOpenAIResponse {
 			name, _ := d.lastTool()

@@ -30,6 +30,7 @@ import (
 // ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
 // entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
+	Observability ObservabilityConfig `yaml:"-"`
 	// 服务入口需要区分键缺失与显式零值；不属于可序列化配置。
 	ingressMissing []string         `yaml:"-"`
 	HTTP           HTTPConfig       `yaml:"http"`
@@ -557,7 +558,7 @@ type CompactionConfig struct {
 // 随各自消费 US 落位。
 // Credential key paths: the provider API key and the admin token share the same
 // placeholder, type and plaintext-rejection checks.
-var credentialKey = regexp.MustCompile(`^(providers\[\d+\]\.api_key|http\.admin_auth\.token)$`)
+var credentialKey = regexp.MustCompile(`^(providers\[\d+\]\.api_key|http\.admin_auth\.token|observability\.export\.headers)$`)
 
 // 单个占位符；${} 与 ${1X} 这类畸形形态不匹配，会在「残留检查」处被判红。
 var placeholder = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
@@ -636,6 +637,9 @@ func LoadConfig(path string, lookupEnv func(string) (string, bool)) (*Config, er
 	// The US-16 sections are checked against the raw tree: a retired key's presence is
 	// invisible once decoded.
 	if err := validateUS16Sections(resolvedMap, cfg); err != nil {
+		return nil, fmt.Errorf("配置 %s: %w", path, err)
+	}
+	if err := cfg.Observability.ValidateHistoryWindow(cfg.Diagnostics.RetentionDays); err != nil {
 		return nil, fmt.Errorf("配置 %s: %w", path, err)
 	}
 	if err := validateConfig(cfg); err != nil {
@@ -742,6 +746,12 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 		return nil, err
 	}
 	cfg.Author = author
+	observabilitySection, observabilityPresent := tree["observability"]
+	observability, err := parseObservabilityConfig(observabilitySection, observabilityPresent)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Observability = observability
 	return cfg, nil
 }
 
@@ -1573,7 +1583,7 @@ func resolveString(raw, path string, lookupEnv func(string) (string, bool)) (any
 		return nil, fmt.Errorf(
 			"配置项 %s 解析后仍残留 ${ 占位（模板畸形）——检查占位符是否闭合、变量名是否合法", path)
 	}
-	if credential && resolved == "" {
+	if credential && resolved == "" && path != "observability.export.headers" {
 		return nil, fmt.Errorf("配置项 %s 解析为空——凭证不得为空值", path)
 	}
 	return resolved, nil

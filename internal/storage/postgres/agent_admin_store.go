@@ -62,7 +62,7 @@ func (s *AgentAdminStore) InsertArchive(ctx context.Context, rec core.AgentArchi
 	}
 
 	// 终态时刻取归档时刻（同一行事实的两种投影，不另取当前时间）。
-	if err := finishOperationTx(ctx, tx, opID, core.OperationSuccess, "", "", nil, time.UnixMilli(rec.ArchivedAt)); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, opID, core.OperationSuccess, "", "", nil, time.UnixMilli(rec.ArchivedAt)); err != nil {
 		return fmt.Errorf("写入归档记录 %s: %w", rec.ArchiveID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -112,7 +112,7 @@ func (s *AgentAdminStore) MarkRestored(ctx context.Context, archiveID, newName, 
 		return restoreMissTx(ctx, tx, archiveID)
 	}
 
-	if err := finishOperationTx(ctx, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
 		return fmt.Errorf("标记归档 %s 已恢复: %w", archiveID, err)
 	}
 	if err := tx.Commit(); err != nil {

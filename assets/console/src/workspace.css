@@ -33,6 +33,7 @@
 .topbar-label { font: 10px/1 var(--font-mono); letter-spacing: .13em; color: var(--muted); }
 .console-topbar .link-button { font-size: 12px; }
 .console-main { width: 100%; max-width: 1500px; padding: 36px 42px 64px; margin: 0 auto; min-width: 0; }
+.console-main.console-main-wide { max-width: 1880px; margin-left: 0; padding-top: 24px; }
 .console-shell--public .console-body { margin-left: 0; }
 .console-shell--public .console-main { max-width: 1300px; }
 .menu-toggle, .sidebar-backdrop { display: none; }

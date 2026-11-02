@@ -92,6 +92,7 @@ type SessionStatusStore interface {
 // ServiceOptions is the assembly surface of the run entry point; every dependency is an
 // explicit field, including the clock.
 type ServiceOptions struct {
+	Phases    PhaseRecorder        // Optional droppable stage timing; never controls admission.
 	Agents    AgentSource          // Agent 装载面（是否存在 / 目录 / 运行级快照）
 	Client    ProviderClient       // 唯一的模型调用入口（实现为 ProviderService：路由 + 两阶段审计在其内）
 	Messages  MessageStore         // 会话历史写透（无状态调用也可为 nil）
@@ -376,6 +377,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		toolSet = withoutToolName(toolSet, "notify")
 	}
 	env := &RunEnv{
+		phases:    s.opts.Phases,
 		Req:       req,
 		AgentUID:  lifecycle.AgentUID,
 		Snapshot:  snap,
@@ -452,6 +454,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if s.opts.Runs != nil {
 		if err := s.opts.Runs.StartRun(ctx, RunRecord{
 			RunID:         runID,
+			RequestID:     req.RequestID,
 			SessionID:     req.SessionID,
 			Agent:         req.Agent,
 			Channel:       req.Channel,
@@ -492,6 +495,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// nothing declared" is a legal empty injection, not an error.
 	if s.opts.Knowledge != nil {
 		env.knowledgeSource = s.opts.Knowledge
+		finishKnowledge := BeginPhase(runCtx, env.phases, PhaseKnowledge, "", runID, "", 0)
 		injection, kerr := s.opts.Knowledge.RetrieveForRun(runCtx, KnowledgeRunRequest{
 			Principal: req.Principal,
 			RunID:     runID,
@@ -499,6 +503,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			Query:     req.Message,
 			Budget:    KnowledgeBudget(env.Budget.ContextTokens),
 		})
+		finishKnowledge(kerr)
 		if kerr != nil {
 			// 取消优先：检索横跨一次外部调用（查询向量化）与两次 SQL，期间的取消 /
 			// 截止不是"知识库故障"——按循环的同一口径记 cancelled，不写成 failed。
@@ -904,6 +909,29 @@ func (s *AgentService) Archive(ctx context.Context, sessionID string) error {
 		return err
 	}
 	return nil
+}
+
+// TrySessionMaintenance excludes admission and archiving for one idle session.
+// Maintenance does not consume a run concurrency slot. Release is idempotent.
+func (s *AgentService) TrySessionMaintenance(sessionID string) (func(), bool) {
+	if sessionID == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.busy[sessionID]; busy {
+		return nil, false
+	}
+	s.busy[sessionID] = struct{}{}
+	released := false
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !released {
+			delete(s.busy, sessionID)
+			released = true
+		}
+	}, true
 }
 
 // mergeBudget 合并实际预算：请求值未填的项补契约 §6 缺省，再让 Profile **只能收紧**迭代上限。

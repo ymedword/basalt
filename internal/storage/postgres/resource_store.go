@@ -281,7 +281,7 @@ func (s *ResourceStore) PublishWithVersionState(ctx context.Context, v core.Reso
 	if err := publishTx(ctx, tx, v.Kind, v.ResourceID, v.ResourceUID, version.ID, applied, operationID, now); err != nil {
 		return core.ResourceVersion{}, err
 	}
-	if err := finishOperationTx(ctx, tx, operationID, core.OperationSuccess, "", "", nil, now); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, operationID, core.OperationSuccess, "", "", nil, now); err != nil {
 		return core.ResourceVersion{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -476,7 +476,7 @@ func (s *ResourceStore) MarkDeleted(ctx context.Context, kind core.ResourceKind,
 	if err := markDeletedTx(ctx, tx, kind, id, core.ResourceUID(uid.String), opID, at); err != nil {
 		return err
 	}
-	if err := finishOperationTx(ctx, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -517,7 +517,7 @@ func (s *ResourceStore) MarkDeletedByUID(ctx context.Context, kind core.Resource
 	if err := markDeletedTx(ctx, tx, kind, id, canonical, opID, at); err != nil {
 		return err
 	}
-	if err := finishOperationTx(ctx, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, opID, core.OperationSuccess, "", "", nil, at); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

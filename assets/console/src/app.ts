@@ -31,6 +31,7 @@ import { CallerDetailView } from './views/caller-detail'
 import { CallersView } from './views/callers'
 import { CatalogView } from './views/catalog'
 import { DiagnosticsView } from './views/diagnostics'
+import { ObservabilityView } from './views/observability'
 import { DocumentDetailView } from './views/document-detail'
 import { HistoryView } from './views/history'
 import { KnowledgeView } from './views/knowledge'
@@ -61,6 +62,7 @@ const VIEWS: Record<RouteName, Component> = {
   knowledge: KnowledgeView, 'knowledge-collection': KnowledgeView,
   'document-detail': DocumentDetailView,
   diagnostics: DiagnosticsView, history: HistoryView,
+  observability: ObservabilityView,
 }
 interface NavItem { label: string; href: string; code: string; names?: readonly RouteName[] }
 const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
@@ -80,8 +82,9 @@ const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
     { label: '执行环境', href: CONSOLE_BASE + '/settings/sandbox', code: '09', names: ['sandbox'] },
     { label: '管理操作', href: CONSOLE_BASE + '/operations', code: '10', names: ['operations'] },
     { label: '调用方', href: callersHref(), code: '11', names: ['callers', 'caller-detail'] },
-    { label: '诊断事件', href: diagnosticsHref(), code: '12', names: ['diagnostics'] },
-    { label: '历史回查', href: historyHref(), code: '13', names: ['history'] },
+    { label: '运行排障', href: CONSOLE_BASE + '/observability', code: '12', names: ['observability'] },
+    { label: '诊断明细', href: diagnosticsHref(), code: '13', names: ['diagnostics'] },
+    { label: '历史回查', href: historyHref(), code: '14', names: ['history'] },
   ] },
 ]
 const TITLES: Record<RouteName, string> = {
@@ -94,7 +97,8 @@ const TITLES: Record<RouteName, string> = {
   tools: '工具与 MCP', memory: '全局记忆', notifications: '通知渠道', sandbox: '执行环境',
   callers: '调用方', 'caller-detail': '调用方详情',
   knowledge: '知识库', 'knowledge-collection': '知识库', 'document-detail': '文档详情',
-  diagnostics: '诊断事件', history: '历史回查',
+  diagnostics: '诊断明细', history: '历史回查',
+  observability: '运行排障',
 }
 function currentLocation(): string { return window.location.pathname + window.location.search }
 function navActive(item: NavItem, match: RouteMatch): boolean {
@@ -210,7 +214,7 @@ export function createConsoleApp(): Component {
             showChrome && secretsRecovery.value
               ? h(Notice, { tone: 'error', text: INSTANCE_SECRETS_RECOVERY_BANNER })
               : null,
-            h('main', { class: 'console-main', id: 'console-main', tabindex: -1 }, [h(VIEWS[match.name], { key: match.name + ':' + match.path, ctx: context, params: match.params, query: match.query })]),
+            h('main', { class: ['console-main', {'console-main-wide': match.name === 'observability' || match.name === 'run-detail'}], id: 'console-main', tabindex: -1 }, [h(VIEWS[match.name], { key: match.name + ':' + match.path + (match.name === 'observability' ? '?' + match.query.toString() : ''), ctx: context, params: match.params, query: match.query })]),
           ]),
         ])
       }

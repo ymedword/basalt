@@ -207,18 +207,36 @@ func TestUS16Demo(t *testing.T) {
 	if diag.SampledOut {
 		t.Fatalf("采样率缺省即全量，不得出现 sampled_out=true")
 	}
+	// 调用级 llm_call 与模型调用一一对应；阶段级 llm_call 是 US-16A 的真实阶段耗时
+	// 证据（复用同一诊断种类，见 run-state R633），另计且必须带白名单内的阶段名。
+	// Call-level llm_call events map one-to-one onto model calls; phase-level ones are
+	// the US-16A phase timings and are counted separately.
 	llmEvents := 0
+	phaseEvents := 0
 	for _, event := range diag.Events {
-		if event.Correlation.RunID != run.RunID {
+		if event.Correlation.RunID != run.RunID || event.Kind != "llm_call" {
 			continue
 		}
-		if event.Kind == "llm_call" {
+		phase, isPhase := event.Attrs["phase"].(string)
+		if !isPhase {
 			llmEvents++
+			continue
 		}
+		if phase != "model_first_response" && phase != "model_response_read" {
+			t.Fatalf("阶段事件的阶段名越界：%q（只允许 model_first_response / model_response_read）", phase)
+		}
+		if event.ReasonCode != "" {
+			t.Fatalf("阶段事件不得携带失败原因码 %q（阶段证据不回答调用成败）", event.ReasonCode)
+		}
+		phaseEvents++
 	}
 	if llmEvents != modelCalls {
-		t.Fatalf("llm_call 诊断事件 %d 条，模型调用 %d 次，期望一一对应（事件 %+v）",
+		t.Fatalf("llm_call 调用级诊断事件 %d 条，模型调用 %d 次，期望一一对应（事件 %+v）",
 			llmEvents, modelCalls, diag.Events)
+	}
+	if phaseEvents != 2*modelCalls {
+		t.Fatalf("llm_call 阶段事件 %d 条，模型调用 %d 次，期望每次两个阶段（首响应 + 响应读取）",
+			phaseEvents, modelCalls)
 	}
 
 	unknown := us16Diagnostics(t, addr, "run_us16_demo_unknown", nil)
@@ -498,9 +516,10 @@ type us16DiagnosticsReading struct {
 // us16DiagnosticEvent 是一条诊断事件（只取本用例判的字段）。
 // us16DiagnosticEvent is one diagnostic event as this demo judges it.
 type us16DiagnosticEvent struct {
-	EventID     string `json:"event_id"`
-	Kind        string `json:"kind"`
-	ReasonCode  string `json:"reason_code"`
+	EventID     string         `json:"event_id"`
+	Kind        string         `json:"kind"`
+	ReasonCode  string         `json:"reason_code"`
+	Attrs       map[string]any `json:"attrs"`
 	Correlation struct {
 		RunID string `json:"run_id"`
 	} `json:"correlation"`

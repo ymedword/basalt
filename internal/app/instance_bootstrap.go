@@ -6,14 +6,14 @@ package app
 // 都不存在，才是新实例。库里已经有数据但它只是没写 YAML 的存量实例，**不得**当成新实例
 // 放宽预算或补生成密钥——那等于替运维改了上限、还替它造了一把新钥匙。
 //
-// 生成次序也是判据的一部分：配置先写、初始化进度记录次之、名册最后。这样"名册在、配置
+// 生成次序也是判据的一部分：配置先写、初始化进度与安装意图次之、名册最后。这样"名册在、配置
 // 不在"只可能由异常中断造成，而"配置在、名册不在"会被下一次启动继续当作新实例补写名册；
 // 反向次序会让一次崩溃永久跳过一次配置生成。进度记录必须先于名册——名册一旦落盘，下一次
-// 启动就不再是"新实例"，中断后的重试只能靠这条记录继续把首次初始化做完（见
-// instance_provisioning.go）。
+// 启动就不再是"新实例"。凭据由初始化进度记录判定，内置安装则由既有incomplete标记续做；
+// 二者不互相代替，也不把全局fresh重新置真。
 //
 // The only definition of a new instance is that neither the database nor the roster
-// exists. The config is written first, then the provisioning record, then the roster:
+// exists. The config is written first, then provisioning and installer intent, then the roster:
 // once the roster is on disk a restart is no longer "fresh", so the record — not the
 // roster vote — is what lets an interrupted first start finish its one-shot work.
 
@@ -193,6 +193,11 @@ func ensureNewInstanceConfig(workDir, runtimeRoot string) (instanceBootstrapRepo
 		return report, fmt.Errorf("记录首次初始化进度: %w", err)
 	}
 	report.ProvisioningRecorded = true
+	// 安装器的既有incomplete标记也先于名册：入口配置拒绝后仍由原标记幂等续做。
+	// Preserve the installer's own incomplete intent before an early refusal loses freshness.
+	if err := recordBuiltinOpenBoxIntent(filepath.Join(workDir, workspaceDirName), id); err != nil {
+		return report, fmt.Errorf("记录首次内置安装意图: %w", err)
+	}
 
 	// ③ 名册最后写：标识只在本进程真正写出时才有意义（EEXIST 说明别人已经写好）。
 	marker := instanceMarker{Version: instanceMarkerVersion, InstanceID: id}
@@ -245,6 +250,57 @@ func createExclusiveFile(base *os.Root, name string, content []byte) (bool, erro
 		return false, err
 	}
 	return true, file.Close()
+}
+
+// recordBuiltinOpenBoxIntent 在严格新实例失去fresh判据前独占发布既有格式的安装意图。
+// Publish the existing incomplete installer marker before the roster makes a new start non-fresh.
+func recordBuiltinOpenBoxIntent(wsRoot, candidateID string) (retErr error) {
+	if !instanceIDPattern.MatchString(candidateID) {
+		return errors.New("内置安装意图的候选实例标识非法")
+	}
+	base, err := os.OpenRoot(wsRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = base.Close() }()
+	if err := base.MkdirAll(builtinOpenBoxControlDir, 0o750); err != nil {
+		return err
+	}
+	info, err := base.Lstat(builtinOpenBoxControlDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("内置安装意图的control必须是目录")
+	}
+	raw, err := json.MarshalIndent(builtinOpenBoxState{SchemaVersion: builtinOpenBoxSchema}, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	tmp := filepath.Join(builtinOpenBoxControlDir, ".builtin-openbox-"+candidateID+".tmp")
+	file, err := base.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := base.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			retErr = errors.Join(retErr, fmt.Errorf("清理本次内置安装意图临时文件: %w", err))
+		}
+	}()
+	_, writeErr := file.Write(raw)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = file.Sync()
+	}
+	if err := errors.Join(writeErr, syncErr, file.Close()); err != nil {
+		return err
+	}
+	final := filepath.Join(builtinOpenBoxControlDir, builtinOpenBoxFileName)
+	if err := base.Link(tmp, final); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("独占发布内置安装意图: %w", err)
+	}
+	return nil
 }
 
 // pathExists 报告路径是否存在（跟随链接）；不存在的错误不外抛。

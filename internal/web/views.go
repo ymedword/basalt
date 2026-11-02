@@ -383,6 +383,7 @@ type SessionDetailView struct {
 // scheduler face, falling back to api when empty) and reason is the public projection.
 type RunView struct {
 	RunID      string `json:"run_id"`
+	RequestID  string `json:"request_id,omitempty"`
 	SessionID  string `json:"session_id"`
 	Agent      string `json:"agent"`
 	Channel    string `json:"channel"`
@@ -873,6 +874,7 @@ func runView(req core.RunRequest, res core.RunResult, started, finished time.Tim
 	}
 	return RunView{
 		RunID:        res.RunID,
+		RequestID:    req.RequestID,
 		SessionID:    req.SessionID,
 		Agent:        req.Agent,
 		Channel:      req.Channel,
@@ -900,6 +902,7 @@ func runRecordView(rec core.RunDetail) RunView {
 	}
 	return RunView{
 		RunID:        rec.RunID,
+		RequestID:    rec.RequestID,
 		SessionID:    rec.SessionID,
 		Agent:        rec.Agent,
 		Channel:      rec.Channel,

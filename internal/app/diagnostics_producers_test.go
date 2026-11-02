@@ -247,6 +247,23 @@ func TestToolDiagAdapter_DropsUnknownShapeAndMissingAnchor(t *testing.T) {
 	require.Empty(t, store.events)
 }
 
+func TestObservabilityProducer_ToolCallID(t *testing.T) {
+	for _, kind := range []core.ToolDiagnosticKind{core.ToolDiagnosticCall, core.ToolDiagnosticDenied} {
+		recorder, store := producerRecorder(t)
+		newToolDiagAdapter(recorder, nil).RecordToolDiagnostic(t.Context(), core.ToolDiagnostic{
+			Kind: kind, RunID: "run-real", Tool: "fs.read", ToolCallID: "call-real", AuditID: 7,
+		})
+		require.Len(t, store.events, 1)
+		require.Equal(t, "call-real", store.events[0].Attrs["tool_call_id"])
+		// 旧事件没有实际ID时，不能用StepID、工具名或审计ID补造。
+		newToolDiagAdapter(recorder, nil).RecordToolDiagnostic(t.Context(), core.ToolDiagnostic{
+			Kind: kind, RunID: "run-real", Tool: "fs.read", StepID: "3", AuditID: 8,
+		})
+		require.Len(t, store.events, 2)
+		require.NotContains(t, store.events[1].Attrs, "tool_call_id")
+	}
+}
+
 // TestQuotaDecision_SplitsVerdictFromReason 守 `quota_decision` 的公共翻译：放行不带
 // 原因码，三种拒绝各自映射契约码，未知错误留空，缺锚点不写。
 //

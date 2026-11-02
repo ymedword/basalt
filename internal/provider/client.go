@@ -9,9 +9,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 
@@ -119,7 +122,26 @@ func (c *OpenAIClient) Chat(ctx context.Context, req core.ChatRequest) (core.Cha
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
+	var firstResponse atomic.Pointer[time.Time]
+	requestStart := time.Now()
+	if req.Timing != nil {
+		httpReq = httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), &httptrace.ClientTrace{GotFirstResponseByte: func() { at := time.Now(); firstResponse.CompareAndSwap(nil, &at) }}))
+	}
 	resp, err := c.http.Do(httpReq)
+	if req.Timing != nil {
+		end, status := time.Now(), "completed"
+		if first := firstResponse.Load(); first != nil {
+			end = *first
+		} else {
+			status = "failed"
+			if ctx.Err() != nil {
+				status = "cancelled"
+			}
+		}
+		if firstResponse.Load() != nil || err != nil {
+			req.Timing.Wait = &core.PhaseTiming{Phase: core.PhaseFirstResponse, Parent: "model_call", StartedAt: requestStart, FinishedAt: end, Duration: end.Sub(requestStart), Status: status}
+		}
+	}
 	if err != nil {
 		// 取消 / 截止归并记 timeout（错误链经 Unwrap 保留，errors.Is 仍可判）；
 		// 其余传输层失败（DNS / 连接 / TLS）归 external_error。
@@ -140,8 +162,19 @@ func (c *OpenAIClient) Chat(ctx context.Context, req core.ChatRequest) (core.Cha
 	// 上限落在读之前：`io.ReadAll` 无条件读到 EOF，会让失控响应按供应商给的体量吃内存。
 	// The cap sits before the read: an unbounded read would let a runaway response size
 	// the client's memory.
+	readStart := time.Now()
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	closeErr := resp.Body.Close()
+	if req.Timing != nil {
+		end, status := time.Now(), "completed"
+		if readErr != nil || closeErr != nil || len(raw) > maxResponseBodyBytes {
+			status = "failed"
+			if ctx.Err() != nil {
+				status = "cancelled"
+			}
+		}
+		req.Timing.Read = &core.PhaseTiming{Phase: core.PhaseResponseRead, Parent: "model_call", StartedAt: readStart, FinishedAt: end, Duration: end.Sub(readStart), Status: status}
+	}
 	if readErr != nil {
 		// 读取阶段同样要分两类：**响应头已返回**后因取消 / 截止中断 → timeout（与传输阶段
 		// 同一归并口径，错误链区分保留）；其余读取失败（对端半途断开等）仍是 external_error。

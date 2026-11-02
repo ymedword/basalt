@@ -68,6 +68,7 @@ func (r *ToolInvocationRepo) BeginInvocation(ctx context.Context, inv core.ToolI
 		inv.RunID, nullIfEmpty(inv.SessionID), nullIfEmpty(inv.ToolCallID), inv.ToolName,
 		nullIfEmpty(string(inv.InputJSON)), string(core.LLMCallPending), startedAt.UnixMilli()).Scan(&id)
 	if err != nil {
+		r.db.noteAuditWriteFailure("tool_invocations", "begin")
 		return 0, fmt.Errorf("预写工具审计行（tool=%s）: %w", inv.ToolName, err)
 	}
 	return id, nil
@@ -96,6 +97,7 @@ func (r *ToolInvocationRepo) FinishInvocation(ctx context.Context, id int64, res
 		result.Duration.Milliseconds(), result.Duration.Milliseconds(),
 		id, string(core.LLMCallPending))
 	if err != nil {
+		r.db.noteAuditWriteFailure("tool_invocations", "finish")
 		return fmt.Errorf("回填工具审计行终态（id=%d）: %w", id, err)
 	}
 

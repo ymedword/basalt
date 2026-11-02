@@ -74,6 +74,7 @@ type loopHarness struct {
 	// （nil = 不记账，既有全部用例的默认）。
 	// runQuota is the run-level task-count port, injected at construction only.
 	runQuota core.RunQuota
+	phases   core.PhaseRecorder
 
 	// 压缩接线（V-7 判据需要"压缩已装配"的 Run）：两字段一并经 withCompaction 置入。
 	compactionReserve int
@@ -172,6 +173,7 @@ func newLoopHarness(t *testing.T, opts ...harnessOption) *loopHarness {
 		Audit:     h.audit,
 		Memory:    h.memory,
 		RunQuota:  h.runQuota,
+		Phases:    h.phases,
 		Loop: core.NewReActLoop(
 			core.NewPromptBuilder(h.registry),
 			core.NewToolExecutor(h.registry, h.audit, logger),

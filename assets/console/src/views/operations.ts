@@ -2,11 +2,12 @@
 // 只读；不提供导出或企业级检索（扩展阶段）。
 // Operations audit view: the fixed-window list and detail of management-side
 // changes. Read-only; export and enterprise search stay out of this phase.
-import { defineComponent, h, ref } from 'vue'
+import { defineComponent, h, nextTick, onUnmounted, ref } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import { errorMessage } from '../api'
 import type { OperationDetail, OperationStatus, OperationTargetKind } from '../api'
 import { CodeBlock, DataTable, Notice, formatTimestamp } from '../components/ui'
+import { observabilityHref } from '../router'
 import {
   OPERATION_STATUS_LABELS,
   badge,
@@ -106,17 +107,35 @@ export const OperationsView = defineComponent({
     const selected = ref<OperationDetail | null>(null)
     const detailError = ref('')
     const detailLoading = ref(false)
+    const detailOpen = ref(false)
+    const detailPanel = ref<HTMLElement | null>(null)
+    let detailEpoch = 0
+    let detailTrigger: HTMLElement | null = null
+    onUnmounted(() => { detailEpoch++ })
+
+    function closeDetail(): void {
+      detailEpoch++
+      detailOpen.value = false
+      detailLoading.value = false
+      selected.value = null
+      detailError.value = ''
+      detailTrigger?.focus()
+    }
 
     async function openDetail(operationId: string): Promise<void> {
+      const epoch = ++detailEpoch
+      detailOpen.value = true
+      selected.value = null
       detailLoading.value = true
       detailError.value = ''
+      void nextTick(() => detailPanel.value?.focus())
       try {
-        selected.value = await api.getOperation(operationId)
+        const detail = await api.getOperation(operationId)
+        if (epoch === detailEpoch) selected.value = detail
       } catch (caught) {
-        detailError.value = errorMessage(caught)
-        selected.value = null
+        if (epoch === detailEpoch) detailError.value = errorMessage(caught)
       } finally {
-        detailLoading.value = false
+        if (epoch === detailEpoch) detailLoading.value = false
       }
     }
 
@@ -240,7 +259,8 @@ export const OperationsView = defineComponent({
                   'button',
                   {
                     type: 'button',
-                    onClick: () => {
+                    onClick: (event: MouseEvent) => {
+                      detailTrigger = event.currentTarget as HTMLElement
                       void openDetail(item.operation_id)
                     },
                   },
@@ -253,13 +273,24 @@ export const OperationsView = defineComponent({
         )
       }
 
-      if (detailError.value !== '') {
-        content.push(h(Notice, { tone: 'error', text: detailError.value }))
-      }
-      if (detailLoading.value) {
-        content.push(h('p', { class: 'muted' }, '详情加载中…'))
-      }
-      content.push(renderDetail())
+      if (detailOpen.value) content.push(h('div', {
+        class: 'dialog-backdrop',
+        onClick: (event: MouseEvent) => { if (event.target === event.currentTarget) closeDetail() },
+      }, [h('section', {
+        class: 'operation-detail-dialog', ref: detailPanel, role: 'dialog', 'aria-modal': 'true', 'aria-label': '管理操作详情', tabindex: -1,
+        onKeydown: (event: KeyboardEvent) => {
+          if (event.key === 'Escape') { event.preventDefault(); closeDetail() }
+          if (event.key !== 'Tab') return
+          const controls = detailPanel.value?.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), [tabindex="0"]')
+          const first = controls?.[0], last = controls?.[controls.length - 1]
+          if (event.shiftKey && (document.activeElement === first || document.activeElement === detailPanel.value)) { event.preventDefault(); last?.focus() }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+        }
+      }, [h('div', {class: 'card-head'}, [h('h2', '管理操作详情'), h('button', {type: 'button', onClick: closeDetail, 'aria-label': '关闭操作详情'}, '关闭')]),
+        detailLoading.value ? h('p', {role: 'status'}, '详情加载中…') : null,
+        detailError.value ? h(Notice, {tone: 'error', text: detailError.value}) : null,
+        renderDetail(), selected.value ? h('a', {href: observabilityHref('query', ['operation_id', selected.value.operation_id])}, '查看此操作的排障记录') : null
+      ])]))
 
       return h('section', { class: 'view view-operations' }, [pageHeading('SYSTEM / 09', '管理操作', '追溯管理面的配置变更、操作者与执行结果。'), ...content])
     }

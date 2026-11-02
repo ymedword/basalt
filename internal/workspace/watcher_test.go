@@ -248,6 +248,31 @@ func TestWatcher_AtomicReplaceMarksAgent(t *testing.T) {
 	require.Empty(t, cs.Skills)
 }
 
+// TestWatcher_DirectorySwapKeepsFileEvents 验证真实目录交换后新inode仍受监听，不能靠注入事件过关。
+// The watcher must observe a real file edit after the editor replaces its parent directory.
+func TestWatcher_DirectorySwapKeepsFileEvents(t *testing.T) {
+	root := t.TempDir()
+	_, err := workspace.Init(root)
+	require.NoError(t, err)
+	writeAgent(t, root, "reporter", "old")
+	w, changes := startWatcher(t, root)
+	runWatcher(t, w)
+
+	_, etag, err := workspace.ManagedAgentFiles(root, "reporter")
+	require.NoError(t, err)
+	_, _, err = workspace.SubmitAgentFiles(root, "reporter", etag, []core.AuthorFile{{
+		Path: "AGENT.md", Content: "---\nname: reporter\nprovider:\n  name: mock\n  model: replaced\n---\n\nReplaced.\n",
+	}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"reporter"}, waitChange(t, changes).Agents)
+	requireNoChange(t, changes, 2*watcherDebounceForTest)
+
+	writeFile(t, filepath.Join(root, "agents", "reporter", "AGENT.md"),
+		"---\nname: reporter\nprovider:\n  name: mock\n  model: edited\n---\n\nEdited after swap.\n")
+	require.Equal(t, []string{"reporter"}, waitChange(t, changes).Agents,
+		"a replaced directory must retain real file notifications without NotifyForTest")
+}
+
 // TestWatcher_NewDirectoryAddsWatch：新建 Agent 目录补一条 watch——目录创建上报一次，
 // 随后写进该目录的文件必须**再次**触发变更（没有补监听就只有第一条）。
 // 逆改点：不补 watch → 第二次等待超时。

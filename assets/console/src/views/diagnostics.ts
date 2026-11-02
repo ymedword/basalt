@@ -23,12 +23,13 @@ import type { DiagnosticEventView, DiagnosticKind, DiagnosticQuery } from '../ap
 import { DataTable, Notice, formatTimestamp } from '../components/ui'
 import type { TableRow } from '../components/ui'
 import { runHref } from '../router'
+import { isVisibilityFilter, observationReasonLabel, visibilityFilterNote } from '../observation-copy'
 import { identifier, pageHeading, useLoader, viewProps } from './shared'
 
 /**
  * 五类主锚点（契约 `oneOf` 的固定集合）；`task_id` 不在其中，只作限定符。
- * `produced=false` 表示契约支持但**当前没有生产端写这类关联**——查了也只会得到空集，
- * 必须如实标注，不能让用户以为"没记录就是没发生"。
+ * `produced=false` 表示当前缺少真实关联；Session虽不直接存事件列，仍可经runs解析。
+ * 必须如实区分查询覆盖与事件直接写入，不能让用户以为"没记录就是没发生"。
  */
 // The five contract anchors; produced=false marks anchors no producer currently sets.
 const ANCHORS = [
@@ -36,7 +37,7 @@ const ANCHORS = [
   { value: 'request_id', label: '请求 ID', produced: true },
   { value: 'operation_id', label: '管理操作 ID', produced: false },
   { value: 'ingest_job_id', label: '摄取任务 ID', produced: true },
-  { value: 'session_id', label: '会话 ID', produced: false },
+  { value: 'session_id', label: '会话 ID', produced: true },
 ] as const
 
 type AnchorValue = (typeof ANCHORS)[number]['value']
@@ -53,6 +54,7 @@ const COVERED_KINDS: ReadonlySet<DiagnosticKind> = new Set<DiagnosticKind>([
   'tool_call',
   'permission_decision',
   'quota_decision',
+  'ingest_stage',
 ])
 
 /** 原因码 → 用户可读文案；键名逐字等于 `DiagnosticReasonCode`（契约注释把文案归 UI）。 */
@@ -75,6 +77,7 @@ const REASON_LABELS: Record<string, string> = {
   migration_verify_failed: '迁移校验失败',
   llm_call_failed: '模型调用没有拿到可用响应',
   concurrency_limited: '并发名额不足（随请求结束恢复）',
+  chunk_invalidated: '资料可见性已收窄',
 }
 
 /** 判定 → 中文；四值与契约 `decision` 枚举逐字对应，空串保持空。 */
@@ -91,8 +94,8 @@ const DECISION_LABELS: Record<string, string> = {
 function coverageText(): string {
   const kinds = KIND_OPTIONS.filter((kind) => COVERED_KINDS.has(kind)).map((kind) => KIND_LABELS[kind])
   const anchors = ANCHORS.filter((anchor) => anchor.produced).map((anchor) => anchor.label)
-  return `当前有生产端的种类：${kinds.join(' / ')}；有生产端的锚点：${anchors.join(' / ')}。` +
-    '未列出的种类与「管理操作 ID / 会话 ID」暂无生产端——查空不等于没发生。' +
+  return `当前有生产端的种类：${kinds.join(' / ')}；可关联查询的锚点：${anchors.join(' / ')}。` +
+    '未列出的种类与「管理操作 ID」暂无生产端——查空不等于没发生。会话 ID 经既有运行关联解析。' +
     '请求 ID 由入口限流与准入拒绝写入，是 Run 账本建立之前定位拒绝现场的唯一锚点。'
 }
 
@@ -208,11 +211,12 @@ function verdictCell(event: DiagnosticEventView): VNodeChild {
       ? '决策 —'
       : `决策 ${DECISION_LABELS[decisionRaw] ?? decisionRaw}`
   const reasonRaw = event.reason_code
-  const reasonText = reasonRaw === '' ? '原因 —' : `原因 ${REASON_LABELS[reasonRaw] ?? reasonRaw}`
+  const reasonText = reasonRaw === '' ? '原因 —' : `原因 ${observationReasonLabel(event.kind, reasonRaw, REASON_LABELS[reasonRaw] ?? reasonRaw)}`
   return h('div', { class: 'muted small' }, [
     h('span', { title: decisionRaw }, decisionText),
     h('br'),
     h('span', { title: reasonRaw }, reasonText),
+    isVisibilityFilter(event.kind, reasonRaw) ? h('p', visibilityFilterNote(event.attrs.count)) : null,
   ])
 }
 
@@ -473,8 +477,8 @@ export const DiagnosticsView = defineComponent({
       return h('section', { class: 'view view-diagnostics' }, [
         pageHeading(
           'SYSTEM / DIAGNOSTICS',
-          '诊断事件',
-          '按关联标识与时间窗查看结构化诊断事件；缺记录按证据缺口呈现，导出归后续模块。',
+          '诊断明细',
+          '逐条查看原始诊断事件和关联标识；通常先到「运行排障」查看结果、耗时与失败原因。',
         ),
         ...content,
       ])

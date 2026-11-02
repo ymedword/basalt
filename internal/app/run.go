@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/ymedword/basalt/internal/historyretention"
+
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/storage/postgres"
@@ -127,6 +129,11 @@ func Run(ctx context.Context, args []string) int {
 	configPath := filepath.Join(workDir, configFileName)
 	cfg, cfgErr := cli.LoadConfig(configPath, os.LookupEnv)
 	logger := bootstrapLogger(cfg, cfgErr, configPath)
+	var retentionLog *retentionLogWriter
+	if serveInit && cfgErr == nil && cfg.Observability.Retention.HistoryEnabled {
+		retentionLog = &retentionLogWriter{}
+		logger = loggerWithWriter(cfg, retentionLog)
+	}
 	if bootstrap.Fresh {
 		// 只报**本次真的做了什么**：配置已存在时不得声称"写了 30 轮预算"。
 		// Report only what actually happened; an existing config is never rewritten.
@@ -253,6 +260,20 @@ func Run(ctx context.Context, args []string) int {
 		if rtErr != nil {
 			logger.Error("重路径装配失败", "error", rtErr)
 			return 1
+		}
+		if retentionLog != nil {
+			files, fileErr := historyretention.OpenFiles(a.wsRoot(), cfg.Observability.Retention.HistoryDays)
+			if fileErr != nil {
+				logger.Error("history file retention unavailable")
+				_ = rt.Close()
+				return 1
+			}
+			defer files.Close()
+			retentionLog.bind(files)
+			previousDefault := slog.Default()
+			slog.SetDefault(logger)
+			defer slog.SetDefault(previousDefault)
+			rt.observability.Files = files
 		}
 		deps.RunService = rt.runService()
 		deps.SessionLister = rt.sessionLister()

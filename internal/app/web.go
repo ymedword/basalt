@@ -354,6 +354,10 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// The write port used by the ingress middleware; the same recorder as the run path.
 		DiagnosticWriter: rt.diagRecorder,
 	}
+	if rt.observability != nil {
+		opts.ObservationLifecycle = rt.observability
+		opts.Observability = rt.observability
+	}
 	a.wireManagementPorts(&opts, rt)
 	wireWritePorts(&opts, rt)
 	wireKnowledgePorts(&opts, rt)

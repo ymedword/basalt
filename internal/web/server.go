@@ -25,9 +25,11 @@ import (
 // Options 是 web 面的装配输入。所有端口由 app 层适配；web 只依赖 core 与标准库。
 // Options is the assembly surface; every port is adapted by the app layer.
 type Options struct {
-	Addr            string        // 空 → defaultAddr
-	MaxRequestBytes int64         // ≤0 → defaultMaxRequestBytes
-	RunTimeout      time.Duration // 0 → defaultRunTimeout
+	Observability        ObservabilityReader
+	ObservationLifecycle ObservationLifecycle
+	Addr                 string        // 空 → defaultAddr
+	MaxRequestBytes      int64         // ≤0 → defaultMaxRequestBytes
+	RunTimeout           time.Duration // 0 → defaultRunTimeout
 	// ScheduleRunTimeout 是手动补跑（POST /schedules/{id}/run）的时限：该端点与定时
 	// 触发共用同一条执行链，预算也取定时运行的 300s（app 层注入同一常量），否则真实
 	// 业务 Demo 会在 60s 处被 HTTP 层截断而定时触发却能跑完。
@@ -555,7 +557,7 @@ func checkRouteSurfaces(rows []route) error {
 // 全部 handler 退出，调用方随后才可释放 MCP / 数据库 / 锁。
 // Run serves until ctx is cancelled and then drains per the five-phase protocol; an
 // abnormal Serve error takes the very same cleanup path.
-func (s *Server) Run(ctx context.Context) error {
+func (s *Server) Run(ctx context.Context) (runErr error) {
 	ln := s.opts.Listener
 	if ln == nil {
 		var err error
@@ -563,6 +565,24 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("监听 %s: %w", s.opts.Addr, err)
 		}
+	}
+	// Shutdown可能先于Serve登记监听器；调用方持有的监听器仍须在所有退出路径释放。
+	// Shutdown may precede Serve's listener registration; the owner still releases it on every exit.
+	defer func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			runErr = errors.Join(runErr, err)
+		}
+	}()
+	if worker := s.opts.ObservationLifecycle; worker != nil {
+		if err := worker.Start(ctx); err != nil {
+			closeErr := ln.Close()
+			workerErr := worker.Close()
+			if ctx.Err() != nil && closeErr == nil && workerErr == nil {
+				return nil
+			}
+			return errors.Join(err, closeErr, workerErr)
+		}
+		defer func() { runErr = errors.Join(runErr, worker.Close()) }()
 	}
 	srv := s.newHTTPServer(ctx)
 	errCh := make(chan error, 1)
@@ -766,6 +786,13 @@ func (s *Server) routeTable() []route {
 		// 读取面不写管理操作审计，也不提供导出（导出归 US-16A（拟）OBS，R23 裁决 1）。
 		// The read-only diagnostics row; export is deliberately absent.
 		{method: http.MethodGet, pattern: "/api/v1/diagnostics", visibility: routeProtected, adminHandler: s.handleListDiagnostics},
+		{method: http.MethodGet, pattern: "/api/v1/observability/overview", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/timeline", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/context", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/metrics", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/alerts", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/export", visibility: routeProtected, adminHandler: s.handleObservability},
+		{method: http.MethodGet, pattern: "/api/v1/observability/cleanup", visibility: routeProtected, adminHandler: s.handleObservability},
 		{method: http.MethodGet, pattern: "/api/v1/system/overview", visibility: routeProtected, adminHandler: s.handleSystemOverview},
 		{method: http.MethodGet, pattern: "/api/v1/system/sample", visibility: routeProtected, adminHandler: s.handleSystemSample},
 		{method: http.MethodGet, pattern: "/api/v1/skills", visibility: routeProtected, adminHandler: s.handleListSkills},

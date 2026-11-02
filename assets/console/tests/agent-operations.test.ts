@@ -549,6 +549,7 @@ describe('agent session operations', () => {
 
     // 直接打开深链等价于刷新 / 收藏 / 从别处分享进来，页面独立读取会话。
     await visit('/console/agents/writer/sessions/s-1')
+    expect(wrapper!.findAll('a').some(item => item.text() === '运行排障' && item.attributes('href') === '/console/observability?view=query&session_id=s-1')).toBe(true)
     await wrapper!.find('#session-chat-input').setValue('hello')
     await button('发送并运行').trigger('click')
     await flushPromises()

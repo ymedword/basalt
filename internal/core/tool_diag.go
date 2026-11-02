@@ -44,6 +44,9 @@ type ToolDiagnostic struct {
 	StepID string
 	Seq    int64
 	Tool   string
+	// ToolCallID 来自模型实际返回的调用标识；没有标识时保持空。
+	// ToolCallID preserves the real model-provided call identity.
+	ToolCallID string
 	// ErrorKind 是失败分类（八类字面量之一）；成功时留空。
 	ErrorKind ErrorKind
 	// AuditID 是 `tool_invocations` 的行标识（预写成功才有）；0 表示没有审计行。

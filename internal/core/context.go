@@ -272,6 +272,18 @@ type AssemblyCandidate struct {
 	RerankScore    float64 // 重排分（未重排时为零值；是否走过重排由 `Purpose` 与 `Decisions` 表达，**不得**用零值反推）
 	Rank           int     // 最终名次
 	ACLDecision    string  // ACL 决定（`allow` / `deny`）
+	Decision       string  // 真实排序/预算决定：kept / rank_cut / budget_drop。
+}
+
+// RetrievalRecord 保存检索实际参数，索引代际未知时保留缺失。
+// RetrievalRecord preserves real retrieval parameters and optional generation.
+type RetrievalRecord struct {
+	TopK            int    `json:"top_k"`
+	CandidateK      int    `json:"candidate_k"`
+	BudgetTokens    int    `json:"budget_tokens"`
+	FilteredCount   int    `json:"filtered_count"`
+	FilteredReason  string `json:"filtered_reason"`
+	IndexGeneration *int   `json:"index_generation,omitempty"`
 }
 
 // CompressionRecord 是本轮压缩的**真实结果**（**不得**写占位零值）：成功记条目引用与
@@ -338,6 +350,7 @@ type AssemblyRecord struct {
 	PromptVersion    string
 	ModelVersion     string
 	Budget           ContextBudget
+	Retrieval        *RetrievalRecord
 	EstimatorVersion string
 	Candidates       []AssemblyCandidate
 	Hits             []string

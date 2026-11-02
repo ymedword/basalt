@@ -36,13 +36,13 @@ const assemblyRecordIDPrefix = "ctxa_"
 // assemblyRecordColumns has exactly one copy, shared by the insert.
 const assemblyRecordColumns = `record_id, run_id, step_id, llm_call_id, purpose, agent,
 	prompt_version, model_version, budget, estimator_version, candidates, hits, decisions,
-	reason_codes, compression, history_trim, final_segments, created_at`
+	reason_codes, compression, history_trim, final_segments, created_at, retrieval`
 
 // assemblyInsert 是单行插入：18 个占位符逐列对应 `assemblyRecordColumns`。
 // assemblyInsert writes one row; the placeholders line up with the column list.
 const assemblyInsert = `INSERT INTO context_assembly_records (` + assemblyRecordColumns + `)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12::jsonb,
-		$13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb, $18)`
+		$13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb, $18, $19::jsonb)`
 
 // assemblyStore 是 `context_assembly_records` 的写入实现。
 // assemblyStore implements the assembly recorder port.
@@ -93,6 +93,7 @@ type assemblyCandidateJSON struct {
 	RerankScore    float64 `json:"rerank_score"`
 	Rank           int     `json:"rank"`
 	ACLDecision    string  `json:"acl_decision"`
+	Decision       string  `json:"decision,omitempty"`
 }
 
 // assemblyCompressionJSON 是 `compression` 列的口径：未压缩时 `decision=none` 且给原因。
@@ -231,14 +232,28 @@ func (s *assemblyStore) Record(ctx context.Context, record core.AssemblyRecord) 
 		}
 		encoded[i] = string(raw)
 	}
+	// 非chat没有上下文预算；检索摘要单独存，不能把历史缺失写成零预算。
+	// Non-chat records have no context budget; retrieval thresholds are separate.
+	var budgetValue, retrievalValue any
+	if record.Purpose == core.PurposeChat {
+		budgetValue = encoded[0]
+	}
+	if record.Purpose == core.PurposeRetrieval && record.Retrieval != nil {
+		raw, err := json.Marshal(record.Retrieval)
+		if err != nil {
+			logger.Warn("assembly retrieval encoding failed", "run_id", record.RunID, "error", err)
+			return
+		}
+		retrievalValue = string(raw)
+	}
 
 	if _, err := s.db.pool.ExecContext(ctx, assemblyInsert,
 		recordID, record.RunID, record.StepID, llmCallID, string(record.Purpose),
 		record.Agent, record.PromptVersion, record.ModelVersion,
-		encoded[0], record.EstimatorVersion,
+		budgetValue, record.EstimatorVersion,
 		encoded[1], encoded[2], encoded[3], encoded[4],
 		encoded[5], encoded[6], encoded[7],
-		createdAt.UTC().UnixMilli(),
+		createdAt.UTC().UnixMilli(), retrievalValue,
 	); err != nil {
 		// 装配记录**可丢弃**：写失败不进调用方的错误链，也**不**重试（重试会在故障期
 		// 放大压力）；但 WARN 必须带够定位信息，否则线上查不出"缺了哪一条"。
@@ -262,6 +277,7 @@ func candidatePayloads(candidates []core.AssemblyCandidate) []assemblyCandidateJ
 			RerankScore:    candidate.RerankScore,
 			Rank:           candidate.Rank,
 			ACLDecision:    candidate.ACLDecision,
+			Decision:       candidate.Decision,
 		})
 	}
 	return out

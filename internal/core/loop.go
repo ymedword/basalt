@@ -237,15 +237,21 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 		// 复核只**收窄**注入面：不重新检索、不补入新片段。
 		// Chunks are frozen per run, but their visibility is re-checked before every
 		// assembly: revocation or deletion must vanish from the very next prompt.
+		finishContext := BeginPhase(ctx, env.phases, PhaseContext, "", runID, strconv.Itoa(round), 0)
+		finishRevalidation := BeginPhase(ctx, env.phases, PhaseRevalidate, PhaseContext, runID, strconv.Itoa(round), 0)
 		l.revalidateKnowledge(ctx, runID, env)
+		finishRevalidation(ctx.Err())
 
 		// ② 轮内组装：**每轮重建**（上一轮追加的工具结果必须进本轮历史）。
 		// 不可裁部分超限 → failed + 点名 `budget.context_tokens`，**零 LLM 调用**。
 		// 压缩在组装**之前**判定（它决定本轮注入哪份摘要、保留哪段历史）；
 		// 装配记录由本循环在压缩结论并入后交给写入器（V-7）；未接线时只算不落库，
 		// 行为与接线前逐字一致（P-12）。
+		finishCompaction := BeginPhase(ctx, env.phases, PhaseCompaction, PhaseContext, runID, strconv.Itoa(round), 0)
 		outcome := l.compact(ctx, runID, round, env)
+		finishCompaction(outcome.abort)
 		if outcome.abort != nil {
+			finishContext(outcome.abort)
 			// 压缩的接线 / 存储失败是基础设施失败，不静默降级成"看起来正常的一轮"；
 			// 取消不算失败（轮首与轮内口径一致）。
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -253,14 +259,18 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 			}
 			return env.fail(outcome.abort, round-1, toolCalls), nil
 		}
+		finishAssembly := BeginPhase(ctx, env.phases, PhaseAssembly, PhaseContext, runID, strconv.Itoa(round), 0)
 		prompt, record, err := l.builder.Build(ctx, env, outcome.inputs)
+		finishAssembly(err)
 		if err != nil {
+			finishContext(err)
 			return env.fail(err, round-1, toolCalls), nil
 		}
 		record.Compression = outcome.record
 		// ②¼ 装配证据落库（V-7）：压缩结论并入之后、模型调用之前交出本轮记录。
 		// 写入**无错误返回**：记录可丢弃，Run 不因证据写失败而失败。
 		l.recordAssembly(ctx, runID, round, env, record)
+		finishContext(nil)
 
 		// ②½ 配额预留（图 6 [5]）：在唯一的模型调用入口**之前**、且在 ProviderService 的
 		// 审计预写 [6] 之前申请本次调用的额度。拒绝属"准入期拒绝"（契约 §2：error 只表达

@@ -1,8 +1,10 @@
 package app
 
 import (
+	"io"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/ymedword/basalt/internal/cli"
 )
@@ -19,7 +21,9 @@ import (
 // 日志一律写标准错误：标准输出留给命令结果本身，两路分离才能让状态报告
 // 与日志各自可读、各自可被测试独立捕获。
 // Logs go to stderr so that stdout carries command results only.
-func NewLogger(cfg *cli.Config) *slog.Logger {
+func NewLogger(cfg *cli.Config) *slog.Logger { return loggerWithWriter(cfg, os.Stderr) }
+
+func loggerWithWriter(cfg *cli.Config, output io.Writer) *slog.Logger {
 	level := slog.LevelInfo
 	format := "text"
 	if cfg != nil {
@@ -32,9 +36,9 @@ func NewLogger(cfg *cli.Config) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
 	if format == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
+		handler = slog.NewJSONHandler(output, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		handler = slog.NewTextHandler(output, opts)
 	}
 	return slog.New(handler)
 }
@@ -53,4 +57,26 @@ func logLevel(level string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// Logger ports are constructed before the runtime acquires its workspace lock.
+// Switch to managed files only after that one runtime has been assembled.
+type retentionLogWriter struct {
+	mu     sync.Mutex
+	output io.Writer
+}
+
+func (w *retentionLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.output == nil {
+		return os.Stderr.Write(p)
+	}
+	return w.output.Write(p)
+}
+
+func (w *retentionLogWriter) bind(output io.Writer) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.output = output
 }

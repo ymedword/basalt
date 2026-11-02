@@ -84,6 +84,7 @@ func (s *ManagementStore) BeginOperation(ctx context.Context, rec core.Operation
 		nullIfZeroInt64(rec.RequestedVersionID), nullIfEmpty(rec.ExpectedETag),
 		detail, createdAt.UnixMilli())
 	if err != nil {
+		s.db.noteAuditWriteFailure("management_operations", "begin")
 		return fmt.Errorf("预写管理操作 %s: %w", rec.OperationID, err)
 	}
 	return nil
@@ -107,17 +108,18 @@ func (s *ManagementStore) FinishOperation(ctx context.Context, operationID strin
 	if err != nil {
 		return fmt.Errorf("回填管理操作 %s: %w", operationID, err)
 	}
-
 	tx, err := s.db.pool.BeginTx(ctx, nil)
 	if err != nil {
+		s.db.noteAuditWriteFailure("management_operations", "begin_transaction")
 		return fmt.Errorf("回填管理操作 %s: 开启事务: %w", operationID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := finishOperationTx(ctx, tx, operationID, status, resultCode, errorMessage, detail, now); err != nil {
+	if err := finishOperationTx(ctx, s.db, tx, operationID, status, resultCode, errorMessage, detail, now); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		s.db.noteAuditWriteFailure("management_operations", "commit")
 		return fmt.Errorf("回填管理操作 %s: 提交: %w", operationID, err)
 	}
 	return nil
@@ -127,7 +129,7 @@ func (s *ManagementStore) FinishOperation(ctx context.Context, operationID strin
 // 只更新仍为 pending 的行；0 行时读当前状态区分"已终态（幂等）"与"不存在"。
 // finishOperationTx is the single terminal-write implementation, reused by US-12's
 // publish/archive transactions; it updates pending rows only.
-func finishOperationTx(ctx context.Context, tx *sql.Tx, operationID string, status core.OperationStatus, resultCode, errorMessage string, detailJSON []byte, now time.Time) error {
+func finishOperationTx(ctx context.Context, db *DB, tx *sql.Tx, operationID string, status core.OperationStatus, resultCode, errorMessage string, detailJSON []byte, now time.Time) error {
 	if !isTerminalOperationStatus(status) {
 		return fmt.Errorf("回填管理操作 %s: 终态必须是 success / failed / unknown，收到 %q", operationID, status)
 	}
@@ -144,10 +146,12 @@ func finishOperationTx(ctx context.Context, tx *sql.Tx, operationID string, stat
 		nullIfEmpty(truncateUTF8(errorMessage, maxErrorMessageBytes)), detailJSON,
 		now.UnixMilli(), operationID)
 	if err != nil {
+		db.noteAuditWriteFailure("management_operations", "finish")
 		return fmt.Errorf("回填管理操作 %s: %w", operationID, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
+		db.noteAuditWriteFailure("management_operations", "finish")
 		return fmt.Errorf("回填管理操作 %s: 读取影响行数: %w", operationID, err)
 	}
 	if affected > 0 {

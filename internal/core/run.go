@@ -203,7 +203,8 @@ func (e *ResourceUnavailableError) Unwrap() error { return e.Cause }
 // §1.1 set verbatim (v3 adds AgentUID); the unexported fields are injection points forced
 // by the frozen method signatures and never appear in any outbound shape.
 type RunEnv struct {
-	Req RunRequest
+	phases PhaseRecorder
+	Req    RunRequest
 	// AgentUID 是准入时从生命周期状态文件读取的稳定身份：资源资格判定只用它、不用名称。
 	// 空串 = 本次运行未接线生命周期（手工构造的测试环境），资格判定必须据此拒绝。
 	AgentUID AgentUID
@@ -419,6 +420,7 @@ func (e *RunEnv) llmEnv(runID string, round int, p Prompt) ChatRequest {
 	msgs = append(msgs, Message{Role: roleSystem, Content: p.System}) // 段 1 + 段 2（记忆核心区；空记忆时与段 1 逐字节相同）
 	msgs = append(msgs, p.History...)
 	return ChatRequest{
+		Phases:     e.phases,
 		Provider:   ref.Name,
 		RunID:      runID,
 		SessionID:  e.Req.SessionID,

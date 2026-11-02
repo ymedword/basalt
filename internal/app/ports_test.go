@@ -84,7 +84,17 @@ func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 52, "契约 v1 恰好 52 张表（与 postgres 包的迁移用例同一口径）")
+	require.Len(t, tables, 60, "运行期v7保留v1的52表、六张OBS表与两张保留账本表")
+	var legacy, observabilityTables []string
+	for _, table := range tables {
+		if strings.HasPrefix(table, "observability_") {
+			observabilityTables = append(observabilityTables, table)
+		} else {
+			legacy = append(legacy, table)
+		}
+	}
+	require.Len(t, legacy, 54, "v1基线的52表与保留账本的两表仍全部保留")
+	require.ElementsMatch(t, []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"}, observabilityTables)
 }
 
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**
