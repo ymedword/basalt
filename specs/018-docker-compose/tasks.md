@@ -152,7 +152,7 @@
 - [x] T050 [P] 更新 `docs/TechnicalDesign.md` §7.2 / §8.2、`docs/Requirements.md` §6.3、`docs/Compatibility.md`、根 `README.md`：只补容器部署事实，不改产品契约与既有验收口径
 - [x] T051 全量门禁：`make check`、`make cover`、`go test -race`、`sh scripts/check-acceptance.sh`（含 `us18-base` 与 `us18-linux`）；逐目标四态记录，失败即修（本机 `make check` 与 11 项全量 profile 通过；`us18-linux` 由草稿 PR 的 `container` job 判卷，证据见 run-state §5）
 - [x] T052 在 `018-docker-compose` 提交、推送并创建草稿 PR，跟进 CI；失败按失败台账修复；**不合并 main**（提交 `8b71421`＋digest 修正 `2891ece`；草稿 PR #2；run 41521764079 六 job 全绿。首次 CI 拉取失败按 F11 修复，push 重跑同步跟进）
-- [x] T053 准备人工走查实例与收口材料：启动实例、访问方式、简明验收步骤、测试 / CI 证据、已知限制；更新 `run-state.md` 未验证清单与收口结论为“待人工 review ②”（实例 `basalt-us18-demo` 运行于 127.0.0.1:8080；U-18-10 已按 CI 实跑登记；收口结论保持“待人工 review ②”，材料见交付说明）
+- [x] T053 准备人工走查实例与收口材料：启动实例、访问方式、简明验收步骤、测试 / CI 证据、已知限制；更新 `run-state.md` 未验证清单与收口结论为“待人工 review ②”（实例 `basalt-us18-demo` 运行于 127.0.0.1:8080；U-18-10 已按 CI 实跑登记；收口结论保持“待人工 review ②”，材料见交付说明。外部 review 修复后实例已用最终提交 `733a2f3` 重建镜像并更新到仓库固定 digest，保留原数据卷、实例身份与凭据，见 run-state §5）
 
 ---
 

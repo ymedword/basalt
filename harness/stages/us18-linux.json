@@ -27,7 +27,7 @@
       "id": "us18-image-build",
       "args": ["go", "test", "-json", "-count=1", "-timeout=20m", "-tags=e2e", "./internal/e2e", "-run", "^TestUS18_Image_"],
       "timeout_seconds": 1500,
-      "required_tests": ["TestUS18_Image_BuildAndRecord"],
+      "required_tests": ["TestUS18_Image_BuildAndRecord", "TestUS18_Image_PreExistingTagPreserved"],
       "level": "process"
     },
     {

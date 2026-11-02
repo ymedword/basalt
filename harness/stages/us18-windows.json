@@ -27,7 +27,7 @@
       "id": "us18-image-build",
       "args": ["wsl", "-d", "Ubuntu", "--", "bash", "-lc", "cd /mnt/d/code/basalt && BASALT_E2E_REQUIRE_DOCKER=1 GOPROXY=https://goproxy.cn go test -json -count=1 -timeout=20m -tags=e2e ./internal/e2e -run '^TestUS18_Image_'", "-json", "-count=1"],
       "timeout_seconds": 1500,
-      "required_tests": ["TestUS18_Image_BuildAndRecord"],
+      "required_tests": ["TestUS18_Image_BuildAndRecord", "TestUS18_Image_PreExistingTagPreserved"],
       "level": "process"
     },
     {
