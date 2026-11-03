@@ -83,7 +83,7 @@
 
 ## 5. 收口结论
 
-**状态：待人工 review ②**（AI 自动门禁、真实容器验收与部署 CI 按本节证据推进；绿态不代替用户验收，本节不自行写“已收口”。）
+**状态：已收口（2026-11-03；用户确认人工 review ② 通过；快进合并 `main` `09fce24 → 2017211`，PR #2 状态 MERGED，mergedAt 2026-11-03T00:55:51Z）。** 合并后 main CI（run 41556307445）六个 job 全绿，`test` job 于 2026-11-03T01:28:27Z 完成；证据见 §5.1。
 
 ### 5.1 本机门禁与验收
 
@@ -107,5 +107,7 @@
 | 全量验收（CI `test` job，修复后） | `.github/workflows/ci.yml`（run 41543696424，job 125613870443；head `733a2f3`） | PASS，11/11；current stage 33 检查、us15-linux 同 job 通过；stage lint 只读预检通过 | `.loop/runs/ci-41543696424-1/acceptance-evidence/…/report.json`（CI artifact `acceptance-evidence` ID 13188992647，指纹 `ae401cc6…`，2026-11-02T23:41Z） |
 | 最终 HEAD 全量 CI（`30393db`，含 stage 锚点强化） | run 41547602884（push；PR run 41547612855 同 SHA）：`container` job 125626904397、`test` job 125626904525 | 六 job 全绿；`container` 6/6 检查、17 用例、0 跳过、零残留；`test` 全量 profile 11/11、current stage 33 检查、us15-linux 通过 | `.loop/runs/ci-41547602884-1/…`（artifacts `container-evidence` ID 13190375837、`acceptance-evidence` ID 13190273516，指纹 `1970a9f0…`，2026-11-02T23:52Z / 2026-11-03T00:09Z） |
 | 走查实例重建（HEAD `07b041d`，版本 0.0.4） | `releasekit build` + `image build`（版本 0.0.4）后 `docker compose -p basalt-us18-demo up -d --wait`（PostgreSQL 容器未重建） | PASS：应用镜像 `sha256:3dfd4285…`、二进制 `sha256:38332596…`（go1.27.3，CGO 关；`733a2f3..07b041d` 仅文档与 stage 配置差异，构建输入未变）、PostgreSQL `sha256:7d0a41…`、健康 200、`/console/` 200；实例身份 `inst_8887959b107334c3`、旧 admin token（43 字节；带 token 200、无 token 401）与三个数据卷未变；库 schema_version=7、60 表 | 本机实测 2026-11-03，`127.0.0.1:8080`（容器 `container_image=sha256:3dfd4285…`，状态 healthy） |
+| 最终 HEAD CI（`2017211`） | run 41551561870（push）／41551567684（PR，同 SHA）：`container` job 125640146653、`test` job 125640146622 | 两轮六 job 全绿；`container` 6/6 检查、17 用例、0 跳过、零残留；`test` 11/11、current 33 检查、us15-linux | `.loop/runs/ci-41551561870-1/…`（artifacts `container-evidence` 13191933479、`acceptance-evidence` 13193239337，指纹 `39e2bd9b…`，2026-11-03T00:24Z / 00:41Z） |
+| main 合并后 CI（run 41556307445，head `2017211`） | push 到 `main` 触发；`test` job 125655922368 | 六 job 全绿；`test` 于 2026-11-03T01:28:27Z 完成（最后一步为 tzdata 隔离检查） | GitHub Actions run 41556307445（本次未另存 artifact） |
 
 说明：`us18-full` 跑在 F-02 清理断言改动之前；修复后的内容由 `us18-full-final`（`f1f1ecbb`）与 `us18-aggregate`（同指纹）两轮全量覆盖——前者覆盖 11 项 profile，后者覆盖 8 项 source/process 检查（34 用例）。`us18-aggregate`、`us18-full-final` 与 `make check` 均跑在未提交的 review 修复树上，指纹绑定当时内容。提交后的判卷由 PR #2 CI（commit `2891ece`，run 41521764079）完成：`container` job 的 `us18-linux` 阶段 6/6 与 `test` job 的全量 profile 11/11 均绿；同 SHA 的 push run 41521755007 六个 job 亦全绿。CI 指纹为 `51430a7e…`，与本地 `f1f1ecbb…` 不同是因为 digest 修正（F11，四处锁文件消费点）发生在本地全量运行之后、提交之前——两者各自绑定实际被判卷的树。`container` job 首次实跑记录 runner 环境：Docker Engine 29.4.2（API 1.54）、containerd 2.4.2、runc 1.5.2、Docker Compose v5.1.3。
