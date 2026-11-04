@@ -840,3 +840,12 @@ Claude接手时保留该待办并告知用户，不以此前T037的四角色证�
 本轮浏览器新开页遇到扩展适配器 timeoutMs 错误，未将真实页面视觉复验记为通过；
 组件渲染／交互测试及新实例只读 API 检查已通过。不阻断用户要求的定点修补交接。
 提交与CI交接见 `claude-handoff.md`；本轮未commit、push、merge、tag或正式发布。
+
+### 2026-11-04 合入 main 与 CI 收口
+
+用户确认 US19 流水线成功后，明确要求“把us19合到主分支，并完全收尾”，随后开始 US20。本条只追加交接后的提交、合并与 CI 证据，不改写上面的人工验收、失败记录与任务勾选。
+
+提交范围：a19637b（US19 实现）与 094a4ac／dcde51d／498bcd3／f87c81c／7d7968c（CI 失败修复）。分支 `019-flow-collaboration` 的 CI run 41768244811 在 7d7968c 上七个 job 全部 success（flow／postgres／build／test／console／website／container）；同轮 `test` job 11:37–12:22 约 45 分钟。
+main 从 ca9a0d2 快进到 7d7968c 并推送 origin/main；推送触发同 SHA 的重复运行 41773179803。合并为纯快进，未改写历史、契约或已发布迁移。
+仍未落实：`bid-general` 及 scope／delivery／commercial 三组对照模板的默认随包增量，保留为后续待办，不登记为已实现或已验收。
+未打 tag、未发布、未部署；未读取或上传发布私钥；60481 人工实例与 8080 用户演示未改动；本轮无真实模型调用。
