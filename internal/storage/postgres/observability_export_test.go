@@ -81,6 +81,26 @@ func TestObservabilityStore_ConcurrentEnqueue(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+// TestObservabilityStore_EnqueueToleratesPrimaryKeyConflict 确定性复现并发入队可能在
+// 主键索引上先报 23505 的路径：预置一行 item_id 与待入队项相同、三元组不同（只有外部
+// 改写或哈希碰撞才可能出现），带目标的 ON CONFLICT 会放行三元组冲突却在主键上失败；
+// 无目标的 DO NOTHING 必须把任一唯一冲突都当作幂等命中。
+// This deterministically pins the primary-key-first 23505 path: a pre-existing row shares
+// the item_id but not the unique tuple, which a targeted ON CONFLICT does not cover.
+func TestObservabilityStore_EnqueueToleratesPrimaryKeyConflict(t *testing.T) {
+	db := portTestDB(t)
+	s := NewObservabilityStore(db)
+	now := time.Now().UTC()
+	item := obsExportItem(t, "pk-conflict", now)
+	_, err := db.pool.ExecContext(t.Context(), `INSERT INTO observability_export_items(item_id,source_kind,source_id,state_hash,signal,source_terminal_at,state,created_at,updated_at)
+		VALUES ($1,'runs','other-row','other-hash','trace',$2,'pending',$2,$2)`, item.ItemID, now.UnixMilli())
+	require.NoError(t, err)
+	require.NoError(t, s.Enqueue(t.Context(), []observability.ExportItem{item}))
+	var count int
+	require.NoError(t, db.pool.QueryRowContext(t.Context(), `SELECT count(*) FROM observability_export_items`).Scan(&count))
+	require.Equal(t, 1, count)
+}
+
 func TestObservabilityStore_BatchAttemptUnknownCounts(t *testing.T) {
 	db := portTestDB(t)
 	s := NewObservabilityStore(db)

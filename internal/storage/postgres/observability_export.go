@@ -44,8 +44,17 @@ func (s *ObservabilityStore) enqueueExportItems(ctx context.Context, items []obs
 			if len(item.Payload) > 0 {
 				payload = string(item.Payload)
 			}
+			// 不指定冲突目标：表上同时有 item_id 主键与 (source_kind,source_id,state_hash)
+			// 唯一约束，而 item_id 正是该三元组的确定性摘要。并发插入同一事实时，PostgreSQL
+			// 可能先在主键索引上报告 23505；带目标的 ON CONFLICT 只处理目标索引，别的唯一
+			// 约束仍会失败。无目标的 DO NOTHING 覆盖任一唯一冲突，语义仍是幂等入队。
+			// No conflict target: the table has both an item_id primary key and the unique
+			// (source_kind,source_id,state_hash) constraint, and item_id is the deterministic
+			// digest of that tuple. Concurrent enqueues can trip the primary-key index first;
+			// a targeted ON CONFLICT only handles its arbiter index, so DO NOTHING without a
+			// target keeps enqueue idempotent across either unique violation.
 			result, err := tx.ExecContext(ctx, `INSERT INTO observability_export_items(item_id,source_kind,source_id,state_hash,signal,source_terminal_at,state,created_at,updated_at,payload)
-				VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$7,$8::jsonb) ON CONFLICT(source_kind,source_id,state_hash) DO NOTHING`, id, item.SourceKind, item.SourceID, item.StateHash, item.Signal, item.SourceTerminalAt.UnixMilli(), now, payload)
+				VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$7,$8::jsonb) ON CONFLICT DO NOTHING`, id, item.SourceKind, item.SourceID, item.StateHash, item.Signal, item.SourceTerminalAt.UnixMilli(), now, payload)
 			if err != nil {
 				return err
 			}
