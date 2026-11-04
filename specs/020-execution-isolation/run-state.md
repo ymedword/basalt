@@ -236,3 +236,10 @@ GATE-04：native首轮fmt/lint/sec通过；普通race测试发现docs_14d仍要�
 分支 CI run 41790196832：build / console / container / postgres / website / flow 六 job 全绿；`test` job 红，定位为累积 stage `015-backfill` 的两处陈旧期望——`internal/e2e/mcp_test.go:247` 仍断言“共 11 件工具”，`internal/e2e/web_test.go` 的 `wantNames` 精确列表缺 `run_code`（期望 14、实际 15）。二者均为 US20 已批准 12 工具变更后的接口适配遗漏；WSL full profile 不含该 e2e 累积检查，故本地全量门禁未暴露。
 
 处置：仅改期望值（11→12；`wantNames` 按升序增加 `run_code`），不改测试名、不断言强度、不改产品与判据文件。WSL + dev-env PG 复跑完整 `015-backfill` 的 11 个 `TestBackfill_*` 通过（99.8s），目标两条 21.1s 通过，`gofumpt -l` 与 `go vet -tags=e2e` 通过。首次复跑时 `127.0.0.1:8080` 被遗留预览进程 `basalt-ui`（PID 2747201，`/tmp/basalt-us20-preview-0g_x1a43`）占用，导致 `listen_addr_override` 环境性假红；核对 exe/cwd 后停止该临时进程并确认 8080 释放，重跑通过。修正提交后重推分支、重跑 CI，绿后再快进合并。
+
+### 2026-11-04 US-20 收口：合并与 CI
+
+- 提交范围：`167688c`（US-20 交付）→ `c8e5b45`（e2e 12 工具期望适配）。
+- 分支 CI：run 41790196832 红（`015-backfill`，已修复并如实保留）；run 41796313526 在 `c8e5b45` 上 7/7 job 成功。
+- 合并：`main` 由 `7a2c288` 快进至 `c8e5b45` 并推送；main 推送触发的 CI run 为 41801778010（记录时 queued，不作为已通过读数）。
+- 收尾环境：遗留预览进程 `basalt-ui`（PID 2747201）已停止，`127.0.0.1:8080` 释放；未 tag、未发布、未部署。
