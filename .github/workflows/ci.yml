@@ -565,7 +565,13 @@ jobs:
     env:
       BASALT_TEST_PG_DSN: postgres://basalt:basalt_ci_only@127.0.0.1:5432/basalt_test?sslmode=disable
     steps:
+      # 全历史检出：019-flow-website-check 的图示溯源用 git merge-base --is-ancestor
+      # 校验 data-source-commit，浅克隆解析不到该提交会把全部图判为无效来源。
+      # Full history: the diagram provenance check resolves data-source-commit with
+      # `git merge-base --is-ancestor`, which a shallow clone cannot resolve.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.3"
