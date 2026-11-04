@@ -107,8 +107,8 @@
     },
     {
       "path": "evaluation-protocol.json",
-      "sha256": "52f111dfed9d66ffef855538f233c3d1727a8e8ed6d838006962883f56fd7d42",
-      "bytes": 2752
+      "sha256": "c20c1fe88360a2b2f1d7b4af01c91d1d69f72c914f5c94cf839138bb713bd9b9",
+      "bytes": 2643
     },
     {
       "path": "start-review.ps1",

@@ -544,19 +544,6 @@
       "level": "source"
     },
     {
-      "id": "019-flow-website-check",
-      "args": [
-        "npm",
-        "--prefix",
-        "website",
-        "run",
-        "check"
-      ],
-      "timeout_seconds": 300,
-      "required_tests": [],
-      "level": "source"
-    },
-    {
       "id": "019-flow-website-build",
       "args": [
         "npm",
@@ -564,6 +551,19 @@
         "website",
         "run",
         "build"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-website-check",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "run",
+        "check"
       ],
       "timeout_seconds": 300,
       "required_tests": [],
