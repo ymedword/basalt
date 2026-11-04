@@ -174,21 +174,52 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// workerQueryError 仅消除已结束父上下文的单链取消包装，复合错误保守保留。
-// workerQueryError normalizes only a single chain ending in the parent's error;
-// joined errors retain every failure and the caller still performs the real join.
+// workerQueryError 仅消除已结束父上下文的纯取消错误，复合错误保守保留。
+// workerQueryError normalizes only errors made purely of the parent's cancellation;
+// joined errors carrying any other failure stay intact for the caller's real join.
 func workerQueryError(ctx context.Context, err error) error {
-	if ctx.Err() == nil {
-		return err
-	}
-	cause := err
-	for errors.Unwrap(cause) != nil {
-		cause = errors.Unwrap(cause)
-	}
-	if cause == ctx.Err() {
+	if CancellationOnly(err, ctx.Err()) {
 		return nil
 	}
 	return err
+}
+
+// CancellationOnly 判定 err 是否为"纯取消"：沿单链包装与 errors.Join 树逐叶下钻，
+// 仅当至少有一个叶子且每个叶子都等于 cancelled 时才为真。该函数存在的理由：
+// `errors.Join(rows.Err(), rows.Close())` 即便只有一个非空子错误也会产生带
+// `Unwrap() []error` 的 join 节点，单链 `errors.Unwrap` 到它就停住；若只按单链
+// 判断，取消期间一句普通查询的 context.Canceled 会被误报为数据库故障，把正常
+// 停机变成 rt.Close() 失败（CI `-race` 的 010-race 即此症状）。携带任何真实
+// 失败叶子（例如数据库错误、drain 超时）的 join 一律保留，交给调用方报告。
+// CancellationOnly reports whether err consists solely of the cancellation sentinel.
+// It descends through both single-chain wrappers and errors.Join trees because a
+// join node stops errors.Unwrap even when it contains only one non-nil child; a
+// pure cancellation wrapped that way must not be mistaken for a database failure.
+// Any join carrying a real failure leaf is retained and reported by the caller.
+func CancellationOnly(err, cancelled error) bool {
+	if err == nil || cancelled == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		found := false
+		for _, child := range children {
+			if child == nil {
+				continue
+			}
+			found = true
+			if !CancellationOnly(child, cancelled) {
+				return false
+			}
+		}
+		return found
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if child := wrapped.Unwrap(); child != nil {
+			return CancellationOnly(child, cancelled)
+		}
+	}
+	return err == cancelled
 }
 
 func storedFlowPrincipal(task Task) (core.Principal, error) {

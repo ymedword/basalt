@@ -11,12 +11,16 @@ import (
 )
 
 func TestFlow_ClosePreservesDrainFailureJoinedWithCancellation(t *testing.T) {
-	for _, mode := range []string{"cancel-only", "drain-only", "cancel-and-drain"} {
+	for _, mode := range []string{"cancel-only", "joined-cancel-only", "drain-only", "cancel-and-drain"} {
 		t.Run(mode, func(t *testing.T) {
 			var result error
 			switch mode {
 			case "cancel-only":
 				result = context.Canceled
+			case "joined-cancel-only":
+				// 与内层查询的 errors.Join(rows.Err(), rows.Close()) 同形：只有一个
+				// 非空子错误，却带 Unwrap() []error；必须仍按纯取消处理。
+				result = errors.Join(context.Canceled)
 			case "drain-only":
 				result = fmt.Errorf("%w: flow drain exceeded 35s", flow.ErrDrainTimeout)
 			case "cancel-and-drain":
@@ -27,7 +31,7 @@ func TestFlow_ClosePreservesDrainFailureJoinedWithCancellation(t *testing.T) {
 			r := &flowRuntime{cancel: func() {}, done: done, runErr: result}
 			for range 2 {
 				err := r.Close()
-				if mode == "cancel-only" {
+				if mode == "cancel-only" || mode == "joined-cancel-only" {
 					require.NoError(t, err)
 				} else {
 					require.ErrorIs(t, err, flow.ErrDrainTimeout)

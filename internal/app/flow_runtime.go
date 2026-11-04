@@ -118,13 +118,11 @@ func (r *flowRuntime) Close() error {
 	r.mu.Lock()
 	err := r.runErr
 	r.mu.Unlock()
-	// 只忽略单链取消；Join 可能同时携带数据库或 drain 错误，必须保留。
-	// Ignore only single-chain cancellation, never a joined database or drain failure.
-	cause := err
-	for errors.Unwrap(cause) != nil {
-		cause = errors.Unwrap(cause)
-	}
-	if cause == context.Canceled {
+	// 只忽略纯取消（含被 errors.Join 单元素包装的取消）；Join 一旦携带数据库
+	// 或 drain 错误，必须保留——由 CancellationOnly 逐叶判定。
+	// Ignore only cancellation-only errors, including a join that wraps just the
+	// cancellation sentinel; any joined database or drain failure is preserved.
+	if flow.CancellationOnly(err, context.Canceled) {
 		return nil
 	}
 	return err
