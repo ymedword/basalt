@@ -244,7 +244,7 @@ func testMCPEnvNegative(t *testing.T) {
 				"WARN 点名槽位与变量名")
 			requireAbsent(t, output, "回显 text 参数",
 				"被跳过的 server 不得注册任何工具")
-			requireContains(t, output, "共 11 件工具",
+			requireContains(t, output, "共 12 件工具",
 				"跳过一个 server 不得影响其余内置工具的装配")
 		})
 	}

@@ -230,3 +230,9 @@ GATE-04：native首轮fmt/lint/sec通过；普通race测试发现docs_14d仍要�
 用户明确回复“US20 进入最终收尾，不再扩大设计或复核范围。人工review也通过；可以进行提交和跟踪CI最后合并到main”。据此：review ② 记为通过，§5.1 七项局部抑制与五个已展示页面的人工视觉确认随本次决定收口；已启用执行档表格未展示的事实保留，不改写为已验证。
 
 授权本轮执行：提交 → 推送 `020-execution-isolation` 分支 → 跟踪分支 CI → 通过后 fast-forward 合入 `main` 并推送 main；不 tag、不发布、不部署，发布仍归用户。提交候选含截图复核后的 console 修正（CSS break-word、dist 重建），其验证口径为 console 472 测试、前端构建、Go internal/web 全包与 CGO_ENABLED=0 构建；容器行为与完整门禁证据对应冻结源码指纹 `39ccb1d6eb9b9f2e5516cfc0cf95f845f2d7abd13b2668c506c74789a58b2645`，不把旧 hash 套到新 UI 候选，最终分支 CI 以提交树重新覆盖。
+
+### 2026-11-04 分支 CI 首轮红态与 e2e 接口适配
+
+分支 CI run 41790196832：build / console / container / postgres / website / flow 六 job 全绿；`test` job 红，定位为累积 stage `015-backfill` 的两处陈旧期望——`internal/e2e/mcp_test.go:247` 仍断言“共 11 件工具”，`internal/e2e/web_test.go` 的 `wantNames` 精确列表缺 `run_code`（期望 14、实际 15）。二者均为 US20 已批准 12 工具变更后的接口适配遗漏；WSL full profile 不含该 e2e 累积检查，故本地全量门禁未暴露。
+
+处置：仅改期望值（11→12；`wantNames` 按升序增加 `run_code`），不改测试名、不断言强度、不改产品与判据文件。WSL + dev-env PG 复跑完整 `015-backfill` 的 11 个 `TestBackfill_*` 通过（99.8s），目标两条 21.1s 通过，`gofumpt -l` 与 `go vet -tags=e2e` 通过。首次复跑时 `127.0.0.1:8080` 被遗留预览进程 `basalt-ui`（PID 2747201，`/tmp/basalt-us20-preview-0g_x1a43`）占用，导致 `listen_addr_override` 环境性假红；核对 exe/cwd 后停止该临时进程并确认 8080 释放，重跑通过。修正提交后重推分支、重跑 CI，绿后再快进合并。
