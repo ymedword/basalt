@@ -73,6 +73,10 @@ type RunRequest struct {
 	// When set, the notify tool is removed from this run's ToolSet and the notify grant is
 	// forced to none; the scheduler sets it whenever the task delivers its result itself.
 	SuppressNotify bool
+	// Flow is server-constructed durable execution context, absent from HTTP DTOs.
+	Flow *FlowRunContext `json:"-"`
+	// FixedTool is app-owned control and is never decoded from an ordinary DTO.
+	FixedTool *ToolCall `json:"-"`
 }
 
 // RunStatus 是运行状态的五值字面量（契约 §2；与审计状态四值是**两套**，不得混用）。
@@ -203,8 +207,12 @@ func (e *ResourceUnavailableError) Unwrap() error { return e.Cause }
 // §1.1 set verbatim (v3 adds AgentUID); the unexported fields are injection points forced
 // by the frozen method signatures and never appear in any outbound shape.
 type RunEnv struct {
-	phases PhaseRecorder
-	Req    RunRequest
+	phases              PhaseRecorder
+	Req                 RunRequest
+	Flow                *FlowRunContext
+	lastFlowToolOutcome ActionOutcome
+	lastFlowToolResult  Result
+	flowWritesReady     bool
 	// AgentUID 是准入时从生命周期状态文件读取的稳定身份：资源资格判定只用它、不用名称。
 	// 空串 = 本次运行未接线生命周期（手工构造的测试环境），资格判定必须据此拒绝。
 	AgentUID AgentUID
@@ -313,6 +321,8 @@ type Budget struct {
 // ToolEnv is the execution environment passed to every tool, built by the loop before each
 // call and passed by value.
 type ToolEnv struct {
+	// Flow remains explicit and is never inferred from a run-id or prompt.
+	Flow *FlowRunContext
 	// ShareGlobalMemory is fixed by the Agent snapshot at run admission.
 	ShareGlobalMemory bool
 	RunID             string // 关联审计的 Run
@@ -420,15 +430,18 @@ func (e *RunEnv) llmEnv(runID string, round int, p Prompt) ChatRequest {
 	msgs = append(msgs, Message{Role: roleSystem, Content: p.System}) // 段 1 + 段 2（记忆核心区；空记忆时与段 1 逐字节相同）
 	msgs = append(msgs, p.History...)
 	return ChatRequest{
-		Phases:     e.phases,
-		Provider:   ref.Name,
-		RunID:      runID,
-		SessionID:  e.Req.SessionID,
-		Round:      round,
-		ConfigHash: e.snapshotHash(),
-		Model:      ref.Model,
-		Messages:   msgs,
-		Tools:      p.Tools,
+		Phases:             e.phases,
+		Flow:               e.Flow,
+		FlowEstimatedInput: estimateTokens(p),
+		FlowEvidenceRefs:   p.EvidenceRefs,
+		Provider:           ref.Name,
+		RunID:              runID,
+		SessionID:          e.Req.SessionID,
+		Round:              round,
+		ConfigHash:         e.snapshotHash(),
+		Model:              ref.Model,
+		Messages:           msgs,
+		Tools:              p.Tools,
 	}
 }
 
@@ -454,6 +467,7 @@ func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
 	shareGlobal := e.Snapshot != nil && e.Snapshot.Profile != nil &&
 		e.Snapshot.Profile.Settings.IncludeGlobalMemory != nil && *e.Snapshot.Profile.Settings.IncludeGlobalMemory
 	return ToolEnv{
+		Flow:              e.Flow,
 		ShareGlobalMemory: shareGlobal,
 		RunID:             runID,
 		SessionID:         e.Req.SessionID,

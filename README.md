@@ -20,6 +20,7 @@ Independent agents. Shared infrastructure.
 - **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.
 - **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.
 - **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.
+- **Durable sequential flows** — Publish immutable task contracts and bounded Agent/tool/subflow steps. Acceptance, evidence and budgets persist in PostgreSQL; unknown side effects stop advancement. Ordinary messages and Runs remain synchronous. Flows are opt-in; see [operations](docs/Operations.md#durable-flows).
 - **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the `vector` and `pg_trgm` extensions, which you run yourself; no Node service at runtime.
 
 For example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.
@@ -214,3 +215,7 @@ Original Basalt content is licensed under the [Apache License 2.0](LICENSE). Thi
 ## Feedback and contributions
 
 Use [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.
+
+默认业务工作流：企业采购响应准备（4类Agent、17节点、48条合成需求）随二进制携带。
+管理台“工作流”可载入模板；安装不调用模型，配置后由用户手动运行。
+详见[默认工作流准备步骤](examples/workflows/bid-readiness/defaults/materials/SETUP.md)。

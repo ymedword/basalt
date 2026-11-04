@@ -27,10 +27,14 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/knowledge"
@@ -39,6 +43,15 @@ import (
 // knowledgeRunSource 编译期锁定端口形状：`core` 的接口一旦漂移，这里先红。
 // The compile-time assertion pins the port shape.
 var _ core.KnowledgeRunSource = (*knowledgeRunSource)(nil)
+
+var (
+	errFlowEmbeddingNotIssued   = errors.New("flow query embedding not issued")
+	errFlowEmbeddingUnconfirmed = errors.New("flow query embedding audit unconfirmed")
+)
+
+type flowQueryEmbedder interface {
+	EmbedFlow(context.Context, []string, func(context.Context, string) error) (knowledge.EmbedBatch, error)
+}
 
 // knowledgeRunSource 是 Run 侧知识链路的装配层实现。
 //
@@ -118,20 +131,52 @@ func (s *knowledgeRunSource) RetrieveForRun(ctx context.Context,
 		return nil, nil
 	}
 
-	embedding, generation := s.embedQuery(ctx, req, query)
+	var collections []string
+	if req.Flow != nil {
+		if req.Flow.Retrieval == nil || req.Flow.Budget == nil {
+			return nil, core.ErrFlowDispatch
+		}
+		var err error
+		collections, err = req.Flow.Retrieval.BeforeRetrieve(ctx, req.Agent)
+		if err != nil {
+			return nil, err
+		}
+		// An empty frozen ceiling must never become the ordinary "all declared"
+		// scope. In particular it must not issue a paid query embedding.
+		if len(collections) == 0 {
+			return nil, nil
+		}
+		for _, id := range collections {
+			if !slices.Contains(req.Flow.Authority.CollectionIDs, id) {
+				return nil, core.ErrFlowDispatch
+			}
+		}
+	}
+	embedding, generation, embedErr := s.embedQuery(ctx, req, query)
+	if embedErr != nil {
+		return nil, embedErr
+	}
 	// 向量化期间可能已取消：**不得**在已结束的 ctx 上继续发起检索（那会把取消误记成
 	// 一次检索降级 / 失败）。
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
+	if req.Flow != nil {
+		current, err := req.Flow.Retrieval.BeforeSourceRead(ctx)
+		if err != nil {
+			return nil, err
+		}
+		req.Principal = current
+	}
 	result, err := s.retriever.Retrieve(ctx, knowledge.RetrieveRequest{
-		Principal:  req.Principal,
-		RunID:      req.RunID,
-		AgentName:  strings.TrimSpace(req.Agent),
-		Query:      query,
-		Embedding:  embedding,
-		Generation: generation,
-		Budget:     req.Budget,
+		Principal:     req.Principal,
+		RunID:         req.RunID,
+		AgentName:     strings.TrimSpace(req.Agent),
+		CollectionIDs: collections,
+		Query:         query,
+		Embedding:     embedding,
+		Generation:    generation,
+		Budget:        req.Budget,
 	})
 	if err != nil {
 		return s.benignRetrieveError(ctx, req, err)
@@ -154,6 +199,13 @@ func (s *knowledgeRunSource) RetrieveForRun(ctx context.Context,
 			// 端口违约（缺文档或版本标识）：引用无法复核，**不得**注入。
 			changed++
 			continue
+		}
+		if req.Flow != nil {
+			current, err := req.Flow.Retrieval.BeforeSourceRead(ctx)
+			if err != nil {
+				return nil, err
+			}
+			req.Principal = current
 		}
 		view, err := s.viewer.SourceView(ctx, req.Principal, knowledge.SourceViewRequest{Ref: ref})
 		switch {
@@ -200,28 +252,66 @@ func (s *knowledgeRunSource) RetrieveForRun(ctx context.Context,
 // actually exists.
 func (s *knowledgeRunSource) embedQuery(ctx context.Context, req core.KnowledgeRunRequest,
 	query string,
-) ([]float32, int) {
+) ([]float32, int, error) {
 	if s.embedder == nil || s.generation < 1 {
-		return nil, 0
+		return nil, 0, nil
+	}
+	var ticket core.BudgetTicket
+	if req.Flow != nil {
+		sum := sha256.Sum256([]byte(query))
+		var err error
+		ticket, err = req.Flow.Budget.Reserve(ctx, req.RunID, "query-embedding:"+hex.EncodeToString(sum[:]), core.UsageEstimate{Tokens: int64(max(1, core.EstimateMessage(core.Message{Role: core.RoleUser, Content: query})))})
+		if err != nil {
+			return nil, 0, err
+		}
 	}
 	finishEmbedding := core.BeginPhase(ctx, s.phases, core.PhaseQueryEmbedding, core.PhaseKnowledge, req.RunID, "", 0)
-	batch, err := s.embedder.Embed(ctx, []string{query})
+	var batch knowledge.EmbedBatch
+	var err error
+	if req.Flow != nil {
+		strict, ok := s.embedder.(flowQueryEmbedder)
+		if !ok {
+			err = errors.Join(errFlowEmbeddingNotIssued, core.ErrFlowDispatch)
+		} else {
+			batch, err = strict.EmbedFlow(ctx, []string{query}, func(ctx context.Context, id string) error { return req.Flow.Retrieval.BeforeEmbedding(ctx, id, ticket) })
+		}
+	} else {
+		batch, err = s.embedder.Embed(ctx, []string{query})
+	}
 	finishEmbedding(err)
+	if req.Flow != nil {
+		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		var settleErr error
+		if errors.Is(err, errFlowEmbeddingNotIssued) {
+			settleErr = req.Flow.Budget.Settle(finish, ticket, core.UsageActual{Known: true})
+		} else if err == nil && batch.PromptTokens > 0 {
+			settleErr = req.Flow.Budget.Settle(finish, ticket, core.UsageActual{Known: true, Tokens: batch.PromptTokens})
+		} else {
+			settleErr = req.Flow.Budget.KeepUnknown(finish, ticket)
+		}
+		if settleErr != nil {
+			return nil, 0, settleErr
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+	}
 	switch {
 	case err != nil:
 		if ctx.Err() != nil {
 			// 取消 / 截止不是"向量化失败"：交给调用方按取消处理，不写降级日志。
-			return nil, 0
+			return nil, 0, nil
 		}
 		s.logger.WarnContext(ctx, "知识库：运行级查询向量化失败，本次降级为关键词检索",
 			"run_id", req.RunID, "error", err)
-		return nil, 0
+		return nil, 0, nil
 	case len(batch.Vectors) != 1:
 		s.logger.WarnContext(ctx, "知识库：运行级查询向量化没有可用向量，本次降级为关键词检索",
 			"run_id", req.RunID, "vectors", len(batch.Vectors))
-		return nil, 0
+		return nil, 0, nil
 	default:
-		return batch.Vectors[0], s.generation
+		return batch.Vectors[0], s.generation, nil
 	}
 }
 
@@ -265,6 +355,16 @@ func (s *knowledgeRunSource) RevalidateChunks(ctx context.Context,
 	kept := make([]core.KnowledgeChunk, 0, len(req.Chunks))
 	revoked, changed := 0, 0
 	for _, chunk := range req.Chunks {
+		if req.Flow != nil {
+			if req.Flow.Retrieval == nil {
+				return nil, core.ErrFlowDispatch
+			}
+			current, err := req.Flow.Retrieval.BeforeSourceRead(ctx)
+			if err != nil {
+				return nil, err
+			}
+			req.Principal = current
+		}
 		view, err := s.viewer.SourceView(ctx, req.Principal, knowledge.SourceViewRequest{Ref: chunk.Ref})
 		switch {
 		case err != nil && ctx.Err() != nil:
@@ -323,6 +423,16 @@ func (s *knowledgeRunSource) ResolveAnswer(ctx context.Context,
 			ChunkID:     chunk.Marker,
 			VersionID:   chunk.Ref.VersionID,
 			EvidenceRef: chunk.Ref,
+		}
+		if req.Flow != nil {
+			if req.Flow.Retrieval == nil {
+				return core.KnowledgeAnswerReport{}, core.ErrFlowDispatch
+			}
+			current, err := req.Flow.Retrieval.BeforeSourceRead(ctx)
+			if err != nil {
+				return core.KnowledgeAnswerReport{}, err
+			}
+			req.Principal = current
 		}
 		view, err := s.viewer.SourceView(ctx, req.Principal, knowledge.SourceViewRequest{Ref: chunk.Ref})
 		switch {

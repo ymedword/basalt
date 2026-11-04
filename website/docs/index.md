@@ -42,8 +42,9 @@ Basalt combines the last two layers in a Go application. The model proposes acti
 - Explicit model connections, published resource versions, built-in tools, MCP and reusable skills.
 - Bounded ReAct execution, context assembly, sessions and Agent-scoped persistent memory.
 - Per-Agent schedules and delivery to configured notification channels.
+- Opt-in durable sequential flows: immutable task contracts, bounded Agent/tool/subflow steps, original Run/audit links, evidence verification and unknown-side-effect stops.
 - An embedded management console, HTTP API, execution records and model/tool call audit.
-- A single-node Go runtime with embedded SQLite and local files; built-in tools use their respective file, command and network policies.
+- A single-node Go runtime backed by self-hosted PostgreSQL (vector and pg_trgm extensions) and local files; built-in tools use their respective file, command and network policies.
 
 Long-term memory is saved when save_memory succeeds. Session history is a separate record; ordinary conversation is not automatically promoted to long-term memory. External models and tools may receive request data according to their configured services.
 

@@ -131,6 +131,8 @@ var processMetrics = map[string]metricDefinition{
 }
 
 var databaseMetrics = map[string]metricDefinition{
+	"obs_flow_tasks_total":             {"1", map[string][]string{"status": {"queued", "running", "succeeded", "failed", "stopped", "blocked", "cancelling", "cancelled", "abandoned"}}},
+	"obs_flow_unknown_actions_total":   {"1", map[string][]string{}},
 	"obs_export_queue_depth":           {"1", map[string][]string{"state": {"pending", "inflight", "retry"}}},
 	"obs_export_unconfirmed_items":     {"1", map[string][]string{}},
 	"obs_export_oldest_pending_age_ms": {"ms", map[string][]string{}},

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1690" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
-<title id="overview-title">Basalt project architecture</title><desc id="overview-desc">Basalt project overview of the current single-node implementation: entry points and triggers, independently defined Agent scopes, management and admission, shared PromptBuilder/ReActLoop/ToolExecutor, Provider/Memory/tool/notification capabilities, embedded SQLite and workspace files. External users, model APIs, local processes, MCP/HTTP systems and notification destinations are outside the Go runtime boundary. Lifecycle and resource scope checks, published Run snapshots, execution budgets, cancellation, fail-closed two-phase audit, instance locking and non-replay recovery cut across the layers. Logical scopes are not container isolation; CLI and serve writers share an exclusive workspace lock. External model and tool requests follow configured data boundaries. This is a logical project map, not a claimed dynamic workflow or future distributed architecture.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
+<title id="overview-title">Basalt project architecture</title><desc id="overview-desc">Basalt project overview of the current single-node implementation: entry points and triggers, independently defined Agent scopes, management and admission, shared PromptBuilder/ReActLoop/ToolExecutor, Provider/Memory/tool/notification capabilities, self-hosted PostgreSQL and workspace files. External users, model APIs, local processes, MCP/HTTP systems and notification destinations are outside the Go runtime boundary. Lifecycle and resource scope checks, published Run snapshots, execution budgets, cancellation, fail-closed two-phase audit, instance locking and non-replay recovery cut across the layers. Logical scopes are not container isolation; CLI and serve writers share an exclusive workspace lock. External model and tool requests follow configured data boundaries. This is a logical project map, not a claimed dynamic workflow or future distributed architecture. US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
 <rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
@@ -18,7 +18,7 @@
 <rect x="330" y="960" width="940" height="155" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
 <text x="350" y="988" font-size="17" fill="#2447df" font-weight="600">04 / INFRASTRUCTURE SERVICE LAYER</text>
 <rect x="330" y="1155" width="940" height="185" rx="8" fill="#f0f5ef" stroke="#ccd1d8"/>
-<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / STORAGE LAYER · .basalt/</text>
+<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / STORAGE LAYER/</text>
 <rect x="330" y="1375" width="940" height="95" rx="8" fill="#e9edf9" stroke="#ccd1d8"/>
 <text x="350" y="1403" font-size="17" fill="#2447df" font-weight="600">SECURITY AND EXECUTION CONTROLS · CROSS-CUTTING</text>
 <path data-edge-id="layer-0" d="M800 345 L800 385" fill="none" stroke="#2447df" stroke-width="1.6"/>
@@ -121,7 +121,7 @@
 <text x="1054" y="1077" font-size="17" fill="#59687a">Tool / scheduled output</text>
 </g>
 <g data-node-id="sqlite"><rect x="350" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
-<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">Embedded SQLite · basalt.db</text>
+<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">Self-hosted PostgreSQL</text>
 <text x="364" y="1251" font-size="17" fill="#59687a">Sessions · runs · model / tool audits</text>
 <text x="364" y="1273" font-size="17" fill="#59687a">Resource versions · encrypted credentials</text>
 <text x="364" y="1295" font-size="17" fill="#59687a">Operations · delivery · optional memory</text>
@@ -179,5 +179,6 @@
 <text x="40" y="1560" font-size="18" fill="#2447df">Logical layers, not an execution sequence. CLI and serve share an exclusive workspace lock.</text>
 <text x="40" y="1600" font-size="18" fill="#59687a">Agent scopes are logical. Collaboration, multi-node execution and container isolation are outside this view.</text>
 <text x="40" y="1629" font-size="18" fill="#59687a">Models and MCP may process data outside the host. Local tool policies do not contain an external MCP server.</text>
-<text x="40" y="1665" font-size="15" fill="#59687a">Current implementation · source eb97cd539e51</text>
-</g></svg>
+<text x="40" y="1665" font-size="15" fill="#59687a">Current implementation · source ca9a0d29f185</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1765" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
+</svg>

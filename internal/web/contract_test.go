@@ -1531,7 +1531,7 @@ func TestContractAdmin_BusinessRouteTableMatchesOpenAPI(t *testing.T) {
 				"POST /sessions 不启动 Run：429 只能是认证失败限速与入口速率，不得声明并发 / 配额 / 容量")
 		}
 	}
-	require.Equal(t, 15, seen, "业务面当前恰十五行（三条会话 / 调用行 + 九条知识库行 + 三条历史回查行）")
+	require.Equal(t, 24, seen, "业务面原十五行加US19九条流程业务行，均须契约认证／403／429对账")
 
 	// 组件文本本身也要对得上：两个 429 组件的业务码集合是 V-4 的冻结内容。
 	// 断言的是**枚举条目形态**（`- \`CODE\`——说明`），不是"正文里出现过这个串"——

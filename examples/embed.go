@@ -18,5 +18,5 @@ import "embed"
 // The go:embed directive cannot cross a nested module, so docs-readonly lives in
 // the main module.
 //
-//go:embed daily shared
+//go:embed daily shared workflows/bid-readiness/defaults
 var Assets embed.FS

@@ -293,4 +293,6 @@ type RunRecord struct {
 	Trigger       Trigger // 落库触发方式：scheduler 显式填 cron / manual；空 = 由 storage 按 Channel 映射（cli→user / web→api / scheduler→cron / admin→manual）
 	ConfigHash    string  // 本次运行使用的配置快照版本（关联 config_snapshots.hash）
 	StartedAt     time.Time
+	// Flow associates an admitted Run with the already durable node attempt.
+	Flow *FlowRunContext
 }

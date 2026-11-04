@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1130" viewBox="0 0 1280 1130" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="module-map" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1280" viewBox="0 0 1280 1280" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="module-map" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
 <title id="diagram-title">Small packages, explicit responsibilities.</title>
-<desc id="diagram-desc">cmd/basalt starts internal/app, the composition root. CLI and HTTP entry adapters submit work to core AgentService and ReActLoop through injected ports. core owns Provider/Tool/Session contracts, admission, execution budgets and orchestration. Concrete provider, tool, memory, workspace and storage packages implement the consumer ports. The cron adapter provides scheduler mechanics. This responsibility map is distinct from the actual Go package import graph.</desc>
+<desc id="diagram-desc">cmd/basalt starts internal/app, the composition root. CLI and HTTP entry adapters submit work to core AgentService and ReActLoop through injected ports. core owns Provider/Tool/Session contracts, admission, execution budgets and orchestration. Concrete provider, tool, memory, workspace and storage packages implement the consumer ports. The cron adapter provides scheduler mechanics. This responsibility map is distinct from the actual Go package import graph. US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
 <rect width="1280" height="1130" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
@@ -77,8 +77,9 @@
 </g>
 <g data-node-id="storage"><rect x="665" y="900" width="350" height="75" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
 <text x="683" y="928" font-size="20" font-weight="600">internal/storage</text>
-<text x="683" y="953" font-size="15" fill="#5d6a70">SQLite repositories and migrations</text>
+<text x="683" y="953" font-size="15" fill="#5d6a70">PostgreSQL repositories and migrations</text>
 </g>
 <text x="40" y="1085" font-size="15" fill="#5d6a70">Arrows here show runtime calls through injected contracts. Concrete packages depend on core, not the reverse.</text>
-<text x="40" y="1111" font-size="12" fill="#5d6a70">Source commit: eb97cd539e51 · Current implementation</text>
-</g></svg>
+<text x="40" y="1111" font-size="12" fill="#5d6a70">Source commit: ca9a0d29f185 · Current implementation</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1140" width="1244" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1170" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1205" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1240" font-size="18" fill="#202b30">PostgreSQL v8 holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
+</svg>

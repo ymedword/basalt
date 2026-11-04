@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1690" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
-<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、内嵌 SQLite 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
+<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、自托管 PostgreSQL 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
 <rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
@@ -18,7 +18,7 @@
 <rect x="330" y="960" width="940" height="155" rx="8" fill="#f3f5fc" stroke="#ccd1d8"/>
 <text x="350" y="988" font-size="17" fill="#2447df" font-weight="600">04 / 基础服务层</text>
 <rect x="330" y="1155" width="940" height="185" rx="8" fill="#f0f5ef" stroke="#ccd1d8"/>
-<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / 存储层 · .basalt/</text>
+<text x="350" y="1183" font-size="17" fill="#2447df" font-weight="600">05 / 存储层/</text>
 <rect x="330" y="1375" width="940" height="95" rx="8" fill="#e9edf9" stroke="#ccd1d8"/>
 <text x="350" y="1403" font-size="17" fill="#2447df" font-weight="600">安全与运行保障（跨层）</text>
 <path data-edge-id="layer-0" d="M800 345 L800 385" fill="none" stroke="#2447df" stroke-width="1.6"/>
@@ -121,7 +121,7 @@
 <text x="1054" y="1077" font-size="17" fill="#59687a">工具与定时结果投递</text>
 </g>
 <g data-node-id="sqlite"><rect x="350" y="1203" width="440" height="110" rx="6" fill="#fffdf8" stroke="#ccd1d8"/>
-<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">内嵌 SQLite · basalt.db</text>
+<text x="364" y="1228" font-size="21" fill="#151e2b" font-weight="600">自托管 PostgreSQL · basalt.db</text>
 <text x="364" y="1251" font-size="17" fill="#59687a">会话／运行／模型与工具审计</text>
 <text x="364" y="1273" font-size="17" fill="#59687a">资源发布版本／加密凭据</text>
 <text x="364" y="1295" font-size="17" fill="#59687a">管理操作／投递／可选记忆载体</text>
@@ -179,5 +179,6 @@
 <text x="40" y="1560" font-size="18" fill="#2447df">这里展示逻辑分层，不是执行时序；CLI 写命令与 serve 共用工作区实例锁。</text>
 <text x="40" y="1600" font-size="18" fill="#59687a">Agent 按逻辑作用域管理；当前图不承诺 Agent 协作、多节点执行或容器隔离。</text>
 <text x="40" y="1629" font-size="18" fill="#59687a">模型与 MCP 可按配置在主机外处理数据；本地工具策略不能约束外部 MCP 服务自身的 I/O。</text>
-<text x="40" y="1665" font-size="15" fill="#59687a">当前实现 · 源码 eb97cd539e51</text>
-</g></svg>
+<text x="40" y="1665" font-size="15" fill="#59687a">当前实现 · 源码 ca9a0d29f185</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1765" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+</svg>

@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "scenario": "synthetic-enterprise-ai-procurement",
+  "not_a_real_tender": true,
+  "baseline_commit": "ca9a0d29f185a548b14b595e6068c52df1c3cdf4",
+  "excluded": [
+    "putuo-rfp-2026: third-party forwarding restriction; never ingested or sent"
+  ],
+  "files": [
+    {
+      "path": "sources/commercial-synthetic.md",
+      "sha256": "ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f",
+      "bytes": 630,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/open-procurement-reference.md",
+      "sha256": "33cc86830ba70d38bf52dab1b73bcd167c6a44abc1d3d8c73831a4a317d6c046",
+      "bytes": 777,
+      "kind": "public"
+    },
+    {
+      "path": "sources/product-main.md",
+      "sha256": "13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1",
+      "bytes": 12530,
+      "kind": "public"
+    },
+    {
+      "path": "sources/request-01.md",
+      "sha256": "ebe6fd5f640e4d89430b436ef8f3de7e75b6d0c77a0638483bffeec2867d450f",
+      "bytes": 843,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-02.md",
+      "sha256": "a4675d1d3fc556d586f5efe656a7a5cc5c072aaee92d7519418120b531c7e281",
+      "bytes": 866,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-03.md",
+      "sha256": "0bff8815a8ac17028d12074c3ea9350e48d5c9a278945725dbae06305b4edfe8",
+      "bytes": 859,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-04.md",
+      "sha256": "d60da3703755183a9ef09f94f2ec1b5b08480c5630de6384ad6a8b2f9b113ea2",
+      "bytes": 839,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-05.md",
+      "sha256": "7b78ce8e64c180970abf6e07c0cf720a52e18bf3cd774eb83d65775314180bc6",
+      "bytes": 837,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-06.md",
+      "sha256": "c00ee2c2aab5d7f630a0a7d14dd69785c3b91ca9f1d19e69e4c4b187eafd3e5d",
+      "bytes": 914,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-07.md",
+      "sha256": "a0c46cbd2a368ad1fc06a0d89d44990d864453ac1f845462fb455a3bf9ed6e19",
+      "bytes": 852,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-08.md",
+      "sha256": "0bf467d78f3cd8bfc83f20c60fc058e282aff843e24d97997a8f6dd52763e3bf",
+      "bytes": 890,
+      "kind": "synthetic"
+    }
+  ],
+  "context_files": [
+    {
+      "path": "roles.json",
+      "sha256": "3f8a2b78c386158acce65b5f2f4dea1d63ee5d9dd451d673dfeb501cc3e9b8fd",
+      "bytes": 2427
+    },
+    {
+      "path": "scenario.py",
+      "sha256": "bc275b0746de96b7c155992b4d970bb381a8994da0ec4a60b73d6f2c127a479b",
+      "bytes": 17119
+    },
+    {
+      "path": "demo.py",
+      "sha256": "290efaf9948afc713ec4a53079630706bf673e0d852ef0f1d4d18bc55df035c4",
+      "bytes": 25575
+    },
+    {
+      "path": "matrix_definition.py",
+      "sha256": "a5b11f3d88376d75439164eb4f3874068b0180e12edb4077e4aa7f2a5e911ec0",
+      "bytes": 4767
+    },
+    {
+      "path": "matrix_report.py",
+      "sha256": "88930660f4099322969a6de7beafd59147f1fbaef59748fc907922299349f7b6",
+      "bytes": 5303
+    },
+    {
+      "path": "collect.py",
+      "sha256": "76d4b705fd09e93a1e7d7326f559810ca6fcfee0cbba849d28ca5e10b45e006d",
+      "bytes": 7514
+    },
+    {
+      "path": "evaluation-protocol.json",
+      "sha256": "52f111dfed9d66ffef855538f233c3d1727a8e8ed6d838006962883f56fd7d42",
+      "bytes": 2752
+    },
+    {
+      "path": "start-review.ps1",
+      "sha256": "ee22bd01ec5db5f927cf80febbab51bec00cab6f6551689b8a1a485ed1e069db",
+      "bytes": 3538
+    },
+    {
+      "path": "serve_fixture_test.go.txt",
+      "sha256": "fe371cfa8546475e4196a3925d9f21942f4ecfbd2cab38287750c6d1fe1aa6c3",
+      "bytes": 6656
+    },
+    {
+      "path": "budget_gateway.py",
+      "sha256": "2853397a36023f96f7de5dd5923552dac6ad8b61cebb48114e4d6125483e8066",
+      "bytes": 14099
+    },
+    {
+      "path": "agents/bid-delivery/AGENT.md",
+      "sha256": "5d7af138ec8bdd0bb88d96feb6d91ac520b83093259e865e6ae17da0399e32a7",
+      "bytes": 1534
+    },
+    {
+      "path": "agents/bid-general/AGENT.md",
+      "sha256": "17f8ee4ff743b9738ccac75ca0acb6400683fb627b38c9ed357c0376cf4d25ae",
+      "bytes": 1551
+    },
+    {
+      "path": "agents/bid-requirements/AGENT.md",
+      "sha256": "01e6519875ba3cd81f767990cadde34fa8b39fe1ff90035bc46c4b561c300aa5",
+      "bytes": 1466
+    },
+    {
+      "path": "agents/bid-reviewer/AGENT.md",
+      "sha256": "91be634ee7b6cd932ac5862d30471b20fd8234eee871b10a8e54ecf8d6c2122b",
+      "bytes": 1627
+    },
+    {
+      "path": "agents/bid-technical/AGENT.md",
+      "sha256": "1af85d78c8f5bd3f9393da31a0b4419cb78a6dbd2c51478486d1fb0e72519237",
+      "bytes": 1538
+    }
+  ]
+}

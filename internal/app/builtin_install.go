@@ -59,9 +59,10 @@ const (
 // 组件的版本——版本在发行布局里，标记只回答"这个名字由本安装器写过"。
 // The marker records which agents and entries the installer already wrote.
 type builtinOpenBoxState struct {
-	SchemaVersion   int    `json:"schema_version"`
-	InstalledAt     string `json:"installed_at,omitempty"`
-	AgentsInstalled bool   `json:"agents_installed"`
+	SchemaVersion    int    `json:"schema_version"`
+	InstalledAt      string `json:"installed_at,omitempty"`
+	AgentsInstalled  bool   `json:"agents_installed"`
+	WorkflowPrepared bool   `json:"workflow_prepared,omitempty"`
 	// AgentsSkipped 记录"这个存量实例的 Agent 不归安装器管"。没有它时，回填写下的
 	// 标记（AgentsInstalled=false）会让下一次启动把五个内置 Agent 补装进老工作区——
 	// 升级一次就多出五只 Agent 是明确禁止的副作用。
@@ -80,10 +81,11 @@ type builtinOpenBoxDeps struct {
 	RuntimeRoot string
 	// Fresh 是本次启动前"库与实例名册都不存在"的唯一口径（T089）。
 	// Fresh is the single new-instance verdict decided before the configuration loads.
-	Fresh     bool
-	LookupEnv func(string) (string, bool)
-	Now       func() time.Time
-	Logger    *slog.Logger
+	Fresh         bool
+	LookupEnv     func(string) (string, bool)
+	Now           func() time.Time
+	Logger        *slog.Logger
+	WorkflowKnown func(string) (bool, error)
 }
 
 // builtinOpenBoxReport 汇总本次做了什么；只用于装配日志与测试断言。
@@ -91,6 +93,7 @@ type builtinOpenBoxDeps struct {
 type builtinOpenBoxReport struct {
 	AgentsInstalled []string
 	AgentsKept      []string
+	WorkflowAgents  []builtin.AgentResult
 	MCPWritten      []string
 	MCPPresent      []string
 	Missing         []string
@@ -231,6 +234,24 @@ func prepareBuiltinOpenBox(ctx context.Context, deps builtinOpenBoxDeps) (builti
 			report.AgentsInstalled = append(report.AgentsInstalled, result.Name)
 		}
 		state.AgentsInstalled = true
+		if err := writeBuiltinOpenBoxState(deps.WorkspaceRoot, state); err != nil {
+			return report, err
+		}
+	}
+
+	if !state.AgentsSkipped && !state.WorkflowPrepared {
+		prepared, readErr := builtin.WorkflowPrepared(deps.WorkspaceRoot)
+		if readErr != nil {
+			return report, readErr
+		}
+		if !prepared {
+			results, installErr := builtin.InstallWorkflow(deps.WorkspaceRoot, deps.WorkflowKnown)
+			if installErr != nil {
+				return report, installErr
+			}
+			report.WorkflowAgents = results
+		}
+		state.WorkflowPrepared = true
 		if err := writeBuiltinOpenBoxState(deps.WorkspaceRoot, state); err != nil {
 			return report, err
 		}

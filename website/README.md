@@ -44,7 +44,7 @@ The checked-in sample was captured against source commit `eb97cd539e51e2b3db15af
 
 ## Diagram sources and exports
 
-`diagrams/basalt-diagrams.drawio` contains twelve editable, uncompressed mxGraph pages: the project overview plus five focused views, each in English and Chinese. The matching static SVGs are under `public/diagrams/en/` and `public/diagrams/zh/`. All twelve currently describe source commit `eb97cd539e51e2b3db15afcfcc1dfa295eaebe77`.
+`diagrams/basalt-diagrams.drawio` contains twelve editable, uncompressed mxGraph pages: the project overview plus five focused views, each in English and Chinese. The matching static SVGs are under `public/diagrams/en/` and `public/diagrams/zh/`. The diagrams retain the architecture baseline and add the US19 sequential Flow boundary in both locales. Their provenance points to base commit `ca9a0d29f185a548b14b595e6068c52df1c3cdf4`; `data-working-tree-feature="US19"` explicitly records the uncommitted addition. This is a source-maintenance annotation, not a claim that the feature exists in that base commit. Drawio and SVG footer cells were updated together; no draw.io executable export is claimed.
 
 The README uses only `system-architecture.svg`, a compact five-layer summary with cross-cutting security and operations. `project-overview.svg` expands the same access, application, execution engine, infrastructure service and storage layers with external systems and concrete components. Scheduling belongs to the application layer. These are logical responsibility layers, not separate deployment units or a guarantee of process isolation.
 

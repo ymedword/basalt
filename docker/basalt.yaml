@@ -29,6 +29,18 @@ http:
 server:
   max_concurrent_runs: 32
 
+# US19：普通 Run 仍同步；容器启动不自动导入或发布流程定义。
+# Ordinary Runs stay synchronous; startup never imports or publishes flow definitions.
+flows:
+  enabled: false
+  max_active: 4
+  interactive_reserved_runs: 1
+  interactive_reserved_per_caller: 1
+  max_open_tasks: 32
+  max_stored_tasks: 10000
+  cancel_wait_seconds: 30
+  shutdown_grace_seconds: 35
+
 budget:
   max_iterations: 30
 

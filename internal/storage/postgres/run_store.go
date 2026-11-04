@@ -371,20 +371,41 @@ func insertRunRow(ctx context.Context, ex sqlExecutor, rec core.RunRecord, trigg
 	if err != nil {
 		return err
 	}
+	var taskID, nodeAttemptID any
+	var revision int64
+	if rec.Flow != nil {
+		if rec.Flow.TaskID == "" || rec.Flow.NodeAttemptID == "" {
+			return core.ErrPreconditionFailed
+		}
+		taskID, nodeAttemptID, revision = rec.Flow.TaskID, rec.Flow.NodeAttemptID, rec.Flow.TaskRevision
+	}
 	// 单条 INSERT 即一个短事务；reason / finished_at 留 NULL（终态才写），
 	// iterations / tool_calls 取列缺省 0（还没跑，不是"跑了零次"）。
-	_, err = ex.ExecContext(ctx,
+	result, err := ex.ExecContext(ctx,
 		`INSERT INTO runs
 		   (run_id, session_id, agent, channel, user_id, trigger, status,
 		    reason, iterations, tool_calls, config_hash, started_at, finished_at,
-		    caller_id, authorizing_kind, key_id, reservation_id, actor, request_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 0, 0, $8, $9, NULL,
-		         $10, $11, $12, $13, $14, $15)`,
+		    caller_id, authorizing_kind, key_id, reservation_id, actor, request_id,flow_task_id,flow_node_attempt_id)
+		 SELECT $1,$2,$3,$4,$5,$6,$7,NULL,0,0,$8,$9,NULL,$10,$11,$12,$13,$14,$15,$16::text,$17::text
+		 WHERE ($16::text IS NULL AND $17::text IS NULL) OR EXISTS (
+		   SELECT 1 FROM flow_tasks t JOIN flow_node_attempts a ON a.task_id=t.task_id
+		   WHERE t.task_id=$16 AND a.node_attempt_id=$17 AND a.run_id=$1 AND a.session_id IS NOT DISTINCT FROM $2::text
+		     AND a.state IN ('prepared','running') AND t.status='running' AND t.close_intent='none' AND NOT t.cancel_requested
+		     AND t.caller_id=$10 AND t.authorizing_kind=$11 AND t.authorizing_key_id IS NOT DISTINCT FROM $12::text
+		     AND t.current_revision=$18 AND a.task_revision=t.current_revision AND a.execution_epoch=t.execution_epoch AND t.deadline>$9
+		 )`,
 		rec.RunID, nullIfEmpty(rec.SessionID), rec.Agent, rec.Channel, rec.UserID,
 		trigger, string(core.StatusRunning), nullIfEmpty(rec.ConfigHash), rec.StartedAt.UnixMilli(),
-		callerID, authorizingKind, nullIfEmpty(keyID), nullIfEmpty(reservationID), actor, nullIfEmpty(rec.RequestID))
+		callerID, authorizingKind, nullIfEmpty(keyID), nullIfEmpty(reservationID), actor, nullIfEmpty(rec.RequestID), taskID, nodeAttemptID, revision)
 	if err != nil {
 		return fmt.Errorf("预写运行账本行（run_id=%s）: %w", rec.RunID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return core.ErrPreconditionFailed
 	}
 	return nil
 }

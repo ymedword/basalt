@@ -1,0 +1,183 @@
+{
+  "version": 1,
+  "id": "us19-process",
+  "approval": "User review 1 passed 2026-11-03: R3 approved body sha256 514ce6c9f6a8bb1e86499c80a281403e858c007a92138f3b8771429c13a37ef5 including section 6.6.0. Actual Claude G-FT design receipt and independent behavioral prerequisites are recorded in gft-receipt/run-state. This stage plus us19-process and full public profile are required; final user review 2 is pending.",
+  "inputs": [
+    "specs/019-flow-collaboration/spec.md",
+    "specs/019-flow-collaboration/plan.md",
+    "specs/019-flow-collaboration/tasks.md",
+    "specs/019-flow-collaboration/gft-design.md",
+    "specs/019-flow-collaboration/gft-receipt.md",
+    "docs/contracts/flow.md",
+    "docs/contracts/flow.pg.sql",
+    "docs/contracts/openapi.yaml",
+    "harness/acceptance.json",
+    "testdata/flow/workloads.json",
+    "testdata/flow/corpus/policy-conflict-v1.json",
+    "testdata/flow/corpus/policy-v1.json",
+    "evals/flow/baseline.json",
+    "evals/flow/model-scripts.json",
+    "evals/flow/README.md",
+    "testdata/flow/definitions.json",
+    "specs/019-flow-collaboration/acceptance-map.json",
+    ".github/workflows/ci.yml"
+  ],
+  "protect": [
+    "internal/app/flow_admission_test.go",
+    "internal/app/flow_authority_test.go",
+    "internal/app/flow_cli_test.go",
+    "internal/app/flow_embedding_integration_test.go",
+    "internal/app/flow_evaluation_integration_test.go",
+    "internal/app/flow_execution_integration_test.go",
+    "internal/app/flow_http_integration_test.go",
+    "internal/app/flow_observation_integration_test.go",
+    "internal/app/flow_progress_integration_test.go",
+    "internal/app/flow_retrieval_test.go",
+    "internal/app/flow_rework_integration_test.go",
+    "internal/app/flow_runtime_integration_test.go",
+    "internal/app/flow_support_integration_test.go",
+    "internal/app/flow_support_test.go",
+    "internal/app/flow_tools_test.go",
+    "internal/app/postgres_port_test.go",
+    "internal/callers/flow_concurrency_test.go",
+    "internal/cli/flow_config_test.go",
+    "internal/core/fixed_tool_test.go",
+    "internal/core/flow_admission_internal_test.go",
+    "internal/core/flow_finish_internal_test.go",
+    "internal/core/flow_model_test.go",
+    "internal/core/flow_progress_probe_test.go",
+    "internal/core/flow_tool_exec_test.go",
+    "internal/core/progress_test.go",
+    "internal/core/tool_group_internal_test.go",
+    "internal/e2e/us19_action_test.go",
+    "internal/e2e/us19_demo_test.go",
+    "internal/e2e/us19_lifecycle_test.go",
+    "internal/e2e/us19_recovery_test.go",
+    "internal/flow/budget_test.go",
+    "internal/flow/config_test.go",
+    "internal/flow/coordinator_integration_test.go",
+    "internal/flow/definition_test.go",
+    "internal/flow/evidence_test.go",
+    "internal/flow/input_test.go",
+    "internal/flow/json_test.go",
+    "internal/flow/loader_test.go",
+    "internal/flow/state_test.go",
+    "internal/flow/verification_test.go",
+    "internal/observability/flow_test.go",
+    "internal/storage/postgres/flow_action_integration_test.go",
+    "internal/storage/postgres/flow_advance_integration_test.go",
+    "internal/storage/postgres/flow_claim_integration_test.go",
+    "internal/storage/postgres/flow_commit_authority_integration_test.go",
+    "internal/storage/postgres/flow_cursor_integration_test.go",
+    "internal/storage/postgres/flow_delegation_integration_test.go",
+    "internal/storage/postgres/flow_embedding_integration_test.go",
+    "internal/storage/postgres/flow_model_integration_test.go",
+    "internal/storage/postgres/flow_poll_integration_test.go",
+    "internal/storage/postgres/flow_progress_integration_test.go",
+    "internal/storage/postgres/flow_query_integration_test.go",
+    "internal/storage/postgres/flow_retention_integration_test.go",
+    "internal/storage/postgres/flow_revision_integration_test.go",
+    "internal/storage/postgres/flow_start_service_integration_test.go",
+    "internal/storage/postgres/flow_store_integration_test.go",
+    "internal/storage/postgres/flow_worker_integration_test.go",
+    "internal/tool/flow_adapter_test.go",
+    "internal/tool/flow_progress_test.go",
+    "internal/tool/schema_test.go",
+    "internal/web/handlers_flow_test.go",
+    "scripts/acceptance/flow_corpus_test.go",
+    "scripts/acceptance/invariants_test.go",
+    "internal/app/ports_test.go",
+    "internal/app/supported_version_injection_test.go",
+    "internal/app/observability_legacy_api_test.go",
+    "internal/storage/postgres/migrate_integration_test.go"
+  ],
+  "checks": [
+    {
+      "id": "019-flow-e2e",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=1200s",
+        "-tags=e2e",
+        "./internal/e2e",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 1260,
+      "required_tests": [
+        "TestFlow_BinaryAcceptExecuteVerifyAndRead",
+        "TestFlow_BinaryCLIUsesServingInstanceWithoutSecondWriter",
+        "TestFlow_BinaryCapacity200TasksAndUnqueuedLatency",
+        "TestFlow_BinaryInteractiveReserveAndDeferredFairness",
+        "TestFlow_BinaryRestartReconciles32OpenWithin30Seconds",
+        "TestFlow_CrashWindowMatrix",
+        "TestFlow_WriteActionCrashKeepsOriginalIdentityAndNeverReplays"
+      ],
+      "level": "process"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T010",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T027",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    },
+    {
+      "id": "T028",
+      "checks": [
+        "019-flow-e2e"
+      ]
+    }
+  ]
+}

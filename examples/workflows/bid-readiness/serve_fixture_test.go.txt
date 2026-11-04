@@ -1,0 +1,163 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+// 本文件只由显式 overlay 加载，为人工走查启动隔离候选实例；不是自动通过证据。
+// This opt-in fixture serves the ordinary binary; it does not implement execution.
+func TestFlow_BusinessReviewFixture(t *testing.T) {
+	require.True(t, os.Getenv("DASHSCOPE_API_KEY") == "", "real provider credential must not enter the application process")
+	require.Equal(t, binarySourceCandidate, binarySource, "explicit candidate required")
+	base := os.Getenv("BASALT_US19_DEMO_GATEWAY")
+	token := os.Getenv("BASALT_US19_GATEWAY_TOKEN")
+	require.True(t, strings.HasPrefix(base, "http://127.0.0.1:"))
+	require.GreaterOrEqual(t, len(token), 32)
+	repo := os.Getenv("BASALT_US19_REPO")
+	require.NotEmpty(t, repo)
+	sourceRoot := filepath.Join(repo, "examples", "workflows", "bid-readiness")
+	approved, err := businessSources(sourceRoot)
+	require.NoError(t, err, "source drift must fail before workspace or service startup")
+	h := newHarness(t)
+	initWorkspace(t, h)
+	addr := freeLoopbackAddr(t)
+	providers := "providers:\n" + v3ProviderBlock("demo-qwen", base, "qwen-plus") + v3ProviderBlock("demo-embedding", base, "text-embedding-v4")
+	extra := "embedding:\n  model_connection: demo-embedding\n  model: text-embedding-v4\n  dimensions: 512\n  batch_size: 10\nflows:\n  enabled: true\n  max_active: 1\n  poll_interval_ms: 200\n"
+	h.writeConfig(t, v3ServeConfig(addr, providers, extra))
+	var roles map[string]struct {
+		Collections []string `json:"collections"`
+	}
+	raw := approved["roles.json"]
+	require.NoError(t, json.Unmarshal(raw, &roles))
+	for name, role := range roles {
+		raw := approved["agents/"+name+"/AGENT.md"]
+		parts := strings.SplitN(string(raw), "---", 3)
+		require.Len(t, parts, 3)
+		h.writeAgent(t, name, strings.ReplaceAll(strings.TrimSpace(parts[1]), "\r\n", "\n"), strings.ReplaceAll(strings.TrimSpace(parts[2]), "\r\n", "\n"))
+		for file, content := range approved {
+			if !strings.HasPrefix(file, "sources/") {
+				continue
+			}
+			leaf := filepath.Base(file)
+			allowed := false
+			for _, collection := range role.Collections {
+				allowed = allowed || collection == "bid-request" && strings.HasPrefix(leaf, "request-") || collection == "bid-product" && leaf == "product-main.md" || collection == "bid-commercial" && (leaf == "commercial-synthetic.md" || leaf == "open-procurement-reference.md")
+			}
+			if !allowed {
+				continue
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(h.Root, ".basalt", "agents", name, leaf), content, 0o600))
+		}
+	}
+	// 默认新工作区无用户私有资源；此 canary 放在任何 Agent 都无权读取的目录外。
+	// The private canary is outside every permitted Agent directory and collection.
+	require.NoError(t, os.WriteFile(filepath.Join(h.Root, "private-canary.txt"), []byte("US19_PRIVATE_CANARY"), 0o600))
+	env := []string{}
+	for _, item := range fixtureEnv() {
+		if !strings.HasPrefix(item, fixtureKeyEnv+"=") {
+			env = append(env, item)
+		}
+	}
+	env = append(env, fixtureKeyEnv+"="+token)
+	h.registerSecret(fixtureKeyEnv, token)
+	startServeWithEnv(t, h, addr, env)
+	var calls int
+	require.NoError(t, h.openDB(t).QueryRow("SELECT count(*) FROM llm_calls").Scan(&calls))
+	require.Zero(t, calls, "setup must not dispatch chat")
+	metadata := map[string]any{"base": "http://" + addr, "workspace": h.Root, "binary_sha256": binarySHA256, "credential_boundary": "application receives local gateway credential only", "real_model_calls_at_setup": calls}
+	raw, err = json.MarshalIndent(metadata, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(repo, ".loop", "us19-business-fixture.json"), raw, 0o600))
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	deadline := time.NewTimer(24 * time.Hour)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if _, err := os.Stat(filepath.Join(repo, ".loop", "us19-business-release")); err == nil {
+				return
+			}
+		case <-deadline.C:
+			return
+		}
+	}
+}
+
+// 来源清单为精确文件集合；目录扫描不能扩大获准出站内容。
+// The frozen manifest, not a glob, controls every visible source and persona.
+func businessSources(root string) (map[string][]byte, error) {
+	type item struct {
+		Path, SHA256 string
+		Bytes        int
+	}
+	var manifest struct {
+		Files   []item `json:"files"`
+		Context []item `json:"context_files"`
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "source-manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	approved := map[string][]byte{}
+	for _, row := range append(manifest.Files, manifest.Context...) {
+		clean := filepath.ToSlash(filepath.Clean(row.Path))
+		if clean != row.Path || strings.HasPrefix(clean, "../") || filepath.IsAbs(clean) {
+			return nil, fmt.Errorf("invalid source path")
+		}
+		content, err := os.ReadFile(filepath.Join(root, row.Path))
+		if err != nil {
+			return nil, err
+		}
+		if len(content) != row.Bytes || fmt.Sprintf("%x", sha256.Sum256(content)) != row.SHA256 {
+			return nil, fmt.Errorf("source changed: %s", row.Path)
+		}
+		approved[row.Path] = content
+	}
+	files, err := filepath.Glob(filepath.Join(root, "sources", "*.md"))
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if _, ok := approved["sources/"+filepath.Base(file)]; !ok {
+			return nil, fmt.Errorf("unregistered source: %s", filepath.Base(file))
+		}
+	}
+	return approved, nil
+}
+
+func TestFlow_BusinessSourcesRejectDrift(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, "sources"), 0o700))
+	content := []byte("synthetic fixture")
+	file := filepath.Join(root, "sources", "request-01.md")
+	require.NoError(t, os.WriteFile(file, content, 0o600))
+	manifest := map[string]any{"files": []any{map[string]any{"path": "sources/request-01.md", "sha256": fmt.Sprintf("%x", sha256.Sum256(content)), "bytes": len(content)}}}
+	raw, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "source-manifest.json"), raw, 0o600))
+	_, err = businessSources(root)
+	require.NoError(t, err)
+	extra := filepath.Join(root, "sources", "request-extra.md")
+	require.NoError(t, os.WriteFile(extra, []byte("not selected"), 0o600))
+	_, err = businessSources(root)
+	require.ErrorContains(t, err, "unregistered source")
+	require.NoError(t, os.Remove(extra))
+	require.NoError(t, os.WriteFile(file, []byte("changed fixture!!"), 0o600))
+	_, err = businessSources(root)
+	require.ErrorContains(t, err, "source changed")
+}

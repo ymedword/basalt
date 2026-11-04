@@ -157,7 +157,7 @@ func (l *ReActLoop) settleCall(
 // 已经发出"处理——宁可让预留等管理面核对，也不把真实消耗释放掉。
 // callNotIssued reports errors raised strictly before the request went out.
 func callNotIssued(err error) bool {
-	return errors.Is(err, ErrAuditWrite) || errors.Is(err, ErrProviderNotConfigured)
+	return errors.Is(err, ErrAuditWrite) || errors.Is(err, ErrProviderNotConfigured) || errors.Is(err, ErrFlowModelNotIssued)
 }
 
 // recordAssembly 把本轮装配记录交给写入器（V-7）。
@@ -200,6 +200,7 @@ func (l *ReActLoop) revalidateKnowledge(ctx context.Context, runID string, env *
 		return
 	}
 	reviewed, err := env.knowledgeSource.RevalidateChunks(ctx, KnowledgeRevalidateRequest{
+		Flow:      env.Req.Flow,
 		Principal: env.Req.Principal,
 		RunID:     runID,
 		Chunks:    env.knowledge.Chunks,
@@ -297,6 +298,9 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return env.cancelled(ctxErr, round-1, toolCalls), nil
 			}
+			if env.Flow != nil && errors.Is(err, ErrFlowBudget) && errors.Is(err, ErrFlowModelNotIssued) {
+				return env.limitReached("flow_budget_exhausted", round-1, toolCalls), nil
+			}
 			return env.fail(err, round-1, toolCalls), nil
 		}
 
@@ -305,9 +309,7 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 		// 来源依赖随转述传播：assistant 消息带上**本次模型输入实际包含**的来源集合
 		// （`Prompt.EvidenceRefs` 由组装层算出，审计集不参与），与消息同事务落库——
 		// 撤权后这条转述与工具原文一起被替换（C-26）。
-		assistant := env.assistantMessage(resp)
-		assistant.EvidenceRefs = prompt.EvidenceRefs
-		if err := env.Session.AppendMessage(ctx, runID, assistant); err != nil {
+		if err := l.appendAssistantGroup(ctx, runID, env, resp, prompt.EvidenceRefs, assistantFromModel); err != nil {
 			return env.fail(err, round, toolCalls), nil
 		}
 
@@ -316,36 +318,10 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 			return env.complete(resp.Content, round, toolCalls), nil
 		}
 
-		// ⑥ **串行**逐个执行——每次执行之前两道检查（取消 → 工具预算），顺序固定。
-		for _, call := range resp.ToolCalls {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				// 先补齐（独立收尾上下文——父 ctx 已取消也得写得进去）再落终态：
-				// 组内未执行的调用取"已取消"合成文本，而不是预算文本。
-				l.completeGroup(ctx, runID, env, resp.ToolCalls, ReasonCancelled)
-				return env.cancelled(ctxErr, round, toolCalls), nil
-			}
-			if env.Budget.ToolCallsExhausted(toolCalls) {
-				l.completeGroup(ctx, runID, env, resp.ToolCalls, ReasonToolBudget)
-				return env.limitReached(ReasonToolBudget, round, toolCalls), nil
-			}
-			// 步骤定位由循环给出（V-8）：`step_id` 取轮次、`seq` 同轮同值——执行器不知道
-			// 自己在第几轮，而诊断的"同一 correlation 内局部有序"只能由知道轮次的一侧补齐。
-			// The loop supplies the step locator because only it knows the round.
-			result := l.executor.ExecuteStep(ctx, env.ToolEnv(ctx, runID), env.ToolSet, call,
-				ToolStep{StepID: strconv.Itoa(round), Seq: int64(round)}) // 流程 D（返回结果，**不写消息**）
-			if err := env.Session.AppendToolResult(ctx, runID, call, result); err != nil {
-				// 工具结果写不进去 = 历史会缺一条 tool 消息（供应商会拒收整段）→ Run failed；
-				// 补齐是幂等兜底，没补上的留给下次启动的恢复扫描。
-				l.completeGroup(ctx, runID, env, resp.ToolCalls, ReasonRunFailed)
-				return env.fail(err, round, toolCalls), nil
-			}
-			toolCalls++
-		}
-
-		// 组返回后复查取消：**取消优先于预算**——本组已执行完，剩余调用按"已取消"补齐。
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			l.completeGroup(ctx, runID, env, resp.ToolCalls, ReasonCancelled)
-			return env.cancelled(ctxErr, round, toolCalls), nil
+		var stopped *RunResult
+		toolCalls, stopped = l.runToolGroup(ctx, runID, env, resp.ToolCalls, round, toolCalls)
+		if stopped != nil {
+			return *stopped, nil
 		}
 	}
 
@@ -377,6 +353,13 @@ type compactionOutcome struct {
 // and only a wiring-level failure aborts the run.
 func (l *ReActLoop) compact(ctx context.Context, runID string, round int, env *RunEnv) compactionOutcome {
 	none := compactionOutcome{record: CompressionRecord{Decision: DecisionNone}}
+	if env.Flow != nil {
+		// Flow already carries a bounded authoritative task summary in the current
+		// user message, which PromptBuilder cannot trim. Do not start an auxiliary
+		// summary model outside the Flow model/budget/audit boundary.
+		none.inputs.State = env.Flow.State
+		return none
+	}
 	if l.assembleCompactor == nil {
 		return none
 	}

@@ -75,6 +75,25 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 			"run_id", req.RunID, "error", err)
 		return core.ChatResponse{}, err
 	}
+	var flowPermit core.FlowModelPermit
+	if req.Flow != nil {
+		if req.Flow.Models == nil {
+			return core.ChatResponse{}, errors.Join(core.ErrFlowModelNotIssued, core.ErrFlowDispatch)
+		}
+		var err error
+		req, _, err = core.SnapshotFlowModelRequest(ctx, req)
+		if err != nil {
+			return core.ChatResponse{}, errors.Join(core.ErrFlowModelNotIssued, err)
+		}
+		prepared, _, err := core.SnapshotFlowModelRequest(ctx, req)
+		if err != nil {
+			return core.ChatResponse{}, errors.Join(core.ErrFlowModelNotIssued, err)
+		}
+		flowPermit, err = req.Flow.Models.PrepareModel(ctx, prepared, req.FlowEstimatedInput)
+		if err != nil || flowPermit == nil {
+			return core.ChatResponse{}, errors.Join(core.ErrFlowModelNotIssued, core.ErrFlowDispatch, err)
+		}
+	}
 
 	// 3. 预写（留痕先于发出，契约 §7.2）：审计不可用时**拒绝发出**——审计为什么比调用更硬，
 	// 见宪法 V：没有留痕的调用在事后无法被复核，等于没发生过。
@@ -95,7 +114,25 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 		// 双 `%w`：`core.ErrAuditWrite` 是"确定未发出"的判定锚点（配额结算据此归还预留，
 		// C-29），底层仓储错误同时保留——排障要看得到真正的原因。
 		// Two %w verbs keep both the sentinel and the underlying store error reachable.
+		if flowPermit != nil {
+			finish, cancel := auditContext(ctx)
+			defer cancel()
+			err = errors.Join(err, flowPermit.RecordOutcome(finish, core.FlowModelOutcome{}))
+		}
 		return core.ChatResponse{}, fmt.Errorf("%w: %w", core.ErrAuditWrite, err)
+	}
+	if flowPermit != nil {
+		grant, _, cloneErr := core.SnapshotFlowModelRequest(ctx, req)
+		grantErr := cloneErr
+		if grantErr == nil {
+			grantErr = flowPermit.BeforeDispatch(ctx, callID, grant)
+		}
+		if grantErr != nil {
+			finish, cancel := auditContext(ctx)
+			defer cancel()
+			confirmed := s.finish(finish, callID, core.LLMCallResult{Status: core.LLMCallFailed, ErrorKind: core.ErrorKindRuntimeError, ErrorMessage: "flow dispatch refused before model call"})
+			return core.ChatResponse{}, errors.Join(core.ErrFlowModelNotIssued, grantErr, flowPermit.RecordOutcome(finish, core.FlowModelOutcome{AuditID: callID, AuditConfirmed: confirmed, Status: core.LLMCallFailed}))
+		}
 	}
 
 	// 4. 发出：一次调用、不重试、不 fallback（技术方案 §2.4.3）。
@@ -114,7 +151,7 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	defer cancelAudit()
 
 	if chatErr == nil {
-		s.finish(auditCtx, callID, core.LLMCallResult{
+		confirmed := s.finish(auditCtx, callID, core.LLMCallResult{
 			Status:   core.LLMCallSuccess,
 			Duration: duration,
 			// 三列显式平铺（不嵌 Usage）：审计表的列是平的，回填结构与列同构；
@@ -123,18 +160,29 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 			CompletionTokens: resp.Usage.CompletionTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
 		})
+		if flowPermit != nil {
+			if err := flowPermit.RecordOutcome(auditCtx, core.FlowModelOutcome{AuditID: callID, Dispatched: true, AuditConfirmed: confirmed, Status: core.LLMCallSuccess, Usage: resp.Usage}); err != nil {
+				return resp, err
+			}
+			if !confirmed {
+				return resp, core.ErrFlowDispatch
+			}
+		}
 		return resp, nil
 	}
 
 	kind := classifyError(chatErr, ctx.Err())
 	s.logger.Warn("模型调用失败", "provider", req.Provider, "model", req.Model,
 		"run_id", req.RunID, "error_kind", string(kind), "error", chatErr)
-	s.finish(auditCtx, callID, core.LLMCallResult{
+	confirmed := s.finish(auditCtx, callID, core.LLMCallResult{
 		Status:       core.LLMCallFailed,
 		ErrorMessage: chatErr.Error(), // 原样记录——脱敏在客户端边界做完（约束 8）
 		ErrorKind:    kind,
 		Duration:     duration,
 	})
+	if flowPermit != nil {
+		chatErr = errors.Join(chatErr, flowPermit.RecordOutcome(auditCtx, core.FlowModelOutcome{AuditID: callID, Dispatched: true, AuditConfirmed: confirmed, Status: core.LLMCallFailed, Usage: resp.Usage}))
+	}
 	return resp, chatErr
 }
 
@@ -202,10 +250,12 @@ func (s *ProviderService) resolveModel(req core.ChatRequest) string {
 // 行会留在 pending，由下次启动的恢复扫描标 unknown（契约 §7.2 残余窗口；扫描本体归 US-4）。
 // finish is the only exit for the terminal write: failures are logged, never panicked
 // and never allowed to rewrite the call result.
-func (s *ProviderService) finish(ctx context.Context, id int64, result core.LLMCallResult) {
+func (s *ProviderService) finish(ctx context.Context, id int64, result core.LLMCallResult) bool {
 	if err := s.store.FinishCall(ctx, id, result); err != nil {
 		s.logger.Error("审计终态回填失败——行保留 pending，待启动恢复标 unknown", "id", id, "error", err)
+		return false
 	}
+	return true
 }
 
 // auditContext 是审计写入的上下文（契约 §4.2：WithoutCancel + 独立短超时）——预写与终态

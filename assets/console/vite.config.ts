@@ -7,6 +7,8 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   base: '/console/',
   plugins: [vue()],
+  // 只额外开放净化的公开素材目录（含 ?raw 变体），不暴露仓库或实验控制目录。
+  server: { fs: { allow: ['.', '../../examples/workflows/bid-readiness/defaults/materials'] } },
   build: {
     outDir: 'dist',
     emptyOutDir: true,

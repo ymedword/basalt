@@ -1,0 +1,18 @@
+{
+  "format_version":1,
+  "usage_per_chat":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8},
+  "scripts": {
+    "report-chain":{"reply_source":"policy-current","flow_replies":3,"baseline_replies":1},
+    "exclusive-branch":{"reply_source":"policy-current","flow_replies":2,"baseline_replies":1},
+    "two-agent-handoff":{"reply_source":"policy-current","flow_replies":2,"baseline_replies":1},
+    "empty-evidence":{"reply_source":"policy-current","flow_replies":1,"baseline_replies":1},
+    "conflicting-versions":{"reply_source":"policy-current","flow_replies":1,"baseline_replies":1},
+    "revoked-source":{"reply_source":"policy-current","flow_replies":1,"baseline_replies":1,"hook":"revoke-source-after-chat"},
+    "no-progress":{"tool":"read_file","arguments":{"path":"policy.json"},"repeat_until_guard":true},
+    "malformed-output":{"reply":{"answer":7},"flow_replies":1,"baseline_replies":1},
+    "cancel":{"hold_until_cancellation":true},
+    "budget-exhausted":{"reply_source":"policy-current","max_total_tokens":1},
+    "completed-checkpoint-reuse":{"reply_source":"policy-current","fault":"artifact-insert-before-commit","flow_replies":1,"baseline_replies":1},
+    "unknown-write":{"tool":"write_file","arguments":{"path":"receipt.txt","content":"frozen controlled side effect"},"fault":"original-tool-terminal-after-effect"}
+  }
+}

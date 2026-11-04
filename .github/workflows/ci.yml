@@ -542,6 +542,75 @@ jobs:
           fi
           echo "ok：${prefix}* 容器 / 卷 / 网络 / 镜像均为零残留"
 
+  flow:
+    # US19 只使用隔离 PG 与本地脚本模型；不调用付费模型，不发布制品。
+    # Run source, authoring/demo, and process stages against one normal candidate.
+    name: flow（US19：完整阶段 + 真实进程）
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          POSTGRES_USER: basalt
+          POSTGRES_PASSWORD: basalt_ci_only
+          POSTGRES_DB: basalt_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basalt -d basalt_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BASALT_TEST_PG_DSN: postgres://basalt:basalt_ci_only@127.0.0.1:5432/basalt_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: website/.nvmrc
+          cache: npm
+          cache-dependency-path: |
+            assets/console/package-lock.json
+            website/package-lock.json
+      - name: Provision isolated PostgreSQL extensions
+        run: |
+          docker exec "${{ job.services.postgres.id }}" psql -v ON_ERROR_STOP=1 -U basalt -d basalt_test \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector' \
+            -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+      - name: Install frontend dependencies
+        run: |
+          npm --prefix assets/console ci
+          npm --prefix website ci
+      - name: US19 complete source stage
+        run: |
+          sh scripts/check-acceptance.sh --stage-only --stage harness/stages/us19-base.json \
+            --out ".loop/runs/us19-base-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: US19 workflow authoring and offline demo stage
+        run: |
+          python --version
+          sh scripts/check-acceptance.sh --stage-only --stage harness/stages/us19-experience.json \
+            --out ".loop/runs/us19-experience-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Build normal candidate and run real-process stage
+        run: |
+          make build
+          export BASALT_E2E_BINARY="$PWD/bin/basalt"
+          sh scripts/check-acceptance.sh --stage-only --stage harness/stages/us19-process.json \
+            --out ".loop/runs/us19-process-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Upload US19 evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow-evidence
+          path: .loop/runs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
   website:
     name: website
     runs-on: ubuntu-latest

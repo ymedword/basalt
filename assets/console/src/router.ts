@@ -41,6 +41,9 @@ export type RouteName =
   | 'document-detail'
   | 'diagnostics'
   | 'observability'
+  | 'flows'
+  | 'flow-tasks'
+  | 'flow-task'
   | 'history'
   | 'not-found'
 
@@ -74,6 +77,9 @@ interface RoutePattern {
 const ROUTES: readonly RoutePattern[] = [
   { name: 'overview', segments: [] },
   { name: 'observability', segments: ['observability'] },
+  { name: 'flows', segments: ['flows'] },
+  { name: 'flow-tasks', segments: ['flow-tasks'] },
+  { name: 'flow-task', segments: ['flow-tasks', ':id'] },
   { name: 'login', segments: ['login'] },
   { name: 'agents', segments: ['agents'] },
   // 静态段 `agents/new` 必须排在动态段 `agents/:name` 之前：否则创建页会被当成

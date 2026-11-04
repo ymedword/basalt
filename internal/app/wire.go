@@ -31,6 +31,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/diagnostics"
+	"github.com/ymedword/basalt/internal/flow"
 	"github.com/ymedword/basalt/internal/memory"
 	"github.com/ymedword/basalt/internal/observability"
 	"github.com/ymedword/basalt/internal/storage/postgres"
@@ -215,7 +216,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// The PostgreSQL handle is opened here; capability checks and the forward
 	// migration happen inside postgres.Open, and a failure aborts startup instead of
 	// falling back to SQLite. The DSN never reaches the log.
-	db, err := postgres.Open(ctx, postgresConfig(cfg.Database))
+	db, err := postgres.Open(ctx, runtimePostgresConfig(cfg))
 	if err != nil {
 		return nil, abortRuntime(fmt.Errorf("打开 PostgreSQL: %w", err), nil, lock)
 	}
@@ -551,9 +552,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		WorkspaceRoot: root,
 		RuntimeRoot:   a.builtinRuntimeRootOr(),
 		Fresh:         a.freshInstance,
-		LookupEnv:     os.LookupEnv,
-		Now:           a.nowOr(),
-		Logger:        logger,
+		WorkflowKnown: func(name string) (bool, error) {
+			record, valid, reason, readErr := versions.LifecycleIndex(ctx, name)
+			return valid || record.Generation != 0 || reason != "", readErr
+		},
+		LookupEnv: os.LookupEnv,
+		Now:       a.nowOr(),
+		Logger:    logger,
 	})
 	if err != nil {
 		return nil, abortRuntime(fmt.Errorf("准备内置 Agent 与 MCP 条目: %w", err), db, lock)
@@ -1173,9 +1178,22 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// The chat assembly records share the knowledge wiring's writer; a failed
 		// write only warns and never changes the run's outcome.
 		WithAssemblyRecorder(knowledgeWire.Assembly)
+	flowConfig, err := runtimeFlowConfig(cfg.Flows, cfg.Server.MaxConcurrentRuns)
+	if err != nil {
+		return nil, abortRuntime(err, db, lock)
+	}
+	admission.flowReservedPerCaller = flowConfig.InteractiveReservedPerCaller
+	// Exactly the same resolver and snapshot builder feed ordinary Run and Flow
+	// pin validation; all credential/lifecycle/resource gates remain shared.
+	runResources := NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate, AdmissionDeps{Identities: versions, NotifyAdmin: notifyAdminStore, Channels: channels, Bindings: bindingStore, Credentials: resolver, CredentialPins: resolver, Checkpoint: checkpoint, Diagnostics: diagRecorder})
+	runSnapshots := newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr())
 	service := core.NewAgentService(core.ServiceOptions{
-		Phases: newPhaseAdapter(diagRecorder),
-		Agents: agents,
+		FlowRunsReady:               flowConfig.Enabled,
+		FlowWritesReady:             true, // G-FT design prerequisites and independent behavior probes passed.
+		FlowInteractiveReservedRuns: flowConfig.InteractiveReservedRuns,
+		ToolPins:                    registry,
+		Phases:                      newPhaseAdapter(diagRecorder),
+		Agents:                      agents,
 		// 生命周期准入（图 F ③ / 约束 15）：状态文件端口与 Agent 级闸门传的是上面那一份
 		// 共享实例——准入在读锁内现场重读，启停迁移持写锁，两者因此互斥。nil 会让准入
 		// 门禁与启停互斥同时静默消失，生产装配**不得**省略。
@@ -1186,26 +1204,8 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 发布资源的两件必须同进同出（图 F ③ / N1）：解析端口在资源闸门读锁内固定版本，
 		// 快照构建器按固定的 SkillDirs 读发布目录；缺一件由 core 在准入前失败关闭。
 		// Resources and RunSnapshots are wired together; a partial wiring fails closed.
-		Resources: NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate, AdmissionDeps{
-			Identities:  versions,
-			NotifyAdmin: notifyAdminStore,
-			Channels:    channels,
-			Bindings:    bindingStore,
-			// 凭据三件同进同出（R4.8 / 约束 44）：准入在资源闸门读锁内固定模型连接的凭据
-			// 版本（`CredentialPins`），绑定检查按解析器的判定拒绝不可用连接（`Credentials`），
-			// 每次模型调用前按 Run 固定的版本重查撤销状态（`Checkpoint`）。缺任何一件，
-			// 托管连接要么无法固定、要么撤销后仍能调用——装配层不给"半套"。
-			// The three credential pieces are supplied together; a partial wiring would let a
-			// revoked credential keep serving an in-flight run.
-			Credentials:    resolver,
-			CredentialPins: resolver,
-			Checkpoint:     checkpoint,
-			// 诊断生产端（T095）：运行路径每次模型调用成功后记一条 `llm_call`；写失败
-			// 只 WARN，Run 照常推进（诊断 fail-open，与审计的 fail-closed 分属两条轨）。
-			// The run-path producer; a failed write only warns and never blocks the run.
-			Diagnostics: diagRecorder,
-		}),
-		RunSnapshots: newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr()),
+		Resources:    runResources,
+		RunSnapshots: runSnapshots,
 		Client:       client,
 		Messages:     sessions,
 		// Sessions 是准入处的会话门禁端口（US-10 约束 40）：调度运行与手动补跑都经
@@ -1277,6 +1277,43 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// the per-caller concurrency limit entirely.
 	adminPosture := &postureBox{}
 	ownerKeys := core.OwnerKeyVerifier(callers.NewKeyVerifier(postgres.NewKeyStore(db)))
+	flowStore := postgres.NewFlowStore(db)
+	flowSchemas := tool.NewSchemaCompiler()
+	flowAuthority := &flowAuthority{agents: agents, lifecycle: lifecycle, gate: agentGate, resources: runResources, snapshots: runSnapshots, definitions: flowStore, keys: ownerKeys, store: flowStore, tools: registry, schemas: flowSchemas, collections: knowledgeWire.Collections, posture: adminPosture.Get, writeReady: true}
+	flowAuthority.newTaskCapacity = func(ctx context.Context, p core.Principal) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		limit, ok := concurrencyLimit.limit(p.CallerID)
+		if !ok {
+			return core.ErrFlowDispatch
+		}
+		reserved := 1
+		if flowConfig.InteractiveReservedPerCaller != nil {
+			reserved = *flowConfig.InteractiveReservedPerCaller
+		}
+		if limit <= reserved {
+			return flow.ErrInteractiveReserve
+		}
+		return nil
+	}
+	flowSources := flowSourceValidity{viewer: knowledgeWire.Source, store: flowStore}
+	flowRunner := &flowNodeRunner{service: service, admission: admission, store: flowStore, authority: flowAuthority, sources: flowSources, collections: postgres.NewKnowledgeAuthz(db, agents), schemas: flowSchemas, writeReady: true}
+	flowService := &flow.Service{Repository: flowStore, Definitions: flowStore, Schemas: flowSchemas, Authority: flowAuthority, Runner: flowRunner, Config: flowConfig, Now: a.nowOr(), Logger: logger, Outputs: flowOutputChecker{store: flowStore, sources: flowSources}, Verification: &flow.VerificationService{Schemas: flowSchemas, Sources: flowSources, Support: flowSourceValueSupport{viewer: knowledgeWire.Source, sources: flowSources, check: flowAuthority.checkSourceProof}}, Operations: ops}
+	flowRuntime := &flowRuntime{service: flowService, store: flowStore, runner: flowRunner, logger: logger, authReady: make(chan struct{}), publisher: &flow.Publisher{Definitions: flowStore, Operations: ops, Validator: &flow.ContractValidator{Schemas: flowSchemas, Resolver: flowAuthority, WriteGate: true}}}
+	flowRuntime.worker = &flow.Worker{Service: flowService, Repository: flowStore, Logger: logger, Startup: func(ctx context.Context) error {
+		select {
+		case <-flowRuntime.authReady:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		flowRunner.mu.Lock()
+		defer flowRunner.mu.Unlock()
+		if !flowRunner.startupComplete {
+			return core.ErrFlowDispatch
+		}
+		return nil
+	}}
 	scheduler := a.newScheduler(postgres.NewTaskStore(db),
 		&admittedRunInvoker{inner: service, admission: admission},
 		agents.Entries(), delivery,
@@ -1494,6 +1531,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpRT.ConnectedNames()))
 	return &heavyRuntime{
+		flows:             flowRuntime,
 		observability:     observation,
 		lock:              lock,
 		db:                db,
@@ -1818,6 +1856,7 @@ func memoryCarrier(db *postgres.DB, now func() time.Time) (core.LongTermMemorySt
 // 读代码时一眼能看出"这是内部接线"还是"这是包外拿到的句柄"。
 // The heavy prefix keeps the internal handle distinguishable from the exported Runtime.
 type heavyRuntime struct {
+	flows         *flowRuntime
 	observability *Observability
 	// lock 是实例锁：进程存续期间持有（写模式的语义就是"这一进程是唯一写者"）。
 	lock *workspace.InstanceLock
@@ -2117,6 +2156,9 @@ type heavyRuntime struct {
 // Close releases in reverse order — watcher, scheduler, MCP pool, database, lock.
 func (r *heavyRuntime) Close() error {
 	var errs []error
+	if r.flows != nil {
+		errs = append(errs, r.flows.Close())
+	}
 	if r.observability != nil {
 		errs = append(errs, r.observability.Close())
 	}

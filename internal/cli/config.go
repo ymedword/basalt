@@ -16,6 +16,7 @@ import (
 	"github.com/goccy/go-yaml"
 
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/flow"
 )
 
 // Config 是 basalt.yaml 的解析结果。
@@ -30,6 +31,7 @@ import (
 // ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
 // entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
+	Flows         flow.Config         `yaml:"-"`
 	Observability ObservabilityConfig `yaml:"-"`
 	// 服务入口需要区分键缺失与显式零值；不属于可序列化配置。
 	ingressMissing []string         `yaml:"-"`
@@ -752,6 +754,12 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 		return nil, err
 	}
 	cfg.Observability = observability
+	flowSection, flowPresent := tree["flows"]
+	flowConfig, err := parseFlowConfig(flowSection, flowPresent, cfg.Server.MaxConcurrentRuns)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Flows = flowConfig
 	return cfg, nil
 }
 

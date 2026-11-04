@@ -378,10 +378,22 @@ func TestBusinessAuth_RouteTableDeclaresScopes(t *testing.T) {
 		"GET /api/v1/history/search":                              fixedScope(core.ScopeSessionsRead),
 		"GET /api/v1/sessions/{session_id}/messages/{message_id}": fixedScope(core.ScopeSessionsRead),
 	}
+	wantFlowScope := map[string]requiredScope{
+		"GET /api/v1/flows":                         fixedScope(core.ScopeFlowsRead),
+		"GET /api/v1/flows/{name}":                  fixedScope(core.ScopeFlowsRead),
+		"GET /api/v1/flow-tasks":                    fixedScope(core.ScopeFlowsRead),
+		"GET /api/v1/flow-tasks/{id}":               fixedScope(core.ScopeFlowsRead),
+		"GET /api/v1/flow-tasks/{id}/artifacts":     fixedScope(core.ScopeFlowsRead),
+		"GET /api/v1/flow-tasks/{id}/verifications": fixedScope(core.ScopeFlowsRead),
+		"POST /api/v1/flow-tasks":                   fixedScope(core.ScopeFlowsWrite),
+		"POST /api/v1/flow-tasks/{id}/cancel":       fixedScope(core.ScopeFlowsWrite),
+		"POST /api/v1/flow-tasks/{id}/resume":       fixedScope(core.ScopeFlowsWrite),
+	}
 	srv := newTestServer(t, nil)
 	businessRows := 0
 	knowledgeRows := 0
 	historyRows := 0
+	flowRows := 0
 	for _, rt := range srv.routeTable() {
 		if rt.surface != surfaceRouteBusiness {
 			continue
@@ -401,9 +413,14 @@ func TestBusinessAuth_RouteTableDeclaresScopes(t *testing.T) {
 			historyRows++
 			require.Equal(t, expected, rt.scope, "%s 的作用域与契约不符", name)
 		}
+		if expected, ok := wantFlowScope[name]; ok {
+			flowRows++
+			require.Equal(t, expected, rt.scope, "%s 的流程scope必须准确匹配", name)
+		}
 	}
-	require.Equal(t, 3+len(wantKnowledgeScope)+len(wantHistoryScope), businessRows,
-		"业务面当前恰十五行：三条会话 / 调用行 + 九条知识库行 + 三条历史回查行")
+	require.Equal(t, 3+len(wantKnowledgeScope)+len(wantHistoryScope)+len(wantFlowScope), businessRows,
+		"业务面逐组计数，US19新增九条流程业务行")
+	require.Equal(t, len(wantFlowScope), flowRows, "全部流程业务行逐条要求scope，不能只满足总数")
 	require.Equal(t, len(wantKnowledgeScope), knowledgeRows,
 		"知识库业务行数与期望表条目数必须一致（缺少或改名都算）")
 	require.Equal(t, len(wantHistoryScope), historyRows,

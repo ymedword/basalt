@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "corpus_version": "us19-local-control-v1",
+  "input": {"answer":"Produce a report using only the frozen policy sources."},
+  "hard_constraint": "Never claim acceptance when required evidence, authority or action outcome is unresolved.",
+  "sources": [
+    {"id":"policy-current","version":"v1","file":"corpus/policy-v1.json"},
+    {"id":"policy-conflicting","version":"v1","file":"corpus/policy-conflict-v1.json"}
+  ],
+  "cases": [
+    {"id":"F19-01","scenario":"report-chain","nodes":["research","draft","review"],"expected":"succeeded","source_ids":["policy-current"],"expected_leaf_runs":3},
+    {"id":"F19-02","scenario":"exclusive-branch","nodes":["decide","route","chosen","unchosen"],"expected":"succeeded","source_ids":["policy-current"],"expected_leaf_runs":2},
+    {"id":"F19-03","scenario":"two-agent-handoff","nodes":["research","review"],"expected":"succeeded","source_ids":["policy-current"],"expected_leaf_runs":2},
+    {"id":"F19-04","scenario":"empty-evidence","nodes":["draft"],"expected":"blocked","source_ids":[],"expected_leaf_runs":1},
+    {"id":"F19-05","scenario":"conflicting-versions","nodes":["draft"],"expected":"blocked","source_ids":["policy-current","policy-conflicting"],"expected_leaf_runs":1},
+    {"id":"F19-06","scenario":"revoked-source","nodes":["draft"],"expected":"blocked","source_ids":["policy-current"],"expected_leaf_runs":1},
+    {"id":"F19-07","scenario":"no-progress","nodes":["read"],"expected":"stopped","source_ids":[],"expected_leaf_runs":1,"expected_tool_dispatches":2},
+    {"id":"F19-08","scenario":"malformed-output","nodes":["draft"],"expected":"failed","source_ids":[],"expected_leaf_runs":1},
+    {"id":"F19-09","scenario":"cancel","nodes":["draft"],"expected":"cancelled","source_ids":[],"expected_leaf_runs":1},
+    {"id":"F19-10","scenario":"budget-exhausted","nodes":["draft"],"expected":"stopped","source_ids":[],"expected_leaf_runs":1},
+    {"id":"F19-11","scenario":"completed-checkpoint-reuse","nodes":["draft"],"expected":"succeeded","source_ids":[],"expected_leaf_runs":1},
+    {"id":"F19-12","scenario":"unknown-write","nodes":["write"],"expected":"blocked","source_ids":[],"expected_leaf_runs":1,"expected_tool_dispatches":1}
+  ]
+}

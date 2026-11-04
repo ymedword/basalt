@@ -8,11 +8,12 @@ export type ObsEvidenceGap = {
 }
 
 export type ObsAnchor = {
-  kind: "run" | "request" | "task" | "operation" | "ingest" | "session"
+  kind: "run" | "request" | "task" | "flow_task" | "operation" | "ingest" | "session"
   value: string
 }
 
 export type ObsTimelineEntry = {
+  flow?: { task_id: string, root_task_id: string, node_id: string, node_attempt_id: string, revision: number, execution_epoch: number, action_id?: string }
   schema_version?: number
   decision?: string
   redacted_fields: number

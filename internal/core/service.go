@@ -109,6 +109,14 @@ type ServiceOptions struct {
 	Logger        *slog.Logger     // 为空 → 进程缺省日志器
 	Now           func() time.Time // 时钟注入；为空 → time.Now
 	MaxConcurrent int              // 实例级并发运行上限；<=0 → 32
+	// Nil reserves one interactive instance slot; explicit zero opts into no reserve.
+	FlowInteractiveReservedRuns *int
+	// FlowRunsReady is app-owned assembly control; never a configuration/DTO flag.
+	// It remains false in production until durable wiring and behavior gates pass.
+	FlowRunsReady bool
+	// FlowWritesReady is separately app-owned and stays false until G-FT behavior
+	// evidence proves the controlled fixed-write branch. Agent tools stay readonly.
+	FlowWritesReady bool
 	// Sessions 是会话状态端口（归档 / 缺失判定）；生产装配必须由 wire.go 单点传入。
 	// nil = 不做会话门禁（仅既有零值单测），此时 Archive 返回 *SessionGateUnavailableError，
 	// 不得 nil 解引用。
@@ -159,10 +167,11 @@ type ServiceOptions struct {
 type AgentService struct {
 	opts ServiceOptions
 
-	mu      sync.Mutex
-	busy    map[string]struct{}   // 会话忙集：键 = session_id（空串不入集——无状态调用之间互不相干）
-	active  map[string]*activeRun // 在途运行登记：键 = run_id（取消信号的唯一入口）
-	running int                   // 实例级在跑数
+	mu          sync.Mutex
+	busy        map[string]struct{}   // 会话忙集：键 = session_id（空串不入集——无状态调用之间互不相干）
+	active      map[string]*activeRun // 在途运行登记：键 = run_id（取消信号的唯一入口）
+	running     int                   // 实例级在跑数
+	flowRunning int
 
 	// cancelWait 是取消信号发出后等待循环收场的上限（约束 20）。生产恒为
 	// defaultCancelWait；测试经 export_test.go 改小，免得超时用例真等 30 秒。
@@ -230,6 +239,15 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if !req.Principal.Valid() {
 		return RunResult{}, fmt.Errorf("%w: run request carries no valid principal", ErrUnauthorized)
 	}
+	// The durable adapter is not yet wired. Fail closed until strict Flow binding
+	// and the G-FT implementation gates replace this guard; never run it as an
+	// ordinary unrestricted Agent by merely setting a Flow pointer.
+	if req.FixedTool != nil && req.Flow == nil {
+		return RunResult{}, ErrFlowDispatch
+	}
+	if req.Flow != nil && (!s.opts.FlowRunsReady || !validFixedFlowRequest(req) || s.opts.Resources == nil || s.opts.Lifecycle == nil || s.opts.RunSnapshots == nil || s.opts.ToolPins == nil || s.opts.RunQuota == nil) {
+		return RunResult{}, ErrFlowDispatch
+	}
 
 	// ① 准入：未知 Agent → 会话锁 → 实例计数（顺序即错误优先级），三道都**不排队**。
 	entry, ok := s.lookupAgent(req.Agent)
@@ -265,6 +283,9 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if err != nil {
 		return RunResult{}, err
 	}
+	if req.Flow != nil && (string(lifecycle.AgentUID) != req.Flow.AgentUID || !slices.Contains(req.Flow.Authority.AgentUIDs, req.Flow.AgentUID)) {
+		return RunResult{}, ErrFlowDispatch
+	}
 
 	// ③ 资源固定（图 F ③，紧随门禁）：解析在 ResourceGate 读锁内完成；清单的生命周期
 	// 状态取**本次准入读到的**记录（同一份读数），技能 / MCP / Provider 版本与哈希自此
@@ -292,13 +313,16 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		// 与映射表分叉，失败关闭，不得退回全局客户端"照样能跑"。
 		// The model client comes from the pinned runtime; a missing entry fails closed
 		// instead of falling back to the global client.
-		llmClient, err = pinnedClient(resolved)
+		llmClient, err = pinnedClientWhenNeeded(resolved, req.FixedTool == nil)
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
 		}
 		manifest, err = BuildRunResourceManifest(lifecycle.AgentUID, lifecycle.State, resolved)
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
+		}
+		if req.Flow != nil && manifest.Hash != req.Flow.ResourceManifestHash {
+			return RunResult{}, ErrFlowDispatch
 		}
 	}
 
@@ -327,6 +351,9 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	snap, err := s.buildRunSnapshot(ctx, entry, resolved, now)
 	if err != nil {
 		return RunResult{RunID: runID, Status: StatusFailed, Reason: err.Error()}, nil
+	}
+	if req.Flow != nil && snap.Hash != req.Flow.AgentConfigHash {
+		return RunResult{}, ErrFlowDispatch
 	}
 	if s.opts.Snapshots != nil {
 		if err := s.opts.Snapshots.SaveSnapshot(ctx, snap); err != nil {
@@ -368,6 +395,12 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// wired, the profile compatibility read otherwise.
 	notifyMode, notifyChannels := s.notifyGrant(resolved, snap)
 	toolSet := snapshotTools(snap)
+	if req.Flow != nil {
+		toolSet = slices.DeleteFunc(slices.Clone(toolSet), func(name string) bool { return !slices.Contains(req.Flow.Authority.Tools, name) })
+		if req.FixedTool != nil && !slices.Contains(toolSet, req.FixedTool.Name) {
+			return RunResult{}, ErrFlowDispatch
+		}
+	}
 	// 系统代投的 Run 不向模型提供 notify（R7）：工具名集里删掉它，模式固定 none。
 	// 授权层仍按 none 兜底——即使工具因装配错误仍在池里，调用也会被拒。
 	// A system-delivery run never sees the notify tool, and the grant is forced to none as
@@ -377,15 +410,17 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		toolSet = withoutToolName(toolSet, "notify")
 	}
 	env := &RunEnv{
-		phases:    s.opts.Phases,
-		Req:       req,
-		AgentUID:  lifecycle.AgentUID,
-		Snapshot:  snap,
-		Resources: runResources,
-		Session:   sess,
-		Budget:    mergeBudget(req.Budget, snap.Profile),
-		ToolSet:   toolSet,
-		llmClient: llmClient,
+		phases:          s.opts.Phases,
+		Req:             req,
+		Flow:            req.Flow,
+		flowWritesReady: s.opts.FlowWritesReady,
+		AgentUID:        lifecycle.AgentUID,
+		Snapshot:        snap,
+		Resources:       runResources,
+		Session:         sess,
+		Budget:          mergeBudget(req.Budget, snap.Profile),
+		ToolSet:         toolSet,
+		llmClient:       llmClient,
 		// 摘要客户端与对话客户端来自准入的**同一张固定映射表**（原则 III）：压缩接线
 		// 只拿这一份，不按名字重新解析；未接资源时为零值，压缩装配据此拒绝。
 		// The summary client comes from the same frozen map as the chat client.
@@ -404,10 +439,24 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	if s.opts.ToolPins != nil {
 		env.pinnedTools, env.pinnedSpecs = s.opts.ToolPins.Pin(toolSet)
 	}
-	if s.opts.Memory == nil && snap.Profile.Settings.IncludeGlobalMemory != nil {
+	if req.Flow != nil && req.FixedTool == nil {
+		filter := req.Flow.Tools.(FlowReadOnlyToolFilter) // Checked before any side effect.
+		allowed, err := filter.ReadOnlyTools(ctx, env.pinnedTools, toolSet)
+		if err != nil {
+			return RunResult{}, err
+		}
+		for _, name := range allowed {
+			if !slices.Contains(toolSet, name) || env.pinnedTools[name] == nil {
+				return RunResult{}, ErrFlowDispatch
+			}
+		}
+		env.ToolSet = allowed
+		env.pinnedSpecs = slices.DeleteFunc(env.pinnedSpecs, func(spec ToolSpec) bool { return !slices.Contains(allowed, spec.Name) })
+	}
+	if req.FixedTool == nil && s.opts.Memory == nil && snap.Profile.Settings.IncludeGlobalMemory != nil {
 		return RunResult{RunID: runID, Status: StatusFailed, Reason: "记忆分层读取未装配", ConfigHash: snap.Hash}, nil
 	}
-	if s.opts.Memory != nil {
+	if req.FixedTool == nil && s.opts.Memory != nil {
 		var text string
 		var err error
 		if snap.Profile.Settings.IncludeGlobalMemory != nil {
@@ -464,6 +513,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			Trigger:       req.Trigger,
 			ConfigHash:    snap.Hash,
 			StartedAt:     now,
+			Flow:          req.Flow,
 		}, manifest); err != nil {
 			return RunResult{}, fmt.Errorf("start run ledger row: %w", err)
 		}
@@ -479,7 +529,11 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 
 	// ⑥ 用户输入写进消息仓储：**宪法 II 规定的唯一写入点**。写失败 = fail-closed →
 	// Run failed（先把账本收口，再如实返回失败）。
-	if err := sess.AppendMessage(ctx, runID, Message{Role: RoleUser, Content: req.Message}); err != nil {
+	user := Message{Role: RoleUser, Content: req.Message}
+	if req.Flow != nil {
+		user.EvidenceRefs = slices.Clone(req.Flow.InputEvidenceRefs)
+	}
+	if err := sess.AppendMessage(ctx, runID, user); err != nil {
 		return s.finish(ctx, runID, env, RunResult{
 			Status: StatusFailed, Reason: err.Error(), ConfigHash: snap.Hash,
 		}), nil
@@ -493,10 +547,14 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// The injection is retrieved after the ledger row and user message so records can anchor
 	// on the run id. Storage failures refuse the run before any model call; "no permission /
 	// nothing declared" is a legal empty injection, not an error.
-	if s.opts.Knowledge != nil {
+	// Flow 的根范围是所有节点的上限；空声明叶子不应把兄弟节点的集合当检索请求。
+	// The root ceiling is not a retrieval request for a leaf with no declared bindings.
+	flowHasKnowledge := req.Flow == nil || len(snap.Profile.Knowledge) > 0
+	if req.FixedTool == nil && s.opts.Knowledge != nil && flowHasKnowledge {
 		env.knowledgeSource = s.opts.Knowledge
 		finishKnowledge := BeginPhase(runCtx, env.phases, PhaseKnowledge, "", runID, "", 0)
 		injection, kerr := s.opts.Knowledge.RetrieveForRun(runCtx, KnowledgeRunRequest{
+			Flow:      req.Flow,
 			Principal: req.Principal,
 			RunID:     runID,
 			Agent:     req.Agent,
@@ -525,7 +583,13 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// 循环拿 `runCtx`：取消信号从这里进入传播链（轮首 / 调用后 / 每次工具前 / 组返回后）。
 	// The loop's error is normally nil; an admission-class refusal (stage [5]) is the
 	// exception and travels up after the ledger is closed as failed.
-	res, loopErr := s.opts.Loop.run(runCtx, runID, env)
+	var res RunResult
+	var loopErr error
+	if req.FixedTool != nil {
+		res, loopErr = s.opts.Loop.runFixedTool(runCtx, runID, env, *req.FixedTool)
+	} else {
+		res, loopErr = s.opts.Loop.run(runCtx, runID, env)
+	}
 	if loopErr != nil {
 		// 账本已经写了 running 行（⑤）：**不得**留成 running 等恢复扫描误判，
 		// 先落 failed 终态，再按错误通道返回。
@@ -541,6 +605,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// review failure never turns a successful run into a failed one.
 	if res.Status == StatusCompleted && s.opts.Knowledge != nil && !env.knowledge.Empty() {
 		if _, aerr := s.opts.Knowledge.ResolveAnswer(ctx, KnowledgeAnswerRequest{
+			Flow:      req.Flow,
 			Principal: req.Principal,
 			RunID:     runID,
 			Answer:    res.FinalText,
@@ -574,7 +639,16 @@ func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, re
 	if s.opts.Runs == nil {
 		return res
 	}
-	if err := s.opts.Runs.FinishRun(ctx, runID, res.Status, res.Reason, res.Iterations, res.ToolCalls, s.opts.Now()); err != nil {
+	finishCtx := ctx
+	if env != nil && env.Flow != nil {
+		// A Flow cancellation joins this original Run before releasing its leaf
+		// capacity. Preserve the same terminal writer with bounded cleanup even
+		// when the execution context has already been cancelled.
+		var cancel context.CancelFunc
+		finishCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+	}
+	if err := s.opts.Runs.FinishRun(finishCtx, runID, res.Status, res.Reason, res.Iterations, res.ToolCalls, s.opts.Now()); err != nil {
 		s.opts.Logger.Error("运行终态落库失败",
 			"run_id", runID, "store", "runs", "op", "finish")
 	}
@@ -762,6 +836,16 @@ func pinnedClient(resolved ResolvedResources) (ProviderClient, error) {
 	return client, nil
 }
 
+// pinnedClientWhenNeeded selects the client before any model-dependent work.
+// The FixedTool design probe uses false: resource/Agent pins still belong to Run
+// admission, while absence of a model mapping must not invent a Chat dependency.
+func pinnedClientWhenNeeded(resolved ResolvedResources, modelRequired bool) (ProviderClient, error) {
+	if !modelRequired {
+		return nil, nil
+	}
+	return pinnedClient(resolved)
+}
+
 // boundSkillDirs 把准入固定的技能目录映射拍成**有序**切片（人工 review ② F1）：文件工具
 // 只放行这些发布版本目录。Go 的 map 遍历顺序随机，不排序就会让同一次运行的工具环境在
 // 不同进程里读数不同；排序后 ToolEnv.SkillDirs 是可复核的稳定输入。
@@ -843,6 +927,15 @@ func (s *AgentService) admit(ctx context.Context, req RunRequest) (func(), error
 	if s.running >= s.opts.MaxConcurrent {
 		return nil, &InstanceFullError{Limit: s.opts.MaxConcurrent}
 	}
+	if req.Flow != nil {
+		reserved := 1
+		if s.opts.FlowInteractiveReservedRuns != nil {
+			reserved = *s.opts.FlowInteractiveReservedRuns
+		}
+		if reserved < 0 || reserved >= s.opts.MaxConcurrent || s.flowRunning >= s.opts.MaxConcurrent-reserved {
+			return nil, &InstanceFullError{Limit: s.opts.MaxConcurrent}
+		}
+	}
 	// 会话状态门禁：只有"要复用某个会话"的请求才查；DB 读在锁内（单次主键查询，
 	// 这把锁只保护准入与归档，不覆盖整个运行——已知取舍）。
 	// 未命中：要求既有 → 调用方错误；否则放行，后续 UpsertSession 自动创建。
@@ -867,6 +960,9 @@ func (s *AgentService) admit(ctx context.Context, req RunRequest) (func(), error
 		s.busy[sessionID] = struct{}{}
 	}
 	s.running++
+	if req.Flow != nil {
+		s.flowRunning++
+	}
 
 	released := false
 	return func() {
@@ -880,6 +976,9 @@ func (s *AgentService) admit(ctx context.Context, req RunRequest) (func(), error
 			delete(s.busy, sessionID)
 		}
 		s.running--
+		if req.Flow != nil {
+			s.flowRunning--
+		}
 	}, nil
 }
 

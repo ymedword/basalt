@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "scenario": "synthetic-enterprise-ai-procurement",
+  "not_a_real_tender": true,
+  "baseline_commit": "ca9a0d29f185a548b14b595e6068c52df1c3cdf4",
+  "files": [
+    {
+      "path": "sources/commercial-synthetic.md",
+      "sha256": "ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f",
+      "bytes": 630,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/open-procurement-reference.md",
+      "sha256": "33cc86830ba70d38bf52dab1b73bcd167c6a44abc1d3d8c73831a4a317d6c046",
+      "bytes": 777,
+      "kind": "public"
+    },
+    {
+      "path": "sources/product-main.md",
+      "sha256": "13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1",
+      "bytes": 12530,
+      "kind": "public"
+    },
+    {
+      "path": "sources/request-01.md",
+      "sha256": "ebe6fd5f640e4d89430b436ef8f3de7e75b6d0c77a0638483bffeec2867d450f",
+      "bytes": 843,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-02.md",
+      "sha256": "a4675d1d3fc556d586f5efe656a7a5cc5c072aaee92d7519418120b531c7e281",
+      "bytes": 866,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-03.md",
+      "sha256": "0bff8815a8ac17028d12074c3ea9350e48d5c9a278945725dbae06305b4edfe8",
+      "bytes": 859,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-04.md",
+      "sha256": "d60da3703755183a9ef09f94f2ec1b5b08480c5630de6384ad6a8b2f9b113ea2",
+      "bytes": 839,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-05.md",
+      "sha256": "7b78ce8e64c180970abf6e07c0cf720a52e18bf3cd774eb83d65775314180bc6",
+      "bytes": 837,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-06.md",
+      "sha256": "c00ee2c2aab5d7f630a0a7d14dd69785c3b91ca9f1d19e69e4c4b187eafd3e5d",
+      "bytes": 914,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-07.md",
+      "sha256": "a0c46cbd2a368ad1fc06a0d89d44990d864453ac1f845462fb455a3bf9ed6e19",
+      "bytes": 852,
+      "kind": "synthetic"
+    },
+    {
+      "path": "sources/request-08.md",
+      "sha256": "0bf467d78f3cd8bfc83f20c60fc058e282aff843e24d97997a8f6dd52763e3bf",
+      "bytes": 890,
+      "kind": "synthetic"
+    }
+  ],
+  "template_version": 1
+}

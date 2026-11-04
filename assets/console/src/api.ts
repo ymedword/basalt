@@ -1144,7 +1144,11 @@ type QueryValues = Record<string, string | number | undefined>
 export interface RequestOptions {
   query?: QueryValues
   body?: unknown
+  /** Strict server-side JSON must see the original bytes (duplicate keys and
+   * exact numbers). Flow uses this instead of a lossy parse/stringify roundtrip. */
+  rawBody?: string
   ifMatch?: string
+  idempotencyKey?: string
   signal?: AbortSignal
   allowEmptyData?: boolean
 }
@@ -1473,8 +1477,16 @@ export class ApiClient {
       headers['Content-Type'] = 'application/json'
       body = JSON.stringify(options.body)
     }
+    if (options.rawBody !== undefined) {
+      if (options.body !== undefined) throw new ApiError(0, 'PROTOCOL', '请求不能同时包含两种正文')
+      headers['Content-Type'] = 'application/json'
+      body = options.rawBody
+    }
     if (options.ifMatch !== undefined) {
       headers['If-Match'] = options.ifMatch
+    }
+    if (options.idempotencyKey !== undefined) {
+      headers['Idempotency-Key'] = options.idempotencyKey
     }
 
     let response: Response

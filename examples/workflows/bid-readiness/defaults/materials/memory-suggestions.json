@@ -1,0 +1,31 @@
+[
+  {
+    "agent": "bid-requirements",
+    "state": "suggestion",
+    "text": "【合成演示经验 M-REQ】历史复盘容易把累计里程碑相加。逐项保留起算点；本提示不是项目事实。",
+    "knowledge_collections": [
+      "bid-request"
+    ]
+  },
+  {
+    "agent": "bid-technical",
+    "state": "suggestion",
+    "text": "【合成演示经验 M-TECH】单二进制仍可依赖数据库。基本 token 鉴权不等于企业 SSO；候选工作流不算已交付。",
+    "knowledge_collections": [
+      "bid-product",
+      "bid-request"
+    ]
+  },
+  {
+    "agent": "bid-delivery",
+    "state": "suggestion",
+    "text": "【合成演示经验 M-DELIVERY】旧演示项目维护期曾为6个月。本条仅历史提醒；当前采购约定优先，不能照搬期限或报价。",
+    "knowledge_collections": []
+  },
+  {
+    "agent": "bid-reviewer",
+    "state": "suggestion",
+    "text": "【合成演示经验 M-REVIEW】同事或 Agent 的结论不是独立证据。要求回到当前来源；合成案例不证明真实资质或业绩。",
+    "knowledge_collections": []
+  }
+]

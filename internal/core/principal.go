@@ -177,6 +177,10 @@ const (
 	// ScopeKnowledgeWrite 允许建集合 / 文档、删除与重建索引。
 	// ScopeKnowledgeWrite allows building and maintaining collections and documents.
 	ScopeKnowledgeWrite = "knowledge:write"
+	// ScopeFlowsRead allows safe definition metadata and one's own durable tasks.
+	ScopeFlowsRead = "flows:read"
+	// ScopeFlowsWrite allows accepting and controlling one's own durable tasks.
+	ScopeFlowsWrite = "flows:write"
 	// ScopeDiagnosticsRead 只随内置管理员生效，**不得**发给调用方 Key。
 	// ScopeDiagnosticsRead is admin-only and never issued to caller keys.
 	ScopeDiagnosticsRead = "diagnostics:read"
@@ -202,7 +206,7 @@ const (
 func KnownScope(scope string) bool {
 	switch scope {
 	case ScopeSessionsRead, ScopeSessionsWrite, ScopeKnowledgeRead, ScopeKnowledgeWrite,
-		ScopeDiagnosticsRead, ScopeCallersAdmin:
+		ScopeDiagnosticsRead, ScopeCallersAdmin, ScopeFlowsRead, ScopeFlowsWrite:
 		return true
 	}
 	name, ok := strings.CutPrefix(scope, AgentInvokeScopePrefix)

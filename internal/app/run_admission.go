@@ -37,6 +37,8 @@ type runAdmission struct {
 	// 意味着 Run 从未开始，事件是它唯一的时间线痕迹（没有执行、没有审计行）。
 	// diag records the run-admission verdict; a denial here has no audit row at all.
 	diag diagnosticRecorder
+	// Nil keeps the approved default reserve of one; explicit zero opts out.
+	flowReservedPerCaller *int
 }
 
 // run 取名额 → 执行 → 归还。`next` 是真正跑 Run 的函数（core 运行入口）。
@@ -46,8 +48,21 @@ func (a *runAdmission) run(
 	req core.RunRequest,
 	next func(context.Context, core.RunRequest) (core.RunResult, error),
 ) (res core.RunResult, err error) {
+	if req.Flow != nil && (a == nil || a.limiter == nil) {
+		return core.RunResult{}, core.ErrFlowDispatch
+	}
 	if a != nil && a.limiter != nil {
-		ticket, admitErr := a.limiter.AdmitRun(ctx, req.Principal)
+		var ticket callers.RunTicket
+		var admitErr error
+		if req.Flow != nil {
+			reserved := 1
+			if a.flowReservedPerCaller != nil {
+				reserved = *a.flowReservedPerCaller
+			}
+			ticket, admitErr = a.limiter.AdmitFlowRun(ctx, req.Principal, reserved)
+		} else {
+			ticket, admitErr = a.limiter.AdmitRun(ctx, req.Principal)
+		}
 		// 准入判定先留痕（V-8）：拒绝时 Run 未开始、没有审计行，这条事件就是它在
 		// 诊断面上的全部痕迹；放行让"这次 Run 拿到过哪个名额表"可被复核。
 		// The verdict is recorded either way; a denial has no other trace.

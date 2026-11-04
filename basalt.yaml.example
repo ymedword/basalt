@@ -198,6 +198,27 @@ author:
   model: deepseek-chat    # 该连接下的模型名
   temperature: 0.2        # 可选，缺省 0.2，取值 [0,2]
 
+# US19：仅 serve 推进已发布的持久顺序流程；普通消息与 Run 仍同步。
+# 默认关闭；固定 Worker 共用 server.max_concurrent_runs，并保留交互名额。
+flows:
+  enabled: false
+  max_active: 4
+  interactive_reserved_runs: 1
+  interactive_reserved_per_caller: 1
+  max_open_tasks: 32
+  max_stored_tasks: 10000
+  poll_interval_ms: 250
+  max_duration_seconds: 1800
+  max_nodes: 64
+  max_depth: 3
+  max_children: 16
+  max_attempts_per_node: 3
+  max_revisions: 2
+  max_total_tokens: 200000
+  max_tool_calls: 200
+  cancel_wait_seconds: 30
+  shutdown_grace_seconds: 35
+
 # US-16A：启动配置快照；没有热加载、按规则DSL或OBS写API。
 # 保留天数默认30天；清理默认关闭，示例不会自动删除数据或向外导出。
 observability:

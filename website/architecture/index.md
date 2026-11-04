@@ -83,4 +83,4 @@ The compact summary below is also used in the README. Four additional views expl
 
 ## Current scope {#current-scope}
 
-This version provides single-node, multi-agent hosting. Agent collaboration, multi-node distributed execution, vector retrieval, automatic learning, enterprise SSO and multi-tenant governance are outside this version. Logical scopes do not provide process or container fault isolation. Data sent to model endpoints and external tools follows their configured services.
+This version provides single-node, multi-agent hosting. Opt-in durable sequential flows coordinate immutable published steps through the original Run and audit path. Unknown side effects stop advancement. Parallel graphs, multi-node distributed execution, automatic learning, enterprise SSO and multi-tenant governance remain outside this version. Logical scopes do not provide process or container fault isolation. Data sent to model endpoints and external tools follows their configured services.

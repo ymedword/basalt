@@ -66,7 +66,7 @@ const RESERVATION_STATUS_LABELS: Readonly<Record<string, { readonly label: strin
 }
 
 /** 常规 scope 复选框：两个管理面 scope 不在其中（签发给 Key 会被 400 拒绝）。 */
-const SCOPE_CHOICES = ['sessions:read', 'sessions:write', 'knowledge:read', 'knowledge:write'] as const
+const SCOPE_CHOICES = ['sessions:read', 'sessions:write', 'knowledge:read', 'knowledge:write', 'flows:read', 'flows:write'] as const
 
 /** 把 `agents:invoke` 输入行归一成完整 scope：接受 Agent 名或完整字面量。 */
 function normalizeAgentScope(line: string): string {

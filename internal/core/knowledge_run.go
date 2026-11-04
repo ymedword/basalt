@@ -142,6 +142,8 @@ func (k *KnowledgeInjection) Refs() []EvidenceRef {
 // KnowledgeRunRequest 是一次 Run 级检索请求（注入面装配时交给装配层实现）。
 // KnowledgeRunRequest is one prompt-bound retrieval issued by the run entry.
 type KnowledgeRunRequest struct {
+	// Flow is internal execution context, never accepted from an API or model.
+	Flow *FlowRunContext
 	// Principal 是本 Run 准入时冻结的调用方身份（**显式传参**，不经 context）。
 	Principal Principal
 	// RunID 是装配记录与诊断事件的关联主锚点（必填）。
@@ -157,6 +159,7 @@ type KnowledgeRunRequest struct {
 // KnowledgeRevalidateRequest 是"注入面现在还有哪些片段仍可按原样使用"的复核请求。
 // KnowledgeRevalidateRequest asks which injected chunks are still usable as-is.
 type KnowledgeRevalidateRequest struct {
+	Flow *FlowRunContext
 	// Principal 是本次 Run 冻结的调用方身份。
 	Principal Principal
 	// RunID 是关联标识（诊断事件的主锚点）。
@@ -168,6 +171,7 @@ type KnowledgeRevalidateRequest struct {
 // KnowledgeAnswerRequest 是答案产出后的引用复核请求。
 // KnowledgeAnswerRequest is the citation review issued once the answer exists.
 type KnowledgeAnswerRequest struct {
+	Flow *FlowRunContext
 	// Principal / RunID 是关联标识（RunID 必填）。
 	Principal Principal
 	RunID     string

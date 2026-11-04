@@ -305,6 +305,13 @@ type Concurrency interface {
 	Release(callerID string)
 }
 
+// FlowConcurrency extends the same slot table, atomically checking total and
+// Flow occupancy. It must not be implemented with a separate semaphore.
+type FlowConcurrency interface {
+	AcquireFlow(ctx context.Context, callerID string, interactiveReserved int) error
+	ReleaseFlow(callerID string)
+}
+
 // RunTicket 是 Run 并发票据：只承载名额，不含任何配额预留，**不得**当作
 // `Ticket` 结算。RunKey 是进程内唯一标识，重复退还同一票据为空操作。
 // RunTicket carries only the slot; RunKey makes repeated releases a no-op.
@@ -321,9 +328,10 @@ type RunTicket struct {
 // memoryConcurrency is the in-process slot table; limits come from an injected
 // lookup and restarting clears counts because the crashed runs are gone too.
 type memoryConcurrency struct {
-	mu    sync.Mutex
-	limit func(callerID string) (int, bool)
-	inUse map[string]int
+	mu        sync.Mutex
+	limit     func(callerID string) (int, bool)
+	inUse     map[string]int
+	flowInUse map[string]int
 }
 
 // NewMemoryConcurrency 构造内存名额表。`limit` 为 nil 是装配错误；限额缺失或为
@@ -334,7 +342,7 @@ func NewMemoryConcurrency(limit func(callerID string) (int, bool)) (Concurrency,
 	if limit == nil {
 		return nil, errConcurrencyUnconfigured
 	}
-	return &memoryConcurrency{limit: limit, inUse: make(map[string]int)}, nil
+	return &memoryConcurrency{limit: limit, inUse: make(map[string]int), flowInUse: make(map[string]int)}, nil
 }
 
 // Acquire 先判上下文与身份，再取限、最后在锁内判定并计数：取消 / 超时的请求
@@ -342,6 +350,17 @@ func NewMemoryConcurrency(limit func(callerID string) (int, bool)) (Concurrency,
 // Acquire checks context and identity before taking a slot, and denies unknown
 // callers or zero limits rather than defaulting to unlimited.
 func (c *memoryConcurrency) Acquire(ctx context.Context, callerID string) error {
+	return c.acquire(ctx, callerID, 0, false)
+}
+
+func (c *memoryConcurrency) AcquireFlow(ctx context.Context, callerID string, reserved int) error {
+	if reserved < 0 {
+		return errInvalidConcurrencyLimit
+	}
+	return c.acquire(ctx, callerID, reserved, true)
+}
+
+func (c *memoryConcurrency) acquire(ctx context.Context, callerID string, reserved int, flow bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -361,21 +380,44 @@ func (c *memoryConcurrency) Acquire(ctx context.Context, callerID string) error 
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.inUse[callerID] >= limit {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.inUse[callerID] >= limit || flow && (reserved >= limit || c.flowInUse[callerID] >= limit-reserved) {
 		return ErrConcurrencyLimited
 	}
 	c.inUse[callerID]++
+	if flow {
+		c.flowInUse[callerID]++
+	}
 	return nil
 }
 
 // Release 归还名额；计数归零时删除键，避免表随历史调用方无限增长。
 // Release returns the slot and drops the key at zero to keep the map bounded.
 func (c *memoryConcurrency) Release(callerID string) {
+	c.release(callerID, false)
+}
+
+func (c *memoryConcurrency) ReleaseFlow(callerID string) { c.release(callerID, true) }
+
+func (c *memoryConcurrency) release(callerID string, flow bool) {
 	if callerID == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if flow {
+		if c.flowInUse[callerID] == 0 {
+			return
+		}
+		c.flowInUse[callerID]--
+		if c.flowInUse[callerID] == 0 {
+			delete(c.flowInUse, callerID)
+		}
+	} else if c.inUse[callerID] <= c.flowInUse[callerID] {
+		return
+	}
 	if c.inUse[callerID] <= 1 {
 		delete(c.inUse, callerID)
 		return
@@ -420,8 +462,13 @@ type Limiter struct {
 	// mu 保护 active 与 nextRun：active 记录已签发且尚未退还的票据，
 	// 既提供退还幂等，又让键空间随在跑 Run 数有界。
 	mu      sync.Mutex
-	active  map[string]string
+	active  map[string]runTicketOwner
 	nextRun uint64
+}
+
+type runTicketOwner struct {
+	callerID string
+	flow     bool
 }
 
 // NewLimiter 构造限制器；缺少端口时仍返回实例，由各 Admit 方法失败关闭，
@@ -434,7 +481,7 @@ func NewLimiter(deps LimiterDeps) *Limiter {
 		quotas:              deps.Quotas,
 		ingressOverrides:    deps.IngressOverrides,
 		localAdminUnlimited: deps.LocalAdminUnlimited,
-		active:              make(map[string]string),
+		active:              make(map[string]runTicketOwner),
 	}
 }
 
@@ -508,6 +555,19 @@ func (l *Limiter) ingressOverride(ctx context.Context, callerID string) (*Ingres
 // rate here drains the HTTP bucket from background triggers; checking identity
 // after acquiring lets zero principals take slots.
 func (l *Limiter) AdmitRun(ctx context.Context, p core.Principal) (RunTicket, error) {
+	return l.admitRun(ctx, p, false, 0)
+}
+
+// AdmitFlowRun shares ordinary per-caller counters and reserves interactive room.
+// Scope remains explicit; adding this method grants nothing to existing keys.
+func (l *Limiter) AdmitFlowRun(ctx context.Context, p core.Principal, reserved int) (RunTicket, error) {
+	if !p.Valid() || !p.HasScope(core.ScopeFlowsWrite) {
+		return RunTicket{}, core.ErrUnauthorized
+	}
+	return l.admitRun(ctx, p, true, reserved)
+}
+
+func (l *Limiter) admitRun(ctx context.Context, p core.Principal, flow bool, reserved int) (RunTicket, error) {
 	if err := ctx.Err(); err != nil {
 		return RunTicket{}, err
 	}
@@ -517,15 +577,25 @@ func (l *Limiter) AdmitRun(ctx context.Context, p core.Principal) (RunTicket, er
 	if l == nil || l.concurrency == nil {
 		return RunTicket{}, errConcurrencyUnconfigured
 	}
-	if err := l.concurrency.Acquire(ctx, p.CallerID); err != nil {
-		return RunTicket{}, err
+	var acquireErr error
+	if flow {
+		port, ok := l.concurrency.(FlowConcurrency)
+		if !ok {
+			return RunTicket{}, errConcurrencyUnconfigured
+		}
+		acquireErr = port.AcquireFlow(ctx, p.CallerID, reserved)
+	} else {
+		acquireErr = l.concurrency.Acquire(ctx, p.CallerID)
+	}
+	if acquireErr != nil {
+		return RunTicket{}, acquireErr
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.nextRun++
 	key := fmt.Sprintf("run_%d", l.nextRun)
-	l.active[key] = p.CallerID
+	l.active[key] = runTicketOwner{callerID: p.CallerID, flow: flow}
 	return RunTicket{CallerID: p.CallerID, RunKey: key}, nil
 }
 
@@ -548,18 +618,26 @@ func (l *Limiter) ReleaseRun(ctx context.Context, t RunTicket) error {
 	}
 
 	l.mu.Lock()
-	callerID, issued := l.active[t.RunKey]
+	owner, issued := l.active[t.RunKey]
 	if !issued {
 		l.mu.Unlock()
 		return nil // 重复退还：票据已归还过，空操作
 	}
-	if callerID != t.CallerID {
+	if owner.callerID != t.CallerID {
 		l.mu.Unlock()
 		return errRunTicketMismatch
 	}
 	delete(l.active, t.RunKey)
 	l.mu.Unlock()
 
-	l.concurrency.Release(t.CallerID)
+	if owner.flow {
+		port, ok := l.concurrency.(FlowConcurrency)
+		if !ok {
+			return errConcurrencyUnconfigured
+		}
+		port.ReleaseFlow(t.CallerID)
+	} else {
+		l.concurrency.Release(t.CallerID)
+	}
 	return nil
 }

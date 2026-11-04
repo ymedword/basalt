@@ -1492,3 +1492,60 @@ observability:
 至少包含 `database.dump`、`workspace.zip`、`basalt.exe` 的 SHA-256，且目录只能含清单列出的普通文件与标记；清理前再次校验全部文件。
 保管好配置、环境密钥来源和实例密钥；本机 DPAPI 密文不代表可跨机器解密。
 新增 PostgreSQL 前向迁移0007；不能仅换回旧二进制打开v7数据库，回退需使用同一停机点的数据库、工作区、配置和程序备份。
+
+## 持久顺序流程（US19） {#durable-flows}
+
+流程任务将跨 Run 的步骤、契约、版本、预算和验收结果保存在 PostgreSQL。普通消息与 Run 继续同步执行；只在 `serve` 且 `flows.enabled: true` 时，由固定 Worker 顺序推进已批准的流程。不是并行图、分布式接管或任意代码执行器。
+
+### 启用与容量
+
+先按停机点备份数据库、工作区、配置、二进制和工作区外实例身份文件，再启动新版。US19 只追加迁移 `0008_flow.sql`，当前数据库版本为8；迁移1–7不改。旧程序不能打开v8库，回退必须恢复同一备份集，不能删除迁移记录。
+
+`basalt.yaml.example` 列出全部有界配置，Docker模板同样默认关闭。缺省为4 active、32 open、10000 stored、250ms轮询、1800秒根时限、64节点、深度3、子任务16、单节点最多3次尝试与2次修订、200000 token与200次工具调用。active只限制本实例固定Worker，所有叶子还共用原实例／调用方Run名额和配额；父子不是各发一份新预算。实例与调用方各保留1个交互名额，可显式配置0；若调用方总名额不大于预留，新受理会拒绝并说明原因。
+
+启用Flow时，既有共享PG池在未设置`database.max_conns`时采用32条上限，未设置`database.min_conns`时按该上限保留可复用空闲连接；不预热，不增加第二连接池。显式配置保留原值，`min_conns`在database/sql中表示最大空闲数。Flow关闭时原缺省不变。多Worker下只保留两条空闲连接会造成大量短连接，Windows／WSL可能耗尽临时端口；连接复用与上限需要一起配置，不能靠无限建连规避容量。
+
+接近stored上限时先导出业务所需产物并规划维护，不会自动删除Flow恢复权威。历史30天清理继续保护Flow引用的Run、消息、调用审计和证据，任务终态也不删除未知动作。流程关闭仅停止新受理／推进；启动核对与已存在任务的关闭操作仍有效。
+
+### 定义、发布与调用
+
+目录包含 `FLOW.yaml` 与其 `task_contract` 指向的普通JSON契约文件。离线校验只验证结构；发布前实例还核对真实Agent UID、生命周期版本、配置／资源清单hash、工具适配器、子定义和当前权限。同名Agent不能接管旧身份。
+
+```sh
+basalt flow validate ./my-flow
+basalt flow validate ./my-flow --bundle > flow-bundle.json
+```
+
+管理台从左侧「工作流」进入，页内分为「工作流定义」和「执行任务」。在定义页选择「新建工作流」，填写目标、约束和任务参数，从已就绪的 Agent 添加步骤；用拖动或上／下移调整顺序，为下一步骤选择任务参数或前面步骤的输出字段。编辑器组织已注册 Agent，不在此创建 Agent 或编写其提示词。移位导致上游引用失效时会阻止发布，不会自动改接其他步骤。
+
+先只读在线校验、检查版本及步骤差异，再在页内核对影响并确认发布。退役只阻止新任务，既有任务仍固定原版本。高级编辑保留完整 bundle 导入，用于复杂 Schema 与受控固定节点；它不是基础编排的必经入口。
+
+在「执行任务」选择已发布定义，按参数表单输入并启动；复杂输入可切换高级 JSON。受理后查看步骤进展、原 Run、证据缺口、验证与产物。发布、恢复及取消均使用页内确认；不确定的写结果保留原操作标识并只读核对。
+
+业务调用方Key须有 `flows:read`／`flows:write` 及叶子对应的 `agents:invoke:<name>`，每次受控边界重查原Key。管理面只接受管理身份；管理元数据不会冒充原调用方读取私有正文。凭据文件沿用操作系统受限权限，token不放argv：
+
+```sh
+basalt flow list --server http://127.0.0.1:8080 --token-file /private/caller-token
+basalt flow start <definition-uid> --input-file input.json --idempotency-key <stable-key> --server http://127.0.0.1:8080 --token-file /private/caller-token
+basalt flow status <task-id> --server http://127.0.0.1:8080 --token-file /private/caller-token
+basalt flow cancel <task-id> --if-match '<complete-etag>' --operation-id <stable-op> --reason 'operator cancellation' --server http://127.0.0.1:8080 --token-file /private/caller-token
+basalt flow resume <task-id> --if-match '<complete-etag>' --operation-id <stable-op> --reason 'dependencies repaired' --server http://127.0.0.1:8080 --token-file /private/caller-token
+```
+
+CLI连接已经运行的实例，不启动第二写实例。远程地址必须HTTPS，HTTP仅回环。受理返回不代表业务成功；只有所有必需验收通过才为`succeeded`。网络结果未确认时保留原幂等键／操作ID，只读核对，不换键重试。控制操作使用详情返回的完整ETag；412需重新读取，不自动套用旧意图。
+
+### 排查、取消与恢复
+
+从任务详情打开原Run或「排查该流程的原运行与诊断」；运行观测可按`flow_task_id`展开已准入的Run，元数据带真实节点尝试与逻辑动作，不把预生成ID当作执行证据。调度包围Run，时长不能相加；多个叶子耗时还需区分实际调用和排队。两个Flow窗口指标是`obs_flow_tasks_total`（创建于该窗口的任务，按当前固定状态计数）与`obs_flow_unknown_actions_total`（创建于该窗口且当前未知的动作尝试）；窗口重叠不能相加，任务／动作ID与正文不进指标标签。
+
+取消先持久化关闭意图再发本地信号，最多等待30秒；原审计独立收尾上限5秒。Worker排空尝试35秒，超时会明确记录并继续等待实际join，不能提前还名额或关闭共享PG。取消不能撤回已经发出的外部请求。运维放弃用于没有可用业务关闭Key等救援，只关闭任务，不把unknown改为成功或退款。
+
+每次启动先沿用原调用／Run恢复，再核对Flow检查点。原成功Run及完整审计／消息可复用，避免重复模型或工具调用；资源换版、撤权、来源失效或结果未知则保持`blocked`。写工具只允许代码归类的受控固定节点，Agent节点只读。幂等声明、文件内容碰巧相同或模型自述均不能解除未知副作用；缺少可信查证结果时不得自动重放，也没有「强制成功」入口。修复依赖后显式恢复仍会重新核对原身份与当前证据，不能换Key或新revision绕过unknown。
+
+验收中的本地50ms模型只证明控制协议、资源边界和时延；不代表真实模型质量或业务效果优势。真实模型对照须另行授权。首次正式发布仍安排在US25收口后，由用户指定版本并触发。
+
+### US19 默认采购工作流
+
+四角色/17节点/48条需求的净化示例随二进制携带。新实例自动准备，受开箱安装器管理的存量实例升级时准备一次；已有目录、生命周期与归档不覆盖。旧未接管实例停止服务后执行 `basalt demo workflow install`。原五个每日Demo清单不变。
+
+按 `.basalt/samples/bid-readiness/SETUP.md` 配置模型、显式摄取/绑定知识、逐条确认核心经验并启用Agent；然后在“工作流”载入采购准备模板，校验/发布后手动创建任务。安装、模板加载和发布均不调用模型；摄取和执行可能计费。模板版本1的产品材料固定main ca9a0d2，不能当成后续版本能力证明。新发行版继续携带模板，但不替换已经安装或发布的用户配置。默认样例说明见 [SETUP](../examples/workflows/bid-readiness/defaults/materials/SETUP.md)。

@@ -1,0 +1,1690 @@
+{
+  "report-chain": {
+    "format_version": 1,
+    "name": "eval-report-chain",
+    "entry": "research",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "research",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "next": "draft"
+      },
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "next": "review",
+        "inputs": [
+          {
+            "target": "answer",
+            "source": "outputs.research.answer"
+          }
+        ]
+      },
+      {
+        "id": "review",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "inputs": [
+          {
+            "target": "answer",
+            "source": "outputs.draft.answer"
+          }
+        ]
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "research",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "exclusive-branch": {
+    "format_version": 1,
+    "name": "eval-exclusive-branch",
+    "entry": "decide",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "decide",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "next": "route"
+      },
+      {
+        "id": "route",
+        "kind": "branch",
+        "output_schema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "branch": {
+          "field": "budget.remaining_tokens",
+          "op": "gt",
+          "value": 0,
+          "then": "chosen",
+          "else": "unchosen"
+        }
+      },
+      {
+        "id": "chosen",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "inputs": [
+          {
+            "target": "answer",
+            "source": "outputs.decide.answer"
+          }
+        ]
+      },
+      {
+        "id": "unchosen",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "inputs": [
+          {
+            "target": "answer",
+            "source": "outputs.decide.answer"
+          }
+        ]
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "decide",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "two-agent-handoff": {
+    "format_version": 1,
+    "name": "eval-two-agent-handoff",
+    "entry": "research",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "research",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "next": "review"
+      },
+      {
+        "id": "review",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reviewer",
+          "name": "reviewer",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "inputs": [
+          {
+            "target": "answer",
+            "source": "outputs.research.answer"
+          }
+        ]
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "research",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "empty-evidence": {
+    "format_version": 1,
+    "name": "eval-empty-evidence",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "draft",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "conflicting-versions": {
+    "format_version": 1,
+    "name": "eval-conflicting-versions",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "draft",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "revoked-source": {
+    "format_version": 1,
+    "name": "eval-revoked-source",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "id": "source-value",
+          "version": 1,
+          "kind": "evidence",
+          "target_kind": "claim",
+          "target_id": "draft",
+          "required": true,
+          "min_sources": 1,
+          "validator_id": "basalt-source-value-v1"
+        }
+      ]
+    }
+  },
+  "no-progress": {
+    "format_version": 1,
+    "name": "eval-no-progress",
+    "entry": "read",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "read",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "malformed-output": {
+    "format_version": 1,
+    "name": "eval-malformed-output",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "cancel": {
+    "format_version": 1,
+    "name": "eval-cancel",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "budget-exhausted": {
+    "format_version": 1,
+    "name": "eval-budget-exhausted",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 1,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 1,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "completed-checkpoint-reuse": {
+    "format_version": 1,
+    "name": "eval-completed-checkpoint-reuse",
+    "entry": "draft",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "draft",
+        "kind": "agent",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "answer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        }
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "answer": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "answer"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  },
+  "unknown-write": {
+    "format_version": 1,
+    "name": "eval-unknown-write",
+    "entry": "write",
+    "task_contract": "TASK.json",
+    "nodes": [
+      {
+        "id": "write",
+        "kind": "tool",
+        "agent": {
+          "uid": "fixture:reader",
+          "name": "reader",
+          "version": 0,
+          "config_hash": "fixture",
+          "manifest_hash": "fixture"
+        },
+        "output_schema": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "additionalProperties": false
+        },
+        "failure": {
+          "max_attempts": 1
+        },
+        "tool": "write_file",
+        "inputs": [
+          {
+            "target": "path",
+            "literal": "receipt.txt"
+          },
+          {
+            "target": "content",
+            "literal": "frozen controlled side effect"
+          }
+        ]
+      }
+    ],
+    "limits": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 200,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 3,
+      "max_revisions": 2
+    },
+    "contract": {
+      "contract_version": 1,
+      "goal": "produce a structured answer",
+      "constraints": [
+        "Never claim acceptance when required evidence, authority or action outcome is unresolved."
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "budget": {
+        "max_total_tokens": 200000,
+        "max_tool_calls": 200,
+        "max_duration_seconds": 1800,
+        "max_depth": 3,
+        "max_children": 16,
+        "max_attempts_per_node": 3,
+        "max_revisions": 2
+      },
+      "stop_conditions": [
+        "budget",
+        "deadline",
+        "unknown"
+      ],
+      "escalation": "show unresolved",
+      "artifact_spec": [
+        {
+          "id": "report",
+          "format": "json",
+          "required": true
+        }
+      ],
+      "acceptance": [
+        {
+          "id": "shape",
+          "version": 1,
+          "kind": "deterministic",
+          "target_kind": "artifact",
+          "target_id": "report",
+          "required": true,
+          "schema": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  }
+}

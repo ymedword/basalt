@@ -1,0 +1,48 @@
+{
+  "bid-requirements": {
+    "title": "采购需求调查员",
+    "collections": [
+      "bid-request"
+    ],
+    "mission": "逐条读取指定采购章节，提取要求、数字、单位、前提与来源。不要判定产品满足，不替技术或商务作承诺。",
+    "memory": "【合成演示经验 M-REQ】历史复盘容易把累计里程碑相加。逐项保留起算点；本提示不是项目事实。"
+  },
+  "bid-technical": {
+    "title": "技术售前核查员",
+    "collections": [
+      "bid-product",
+      "bid-request"
+    ],
+    "mission": "将上游需求与固定 main 产品知识逐项比对。只把可追溯材料支持的部分标为有依据；没有测评与压测不可凭常识推断达标。",
+    "memory": "【合成演示经验 M-TECH】单二进制仍可依赖数据库。基本 token 鉴权不等于企业 SSO；候选工作流不算已交付。"
+  },
+  "bid-delivery": {
+    "title": "商务交付核查员",
+    "collections": [
+      "bid-request",
+      "bid-commercial"
+    ],
+    "mission": "检查合同起算、验收、付款与运维材料。识别报价、资质、人员证据缺口，列出负责人和下一行动；不自行补造或承诺。",
+    "memory": "【合成演示经验 M-DELIVERY】旧演示项目维护期曾为6个月。本条仅历史提醒；当前采购约定优先，不能照搬期限或报价。"
+  },
+  "bid-reviewer": {
+    "title": "标前复核协调员",
+    "collections": [
+      "bid-request",
+      "bid-product",
+      "bid-commercial"
+    ],
+    "mission": "独立核对上游各专业的遗漏、矛盾与无依据承诺。保留不确定结论和责任人，整合成内部准备包。不得将格式校验或模型自评说成业务验收。",
+    "memory": "【合成演示经验 M-REVIEW】同事或 Agent 的结论不是独立证据。要求回到当前来源；合成案例不证明真实资质或业绩。"
+  },
+  "bid-general": {
+    "title": "通用采购助手（对照）",
+    "collections": [
+      "bid-request",
+      "bid-product",
+      "bid-commercial"
+    ],
+    "mission": "完成采购要求、技术对照、商务交付和最终检查。保持准确、可追溯，不虚构缺少的资质、性能或企业事实。",
+    "memory": "【合成演示经验 M-GENERAL】核对版本、单位和累计里程碑；当前合同优先于历史经验。无材料的资格、性能、报价应列为待核对。"
+  }
+}

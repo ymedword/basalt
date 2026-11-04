@@ -191,10 +191,11 @@ func Run(ctx context.Context, args []string) int {
 		// init 引导的是 SQLite 源谱系（v6）：与运行期 PG 谱系（v1）分开传，混用会写出
 		// "v6 schema + v1 版本行"的库，db export 随即拒绝（T078 实测）。
 		// init provisions the SQLite source lineage; it is a different constant.
-		SourceSchemaVersion: storage.SupportedSchemaVersion,
-		Logger:              logger,
-		Store:               storageStore{},
-		Workspace:           workspacePort{},
+		SourceSchemaVersion:  storage.SupportedSchemaVersion,
+		Logger:               logger,
+		Store:                storageStore{},
+		Workspace:            workspacePort{},
+		AcquireWorkspaceLock: workspacePort{}.AcquireLock,
 		// Agents 是写模式端口（create / delete 在实现侧取实例锁、开关库、写操作行）——
 		// schema 目标版本与命令面同源，构造参数显式传递。
 		// The agents port owns the CLI write path; the schema target matches the command face.
@@ -230,6 +231,7 @@ func Run(ctx context.Context, args []string) int {
 		// 同级配置，零外呼、不装配运行期——与上面两个离线端口同一条理由，两条路径都安全带上。
 		// The handoff gate is read-only and offline, so it is wired on every path.
 		Handoff: handoffVerifyPort{Logger: logger},
+		Flow:    flowCLIPort{},
 	}
 
 	// 装配面在这里构造一次，两条路径共用（重路径接管句柄，只读路径只开一次只读库）。
@@ -327,6 +329,11 @@ func Run(ctx context.Context, args []string) int {
 			}
 		}
 		if needsServer(args) {
+			if flowErr := rt.flows.Start(runCtx); flowErr != nil {
+				logger.Error("Flow 启动核对失败", "reason", "flow_recovery_unavailable")
+				_ = rt.Close()
+				return 1
+			}
 			// 配置监听在调度器就绪之后、HTTP 开放之前接入（图 A ⑧–⑩）：先接监听再交
 			// 端口，反过来的顺序会让"启动后头几秒的修改不生效"成为可复现的缺陷。调度联动
 			// 走运行期保留的**同一份**编辑适配器（私有 claim 基线随热加载增减，约束 39）。

@@ -84,12 +84,25 @@ func (e *ToolExecutor) Execute(ctx context.Context, env ToolEnv, toolSet []strin
 func (e *ToolExecutor) ExecuteStep(
 	ctx context.Context, env ToolEnv, toolSet []string, call ToolCall, step ToolStep,
 ) Result {
+	result, _, _ := e.executeStep(ctx, env, toolSet, call, step, nil)
+	return result
+}
+
+func (e *ToolExecutor) executeStep(
+	ctx context.Context, env ToolEnv, toolSet []string, call ToolCall, step ToolStep, flowCall *preparedFlowCall,
+) (Result, ActionOutcome, error) {
+	outcome := ActionOutcome{Outcome: "not_dispatched"}
 	// ① 工具名解析 + 运行时归属校验（两道，均在执行之前——不产生审计行、不终止 Run）。
 	// 解析**先查准入时钉住的实例**（14D / C4）：受控重建换掉注册池后，在途 Run 继续用
 	// 它自己那一代实例，不会被悄悄转到新连接；未钉（零值单测 / 非 Run 直调）才查注册池。
 	// Pinned instances win so an apply can never retarget an in-flight run.
 	tool, ok := env.Tools[call.Name]
-	if !ok {
+	if flowCall != nil {
+		// Preserve the very instance validated before action preparation. A callback
+		// or registry rebuild cannot retarget this call to a same-named instance.
+		tool, ok = flowCall.tool, flowCall.tool != nil
+	}
+	if !ok && flowCall == nil {
 		tool, ok = e.resolver.Resolve(call.Name)
 	}
 	if !ok {
@@ -100,7 +113,7 @@ func (e *ToolExecutor) ExecuteStep(
 		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticCall, Tool: call.Name, ErrorKind: ErrorKindNotFound,
 		})
-		return Result{Content: fmt.Sprintf("tool not registered: %s", call.Name)}
+		return Result{Content: fmt.Sprintf("tool not registered: %s", call.Name)}, outcome, nil
 	}
 	if !slices.Contains(toolSet, call.Name) {
 		// 全局已注册但**本 Agent 未声明**：四段式拒绝，放行指引点名 `AGENT.md` 的 `tools:`（需重启）。
@@ -121,12 +134,12 @@ func (e *ToolExecutor) ExecuteStep(
 		e.recordDiag(ctx, env, step, call.ID, ToolDiagnostic{
 			Kind: ToolDiagnosticDenied, Tool: call.Name,
 		})
-		return Result{Content: refusal.Error()}
+		return Result{Content: refusal.Error()}, outcome, nil
 	}
 
 	// ② 入参校验：json.Valid + 能解出**对象**。非法 → **仍写审计**（工具确实被调用了）。
 	if reason := checkToolInput(tool, call.Arguments); reason != "" {
-		return e.refuseInvalidInput(ctx, env, step, call, reason)
+		return e.refuseInvalidInput(ctx, env, step, call, reason), outcome, nil
 	}
 
 	// ③ 审计**先写 pending**；写失败 → 拒绝执行（fail-closed）+ 回填"审计不可用" → Run 继续。
@@ -142,16 +155,26 @@ func (e *ToolExecutor) ExecuteStep(
 		e.logger.Error("工具执行被拒绝——审计仓储未装配（fail-closed）",
 			"run_id", env.RunID, "session_id", env.SessionID, "tool", call.Name,
 			"store", "tool_invocations", "op", "start")
-		return Result{Content: auditUnavailableText}
+		return Result{Content: auditUnavailableText}, outcome, ErrAuditWrite
 	}
 	id, ok := e.beginInvocation(ctx, env, call)
 	if !ok {
-		return Result{Content: auditUnavailableText}
+		return Result{Content: auditUnavailableText}, outcome, ErrAuditWrite
 	}
+	outcome.AuditID = id
 	// 预写成功后把行 id 注入执行环境：工具（目前是 notify）据此写与本次调用一对一的
 	// 派生记录。没有行 id 时不写——审计失败已经在上面 fail-closed。
 	// Inject the audit row id so the tool can write its one-per-invocation derived record.
 	env.ToolInvocationID = id
+	if flowCall != nil {
+		if err := flowCall.beforeDispatch(ctx, tool, id); err != nil {
+			outcome.AuditConfirmed = e.finishInvocation(ctx, env, id, ToolInvocationResult{
+				Status: LLMCallFailed, ErrorKind: ErrorKindRuntimeError,
+				ErrorMessage: "flow dispatch authorization rejected", ResultJSON: marshalToolResult(toolResultJSON{Content: "flow dispatch authorization rejected"}),
+			})
+			return Result{Content: "flow dispatch authorization rejected"}, outcome, err
+		}
+	}
 
 	// ④⑤ 执行：`env` 由循环侧构造（本流程只消费）；单工具超时在这里**实际建立**
 	// （env.Timeout 已是"工具默认 / Profile 覆盖 / 剩余 Run 预算"三者最小，工具要更短
@@ -163,6 +186,7 @@ func (e *ToolExecutor) ExecuteStep(
 		defer cancelExec()
 	}
 	start := time.Now()
+	outcome.Dispatched = true
 	res, err := tool.Execute(execCtx, env, json.RawMessage(call.Arguments))
 	duration := time.Since(start)
 
@@ -188,7 +212,13 @@ func (e *ToolExecutor) ExecuteStep(
 		Retryable: res.Retryable,
 		Truncated: truncated,
 	})
-	e.finishInvocation(ctx, env, id, out)
+	outcome.AuditConfirmed = e.finishInvocation(ctx, env, id, out)
+	outcome.Outcome = string(out.Status)
+	if !outcome.AuditConfirmed {
+		outcome.Outcome = string(LLMCallUnknown)
+	}
+	outcome.Output = append(json.RawMessage(nil), out.ResultJSON...)
+	outcome.OutputHash = flowBytesHash(outcome.Output)
 	// 诊断（V-8）：一次真实执行的结局，`audit_ref` 指向上面的行。即便终态回填失败，
 	// 这里记的仍是"调用发生过"——行的 pending 形态由恢复扫描回答，诊断不重复它的职责。
 	// The event records the execution's outcome and points at its audit row.
@@ -200,7 +230,7 @@ func (e *ToolExecutor) ExecuteStep(
 	// 循环把它写进 tool 消息（C-26：来源依赖随转述传播），丢弃一处即断链。
 	// Step ⑧ must carry EvidenceRefs through: the loop writes them onto the tool
 	// message, and dropping them here breaks the C-26 provenance chain.
-	return Result{Content: content, Retryable: res.Retryable, EvidenceRefs: res.EvidenceRefs}
+	return Result{Content: content, Retryable: res.Retryable, EvidenceRefs: res.EvidenceRefs}, outcome, nil
 }
 
 // refuseInvalidInput 为非法入参补一条 `failed` + `invalid_input` 审计行并回填失败文本（流程 D ②）。
@@ -273,12 +303,14 @@ func (e *ToolExecutor) beginInvocation(ctx context.Context, env ToolEnv, call To
 // 而**结果照常返回给模型**——修复历史不能以扣下答案为代价。
 // finishInvocation writes the terminal state. A failed write keeps the row pending and is
 // logged only; the result still travels back to the model.
-func (e *ToolExecutor) finishInvocation(ctx context.Context, env ToolEnv, id int64, out ToolInvocationResult) {
+func (e *ToolExecutor) finishInvocation(ctx context.Context, env ToolEnv, id int64, out ToolInvocationResult) bool {
 	finCtx, cancel := finishContext(ctx)
 	defer cancel()
 	if err := e.audit.FinishInvocation(finCtx, id, out); err != nil {
 		e.logger.Error("工具审计终态回填失败", "run_id", env.RunID, "store", "tool_invocations", "op", "finish")
+		return false
 	}
+	return true
 }
 
 // pendingInvocation 组装审计预写形态（`input_json` 原样保存：模型给的 arguments 是 JSON

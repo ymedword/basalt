@@ -222,6 +222,11 @@ func (s *HistoryRetentionStore) cleanupRunGroup(ctx context.Context, tx *sql.Tx,
 
 const runGroupProtectedSQL = `SELECT
  EXISTS(SELECT 1 FROM runs WHERE run_id IN(SELECT run_id FROM retention_runs) AND (status NOT IN('completed','failed','cancelled','limit_reached') OR finished_at IS NULL OR finished_at >= $1))
+ -- Flow authority is not automatically pruned in US-19, including terminal
+ -- tasks with unknown actions. Keep the original Run/messages/audits it pins.
+ OR EXISTS(SELECT 1 FROM runs WHERE run_id IN(SELECT run_id FROM retention_runs) AND flow_task_id IS NOT NULL)
+ OR EXISTS(SELECT 1 FROM flow_node_attempts WHERE run_id IN(SELECT run_id FROM retention_runs) OR ($2='sessions' AND session_id=$3))
+ OR EXISTS(SELECT 1 FROM flow_evidence_refs WHERE run_id IN(SELECT run_id FROM retention_runs))
  OR ($2='runs' AND NOT EXISTS(SELECT 1 FROM retention_runs))
  OR EXISTS(SELECT 1 FROM messages WHERE id IN(SELECT id FROM retention_messages) AND created_at >= $1)
  OR EXISTS(SELECT 1 FROM messages WHERE run_id IN(SELECT run_id FROM retention_runs) AND id NOT IN(SELECT id FROM retention_messages))

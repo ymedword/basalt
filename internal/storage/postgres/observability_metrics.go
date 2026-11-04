@@ -45,6 +45,7 @@ func (s *ObservabilityStore) WindowCountsAt(ctx context.Context, window time.Dur
 	args := []any{now.Add(-window).UnixMilli(), now.UnixMilli()}
 	out := make([]observability.MetricSample, 0, 100)
 	for _, group := range []struct{ name, query, label1, label2 string }{
+		{"obs_flow_tasks_total", `SELECT status,''::text,count(*) FROM flow_tasks WHERE created_at BETWEEN $1 AND $2 GROUP BY status`, "status", ""},
 		{"obs_runs_total", `SELECT status,trigger,count(*) FROM runs WHERE started_at BETWEEN $1 AND $2 GROUP BY status,trigger`, "status", "trigger"},
 		{"obs_tool_invocations_total", `SELECT status,''::text,count(*) FROM tool_invocations WHERE started_at BETWEEN $1 AND $2 GROUP BY status`, "status", ""},
 		{"obs_retrieval_empty_total", `SELECT COALESCE(reason_codes->>0,''),''::text,count(*) FROM context_assembly_records WHERE created_at BETWEEN $1 AND $2 AND purpose='retrieval' AND jsonb_array_length(hits)=0 GROUP BY reason_codes->>0`, "reason_code", ""},
@@ -77,6 +78,7 @@ func (s *ObservabilityStore) WindowCountsAt(ctx context.Context, window time.Dur
 		out = append(out, samples...)
 	}
 	for _, scalar := range []struct{ name, query, unit string }{
+		{"obs_flow_unknown_actions_total", `SELECT count(*) FROM flow_action_attempts WHERE outcome='unknown' AND created_at BETWEEN $1 AND $2`, "1"},
 		{"obs_llm_timeout_total", `SELECT count(*) FROM llm_calls WHERE created_at BETWEEN $1 AND $2 AND error_kind='timeout'`, "1"},
 		{"obs_tool_denials_total", `SELECT (SELECT count(*) FROM tool_invocations WHERE started_at BETWEEN $1 AND $2 AND error_kind='sandbox_denied') + (SELECT count(*) FROM diagnostic_events WHERE occurred_at BETWEEN $1 AND $2 AND kind='permission_decision' AND reason_code='permission_denied')`, "1"},
 		{"obs_assembly_missing_total", `SELECT count(*) FROM runs r WHERE r.started_at BETWEEN $1 AND $2 AND NOT EXISTS(SELECT 1 FROM context_assembly_records a WHERE a.run_id=r.run_id)`, "1"},

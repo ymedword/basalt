@@ -159,6 +159,9 @@ func resolveBinaryHash(rpt *acceptanceReport) error {
 // execute 直执受保护配置中的 argv，显式限制超时并清理进程树；日志不记录环境变量。
 // execute uses argv directly, with an explicit timeout and process-tree cleanup.
 func execute(ctx context.Context, root, out string, c command, log string) (int, error) {
+	if err := offlineModelPolicy([]check{{command: c}}, os.Getenv("GOFLAGS")); err != nil {
+		return 2, err
+	}
 	args := slices.Clone(c.Args)
 	for i := range args {
 		args[i] = strings.ReplaceAll(args[i], "{out}", out)
@@ -179,7 +182,7 @@ func execute(ctx context.Context, root, out string, c command, log string) (int,
 	defer f.Close()
 	budget, cancel := context.WithTimeout(ctx, time.Duration(c.TimeoutSeconds)*time.Second)
 	defer cancel()
-	cmd := &exec.Cmd{Path: path, Args: args, Dir: root, Stdout: f, Stderr: f}
+	cmd := &exec.Cmd{Path: path, Args: args, Dir: root, Stdout: f, Stderr: f, Env: offlineModelEnvironment(os.Environ())}
 	prepareProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return 2, errors.New("process could not start; see log")

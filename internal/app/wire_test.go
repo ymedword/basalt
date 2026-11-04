@@ -69,6 +69,9 @@ type wireFixture struct {
 	// Provider"的用例在这里挂脚本替身，装配时原样交给 `App.providerOverride`。
 	// override is the optional in-process model double handed to the assembly.
 	override core.ProviderClient
+	// 只有显式超时失败探针设置；普通夹具的Close仍必须无错误。
+	// Only deliberate lifecycle-failure probes opt into an expected close error.
+	expectedCloseError string
 }
 
 // newWireFixture 建骨架 + 配置 + 记录型日志器；**不开库**（库由重路径自己开，
@@ -280,7 +283,14 @@ func (f *wireFixture) assemble(t *testing.T) *heavyRuntime {
 	f.seedPublishedProviders(t)
 	rt, err := f.app().newRuntime(context.Background())
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
-	t.Cleanup(func() { require.NoError(t, rt.Close()) })
+	t.Cleanup(func() {
+		err := rt.Close()
+		if f.expectedCloseError != "" {
+			require.ErrorContains(t, err, f.expectedCloseError)
+		} else {
+			require.NoError(t, err)
+		}
+	})
 
 	// 基线把既有 Agent 一律写成 disabled（D-01 A / 注 1）——这是本 US 的**行为变更**。
 	// 夹具经真实迁移入口把它们启用，让本 US 之前的用例继续验证各自原本的判据（随已批准

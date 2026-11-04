@@ -1,0 +1,788 @@
+{
+  "version": 1,
+  "id": "us19-base",
+  "approval": "User review 1 passed 2026-11-03: R3 approved body sha256 514ce6c9f6a8bb1e86499c80a281403e858c007a92138f3b8771429c13a37ef5 including section 6.6.0. Actual Claude G-FT design receipt and independent behavioral prerequisites are recorded in gft-receipt/run-state. This stage plus us19-process and full public profile are required; final user review 2 is pending.",
+  "inputs": [
+    "specs/019-flow-collaboration/spec.md",
+    "specs/019-flow-collaboration/plan.md",
+    "specs/019-flow-collaboration/tasks.md",
+    "specs/019-flow-collaboration/gft-design.md",
+    "specs/019-flow-collaboration/gft-receipt.md",
+    "docs/contracts/flow.md",
+    "docs/contracts/flow.pg.sql",
+    "docs/contracts/openapi.yaml",
+    "harness/acceptance.json",
+    "testdata/flow/workloads.json",
+    "testdata/flow/corpus/policy-conflict-v1.json",
+    "testdata/flow/corpus/policy-v1.json",
+    "evals/flow/baseline.json",
+    "evals/flow/model-scripts.json",
+    "evals/flow/README.md",
+    "testdata/flow/definitions.json",
+    "specs/019-flow-collaboration/acceptance-map.json",
+    ".github/workflows/ci.yml"
+  ],
+  "protect": [
+    "internal/app/flow_admission_test.go",
+    "internal/app/flow_authority_test.go",
+    "internal/app/flow_cli_test.go",
+    "internal/app/flow_embedding_integration_test.go",
+    "internal/app/flow_evaluation_integration_test.go",
+    "internal/app/flow_execution_integration_test.go",
+    "internal/app/flow_http_integration_test.go",
+    "internal/app/flow_observation_integration_test.go",
+    "internal/app/flow_progress_integration_test.go",
+    "internal/app/flow_retrieval_test.go",
+    "internal/app/flow_rework_integration_test.go",
+    "internal/app/flow_runtime_integration_test.go",
+    "internal/app/flow_support_integration_test.go",
+    "internal/app/flow_support_test.go",
+    "internal/app/flow_tools_test.go",
+    "internal/app/postgres_port_test.go",
+    "internal/callers/flow_concurrency_test.go",
+    "internal/cli/flow_config_test.go",
+    "internal/core/fixed_tool_test.go",
+    "internal/core/flow_admission_internal_test.go",
+    "internal/core/flow_finish_internal_test.go",
+    "internal/core/flow_model_test.go",
+    "internal/core/flow_progress_probe_test.go",
+    "internal/core/flow_tool_exec_test.go",
+    "internal/core/progress_test.go",
+    "internal/core/tool_group_internal_test.go",
+    "internal/e2e/us19_action_test.go",
+    "internal/e2e/us19_demo_test.go",
+    "internal/e2e/us19_lifecycle_test.go",
+    "internal/e2e/us19_recovery_test.go",
+    "internal/flow/budget_test.go",
+    "internal/flow/config_test.go",
+    "internal/flow/coordinator_integration_test.go",
+    "internal/flow/definition_test.go",
+    "internal/flow/evidence_test.go",
+    "internal/flow/input_test.go",
+    "internal/flow/json_test.go",
+    "internal/flow/loader_test.go",
+    "internal/flow/state_test.go",
+    "internal/flow/verification_test.go",
+    "internal/observability/flow_test.go",
+    "internal/storage/postgres/flow_action_integration_test.go",
+    "internal/storage/postgres/flow_advance_integration_test.go",
+    "internal/storage/postgres/flow_claim_integration_test.go",
+    "internal/storage/postgres/flow_commit_authority_integration_test.go",
+    "internal/storage/postgres/flow_cursor_integration_test.go",
+    "internal/storage/postgres/flow_delegation_integration_test.go",
+    "internal/storage/postgres/flow_embedding_integration_test.go",
+    "internal/storage/postgres/flow_model_integration_test.go",
+    "internal/storage/postgres/flow_poll_integration_test.go",
+    "internal/storage/postgres/flow_progress_integration_test.go",
+    "internal/storage/postgres/flow_query_integration_test.go",
+    "internal/storage/postgres/flow_retention_integration_test.go",
+    "internal/storage/postgres/flow_revision_integration_test.go",
+    "internal/storage/postgres/flow_start_service_integration_test.go",
+    "internal/storage/postgres/flow_store_integration_test.go",
+    "internal/storage/postgres/flow_worker_integration_test.go",
+    "internal/tool/flow_adapter_test.go",
+    "internal/tool/flow_progress_test.go",
+    "internal/tool/schema_test.go",
+    "internal/web/handlers_flow_test.go",
+    "scripts/acceptance/flow_corpus_test.go",
+    "scripts/acceptance/invariants_test.go",
+    "internal/app/ports_test.go",
+    "internal/app/supported_version_injection_test.go",
+    "internal/app/observability_legacy_api_test.go",
+    "internal/storage/postgres/migrate_integration_test.go",
+    "internal/app/flow_context_integration_test.go",
+    "internal/storage/postgres/flow_migration_integration_test.go",
+    "internal/app/flow_runtime_test.go",
+    "internal/flow/worker_test.go"
+  ],
+  "checks": [
+    {
+      "id": "019-flow-unit",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=300s",
+        "-tags=integration",
+        "./internal/flow",
+        "./internal/core",
+        "./internal/tool",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 360,
+      "required_tests": [
+        "TestFlow_AdapterClassificationIsCodeOwned",
+        "TestFlow_BlockedCloseWaitsWithoutIllegalTransition",
+        "TestFlow_BranchReadsTrustedSlotState",
+        "TestFlow_BranchUsesProgramStateAndExactNumbers",
+        "TestFlow_BudgetTighteningAndKnownOverage",
+        "TestFlow_CancelIntentNeverRequeues",
+        "TestFlow_CancelledLeafUsesBoundedOriginalTerminalWriter",
+        "TestFlow_CanonicalInputPreservesExactSemantics",
+        "TestFlow_ChildBudgetNeverResets",
+        "TestFlow_ClaimDependencyCycleRejected",
+        "TestFlow_CloseIntentCombinationDomain",
+        "TestFlow_CloseWaitsForJoinAndPreservesIntent",
+        "TestFlow_ConfigBoundsCannotOverflowOrRemoveReserves",
+        "TestFlow_ContractCannotExceedPublishedLimits",
+        "TestFlow_CoordinatorOriginalLedgerLifecycle",
+        "TestFlow_CoordinatorWorkerNeverStartsAtConstruction",
+        "TestFlow_DeclaredPaginationMakesProgress",
+        "TestFlow_DefinitionHashFreezesContract",
+        "TestFlow_DefinitionRejectsUnboundedRoute",
+        "TestFlow_DefinitionRejectsUnsupported",
+        "TestFlow_EvidenceInvalidationClosure",
+        "TestFlow_EvidenceSupportBindsContentAndSources",
+        "TestFlow_ExecutorInputAndSchemaFrozen",
+        "TestFlow_ExecutorOutcomeRetainsAuditUncertainty",
+        "TestFlow_ExecutorOutcomeWriteFailureDoesNotAdvanceProgress",
+        "TestFlow_ExecutorPrewriteFailureNoDispatch",
+        "TestFlow_ExecutorStrictPinAndSchema",
+        "TestFlow_FileReplacementAndAliasesCannotResetNoProgress",
+        "TestFlow_FixedReadOnlyRunHasNoModelPromptOrChatCharge",
+        "TestFlow_FixedToolClientSelectionHasNoModelDependency",
+        "TestFlow_InputMappingRequiresCurrentVerifiedOutput",
+        "TestFlow_InputReferencesRequireGuaranteedUpstreamNode",
+        "TestFlow_InstanceReserveUsesOriginalTotal",
+        "TestFlow_InstanceSingleSlotNeedsExplicitZeroReserve",
+        "TestFlow_LoaderBoundariesAndHashes",
+        "TestFlow_LoaderDoesNotMergeContractFiles",
+        "TestFlow_LoaderRejectsNonRegularContract",
+        "TestFlow_ModelUsageNeverUnderstatesKnownComponents",
+        "TestFlow_NestedSchemaViolationZeroDispatch",
+        "TestFlow_NoProgressAcrossRevision",
+        "TestFlow_NotifySchemaRejectsMissingChannelAndByteOverflow",
+        "TestFlow_ReadProgressRejectsPostReadAtomicReplacement",
+        "TestFlow_ReadProgressUsesStableSourceIdentity",
+        "TestFlow_ReadableSourcesAloneCannotVerify",
+        "TestFlow_RecoveryRechecksSourceAuthority",
+        "TestFlow_RepeatedSourceIsNotIndependentEvidence",
+        "TestFlow_RepetitionAndAlternationStop",
+        "TestFlow_RequiredClaimHasGuaranteedLeafProducer",
+        "TestFlow_RequiredSlotMustHaveValidator",
+        "TestFlow_RequiredSourcesCannotBeBypassedBySchemaRule",
+        "TestFlow_SchemaAdapterFailureFailsClosed",
+        "TestFlow_SchemaCompilerConcurrentCache",
+        "TestFlow_SharedGroupPrewriteFailureCompletesMessagesWithoutDispatch",
+        "TestFlow_SharedHelperFixedAssistantGroup",
+        "TestFlow_SharedToolGroupCountsBeforeMessageFailure",
+        "TestFlow_SubflowBoundsIncludeParentReworkMultipliers",
+        "TestFlow_ToolSuccessIsNotTaskAcceptance",
+        "TestFlow_TrustedJudgeCalibrationAndSlotMinimum",
+        "TestFlow_UnknownSchemaKeywordRejected",
+        "TestFlow_UnknownUsageKeepsReservation",
+        "TestFlow_UnwiredRunNeverFallsBackToOrdinaryExecution",
+        "TestFlow_VerificationBindsTargetVersion",
+        "TestFlow_WorkerCancellationDuringQueryPreservesOtherErrors"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-pg",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=600s",
+        "-tags=integration",
+        "./internal/storage/postgres",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 660,
+      "required_tests": [
+        "TestFlow_ActionAuditBoundBeforeRealDispatch",
+        "TestFlow_AdvanceCapacityYieldsWithoutRun",
+        "TestFlow_AdvanceVerifiesBeforeAtomicSuccess",
+        "TestFlow_AncestorBudgetOverageBlocksAllDimensions",
+        "TestFlow_AttemptChronologicalPagination",
+        "TestFlow_CancelIntentNeverRequeues",
+        "TestFlow_CancelRequiresRealLeafJoin",
+        "TestFlow_CheckpointRequiredKeysEnforcedByPG",
+        "TestFlow_ClaimAcceptanceAndArtifactDependenciesAreAtomic",
+        "TestFlow_CommitRechecksOriginalKeyAfterValidation",
+        "TestFlow_ConcurrentAdvanceSingleAttempt",
+        "TestFlow_CrossCallerMalformedCheckpointHidden",
+        "TestFlow_DefinitionPublishFreezesVersion",
+        "TestFlow_HistoryRetentionPreservesReferencedRun",
+        "TestFlow_IdempotencyAfterDefinitionSwitch",
+        "TestFlow_InvalidCloseIntentCombination",
+        "TestFlow_MigrateV7PreservesOriginalExecutionAndAudit",
+        "TestFlow_ModelAuditBudgetBoundBeforeRealDispatch",
+        "TestFlow_ModelCallbackCannotReplaceFrozenPayload",
+        "TestFlow_ModelContradictoryUsageDoesNotReleaseEitherBudget",
+        "TestFlow_ModelPrewritesRefuseBeforeDispatch",
+        "TestFlow_ModelRequestSnapshotPreservesExactValues",
+        "TestFlow_ModelUnknownAndMissingUsageRetainReservation",
+        "TestFlow_PollLoadsBoundedBatchWithoutPerTaskRoundTrips",
+        "TestFlow_PrewriteFailureNoCall",
+        "TestFlow_ProgressObservationFailureBlocksNextDispatch",
+        "TestFlow_ProgressWindowSurvivesRevision",
+        "TestFlow_QueryEmbeddingPersistentPermit",
+        "TestFlow_ResultAndTransitionCommitAtomically",
+        "TestFlow_RevisionCheckpointFaultIsAtomic",
+        "TestFlow_RevisionClosedProposalAndImmutableLimits",
+        "TestFlow_RootCancelPreventsChildClaim",
+        "TestFlow_RunLedgerRequiresTheClaimedNodeIdentity",
+        "TestFlow_StaleRevisionCannotCommit",
+        "TestFlow_StartAckRequiresCommit",
+        "TestFlow_StartIdempotency",
+        "TestFlow_StartRaceReconcilesWinnerAgainstAcceptedTemplate",
+        "TestFlow_StartUsesFrozenContractBeforeCurrentPointer",
+        "TestFlow_SubflowUsesOnlyLeafRunAndFrozenIdentity",
+        "TestFlow_TaskContractHashMismatchBlocksWorker",
+        "TestFlow_TaskPagesAndOutputProvenance",
+        "TestFlow_TrustedCursorProgressRequiresOriginalAuditAndMonotonicPage",
+        "TestFlow_UnadmittedCapacityDoesNotConsumeAttempt",
+        "TestFlow_UnknownActionAndBudgetSurviveClose",
+        "TestFlow_UnknownDefinitionVersionNotFound",
+        "TestFlow_WorkerShutdownWaitsForActualJoin",
+        "TestFlow_WorkerUsesBoundedPoolAndDurableQueue"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-app-web",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=600s",
+        "-tags=integration",
+        "./internal/app",
+        "./internal/web",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 660,
+      "required_tests": [
+        "TestFlow_AdmissionMissingLimiterFailsClosed",
+        "TestFlow_AdmissionWrapperAlwaysReturnsOriginalSharedTicket",
+        "TestFlow_AuthorityChecksEachBindingOncePerBoundaryWithoutCachingAcrossCalls",
+        "TestFlow_AuthorityKeepsOriginalKeyAndReadOnlyCeiling",
+        "TestFlow_AuthorityRejectsRecreatedOrChangedAgent",
+        "TestFlow_CLIOfflineStructureHasNoRuntimeAuthority",
+        "TestFlow_CLIRoutesThroughService",
+        "TestFlow_CLIStatusDoesNotTreatStoppedAsBusinessSuccess",
+        "TestFlow_CLIUncertainWriteRetainsIdentityAndRejectsUnsafeRequests",
+        "TestFlow_ClosePreservesDrainFailureJoinedWithCancellation",
+        "TestFlow_ConcurrentCloseWaitsForSameRealJoin",
+        "TestFlow_ContextKeepsHardConstraintsAndFailsClosed",
+        "TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin",
+        "TestFlow_DemoContractAndArtifacts",
+        "TestFlow_DiagnosticsDoNotAdvanceTask",
+        "TestFlow_EmbeddingCallbackRevocationStopsSourceRead",
+        "TestFlow_HTTPFullETagAndMissingPreconditionZeroWrite",
+        "TestFlow_HTTPInteractiveReserveRejectsOnlyNewAcceptance",
+        "TestFlow_HTTPRealControlAndReadOnlyQueries",
+        "TestFlow_HTTPRealWorkerOwnershipArtifactAndDualQuota",
+        "TestFlow_HTTPResumeIdempotentFactBeforeCurrentVersion",
+        "TestFlow_HTTPScopesAndAdminAreSeparate",
+        "TestFlow_HTTPStrictInputAndIdempotentAcceptance",
+        "TestFlow_HTTPValidationPathDoesNotEchoValues",
+        "TestFlow_LaterSourceConsumersRecheckOriginalKey",
+        "TestFlow_ProductionAliasReplacementChainCannotMintProgress",
+        "TestFlow_ProductionNodeUsesOriginalRunAndAudit",
+        "TestFlow_ProductionProgressAcceptsNewSourcesAndRejectsChangedBytes",
+        "TestFlow_ProductionSourceVerificationAndClaimProjection",
+        "TestFlow_ProductionWorkerFollowsOnlyBoundedPublishedRework",
+        "TestFlow_PublicationWriteGateIsSeparateFromReadOnlyFixedTool",
+        "TestFlow_QueryAuditTerminalFailureRetainsBudget",
+        "TestFlow_RetrievalCeilingAndEmbeddingBudget",
+        "TestFlow_RetrievalRejectsScopeExpansionBeforeExternalCall",
+        "TestFlow_RuntimeConstructionAndAuthenticatedWorkerLifecycle",
+        "TestFlow_RuntimePostgresPoolIsBoundedAndReusesConnections",
+        "TestFlow_SourceValueProofBindsExactDataWithoutSemanticInference",
+        "TestFlow_ToolBinderUsesPinnedCodeOwnedAdapter",
+        "TestFlow_WriteBinderRequiresFixedNodeAndBehaviorGate",
+        "TestFlow_ClosePreservesDatabaseErrorJoinedWithCancellation"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-scope-obs",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/callers",
+        "./internal/cli",
+        "./internal/observability",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 360,
+      "required_tests": [
+        "TestFlow_CallerMixedAdmissionIsAtomic",
+        "TestFlow_CallerReserveSharesOriginalTotalAcrossKeys",
+        "TestFlow_CallerSingleSlotNeedsExplicitZeroReserve",
+        "TestFlow_ConfigClosedAndBounded",
+        "TestFlow_MetricsRejectHighCardinalityAndUnknownStatus"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-corpus",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=300s",
+        "./scripts/acceptance",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 360,
+      "required_tests": [
+        "TestFlow_EvaluationCorpusIsFrozen",
+        "TestFlow_StageMappingCoversFrozenTasksAndBehaviorGroups"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-race",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=900s",
+        "-race",
+        "-tags=integration",
+        "./internal/flow",
+        "./internal/core",
+        "./internal/app",
+        "./internal/storage/postgres",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 960,
+      "required_tests": [
+        "TestFlow_ActionAuditBoundBeforeRealDispatch",
+        "TestFlow_AdmissionMissingLimiterFailsClosed",
+        "TestFlow_AdmissionWrapperAlwaysReturnsOriginalSharedTicket",
+        "TestFlow_AdvanceCapacityYieldsWithoutRun",
+        "TestFlow_AdvanceVerifiesBeforeAtomicSuccess",
+        "TestFlow_AncestorBudgetOverageBlocksAllDimensions",
+        "TestFlow_AttemptChronologicalPagination",
+        "TestFlow_AuthorityChecksEachBindingOncePerBoundaryWithoutCachingAcrossCalls",
+        "TestFlow_AuthorityKeepsOriginalKeyAndReadOnlyCeiling",
+        "TestFlow_AuthorityRejectsRecreatedOrChangedAgent",
+        "TestFlow_BlockedCloseWaitsWithoutIllegalTransition",
+        "TestFlow_BranchReadsTrustedSlotState",
+        "TestFlow_BranchUsesProgramStateAndExactNumbers",
+        "TestFlow_BudgetTighteningAndKnownOverage",
+        "TestFlow_CLIOfflineStructureHasNoRuntimeAuthority",
+        "TestFlow_CLIRoutesThroughService",
+        "TestFlow_CLIStatusDoesNotTreatStoppedAsBusinessSuccess",
+        "TestFlow_CLIUncertainWriteRetainsIdentityAndRejectsUnsafeRequests",
+        "TestFlow_CancelIntentNeverRequeues",
+        "TestFlow_CancelRequiresRealLeafJoin",
+        "TestFlow_CancelledLeafUsesBoundedOriginalTerminalWriter",
+        "TestFlow_CanonicalInputPreservesExactSemantics",
+        "TestFlow_CheckpointRequiredKeysEnforcedByPG",
+        "TestFlow_ChildBudgetNeverResets",
+        "TestFlow_ClaimAcceptanceAndArtifactDependenciesAreAtomic",
+        "TestFlow_ClaimDependencyCycleRejected",
+        "TestFlow_CloseIntentCombinationDomain",
+        "TestFlow_ClosePreservesDrainFailureJoinedWithCancellation",
+        "TestFlow_CloseWaitsForJoinAndPreservesIntent",
+        "TestFlow_CommitRechecksOriginalKeyAfterValidation",
+        "TestFlow_ConcurrentAdvanceSingleAttempt",
+        "TestFlow_ConcurrentCloseWaitsForSameRealJoin",
+        "TestFlow_ConfigBoundsCannotOverflowOrRemoveReserves",
+        "TestFlow_ContextKeepsHardConstraintsAndFailsClosed",
+        "TestFlow_ContractCannotExceedPublishedLimits",
+        "TestFlow_CoordinatorOriginalLedgerLifecycle",
+        "TestFlow_CoordinatorWorkerNeverStartsAtConstruction",
+        "TestFlow_CrossCallerMalformedCheckpointHidden",
+        "TestFlow_DeclaredPaginationMakesProgress",
+        "TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin",
+        "TestFlow_DefinitionHashFreezesContract",
+        "TestFlow_DefinitionPublishFreezesVersion",
+        "TestFlow_DefinitionRejectsUnboundedRoute",
+        "TestFlow_DefinitionRejectsUnsupported",
+        "TestFlow_DemoContractAndArtifacts",
+        "TestFlow_DiagnosticsDoNotAdvanceTask",
+        "TestFlow_EmbeddingCallbackRevocationStopsSourceRead",
+        "TestFlow_EvidenceInvalidationClosure",
+        "TestFlow_EvidenceSupportBindsContentAndSources",
+        "TestFlow_ExecutorInputAndSchemaFrozen",
+        "TestFlow_ExecutorOutcomeRetainsAuditUncertainty",
+        "TestFlow_ExecutorOutcomeWriteFailureDoesNotAdvanceProgress",
+        "TestFlow_ExecutorPrewriteFailureNoDispatch",
+        "TestFlow_ExecutorStrictPinAndSchema",
+        "TestFlow_FileReplacementAndAliasesCannotResetNoProgress",
+        "TestFlow_FixedReadOnlyRunHasNoModelPromptOrChatCharge",
+        "TestFlow_FixedToolClientSelectionHasNoModelDependency",
+        "TestFlow_HTTPInteractiveReserveRejectsOnlyNewAcceptance",
+        "TestFlow_HTTPRealControlAndReadOnlyQueries",
+        "TestFlow_HTTPRealWorkerOwnershipArtifactAndDualQuota",
+        "TestFlow_HTTPResumeIdempotentFactBeforeCurrentVersion",
+        "TestFlow_HistoryRetentionPreservesReferencedRun",
+        "TestFlow_IdempotencyAfterDefinitionSwitch",
+        "TestFlow_InputMappingRequiresCurrentVerifiedOutput",
+        "TestFlow_InputReferencesRequireGuaranteedUpstreamNode",
+        "TestFlow_InstanceReserveUsesOriginalTotal",
+        "TestFlow_InstanceSingleSlotNeedsExplicitZeroReserve",
+        "TestFlow_InvalidCloseIntentCombination",
+        "TestFlow_LaterSourceConsumersRecheckOriginalKey",
+        "TestFlow_LoaderBoundariesAndHashes",
+        "TestFlow_LoaderDoesNotMergeContractFiles",
+        "TestFlow_LoaderRejectsNonRegularContract",
+        "TestFlow_MigrateV7PreservesOriginalExecutionAndAudit",
+        "TestFlow_ModelAuditBudgetBoundBeforeRealDispatch",
+        "TestFlow_ModelCallbackCannotReplaceFrozenPayload",
+        "TestFlow_ModelContradictoryUsageDoesNotReleaseEitherBudget",
+        "TestFlow_ModelPrewritesRefuseBeforeDispatch",
+        "TestFlow_ModelRequestSnapshotPreservesExactValues",
+        "TestFlow_ModelUnknownAndMissingUsageRetainReservation",
+        "TestFlow_ModelUsageNeverUnderstatesKnownComponents",
+        "TestFlow_NoProgressAcrossRevision",
+        "TestFlow_PollLoadsBoundedBatchWithoutPerTaskRoundTrips",
+        "TestFlow_PrewriteFailureNoCall",
+        "TestFlow_ProductionAliasReplacementChainCannotMintProgress",
+        "TestFlow_ProductionNodeUsesOriginalRunAndAudit",
+        "TestFlow_ProductionProgressAcceptsNewSourcesAndRejectsChangedBytes",
+        "TestFlow_ProductionSourceVerificationAndClaimProjection",
+        "TestFlow_ProductionWorkerFollowsOnlyBoundedPublishedRework",
+        "TestFlow_ProgressObservationFailureBlocksNextDispatch",
+        "TestFlow_ProgressWindowSurvivesRevision",
+        "TestFlow_PublicationWriteGateIsSeparateFromReadOnlyFixedTool",
+        "TestFlow_QueryAuditTerminalFailureRetainsBudget",
+        "TestFlow_QueryEmbeddingPersistentPermit",
+        "TestFlow_ReadableSourcesAloneCannotVerify",
+        "TestFlow_RecoveryRechecksSourceAuthority",
+        "TestFlow_RepeatedSourceIsNotIndependentEvidence",
+        "TestFlow_RepetitionAndAlternationStop",
+        "TestFlow_RequiredClaimHasGuaranteedLeafProducer",
+        "TestFlow_RequiredSlotMustHaveValidator",
+        "TestFlow_RequiredSourcesCannotBeBypassedBySchemaRule",
+        "TestFlow_ResultAndTransitionCommitAtomically",
+        "TestFlow_RetrievalCeilingAndEmbeddingBudget",
+        "TestFlow_RetrievalRejectsScopeExpansionBeforeExternalCall",
+        "TestFlow_RevisionCheckpointFaultIsAtomic",
+        "TestFlow_RevisionClosedProposalAndImmutableLimits",
+        "TestFlow_RootCancelPreventsChildClaim",
+        "TestFlow_RunLedgerRequiresTheClaimedNodeIdentity",
+        "TestFlow_RuntimeConstructionAndAuthenticatedWorkerLifecycle",
+        "TestFlow_RuntimePostgresPoolIsBoundedAndReusesConnections",
+        "TestFlow_SharedGroupPrewriteFailureCompletesMessagesWithoutDispatch",
+        "TestFlow_SharedHelperFixedAssistantGroup",
+        "TestFlow_SharedToolGroupCountsBeforeMessageFailure",
+        "TestFlow_SourceValueProofBindsExactDataWithoutSemanticInference",
+        "TestFlow_StaleRevisionCannotCommit",
+        "TestFlow_StartAckRequiresCommit",
+        "TestFlow_StartIdempotency",
+        "TestFlow_StartRaceReconcilesWinnerAgainstAcceptedTemplate",
+        "TestFlow_StartUsesFrozenContractBeforeCurrentPointer",
+        "TestFlow_SubflowBoundsIncludeParentReworkMultipliers",
+        "TestFlow_SubflowUsesOnlyLeafRunAndFrozenIdentity",
+        "TestFlow_TaskContractHashMismatchBlocksWorker",
+        "TestFlow_TaskPagesAndOutputProvenance",
+        "TestFlow_ToolBinderUsesPinnedCodeOwnedAdapter",
+        "TestFlow_ToolSuccessIsNotTaskAcceptance",
+        "TestFlow_TrustedCursorProgressRequiresOriginalAuditAndMonotonicPage",
+        "TestFlow_TrustedJudgeCalibrationAndSlotMinimum",
+        "TestFlow_UnadmittedCapacityDoesNotConsumeAttempt",
+        "TestFlow_UnknownActionAndBudgetSurviveClose",
+        "TestFlow_UnknownDefinitionVersionNotFound",
+        "TestFlow_UnknownUsageKeepsReservation",
+        "TestFlow_UnwiredRunNeverFallsBackToOrdinaryExecution",
+        "TestFlow_VerificationBindsTargetVersion",
+        "TestFlow_WorkerShutdownWaitsForActualJoin",
+        "TestFlow_WorkerUsesBoundedPoolAndDurableQueue",
+        "TestFlow_WriteBinderRequiresFixedNodeAndBehaviorGate",
+        "TestFlow_WorkerCancellationDuringQueryPreservesOtherErrors",
+        "TestFlow_ClosePreservesDatabaseErrorJoinedWithCancellation"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-console-test",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "test"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-console-typecheck",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "run",
+        "typecheck"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-console-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-website-check",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "run",
+        "check"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-flow-website-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "website",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 300,
+      "required_tests": [],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T001",
+      "checks": [
+        "019-flow-corpus"
+      ]
+    },
+    {
+      "id": "T002",
+      "checks": [
+        "019-flow-corpus"
+      ]
+    },
+    {
+      "id": "T003",
+      "checks": [
+        "019-flow-unit"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "019-flow-unit"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T007",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-app-web",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "019-flow-pg",
+        "019-flow-app-web"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-app-web"
+      ]
+    },
+    {
+      "id": "T010",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-app-web",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T011",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "019-flow-pg",
+        "019-flow-app-web",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "019-flow-pg",
+        "019-flow-app-web"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T015",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-pg",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-scope-obs",
+        "019-flow-app-web",
+        "019-flow-pg",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T017",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-pg",
+        "019-flow-app-web",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T018",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-app-web",
+        "019-flow-pg",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-pg",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T020",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-scope-obs"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-scope-obs"
+      ]
+    },
+    {
+      "id": "T022",
+      "checks": [
+        "019-flow-scope-obs",
+        "019-flow-app-web",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T023",
+      "checks": [
+        "019-flow-console-test",
+        "019-flow-console-typecheck",
+        "019-flow-console-build"
+      ]
+    },
+    {
+      "id": "T024",
+      "checks": [
+        "019-flow-website-check",
+        "019-flow-website-build",
+        "019-flow-corpus"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "019-flow-corpus",
+        "019-flow-app-web"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "019-flow-app-web",
+        "019-flow-race"
+      ]
+    },
+    {
+      "id": "T027",
+      "checks": [
+        "019-flow-unit",
+        "019-flow-pg",
+        "019-flow-app-web",
+        "019-flow-scope-obs",
+        "019-flow-corpus",
+        "019-flow-race",
+        "019-flow-console-test",
+        "019-flow-console-typecheck",
+        "019-flow-console-build",
+        "019-flow-website-check",
+        "019-flow-website-build"
+      ]
+    },
+    {
+      "id": "T028",
+      "checks": [
+        "019-flow-corpus"
+      ]
+    }
+  ]
+}

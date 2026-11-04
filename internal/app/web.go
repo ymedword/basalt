@@ -136,6 +136,11 @@ func (a *App) newWebServer(rt *heavyRuntime) (*web.Server, error) {
 	// 生成提示放在服务构造成功之后：只有真的能开服务，才值得把密码出示一次。
 	// The one-time hint comes after the server exists, so a failed start prints nothing.
 	announceAdminToken(os.Stdout, token, isInteractiveWriter(os.Stdout))
+	// Flow recovery is already complete; only now is the real bound listener's
+	// validated authentication posture available for its builtin-admin tasks.
+	if rt.flows != nil {
+		rt.flows.authenticationReady()
+	}
 	return srv, nil
 }
 
@@ -250,6 +255,12 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		cfg = &cli.Config{}
 	}
 	opts := web.Options{
+		Flows: &flowHTTP{runtime: rt.flows, entries: func() []core.AgentEntry {
+			if rt.agents == nil {
+				return nil
+			}
+			return rt.agents.Entries()
+		}},
 		Addr:            cfg.HTTP.Addr,
 		MaxRequestBytes: cfg.HTTP.MaxRequestBytes,
 		// 手动补跑与定时触发共用同一条执行链，预算取同一个常量（scheduleRunTimeout）：

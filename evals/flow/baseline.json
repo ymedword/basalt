@@ -1,0 +1,11 @@
+{
+  "format_version":1,
+  "strategy":"one ordinary synchronous Agent Run per workload",
+  "corpus_version":"us19-local-control-v1",
+  "model_protocol":"local scripted responses only",
+  "max_total_tokens":200000,
+  "max_tool_calls":200,
+  "max_duration_seconds":1800,
+  "acceptance":"Use the same frozen sources, exact output schema and unresolved-outcome rules as the paired Flow workload; Run completed is not task acceptance.",
+  "quality_claim":"none; paid-model quality comparisons are not authorized"
+}

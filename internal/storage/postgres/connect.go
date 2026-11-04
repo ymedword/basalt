@@ -37,14 +37,15 @@ import (
 // 加 `revision` 并去掉 `(document_id, content_hash)` 唯一约束）；5 =
 // `0005_knowledge_collection_description.sql`（集合简介与 `description_revision`，
 // 乐观并发令牌）；6 = `0006_observability.sql`（诊断关联、检索摘要与独立遥测账本）；
-// 7 = `0007_history_retention.sql`（关联历史保留账本，只记录清理组与行数）。
+// 7 = `0007_history_retention.sql`（关联历史保留账本，只记录清理组与行数）；
+// 8 = `0008_flow.sql`（持久流程、版本化验收与动作／祖先预算账本）。
 // 迁移只追加，**不得**回头改建表字面量——既有库已经按 v1 建过表。
 // Version chain: 1 is the frozen contract baseline, 2 widens the binding kind set,
 // 3 repairs source_text; 4 gives immutable knowledge versions ordered revisions;
 // 5 adds the user-managed collection description with its optimistic-concurrency token;
 // 6 adds observability correlation and non-authoritative telemetry ledgers;
-// 7 appends the related-history retention ledger.
-const SupportedSchemaVersion = 7
+// 7 appends the related-history retention ledger; 8 adds durable Flow ledgers.
+const SupportedSchemaVersion = 8
 
 // undefinedTableSQLState 是 PostgreSQL 的 `undefined_table`（42P01）：它把"版本表不存在"
 // 从其他查询失败里区分出来，避免把连接故障误判成"未初始化"。

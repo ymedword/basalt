@@ -19,6 +19,7 @@ const (
 	AnchorOperation AnchorKind = "operation"
 	AnchorIngest    AnchorKind = "ingest"
 	AnchorSession   AnchorKind = "session"
+	AnchorFlowTask  AnchorKind = "flow_task"
 )
 
 // Anchor 把标识与作用域显式传递，不通过 context 隐式携带。
@@ -36,7 +37,7 @@ var ErrInvalidQuery = errors.New("invalid observability query")
 // Validate rejects empty, oversized, or unsupported anchors.
 func (a Anchor) Validate() error {
 	switch a.Kind {
-	case AnchorRun, AnchorRequest, AnchorTask, AnchorOperation, AnchorIngest, AnchorSession:
+	case AnchorRun, AnchorRequest, AnchorTask, AnchorOperation, AnchorIngest, AnchorSession, AnchorFlowTask:
 	default:
 		return ErrInvalidQuery
 	}

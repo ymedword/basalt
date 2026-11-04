@@ -54,7 +54,7 @@ func TestObservability_APILegacyEnumsAfterV5Upgrade(t *testing.T) {
 	f.cfg.Observability.Alerts.Enabled = &disabled
 	rt := f.assemble(t)
 	require.NoError(t, legacy.QueryRowContext(t.Context(), `SELECT max(version) FROM schema_version`).Scan(&version))
-	require.Equal(t, 7, version)
+	require.Equal(t, 8, version)
 	var original string
 	require.NoError(t, legacy.QueryRowContext(t.Context(), `SELECT kind||reason_code||decision FROM diagnostic_events WHERE event_id=$1`, id).Scan(&original))
 	require.Contains(t, original, "CANARY_OBS_KIND")

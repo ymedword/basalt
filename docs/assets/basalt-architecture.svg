@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="2300" height="1920" viewBox="0 0 2300 1920" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="2300" height="2070" viewBox="0 0 2300 2070" role="img" aria-labelledby="title desc">
 <title id="title">Basalt Agent OS 核心架构</title>
-<desc id="desc">从左向右阅读运行主线：CLI、REST 与管理台、定时调度归一进入 AgentService.Run，随后进入手写 ReActLoop。循环内从上向下为 PromptBuilder、ProviderService、ToolExecutor；工具结果在卡片外侧回填至下一轮。下方独立区域包含声明式工作区、加载与配置快照、MemoryService、内置工具与 MCP 适配，以及 SQLite 和文件系统。右侧模型服务与 MCP Server 位于进程外。内置工具由 WhitelistPolicy 授权，shell 由 LocalRunner 执行；外部 MCP Server 的内部行为不经过本地 Policy。大框表示 Basalt 实例的 Go 运行时与本地工作区。实线表示调用与返回，虚线表示上下文或持久化关系，不表示 Go 包的 import 方向。</desc>
+<desc id="desc">从左向右阅读运行主线：CLI、REST 与管理台、定时调度归一进入 AgentService.Run，随后进入手写 ReActLoop。循环内从上向下为 PromptBuilder、ProviderService、ToolExecutor；工具结果在卡片外侧回填至下一轮。下方独立区域包含声明式工作区、加载与配置快照、MemoryService、内置工具与 MCP 适配，以及 PostgreSQL 和文件系统。右侧模型服务与 MCP Server 位于进程外。内置工具由 WhitelistPolicy 授权，shell 由 LocalRunner 执行；外部 MCP Server 的内部行为不经过本地 Policy。大框表示单实例责任边界，不是进程边界；PostgreSQL 是独立服务。实线表示调用与返回，虚线表示上下文或持久化关系，不表示 Go 包的 import 方向。</desc>
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#476585"/></marker>
 <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#77869a"/></marker>
@@ -14,7 +14,7 @@
 <rect x="1480" y="57" width="214" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
 <text x="1587" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">Go 单二进制</text>
 <rect x="1718" y="57" width="224" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
-<text x="1830" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">SQLite 内嵌</text>
+<text x="1830" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">PostgreSQL 外置</text>
 <rect x="1966" y="57" width="278" height="52" rx="26" fill="#f2f7f9" stroke="#dce8eb" stroke-width="1.5"/>
 <text x="2105" y="91" font-size="22" fill="#285d65" font-weight="600" text-anchor="middle">管理台资源 embed</text>
 <g id="basalt-instance">
@@ -81,7 +81,7 @@
 <rect x="600" y="1100" width="376" height="278" rx="18" fill="#f4f0fb" stroke="#dacfed" stroke-width="1.5"/>
 <text x="628" y="1145" font-size="31" fill="#594383" font-weight="600" class="mono">MemoryService</text>
 <text x="628" y="1200" font-size="26" fill="#516174" font-weight="400">Agent 层 / 全局回退</text>
-<text x="628" y="1248" font-size="26" fill="#516174" font-weight="400">Markdown / SQLite</text>
+<text x="628" y="1248" font-size="26" fill="#516174" font-weight="400">Markdown / PostgreSQL</text>
 <text x="628" y="1296" font-size="25" fill="#516174" font-weight="400">运行内记忆快照</text>
 <text x="628" y="1344" font-size="25" fill="#516174" font-weight="400">记忆工具读写</text>
 <path d="M 316 1100 V 1038 H 760" fill="none" stroke="#127e78" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="9 8"/>
@@ -128,7 +128,7 @@
 <rect x="72" y="1480" width="1704" height="318" rx="20" fill="#edf2f8" stroke="#c9d7e6" stroke-width="1.5"/>
 <text x="100" y="1533" font-size="32" fill="#24465d" font-weight="700">持久化与运行保障</text>
 <rect x="96" y="1560" width="764" height="166" rx="16" fill="#ffffff" stroke="#d1dce8" stroke-width="1.5"/>
-<text x="124" y="1608" font-size="32" fill="#23425c" font-weight="700">SQLite · WAL</text>
+<text x="124" y="1608" font-size="32" fill="#23425c" font-weight="700">PostgreSQL · WAL</text>
 <text x="124" y="1656" font-size="27" fill="#516174" font-weight="400">会话 · 消息 · Run · 配置快照</text>
 <text x="124" y="1700" font-size="26" fill="#516174" font-weight="400">LLM / 工具审计 · 定时 · 通知 · 记忆</text>
 <rect x="900" y="1560" width="852" height="166" rx="16" fill="#ffffff" stroke="#d1dce8" stroke-width="1.5"/>
@@ -151,4 +151,4 @@
 </g>
 <text x="52" y="1884" font-size="22" fill="#7b8899" font-weight="400">Basalt v0.1 · 核心阶段设计（待原型验证）</text>
 <text x="2244" y="1884" font-size="22" fill="#7b8899" font-weight="400" text-anchor="end">依据 TechnicalDesign.md §1–§8</text>
-</svg>
+<g id="us19-flow" font-family="Microsoft YaHei, sans-serif"><rect x="30" y="1930" width="2240" height="120" rx="10" fill="#eef1fb" stroke="#244bd8"/><text x="55" y="1970" font-size="27" fill="#202b30">可选持久顺序流程：固定契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="55" y="2015" font-size="24" fill="#202b30">PostgreSQL v8 保存检查点与动作账本；未知副作用不自动重放。普通消息与 Run 仍同步。</text></g></svg>

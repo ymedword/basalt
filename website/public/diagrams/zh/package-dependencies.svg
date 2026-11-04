@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1300" viewBox="0 0 1320 1300" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="package-dependencies" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1450" viewBox="0 0 1320 1450" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="package-dependencies" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
 <title id="diagram-title">依赖指向内核，内核不依赖实现。</title>
-<desc id="diagram-desc">实际本地 Go 导入图：cmd/basalt 导入 internal/app；app 导入 cli、web、provider、tool、storage、memory、workspace、adapters/cron、core 和 assets；cli 导入 core 与 channel；web、provider、tool、storage、memory、workspace、adapters/cron 导入 core；memory 还导入 workspace。channel 与 assets 不导入其他本地生产包，core 只导入标准库。省略标准库、外部协议 SDK 与测试专用依赖。箭头由导入者指向依赖。</desc>
+<desc id="diagram-desc">实际本地 Go 导入图：cmd/basalt 导入 internal/app；app 导入 cli、web、provider、tool、storage、memory、workspace、adapters/cron、core 和 assets；cli 导入 core 与 channel；web、provider、tool、storage、memory、workspace、adapters/cron 导入 core；memory 还导入 workspace。channel 与 assets 不导入其他本地生产包，core 只导入标准库。省略标准库、外部协议 SDK 与测试专用依赖。箭头由导入者指向依赖。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
 <rect width="1320" height="1300" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
@@ -80,5 +80,6 @@
 <text x="1028" y="729" font-size="15" fill="#5d6a70">不导入具体实现包</text>
 </g>
 <text x="40" y="1255" font-size="15" fill="#5d6a70">箭头表示直接导入；省略标准库、协议 SDK 与测试专用依赖。执行循环不由 Agent 框架接管。</text>
-<text x="40" y="1281" font-size="12" fill="#5d6a70">源码提交: eb97cd539e51 · 当前实现</text>
-</g></svg>
+<text x="40" y="1281" font-size="12" fill="#5d6a70">源码提交: ca9a0d29f185 · 当前实现</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1310" width="1284" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1340" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1375" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1410" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+</svg>

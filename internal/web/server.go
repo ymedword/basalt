@@ -25,6 +25,7 @@ import (
 // Options 是 web 面的装配输入。所有端口由 app 层适配；web 只依赖 core 与标准库。
 // Options is the assembly surface; every port is adapted by the app layer.
 type Options struct {
+	Flows                FlowBackend
 	Observability        ObservabilityReader
 	ObservationLifecycle ObservationLifecycle
 	Addr                 string        // 空 → defaultAddr
@@ -823,6 +824,7 @@ func (s *Server) routeTable() []route {
 	// 历史回查三行（T056 / routes_history.go）：会话列表 + 检索 + 精确读取，全部业务面。
 	// The three history read rows, all on the business surface.
 	rows = append(rows, s.historyRoutes()...)
+	rows = append(rows, s.flowRoutes()...)
 	rows = append(rows, s.adminRoutes()...)
 	// 方法无关 catch-all（注 3）：未匹配的路径与方法一律落到 404 信封，
 	// 不暴露 ServeMux 的纯文本 404 与自动 405。

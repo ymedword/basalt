@@ -48,6 +48,10 @@ type Deps struct {
 	Store     Store
 	Workspace Workspace
 
+	// AcquireWorkspaceLock 为离线素材安装取原实例锁；缺失时拒绝写入。
+	// AcquireWorkspaceLock injects the original lock without importing its implementation.
+	AcquireWorkspaceLock func(root string) (release func() error, err error)
+
 	// Agents 是 Agent 目录端口：list / show 只读（轻路径——不取实例锁、不触数据库），
 	// create / delete 是**写模式**（实现侧先取实例锁：被活实例持有时拒绝启动且零写入）。
 	// Agents is the agent-directory port: list / show stay read-only, while create /
@@ -107,6 +111,10 @@ type Deps struct {
 	// The offline handoff gate sits beside Migration so a read-only roster/key/ciphertext
 	// check never drags the PG migration chain along.
 	Handoff HandoffVerification
+
+	// Flow is a stateless service client and offline loader, available on the
+	// light path; none of its commands assemble a second runtime or acquire a lock.
+	Flow FlowClient
 
 	// Tools 是工具注册池端口（见 ports.go）：`tool list` 经它取「注册了什么」这一份数据，
 	// 清单的顺序由实现侧给出、命令面零重排。只有重路径装配才构建过注册池，因此该端口

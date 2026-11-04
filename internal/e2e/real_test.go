@@ -108,6 +108,7 @@ func TestBackfill_RealFeishu(t *testing.T) {
 // skip) and the message names only the variables, never their values.
 func requireRealLLMEnv(t *testing.T) realLLM {
 	t.Helper()
+	forbidRealModelValidation(t)
 	required := []string{realLLMBaseURLEnv, realLLMModelEnv, realLLMAPIKeyEnv}
 	var missing []string
 	for _, key := range required {
@@ -128,6 +129,13 @@ func requireRealLLMEnv(t *testing.T) realLLM {
 		Model:   strings.TrimSpace(os.Getenv(realLLMModelEnv)),
 		APIKey:  os.Getenv(realLLMAPIKeyEnv),
 	}
+}
+
+// forbidRealModelValidation 落实2026-11-04用户裁决；旧真实验收只保留历史证据。
+// forbidRealModelValidation disables historical paid-model validation before reading credentials.
+func forbidRealModelValidation(t *testing.T) {
+	t.Helper()
+	t.Fatal("real-model automated validation disabled by user decision 2026-11-04; historical authorization is not reusable")
 }
 
 // requireRealFeishuURL 读取真实飞书 webhook；缺失即 FAIL。返回值与原文只为拼配置与

@@ -218,7 +218,7 @@ func newDemoCommand(deps Deps) *cobra.Command {
 	install.Flags().BoolVar(&opts.Force, "force", false,
 		"重建已存在的 Agent 目录与样例库：会**删除整个目录**（含同目录下的用户文件），不是只更新模板正文")
 	install.Flags().BoolVar(&opts.DryRun, "dry-run", false, "只打印安装计划，不写任何文件")
-	demo.AddCommand(install)
+	demo.AddCommand(install, newDemoWorkflowCommand(deps))
 	return demo
 }
 

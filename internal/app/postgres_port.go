@@ -67,6 +67,24 @@ func postgresConfig(database cli.DatabaseConfig) postgres.Config {
 	}
 }
 
+// runtimePostgresConfig 为启用有界 Flow 的共享池补齐有限上限与连接复用。
+// runtimePostgresConfig bounds and reuses the existing pool for opted-in Flows.
+func runtimePostgresConfig(cfg *cli.Config) postgres.Config {
+	out := postgresConfig(databaseConfig(cfg))
+	if cfg == nil || !cfg.Flows.Enabled {
+		return out
+	}
+	if out.MaxConns == 0 {
+		out.MaxConns = 32
+	}
+	if out.MinConns == 0 {
+		// database/sql 的默认2条空闲连接会在多Worker边界反复建连／关闭。
+		// Reuse the bounded peak rather than exhausting ephemeral ports with churn.
+		out.MinConns = out.MaxConns
+	}
+	return out
+}
+
 // secondsDuration 把秒数换算成时长；非正值一律归零——装载层已拒绝负数，这里再收一次
 // 口：负的会话参数没有意义，而 0 的语义是"取后端缺省"。
 // Non-positive seconds collapse to zero, which means "use the backend default".

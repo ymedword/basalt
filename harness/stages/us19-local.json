@@ -1,0 +1,266 @@
+{
+  "version": 1,
+  "id": "us19-local",
+  "approval": "User review 1 passed 2026-11-03, R3 sha256 514ce6c9f6a8bb1e86499c80a281403e858c007a92138f3b8771429c13a37ef5 and section 6.6.0 approved. This local foundation subset is not full US19 acceptance; G-FT and review 2 remain pending.",
+  "inputs": [
+    "docs/us/us19-flow-collaboration.md",
+    "specs/019-flow-collaboration/spec.md",
+    "specs/019-flow-collaboration/plan.md",
+    "specs/019-flow-collaboration/tasks.md",
+    "docs/contracts/flow.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/app/flow_admission_test.go",
+    "internal/callers/flow_concurrency_test.go",
+    "internal/core/fixed_tool_test.go",
+    "internal/core/flow_admission_internal_test.go",
+    "internal/core/flow_progress_probe_test.go",
+    "internal/core/flow_tool_exec_test.go",
+    "internal/core/tool_group_internal_test.go",
+    "internal/flow/budget_test.go",
+    "internal/flow/config_test.go",
+    "internal/flow/definition_test.go",
+    "internal/flow/evidence_test.go",
+    "internal/flow/input_test.go",
+    "internal/flow/json_test.go",
+    "internal/flow/loader_test.go",
+    "internal/flow/state_test.go",
+    "internal/flow/verification_test.go",
+    "internal/storage/postgres/flow_action_integration_test.go",
+    "internal/storage/postgres/flow_start_service_integration_test.go",
+    "internal/storage/postgres/flow_store_integration_test.go",
+    "internal/tool/schema_test.go"
+  ],
+  "checks": [
+    {
+      "id": "019-flow-schema",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/tool",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_NestedSchemaViolationZeroDispatch",
+        "TestFlow_UnknownSchemaKeywordRejected",
+        "TestFlow_SchemaAdapterFailureFailsClosed",
+        "TestFlow_SchemaCompilerConcurrentCache"
+      ]
+    },
+    {
+      "id": "019-flow-domain",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=integration",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/flow",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_BlockedCloseWaitsWithoutIllegalTransition",
+        "TestFlow_BranchReadsTrustedSlotState",
+        "TestFlow_BranchUsesProgramStateAndExactNumbers",
+        "TestFlow_BudgetTighteningAndKnownOverage",
+        "TestFlow_CancelIntentNeverRequeues",
+        "TestFlow_CanonicalInputPreservesExactSemantics",
+        "TestFlow_ChildBudgetNeverResets",
+        "TestFlow_ClaimDependencyCycleRejected",
+        "TestFlow_CloseIntentCombinationDomain",
+        "TestFlow_CloseWaitsForJoinAndPreservesIntent",
+        "TestFlow_ConfigBoundsCannotOverflowOrRemoveReserves",
+        "TestFlow_ContractCannotExceedPublishedLimits",
+        "TestFlow_DefinitionHashFreezesContract",
+        "TestFlow_DefinitionRejectsUnboundedRoute",
+        "TestFlow_DefinitionRejectsUnsupported",
+        "TestFlow_EvidenceInvalidationClosure",
+        "TestFlow_EvidenceSupportBindsContentAndSources",
+        "TestFlow_InputMappingRequiresCurrentVerifiedOutput",
+        "TestFlow_InputReferencesRequireGuaranteedUpstreamNode",
+        "TestFlow_LoaderBoundariesAndHashes",
+        "TestFlow_LoaderDoesNotMergeContractFiles",
+        "TestFlow_LoaderRejectsNonRegularContract",
+        "TestFlow_ReadableSourcesAloneCannotVerify",
+        "TestFlow_RecoveryRechecksSourceAuthority",
+        "TestFlow_RepeatedSourceIsNotIndependentEvidence",
+        "TestFlow_RequiredSlotMustHaveValidator",
+        "TestFlow_RequiredSourcesCannotBeBypassedBySchemaRule",
+        "TestFlow_SubflowBoundsIncludeParentReworkMultipliers",
+        "TestFlow_ToolSuccessIsNotTaskAcceptance",
+        "TestFlow_TrustedJudgeCalibrationAndSlotMinimum",
+        "TestFlow_UnknownUsageKeepsReservation",
+        "TestFlow_VerificationBindsTargetVersion"
+      ]
+    },
+    {
+      "id": "019-flow-core",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=integration",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/core",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_ExecutorInputAndSchemaFrozen",
+        "TestFlow_ExecutorOutcomeRetainsAuditUncertainty",
+        "TestFlow_ExecutorOutcomeWriteFailureDoesNotAdvanceProgress",
+        "TestFlow_ExecutorPrewriteFailureNoDispatch",
+        "TestFlow_ExecutorStrictPinAndSchema",
+        "TestFlow_FixedReadOnlyRunHasNoModelPromptOrChatCharge",
+        "TestFlow_FixedToolClientSelectionHasNoModelDependency",
+        "TestFlow_InstanceReserveUsesOriginalTotal",
+        "TestFlow_InstanceSingleSlotNeedsExplicitZeroReserve",
+        "TestFlow_SharedGroupPrewriteFailureCompletesMessagesWithoutDispatch",
+        "TestFlow_SharedHelperFixedAssistantGroup",
+        "TestFlow_SharedToolGroupCountsBeforeMessageFailure",
+        "TestFlow_UnwiredRunNeverFallsBackToOrdinaryExecution"
+      ]
+    },
+    {
+      "id": "019-flow-pg",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=integration",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/storage/postgres",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_ActionAuditBoundBeforeRealDispatch",
+        "TestFlow_AncestorBudgetOverageBlocksAllDimensions",
+        "TestFlow_CancelIntentNeverRequeues",
+        "TestFlow_CheckpointRequiredKeysEnforcedByPG",
+        "TestFlow_ConcurrentAdvanceSingleAttempt",
+        "TestFlow_CrossCallerMalformedCheckpointHidden",
+        "TestFlow_DefinitionPublishFreezesVersion",
+        "TestFlow_IdempotencyAfterDefinitionSwitch",
+        "TestFlow_InvalidCloseIntentCombination",
+        "TestFlow_PrewriteFailureNoCall",
+        "TestFlow_ResultAndTransitionCommitAtomically",
+        "TestFlow_RootCancelPreventsChildClaim",
+        "TestFlow_StaleRevisionCannotCommit",
+        "TestFlow_StartAckRequiresCommit",
+        "TestFlow_StartIdempotency",
+        "TestFlow_StartRaceReconcilesWinnerAgainstAcceptedTemplate",
+        "TestFlow_StartUsesFrozenContractBeforeCurrentPointer",
+        "TestFlow_TaskContractHashMismatchBlocksWorker",
+        "TestFlow_UnknownActionAndBudgetSurviveClose",
+        "TestFlow_UnknownDefinitionVersionNotFound"
+      ]
+    },
+    {
+      "id": "019-flow-callers",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=integration",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/callers",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_CallerMixedAdmissionIsAtomic",
+        "TestFlow_CallerReserveSharesOriginalTotalAcrossKeys",
+        "TestFlow_CallerSingleSlotNeedsExplicitZeroReserve"
+      ]
+    },
+    {
+      "id": "019-flow-app",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-tags=integration",
+        "-count=1",
+        "-timeout=300s",
+        "./internal/app",
+        "-run",
+        "^TestFlow_"
+      ],
+      "timeout_seconds": 330,
+      "required_tests": [
+        "TestFlow_AdmissionMissingLimiterFailsClosed",
+        "TestFlow_AdmissionWrapperAlwaysReturnsOriginalSharedTicket"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T003",
+      "checks": [
+        "019-flow-schema"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "019-flow-domain"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "019-flow-domain"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T007",
+      "checks": [
+        "019-flow-core",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "019-flow-core"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "019-flow-domain",
+        "019-flow-pg"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "019-flow-core",
+        "019-flow-callers",
+        "019-flow-app"
+      ]
+    }
+  ]
+}

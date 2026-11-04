@@ -42,7 +42,7 @@ func (s *Server) handleObservability(w http.ResponseWriter, r *http.Request, _ c
 			}
 		}
 	case "timeline":
-		p, err = observationParams(r, "run_id", "request_id", "task_id", "operation_id", "ingest_job_id", "session_id", "from", "to", "sources", "limit")
+		p, err = observationParams(r, "run_id", "request_id", "task_id", "flow_task_id", "operation_id", "ingest_job_id", "session_id", "from", "to", "sources", "limit")
 		if err == nil {
 			q := observability.TimelineQuery{Limit: 200, Sources: observationSources(p.Get("sources"))}
 			q.Anchor, err = observationAnchor(p)
@@ -172,7 +172,7 @@ func observationAnchor(p url.Values) (observability.Anchor, error) {
 	for _, entry := range []struct {
 		key  string
 		kind observability.AnchorKind
-	}{{"run_id", observability.AnchorRun}, {"request_id", observability.AnchorRequest}, {"task_id", observability.AnchorTask}, {"operation_id", observability.AnchorOperation}, {"ingest_job_id", observability.AnchorIngest}, {"session_id", observability.AnchorSession}} {
+	}{{"run_id", observability.AnchorRun}, {"request_id", observability.AnchorRequest}, {"task_id", observability.AnchorTask}, {"flow_task_id", observability.AnchorFlowTask}, {"operation_id", observability.AnchorOperation}, {"ingest_job_id", observability.AnchorIngest}, {"session_id", observability.AnchorSession}} {
 		if id := p.Get(entry.key); id != "" {
 			a = observability.Anchor{Kind: entry.kind, Value: id}
 			count++

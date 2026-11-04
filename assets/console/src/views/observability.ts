@@ -40,6 +40,8 @@ const ANCHORS = [
   ], [
     'task_id', '调度任务 ID'
   ], [
+    'flow_task_id', '流程任务 ID'
+  ], [
     'operation_id', '管理操作 ID'
   ], [
     'ingest_job_id', '摄取任务 ID'

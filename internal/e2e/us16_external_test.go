@@ -142,6 +142,7 @@ func us16ExtAbsURL(t *testing.T, key, raw string) string {
 // requireUS16ExtDeepSeek reads the three DeepSeek readings with public defaults.
 func requireUS16ExtDeepSeek(t *testing.T) us16ExtLLM {
 	t.Helper()
+	forbidRealModelValidation(t)
 	requireUS16ExtEnv(t, "真实 DeepSeek Chat", us16ExtChatKeyEnv)
 	base := strings.TrimSpace(os.Getenv(us16ExtChatBaseEnv))
 	if base == "" {
@@ -167,6 +168,7 @@ func requireUS16ExtDeepSeek(t *testing.T) us16ExtLLM {
 // recorded, never compared. Consistency is judged on the stored dimension columns instead.
 func requireUS16ExtEmbedding(t *testing.T) us16ExtEmbedding {
 	t.Helper()
+	forbidRealModelValidation(t)
 	requireUS16ExtEnv(t, "真实 embedding", us16ExtEmbedKeyEnv, us16ExtEmbedBaseEnv, us16ExtEmbedModelEnv)
 	if handoff := strings.TrimSpace(os.Getenv(us16ExtEmbedDimEnv)); handoff != "" {
 		t.Logf("交接维度 %s=%s（非配置键；本验证按 D-05 冻结宽度 %d 配置）",

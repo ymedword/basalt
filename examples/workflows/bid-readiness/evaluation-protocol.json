@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "paired_cases": [
+    {
+      "id": "scope",
+      "requirements": [
+        "R01",
+        "R03",
+        "R05",
+        "R06",
+        "R19",
+        "R25",
+        "R26",
+        "R28"
+      ],
+      "critical": [
+        "no-multitenancy-claim",
+        "database-separate",
+        "no-ha-proof",
+        "candidate-not-main",
+        "no-load-test",
+        "token-not-sso",
+        "no-certificate",
+        "external-data-disclosed"
+      ]
+    },
+    {
+      "id": "delivery",
+      "requirements": [
+        "R10",
+        "R21",
+        "R22",
+        "R23",
+        "R31",
+        "R35",
+        "R36",
+        "R40"
+      ],
+      "critical": [
+        "18-months-overrides-memory",
+        "99.5-target-not-measurement",
+        "30-minutes-6-hours",
+        "21-days-trial",
+        "20-60-90-not-summed",
+        "12-hour-4-hour-unverified",
+        "project-specific-rehearsal",
+        "no-personnel-proof"
+      ]
+    },
+    {
+      "id": "commercial",
+      "requirements": [
+        "R27",
+        "R30",
+        "R33",
+        "R37",
+        "R38",
+        "R39",
+        "R47",
+        "R48"
+      ],
+      "critical": [
+        "missing-qualifications",
+        "rights-distinct",
+        "human-acceptance",
+        "480000-cap-not-price",
+        "20-40-30-10-percent",
+        "metered-model-cost",
+        "synthetic-not-performance",
+        "internal-pack-only"
+      ]
+    }
+  ],
+  "arms": {
+    "A": "single general Agent ordinary Run",
+    "B": "same general Agent in three sequential stages",
+    "C": "three specialist Agents in the same sequential stages"
+  },
+  "scoring": {
+    "per_requirement": {
+      "fact": 1,
+      "source": 1,
+      "boundary": 1
+    },
+    "fabrication_count": "count separately; cannot offset with other points",
+    "judge": "frozen rubric plus human-readable evidence; no model self-grading",
+    "sample_limit": "three paired cases, not statistical significance"
+  },
+  "global_authorization": {
+    "chat_calls": 90,
+    "input_tokens": 1000000,
+    "output_tokens": 80000,
+    "cny_including_embeddings": 30
+  },
+  "source_manifest": "source-manifest.json",
+  "authorization_amendments": [
+    {
+      "approved_at": "2026-11-04",
+      "chat_calls": 115,
+      "scope": "one corrected US19 verification; all other cumulative limits unchanged",
+      "duration_criterion": "complete multi-stage business result; maximum 30 minutes, no minimum"
+    },
+    {
+      "approved_at": "2026-11-04",
+      "chat_calls": 125,
+      "scope": "one complete rerun after offline fixes; retain failed tasks and all cumulative usage; other caps unchanged"
+    }
+  ]
+}

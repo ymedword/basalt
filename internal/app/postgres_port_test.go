@@ -45,6 +45,25 @@ func TestPostgresConfig_MapsDatabaseSection(t *testing.T) {
 	require.Zero(t, secondsDuration(-1), "负秒数必须归零而不是变成负时长")
 }
 
+func TestFlow_RuntimePostgresPoolIsBoundedAndReusesConnections(t *testing.T) {
+	cfg := &cli.Config{}
+	ordinary := runtimePostgresConfig(cfg)
+	require.Zero(t, ordinary.MaxConns)
+	require.Zero(t, ordinary.MinConns)
+	cfg.Flows.Enabled = true
+	defaults := runtimePostgresConfig(cfg)
+	require.Equal(t, 32, defaults.MaxConns)
+	require.Equal(t, 32, defaults.MinConns)
+	cfg.Database.MaxConns = 8
+	bounded := runtimePostgresConfig(cfg)
+	require.Equal(t, 8, bounded.MaxConns)
+	require.Equal(t, 8, bounded.MinConns, "idle ceiling must respect the explicit open ceiling")
+	cfg.Database.MinConns = 2
+	explicit := runtimePostgresConfig(cfg)
+	require.Equal(t, 8, explicit.MaxConns)
+	require.Equal(t, 2, explicit.MinConns, "explicit deployment choices remain authoritative")
+}
+
 // TestPostgresMigratorPort_EmptyDSNFailsClosed 验收点：空 DSN 在**拨号之前**就被拒绝
 // （含残留占位的空值形态），不会退化成一个连向本机缺省端口的尝试。
 // 逆改点：去掉空值判定或先拨号 → 用例要么拿到连接错误而不是"连接串为空"，要么超时。

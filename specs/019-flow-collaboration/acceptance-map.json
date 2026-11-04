@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "note": "Implementation names refine the plan's candidate names; behavior and negative boundaries are unchanged. Both exact stages and the full public profile are required. Browser interaction is separate evidence.",
+  "groups": {
+    "F01": [
+      "TestFlow_DefinitionRejectsUnsupported",
+      "TestFlow_DefinitionPublishFreezesVersion",
+      "TestFlow_RequiredSlotMustHaveValidator",
+      "TestFlow_BranchReadsTrustedSlotState"
+    ],
+    "F02": [
+      "TestFlow_StartAckRequiresCommit",
+      "TestFlow_StartIdempotency",
+      "TestFlow_IdempotencyAfterDefinitionSwitch",
+      "TestFlow_HTTPRealControlAndReadOnlyQueries"
+    ],
+    "F03": [
+      "TestFlow_ConcurrentAdvanceSingleAttempt",
+      "TestFlow_StaleRevisionCannotCommit",
+      "TestFlow_RunLedgerRequiresTheClaimedNodeIdentity"
+    ],
+    "F04": [
+      "TestFlow_ExecutorPrewriteFailureNoDispatch",
+      "TestFlow_ProductionNodeUsesOriginalRunAndAudit",
+      "TestFlow_FixedReadOnlyRunHasNoModelPromptOrChatCharge",
+      "TestFlow_ExecutorInputAndSchemaFrozen",
+      "TestFlow_WriteActionCrashKeepsOriginalIdentityAndNeverReplays"
+    ],
+    "F05": [
+      "TestFlow_CancelIntentNeverRequeues",
+      "TestFlow_CancelRequiresRealLeafJoin",
+      "TestFlow_CloseWaitsForJoinAndPreservesIntent",
+      "TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin"
+    ],
+    "F06": [
+      "TestFlow_SubflowUsesOnlyLeafRunAndFrozenIdentity",
+      "TestFlow_AuthorityKeepsOriginalKeyAndReadOnlyCeiling",
+      "TestFlow_AuthorityRejectsRecreatedOrChangedAgent",
+      "TestFlow_CrossCallerMalformedCheckpointHidden"
+    ],
+    "F07": [
+      "TestFlow_ChildBudgetNeverResets",
+      "TestFlow_UnknownUsageKeepsReservation",
+      "TestFlow_AncestorBudgetOverageBlocksAllDimensions",
+      "TestFlow_HTTPRealWorkerOwnershipArtifactAndDualQuota"
+    ],
+    "F08": [
+      "TestFlow_EvidenceInvalidationClosure",
+      "TestFlow_ClaimDependencyCycleRejected",
+      "TestFlow_CommitRechecksOriginalKeyAfterValidation",
+      "TestFlow_LaterSourceConsumersRecheckOriginalKey"
+    ],
+    "F09": [
+      "TestFlow_ContractCannotExceedPublishedLimits",
+      "TestFlow_ToolSuccessIsNotTaskAcceptance",
+      "TestFlow_RepeatedSourceIsNotIndependentEvidence",
+      "TestFlow_VerificationBindsTargetVersion",
+      "TestFlow_ProductionSourceVerificationAndClaimProjection"
+    ],
+    "F10": [
+      "TestFlow_CrashWindowMatrix",
+      "TestFlow_BinaryRestartReconciles32OpenWithin30Seconds",
+      "TestFlow_TaskContractHashMismatchBlocksWorker"
+    ],
+    "F11": [
+      "TestFlow_RepetitionAndAlternationStop",
+      "TestFlow_NoProgressAcrossRevision",
+      "TestFlow_TrustedCursorProgressRequiresOriginalAuditAndMonotonicPage",
+      "TestFlow_ProductionAliasReplacementChainCannotMintProgress",
+      "TestFlow_RevisionCheckpointFaultIsAtomic"
+    ],
+    "F12": [
+      "TestFlow_ExecutorStrictPinAndSchema",
+      "TestFlow_NestedSchemaViolationZeroDispatch",
+      "TestFlow_UnknownSchemaKeywordRejected",
+      "TestFlow_SchemaAdapterFailureFailsClosed"
+    ],
+    "F13": [
+      "TestFlow_ContextKeepsHardConstraintsAndFailsClosed"
+    ],
+    "F14": [
+      "TestFlow_ResultAndTransitionCommitAtomically",
+      "TestFlow_ClaimAcceptanceAndArtifactDependenciesAreAtomic",
+      "TestFlow_InvalidCloseIntentCombination",
+      "TestFlow_CrashWindowMatrix"
+    ],
+    "F15": [
+      "TestFlow_HTTPScopesAndAdminAreSeparate",
+      "TestFlow_CLIRoutesThroughService",
+      "TestFlow_BinaryCLIUsesServingInstanceWithoutSecondWriter",
+      "TestFlow_DiagnosticsDoNotAdvanceTask",
+      "TestFlow_HTTPValidationPathDoesNotEchoValues"
+    ],
+    "F16": [
+      "TestFlow_BinaryCapacity200TasksAndUnqueuedLatency",
+      "TestFlow_BinaryInteractiveReserveAndDeferredFairness",
+      "TestFlow_BinaryRestartReconciles32OpenWithin30Seconds",
+      "TestFlow_WorkerShutdownWaitsForActualJoin",
+      "TestFlow_ConfigBoundsCannotOverflowOrRemoveReserves",
+      "TestFlow_ClosePreservesDrainFailureJoinedWithCancellation"
+    ],
+    "F17": [
+      "TestFlow_MigrateV7PreservesOriginalExecutionAndAudit",
+      "TestFlow_HistoryRetentionPreservesReferencedRun",
+      "TestFlow_UnknownActionAndBudgetSurviveClose",
+      "TestFlow_CoordinatorOriginalLedgerLifecycle"
+    ],
+    "F18": [
+      "019-flow-console-test",
+      "019-flow-console-typecheck",
+      "019-flow-console-build"
+    ],
+    "F19": [
+      "TestFlow_DemoContractAndArtifacts",
+      "TestFlow_EvaluationCorpusIsFrozen",
+      "019-flow-website-check",
+      "019-flow-website-build"
+    ],
+    "F20": [
+      "019-experience-console"
+    ],
+    "F21": [
+      "019-experience-authoring"
+    ],
+    "F22": [
+      "019-experience-console"
+    ],
+    "F23": [
+      "TestFlow_BusinessDemoSourceAndRoleBoundaries",
+      "TestFlow_BusinessDemoThreeArmProtocol"
+    ],
+    "F24": [
+      "019-experience-authoring",
+      "019-experience-console",
+      "019-experience-demo",
+      "019-offline-model-policy",
+      "019-experience-demo-controller"
+    ],
+    "F25": [
+      "019-experience-defaults",
+      "019-experience-console"
+    ]
+  }
+}

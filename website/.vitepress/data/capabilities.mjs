@@ -22,6 +22,6 @@ export const DIAGRAMS = [
   { id: 'deployment', titleEn: 'Current deployment', titleZh: '当前部署', descriptionEn: 'A single Go process, local state and explicitly configured external services.', descriptionZh: '单个 Go 进程、本地状态与显式配置的外部服务。' }
 ]
 export const CURRENT_SCOPE_NOTE = {
-  en: 'This version hosts multiple agents in one runtime. Agent collaboration, multi-node execution, vector retrieval, automatic learning, SSO and multi-tenant governance are outside this version. Logical scopes do not provide process or container fault isolation.',
-  zh: '当前版本在统一运行时托管多个 Agent。Agent 协作、多节点执行、向量检索、自动学习、SSO 和多租户治理不属于本版本。逻辑作用域不等同于进程或容器故障隔离。'
+  en: 'This version hosts multiple agents in one runtime. Opt-in durable sequential flows coordinate published steps; parallel graphs, multi-node execution, automatic learning, SSO and multi-tenant governance remain outside this version. Logical scopes do not provide process or container fault isolation.',
+  zh: '当前版本在统一运行时托管多个 Agent。可选持久顺序流程协调已发布步骤；并行图、多节点执行、自动学习、SSO 和多租户治理仍不属于本版本。逻辑作用域不等同于进程或容器故障隔离。'
 }

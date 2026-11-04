@@ -58,6 +58,16 @@ func (storageStore) OpenReadOnly(ctx context.Context, database cli.DatabaseConfi
 // workspacePort adapts the workspace package to cli.Workspace.
 type workspacePort struct{}
 
+// AcquireLock 为离线 CLI 注入原实例锁；命令面只收到释放操作。
+// AcquireLock adapts the original instance lock without exposing its concrete type.
+func (workspacePort) AcquireLock(root string) (func() error, error) {
+	lock, err := workspace.AcquireInstanceLock(root)
+	if err != nil {
+		return nil, err
+	}
+	return lock.Release, nil
+}
+
 // Init 转调骨架创建，报告类型收成裸切片（端口形态）。
 // Init forwards the skeleton creation, flattening the report struct.
 func (workspacePort) Init(root string) (created, kept []string, err error) {

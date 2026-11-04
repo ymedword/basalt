@@ -84,8 +84,11 @@ type Usage struct {
 // consumes the protocol payload.
 type ChatRequest struct {
 	// Observation-only, never serialized into the provider request envelope.
-	Phases PhaseRecorder `json:"-"`
-	Timing *ModelTiming  `json:"-"`
+	Phases             PhaseRecorder   `json:"-"`
+	Timing             *ModelTiming    `json:"-"`
+	Flow               *FlowRunContext `json:"-"`
+	FlowEstimatedInput int             `json:"-"`
+	FlowEvidenceRefs   []EvidenceRef   `json:"-"`
 	// —— 路由与审计关联（ProviderService 消费）——
 	// Routing and audit bindings, consumed by ProviderService.
 

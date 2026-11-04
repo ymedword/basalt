@@ -32,6 +32,8 @@ import { CallersView } from './views/callers'
 import { CatalogView } from './views/catalog'
 import { DiagnosticsView } from './views/diagnostics'
 import { ObservabilityView } from './views/observability'
+import { FlowsView, FlowTasksView } from './views/flows'
+import { FlowTaskView } from './views/flow-task'
 import { DocumentDetailView } from './views/document-detail'
 import { HistoryView } from './views/history'
 import { KnowledgeView } from './views/knowledge'
@@ -63,12 +65,14 @@ const VIEWS: Record<RouteName, Component> = {
   'document-detail': DocumentDetailView,
   diagnostics: DiagnosticsView, history: HistoryView,
   observability: ObservabilityView,
+  flows: FlowsView, 'flow-tasks': FlowTasksView, 'flow-task': FlowTaskView,
 }
 interface NavItem { label: string; href: string; code: string; names?: readonly RouteName[] }
 const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
   { label: '工作区', items: [
     { label: '系统总览', href: CONSOLE_BASE + '/', code: '01', names: ['overview'] },
     { label: 'Agents', href: CONSOLE_BASE + '/agents', code: '02', names: ['agents', 'agents-new', 'agent-detail', 'agent-config', 'agent-session', 'archived'] },
+    { label: '工作流', href: CONSOLE_BASE + '/flows', code: '15', names: ['flows', 'flow-tasks', 'flow-task'] },
   ] },
   { label: '资源库', items: [
     { label: '模型与连接', href: resourceHref('model-connections'), code: '03' },
@@ -99,6 +103,7 @@ const TITLES: Record<RouteName, string> = {
   knowledge: '知识库', 'knowledge-collection': '知识库', 'document-detail': '文档详情',
   diagnostics: '诊断明细', history: '历史回查',
   observability: '运行排障',
+  flows: '工作流', 'flow-tasks': '工作流执行任务', 'flow-task': '工作流任务详情',
 }
 function currentLocation(): string { return window.location.pathname + window.location.search }
 function navActive(item: NavItem, match: RouteMatch): boolean {
@@ -214,7 +219,7 @@ export function createConsoleApp(): Component {
             showChrome && secretsRecovery.value
               ? h(Notice, { tone: 'error', text: INSTANCE_SECRETS_RECOVERY_BANNER })
               : null,
-            h('main', { class: ['console-main', {'console-main-wide': match.name === 'observability' || match.name === 'run-detail'}], id: 'console-main', tabindex: -1 }, [h(VIEWS[match.name], { key: match.name + ':' + match.path + (match.name === 'observability' ? '?' + match.query.toString() : ''), ctx: context, params: match.params, query: match.query })]),
+            h('main', { class: ['console-main', {'console-main-wide': ['observability', 'run-detail', 'flows', 'flow-tasks', 'flow-task'].includes(match.name)}], id: 'console-main', tabindex: -1 }, [h(VIEWS[match.name], { key: match.name + ':' + match.path + (['observability', 'flow-task', 'flow-tasks'].includes(match.name) ? '?' + match.query.toString() : ''), ctx: context, params: match.params, query: match.query })]),
           ]),
         ])
       }

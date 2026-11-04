@@ -16,6 +16,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -68,11 +69,32 @@ var _ knowledge.Embedder = (*auditedEmbedder)(nil)
 // Embed 执行一次带审计的查询侧 embedding。
 // Embed runs one audited query-side embedding call.
 func (a *auditedEmbedder) Embed(ctx context.Context, texts []string) (knowledge.EmbedBatch, error) {
+	return a.embed(ctx, texts, nil)
+}
+
+// EmbedFlow uses the same original audit writer. Only Flow makes terminal
+// confirmation mandatory and binds its durable dispatch permit to that pending id.
+func (a *auditedEmbedder) EmbedFlow(ctx context.Context, texts []string, before func(context.Context, string) error) (knowledge.EmbedBatch, error) {
+	if before == nil {
+		return knowledge.EmbedBatch{}, errFlowEmbeddingNotIssued
+	}
+	return a.embed(ctx, append([]string(nil), texts...), before)
+}
+
+func (a *auditedEmbedder) embed(ctx context.Context, texts []string, before func(context.Context, string) error) (knowledge.EmbedBatch, error) {
 	callID, err := a.audit.BeginEmbedding(ctx, "", a.model, len(texts))
 	if err != nil {
 		// 预写不成功就**不发**：这是原则 V 与 `run-and-errors.md` §7.2 的同一句话。
 		// No pending row, no outgoing call.
-		return knowledge.EmbedBatch{}, fmt.Errorf("查询侧 embedding 审计预写失败，本次调用未发出: %w", err)
+		return knowledge.EmbedBatch{}, fmt.Errorf("查询侧 embedding 审计预写失败，本次调用未发出: %w", errors.Join(errFlowEmbeddingNotIssued, err))
+	}
+	if before != nil {
+		if err := before(ctx, callID); err != nil {
+			finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditFinishTimeout)
+			defer cancel()
+			finishErr := a.audit.FinishEmbedding(finishCtx, callID, 0, err)
+			return knowledge.EmbedBatch{}, errors.Join(errFlowEmbeddingNotIssued, err, finishErr)
+		}
 	}
 
 	batch, callErr := a.inner.Embed(ctx, texts)
@@ -81,7 +103,15 @@ func (a *auditedEmbedder) Embed(ctx context.Context, texts []string) (knowledge.
 	if callErr == nil {
 		tokens = batch.PromptTokens
 	}
-	a.finish(ctx, callID, tokens, callErr)
+	if before != nil {
+		finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditFinishTimeout)
+		defer cancel()
+		if err := a.audit.FinishEmbedding(finishCtx, callID, tokens, callErr); err != nil {
+			return batch, errors.Join(errFlowEmbeddingUnconfirmed, callErr, err)
+		}
+	} else {
+		a.finish(ctx, callID, tokens, callErr)
+	}
 	return batch, callErr
 }
 

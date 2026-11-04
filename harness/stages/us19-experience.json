@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "id": "us19-experience",
+  "approval": "User 2026-11-03 explicitly adds unified workflow UI, visual authoring and business Agents/demo to US19; separately authorizes bounded qwen-plus evaluation. experience-design.md and appended spec/plan/tasks control this additive scope; original R3 gates remain required. Final human review 2 pending.",
+  "inputs": [
+    "specs/019-flow-collaboration/experience-design.md",
+    "specs/019-flow-collaboration/spec.md",
+    "specs/019-flow-collaboration/plan.md",
+    "specs/019-flow-collaboration/tasks.md",
+    "docs/contracts/flow.md",
+    "docs/contracts/openapi.yaml"
+  ],
+  "protect": [
+    "internal/app/flow_authoring_integration_test.go",
+    "internal/app/flow_embedding_integration_test.go",
+    "internal/web/handlers_flow_authoring_test.go",
+    "assets/console/tests/workflow-editor.test.ts",
+    "assets/console/tests/workflow-editor-view.test.ts",
+    "scripts/acceptance/flow_business_demo_test.go",
+    "examples/workflows/bid-readiness/test_matrix.py",
+    "examples/workflows/bid-readiness/test_collect.py",
+    "examples/workflows/bid-readiness/test_demo.py",
+    "examples/workflows/bid-readiness/test_budget_gateway.py",
+    "scripts/acceptance/model_policy_test.go",
+    "internal/builtin/workflow_test.go",
+    "internal/app/builtin_workflow_test.go",
+    "internal/cli/demo_workflow_test.go",
+    "internal/cli/ports_test.go",
+    "assets/console/tests/workflow-template.test.ts"
+  ],
+  "checks": [
+    {
+      "id": "019-offline-model-policy",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=60s",
+        "./scripts/acceptance",
+        "-run",
+        "^TestOfflineModelPolicy_"
+      ],
+      "timeout_seconds": 90,
+      "required_tests": [
+        "TestOfflineModelPolicy_RefusesBeforeProcessStart",
+        "TestOfflineModelPolicy_AllowedInfrastructure",
+        "TestOfflineModelPolicy_EnvironmentPreservesFixtures",
+        "TestOfflineModelPolicy_ChildEnvironment"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-experience-authoring",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=180s",
+        "-tags=integration",
+        "./internal/app",
+        "./internal/web",
+        "-run",
+        "^TestFlow_(Authoring|NoKnowledgeLeafKeepsSharedRunChain)"
+      ],
+      "timeout_seconds": 240,
+      "required_tests": [
+        "TestFlow_AuthoringCatalogUsesCurrentPinsWithoutDispatch",
+        "TestFlow_AuthoringVersionReadRequiresAdmin",
+        "TestFlow_AuthoringCatalogRejectsStaleAndDisabled",
+        "TestFlow_AuthoringEndpointsAuthentication",
+        "TestFlow_NoKnowledgeLeafKeepsSharedRunChain"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-experience-console",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "test",
+        "--",
+        "workflow-editor.test.ts",
+        "workflow-editor-view.test.ts",
+        "workflow-template.test.ts",
+        "flow-views.test.ts"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-experience-demo-controller",
+      "args": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "examples/workflows/bid-readiness",
+        "-p",
+        "test_*.py",
+        "-v"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [],
+      "level": "source"
+    },
+    {
+      "id": "019-experience-demo",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=120s",
+        "./scripts/acceptance",
+        "-run",
+        "^TestFlow_BusinessDemo"
+      ],
+      "timeout_seconds": 180,
+      "required_tests": [
+        "TestFlow_BusinessDemoSourceAndRoleBoundaries",
+        "TestFlow_BusinessDemoThreeArmProtocol"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "019-experience-defaults",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=90s",
+        "./internal/builtin",
+        "./internal/app",
+        "./internal/cli",
+        "-run",
+        "^(TestFlow_DefaultWorkflow|TestDependencyDirection_CliDoesNotImportImplementations$)"
+      ],
+      "timeout_seconds": 120,
+      "required_tests": [
+        "TestFlow_DefaultWorkflowInstallPreservesOwnedContent",
+        "TestFlow_DefaultWorkflowCopyFailureHasNoPartialTarget",
+        "TestFlow_DefaultWorkflowAssetsPortableAndBounded",
+        "TestFlow_DefaultWorkflowStartupOnceAndLegacySkipped",
+        "TestFlow_DefaultWorkflowExplicitInstallDoesNotResurrect",
+        "TestFlow_DefaultWorkflowCLIInstallsWithoutRuntime",
+        "TestFlow_DefaultWorkflowCLILockIsWired",
+        "TestDependencyDirection_CliDoesNotImportImplementations"
+      ],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T029",
+      "checks": [
+        "019-experience-authoring"
+      ]
+    },
+    {
+      "id": "T030",
+      "checks": [
+        "019-experience-authoring"
+      ]
+    },
+    {
+      "id": "T031",
+      "checks": [
+        "019-experience-console"
+      ]
+    },
+    {
+      "id": "T032",
+      "checks": [
+        "019-experience-console"
+      ]
+    },
+    {
+      "id": "T033",
+      "checks": [
+        "019-experience-authoring",
+        "019-experience-demo",
+        "019-experience-demo-controller"
+      ]
+    },
+    {
+      "id": "T034",
+      "checks": [
+        "019-experience-demo",
+        "019-experience-demo-controller"
+      ]
+    },
+    {
+      "id": "T035",
+      "checks": [
+        "019-experience-console"
+      ]
+    },
+    {
+      "id": "T036",
+      "checks": [
+        "019-experience-authoring",
+        "019-offline-model-policy"
+      ]
+    },
+    {
+      "id": "T037",
+      "checks": [
+        "019-experience-defaults",
+        "019-experience-console"
+      ]
+    }
+  ]
+}

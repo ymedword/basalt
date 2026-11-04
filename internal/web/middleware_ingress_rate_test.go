@@ -333,18 +333,27 @@ func TestIngressRoutes_BusinessRowsDeclareClass(t *testing.T) {
 	// 知识库九行的归类依据记 US-16 附录 R52（契约点名的照抄，未点名的三条按
 	// "写操作计入摄取桶"裁决）。
 	want := map[string]callers.IngressClass{
-		"POST /api/v1/sessions":                   callers.IngressRun,
-		"POST /api/v1/sessions/{id}/messages":     callers.IngressRun,
-		"POST /api/v1/agents/{name}/invoke":       callers.IngressRun,
-		"POST /api/v1/collections":                callers.IngressIngest,
-		"DELETE /api/v1/collections/{id}":         callers.IngressIngest,
-		"GET /api/v1/collections/{id}/documents":  callers.IngressRead,
-		"POST /api/v1/collections/{id}/documents": callers.IngressIngest,
-		"DELETE /api/v1/documents/{id}":           callers.IngressIngest,
-		"GET /api/v1/documents/{id}/versions":     callers.IngressRead,
-		"POST /api/v1/documents/{id}/reindex":     callers.IngressIngest,
-		"POST /api/v1/search":                     callers.IngressRead,
-		"POST /api/v1/sources/view":               callers.IngressRead,
+		"GET /api/v1/flows":                         callers.IngressRead,
+		"GET /api/v1/flows/{name}":                  callers.IngressRead,
+		"GET /api/v1/flow-tasks":                    callers.IngressRead,
+		"GET /api/v1/flow-tasks/{id}":               callers.IngressRead,
+		"GET /api/v1/flow-tasks/{id}/artifacts":     callers.IngressRead,
+		"GET /api/v1/flow-tasks/{id}/verifications": callers.IngressRead,
+		"POST /api/v1/flow-tasks":                   callers.IngressRun,
+		"POST /api/v1/flow-tasks/{id}/cancel":       callers.IngressRun,
+		"POST /api/v1/flow-tasks/{id}/resume":       callers.IngressRun,
+		"POST /api/v1/sessions":                     callers.IngressRun,
+		"POST /api/v1/sessions/{id}/messages":       callers.IngressRun,
+		"POST /api/v1/agents/{name}/invoke":         callers.IngressRun,
+		"POST /api/v1/collections":                  callers.IngressIngest,
+		"DELETE /api/v1/collections/{id}":           callers.IngressIngest,
+		"GET /api/v1/collections/{id}/documents":    callers.IngressRead,
+		"POST /api/v1/collections/{id}/documents":   callers.IngressIngest,
+		"DELETE /api/v1/documents/{id}":             callers.IngressIngest,
+		"GET /api/v1/documents/{id}/versions":       callers.IngressRead,
+		"POST /api/v1/documents/{id}/reindex":       callers.IngressIngest,
+		"POST /api/v1/search":                       callers.IngressRead,
+		"POST /api/v1/sources/view":                 callers.IngressRead,
 		// 历史回查三行（T056）：列表 / 检索 / 精确读取都是只读，计 IngressRead。
 		// 任一条按 Run 计桶都会让"打开列表页"消耗运行预算（D-30 / T126）。
 		"GET /api/v1/sessions":                                    callers.IngressRead,
@@ -366,7 +375,7 @@ func TestIngressRoutes_BusinessRowsDeclareClass(t *testing.T) {
 		require.Equal(t, expected, rt.ingress, "%s 的入口类别与期望不符", name)
 	}
 	require.Equal(t, len(want), businessRows,
-		"业务行数与期望表条目数必须一致：三条会话 / 调用行 + 九条知识库行 + 三条历史回查行")
+		"业务行数与期望表逐项一致，包含US19九条流程业务行")
 	require.NoError(t, checkRouteIngress(srv.routeTable()))
 }
 

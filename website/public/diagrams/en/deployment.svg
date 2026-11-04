@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1120" viewBox="0 0 1320 1120" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="deployment" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1270" viewBox="0 0 1320 1270" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="deployment" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
 <title id="diagram-title">Self-hosted, on a single node.</title>
-<desc id="diagram-desc">Current supported product topology: a single self-hosted Go binary with the embedded management console, basalt.yaml and the .basalt workspace containing SQLite, Agent definitions, skills and memory. The console listens on loopback by default. CLI commands and serve share one workspace instance lock and must not write concurrently. Remote management requires deployment-managed TLS/reverse proxy or a trusted encrypted channel; TLS is not built into serve. Model and external tool endpoints remain external configured services. Managed-credential master keys live outside the workspace and require separate backup. No container or multi-worker topology is claimed.</desc>
+<desc id="diagram-desc">Current supported product topology: a single self-hosted Go binary with the embedded management console, basalt.yaml and the .basalt workspace containing Agent definitions and skills, with PostgreSQL holding runtime data. The console listens on loopback by default. CLI commands and serve share one workspace instance lock and must not write concurrently. Remote management requires deployment-managed TLS/reverse proxy or a trusted encrypted channel; TLS is not built into serve. Model and external tool endpoints remain external configured services. Managed-credential master keys live outside the workspace and require separate backup. Single-instance Docker Compose is supported; replicated or distributed workers are outside this scope. US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
 <rect width="1320" height="1120" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
@@ -58,9 +58,9 @@
 <text x="93" y="751" font-size="15" fill="#5d6a70">Environment credential references</text>
 </g>
 <g data-node-id="data"><rect x="435" y="675" width="370" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
-<text x="453" y="703" font-size="20" font-weight="600">.basalt/</text>
-<text x="453" y="728" font-size="16" fill="#5d6a70">basalt.db · embedded SQLite</text>
-<text x="453" y="751" font-size="16" fill="#5d6a70">Agent / skill / session / memory data</text>
+<text x="453" y="703" font-size="20" font-weight="600">Workspace + PostgreSQL</text>
+<text x="453" y="728" font-size="16" fill="#5d6a70">.basalt/ · Agent and skill files</text>
+<text x="453" y="751" font-size="16" fill="#5d6a70">PostgreSQL · sessions, audit, memory</text>
 <text x="453" y="774" font-size="16" fill="#5d6a70">Back up through the operations procedure</text>
 </g>
 <g data-node-id="external"><rect x="935" y="455" width="330" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
@@ -75,5 +75,6 @@
 <text x="93" y="906" font-size="16" fill="#5d6a70">Environment credential mode does not require this key</text>
 </g>
 <text x="40" y="1075" font-size="15" fill="#5d6a70">Use the public operations guide for reverse-proxy, authentication, backup and upgrade instructions. No multi-node topology is shown.</text>
-<text x="40" y="1101" font-size="12" fill="#5d6a70">Source commit: eb97cd539e51 · Current implementation</text>
-</g></svg>
+<text x="40" y="1101" font-size="12" fill="#5d6a70">Source commit: ca9a0d29f185 · Current implementation</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1130" width="1284" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1160" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1195" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1230" font-size="18" fill="#202b30">PostgreSQL v8 holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
+</svg>

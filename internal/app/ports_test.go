@@ -84,17 +84,20 @@ func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 60, "运行期v7保留v1的52表、六张OBS表与两张保留账本表")
-	var legacy, observabilityTables []string
+	require.Len(t, tables, 77, "运行期v8保留原60表并追加17张Flow表")
+	var legacy, observabilityTables, flowTables []string
 	for _, table := range tables {
 		if strings.HasPrefix(table, "observability_") {
 			observabilityTables = append(observabilityTables, table)
+		} else if strings.HasPrefix(table, "flow_") {
+			flowTables = append(flowTables, table)
 		} else {
 			legacy = append(legacy, table)
 		}
 	}
 	require.Len(t, legacy, 54, "v1基线的52表与保留账本的两表仍全部保留")
 	require.ElementsMatch(t, []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"}, observabilityTables)
+	require.ElementsMatch(t, []string{"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations"}, flowTables)
 }
 
 // TestStorageStore_OpenReadOnlyErrorReturnsNilView typed-nil 回归：错误路径**必须**

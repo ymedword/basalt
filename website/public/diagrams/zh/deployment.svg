@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1120" viewBox="0 0 1320 1120" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="deployment" data-source-commit="eb97cd539e51e2b3db15afcfcc1dfa295eaebe77">
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1270" viewBox="0 0 1320 1270" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="deployment" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
 <title id="diagram-title">当前部署：单节点，自托管。</title>
-<desc id="diagram-desc">当前产品拓扑为单节点：自托管 Go 二进制内嵌管理台，读取 basalt.yaml，使用 .basalt 工作区中的 SQLite、Agent 定义、技能和记忆。管理台默认仅回环监听。CLI 写命令与 serve 共用工作区实例锁，不能并行写同一工作区。远程管理需由部署方提供 TLS／反向代理或可信加密通道，serve 不内置 TLS。模型与外部工具端点按配置连接。托管凭据主密钥位于工作区之外，单独备份。不承诺容器或多 Worker 拓扑。</desc>
+<desc id="diagram-desc">当前产品拓扑为单节点：自托管 Go 二进制内嵌管理台，读取 basalt.yaml，使用 .basalt 工作区中的 Agent 定义与技能，运行记录保存在外置 PostgreSQL。管理台默认仅回环监听。CLI 写命令与 serve 共用工作区实例锁，不能并行写同一工作区。远程管理需由部署方提供 TLS／反向代理或可信加密通道，serve 不内置 TLS。模型与外部工具端点按配置连接。托管凭据主密钥位于工作区之外，单独备份。支持单实例 Docker Compose；不承诺多副本或分布式 Worker。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
 <rect width="1320" height="1120" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
@@ -58,10 +58,10 @@
 <text x="93" y="751" font-size="15" fill="#5d6a70">环境变量凭据引用</text>
 </g>
 <g data-node-id="data"><rect x="435" y="675" width="370" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
-<text x="453" y="703" font-size="20" font-weight="600">自托管工作区 .basalt/</text>
-<text x="453" y="728" font-size="16" fill="#5d6a70">basalt.db · 内嵌 SQLite</text>
-<text x="453" y="751" font-size="16" fill="#5d6a70">Agent／技能／会话／记忆数据</text>
-<text x="453" y="774" font-size="16" fill="#5d6a70">按运维流程备份</text>
+<text x="453" y="703" font-size="20" font-weight="600">工作区与运行数据库</text>
+<text x="453" y="728" font-size="16" fill="#5d6a70">.basalt/ · Agent／技能文件</text>
+<text x="453" y="751" font-size="16" fill="#5d6a70">PostgreSQL · 会话／审计／记忆</text>
+<text x="453" y="774" font-size="16" fill="#5d6a70">按运维流程分别备份</text>
 </g>
 <g data-node-id="external"><rect x="935" y="455" width="330" height="125" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
 <text x="953" y="483" font-size="20" font-weight="600">配置的外部服务</text>
@@ -75,5 +75,6 @@
 <text x="93" y="906" font-size="16" fill="#5d6a70">纯环境变量凭据模式不需要此主密钥</text>
 </g>
 <text x="40" y="1075" font-size="15" fill="#5d6a70">远程代理、认证、备份与升级请按公开运维手册操作；本图不把多节点部署画成现状。</text>
-<text x="40" y="1101" font-size="12" fill="#5d6a70">源码提交: eb97cd539e51 · 当前实现</text>
-</g></svg>
+<text x="40" y="1101" font-size="12" fill="#5d6a70">源码提交: ca9a0d29f185 · 当前实现</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1130" width="1284" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1160" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1195" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1230" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+</svg>

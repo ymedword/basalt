@@ -254,6 +254,7 @@ export function diagnosticTimeline(v: ObsTimeline, mode: TimelineMode, change: (
               ['判定', e.decision ?? '不适用'], ['步骤 ID', e.step_id ?? '不按轮次 / 未记录'], ['尝试 ID', e.attempt_id ?? '尝试未记录'], ['父步骤 ID', e.parent_step_id ?? '父关系未记录'],
               ...(isVisibilityFilter(e.kind, e.reason_code ?? '') ? [['筛选统计', visibilityFilterNote(e.attrs.count)] as const] : []),
               ['局部序号', e.seq ?? '未记录'], ['审计回指', e.audit_ref ?? '未记录'], ['结束时间来源', e.end_source],
+              ...(e.flow ? [['流程任务', h('a', {href: '/console/flow-tasks/' + encodeURIComponent(e.flow.task_id) + '?admin=1'}, e.flow.task_id)], ['流程节点', e.flow.node_id], ['节点尝试', e.flow.node_attempt_id], ['逻辑动作', e.flow.action_id ?? '非工具动作'], ['任务修订 / 执行代次', `${e.flow.revision} / ${e.flow.execution_epoch}`]] as const : []),
               ['记录耗时（毫秒）', e.attrs.duration_ms ?? '未记录'], ['模型', e.attrs.model ?? '不适用'], ['输入 token', e.attrs.prompt_tokens ?? '未记录'], ['输出 token', e.attrs.completion_tokens ?? '未记录'],
               ['操作结果码', e.attrs.result_code ?? '不适用'], ['真实运行关联', typeof e.attrs.run_id === 'string' ? h('a', {href: observabilityHref('run', ['run_id', e.attrs.run_id])}, e.attrs.run_id) : '当前查询锚点']
             ])])])

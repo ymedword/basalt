@@ -77,26 +77,27 @@ func (q TimelineQuery) Validate() error {
 // TimelineEntry 把展示编号与真实标识分开，Attrs只含允许字段。
 // TimelineEntry separates display numbers from persistent identities.
 type TimelineEntry struct {
-	SchemaVersion  *int           `json:"schema_version,omitempty"`
-	Decision       string         `json:"decision,omitempty"`
-	RedactedFields int            `json:"redacted_fields"`
-	DisplayStepID  string         `json:"display_step_id"`
-	EventID        string         `json:"event_id,omitempty"`
-	Source         SourceKind     `json:"source"`
-	SourceID       string         `json:"source_id"`
-	Kind           string         `json:"kind"`
-	OccurredAt     time.Time      `json:"occurred_at"`
-	EndedAt        *time.Time     `json:"ended_at"`
-	EndSource      EndTimeSource  `json:"end_source"`
-	Status         string         `json:"status"`
-	ReasonCode     string         `json:"reason_code,omitempty"`
-	StepID         string         `json:"step_id,omitempty"`
-	AttemptID      string         `json:"attempt_id,omitempty"`
-	ParentStepID   string         `json:"parent_step_id,omitempty"`
-	Seq            int64          `json:"seq,omitempty"`
-	AuditRef       string         `json:"audit_ref,omitempty"`
-	Evidence       EvidenceGrade  `json:"evidence"`
-	Attrs          map[string]any `json:"attrs"`
+	Flow           *FlowAssociation `json:"flow,omitempty"`
+	SchemaVersion  *int             `json:"schema_version,omitempty"`
+	Decision       string           `json:"decision,omitempty"`
+	RedactedFields int              `json:"redacted_fields"`
+	DisplayStepID  string           `json:"display_step_id"`
+	EventID        string           `json:"event_id,omitempty"`
+	Source         SourceKind       `json:"source"`
+	SourceID       string           `json:"source_id"`
+	Kind           string           `json:"kind"`
+	OccurredAt     time.Time        `json:"occurred_at"`
+	EndedAt        *time.Time       `json:"ended_at"`
+	EndSource      EndTimeSource    `json:"end_source"`
+	Status         string           `json:"status"`
+	ReasonCode     string           `json:"reason_code,omitempty"`
+	StepID         string           `json:"step_id,omitempty"`
+	AttemptID      string           `json:"attempt_id,omitempty"`
+	ParentStepID   string           `json:"parent_step_id,omitempty"`
+	Seq            int64            `json:"seq,omitempty"`
+	AuditRef       string           `json:"audit_ref,omitempty"`
+	Evidence       EvidenceGrade    `json:"evidence"`
+	Attrs          map[string]any   `json:"attrs"`
 	runID          string
 }
 
@@ -257,6 +258,14 @@ func (p *Projector) resolveAnchor(ctx context.Context, anchor Anchor) ([]string,
 		return false
 	}
 	switch anchor.Kind {
+	case AnchorFlowTask:
+		reader, ok := p.ports.Runs.(FlowFactsReader)
+		if !ok {
+			return nil, nil, []EvidenceGap{factGap(SourceRun, GapNotSupported)}
+		}
+		var err error
+		ids, err = reader.RunsByFlowTaskID(ctx, anchor.Value)
+		failed(SourceRun, err)
 	case AnchorRun:
 		ids = []string{anchor.Value}
 	case AnchorRequest, AnchorSession:
@@ -418,7 +427,11 @@ func (p *Projector) loadRunFacts(ctx context.Context, runID string) ([]TimelineE
 		}
 	}
 	diag, diagGaps := p.loadDiagnostics(ctx, diagnostics.Query{RunID: runID, Limit: min(p.cfg.MaxEvents, diagnostics.MaxQueryLimit)}, from, to)
-	return append(entries, diag...), append(gaps, diagGaps...)
+	entries, err := p.associateFlow(ctx, runID, append(entries, diag...))
+	if err != nil {
+		gaps = append(gaps, queryGap(SourceRun, err))
+	}
+	return entries, append(gaps, diagGaps...)
 }
 
 func optionalRound(round int) string {

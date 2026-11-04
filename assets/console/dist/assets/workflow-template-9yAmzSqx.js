@@ -1,0 +1,1906 @@
+import{t as e}from"./index-DiM6ijVI.js";var t=`{
+  "format_version": 1,
+  "name": "bid-readiness-matrix-v1",
+  "entry": "requirements_1",
+  "task_contract": "TASK.json",
+  "limits": {
+    "max_total_tokens": 200000,
+    "max_tool_calls": 70,
+    "max_duration_seconds": 1800,
+    "max_depth": 3,
+    "max_children": 16,
+    "max_attempts_per_node": 1,
+    "max_revisions": 2
+  },
+  "nodes": [
+    {
+      "id": "requirements_1",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-requirements"
+      },
+      "inputs": [
+        {
+          "target": "instruction",
+          "literal": "读取source_path第一章；以下是相邻第二章的冻结全文。提取两章全部12项：编号、原始要求、数字/单位/边界和来源锚点。逐项保留，不判断供应商已满足。result紧凑12行，900字以内。\\n# 合成演示采购需求 · 第 02 章 知识与经验\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R07\\n\\n须以原始文件版本和章节编号追溯知识库引用；检索相似不能替代原文核对。\\n\\n## R08\\n\\n提供知识集合读取边界，并以两个测试身份验证越权资料不会进入模型输入。\\n\\n## R09\\n\\n长期记忆须经确认后生效；本项目经验仅可给出提醒，不能覆盖当前采购文件。\\n\\n## R10\\n\\n本项目维护期为最终验收后 18 个月；旧经验卡中的 6 个月约定不适用于本项目。\\n\\n## R11\\n\\n投标准备阶段只处理本例合成资料与获许可公开产品材料，不导入真实客户隐私。\\n\\n## R12\\n\\n新产生经验只能输出待确认建议卡，不得由模型直接改写共享事实或确认自己的结论。\\n"
+        },
+        {
+          "target": "source_path",
+          "literal": "request-01.md"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "requirements_2"
+    },
+    {
+      "id": "requirements_2",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-requirements"
+      },
+      "inputs": [
+        {
+          "target": "instruction",
+          "literal": "读取source_path第一章；以下是相邻第二章的冻结全文。提取两章全部12项：编号、原始要求、数字/单位/边界和来源锚点。逐项保留，不判断供应商已满足。result紧凑12行，900字以内。\\n# 合成演示采购需求 · 第 04 章 性能与运营\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R19\\n\\n验收目标：40 个同时在线用户、12 个并发任务；当前未提供压测报告，状态应为待验证。\\n\\n## R20\\n\\n接口首响应 P95 目标为 3 秒；非流式响应的首响应等待不得标成首 token 延迟。\\n\\n## R21\\n\\n非外部依赖故障的月度服务可用率目标 99.5%；目标不等于当前已实测达到。\\n\\n## R22\\n\\n故障处置要求 30 分钟响应、6 小时内提供恢复或替代方案；需要供应商书面承诺。\\n\\n## R23\\n\\n试运行要求连续 21 天；测试通过和演示完成都不等于项目终验。\\n\\n## R24\\n\\n须拆分模型调用、工具调用及总墙钟耗时；重叠区间不能相加虚增总耗时。\\n"
+        },
+        {
+          "target": "source_path",
+          "literal": "request-03.md"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "requirements_3"
+    },
+    {
+      "id": "requirements_3",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-requirements"
+      },
+      "inputs": [
+        {
+          "target": "instruction",
+          "literal": "读取source_path第一章；以下是相邻第二章的冻结全文。提取两章全部12项：编号、原始要求、数字/单位/边界和来源锚点。逐项保留，不判断供应商已满足。result紧凑12行，900字以内。\\n# 合成演示采购需求 · 第 06 章 计划与验收\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R31\\n\\nT0 为合同起算日；第 20 天完成需求确认，第 60 天完成集成测试，第 90 天申请终验；三者为累计里程碑，不相加。\\n\\n## R32\\n\\n资料包须包含需求追踪矩阵、部署说明、测试报告、备份恢复记录及待办清单。\\n\\n## R33\\n\\n里程碑验收由采购方签字；工作流的格式验收不代替采购方业务验收。\\n\\n## R34\\n\\n每项未满足要求须给出补证责任角色与下一行动；不能只写风险高低。\\n\\n## R35\\n\\n数据恢复目标：备份间隔不超过 12 小时，恢复演练在 4 小时内完成；没有报告时须待验证。\\n\\n## R36\\n\\n上线之前需使用本项目数据形态演练备份、恢复和失败回滚；已有通用脚本不能直接判通过。\\n"
+        },
+        {
+          "target": "source_path",
+          "literal": "request-05.md"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "requirements_4"
+    },
+    {
+      "id": "requirements_4",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-requirements"
+      },
+      "inputs": [
+        {
+          "target": "instruction",
+          "literal": "读取source_path第一章；以下是相邻第二章的冻结全文。提取两章全部12项：编号、原始要求、数字/单位/边界和来源锚点。逐项保留，不判断供应商已满足。result紧凑12行，900字以内。\\n# 合成演示采购需求 · 第 08 章 评审与交接\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R43\\n\\n最终矩阵必须覆盖 R01–R48，逐项给出结论和来源；未读条目不得自动标成满足。\\n\\n## R44\\n\\n状态限定为有依据、部分有依据、待验证、待补材料、不适用；所有有依据须注明具体来源。\\n\\n## R45\\n\\n最终包包含技术、交付、商务三类风险，并区分阻断条件和一般建议。\\n\\n## R46\\n\\n不同专业意见冲突时保留双方来源，交最终复核列为待澄清，不擅自选较乐观结论。\\n\\n## R47\\n\\n合成经验卡不得成为客户业绩、资格或产品性能的证明；正文须显著标识演示性质。\\n\\n## R48\\n\\n最终交付是内部采购响应准备包；不得表述为已经中标、已对外提交或已通过法律审查。\\n"
+        },
+        {
+          "target": "source_path",
+          "literal": "request-07.md"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "technical_1"
+    },
+    {
+      "id": "technical_1",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-technical"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "对照上游12项与以下product-main.md冻结全文，逐项给编号、状态、能力或证据缺口、来源、补证角色。采购期望不是测评证明。非技术事项交商务。result紧凑12行，900字以内。无需再次读取同一文件。\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n本组采购原文，冲突时以原文为准，不只信上游转述：\\n\\n来源：request-01.md；SHA-256：ebe6fd5f640e4d89430b436ef8f3de7e75b6d0c77a0638483bffeec2867d450f\\n# 合成演示采购需求 · 第 01 章 范围与部署\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R01\\n\\n采购单节点自托管企业 Agent 平台；第一期不采购多租户 SaaS。\\n\\n## R02\\n\\n平台应支持多个业务 Agent 分别配置，复用公共模型、工具、渠道与记忆。\\n\\n## R03\\n\\n服务程序以单 Go 二进制交付；外部数据库单独部署，不能把单二进制解释为无数据库。\\n\\n## R04\\n\\n本期目标操作系统为 Windows amd64 和 Linux amd64；另外架构的支持须单独举证。\\n\\n## R05\\n\\n允许容器单实例交付；不得承诺已有跨机高可用、滚动升级或 Kubernetes 多副本能力。\\n\\n## R06\\n\\n材料必须固定产品版本；开发中的工作流功能须单列候选能力，不计入已交付基线。\\n\\n\\n来源：request-02.md；SHA-256：a4675d1d3fc556d586f5efe656a7a5cc5c072aaee92d7519418120b531c7e281\\n# 合成演示采购需求 · 第 02 章 知识与经验\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R07\\n\\n须以原始文件版本和章节编号追溯知识库引用；检索相似不能替代原文核对。\\n\\n## R08\\n\\n提供知识集合读取边界，并以两个测试身份验证越权资料不会进入模型输入。\\n\\n## R09\\n\\n长期记忆须经确认后生效；本项目经验仅可给出提醒，不能覆盖当前采购文件。\\n\\n## R10\\n\\n本项目维护期为最终验收后 18 个月；旧经验卡中的 6 个月约定不适用于本项目。\\n\\n## R11\\n\\n投标准备阶段只处理本例合成资料与获许可公开产品材料，不导入真实客户隐私。\\n\\n## R12\\n\\n新产生经验只能输出待确认建议卡，不得由模型直接改写共享事实或确认自己的结论。\\n"
+        },
+        {
+          "target": "requirements_1_report",
+          "source": "outputs.requirements_1.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "technical_2"
+    },
+    {
+      "id": "technical_2",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-technical"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "对照上游12项与以下product-main.md冻结全文，逐项给编号、状态、能力或证据缺口、来源、补证角色。采购期望不是测评证明。非技术事项交商务。result紧凑12行，900字以内。无需再次读取同一文件。\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n本组采购原文，冲突时以原文为准，不只信上游转述：\\n\\n来源：request-03.md；SHA-256：0bff8815a8ac17028d12074c3ea9350e48d5c9a278945725dbae06305b4edfe8\\n# 合成演示采购需求 · 第 03 章 执行与审计\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R13\\n\\n需要运行、模型调用和工具调用的关联记录；每项结论须说明证据来自哪个版本。\\n\\n## R14\\n\\n外部调用前须有审计预写；审计失败不得继续派发，须提交相应失败注入证据。\\n\\n## R15\\n\\n有持久任务时，中断恢复须复用已确认结果；外部动作结果未知时禁止自动重放。\\n\\n## R16\\n\\n管理变更要能查到操作者和结果；页面出现成功提示不能替代审计终态。\\n\\n## R17\\n\\n工具执行应有权限检查与执行接口分离，并对不被允许的命令提供零执行证据。\\n\\n## R18\\n\\n要求任务预算和截止时间控制；不可用模型的单次上限冒充整个长任务累计上限。\\n\\n\\n来源：request-04.md；SHA-256：d60da3703755183a9ef09f94f2ec1b5b08480c5630de6384ad6a8b2f9b113ea2\\n# 合成演示采购需求 · 第 04 章 性能与运营\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R19\\n\\n验收目标：40 个同时在线用户、12 个并发任务；当前未提供压测报告，状态应为待验证。\\n\\n## R20\\n\\n接口首响应 P95 目标为 3 秒；非流式响应的首响应等待不得标成首 token 延迟。\\n\\n## R21\\n\\n非外部依赖故障的月度服务可用率目标 99.5%；目标不等于当前已实测达到。\\n\\n## R22\\n\\n故障处置要求 30 分钟响应、6 小时内提供恢复或替代方案；需要供应商书面承诺。\\n\\n## R23\\n\\n试运行要求连续 21 天；测试通过和演示完成都不等于项目终验。\\n\\n## R24\\n\\n须拆分模型调用、工具调用及总墙钟耗时；重叠区间不能相加虚增总耗时。\\n"
+        },
+        {
+          "target": "requirements_2_report",
+          "source": "outputs.requirements_2.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "technical_3"
+    },
+    {
+      "id": "technical_3",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-technical"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "对照上游12项与以下product-main.md冻结全文，逐项给编号、状态、能力或证据缺口、来源、补证角色。采购期望不是测评证明。非技术事项交商务。result紧凑12行，900字以内。无需再次读取同一文件。\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n本组采购原文，冲突时以原文为准，不只信上游转述：\\n\\n来源：request-05.md；SHA-256：7b78ce8e64c180970abf6e07c0cf720a52e18bf3cd774eb83d65775314180bc6\\n# 合成演示采购需求 · 第 05 章 安全与资质\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R25\\n\\n第一期使用基本管理 token；若承诺 SAML、OIDC 或 MFA，必须另有交付与测试证据。\\n\\n## R26\\n\\n须提交由有资质机构出具的安全评估报告；开源许可证不能替代认证或测评报告。\\n\\n## R27\\n\\n本例未提供厂商资质、人员证书或客户合同；这些材料统一列为待补，不得虚构。\\n\\n## R28\\n\\n平台传给外部模型的数据必须如实列明；私有部署不能解释为数据必不离开机器。\\n\\n## R29\\n\\n交付包要校验哈希和签名；部署者须从独立可信渠道取得公钥。\\n\\n## R30\\n\\n保留依赖许可清单，区分开源底座、第三方组件和本项目新增代码权利。\\n\\n\\n来源：request-06.md；SHA-256：c00ee2c2aab5d7f630a0a7d14dd69785c3b91ca9f1d19e69e4c4b187eafd3e5d\\n# 合成演示采购需求 · 第 06 章 计划与验收\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R31\\n\\nT0 为合同起算日；第 20 天完成需求确认，第 60 天完成集成测试，第 90 天申请终验；三者为累计里程碑，不相加。\\n\\n## R32\\n\\n资料包须包含需求追踪矩阵、部署说明、测试报告、备份恢复记录及待办清单。\\n\\n## R33\\n\\n里程碑验收由采购方签字；工作流的格式验收不代替采购方业务验收。\\n\\n## R34\\n\\n每项未满足要求须给出补证责任角色与下一行动；不能只写风险高低。\\n\\n## R35\\n\\n数据恢复目标：备份间隔不超过 12 小时，恢复演练在 4 小时内完成；没有报告时须待验证。\\n\\n## R36\\n\\n上线之前需使用本项目数据形态演练备份、恢复和失败回滚；已有通用脚本不能直接判通过。\\n"
+        },
+        {
+          "target": "requirements_3_report",
+          "source": "outputs.requirements_3.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "technical_4"
+    },
+    {
+      "id": "technical_4",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-technical"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "对照上游12项与以下product-main.md冻结全文，逐项给编号、状态、能力或证据缺口、来源、补证角色。采购期望不是测评证明。非技术事项交商务。result紧凑12行，900字以内。无需再次读取同一文件。\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n本组采购原文，冲突时以原文为准，不只信上游转述：\\n\\n来源：request-07.md；SHA-256：a0c46cbd2a368ad1fc06a0d89d44990d864453ac1f845462fb455a3bf9ed6e19\\n# 合成演示采购需求 · 第 07 章 商务约束\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R37\\n\\n预算上限为含税人民币 480000 元，包含实施与 18 个月维护；当前没有授权报价。\\n\\n## R38\\n\\n付款里程碑为需求确认 20%、初验 40%、终验 30%、维护结束 10%；须说明尾款影响。\\n\\n## R39\\n\\n外部模型费用单列按量结算，不得假称免费或包含无限量 token。\\n\\n## R40\\n\\n计划投入 4 名实施人员；本例未提供真实人员名单，不得把 4 个 Agent 写成人力证明。\\n\\n## R41\\n\\n任何对客户的时限、价格和赔偿承诺均需人工审批；准备包只给建议，不自动对外提交。\\n\\n## R42\\n\\n现有产品与第三方许可不作无条件转让承诺；采购合同相关条款交人工审阅。\\n\\n\\n来源：request-08.md；SHA-256：0bf467d78f3cd8bfc83f20c60fc058e282aff843e24d97997a8f6dd52763e3bf\\n# 合成演示采购需求 · 第 08 章 评审与交接\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R43\\n\\n最终矩阵必须覆盖 R01–R48，逐项给出结论和来源；未读条目不得自动标成满足。\\n\\n## R44\\n\\n状态限定为有依据、部分有依据、待验证、待补材料、不适用；所有有依据须注明具体来源。\\n\\n## R45\\n\\n最终包包含技术、交付、商务三类风险，并区分阻断条件和一般建议。\\n\\n## R46\\n\\n不同专业意见冲突时保留双方来源，交最终复核列为待澄清，不擅自选较乐观结论。\\n\\n## R47\\n\\n合成经验卡不得成为客户业绩、资格或产品性能的证明；正文须显著标识演示性质。\\n\\n## R48\\n\\n最终交付是内部采购响应准备包；不得表述为已经中标、已对外提交或已通过法律审查。\\n"
+        },
+        {
+          "target": "requirements_4_report",
+          "source": "outputs.requirements_4.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "delivery_1"
+    },
+    {
+      "id": "delivery_1",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-delivery"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "复核本组12项：期限起算、维护/付款/人员/验收责任和缺证。逐项保留准确单位，当前文件优先旧经验。result紧凑12行，900字以内。合同履约事项不等于缺少软件模块；采购预算不是报价。商业材料只以以下登记为准，产品能力结论仍是待复核的上游意见。冻结全文无需再读：\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n\\n本组采购原文，冲突时以原文为准：\\n\\n来源：request-01.md；SHA-256：ebe6fd5f640e4d89430b436ef8f3de7e75b6d0c77a0638483bffeec2867d450f\\n# 合成演示采购需求 · 第 01 章 范围与部署\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R01\\n\\n采购单节点自托管企业 Agent 平台；第一期不采购多租户 SaaS。\\n\\n## R02\\n\\n平台应支持多个业务 Agent 分别配置，复用公共模型、工具、渠道与记忆。\\n\\n## R03\\n\\n服务程序以单 Go 二进制交付；外部数据库单独部署，不能把单二进制解释为无数据库。\\n\\n## R04\\n\\n本期目标操作系统为 Windows amd64 和 Linux amd64；另外架构的支持须单独举证。\\n\\n## R05\\n\\n允许容器单实例交付；不得承诺已有跨机高可用、滚动升级或 Kubernetes 多副本能力。\\n\\n## R06\\n\\n材料必须固定产品版本；开发中的工作流功能须单列候选能力，不计入已交付基线。\\n\\n\\n来源：request-02.md；SHA-256：a4675d1d3fc556d586f5efe656a7a5cc5c072aaee92d7519418120b531c7e281\\n# 合成演示采购需求 · 第 02 章 知识与经验\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R07\\n\\n须以原始文件版本和章节编号追溯知识库引用；检索相似不能替代原文核对。\\n\\n## R08\\n\\n提供知识集合读取边界，并以两个测试身份验证越权资料不会进入模型输入。\\n\\n## R09\\n\\n长期记忆须经确认后生效；本项目经验仅可给出提醒，不能覆盖当前采购文件。\\n\\n## R10\\n\\n本项目维护期为最终验收后 18 个月；旧经验卡中的 6 个月约定不适用于本项目。\\n\\n## R11\\n\\n投标准备阶段只处理本例合成资料与获许可公开产品材料，不导入真实客户隐私。\\n\\n## R12\\n\\n新产生经验只能输出待确认建议卡，不得由模型直接改写共享事实或确认自己的结论。\\n"
+        },
+        {
+          "target": "requirements_1_report",
+          "source": "outputs.requirements_1.report"
+        },
+        {
+          "target": "technical_1_report",
+          "source": "outputs.technical_1.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "delivery_2"
+    },
+    {
+      "id": "delivery_2",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-delivery"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "复核本组12项：期限起算、维护/付款/人员/验收责任和缺证。逐项保留准确单位，当前文件优先旧经验。result紧凑12行，900字以内。合同履约事项不等于缺少软件模块；采购预算不是报价。商业材料只以以下登记为准，产品能力结论仍是待复核的上游意见。冻结全文无需再读：\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n\\n本组采购原文，冲突时以原文为准：\\n\\n来源：request-03.md；SHA-256：0bff8815a8ac17028d12074c3ea9350e48d5c9a278945725dbae06305b4edfe8\\n# 合成演示采购需求 · 第 03 章 执行与审计\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R13\\n\\n需要运行、模型调用和工具调用的关联记录；每项结论须说明证据来自哪个版本。\\n\\n## R14\\n\\n外部调用前须有审计预写；审计失败不得继续派发，须提交相应失败注入证据。\\n\\n## R15\\n\\n有持久任务时，中断恢复须复用已确认结果；外部动作结果未知时禁止自动重放。\\n\\n## R16\\n\\n管理变更要能查到操作者和结果；页面出现成功提示不能替代审计终态。\\n\\n## R17\\n\\n工具执行应有权限检查与执行接口分离，并对不被允许的命令提供零执行证据。\\n\\n## R18\\n\\n要求任务预算和截止时间控制；不可用模型的单次上限冒充整个长任务累计上限。\\n\\n\\n来源：request-04.md；SHA-256：d60da3703755183a9ef09f94f2ec1b5b08480c5630de6384ad6a8b2f9b113ea2\\n# 合成演示采购需求 · 第 04 章 性能与运营\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R19\\n\\n验收目标：40 个同时在线用户、12 个并发任务；当前未提供压测报告，状态应为待验证。\\n\\n## R20\\n\\n接口首响应 P95 目标为 3 秒；非流式响应的首响应等待不得标成首 token 延迟。\\n\\n## R21\\n\\n非外部依赖故障的月度服务可用率目标 99.5%；目标不等于当前已实测达到。\\n\\n## R22\\n\\n故障处置要求 30 分钟响应、6 小时内提供恢复或替代方案；需要供应商书面承诺。\\n\\n## R23\\n\\n试运行要求连续 21 天；测试通过和演示完成都不等于项目终验。\\n\\n## R24\\n\\n须拆分模型调用、工具调用及总墙钟耗时；重叠区间不能相加虚增总耗时。\\n"
+        },
+        {
+          "target": "requirements_2_report",
+          "source": "outputs.requirements_2.report"
+        },
+        {
+          "target": "technical_2_report",
+          "source": "outputs.technical_2.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "delivery_3"
+    },
+    {
+      "id": "delivery_3",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-delivery"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "复核本组12项：期限起算、维护/付款/人员/验收责任和缺证。逐项保留准确单位，当前文件优先旧经验。result紧凑12行，900字以内。合同履约事项不等于缺少软件模块；采购预算不是报价。商业材料只以以下登记为准，产品能力结论仍是待复核的上游意见。冻结全文无需再读：\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n\\n本组采购原文，冲突时以原文为准：\\n\\n来源：request-05.md；SHA-256：7b78ce8e64c180970abf6e07c0cf720a52e18bf3cd774eb83d65775314180bc6\\n# 合成演示采购需求 · 第 05 章 安全与资质\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R25\\n\\n第一期使用基本管理 token；若承诺 SAML、OIDC 或 MFA，必须另有交付与测试证据。\\n\\n## R26\\n\\n须提交由有资质机构出具的安全评估报告；开源许可证不能替代认证或测评报告。\\n\\n## R27\\n\\n本例未提供厂商资质、人员证书或客户合同；这些材料统一列为待补，不得虚构。\\n\\n## R28\\n\\n平台传给外部模型的数据必须如实列明；私有部署不能解释为数据必不离开机器。\\n\\n## R29\\n\\n交付包要校验哈希和签名；部署者须从独立可信渠道取得公钥。\\n\\n## R30\\n\\n保留依赖许可清单，区分开源底座、第三方组件和本项目新增代码权利。\\n\\n\\n来源：request-06.md；SHA-256：c00ee2c2aab5d7f630a0a7d14dd69785c3b91ca9f1d19e69e4c4b187eafd3e5d\\n# 合成演示采购需求 · 第 06 章 计划与验收\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R31\\n\\nT0 为合同起算日；第 20 天完成需求确认，第 60 天完成集成测试，第 90 天申请终验；三者为累计里程碑，不相加。\\n\\n## R32\\n\\n资料包须包含需求追踪矩阵、部署说明、测试报告、备份恢复记录及待办清单。\\n\\n## R33\\n\\n里程碑验收由采购方签字；工作流的格式验收不代替采购方业务验收。\\n\\n## R34\\n\\n每项未满足要求须给出补证责任角色与下一行动；不能只写风险高低。\\n\\n## R35\\n\\n数据恢复目标：备份间隔不超过 12 小时，恢复演练在 4 小时内完成；没有报告时须待验证。\\n\\n## R36\\n\\n上线之前需使用本项目数据形态演练备份、恢复和失败回滚；已有通用脚本不能直接判通过。\\n"
+        },
+        {
+          "target": "requirements_3_report",
+          "source": "outputs.requirements_3.report"
+        },
+        {
+          "target": "technical_3_report",
+          "source": "outputs.technical_3.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "delivery_4"
+    },
+    {
+      "id": "delivery_4",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-delivery"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "复核本组12项：期限起算、维护/付款/人员/验收责任和缺证。逐项保留准确单位，当前文件优先旧经验。result紧凑12行，900字以内。合同履约事项不等于缺少软件模块；采购预算不是报价。商业材料只以以下登记为准，产品能力结论仍是待复核的上游意见。冻结全文无需再读：\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n\\n本组采购原文，冲突时以原文为准：\\n\\n来源：request-07.md；SHA-256：a0c46cbd2a368ad1fc06a0d89d44990d864453ac1f845462fb455a3bf9ed6e19\\n# 合成演示采购需求 · 第 07 章 商务约束\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R37\\n\\n预算上限为含税人民币 480000 元，包含实施与 18 个月维护；当前没有授权报价。\\n\\n## R38\\n\\n付款里程碑为需求确认 20%、初验 40%、终验 30%、维护结束 10%；须说明尾款影响。\\n\\n## R39\\n\\n外部模型费用单列按量结算，不得假称免费或包含无限量 token。\\n\\n## R40\\n\\n计划投入 4 名实施人员；本例未提供真实人员名单，不得把 4 个 Agent 写成人力证明。\\n\\n## R41\\n\\n任何对客户的时限、价格和赔偿承诺均需人工审批；准备包只给建议，不自动对外提交。\\n\\n## R42\\n\\n现有产品与第三方许可不作无条件转让承诺；采购合同相关条款交人工审阅。\\n\\n\\n来源：request-08.md；SHA-256：0bf467d78f3cd8bfc83f20c60fc058e282aff843e24d97997a8f6dd52763e3bf\\n# 合成演示采购需求 · 第 08 章 评审与交接\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R43\\n\\n最终矩阵必须覆盖 R01–R48，逐项给出结论和来源；未读条目不得自动标成满足。\\n\\n## R44\\n\\n状态限定为有依据、部分有依据、待验证、待补材料、不适用；所有有依据须注明具体来源。\\n\\n## R45\\n\\n最终包包含技术、交付、商务三类风险，并区分阻断条件和一般建议。\\n\\n## R46\\n\\n不同专业意见冲突时保留双方来源，交最终复核列为待澄清，不擅自选较乐观结论。\\n\\n## R47\\n\\n合成经验卡不得成为客户业绩、资格或产品性能的证明；正文须显著标识演示性质。\\n\\n## R48\\n\\n最终交付是内部采购响应准备包；不得表述为已经中标、已对外提交或已通过法律审查。\\n"
+        },
+        {
+          "target": "requirements_4_report",
+          "source": "outputs.requirements_4.report"
+        },
+        {
+          "target": "technical_4_report",
+          "source": "outputs.technical_4.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "review_1"
+    },
+    {
+      "id": "review_1",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-reviewer"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "独立复核下列12条原始要求与上游意见。严格按output_schema输出report：result和statuses各含且仅含本组12个R编号。result每项按‘依据：…；缺口：…；责任：…；行动：…’四段填写，尽量80字以内；每段不可空白。statuses逐项用规定五状态。采购期望不能当产品证明；原文将由报告器原样展示，不必改写数字和条款。每项仍须真实核查，不能靠复制原文算完成。不得把合同履约事项改成缺少某个软件模块；已有付款触发条件不可说缺失。区分真实公开产品基线与合成经验。sources只引用本次实际输入或读到的资料，产品全文无此声明时不可写成直接引文。open_questions保留不确定项。\\n\\n来源：request-01.md；SHA-256：ebe6fd5f640e4d89430b436ef8f3de7e75b6d0c77a0638483bffeec2867d450f\\n# 合成演示采购需求 · 第 01 章 范围与部署\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R01\\n\\n采购单节点自托管企业 Agent 平台；第一期不采购多租户 SaaS。\\n\\n## R02\\n\\n平台应支持多个业务 Agent 分别配置，复用公共模型、工具、渠道与记忆。\\n\\n## R03\\n\\n服务程序以单 Go 二进制交付；外部数据库单独部署，不能把单二进制解释为无数据库。\\n\\n## R04\\n\\n本期目标操作系统为 Windows amd64 和 Linux amd64；另外架构的支持须单独举证。\\n\\n## R05\\n\\n允许容器单实例交付；不得承诺已有跨机高可用、滚动升级或 Kubernetes 多副本能力。\\n\\n## R06\\n\\n材料必须固定产品版本；开发中的工作流功能须单列候选能力，不计入已交付基线。\\n\\n\\n来源：request-02.md；SHA-256：a4675d1d3fc556d586f5efe656a7a5cc5c072aaee92d7519418120b531c7e281\\n# 合成演示采购需求 · 第 02 章 知识与经验\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R07\\n\\n须以原始文件版本和章节编号追溯知识库引用；检索相似不能替代原文核对。\\n\\n## R08\\n\\n提供知识集合读取边界，并以两个测试身份验证越权资料不会进入模型输入。\\n\\n## R09\\n\\n长期记忆须经确认后生效；本项目经验仅可给出提醒，不能覆盖当前采购文件。\\n\\n## R10\\n\\n本项目维护期为最终验收后 18 个月；旧经验卡中的 6 个月约定不适用于本项目。\\n\\n## R11\\n\\n投标准备阶段只处理本例合成资料与获许可公开产品材料，不导入真实客户隐私。\\n\\n## R12\\n\\n新产生经验只能输出待确认建议卡，不得由模型直接改写共享事实或确认自己的结论。\\n\\n以下是独立复核的冻结原文。上游模型意见不是新的事实来源。公开基线只证明明确写出的能力，未写出不等于已证明不支持；企业登记是合成案例。\\n\\n来源：product-main.md；SHA-256：13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n"
+        },
+        {
+          "target": "technical_1_report",
+          "source": "outputs.technical_1.report"
+        },
+        {
+          "target": "delivery_1_report",
+          "source": "outputs.delivery_1.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object",
+                "properties": {
+                  "R01": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R02": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R03": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R04": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R05": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R06": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R07": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R08": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R09": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R10": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R11": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R12": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "R01",
+                  "R02",
+                  "R03",
+                  "R04",
+                  "R05",
+                  "R06",
+                  "R07",
+                  "R08",
+                  "R09",
+                  "R10",
+                  "R11",
+                  "R12"
+                ],
+                "additionalProperties": false
+              },
+              "statuses": {
+                "type": "object",
+                "properties": {
+                  "R01": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R02": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R03": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R04": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R05": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R06": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R07": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R08": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R09": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R10": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R11": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R12": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  }
+                },
+                "required": [
+                  "R01",
+                  "R02",
+                  "R03",
+                  "R04",
+                  "R05",
+                  "R06",
+                  "R07",
+                  "R08",
+                  "R09",
+                  "R10",
+                  "R11",
+                  "R12"
+                ],
+                "additionalProperties": false
+              },
+              "sources": {
+                "type": "string",
+                "minLength": 1
+              },
+              "open_questions": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "result",
+              "statuses",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "review_2"
+    },
+    {
+      "id": "review_2",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-reviewer"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "独立复核下列12条原始要求与上游意见。严格按output_schema输出report：result和statuses各含且仅含本组12个R编号。result每项按‘依据：…；缺口：…；责任：…；行动：…’四段填写，尽量80字以内；每段不可空白。statuses逐项用规定五状态。采购期望不能当产品证明；原文将由报告器原样展示，不必改写数字和条款。每项仍须真实核查，不能靠复制原文算完成。不得把合同履约事项改成缺少某个软件模块；已有付款触发条件不可说缺失。区分真实公开产品基线与合成经验。sources只引用本次实际输入或读到的资料，产品全文无此声明时不可写成直接引文。open_questions保留不确定项。\\n\\n来源：request-03.md；SHA-256：0bff8815a8ac17028d12074c3ea9350e48d5c9a278945725dbae06305b4edfe8\\n# 合成演示采购需求 · 第 03 章 执行与审计\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R13\\n\\n需要运行、模型调用和工具调用的关联记录；每项结论须说明证据来自哪个版本。\\n\\n## R14\\n\\n外部调用前须有审计预写；审计失败不得继续派发，须提交相应失败注入证据。\\n\\n## R15\\n\\n有持久任务时，中断恢复须复用已确认结果；外部动作结果未知时禁止自动重放。\\n\\n## R16\\n\\n管理变更要能查到操作者和结果；页面出现成功提示不能替代审计终态。\\n\\n## R17\\n\\n工具执行应有权限检查与执行接口分离，并对不被允许的命令提供零执行证据。\\n\\n## R18\\n\\n要求任务预算和截止时间控制；不可用模型的单次上限冒充整个长任务累计上限。\\n\\n\\n来源：request-04.md；SHA-256：d60da3703755183a9ef09f94f2ec1b5b08480c5630de6384ad6a8b2f9b113ea2\\n# 合成演示采购需求 · 第 04 章 性能与运营\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R19\\n\\n验收目标：40 个同时在线用户、12 个并发任务；当前未提供压测报告，状态应为待验证。\\n\\n## R20\\n\\n接口首响应 P95 目标为 3 秒；非流式响应的首响应等待不得标成首 token 延迟。\\n\\n## R21\\n\\n非外部依赖故障的月度服务可用率目标 99.5%；目标不等于当前已实测达到。\\n\\n## R22\\n\\n故障处置要求 30 分钟响应、6 小时内提供恢复或替代方案；需要供应商书面承诺。\\n\\n## R23\\n\\n试运行要求连续 21 天；测试通过和演示完成都不等于项目终验。\\n\\n## R24\\n\\n须拆分模型调用、工具调用及总墙钟耗时；重叠区间不能相加虚增总耗时。\\n\\n以下是独立复核的冻结原文。上游模型意见不是新的事实来源。公开基线只证明明确写出的能力，未写出不等于已证明不支持；企业登记是合成案例。\\n\\n来源：product-main.md；SHA-256：13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n"
+        },
+        {
+          "target": "technical_2_report",
+          "source": "outputs.technical_2.report"
+        },
+        {
+          "target": "delivery_2_report",
+          "source": "outputs.delivery_2.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object",
+                "properties": {
+                  "R13": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R14": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R15": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R16": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R17": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R18": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R19": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R20": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R21": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R22": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R23": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R24": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "R13",
+                  "R14",
+                  "R15",
+                  "R16",
+                  "R17",
+                  "R18",
+                  "R19",
+                  "R20",
+                  "R21",
+                  "R22",
+                  "R23",
+                  "R24"
+                ],
+                "additionalProperties": false
+              },
+              "statuses": {
+                "type": "object",
+                "properties": {
+                  "R13": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R14": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R15": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R16": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R17": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R18": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R19": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R20": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R21": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R22": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R23": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R24": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  }
+                },
+                "required": [
+                  "R13",
+                  "R14",
+                  "R15",
+                  "R16",
+                  "R17",
+                  "R18",
+                  "R19",
+                  "R20",
+                  "R21",
+                  "R22",
+                  "R23",
+                  "R24"
+                ],
+                "additionalProperties": false
+              },
+              "sources": {
+                "type": "string",
+                "minLength": 1
+              },
+              "open_questions": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "result",
+              "statuses",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "review_3"
+    },
+    {
+      "id": "review_3",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-reviewer"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "独立复核下列12条原始要求与上游意见。严格按output_schema输出report：result和statuses各含且仅含本组12个R编号。result每项按‘依据：…；缺口：…；责任：…；行动：…’四段填写，尽量80字以内；每段不可空白。statuses逐项用规定五状态。采购期望不能当产品证明；原文将由报告器原样展示，不必改写数字和条款。每项仍须真实核查，不能靠复制原文算完成。不得把合同履约事项改成缺少某个软件模块；已有付款触发条件不可说缺失。区分真实公开产品基线与合成经验。sources只引用本次实际输入或读到的资料，产品全文无此声明时不可写成直接引文。open_questions保留不确定项。\\n\\n来源：request-05.md；SHA-256：7b78ce8e64c180970abf6e07c0cf720a52e18bf3cd774eb83d65775314180bc6\\n# 合成演示采购需求 · 第 05 章 安全与资质\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R25\\n\\n第一期使用基本管理 token；若承诺 SAML、OIDC 或 MFA，必须另有交付与测试证据。\\n\\n## R26\\n\\n须提交由有资质机构出具的安全评估报告；开源许可证不能替代认证或测评报告。\\n\\n## R27\\n\\n本例未提供厂商资质、人员证书或客户合同；这些材料统一列为待补，不得虚构。\\n\\n## R28\\n\\n平台传给外部模型的数据必须如实列明；私有部署不能解释为数据必不离开机器。\\n\\n## R29\\n\\n交付包要校验哈希和签名；部署者须从独立可信渠道取得公钥。\\n\\n## R30\\n\\n保留依赖许可清单，区分开源底座、第三方组件和本项目新增代码权利。\\n\\n\\n来源：request-06.md；SHA-256：c00ee2c2aab5d7f630a0a7d14dd69785c3b91ca9f1d19e69e4c4b187eafd3e5d\\n# 合成演示采购需求 · 第 06 章 计划与验收\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R31\\n\\nT0 为合同起算日；第 20 天完成需求确认，第 60 天完成集成测试，第 90 天申请终验；三者为累计里程碑，不相加。\\n\\n## R32\\n\\n资料包须包含需求追踪矩阵、部署说明、测试报告、备份恢复记录及待办清单。\\n\\n## R33\\n\\n里程碑验收由采购方签字；工作流的格式验收不代替采购方业务验收。\\n\\n## R34\\n\\n每项未满足要求须给出补证责任角色与下一行动；不能只写风险高低。\\n\\n## R35\\n\\n数据恢复目标：备份间隔不超过 12 小时，恢复演练在 4 小时内完成；没有报告时须待验证。\\n\\n## R36\\n\\n上线之前需使用本项目数据形态演练备份、恢复和失败回滚；已有通用脚本不能直接判通过。\\n\\n以下是独立复核的冻结原文。上游模型意见不是新的事实来源。公开基线只证明明确写出的能力，未写出不等于已证明不支持；企业登记是合成案例。\\n\\n来源：product-main.md；SHA-256：13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n"
+        },
+        {
+          "target": "technical_3_report",
+          "source": "outputs.technical_3.report"
+        },
+        {
+          "target": "delivery_3_report",
+          "source": "outputs.delivery_3.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object",
+                "properties": {
+                  "R25": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R26": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R27": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R28": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R29": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R30": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R31": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R32": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R33": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R34": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R35": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R36": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "R25",
+                  "R26",
+                  "R27",
+                  "R28",
+                  "R29",
+                  "R30",
+                  "R31",
+                  "R32",
+                  "R33",
+                  "R34",
+                  "R35",
+                  "R36"
+                ],
+                "additionalProperties": false
+              },
+              "statuses": {
+                "type": "object",
+                "properties": {
+                  "R25": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R26": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R27": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R28": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R29": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R30": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R31": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R32": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R33": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R34": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R35": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R36": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  }
+                },
+                "required": [
+                  "R25",
+                  "R26",
+                  "R27",
+                  "R28",
+                  "R29",
+                  "R30",
+                  "R31",
+                  "R32",
+                  "R33",
+                  "R34",
+                  "R35",
+                  "R36"
+                ],
+                "additionalProperties": false
+              },
+              "sources": {
+                "type": "string",
+                "minLength": 1
+              },
+              "open_questions": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "result",
+              "statuses",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "review_4"
+    },
+    {
+      "id": "review_4",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-reviewer"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "独立复核下列12条原始要求与上游意见。严格按output_schema输出report：result和statuses各含且仅含本组12个R编号。result每项按‘依据：…；缺口：…；责任：…；行动：…’四段填写，尽量80字以内；每段不可空白。statuses逐项用规定五状态。采购期望不能当产品证明；原文将由报告器原样展示，不必改写数字和条款。每项仍须真实核查，不能靠复制原文算完成。不得把合同履约事项改成缺少某个软件模块；已有付款触发条件不可说缺失。区分真实公开产品基线与合成经验。sources只引用本次实际输入或读到的资料，产品全文无此声明时不可写成直接引文。open_questions保留不确定项。\\n\\n来源：request-07.md；SHA-256：a0c46cbd2a368ad1fc06a0d89d44990d864453ac1f845462fb455a3bf9ed6e19\\n# 合成演示采购需求 · 第 07 章 商务约束\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R37\\n\\n预算上限为含税人民币 480000 元，包含实施与 18 个月维护；当前没有授权报价。\\n\\n## R38\\n\\n付款里程碑为需求确认 20%、初验 40%、终验 30%、维护结束 10%；须说明尾款影响。\\n\\n## R39\\n\\n外部模型费用单列按量结算，不得假称免费或包含无限量 token。\\n\\n## R40\\n\\n计划投入 4 名实施人员；本例未提供真实人员名单，不得把 4 个 Agent 写成人力证明。\\n\\n## R41\\n\\n任何对客户的时限、价格和赔偿承诺均需人工审批；准备包只给建议，不自动对外提交。\\n\\n## R42\\n\\n现有产品与第三方许可不作无条件转让承诺；采购合同相关条款交人工审阅。\\n\\n\\n来源：request-08.md；SHA-256：0bf467d78f3cd8bfc83f20c60fc058e282aff843e24d97997a8f6dd52763e3bf\\n# 合成演示采购需求 · 第 08 章 评审与交接\\n\\n项目 SYN-AI-2026，版本 1。不是现实招标，不存在真实采购方。条款编号是来源锚点。\\n\\n## R43\\n\\n最终矩阵必须覆盖 R01–R48，逐项给出结论和来源；未读条目不得自动标成满足。\\n\\n## R44\\n\\n状态限定为有依据、部分有依据、待验证、待补材料、不适用；所有有依据须注明具体来源。\\n\\n## R45\\n\\n最终包包含技术、交付、商务三类风险，并区分阻断条件和一般建议。\\n\\n## R46\\n\\n不同专业意见冲突时保留双方来源，交最终复核列为待澄清，不擅自选较乐观结论。\\n\\n## R47\\n\\n合成经验卡不得成为客户业绩、资格或产品性能的证明；正文须显著标识演示性质。\\n\\n## R48\\n\\n最终交付是内部采购响应准备包；不得表述为已经中标、已对外提交或已通过法律审查。\\n\\n以下是独立复核的冻结原文。上游模型意见不是新的事实来源。公开基线只证明明确写出的能力，未写出不等于已证明不支持；企业登记是合成案例。\\n\\n来源：product-main.md；SHA-256：13141868987fdb2bc7cf762e84b7967fc557107b092c45a147fbec09e9ac2fc1\\n# Basalt 已交付公开基线\\n\\n来源 main commit \`ca9a0d29f185a548b14b595e6068c52df1c3cdf4\` 的 README；不含 US19 候选实现。以下保留原文。\\n\\n<!-- markdownlint-configure-file {\\"MD041\\":false,\\"MD033\\":{\\"allowed_elements\\":[\\"a\\",\\"details\\",\\"div\\",\\"img\\",\\"summary\\"]}} -->\\n\\n<div align=\\"center\\">\\n\\n<img src=\\"website/public/brand/favicon.svg\\" width=\\"48\\" height=\\"52\\" alt=\\"\\">\\n\\n# Basalt\\n\\n**A self-hosted Agent OS for enterprise teams.**\\n\\nIndependent agents. Shared infrastructure.\\n\\n[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)\\n\\n</div>\\n\\n## Why Basalt\\n\\n- **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.\\n- **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.\\n- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.\\n- **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.\\n- **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the \`vector\` and \`pg_trgm\` extensions, which you run yourself; no Node service at runtime.\\n\\nFor example, configure daily-report for scheduled briefings and file-review for permitted workspace checks. They reuse the platform while keeping separate configurations, sessions and memory.\\n\\n## Architecture\\n\\n![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)\\n\\nThe current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.\\n\\n## Quick start\\n\\nFor a source build, use Git and the Go toolchain declared in go.mod. You also need a reachable PostgreSQL 16/17 instance with the \`vector\` extension (pgvector) and \`pg_trgm\`, plus a database for Basalt — the runtime refuses to start when either extension is missing and never falls back to an embedded store. A compatible model endpoint, model name and API key are needed for agent runs. If you already have a built binary, put it on PATH and skip the build; running the binary needs neither Go nor Node.\\n\\n### Run with Docker instead\\n\\nA single-instance Compose unit lives in [\`docker/\`](docker/). It runs the official linux/amd64 image (Go binary with the embedded console) plus PostgreSQL/pgvector with the required extensions; nothing is built or downloaded at startup.\\n\\n\`\`\`sh\\ncp docker/.env.example docker/.env   # set BASALT_IMAGE=basalt:<version>@sha256:<digest> and the six ingress limits\\nsudo sh docker/init-secrets.sh docker/secrets\\ncd docker && docker compose -p basalt up -d --wait\\n\`\`\`\\n\\nThe first start seeds the configuration into the workspace volume and generates the management token in the private volume. Read it with \`docker compose -p basalt exec basalt sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'\`, then open the [local console](http://127.0.0.1:8080/console/). Image build and verification, backup/restore, upgrade and rollback are documented in [Operations](docs/Operations.md). Never run \`docker compose down -v\` against a real instance: it deletes the volumes that hold the identity and the management token.\\n\\n### 1. Build\\n\\n\`\`\`sh\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\nCGO_ENABLED=0 go build -trimpath -o bin/basalt ./cmd/basalt\\nexport PATH=\\"$PWD/bin:$PATH\\"\\n\`\`\`\\n\\n<details>\\n\\n<summary>Windows PowerShell build</summary>\\n\\n\`\`\`powershell\\ngit clone https://github.com/ymedword/basalt.git\\ncd basalt\\n$env:CGO_ENABLED = \\"0\\"\\ngo build -trimpath -o bin\\\\basalt.exe ./cmd/basalt\\n$env:PATH = \\"$PWD\\\\bin;$env:PATH\\"\\n\`\`\`\\n\\n</details>\\n\\n### 2. Configure the model and management access\\n\\nExpand the minimal configuration below, create basalt.yaml in the current directory, and set the environment variables it references.\\n\\n<details>\\n\\n<summary>Minimal configuration and environment variables (POSIX / PowerShell)</summary>\\n\\n\`\`\`yaml\\ndatabase:\\n  dsn: \${BASALT_DATABASE_DSN}\\nproviders:\\n  - name: primary\\n    base_url: https://api.deepseek.com\\n    credential_mode: env\\n    api_key: \${BASALT_MODEL_KEY}\\n    default_model: deepseek-chat\\nhttp:\\n  addr: 127.0.0.1:8080\\n  admin_auth:\\n    mode: token\\n    token: \${BASALT_ADMIN_TOKEN}\\n\`\`\`\\n\\n\`database.dsn\` is mandatory: an unset or unresolved \`\${...}\` placeholder is treated as an empty value and startup is refused. The template that a fresh first start generates carries the same placeholder — it only reserves the key, it does not mean a database is already available.\\n\\n#### POSIX environment\\n\\n\`\`\`sh\\nexport BASALT_DATABASE_DSN=\\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\nexport BASALT_MODEL_KEY=\\"your-own-model-key\\"\\nexport BASALT_ADMIN_TOKEN=\\"$(openssl rand -hex 32)\\"\\n\`\`\`\\n\\n#### PowerShell environment\\n\\n\`\`\`powershell\\n$env:BASALT_DATABASE_DSN = \\"postgres://basalt:<password>@127.0.0.1:5432/basalt?sslmode=disable\\"\\n$env:BASALT_MODEL_KEY = \\"your-own-model-key\\"\\n$bytes = New-Object byte[] 32\\n$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()\\ntry { $rng.GetBytes($bytes) } finally { $rng.Dispose() }\\n$env:BASALT_ADMIN_TOKEN = [Convert]::ToBase64String($bytes)\\n\`\`\`\\n\\nReplace the example key with your own value and adjust the endpoint/model for your service. Keep environment-variable references in the configuration file.\\n\\n</details>\\n\\n### 3. Create and run your first agent\\n\\n<!-- quickstart-commands:start -->\\n\\n\`\`\`sh\\nbasalt init\\nbasalt profile create demo\\nbasalt profile list\\n\`\`\`\\n\\nA new agent is disabled. registered=true only means its definition loaded. Start management next to configure the actual model and enable the agent.\\n\\n\`\`\`sh\\nbasalt serve\\n\`\`\`\\n\\nOpen the [local console](http://127.0.0.1:8080/console/) and enter the management token generated above:\\n\\n1. Open demo in Agents, select its configuration, choose the primary model connection and enter the actual model ID.\\n2. Save, return to the Agent workspace, enable the agent and confirm.\\n3. Press Ctrl+C to stop the server and release the workspace lock before CLI chat.\\n\\n\`\`\`sh\\nbasalt chat --agent demo --message \\"Hello\\"\\nbasalt session list\\n\`\`\`\\n\\n<!-- quickstart-commands:end -->\\n\\n[The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.\\n\\n## Templates & demos\\n\\n\`examples/\` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.\\n\\n| Daily agent | What it produces | Needs |\\n| --- | --- | --- |\\n| [daily/github-radar](examples/daily/github-radar/) | Star deltas and new projects for a topic, de-duplicated against the previous run | GitHub MCP server and a personal access token |\\n| [daily/repo-digest](examples/daily/repo-digest/) | Pull request, issue and release counts with follow-up items, delivered by its schedule | GitHub MCP server and a personal access token |\\n| [daily/biz-daily](examples/daily/biz-daily/) | Business metrics from a read-only SQLite sample, with data-quality counts | DBHub over SQLite |\\n| [daily/docs-diff](examples/daily/docs-diff/) | Added, modified and deleted documents with a content hash each | Bundled read-only MCP server |\\n| [daily/industry-brief](examples/daily/industry-brief/) | Briefing with a source table of URL, title, date and access time | Built-in web search (DeepSeek Search API) and the Fetch MCP server |\\n\\nThe eight templates cover smaller domains: weather, arXiv, policy pages, support tickets, onboarding docs, dependencies, web changes and startup funding. Six are complete and replayable from fixtures (tier A), one also needs the Playwright browser (tier A*, and it stays A* while that dependency is missing), and one is a configuration recipe only (tier B, not claimed to run). [The examples index](examples/README.md) lists every directory with its tier, dependencies and evidence status.\\n\\n## MCP catalog\\n\\nThe console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read-only Filesystem and DBHub. Each entry shows the transport, the command or URL, the environment variables it needs, its dependencies and its known limits. \\"Add to configuration\\" prefills the form; it never saves on its own.\\n\\nSaving, publishing or rolling back an MCP configuration fails closed when a referenced environment variable is missing or empty: the request returns 503 with an operation ID, and neither the file, the published version nor the pointer changes. A recipe that has not been exercised on your machine says so; the catalog shows no \\"verified\\" badge for it. Reading the catalog starts no process, installs nothing and writes no operation record.\\n\\n## Run a demo\\n\\n1. Copy an agent directory into the workspace:\\n\\n   \`\`\`sh\\n   cp -r examples/daily/github-radar .basalt/agents/github-radar\\n   \`\`\`\\n\\n2. Follow that directory's setup notes: model connection and model ID, notification channel, MCP command and environment variables. Every credential stays a \`\${VAR}\` reference.\\n3. Add the MCP server command to your workspace command allowlist yourself; the examples never widen it for you.\\n4. Start \`basalt serve\` and enable the agent.\\n5. Trigger the schedule from the console or the management API. A manual run is recorded with \`trigger=manual\`: it is evidence of a working agent, but not evidence that the schedule fired by itself.\\n\\nThe demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.\\n\\n## What is verified\\n\\nTwo kinds of claim live in this repository, and they are not interchangeable:\\n\\n| Claim | What it means | Where it is checked |\\n| --- | --- | --- |\\n| Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | \`make example-tests\`, plus the release end-to-end suite |\\n| Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |\\n\\nA successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. \`make check\` runs the local gate, \`make e2e\` runs the release scenarios against the built binary, and \`make example-tests\` runs the bundled MCP server tests plus every demo script's unit tests.\\n\\n## Documentation\\n\\n| Your goal | Start here |\\n| --- | --- |\\n| Understand the Agent OS, current scope and direction | [Product documentation](https://ymedword.github.io/basalt/docs/) |\\n| Build, configure and run an agent | [Quickstart](https://ymedword.github.io/basalt/quickstart/) |\\n| Explore detailed architecture and execution | [Architecture](https://ymedword.github.io/basalt/architecture/) |\\n| Deploy, authenticate, back up and upgrade | [Operations](docs/Operations.md) |\\n| Look up configuration and API contracts | [Configuration example](basalt.yaml.example) · [HTTP API](docs/contracts/openapi.yaml) |\\n\\nThe management token provides basic management authentication. Operations and architecture documentation explain remote access, model data flows and tool permissions.\\n\\n## License\\n\\nOriginal Basalt content is licensed under the [Apache License 2.0](LICENSE). Third-party components remain under their own licenses; see [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for attribution and the notices included in distributions.\\n\\n## Feedback and contributions\\n\\nUse [GitHub Issues](https://github.com/ymedword/basalt/issues) for bugs and proposals. Include your platform, reproduction steps and relevant error messages.\\n\\n来源：commercial-synthetic.md；SHA-256：ce3c3471095fe664ae13ba17d25f645e911e51cfb22dc54c2134e5862e8de26f\\n# 合成演示企业材料登记 v1\\n\\n仅供演示，不代表 Basalt 开发者或任何真实企业。现有材料只有公开产品说明，没有真实报价、员工名单、证书、客户合同、性能测试或供应商信用证明。\\n预算和期望团队规模来自采购要求，不是供应商承诺。标前责任角色：技术负责人补实现/测试证据；交付负责人补计划/恢复演练；商务负责人补报价及付款影响；人工最终审批。\\n“平台可自托管”不是安全认证、等保或服务SLA。4个Agent不能证明4名实施人员。计划形成材料不等于材料已交付。\\n"
+        },
+        {
+          "target": "technical_4_report",
+          "source": "outputs.technical_4.report"
+        },
+        {
+          "target": "delivery_4_report",
+          "source": "outputs.delivery_4.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object",
+                "properties": {
+                  "R37": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R38": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R39": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R40": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R41": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R42": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R43": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R44": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R45": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R46": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R47": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "R48": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "R37",
+                  "R38",
+                  "R39",
+                  "R40",
+                  "R41",
+                  "R42",
+                  "R43",
+                  "R44",
+                  "R45",
+                  "R46",
+                  "R47",
+                  "R48"
+                ],
+                "additionalProperties": false
+              },
+              "statuses": {
+                "type": "object",
+                "properties": {
+                  "R37": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R38": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R39": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R40": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R41": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R42": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R43": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R44": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R45": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R46": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R47": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  },
+                  "R48": {
+                    "type": "string",
+                    "enum": [
+                      "有依据",
+                      "部分有依据",
+                      "待验证",
+                      "待补材料",
+                      "不适用"
+                    ]
+                  }
+                },
+                "required": [
+                  "R37",
+                  "R38",
+                  "R39",
+                  "R40",
+                  "R41",
+                  "R42",
+                  "R43",
+                  "R44",
+                  "R45",
+                  "R46",
+                  "R47",
+                  "R48"
+                ],
+                "additionalProperties": false
+              },
+              "sources": {
+                "type": "string",
+                "minLength": 1
+              },
+              "open_questions": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "result",
+              "statuses",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      },
+      "next": "final_pack"
+    },
+    {
+      "id": "final_pack",
+      "kind": "agent",
+      "agent": {
+        "name": "bid-reviewer"
+      },
+      "inputs": [
+        {
+          "target": "request",
+          "source": "input.request"
+        },
+        {
+          "target": "instruction",
+          "literal": "基于四组完整矩阵生成内部准备包的决策摘要。result显著标明合成演示；列三类主要阻断、责任角色、下一行动及可继续/待补证的建议，不压缩重写48行矩阵。完整条款依据保留在review_1至review_4原Run的最终输出，作为准备包附件。sources保留四组来源版本与章节；open_questions汇总尚需人工确认的资质、报价、性能、维护等。摘要600字以内；不得宣称业务验收通过。"
+        },
+        {
+          "target": "review_1_report",
+          "source": "outputs.review_1.report"
+        },
+        {
+          "target": "review_2_report",
+          "source": "outputs.review_2.report"
+        },
+        {
+          "target": "review_3_report",
+          "source": "outputs.review_3.report"
+        },
+        {
+          "target": "review_4_report",
+          "source": "outputs.review_4.report"
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "string"
+              },
+              "open_questions": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "result",
+              "sources",
+              "open_questions"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "additionalProperties": false
+      },
+      "failure": {
+        "max_attempts": 1
+      }
+    }
+  ],
+  "contract": {
+    "contract_version": 1,
+    "goal": "覆盖48项采购要求，产出可追溯的内部采购响应准备包",
+    "constraints": [
+      "全部企业与采购材料均为合成演示，不能冒充真实客户。",
+      "不得虚构资质、报价、性能证明；当前采购条款优先于历史经验。",
+      "只输出内部准备材料，不对外提交、承诺或确认新的长期记忆。"
+    ],
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "additionalProperties": false
+    },
+    "output_schema": {
+      "type": "object",
+      "properties": {
+        "report": {
+          "type": "object",
+          "properties": {
+            "result": {
+              "type": "string"
+            },
+            "sources": {
+              "type": "string"
+            },
+            "open_questions": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "result",
+            "sources",
+            "open_questions"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "report"
+      ],
+      "additionalProperties": false
+    },
+    "budget": {
+      "max_total_tokens": 200000,
+      "max_tool_calls": 70,
+      "max_duration_seconds": 1800,
+      "max_depth": 3,
+      "max_children": 16,
+      "max_attempts_per_node": 1,
+      "max_revisions": 2
+    },
+    "artifact_spec": [
+      {
+        "id": "report",
+        "format": "json",
+        "required": true
+      }
+    ],
+    "acceptance": [
+      {
+        "id": "report-shape",
+        "version": 1,
+        "kind": "deterministic",
+        "target_kind": "artifact",
+        "target_id": "report",
+        "required": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "report": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "type": "string"
+                },
+                "sources": {
+                  "type": "string"
+                },
+                "open_questions": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "result",
+                "sources",
+                "open_questions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "report"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ],
+    "stop_conditions": [
+      "budget",
+      "deadline",
+      "unknown"
+    ],
+    "escalation": "保留证据缺口，交人工核对；格式通过不代表业务通过。"
+  }
+}
+`;function n(n){let r=e(t),i=[];for(let e of r.nodes){let t=e.agent.name,r=n.filter(e=>e.name===t),a=r.length===1?r[0]:void 0;!a?.eligible||!a.agent||a.agent.name!==t?i.includes(t)||i.push(t):e.agent={...a.agent}}return{text:i.length?``:JSON.stringify(r,null,2),missing:i}}export{n as procurementTemplate};

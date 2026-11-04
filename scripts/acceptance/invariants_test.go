@@ -191,22 +191,26 @@ func TestRepoInvariants_NoORM(t *testing.T) {
 }
 
 // TestRepoInvariants_TestOnlyDependencyNotLinked 守单二进制纪律的依赖最小化：
-// 测试专用坐标（技术栈句：santhosh-tekuri/jsonschema，仅 *_test.go 导入）不得进入发布二进制。
-// 双重判据：① 生产源码零导入；② `go list -deps ./cmd/basalt` 的依赖图零命中（传递引入也算）。
-// 逆改点：在生产代码 import santhosh-tekuri/jsonschema 即红（两层任一命中）。
-// Inverse probe: importing the test-only module from production code turns this red.
+// US19 已批准现有 jsonschema/v6 从测试扩展到唯一 tool Schema 适配器（plan P08）。
+// 其余生产位置仍零导入；版本仅 v6，testify 等测试框架仍不得链接。
+// The approved Flow adapter owns v6; any other production import remains forbidden.
 func TestRepoInvariants_TestOnlyDependencyNotLinked(t *testing.T) {
 	root := stageTestRoot(t)
 	const coord = "santhosh-tekuri/jsonschema"
 	hits := scanSurfaces(t, root, []string{"cmd", "internal"}, func(rel string) bool {
-		return strings.HasSuffix(path.Base(rel), "_test.go")
+		return strings.HasSuffix(path.Base(rel), "_test.go") || path.Clean(rel) == "internal/tool/schema.go"
 	}, func(line string) bool { return strings.Contains(line, coord) })
 	requireNoHits(t, hits,
-		"生产代码导入了测试专用依赖 %s（发布二进制只带必要依赖）", coord)
+		"批准的 Flow Schema 适配器以外导入了 %s", coord)
 
 	deps := runGoOutput(t, root, "list", "-deps", "-f", "{{.ImportPath}}", "./cmd/basalt")
-	require.NotContains(t, deps, coord,
-		"发布二进制依赖图包含测试专用依赖 %s（发布面只允许构建所需依赖）", coord)
+	require.Contains(t, deps, "github.com/santhosh-tekuri/jsonschema/v6\n", "批准的 Schema 适配器必须真实链接")
+	for _, dep := range strings.Fields(deps) {
+		if strings.Contains(dep, coord) {
+			require.True(t, dep == "github.com/santhosh-tekuri/jsonschema/v6" || strings.HasPrefix(dep, "github.com/santhosh-tekuri/jsonschema/v6/"), "不允许未批准 Schema 版本：%s", dep)
+		}
+	}
+	require.NotContains(t, deps, "github.com/stretchr/testify", "测试框架不得进入生产依赖图")
 }
 
 // TestRepoInvariants_CIRunDirsUnique 守 CI 运行目录跨运行 / 重试唯一：

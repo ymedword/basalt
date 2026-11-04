@@ -142,6 +142,10 @@ func mainRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	if err := offlineModelPolicy(checks, os.Getenv("GOFLAGS")); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	// D-01（US-16 / T125）：test-integration 与 cover 的判据是「连真实 PostgreSQL 跑」，
 	// 缺 BASALT_TEST_PG_DSN 即失败。起跑前给出单行可读错误与排查路径——否则提示会被
 	// 埋在逐 check 日志里，且要等整套测试跑完才看得到。新增 PG 依赖 check 时同步本表。
