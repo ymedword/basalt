@@ -57,10 +57,23 @@ func TestFlow_ContextKeepsHardConstraintsAndFailsClosed(t *testing.T) {
 			require.NoError(t, err)
 			rt.flows.authenticationReady()
 			require.NoError(t, rt.flows.Start(t.Context()))
+			t.Cleanup(func() {
+				if t.Failed() {
+					t.Logf("flow context mode=%s: last read status=%s reason=%s err=%v", mode, task.Status, task.Reason, err)
+				}
+			})
+			// 溢出样例携带约 390KB 硬约束：每次 ReadForWorker 都要重解定义 / 契约 / 检查点
+			// （各约 390KB）。20ms 轮询在 -race 下把读侧和 Worker 互相挤慢，8s 边界实测只剩
+			// 不到一秒余量（绿跑 8.42–9.41s，红跑 9.81s 超时）。轮询放宽到 100ms、等待放宽
+			// 到 30s；判据不变：仍必须到达终态或非 rework 的 Blocked，且零模型调用。
+			// The overflow case carries ~390KB hard state and every ReadForWorker re-parses
+			// the definition, contract and checkpoint. A 20ms poll starves both sides under
+			// -race, leaving under a second of margin on an 8s bound; 100ms/30s keeps the
+			// same predicates with room. The cleanup line records the last read on failure.
 			require.Eventually(t, func() bool {
 				task, err = rt.flows.store.ReadForWorker(t.Context(), task.ID)
 				return err == nil && (task.Status.Terminal() || task.Status == flow.Blocked && task.Reason != "bounded_rework_required")
-			}, 8*time.Second, 20*time.Millisecond)
+			}, 30*time.Second, 100*time.Millisecond)
 			require.NoError(t, rt.flows.Close())
 			require.NotEqual(t, flow.Succeeded, task.Status)
 			require.NotEqual(t, "verified", task.Revision.Slots["facts"].State)
