@@ -363,6 +363,7 @@ export interface RunResourceManifestView {
 
 export interface RunDetail extends RunView {
   resource_manifest: RunResourceManifestView | null
+  isolation_executions: IsolationExecutionView[]
 }
 
 /** 取消结果：message 说明「已是终态、无需取消」等提示（契约 /runs/{id}/cancel）。 */
@@ -839,6 +840,7 @@ export interface NetworkAllowlistView {
 }
 
 export interface SandboxView {
+  isolation: IsolationView
   file_allowed_paths: string[]
   shell_allowed_commands: string[]
   shell_interpreters: string[]
@@ -853,6 +855,51 @@ export interface SandboxView {
   denied_domains: string[]
   /** 禁止域名行的生效元数据；条件写用它的 ETag。 */
   network_denylist: NetworkAllowlistView
+}
+
+/** 隔离配置与启动探针的只读投影。 Read-only isolation configuration and probe facts. */
+export interface IsolationView {
+  enabled: boolean
+  backend: string
+  profiles: IsolationProfileView[]
+  tools: Record<string, string>
+  max_concurrent: number
+  max_total_cpus: number
+  max_total_memory_mb: number
+  max_total_temp_bytes: number
+  max_total_artifact_bytes: number
+  checked_at: string
+  unavailable_reason: string
+}
+
+export interface IsolationProfileView {
+  name: string
+  runtime: string
+  image_digest: string
+  bound: boolean
+  available: boolean
+  reason: string
+  cpus: number
+  memory_mb: number
+  pids: number
+  tmpfs_mb: number
+  timeout_seconds: number
+}
+
+export interface IsolationExecutionView {
+  tool_invocation_id: number
+  tool_call_id: string
+  tool_name: string
+  profile: string
+  runtime: string
+  state: 'creating' | 'running' | 'finished' | 'failed' | 'timeout' | 'canceled' | 'unknown'
+  exit_code: number
+  cleanup_state: 'pending' | 'cleaned' | 'failed'
+  error_reason: string
+  artifact_count: number
+  artifact_bytes: number
+  started_at: string
+  finished_at: string
 }
 
 /** 一条升级迁移待确认项（契约 PendingPolicyConfirmation）：只读扫描结果，不落库。 */

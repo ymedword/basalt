@@ -227,6 +227,7 @@ const runGroupProtectedSQL = `SELECT
  OR EXISTS(SELECT 1 FROM runs WHERE run_id IN(SELECT run_id FROM retention_runs) AND flow_task_id IS NOT NULL)
  OR EXISTS(SELECT 1 FROM flow_node_attempts WHERE run_id IN(SELECT run_id FROM retention_runs) OR ($2='sessions' AND session_id=$3))
  OR EXISTS(SELECT 1 FROM flow_evidence_refs WHERE run_id IN(SELECT run_id FROM retention_runs))
+ OR EXISTS(SELECT 1 FROM sandbox_executions WHERE run_id IN(SELECT run_id FROM retention_runs) AND cleanup_state IN('pending','failed'))
  OR ($2='runs' AND NOT EXISTS(SELECT 1 FROM retention_runs))
  OR EXISTS(SELECT 1 FROM messages WHERE id IN(SELECT id FROM retention_messages) AND created_at >= $1)
  OR EXISTS(SELECT 1 FROM messages WHERE run_id IN(SELECT run_id FROM retention_runs) AND id NOT IN(SELECT id FROM retention_messages))

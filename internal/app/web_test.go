@@ -532,16 +532,16 @@ func (fakeTool) Execute(context.Context, core.ToolEnv, json.RawMessage) (core.Re
 }
 
 // TestDeclaredToolNames_IncludesManageSchedule 对应颗粒度文档 §3.2.2（约束 32）：
-// 十一名声明清单**逐字对照**（判据面变更 §3.5 #4；14D T125 精确集 10 → 11）。实现若漏
+// 十二名声明清单**逐字对照**（US20 增加 run_code，保留旧测试锚点）。实现若漏
 // 登记 `manage_schedule` 或 `web_search`，轻路径会判它"池外"；若多列未注册名，重路径
 // 等值门禁会拒绝启动——两种漂移都在这里红。
-// The eleven-name literal list is the only judge of the newest tools' drift: the nine-name
+// The twelve-name literal list is the only judge of the newest tools' drift: the nine-name
 // classification fixture above cannot see a missing or extra declaration (P-03).
 func TestDeclaredToolNames_IncludesManageSchedule(t *testing.T) {
 	require.Equal(t, []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-		"recall_memory", "save_memory", "shell", "web_search", "write_file",
-	}, declaredToolNames, "声明名集必须与注册池十一件逐字一致（排序序）")
+		"recall_memory", "run_code", "save_memory", "shell", "web_search", "write_file",
+	}, declaredToolNames, "声明名集必须与注册池十二件逐字一致（排序序）")
 }
 
 // TestWebOptions_SchedulesWired 对应颗粒度文档 §3.2.2（§3.1.19 / 约束 21）：

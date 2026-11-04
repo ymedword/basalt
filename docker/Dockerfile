@@ -21,7 +21,7 @@ RUN apk add --no-cache ca-certificates
 # （10001 是固定数字 UID，镜像内没有同名用户也成立）。
 # Named volumes inherit the ownership of their image-side mount point on first
 # creation, so both mount points are pre-created for the fixed numeric UID.
-RUN mkdir -p /data /var/lib/basalt && chown 10001:10001 /data /var/lib/basalt
+RUN mkdir -p /data /var/lib/basalt /task /output && chown 10001:10001 /data /var/lib/basalt
 
 COPY basalt /opt/basalt/basalt
 COPY entrypoint.sh /opt/basalt/entrypoint.sh

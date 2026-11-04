@@ -1,0 +1,379 @@
+{
+    "version":  1,
+    "id":  "us20-base",
+    "approval":  "User review 1 passed 2026-11-04; approved R1.5 SHA256 9bd639e9280d81b2e1815ad4f57b22acf69fbeb9f285226faeb965b83e3b1c78. WSL Linux authorized for US20; review 2 pending.",
+    "inputs":  [
+                   "specs/020-execution-isolation/spec.md",
+                   "specs/020-execution-isolation/plan.md",
+                   "specs/020-execution-isolation/tasks.md",
+                   "harness/acceptance.json"
+               ],
+    "protect":  [
+                    "internal/tool/isolation_runner_test.go",
+                    "internal/tool/isolation_ledger_test.go",
+                    "internal/tool/runcode_test.go",
+                    "internal/tool/runcode_artifacts_test.go",
+                    "internal/cli/config_isolation_test.go",
+                    "internal/app/isolation_test.go",
+                    "internal/app/isolation_e2e_test.go",
+                    "internal/e2e/us20_fixture_test.go",
+                    "internal/e2e/us20_oci_test.go",
+                    "internal/e2e/us20_gvisor_test.go",
+                    "internal/web/isolation_view_test.go",
+                    "internal/core/isolation_audit_test.go",
+                    "internal/tool/isolation_runner.go",
+                    "internal/tool/isolation_cli.go",
+                    "internal/tool/isolation_cleanup.go",
+                    "internal/tool/runcode.go",
+                    "internal/tool/runcode_stage.go",
+                    "internal/tool/runcode_artifacts.go",
+                    "internal/tool/isolation_ledger.go",
+                    "internal/tool/shelltools.go",
+                    "internal/tool/runner.go",
+                    "internal/tool/command_guard.go",
+                    "internal/app/isolation.go",
+                    "internal/app/isolation_recovery.go",
+                    "internal/cli/config.go",
+                    "internal/cli/config_isolation.go",
+                    "internal/storage/postgres/isolation.go",
+                    "internal/storage/postgres/migrations/0009_sandbox_execution.sql",
+                    "assets/console/src/views/workspace.ts",
+                    "assets/console/src/views/run-detail.ts",
+                    "assets/console/src/views/isolation.ts"
+                ],
+    "checks":  [
+                   {
+                       "id":  "us20-base-config",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=5m",
+                                    "./internal/cli",
+                                    "-run",
+                                    "^TestUS20_"
+                                ],
+                       "timeout_seconds":  600,
+                       "required_tests":  [
+                                              "TestUS20_Config_OldConfigUnchanged",
+                                              "TestUS20_Config_UnknownKeyRejected",
+                                              "TestUS20_Config_RunCodeMustBeGvisor",
+                                              "TestUS20_Config_ImageMustBePinned",
+                                              "TestUS20_Config_ImageMustBeApproved",
+                                              "TestUS20_Config_ReleaseManifestRequired",
+                                              "TestUS20_Config_IsolationDoesNotUpgradeProfile",
+                                              "TestUS20_Config_TmpfsUpperBound",
+                                              "TestUS20_Config_TempFormulaBytes",
+                                              "TestUS20_IsolationCLI_Check"
+                                          ],
+                       "level":  "source"
+                   },
+                   {
+                       "id":  "us20-base-core",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=10m",
+                                    "./internal/tool",
+                                    "./internal/core",
+                                    "./internal/isolation",
+                                    "-run",
+                                    "^TestUS20_"
+                                ],
+                       "timeout_seconds":  900,
+                       "required_tests":  [
+                                              "TestUS20_LocalRunnerRejectsIsolation",
+                                              "TestUS20_ContainerRunnerRequiresIsolation",
+                                              "TestUS20_ImageNotApprovedRejects",
+                                              "TestUS20_BuildCreateArgs",
+                                              "TestUS20_OutputDirOutsideRootRejects",
+                                              "TestUS20_InterpreterAbsolutePathStillValidated",
+                                              "TestUS20_TrustManifestSignature",
+                                              "TestUS20_RunCode_PolicyDenied",
+                                              "TestUS20_RunCode_PolicyAllowed",
+                                              "TestUS20_NoFallback_Unconfigured",
+                                              "TestUS20_ArtifactScanner_RejectsSymlink",
+                                              "TestUS20_ArtifactScan_Directory",
+                                              "TestUS20_ArtifactLimits",
+                                              "TestUS20_ArtifactPublishSerialized",
+                                              "TestUS20_ReleaseStage",
+                                              "TestUS20_RemoveOutputDirNoop",
+                                              "TestUS20_RemoveOutputDirArgv",
+                                              "TestUS20_RemoveOutputDirCreateArgs",
+                                              "TestUS20_RemoveOutputDirCleanupLeftover",
+                                              "TestUS20_PublishMuPrivateWhenNil",
+                                              "TestUS20_InstanceTotal",
+                                              "TestUS20_CreateUnknownNoRetry",
+                                              "TestUS20_SandboxLedger_Order",
+                                              "TestUS20_SandboxLedger_FinishUnknown",
+                                              "TestUS20_SandboxLedger_StoreFailureWarns",
+                                              "TestUS20_AuditSingleRow",
+                                              "TestUS20_ErrorKindMapping",
+                                              "TestUS20_PolicyDenialReasonUnchanged",
+                                              "TestUS20_CommandZeroValue",
+                                              "TestUS20_ShellLocalUnchanged",
+                                              "TestUS20_OCI_RejectsInlineCode",
+                                              "TestUS20_OCI_RejectsOutOfTaskScript",
+                                              "TestUS20_OCI_TranslateScriptArg",
+                                              "TestUS20_AdmissionStoreFailureDenies",
+                                              "TestUS20_AdmissionDoesNotDoubleCountLedger",
+                                              "TestUS20_MixedTierAdmission",
+                                              "TestUS20_PinnedSlotStaysOccupied",
+                                              "TestUS20_RunCodeArtifactCancellation",
+                                              "TestUS20_ArtifactCancelFinalWrite",
+                                              "TestUS20_ContainerTruncationMarker",
+                                              "TestUS20_RunCodeOptionalNullRejected"
+                                          ],
+                       "level":  "source"
+                   },
+                   {
+                       "id":  "us20-base-race",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=10m",
+                                    "-race",
+                                    "./internal/tool",
+                                    "-run",
+                                    "^TestUS20_(ConcurrentAdmissionRace|AdmissionDoesNotDoubleCountLedger|MixedTierAdmission|PinnedSlotStaysOccupied|ArtifactPublishSerialized)$"
+                                ],
+                       "timeout_seconds":  900,
+                       "required_tests":  [
+                                              "TestUS20_ConcurrentAdmissionRace",
+                                              "TestUS20_AdmissionDoesNotDoubleCountLedger",
+                                              "TestUS20_MixedTierAdmission",
+                                              "TestUS20_PinnedSlotStaysOccupied",
+                                              "TestUS20_ArtifactPublishSerialized"
+                                          ],
+                       "level":  "source"
+                   },
+                   {
+                       "id":  "us20-base-app",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=10m",
+                                    "./internal/app",
+                                    "-run",
+                                    "^TestUS20_"
+                                ],
+                       "timeout_seconds":  900,
+                       "required_tests":  [
+                                              "TestUS20_Probe_RuntimeMissingRefusesStartup",
+                                              "TestUS20_CleanupOrphans",
+                                              "TestUS20_CleanupOrphansSkipsHandled",
+                                              "TestUS20_CleanupOrphansFailClosed",
+                                              "TestUS20_CleanupOrphansListFailure",
+                                              "TestUS20_DeclaredToolsMatchRegistry",
+                                              "TestUS20_BuiltinCatalogIncludesRunCode",
+                                              "TestUS20_MCPBoundaryUnchanged",
+                                              "TestUS20_RecoveryManyEmptyRuns"
+                                          ],
+                       "level":  "source"
+                   },
+                   {
+                       "id":  "us20-base-web",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=5m",
+                                    "./internal/web",
+                                    "-run",
+                                    "^TestUS20_"
+                                ],
+                       "timeout_seconds":  600,
+                       "required_tests":  [
+                                              "TestUS20_ConsoleReadOnly",
+                                              "TestUS20_OpenAPIContract",
+                                              "TestUS20_RunDetailProjection"
+                                          ],
+                       "level":  "source"
+                   }
+               ],
+    "tasks":  [
+                  {
+                      "id":  "T001",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T002",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T003",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T004",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T005",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T006",
+                      "checks":  [
+                                     "us20-base-config"
+                                 ]
+                  },
+                  {
+                      "id":  "T007",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T008",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T009",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T010",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T011",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T012",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T013",
+                      "checks":  [
+                                     "us20-base-core",
+                                     "us20-base-race"
+                                 ]
+                  },
+                  {
+                      "id":  "T014",
+                      "checks":  [
+                                     "us20-base-core"
+                                 ]
+                  },
+                  {
+                      "id":  "T015",
+                      "checks":  [
+                                     "us20-base-core",
+                                     "us20-base-race"
+                                 ]
+                  },
+                  {
+                      "id":  "T016",
+                      "checks":  [
+                                     "us20-base-core",
+                                     "us20-base-race"
+                                 ]
+                  },
+                  {
+                      "id":  "T017",
+                      "checks":  [
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T018",
+                      "checks":  [
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T019",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T020",
+                      "checks":  [
+                                     "us20-base-web"
+                                 ]
+                  },
+                  {
+                      "id":  "T021",
+                      "checks":  [
+                                     "us20-base-web"
+                                 ]
+                  },
+                  {
+                      "id":  "T022",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-core",
+                                     "us20-base-web"
+                                 ]
+                  },
+                  {
+                      "id":  "T027",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-core",
+                                     "us20-base-race",
+                                     "us20-base-app"
+                                 ]
+                  },
+                  {
+                      "id":  "T028",
+                      "checks":  [
+                                     "us20-base-web"
+                                 ]
+                  },
+                  {
+                      "id":  "T029",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-core",
+                                     "us20-base-race",
+                                     "us20-base-app",
+                                     "us20-base-web"
+                                 ]
+                  },
+                  {
+                      "id":  "T030",
+                      "checks":  [
+                                     "us20-base-config",
+                                     "us20-base-core",
+                                     "us20-base-race",
+                                     "us20-base-app",
+                                     "us20-base-web"
+                                 ]
+                  }
+              ]
+}

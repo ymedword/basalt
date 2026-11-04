@@ -166,8 +166,8 @@ func TestDocs14D_FactsMatchImplementation(t *testing.T) {
 	// example directory; the contract promises no rate the official page has not confirmed.
 	t.Run("web-search-sync", func(t *testing.T) {
 		contract := read(t, filepath.Join("docs", "contracts", "agent-md.md"))
-		if !strings.Contains(contract, "## 5. 内置工具契约（11 个）") {
-			t.Error("docs/contracts/agent-md.md no longer declares eleven built-in tools")
+		if !strings.Contains(contract, "## 5. 内置工具契约（12 个）") {
+			t.Error("docs/contracts/agent-md.md must declare twelve built-in tools after US20")
 		}
 		const sectionHeading = "### 5.7 SearchTools"
 		_, after, found := strings.Cut(contract, sectionHeading)
@@ -240,7 +240,7 @@ func TestDocs14D_FactsMatchImplementation(t *testing.T) {
 					"`exception_missing`", "admin-token", "没有**默认密码",
 					"basalt secrets init", "basalt demo install",
 					"`execution_policy`", "`instance_secrets`", "`credentials`（v6 重建）",
-					"**内置十一工具**", "`web_search`", "搜索 + Fetch 双通道",
+					"**内置十二工具**", "`web_search`", "搜索 + Fetch 双通道",
 				},
 			},
 			{

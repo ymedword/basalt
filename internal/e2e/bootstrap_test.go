@@ -548,7 +548,7 @@ func testBootstrapCLIImportGraph(t *testing.T) {
 	requireContains(t, string(run), "Agents: agentsPort{", "agentsPort 注入")
 }
 
-// testBootstrapToolList：`tool list` 冒烟——十一件内置工具（US-5 §6.1 第 4 项；US-6 §6.1
+// testBootstrapToolList：`tool list` 冒烟——十二件内置工具（US20 新增 run_code；US-5 §6.1 第 4 项；US-6 §6.1
 // 第 11 项记录历史读数八件的差异，以现行件数为判据；14D T125 增 web_search 至 11 件）。
 func testBootstrapToolList(t *testing.T) {
 	h := newHarness(t)
@@ -557,10 +557,10 @@ func testBootstrapToolList(t *testing.T) {
 
 	res := h.run(t, fixtureEnv(), "tool", "list")
 	requireExit(t, res, 0, "tool list")
-	requireContains(t, res.Stdout, "共 11 件工具", "tool list")
+	requireContains(t, res.Stdout, "共 12 件工具", "tool list")
 	for _, name := range []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify",
-		"read_file", "recall_memory", "save_memory", "shell", "web_search", "write_file",
+		"read_file", "recall_memory", "run_code", "save_memory", "shell", "web_search", "write_file",
 	} {
 		requireContains(t, res.Stdout, name+"：", "tool list "+name)
 	}

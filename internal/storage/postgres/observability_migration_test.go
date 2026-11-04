@@ -27,7 +27,7 @@ func TestObservability_MigrationForwardOnly(t *testing.T) {
 	first, err := os.ReadFile("migrations/0001_postgres_v1.sql")
 	require.NoError(t, err)
 	require.Equal(t, first, contract, "v1 contract must stay frozen")
-	require.Equal(t, 8, SupportedSchemaVersion, "US-19 adds v8; published v1 and observability migrations stay immutable")
+	require.Equal(t, 9, SupportedSchemaVersion, "US-20 adds v9; published v1 and observability migrations stay immutable")
 	flowContract, err := os.ReadFile("../../../docs/contracts/flow.pg.sql")
 	require.NoError(t, err)
 	flowMigration, err := os.ReadFile("migrations/0008_flow.sql")

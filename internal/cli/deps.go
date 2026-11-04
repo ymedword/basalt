@@ -17,6 +17,9 @@ import (
 // os.Getwd, which keeps tests free of chdir and pins every status section to the
 // same workspace.
 type Deps struct {
+	// IsolationProbe 是不触数据库的隔离运行时自检端口。
+	// IsolationProbe checks isolation runtimes without database access.
+	IsolationProbe IsolationProbe
 	// WorkDir 是运行命令的进程工作目录；工作区 = <WorkDir>/.basalt。
 	// WorkDir is the process working directory; the workspace is <WorkDir>/.basalt.
 	WorkDir string

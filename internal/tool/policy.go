@@ -115,6 +115,9 @@ const (
 // PolicyOptions mirrors the existing configuration keys verbatim; empty lists deny by
 // default.
 type PolicyOptions struct {
+	// AllowRunCode 是独立的显式代码执行授权，不随 strict/standard 改变。
+	// AllowRunCode is explicit code-execution authority independent of strict/standard.
+	AllowRunCode    bool
 	Root            string   // 工作区根（`.basalt`）；agents/、skills/、memory/ 相对它定位
 	CrossAgentRead  []string // sandbox.cross_agent_read：允许被跨 Agent 读取的 Agent 名
 	AllowedCommands []string // shell.allowed_commands：executable 整串逐字比对
@@ -137,6 +140,7 @@ type PolicyOptions struct {
 // WhitelistPolicy authorizes by "who touches what" only. The outbound domain allowlist
 // is the only hot-swappable dimension; the other three stay construction-time snapshots.
 type WhitelistPolicy struct {
+	allowRunCode    bool
 	root            string
 	programDir      string
 	crossAgentRead  map[string]struct{}
@@ -175,6 +179,7 @@ var _ core.Policy = (*WhitelistPolicy)(nil)
 // NewWhitelistPolicy wires the policy; the lists become explicit lookup tables.
 func NewWhitelistPolicy(opts PolicyOptions) *WhitelistPolicy {
 	policy := &WhitelistPolicy{
+		allowRunCode:    opts.AllowRunCode,
 		root:            filepath.Clean(opts.Root),
 		programDir:      filepath.Clean(opts.ProgramDir),
 		crossAgentRead:  make(map[string]struct{}, len(opts.CrossAgentRead)),
@@ -378,6 +383,11 @@ func (p *WhitelistPolicy) hostExcepted(host string) bool {
 // the tool result verbatim. ctx does not change the verdict here.
 func (p *WhitelistPolicy) Check(ctx context.Context, action core.Action) error {
 	switch action.Type {
+	case core.ActionRunCode:
+		if !p.allowRunCode || !action.RunBound || !validSingleName(action.Agent) || action.Agent == "" {
+			return isolationDenied("policy_denied", "生成代码执行需要 execution.allow_run_code 显式授权和有效 Run 身份")
+		}
+		return nil
 	case core.ActionFileRead:
 		return p.checkFile(action, accessRead)
 	case core.ActionFileWrite:

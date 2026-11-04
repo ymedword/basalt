@@ -20,6 +20,7 @@ Independent agents. Shared infrastructure.
 - **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.
 - **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.
 - **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.
+- **Opt-in task isolation** — On Linux, bind controlled shell commands to hardened OCI and generated code to gVisor. Tasks run without network access or service credentials; unavailable isolation fails closed. Local execution remains the default. See the [isolation contract](docs/contracts/isolation.md).
 - **Durable sequential flows** — Publish immutable task contracts and bounded Agent/tool/subflow steps. Acceptance, evidence and budgets persist in PostgreSQL; unknown side effects stop advancement. Ordinary messages and Runs remain synchronous. Flows are opt-in; see [operations](docs/Operations.md#durable-flows).
 - **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the `vector` and `pg_trgm` extensions, which you run yourself; no Node service at runtime.
 

@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	releaseRecordName = "release-record.json"
-	recordSignature   = "release-record.json.sig"
-	sumsSignature     = "SHA256SUMS.sig"
+	releaseRecordName  = "release-record.json"
+	recordSignature    = "release-record.json.sig"
+	sumsSignature      = "SHA256SUMS.sig"
+	imageLockName      = "image-lock.json"
+	imageLockSignature = "image-lock.json.sig"
 )
 
 // VerifyRelease 验证发布目录：先逐文件核对哈希，再按策略验证签名；任一失败即停。
@@ -111,6 +113,9 @@ func VerifyRelease(ctx context.Context, dir string, policy VerifyPolicy) (Verify
 	report.Signed = len(report.VerifiedSignatures) == 2
 	if require && !report.Signed {
 		return report, errors.New("final 发布必须同时验证记录签名与校验和签名")
+	}
+	if err := verifySandboxManifest(dir, record, policy, &report); err != nil {
+		return report, err
 	}
 	if strings.TrimSpace(policy.TrustFile) != "" {
 		if err := checkTrust(policy.TrustFile, policy.PublicKey); err != nil {

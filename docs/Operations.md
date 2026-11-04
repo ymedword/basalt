@@ -1549,3 +1549,15 @@ CLI连接已经运行的实例，不启动第二写实例。远程地址必须HT
 四角色/17节点/48条需求的净化示例随二进制携带。新实例自动准备，受开箱安装器管理的存量实例升级时准备一次；已有目录、生命周期与归档不覆盖。旧未接管实例停止服务后执行 `basalt demo workflow install`。原五个每日Demo清单不变。
 
 按 `.basalt/samples/bid-readiness/SETUP.md` 配置模型、显式摄取/绑定知识、逐条确认核心经验并启用Agent；然后在“工作流”载入采购准备模板，校验/发布后手动创建任务。安装、模板加载和发布均不调用模型；摄取和执行可能计费。模板版本1的产品材料固定main ca9a0d2，不能当成后续版本能力证明。新发行版继续携带模板，但不替换已经安装或发布的用户配置。默认样例说明见 [SETUP](../examples/workflows/bid-readiness/defaults/materials/SETUP.md)。
+
+## 任务执行隔离
+
+任务隔离默认关闭；既有本地 shell 行为保留。启用前准备 Linux 本机 Docker daemon（Unix socket）、对应 runc/runsc、已预载并固定 digest 的发布镜像，以及与内嵌发布公钥对应的 `image-lock.json` / `.sig`。签名清单缺失、被篡改、内容非法或实际镜像不符均拒绝。不要把运行 Basalt 的服务容器当作任务隔离；默认 Compose 不挂 Docker socket，容器内接宿主 daemon 的路径/权限需要另行部署设计。
+
+按 [配置契约](contracts/isolation.md) 设置静态绑定和资源预算，再执行 `basalt isolation check`。它只运行受限探针，不访问数据库。服务启动还会先恢复孤儿、查证容量再接单；任一步不具备能力就拒绝隔离装配。管理台“执行环境”仅展示真实档位，修改配置后重启。
+
+`output_root` 必须是本实例独占的 tmpfs 挂载点，服务 UID 可读写；大小须满足两条容量不等式。示例 N=2、每档 tmpfs/output=8MiB、输入1MiB、stdout上限256KiB、总临时预算128MiB，可选输出挂载64MiB；不可与另一实例或非隔离临时文件共用。默认任务 UID/GID65534；仅单次输出叶目录0777。v1 输出容量在任务间共享，一个任务可耗尽它并导致其他任务失败。
+
+探针会验证真实 bind、UID 与 mode000/双点目录清理。资源预算也要覆盖 runtime 的辅助线程；本地 WSL 测得 runsc + bind 在32pids下可能报 ENOMEM，64pids/256MiB通过基础探针，此为验证环境读数而非所有宿主的保证。Docker local 日志采用 max-file=1、compress=false 与固定 max-size。
+
+排障先看运行详情的执行状态、清理状态和原因，再核对本实例 `basalt.instance_id` 标签。账本未知不重放；任务容器、清理容器、输出目录、staging 未全部释放就继续占容量。已登记记录清理失败记录 WARN；无法枚举或无账本孤儿不能清理会拒绝启动。人工处置只针对已核对实例标签/路径的残留，确认服务停机和任务归属后再清理；不要批量删除其他实例容器、工作区或产物。清理完成后重启由恢复路径重算基线，不直接改账本伪造成功。

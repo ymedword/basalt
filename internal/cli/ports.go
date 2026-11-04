@@ -823,3 +823,9 @@ type HandoffVerification interface {
 	// report is filled either way.
 	VerifyHandoff(ctx context.Context, req HandoffVerifyRequest) (HandoffVerifyReport, error)
 }
+
+// IsolationProbe 是只读配置与有界运行时探针的窄端口。
+// IsolationProbe exposes configuration and bounded runtime probes without persistence.
+type IsolationProbe interface {
+	CheckIsolation(context.Context) (IsolationCheckReport, error)
+}

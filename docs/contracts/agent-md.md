@@ -109,7 +109,7 @@ schedules:
 | 1 | `name` 等于目录名 | WARN `name mismatch` |
 | 2 | `provider.name` 在**已发布 Provider 版本表**里（`resource_pointers` 有未删除的发布版本） | WARN `provider version missing: <name>` |
 | 3 | `provider.model` 非空白 | WARN `blank model` |
-| 4 | `tools` 里每个名字都能解析（内置 11 个 / MCP / 代码内注册） | WARN `tool not registered: <name>` |
+| 4 | `tools` 里每个名字都能解析（内置 12 个 / MCP / 代码内注册） | WARN `tool not registered: <name>` |
 | 5 | `skills` 里每个名字在技能库有实体（加载期），且存在**已发布版本**（注册装配期） | 无实体 → WARN `skill not found: <name>`；有实体但无已发布版本 → WARN `skill version missing: <name>[, <name>…]`（多个缺失名按升序、以逗号加空格连接，一条 WARN 点名该 Agent 的全部缺失技能） |
 | 6 | `mcp_servers` 里每个名字有**实际生效**的版本（待重启内容不算）且连接成功 | WARN `mcp server skipped: <name>` |
 | 7 | `bootstrap` 里每个文件存在 | WARN `bootstrap file missing` |
@@ -374,7 +374,7 @@ type ToolCall struct {
 
 ---
 
-## 5. 内置工具契约（11 个）
+## 5. 内置工具契约（12 个）
 
 工具名与参数名是**模型可见契约**：改字面量等于改调用方式。
 
@@ -559,6 +559,24 @@ type ToolCall struct {
 > 本工具是 US-14 的 14D 增量（2026-10-26 裁决）。字段名与错误码的官方核对记录见
 > `specs/014-templates-demos-release/run-state.md`。官方限流口径以官方文档为准；
 > 契约不声明 QPS 数值。
+
+---
+
+### 5.8 RunCodeTools（1 个，US-20）
+
+#### run_code
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `code` | string | 是 | POSIX shell 代码，1–65536 字节，禁止 NUL；执行 `/bin/sh /task/main.sh` |
+| `inputs` | []string | 否 | 最多 16 个授权可读的普通文件路径；每路径 1–512 字节；受输入累计预算约束 |
+| `timeout_seconds` | int | 否 | 1–300 秒，只能收窄执行档与调用上下文的上限；省略使用二者较小值 |
+
+未知参数、尾随 JSON、超限输入均拒绝。输入只读位于 `/task/input`，代码只读位于 `/task/main.sh`；仅 `/output` 用于产物，执行环境完全无网。工具始终注册，但只有显式 gVisor 绑定与 `execution.allow_run_code: true` 才可执行；未配置、未授权或隔离不可用时拒绝，绝不退回 OCI 或本地。
+
+返回：退出码、合并 stdout/stderr，以及通过校验的产物相对路径、字节数和 SHA-256。产物只接受顶层普通文件，拒绝目录、链接、特殊文件与数量/字节超限；发布到当前 Agent 的 `artifacts/<run>/<invocation>/`。文本输出按执行档和工具调用上限截断。非零程序退出码作为执行结果返回，不伪造进程成功。
+
+失败仍使用既有 `error_kind`：输入不合法为 `invalid_input`，授权/配置/镜像拒绝为 `sandbox_denied`，超时或取消为 `timeout`，基础设施与发布失败按既有错误映射处理。隔离专属原因、账本、清理与容量语义见 [isolation.md](isolation.md)。工具调用仍只有 ToolExecutor 的一条审计记录；隔离账本是其关联执行记录。
 
 ---
 

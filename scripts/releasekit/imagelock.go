@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/ymedword/basalt/internal/isolation"
 )
 
 // ImageLock 固定部署用到的两个基础镜像 digest：应用镜像的 alpine 底包与
@@ -15,9 +17,10 @@ import (
 // application image and the PostgreSQL/pgvector image. The Go version stays out of
 // the lock file: go.mod's toolchain directive and CI are its single source of truth.
 type ImageLock struct {
-	Schema   int    `json:"schema"`
-	AppBase  string `json:"app_base"`
-	Postgres string `json:"postgres"`
+	Schema   int                     `json:"schema"`
+	AppBase  string                  `json:"app_base"`
+	Postgres string                  `json:"postgres"`
+	Sandbox  isolation.SandboxImages `json:"sandbox"`
 }
 
 // ReadImageLock 读取并校验锁文件格式。
@@ -27,20 +30,11 @@ func ReadImageLock(path string) (ImageLock, error) {
 	if err != nil {
 		return ImageLock{}, fmt.Errorf("读取镜像锁文件 %s：%w", path, err)
 	}
-	var lock ImageLock
-	if err := json.Unmarshal(body, &lock); err != nil {
+	m, err := isolation.ParseImageManifest(body, false)
+	if err != nil {
 		return ImageLock{}, fmt.Errorf("解析镜像锁文件 %s：%w", path, err)
 	}
-	if lock.Schema != 1 {
-		return ImageLock{}, fmt.Errorf("镜像锁文件 schema=%d，期望 1", lock.Schema)
-	}
-	if _, _, err := parseBaseRef(lock.AppBase); err != nil {
-		return ImageLock{}, fmt.Errorf("app_base：%w", err)
-	}
-	if _, _, err := parseBaseRef(lock.Postgres); err != nil {
-		return ImageLock{}, fmt.Errorf("postgres：%w", err)
-	}
-	return lock, nil
+	return ImageLock{Schema: m.Schema, AppBase: m.AppBase, Postgres: m.Postgres, Sandbox: m.Sandbox}, nil
 }
 
 // CheckImageLock 核对锁文件与部署源码一致：AppBase 只对 Dockerfile 的
@@ -50,8 +44,8 @@ func ReadImageLock(path string) (ImageLock, error) {
 // the Dockerfile's ARG BASE_IMAGE, Postgres with the compose database image and the
 // BASALT_DB_IMAGE entry of .env.example. The comparison surface is fixed.
 func CheckImageLock(lock ImageLock, dockerfile, compose, envExample string) error {
-	if lock.Schema != 1 {
-		return fmt.Errorf("镜像锁文件 schema=%d，期望 1", lock.Schema)
+	if lock.Schema != 2 {
+		return fmt.Errorf("镜像锁文件 schema=%d，期望 2", lock.Schema)
 	}
 	dockerfileBody, err := os.ReadFile(dockerfile) // #nosec G304 -- 部署源码路径由调用方显式给出
 	if err != nil {
@@ -99,6 +93,31 @@ func CheckImageLock(lock ImageLock, dockerfile, compose, envExample string) erro
 		return fmt.Errorf("%s 的 BASALT_DB_IMAGE=%q 与锁文件 postgres=%q 不一致", envExample, envImage, lock.Postgres)
 	}
 	return nil
+}
+
+// MergeSandboxImages 将镜像记录合并到副本，不回写源锁或以本地 ID 冒充发布 digest。
+// MergeSandboxImages merges image records into a copy without rewriting the source or substituting local IDs for published digests.
+func MergeSandboxImages(source ImageLock, images []ImageRecord, require bool) (ImageLock, error) {
+	if len(images) != 1 {
+		return ImageLock{}, errors.New("执行镜像清单需要唯一 linux/amd64 镜像记录")
+	}
+	image := images[0]
+	if err := image.Validate(); err != nil {
+		return ImageLock{}, err
+	}
+	source.Sandbox = isolation.SandboxImages{}
+	if image.RepoDigest != "" {
+		ref := image.Tag + "@" + image.RepoDigest
+		source.Sandbox = isolation.SandboxImages{OCI: ref, GVisor: ref}
+	}
+	body, err := json.Marshal(source)
+	if err != nil {
+		return ImageLock{}, err
+	}
+	if _, err := isolation.ParseImageManifest(body, require); err != nil {
+		return ImageLock{}, err
+	}
+	return source, nil
 }
 
 // dockerfileBaseArg 取 ARG BASE_IMAGE 的默认值；缺失、重复或空值都拒绝。

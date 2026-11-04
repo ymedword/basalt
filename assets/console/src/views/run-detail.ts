@@ -17,6 +17,7 @@ import {
 import { renderSafeText } from '../render'
 import { diagnosticsHref, observabilityHref } from '../router'
 import { CompactionPanel } from './compaction'
+import { renderIsolationExecutions } from './isolation'
 import {
   AGENT_STATE_LABELS,
   RUN_STATUS_LABELS,
@@ -153,6 +154,7 @@ export const RunDetailView = defineComponent({
           ]),
           diagnosis.data.value && Array.isArray(diagnosis.data.value.entries) ? runSummary(diagnosis.data.value) : null,
           diagnosis.error.value ? h(Notice, {tone: 'warn', text: '诊断摘要暂时无法读取；下方保留权威运行记录。'}) : null,
+          renderIsolationExecutions(detail.isolation_executions),
           h('details', {class: 'obs-details'}, [h('summary', '运行标识与执行记录'),
           section('执行记录', [definitions([
             ['会话', identifier(detail.session_id)],

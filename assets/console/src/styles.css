@@ -1276,3 +1276,7 @@ textarea.editor {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* 短状态词保持完整；长内容兜底换行，窄屏由表格容器滚动。 Keep short states intact and scroll narrow tables. */
+.isolation-table td { overflow-wrap: break-word; }
+.isolation-digest { white-space: normal; overflow-wrap: anywhere; }

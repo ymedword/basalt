@@ -199,6 +199,46 @@ author:
   temperature: 0.2        # 可选，缺省 0.2，取值 [0,2]
 
 # US19：仅 serve 推进已发布的持久顺序流程；普通消息与 Run 仍同步。
+# US20：任务隔离默认关闭。以下为 Linux 宿主示例（完整规则见 docs/contracts/isolation.md）。
+# 不要原样启用：镜像必须替换为已验签发布清单中的固定引用，output_root 必须独占 tmpfs。
+# execution:
+#   allow_run_code: true  # 独立于 strict/standard，缺省 false
+# isolation:
+#   backend: docker
+#   output_root: /var/lib/basalt-output
+#   release_manifest: /etc/basalt/image-lock.json
+#   run_as_uid: 65534
+#   run_as_gid: 65534
+#   max_concurrent: 2
+#   max_total_cpus: 2
+#   max_total_memory_mb: 512
+#   max_total_temp_bytes: 134217728
+#   max_input_bytes: 1048576
+#   max_total_artifact_bytes: 67108864
+#   tools: {shell: oci, run_code: gvisor}
+#   profiles:
+#     oci:
+#       runtime: runc
+#       image: ${BASALT_SANDBOX_IMAGE}
+#       cpus: 1
+#       memory_mb: 256
+#       pids: 64
+#       tmpfs_mb: 8
+#       output_tmpfs_mb: 8
+#       max_output_bytes: 262144
+#       timeout_seconds: 60
+#     gvisor:
+#       runtime: runsc
+#       image: ${BASALT_SANDBOX_IMAGE}
+#       cpus: 1
+#       memory_mb: 256
+#       pids: 64
+#       tmpfs_mb: 8
+#       output_tmpfs_mb: 8
+#       max_output_bytes: 262144
+#       timeout_seconds: 60
+
+# US19：仅 serve 推进已发布的持久顺序流程；普通消息与 Run 仍同步。
 # 默认关闭；固定 Worker 共用 server.max_concurrent_runs，并保留交互名额。
 flows:
   enabled: false

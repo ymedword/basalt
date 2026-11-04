@@ -22,6 +22,7 @@ import type {
 import { ConsoleAuth } from '../src/auth'
 import { ConsoleRouter } from '../src/router'
 import { SandboxView } from '../src/views/workspace'
+import { isolationFixture } from './isolation-fixture'
 
 interface Call {
   readonly url: string
@@ -46,6 +47,7 @@ function meta(etag: string, revision: number, source: NetworkAllowlistView['sour
 
 function sandboxOf(state: State, denylistRevision = 4): SandboxViewData {
   return {
+    isolation: isolationFixture(),
     file_allowed_paths: ['.basalt/agents/<agent>/'],
     shell_allowed_commands: ['git'],
     shell_interpreters: ['python3'],

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -35,8 +37,28 @@ const shellInputSchema = `{"type":"object","properties":{"executable":{"type":"s
 // 本类型只做编排：解码 → 判定 → 收窄超时 → 组装命令 → 执行 → 呈现结果。
 // ShellTool orchestrates one guarded command run; the two faces stay in their interfaces.
 type ShellTool struct {
-	policy core.Policy
-	runner core.CommandRunner
+	policy    core.Policy
+	runner    core.CommandRunner
+	isolation *ShellIsolationOptions
+}
+
+// ShellIsolationOptions 显式绑定 OCI 账本、共享准入和受控脚本范围。
+// ShellIsolationOptions explicitly binds the OCI ledger, shared admission and script boundary.
+type ShellIsolationOptions struct {
+	Ledger        *SandboxLedger
+	Admission     *SandboxAdmission
+	Root          string
+	Interpreters  []string
+	MaxConcurrent int
+	MaxTimeout    time.Duration
+}
+
+// WithIsolation 在装配期启用隔离，保留未调用此方法时的本机行为。
+// WithIsolation enables isolation at wiring time while preserving the default local behavior.
+func (t *ShellTool) WithIsolation(opts ShellIsolationOptions) *ShellTool {
+	opts.Interpreters = slices.Clone(opts.Interpreters)
+	t.isolation = &opts
+	return t
 }
 
 // 编译期断言：调用方只依赖 `core.Tool`，装配处换实现不触及本类型（宪法 VI）。
@@ -84,13 +106,50 @@ func (t *ShellTool) Execute(ctx context.Context, env core.ToolEnv, input json.Ra
 	}
 	narrowed, cancel := narrowTimeout(ctx, env.Timeout, in.TimeoutSeconds)
 	defer cancel()
-	res, err := t.runner.Run(narrowed, t.command(env, in))
+	var res core.CommandResult
+	if t.isolation != nil {
+		res, err = t.runIsolated(narrowed, env, t.command(env, in))
+	} else {
+		res, err = t.runner.Run(narrowed, t.command(env, in))
+	}
 	if err != nil {
 		// 执行侧的错误原样上抛：启动失败 / 解释器形态 / 脚本越界 / 取消与截止的**身份**
 		// 都由那一边定，分类（sandbox_denied / runtime_error / timeout）归执行器。
 		return core.Result{}, err
 	}
 	return core.Result{Content: shellContent(res), Retryable: false}, nil
+}
+
+func (t *ShellTool) runIsolated(ctx context.Context, env core.ToolEnv, cmd core.Command) (core.CommandResult, error) {
+	o := t.isolation
+	if o.Ledger == nil || o.Admission == nil || t.runner == nil || !env.RunBound || env.ToolInvocationID <= 0 || !safeExecutionSegment(env.RunID) || !safeExecutionSegment(env.AgentName) || foldCase(filepath.Clean(env.AgentDir)) != foldCase(filepath.Join(o.Root, "agents", env.AgentName)) {
+		return core.CommandResult{}, isolationDenied("not_ready", "OCI shell 缺少隔离身份或共享准入")
+	}
+	if _, err := o.Admission.acquire(o.MaxConcurrent); err != nil {
+		return core.CommandResult{}, err
+	}
+	defer o.Admission.release()
+	if err := validateControlledCommand(cmd, interpreterSet(o.Interpreters), []string{filepath.Join(env.AgentDir, scriptsDirName)}); err != nil {
+		return core.CommandResult{}, err
+	}
+	if o.MaxTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, o.MaxTimeout)
+		defer cancel()
+	}
+	name := sandboxContainerName(o.Ledger.instanceID, env.ToolInvocationID)
+	if err := o.Ledger.begin(ctx, env, name); err != nil {
+		return core.CommandResult{}, err
+	}
+	_ = o.Ledger.markRunning(ctx, env)
+	cmd.Isolation = &core.IsolationSpec{ToolInvocationID: env.ToolInvocationID, ContainerName: name}
+	res, err := t.runner.Run(ctx, cmd)
+	cleanup := releaseStage(env, t.runner, runCodeStage{}, res.Execution)
+	if cleanup != core.CleanupCleaned {
+		o.Admission.pin()
+	}
+	o.Ledger.finish(ctx, env, res, err, isolationReason(err), cleanup, nil)
+	return res, err
 }
 
 // shellToolInput 是 shell 的入参形态：字段**是否出现**由 Schema 的 required 判（执行侧据此

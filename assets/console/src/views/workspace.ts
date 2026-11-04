@@ -22,6 +22,7 @@ import type { Tone } from '../components/ui'
 import { resourceDetailHref } from '../router'
 import type { NoticeTone } from './shared'
 import { capabilityTabs, definitions, identifier, pageHeading, section, useLoader, viewProps } from './shared'
+import { isolationSummary, renderIsolation } from './isolation'
 
 function page(title: string, note: string, content: VNodeChild[]): VNode {
   return h('section', { class: 'view view-library' }, [
@@ -522,7 +523,7 @@ export const SandboxView = defineComponent({
       const switchLabel = profile === 'strict' ? '切换到标准…' : '切换到严格…'
       return section('执行概览', [
         definitions([
-          ['执行方式', '本机进程（无容器隔离）'],
+          ['执行方式', isolationSummary(sandboxView.isolation)],
           ['执行策略', h('span', { class: 'profile-switch' }, [
             h(StatusBadge, { label: PROFILE_LABELS[profile], tone: PROFILE_BADGE_TONES[profile] }),
             profile === 'strict'
@@ -1126,6 +1127,7 @@ export const SandboxView = defineComponent({
         policy.error.value ? h(Notice, { tone: 'error', text: policy.error.value }) : null,
         sandbox.loading.value ? h('p', { class: 'loading' }, '正在读取执行策略…') : null,
         data === null || policyView === null ? null : renderSummary(policyView, data),
+        data === null ? null : renderIsolation(data.isolation),
         data === null || policyView === null ? null : renderStrictEmptyWarning(policyView, data),
         strict ? allowlist : null,
         data === null ? null : renderDeniedDomains(data),

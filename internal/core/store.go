@@ -296,3 +296,20 @@ type RunRecord struct {
 	// Flow associates an admitted Run with the already durable node attempt.
 	Flow *FlowRunContext
 }
+
+// SandboxExecutionStore 是生命周期写入端口；审计仍由 ToolExecutor 独占。
+// SandboxExecutionStore persists lifecycle facts, not tool audit conclusions.
+type SandboxExecutionStore interface {
+	BeginSandboxExecution(context.Context, SandboxExecution) error
+	MarkSandboxRunning(context.Context, int64, time.Time) error
+	FinishSandboxExecution(context.Context, SandboxExecutionResult) error
+	CountActiveSandboxExecutions(context.Context, string) (int, error)
+	MarkSandboxCleaned(context.Context, int64, SandboxState, CleanupState, string, time.Time) error
+}
+
+// SandboxExecutionReader 是恢复与运行详情的窄读端口。
+// SandboxExecutionReader serves recovery and run detail projections.
+type SandboxExecutionReader interface {
+	PendingSandboxExecutions(context.Context, string) ([]SandboxExecution, error)
+	SandboxExecutionsByRun(context.Context, string) ([]SandboxExecutionView, error)
+}

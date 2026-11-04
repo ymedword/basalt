@@ -307,7 +307,9 @@ func (a *App) webOptions(rt *heavyRuntime) web.Options {
 		// 渠道仓储只读且与发送路径共用同一实现——页面读到的就是下一发会用的。
 		// Sandbox is a display projection of the configuration; the notify repo is the
 		// very same read face the send path uses.
-		Sandbox: sandboxConfigView(cfg),
+		Sandbox:             sandboxConfigView(cfg),
+		Isolation:           runtimeIsolationView(rt),
+		IsolationExecutions: runtimeIsolationReader(rt),
 		// 出网域名白名单的管理端口（R8 裁决 2）：与运行期策略、MCP supervisor 同一批
 		// 实例，保存成功即热生效；`http.allowed_domains` 因此不再只来源于配置投影。
 		// The managed allowlist port is the very instance the live policy uses.
@@ -1554,7 +1556,7 @@ func (p agentProfilesPort) Profiles() []core.AgentEntry {
 
 // toolCatalogPort 把注册池与 MCP 连接结果适配成工具清单（约束 27）：顺序 =
 // `Registry.Names()`（排序序），来源判定 builtin 集 → builtin、MCP 连接池 → mcp、
-// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（十一件内置的唯一声明），
+// 其余 → code。builtin 集**必须**取自 `declaredToolNames`（十二件内置的唯一声明），
 // 另写一份名单必然漂移。
 // 14D 起来源优先取**运行期来源表**（受控重建会整组换掉某个 server 的工具名，装配期
 // 快照会过期）；没有来源表时退回连接快照扫描——两条路径的判定口径一致。

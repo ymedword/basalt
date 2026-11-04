@@ -449,6 +449,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// empty manifest means no auto-admission, so runtime executables need an explicit
 	// registration. This assembly intentionally invents no manifest file format.
 	policy := tool.NewWhitelistPolicy(tool.PolicyOptions{
+		AllowRunCode:    cfg.Execution.AllowRunCode,
 		Root:            root,
 		CrossAgentRead:  cfg.Sandbox.CrossAgentRead,
 		AllowedCommands: cfg.Shell.AllowedCommands,
@@ -478,7 +479,24 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// ProgramDir and ProgramManifest come from the same installer-produced source;
 		// left empty, the three-condition admission never fires.
 	})
-	// 十一件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 +
+	shellTool := tool.NewShellTool(policy, runner)
+	runCodeTool := tool.NewRunCodeTool(tool.RunCodeOptions{Policy: policy})
+	var isolationRT *isolationRuntime
+	if cfg.Isolation.Backend != "" {
+		marker, present, err := readInstanceMarkerAt(root)
+		if err != nil || !present {
+			return nil, abortRuntime(errors.New("隔离执行需要有效实例名册"), db, lock)
+		}
+		isolationRT, err = buildIsolation(ctx, isolationDeps{Config: cfg.Isolation, ShellConfig: cfg.Shell, Policy: policy, Root: root, InstanceID: marker.InstanceID, Store: db, Reader: db, Logger: logger})
+		if err != nil {
+			return nil, abortRuntime(fmt.Errorf("装配隔离执行: %w", err), db, lock)
+		}
+		if isolationRT.Shell != nil {
+			shellTool = isolationRT.Shell
+		}
+		runCodeTool = isolationRT.RunCode
+	}
+	// 十二件工具：三件文件工具 + US-5 的 shell / http_get / http_post + 两件记忆工具 +
 	// US-8 的 notify + US-10 的 manage_schedule + 14D 的 web_search（技能调用工具永久禁；
 	// US-7 的 MCP 各件在等值门禁之后注册——颗粒度文档 §3.5 后续占位 1）。`manage_schedule`
 	// 的编辑后端与 `web_search` 的凭据解析面都在 runtime / 注册表之后才存在，这里先建
@@ -506,7 +524,8 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
 		tool.NewListDirTool(policy, root),
-		tool.NewShellTool(policy, runner),
+		shellTool,
+		runCodeTool,
 		tool.NewHTTPGetTool(policy),
 		tool.NewHTTPPostTool(policy),
 		// save_memory 的工具侧拿到**带写后补索引**的门面（V-5）：Append 返回时 per-scope
@@ -1531,6 +1550,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpRT.ConnectedNames()))
 	return &heavyRuntime{
+		isolation:         isolationRT,
 		flows:             flowRuntime,
 		observability:     observation,
 		lock:              lock,
@@ -1745,7 +1765,7 @@ func authorAppliedMCPServers(ctx context.Context, versions *postgres.ResourceSto
 
 // declaredToolNames 是装配层注册池的**声明名集**（颗粒度文档 US-4 §2.4 注 4：名字在装配期
 // 一次导出——`workspace` 不反向 import `tool`，装载器只认这份字符串清单）。两个消费面读的是
-// 同一份：① 重路径在注册完十一件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
+// 同一份：① 重路径在注册完十二件工具之后拿它校验注册池（不一致即拒绝启动）；② 轻路径
 // （`profile list` / `profile show` 经 `agentsPort`）不建注册池，直接拿它当池做装载判定
 // （池外工具名 → 整只不注册，宪法 IV）。两条路因此对同一份 AGENT.md 给出同一个结论。
 // 顺序 = `tool.Registry.Names()` 的排序序（比较逐名且保序）——**不得**按主题分组重排。
@@ -1754,7 +1774,7 @@ func authorAppliedMCPServers(ctx context.Context, versions *postgres.ResourceSto
 // order matches Registry.Names(), which is sorted.
 var declaredToolNames = []string{
 	"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-	"recall_memory", "save_memory", "shell", "web_search", "write_file",
+	"recall_memory", "run_code", "save_memory", "shell", "web_search", "write_file",
 }
 
 // providerNameUnion 返回"配置文件名字 ∪ 未删除发布指针名字"的并集（去重、升序），只服务
@@ -1856,6 +1876,7 @@ func memoryCarrier(db *postgres.DB, now func() time.Time) (core.LongTermMemorySt
 // 读代码时一眼能看出"这是内部接线"还是"这是包外拿到的句柄"。
 // The heavy prefix keeps the internal handle distinguishable from the exported Runtime.
 type heavyRuntime struct {
+	isolation     *isolationRuntime
 	flows         *flowRuntime
 	observability *Observability
 	// lock 是实例锁：进程存续期间持有（写模式的语义就是"这一进程是唯一写者"）。

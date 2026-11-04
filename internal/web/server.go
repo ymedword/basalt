@@ -25,6 +25,10 @@ import (
 // Options 是 web 面的装配输入。所有端口由 app 层适配；web 只依赖 core 与标准库。
 // Options is the assembly surface; every port is adapted by the app layer.
 type Options struct {
+	// Isolation 与 Reader 必须来自同一运行实例，开启时不可缺读面。
+	// Isolation and its reader describe one runtime; enabled isolation requires the reader.
+	Isolation            IsolationView
+	IsolationExecutions  core.SandboxExecutionReader
 	Flows                FlowBackend
 	Observability        ObservabilityReader
 	ObservationLifecycle ObservationLifecycle
@@ -444,6 +448,10 @@ const consoleRootPath = "/console/"
 // 避免进程起来后每个请求都 500。
 // NewServer fills defaults and rejects a missing port up front.
 func NewServer(opts Options) (*Server, error) {
+	if opts.Isolation.Enabled && opts.IsolationExecutions == nil {
+		return nil, errors.New("启用隔离时缺少执行账本读面")
+	}
+	opts.Isolation = normalizedIsolationView(opts.Isolation)
 	if opts.Addr == "" {
 		opts.Addr = defaultAddr
 	}

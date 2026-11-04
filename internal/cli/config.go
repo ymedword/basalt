@@ -31,6 +31,7 @@ import (
 // ParseAuthorSection (module card §3.1.9): unknown-key rejection needs an explicit
 // entry point, so it is not decoded by the yaml decoder into the struct.
 type Config struct {
+	Isolation     IsolationConfig     `yaml:"-"`
 	Flows         flow.Config         `yaml:"-"`
 	Observability ObservabilityConfig `yaml:"-"`
 	// 服务入口需要区分键缺失与显式零值；不属于可序列化配置。
@@ -65,6 +66,9 @@ type Config struct {
 // ExecutionConfig 是执行档位段（`execution`，14D）。
 // ExecutionConfig is the `execution` section (14D).
 type ExecutionConfig struct {
+	// AllowRunCode 是独立的静态授权，不是数据库档位的种子。
+	// AllowRunCode explicitly authorizes generated code and is independent of profile.
+	AllowRunCode bool `yaml:"allow_run_code"`
 	// Profile 是首次种子档位（standard / strict）；空 = 新库按 standard、存量库由迁移写
 	// strict。运行期切档只经管理台（`PUT /api/v1/execution-policy`）。
 	// Profile seeds a fresh instance; runtime changes go through the console only.
@@ -760,6 +764,14 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 		return nil, err
 	}
 	cfg.Flows = flowConfig
+	isolationSection, isolationPresent := tree["isolation"]
+	cfg.Isolation, err = parseIsolationConfig(isolationSection, isolationPresent)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateIsolationConfig(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 

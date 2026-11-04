@@ -47,7 +47,7 @@ func writeLockFixture(t *testing.T) lockFixture {
 	t.Helper()
 	dir := t.TempDir()
 	fixture := lockFixture{
-		lock:       ImageLock{Schema: 1, AppBase: lockFixtureBase, Postgres: lockFixturePG},
+		lock:       ImageLock{Schema: 2, AppBase: lockFixtureBase, Postgres: lockFixturePG},
 		dockerfile: filepath.Join(dir, "Dockerfile"),
 		compose:    filepath.Join(dir, "compose.yaml"),
 		env:        filepath.Join(dir, ".env.example"),
@@ -125,20 +125,47 @@ func TestUS18_Image_LockMatchesSources(t *testing.T) {
 		t.Fatalf("重复引用必须被拒，got %v", err)
 	}
 
-	// 变异五：锁文件 schema 不是 1。
+	// 变异五：锁文件 schema 不是已批准的 2。
 	badSchema := fixture.lock
-	badSchema.Schema = 2
+	badSchema.Schema = 3
 	if err := CheckImageLock(badSchema, fixture.dockerfile, fixture.compose, fixture.env); err == nil {
-		t.Fatal("锁文件 schema 非 1 必须被拒")
+		t.Fatal("锁文件 schema 非 2 必须被拒")
 	}
 
 	// 变异六：锁文件里的引用缺 digest。
 	noDigest := filepath.Join(t.TempDir(), "image-lock.json")
 	if err := os.WriteFile(noDigest,
-		[]byte(`{"schema":1,"app_base":"alpine:3.23","postgres":"`+lockFixturePG+`"}`), 0o644); err != nil {
+		[]byte(`{"schema":2,"app_base":"alpine:3.23","postgres":"`+lockFixturePG+`"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReadImageLock(noDigest); err == nil {
 		t.Fatal("缺 digest 的锁文件必须被拒")
+	}
+}
+
+func TestUS20_ImageLockMerge(t *testing.T) {
+	source := ImageLock{Schema: 2, AppBase: lockFixtureBase, Postgres: lockFixturePG}
+	image := validImageRecord()
+	image.RepoDigest = "sha256:" + hex64("7")
+	merged, err := MergeSandboxImages(source, []ImageRecord{image}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := image.Tag + "@" + image.RepoDigest
+	if merged.Sandbox.OCI != want || merged.Sandbox.GVisor != want || source.Sandbox.OCI != "" || merged.AppBase != source.AppBase || merged.Postgres != source.Postgres {
+		t.Fatalf("bad merge: %+v", merged)
+	}
+	image.RepoDigest = ""
+	if _, err := MergeSandboxImages(source, []ImageRecord{image}, true); err == nil {
+		t.Fatal("local ID used as published digest")
+	}
+	preview, err := MergeSandboxImages(source, []ImageRecord{image}, false)
+	if err != nil || preview.Sandbox.OCI != "" {
+		t.Fatalf("unsigned preview: %+v %v", preview, err)
+	}
+	image.RepoDigest = "sha256:" + hex64("7")
+	image.BaseRef = lockFixtureBase
+	if _, err := MergeSandboxImages(source, []ImageRecord{image, image}, true); err == nil {
+		t.Fatal("ambiguous records accepted")
 	}
 }

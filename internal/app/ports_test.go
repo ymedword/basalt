@@ -84,18 +84,21 @@ func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 77, "运行期v8保留原60表并追加17张Flow表")
-	var legacy, observabilityTables, flowTables []string
+	require.Len(t, tables, 78, "运行期v9保留77表并追加隔离执行账本")
+	var legacy, observabilityTables, flowTables, sandboxTables []string
 	for _, table := range tables {
 		if strings.HasPrefix(table, "observability_") {
 			observabilityTables = append(observabilityTables, table)
 		} else if strings.HasPrefix(table, "flow_") {
 			flowTables = append(flowTables, table)
+		} else if strings.HasPrefix(table, "sandbox_") {
+			sandboxTables = append(sandboxTables, table)
 		} else {
 			legacy = append(legacy, table)
 		}
 	}
 	require.Len(t, legacy, 54, "v1基线的52表与保留账本的两表仍全部保留")
+	require.Equal(t, []string{"sandbox_executions"}, sandboxTables)
 	require.ElementsMatch(t, []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"}, observabilityTables)
 	require.ElementsMatch(t, []string{"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations"}, flowTables)
 }
@@ -640,14 +643,14 @@ func TestToolListerPort_ForwardsSpecsInRegistryOrder(t *testing.T) {
 	require.Equal(t, registry.Specs(registry.Names()), specs, "转调必须逐字段保真（描述与 schema 一并）")
 }
 
-// TestToolListerPort_HeavyAssemblyRegistersElevenTools：重路径装配池**十一件**——三件文件工具
+// TestToolListerPort_HeavyAssemblyRegistersElevenTools：保留旧测试锚点，US20 精确集扩至十二件。
 // 加 `shell` / `http_get` / `http_post`（US-5）、`save_memory` / `recall_memory`（US-6/7 记忆对）、
 // US-8 的 `notify`、US-10 的 `manage_schedule` 与 14D 的 `web_search`，且新件确实可解析
 // （`Resolve` 命中），不再是"注册了名字、背后没有实体"的形态。（判据面变更 §3.5 #4：
 // 原名 `...NineTools`，精确集 9 → 10；14D T125 再改名为 `...ElevenTools`，精确集 10 → 11，
 // 断言只收紧、不删除。）
 //
-// 名集是**恰好十一件**而不是"至少包含"：装配池少一件（搜索工具忘接）或多一件（误接线）
+// 名集是**恰好十二件**而不是"至少包含"：装配池少一件或多一件都是故障。
 // 都是装配故障，集合比较让两种都当场落红。
 // The pool is compared as an exact set: one tool short or one extra is an assembly
 // fault either way, and only the set comparison catches both.
@@ -662,10 +665,10 @@ func TestToolListerPort_HeavyAssemblyRegistersElevenTools(t *testing.T) {
 	}
 	require.Equal(t, []string{
 		"http_get", "http_post", "list_dir", "manage_schedule", "notify", "read_file",
-		"recall_memory", "save_memory", "shell", "web_search", "write_file",
-	}, names, "装配池补到十一件（三件文件工具 + shell / http_get / http_post + 两件记忆工具 + notify + manage_schedule + web_search）")
+		"recall_memory", "run_code", "save_memory", "shell", "web_search", "write_file",
+	}, names, "US20 精确登记十二件，run_code 未配置时仍可解析但执行拒绝")
 
-	for _, name := range []string{"shell", "http_get", "http_post", "save_memory", "recall_memory", "notify", "web_search"} {
+	for _, name := range []string{"shell", "http_get", "http_post", "save_memory", "recall_memory", "notify", "web_search", "run_code"} {
 		resolved, ok := rt.registry.Resolve(name)
 		require.True(t, ok, "工具必须在注册池内可解析：%s", name)
 		require.Equal(t, name, resolved.Name())

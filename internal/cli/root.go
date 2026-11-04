@@ -55,6 +55,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newDBCommand(deps),
 		newInstanceCommand(deps),
 		newFlowCommand(deps),
+		newIsolationCommand(deps),
 	)
 
 	return root

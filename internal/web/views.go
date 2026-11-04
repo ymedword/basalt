@@ -182,10 +182,11 @@ type MemoryCorrectionWrite struct {
 // SandboxView projects the four allowlists; http_allowed_domains is the live value
 // (managed and hot-swapped), the other three stay deployment configuration.
 type SandboxView struct {
-	FileAllowedPaths     []string `json:"file_allowed_paths"`
-	ShellAllowedCommands []string `json:"shell_allowed_commands"`
-	ShellInterpreters    []string `json:"shell_interpreters"`
-	HTTPAllowedDomains   []string `json:"http_allowed_domains"`
+	Isolation            IsolationView `json:"isolation"`
+	FileAllowedPaths     []string      `json:"file_allowed_paths"`
+	ShellAllowedCommands []string      `json:"shell_allowed_commands"`
+	ShellInterpreters    []string      `json:"shell_interpreters"`
+	HTTPAllowedDomains   []string      `json:"http_allowed_domains"`
 	// NetworkAllowlist 是出网域名白名单的生效元数据（R8.2.2）：`etag` 用于条件写
 	// 的 If-Match，`revision` 从 1 起（0 = 管理服务未装载），`source` 为
 	// config_seed | database，`updated_by` 是脱敏 actor（种子为空串）。
@@ -406,7 +407,8 @@ type RunView struct {
 // RunDetailView flattens RunView and adds the admission manifest view.
 type RunDetailView struct {
 	RunView
-	ResourceManifest *RunResourceManifestView `json:"resource_manifest"`
+	IsolationExecutions []IsolationExecutionView `json:"isolation_executions"`
+	ResourceManifest    *RunResourceManifestView `json:"resource_manifest"`
 }
 
 // RunResourceManifestView 是准入清单的 HTTP 视图（契约 components.schemas
@@ -640,6 +642,7 @@ func sandboxView(cfg SandboxConfig) SandboxView {
 // and an empty ETag, which truthfully means "no authoritative row to write against".
 func (s *Server) sandboxView() SandboxView {
 	view := sandboxView(s.opts.Sandbox)
+	view.Isolation = normalizedIsolationView(s.opts.Isolation)
 	if s.opts.NetworkAllowlist != nil {
 		policy := s.opts.NetworkAllowlist.Current()
 		view.HTTPAllowedDomains = nonNilStrings(policy.Domains)
@@ -923,8 +926,9 @@ func runRecordView(rec core.RunDetail) RunView {
 // runDetailView combines the ledger row with the admission manifest view.
 func runDetailView(rec core.RunDetail) RunDetailView {
 	return RunDetailView{
-		RunView:          runRecordView(rec),
-		ResourceManifest: runResourceManifestView(rec.ResourceManifest),
+		IsolationExecutions: []IsolationExecutionView{},
+		RunView:             runRecordView(rec),
+		ResourceManifest:    runResourceManifestView(rec.ResourceManifest),
 	}
 }
 

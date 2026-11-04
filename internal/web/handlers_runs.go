@@ -112,7 +112,19 @@ func (s *Server) handleRunDetail(w http.ResponseWriter, r *http.Request, actor c
 		s.writeRunLedgerError(w, err, id)
 		return
 	}
-	s.writeOK(w, runDetailView(rec))
+	view := runDetailView(rec)
+	if s.opts.IsolationExecutions != nil {
+		rows, err := s.opts.IsolationExecutions.SandboxExecutionsByRun(r.Context(), id)
+		if err != nil {
+			s.logger().Error("读取隔离执行详情失败", "run_id", id, "error", err)
+			s.writeError(w, http.StatusInternalServerError, codeInternal, messageInternal)
+			return
+		}
+		for _, row := range rows {
+			view.IsolationExecutions = append(view.IsolationExecutions, isolationExecutionView(row))
+		}
+	}
+	s.writeOK(w, view)
 }
 
 // handleCancelRun 请求取消并返回**当前**状态：等待上限与信号传播都在 core，本层只

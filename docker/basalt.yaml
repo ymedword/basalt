@@ -3,6 +3,8 @@
 # Basalt container config template, seeded to /data/basalt.yaml on first boot and
 # never overwritten afterwards. These are deployment example values, not product
 # defaults.
+# 任务隔离默认关闭；宿主 Linux 的静态配置与前置见 docs/contracts/isolation.md。
+# Task isolation is off by default; see the host-Linux isolation contract.
 
 http:
   # 容器内监听全部网卡，由 compose 的 ports 只发布到宿主回环。

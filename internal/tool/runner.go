@@ -77,7 +77,7 @@ type RunnerOptions struct {
 type LocalRunner struct {
 	root           string
 	envPassthrough []string
-	interpreters   map[string]struct{}
+	interpreters   map[string]bool
 	maxOutputBytes int                    // 装配期上限（非正值按缺省）；逐 Run 收窄经 effectiveMaxOutputBytes
 	programRuntime string                 // `<ProgramDir>/runtime`（空 = 未装配程序目录）
 	programPaths   map[string]string      // 相对 runtime 的折叠路径（`/` 分隔）→ SHA-256
@@ -94,10 +94,7 @@ var _ core.CommandRunner = (*LocalRunner)(nil)
 // 上限按**装配值原样**存下（含非正值），生效值逐次执行时由 effectiveMaxOutputBytes 算。
 // NewLocalRunner wires the runner; the lists become explicit lookup tables.
 func NewLocalRunner(opts RunnerOptions) *LocalRunner {
-	interpreters := make(map[string]struct{}, len(opts.Interpreters))
-	for _, name := range opts.Interpreters {
-		interpreters[name] = struct{}{}
-	}
+	interpreters := interpreterSet(opts.Interpreters)
 	runner := &LocalRunner{
 		root:           filepath.Clean(opts.Root),
 		envPassthrough: slices.Clone(opts.EnvPassthrough),
@@ -140,6 +137,9 @@ func (r *LocalRunner) effectiveMaxOutputBytes(cmd core.Command) int {
 // 退出码连同合并后的输出一并交给调用方判读（失败分类归工具层）。
 // Run executes one guarded command; a non-zero exit code is a result, not an error.
 func (r *LocalRunner) Run(ctx context.Context, cmd core.Command) (core.CommandResult, error) {
+	if cmd.Isolation != nil {
+		return core.CommandResult{}, deny("隔离请求不能由本机执行器承接", cmd.Executable, "没有配置键可以降级；请装配所选隔离执行档。")
+	}
 	if err := r.checkShellName(cmd); err != nil {
 		return core.CommandResult{}, err
 	}
@@ -344,28 +344,7 @@ func (r *LocalRunner) childEnv(cmd core.Command) ([]string, error) {
 // Interpreter argv shape and script-path validation live here, on the execution side:
 // the authorization face sees only the executable string, never the argv.
 func (r *LocalRunner) checkInterpreter(cmd core.Command) error {
-	if _, ok := r.interpreters[cmd.Executable]; !ok {
-		return nil
-	}
-	if len(cmd.Args) == 0 {
-		return deny(ruleInterpreterShape, "（无参数）", guidanceInterpreterShape)
-	}
-	script := cmd.Args[0]
-	// argv 首项必须是**脚本路径**：`-c` / `-e` 这类内联代码形态一律拒（放行它们等于
-	// 把解释器变成不受 scripts/ 只读区约束的任意代码通道）。
-	if strings.HasPrefix(script, "-") {
-		return deny(ruleInterpreterShape, script, guidanceInterpreterShape)
-	}
-	real, err := resolveRealPath(cmd.Dir, script)
-	if err != nil {
-		return deny(ruleScriptOutside, script, guidanceScriptOutside)
-	}
-	for _, dir := range r.scriptRoots(cmd) {
-		if withinDir(real, dir) {
-			return nil
-		}
-	}
-	return deny(ruleScriptOutside, script, guidanceScriptOutside)
+	return validateControlledCommand(cmd, r.interpreters, r.scriptRoots(cmd))
 }
 
 // checkShellName 是**执行侧**的同一道能力上限（14D §2.2.5 / D7）：授权面按命令名字面判过

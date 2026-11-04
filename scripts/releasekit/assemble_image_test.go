@@ -36,6 +36,7 @@ func writeFakeRepo(t *testing.T) (repo, runtimeDir string) {
 	files := map[string]string{
 		"go.mod":  "module example.com/basalt-fake\n\ngo 1.27\n",
 		"LICENSE": "Apache License\n",
+		filepath.Join("release", "image-lock.json"): `{"schema":2,"app_base":"` + lockFixtureBase + `","postgres":"` + lockFixturePG + `","sandbox":{"oci":"","gvisor":""}}`,
 		filepath.Join("cmd", "basalt", "main.go"): "package main\n\nimport \"fmt\"\n\nvar version = \"dev\"\n\n" +
 			"func main() { fmt.Println(\"basalt\", version) }\n",
 		filepath.Join("cmd", "basalt-verify", "main.go"): "package main\n\nimport \"fmt\"\n\nvar version = \"dev\"\n\n" +

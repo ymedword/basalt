@@ -84,3 +84,9 @@ The compact summary below is also used in the README. Four additional views expl
 ## Current scope {#current-scope}
 
 This version provides single-node, multi-agent hosting. Opt-in durable sequential flows coordinate immutable published steps through the original Run and audit path. Unknown side effects stop advancement. Parallel graphs, multi-node distributed execution, automatic learning, enterprise SSO and multi-tenant governance remain outside this version. Logical scopes do not provide process or container fault isolation. Data sent to model endpoints and external tools follows their configured services.
+
+## Opt-in task isolation
+
+Linux deployments can explicitly bind controlled shell commands to hardened OCI/runc and generated code (`run_code`) to gVisor/runsc. Both run without network access or service credentials, with fixed images and bounded resources. Startup verifies runtime capability and signed image trust; unavailable isolation refuses execution. The default remains local execution. Output space has an instance-wide hard limit and can be contended by tasks; v1 has no per-task output filesystem quota.
+
+The existing console displays execution profiles and cleanup outcomes without adding configuration controls. MCP, HTTP and notification tools keep their existing paths. A service container alone does not isolate individual tasks. microVMs, automatic isolation of all tools and equivalent native Windows/macOS isolation are outside this increment.

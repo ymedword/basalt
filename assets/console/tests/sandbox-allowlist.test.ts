@@ -9,6 +9,7 @@ import type { SandboxView as SandboxViewData } from '../src/api'
 import { ConsoleAuth } from '../src/auth'
 import { ConsoleRouter } from '../src/router'
 import { SandboxView } from '../src/views/workspace'
+import { isolationFixture } from './isolation-fixture'
 
 interface Call {
   readonly url: string
@@ -21,6 +22,7 @@ const NEW_ETAG = `"sha256:${'b'.repeat(64)}"`
 function sandboxView(domains: readonly string[],
   overrides: Partial<SandboxViewData['network_allowlist']> = {}): SandboxViewData {
   return {
+    isolation: isolationFixture(),
     file_allowed_paths: [],
     shell_allowed_commands: [],
     shell_interpreters: [],

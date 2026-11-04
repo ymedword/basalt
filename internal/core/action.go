@@ -29,8 +29,8 @@ type Action struct {
 	RunBound bool
 }
 
-// ActionType 是四类动作的字面量集合（**动作类型不含命令行参数**）。
-// ActionType is the literal set of the four action kinds.
+// ActionType 是动作字面量集合（**动作类型不含命令行参数**）。
+// ActionType is the literal set of action kinds without command-line arguments.
 type ActionType string
 
 const (
@@ -42,6 +42,9 @@ const (
 	ActionShellCommand ActionType = "SHELL_COMMAND"
 	// ActionHTTPRequest 是出网判定——逐跳校验由调用方在每一跳发送前再次 Check（US-5 驱动）。
 	ActionHTTPRequest ActionType = "HTTP_REQUEST"
+	// ActionRunCode 是显式授权的生成代码执行动作。
+	// ActionRunCode authorizes generated code independently of the execution profile.
+	ActionRunCode ActionType = "RUN_CODE"
 )
 
 // Command 是一次受控子进程执行请求，经 CommandRunner.Run 消费。
@@ -51,11 +54,12 @@ const (
 // carried separately: authorization compares the executable string verbatim while the
 // runner validates argv shape.
 type Command struct {
-	Executable     string   // 与 shell.allowed_commands / interpreters 比对的对象（多词串必拒）
-	Args           []string // argv 原样传递，不经任何 shell 解释
-	Dir            string   // 工作目录：有 Agent 上下文 = 该 Agent 的目录；空 = 进程默认 CWD（不引入全局 chdir）
-	Env            []string // 工具显式声明的附加变量（KEY=VALUE）；透传白名单在 Runner 侧统一执行
-	MaxOutputBytes int      // 本次执行的读取侧上限；<=0 = 用 runner 装配值；只许比装配值更短
+	Executable     string         // 与 shell.allowed_commands / interpreters 比对的对象（多词串必拒）
+	Args           []string       // argv 原样传递，不经任何 shell 解释
+	Dir            string         // 工作目录：有 Agent 上下文 = 该 Agent 的目录；空 = 进程默认 CWD（不引入全局 chdir）
+	Env            []string       // 工具显式声明的附加变量（KEY=VALUE）；透传白名单在 Runner 侧统一执行
+	MaxOutputBytes int            // 本次执行的读取侧上限；<=0 = 用 runner 装配值；只许比装配值更短
+	Isolation      *IsolationSpec // 非 nil 必须由容器承接；non-nil requires isolation.
 }
 
 // CommandResult 是一次受控执行的产出：stdout 与 stderr **合并**为单串（顺序即进程写出顺序）。
@@ -66,4 +70,5 @@ type CommandResult struct {
 	Output    string
 	ExitCode  int
 	Truncated bool
+	Execution *CommandExecution // 容器事实投影；nil preserves local execution.
 }

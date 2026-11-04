@@ -18,6 +18,10 @@ services:
     volumes:
       - workspace:/data
       - private:/var/lib/basalt
+      # 可选只读发布清单；仅挂清单不启用隔离，默认不挂 Docker socket。
+      # Optional trust files; task isolation and Docker access are not enabled here.
+      # - ./release/image-lock.json:/etc/basalt/image-lock.json:ro
+      # - ./release/image-lock.json.sig:/etc/basalt/image-lock.json.sig:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=256m
     secrets: [database_dsn]

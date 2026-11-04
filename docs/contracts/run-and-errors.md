@@ -699,3 +699,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - 周期按 `caller_limits.timezone` 的本地 00:00 起算（缺省 UTC），`period_start` 存 Unix 毫秒 UTC；`Commit` / `Release` / `Reconcile` **总是**更新创建时那个周期的行，**不得**按当前时间重算。
 - 额度按 `CallerID` 计，**不按 `KeyID`**：同一调用方的多个 Key 共享额度，轮换 / 吊销单个 Key **不得**重置周期或清零用量。
 - 配额服务（PG）故障 → **拒绝新的受控消耗**（fail-closed），不放行；在途 reservation 保持 `pending`，恢复后核对。
+
+## US-20 执行隔离补充
+
+执行隔离不增加顶层 `error_kind`，也不扩展四类 `policy_denial_reason`。隔离原因、生命周期账本、两档执行边界与只读投影见 [执行隔离契约](isolation.md)。取消/超时保留 context 错误身份；未知执行不得自动重试或降级本地。调用审计与消息仍由既有唯一执行路径写入。

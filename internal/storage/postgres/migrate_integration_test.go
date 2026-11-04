@@ -87,6 +87,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		6: "migrations/0006_observability.sql",
 		7: "migrations/0007_history_retention.sql",
 		8: "migrations/0008_flow.sql",
+		9: "migrations/0009_sandbox_execution.sql",
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT version, description FROM schema_version ORDER BY version`)
 	require.NoError(t, err)
@@ -103,11 +104,12 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 
 	tables, err := tableNames(ctx, conn)
 	require.NoError(t, err)
-	require.Len(t, tables, 77, "原60表与0008追加的17张Flow表必须全部存在")
+	require.Len(t, tables, 78, "原77表与0009追加的隔离执行账本必须全部存在")
 	for _, name := range []string{
 		"callers", "sessions", "messages", "runs", "kb_chunks", "kb_chunk_embeddings",
 		"compaction_entries", "context_assembly_records", "diagnostic_events", "storage_cutover",
 		"history_retention_runs", "history_retention_rollups",
+		"sandbox_executions",
 		"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations",
 	} {
 		require.Contains(t, tables, name)

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
-<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、自托管 PostgreSQL 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
+<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、自托管 PostgreSQL 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4. US20 working-tree addition: explicit OCI/runc shell and gVisor/runsc code isolation; default local execution, no network or service credentials in tasks, signed images and fail-closed startup.</desc>
 <metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
 <rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
@@ -155,7 +155,7 @@
 <g data-node-id="processes"><rect x="1320" y="590" width="250" height="160" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
 <text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">本地子进程</text>
 <text x="1334" y="638" font-size="17" fill="#59687a">命令与脚本</text>
-<text x="1334" y="660" font-size="17" fill="#59687a">策略与 LocalRunner</text>
+<text x="1334" y="660" font-size="17" fill="#59687a">策略与执行器</text>
 <text x="1334" y="682" font-size="17" fill="#59687a">当前不提供容器</text>
 <text x="1334" y="704" font-size="17" fill="#59687a">级别的故障隔离</text>
 </g>

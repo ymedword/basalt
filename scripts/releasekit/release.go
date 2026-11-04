@@ -177,6 +177,24 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 	if err != nil {
 		return err
 	}
+	if len(images) > 0 {
+		source, err := ReadImageLock(filepath.Join(in.Repo, "release", imageLockName))
+		if err != nil {
+			return err
+		}
+		merged, err := MergeSandboxImages(source, images, in.Mode == ModeFinal)
+		if err != nil {
+			return err
+		}
+		if err := writeJSON(filepath.Join(opts.OutDir, imageLockName), merged); err != nil {
+			return err
+		}
+		if in.Mode == ModeFinal {
+			if _, err := SignFile(opts.SigningKey, opts.OutDir, imageLockName); err != nil {
+				return err
+			}
+		}
+	}
 	for _, target := range DefaultTargets() {
 		if _, err := BuildVerifier(ctx, in.Repo, in.Version, target, opts.OutDir); err != nil {
 			return err
@@ -241,6 +259,9 @@ func assembleRelease(ctx context.Context, opts AssembleOptions) error {
 		record.Signing = SigningInfo{
 			Status: "signed", Algorithm: "ed25519", PublicKeyFingerprint: fingerprint,
 			SignedFiles: []string{recordSignature, sumsSignature},
+		}
+		if len(images) > 0 {
+			record.Signing.SignedFiles = append(record.Signing.SignedFiles, imageLockSignature)
 		}
 	}
 	if err := writeJSON(filepath.Join(opts.OutDir, releaseRecordName), record); err != nil {

@@ -186,6 +186,7 @@ func Run(ctx context.Context, args []string) int {
 	// 声明的端口，storage / workspace 的实现细节不越过这道接缝。
 	// The adapters are injected here; the command surface only sees its own ports.
 	deps := cli.Deps{
+		IsolationProbe:         isolationProbePort{Config: cfg, ConfigErr: cfgErr, Root: filepath.Join(workDir, workspaceDirName), Logger: logger},
 		WorkDir:                workDir,
 		SupportedSchemaVersion: postgres.SupportedSchemaVersion,
 		// init 引导的是 SQLite 源谱系（v6）：与运行期 PG 谱系（v1）分开传，混用会写出

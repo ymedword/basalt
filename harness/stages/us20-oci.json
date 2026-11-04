@@ -1,0 +1,213 @@
+{
+    "version":  1,
+    "id":  "us20-oci",
+    "approval":  "User review 1 passed 2026-11-04; approved R1.5 SHA256 9bd639e9280d81b2e1815ad4f57b22acf69fbeb9f285226faeb965b83e3b1c78. WSL Linux authorized for US20; review 2 pending.",
+    "inputs":  [
+                   "specs/020-execution-isolation/spec.md",
+                   "specs/020-execution-isolation/plan.md",
+                   "specs/020-execution-isolation/tasks.md",
+                   "harness/acceptance.json"
+               ],
+    "protect":  [
+                    "internal/tool/isolation_runner_test.go",
+                    "internal/tool/isolation_ledger_test.go",
+                    "internal/tool/runcode_test.go",
+                    "internal/tool/runcode_artifacts_test.go",
+                    "internal/cli/config_isolation_test.go",
+                    "internal/app/isolation_test.go",
+                    "internal/app/isolation_e2e_test.go",
+                    "internal/e2e/us20_fixture_test.go",
+                    "internal/e2e/us20_oci_test.go",
+                    "internal/e2e/us20_gvisor_test.go",
+                    "internal/web/isolation_view_test.go",
+                    "internal/core/isolation_audit_test.go",
+                    "internal/tool/isolation_runner.go",
+                    "internal/tool/isolation_cli.go",
+                    "internal/tool/isolation_cleanup.go",
+                    "internal/tool/runcode.go",
+                    "internal/tool/runcode_stage.go",
+                    "internal/tool/runcode_artifacts.go",
+                    "internal/tool/isolation_ledger.go",
+                    "internal/tool/shelltools.go",
+                    "internal/tool/runner.go",
+                    "internal/tool/command_guard.go",
+                    "internal/app/isolation.go",
+                    "internal/app/isolation_recovery.go",
+                    "internal/cli/config.go",
+                    "internal/cli/config_isolation.go",
+                    "internal/storage/postgres/isolation.go",
+                    "internal/storage/postgres/migrations/0009_sandbox_execution.sql",
+                    "assets/console/src/views/workspace.ts",
+                    "assets/console/src/views/run-detail.ts",
+                    "assets/console/src/views/isolation.ts"
+                ],
+    "checks":  [
+                   {
+                       "id":  "us20-oci-lifecycle",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=20m",
+                                    "-tags=e2e",
+                                    "./internal/e2e",
+                                    "-run",
+                                    "^TestUS20_OCI_(ShellLifecycle|CancelTimeout|Lifecycle)$"
+                                ],
+                       "timeout_seconds":  1500,
+                       "required_tests":  [
+                                              "TestUS20_OCI_ShellLifecycle",
+                                              "TestUS20_OCI_CancelTimeout",
+                                              "TestUS20_OCI_Lifecycle"
+                                          ],
+                       "level":  "process"
+                   },
+                   {
+                       "id":  "us20-oci-security",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=20m",
+                                    "-tags=e2e",
+                                    "./internal/e2e",
+                                    "-run",
+                                    "^TestUS20_OCI_(NoNetwork|NoHostSecrets|ReadOnlyRoot|ResourceLimits)$"
+                                ],
+                       "timeout_seconds":  1500,
+                       "required_tests":  [
+                                              "TestUS20_OCI_NoNetwork",
+                                              "TestUS20_OCI_NoHostSecrets",
+                                              "TestUS20_OCI_ReadOnlyRoot",
+                                              "TestUS20_OCI_ResourceLimits"
+                                          ],
+                       "level":  "process"
+                   },
+                   {
+                       "id":  "us20-oci-cleanup",
+                       "args":  [
+                                    "go",
+                                    "test",
+                                    "-json",
+                                    "-count=1",
+                                    "-timeout=20m",
+                                    "-tags=e2e",
+                                    "./internal/e2e",
+                                    "./internal/app",
+                                    "-run",
+                                    "^TestUS20_OCI_(OrphanCleanup|OrphanDirSweep|CrashResidue|RecoveryReleasesCapacity|ImageDigestMismatch|ImageNotApproved)$"
+                                ],
+                       "timeout_seconds":  1200,
+                       "required_tests":  [
+                                              "TestUS20_OCI_OrphanCleanup",
+                                              "TestUS20_OCI_OrphanDirSweep",
+                                              "TestUS20_OCI_CrashResidue",
+                                              "TestUS20_OCI_RecoveryReleasesCapacity",
+                                              "TestUS20_OCI_ImageDigestMismatch",
+                                              "TestUS20_OCI_ImageNotApproved"
+                                          ],
+                       "level":  "process"
+                   }
+               ],
+    "tasks":  [
+                  {
+                      "id":  "T007",
+                      "checks":  [
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T010",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security"
+                                 ]
+                  },
+                  {
+                      "id":  "T011",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T012",
+                      "checks":  [
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T013",
+                      "checks":  [
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T016",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security"
+                                 ]
+                  },
+                  {
+                      "id":  "T017",
+                      "checks":  [
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T018",
+                      "checks":  [
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T023",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security"
+                                 ]
+                  },
+                  {
+                      "id":  "T024",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security",
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T025",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security",
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T027",
+                      "checks":  [
+                                     "us20-oci-security",
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T029",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security",
+                                     "us20-oci-cleanup"
+                                 ]
+                  },
+                  {
+                      "id":  "T030",
+                      "checks":  [
+                                     "us20-oci-lifecycle",
+                                     "us20-oci-security",
+                                     "us20-oci-cleanup"
+                                 ]
+                  }
+              ]
+}
