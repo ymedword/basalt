@@ -53,11 +53,10 @@ func knTestDB(t *testing.T) *DB {
 		seen[extSchema] = true
 		paths = append(paths, extSchema)
 	}
-	db, err := Open(context.Background(), Config{
+	db := openMigratedTestDB(t, Config{
 		DSN:            withSearchPath(t, testDSN(t), paths...),
 		ConnectTimeout: 5 * time.Second,
 	})
-	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return db
 }

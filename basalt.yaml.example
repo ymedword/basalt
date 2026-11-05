@@ -162,19 +162,23 @@ budget:
 
 # 会话压缩段（US-16）：超长会话是否主动摘要。
 # 关闭（缺省）时行为与升级前一致——不压缩，超限走整组裁剪或显式拒绝。
-# 打开必须给全八个配套键（D-24：装载层不预填阈值，数值由容量实验冻结），
-# 缺任一即拒绝启动并**一次列全**缺失键，避免部署者反复重启试错。
+# 打开时除 keep_recent_groups 外的七个键必须给全（D-24：装载层不预填阈值，
+# 数值由容量实验冻结），缺任一即拒绝启动并**一次列全**缺失键，避免部署者
+# 反复重启试错。keep_recent_groups 是唯一例外：省略时取部署初始值 4
+# （2026-11-05 用户裁决；4 是机制推导的初始值，不是容量实验冻结值）；
+# 显式写 0 / 负数仍拒绝。
 compaction:
   enabled: false                      # 缺省 false
-  # 以下八个键仅在 enabled: true 时必填：
+  # 以下七个键仅在 enabled: true 时必填：
   # trigger_ratio: <0<r<1>            # 主动压缩触发比例（投影超过 r × 可用输入即触发）
-  # keep_recent_groups: <N>           # 保留最近完整工具组数
   # summary_max_tokens: <N>           # 摘要调用**自身**的输出上限（与下一条分开）
   # output_reserve_tokens: <N>        # 本轮回复预留，参与投影判定
   # safety_margin_ratio: <0<=r<1>     # 估算误差缓冲，同时收紧触发线与压缩后准入线
   # timeout_seconds: <N>              # 摘要调用超时，与 Run 取消共用 ctx
   # prompt_version: <v>               # 摘要模板版本，进条目与装配记录
   # strategy_version: <v>             # 切点 / 预算策略版本，进条目与装配记录
+  # 唯一可选键（默认 4）：
+  # keep_recent_groups: <N>=1>        # 保留最近完整工具组数；不写 = 4
 
 # 沙箱白名单（WhitelistPolicy 的配置入口；逐项以 docs/TechnicalDesign.md §4.3 为准）
 sandbox:

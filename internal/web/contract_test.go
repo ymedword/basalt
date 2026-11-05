@@ -960,6 +960,7 @@ func TestOpenAPI_ViewEnumsMatchGoLiterals(t *testing.T) {
 			"network_allowlist", "network_denylist", "execution_policy", "network_exception", "system",
 			"caller", "instance", "memory",
 			core.TargetKindKnowledgeUpload, core.TargetKindKnowledgeDocument, core.TargetKindKnowledgeCollection,
+			core.TargetKindSkillAdmission,
 			"provider", "mcp", "schedule_trigger",
 		}, validOperationTargetKind),
 		"OperationView.target_kind 的接受集合必须等于契约枚举")

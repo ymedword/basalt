@@ -756,6 +756,17 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// pending 行按条目行状态与正文摘要判定三态（契约 §9.4）。
 		// The memory verdicts read the very carrier the write path uses.
 		Memory: memStore,
+		// 准入操作的只读查证面（US-21 / 颗粒度文档 §2.3.7）：准入写面走独立 CLI 端口，
+		// 崩溃留下的 pending 行由下一次服务启动查证。这里只装配查证需要的工作区根与
+		// 准入仓储——`LockResource` / `References` 归写会话，恢复只读行与候选目录。
+		// The admission verifier needs only the workspace root and the admission store;
+		// the write-side lock table stays with the CLI session.
+		Admission: NewAdmissionAdmin(AdmissionAdminDeps{
+			Root:   root,
+			Store:  postgres.NewAdmissionStore(db),
+			Logger: logger,
+			Now:    a.nowOr(),
+		}),
 	}); err != nil {
 		return fail(err)
 	}

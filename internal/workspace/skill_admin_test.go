@@ -203,6 +203,28 @@ func TestSkillImport_BoundaryMatrix(t *testing.T) {
 	require.Equal(t, []string{"SKILL.md", "docs/guide.md"}, candidatePaths(cand))
 }
 
+// TestSkillImport_EdgeWhitespace：US-21 review ② F-03 的回归——段首尾空白一律拒绝。
+// `run.sh ` 的扩展名是带空格的 ".sh "，不拒绝即可把脚本伪装成普通文件，绕过静态
+// 审查与高风险提出者 ≠ 批准者分离；Win32 还会静默剥离尾随空格，让冻结清单与落盘
+// 名字不一致。判别力：删掉 normalizeSkillFilePath 的空白段判定，全部用例转红。
+func TestSkillImport_EdgeWhitespace(t *testing.T) {
+	for _, badPath := range []string{
+		"scripts/run.sh ",
+		"scripts/collect. ",
+		" notes.md",
+		"dir /notes.md",
+		"docs/ guide.md",
+	} {
+		t.Run(badPath, func(t *testing.T) {
+			_, err := workspace.ValidateSkillDraft("demo", authorFiles(t,
+				"SKILL.md", skillMD("demo", "空白", "body"),
+				badPath, "x",
+			))
+			requireImportRejected(t, err, "空白")
+		})
+	}
+}
+
 // TestSkillImport_CaseFoldDuplicate：大小写折叠后重名拒绝——Windows / macOS 上两个
 // 路径会落到同一文件，留着就是"发布清单与实际落盘不一致"的伏笔。
 func TestSkillImport_CaseFoldDuplicate(t *testing.T) {

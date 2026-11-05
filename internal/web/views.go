@@ -2025,6 +2025,96 @@ func agentFilesView(files core.AgentFiles, etag string) AgentFilesView {
 	}
 }
 
+// AdmissionListView 是学习准入候选的列表行（US-21 §3.1.11）：只有数据库行的
+// 投影，**没有**清单摘要与文件正文；`state` 是派生展示态（approved 且活跃批准
+// 过期时显示 expired）。列表不显示批准有效期，详情里的 decision 携带 expires_at。
+// AdmissionListView is one list row; the state is the derived display state and no
+// manifest digest or file body appears here.
+type AdmissionListView struct {
+	CandidateID     string `json:"candidate_id"`
+	SkillName       string `json:"skill_name"`
+	State           string `json:"state"`
+	RiskTier        string `json:"risk_tier"`
+	ProposerSubject string `json:"proposer_subject"`
+	CandidateHash   string `json:"candidate_hash"`
+	SourceHash      string `json:"source_hash"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+// AdmissionDetailView 是学习准入候选的详情（列表行摊平 + 结构化来源声明 +
+// 冻结清单摘要 + 最新评估 / 决策 / 发布记录）；子记录缺失时对应字段为 null。
+// AdmissionDetailView flattens the list row and adds the structured source, the frozen
+// manifest digests, and the latest evaluation / decision / publication.
+type AdmissionDetailView struct {
+	AdmissionListView
+	// Source 是严格解析后的来源声明；`notes` 不整段出站（置空）。
+	// Source is the parsed declaration with the free-form notes withheld.
+	Source      core.AdmissionSource      `json:"source"`
+	Files       []AdmissionFileView       `json:"files"`
+	Evaluation  *AdmissionEvaluationView  `json:"evaluation"`
+	Decision    *AdmissionDecisionView    `json:"decision"`
+	Publication *AdmissionPublicationView `json:"publication"`
+}
+
+// AdmissionFileView 是冻结清单的一条文件摘要（路径 / 哈希 / 大小），**没有**正文。
+// AdmissionFileView is one frozen manifest digest; file bodies never appear.
+type AdmissionFileView struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+// AdmissionEvaluationView 是最新一次确定性评估的投影：七维判定、脚本清单与
+// 绑定证据；持久内部结构（baseline / approved_scope）不在此出站。
+// AdmissionEvaluationView projects the latest evaluation without internal blobs.
+type AdmissionEvaluationView struct {
+	EvaluationID      string                    `json:"evaluation_id"`
+	CandidateRevision int64                     `json:"candidate_revision"`
+	CandidateHash     string                    `json:"candidate_hash"`
+	EvaluationHash    string                    `json:"evaluation_hash"`
+	GraderVersion     string                    `json:"grader_version"`
+	PolicyHash        string                    `json:"policy_hash"`
+	Dimensions        []core.AdmissionDimension `json:"dimensions"`
+	Scripts           []string                  `json:"scripts"`
+	Aggregate         string                    `json:"aggregate"`
+	RiskTier          string                    `json:"risk_tier"`
+	Referrers         []string                  `json:"referrers"`
+	EvaluatedAt       string                    `json:"evaluated_at"`
+}
+
+// AdmissionDecisionView 是最新一次批准 / 拒绝的投影：批准者主体只能来自本机
+// CLI（不在请求字段里），有效期与理由按写入时的上限（2000 字符）展示。
+// AdmissionDecisionView projects the latest decision; the approver subject comes from
+// the local CLI identity only.
+type AdmissionDecisionView struct {
+	DecisionID      string   `json:"decision_id"`
+	Decision        string   `json:"decision"`
+	Reason          string   `json:"reason"`
+	Acknowledged    []string `json:"acknowledged"`
+	RiskTier        string   `json:"risk_tier"`
+	ApproverSubject string   `json:"approver_subject"`
+	ExpiresAt       string   `json:"expires_at"`
+	SupersededAt    string   `json:"superseded_at"`
+	CreatedAt       string   `json:"created_at"`
+}
+
+// AdmissionPublicationView 是发布记录的投影：版本号与内容哈希、发布 / 撤回
+// 状态与撤回分类（withdraw_version_id 为 0 表示本次撤回没有移动发布指针）。
+// AdmissionPublicationView projects the publication record and its withdrawal
+// classification; a zero withdraw_version_id means the pointer never moved.
+type AdmissionPublicationView struct {
+	SkillName         string `json:"skill_name"`
+	VersionID         int64  `json:"version_id"`
+	VersionNo         int64  `json:"version_no"`
+	ContentHash       string `json:"content_hash"`
+	State             string `json:"state"`
+	PublishedAt       string `json:"published_at"`
+	WithdrawnAt       string `json:"withdrawn_at"`
+	WithdrawReason    string `json:"withdraw_reason"`
+	WithdrawVersionID int64  `json:"withdraw_version_id"`
+}
+
 // formatTime 是视图时间字段的唯一格式器：RFC3339 UTC；零值渲染空串（约束 34）。
 // formatTime is the single time formatter for views; zero renders as empty.
 func formatTime(t time.Time) string {

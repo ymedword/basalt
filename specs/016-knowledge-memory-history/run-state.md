@@ -8696,3 +8696,27 @@ US-16 保持**未收口**；`main` 未动。
   其余未验证项（最终树全量验收、首启配置路径）**保持未验证**，依据见 R172 ·3，
   不得改写成通过。
 - 演示实例以 `092e1cd` 运行，回退件就位；数据、密钥、配置均未变动。
+
+## R175 · 2026-11-05 · D-24 修订：`keep_recent_groups` 省略时装载层取 4（用户裁决）
+
+·1 **裁决与范围**
+
+- 用户 2026-11-05 明确要求：`compaction.keep_recent_groups` 不填时默认 4，且后续部署同样生效（「不止 us16，我后面部署也要默认 4，这个要持久化生效」）。这是对 D-24「装载层不预填阈值」的**定向修订**，只放开这一个键。
+- 生效范围：`compaction.enabled: true` 且未写 `keep_recent_groups` 时，装载层落值 4；其余七个键仍全部必填并一次列全；显式写 0 / 负数仍拒绝；`enabled: false` 时不落值（保持零值）。
+- **4 是机制推导的部署初始值，不是容量实验冻结值**：T008b 仍未执行，收益与参数无实测读数；文档、示例与发布说明不得把 4 写成实测结论。
+
+·2 **落地位置**
+
+| 文件 | 改动 |
+| --- | --- |
+| `internal/cli/config.go` | 新增 `const defaultKeepRecentGroups = 4`；`validateUS16Sections` 在开关打开且键缺失时补值；`required` 名单去掉该键，错误文案改为「七个键必填 + keep_recent_groups 缺省 4」；新增显式 `<1` 拒绝 |
+| `internal/cli/config_test.go` | 缺键断言改为七个键并断言该键不在缺失名单；新增 `TestLoadConfig_CompactionKeepRecentGroupsDefaultsToFour` 四子用例（省略=4 / 显式覆盖 / 显式 0 拒绝 / 关闭不落值） |
+| `internal/app/wire_compaction.go` | 只改注释：装配层仍是纯投影，缺省在装载层落值 |
+| `basalt.yaml.example` | 压缩段注释改为七键必填 + `keep_recent_groups` 缺省 4 |
+| `docs/TechnicalDesign.md` §2.5.3 | 新增「配置」条目，记录本次裁决与「非实测冻结值」的表述边界 |
+| 两个演示配置 | `basalt-demo-us16` / `basalt-demo-us16-secure` 的 `keep_recent_groups` 由 1 改为 4（显式写出，不依赖缺省） |
+
+·3 **验证**
+
+- `gofumpt -w` 三个 Go 文件通过；`go test ./internal/cli -count=1` 全包通过；`go test ./internal/app -run Compaction -count=1` 通过。
+- **未验证**：参数 4 的实际压缩效果（需真实模型与费用，按 2026-11-04 裁决不跑）；`make check` 全量门禁本轮未跑，须在合入前补。

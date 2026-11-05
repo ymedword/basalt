@@ -1035,6 +1035,7 @@ export type OperationTargetKind =
   | 'knowledge_upload'
   | 'knowledge_document'
   | 'knowledge_collection'
+  | 'skill_admission'
 
 export interface OperationView {
   operation_id: string
@@ -1058,6 +1059,158 @@ export interface OperationDetail extends OperationView {
   detail: Record<string, unknown>
   recovered_at: string
   verification: 'not_required' | 'applied' | 'not_applied' | 'indeterminate'
+}
+
+// ---------------------------------------------------------------------------
+// 学习准入（US-21 §3.1.12 / T022）：只读视图
+// Admission views: read-only. Approve / publish / withdraw live on the local CLI.
+// ---------------------------------------------------------------------------
+
+/**
+ * 学习准入状态机的八个字面量。`expired` 是**派生展示态**：批准过了有效期时页面
+ * 显示 expired，数据库里仍是 `approved`（发布会在 CLI 侧被拒绝）。
+ * The eight literals; `expired` is derived for display, the stored state stays approved.
+ */
+export type AdmissionState =
+  | 'proposed'
+  | 'evaluated'
+  | 'approved'
+  | 'rejected'
+  | 'canceled'
+  | 'published'
+  | 'withdrawn'
+  | 'expired'
+
+/** 风险档：`unknown` 只出现在尚未评估的候选上；评估之后只有 normal / high。 */
+export type AdmissionRiskTier = 'unknown' | 'normal' | 'high'
+
+/** 七个固定评估维度。 */
+export type AdmissionDimensionName =
+  | 'content'
+  | 'source'
+  | 'permissions'
+  | 'safety'
+  | 'regression'
+  | 'effect'
+  | 'cost'
+
+/** 单维判定；`not_evaluable` **不等于**通过（页面必须单独标注）。 */
+export type AdmissionDimensionStatus = 'passed' | 'failed' | 'not_evaluable'
+
+/** 评估聚合：全部通过 / 至少一维失败 / 无失败但有维度不可评估。 */
+export type AdmissionAggregate = 'passed' | 'failed' | 'incomplete'
+
+/** 本机决策只有批准与拒绝两种。 */
+export type AdmissionDecisionKind = 'approve' | 'reject'
+
+/** 发布记录状态；撤回后记录保留，只把状态置 withdrawn。 */
+export type AdmissionPublicationState = 'active' | 'withdrawn'
+
+/** 撤回原因分类：恢复上一版 / 指针已被超越 / 技能已删除。 */
+export type AdmissionWithdrawClass = 'restored_previous' | 'superseded' | 'deleted'
+
+/** 列表行：只有数据库行的投影，没有清单摘要与文件正文。 */
+export interface AdmissionListView {
+  candidate_id: string
+  skill_name: string
+  /** 派生展示态：approved 且活跃批准已过期时为 expired。 */
+  state: AdmissionState
+  risk_tier: AdmissionRiskTier
+  proposer_subject: string
+  candidate_hash: string
+  source_hash: string
+  created_at: string
+  updated_at: string
+}
+
+/** 来源声明（服务端已把自由文本 `notes` 置空，页面不渲染该字段）。 */
+export interface AdmissionSourceView {
+  kind: string
+  ref: string
+  task_outcome: string
+  confirmation: string
+  authorization: string
+  redaction: string
+  retention_until: string
+  applicable: boolean
+  counterexamples: string[]
+  evidence: string[]
+  limitations: string[]
+  /** 服务端置空：候选备注不整段出站。 */
+  notes: string
+}
+
+/** 冻结清单的一条文件摘要；没有正文。 */
+export interface AdmissionFileView {
+  path: string
+  sha256: string
+  size: number
+}
+
+/** 单维判定；`reason` 为 omitempty，空串时字段可以不出现。 */
+export interface AdmissionDimensionView {
+  name: AdmissionDimensionName
+  status: AdmissionDimensionStatus
+  reason?: string
+}
+
+export interface AdmissionEvaluationView {
+  evaluation_id: string
+  candidate_revision: number
+  candidate_hash: string
+  evaluation_hash: string
+  grader_version: string
+  policy_hash: string
+  dimensions: AdmissionDimensionView[]
+  /** 候选内脚本 / 可执行文件相对路径；含脚本即高风险，批准要有逐条静态审查。 */
+  scripts: string[]
+  aggregate: AdmissionAggregate
+  risk_tier: AdmissionRiskTier
+  referrers: string[]
+  evaluated_at: string
+}
+
+export interface AdmissionDecisionView {
+  decision_id: string
+  decision: AdmissionDecisionKind
+  reason: string
+  acknowledged: string[]
+  risk_tier: AdmissionRiskTier
+  /** 批准者只能来自本机 CLI 身份，不在请求字段里。 */
+  approver_subject: string
+  /** 批准有效期（≤ 24 小时）；过期后候选按派生态显示 expired。 */
+  expires_at: string
+  superseded_at: string
+  created_at: string
+}
+
+export interface AdmissionPublicationView {
+  skill_name: string
+  version_id: number
+  version_no: number
+  content_hash: string
+  state: AdmissionPublicationState
+  published_at: string
+  withdrawn_at: string
+  withdraw_reason: string
+  /** 撤回分类字面量；0 / 空串表示本次撤回没有移动发布指针。 */
+  withdraw_version_id: number
+}
+
+/** 详情 = 列表行摊平 + 来源 / 清单 + 最新评估 / 决策 / 发布记录（缺失为 null）。 */
+export interface AdmissionDetailView extends AdmissionListView {
+  source: AdmissionSourceView
+  files: AdmissionFileView[]
+  evaluation: AdmissionEvaluationView | null
+  decision: AdmissionDecisionView | null
+  publication: AdmissionPublicationView | null
+}
+
+/** 列表过滤：只认契约的 state / skill / limit 三个参数。 */
+export interface AdmissionFilter {
+  state?: AdmissionState
+  skill?: string
+  limit?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +1661,24 @@ export class ApiClient {
       'GET',
       `/operations/${encodeURIComponent(operationId)}`,
     )
+  }
+
+  // --- 学习准入（US-21 §3.1.12）------------------------------------------
+
+  /**
+   * 学习准入候选列表（只读）。批准 / 发布 / 撤回只在本机 CLI 执行，管理面**没有**
+   * 写端点——这里只提供 GET。
+   * Read-only admission list; the admin surface has no write endpoint.
+   */
+  getAdmissions(filter: AdmissionFilter = {}): Promise<AdmissionListView[]> {
+    return this.#request<AdmissionListView[]>('GET', '/admissions', {
+      query: { state: filter.state, skill: filter.skill, limit: filter.limit },
+    })
+  }
+
+  /** 准入候选详情（只读）；缺失的评估 / 决策 / 发布记录投影为 null。 */
+  getAdmission(candidateId: string): Promise<AdmissionDetailView> {
+    return this.#request<AdmissionDetailView>('GET', `/admissions/${encodeURIComponent(candidateId)}`)
   }
 
   // --- 内部实现 -----------------------------------------------------------

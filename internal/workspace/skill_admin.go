@@ -55,6 +55,14 @@ const (
 	skillVersionDirPerm  os.FileMode = 0o555
 )
 
+// ErrWorkCopyUncertain 表示工作副本交换失败且回滚也失败：正式目录已不在，旧树留在
+// `.backup`、新树留在 `.staging`，磁盘状态既不是旧树也不是新树。调用方**必须**把
+// 操作记为 unknown 留待恢复查证 / 人工裁决，**不得**记 failed，也**不得**自行清理
+// 或复原（契约「提交结果未知时禁止磁盘补偿」段：补偿失败不谎报 failed）。
+// ErrWorkCopyUncertain marks a work copy whose swap failed and whose rollback failed
+// too; callers must record the operation as unknown and leave the scene untouched.
+var ErrWorkCopyUncertain = errors.New("技能工作副本处于不确定状态")
+
 // SkillFile 是技能候选里的一个文件：路径相对技能目录、正斜杠；内容按字节保存
 // （文本闸门在构建候选时已判过），SHA256 / Size 由构建结果给出，不采信调用方填值。
 // SkillFile is one file of a skill candidate. The hashes are outputs of candidate
@@ -107,6 +115,15 @@ func ValidateSkillDraft(name string, files []core.AuthorFile) (SkillCandidate, e
 // WriteSkillWorkCopy replaces the work copy wholesale via a staging tree and two
 // renames. Existing staging/backup residue is refused rather than resolved here.
 func WriteSkillWorkCopy(root string, cand SkillCandidate) error {
+	return writeSkillWorkCopy(root, cand, nil)
+}
+
+// writeSkillWorkCopy 是 WriteSkillWorkCopy 的实现；renameFunc 为 nil 时用
+// os.Root.Rename，非 nil 供同包测试注入交换 / 回滚失败——回滚失败无法跨平台确定性
+// 制造（与 AgentLoader.rename 同一手法，颗粒度文档 §3.2 的故障注入惯例）。
+// writeSkillWorkCopy is the implementation behind WriteSkillWorkCopy; renameFunc is a
+// test seam and is nil in production.
+func writeSkillWorkCopy(root string, cand SkillCandidate, renameFunc func(root *os.Root, oldname, newname string) error) error {
 	rebuilt, err := buildSkillCandidate(cand.Name, cand.Files)
 	if err != nil {
 		return skillWriteFailed(cand.Name, importRejected(err))
@@ -127,6 +144,13 @@ func WriteSkillWorkCopy(root string, cand SkillCandidate) error {
 	relDir := path.Join(skillsDirName, cand.Name)
 	relStaging := relDir + stagingSuffix
 	relBackup := relDir + backupSuffix
+
+	rename := base.Rename
+	if renameFunc != nil {
+		rename = func(oldname, newname string) error {
+			return renameFunc(base, oldname, newname)
+		}
+	}
 
 	for _, rel := range []string{relStaging, relBackup} {
 		if _, statErr := base.Lstat(filepath.FromSlash(rel)); statErr == nil {
@@ -161,18 +185,21 @@ func WriteSkillWorkCopy(root string, cand SkillCandidate) error {
 	}
 
 	if exists {
-		if err := base.Rename(filepath.FromSlash(relDir), filepath.FromSlash(relBackup)); err != nil {
+		if err := rename(filepath.FromSlash(relDir), filepath.FromSlash(relBackup)); err != nil {
 			return skillWriteFailed(cand.Name, discard(fmt.Errorf(
 				"交换技能工作副本 %s → %s: %w", relDir, relBackup, err)))
 		}
 	}
-	if err := base.Rename(filepath.FromSlash(relStaging), filepath.FromSlash(relDir)); err != nil {
+	if err := rename(filepath.FromSlash(relStaging), filepath.FromSlash(relDir)); err != nil {
 		if exists {
-			if rollbackErr := base.Rename(
+			if rollbackErr := rename(
 				filepath.FromSlash(relBackup), filepath.FromSlash(relDir),
 			); rollbackErr != nil {
-				// 正式目录缺失、旧树在 .backup、新树在 .staging：保留现场交由人工裁决。
+				// 正式目录缺失、旧树在 .backup、新树在 .staging：保留现场交由人工裁决，
+				// 错误必须带 ErrWorkCopyUncertain 让调用方记 unknown 而不是 failed。
+				// The scene is left untouched and flagged as uncertain for the caller.
 				return skillWriteFailed(cand.Name, errors.Join(
+					ErrWorkCopyUncertain,
 					fmt.Errorf("安装技能候选目录 %s → %s: %w", relStaging, relDir, err),
 					fmt.Errorf("回滚目录 %s → %s 失败，技能工作副本处于不确定状态: %w",
 						relBackup, relDir, rollbackErr)))
@@ -374,6 +401,14 @@ func normalizeSkillFilePath(raw string) (string, error) {
 	for _, segment := range strings.Split(normalized, "/") {
 		if strings.HasPrefix(segment, ".") {
 			return "", fmt.Errorf("路径不得包含以点开头的段（隐藏目录 / 文件）：%q", raw)
+		}
+		// 段首尾空白一律拒绝（review ② F-03）：`run.sh ` 的扩展名是 ".sh " 而不是
+		// ".sh"，会绕过准入的脚本识别，从而避开静态审查与提出者 ≠ 批准者的分离要求；
+		// 另外 Win32 会静默剥离尾随空格 / 点，清单记录的名字与落盘名字将不一致。
+		// Edge whitespace can hide a script from admission's classifier and is
+		// normalised away by Win32, so such names never enter a candidate.
+		if strings.TrimSpace(segment) != segment {
+			return "", fmt.Errorf("路径段不得以空白开头或结尾：%q", raw)
 		}
 	}
 	return normalized, nil

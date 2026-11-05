@@ -16,6 +16,7 @@ import (
 	"github.com/ymedword/basalt/internal/historyretention"
 
 	"github.com/ymedword/basalt/internal/cli"
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 )
@@ -233,6 +234,18 @@ func Run(ctx context.Context, args []string) int {
 		// The handoff gate is read-only and offline, so it is wired on every path.
 		Handoff: handoffVerifyPort{Logger: logger},
 		Flow:    flowCLIPort{},
+		// 学习准入端口：写命令的实例锁由命令面持有（本适配器不再取锁），读命令走只读
+		// 会话；行为与身份口径见 admission_port.go。CLIWriteActor 是七个写动作唯一的
+		// 身份来源——命令面没有 --approver 之类旁路。
+		// The admission port; the command surface owns the instance lock, and the actor
+		// function is the only identity source for the seven write actions.
+		Admission: admissionPort{
+			WorkDir:                workDir,
+			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+			Database:               databaseConfig(cfg),
+			Logger:                 logger,
+		},
+		CLIWriteActor: func() core.Actor { return cliWriteActor(logger) },
 	}
 
 	// 装配面在这里构造一次，两条路径共用（重路径接管句柄，只读路径只开一次只读库）。

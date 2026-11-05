@@ -3,6 +3,8 @@ package cli
 import (
 	"log/slog"
 	"os"
+
+	"github.com/ymedword/basalt/internal/core"
 )
 
 // Deps 是命令面的显式类型化装配参数——工作目录、目标 schema 版本与日志器一律
@@ -125,6 +127,21 @@ type Deps struct {
 	// The tool-registry port: only the heavy path ever builds the pool, so a nil here
 	// means a wiring gap and is reported as such.
 	Tools ToolLister
+
+	// Admission 是学习准入端口（见 ports.go）：propose / evaluate 等写命令经它冻结
+	// 候选并预写管理审计；list / show 只读。命令面拿到 nil 即报缺件——**不得**自己
+	// 打开数据库补出第二条准入读写路径。
+	// The admission port; a nil here is a wiring gap, never a reason to open a second
+	// database path from the command surface.
+	Admission AdmissionPort
+
+	// CLIWriteActor 给出**本机 CLI 写动作**的操作主体（`cli:<OS user>`）。它是七个
+	// 准入写动作的唯一身份来源：命令面没有 `--approver` 之类旁路，缺失即报缺件；
+	// `cli:unknown` 在取锁与开库之前被拒绝（颗粒度文档 §3.1.10）。
+	// CLIWriteActor is the sole identity source for the admission write commands; there
+	// is no --approver-style bypass, and cli:unknown is rejected before the lock or any
+	// database is opened.
+	CLIWriteActor func() core.Actor
 
 	// In / Out 是命令面应当读写的**介质**（真控制台或管道——分流由渠道层按句柄判定，
 	// 不看环境变量）；Signals 是中断来源。三者为空即用进程标准流与渠道自建的中断源。

@@ -84,7 +84,7 @@ func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
 
 	tables, err := view.TableNames(ctx)
 	require.NoError(t, err)
-	require.Len(t, tables, 78, "运行期v9保留77表并追加隔离执行账本")
+	require.Len(t, tables, 82, "运行期v10在v9的78表之上追加学习准入四表")
 	var legacy, observabilityTables, flowTables, sandboxTables []string
 	for _, table := range tables {
 		if strings.HasPrefix(table, "observability_") {
@@ -97,7 +97,7 @@ func TestStorageStore_OpenReadOnlyPostgres(t *testing.T) {
 			legacy = append(legacy, table)
 		}
 	}
-	require.Len(t, legacy, 54, "v1基线的52表与保留账本的两表仍全部保留")
+	require.Len(t, legacy, 58, "旧表桶：v1基线的52表、保留账本两表与学习准入四表")
 	require.Equal(t, []string{"sandbox_executions"}, sandboxTables)
 	require.ElementsMatch(t, []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"}, observabilityTables)
 	require.ElementsMatch(t, []string{"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations"}, flowTables)

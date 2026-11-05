@@ -35,7 +35,7 @@ func TestApp_SupportedVersionInjectedPerBackend(t *testing.T) {
 	// `0002_agent_binding_knowledge_kind.sql` 加宽 `resource_kind` 闭集并前移到 2；
 	// R59 的 `source_text` 补列修复以 `0003_knowledge_source_text_repair.sql` 前移到 3
 	// ——已发布的 0001 现场字面量保持逐字节不变（D-19 裁决 2026-10-30 / R59 2026-10-31）。
-	require.Equal(t, 9, postgres.SupportedSchemaVersion, "运行期PostgreSQL追加已批准的0009隔离迁移，SQLite源谱系独立")
+	require.Equal(t, 10, postgres.SupportedSchemaVersion, "运行期PostgreSQL追加已批准的0009隔离与0010学习准入迁移，SQLite源谱系独立")
 	require.Equal(t, 6, storage.SupportedSchemaVersion, "SQLite 源谱系保持 v6（导出 / 旧库升级来源）")
 
 	workDir := t.TempDir()
@@ -91,7 +91,7 @@ func TestApp_SupportedVersionInjectedPerBackend(t *testing.T) {
 	require.NoError(t, err)
 	pgVersion, err := pgDB.SchemaVersion(ctx)
 	require.NoError(t, err)
-	require.Equal(t, postgres.SupportedSchemaVersion, pgVersion, "PG谱系应迁到当前版本v6")
+	require.Equal(t, postgres.SupportedSchemaVersion, pgVersion, "PG谱系应迁到二进制声明的当前版本")
 	pgTables, err := pgDB.TableNames(ctx)
 	require.NoError(t, err)
 	for _, name := range []string{"observability_alert_states", "observability_alert_transitions", "observability_cleanup_runs", "observability_export_batches", "observability_export_items", "observability_export_scan"} {

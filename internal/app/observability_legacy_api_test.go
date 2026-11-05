@@ -19,6 +19,7 @@ import (
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/diagnostics"
 	"github.com/ymedword/basalt/internal/observability"
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/web"
 )
 
@@ -54,7 +55,8 @@ func TestObservability_APILegacyEnumsAfterV5Upgrade(t *testing.T) {
 	f.cfg.Observability.Alerts.Enabled = &disabled
 	rt := f.assemble(t)
 	require.NoError(t, legacy.QueryRowContext(t.Context(), `SELECT max(version) FROM schema_version`).Scan(&version))
-	require.Equal(t, 9, version)
+	// 装配期把 v5 旧库前移到二进制声明的当前版本（US-20 起 0009、US-21 追加 0010）。
+	require.Equal(t, postgres.SupportedSchemaVersion, version)
 	var original string
 	require.NoError(t, legacy.QueryRowContext(t.Context(), `SELECT kind||reason_code||decision FROM diagnostic_events WHERE event_id=$1`, id).Scan(&original))
 	require.Contains(t, original, "CANARY_OBS_KIND")

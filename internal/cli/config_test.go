@@ -1275,9 +1275,12 @@ func TestLoadConfig_US16DefaultsStayWithConsumers(t *testing.T) {
 	require.False(t, cfg.Compaction.Enabled, "compaction 缺省关闭，升级后行为与现状一致")
 }
 
-// TestLoadConfig_CompactionEnabledListsAllMissingKeys：开关打开后八个配套键
-// **一次列全**（D-24）——逐个报错会让部署者反复重启。
-// 逆改点：把缺失收集换成「命中第一个就返回」→ 缺键数断言变红。
+// TestLoadConfig_CompactionEnabledListsAllMissingKeys：开关打开后除
+// `keep_recent_groups` 外的七个配套键**一次列全**（D-24）——逐个报错会让部署者
+// 反复重启。`keep_recent_groups` 省略时取缺省 4（2026-11-05 用户裁决），因此
+// 不出现在缺键名单里，但错误文案必须说明这一缺省，避免部署者以为漏配。
+// 逆改点：把缺失收集换成「命中第一个就返回」→ 缺键断言变红；把
+// keep_recent_groups 塞回必填 → 本测试与缺省测试同时变红。
 func TestLoadConfig_CompactionEnabledListsAllMissingKeys(t *testing.T) {
 	path := writeConfig(t, baseConfig+"compaction:\n  enabled: true\n")
 	_, err := cli.LoadConfig(path, envLookup(us16Env()))
@@ -1285,7 +1288,6 @@ func TestLoadConfig_CompactionEnabledListsAllMissingKeys(t *testing.T) {
 
 	for _, key := range []string{
 		"compaction.trigger_ratio",
-		"compaction.keep_recent_groups",
 		"compaction.summary_max_tokens",
 		"compaction.output_reserve_tokens",
 		"compaction.safety_margin_ratio",
@@ -1295,6 +1297,53 @@ func TestLoadConfig_CompactionEnabledListsAllMissingKeys(t *testing.T) {
 	} {
 		require.Contains(t, err.Error(), key, "缺失键必须一次列全：%s", key)
 	}
+	require.NotContains(t, err.Error(), "compaction.keep_recent_groups 缺失",
+		"keep_recent_groups 有缺省，不参与缺键名单")
+}
+
+// TestLoadConfig_CompactionKeepRecentGroupsDefaultsToFour：`keep_recent_groups`
+// 省略时装载层补 4（2026-11-05 用户裁决，D-24 的唯一例外）；显式 0 仍拒绝，
+// 显式正数照常生效；开关关闭时不落缺省，保持零值。
+// 逆改点：删掉补缺省分支 → omitted 子用例拿到 0（红）；删掉 <1 校验 →
+// explicit_zero 子用例通过（红）。
+func TestLoadConfig_CompactionKeepRecentGroupsDefaultsToFour(t *testing.T) {
+	// 除 keep_recent_groups 外的七个键全给，只差它。
+	const compactionWithoutKeep = `compaction:
+  enabled: true
+  trigger_ratio: 0.5
+  summary_max_tokens: 800
+  output_reserve_tokens: 256
+  safety_margin_ratio: 0.1
+  timeout_seconds: 30
+  prompt_version: v1
+  strategy_version: v1
+`
+
+	t.Run("omitted_uses_default", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig+compactionWithoutKeep), envLookup(us16Env()))
+		require.NoError(t, err, "省略 keep_recent_groups 不应再拒绝启动")
+		require.Equal(t, 4, cfg.Compaction.KeepRecentGroups, "省略时必须落缺省 4")
+	})
+
+	t.Run("explicit_value_wins", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig+compactionWithoutKeep+
+			"  keep_recent_groups: 2\n"), envLookup(us16Env()))
+		require.NoError(t, err)
+		require.Equal(t, 2, cfg.Compaction.KeepRecentGroups, "显式值必须覆盖缺省")
+	})
+
+	t.Run("explicit_zero_rejected", func(t *testing.T) {
+		_, err := cli.LoadConfig(writeConfig(t, baseConfig+compactionWithoutKeep+
+			"  keep_recent_groups: 0\n"), envLookup(us16Env()))
+		require.Error(t, err, "显式 0 是非法取值，不得被缺省悄悄救回来")
+		require.Contains(t, err.Error(), "compaction.keep_recent_groups")
+	})
+
+	t.Run("disabled_keeps_zero", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig+"compaction:\n  enabled: false\n"), envLookup(us16Env()))
+		require.NoError(t, err)
+		require.Zero(t, cfg.Compaction.KeepRecentGroups, "开关关闭时不落缺省，不制造「已配置」假象")
+	})
 }
 
 // TestLoadConfig_EmbeddingConnectionRequiresModelAndDimensions：只写连接不写

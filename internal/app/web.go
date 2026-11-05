@@ -1171,6 +1171,12 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 	if rt.ops != nil {
 		opts.Operations = rt.ops
 	}
+	// 学习准入只读面（US-21 §3.1.11）：直接注入 PostgreSQL 行式读取器——管理台只
+	// 读库、不读 `.basalt/admissions` 磁盘、不返回候选正文；写动作只在本机 CLI。
+	// The read-only admission surface reads rows; no write endpoint is assembled here.
+	if rt.db != nil {
+		opts.Admissions = postgres.NewAdmissionStore(rt.db)
+	}
 	if rt.versions != nil && rt.lifecycle != nil {
 		// MCPCredentials 与写端口是**同一实例**：列表页的「凭据」列读的就是下一次保存会
 		// 走的逐槽位判定。漏传会让 `credential_keys` 恒为空，声明过的槽位在页面上被误标

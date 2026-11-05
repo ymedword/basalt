@@ -60,7 +60,11 @@ test: ; go test -race -cover ./...
 # 集成冒烟：build tag 隔离的用例默认不执行，必须单列一步。缺 DSN 由前置闸门判失败，
 # 不让测试层"全部跳过"冒充通过。配方**保持 ASCII**（本机 make 按 ANSI 读 Makefile）。
 # A missing DSN fails the guard before any test runs; the recipe stays ASCII.
-test-integration: ; @test -n "$${BASALT_TEST_PG_DSN:-}" || { echo "test-integration: BASALT_TEST_PG_DSN is not set (fail-closed per D-01; skipping is not allowed). Start the dev-env test database and run through dev-env/scripts/with-postgres.sh; setup: docs/DevelopmentLoop.md section 10." >&2; exit 1; }; go test -tags=integration -count=1 ./...
+# 显式 -timeout=20m：go 默认每包 10 分钟；2026-11-05 实测 internal/app 单跑 802.7s、
+# 并行争用 840.8s（14m 内层必红），用户裁决内层 14m→20m（外层 1800s）；只放宽时限，
+# 不改断言、包范围与覆盖率阈值。历史：10m 默认 → 12m → 14m → 20m，逐次附实测读数。
+# Explicit -timeout=20m: internal/app measured 802.7s solo and 840.8s under contention.
+test-integration: ; @test -n "$${BASALT_TEST_PG_DSN:-}" || { echo "test-integration: BASALT_TEST_PG_DSN is not set (fail-closed per D-01; skipping is not allowed). Start the dev-env test database and run through dev-env/scripts/with-postgres.sh; setup: docs/DevelopmentLoop.md section 10." >&2; exit 1; }; go test -tags=integration -count=1 -timeout=20m ./...
 
 # 覆盖率底线：go test -cover 只打印百分比、不会因低于阈值而失败——由脚本按包判失败。
 # 判卷同时跑 `-tags=integration`（覆盖率口径含 PG 存储），故脚本自身也要求 DSN。

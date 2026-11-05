@@ -829,3 +829,77 @@ type HandoffVerification interface {
 type IsolationProbe interface {
 	CheckIsolation(context.Context) (IsolationCheckReport, error)
 }
+
+// AdmissionPort 是学习准入的窄端口（颗粒度文档 §3.2 P-04）：命令面只经它触发
+// 候选冻结、确定性评估、受控发布与撤回，**不**自己拼装存储、不另起审计路径。
+// 文档列举的九个业务方法逐字保真；另有三个只读文件辅助方法（ImportFiles /
+// ReadSourceFile / ReadDecisionFile）超出该清单——因为 cli 不许 import workspace，
+// 源目录与文件级边界检查只能留在 app / workspace 一侧，否则会出现第二份实现。
+// 该增补已登记在收口材料（人工 review ② 决策项），不改写已审模块卡。
+// The nine business methods are verbatim from the card; three bounded read helpers go
+// beyond it so the boundary checks stay single-implementation while cli avoids
+// importing workspace. The addition is registered in the closeout materials.
+type AdmissionPort interface {
+	// ImportFiles 读取技能源目录并返回冻结前的文件清单：不跟随软链接、拒绝目录
+	// 穿越，路径与体积上限与 `ValidateSkillDraft` 同一口径。放在端口上是因为
+	// cli 不许 import workspace——边界检查只能有一份实现。
+	// ImportFiles reads a skill source directory under the same no-symlink, no-traversal
+	// and volume rules as ValidateSkillDraft; it lives on the port because cli must
+	// not import workspace, so the boundary checks keep a single implementation.
+	ImportFiles(dir string) ([]core.AuthorFile, error)
+
+	// ReadSourceFile 读取来源声明文件（严格 JSON 由编排层解析）；同样因为 cli 不许
+	// import workspace 而放在端口上。
+	// ReadSourceFile reads the source declaration bounded to 64 KiB.
+	ReadSourceFile(path string) ([]byte, error)
+
+	// ReadDecisionFile 读取决策文件（≤64 KiB、普通文件、不跟随软链接）；文件级约束
+	// 与来源声明同一读取器纪律，cli 因此同样不直接开文件。
+	// ReadDecisionFile reads --decision-file under the same bounded, no-symlink rules.
+	ReadDecisionFile(path string) ([]byte, error)
+
+	// Propose 冻结候选并预写 `pending` 管理审计；重复活跃候选按 409 拒绝且零写入。
+	// Propose freezes the candidate behind a pending audit row; duplicates are 409
+	// with zero writes.
+	Propose(ctx context.Context, actor core.Actor, req core.AdmissionProposeRequest) (core.AdmissionCandidate, error)
+
+	// Evaluate 从磁盘重读候选、复算哈希并跑七维确定性评估；policy 是命令面在实例
+	// 锁内读到的快照输入，数据库三张策略表由适配器在同一把锁内补齐后合并成完整快照。
+	// Evaluate re-reads the frozen candidate and runs the fixed grader; the adapter
+	// merges the caller's YAML-derived config with the database policy rows.
+	Evaluate(ctx context.Context, actor core.Actor, candidateID string, policy core.AdmissionPolicyConfig) (core.AdmissionEvaluation, error)
+
+	// Approve 用决策文件批准候选；适配器先拍策略快照，编排层复核基线 / 策略 / 风险档。
+	// Approve approves with the decision file; the adapter snapshots the policy first.
+	Approve(ctx context.Context, actor core.Actor, candidateID string, decisionJSON []byte,
+		policy core.AdmissionPolicyConfig) (core.AdmissionDecision, error)
+
+	// Reject 用决策文件拒绝候选；不需要策略快照（不做发布绑定复核）。
+	// Reject rejects with the decision file and takes no policy snapshot.
+	Reject(ctx context.Context, actor core.Actor, candidateID string, decisionJSON []byte) (core.AdmissionDecision, error)
+
+	// Cancel 取消一个未发布的候选；理由 ≤2000 字符并扫描凭证。
+	// Cancel cancels an unpublished candidate; the reason is scanned for secrets.
+	Cancel(ctx context.Context, actor core.Actor, candidateID, reason string) (core.AdmissionCandidate, error)
+
+	// Publish 在实例锁内拍策略快照并整条事务发布（版本 + 指针 + 发布记录 + 状态）。
+	// Publish snapshots the policy and publishes inside one transaction.
+	Publish(ctx context.Context, actor core.Actor, candidateID string,
+		policy core.AdmissionPolicyConfig) (core.AdmissionPublication, error)
+
+	// Withdraw 撤回已发布候选：指针仍指向本次发布时把上一版内容作为**新版本**重新
+	// 发布，被超越 / 已删除只记撤回；首版撤回到空按拒绝返回。理由 ≤2000 字符并扫描
+	// 凭证；重复撤回幂等返回原发布记录。
+	// Withdraw re-publishes the previous content as a new version when the pointer
+	// still names this publication; superseded / deleted skills only record the
+	// withdrawal, and the first version refuses to withdraw to nothing.
+	Withdraw(ctx context.Context, actor core.Actor, candidateID, reason string) (core.AdmissionPublication, error)
+
+	// List 是只读查询：不取实例锁、不校验身份、不写审计。
+	// List is read-only: no lock, no identity check, no audit write.
+	List(ctx context.Context, filter core.AdmissionFilter) ([]core.AdmissionCandidate, error)
+
+	// Get 是只读详情；IncludeFiles / IncludeDiff 才读磁盘正文，diff 上限 1 MiB。
+	// Get is the read-only detail; bodies are only read when explicitly requested.
+	Get(ctx context.Context, candidateID string, options core.AdmissionShowOptions) (core.AdmissionDetail, error)
+}

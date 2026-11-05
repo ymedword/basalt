@@ -515,10 +515,12 @@ func (d DiagnosticsConfig) SampleRateOrDefault() float64 {
 // CompactionConfig 是会话压缩段（`compaction`，US-16 §3.3）。
 // CompactionConfig is the compaction section (US-16 §3.3).
 //
-// `enabled` 缺省 false（存量配置升级后行为与现状一致）；显式 true 时其余八个键
-// **全部必填**，缺任一即启动拒绝且**一次列全**（D-24：不在代码里预填阈值数字）。
-// Enabled defaults to false; turning it on makes every other key required, and the
-// error lists all missing keys at once.
+// `enabled` 缺省 false（存量配置升级后行为与现状一致）；显式 true 时除
+// `keep_recent_groups` 外的七个键**全部必填**，缺任一即启动拒绝且**一次列全**
+// （D-24：不在代码里预填阈值数字）。`keep_recent_groups` 是唯一例外：省略时取
+// `defaultKeepRecentGroups`（2026-11-05 用户裁决）；显式写 0 / 负数仍拒绝。
+// Enabled defaults to false; besides keep_recent_groups, every other key is required.
+// keep_recent_groups alone defaults to 4 when omitted; explicit zero stays invalid.
 type CompactionConfig struct {
 	// Enabled 开关；false 时行为等同现状（不压缩，超限走整组裁剪或显式拒绝）。
 	// Enabled switches compaction on; false keeps the pre-US-16 behavior.
@@ -558,6 +560,14 @@ type CompactionConfig struct {
 	PromptVersion   string `yaml:"prompt_version"`
 	StrategyVersion string `yaml:"strategy_version"`
 }
+
+// defaultKeepRecentGroups 是 `compaction.keep_recent_groups` 省略时的部署初始值
+// （2026-11-05 用户裁决）。它是 D-24「装载层不预填阈值」的唯一例外；其余七个压缩键
+// 仍必须显式给出，显式写 0 / 负数仍按非法取值拒绝。4 是机制推导的初始值，不是容量
+// 实验冻结值——文档与发布说明**不得**把它写成实测结论。
+// defaultKeepRecentGroups is the only prefilled compaction threshold: 4 groups when
+// the key is omitted. Explicit zero or negative values are still refused.
+const defaultKeepRecentGroups = 4
 
 // 凭证键路径：providers[i].api_key 与管理面 token（http.admin_auth.token）走同一套
 // 占位形态、类型与明文拒绝检查；其余凭证形态（mem0 api-key、notify_channels url）
@@ -1092,14 +1102,23 @@ func validateUS16Sections(tree map[string]any, cfg *Config) error {
 		}
 	}
 
+	// 2026-11-05 用户裁决：`keep_recent_groups` 省略时取部署初始值 4。这是 D-24
+	// 「装载层不预填阈值」的唯一例外——其余七个键仍必须显式给出，显式 0 / 负数
+	// 仍拒绝。默认只在开关打开时落值；关闭时保持零值，不制造"看起来配了"的假象。
+	if cfg.Compaction.Enabled {
+		if _, present := lookupKeyPath(tree, "compaction.keep_recent_groups"); !present {
+			cfg.Compaction.KeepRecentGroups = defaultKeepRecentGroups
+		}
+	}
 	return validateCompactionSection(tree, cfg.Compaction)
 }
 
 // validateCompactionSection 校验压缩段：开关关闭时只判已写取值的合法性，
-// 打开时八个配套键**全部必填并一次列全**（D-24）。
+// 打开时除 `keep_recent_groups` 外的七个键**全部必填并一次列全**（D-24）；
+// `keep_recent_groups` 省略时已由调用方补 4，显式 0 / 负数仍拒绝。
 // validateCompactionSection checks the compaction section: with the switch off only
-// written values are validated; with it on every companion key is required and all
-// missing ones are listed at once.
+// written values are validated; with it on the seven required keys are listed at once.
+// keep_recent_groups is defaulted to 4 when omitted by the caller; explicit zero fails.
 func validateCompactionSection(tree map[string]any, cfg CompactionConfig) error {
 	// 比例键无论在开关哪一档都要判：写了越界值说明配置本身有错，等打开时
 	// 才报只会把问题推迟到切换开关的那一刻。
@@ -1121,10 +1140,10 @@ func validateCompactionSection(tree map[string]any, cfg CompactionConfig) error 
 		return nil
 	}
 	// 开关打开：D-24 要求阈值显式给出，缺任一即拒绝启动，且**一次列全**——
-	// 逐键试错会让部署者反复重启。
+	// 逐键试错会让部署者反复重启。`keep_recent_groups` 是唯一例外：调用方已在
+	// 省略时补 4；若显式写出，仍按 ≥1 的取值校验。
 	required := []string{
 		"compaction.trigger_ratio",
-		"compaction.keep_recent_groups",
 		"compaction.summary_max_tokens",
 		"compaction.output_reserve_tokens",
 		"compaction.safety_margin_ratio",
@@ -1135,8 +1154,13 @@ func validateCompactionSection(tree map[string]any, cfg CompactionConfig) error 
 	missing := missingKeyPaths(tree, required...)
 	if len(missing) > 0 {
 		return fmt.Errorf(
-			"配置项 %s 缺失——compaction.enabled: true 时这八个键全部必填（D-24：装载层不预填阈值），请补齐后重启",
-			strings.Join(missing, "、"))
+			"配置项 %s 缺失——compaction.enabled: true 时除 keep_recent_groups 外的七个键全部必填（D-24：装载层不预填阈值；keep_recent_groups 省略时缺省 %d），请补齐后重启",
+			strings.Join(missing, "、"), defaultKeepRecentGroups)
+	}
+	if _, present := lookupKeyPath(tree, "compaction.keep_recent_groups"); present && cfg.KeepRecentGroups < 1 {
+		return fmt.Errorf(
+			"配置项 compaction.keep_recent_groups 取值非法（%d）——必须是 ≥1 的整数；省略时缺省 %d",
+			cfg.KeepRecentGroups, defaultKeepRecentGroups)
 	}
 	if cfg.TriggerRatio <= 0 || cfg.TriggerRatio >= 1 {
 		return fmt.Errorf(

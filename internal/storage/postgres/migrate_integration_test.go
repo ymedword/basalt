@@ -79,15 +79,16 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 	// 版本链逐条可溯源：每一版一条记录、描述指向该版的内嵌脚本。
 	// 逆改点：把 0002 的描述写错 / 跳版 → 本断言红。
 	wantDescription := map[int]string{
-		1: "migrations/0001_postgres_v1.sql",
-		2: "migrations/0002_agent_binding_knowledge_kind.sql",
-		3: "migrations/0003_knowledge_source_text_repair.sql",
-		4: "migrations/0004_knowledge_version_revision.sql",
-		5: "migrations/0005_knowledge_collection_description.sql",
-		6: "migrations/0006_observability.sql",
-		7: "migrations/0007_history_retention.sql",
-		8: "migrations/0008_flow.sql",
-		9: "migrations/0009_sandbox_execution.sql",
+		1:  "migrations/0001_postgres_v1.sql",
+		2:  "migrations/0002_agent_binding_knowledge_kind.sql",
+		3:  "migrations/0003_knowledge_source_text_repair.sql",
+		4:  "migrations/0004_knowledge_version_revision.sql",
+		5:  "migrations/0005_knowledge_collection_description.sql",
+		6:  "migrations/0006_observability.sql",
+		7:  "migrations/0007_history_retention.sql",
+		8:  "migrations/0008_flow.sql",
+		9:  "migrations/0009_sandbox_execution.sql",
+		10: "migrations/0010_skill_admission.sql",
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT version, description FROM schema_version ORDER BY version`)
 	require.NoError(t, err)
@@ -104,12 +105,14 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 
 	tables, err := tableNames(ctx, conn)
 	require.NoError(t, err)
-	require.Len(t, tables, 78, "原77表与0009追加的隔离执行账本必须全部存在")
+	require.Len(t, tables, 82, "原77表、0009 的隔离执行账本与 0010 的准入四表必须全部存在")
 	for _, name := range []string{
 		"callers", "sessions", "messages", "runs", "kb_chunks", "kb_chunk_embeddings",
 		"compaction_entries", "context_assembly_records", "diagnostic_events", "storage_cutover",
 		"history_retention_runs", "history_retention_rollups",
 		"sandbox_executions",
+		"skill_admission_candidates", "skill_admission_evaluations",
+		"skill_admission_decisions", "skill_admission_publications",
 		"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations",
 	} {
 		require.Contains(t, tables, name)
@@ -299,16 +302,21 @@ func TestPostgres_UpgradeLegacyV1RepairsSourceText(t *testing.T) {
 	require.Equal(t, "YES", nullable, "列必须可空：NULL 表示该版本未保留原文")
 }
 
-// TestPostgres_MigrateTakesAdvisoryLock 判迁移真的取固定的 advisory 锁：另一条连接先
-// 持同一把锁时，迁移连接必须在锁上等待，按会话 `lock_timeout` 失败而不是照建表；
-// 锁释放后重试成功。
+// TestPostgres_MigrateTakesAdvisoryLock 判迁移真的取**本 schema** 的 advisory 锁：另一条
+// 连接先持同一把锁时，迁移连接必须在锁上等待，按会话 `lock_timeout` 失败而不是照建表；
+// 锁释放后重试成功。同 schema 互斥是新锁定的第一半判据（第二半见
+// TestPostgres_Migrate_DifferentSchemasRunInParallel）。
 // 逆改点：删掉 `pg_advisory_xact_lock` 那条语句 → 本用例拿到 nil error 而红（阻塞方
-// 持锁期间迁移照常建表）；把键改成别的种子 → 同样红。
+// 持锁期间迁移照常建表）；把键改成别的种子 / 不按 schema 派生 → 同样红。
 func TestPostgres_MigrateTakesAdvisoryLock(t *testing.T) {
 	ctx := context.Background()
 	conn := migrationConn(t)
 
-	// 阻塞方用独立连接、独立事务持锁：advisory 锁是**库级**对象，与 schema 无关。
+	// 目标 schema 从连接本身取：锁键必须按它派生，才能与 ensureSchema 取到同一把锁。
+	var schema string
+	require.NoError(t, conn.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema))
+
+	// 阻塞方用独立连接、独立事务持**本 schema** 的锁：键按目标 schema 派生，不是全库一把。
 	blockerPool := testPool(t)
 	blocker, err := blockerPool.Conn(ctx)
 	require.NoError(t, err)
@@ -316,7 +324,7 @@ func TestPostgres_MigrateTakesAdvisoryLock(t *testing.T) {
 	blockerTx, err := blocker.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = blockerTx.Rollback() })
-	_, err = blockerTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationAdvisoryKey)
+	_, err = blockerTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationAdvisoryKeyFor(schema))
 	require.NoError(t, err)
 
 	// 会话级 lock_timeout：让"等待"变成可判定的失败，而不是把测试挂住。
@@ -335,4 +343,69 @@ func TestPostgres_MigrateTakesAdvisoryLock(t *testing.T) {
 	version, err := schemaVersion(ctx, conn)
 	require.NoError(t, err)
 	require.Equal(t, SupportedSchemaVersion, version)
+}
+
+// TestPostgres_Migrate_DifferentSchemasRunInParallel 判迁移锁按 schema 隔离：另一个 schema
+// 持着它的迁移锁时，本 schema 的迁移必须照常建表完成——全库固定键会让它一直等到会话
+// `lock_timeout` 失败。这是"不同 schema 可并行"的直接判据。
+// 逆改点：把 migrationAdvisoryKeyFor 改回全库固定键 → 本用例拿到 lock timeout 而红。
+func TestPostgres_Migrate_DifferentSchemasRunInParallel(t *testing.T) {
+	ctx := context.Background()
+
+	// 阻塞方：在**另一个**隔离 schema 上持它的迁移锁。
+	otherConn := migrationConn(t)
+	var otherSchema string
+	require.NoError(t, otherConn.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&otherSchema))
+	blockerPool := testPool(t)
+	blocker, err := blockerPool.Conn(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, blocker.Close()) })
+	blockerTx, err := blocker.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = blockerTx.Rollback() })
+	_, err = blockerTx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationAdvisoryKeyFor(otherSchema))
+	require.NoError(t, err)
+
+	// 被测：本用例 schema 的迁移。锁等待上限故意设小——若两把键相同，必然失败。
+	conn := migrationConn(t)
+	_, err = conn.ExecContext(ctx, `SET lock_timeout = '300ms'`)
+	require.NoError(t, err)
+	require.NoError(t, ensureSchema(ctx, conn, SupportedSchemaVersion),
+		"别的 schema 持锁不得挡住本 schema 的迁移")
+
+	version, err := schemaVersion(ctx, conn)
+	require.NoError(t, err)
+	require.Equal(t, SupportedSchemaVersion, version)
+}
+
+// TestPostgres_Migrate_RejectsVersionTableOutsideTargetSchema 判 search_path 回退被拒绝：
+// 目标 schema 是空的，但 search_path 上挂着另一个已迁移的 schema，`schema_version` 会
+// 解析到后者——迁移若照常执行，就会在本 schema 建表、按别处判版本（或直接 no-op）。
+// 用例要求明确报错，且目标 schema 一张表都不许留下。
+// 逆改点：去掉 migrationTargetSchema 的归属核对 → 本用例拿到 nil error（no-op 放行）而红。
+func TestPostgres_Migrate_RejectsVersionTableOutsideTargetSchema(t *testing.T) {
+	ctx := context.Background()
+
+	ownerConn := migrationConn(t)
+	require.NoError(t, ensureSchema(ctx, ownerConn, SupportedSchemaVersion))
+	var owner string
+	require.NoError(t, ownerConn.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&owner))
+
+	targetConn := migrationConn(t)
+	var target string
+	require.NoError(t, targetConn.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&target))
+	_, err := targetConn.ExecContext(ctx,
+		`SELECT set_config('search_path', $1, false)`, target+", "+owner)
+	require.NoError(t, err)
+
+	err = ensureSchema(ctx, targetConn, SupportedSchemaVersion)
+	require.Error(t, err, "版本表在别的 schema 时必须拒绝迁移")
+	require.Contains(t, err.Error(), "search_path 回退", "失败必须来自归属核对")
+
+	// 拒绝不得留下半截结构：目标 schema 仍然零表。
+	var tables int
+	require.NoError(t, targetConn.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		 WHERE table_schema = $1 AND table_type = 'BASE TABLE'`, target).Scan(&tables))
+	require.Zero(t, tables, "拒绝后目标 schema 不得留下任何表")
 }

@@ -18,8 +18,9 @@ import (
 
 // 本文件是 PostgreSQL 谱系的**受控前向迁移**（设计 §3.1.1 / C-15 / 契约头部「迁移纪律」）：
 // 单事务 + `pg_advisory_xact_lock` 串行，已发布迁移只追加不改写，失败整体回滚、不自动修补。
+// 锁键按**目标 schema** 派生：同一 schema 严格互斥，不同 schema 可并行。
 // This file is the PostgreSQL lineage's controlled forward migration: one transaction,
-// serialized by an advisory lock, append-only published scripts, all-or-nothing failure.
+// serialized by a per-schema advisory lock, append-only scripts, all-or-nothing failure.
 
 // migrationsDir 是内嵌迁移目录；文件名 = `<4 位零填充版本>_<描述>.sql`，一个版本恰好一个
 // 文件——缺文件即拒绝、不跳过版本（与 SQLite 谱系同一命名纪律）。
@@ -27,15 +28,26 @@ import (
 // a missing file is a hard refusal, never a skipped version.
 const migrationsDir = "migrations"
 
-// migrationLockSeed 是迁移 advisory lock 的固定种子。键经 sha256 派生而不是硬编码魔术
-// 数字：同一个常量在 `TestPostgres_MigrateTakesAdvisoryLock` 里被复用，改种子必然改行为。
+// migrationLockSeed 是迁移 advisory lock 的种子的前半段。完整种子 = 本常量 + "/" + 目标
+// schema——键**按 schema 派生**而不是全库一把固定键：同一 schema 的两个迁移进程仍然互斥，
+// 不同 schema 可以并行。全库固定键会把每个隔离 schema 的迁移串成一条队列（2026-11-05
+// 实测：8 个 fixture 并发只比串行快 1.59×，全仓上千个测试 fixture 因此排队）。
 // 前缀与压缩链的 `basalt/compaction-append` 不同——两类锁不得撞键。
-// The lock key is derived from a fixed seed so migration and compaction locks never collide.
+//
+// **兼容边界**：旧二进制取的是固定键 `advisoryKey(migrationLockSeed)`，与新版按 schema
+// 派生的键**不互斥**——混合版本并发迁移同一库不在保护范围内。升级必须停旧启新，**不得**
+// 让两个版本同时连同一库迁移（单二进制、单实例的既有部署口径）。同一版本内，同一 schema
+// 严格互斥；不同 schema 互不影响。已发布迁移脚本不因本改动改写。
+// The key is seed + "/" + target schema: the same schema stays mutually exclusive while
+// different schemas migrate in parallel. Mixed-version concurrency is NOT covered (the old
+// binary holds the old fixed key): stop the old instance before starting the new one.
 const migrationLockSeed = "basalt/schema-migrate"
 
-// migrationAdvisoryKey 是迁移用的固定 advisory 锁键（int64）。
-// migrationAdvisoryKey is the fixed advisory lock key for migrations.
-var migrationAdvisoryKey = advisoryKey(migrationLockSeed)
+// migrationAdvisoryKeyFor 按目标 schema 派生迁移 advisory 锁键（int64）。
+// migrationAdvisoryKeyFor derives the migration advisory key for one target schema.
+func migrationAdvisoryKeyFor(schema string) int64 {
+	return advisoryKey(migrationLockSeed + "/" + schema)
+}
 
 // advisoryKey 把种子串派生为 int64：sha256 前 8 字节按大端读取。与设计 §3.1.11 的
 // `scopeAdvisoryKey` 同一派生方式，键只用于 `pg_advisory_xact_lock`，**不落库**。
@@ -60,6 +72,40 @@ func advisoryKey(seed string) int64 {
 //go:embed all:migrations
 var migrationFS embed.FS
 
+// migrationTargetSchema 解析迁移的**目标 schema**，并拒绝 search_path 回退造成的跨 schema
+// 错位：版本表若经 search_path 解析到别的 schema，迁移会在本 schema 建表、却按别处的版本
+// 记录判"已是最新"直接 no-op（或反之）。解析结果同时用于派生 advisory 锁键——**锁与 DDL
+// 必须落在同一个 schema 上**，这是"同 schema 互斥 / 不同 schema 并行"成立的前提。
+//
+// 拒绝条件：① `current_schema()` 为 NULL（search_path 里没有可用 schema）；② `schema_version`
+// 已存在但不属于该 schema。空 schema（首次迁移）没有版本表，只做第一项判定。
+// migrationTargetSchema resolves the schema migrations will write into and refuses
+// search_path fallback: a version table resolved from another schema would make the
+// migration compare against someone else's version. The same value keys the advisory lock.
+func migrationTargetSchema(ctx context.Context, q Queryer) (string, error) {
+	var schema sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return "", fmt.Errorf("解析迁移目标 schema: %w", err)
+	}
+	if !schema.Valid || schema.String == "" {
+		return "", errors.New("postgres: search_path 没有可用的 schema——无法确定迁移目标，拒绝执行")
+	}
+	var owner sql.NullString
+	err := q.QueryRowContext(ctx, `
+		SELECT n.nspname
+		  FROM pg_catalog.pg_class c
+		  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		 WHERE c.oid = to_regclass('schema_version')`).Scan(&owner)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("核对 schema_version 归属: %w", err)
+	}
+	if owner.Valid && owner.String != schema.String {
+		return "", fmt.Errorf("postgres: schema_version 解析到 %q，迁移目标却是 %q——search_path 回退会让迁移跨 schema，拒绝执行（目标 schema 必须是 search_path 的第一项）",
+			owner.String, schema.String)
+	}
+	return schema.String, nil
+}
+
 // ensureSchema 把库带到 target 版本（设计 §3.1.1 的签名逐字）：空库全量建 v1；版本表缺失
 // 但有未知表则拒绝；低版本前向迁移；高版本拒绝。事务外先预检（尽早报错），随后在**同一
 // 事务内**取 advisory 锁并**重新断言**——并发安全判据只在锁内成立。
@@ -82,11 +128,17 @@ func ensureSchema(ctx context.Context, q Queryer, target int) error {
 	// 提交后的 Rollback 返回 sql.ErrTxDone；只做释放，不覆盖已返回的结论。
 	defer func() { _ = tx.Rollback() }()
 
-	// 事务第一条语句取固定键的 advisory 事务锁：并发启动的第二个进程在此等待（或按会话
-	// `lock_timeout` 失败），**不得**两进程同时建表（C-15）。
-	// First statement of the transaction takes the advisory lock; a concurrent starter
-	// waits here instead of creating objects twice.
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationAdvisoryKey); err != nil {
+	// 事务内先解析**目标 schema**（同一会话、同一事务，解析结果与随后 DDL 落在同一
+	// schema 上），再按它取 advisory 事务锁：同一 schema 的并发启动在此等待（或按会话
+	// `lock_timeout` 失败），不同 schema 各持一把键、互不排队。**不得**两进程在同一
+	// schema 上同时建表（C-15）。
+	// Resolve the target schema in this same transaction, then take that schema's advisory
+	// lock: same-schema starters wait here; different schemas never queue behind each other.
+	schema, err := migrationTargetSchema(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationAdvisoryKeyFor(schema)); err != nil {
 		return fmt.Errorf("获取迁移 advisory 锁: %w", err)
 	}
 

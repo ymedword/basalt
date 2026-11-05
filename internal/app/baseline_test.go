@@ -56,8 +56,7 @@ func newBaselineEnv(t *testing.T) *baselineEnv {
 	writeWorkspaceFile(t, root, "skills/draft/notes.md", "草稿\n")
 
 	dsn := pgtest.NewTestSchema(t)
-	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
-	require.NoError(t, err)
+	db := pgtest.OpenMigrated(t, dsn)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	logger, logs := newCapturedLogger()
@@ -373,8 +372,7 @@ func TestRunBaseline_NoWorkWritesNoOperation(t *testing.T) {
 	require.NoError(t, err)
 
 	dsn := pgtest.NewTestSchema(t)
-	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
-	require.NoError(t, err)
+	db := pgtest.OpenMigrated(t, dsn)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	logger, logs := newCapturedLogger()

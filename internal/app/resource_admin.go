@@ -1420,30 +1420,62 @@ func (s *ResourceAdmin) skillWorkCopyState(name string, published core.ResourceV
 	return work, nil
 }
 
-// abortSkillWrite 是预写之后的统一回滚：恢复工作副本（创建 / 导入为删除，更新 / 发布
-// 为重建旧文件）并删除本次快照；补偿失败一律置 unknown，不谎报 failed。返回的 500
-// 带回可查的操作标识（约束 1a）。
-// abortSkillWrite restores the work copy and drops this attempt's snapshot; a failed
-// compensation is classified unknown rather than reported as a clean failure.
-func (s *ResourceAdmin) abortSkillWrite(ctx context.Context, operationID, name, reason string,
-	cause error, uid core.ResourceUID, versionNo int, restore func() error,
+// skillCommitFinisher 回填一次技能提交失败的操作终态。ResourceAdmin 与 AdmissionAdmin
+// 各自传入自己的终态写入闭包，包级补偿逻辑因此不依赖具体编排器的错误码约定。
+// skillCommitFinisher writes the terminal state of a failed skill commit; both
+// orchestrators pass their own closure so the compensation logic stays shared.
+type skillCommitFinisher func(ctx context.Context, operationID string, status core.OperationStatus, message string)
+
+// abortSkillCommit 是技能提交失败后的统一补偿（P-03，US-21 §3.5）：先恢复工作副本，
+// 再删除本次快照；任一步失败即把操作记 unknown 并保留现场供查证。返回给调用方的错误
+// 带 operation_id，便于按审计行追查。补偿失败时不谎报 failed——现场还在，状态未知。
+// abortSkillCommit is the shared compensation for a failed skill commit: restore the
+// work copy, remove this attempt's snapshot, then record failed or unknown.
+func abortSkillCommit(ctx context.Context, root string, logger *slog.Logger, finish skillCommitFinisher,
+	operationID, name, reason string, cause error, uid core.ResourceUID, versionNo int, restore func() error,
 ) error {
-	s.logger.Error("技能写失败，开始回滚", "skill", name, "operation_id", operationID,
+	logger.Error("技能提交失败，开始回滚", "skill", name, "operation_id", operationID,
 		"reason", reason, "error", cause)
+	// 提交结果未知（数据库连接中断等）：事务可能已经生效，此时恢复工作副本或
+	// 删除快照会破坏已发布版本。禁止任何磁盘补偿，只把操作记 unknown 交恢复
+	// 路径查证（US-21 review ② 发现 1）。
+	// An unknown commit may have succeeded; on-disk compensation would destroy the
+	// published version, so only record unknown and leave the scene for recovery.
+	if errors.Is(cause, core.ErrAdmissionCommitUnknown) {
+		message := reason + "；提交结果未知，未回滚磁盘，待恢复路径查证"
+		finish(ctx, operationID, core.OperationUnknown, message)
+		return operationFailedError(operationID, message)
+	}
 	status := core.OperationFailed
 	message := reason
 	if err := restore(); err != nil {
 		status = core.OperationUnknown
 		message = reason + "；回滚工作副本失败，结果待查证"
-		s.logger.Error("技能写回滚工作副本失败", "skill", name, "operation_id", operationID, "error", err)
-	} else if err := removeSkillSnapshot(s.root, name, uid, versionNo); err != nil {
+		logger.Error("技能提交回滚工作副本失败", "skill", name, "operation_id", operationID, "error", err)
+	} else if err := removeSkillSnapshot(root, name, uid, versionNo); err != nil {
 		status = core.OperationUnknown
 		message = reason + "；清理快照失败，结果待查证"
-		s.logger.Error("技能写回滚清理快照失败", "skill", name, "operation_id", operationID,
+		logger.Error("技能提交回滚清理快照失败", "skill", name, "operation_id", operationID,
 			"version_no", versionNo, "error", err)
 	}
-	s.finish(ctx, operationID, status, lifecycleResultInternal, message)
+	finish(ctx, operationID, status, message)
 	return operationFailedError(operationID, message)
+}
+
+// abortSkillWrite 是预写之后的统一回滚：恢复工作副本（创建 / 导入为删除，更新 / 发布
+// 为重建旧文件）并删除本次快照；补偿失败一律置 unknown，不谎报 failed。返回的 500
+// 带回可查的操作标识（约束 1a）。补偿本体收敛到包级 abortSkillCommit（P-03），
+// 本方法只负责把资源面的结果码绑进终态写入闭包——两份编排器共用同一套回滚语义。
+// abortSkillWrite binds the resource-lifecycle result code and delegates to the shared
+// abortSkillCommit compensation; the rollback semantics themselves are not duplicated.
+func (s *ResourceAdmin) abortSkillWrite(ctx context.Context, operationID, name, reason string,
+	cause error, uid core.ResourceUID, versionNo int, restore func() error,
+) error {
+	finish := func(ctx context.Context, operationID string, status core.OperationStatus, message string) {
+		s.finish(ctx, operationID, status, lifecycleResultInternal, message)
+	}
+	return abortSkillCommit(ctx, s.root, s.logger, finish, operationID, name, reason, cause,
+		uid, versionNo, restore)
 }
 
 // skillDetail 组装写操作的结果视图：path 与只读面同一口径；引用列表读仓储，读失败

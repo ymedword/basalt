@@ -197,7 +197,7 @@ func (s *ResourceStore) Publish(ctx context.Context, kind core.ResourceKind, res
 	if err != nil {
 		return err
 	}
-	if err := publishTx(ctx, tx, kind, resourceID, uid, versionID, applied, operationID, now); err != nil {
+	if err := publishTx(ctx, tx, kind, resourceID, uid, versionID, applied, operationID, now, nil); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -278,7 +278,7 @@ func (s *ResourceStore) PublishWithVersionState(ctx context.Context, v core.Reso
 	if err != nil {
 		return core.ResourceVersion{}, err
 	}
-	if err := publishTx(ctx, tx, v.Kind, v.ResourceID, v.ResourceUID, version.ID, applied, operationID, now); err != nil {
+	if err := publishTx(ctx, tx, v.Kind, v.ResourceID, v.ResourceUID, version.ID, applied, operationID, now, nil); err != nil {
 		return core.ResourceVersion{}, err
 	}
 	if err := finishOperationTx(ctx, s.db, tx, operationID, core.OperationSuccess, "", "", nil, now); err != nil {
@@ -290,18 +290,90 @@ func (s *ResourceStore) PublishWithVersionState(ctx context.Context, v core.Reso
 	return version, nil
 }
 
+// pointerExpectation 是 P-02 扩展：调用方在指针 UPSERT 之前对当前指针行的条件断言。
+// `Absent=true` 断言"没有指针行"（首版发布）；否则逐项比对 uid / published_version_id /
+// deleted，`Revision > 0` 时再比对 revision（0 表示调用方没有该读数，不比对）。
+// 任一不符返回 `Mismatch` 包装的错误——调用方据此区分"基线漂移"与普通写失败。
+// pointerExpectation is the P-02 conditional guard evaluated before the pointer UPSERT.
+// Absent asserts "no pointer row"; otherwise uid / published version / deleted (and the
+// revision when known) must match exactly, or the wrapped Mismatch error is returned.
+type pointerExpectation struct {
+	Absent             bool
+	UID                core.ResourceUID
+	PublishedVersionID int64
+	Revision           int64
+	Deleted            bool
+	Mismatch           error
+}
+
+// checkPointerExpectation 读取并锁定（FOR UPDATE）当前指针行后逐项比对期望。行级锁
+// 让"核对 → UPSERT"之间不会被别的发布事务插队；`Absent` 断言没有行时 PostgreSQL 没有
+// 可锁对象，跨进程串行由 CLI 实例锁与候选锁保证（服务器不提供准入写端点）。
+// checkPointerExpectation locks the pointer row (FOR UPDATE) and compares the expectation;
+// the row lock closes the check-then-upsert window. The absent case has no row to lock and
+// is serialized by the CLI instance lock and the per-candidate lock instead.
+func checkPointerExpectation(ctx context.Context, tx *sql.Tx, kind core.ResourceKind, resourceID string, expect *pointerExpectation) error {
+	mismatch := expect.Mismatch
+	if mismatch == nil {
+		mismatch = core.ErrAdmissionInvalidState
+	}
+	var (
+		uid              sql.NullString
+		publishedVersion sql.NullInt64
+		revision         sql.NullInt64
+		deletedAt        sql.NullInt64
+	)
+	err := tx.QueryRowContext(ctx,
+		`SELECT resource_uid, published_version_id, revision, deleted_at
+		   FROM resource_pointers
+		  WHERE resource_kind = $1 AND resource_id = $2
+		  FOR UPDATE`, string(kind), resourceID).
+		Scan(&uid, &publishedVersion, &revision, &deletedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		if expect.Absent {
+			return nil
+		}
+		return fmt.Errorf("%w: %s/%s 指针缺失，期望 UID=%s", mismatch, kind, resourceID, expect.UID)
+	}
+	if err != nil {
+		return fmt.Errorf("校验发布指针期望 %s/%s: %w", kind, resourceID, err)
+	}
+	if expect.Absent {
+		return fmt.Errorf("%w: %s/%s 已存在指针行，期望首版发布", mismatch, kind, resourceID)
+	}
+	switch {
+	case !uid.Valid || core.ResourceUID(uid.String) != expect.UID:
+		return fmt.Errorf("%w: %s/%s 指针 UID 与期望不一致", mismatch, kind, resourceID)
+	case !publishedVersion.Valid || publishedVersion.Int64 != expect.PublishedVersionID:
+		return fmt.Errorf("%w: %s/%s 指针版本与期望不一致", mismatch, kind, resourceID)
+	case deletedAt.Valid != expect.Deleted:
+		return fmt.Errorf("%w: %s/%s 指针删除状态与期望不一致", mismatch, kind, resourceID)
+	case expect.Revision > 0 && (!revision.Valid || revision.Int64 != expect.Revision):
+		return fmt.Errorf("%w: %s/%s 指针修订号与期望不一致", mismatch, kind, resourceID)
+	}
+	return nil
+}
+
 // publishTx 是指针写入的唯一 SQL 实现：插入时 applied 取决于本次发布，更新时
 // `applied=false` 保留旧值；发布同时清掉删除标记（撤回 = 新版本）。
 //
 // 身份守卫：名称的活跃指针已指向**另一个**资源实例时拒绝——同名重建只允许发生在删除
 // 之后（墓碑行），不得让两个活着的实例共用一个名称。`revision` 每次发布 +1（参与 ETag）。
+// `expect` 非 nil 时先做 P-02 条件断言；既有调用传 nil，行为与原来逐字一致。
 // publishTx is the single pointer UPSERT. An active pointer already bound to another uid
-// is refused: a same-name rebuild is only possible after the previous delete.
+// is refused: a same-name rebuild is only possible after the previous delete. A non-nil
+// expectation runs the P-02 guard first; existing callers pass nil and behave as before.
 func publishTx(ctx context.Context, tx *sql.Tx, kind core.ResourceKind, resourceID string,
 	uid core.ResourceUID, versionID int64, applied bool, operationID string, now time.Time,
+	expect *pointerExpectation,
 ) error {
 	if now.IsZero() {
 		now = time.Now()
+	}
+	if expect != nil {
+		if err := checkPointerExpectation(ctx, tx, kind, resourceID, expect); err != nil {
+			return err
+		}
 	}
 	if err := checkPointerIdentity(ctx, tx, kind, resourceID, uid); err != nil {
 		return err

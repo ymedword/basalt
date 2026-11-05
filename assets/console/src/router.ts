@@ -3,13 +3,14 @@
 // `workspace`）+ 会话详情深链（`agents/:name/sessions/:id`，R7）+ US-14 的 MCP 目录
 // （`catalog/mcp`）+ US-16 的调用方列表与详情（`callers`、`callers/:id`）、知识库
 // 集合 / 文档详情（`knowledge`、`knowledge/:collectionId`、`knowledge/documents/:id`）
-// 与诊断事件页（`diagnostics`）、历史回查页（`history`）+ 404 视图，不引入第三方
-// 路由库；静态段先于动态段。
+// 与诊断事件页（`diagnostics`）、历史回查页（`history`）+ US-21 的只读准入页
+// （`admissions`、`admissions/:id`）+ 404 视图，不引入第三方路由库；静态段先于
+// 动态段。
 // popstate 恢复视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
 // A hand-written History API router: twelve US-11 paths, the five US-12 paths, the R7
 // session deep link, the US-14 catalog, the US-16 pages (callers, knowledge,
-// diagnostics, history), and the 404 view, matching static segments before dynamic
-// ones.
+// diagnostics, history), the US-21 read-only admission pages, and the 404 view,
+// matching static segments before dynamic ones.
 
 /** 管理台路径前缀；服务端对 /console/* 非静态资源一律回退 index.html。 */
 export const CONSOLE_BASE = '/console'
@@ -41,6 +42,8 @@ export type RouteName =
   | 'document-detail'
   | 'diagnostics'
   | 'observability'
+  | 'admissions'
+  | 'admission-detail'
   | 'flows'
   | 'flow-tasks'
   | 'flow-task'
@@ -130,6 +133,10 @@ const ROUTES: readonly RoutePattern[] = [
   // 历史回查（US-16 / T057）：单段静态路径；会话详情页以 `?session_id=` 深链进来。
   // History: one static segment; the session page deep-links with `?session_id=`.
   { name: 'history', segments: ['history'] },
+  // 学习准入（US-21 / T022）：只读列表与按 `candidate_id` 的详情深链。
+  // Learning admission: the read-only list and the candidate deep link.
+  { name: 'admissions', segments: ['admissions'] },
+  { name: 'admission-detail', segments: ['admissions', ':id'] },
 ]
 
 function isResourceKind(value: string): value is ResourceKind {
@@ -311,6 +318,16 @@ export function callersHref(): string {
 /** 调用方详情：按 caller_id 深链。 */
 export function callerHref(callerId: string): string {
   return `${CONSOLE_BASE}/callers/${encodeURIComponent(callerId)}`
+}
+
+/** 学习准入列表（只读）。 */
+export function admissionsHref(): string {
+  return `${CONSOLE_BASE}/admissions`
+}
+
+/** 准入候选详情：按 candidate_id 深链，刷新与分享都回到同一候选。 */
+export function admissionHref(candidateId: string): string {
+  return `${CONSOLE_BASE}/admissions/${encodeURIComponent(candidateId)}`
 }
 
 /** 诊断事件页；关联标识经查询串给出，走最短路深链。 */

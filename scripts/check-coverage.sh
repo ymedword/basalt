@@ -76,7 +76,17 @@ else
 		echo "check-coverage: 排查路径：本地启动 dev-env 测试库并经 dev-env/scripts/with-postgres.sh 运行；环境准备见 docs/DevelopmentLoop.md §10；CI 由 postgres service 注入 DSN" >&2
 		exit 1
 	}
-	( cd "$tree" && go test -tags=integration -count=1 -coverprofile="$profile" ./... ) || {
+	# 显式 -timeout：go test 默认每包 10 分钟。2026-11-05 实测 internal/app 单跑
+	# 601.7s、全仓并行下 cover 轮 900.1s（贴着 15m 边界）；用户裁决内层 15m→17m。
+	# 同日晚夹具闸门（pgtemp）落地后权重上升：仍为 17m 时 cover 轮的 internal/app
+	# 在 1020.637s 撞线（同一源码不带 -cover 时 949.793s），用户裁决 17m→22m，
+	# 外层 harness 预算 1200s→1500s。只放宽时限，断言、包范围与覆盖率阈值不变。
+	# Explicit -timeout: internal/app measured 601.7s solo and 900.1s under the
+	# cover run's parallel contention; the inner bound went 15m→17m→22m as measured
+	# (it hit 1020.637s at 17m while the same tree took 949.793s without -cover),
+	# and the harness budget is now 1500s. Assertions, package scope and coverage
+	# thresholds are unchanged.
+	( cd "$tree" && go test -tags=integration -count=1 -timeout=22m -coverprofile="$profile" ./... ) || {
 		echo "check-coverage: go test 失败——覆盖率判据不成立（不得把测试失败当通过）" >&2
 		exit 1
 	}

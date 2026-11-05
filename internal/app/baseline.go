@@ -180,6 +180,11 @@ type RecoveryDeps struct {
 	// 摘要判定三态。nil 只意味着该组判 unknown——记忆写面装配失败时启动本就拒绝。
 	// Memory backs the memory verdicts; nil means indeterminate only.
 	Memory memory.MemoryStore
+	// Admission 是学习准入的只读查证面（`skill.admission.*` 七个动作）：按候选行 /
+	// 评估行 / 决策行 / 发布行与候选目录判定三态，**不重放**。nil 只意味着该组判
+	// unknown——准入写面走独立 CLI 端口，服务进程装配缺它时仍能启动（查证降级）。
+	// Admission backs the admission verdicts; nil means indeterminate only.
+	Admission *AdmissionAdmin
 }
 
 // SchemaVersionSource 回答库当前的 schema 版本（`*storage.DB` 满足）。
@@ -993,9 +998,26 @@ func verifyOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRe
 	case core.ActionMemoryPropose, core.ActionMemoryConfirm,
 		core.ActionMemoryCorrect, core.ActionMemoryDelete:
 		return verifyMemoryOperation(ctx, deps, op)
+	case core.ActionSkillAdmissionPropose, core.ActionSkillAdmissionEvaluate,
+		core.ActionSkillAdmissionApprove, core.ActionSkillAdmissionReject,
+		core.ActionSkillAdmissionCancel, core.ActionSkillAdmissionPublish,
+		core.ActionSkillAdmissionWithdraw:
+		return verifyAdmissionOperation(ctx, deps, op)
 	default:
 		return core.VerificationIndeterminate
 	}
+}
+
+// verifyAdmissionOperation 把 `skill.admission.*` 的查证委托给准入编排面的只读方法，
+// 并强制 `target_kind = skill_admission`：别的目标类型冒用这组 action 时无法判定，
+// 不能拿准入仓储的行去证明它。装配缺失同样只能判 unknown。
+// verifyAdmissionOperation delegates to the admission verifier and requires the
+// admission target kind, so a spoofed action never inherits another target's evidence.
+func verifyAdmissionOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) string {
+	if deps.Admission == nil || op.TargetKind != core.TargetKindSkillAdmission {
+		return core.VerificationIndeterminate
+	}
+	return deps.Admission.VerifyOperation(ctx, op)
 }
 
 // memoryVerifyDetail 是恢复查证专用的一份 `detail_json` 解码：**用指针表达"缺字段"**。

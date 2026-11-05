@@ -400,8 +400,11 @@ func errorTextOf(err error) string {
 }
 
 // compactionPolicyOf 把配置段投影成引擎策略（**不补默认值**：配置层已校验完整）。
-// 任一零值都表示"没写"——引擎的 `valid()` 会拒绝，而不是拿零值跑起来（D-24）。
+// 除 `keep_recent_groups` 外，任一零值都表示"没写"——引擎的 `valid()` 会拒绝，
+// 而不是拿零值跑起来（D-24）。`keep_recent_groups` 的缺省 4 已在装载层落值
+// （2026-11-05 用户裁决，D-24 的唯一例外），装配层只做投影、不另补一份缺省。
 // compactionPolicyOf projects the config section as-is; nothing is defaulted here.
+// keep_recent_groups already got its load-time default (4); this layer stays a projection.
 func compactionPolicyOf(cfg cli.CompactionConfig) compaction.Policy {
 	return compaction.Policy{
 		TriggerRatio:      cfg.TriggerRatio,

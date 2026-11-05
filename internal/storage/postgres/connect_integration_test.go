@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/storage/postgres/pgtemp"
 )
 
 // 本文件是启动校验的**有库**用例：每个用例在测试库里建独立 schema 并在连接上固定
@@ -91,10 +92,38 @@ func createSchema(t *testing.T, pool *sql.DB) string {
 	_, err := pool.ExecContext(context.Background(), "CREATE SCHEMA "+schema)
 	require.NoError(t, err)
 	t.Cleanup(func() {
+		// 回收按对象计锁：`DROP SCHEMA ... CASCADE` 在删每个表 / 索引时持锁（实测 1,597
+		// 条），几十个并行用例叠加会打爆测试库锁表（SQLSTATE 53200）。因此回收与迁移一样
+		// 走 `pgtemp` 的跨进程闸门；排队本身给 3 分钟上限，槽位泄漏时失败落在这一次清理上。
+		// DROP goes through the shared cross-process gate for the same lock-count reason.
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 3*time.Minute)
+		release, releaseErr := pgtemp.AcquireDropSlot(waitCtx)
+		cancelWait()
+		require.NoError(t, releaseErr)
+		defer release()
 		_, dropErr := pool.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
 		require.NoError(t, dropErr)
 	})
 	return schema
+}
+
+// openMigratedTestDB 在夹具迁移槽位内跑 `Open`（内部执行全量迁移并加 `schema_version`）。
+// 全量迁移在一个事务里持约 1,136 个锁表条目，本包几十个并行用例各自迁移会打爆测试库锁表
+// （2026-11-05 实测 SQLSTATE 53200）。槽位在迁移返回后**立刻**释放，不跨用例持有——否则
+// 并行的迁移用例会互相饿死。迁移并发用例（`migrate_integration_test.go`）**不走**这里：
+// 它们要验证的正是「同 schema 互斥 / 不同 schema 并行」，必须直接调用迁移路径。
+// openMigratedTestDB runs Open under the shared migration slot and releases it as soon
+// as the migration returns; the migration-concurrency cases deliberately bypass it.
+func openMigratedTestDB(t *testing.T, cfg Config) *DB {
+	t.Helper()
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 3*time.Minute)
+	release, err := pgtemp.AcquireMigrationSlot(waitCtx)
+	cancelWait()
+	require.NoError(t, err)
+	defer release()
+	db, err := Open(context.Background(), cfg)
+	require.NoError(t, err)
+	return db
 }
 
 // withSearchPath 把会话 `search_path` 钉到给定 schema 列表。`Open` 会在连接池上建库，
@@ -302,8 +331,7 @@ func TestStartupVerification_OpenPinsUTCAndPrimarySession(t *testing.T) {
 		seen[extSchema] = true
 		paths = append(paths, extSchema)
 	}
-	db, err := Open(ctx, Config{DSN: withSearchPath(t, testDSN(t), paths...), ConnectTimeout: 5 * time.Second})
-	require.NoError(t, err, "测试库必须是可用的运行后端")
+	db := openMigratedTestDB(t, Config{DSN: withSearchPath(t, testDSN(t), paths...), ConnectTimeout: 5 * time.Second})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	var timezone string

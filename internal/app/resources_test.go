@@ -70,8 +70,7 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 	require.NoError(t, err)
 
 	dsn := pgtest.NewTestSchema(t)
-	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
-	require.NoError(t, err)
+	db := pgtest.OpenMigrated(t, dsn)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	client := providerClientFunc(func(context.Context, core.ChatRequest) (core.ChatResponse, error) {

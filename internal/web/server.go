@@ -97,6 +97,14 @@ type Options struct {
 	// assembly error answered with a fixed 500, never an empty list.
 	Resources ResourceReader
 
+	// Admissions 是学习准入只读面的数据源（US-21 §3.1.11，装配传
+	// `*postgres.AdmissionStore`）：两条 GET 路由只读候选 / 评估 / 决策 / 发布行，
+	// **不**读 `.basalt/admissions` 磁盘、不返回候选文件正文，也**没有**写端点。
+	// nil = 装配缺失，两条路由按固定 500 失败关闭——**不得**用空列表冒充"没有候选"。
+	// Admissions backs the two read-only admission routes; a nil port fails closed
+	// instead of serving an empty list that looks like a real empty state.
+	Admissions AdmissionReader
+
 	// Console 是管理台内嵌产物根（`assets.Console()`，§3.1.22）：装配期必需——缺它
 	// 就没有 `/console/*` 与根重定向的落点，NewServer 直接拒绝（约束 41 / 43）。
 	// Console is the embedded dist root; it is required at assembly time.
@@ -810,6 +818,12 @@ func (s *Server) routeTable() []route {
 		{method: http.MethodGet, pattern: "/api/v1/mcp-servers/{name}", visibility: routeProtected, adminHandler: s.handleGetMCPServer},
 		{method: http.MethodGet, pattern: "/api/v1/model-connections", visibility: routeProtected, adminHandler: s.handleListModelConnections},
 		{method: http.MethodGet, pattern: "/api/v1/model-connections/{name}", visibility: routeProtected, adminHandler: s.handleGetModelConnection},
+		// 学习准入只读面（US-21 §3.1.11）：两条 GET，**没有**写方法——批准 / 发布 /
+		// 撤回只在本机 CLI 执行（C-14）。写方法会落到表尾的方法无关兜底 404。
+		// The two read-only admission rows; no write method exists, so POST/PUT/PATCH/
+		// DELETE fall through to the method-agnostic 404 fallback.
+		{method: http.MethodGet, pattern: "/api/v1/admissions", visibility: routeProtected, adminHandler: s.handleListAdmissions},
+		{method: http.MethodGet, pattern: "/api/v1/admissions/{candidate_id}", visibility: routeProtected, adminHandler: s.handleGetAdmission},
 		{method: http.MethodGet, pattern: "/api/v1/schedules", visibility: routeProtected, handler: s.handleListSchedules},
 		{method: http.MethodPut, pattern: "/api/v1/schedules/{id}", visibility: routeProtected, handler: s.handleSetScheduleEnabled},
 		{method: http.MethodGet, pattern: "/api/v1/schedules/{id}/executions", visibility: routeProtected, handler: s.handleListExecutions},

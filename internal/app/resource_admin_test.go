@@ -233,8 +233,9 @@ func newResourceEnv(t *testing.T, mutate ...func(*ResourceAdminDeps)) *resourceE
 	require.NoError(t, os.WriteFile(configPath, []byte(initialResourceConfig), 0o600))
 
 	dsn := pgtest.NewTestSchema(t)
-	db, err := postgres.Open(context.Background(), postgres.Config{DSN: dsn})
-	require.NoError(t, err)
+	// 走夹具槽位：直接 postgres.Open 会让全量迁移绕开限流，几十个并行用例一起迁移
+	// 会打爆测试库共享锁表（2026-11-05 实测 SQLSTATE 53200）。
+	db := pgtest.OpenMigrated(t, dsn)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	catalog := &providerCatalogStore{}

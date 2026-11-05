@@ -15,6 +15,7 @@ package pgtest
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -69,13 +70,9 @@ func NewTestSchema(t *testing.T) string {
 func NewFixture(t *testing.T) Fixture {
 	t.Helper()
 	pinned := newPinnedDSN(t)
-	ctx := t.Context()
-	db, err := postgres.Open(ctx, postgres.Config{
-		DSN:            pinned,
-		ConnectTimeout: 5 * time.Second,
-	})
+	db, err := openMigrated(t.Context(), pinned)
 	if err != nil {
-		t.Fatalf("在隔离 schema 上打开句柄: %v", err)
+		t.Fatalf("%v", err)
 	}
 	t.Cleanup(func() {
 		if err := db.Close(); err != nil {
@@ -83,6 +80,40 @@ func NewFixture(t *testing.T) Fixture {
 		}
 	})
 	return Fixture{DSN: pinned, DB: db}
+}
+
+// OpenMigrated 在给定 DSN 上打开一个**已迁移**句柄，准备过程同样受全局夹具槽位约束。
+// 给"先 NewTestSchema 拿 DSN、再自己 postgres.Open"的用例用：直接调 postgres.Open 会让
+// 全量迁移绕过槽位，几十个 `t.Parallel()` 用例并联时一样打爆测试库锁表
+// （2026-11-05 实测：cover 轮 20 条用例因此报 SQLSTATE 53200）。
+// OpenMigrated opens a migrated handle under the shared slot, for cases that
+// provision their own schema instead of using NewFixture.
+func OpenMigrated(t *testing.T, dsn string) *postgres.DB {
+	t.Helper()
+	db, err := openMigrated(t.Context(), dsn)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return db
+}
+
+// openMigrated 在迁移槽位内跑 postgres.Open（内部会执行全量迁移）。迁移在一个事务里
+// 持有约 1,136 个锁表条目，因此必须排队（见 pgtemp 的闸门说明）。
+// openMigrated runs postgres.Open (which migrates) inside the migration slot.
+func openMigrated(ctx context.Context, dsn string) (*postgres.DB, error) {
+	release, err := pgtemp.AcquireMigrationSlot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("获取夹具迁移槽位: %w", err)
+	}
+	defer release()
+	db, err := postgres.Open(ctx, postgres.Config{
+		DSN:            dsn,
+		ConnectTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("在隔离 schema 上打开句柄: %w", err)
+	}
+	return db, nil
 }
 
 // newPinnedDSN 建隔离 schema 并把回收挂到 `t.Cleanup`；准备失败一律 `t.Fatalf`——
@@ -98,6 +129,20 @@ func newPinnedDSN(t *testing.T) string {
 	t.Cleanup(func() {
 		// t.Context() 在 cleanup 前已取消，回收一律用独立上下文。
 		// t.Context() is already canceled here, so cleanup uses its own context.
+		// 回收同样按对象计锁：`DROP SCHEMA ... CASCADE` 在删每个表 / 索引时持锁（实测
+		// 1,597 条），并发回收与并发迁移叠加会一起触发 53200（本次实测里就有 16 条回收
+		// 因此失败）。因此回收走自己的闸门（1 路），与迁移闸门分开。
+		// 先排队取槽位、再起 10s 的 DROP 时限——否则排队时间会算进 DROP 预算，
+		// 回收被误判成超时（2026-11-05 实测：6 个用例因此假红）。排队本身给 3 分钟
+		// 上限：槽位若被泄漏，失败要落在这一次清理上，而不是把整包挂到全局超时。
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 3*time.Minute)
+		release, err := pgtemp.AcquireDropSlot(waitCtx)
+		cancelWait()
+		if err != nil {
+			t.Errorf("获取回收槽位 %s: %v", schema.Name, err)
+			return
+		}
+		defer release()
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := schema.Drop(cleanupCtx); err != nil {

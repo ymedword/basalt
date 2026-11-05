@@ -58,8 +58,7 @@ func newTxTestDB(t *testing.T) *DB {
 		"search_path 已能解析到 schema_version（%s）——迁移会在别的 schema 上空转", shadow.String)
 	require.NoError(t, conn.Close())
 
-	db, err := Open(ctx, Config{DSN: withSearchPath(t, testDSN(t), paths...), ConnectTimeout: 5 * time.Second})
-	require.NoError(t, err)
+	db := openMigratedTestDB(t, Config{DSN: withSearchPath(t, testDSN(t), paths...), ConnectTimeout: 5 * time.Second})
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	_, err = db.pool.ExecContext(ctx, `INSERT INTO callers
@@ -73,8 +72,7 @@ func newTxTestDB(t *testing.T) *DB {
 // reopenDB reopens the same schema, simulating a process restart.
 func reopenDB(t *testing.T, db *DB) *DB {
 	t.Helper()
-	clone, err := Open(context.Background(), db.cfg)
-	require.NoError(t, err)
+	clone := openMigratedTestDB(t, db.cfg)
 	t.Cleanup(func() { require.NoError(t, clone.Close()) })
 	return clone
 }

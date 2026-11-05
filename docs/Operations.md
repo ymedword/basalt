@@ -322,6 +322,7 @@ IANA 时区名（`Asia/Shanghai`）的解析依赖 tz 数据库。Go 默认去�
 | `basalt.db`（+ `-wal` / `-shm`） | **SQLite 谱系遗留**：迁移到 PostgreSQL 之后只作回退快照，**不是**运行中的权威数据；权威库内容见上方口径变更说明 | 迁移**前**丢它 = 会话 / 消息 / 运行审计三表 + 管理操作审计 / 资源版本与发布指针 / Run 资源引用 / 记忆（sqlite 档）/ 定时状态全丢；迁移**后**丢它不影响运行，只失去回退窗口 |
 | `control/agents/*.json` | **不可再生** | Agent 生命周期状态（`active` / `disabled` / `archived`）丢失；DB 索引可由状态文件重建，反向不行。状态文件 schema 2 的 `agent_uid` 是 **Agent 身份**（绑定、专属资源、归档恢复按它关联），丢失后**不得**按同名猜回旧身份。缺失时该 Agent 拒绝新 Run（fail-closed），不会静默当作 `active` |
 | 技能不可变版本快照目录（`resource_versions.storage_path` 指向） | **不可再生** | 已发布技能版本的内容丢失；数据库里的清单与哈希还在，但无法还原文件。Run 冻结的资源清单指向这些版本 |
+| `.basalt/admissions/candidates/` | **不可再生**（US-21） | 准入候选的冻结正文与来源声明；数据库行只记清单哈希与状态，正文只在此目录。丢失后无法重放评估或核对批准证据，只能重新提议 |
 | `agents/`、`skills/` | 配置（可重建，但重建成本高） | Agent 与技能全丢 |
 | `memory/*.md`（markdown 档） | **不可再生** | 长期记忆丢（记忆后端为 markdown 时） |
 | `mcp_servers.yaml`、`AGENTS.md` / `SOUL.md` / `USER.md` | 配置 | 同上 |
@@ -1561,3 +1562,38 @@ CLI连接已经运行的实例，不启动第二写实例。远程地址必须HT
 探针会验证真实 bind、UID 与 mode000/双点目录清理。资源预算也要覆盖 runtime 的辅助线程；本地 WSL 测得 runsc + bind 在32pids下可能报 ENOMEM，64pids/256MiB通过基础探针，此为验证环境读数而非所有宿主的保证。Docker local 日志采用 max-file=1、compress=false 与固定 max-size。
 
 排障先看运行详情的执行状态、清理状态和原因，再核对本实例 `basalt.instance_id` 标签。账本未知不重放；任务容器、清理容器、输出目录、staging 未全部释放就继续占容量。已登记记录清理失败记录 WARN；无法枚举或无账本孤儿不能清理会拒绝启动。人工处置只针对已核对实例标签/路径的残留，确认服务停机和任务归属后再清理；不要批量删除其他实例容器、工作区或产物。清理完成后重启由恢复路径重算基线，不直接改账本伪造成功。
+
+## 学习准入（US-21）
+
+准入是技能入库的**本机 CLI** 通道：提议并冻结候选 → 七维确定性评估 → 本机人工批准 → 复用技能发布事务发布；发布后可按上一版内容撤回，首版撤回到空拒绝。技能库对 Agent 仍只读；`.basalt/admissions/` **不在**任何 Agent 读写白名单。不调用真实模型、不发起外部网络请求、不执行候选脚本，含脚本候选只接受逐条人工静态审查证据。
+
+### 停服与写命令
+
+`propose` / `evaluate` / `approve` / `reject` / `cancel` / `publish` / `withdraw` 七个写命令取工作区实例锁，**要求服务已停止**——`serve` 运行中执行会被锁拒绝，先按 §5.3 停机。`list` / `show` 只读，可在服务运行时执行。批准者主体只来自本机 CLI 身份（`cli:<本机用户>`），没有 `--approver` 类旁路参数。管理面与 CLI 都**没有** HTTP 批准 / 发布 / 撤回端点。
+
+```sh
+# 1. 冻结候选：来源声明为严格 JSON（未知键即拒、≤64 KiB）
+basalt admission propose --name <skill> --from-dir ./skills/<skill> --source-file source.json
+
+# 2. 评估并留证据：七维固定输出，effect / cost 恒为 not_evaluable（不等于通过）
+basalt admission evaluate adm_...
+basalt admission show adm_... --decision-template > decision.json
+
+# 3. 填好 reason / expires_at（≤24h）/ 审查证据后批准并发布
+basalt admission approve adm_... --decision-file decision.json
+basalt admission publish adm_...
+
+# 4. 出问题时撤回：上一版内容作为新版本发布；被超越 / 已删除只记撤回
+basalt admission withdraw adm_... --reason '回退到上一版'
+```
+
+### 升级与备份
+
+首次启动自动执行前向迁移到 schema v10（`0010_skill_admission.sql`），既有迁移不改写；升级前按 §5.1 做停机备份。`.basalt/admissions/candidates/`（候选正文与来源声明）与 PostgreSQL 准入四表**必须**来自同一次停机快照——只恢复库不恢复候选目录会得到「行在、正文不在」；恢复验证必须检出这类不一致，**不得**当作恢复成功。该目录随 `.basalt/` 整目录备份（§4.1），不纳入自动清理。
+
+### 排查
+
+- 审批 / 发布失败先看命令输出的错误文本（如 `admission approval expired`、`admission candidate mismatch`）；再查 `GET /operations?target_kind=skill_admission` 的操作行，以及管理台「学习准入」只读页的评估维度、批准者与发布状态。
+- 操作行 `unknown`（带 `recovered_at` / `verification`）表示崩溃恢复无法判定：只查证、不重放，**不得**手工改成 `success`，也**不得**删候选目录「重来」——先按操作标识核对库行与 `.basalt/admissions/candidates/<candidate_id>/` 是否存在。
+- `propose` 崩溃可能留下孤儿候选目录（行不存在、目录存在）；恢复只报告不删除，人工核对后再处置。
+- `approved` 显示为 `expired` 是**派生展示态**（库内仍是 `approved`）：重新评估或重申批准才能再发布，**不得**用 SQL 改状态。过期没有后台扫描，也不会自动回滚。

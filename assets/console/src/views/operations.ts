@@ -38,6 +38,7 @@ const TARGET_KINDS: readonly OperationTargetKind[] = [
   'knowledge_upload',
   'knowledge_document',
   'knowledge_collection',
+  'skill_admission',
 ]
 
 const TARGET_KIND_LABELS: Record<OperationTargetKind, string> = {
@@ -58,6 +59,7 @@ const TARGET_KIND_LABELS: Record<OperationTargetKind, string> = {
   knowledge_upload: '知识库上传',
   knowledge_document: '知识库文档',
   knowledge_collection: '知识库集合',
+  skill_admission: '学习准入',
 }
 
 const STATUSES: readonly OperationStatus[] = ['pending', 'success', 'failed', 'unknown']

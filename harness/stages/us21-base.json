@@ -1,0 +1,510 @@
+{
+ "version": 1,
+ "id": "us21-base",
+ "approval": "Human review 1 passed 2026-11-04 (user: review通过，你可以开始开发了；我等后面收尾时人工review). Reviewed module card docs/us/us21-learning-admission.md R2, sha256 14a1b4f7a19c9d8fbf4232fd385db7520ad312372933a39a05a84fe7d4fe5e78, 2697 lines; registry line 50. Derived by module-dev step 6.1: checks follow module card §4.6; us21-base-pg also runs the immutable migration tests (TestPostgres_* / TestObservability_*) and us21-base-app adds -tags=integration because US-16 moved storage-facing app tests behind that tag (without it the run would match nothing). Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. Human review 2 pending. 2026-11-05 analyze F-08 disposition: protect extended additively to cover every US-21 new file and the existing skill-publish / policy / operation-view tests (card §3.1.14); checks and required_tests unchanged. 2026-11-05 delta-review D-F-03 disposition: us21-base-app.required_tests extended additively 114 -> 116 with TestUS21_Withdraw_SnapshotFailureKeepsPublished and TestUS21_Withdraw_TamperedPublishedContentRejected (both existed and ran under the broad -run ^TestUS21_; now pinned individually). No existing entry removed or renamed; acceptance semantics unchanged, only coverage of the named regressions is made explicit. 2026-11-05 review-2 return and fix cycle: user decided R-03 (policy hash must include isolation.profiles.* with image/memory/PID/timeout and every other execution boundary; regression: editing a same-named profile after evaluation/approval makes the old approval unpublishable) and accepted F-04 (three read-only helpers kept). User also required four findings fixed before closeout: no blind snapshot deletion when a commit outcome is unknown; extensionless files cannot bypass script review or proposer/approver separation; policy hash completed (R-03); withdraw compensation failure recorded as unknown. required_tests extended additively 116 -> 122 with TestUS21_Evaluate_ExtensionlessScript, TestUS21_Policy_IsolationProfileChangesHash, TestUS21_Approve_ExtensionlessScriptRequiresReview, TestUS21_Policy_IsolationProfileDriftRejectsApproval, TestUS21_Publish_CommitUnknown_KeepsSnapshot, TestUS21_Withdraw_CompensationFailureRecordedUnknown. No entry removed or renamed. The reviewed module-card body is unchanged; an appended revision record (card section 7) documents the deltas. Review-2 return round 2 (2026-11-05): an independent-context re-review of the fix cycle found three residual instances of the same defect classes; all were fixed and proven red first. required_tests extended additively 122 -> 125 with TestUS21_Propose_CommitUnknown_KeepsSnapshot, TestUS21_Withdraw_SupersededCommitUnknownRecorded, TestUS21_Evaluate_TrailingDotScript. No entry removed or renamed; check ids unchanged. The reviewed module-card body is unchanged; an appended revision record (card section 7) documents the deltas.",
+ "inputs": [
+  "specs/021-learning-admission/spec.md",
+  "specs/021-learning-admission/plan.md",
+  "specs/021-learning-admission/tasks.md",
+  "harness/acceptance.json"
+ ],
+ "protect": [
+  "internal/core/admission.go",
+  "internal/core/admission_json.go",
+  "internal/core/admission_json_test.go",
+  "internal/workspace/admission_store.go",
+  "internal/workspace/admission_store_test.go",
+  "internal/workspace/skill_admin.go",
+  "internal/workspace/skill_version.go",
+  "internal/storage/postgres/admission_store.go",
+  "internal/storage/postgres/admission_store_test.go",
+  "internal/storage/postgres/migrations/0010_skill_admission.sql",
+  "internal/storage/postgres/connect.go",
+  "internal/storage/postgres/resource_store.go",
+  "internal/storage/postgres/resource_store_port_test.go",
+  "internal/storage/postgres/migrate_integration_test.go",
+  "internal/storage/postgres/observability_migration_test.go",
+  "internal/app/admission_admin.go",
+  "internal/app/admission_admin_test.go",
+  "internal/app/admission_approve_test.go",
+  "internal/app/admission_approve_unit_test.go",
+  "internal/app/admission_audit_test.go",
+  "internal/app/admission_cancel_test.go",
+  "internal/app/admission_eval.go",
+  "internal/app/admission_eval_test.go",
+  "internal/app/admission_port.go",
+  "internal/app/admission_port_test.go",
+  "internal/app/admission_publish_test.go",
+  "internal/app/admission_recovery_test.go",
+  "internal/app/admission_refs.go",
+  "internal/app/admission_refs_test.go",
+  "internal/app/admission_secret.go",
+  "internal/app/admission_secret_test.go",
+  "internal/app/admission_withdraw_test.go",
+  "internal/app/resource_admin.go",
+  "internal/app/resource_admin_test.go",
+  "internal/app/execution_policy_test.go",
+  "internal/app/execution_policy_migration_test.go",
+  "internal/app/recovery_operations_test.go",
+  "internal/app/skill_edit_integration_test.go",
+  "internal/app/ports_test.go",
+  "internal/app/baseline.go",
+  "internal/app/wire.go",
+  "internal/app/run.go",
+  "internal/app/web.go",
+  "internal/app/ports.go",
+  "internal/cli/admission.go",
+  "internal/cli/admission_test.go",
+  "internal/cli/ports.go",
+  "internal/cli/root.go",
+  "internal/cli/deps.go",
+  "internal/web/handlers_admissions.go",
+  "internal/web/handlers_admissions_test.go",
+  "internal/web/contracts_admissions_test.go",
+  "internal/web/handlers_operations.go",
+  "internal/web/handlers_operations_test.go",
+  "internal/web/contract_test.go",
+  "internal/web/server_test.go",
+  "internal/web/views.go",
+  "internal/web/admin_routes.go",
+  "internal/web/server.go",
+  "internal/e2e/us21_admission_test.go",
+  "assets/console/src/api.ts",
+  "assets/console/src/app.ts",
+  "assets/console/src/router.ts",
+  "assets/console/src/views/operations.ts",
+  "assets/console/src/views/admissions.ts",
+  "assets/console/src/views/admission-detail.ts",
+  "assets/console/tests/admissions.test.ts",
+  "docs/contracts/skill-admission.md",
+  "docs/contracts/run-and-errors.md",
+  "docs/contracts/openapi.yaml",
+  "docs/contracts/schema.pg.sql"
+ ],
+ "checks": [
+  {
+   "id": "us21-base-core",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-timeout=5m",
+    "./internal/core",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 600,
+   "required_tests": [
+    "TestUS21_Source_StrictJSON_Accepts",
+    "TestUS21_Source_StrictJSON_RejectsBoundary",
+    "TestUS21_Source_StrictJSON_RejectsMalformed",
+    "TestUS21_Decision_StrictJSON_AcceptsApprove",
+    "TestUS21_Decision_StrictJSON_AcceptsReject",
+    "TestUS21_Decision_StrictJSON_RejectsBoundary",
+    "TestUS21_Decision_StrictJSON_RejectHasNoApprovalFields",
+    "TestUS21_Manifest_RequiresCanonicalOrder",
+    "TestUS21_ScriptReviewJSON_NilIsEmptyArray",
+    "TestUS21_ApprovedScopeJSON_Deterministic",
+    "TestUS21_BaselineCanonical_IgnoresDerivedField",
+    "TestUS21_EvaluationHash_BindsContentAndNormalisesTime",
+    "TestUS21_RequestHash_SeparatesElements",
+    "TestUS21_DecisionTemplate_PrefillsAndBlanks",
+    "TestUS21_State_Transitions",
+    "TestUS21_AdmissionIDs_RoundTrip"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-workspace",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-timeout=5m",
+    "./internal/workspace",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 600,
+   "required_tests": [
+    "TestUS21_AdmissionCandidate_RoundTrip",
+    "TestUS21_CandidateDirReadOnly",
+    "TestUS21_AdmissionCandidate_RefusesResidueAndExisting",
+    "TestUS21_AdmissionCandidate_WriteRejectsInconsistentRequest",
+    "TestUS21_AdmissionCandidate_TamperDetected",
+    "TestUS21_AdmissionCandidate_MissingArtifacts",
+    "TestUS21_AdmissionCandidate_RejectsSymlinkInFiles",
+    "TestUS21_Propose_RejectsSymlinkSource",
+    "TestUS21_Propose_RejectsTraversal",
+    "TestUS21_Propose_EnforcesImportLimits",
+    "TestUS21_ReadAdmissionInputFiles_Bounds",
+    "TestUS21_AdmissionCandidate_RejectsInvalidID",
+    "TestUS21_RemoveAdmissionCandidate_ClearsFrozenTree"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-app",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-tags=integration",
+    "-timeout=10m",
+    "./internal/app",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 900,
+   "required_tests": [
+    "TestUS21_Propose_FreezeAndHash",
+    "TestUS21_Propose_ActiveCandidateExists",
+    "TestUS21_Evaluate_Dimensions",
+    "TestUS21_Evaluate_Aggregate",
+    "TestUS21_Evaluate_RiskTier",
+    "TestUS21_Evaluate_RetentionExpired",
+    "TestUS21_Evaluate_NoProviderOrNetwork",
+    "TestUS21_Evaluate_ScriptsNotExecuted",
+    "TestUS21_Evaluate_ExtensionlessScript",
+    "TestUS21_Policy_DomainTableRevisionChangesHash",
+    "TestUS21_Policy_IsolationProfileChangesHash",
+    "TestUS21_Policy_AdmissionsDirDenied",
+    "TestUS21_NotEvaluable_IsNotPass",
+    "TestUS21_WriteActions_RejectUntrustedActor",
+    "TestUS21_Approve_BearerRejected",
+    "TestUS21_Approve_UnknownCLIRejected",
+    "TestUS21_Approve_ContentChangedAfterEvaluation_Rejected",
+    "TestUS21_Approve_SourceChangedAfterEvaluation_Rejected",
+    "TestUS21_Approve_AcknowledgmentMismatch_Rejected",
+    "TestUS21_Approve_FailedEvaluationRejected",
+    "TestUS21_Approve_ExpiryWindow",
+    "TestUS21_Approve_ExpiredPublicationRejected",
+    "TestUS21_Approve_RetentionExpired_Rejected",
+    "TestUS21_Approve_ScriptsRequireStaticReview",
+    "TestUS21_Approve_ExtensionlessScriptRequiresReview",
+    "TestUS21_HighRisk_SelfApproval_Rejected",
+    "TestUS21_HighRisk_SeparationPasses",
+    "TestUS21_StateMachine_DuplicateApprove_OneActive",
+    "TestUS21_ConcurrentPublish_OneWinner",
+    "TestUS21_State_ExpiredIsDerived",
+    "TestUS21_AdmissionBlockedDimensions_InconsistentRow",
+    "TestUS21_Publish_ContentChangedAfterApproval_Rejected",
+    "TestUS21_Publish_SourceHashMismatch_Rejected",
+    "TestUS21_Publish_StaleBaseline_Rejected",
+    "TestUS21_Publish_StalePolicy_Rejected",
+    "TestUS21_Policy_IsolationProfileDriftRejectsApproval",
+    "TestUS21_Publish_AtomicOnFailure",
+    "TestUS21_Publish_UsesSharedPrimitives",
+    "TestUS21_Publish_PointerCAS",
+    "TestUS21_Publish_GateLocked",
+    "TestUS21_Publish_FailureKeepsApproved",
+    "TestUS21_Publish_CommitUnknown_KeepsSnapshot",
+    "TestUS21_Publish_RetryRechecks",
+    "TestUS21_Publish_DuplicateRejected",
+    "TestUS21_Publish_RetentionExpired_Rejected",
+    "TestUS21_Withdraw_RestoresPreviousVersion",
+    "TestUS21_Withdraw_SupersededDoesNotMovePointer",
+    "TestUS21_Withdraw_DeletedSkill",
+    "TestUS21_Withdraw_FirstVersionRejected",
+    "TestUS21_Withdraw_KeepsEvidence",
+    "TestUS21_Withdraw_SnapshotFailureKeepsPublished",
+    "TestUS21_Withdraw_CompensationFailureRecordedUnknown",
+    "TestUS21_Withdraw_TamperedPublishedContentRejected",
+    "TestUS21_Audit_PreWriteBeforeMutation",
+    "TestUS21_Audit_DetailJSONEmpty",
+    "TestUS21_Recovery_PublishNotApplied_NotReplayed",
+    "TestUS21_Recovery_UnknownNotRewritten",
+    "TestUS21_Recovery_DispatchCoversSevenActions",
+    "TestUS21_Secrets_NotEchoed",
+    "TestUS21_Errors_DoNotEchoSecrets",
+    "TestUS21_Propose_CommitUnknown_KeepsSnapshot",
+    "TestUS21_Withdraw_SupersededCommitUnknownRecorded",
+    "TestUS21_Evaluate_TrailingDotScript"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-pg",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-tags=integration",
+    "-timeout=10m",
+    "./internal/storage/postgres",
+    "-run",
+    "^(TestUS21_|TestPostgres_|TestObservability_)"
+   ],
+   "timeout_seconds": 900,
+   "required_tests": [
+    "TestUS21_Store_CreateCandidateEnforcesActiveName",
+    "TestUS21_Store_CandidateStateCAS",
+    "TestUS21_Store_LatestOrderedBySeq",
+    "TestUS21_Store_ListCandidatesFiltersExpired",
+    "TestUS21_Store_PublishThenWithdrawRestoresPrevious",
+    "TestUS21_Store_WithdrawSuperseded",
+    "TestUS21_Store_WithdrawDeleted",
+    "TestUS21_Store_ConcurrentPublishSingleWinner",
+    "TestUS21_Store_PublishRejectsStaleBaseline",
+    "TestUS21_Store_PublishRejectsVersionNumberDrift",
+    "TestUS21_Migration_PartialUniqueIndex",
+    "TestPostgres_FreshSchemaIsV1",
+    "TestPostgres_MigrateTakesAdvisoryLock",
+    "TestObservability_MigrationForwardOnly"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-web",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-timeout=5m",
+    "./internal/web",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 600,
+   "required_tests": [
+    "TestUS21_ConsoleReadOnly",
+    "TestUS21_NoWriteEndpoints",
+    "TestUS21_OpenAPIContract",
+    "TestUS21_OperationTargetKind",
+    "TestUS21_AdmissionList_DerivedExpired"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-cli",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-timeout=5m",
+    "./internal/cli",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 600,
+   "required_tests": [
+    "TestUS21_CLI_WriteCommandsTakeLock",
+    "TestUS21_CLI_ReadCommandsNoLock",
+    "TestUS21_CLI_NoApproverFlag",
+    "TestUS21_CLI_UntrustedActorRejected",
+    "TestUS21_CLI_ShowHidesRejectTerminalReason"
+   ],
+   "level": "source"
+  },
+  {
+   "id": "us21-base-e2e",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-tags=e2e",
+    "-timeout=10m",
+    "./internal/e2e",
+    "-run",
+    "^TestUS21_"
+   ],
+   "timeout_seconds": 900,
+   "required_tests": [
+    "TestUS21_E2E_FullAdmissionFlow",
+    "TestUS21_E2E_WithdrawRestoresPrevious",
+    "TestUS21_E2E_RecoveryAfterCrash",
+    "TestUS21_E2E_ConcurrentPublish",
+    "TestUS21_E2E_ReadOnlyConsole"
+   ],
+   "level": "process"
+  },
+  {
+   "id": "us21-base-console-test",
+   "args": [
+    "npm",
+    "--prefix",
+    "assets/console",
+    "test"
+   ],
+   "timeout_seconds": 600,
+   "level": "source"
+  },
+  {
+   "id": "us21-base-console-build",
+   "args": [
+    "npm",
+    "--prefix",
+    "assets/console",
+    "run",
+    "build"
+   ],
+   "timeout_seconds": 600,
+   "level": "source"
+  },
+  {
+   "id": "us21-base-race",
+   "args": [
+    "go",
+    "test",
+    "-json",
+    "-count=1",
+    "-race",
+    "-tags=integration",
+    "-timeout=10m",
+    "./internal/app",
+    "-run",
+    "^TestUS21_(ConcurrentPublish_OneWinner|StateMachine_DuplicateApprove_OneActive|Publish_PointerCAS|Publish_GateLocked)$"
+   ],
+   "timeout_seconds": 900,
+   "required_tests": [
+    "TestUS21_ConcurrentPublish_OneWinner",
+    "TestUS21_StateMachine_DuplicateApprove_OneActive",
+    "TestUS21_Publish_PointerCAS",
+    "TestUS21_Publish_GateLocked"
+   ],
+   "level": "source"
+  }
+ ],
+ "tasks": [
+  {
+   "id": "T003",
+   "checks": [
+    "us21-base-pg"
+   ]
+  },
+  {
+   "id": "T004",
+   "checks": [
+    "us21-base-core"
+   ]
+  },
+  {
+   "id": "T005",
+   "checks": [
+    "us21-base-core"
+   ]
+  },
+  {
+   "id": "T006",
+   "checks": [
+    "us21-base-pg"
+   ]
+  },
+  {
+   "id": "T007",
+   "checks": [
+    "us21-base-workspace"
+   ]
+  },
+  {
+   "id": "T008",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T009",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T010",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T011",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T012",
+   "checks": [
+    "us21-base-cli"
+   ]
+  },
+  {
+   "id": "T013",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T014",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T015",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T016",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T017",
+   "checks": [
+    "us21-base-cli"
+   ]
+  },
+  {
+   "id": "T018",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T019",
+   "checks": [
+    "us21-base-app"
+   ]
+  },
+  {
+   "id": "T020",
+   "checks": [
+    "us21-base-cli"
+   ]
+  },
+  {
+   "id": "T021",
+   "checks": [
+    "us21-base-web"
+   ]
+  },
+  {
+   "id": "T022",
+   "checks": [
+    "us21-base-console-test",
+    "us21-base-console-build"
+   ]
+  },
+  {
+   "id": "T023",
+   "checks": [
+    "us21-base-web"
+   ]
+  },
+  {
+   "id": "T025",
+   "checks": [
+    "us21-base-e2e"
+   ]
+  }
+ ]
+}

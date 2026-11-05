@@ -18,7 +18,7 @@ info:
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=8`**（US-19 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
+    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=10`**（US-21 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
     - **两类凭据不可互换**（US-16）：管理面只接受 admin token（或 `local_trust`），业务面接受调用方 API Key。`callers:admin` / `diagnostics:read` 只随内置 `local-admin` 生效，**不**发给 caller key；caller key 也无法表达管理员 Kind
     - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 / US-16 新增路径同样以本文件为准
 servers:
@@ -998,6 +998,75 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /admissions:
+    get:
+      tags: [resources]
+      summary: 列学习准入候选（只读）
+      description: |
+        只回数据库行投影，**没有**清单摘要与文件正文；`state` 是派生展示态——`approved` 且活跃批准
+        `expires_at` 已到（含相等）时显示 `expired`，库内状态不变。`state=approved` 与 `state=expired`
+        互斥：前者剔除派生过期行，后者只回过期行。顺序由服务端固定（`updated_at` 倒序，再按候选标识），
+        **不得**提供排序参数。未知查询参数忽略。只读：不写管理操作行，不读候选目录。
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { type: string, enum: [proposed, evaluated, approved, rejected, canceled, published, withdrawn, expired] }
+        - name: skill
+          in: query
+          required: false
+          schema: { type: string, description: 按技能名精确过滤 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: 候选列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AdmissionListView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admissions/{candidate_id}:
+    parameters:
+      - name: candidate_id
+        in: path
+        required: true
+        schema: { type: string, description: '`adm_` + 26 位 Crockford' }
+    get:
+      tags: [resources]
+      summary: 读学习准入候选详情（只读）
+      description: |
+        列表行摊平 + 结构化来源声明（`notes` 置空）+ 冻结清单摘要（**不含**文件正文）+
+        最新评估 / 决策 / 发布记录。子记录缺失时对应字段为 `null`；只有候选本身不存在才是 404。
+        只读：不写管理操作行，也没有任何写端点——批准 / 发布 / 撤回只在本机 CLI 执行。
+      responses:
+        '200':
+          description: 候选详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AdmissionDetailView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /catalog/mcp:
     get:
       tags: [resources]
@@ -1561,7 +1630,7 @@ paths:
           schema: { type: string }
         - name: target_kind
           in: query
-          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection] }
+          schema: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection, skill_admission] }
         - name: target_id
           in: query
           schema: { type: string }
@@ -6079,6 +6148,135 @@ components:
         file_count: { type: integer }
         referenced_by: { type: array, items: { type: string } }
 
+    AdmissionListView:
+      type: object
+      required: [candidate_id, skill_name, state, risk_tier, proposer_subject, candidate_hash, source_hash, created_at, updated_at]
+      properties:
+        candidate_id: { type: string, description: '`adm_` + 26 位 Crockford' }
+        skill_name: { type: string }
+        state:
+          type: string
+          enum: [proposed, evaluated, approved, rejected, canceled, published, withdrawn, expired]
+          description: 派生展示态；`expired` 永不落库（库内仍是 `approved`）
+        risk_tier: { type: string, enum: [unknown, normal, high], description: '尚未评估时为 `unknown`' }
+        proposer_subject: { type: string, description: '提出者主体，`cli:<本机用户>`' }
+        candidate_hash: { type: string, description: '候选文件清单摘要（升序 `[{path, sha256, size}]`）' }
+        source_hash: { type: string, description: '`source.json` 原始字节摘要' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdmissionFileView:
+      type: object
+      required: [path, sha256, size]
+      properties:
+        path: { type: string, description: 候选内相对路径 }
+        sha256: { type: string }
+        size: { type: integer, minimum: 0 }
+      description: 冻结清单的一条摘要；**没有**文件正文
+
+    AdmissionSource:
+      type: object
+      required: [kind, ref, task_outcome, confirmation, authorization, redaction, retention_until, applicable, counterexamples, evidence, limitations, notes]
+      properties:
+        kind: { type: string, enum: [manual, run, import, model_proposal] }
+        ref: { type: string, description: 来源引用；≤500 字符 }
+        task_outcome: { type: string, enum: [completed, failed, unknown, not_applicable] }
+        confirmation: { type: string, enum: [direct, user_confirmed, model_inferred, relayed] }
+        authorization: { type: string, enum: [declared, not_required, unknown] }
+        redaction: { type: string, enum: [declared, not_needed, unknown] }
+        retention_until:
+          oneOf: [{ type: string, format: date-time }, { const: "" }]
+          description: 空串表示未声明保留期
+        applicable: { type: boolean }
+        counterexamples: { type: array, items: { type: string } }
+        evidence: { type: array, items: { type: string } }
+        limitations: { type: array, items: { type: string } }
+        notes: { type: string, description: 自由文本；详情出站时恒为空串 }
+
+    AdmissionDimension:
+      type: object
+      required: [name, status]
+      properties:
+        name: { type: string, enum: [content, source, permissions, safety, regression, effect, cost] }
+        status: { type: string, enum: [passed, failed, not_evaluable] }
+        reason: { type: string, description: 可读理由；通过项通常省略（omitempty） }
+
+    AdmissionEvaluationView:
+      type: object
+      required: [evaluation_id, candidate_revision, candidate_hash, evaluation_hash, grader_version, policy_hash, dimensions, scripts, aggregate, risk_tier, referrers, evaluated_at]
+      properties:
+        evaluation_id: { type: string, description: '`eval_` + 26 位 Crockford' }
+        candidate_revision: { type: integer, minimum: 1 }
+        candidate_hash: { type: string }
+        evaluation_hash: { type: string, description: 绑定候选 / 策略 / 基线 / 维度 / 脚本 / 时间的证据链摘要 }
+        grader_version: { type: string, description: 当前固定 `admission-eval-v1` }
+        policy_hash: { type: string }
+        dimensions:
+          type: array
+          items: { $ref: '#/components/schemas/AdmissionDimension' }
+        scripts: { type: array, items: { type: string } }
+        aggregate: { type: string, enum: [passed, failed, incomplete] }
+        risk_tier: { type: string, enum: [normal, high] }
+        referrers: { type: array, items: { type: string } }
+        evaluated_at: { type: string, format: date-time }
+
+    AdmissionDecisionView:
+      type: object
+      required: [decision_id, decision, reason, acknowledged, risk_tier, approver_subject, expires_at, superseded_at, created_at]
+      properties:
+        decision_id: { type: string, description: '`dec_` + 26 位 Crockford' }
+        decision: { type: string, enum: [approve, reject] }
+        reason: { type: string, description: ≤2000 字符 }
+        acknowledged:
+          type: array
+          items: { type: string, enum: [effect, cost, regression] }
+          description: 可确认维度集合的精确值（approve 时）
+        risk_tier: { type: string, enum: [normal, high] }
+        approver_subject: { type: string, description: 只来自本机 CLI 身份，`cli:<本机用户>` }
+        expires_at:
+          oneOf: [{ type: string, format: date-time }, { const: "" }]
+          description: 批准有效期；reject 决策为空串
+        superseded_at:
+          oneOf: [{ type: string, format: date-time }, { const: "" }]
+          description: 活跃批准为空串
+        created_at: { type: string, format: date-time }
+
+    AdmissionPublicationView:
+      type: object
+      required: [skill_name, version_id, version_no, content_hash, state, published_at, withdrawn_at, withdraw_reason, withdraw_version_id]
+      properties:
+        skill_name: { type: string }
+        version_id: { type: integer }
+        version_no: { type: integer }
+        content_hash: { type: string }
+        state: { type: string, enum: [active, withdrawn] }
+        published_at: { type: string, format: date-time }
+        withdrawn_at:
+          oneOf: [{ type: string, format: date-time }, { const: "" }]
+          description: 未撤回时为空串
+        withdraw_reason: { type: string, enum: [restored_previous, superseded, deleted, ""], description: 撤回三分类；未撤回时为空串 }
+        withdraw_version_id: { type: integer, minimum: 0, description: 0 表示本次撤回没有移动发布指针 }
+
+    AdmissionDetailView:
+      allOf:
+        - $ref: '#/components/schemas/AdmissionListView'
+        - type: object
+          required: [source, files, evaluation, decision, publication]
+          properties:
+            source: { $ref: '#/components/schemas/AdmissionSource' }
+            files:
+              type: array
+              items: { $ref: '#/components/schemas/AdmissionFileView' }
+            evaluation:
+              oneOf: [{ $ref: '#/components/schemas/AdmissionEvaluationView' }, { type: "null" }]
+              description: 最新一次评估；未评估时为 null
+            decision:
+              oneOf: [{ $ref: '#/components/schemas/AdmissionDecisionView' }, { type: "null" }]
+              description: 最新一次决策；未决策时为 null
+            publication:
+              oneOf: [{ $ref: '#/components/schemas/AdmissionPublicationView' }, { type: "null" }]
+              description: 发布记录；未发布时为 null
+
     McpServerView:
       type: object
       properties:
@@ -7475,7 +7673,7 @@ components:
       properties:
         operation_id: { type: string }
         action: { type: string }
-        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection] }
+        target_kind: { type: string, enum: [agent, schedule, model_connection, mcp_server, skill, notify_channel, network_allowlist, network_denylist, execution_policy, network_exception, system, caller, instance, memory, knowledge_upload, knowledge_document, knowledge_collection, skill_admission] }
         target_id: { type: string }
         actor_subject: { type: string }
         auth_method: { type: string, enum: [bearer, local_trust, cli, migration] }

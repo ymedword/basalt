@@ -14,6 +14,7 @@ import {
 import {
   CONSOLE_BASE,
   ConsoleRouter,
+  admissionsHref,
   callersHref,
   diagnosticsHref,
   historyHref,
@@ -22,6 +23,8 @@ import {
   resourceHref,
 } from './router'
 import type { RouteMatch, RouteName } from './router'
+import { AdmissionDetailView } from './views/admission-detail'
+import { AdmissionsView } from './views/admissions'
 import { AgentConfigPage } from './views/agent-config'
 import { AgentDetailView } from './views/agent-detail'
 import { AgentsNewView } from './views/agents-new'
@@ -64,6 +67,7 @@ const VIEWS: Record<RouteName, Component> = {
   knowledge: KnowledgeView, 'knowledge-collection': KnowledgeView,
   'document-detail': DocumentDetailView,
   diagnostics: DiagnosticsView, history: HistoryView,
+  admissions: AdmissionsView, 'admission-detail': AdmissionDetailView,
   observability: ObservabilityView,
   flows: FlowsView, 'flow-tasks': FlowTasksView, 'flow-task': FlowTaskView,
 }
@@ -78,6 +82,7 @@ const GROUPS: readonly { label: string; items: readonly NavItem[] }[] = [
     { label: '模型与连接', href: resourceHref('model-connections'), code: '03' },
     { label: '工具与 MCP', href: CONSOLE_BASE + '/library/tools', code: '04', names: ['tools'] },
     { label: '技能', href: resourceHref('skills'), code: '05' },
+    { label: '学习准入', href: admissionsHref(), code: '16', names: ['admissions', 'admission-detail'] },
     { label: '知识库', href: knowledgeHref(), code: '06', names: ['knowledge', 'knowledge-collection', 'document-detail'] },
     { label: '全局记忆', href: CONSOLE_BASE + '/library/memory', code: '07', names: ['memory'] },
   ] },
@@ -102,6 +107,7 @@ const TITLES: Record<RouteName, string> = {
   callers: '调用方', 'caller-detail': '调用方详情',
   knowledge: '知识库', 'knowledge-collection': '知识库', 'document-detail': '文档详情',
   diagnostics: '诊断明细', history: '历史回查',
+  admissions: '学习准入', 'admission-detail': '准入候选详情',
   observability: '运行排障',
   flows: '工作流', 'flow-tasks': '工作流执行任务', 'flow-task': '工作流任务详情',
 }
