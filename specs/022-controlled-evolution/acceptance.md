@@ -281,6 +281,13 @@
 
 **结论**：CRITICAL 0 / HIGH 0 / MEDIUM 0 / LOW 4（均已登记——3 项不改代码、F-06 随 review ② 裁决）。
 
+### 6.6 提交、合入与远程 CI（2026-11-06）
+
+- **收口提交**：`118de3308a8cf286fc46697fb949ccd2b858b473`（`feat(memory): deliver US-22 controlled self-evolution`，129 文件，+24521/−456），US 分支 `022-controlled-evolution` 已推送并建立上游跟踪。
+- **合回 `main`**：`git merge --ff-only` 快进（`54212c3..118de33`，无合并提交），本地与远端 `main` SHA 一致；提交树无私有路径、无明文凭据。
+- **远程 CI**（同一 headSha）：`main` run [42210613589](https://github.com/ymedword/basalt/actions/runs/42210613589) 与分支 run [42210587233](https://github.com/ymedword/basalt/actions/runs/42210587233) 均 **7/7 全绿**（test / postgres 集成 / build 四平台 / flow / console / website / container）。
+- 该 CI 覆盖收口提交本身，与本地第 17 轮 `make check`、stage `accept-20261106T105018.044921100` 互为独立证据；本记录提交不改动被测源码。
+
 ## 7. 复跑与交接
 
 ```sh
