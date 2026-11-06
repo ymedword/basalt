@@ -591,7 +591,8 @@ func TestNotifyDeliveryStore_AdmissionFreezesChannels(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, pinned, "通知不固定凭据版本")
 
-	require.NoError(t, runs.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 1, notifyPortFixedNow))
+	require.True(t, requireFinishRun(t, runs, ctx, rec.RunID, core.StatusCompleted, "", 1, 1, notifyPortFixedNow))
+	require.NoError(t, runs.ReleaseRunRefs(ctx, rec.RunID, notifyPortFixedNow))
 	refs, err = store.Refs(ctx, rec.RunID)
 	require.NoError(t, err)
 	require.Len(t, refs, 2, "释放不删行")

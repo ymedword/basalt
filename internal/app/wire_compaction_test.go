@@ -1135,13 +1135,19 @@ func (s *cmpwRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifes
 
 // FinishRun 实现 `core.RunStore`。
 // FinishRun implements core.RunStore.
-func (s *cmpwRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) error {
+func (s *cmpwRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.status == nil {
 		s.status = map[string]core.RunStatus{}
 	}
 	s.status[runID] = status
+	return true, nil
+}
+
+// ReleaseRunRefs 实现 `core.RunStore`（本用例不持有引用）。
+// ReleaseRunRefs implements core.RunStore; this fixture holds no references.
+func (s *cmpwRunStore) ReleaseRunRefs(context.Context, string, time.Time) error {
 	return nil
 }
 

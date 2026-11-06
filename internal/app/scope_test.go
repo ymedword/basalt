@@ -169,9 +169,12 @@ func TestScopeConversion_BlockedByRun(t *testing.T) {
 	require.Contains(t, err.Error(), runID, "409 必须点名未释放的运行")
 	require.Equal(t, core.ScopeShared, env.pointerScope(t, "alpha").Scope)
 
-	// 运行结束 → 引用释放 → 转换通过。
-	require.NoError(t, env.runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0,
-		baselineClock().Add(0)))
+	// 运行结束 → 引用释放 → 转换通过。US-22 C-05：终态写回与引用释放是两个显式调用。
+	applied, err := env.runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0,
+		baselineClock().Add(0))
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.NoError(t, env.runs.ReleaseRunRefs(ctx, runID, baselineClock()))
 	_, err = env.service.Convert(ctx, ScopeRequest{
 		Kind: core.ResourceModelConnection, Name: "alpha", ResourceUID: version.ResourceUID,
 		Scope: core.ScopeExclusive, OwnerAgent: "reporter", OperationID: env.opID,

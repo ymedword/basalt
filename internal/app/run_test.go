@@ -691,10 +691,10 @@ type recordingRunStore struct {
 
 func (s *recordingRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus,
 	reason string, iterations, toolCalls int, now time.Time,
-) error {
-	err := s.RunStore.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
+) (bool, error) {
+	applied, err := s.RunStore.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
 	s.rec.record("finish")
-	return err
+	return applied, err
 }
 
 // A3：`FinishRun` 之后才 `Release`，且恰好一次（约束 17 / 46）。判据是事件次序：

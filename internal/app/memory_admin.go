@@ -67,22 +67,28 @@ type MemoryAdminDeps struct {
 	// Operations 是管理操作仓储：四个写动作都要预写 pending 再回填终态。
 	// Operations backs the two-phase audit of all four writes.
 	Operations core.OperationStore
+	// Index 是确认成功后的 best-effort 向量补索引槽位（C-28）；nil = 不补索引。
+	// Index is the optional post-confirmation indexing slot (C-28).
+	Index *memoryIndexSlot
 	// Logger / Now 为 nil 时回落进程默认值。
 	// Logger and Now fall back to process defaults when nil.
 	Logger *slog.Logger
 	Now    func() time.Time
 }
 
-// MemoryAdmin 是 `core.MemoryAdmin` 的生产实现。它**不是**召回面，也不被 Run 结束
-// 路径引用——C-21 的"不自动抽取"由此处没有调用点来保证。
-// MemoryAdmin implements core.MemoryAdmin. It has no run-end caller, which is how the
-// "no automatic extraction" boundary is enforced.
+// MemoryAdmin 是 `core.MemoryAdmin`（以及可选的 `core.MemoryConfirmResolver`）的生产
+// 实现。它**不是**召回面，也不被 Run 结束路径引用——C-21 的"不自动抽取"由此处没有
+// 调用点来保证。
+// MemoryAdmin implements core.MemoryAdmin and the optional resolver. It has no run-end
+// caller, which is how the "no automatic extraction" boundary is enforced.
 type MemoryAdmin struct {
-	store      *memory.SemanticStore
-	listStore  memory.MemoryStore
-	operations core.OperationStore
-	logger     *slog.Logger
-	now        func() time.Time
+	store        *memory.SemanticStore
+	listStore    memory.MemoryStore
+	confirmStore memory.CandidateConfirmStore
+	operations   core.OperationStore
+	index        *memoryIndexSlot
+	logger       *slog.Logger
+	now          func() time.Time
 }
 
 // 编译期断言：端口形状由 core 声明，本包只适配。
@@ -105,6 +111,7 @@ func NewMemoryAdmin(deps MemoryAdminDeps) *MemoryAdmin {
 	admin := &MemoryAdmin{
 		listStore:  deps.Store,
 		operations: deps.Operations,
+		index:      deps.Index,
 		logger:     logger,
 		now:        now,
 	}
@@ -114,6 +121,12 @@ func NewMemoryAdmin(deps MemoryAdminDeps) *MemoryAdmin {
 		// Lifecycle actions never need an embedder; recall is assembled elsewhere over
 		// the same store port.
 		admin.store = memory.NewSemanticStore(memory.SemanticDeps{Store: deps.Store})
+		// 确认处置是**可选**扩展（卡 §3.1.4）：存储端口不必实现它，管理面在需要时
+		// 类型断言；自动候选遇到未实现即 fail-closed，**不得**退化成 keep_both。
+		// The resolution port is optional; auto candidates fail closed without it.
+		if confirmStore, ok := deps.Store.(memory.CandidateConfirmStore); ok {
+			admin.confirmStore = confirmStore
+		}
 	}
 	return admin
 }
@@ -149,7 +162,7 @@ func (s *MemoryAdmin) ListEntries(ctx context.Context, filter core.MemoryEntryFi
 	}
 	records := make([]core.MemoryEntryRecord, 0, len(entries))
 	for _, entry := range entries {
-		records = append(records, core.MemoryEntryRecord{
+		record := core.MemoryEntryRecord{
 			EntryID:      entry.ID,
 			Scope:        entry.Scope,
 			Section:      entry.Section,
@@ -158,7 +171,21 @@ func (s *MemoryAdmin) ListEntries(ctx context.Context, filter core.MemoryEntryFi
 			Source:       entry.Source(),
 			SupersedesID: entry.SupersedesID,
 			CreatedAt:    entry.CreatedAt,
-		})
+		}
+		// 自动候选的元数据是**证据**：页面据此展示逐字引文与建议目标。读失败必须上抛，
+		// **不得**把"证据读不出来"降级成"没有证据"的普通候选。
+		// Auto candidates carry their evidence here; a read failure surfaces rather than
+		// degrading into a candidate that merely looks evidence-free.
+		if s.confirmStore != nil && entry.Source() == memory.SourceAutoExtract {
+			meta, found, err := s.confirmStore.LoadCandidateMeta(ctx, entry.ID)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				record.Candidate = &meta
+			}
+		}
+		records = append(records, record)
 	}
 	return records, nil
 }
@@ -270,6 +297,16 @@ func (s *MemoryAdmin) Confirm(ctx context.Context, actor core.Actor, entryID int
 	if err != nil {
 		return core.MemoryEntryResult{}, err
 	}
+	// 自动候选**不得**走旧 Confirm：这条路径没有候选到期、来源闭包与来源身份门禁。
+	// web 在未装配 `core.MemoryConfirmResolver` 时仍会调到这里，自动候选必须在这里
+	// fail-closed（web 503 NOT_CONFIGURED），不得静默晋升（§3.1.8）。
+	auto, err := s.autoCandidateFor(ctx, target)
+	if err != nil {
+		return core.MemoryEntryResult{}, err
+	}
+	if auto {
+		return core.MemoryEntryResult{}, core.ErrMemoryConfirmUnavailable
+	}
 
 	detail := memoryOperationDetail{
 		EntryID:     target.ID,
@@ -292,6 +329,126 @@ func (s *MemoryAdmin) Confirm(ctx context.Context, actor core.Actor, entryID int
 	}
 	s.finish(ctx, operationID, core.OperationSuccess, memoryAdminResultOK, "", detail)
 	return core.MemoryEntryResult{EntryID: entryID, State: memory.StateActive}, nil
+}
+
+// ConfirmWithResolution 是自动候选的确认入口（颗粒度文档 §3.1.8 / C-16 / C-17），也是
+// `core.MemoryConfirmResolver` 的实现。顺序固定：校验处置字面量 → 纯读候选与元数据 →
+// 复核目标 / 直接来源 / 候选到期 → 预写 `memory.confirm` `pending` → 单事务确认
+// （存储侧再做一遍同样检查）→ 回填终态 → best-effort 补索引（C-28）。
+//
+// 两条边界**不得**越过：
+//  1. **空 body 不改走旧 Confirm**：空 body 只把处置取 `keep_both`，自动候选照样走全门禁；
+//     只有 `source<>'auto_extract'` 且无候选元数据的显式条目才保持旧路径（C-03）。
+//  2. 预写之后的失败（来源到期、Key 撤销、调用方停用、并发竞争）必须把审计回填
+//     `failed` 并返回 409，**不得**留下 `pending`，也**不得**退还条目原状之外的副作用。
+//
+// The resolution entry point: literal check → pure reads → pending audit → single
+// transaction → terminal write → best-effort indexing. An empty body only picks
+// keep_both; it never bypasses the gates for an auto candidate.
+func (s *MemoryAdmin) ConfirmWithResolution(ctx context.Context, actor core.Actor,
+	req core.MemoryConfirmRequest,
+) (core.MemoryEntryResult, error) {
+	if s.store == nil || s.listStore == nil {
+		return core.MemoryEntryResult{}, errMemoryAdminNotAssembled
+	}
+	resolution, err := memoryConfirmResolution(req)
+	if err != nil {
+		return core.MemoryEntryResult{}, err
+	}
+	target, err := s.loadTarget(ctx, req.EntryID, memoryAdminToolConfirm)
+	if err != nil {
+		return core.MemoryEntryResult{}, err
+	}
+	meta, auto, err := s.candidateMetaFor(ctx, target)
+	if err != nil {
+		return core.MemoryEntryResult{}, err
+	}
+	if !auto {
+		// 显式提议候选 / 手工条目：既有确认路径与回执逐字不变（C-03）。
+		return s.Confirm(ctx, actor, req.EntryID)
+	}
+
+	now := s.now()
+	// 候选到期在预写**之前**判：被拒绝的请求不留操作行（C-17 的预写纪律）。
+	if !meta.ValidTo.IsZero() && !meta.ValidTo.After(now) {
+		return core.MemoryEntryResult{}, memoryConfirmReject("候选 %d 已过期（valid_to=%s）",
+			req.EntryID, meta.ValidTo.UTC().Format(time.RFC3339))
+	}
+	if resolution == memory.ResolutionSupersede {
+		// 旧建议不得覆盖新纠正：目标必须与元数据里的建议逐字相等，且仍 active。
+		if meta.SuggestedSupersedesID <= 0 || meta.SuggestedSupersedesID != req.SupersedesEntryID {
+			return core.MemoryEntryResult{}, memoryConfirmReject(
+				"替代目标 %d 与候选建议 %d 不一致", req.SupersedesEntryID, meta.SuggestedSupersedesID)
+		}
+		superseded, found, err := s.listStore.LoadEntry(ctx, req.SupersedesEntryID)
+		if err != nil {
+			return core.MemoryEntryResult{}, err
+		}
+		if !found || superseded.State != memory.StateActive {
+			return core.MemoryEntryResult{}, memoryConfirmReject(
+				"替代目标 %d 不存在或已不在 active", req.SupersedesEntryID)
+		}
+	}
+	// 直接来源先做快速复核；来源闭包（递归）、来源到期、Key 撤销 / 到期与调用方停用
+	// 只有事务内可见，由 ConfirmCandidate 复核；那时的失败回填 failed 并返回 409
+	// （§3.1.8 明文允许）。
+	for _, sourceID := range memoryUniqueIDs(meta.SourceEntryIDs) {
+		source, found, err := s.listStore.LoadEntry(ctx, sourceID)
+		if err != nil {
+			return core.MemoryEntryResult{}, err
+		}
+		if !found || source.State != memory.StateActive {
+			return core.MemoryEntryResult{}, memoryConfirmReject(
+				"来源条目 %d 不存在或已不在 active", sourceID)
+		}
+	}
+	if s.confirmStore == nil {
+		// candidateMetaFor 已保证自动候选必须有确认端口；这里只是防御式复查。
+		return core.MemoryEntryResult{}, core.ErrMemoryConfirmUnavailable
+	}
+
+	detail := memoryOperationDetail{
+		EntryID:      target.ID,
+		Section:      string(target.Section),
+		Agent:        target.Scope.Agent,
+		StateBefore:  target.State,
+		StateAfter:   memory.StateActive,
+		Resolution:   resolution,
+		SupersedesID: req.SupersedesEntryID,
+	}
+	operationID, err := s.begin(ctx, actor, core.ActionMemoryConfirm,
+		memoryTargetID(target.Scope),
+		memoryRequestHash(memoryAdminTargetLayers(target.Scope), fmt.Sprint(req.EntryID),
+			resolution, fmt.Sprint(req.SupersedesEntryID)), detail)
+	if err != nil {
+		return core.MemoryEntryResult{}, err
+	}
+
+	result, confirmErr := s.confirmStore.ConfirmCandidate(ctx, memory.ConfirmCandidateRequest{
+		EntryID:           req.EntryID,
+		Resolution:        resolution,
+		SupersedesEntryID: req.SupersedesEntryID,
+		ConfirmedBy:       memoryConfirmedBy(actor),
+		Now:               now,
+	})
+	if confirmErr != nil {
+		s.finish(ctx, operationID, core.OperationFailed, memoryAdminResultFor(confirmErr),
+			"确认候选记忆失败", detail)
+		return core.MemoryEntryResult{}, postPendingError(confirmErr, operationID)
+	}
+	detail.SupersedesID = result.SupersededID
+	s.finish(ctx, operationID, core.OperationSuccess, memoryAdminResultOK, "", detail)
+
+	// C-28：晋升已经提交，补索引只是**最好努力**——失败只记 WARN，确认保持 active，
+	// 缺口由启动期回填补齐。**不得**把补索引失败写成确认失败。
+	if s.index != nil {
+		s.index.IndexAppended(ctx, target.Scope, target.Section, target.Content)
+	}
+	return core.MemoryEntryResult{
+		EntryID:      result.EntryID,
+		State:        memory.StateActive,
+		SupersededID: result.SupersededID,
+	}, nil
 }
 
 // Correct 纠正一条既有条目：目标 active 时新条 active、旧条转 corrected；目标已不在
@@ -407,6 +564,109 @@ const (
 	memoryAdminResultInternalCode = "INTERNAL"
 )
 
+// memoryConfirmResolution 校验确认处置的闭集：空串（无 body）等价 `keep_both`，**不是**
+// 第三种处置；`keep_both` 不得夹带替代目标，`supersede` 必须带正整数目标。
+// `keep_both` + 目标 = 两种处置被拼在一起，按状态冲突（409，契约 §7.1）拒绝；未知处置
+// 字面量与缺少目标属入参错误（400，OpenAPI）。都发生在预写之前，不留操作行。
+// memoryConfirmResolution validates the closed set; an empty value means keep_both.
+func memoryConfirmResolution(req core.MemoryConfirmRequest) (string, error) {
+	switch req.Resolution {
+	case "", memory.ResolutionKeepBoth:
+		if req.SupersedesEntryID != 0 {
+			return "", memoryConfirmReject("保留双方不得携带替代目标（收到 %d）", req.SupersedesEntryID)
+		}
+		return memory.ResolutionKeepBoth, nil
+	case memory.ResolutionSupersede:
+		if req.SupersedesEntryID <= 0 {
+			return "", &core.InvalidInputError{
+				Tool:   memoryAdminToolConfirm,
+				Reason: "替代处置缺少有效的替代目标",
+			}
+		}
+		return memory.ResolutionSupersede, nil
+	default:
+		return "", &core.InvalidInputError{
+			Tool:   memoryAdminToolConfirm,
+			Reason: fmt.Sprintf("未知的确认处置：%q（只接受 keep_both / supersede）", req.Resolution),
+		}
+	}
+}
+
+// autoCandidateFor 判定目标是不是自动候选（`source='auto_extract'` 或存在候选元数据）。
+// 旧 Confirm 用它挡下自动候选：读元数据失败时按错误上抛，**不**猜"大概不是候选"。
+// autoCandidateFor reports whether the entry must be confirmed through the gated path;
+// a metadata read failure propagates instead of guessing.
+func (s *MemoryAdmin) autoCandidateFor(ctx context.Context, entry memory.MemoryEntry) (bool, error) {
+	if entry.Source() == memory.SourceAutoExtract {
+		return true, nil
+	}
+	if s.confirmStore == nil {
+		return false, nil
+	}
+	_, found, err := s.confirmStore.LoadCandidateMeta(ctx, entry.ID)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+// candidateMetaFor 判定目标是不是**自动候选**：`source='auto_extract'` 或存在候选
+// 元数据，任一成立即走统一确认事务（C-16）。两种情况 fail-closed、**不得**退化成旧的
+// Confirm 或 keep_both：自动候选缺元数据（来源不可查证）、存储未实现确认事务。
+// candidateMetaFor decides whether the target is an auto candidate; both "auto without
+// metadata" and "port not assembled" fail closed rather than degrading to the old path.
+func (s *MemoryAdmin) candidateMetaFor(ctx context.Context, entry memory.MemoryEntry) (core.MemoryCandidateMeta, bool, error) {
+	auto := entry.Source() == memory.SourceAutoExtract
+	if s.confirmStore == nil {
+		if auto {
+			// 候选确认事务端口未装配：自动候选无法在不关掉门禁的前提下确认，按
+			// 503「未装配」拒绝（web 映射 NOT_CONFIGURED），**不得**退化成旧 Confirm。
+			return core.MemoryCandidateMeta{}, false, core.ErrMemoryConfirmUnavailable
+		}
+		return core.MemoryCandidateMeta{}, false, nil
+	}
+	meta, found, err := s.confirmStore.LoadCandidateMeta(ctx, entry.ID)
+	if err != nil {
+		return core.MemoryCandidateMeta{}, false, err
+	}
+	if found {
+		return meta, true, nil
+	}
+	if auto {
+		return core.MemoryCandidateMeta{}, false,
+			memoryConfirmReject("自动候选 %d 缺少候选元数据，无法查证来源", entry.ID)
+	}
+	return core.MemoryCandidateMeta{}, false, nil
+}
+
+// memoryConfirmReject 把门禁拒绝统一包成 `core.ErrConflict`（web 409），消息只含主键与
+// 状态名——正文、证据引文与凭据**不得**进入错误串（它们会进日志与响应）。
+// memoryConfirmReject wraps a gate failure as core.ErrConflict with a safe message.
+func memoryConfirmReject(format string, args ...any) error {
+	return fmt.Errorf("确认候选记忆: %s: %w", fmt.Sprintf(format, args...), core.ErrConflict)
+}
+
+// memoryUniqueIDs 保序去重来源主键；0 与负数不是合法条目主键，一并剔除。
+// memoryUniqueIDs dedupes source ids while preserving order.
+func memoryUniqueIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 // memoryAdminResultFor 按错误类别选 result_code——只认类型 / 哨兵，**不比文案**。
 // memoryAdminResultFor classifies by sentinel and type, never by error text.
 func memoryAdminResultFor(err error) string {
@@ -434,6 +694,11 @@ type memoryOperationDetail struct {
 	StateBefore   string `json:"state_before"`
 	StateAfter    string `json:"state_after"`
 	ContentSHA256 string `json:"content_sha256"`
+	// Resolution / SupersedesID 是 US-22 追加的**可选**键（C-17）：旧 Confirm 路径
+	// 不写这两个键，旧操作行与旧客户端照常可读。它们只记处置与主键，不记正文或证据。
+	// The two keys are additive; the legacy Confirm path leaves them out entirely.
+	Resolution   string `json:"resolution,omitempty"`
+	SupersedesID int64  `json:"supersedes_id,omitempty"`
 }
 
 // loadTarget 预读目标条目：不存在 → 404 分类（`core.ErrMemoryEntryNotFound`），

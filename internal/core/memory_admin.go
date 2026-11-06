@@ -43,6 +43,14 @@ const TargetKindMemory = "memory"
 // (409); neither class is ever matched by comparing error text.
 var ErrMemoryEntryNotFound = errMemory("memory: entry not found")
 
+// ErrMemoryConfirmUnavailable 表示**自动候选在当前装配下无法确认**：web 侧未装配
+// 候选确认解析器（`MemoryConfirmResolver`），或管理面缺少候选确认事务端口。web 把它
+// 映射为 503 `NOT_CONFIGURED`，**不得**退化成旧 `Confirm` 或 keep_both——旧路径没有
+// 来源闭包与候选到期门禁，退一步就等于关掉确认门禁（§3.1.8）。
+// ErrMemoryConfirmUnavailable means an auto candidate cannot be confirmed under the
+// current assembly; the web layer maps it to 503 instead of degrading the gates.
+var ErrMemoryConfirmUnavailable = errMemory("memory: confirm resolver not assembled")
+
 // errMemory 是本地错误类型：只为了让 `errors.Is` 在同一哨兵上成立，不带额外载荷。
 // errMemory is a local error type so the sentinels compare by identity.
 type errMemory string
@@ -75,6 +83,10 @@ type MemoryEntryRecord struct {
 	SupersedesID int64
 	// CreatedAt 是写入时刻（UTC）。
 	CreatedAt time.Time
+	// Candidate 是自动候选的元数据（证据与来源关系）；nil = 非自动候选。
+	// 该字段是读面追加位，旧调用方读不到它，零值即"不适用"。
+	// Candidate carries the auto-candidate metadata; nil means the row is not one.
+	Candidate *MemoryCandidateMeta
 }
 
 // MemoryEntryFilter 是条目列表的过滤条件；空字段表示不过滤。
@@ -121,6 +133,46 @@ type MemoryEntryResult struct {
 	ReplacedID int64
 	// Merged 表示提议命中了同源去重、**没有**新增行（C-21 的"重复转述合并"）。
 	Merged bool
+	// SupersededID 是本次替代的旧条目；0 = 不适用。
+	// SupersededID is the entry replaced by this action; zero means not applicable.
+	SupersededID int64
+}
+
+// MemoryConfirmRequest 是可选确认处置；零值 Resolution 等价 keep_both。空 body 只决定
+// 处置，不决定门禁：自动候选（source='auto_extract' 或存在候选元数据）无论 body 是否
+// 为空都进入统一确认事务；只有显式提议候选与既有手工条目保持旧 Confirm 路径。
+// MemoryConfirmRequest carries the optional confirmation resolution. An empty body only
+// picks the default resolution; it never skips the gates for an auto candidate.
+type MemoryConfirmRequest struct {
+	EntryID           int64
+	Resolution        string // keep_both / supersede
+	SupersedesEntryID int64
+}
+
+// MemoryConfirmResolver 是 MemoryAdmin 的**可选**扩展面：web 在确认时先做类型断言。
+// 未实现时只有显式条目按旧 Confirm 执行；自动候选项必须返回 503，不得退化（§3.1.8）。
+// MemoryConfirmResolver is the optional extension the web layer type-asserts. Without it
+// an auto candidate fails closed (503) instead of degrading to the manual path.
+type MemoryConfirmResolver interface {
+	ConfirmWithResolution(ctx context.Context, actor Actor, req MemoryConfirmRequest) (MemoryEntryResult, error)
+}
+
+// MemoryCandidateMeta 是自动候选的元数据读模型（与 memory_candidate_meta 同构）。
+// MemoryCandidateMeta mirrors one memory_candidate_meta row.
+type MemoryCandidateMeta struct {
+	EntryID               int64
+	ExtractionID          string
+	Kind                  string
+	Certainty             string
+	Confidence            float64
+	Evidence              []LearningEvidence
+	SourceEntryIDs        []int64
+	SuggestedSupersedesID int64
+	OriginCallerID        string
+	OriginKeyID           string
+	EvidenceAt            time.Time
+	ValidTo               time.Time
+	TimeConfidence        string
 }
 
 // MemoryAdmin 是管理面记忆端口的**消费方接口**（实现在 `internal/app`）。

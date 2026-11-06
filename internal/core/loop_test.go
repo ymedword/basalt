@@ -388,6 +388,8 @@ type fakeStore struct {
 	// finishCalls 是 FinishRun 被调用的次数（取消用例的判据：取消路径**不得**写终态，
 	// 终态只能由 Run 自己经 FinishRun 写一次）。
 	finishCalls int
+	// releaseCalls 是 ReleaseRunRefs 被调用的次数（US-22：释放无条件执行）。
+	releaseCalls int
 
 	// failToolAppendOnce 注入"工具结果追加失败"（提前返回路径用例）——**一次性**：
 	// 只失败第一次，之后的补齐写入必须能落（否则测的是"存储全坏"，不是"提前返回路径"）。
@@ -473,13 +475,25 @@ func (s *fakeStore) StartRun(_ context.Context, rec core.RunRecord, manifest cor
 	return nil
 }
 
-// FinishRun 把终态写回同一行（不接收 finalText——列面没有它）。
-func (s *fakeStore) FinishRun(_ context.Context, runID string, status core.RunStatus, reason string, _, _ int, _ time.Time) error {
+// FinishRun 把终态写回同一行（不接收 finalText——列面没有它）。只有从 running
+// 转换的行返回 applied=true，与真实仓储的 `WHERE status='running'` 守卫同口径。
+func (s *fakeStore) FinishRun(_ context.Context, runID string, status core.RunStatus, reason string, _, _ int, _ time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.status[runID] = status
-	s.reason[runID] = reason
+	applied := s.status[runID] == core.StatusRunning
+	if applied {
+		s.status[runID] = status
+		s.reason[runID] = reason
+	}
 	s.finishCalls++
+	return applied, nil
+}
+
+// ReleaseRunRefs 在假仓储里没有引用可释放：只计次，供引用释放顺序用例对账。
+func (s *fakeStore) ReleaseRunRefs(_ context.Context, runID string, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseCalls++
 	return nil
 }
 

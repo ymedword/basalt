@@ -186,7 +186,9 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 
 **状态只前进一次**：`running` → 任一终态，**不得**从终态回退。崩溃恢复时未完成的行由重启流程标记（见 §4.3）。
 
-Run 进入终态时，**在同一事务内**把该 Run 的 `run_resource_refs.released_at` 写为当前时间（最后引用释放后版本才可回收）；事务失败时 Run 仍可停在 `running` 或引用仍未释放，由启动恢复按终态 Run 补齐。**不得**先删引用行来“释放”——行是历史证据，释放只置 `released_at`。
+**正常收尾**（`AgentService.finish`）分三步且顺序固定：**终态先落库**（`FinishRun`，独立 5 秒预算 + `WithoutCancel`）→ **学习抽取钩子**（同步、有界；US-22，见 [memory-learning.md](memory-learning.md) §2.3）→ **引用释放**（`ReleaseRunRefs`，无条件 defer）。释放调用无条件执行，但**释放前先确认终态已持久化**：`status` 仍为 `running`（`FinishRun` 写失败或未提交）或 Run 行不存在时**不释放**，引用留给启动恢复——否则钩子尚未运行凭据就被回收。释放失败**不回滚终态**：记 ERROR，`run_resource_refs.released_at` 仍为空的行由下次启动的 `releaseTerminalRefs` 按**已终态** Run 补齐。**不得**先删引用行来“释放”——行是历史证据，释放只置 `released_at`。
+
+**崩溃恢复**关闭 `running` 行是另一条路径：状态标记与释放**仍在同一事务**内完成（§4.3.2），事务失败整笔回滚、Run 保持 `running` 等下次启动。两条路径判据不同是设计使然：正常收尾必须让抽取钩子在引用释放之前运行，崩溃恢复没有钩子要跑。旧判据 `TestRunStore_FinishRunRollsBackWhenReleaseFails` 已按 US-22 §2.4.6 替换为 `TestUS22_FinishRunKeepsTerminalWhenReleaseFails`，恢复子用例 `release_failure_keeps_run_running` 保留。
 
 ---
 
@@ -603,6 +605,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - `system.secrets_init` 的 `target_id` = 固定字面量 `master_key`；`detail_json` 只记 `key_id`、`fingerprint`（可公开的密钥材料摘要）与 `recovered`（是否走了残留恢复），**不**记路径、不记密钥材料
 - `instance.adopt` 的 `target_kind` = `instance`，`target_id` = 固定字面量 `instance_identity`；`detail_json` 固定键集为 `candidate_instance_id` / `candidate_instance_id_sha256` / `case`（四判定编号 1～4）/ `key_path_persisted` / `key_path_config_key` / `managed_ciphertexts`。候选标识必须在**预写**时就写全，崩溃后只按它查证；**不**记密钥路径的值、密钥材料、密文或明文
 - 四个 `memory.*` 动作的 `target_kind` = `memory`，`target_id` 表达分层（全局层固定字面量 `global`，Agent 层 `agent:<name>`），条目主键只进 `detail_json`。`detail_json` 固定键集为 `entry_id` / `replaced_id` / `section` / `agent` / `state_before` / `state_after` / `content_sha256`；**正文不得**进 `detail_json`（记忆正文可能是用户隐私），只留规范化正文的 sha256。`memory.propose` 在预写时还拿不到新主键（领域层才分配），`entry_id` 允许为 0；命中去重时它是既有条目的主键，`state_after` 取该行的真实状态（新增行恒为 `candidate`；合并进 `active` 记忆时为 `active`，**不得**伪造成候选）
+- `memory.confirm` 自 US-22 起**追加**两个**可选**键（其余三个 `memory.*` 动作不写它们）：`resolution`（`keep_both` / `supersede`；空 body 归一化为 `keep_both` 后照写）与 `supersedes_id`（supersede 成功后被退役的旧条目主键；未替代时省略）。旧确认路径不写这两个键，旧操作行与旧客户端照常可读；**不新增**动作字面量，自动候选仍走 `memory.confirm`。语义与门禁见 [memory-learning.md](memory-learning.md) §6 / §7
 - 七个 `skill.admission.*` 动作的 `target_kind` = `skill_admission`，`target_id` = `candidate_id`，`detail_json` **固定为 `{}`**——证据在候选目录、评估 / 决策 / 发布行与 `request_hash` 里，不在审计详情里重抄正文。`request_hash` 逐动作固定：`propose` 取 `[skill_name, candidate_hash]`、`evaluate` 取 `[candidate_id, candidate_hash]`、`approve` / `reject` 取决策文件原始字节的 SHA-256、`cancel` 取 `[candidate_id, revision, reason]`、`publish` 取 `[candidate_id, decision_id]`、`withdraw` 取 `[candidate_id, version_id, reason]`（`AdmissionRequestHash` = 对 `json.Marshal([]string)` 取 SHA-256）。失败原文同样截断 4 KB，且**不得**含凭证、候选文件正文或来源声明全文。准入动作不产生 Run：它们既不是模型调用也不是工具调用，三种审计互不混写
 - 只读浏览、列表、校验（`/skills/{name}/validate`）不写管理操作审计；模型连接测试**要写**（它是可能计费的模型调用，但没有 Run）；通知渠道测试**也要写**（它会对外发送一条 `Basalt 连通性测试`），同样不产生 Run、不伪造模型工具调用
 - `agent.generate_files` 字面量保留，但该端点**不写**管理操作行（唯一写入是 LLM 调用审计）；实现**不得**据字面量补恢复行、伪造操作或把草稿当变更
@@ -636,6 +639,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | `skill.admission.evaluate` / `skill.admission.approve` / `skill.admission.reject` / `skill.admission.publish` / `skill.admission.withdraw` | 按 `operation_id` 查评估行 / 决策行 / 发布记录；`withdraw` 按 `withdraw_operation_id` 查发布记录 | 行存在 | 行不存在（可证明未提交） | 查询本身失败 → `unknown`；**不得**重放评估、决策、发布或撤回，**不得**据 `pending` 行补写记录 |
 | `skill.admission.cancel` | 候选状态与 `terminal_operation_id` | `state = canceled` 且终态操作 = 本 `operation_id` | 仍是 `proposed` / `evaluated` / `approved` | 其他状态、终态操作指向别的 `operation_id`，或候选行读不到 → `unknown`；**不得**补写取消、**不得**改写已有终态 |
 | `memory.propose` / `memory.confirm` / `memory.correct` / `memory.delete` | `memory_entries` 行：按 `detail_json.entry_id` 读目标（提议预写时主键未知，改按同层同分区 + `content_sha256` 认领），对照 `state_before` / `state_after` / `content_sha256`；纠正按 `supersedes_id` = 目标 + 正文摘要认领新条 | 状态已到后态（确认 → `active`、删除 → `deleted`、纠正的旧条 → `corrected`，或新条 `supersedes_id` + 摘要对上） | 目标仍是 `state_before`；或提议在同层同分区找不到任何正文摘要相同的行（可证明未写入） | 目标存在但层 / 分区 / 正文摘要与 `detail_json` 不符；或提议找到同源行（合并**无法**归属本操作，不得据此判 `applied`）→ `unknown`。**不得**重放提议 / 确认 / 纠正 / 删除 |
+| 学习抽取（US-22，**独立账本**，不是 `management_operations` 行） | `memory_extractions` 的 `pending` 行：按 `extraction_id` 查 `memory_candidate_meta` 与 `memory_method_drafts` 是否已有该行 | 已有候选元数据**或**草案行 → `success` | —（零条目提交与未提交不可区分，**不判** `not_applied`） | 两者都不存在 → `unknown`。两种结论都在同一事务写 `status` + `verified_at` 并推进来源游标；**不得**重读消息、重调模型、删草案目录或补插候选行。完整规则见 [memory-learning.md](memory-learning.md) §8 |
 
 - `applied` → `success`；`not_applied` → `failed`；其余 → `unknown`；写 `recovered_at` 与 `verification`
 - 恢复**不得**重放模型 / 工具调用，也**不得**重发连接测试；凭据动作**不得**重做加密、重新生成密文或补写凭据版本——四证不足时停在 `unknown`，由人核对后显式重做

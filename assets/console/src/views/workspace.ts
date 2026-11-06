@@ -1,6 +1,6 @@
 // 只读页与执行环境的白名单编辑入口（R8 裁决 2：保存即热生效，不重启）。
 // Read-only views plus the live network-allowlist editor on the execution page.
-import { defineComponent, h, ref, watch } from 'vue'
+import { computed, defineComponent, h, ref, watch } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
 import { ApiError, errorMessage } from '../api'
 import type {
@@ -23,6 +23,7 @@ import { resourceDetailHref } from '../router'
 import type { NoticeTone } from './shared'
 import { capabilityTabs, definitions, identifier, pageHeading, section, useLoader, viewProps } from './shared'
 import { isolationSummary, renderIsolation } from './isolation'
+import { LearningRecords, MemoryTabNav, PendingCandidates, memoryTabOf } from './learning-records'
 
 function page(title: string, note: string, content: VNodeChild[]): VNode {
   return h('section', { class: 'view view-library' }, [
@@ -45,33 +46,60 @@ export const ToolsView = defineComponent({
   },
 })
 
+/**
+ * 「记忆」页（US-22）：同一路由下三个页签——记忆库 / 待确认 / 学习记录。
+ * 页签只切查询串（`?tab=`），不新增左侧入口与 `/console/learning*` 路由；
+ * `agent` 与各锚点原样传给页签组件，深链刷新与前进后退都回到同一位置。
+ * The memory page hosts three tabs on one route; the tab lives in the query string.
+ */
 export const GlobalMemoryView = defineComponent({
   name: 'GlobalMemoryView', props: viewProps,
   setup(props) {
     const memory = useLoader(() => props.ctx.api.getGlobalMemory())
+    const tab = computed(() => memoryTabOf(props.query))
+    const agent = computed(() => props.query.get('agent') ?? '')
     // 分区按行为命名（常驻 / 可检索）；服务端渲染的标题固定为「核心记忆 / 归档记忆」，
     // 两者是同一份数据的两个分区，不是两套存储。
     // Sections are named by behaviour; the rendered headings stay 核心记忆 / 归档记忆.
-    return () => page('全局记忆', '工作区独立维护的一层长期记忆：不是各 Agent 记忆的汇总，也不是会话历史。这里可以查看生效条目，也能按条目提议、确认、纠正与删除；实际使用范围由各 Agent 的配置决定。', [
-      memory.error.value ? h(Notice, { tone: 'error', text: memory.error.value }) : null,
-      memory.loading.value ? h('p', { class: 'loading' }, '正在读取全局记忆…') : null,
-      memory.data.value === null ? null : h('div', { class: 'memory-columns' }, [
-        section('常驻记忆', [
-          h('p', { class: 'muted small' }, '当 Agent 配置允许使用这一层时，运行开始会读取常驻记忆；运行内已注入的内容不会中途改变。'),
-          memory.data.value.core ? h(CodeBlock, { text: memory.data.value.core }) : h('p', { class: 'empty' }, '还没有全局常驻记忆。'),
+    return () => {
+      const current = tab.value
+      const tabs = h(MemoryTabNav, { active: current, agent: agent.value })
+      if (current === 'pending') {
+        return page(
+          '待确认候选',
+          '模型从已完成运行中抽取的记忆候选：每条都带逐字证据，确认之前不参与任何召回或注入。确认与删除复用既有记忆管理动作；显式提议的候选仍在「记忆库」处理。',
+          [tabs, h(PendingCandidates, { ctx: props.ctx, query: props.query })],
+        )
+      }
+      if (current === 'records') {
+        return page(
+          '学习记录',
+          '自动抽取的只读记录：启用状态、滚动预算、抽取账本（含失败分类）与关联方法草案。启用只改 basalt.yaml；本页没有开关、手动抽取、重试或发布按钮。',
+          [tabs, h(LearningRecords, { ctx: props.ctx, query: props.query })],
+        )
+      }
+      return page('全局记忆', '工作区独立维护的一层长期记忆：不是各 Agent 记忆的汇总，也不是会话历史。这里可以查看生效条目，也能按条目提议、确认、纠正与删除；实际使用范围由各 Agent 的配置决定。', [
+        tabs,
+        memory.error.value ? h(Notice, { tone: 'error', text: memory.error.value }) : null,
+        memory.loading.value ? h('p', { class: 'loading' }, '正在读取全局记忆…') : null,
+        memory.data.value === null ? null : h('div', { class: 'memory-columns' }, [
+          section('常驻记忆', [
+            h('p', { class: 'muted small' }, '当 Agent 配置允许使用这一层时，运行开始会读取常驻记忆；运行内已注入的内容不会中途改变。'),
+            memory.data.value.core ? h(CodeBlock, { text: memory.data.value.core }) : h('p', { class: 'empty' }, '还没有全局常驻记忆。'),
+          ]),
+          section('可检索记忆', [
+            h('p', { class: 'muted small' }, '不自动进入上下文；模型需要时调用 recall_memory 取回，缺省是语义（向量）检索——只有显式传 mode=keyword 时才是整串子串匹配、区分大小写。'),
+            memory.data.value.archive ? h(CodeBlock, { text: memory.data.value.archive }) : h('p', { class: 'empty' }, '还没有全局可检索记忆。'),
+          ]),
         ]),
-        section('可检索记忆', [
-          h('p', { class: 'muted small' }, '不自动进入上下文；模型需要时调用 recall_memory 取回，缺省是语义（向量）检索——只有显式传 mode=keyword 时才是整串子串匹配、区分大小写。'),
-          memory.data.value.archive ? h(CodeBlock, { text: memory.data.value.archive }) : h('p', { class: 'empty' }, '还没有全局可检索记忆。'),
+        h('p', { class: 'muted small' }, '每个 Agent 可在配置中选择是否同时使用全局记忆；未明确设置时沿用旧规则：Agent 层有内容时只使用该层，否则回退全局层。'),
+        h('p', { class: 'muted small' }, '上面两栏只含生效且未到期的全局条目；某次运行是否使用它们取决于 Agent 配置。全局条目可由本页提议并确认，或从旧工作区一次性导入；普通 Agent 调用 save_memory 时写入自己的层。会话结束的自动抽取只写各 Agent 自己的层（默认关闭，产物先进入「待确认」），不会写入全局层。'),
+        section('按条管理', [
+          h('p', { class: 'muted small' }, '下面是这一层的条目记录：六态、来源、写入时间与可执行动作。这里的改动立即影响下一次运行；正在运行中的 Agent 不会中途改变已注入的内容。'),
+          h(MemoryEntries, { api: props.ctx.api, agent: '' }),
         ]),
-      ]),
-      h('p', { class: 'muted small' }, '每个 Agent 可在配置中选择是否同时使用全局记忆；未明确设置时沿用旧规则：Agent 层有内容时只使用该层，否则回退全局层。'),
-      h('p', { class: 'muted small' }, '上面两栏只含生效且未到期的全局条目；某次运行是否使用它们取决于 Agent 配置。全局条目可由本页提议并确认，或从旧工作区一次性导入；普通 Agent 调用 save_memory 时写入自己的层。会话结束不会自动抽取记忆。'),
-      section('按条管理', [
-        h('p', { class: 'muted small' }, '下面是这一层的条目记录：六态、来源、写入时间与可执行动作。这里的改动立即影响下一次运行；正在运行中的 Agent 不会中途改变已注入的内容。'),
-        h(MemoryEntries, { api: props.ctx.api, agent: '' }),
-      ]),
-    ])
+      ])
+    }
   },
 })
 

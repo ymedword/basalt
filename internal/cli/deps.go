@@ -135,6 +135,13 @@ type Deps struct {
 	// database path from the command surface.
 	Admission AdmissionPort
 
+	// Learning 是受控自我进化端口（见 ports.go）：status / extractions / drafts 只读，
+	// handoff 是唯一写适配（实例锁归实现侧持有，命令面不重复取锁）。拿到 nil 即报
+	// 缺件——**不得**自行拼装存储或另起一条抽取 / 审计路径。
+	// The learning port; its handoff adapter owns the instance lock, so the command
+	// surface never takes a second one. A nil here is a wiring gap.
+	Learning LearningPort
+
 	// CLIWriteActor 给出**本机 CLI 写动作**的操作主体（`cli:<OS user>`）。它是七个
 	// 准入写动作的唯一身份来源：命令面没有 `--approver` 之类旁路，缺失即报缺件；
 	// `cli:unknown` 在取锁与开库之前被拒绝（颗粒度文档 §3.1.10）。

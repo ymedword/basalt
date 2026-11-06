@@ -13,6 +13,12 @@ import type {
   ExecutionPolicyView,
   ExecutionProfile,
   InstanceSecretsView,
+  LearningDraftDetailView,
+  LearningDraftListView,
+  LearningExtractionDetailView,
+  LearningExtractionListView,
+  LearningExtractionState,
+  LearningStatusView,
   McpCredentialKeyMode,
   McpServerView,
   MemoryEntryListView,
@@ -443,6 +449,29 @@ export interface MemoryProposalWrite {
 export interface MemoryCorrectionWrite {
   /** 纠正后的正文；分层与分区继承目标条。 */
   content: string
+}
+
+/**
+ * 确认的可选处置（契约 MemoryConfirmWrite）：空 body = `keep_both`。空 body 只决定
+ * 处置，**不**跳过门禁——自动候选无论 body 是否为空都走统一确认事务。
+ * `supersedes_entry_id` 只对 `supersede` 有意义，且必须与候选建议逐字相等。
+ */
+export interface MemoryConfirmWrite {
+  resolution?: 'keep_both' | 'supersede'
+  supersedes_entry_id?: number
+}
+
+/** 抽取列表过滤：`agent` 空串 = 不过滤，`state` 空串 = 五态全列。 */
+export interface LearningExtractionFilter {
+  agent?: string
+  state?: LearningExtractionState | ''
+  limit?: number
+}
+
+/** 草案列表过滤：`agent` 空串 = 不过滤。 */
+export interface LearningDraftFilter {
+  agent?: string
+  limit?: number
 }
 
 export interface WorkspaceEntry {
@@ -898,11 +927,16 @@ export class AdminApi {
     return this.#client.request<MemoryEntryReceipt>('POST', memoryProposalsPath(agent), { body })
   }
 
-  /** 确认候选（唯一晋升路径）；非候选目标由服务端 409，页面不自动重放。 */
-  confirmMemory(entryID: number): Promise<MemoryEntryReceipt> {
+  /**
+   * 确认候选（唯一晋升路径）；非候选目标由服务端 409，页面不自动重放。
+   * `body` 省略时与旧版逐字节相同（无请求体）；自动候选的「保留双方 / 替代」显式
+   * 给出 `resolution`，让回执里的 `superseded_id` 与处置一一对应。
+   */
+  confirmMemory(entryID: number, body?: MemoryConfirmWrite): Promise<MemoryEntryReceipt> {
     return this.#client.request<MemoryEntryReceipt>(
       'POST',
       `/memory/entries/${entryID}/confirm`,
+      body === undefined ? {} : { body },
     )
   }
 
@@ -918,6 +952,64 @@ export class AdminApi {
   /** 软删：行与审计保留、立即不可召回；重复删除按幂等返回成功。 */
   deleteMemory(entryID: number): Promise<MemoryEntryReceipt> {
     return this.#client.request<MemoryEntryReceipt>('DELETE', `/memory/entries/${entryID}`)
+  }
+
+  // --- 学习查询面（US-22，只读）-------------------------------------------
+  //
+  // 五条 GET 与契约 `/learning/*` 同构。本面**没有**写方法：启用只改 `basalt.yaml`，
+  // 候选的确认 / 删除复用上面的记忆管理动作。404 按 `ApiError.status === 404`
+  // 由页面呈现「已不存在」，不回退成空列表。
+
+  /** 启用状态、预算与待决计数。 */
+  getLearningStatus(): Promise<LearningStatusView> {
+    return this.#client.request<LearningStatusView>('GET', '/learning/status')
+  }
+
+  /** 抽取列表；`state` 为五字面量之一，`limit` 1–200（服务端缺省 50）。 */
+  listLearningExtractions(filter: LearningExtractionFilter = {}): Promise<LearningExtractionListView> {
+    const query: Record<string, string | number> = {}
+    if (filter.agent !== undefined && filter.agent !== '') {
+      query.agent = filter.agent
+    }
+    if (filter.state !== undefined && filter.state !== '') {
+      query.state = filter.state
+    }
+    if (filter.limit !== undefined) {
+      query.limit = filter.limit
+    }
+    return this.#client.request<LearningExtractionListView>('GET', '/learning/extractions', {
+      query: Object.keys(query).length === 0 ? undefined : query,
+    })
+  }
+
+  /** 抽取详情：账本行 + 候选视图 + 草案摘要；不存在时 404。 */
+  getLearningExtraction(extractionId: string): Promise<LearningExtractionDetailView> {
+    return this.#client.request<LearningExtractionDetailView>(
+      'GET',
+      `/learning/extractions/${encodeURIComponent(extractionId)}`,
+    )
+  }
+
+  /** 草案列表（只有元数据）；`agent` 空串 = 不过滤。 */
+  listLearningDrafts(filter: LearningDraftFilter = {}): Promise<LearningDraftListView> {
+    const query: Record<string, string | number> = {}
+    if (filter.agent !== undefined && filter.agent !== '') {
+      query.agent = filter.agent
+    }
+    if (filter.limit !== undefined) {
+      query.limit = filter.limit
+    }
+    return this.#client.request<LearningDraftListView>('GET', '/learning/drafts', {
+      query: Object.keys(query).length === 0 ? undefined : query,
+    })
+  }
+
+  /** 草案详情：元数据 + `DRAFT.md` 正文 + 证据；不存在时 404。 */
+  getLearningDraft(draftId: string): Promise<LearningDraftDetailView> {
+    return this.#client.request<LearningDraftDetailView>(
+      'GET',
+      `/learning/drafts/${encodeURIComponent(draftId)}`,
+    )
   }
 
   // --- 工作区（只读）------------------------------------------------------

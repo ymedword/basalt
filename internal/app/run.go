@@ -245,6 +245,18 @@ func Run(ctx context.Context, args []string) int {
 			Database:               databaseConfig(cfg),
 			Logger:                 logger,
 		},
+		// 受控自我进化端口（US-22 §3.1.10）：查询只读、不取实例锁；handoff 先锁后库，
+		// 与准入端口同一理由在两条路径都安全带上（每次调用自建句柄，不装配运行期）。
+		// The learning port: read-only queries without the instance lock, and a handoff
+		// that takes the lock before opening the database. Stateless, hence both paths.
+		Learning: learningPort{
+			WorkDir:                workDir,
+			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+			Database:               databaseConfig(cfg),
+			AutoExtract:            learningPortConfig(cfg).AutoExtract,
+			Agents:                 learningPortConfig(cfg).Agents,
+			Logger:                 logger,
+		},
 		CLIWriteActor: func() core.Actor { return cliWriteActor(logger) },
 	}
 

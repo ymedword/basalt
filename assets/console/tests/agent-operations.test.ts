@@ -587,9 +587,10 @@ describe('agent session operations', () => {
     expect(text).toContain('会话消息随每次运行自动保存为会话历史')
     expect(text).toContain('不会自动进入长期记忆')
     expect(text).toContain('记忆可由 Agent 调用 save_memory 写入，也可在此页提议并确认')
-    // 可检索层靠 recall_memory 召回（缺省语义检索），也没有对话后的自动抽取。
+    // 可检索层靠 recall_memory 召回（缺省语义检索）；自动抽取（可配置，默认关闭）
+    // 只产候选，确认后才进入这一区（2026-11-06 复核 F-03 同步文案）。
     expect(text).toContain('缺省是语义（向量）检索')
-    expect(text).toContain('不会自动从对话里抽取内容')
+    expect(text).toContain('确认后才进入这一区')
     expect(text).not.toContain('自动形成长期记忆')
   })
 })

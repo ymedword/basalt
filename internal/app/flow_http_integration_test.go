@@ -80,7 +80,8 @@ func newFlowHTTPFixture(t *testing.T, configure ...func(*cli.Config)) *flowHTTPF
 		select {
 		case err := <-done:
 			require.NoError(t, err)
-		case <-time.After(5 * time.Second):
+		// 5s → 15s：并行判卷下收尾 join 的等待上限同样属夹具余量（2026-11-06 用户裁决）；断言不变。
+		case <-time.After(15 * time.Second):
 			t.Error("HTTP server did not join")
 		}
 	})
@@ -89,7 +90,11 @@ func newFlowHTTPFixture(t *testing.T, configure ...func(*cli.Config)) *flowHTTPF
 	require.NoError(t, rt.flows.Start(ctx))
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true}
 	t.Cleanup(transport.CloseIdleConnections)
-	return &flowHTTPFixture{t: t, rt: rt, base: "http://" + addr, admin: admin, client: &http.Client{Transport: transport, Timeout: 3 * time.Second}, model: model}
+	// 客户端时限是**夹具余量**，不是断言：3s → 15s（2026-11-06 用户裁决）。全仓并行判卷下
+	// 该夹具的请求偶发超过 3s（第七轮 `TestFlow_HTTPResumeIdempotentFactBeforeCurrentVersion`
+	// 实测 `Client.Timeout exceeded while awaiting headers`），连带整轮重跑；加长余量不改动
+	// 任何断言，只在真挂死时把失败暴露时间从 3s 推迟到 15s（内层 20m / 22m 上限不变）。
+	return &flowHTTPFixture{t: t, rt: rt, base: "http://" + addr, admin: admin, client: &http.Client{Transport: transport, Timeout: 15 * time.Second}, model: model}
 }
 
 func (f *flowHTTPFixture) request(method, path, token, idem, etag string, body any) (int, http.Header, json.RawMessage, string) {

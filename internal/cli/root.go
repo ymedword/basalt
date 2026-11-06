@@ -57,6 +57,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newFlowCommand(deps),
 		newIsolationCommand(deps),
 		newAdmissionCommand(deps),
+		newLearningCommand(deps),
 	)
 
 	return root

@@ -138,7 +138,50 @@ type MemoryEntryView struct {
 	Source       string `json:"source"`
 	SupersedesID int64  `json:"supersedes_id"` // 0 = 无
 	CreatedAt    string `json:"created_at"`
+	// Candidate 是自动候选的元数据（证据与来源关系）；非自动候选输出 null。
+	// 该键**恒在**（不 omitempty）：页面据"有没有这个对象"区分自动候选与显式条目，
+	// 缺键与 null 会让前端出现第三种状态。来源调用方 / Key 不对外投影。
+	// Candidate carries the auto-candidate metadata; the key is always present and is
+	// null for non-candidates. The origin caller and key are never projected.
+	Candidate *MemoryCandidateView `json:"candidate"`
 }
+
+// MemoryCandidateView 是自动候选元数据的出站投影（契约 MemoryCandidateView）：证据按
+// 逐字引文给出，页面据此让管理员复核"模型确实是从这些消息里读出来的"。时间统一按
+// RFC3339 UTC 输出，`valid_to` 空串表示无到期（不是零值时间）。
+// MemoryCandidateView projects one auto candidate's metadata for the pending tab.
+type MemoryCandidateView struct {
+	ExtractionID          string               `json:"extraction_id"`
+	Kind                  string               `json:"kind"`
+	Certainty             string               `json:"certainty"`
+	Confidence            float64              `json:"confidence"`
+	Evidence              []MemoryEvidenceView `json:"evidence"`
+	SourceEntryIDs        []int64              `json:"source_entry_ids"`
+	SuggestedSupersedesID int64                `json:"suggested_supersedes_id"`
+	EvidenceAt            string               `json:"evidence_at"`
+	ValidTo               string               `json:"valid_to"`
+	TimeConfidence        string               `json:"time_confidence"`
+}
+
+// MemoryEvidenceView 是一条逐字证据：消息主键、所属 Run、角色、引文与消息时刻。
+// 引文是**用户消息原文**，只经管理面读模型出站；审计与日志都不落它。
+// MemoryEvidenceView is one verbatim citation; it leaves the process only here.
+type MemoryEvidenceView struct {
+	MessageID int64  `json:"message_id"`
+	RunID     string `json:"run_id"`
+	Role      string `json:"role"`
+	Quote     string `json:"quote"`
+	MessageAt string `json:"message_at"`
+}
+
+// 确认处置的固定字面量（契约 MemoryConfirmWrite）：web 只透传与投影，取值域由适配器
+// 裁定（越界按 400）。操作明细白名单也用同一对字面量做闭集投影。
+// The fixed confirmation resolutions; the adapter owns validation, the web layer only
+// passes them through and re-projects the same closed set in the operations detail.
+const (
+	memoryResolutionKeepBoth  = "keep_both"
+	memoryResolutionSupersede = "supersede"
+)
 
 // MemoryEntryListView 是两条结构化读端点的响应体：分层声明 + 条目数组（空集合输出
 // `[]`，**不**输出 null）。
@@ -158,6 +201,11 @@ type MemoryEntryReceipt struct {
 	State      string `json:"state"`
 	ReplacedID int64  `json:"replaced_id"`
 	Merged     bool   `json:"merged"`
+	// SupersededID 是确认（替代处置）退役的旧条目；0 = 本次没有替代。键**恒在**：
+	// 页面据此区分"保留双方"与"替代了谁"，缺键会让两种结果长得一样。
+	// SupersededID names the entry retired by a supersede confirmation; the key is
+	// always present and zero means no replacement happened.
+	SupersededID int64 `json:"superseded_id"`
 }
 
 // MemoryProposalWrite 是显式提议的请求体：`section` 缺省（空串）按归档区落——候选
@@ -173,6 +221,17 @@ type MemoryProposalWrite struct {
 // MemoryCorrectionWrite carries only the new body; scope is inherited from the target.
 type MemoryCorrectionWrite struct {
 	Content string `json:"content"`
+}
+
+// MemoryConfirmWrite 是确认的可选请求体（契约 MemoryConfirmWrite）：**空 body 合法**，
+// 等价 `resolution=keep_both`；空 body 只决定处置，不决定门禁——自动候选照样走统一
+// 确认事务。`supersedes_entry_id` 只对 `supersede` 有意义，且必须与候选建议逐字相等
+// （适配器裁定，越界 400 / 409）。
+// MemoryConfirmWrite is the optional confirmation body; an empty body means keep_both
+// and never skips the gates of an auto candidate.
+type MemoryConfirmWrite struct {
+	Resolution        string `json:"resolution"`
+	SupersedesEntryID int64  `json:"supersedes_entry_id"`
 }
 
 // SandboxView 是 /sandbox 的响应体（契约 components.schemas.SandboxView）：四类白名单
@@ -1652,6 +1711,18 @@ func projectOperationDetailValue(key string, value any) (any, bool) {
 		return class, true
 	case "error_code", "error_message":
 		return detailText(value)
+	// —— US-22 追加的两个记忆确认键（C-17）——
+	// `resolution` 按固定闭集投影（不认识的字面量整键丢弃），`supersedes_id` 与其余
+	// 主键同口径只接收非负整数。两键都是**追加**：旧确认行没有它们，页面照常渲染。
+	// US-22's two additive confirmation keys; unknown resolution literals are dropped.
+	case "resolution":
+		resolution, ok := value.(string)
+		if !ok || (resolution != memoryResolutionKeepBoth && resolution != memoryResolutionSupersede) {
+			return nil, false
+		}
+		return resolution, true
+	case "supersedes_id":
+		return detailInteger(value)
 	default:
 		return nil, false
 	}

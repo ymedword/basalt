@@ -1177,6 +1177,15 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 	if rt.db != nil {
 		opts.Admissions = postgres.NewAdmissionStore(rt.db)
 	}
+	// 只读学习查询面（US-22 §3.1.10 / FR-22-11）：`*LearningAdmin` 由装配期构造，
+	// 直接满足 `core.LearningAdmin`（结构化满足，不写适配器）。判空只为投影用例的
+	// 半截运行期——裸 nil 指针装进接口会变成"非 nil 接口 + nil 接收者"，所以显式判空；
+	// 缺端口时五条路由按固定 500 失败关闭。
+	// The read-only learning surface is structurally satisfied by the assembled
+	// *LearningAdmin; a nil pointer must not become a non-nil interface.
+	if rt.learningAdmin != nil {
+		opts.LearningAdmin = rt.learningAdmin
+	}
 	if rt.versions != nil && rt.lifecycle != nil {
 		// MCPCredentials 与写端口是**同一实例**：列表页的「凭据」列读的就是下一次保存会
 		// 走的逐槽位判定。漏传会让 `credential_keys` 恒为空，声明过的槽位在页面上被误标

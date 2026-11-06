@@ -56,6 +56,11 @@ const (
 	memorySourceExplicitPropose = "explicit_propose"
 	memorySourceLegacyImport    = "legacy_import"
 	memorySourceMigration       = "migration"
+	// memorySourceAutoExtract 是受控自我进化提交事务写入的候选来源（US-22）；它只在
+	// CommitExtraction 的受信任路径与本文件回读还原时出现，普通 Append / Propose 没有
+	// 来源入参，无法伪装。
+	// memorySourceAutoExtract is the trusted commit path's source literal from US-22.
+	memorySourceAutoExtract = "auto_extract"
 )
 
 // memoryEntrySource 结算入库来源：条目显式带了来源（旧记忆导入 / 迁移作业 / 回读还原）
@@ -70,7 +75,7 @@ func memoryEntrySource(entry memory.MemoryEntry) (string, error) {
 	}
 	switch source {
 	case memorySourceSaveMemory, memorySourceExplicitPropose,
-		memorySourceLegacyImport, memorySourceMigration:
+		memorySourceLegacyImport, memorySourceMigration, memorySourceAutoExtract:
 		return source, nil
 	}
 	return "", fmt.Errorf("记忆条目来源 %q 不在闭集内", source)
@@ -124,6 +129,10 @@ type memoryRow struct {
 	source       string
 	createdAt    int64
 	supersedesID int64
+	// validTo 是条目到期时刻（Unix 毫秒）；0 = 无到期，落库写 NULL。既有 Append /
+	// InsertEntry / ReplaceEntry 传零值，行为与 US-22 之前完全一致。
+	// validTo lands as NULL when zero, so existing write paths are unchanged.
+	validTo int64
 	// confirmedBy 是确认 / 纠正时记录的确认人；空串落 NULL（候选、导入行与旧数据
 	// 本来就没有确认人，用空串顶替 NULL 会让"从未确认"与"确认人是空串"无法区分）。
 	// confirmedBy lands as NULL when empty, keeping "never recorded" distinct.
@@ -184,16 +193,20 @@ func insertMemoryRow(ctx context.Context, tx Queryer, row memoryRow) (int64, err
 	if row.confirmedBy != "" {
 		confirmedBy = row.confirmedBy
 	}
+	var validTo any
+	if row.validTo > 0 {
+		validTo = row.validTo
+	}
 
 	var id int64
 	err := tx.QueryRowContext(ctx,
 		`INSERT INTO memory_entries
 		   (scope, agent_name, section, content, created_at,
-		    state, source, valid_from, supersedes_id, content_hash, confirmed_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		    state, source, valid_from, valid_to, supersedes_id, content_hash, confirmed_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 RETURNING id`,
 		row.scopeCol, row.agentName, string(row.section), row.content, row.createdAt,
-		row.state, row.source, row.createdAt, supersedes, memoryContentHash(row.content),
+		row.state, row.source, row.createdAt, validTo, supersedes, memoryContentHash(row.content),
 		confirmedBy).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("写入记忆条目（%s/%s）: %w", row.scopeCol, row.section, err)
@@ -252,19 +265,69 @@ func (s *MemoryStore) Load(ctx context.Context, scope core.Scope) (string, error
 	return renderMemoryText(scope, coreEntries, archiveEntries), nil
 }
 
+// derivedClosureCTE 与 derivedLiveFilterSQL 是召回面**派生复核**的同一段判据（US-22 /
+// C-31）：三个 SQL 入口（RecallByKeyword、无向量关键词回退、向量路径）逐字共用，不各写一份。
+//
+//   - derivedClosureCTE 沿 `memory_candidate_sources` 递归取「被召回条目 → 来源 → 来源的
+//     来源…」的闭包。种子只从本次召回的分层（$1 / $2 / $3）里的派生条目起步，递归本身
+//     跨分层（来源没有同层要求）。闭包每次查询只物化一次，行级判据按 entry_id 关联回外层行。
+//     深度到 8 就停：链还没走完的节点由判据按失效处理（fail-closed），绝不返回无法证明
+//     来源有效的条目。
+//   - derivedLiveFilterSQL 是行级判据：闭包内任一来源缺失（物理删除，正常不会发生）、非
+//     `active` 或已过期（`valid_to <= $4`，与生效层判据同一时间参数）→ 排除该派生条目；
+//     无来源行的显式条目闭包为空，判据恒真，不受影响。它写在 WHERE 里，故先于 ORDER BY /
+//     LIMIT / top-k 生效——被排除的派生条目不占返回名额，条数不足时**不回填**。
+//
+// 占位符约定：三个入口的 $1 = scope、$2 = agent_name、$3 = section、$4 = now 逐字一致，
+// 共享片段才能原样拼接（SQL 文本是编译期常量，不做运行时拼接）。
+// The shared derived-entry re-check: one recursive closure over memory_candidate_sources
+// and one row-level predicate, applied in SQL before ordering and top-k, depth-limited at 8
+// and fail-closed.
+const derivedClosureCTE = `WITH RECURSIVE derived_closure(entry_id, source_id, depth) AS (
+	SELECT s.entry_id, s.source_entry_id, 1
+	  FROM memory_candidate_sources s
+	  JOIN memory_entries e ON e.id = s.entry_id
+	 WHERE e.scope = $1 AND e.agent_name IS NOT DISTINCT FROM $2 AND e.section = $3
+	UNION ALL
+	SELECT c.entry_id, s.source_entry_id, c.depth + 1
+	  FROM derived_closure c
+	  JOIN memory_candidate_sources s ON s.entry_id = c.source_id
+	 WHERE c.depth < 8
+)
+`
+
+const derivedLiveFilterSQL = `NOT EXISTS (
+	SELECT 1
+	  FROM derived_closure c
+	  LEFT JOIN memory_entries src ON src.id = c.source_id
+	 WHERE c.entry_id = memory_entries.id
+	   AND (src.id IS NULL
+	        OR src.state <> 'active'
+	        OR (src.valid_to IS NOT NULL AND src.valid_to <= $4)
+	        OR (c.depth >= 8 AND EXISTS (
+	            SELECT 1 FROM memory_candidate_sources deeper WHERE deeper.entry_id = c.source_id)))
+)`
+
+// recallByKeywordSQL 是 RecallByKeyword 的完整语句：既有生效层判据 + 派生复核。
+// The keyword statement = effective-layer predicate + derived re-check.
+const recallByKeywordSQL = derivedClosureCTE + `
+SELECT content FROM memory_entries
+ WHERE scope = $1 AND agent_name IS NOT DISTINCT FROM $2 AND section = $3
+   AND state = 'active' AND (valid_to IS NULL OR valid_to > $4)
+   AND strpos(content, $5) > 0
+   AND ` + derivedLiveFilterSQL + `
+ ORDER BY id`
+
 // RecallByKeyword 在**归档区**做整串子串检索：`strpos` 是字节级匹配——不分词、不扩词、
 // 不做大小写折叠；按 `id` 升序即写入顺序。未命中 = 空结果 + `nil` error（口径 10）。
-// 与 Load 同一生效层判据：失效条目即便正文命中也不得返回。
+// 与 Load 同一生效层判据：失效条目即便正文命中也不得返回；来源已失效的派生条目同样
+// 不得返回（C-31）。
 // RecallByKeyword matches whole substrings over the effective archive in write order.
 func (s *MemoryStore) RecallByKeyword(ctx context.Context, scope core.Scope, query string) ([]string, error) {
 	scopeCol, agentName := scopeColumns(scope)
 
-	rows, err := s.db.pool.QueryContext(ctx,
-		`SELECT content FROM memory_entries
-		  WHERE scope = $1 AND agent_name IS NOT DISTINCT FROM $2 AND section = $3
-		    AND state = 'active' AND (valid_to IS NULL OR valid_to > $4)
-		    AND strpos(content, $5) > 0
-		  ORDER BY id`, scopeCol, agentName, string(core.SectionArchive), s.now().UnixMilli(), query)
+	rows, err := s.db.pool.QueryContext(ctx, recallByKeywordSQL,
+		scopeCol, agentName, string(core.SectionArchive), s.now().UnixMilli(), query)
 	if err != nil {
 		return nil, fmt.Errorf("检索记忆归档区（%s）: %w", scopeCol, err)
 	}
@@ -312,20 +375,27 @@ func (s *MemoryStore) RecallEntries(ctx context.Context, query memory.RecallQuer
 	return s.recallEntriesByVector(ctx, scopeCol, agentName, vector, model, now, query.Limit)
 }
 
+// recallEntriesByKeywordSQL 是关键词回退的完整语句：列序与向量路径一致，判据与
+// `RecallByKeyword` 逐字共用（含派生复核与 `strpos` 空 query 匹配全部的既有语义）。
+// The keyword fallback shares the derived re-check verbatim with RecallByKeyword.
+const recallEntriesByKeywordSQL = derivedClosureCTE + `
+SELECT id, scope, agent_name, section, content, state, source, supersedes_id, created_at,
+       0::float8 AS score
+  FROM memory_entries
+ WHERE scope = $1 AND agent_name IS NOT DISTINCT FROM $2 AND section = $3
+   AND state = 'active' AND (valid_to IS NULL OR valid_to > $4)
+   AND strpos(content, $5) > 0
+   AND ` + derivedLiveFilterSQL + `
+ ORDER BY id
+ LIMIT $6::bigint`
+
 // recallEntriesByKeyword 是语义路径的兼容回退：调用方没走 embedding（empty vector）时，
 // 按整串子串召回、score 恒 0，判据与 `RecallByKeyword` 逐字一致（含空 query 匹配全部
 // 的 `strpos` 既有语义——不在 T052 改判据）。
 // recallEntriesByKeyword matches whole substrings with a constant zero score.
 func (s *MemoryStore) recallEntriesByKeyword(ctx context.Context, scopeCol string, agentName any, query string, now int64, limit int) ([]memory.MemoryEntry, error) {
-	rows, err := s.db.pool.QueryContext(ctx,
-		`SELECT id, scope, agent_name, section, content, state, source, supersedes_id, created_at,
-		        0::float8 AS score
-		   FROM memory_entries
-		  WHERE scope = $1 AND agent_name IS NOT DISTINCT FROM $2 AND section = $3
-		    AND state = 'active' AND (valid_to IS NULL OR valid_to > $4)
-		    AND strpos(content, $5) > 0
-		  ORDER BY id
-		  LIMIT $6::bigint`, scopeCol, agentName, string(core.SectionArchive), now, query, limitArg(limit))
+	rows, err := s.db.pool.QueryContext(ctx, recallEntriesByKeywordSQL,
+		scopeCol, agentName, string(core.SectionArchive), now, query, limitArg(limit))
 	if err != nil {
 		return nil, fmt.Errorf("召回记忆归档区（%s）: %w", scopeCol, err)
 	}
@@ -336,9 +406,40 @@ func (s *MemoryStore) recallEntriesByKeyword(ctx context.Context, scopeCol strin
 	return entries, nil
 }
 
+// recallEntriesByVectorSQL 是向量召回的完整语句：生效层判据、派生复核与距离表达式同一
+// 形态；占位符按共享片段约定重排为 $1 scope / $2 agent / $3 section / $4 now，
+// $5 查询向量 / $6 代际 / $7 LIMIT。距离 CASE 三选一保持静态（gosec G202 与可读性两头
+// 都站得住）。
+// The vector statement keeps the shared $1-$4 prefix so the derived re-check is reused
+// verbatim; $5 is the query vector, $6 the generation and $7 the limit.
+const recallEntriesByVectorSQL = derivedClosureCTE + `
+SELECT id, scope, agent_name, section, content, state, source, supersedes_id, created_at,
+       CASE v.distance
+         WHEN 'cosine' THEN 1.0 - (v.embedding <=> $5::vector)
+         WHEN 'l2' THEN 1.0 / (1.0 + (v.embedding <-> $5::vector))
+         ELSE -(v.embedding <#> $5::vector)
+       END AS score
+  FROM memory_entries
+  JOIN (
+      SELECT m.entry_id, m.embedding, g.distance
+        FROM memory_embeddings m
+        JOIN kb_index_generations g ON g.generation = m.generation
+       WHERE m.generation = $6
+  ) v ON v.entry_id = memory_entries.id
+ WHERE scope = $1 AND agent_name IS NOT DISTINCT FROM $2 AND section = $3
+   AND state = 'active' AND (valid_to IS NULL OR valid_to > $4)
+   AND ` + derivedLiveFilterSQL + `
+ ORDER BY CASE v.distance
+            WHEN 'cosine' THEN v.embedding <=> $5::vector
+            WHEN 'l2' THEN v.embedding <-> $5::vector
+            ELSE v.embedding <#> $5::vector
+          END ASC, id DESC
+ LIMIT $7::bigint`
+
 // recallEntriesByVector 在**单个 active 代际**上做向量召回（C-09）：代际、模型与维度
 // 三项一起核对，任一不符即拒绝。距离表达式与 `vectorSearcher.Search` 同一形态——静态
-// CASE 三选一，不拼动态 SQL（gosec G202 与可读性两头都站得住）。
+// CASE 三选一，不拼动态 SQL（gosec G202 与可读性两头都站得住）。派生复核在排序与 LIMIT
+// 之前生效（C-31）：来源已失效的派生条目不占名额，也不挤掉有效条目。
 //
 // 向量**零命中**时再判一次索引缺口（V-5）：同层同代际下存在生效归档条目却没有向量，
 // 就说明"没有可召回记忆"这个结论不成立——返回 `memory.ErrIndexNotReady`，由工具层
@@ -380,29 +481,8 @@ func (s *MemoryStore) recallEntriesByVector(ctx context.Context, scopeCol string
 		return nil, err
 	}
 
-	rows, err := s.db.pool.QueryContext(ctx, `
-		SELECT id, scope, agent_name, section, content, state, source, supersedes_id, created_at,
-		       CASE v.distance
-		         WHEN 'cosine' THEN 1.0 - (v.embedding <=> $1::vector)
-		         WHEN 'l2' THEN 1.0 / (1.0 + (v.embedding <-> $1::vector))
-		         ELSE -(v.embedding <#> $1::vector)
-		       END AS score
-		  FROM memory_entries
-		  JOIN (
-		      SELECT m.entry_id, m.embedding, g.distance
-		        FROM memory_embeddings m
-		        JOIN kb_index_generations g ON g.generation = m.generation
-		       WHERE m.generation = $2
-		  ) v ON v.entry_id = memory_entries.id
-		 WHERE scope = $3 AND agent_name IS NOT DISTINCT FROM $4 AND section = $5
-		   AND state = 'active' AND (valid_to IS NULL OR valid_to > $6)
-		 ORDER BY CASE v.distance
-		            WHEN 'cosine' THEN v.embedding <=> $1::vector
-		            WHEN 'l2' THEN v.embedding <-> $1::vector
-		            ELSE v.embedding <#> $1::vector
-		          END ASC, id DESC
-		 LIMIT $7::bigint`,
-		literal, generation, scopeCol, agentName, string(core.SectionArchive), now, limitArg(limit))
+	rows, err := s.db.pool.QueryContext(ctx, recallEntriesByVectorSQL,
+		scopeCol, agentName, string(core.SectionArchive), now, literal, generation, limitArg(limit))
 	if err != nil {
 		return nil, fmt.Errorf("向量召回记忆归档区（%s）: %w", scopeCol, err)
 	}

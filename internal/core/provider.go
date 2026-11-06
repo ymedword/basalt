@@ -104,6 +104,14 @@ type ChatRequest struct {
 	Model    string     // 空 = 用供应商缺省模型（models 映射）
 	Messages []Message  // 完整消息模型（含 tool_calls / reasoning_content，原样发出）
 	Tools    []ToolSpec // 工具定义（Function Calling 形态）；**空 = 请求体不带 tools 键**（客户端行为逐字不变）
+	// HookDeadline 是钩子总截止（绝对时刻）；零值 = 不额外限制。只有记忆抽取路径设置它：
+	// 服务只传钩子的总截止，不预先计算 5s 回填窗口；Provider 在**开始回填时**才计算
+	// min(回填开始时刻+5s, HookDeadline)，再用 context.WithDeadline(...) 回填。
+	// 若在调用前预先算死，模型第 8 秒正常返回时回填上下文已经过期。
+	// 该字段不参与路由、模型选择或预写；Chat 路径不使用。
+	// HookDeadline is the hook's absolute outer bound, set only by the extraction path.
+	// The provider computes the 5s finalize budget when finalize starts, never before.
+	HookDeadline time.Time
 }
 
 // ChatResponse 是一次调用的返回（usage 可空；tool_calls 只透传，执行权归 US-4 的 ToolExecutor）。
@@ -160,6 +168,10 @@ const (
 	// LLMCallPurposeCompaction 是会话压缩的摘要调用（`BeginCompactionCall` 固定写它）：
 	// 摘要不是对话轮，单独成值才能让"摘要花了多少钱"可被直接聚合（C-25）。
 	LLMCallPurposeCompaction LLMCallPurpose = "compaction"
+	// LLMCallPurposeMemoryExtract 是记忆抽取调用的固定用途（迁移 0011 把它加入 CHECK 闭集）。
+	// LLMCallPurposeMemoryExtract is the fixed purpose of memory-extraction calls; migration
+	// 0011 adds it to the CHECK set.
+	LLMCallPurposeMemoryExtract LLMCallPurpose = "memory_extract"
 )
 
 // ErrorKind 是失败分类的八类字面量（契约 §7.3；R4 新增 notify_disabled）。
@@ -249,5 +261,18 @@ type LLMCallStore interface {
 	// FinishCall 把该行更新为终态；调用方以独立短超时 + WithoutCancel 调用（契约 §4.2）。
 	// FinishCall writes the terminal state. Callers use an independent short timeout with
 	// the cancellation detached (contract §4.2).
+	FinishCall(ctx context.Context, id int64, result LLMCallResult) error
+}
+
+// MemoryExtractCallStore 是 purpose='memory_extract' 的预写面：purpose 由仓储固定写，
+// 调用方没有传入口；与 LLMCallStore 分开，避免把用途选择暴露给对话路径。
+// MemoryExtractCallStore is the pre-write surface for memory_extract calls. The purpose
+// is fixed in SQL, so the chat path never chooses it.
+type MemoryExtractCallStore interface {
+	// BeginMemoryExtractCall 插入 status=pending、purpose='memory_extract' 的审计行；
+	// 失败 = 调用方**拒绝发出**该次调用（fail-closed）。
+	BeginMemoryExtractCall(ctx context.Context, call LLMCall) (int64, error)
+
+	// FinishCall 把该行更新为终态；与 LLMCallStore 的同名方法语义一致。
 	FinishCall(ctx context.Context, id int64, result LLMCallResult) error
 }

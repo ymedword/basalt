@@ -89,6 +89,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		8:  "migrations/0008_flow.sql",
 		9:  "migrations/0009_sandbox_execution.sql",
 		10: "migrations/0010_skill_admission.sql",
+		11: "migrations/0011_memory_learning.sql",
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT version, description FROM schema_version ORDER BY version`)
 	require.NoError(t, err)
@@ -105,7 +106,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 
 	tables, err := tableNames(ctx, conn)
 	require.NoError(t, err)
-	require.Len(t, tables, 82, "原77表、0009 的隔离执行账本与 0010 的准入四表必须全部存在")
+	require.Len(t, tables, 87, "原77表、0009 的隔离执行账本、0010 的准入四表与 0011 的学习五表必须全部存在")
 	for _, name := range []string{
 		"callers", "sessions", "messages", "runs", "kb_chunks", "kb_chunk_embeddings",
 		"compaction_entries", "context_assembly_records", "diagnostic_events", "storage_cutover",
@@ -113,6 +114,8 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		"sandbox_executions",
 		"skill_admission_candidates", "skill_admission_evaluations",
 		"skill_admission_decisions", "skill_admission_publications",
+		"memory_extractions", "memory_extraction_cursors", "memory_candidate_meta",
+		"memory_candidate_sources", "memory_method_drafts",
 		"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations",
 	} {
 		require.Contains(t, tables, name)

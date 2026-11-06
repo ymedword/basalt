@@ -31,6 +31,11 @@ const (
 	// messageMemoryEntryID 是路径里条目标识非法时的固定文案：用 404 而不是 400，
 	// 免得"这个标识格式对不对"成为存在性探针。
 	messageMemoryEntryID = "记忆条目标识不存在"
+	// messageMemoryConfirmBody 是确认请求体不是合法 JSON / 含未知字段时的固定文案。
+	messageMemoryConfirmBody = "请求体不是合法的记忆确认"
+	// messageMemoryConfirmUnavailable 是未装配候选确认端口时的 503 文案：点名缺的是
+	// **装配**，不是"服务器内部错误"——否则运维只会翻日志，不会去看装配。
+	messageMemoryConfirmUnavailable = "记忆候选确认端口未装配：自动候选无法确认，请检查部署装配"
 )
 
 // handleAdminListGlobalMemoryEntries 处理 `GET /memory/entries`：全局层的结构化读模型。
@@ -130,7 +135,16 @@ func (s *Server) handleAdminProposeMemory(w http.ResponseWriter, r *http.Request
 // handleAdminConfirmMemory 处理 `POST /memory/entries/{id}/confirm`：候选晋升的
 // **唯一**用户可达路径。非候选目标由适配器按 `core.ErrConflict` 报 409，页面据此
 // 提示"该条已不是候选"，**不**自动重放。
-// handleAdminConfirmMemory is the only user-reachable promotion path.
+//
+// 请求体**可空**（契约 MemoryConfirmWrite）：空 body 只表示 `keep_both`，**不**表示
+// 跳过门禁——自动候选照样走统一确认事务。装配约束（§3.1.8）：自动候选必须经
+// `core.MemoryConfirmResolver` 确认；未装配 resolver 时只有显式条目按旧 `Confirm`
+// 执行，自动候选由适配器回 `core.ErrMemoryConfirmUnavailable`，本层映射 503
+// `NOT_CONFIGURED`——**不得**退化成旧 Confirm 或 keep_both。请求带了处置字段而本
+// 装配无法兑现时同样按 503 拒绝：静默忽略会让页面以为"替代已完成"。
+// handleAdminConfirmMemory is the only user-reachable promotion path. The body is
+// optional (keep_both), and an auto candidate without the optional resolver fails
+// closed with 503 instead of degrading to the un-gated legacy Confirm.
 func (s *Server) handleAdminConfirmMemory(w http.ResponseWriter, r *http.Request, actor core.Actor) {
 	entryID, ok := s.memoryEntryID(w, r)
 	if !ok {
@@ -140,7 +154,31 @@ func (s *Server) handleAdminConfirmMemory(w http.ResponseWriter, r *http.Request
 		s.writeAdminPortMissing(w, "MemoryAdmin", "POST "+r.URL.Path)
 		return
 	}
-	result, err := s.opts.MemoryAdmin.Confirm(r.Context(), actor, entryID)
+	var body MemoryConfirmWrite
+	if err := s.decodeAdminWriteBodyOptional(w, r, &body, messageMemoryConfirmBody); err != nil {
+		s.writeError(w, http.StatusBadRequest, codeBadRequest, err.Error())
+		return
+	}
+	request := core.MemoryConfirmRequest{
+		EntryID:           entryID,
+		Resolution:        body.Resolution,
+		SupersedesEntryID: body.SupersedesEntryID,
+	}
+	resolver, ok := s.opts.MemoryAdmin.(core.MemoryConfirmResolver)
+	if !ok {
+		if request.Resolution != "" || request.SupersedesEntryID != 0 {
+			s.writeMemoryAdminError(w, core.ErrMemoryConfirmUnavailable, "确认记忆")
+			return
+		}
+		result, err := s.opts.MemoryAdmin.Confirm(r.Context(), actor, entryID)
+		if err != nil {
+			s.writeMemoryAdminError(w, err, "确认记忆")
+			return
+		}
+		s.writeOK(w, memoryEntryReceipt(result))
+		return
+	}
+	result, err := resolver.ConfirmWithResolution(r.Context(), actor, request)
 	if err != nil {
 		s.writeMemoryAdminError(w, err, "确认记忆")
 		return
@@ -219,6 +257,7 @@ func parseMemoryEntryID(raw string) (int64, bool) { return parseVersionID(raw) }
 //   - core.ErrMemoryEntryNotFound → 404 NOT_FOUND（条目不存在或已被清理）
 //   - *core.InvalidInputError → 400 BAD_REQUEST（正文为空 / 状态取值域外 / 分区未知）
 //   - core.ErrConflict → 409 CONFLICT（对非候选执行确认等状态冲突）
+//   - core.ErrMemoryConfirmUnavailable → 503 NOT_CONFIGURED（自动候选缺候选确认端口）
 //   - 其余 → 500 INTERNAL，底层原因只进日志
 //
 // 每条分支都经 `writeAdminDataError` 出站：`pending` 之后的失败带 `operation_id`，
@@ -236,6 +275,12 @@ func (s *Server) writeMemoryAdminError(w http.ResponseWriter, err error, action 
 	case errors.Is(err, core.ErrConflict):
 		s.writeAdminDataError(w, http.StatusConflict, codeConflict,
 			"记忆条目的当前状态不允许本次操作", err)
+	case errors.Is(err, core.ErrMemoryConfirmUnavailable):
+		// 装配缺口只在服务端日志里带底层原因；响应是固定文案，不泄露装配细节。
+		s.logger().Error("记忆候选确认端口未装配，拒绝确认自动候选",
+			"action", action, "error", err)
+		s.writeAdminDataError(w, http.StatusServiceUnavailable, codeNotConfigured,
+			messageMemoryConfirmUnavailable, err)
 	default:
 		s.logger().Error("记忆管理写失败", "action", action, "error", err)
 		s.writeAdminDataError(w, http.StatusInternalServerError, codeInternal, messageInternal, err)
@@ -266,16 +311,55 @@ func memoryEntryView(record core.MemoryEntryRecord) MemoryEntryView {
 		Source:       record.Source,
 		SupersedesID: record.SupersedesID,
 		CreatedAt:    formatTime(record.CreatedAt),
+		Candidate:    memoryCandidateView(record.Candidate),
+	}
+}
+
+// memoryCandidateView 把候选元数据投影成出站视图；nil 原样输出 `null`（非自动候选）。
+// `evidence` 与 `source_entry_ids` **恒为数组**：空集合输出 `[]` 而不是 null，页面
+// 不用区分两种"没有"。来源调用方 / Key 不投影——证据复核只需要消息与引文。
+// memoryCandidateView projects the metadata; arrays stay non-nil and the origin caller
+// and key never leave the process.
+func memoryCandidateView(meta *core.MemoryCandidateMeta) *MemoryCandidateView {
+	if meta == nil {
+		return nil
+	}
+	evidence := make([]MemoryEvidenceView, 0, len(meta.Evidence))
+	for _, item := range meta.Evidence {
+		evidence = append(evidence, MemoryEvidenceView{
+			MessageID: item.MessageID,
+			RunID:     item.RunID,
+			Role:      item.Role,
+			Quote:     item.Quote,
+			MessageAt: formatTime(item.MessageAt),
+		})
+	}
+	sourceIDs := make([]int64, 0, len(meta.SourceEntryIDs))
+	sourceIDs = append(sourceIDs, meta.SourceEntryIDs...)
+	return &MemoryCandidateView{
+		ExtractionID:          meta.ExtractionID,
+		Kind:                  meta.Kind,
+		Certainty:             meta.Certainty,
+		Confidence:            meta.Confidence,
+		Evidence:              evidence,
+		SourceEntryIDs:        sourceIDs,
+		SuggestedSupersedesID: meta.SuggestedSupersedesID,
+		EvidenceAt:            formatTime(meta.EvidenceAt),
+		// 空串 = 无到期：格式化的零值时间就是空串，不需要第二个哨兵。
+		ValidTo:        formatTime(meta.ValidTo),
+		TimeConfidence: meta.TimeConfidence,
 	}
 }
 
 // memoryEntryReceipt 把写回执投影成视图：页面据此只刷新受影响的行。
+// `superseded_id` 恒在：0 明确表示"本次没有替代任何条目"。
 // memoryEntryReceipt projects a write receipt so the page can refresh one row.
 func memoryEntryReceipt(result core.MemoryEntryResult) MemoryEntryReceipt {
 	return MemoryEntryReceipt{
-		EntryID:    result.EntryID,
-		State:      result.State,
-		ReplacedID: result.ReplacedID,
-		Merged:     result.Merged,
+		EntryID:      result.EntryID,
+		State:        result.State,
+		ReplacedID:   result.ReplacedID,
+		Merged:       result.Merged,
+		SupersededID: result.SupersededID,
 	}
 }

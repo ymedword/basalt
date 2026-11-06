@@ -421,8 +421,8 @@ func admissionPermissionsDimension(files []core.AuthorFile, scripts []string) co
 // belong to candidate freezing and ValidateSkillDraft.
 func admissionSafetyDimension(files []core.AuthorFile, source core.AdmissionSource) core.AdmissionDimension {
 	name := core.AdmissionDimensionSafety
-	hits := ScanAdmissionSecrets(files)
-	sourceHit := AdmissionSourceHasSecret(source)
+	hits := core.ScanFilesForSecrets(files)
+	sourceHit := core.SourceHasSecret(source)
 	if len(hits) == 0 && !sourceHit {
 		return core.AdmissionDimension{Name: name, Status: core.AdmissionDimensionPassed}
 	}

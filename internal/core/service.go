@@ -157,6 +157,14 @@ type ServiceOptions struct {
 	// RunQuota charges one task per admitted run before any business write; nil keeps the
 	// pre-wiring behaviour byte for byte.
 	RunQuota RunQuota
+	// Learning 是 Run 终态之后的**唯一**同步回调（US-22 记忆抽取）；nil = 关闭，
+	// 行为与接线前逐字节相同。它**没有返回值**：从类型上就不可能改变 Run 的结果、
+	// 状态或错误；触发点只在本文件的 `finish`（C-05），**不得**在 web / CLI / 调度器
+	// 另接第二个。
+	// Learning is the one synchronous callback after a run's terminal state. Nil keeps the
+	// pre-wiring behaviour byte for byte, and the hook cannot change the run's result by
+	// construction; finish is its only trigger point.
+	Learning LearningHook
 }
 
 // AgentService 是唯一运行入口的实现：准入计数 + 一次运行的完整编排。
@@ -620,10 +628,13 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	return s.finish(ctx, runID, env, res), nil
 }
 
-// finish 写终态账本行并返回结果。写失败只记 ERROR：结果照常返回——修复历史不能以
-// 扣下已得结果为代价（与工具审计终态回填同一纪律）。
-// finish writes the terminal ledger state; a failed write is logged only and the result
-// still travels back to the caller.
+// finish 写终态账本行、按条件触发唯一的同步学习钩子，并释放运行引用；返回结果。
+// 三段顺序固定（C-05）：**终态落库 → 抽取钩子 → 引用释放**。写失败只记 ERROR：
+// 结果照常返回——修复历史不能以扣下已得结果为代价。释放**无条件**执行（钩子 panic、
+// 超时、跳过都不影响），失败只记 ERROR 并留给启动恢复兜底。
+// finish writes the terminal ledger state, triggers the one synchronous learning hook
+// under its conditions, and releases the run's references — in that fixed order. The
+// release is unconditional; neither the hook nor the release can change the result.
 func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, res RunResult) RunResult {
 	res.RunID = runID
 	if res.ConfigHash == "" {
@@ -639,20 +650,78 @@ func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, re
 	if s.opts.Runs == nil {
 		return res
 	}
-	finishCtx := ctx
-	if env != nil && env.Flow != nil {
-		// A Flow cancellation joins this original Run before releasing its leaf
-		// capacity. Preserve the same terminal writer with bounded cleanup even
-		// when the execution context has already been cancelled.
-		var cancel context.CancelFunc
-		finishCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-	}
-	if err := s.opts.Runs.FinishRun(finishCtx, runID, res.Status, res.Reason, res.Iterations, res.ToolCalls, s.opts.Now()); err != nil {
+
+	// 终态写回用独立 5 秒 + WithoutCancel：调用方取消不得让终态落不进去（既有
+	// Flow 取消路径的同一纪律，现在统一适用）。`applied` 是本次是否真正完成转换。
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	applied, err := s.opts.Runs.FinishRun(finishCtx, runID, res.Status, res.Reason,
+		res.Iterations, res.ToolCalls, s.opts.Now())
+	if err != nil {
 		s.opts.Logger.Error("运行终态落库失败",
 			"run_id", runID, "store", "runs", "op", "finish")
 	}
+
+	// 释放无条件执行：钩子 panic、超时、跳过都不影响；失败由启动恢复补齐。
+	// 注册在钩子之前为的是让它在钩子返回之后才跑——顺序是终态 → 抽取 → 释放。
+	// The release is registered before the hook so it runs after the hook returns.
+	defer func() {
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelRelease()
+		if rerr := s.opts.Runs.ReleaseRunRefs(releaseCtx, runID, s.opts.Now()); rerr != nil {
+			s.opts.Logger.Error("运行引用释放失败——留待启动恢复",
+				"run_id", runID, "store", "runs", "op", "release")
+		}
+	}()
+
+	// 抽取只在**本次调用确实完成终态转换**时发生，且只对正常完成的普通交互运行。
+	// `FinishRun` 写失败或命中 0 行幂等分支都跳过（C-05）；Flow / 固定工具走各自的
+	// 受控执行路径，调度器渠道没有"用户陈述"可抽取。
+	// Extraction happens only after this call really applied the terminal state, and only
+	// for ordinary completed web/cli runs; every other path returns untouched.
+	if !applied || res.Status != StatusCompleted || s.opts.Learning == nil ||
+		env == nil || env.Req.Flow != nil || env.Req.FixedTool != nil {
+		return res
+	}
+	if env.Req.Channel != "web" && env.Req.Channel != "cli" {
+		return res
+	}
+	// 类型断言取本次 Run 准入时冻结的客户端；断言失败 → nil，抽取服务据此放弃，
+	// 不退回装配期全局客户端（原则 III）。生产链路的 guarded / diagnostic 装饰器
+	// 都必须实现 ChatMemoryExtract，否则此处永远失败。
+	// The extractor is the client frozen at admission; a failed assertion yields nil and
+	// the service gives up rather than reaching for a global client.
+	extractor, _ := env.ProviderClient().(MemoryExtractor)
+	s.callLearningHook(ctx, LearningRunInput{
+		RunID:       res.RunID,
+		Agent:       env.agentName(),
+		SessionID:   env.Req.SessionID,
+		Channel:     env.Req.Channel,
+		Provider:    env.providerRef().Name,
+		Model:       env.ProviderModel(),
+		ConfigHash:  res.ConfigHash,
+		CompletedAt: s.opts.Now(),
+		Extractor:   extractor,
+	}, res)
 	return res
+}
+
+// callLearningHook 调用唯一的同步抽取钩子，并在最外层兜底 recover：生产实现
+// （memory.LearningService）内部已有一层 recover，这一层保证「钩子自身有缺陷」也不可能把
+// panic 穿过收尾路径拖垮请求的返回；已登记的释放 defer 在恢复后照常执行（C-27 / C-32）。
+// callLearningHook invokes the one synchronous extraction hook behind an outer recover:
+// the production hook already recovers internally; this layer guarantees a defective hook
+// still cannot take down the request, and the release defer still runs afterwards.
+func (s *AgentService) callLearningHook(ctx context.Context, in LearningRunInput, res RunResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			// 只记 panic 类型：panic 值可能携带消息正文或凭证，日志不得落内容（C-33）。
+			// Log the type only: a panic value may carry content or credentials.
+			s.opts.Logger.Error("学习抽取钩子 panic——已恢复，Run 结果不变",
+				"run_id", in.RunID, "panic_type", fmt.Sprintf("%T", r))
+		}
+	}()
+	s.opts.Learning.AfterRun(ctx, in, res)
 }
 
 // Cancel 取消一次在途运行——**只发信号，不写终态**（约束 20 / 图 G）。

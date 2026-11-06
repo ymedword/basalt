@@ -30,6 +30,19 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
+// requireFinishRun 断言终态写回成功并返回 `applied`（US-22 C-05：终态写回与引用释放
+// 已拆成两个显式调用，释放由 `ReleaseRunRefs` 承担）。
+// requireFinishRun asserts a successful terminal write and returns applied; release is a
+// separate explicit call since US-22.
+func requireFinishRun(t *testing.T, store core.RunStore, ctx context.Context, runID string,
+	status core.RunStatus, reason string, iterations, toolCalls int, now time.Time,
+) bool {
+	t.Helper()
+	applied, err := store.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
+	require.NoError(t, err)
+	return applied
+}
+
 // runRow 是 runs 一行的判卷形态（列全部显式——可空列用 Null 形态，判 NULL 与判空串不同）。
 // runRow is the assertion shape of one runs row; nullable columns stay nullable.
 type runRow struct {
@@ -123,7 +136,7 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 
 	finished := fixedStart.Add(90 * time.Second)
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished))
+	requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished)
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusCompleted), row.Status)
@@ -137,7 +150,7 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	limited := startRow("web")
 	limited.RunID = "web-1776000000123-limit1"
 	require.NoError(t, store.StartRun(ctx, limited, core.RunResourceManifest{}))
-	require.NoError(t, store.FinishRun(ctx, limited.RunID, core.StatusLimitReached, "工具调用次数超限", 3, 50, finished))
+	requireFinishRun(t, store, ctx, limited.RunID, core.StatusLimitReached, "工具调用次数超限", 3, 50, finished)
 	again := readRunRow(t, db, limited.RunID)
 	require.Equal(t, string(core.StatusLimitReached), again.Status)
 	require.Equal(t, "工具调用次数超限", again.Reason.String)
@@ -157,12 +170,12 @@ func TestRunStore_CloseRunningLeavesTerminalRowsUntouched(t *testing.T) {
 	completed := startRow("cli")
 	completed.RunID = "cli-1776000000123-comple"
 	require.NoError(t, store.StartRun(ctx, completed, core.RunResourceManifest{}))
-	require.NoError(t, store.FinishRun(ctx, completed.RunID, core.StatusCompleted, "", 1, 0, fixedStart))
+	requireFinishRun(t, store, ctx, completed.RunID, core.StatusCompleted, "", 1, 0, fixedStart)
 
 	cancelled := startRow("cli")
 	cancelled.RunID = "cli-1776000000123-cancel"
 	require.NoError(t, store.StartRun(ctx, cancelled, core.RunResourceManifest{}))
-	require.NoError(t, store.FinishRun(ctx, cancelled.RunID, core.StatusCancelled, "context canceled", 1, 0, fixedStart))
+	requireFinishRun(t, store, ctx, cancelled.RunID, core.StatusCancelled, "context canceled", 1, 0, fixedStart)
 
 	stale := startRow("scheduler")
 	stale.RunID = "scheduler-1776000000123-stale0"
@@ -243,7 +256,7 @@ func TestRunStore_TimestampsAreUnixMilli(t *testing.T) {
 	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 
 	finish := start.Add(1500 * time.Millisecond)
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusFailed, "模型调用失败", 1, 0, finish))
+	requireFinishRun(t, store, ctx, rec.RunID, core.StatusFailed, "模型调用失败", 1, 0, finish)
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, start.UnixMilli(), row.StartedAt)
@@ -712,11 +725,12 @@ func TestRunStore_StartRunRejectsNonActiveLifecycle(t *testing.T) {
 	requireNoRunTrace(t, db, rec.RunID)
 }
 
-// TestRunStore_FinishRunReleasesRefsInSameTransaction —— 约束 19 的正向判据：终态与
-// 引用释放一起提交，且释放按 run_id 收窄——共用同一批版本的另一个 Run 不受波及。
-// TestRunStore_FinishRunReleasesRefsInSameTransaction pins the same-transaction release,
-// scoped to the run that actually transitioned.
-func TestRunStore_FinishRunReleasesRefsInSameTransaction(t *testing.T) {
+// TestRunStore_ReleaseRunRefsScopedToRun —— 约束 19 的正向判据（US-22 C-05 拆分后）：
+// `FinishRun` 只写终态、**不**释放引用；`ReleaseRunRefs` 按 run_id 收窄释放，共用同一批
+// 版本的另一个 Run 不受波及。
+// TestRunStore_ReleaseRunRefsScopedToRun pins the split: FinishRun writes only the
+// terminal state, and ReleaseRunRefs releases exactly the finishing run's refs.
+func TestRunStore_ReleaseRunRefsScopedToRun(t *testing.T) {
 	ctx := context.Background()
 	db := portTestDB(t)
 	store := NewRunStore(db)
@@ -730,18 +744,23 @@ func TestRunStore_FinishRunReleasesRefsInSameTransaction(t *testing.T) {
 		"同一批版本可被多个 Run 同时引用（引用表主键是 run_id + 资源）")
 
 	finished := fixedStart.Add(2 * time.Minute)
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished))
+	require.True(t, requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished))
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusCompleted), row.Status)
 	require.Equal(t, finished.UnixMilli(), row.FinishedAt.Int64)
+	for _, ref := range readRunRefRows(t, db, rec.RunID) {
+		require.False(t, ref.ReleasedAt.Valid, "终态写回不再连带释放：%s/%s", ref.Kind, ref.ResourceID)
+	}
+
+	require.NoError(t, store.ReleaseRunRefs(ctx, rec.RunID, finished))
 
 	released := readRunRefRows(t, db, rec.RunID)
 	require.Len(t, released, 4)
 	for _, ref := range released {
 		require.True(t, ref.ReleasedAt.Valid, "终态的 Run 不得留着未释放引用（%s/%s）",
 			ref.Kind, ref.ResourceID)
-		require.Equal(t, finished.UnixMilli(), ref.ReleasedAt.Int64, "释放时刻与终态同一时刻")
+		require.Equal(t, finished.UnixMilli(), ref.ReleasedAt.Int64, "释放时刻取调用方给的时刻")
 	}
 
 	for _, ref := range readRunRefRows(t, db, other.RunID) {
@@ -750,11 +769,44 @@ func TestRunStore_FinishRunReleasesRefsInSameTransaction(t *testing.T) {
 	}
 }
 
-// TestRunStore_FinishRunRollsBackWhenReleaseFails —— 约束 19 的反向判据：引用释放失败
-// 时终态转换一起回滚（同一事务），运行保持 running 等下次收口，不会出现"已结束但仍占着版本"。
-// TestRunStore_FinishRunRollsBackWhenReleaseFails proves the status flip and the release
-// commit or roll back as one unit.
-func TestRunStore_FinishRunRollsBackWhenReleaseFails(t *testing.T) {
+// TestUS22_ReleaseRunRefsSkipsWhileRunning —— C-05 的守卫判据：终态未持久化（`FinishRun`
+// 写失败 / 未提交）时 `ReleaseRunRefs` 不释放引用，留给启动恢复；行不存在同样是无操作。
+// TestUS22_ReleaseRunRefsSkipsWhileRunning pins the status guard: while the run is still
+// running (or absent) the release is a no-op, leaving refs to startup recovery.
+func TestUS22_ReleaseRunRefsSkipsWhileRunning(t *testing.T) {
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewRunStore(db)
+	fx := seedRunManifest(t, db)
+
+	rec := startRow("cli")
+	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+
+	// ① 仍在运行：释放是空操作，引用原样保留（钩子还要用凭据）。
+	require.NoError(t, store.ReleaseRunRefs(ctx, rec.RunID, fixedStart.Add(time.Minute)))
+	for _, ref := range readRunRefRows(t, db, rec.RunID) {
+		require.False(t, ref.ReleasedAt.Valid,
+			"running 的 Run 不得释放引用：%s/%s", ref.Kind, ref.ResourceID)
+	}
+
+	// ② 行不存在：无引用可释放，返回 nil（收尾 defer 在 FinishRun 失败后照常调用）。
+	require.NoError(t, store.ReleaseRunRefs(ctx, "missing-run-id", fixedStart.Add(time.Minute)))
+
+	// ③ 终态落库后才释放。
+	finished := fixedStart.Add(2 * time.Minute)
+	require.True(t, requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 1, 0, finished))
+	require.NoError(t, store.ReleaseRunRefs(ctx, rec.RunID, finished))
+	for _, ref := range readRunRefRows(t, db, rec.RunID) {
+		require.True(t, ref.ReleasedAt.Valid,
+			"终态后的释放必须生效：%s/%s", ref.Kind, ref.ResourceID)
+	}
+}
+
+// TestUS22_FinishRunKeepsTerminalWhenReleaseFails —— US-22 C-05 的反向判据：终态与释放
+// 已拆分，释放失败**不得**回滚已判定的终态；运行保持终态、引用留待启动恢复补齐。
+// TestUS22_FinishRunKeepsTerminalWhenReleaseFails proves a failed release never rolls back
+// the terminal state; startup recovery backfills the residual refs.
+func TestUS22_FinishRunKeepsTerminalWhenReleaseFails(t *testing.T) {
 	ctx := context.Background()
 	db := portTestDB(t)
 	store := NewRunStore(db)
@@ -789,16 +841,21 @@ func TestRunStore_FinishRunRollsBackWhenReleaseFails(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	err = store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 0, fixedStart.Add(time.Minute))
+	finished := fixedStart.Add(time.Minute)
+	applied, err := store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 0, finished)
+	require.NoError(t, err, "释放失败不得让终态写回失败")
+	require.True(t, applied)
+
+	err = store.ReleaseRunRefs(ctx, rec.RunID, finished)
 	require.Error(t, err, "引用释放失败必须如实上抛")
 	require.Contains(t, err.Error(), "释放运行资源引用")
 
 	row := readRunRow(t, db, rec.RunID)
-	require.Equal(t, string(core.StatusRunning), row.Status,
-		"引用释放失败 → 终态转换一起回滚（同一事务）")
-	require.False(t, row.FinishedAt.Valid)
+	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得因释放失败被回滚")
+	require.Equal(t, finished.UnixMilli(), row.FinishedAt.Int64)
 	for _, ref := range readRunRefRows(t, db, rec.RunID) {
-		require.False(t, ref.ReleasedAt.Valid, "回滚后引用仍未释放：%s/%s", ref.Kind, ref.ResourceID)
+		require.False(t, ref.ReleasedAt.Valid, "释放失败后引用仍未释放（待启动恢复）：%s/%s",
+			ref.Kind, ref.ResourceID)
 	}
 }
 
@@ -814,12 +871,13 @@ func TestRunStore_FinishRunDoesNotOverwriteTerminalState(t *testing.T) {
 	rec := startRow("web")
 	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
 	first := fixedStart.Add(90 * time.Second)
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 2, 1, first))
+	require.True(t, requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 2, 1, first))
 
-	// 迟到的失败写（并发收尾 / 重复取消）：必须有守卫，且按幂等成功返回。
+	// 迟到的失败写（并发收尾 / 重复取消）：必须有守卫，且按幂等**未转换**返回
+	// （US-22：applied=false 是抽取钩子跳过的依据）。
 	late := first.Add(30 * time.Second)
-	require.NoError(t, store.FinishRun(ctx, rec.RunID, core.StatusCancelled, "迟到的取消", 9, 9, late),
-		"已终态的行 → 幂等成功，不报错也不覆盖")
+	require.False(t, requireFinishRun(t, store, ctx, rec.RunID, core.StatusCancelled, "迟到的取消", 9, 9, late),
+		"已终态的行 → 幂等未转换，不报错也不覆盖")
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得被改口")
@@ -837,7 +895,7 @@ func TestRunStore_FinishRunMissingRowIsError(t *testing.T) {
 	db := portTestDB(t)
 	store := NewRunStore(db)
 
-	err := store.FinishRun(ctx, "web-1776000000123-ghost", core.StatusFailed, "", 0, 0, fixedStart)
+	_, err := store.FinishRun(ctx, "web-1776000000123-ghost", core.StatusFailed, "", 0, 0, fixedStart)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "账本行不存在")
 }

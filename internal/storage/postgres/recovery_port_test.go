@@ -906,7 +906,7 @@ func recSeedRunManifest(t *testing.T, db *DB) recRunManifestFixture {
 }
 
 // recLedgerManifest 在资源账夹具上再冻结一个托管凭据与两个通知渠道：正常收尾
-// `FinishRun` 释放三张引用表（资源 / 凭据 / 通知），恢复必须逐表同口径——只释放资源行
+// `ReleaseRunRefs` 释放三张引用表（资源 / 凭据 / 通知），恢复必须逐表同口径——只释放资源行
 // 会让已失败的 Run 永远点名凭据与渠道。
 // recLedgerManifest adds a managed credential pin and two notify channels on top of
 // the resource fixture so all three reference tables hold unreleased rows.
@@ -1093,12 +1093,13 @@ func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 	rec := recStartRow("web")
 	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
 
-	// 模拟"终态已写、释放没跑到"的残留：直接改状态列，不走 FinishRun（它会连带释放）。
+	// 模拟"终态已写、释放没跑到"的残留：US-22 C-05 起 FinishRun 只写终态、不释放引用，
+	// 正是崩溃发生在终态与释放之间时留下的真实形态。
 	settled := recFixedStart.Add(10 * time.Minute)
-	_, err := db.pool.ExecContext(ctx,
-		`UPDATE runs SET status = $1, reason = $2, finished_at = $3 WHERE run_id = $4`,
-		string(core.StatusCompleted), "人工修库留下的终态", settled.UnixMilli(), rec.RunID)
+	applied, err := NewRunStore(db).FinishRun(ctx, rec.RunID, core.StatusCompleted,
+		"终态已写、释放未跑的残留", 1, 0, settled)
 	require.NoError(t, err)
+	require.True(t, applied)
 
 	report, err := Recover(ctx, db.pool, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
@@ -1106,7 +1107,7 @@ func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 
 	row := recReadRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得被恢复改口")
-	require.Equal(t, "人工修库留下的终态", row.Reason.String)
+	require.Equal(t, "终态已写、释放未跑的残留", row.Reason.String)
 	require.Equal(t, settled.UnixMilli(), row.FinishedAt.Int64)
 
 	recRequireRunLedgerReleased(t, db, rec.RunID, true)

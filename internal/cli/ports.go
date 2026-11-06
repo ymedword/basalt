@@ -903,3 +903,23 @@ type AdmissionPort interface {
 	// Get is the read-only detail; bodies are only read when explicitly requested.
 	Get(ctx context.Context, candidateID string, options core.AdmissionShowOptions) (core.AdmissionDetail, error)
 }
+
+// LearningPort 是受控自我进化命令面的窄端口（US-22 §3.1.10）：只读查询面与
+// `core.LearningAdmin` 同形（status / extractions / drafts），handoff 是唯一的写
+// 适配——它把只读方法草案转交 US-21 的提议入口，评估 / 批准 / 发布仍归准入命令。
+//
+// 实例锁归端口适配器持有（与 `agentsPort.withCLIAdmin` 同型）：`handoff` 的锁在
+// 实现侧取得，命令面**不**重复取锁——独占锁不可重入，双重获取会把一次正常转交
+// 变成「锁被占用」。只读命令不取锁、不校验身份。
+// The read surface mirrors core.LearningAdmin; handoff is the only write adapter and
+// owns the instance lock inside the implementation, exactly like the agents port.
+type LearningPort interface {
+	core.LearningAdmin
+
+	// Handoff 在实例锁内读草案元数据并调用既有准入提议入口；主体必须是可信本机
+	// CLI、来源声明必须严格 JSON 且为 user_confirmed，强制 kind / ref 后只返回草案
+	// 元数据与 propose 回执。草案不存在返回 `core.ErrLearningDraftNotFound`。
+	// Handoff reads the draft under the instance lock and calls Propose only; it
+	// returns draft metadata plus the propose receipt and nothing else.
+	Handoff(ctx context.Context, req core.LearningHandoffRequest) (core.LearningHandoffResult, error)
+}

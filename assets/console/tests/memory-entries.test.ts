@@ -58,6 +58,8 @@ function entry(overrides: Partial<MemoryEntryView> = {}): MemoryEntryView {
     source: 'explicit_propose',
     supersedes_id: 0,
     created_at: '2026-11-01T07:00:00Z',
+    // US-22：非自动抽取条目没有候选元数据，这个键恒在、值为 null。
+    candidate: null,
     ...overrides,
   }
 }

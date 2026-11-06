@@ -132,9 +132,11 @@ func newPinnedDSN(t *testing.T) string {
 		// 回收同样按对象计锁：`DROP SCHEMA ... CASCADE` 在删每个表 / 索引时持锁（实测
 		// 1,597 条），并发回收与并发迁移叠加会一起触发 53200（本次实测里就有 16 条回收
 		// 因此失败）。因此回收走自己的闸门（1 路），与迁移闸门分开。
-		// 先排队取槽位、再起 10s 的 DROP 时限——否则排队时间会算进 DROP 预算，
+		// 先排队取槽位、再起 DROP 时限——否则排队时间会算进 DROP 预算，
 		// 回收被误判成超时（2026-11-05 实测：6 个用例因此假红）。排队本身给 3 分钟
 		// 上限：槽位若被泄漏，失败要落在这一次清理上，而不是把整包挂到全局超时。
+		// DROP 预算 10s → 30s（2026-11-06）：全量 test-integration 并行下实测超过 10s
+		// （隔离 -count=5 每条 0.38–1.47s；30ms 上限可复现逐字相同超时文案）。
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), 3*time.Minute)
 		release, err := pgtemp.AcquireDropSlot(waitCtx)
 		cancelWait()
@@ -143,7 +145,7 @@ func newPinnedDSN(t *testing.T) string {
 			return
 		}
 		defer release()
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := schema.Drop(cleanupCtx); err != nil {
 			t.Errorf("删除隔离 schema %s: %v", schema.Name, err)

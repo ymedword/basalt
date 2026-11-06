@@ -96,9 +96,14 @@ func (r *coordinatorLeaf) Run(ctx context.Context, req flow.NodeRunRequest) (flo
 		<-r.release
 		status = core.StatusCancelled
 	}
-	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	// 1s → 15s（2026-11-06）：这是夹具写回终态的上限，不是断言——写完立即返回，
+	// 正常路径零成本。cover 轮 20 核并行下 1s 预算被 PG 争用打穿时，叶子返回错误，
+	// 产品按 fail-closed 把任务停为 blocked（leaf_execution_unconfirmed），表现为
+	// 本文件状态断言「expected succeeded / actual blocked」。已用 1ns 上限诱导红态
+	// 复现同一症状（回填运行终态: 开启事务: context deadline exceeded），机制同源。
+	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
-	if err := runs.FinishRun(finish, req.Attempt.RunID, status, "", 1, 0, time.Now()); err != nil {
+	if _, err := runs.FinishRun(finish, req.Attempt.RunID, status, "", 1, 0, time.Now()); err != nil {
 		return flow.NodeRunResult{}, err
 	}
 	output := json.RawMessage(`{"answer":"coordinator result"}`)
@@ -230,7 +235,9 @@ func TestFlow_CoordinatorOriginalLedgerLifecycle(t *testing.T) {
 			if mode == "missing-human" {
 				want = flow.Blocked
 			}
-			require.Equal(t, want, task.Status)
+			// 断言不变；补 reason 只为下次失败能当场看到产品侧的停因（如
+			// leaf_execution_unconfirmed），不改变判据。
+			require.Equal(t, want, task.Status, "reason=%q", task.Reason)
 			graph, err := f.store.ReadGraph(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)
 			require.NoError(t, err)
 			if want == flow.Succeeded {

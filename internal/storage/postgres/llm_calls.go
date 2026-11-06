@@ -90,9 +90,19 @@ func (r *LLMCallRepo) BeginCompactionCall(ctx context.Context, call core.LLMCall
 	return r.beginPendingCall(ctx, string(core.LLMCallPurposeCompaction), call)
 }
 
-// beginPendingCall 是两条预写入口的**唯一** INSERT（列清单只写一份，两处各写一份就是
-// 两处漂移点）：状态恒 'pending'，purpose 由调用种类固定给出。
-// beginPendingCall is the single INSERT behind both pre-write entry points.
+// BeginMemoryExtractCall 插入**记忆抽取**调用的 pending 审计行
+// （`purpose='memory_extract'`），返回行 id；失败 = 抽取调用**拒绝发出**（US-22 的
+// 两级预写与 Chat / Compaction 同一口径）。它委托 `beginPendingCall`，不复制第二条
+// INSERT——用途只由本入口固定写，抽取服务没有选择用途的入口。
+// BeginMemoryExtractCall pre-writes the extraction audit row; the purpose is fixed here,
+// and the single INSERT stays in beginPendingCall.
+func (r *LLMCallRepo) BeginMemoryExtractCall(ctx context.Context, call core.LLMCall) (int64, error) {
+	return r.beginPendingCall(ctx, string(core.LLMCallPurposeMemoryExtract), call)
+}
+
+// beginPendingCall 是三条预写入口的**唯一** INSERT（列清单只写一份，三处各写一份就是
+// 三处漂移点）：状态恒 'pending'，purpose 由调用种类固定给出。
+// beginPendingCall is the single INSERT behind all pre-write entry points.
 func (r *LLMCallRepo) beginPendingCall(ctx context.Context, purpose string, call core.LLMCall) (int64, error) {
 	createdAt := call.CreatedAt
 	if createdAt.IsZero() {

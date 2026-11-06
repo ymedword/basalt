@@ -51,7 +51,9 @@ func TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin(t *testing.T)
 	rt.flows.authenticationReady()
 	select {
 	case <-protocol.entered:
-	case <-time.After(3 * time.Second):
+	// 3s → 15s（2026-11-06 用户裁决：并行判卷下余量不足会让整轮门禁重跑）。只放宽等待上限，
+	// 断言不变：Run 必须真正进入模型协议。
+	case <-time.After(15 * time.Second):
 		t.Fatal("original Run did not start")
 	}
 	task, err = rt.flows.store.Read(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)
@@ -69,25 +71,28 @@ func TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin(t *testing.T)
 	}()
 	select {
 	case <-protocol.cancelled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("original context was not cancelled")
 	}
 	joined := make(chan error, 1)
 	drainStarted := time.Now()
 	go func() { joined <- rt.flows.Close() }()
 	var closed result
+	// 上界 32s → 40s（2026-11-06 用户裁决）：30s 取消容忍期满后还要做落库 / 审计，
+	// 20 核并行 + cover 插桩下实测 32.57s，2s 松弛不足。下界「必须等满 30s」逐字不动，
+	// 上界仍能抓住「卡死不返回」；看门狗同步抬到 45s（必须大于上界）。
 	select {
 	case closed = <-cancelled:
-	case <-time.After(32 * time.Second):
+	case <-time.After(45 * time.Second):
 		t.Fatal("cancel exceeded its 30-second wait allowance")
 	}
 	require.NoError(t, closed.err)
 	require.Equal(t, flow.Cancelling, closed.task.Status)
 	require.GreaterOrEqual(t, closed.elapsed, 30*time.Second)
-	require.Less(t, closed.elapsed, 32*time.Second)
+	require.Less(t, closed.elapsed, 40*time.Second)
 	select {
 	case <-overrun:
-	case <-time.After(7 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("worker did not report the 35-second drain overrun")
 	}
 	require.GreaterOrEqual(t, time.Since(drainStarted), 35*time.Second)
@@ -103,10 +108,12 @@ func TestFlow_DefaultCancelAndShutdownClocksKeepResourcesUntilJoin(t *testing.T)
 	require.NoError(t, rt.db.QueryRowContext(t.Context(), `SELECT 1`).Scan(&alive))
 	require.Equal(t, 1, alive)
 	release()
+	// 6s → 30s：第十轮 make check 实测该 6s 看门狗在并行争用下提前触发（释放后叶子 Run 尚未 join），
+	// 只放宽等待上限；"必须真正 join"这一断言不变（2026-11-06 用户裁决）。
 	select {
 	case err := <-joined:
 		require.ErrorContains(t, err, "flow drain exceeded 35s")
-	case <-time.After(6 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("original leaf did not join after release")
 	}
 	actualJoin, err = rt.flows.runner.Joined(t.Context(), closed.task)
@@ -220,7 +227,7 @@ func TestFlow_ConcurrentCloseWaitsForSameRealJoin(t *testing.T) {
 	rt.flows.authenticationReady()
 	select {
 	case <-protocol.entered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("real Run did not enter model protocol")
 	}
 	closed := make(chan error, 2)
@@ -232,7 +239,7 @@ func TestFlow_ConcurrentCloseWaitsForSameRealJoin(t *testing.T) {
 	<-started
 	select {
 	case <-protocol.cancelled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("close did not signal original Run")
 	}
 	require.ErrorIs(t, rt.flows.Start(t.Context()), flow.ErrStateConflict, "a stopping runtime must not start a second pool")
@@ -249,7 +256,7 @@ func TestFlow_ConcurrentCloseWaitsForSameRealJoin(t *testing.T) {
 		select {
 		case err := <-closed:
 			require.NoError(t, err)
-		case <-time.After(3 * time.Second):
+		case <-time.After(15 * time.Second):
 			t.Fatal("a concurrent Close did not receive the shared join result")
 		}
 	}

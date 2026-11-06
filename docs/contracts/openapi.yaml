@@ -18,7 +18,7 @@ info:
     - **错误码** 见 `contracts/run-and-errors.md` §8；错误响应**不得**回显凭证、绝对路径与堆栈
     - **列表端点不暴露排序参数**——顺序由服务端固定（安全约束，见技术方案§4.3）
     - **请求体总上限** `http.max_request_bytes`（缺省 1 MiB）：一切端点的请求体在**解析之前**经上限 reader 约束，超限返回 400——它是兜底约束，各端点另有更严的入口上限（如单条消息 32 KB）
-    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=10`**（US-21 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
+    - **数据库目标版本**：运行期谱系为 **PostgreSQL**，当前目标版本 **`schema_version=11`**（US-22 起；以 `internal/storage/postgres/connect.go` 的 `SupportedSchemaVersion` 为唯一事实源，本行随迁移追加同步）；SQLite `schema_version=6` 冻结为迁移源，只由 `basalt db export` 只读访问
     - **两类凭据不可互换**（US-16）：管理面只接受 admin token（或 `local_trust`），业务面接受调用方 API Key。`callers:admin` / `diagnostics:read` 只随内置 `local-admin` 生效，**不**发给 caller key；caller key 也无法表达管理员 Kind
     - 挂载点标注：本文件冻结了技术方案§6.2.3（10 个核心端点）与 §6.2.4（管理台追加端点）的全部路径；US-11 / US-12 / US-14 / US-16 新增路径同样以本文件为准
 servers:
@@ -602,9 +602,23 @@ paths:
       summary: 确认候选（唯一晋升路径）
       description: |
         `candidate` → `active`，本次操作是条目进入注入面与召回面的**唯一**用户可达路径。
+
+        请求体**可省略**：省略等价 `{"resolution":"keep_both"}`。空 body 只决定处置，**不**决定门禁——
+        自动候选（`source='auto_extract'` 或带候选元数据）无论 body 是否为空都进入统一确认事务，
+        复核候选状态 CAS、候选到期、来源闭合、来源 Key 与调用方状态；任一不满足 → 409 并回滚。
+        只有显式提议候选与既有手工条目保持旧确认路径。替代处置（`resolution=supersede`）要求
+        `supersedes_entry_id` 与候选建议逐字相等。回执追加 `superseded_id`（本次替代的旧条目，0 = 无）。
+
         目标不存在 → 404（预读发生在留痕之前，不产生操作行）；目标已不是 `candidate` → 409 `CONFLICT`，
-        **不**自动重放、**不**静默改写成其他状态。预写失败 → 500 且零改动。
-        路径标识不是十进制正整数同样按 404，避免"标识格式对不对"成为存在性探针。
+        **不**自动重放、**不**静默改写成其他状态。处置字面量越界 / 空 body 之外的 JSON 非法 → 400。
+        自动候选的确认端口未装配 → 503 `NOT_CONFIGURED`，**不得**退化成旧确认路径或 keep_both。
+        预写失败 → 500 且零改动。路径标识不是十进制正整数同样按 404，避免"标识格式对不对"成为存在性探针。
+      requestBody:
+        required: false
+        description: 可省略；省略等价 `{"resolution":"keep_both"}`
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemoryConfirmWrite' }
       responses:
         '200':
           description: 确认回执
@@ -616,11 +630,13 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/NotConfigured' }
 
   /memory/entries/{id}/correct:
     parameters:
@@ -683,6 +699,156 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: '#/components/schemas/MemoryEntryReceipt' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ==========================================================
+  # 学习（只读；US-22 §3.1.10 / FR-22-11）
+  # 五条 GET：状态、抽取列表与详情、方法草案列表与详情。**没有**写端点——候选确认 /
+  # 删除复用既有记忆管理动作，启用只改 `basalt.yaml`。任何写方法落到 404 兜底。
+  # ==========================================================
+  /learning/status:
+    get:
+      tags: [console]
+      summary: 学习面状态（只读）
+      description: |
+        出厂默认关闭时 `enabled=false`、各类计数为 0；读取不写行、不发模型调用。`unknown_agents`
+        是配置名单里但工作区不存在的 Agent（记 WARN、不抽取、不阻止启动）。`exhausted` 表示当前
+        滚动预算窗口内的尝试额度已用尽。**读取面没有写端点**：启用只改 `basalt.yaml`。
+        端口未装配或读取失败 → 500 `INTERNAL`，**不得**用空状态或全零冒充正常读数。
+      responses:
+        '200':
+          description: 学习面状态
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LearningStatusView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /learning/extractions:
+    get:
+      tags: [console]
+      summary: 列学习抽取（只读账本）
+      description: |
+        按 `created_at` 倒序返回抽取账本行，**不**展开候选与草案（展开只发生在详情）。
+        `state` 只接受五字面量；`limit` 为 1–200 的整数，缺省 50。非法 `state` 或越界 `limit`
+        → 400 且不触达存储；存储失败 → 500，**不得**用空列表冒充「没有抽取」。
+      parameters:
+        - name: agent
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string, enum: [pending, success, failed, skipped, unknown] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: 抽取列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LearningExtractionListView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /learning/extractions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [console]
+      summary: 查一次抽取及其候选与草案（只读）
+      description: |
+        详情 = 抽取账本行（含 `attempts` / `last_attempt_run_id` / 来源身份 / 冻结窗口主键）+
+        候选视图（逐字证据、来源关系、建议替代目标）+ 方法草案摘要。草案正文只在
+        `GET /learning/drafts/{id}` 出站。不存在 → 404；存储失败 → 500。
+      responses:
+        '200':
+          description: 抽取详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LearningExtractionDetailView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /learning/drafts:
+    get:
+      tags: [console]
+      summary: 列学习方法草案（只读元数据）
+      description: |
+        只返回草案元数据，**不含**正文；正文只在 `GET /learning/drafts/{id}` 出站。
+        `limit` 为 1–200 的整数，缺省 50；越界 → 400 且不触达存储；存储失败 → 500。
+      parameters:
+        - name: agent
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: 草案列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LearningDraftListView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /learning/drafts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [console]
+      summary: 查一份方法草案（只读；含正文与证据）
+      description: |
+        元数据 + `DRAFT.md` 正文 + `evidence.json` 证据。草案是不可执行的只读文件集，不会成为
+        记忆条目、技能或脚本。不存在 → 404；存储失败 → 500。
+      responses:
+        '200':
+          description: 草案详情
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LearningDraftDetailView' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -6038,9 +6204,14 @@ components:
           enum: [candidate, active, superseded, corrected, deleted, conflicted]
           description: '六态全集：读模型不做状态裁剪；到期不是状态，由 valid_to 表达'
         content: { type: string, description: 条目正文（管理面读模型；审计与日志均不落正文） }
-        source: { type: string, enum: [save_memory, explicit_propose, legacy_import, migration] }
+        source: { type: string, enum: [save_memory, explicit_propose, legacy_import, migration, auto_extract] }
         supersedes_id: { type: integer, format: int64, description: '0 = 无（纠正 / 替代链上的上一条）' }
         created_at: { type: string, format: date-time }
+        candidate:
+          description: '自动候选元数据；非自动候选（含显式提议候选）输出 null。键恒在，不用缺键表达"不适用"'
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/MemoryCandidateView'
 
     MemoryEntryListView:
       type: object
@@ -6060,6 +6231,46 @@ components:
         state: { type: string, enum: [candidate, active, corrected, deleted, conflicted] }
         replaced_id: { type: integer, format: int64, description: '仅纠正是旧条主键；其余为 0' }
         merged: { type: boolean, description: '仅提议有意义：命中同源去重 = true（未新增行，entry_id 为既有条目）' }
+        superseded_id: { type: integer, format: int64, description: '仅替代处置的确认有意义：被退役的旧条目；0 = 本次没有替代' }
+
+    MemoryCandidateView:
+      type: object
+      description: 自动候选的元数据读模型（与 memory_candidate_meta 同构；不含来源调用方 / Key）
+      properties:
+        extraction_id: { type: string, description: 来源抽取标识 }
+        kind: { type: string, enum: [fact, preference, constraint, inference, temporary], description: '与 memory_candidate_meta.kind 的 CHECK 同源（五项）；method 只入方法草案，候选视图不出现' }
+        certainty: { type: string, enum: [asserted, uncertain], description: 由程序派生的确定性，不是模型自报置信度 }
+        confidence: { type: number, description: 模型自报置信度；只作展示，不作确认门槛 }
+        evidence:
+          type: array
+          description: 逐字证据；空集合输出 `[]`，不输出 null
+          items: { $ref: '#/components/schemas/MemoryEvidenceView' }
+        source_entry_ids:
+          type: array
+          description: 候选引用的既有条目主键；空集合输出 `[]`
+          items: { type: integer, format: int64 }
+        suggested_supersedes_id: { type: integer, format: int64, description: '0 = 无可替代建议' }
+        evidence_at: { type: string, format: date-time, description: 证据消息的记录时刻（不是事实发生时刻） }
+        valid_to: { type: string, description: '空串 = 无到期；否则 RFC3339 UTC 的到期时刻' }
+        time_confidence: { type: string, enum: [exact, relative_unknown, unknown] }
+
+    MemoryEvidenceView:
+      type: object
+      description: 一条逐字证据；引文只经管理面读模型出站，审计与日志都不落它
+      properties:
+        message_id: { type: integer, format: int64 }
+        run_id: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        quote: { type: string, description: 用户或助手消息的逐字片段 }
+        message_at: { type: string, format: date-time }
+
+    MemoryConfirmWrite:
+      type: object
+      additionalProperties: false
+      description: 确认的可选请求体；整个 body 可省略，省略等价 `{"resolution":"keep_both"}`
+      properties:
+        resolution: { type: string, enum: [keep_both, supersede], description: '缺省（空串）= keep_both' }
+        supersedes_entry_id: { type: integer, format: int64, description: '仅 supersede 必填，且必须与候选建议逐字相等' }
 
     MemoryProposalWrite:
       type: object
@@ -6076,6 +6287,148 @@ components:
       properties:
         content: { type: string, description: 去空白后不得为空；分层与分区继承目标条 }
 
+    LearningStatusView:
+      type: object
+      description: 学习面状态读模型（只读；字段与 CLI `learning status --json` 逐项同源）
+      properties:
+        enabled: { type: boolean, description: 出厂默认 false }
+        agents:
+          type: array
+          description: 配置名单；空集合输出 `[]`
+          items: { type: string }
+        unknown_agents:
+          type: array
+          description: 名单内但工作区不存在的 Agent（记 WARN、不抽取、不阻止启动）
+          items: { type: string }
+        rule_version: { type: string }
+        prompt_version: { type: string }
+        attempts_used: { type: integer, minimum: 0, description: 当前滚动预算窗口内的尝试次数 }
+        attempt_limit: { type: integer, minimum: 0, description: 每 Agent 每窗口尝试上限（代码常量） }
+        exhausted: { type: boolean, description: attempts_used >= attempt_limit }
+        budget_window_seconds: { type: integer, minimum: 0, description: 滚动预算窗口（秒） }
+        pending_extractions: { type: integer, minimum: 0 }
+        unknown_extractions: { type: integer, minimum: 0, description: 状态 unknown 的抽取数 }
+        orphan_drafts: { type: integer, minimum: 0 }
+        last_extraction_at: { type: string, description: '空串 = 从未抽取；否则 RFC3339 UTC 时刻' }
+
+    LearningExtractionView:
+      type: object
+      description: 一行抽取账本；existing_entries / config_hash 属内部计数与装配哈希，不投影
+      properties:
+        extraction_id: { type: string }
+        agent: { type: string }
+        session_id: { type: string }
+        run_id: { type: string, description: 触发本次抽取的 Run（一行恒对应一个触发 Run） }
+        last_attempt_run_id: { type: string, description: 最近一次尝试的 Run（重试时更新） }
+        origin_caller_id: { type: string, description: 来源调用方标识（可读面上的来源身份） }
+        origin_key_id: { type: string, description: '来源 Key；空串 = 本地管理员' }
+        status: { type: string, enum: [pending, success, failed, skipped, unknown] }
+        window_from_message_id: { type: integer, format: int64, description: 冻结窗口起始消息主键 }
+        window_to_message_id: { type: integer, format: int64, description: 冻结窗口结束消息主键 }
+        window_messages: { type: integer, minimum: 0 }
+        dropped_window_messages: { type: integer, minimum: 0, description: 超限丢弃的消息数 }
+        prior_messages: { type: integer, minimum: 0, description: 只进提示词、不作证据的前文条数 }
+        attempts: { type: integer, minimum: 0, maximum: 3 }
+        items_total: { type: integer, minimum: 0 }
+        items_accepted: { type: integer, minimum: 0 }
+        items_dropped: { type: integer, minimum: 0 }
+        prompt_version: { type: string }
+        rule_version: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        failure_class: { type: string, enum: ['', model_error, invalid_output, timeout, audit_unavailable, extractor_unavailable, window_gone], description: '空串 = 无失败；六字面量与 memory_extractions.failure_class 的 CHECK 同源' }
+        error_message: { type: string }
+        created_at: { type: string, format: date-time }
+        last_attempt_at: { type: string, format: date-time }
+        finished_at: { type: string, description: '空串 = 尚未终态；否则 RFC3339 UTC 时刻' }
+        verified_at: { type: string, description: '空串 = 尚未查证；恢复只查证不重放' }
+
+    LearningExtractionListView:
+      type: object
+      properties:
+        extractions:
+          type: array
+          description: 空集合输出 `[]`，不输出 null
+          items: { $ref: '#/components/schemas/LearningExtractionView' }
+
+    LearningCandidateView:
+      type: object
+      description: 自动候选的复核投影（证据逐字、来源关系可追溯）；来源调用方 / Key 在抽取行上，不在此重复
+      properties:
+        entry_id: { type: integer, format: int64, minimum: 1 }
+        state: { type: string, enum: [candidate, active, superseded, corrected, deleted, conflicted] }
+        content: { type: string, description: 候选正文；只经管理面读模型出站，审计与日志均不落 }
+        kind: { type: string, enum: [fact, preference, constraint, inference, temporary], description: '与 MemoryCandidateView.kind 同集（五项）；method 只入方法草案，候选视图不出现' }
+        certainty: { type: string, enum: [asserted, uncertain], description: 由程序派生，不是模型自报置信度 }
+        confidence: { type: number, description: 模型自报置信度；只作展示，不作确认门槛 }
+        evidence:
+          type: array
+          description: 逐字证据；空集合输出 `[]`
+          items: { $ref: '#/components/schemas/LearningEvidenceView' }
+        source_entry_ids:
+          type: array
+          description: 候选引用的既有条目主键；空集合输出 `[]`
+          items: { type: integer, format: int64 }
+        suggested_supersedes_id: { type: integer, format: int64, description: '0 = 无可替代建议' }
+        evidence_at: { type: string, format: date-time, description: 证据消息的记录时刻（不是事实发生时刻） }
+        valid_to: { type: string, description: '空串 = 无到期；否则 RFC3339 UTC 的到期时刻' }
+        time_confidence: { type: string, enum: [exact, relative_unknown, unknown] }
+        created_at: { type: string, format: date-time }
+
+    LearningEvidenceView:
+      type: object
+      description: 一条逐字证据；引文只经管理面读模型出站，审计与日志都不落它
+      properties:
+        message_id: { type: integer, format: int64 }
+        run_id: { type: string }
+        role: { type: string, enum: [user, assistant] }
+        quote: { type: string, description: 用户或助手消息的逐字片段 }
+        message_at: { type: string, format: date-time }
+
+    LearningExtractionDetailView:
+      type: object
+      properties:
+        extraction: { $ref: '#/components/schemas/LearningExtractionView' }
+        candidates:
+          type: array
+          description: 本次抽取提交的候选；空集合输出 `[]`
+          items: { $ref: '#/components/schemas/LearningCandidateView' }
+        drafts:
+          type: array
+          description: 本次抽取提交的方法草案摘要（不含正文）；空集合输出 `[]`
+          items: { $ref: '#/components/schemas/LearningDraftMetaView' }
+
+    LearningDraftMetaView:
+      type: object
+      description: 草案元数据；**不含**正文（正文只在 LearningDraftDetailView 出站）
+      properties:
+        draft_id: { type: string }
+        extraction_id: { type: string }
+        agent: { type: string }
+        name: { type: string }
+        content_sha256: { type: string }
+        rel_dir: { type: string, description: 相对工作区的草案目录（固定布局） }
+        created_at: { type: string, format: date-time }
+
+    LearningDraftListView:
+      type: object
+      properties:
+        drafts:
+          type: array
+          description: 空集合输出 `[]`，不输出 null
+          items: { $ref: '#/components/schemas/LearningDraftMetaView' }
+
+    LearningDraftDetailView:
+      description: 草案详情 = 元数据 + `DRAFT.md` 正文 + `evidence.json` 证据
+      allOf:
+        - $ref: '#/components/schemas/LearningDraftMetaView'
+        - type: object
+          properties:
+            content: { type: string, description: DRAFT.md 正文（只读；不可执行、不进记忆条目） }
+            evidence:
+              type: array
+              description: evidence.json 内容；空集合输出 `[]`
+              items: { $ref: '#/components/schemas/LearningEvidenceView' }
 
     SessionSummary:
       type: object

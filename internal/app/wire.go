@@ -432,9 +432,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil, abortRuntime(errors.New(
 			"记忆管理面：载体未实现窄持久化端口——拒绝启动，不降级为只读门面"), db, lock)
 	}
+	// 索引槽位先于管理面构造：确认晋升成功后的 best-effort 补索引（US-22 C-28）要与
+	// `save_memory` 共用同一个槽位。槽位是两段绑定，晚绑定（下方知识库装配处 Bind）
+	// 不影响此处先建后传。
+	// The index slot is built before the admin surface so a confirmed promotion can
+	// re-index through the very slot save_memory uses; binding still happens later.
+	memoryIndexSlot := newMemoryIndexSlot(logger)
 	memAdmin := NewMemoryAdmin(MemoryAdminDeps{
 		Store:      memStore,
 		Operations: ops,
+		Index:      memoryIndexSlot,
 		Logger:     logger,
 		Now:        a.nowOr(),
 	})
@@ -516,10 +523,11 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 装配之后才存在，槽位先建、`knowledgeWire` 就绪后 Bind；未绑定即失败关闭。
 	// The semantic recall face is two-stage bound for the same reason as web_search.
 	memoryRecallSlot := newMemoryRecallSlot()
-	// 记忆向量的写后补索引同样两段绑定（V-5）：槽位先建，知识库装配完成后 Bind 并做
-	// 一次启动期回填。未绑定（embedding 未配置）时补索引是 no-op，保存路径行为不变。
-	// The write-side index slot is bound with the knowledge wiring; unbound means no-op.
-	memoryIndexSlot := newMemoryIndexSlot(logger)
+	// 记忆向量的写后补索引同样两段绑定（V-5）：槽位早在记忆管理面构造前已建（US-22 的
+	// 确认晋升也向它补索引），此处沿用同一个槽位；知识库装配完成后 Bind 并做一次启动期
+	// 回填。未绑定（embedding 未配置）时补索引是 no-op，保存路径行为不变。
+	// The write-side index slot was created before the admin surface; the knowledge
+	// wiring binds it later and unbound means no-op.
 	for _, t := range []core.Tool{
 		tool.NewReadFileTool(policy, root),
 		tool.NewWriteFileTool(policy, root, ""),
@@ -1045,12 +1053,62 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// "读到的"就是"写下的"（两条连接池之间的影子账本会让排障无从对齐）。
 	// One run store is shared by the writer (AgentService) and the reader (the web port).
 	runs := postgres.NewRunStore(db)
+	// 受控自我进化（US-22 §3.1.8）：**同一个**仓储实例同时喂抽取服务（写路径）与
+	// 只读状态面（读路径）——列表读到的行就是钩子刚提交的那行，不存在两套账。
+	// 未启用时钩子在首行返回：零写入、零模型调用；管理面仍可读出「已关闭」的状态。
+	// 名单内未注册的 Agent 只 WARN + 状态页列出（Q7），不抽取、不阻止启动。
+	// One repository feeds both the extraction service and the read-only status face;
+	// disabled deployments do nothing on the hook while the console still sees "off".
+	learningRepo := postgres.NewLearningRepo(db)
+	// 启动恢复（§2.3.6 / C-15）：扫描上次崩溃留下的 pending 抽取行，只查证、不重放。
+	// 查证结论（有候选 / 草案 → success，否则 unknown）在同一事务推进来源游标并写
+	// `verified_at`，此后该行不再阻断同来源新窗口；恢复失败拒绝启动——带着结果未知的
+	// 抽取行开始服务，同来源的下一窗口要么永久阻断，要么被重复抽取。
+	// Startup recovery verifies pending extractions before serving; it never replays,
+	// and a storage failure aborts startup.
+	if err := recoverLearning(ctx, LearningRecoveryDeps{
+		Store:  learningRepo,
+		Logger: logger,
+		Now:    a.nowOr(),
+	}); err != nil {
+		return fail(fmt.Errorf("启动恢复：学习抽取查证: %w", err))
+	}
+	learningDraftRoot := filepath.Join(root, "learning", "drafts")
+	learningSvc := memory.NewLearningService(memory.LearningDeps{
+		Store:     learningRepo,
+		Messages:  sessions,
+		Enabled:   cfg.Learning.AutoExtract,
+		Agents:    cfg.Learning.Agents,
+		DraftRoot: learningDraftRoot,
+		Limits:    memory.DefaultLearningLimits(),
+		Logger:    logger,
+		Now:       a.nowOr(),
+	})
+	unknownLearning := reportUnknownLearningAgents(logger, cfg.Learning.AutoExtract,
+		cfg.Learning.Agents, registeredAgentNames(entries))
+	learningAdmin := NewLearningAdmin(LearningAdminDeps{
+		Store:         learningRepo,
+		DraftRoot:     learningDraftRoot,
+		Enabled:       cfg.Learning.AutoExtract,
+		Agents:        cfg.Learning.Agents,
+		UnknownAgents: unknownLearning,
+		Limits:        memory.DefaultLearningLimits(),
+		Logger:        logger,
+		Now:           a.nowOr(),
+	})
 	// 模型调用的唯一入口按**当前**目录路由（约束 16 / 17）：发布在 ResourceGate 写锁内
 	// 替换持有者后，下一个新 Run 与下一次作者调用立即读新表；在途 Run 拿的是准入时固定的
 	// `Pinned` 视图，不受影响。路由仍只查表，查不到即拒绝发出（宪法 III）。
-	// The one model entry point routes against the current catalog; admitted runs keep
-	// the pinned view captured at admission.
-	client := newCatalogProviderRouter(catalogStore, llmCalls, logger)
+	// 抽取预写面（US-22 §3.1.6）必须在**装配期**装进路由器：运行期 `env.ProviderClient()`
+	// 拿到的是 `Pinned` 交出的冻结视图，路由器本身不实现 `MemoryExtractor`；不带仓储的
+	// 冻结视图会在预写处 fail-closed，抽取在生产链路永不可达（本缺陷由 T031 E2E 捕获）。
+	// 装配只是能力挂载、不产生写入；未启用抽取时钩子在首行返回，仍是零写入零调用。
+	// The extraction pre-write surface must ride on the router from assembly time: the run
+	// path only ever extracts through the pinned view, and a view without the surface
+	// fails closed, leaving extraction unreachable in production. Attaching it is a pure
+	// capability mount — a disabled deployment still performs no writes or model calls.
+	client := newCatalogProviderRouter(catalogStore, llmCalls, logger).
+		WithMemoryExtractStore(llmCalls)
 	// 诊断两件（US-16 T095 / T097）：写入器进运行路径，读取器进管理面。配置非法在这里
 	// 拒绝启动；两个实例共用同一个存储适配器，读到的就是刚写下的那批事件。
 	// The diagnostics pair: the recorder joins the run path, the reader the console.
@@ -1248,6 +1306,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Snapshots: postgres.NewSnapshotStore(db),
 		Audit:     invocations,
 		Memory:    memSvc,
+		// 唯一的抽取触发点（US-22 C-05）：钩子只在 `FinishRun` 真正落库之后、引用释放
+		// 之前同步运行；关闭时 `AfterRun` 首行返回，与未接线前逐字节相同。
+		// The one extraction trigger; disabled means the hook returns on its first line.
+		Learning: learningSvc,
 		// Run 侧知识链路（V-6）：装配时检索并注入、每轮复核、答案后引用复核。
 		// 与 web 的检索端口共用同一个检索器 / 来源视图 / 索引代际。
 		// The run-side knowledge port shares the retriever, viewer and generation with
@@ -1651,6 +1713,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		entries:         entries,
 		mem:             memSvc,
 		memoryAdmin:     memAdmin,
+		learningAdmin:   learningAdmin,
 		mcpConns:        mcpConns,
 		root:            root,
 		loader:          loader,
@@ -2147,6 +2210,12 @@ type heavyRuntime struct {
 	// 载体，启动恢复也用它查证 `memory.*` 的 pending 行。
 	// memoryAdmin shares the facade's carrier and backs the memory recovery verdicts.
 	memoryAdmin *MemoryAdmin
+
+	// learningAdmin 是 US-22 的只读学习查询面：状态 / 抽取 / 草案投影，供 web 与
+	// CLI 读取；抽取服务本身经 `core.ServiceOptions.Learning` 进入 Run 收尾路径。
+	// learningAdmin is the read-only learning surface; the extraction service joins
+	// the run finish path through core.ServiceOptions.Learning.
+	learningAdmin *LearningAdmin
 
 	// mcpConns 是已连接的 MCP server 与工具（`/info` 的连接数与 `/tools` 的 mcp 来源）。
 	// mcpConns carries the connected MCP servers and their tools.

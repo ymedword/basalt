@@ -267,6 +267,221 @@ func (s *SessionStore) MessagesTail(ctx context.Context, id string, limit int) (
 	return out, nil
 }
 
+// learningMessageColumns 是学习窗口两条查询共用的列清单（消息主键、Run、角色、正文、时刻）。
+// learningMessageColumns is the shared projection for both learning window queries.
+const learningMessageColumns = `m.id, COALESCE(m.run_id, ''), m.role, COALESCE(m.content, ''), m.created_at`
+
+// MessagesForExtraction 取一次新抽取的有界窗口（US-22 §3.1.7）：只读、不追加。窗口取
+// **触发 Run 自己在会话里的最后一条消息**为右界（`To`），游标为左界（不含），只收
+// user / assistant 角色，并按「同一来源调用方 + 同一来源 Key」过滤——JOIN runs 同时
+// 完成了来源判定与 `run_id IS NULL` 迁移遗留消息的排除（那类消息没有来源，不得作为证据）。
+// 行数与字节双上限都保留**最近**的消息：从新到旧累计，任一上限先到即停，但至少保留最新
+// 一条（一条就超过字节上限时仍保留它——否则会话会永远卡在同一位置不再前进）。
+// `From` / `To` 是实际保留的消息主键边界，`Dropped` 是同一候选集里未保留的条数；前文
+// （`id < From`）单独取，只进提示词、不作证据，同样受条数与字节上限约束。
+// MessagesForExtraction reads the bounded, origin-scoped window anchored at the triggering
+// run's last message and keeps the newest messages under both caps.
+func (s *SessionStore) MessagesForExtraction(ctx context.Context, sessionID, runID string,
+	afterMessageID int64, priorLimit, newLimit, priorBytes, newBytes int,
+) (core.LearningWindow, error) {
+	if sessionID == "" {
+		return core.LearningWindow{}, nil
+	}
+	var (
+		callerID, keyID string
+		lastMessageID   int64
+	)
+	err := s.db.pool.QueryRowContext(ctx,
+		`SELECT r.caller_id, COALESCE(r.key_id, ''),
+		        COALESCE((SELECT MAX(m.id) FROM messages m
+		                   WHERE m.session_id = $2 AND m.run_id = r.run_id), 0)
+		   FROM runs r WHERE r.run_id = $1`, runID, sessionID).
+		Scan(&callerID, &keyID, &lastMessageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 运行记录不存在（run_id=%s）", runID)
+	}
+	if err != nil {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 读取运行来源（run_id=%s）: %w", runID, err)
+	}
+	if lastMessageID <= 0 || lastMessageID <= afterMessageID {
+		return core.LearningWindow{}, nil
+	}
+
+	// `count(*) OVER ()` 在 LIMIT 之前计数：它给出窗口候选集的真实条数，Dropped 才能如实
+	// 记录"窗口外还有多少条"。排序与上限都是常量，调用方影响不到。
+	rows, err := s.db.pool.QueryContext(ctx,
+		`SELECT `+learningMessageColumns+`, count(*) OVER ()
+		   FROM messages m
+		   JOIN runs r ON r.run_id = m.run_id
+		  WHERE m.session_id = $1 AND m.id > $2 AND m.id <= $3
+		    AND m.role IN ('user', 'assistant')
+		    AND r.caller_id = $4 AND COALESCE(r.key_id, '') = $5
+		  ORDER BY m.id DESC
+		  LIMIT $6`,
+		sessionID, afterMessageID, lastMessageID, callerID, keyID, limitArg(newLimit))
+	if err != nil {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 读取抽取窗口（session_id=%s）: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var (
+		window core.LearningWindow
+		total  int
+		bytes  int
+	)
+	for rows.Next() {
+		var (
+			msg    core.LearningMessage
+			runStr string
+			at     int64
+		)
+		if err := rows.Scan(&msg.MessageID, &runStr, &msg.Role, &msg.Content, &at, &total); err != nil {
+			return core.LearningWindow{}, fmt.Errorf("学习窗口: 扫描抽取窗口（session_id=%s）: %w", sessionID, err)
+		}
+		msg.RunID = runStr
+		msg.CreatedAt = time.UnixMilli(at).UTC()
+		if newBytes > 0 && len(window.New) > 0 && bytes+len(msg.Content) > newBytes {
+			break
+		}
+		window.New = append(window.New, msg)
+		bytes += len(msg.Content)
+	}
+	if err := rows.Err(); err != nil {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 遍历抽取窗口（session_id=%s）: %w", sessionID, err)
+	}
+	if len(window.New) == 0 {
+		return core.LearningWindow{}, nil
+	}
+	window.Dropped = total - len(window.New)
+	// DESC 读入、反转成主键升序返回：调用方拿到的窗口顺序是确定的，不用自己排序。
+	window.ToMessageID = window.New[0].MessageID
+	window.FromMessageID = window.New[len(window.New)-1].MessageID
+	for i, j := 0, len(window.New)-1; i < j; i, j = i+1, j-1 {
+		window.New[i], window.New[j] = window.New[j], window.New[i]
+	}
+
+	prior, err := s.readLearningPrior(ctx, sessionID, callerID, keyID, window.FromMessageID, priorLimit, priorBytes)
+	if err != nil {
+		return core.LearningWindow{}, err
+	}
+	window.Prior = prior
+	return window, nil
+}
+
+// MessagesForFrozenWindow 按冻结的 `from` / `to` 与来源**重读**同一批消息（重试路径专用）：
+// 不重新计算边界、不做新窗口裁剪，也不改条数——调用方拿重读条数与 `window_messages`
+// 对比，缺失即按 `window_gone` 跳过并推进游标（US-22 §2.3.2，C-33）。前文仍单独取；
+// 字节上限只影响前文，不重写 `From` / `To`。
+// MessagesForFrozenWindow re-reads the frozen window verbatim; the caller compares the
+// returned count against the recorded one to detect a pruned window.
+func (s *SessionStore) MessagesForFrozenWindow(ctx context.Context, sessionID, originCallerID,
+	originKeyID string, fromMessageID, toMessageID int64, priorLimit, priorBytes int,
+) (core.LearningWindow, error) {
+	if sessionID == "" || fromMessageID <= 0 || toMessageID < fromMessageID {
+		return core.LearningWindow{}, nil
+	}
+	rows, err := s.db.pool.QueryContext(ctx,
+		`SELECT `+learningMessageColumns+`
+		   FROM messages m
+		   JOIN runs r ON r.run_id = m.run_id
+		  WHERE m.session_id = $1 AND m.id >= $2 AND m.id <= $3
+		    AND m.role IN ('user', 'assistant')
+		    AND r.caller_id = $4 AND COALESCE(r.key_id, '') = $5
+		  ORDER BY m.id DESC`,
+		sessionID, fromMessageID, toMessageID, originCallerID, originKeyID)
+	if err != nil {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 重读冻结窗口（session_id=%s）: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var window core.LearningWindow
+	for rows.Next() {
+		var (
+			msg    core.LearningMessage
+			runStr string
+			at     int64
+		)
+		if err := rows.Scan(&msg.MessageID, &runStr, &msg.Role, &msg.Content, &at); err != nil {
+			return core.LearningWindow{}, fmt.Errorf("学习窗口: 扫描冻结窗口（session_id=%s）: %w", sessionID, err)
+		}
+		msg.RunID = runStr
+		msg.CreatedAt = time.UnixMilli(at).UTC()
+		window.New = append(window.New, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return core.LearningWindow{}, fmt.Errorf("学习窗口: 遍历冻结窗口（session_id=%s）: %w", sessionID, err)
+	}
+	for i, j := 0, len(window.New)-1; i < j; i, j = i+1, j-1 {
+		window.New[i], window.New[j] = window.New[j], window.New[i]
+	}
+	// 边界原样返回（不是按重读结果重算）：冻结窗口就是"当初记下的这一段"。
+	window.FromMessageID = fromMessageID
+	window.ToMessageID = toMessageID
+
+	prior, err := s.readLearningPrior(ctx, sessionID, originCallerID, originKeyID, fromMessageID, priorLimit, priorBytes)
+	if err != nil {
+		return core.LearningWindow{}, err
+	}
+	window.Prior = prior
+	return window, nil
+}
+
+// readLearningPrior 取窗口之前（`m.id < beforeMessageID`）的同来源前文：只进提示词、
+// 不作证据，保留最近 priorLimit 条 / priorBytes 字节（至少一条）。来源与角色过滤与
+// 窗口查询同解；参数非正即视为"不要前文"。
+// readLearningPrior reads the same-origin context before the window, capped and never
+// used as evidence.
+func (s *SessionStore) readLearningPrior(ctx context.Context, sessionID, callerID, keyID string,
+	beforeMessageID int64, priorLimit, priorBytes int,
+) ([]core.LearningMessage, error) {
+	if priorLimit <= 0 || beforeMessageID <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.pool.QueryContext(ctx,
+		`SELECT `+learningMessageColumns+`
+		   FROM messages m
+		   JOIN runs r ON r.run_id = m.run_id
+		  WHERE m.session_id = $1 AND m.id < $2
+		    AND m.role IN ('user', 'assistant')
+		    AND r.caller_id = $3 AND COALESCE(r.key_id, '') = $4
+		  ORDER BY m.id DESC
+		  LIMIT $5`,
+		sessionID, beforeMessageID, callerID, keyID, priorLimit)
+	if err != nil {
+		return nil, fmt.Errorf("学习窗口: 读取窗口前文（session_id=%s）: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var (
+		out   []core.LearningMessage
+		bytes int
+	)
+	for rows.Next() {
+		var (
+			msg    core.LearningMessage
+			runStr string
+			at     int64
+		)
+		if err := rows.Scan(&msg.MessageID, &runStr, &msg.Role, &msg.Content, &at); err != nil {
+			return nil, fmt.Errorf("学习窗口: 扫描窗口前文（session_id=%s）: %w", sessionID, err)
+		}
+		msg.RunID = runStr
+		msg.CreatedAt = time.UnixMilli(at).UTC()
+		if priorBytes > 0 && len(out) > 0 && bytes+len(msg.Content) > priorBytes {
+			break
+		}
+		out = append(out, msg)
+		bytes += len(msg.Content)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("学习窗口: 遍历窗口前文（session_id=%s）: %w", sessionID, err)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // UpsertSession 建行或刷新会话行（不存在即建、存在只刷新**最后活动时间**）。
 // UpsertSession inserts the session row or refreshes its last-active time.
 //

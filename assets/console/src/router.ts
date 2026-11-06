@@ -5,7 +5,8 @@
 // 集合 / 文档详情（`knowledge`、`knowledge/:collectionId`、`knowledge/documents/:id`）
 // 与诊断事件页（`diagnostics`）、历史回查页（`history`）+ US-21 的只读准入页
 // （`admissions`、`admissions/:id`）+ 404 视图，不引入第三方路由库；静态段先于
-// 动态段。
+// 动态段。US-22 的「记忆」页三页签与深链**不新增路由**：同一路径由查询串承载
+// `tab` / `agent` / `candidate` / `extraction` / `draft`。
 // popstate 恢复视图，未知路径渲染 404；离开守卫承载「未保存编辑离开前确认」。
 // A hand-written History API router: twelve US-11 paths, the five US-12 paths, the R7
 // session deep link, the US-14 catalog, the US-16 pages (callers, knowledge,
@@ -318,6 +319,44 @@ export function callersHref(): string {
 /** 调用方详情：按 caller_id 深链。 */
 export function callerHref(callerId: string): string {
   return `${CONSOLE_BASE}/callers/${encodeURIComponent(callerId)}`
+}
+
+/**
+ * 「记忆」页的三个页签（US-22 信息架构裁决：不新增左侧「学习」入口）。页签与锚点
+ * 全部走查询串，刷新、分享与前进后退落在同一页签；`agent` 在切换页签与双向跳转时
+ * 一律保留，不清空 Agent 上下文。缺省页签（记忆库）不写 `tab`。
+ * The three memory tabs share one route; tabs and anchors live in the query string and
+ * the agent context is preserved across every switch.
+ */
+export type MemoryTab = 'library' | 'pending' | 'records'
+
+/** 记忆页深链的锚点；`candidate` 指条目主键，`extraction` / `draft` 指学习记录主键。 */
+export interface MemoryAnchor {
+  agent?: string
+  candidate?: string
+  extraction?: string
+  draft?: string
+}
+
+export function memoryHref(tab: MemoryTab = 'library', anchor: MemoryAnchor = {}): string {
+  const query = new URLSearchParams()
+  if (tab !== 'library') {
+    query.set('tab', tab)
+  }
+  if (anchor.agent !== undefined && anchor.agent !== '') {
+    query.set('agent', anchor.agent)
+  }
+  if (anchor.candidate !== undefined && anchor.candidate !== '') {
+    query.set('candidate', anchor.candidate)
+  }
+  if (anchor.extraction !== undefined && anchor.extraction !== '') {
+    query.set('extraction', anchor.extraction)
+  }
+  if (anchor.draft !== undefined && anchor.draft !== '') {
+    query.set('draft', anchor.draft)
+  }
+  const search = query.toString()
+  return search === '' ? `${CONSOLE_BASE}/library/memory` : `${CONSOLE_BASE}/library/memory?${search}`
 }
 
 /** 学习准入列表（只读）。 */

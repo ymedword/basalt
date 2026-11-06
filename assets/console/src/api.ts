@@ -394,6 +394,37 @@ export type MemoryEntryState =
   | 'conflicted'
 
 /**
+ * 一条逐字证据（契约 MemoryEvidenceView）：消息主键、所属 Run、角色、引文与消息
+ * 时刻。引文是用户消息原文，只在管理面读模型出站；页面原样展示供人工复核。
+ */
+export interface MemoryEvidenceView {
+  message_id: number
+  run_id: string
+  role: string
+  quote: string
+  message_at: string
+}
+
+/**
+ * 自动候选的元数据（契约 MemoryCandidateView）：证据按逐字引文给出，页面据此让
+ * 管理员复核「模型确实是从这些消息里读出来的」。`valid_to` 空串表示无到期。
+ * 来源调用方 / Key 不在其中——它们属于抽取行，不是候选属性。
+ */
+export interface MemoryCandidateView {
+  extraction_id: string
+  kind: string
+  certainty: string
+  confidence: number
+  evidence: MemoryEvidenceView[]
+  source_entry_ids: number[]
+  /** 0 = 没有建议替代目标；「替代」按钮据此禁用。 */
+  suggested_supersedes_id: number
+  evidence_at: string
+  valid_to: string
+  time_confidence: string
+}
+
+/**
  * 结构化读模型的一行：带主键与状态。没有主键页面就没有可确认 / 纠正 / 删除的对象，
  * 没有状态就看不见候选与已删条目。它是**管理视图**，不是召回结果。
  */
@@ -405,10 +436,12 @@ export interface MemoryEntryView {
   section: 'core' | 'archive'
   state: MemoryEntryState
   content: string
-  source: 'save_memory' | 'explicit_propose' | 'legacy_import' | 'migration'
+  source: 'save_memory' | 'explicit_propose' | 'legacy_import' | 'migration' | 'auto_extract'
   /** 0 = 无（纠正 / 替代链上的上一条）。 */
   supersedes_id: number
   created_at: string
+  /** 自动候选元数据；显式条目与 `save_memory` 写入的行是 null。 */
+  candidate: MemoryCandidateView | null
 }
 
 export interface MemoryEntryListView {
@@ -425,6 +458,118 @@ export interface MemoryEntryReceipt {
   replaced_id: number
   /** 仅提议有意义：命中同源去重 = true（未新增行，entry_id 是既有条目）。 */
   merged: boolean
+  /** 确认（替代处置）退役的旧条目；0 = 本次没有替代。键恒在。 */
+  superseded_id: number
+}
+
+// --- 学习查询面（US-22；只读，没有写端点）--------------------------------
+//
+// 五条 GET：状态、抽取列表与详情、草案列表与详情。页面只读展示；启用只改
+// `basalt.yaml`，确认 / 删除复用既有记忆管理动作。
+// The read-only learning surface: five GET views with no write counterparts.
+
+/** 抽取状态五字面量（与 `memory_extractions.status` 的 CHECK 同源）。 */
+export type LearningExtractionState =
+  | 'pending'
+  | 'success'
+  | 'failed'
+  | 'skipped'
+  | 'unknown'
+
+/** 状态面（契约 LearningStatusView）：启用状态、预算与待决计数。 */
+export interface LearningStatusView {
+  enabled: boolean
+  agents: string[]
+  unknown_agents: string[]
+  rule_version: string
+  prompt_version: string
+  attempts_used: number
+  attempt_limit: number
+  exhausted: boolean
+  budget_window_seconds: number
+  pending_extractions: number
+  unknown_extractions: number
+  orphan_drafts: number
+  last_extraction_at: string
+}
+
+/** 一行抽取账本（契约 LearningExtractionView）；时间空串 = 该阶段未发生。 */
+export interface LearningExtractionView {
+  extraction_id: string
+  agent: string
+  session_id: string
+  run_id: string
+  last_attempt_run_id: string
+  origin_caller_id: string
+  origin_key_id: string
+  status: LearningExtractionState
+  window_from_message_id: number
+  window_to_message_id: number
+  window_messages: number
+  dropped_window_messages: number
+  prior_messages: number
+  attempts: number
+  items_total: number
+  items_accepted: number
+  items_dropped: number
+  prompt_version: string
+  rule_version: string
+  provider: string
+  model: string
+  /** 六类失败分类；非失败行为空串。 */
+  failure_class: string
+  error_message: string
+  created_at: string
+  last_attempt_at: string
+  finished_at: string
+  verified_at: string
+}
+
+export interface LearningExtractionListView {
+  extractions: LearningExtractionView[]
+}
+
+/** 抽取详情里的候选（契约 LearningCandidateView）：带正文与逐字证据。 */
+export interface LearningCandidateView {
+  entry_id: number
+  state: MemoryEntryState
+  content: string
+  kind: string
+  certainty: string
+  confidence: number
+  evidence: MemoryEvidenceView[]
+  source_entry_ids: number[]
+  suggested_supersedes_id: number
+  evidence_at: string
+  valid_to: string
+  time_confidence: string
+  created_at: string
+}
+
+/** 草案摘要（契约 LearningDraftMetaView）：**没有正文**，正文只在详情出站。 */
+export interface LearningDraftMetaView {
+  draft_id: string
+  extraction_id: string
+  agent: string
+  name: string
+  content_sha256: string
+  rel_dir: string
+  created_at: string
+}
+
+export interface LearningDraftListView {
+  drafts: LearningDraftMetaView[]
+}
+
+export interface LearningExtractionDetailView {
+  extraction: LearningExtractionView
+  candidates: LearningCandidateView[]
+  drafts: LearningDraftMetaView[]
+}
+
+export interface LearningDraftDetailView extends LearningDraftMetaView {
+  content: string
+  evidence: MemoryEvidenceView[]
 }
 
 export interface NotifyChannelView {

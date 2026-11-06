@@ -24,10 +24,12 @@ func TestFlow_DiagnosticsDoNotAdvanceTask(t *testing.T) {
 	require.NoError(t, err)
 	task, err := f.rt.flows.service.Start(t.Context(), flow.StartRequest{Principal: core.LocalAdminCLIPrincipal(), DefinitionUID: published.DefinitionUID, IdempotencyKey: "observe", Input: json.RawMessage(`{"answer":"PRIVATE_TASK_BODY"}`)})
 	require.NoError(t, err)
+	// 余量 5s → 20s（2026-11-06）：全量 test-integration 并行 + PG 争用下实测超过 5s
+	// （同一用例隔离 -count=10 每条 0.83–1.28s）；只放宽等待上限，状态断言不变。
 	require.Eventually(t, func() bool {
 		task, err = f.rt.flows.store.ReadForWorker(t.Context(), task.ID)
 		return err == nil && task.Status == flow.Succeeded
-	}, 5*time.Second, 20*time.Millisecond)
+	}, 20*time.Second, 20*time.Millisecond)
 	store := postgres.NewObservabilityStore(f.rt.db)
 	ids, err := store.RunsByFlowTaskID(t.Context(), task.ID)
 	require.NoError(t, err)

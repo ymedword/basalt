@@ -569,11 +569,17 @@ func TestOpenAIClient_RejectsResponseBodyOverLimit(t *testing.T) {
 	}
 }
 
-// readPhaseTrigger 是"读取中"回归用例的触发延迟：响应头在毫秒级到达，触发点在这个量级的
-// 百倍之后——取消 / 截止因此必然落在**读取正文**阶段（已越过 Do），而不是还在等响应头。
+// readPhaseTrigger 是"读取中"回归用例的触发延迟：响应头在毫秒级到达，触发点远在其后——
+// 取消 / 截止因此必然落在**读取正文**阶段（已越过 Do），而不是还在等响应头。
 // 这是余量，不是同步手段：真正的判据见用例里的 Status == 200（取自已返回的响应头）。
-// readPhaseTrigger is a margin, not a synchronization primitive.
-const readPhaseTrigger = 500 * time.Millisecond
+//
+// 500ms → 5s（2026-11-06 用户裁决）：全仓并行判卷（`-cover` 轮）下回环往返偶发超过 500ms，
+// 取消落到传输阶段 → 该用例偶发失败并连带整轮 `make check` / stage 重跑。加长余量**不改变**
+// 任何断言：两阶段的判别仍由「未取完响应」文案与 Status == 200 承担，只降低争用下的误触发。
+// readPhaseTrigger is a margin, not a synchronization primitive. Raised from 500ms to 5s
+// under user adjudication (2026-11-06) because loopback round trips occasionally exceeded
+// 500ms under the parallel cover gate; no assertion changes.
+const readPhaseTrigger = 5 * time.Second
 
 // stalledResponseServer 起一个"响应头已返回、正文写了一半就挂住"的回环服务：客户端必然越过
 // Do 并阻塞在读取上，直到 ctx 取消 / 截止把它打断（服务端请求上下文随之结束）。

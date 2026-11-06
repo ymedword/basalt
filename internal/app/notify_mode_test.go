@@ -298,7 +298,10 @@ func TestNotifyMode_MidRunChangeKeepsFrozen(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, unblocked, "准入之后才出现的渠道没有被任何在途 Run 冻结")
 
-	require.NoError(t, runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0, baselineClock()))
+	applied, err := runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0, baselineClock())
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.NoError(t, runs.ReleaseRunRefs(ctx, runID, baselineClock()))
 	blocked, err = deliveries.UnreleasedRunsByChannel(ctx, first)
 	require.NoError(t, err)
 	require.Empty(t, blocked, "Run 终态释放冻结")

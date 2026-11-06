@@ -438,9 +438,16 @@ type guardedProviderClient struct {
 	checkpoint RunCredentialCheckpoint
 }
 
-// 编译期断言：带检查点的客户端仍是模型客户端。
-// Compile-time assertion that the guarded client stays a model client.
-var _ core.ProviderClient = (*guardedProviderClient)(nil)
+// 编译期断言：带检查点的客户端仍是模型客户端，并且实现了抽取面（US-22 §3.1.6）——
+// 生产运行入口取的是装饰器，不实现抽取接口则 `env.ProviderClient()` 的类型断言恒失败，
+// 抽取在生产环境永不可达。
+// Compile-time assertions that the guarded client stays a model client and implements
+// the extraction surface; production always hands out a decorator, so a decorator without
+// it would make extraction unreachable.
+var (
+	_ core.ProviderClient  = (*guardedProviderClient)(nil)
+	_ core.MemoryExtractor = (*guardedProviderClient)(nil)
+)
 
 // Chat 先复核 Run 固定的凭据版本，再交给固定视图发出。
 // Chat checks the pinned credential and then delegates to the pinned view.
@@ -449,6 +456,23 @@ func (c *guardedProviderClient) Chat(ctx context.Context, req core.ChatRequest) 
 		return core.ChatResponse{}, err
 	}
 	return c.inner.Chat(ctx, req)
+}
+
+// ChatMemoryExtract 先复核 Run 固定的凭据版本，再交给内层冻结视图发出（US-22 §3.1.6）：
+// Run 行在完成后仍存在，撤权对抽取同样立即生效。内层不支持抽取时返回装配缺陷哨兵，
+// **不得**换客户端或退回 `Chat`——退回聊天路径会让抽取费用记成对话调用，并绕过
+// `purpose='memory_extract'` 的专用预写。
+// ChatMemoryExtract runs the same credential checkpoint, then delegates to the frozen
+// inner view; a missing extractor is an assembly defect, never a fallback to Chat.
+func (c *guardedProviderClient) ChatMemoryExtract(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
+	if err := c.checkpoint.CheckRun(ctx, req.RunID); err != nil {
+		return core.ChatResponse{}, err
+	}
+	extractor, ok := c.inner.(core.MemoryExtractor)
+	if !ok {
+		return core.ChatResponse{}, core.ErrLearningExtractorUnavailable
+	}
+	return extractor.ChatMemoryExtract(ctx, req)
 }
 
 // resolveMCP 取 MCP 的**已应用**版本：发布指针可以指向尚未生效的新版本（D-12），

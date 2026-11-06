@@ -1,10 +1,11 @@
 package storage
 
 // 本文件是 Run 凭据固定仓储的判卷（颗粒度文档 R4.8 / T116，check `012-storage-admin`）：
-// 准入冻结、终态释放、行保留为历史。冻结与释放都要在**准入 / 终态事务**里发生，
-// 所以用例同时验证 StartRun 与 FinishRun 的接线段——只测独立方法会漏掉接线。
-// These tests pin the run credential repository, including the StartRun/FinishRun wiring
-// that freezes and releases the pin inside the admission and terminal transactions.
+// 准入冻结、终态释放、行保留为历史。冻结在**准入事务**里随 StartRun 发生；US-22 C-05
+// 起释放由收尾编排在终态之后经 `ReleaseRunRefs` 显式触发。用例同时验证两段接线——
+// 只测独立方法会漏掉接线。
+// These tests pin the run credential repository: StartRun freezes inside the admission
+// transaction, and — since US-22 C-05 — ReleaseRunRefs releases after the terminal write.
 
 import (
 	"context"
@@ -97,7 +98,7 @@ func TestRunCredentialStore_FreezeAndRelease(t *testing.T) {
 }
 
 // TestRunCredentialStore_AdmissionFreezesAndFinishReleases：接线判卷——托管模式的
-// 准入清单经 StartRun 自动冻结，FinishRun 在同一事务释放；env 模式不写行。
+// 准入清单经 StartRun 自动冻结，终态之后 ReleaseRunRefs 释放；env 模式不写行。
 // 中文验收点：凭据固定在准入时生效，不靠调用方补写。
 func TestRunCredentialStore_AdmissionFreezesAndFinishReleases(t *testing.T) {
 	db := openTempDB(t)
@@ -120,7 +121,8 @@ func TestRunCredentialStore_AdmissionFreezesAndFinishReleases(t *testing.T) {
 	require.Equal(t, managed.Provider.ResourceUID, stored[0].ResourceUID)
 	require.Equal(t, managed.Provider.Name, stored[0].ResourceName)
 
-	require.NoError(t, runs.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 0, fixedNow))
+	require.True(t, requireFinishRun(t, runs, ctx, rec.RunID, core.StatusCompleted, "", 1, 0, fixedNow))
+	require.NoError(t, runs.ReleaseRunRefs(ctx, rec.RunID, fixedNow))
 	stored, err = pins.Pins(ctx, rec.RunID)
 	require.NoError(t, err)
 	require.Len(t, stored, 1)

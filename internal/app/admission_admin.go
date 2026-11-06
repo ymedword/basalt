@@ -242,7 +242,7 @@ func (a *AdmissionAdmin) Propose(ctx context.Context, actor core.Actor, req core
 	if err != nil {
 		return core.AdmissionCandidate{}, err
 	}
-	if AdmissionSourceHasSecret(source) || len(ScanAdmissionSecrets(req.Files)) > 0 {
+	if core.SourceHasSecret(source) || len(core.ScanFilesForSecrets(req.Files)) > 0 {
 		return core.AdmissionCandidate{}, core.ErrAdmissionSecretDetected
 	}
 	baseline, err := a.baseline(ctx, req.SkillName)
@@ -648,7 +648,7 @@ func (a *AdmissionAdmin) Approve(ctx context.Context, actor core.Actor, candidat
 		return core.AdmissionDecision{}, fmt.Errorf("%w: 批准入口只接受 approve 决策",
 			core.ErrAdmissionInvalidInput)
 	}
-	if AdmissionTextHasSecret(input.Reason) {
+	if core.TextHasSecret(input.Reason) {
 		return core.AdmissionDecision{}, core.ErrAdmissionSecretDetected
 	}
 	if err := bindAdmissionDecision(candidate, evaluation, input); err != nil {
@@ -757,7 +757,7 @@ func (a *AdmissionAdmin) Reject(ctx context.Context, actor core.Actor, candidate
 		return core.AdmissionDecision{}, fmt.Errorf("%w: 拒绝入口只接受 reject 决策",
 			core.ErrAdmissionInvalidInput)
 	}
-	if AdmissionTextHasSecret(input.Reason) {
+	if core.TextHasSecret(input.Reason) {
 		return core.AdmissionDecision{}, core.ErrAdmissionSecretDetected
 	}
 	if err := bindAdmissionDecision(candidate, evaluation, input); err != nil {
@@ -834,7 +834,7 @@ func (a *AdmissionAdmin) Cancel(ctx context.Context, actor core.Actor, candidate
 		return core.AdmissionCandidate{}, fmt.Errorf("%w: 取消理由必须为 1~%d 字符",
 			core.ErrAdmissionInvalidInput, admissionReasonMaxRunes)
 	}
-	if AdmissionTextHasSecret(reason) {
+	if core.TextHasSecret(reason) {
 		return core.AdmissionCandidate{}, core.ErrAdmissionSecretDetected
 	}
 	now := a.now()
@@ -1108,7 +1108,7 @@ func (a *AdmissionAdmin) Withdraw(ctx context.Context, actor core.Actor, candida
 	if publication.State == core.AdmissionPublicationWithdrawn {
 		return publication, nil
 	}
-	if AdmissionTextHasSecret(reason) {
+	if core.TextHasSecret(reason) {
 		return core.AdmissionPublication{}, core.ErrAdmissionSecretDetected
 	}
 	pointer, err := a.resources.Pointer(ctx, core.ResourceSkill, candidate.SkillName)

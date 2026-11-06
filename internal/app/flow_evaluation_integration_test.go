@@ -196,7 +196,9 @@ func TestFlow_DemoContractAndArtifacts(t *testing.T) {
 						}()
 						select {
 						case <-model.entered:
-						case <-time.After(3 * time.Second):
+						// 3s → 15s（2026-11-06 用户裁决：并行判卷下余量不足会让整轮门禁重跑）。
+						// 只放宽等待上限，断言不变。
+						case <-time.After(15 * time.Second):
 							t.Fatal("cancel script did not start")
 						}
 						task, err = rt.flows.store.ReadForWorker(t.Context(), task.ID)

@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/memory"
 )
 
 // admissionSecretSamples 是每类模式一条命中样本；样本值本身仅用于断言"未回显"。
@@ -56,10 +57,10 @@ var admissionSecretPlaceholders = []string{
 func TestUS21_Secrets_NotEchoed(t *testing.T) {
 	t.Parallel()
 	for _, sample := range admissionSecretSamples {
-		require.Truef(t, AdmissionTextHasSecret(sample), "样本必须命中：%q", sample)
+		require.Truef(t, core.TextHasSecret(sample), "样本必须命中：%q", sample)
 	}
 	for _, placeholder := range admissionSecretPlaceholders {
-		require.Falsef(t, AdmissionTextHasSecret(placeholder), "占位不得命中：%q", placeholder)
+		require.Falsef(t, core.TextHasSecret(placeholder), "占位不得命中：%q", placeholder)
 	}
 	for _, benign := range []string{
 		"技能说明：本技能把日报汇总为 Markdown。",
@@ -67,7 +68,7 @@ func TestUS21_Secrets_NotEchoed(t *testing.T) {
 		"token budget: 4096",
 		"",
 	} {
-		require.Falsef(t, AdmissionTextHasSecret(benign), "普通文本不得命中：%q", benign)
+		require.Falsef(t, core.TextHasSecret(benign), "普通文本不得命中：%q", benign)
 	}
 
 	files := []core.AuthorFile{
@@ -78,7 +79,7 @@ func TestUS21_Secrets_NotEchoed(t *testing.T) {
 		{Path: "config/example.yaml", Content: admissionSecretPlaceholders[0]},
 		{Path: "scripts/run.sh", Content: admissionSecretSamples[7]},
 	}
-	hits := ScanAdmissionSecrets(files)
+	hits := core.ScanFilesForSecrets(files)
 	require.Equal(t, []string{"notes/usage.md", "scripts/run.sh"}, hits)
 	for _, hit := range hits {
 		for _, sample := range admissionSecretSamples {
@@ -91,7 +92,7 @@ func TestUS21_Secrets_NotEchoed(t *testing.T) {
 		Evidence: []string{"tests/demo.md"}, Counterexamples: []string{"不适用"},
 		Limitations: []string{"覆盖率有限"}, RetentionUntil: "2027-01-01T00:00:00Z",
 	}
-	require.False(t, AdmissionSourceHasSecret(clean))
+	require.False(t, core.SourceHasSecret(clean))
 	for name, mutate := range map[string]func(*core.AdmissionSource){
 		"ref":             func(s *core.AdmissionSource) { s.Ref = admissionSecretSamples[1] },
 		"notes":           func(s *core.AdmissionSource) { s.Notes = admissionSecretSamples[2] },
@@ -102,7 +103,7 @@ func TestUS21_Secrets_NotEchoed(t *testing.T) {
 	} {
 		declared := clean
 		mutate(&declared)
-		require.Equal(t, name != "placeholder", AdmissionSourceHasSecret(declared), "来源字段 %s 判定不符", name)
+		require.Equal(t, name != "placeholder", core.SourceHasSecret(declared), "来源字段 %s 判定不符", name)
 	}
 }
 
@@ -117,4 +118,28 @@ func TestUS21_Errors_DoNotEchoSecrets(t *testing.T) {
 	}
 	require.False(t, errors.Is(wrapped, core.ErrAdmissionInvalidInput))
 	require.False(t, strings.Contains(wrapped.Error(), "PRIVATE KEY"))
+}
+
+// TestUS22_SecretScanner_SharedWithAdmission 守 C-12：抽取侧的凭证判定与 US-21 准入
+// 扫描器是**同一份实现**——对同一组命中 / 占位 / 普通文本样本必须逐字同判；任何一侧
+// 复制规则并各自演化，都会在边界样本（占位放行、通用赋值长度）上先漂移。
+// Extraction reuses the admission scanner: both sides must classify every sample the
+// same way. A second rule copy drifts first on the placeholder and length-boundary cases.
+func TestUS22_SecretScanner_SharedWithAdmission(t *testing.T) {
+	t.Parallel()
+	samples := append([]string{}, admissionSecretSamples...)
+	samples = append(samples, admissionSecretPlaceholders...)
+	samples = append(samples,
+		"技能说明：本技能把日报汇总为 Markdown。",
+		"password rotation is documented in the operations guide.",
+		"token budget: 4096",
+		"",
+		// 抽取面的典型载体：证据引文里夹带凭证、正文里只有占位。
+		"用户说：把 key 记成 "+admissionSecretSamples[0]+" 就行",
+		"偏好：凭据用 ${LLM_API_KEY} 占位，不写明文",
+	)
+	for _, sample := range samples {
+		require.Equal(t, core.TextHasSecret(sample), memory.TextHasCredential(sample),
+			"准入与抽取必须共用同一份扫描规则：%q", sample)
+	}
 }

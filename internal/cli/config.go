@@ -60,7 +60,24 @@ type Config struct {
 	// 改这里不会覆盖管理台写入的值（与 `http.allowed_domains` 同一口径）。
 	// The execution section seeds the profile once; the database is authoritative after.
 	Execution ExecutionConfig   `yaml:"execution"`
+	Learning  LearningConfig    `yaml:"learning"`
 	Author    core.AuthorConfig `yaml:"-"`
+}
+
+// LearningConfig 是受控自我进化的启用段（`learning`，US-22 §3.1.11）。
+// 出厂默认关闭：`auto_extract` 缺省 false，未启用时钩子零写入、零模型调用。
+// 严格校验（启用但名单为空 / 重复名 / 非法名）在装载期由 validateLearningConfig
+// 完成；本结构只承担类型化解码与生效判定。
+// LearningConfig is the `learning` section: off by default, enabled only by an
+// explicit agent allow-list. Strict validation lives in validateLearningConfig.
+type LearningConfig struct {
+	// AutoExtract 是唯一启用通道：true 才允许 Run 终态之后的同步抽取。
+	// AutoExtract is the only enable switch.
+	AutoExtract bool `yaml:"auto_extract"`
+	// Agents 是抽取名单：启用时必须至少一个；名单内未注册的 Agent 只 WARN + 状态页
+	// 列出，不抽取、不阻止启动（Q7）。
+	// Agents is the extraction allow-list; unknown names warn instead of blocking.
+	Agents []string `yaml:"agents"`
 }
 
 // ExecutionConfig 是执行档位段（`execution`，14D）。
@@ -925,6 +942,15 @@ func validateConfig(cfg *Config) error {
 		return err
 	}
 
+	// learning 段：与 compaction 同形——开关关闭时也判已写名单的合法性（拼错的名单
+	// 等打开开关才报，只会把问题推迟到切换那一刻）；启用但名单为空是启动错误，
+	// 绝不把空名单解释为「全部 Agent」。
+	// The learning section: written names are validated even while the switch is off,
+	// and an enabled-but-empty allow-list refuses startup.
+	if err := validateLearningConfig(cfg.Learning); err != nil {
+		return err
+	}
+
 	// seen 记条目名 → **首次出现**的下标：重名拒绝要同时点名两条，只报后一条会让
 	// 用户不知道跟谁撞了。
 	// seen maps a name to its first index so a duplicate can name both entries.
@@ -971,6 +997,47 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf(
 				"配置项 providers[%d].credential_mode 取值非法（%s）——只允许 env（缺省）或 managed", i, mode)
 		}
+	}
+	return nil
+}
+
+// learningAgentNamePattern 是 `learning.agents` 名单的合法名形态（§3.1.11 冻结的
+// 字面量 `[a-z0-9][a-z0-9_-]*`）：小写字母 / 数字开头，后续只允许小写字母、数字、
+// 下划线与连字符。名单值是 Agent 目录名的精确匹配键——拼错一个字符就会让该 Agent
+// 静默不抽取，因此不合法形态一律拒绝启动，不做"尽力匹配"。
+// learningAgentNamePattern is the frozen allow-list name shape: a typo would silently
+// stop extraction for that agent, so malformed names refuse startup.
+var learningAgentNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// validateLearningConfig 校验受控自我进化段（§3.1.11）：空条目、非法名、重名都是
+// 启动错误；启用（auto_extract: true）但名单为空同样是启动错误——空名单**不得**被
+// 解释为「全部 Agent」。重名拒绝同时点名两条下标（与 providers 同形），只报后一条
+// 会让部署者不知道跟谁撞了。名单内未注册的 Agent 不在这里判：装载层看不到目录，
+// 由装配层记 WARN 并列入状态页（Q7）。
+// validateLearningConfig rejects empty, malformed and duplicate allow-list entries and
+// an enabled-but-empty list; unknown-but-legal names are left to the assembly layer,
+// which warns without blocking startup.
+func validateLearningConfig(cfg LearningConfig) error {
+	seen := make(map[string]int, len(cfg.Agents))
+	for i, name := range cfg.Agents {
+		if name == "" {
+			return fmt.Errorf("配置项 learning.agents[%d] 为空——名单条目必须是非空 Agent 名", i)
+		}
+		if !learningAgentNamePattern.MatchString(name) {
+			return fmt.Errorf(
+				"配置项 learning.agents[%d] 名字非法（%q）——只允许小写字母 / 数字开头，后续字符限小写字母、数字、下划线与连字符",
+				i, name)
+		}
+		if first, dup := seen[name]; dup {
+			return fmt.Errorf(
+				"配置项 learning.agents[%d] 与 learning.agents[%d] 重复（%q）——名单决定抽取归属，重名会让同一 Agent 被列出两次",
+				first, i, name)
+		}
+		seen[name] = i
+	}
+	if cfg.AutoExtract && len(cfg.Agents) == 0 {
+		return errors.New(
+			"配置项 learning.agents 为空——learning.auto_extract: true 时必须显式列出至少一个 Agent；空名单不等于「全部 Agent」")
 	}
 	return nil
 }

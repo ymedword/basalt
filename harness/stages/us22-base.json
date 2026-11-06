@@ -1,0 +1,707 @@
+{
+  "version": 1,
+  "id": "us22-base",
+  "approval": "Human review 1 passed 2026-11-05 (user: US-22 R6 及两处定稿勘误通过人工 review ①，以完整 SHA-256 289b5e70712974002d9addd9ab63893144ff7c6de332de73d6a1dd95c41ddfe9 对应版本为已审内容). Reviewed module card docs/us/us22-controlled-evolution.md R6 plus two final errata, sha256 289b5e70... (2039 lines); the approved content is frozen and the post-approval banner/section-7 bytes are excluded from that hash; registry row 22. Derived by module-dev step 6.1: the twelve checks follow module card section 4.6; us22-base-pg also runs the immutable migration tests (TestPostgres_* / TestObservability_*); us22-base-app and us22-base-pg use -tags=integration because US-16 moved storage-facing tests behind that tag. Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. required_tests follow the package assignments in card section 4.2; the 'core/app' group is split by natural test home (service-level hook/release order tests in internal/core, assembled wiring, bounded-budget and race tests in internal/app). Human review 2 pending.",
+  "inputs": [
+    "specs/022-controlled-evolution/spec.md",
+    "specs/022-controlled-evolution/plan.md",
+    "specs/022-controlled-evolution/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/core/learning.go",
+    "internal/core/secret_scan.go",
+    "internal/core/service.go",
+    "internal/core/store.go",
+    "internal/core/provider.go",
+    "internal/core/memory_admin.go",
+    "internal/memory/learning.go",
+    "internal/memory/learning_test.go",
+    "internal/memory/extract_output.go",
+    "internal/memory/extract_validate.go",
+    "internal/provider/service.go",
+    "internal/provider/memory_extract_test.go",
+    "internal/storage/run_store.go",
+    "internal/storage/run_store_test.go",
+    "internal/storage/recovery.go",
+    "internal/storage/postgres/learning_store.go",
+    "internal/storage/postgres/learning_store_test.go",
+    "internal/storage/postgres/memory_confirm.go",
+    "internal/storage/postgres/migrations/0011_memory_learning.sql",
+    "internal/storage/postgres/run_store.go",
+    "internal/storage/postgres/run_store_port_test.go",
+    "internal/storage/postgres/recovery.go",
+    "internal/storage/postgres/recovery_port_test.go",
+    "internal/storage/postgres/connect.go",
+    "internal/storage/postgres/migrate_integration_test.go",
+    "internal/storage/postgres/observability_migration_test.go",
+    "internal/storage/postgres/llm_calls.go",
+    "internal/storage/postgres/memory_store.go",
+    "internal/storage/postgres/memory_store_test.go",
+    "internal/storage/postgres/session_store.go",
+    "internal/storage/postgres/session_store_port_test.go",
+    "internal/app/learning_admin.go",
+    "internal/app/learning_recovery.go",
+    "internal/app/learning_test.go",
+    "internal/app/memory_admin.go",
+    "internal/app/memory_admin_test.go",
+    "internal/app/providers.go",
+    "internal/app/resources.go",
+    "internal/app/resources_test.go",
+    "internal/app/diagnostics_client.go",
+    "internal/app/diagnostics_producers_test.go",
+    "internal/app/admission_secret_test.go",
+    "internal/app/wire.go",
+    "internal/web/handlers_admin_memory.go",
+    "internal/web/handlers_learning.go",
+    "internal/web/handlers_learning_test.go",
+    "internal/web/contracts_learning_test.go",
+    "internal/web/server.go",
+    "internal/app/web.go",
+    "internal/web/admin_routes.go",
+    "internal/web/contract_test.go",
+    "internal/cli/learning.go",
+    "internal/cli/learning_test.go",
+    "internal/cli/config.go",
+    "internal/cli/ports.go",
+    "internal/cli/deps.go",
+    "internal/e2e/us22_learning_test.go",
+    "assets/console/src/views/workspace.ts",
+    "assets/console/src/views/learning-records.ts",
+    "assets/console/src/components/memory-entries.ts",
+    "assets/console/src/router.ts",
+    "assets/console/src/api-admin.ts",
+    "assets/console/src/api.ts",
+    "assets/console/tests/memory-entries.test.ts",
+    "assets/console/tests/memory-learning.test.ts",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/run-and-errors.md",
+    "docs/contracts/memory-learning.md",
+    "docs/contracts/schema.pg.sql",
+    "docs/Operations.md"
+  ],
+  "checks": [
+    {
+      "id": "us22-base-core",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=5m",
+        "./internal/core",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_Hook_OnlyAfterTerminalApplied",
+        "TestUS22_FinishWriteFailure_SkipsExtraction",
+        "TestUS22_Hook_SkipsFlowFixedToolScheduler",
+        "TestUS22_Hook_FailureDoesNotChangeRun",
+        "TestUS22_Hook_PanicRecovered",
+        "TestUS22_Release_RunsAfterHookFailure",
+        "TestUS22_Release_RunsWhenHookSkipped",
+        "TestUS22_ReleaseFailureKeepsTerminal"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-memory",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=5m",
+        "./internal/memory",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_Disabled_NoWritesNoCalls",
+        "TestUS22_AgentNotListed_Noop",
+        "TestUS22_Window_FrozenSameOriginOnly",
+        "TestUS22_Window_BoundsAndDrop",
+        "TestUS22_Window_ExcludesToolAndSystem",
+        "TestUS22_Prior_NotEvidence",
+        "TestUS22_Window_PriorBytesCapped",
+        "TestUS22_EntrySnapshot_BytesCapped",
+        "TestUS22_Window_EmptyNoop",
+        "TestUS22_Window_ReadErrorNoop",
+        "TestUS22_Cursor_ReadErrorNoop",
+        "TestUS22_DeterministicPromptVersion",
+        "TestUS22_Parse_StrictRejectsUnknownAndTrailing",
+        "TestUS22_Parse_RejectsOversize",
+        "TestUS22_Parse_RejectsMalformedUTF8",
+        "TestUS22_Validate_EvidenceWindowOnly",
+        "TestUS22_Validate_QuoteMustBeVerbatim",
+        "TestUS22_Validate_NoUserEvidenceDowngrades",
+        "TestUS22_Validate_TemporaryNeedsValidTo",
+        "TestUS22_Validate_DedupeCandidateActive",
+        "TestUS22_Validate_SourceIDsSubset",
+        "TestUS22_Validate_SuggestionSnapshotOnly",
+        "TestUS22_Validate_CredentialDropped",
+        "TestUS22_Validate_DropsInvalidItemKeepsOthers",
+        "TestUS22_Validate_NoArbitraryTargets",
+        "TestUS22_Time_AbsoluteOnly",
+        "TestUS22_Time_RelativeStaysUnknown",
+        "TestUS22_Time_ValidToMustBeFuture",
+        "TestUS22_Time_EvidenceAtIsRecordTime",
+        "TestUS22_Candidate_InsertedAsCandidate",
+        "TestUS22_Source_IsAutoExtract",
+        "TestUS22_Commit_ZeroCandidatesAdvances",
+        "TestUS22_Commit_DedupeUsesDatabase",
+        "TestUS22_Extraction_RunUnique",
+        "TestUS22_Scope_AgentOnly",
+        "TestUS22_Scope_NoGlobalWrite",
+        "TestUS22_Commit_OriginFromRunRow",
+        "TestUS22_Method_DraftNotMemory",
+        "TestUS22_Draft_FixedLayout",
+        "TestUS22_Draft_WriteFailureDropsItem",
+        "TestUS22_Draft_ReadOnly",
+        "TestUS22_Draft_NotAgentReadable",
+        "TestUS22_Draft_NoScripts",
+        "TestUS22_Budget_ExhaustedNoCallNoRow",
+        "TestUS22_Budget_RollingWindow",
+        "TestUS22_Budget_CountsAttempts",
+        "TestUS22_Retry_FrozenWindowOnly",
+        "TestUS22_Retry_AttemptBindsRunModel",
+        "TestUS22_Unresolved_BlocksSameOrigin",
+        "TestUS22_Cursor_AdvanceOnSuccess",
+        "TestUS22_Cursor_NoAdvanceOnFailure",
+        "TestUS22_Cursor_ThreeFailuresSkip",
+        "TestUS22_Model_ErrorCountsTowardSkip",
+        "TestUS22_Failure_AuditUnavailable",
+        "TestUS22_Failure_TimeoutRecordedAfterDeadline",
+        "TestUS22_Latency_TotalBudget",
+        "TestUS22_Latency_StageBounds",
+        "TestUS22_Latency_AuditPreWriteCrossDeadline",
+        "TestUS22_Latency_SlowModelAuditSuccess",
+        "TestUS22_Latency_WorkDeadlineFailureStillAudited",
+        "TestUS22_Window_FullGoneSkipsAndAdvances",
+        "TestUS22_Window_PartialGoneSkips",
+        "TestUS22_Commit_AtomicOnFailure",
+        "TestUS22_Commit_UnknownKeepsPending",
+        "TestUS22_Concurrent_SameAgentSerialized",
+        "TestUS22_Logs_NoContentOrSecret",
+        "TestUS22_Logs_FailureWarn",
+        "TestUS22_Errors_MessageSanitized",
+        "TestUS22_Prompt_EntriesCredentialFiltered"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-provider",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=5m",
+        "./internal/provider",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_Provider_PurposeMemoryExtract",
+        "TestUS22_Provider_RoundZero",
+        "TestUS22_Provider_RejectsTools",
+        "TestUS22_Provider_RejectsFlow",
+        "TestUS22_Provider_OneCallNoRetry",
+        "TestUS22_Provider_PinnedRunModel",
+        "TestUS22_Provider_UnknownProviderFailed",
+        "TestUS22_Provider_AuditPreWriteFailureNoCall",
+        "TestUS22_Provider_FinishOnError",
+        "TestUS22_Provider_PinnedCarriesMemoryStore",
+        "TestUS22_Provider_FinalizeDeadlineUsesStartTime"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-app",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=integration",
+        "-timeout=10m",
+        "./internal/app",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS22_Config_DefaultsOff",
+        "TestUS22_Config_EnabledRequiresAgents",
+        "TestUS22_Config_DuplicateRejected",
+        "TestUS22_Config_UnknownAgentWarn",
+        "TestUS22_Hook_OncePerRun",
+        "TestUS22_Hook_BoundedAndNoGoroutineLeak",
+        "TestUS22_Hook_ExtractorNotAssembledFailsClosed",
+        "TestUS22_Recovery_TerminalRefsReleased",
+        "TestUS22_Extractor_DecoratedReachable",
+        "TestUS22_Extractor_GuardedChecksCredential",
+        "TestUS22_Extractor_GuardedRejectsReleasedRef",
+        "TestUS22_Router_NotExtractor",
+        "TestUS22_Audit_ExtractionPendingBeforeCall",
+        "TestUS22_Audit_LLMPendingBeforeCall",
+        "TestUS22_Audit_PreWriteFailureNoCall",
+        "TestUS22_Candidate_NotRecalledBeforeConfirm",
+        "TestUS22_Candidate_NotInjected",
+        "TestUS22_Compat_SaveMemoryStaysActive",
+        "TestUS22_Compat_AdminProposeUnchanged",
+        "TestUS22_Confirm_AutoCandidateSameGate",
+        "TestUS22_Confirm_EmptyBodyRunsGates",
+        "TestUS22_Confirm_ManualPathUnchanged",
+        "TestUS22_Confirm_KeepBothDefault",
+        "TestUS22_Confirm_SupersedeReplacesActive",
+        "TestUS22_Confirm_SupersedeMismatchRejected",
+        "TestUS22_Confirm_StaleSuggestionRejected",
+        "TestUS22_Confirm_TargetNotActiveRejected",
+        "TestUS22_Confirm_SourceInvalidatedRejected",
+        "TestUS22_Confirm_SourceEntryExpiredRejected",
+        "TestUS22_Confirm_OriginRevokedRejected",
+        "TestUS22_Confirm_KeyExpiredRejected",
+        "TestUS22_Confirm_CallerDisabledRejected",
+        "TestUS22_Confirm_ExpiredRejected",
+        "TestUS22_Confirm_ConcurrentOneWinner",
+        "TestUS22_Confirm_ConcurrentRevokeFailsClosed",
+        "TestUS22_Confirm_AuditPreWrite",
+        "TestUS22_Confirm_DetailNoContent",
+        "TestUS22_Confirm_AuditFailureNoMutation",
+        "TestUS22_Confirm_IndexesAfterPromotion",
+        "TestUS22_Confirm_IndexFailureKeepsActive",
+        "TestUS22_Recovery_CandidatesMeanSuccess",
+        "TestUS22_Recovery_UnknownAdvancesNoReplay",
+        "TestUS22_Recovery_UnknownNotRewritten",
+        "TestUS22_Recovery_NoReplay",
+        "TestUS22_Recovery_RecoveredUnknownUnblocks",
+        "TestUS22_Unknown_NoRestartNextRunNoReplay",
+        "TestUS22_Status_ShowsBudget",
+        "TestUS22_Status_ShowsExhausted",
+        "TestUS22_Handoff_TakesLock",
+        "TestUS22_Handoff_ForcesSourceFields",
+        "TestUS22_Handoff_RequiresUserConfirmed",
+        "TestUS22_Handoff_CallsProposeOnly",
+        "TestUS22_Evidence_SurvivesMessageDeletion",
+        "TestUS22_Messages_ReadOnly",
+        "TestUS22_SecretScanner_SharedWithAdmission",
+        "TestUS22_Recall_ToolKeywordStopsDerived",
+        "TestUS22_LearningPort_ReadCommandsReachProductionPort",
+        "TestUS22_LearningPort_HandoffReachesRepository",
+        "TestUS22_LoadDraft_RejectsDotIDs",
+        "TestUS22_Confirm_MixedResolutionRejected"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-pg",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=integration",
+        "-timeout=10m",
+        "./internal/storage/postgres",
+        "-run",
+        "^(TestUS22_|TestPostgres_|TestObservability_)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS22_FinishRunKeepsTerminalWhenReleaseFails",
+        "TestUS22_Store_MessagesSameOrigin",
+        "TestUS22_Store_MessagesForFrozenWindow",
+        "TestUS22_Origin_FromRunRecord",
+        "TestUS22_Cursor_PerOrigin",
+        "TestUS22_Store_SourceAutoExtractAllowed",
+        "TestUS22_Store_InsertRowWritesValidTo",
+        "TestUS22_Store_ConfirmCandidateCAS",
+        "TestUS22_Store_ConfirmCandidateSupersede",
+        "TestUS22_Store_CandidateMetaRoundTrip",
+        "TestUS22_Store_ConfirmLocksSourceRows",
+        "TestUS22_Store_PendingScan",
+        "TestUS22_Store_RecoverAdvancesCursor",
+        "TestUS22_Store_RecoverSetsVerifiedAt",
+        "TestUS22_Store_UnresolvedBlocksSameOrigin",
+        "TestUS22_Store_UnresolvedSkipsVerifiedUnknown",
+        "TestUS22_Store_CommitAtomic",
+        "TestUS22_Store_CommitAdvisoryLock",
+        "TestUS22_Store_BudgetAtomic",
+        "TestUS22_Store_RetryKeepsFrozenWindow",
+        "TestUS22_Store_RetryUpdatesAttemptIdentity",
+        "TestUS22_Store_RetryWindowMissingSkips",
+        "TestUS22_Migration_SourcePurposeExtended",
+        "TestUS22_Migration_FailureClassWindowGone",
+        "TestUS22_Migration_ForwardFromV10",
+        "TestUS22_Migration_CandidateSourcesTable",
+        "TestUS22_Store_BeginExtractionUniqueRun",
+        "TestUS22_Recall_DerivedSourceDeleted_Keyword",
+        "TestUS22_Recall_DerivedSourceDeleted_LegacyKeyword",
+        "TestUS22_Recall_DerivedSourceDeleted_Semantic",
+        "TestUS22_Recall_DerivedSourceExpired",
+        "TestUS22_Recall_DerivedChainTransitive",
+        "TestUS22_Recall_DepthLimitFailsClosed",
+        "TestUS22_Recall_ExplicitEntryUnaffected",
+        "TestPostgres_FreshSchemaIsV1",
+        "TestPostgres_MigrateTakesAdvisoryLock",
+        "TestObservability_MigrationForwardOnly",
+        "TestUS22_ReleaseRunRefsSkipsWhileRunning",
+        "TestUS22_Confirm_ClosureInvalidatedRejected"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-web",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=5m",
+        "./internal/web",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_LearningStatus_ReadOnly",
+        "TestUS22_LearningExtractions_ListAndDetail",
+        "TestUS22_LearningDrafts_ListAndDetail",
+        "TestUS22_NoWriteEndpoints",
+        "TestUS22_OpenAPIContract",
+        "TestUS22_Confirm_BodyOptional",
+        "TestUS22_Confirm_ResolutionReceipt",
+        "TestUS22_MemoryEntry_CandidateMeta",
+        "TestUS22_OperationDetailResolution",
+        "TestUS22_Status_StoreError",
+        "TestUS22_Contracts_NoNewActionLiterals"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-cli",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-timeout=5m",
+        "./internal/cli",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_CLI_Status",
+        "TestUS22_CLI_ListShow",
+        "TestUS22_CLI_HandoffTakesLock",
+        "TestUS22_CLI_HandoffUntrustedActor",
+        "TestUS22_CLI_HandoffStrictSource",
+        "TestUS22_CLI_HandoffCallsPropose"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-e2e",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-tags=e2e",
+        "-timeout=10m",
+        "./internal/e2e",
+        "-run",
+        "^TestUS22_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS22_E2E_ExtractConfirmRecall",
+        "TestUS22_E2E_RejectWrongCandidate",
+        "TestUS22_E2E_DeleteStopsRecall",
+        "TestUS22_E2E_DeleteSourceStopsDerived",
+        "TestUS22_E2E_RecoveryAfterCrash",
+        "TestUS22_E2E_DisabledNoSideEffects"
+      ],
+      "level": "process"
+    },
+    {
+      "id": "us22-base-console-test",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "test"
+      ],
+      "timeout_seconds": 600,
+      "level": "source"
+    },
+    {
+      "id": "us22-base-console-build",
+      "args": [
+        "npm",
+        "--prefix",
+        "assets/console",
+        "run",
+        "build"
+      ],
+      "timeout_seconds": 600,
+      "level": "source"
+    },
+    {
+      "id": "us22-base-race",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-race",
+        "-tags=integration",
+        "-timeout=10m",
+        "./internal/app",
+        "-run",
+        "^TestUS22_(Confirm_ConcurrentOneWinner|Confirm_ConcurrentRevokeFailsClosed|Hook_OncePerRun|Hook_BoundedAndNoGoroutineLeak|Recovery_UnknownAdvancesNoReplay|Unknown_NoRestartNextRunNoReplay)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestUS22_Confirm_ConcurrentOneWinner",
+        "TestUS22_Confirm_ConcurrentRevokeFailsClosed",
+        "TestUS22_Hook_OncePerRun",
+        "TestUS22_Hook_BoundedAndNoGoroutineLeak",
+        "TestUS22_Recovery_UnknownAdvancesNoReplay",
+        "TestUS22_Unknown_NoRestartNextRunNoReplay"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us22-base-memory-race",
+      "args": [
+        "go",
+        "test",
+        "-json",
+        "-count=1",
+        "-race",
+        "-timeout=5m",
+        "./internal/memory",
+        "-run",
+        "^TestUS22_Concurrent_SameAgentSerialized$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS22_Concurrent_SameAgentSerialized"
+      ],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T003",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T004",
+      "checks": [
+        "us22-base-core"
+      ]
+    },
+    {
+      "id": "T005",
+      "checks": [
+        "us22-base-core",
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T006",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T007",
+      "checks": [
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T008",
+      "checks": [
+        "us22-base-memory"
+      ]
+    },
+    {
+      "id": "T009",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T010",
+      "checks": [
+        "us22-base-provider"
+      ]
+    },
+    {
+      "id": "T011",
+      "checks": [
+        "us22-base-memory"
+      ]
+    },
+    {
+      "id": "T012",
+      "checks": [
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T013",
+      "checks": [
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T014",
+      "checks": [
+        "us22-base-app",
+        "us22-base-pg",
+        "us22-base-race"
+      ]
+    },
+    {
+      "id": "T015",
+      "checks": [
+        "us22-base-web",
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T016",
+      "checks": [
+        "us22-base-memory",
+        "us22-base-pg",
+        "us22-base-memory-race"
+      ]
+    },
+    {
+      "id": "T017",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T018",
+      "checks": [
+        "us22-base-provider",
+        "us22-base-memory",
+        "us22-base-app",
+        "us22-base-race"
+      ]
+    },
+    {
+      "id": "T019",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T020",
+      "checks": [
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T021",
+      "checks": [
+        "us22-base-memory",
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T022",
+      "checks": [
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T023",
+      "checks": [
+        "us22-base-cli",
+        "us22-base-app"
+      ]
+    },
+    {
+      "id": "T024",
+      "checks": [
+        "us22-base-app",
+        "us22-base-race"
+      ]
+    },
+    {
+      "id": "T025",
+      "checks": [
+        "us22-base-pg"
+      ]
+    },
+    {
+      "id": "T026",
+      "checks": [
+        "us22-base-web"
+      ]
+    },
+    {
+      "id": "T027",
+      "checks": [
+        "us22-base-cli"
+      ]
+    },
+    {
+      "id": "T028",
+      "checks": [
+        "us22-base-console-test",
+        "us22-base-console-build"
+      ]
+    },
+    {
+      "id": "T029",
+      "checks": [
+        "us22-base-web"
+      ]
+    },
+    {
+      "id": "T031",
+      "checks": [
+        "us22-base-e2e"
+      ]
+    },
+    {
+      "id": "T032",
+      "checks": [
+        "us22-base-core",
+        "us22-base-memory",
+        "us22-base-provider",
+        "us22-base-app",
+        "us22-base-pg",
+        "us22-base-web",
+        "us22-base-cli",
+        "us22-base-e2e",
+        "us22-base-console-test",
+        "us22-base-console-build",
+        "us22-base-race",
+        "us22-base-memory-race"
+      ]
+    },
+    {
+      "id": "T034",
+      "checks": [
+        "us22-base-app"
+      ]
+    }
+  ]
+}

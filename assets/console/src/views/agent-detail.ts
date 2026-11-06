@@ -1207,7 +1207,8 @@ export const AgentDetailView = defineComponent({
 
     // 记忆展示按实际行为命名：常驻区每轮完整注入且不裁剪；可检索区只在
     // recall_memory 命中时进入上下文（缺省语义检索，mode=keyword 才是整串子串
-    // 匹配），也不会自动抽取。分区标题仍是契约固定的「核心记忆 / 归档记忆」。
+    // 匹配）。自动抽取（可配置，默认关闭）只产候选，确认后才进入可检索区。
+    // 分区标题仍是契约固定的「核心记忆 / 归档记忆」。
     // The memory view names the two partitions by behaviour; the headings stay the
     // contract literals 核心记忆 / 归档记忆.
     function renderMemoryView(view: MemoryView): VNodeChild {
@@ -1226,7 +1227,7 @@ export const AgentDetailView = defineComponent({
             'p',
             { class: 'muted small' },
             '每次运行都会把这一整段完整注入系统提示词，不参与历史裁剪（分区标题为「核心记忆」）。' +
-              '写入来自 Agent 在运行中调用 save_memory 且 scope=CORE，或本页提议后确认；不会从对话里自动抽取。',
+              '写入来自 Agent 在运行中调用 save_memory 且 scope=CORE，或本页提议后确认；自动抽取的候选只落在可检索记忆，不会写入核心区。',
           ),
           view.core === ''
             ? h(
@@ -1243,8 +1244,8 @@ export const AgentDetailView = defineComponent({
             'p',
             { class: 'muted small' },
             '不会自动注入上下文。Agent 调用 recall_memory 时检索这一区：缺省是语义（向量）检索，' +
-              '显式传 mode=keyword 才是整串子串匹配（分区标题为「归档记忆」）。命中的条目才进入当次运行，' +
-              '也不会自动从对话里抽取内容。',
+              '显式传 mode=keyword 才是整串子串匹配（分区标题为「归档记忆」）。命中的条目才进入当次运行；' +
+              '启用自动抽取的 Agent 会在会话结束产生候选，确认后才进入这一区。',
           ),
           view.archive === ''
             ? h(
@@ -1263,7 +1264,8 @@ export const AgentDetailView = defineComponent({
           tone: 'info',
           text:
             '会话消息随每次运行自动保存为会话历史（在「会话」页签查看），但那只代表对话记录本身：' +
-            '它不会自动进入长期记忆，也不会在对话结束后被抽取成记忆条目。记忆可由 Agent 调用 save_memory 写入，也可在此页提议并确认。',
+            '它不会自动进入长期记忆，默认也不会在对话结束后被抽取；显式启用自动抽取的 Agent 会在会话结束生成候选（进入「待确认」），确认后才成为条目。' +
+            '记忆可由 Agent 调用 save_memory 写入，也可在此页提议并确认。',
         }),
       )
       parts.push(

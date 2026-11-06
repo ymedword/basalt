@@ -181,6 +181,9 @@ type runHarnessOptions struct {
 	// The lost-ack hook must arm right before the business transaction, because N-01 put
 	// quota commits in front of it on the run path.
 	ArmLostAckBeforeStartRun bool
+	// Learning 是抽取钩子；nil = 未装配（既有用例的行为与读数逐字节不变）。
+	// Learning is the extraction hook; nil keeps every existing case identical.
+	Learning core.LearningHook
 }
 
 // newRunHarness 组装默认夹具。
@@ -310,6 +313,7 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 		// Run 级任务次数（N-01）：与 [3] / [5] 共用同一个限制器实例（C-35），
 		// 任务次数与对话 Token 因此读同一份限额行、落在同一张预留表上。
 		RunQuota: newRunQuota(h.limiter, h.diag, logger),
+		Learning: opts.Learning,
 	}
 	if opts.Wire != nil {
 		// Run 侧知识端口按需接线：未接线时 `Knowledge` 保持 nil，服务路径逐字节不变。
@@ -342,8 +346,13 @@ func (s *armingRunStore) StartRun(ctx context.Context, rec core.RunRecord, manif
 }
 
 // FinishRun 原样转发。
-func (s *armingRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, at time.Time) error {
+func (s *armingRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, at time.Time) (bool, error) {
 	return s.inner.FinishRun(ctx, runID, status, reason, iterations, toolCalls, at)
+}
+
+// ReleaseRunRefs 原样转发。
+func (s *armingRunStore) ReleaseRunRefs(ctx context.Context, runID string, at time.Time) error {
+	return s.inner.ReleaseRunRefs(ctx, runID, at)
 }
 
 // GetRun 原样转发。

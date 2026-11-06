@@ -105,6 +105,14 @@ type Options struct {
 	// instead of serving an empty list that looks like a real empty state.
 	Admissions AdmissionReader
 
+	// LearningAdmin 是受控自我进化的只读学习查询面（US-22 §3.1.10 / FR-22-11）：
+	// 五条 GET 只读抽取账本、候选视图与方法草案，**没有**写方法——确认 / 删除复用
+	// 既有记忆管理动作，启用只改 `basalt.yaml`。nil = 装配缺失，五条路由按固定 500
+	// 失败关闭——**不得**用空列表冒充"没有抽取"，那会把装配故障显示成"学习没跑过"。
+	// LearningAdmin backs the five read-only learning routes; a nil port fails closed
+	// rather than serving an empty list that looks like a real empty state.
+	LearningAdmin core.LearningAdmin
+
 	// Console 是管理台内嵌产物根（`assets.Console()`，§3.1.22）：装配期必需——缺它
 	// 就没有 `/console/*` 与根重定向的落点，NewServer 直接拒绝（约束 41 / 43）。
 	// Console is the embedded dist root; it is required at assembly time.
@@ -824,6 +832,16 @@ func (s *Server) routeTable() []route {
 		// DELETE fall through to the method-agnostic 404 fallback.
 		{method: http.MethodGet, pattern: "/api/v1/admissions", visibility: routeProtected, adminHandler: s.handleListAdmissions},
 		{method: http.MethodGet, pattern: "/api/v1/admissions/{candidate_id}", visibility: routeProtected, adminHandler: s.handleGetAdmission},
+		// 学习查询只读面（US-22 §3.1.10 / FR-22-11）：五条 GET，**没有**写方法——
+		// 确认 / 删除复用既有记忆管理动作，启用只改配置文件。写方法会落到表尾的方法
+		// 无关兜底 404（与准入门同一口径）。
+		// The five read-only learning rows; any write method falls through to the
+		// method-agnostic 404 fallback, exactly like the admission rows.
+		{method: http.MethodGet, pattern: "/api/v1/learning/status", visibility: routeProtected, adminHandler: s.handleAdminLearningStatus},
+		{method: http.MethodGet, pattern: "/api/v1/learning/extractions", visibility: routeProtected, adminHandler: s.handleAdminListLearningExtractions},
+		{method: http.MethodGet, pattern: "/api/v1/learning/extractions/{id}", visibility: routeProtected, adminHandler: s.handleAdminLoadLearningExtraction},
+		{method: http.MethodGet, pattern: "/api/v1/learning/drafts", visibility: routeProtected, adminHandler: s.handleAdminListLearningDrafts},
+		{method: http.MethodGet, pattern: "/api/v1/learning/drafts/{id}", visibility: routeProtected, adminHandler: s.handleAdminLoadLearningDraft},
 		{method: http.MethodGet, pattern: "/api/v1/schedules", visibility: routeProtected, handler: s.handleListSchedules},
 		{method: http.MethodPut, pattern: "/api/v1/schedules/{id}", visibility: routeProtected, handler: s.handleSetScheduleEnabled},
 		{method: http.MethodGet, pattern: "/api/v1/schedules/{id}/executions", visibility: routeProtected, handler: s.handleListExecutions},

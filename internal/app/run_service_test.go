@@ -57,7 +57,8 @@ func seedRunServiceRow(t *testing.T, runs *postgres.RunStore, runID, agent strin
 		Principal: core.LocalAdminPrincipal(), StartedAt: startedAt,
 	}, core.RunResourceManifest{}))
 	if status != core.StatusRunning {
-		require.NoError(t, runs.FinishRun(ctx, runID, status, "", 1, 0, startedAt.Add(time.Minute)))
+		_, err := runs.FinishRun(ctx, runID, status, "", 1, 0, startedAt.Add(time.Minute))
+		require.NoError(t, err)
 	}
 }
 

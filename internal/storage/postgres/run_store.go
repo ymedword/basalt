@@ -243,22 +243,25 @@ func manifestNotifyRefs(runID string, manifest core.RunResourceManifest) []core.
 }
 
 // FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at），
-// 并在**同一事务**释放该 Run 的资源引用（约束 19）。
-// FinishRun writes the terminal state and releases the run's resource references in the
-// same transaction.
+// 并报告**本次调用是否真正完成了状态转换**（US-22：抽取钩子的唯一触发判据）。
+// 引用释放**不在**本方法内：终态 → 抽取 → 释放的顺序由 `core.AgentService.finish` 编排，
+// 钩子要读的运行期客户端依赖引用仍然有效（C-05）。
+// FinishRun writes the terminal state and reports whether this call applied it. Reference
+// release moved out: the core service orders terminal → hook → release so the hook still
+// sees live refs.
 //
 // 两条守卫。① `WHERE status = 'running'`：取消路径只发信号、崩溃恢复与超时兜底都可能
 // 并发调用本方法；已判定的终态**不得**被迟到的写入改口（注 8）。② 影响 0 行时读当前行：
-// 行存在 = 幂等成功（不覆盖、不释放——释放只属于本次实际转换的行）；行不存在 = **如实
-// 报错**，账本行缺失说明启动纪律被绕过，不该被"更新成功"掩盖。
+// 行存在 = 幂等未转换（返回 false，不覆盖）；行不存在 = **如实报错**，账本行缺失说明
+// 启动纪律被绕过，不该被"更新成功"掩盖。
 // The status guard keeps a late terminal write from re-judging a finished run; a zero-row
-// update is idempotent success when the row exists, and a hard error when it does not.
+// update is an idempotent no-op when the row exists, and a hard error when it does not.
 func (s *RunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string,
 	iterations, toolCalls int, now time.Time,
-) error {
+) (bool, error) {
 	tx, err := s.db.pool.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("回填运行终态（run_id=%s）: 开启事务: %w", runID, err)
+		return false, fmt.Errorf("回填运行终态（run_id=%s）: 开启事务: %w", runID, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -269,20 +272,50 @@ func (s *RunStore) FinishRun(ctx context.Context, runID string, status core.RunS
 		string(status), nullIfEmpty(reason), iterations, toolCalls, now.UnixMilli(),
 		runID, string(core.StatusRunning))
 	if err != nil {
-		return fmt.Errorf("回填运行终态（run_id=%s）: %w", runID, err)
+		return false, fmt.Errorf("回填运行终态（run_id=%s）: %w", runID, err)
 	}
 
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("确认运行终态写入（run_id=%s）: %w", runID, err)
+		return false, fmt.Errorf("确认运行终态写入（run_id=%s）: %w", runID, err)
 	}
 	if affected == 0 {
 		if err := requireRunRow(ctx, tx, runID); err != nil {
-			return err
+			return false, err
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("回填运行终态（run_id=%s）: 提交: %w", runID, err)
+			return false, fmt.Errorf("回填运行终态（run_id=%s）: 提交: %w", runID, err)
 		}
+		return false, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("回填运行终态（run_id=%s）: 提交: %w", runID, err)
+	}
+	return true, nil
+}
+
+// ReleaseRunRefs 释放该 Run 的资源 / 凭据 / 通知三类引用（幂等：只更新未释放的行）。
+// 在终态落库与抽取钩子之后由 `core.AgentService.finish` **无条件**调用；失败只上抛，
+// 由调用方记 ERROR，已终态未释放的行由下次启动的 `releaseTerminalRefs` 补齐。
+// **释放前先确认终态已持久化**（`status <> 'running'`）：`FinishRun` 写失败或尚未提交时
+// 引用不释放，留给启动恢复——否则钩子还没跑凭据就被回收，抽取必失败（C-05）。
+// ReleaseRunRefs releases the three reference kinds; idempotent, called unconditionally
+// after the terminal write and the extraction hook. It refuses to release while the run
+// is still `running` (FinishRun failed or not yet committed): those refs are left to
+// startup recovery. Startup recovery closes any leftovers.
+func (s *RunStore) ReleaseRunRefs(ctx context.Context, runID string, now time.Time) error {
+	tx, err := s.db.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("释放运行引用（run_id=%s）: 开启事务: %w", runID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	terminal, err := runTerminal(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if !terminal {
 		return nil
 	}
 
@@ -296,16 +329,15 @@ func (s *RunStore) FinishRun(ctx context.Context, runID string, status core.RunS
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("回填运行终态（run_id=%s）: 提交: %w", runID, err)
+		return fmt.Errorf("释放运行引用（run_id=%s）: 提交: %w", runID, err)
 	}
 	return nil
 }
 
-// releaseRunRefs 释放某个 Run 的全部未释放引用（约束 19 / 注 8）。
-// **事务边界由调用方保证**：终态转换与引用释放必须一起提交——正是"版本永远显示被引用"
-// 或"Run 已收尾却仍占着版本"两种中间态的防线。
-// releaseRunRefs stamps released_at on the run's unreleased references; the caller owns
-// the transaction so the status flip and the release always commit together.
+// releaseRunRefs 释放某个 Run 的全部未释放资源引用（约束 19 / 注 8）。
+// **事务边界由调用方保证**：`ReleaseRunRefs` 把三类释放放进同一事务提交。
+// releaseRunRefs stamps released_at on the run's unreleased resource refs; the caller
+// owns the transaction that commits the three kinds together.
 func releaseRunRefs(ctx context.Context, ex sqlExecutor, runID string, now time.Time) (int, error) {
 	res, err := ex.ExecContext(ctx,
 		`UPDATE run_resource_refs
@@ -334,6 +366,24 @@ func requireRunRow(ctx context.Context, q Queryer, runID string) error {
 		return fmt.Errorf("读取运行账本行（run_id=%s）: %w", runID, err)
 	}
 	return nil
+}
+
+// runTerminal 报告该 Run 的终态是否已持久化（`status <> 'running'`）。
+// `ReleaseRunRefs` 据此守卫：行仍 running（FinishRun 失败 / 未提交）或行不存在时不释放，
+// 引用留给启动恢复；状态只从 running 走向终态、不会回退，读后无需再锁。
+// runTerminal reports whether the terminal state is persisted (status <> 'running').
+// ReleaseRunRefs uses it as the release guard: a running or missing row keeps its refs
+// for startup recovery. Statuses never move back to running, so no extra locking needed.
+func runTerminal(ctx context.Context, q Queryer, runID string) (bool, error) {
+	var status string
+	err := q.QueryRowContext(ctx, `SELECT status FROM runs WHERE run_id = $1`, runID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("读取运行终态（run_id=%s）: %w", runID, err)
+	}
+	return status != string(core.StatusRunning), nil
 }
 
 // runOwnership 把 `RunRecord.Principal` 派生为 runs 的五个归属列：`caller_id` /

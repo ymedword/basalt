@@ -17,6 +17,8 @@ package app
 //     对应日志回答，记成失败事件等于凭一条不存在的调用冒充供应商故障（§2.9.1）。
 //     `decision` 在两态都留空：模型调用的成败不是一次策略判定（allow / deny / trim /
 //     degrade 都不成立），把失败写成 `deny` 会把"供应商故障"误导成"策略拒绝"。
+//   - **抽取只转发不记事件**（US-22）：`ChatMemoryExtract` 固定 `round=0`，低于诊断步号
+//     下限 `>=1`；抽取的观测由 `llm_calls` 行与 WARN / ERROR 日志承担。
 //
 // This file is the diagnostics producer on the run path. The decorator observes and
 // never intervenes; failures now carry llm_call_failed, while `decision` stays empty in
@@ -50,6 +52,14 @@ type diagnosticProviderClient struct {
 	inner    core.ProviderClient
 	recorder diagnosticRecorder
 }
+
+// 编译期断言：诊断装饰器同样实现抽取面（US-22 §3.1.6）。生产运行入口外面总套着本
+// 装饰器；不实现时抽取的类型断言恒失败，抽取在生产环境永不可达。
+// Compile-time assertion that the diagnostics decorator also implements extraction.
+var (
+	_ core.ProviderClient  = (*diagnosticProviderClient)(nil)
+	_ core.MemoryExtractor = (*diagnosticProviderClient)(nil)
+)
 
 // newDiagnosticProviderClient 装配装饰器；`recorder` 为 nil 时**原样返回内层客户端**
 // ——诊断未启用的实例因此与接线前逐字一致（零额外分配、零额外调用）。
@@ -98,6 +108,20 @@ func (c *diagnosticProviderClient) Chat(ctx context.Context, req core.ChatReques
 	}
 	c.recorder.Record(ctx, ev)
 	return resp, err
+}
+
+// ChatMemoryExtract 只转发、**不记** `llm_call` 诊断事件（US-22 §3.1.6）：抽取调用
+// 固定 `round=0`，低于诊断步号下限 `>=1`，本 US 不新增诊断步号；抽取的观测由
+// `llm_calls` 行与 WARN / ERROR 日志承担。内层不支持抽取时返回装配缺陷哨兵，
+// **不得**换客户端或退回 `Chat`。
+// ChatMemoryExtract forwards only and records no llm_call event: extraction uses
+// round 0, below the diagnostic step floor of 1, and this US adds no step id.
+func (c *diagnosticProviderClient) ChatMemoryExtract(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
+	extractor, ok := c.inner.(core.MemoryExtractor)
+	if !ok {
+		return core.ChatResponse{}, core.ErrLearningExtractorUnavailable
+	}
+	return extractor.ChatMemoryExtract(ctx, req)
 }
 
 // callNeverIssued 判定一次失败是否发生在**调用发出之前**。四个哨兵各自对应一条确定

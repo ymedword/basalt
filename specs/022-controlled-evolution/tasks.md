@@ -1,0 +1,130 @@
+# Tasks: US22 受控自我进化
+
+**Input**: spec.md / plan.md / research.md / data-model.md / contracts/README.md / quickstart.md；颗粒度文档 `docs/us/us22-controlled-evolution.md` R6（review ① 已通过，SHA-256 `289b5e70…`，2039 行）。
+
+**Tests**: 已审 Harness 的必跑测试与关键反例必须落地；安全 / 并发 / 审计类红态先行；不删除断言、不无理由跳过、不放宽阈值。测试函数名英文 `TestUS22_<主题>_<行为>`，中文验收点写进注释。
+
+## Phase 1: Setup
+
+- [x] T001 核对 US-21 收口、台账行 22 与模块卡 R6 的 review ① 依据；建立 `specs/022-controlled-evolution/run-state.md` 基线、派生工件指纹与失败预算；DoD：登记唯一、R6 哈希可复算、spec / plan 指纹与文件一致、无范围外改动。
+- [x] T002 从具名判据派生 `harness/stages/us22-base.json`（12 个 check、`protect` 路径、`inputs`、`tasks` 映射）；DoD：`required_tests` 与 §4.2 逐包对应，protect 覆盖 §3.1 新增文件、§3.2 改造文件与既有回归测试（`memory_store_test.go`、`memory_admin_test.go`、`resources_test.go`、`diagnostics_producers_test.go`、`migrate_integration_test.go`、`observability_migration_test.go`、`admission_secret_test.go`），缺环境不冒充通过。
+
+## Phase 2: Foundational
+
+- [x] T003 在 `internal/storage/postgres/migrations/0011_memory_learning.sql`、`internal/storage/postgres/connect.go` 落两个 CHECK 扩展与五张新表，并把 `SupportedSchemaVersion` 推进到 11；DoD：0001–0010 零改写、幂等重放、v10 旧库前向可迁移、表数 82 → 87、`schema.pg.sql` 不改。
+- [x] T004 在 `internal/core/learning.go` 落 `LearningRunInput` / `LearningHook` / `MemoryExtractor` / 抽取与候选类型 / 窗口与读模型 / `LearningLimits` 默认值 / 四类哨兵；在 `internal/core/provider.go` 追加 `LLMCallPurposeMemoryExtract`、`MemoryExtractCallStore`、`ChatRequest.HookDeadline`；在 `internal/core/memory_admin.go` 追加 `MemoryConfirmRequest` / `MemoryConfirmResolver` / `SupersededID` / `MemoryCandidateMeta` / `MemoryEntryRecord.Candidate`；DoD：`core` 仍只依赖标准库，既有字段与调用方兼容，哨兵可按 `errors.Is` 区分。
+- [x] T005 在 `internal/core/service.go` 把收尾改为「`FinishRun` 返回 `applied` → 条件钩子 → `defer ReleaseRunRefs`」，在 `internal/core/store.go` 改 `RunStore.FinishRun` 签名并新增 `ReleaseRunRefs`；DoD：`Learning=nil` 或 `applied=false` 时除签名外行为不变；Flow / 固定工具 / 渠道不属于 {web, cli} 时跳过；释放无条件执行；钩子 panic 不改变 Run 结果。
+- [x] T006 在 `internal/storage/run_store.go`（SQLite）与 `internal/storage/postgres/run_store.go` 把终态与三类引用释放拆成 `FinishRun` / `ReleaseRunRefs`；DoD：`TestRunStore_FinishRunRollsBackWhenReleaseFails` 按 §2.4.6 替换为 `TestUS22_FinishRunKeepsTerminalWhenReleaseFails`（SQLite / PG 各一），崩溃收尾同事务用例保留，`core.RunStore` 编译期断言成立，启动 `releaseTerminalRefs` 兜底用例全绿。
+- [x] T007 把 `internal/app/admission_secret.go` 的凭证扫描器下沉到 `internal/core/secret_scan.go`，app 与 memory 共用；DoD：US-21 凭证扫描用例全绿、`TestUS22_SecretScanner_SharedWithAdmission` 通过、规则只有一份。
+- [x] T008 在 `internal/memory/extract_output.go`、`internal/memory/extract_validate.go` 与 `internal/memory/learning_test.go` 落严格 JSON（≤64 KiB / UTF-8 / 无未知键 / 无尾随）与逐项校验（类型闭集、内容上限、证据窗口内且逐字、角色、临时约束未来绝对 `valid_to`、去重、来源子集、建议目标、凭证丢弃、`certainty` 程序派生）；DoD：§4.2 FR-22-05 全部用例绿，丢弃单项不失败整次。
+- [x] T009 在 `internal/storage/postgres/learning_store.go` 落五表读写、`UnresolvedForOrigin` / `LoadCursor` / `BeginExtraction`（advisory lock、来源复制、预算与重试同事务）/ `CommitExtraction` / 读模型；在 `session_store.go` 追加 `MessagesForExtraction` / `MessagesForFrozenWindow`；在 `llm_calls.go` 追加 `BeginMemoryExtractCall` 委托 `beginPendingCall`；DoD：`TestUS22_Store_*` 全绿、`run_id` 唯一、冻结窗口不更新、既有 `Messages` / `MessagesTail` / `BeginCall` / `BeginCompactionCall` 不变。
+
+## Phase 3: User Story 1 - 默认关闭的候选生成与人工确认晋升 (P1)
+
+独立判据：空配置零写入零调用；启用后桩模型输出落 `candidate / auto_extract / archive` 且带元数据与来源关系；确认前不召回、不注入。
+
+- [x] T010 [US1] 在 `internal/provider/service.go` 抽出共享 chat 路径并落 `ChatMemoryExtract`（显式映射、`round=0`、`BeginMemoryExtractCall` 预写、一次调用、不接受 `Tools` / `Flow`、`Pinned` 复制 `memoryStore`）；DoD：`TestUS22_Provider_*` 全绿、预写失败不发出调用、既有 `Chat` 审计仍为 `purpose='chat'`。
+- [x] T011 [US1] 在 `internal/memory/learning.go` 落 `LearningService.AfterRun` 主流程（启用与 Agent 名单判定、未决阻断、窗口与前文读取、条目快照、`BeginExtraction`、提示词、`ChatMemoryExtract`、解析校验、草案与候选构建、`CommitExtraction`、失败分类与 `fail`）；DoD：与 §2.3.1 伪代码逐块一致、默认关闭零副作用、零合法候选仍记 `success`、日志不含正文 / 证据 / 凭证。
+- [x] T012 [US1] 在 `internal/app/providers.go` / `resources.go` / `diagnostics_client.go` 落 `WithMemoryExtractStore`、装饰器 `ChatMemoryExtract` 与路由器禁区；DoD：`TestUS22_Extractor_DecoratedReachable` / `TestUS22_Extractor_GuardedChecksCredential` / `TestUS22_Extractor_GuardedRejectsReleasedRef` / `TestUS22_Router_NotExtractor` 全绿，路由到准入冻结视图而非当前快照。
+- [x] T013 [US1] 在 `internal/app/wire.go` 装配 `LearningService` / `LearningAdmin` / `ConfirmWithResolution` / `recoverLearning`，在 `internal/app/learning_admin.go` 落状态与抽取 / 草案 / 候选读模型；DoD：未配置 `learning` 时所有端口关闭且启动不新增行或调用；`TestUS22_Status_ShowsBudget` / `TestUS22_Status_StoreError` / `TestUS22_Candidate_NotRecalledBeforeConfirm` / `TestUS22_Candidate_NotInjected` / `TestUS22_Compat_SaveMemoryStaysActive` / `TestUS22_Compat_AdminProposeUnchanged` 通过。
+
+## Phase 4: User Story 2 - 确认门禁与来源失效复核 (P1)
+
+独立判据：候选到期、来源闭包失效 / 到期、Key 撤销 / 到期、调用方停用、替代目标不一致任一出现即 409 且状态不变；并发确认恰好一个成功。
+
+- [x] T014 [US2] 在 `internal/app/memory_admin.go` 落 `ConfirmWithResolution`（处置校验 → 纯读复核 → 审计 `pending` → 事务 → 回填），在 `internal/storage/postgres/memory_confirm.go` 落单事务 CAS 与来源闭包 / Key / 调用方 / 目标复核；DoD：空 body 仍走全门禁、显式提议走旧 `Confirm`、`TestUS22_Confirm_*` 与 `TestUS22_Store_ConfirmCandidate*` 全绿、并发单赢家、锁序固定、审计明细不含正文。
+- [x] T015 [US2] 在 `internal/web/handlers_admin_memory.go` 解析可选确认 body，并补 `TestUS22_Confirm_BodyOptional` / `TestUS22_Confirm_ResolutionReceipt` / `TestUS22_OperationDetailResolution` / `TestUS22_MemoryEntry_CandidateMeta`；DoD：未装配 resolver 时自动候选 503 不降级、替代回执带 `superseded_id`、操作明细只追加键、候选元数据随条目返回、索引补建失败保持 `active` 只记 WARN。
+
+## Phase 5: User Story 3 - 有界窗口、冻结重试与预算 (P2)
+
+独立判据：窗口保留最近并记录丢弃、剔除工具 / 系统消息、跨来源隔离；失败只重试同一冻结窗口；第 3 次失败转 `skipped`；200 次后不建行不调用。
+
+- [x] T016 [US3] 在 `internal/memory/learning.go` 与 `internal/storage/postgres/learning_store.go` 补齐窗口冻结、前文双字节上限、按来源游标、滚动 24h 尝试预算、`failed` 同窗口重试（尝试身份绑定本次 Run）、三次失败转 `skipped`、`window_gone` 跳过；DoD：`TestUS22_Window_*` / `TestUS22_Budget_*` / `TestUS22_Retry_*` / `TestUS22_Cursor_*` / `TestUS22_Store_BudgetAtomic` / `TestUS22_Store_RetryKeepsFrozenWindow` / `TestUS22_Store_RetryUpdatesAttemptIdentity` 全绿。
+- [x] T017 [US3] 在 `internal/storage/postgres/session_store.go` 落冻结窗口完整性复核（实际条数 vs 冻结条数）与来源过滤，并补 `TestUS22_Store_MessagesSameOrigin` / `TestUS22_Store_MessagesForFrozenWindow` / `TestUS22_Window_PartialGoneSkips` / `TestUS22_Window_FullGoneSkipsAndAdvances`；DoD：部分 / 全缺都转 `skipped` 并推进游标，缺消息不返回空集合让 `failed` 永久挂起。
+
+## Phase 6: User Story 4 - 两级预写审计与有界时延 (P2)
+
+独立判据：任一预写失败调用次数为零；慢模型 8 秒仍写 `success`；工作段耗尽仍在 20 秒内落 `failed`；无 goroutine 泄漏。
+
+- [x] T018 [US4] 在 `internal/provider/service.go` 落审计预写受 13s 工作段约束、终态回填在开始时取 `min(now+5s, req.HookDeadline)`、失败回填 `min(now+2s, 钩子总截止)`；在 `internal/memory/learning.go` 落 `hookDeadline` / `fail` 与总预算；DoD：`TestUS22_Latency_*` / `TestUS22_Audit_*` / `TestUS22_Hook_BoundedAndNoGoroutineLeak` / `TestUS22_Hook_PanicRecovered` 全绿，`-race` 无泄漏，`FinishRun` 与 `ReleaseRunRefs` 各自 ≤5s。
+
+## Phase 7: User Story 5 - 召回面派生复核与失效停止召回 (P2)
+
+独立判据：来源 A 删除 / 到期后，关键词、旧关键词入口、真实工具入口与语义四条链路都不返回派生 B / C；传递链退出；深度超限 fail-closed；显式条目不受影响。
+
+- [x] T019 [US5] 在 `internal/storage/postgres/memory_store.go` 落 `derivedLiveFilterSQL` 并接入 `RecallByKeyword`、`RecallEntries` 关键词回退、`RecallEntries` 向量三个入口，补 `valid_to` 写入与 `LoadCandidateMeta`；DoD：`TestUS22_Recall_*`（存储层）/ `TestUS22_Store_InsertRowWritesValidTo` 全绿，过滤在排序与 top-k 之前，显式条目零影响。
+- [x] T020 [US5] 在 `internal/app/learning_test.go` 从真实 `recall_memory(mode=keyword)` 工具入口补 `TestUS22_Recall_ToolKeywordStopsDerived` 与传递链 / 深度 fail-closed 用例；DoD：真实入口进入一次、不只手测存储层辅助函数、有效条数不足时不回填。
+
+## Phase 8: User Story 6 - 方法草案与受控转交 (P3)
+
+独立判据：草案固定布局、只读、不可执行、不进 Agent 白名单；handoff 取锁 + 本机 CLI 主体 + 用户确认来源，只调 `Propose`。
+
+- [x] T021 [US6] 在 `internal/memory/learning.go` 落 `writeDrafts`（固定路径、`DRAFT.md` + `evidence.json`、只读、`name` / 正文校验、写盘失败丢弃该条），在 `internal/storage/postgres/learning_store.go` 落 `memory_method_drafts` 行；DoD：`TestUS22_Method_DraftNotMemory` / `TestUS22_Draft_*` 全绿，草案不写 `memory_entries`、不写脚本、Agent 文件工具不可读。
+- [x] T022 [US6] 在 `internal/app/learning_admin.go` 落 handoff 薄适配（实例锁、`cli:<OS user>`、`user_confirmed`、强制 `kind=model_proposal` 与 `ref=learning/draft/<id>`、只调用 `AdmissionAdmin.Propose`）；DoD：`TestUS22_Handoff_TakesLock` / `TestUS22_Handoff_ForcesSourceFields` / `TestUS22_Handoff_RequiresUserConfirmed` / `TestUS22_Handoff_CallsProposeOnly` 全绿，不直接评估 / 批准 / 发布。
+- [x] T023 [US6] 在 `internal/cli/learning.go`、`internal/cli/config.go` 与端口接线落 `learning handoff` 与 `LearningConfig` 严格校验；DoD：`TestUS22_CLI_Handoff*` 全绿，`cli:unknown` 在开库前拒绝，启用但名单为空 / 重复 / 非法名启动报错，未知 Agent WARN + 状态页列出。
+
+## Phase 9: User Story 7 - 崩溃恢复、只读学习查询面与迁移 (P2)
+
+独立判据：`pending` 重启只查证、不重放；`verified_at` 写入、游标推进、恢复后解除阻断；学习端点无写方法；管理台三页签无新入口。
+
+- [x] T024 [US7] 在 `internal/app/learning_recovery.go` 与 `internal/app/wire.go` 落启动恢复（扫描 `pending`、已有候选 / 草案行判 `success`、否则 `unknown`、不重放、不删草案、不写 `failed` 覆盖）；DoD：`TestUS22_Recovery_*` / `TestUS22_Unknown_NoRestartNextRunNoReplay` 全绿，恢复前同来源新窗口被阻断、恢复后解除。
+- [x] T025 [US7] 在 `internal/storage/postgres/learning_store.go` 落 `RecoverExtraction` 单事务（状态 + `verified_at` + 游标 `GREATEST`），补 `TestUS22_Store_PendingScan` / `TestUS22_Store_RecoverAdvancesCursor` / `TestUS22_Store_RecoverSetsVerifiedAt` / `TestUS22_Store_UnresolvedBlocksSameOrigin` / `TestUS22_Store_UnresolvedSkipsVerifiedUnknown`；DoD：查证与游标同事务、`skipped` 不重复写。
+- [x] T026 [US7] 在 `internal/web/handlers_learning.go`、`internal/web/admin_routes.go`、`internal/web/contract_test.go` 与 `docs/contracts/openapi.yaml` 落五个只读端点与契约；DoD：`TestUS22_LearningStatus_ReadOnly` / `TestUS22_LearningExtractions_ListAndDetail` / `TestUS22_LearningDrafts_ListAndDetail` / `TestUS22_NoWriteEndpoints` / `TestUS22_OpenAPIContract` / `TestUS22_Contracts_NoNewActionLiterals` 全绿，存储错误显式失败而非空列表。
+- [x] T027 [US7] 在 `internal/cli/learning.go`、`internal/cli/ports.go`、`internal/cli/deps.go` 落 `status` / `extractions list|show` / `drafts list|show`；DoD：`TestUS22_CLI_Status` / `TestUS22_CLI_ListShow` 全绿，查询命令不取实例锁，错误非空。
+- [x] T028 [US7] 在 `assets/console/src/views/workspace.ts`、`components/memory-entries.ts`、新增 `views/learning-records.ts`、`api-admin.ts`、`router.ts`、`tests/memory-learning.test.ts` 落「记忆」页三页签与深链，并重建 `dist`；DoD：`TestUS22_Console_*` 与 `npm --prefix assets/console run build` 全绿，无左侧「学习」入口、无 `/console/learning*` 路由、学习记录无写按钮、替代前对照且无建议禁用、往返保留 `agent`。
+
+## Phase 10: 契约、文档、E2E 与收口
+
+- [x] T029 新建 `docs/contracts/memory-learning.md`，并在 `docs/contracts/openapi.yaml` / `docs/contracts/run-and-errors.md` 追加 learning 只读端点、可选确认 body、`memory.confirm` 明细键与恢复表「学习抽取」行；按 §2.4.6 修订正常收尾条文（崩溃恢复关闭 `running` 行仍同事务）；DoD：固定字面量与实现逐字一致、`schema.pg.sql` 不改、无新增动作字面量。
+- [x] T030 在 `docs/Requirements.md:331` / `:338` 落两句修订，在 `docs/TechnicalDesign.md:635` 落候选抽取修订，在 `docs/Operations.md` 追加 `learning` 配置 / 备份 / 升级到 v11 / 失败排查，在 `docs/Compatibility.md` 记录 v11；DoD：逐字按 §2.4 提案、历史记录不改、不把未实现能力写成现状、markdownlint 零诊断。
+- [x] T031 在 `internal/e2e/us22_learning_test.go` 落六条主链（生成 → 拒绝错误候选 → 确认 → 新 Run 召回 → 删除停止召回 → 崩溃恢复）与默认关闭零副作用；DoD：真实二进制 + 隔离 schema + 回环假模型，无真实模型 / 外网 / 脚本执行，`TestUS22_E2E_*` 六个用例全绿。
+- [x] T032 跑 `make check` 七目标、`sh scripts/check-acceptance.sh --stage us22-base` 与两条 `-race` 命令；DoD：逐目标四态登记、覆盖率不低于底线（`core` / `tool` / `memory` / `storage` ≥70%，其余 ≥50%）、`CGO_ENABLED=0` 发布构建通过、`git diff go.mod go.sum assets/console/package.json` 为空。
+- [x] T033 复跑 `/speckit-analyze`（CRITICAL 清零）、独立上下文复核（findings 与未覆盖面逐条处置）并完成七项证据到 `specs/022-controlled-evolution/acceptance.md` 与 run-state；DoD：四态登记、变更总结四段、判据面逐路径核对、效果类结论保持 `未测量`、输出人工 review ② 收口包，禁止代签 / 自动提交。
+- [x] T034 补遗（T024 阶段检查发现 §4.2 app 组四个用例无归属任务）：在 `internal/app/learning_test.go` 落 `TestUS22_Hook_ExtractorNotAssembledFailsClosed` / `TestUS22_Recovery_TerminalRefsReleased` / `TestUS22_Messages_ReadOnly` / `TestUS22_Evidence_SurvivesMessageDeletion`（真实 PostgreSQL + 生产抽取服务）；DoD：四用例全绿并映射 `us22-base-app`。
+
+## Check 映射（stage `us22-base` 派生依据）
+
+| 任务 | check |
+| --- | --- |
+| T001 | —（流程证据：run-state 基线） |
+| T002 | 全部 12 个 check（stage 自身） |
+| T003 | `us22-base-pg` |
+| T004 | `us22-base-core` |
+| T005 | `us22-base-core`、`us22-base-app` |
+| T006 | `us22-base-pg`（PG 变体）、`make check` 的 `test` / `test-integration`（SQLite 变体在 `internal/storage`，不在 stage 包清单内） |
+| T007 | `us22-base-app` |
+| T008 | `us22-base-memory` |
+| T009 | `us22-base-pg` |
+| T010 | `us22-base-provider` |
+| T011 | `us22-base-memory` |
+| T012 | `us22-base-app` |
+| T013 | `us22-base-app` |
+| T014 | `us22-base-app`、`us22-base-pg`、`us22-base-race` |
+| T015 | `us22-base-web`、`us22-base-app` |
+| T016 | `us22-base-memory`、`us22-base-pg`、`us22-base-memory-race` |
+| T017 | `us22-base-pg` |
+| T018 | `us22-base-provider`、`us22-base-memory`、`us22-base-app`、`us22-base-race` |
+| T019 | `us22-base-pg` |
+| T020 | `us22-base-app` |
+| T021 | `us22-base-memory`、`us22-base-pg` |
+| T022 | `us22-base-app` |
+| T023 | `us22-base-cli`、`us22-base-app`（配置校验） |
+| T024 | `us22-base-app`、`us22-base-race` |
+| T025 | `us22-base-pg` |
+| T026 | `us22-base-web` |
+| T027 | `us22-base-cli` |
+| T028 | `us22-base-console-test`、`us22-base-console-build` |
+| T029 | `us22-base-web` |
+| T030 | —（文档修订；`docs/contracts/memory-learning.md` 在 protect 内） |
+| T031 | `us22-base-e2e` |
+| T032 | 全部 check + `make check` 七目标 |
+| T033 | —（收口三件套） |
+| T034 | `us22-base-app` |
+
+## 依赖与执行顺序
+
+- Phase 2 阻塞所有故事：T003 → T004 → T005 → T006；T007、T008 可并行；T009 依赖 T003 / T004。
+- US1 依赖 T009 / T010；US2 依赖 US1 的候选与 T013 的装配；US3 / US4 与 US1 同文件（`internal/memory/learning.go`），按 T011 → T016 → T018 顺序推进。
+- US5 的存储入口（T019）依赖 T009；真实工具入口（T020）依赖 T019 与既有 `memory/semantic.go` 链路。
+- US6 依赖 T011 的提交路径；US7 依赖 T009 / T024 / T025；T028 依赖 T026 / T027。
+- 收尾 T029–T033 依赖全部实现任务；T033 之前不得宣称完成。

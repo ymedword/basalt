@@ -302,6 +302,35 @@ func (s *Server) decodeAdminWriteBody(w http.ResponseWriter, r *http.Request, ds
 	return nil
 }
 
+// decodeAdminWriteBodyOptional 与 `decodeAdminWriteBody` 同口径，唯一差别是**空 body
+// 合法**：首解码读到 EOF 即视为全缺省（零值），不报错。它只服务确认端点——契约里
+// 确认的 body 可空，而空 body 只决定处置（keep_both），不改变任何门禁。
+// The optional-body variant accepts an empty body as all-defaults; every other rule is
+// shared with decodeAdminWriteBody.
+func (s *Server) decodeAdminWriteBodyOptional(w http.ResponseWriter, r *http.Request, dst any, message string) error {
+	r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("请求体超过 %d 字节上限", s.opts.MaxRequestBytes)
+		}
+		return errors.New(message)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return fmt.Errorf("请求体超过 %d 字节上限", s.opts.MaxRequestBytes)
+		}
+		return errors.New(message)
+	}
+	return nil
+}
+
 // writeAdminPortMissing 是装配缺失的唯一出口：缺端口是装配错误，不是空结果，也不是
 // 客户端的错——记 ERROR 并回固定 500（与 US-11 只读面的缺端口口径一致）。
 // A missing write port is an assembly error: ERROR log plus a fixed 500.

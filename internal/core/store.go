@@ -93,11 +93,25 @@ type RunStore interface {
 	// never fabricated.
 	StartRun(ctx context.Context, rec RunRecord, manifest RunResourceManifest) error
 
-	// FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at）。
-	// 写失败**不得**覆盖已得结果：调用方如实返回 RunResult，行留给下次启动的恢复扫描收尾。
-	// FinishRun writes the terminal state onto the same row. A write failure must not
-	// overwrite an obtained result: the caller returns it as-is and recovery closes the row.
-	FinishRun(ctx context.Context, runID string, status RunStatus, reason string, iterations, toolCalls int, now time.Time) error
+	// FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at），
+	// 并返回**本次调用是否真正完成了状态转换**（`applied`）：目标是终态（已终态 / 已删除）
+	// 时命中 0 行、返回 false。写失败**不得**覆盖已得结果：调用方如实返回 RunResult，
+	// 行留给下次启动的恢复扫描收尾。`applied` 是记忆抽取钩子的唯一触发判据——写失败或
+	// 幂等未转换一律不抽取（C-05）。
+	// FinishRun writes the terminal state and reports whether this call performed the
+	// transition (applied). Zero rows — already terminal or deleted — returns false. A
+	// write failure must not overwrite an obtained result; recovery closes the row later.
+	// applied is the extraction hook's only trigger condition.
+	FinishRun(ctx context.Context, runID string, status RunStatus, reason string, iterations, toolCalls int, now time.Time) (applied bool, err error)
+
+	// ReleaseRunRefs 释放该 Run 的资源 / 凭据 / 通知三类引用（幂等，已释放的行跳过）。
+	// 调用时机固定在终态落库与抽取钩子**之后**、无条件执行：钩子要读的运行期客户端
+	// 依赖这些引用仍然有效。释放失败只记 ERROR，已终态未释放的行由下次启动的
+	// `releaseTerminalRefs` 兜底补齐（C-05）。
+	// ReleaseRunRefs releases the run's resource/credential/notification refs. It runs
+	// unconditionally after the terminal write and the extraction hook, because the hook
+	// needs those refs alive. A failure is logged and closed by startup recovery.
+	ReleaseRunRefs(ctx context.Context, runID string, now time.Time) error
 
 	// GetRun 取单条运行详情（含准入清单）；不存在返回 ErrRunNotFound。
 	// GetRun returns one run detail including its admission manifest, or ErrRunNotFound.

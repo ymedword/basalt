@@ -1543,7 +1543,7 @@ CLI连接已经运行的实例，不启动第二写实例。远程地址必须HT
 
 每次启动先沿用原调用／Run恢复，再核对Flow检查点。原成功Run及完整审计／消息可复用，避免重复模型或工具调用；资源换版、撤权、来源失效或结果未知则保持`blocked`。写工具只允许代码归类的受控固定节点，Agent节点只读。幂等声明、文件内容碰巧相同或模型自述均不能解除未知副作用；缺少可信查证结果时不得自动重放，也没有「强制成功」入口。修复依赖后显式恢复仍会重新核对原身份与当前证据，不能换Key或新revision绕过unknown。
 
-验收中的本地50ms模型只证明控制协议、资源边界和时延；不代表真实模型质量或业务效果优势。真实模型对照须另行授权。首次正式发布仍安排在US25收口后，由用户指定版本并触发。
+验收中的本地50ms模型只证明控制协议、资源边界和时延；不代表真实模型质量或业务效果优势。真实模型对照须另行授权。首次正式发布仍安排在US-25（Compose 多 Worker 交付）收口后，由用户指定版本并触发；K8s 档由 US-23／US-25A 后续交付，不阻塞首发。
 
 ### US19 默认采购工作流
 
@@ -1597,3 +1597,31 @@ basalt admission withdraw adm_... --reason '回退到上一版'
 - 操作行 `unknown`（带 `recovered_at` / `verification`）表示崩溃恢复无法判定：只查证、不重放，**不得**手工改成 `success`，也**不得**删候选目录「重来」——先按操作标识核对库行与 `.basalt/admissions/candidates/<candidate_id>/` 是否存在。
 - `propose` 崩溃可能留下孤儿候选目录（行不存在、目录存在）；恢复只报告不删除，人工核对后再处置。
 - `approved` 显示为 `expired` 是**派生展示态**（库内仍是 `approved`）：重新评估或重申批准才能再发布，**不得**用 SQL 改状态。过期没有后台扫描，也不会自动回滚。
+
+## 学习抽取（US-22）
+
+学习抽取把已完成 Run 中有长期价值的用户陈述提炼成**记忆候选**：候选以 `state='candidate'`、`source='auto_extract'` 落库，不参与召回与注入，只有人工确认才晋升为 `active`；抽取只产生候选，不自动产生生效条目，也不自动纠正 / 删除。出厂默认关闭，未启用时零写入、零模型调用。契约见 [记忆学习契约](contracts/memory-learning.md)。
+
+### 启用与生效
+
+```yaml
+learning:
+  auto_extract: true        # 唯一启用开关；缺省 false
+  agents: [assistant, ops]  # 启用时必须至少一个；空 / 重名 / 非法名启动即报错
+```
+
+名单只决定哪些 Agent 在 Run 结束时触发抽取；名单内尚未注册的 Agent 只记 WARN 并在状态视图列出，不抽取、不阻止启动。抽取条件固定：Run 终态**已真正落库**（`applied` 且 `completed`）、渠道为 web / cli、非 Flow、非固定工具；写失败或幂等未转换一律跳过。配置在 `serve` 启动时读取，修改后**重启**生效；开关关闭时也校验已写名单的写法（拼错的名单不能当"没启用"糊过去）。钩子同步、有界（端到端 ≤20 秒），不起 goroutine，失败不改变 Run 的终态 / 返回 / 错误。
+
+### 预算与失败排查
+
+每 Agent 每滚动 24 小时最多 200 次抽取尝试（代码常量，不可配置）；预算判定与 pending 行写入同事务并取 Agent 锁，耗尽时不建行、不调用模型。同一冻结窗口至多尝试 3 次，之后转 `skipped` 并推进游标。
+
+- 状态与记录：`GET /api/v1/learning/status`、抽取列表 / 详情、草案列表 / 详情（`basalt learning status` / `extractions` / `drafts` 只读命令同源）；管理台并入「记忆 → 学习记录」页签，没有启停、手动抽取 / 重试 / 发布按钮。
+- 失败分类落库：`model_error` / `invalid_output` / `timeout` / `audit_unavailable` / `extractor_unavailable` / `window_gone`；`window_gone`（冻结窗口已不可读）直接转 `skipped`，不按失败重试。
+- `unknown` 表示崩溃恢复无法判定（已有候选元数据或草案行 → `success`，两者都不在 → `unknown`）：只查证、不重放，**不得**重读消息、重调模型或插入候选；未查证的同来源新窗口被阻断，查证后不再阻断。
+
+### 备份与升级
+
+首次启动自动前向迁移到 schema v11（`0011_memory_learning.sql`：新增 `memory_extractions` / `memory_extraction_cursors` / `memory_candidate_meta` / `memory_candidate_sources` / `memory_method_drafts` 五张表，并把 `memory_entries.source` 闭集扩到含 `auto_extract`、`llm_calls.purpose` 闭集扩到含 `memory_extract`）；迁移 0001–0010 不改写，旧二进制拒绝打开 v11 库，回退须恢复升级前的同版本数据库 / 工作区快照。升级前按 §5.1 做停机备份。
+
+方法草案写在 `<工作区>/.basalt/learning/drafts/<draft_id>/`（`DRAFT.md` + `evidence.json`，文件 0444、目录 0555），随 `.basalt/` 整目录备份（§4.1），不纳入自动清理；该目录**不在**任何 Agent 读写白名单。草案只能经 `basalt learning handoff`（本机 CLI、实例锁、用户确认来源）转交 US-21 的技能准入提议入口；评估 / 批准 / 发布仍全部归学习准入。

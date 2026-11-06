@@ -27,12 +27,21 @@ type ProviderService struct {
 	clients map[string]core.ProviderClient
 	models  map[string]string
 	store   core.LLMCallStore
-	logger  *slog.Logger
+	// memoryStore 是 purpose='memory_extract' 的专用预写面（US-22）；nil = 该视图不支持
+	// 抽取，`ChatMemoryExtract` 在预写处 fail-closed，**不得**退回 `purpose='chat'`。
+	// memoryStore is the dedicated pre-write surface for memory_extract; nil means the
+	// view cannot extract and must fail closed rather than fall back to purpose='chat'.
+	memoryStore core.MemoryExtractCallStore
+	logger      *slog.Logger
 }
 
 // 编译期断言：路由面与单供应商面同形——调用方不必知道自己在跟谁说话。
 // Compile-time assertion that the routing face has the same shape as a single provider.
 var _ core.ProviderClient = (*ProviderService)(nil)
+
+// 编译期断言：抽取调用面由本服务唯一实现（颗粒度文档 §3.1.6）。
+// Compile-time assertion that this service is the extraction call surface.
+var _ core.MemoryExtractor = (*ProviderService)(nil)
 
 // NewProviderService 装配服务；映射表与模型表由装配处逐条构造后传入（不遍历推断）。
 // NewProviderService wires the service to the maps built entry by entry at assembly time.
@@ -45,6 +54,17 @@ func NewProviderService(clients map[string]core.ProviderClient, models map[strin
 	return &ProviderService{clients: clients, models: models, store: store, logger: logger}
 }
 
+// clientFor 是路由的唯一实现：只查显式映射表——不遍历、不推断、不取"唯一的那个"当默认
+// （宪法 III）。聊天与抽取共用，两条路径的语义完全一致。
+// clientFor is the single routing implementation; chat and extraction share it.
+func (s *ProviderService) clientFor(providerName string) (core.ProviderClient, error) {
+	client, ok := s.clients[providerName]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", core.ErrProviderNotConfigured, providerName)
+	}
+	return client, nil
+}
+
 // Chat 是契约 §2.3 流程 B 的落地：三道拒绝都在预写之前（无审计行）；预写失败即拒绝发出；
 // 调用返回后无论成败都回填终态（取消路径亦然）。返回的调用结果**不因审计写失败而改写**。
 // Chat follows flow B: the three rejections happen before the pre-write (no audit row),
@@ -52,9 +72,8 @@ func NewProviderService(clients map[string]core.ProviderClient, models map[strin
 // outcomes. Audit write failures never rewrite the call result.
 func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
 	// 1. 路由：只查表——不遍历（Go map 遍历顺序随机）、不推断、不取"唯一的那个"当默认。
-	client, ok := s.clients[req.Provider]
-	if !ok {
-		err := fmt.Errorf("%w: %s", core.ErrProviderNotConfigured, req.Provider)
+	client, err := s.clientFor(req.Provider)
+	if err != nil {
 		s.logger.Warn("provider 不在显式映射表内——拒绝发出", "provider", req.Provider,
 			"run_id", req.RunID, "error", err)
 		return core.ChatResponse{}, err
@@ -186,6 +205,132 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	return resp, chatErr
 }
 
+// WithMemoryExtractStore 返回共享客户端、模型表、日志与聊天审计仓储的新实例，并装上抽取
+// 预写面；装配期调用，运行期只读。未设置该仓储时 `ChatMemoryExtract` 拒绝发出（fail-closed）。
+// WithMemoryExtractStore returns a new view that shares the routing map, model map, logger
+// and chat audit store, plus the extraction pre-write surface.
+func (s *ProviderService) WithMemoryExtractStore(store core.MemoryExtractCallStore) *ProviderService {
+	clone := *s
+	clone.memoryStore = store
+	return &clone
+}
+
+// ChatMemoryExtract 是唯一允许的抽取调用入口（颗粒度文档 §3.1.6）：查显式映射表 →
+// 固定 `round=0` → `BeginMemoryExtractCall(pending)` → 一次调用（不重试、不 fallback、
+// 无工具、无 Flow）→ `FinishCall`。任一预写失败返回 `*core.ErrAuditWrite`（包装底层错误），
+// 调用不发出。
+//
+// 截止口径（FR-22-10）：预写用 `context.WithTimeout(ctx, 5s)` 继承工作段截止，**不**
+// `WithoutCancel` 外扩；终态回填在**开始回填时**计算 `min(now+5s, HookDeadline)`，再以
+// `context.WithDeadline(context.WithoutCancel(ctx), …)` 写入——预先算死会让慢模型正常返回
+// 时回填上下文已过期，成功审计落不了库。
+// ChatMemoryExtract is the only extraction entry: explicit map, round=0, pre-write,
+// exactly one call, terminal write. The finalize deadline is computed when finalize
+// starts, never at call start.
+func (s *ProviderService) ChatMemoryExtract(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
+	// 1. 路由与关联校验：全部在预写之前——拒绝即无审计行，且确定没有发出调用。
+	client, err := s.clientFor(req.Provider)
+	if err != nil {
+		s.logger.Warn("provider 不在显式映射表内——抽取拒绝发出", "provider", req.Provider,
+			"run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, err
+	}
+	if req.RunID == "" || req.Round != 0 {
+		err = fmt.Errorf("抽取调用关联标识非法（provider=%s）：run_id 不得为空、round 必须为 0（实际 round=%d）",
+			req.Provider, req.Round)
+		s.logger.Warn("抽取调用关联标识非法——拒绝发出", "provider", req.Provider,
+			"run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, err
+	}
+	// 抽取调用不是对话轮：Flow 的模型许可与工具定义都不属于它（§3.1.6）。
+	if req.Flow != nil {
+		err = fmt.Errorf("抽取调用不得携带 Flow（provider=%s）", req.Provider)
+		s.logger.Warn("抽取调用携带 Flow——拒绝发出", "provider", req.Provider,
+			"run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, err
+	}
+	if len(req.Tools) > 0 {
+		err = fmt.Errorf("抽取调用不得携带工具定义（provider=%s，tools=%d）", req.Provider, len(req.Tools))
+		s.logger.Warn("抽取调用携带工具定义——拒绝发出", "provider", req.Provider,
+			"run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, err
+	}
+	req.Model = s.resolveModel(req)
+	if req.Model == "" {
+		err = fmt.Errorf("无法解析生效模型（provider=%s）：请求模型与供应商缺省模型都为空", req.Provider)
+		s.logger.Warn("模型无法解析——抽取拒绝发出", "provider", req.Provider,
+			"run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, err
+	}
+	if s.memoryStore == nil {
+		// 装配缺陷：绝不能用聊天预写顶替（那会把用途写成 chat，破坏审计口径）。
+		s.logger.Error("抽取预写仓储未装配——拒绝发出该次调用（fail-closed）",
+			"provider", req.Provider, "run_id", req.RunID)
+		return core.ChatResponse{}, fmt.Errorf("%w: memory_extract store is nil",
+			core.ErrLearningExtractorUnavailable)
+	}
+
+	// 2. 预写：受工作段截止约束（不 WithoutCancel 外扩），失败即拒绝发出（宪法 V）。
+	beginCtx, cancelBegin := context.WithTimeout(ctx, auditWriteTimeout)
+	callID, err := s.memoryStore.BeginMemoryExtractCall(beginCtx, core.LLMCall{
+		RunID:      req.RunID,
+		SessionID:  req.SessionID,
+		Round:      req.Round,
+		Provider:   req.Provider,
+		Model:      req.Model,
+		ConfigHash: req.ConfigHash,
+		CreatedAt:  time.Now(),
+	})
+	cancelBegin()
+	if err != nil {
+		s.logger.Error("抽取审计预写失败——拒绝发出该次调用（fail-closed）", "provider", req.Provider,
+			"model", req.Model, "run_id", req.RunID, "error", err)
+		return core.ChatResponse{}, fmt.Errorf("%w: %w", core.ErrAuditWrite, err)
+	}
+
+	// 3. 发出：一次调用、不重试、不 fallback。
+	start := time.Now()
+	resp, callErr := client.Chat(ctx, req)
+	duration := time.Since(start)
+
+	// 4. 终态回填：截止在**开始回填时**才计算（慢调用正常返回仍要能写 success）。
+	finalizeCtx, cancelFinalize := memoryExtractFinalizeContext(ctx, req.HookDeadline)
+	defer cancelFinalize()
+
+	if callErr == nil {
+		s.finish(finalizeCtx, callID, core.LLMCallResult{
+			Status:           core.LLMCallSuccess,
+			Duration:         duration,
+			PromptTokens:     resp.Usage.PromptTokens,
+			CompletionTokens: resp.Usage.CompletionTokens,
+			TotalTokens:      resp.Usage.TotalTokens,
+		})
+		return resp, nil
+	}
+
+	kind := classifyError(callErr, ctx.Err())
+	s.logger.Warn("抽取模型调用失败", "provider", req.Provider, "model", req.Model,
+		"run_id", req.RunID, "error_kind", string(kind), "error", callErr)
+	s.finish(finalizeCtx, callID, core.LLMCallResult{
+		Status:       core.LLMCallFailed,
+		ErrorMessage: callErr.Error(), // 原样记录——脱敏在客户端边界做完（约束 8）
+		ErrorKind:    kind,
+		Duration:     duration,
+	})
+	return resp, callErr
+}
+
+// memoryExtractFinalizeContext 在开始回填时计算截止：`min(now+5s, HookDeadline)`；零值
+// HookDeadline 表示不额外限制。取消继承被摘除——被取消 / 超时的调用同样要落终态。
+// memoryExtractFinalizeContext computes min(now+5s, HookDeadline) when finalize starts.
+func memoryExtractFinalizeContext(ctx context.Context, hookDeadline time.Time) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(auditWriteTimeout)
+	if !hookDeadline.IsZero() && hookDeadline.Before(deadline) {
+		deadline = hookDeadline
+	}
+	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
+}
+
 func (s *ProviderService) recordTransportTiming(ctx context.Context, req core.ChatRequest, callID int64) {
 	if req.Timing == nil {
 		return
@@ -216,10 +361,11 @@ func (s *ProviderService) Pinned(name string) (*ProviderService, bool) {
 		models[name] = model
 	}
 	return &ProviderService{
-		clients: map[string]core.ProviderClient{name: client},
-		models:  models,
-		store:   s.store,
-		logger:  s.logger,
+		clients:     map[string]core.ProviderClient{name: client},
+		models:      models,
+		store:       s.store,
+		memoryStore: s.memoryStore,
+		logger:      s.logger,
 	}, true
 }
 

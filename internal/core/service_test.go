@@ -52,7 +52,7 @@ func newRecordingStore() *recordingStore {
 
 // FinishRun 先记录列面再落库。
 // FinishRun records the column surface before delegating to the wrapped store.
-func (s *recordingStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) error {
+func (s *recordingStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
 	s.mu.Lock()
 	s.iters[runID] = iterations
 	s.calls[runID] = toolCalls

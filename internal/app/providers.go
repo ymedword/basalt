@@ -425,11 +425,40 @@ type catalogProviderRouter struct {
 	catalog *providerCatalogStore
 	store   core.LLMCallStore
 	logger  *slog.Logger
+	// memoryStore 是 purpose='memory_extract' 的专用预写面（US-22）；nil = 装配方没有装入
+	// 该面（本仓生产装配在 `wire.go` 总会装入；单测可省略），冻结视图的 `ChatMemoryExtract`
+	// 在预写处 fail-closed，**不**退回聊天审计。
+	// memoryStore is the extraction pre-write surface; when nil (only an assembly that
+	// skipped it — production always installs it in wire.go) the frozen view fails closed
+	// instead of falling back to the chat audit.
+	memoryStore core.MemoryExtractCallStore
 }
 
 // 编译期断言：运行入口与准入端口看到的是同一个模型客户端面。
 // Compile-time assertion that the router is a model client in its own right.
 var _ core.ProviderClient = (*catalogProviderRouter)(nil)
+
+// 路由器**不得**实现 `core.MemoryExtractor`（US-22 §3.1.6）：它按调用发生那一刻的
+// 快照路由，不是 Run 准入时冻结的视图。若它满足抽取接口，`RunEnv.ProviderClient()`
+// 的类型断言会在资源未装配时成功，抽取将路由到准入后变更的 provider（违反原则 III）。
+// 抽取只认 `ProviderService` 这条准入冻结视图，本类型刻意**没有** `ChatMemoryExtract`。
+// The router deliberately has no ChatMemoryExtract: it routes against the live snapshot,
+// not the view frozen at admission. If it satisfied MemoryExtractor, extraction could be
+// routed to a provider published after admission, violating principle III.
+
+// WithMemoryExtractStore 返回带抽取预写面的**新**路由器（装配期一次调用，运行期只读）：
+// 与目录快照的写时复制同一口径，旧路由器不被原地修改。此后 `Pinned` 构造的一行视图
+// 必须携带该仓储，否则冻结视图写不出 `purpose='memory_extract'` 的审计行。
+// WithMemoryExtractStore returns a new router carrying the extraction pre-write surface;
+// from then on Pinned's one-entry views carry it too.
+func (r *catalogProviderRouter) WithMemoryExtractStore(store core.MemoryExtractCallStore) *catalogProviderRouter {
+	if r == nil {
+		return nil
+	}
+	clone := *r
+	clone.memoryStore = store
+	return &clone
+}
 
 // newCatalogProviderRouter 装配运行期路由；日志器缺省与 `provider.NewProviderService`
 // 同口径（nil 用 slog.Default，不另造一份）。
@@ -460,8 +489,13 @@ func (r *catalogProviderRouter) Pinned(name string) (*provider.ProviderService, 
 	if model, ok := snapshot.models[name]; ok {
 		models[name] = model
 	}
-	return provider.NewProviderService(
-		map[string]core.ProviderClient{name: client}, models, r.store, r.logger), true
+	service := provider.NewProviderService(
+		map[string]core.ProviderClient{name: client}, models, r.store, r.logger)
+	// 冻结视图必须携带抽取预写面（US-22 §3.1.6）：不携带时 `ChatMemoryExtract` 在预写处
+	// fail-closed，而不是静默退回 `purpose='chat'`——后者会让抽取费用记进对话审计。
+	// The pinned view must carry the extraction pre-write surface; a missing surface fails
+	// the extraction closed instead of quietly charging it to the chat audit.
+	return service.WithMemoryExtractStore(r.memoryStore), true
 }
 
 // SummaryPinned 返回当前快照里某个 Provider 的**裸协议客户端**，只服务会话压缩的

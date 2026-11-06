@@ -40,15 +40,18 @@ import (
 // 7 = `0007_history_retention.sql`（关联历史保留账本，只记录清理组与行数）；
 // 8 = `0008_flow.sql`（持久流程、版本化验收与动作／祖先预算账本）；
 // 9 = `0009_sandbox_execution.sql`（任务隔离生命周期与清理账本）；
-// 10 = `0010_skill_admission.sql`（技能学习准入候选、评估、决策与发布记录）。
+// 10 = `0010_skill_admission.sql`（技能学习准入候选、评估、决策与发布记录）；
+// 11 = `0011_memory_learning.sql`（记忆抽取账本、游标、候选元数据、候选来源与方法草案，
+// 并扩展 source / purpose 两个闭集）。
 // 迁移只追加，**不得**回头改建表字面量——既有库已经按 v1 建过表。
 // Version chain: 1 is the frozen contract baseline, 2 widens the binding kind set,
 // 3 repairs source_text; 4 gives immutable knowledge versions ordered revisions;
 // 5 adds the user-managed collection description with its optimistic-concurrency token;
 // 6 adds observability correlation and non-authoritative telemetry ledgers;
 // 7 appends the related-history retention ledger; 8 adds durable Flow ledgers;
-// 9 adds the sandbox execution ledger; 10 adds the skill admission ledgers.
-const SupportedSchemaVersion = 10
+// 9 adds the sandbox execution ledger; 10 adds the skill admission ledgers;
+// 11 adds the memory learning ledgers and widens the source/purpose closed sets.
+const SupportedSchemaVersion = 11
 
 // undefinedTableSQLState 是 PostgreSQL 的 `undefined_table`（42P01）：它把"版本表不存在"
 // 从其他查询失败里区分出来，避免把连接故障误判成"未初始化"。

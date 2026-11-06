@@ -40,14 +40,16 @@ func (r *flowAdvanceRunner) Run(ctx context.Context, req flow.NodeRunRequest) (f
 		if r.release != nil {
 			<-r.release
 		}
-		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		// 1s → 15s（2026-11-06）：夹具写回终态的上限而非断言，正常路径写完即返回。
+		// 与 internal/flow 同族夹具同步抬高，避免并行判卷下 PG 争用把上限打穿。
+		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
-		if err := runs.FinishRun(finish, req.Attempt.RunID, core.StatusCancelled, "cancelled", 0, 0, time.Now()); err != nil {
+		if _, err := runs.FinishRun(finish, req.Attempt.RunID, core.StatusCancelled, "cancelled", 0, 0, time.Now()); err != nil {
 			return flow.NodeRunResult{}, err
 		}
 		return flow.NodeRunResult{Run: core.RunResult{RunID: req.Attempt.RunID, Status: core.StatusCancelled}}, nil
 	}
-	if err := runs.FinishRun(ctx, req.Attempt.RunID, core.StatusCompleted, "", 1, 0, time.Now()); err != nil {
+	if _, err := runs.FinishRun(ctx, req.Attempt.RunID, core.StatusCompleted, "", 1, 0, time.Now()); err != nil {
 		return flow.NodeRunResult{}, err
 	}
 	return flow.NodeRunResult{Run: core.RunResult{RunID: req.Attempt.RunID, Status: core.StatusCompleted, FinalText: string(r.output), Iterations: 1}, Output: r.output}, nil
