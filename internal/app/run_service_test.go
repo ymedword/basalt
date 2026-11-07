@@ -52,12 +52,12 @@ func seedRunServiceRow(t *testing.T, runs *postgres.RunStore, runID, agent strin
 	// 零清单 = 装配未接线：只写运行行，读取面如实呈现"未记录"（约束 24）。
 	// PostgreSQL 的归属列（caller_id / authorizing_kind / actor）为 NOT NULL +
 	// CHECK，Run 必须携带有效 Principal——夹具按管理面身份建行，读面无归属断言。
-	require.NoError(t, runs.StartRun(ctx, core.RunRecord{
+	require.NoError(t, startRunTest(runs, ctx, core.RunRecord{
 		RunID: runID, Agent: agent, Channel: "web", UserID: "u-1",
 		Principal: core.LocalAdminPrincipal(), StartedAt: startedAt,
 	}, core.RunResourceManifest{}))
 	if status != core.StatusRunning {
-		_, err := runs.FinishRun(ctx, runID, status, "", 1, 0, startedAt.Add(time.Minute))
+		_, err := runs.FinishRun(ctx, runID, core.LeaseToken{}, status, "", 1, 0, startedAt.Add(time.Minute))
 		require.NoError(t, err)
 	}
 }

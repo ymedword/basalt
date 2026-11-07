@@ -267,7 +267,7 @@ func TestNotifyMode_MidRunChangeKeepsFrozen(t *testing.T) {
 	runs := postgres.NewRunStore(env.db)
 	// 归属三列（caller_id / authorizing_kind / actor）在 PostgreSQL 是 NOT NULL +
 	// CHECK：Run 必须携带有效 Principal，夹具按内置管理员形态建行。
-	require.NoError(t, runs.StartRun(ctx, core.RunRecord{
+	require.NoError(t, startRunTest(runs, ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
 		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))
@@ -298,7 +298,7 @@ func TestNotifyMode_MidRunChangeKeepsFrozen(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, unblocked, "准入之后才出现的渠道没有被任何在途 Run 冻结")
 
-	applied, err := runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0, baselineClock())
+	applied, err := runs.FinishRun(ctx, runID, core.LeaseToken{}, core.StatusCompleted, "", 1, 0, baselineClock())
 	require.NoError(t, err)
 	require.True(t, applied)
 	require.NoError(t, runs.ReleaseRunRefs(ctx, runID, baselineClock()))
@@ -490,7 +490,7 @@ func TestNotifyDelivery_ExecutorWritesDerivedRow(t *testing.T) {
 		})
 	require.NoError(t, err)
 	runID := "webhook-1700000000100-delivery"
-	require.NoError(t, postgres.NewRunStore(env.db).StartRun(ctx, core.RunRecord{
+	require.NoError(t, startRunTest(postgres.NewRunStore(env.db), ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
 		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))

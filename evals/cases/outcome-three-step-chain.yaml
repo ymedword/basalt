@@ -1,0 +1,103 @@
+# 读数：业务结果 —— 三步工具链（列目录 → 读第一个文件 → 读第二个文件）跑完后，
+# 最终回答是否同时用上了后两步读到的内容。
+#
+# US-24 语境：每次运行都经资产校验（本地 bundle ↔ 共享发布记录）与 run 租约 / 归属代次
+# 保护，助手消息追加、工具结果回填、状态推进都走同一套归属保护写入。本用例**只断言
+# 模型面读数**（状态 / 工具序列 / 最终文本 / 工具结果 / 审计 / 调用次数 / 用量）——
+# 租约、代次与资产校验属执行底座，任何一项进入模型可见的消息或工具结果都会让这些
+# 逐位断言变红。跨轮次越多，越能暴露"某一轮的写入被归属保护误伤"这类问题。
+id: outcome-three-step-chain
+kind: 业务结果
+provider: ""
+description: 三步工具链（list_dir → read_file → read_file）——期望顺序逐位正确、最终回答合并两个文件的事实
+message: 先列一下 reports 目录，再读 alpha.md 和 archive/summary.txt，告诉我发布窗口和归档情况。
+fixture:
+  agent: chain-agent
+  agent_md: |
+    ---
+    name: chain-agent
+    description: 评测夹具——业务结果读数（三步链）
+    provider:
+      name: probe
+      model: eval-probe-model
+    tools:
+      - list_dir
+      - read_file
+    settings:
+      max_iterations: 10
+    ---
+
+    你是评测夹具 Agent：按顺序读齐材料，最后用一句话合并回答。
+  files:
+    reports/alpha.md: |
+      # Alpha 报告
+      发布窗口：周三 22:00。
+    reports/beta.md: |
+      # Beta 报告
+      发布窗口：周五 22:00。
+    archive/summary.txt: |
+      归档：2026-10 已完成 3 次发布。
+budget:
+  max_iterations: 6
+  max_tool_calls: 8
+  context_tokens: 32768
+script:
+  - content: 先列一下 reports 目录。
+    usage:
+      prompt: 150
+      completion: 16
+      total: 166
+    tool_calls:
+      - id: call-chain-1
+        name: list_dir
+        arguments: '{"path": "reports"}'
+  - content: 目录里有两个文件，我读 alpha.md。
+    usage:
+      prompt: 260
+      completion: 22
+      total: 282
+    tool_calls:
+      - id: call-chain-2
+        name: read_file
+        arguments: '{"path": "reports/alpha.md"}'
+  - content: 再读归档摘要。
+    usage:
+      prompt: 360
+      completion: 20
+      total: 380
+    tool_calls:
+      - id: call-chain-3
+        name: read_file
+        arguments: '{"path": "archive/summary.txt"}'
+  - content: alpha.md 的发布窗口是周三 22:00，归档显示 2026-10 已完成 3 次发布。
+    usage:
+      prompt: 460
+      completion: 28
+      total: 488
+expect:
+  status: completed
+  tool_sequence:
+    - list_dir
+    - read_file
+    - read_file
+  text_contains:
+    - 周三 22:00
+    - 3 次发布
+  tool_results_contain:
+    # 第一步读数的证据：目录列表里点名了两个文件。
+    - alpha.md
+    - beta.md
+    # 第二步读数的证据：文件正文被原样喂回模型。
+    - 发布窗口：周三
+    # 第三步读数的证据：另一个目录下的文件同样被原样喂回。
+    - 已完成 3 次发布
+  audit:
+    - tool_call_id: call-chain-1
+      status: success
+    - tool_call_id: call-chain-2
+      status: success
+    - tool_call_id: call-chain-3
+      status: success
+  llm_calls: 4
+  min_total_tokens: 1316
+  usage_complete: true

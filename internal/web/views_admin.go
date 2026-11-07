@@ -593,31 +593,35 @@ const (
 	NotifyModeSourceLegacy   = "legacy_inferred"
 )
 
-// ErrorDataView 是失败信封 `data` 的白名单投影：只允许契约固定的四个字符串数组
-// （agents / active_runs / run_ids / problems）、条件写的当前 ETag（current_etag）、
-// `pending` 之后失败的 `operation_id`（约束 1a：失败行必须可经
+// ErrorDataView 是失败信封 `data` 的白名单投影：只允许契约固定的字符串数组
+// （agents / active_runs / run_ids / problems / unmet_predicates）、条件写的当前 ETag
+// （current_etag）、`pending` 之后失败的 `operation_id`（约束 1a：失败行必须可经
 // `GET /operations/{id}` 追查）、`RESOURCE_UID_MISMATCH` 的当前 `resource_uid` 与
 // `POST /search` 的稳定 `reason_code`（US-16）。其余键——定义正文、凭证、内部路径
 // ——**不得**经由本结构出站。
-// ErrorDataView is the whitelisted failure payload: the four string arrays, the
+// `unmet_predicates` 是归档超时 409 AGENT_BUSY 的判据编号（FR-24-41）：操作员要能
+// 就地看出是哪一条（在跑行 / 未决审计 / 引用未释放 / 未决投递）没达成，而不是只拿到
+// run_ids 去猜。
+// ErrorDataView is the whitelisted failure payload: the string arrays, the
 // current ETag of a conditional write, the operation id of a post-pending failure,
 // the current resource uid of a uid mismatch, the live execution profile of a
-// direction mismatch, and the contract's search reason code; definition bodies and
-// credentials have no carrier here.
-// 四个数组用指针区分"未携带"（nil，字段省略）与"携带空数组"（非 nil 空切片，
+// direction mismatch, the archive predicates that are still unmet, and the
+// contract's search reason code; definition bodies and credentials have no carrier here.
+// 数组用指针区分"未携带"（nil，字段省略）与"携带空数组"（非 nil 空切片，
 // 输出 `[]`）——`omitempty` 会把空切片也省略掉，契约不允许。`current_etag` /
 // `operation_id` / `current_profile` 同理：空串视为未携带。
 // Pointer fields distinguish "absent" from "present but empty"; omitempty alone would
 // drop an empty array, which the contract requires to render as [].
 type ErrorDataView struct {
-	Agents         *[]string `json:"agents,omitempty"`
-	ActiveRuns     *[]string `json:"active_runs,omitempty"`
-	RunIDs         *[]string `json:"run_ids,omitempty"`
-	Problems       *[]string `json:"problems,omitempty"`
-	CurrentETag    *string   `json:"current_etag,omitempty"`
-	OperationID    *string   `json:"operation_id,omitempty"`
-	ResourceUID    *string   `json:"resource_uid,omitempty"`
-	CurrentProfile *string   `json:"current_profile,omitempty"`
+	Agents          *[]string `json:"agents,omitempty"`
+	ActiveRuns      *[]string `json:"active_runs,omitempty"`
+	RunIDs          *[]string `json:"run_ids,omitempty"`
+	Problems        *[]string `json:"problems,omitempty"`
+	UnmetPredicates *[]string `json:"unmet_predicates,omitempty"`
+	CurrentETag     *string   `json:"current_etag,omitempty"`
+	OperationID     *string   `json:"operation_id,omitempty"`
+	ResourceUID     *string   `json:"resource_uid,omitempty"`
+	CurrentProfile  *string   `json:"current_profile,omitempty"`
 	// ReasonCode 是契约点名的稳定原因码（US-16：`POST /search` 两路皆失败时的
 	// `data.reason_code`），取值是冻结枚举而不是自由文本——调用方要能机判"哪一路
 	// 不可用"，所以它必须是结构字段，不能拼进 message。
@@ -625,9 +629,10 @@ type ErrorDataView struct {
 	ReasonCode *string `json:"reason_code,omitempty"`
 }
 
-// errorDataView 从 `core.AdminError` 的 data 里只取四个固定数组、`current_etag`、
-// `operation_id`、`resource_uid` 与 `current_profile`；值与契约形状不符的同名键
-// （非 []string / 非非空字符串）按"没有该键"处理——宁可不给，也不出站未知形状。
+// errorDataView 从 `core.AdminError` 的 data 里只取固定数组（含 `unmet_predicates`）、
+// `current_etag`、`operation_id`、`resource_uid` 与 `current_profile`；值与契约形状
+// 不符的同名键（非 []string / 非非空字符串）按"没有该键"处理——宁可不给，也不出站
+// 未知形状。
 // 第二个返回值为真表示至少带了一个白名单字段——空数组也算携带（输出 `[]`），
 // 空串 ETag / 操作标识 / 档位不算。
 // errorDataView extracts only the whitelisted keys; anything else is dropped.
@@ -649,6 +654,9 @@ func errorDataView(err error) (ErrorDataView, bool) {
 	}
 	if list, ok := stringListField(raw, "problems"); ok {
 		view.Problems, present = &list, true
+	}
+	if list, ok := stringListField(raw, "unmet_predicates"); ok {
+		view.UnmetPredicates, present = &list, true
 	}
 	if etag, ok := raw["current_etag"].(string); ok && etag != "" {
 		view.CurrentETag, present = &etag, true

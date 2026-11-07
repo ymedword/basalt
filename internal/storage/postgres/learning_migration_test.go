@@ -81,7 +81,7 @@ func TestUS22_Migration_SourcePurposeExtended(t *testing.T) {
 	require.NoError(t, ensureSchema(ctx, conn, SupportedSchemaVersion), "v10 库必须能前向迁到 v11")
 	version, err = schemaVersion(ctx, conn)
 	require.NoError(t, err)
-	require.Equal(t, 11, version)
+	require.Equal(t, SupportedSchemaVersion, version, "迁移终点必须是当前支持版本（US-24 起为 12）")
 
 	_, err = conn.ExecContext(ctx, lmMemoryInsert, lmBase, "auto_extract")
 	require.NoError(t, err, "v11 闭集必须接受 auto_extract")
@@ -123,7 +123,12 @@ func TestUS22_Migration_FailureClassWindowGone(t *testing.T) {
 	conn := migrationConn(t)
 	ctx := context.Background()
 	require.NoError(t, ensureSchema(ctx, conn, SupportedSchemaVersion))
-	require.Equal(t, 11, SupportedSchemaVersion, "本用例的夹具按 v11 建表")
+	// US-24 把支持版本推进到 12；本用例的判据是「v11 学习 DDL 在场」，不是版本号等于 11。
+	var learningMigration string
+	require.NoError(t, conn.QueryRowContext(ctx,
+		`SELECT description FROM schema_version WHERE version = 11`).Scan(&learningMigration),
+		"版本历史中必须有 v11 记录")
+	require.Contains(t, learningMigration, "0011_memory_learning", "本用例的夹具必须包含 v11 学习 DDL")
 
 	// 夹具提取行的提取器与版本列取固定值；状态与分类逐值参数化。
 	insert := func(id, status string, class any) error {
@@ -206,7 +211,7 @@ func TestUS22_Migration_ForwardFromV10(t *testing.T) {
 	require.NoError(t, ensureSchema(ctx, conn, SupportedSchemaVersion), "v10 库必须能前向迁到 v11")
 	version, err = schemaVersion(ctx, conn)
 	require.NoError(t, err)
-	require.Equal(t, 11, version)
+	require.Equal(t, SupportedSchemaVersion, version, "迁移终点必须是当前支持版本（US-24 起为 12）")
 
 	for _, table := range []string{
 		"memory_extractions", "memory_extraction_cursors", "memory_candidate_meta",

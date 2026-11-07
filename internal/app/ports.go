@@ -123,6 +123,13 @@ type agentsPort struct {
 	// Logger 是装配层注入的日志器（带配置档位）；nil 时回落进程默认档。
 	// Logger is the injected logger; a nil falls back to the process default.
 	Logger *slog.Logger
+
+	// BundleRoot 是解析后的内容寻址资产根（US-24 §2.3.9）：创建成功后发布的 bundle
+	// 必须落在与 `assets install --agent` 相同的根下（FR-24-44）。空值表示装配不提供
+	// 资产发布面（零值测试装配只验写面），发布回调因此不接线。
+	// BundleRoot is the resolved asset root shared with `assets install --agent`; an
+	// empty value means this assembly offers no bundle publication.
+	BundleRoot string
 }
 
 // List 转调装载器：provider 名集由调用方显式传入（适配器**不**另读一次配置）；工具池用
@@ -240,11 +247,16 @@ type cliAdminSession struct {
 }
 
 // openCLIAdmin 在已持有的实例锁内打开 PostgreSQL，装配约束 27 / 32 需要的最小组件：
-// 管理操作仓储、生命周期状态文件、资源存储（生命周期索引）、Agent 写锁与归档仓储。
-// HTTP / MCP / 调度器 / 文件监视器**不**装配——CLI 写命令不服务请求也不跑定时任务，
-// 归档的注销 / 取消 / 等待因此以三项 nil 依赖表达（约束 32 的 CLI 分支）。
-// openCLIAdmin opens PostgreSQL under the held lock and wires only the components the
-// CLI write path needs; the heavy runtime stays unbuilt.
+// 管理操作仓储、生命周期状态文件、资源存储（生命周期索引）、Agent 写锁、归档仓储与
+// **跨 Worker 的 Run 取消器**。HTTP / MCP / 调度器 / 文件监视器**不**装配——CLI 写命令
+// 不服务请求也不跑定时任务，注册面（Registry / Scheduler）因此以 nil 表达（约束 32 的
+// CLI 分支）。
+//
+// Run 取消器**不**随注册面省略：CLI 与 serve 共用同一个库，归档的在途 Run 判定读的是
+// 共享账本——远端 Worker 仍在跑时，CLI 归档同样必须 409 而不是搬走目录（FR-24-23）。
+// 取消只写 `runs.cancel_requested`（CLI 没有本地循环），与 serve 的远端分支同义。
+// The CLI still needs the canceller: residual facts live on the shared database, so a
+// remote live run must block the archive here too.
 func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() time.Time,
 	providers []string,
 ) (*cliAdminSession, error) {
@@ -270,8 +282,12 @@ func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() ti
 		Index:      index,
 		Operations: operations,
 		Archives:   postgres.NewAgentAdminStore(db),
-		Logger:     p.logger(),
-		Now:        now,
+		// Registry / Scheduler 省略（CLI 不跑调度）；RunCanceller **必须**接共享账本：
+		// 在途 Run 判定与跨 Worker 取消不允许因"CLI 只查本地"而跳过（FR-24-23）。
+		// Registry/Scheduler stay nil here; the canceller binds the shared ledger.
+		RunCanceller: runCancellerAdapter{runs: postgres.NewRunStore(db)},
+		Logger:       p.logger(),
+		Now:          now,
 		// CLI 没有已发布目录快照：模板的 provider 顺序以命令层装载的配置列表为准。
 		// The CLI has no published snapshot; the configured list is the template source.
 		PublishedProviders: func(context.Context) ([]workspace.ProviderEntry, error) {
@@ -281,8 +297,37 @@ func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() ti
 			}
 			return entries, nil
 		},
+		// 资产发布面（US-24 §2.3.9 / FR-24-25）：CLI 与 serve 共用同一个库与同一个资产根，
+		// 创建成功后必须把落盘定义写成共享 bundle，否则该 Agent 在本机启用后会按
+		// ASSET_UNAVAILABLE 失败关闭。发布在这里直接复用 `publishWorkspaceAgentBundle`：
+		// 本函数已在实例锁内，走 `assetsPort.Publish` 会二次取锁。BundleRoot 为空表示
+		// 装配不提供资产发布面（零值测试装配），此时不接线。
+		// The same shared publication chain runs here under the already-held instance
+		// lock; going through assetsPort.Publish would take the lock a second time.
+		PublishBundle: p.publishBundle(root, index, operations),
 	})
 	return &cliAdminSession{db: db, admin: admin}, nil
+}
+
+// publishBundle 构造 CLI 写路径的资产发布回调；BundleRoot 未配置时返回 nil（不接线）。
+// publishBundle returns nil when the assembly carries no asset root, so the write path
+// keeps its exact behaviour in zero-value test assemblies.
+func (p agentsPort) publishBundle(root string, index *postgres.ResourceStore,
+	operations core.OperationStore,
+) func(ctx context.Context, agent string) (int64, error) {
+	if p.BundleRoot == "" {
+		return nil
+	}
+	return func(ctx context.Context, agent string) (int64, error) {
+		return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
+			Root:       root,
+			BundleRoot: p.BundleRoot,
+			Versions:   index,
+			Operations: operations,
+			Logger:     p.logger(),
+			Now:        time.Now,
+		}, agent)
+	}
 }
 
 // actor 是 CLI 写路径的操作主体：`cli:<本机用户>` / auth_method=cli / source=cli

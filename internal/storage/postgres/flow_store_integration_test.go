@@ -130,6 +130,7 @@ func TestFlow_ConcurrentAdvanceSingleAttempt(t *testing.T) {
 	s, def := newFlowStoreTest(t)
 	task, err := s.Create(t.Context(), flowCreateRequest(def, "task-claim", "key-claim"))
 	require.NoError(t, err)
+	acquireFlowRootLease(t, s.db, task.RootTaskID)
 	const concurrent = 8
 	errorsSeen := make(chan error, concurrent)
 	var group sync.WaitGroup
@@ -177,6 +178,7 @@ func TestFlow_CancelIntentNeverRequeues(t *testing.T) {
 	s, def := newFlowStoreTest(t)
 	task, err := s.Create(t.Context(), flowCreateRequest(def, "task-cancel", "key-cancel"))
 	require.NoError(t, err)
+	acquireFlowRootLease(t, s.db, task.RootTaskID)
 	_, err = s.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Now: task.CreatedAt + 1, Attempt: flow.NodeAttempt{ID: "attempt-cancel", TaskID: task.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: 1, Input: task.Revision.Input, InputHash: task.Revision.InputHash}})
 	require.NoError(t, err)
 	task, err = s.ReadForWorker(t.Context(), task.ID)
@@ -241,8 +243,14 @@ func TestFlow_CheckpointRequiredKeysEnforcedByPG(t *testing.T) {
 
 func claimFlowForTest(t *testing.T, s *FlowStore, task flow.Task) flow.Task {
 	t.Helper()
+	// 领取需要活跃根租约，但领取后必须立刻释放：ReadyRoots 会把"持活租约的根"
+	// 排除在就绪扫描之外（US-24 §3.1.6），夹具不该冒充执行者长期占着根。
+	// The claim needs a live root lease; release it right after so ReadyRoots can
+	// still see the idle root, matching the production lease interval.
+	lease := flowRootLeaseFor(t, s.db, task.RootTaskID)
 	_, err := s.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Now: task.CreatedAt + 1, Attempt: flow.NodeAttempt{ID: "attempt-" + task.ID, TaskID: task.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: 1, Input: task.Revision.Input, InputHash: task.Revision.InputHash}})
 	require.NoError(t, err)
+	require.NoError(t, NewLeaseStore(s.db).Release(t.Context(), lease))
 	claimed, err := s.ReadForWorker(t.Context(), task.ID)
 	require.NoError(t, err)
 	return claimed
@@ -322,11 +330,24 @@ func TestFlow_RunLedgerRequiresTheClaimedNodeIdentity(t *testing.T) {
 	s, def := newFlowStoreTest(t)
 	task, err := s.Create(t.Context(), flowCreateRequest(def, "task-ledger-link", "key-ledger-link"))
 	require.NoError(t, err)
+	lease := flowRootLeaseFor(t, s.db, task.RootTaskID)
 	_, err = s.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Now: task.CreatedAt + 1, Attempt: flow.NodeAttempt{ID: "ledger-attempt", TaskID: task.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: 1, RunID: "planned-flow-run", SessionID: "planned-session", Input: task.Revision.Input, InputHash: task.Revision.InputHash}})
 	require.NoError(t, err)
-	for _, bad := range []string{"node-attempt", "task", "run", "session", "revision"} {
-		record := core.RunRecord{RunID: "planned-flow-run", SessionID: "planned-session", Agent: "writer", Channel: "cli", UserID: "probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: "ledger-attempt", TaskRevision: 0}}
-		switch bad {
+	// 判据面变更（US-24 §3.1.9 / P-05）：attempt 归属 / 代次 / revision 不符由
+	// CreateRunForNode 前置判定为 ErrFlowAttemptStale；Run 行自身身份（run_id /
+	// session_id）不符仍由唯一 INSERT 的 EXISTS 判 core.ErrPreconditionFailed。
+	for _, bad := range []struct {
+		name string
+		want error
+	}{
+		{"node-attempt", flow.ErrFlowAttemptStale},
+		{"task", flow.ErrFlowAttemptStale},
+		{"run", core.ErrPreconditionFailed},
+		{"session", core.ErrPreconditionFailed},
+		{"revision", flow.ErrFlowAttemptStale},
+	} {
+		record := core.RunRecord{RunID: "planned-flow-run", SessionID: "planned-session", Agent: "writer", Channel: "cli", UserID: "probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: "ledger-attempt", TaskRevision: 0, Lease: lease}}
+		switch bad.name {
 		case "node-attempt":
 			record.Flow.NodeAttemptID = "other"
 		case "task":
@@ -338,12 +359,17 @@ func TestFlow_RunLedgerRequiresTheClaimedNodeIdentity(t *testing.T) {
 		case "revision":
 			record.Flow.TaskRevision = 1
 		}
-		require.ErrorIs(t, NewRunStore(s.db).StartRun(t.Context(), record, core.RunResourceManifest{}), core.ErrPreconditionFailed, "mismatched Flow link must insert zero Runs")
+		require.ErrorIs(t, startRunTest(NewRunStore(s.db), t.Context(), record, core.RunResourceManifest{}), bad.want, "mismatched Flow link must insert zero Runs: %s", bad.name)
 	}
 	var count int
 	require.NoError(t, s.db.pool.QueryRowContext(t.Context(), `SELECT count(*) FROM runs`).Scan(&count))
 	require.Zero(t, count)
-	require.NoError(t, NewRunStore(s.db).StartRun(t.Context(), core.RunRecord{RunID: "planned-flow-run", SessionID: "planned-session", Agent: "writer", Channel: "cli", UserID: "probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: "ledger-attempt"}}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(NewRunStore(s.db), t.Context(), core.RunRecord{RunID: "planned-flow-run", SessionID: "planned-session", Agent: "writer", Channel: "cli", UserID: "probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: "ledger-attempt", Lease: lease}}, core.RunResourceManifest{}))
 	require.NoError(t, s.db.pool.QueryRowContext(t.Context(), `SELECT count(*) FROM runs WHERE flow_task_id=$1 AND flow_node_attempt_id='ledger-attempt'`, task.ID).Scan(&count))
 	require.Equal(t, 1, count)
+	// 父根租约被释放（执行者失权）时，即使 attempt 归属与代次都匹配，创建子 Run
+	// 也必须失权：ErrLeaseLost 与 ErrFlowAttemptStale 分开，调用方才能区分"停下"
+	// 与"放弃"（US-24 §2.3.9 / P-05）。
+	require.NoError(t, NewLeaseStore(s.db).Release(t.Context(), lease))
+	require.ErrorIs(t, startRunTest(NewRunStore(s.db), t.Context(), core.RunRecord{RunID: "planned-flow-run", SessionID: "planned-session", Agent: "writer", Channel: "cli", UserID: "probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: "ledger-attempt", Lease: lease}}, core.RunResourceManifest{}), core.ErrLeaseLost)
 }

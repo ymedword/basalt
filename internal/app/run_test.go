@@ -599,7 +599,9 @@ func TestRunAdmission_RoutingFollowsPublishedCatalog(t *testing.T) {
 
 	publishedClient := &scriptedProviderClient{replies: []core.ChatResponse{{Content: "fresh"}}}
 	rt.resourceGate.Lock()
-	rt.catalogStore.Store(rt.catalogStore.Load().with("probe", publishedClient, "probe-model-v2"))
+	// 替身不实现 `BuiltVersioned`：构建证据按零值（未声明）换入——本用例的判据是
+	// "路由跟随目录"，不是本地实例版本证明（P-21 的用例另有其文）。
+	rt.catalogStore.Store(rt.catalogStore.Load().with("probe", publishedClient, "probe-model-v2", core.BuiltVersion{}))
 	rt.resourceGate.Unlock()
 
 	res, err := rt.service.Run(context.Background(), core.RunRequest{
@@ -689,12 +691,18 @@ type recordingRunStore struct {
 	rec *runEventRecorder
 }
 
-func (s *recordingRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus,
-	reason string, iterations, toolCalls int, now time.Time,
+func (s *recordingRunStore) FinishRun(ctx context.Context, runID string, token core.LeaseToken,
+	status core.RunStatus, reason string, iterations, toolCalls int, now time.Time,
 ) (bool, error) {
-	applied, err := s.RunStore.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
+	applied, err := s.RunStore.FinishRun(ctx, runID, token, status, reason, iterations, toolCalls, now)
 	s.rec.record("finish")
 	return applied, err
+}
+
+// CompleteRunCloseout 记入同一事件序列：US-24 的收尾末笔排在释放之后。
+func (s *recordingRunStore) CompleteRunCloseout(ctx context.Context, runID string, token core.LeaseToken, now time.Time) error {
+	s.rec.record("closeout")
+	return s.RunStore.CompleteRunCloseout(ctx, runID, token, now)
 }
 
 // A3：`FinishRun` 之后才 `Release`，且恰好一次（约束 17 / 46）。判据是事件次序：
@@ -717,6 +725,9 @@ func TestRunRuntime_ReleaseAfterFinish(t *testing.T) {
 				NotifyAdmin: postgres.NewNotifyAdminStore(rt.db),
 				Channels:    postgres.NewNotifyChannelRepo(rt.db),
 				Bindings:    postgres.NewBindingStore(rt.db),
+				// 轻装配显式声明"本清单不记 bundle 哈希"；资产校验没有旁路。
+				// The light assembly declares "unrecorded" explicitly; assets have no bypass.
+				Assets: undeclaredAssets{},
 			}),
 		rec: rec,
 	}
@@ -750,8 +761,8 @@ func TestRunRuntime_ReleaseAfterFinish(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, res.Status, "reason=%s", res.Reason)
 
-	require.Equal(t, []string{"finish", "runtime-release"}, rec.snapshot(),
-		"次序固定：终态落库之后才释放运行时")
+	require.Equal(t, []string{"finish", "closeout", "runtime-release"}, rec.snapshot(),
+		"次序固定：终态落库 → 收尾末笔 → 释放运行时")
 	require.Equal(t, 1, rec.releaseCount(), "Release 恰好调用一次")
 
 	pinned := rec.lastRuntime()

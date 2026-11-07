@@ -10,34 +10,29 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/flow"
 )
 
-// 本文件是崩溃恢复扫描（docs/us/us4-react-loop.md §2.3 流程 G 六步里的 ①②③④⑥；
-// 步骤 ⑤ 的工作区残留归 internal/workspace）。调用方是**持锁的重命令**，启动时跑一次
-// （契约 §4.3.1：只读命令不取锁、不做恢复、不清理锁文件）。
-// This file is the crash-recovery scan (flow G steps ①-④ and ⑥); the locked heavy path
-// invokes it once at startup.
+// 本文件是**作用域化的接管收尾**（US-24 / 模块卡 §2.3.5 A1～A3）：只有在回收器
+// **合法领取**了某个资源的执行权之后，才对这个资源做收尾。签名因此收 token 与
+// 显式的作用域标识，而不是"扫全库找坏的"。
 //
-// 三条纪律。① **组看消息、Run 看表**：半截组的判据只落在 `messages` 上，且判组**按位置**
-// （同一会话内 assistant 之后紧邻的 tool 段），**不**按 `tool_call_id` 跨 Run 查——跨 Run 的
-// 同 id 会把"这次没执行"误配成"上次执行过的结果"。② **同一短事务**：一个 Run 的组修复与
-// 其收尾要么一起提交、要么一起回滚——契约明写"Run 已翻 failed 而组仍半截"的中间态不可能
-// 持久化。③ **只改仍未结束的行**：`WHERE status = 'pending'` 与 `WHERE status = 'running'`
-// 是两条语句的全部意义，恢复可能在任何时刻重跑，幂等性靠它们而不是靠"只调一次"。
-// Three rules: a purely positional group criterion over messages, one short transaction per
-// run covering repair and closure, and a status guard on every statement so a rerun is a no-op.
+// 与 US-4 版的三处差别：
 //
-// 冻结签名（§3.1）收的是裸 `*sql.DB`——本文件因此不复用需要 `*DB` 句柄的仓储方法，改为直接
-// 对连接执行；判据与仓储逐字同源，差别只在收尾面（按 run_id 收窄）与执行面（事务连接）。
-// **消息写入是例外**：`appendMessage`（`session_store.go`）按执行面取参，两处共用同一份
-// 语句——`seq` 分配与计数列这两条纪律不允许有第二个版本。
-// The frozen signature hands recovery a bare *sql.DB, so the statements here mirror the
-// repositories' criteria instead of reusing methods that need the *DB handle. Message
-// writes are the deliberate exception: both paths share the one INSERT statement.
-
-// recoveryCloseReason 是崩溃收尾写进 `runs.reason` 的逐字文本（契约 §4.3.2 步骤 ③④）。
-// The verbatim reason stamped on crash closure.
-const recoveryCloseReason = "进程中断（启动时发现未完成的运行）"
+//  1. **没有全局扫描**（FR-24-02）：`RecoverRun` 只处理调用方持有的那条 run 租约，
+//     审计归一化与半截工具组补齐全按 run_id 过滤（FR-24-16）。库里的 pending 行若
+//     没有人持有其租约，只报告不改写——改写它等于替一个可能还活着的 Worker 作结论。
+//  2. **整笔一个事务**（§2.3.5 A1 末条）：归一化 → 补组 → 释放引用 → 投递结算 →
+//     终态 → 释放租约一起提交。只有接管路径可以这样合并：原属主已失联，学习抽取
+//     钩子已经丢失（记 skipped: worker_lost，不重放），"引用留给钩子用"的约束在
+//     这里不存在。**正常收尾仍是五步**，不并进一个事务。
+//  3. **归属由租约保证**：事务外壳是 `runFencedTx`——先锁租约行、再校验 owner +
+//     epoch + 未释放 + 未过期，然后才动业务行。旧持有者即使恢复，它的写入也会在
+//     这里被 `ErrLeaseLost` 挡下（FR-24-15 / FR-24-36）。
+//
+// Three differences from the single-process version: no global scan, one transaction for
+// the whole takeover closeout, and ownership guaranteed by the leased fence rather than
+// by "we started first".
 
 // recoveryOwnerUnauthorized 是原授权 Key 已失效时写进 `runs.reason` 的固定文案
 // （C-32）：与调度侧的 `owner_unauthorized` 同一字面量，运维不必为两条路径记两套。
@@ -45,167 +40,401 @@ const recoveryCloseReason = "进程中断（启动时发现未完成的运行）
 // authorizing key no longer holds.
 const recoveryOwnerUnauthorized = "owner_unauthorized"
 
-// RecoveryReport 是恢复扫描的三个读数（契约 §4.3.2 步骤 ⑥ 的启动摘要）。
-// RecoveryReport carries the three counters of the startup summary.
+// UnreplayedAction 是一条本次接管**没有重放**、结果永远不可知的审计行
+// （模块卡 §2.3.5 A1："未完成的工具副作用：不重放，记 unknown 并写诊断事件"）。
+//
+// 它只描述"哪一行被归一化了"，不携带诊断事件的翻译：事件种类、原因码与脱敏都属于
+// 装配层（与 `tool_diagnostics.go` 同一套纪律），存储层不 import 诊断包去做翻译。
+// UnreplayedAction names one audit row that was normalized to unknown and will never be
+// replayed; translating it into a diagnostic event belongs to the assembly layer.
+type UnreplayedAction struct {
+	// Table 是承载该动作的审计表；取值只来自下面两个常量。
+	Table string
+
+	// ID 是该表的 bigint 主键，诊断的 `audit_ref` 用它回指审计行。
+	ID int64
+
+	// Round 是 `llm_calls.round`（工具行为 0）：运行期 `llm_call` 事件用轮号作
+	// `step_id`，恢复事件据此与同一轮的原事件对齐；**不**另造全局序号（C-23）。
+	Round int64
+
+	// ToolCallID 是 `tool_invocations.tool_call_id`（可空）：工具事件的关联标识。
+	ToolCallID string
+
+	// ToolName 是 `tool_invocations.tool_name`：工具事件 attrs 的 `tool` 键。
+	ToolName string
+}
+
+// 两张被归一化的审计表名（`UnreplayedAction.Table` 的取值域）。
+// The two normalized audit tables; these are the only Table values.
+const (
+	// UnreplayedTableLLMCalls 是模型调用审计表。
+	UnreplayedTableLLMCalls = "llm_calls"
+	// UnreplayedTableToolInvocations 是工具调用审计表。
+	UnreplayedTableToolInvocations = "tool_invocations"
+)
+
+// RecoveryReport 是**单个资源**接管收尾的读数（不再是全库扫描的汇总）。
+// 四个计数都指"这一趟真落了盘"的数量：事务回滚时全部为零。
+// RecoveryReport counts what one takeover closeout actually committed.
 type RecoveryReport struct {
 	// Unknowns 是 ① 归一化为 `unknown` 的审计行数（`llm_calls` 与 `tool_invocations` 合计）。
 	Unknowns int
 
+	// Unreplayed 与 Unknowns 同源：每条被归一化的审计行一项，供装配层逐条写诊断事件。
+	// 诊断可丢弃，本报告不依赖它是否写成功；事务回滚时本字段为空。
+	Unreplayed []UnreplayedAction
+
 	// RepairedGroups 是被补齐的**半截组数**（按 assistant 消息计，不按缺失的调用计）。
 	RepairedGroups int
 
-	// ClosedRuns 是被收尾为 `failed` 的运行数（含没有任何半截组、纯靠账本判定者）。
+	// ClosedRuns 是被收尾为 `failed` 的运行数（0 或 1）。
 	ClosedRuns int
+
+	// DeliveriesSkipped 是本次收尾判为 `skipped` 的 pending 投递行数。
+	// 终态为 failed 的 Run 的投递**永不重发**，只能落 skipped（FR-24-21）。
+	DeliveriesSkipped int
 }
 
-// Recover 执行一次崩溃恢复扫描。返回的 error 是**尽力而为**的汇总（`errors.Join`）：
-// 某个 Run 修复失败不影响其余 Run，但启动方必须看见它（据此决定要不要开跑）。
-// Recover performs one crash-recovery scan; the error aggregates per-run failures without
-// hiding any of them from the caller.
-func Recover(ctx context.Context, db *sql.DB, logger *slog.Logger, now time.Time) (RecoveryReport, error) {
+// RecoverRun 按 A1 收尾**一个已合法领取的 Run**。
+//
+// 顺序固定（模块卡 §2.3.5 A1）：审计 pending 归一化 → 半截工具组补齐 → 释放三类
+// 引用 → 投递结算 → 终态写入 → 释放租约，全部在**同一事务**里。任何一步失败都整笔
+// 回滚：Run 保持 running、租约保持"我持有但未释放"，到期后下一轮重新领取重试——
+// **不交还**在这里表达"根本没查完"（与 A3 的错误分类同一原则）。
+// RecoverRun closes one claimed run in a single transaction; a rollback keeps the lease
+// unreleased so the next round retries instead of pretending the work was done.
+func RecoverRun(ctx context.Context, db *DB, logger *slog.Logger, token core.LeaseToken,
+	now time.Time,
+) (RecoveryReport, error) {
 	var report RecoveryReport
 	if logger == nil {
-		// 冻结签名收 `*slog.Logger`；调用方图省事传 nil 不该让恢复崩在日志上。
 		logger = slog.Default()
 	}
-
-	// ① `pending` → `unknown`（两表）。放在最前：③ 的分类要读审计行，而"还在 pending"
-	// 这个假象一旦开机就不该再留在库里。
-	unknowns, err := normalizePendingAuditRows(ctx, db, now)
-	if err != nil {
-		return report, err
+	if db == nil || db.pool == nil {
+		return report, errors.New("postgres: 句柄未装配连接池，不得做接管收尾")
 	}
-	report.Unknowns = unknowns
-
-	// ② 半截组扫描（只读，按会话 + seq 走一遍消息）。
-	groups, err := scanHalfGroups(ctx, db)
-	if err != nil {
-		return report, err
+	if token.Kind != core.LeaseRun {
+		return report, fmt.Errorf("postgres: 接管收尾的执行权类型 %q 不是 run", token.Kind)
 	}
+	if token.ResourceID == "" {
+		return report, fmt.Errorf("postgres: 接管收尾缺少 Run 标识")
+	}
+	runID := token.ResourceID
 
-	// ③ 每个含半截组的 Run 一个短事务。**失败也要记账为"已处理"**：它留着 running 等下次
-	// 启动重扫，不能被 ④ 顺手收尾（否则就成了"Run 已翻 failed 而组仍半截"——契约禁止的中间态）。
-	byRun, runOrder := halfGroupsByRun(groups)
-	handled := make(map[string]struct{}, len(runOrder))
-	var errs []error
-	for _, runID := range runOrder {
-		handled[runID] = struct{}{}
-		repaired, closed, err := repairRunGroups(ctx, db, logger, runID, byRun[runID], now)
+	err := runFencedTx(ctx, db, token, nil, func(ctx context.Context, tx *sql.Tx) error {
+		report = RecoveryReport{}
+
+		// ① `pending` → `unknown`，**只限本次领取的 run_id**。放在最前：后续的
+		// 补组要按审计行还原真实结果，"还在 pending"这个假象必须先消掉。
+		unreplayed, err := normalizePendingAuditRows(ctx, tx, []string{runID}, now)
 		if err != nil {
-			errs = append(errs, err)
-			logger.Error("崩溃恢复：半截组修复失败（该 Run 保持 running，下次启动重扫）",
-				"run_id", runID, "error", err)
-			continue
+			return err
 		}
-		report.RepairedGroups += repaired
-		if closed {
-			report.ClosedRuns++
-		}
-	}
+		report.Unknowns = len(unreplayed)
+		report.Unreplayed = unreplayed
 
-	// ④ 另扫 runs：仍为 running 且**不在** ③ 里的行，同样收尾。这一类包含"一条消息都没写就
-	// 崩在首次模型响应上""最终回答已落库但终态没写""无状态 invoke"——它们的共同点是：
-	// 消息侧看不出任何异常，只有账本知道上次没跑完。
-	// 每个 Run 一个短事务：收尾与资源引用释放一起提交（约束 19）——分开写会留下
-	// "Run 已终态、版本却仍被引用"的中间态。
-	runningIDs, err := listRunningRunIDs(ctx, db)
-	if err != nil {
-		return report, errors.Join(append(errs, err)...)
-	}
-	for _, runID := range runningIDs {
-		if _, done := handled[runID]; done {
-			continue
-		}
-		closed, err := closeRunInTransaction(ctx, db, runID, now)
+		// ② 半截组扫描（只读，只扫本次领取的 Run 的消息）。
+		groups, err := scanHalfGroups(ctx, tx, []string{runID})
 		if err != nil {
-			errs = append(errs, err)
-			logger.Error("崩溃恢复：运行收尾失败（该 Run 保持 running，下次启动重扫）",
-				"run_id", runID, "error", err)
-			continue
+			return err
+		}
+
+		// ③ 补组：分类要看该 Run **当前**的状态——cancelled → "已取消…"、
+		// limit_reached → "未执行（工具调用次数超限）"、其余 → "未执行（进程中断）"。
+		status, _, err := lookupRunStatus(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		reason := recoveryReasonFor(status)
+		for _, g := range groups {
+			for _, call := range g.missing {
+				content, err := core.SynthesizeMissingResult(ctx, recoveryAuditReader{q: tx}, runID, call, reason)
+				if err != nil {
+					// 查审计失败**不**写兜底文本：整笔回滚、该 Run 留 running，
+					// 下一轮接管会重扫——不必在拿不准时落笔。
+					return fmt.Errorf("补齐半截工具组（session=%s, seq=%d, tool_call_id=%s）: %w",
+						g.sessionID, g.seq, call.ID, err)
+				}
+				// 写入与正常运行路径**共用同一份语句**（含 `seq` 分配与计数列递增）。
+				m := core.Message{Role: core.RoleTool, Content: content, ToolCallID: call.ID}
+				if _, err := appendMessage(ctx, tx, g.sessionID, g.runID, m, now); err != nil {
+					return err
+				}
+			}
+			report.RepairedGroups++
+		}
+
+		// ④ 释放三类引用。与正常收尾 `FinishRun` 同一口径：漏掉通知冻结会让渠道
+		// 删除永远点名一个已失败的 Run。
+		if _, err := releaseRunRefs(ctx, tx, runID, now); err != nil {
+			return err
+		}
+		if _, err := releaseRunCredentialRefs(ctx, tx, runID, now); err != nil {
+			return err
+		}
+		if _, err := releaseRunNotifyRefs(ctx, tx, runID, now); err != nil {
+			return err
+		}
+
+		// ⑤ 投递结算：本次收尾为 failed → 该 Run 的 pending 投递置 skipped。
+		// **不重发**：投递结果无法证明，重发就是重复通知。
+		skipped, err := settleDeliveriesInTx(ctx, tx, runID, core.DeliverySkipped,
+			"运行未完成，未投递", now)
+		if err != nil {
+			return err
+		}
+		report.DeliveriesSkipped = skipped
+
+		// ⑥ 终态写入。reason 默认 `worker_lost`（FR-24 的机器可读字面量）；
+		// 绑定的调用方 Key 已失效时改记 `owner_unauthorized`——同一行的授权已经不在，
+		// 这条事实比"进程没了"更该被运维看见，且它是既有验收判据（C-32）。
+		closed, err := closeRunningRun(ctx, tx, runID, now)
+		if err != nil {
+			return err
 		}
 		if closed {
-			report.ClosedRuns++
+			report.ClosedRuns = 1
 		}
-	}
 
-	// ⑤ 终态 Run 的残留引用补齐（约束 19 末句 / 契约 DDL 注释）：它们早已不是 running，
-	// ④ 的扫描面看不到；一条幂等语句按"Run 已终态"补齐。正常路径（FinishRun / ③ / ④）
-	// 都是同事务释放，这一步只兜版本间残留与人工修库留下的行——**不**补造任何历史。
-	if err := releaseTerminalRefs(ctx, db, now); err != nil {
-		errs = append(errs, err)
-		logger.Error("崩溃恢复：终态运行的残留资源引用补齐失败", "error", err)
+		// ⑦ 释放租约（同一事务）。提交之后"该 Run 无有效租约"，B1 的入选谓词因此
+		// 可信："收尾已完成，或属主已经不在了"。
+		nowMS, err := readDBMillis(ctx, tx)
+		if err != nil {
+			return err
+		}
+		return releaseLeaseInTx(ctx, tx, token, nowMS)
+	})
+	if err != nil {
+		return RecoveryReport{}, err
 	}
-
-	// ⑥ 启动摘要。三键与返回值里的三个读数**同源**（一处算、两处读），日志与报告的差异
-	// 因此只可能是"有人看的是另一次运行"，不会出现口径差。
-	logger.Info("崩溃恢复扫描完成",
+	logger.Info("接管收尾完成", "run_id", runID,
+		"ownership_epoch", token.OwnershipEpoch,
 		"unknowns", report.Unknowns,
 		"repaired_groups", report.RepairedGroups,
+		"deliveries_skipped", report.DeliveriesSkipped,
 		"closed_runs", report.ClosedRuns)
-
-	return report, errors.Join(errs...)
+	return report, nil
 }
 
-// Recover 是机制层 Recover 的 *DB 形态（**装配面**）：持锁重路径在取锁之后、开跑之前
-// 调用它（US-4 起），此后机制函数的直接调用方只在本包内。
-// DB.Recover is the assembly-facing form of the recovery scan: the locked heavy path
-// calls it between taking the lock and serving, and it is the only production caller.
+// RecoverExecution 按 A2 收尾**一个已合法领取的执行行**，把它映射回执行行的四值域
+// （模块卡 §2.3.5 A2）。
 //
-// 为什么不把连接池交出去：`DB.pool` 与迁移用的嵌入源都不出包——SQL 文本与 schema 的
-// 读法由本包保管，不交给调用方自觉。未装配的句柄在这里**显式拒绝**，而不是让它崩在
-// 一句 nil 解引用上。
-// The pool stays inside this package: the handle carries the boundary. An unwired
-// handle is refused explicitly instead of panicking on a nil pool.
-func (db *DB) Recover(ctx context.Context, logger *slog.Logger, now time.Time) (RecoveryReport, error) {
-	if db == nil || db.pool == nil {
-		return RecoveryReport{}, errors.New("postgres: 句柄未装配连接池，不得做恢复扫描")
+// 映射不是"照抄 Run 状态"：`task_executions.status` 只有 started / completed /
+// failed / skipped 四值，没有 limit_reached 或 cancelled。写约束外的值会被 CHECK
+// 拒绝，把 Run 状态原样搬过去还会把"Run 达标完成、仅执行行未收尾"记成故障，污染
+// 调度成功率。
+//
+// 读取 run 状态与写入分属两个事务：读是快照，写入的权威判据在 `FinishExecution`
+// 内部——它在租约 fence 下再查一次 `status='started'`，0 行按"已终态"幂等返回。
+// RecoverExecution maps the run state onto the execution row's four-value domain and
+// leaves the authoritative check to FinishExecution's fenced write.
+func RecoverExecution(ctx context.Context, db *DB, token core.LeaseToken, now time.Time) (core.ExecutionStatus, error) {
+	executionID, err := executionIDOf(token)
+	if err != nil {
+		return "", err
 	}
-	return Recover(ctx, db.pool, logger, now)
+	store := NewTaskStore(db)
+	row, found, err := store.readExecutionForRecovery(ctx, executionID)
+	if err != nil {
+		return "", err
+	}
+	if !found || row.status != string(core.ExecutionStarted) {
+		// 行已不在 started（已被合法收尾或从未开始）——按幂等处理，不写任何东西。
+		return "", nil
+	}
+
+	status, message := executionOutcomeFor(row.runStatus)
+	duration := time.Duration(0)
+	if row.startedAt > 0 {
+		duration = now.Sub(time.UnixMilli(row.startedAt))
+		if duration < 0 {
+			duration = 0
+		}
+	}
+	if err := store.FinishExecution(ctx, executionID, token, status, duration, message, now); err != nil {
+		return "", err
+	}
+	return status, nil
 }
 
-// normalizePendingAuditRows 把两张审计表里仍为 `pending` 的行归一化为 `unknown` 并写
-// `error_kind = 'unknown'`（契约 §4.3.2 步骤 ①）。`finished_at` 与 `duration_ms` 保持 NULL：
-// 这两列说的都是"进程没走到那一步"，编一个结束时刻或时长比留空更误导。
-// Tables are normalized in one transaction so the two audit surfaces never disagree about
-// "what was still in flight when the process died".
-func normalizePendingAuditRows(ctx context.Context, db *sql.DB, now time.Time) (int, error) {
-	var total int
-	err := withTxOn(ctx, db, now, func(ctx context.Context, tx *sql.Tx) error {
-		total = 0
-		updated, err := normalizePendingRows(ctx, tx,
-			`UPDATE llm_calls SET status = $1, error_kind = $2, recovered_at = $4 WHERE status = $3`, now)
-		if err != nil {
-			return fmt.Errorf("归一化 llm_calls 的 pending 行: %w", err)
-		}
-		total += updated
+// executionRecoveryRow 是 A2 需要的执行行读数（含关联 Run 的状态）。
+type executionRecoveryRow struct {
+	status    string
+	startedAt int64
+	runStatus sql.NullString
+}
 
-		updated, err = normalizePendingRows(ctx, tx,
-			`UPDATE tool_invocations SET status = $1, error_kind = $2, recovered_at = $4 WHERE status = $3`, now)
+// executionIDOf 从 `schedule_execution` 域的凭证里解出执行行主键。
+func executionIDOf(token core.LeaseToken) (int64, error) {
+	if token.Kind != core.LeaseScheduleExecution {
+		return 0, fmt.Errorf("postgres: 执行行收尾的执行权类型 %q 不是 schedule_execution", token.Kind)
+	}
+	id, err := parseExecutionResourceID(token.ResourceID)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// executionOutcomeFor 把 Run 状态映射为执行行的四值域（模块卡 §2.3.5 A2）。
+//
+//	completed / limit_reached → completed（达标完成，不是故障）
+//	failed / cancelled        → failed，错误文案取 Run 自己的 reason
+//	无 Run / running          → failed + worker_lost（执行者已失联，无从查证）
+//
+// 无 Run / running 一律带 `worker_lost`：这一支的共同点是"没有任何证据说明这次执行
+// 正常结束过"，留空会让故障在审计里与成功难以区分。
+// executionOutcomeFor maps the run state onto the execution row's four-value domain.
+func executionOutcomeFor(runStatus sql.NullString) (core.ExecutionStatus, string) {
+	if !runStatus.Valid {
+		return core.ExecutionFailed, workerLostReason
+	}
+	switch core.RunStatus(runStatus.String) {
+	case core.StatusCompleted, core.StatusLimitReached:
+		return core.ExecutionCompleted, ""
+	case core.StatusFailed, core.StatusCancelled:
+		return core.ExecutionFailed, ""
+	default:
+		// 仍 running（A1 因活租约放过）或未知状态：没有证据说明它正常结束过。
+		return core.ExecutionFailed, workerLostReason
+	}
+}
+
+// FlowRootRecovery 是 A3 恢复所需的**全部输入**（只读快照）。
+//
+// 三个判据各自独立（模块卡 §2.3.6）：`Isolated` 决定能否 Recover，`Joined` 决定
+// Recover 之后落到 Queued 还是 Blocked，`Unresolved` 命中即**不得**推进。
+// Three independent predicates; none may be derived from another.
+type FlowRootRecovery struct {
+	// Task 是根行的当前快照（含 Version——A3 必须把 Expected 传下去，不猜版本）。
+	Task flow.Task
+
+	// Isolated 为真表示子树里没有任何**仍有效**的 run 租约：没人还能提交。
+	Isolated bool
+
+	// Joined 为真表示子树里没有 prepared / running 的节点尝试。
+	Joined bool
+
+	// Unresolved 为真表示子树里还有 outcome ∈ (dispatching, unknown) 的动作。
+	Unresolved bool
+}
+
+// RecoverFlowRoot 读出 A3 的四项输入，**在一个事务里**取同一快照：分四次独立查询
+// 会读到一个既"没人持有租约"又"还有在途 attempt"的中间态，据此下的结论不可复现。
+//
+// **状态不由这里决定**：唯一的决定者是 `flow.Service.Recover`。本函数只回答"输入是
+// 什么"，所以它是只读的——名字里的 Recover 指"为恢复取证"，不指"执行恢复"。
+// RecoverFlowRoot only gathers A3's inputs in one snapshot; the only thing allowed to
+// decide the resulting status is flow.Service.Recover.
+func RecoverFlowRoot(ctx context.Context, db *DB, rootTaskID string) (FlowRootRecovery, error) {
+	var out FlowRootRecovery
+	if db == nil || db.pool == nil {
+		return out, errors.New("postgres: 句柄未装配连接池，不得读取 Flow 根恢复输入")
+	}
+	if rootTaskID == "" {
+		return out, errors.New("postgres: Flow 根恢复输入缺少根任务标识")
+	}
+	err := db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		task, err := readFlowTask(ctx, tx, rootTaskID)
 		if err != nil {
-			return fmt.Errorf("归一化 tool_invocations 的 pending 行: %w", err)
+			return err
 		}
-		total += updated
+		if task.RootTaskID != task.ID || task.ParentTaskID != "" || task.Depth != 0 {
+			// A3 只服务根行：把子任务当根去 Recover 会推进整棵树的版本。
+			return fmt.Errorf("postgres: 任务 %s 不是 Flow 根（root=%q parent=%q depth=%d）",
+				rootTaskID, task.RootTaskID, task.ParentTaskID, task.Depth)
+		}
+		out.Task = task
+		live, err := querySubtreeExists(ctx, tx, subtreeLiveRunLeaseQuery, rootTaskID, "HasLiveRunLease")
+		if err != nil {
+			return err
+		}
+		out.Isolated = !live
+		inflight, err := querySubtreeExists(ctx, tx, subtreeInFlightAttemptQuery, rootTaskID, "HasInFlightNodeAttempt")
+		if err != nil {
+			return err
+		}
+		out.Joined = !inflight
+		unresolved, err := querySubtreeExists(ctx, tx, subtreeUnresolvedActionQuery, rootTaskID, "HasUnresolvedAction")
+		if err != nil {
+			return err
+		}
+		out.Unresolved = unresolved
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return FlowRootRecovery{}, err
 	}
-	return total, nil
+	return out, nil
 }
 
-// normalizePendingRows 执行一条归一化语句并返回影响行数（两条语句共用，参数相同）。
-// Runs one normalization statement and reports the affected row count.
-func normalizePendingRows(ctx context.Context, ex sqlExecutor, stmt string, now time.Time) (int, error) {
-	res, err := ex.ExecContext(ctx, stmt,
-		string(core.LLMCallUnknown), string(core.ErrorKindUnknown), string(core.LLMCallPending), now.UnixMilli())
-	if err != nil {
-		return 0, err
+// normalizePendingAuditRows 把两张审计表里仍为 `pending` 的行归一化为 `unknown`，
+// 写 `error_kind = 'unknown'`（契约 §4.3.2 步骤 ①）。`finished_at` 与 `duration_ms`
+// 保持 NULL：这两列说的都是"进程没走到那一步"，编一个结束时刻或时长比留空更误导。
+//
+// **必须按 runIDs 过滤**（FR-24-16）：无租约的 pending 行只报告不改写——它可能正被
+// 一个还活着的 Worker 持有。
+//
+// 返回值逐行给出被归一化的动作（表名 + 主键 + 关联列），供 A1 的装配层写诊断事件
+// （评审 IDX-28）。**只有这里能拿到准确的 id**：`RowsAffected` 说"改了几行"，却指不出
+// 是哪几行，事后重查又会被并发收尾带走。`RETURNING` 让"改了"与"是哪一行"来自同一条
+// 语句、同一个事务快照。
+// The rows are returned so the assembly layer can annotate each unreplayed action; the
+// ids come from the very UPDATE, not from a later query that a concurrent closeout
+// could invalidate.
+func normalizePendingAuditRows(ctx context.Context, ex sqlExecutor, runIDs []string, now time.Time) ([]UnreplayedAction, error) {
+	if len(runIDs) == 0 {
+		return nil, nil
 	}
-	affected, err := res.RowsAffected()
+	var out []UnreplayedAction
+
+	llmRows, err := ex.QueryContext(ctx,
+		`UPDATE llm_calls SET status = $1, error_kind = $2, recovered_at = $4
+		  WHERE status = $3 AND run_id = ANY($5)
+		  RETURNING id, round`,
+		string(core.LLMCallUnknown), string(core.ErrorKindUnknown),
+		string(core.LLMCallPending), now.UnixMilli(), runIDs)
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("归一化 %s 的 pending 行: %w", UnreplayedTableLLMCalls, err)
 	}
-	return int(affected), nil
+	for llmRows.Next() {
+		action := UnreplayedAction{Table: UnreplayedTableLLMCalls}
+		if err := llmRows.Scan(&action.ID, &action.Round); err != nil {
+			_ = llmRows.Close()
+			return nil, fmt.Errorf("读取 %s 的归一化行: %w", UnreplayedTableLLMCalls, err)
+		}
+		out = append(out, action)
+	}
+	llmErr := llmRows.Err()
+	_ = llmRows.Close()
+	if llmErr != nil {
+		return nil, fmt.Errorf("归一化 %s 的 pending 行: %w", UnreplayedTableLLMCalls, llmErr)
+	}
+
+	toolRows, err := ex.QueryContext(ctx,
+		`UPDATE tool_invocations SET status = $1, error_kind = $2, recovered_at = $4
+		  WHERE status = $3 AND run_id = ANY($5)
+		  RETURNING id, COALESCE(tool_call_id, ''), tool_name`,
+		string(core.LLMCallUnknown), string(core.ErrorKindUnknown),
+		string(core.LLMCallPending), now.UnixMilli(), runIDs)
+	if err != nil {
+		return nil, fmt.Errorf("归一化 %s 的 pending 行: %w", UnreplayedTableToolInvocations, err)
+	}
+	for toolRows.Next() {
+		action := UnreplayedAction{Table: UnreplayedTableToolInvocations}
+		if err := toolRows.Scan(&action.ID, &action.ToolCallID, &action.ToolName); err != nil {
+			_ = toolRows.Close()
+			return nil, fmt.Errorf("读取 %s 的归一化行: %w", UnreplayedTableToolInvocations, err)
+		}
+		out = append(out, action)
+	}
+	toolErr := toolRows.Err()
+	_ = toolRows.Close()
+	if toolErr != nil {
+		return nil, fmt.Errorf("归一化 %s 的 pending 行: %w", UnreplayedTableToolInvocations, toolErr)
+	}
+	return out, nil
 }
 
 // halfGroup 是一个"半截工具组"：某条 assistant 消息声明了工具调用，紧随其后的 tool 消息段
@@ -218,19 +447,25 @@ type halfGroup struct {
 	missing   []core.ToolCall
 }
 
-// scanHalfGroups 扫出全部半截组（契约 §4.3.2 步骤 ②）。判组**按位置**：同一个会话内按 seq
-// 顺序走，遇到 `role=assistant` 且 `tool_calls` 非空就开一个组，随后**紧邻**的 `role=tool`
-// 消息段就是这组的答卷；中间出现任何别的角色即封组。**不得**按 `tool_call_id` 全会话查——
-// 跨 Run 的同 id 会互相误配（判卷用例 `TestRecovery_RepairsHalfGroupByPosition`）。
-// Groups are located positionally inside each session; the shared judgement itself comes from
-// core.MissingToolResults, so the crash path and the cancel path always agree.
-func scanHalfGroups(ctx context.Context, db *sql.DB) ([]halfGroup, error) {
-	rows, err := db.QueryContext(ctx,
+// scanHalfGroups 扫出**指定 Run 集合**内的半截组（契约 §4.3.2 步骤 ②）。
+// 判组**按位置**：同一个会话内按 seq 顺序走，遇到 `role=assistant` 且 `tool_calls`
+// 非空就开一个组，随后**紧邻**的 `role=tool` 消息段就是这组的答卷；中间出现任何别的
+// 角色即封组。**不得**按 `tool_call_id` 全会话查——跨 Run 的同 id 会互相误配
+// （判卷用例 `TestRecovery_RepairsHalfGroupByPosition`）。
+//
+// 作用域过滤落在 `run_id = ANY($1)` 上：只扫本次合法领取的 Run。落在集合外的组
+// （包括 run_id 为空的历史行）**不改写**——它们不属于任何我们持有执行权的 Run。
+// Groups are located positionally inside each session, restricted to the claimed runs.
+func scanHalfGroups(ctx context.Context, ex Queryer, runIDs []string) ([]halfGroup, error) {
+	if len(runIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := ex.QueryContext(ctx,
 		`SELECT session_id, COALESCE(run_id, ''), seq, role, COALESCE(tool_calls, ''),
 		        COALESCE(tool_call_id, '')
 		   FROM messages
-		  WHERE session_id IS NOT NULL
-		  ORDER BY session_id, seq`)
+		  WHERE session_id IS NOT NULL AND run_id = ANY($1)
+		  ORDER BY session_id, seq`, runIDs)
 	if err != nil {
 		return nil, fmt.Errorf("扫描半截工具组: %w", err)
 	}
@@ -315,90 +550,8 @@ func parseToolCalls(raw string) ([]core.ToolCall, error) {
 	return calls, nil
 }
 
-// halfGroupsByRun 把半截组按 Run 归并，并返回**首次出现序**（扫描序）——每个 Run 一个事务，
-// 处理的先后因此与消息顺序一致，判卷与日志都可复现。
-// Groups are bucketed per run in first-appearance order so each run gets exactly one
-// transaction and the processing order stays reproducible.
-func halfGroupsByRun(groups []halfGroup) (map[string][]halfGroup, []string) {
-	byRun := make(map[string][]halfGroup, len(groups))
-	order := make([]string, 0, len(groups))
-	for _, g := range groups {
-		if _, seen := byRun[g.runID]; !seen {
-			order = append(order, g.runID)
-		}
-		byRun[g.runID] = append(byRun[g.runID], g)
-	}
-	return byRun, order
-}
-
-// repairRunGroups 在**一个短事务**里补齐该 Run 的全部半截组、并把仍为 `running` 的它收尾
-// （契约 §4.3.2 步骤 ③）。返回的读数是"这一趟真落了盘"的数量——事务回滚时两者都为零。
-// Repairs every half group of one run and closes it if still running, all inside a single
-// short transaction; a rolled-back transaction reports zero on both counters.
-func repairRunGroups(ctx context.Context, db *sql.DB, logger *slog.Logger, runID string,
-	groups []halfGroup, now time.Time,
-) (int, bool, error) {
-	var (
-		repairedGroups int
-		closed         bool
-	)
-	err := withTxOn(ctx, db, now, func(ctx context.Context, tx *sql.Tx) error {
-		repairedGroups = 0
-		closed = false
-
-		// 分类要看该 Run **当前**的状态：cancelled → "已取消…"、limit_reached → "未执行
-		// （工具调用次数超限）"、其余（含仍 running 与已终结的其它态）→ "未执行（进程中断）"。
-		status, found, err := lookupRunStatus(ctx, tx, runID)
-		if err != nil {
-			return err
-		}
-		reason := recoveryReasonFor(status)
-
-		for _, g := range groups {
-			if !found {
-				// 契约 §4.3.2 步骤 ③ 的明文：run_id 为空或找不到 runs 行时**仍然补组**——
-				// 历史里少一条 tool 结果会让整段会话对供应商不可用（400），比"给一个查不到
-				// Run 的组留白"严重得多；但这件事要有人看见，故 WARN 点名 run_id 与会话。
-				logger.Warn("崩溃恢复：半截组找不到对应的运行行（仍按进程中断补齐）",
-					"run_id", runID, "session_id", g.sessionID, "seq", g.seq)
-			}
-			for _, call := range g.missing {
-				content, err := core.SynthesizeMissingResult(ctx, recoveryAuditReader{q: tx}, runID, call, reason)
-				if err != nil {
-					// 查审计失败**不**写兜底文本（与取消路径的差别在时机）：这里还是开机，
-					// 整笔回滚、该 Run 留 running，下次启动会重扫一遍——不必在拿不准时落笔。
-					return fmt.Errorf("补齐半截工具组（session=%s, seq=%d, tool_call_id=%s）: %w",
-						g.sessionID, g.seq, call.ID, err)
-				}
-				// 写入与正常运行路径**共用同一份语句**（含 `seq` 分配与计数列递增）——
-				// 两处各写一份同义 SQL 就会有第二处漂移点。
-				m := core.Message{Role: core.RoleTool, Content: content, ToolCallID: call.ID}
-				// 恢复路径不产出装配记录，标识虽取回也不使用——但**不得**因此吞掉
-				// 「拿不到标识」的错误：那说明行本身不完整。
-				// Recovery emits no assembly record, yet the id is still read so a missing
-				// one surfaces as an error instead of an incomplete row.
-				if _, err := appendMessage(ctx, tx, g.sessionID, g.runID, m, now); err != nil {
-					return err
-				}
-			}
-			repairedGroups++
-		}
-
-		closedNow, err := closeAndReleaseRun(ctx, tx, runID, now)
-		if err != nil {
-			return err
-		}
-		closed = closedNow
-		return nil
-	})
-	if err != nil {
-		return 0, false, err
-	}
-	return repairedGroups, closed, nil
-}
-
 // lookupRunStatus 读该 Run 当前的状态（分类用）。行不存在返回 found=false——**不是错误**：
-// 半截组的 run_id 可能为空，也可能指向一个没有账本行的 Run（契约 §4.3.2 步骤 ③）。
+// 半截组的 run_id 可能指向一个没有账本行的 Run（契约 §4.3.2 步骤 ③）。
 // A missing ledger row is not an error here: it is one of the documented cases.
 func lookupRunStatus(ctx context.Context, q Queryer, runID string) (string, bool, error) {
 	var status string
@@ -414,7 +567,10 @@ func lookupRunStatus(ctx context.Context, q Queryer, runID string) (string, bool
 
 // recoveryReasonFor 把 Run 的当前状态映射为补齐分类的原因（契约 §4.4 五分支）。
 // 只影响"**无**审计行"的兜底文本：有终态行就还原真实结果，与原因无关。
-// Maps the run state onto the completion reason; it only shapes the no-audit-row fallback.
+//
+// 注意它与 A2 的 `executionOutcomeFor` **不是同一件事**：本函数产出的是**文案**，
+// 那个产出的是执行行的**状态值**。混用会写出约束外的取值（模块卡 §2.3.5 A2 注）。
+// Maps the run state onto the completion reason text — not onto an execution status.
 func recoveryReasonFor(status string) string {
 	switch core.RunStatus(status) {
 	case core.StatusCancelled:
@@ -426,47 +582,15 @@ func recoveryReasonFor(status string) string {
 	}
 }
 
-// closeAndReleaseRun 收尾**指定的、仍为 `running`** 的行，并在**同一事务**释放它的资源
-// 引用（步骤 ③④，约束 19 / 注 8）。两个动作必须一起提交：只关不加锁引用会让版本永远
-// 显示"被引用"，只释放不关行则是把 Running 的账静默变成"没有引用"。
-// 已终态的行不会被覆盖（`status = 'running'` 守卫），但它的残留引用照样释放——这正是
-// "终态 Run 残留补齐"在单 Run 面上的落点；行根本不存在时释放是 0 行 no-op。
-// closeAndReleaseRun closes the run and releases its references in the caller's
-// transaction; an already-terminal row keeps its status but still gets its residual
-// references released.
-//
-// `ex` 收执行面而非库句柄：步骤 ③ 在组修复的短事务里调用，步骤 ④ 由
-// closeRunInTransaction 开事务；两步的事务边界都在调用方，本函数不自开事务。
-func closeAndReleaseRun(ctx context.Context, ex sqlExecutor, runID string, now time.Time) (bool, error) {
-	closed, err := closeRunningRun(ctx, ex, runID, now)
-	if err != nil {
-		return false, err
-	}
-	// 三类引用一起释放，与正常收尾 `FinishRun` 同一口径：漏掉通知冻结会让渠道删除
-	// 永远点名一个已失败的 Run，漏掉凭据固定会让凭据资源永远显示被引用。
-	if _, err := releaseRunRefs(ctx, ex, runID, now); err != nil {
-		return false, err
-	}
-	if _, err := releaseRunCredentialRefs(ctx, ex, runID, now); err != nil {
-		return false, err
-	}
-	if _, err := releaseRunNotifyRefs(ctx, ex, runID, now); err != nil {
-		return false, err
-	}
-	return closed, nil
-}
-
-// closeRunningRun 把**指定的、仍为 `running`** 的行收尾为 `failed`（步骤 ③④ 的状态转换，
-// 引用释放由 closeAndReleaseRun 在同一事务内追加）。`WHERE status = 'running'` 是这条
-// 语句的全部意义：恢复扫描可能在任何时刻重跑，幂等靠它。
+// closeRunningRun 把**指定的、仍为 `running`** 的行收尾为 `failed`（A1 步骤 ⑥）。
+// `WHERE status = 'running'` 是这条语句的全部意义：并发接管与重跑都可能发生，幂等靠它。
 //
 // 同一条语句做另外两件事（C-32 / §3.4.2）：
 //   - `actor` 改写为 `recovery`——执行者与归属分开记，`caller_id` / `authorizing_kind`
 //     / `key_id` **一律不动**，恢复**不得**改写归属、**不得**提升成管理员；
 //   - caller-key 运行在收尾前复核**那一把**原授权 Key（未吊销、未过期、调用方仍
 //     启用、scope 仍覆盖该 Agent）。失效时 reason 记 `owner_unauthorized`——恢复
-//     不会自动重放，但"该 Run 的授权已经不在"必须留在同一行上，不得只写通用中断文案。
-//     复核必须在这条 SQL 内完成：`Recover` 的签名只拿到 `*sql.DB`，拿不到 KeyStore。
+//     不会自动重放，但"该 Run 的授权已经不在"必须留在同一行上。
 //
 // closeRunningRun performs the guarded status flip, marks the executor as recovery and
 // rechecks the bound caller key in the same statement; the owner columns never change.
@@ -491,7 +615,7 @@ func closeRunningRun(ctx context.Context, ex sqlExecutor, runID string, now time
 		        actor = $9,
 		        finished_at = $3
 		  WHERE run_id = $4 AND status = $5`,
-		string(core.StatusFailed), recoveryCloseReason, now.UnixMilli(), runID, string(core.StatusRunning),
+		string(core.StatusFailed), workerLostReason, now.UnixMilli(), runID, string(core.StatusRunning),
 		string(core.AuthorizingKindCallerKey), now.UnixMilli(),
 		recoveryOwnerUnauthorized, string(core.ActorRecovery))
 	if err != nil {
@@ -504,84 +628,28 @@ func closeRunningRun(ctx context.Context, ex sqlExecutor, runID string, now time
 	return affected > 0, nil
 }
 
-// closeRunInTransaction 为步骤 ④ 的单个 Run 开一个短事务，把收尾与引用释放一起提交
-// （约束 19）。步骤 ③ 已在组修复事务里，不能重复开事务——两条路径因此共用
-// closeAndReleaseRun，事务边界各自给。
-// closeRunInTransaction wraps closeAndReleaseRun in one short transaction for step ④;
-// step ③ already sits inside the group-repair transaction.
-func closeRunInTransaction(ctx context.Context, db *sql.DB, runID string, now time.Time) (bool, error) {
-	var closed bool
-	err := withTxOn(ctx, db, now, func(ctx context.Context, tx *sql.Tx) error {
-		var err error
-		closed, err = closeAndReleaseRun(ctx, tx, runID, now)
-		return err
-	})
+// releaseLeaseInTx 在调用方的事务里释放租约并记 `released` 事件。
+// 0 行即失权（我们已不是该代次的持有者）——整笔回滚，不带着错误认知提交。
+// releaseLeaseInTx releases the lease inside the caller's transaction.
+func releaseLeaseInTx(ctx context.Context, tx *sql.Tx, token core.LeaseToken, nowMS int64) error {
+	res, err := tx.ExecContext(ctx, `
+UPDATE execution_leases
+   SET released_at = $5
+ WHERE kind = $1 AND resource_id = $2 AND owner_worker_id = $3 AND ownership_epoch = $4
+   AND released_at IS NULL`,
+		string(token.Kind), token.ResourceID, token.OwnerWorkerID, token.OwnershipEpoch, nowMS)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("释放接管租约（%s/%s）: %w", token.Kind, token.ResourceID, err)
 	}
-	return closed, nil
-}
-
-// releaseTerminalRefs 补齐**已终态** Run 仍挂着的未释放引用（约束 19 末句）：步骤 ④ 只
-// 扫得到 running 行，而版本间残留 / 人工修库留下的行可能早就不是 running 了。一条语句
-// 按"Run 已终态"收口，幂等；**不**碰 running 行，也**不**补造清单或历史。
-// releaseTerminalRefs releases residual references on already-terminal runs; running rows
-// are untouched and nothing historical is fabricated.
-func releaseTerminalRefs(ctx context.Context, db *sql.DB, now time.Time) error {
-	return withTxOn(ctx, db, now, func(ctx context.Context, tx *sql.Tx) error {
-		// 三类引用各一条语句（与 `FinishRun` 释放的三张表一致）：只补资源引用会让
-		// 崩溃 Run 的通知冻结与凭据固定永远悬着，删除 / 范围转换被一个已失败的 Run 挡住。
-		statements := []struct {
-			table string
-			sql   string
-		}{
-			{"run_resource_refs", `UPDATE run_resource_refs
-			    SET released_at = $1
-			  WHERE released_at IS NULL
-			    AND run_id IN (SELECT run_id FROM runs WHERE status <> $2)`},
-			{"run_credential_refs", `UPDATE run_credential_refs
-			    SET released_at = $1
-			  WHERE released_at IS NULL
-			    AND run_id IN (SELECT run_id FROM runs WHERE status <> $2)`},
-			{"run_notify_refs", `UPDATE run_notify_refs
-			    SET released_at = $1
-			  WHERE released_at IS NULL
-			    AND run_id IN (SELECT run_id FROM runs WHERE status <> $2)`},
-		}
-		for _, statement := range statements {
-			if _, err := tx.ExecContext(ctx, statement.sql,
-				now.UnixMilli(), string(core.StatusRunning)); err != nil {
-				return fmt.Errorf("补齐终态运行的残留引用（%s）: %w", statement.table, err)
-			}
-		}
-		return nil
-	})
-}
-
-// listRunningRunIDs 扫出仍为 `running` 的 run_id（步骤 ④ 的取数面——"组看消息、Run 看表"
-// 里的表侧判据）。与 `RunStore.listRunning` 同一条判据、不同返回面：恢复只要 id，
-// 那具方法要 `*DB` 句柄而冻结签名只有裸 `*sql.DB`。
-// The table-side scan of step ④; it only needs the ids, unlike RunStore.listRunning.
-func listRunningRunIDs(ctx context.Context, db *sql.DB) ([]string, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT run_id FROM runs WHERE status = $1 ORDER BY started_at, run_id`, string(core.StatusRunning))
+	affected, err := res.RowsAffected()
 	if err != nil {
-		return nil, fmt.Errorf("扫描仍为 running 的运行行: %w", err)
+		return fmt.Errorf("确认接管租约释放: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("读仍为 running 的运行行: %w", err)
-		}
-		ids = append(ids, id)
+	if affected != 1 {
+		return core.ErrLeaseLost
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("扫描仍为 running 的运行行: %w", err)
-	}
-	return ids, nil
+	return appendLeaseEvent(ctx, tx, token.Kind, token.ResourceID, "released",
+		token.OwnerWorkerID, token.OwnershipEpoch, "", sql.NullInt64{}, "接管收尾后释放", nowMS)
 }
 
 // recoveryAuditReader 是 `core.ToolInvocationReader` 在**恢复事务内**的适配器：判据与

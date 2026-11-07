@@ -1504,9 +1504,82 @@ func (h *harness) prepareHeavy(t *testing.T, env []string, args []string) {
 	// provider 仍未发布（配置里没有或基线失败）时 seedBindings 自动跳过：交给被测命令
 	// 按原判据报错，夹具不替它掩盖。
 	// A provider that is still unpublished is left alone so the command under test reports it.
+	seeded := false
 	for _, doc := range docs {
-		h.seedBindings(t, doc.Path)
+		if h.seedBindings(t, doc.Path) {
+			seeded = true
+		}
 	}
+	// 首轮基线跑在绑定补齐**之前**：那时定义装载不过，基线不写生命周期索引，随后
+	// `assets install` 会报"生命周期索引里没有身份"、执行期准入 503 ASSET_UNAVAILABLE。
+	// 绑定改写过就必须再跑一次基线，把索引落下来，bundle 才发布得出去。
+	// The first warm-up ran before the bindings existed, so it left no lifecycle index
+	// entry; re-run it after seeding or every later admission fails with ASSET_UNAVAILABLE.
+	if seeded {
+		h.runBaselineWarmup(t, env)
+	}
+	// 定义已补齐：发布成内容寻址 bundle。US-24 起执行期只读准入时固定的 bundle，
+	// 改了工作区定义就必须重新发布，下一个 Run 才看得到（不发布 = ASSET_UNAVAILABLE）。
+	// 常驻 serve 持有实例锁时这里必然失败——夹具不越权：serve 运行期间改定义走控制台
+	// 提交路径（服务端在写路径上自己发布），这条失败只登记，不替用例判卷。
+	// Publish the seeded definitions: since US-24 the execution side reads the bundle fixed
+	// at admission, so a workspace edit only reaches the next run after a publication. A
+	// running serve holds the instance lock, so this attempt fails by design there; cases
+	// that change definitions mid-serve must go through the console write path instead.
+	h.publishAgentBundles(t, env, docs)
+}
+
+// publishAgentBundles 逐个把工作区里的当前定义发布成 bundle（失败的只登记）。
+// 失败不是测试失败：有的用例故意留下装载不通过的定义，判卷交给被测命令按原判据报错。
+// 例外是"生命周期索引里没有身份"：那是夹具的**时序**问题（定义在最近一次基线之后
+// 才落下），不是被测命令的判据——按运维顺序补跑一次启动基线再装，仍失败才登记。
+// publishAgentBundles publishes each agent's current definition; failures are logged
+// only, because some cases deliberately keep a definition that fails to load. A missing
+// lifecycle identity is fixture sequencing, so one baseline re-run is attempted first.
+func (h *harness) publishAgentBundles(t *testing.T, env []string, docs []bindingDoc) {
+	t.Helper()
+	warmed := false
+	for _, doc := range docs {
+		output, err, timedOut := h.installAgentBundle(t, env, doc.Agent)
+		if err == nil {
+			continue
+		}
+		if timedOut {
+			t.Fatalf("夹具发布 Agent %s 的资产超时（%s）\n%s",
+				doc.Agent, h.timeout(), h.redact(string(output)))
+		}
+		if !warmed && strings.Contains(string(output), "生命周期索引里没有身份") {
+			// 启动基线是索引的唯一写入方（`tool list` 触发）：定义晚于基线落下时，
+			// 第一次 install 读不到身份。补跑一次基线（幂等，只补建缺失行）后再装。
+			// The startup baseline is the only writer of the lifecycle index; when the
+			// definition landed after it, install cannot see an identity yet.
+			warmed = true
+			h.runBaselineWarmup(t, env)
+			output, err, timedOut = h.installAgentBundle(t, env, doc.Agent)
+			if err == nil {
+				continue
+			}
+			if timedOut {
+				t.Fatalf("夹具发布 Agent %s 的资产超时（%s）\n%s",
+					doc.Agent, h.timeout(), h.redact(string(output)))
+			}
+		}
+		t.Logf("夹具发布 Agent %s 的资产失败（常驻实例持锁或定义未就绪，交由被测命令判卷）：%v\n%s",
+			doc.Agent, err, h.redact(string(output)))
+	}
+}
+
+// installAgentBundle 跑一次 `assets install`，返回输出、错误与超时标记。
+// installAgentBundle runs one `assets install` invocation for the fixture.
+func (h *harness) installAgentBundle(t *testing.T, env []string, agent string) ([]byte, error, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, h.Binary, "assets", "install", "--agent", agent)
+	cmd.Dir = h.Root
+	cmd.Env = h.environ(env)
+	output, err := cmd.CombinedOutput()
+	return output, err, ctx.Err() != nil
 }
 
 // publishBeforeSnapshot 在用例**快照定义文件之前**完成一次启动基线发布并补齐夹具绑定，

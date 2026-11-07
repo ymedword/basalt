@@ -213,26 +213,32 @@ func TestFlow_CrashWindowMatrix(t *testing.T) {
 					t.Fatal("cancel request did not join after process kill")
 				}
 			} else if tc.unknown {
-				u.waitStatus(t, beforeTask, "blocked")
+				// US-24：启动不做全局扫描，A1 只按**过期租约**收尾叶子 Run（FR-24-02）。
+				// 根上有未决动作时 `Recover` 在写库前返回 ErrActionUnknown（R4–R7），根保持
+				// 非终态、动作守卫原样保留——它不是"本轮被写成了 blocked"，也不会自动推进。
+				// The root now stays non-terminal with its guard intact; it is never auto-advanced.
+				u.waitRunOver(t, beforeTask)
+				var rootStatus string
+				require.NoError(t, db.QueryRow(`SELECT status FROM flow_tasks WHERE task_id=$1`, beforeTask).Scan(&rootStatus))
+				require.False(t, flowStatusTerminal(rootStatus), "未决动作不得被自动收为终态")
 				r := u.control(t, beforeTask, "resume", "resume-unknown")
-				requireWebStatus(t, r, 409, "FLOW_ACTION_UNKNOWN", "", "unknown stays blocked")
+				requireWebStatus(t, r, 409, "FLOW_ACTION_UNKNOWN", "", "unknown action must not resume")
 				require.Equal(t, callsAtCrash, received.Load(), "unknown cannot issue another model call")
 				var held int64
 				require.NoError(t, db.QueryRow(`SELECT COALESCE(sum(reserved_tokens),0) FROM flow_budget_allocations WHERE task_id=$1 AND state IN ('pending','unknown')`, beforeTask).Scan(&held))
 				require.Positive(t, held)
 				closeResult := u.control(t, beforeTask, "cancel", "close-unknown")
-				requireWebStatus(t, closeResult, 200, "OK", "", "close without pretending no call happened")
+				requireCloseAccepted(t, closeResult, "close without pretending no call happened")
+				// 关闭可以收敛（收敛判据用 Isolated 而不是 Joined，FR-24-38），但不抹掉未知事实。
+				u.waitStatus(t, beforeTask, "cancelled")
 				require.Equal(t, callsAtCrash, received.Load())
 				var afterHeld int64
 				require.NoError(t, db.QueryRow(`SELECT COALESCE(sum(reserved_tokens),0) FROM flow_budget_allocations WHERE task_id=$1 AND state IN ('pending','unknown')`, beforeTask).Scan(&afterHeld))
 				require.Equal(t, held, afterHeld)
 			} else {
-				var status string
-				require.NoError(t, db.QueryRow(`SELECT status FROM flow_tasks WHERE task_id=$1`, beforeTask).Scan(&status))
-				if status == "blocked" && tc.name != "revision-before-commit" {
-					r := u.control(t, beforeTask, "resume", "resume-known")
-					requireWebStatus(t, r, 200, "OK", "", "resume known checkpoint")
-				}
+				// 非未决窗口由租约回收自动推进：A3 把 worker_lease_expired 的 blocked 根重入
+				// queued（FR-24-37），无需人工 resume；这里判的仍是"计划内的已知调用恰好发生"。
+				// Known windows converge automatically through the reclaimer; no resume needed.
 				u.waitStatus(t, beforeTask, "succeeded")
 				expectedCalls, expectedRuns := 2, 1
 				if tc.rework {

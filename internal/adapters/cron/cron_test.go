@@ -3,7 +3,6 @@ package cronadapter_test
 import (
 	"io"
 	"log/slog"
-	"sync"
 	"testing"
 	"time"
 
@@ -37,33 +36,39 @@ func occurrencesUTC(e *cronadapter.Engine, spec string, from, to time.Time, limi
 }
 
 // TestEngine_RejectsFiveFieldSpec —— 约束 4 / 5：6 段解析器必须拒绝 5 段表达式。
-// 逆改点：解析器退化为 5 段（`cron.Minute|cron.Hour|...`）→ 本用例 `Add` 成功，断言红。
+// 逆改点：解析器退化为 5 段（`cron.Minute|cron.Hour|...`）→ 本用例 `Next` 成功，断言红。
 func TestEngine_RejectsFiveFieldSpec(t *testing.T) {
 	e := newTestEngine()
 
-	_, err := e.Add("CRON_TZ=UTC 0 8 * * *", func() {})
-	require.Error(t, err, "5 段表达式不得注册（6 段制式，约束 4 / 5）")
+	_, err := e.Next("CRON_TZ=UTC 0 8 * * *", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	require.Error(t, err, "5 段表达式不得解析（6 段制式，约束 4 / 5）")
 }
 
 // TestEngine_RejectsMissingCRONTZ —— 约束 5：无 `CRON_TZ=` 前缀的 spec 必须拒绝。
 // robfig 缺省按进程本地时区解释，放行即把服务器时区带进触发。
-// 逆改点：不校验前缀 → `Add` 成功，断言红。
+// 逆改点：不校验前缀 → `Next` 成功，断言红。
 func TestEngine_RejectsMissingCRONTZ(t *testing.T) {
 	e := newTestEngine()
 
-	_, err := e.Add("0 0 8 * * *", func() {})
-	require.Error(t, err, "缺少 CRON_TZ= 前缀不得注册（约束 5）")
+	_, err := e.Next("0 0 8 * * *", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	require.Error(t, err, "缺少 CRON_TZ= 前缀不得解析（约束 5）")
 	require.Contains(t, err.Error(), "CRON_TZ", "错误必须点名缺失的前缀")
 }
 
-// TestEngine_ParsesSixFieldWithCRONTZ —— 约束 5：6 段 + `CRON_TZ=` 前缀正常注册。
-func TestEngine_ParsesSixFieldWithCRONTZ(t *testing.T) {
+// TestEngine_NextParsesSixFieldWithCRONTZ —— 约束 5 / §3.1.4：6 段 + `CRON_TZ=` 前缀
+// 解析成功，且 `Next` 严格晚于 from（起点恰为触发点 → 取下一次）。
+// 期望值是独立换算的字面量（D-16）：上海每日 08:00 = 00:00Z。
+func TestEngine_NextParsesSixFieldWithCRONTZ(t *testing.T) {
 	e := newTestEngine()
 
-	h, err := e.Add("CRON_TZ=Asia/Shanghai 0 0 8 * * *", func() {})
+	next, err := e.Next("CRON_TZ=Asia/Shanghai 0 0 8 * * *", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
 	require.NoError(t, err)
-	require.NotNil(t, h)
-	h.Stop()
+	require.Equal(t, "2026-10-02T00:00:00Z", next.UTC().Format(time.RFC3339),
+		"Next 严格晚于 from：起点正是当日触发点，故取次日")
+
+	mid, err := e.Next("CRON_TZ=Asia/Shanghai 0 0 8 * * *", time.Date(2026, 10, 1, 0, 0, 0, 1, time.UTC))
+	require.NoError(t, err)
+	require.Equal(t, "2026-10-02T00:00:00Z", mid.UTC().Format(time.RFC3339))
 }
 
 // TestEngine_OccurrencesFromFixedStart —— 约束 5 / TD §6.3 / agent-md §3.1：
@@ -164,100 +169,12 @@ func TestEngine_OccurrencesNoMoreTimes(t *testing.T) {
 	require.Len(t, got, 5, "每秒一次、含 to 本秒，窗口 5 秒恰 5 个")
 }
 
-// TestEngine_AddAndStop —— 句柄停止单个任务；同 spec 的多任务可并存。
-func TestEngine_AddAndStop(t *testing.T) {
-	t.Run("handle_stops_job", func(t *testing.T) {
-		e := newTestEngine()
-		fired := make(chan struct{}, 8)
-		h, err := e.Add("CRON_TZ=UTC * * * * * *", func() { fired <- struct{}{} })
-		require.NoError(t, err)
-		e.Start()
-
-		select {
-		case <-fired:
-		case <-time.After(5 * time.Second):
-			t.Fatal("任务未在 5 秒内触发")
-		}
-		h.Stop()
-
-		// 清掉停止前后可能已排队的触发，再跨过一个完整 tick 断言不再触发。
-		for {
-			select {
-			case <-fired:
-				continue
-			default:
-			}
-			break
-		}
-		select {
-		case <-fired:
-			t.Fatal("句柄停止后任务仍在触发")
-		case <-time.After(1500 * time.Millisecond):
-		}
-		<-e.Stop().Done()
-	})
-
-	t.Run("same_spec_two_jobs", func(t *testing.T) {
-		e := newTestEngine()
-		firedA := make(chan struct{}, 4)
-		firedB := make(chan struct{}, 4)
-		_, err := e.Add("CRON_TZ=UTC * * * * * *", func() { firedA <- struct{}{} })
-		require.NoError(t, err)
-		_, err = e.Add("CRON_TZ=UTC * * * * * *", func() { firedB <- struct{}{} })
-		require.NoError(t, err)
-		e.Start()
-		defer func() { <-e.Stop().Done() }()
-
-		for name, ch := range map[string]chan struct{}{"A": firedA, "B": firedB} {
-			select {
-			case <-ch:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("同 spec 的任务 %s 未触发", name)
-			}
-		}
-	})
-}
-
-// TestEngine_StopWaitsForJobs —— `Stop` 返回的 ctx 在在途 job 结束后才关闭。
-func TestEngine_StopWaitsForJobs(t *testing.T) {
-	e := newTestEngine()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	_, err := e.Add("CRON_TZ=UTC * * * * * *", func() {
-		once.Do(func() { close(started) })
-		<-release
-	})
-	require.NoError(t, err)
-	e.Start()
-
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("任务未在 5 秒内触发")
-	}
-
-	ctx := e.Stop()
-	select {
-	case <-ctx.Done():
-		t.Fatal("在途 job 未结束，Stop 的 ctx 不得关闭")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("job 结束后 Stop 的 ctx 仍未关闭")
-	}
-}
-
-// TestEngine_UnknownZoneFails —— 未知时区在解析期失败（Add 返回错误）。
+// TestEngine_UnknownZoneFails —— 未知时区在解析期失败（Next 返回错误）。
 func TestEngine_UnknownZoneFails(t *testing.T) {
 	e := newTestEngine()
 
-	_, err := e.Add("CRON_TZ=Not/AZone 0 0 8 * * *", func() {})
-	require.Error(t, err, "未知时区不得注册")
+	_, err := e.Next("CRON_TZ=Not/AZone 0 0 8 * * *", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	require.Error(t, err, "未知时区不得解析")
 }
 
 // TestParseOccurrences_MatchesEngine：包级 ParseOccurrences 与引擎同一套 6 段解析器

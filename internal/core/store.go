@@ -50,6 +50,14 @@ type MessageStore interface {
 // ErrRunNotFound means no ledger row exists for the id; the web layer maps it to 404.
 var ErrRunNotFound = errors.New("run not found")
 
+// ErrAdmissionOutcomeUnknown 表示准入事务的**提交结果未知**（连接中断 / 超时）：
+// 事务可能已提交、也可能没有。调用方**只能**按 Run 标识回查（`LookupAdmittedRun`），
+// 查得到就按成功继续、查不到就按失败返回——**不得**退款、**不得**重试，重试会在
+// "其实已提交"的分支上多记一次任务次数、多建一条 Run。
+// ErrAdmissionOutcomeUnknown marks an admission commit whose outcome is unknown. The
+// caller may only look the run up; refunding or retrying would double-book.
+var ErrAdmissionOutcomeUnknown = errors.New("core: admission outcome unknown")
+
 // RunFilter 是运行列表的三个过滤参数（约束 21）：只有会话 / Agent / 状态三个过滤，
 // 排序与窗口由仓储固定——**不得**随请求派生 ORDER BY 或任意分页参数。
 // RunFilter carries exactly the three allowed list filters; ordering and window are fixed
@@ -77,32 +85,123 @@ type RunDetail struct {
 	ManifestHash     string
 	FinishedAt       time.Time
 	ResourceManifest *RunResourceManifest
+	// WorkerInstanceID 是该 Run 的 run 租约**最后一个**负责人（未释放 / 已回收的
+	// 行都读得到）；迁移前的历史 Run 没有租约行，为空串。它只是诊断读数——归属
+	// 判定由 `LeaseStore` 负责，本字段不参与任何写入校验。
+	// WorkerInstanceID is the last owner of this run's lease; legacy runs have none.
+	// It is a diagnostic reading and never feeds an ownership check.
+	WorkerInstanceID string
+	// OwnershipEpoch 是该租约的归属代次（每接管一次加一）；无租约行时为 0，
+	// 与迁移回填的 `owner='legacy', epoch=0` 同形。
+	// OwnershipEpoch is the lease epoch, 0 when there is no lease row.
+	OwnershipEpoch int64
+	// AssetBundleHash 是准入时固定的资产包哈希（v3 清单起；更早的清单为空 =
+	// 未记录）。它只在详情读取时填充——列表不解析清单正文。
+	// AssetBundleHash is the frozen bundle hash from the v3 manifest; detail reads
+	// only, because lists never parse the manifest body.
+	AssetBundleHash string
 }
+
+// CallerAdmission 是调用方并发的判定输入，由装配层按既有 `caller_limits` 投影解析
+// （行 > 0 用行值；行 0 或无行回落实例上限；读失败 fail-closed）。`Enabled=false` 只表示
+// "不占调用方名额桶"（内置不限量管理员），**不**表示跳过实例上限、会话串行或审计。
+//
+// `ReservedForInteractive` 是**交互预留**：从 `MaxConcurrent` 中扣掉后，剩下的是 Flow
+// 叶 Run 的上限。它是"给交互留的"，不是"给 Flow 留的"——字段名反过来会让 Flow 上限算反。
+// 第二条限制只对 `IsFlow=true` 的请求生效；非 Flow 请求判了它，交互预留就会反过来拒绝
+// 本该被预留保护的交互 Run（与 `callers.Limiter.acquire` 的 `flow &&` 门控同形）。
+// 预检与事务内权威复查**必须**传同一个值。
+// CallerAdmission is the caller-concurrency input resolved by the assembly. The reserved
+// slice protects interactive runs, so the second limit applies to flow requests only.
+// Precheck and the authoritative recheck must receive the same value.
+type CallerAdmission struct {
+	Enabled                bool
+	MaxConcurrent          int
+	ReservedForInteractive int
+	IsFlow                 bool
+}
+
+// CallerAdmissionResolver 把调用方身份投影为一次准入的判定输入。接口声明在消费方
+// （`core`），实现落在 `app`——解析要读 `caller_limits` 行并回落实例上限，那是装配层
+// 才知道的事实。`Principal` 不合法时返回 `ErrUnauthorized`（fail-closed，不得回落成
+// `Enabled=false` 的"不限量"）。
+// CallerAdmissionResolver projects a principal into admission input; the assembly owns
+// the implementation. An invalid principal is refused rather than treated as unlimited.
+type CallerAdmissionResolver interface {
+	For(p Principal) (CallerAdmission, error)
+}
+
+// LifecycleExpectation 定义在 lifecycle.go（与 `LifecycleIndex` 端口同一文件）。
+// LifecycleExpectation lives in lifecycle.go, next to the index port that feeds it.
 
 // RunStore 是运行账本的读写接口。**不接受 finalText 参数**——最终回答只存在
 // RunResult 与会话的 assistant 消息里（§3.4：`runs` 表无 `final_text` 列）。
 // RunStore is the read/write interface of the run ledger. FinishRun takes no finalText:
 // the final answer lives in RunResult and the assistant message only.
 type RunStore interface {
+	// CheckAdmission 是**只读预检**：调用方并发计数在前、同会话活跃租约在后，与
+	// openapi 的错误优先级一致（429 CALLER_CONCURRENCY_LIMITED → 409 SESSION_BUSY）。
+	// 结论可能被 `StartRun` 的权威复查推翻；本方法**不写任何行**、不产生任何占用。
+	// 会话与实例两段按既有语义就地判定（预检不需要 advisory 锁）。
+	// CheckAdmission is the read-only precheck; its verdict may be overturned by the
+	// authoritative recheck inside StartRun, and it never writes a row.
+	CheckAdmission(ctx context.Context, sessionID string, p Principal, admission CallerAdmission) error
+
 	// StartRun 建 `status=running` 的账本行（`trigger` 由 Channel 按契约 §5 映射），并在
-	// 同一事务内写入准入清单与全部资源引用；任一失败整笔回滚（约束 18）。
+	// **同一事务**内完成权威准入、任务次数记账、清单与全部资源引用、run 租约；任一步
+	// 失败整笔回滚（零占用，FR-24-03 / FR-24-33）。
 	// `manifest.FormatVersion == 0` 表示装配尚未接线：只写运行行、**不伪造**清单——这类
 	// 运行在读取面如实呈现为"未记录"（legacy_unrecorded），不得补造。
-	// StartRun inserts the running row and, in the same transaction, the admission manifest
-	// and its resource refs. A zero manifest writes only the row — recorded as unrecorded,
-	// never fabricated.
-	StartRun(ctx context.Context, rec RunRecord, manifest RunResourceManifest) error
+	// 返回的 token 从这一次起就是本 Run 的执行权凭证：调用方把它填进 RunEnv 并在终态、
+	// 收尾与受保护写入面带上它。`rec.Lifecycle` 的零值表示调用方未提供期望值——准入
+	// **拒绝**而不是跳过最终复查（P-16）。提交结果未知返回 ErrAdmissionOutcomeUnknown。
+	// StartRun admits, accounts, writes the row/manifest/refs and creates the run lease in
+	// one transaction. The returned token is this run's credential from then on; a zero
+	// Lifecycle expectation is refused, never skipped. An unknown commit outcome returns
+	// ErrAdmissionOutcomeUnknown.
+	StartRun(ctx context.Context, rec RunRecord, manifest RunResourceManifest,
+		owner WorkerIdentity, admission CallerAdmission, runID string) (LeaseToken, error)
+
+	// LookupAdmittedRun 是提交结果未知后的唯一回查面：按 runID 读 Run 行与其 run 租约，
+	// 读得到就返回该租约的 token（调用方按成功继续），读不到返回 ErrRunNotFound。
+	// **不得**用它判断"是否该再试一次"——未知结果不重试。
+	// LookupAdmittedRun is the only lookup after an unknown commit; it never authorises
+	// a retry.
+	LookupAdmittedRun(ctx context.Context, runID string) (LeaseToken, error)
 
 	// FinishRun 把终态写回同一行（status / reason / iterations / tool_calls / finished_at），
 	// 并返回**本次调用是否真正完成了状态转换**（`applied`）：目标是终态（已终态 / 已删除）
 	// 时命中 0 行、返回 false。写失败**不得**覆盖已得结果：调用方如实返回 RunResult，
 	// 行留给下次启动的恢复扫描收尾。`applied` 是记忆抽取钩子的唯一触发判据——写失败或
 	// 幂等未转换一律不抽取（C-05）。
+	//
+	// token 非零时必须做归属 fencing（US-24 FR-24-36）：同一事务先锁租约行再校验
+	// 负责人 + 归属代次 + 未过期，不符返回 `ErrLeaseLost`；**只写终态列**，不释放引用、
+	// 不结算投递、不释放租约——收尾留给 `CompleteRunCloseout`。零值 token 表示该装配
+	// 没有租约（SQLite 谱系 / 轻装配 / 零值单测），走无 fencing 的纯条件更新。
 	// FinishRun writes the terminal state and reports whether this call performed the
 	// transition (applied). Zero rows — already terminal or deleted — returns false. A
 	// write failure must not overwrite an obtained result; recovery closes the row later.
-	// applied is the extraction hook's only trigger condition.
-	FinishRun(ctx context.Context, runID string, status RunStatus, reason string, iterations, toolCalls int, now time.Time) (applied bool, err error)
+	// applied is the extraction hook's only trigger condition. A non-zero token fences the
+	// write on owner + epoch + not-expired and never releases refs, deliveries or the lease.
+	FinishRun(ctx context.Context, runID string, token LeaseToken, status RunStatus, reason string, iterations, toolCalls int, now time.Time) (applied bool, err error)
+
+	// CompleteRunCloseout 是 Run 收尾的**最后一步**：引用释放（资源 / 凭据 / 通知三类，
+	// 幂等）与 run 租约释放在**同一事务**内提交，token 非零时同样做归属 fencing
+	// （US-24 FR-24-36 / 模块卡 §2.3.5）。调用时机固定在学习钩子与投递都结束之后；
+	// "该 run 无有效租约"精确等价于"收尾已完成，或属主已经不在了"——回收器的 B1
+	// 谓词正好用这一条。已释放的租约重放返回 nil（幂等），不属于本人的 token 返回
+	// `ErrLeaseLost`。
+	// CompleteRunCloseout releases refs and the run lease in one transaction. It runs last,
+	// after the learning hook and delivery settlement; a replay is idempotent.
+	CompleteRunCloseout(ctx context.Context, runID string, token LeaseToken, now time.Time) error
+
+	// RequestCancel 写 `runs.cancel_requested`：运行不在本进程时由**属主**在续约 /
+	// 检查点观察并自行收尾。非属主只写标志、如实返回当前状态——**不得**假装取消成功，
+	// 也不得代替属主提交终态（FR-24-22）。返回写后的运行详情；行不存在返回 ErrRunNotFound。
+	// RequestCancel writes the cancel flag; a non-owner only writes it and reports the
+	// current state truthfully. It never fakes a successful cancel.
+	RequestCancel(ctx context.Context, runID string) (RunDetail, error)
 
 	// ReleaseRunRefs 释放该 Run 的资源 / 凭据 / 通知三类引用（幂等，已释放的行跳过）。
 	// 调用时机固定在终态落库与抽取钩子**之后**、无条件执行：钩子要读的运行期客户端
@@ -307,6 +406,12 @@ type RunRecord struct {
 	Trigger       Trigger // 落库触发方式：scheduler 显式填 cron / manual；空 = 由 storage 按 Channel 映射（cli→user / web→api / scheduler→cron / admin→manual）
 	ConfigHash    string  // 本次运行使用的配置快照版本（关联 config_snapshots.hash）
 	StartedAt     time.Time
+	// Lifecycle 是准入 [1] 读到的生命周期期望值（P-16）：`StartRun` 在事务内与共享
+	// 索引比对，发布 / 归档竞争因此不能在"已固定版本、未落库"的窗口里插进来。
+	// 零值 = 调用方未提供 → **拒绝**（缺期望值就无法做最终复查）。
+	// Lifecycle carries the admission-time expectation rechecked inside StartRun's
+	// transaction; a zero value is refused rather than skipped.
+	Lifecycle LifecycleExpectation
 	// Flow associates an admitted Run with the already durable node attempt.
 	Flow *FlowRunContext
 }

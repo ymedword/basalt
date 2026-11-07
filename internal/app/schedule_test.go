@@ -231,22 +231,29 @@ func TestHeavyRuntime_CloseStopsSchedulerFirst(t *testing.T) {
 	require.NoError(t, err)
 
 	store := postgres.NewTaskStore(db)
-	engine := &orderProbeEngine{}
+	// 释放顺序的"调度器已先停"读数改在**到期扫描**上取（US-24 起引擎只剩纯计算，
+	// 没有 Stop 可观察）：扫描挂起到停机取消，Stop 返回即扫描已退出。
+	probeStore := newStopProbeStore(store)
 	sched := core.NewScheduler(core.SchedulerOptions{
-		Store:      store,
-		Invoker:    &scheduleTestInvoker{},
-		Engine:     engine,
-		CronSpec:   workspace.CronSpec,
-		RunTimeout: scheduleRunTimeout,
-		StopGrace:  scheduleStopGrace,
-		Logger:     slog.Default(),
-		Now:        func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
+		Store:         probeStore,
+		Invoker:       &scheduleTestInvoker{},
+		Engine:        stopProbeEngine{},
+		CronSpec:      workspace.CronSpec,
+		RunTimeout:    scheduleRunTimeout,
+		StopGrace:     scheduleStopGrace,
+		Logger:        slog.Default(),
+		Now:           time.Now,
+		Leases:        schedTestLeases{},
+		Worker:        schedTestWorker,
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 10 * time.Second,
 	})
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	t.Cleanup(cancelRun)
+	t.Cleanup(sched.Stop) // 失败路径下也要把挂在扫描上的 goroutine 收回来
 	require.NoError(t, sched.Start(runCtx))
 
-	probe := &releaseOrderProbe{engine: engine, store: store, root: f.root}
+	probe := &releaseOrderProbe{store: probeStore, root: f.root}
 	rt := &heavyRuntime{scheduler: sched, mcp: probe, db: db, lock: lock}
 	require.NoError(t, rt.Close())
 
@@ -311,62 +318,118 @@ func TestApp_SignalContextUsesInjectedNotifier(t *testing.T) {
 	require.Equal(t, 1, stopCalls, "stopSignals 必须是注入器返回的 cancel（调用方要能停掉信号监听）")
 }
 
-// orderProbeEngine 是 CronEngine 的探针实现：只记录 Stop 是否已被调用，不真正调度。
-// Stop 返回已完成的 ctx——没有在途作业，调度器停机立即收尾。
-// orderProbeEngine records whether Stop has run; it never schedules anything.
-type orderProbeEngine struct {
-	mu      sync.Mutex
-	stopped bool
-}
+// stopProbeEngine 是 CronEngine 的纯计算替身：下一次触发固定推后一小时，本文件的
+// 装配面用例因此不会在用例寿命内到期（US-24 起引擎不再持有作业或调度循环）。
+// stopProbeEngine only computes occurrences; nothing becomes due during these cases.
+type stopProbeEngine struct{}
 
-// Add 接受注册但不保存作业（本用例不触发运行）。
-// Add accepts registrations without keeping the job.
-func (e *orderProbeEngine) Add(string, func()) (core.CronHandle, error) {
-	return noopCronHandle{}, nil
-}
-
-// Start 是空实现：探针引擎没有调度循环。
-// Start is a no-op: the probe engine has no scheduling loop.
-func (e *orderProbeEngine) Start() {}
-
-// Stop 记录停机事实并返回一个已完成 ctx（无在途作业）。
-// Stop records the shutdown and returns an already-done context.
-func (e *orderProbeEngine) Stop() context.Context {
-	e.mu.Lock()
-	e.stopped = true
-	e.mu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
+// Next 把下一次触发推后一小时。
+// Next pushes the next occurrence one hour out.
+func (stopProbeEngine) Next(_ string, from time.Time) (time.Time, error) {
+	return from.Add(time.Hour), nil
 }
 
 // Occurrences 返回空集：本用例没有错过触发点的任务。
 // Occurrences returns nothing: there is no task with a missed trigger here.
-func (e *orderProbeEngine) Occurrences(string, time.Time, time.Time, int) []time.Time { return nil }
+func (stopProbeEngine) Occurrences(string, time.Time, time.Time, int) []time.Time { return nil }
 
-// wasStopped 报告 Stop 是否已执行（调度器先停的判据）。
-// wasStopped reports whether Stop has run — the "scheduler stops first" reading.
-func (e *orderProbeEngine) wasStopped() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.stopped
+// schedTestWorker 是装配面用例的 Worker 身份：领取执行权必须有真实归属
+// （空实例标识在仓储层就是装配错误）。
+// schedTestWorker is the worker identity these assembly cases lease with.
+var schedTestWorker = core.WorkerIdentity{
+	InstanceID:    "app-sched-test-worker",
+	Name:          "app-test",
+	Hostname:      "localhost",
+	Version:       "test",
+	SchemaVersion: 12,
 }
 
-// noopCronHandle 是探针引擎的注册句柄。
-// noopCronHandle is the probe engine's registration handle.
-type noopCronHandle struct{}
+// schedTestLeases 是执行权端口的空实现：本文件的用例不续约、不接管，也不需要
+// 受保护写入（RenewInterval 远长于用例寿命，keeper 一次都不会调用它）。
+// schedTestLeases is an inert lease port; the keeper never ticks within a case.
+type schedTestLeases struct{}
 
-// Stop 是空实现：探针作业不会被触发。
-// Stop is a no-op because the probe job never runs.
-func (noopCronHandle) Stop() {}
+// Acquire 拒绝：装配面用例从不主动领取租约（领取由数据库事务完成）。
+// Acquire is never expected on this path.
+func (schedTestLeases) Acquire(context.Context, core.LeaseKind, string, core.WorkerIdentity,
+	time.Duration,
+) (core.Lease, error) {
+	return core.Lease{}, core.ErrLeaseHeld
+}
+
+// Renew 原样返回零值租约：keeper 在用例寿命内不会触发续约。
+// Renew returns the zero lease; the keeper never ticks here.
+func (schedTestLeases) Renew(_ context.Context, token core.LeaseToken,
+	_ time.Duration,
+) (core.Lease, error) {
+	return core.Lease{LeaseToken: token}, nil
+}
+
+// Release 是空实现。
+// Release is a no-op.
+func (schedTestLeases) Release(context.Context, core.LeaseToken) error { return nil }
+
+// FencedTx 拒绝：需要受保护写入的用例在 postgres 包内，这里没有实现可委托。
+// FencedTx refuses; fenced writes are covered by the postgres cases.
+func (schedTestLeases) FencedTx(context.Context, core.LeaseToken,
+	func(context.Context, core.Tx) error,
+) error {
+	return core.ErrLeaseFenceUnavailable
+}
+
+// stopProbeStore 包住任务仓储，在**到期扫描**的收尾点读出"扫描 ctx 已被取消"。
+//
+// 首轮扫描挂起在 ctx 上（本用例的库没有到期任务，挂起不改变任何判定）：停机先取消
+// 扫描 ctx、再等扫描退出，因此"Stop 已返回"与"扫描已退出"是同一个可观测事实——
+// 它取代 US-24 之前观察引擎 Stop 的读数，判据（调度器先于 MCP 停止）一字不变。
+// The first due-scan parks on its context; since Stop cancels the scan and then joins
+// it, "Stop returned" and "scan exited" are one observable fact.
+type stopProbeStore struct {
+	core.TaskStore
+	once    sync.Once
+	entered chan struct{}
+	mu      sync.Mutex
+	exited  bool
+}
+
+// newStopProbeStore 包装任务仓储并暴露扫描进入 / 退出的事实。
+// newStopProbeStore wraps a task store and exposes scan entry / exit.
+func newStopProbeStore(inner core.TaskStore) *stopProbeStore {
+	return &stopProbeStore{TaskStore: inner, entered: make(chan struct{})}
+}
+
+// ListDispatchable 首次调用挂起到扫描 ctx 取消，并在返回前记录退出。
+// ListDispatchable parks on the first call and records the exit before returning.
+func (s *stopProbeStore) ListDispatchable(ctx context.Context, limit int) ([]core.DueTask, error) {
+	first := false
+	s.once.Do(func() {
+		first = true
+		close(s.entered)
+	})
+	if !first {
+		return s.TaskStore.ListDispatchable(ctx, limit)
+	}
+	<-ctx.Done()
+	s.mu.Lock()
+	s.exited = true
+	s.mu.Unlock()
+	return nil, ctx.Err()
+}
+
+// scanExited 报告首轮扫描是否已因停机取消而退出（"调度器先停"的判据）。
+// scanExited reports whether the first scan has already exited due to shutdown.
+func (s *stopProbeStore) scanExited() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exited
+}
 
 // releaseOrderProbe 是释放顺序探针（mcpConnector 实现）：在 MCP.Close 的调用点观察其余
 // 资源的可观测状态——调度器是否已停、库是否仍可读、实例锁是否仍被持有。
 // releaseOrderProbe observes the other resources at the exact MCP.Close call site.
 type releaseOrderProbe struct {
-	engine *orderProbeEngine
-	store  core.TaskStore
-	root   string
+	store *stopProbeStore
+	root  string
 
 	closeCalls                 int
 	schedulerStoppedAtMCPClose bool
@@ -384,7 +447,7 @@ func (p *releaseOrderProbe) Connect(context.Context, []core.MCPServerConfig) ([]
 // Close reads the state of the three resources without changing the release order.
 func (p *releaseOrderProbe) Close() error {
 	p.closeCalls++
-	p.schedulerStoppedAtMCPClose = p.engine.wasStopped()
+	p.schedulerStoppedAtMCPClose = p.store.scanExited()
 	if _, err := p.store.ListTasks(context.Background()); err == nil {
 		p.dbOpenAtMCPClose = true
 	}
@@ -426,13 +489,16 @@ func openScheduleDB(t *testing.T) *postgres.DB {
 func newScheduleTestScheduler(t *testing.T, cfg *cli.Config, entries []core.AgentEntry) (*core.Scheduler, *scheduleTestInvoker, core.TaskStore) {
 	t.Helper()
 
-	store := postgres.NewTaskStore(openScheduleDB(t))
+	db := openScheduleDB(t)
+	store := postgres.NewTaskStore(db)
 	invoker := &scheduleTestInvoker{}
-	a := &App{
-		logger: slog.Default(),
-		now:    func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
-	}
-	sched := a.newScheduler(store, invoker, entries, nil, nil, cfg, slog.Default(), nil, &postureBox{})
+	// 时钟用真实时间：到期集合由**数据库时钟**筛选（`ListDispatchable`），调度器
+	// 自己的读数若停在过去，每条扫描都会把同一任务重新判成到期并连跑。
+	// The clock is real: the due set is filtered by the database clock, so a past
+	// reading would make every scan claim the same task again.
+	a := &App{logger: slog.Default(), now: time.Now}
+	sched := a.newScheduler(store, invoker, entries, nil, nil, nil, cfg, slog.Default(), nil,
+		&postureBox{}, postgres.NewLeaseStore(db), schedTestWorker)
 	return sched, invoker, store
 }
 
@@ -900,15 +966,19 @@ func newArchiveScheduleFixture(t *testing.T, entries []core.AgentEntry, store co
 		writeAgentFixture(t, root, entry.Name)
 	}
 	sched := core.NewScheduler(core.SchedulerOptions{
-		Store:      store,
-		Invoker:    &scheduleTestInvoker{},
-		Engine:     &orderProbeEngine{},
-		Entries:    entries,
-		CronSpec:   workspace.CronSpec,
-		RunTimeout: scheduleRunTimeout,
-		StopGrace:  scheduleStopGrace,
-		Logger:     slog.Default(),
-		Now:        func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
+		Store:         store,
+		Invoker:       &scheduleTestInvoker{},
+		Engine:        stopProbeEngine{},
+		Entries:       entries,
+		CronSpec:      workspace.CronSpec,
+		RunTimeout:    scheduleRunTimeout,
+		StopGrace:     scheduleStopGrace,
+		Logger:        slog.Default(),
+		Now:           time.Now,
+		Leases:        schedTestLeases{},
+		Worker:        schedTestWorker,
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 10 * time.Second,
 	})
 	require.NoError(t, sched.Start(context.Background()))
 	t.Cleanup(sched.Stop)
@@ -974,15 +1044,19 @@ func newAdapterFixture(t *testing.T, root string, entries []core.AgentEntry, sto
 
 	loader := workspace.NewAgentLoader(workspace.AgentLoaderOptions{Logger: slog.Default()})
 	sched := core.NewScheduler(core.SchedulerOptions{
-		Store:      store,
-		Invoker:    &scheduleTestInvoker{},
-		Engine:     &orderProbeEngine{},
-		Entries:    entries,
-		CronSpec:   workspace.CronSpec,
-		RunTimeout: scheduleRunTimeout,
-		StopGrace:  scheduleStopGrace,
-		Logger:     slog.Default(),
-		Now:        func() time.Time { return time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC) },
+		Store:         store,
+		Invoker:       &scheduleTestInvoker{},
+		Engine:        stopProbeEngine{},
+		Entries:       entries,
+		CronSpec:      workspace.CronSpec,
+		RunTimeout:    scheduleRunTimeout,
+		StopGrace:     scheduleStopGrace,
+		Logger:        slog.Default(),
+		Now:           time.Now,
+		Leases:        schedTestLeases{},
+		Worker:        schedTestWorker,
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 10 * time.Second,
 	})
 	if start {
 		require.NoError(t, sched.Start(context.Background()))
@@ -1034,4 +1108,140 @@ func TestRegistrySync_AdapterKeepsClaimBaseline(t *testing.T) {
 	require.NoError(t, adapter.SetRegistered("demo", true))
 	_, ok = adapter.claims["demo"]
 	require.False(t, ok, "加入只放开准入，claim 由 ReconcileAgent 写入")
+}
+
+// ===== US-24：代投 Run 的五步收尾由调度器补齐（真实 PostgreSQL）=====
+
+// closeoutRecordingDelivery 只记录代投结算：本用例关心的是收尾末笔与租约，不在渠道上。
+// closeoutRecordingDelivery records settlement only; hardware and channels are out of scope.
+type closeoutRecordingDelivery struct {
+	mu        sync.Mutex
+	delivered int
+}
+
+func (d *closeoutRecordingDelivery) Prepare(context.Context, core.DeliveryIntent) error {
+	return nil
+}
+
+func (d *closeoutRecordingDelivery) Deliver(context.Context, core.DeliveryIntent, string) core.DeliveryOutcome {
+	d.mu.Lock()
+	d.delivered++
+	d.mu.Unlock()
+	return core.DeliveryOutcome{Status: core.DeliverySent}
+}
+
+func (d *closeoutRecordingDelivery) Skip(context.Context, core.DeliveryIntent, string) error {
+	return nil
+}
+
+func (d *closeoutRecordingDelivery) Recover(context.Context, time.Time, string) (int, error) {
+	return 0, nil
+}
+
+func (d *closeoutRecordingDelivery) deliveredCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.delivered
+}
+
+// closeoutInvoker 模拟服务侧的代投 Run：按调度器分配的 run_id 走真实准入（写 Run 行 +
+// 资源清单 + run 租约），只做五步收尾的第 1 步（终态提交）就把结果交回——这正是
+// `RunRequest.SuppressNotify=true` 时服务侧跳过 `CompleteRunCloseout` 的事实。
+// closeoutInvoker performs real admission and only the terminal-status step, mirroring a
+// service-side run that suppresses notify and leaves the closeout to the scheduler.
+type closeoutInvoker struct {
+	runs   *postgres.RunStore
+	worker core.WorkerIdentity
+
+	mu     sync.Mutex
+	runIDs []string
+}
+
+func (i *closeoutInvoker) Run(ctx context.Context, req core.RunRequest) (core.RunResult, error) {
+	rec := core.RunRecord{
+		RunID:     req.RunID,
+		Agent:     req.Agent,
+		Channel:   "cli",
+		Principal: core.LocalAdminCLIPrincipal(),
+		StartedAt: time.Now().UTC(),
+	}
+	token, err := i.runs.StartRun(ctx, rec, core.RunResourceManifest{},
+		i.worker, core.CallerAdmission{}, req.RunID)
+	if err != nil {
+		return core.RunResult{}, err
+	}
+	if _, err := i.runs.FinishRun(ctx, req.RunID, token, core.StatusCompleted,
+		"", 1, 0, time.Now().UTC()); err != nil {
+		return core.RunResult{}, err
+	}
+	i.mu.Lock()
+	i.runIDs = append(i.runIDs, req.RunID)
+	i.mu.Unlock()
+	return core.RunResult{RunID: req.RunID, Status: core.StatusCompleted, FinalText: "完成"}, nil
+}
+
+func (i *closeoutInvoker) firstRunID() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if len(i.runIDs) == 0 {
+		return ""
+	}
+	return i.runIDs[0]
+}
+
+// TestScheduler_DeliveredRunReleasesLeaseAfterCloseout 用真实 PostgreSQL 证明：系统代投
+// 的 Run 在投递结算之后补齐 `CompleteRunCloseout`，run 租约最终 `released_at` 非空。
+// 没有这一步，租约只能等自然过期，由回收器按终态残留接手——本 US 的 A1 本来就不碰
+// 终态 Run。装配走生产同一入口 `a.newScheduler`，防止"端口只在核心单测里接上"。
+//
+// 逆改点：`newScheduler` 传 nil closeout（或删掉 settleAndClose 的末笔）→ 租约
+// `released_at` 一直为空而红。
+// A real PostgreSQL proves the scheduler completes the fifth closeout step and the run
+// lease ends released.
+func TestScheduler_DeliveredRunReleasesLeaseAfterCloseout(t *testing.T) {
+	ctx := context.Background()
+	db := openScheduleDB(t)
+	store := postgres.NewTaskStore(db)
+	leases := postgres.NewLeaseStore(db)
+	runs := postgres.NewRunStoreWithLeaseTTL(db, time.Minute)
+	delivery := &closeoutRecordingDelivery{}
+	invoker := &closeoutInvoker{runs: runs, worker: schedTestWorker}
+
+	entries := []core.AgentEntry{{
+		Name:       "demo",
+		Registered: true,
+		Profile: &core.Profile{Schedules: []core.Schedule{{
+			ID: "deliver-closeout-1", Cron: "*/1 * * * * *", Zone: "UTC", Message: "巡检",
+			DeliverTo: "rs_01J8Z6YQ4M2S3T7V9W0X1Y2Z3A",
+		}}},
+	}}
+	a := &App{logger: slog.Default(), now: time.Now}
+	sched := a.newScheduler(store, invoker, entries, delivery, runs, nil,
+		&cli.Config{}, slog.Default(), nil, &postureBox{}, leases, schedTestWorker)
+	require.NoError(t, sched.Start(ctx))
+	t.Cleanup(sched.Stop)
+
+	var runID string
+	require.Eventually(t, func() bool {
+		runID = invoker.firstRunID()
+		return runID != ""
+	}, 10*time.Second, 20*time.Millisecond, "定时任务到点未发起运行")
+
+	released := func() bool {
+		var count int
+		err := db.QueryRowContext(ctx, `
+			SELECT count(*) FROM execution_leases
+			 WHERE kind = $1 AND resource_id = $2 AND released_at IS NOT NULL`,
+			string(core.LeaseRun), runID).Scan(&count)
+		return err == nil && count == 1
+	}
+	require.Eventually(t, released, 10*time.Second, 50*time.Millisecond,
+		"代投 Run 收尾后必须释放 run 租约（released_at 非空）")
+	require.Equal(t, 1, delivery.deliveredCount(), "投递结算与收尾末笔在同一轮完成")
+
+	// 收尾还必须在终态之后：Run 行已经是 completed，且没有任何未释放租约残留。
+	var status string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT status FROM runs WHERE run_id = $1`, runID).Scan(&status))
+	require.Equal(t, string(core.StatusCompleted), status)
 }

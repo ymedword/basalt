@@ -189,9 +189,13 @@ func TestFlow_DemoContractAndArtifacts(t *testing.T) {
 					task, err := rt.flows.service.Start(t.Context(), flow.StartRequest{Principal: core.LocalAdminCLIPrincipal(), DefinitionUID: published.DefinitionUID, IdempotencyKey: "eval", Input: catalog.Input})
 					require.NoError(t, err)
 					if script.Hold {
+						// 调度在**测试 goroutine** 里领租约：require 不得从子 goroutine
+						// FailNow。取消走关闭类写入，不需要根租约，所以持有期间 Cancel
+						// 照常生效（US-24 §2.3.6 写入分档）。
+						root := acquireFlowRootForTest(t, rt.db, task.RootTaskID)
 						done := make(chan error, 1)
 						go func() {
-							_, err := rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+							_, err := rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 							done <- err
 						}()
 						select {
@@ -206,13 +210,14 @@ func TestFlow_DemoContractAndArtifacts(t *testing.T) {
 						_, err = rt.flows.service.Cancel(t.Context(), flow.CancelRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, OperationID: "cancel-eval", Reason: "frozen cancellation"})
 						require.NoError(t, err)
 						require.NoError(t, <-done)
+						releaseFlowRootForTest(t, rt.db, root)
 						task, err = rt.flows.store.ReadForWorker(t.Context(), task.ID)
 						require.NoError(t, err)
 					} else {
 						if script.Fault == "artifact-insert-before-commit" {
 							_, err = rt.db.ExecContext(t.Context(), `CREATE SEQUENCE eval_fault_seq; CREATE FUNCTION eval_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('eval_fault_seq'); RAISE EXCEPTION 'frozen eval fault'; END $$; CREATE TRIGGER eval_fault BEFORE INSERT ON flow_artifacts FOR EACH ROW EXECUTE FUNCTION eval_fault()`)
 							require.NoError(t, err)
-							_, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+							_, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
 							require.Error(t, err)
 							_, err = rt.db.ExecContext(t.Context(), `DROP TRIGGER eval_fault ON flow_artifacts`)
 							require.NoError(t, err)
@@ -221,11 +226,20 @@ func TestFlow_DemoContractAndArtifacts(t *testing.T) {
 							require.NoError(t, rt.flows.store.ParkTask(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, task.Version, "eval_checkpoint"))
 							task, err = rt.flows.store.ReadForWorker(t.Context(), task.ID)
 							require.NoError(t, err)
+							// 两轮收敛（US-24 §2.3.6 / FR-24-38）：第一轮以 Isolated=true 把
+							// 子树里残留的 running attempt 收敛成 interrupted，结论仍是 Blocked；
+							// 第二轮没有 in-flight attempt 才允许写 Queued。单个 Recover 停在
+							// Blocked 是设计行为，不是失败——旧用例断言一轮即 Queued，那是进程内
+							// Joined 时代的语义。
 							task, err = rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, OperationID: "recover-eval", Reason: "original completed result"})
 							require.NoError(t, err)
+							require.Equal(t, flow.Blocked, task.Status, "第一轮只收敛子树，不放行推进")
+							task, err = rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, OperationID: "recover-eval-joined", Reason: "original completed result"})
+							require.NoError(t, err)
+							require.Equal(t, flow.Queued, task.Status, "第二轮 joined 成立才写 Queued")
 						}
 						for n := 0; n < 8 && !task.Status.Terminal() && task.Status != flow.Blocked; n++ {
-							task, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+							task, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
 							require.NoError(t, err, "reason=%s", task.Reason)
 						}
 						graph, err := rt.flows.store.ReadGraph(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)

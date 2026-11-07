@@ -66,10 +66,11 @@ type RunEnv struct {
 // config_hash 保持 ConfigSnapshot 原义；本清单单独记录 Provider / MCP / 技能的发布版本、
 // Provider 凭据版本与通知渠道 UID 集合，不得倒写进 config_hash，也不得用当前版本给历史 Run 补造。
 type RunResourceManifest struct {
-    FormatVersion  int                  // 清单格式版本；首版为 1，当前为 2（v1 可读）
+    FormatVersion  int                  // 清单格式版本；首版为 1，v2 增加 agent_uid / 凭据固定 / notify，当前为 3（v1 / v2 只读兼容，缺字段读作"未记录"）
     Hash           string               // 本清单规整序列化的 sha256
     AgentUID       string               // 准入时的 Agent 稳定身份（v2 起必填）
     AgentLifecycle string               // 准入时的生命周期状态（只可能为 active）
+    AssetBundleHash string              // 准入时固定的内容寻址资产包哈希（v3 起；旧清单为空 = 未记录，执行期只按它定位 bundles/<agent>/<hash>/）
     Provider       ProviderVersionRef   // 本 Run 使用的 Provider 发布版本 + 凭据版本
     MCPServers     []ResourceVersionRef // 实际生效的 MCP 版本（待重启内容不算）
     Skills         []SkillVersionRef    // 每个绑定技能的已发布版本与完整文件清单
@@ -200,7 +201,7 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 | --- | --- |
 | 同一 Session 有 Run 正在执行，又来一条消息 | **拒绝**：HTTP **409** + 可读文案（`该会话有正在执行的任务，请等待完成或稍后重试`）；CLI 提示等待 |
 | 不同 Session | 并行执行（goroutine，互不阻塞） |
-| 实例级并发上限 | 超过 `server.max_concurrent_runs`（缺省 32）→ 429 + 可读文案 |
+| 实例级并发上限 | 超过**本 Worker** 的 `server.max_concurrent_runs`（缺省 32）→ 429 + 可读文案；多 Worker 部署下该上限**按实例计**，不是集群总量（见 §3.2） |
 
 **不排队**。排队会把"这条消息什么时候有结果"变成不可预测的问题，且队列本身需要持久化——核心阶段明确不做。拒绝是即时、可解释、可重试的。
 
@@ -210,7 +211,11 @@ Basalt 的约定：达上限 = `limit_reached` 状态 + 部分结果。
 
 锁在**会话**上（`session_id`），不在 Agent 上：同一 Agent 的不同会话可以并行（例如两个工程师分别和运维助手对话）。
 
-锁是**进程内**的（`sync.Mutex` per session_id）。多副本部署的处理属扩展阶段。
+单进程仍用进程内快路径；多进程的**权威判定**是数据库内同会话未过期 run 租约 + 事务 advisory lock（会话键**在 Go 侧**由 `advisoryKey("basalt/session/"+session_id)` 派生——SHA-256 前 8 字节按两个 32 位半段拼成 `int64`，再以 `$1` 绑定给 `pg_advisory_xact_lock`；US-24 / 迁移 0012 的 `execution_leases`）。准入在 `StartRun` 事务内、持 advisory lock 复查并插入，二者是同一互斥边界。**恢复期间租约不释放**，故旧会话在新 Run 准入时仍为 `SESSION_BUSY`——直到恢复事务提交、旧 Run 落到终态为止。
+
+- **准入顺序原样保留**：并发 → 会话 / 实例 → 配额，并在 `StartRun` 事务内复查。任务次数记账并入同一事务，被拒请求整笔回滚（零占用）；**不再有"先预留后释放"的窗口**（Q21 改判）。
+- **实例并发上限按每个 Worker 计**：`server.max_concurrent_runs`（缺省 32）不是集群全局量，第二个 Worker 不因第一个满载被误拒。
+- **QPS 是每 Worker 软限额**：`internal/callers` 的 Limiter 各自放行 N，集群总量不承诺硬上限；周期配额走数据库记账，跨 Worker 生效。
 
 ### 3.3 重试与幂等（v0.1 承诺边界）
 
@@ -231,12 +236,13 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | Run 准入 | `AgentGate` 读锁 | 重读状态文件并校验（`active` 才放行）；**只覆盖状态重读与校验这一小段**，判定后立即释放——状态放行判定即准入线性化点 |
 | Run 准入 | `ResourceGate` 读租约 | 校验通过后取得：解析并固定 `RunResourceManifest` v2（Provider / MCP / 技能发布版本与哈希、Provider 凭据版本与目标绑定、按 `notify_mode` 枚举出的具体渠道 UID）；校验绑定 UID 的资格（共享或本 Agent 专属）与绑定完整性，写入 `run_resource_refs` / `run_credential_refs` / `run_notify_refs`；租约覆盖"资源解析 → 固定资源 → `StartRun` 事务成功"，失败路径归还租约并释放已固定运行时 |
 | 禁用 / 启用 | `AgentGate` 写锁 | 校验 `expected_state` / `expected_generation` → 原子写状态文件（generation + 1）→ 更新生命周期索引 |
-| 归档 | `AgentGate` 写锁 | 注销定时 → 标记 `archived` → 移出注册索引 → 取消在跑 Run 并等待 → 移动目录；失败按 §9.4 查证并恢复注册 |
+| 归档 | `AgentGate` 写锁 | **先立准入屏障**（`agent_lifecycle.state` 置 `disabled`，`prior_state` 落 `management_operations.detail_json`）→ 注销定时 → 发 `cancel_requested` → 有界等待属主观察 → 移出注册索引 → 移动目录；超时按 `prior_state` 回滚并 `409 AGENT_BUSY`；失败按 §9.4 查证并恢复注册 |
 
 - **禁用不取消已在跑的 Run**：它们继续完成；禁用返回后该 Agent 不再接受新 Run。但准入线性化点在状态放行判定——在禁用写锁取得**之前**已判定放行（并随即释放读锁）的准入，仍可能在禁用返回后完成 `StartRun`；**不得**声称"禁用返回即保证没有新 Run 开始"。归档才取消并等待。
 - 状态文件缺失 / 损坏时，准入在锁内直接拒绝（`409 AGENT_UNAVAILABLE`），**不得**回退为“按目录存在即 active”。
 - `AgentGate` 读锁只覆盖"重读状态文件并校验"，**不得**跨越资源解析、LLM 调用或工具执行；"资源已固定、账本未落库"的窗口由 `ResourceGate` 读租约覆盖（到 `StartRun` 事务成功为止），发布写锁因此插不进来；Run 开始后配置与资源版本已固定。
-- 归档等待有界（缺省 30 秒）；超时返回 `409 AGENT_BUSY` 并点名仍在运行的 Run，注册与生命周期状态回滚到归档前。
+- **归档先立屏障再等待**（US-24）：先把 `agent_lifecycle.state` 置为非 `active`（原值 `prior_state` 落 `management_operations.detail_json`），`StartRun` 事务内复查同一行 `FOR UPDATE` 即拒绝新 Run——屏障覆盖**所有 Worker**，不是只查本地忙碌。屏障落库后才发跨 Worker 取消（写 `runs.cancel_requested`），再有界等待属主观察。超时回滚状态并 `409 AGENT_BUSY` 点名仍在运行的 Run。**不是**"远程在跑即立刻 409"；远端 Run 仍在跑时**不得**假装取消成功或宣称归档完成。
+- 归档等待有界（缺省 30 秒）；超时返回 `409 AGENT_BUSY`，注册与生命周期状态回滚到归档前（按 `prior_state`）。
 - **准入绑定校验**：`resource_bindings` 缺少对 `provider.name` / `notify_channels` 的绑定 → `409 AGENT_RESOURCE_BINDING_MISSING`；绑定 UID 与当前发布指针不符、已删除或未发布 → `409 AGENT_RESOURCE_BINDING_INVALID`；绑定的资源是其他 Agent 的专属（或当前 Agent 使用声明外渠道）→ `409 RESOURCE_NOT_ELIGIBLE`；Provider 凭据已撤销 → `409 CREDENTIAL_REVOKED`；托管凭据因主密钥不可用无法解密 → `503 CREDENTIAL_UNAVAILABLE`。以上都只拒绝**新 Run**，不改写配置、不自动改绑、不静默回退到同名资源。
 - **准入固定粒度**：Provider 固定到**凭据版本**（`run_credential_refs`），Run 内每次模型调用前检查该版本状态；通知只固定**渠道 UID 集合**（`run_notify_refs`），**不**固定渠道凭据版本——每次发送解析当前 `active` 版本。两者不得互相套用。
 
@@ -273,26 +279,42 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 - **锁的生命周期由内核决定，不由写进文件的值推断**：进程存活期间一直持有；进程结束（正常退出 / 崩溃 / `kill -9` / 断电后重启）由**操作系统**释放。于是"锁拿不到"的唯一含义就是"另一个活进程正持有它"——Windows 上同理，进程消亡即释放
 - 锁文件里记录的 `instance_id` / `pid` / 心跳时间戳**只作诊断用**（拿不到锁时告诉运维"是哪个进程、从何时开始占着"）；**不得**仅凭心跳过期（如"超过 30 秒没刷新"）抢占锁——被 `SIGSTOP`、宿主挂起或长时间停顿的进程心跳同样会停，但它并没有退出，两个进程同时写库会直接击穿 §3.2 的会话串行契约。**心跳超时永远不构成抢锁的理由**
 - **不得**用"创建文件成功即持锁"（exists 判据）或"定期刷新时间戳"（心跳判据）实现互斥：前者在崩溃后因遗留文件**永久挡住启动**，后者在进程被暂停时**把锁骗给第二个进程**。锁文件**可以**留在磁盘上不清理——互斥由内核的锁承担，残留文件只是诊断信息；下次启动打开同一路径重新加锁即可
-- 拿不到锁 = 另一**活实例**在跑 → **写模式命令**（`serve` / `gateway` / `chat`，以及 `profile create` / `profile delete` 等会写工作区或数据库的 CLI 子命令）**拒绝启动**并给出可读文案（点名诊断信息里的 pid 与开始时间；服务在跑时指引改用 REST / 管理台——保存即生效）——这守的是既有并发契约：§3.2 的进程内会话锁跨不了进程，两个写实例会让"同会话串行 + 忙回 409"失效
-- **只有拿到锁的进程**在启动时执行一次崩溃恢复扫描（此刻不可能有别的活实例在写库）
+- 拿不到锁 = 另一**活实例**在跑 → **写模式命令**（`serve` / `gateway` / `chat`，以及 `profile create` / `profile delete` 等会写工作区或数据库的 CLI 子命令）**拒绝启动**并给出可读文案（点名诊断信息里的 pid 与开始时间；服务在跑时指引改用 REST / 管理台——保存即生效）。工作区实例锁语义**不变**——它守的是"同一工作区不被两个进程同时写文件与库"。多 Worker 部署是**每个 Worker 一个工作区**（各自的 `.basalt/basalt.lock`），跨 Worker 的会话串行由 §3.2 的数据库租约 + advisory lock 承担，**不是**由这把文件锁承担
+- **启动不再做全局崩溃恢复扫描**。恢复**只作用于本 Worker 合法领取的过期租约**（§4.3.2），其他主机上的活 Worker 与其在跑行不受影响——这正是 US-24 取代旧"拿到锁即扫全库"口径的地方：那把工作区锁只证明本工作区无第二个写者，不证明数据库里没有别的活 Worker
 - **只读命令**（`init`、`profile list` / `profile show`、`session list` 等）不取锁、不做恢复，也**不得**去清理或删除锁文件（那会破坏在跑实例的锁语义），直接读库；打开库前**必须**校验 `schema_version`（高于二进制支持的版本 → 拒绝并提示升级二进制，见 [schema.sql](schema.sql) 迁移纪律 2）
 
-> 实例锁是**工作区级**的（一个进程对一份 `.basalt`），与 §3.2 的**会话级**进程内锁是两回事：前者保证"库只有一个写者"，后者保证"同一会话只有一个 Run"。
+> 实例锁是**工作区级**的（一个进程对一份 `.basalt`）：它只把**同一个工作目录**的文件写入串行化，**不**保证"库里只有一个写者"。多 Worker 共用一套 PostgreSQL 时，跨 Worker 的单写者纪律由 §3.2 的 `execution_leases`（负责人 + 归属代次 + 过期判据）与数据库 advisory lock 承担；"同一会话只有一个 Run"同样由 §3.2 的会话 advisory lock 与 `run` 租约承担，与本文件锁无关。
 >
 > 边界：工作区放在 **NFS / SMB 等网络文件系统**上时，OS 锁的语义取决于服务端实现（可能不生效）——v0.1 **不支持**网络文件系统上的工作区（本地盘或块设备挂载）。
 
 #### 4.3.2 恢复扫描做什么
 
-拿到锁后、开始服务之前，**完整跑一遍**下面六步。每一步都**幂等**——重复执行结果相同，中途再崩一次，下次启动从头重跑也会收敛到同一结果。
+**输入集合改为本次合法领取的租约**（US-24）：六步算法原样保留，但不再由"启动拿到工作区锁"触发全局扫描，而由固定有界的回收循环（独立于 cron，条数上限 + 超时，不执行业务推进与模型 / 工具调用）对**本次合法领取的过期或已释放租约**执行。每一步都**幂等**——重复执行结果相同，中途再崩一次，下一轮重跑也会收敛到同一结果。
 
-1. **归一化审计行**：`llm_calls` 与 `tool_invocations` 中所有 `status = 'pending'` 的行 → 标 `unknown`（调用 / 工具是否已发生**无法确定**——外部副作用可能已产生）
-2. **扫未完成组（工具组的入口是消息，不是 `runs` 表）——按位置判定**：每条 `role = 'assistant'` 且 `tool_calls` 非空的消息即一组，取其在**同一会话内紧随其后（`seq` 更大且连续）的 `role = 'tool'` 消息段**（直到下一条非 `tool` 角色消息为止）；组内 `tool_call_id` 集合未覆盖该 assistant 的全部 `id` → 半截组。**不得**用"全会话按 `tool_call_id` 查找"作判据——旧 Run 留下过同 id 的结果行时，新 Run 复用该 id 后的半截组会被误判为已完成（供应商的调用 id 跨 Run 复用不受控，内部关联**不得**只靠它）
-3. **逐组修复，且与 Run 状态修复放进同一个短事务**：对每个含半截组的 Run（`messages.run_id`），在**一个事务**里做完两件事再提交——按 §4.4 补齐该 Run **全部**半截组缺的结果（合成结果只写 `messages`），并把该 Run 若仍是 `running` 则一并标 `failed`、`reason = '进程中断（启动时发现未完成的运行）'`、写 `finished_at`。崩溃发生在提交前 → 整个事务回滚，组与 Run 都保持原样，下次启动重新扫到；提交后 → 两者同时落地。因此**"Run 已翻成 failed 而组仍半截"这一中间态不可能持久化**
+**无租约的 `pending` 只报告不改写**：改写它等于替一个可能仍活着的 Worker 下结论。
+
+**A 类 / B 类分工**：A 类（`run` / `schedule_execution` / `flow_root` 三种租约）先以 `SKIP LOCKED` + 代次条件领取，再按作用域收尾；**只有接管路径（A1）**把归一化 → 补组 → 引用释放 → 投递结算 → 终态 → 释放租约合并为**一个事务**（那条路径上学习钩子已丢失，没有需要跨事务保留的进程内资源）。B 类（终态残留、Run 创建前的 `pending` 投递、孤儿学习抽取）**不领租约**，用幂等条件更新，重复执行无害——但幂等不是所有权证明，所有权仍由租约判。
+
+1. **归一化审计行**：`llm_calls` 与 `tool_invocations` 中 `status = 'pending'` 的行 → 标 `unknown`（调用 / 工具是否已发生**无法确定**——外部副作用可能已产生）；**范围限定在本次领取的 `run_id` 集合内**，库中其余 `pending` 行只进报告
+2. **扫未完成组（工具组的入口是消息，不是 `runs` 表）——按位置判定，范围限定在本次领取的 `run_id`**：每条 `role = 'assistant'` 且 `tool_calls` 非空的消息即一组，取其在**同一会话内紧随其后（`seq` 更大且连续）的 `role = 'tool'` 消息段**（直到下一条非 `tool` 角色消息为止）；组内 `tool_call_id` 集合未覆盖该 assistant 的全部 `id` → 半截组。**不得**用"全会话按 `tool_call_id` 查找"作判据——旧 Run 留下过同 id 的结果行时，新 Run 复用该 id 后的半截组会被误判为已完成（供应商的调用 id 跨 Run 复用不受控，内部关联**不得**只靠它）
+3. **逐组修复，且与 Run 状态修复放进同一个短事务**：对每个含半截组的 Run（`messages.run_id`），在**一个事务**里做完两件事再提交——按 §4.4 补齐该 Run **全部**半截组缺的结果（合成结果只写 `messages`），并把该 Run 若仍是 `running` 则一并标 `failed`、写 `finished_at`，`reason` 按后端见下方「租约丢失的 reason 字面量」。崩溃发生在提交前 → 整个事务回滚，组与 Run 都保持原样，下次启动重新扫到；提交后 → 两者同时落地。因此**"Run 已翻成 failed 而组仍半截"这一中间态不可能持久化**
    - 半截组的 `run_id` 为空、或找不到对应 `runs` 行（异常数据）→ **仍然补组**（Run 状态无从修复），记 WARN 点名该 `run_id` 与会话
    - 崩溃时的 Run 一律标 `failed`，即使它当时正走在取消路径上：进程死在把 `cancelled` 写下来之前，"已取消"是没写成的意图、不是事实
-4. **收尾剩余 `running` 的 Run，并释放已终态 Run 的资源引用（这一步扫 `runs` 表）**：第 3 步只覆盖**含半截组**的 Run，而崩溃还会留下**没有半截组可补**的 `running` 行——典型三种：正在等第一次 LLM 响应（还没有 `tool_calls` 落库）；最终回答已落库但终态未写；无状态 `invoke`（不落会话消息，消息里根本没有它的组）。它们同样必须收尾。故在**补组完成之后、开放服务之前**再扫一次 `runs`：仍为 `running` 的行全部 → `failed`、`reason = '进程中断（启动时发现未完成的运行）'`、写 `finished_at`；**同一轮**把 `run_resource_refs` 中 `released_at IS NULL` 且所属 Run 已是终态的行补写释放时间（覆盖“Run 已终态但引用未释放”的崩溃窗口）。第 3 步与第 4 步互补——**"这个组补齐了吗"只有消息能答，"这个 Run 结束了吗"只有 `runs` 能答**，两件事的入口不同，缺任何一个都会留下"永远 running"的记录
-5. **工作区替换残留判定**（多文件提交的目录交换中断，见技术方案 §3.4.2）：有 `<agent>/.backup` 且正式目录缺失 → **回滚**（把 `.backup` 恢复为正式目录）；正式目录完整且 `.backup` 尚在 → **前滚**（删除 `.backup` 与 `.staging` 残留）。判定只看文件系统状态，幂等可重跑，结果记 INFO 日志
-6. 恢复过程记 INFO 日志（数据库与工作区两部分），条数写进启动摘要
+4. **收尾剩余 `running` 的 Run，并释放已终态 Run 的资源引用（这一步扫 `runs` 表）**：第 3 步只覆盖**含半截组**的 Run，而崩溃还会留下**没有半截组可补**的 `running` 行——典型三种：正在等第一次 LLM 响应（还没有 `tool_calls` 落库）；最终回答已落库但终态未写；无状态 `invoke`（不落会话消息，消息里根本没有它的组）。它们同样必须收尾。故在**补组完成之后**再扫一次 `runs`（同样限定在本次领取的租约作用域）：仍为 `running` 的行全部 → `failed`、写 `finished_at`，`reason` 按后端见下方「租约丢失的 reason 字面量」；**同一轮**把 `run_resource_refs` / `run_credential_refs` / `run_notify_refs` 中 `released_at IS NULL` 且所属 Run 已是终态的行补写释放时间（覆盖“Run 已终态但引用未释放”的崩溃窗口，B 类的终态残留分支）。第 3 步与第 4 步互补——**"这个组补齐了吗"只有消息能答，"这个 Run 结束了吗"只有 `runs` 能答**，两件事的入口不同，缺任何一个都会留下"永远 running"的记录
+5. **工作区替换残留判定**（多文件提交的目录交换中断，见技术方案 §3.4.2）：有 `<agent>/.backup` 且正式目录缺失 → **回滚**（把 `.backup` 恢复为正式目录）；正式目录完整且 `.backup` 尚在 → **前滚**（删除 `.backup` 与 `.staging` 残留）。判定只看文件系统状态，幂等可重跑，结果记 INFO 日志。这一步只看**本工作区**的文件系统，与数据库租约无关，仍随进程启动做一次
+6. 恢复过程记 INFO 日志（数据库与工作区两部分），条数写进回收摘要 / 启动摘要
+
+**租约丢失的 reason 字面量**（机器可读，按后端）：
+
+| 触发路径 | 后端 | `runs.reason` |
+| --- | --- | --- |
+| 回收器接管已过期 run 租约收尾 | PostgreSQL | `worker_lost`（固定字面量） |
+| 同上，但绑定的调用方 Key 已失效（`owner_unauthorized` 优先于 `worker_lost`） | PostgreSQL | `owner_unauthorized` |
+| 属主连续续约失败达 `ttl - renewInterval`，或续约返回失权后自行收场 | PostgreSQL | `renew_failed`（固定字面量；Run 状态为 `cancelled`） |
+| 调度器处理错过宽限 | 两者 | `missed_grace_exceeded` |
+| 旧单机启动恢复（SQLite 谱系，保留不动） | SQLite | `进程中断（启动时发现未完成的运行）` |
+
+**reason 原文不出 API**：`runs.reason` 与日志保留上述字面量；HTTP 响应经 `publicRunReason` 投影（cancelled / failed / limit_reached 各有固定公开文案，仅 `ReasonIterationLimit` / `ReasonToolBudget` 透出），原始 reason 不得直接出现在响应里。
 
 > 为什么**工具组修复**不以 `runs` 表为入口：`runs.status = 'running'` 只说明"这个 Run 没结束"，而**半截组才是要修的东西**。以 Run 为入口、且"先标 `failed`、后补组"分两步提交时，中间再崩一次，下次启动的候选集里已经没有这个 Run（它不再是 `running`），半截组就**永久遗留**——用当前 DDL 在内存 SQLite 上构造过这个反例：恢复候选为 0、工具结果仍缺失。以**消息**为入口（步骤 2，不看 Run 状态）+ **状态与补齐同事务**（步骤 3），两个坑一起消掉：工作永远可被重新发现，中间态永远不可持久化。
 >
@@ -503,8 +525,15 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 409 | `EXECUTION_PROFILE_MISMATCH` | `PUT /execution-policy` 的 `expected_profile` 与库内当前档位不一致 | 给出当前档位；零写入、零操作行；与修订号 CAS 的 `CONFLICT` 分开 |
 | 409 | `IDEMPOTENCY_CONFLICT` | 同一幂等键的再次请求与首次参数（`class` / `cost`）不一致 | 点名冲突参数；**不得**静默复用旧结果或新建第二行 |
 | 409 | `MCP_APPLY_SUPERSEDED` | `apply` 期间发生 publish / revoke / 另一次 `apply`，本次被取代 | 点名取代者配置的 `superseded_by`；候选注册与候选连接已撤回，`applied` 与旧连接不变 |
+| 409 | `FLOW_ROOT_BUSY` | 管理面 `resume` / `revise` 需要把根推进（写 `queued`）时，`flow_root` 租约已被某个执行者持有 | 说明根任务正由执行者推进、请在其交棒后重试；**不重试、不降级成无租约写入**，`flow_tasks` 一行不改 |
 | 500 | `MCP_APPLY_FAILED` | `apply` 在预检之后的启动 / 握手阶段失败，候选已可靠回收 | 点名 `failure_class` 与目标版本；`data.operation_id` 供查证；旧连接状态如实说明（含"旧连接也不合法"的情形） |
 | 409 | `AGENT_COPY_BLOCKED` | 复制源 Agent 引用了源 Agent 专属资源，且未提供显式映射 | 列出需要映射的资源名与类型；不产生副本 |
+| 409 | `ASSET_VERSION_MISMATCH` | 本地资产包的目录名 / 逐文件哈希 / `bundle_hash` 与共享发布记录（`agent_bundle` 指针的 `content_hash`）不一致 | 点名 Agent 与"重新安装"入口；不回显文件内容或哈希明细；不静默换版本 |
+| 409 | `AGENT_LIFECYCLE_STALE` | 本地生命周期代次**低于**共享索引（另一个 Worker 已推进） | 给出两侧代次；本地**不得**把旧代次写回索引 |
+| 409 | `AGENT_LIFECYCLE_MISMATCH` | 同代次内容不一致、索引行缺失 / 非 active，或准入未携带生命周期期望值（零值即拒绝） | 给出状态与代次；走管理操作单调修复，不自动放行 |
+| 409 | `RESOURCE_VERSION_MISMATCH` | 准入事务内复查发现 Provider 的 `published_version_id` / MCP 的 `applied_version_id` / 凭据 pin 在预检之后被推进或删除（发布 / apply / 轮换插进了窗口） | 说明这一笔固定的是过期事实、重试即可；被拒请求零占用；**不得**以最新为准 |
+| 503 | `ASSET_UNAVAILABLE` | `agent_bundle` 发布指针缺失 / 已软删除，或本地内容寻址目录缺失 / 不可读 | 点名 Agent 与"先执行 `basalt assets install --agent <agent>`（首次发布）或 `basalt assets install <bundle_dir>`（装入已导出副本）"；**不**自动发布本地内容为真相 |
+| 503 | `RESOURCE_VERSION_MISMATCH` | Provider / MCP 的本地实例版本证明不成立（含 MCP 尚无已应用版本），且按同一目标版本重建-换入-再比后仍不符 | 说明可重试但**不得**以最新为准；修复入口是重启服务或重新发布该资源；不回显凭据或连接细节 |
 | 410 | `GONE` | 目标已被保留策略 / 软删移除，**不再**可读（被裁剪的消息、已软删的文档与版本） | 说明已不可读与原因；不回显原文、标题或片段 |
 | 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
 | 429 | `TOO_MANY_RUNS` | 实例级并发超限 | 给出当前上限 |

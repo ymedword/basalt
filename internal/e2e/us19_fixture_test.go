@@ -39,7 +39,13 @@ func newUS19Harness(t *testing.T, modelURL string, options ...us19HarnessOptions
 	if len(options) > 0 {
 		option = options[0]
 	}
-	config := configWithAddr(modelURL, addr) + "flows:\n  enabled: true\n  max_active: 2\n  poll_interval_ms: 100\n"
+	// US-24 起崩溃恢复由**过期租约的回收**触发，不再有启动全局扫描：接管发生在
+	// TTL 到期后的回收轮次。夹具把执行权时效压到用例可等待的量级（默认 30s TTL
+	// 会让每个崩溃窗口白等半分钟），判据仍是终态列，不放宽任何断言。
+	// Since US-24 takeover comes from reclaiming expired leases, the fixture shortens the
+	// lease timing so crash cases still converge inside their wait budgets.
+	config := configWithAddr(modelURL, addr) + fastWorkerSection() +
+		"flows:\n  enabled: true\n  max_active: 2\n  poll_interval_ms: 100\n"
 	if option.config != nil {
 		config = option.config(config)
 	}
@@ -117,13 +123,18 @@ func (u *us19Harness) start(t *testing.T, uid, key string) *webResponse {
 	return webRequest(t, u.addr, http.MethodPost, "/api/v1/flow-tasks", mustJSON(map[string]any{"definition_uid": uid, "input": map[string]any{"answer": "immutable input"}}), u.headers(key))
 }
 
+// waitStatus 等到根任务到达期望状态。US-24 起接管由**过期租约的回收轮次**驱动
+// （FR-24-02 / 卡片 §7 Q2：恢复最多等一个 TTL），不再是启动即扫描；预算因此覆盖
+// 夹具压缩后的 TTL（6s）+ 回收间隔（1s）+ 收尾耗时，判据仍是精确的终态值。
+// The budget now covers the fixture's shortened lease TTL plus a reclaim round; the
+// verdict is still the exact terminal status.
 func (u *us19Harness) waitStatus(t *testing.T, id, status string) {
 	t.Helper()
 	db := u.h.openDB(t)
 	var last string
 	require.Eventually(t, func() bool {
 		return db.QueryRow(`SELECT status FROM flow_tasks WHERE task_id=$1`, id).Scan(&last) == nil && last == status
-	}, 10*time.Second, 20*time.Millisecond, "task %s expected %s, last %s", id, status, last)
+	}, 30*time.Second, 20*time.Millisecond, "task %s expected %s, last %s", id, status, last)
 }
 
 func (u *us19Harness) restart(t *testing.T) {
@@ -131,6 +142,50 @@ func (u *us19Harness) restart(t *testing.T) {
 	u.p.kill()
 	u.p.waitExit(t, 10*time.Second)
 	u.p = startServeWithEnv(t, u.h, u.addr, u.env)
+}
+
+// waitRunOver 等到某个根的叶子 Run 被接管方按 A1 收尾（进入终态）。US-24 起崩溃恢复
+// 只作用于**合法领取的过期租约**（FR-24-02），因此这个等待同时是"接管真的发生过"
+// 的证据：它不依赖启动扫描，也不靠心跳推断死亡。
+// It waits until the root's leaf run was closed by a lease-driven takeover.
+func (u *us19Harness) waitRunOver(t *testing.T, taskID string) {
+	t.Helper()
+	db := u.h.openDB(t)
+	require.Eventually(t, func() bool {
+		var total, closed int
+		if err := db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE status IN ('failed','completed')) FROM runs WHERE flow_task_id=$1`, taskID).Scan(&total, &closed); err != nil {
+			return false
+		}
+		return total > 0 && total == closed
+	}, 30*time.Second, 20*time.Millisecond, "task %s expected its leaf run closed by the takeover reclaimer", taskID)
+}
+
+// requireCloseAccepted 接受关闭控制的两种合法回应：已收敛的 200，或关闭意图已受理、
+// 本地执行仍在收束的 202（`flowWriteView` 对 accepted 返回 202，见
+// internal/web/handlers_flow.go:101-108；US-19 起的既定契约）。两者 code 都是 OK。
+// 202 只证明受理，不证明收敛——调用方必须另以精确终态等待证明结果，不得把 202
+// 当失败，也不得把它当成功。
+// Accepts either the converged 200 or the accepted-but-still-joining 202; callers
+// must still wait for the exact terminal status.
+func requireCloseAccepted(t *testing.T, resp *webResponse, label string) {
+	t.Helper()
+	if resp.Status != 200 && resp.Status != 202 {
+		t.Fatalf("%s：HTTP = %d，期望 200 或 202（信封 %s）", label, resp.Status, resp.Raw)
+	}
+	if resp.Env.Code != "OK" {
+		t.Fatalf("%s：code = %q，期望 %q（信封 %s）", label, resp.Env.Code, "OK", resp.Raw)
+	}
+}
+
+// flowStatusTerminal 给出 Flow 任务状态的终态集合（与 `TaskStatus.Terminal` 同一口径，
+// e2e 不能 import internal/flow 的内部判定，只能复制字面量并在此标注来源）。
+// Terminal Flow task statuses, mirroring internal/flow/state.go.
+func flowStatusTerminal(status string) bool {
+	switch status {
+	case "succeeded", "failed", "stopped", "cancelled", "abandoned":
+		return true
+	}
+	return false
 }
 
 func (u *us19Harness) control(t *testing.T, id, action, op string) *webResponse {

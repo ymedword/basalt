@@ -21,6 +21,7 @@ import (
 	// 判卷侧走裸连接读库（与 providers_test.go / realcall_integration_test.go 同一先例）。
 	_ "modernc.org/sqlite"
 
+	"github.com/ymedword/basalt/internal/assets"
 	"github.com/ymedword/basalt/internal/cli"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/memory"
@@ -218,6 +219,73 @@ func (f *wireFixture) seedPublishedProviders(t *testing.T) {
 	}
 }
 
+// seedPublishedBundles 在**装配之后**为夹具里每个 Agent 发布一份内容寻址资产包：
+// US-24 的准入把 `agent_bundle` 指针当作期望哈希的**唯一**来源，缺指针即
+// `503 ASSET_UNAVAILABLE`（§2.3.9 首次初始化由显式安装完成、服务器不自动发布）。
+// 夹具因此必须替运维把"显式安装"这一步做掉，否则所有经 `service.Run` 的用例都会停在
+// 资产准入，而不是它们各自要判的那一步。
+//
+// 走的是与 `basalt assets install --agent` 同一条生产路径（`buildWorkspaceBundle` →
+// `assets.Install` → `bundlePublisher.Publish`），**不**给准入留旁路：模块卡 §2.3.9
+// 明确删除 `assets.require_bundle`，"资产校验是**无条件**不变量，不提供配置出口"。
+// 构建入口也复用生产那一份：夹具另拼一份配置路径（Agent 目录相对）会让执行期读不到
+// `agents/<agent>/AGENT.md`，用例就停在资产读取而不是它们各自要判的那一步。
+// 身份取装配时基线写下的生命周期索引（uid 由基线铸造，夹具不另造）；索引缺失或
+// uid 非法的 Agent 跳过——它们本来就进不了准入。
+//
+// seedPublishedBundles publishes one content-addressed bundle per fixture agent after
+// assembly through the very install/publication path the CLI uses; admission has no
+// bypass switch to lean on instead.
+func (f *wireFixture) seedPublishedBundles(t *testing.T) {
+	t.Helper()
+
+	if len(f.agents) == 0 {
+		return
+	}
+	ctx := context.Background()
+	db, err := postgres.Open(ctx, postgres.Config{DSN: f.dsn})
+	require.NoError(t, err, "种子资产包必须能写模式打开库")
+	defer func() { require.NoError(t, db.Close()) }()
+
+	versions := postgres.NewResourceStore(db)
+	operations := postgres.NewManagementStore(db)
+	publisher := newBundlePublisher(versions, operations, f.logger, time.Now)
+	// 资产根与运行期同一解析口径（`assets.bundle_root` 的缺省值 + 进程工作目录）：
+	// 夹具装的目录必须就是准入要读的目录，否则这条判据本身就成了假象。
+	assetRoot := resolveAssetBundleRoot(f.cfg, f.workDir)
+
+	for _, name := range f.agents {
+		// 身份走准入用的同一个读取口（`AgentIdentity` 读 `agent_lifecycle.agent_uid`）；
+		// 不取 `ReadLifecycleIndex` 的 `AgentUID`——那个字段是 v2 记录才有的，v1 行为空。
+		// The uid comes from the very reader admission uses; ReadLifecycleIndex leaves
+		// AgentUID empty on v1 records.
+		uid, _, ok, err := versions.AgentIdentity(ctx, name)
+		require.NoError(t, err)
+		if !ok {
+			continue // 基线没有为它写索引：没有身份，就没有可发布的 bundle
+		}
+		if _, err := core.ParseAgentUID(string(uid)); err != nil {
+			continue // v1 遗留记录没有 uid：准入会以身份缺失失败关闭，夹具不替它编造
+		}
+		if _, err := versions.PointerByUID(ctx, core.ResourceAgentBundle, core.ResourceUID(uid)); err == nil {
+			continue // 已发布（重复装配的用例会再次走到这里）：指针在即幂等跳过
+		} else {
+			require.ErrorIs(t, err, core.ErrResourceNotFound, "读指针的失败方式只能是「不存在」")
+		}
+
+		staging, err := os.MkdirTemp("", "basalt-fixture-bundle-")
+		require.NoError(t, err)
+		_, err = buildWorkspaceBundle(ctx, workspaceBundleDeps{Root: f.root, Versions: versions},
+			name, uid, staging)
+		require.NoError(t, err, "构建 %s 的资产包失败", name)
+		installed, err := assets.Install(ctx, staging, assetRoot)
+		require.NoError(t, err, "安装 %s 的资产包失败", name)
+		_, err = publisher.Publish(ctx, installed)
+		require.NoError(t, err, "发布 %s 的资产包失败", name)
+		require.NoError(t, os.RemoveAll(staging), "构建暂存目录用毕即删")
+	}
+}
+
 // writeAgent 落一份可装载的 AGENT.md：provider 指向探针，tools 取声明值。
 // 名字声明与目录名一致是装载规则 1；声明 pool 外的工具名 → 整只不注册（规则 4）。
 // writeAgent writes one loadable AGENT.md whose declared provider is the probe.
@@ -309,37 +377,71 @@ func (f *wireFixture) assemble(t *testing.T) *heavyRuntime {
 func (f *wireFixture) enableAgents(t *testing.T, rt *heavyRuntime) {
 	t.Helper()
 
+	// 启用之后紧接着就会有 Run 走准入；资产包必须先于这一步发布（US-24 §2.3.9）。
+	// Admission starts right after enabling, so the bundles must be published first.
+	f.seedPublishedBundles(t)
+	console := NewAgentConsole(AgentConsoleDeps{
+		Lifecycle:  rt.lifecycle,
+		Index:      rt.versions,
+		Gate:       rt.agentGate,
+		Operations: rt.ops,
+		Logger:     f.logger,
+		Now:        time.Now,
+	})
 	for _, name := range f.agents {
-		release := rt.agentGate.Lock(name)
-		err := activateAgent(context.Background(), rt.lifecycle, name)
-		release()
+		err := activateAgent(context.Background(), rt.lifecycle, console, name)
 		require.NoError(t, err, "启用 Agent %s 失败——基线必须已写下 disabled/1 的状态文件", name)
 	}
 }
 
-// enableAgentsBesideRuntime 用于只拿得到包外句柄（`OpenRuntime`）的用例：另建一份状态
-// 文件存储完成同一迁移。此时没有在途运行，文件是唯一权威；闸门只用于让迁移调用满足
-// "调用方持写锁"的前置条件。
-// enableAgentsBesideRuntime performs the same transition through a stand-alone store, for
+// enableAgentsBesideRuntime 用于只拿得到包外句柄（`OpenRuntime`）的用例：按同一个 DSN
+// 另建一份存储与索引完成同一迁移。此时没有在途运行，文件是唯一权威。
+// enableAgentsBesideRuntime performs the same transition through stand-alone stores, for
 // cases that only hold the exported handle; nothing is in flight at that point.
 func (f *wireFixture) enableAgentsBesideRuntime(t *testing.T) {
 	t.Helper()
 
-	gate := core.NewAgentGate()
+	// 同 `enableAgents`：包外句柄的用例同样经准入跑 Run，资产包要先发布。
+	// As in enableAgents, the exported-handle cases run through admission too.
+	f.seedPublishedBundles(t)
+
+	// 包外句柄拿不到装配里的实例：按同一个 DSN 另开一套。写的是**同一个库**，
+	// 准入读到的就是这里写下的代次。
+	ctx := context.Background()
+	db, err := postgres.Open(ctx, postgres.Config{DSN: f.dsn})
+	require.NoError(t, err, "启用 Agent 必须能写模式打开库（生命周期索引与状态文件同步）")
+	defer func() { require.NoError(t, db.Close()) }()
+
 	store := workspace.NewLifecycleStore(f.root, time.Now)
+	console := NewAgentConsole(AgentConsoleDeps{
+		Lifecycle:  store,
+		Index:      postgres.NewResourceStore(db),
+		Gate:       core.NewAgentGate(),
+		Operations: postgres.NewManagementStore(db),
+		Logger:     f.logger,
+		Now:        time.Now,
+	})
 	for _, name := range f.agents {
-		release := gate.Lock(name)
-		err := activateAgent(context.Background(), store, name)
-		release()
+		err := activateAgent(ctx, store, console, name)
 		require.NoError(t, err, "启用 Agent %s 失败——基线必须已写下 disabled/1 的状态文件", name)
 	}
 }
 
-// activateAgent 把状态文件迁到 active：已是 active 时原样返回（重复装配的用例因此
-// 可以再跑一次），其余状态按**读到的**状态与代数作前置条件——与生产迁移同一口径。
-// activateAgent transitions the state file to active; an already-active agent is a no-op
-// so restart cases can enable twice.
-func activateAgent(ctx context.Context, store *workspace.LifecycleStore, name string) error {
+// activateAgent 经**生产启停入口**（`agentConsole.Transition`）把状态文件迁到 active：
+// 已是 active 时原样返回（重复装配的用例因此可以再跑一次），其余状态按**读到的**
+// 状态与代数作前置条件。
+//
+// 不能只调 `LifecycleStore.Transition` 就完事：`StartRun` 在事务里用
+// `agent_lifecycle` 索引核对代次（US-24 FR-42），只迁状态文件会让准入看到
+// "本地代次 N+1 高于共享索引 N"并 `AGENT_LIFECYCLE_MISMATCH`；而索引行带
+// `operation_id` 外键，必须先有 pending 管理操作行。这两件事都已封装在 console 里
+// （`BeginOperation` → `Transition` → `PutLifecycleIndex` → 回填终态），夹具走它即可，
+// 不必自己拼顺序。
+// activateAgent goes through the production transition entry so the operation row and the
+// derived index are written in the one order production uses.
+func activateAgent(ctx context.Context, store *workspace.LifecycleStore, console core.AgentAdmin,
+	name string,
+) error {
 	record, exists, err := store.Read(ctx, name)
 	if err != nil {
 		return err
@@ -347,8 +449,10 @@ func activateAgent(ctx context.Context, store *workspace.LifecycleStore, name st
 	if exists && record.State == core.AgentActive {
 		return nil
 	}
-	_, err = store.Transition(ctx, name, record.State, record.Generation, core.AgentActive,
-		core.NewOperationID(time.Now()))
+	_, err = console.Transition(ctx, name, core.AgentActive, core.AgentLifecycleTransition{
+		ExpectedState:      record.State,
+		ExpectedGeneration: record.Generation,
+	}, consoleActor())
 	return err
 }
 
@@ -504,7 +608,11 @@ func (c *scriptedProviderClient) requests() []core.ChatRequest {
 }
 
 // TestWire_HeavyPathStepsAppearInOrder 是 T1：重路径的**十个**次序读数在日志里**按序**
-// 可见，且恢复完成的一条携带启动摘要的五个计数；装配失败时句柄不半开（锁被放回）。
+// 可见；`recover` 一步只做**工作区侧**残留判定并报告回滚 / 前滚计数——US-24 起启动
+// **不再**做全局账本扫描（FR-24-02：多 Worker 下按"启动时还看到 running"改写别的活
+// 实例的在跑行就是打断执行），账本六步改由回收器对**本次合法领取的过期租约**执行，
+// 启动摘要因此不再出现 unknowns / repaired_groups / closed_runs。装配失败时句柄不
+// 半开（锁被放回）。
 // 基线与管理面恢复各自是一条读数（图 A ③④）；US-12 追加对账 → 目录 → 注册表（图 A
 // ⑤⑥⑦）——定义对账先于运行目录与注册表，中间被别的步骤插队就是接线错了。
 // 14D T085 在迁移之后、恢复之前插入 `secrets`：它要读 `instance_secrets` 表（迁移之后
@@ -523,8 +631,11 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 		"重路径次序固定：取锁 → 写模式打开 → 显式迁移 → 实例加密 → 崩溃恢复 → 启动基线 → 管理面恢复 → 定义对账 → 运行目录 → 注册表（次序即正确性）")
 
 	recoverRec := findStep(t, fx.logs.String(), "recover")
-	for _, key := range []string{"unknowns", "repaired_groups", "closed_runs", "rolled_back", "rolled_forward"} {
-		require.Contains(t, recoverRec, key, "恢复完成的一条必须携带启动摘要（契约 §4.3.2 第 6 步）")
+	for _, key := range []string{"rolled_back", "rolled_forward"} {
+		require.Contains(t, recoverRec, key, "`recover` 步必须报告工作区残留判定的回滚 / 前滚计数（契约 §4.3.2）")
+	}
+	for _, key := range []string{"unknowns", "repaired_groups", "closed_runs"} {
+		require.NotContains(t, recoverRec, key, "US-24 起启动不得扫描账本；账本恢复只发生在回收器合法领取的过期租约上（FR-24-02）")
 	}
 
 	require.True(t, fx.migrated(t), "重路径第二步写模式打开：隔离 schema 此时已有运行期表")

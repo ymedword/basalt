@@ -78,7 +78,7 @@ func TestRunStore_StartRunLinksAdmissionReservation(t *testing.T) {
 
 	rec := startRow("web")
 	rec.ReservationID = reservation
-	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, startRunTest(store, ctx, rec, fx.manifest))
 
 	require.Equal(t, reservation, readRunReservationID(t, db, rec.RunID),
 		"账本行必须记下准入预留")
@@ -100,7 +100,7 @@ func TestRunStore_StartRunLinksReservationWithoutManifest(t *testing.T) {
 
 	rec := startRow("cli")
 	rec.ReservationID = reservation
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	require.Equal(t, reservation, readRunReservationID(t, db, rec.RunID))
 	require.Equal(t, rec.RunID, readReservationRunID(t, db, reservation),
@@ -123,7 +123,7 @@ func TestRunStore_StartRunRejectsUnknownReservation(t *testing.T) {
 
 	rec := startRow("web")
 	rec.ReservationID = "rsv-does-not-exist"
-	err := store.StartRun(ctx, rec, fx.manifest)
+	err := startRunTest(store, ctx, rec, fx.manifest)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "回填预留归属", "失败点必须是预留回填")
 	require.Contains(t, err.Error(), "不存在", "错误必须说清是预留不存在")
@@ -144,7 +144,7 @@ func TestRunStore_StartRunRejectsReservationOwnedByAnotherCaller(t *testing.T) {
 
 	rec := startRow("cli")
 	rec.ReservationID = reservation
-	err := store.StartRun(ctx, rec, core.RunResourceManifest{})
+	err := startRunTest(store, ctx, rec, core.RunResourceManifest{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "回填预留归属")
 	require.Contains(t, err.Error(), "不属于调用方", "错误必须点名归属不符")
@@ -166,11 +166,11 @@ func TestRunStore_StartRunRejectsReservationOfAnotherRun(t *testing.T) {
 
 	first := startRow("cli")
 	first.ReservationID = reservation
-	require.NoError(t, store.StartRun(ctx, first, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, first, core.RunResourceManifest{}))
 
 	second := startRow("web")
 	second.ReservationID = reservation
-	err := store.StartRun(ctx, second, core.RunResourceManifest{})
+	err := startRunTest(store, ctx, second, core.RunResourceManifest{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "已属于 Run", "错误必须点名该预留的实际归属")
 	requireNoRunTrace(t, db, second.RunID)
@@ -191,7 +191,7 @@ func TestBackfillReservationRun_IsIdempotentForSameRun(t *testing.T) {
 
 	rec := startRow("cli")
 	rec.ReservationID = reservation
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	require.NoError(t, backfillReservationRun(ctx, db.pool, rec),
 		"同一 Run 的重放必须幂等通过")

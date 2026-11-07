@@ -129,6 +129,7 @@ func TestAgentService_Cancel_DoesNotOverwriteTerminal(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, core.StatusCompleted, got.Status, "已完成的 Run 必须返回当前终态")
 	require.Equal(t, 0, h.store.finishCount(), "取消不得写终态")
+	require.False(t, h.store.cancelFlag("run-done"), "已终态不再写取消标志——幂等路径不该有写")
 
 	if _, err := h.service.Cancel(context.Background(), "run-missing"); !errors.Is(err, core.ErrRunNotFound) {
 		t.Fatalf("未知 run_id 的错误分类 = %v，期望 ErrRunNotFound", err)
@@ -181,16 +182,27 @@ func TestAgentService_Cancel_StopsWaitingOnCallerCancel(t *testing.T) {
 }
 
 // TestAgentService_Cancel_DatabaseRunningWithoutProcessEntry 守"运行不在本进程"：
-// 验收点（注 15）——库里 running 但内存无登记时如实返回当前状态并记 ERROR，不假装取消成功。
+// 验收点（注 15 / FR-24-22）——库里 running 但内存无登记时，改走 `RequestCancel` **只写**
+// 取消标志、如实返回当前状态（仍是 running），**不**假装取消成功，也不代替属主写终态。
+// 跨 Worker 标志的完整判据（续约响应带回、终态幂等）在 postgres 用例 §4.4.6。
 func TestAgentService_Cancel_DatabaseRunningWithoutProcessEntry(t *testing.T) {
 	h := newCancelHarness(t)
 	seedRunRow(h.store, "run-ghost", core.StatusRunning)
 
 	detail, err := h.service.Cancel(context.Background(), "run-ghost")
 	require.NoError(t, err)
-	require.Equal(t, core.StatusRunning, detail.Status)
+	require.Equal(t, core.StatusRunning, detail.Status, "非属主只写标志，不假装取消成功")
 	require.Equal(t, 0, h.store.finishCount(), "幽灵行同样不得被取消路径改写")
 	require.Contains(t, h.logs.String(), "运行不在本进程")
+	require.True(t, h.store.cancelFlag("run-ghost"), "非属主必须写取消标志，由属主观察")
+}
+
+// cancelFlag 读假仓储记录的取消标志（跨 Worker 取消的调用侧判据）。
+// cancelFlag reports the flag the fake store recorded.
+func (s *fakeStore) cancelFlag(runID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelRequested[runID]
 }
 
 // TestAgentService_Cancel_RepeatedReturnsCurrentState 守"重复取消幂等"：

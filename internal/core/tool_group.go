@@ -39,7 +39,7 @@ func (l *ReActLoop) runToolGroup(ctx context.Context, runID string, env *RunEnv,
 		return toolCalls, &result
 	}
 	for _, call := range calls {
-		if err := ctx.Err(); err != nil {
+		if err := context.Cause(ctx); err != nil {
 			return stop(env.cancelled(err, round, toolCalls), ReasonCancelled)
 		}
 		if env.Budget.ToolCallsExhausted(toolCalls) {
@@ -98,7 +98,7 @@ func (l *ReActLoop) runToolGroup(ctx context.Context, runID string, env *RunEnv,
 			return stop(env.fail(ErrFlowDispatch, round, toolCalls), ReasonRunFailed)
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return stop(env.cancelled(err, round, toolCalls), ReasonCancelled)
 	}
 	return toolCalls, nil

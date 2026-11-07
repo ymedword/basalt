@@ -12,7 +12,7 @@ import (
 
 func (s *FlowStore) Cancel(ctx context.Context, req flow.CancelTask) (flow.Task, error) {
 	r := req.Request
-	return s.closeFlowTask(ctx, r.Principal, r.TaskID, r.OperationID, r.Reason, r.Expected, flow.CloseCancel, req.Joined, false, req.Now)
+	return s.closeFlowTask(ctx, r.Principal, r.TaskID, r.OperationID, r.Reason, r.Expected, flow.CloseCancel, req.Joined, req.Isolated, false, req.Now)
 }
 
 func (s *FlowStore) Abandon(ctx context.Context, req flow.AbandonTask) (flow.Task, error) {
@@ -20,10 +20,16 @@ func (s *FlowStore) Abandon(ctx context.Context, req flow.AbandonTask) (flow.Tas
 	if !r.Principal.Valid() || r.Principal.Kind != core.PrincipalLocalAdmin || r.Actor.Subject == "" || r.Actor.Method == "" || r.Actor.Source == "" || strings.TrimSpace(r.Reason) == "" {
 		return flow.Task{}, core.ErrUnauthorized
 	}
-	return s.closeFlowTask(ctx, r.Principal, r.TaskID, r.OperationID, r.Reason, r.Expected, flow.CloseAbandon, req.Joined, req.NoAvailableCallerKey, req.Now)
+	return s.closeFlowTask(ctx, r.Principal, r.TaskID, r.OperationID, r.Reason, r.Expected, flow.CloseAbandon, req.Joined, req.Isolated, req.NoAvailableCallerKey, req.Now)
 }
 
-func (s *FlowStore) closeFlowTask(ctx context.Context, p core.Principal, id, op, reason string, expected flow.TaskVersion, intent flow.CloseIntent, joined, rescue bool, now int64) (flow.Task, error) {
+// closeFlowTask 收尾一个任务。两个判据各管一段（US-24 §3.1.7 / FR-24-38）：
+// joined 决定关闭阶段名（close-intent / close-join）与 CloseState 的目标状态；
+// isolated 决定 attempt 收敛——只有旧执行已隔离（根子树没有仍有效的 run 租约）时，
+// 才把整棵子树的 prepared / running attempt 标记为 interrupted，避免把别的 Worker
+// 正在跑的子 Run 记成已中断。
+// joined selects the close phase and target state; isolated gates attempt convergence.
+func (s *FlowStore) closeFlowTask(ctx context.Context, p core.Principal, id, op, reason string, expected flow.TaskVersion, intent flow.CloseIntent, joined, isolated, rescue bool, now int64) (flow.Task, error) {
 	var result flow.Task
 	if !p.Valid() || op == "" || len(op) > 256 || len(reason) > 4096 {
 		return result, flow.ErrStateConflict
@@ -99,7 +105,7 @@ func (s *FlowStore) closeFlowTask(ctx context.Context, p core.Principal, id, op,
 		if err := appendFlowTransition(ctx, tx, task, op, phase, hash, status, task.Version.Revision, now, reason, p); err != nil {
 			return err
 		}
-		if joined {
+		if isolated {
 			// This closes bookkeeping only; action outcome/unknown reservations stay.
 			if _, err := tx.ExecContext(ctx, `UPDATE flow_node_attempts SET state='interrupted',finished_at=$2 WHERE task_id=$1 AND state IN ('prepared','running')`, id, now); err != nil {
 				return err
@@ -110,7 +116,7 @@ func (s *FlowStore) closeFlowTask(ctx context.Context, p core.Principal, id, op,
 				return err
 			}
 		}
-		if err := propagateFlowClose(ctx, tx, task, intent, joined, rescue, op, hash, reason, p, now); err != nil {
+		if err := propagateFlowClose(ctx, tx, task, intent, joined, isolated, rescue, op, hash, reason, p, now); err != nil {
 			return err
 		}
 		result, err = readFlowTask(ctx, tx, id)
@@ -118,6 +124,21 @@ func (s *FlowStore) closeFlowTask(ctx context.Context, p core.Principal, id, op,
 	})
 	return result, err
 }
+
+// subtreeRunLeaseLockQuery 锁住根子树**现存**的全部 run 租约行（US-24 §2.3.6 注记 /
+// 评审 IDX-13）：它与 `FencedTx` 的"租约行 → 业务行"加锁顺序共用同一批行，从而与
+// "过期前已开始、正在提交"的那一笔串行化——对方持锁时本事务等待，对方提交后再重读。
+// `FOR UPDATE OF l` 只锁租约行，不锁 runs / flow_tasks，避免与 fenced 写入形成反向锁序。
+// Lock the subtree's run lease rows only; fenced writes lock the same rows first, so this
+// serializes Recover with a write that began before expiry and is committing now.
+const subtreeRunLeaseLockQuery = `
+SELECT 1
+  FROM flow_tasks t
+  JOIN runs r ON r.flow_task_id = t.task_id
+  JOIN execution_leases l ON l.kind = 'run' AND l.resource_id = r.run_id
+ WHERE t.root_task_id = $1
+ ORDER BY l.resource_id
+ FOR UPDATE OF l`
 
 func (s *FlowStore) Recover(ctx context.Context, req flow.ReconcileTask) (flow.Task, error) {
 	var result flow.Task
@@ -154,6 +175,26 @@ func (s *FlowStore) Recover(ctx context.Context, req flow.ReconcileTask) (flow.T
 		if status == flow.Queued && (intent != flow.CloseNone || task.CancelRequested || req.Now >= task.Deadline) {
 			return flow.ErrStateConflict
 		}
+		// Isolated 必须以**同一事务内、锁之后的实测**为准（US-24 §2.3.6 注记 / 评审 IDX-13）：
+		// 调用方在事务外算出的 req.Isolated 只是提示。先锁子树现存的 run 租约行，与
+		// "过期前已开始、正在提交"的那一笔串行化；持锁后再按数据库时钟重读判据，仍能
+		// 看到有效租约时一律不收敛 attempt，也不得把根写回 Queued。
+		// The caller's Isolated bool is only a hint: lock the subtree's run lease rows, then
+		// re-read the predicate with database time inside this same transaction.
+		isolated := req.Isolated
+		if isolated {
+			if _, err := tx.ExecContext(ctx, subtreeRunLeaseLockQuery, task.RootTaskID); err != nil {
+				return err
+			}
+			live, err := querySubtreeExists(ctx, tx, subtreeLiveRunLeaseQuery, task.RootTaskID, "Recover.Isolated")
+			if err != nil {
+				return err
+			}
+			isolated = !live
+		}
+		// 事务外的 Isolated 快照被锁后实测推翻：写 Blocked 而不是排队推进。
+		// A contradicted pre-transaction snapshot must fall back to Blocked, never Queued.
+		contradicted := req.Isolated && !isolated
 		if intent != flow.CloseNone || req.Now >= task.Deadline {
 			if intent == flow.CloseNone {
 				intent = flow.CloseDeadline
@@ -163,18 +204,23 @@ func (s *FlowStore) Recover(ctx context.Context, req flow.ReconcileTask) (flow.T
 				return err
 			}
 		} else if status == flow.Queued {
-			if !req.Joined || task.Status != flow.Blocked || r.Principal.KeyID != task.AuthorizingKeyID {
-				return flow.ErrStateConflict
-			}
-			if err := ensureFlowAncestorsOpen(ctx, tx, task, req.Now); err != nil {
-				return err
-			}
-			unknown, err := unknownFlowActions(ctx, tx, task.RootTaskID)
-			if err != nil {
-				return err
-			}
-			if unknown {
-				return flow.ErrActionUnknown
+			if contradicted {
+				// 锁后仍能看到有效 run 租约：子树未隔离，不得排队推进。
+				status = flow.Blocked
+			} else {
+				if !req.Joined || task.Status != flow.Blocked || r.Principal.KeyID != task.AuthorizingKeyID {
+					return flow.ErrStateConflict
+				}
+				if err := ensureFlowAncestorsOpen(ctx, tx, task, req.Now); err != nil {
+					return err
+				}
+				unknown, err := unknownFlowActions(ctx, tx, task.RootTaskID)
+				if err != nil {
+					return err
+				}
+				if unknown {
+					return flow.ErrActionUnknown
+				}
 			}
 		} else if status != flow.Blocked {
 			return flow.ErrStateConflict
@@ -197,13 +243,17 @@ func (s *FlowStore) Recover(ctx context.Context, req flow.ReconcileTask) (flow.T
 		if err := appendFlowTransition(ctx, tx, task, r.OperationID, "recover", hash, status, task.Version.Revision, req.Now, req.Reason, r.Principal); err != nil {
 			return err
 		}
-		if req.Joined {
-			if _, err := tx.ExecContext(ctx, `UPDATE flow_node_attempts SET state='interrupted',finished_at=$2 WHERE task_id=$1 AND state IN ('prepared','running')`, task.ID, req.Now); err != nil {
+		if isolated {
+			// 收敛整棵子树（US-24 §3.1.7 / FR-24-38）：只有旧执行已隔离时，才把子树里
+			// prepared / running 的 attempt 标为 interrupted；范围按 root_task_id 覆盖
+			// 全部子任务，而不是只动根行自身。
+			// Convergence covers the whole root subtree, not only the recovered row.
+			if _, err := tx.ExecContext(ctx, `UPDATE flow_node_attempts a SET state='interrupted',finished_at=$2 FROM flow_tasks t WHERE t.task_id=a.task_id AND t.root_task_id=$1 AND a.state IN ('prepared','running')`, task.RootTaskID, req.Now); err != nil {
 				return err
 			}
 		}
 		if intent != flow.CloseNone {
-			if err := propagateFlowClose(ctx, tx, task, intent, req.Joined, false, r.OperationID, hash, req.Reason, r.Principal, req.Now); err != nil {
+			if err := propagateFlowClose(ctx, tx, task, intent, req.Joined, isolated, false, r.OperationID, hash, req.Reason, r.Principal, req.Now); err != nil {
 				return err
 			}
 		}
@@ -243,7 +293,7 @@ func unknownFlowActions(ctx context.Context, q Queryer, root string) (bool, erro
 	return found, err
 }
 
-func propagateFlowClose(ctx context.Context, tx *sql.Tx, parent flow.Task, intent flow.CloseIntent, joined, rescue bool, op, hash, reason string, p core.Principal, now int64) error {
+func propagateFlowClose(ctx context.Context, tx *sql.Tx, parent flow.Task, intent flow.CloseIntent, joined, isolated, rescue bool, op, hash, reason string, p core.Principal, now int64) error {
 	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE subtree AS (
  SELECT task_id,0 AS level FROM flow_tasks WHERE task_id=$1
  UNION ALL SELECT t.task_id,s.level+1 FROM flow_tasks t JOIN subtree s ON t.parent_task_id=s.task_id WHERE s.level<3
@@ -294,7 +344,7 @@ func propagateFlowClose(ctx context.Context, tx *sql.Tx, parent flow.Task, inten
 		if err := appendFlowTransition(ctx, tx, child, op, phase, hash, status, child.Version.Revision, now, reason, p); err != nil {
 			return err
 		}
-		if joined {
+		if isolated {
 			if _, err := tx.ExecContext(ctx, `UPDATE flow_node_attempts SET state='interrupted',finished_at=$2 WHERE task_id=$1 AND state IN ('prepared','running')`, id, now); err != nil {
 				return err
 			}

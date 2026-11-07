@@ -771,7 +771,7 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 		db := openTempDB(t)
 		manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 		rec := startRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+		require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
 
 		report, err := Recover(ctx, db.write, testLogger(t), fixedNow)
 		require.NoError(t, err)
@@ -789,7 +789,7 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 		db := openTempDB(t)
 		manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 		rec := startRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+		require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
 
 		_, err := db.write.ExecContext(ctx, `CREATE TRIGGER recovery_block_release
 		    BEFORE UPDATE ON run_resource_refs
@@ -822,12 +822,12 @@ func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 	db := openTempDB(t)
 	manifest := recoveryLedgerManifest(t, seedRunManifest(t, db))
 	rec := startRow("web")
-	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+	require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
 
 	// 模拟"终态已写、释放没跑到"的残留：US-22 C-05 起 FinishRun 只写终态、不释放引用，
 	// 正是崩溃发生在终态与释放之间时留下的真实形态。
 	settled := fixedStart.Add(10 * time.Minute)
-	applied, err := NewRunStore(db).FinishRun(ctx, rec.RunID, core.StatusCompleted,
+	applied, err := NewRunStore(db).FinishRun(ctx, rec.RunID, core.LeaseToken{}, core.StatusCompleted,
 		"终态已写、释放未跑的残留", 1, 0, settled)
 	require.NoError(t, err)
 	require.True(t, applied)

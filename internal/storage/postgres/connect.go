@@ -42,7 +42,9 @@ import (
 // 9 = `0009_sandbox_execution.sql`（任务隔离生命周期与清理账本）；
 // 10 = `0010_skill_admission.sql`（技能学习准入候选、评估、决策与发布记录）；
 // 11 = `0011_memory_learning.sql`（记忆抽取账本、游标、候选元数据、候选来源与方法草案，
-// 并扩展 source / purpose 两个闭集）。
+// 并扩展 source / purpose 两个闭集）；12 = `0012_distributed_execution.sql`
+// （Worker 登记、执行权租约、租约状态转换、调度触发去重列与索引、跨 Worker 取消标志、
+// `resource_kind` 闭集加入 `agent_bundle`，以及三类在途行的立即过期租约回填）。
 // 迁移只追加，**不得**回头改建表字面量——既有库已经按 v1 建过表。
 // Version chain: 1 is the frozen contract baseline, 2 widens the binding kind set,
 // 3 repairs source_text; 4 gives immutable knowledge versions ordered revisions;
@@ -50,8 +52,11 @@ import (
 // 6 adds observability correlation and non-authoritative telemetry ledgers;
 // 7 appends the related-history retention ledger; 8 adds durable Flow ledgers;
 // 9 adds the sandbox execution ledger; 10 adds the skill admission ledgers;
-// 11 adds the memory learning ledgers and widens the source/purpose closed sets.
-const SupportedSchemaVersion = 11
+// 11 adds the memory learning ledgers and widens the source/purpose closed sets;
+// 12 adds worker nodes, execution leases with their transition log, DB-claimed scheduling
+// columns and indexes, the cross-worker cancel flag, and the agent_bundle resource kind.
+// Migrations are append-only: published scripts are never rewritten.
+const SupportedSchemaVersion = 12
 
 // undefinedTableSQLState 是 PostgreSQL 的 `undefined_table`（42P01）：它把"版本表不存在"
 // 从其他查询失败里区分出来，避免把连接故障误判成"未初始化"。

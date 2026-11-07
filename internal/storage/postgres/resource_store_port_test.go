@@ -508,21 +508,21 @@ func TestResourceStore_LifecycleIndexRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, store.PutLifecycleIndex(context.Background(), rec, true, ""))
 
-	got, valid, errMsg, err := store.LifecycleIndex(context.Background(), "writer")
+	got, valid, errMsg, err := store.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Empty(t, errMsg)
 	require.Equal(t, rec, got)
 
 	require.NoError(t, store.PutLifecycleIndex(context.Background(), rec, false, "状态文件校验和不符"))
-	got, valid, errMsg, err = store.LifecycleIndex(context.Background(), "writer")
+	got, valid, errMsg, err = store.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, err)
 	require.False(t, valid)
 	require.Equal(t, "状态文件校验和不符", errMsg)
 	require.Empty(t, got.State)
 	require.Zero(t, got.Generation)
 
-	missing, valid, errMsg, err := store.LifecycleIndex(context.Background(), "ghost")
+	missing, valid, errMsg, err := store.ReadLifecycleIndex(context.Background(), "ghost")
 	require.NoError(t, err)
 	require.False(t, valid)
 	require.Empty(t, errMsg)
@@ -1457,11 +1457,11 @@ func TestResourceStore_BackfillAgentUID(t *testing.T) {
 	require.Equal(t, "state_file", source)
 
 	// 已一致：幂等 no-op（updated_at 不刷新）。
-	before, valid, _, err := store.LifecycleIndex(ctx, "writer")
+	before, valid, _, err := store.ReadLifecycleIndex(ctx, "writer")
 	require.NoError(t, err)
 	require.False(t, valid)
 	require.NoError(t, store.BackfillAgentUID(ctx, "writer", testAgentUID, "op-bf-1", opNow.Add(time.Hour)))
-	after, _, _, err := store.LifecycleIndex(ctx, "writer")
+	after, _, _, err := store.ReadLifecycleIndex(ctx, "writer")
 	require.NoError(t, err)
 	require.Equal(t, before.UpdatedAt, after.UpdatedAt)
 
@@ -1540,4 +1540,97 @@ func TestResourceStore_WriteValidationAndZeroTime(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ptr.DeletedAt)
 	require.NotZero(t, *ptr.DeletedAt)
+}
+
+// TestResourceStore_EnsureVersionAgentBundle：`agent_bundle` 的 `ag_` 身份经**真实仓储
+// API** 落库——`resource_uid` 与 `resource_id` 同为规范化 AgentUID；幂等键是内容哈希
+// （bundle hash），二次调用 `inserted=false` 且版本号不变（US-24 §2.3.9 / P-19）。
+// 中文用例名：资产 bundle 版本经仓储 API 插入且按哈希幂等。
+func TestResourceStore_EnsureVersionAgentBundle(t *testing.T) {
+	db := portTestDB(t)
+	seedOperation(t, db, "op-ab-1")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	bundle := core.ResourceVersion{
+		Kind:         core.ResourceAgentBundle,
+		ResourceUID:  core.ResourceUID(testAgentUID),
+		ResourceID:   string(testAgentUID),
+		ContentHash:  "sha256:bundle-1",
+		ManifestJSON: `{"format_version":1}`,
+		StoragePath:  ".basalt/assets/bundles/writer/" + strings.Repeat("0", 64),
+		CreatedAt:    opNow.UnixMilli(),
+		OperationID:  "op-ab-1",
+	}
+	first, inserted, err := store.EnsureVersion(ctx, bundle)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.Equal(t, 1, first.VersionNo)
+	require.Equal(t, core.ResourceUID(testAgentUID), first.ResourceUID)
+	require.Equal(t, string(testAgentUID), first.ResourceID)
+
+	second, inserted, err := store.EnsureVersion(ctx, bundle)
+	require.NoError(t, err)
+	require.False(t, inserted, "同一 bundle hash 二次写入必须是幂等 no-op")
+	require.Equal(t, first.ID, second.ID)
+	require.Equal(t, first.VersionNo, second.VersionNo)
+
+	// 发布指针仍走 `resource_pointers`（P-19 / §2.3.9）：读取路径不另开一张表，
+	// 期望的 BundleHash 由 指针 → 版本行 content_hash 得到。
+	require.NoError(t, store.Publish(ctx, core.ResourceAgentBundle,
+		string(testAgentUID), first.ID, true, "op-ab-1", opNow))
+	ptr, err := store.Pointer(ctx, core.ResourceAgentBundle, string(testAgentUID))
+	require.NoError(t, err)
+	require.Equal(t, first.ID, ptr.PublishedVersionID)
+	require.Equal(t, core.ResourceUID(testAgentUID), ptr.ResourceUID)
+}
+
+// TestResourceStore_RejectsCrossKindUID：身份解析按 kind 分派——`agent_bundle` 只认
+// `ag_`、`skill` 只认 `rs_`；**两个方向都拒绝**（只放宽一类等于只校验不校准），
+// `agent_bundle` 也不接受用 Agent 名顶替 UID（存储层不按名称推断身份）。
+// 中文用例名：跨种类身份双向拒绝、拒绝路径零写入。
+func TestResourceStore_RejectsCrossKindUID(t *testing.T) {
+	db := portTestDB(t)
+	seedOperation(t, db, "op-xk-1")
+	store := NewResourceStore(db)
+	ctx := context.Background()
+
+	skillUID := resourceUIDFor(core.ResourceSkill, "research")
+	_, _, err := store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:         core.ResourceAgentBundle,
+		ResourceUID:  skillUID,
+		ResourceID:   string(skillUID),
+		ContentHash:  "sha256:cross-1",
+		ManifestJSON: `{"format_version":1}`,
+		StoragePath:  ".basalt/assets/bundles/writer/x",
+		OperationID:  "op-xk-1",
+	})
+	require.Error(t, err, "agent_bundle + rs_ 必须拒绝")
+
+	_, _, err = store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:         core.ResourceSkill,
+		ResourceUID:  core.ResourceUID(testAgentUID),
+		ResourceID:   string(testAgentUID),
+		ContentHash:  "sha256:cross-2",
+		ManifestJSON: `[]`,
+		StoragePath:  ".basalt/versions/skills/research/1",
+		OperationID:  "op-xk-1",
+	})
+	require.Error(t, err, "skill + ag_ 必须拒绝")
+
+	_, _, err = store.EnsureVersion(ctx, core.ResourceVersion{
+		Kind:         core.ResourceAgentBundle,
+		ResourceUID:  core.ResourceUID(testAgentUID),
+		ResourceID:   "writer",
+		ContentHash:  "sha256:cross-3",
+		ManifestJSON: `{"format_version":1}`,
+		StoragePath:  ".basalt/assets/bundles/writer/x",
+		OperationID:  "op-xk-1",
+	})
+	require.Error(t, err, "agent_bundle 的 resource_id 不能用 Agent 名顶替 AgentUID")
+
+	var count int
+	require.NoError(t, db.pool.QueryRowContext(ctx,
+		`SELECT count(*) FROM resource_versions`).Scan(&count))
+	require.Zero(t, count, "三种拒绝都必须零写入")
 }

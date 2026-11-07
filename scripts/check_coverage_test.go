@@ -170,6 +170,28 @@ func TestCheckCoverage_PostgresBaseNameUsesSeventyTier(t *testing.T) {
 	require.Contains(t, out, "(>= 50%)", "同内容的 p 包仍在 50% 档")
 }
 
+// TestCheckCoverage_AssetsBaseNameUsesSeventyTier 锁定 `assets` 档位：US-24 新增的
+// `internal/assets` 按模块卡 §4.7 与 `core` 同档（>= 70%）。与 postgres 用例同构：
+// 同树放两个内容相同、覆盖率同为 50% 的包，只有 `assets` 被判失败，证明档位只由
+// 包基名决定，不是别处凑巧。
+// TestCheckCoverage_AssetsBaseNameUsesSeventyTier locks the 70% tier for `assets`.
+func TestCheckCoverage_AssetsBaseNameUsesSeventyTier(t *testing.T) {
+	tree := writeTree(t, map[string]string{
+		"go.mod":           probeGoMod,
+		"p/p.go":           twoFuncs,
+		"p/p_test.go":      coverFFunc,
+		"assets/q.go":      withPackage("assets", twoFuncs),
+		"assets/q_test.go": withPackage("assets", coverFFunc),
+	})
+
+	out, err := runScript(t, "--tree", tree)
+	require.Error(t, err, "50%% 的 assets 包必须按 70%% 档判失败: %s", out)
+	require.Contains(t, out, "example.com/probe/assets")
+	require.Contains(t, out, "(< 70%)", "assets 包必须落在 70% 档")
+	require.Contains(t, out, "example.com/probe/p")
+	require.Contains(t, out, "(>= 50%)", "同内容的 p 包仍在 50% 档")
+}
+
 // TestCheckCoverage_NoStatementsSkipped 判据 3：无可执行语句的包跳过——即便是
 // 无测试文件、0% 的形态，也不得判失败（无从测量）。
 func TestCheckCoverage_NoStatementsSkipped(t *testing.T) {

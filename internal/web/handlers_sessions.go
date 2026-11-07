@@ -361,6 +361,38 @@ func (s *Server) writeRunAdmissionError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, core.ErrCredentialUnavailable):
 		s.writeError(w, http.StatusServiceUnavailable, codeCredentialUnavailable,
 			adminMessageOr(err, messageCredentialUnavailable))
+	// US-24 资产 / 生命周期准入（模块卡 §3.4）：前两个是"没有可用的发布事实 /
+	// 本地内容与记录不符"，中间两个是"代次落后 / 同代次不一致"，最后一个是本地实例
+	// 版本证明不成立。全部拒绝新 Run 且不产生 Run 行——**不得**退回按名称生成身份、
+	// 静默换版本或跳过校验。
+	// US-24 asset and lifecycle admission codes; every branch refuses the run.
+	case errors.Is(err, core.ErrAssetUnavailable):
+		s.writeError(w, http.StatusServiceUnavailable, codeAssetUnavailable,
+			adminMessageOr(err, messageAssetUnavailable))
+	case errors.Is(err, core.ErrAssetVersionMismatch):
+		s.writeError(w, http.StatusConflict, codeAssetVersionMismatch,
+			adminMessageOr(err, messageAssetMismatch))
+	case errors.Is(err, core.ErrAgentLifecycleStale):
+		s.writeError(w, http.StatusConflict, codeAgentLifecycleStale,
+			adminMessageOr(err, messageLifecycleStale))
+	case errors.Is(err, core.ErrAgentLifecycleMismatch):
+		s.writeError(w, http.StatusConflict, codeAgentLifecycleMismatch,
+			adminMessageOr(err, messageLifecycleMismatch))
+	// `RESOURCE_VERSION_MISMATCH` 一个码两种状态（契约 §8 两行；评审 IDX-15）：
+	// 经 `*core.ResourceUnavailableError` 包装 = 本地实例版本证明不成立 → 503
+	// （修本地实例）；裸 sentinel = 准入事务内复查发现指针 / 凭据 pin 在预检窗口内被
+	// 推进 → 409（重试这一笔即可）。两者都**不得**以最新为准。
+	// One code, two statuses: a wrapped instance-proof failure is 503; the plain
+	// sentinel raised by the in-transaction recheck is 409.
+	case errors.Is(err, core.ErrResourceVersionMismatch):
+		var unavailable *core.ResourceUnavailableError
+		if errors.As(err, &unavailable) {
+			s.writeError(w, http.StatusServiceUnavailable, codeResourceVersionMismatch,
+				adminMessageOr(err, messageResourceVersionMismatch))
+		} else {
+			s.writeError(w, http.StatusConflict, codeResourceVersionMismatch,
+				adminMessageOr(err, messageResourceVersionConflict))
+		}
 	default:
 		return false
 	}

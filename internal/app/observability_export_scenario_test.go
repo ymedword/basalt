@@ -64,7 +64,7 @@ func TestScenario_ExportFailureRecovery(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, o.Close()) })
 			for _, id := range []string{"source-a", "source-b", "source-c"} {
-				require.NoError(t, postgres.NewRunStore(h.db).StartRun(t.Context(), core.RunRecord{RunID: id, Agent: "synthetic", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now.Add(-10 * time.Minute)}, core.RunResourceManifest{}))
+				require.NoError(t, startRunTest(postgres.NewRunStore(h.db), t.Context(), core.RunRecord{RunID: id, Agent: "synthetic", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now.Add(-10 * time.Minute)}, core.RunResourceManifest{}))
 				_, err = h.db.ExecContext(t.Context(), `UPDATE runs SET status='completed',finished_at=$1 WHERE run_id=$2`, now.Add(-3*time.Minute).UnixMilli(), id)
 				require.NoError(t, err)
 			}

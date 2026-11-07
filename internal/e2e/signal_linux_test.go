@@ -10,14 +10,16 @@ package e2e
 // stay unverified there; the real-signal verdict runs on Linux / WSL / CI.
 //
 // 两个子测试的判据：
-//   - grace_exhausted：在途调度运行把 70s 停机宽限耗满——监听先关 → 宽限内运行存活
+//   - grace_exhausted：在途调度运行把排空宽限耗满——监听先关 → 宽限内运行存活
 //     → 到点取消 → 终态落库 → 进程按 0 退出且不挂死。取消耗时被夹在
 //     [signalGraceLower, signalGraceUpper] 之间，提前取消或永不取消都变红。
+//     US-24 起排空上界是 flows.shutdown_grace_seconds（缺省 35s，§2.3.11 [4]），
+//     取消由停机编排在排空到点时显式触发；旧的 70s 调度器兜底宽限不再是判据。
 //   - sigterm_order：serve 与 gateway 两种模式各收一次真实 SIGTERM——在途运行在宽限
 //     内继续走完 MCP 工具调用与收尾文本，证明「调度器先停、MCP 池后关」的释放次序；
 //     退出后无 started 残行，实例锁已释放。
-// The two subtests pin the 70s grace boundary and the release order (scheduler before the
-// MCP pool), each with a real SIGTERM against the built binary.
+// The grace-exhaustion case pins the figure-11 drain window (flows.shutdown_grace,
+// default 35s) and the order case pins the release order, each against a real SIGTERM.
 
 import (
 	"encoding/json"
@@ -38,11 +40,12 @@ const (
 	// signalScheduleLead is the cron lead time used by the other scheduler cases.
 	signalScheduleLead = 15 * time.Second
 
-	// signalGraceLower / signalGraceUpper 把 70s 宽限的取消点夹在中间：下界留 2s
-	// 时钟与调度抖动，上界再留 20s 给取消后的收尾与进程退出。
-	// The bounds bracket the 70s cancellation point with slack on both sides.
-	signalGraceLower = 68 * time.Second
-	signalGraceUpper = 90 * time.Second
+	// signalGraceLower / signalGraceUpper 把 flows.shutdown_grace_seconds（缺省 35s）
+	// 的取消点夹在中间：下界留 2s 时钟与调度抖动，上界再留 25s 给取消后的收尾与
+	// 进程退出（worker.shutdown_grace 45s 是硬上界，超出即非零退出）。
+	// The bounds bracket the figure-11 drain deadline (flows grace, 35s by default).
+	signalGraceLower = 33 * time.Second
+	signalGraceUpper = 60 * time.Second
 
 	// signalEchoText 是 SIGTERM 之后经 MCP 回显的合成文本（无敏感内容）。
 	// signalEchoText is the synthetic text echoed over MCP after SIGTERM.
@@ -66,12 +69,13 @@ func TestBackfill_SignalLinux(t *testing.T) {
 	t.Run("sigterm_order", testSignalOrder)
 }
 
-// testSignalGraceExhausted：调度器在途运行把 70s 宽限耗满的五阶段停机。
+// testSignalGraceExhausted：在途调度运行把排空宽限（flows.shutdown_grace_seconds，
+// 缺省 35s）耗满的五阶段停机。
 // 判据（事件序）：① 监听先关（新连接被拒）；② 宽限内进程与在途模型调用都还活着；
 // ③ 宽限到点才取消在途运行；④ 取消后进程按 0 退出、不挂死；⑤ 执行行以 failed 终态
 // 落库、无 started 残行。Web 层的宽限分支由组件缝 TestServer_ShutdownGraceExhausted
-// 覆盖——进程级 70s 只在调度器 StopGrace 上可达（HTTP 处理器受 60s RunTimeout 约束）。
-// testSignalGraceExhausted drives the scheduler's 70s stop grace to exhaustion and
+// 覆盖——进程级宽限只在调度执行的排空窗口上可达（HTTP 处理器受 60s RunTimeout 约束）。
+// testSignalGraceExhausted drives the figure-11 drain window to exhaustion and
 // asserts the five-phase order and the elapsed-time budget.
 func testSignalGraceExhausted(t *testing.T) {
 	h := newHarness(t)
@@ -97,7 +101,7 @@ func testSignalGraceExhausted(t *testing.T) {
 	// 进程也必须还活着（正在宽限里等它）。
 	select {
 	case <-model.aborted:
-		t.Fatalf("SIGTERM 后 %s 内在途运行就被取消：70s 宽限未生效", time.Since(signalAt))
+		t.Fatalf("SIGTERM 后 %s 内在途运行就被取消：排空宽限未生效", time.Since(signalAt))
 	case <-time.After(3 * time.Second):
 	}
 	select {
@@ -115,18 +119,18 @@ func testSignalGraceExhausted(t *testing.T) {
 	}
 	elapsed := time.Since(signalAt)
 	if elapsed < signalGraceLower {
-		t.Fatalf("在途运行在 SIGTERM 后 %s 就被取消：早于 70s 宽限（下界 %s）",
+		t.Fatalf("在途运行在 SIGTERM 后 %s 就被取消：早于排空宽限（下界 %s）",
 			elapsed, signalGraceLower)
 	}
 	if elapsed > signalGraceUpper {
 		t.Fatalf("宽限到期后的取消耗时 %s 超过上界 %s", elapsed, signalGraceUpper)
 	}
 
-	// ④ 收尾：取消后进程按 0 退出（不挂死）；msg=stop 是 cron 引擎停机标记。
+	// ④ 收尾：取消后进程按 0 退出（不挂死）；msg=停机完成 是编排层的成功停机标记。
 	if code := p.waitExit(t, 30*time.Second); code != 0 {
 		t.Fatalf("宽限耗尽后的退出码 = %d，期望 0\n%s", code, p.output())
 	}
-	requireContains(t, p.combined(), "msg=stop", "调度器停机标记")
+	requireContains(t, p.combined(), "msg=停机完成", "调度器停机标记")
 
 	// ⑤ 终态落库：执行行 failed、无 started 残行、任务 last_status 同步。
 	db := h.openDB(t)
@@ -220,7 +224,7 @@ func testSignalOrder(t *testing.T) {
 	if elapsed := time.Since(signalAt); elapsed >= signalGraceLower {
 		t.Fatalf("在途运行耗时 %s 才收场：预期在宽限内自然完成（< %s）", elapsed, signalGraceLower)
 	}
-	requireContains(t, p.combined(), "msg=stop", "调度器停机标记")
+	requireContains(t, p.combined(), "msg=停机完成", "调度器停机标记")
 
 	reqs := model.requests()
 	if len(reqs) != 2 {
@@ -330,7 +334,7 @@ func testSignalOrder(t *testing.T) {
 	if code := g.waitExit(t, 40*time.Second); code != 0 {
 		t.Fatalf("gateway 停机退出码 = %d，期望 0\n%s", code, g.output())
 	}
-	requireContains(t, g.combined(), "msg=stop", "gateway 停机标记")
+	requireContains(t, g.combined(), "msg=停机完成", "gateway 停机标记")
 
 	dbGateway := hGateway.openDB(t)
 	if n := scalarInt(t, dbGateway, `SELECT COUNT(*) FROM task_executions WHERE status = 'started'`); n != 0 {

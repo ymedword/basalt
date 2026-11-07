@@ -66,15 +66,25 @@ func (b *postureBox) Get() core.AdminPosture {
 
 // newScheduler 构造调度器；Entries 由 core.NewScheduler 在构造时拷成私有快照，
 // 适配器与 web 只读面此后都不回写它（P-05 / 约束 3）。
-// newScheduler builds the scheduler; core.NewScheduler snapshots Entries at construction,
-// so later mutations of the caller's slice cannot change definitions.
+//
+// US-24 起触发权在数据库（模块卡 §3.1.5 / §3.3）：除仓储与运行入口外，这里必须同时
+// 交出**执行权**装配——租约仓储、进程身份、租约 TTL 与续约节奏，以及到期扫描的轮询
+// 间隔 / 单轮上限 / 错失宽限。四项执行权装配缺任一项，core 会拒绝 Start
+// （`errSchedulerNoLeases`）：没有执行权就没有可续约、可 fencing 的执行，宁可起不来，
+// 也不得跑一条无法证明归属的定时执行。
+// newScheduler builds the scheduler and hands over the ownership wiring the database-driven
+// trigger path requires; a missing piece makes core refuse to start.
 func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entries []core.AgentEntry,
-	delivery core.ScheduleDelivery, gate core.ScheduleGate, cfg *cli.Config, logger *slog.Logger,
+	delivery core.ScheduleDelivery, closeout core.RunCloseout, gate core.ScheduleGate,
+	cfg *cli.Config, logger *slog.Logger,
 	ownerKeys core.OwnerKeyVerifier, posture *postureBox,
+	leases core.LeaseStore, worker core.WorkerIdentity,
 ) *core.Scheduler {
 	if logger == nil {
 		logger = a.loggerOr()
 	}
+	workerCfg := workerSettings(cfg)
+	schedCfg := schedulerSettings(cfg)
 	return core.NewScheduler(core.SchedulerOptions{
 		Store:        store,
 		Invoker:      invoker,
@@ -85,12 +95,38 @@ func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entrie
 		OwnerKeys:    ownerKeys,
 		AdminPosture: posture.Get,
 		Delivery:     delivery,
-		Budget:       webBudget(cfg),
-		RunTimeout:   scheduleRunTimeout,
-		StopGrace:    scheduleStopGrace,
-		Logger:       logger,
-		Now:          a.nowOr(),
+		// 代投 Run 的收尾末笔由调度器补（五步收尾的第 5 步）：Run 返回后投递才结算，
+		// 服务侧跳过 CompleteRunCloseout，把租约交还给调用方持有到投递落库为止。
+		// The scheduler owns the caller-side closeout for system-delivered runs.
+		Closeout:   closeout,
+		Budget:     webBudget(cfg),
+		RunTimeout: scheduleRunTimeout,
+		StopGrace:  scheduleStopGrace,
+		Logger:     logger,
+		Now:        a.nowOr(),
+		// 执行权：租约 TTL 与续约节奏取 `worker` 段的**同一份**值——运行入口建的 run
+		// 租约与这里建的 schedule_execution 租约因此不会各按一套时长过期。
+		// The lease timing comes from the one worker section, shared with run admission.
+		Leases:        leases,
+		Worker:        worker,
+		LeaseTTL:      workerCfg.LeaseTTL(),
+		RenewInterval: workerCfg.RenewInterval(),
+		// 到期扫描节奏取 `scheduler` 段（§3.3）。
+		PollInterval:  schedCfg.PollInterval(),
+		DispatchBatch: schedCfg.DispatchBatch,
+		MissedGrace:   schedCfg.MissedGrace(),
 	})
+}
+
+// schedulerSettings 取出 `scheduler` 段；配置文件整体缺失时（`cfg == nil` 或未经解码
+// 的零值）退回 §3.3 的冻结缺省。段存在时解析入口已填入缺省并通过装载期校验，这里不再判。
+// schedulerSettings falls back to the frozen defaults only when the config file itself is
+// absent; a present section has already been defaulted and validated at load time.
+func schedulerSettings(cfg *cli.Config) cli.SchedulerConfig {
+	if cfg == nil || cfg.Scheduler.PollIntervalMS == 0 {
+		return cli.DefaultSchedulerConfig()
+	}
+	return cfg.Scheduler
 }
 
 // lifecycleScheduleGate 把「生命周期状态是否为 active」接成调度门的默认实现

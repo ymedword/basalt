@@ -37,8 +37,12 @@ type fakeSchedulerDelivery struct {
 	prepareErr   error
 	recoverErr   error
 	recoverCount int
+	recoverCalls int
 	outcome      DeliveryOutcome
 	onPrepare    func()
+	// onDeliver 在发送进入锁之前执行：用例据此做"发送中"的事件记录或阻塞，
+	// 不占住替身自己的互斥锁。
+	onDeliver func()
 
 	prepares  []DeliveryIntent
 	delivers  []DeliveryIntent
@@ -64,6 +68,9 @@ func (d *fakeSchedulerDelivery) Prepare(_ context.Context, intent DeliveryIntent
 func (d *fakeSchedulerDelivery) Deliver(ctx context.Context, intent DeliveryIntent,
 	content string,
 ) DeliveryOutcome {
+	if d.onDeliver != nil {
+		d.onDeliver()
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.delivers = append(d.delivers, intent)
@@ -84,8 +91,18 @@ func (d *fakeSchedulerDelivery) Skip(_ context.Context, intent DeliveryIntent, r
 	return nil
 }
 
-func (d *fakeSchedulerDelivery) Recover(_ context.Context, _ time.Time) (int, error) {
+func (d *fakeSchedulerDelivery) Recover(_ context.Context, _ time.Time, _ string) (int, error) {
+	d.mu.Lock()
+	d.recoverCalls++
+	d.mu.Unlock()
 	return d.recoverCount, d.recoverErr
+}
+
+// recoverCallCount 读回 Recover 被调用的次数（US-24：启动路径必须为零）。
+func (d *fakeSchedulerDelivery) recoverCallCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.recoverCalls
 }
 
 func (d *fakeSchedulerDelivery) snapshot() (prepares, delivers []DeliveryIntent, skips []string) {
@@ -299,27 +316,32 @@ func TestScheduler_DeliveryUsesIndependentDeadline(t *testing.T) {
 		delivery.deliverDeadline, 2*time.Second)
 }
 
-// TestScheduler_DeliveryRecoverAtStart —— 启动时恢复遗留 pending 行；恢复失败是致命的，
-// 调度器不得带着未恢复的投递行开始接单。
-// Startup recovery runs before serving, and its failure is fatal.
-func TestScheduler_DeliveryRecoverAtStart(t *testing.T) {
-	t.Run("failure is fatal", func(t *testing.T) {
-		delivery := &fakeSchedulerDelivery{recoverErr: errors.New("database is locked")}
-		fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery, nil)
-		err := fixture.sched.Start(context.Background())
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "recover schedule deliveries")
-	})
+// TestScheduler_Start_DoesNotRecoverDeliveriesGlobally —— US-24 起**启动不做全局恢复**
+// （FR-24-02 / FR-24-21）：投递 pending 的改判由回收器在**被领取的 Run 作用域**内完成，
+// 启动路径一次都不碰投递表。
+//
+// 逆改点：把 `Recover` 的全局调用加回 `Start`，`recoverCallCount()` 立刻从 0 变成 1；
+// 恢复失败也不再是致命的——因为启动根本不等待它。
+// Startup must not scan pending deliveries globally; scope-based settlement belongs to
+// the reclaimer inside a claimed run.
+func TestScheduler_Start_DoesNotRecoverDeliveriesGlobally(t *testing.T) {
+	deprecated := []struct {
+		name    string
+		deliver *fakeSchedulerDelivery
+	}{
+		{name: "recover error", deliver: &fakeSchedulerDelivery{recoverErr: errors.New("database is locked")}},
+		{name: "recover would return rows", deliver: &fakeSchedulerDelivery{recoverCount: 3}},
+	}
+	for _, tc := range deprecated {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, tc.deliver, nil)
+			fixture.start(t)
 
-	t.Run("count is logged", func(t *testing.T) {
-		delivery := &fakeSchedulerDelivery{recoverCount: 3}
-		fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery, nil)
-		fixture.start(t)
-		rec := fixture.logs.requireRecord(t, slog.LevelInfo, "投递恢复完成")
-		count, ok := attrOf(rec, "recovered")
-		require.True(t, ok)
-		require.Equal(t, "3", count.String())
-	})
+			require.Zero(t, tc.deliver.recoverCallCount(), "启动不得做全局投递恢复")
+			require.False(t, fixture.logs.hasRecord(slog.LevelInfo, "投递恢复完成"),
+				"US-24 起启动不再产出全局恢复计数日志")
+		})
+	}
 }
 
 // TestScheduler_ReconcileKeepsDeliverTo —— 对账把定义里的 deliver_to 写入库行：它是
@@ -343,4 +365,244 @@ func TestScheduler_ReconcileKeepsDeliverTo(t *testing.T) {
 	task, ok = fixture.store.tasks[schedTaskID]
 	require.True(t, ok)
 	require.Equal(t, deliverySchedChannelSecond, task.DeliverTo)
+}
+
+// ===== 调度器侧收尾末笔（US-24 五步收尾的第 4、5 步）=====
+
+// fakeRunCloseout 是 RunCloseout 的记录替身：Lookup 按 run_id 造出本进程持有的租约
+// 凭证，Complete 记录调用；onClose 在返回前执行，用例据此把收尾放进共享事件序列。
+type fakeRunCloseout struct {
+	mu        sync.Mutex
+	lookupErr error
+	// lookupEpoch 覆盖回查租约的代次（0 = 准入代次 1）。用它构造"被回收器以
+	// 更高代次领回"的既成事实。
+	// lookupEpoch overrides the looked-up epoch (0 means the admission epoch 1).
+	lookupEpoch int64
+	lookupIDs   []string
+	closeIDs    []string
+	onClose     func()
+}
+
+func (c *fakeRunCloseout) LookupAdmittedRun(_ context.Context, runID string) (LeaseToken, error) {
+	c.mu.Lock()
+	c.lookupIDs = append(c.lookupIDs, runID)
+	lookupErr := c.lookupErr
+	c.mu.Unlock()
+	if lookupErr != nil {
+		return LeaseToken{}, lookupErr
+	}
+	epoch := c.lookupEpoch
+	if epoch == 0 {
+		epoch = 1
+	}
+	return LeaseToken{
+		Kind: LeaseRun, ResourceID: runID,
+		OwnerWorkerID: schedWorker.InstanceID, OwnershipEpoch: epoch,
+	}, nil
+}
+
+func (c *fakeRunCloseout) CompleteRunCloseout(_ context.Context, runID string,
+	_ LeaseToken, _ time.Time,
+) error {
+	c.mu.Lock()
+	c.closeIDs = append(c.closeIDs, runID)
+	c.mu.Unlock()
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
+
+// lookupCount / closeCount 读回计数（并发安全）。
+func (c *fakeRunCloseout) lookupCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.lookupIDs)
+}
+
+func (c *fakeRunCloseout) closeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.closeIDs)
+}
+
+// renewRecordingLeases 接受任意 token 并记录续约：用来证明结算期间 run 租约仍在续。
+type renewRecordingLeases struct {
+	mu     sync.Mutex
+	renews []LeaseToken
+}
+
+func (l *renewRecordingLeases) Acquire(_ context.Context, kind LeaseKind, resourceID string,
+	owner WorkerIdentity, ttl time.Duration,
+) (Lease, error) {
+	token := LeaseToken{
+		Kind: kind, ResourceID: resourceID,
+		OwnerWorkerID: owner.InstanceID, OwnershipEpoch: 1,
+	}
+	now := time.Now()
+	return Lease{LeaseToken: token, AcquiredAt: now, RenewedAt: now, ExpiresAt: now.Add(ttl)}, nil
+}
+
+func (l *renewRecordingLeases) Renew(_ context.Context, token LeaseToken, ttl time.Duration) (Lease, error) {
+	l.mu.Lock()
+	l.renews = append(l.renews, token)
+	l.mu.Unlock()
+	now := time.Now()
+	return Lease{LeaseToken: token, AcquiredAt: now, RenewedAt: now, ExpiresAt: now.Add(ttl)}, nil
+}
+
+func (l *renewRecordingLeases) Release(_ context.Context, _ LeaseToken) error { return nil }
+
+func (l *renewRecordingLeases) FencedTx(context.Context, LeaseToken,
+	func(context.Context, Tx) error,
+) error {
+	return ErrLeaseFenceUnavailable
+}
+
+func (l *renewRecordingLeases) renewCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.renews)
+}
+
+// TestScheduler_DeliveredRunClosesOutAfterDelivery —— 系统代投的 Run 由调度器补齐
+// 五步收尾的第 5 步，且次序固定：投递结算 → CompleteRunCloseout。投递结果落库前
+// 交还租约，B1 就会把**在途**发送改判成 unknown。
+//
+// 逆改点：把 settleAndClose 换回 settleDelivery（不补末笔），closeIDs 立刻为空。
+// The scheduler must settle the delivery first and complete the caller-side closeout
+// afterwards.
+func TestScheduler_DeliveredRunClosesOutAfterDelivery(t *testing.T) {
+	var eventsMu sync.Mutex
+	var events []string
+	record := func(event string) {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		events = append(events, event)
+	}
+	delivery := &fakeSchedulerDelivery{onDeliver: func() { record("deliver") }}
+	closeout := &fakeRunCloseout{onClose: func() { record("closeout") }}
+	fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery,
+		func(o *SchedulerOptions) {
+			o.Closeout = closeout
+			o.Leases = &renewRecordingLeases{}
+		})
+	fixture.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
+		return RunResult{RunID: req.RunID, Status: StatusCompleted, FinalText: "巡检完成"}, nil
+	}
+	fixture.start(t)
+	fixture.fire(t, schedTaskID)
+
+	_, delivers, skips := delivery.snapshot()
+	require.Len(t, delivers, 1)
+	require.Empty(t, skips)
+	require.Equal(t, []string{delivers[0].RunID}, closeout.lookupIDs,
+		"收尾末笔必须按本次 Run 的 run_id 取回租约凭证")
+	require.Equal(t, []string{delivers[0].RunID}, closeout.closeIDs)
+	require.Equal(t, []string{"deliver", "closeout"}, events,
+		"次序固定：投递结果先落库，收尾末笔在其后")
+}
+
+// TestScheduler_DeliveredRunRenewsRunLeaseDuringSend —— Run 返回时服务侧 keeper 已经
+// 只停不续；结算期间必须由调度器续约。否则一次超过 TTL 的发送会让租约自然过期，
+// 回收器把在途投递改判成 unknown，与「不重发」的结论混在一起。
+//
+// 逆改点：去掉 settleAndClose 里的 KeepLease，续约次数为 0。
+// The scheduler keeps the run lease alive while the send is in flight.
+func TestScheduler_DeliveredRunRenewsRunLeaseDuringSend(t *testing.T) {
+	delivery := &fakeSchedulerDelivery{onDeliver: func() { time.Sleep(120 * time.Millisecond) }}
+	closeout := &fakeRunCloseout{}
+	leases := &renewRecordingLeases{}
+	fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery,
+		func(o *SchedulerOptions) {
+			o.Closeout = closeout
+			o.Leases = leases
+			o.LeaseTTL = 200 * time.Millisecond
+			o.RenewInterval = 20 * time.Millisecond
+		})
+	fixture.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
+		return RunResult{RunID: req.RunID, Status: StatusCompleted, FinalText: "巡检完成"}, nil
+	}
+	fixture.start(t)
+	fixture.fire(t, schedTaskID)
+
+	require.Equal(t, 1, closeout.closeCount())
+	require.GreaterOrEqual(t, leases.renewCount(), 2,
+		"结算期间必须持续续约 run 租约，租约不得在投递落库前过期")
+}
+
+// TestScheduler_DeliveredRunLookupFailureStillSettlesDelivery —— Run 没有建成（准入
+// 被拒）时回查返回 ErrRunNotFound：投递仍要如实结算（本轮标 skipped），收尾不补；
+// 残余 pending 留给 B2 按「无 Run 的前置投递」收成 skipped。
+// A missing run row still settles the delivery; the closeout is not attempted.
+func TestScheduler_DeliveredRunLookupFailureStillSettlesDelivery(t *testing.T) {
+	delivery := &fakeSchedulerDelivery{}
+	closeout := &fakeRunCloseout{lookupErr: ErrRunNotFound}
+	fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery,
+		func(o *SchedulerOptions) {
+			o.Closeout = closeout
+			o.Leases = &renewRecordingLeases{}
+		})
+	fixture.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
+		return RunResult{}, errors.New("准入被拒")
+	}
+	fixture.start(t)
+	fixture.fire(t, schedTaskID)
+
+	_, delivers, skips := delivery.snapshot()
+	require.Empty(t, delivers)
+	require.Equal(t, []string{"运行未成功，未投递"}, skips)
+	require.Equal(t, 1, closeout.lookupCount())
+	require.Zero(t, closeout.closeCount(), "没有 Run 行就没有收尾末笔")
+}
+
+// TestScheduler_DeliveredRunReclaimedAtHigherEpochSkipsSettlement —— 回查到的 run
+// 租约虽然仍属**本 Worker 实例**，但代次已不是准入时的 1：本进程的回收器在投递结算
+// 之前领回过这条租约（回收器与调度器共用同一 Worker 身份，领取语句不排除自身），
+// Run 的终态与投递已由回收作用域裁决。此时派发投递或补末笔都会顶替该裁决，两项一律
+// 不做。逆改点：把 `token.OwnershipEpoch != 1` 从守卫里去掉，本用例立刻红——
+// 投递被发出、末笔被补写。
+// A lease re-claimed at a higher epoch (possibly by this process's own reclaimer) is
+// no longer ours to settle, even though the owner id still matches.
+func TestScheduler_DeliveredRunReclaimedAtHigherEpochSkipsSettlement(t *testing.T) {
+	delivery := &fakeSchedulerDelivery{}
+	closeout := &fakeRunCloseout{lookupEpoch: 2}
+	fixture := newDeliverySchedFixture(t, []Schedule{deliverySchedTask()}, delivery,
+		func(o *SchedulerOptions) {
+			o.Closeout = closeout
+			o.Leases = &renewRecordingLeases{}
+		})
+	fixture.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
+		return RunResult{RunID: req.RunID, Status: StatusCompleted, FinalText: "巡检完成"}, nil
+	}
+	fixture.start(t)
+	fixture.fire(t, schedTaskID)
+
+	_, delivers, skips := delivery.snapshot()
+	require.Empty(t, delivers, "代次已前进的 Run 不得再发投递")
+	require.Empty(t, skips, "也不得再改写投递行（回收作用域已裁决）")
+	require.Equal(t, 1, closeout.lookupCount(), "守卫必须以回查到的租约为判据")
+	require.Zero(t, closeout.closeCount(), "代次已前进的 Run 不补收尾末笔")
+}
+
+// TestScheduler_NoDeliveryTargetSkipsCallerCloseout —— 未配置代投的 Run 不设
+// SuppressNotify，五步收尾在服务侧已经走完；调度器不得再补一次收尾。
+// A run without a delivery target is closed out by the service, not the scheduler.
+func TestScheduler_NoDeliveryTargetSkipsCallerCloseout(t *testing.T) {
+	delivery := &fakeSchedulerDelivery{}
+	closeout := &fakeRunCloseout{}
+	fixture := newDeliverySchedFixture(t, []Schedule{demoTask(schedTaskID)}, delivery,
+		func(o *SchedulerOptions) {
+			o.Closeout = closeout
+			o.Leases = &renewRecordingLeases{}
+		})
+	fixture.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
+		require.False(t, req.SuppressNotify, "未代投的 Run 不抑制 notify")
+		return RunResult{RunID: req.RunID, Status: StatusCompleted, FinalText: "完成"}, nil
+	}
+	fixture.start(t)
+	fixture.fire(t, schedTaskID)
+
+	require.Zero(t, closeout.lookupCount(), "服务侧收尾的 Run 不得被调度器重复收尾")
+	require.Zero(t, closeout.closeCount())
 }

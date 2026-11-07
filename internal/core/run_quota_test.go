@@ -5,18 +5,26 @@ package core_test
 // 口径在 `internal/app/run_quota_test.go`，真实 PostgreSQL 的限额效果在
 // `internal/app/run_quota_integration_test.go`——三层各判一件事，不重复。
 //
+// 自 US-24 Q21 起扣费点移入 `RunStore.StartRun` 的准入事务：本文件因此判两件事——
+// ① 进程内语义仍然成立（恰好一次、拒绝零占用、预留标识进账本）；② **不得**出现
+// 第二套扣费路径（service 再手调一次端口，调用次数立刻变成 2）。真实事务内原子性
+// 由 `internal/storage/postgres/run_lease_test.go` 的
+// `TestStartRun_TaskQuotaAccountedInSameTx` 判卷，假仓储不冒充它。
+//
 // 逆改点（实现改坏时哪条断言红）：
-//   - 把计费挪到 `StartRun` 之后 → `TestRunService_RunQuotaRefusalLeavesNoTrace` 的
-//     "零账本行"断言红（拒绝了却留下 running 行）；
+//   - 在 service 层再加一条计费路径（重复扣费）→ `TestRunService_RunQuotaChargesOncePerRun`
+//     的"恰一次"断言红；
 //   - 把预留标识丢掉不写账本 → `TestRunService_RunQuotaReservationReachesLedger` 红；
-//   - 每轮模型调用都记一次任务 → `TestRunService_RunQuotaChargesOncePerRun` 红；
-//   - 计费早于快照落库 → `TestRunService_RunQuotaSitsBetweenEvidenceAndLedger` 的
-//     "调用时刻快照已落库、账本尚未创建"断言红；
+//   - 计费早于快照落库、或晚到账本行创建之后 → `TestRunService_RunQuotaSitsBetweenEvidenceAndLedger`
+//     的"调用时刻快照已落库、账本尚未创建"断言红；
+//   - 拒绝时仍先落 running 行 → `TestRunService_RunQuotaRefusalLeavesNoTrace` 的
+//     "零账本行"断言红；
 //   - 拒绝时把它降级成 Run failed 结果 → 第一个用例的 `require.Error` 红（拒绝是
 //     函数级错误，调用方据此映射 429，而不是"跑失败了"）。
 //
 // The verdict: the port is charged exactly once per admitted run, after the evidence
-// writes and before the ledger row, and a refusal leaves no trace at all.
+// writes and before the ledger row, and a refusal leaves no trace at all. The fake store
+// performs the charge inside StartRun, mirroring the real in-transaction charge.
 
 import (
 	"context"

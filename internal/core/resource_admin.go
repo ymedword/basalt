@@ -81,6 +81,14 @@ const (
 	// ActionNotifyChannelTest 是测试通知渠道连通性（会真实发出一条固定测试消息，
 	// 必须留痕）。R7 范围修订新增（契约 §9.3 同步）。
 	ActionNotifyChannelTest = "notify_channel.test"
+
+	// ActionAgentBundlePublish 是安装并发布 Agent 资产 bundle（US-24 §2.3.9）：
+	// 一个管理操作内完成「EnsureVersion（按内容哈希幂等）+ 发布指针 CAS」。预写
+	// pending、指针提交与终态回填同事务；崩溃留下的 pending 行由启动恢复按指针
+	// 是否已指向本哈希查证，**不重放**。字面量由 US-24 追加到契约 §9.3（只增）。
+	// ActionAgentBundlePublish is the asset-bundle publication step of §2.3.9; the
+	// literal is appended to contract §9.3 by US-24.
+	ActionAgentBundlePublish = "agent_bundle.publish"
 )
 
 // —— 目标类型字面量（契约 §9.3 逐字）——
@@ -96,6 +104,11 @@ const (
 	TargetKindSkill = "skill"
 	// TargetKindNotifyChannel 是通知渠道目标。
 	TargetKindNotifyChannel = "notify_channel"
+	// TargetKindAgentBundle 是 Agent 资产 bundle 目标（US-24 §2.3.9）：`target_id`
+	// 取规范化的 AgentUID（`ag_`），不是 Agent 名——指针按 UID 寻址，按名寻址
+	// 会在同名重建后指向另一个实例。
+	// TargetKindAgentBundle keys the operation by the canonical AgentUID.
+	TargetKindAgentBundle = "agent_bundle"
 )
 
 // ParseResourceKind 把外部字符串解析为三个冻结的资源种类之一；其余一律拒绝

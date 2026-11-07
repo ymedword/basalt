@@ -82,14 +82,24 @@ const learningFailureWriteTimeout = 2 * time.Second
 // 契约细节见颗粒度文档 §3.1.4：UnresolvedForOrigin 只返回需要阻断或重试的行；
 // BeginExtraction 在单事务内重判未决与尝试上限并复制来源；CommitExtraction 在单事务内
 // 写候选 / 元数据 / 来源关系 / 草案行 / 成功状态并推进游标。
-// LearningStore is the narrow write port consumed by the extraction service.
+//
+// 三个写方法都收**触发 Run** 的执行权凭证（US-24 §2.3.5 / FR-24-36）：非零 token 时
+// 存储层必须先锁该 Run 的租约行并校验 owner + epoch + 未释放 + 未过期，再进业务写入；
+// 零值只出现在未接执行权的装配（SQLite 谱系 / 轻装配），存储层退化为无 fence 路径。
+// fence 对象恒为 token.ResourceID（= 本次 Run），**不得**改用抽取行上的 run_id 或
+// last_attempt_run_id。FailExtraction 另多收两个预期值供 window_gone 受控收尾使用
+// （pending 分支忽略它们）。
+// The three write methods carry the triggering run's ownership credential; a non-zero
+// token must be fenced on that run's lease before any business write.
 type LearningStore interface {
 	UnresolvedForOrigin(ctx context.Context, agent, sessionID, runID string) (*core.LearningExtraction, error)
 	LoadCursor(ctx context.Context, agent, sessionID, runID string) (core.LearningCursor, bool, error)
 	EntriesForExtraction(ctx context.Context, scope core.Scope, limit, maxBytes int) ([]LearningEntrySnapshot, error)
-	BeginExtraction(ctx context.Context, row core.LearningExtraction) (core.LearningExtraction, error)
-	FailExtraction(ctx context.Context, extractionID string, class core.LearningFailureClass, message string, failedAt time.Time) error
-	CommitExtraction(ctx context.Context, req core.CommitLearningExtraction) (core.LearningCommitResult, error)
+	BeginExtraction(ctx context.Context, row core.LearningExtraction, token core.LeaseToken) (core.LearningExtraction, error)
+	FailExtraction(ctx context.Context, extractionID, triggerRunID string, token core.LeaseToken,
+		expectedPrev string, expectedAttempts int,
+		class core.LearningFailureClass, message string, failedAt time.Time) error
+	CommitExtraction(ctx context.Context, req core.CommitLearningExtraction, token core.LeaseToken) (core.LearningCommitResult, error)
 }
 
 // LearningMessageStore 是消息读面的专用端口：只读、带游标与双字节上限；不新增追加路径。
@@ -103,14 +113,20 @@ type LearningMessageStore interface {
 
 // LearningAdminStore 是只读查询与恢复查证的端口（app 消费；实现在 storage/postgres）。
 // 它**没有**写学习结果的业务方法：恢复只查证不重放，候选晋升仍走既有记忆管理动作。
-// Recovery 三个入口只处理 pending 行；List / Load 是管理台与 CLI 的只读投影。
-// LearningAdminStore is the read-only query and recovery-verification port consumed by
-// internal/app; it deliberately exposes no business write for learning outcomes.
+// Recovery 两个入口只处理 pending 行；List / Load 是管理台与 CLI 的只读投影。
+//
+// 两个 pending 读面共享**同一归属判据**（P-18）：最近一次尝试的 Run（last_attempt_run_id）
+// 已无有效 run 租约才入选——属主仍活着时多 Worker 下由它自己收尾，别人不得抢先查证。
+// 区别只在用途：PendingExtractions 供启动扫描（全量），OrphanPendingExtractions 供回收器
+// B3（每轮有界）。RecoverExtraction 收预期值并在事务内重检，结论过期时零写入跳过。
+// Both pending readers share the same ownership predicate; RecoverExtraction re-checks
+// the expectation inside its transaction and skips with zero writes when it went stale.
 type LearningAdminStore interface {
 	PendingExtractions(ctx context.Context) ([]core.LearningExtraction, error)
+	OrphanPendingExtractions(ctx context.Context, limit int) ([]core.LearningExtraction, error)
 	ExtractionCandidateCount(ctx context.Context, extractionID string) (int, error)
 	ExtractionDraftCount(ctx context.Context, extractionID string) (int, error)
-	RecoverExtraction(ctx context.Context, extractionID string, status core.LearningExtractionState, verifiedAt time.Time) error
+	RecoverExtraction(ctx context.Context, req core.RecoverLearningExtraction) (bool, error)
 	ListExtractions(ctx context.Context, filter core.LearningExtractionFilter) ([]core.LearningExtractionView, error)
 	LoadExtraction(ctx context.Context, extractionID string) (core.LearningExtractionView, bool, error)
 	ListDrafts(ctx context.Context, filter core.LearningDraftFilter) ([]core.LearningDraftView, error)
@@ -427,7 +443,10 @@ func (s *LearningService) AfterRun(ctx context.Context, in core.LearningRunInput
 		// 消息可被保留策略清理：实际条数少于冻结条数即视为窗口缺失，
 		// 记 skipped / window_gone 并推进游标，不用残缺集合抽取（C-33）。
 		if err == nil && len(window.New) != row.WindowMessages {
-			s.fail(totalCtx, row, core.LearningFailureWindowGone,
+			// 预期值取**扫描时**的行值（unresolved），不是 row——row 的
+			// LastAttemptRunID 已被改写成本次触发 Run，而这次 Run 并没有真正尝试。
+			s.fail(totalCtx, in, row, unresolved.LastAttemptRunID, unresolved.Attempts,
+				core.LearningFailureWindowGone,
 				fmt.Errorf("frozen window incomplete: want %d messages, got %d", row.WindowMessages, len(window.New)))
 			return
 		}
@@ -477,7 +496,7 @@ func (s *LearningService) AfterRun(ctx context.Context, in core.LearningRunInput
 	// 预算、未决阻断与来源复制都在同一事务内；origin 由 runs 行复制，不取当前 Principal。
 	// 重试时本事务同时写入 last_attempt_run_id / last_attempt_at 与本次尝试的
 	// provider / model / config_hash；返回行即本次尝试的调用参数，不得改用旧行值。
-	row, err = s.store.BeginExtraction(workCtx, row)
+	row, err = s.store.BeginExtraction(workCtx, row, in.Token)
 	if err != nil {
 		if errors.Is(err, core.ErrLearningBudgetExhausted) {
 			s.logger.WarnContext(workCtx, "学习抽取：尝试次数上限已耗尽，跳过",
@@ -502,12 +521,13 @@ func (s *LearningService) AfterRun(ctx context.Context, in core.LearningRunInput
 		HookDeadline: s.hookDeadline(totalCtx),
 	})
 	if err != nil {
-		s.fail(totalCtx, row, s.classifyFailure(err), err) // 独立 2s，从总预算起点计
+		// 本轮已 Begin，pending 分支按本轮绑定的触发 Run 断言，预期值不适用。
+		s.fail(totalCtx, in, row, "", 0, s.classifyFailure(err), err) // 独立 2s，从总预算起点计
 		return
 	}
 	items, dropped, err := s.parseAndValidate(workCtx, row, reply.Content, window, entries)
 	if err != nil {
-		s.fail(totalCtx, row, core.LearningFailureInvalidOutput, err)
+		s.fail(totalCtx, in, row, "", 0, core.LearningFailureInvalidOutput, err)
 		return
 	}
 	drafts, draftDropped := s.writeDrafts(workCtx, row, items)
@@ -521,7 +541,7 @@ func (s *LearningService) AfterRun(ctx context.Context, in core.LearningRunInput
 		ItemsAccepted: len(candidates) + len(drafts),
 		ItemsDropped:  dropped,
 		CompletedAt:   s.now(),
-	}); err != nil {
+	}, in.Token); err != nil {
 		s.logger.ErrorContext(workCtx, "学习抽取：提交结果未知，留 pending 交恢复查证",
 			"extraction_id", row.ExtractionID, "agent", in.Agent, "error", err)
 		return
@@ -831,8 +851,18 @@ func (s *LearningService) hookDeadline(totalCtx context.Context) time.Time {
 // fail 用 context.WithoutCancel + 2s 的独立上下文写终态，并把截止截到钩子总截止；
 // window_gone 走同一入口但由 FailExtraction 置 skipped 并推进游标。日志与错误消息
 // 都不得包含正文、证据引文或凭证（C-30）。
+//
+// WithoutCancel 只是"取消后仍能写完"的时间预算，**不是**执行权证明（§2.3.5）：真正
+// 的归属保护由 FailExtraction 在事务内按 in.Token 锁租约行完成。expectedPrev /
+// expectedAttempts 只对 window_gone 受控收尾有意义——本轮没有 Begin，必须传**扫描时
+// 读到的** last_attempt_run_id / attempts；pending 分支忽略它们，改按本轮绑定的
+// 触发 Run 断言。
 // fail writes the terminal state in its own bounded context, capped by the hook deadline.
-func (s *LearningService) fail(ctx context.Context, row core.LearningExtraction, class core.LearningFailureClass, cause error) {
+// WithoutCancel is a time budget, not proof of ownership: the fence lives in
+// FailExtraction. The expected values matter only on the pre-Begin window_gone path.
+func (s *LearningService) fail(ctx context.Context, in core.LearningRunInput, row core.LearningExtraction,
+	expectedPrev string, expectedAttempts int, class core.LearningFailureClass, cause error,
+) {
 	deadline := time.Now().Add(s.limits.failureWriteTimeout)
 	if hookDeadline, ok := ctx.Deadline(); ok && hookDeadline.Before(deadline) {
 		deadline = hookDeadline
@@ -846,7 +876,8 @@ func (s *LearningService) fail(ctx context.Context, row core.LearningExtraction,
 	}
 	s.logger.WarnContext(failCtx, "学习抽取失败",
 		"extraction_id", row.ExtractionID, "agent", row.Agent, "failure_class", string(class), "status", status)
-	if err := s.store.FailExtraction(failCtx, row.ExtractionID, class, s.failureMessage(class, cause), s.now()); err != nil {
+	if err := s.store.FailExtraction(failCtx, row.ExtractionID, in.RunID, in.Token,
+		expectedPrev, expectedAttempts, class, s.failureMessage(class, cause), s.now()); err != nil {
 		s.logger.ErrorContext(failCtx, "学习抽取：失败终态写回失败，留待恢复",
 			"extraction_id", row.ExtractionID, "agent", row.Agent, "failure_class", string(class), "error", err)
 	}

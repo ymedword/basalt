@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -306,23 +307,97 @@ func recCaptureLogger() (*slog.Logger, *recLogCapture) {
 	return slog.New(slog.NewTextHandler(capture, nil)), capture
 }
 
+// ---- US-24：显式租约夹具 -----------------------------------------------------
+
+// recTestWorker 是回收器用例的 Worker 身份（InstanceID 才是身份，Name 只作诊断）。
+var recTestWorker = core.WorkerIdentity{InstanceID: "rec-test-worker", Name: "rec-test"}
+
+// recSeedExpiredLeases 给"仍为 running 且尚无租约行"的 Run 造一条**已过期**租约。
+//
+// US-24 之后没有"扫全库推断谁死了"的入口（FR-24-02）：恢复只作用于**合法领取**的过期
+// 租约（FR-24-15）。测试因此必须自己把"原属主已失联"这个唯一可判的状态造出来——租约
+// 过期——而不是让恢复去猜。已经有租约行的 Run 一律不动：那可能是用例特意留下的活租约。
+// Recovery tests must build the one decidable state themselves: an expired lease.
+func recSeedExpiredLeases(t *testing.T, db *sql.DB, now time.Time) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(),
+		`INSERT INTO execution_leases
+		   (kind, resource_id, owner_worker_id, ownership_epoch,
+		    acquired_at, renewed_at, expires_at, released_at)
+		 SELECT 'run', r.run_id, 'dead-worker', 1, $1, $1, $1, NULL
+		   FROM runs r
+		  WHERE r.status = 'running'
+		 ON CONFLICT (kind, resource_id) DO NOTHING`,
+		now.Add(-time.Minute).UnixMilli())
+	require.NoError(t, err)
+}
+
+// recExpireRunLease 把某个 Run **已有的**租约推到过期（`startRunTest` 会建一条有效租约，
+// 用它造出"属主已失联"的既成事实）。
+// recExpireRunLease pushes an existing run lease past its expiry.
+func recExpireRunLease(t *testing.T, db *sql.DB, runID string) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(),
+		`UPDATE execution_leases SET expires_at = $2
+		  WHERE kind = 'run' AND resource_id = $1`,
+		runID, recFixedNow.Add(-time.Minute).UnixMilli())
+	require.NoError(t, err)
+}
+
+// recRecoverAll 模拟一轮回收：把库里所有已过期的 run 租约领取并逐个按 A1 收尾，
+// 汇总读数返回。单个 Run 的错误不阻断其它 Run（per-Run 事务），最后用 errors.Join
+// 如实上抛——启动方据此决定要不要开跑。
+// recRecoverAll claims every expired run lease and closes each one in its own transaction.
+func recRecoverAll(ctx context.Context, t *testing.T, db *sql.DB, logger *slog.Logger,
+	now time.Time,
+) (RecoveryReport, error) {
+	t.Helper()
+	recSeedExpiredLeases(t, db, now)
+
+	handle := &DB{pool: db}
+	leases, err := NewReclaimerStore(handle).ClaimExpired(ctx, core.LeaseRun, recTestWorker, 64, time.Minute)
+	require.NoError(t, err)
+
+	var (
+		total RecoveryReport
+		errs  []error
+	)
+	for _, lease := range leases {
+		report, err := RecoverRun(ctx, handle, logger, lease.LeaseToken, now)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		total.Unknowns += report.Unknowns
+		total.RepairedGroups += report.RepairedGroups
+		total.ClosedRuns += report.ClosedRuns
+		total.DeliveriesSkipped += report.DeliveriesSkipped
+	}
+	return total, errors.Join(errs...)
+}
+
 // ---- M1 -------------------------------------------------------------------
 
 // 中文验收点（契约 §4.3.2 步骤 ①）：两张审计表的 `pending` 行都归一化为 `unknown` 且
 // `error_kind` 写 `unknown`；**只改 pending**——终态行一字不动；读数 `unknowns` 是两表合计。
+//
+// US-24 起归一化只在**本次合法领取的 run_id 集合**内进行（FR-24-16），因此夹具必须给出
+// 一个"running + 过期租约"的 Run 供回收器领取；"无租约的 pending 行不改写"由
+// `TestReclaimer_AuditNormalizationScopedToClaimedRuns` 单独判。
 func TestRecovery_NormalizesPendingRowsToUnknown(t *testing.T) {
 	ctx := context.Background()
 	db := recTestDB(t)
+	recSeedRun(t, db, "run-1", "running")
 	pendingCall := recSeedToolInvocation(t, db, "run-1", "c1", "pending", "")
 	doneCall := recSeedToolInvocation(t, db, "run-1", "c2", "success", "已经执行过的结果")
 	pendingLLM := recSeedLLMCall(t, db, "run-1", "pending")
 	failedLLM := recSeedLLMCall(t, db, "run-1", "failed")
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 2, report.Unknowns, "两表各一行 pending，合计 2")
 	require.Zero(t, report.RepairedGroups, "没有消息就没有半截组")
-	require.Zero(t, report.ClosedRuns, "没有 running 的账本行")
+	require.Equal(t, 1, report.ClosedRuns, "被领取的 Run 按 A1 收尾")
 
 	status, kind := recLoadInvocationAudit(t, db, pendingCall)
 	require.Equal(t, "unknown", status, "崩溃窗口的 pending → unknown（工具是否已产生副作用无法确定）")
@@ -355,7 +430,7 @@ func TestRecovery_RepairsHalfGroupByPosition(t *testing.T) {
 		core.ToolCall{ID: "c1", Name: "read_file", Arguments: `{"path":"notes.txt"}`}) // 本轮组：缺 tool 行
 	recSeedToolInvocation(t, db, "run-0", "c1", "success", "【陈旧】上一次运行的同 id 结果")
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow) // 参数与 §3.1 声明一致
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow) // 参数与 §3.1 声明一致
 	require.NoError(t, err)
 	require.Equal(t, 1, report.RepairedGroups)
 	require.Equal(t, 1, report.ClosedRuns)
@@ -375,7 +450,7 @@ func TestRecovery_RepairsHalfGroupByPosition(t *testing.T) {
 		core.ToolCall{ID: "c2", Name: "read_file"})
 	recSeedToolInvocation(t, db, "run-2", "c2", "pending", "")
 
-	_, err = Recover(ctx, db, recTestLogger(t), recFixedNow)
+	_, err = recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	got = recLoadMessages(t, db, recRecoverySession)
 	require.Equal(t, "结果未知（进程中断，无法确定是否已产生外部副作用）", got[5].Content,
@@ -383,7 +458,7 @@ func TestRecovery_RepairsHalfGroupByPosition(t *testing.T) {
 
 	// ③ 幂等：连跑第二次零变化
 	before := recDumpMessages(t, db, recRecoverySession)
-	_, err = Recover(ctx, db, recTestLogger(t), recFixedNow)
+	_, err = recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, before, recDumpMessages(t, db, recRecoverySession))
 }
@@ -391,21 +466,24 @@ func TestRecovery_RepairsHalfGroupByPosition(t *testing.T) {
 // ---- M3 -------------------------------------------------------------------
 
 // 中文验收点（契约 §4.3.2 步骤 ②）：组内每个 `tool_call_id` 都有结果消息 → 不是半截组，
-// 一条消息都不写（`repaired_groups` 只数真补过的组）。运行已终结，故 ④ 也不收尾。
+// 一条消息都不写（`repaired_groups` 只数真补过的组）。
+//
+// US-24 起 Run 必须"running + 过期租约"才会被领取（FR-24-02 / FR-24-15）——终态行不在
+// A 类的扫描面里。这里因此把 Run 设成 running，让"完整组不被改写"的断言仍然有效。
 func TestRecovery_LeavesCompleteGroupsUntouched(t *testing.T) {
 	ctx := context.Background()
 	db := recTestDB(t)
-	recSeedRun(t, db, "run-1", "cancelled")
+	recSeedRun(t, db, "run-1", "running")
 	recSeedMessage(t, db, recRecoverySession, 1, core.RoleUser, "读文件", "run-1")
 	recSeedMessage(t, db, recRecoverySession, 2, core.RoleAssistant, "", "run-1",
 		core.ToolCall{ID: "c1", Name: "read_file"})
 	recSeedToolMessage(t, db, recRecoverySession, 3, "run-1", "c1", "文件内容")
 
 	before := recDumpMessages(t, db, recRecoverySession)
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Zero(t, report.RepairedGroups)
-	require.Zero(t, report.ClosedRuns)
+	require.Equal(t, 1, report.ClosedRuns, "被领取的 Run 按 A1 收尾")
 	require.Equal(t, before, recDumpMessages(t, db, recRecoverySession), "完整的组不得被改写")
 }
 
@@ -422,7 +500,7 @@ func TestRecovery_RestoresTerminalAuditResult(t *testing.T) {
 	recSeedToolInvocation(t, db, "run-1", "c1", "success", "真实结果全文") // 有终态行 → 还原
 	invocationsBefore := recCountToolInvocations(t, db)
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 1, report.RepairedGroups, "一组算一次，不按缺失调用计")
 
@@ -452,7 +530,7 @@ func TestRecovery_RestoresAuditResultWithUnstorableBytes(t *testing.T) {
 		core.ToolCall{ID: "c1", Name: "fetch"})
 	recSeedToolInvocation(t, db, "run-1", "c1", "success", "正文\u0000尾部")
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err, "恢复不得因外部结果的坏字节失败（真库报 SQLSTATE 22021）")
 	require.Equal(t, 1, report.RepairedGroups)
 
@@ -472,29 +550,32 @@ func TestRecovery_RestoresAuditResultWithUnstorableBytes(t *testing.T) {
 // ---- M5 -------------------------------------------------------------------
 
 // 中文验收点（契约 §4.4 五分支第 3/4 行）：**无**审计行时按 Run 的状态分类——cancelled
-// 的组取"已取消…"、limit_reached 的组取"未执行（工具调用次数超限）"；两种情况都不许
-// 被 ④ 顺手收尾覆盖（终态就是终态）。
+// 的组取"已取消…"、limit_reached 的组取"未执行（工具调用次数超限）"。
+//
+// US-24 起这两支不再经由回收路径到达：A 类谓词只领取 `status='running'` 的行
+// （模块卡 §2.3.5），`recoveryReasonFor` 在回收器里只会产出"进程中断"。分类规则本身
+// 仍是契约的一部分（函数原样保留），因此改为直接判它，不再摆一个回收器永远走不到的
+// 库内现场——原来的库内夹具会被新谓词跳过，断言不成立。
 func TestRecovery_ClassifiesMissingRowsByRunState(t *testing.T) {
 	ctx := context.Background()
-	db := recTestDB(t)
-	recSeedRun(t, db, "run-cancelled", "cancelled")
-	recSeedRun(t, db, "run-limit", "limit_reached")
-	recSeedMessage(t, db, "s-cancel", 1, core.RoleAssistant, "", "run-cancelled",
-		core.ToolCall{ID: "c1", Name: "read_file"})
-	recSeedMessage(t, db, "s-limit", 1, core.RoleAssistant, "", "run-limit",
-		core.ToolCall{ID: "c1", Name: "read_file"})
-
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
-	require.NoError(t, err)
-	require.Equal(t, 2, report.RepairedGroups)
-	require.Zero(t, report.ClosedRuns, "已结束的运行不归恢复收尾")
-
-	require.Equal(t, core.TextToolCancelled, recLoadMessages(t, db, "s-cancel")[1].Content,
-		"取消时尚未执行 → 已取消文本（而不是进程中断）")
-	require.Equal(t, core.TextToolBudget, recLoadMessages(t, db, "s-limit")[1].Content,
-		"预算耗尽未轮到 → 次数超限文本")
-	require.Equal(t, "cancelled", recLoadRunStatus(t, db, "run-cancelled"))
-	require.Equal(t, "limit_reached", recLoadRunStatus(t, db, "run-limit"))
+	cases := []struct {
+		status string
+		reason string
+		text   string
+	}{
+		{"cancelled", core.ReasonCancelled, core.TextToolCancelled},
+		{"limit_reached", core.ReasonToolBudget, core.TextToolBudget},
+		{"failed", core.ReasonRunFailed, core.TextToolInterrupted},
+		{"running", core.ReasonRunFailed, core.TextToolInterrupted},
+	}
+	for _, tc := range cases {
+		reason := recoveryReasonFor(tc.status)
+		require.Equal(t, tc.reason, reason, "status=%s 的分类文案", tc.status)
+		text, err := core.SynthesizeMissingResult(ctx, nil, "run-1",
+			core.ToolCall{ID: "c1", Name: "read_file"}, reason)
+		require.NoError(t, err)
+		require.Equal(t, tc.text, text, "status=%s 的补齐文本", tc.status)
+	}
 }
 
 // ---- M6 -------------------------------------------------------------------
@@ -516,7 +597,7 @@ func TestRecovery_ClosesOnlyRunningRuns(t *testing.T) {
 	}
 	recSeedRun(t, db, "run-crash", "running")
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 1, report.ClosedRuns)
 
@@ -525,7 +606,8 @@ func TestRecovery_ClosesOnlyRunningRuns(t *testing.T) {
 	}
 	crashed := recLoadRunState(t, db, "run-crash")
 	require.Equal(t, "failed", crashed.Status)
-	require.Equal(t, "进程中断（启动时发现未完成的运行）", crashed.Reason.String, "reason 逐字（契约 §4.3.2）")
+	require.Equal(t, workerLostReason, crashed.Reason.String,
+		"reason 是机器可读的稳定字面量（契约 §4.3.2 / FR-24-39）")
 	require.Equal(t, recFixedNow.UnixMilli(), crashed.FinishedAt.Int64, "finished_at 取传入的 now")
 }
 
@@ -539,7 +621,7 @@ func TestRecovery_ClosesStatelessRuns(t *testing.T) {
 	recSeedStatelessRun(t, db, "run-invoke", "running")
 	recSeedRun(t, db, "run-chat", "running")
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 2, report.ClosedRuns)
 
@@ -559,7 +641,7 @@ func TestRecovery_ClosesRunsWithoutHalfGroups(t *testing.T) {
 	recSeedRun(t, db, "run-silent", "running")
 
 	before := recDumpMessages(t, db, recRecoverySession)
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Zero(t, report.RepairedGroups)
 	require.Equal(t, 1, report.ClosedRuns, "没有半截组不影响收尾")
@@ -567,7 +649,7 @@ func TestRecovery_ClosesRunsWithoutHalfGroups(t *testing.T) {
 
 	crashed := recLoadRunState(t, db, "run-silent")
 	require.Equal(t, "failed", crashed.Status)
-	require.Equal(t, "进程中断（启动时发现未完成的运行）", crashed.Reason.String)
+	require.Equal(t, workerLostReason, crashed.Reason.String)
 }
 
 // ---- M9 -------------------------------------------------------------------
@@ -582,7 +664,7 @@ func TestRecovery_ClosesRunsWithoutHalfGroups(t *testing.T) {
 func TestRecovery_RepairsAndClosesInOneTransaction(t *testing.T) {
 	ctx := context.Background()
 	db := recTestDB(t)
-	// 扫描序按 session_id：s1 的 Run 先处理并提交，s2 的 Run 随后失败。
+	// 领取序按 resource_id：run-bad 先处理并失败，run-ok 随后照常提交（per-Run 事务）。
 	recSeedRun(t, db, "run-ok", "running")
 	recSeedRun(t, db, "run-bad", "running")
 	recSeedMessage(t, db, "s1", 1, core.RoleAssistant, "", "run-ok", core.ToolCall{ID: "c1", Name: "read_file"})
@@ -590,7 +672,7 @@ func TestRecovery_RepairsAndClosesInOneTransaction(t *testing.T) {
 
 	recInstallCloseBlocker(t, db)
 
-	report, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.Error(t, err, "修复失败必须如实上抛（启动方据此决定要不要开跑）")
 	require.Contains(t, err.Error(), "run-bad")
 	require.Equal(t, 1, report.RepairedGroups, "先处理的 Run 照常提交")
@@ -639,14 +721,14 @@ func TestRecovery_IsIdempotent(t *testing.T) {
 	recSeedToolInvocation(t, db, "run-crash", "c1", "pending", "")
 	recSeedLLMCall(t, db, "run-crash", "pending")
 
-	first, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	first, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 2, first.Unknowns, "两张表各一行 pending")
 	require.Equal(t, 1, first.RepairedGroups)
 	require.Equal(t, 2, first.ClosedRuns)
 
 	before := recDumpAll(t, db)
-	second, err := Recover(ctx, db, recTestLogger(t), recFixedNow)
+	second, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Zero(t, second.Unknowns, "没有再可归一化的行")
 	require.Zero(t, second.RepairedGroups, "组已完整即 no-op")
@@ -680,26 +762,33 @@ func TestRecovery_LogsStepCounts(t *testing.T) {
 	recSeedLLMCall(t, db, "run-crash", "pending")
 
 	logger, logs := recCaptureLogger()
-	report, err := Recover(ctx, db, logger, recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, logger, recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, RecoveryReport{Unknowns: 2, RepairedGroups: 1, ClosedRuns: 2}, report)
 
 	// 判卷面只读收到的 logger：core 在"结果未知"分支打的 WARN 走 slog.Default()，
-	// 不在本捕获里——这里要判的是恢复自己的启动摘要，不是分类层的告警。
+	// 不在本捕获里——这里要判的是恢复自己的读数，不是分类层的告警。
+	//
+	// US-24 起收尾按**单个 Run** 记一条 INFO（每个 Run 一个事务），因此计数落在各自那
+	// 一行上：两个 Run 各记一次 closed_runs=1，合计才是返回的 2。
 	log := logs.text()
 	require.Contains(t, log, "level=INFO")
-	require.Contains(t, log, "崩溃恢复扫描完成")
+	require.Contains(t, log, "接管收尾完成")
 	require.Contains(t, log, "unknowns=2")
 	require.Contains(t, log, "repaired_groups=1")
-	require.Contains(t, log, "closed_runs=2")
+	require.Equal(t, 2, strings.Count(log, "closed_runs=1"), "两个 Run 各收尾一次")
 }
 
 // ---- M12 ------------------------------------------------------------------
 
-// 中文验收点（契约 §4.3.2 步骤 ③ 的明文）：半截组的 `run_id` 为空、或指向一个**不存在**的
-// 运行行时，**仍然补齐**（历史里少一条 tool 结果比多一条诊断严重得多），并 WARN 点名该
-// run_id 与会话；这类组不产生收尾。
-func TestRecovery_RepairsGroupsWithUnknownRun(t *testing.T) {
+// 中文验收点（FR-24-16 / C-08）：半截组的 `run_id` 为空、或指向一个**不存在**的运行行
+// 时，**不再补齐**——这些组不在本次合法领取的 run_id 集合内，改写它等于替一个可能还
+// 活着的 Worker 作结论。同一轮里被合法领取的 Run 的组照常补齐（对照分支）。
+//
+// 这条判据**推翻了 US-4 的旧口径**（原用例名 `TestRecovery_RepairsGroupsWithUnknownRun`，
+// 断言"找不到运行行仍然补组"）：模块卡 C-08 明确规定"无租约的 pending 行**不得**被
+// 静默改写，只允许报告"。这是 US-24 有意的判据面变更，记录见 run-state。
+func TestRecovery_LeavesUnclaimedGroupsUntouched(t *testing.T) {
 	ctx := context.Background()
 	db := recTestDB(t)
 	// (a) 组的 run_id 为空（不承载 Run 的消息）
@@ -708,26 +797,23 @@ func TestRecovery_RepairsGroupsWithUnknownRun(t *testing.T) {
 	// (b) run_id 有值，但账本里根本没有这一行
 	recSeedMessage(t, db, "s-ghost", 1, core.RoleAssistant, "", "run-ghost",
 		core.ToolCall{ID: "c8", Name: "read_file"})
+	// (c) 对照：被合法领取的 Run 的组必须补齐
+	recSeedRun(t, db, "run-live", "running")
+	recSeedMessage(t, db, "s-live", 1, core.RoleAssistant, "", "run-live",
+		core.ToolCall{ID: "c9", Name: "read_file"})
 
-	logger, logs := recCaptureLogger()
-	report, err := Recover(ctx, db, logger, recFixedNow)
+	report, err := recRecoverAll(ctx, t, db, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
-	require.Equal(t, 2, report.RepairedGroups, "找不到运行行仍然补组")
-	require.Zero(t, report.ClosedRuns)
+	require.Equal(t, 1, report.RepairedGroups, "只有被合法领取的那个 Run 的组被补齐")
+	require.Equal(t, 1, report.ClosedRuns)
 
-	orphan := recLoadMessages(t, db, "s-orphan")
-	require.Len(t, orphan, 2)
-	require.Equal(t, core.TextToolInterrupted, orphan[1].Content)
-	require.Equal(t, "c7", orphan[1].ToolCallID)
-	ghost := recLoadMessages(t, db, "s-ghost")
-	require.Len(t, ghost, 2)
-	require.Equal(t, core.TextToolInterrupted, ghost[1].Content)
+	require.Len(t, recLoadMessages(t, db, "s-orphan"), 1, "无 Run 的组不得被改写")
+	require.Len(t, recLoadMessages(t, db, "s-ghost"), 1, "幽灵 Run 的组不得被改写")
 
-	log := logs.text()
-	require.Contains(t, log, "level=WARN")
-	require.Contains(t, log, "run_id=run-ghost", "WARN 点名该 run_id")
-	require.Contains(t, log, "session_id=s-orphan", "WARN 点名该会话")
-	require.Contains(t, log, "session_id=s-ghost")
+	live := recLoadMessages(t, db, "s-live")
+	require.Len(t, live, 2)
+	require.Equal(t, core.TextToolInterrupted, live[1].Content)
+	require.Equal(t, "c9", live[1].ToolCallID)
 }
 
 // ---- 运行资源账（约束 19 的恢复面） -----------------------------------------
@@ -1001,11 +1087,12 @@ func recRequireRunLedgerReleased(t *testing.T, db *DB, runID string, wantRelease
 	}
 }
 
-// TestRecovery_ClosesRunningRunsAndReleasesRefs —— 崩溃收尾与引用释放必须同事务：
-// 正常路径一起提交（Run 终态 + 引用已释放）；释放失败时一起回滚（Run 保持 running，
-// 等下次启动重扫），不得留下"Run 已 failed、版本却仍被引用"的中间态。
-// TestRecovery_ClosesRunningRunsAndReleasesRefs pins the crash closure and the reference
-// release to one transaction, in both the success and the failure path.
+// TestRecovery_ClosesRunningRunsAndReleasesRefs —— 接管收尾与引用释放必须同事务：
+// 正常路径一起提交（Run 终态 + 引用已释放）；释放失败时一起回滚（Run 保持 running、
+// 租约保持"我持有但未释放"，下一轮重新领取重试），不得留下"Run 已 failed、版本却仍被
+// 引用"的中间态。
+// TestRecovery_ClosesRunningRunsAndReleasesRefs pins the takeover closure and the
+// reference release to one transaction, in both the success and the failure path.
 func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 	ctx := context.Background()
 
@@ -1013,15 +1100,16 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 		db := portTestDB(t)
 		manifest := recLedgerManifest(t, recSeedRunManifest(t, db))
 		rec := recStartRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+		require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
+		recExpireRunLease(t, db.pool, rec.RunID)
 
-		report, err := Recover(ctx, db.pool, recTestLogger(t), recFixedNow)
+		report, err := recRecoverAll(ctx, t, db.pool, recTestLogger(t), recFixedNow)
 		require.NoError(t, err)
 		require.Equal(t, 1, report.ClosedRuns)
 
 		row := recReadRunRow(t, db, rec.RunID)
 		require.Equal(t, string(core.StatusFailed), row.Status)
-		require.Equal(t, recoveryCloseReason, row.Reason.String)
+		require.Equal(t, workerLostReason, row.Reason.String)
 		require.Equal(t, recFixedNow.UnixMilli(), row.FinishedAt.Int64)
 
 		recRequireRunLedgerReleased(t, db, rec.RunID, true)
@@ -1031,20 +1119,21 @@ func TestRecovery_ClosesRunningRunsAndReleasesRefs(t *testing.T) {
 		db := portTestDB(t)
 		manifest := recLedgerManifest(t, recSeedRunManifest(t, db))
 		rec := recStartRow("web")
-		require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+		require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
+		recExpireRunLease(t, db.pool, rec.RunID)
 
 		recInstallReleaseBlocker(t, db)
 		t.Cleanup(func() {
 			recDropReleaseBlocker(t, db)
 		})
 
-		report, err := Recover(ctx, db.pool, recTestLogger(t), recFixedNow)
+		report, err := recRecoverAll(ctx, t, db.pool, recTestLogger(t), recFixedNow)
 		require.Error(t, err, "释放失败必须如实上抛（启动方据此决定要不要开跑）")
 		require.Contains(t, err.Error(), rec.RunID)
 		require.Zero(t, report.ClosedRuns)
 
 		require.Equal(t, string(core.StatusRunning), recLoadRunStatus(t, db.pool, rec.RunID),
-			"释放失败 → 整个收尾事务回滚，Run 保持 running 等下次重扫")
+			"释放失败 → 整个收尾事务回滚，Run 保持 running 等下一轮重新领取")
 		recRequireRunLedgerReleased(t, db, rec.RunID, false)
 	})
 }
@@ -1081,9 +1170,9 @@ func recDropReleaseBlocker(t *testing.T, db *DB) {
 	require.NoError(t, err)
 }
 
-// TestRecovery_BackfillsTerminalRunResidualRefs —— 已终态 Run 的残留引用由启动恢复补齐
-// （约束 19 末句）：④ 的扫描面看不到它们，step ⑤ 的幂等语句按"Run 已终态"补齐，
-// 且**不改**已判定的状态、原因与终态时刻。
+// TestRecovery_BackfillsTerminalRunResidualRefs —— 已终态 Run 的残留引用由 **B1 终态残留
+// 对账**补齐（约束 19 末句 / FR-24-39）：A 类谓词只领取未终态行，看不到它们；B1 用幂等
+// 条件更新按"Run 已终态且不存在仍有效租约"补齐，且**不改**已判定的状态、原因与终态时刻。
 // TestRecovery_BackfillsTerminalRunResidualRefs releases residual references of runs that
 // are already terminal, without re-judging their state.
 func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
@@ -1091,19 +1180,24 @@ func TestRecovery_BackfillsTerminalRunResidualRefs(t *testing.T) {
 	db := portTestDB(t)
 	manifest := recLedgerManifest(t, recSeedRunManifest(t, db))
 	rec := recStartRow("web")
-	require.NoError(t, NewRunStore(db).StartRun(ctx, rec, manifest))
+	require.NoError(t, startRunTest(NewRunStore(db), ctx, rec, manifest))
 
 	// 模拟"终态已写、释放没跑到"的残留：US-22 C-05 起 FinishRun 只写终态、不释放引用，
 	// 正是崩溃发生在终态与释放之间时留下的真实形态。
 	settled := recFixedStart.Add(10 * time.Minute)
-	applied, err := NewRunStore(db).FinishRun(ctx, rec.RunID, core.StatusCompleted,
+	applied, err := NewRunStore(db).FinishRun(ctx, rec.RunID, core.LeaseToken{}, core.StatusCompleted,
 		"终态已写、释放未跑的残留", 1, 0, settled)
 	require.NoError(t, err)
 	require.True(t, applied)
 
-	report, err := Recover(ctx, db.pool, recTestLogger(t), recFixedNow)
+	// B1 的入选谓词要求"不存在**仍有效**的 run 租约"：属主还活着时不得动手（那可能正
+	// 处在正常五步收尾的中间），因此先把租约推到过期，造出"属主已失联"的既成事实。
+	recExpireRunLease(t, db.pool, rec.RunID)
+
+	trace, err := NewReclaimerStore(db).ReclaimTerminalResidue(ctx, 16, recFixedNow)
 	require.NoError(t, err)
-	require.Zero(t, report.ClosedRuns, "已终态的 Run 不在收尾扫描面里")
+	require.Equal(t, 1, trace.Runs, "已终态 Run 的残留由 B1 对账")
+	require.Zero(t, trace.DeliveriesSettled, "这条 Run 没有投递行")
 
 	row := recReadRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusCompleted), row.Status, "已判定的终态不得被恢复改口")
@@ -1123,7 +1217,7 @@ func TestRecovery_DoesNotFabricateResourceLedger(t *testing.T) {
 	db := portTestDB(t)
 	recSeedRun(t, db.pool, "run-legacy", "running")
 
-	report, err := Recover(ctx, db.pool, recTestLogger(t), recFixedNow)
+	report, err := recRecoverAll(ctx, t, db.pool, recTestLogger(t), recFixedNow)
 	require.NoError(t, err)
 	require.Equal(t, 1, report.ClosedRuns)
 	require.Equal(t, string(core.StatusFailed), recLoadRunStatus(t, db.pool, "run-legacy"))

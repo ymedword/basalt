@@ -2,7 +2,10 @@
 
 package postgres
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+)
 
 // 本文件是提交故障钩子的**生产构建空壳**（设计 §3.1.1 `DB` 行："仅测试构建可见的
 // 提交故障钩子"）。`newCommitFaults` 返回 nil，于是 `Tx` / `VerifyTx` 里的注入分支
@@ -28,3 +31,7 @@ func (f *commitFaults) commitWithFaults(*sql.Tx, TxAttempt,
 
 // replicaPool 在生产构建里恒为 nil：核查只走主库连接池。
 func (f *commitFaults) replicaPool() *sql.DB { return nil }
+
+// holdAdmissionLock 在生产构建里是无操作：发布二进制不携带任何准入暂停点。
+// holdAdmissionLock is a no-op in the production build.
+func (f *commitFaults) holdAdmissionLock(context.Context) error { return nil }

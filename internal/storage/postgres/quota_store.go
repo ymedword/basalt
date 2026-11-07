@@ -800,6 +800,219 @@ func affectedOnce(res sql.Result, err error, action string) error {
 	return nil
 }
 
+// runTaskAmount 是每次 Run 准入记入 `tasks` 账本的数量：一次逻辑准入算一次任务，
+// 与装配层 `runQuotaTasksPerRun` 同值。两个包各持一个字面量是分层使然（`postgres`
+// 不得 import `app`），两者都是契约「一次 Run 一次任务」的落地，改动须同批。
+// runTaskAmount mirrors app's runQuotaTasksPerRun; changing one requires the other.
+const runTaskAmount = 1
+
+// runTaskChargeIdempotencyKey 与装配层 `runQuotaIdempotencyKey` **逐字同形**
+// （`run:<run_id>:admit`）：同一 Run 的两条记账路径若用不同键，会被记两次。
+// The key must stay byte-identical to the assembly's runQuotaIdempotencyKey.
+func runTaskChargeIdempotencyKey(runID string) string { return "run:" + runID + ":admit" }
+
+// chargeRunTaskQuotaTx 在调用方**自己的事务**里完成一次 Run 级任务次数记账
+// （预留 + 结算 `pending → committed`；模块卡 §2.3.2 的 Q21 接缝 / T012）：它接收
+// `*sql.Tx` 而不是开自己的事务，因此与权威准入、Run 行与 run 租约同生共死——任一步
+// 失败整笔回滚，零占用。`core.RunQuota` 的公开接口不变，本路径**不经**它。
+// chargeRunTaskQuotaTx reserves and settles one run-level task charge inside the
+// caller's transaction, so the charge commits or rolls back with admission itself.
+//
+// 判据与 `Reserve` + `Commit` 同口径（照抄而非复用，是为了不把"记账"拆成两个事务）：
+//   - 限额行缺失 / 额度为零 → `QuotaExhaustedError`（fail-closed，**不**退化成不限量）；
+//   - 幂等键 `(caller_id, idempotency_key)` 命中：已 committed 且参数一致 → 返回原
+//     预留（重放）；pending → 按"存量未收口"收口（见 `replayRunTaskChargeTx` 的说明，
+//     不退款、不重试、只结算一次）；released / reconciled → `ErrReservationSettled`
+//     （**不**把已结算的预留当成可再花一次）；
+//   - 超额（overage > 0）→ 等管理员核对，`RetryAt` 保持零值；额度不足 → 带下一周期。
+//
+// The helper mirrors Reserve+Commit's judgement without splitting them into two
+// transactions, and it never treats a settled reservation as spendable again.
+func chargeRunTaskQuotaTx(ctx context.Context, tx *sql.Tx, callerID, runID string, now time.Time) (string, error) {
+	if tx == nil {
+		return "", errors.New("postgres: 任务次数记账缺少事务")
+	}
+	if strings.TrimSpace(callerID) == "" || strings.TrimSpace(runID) == "" {
+		return "", fmt.Errorf("%w: 任务次数记账缺少调用方或 Run 标识", errQuotaInvalidArgument)
+	}
+	limit, periodStart, nextPeriod, err := reservationPeriod(ctx, tx, callerID, usageKindTasks, now)
+	if err != nil {
+		return "", err
+	}
+	idem := runTaskChargeIdempotencyKey(runID)
+	id, err := newReservationID(usageKindTasks)
+	if err != nil {
+		return "", err
+	}
+
+	var inserted string
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO quota_reservations
+			(reservation_id, caller_id, idempotency_key, class, period_start, amount, state, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+		ON CONFLICT (caller_id, idempotency_key) DO NOTHING
+		RETURNING reservation_id`,
+		id, callerID, idem, string(callers.ClassRun), periodStart, runTaskAmount, now.UnixMilli(),
+	).Scan(&inserted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return replayRunTaskChargeTx(ctx, tx, callerID, idem, runID, now)
+	}
+	if err != nil {
+		return "", fmt.Errorf("写入任务次数预留（run_id=%s）: %w", runID, err)
+	}
+
+	// 惰性建周期行（与 `Reserve` 同一手法）：旧周期行保留供审计。
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO caller_usage_periods
+			(caller_id, period_start, kind, used, reserved, overage, updated_at)
+		VALUES ($1, $2, $3, 0, 0, 0, $4)
+		ON CONFLICT (caller_id, period_start, kind) DO NOTHING`,
+		callerID, periodStart, usageKindTasks, now.UnixMilli(),
+	); err != nil {
+		return "", fmt.Errorf("建周期用量行（run_id=%s）: %w", runID, err)
+	}
+
+	// 条件累加：`overage = 0 AND used + reserved + amount <= limit` 在同一条 UPDATE
+	// 里求值，并发准入不会双双通过（与 `Reserve` 同一逆改点）。
+	res, err := tx.ExecContext(ctx, `
+		UPDATE caller_usage_periods
+		SET reserved = reserved + $4, updated_at = $5
+		WHERE caller_id = $1 AND period_start = $2 AND kind = $3
+		  AND overage = 0
+		  AND used + reserved + $4 <= $6`,
+		callerID, periodStart, usageKindTasks, runTaskAmount, now.UnixMilli(), limit,
+	)
+	if err != nil {
+		return "", fmt.Errorf("占用任务次数额度（run_id=%s）: %w", runID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("读取任务次数占用结果（run_id=%s）: %w", runID, err)
+	}
+	if affected == 0 {
+		var overage int64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT overage FROM caller_usage_periods
+			WHERE caller_id = $1 AND period_start = $2 AND kind = $3`,
+			callerID, periodStart, usageKindTasks,
+		).Scan(&overage); err != nil {
+			return "", fmt.Errorf("读取任务次数用量行（run_id=%s）: %w", runID, err)
+		}
+		if overage > 0 {
+			return "", &callers.QuotaExhaustedError{
+				Reason: fmt.Sprintf("账本 %s 有未核对的超额 %d", usageKindTasks, overage),
+			}
+		}
+		return "", &callers.QuotaExhaustedError{
+			Reason:  fmt.Sprintf("账本 %s 周期额度不足", usageKindTasks),
+			RetryAt: nextPeriod,
+		}
+	}
+
+	// 同一事务内立刻结算：先归还原预留、累加已用，再把预留行翻成 committed。
+	// 两步都要求恰好命中一行——行缺失或重复扣减按数据不一致回滚（`affectedOnce`）。
+	row := reservationRow{
+		id:          id,
+		callerID:    callerID,
+		class:       callers.ClassRun,
+		periodStart: periodStart,
+		amount:      runTaskAmount,
+		status:      callers.ReservationPending,
+	}
+	if err := applySettlement(ctx, tx, row, usageKindTasks, runTaskAmount, 0, now); err != nil {
+		return "", fmt.Errorf("结算任务次数（run_id=%s）: %w", runID, err)
+	}
+	settled, err := tx.ExecContext(ctx, `
+		UPDATE quota_reservations
+		SET state = 'committed', actual = $2, overage = 0, settled_at = $3
+		WHERE reservation_id = $1 AND state = 'pending'`,
+		id, runTaskAmount, now.UnixMilli())
+	if err := affectedOnce(settled, err, "提交任务次数预留（run_id="+runID+"）"); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// replayRunTaskChargeTx 处理幂等键命中：只有"已 committed 且参数一致"或"存量 pending
+// 可收口"两种情形可以返回原预留，其余状态一律失败关闭。`run_id` 只用于错误文案——
+// 归属回填由 `backfillReservationRun` 在 Run 行插入后独立校验。
+//
+// 为什么 pending 不是拒绝而是**就地收口**：本事务内的记账要么提交成 committed、要么
+// 整笔回滚、要么让同键的并发准入在 `INSERT … ON CONFLICT` 上等待并在对方提交后读到
+// committed——US-24 的路径**产生不出**一条已提交的 pending 行。能观察到它，只有两种
+// 来路：Q21 之前"预留事务 + 结算事务"两笔提交留下的存量行，或管理面 / 测试夹具手工
+// 种下的行。已接受的崩溃恢复契约要求这类行在**同一准入键**的下一次准入时收敛为
+// committed（恰好一次、不退款、不重试），而不是把整个调用方永久卡死。收口只碰它自己
+// 的周期行（`period_start` 取自存量行），因此跨周期也不会记错账；预留行先用
+// `WHERE state='pending'` 的条件更新上锁，并发收口者只有一个能命中，另一个整笔回滚
+// （不产生第二次扣减）。
+// A committed pending row cannot come from this path: it is either pre-Q21 legacy or a
+// seeded fixture, so the same idempotency key converges by settling it exactly once on its
+// own period — never a refund, never a retry, and never a permanent caller lockout.
+func replayRunTaskChargeTx(ctx context.Context, tx *sql.Tx, callerID, idem, runID string, now time.Time) (string, error) {
+	var (
+		existingID  string
+		class       string
+		amount      int64
+		state       string
+		periodStart int64
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT reservation_id, class, amount, state, period_start
+		FROM quota_reservations
+		WHERE caller_id = $1 AND idempotency_key = $2`,
+		callerID, idem,
+	).Scan(&existingID, &class, &amount, &state, &periodStart)
+	if err != nil {
+		return "", fmt.Errorf("读取同键任务预留（run_id=%s）: %w", runID, err)
+	}
+	if class != string(callers.ClassRun) || amount != runTaskAmount {
+		return "", fmt.Errorf("%w: 键 %q 已用于 class=%s amount=%d",
+			callers.ErrIdempotencyConflict, idem, class, amount)
+	}
+	switch callers.ReservationStatus(state) {
+	case callers.ReservationCommitted:
+		return existingID, nil
+	case callers.ReservationPending:
+		return settleLegacyRunTaskChargeTx(ctx, tx, callerID, existingID, periodStart, amount, runID, now)
+	default:
+		return "", fmt.Errorf("%w: 预留 %s 已结算为 %q",
+			callers.ErrReservationSettled, existingID, state)
+	}
+}
+
+// settleLegacyRunTaskChargeTx 把一条存量 pending 预留就地结算为 committed：先按
+// `state='pending'` 条件更新预留行（并发收口者在此串行化，落败方整笔回滚），再在它
+// **自己的周期行**上做与正常路径完全相同的结算（`reserved - amount`、`used + actual`）。
+// 顺序与 `chargeRunTaskQuotaTx` 的收尾一致，用的是同一个 `applySettlement`——两条路径
+// 的记账口径因此不会分叉。
+// settleLegacyRunTaskChargeTx settles a leftover pending reservation in place, on its own
+// period, through the same applySettlement used by the normal path.
+func settleLegacyRunTaskChargeTx(ctx context.Context, tx *sql.Tx, callerID, reservationID string,
+	periodStart, amount int64, runID string, now time.Time,
+) (string, error) {
+	settled, err := tx.ExecContext(ctx, `
+		UPDATE quota_reservations
+		SET state = 'committed', actual = $2, overage = 0, settled_at = $3
+		WHERE reservation_id = $1 AND state = 'pending'`,
+		reservationID, amount, now.UnixMilli())
+	if err := affectedOnce(settled, err, "收口存量任务次数预留（run_id="+runID+"）"); err != nil {
+		return "", err
+	}
+	row := reservationRow{
+		id:          reservationID,
+		callerID:    callerID,
+		class:       callers.ClassRun,
+		periodStart: periodStart,
+		amount:      amount,
+		status:      callers.ReservationPending,
+	}
+	if err := applySettlement(ctx, tx, row, usageKindTasks, amount, 0, now); err != nil {
+		return "", fmt.Errorf("结算存量任务次数（run_id=%s）: %w", runID, err)
+	}
+	return reservationID, nil
+}
+
 // resolveAdminPeriodStart 把管理面给出的瞬时折算成周期起点；限额行缺失时按 DDL
 // 缺省（day / UTC）解释，**不**把"没有限额"当成"没有这个调用方"——调用方是否
 // 存在由管理面的 `LookupCaller` 先行判定，两者是不同的 404 语义。

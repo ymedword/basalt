@@ -10,8 +10,15 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
-// 本文件是 runs（及其资源清单 / 引用）的**唯一 SQL 入口**。表 / 列 / 状态字面量以
-// docs/contracts/schema.sql 为准。四条纪律。① **起始态不由调用方给**：`RunRecord` 没有状态
+// 本文件是 **SQLite 源谱系** runs（及其资源清单 / 引用）的唯一 SQL 入口。运行期实现是
+// `internal/storage/postgres`（US-16 起 PG 是运行期唯一后端）；本文件保留以满足源谱系
+// 用例与 `basalt` 本地谱系的编译面，**不**提供执行租约（`execution_leases` 是 PG 运行期
+// 表）。因此 US-24 的三个租约相关端口在本谱系里一律**显式拒绝**，而不是静默降级：
+// 非零 token / 非零 owner 会走到这里，说明租约被接进了不带租约的后端，那是装配缺陷。
+// This file is the SQLite source-lineage entry point; the runtime backend is postgres.
+// The three lease-bearing ports refuse explicitly here instead of degrading silently.
+//
+// 原四条纪律不变。① **起始态不由调用方给**：`RunRecord` 没有状态
 // 字段，`running` 由本文件的 SQL 固定写——与审计预写同一手法，调用方也就没有传错的可能。
 // ② **不接收 finalText**：`runs` 表没有该列（§3.4 列级口径），最终回答只存在 `RunResult`
 // 与会话的 assistant 消息里。③ **一次准入一笔账**：运行行、资源清单与全部引用在**同一
@@ -69,7 +76,27 @@ func NewRunStore(db *DB) *RunStore { return &RunStore{db: db} }
 // `hash`），读侧重算的是"清空 hash 后的规整字节"，两者因此自洽（run_query.go）。
 // The hash is re-derived and verified before any write; storing a self-inconsistent row
 // would only move the failure to the read side.
-func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
+func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest,
+	owner core.WorkerIdentity, admission core.CallerAdmission, runID string,
+) (core.LeaseToken, error) {
+	// SQLite 源谱系没有执行租约：只有零值 owner（未接租约的装配）能走到这里，
+	// 非零 owner 是装配缺陷。返回零值 token 表示"本装配没有执行权凭证"。
+	// Only a zero-value owner reaches here; the zero token reports "no lease in this
+	// assembly", which the service already handles.
+	if !owner.IsZero() {
+		return core.LeaseToken{}, fmt.Errorf("预写运行账本（run_id=%s）: SQLite 源谱系没有执行租约，不接受非零 owner", rec.RunID)
+	}
+	_ = admission // 本谱系没有跨 Worker 判定，预检结论不改变写入。
+	_ = runID     // 幂等键只在带租约的准入事务里有意义。
+	if err := s.startRun(ctx, rec, manifest); err != nil {
+		return core.LeaseToken{}, err
+	}
+	return core.LeaseToken{}, nil
+}
+
+// startRun 是 StartRun 的写入本体（源谱系语义与 US-24 前一致）。
+// startRun is the write body; its lineage semantics are unchanged from before US-24.
+func (s *RunStore) startRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
 	trigger, err := triggerFor(rec.Channel, rec.Trigger)
 	if err != nil {
 		return err
@@ -133,6 +160,41 @@ func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest co
 		return fmt.Errorf("预写运行账本（run_id=%s）: 提交: %w", rec.RunID, err)
 	}
 	return nil
+}
+
+// CheckAdmission 在 SQLite 源谱系是**空操作**：这里没有 `execution_leases`，也就没有
+// "同会话未过期 run 租约"可查；调用方并发名额由 `callers.Limiter` 的进程内表承担
+// （本谱系没有跨 Worker 语义）。**不**伪造一个"看起来查过"的判定——权威写入路径
+// （`startRun`）仍然照旧拒绝重复行。
+// CheckAdmission is a no-op here: this lineage has no lease table and no cross-worker
+// semantics, so it reports no objection instead of faking a check.
+func (s *RunStore) CheckAdmission(ctx context.Context, sessionID string, p core.Principal,
+	admission core.CallerAdmission,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !p.Valid() {
+		return core.ErrUnauthorized
+	}
+	_ = sessionID
+	_ = admission
+	return nil
+}
+
+// LookupAdmittedRun 在本谱系不可用：准入事务不会返回"结果未知"（没有租约可建），
+// 因此没有任何调用点；显式拒绝而不是返回零值 token，避免调用方把"没查"当成成功。
+// LookupAdmittedRun is unavailable without leases; it refuses rather than returning
+// a zero token that would read as success.
+func (s *RunStore) LookupAdmittedRun(ctx context.Context, runID string) (core.LeaseToken, error) {
+	return core.LeaseToken{}, fmt.Errorf("回查准入结果（run_id=%s）: SQLite 源谱系没有执行租约", runID)
+}
+
+// RequestCancel 写 `runs.cancel_requested`——该列是 0012 的 PG 运行期增量，SQLite 源
+// 谱系没有它，也没有跨 Worker 取消语义（同进程取消走内存 cancel）。显式拒绝。
+// RequestCancel refuses: cancel_requested and cross-worker cancel exist only in PG.
+func (s *RunStore) RequestCancel(ctx context.Context, runID string) (core.RunDetail, error) {
+	return core.RunDetail{}, fmt.Errorf("请求取消运行（run_id=%s）: SQLite 源谱系没有跨 Worker 取消标志", runID)
 }
 
 // validateManifestCredentialPin 校验清单里的凭据固定形状：托管模式三项齐备且合法，
@@ -229,9 +291,15 @@ func manifestNotifyRefs(runID string, manifest core.RunResourceManifest) []core.
 // 启动纪律被绕过，不该被"更新成功"掩盖。
 // The status guard keeps a late terminal write from re-judging a finished run; a zero-row
 // update is an idempotent no-op when the row exists, and a hard error when it does not.
-func (s *RunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string,
-	iterations, toolCalls int, now time.Time,
+func (s *RunStore) FinishRun(ctx context.Context, runID string, token core.LeaseToken,
+	status core.RunStatus, reason string, iterations, toolCalls int, now time.Time,
 ) (bool, error) {
+	// SQLite 源谱系没有执行租约（`execution_leases` 是 PG 运行期表，US-24 新增）：
+	// 这条装配只能收零值 token。非零 token 走到这里说明租约被接进了不带租约的
+	// 后端——装配缺陷，显式拒绝，不假装做过 fencing。
+	if !token.IsZero() {
+		return false, fmt.Errorf("回填运行终态（run_id=%s）: SQLite 源谱系没有执行租约，不接受非零 token", runID)
+	}
 	tx, err := s.db.write.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("回填运行终态（run_id=%s）: 开启事务: %w", runID, err)
@@ -304,6 +372,18 @@ func (s *RunStore) ReleaseRunRefs(ctx context.Context, runID string, now time.Ti
 		return fmt.Errorf("释放运行引用（run_id=%s）: 提交: %w", runID, err)
 	}
 	return nil
+}
+
+// CompleteRunCloseout 在无租约装配里就是"释放三类引用"本身：没有租约可交还。
+// token 非零同样显式拒绝（与 FinishRun 同一口径）。
+// Without leases the closeout is exactly the ref release; a non-zero token is refused.
+func (s *RunStore) CompleteRunCloseout(ctx context.Context, runID string, token core.LeaseToken,
+	now time.Time,
+) error {
+	if !token.IsZero() {
+		return fmt.Errorf("运行收尾（run_id=%s）: SQLite 源谱系没有执行租约，不接受非零 token", runID)
+	}
+	return s.ReleaseRunRefs(ctx, runID, now)
 }
 
 // releaseRunRefs 释放某个 Run 的全部未释放资源引用（约束 19 / 注 8）。

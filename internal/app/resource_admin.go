@@ -242,7 +242,8 @@ type ResourceAdminDeps struct {
 	// CredentialSource 是删除模型连接后按剩余已发布集合重建目录时的托管凭据解析面：
 	// 剩余条目里可能有 `credential_mode: managed`。nil 表示本次装配没有托管凭据能力，
 	// 遇到 managed 条目时重建失败关闭（目录不换、定义文件按身份检查回滚），不猜值。
-	CredentialSource managedCredentialSource
+	// US-24 起同一面还负责算构建证据的凭据 pin（P-21），因此是完整的两方法接口。
+	CredentialSource catalogCredentialSource
 	// CredentialWriter 是保存路径上的托管凭据写入面（`*CredentialOps`）：managed 保存
 	// 在发布定义**之后**写凭据（目标绑定要读新定义），env 切换用它退役身份。
 	// nil 表示本次装配没有凭据写面：managed 保存一律拒绝（fail-closed），env 照常。
@@ -295,7 +296,7 @@ type ResourceAdmin struct {
 	catalog          *providerCatalogStore
 	supervisor       *MCPSupervisor
 	credentials      *postgres.CredentialStore
-	credentialSource managedCredentialSource
+	credentialSource catalogCredentialSource
 	credentialWriter CredentialSaveWriter
 	scopes           *ScopeService
 	bindings         NotifyBindingReferrer
@@ -773,8 +774,15 @@ func (s *ResourceAdmin) adoptManagedClient(ctx context.Context, name string,
 	if err != nil {
 		return fmt.Errorf("模型连接 %s: %w", name, err)
 	}
+	built, builtErr := builtProviderVersion(ctx, s.store, name, s.credentialSource)
+	if builtErr != nil {
+		// 构建证据取不到不阻断换入：客户端本身已按已发布版本构建成功，缺证据只会让
+		// 后续准入跳过本地实例比对（零值 = 未声明）。WARN 留痕，下次启动重建时补上。
+		s.logger.Warn("模型连接换入时未能记录构建证据（准入将跳过本地实例比对）",
+			"resource", name, "error", builtErr)
+	}
 	s.gate.Lock()
-	s.catalog.Store(s.catalog.Load().with(name, client, model))
+	s.catalog.Store(s.catalog.Load().with(name, client, model, built))
 	s.gate.Unlock()
 	return nil
 }
@@ -3563,8 +3571,15 @@ func (s *ResourceAdmin) commitModelConnection(ctx context.Context, operationID s
 	}
 	if client != nil {
 		// managed 新 Key 的客户端在凭据落库后才构建（`adoptManagedClient`）：此刻目录
-		// 不换入半成品，也不把 nil 当客户端写进去。
-		s.catalog.Store(s.catalog.Load().with(name, client, model))
+		// 不换入半成品，也不把 nil 当客户端写进去。构建证据用**刚发布的这一版**算，
+		// 与客户端同一份输入；算不出就记未声明（零值）并留 WARN，不编版本。
+		built, builtErr := builtVersionFrom(ctx, name, version, record.DefinitionYAML, s.credentialSource)
+		if builtErr != nil {
+			s.logger.Warn("发布提交段未能记录构建证据（准入将跳过本地实例比对）",
+				"resource", name, "error", builtErr)
+			built = core.BuiltVersion{}
+		}
+		s.catalog.Store(s.catalog.Load().with(name, client, model, built))
 	}
 	s.gate.Unlock()
 	return version, nil

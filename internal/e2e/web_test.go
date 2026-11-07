@@ -568,7 +568,7 @@ func (p *groupedProcess) interrupt(t *testing.T) {
 
 // interruptWindows 经 PowerShell P/Invoke 向子进程组投递 CTRL_BREAK_EVENT（事件号 1）。
 // Go 运行时把 Ctrl+Break 映射为 os.Interrupt，serve / gateway 的单一信号源据此
-// 走五阶段优雅停机。探针实测：进程以 0 退出并打出 msg=stop。
+// 走五阶段优雅停机。进程以 0 退出并打出 msg=停机完成（编排层成功停机标记）。
 // interruptWindows delivers CTRL_BREAK_EVENT to the child's process group through
 // PowerShell P/Invoke; the Go runtime maps it to os.Interrupt.
 func interruptWindows(t *testing.T, pid int) {
@@ -1146,7 +1146,8 @@ func testWebRedaction(t *testing.T) {
 	addr := freeLoopbackAddr(t)
 	model := newBarrierModel(t)
 	model.setFailure(`认证失败：C:\secret\` + marker + `.txt 不可读`)
-	h.writeConfig(t, configWithAddr(model.URL(), addr))
+	// 快速租约：本项最后要靠"租约过期后的回收"收尾留 running 的行（US-24 起没有启动扫描）。
+	h.writeConfig(t, configWithAddr(model.URL(), addr)+fastWorkerSection())
 	writeWebAgent(t, h, "ops-agent", nil)
 
 	p := startGrouped(t, h, fixtureEnv(), "serve")
@@ -1240,12 +1241,15 @@ func testWebRedaction(t *testing.T) {
 			cancelledRows[0]["status"])
 	}
 
-	// 重启后恢复扫描必须把仍为 running 的行收尾为 failed——这是「行留 running」的兑现。
+	// 仍为 running 的行必须由接管收尾为 failed——这是「行留 running」的兑现。US-24 起
+	// 没有启动扫描：收尾发生在重启进程的周期回收领取到期租约之后，因此轮询终态列，
+	// 不假设重启那一刻就已收场。
 	restartAddr := freeLoopbackAddr(t)
-	h.writeConfig(t, configWithAddr(model.URL(), restartAddr))
+	h.writeConfig(t, configWithAddr(model.URL(), restartAddr)+fastWorkerSection())
 	p2 := startGrouped(t, h, fixtureEnv(), "serve")
 	defer p2.stop(t)
 	waitHealthHTTP(t, p2, restartAddr, 30*time.Second)
+	waitNoRunningRuns(t, db, 90*time.Second, p2.output)
 	p2.stop(t)
 
 	closed := queryRows(t, db, `SELECT status, finished_at FROM runs WHERE run_id <> $1`, run.RunID)
@@ -1301,7 +1305,7 @@ func testWebReleaseOrder(t *testing.T) {
 	if code := p.waitExit(t, 60*time.Second); code != 0 {
 		t.Fatalf("优雅停机退出码 = %d，期望 0\n%s", code, p.output())
 	}
-	requireContains(t, p.combined(), "msg=stop", "运行时释放（调度器停止标记）")
+	requireContains(t, p.combined(), "msg=停机完成", "运行时释放（调度器停止标记）")
 
 	// 锁已释放：同工作区可以立刻重启。
 	secondAddr := freeLoopbackAddr(t)
@@ -1311,7 +1315,7 @@ func testWebReleaseOrder(t *testing.T) {
 	waitHealthHTTP(t, p2, secondAddr, 30*time.Second)
 	p2.stop(t)
 
-	// exec 出错路径：端口被测试进程占住 → serve 退出 1，但仍释放运行时（msg=stop）。
+	// exec 出错路径：端口被测试进程占住 → serve 退出 1，但仍释放运行时（msg=停机完成）。
 	busyAddr := freeLoopbackAddr(t)
 	listener, err := net.Listen("tcp", busyAddr)
 	if err != nil {
@@ -1321,7 +1325,7 @@ func testWebReleaseOrder(t *testing.T) {
 	res := h.run(t, fixtureEnv(), "serve")
 	closeListener(t, listener)
 	requireExit(t, res, 1, "端口占用停机")
-	requireContains(t, res.Stdout+res.Stderr, "msg=stop", "exec 出错同样释放运行时")
+	requireContains(t, res.Stdout+res.Stderr, "msg=停机完成", "exec 出错同样释放运行时")
 	requireContains(t, res.Stdout+res.Stderr, "监听", "端口占用错误点名监听地址")
 
 	// 出错路径之后锁同样已释放。
@@ -1798,7 +1802,7 @@ func testWebGatewayLifecycle(t *testing.T) {
 	requireContains(t, res.Stdout+res.Stderr, "工作区实例锁已被占用", "实例锁互斥")
 
 	gateway.stop(t)
-	requireContains(t, gateway.combined(), "msg=stop", "gateway 退出时释放运行时")
+	requireContains(t, gateway.combined(), "msg=停机完成", "gateway 退出时释放运行时")
 
 	// 锁已释放：serve 能正常启动并监听。
 	serve := startGrouped(t, h, fixtureEnv(), "serve")

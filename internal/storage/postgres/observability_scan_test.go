@@ -143,7 +143,7 @@ func TestObservabilityStore_ScanRecoveryUnknown(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.pool.ExecContext(t.Context(), `INSERT INTO tool_invocations(run_id,tool_name,status,started_at) VALUES('recovered','fake','pending',$1)`, now.Add(-72*time.Hour).UnixMilli())
 	require.NoError(t, err)
-	_, err = normalizePendingAuditRows(t.Context(), db.pool, now)
+	_, err = normalizePendingAuditRows(t.Context(), db.pool, []string{"recovered"}, now)
 	require.NoError(t, err)
 	s := NewObservabilityStore(db)
 	result, err := observability.NewScanner(s, obsScanConfig()).Scan(t.Context(), now)

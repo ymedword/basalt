@@ -34,7 +34,7 @@ func TestObservabilityStore_FixedFailureReasons(t *testing.T) {
 			require.Equal(t, kind, fact.ErrorKind, "fixed ingest failure classes must survive projection")
 		}
 	}
-	require.NoError(t, NewRunStore(db).StartRun(t.Context(), core.RunRecord{
+	require.NoError(t, startRunTest(NewRunStore(db), t.Context(), core.RunRecord{
 		RunID: "obs-known-reason", Agent: "synthetic", Channel: "web",
 		StartedAt: time.UnixMilli(1000), Principal: core.LocalAdminCLIPrincipal(),
 	}, core.RunResourceManifest{}))
@@ -49,7 +49,7 @@ func TestObservabilityStore_FixedFailureReasons(t *testing.T) {
 
 func TestObservabilityStore_AssemblyPresence(t *testing.T) {
 	db := portTestDB(t)
-	require.NoError(t, NewRunStore(db).StartRun(t.Context(), core.RunRecord{
+	require.NoError(t, startRunTest(NewRunStore(db), t.Context(), core.RunRecord{
 		RunID: "assembly-presence", Agent: "synthetic",
 		Channel: "web", StartedAt: time.UnixMilli(1000), Principal: core.LocalAdminCLIPrincipal(),
 	}, core.RunResourceManifest{}))
@@ -80,7 +80,7 @@ func TestObservabilityStore_TimelineQueries(t *testing.T) {
 		RunID: "obs-read", RequestID: "request:read", SessionID: "session-read", Agent: "synthetic",
 		Channel: "web", StartedAt: time.UnixMilli(1000), Principal: core.LocalAdminCLIPrincipal(),
 	}
-	require.NoError(t, NewRunStore(db).StartRun(ctx, record, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(NewRunStore(db), ctx, record, core.RunResourceManifest{}))
 	_, err := db.pool.ExecContext(ctx, `UPDATE runs SET reason='CANARY_RAW_ERROR' WHERE run_id=$1`, record.RunID)
 	require.NoError(t, err)
 	_, err = db.pool.ExecContext(ctx, `INSERT INTO llm_calls(run_id,round,provider,model,duration_ms,status,created_at,error_message)
@@ -232,7 +232,7 @@ func TestObservabilityStore_RequestIDBridge(t *testing.T) {
 		UserID: "synthetic", StartedAt: time.UnixMilli(1),
 		Principal: core.LocalAdminCLIPrincipal(),
 	}
-	require.NoError(t, store.StartRun(t.Context(), record, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, t.Context(), record, core.RunResourceManifest{}))
 	var request sql.NullString
 	require.NoError(t, db.pool.QueryRowContext(t.Context(), `SELECT request_id FROM runs WHERE run_id=$1`, record.RunID).Scan(&request))
 	require.True(t, request.Valid, "real request identity must reach the run ledger")
@@ -241,7 +241,7 @@ func TestObservabilityStore_RequestIDBridge(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, record.RequestID, detail.RequestID)
 	record.RunID, record.RequestID, record.Channel = "obs-scheduled", "", "scheduler"
-	require.NoError(t, store.StartRun(t.Context(), record, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, t.Context(), record, core.RunResourceManifest{}))
 	require.NoError(t, db.pool.QueryRowContext(t.Context(), `SELECT request_id FROM runs WHERE run_id=$1`, record.RunID).Scan(&request))
 	require.False(t, request.Valid, "scheduler has no HTTP request identity to invent")
 }

@@ -476,21 +476,21 @@ func TestResourceStore_LifecycleIndexRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, store.PutLifecycleIndex(context.Background(), rec, true, ""))
 
-	got, valid, errMsg, err := store.LifecycleIndex(context.Background(), "writer")
+	got, valid, errMsg, err := store.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Empty(t, errMsg)
 	require.Equal(t, rec, got)
 
 	require.NoError(t, store.PutLifecycleIndex(context.Background(), rec, false, "状态文件校验和不符"))
-	got, valid, errMsg, err = store.LifecycleIndex(context.Background(), "writer")
+	got, valid, errMsg, err = store.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, err)
 	require.False(t, valid)
 	require.Equal(t, "状态文件校验和不符", errMsg)
 	require.Empty(t, got.State)
 	require.Zero(t, got.Generation)
 
-	missing, valid, errMsg, err := store.LifecycleIndex(context.Background(), "ghost")
+	missing, valid, errMsg, err := store.ReadLifecycleIndex(context.Background(), "ghost")
 	require.NoError(t, err)
 	require.False(t, valid)
 	require.Empty(t, errMsg)

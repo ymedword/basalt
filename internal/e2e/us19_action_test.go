@@ -53,17 +53,31 @@ func TestFlow_WriteActionCrashKeepsOriginalIdentityAndNeverReplays(t *testing.T)
 			require.True(t, terminated)
 			remove()
 			u.p = startServe(t, u.h, u.addr)
-			u.waitStatus(t, task.ID, "blocked")
-			resume := u.control(t, task.ID, "resume", "resume-controlled-write")
+			// US-24：启动不再做全局扫描；A1 按**过期租约**收尾叶子 Run（FR-24-02）。之后
+			// 两种窗口分道：
+			//   - 未决动作存在 → `Recover` 在写库前返回 ErrActionUnknown（R4–R7 / FR-24-37），
+			//     根保持非终态、动作守卫原样保留，只能由管理面查证（resume 409 / cancel 200）；
+			//   - 动作与审计都已落定（known）→ A3 按 worker_lease_expired 把 blocked 根重入
+			//     queued，普通 Worker 复用已完成节点的运行证据，无需人工 resume（FR-24-37）。
+			// The crash window now resolves through lease-driven reclamation; a known action
+			// converges without an administrative resume, an unresolved one never does.
+			u.waitRunOver(t, task.ID)
 			if window == "effect-before-audit-terminal" {
+				require.Equal(t, 1, scalarInt(t, db, `SELECT count(*) FROM flow_actions WHERE task_id=$1 AND outcome IN ('dispatching','unknown')`, task.ID), "未决动作必须保持守卫直到人工查证")
+				var rootStatus string
+				require.NoError(t, db.QueryRow(`SELECT status FROM flow_tasks WHERE task_id=$1`, task.ID).Scan(&rootStatus))
+				require.False(t, flowStatusTerminal(rootStatus), "有未决动作的根不得被自动收为终态")
+				resume := u.control(t, task.ID, "resume", "resume-controlled-write")
 				requireWebStatus(t, resume, 409, "FLOW_ACTION_UNKNOWN", "", "unknown write must not replay")
 				var held int64
 				require.NoError(t, db.QueryRow(`SELECT COALESCE(sum(reserved_tool_calls),0) FROM flow_budget_allocations WHERE task_id=$1 AND state IN ('pending','unknown')`, task.ID).Scan(&held))
 				require.EqualValues(t, 1, held)
 				closed := u.control(t, task.ID, "cancel", "close-controlled-write")
-				requireWebStatus(t, closed, 200, "OK", "", "close unknown write without clearing its effect")
+				requireCloseAccepted(t, closed, "close unknown write without clearing its effect")
+				// 202 只表示关闭意图已受理；收敛由 sweepClosures 在可收敛后推进，
+				// 这里以精确终态证明它真的收敛，且不改变下面"零重放"的判据。
+				u.waitStatus(t, task.ID, "cancelled")
 			} else {
-				requireWebStatus(t, resume, 200, "OK", "", "reconcile original known output")
 				u.waitStatus(t, task.ID, "succeeded")
 			}
 			after, err := os.Stat(path)

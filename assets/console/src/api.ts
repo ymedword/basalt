@@ -321,6 +321,12 @@ export interface RunView {
   tool_calls: number
   config_hash: string
   manifest_hash: string
+  /** US-24 只读诊断：持有该 Run 执行权的 Worker 实例；历史 / 已释放时为空。 */
+  worker_instance_id: string
+  /** US-24 只读诊断：该 Run 租约的归属代次；历史 Run 为 0。 */
+  ownership_epoch: number
+  /** US-24 只读诊断：准入固定的资产包哈希（列表视图与旧清单为空）。 */
+  asset_bundle_hash: string
   started_at: string
   finished_at: string
 }
@@ -1141,6 +1147,17 @@ export interface SystemOverview {
     model_connections: number
     mcp_servers: number
     skills: number
+  }
+  /** US-24 只读诊断：数据库不可读时整组省略，不补 0。 */
+  workers?: {
+    active_leases: number
+    nodes: {
+      instance: string
+      name: string
+      started_at: string
+      heartbeat_at: string
+      active_leases: number
+    }[]
   }
   database: {
     status: 'ok' | 'unavailable'

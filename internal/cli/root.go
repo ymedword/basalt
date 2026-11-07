@@ -58,6 +58,10 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newIsolationCommand(deps),
 		newAdmissionCommand(deps),
 		newLearningCommand(deps),
+		// US-24：资产 bundle 命令面与 Worker 登记行的只读列表（§3.1.12）。
+		// US-24 adds the asset bundle surface and the read-only worker listing.
+		newAssetsCommand(deps),
+		newWorkersCommand(deps),
 	)
 
 	return root

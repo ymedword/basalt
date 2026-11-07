@@ -400,16 +400,3 @@ func (db *DB) withTx(ctx context.Context, fn func(context.Context, *sql.Tx) erro
 	}
 	return nil
 }
-
-// withTxOn 是 `withTx` 的自由函数形态（裸 `*sql.DB` 的调用方，如崩溃恢复）。
-// withTxOn is the bare-pool counterpart of withTx.
-func withTxOn(ctx context.Context, pool *sql.DB, now time.Time, fn func(context.Context, *sql.Tx) error) error {
-	outcome, err := txOn(ctx, pool, now, nil, fn)
-	if err != nil {
-		return err
-	}
-	if outcome != TxCommitted {
-		return fmt.Errorf("%w: 业务回调未报错但事务结局为 %q", ErrTxOutcomeUnknown, outcome)
-	}
-	return nil
-}

@@ -290,9 +290,29 @@ func (e *ToolExecutor) recordDiag(ctx context.Context, env ToolEnv, step ToolSte
 func (e *ToolExecutor) beginInvocation(ctx context.Context, env ToolEnv, call ToolCall) (int64, bool) {
 	beginCtx, cancel := finishContext(ctx)
 	defer cancel()
-	id, err := e.audit.BeginInvocation(beginCtx, pendingInvocation(env, call))
+	inv := pendingInvocation(env, call)
+	var (
+		id  int64
+		err error
+	)
+	if env.lease.IsZero() {
+		// 未接执行权的装配（零值单测 / SQLite 谱系）走普通入口，行为与接入前逐字相同。
+		// Unleased assemblies keep the plain path unchanged.
+		id, err = e.audit.BeginInvocation(beginCtx, inv)
+	} else {
+		fenced, ok := e.audit.(FencedToolAuditStore)
+		if !ok {
+			// 有凭证却没有 fenced 入口 = 装配缺陷：**不得**降级成无保护写。
+			// A credential without a fenced entry point is an assembly defect; never
+			// degrade to the unprotected write.
+			err = fmt.Errorf("%w（工具审计存储 %T）", ErrLeaseFenceUnavailable, e.audit)
+		} else {
+			id, err = fenced.FencedBeginInvocation(beginCtx, env.lease, inv)
+		}
+	}
 	if err != nil {
-		e.logger.Error("工具审计预写失败", "run_id", env.RunID, "store", "tool_invocations", "op", "start")
+		e.logger.Error("工具审计预写失败", "run_id", env.RunID, "store", "tool_invocations", "op", "start",
+			"error", err)
 		return 0, false
 	}
 	return id, true
@@ -306,8 +326,21 @@ func (e *ToolExecutor) beginInvocation(ctx context.Context, env ToolEnv, call To
 func (e *ToolExecutor) finishInvocation(ctx context.Context, env ToolEnv, id int64, out ToolInvocationResult) bool {
 	finCtx, cancel := finishContext(ctx)
 	defer cancel()
-	if err := e.audit.FinishInvocation(finCtx, id, out); err != nil {
-		e.logger.Error("工具审计终态回填失败", "run_id", env.RunID, "store", "tool_invocations", "op", "finish")
+	var err error
+	if env.lease.IsZero() {
+		err = e.audit.FinishInvocation(finCtx, id, out)
+	} else if fenced, ok := e.audit.(FencedToolAuditStore); ok {
+		err = fenced.FencedFinishInvocation(finCtx, env.lease, id, out)
+	} else {
+		err = fmt.Errorf("%w（工具审计存储 %T）", ErrLeaseFenceUnavailable, e.audit)
+	}
+	if err != nil {
+		// 失权时终态不落库、行留 pending：如实记录真实类别（错误不吞，`errors.Is` 仍可判
+		// `ErrLeaseLost`），结果照常回给模型——扣下答案并不能修复历史。
+		// On a lost lease the row stays pending; the error keeps its identity and the
+		// result still travels back to the model.
+		e.logger.Error("工具审计终态回填失败", "run_id", env.RunID, "store", "tool_invocations", "op", "finish",
+			"error", err)
 		return false
 	}
 	return true

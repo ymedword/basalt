@@ -42,6 +42,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/ymedword/basalt/internal/testutil"
 )
 
@@ -948,7 +950,9 @@ func TestUS22_E2E_RecoveryAfterCrash(t *testing.T) {
 	model := newUS22Model(t, textResponse("第一次回复"))
 	model.blockExtract = true
 	providers := "providers:\n" + v3ProviderBlock(fixtureProvider, model.URL(), fixtureModel)
-	h.writeConfig(t, v3ServeConfig(addr, providers, us22LearningSection(us22Agent)))
+	// US-24 起崩溃恢复由过期租约的回收轮次驱动（FR-24-02 / 卡片 §7 Q2），夹具把执行权
+	// 时效压到可等待的量级；判据仍是"只查证不重放"的终态，不放宽任何断言。
+	h.writeConfig(t, v3ServeConfig(addr, providers, us22LearningSection(us22Agent))+fastWorkerSection())
 	writeWebAgent(t, h, us22Agent, nil)
 
 	p := startGrouped(t, h, fixtureEnv(), "serve")
@@ -1000,16 +1004,21 @@ func TestUS22_E2E_RecoveryAfterCrash(t *testing.T) {
 	addr2 := freeLoopbackAddr(t)
 	model2 := newUS22Model(t, textResponse("第二次回复"))
 	providers2 := "providers:\n" + v3ProviderBlock(fixtureProvider, model2.URL(), fixtureModel)
-	h.writeConfig(t, v3ServeConfig(addr2, providers2, us22LearningSection(us22Agent)))
+	h.writeConfig(t, v3ServeConfig(addr2, providers2, us22LearningSection(us22Agent))+fastWorkerSection())
 	p2 := startGrouped(t, h, fixtureEnv(), "serve")
 	defer p2.stop(t)
 	waitHealthHTTP(t, p2, addr2, 30*time.Second)
 
 	// 恢复只查证：pending → unknown + verified_at，游标推进到冻结窗口末尾；
 	// 抽取调用审计不重放（同一 Run 仍只有一条，且被归一化为 unknown）。
-	if got := us22String(t, db, `SELECT status FROM memory_extractions WHERE extraction_id = $1`, extractionID); got != "unknown" {
-		t.Fatalf("恢复后的抽取行 status = %q，期望 unknown（只查证不重放）", got)
-	}
+	// 查证入口有两处：启动扫描按归属保护跳过**仍有活租约**的行，孤儿行由回收器
+	// （B3）在 TTL 到期后领取——因此这里等到状态翻转，而不是健康检查后立刻读。
+	// Two entry points exist now: startup skips rows with a live lease and the reclaimer
+	// takes over after expiry, so the verdict is a bounded wait rather than an instant read.
+	require.Eventually(t, func() bool {
+		var status string
+		return db.QueryRow(`SELECT status FROM memory_extractions WHERE extraction_id = $1`, extractionID).Scan(&status) == nil && status == "unknown"
+	}, 30*time.Second, 50*time.Millisecond, "恢复后的抽取行 status 未变为 unknown（只查证不重放）")
 	if n := scalarInt(t, db,
 		`SELECT COUNT(*) FROM memory_extractions WHERE extraction_id = $1 AND verified_at IS NOT NULL`, extractionID); n != 1 {
 		t.Fatalf("恢复后未写查证时间（verified_at 为空）")

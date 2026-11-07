@@ -18,6 +18,11 @@ import {
 import { agentHref, resourceHref, runHref } from '../router'
 import { badge, definitions, RUN_STATUS_LABELS, useLoader, viewProps } from './shared'
 
+/** shortInstance 把 16 进制实例标识压成可读短码；完整值留在 title 里。 */
+function shortInstance(instance: string): string {
+  return instance.length <= 18 ? instance : `${instance.slice(0, 8)}…${instance.slice(-6)}`
+}
+
 function metric(label: string, value: string, note: VNodeChild, accent = false): VNode {
   return h('div', { class: ['overview-metric', accent ? 'metric-accent' : ''] }, [
     h('span', { class: 'metric-label' }, label), h('strong', { class: 'metric-value' }, value), h('div', { class: 'metric-note' }, [note]),
@@ -115,6 +120,42 @@ export const OverviewView = defineComponent({
         ...rows,
       ])
     }
+    /**
+     * 分布式执行面板（US-24 §3.1.13）：Worker 列表与全库活跃租约数都是只读诊断。
+     * 数据库不可读时整组省略——这里显示"读不到"，**不得**显示成"没有 Worker 在跑"；
+     * 反过来，能读到的 0 是真实读数（单 Worker 空闲）。
+     * The distributed-execution panel is read-only diagnostics; an unreadable database
+     * shows "unknown", never an empty cluster.
+     */
+    function renderWorkersPanel(): VNode {
+      const summary = overview.data.value
+      const workers = summary?.workers ?? null
+      const rows: VNodeChild[] =
+        workers === null
+          ? [h('p', { class: 'muted' }, summary === null ? '正在读取 Worker 状态…' : '数据库不可读，Worker 状态暂不可用。')]
+          : workers.nodes.length === 0
+            ? [h('p', { class: 'muted' }, '还没有 Worker 登记：启动一个 serve 进程后会出现在这里。')]
+            : workers.nodes.map(node =>
+                h('div', { key: node.instance, class: 'dependency-row' }, [
+                  h('div', [
+                    h('strong', { title: node.instance }, node.name === '' ? shortInstance(node.instance) : `${node.name} · ${shortInstance(node.instance)}`),
+                    h('p', `启动 ${formatTimestamp(node.started_at)} · 心跳 ${formatTimestamp(node.heartbeat_at)}`),
+                  ]),
+                  h('span', { class: 'dependency-count' }, `${node.active_leases} 个活跃租约`),
+                ]),
+              )
+      return h('section', { class: 'overview-panel workers-panel' }, [
+        h('div', { class: 'panel-heading' }, [
+          h('h2', '分布式执行'),
+          badge(workers === null ? '待确认' : `${workers.nodes.length} 个 Worker`, workers === null ? 'muted' : 'ok'),
+        ]),
+        h('p', { class: 'muted small' },
+          workers === null
+            ? '活跃租约数读不到时不显示为 0。'
+            : `全库活跃执行权 ${workers.active_leases} 个；心跳只作诊断，死亡判定以租约到期为准。`),
+        ...rows,
+      ])
+    }
     return (): VNode => {
       const summary = overview.data.value
       const system = info.data.value
@@ -164,9 +205,11 @@ export const OverviewView = defineComponent({
             h('a', { class: 'dependency-row', href: resourceHref('model-connections') }, [h('div', [h('strong', '模型连接'), h('p', '配置已加载；未执行模型探测')]), h('span', { class: 'dependency-count' }, summary ? summary.resources.model_connections + ' 项 ↗' : '—')]),
             h('a', { class: 'dependency-row', href: resourceHref('mcp-servers') }, [h('div', [h('strong', 'MCP 服务'), h('p', '当前实际建立的服务连接')]), h('span', { class: 'dependency-count' }, mcps.data.value ? mcps.data.value.filter(item => item.connected).length + ' / ' + mcps.data.value.length + ' ↗' : '—')]),
             h('div', { class: 'dependency-row' }, [h('div', [h('strong', '管理面认证'), h('p', summary ? summary.auth.loopback_only ? '仅回环访问' : '允许远程访问' : '正在读取')]), h('span', { class: 'dependency-count' }, summary ? summary.auth.mode === 'token' ? 'Token' : '本机信任' : '—')]),
+            h('div', { class: 'dependency-row' }, [h('div', [h('strong', '分布式执行'), h('p', '登记的 Worker 与全库活跃执行权')]), h('span', { class: 'dependency-count' }, summary?.workers ? `${summary.workers.nodes.length} 节点 · ${summary.workers.active_leases} 租约` : '待确认')]),
           ]),
         ]),
         renderSecretsPanel(),
+        renderWorkersPanel(),
         h('section', { class: 'overview-panel process-panel' }, [
           h('div', { class: 'panel-heading' }, [h('h2', '进程读数'), h('span', { class: 'muted small' }, readings ? '采样于 ' + formatTimestamp(readings.sampled_at) : '尚未取得采样')]),
           h('div', { class: 'process-readings' }, [

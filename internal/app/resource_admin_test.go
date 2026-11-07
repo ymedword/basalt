@@ -3848,6 +3848,18 @@ func (f *fixedManagedCredentials) ResolveModelCredential(_ context.Context,
 	return f.key, nil
 }
 
+// PinModelCredential 返回零值 pin：本夹具只断言取 Key 的路径（US-24 起目录构建也
+// 读凭据 pin），凭据 pin 的取值不在本用例的判据面内。
+// PinModelCredential returns a zero pin; this fixture only asserts the key path.
+func (f *fixedManagedCredentials) PinModelCredential(_ context.Context, _ core.ResourceUID,
+	_ string,
+) (core.CredentialPin, error) {
+	if f.err != nil {
+		return core.CredentialPin{}, f.err
+	}
+	return core.CredentialPin{}, nil
+}
+
 // newManagedModelEnv 在资源夹具上接托管凭据的读写两面替身。
 // newManagedModelEnv wires the resource fixture with a fake resolver and writer.
 func newManagedModelEnv(t *testing.T, source *fixedManagedCredentials) (*resourceEnv, *credentialRecorder) {

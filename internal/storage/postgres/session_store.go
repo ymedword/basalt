@@ -35,6 +35,18 @@ type SessionStore struct{ db *DB }
 // Compile-time assertion that SessionStore satisfies the consumer-declared interface.
 var _ core.MessageStore = (*SessionStore)(nil)
 
+// 编译期断言：同一实现也提供**受归属保护**的追加入口（US-24 T008 / FR-24-36）。
+// The same implementation provides the fenced append entry point.
+var _ core.FencedMessageStore = (*SessionStore)(nil)
+
+// errEmptySessionAppend 是两条追加入口共用的入口校验：空 session_id 是"无状态调用"的
+// 语义（仅在内存、不落会话历史，契约 §1.1），本层没有它可以写的行（`messages.session_id`
+// 有外键）；静默 no-op 会让调用方以为消息落了库——那正是"内存里有、库里没有"的历史分叉。
+// fenced 入口与普通入口必须给**同一个**错误：否则同一种非法输入会因路径不同而不同解。
+// errEmptySessionAppend is shared by both append entry points so the same illegal input
+// always yields the same answer, whichever path the caller took.
+var errEmptySessionAppend = errors.New("追加会话消息: 空会话标识——无状态会话只在内存，不落消息历史")
+
 // NewSessionStore 绑定一个已打开的库句柄（写入走写池、读取走读池）。
 // NewSessionStore binds the store to an opened database handle.
 func NewSessionStore(db *DB) *SessionStore { return &SessionStore{db: db} }
@@ -54,7 +66,7 @@ func NewSessionStore(db *DB) *SessionStore { return &SessionStore{db: db} }
 // an empty id because the identity only exists once the row is really there.
 func (s *SessionStore) AppendMessage(ctx context.Context, sessionID, runID string, m core.Message) (string, error) {
 	if sessionID == "" {
-		return "", errors.New("追加会话消息: 空会话标识——无状态会话只在内存，不落消息历史")
+		return "", errEmptySessionAppend
 	}
 	// 时间取本语句执行时刻：冻结签名（颗粒度文档 §3.1）里没有时间位，而 `created_at`
 	// 是 NOT NULL 的"这一时刻"。与 `ToolInvocationRepo.BeginInvocation` 同一手法、同一理由。
@@ -62,6 +74,32 @@ func (s *SessionStore) AppendMessage(ctx context.Context, sessionID, runID strin
 	// the same treatment BeginInvocation gives its started_at column.
 	var id string
 	err := s.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		id, err = appendMessage(ctx, tx, sessionID, runID, m, time.Now())
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// FencedAppendMessage 是同一追加语句的**受归属保护**入口（消息追加面，§2.3.3 /
+// US-24 T008）：先锁租约行、校验 owner + epoch + 未过期，再写消息与计数——同一事务。
+// 失权返回 `ErrLeaseLost` 且**零新行**：旧持有者不得再往会话历史里追加。
+//
+// 注意 fence 的对象是 token 指向的那条 Run 的租约，而不是 sessionID：会话可以跨越
+// 多次 Run，租约却只覆盖当前这次（§2.3.1 的粒度）。
+// FencedAppendMessage fences the append on the run's lease, not on the session: a session
+// spans runs, while a lease covers exactly one.
+func (s *SessionStore) FencedAppendMessage(ctx context.Context, token core.LeaseToken,
+	sessionID, runID string, m core.Message,
+) (string, error) {
+	if sessionID == "" {
+		return "", errEmptySessionAppend
+	}
+	var id string
+	err := fencedTx(ctx, s.db, token, func(ctx context.Context, tx *sql.Tx) error {
 		var err error
 		id, err = appendMessage(ctx, tx, sessionID, runID, m, time.Now())
 		return err

@@ -66,7 +66,7 @@ func (s *us22ExtractStore) EntriesForExtraction(context.Context, core.Scope, int
 	return nil, nil
 }
 
-func (s *us22ExtractStore) BeginExtraction(_ context.Context, row core.LearningExtraction) (core.LearningExtraction, error) {
+func (s *us22ExtractStore) BeginExtraction(_ context.Context, row core.LearningExtraction, _ core.LeaseToken) (core.LearningExtraction, error) {
 	s.beginCalls++
 	if s.events != nil {
 		s.events.add("extraction-pending")
@@ -79,8 +79,8 @@ func (s *us22ExtractStore) BeginExtraction(_ context.Context, row core.LearningE
 	return row, nil
 }
 
-func (s *us22ExtractStore) FailExtraction(ctx context.Context, _ string, class core.LearningFailureClass,
-	_ string, _ time.Time,
+func (s *us22ExtractStore) FailExtraction(ctx context.Context, _, _ string, _ core.LeaseToken,
+	_ string, _ int, class core.LearningFailureClass, _ string, _ time.Time,
 ) error {
 	s.failCalls++
 	s.failClass = class
@@ -92,7 +92,7 @@ func (s *us22ExtractStore) FailExtraction(ctx context.Context, _ string, class c
 	return nil
 }
 
-func (s *us22ExtractStore) CommitExtraction(context.Context, core.CommitLearningExtraction) (core.LearningCommitResult, error) {
+func (s *us22ExtractStore) CommitExtraction(context.Context, core.CommitLearningExtraction, core.LeaseToken) (core.LearningCommitResult, error) {
 	s.commitCalls++
 	if s.events != nil {
 		s.events.add("commit")

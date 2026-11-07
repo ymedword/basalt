@@ -260,7 +260,7 @@ func us19LogTail(raw string, limit int) string {
 	return raw
 }
 
-// SC-003：32个真实open任务，四个已外发动作只核对为unknown，绝不当成功恢复。
+// SC-003：32个真实open任务，四个已外发动作只核对为未决（dispatching），绝不当成功恢复。
 // Reconcile the real 32-task backlog without replaying any interrupted dispatch.
 func TestFlow_BinaryRestartReconciles32OpenWithin30Seconds(t *testing.T) {
 	var calls atomic.Int64
@@ -296,17 +296,59 @@ func TestFlow_BinaryRestartReconciles32OpenWithin30Seconds(t *testing.T) {
 	close(release)
 	started := time.Now()
 	u.p = startServeWithEnv(t, u.h, u.addr, u.env)
+	// US-24：恢复由**过期租约的回收**驱动（FR-24-02）。28 个排队根在窗口内推进到
+	// succeeded；4 个已外发调用的根先由 A1 收尾叶子 Run，再因未决动作停在非终态
+	// （`Recover` 在写库前返回 ErrActionUnknown，R4–R7 / FR-24-37），不会自动成功、
+	// 也不会被自动改写。判据仍是精确的计数与"零重放"。
+	// The 28 queued roots converge; the 4 dispatched roots stay non-terminal with their
+	// guard intact and are never replayed.
 	require.Eventually(t, func() bool {
-		return scalarInt(t, db, `SELECT count(*) FROM flow_tasks WHERE status IN ('succeeded','blocked')`) == 32
+		succeeded := scalarInt(t, db, `SELECT count(*) FROM flow_tasks WHERE status='succeeded'`)
+		closedRuns := scalarInt(t, db, `SELECT count(*) FROM runs r JOIN flow_tasks t ON t.task_id=r.flow_task_id WHERE t.status NOT IN ('succeeded','failed','stopped','cancelled','abandoned') AND r.status='failed'`)
+		return succeeded == 28 && closedRuns == 4
 	}, 30*time.Second-time.Since(started), 25*time.Millisecond)
 	elapsed := time.Since(started)
 	require.LessOrEqual(t, elapsed, 30*time.Second)
 	require.Equal(t, 28, scalarInt(t, db, `SELECT count(*) FROM flow_tasks WHERE status='succeeded'`))
-	require.Equal(t, 4, scalarInt(t, db, `SELECT count(*) FROM flow_tasks WHERE status='blocked'`))
-	require.Equal(t, 4, scalarInt(t, db, `SELECT count(*) FROM flow_action_attempts WHERE outcome='unknown'`))
+	require.Equal(t, 4, scalarInt(t, db, `SELECT count(*) FROM flow_tasks WHERE status NOT IN ('succeeded','failed','stopped','cancelled','abandoned')`), "四个中断根必须保持非终态等待人工查证")
+	require.Equal(t, 4, scalarInt(t, db, `SELECT count(*) FROM flow_action_attempts WHERE outcome='dispatching'`), "未决动作的守卫必须原样保留，不得被自动改写成结论")
+	require.Equal(t, 0, scalarInt(t, db, `SELECT count(*) FROM flow_action_attempts WHERE outcome='unknown'`), "启动不再有全局归一化：未决动作不靠改写尝试行来表达")
+	require.Equal(t, 4, scalarInt(t, db, `SELECT count(*) FROM llm_calls WHERE run_id IN (SELECT run_id FROM runs WHERE flow_task_id IS NOT NULL) AND status='unknown'`), "四个未确认的模型调用只能归一化为 unknown")
 	require.EqualValues(t, 33, calls.Load(), "one warm-up, four interrupted, twenty-eight safe; unknown calls must not replay")
-	require.Equal(t, 32, scalarInt(t, db, `SELECT count(*) FROM flow_node_attempts`))
-	t.Logf("US19_RESTART open=32 safe_succeeded=28 unknown_blocked=4 replayed=0 reconciliation_ms=%.3f", float64(elapsed.Microseconds())/1000)
+	// US-24 判据面修订（2026-11-07，记录见 run-state §2）：attempt 行数不再是固定 32。
+	// 容量未准入时 `YieldUnadmitted` 把这次领取记成 interrupted 并退回逻辑尝试号，之后
+	// 合法重领——行数随调度时序浮动（实测 36 / 38），行数本身不再承载"零重放"语义。
+	// 零重放改由三条可确定的不变量承担：每个根至少一次领取；被重试的中断尝试**从未
+	// 准入**（无 Run / 动作 / 预留，与 `YieldUnadmitted` 的退款前提同一条谓词）；逻辑
+	// 尝试编号不超过 max_attempts_per_node=3。真正的零重放仍由 calls==33 与 4 条动作
+	// 守卫承担。
+	// Attempt rows are no longer a fixed 32: a capacity yield records an interrupted row
+	// and legally re-claims later. The zero-replay guarantee moves to these invariants.
+	require.GreaterOrEqual(t, scalarInt(t, db, `SELECT count(*) FROM flow_node_attempts`), 32, "每个根至少一次领取")
+	require.Equal(t, 0, scalarInt(t, db, `SELECT count(*) FROM flow_node_attempts a WHERE a.state='interrupted' AND (EXISTS(SELECT 1 FROM runs r WHERE r.run_id=a.run_id) OR EXISTS(SELECT 1 FROM flow_action_attempts fa WHERE fa.task_id=a.task_id AND fa.node_attempt_id=a.node_attempt_id) OR EXISTS(SELECT 1 FROM flow_budget_allocations b WHERE b.task_id=a.task_id AND b.run_id=a.run_id))`), "被重试的中断尝试必须从未准入")
+	require.LessOrEqual(t, scalarInt(t, db, `SELECT COALESCE(max(attempt),0) FROM flow_node_attempts`), 3, "逻辑尝试编号不得超过 max_attempts_per_node")
+	var stuck []string
+	rows, err := db.Query(`SELECT task_id FROM flow_tasks WHERE status NOT IN ('succeeded','failed','stopped','cancelled','abandoned') ORDER BY task_id`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		stuck = append(stuck, id)
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	require.Len(t, stuck, 4)
+	for _, id := range stuck {
+		require.Equal(t, 1, scalarInt(t, db, `SELECT count(*) FROM flow_action_attempts WHERE task_id=$1 AND outcome='dispatching'`, id), "每个中断根的动作守卫必须保留")
+		require.Equal(t, 1, scalarInt(t, db, `SELECT count(*) FROM runs WHERE flow_task_id=$1 AND status='failed'`, id), "中断的叶子 Run 只能被接管收尾为 failed")
+	}
+	refused := u.control(t, stuck[0], "resume", "resume-restart-unknown")
+	requireWebStatus(t, refused, 409, "FLOW_ACTION_UNKNOWN", "", "an interrupted dispatch is never treated as success")
+	closedRoot := u.control(t, stuck[0], "cancel", "close-restart-unknown")
+	requireCloseAccepted(t, closedRoot, "operator can close the unresolved root without clearing the fact")
+	u.waitStatus(t, stuck[0], "cancelled")
+	require.EqualValues(t, 33, calls.Load())
+	t.Logf("US19_RESTART open=32 safe_succeeded=28 unknown_nonterminal=4 replayed=0 reconciliation_ms=%.3f", float64(elapsed.Microseconds())/1000)
 }
 
 func TestFlow_BinaryInteractiveReserveAndDeferredFairness(t *testing.T) {

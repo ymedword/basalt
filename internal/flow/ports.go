@@ -23,6 +23,12 @@ type AdvanceRequest struct {
 	Principal core.Principal
 	TaskID    string
 	Expected  TaskVersion
+	// Lease 是本次推进持有的 flow_root 根租约凭证（US-24 §3.1.6）：推进类写入的
+	// `updateFlowHead` 按 `root_task_id` 校验它存在且未过期。零值只在未接执行权的
+	// 装配（单测 / SQLite 谱系）出现，真实 Worker 领取后恒为非零。
+	// Lease is the flow-root credential of this advance; the storage layer checks it on
+	// every advance-class write. Zero only appears in unleased assemblies.
+	Lease core.LeaseToken
 }
 
 // CancelRequest 保存有归属的幂等关闭操作。
@@ -34,11 +40,18 @@ type CancelRequest struct {
 }
 
 // ResumeRequest 只要求可信核对，不授权重放未知动作。
-// ResumeRequest requests reconciliation, never blind replay.
+//
+// Lease 是**回收器（A3）**持有的根租约凭证：跨 Worker 接管时 `Service.Recover` 拿着它
+// 校验"我确实是这次领取的执行者"，`Repository.Recover` 拿它做写入档的租约条件
+// （模块卡 §3.1.6 / P-04）。其它调用方（关闭、管理面）传零值，由 `Service.Recover`
+// 按需自取（T020）——零值不等于"免校验"，而是"本路径不携带"。
+// ResumeRequest requests reconciliation, never blind replay. Lease carries the
+// reclaimer's flow-root credential so a takeover is verified as this claim's owner.
 type ResumeRequest struct {
 	Principal                              core.Principal
 	TaskID, RequestID, OperationID, Reason string
 	Expected                               TaskVersion
+	Lease                                  core.LeaseToken
 }
 
 // AbandonRequest 是带管理认证及理由的救援操作。
@@ -119,7 +132,10 @@ type ClaimNode struct {
 	TaskID    string
 	Expected  TaskVersion
 	Attempt   NodeAttempt
-	Now       int64
+	// Lease 是节点领取（推进类写入）的根租约凭证，语义同 AdvanceRequest.Lease。
+	// Lease carries the root credential of this node claim, same semantics.
+	Lease core.LeaseToken
+	Now   int64
 }
 
 // CommitNode 一次提交输出、关系、验收和转移。
@@ -139,15 +155,26 @@ type CommitNode struct {
 	Claims                         []ClaimRevision
 	Artifacts                      []ArtifactVersion
 	Verifications                  []Verification
-	Now                            int64
+	// Lease 是节点提交的根租约凭证：提交同样是推进类写入（写后状态可能落
+	// `running` / `succeeded` / `failed`），因此要按 `root_task_id` 校验根租约。
+	// Lease is the root credential of this node commit, another advance-class write.
+	Lease core.LeaseToken
+	Now   int64
 }
 
 // CancelTask 携真实join证明，不能用等待超时替代。
 // CancelTask carries actual join proof rather than a wait timeout.
 type CancelTask struct {
 	Request CancelRequest
-	Joined  bool
-	Now     int64
+	// Joined 决定关闭传播能否立即收尾子任务（沿用旧语义）。
+	Joined bool
+	// Isolated = 根子树无仍有效的 run 租约（R5，语义与 ReconcileTask.Isolated
+	// 逐字相同）：唯一用途是驱动 `prepared|running → interrupted` 的收敛。
+	// 关闭类写入**不**要求根租约，但必须携带本判据——否则关闭态下 attempt 永远
+	// 收敛不掉（`closeFlowTask` 收敛根自身、`propagateFlowClose` 收敛后代）。
+	// Isolated gates the attempt convergence of close-class writes.
+	Isolated bool
+	Now      int64
 }
 
 // AbandonTask 的救援标志只由可信授权检查产生。
@@ -155,17 +182,34 @@ type CancelTask struct {
 type AbandonTask struct {
 	Request                      AbandonRequest
 	Joined, NoAvailableCallerKey bool
-	Now                          int64
+	// Isolated 语义与 CancelTask.Isolated 逐字相同（§2.3.6 第 1037 行）：
+	// Abandon 经 closeFlowTask / propagateFlowClose 收敛 attempt，因此同样要携带。
+	// Isolated carries the same subtree-isolation fact as CancelTask.Isolated.
+	Isolated bool
+	Now      int64
 }
 
 // ReconcileTask 保存核对事实，不允许清除取消位。
 // ReconcileTask supplies reconciliation facts without clearing cancellation.
+//
+// 租约经内嵌的 `Request.Lease` 传导，**不设**顶层 Lease 字段（模块卡 §3.1.6
+// 注意 m10）：同一语义有两个来源会让夹具构造点分叉。
+// The lease travels through Request.Lease; a second top-level field is forbidden.
 type ReconcileTask struct {
 	Request ResumeRequest
 	Status  TaskStatus
 	Reason  string
-	Joined  bool
-	Now     int64
+	// Joined = 根子树无 prepared / running attempt：决定 Blocked → Queued 是否放行，
+	// 也决定关闭传播能否立即收尾子任务。
+	Joined bool
+	// Isolated = 根子树无仍有效的 run 租约（R4 新增的**另一个**判据）：
+	// 唯一用途是驱动 `prepared|running → interrupted` 的整棵子树收敛。
+	// 不能用 Joined 顶替——Joined 要求 prepared/running 先消失，而它们正是要被
+	// 收敛掉的那一批；false 时存储层不得动 attempt（仍有活执行，fail-closed）。
+	// Isolated gates attempt convergence across the whole subtree; false means the
+	// storage layer must not touch any attempt.
+	Isolated bool
+	Now      int64
 }
 
 // AcceptRevision 固定旧头、契约和不增预算的完整新头。

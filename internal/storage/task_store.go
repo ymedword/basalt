@@ -25,13 +25,18 @@ import (
 // Three rules: definitions never overwrite run state, ownership is guarded inside SQL,
 // and a terminal execution row only keeps run_id when the runs row actually exists.
 
-// TaskStore 是 core.TaskStore 的 SQLite 实现。
-// TaskStore is the SQLite implementation of core.TaskStore.
+// TaskStore 是任务定义与执行历史在 SQLite 上的**实现沿革**（单机时代的仓储）。
+// 它**不再**满足 core.TaskStore：US-24 把调度触发权移到 PostgreSQL 的到期扫描与
+// 领取事务（FR-24-10～15），SQLite 侧不实现协调后端（模块卡第 3278 行：本 US 的
+// 协调后端是 PostgreSQL，SQLite 路径冻结）。保留本类型是为了不删单机测试夹具，
+// 但**不得**把它重新接回生产装配——那会形成第二套触发路径。
+// TaskStore is the SQLite implementation retained from the single-node era. It no
+// longer satisfies core.TaskStore: US-24 moved trigger ownership to PostgreSQL due
+// scanning and claim transactions, and the SQLite path implements no coordination
+// backend (module card line 3278). Keeping the type preserves the single-node test
+// fixtures; it must never be wired back into production, which would create a second
+// trigger path.
 type TaskStore struct{ db *DB }
-
-// 编译期断言：TaskStore 满足消费方（core）声明的仓储接口。
-// Compile-time assertion that TaskStore satisfies the consumer-declared interface.
-var _ core.TaskStore = (*TaskStore)(nil)
 
 // NewTaskStore 绑定一个已打开的写模式库句柄。
 // NewTaskStore binds the store to an opened writable database handle.
@@ -257,83 +262,6 @@ func (s *TaskStore) RecordSkipped(ctx context.Context, rec core.ExecutionRecord)
 		return fmt.Errorf("记录跳过执行（task_id=%s）: %w", rec.TaskID, err)
 	}
 	return nil
-}
-
-// RecoverStartedExecutions 收尾崩溃遗留的 `started` 行：LEFT JOIN `runs` 取 Run 终态，
-// Run 完成 / 达上限 → completed，其余（failed / cancelled / 仍 running / 无 Run）→ failed。
-// 无 Run 行同时把 `run_id` 置 NULL（与 FinishExecution 同一条存在性判据，P-04）。
-//
-// `run_id` 与 `r.status` 都用 `sql.NullString` 接：前者可空、后者在 LEFT JOIN 无匹配时
-// 为 NULL。按 `started_at` 正序处理是判据的一部分——同一任务多行遗留时，最后写入的
-// `last_status` 必来自最新一行。
-// Recovery closes leftover started rows; ordering by started_at ascending is part of the
-// contract so the newest row wins last_status.
-func (s *TaskStore) RecoverStartedExecutions(ctx context.Context, now time.Time) (int, error) {
-	type startedRow struct {
-		id       int64
-		taskID   string
-		runID    sql.NullString
-		runState sql.NullString
-	}
-
-	var pending []startedRow
-	recovered := 0
-	err := withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx,
-			`SELECT e.id, e.task_id, e.run_id, r.status
-			   FROM task_executions e
-			   LEFT JOIN runs r ON r.run_id = e.run_id
-			  WHERE e.status = ?
-			  ORDER BY e.started_at ASC, e.id ASC`, string(core.ExecutionStarted))
-		if err != nil {
-			return fmt.Errorf("扫描遗留的 started 执行行: %w", err)
-		}
-		for rows.Next() {
-			var row startedRow
-			if err := rows.Scan(&row.id, &row.taskID, &row.runID, &row.runState); err != nil {
-				_ = rows.Close()
-				return fmt.Errorf("读取遗留的 started 执行行: %w", err)
-			}
-			pending = append(pending, row)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("遍历遗留的 started 执行行: %w", err)
-		}
-		// 必须先关闭游标再写：写与读共用钉住的那一条写连接。
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("关闭遗留执行行游标: %w", err)
-		}
-
-		for _, row := range pending {
-			status := core.ExecutionFailed
-			if row.runState.Valid &&
-				(row.runState.String == string(core.StatusCompleted) ||
-					row.runState.String == string(core.StatusLimitReached)) {
-				status = core.ExecutionCompleted
-			}
-			runID := row.runID
-			if !row.runState.Valid {
-				runID = sql.NullString{} // 无 Run 行 → 不留悬空引用
-			}
-			if _, err := conn.ExecContext(ctx,
-				`UPDATE task_executions SET status = ?, finished_at = ?, run_id = ?
-				  WHERE id = ?`, string(status), now.UnixMilli(), runID, row.id); err != nil {
-				return fmt.Errorf("收尾遗留执行行（id=%d）: %w", row.id, err)
-			}
-			if _, err := conn.ExecContext(ctx,
-				`UPDATE scheduled_tasks SET last_status = ? WHERE task_id = ?`,
-				string(status), row.taskID); err != nil {
-				return fmt.Errorf("同步任务最后状态（task_id=%s）: %w", row.taskID, err)
-			}
-			recovered++
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return recovered, nil
 }
 
 // ListExecutions 按 started_at 降序（同刻按 id 降序）返回某任务的执行历史，最多 limit 条。

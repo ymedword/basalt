@@ -17,7 +17,7 @@ type completedNodeObserver interface {
 
 // reuseCompleted checks original audit/messages and current source authority.
 // It starts no Run/session and acquires no second caller quota reservation.
-func (s *Service) reuseCompleted(ctx context.Context, p core.Principal, task Task, node Node, inputHash string) (Task, bool, error) {
+func (s *Service) reuseCompleted(ctx context.Context, p core.Principal, task Task, node Node, inputHash string, lease core.LeaseToken) (Task, bool, error) {
 	reader, ok := s.Repository.(completedAttemptRepository)
 	if !ok {
 		return task, false, nil
@@ -56,6 +56,7 @@ func (s *Service) reuseCompleted(ctx context.Context, p core.Principal, task Tas
 		return task, true, err
 	}
 	result.Reused = true
-	accepted, err := s.acceptAttempt(ctx, p, claimed, node, attempt, result, nil)
+	// ReclaimCompleted 与随后的 Commit 都是推进类写入，凭证原样下传。
+	accepted, err := s.acceptAttempt(ctx, p, claimed, node, attempt, result, nil, lease)
 	return accepted, true, err
 }

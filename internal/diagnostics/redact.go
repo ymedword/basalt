@@ -27,6 +27,13 @@ var commonAttrKeys = map[string]struct{}{
 	"authorizing_kind": {}, // 设计卡 :909——授权来源
 	"count":            {}, // 设计卡 :1219——被拒元素只允许计数
 	URLAttrKey:         {}, // 设计卡 :1219——地址只存 scheme://host
+	// US-24 C-23（模块卡 §2.7「诊断关联」行）：跨 Worker 归属两项。取值**不是**生产者
+	// 自由填写的正文，而是写入路径按 `execution_leases` 回填的进程身份与归属代次；
+	// 读面必须保留，否则跨 Worker 时间线读回来就丢了归属（读面会再脱敏一次）。
+	// US-24 C-23: the lease owner and epoch are backfilled by the write path from
+	// execution_leases, not supplied by producers; the read side must keep them.
+	"worker_instance_id": {},
+	"ownership_epoch":    {},
 }
 
 // kindAttrKeys 是各 kind 的增量白名单（V-8：生产端补齐后按 kind 收窄）。三条取舍：

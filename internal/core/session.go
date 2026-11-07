@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"unicode/utf8"
@@ -30,7 +31,11 @@ type Session struct {
 	sessionID string               // 空串 = 无状态（不落库）
 	store     MessageStore         // 写透仓储；无状态会话为 nil
 	audit     ToolInvocationReader // 补齐分类只读审计行（Session 只读不写审计）
-	messages  []Message            // 内存历史（升序；Load 一次、之后只追加）
+	// lease 是本次 Run 的执行权凭证（US-24 T008）：非零时消息追加走 fenced 入口，
+	// 零值时退回普通入口（未接执行权的装配）。由 `BindLease` 在准入后绑定一次。
+	// lease selects the fenced append when non-zero; BindLease sets it once at admission.
+	lease    LeaseToken
+	messages []Message // 内存历史（升序；Load 一次、之后只追加）
 }
 
 // NewSession 组装一个会话面。`store` 为空（或 `sessionID` 为空）即无状态会话；
@@ -39,6 +44,31 @@ type Session struct {
 // session; audit may be nil, in which case completion always takes the "no row" branch.
 func NewSession(sessionID string, store MessageStore, audit ToolInvocationReader) *Session {
 	return &Session{sessionID: sessionID, store: store, audit: audit}
+}
+
+// BindLease 绑定本次 Run 的执行权凭证（US-24 T008）。准入领取租约后调用一次；
+// 运行内**不换代次**——续约成功时代次不变，失权时运行必须结束而不是换凭证继续。
+// 零值 token 等价于"未接执行权"，追加退回普通入口。
+// BindLease binds the run's ownership credential once at admission. The epoch never
+// changes mid-run: a renewal keeps it, and losing it ends the run.
+func (s *Session) BindLease(token LeaseToken) {
+	s.lease = token
+}
+
+// appendThrough 是两条追加入口的分流点：零值凭证走普通写，非零凭证**必须**走 fenced 写，
+// 实现缺失即 fail-closed（`ErrLeaseFenceUnavailable`）。这里绝不"降级回普通写"——
+// 那正是旧持有者在接管后覆盖新结果的入口。
+// appendThrough picks the fenced entry point for a non-zero credential and fails closed
+// when the store lacks one. It never degrades to the plain write.
+func (s *Session) appendThrough(ctx context.Context, runID string, m Message) (string, error) {
+	if s.lease.IsZero() {
+		return s.store.AppendMessage(ctx, s.sessionID, runID, m)
+	}
+	fenced, ok := s.store.(FencedMessageStore)
+	if !ok {
+		return "", fmt.Errorf("%w（会话存储 %T）", ErrLeaseFenceUnavailable, s.store)
+	}
+	return fenced.FencedAppendMessage(ctx, s.lease, s.sessionID, runID, m)
 }
 
 // Load 载入整段会话历史（升序）；无状态会话为 no-op。
@@ -76,7 +106,7 @@ func (s *Session) AppendMessage(ctx context.Context, runID string, m Message) er
 	if s.persistent() {
 		writeCtx, cancel := finishContext(ctx)
 		defer cancel()
-		id, err := s.store.AppendMessage(writeCtx, s.sessionID, runID, m)
+		id, err := s.appendThrough(writeCtx, runID, m)
 		if err != nil {
 			return err
 		}

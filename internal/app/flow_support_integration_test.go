@@ -147,7 +147,7 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 			if mode == "support-temporarily-unavailable" {
 				rt.flows.service.Verification.Support = nil
 			}
-			finished, err := rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			finished, err := advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
 			if mode == "outside-frozen-scope" {
 				require.Error(t, err)
 				require.Empty(t, model.requests(), "out-of-scope contract source must stop before model dispatch")
@@ -164,7 +164,7 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 				require.Equal(t, "proposed", graph.Artifacts[0].State)
 				resumed, err := rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version, OperationID: "resume-artifact-human", Reason: "recheck original result without approving human gate"})
 				require.NoError(t, err)
-				finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: resumed.Version})
+				finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: resumed.Version})
 				require.NoError(t, err)
 				require.Equal(t, flow.Blocked, finished.Status)
 				require.Len(t, model.requests(), 1, "missing human verification cannot cause a second model call or a false pass")
@@ -181,7 +181,7 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 				if strings.HasSuffix(mode, "optional-proposal") {
 					require.False(t, finished.Revision.Outputs["draft"].Verified)
 				}
-				finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
+				finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
 				if mode == "used-optional-proposal" {
 					require.Error(t, err)
 					require.Len(t, model.requests(), 1)
@@ -191,7 +191,7 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 				require.NoError(t, err)
 				if mode == "accepted-through-unclaimed-middle" {
 					require.Equal(t, flow.Running, finished.Status)
-					finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
+					finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
 					require.NoError(t, err)
 				}
 				require.Equal(t, flow.Succeeded, finished.Status)
@@ -209,14 +209,14 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 			}
 			if mode == "unaffected-upstream-revision" {
 				require.Equal(t, flow.Running, finished.Status)
-				finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
+				finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version})
 				require.NoError(t, err)
 				require.Equal(t, flow.Blocked, finished.Status)
 				revised, err := rt.flows.service.Revise(t.Context(), flow.RevisionRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version, OperationID: "revise-final-only", Proposal: json.RawMessage(`{"reason":"correct final artifact","node_id":"final"}`)})
 				require.NoError(t, err)
 				require.EqualValues(t, 1, revised.Version.Revision)
 				require.Equal(t, finished.Revision.Outputs["draft"], revised.Revision.Outputs["draft"])
-				finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: revised.Version})
+				finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: revised.Version})
 				require.NoError(t, err)
 				require.Equal(t, flow.Succeeded, finished.Status, "reason=%s node=%s attempts=%v calls=%d", finished.Reason, finished.Revision.NodeID, finished.Revision.Attempts, len(model.requests()))
 				graph, err = rt.flows.store.ReadGraph(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)
@@ -234,7 +234,7 @@ func TestFlow_ProductionSourceVerificationAndClaimProjection(t *testing.T) {
 				rt.flows.service.Verification.Support = support
 				resumed, err := rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: finished.Version, OperationID: "resume-source-proof", Reason: "validator available; recheck original output"})
 				require.NoError(t, err)
-				finished, err = rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: resumed.Version})
+				finished, err = advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: resumed.Version})
 				require.NoError(t, err)
 				require.Equal(t, flow.Succeeded, finished.Status)
 				graph, err = rt.flows.store.ReadGraph(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)

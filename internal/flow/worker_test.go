@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/ymedword/basalt/internal/core"
 )
 
 type stoppingQueryRepository struct {
@@ -27,6 +28,47 @@ func (r *stoppingQueryRepository) OpenRoots(ctx context.Context, _ int) ([]Task,
 func (r *stoppingQueryRepository) ReadyRoots(ctx context.Context, _ int64, _ int) ([]Task, error) {
 	r.called = true
 	return nil, r.stop(ctx)
+}
+
+// parkingRepository 记录 ParkTask 调用；未覆盖的 Repository 方法经内嵌接口转发，
+// 测试里真走到它们会直接 panic——正好暴露意外路径。
+// parkingRepository records ParkTask calls; any other repository use panics.
+type parkingRepository struct {
+	Repository
+	task   Task
+	parked []string
+}
+
+func (r *parkingRepository) Read(context.Context, core.Principal, string) (Task, error) {
+	return r.task, nil
+}
+
+func (r *parkingRepository) ParkTask(_ context.Context, _ core.Principal, _ string, _ TaskVersion, reason string) error {
+	r.parked = append(r.parked, reason)
+	return nil
+}
+
+// TestFlow_WorkerReworkContentionKeepsRoutingReason —— 两个 Worker 同时拿到同一个
+// blocked + bounded_rework_required 根时，落败方的 rework → Revise 自取根租约撞忙
+// （ErrFlowRootBusy）。这不是推进失败：不得停靠、不得把 reason 改写成
+// advance_unavailable——A3 靠 reason 分路，持有者的 AcceptRevision 还会因
+// state_version CAS 失败丢掉这次返工（评审 IDX-14）。
+// Losing the root-lease race is contention, not an advance failure: the row keeps its
+// routing reason and the pending bounded rework.
+func TestFlow_WorkerReworkContentionKeepsRoutingReason(t *testing.T) {
+	task := Task{ID: "root-1", RootTaskID: "root-1", Status: Blocked, Reason: "bounded_rework_required", CloseIntent: CloseNone}
+	repository := &parkingRepository{task: task}
+	worker := &Worker{Service: &Service{Repository: repository}}
+	item := workItem{task: task, principal: core.LocalAdminCLIPrincipal()}
+	ctx := context.Background()
+
+	for _, ignored := range []error{core.ErrPreconditionFailed, ErrTaskClosed, ErrCapacity, ErrFlowRootBusy} {
+		worker.handleJobError(ctx, item, ignored)
+	}
+	require.Empty(t, repository.parked, "竞争 / 会话语义错误不得停靠改写 reason")
+
+	worker.handleJobError(ctx, item, errors.New("database unavailable"))
+	require.Equal(t, []string{"advance_unavailable"}, repository.parked, "真实失败仍须停靠保留检查点")
 }
 
 func TestFlow_WorkerCancellationDuringQueryPreservesOtherErrors(t *testing.T) {

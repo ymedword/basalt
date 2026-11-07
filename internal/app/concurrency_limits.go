@@ -21,9 +21,21 @@ package app
 // 缓存：限额是低频写、高频读的配置。查询结果按 `concurrencyLimitTTL` 缓存，管理面
 // 改完最迟一个 TTL 后生效（`SetLimit` 只写库，跨进程无失效广播——这一点在验收报告
 // 的"未覆盖面"里登记）。读失败**不**缓存，下一次 Acquire 会立刻重试。
+//
+// US-24 P-06 起本文件供数的名额表**降为预检**：它给出的判定只是"早失败"的快路径，
+// 不跨进程；权威判定在 `StartRun` 的同一事务内（调用方 advisory 锁后
+// `checkCallerConcurrency` 按 `runs` 表 running 行复查，FR-24-08）。因此本文件不承诺
+// 集群级并发上限，也不得据此声称跨 Worker 名额已被强制——两个 Worker 各自的预检
+// 可以同时通过，最后由数据库那次复查裁决（拒绝方拿到
+// `core.ErrCallerConcurrencyLimited`，经 callers 别名映射 429）。
+// Since US-24 P-06 this lookup only feeds the precheck: it is a per-process fast
+// path. The authoritative verdict is the in-transaction recheck in StartRun, which
+// counts running rows in the shared database.
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -131,4 +143,166 @@ func (c *concurrencyLimitCache) limit(callerID string) (int, bool) {
 	c.cache[callerID] = result
 	c.mu.Unlock()
 	return result.limit, result.ok
+}
+
+// —— `worker.max_inflight` 池化名额（US-24 FR-24-40 / 模块卡 §2.3.11 [1]）——
+//
+// 三条执行路径共用**同一个**信号量：① HTTP / CLI 的交互 Run、② 调度器领到的执行组、
+// ③ Flow 节点 Run。三者最终都经过 `runAdmission.run`，池化名额因此只有这一个取槽点。
+// One pooled semaphore is shared by the three execution paths; they all funnel through
+// runAdmission.run, so this is the only place a slot is taken.
+
+// errShutdownDraining 表示本进程已进入停机排空（图 11 [2] 之后）：仍在排队等槽的
+// 后台执行不再等待。它不是对外的错误码——排空期间本来就不该再有合法的新领取，
+// 这条错误只让等待者立刻退出，而不是把停机的 45 秒耗在队列里。
+// errShutdownDraining releases background executions still queued for a slot once the
+// process starts draining; no legitimate new claim can start after that point.
+var errShutdownDraining = errors.New("shutdown draining: max_inflight pool closed")
+
+// inflightLimiter 是池化在途名额。`nil` 表示未接线（轻装配与既有单测）：不加判据、
+// 行为与接线前逐字一致。
+// inflightLimiter is the pooled in-flight budget; nil means "not wired".
+type inflightLimiter struct {
+	slots chan struct{}
+	limit int
+	// drained 在停机进入排空时关闭：等待中的后台 goroutine 据此立刻返回，而不是
+	// 等到执行 ctx 被取消（那要等到宽限耗尽）。
+	// drained is closed when the drain phase starts, so queued background work bails out
+	// immediately instead of waiting for the grace to expire.
+	drained   chan struct{}
+	drainOnce sync.Once
+}
+
+// newInflightLimiter 构造名额池；`limit <= 0` 返回 nil（= 不限、不接线），与
+// `worker.max_inflight` 的配置校验（1..512）保持同一口径。
+// newInflightLimiter returns nil for a non-positive limit, matching the config contract.
+func newInflightLimiter(limit int) *inflightLimiter {
+	if limit <= 0 {
+		return nil
+	}
+	return &inflightLimiter{
+		slots:   make(chan struct{}, limit),
+		limit:   limit,
+		drained: make(chan struct{}),
+	}
+}
+
+// acquireInteractive 给交互 Run 取槽：**非阻塞**，满额立即
+// `core.InstanceFullError`（HTTP 429 `TOO_MANY_RUNS`，沿用"拒绝、不排队"的既有契约）。
+// 取不到槽的 Run 一个字节都没占用：不写 Run 行、不建租约、不记配额。
+// acquireInteractive never queues: a full pool rejects immediately with the same
+// capacity error the instance cap uses.
+func (l *inflightLimiter) acquireInteractive() (func(), error) {
+	if l == nil {
+		return nil, nil
+	}
+	select {
+	case l.slots <- struct{}{}:
+		return l.release, nil
+	default:
+		return nil, &core.InstanceFullError{Limit: l.limit}
+	}
+}
+
+// acquireBackground 给后台执行（调度执行组 / Flow 节点 Run）取槽：阻塞等待，
+// 可被执行 ctx 取消，也可被停机排空打断。阻塞期间不推进任何状态——调用方拿到
+// 名额之前不会开始执行，`next_eligible_at` 之类的推进都在执行内部。
+// acquireBackground blocks until a slot frees up, the execution context ends, or the
+// drain starts; no state is advanced while queued.
+func (l *inflightLimiter) acquireBackground(ctx context.Context) (func(), error) {
+	if l == nil {
+		return nil, nil
+	}
+	// 已取消的执行不再取槽：名额取到也只会被立刻归还，先拒绝更诚实。
+	// A cancelled execution never takes a slot it will not use.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	// 快路径：有空槽就不进第二段 select，避免与已关闭的 drained 随机二选一。
+	// Fast path first, so an idle pool never loses the race against a closed drain.
+	select {
+	case l.slots <- struct{}{}:
+		return l.release, nil
+	default:
+	}
+	select {
+	case l.slots <- struct{}{}:
+		return l.release, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-l.drained:
+		return nil, errShutdownDraining
+	}
+}
+
+// release 归还名额。与取槽一一对应，由调用方的 defer 保证恰好执行一次。
+// release returns the slot; the caller's defer guarantees exactly one call.
+func (l *inflightLimiter) release() { <-l.slots }
+
+// drain 关闭排队入口（幂等）：停机 [2] 之后仍在等槽的后台 goroutine 立刻返回。
+// 已持槽的执行不受影响——它们照常走完收尾。
+// drain closes the queue entry once; holders keep their slots until their closeout ends.
+func (l *inflightLimiter) drain() {
+	if l == nil {
+		return
+	}
+	l.drainOnce.Do(func() { close(l.drained) })
+}
+
+// callerAdmissionResolver 是 `core.CallerAdmissionResolver` 的装配层实现（US-24
+// T013 / 模块卡 §3.1.2）：把调用方身份投影成一次准入的判定输入。它读的是
+// `concurrencyLimitCache` 的**同一份**投影——预检名额表与事务内权威复查因此不会
+// 各拿一份限额视图（C-35 的单实例口径）。
+//
+// `Enabled=false` 只给内置不限量管理员：与 `callers.Limiter` 的
+// `LocalAdminUnlimited` 同一个开关，表示"不占调用方名额桶"，**不**表示跳过实例
+// 上限、会话串行或审计。其余调用方一律 `Enabled=true`。
+//
+// 读失败 **fail-closed**：返回包装后的 `core.ErrCallerConcurrencyLimited`（与名额
+// 表"看不见上限即拒绝"同一个哨兵，入口映射 429）。不得退化成 `Enabled=false`——
+// 那会把"仓库读不出来"变成"不限并发"。
+// The resolver projects a principal onto the admission input using the very same limit
+// cache the precheck slot table reads. An unreadable limit fails closed with the shared
+// sentinel; only the built-in unlimited admin is exempt from the caller slot bucket.
+type callerAdmissionResolver struct {
+	limits *concurrencyLimitCache
+	// localAdminUnlimited 与 `callers.Limiter` 的同名开关同源（`callers.local_admin.unlimited`，
+	// 未写 = true）。为真时内置管理员 `Enabled=false`。
+	localAdminUnlimited bool
+	// reserved 是交互预留（`flows.interactive_reserved_per_caller`）：Flow 叶 Run 的上限
+	// = MaxConcurrent - reserved。nil 时按 1（与 `runAdmission` 的缺省同值）。
+	reserved *int
+}
+
+var _ core.CallerAdmissionResolver = (*callerAdmissionResolver)(nil)
+
+// For 解析一次准入的判定输入。身份不合法 → `core.ErrUnauthorized`（fail-closed，
+// 不回落成"不限量"）。
+// For resolves the admission input; an invalid principal is refused, never widened.
+func (r *callerAdmissionResolver) For(p core.Principal) (core.CallerAdmission, error) {
+	if !p.Valid() {
+		return core.CallerAdmission{}, core.ErrUnauthorized
+	}
+	if r == nil || r.limits == nil {
+		// 未接线（轻装配与既有单测）：不占桶、不加判据，行为与接线前逐字一致。
+		// Not wired: behaves exactly as before the resolver existed.
+		return core.CallerAdmission{}, nil
+	}
+	if r.localAdminUnlimited && p.Kind == core.PrincipalLocalAdmin {
+		return core.CallerAdmission{Enabled: false}, nil
+	}
+	limit, ok := r.limits.limit(p.CallerID)
+	if !ok {
+		// 看不见上限 → 拒绝（C-02）。负值原样上交：那是配置缺陷，由事务复查按
+		// `MaxConcurrent <= 0` 拒绝，不在这里悄悄改成缺省值。
+		// An unreadable limit denies; a negative value is passed through as a config defect.
+		return core.CallerAdmission{}, fmt.Errorf("读取调用方并发上限 %q: %w", p.CallerID, core.ErrCallerConcurrencyLimited)
+	}
+	reserved := 1
+	if r.reserved != nil {
+		reserved = *r.reserved
+	}
+	return core.CallerAdmission{Enabled: true, MaxConcurrent: limit, ReservedForInteractive: reserved}, nil
 }

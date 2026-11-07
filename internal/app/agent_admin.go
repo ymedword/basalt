@@ -71,6 +71,10 @@ const (
 	// agentBusyWait 是归档等待在途 Run 退出缺省上限（约束 32 ③：默认 30 秒）。
 	// agentBusyWait is the default bounded wait for in-flight runs (constraint 32).
 	agentBusyWait = 30 * time.Second
+
+	// archiveResidualPoll 是等待窗口内复核四条完成判据的间隔（图 8 [4]）。
+	// archiveResidualPoll is how often the four completion predicates are re-read.
+	archiveResidualPoll = 100 * time.Millisecond
 )
 
 // 复制 / 归档 / 恢复三个动作在入参错误里同样复用契约动作字面量作工具名。
@@ -81,23 +85,22 @@ const (
 	agentRestoreTool = core.ActionAgentRestore
 )
 
-// RunCanceller 是归档路径等待在途 Run 的消费面（§3.1.7）：一次快照、发出取消、在有界
-// 窗口内等待退出。实现由装配层提供（内部存储的 running 行 + `AgentService.Cancel`）；
-// 归档编排只依赖这三个动作，不依赖任何具体运行实现。
-// RunCanceller is the consumer-side surface the archive path needs: snapshot, signal,
-// then a bounded wait. The assembly layer supplies the implementation.
+// RunCanceller 是归档路径等待在途 Run 的消费面（§3.1.7 / 图 8 的 [3][4]）：一次持久
+// 残量快照、发出取消、再按**同一组判据**轮询到全部达成为止。实现由装配层提供（运行账本
+// 的 running 行 + `AgentService.Cancel`）；归档编排只依赖这两个动作，不依赖任何具体
+// 运行实现。
+//
+// 判据是**持久结果**（图 8 [4] 的 ①②③④），不是租约：租约只说明没人能再提交，不证明
+// 执行已退出——拿 TTL 当退出判据会把"已失联但收尾未完成"的 Agent 直接归档掉。
+// RunCanceller is the consumer-side surface the archive path needs: one persisted
+// residual snapshot plus the cancel signal. Lease expiry is never an exit proof.
 type RunCanceller interface {
-	// RunningRunIDs 返回该 Agent 当前仍在运行的 Run 标识（一次快照，不等待）。
-	// RunningRunIDs snapshots the runs still running for one agent.
-	RunningRunIDs(ctx context.Context, agent string) ([]string, error)
+	// Residuals 返回一次归档完成判据快照：仍在运行的 Run 与尚未达成的判据。
+	// Residuals snapshots the archive-completion predicates for one agent.
+	Residuals(ctx context.Context, agent string) (core.ArchiveResiduals, error)
 	// CancelRun 发出取消信号；返回不代表 Run 已退出。
 	// CancelRun signals cancellation; a nil error does not mean the run has exited.
 	CancelRun(ctx context.Context, runID string) error
-	// WaitRuns 在 ctx 窗口内等待给定 Run 退出，返回窗口结束时仍未退出的标识；
-	// 窗口到期不是错误——剩余集合就是等待结果。
-	// WaitRuns waits within ctx and returns the ids still alive when the window closes;
-	// an expired window is a result, not an error.
-	WaitRuns(ctx context.Context, runIDs []string) ([]string, error)
 }
 
 // AgentRegistry 是归档路径需要的注册表最小面（US-11 的 `*agentRegistry` 直接满足）：
@@ -190,12 +193,18 @@ type AgentAdminDeps struct {
 	// Archives 是归档行的存储端口：归档 / 恢复两个动作都必须装配它。
 	// Archives stores archive rows; archive and restore both require it.
 	Archives AgentArchiveStore
-	// Registry / Scheduler / RunCanceller 是归档路径的注销、调度与在途 Run 面；
-	// 三者**同时提供或同时省略**（CLI 持有实例锁时省略并记 Debug，约束 32）。
-	// Registry, Scheduler and RunCanceller are all-or-nothing: HTTP supplies all three,
-	// the CLI path supplies none and logs at Debug.
-	Registry     AgentRegistry
-	Scheduler    ScheduleRegistry
+	// Registry / Scheduler 是归档路径的**进程内注册面**：两者必须同时提供或同时省略
+	// （CLI 持有实例锁时省略并记 Debug，约束 32）。只给一半是装配错误——注销得掉却
+	// 恢复不了，回滚矩阵会静默缺口。
+	// Registry/Scheduler are the in-process registration surface: all-or-nothing.
+	Registry  AgentRegistry
+	Scheduler ScheduleRegistry
+	// RunCanceller 是归档的**跨 Worker 在途 Run 面**，**每一条归档路径都必须提供**
+	// （HTTP 与 CLI 都算）：残量快照、跨 Worker 取消与有界等待是归档完成判据本身
+	// （FR-24-23 / FR-24-41），CLI 与 serve 共用同一个库，只查本进程忙碌就搬目录会把
+	// 另一台机器正在跑的 Agent 搬走。缺它 = 装配错误，不是"跳过等待"的许可。
+	// RunCanceller is mandatory on every archive path: the residual snapshot, the
+	// cross-worker cancel and the bounded wait are the archive's completion predicate.
 	RunCanceller RunCanceller
 	// BusyWait 是归档等待在途 Run 的上限；≤0 时取缺省的 30 秒（约束 32 ③）。
 	// BusyWait overrides the 30-second default bounded wait; tests inject a tiny value.
@@ -213,6 +222,13 @@ type AgentAdminDeps struct {
 	// Projection rebuilds the binding projection after each lifecycle write; a rebuild
 	// failure is logged, never turned into a failed write.
 	Projection *BindingProjection
+	// PublishBundle 是"定义已落盘后把最新内容发布为共享资产"的写面（FR-24-25 / §2.3.9）：
+	// 控制台与 CLI 的创建 / 提交 / 复制 / 恢复成功之后调用，准入因此总能读到与本机
+	// 定义一致的 bundle。可选：nil 表示装配不提供资产发布面（只读面或纯写面测试），
+	// 写路径行为一字不变；发布失败只记 ERROR，**不**把已生效的写改写成失败。
+	// PublishBundle publishes the just-written definition as a shared bundle. It is
+	// optional; a failure is logged and never turns a committed write into a failure.
+	PublishBundle func(ctx context.Context, agent string) (int64, error)
 }
 
 // AgentAdmin 是 Agent 写面的编排实现；字段全部私有，构造后不再变化。
@@ -241,6 +257,7 @@ type AgentAdmin struct {
 	resources       *postgres.ResourceStore
 	notify          *postgres.NotifyAdminStore
 	projection      *BindingProjection
+	publishBundle   func(ctx context.Context, agent string) (int64, error)
 }
 
 // NewAgentAdmin 组装 Agent 写面；Gate 为 nil 时退化为私有锁表（只防本实例自身并发，
@@ -292,6 +309,7 @@ func NewAgentAdmin(deps AgentAdminDeps) *AgentAdmin {
 		resources:       deps.Resources,
 		notify:          deps.NotifyAdmin,
 		projection:      deps.Projection,
+		publishBundle:   deps.PublishBundle,
 	}
 }
 
@@ -412,6 +430,9 @@ func (s *AgentAdmin) Create(ctx context.Context, actor core.Actor, spec core.Age
 
 	// 创建成功即按落盘的定义建立投影：删除闸门与准入从这一刻起就能按投影反查引用。
 	s.rebuildActiveProjection(ctx, spec.Name, rec.AgentUID)
+	// 同一时刻发布资产：控制台 / CLI 创建的 Agent 在启用后必须能被准入读到本机定义
+	// 对应的 bundle，否则第一次运行会按 ASSET_UNAVAILABLE 失败关闭（FR-24-25）。
+	s.publishAgentBundle(ctx, spec.Name)
 
 	if view, ok := s.readFilesView(ctx, spec.Name); ok {
 		return view, nil
@@ -541,6 +562,10 @@ func (s *AgentAdmin) SubmitFiles(ctx context.Context, actor core.Actor, name, if
 	} else {
 		s.rebuildActiveProjection(ctx, name, rec.AgentUID)
 	}
+
+	// 定义已整份落盘：把新内容发布为共享 bundle——下一个 Run 的准入固定到本次哈希，
+	// 运行中的 Run 仍固定在它开始时的那份目录上（FR-24-42）。
+	s.publishAgentBundle(ctx, name)
 
 	return AgentFilesView{
 		Agent:     name,
@@ -925,10 +950,19 @@ func describeCopyRewrites(rewrites []workspace.AgentCopyRewrite) []string {
 }
 
 // agentArchiveOperationDetail 是归档操作 `detail_json` 的固定投影：归档前的生命周期状态
-// （回滚矩阵的判据与审计对账都从它出发）。
-// agentArchiveOperationDetail records the lifecycle state the archive started from.
+// （回滚矩阵的判据与审计对账都从它出发），以及准入屏障的三项标记（图 8 的崩溃恢复判据）。
+// agentArchiveOperationDetail records the lifecycle state the archive started from plus
+// the three barrier markers that make a crash between "disabled" and "archived" decidable.
 type agentArchiveOperationDetail struct {
 	BeforeState string `json:"before_state"`
+	// ArchiveBarrier 声明本次归档在共享索引上立了准入屏障。启动对账**只**按它判断
+	// "这个 disabled 是屏障留下的还是用户主动禁用的"：没带这个标记的 disabled 一律不动。
+	ArchiveBarrier bool `json:"archive_barrier,omitempty"`
+	// PriorState 是屏障前置时的生命周期状态（active / disabled）。超时回滚按它恢复；
+	// 崩溃时**不**自动回滚，只用来判断原状态。必须取**锁内**读数，不能沿用预锁快照。
+	PriorState string `json:"prior_state,omitempty"`
+	// Agent 是屏障作用的 Agent 名（启动对账按名字匹配索引行）。
+	Agent string `json:"agent,omitempty"`
 }
 
 // agentRestoreOperationDetail 是恢复操作 `detail_json` 的固定投影：归档标识、目标名与
@@ -1058,6 +1092,8 @@ func (s *AgentAdmin) Copy(ctx context.Context, actor core.Actor, source, target 
 	// 复制成功即按副本的定义重建投影：副本的新身份与改写后的绑定清单都已落盘，
 	// 不能沿用源 Agent 的投影行（那属于源身份）。
 	s.rebuildActiveProjection(ctx, target, rec.AgentUID)
+	// 副本是新身份：共享记录里还没有它的 bundle，必须此刻发布（FR-24-25）。
+	s.publishAgentBundle(ctx, target)
 
 	if view, ok := s.readFilesView(ctx, target); ok {
 		return view, nil
@@ -1079,23 +1115,46 @@ func (s *AgentAdmin) Copy(ctx context.Context, actor core.Actor, source, target 
 // 校验，索引写失败只记 ERROR（索引可重建，不进权威链）。
 // Archive runs the nine-step figure-F sequence. Every compensation failure converges to
 // an unknown operation; the state file is kept at archived for the original-name restore.
-func (s *AgentAdmin) Archive(ctx context.Context, actor core.Actor, name string) (core.AgentArchiveRecord, error) {
+func (s *AgentAdmin) Archive(ctx context.Context, actor core.Actor, name string) (out core.AgentArchiveRecord, retErr error) {
 	if err := workspace.ValidateAgentName(name); err != nil {
 		return core.AgentArchiveRecord{}, &core.InvalidInputError{Tool: agentArchiveTool, Reason: err.Error()}
 	}
 	if s.archives == nil {
 		return core.AgentArchiveRecord{}, errors.New("归档管理面缺少归档存储（装配错误）")
 	}
+	// 屏障写不进索引就无法阻止其他 Worker 在等待窗口内继续准入——缺索引不是"跳过屏障"
+	// 的许可，而是装配错误（HTTP / CLI 两条路径都必须提供）。
+	// Without the index port there is no cross-worker veto, so a missing index is an
+	// assembly error rather than a licence to archiving without a barrier.
+	if s.index == nil {
+		return core.AgentArchiveRecord{}, errors.New("归档管理面缺少生命周期索引（装配错误）")
+	}
 	live, depsErr := s.archiveLiveDeps()
 	if depsErr != nil {
 		return core.AgentArchiveRecord{}, depsErr
 	}
 
-	initial, err := s.checkArchiveSource(ctx, name)
+	// 预锁快照只为"明显不可归档"的请求省掉取锁与操作行；**锁内**复核才是判据。
+	// detail_json 里的 prior_state 必须是锁内读数，否则崩溃对账会按陈旧状态判断。
+	if _, err := s.checkArchiveSource(ctx, name); err != nil {
+		return core.AgentArchiveRecord{}, err
+	}
+
+	unlock := s.gate.Lock(name)
+	defer unlock()
+
+	current, err := s.checkArchiveSource(ctx, name)
 	if err != nil {
 		return core.AgentArchiveRecord{}, err
 	}
-	detail, err := json.Marshal(agentArchiveOperationDetail{BeforeState: string(initial.State)})
+	beforeState := current.State
+
+	detail, err := json.Marshal(agentArchiveOperationDetail{
+		BeforeState:    string(beforeState),
+		ArchiveBarrier: true,
+		PriorState:     string(beforeState),
+		Agent:          name,
+	})
 	if err != nil {
 		return core.AgentArchiveRecord{}, fmt.Errorf("组装归档操作详情: %w", err)
 	}
@@ -1105,17 +1164,50 @@ func (s *AgentAdmin) Archive(ctx context.Context, actor core.Actor, name string)
 		return core.AgentArchiveRecord{}, beginErr
 	}
 
-	unlock := s.gate.Lock(name)
-	defer unlock()
-
-	current, err := s.checkArchiveSource(ctx, name)
-	if err != nil {
-		s.finish(ctx, operationID, core.OperationFailed, agentResultCode(err),
-			"归档前置条件在锁内复核失败", detail)
-		return core.AgentArchiveRecord{}, postPendingError(err, operationID)
+	// [1] 准入屏障**先于**任何取消 / 等待落下（图 8 的 R1 修正）：先等再改状态的窗口里
+	// 新请求仍会被准入，等待集永远追不平。屏障是共享索引上的准入否决——`state` 条件
+	// 更新为 disabled，`generation` / `state_file_hash` 与状态文件都不动（状态文件仍是
+	// 权威，既有回滚矩阵也据它判"等待期间状态不得提前迁移"）。
+	// 屏障的 UPDATE 与 `StartRun` 事务内的 `FOR UPDATE` 复查是同一条行锁，两种获锁
+	// 顺序都成立：复查先行 → 本 UPDATE 等它提交后重读；屏障先行 → 复查读到 disabled。
+	// 屏障期的代次是补偿的 CAS 期望值：屏障自身不改 generation，因此它等于归档开始时
+	// 状态文件的代次；恢复时若索引代次已被别的操作推进，补偿必须放弃而不是覆盖。
+	// The barrier-time generation is the compensation's CAS expectation.
+	barrierGeneration := current.Generation
+	barrierApplied, barrierErr := s.index.SetLifecycleBarrier(ctx, name, operationID, s.now())
+	if barrierErr != nil {
+		s.logger.Error("归档准入屏障写入失败，拒绝归档",
+			"agent", name, "operation_id", operationID, "error", barrierErr)
+		s.finish(ctx, operationID, core.OperationFailed, lifecycleResultInternal,
+			"归档准入屏障写入失败", detail)
+		return core.AgentArchiveRecord{}, postPendingError(barrierErr, operationID)
 	}
-	beforeState := current.State
+	if !barrierApplied {
+		// 行不存在或已非 active：这两种情况本就不再准入（复查同样拒绝），屏障无需生效。
+		// 但索引与状态文件可能只是短暂不一致，所以照常继续，由后续步骤给出真实结论。
+		s.logger.Warn("归档准入屏障未生效：索引行不存在或已非 active",
+			"agent", name, "operation_id", operationID,
+			"state_file_state", string(beforeState))
+	}
+	if barrierApplied {
+		// 屏障的唯一放宽点是"状态文件真正迁移为 archived 之后"：那之前的任何失败分支都
+		// 必须把索引写回状态文件的现值（只在索引仍是本次 disabled 时生效，因此不会覆盖
+		// 别的进程已完成的推进）。恢复失败只记 ERROR 并随错误返回；操作行仍是 pending，
+		// 重启对账按 archive_barrier 标记为 archive_resume_required，不自动恢复 active。
+		defer func() {
+			if restoreErr := s.restoreArchiveBarrier(ctx, name, operationID, barrierGeneration); restoreErr != nil {
+				s.logger.Error("归档失败且准入屏障未恢复，操作保持可查（重启按 archive_resume_required 处置）",
+					"agent", name, "operation_id", operationID, "error", restoreErr)
+				retErr = errors.Join(retErr, restoreErr)
+			}
+		}()
+	}
 
+	// [2] 注销进程内注册面只在 serve 路径有意义（持有注册表与调度）；CLI 持有实例锁、
+	// 不跑调度，没有对象可注销。[3][4] 的在途 Run 判定**不随 live 跳过**——它读的是共享库，
+	// 远端 Worker 的在跑 Run 同样必须被等掉（FR-24-23）。
+	// Step [2] only exists where the process holds the registry; the residual wait reads
+	// the shared database and therefore runs on every path.
 	registration := archiveRegistration{}
 	if live {
 		registration = s.captureArchiveRegistration(name)
@@ -1132,38 +1224,45 @@ func (s *AgentAdmin) Archive(ctx context.Context, actor core.Actor, name string)
 			return core.AgentArchiveRecord{}, postPendingError(unregErr, operationID)
 		}
 		s.registry.Remove(name)
-
-		remaining, runErr := s.awaitArchiveRuns(ctx, name)
-		if runErr != nil {
-			if regErr := s.restoreArchiveRegistration(ctx, name, registration); regErr != nil {
-				s.logger.Error("列出 / 等待在途 Run 失败且注册恢复失败，操作标记 unknown",
-					"agent", name, "operation_id", operationID, "error", errors.Join(runErr, regErr))
-				s.finish(ctx, operationID, core.OperationUnknown, lifecycleResultInternal,
-					"归档等待在途 Run 失败且回滚失败，需查证", detail)
-				return core.AgentArchiveRecord{}, postPendingError(errors.Join(runErr, regErr), operationID)
-			}
-			s.finish(ctx, operationID, core.OperationFailed, lifecycleResultInternal,
-				"归档等待在途 Run 失败", detail)
-			return core.AgentArchiveRecord{}, postPendingError(runErr, operationID)
-		}
-		if len(remaining) > 0 {
-			// 超时不是"稍后再说"：已发出的取消信号保留（不回滚取消），只回滚 ①②。
-			busy := &core.AgentBusyError{RunIDs: remaining, OperationID: operationID}
-			if regErr := s.restoreArchiveRegistration(ctx, name, registration); regErr != nil {
-				s.logger.Error("归档等待超时且注册恢复失败，操作标记 unknown",
-					"agent", name, "operation_id", operationID,
-					"run_ids", remaining, "error", regErr)
-				s.finish(ctx, operationID, core.OperationUnknown, agentResultAgentBusy,
-					"归档等待超时且回滚失败，需查证", detail)
-				return core.AgentArchiveRecord{}, postPendingError(errors.Join(busy, regErr), operationID)
-			}
-			s.finish(ctx, operationID, core.OperationFailed, agentResultAgentBusy,
-				"归档等待在途 Run 超时", detail)
-			return core.AgentArchiveRecord{}, postPendingError(busy, operationID)
-		}
 	} else {
-		s.logger.Debug("CLI 持有实例锁：归档跳过注册表注销 / 调度取消 / Run 等待",
+		s.logger.Debug("CLI 持有实例锁：归档跳过进程内注册表注销 / 调度取消；共享库的在途 Run 判定照常执行",
 			"agent", name, "operation_id", operationID)
+	}
+
+	// [3][4] 残量快照 → 跨 Worker 取消 → 有界等待：**每一条归档路径**都走这一段。
+	// The residual snapshot, cross-worker cancel and bounded wait run on every path.
+	remaining, runErr := s.awaitArchiveRuns(ctx, name)
+	if runErr != nil {
+		if regErr := s.restoreArchiveRegistrationIfLive(ctx, name, live, registration); regErr != nil {
+			s.logger.Error("列出 / 等待在途 Run 失败且注册恢复失败，操作标记 unknown",
+				"agent", name, "operation_id", operationID, "error", errors.Join(runErr, regErr))
+			s.finish(ctx, operationID, core.OperationUnknown, lifecycleResultInternal,
+				"归档等待在途 Run 失败且回滚失败，需查证", detail)
+			return core.AgentArchiveRecord{}, postPendingError(errors.Join(runErr, regErr), operationID)
+		}
+		s.finish(ctx, operationID, core.OperationFailed, lifecycleResultInternal,
+			"归档等待在途 Run 失败", detail)
+		return core.AgentArchiveRecord{}, postPendingError(runErr, operationID)
+	}
+	if len(remaining.Unmet) > 0 {
+		// 超时不是"稍后再说"：已发出的取消信号保留（不回滚取消），只回滚 ①②。
+		// 409 带上未退出的 Run 与**未达成的判据号**，让管理员看到真实缺口。
+		busy := &core.AgentBusyError{
+			RunIDs:      remaining.RunIDs,
+			OperationID: operationID,
+			Unmet:       remaining.Unmet,
+		}
+		if regErr := s.restoreArchiveRegistrationIfLive(ctx, name, live, registration); regErr != nil {
+			s.logger.Error("归档等待超时且注册恢复失败，操作标记 unknown",
+				"agent", name, "operation_id", operationID,
+				"run_ids", remaining.RunIDs, "unmet_predicates", remaining.Unmet, "error", regErr)
+			s.finish(ctx, operationID, core.OperationUnknown, agentResultAgentBusy,
+				"归档等待超时且回滚失败，需查证", detail)
+			return core.AgentArchiveRecord{}, postPendingError(errors.Join(busy, regErr), operationID)
+		}
+		s.finish(ctx, operationID, core.OperationFailed, agentResultAgentBusy,
+			"归档等待在途 Run 超时", detail)
+		return core.AgentArchiveRecord{}, postPendingError(busy, operationID)
 	}
 
 	archivedRec, transErr := s.lifecycle.Transition(ctx, name, beforeState, current.Generation,
@@ -1454,6 +1553,9 @@ func (s *AgentAdmin) Restore(ctx context.Context, actor core.Actor, archiveID, n
 	if row.AgentUID != "" && row.AgentUID != rec.AgentUID {
 		s.clearProjectionIdentity(ctx, row.AgentUID)
 	}
+	// 恢复把定义写回活动区：同名恢复可能连内容带代次一起回退，异名恢复换了新身份，
+	// 两种情形都必须让共享 bundle 跟上落盘后的定义（FR-24-25 / FR-24-42）。
+	s.publishAgentBundle(ctx, target)
 
 	if view, ok := s.readFilesView(ctx, target); ok {
 		return view, nil
@@ -1545,25 +1647,29 @@ func archiveTargetConflictError(err error) error {
 	}
 }
 
-// archiveLiveDeps 判定归档的三项活动面依赖是否可用：全有（HTTP 路径）或全无（CLI 路径）；
-// 部分装配是装配错误，**不得**静默降级成"跳过注销"。
-// archiveLiveDeps requires the registry, scheduler and run canceller all-or-nothing.
+// archiveLiveDeps 判定归档可用的两类依赖，并报告**进程内注册面**是否存在（live）。
+//
+//   - 注册面（Registry + Scheduler）：**必须同时提供或同时省略**——只给一半是装配错误，
+//     注销得掉却恢复不了会让回滚矩阵静默缺口；CLI 持有实例锁、不跑调度，两者都省略。
+//   - Run 取消器（RunCanceller）：**每一条归档路径都必须提供**。残量快照、跨 Worker
+//     取消与有界等待是归档完成判据的组成部分（FR-24-23 / FR-24-41）：CLI 与 serve 共用
+//     同一个库，只查本进程忙碌就移动目录，会把另一台机器正在跑的 Agent 搬走。缺它 =
+//     装配错误，不是"跳过等待"的许可。
+//
+// archiveLiveDeps reports whether the in-process registration surface is wired; the
+// run canceller is mandatory on every path because the residual snapshot is a shared
+// database fact a local busy set cannot substitute.
 func (s *AgentAdmin) archiveLiveDeps() (bool, error) {
-	provided := 0
-	for _, present := range []bool{s.registry != nil, s.scheduler != nil, s.canceller != nil} {
-		if present {
-			provided++
-		}
-	}
-	switch provided {
-	case 0:
-		return false, nil
-	case 3:
-		return true, nil
-	default:
+	if s.canceller == nil {
 		return false, errors.New(
-			"归档管理面依赖不完整：注册表 / 调度 / Run 取消器必须同时提供或同时省略（装配错误）")
+			"归档管理面缺少 Run 取消器：在途 Run 快照 / 跨 Worker 取消 / 有界等待不得跳过（装配错误）")
 	}
+	hasRegistry, hasScheduler := s.registry != nil, s.scheduler != nil
+	if hasRegistry != hasScheduler {
+		return false, errors.New(
+			"归档管理面依赖不完整：注册表与调度必须同时提供或同时省略（装配错误）")
+	}
+	return hasRegistry, nil
 }
 
 // checkArchiveSource 判定归档源可归档：状态文件存在且为 active / disabled，目录存在。
@@ -1960,18 +2066,36 @@ func (s *AgentAdmin) restoreArchiveRegistration(ctx context.Context, name string
 	return errors.Join(errs...)
 }
 
-// awaitArchiveRuns 取消该 Agent 的在途 Run 并在有界窗口内等待退出，返回窗口结束时仍在
-// 运行的标识。取消信号是尽力而为（单个取消失败只记 WARN，等待结果才是判据）。
-// awaitArchiveRuns signals cancellation and waits up to the bounded window.
-func (s *AgentAdmin) awaitArchiveRuns(ctx context.Context, name string) ([]string, error) {
-	runIDs, err := s.canceller.RunningRunIDs(ctx, name)
+// restoreArchiveRegistrationIfLive 只在进程内注册面被注销过时才回滚它：CLI 路径
+// （live=false）从未做过 [2]，回滚 [2] 既无对象也会撞上 nil 依赖。
+// The rollback of [2] only applies where [2] ran; the CLI never touched the registry.
+func (s *AgentAdmin) restoreArchiveRegistrationIfLive(
+	ctx context.Context, name string, live bool, snapshot archiveRegistration,
+) error {
+	if !live {
+		return nil
+	}
+	return s.restoreArchiveRegistration(ctx, name, snapshot)
+}
+
+// awaitArchiveRuns 按图 8 [3][4] 有界等待该 Agent 的**安全收尾结果**：先取一次残量快照
+// （仍在运行的 Run），逐个发出取消信号（尽力而为，单个失败只记 WARN），再在 `busyWait`
+// 窗口内轮询四条完成判据，全部达成时返回空。窗口到期时返回最后一次快照——未退出的 Run
+// 与未达成的判据就是 409 AGENT_BUSY 点名的那份证据。
+//
+// [5] 该 Agent 没有任何 Run 行时四条判据同时成立，直接继续既有归档事务。
+// 租约到期 / 释放**不是**退出证据：判据全部来自持久结果（图 8 的 R4 修正）。
+// awaitArchiveRuns waits (bounded) for the four persisted completion predicates; the
+// last snapshot is the evidence the 409 names.
+func (s *AgentAdmin) awaitArchiveRuns(ctx context.Context, name string) (core.ArchiveResiduals, error) {
+	residuals, err := s.canceller.Residuals(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("列出 Agent %s 的在途 Run: %w", name, err)
+		return core.ArchiveResiduals{}, fmt.Errorf("列出 Agent %s 的在途 Run: %w", name, err)
 	}
-	if len(runIDs) == 0 {
-		return nil, nil
+	if len(residuals.Unmet) == 0 {
+		return core.ArchiveResiduals{}, nil
 	}
-	for _, runID := range runIDs {
+	for _, runID := range residuals.RunIDs {
 		if cancelErr := s.canceller.CancelRun(ctx, runID); cancelErr != nil {
 			s.logger.Warn("归档：取消在途 Run 失败，继续等待",
 				"agent", name, "run_id", runID, "error", cancelErr)
@@ -1979,11 +2103,60 @@ func (s *AgentAdmin) awaitArchiveRuns(ctx context.Context, name string) ([]strin
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, s.busyWait)
 	defer cancel()
-	remaining, waitErr := s.canceller.WaitRuns(waitCtx, runIDs)
-	if waitErr != nil {
-		return nil, fmt.Errorf("等待 Agent %s 的在途 Run 退出: %w", name, waitErr)
+	ticker := time.NewTicker(archiveResidualPoll)
+	defer ticker.Stop()
+	for {
+		next, snapErr := s.canceller.Residuals(waitCtx, name)
+		if snapErr != nil {
+			// 窗口到期与查询失败竞争时**期限优先**：最后一份快照就是等待结果。
+			if waitCtx.Err() != nil {
+				return residuals, nil
+			}
+			return core.ArchiveResiduals{}, fmt.Errorf("等待 Agent %s 的在途 Run 退出: %w", name, snapErr)
+		}
+		residuals = next
+		if len(residuals.Unmet) == 0 {
+			return core.ArchiveResiduals{}, nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return residuals, nil
+		case <-ticker.C:
+		}
 	}
-	return remaining, nil
+}
+
+// restoreArchiveBarrier 是屏障的唯一放宽路径：用**状态文件的当前内容**写回索引。
+// 补偿带本次归档的操作标识与屏障期代次做 CAS，因此不会覆盖别的进程已完成的推进，
+// 也不会覆盖同一归档操作自己推进过的代次；状态文件已归档说明归档已落地
+// （⑨ 的同步负责索引），这里不插手。读文件失败如实返回——调用方按"补偿失败"
+// 记 ERROR 并把错误并进返回值，操作行保持 pending 供重启对账。
+// restoreArchiveBarrier writes the authoritative file's tuple back through the
+// barrier-identity CAS, so a concurrent advance is never overwritten.
+func (s *AgentAdmin) restoreArchiveBarrier(ctx context.Context, name, operationID string,
+	barrierGeneration int64,
+) error {
+	restoreCtx := context.WithoutCancel(ctx)
+	rec, exists, err := s.lifecycle.Read(restoreCtx, name)
+	if err != nil {
+		return fmt.Errorf("读取 %s 的生命周期状态以恢复准入屏障: %w", name, err)
+	}
+	if !exists {
+		return fmt.Errorf("读取 %s 的生命周期状态以恢复准入屏障: 状态文件不存在", name)
+	}
+	if rec.State == core.AgentArchived {
+		return nil
+	}
+	applied, err := s.index.RestoreLifecycleBarrier(restoreCtx, rec, operationID, barrierGeneration)
+	if err != nil {
+		return fmt.Errorf("恢复 Agent %s 的准入屏障: %w", name, err)
+	}
+	if !applied {
+		s.logger.Warn("准入屏障恢复跳过：索引行已不是本次屏障留下的 disabled",
+			"agent", name, "operation_id", operationID,
+			"barrier_generation", barrierGeneration, "state_file_state", string(rec.State))
+	}
+	return nil
 }
 
 // rollbackArchiveState 把状态文件从 archived 回退到归档前状态（generation 再 +1，
@@ -2056,6 +2229,25 @@ func (s *AgentAdmin) syncLifecycleIndex(ctx context.Context, rec core.LifecycleR
 // successful write; a failure is logged and never turned into a write failure.
 func (s *AgentAdmin) rebuildActiveProjection(ctx context.Context, agent string, uid core.AgentUID) {
 	RebuildAgentFromDisk(ctx, s.projection, s.root, agent, uid, s.logger)
+}
+
+// publishAgentBundle 在写路径成功之后尽力把该 Agent 的最新定义发布为共享资产。
+//
+// 为什么是"尽力"：目录与状态文件此刻已经生效，发布失败不得把一次成功的写改写成失败
+// （与索引、投影同一纪律）。但失败必须留 ERROR 并**点名后果**——准入会按资产缺失或
+// 版本不符失败关闭（FR-24-25），运维据此重跑 `basalt assets install --agent`。
+// 用 WithoutCancel：客户端断开不应让共享记录停在旧版本（写已提交，后续动作必须完成）。
+//
+// publishAgentBundle is best-effort after a committed write: the write never turns into a
+// failure, but the log names the consequence (admission fails closed until a republish).
+func (s *AgentAdmin) publishAgentBundle(ctx context.Context, agent string) {
+	if s.publishBundle == nil {
+		return
+	}
+	if _, err := s.publishBundle(context.WithoutCancel(ctx), agent); err != nil {
+		s.logger.Error("写路径成功后发布 Agent 资产失败（变更已生效，准入将按资产缺失或版本不符失败关闭）",
+			"agent", agent, "error", err)
+	}
 }
 
 // rebuildArchivedProjection 按归档副本的定义文件重建投影（归档成功之后调用）：归档

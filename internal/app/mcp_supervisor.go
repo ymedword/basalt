@@ -191,6 +191,27 @@ func (s *MCPSupervisor) ApplyPublished(ctx context.Context, servers []core.Publi
 // `applied`（约束 17 / 21 / 42）。连接失败 → 保留旧 applied、connected=false。
 // Start authorizes, connects, and only then records applied under the gate.
 func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPServer) error {
+	return s.start(ctx, published, true)
+}
+
+// RebuildAtApplied 在**不写 applied 指针**的前提下重建一个 server 的连接，供准入的
+// 本地实例版本证明修复路径使用（US-24 P-21）：重建目标是库里**已经 applied** 的那一版，
+// 指针不需要、也不该被重写。更关键的是**锁**：准入在 `ResourceGate` 读锁内调用本方法，
+// 而 `markApplied` 要取写锁——同一条路径上再取写锁会与自身持有的读锁互等（RWMutex
+// 不可重入）。跳过那次写库既保住了"库内 applied == 实际连接版本"的不变量（两端都是同一
+// 版本），也避开了自锁。
+// RebuildAtApplied re-establishes the connection for the version already applied and
+// skips the applied write, which would otherwise take the gate's write lock while the
+// admission holds its read lock.
+func (s *MCPSupervisor) RebuildAtApplied(ctx context.Context, published core.PublishedMCPServer) error {
+	return s.start(ctx, published, false)
+}
+
+// start 是 Start / RebuildAtApplied 的共同实现；`recordApplied` 决定是否写库。
+// start is the shared implementation; recordApplied selects whether applied is written.
+func (s *MCPSupervisor) start(ctx context.Context, published core.PublishedMCPServer,
+	recordApplied bool,
+) error {
 	cfg := published.Config
 	if err := validateSupervisorConfig(cfg); err != nil {
 		return err
@@ -279,15 +300,23 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 	// 已不属于本次启动。
 	// Applied is recorded before tools are published; a failed record fails the
 	// connection closed, and a superseded connect never publishes tools.
-	applied, applyErr := s.markApplied(ctx, entry, epoch, published)
-	if applyErr != nil {
-		s.abandonApply(entry, epoch, connector, link, cfg)
-		return applyErr
-	}
-	if !applied {
-		// 被顶替时连接已由顶替者关闭：Start / Stop 都在 entry.mu 内递增 epoch 并关闭
-		// `entry.conn`，因此 epoch 变化必然意味着本次连接已被收走，这里不重复关闭。
-		// The superseder already closed this connector while holding entry.mu.
+	if recordApplied {
+		applied, applyErr := s.markApplied(ctx, entry, epoch, published)
+		if applyErr != nil {
+			s.abandonApply(entry, epoch, connector, link, cfg)
+			return applyErr
+		}
+		if !applied {
+			// 被顶替时连接已由顶替者关闭：Start / Stop 都在 entry.mu 内递增 epoch 并关闭
+			// `entry.conn`，因此 epoch 变化必然意味着本次连接已被收走，这里不重复关闭。
+			// The superseder already closed this connector while holding entry.mu.
+			return nil
+		}
+	} else if !s.alignAppliedLocally(entry, epoch, published.VersionID) {
+		// 重建路径不写库：只把进程内的已应用版本对齐到本次重建的目标（库内本来就是它）。
+		// epoch 已变说明槽位被别人接管，连接归它，本次不发布工具。
+		// The rebuild path only aligns the in-process version; a superseded epoch never
+		// publishes tools.
 		return nil
 	}
 	if s.deps.OnConnected != nil {
@@ -297,6 +326,20 @@ func (s *MCPSupervisor) Start(ctx context.Context, published core.PublishedMCPSe
 		"transport", mcpTransport(cfg.Transport), "version_id", published.VersionID,
 		"tools", toolCount)
 	return nil
+}
+
+// alignAppliedLocally 把进程内的已应用版本对齐到重建目标（不写库）：返回 false 表示本次
+// 重建已被顶替，调用方不得发布工具。只有仍是本代（epoch 未变）才改状态。
+// alignAppliedLocally aligns the in-process applied version; false means superseded.
+func (s *MCPSupervisor) alignAppliedLocally(entry *mcpServerEntry, epoch uint64, versionID int64) bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.epoch != epoch || !entry.status.Connected {
+		return false
+	}
+	entry.status.AppliedVersionID = versionID
+	entry.status.Error = ""
+	return true
 }
 
 // abandonApply 处理"连接成功但 applied 落库失败"：失效关闭本次连接、把状态退回未连接、

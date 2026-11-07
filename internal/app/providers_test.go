@@ -363,10 +363,23 @@ func TestProviderCatalog_MultipleEntriesRejected(t *testing.T) {
 // catalogCredentialSpy 是 `managedCredentialSource` 的计数替身：记录收到的发布版本引用，
 // 可注入固定失败。目录构建对每个托管条目只应调用它**一次**，且 override 注入时一次都不调。
 // catalogCredentialSpy counts resolution calls and records the pinned version references.
+// catalogCredentialSpy 同时实现 `catalogCredentialSource` 的两面（US-24 起目录构建
+// 也读凭据 pin）：`ResolveModelCredential` 记下解析过的版本引用，`PinModelCredential`
+// 只做透传——本用例断言的是"取 Key 走哪条路"，pin 不在判据面内。
 type catalogCredentialSpy struct {
-	inner managedCredentialSource
+	inner catalogCredentialSource
 	err   error
 	refs  []core.ResourceVersionRef
+}
+
+// PinModelCredential 透传凭据 pin；`err` 置位时与解析面同样失败关闭。
+func (s *catalogCredentialSpy) PinModelCredential(ctx context.Context, uid core.ResourceUID,
+	targetBinding string,
+) (core.CredentialPin, error) {
+	if s.err != nil {
+		return core.CredentialPin{}, s.err
+	}
+	return s.inner.PinModelCredential(ctx, uid, targetBinding)
 }
 
 func (s *catalogCredentialSpy) ResolveModelCredential(ctx context.Context,
@@ -462,4 +475,82 @@ func TestProviders_RevokedCredentialKeepsOldTable(t *testing.T) {
 	require.Same(t, oldClient, holder.Load().clients[name], "旧客户端继续服务")
 	require.Contains(t, err.Error(), name)
 	require.NotContains(t, err.Error(), "sk-managed-revoked-plaintext")
+}
+
+// rotatingCredentialSource 在**取 Key 之后、返回之前**提交一次凭据换代：它把"两次独立读
+// 之间夹着一次轮换提交"这个时序确定性化，不依赖睡眠 / 调度猜测。`PinModelCredential`
+// 原样透传——判据要观察的正是构建器自己两次取 pin 的结果，替身不得替它决定。
+// rotatingCredentialSource commits a rotation between the builder's key read and its
+// pin read, making the interleaving deterministic instead of timing-dependent.
+type rotatingCredentialSource struct {
+	inner   catalogCredentialSource
+	rotate  func()
+	rotated bool
+}
+
+func (s *rotatingCredentialSource) ResolveModelCredential(ctx context.Context,
+	ref core.ResourceVersionRef,
+) (string, error) {
+	key, err := s.inner.ResolveModelCredential(ctx, ref)
+	if err == nil && !s.rotated {
+		s.rotated = true
+		s.rotate()
+	}
+	return key, err
+}
+
+func (s *rotatingCredentialSource) PinModelCredential(ctx context.Context, uid core.ResourceUID,
+	targetBinding string,
+) (core.CredentialPin, error) {
+	return s.inner.PinModelCredential(ctx, uid, targetBinding)
+}
+
+// TestProviderCatalog_CredentialRotatedDuringBuildFailsClosed（review ② finding 5 /
+// 模块卡 P-21）：目录构建先取 Key、再取凭据 pin，是两次独立读——托管凭据的轮换是一次
+// 独立事务（追加版本并推进 `current_version`），若它恰好提交在两次读之间，客户端里装的
+// 是 v1 明文、构建证据却写 v2：准入此后拿这份假证据比对"相等"，重建被跳过，每一次调用
+// 都带旧 Key 而审计记新 Key。修复在取 Key 前后各取一次 pin，两次不等即失败关闭。
+//
+// 逆改点：删掉 `pin != pinBefore` 守卫 → 构建成功且 `built["alpha"].Credential.Version`
+// 记为 2（而客户端装的是 v1 材料），`require.Error` 红。
+func TestProviderCatalog_CredentialRotatedDuringBuildFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	f := newResolverFixture(t)
+	const (
+		name = "alpha"
+		base = "https://api.example.com/v1"
+	)
+	const plaintext = "sk-rotation-v1-plaintext"
+	f.seedManagedModelConnection(t, name, base)
+	target, err := CredentialTargetBinding(core.BindingModelConnection, base, "")
+	require.NoError(t, err)
+	credID := f.seedSealedCredential(t, core.ResourceModelConnection, name, target, plaintext)
+
+	// 正向对照：没有轮换时构建成功，证据版本就是 active 的那一版。
+	catalog, err := newProviderCatalogFromPublished(ctx, f.versions, nil, nil, f.resolver)
+	require.NoError(t, err)
+	require.Equal(t, 1, catalog.built[name].Credential.Version)
+
+	source := &rotatingCredentialSource{
+		inner: f.resolver,
+		rotate: func() {
+			require.NoError(t, f.credentials.AppendVersion(ctx, credID, "master/v1", f.opID,
+				core.CredentialVersionRecord{
+					KeyID:         "master/v1",
+					TargetBinding: target,
+					Last4:         "0002",
+					Nonce:         make([]byte, 12),
+					Ciphertext:    []byte("sealed:alpha:v2"),
+					OperationID:   f.opID,
+				}, baselineClock()))
+		},
+	}
+
+	built, err := newProviderCatalogFromPublished(ctx, f.versions, nil, nil, source)
+	require.True(t, source.rotated, "前置：换代必须提交在取 Key 与取 pin 之间")
+	require.Error(t, err, "证据版本与客户端材料不符时必须失败关闭")
+	require.ErrorIs(t, err, core.ErrCredentialUnavailable)
+	require.Nil(t, built, "失败不得返回半张映射表")
+	require.Contains(t, err.Error(), name)
+	require.NotContains(t, err.Error(), plaintext, "不得回显凭据材料")
 }

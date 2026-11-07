@@ -23,6 +23,11 @@ type flowAdvanceRunner struct {
 	block    chan struct{}
 	release  chan struct{}
 	capacity bool
+	// owner 非零时按真实 Worker 身份建 Run（连带 run 租约）。生产里每个节点 Run 都由
+	// 持身份的 Worker 创建；零值保留 StartRun 的"无租约"兼容分支，供不判租约的用例
+	// 沿用，避免给所有用例凭空加租约。
+	// A non-zero owner models the production leaf: every node Run carries a run lease.
+	owner core.WorkerIdentity
 }
 
 func (r *flowAdvanceRunner) Run(ctx context.Context, req flow.NodeRunRequest) (flow.NodeRunResult, error) {
@@ -31,7 +36,7 @@ func (r *flowAdvanceRunner) Run(ctx context.Context, req flow.NodeRunRequest) (f
 		return flow.NodeRunResult{}, flow.ErrCapacity
 	}
 	runs := NewRunStore(r.store.db)
-	if err := runs.StartRun(ctx, core.RunRecord{RunID: req.Attempt.RunID, SessionID: req.Attempt.SessionID, Agent: req.Node.Agent.Name, Channel: "cli", UserID: "flow-probe", Principal: req.Principal, StartedAt: time.Now(), Flow: req.Flow}, core.RunResourceManifest{}); err != nil {
+	if err := startRunOwnedTest(runs, ctx, core.RunRecord{RunID: req.Attempt.RunID, SessionID: req.Attempt.SessionID, Agent: req.Node.Agent.Name, Channel: "cli", UserID: "flow-probe", Principal: req.Principal, StartedAt: time.Now(), Flow: req.Flow}, core.RunResourceManifest{}, r.owner); err != nil {
 		return flow.NodeRunResult{}, err
 	}
 	if r.block != nil {
@@ -44,12 +49,12 @@ func (r *flowAdvanceRunner) Run(ctx context.Context, req flow.NodeRunRequest) (f
 		// 与 internal/flow 同族夹具同步抬高，避免并行判卷下 PG 争用把上限打穿。
 		finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
-		if _, err := runs.FinishRun(finish, req.Attempt.RunID, core.StatusCancelled, "cancelled", 0, 0, time.Now()); err != nil {
+		if _, err := runs.FinishRun(finish, req.Attempt.RunID, core.LeaseToken{}, core.StatusCancelled, "cancelled", 0, 0, time.Now()); err != nil {
 			return flow.NodeRunResult{}, err
 		}
 		return flow.NodeRunResult{Run: core.RunResult{RunID: req.Attempt.RunID, Status: core.StatusCancelled}}, nil
 	}
-	if _, err := runs.FinishRun(ctx, req.Attempt.RunID, core.StatusCompleted, "", 1, 0, time.Now()); err != nil {
+	if _, err := runs.FinishRun(ctx, req.Attempt.RunID, core.LeaseToken{}, core.StatusCompleted, "", 1, 0, time.Now()); err != nil {
 		return flow.NodeRunResult{}, err
 	}
 	return flow.NodeRunResult{Run: core.RunResult{RunID: req.Attempt.RunID, Status: core.StatusCompleted, FinalText: string(r.output), Iterations: 1}, Output: r.output}, nil
@@ -73,7 +78,11 @@ func TestFlow_AdvanceVerifiesBeforeAtomicSuccess(t *testing.T) {
 			service.Runner = runner
 			task, err := service.Start(t.Context(), startFlowRequest(def, "advance"))
 			require.NoError(t, err)
-			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			// 直接调 Service.Advance 的夹具没有 Worker 领取环节，按真实执行者身份
+			// 预领根租约（US-24 §3.1.6 / FR-24-18）；T022 只改 Worker 领取路径。
+			// 凭证必须原样下传：子 Run 创建（createRunForNode）以它证明父根归属。
+			root := flowRootLeaseFor(t, s.db, task.RootTaskID)
+			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 			require.NoError(t, err)
 			require.Equal(t, tc.status, finished.Status)
 			require.EqualValues(t, 1, runner.calls.Load())
@@ -102,7 +111,8 @@ func TestFlow_AdvanceCapacityYieldsWithoutRun(t *testing.T) {
 	service.Runner = runner
 	task, err := service.Start(t.Context(), startFlowRequest(def, "defer"))
 	require.NoError(t, err)
-	deferred, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+	root := flowRootLeaseFor(t, s.db, task.RootTaskID)
+	deferred, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 	require.NoError(t, err)
 	require.Equal(t, flow.Running, deferred.Status)
 	require.Zero(t, deferred.Revision.Attempts["draft"])
@@ -112,7 +122,7 @@ func TestFlow_AdvanceCapacityYieldsWithoutRun(t *testing.T) {
 	require.Zero(t, count)
 	runner.capacity = false
 	runner.output = json.RawMessage(`{"answer":"ready"}`)
-	finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: deferred.Version})
+	finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: deferred.Version, Lease: root})
 	require.NoError(t, err)
 	require.Equal(t, flow.Succeeded, finished.Status)
 	require.Equal(t, 1, finished.Revision.Attempts["draft"])
@@ -125,9 +135,10 @@ func TestFlow_CancelRequiresRealLeafJoin(t *testing.T) {
 	service.Runner = runner
 	task, err := service.Start(t.Context(), startFlowRequest(def, "cancel-join"))
 	require.NoError(t, err)
+	root := flowRootLeaseFor(t, s.db, task.RootTaskID)
 	result := make(chan error, 1)
 	go func() {
-		_, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+		_, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 		result <- err
 	}()
 	select {

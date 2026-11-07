@@ -76,6 +76,14 @@ type loopHarness struct {
 	runQuota core.RunQuota
 	phases   core.PhaseRecorder
 
+	// 执行权接线（T007）：经 withLeaseKeeper 在构造期置入；全部零值 = 无租约装配，
+	// 既有用例的行为与接线前逐字节相同。
+	// Lease wiring injected by withLeaseKeeper; zero values keep the unleased assembly.
+	worker        core.WorkerIdentity
+	leases        core.LeaseStore
+	renewInterval time.Duration
+	leaseTTL      time.Duration
+
 	// 压缩接线（V-7 判据需要"压缩已装配"的 Run）：两字段一并经 withCompaction 置入。
 	compactionReserve int
 	assembleCompactor func(*core.RunEnv) core.ContextCompactor
@@ -113,10 +121,16 @@ func withAssemblyRecorder(r core.AssemblyRecorder) harnessOption {
 }
 
 // withRunQuota 把 Run 级任务次数端口**在构造期**置入（N-01）：构造之后再写
-// `h.runQuota` 对已建好的 service 无效，断言会恒空地"通过"。
-// withRunQuota injects the run-level task-count port at construction time.
+// `h.runQuota` 对已建好的 service 无效，断言会恒空地"通过"。自 US-24 Q21 起，
+// 真实记账在 `RunStore.StartRun` 的准入事务内完成，假仓储因此在构造期同样拿到
+// 该端口——两条注入缺一，记账用例都会退化成恒绿。
+// withRunQuota injects the run-level task-count port at construction time and binds it
+// into the fake store, which emulates the in-transaction charge (US-24 Q21).
 func withRunQuota(q core.RunQuota) harnessOption {
-	return func(h *loopHarness) { h.runQuota = q }
+	return func(h *loopHarness) {
+		h.runQuota = q
+		h.store.runQuota = q
+	}
 }
 
 // withCompaction 把压缩接线**在构造期**置入循环（V-7 压缩结论透传判据用）：
@@ -124,6 +138,21 @@ func withRunQuota(q core.RunQuota) harnessOption {
 // 不调用本选项 = 未接压缩，循环照旧报 `decision=none`。
 // withCompaction wires compaction at construction time; leaving it out keeps the
 // pre-wiring behaviour of `decision=none`.
+// withLeaseKeeper 把执行权接进夹具（T007）：Worker 身份、续约端口与时长**在构造期**
+// 置入 service，假仓储同步进入"有执行权"形态并在失权后拒绝受保护写入。不调用即保持
+// 无租约装配——既有用例一个字节都不用改。
+// withLeaseKeeper wires the keeper at construction time and switches the fake store
+// into leased mode; leaving it out keeps every existing case on the unleased path.
+func withLeaseKeeper(leases *fakeLeaseStore, renewInterval, ttl time.Duration) harnessOption {
+	return func(h *loopHarness) {
+		h.worker = core.WorkerIdentity{InstanceID: "wrk_loop_fixture", Name: "loop-fixture"}
+		h.leases = leases
+		h.renewInterval = renewInterval
+		h.leaseTTL = ttl
+		h.store.leases = leases
+	}
+}
+
 func withCompaction(outputReserve int, assemble func(*core.RunEnv) core.ContextCompactor) harnessOption {
 	return func(h *loopHarness) {
 		h.compactionReserve = outputReserve
@@ -174,6 +203,12 @@ func newLoopHarness(t *testing.T, opts ...harnessOption) *loopHarness {
 		Memory:    h.memory,
 		RunQuota:  h.runQuota,
 		Phases:    h.phases,
+		// 执行权（T007）：零值即无租约装配——既有全部用例走这一支。
+		// Zero values keep the unleased assembly for every existing case.
+		Worker:        h.worker,
+		Leases:        h.leases,
+		RenewInterval: h.renewInterval,
+		LeaseTTL:      h.leaseTTL,
 		Loop: core.NewReActLoop(
 			core.NewPromptBuilder(h.registry),
 			core.NewToolExecutor(h.registry, h.audit, logger),
@@ -384,12 +419,16 @@ type fakeStore struct {
 
 	// lastManifest 是最近一次 StartRun 收到的清单（零清单 = 装配未接线）。
 	lastManifest core.RunResourceManifest
+	// cancelRequested 记录 RequestCancel 写下的标志（跨 Worker 取消的调用侧判据）。
+	cancelRequested map[string]bool
 
 	// finishCalls 是 FinishRun 被调用的次数（取消用例的判据：取消路径**不得**写终态，
 	// 终态只能由 Run 自己经 FinishRun 写一次）。
 	finishCalls int
 	// releaseCalls 是 ReleaseRunRefs 被调用的次数（US-22：释放无条件执行）。
 	releaseCalls int
+	// closeoutCalls 是 CompleteRunCloseout 被调用的次数（US-24 五步收尾的末笔）。
+	closeoutCalls int
 
 	// failToolAppendOnce 注入"工具结果追加失败"（提前返回路径用例）——**一次性**：
 	// 只失败第一次，之后的补齐写入必须能落（否则测的是"存储全坏"，不是"提前返回路径"）。
@@ -400,6 +439,87 @@ type fakeStore struct {
 	// startRunErr injects a ledger failure; onStartRun observes the state at StartRun.
 	startRunErr error
 	onStartRun  func()
+
+	// lookupToken 是"提交结果未知后回查"的返回：零值 = 查无行（ErrRunNotFound），
+	// 非零 = 租约的**当前**视图。用例借此造出"回查命中的是回收器以更高代次领回的
+	// 他人租约"（review ② finding 4），不需要真实数据库。
+	// lookupToken is what the unknown-outcome look-up returns; zero means "no row".
+	lookupToken core.LeaseToken
+
+	// runQuota 是假仓储在 StartRun "事务内"模拟的任务次数记账（Q21）：真实实现由
+	// PostgreSQL 准入事务扣费，本假存储把它同样放在建账本行**之前**，让拒绝路径
+	// 的"零占用"判据在进程内同样可测。nil = 未接线（不记账）。
+	// runQuota emulates the in-transaction task charge of the real store.
+	runQuota core.RunQuota
+
+	// leases 非 nil 时本假仓储进入"有执行权"形态（T007 的运行级续约接线）：StartRun
+	// 按 owner 发放 run 租约，FinishRun / CompleteRunCloseout / FencedAppendMessage
+	// 接受该 token，失权后一律 ErrLeaseLost。租约互斥、代次与过期判定的**判据面**
+	// 在 postgres 用例；这里只模拟"持权 / 失权"两态，供进程内用例观察取消传播。
+	// leases turns the fake into a leased store: tokens are issued at StartRun and every
+	// fenced write is refused after the scripted loss.
+	leases *fakeLeaseStore
+}
+
+// fakeLeaseStore 是续约端口的替身：`lose()` 之前每次 Renew 成功，之后返回
+// ErrLeaseLost——keeper 的立即失权分支（不等到有界停止阈值）。
+// fakeLeaseStore succeeds until lose(), then reports ErrLeaseLost so the keeper takes
+// its immediate loss branch.
+type fakeLeaseStore struct {
+	mu      sync.Mutex
+	calls   int
+	lost    bool
+	release int
+}
+
+// lose 让后续续约全部失败（失权）。工具开始执行后由用例触发，时序因此确定。
+func (l *fakeLeaseStore) lose() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lost = true
+}
+
+// isLost 报告脚本化的失权是否已触发（受保护写入据此判定放行 / 拒绝）。
+func (l *fakeLeaseStore) isLost() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lost
+}
+
+// renewCount 返回续约尝试次数（keeper 确实跑起来的判据）。
+func (l *fakeLeaseStore) renewCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+// Acquire 不在本替身的作用面内（Run 的租约由 StartRun 事务发放）。
+func (*fakeLeaseStore) Acquire(context.Context, core.LeaseKind, string, core.WorkerIdentity, time.Duration) (core.Lease, error) {
+	return core.Lease{}, errors.New("fake lease store: acquire unused")
+}
+
+// Renew 在失权后返回 ErrLeaseLost，否则让租约继续有效。
+func (l *fakeLeaseStore) Renew(_ context.Context, token core.LeaseToken, _ time.Duration) (core.Lease, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	if l.lost {
+		return core.Lease{}, core.ErrLeaseLost
+	}
+	return core.Lease{LeaseToken: token}, nil
+}
+
+// Release 只计次（本替身的租约没有存储行）。
+func (l *fakeLeaseStore) Release(context.Context, core.LeaseToken) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.release++
+	return nil
+}
+
+// FencedTx 不在本替身的作用面内：受保护写入走 fakeStore 的 fenced 方法。
+func (*fakeLeaseStore) FencedTx(context.Context, core.LeaseToken, func(context.Context, core.Tx) error) error {
+	return core.ErrLeaseLost
 }
 
 func newFakeStore() *fakeStore {
@@ -459,25 +579,108 @@ func (s *fakeStore) ListSessions(_ context.Context, _ core.SessionFilter) ([]cor
 
 // StartRun 建 `running` 行（清单随运行传入，本假存储只记「零清单 / 非零清单」两态——
 // 清单内容的判据面在 storage 的 run_store 用例）。`startRunErr` 注入账本失败；
-// `onStartRun` 在记账前观察调用时刻的状态（准入租约的时点判据）。
-func (s *fakeStore) StartRun(_ context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
+// `onStartRun` 在记账前观察调用时刻的状态（准入租约的时点判据）；`runQuota` 非 nil 时
+// 在"事务内"先记账再建行——拒绝则整笔不落（零占用）。
+func (s *fakeStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest,
+	owner core.WorkerIdentity, _ core.CallerAdmission, _ string,
+) (core.LeaseToken, error) {
+	// 假仓储默认没有租约：只接受零值 owner（与 SQLite 源谱系同一口径），返回零值
+	// token。`withLeaseKeeper` 打开后按 owner 发放本 Run 的 run 租约（资源标识 = run_id），
+	// 之后的受保护写入按该 token 判定"持权 / 失权"。
+	// No leases by default; with the keeper harness option the store issues one per run.
+	var token core.LeaseToken
+	if !owner.IsZero() {
+		if s.leases == nil {
+			return core.LeaseToken{}, errors.New("fake store: no execution leases")
+		}
+		token = core.LeaseToken{
+			Kind: core.LeaseRun, ResourceID: rec.RunID,
+			OwnerWorkerID: owner.InstanceID, OwnershipEpoch: 1,
+		}
+	}
 	if hook := s.onStartRun; hook != nil {
 		hook()
+	}
+	// 事务内记账（Q21）：真实仓储在准入事务里扣任务次数，假仓储在同一时点模拟。
+	// 失败即整笔回滚——账本行不得先落，被拒的 Run 零占用。
+	if s.runQuota != nil {
+		charged, err := s.runQuota.ChargeRun(ctx, core.RunQuotaRequest{Principal: rec.Principal, RunID: rec.RunID})
+		if err != nil {
+			return core.LeaseToken{}, err
+		}
+		rec.ReservationID = charged.ReservationID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.startRunErr != nil {
-		return s.startRunErr
+		return core.LeaseToken{}, s.startRunErr
 	}
 	s.runs[rec.RunID] = rec
 	s.status[rec.RunID] = core.StatusRunning
 	s.lastManifest = manifest
+	return token, nil
+}
+
+// FencedAppendMessage 是受保护追加的替身：持权时与普通追加同路径（互斥与代次的判据面
+// 在 postgres 用例），失权后返回 ErrLeaseLost 且零写入——与真实仓储的 fail-closed 同解。
+// The fenced append mirrors the real store's two states: it writes while the lease is
+// held and refuses with zero writes after the scripted loss.
+func (s *fakeStore) FencedAppendMessage(ctx context.Context, _ core.LeaseToken,
+	sessionID, runID string, m core.Message,
+) (string, error) {
+	if s.leases == nil || s.leases.isLost() {
+		return "", core.ErrLeaseLost
+	}
+	return s.AppendMessage(ctx, sessionID, runID, m)
+}
+
+// CheckAdmission 在假仓储里只做身份判定：没有并发计数与租约表可查（那些判据面
+// 在 postgres 的准入用例），返回无异议由 StartRun 的既有行为兜底。
+// CheckAdmission only validates the principal; the counters live in postgres.
+func (s *fakeStore) CheckAdmission(_ context.Context, _ string, p core.Principal, _ core.CallerAdmission) error {
+	if !p.Valid() {
+		return core.ErrUnauthorized
+	}
 	return nil
+}
+
+// LookupAdmittedRun 默认查无行（既有用例不走未知结局分支）；`lookupToken` 非零时
+// 返回它，模拟真实仓储"按 run_id 读租约**当前**行"的语义。
+// LookupAdmittedRun reports no row by default; a non-zero lookupToken emulates the real
+// store returning the lease's current row after an unknown commit outcome.
+func (s *fakeStore) LookupAdmittedRun(_ context.Context, _ string) (core.LeaseToken, error) {
+	if !s.lookupToken.IsZero() {
+		return s.lookupToken, nil
+	}
+	return core.LeaseToken{}, core.ErrRunNotFound
+}
+
+// RequestCancel 记下取消标志并返回当前状态（假仓储不做终态判定——"非属主只写标志"
+// 的判据面在 postgres 用例）。
+// RequestCancel records the flag and reports the current state.
+func (s *fakeStore) RequestCancel(ctx context.Context, runID string) (core.RunDetail, error) {
+	detail, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return core.RunDetail{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelRequested == nil {
+		s.cancelRequested = map[string]bool{}
+	}
+	s.cancelRequested[runID] = true
+	return detail, nil
 }
 
 // FinishRun 把终态写回同一行（不接收 finalText——列面没有它）。只有从 running
 // 转换的行返回 applied=true，与真实仓储的 `WHERE status='running'` 守卫同口径。
-func (s *fakeStore) FinishRun(_ context.Context, runID string, status core.RunStatus, reason string, _, _ int, _ time.Time) (bool, error) {
+// 假仓储没有租约：只接受零值 token（非零说明装配把租约接进了不该有的后端）。
+func (s *fakeStore) FinishRun(_ context.Context, runID string, token core.LeaseToken,
+	status core.RunStatus, reason string, _, _ int, _ time.Time,
+) (bool, error) {
+	if !token.IsZero() && (s.leases == nil || s.leases.isLost()) {
+		return false, core.ErrLeaseLost
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	applied := s.status[runID] == core.StatusRunning
@@ -494,6 +697,17 @@ func (s *fakeStore) ReleaseRunRefs(_ context.Context, runID string, _ time.Time)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.releaseCalls++
+	return nil
+}
+
+// CompleteRunCloseout 在假仓储里只计次：收尾顺序的判据面在调用侧的事件序列。
+func (s *fakeStore) CompleteRunCloseout(_ context.Context, runID string, token core.LeaseToken, _ time.Time) error {
+	if !token.IsZero() && (s.leases == nil || s.leases.isLost()) {
+		return core.ErrLeaseLost
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeoutCalls++
 	return nil
 }
 
@@ -664,6 +878,24 @@ func (a *fakeAudit) FinishInvocation(_ context.Context, id int64, res core.ToolI
 		return nil
 	}
 	return fmt.Errorf("tool invocation row %d not found", id)
+}
+
+// FencedBeginInvocation 是审计预写的受保护替身：持权时同普通预写，失权后零写入。
+// The fenced pre-write follows the same held/lost split as the message append.
+func (a *fakeAudit) FencedBeginInvocation(ctx context.Context, _ core.LeaseToken, inv core.ToolInvocation) (int64, error) {
+	if a.store.leases == nil || a.store.leases.isLost() {
+		return 0, core.ErrLeaseLost
+	}
+	return a.BeginInvocation(ctx, inv)
+}
+
+// FencedFinishInvocation 是审计终态回填的受保护替身：失权后行保持 pending。
+// A lost lease keeps the row pending, exactly like the real store.
+func (a *fakeAudit) FencedFinishInvocation(ctx context.Context, _ core.LeaseToken, id int64, res core.ToolInvocationResult) error {
+	if a.store.leases == nil || a.store.leases.isLost() {
+		return core.ErrLeaseLost
+	}
+	return a.FinishInvocation(ctx, id, res)
 }
 
 // Lookup 按 (runID, toolCallID) 取审计行（补齐路径专用只读面）。
@@ -1276,4 +1508,31 @@ func TestReActLoop_RunIDShape(t *testing.T) {
 	require.Regexp(t, pattern, res.RunID)
 	require.Contains(t, res.RunID, fmt.Sprintf("cli-%d-", h.now.UnixMilli()),
 		"毫秒段取自本次运行的时间（时钟注入、时间显式传入）")
+}
+
+// TestRun_RenewFailureCancelsBeforeNextAction 守 T007 的运行级接线（FR-24-04 / FR-24-05）：
+// 续约失权后本次 Run **不得**再发起第二次模型调用；在途工具随上下文取消结束，工具结果的
+// 受保护追加被拒（ErrLeaseLost），终态写同样被 fencing 拒绝——账本行留 running 交回收器。
+// 时序确定：工具开始执行后才脚本化失权，keeper 的下一拍失败并取消，工具因此退出。
+// A lost lease cancels the run context: no second model call, the fenced tool-result
+// append is refused, and the terminal write is fenced too.
+func TestRun_RenewFailureCancelsBeforeNextAction(t *testing.T) {
+	leases := &fakeLeaseStore{}
+	h := newLoopHarness(t, withLeaseKeeper(leases, 2*time.Millisecond, 30*time.Second))
+	h.provider.onCall(0, toolCallResponse("c1", "read_file", `{"path":"a.txt"}`))
+	h.provider.onCall(1, textResponse("第二轮不得被调用"))
+	h.tools.blockUntilCancel = true
+	// 工具已进入执行体（审计预写成功、在途动作已开始）之后才失权：取消只能来自 keeper，
+	// 工具退出本身就是"执行上下文已被取消"的证据。
+	h.tools.onStarted = leases.lose
+
+	res, err := h.service.Run(ctx, h.req("读一下"))
+	require.NoError(t, err, "失权是运行期结局，不是调用方错误")
+	require.Equal(t, 1, h.provider.callCount(), "失权后不得再发起模型调用")
+	require.Equal(t, core.StatusFailed, res.Status, "失权后的写入被拒，本 Run 以失败收场")
+	require.Contains(t, res.Reason, core.ErrLeaseLost.Error(), "失权原因必须如实带出")
+	require.GreaterOrEqual(t, leases.renewCount(), 1, "keeper 必须实际尝试过续约")
+	// 终态写同样被 fencing 拒绝：行留在 running，由回收器按租赁作用域收尾（真实仓储
+	// 的 0 行区分在 postgres 用例判卷，这里只判"本进程没有覆盖账本"）。
+	require.Equal(t, core.StatusRunning, h.store.status[res.RunID], "失权后本进程不得写终态")
 }

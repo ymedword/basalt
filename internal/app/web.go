@@ -1198,7 +1198,11 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 			})
 	}
 	if rt.db != nil && rt.runs != nil && rt.versions != nil {
-		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, a.nowOr())
+		// WorkerStore 是无状态仓储（每次调用一次查询），与 SnapshotStore 同一装法：
+		// 现建现用，不额外占 heavyRuntime 字段。
+		// The worker store is stateless per call, so it is constructed inline like the
+		// snapshot store rather than parked on heavyRuntime.
+		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, postgres.NewWorkerStore(rt.db), a.nowOr())
 	}
 	opts.Sampler = web.NewSampler(a.nowOr())
 
@@ -1275,6 +1279,7 @@ type systemReader struct {
 	db       *postgres.DB
 	runs     *postgres.RunStore
 	versions *postgres.ResourceStore
+	workers  *postgres.WorkerStore
 	now      func() time.Time
 }
 
@@ -1284,19 +1289,20 @@ var _ web.SystemReader = systemReader{}
 
 // newSystemReader 组装概览读数适配器；now 为 nil 时退回 time.Now（生产恒传注入时钟）。
 // newSystemReader builds the overview reader; a nil clock falls back to time.Now.
-func newSystemReader(db *postgres.DB, runs *postgres.RunStore, versions *postgres.ResourceStore, now func() time.Time) systemReader {
+func newSystemReader(db *postgres.DB, runs *postgres.RunStore, versions *postgres.ResourceStore, workers *postgres.WorkerStore, now func() time.Time) systemReader {
 	if now == nil {
 		now = time.Now
 	}
-	return systemReader{db: db, runs: runs, versions: versions, now: now}
+	return systemReader{db: db, runs: runs, versions: versions, workers: workers, now: now}
 }
 
-// ReadOverview 汇总一次概览读数：探活 → 库版本 → 三个运行计数 → 三类发布指针计数。
-// 顺序固定，任一失败即整体失败（部分读数会在页面上伪装成"其余为 0"）。
+// ReadOverview 汇总一次概览读数：探活 → 库版本 → 三个运行计数 → 三类发布指针计数 →
+// Worker 列表与全库活跃租约数。顺序固定，任一失败即整体失败（部分读数会在页面上伪装
+// 成"其余为 0"）。
 // ReadOverview reads the overview in a fixed order and fails as a whole on any error.
 func (r systemReader) ReadOverview(ctx context.Context) (web.SystemReadings, error) {
-	if r.db == nil || r.runs == nil || r.versions == nil {
-		return web.SystemReadings{}, errors.New("系统概览读数缺少数据库 / 运行账本 / 资源仓储")
+	if r.db == nil || r.runs == nil || r.versions == nil || r.workers == nil {
+		return web.SystemReadings{}, errors.New("系统概览读数缺少数据库 / 运行账本 / 资源仓储 / Worker 仓储")
 	}
 	if err := r.db.Ping(ctx); err != nil {
 		return web.SystemReadings{}, fmt.Errorf("系统概览探活: %w", err)
@@ -1321,6 +1327,18 @@ func (r systemReader) ReadOverview(ctx context.Context) (web.SystemReadings, err
 	if err != nil {
 		return web.SystemReadings{}, err
 	}
+	// Worker 列表与全库活跃租约数（US-24 §3.1.13）：两者都是**只读诊断**，读不到就整体
+	// 失败——概览页不把"读不到"显示成"没有 Worker"。
+	// Worker rows and the cluster-wide active lease count; a read failure fails the
+	// reading rather than showing an empty cluster.
+	nodes, err := r.workers.ListNodes(ctx)
+	if err != nil {
+		return web.SystemReadings{}, err
+	}
+	activeLeases, err := r.workers.CountActiveLeases(ctx)
+	if err != nil {
+		return web.SystemReadings{}, err
+	}
 	return web.SystemReadings{
 		RunsRunning:       running,
 		RunsLast24h:       last24h,
@@ -1329,6 +1347,8 @@ func (r systemReader) ReadOverview(ctx context.Context) (web.SystemReadings, err
 		MCPServers:        mcpServers,
 		Skills:            skills,
 		SchemaVersion:     schemaVersion,
+		Workers:           nodes,
+		ActiveLeases:      activeLeases,
 	}, nil
 }
 

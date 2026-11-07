@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/ymedword/basalt/internal/assets"
 	"github.com/ymedword/basalt/internal/core"
 )
 
@@ -922,4 +923,43 @@ type LearningPort interface {
 	// Handoff reads the draft under the instance lock and calls Propose only; it
 	// returns draft metadata plus the propose receipt and nothing else.
 	Handoff(ctx context.Context, req core.LearningHandoffRequest) (core.LearningHandoffResult, error)
+}
+
+// WorkerLister 是 `basalt workers list` 的**只读**端口（US-24 模块卡 §3.1.12）。
+//
+// 它刻意不是 `core.WorkerRegistry` 的扩展：登记端口冻结在 Register / Heartbeat /
+// Stop 三个方法上，给它加一个读方法等于改已定字面量。命令面只读、不取实例锁、
+// 不写任何行（服务运行中也能查），因此这里只声明一个查询方法。
+// WorkerLister is the read-only port behind `basalt workers list`. It is deliberately
+// not an extension of core.WorkerRegistry, whose literal is frozen at three methods.
+type WorkerLister interface {
+	// ListNodes 返回全部 Worker 实例的只读投影（含各自的活跃租约数）。
+	// ListNodes returns every worker node with its active lease count.
+	ListNodes(ctx context.Context) ([]core.WorkerNodeView, error)
+}
+
+// AssetsPort 是 `basalt assets export|install|verify` 的装配面（模块卡 §3.1.11）。
+//
+// `AssetRoot` 由装配层按 `assets.bundle_root` 解析后注入（相对路径按进程工作目录
+// 展开），命令面不自己读配置文件——否则"装在哪"与"读哪"会出现第二种基准。`Publish`
+// 是 install 的**必需**步骤：只装本地等于绕开共享发布记录，缺接线必须失败关闭。
+// AssetsPort wires the asset commands; the root is resolved by the assembly layer and
+// Publish is mandatory for install, so a local-only install can never happen.
+type AssetsPort interface {
+	// AssetRoot 返回已经被装配层解析（绝对化）的内容寻址 bundle 根目录。
+	// AssetRoot returns the resolved content-addressed bundle root.
+	AssetRoot() string
+
+	// Publish 把一个已安装的 bundle 写进共享发布记录并推进指针，返回本次发布的
+	// `published_version_id`；实例锁与库句柄归实现侧，命令面不重复取锁。
+	// Publish writes the installed bundle into the shared record and moves the
+	// pointer; the instance lock and the database handle belong to the adapter.
+	Publish(ctx context.Context, installed assets.Installed) (publishedVersionID int64, err error)
+
+	// Build 从工作区把该 Agent 的当前定义（AGENT.md、bootstrap 文件与声明的技能发布
+	// 版本）构建成 bundle 到 `dest`。它是 `install --agent` 的前半段：工作区布局与
+	// 共享发布记录都由实现侧读，命令面不感知。
+	// Build assembles the agent's current definition from the workspace into dest; it
+	// is the first half of install --agent, and the adapter owns all the reading.
+	Build(ctx context.Context, agent, dest string) (assets.Manifest, error)
 }

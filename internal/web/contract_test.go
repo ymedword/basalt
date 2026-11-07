@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -385,8 +386,12 @@ var goCodeDeclaration = regexp.MustCompile(`(?m)^\s*(code[A-Z][A-Za-z]*)\s*=\s*"
 // contractErrorCodes 解析契约 §8 的错误码表（`| 状态 | `CODE` | …`），返回
 // 码字面量 → HTTP 状态。成功码 OK 也在表内，调用方按需剔除；表不可解析直接失败
 // ——结构漂移不得静默变成"没有错误码可对账"。
-// contractErrorCodes parses the §8 table into code → HTTP status; a structural
-// drift fails instead of silently yielding an empty map.
+//
+// 一个码可以占两行（`RESOURCE_VERSION_MISMATCH` 409 + 503，评审 IDX-15）：状态按
+// 升序以 `/` 连接成 `"409/503"`，判据是"码集合 + 每个码的全部状态"而不是"表行集合"
+// ——重复行合并、缺行仍红。
+// contractErrorCodes parses the §8 table into code → HTTP status; a code may own two
+// rows, whose statuses are joined in ascending order (`"409/503"`).
 func contractErrorCodes(t *testing.T) map[string]string {
 	t.Helper()
 	root, err := os.OpenRoot("../../docs/contracts")
@@ -395,27 +400,38 @@ func contractErrorCodes(t *testing.T) map[string]string {
 	raw, err := root.ReadFile("run-and-errors.md")
 	require.NoError(t, err)
 
-	contract := map[string]string{}
+	statuses := map[string][]string{}
 	for _, line := range strings.Split(string(raw), "\n") {
 		if m := errorCodeRow.FindStringSubmatch(line); m != nil {
-			contract[m[2]] = m[1]
+			statuses[m[2]] = append(statuses[m[2]], m[1])
 		}
 	}
-	require.NotEmpty(t, contract, "契约 §8 错误码表必须可解析——结构漂移不得静默跳过")
+	require.NotEmpty(t, statuses, "契约 §8 错误码表必须可解析——结构漂移不得静默跳过")
+	contract := make(map[string]string, len(statuses))
+	for code, rows := range statuses {
+		sort.Strings(rows)
+		contract[code] = strings.Join(rows, "/")
+	}
 	return contract
 }
 
-// TestContract_ErrorCodes 逐个断言本包产生的 40 个错误码及其 HTTP 状态（§6.3 /
+// TestContract_ErrorCodes 逐个断言本包产生的 46 个错误码及其 HTTP 状态（§6.3 /
 // run-and-errors §8，含 LIMIT_REACHED 与 R4 的凭据 / 范围 / 绑定码，不含 OK），并把
 // envelope.go 的常量集合与契约表逐条对账（等价于模块卡 §6.3 行 2247 的 grep 判据）。
 // 判据面沿革（记录在 run-state）：T016 把 US-11 的集合扩到 18 个码；R4 修订把契约表
 // 扩到 30 行后，本用例同批扩到 30；14D 契约把密钥三态 / 执行环境 / MCP 受控发布
 // 四行并入 §8 后扩到 34；US-16 的 D-42 契约冻结（2026-10-28）并入作用域 / 幂等 /
-// 已移除与三个调用方 429 共六行后扩到 40——对账口径（不得多、不得少、不得改
-// 字面量）**原样保留**，适配是扩大期望集合，不是删除断言。
+// 已移除与三个调用方 429 共六行后扩到 40；US-24 的资产 / 生命周期准入把契约表扩到
+// 45 行（`ASSET_VERSION_MISMATCH` / `AGENT_LIFECYCLE_STALE` / `AGENT_LIFECYCLE_MISMATCH`
+// / `ASSET_UNAVAILABLE` / `RESOURCE_VERSION_MISMATCH`）后同批扩到 45；T035 把 R4 原以
+// 字面量写在 handlers_flow.go 的 `FLOW_ROOT_BUSY` 收进本包常量表并补契约行，同批扩到
+// 46；US-24 收口评审 IDX-15 把 `RESOURCE_VERSION_MISMATCH` 按"准入窗口内漂移 409 /
+// 本地实例证明不成立 503"拆成两行后，契约表行 47、码仍 46，本表的状态列写成
+// `"409/503"`——对账口径（不得多、不得少、不得改字面量）**原样保留**，适配是扩大
+// 期望集合与允许一个码带两个状态，不是删除断言。
 // 逆改点：新增一个未入契约的码常量 / 改错某个码字面量 / 从契约表删掉任一码 →
 // 表比对或常量比对红。
-// The 40 codes this package produces must equal the contract table both by literal
+// The 46 codes this package produces must equal the contract table both by literal
 // and by HTTP status; the constant set in envelope.go is reconciled the same way.
 func TestContract_ErrorCodes(t *testing.T) {
 	contract := contractErrorCodes(t)
@@ -455,6 +471,10 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeExecutionProfileMismatch", codeExecutionProfileMismatch, "409"},
 		{"codeIdempotencyConflict", codeIdempotencyConflict, "409"},
 		{"codeMCPApplySuperseded", codeMCPApplySuperseded, "409"},
+		{"codeAssetVersionMismatch", codeAssetVersionMismatch, "409"},
+		{"codeAgentLifecycleStale", codeAgentLifecycleStale, "409"},
+		{"codeAgentLifecycleMismatch", codeAgentLifecycleMismatch, "409"},
+		{"codeFlowRootBusy", codeFlowRootBusy, "409"},
 		{"codeGone", codeGone, "410"},
 		{"codeMCPApplyFailed", codeMCPApplyFailed, "500"},
 		{"codePreconditionFailed", codePreconditionFailed, "412"},
@@ -466,9 +486,11 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeInternal", codeInternal, "500"},
 		{"codeNotConfigured", codeNotConfigured, "503"},
 		{"codeCredentialUnavailable", codeCredentialUnavailable, "503"},
+		{"codeAssetUnavailable", codeAssetUnavailable, "503"},
+		{"codeResourceVersionMismatch", codeResourceVersionMismatch, "409/503"},
 		{"codeTimeout", codeTimeout, "504"},
 	}
-	require.Len(t, produced, 40, "本包产生契约 §8 的全部 40 个错误码（不含 OK）")
+	require.Len(t, produced, 46, "本包产生契约 §8 的全部 46 个错误码（不含 OK）")
 
 	byCode := make(map[string]string, len(produced))
 	byName := make(map[string]string, len(produced))
@@ -1102,9 +1124,12 @@ func TestContract_PersistenceShapeNotSerialized(t *testing.T) {
 // R3 阶段 US-12 **唯一**新增的码是 IMPORT_REJECTED，且在契约 §8 里是 400；R4 修订
 // 又把凭据 / 范围 / 绑定的十条并入契约表，本用例的常量数量随之到 30；14D 契约再并入
 // 密钥三态 / 执行环境 / MCP 受控发布四行到 34；US-16 的 D-42 契约冻结（2026-10-28）
-// 再并入作用域 / 幂等 / 已移除与三个调用方 429 共六行到 40。各轮都遵守同
-// 一条纪律：US-11 已产出的码 HTTP 状态不漂移（M6 的复用清单），envelope.go 的常量
-// 声明集合与契约表（OK 除外）**逐条**对上，不得出现未入契约的码，也不得少一条。
+// 再并入作用域 / 幂等 / 已移除与三个调用方 429 共六行到 40；US-24 的资产 / 生命周期
+// 准入五行到 45；T035 把 `FLOW_ROOT_BUSY` 从 handlers_flow.go 的字面量收进常量表到 46。
+// 各轮都遵守同一条纪律：US-11 已产出的码 HTTP 状态不漂移（M6 的复用清单），
+// envelope.go 的常量声明集合与契约表（OK 除外）**逐条**对上，不得出现未入契约的码，
+// 也不得少一条。本用例与 TestContract_ErrorCodes 是同一判据的两处落点——**必须**同批
+// 扩集合（US-24 只改了一处曾让本用例红，T035 一并修正）。
 // 逆改点：改 IMPORT_REJECTED 的状态 / 字面量 / 再加一个码常量 / 删契约行 → 红。
 // 中文用例名：US-12 新增错误码与契约表对账。
 func TestContractAdmin_NewErrorCodes(t *testing.T) {
@@ -1148,7 +1173,7 @@ func TestContractAdmin_NewErrorCodes(t *testing.T) {
 	}
 	require.Equal(t, "OK", declared["codeOK"])
 	delete(declared, "codeOK")
-	require.Len(t, declared, 40, "US-16 契约落地后错误码常量恰为契约 §8 的 40 个")
+	require.Len(t, declared, 46, "US-24 / T035 契约落地后错误码常量恰为契约 §8 的 46 个")
 
 	declaredByCode := make(map[string]string, len(declared))
 	for _, code := range declared {
@@ -1336,6 +1361,41 @@ func TestContract_SaveAndAdmissionSplit(t *testing.T) {
 			"凭据码归 writeCredentialError")
 		require.False(t, s.writeCredentialError(httptest.NewRecorder(), core.ErrAgentResourceBindingMissing),
 			"绑定额归 writeBindingError")
+	})
+}
+
+// TestContract_ResourceVersionMismatchDualStatus 钉住评审 IDX-15 / IDX-21：同一个码
+// `RESOURCE_VERSION_MISMATCH` 有两个状态，判定依据是**错误形态**而不是文案——
+//   - 准入事务内复查抛出的裸 sentinel（core 以 `fmt.Errorf("start run ledger row: %w")`
+//     上抛，从未包进 `*ResourceUnavailableError`）→ 409：这一笔固定的是过期事实，
+//     重试即可，被拒请求零占用；
+//   - 被 `*core.ResourceUnavailableError` 包装的本地实例版本证明失败（含 MCP 尚无
+//     已应用版本）→ 503：修复入口是重启服务 / 重新发布资源。
+//
+// 逆改点：两分支合并回单一状态 / 用字符串匹配代替 `errors.As` / 把 409 的实现也包进
+// `ResourceUnavailableError` → 对应断言红。
+// 中文用例名：资源版本不一致的双状态（IDX-15 / IDX-21）。
+func TestContract_ResourceVersionMismatchDualStatus(t *testing.T) {
+	s := newTestServer(t, nil)
+	ledgerDrift := fmt.Errorf("start run ledger row: %w", core.ErrResourceVersionMismatch)
+	instanceProof := &core.ResourceUnavailableError{
+		Name:   "alpha",
+		Reason: "published resource version unavailable; re-run the baseline or republish",
+		Cause:  fmt.Errorf("%w: 模型连接 alpha 重建后仍与目标版本不一致", core.ErrResourceVersionMismatch),
+	}
+
+	t.Run("准入窗口内漂移", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		s.writeRunError(rec, ledgerDrift, context.Background())
+		require.Equal(t, http.StatusConflict, rec.Code, "裸 sentinel 是 409：重试这一笔，不去修本地实例")
+		require.Equal(t, codeResourceVersionMismatch, decodeAuthEnvelope(t, rec).Code)
+	})
+
+	t.Run("本地实例版本证明不成立", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		s.writeRunError(rec, instanceProof, context.Background())
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code, "包装形态是 503：修复入口在本地实例 / 发布状态")
+		require.Equal(t, codeResourceVersionMismatch, decodeAuthEnvelope(t, rec).Code)
 	})
 }
 

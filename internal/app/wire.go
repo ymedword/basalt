@@ -392,21 +392,19 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil, abortRuntime(err, db, lock)
 	}
 
-	// ④ 崩溃恢复两段，都在开跑之前、都在同一把锁之下：账本侧（半截工具组 + 陈旧运行）与
-	// 工作区侧（目录交换残留）。第 6 步的启动摘要——"这次启动修了什么"——由下面这条 INFO
-	// 一句话答出（契约 §4.3.2 第 6 步）。
-	report, err := db.Recover(ctx, logger, a.nowOr()())
-	if err != nil {
-		return nil, abortRuntime(fmt.Errorf("崩溃恢复扫描: %w", err), db, lock)
-	}
+	// ④ 启动只做**工作区侧**残留判定（目录交换残留）。账本侧**不再**在这里全局扫描：
+	// 多 Worker 下启动时可能有别的活实例在写库，按"跑得久 / 心跳旧"推断死亡会改写别人的
+	// 在跑行（FR-24-02 / C-06）。账本恢复改为只作用于**合法领取的过期租约**，由
+	// `startWorkerRuntime` 的首轮 `Reclaimer.ReclaimOnce` 完成（图 1）。
+	// Startup only settles workspace residue here. Ledger recovery is no longer a global
+	// scan: with multiple workers it would rewrite live rows. Recovery is scoped to
+	// legitimately claimed expired leases and runs as the first ReclaimOnce of the worker.
 	residue, err := workspace.RecoverWorkspaceResidue(root, logger)
 	if err != nil {
 		return nil, abortRuntime(fmt.Errorf("工作区残留判定: %w", err), db, lock)
 	}
-	logger.Info("重路径：崩溃恢复完成", "step", stepRecover,
-		"unknowns", report.Unknowns, "repaired_groups", report.RepairedGroups,
-		"closed_runs", report.ClosedRuns, "rolled_back", residue.RolledBack,
-		"rolled_forward", residue.RolledForward)
+	logger.Info("重路径：工作区残留判定完成", "step", stepRecover,
+		"rolled_back", residue.RolledBack, "rolled_forward", residue.RolledForward)
 
 	// 记忆门面（US-6，位置在 ④ 与 ⑤ 之间——颗粒度文档 §3.1）：载体恒为 PostgreSQL
 	// （D-18），门面**一个实例喂两个消费面**——工具侧（写路径）与运行入口的段 2
@@ -580,7 +578,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		RuntimeRoot:   a.builtinRuntimeRootOr(),
 		Fresh:         a.freshInstance,
 		WorkflowKnown: func(name string) (bool, error) {
-			record, valid, reason, readErr := versions.LifecycleIndex(ctx, name)
+			record, valid, reason, readErr := versions.ReadLifecycleIndex(ctx, name)
 			return valid || record.Generation != 0 || reason != "", readErr
 		},
 		LookupEnv: os.LookupEnv,
@@ -707,6 +705,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 版本目录与工作副本的形态因此只有一个来源。
 	// One skill library shared by the baseline, admission and the published snapshot.
 	skills := workspace.NewSkillLibrary(root)
+	// 资产根（US-24 §2.3.9）：`assets.bundle_root` 的相对路径按**进程工作目录**解析，
+	// 与工作区根同一基准——缺省值因此落在 `<workDir>/.basalt/assets`，安装目录是
+	// `<assetRoot>/bundles/<agent>/<hash>`。空值不在这里兜底：配置校验已拒绝空串
+	// （`validateDistributedConfig`），这里的缺省只覆盖"没有配置文件"的零值装配。
+	// The asset root resolves against the process working directory, the same base as
+	// the workspace; an empty value only appears in a zero-value test assembly.
+	bundleRoot := resolveAssetBundleRoot(cfg, a.workDir)
 	if err := runBaseline(ctx, BaselineDeps{
 		Operations: ops,
 		Resources:  versions,
@@ -722,6 +727,21 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	}
 	logger.Info("重路径：启动基线完成", "step", stepBaseline,
 		"providers", len(providerDefs), "mcp", len(mcpDefs), "agents", len(entries))
+
+	// 资产自举（US-24 §2.3.9 启动自举）：只在"共享发布记录在、本地 hash 目录缺"且本地
+	// 代次与共享索引**相等**时按记录重建；不发布、不改索引、不覆盖既有目录，单个 Agent
+	// 失败只 WARN 不阻塞启动。这里**不带 `step` 键**：启动步骤清单是已定判据，自举不是
+	// 新步骤，也不是一次独立的恢复扫描。
+	// The asset bootstrap never publishes, never touches the index and never blocks
+	// startup; it deliberately carries no "step" key.
+	bootstrapAgentBundles(ctx, assetBootstrapDeps{
+		Root:      root,
+		AssetRoot: bundleRoot,
+		Versions:  versions,
+		Lifecycle: lifecycle,
+		Agents:    entries,
+		Logger:    logger,
+	})
 
 	// 管理面恢复（图 A ④ / 约束 38）：基线自己若留下 pending 行，它已在上一段收口；
 	// 其余按动作组查证，判定不了的标 unknown 并**保留原样**——重放一次停用会让 generation
@@ -1049,10 +1069,29 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	sessions := postgres.NewSessionStore(db)
 	invocations := postgres.NewToolInvocationRepo(db)
 	llmCalls := postgres.NewLLMCallRepo(db)
+	// Worker 身份在装配期生成一次（US-24 T007）：运行入口按它写租约归属，`serve` /
+	// `gateway` 的登记与心跳复用同一个实例。装配期生成而不是等登记时再生成，是因为
+	// 运行入口先于登记拿到服务对象——两处各生成一次会让租约指向一个不在
+	// `worker_nodes` 里的标识。熵源失败按启动失败处理（没有身份就不参与协调）。
+	// The identity is minted once here so admission-time lease ownership and the
+	// serve-time registration always name the same process.
+	workerIdentity, idErr := mintWorkerIdentity(cfg)
+	if idErr != nil {
+		return nil, abortRuntime(idErr, db, lock)
+	}
+	workerCfg := workerSettings(cfg)
 	// 运行账本只建一次：AgentService 写、web.RunService 适配器读，同一实例保证
 	// "读到的"就是"写下的"（两条连接池之间的影子账本会让排障无从对齐）。
-	// One run store is shared by the writer (AgentService) and the reader (the web port).
-	runs := postgres.NewRunStore(db)
+	// 租约 TTL 与续约循环取**同一份** `worker.lease_ttl_seconds`：仓储按它判过期、
+	// keeper 按它续约，两边不同源会让本进程在自己仍执行时被判过期。
+	// One run store is shared by the writer (AgentService) and the reader (the web port);
+	// its lease TTL is the same value the keeper renews against.
+	runs := postgres.NewRunStoreWithLeaseTTL(db, workerCfg.LeaseTTL())
+	// 执行租约仓储只建一次（US-24）：运行入口写 run 租约、调度器写 schedule_execution
+	// 租约，两者共用同一个实例（类型无状态，共用保证的是"装配面只有一处构造"与同一份
+	// TTL / 续约节奏，见下面两处接线）。
+	// One lease store serves both run leases and schedule_execution leases.
+	leases := postgres.NewLeaseStore(db)
 	// 受控自我进化（US-22 §3.1.8）：**同一个**仓储实例同时喂抽取服务（写路径）与
 	// 只读状态面（读路径）——列表读到的行就是钩子刚提交的那行，不存在两套账。
 	// 未启用时钩子在首行返回：零写入、零模型调用；管理面仍可读出「已关闭」的状态。
@@ -1119,7 +1158,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		observationMetrics = observability.NewMetricsCollector(observationStore, a.nowOr())
 		db.ObserveAuditWriteFailures(func() { observationMetrics.IncCounter("obs_audit_write_failures_total", nil) })
 	}
-	diagRecorder, diagReader, err := newDiagnosticsPortsWithMetrics(cfg.Diagnostics, db, a.nowOr(), logger, observationMetrics)
+	diagRecorder, diagReader, err := newDiagnosticsPortsWithMetrics(cfg.Diagnostics, db, workerIdentity, a.nowOr(), logger, observationMetrics)
 	if err != nil {
 		return fail(err)
 	}
@@ -1148,7 +1187,26 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	})
 	// 运行准入（取名额 / 归还 / panic 收口）只装配这一份，web 入口与调度器共用。
 	// The one admission object shared by the web entry and the scheduler.
-	admission := &runAdmission{limiter: runLimiter, logger: logger, diag: diagRecorder}
+	// inflight 是 `worker.max_inflight` 的池化名额（US-24 T026）：三条执行路径共用
+	// 这一份，配置校验保证 dispatch_batch + flows.max_active 不超过它。
+	// One pooled budget for the three execution paths; config keeps it large enough.
+	// 准入解析器只建一次（US-24）：入口的 [4] 预检与 `core.AgentService` 的 [4] /
+	// `StartRun` 事务复查必须读**同一份**限额投影，另建一份会让同一次准入在两个判据点
+	// 看到不同的 max_concurrent。`reserved`（交互预留）由下面的 `flowConfig` 补填——
+	// 它在本段之后才派生，两处都写在同一个变量上。
+	// One resolver serves the entry precheck and the core precheck / in-tx recheck.
+	admissionResolver := &callerAdmissionResolver{
+		limits:              concurrencyLimit,
+		localAdminUnlimited: cfg.Callers.LocalAdmin.UnlimitedEnabled(),
+	}
+	admission := &runAdmission{
+		limiter:   runLimiter,
+		inflight:  newInflightLimiter(workerCfg.MaxInflight),
+		runs:      runs,
+		admission: admissionResolver,
+		logger:    logger,
+		diag:      diagRecorder,
+	}
 	// 知识库与历史回查接线（US-16 T099 前置）：领域对象必须在压缩接线**之前**落地——
 	// 压缩的来源闸门要用知识库的有效性判定，而读面（来源视图 / 引用有效性）用的必须是
 	// **同一个** `SourceViewer`，两处判定才不可能分叉。embedding 未配置时装配照常成功，
@@ -1271,9 +1329,11 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil, abortRuntime(err, db, lock)
 	}
 	admission.flowReservedPerCaller = flowConfig.InteractiveReservedPerCaller
+	// 入口预检与 core 预检 / 事务复查共用同一个交互预留（见上面 resolver 的说明）。
+	admissionResolver.reserved = flowConfig.InteractiveReservedPerCaller
 	// Exactly the same resolver and snapshot builder feed ordinary Run and Flow
 	// pin validation; all credential/lifecycle/resource gates remain shared.
-	runResources := NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate, AdmissionDeps{Identities: versions, NotifyAdmin: notifyAdminStore, Channels: channels, Bindings: bindingStore, Credentials: resolver, CredentialPins: resolver, Checkpoint: checkpoint, Diagnostics: diagRecorder})
+	runResources := NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate, AdmissionDeps{Identities: versions, NotifyAdmin: notifyAdminStore, Channels: channels, Bindings: bindingStore, Credentials: resolver, CredentialPins: resolver, Checkpoint: checkpoint, Diagnostics: diagRecorder, Assets: newAssetVerifier(versions, bundleRoot), Rebuild: newLocalRebuilder(versions, catalogStore, resolver, mcpRT, mcpCredentials)})
 	runSnapshots := newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr())
 	service := core.NewAgentService(core.ServiceOptions{
 		FlowRunsReady:               flowConfig.Enabled,
@@ -1321,12 +1381,29 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 并发上限接线（US-9 约束 31）：0 / 未配置由 core 落缺省 32，负数已在装载期拒绝。
 		// The cap is wired explicitly; zero falls back to core's single default.
 		MaxConcurrent: cfg.Server.MaxConcurrentRuns,
+		// 调用方并发判定输入（US-24 T013）：与上面的名额表共用**同一份**限额投影，
+		// 预检与 `StartRun` 事务内权威复查因此不会各读一套上限值；内置不限量管理员
+		// 与限制器持同一开关（`Enabled=false` 只表示不占桶）。
+		// The resolver shares the very limit projection the slot table reads, so the
+		// precheck and the in-transaction recheck can never disagree about the limit.
+		Admission: admissionResolver,
 		// Run 级任务次数（N-01 / 图 6 [5] 的 ClassRun 一支）：与 [3] 并发名额、[5] 对话
 		// 记账共用**同一个**限制器实例（C-35）——另建一个会让同一调用方在准入与记账
-		// 各拿一份限额视图，超额放行且诊断面对不上账。
-		// The run-level task count shares the one limiter; a second instance would fork
-		// the caller's limit view between admission and accounting.
+		// 各拿一份限额视图，超额放行且诊断面对不上账。US-24 P-12 起准入路径的记账已
+		// 迁进 `StartRun` 事务（`chargeRunTaskQuotaTx`），这里的端口保留为 Flow 准入的
+		// 前置与 `core.RunQuota` 的公开形状；两条记账路径不得同时生效（见 run_quota.go）。
+		// The run-level task count shares the one limiter; since P-12 the admission charge
+		// commits inside StartRun's transaction and this port stays for Flow readiness.
 		RunQuota: newRunQuota(runLimiter, diagRecorder, logger),
+		// 执行权（US-24 T007）：每次 Run 的账本事务写租约归属，运行期由 keeper 按
+		// `worker.*` 的周期续约；失权后执行上下文被取消，受保护写入再由仓储逐笔拒绝。
+		// 时长与 `runs` 的租约 TTL 同源（上面同一个 `workerCfg`）。
+		// The lease owner, renewal port and durations: the TTL is the same value the run
+		// store uses, so admission and renewal cannot disagree about expiry.
+		Worker:        workerIdentity,
+		Leases:        leases,
+		RenewInterval: workerCfg.RenewInterval(),
+		LeaseTTL:      workerCfg.LeaseTTL(),
 	})
 
 	observation.History = postgres.NewHistoryRetentionStore(db, observationConfig.Export.Enabled)
@@ -1390,10 +1467,18 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		return nil
 	}
 	flowSources := flowSourceValidity{viewer: knowledgeWire.Source, store: flowStore}
-	flowRunner := &flowNodeRunner{service: service, admission: admission, store: flowStore, authority: flowAuthority, sources: flowSources, collections: postgres.NewKnowledgeAuthz(db, agents), schemas: flowSchemas, writeReady: true}
-	flowService := &flow.Service{Repository: flowStore, Definitions: flowStore, Schemas: flowSchemas, Authority: flowAuthority, Runner: flowRunner, Config: flowConfig, Now: a.nowOr(), Logger: logger, Outputs: flowOutputChecker{store: flowStore, sources: flowSources}, Verification: &flow.VerificationService{Schemas: flowSchemas, Sources: flowSources, Support: flowSourceValueSupport{viewer: knowledgeWire.Source, sources: flowSources, check: flowAuthority.checkSourceProof}}, Operations: ops}
-	flowRuntime := &flowRuntime{service: flowService, store: flowStore, runner: flowRunner, logger: logger, authReady: make(chan struct{}), publisher: &flow.Publisher{Definitions: flowStore, Operations: ops, Validator: &flow.ContractValidator{Schemas: flowSchemas, Resolver: flowAuthority, WriteGate: true}}}
-	flowRuntime.worker = &flow.Worker{Service: flowService, Repository: flowStore, Logger: logger, Startup: func(ctx context.Context) error {
+	flowRunner := &flowNodeRunner{service: service, admission: admission, store: flowStore, authority: flowAuthority, sources: flowSources, gate: postgres.NewSubtreeGate(db), collections: postgres.NewKnowledgeAuthz(db, agents), schemas: flowSchemas, writeReady: true}
+	// Identity / Leases / LeaseTTL 是管理面"零 token 自取根租约"的装配面（US-24 §3.1.6）：
+	// resume / revise 的请求里没有租约来源，写 Queued 时由 withRootLease 用这三项自取。
+	// The management path self-acquires the flow-root lease through these three fields.
+	flowService := &flow.Service{Repository: flowStore, Definitions: flowStore, Schemas: flowSchemas, Authority: flowAuthority, Runner: flowRunner, Config: flowConfig, Now: a.nowOr(), Logger: logger, Outputs: flowOutputChecker{store: flowStore, sources: flowSources}, Verification: &flow.VerificationService{Schemas: flowSchemas, Sources: flowSources, Support: flowSourceValueSupport{viewer: knowledgeWire.Source, sources: flowSources, check: flowAuthority.checkSourceProof}}, Operations: ops, Identity: workerIdentity, Leases: leases, LeaseTTL: workerCfg.LeaseTTL()}
+	flowRuntime := &flowRuntime{service: flowService, store: flowStore, runner: flowRunner, logger: logger, workerGrace: workerCfg.ShutdownGrace(), authReady: make(chan struct{}), publisher: &flow.Publisher{Definitions: flowStore, Operations: ops, Validator: &flow.ContractValidator{Schemas: flowSchemas, Resolver: flowAuthority, WriteGate: true}}}
+	// 根推进的执行权（US-24 §3.1.7）：Identity 是领取者，Leases 是领取 / 续约 / 交还
+	// 的端口，Gate 是跨 Worker 三判据，ReleaseCtx 给出交还时的剩余停机预算。
+	// 构造仍不启动；首轮与循环由 startWorkerRuntime 在 serve / gateway 上启动。
+	// The root-advancement authority: identity, lease port, durable subtree gate, and
+	// the remaining shutdown budget used when a lease is handed back.
+	flowRuntime.worker = &flow.Worker{Service: flowService, Repository: flowStore, Identity: workerIdentity, Leases: leases, Gate: postgres.NewSubtreeGate(db), LeaseTTL: workerCfg.LeaseTTL(), RenewInterval: workerCfg.RenewInterval(), ReleaseCtx: flowRuntime.releaseCtx, Logger: logger, Startup: func(ctx context.Context) error {
 		select {
 		case <-flowRuntime.authReady:
 		case <-ctx.Done():
@@ -1406,10 +1491,40 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		}
 		return nil
 	}}
+	// 停机编排（US-24 T026 / 图 11）：三段预算全部来自配置——`worker.shutdown_grace`
+	// 是总上界，`flows.shutdown_grace` 是排空上界（含它自己的 cancel_wait），
+	// `flows.cancel_wait` 是取消后 join 的基值。配置校验保证 35+5 ≤ 45 ≤ 70−5。
+	// The figure-11 budgets come from config; validation keeps 35+5 ≤ 45 ≤ 70−5.
+	shutdownCoord := newShutdownCoordinator(workerCfg.ShutdownGrace(),
+		time.Duration(flowConfig.ShutdownGraceSeconds)*time.Second,
+		time.Duration(flowConfig.CancelWaitSeconds)*time.Second, logger)
+	// 回收器（US-24 T017 / §2.3.5 图 5）：装配在这里是**固定位置**——它同时需要 Flow
+	// 服务（A3 里根状态的唯一判定者）与租约端口；两样都在上面就绪后立即构造。构造本身
+	// 不启动任何循环，首轮与循环由 `startWorkerRuntime` 在 serve / gateway 上启动。
+	// 装配失败即整条重路径失败：半套装配会让"领到了却交还不了"变成静默租约泄漏。
+	// The reclaimer is assembled once here, after the flow service and the lease port;
+	// construction starts nothing, and a partial assembly aborts the heavy path.
+	reclaimer, reclaimErr := newLeaseReclaimer(reclaimerDeps{
+		DB:       db,
+		Flows:    flowService,
+		Leases:   leases,
+		Worker:   workerIdentity,
+		Logger:   logger,
+		Now:      a.nowOr(),
+		LeaseTTL: workerCfg.LeaseTTL(),
+		Learning: learningRepo,
+		// A1 的未重放动作要挂回 Run 时间线（§2.3.5 A1）；同一个诊断写入器与运行路径
+		// 共用实例，读到的就是刚写下的那批事件。
+		Diagnostics: diagRecorder,
+	})
+	if reclaimErr != nil {
+		return nil, abortRuntime(reclaimErr, db, lock)
+	}
 	scheduler := a.newScheduler(postgres.NewTaskStore(db),
 		&admittedRunInvoker{inner: service, admission: admission},
-		agents.Entries(), delivery,
-		lifecycleScheduleGate(lifecycle), cfg, logger, ownerKeys, adminPosture)
+		agents.Entries(), delivery, runs,
+		lifecycleScheduleGate(lifecycle), cfg, logger, ownerKeys, adminPosture,
+		leases, workerIdentity)
 	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
 	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
 	// 适配器同时保留在运行期上：配置热加载的调度联动必须走**同一实例**（约束 39 的
@@ -1490,6 +1605,22 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Resources:   versions,
 		NotifyAdmin: notifyAdminStore,
 		Projection:  projection,
+		// 资产发布面（US-24 §2.3.9 / FR-24-25）：创建 / 提交 / 复制 / 恢复成功之后把
+		// **落盘后的定义**构建成内容寻址 bundle 并推进共享指针——准入因此总能读到与本机
+		// 定义一致的资产；运行中的 Run 仍固定在开始时那个哈希目录（FR-24-42）。构建与
+		// 发布与 `basalt assets install --agent` 是同一份实现，不新增协议。
+		// The console write path publishes the committed definition through the same chain
+		// as `assets install --agent`.
+		PublishBundle: func(ctx context.Context, agent string) (int64, error) {
+			return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
+				Root:       root,
+				BundleRoot: bundleRoot,
+				Versions:   versions,
+				Operations: ops,
+				Logger:     logger,
+				Now:        now,
+			}, agent)
+		},
 	})
 	// 公共资源写面（颗粒度文档 §3.1.7 / 图 B）：版本仓储、管理操作仓储、发布 / 准入闸门
 	// 与上文是**同一份**共享实例，运行期目录以原子持有者共享——发布在写锁内替换后，新
@@ -1643,6 +1774,9 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		networkExceptions: networkExceptions,
 		execPolicy:        executionPolicy,
 		scheduler:         scheduler,
+		shutdown:          shutdownCoord,
+		workerIdentity:    workerIdentity,
+		reclaimer:         reclaimer,
 		adminPosture:      adminPosture,
 		scheduleSlot:      scheduleSlot,
 		scheduleEditor:    scheduleEditor,
@@ -1667,6 +1801,7 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		notifyAdmin:       notifyAdmin,
 		channelRead:       channelRead,
 		catalogStore:      catalogStore,
+		bundleRoot:        bundleRoot,
 		// US-16 知识与历史两条链路的装配产物：web 的八个消费方端口由 `webOptions` 里的
 		// `wireKnowledgePorts` 逐槽位投影；压缩读面的链目录也在这里（与压缩写面同一个
 		// `CompactionStore` 实例，读到的就是刚写下的链）。
@@ -2040,6 +2175,31 @@ type heavyRuntime struct {
 	// before the database closes.
 	scheduler *core.Scheduler
 
+	// worker 是 `serve` / `gateway` 的 Worker 身份与诊断心跳（US-24 T006）：只有进入
+	// 调度分支才登记；chat / tool / secrets 不登记、不参与多 Worker 协调。停机时在
+	// 调度器停止之后、库关闭之前标记下线（图 1 的次序）。
+	// worker is the serve/gateway identity and diagnostic heartbeat; nil for chat/tool.
+	// It stops after the scheduler and before the database closes.
+	worker *workerRuntime
+
+	// shutdown 是图 11 的停机预算与退出点（US-24 T026）。只有 `worker != nil` 的
+	// serve / gateway 走编排路径；chat / tool 与各测试夹具继续用原来的释放顺序。
+	// shutdown carries the figure-11 budgets; only serve/gateway (worker != nil) use it.
+	shutdown *shutdownCoordinator
+
+	// workerIdentity 是装配期生成一次的进程身份（US-24 T007）：运行入口按它写租约
+	// 归属，`startWorkerRuntime` 注册与心跳复用同一个值。chat / tool 也持有它——运行
+	// 租约照样写上，崩溃后的回收因此不区分触发源；只是不登记 `worker_nodes`。
+	// workerIdentity is the assembly-time identity shared by run leases and the serve
+	// registration; chat/tool hold it too but never register.
+	workerIdentity core.WorkerIdentity
+
+	// reclaimer 是重路径上**唯一**的回收器实例（US-24 T017 / §2.3.5 图 5）：首轮与
+	// 循环都由 `startWorkerRuntime` 取得它后启动。构造不启动；chat / tool 不启动任何
+	// 循环——它们没有协调身份，跑回收只会替别的 Worker 做没有归属依据的收尾。
+	// reclaimer is the one heavy-path reclaim implementation; only serve/gateway start it.
+	reclaimer core.Reclaimer
+
 	// adminPosture 是启动期管理认证姿态的发布盒（T027 / §2.14）：web 面在监听成功后
 	// 写入，调度器经它迟绑定读取——`unavailable` 时 admin-builtin 后台任务不再执行。
 	// adminPosture carries the startup posture from the web face to the scheduler.
@@ -2189,6 +2349,13 @@ type heavyRuntime struct {
 	root   string
 	loader *workspace.AgentLoader
 
+	// bundleRoot 是 `assets.bundle_root` 解析后的内容寻址资产根（US-24 §2.3.9）：装配
+	// 期算一次，准入校验与包外发布入口（评测基座）读的是**同一个**绝对路径——两处各
+	// 拼一次会让"装在哪"与"读哪"分叉（FR-24-44）。
+	// bundleRoot is the resolved content-addressed asset root shared by admission and
+	// the out-of-package publish entry.
+	bundleRoot string
+
 	// 以下为 US-9 追加的只读装配态（均为既有局部值的保留，不新增读取）：
 	// US-9 retains the read-only assembly state computed above.
 	//
@@ -2255,7 +2422,22 @@ type heavyRuntime struct {
 // 子进程与会话，最后才关写池的使用者（库），锁等所有写入收尾之后才松开。每处失败
 // 并入同一条错误链，释放失败不得静默。
 // Close releases in reverse order — watcher, scheduler, MCP pool, database, lock.
+//
+// US-24 T026：`serve` / `gateway`（`worker != nil`）走图 11 的编排路径
+// （`closeCoordinated`，含预算、取消后 join 与超界直接退出）；chat / tool 与测试
+// 夹具保持原来的释放顺序，行为不变。
+// Serve/gateway run the coordinated figure-11 shutdown; everything else keeps the
+// historical release order.
 func (r *heavyRuntime) Close() error {
+	if r.shutdown != nil && r.worker != nil {
+		return r.closeCoordinated()
+	}
+	return r.closeLegacy()
+}
+
+// closeLegacy 是 chat / tool 与测试夹具的释放顺序（US-24 之前的行为，逐字保留）。
+// closeLegacy is the historical release order, unchanged.
+func (r *heavyRuntime) closeLegacy() error {
 	var errs []error
 	if r.flows != nil {
 		errs = append(errs, r.flows.Close())
@@ -2268,6 +2450,12 @@ func (r *heavyRuntime) Close() error {
 	}
 	if r.scheduler != nil {
 		r.scheduler.Stop()
+	}
+	// Worker 下线标记在调度器停止之后、库关闭之前：先不再领取，再写下线，最后关连接
+	// （模块卡图 1 的停机次序；心跳只为诊断，失败并入错误链但不回滚停机）。
+	// Mark the worker stopped after the scheduler and before the database closes.
+	if r.worker != nil {
+		errs = append(errs, r.worker.Stop(context.Background()))
 	}
 	if r.mcpSupervisor != nil {
 		errs = append(errs, r.mcpSupervisor.Close())
@@ -2297,121 +2485,70 @@ func (r *heavyRuntime) sessionLister() cli.SessionLister { return sessionListerP
 // tools hands the assembly-time registry to the command surface's tool-listing port.
 func (r *heavyRuntime) tools() cli.ToolLister { return toolListerPort{registry: r.registry} }
 
-// runCancellerAdapter 把运行账本与运行入口适配成 Agent 写面的在途 Run 端口（约束 32 ③）：
-// 归档编排只认三个语义——快照在途 Run、尽力送达取消信号、在有界窗口内等它们退出。适配器
-// 不复制任何循环逻辑：取消之后由谁把 Run 写成终态仍归 `ReActLoop`（宪法 2），`Cancel` 本身
-// 从不写终态。
+// runCancellerAdapter 把运行账本与运行入口适配成 Agent 写面的归档端口（约束 32 ③ / 图 8
+// 的 [3][4]）：快照四条完成判据、尽力送达取消信号。适配器不复制任何循环逻辑：取消之后由谁
+// 把 Run 写成终态仍归 `ReActLoop`（宪法 2），`Cancel` 本身从不写终态；有界等待的轮询节奏
+// 归 `AgentAdmin`（同一个窗口对四条判据统一计时）。
 // runCancellerAdapter adapts the run ledger and the run service to the archive port. It
-// signals only; the loop alone writes terminal states.
+// signals only; the loop alone writes terminal states, and the bounded wait is AgentAdmin's.
 type runCancellerAdapter struct {
-	runs    *postgres.RunStore
+	// runs 是共享运行账本：残量快照与跨 Worker 取消标志都从这里读写（每条路径必填）。
+	// runs is the shared ledger; every assembly must supply it.
+	runs *postgres.RunStore
+	// service 是本进程的运行入口；nil = CLI 装配（不跑循环），CancelRun 直接写共享标志。
+	// A nil service means the CLI assembly, where cancel is a flag write.
 	service *core.AgentService
-	// poll 是等待窗口内的轮询间隔；≤0 取 runCancellerPoll（测试注入小值只为缩短用例）。
-	// poll is the polling interval inside the bounded wait window.
+	// poll 是取消信号送达后的等待上限；≤0 取 runCancellerPoll（测试注入小值只为缩短用例）。
+	// poll caps how long one cancel signal waits before returning to the caller.
 	poll time.Duration
 }
 
 const (
-	// runCancellerPoll 是等待窗口内的轮询间隔：100ms 足以让几十秒级的归档窗口及时看到退出，
-	// 又不会把一次 30 秒窗口变成上千次查询。
-	// runCancellerPoll is the polling interval inside the bounded wait window.
+	// runCancellerPoll 是单个取消信号送达后的等待上限：100ms 足以让本地循环看到标志，
+	// 又不会让逐个 Run 的信号把有界窗口撑成 N×30 秒。
+	// runCancellerPoll caps one cancel signal so N runs never spend N×30s of the window.
 	runCancellerPoll = 100 * time.Millisecond
-
-	// runCancellerListLimit 是在途快照的行数上限，与 `ListRuns` 的固定窗口上限同值（200）：
-	// 归档不为在途判定另开一条全表扫描。
-	// runCancellerListLimit mirrors the run list window cap (200).
-	runCancellerListLimit = 200
 )
 
 // 编译期断言：端口形状一旦漂移在这里先红（与 web.go 的端口断言同一纪律）。
 // Compile-time assertion: the port shape is fixed here.
 var _ RunCanceller = runCancellerAdapter{}
 
-// RunningRunIDs 从运行账本取该 Agent 仍处于 running 的行（一次快照，不等待）。过滤与排序
-// 全部走 `ListRuns` 的常量 SQL，请求侧只给值谓词。
-// RunningRunIDs snapshots the agent's running rows through the shared list query.
-func (a runCancellerAdapter) RunningRunIDs(ctx context.Context, agent string) ([]string, error) {
-	details, err := a.runs.ListRuns(ctx, core.RunFilter{
-		Agent:  agent,
-		Status: string(core.StatusRunning),
-		Limit:  runCancellerListLimit,
-	})
+// Residuals 取一次归档完成判据快照（图 8 [4] 的 ①②③④）。判定全部在存储层用常量 SQL
+// 完成：本层只做类型透传，不拼查询、不缓存（缓存会把"已达成"读成"仍残留"）。
+// Residuals snapshots the four completion predicates; the storage layer owns the SQL.
+func (a runCancellerAdapter) Residuals(ctx context.Context, agent string) (core.ArchiveResiduals, error) {
+	residuals, err := a.runs.AgentResiduals(ctx, agent)
 	if err != nil {
-		return nil, fmt.Errorf("列出 Agent %s 的在途 Run: %w", agent, err)
+		return core.ArchiveResiduals{}, fmt.Errorf("读取 Agent %s 的归档完成判据: %w", agent, err)
 	}
-	ids := make([]string, 0, len(details))
-	for _, detail := range details {
-		ids = append(ids, detail.RunID)
-	}
-	return ids, nil
+	return residuals, nil
 }
 
 // CancelRun 只负责把取消信号送达运行循环：`AgentService.Cancel` 在信号之后至多等**一个
-// 轮询间隔**（而不是它自己的 30 秒上限）——整段归档等待由 `WaitRuns` 的窗口统一计时，
-// 逐个 Run 各等 30 秒会把有界窗口撑成 N×30 秒。行已不存在（已退出并清理）视为已达成。
-// CancelRun delivers the signal and returns; the bounded wait belongs to WaitRuns.
+// 轮询间隔**（而不是它自己的 30 秒上限）——整段归档等待由 `AgentAdmin` 的窗口统一计时。
+// 行已不存在（已退出并清理）视为已达成。**非属主也可以调用**：远端 Run 的取消由属主在
+// 续约 / 检查点观察 `cancel_requested`（FR-24-22）。
+//
+// `service == nil` 是 CLI 装配：进程不跑 ReAct 循环，任何在跑 Run 都在别的 Worker 上，
+// 跨 Worker 取消的唯一合法动作就是把标志写进共享库——与 `AgentService.Cancel` 的远端
+// 分支逐字相同。取消仍**不**代替属主提交终态（宪法 2）。
+// A nil service is the CLI assembly: with no local loop every live run belongs to
+// another worker, so raising the shared flag is the only legal action.
+// CancelRun delivers the signal and returns; the bounded wait belongs to AgentAdmin.
 func (a runCancellerAdapter) CancelRun(ctx context.Context, runID string) error {
 	signalCtx, cancel := context.WithTimeout(ctx, a.interval())
 	defer cancel()
+	if a.service == nil {
+		if _, err := a.runs.RequestCancel(signalCtx, runID); err != nil && !errors.Is(err, core.ErrRunNotFound) {
+			return err
+		}
+		return nil
+	}
 	if _, err := a.service.Cancel(signalCtx, runID); err != nil && !errors.Is(err, core.ErrRunNotFound) {
 		return err
 	}
 	return nil
-}
-
-// WaitRuns 在 ctx 窗口内轮询运行账本，返回窗口结束时仍未退出的标识。**到期不是错误**：
-// 剩余集合就是等待结果，调用方据此判 409 并回滚（约束 32 ③）；只有查询失败才上抛。
-// WaitRuns polls within the window; an expired window is a result, not an error.
-func (a runCancellerAdapter) WaitRuns(ctx context.Context, runIDs []string) ([]string, error) {
-	pending := append([]string(nil), runIDs...)
-	if len(pending) == 0 {
-		return nil, nil
-	}
-	ticker := time.NewTicker(a.interval())
-	defer ticker.Stop()
-	for {
-		remaining, err := a.aliveRuns(ctx, pending)
-		if err != nil {
-			return nil, err
-		}
-		if len(remaining) == 0 {
-			return nil, nil
-		}
-		pending = remaining
-		select {
-		case <-ctx.Done():
-			return pending, nil
-		case <-ticker.C:
-		}
-	}
-}
-
-// aliveRuns 逐个读当前状态：终态或行已不存在算已退出，running 算在途。窗口到期与查询判定
-// 竞争时**期限断言优先**（按未退出计），其余查询失败如实上抛。
-// aliveRuns classifies each run as exited or alive; an expired window wins over a read.
-func (a runCancellerAdapter) aliveRuns(ctx context.Context, runIDs []string) ([]string, error) {
-	alive := make([]string, 0, len(runIDs))
-	for _, runID := range runIDs {
-		if ctx.Err() != nil {
-			alive = append(alive, runID)
-			continue
-		}
-		detail, err := a.runs.GetRun(ctx, runID)
-		switch {
-		case err == nil:
-			if detail.Status == core.StatusRunning {
-				alive = append(alive, runID)
-			}
-		case errors.Is(err, core.ErrRunNotFound):
-			// 行已不存在：账本清理与退出同源，按已退出处理。
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			// 窗口到期打断本次读取：按未退出计，由调用方判 409。
-			alive = append(alive, runID)
-		default:
-			return nil, fmt.Errorf("读取 Run %s 的状态: %w", runID, err)
-		}
-	}
-	return alive, nil
 }
 
 // interval 给未注入轮询间隔的装配一个缺省值。

@@ -76,15 +76,24 @@ func newKeyOwnerHarness(t *testing.T) *keyOwnerHarness {
 		now:     time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC),
 	}
 	h.sched = core.NewScheduler(core.SchedulerOptions{
-		Store:      h.tasks,
-		Invoker:    h.invoker,
-		Entries:    []core.AgentEntry{{Name: schedOwnerAgent, Registered: true}},
-		OwnerKeys:  callers.NewKeyVerifier(keys),
-		Budget:     core.Budget{MaxIterations: 10},
-		RunTimeout: time.Minute,
-		StopGrace:  time.Minute,
-		Logger:     slog.New(slog.DiscardHandler),
-		Now:        func() time.Time { return h.now },
+		Store:     h.tasks,
+		Invoker:   h.invoker,
+		Entries:   []core.AgentEntry{{Name: schedOwnerAgent, Registered: true}},
+		OwnerKeys: callers.NewKeyVerifier(keys),
+		// US-24：调度器必须具备执行权装配（租约仓储 + 进程身份 + 时长），否则
+		// RunNow 与到期扫描一律 fail-closed（errSchedulerNoLeases）。夹具按真实
+		// 装配注入，让"再绑定后下一次触发可执行"这条判据走的是产品的领取事务。
+		// US-24: the scheduler needs the lease wiring; the fixture injects it like
+		// production so the rebind check exercises the real claim transaction.
+		Leases:        postgres.NewLeaseStore(db),
+		Worker:        core.WorkerIdentity{InstanceID: "key-owner-fixture", Name: "fixture"},
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 10 * time.Second,
+		Budget:        core.Budget{MaxIterations: 10},
+		RunTimeout:    time.Minute,
+		StopGrace:     time.Minute,
+		Logger:        slog.New(slog.DiscardHandler),
+		Now:           func() time.Time { return h.now },
 	})
 	h.seedCaller("caller-1")
 	return h

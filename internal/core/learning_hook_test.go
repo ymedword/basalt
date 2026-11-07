@@ -42,18 +42,22 @@ func (p *learningHookProbe) AfterRun(_ context.Context, in LearningRunInput, res
 // can inject failures per case.
 type finishOrderProbe struct {
 	RunStore
-	events          *[]string
-	finishErr       error
-	notApplied      bool
-	releaseErr      error
-	releaseN        int
-	finishCtxErr    error
-	finishDeadline  time.Time
-	releaseCtxErr   error
-	releaseDeadline time.Time
+	events           *[]string
+	finishErr        error
+	notApplied       bool
+	releaseErr       error
+	releaseN         int
+	finishCtxErr     error
+	finishDeadline   time.Time
+	releaseCtxErr    error
+	releaseDeadline  time.Time
+	closeoutErr      error
+	closeoutN        int
+	closeoutCtxErr   error
+	closeoutDeadline time.Time
 }
 
-func (p *finishOrderProbe) FinishRun(ctx context.Context, _ string, _ RunStatus, _ string, _, _ int, _ time.Time) (bool, error) {
+func (p *finishOrderProbe) FinishRun(ctx context.Context, _ string, _ LeaseToken, _ RunStatus, _ string, _, _ int, _ time.Time) (bool, error) {
 	if p.events != nil {
 		*p.events = append(*p.events, "finish")
 	}
@@ -63,6 +67,18 @@ func (p *finishOrderProbe) FinishRun(ctx context.Context, _ string, _ RunStatus,
 		return false, p.finishErr
 	}
 	return !p.notApplied, nil
+}
+
+// CompleteRunCloseout 记入同一事件序列：US-24 的五步收尾要求它排在释放**之后**，
+// 且系统代投的 Run 不在这里出现（投递在 Run 返回之后结算，由调用方补这一笔）。
+func (p *finishOrderProbe) CompleteRunCloseout(ctx context.Context, _ string, _ LeaseToken, _ time.Time) error {
+	p.closeoutN++
+	p.closeoutCtxErr = ctx.Err()
+	p.closeoutDeadline, _ = ctx.Deadline()
+	if p.events != nil {
+		*p.events = append(*p.events, "closeout")
+	}
+	return p.closeoutErr
 }
 
 func (p *finishOrderProbe) ReleaseRunRefs(ctx context.Context, _ string, _ time.Time) error {
@@ -91,9 +107,10 @@ func completedLearningEnv() *RunEnv {
 }
 
 // TestUS22_Hook_OnlyAfterTerminalApplied 守 C-05：只有本次调用真正完成终态转换才抽取，
-// 且顺序固定为 终态 → 钩子 → 释放。
-// Only a run whose terminal state was really applied extracts, in the fixed order
-// terminal → hook → release.
+// 且顺序固定为 终态 → 钩子 → 释放 → 收尾（US-24 起，投递结算之后才是收尾末笔；
+// 本方法内的收尾排在释放之后，系统代投的 Run 由调用方在投递落库后补）。
+// Only a run whose terminal state was really applied extracts, in the fixed US-24 order
+// terminal → hook → release → closeout.
 func TestUS22_Hook_OnlyAfterTerminalApplied(t *testing.T) {
 	t.Run("completed-web-runs-once", func(t *testing.T) {
 		var events []string
@@ -101,14 +118,31 @@ func TestUS22_Hook_OnlyAfterTerminalApplied(t *testing.T) {
 		hook := &learningHookProbe{events: &events}
 		result := newLearningHookService(store, hook).finish(
 			t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
-		require.Equal(t, []string{"finish", "hook", "release"}, events)
+		require.Equal(t, []string{"finish", "hook", "release", "closeout"}, events)
 		require.Equal(t, 1, hook.calls)
+		require.Equal(t, 1, store.closeoutN)
 		require.Equal(t, StatusCompleted, hook.results[0].Status)
 		require.Equal(t, "run_1", result.RunID)
 		require.NoError(t, store.finishCtxErr, "终态写回必须用不受调用方取消影响的上下文")
 		require.False(t, store.finishDeadline.IsZero())
 		require.WithinDuration(t, time.Now().Add(5*time.Second), store.finishDeadline, 150*time.Millisecond,
 			"FinishRun 的独立预算 ≤5s（C-05/card §3.1.12）")
+		require.NoError(t, store.closeoutCtxErr, "收尾必须用不受调用方取消影响的上下文")
+		require.False(t, store.closeoutDeadline.IsZero())
+		require.WithinDuration(t, time.Now().Add(5*time.Second), store.closeoutDeadline, 150*time.Millisecond,
+			"CompleteRunCloseout 的独立预算 ≤5s（card §2.3.5）")
+	})
+	t.Run("system-delivery-closeout-deferred-to-caller", func(t *testing.T) {
+		var events []string
+		store := &finishOrderProbe{events: &events}
+		hook := &learningHookProbe{events: &events}
+		env := completedLearningEnv()
+		env.Req.SuppressNotify = true
+		newLearningHookService(store, hook).finish(
+			t.Context(), "run_1", env, RunResult{Status: StatusCompleted})
+		require.Equal(t, []string{"finish", "hook", "release"}, events,
+			"系统代投的 Run 在投递落库前不得收尾——否则 B1 会把在途投递误判成 unknown")
+		require.Equal(t, 0, store.closeoutN)
 	})
 	t.Run("idempotent-not-applied", func(t *testing.T) {
 		var events []string
@@ -117,7 +151,7 @@ func TestUS22_Hook_OnlyAfterTerminalApplied(t *testing.T) {
 		newLearningHookService(store, hook).finish(
 			t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
 		require.Equal(t, 0, hook.calls, "命中 0 行幂等分支不得抽取")
-		require.Equal(t, []string{"finish", "release"}, events)
+		require.Equal(t, []string{"finish", "release", "closeout"}, events)
 	})
 	t.Run("terminal-not-completed", func(t *testing.T) {
 		var events []string
@@ -126,7 +160,7 @@ func TestUS22_Hook_OnlyAfterTerminalApplied(t *testing.T) {
 		newLearningHookService(store, hook).finish(
 			t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCancelled})
 		require.Equal(t, 0, hook.calls)
-		require.Equal(t, []string{"finish", "release"}, events)
+		require.Equal(t, []string{"finish", "release", "closeout"}, events)
 	})
 	t.Run("finish-write-error", func(t *testing.T) {
 		var events []string
@@ -135,7 +169,7 @@ func TestUS22_Hook_OnlyAfterTerminalApplied(t *testing.T) {
 		newLearningHookService(store, hook).finish(
 			t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
 		require.Equal(t, 0, hook.calls)
-		require.Equal(t, []string{"finish", "release"}, events)
+		require.Equal(t, []string{"finish", "release", "closeout"}, events)
 	})
 }
 
@@ -150,7 +184,7 @@ func TestUS22_FinishWriteFailure_SkipsExtraction(t *testing.T) {
 	input := RunResult{Status: StatusCompleted, FinalText: "answer", Iterations: 3, ToolCalls: 2, ConfigHash: "cfg-1"}
 	result := newLearningHookService(store, hook).finish(t.Context(), "run_1", completedLearningEnv(), input)
 	require.Equal(t, 0, hook.calls)
-	require.Equal(t, []string{"finish", "release"}, events)
+	require.Equal(t, []string{"finish", "release", "closeout"}, events)
 	require.Equal(t, input.FinalText, result.FinalText)
 	require.Equal(t, input.Status, result.Status)
 	require.Equal(t, input.ConfigHash, result.ConfigHash)
@@ -177,7 +211,7 @@ func TestUS22_Hook_SkipsFlowFixedToolScheduler(t *testing.T) {
 			newLearningHookService(store, hook).finish(
 				t.Context(), "run_1", env, RunResult{Status: StatusCompleted})
 			require.Equal(t, 0, hook.calls)
-			require.Equal(t, []string{"finish", "release"}, events)
+			require.Equal(t, []string{"finish", "release", "closeout"}, events)
 		})
 	}
 }
@@ -217,7 +251,7 @@ func TestUS22_Hook_PanicRecovered(t *testing.T) {
 			t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
 		require.Equal(t, "run_1", result.RunID)
 	})
-	require.Equal(t, []string{"finish", "hook", "release"}, events)
+	require.Equal(t, []string{"finish", "hook", "release", "closeout"}, events)
 	require.Equal(t, 1, store.releaseN)
 }
 
@@ -229,7 +263,7 @@ func TestUS22_Release_RunsAfterHookFailure(t *testing.T) {
 	hook := &learningHookProbe{events: &events, panicIt: true}
 	newLearningHookService(store, hook).finish(
 		t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
-	require.Equal(t, []string{"finish", "hook", "release"}, events)
+	require.Equal(t, []string{"finish", "hook", "release", "closeout"}, events)
 	require.NoError(t, store.releaseCtxErr, "释放必须用不受调用方取消影响的上下文")
 	require.WithinDuration(t, time.Now().Add(5*time.Second), store.releaseDeadline, 100*time.Millisecond)
 }
@@ -243,7 +277,7 @@ func TestUS22_Release_RunsWhenHookSkipped(t *testing.T) {
 	newLearningHookService(store, hook).finish(
 		t.Context(), "run_1", completedLearningEnv(), RunResult{Status: StatusCompleted})
 	require.Equal(t, 0, hook.calls)
-	require.Equal(t, []string{"finish", "release"}, events)
+	require.Equal(t, []string{"finish", "release", "closeout"}, events)
 }
 
 // TestUS22_ReleaseFailureKeepsTerminal 守 C-32：释放失败只记错误，不改变已落库的终态，
@@ -255,7 +289,7 @@ func TestUS22_ReleaseFailureKeepsTerminal(t *testing.T) {
 	hook := &learningHookProbe{events: &events}
 	input := RunResult{Status: StatusCompleted, FinalText: "done"}
 	result := newLearningHookService(store, hook).finish(t.Context(), "run_1", completedLearningEnv(), input)
-	require.Equal(t, []string{"finish", "hook", "release"}, events)
+	require.Equal(t, []string{"finish", "hook", "release", "closeout"}, events)
 	require.Equal(t, 1, hook.calls, "释放失败发生在钩子之后，不得反过来阻断抽取")
 	require.Equal(t, input.Status, result.Status)
 	require.Equal(t, input.FinalText, result.FinalText)

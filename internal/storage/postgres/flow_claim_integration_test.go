@@ -78,7 +78,9 @@ func TestFlow_ClaimAcceptanceAndArtifactDependenciesAreAtomic(t *testing.T) {
 			service.Runner = runner
 			task, err := service.Start(t.Context(), startFlowRequest(version, "claim-probe"))
 			require.NoError(t, err)
-			task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			// 凭证必须原样下传：子 Run 创建（createRunForNode）以它证明父根归属。
+			root := flowRootLeaseFor(t, s.db, task.RootTaskID)
+			task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 			require.NoError(t, err)
 			graph, err := s.ReadGraph(t.Context(), core.LocalAdminCLIPrincipal(), task.ID)
 			require.NoError(t, err)
@@ -99,7 +101,7 @@ func TestFlow_ClaimAcceptanceAndArtifactDependenciesAreAtomic(t *testing.T) {
 			if mode == "dependency-write-fault" {
 				installFlowFault(t, s, "flow_claim_dependencies", "INSERT", "")
 			}
-			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 			if mode == "dependency-write-fault" {
 				require.Error(t, err)
 				var fired bool

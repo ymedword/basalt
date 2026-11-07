@@ -621,7 +621,7 @@ func (f *learningFakeStore) EntriesForExtraction(_ context.Context, _ core.Scope
 	return f.entries, f.entriesErr
 }
 
-func (f *learningFakeStore) BeginExtraction(_ context.Context, row core.LearningExtraction) (core.LearningExtraction, error) {
+func (f *learningFakeStore) BeginExtraction(_ context.Context, row core.LearningExtraction, _ core.LeaseToken) (core.LearningExtraction, error) {
 	f.beginCalls++
 	f.beginRow = row
 	if f.beginErr != nil {
@@ -631,14 +631,16 @@ func (f *learningFakeStore) BeginExtraction(_ context.Context, row core.Learning
 	return row, nil
 }
 
-func (f *learningFakeStore) FailExtraction(_ context.Context, _ string, class core.LearningFailureClass, message string, _ time.Time) error {
+func (f *learningFakeStore) FailExtraction(_ context.Context, _, _ string, _ core.LeaseToken, _ string, _ int,
+	class core.LearningFailureClass, message string, _ time.Time,
+) error {
 	f.failCalls++
 	f.failClass = class
 	f.failMessage = message
 	return nil
 }
 
-func (f *learningFakeStore) CommitExtraction(_ context.Context, req core.CommitLearningExtraction) (core.LearningCommitResult, error) {
+func (f *learningFakeStore) CommitExtraction(_ context.Context, req core.CommitLearningExtraction, _ core.LeaseToken) (core.LearningCommitResult, error) {
 	f.commitCalls++
 	f.commitReq = req
 	return core.LearningCommitResult{}, f.commitErr

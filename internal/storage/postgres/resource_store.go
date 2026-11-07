@@ -246,6 +246,93 @@ func (s *ResourceStore) CASApplied(ctx context.Context, kind core.ResourceKind, 
 	return affected == 1, nil
 }
 
+// errBundlePointerConflict 是"发布指针期望不成立"的内部判据（§2.3.9 ③ 的丢失更新）：
+// 只在本包内区分"正常竞争"与"写库失败"，不外抛成公共错误码——调用方拿到的是
+// `(false, nil)`，据此重读指针再试或按版本竞争返回。
+// errBundlePointerConflict marks a failed pointer expectation inside this package; the
+// public contract is the (false, nil) result, not an error code.
+var errBundlePointerConflict = errors.New("发布指针期望不成立")
+
+// PublishAgentBundle 在**同一事务**内推进 `agent_bundle` 发布指针并回填操作终态
+// （§2.3.9 更新协议的 ③）：`expectedPublished == 0` 表示首次初始化，要求指针行
+// **不存在**（INSERT + ON CONFLICT DO NOTHING，行数 0 即丢更新）；否则按
+// `published_version_id` 做行级 CAS（`FOR UPDATE` 后核对再 UPSERT）。
+//
+// 返回 `(false, nil)` 表示期望不成立——**不是**写失败。调用方**不得**无条件覆盖，
+// 只能重读指针后重试或按版本竞争返回。首个指针的写入由显式安装完成，服务器**不**
+// 自动发布（§2.3.9 首次初始化）。
+// PublishAgentBundle moves the bundle pointer under a pointer expectation and closes the
+// operation in the same transaction; a false result with a nil error means the
+// expectation missed, and the caller must never overwrite unconditionally.
+func (s *ResourceStore) PublishAgentBundle(ctx context.Context, uid core.AgentUID, versionID, expectedPublished int64,
+	operationID string, now time.Time,
+) (bool, error) {
+	if operationID == "" {
+		return false, errors.New("发布 Agent 资产: operation_id 不能为空")
+	}
+	if _, err := core.ParseAgentUID(string(uid)); err != nil {
+		return false, fmt.Errorf("发布 Agent 资产: %w", err)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	tx, err := s.db.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("发布 Agent 资产 %s: 开启事务: %w", uid, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	resourceID := string(uid)
+	pointerUID, err := checkVersionBelongsTo(ctx, tx, core.ResourceAgentBundle, resourceID, versionID)
+	if err != nil {
+		return false, err
+	}
+	if expectedPublished <= 0 {
+		// 首次初始化：INSERT 语义。`DO NOTHING` 让并发的两次首装只有一个成功，
+		// 另一个拿到 0 行走"重读后重试"，不是把对方刚写的指针覆盖掉。
+		result, err := tx.ExecContext(ctx,
+			`INSERT INTO resource_pointers
+			   (resource_kind, resource_id, resource_uid, published_version_id, applied_version_id,
+			    scope, owner_agent_uid, revision, deleted_at, updated_at, operation_id)
+			 VALUES ($1, $2, $3, $4, $4, 'shared', NULL, 1, NULL, $5, $6)
+			 ON CONFLICT (resource_kind, resource_id) DO NOTHING`,
+			string(core.ResourceAgentBundle), resourceID, string(pointerUID), versionID,
+			now.UnixMilli(), operationID)
+		if err != nil {
+			return false, fmt.Errorf("初始化发布指针 %s: %w", resourceID, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("初始化发布指针 %s: 读取影响行数: %w", resourceID, err)
+		}
+		if affected == 0 {
+			return false, nil
+		}
+	} else {
+		// CAS：`checkPointerExpectation` 先锁行再逐项核对，锁一直持到本事务提交，
+		// 因此核对与 UPSERT 之间不会被别的发布事务插队。
+		expect := &pointerExpectation{
+			UID:                pointerUID,
+			PublishedVersionID: expectedPublished,
+			Mismatch:           errBundlePointerConflict,
+		}
+		if err := publishTx(ctx, tx, core.ResourceAgentBundle, resourceID, pointerUID,
+			versionID, true, operationID, now, expect); err != nil {
+			if errors.Is(err, errBundlePointerConflict) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	if err := finishOperationTx(ctx, s.db, tx, operationID, core.OperationSuccess, "", "", nil, now); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("发布 Agent 资产 %s: 提交: %w", uid, err)
+	}
+	return true, nil
+}
+
 // PublishWithVersion 在**同一事务**内追加版本行、更新发布指针并回填操作终态
 // （US-12 的发布 / 撤回路径）：版本、指针与操作状态不会出现中间态。版本**总是**
 // 新插入一行（撤回 = 用旧内容建新版本）；指针写失败时版本行与终态一起回滚。
@@ -441,6 +528,15 @@ func checkPointerIdentity(ctx context.Context, tx *sql.Tx, kind core.ResourceKin
 func ensureIdentityTx(ctx context.Context, tx *sql.Tx, kind core.ResourceKind, name string,
 	uid core.ResourceUID, operationID string, at time.Time,
 ) error {
+	if kind == core.ResourceAgentBundle {
+		// 身份表只登记**资源身份**四种（`schema.pg.sql:344`，`notify_channel` 只属身份表），
+		// `agent_bundle` 是版本表侧的种类（§2.3.9 的身份适配只放宽 versions / pointers 两张表，
+		// 迁移 0012 同口径）。Agent 身份由 `ag_` AgentUID 与 agent_lifecycle 承载，不在这里
+		// 重复登记；发布指针的身份仍取自版本行并由 checkPointerIdentity 核对，守卫不降级。
+		// The identity table's closed set is the four resource-identity kinds; agent bundles
+		// are version-table-only, so the agent identity is not re-registered here.
+		return nil
+	}
 	var (
 		gotKind string
 		gotName string
@@ -498,7 +594,7 @@ func checkVersionBelongsTo(ctx context.Context, tx *sql.Tx, kind core.ResourceKi
 	if gotKind != kind || gotID != resourceID {
 		return "", fmt.Errorf("版本 %d 属于 %s/%s，不能发布为 %s/%s", versionID, gotKind, gotID, kind, resourceID)
 	}
-	if _, err := core.ParseResourceUID(string(gotUID)); err != nil {
+	if _, err := parseResourceIdentity(kind, gotUID); err != nil {
 		return "", fmt.Errorf("版本 %d 的资源 UID 非法: %w", versionID, err)
 	}
 	return gotUID, nil
@@ -572,7 +668,7 @@ func (s *ResourceStore) MarkDeletedByUID(ctx context.Context, kind core.Resource
 	if opID == "" {
 		return errors.New("删除资源: operation_id 不能为空")
 	}
-	canonical, err := core.ParseResourceUID(string(uid))
+	canonical, err := parseResourceIdentity(kind, uid)
 	if err != nil {
 		return fmt.Errorf("删除资源 %s/%s: %w", kind, id, err)
 	}
@@ -676,7 +772,7 @@ func (s *ResourceStore) Pointer(ctx context.Context, kind core.ResourceKind, res
 // PointerByUID reads the pointer row by resource identity; credential and scope actions
 // address resources by uid rather than guessing from the name.
 func (s *ResourceStore) PointerByUID(ctx context.Context, kind core.ResourceKind, uid core.ResourceUID) (core.ResourcePointer, error) {
-	canonical, err := core.ParseResourceUID(string(uid))
+	canonical, err := parseResourceIdentity(kind, uid)
 	if err != nil {
 		return core.ResourcePointer{}, err
 	}
@@ -984,7 +1080,7 @@ func (s *ResourceStore) Versions(ctx context.Context, kind core.ResourceKind, re
 // 唯一正确读法：同名重建的另一代不会被混进来。
 // VersionsByUID lists one resource instance's versions, newest first.
 func (s *ResourceStore) VersionsByUID(ctx context.Context, kind core.ResourceKind, uid core.ResourceUID) ([]core.ResourceVersion, error) {
-	canonical, err := core.ParseResourceUID(string(uid))
+	canonical, err := parseResourceIdentity(kind, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -1032,7 +1128,7 @@ func (s *ResourceStore) ReferencedBy(ctx context.Context, kind core.ResourceKind
 // ReferencedByUID 按资源实例身份给出未释放引用的 Run（同名重建的两代互不影响）。
 // ReferencedByUID lists unreleased runs by resource identity.
 func (s *ResourceStore) ReferencedByUID(ctx context.Context, kind core.ResourceKind, uid core.ResourceUID) ([]string, error) {
-	canonical, err := core.ParseResourceUID(string(uid))
+	canonical, err := parseResourceIdentity(kind, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -1065,9 +1161,26 @@ func (s *ResourceStore) queryReferencedBy(ctx context.Context, query string, arg
 	return runIDs, nil
 }
 
-// PutLifecycleIndex 写 `agent_lifecycle` 索引（upsert）。`valid=false` 时 state 写 NULL、
-// generation 归零、error_message 记原因——索引可由状态文件重建，写失败不回滚权威文件。
-// PutLifecycleIndex upserts the rebuildable lifecycle index; invalid rows carry NULL state.
+// PutLifecycleIndex 写 `agent_lifecycle` 索引（upsert），并把 US-24 的**代次单调**
+// 规则挡在写库之前（§2.3.9「生命周期写入」）：
+//
+//   - 本地代次**低于**索引 → `ErrAgentLifecycleStale`（拒绝回退，索引一个字节不动）；
+//   - 同代次 → 只接受**逐项完全一致**的内容（`generation / state / state_file_hash /
+//     agent_uid / uid_source / operation_id` 六列），一致即幂等成功、不一致返回
+//     `ErrAgentLifecycleMismatch`（同样零写入）；
+//   - 本地代次**高于**索引 → 放行写入；"本地更大是否准入"由调用方判定（P-17：先
+//     标不可准入，修复走管理操作的单调路径），索引不擅自替调用方拒绝，也绝不回退。
+//
+// `updated_at` 不参与比较（服务端写入时间，重放必然不同），`valid` /
+// `error_message` 由校验结果派生同样不比较。**`valid=false` 的写入不受本规则约束**：
+// 它记的是"这份文件不可用"（state 归 NULL、generation 归零），不携带代次主张；若也
+// 纳入单调比较，索引就再也无法记录"文件损坏"这件事本身，可用性反而更低。调用方
+// 需要判断的是状态文件的权威内容，索引只是派生面。
+//
+// PutLifecycleIndex enforces the monotonic-generation rule before writing: a lower
+// generation is refused, an equal generation accepts only a field-by-field identical
+// row, and a higher one is the caller's admission question (P-17), never a rollback.
+// Invalid rows are exempt because they carry no generation claim at all.
 func (s *ResourceStore) PutLifecycleIndex(ctx context.Context, rec core.LifecycleRecord, valid bool, errMsg string) error {
 	if rec.Agent == "" {
 		return errors.New("写生命周期索引: agent 不能为空")
@@ -1102,28 +1215,231 @@ func (s *ResourceStore) PutLifecycleIndex(ctx context.Context, rec core.Lifecycl
 		errMessage = nullIfEmpty(errMsg)
 	}
 
-	_, err := s.db.pool.ExecContext(ctx,
+	tx, err := s.db.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("写生命周期索引 %s: 开启事务: %w", rec.Agent, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 先尝试插入；`DO NOTHING` 让"行已存在"走下面的加锁复查，而不是在冲突分支里
+	// 绕过代次守卫（ON CONFLICT DO UPDATE 会直接覆盖，规则就形同虚设）。
+	// Insert first; a conflict falls through to the locked recheck so the guard cannot
+	// be bypassed by the conflict branch.
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO agent_lifecycle
 		   (agent_name, agent_uid, uid_source, state, generation, state_file_hash, valid,
 		    error_message, updated_at, operation_id)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		 ON CONFLICT(agent_name) DO UPDATE SET
-		   agent_uid = COALESCE(excluded.agent_uid, agent_lifecycle.agent_uid),
-		   uid_source = COALESCE(excluded.uid_source, agent_lifecycle.uid_source),
-		   state = excluded.state,
-		   generation = excluded.generation,
-		   state_file_hash = excluded.state_file_hash,
-		   valid = excluded.valid,
-		   error_message = excluded.error_message,
-		   updated_at = excluded.updated_at,
-		   operation_id = excluded.operation_id`,
+		 ON CONFLICT(agent_name) DO NOTHING`,
 		rec.Agent, nullIfEmpty(string(rec.AgentUID)), uidSourceOf(rec.AgentUID),
 		state, generation, fileHash, validValue, errMessage,
 		updatedAt, nullIfEmpty(rec.OperationID))
 	if err != nil {
 		return fmt.Errorf("写生命周期索引 %s: %w", rec.Agent, err)
 	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("确认生命周期索引写入 %s: %w", rec.Agent, err)
+	}
+	if inserted == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("写生命周期索引 %s: 提交: %w", rec.Agent, err)
+		}
+		return nil
+	}
+
+	// 行已存在：锁住它再比代次。`FOR UPDATE` 与 `RestoreLifecycleBarrier` 的
+	// 条件 UPDATE、`StartRun` 的复查取的是同一把行锁——三者的相对顺序因此可判。
+	// Row exists: lock it, so the order of this write, RestoreLifecycleBarrier and
+	// StartRun's recheck is serialized on one row lock.
+	var (
+		indexGeneration int64
+		indexState      sql.NullString
+		indexHash       sql.NullString
+		indexUID        sql.NullString
+		indexSource     sql.NullString
+		indexOperation  sql.NullString
+	)
+	err = tx.QueryRowContext(ctx,
+		`SELECT generation, state, state_file_hash, agent_uid, uid_source, operation_id
+		   FROM agent_lifecycle WHERE agent_name = $1 FOR UPDATE`, rec.Agent).
+		Scan(&indexGeneration, &indexState, &indexHash, &indexUID, &indexSource, &indexOperation)
+	if err != nil {
+		return fmt.Errorf("读取生命周期索引 %s 以校验代次: %w", rec.Agent, err)
+	}
+
+	if valid {
+		if rec.Generation < indexGeneration {
+			// 回滚后索引保持原样：拒绝路径零写入。
+			return fmt.Errorf("%w: Agent %s 本地代次 %d 低于索引代次 %d",
+				core.ErrAgentLifecycleStale, rec.Agent, rec.Generation, indexGeneration)
+		}
+		if rec.Generation == indexGeneration {
+			if !lifecycleIndexIdentical(rec, indexState, indexHash, indexUID, indexSource, indexOperation) {
+				return fmt.Errorf("%w: Agent %s 同代次 %d 的内容与索引不一致",
+					core.ErrAgentLifecycleMismatch, rec.Agent, rec.Generation)
+			}
+			// 逐项一致：幂等成功，不刷新 updated_at（重放不该制造"刚写过"的假象）。
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("写生命周期索引 %s: 提交: %w", rec.Agent, err)
+			}
+			return nil
+		}
+	}
+
+	// 本地代次更高，或本次是"文件不可用"的派生记录：按原有 COALESCE 语义更新。
+	// A higher local generation, or an invalid-row record: update with the original
+	// COALESCE semantics.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE agent_lifecycle SET
+		   agent_uid = COALESCE($2, agent_uid),
+		   uid_source = COALESCE($3, uid_source),
+		   state = $4,
+		   generation = $5,
+		   state_file_hash = $6,
+		   valid = $7,
+		   error_message = $8,
+		   updated_at = $9,
+		   operation_id = $10
+		 WHERE agent_name = $1`,
+		rec.Agent, nullIfEmpty(string(rec.AgentUID)), uidSourceOf(rec.AgentUID),
+		state, generation, fileHash, validValue, errMessage,
+		updatedAt, nullIfEmpty(rec.OperationID)); err != nil {
+		return fmt.Errorf("写生命周期索引 %s: %w", rec.Agent, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("写生命周期索引 %s: 提交: %w", rec.Agent, err)
+	}
 	return nil
+}
+
+// lifecycleIndexIdentical 判定"同代次逐项一致"（§2.3.9 的六列元组）。`agent_uid` 与
+// `uid_source` 按写入的 `COALESCE(excluded, existing)` 语义比较：本次没有给出身份
+// 就等于"保留既有值"，不构成内容分裂；`operation_id` 是直接覆盖，严格比较。
+// lifecycleIndexIdentical compares the six-column tuple with the COALESCE semantics of
+// the write: an absent identity preserves the stored one, operation_id compares exactly.
+func lifecycleIndexIdentical(rec core.LifecycleRecord, indexState, indexHash, indexUID,
+	indexSource, indexOperation sql.NullString,
+) bool {
+	if !nullAnyMatches(string(rec.State), indexState) {
+		return false
+	}
+	if !nullAnyMatches(nullIfEmpty(rec.Checksum), indexHash) {
+		return false
+	}
+	if !nullAnyPreserves(nullIfEmpty(string(rec.AgentUID)), indexUID) {
+		return false
+	}
+	if !nullAnyPreserves(uidSourceOf(rec.AgentUID), indexSource) {
+		return false
+	}
+	return nullAnyMatches(nullIfEmpty(rec.OperationID), indexOperation)
+}
+
+// nullAnyMatches 比较"即将写入的值"与既有列：`sql.NullString{}` / nil 视为 NULL，
+// 只有双方都是 NULL 或非 NULL 且相等才算一致。
+// nullAnyMatches compares a to-be-written value with a stored column, bit for bit.
+func nullAnyMatches(value any, stored sql.NullString) bool {
+	switch v := value.(type) {
+	case string:
+		return stored.Valid && stored.String == v
+	case sql.NullString:
+		return !stored.Valid
+	default:
+		return value == nil && !stored.Valid
+	}
+}
+
+// nullAnyPreserves 比较 `COALESCE(excluded.col, existing.col)` 形式的列：本次为 NULL
+// 表示保留既有值，恒成立；非 NULL 则必须与既有值相等（既有为 NULL 也算分裂）。
+// nullAnyPreserves compares a COALESCE-written column: NULL keeps the stored value.
+func nullAnyPreserves(value any, stored sql.NullString) bool {
+	if v, ok := value.(string); ok {
+		return stored.Valid && stored.String == v
+	}
+	return true
+}
+
+// SetLifecycleBarrier 实现归档准入屏障（FR-24-41 / 图 8 的 [1]）：一条条件 UPDATE
+// 把 `active` 改成 `disabled`，**只动 state / operation_id / updated_at**。
+// generation 与 state_file_hash 保持状态文件里的值——屏障不是迁移，代次不动，
+// `scanAgents` 的对账也不会把它当成"文件更新"去重放（重放由 baseline 的屏障守卫处理）。
+// UPDATE 自身持有行锁，与 `StartRun` 事务内的 `SELECT … FOR UPDATE` 复查互斥：
+// 归档先行 → 复查读到 disabled 并拒绝；复查先行 → 本 UPDATE 等它提交后重读该行。
+//
+// SetLifecycleBarrier is the archive admission veto: one conditional UPDATE that flips
+// active→disabled and touches nothing else, so the generation stays the file's.
+func (s *ResourceStore) SetLifecycleBarrier(ctx context.Context, agent, operationID string,
+	at time.Time,
+) (bool, error) {
+	if agent == "" {
+		return false, errors.New("写归档准入屏障: agent 不能为空")
+	}
+	if operationID == "" {
+		// 屏障身份是恢复补偿的 CAS 条件：空值写进去后无法证明"这次恢复撤销的是
+		// 哪一次屏障"，失败分支只能永久留着 disabled。直接拒绝。
+		return false, errors.New("写归档准入屏障: 操作标识不能为空")
+	}
+	res, err := s.db.pool.ExecContext(ctx,
+		`UPDATE agent_lifecycle
+		    SET state = 'disabled', operation_id = $2, updated_at = $3
+		  WHERE agent_name = $1 AND state = 'active'`,
+		agent, nullIfEmpty(operationID), at.UTC().UnixMilli())
+	if err != nil {
+		return false, fmt.Errorf("写归档准入屏障 %s: %w", agent, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("确认归档准入屏障 %s: %w", agent, err)
+	}
+	return affected == 1, nil
+}
+
+// RestoreLifecycleBarrier 用状态文件记录把索引写回（屏障超时 / 取消时的补偿），
+// 且**只撤销本次归档操作留下的那一行**：CAS 条件是 `state='disabled'` +
+// `operation_id = <本次屏障的操作标识>` + `generation = <屏障期观测到的代次>`。
+//
+// 为什么第二个条件不能省：后续的一次停用同样把行写成 `disabled`，只判状态就会把
+// 更晚提交的管理操作回写成旧代次（实测：`active/gen=3` 覆盖了别人的
+// `disabled/gen=4`）。为什么第三个条件不能省：同一归档操作的后续推进（例如回滚
+// 状态文件再同步索引）保留同一个 `operation_id` 但递增代次，只判身份仍会覆盖它。
+// applied=false 表示该行已不是本屏障留下的状态，调用方按"索引已由他人推进"处理。
+//
+// 代次与哈希都取权威记录的现值，因此这是"同一代次的内容写回"，不受
+// `PutLifecycleIndex` 的代次单调规则约束（T028 的代次守卫需豁免本法）。
+//
+// RestoreLifecycleBarrier writes the authoritative tuple back only while the row is
+// still the disabled row this archive operation installed (same operation id, same
+// generation); a plain state='disabled' predicate would overwrite a later disable.
+func (s *ResourceStore) RestoreLifecycleBarrier(ctx context.Context, rec core.LifecycleRecord,
+	barrierOperationID string, expectedGeneration int64,
+) (bool, error) {
+	if rec.Agent == "" {
+		return false, errors.New("恢复生命周期屏障: agent 不能为空")
+	}
+	if barrierOperationID == "" {
+		return false, errors.New("恢复生命周期屏障: 屏障操作标识不能为空")
+	}
+	updatedAt := rec.UpdatedAt
+	if updatedAt == 0 {
+		updatedAt = time.Now().UnixMilli()
+	}
+	res, err := s.db.pool.ExecContext(ctx,
+		`UPDATE agent_lifecycle
+		    SET state = $2, generation = $3, state_file_hash = $4, valid = true,
+		        error_message = NULL, updated_at = $5, operation_id = $6
+		  WHERE agent_name = $1 AND state = 'disabled'
+		    AND operation_id = $7 AND generation = $8`,
+		rec.Agent, string(rec.State), rec.Generation, nullIfEmpty(rec.Checksum),
+		updatedAt, nullIfEmpty(rec.OperationID), barrierOperationID, expectedGeneration)
+	if err != nil {
+		return false, fmt.Errorf("恢复生命周期屏障 %s: %w", rec.Agent, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("确认生命周期屏障恢复 %s: %w", rec.Agent, err)
+	}
+	return affected == 1, nil
 }
 
 // uidSourceOf 把身份映射为镜像来源：有 UID = 状态文件（`state_file`），无 UID = NULL
@@ -1257,11 +1573,13 @@ func uidSourceString(uid core.AgentUID) string {
 	return "state_file"
 }
 
-// LifecycleIndex 读 `agent_lifecycle` 索引：返回记录、`valid` 标志与无效原因；
+// ReadLifecycleIndex 读 `agent_lifecycle` 索引：返回记录、`valid` 标志与无效原因；
 // 索引无该 Agent 时返回零记录、valid=false、空原因、nil 错误（"没有索引行"不是故障，
-// 视图据此回退到状态文件读取）。
-// LifecycleIndex reads the index row; a missing row is not an error.
-func (s *ResourceStore) LifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error) {
+// 视图据此回退到状态文件读取）。名字与 `core.LifecycleIndex` 端口的读法逐字一致：
+// 读只有这一条实现，不另设同义的第二套扫描。
+// ReadLifecycleIndex reads the index row; a missing row is not an error, and this is
+// the only read implementation behind the port.
+func (s *ResourceStore) ReadLifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error) {
 	var (
 		state      sql.NullString
 		generation int64
@@ -1389,34 +1707,66 @@ func nextVersionNo(ctx context.Context, q Queryer, kind core.ResourceKind, uid c
 	return next, nil
 }
 
-// validateResourceKind 锁定三值字面量；未知类型在写库前拒绝（CHECK 只是最后一道）。
-// validateResourceKind freezes the three literal resource kinds.
+// validateResourceKind 锁定四值字面量；未知类型在写库前拒绝（CHECK 只是最后一道）。
+// 第四值 `agent_bundle` 由迁移 0012 追加（US-24 §2.3.9），管理 API 的
+// `ParseResourceKind` 不随之放宽。
+// validateResourceKind freezes the four literal resource kinds; the admin API parser
+// stays at three.
 func validateResourceKind(kind core.ResourceKind) error {
 	switch kind {
-	case core.ResourceModelConnection, core.ResourceMCPServer, core.ResourceSkill:
+	case core.ResourceModelConnection, core.ResourceMCPServer, core.ResourceSkill,
+		core.ResourceAgentBundle:
 		return nil
 	default:
 		return fmt.Errorf("未知资源类型 %q", kind)
 	}
 }
 
+// parseResourceIdentity 是资源身份校验的**唯一分派点**（§2.3.9 身份适配表）：
+// 前三类走 `rs_` 资源身份，`agent_bundle` 走 `ag_` Agent 身份。写面与读面共用同一
+// 分派——只放宽写面会让发布校验（`checkVersionBelongsTo`）在首次安装时就拒绝合法
+// 版本，只放宽读面则相反；两边都不允许 `rs_` 与 `ag_` 互相冒充。
+// parseResourceIdentity is the single identity dispatch: the first three kinds use the
+// rs_ resource identity, agent_bundle uses the ag_ agent identity, and neither is
+// silently reinterpreted as the other on either the write or the read path.
+func parseResourceIdentity(kind core.ResourceKind, uid core.ResourceUID) (core.ResourceUID, error) {
+	if kind == core.ResourceAgentBundle {
+		agentUID, err := core.ParseAgentUID(string(uid))
+		if err != nil {
+			return "", err
+		}
+		return core.ResourceUID(agentUID), nil
+	}
+	return core.ParseResourceUID(string(uid))
+}
+
 // normalizeResourceVersion 校验版本行的必填字段与按类型的非空约束（与 schema CHECK 同口径），
-// 并把资源 UID 规范化为大写载荷：身份是版本的键，缺失或非法一律在写库前拒绝——
-// 存储层不按名称推断身份。
-// normalizeResourceVersion validates the row and canonicalizes the uid; a missing or
-// malformed uid is refused because identity is never inferred from the name.
+// 并按 kind 分派身份解析：前三类走 `rs_` 资源身份，`agent_bundle` 走 `ag_` Agent
+// 身份（US-24 §2.3.9 的身份适配表）。身份是版本的键，缺失或非法一律在写库前拒绝——
+// 存储层不按名称推断身份，也不把 `ag_` 悄悄当 `rs_`（反之亦然）。
+// normalizeResourceVersion validates the row and canonicalizes the uid by kind: the
+// first three kinds use the rs_ resource identity, agent_bundle uses the ag_ agent
+// identity, and neither is silently reinterpreted as the other.
 func normalizeResourceVersion(v core.ResourceVersion) (core.ResourceVersion, error) {
 	if err := validateResourceKind(v.Kind); err != nil {
 		return core.ResourceVersion{}, err
 	}
-	uid, err := core.ParseResourceUID(string(v.ResourceUID))
-	if err != nil {
-		return core.ResourceVersion{}, fmt.Errorf("资源版本 %s/%s: %w", v.Kind, v.ResourceID, err)
-	}
-	v.ResourceUID = uid
 	if v.ResourceID == "" {
 		return core.ResourceVersion{}, errors.New("资源版本: resource_id 不能为空")
 	}
+	canonical, err := parseResourceIdentity(v.Kind, v.ResourceUID)
+	if err != nil {
+		return core.ResourceVersion{}, fmt.Errorf("资源版本 %s/%s: %w", v.Kind, v.ResourceID, err)
+	}
+	if v.Kind == core.ResourceAgentBundle && v.ResourceID != string(canonical) {
+		// `agent_bundle` 的 `resource_id` 与 `resource_uid` 同取规范化的 AgentUID：
+		// 指针读取按 `resource_id = <agent_uid>` 查（§2.3.9），两列不同值会让发布
+		// 记录查不到自己刚写的版本。要求调用方显式给同值，**不得**用 Agent 名替代。
+		return core.ResourceVersion{}, fmt.Errorf(
+			"资源版本 %s/%s: resource_id 必须与规范化的 AgentUID %s 同值",
+			v.Kind, v.ResourceID, canonical)
+	}
+	v.ResourceUID = canonical
 	if v.ContentHash == "" {
 		return core.ResourceVersion{}, errors.New("资源版本: content_hash 不能为空")
 	}
@@ -1425,9 +1775,11 @@ func normalizeResourceVersion(v core.ResourceVersion) (core.ResourceVersion, err
 		if v.DefinitionYAML == "" {
 			return core.ResourceVersion{}, fmt.Errorf("资源版本 %s/%s: 定义原文不能为空", v.Kind, v.ResourceID)
 		}
-	case core.ResourceSkill:
+	case core.ResourceSkill, core.ResourceAgentBundle:
+		// bundle 与技能同形：manifest 记逐文件哈希与 bundle hash，storage_path 钉住
+		// 不可变安装目录。字段必填不因"只放宽身份类型"而放宽（P-19）。
 		if v.ManifestJSON == "" || v.StoragePath == "" {
-			return core.ResourceVersion{}, fmt.Errorf("资源版本 %s/%s: 技能版本必须带清单与存储路径", v.Kind, v.ResourceID)
+			return core.ResourceVersion{}, fmt.Errorf("资源版本 %s/%s: 必须带清单与存储路径", v.Kind, v.ResourceID)
 		}
 	}
 	return v, nil

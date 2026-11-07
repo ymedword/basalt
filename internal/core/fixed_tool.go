@@ -32,7 +32,7 @@ func validFixedFlowRequest(req RunRequest) bool {
 // runFixedTool uses the original message group and executor. Production remains
 // disabled until app enables the durable Run path and its separate write gate.
 func (l *ReActLoop) runFixedTool(ctx context.Context, runID string, env *RunEnv, call ToolCall) (RunResult, error) {
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return env.cancelled(err, 0, 0), nil
 	}
 	response := ChatResponse{ToolCalls: []ToolCall{call}}

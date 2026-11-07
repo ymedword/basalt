@@ -104,12 +104,45 @@ func (h *recoveryOwnerHarness) revokeAllKeys(callerID string) {
 	require.NoError(h.t, err)
 }
 
-// recover 跑一次恢复扫描。
-// recover runs one recovery sweep.
+// seedExpiredLeases 为每条 `running` 行补一条**已过期**的 run 租约。
+//
+// US-24 起恢复只作用于「合法领取的过期租约」（FR-24-02 / FR-24-15）：这些夹具直接
+// 种库，崩溃现场没有真实租约行，所以这里显式造出"属主已失联"的既成事实。反过来说，
+// 按心跳或进程启动时间推断死亡正是本 US 明确拒绝的路径——本夹具若改成那种写法，
+// 下面所有用例都会红。
+// seedExpiredLeases plants one already-expired run lease per running row.
+func (h *recoveryOwnerHarness) seedExpiredLeases() {
+	h.t.Helper()
+	_, err := h.db.ExecContext(h.t.Context(), `
+		INSERT INTO execution_leases
+			(kind, resource_id, owner_worker_id, ownership_epoch,
+			 acquired_at, renewed_at, expires_at, released_at)
+		SELECT 'run', r.run_id, 'dead-worker', 1, $1, $1, $1, NULL
+		  FROM runs r
+		 WHERE r.status = 'running'
+		ON CONFLICT (kind, resource_id) DO NOTHING`,
+		h.now.Add(-time.Minute).UnixMilli())
+	require.NoError(h.t, err)
+}
+
+// recover 走一次**作用域限定**的接管收尾：先按过期租约领取，再逐条按其作用域恢复。
+// 没有全局扫描（FR-24-02）：没被领取的行一条都不会动。
+// recover claims expired leases then recovers each claimed run in its own scope.
 func (h *recoveryOwnerHarness) recover() {
 	h.t.Helper()
-	_, err := h.db.Recover(h.t.Context(), slogDiscard(), h.now)
+	h.seedExpiredLeases()
+	worker := core.WorkerIdentity{
+		InstanceID: "recovery-owner-test",
+		Name:       "recovery-owner-test",
+	}
+	leases, err := postgres.NewReclaimerStore(h.db).ClaimExpired(h.t.Context(),
+		core.LeaseRun, worker, 64, time.Minute)
 	require.NoError(h.t, err)
+	for _, lease := range leases {
+		_, err := postgres.RecoverRun(h.t.Context(), h.db, slogDiscard(),
+			lease.LeaseToken, h.now)
+		require.NoError(h.t, err)
+	}
 }
 
 // lastRunPrincipal 从运行行重建执行身份：归属取 `caller_id`，执行者取 `actor`。

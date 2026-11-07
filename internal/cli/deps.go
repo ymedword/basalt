@@ -142,6 +142,18 @@ type Deps struct {
 	// surface never takes a second one. A nil here is a wiring gap.
 	Learning LearningPort
 
+	// Workers 是 Worker 登记行的**只读**端口（见 ports.go）：`workers list` 经它取
+	// 实例 / 名称 / 启动 / 心跳 / 活跃租约数，不取实例锁、不写任何行。拿到 nil 即报
+	// 缺件——命令面**不得**自己打开数据库补出第二条读面。
+	// The read-only worker listing port; a nil here is a wiring gap.
+	Workers WorkerLister
+
+	// Assets 是资产 bundle 命令面的装配（见 ports.go）：资产根由装配层解析，
+	// `assets install` 的共享发布记录写入由 Publish 提供。nil 即报缺件；
+	// install 缺 Publish 时失败关闭（**不得**退化成只装本地）。
+	// The asset command surface; a nil port is a wiring gap and install fails closed.
+	Assets AssetsPort
+
 	// CLIWriteActor 给出**本机 CLI 写动作**的操作主体（`cli:<OS user>`）。它是七个
 	// 准入写动作的唯一身份来源：命令面没有 `--approver` 之类旁路，缺失即报缺件；
 	// `cli:unknown` 在取锁与开库之前被拒绝（颗粒度文档 §3.1.10）。

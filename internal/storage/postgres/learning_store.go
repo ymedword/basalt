@@ -123,20 +123,43 @@ func learningTimeFromNull(ms sql.NullInt64) time.Time {
 	return learningTimeFromMS(ms.Int64)
 }
 
-// learningRunOrigin 读取触发 Run 的来源身份（原则 III 的同一条口径：身份取自数据库，
-// 不取请求）。runs.caller_id 为 NOT NULL，key_id 为 NULL 时落空串（本地管理员）。
-// learningRunOrigin reads the origin identity from the runs row, never from a request.
-func learningRunOrigin(ctx context.Context, q Queryer, runID string) (callerID, keyID string, err error) {
-	err = q.QueryRowContext(ctx,
-		`SELECT caller_id, COALESCE(key_id, '') FROM runs WHERE run_id = $1`, runID).
-		Scan(&callerID, &keyID)
+// learningOrigin 是一次 Run 的**四项来源身份**（原则 III：只从 runs 行取，不取请求）。
+// Agent / SessionID 是 US-24 §2.3.5 给 "window_gone 同来源" 受控收尾条件补的两项：
+// DB 抽取行的四项必须与触发 Run 的四项逐项相等，否则这次 Run 与该行无关。
+// learningOrigin carries the four origin fields; the extra two exist for the window_gone
+// same-origin predicate.
+type learningOrigin struct {
+	Agent     string
+	SessionID string
+	CallerID  string
+	KeyID     string
+}
+
+// learningRunIdentity 读取一次 Run 的完整来源身份。runs.caller_id 为 NOT NULL，
+// key_id 为 NULL 时落空串（本地管理员）。
+// learningRunIdentity reads the complete origin identity from the runs row.
+func learningRunIdentity(ctx context.Context, q Queryer, runID string) (learningOrigin, error) {
+	var out learningOrigin
+	err := q.QueryRowContext(ctx,
+		`SELECT agent, session_id, caller_id, COALESCE(key_id, '') FROM runs WHERE run_id = $1`,
+		runID).Scan(&out.Agent, &out.SessionID, &out.CallerID, &out.KeyID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", fmt.Errorf("学习抽取: 运行记录不存在（run_id=%s）", runID)
+		return learningOrigin{}, fmt.Errorf("学习抽取: 运行记录不存在（run_id=%s）", runID)
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("学习抽取: 读取运行来源（run_id=%s）: %w", runID, err)
+		return learningOrigin{}, fmt.Errorf("学习抽取: 读取运行来源（run_id=%s）: %w", runID, err)
 	}
-	return callerID, keyID, nil
+	return out, nil
+}
+
+// learningRunOrigin 只取调用方与 Key 两个字段（读游标 / 未决行用）。
+// learningRunOrigin narrows learningRunIdentity to the two fields the read paths need.
+func learningRunOrigin(ctx context.Context, q Queryer, runID string) (callerID, keyID string, err error) {
+	origin, err := learningRunIdentity(ctx, q, runID)
+	if err != nil {
+		return "", "", err
+	}
+	return origin.CallerID, origin.KeyID, nil
 }
 
 // UnresolvedForOrigin 只返回需要阻断或重试的行：pending、failed 且 attempts < 3、
@@ -250,14 +273,95 @@ func (r *LearningRepo) EntriesForExtraction(ctx context.Context, scope core.Scop
 	return out, nil
 }
 
+// lockLearningAgent 取 Agent 级事务 advisory lock——学习写面锁序的第一步
+// （advisory → 租约行 → 业务行，§2.3.5 / R7）。它只被学习仓储使用，不参与 StartRun
+// 的锁序，因此不与「会话 advisory → 租约行」构成环。
+// lockLearningAgent takes the agent advisory lock, the first step of the learning
+// write-surface lock order: advisory → lease row → business row.
+func lockLearningAgent(ctx context.Context, tx *sql.Tx, agent string) error {
+	if _, err := tx.ExecContext(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext('memory_extract:' || $1))`, agent); err != nil {
+		return fmt.Errorf("学习抽取: 取 Agent 锁（agent=%s）: %w", agent, err)
+	}
+	return nil
+}
+
+// learningAgentOf 读抽取行所属 Agent。这是 advisory 之前的**不加锁**读取：普通 SELECT
+// 不取行锁，不改变 advisory → 租约行 → 业务行的取锁次序（与 CommitExtraction 的既有
+// 做法一致）。
+// learningAgentOf reads the row's agent without locking; a plain SELECT takes no row
+// lock, so the lock order stays advisory → lease row → business row.
+func learningAgentOf(ctx context.Context, q Queryer, extractionID string) (string, error) {
+	var agent string
+	err := q.QueryRowContext(ctx,
+		`SELECT agent_name FROM memory_extractions WHERE extraction_id = $1`, extractionID).Scan(&agent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", extractionID, core.ErrLearningNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("学习抽取: 读取抽取行 Agent（%s）: %w", extractionID, err)
+	}
+	return agent, nil
+}
+
 // BeginExtraction 在单事务内完成四件事（§3.1.7）：取 Agent advisory lock → 从 runs 行
 // 复制来源 → 重判同来源未决行 → 滚动 24h 尝试上限。判定先于任何写入：未决返回
 // ErrLearningUnresolved、预算耗尽返回 ErrLearningBudgetExhausted，两者都不建行、不发调用。
 // 通过后：存在 failed 且 attempts < 3 的行就把它改回 pending 并递增（window_from/to 不变，
 // 本次 Run 的身份与版本号刷新），否则插入新的 pending 行（attempts=1）。返回落库后的整行。
+//
+// token 非零时整个事务经 fencedTxWithPre：advisory 之后先锁**触发 Run** 的租约行并校验
+// owner + epoch + 未释放 + 未过期，通过后才读业务行、写重试或插入；零值只出现在未接
+// 执行权的装配（SQLite 谱系 / 轻装配），此时退化为原来的单事务路径。
 // BeginExtraction is the single execution point for unresolved blocking and the rolling
-// budget; both refusals happen before any write.
-func (r *LearningRepo) BeginExtraction(ctx context.Context, row core.LearningExtraction) (core.LearningExtraction, error) {
+// budget; both refusals happen before any write. A non-zero token wraps the whole
+// transaction in the lease fence on the triggering run.
+func (r *LearningRepo) BeginExtraction(ctx context.Context, row core.LearningExtraction,
+	token core.LeaseToken,
+) (core.LearningExtraction, error) {
+	// triggerRunID 是本次尝试要绑定的 Run。非零 token 时**只认 token.ResourceID**，
+	// 不得从 row.RunID 取：重试路径上 row.RunID 是首次 Run 的列值（UNIQUE 且不再改），
+	// 拿它做绑定 / fence 会挡住合法重试（§2.3.5「三个 Run 身份」）。零值 token 时服务
+	// 已在 LastAttemptRunID 上写好本次触发 Run，空值回退到 RunID 保持旧行为。
+	triggerRunID := row.LastAttemptRunID
+	if !token.IsZero() {
+		triggerRunID = token.ResourceID
+	} else if triggerRunID == "" {
+		triggerRunID = row.RunID
+	}
+
+	var out core.LearningExtraction
+	run := func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		out, err = r.beginExtractionTx(ctx, tx, row, triggerRunID)
+		return err
+	}
+	var err error
+	if token.IsZero() {
+		err = r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			if err := lockLearningAgent(ctx, tx, row.Agent); err != nil {
+				return err
+			}
+			return run(ctx, tx)
+		})
+	} else {
+		err = fencedTxWithPre(ctx, r.db, token,
+			func(ctx context.Context, tx *sql.Tx) error { return lockLearningAgent(ctx, tx, row.Agent) },
+			run)
+	}
+	if err != nil {
+		return core.LearningExtraction{}, err
+	}
+	return out, nil
+}
+
+// beginExtractionTx 是 BeginExtraction 的业务体：调用方已取到 advisory，fenced 路径
+// 还已校验租约；锁序从此处继续遵守 advisory → 租约行 → 业务行。
+// beginExtractionTx is the business body; the caller already holds the advisory and,
+// on the fenced path, the lease has been verified.
+func (r *LearningRepo) beginExtractionTx(ctx context.Context, tx *sql.Tx, row core.LearningExtraction,
+	triggerRunID string,
+) (core.LearningExtraction, error) {
 	now := row.LastAttemptAt
 	if now.IsZero() {
 		now = r.db.clock()
@@ -268,105 +372,115 @@ func (r *LearningRepo) BeginExtraction(ctx context.Context, row core.LearningExt
 	}
 	nowMs := now.UnixMilli()
 
-	var out core.LearningExtraction
-	err := r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		// 锁顺序固定为「advisory → 行锁」：提交事务与重试路径都按同一顺序取锁，不会互锁。
-		if _, err := tx.ExecContext(ctx,
-			`SELECT pg_advisory_xact_lock(hashtext('memory_extract:' || $1))`, row.Agent); err != nil {
-			return fmt.Errorf("学习抽取: 取 Agent 锁（agent=%s）: %w", row.Agent, err)
-		}
-		callerID, keyID, err := learningRunOrigin(ctx, tx, row.RunID)
-		if err != nil {
-			return err
-		}
-
-		// 未决阻断：pending 与未查证 unknown 都不建行、不发调用（恢复查证后自然解除）。
-		_, err = scanLearningExtraction(tx.QueryRowContext(ctx,
-			`SELECT `+learningExtractionColumns+`
-			   FROM memory_extractions
-			  WHERE agent_name = $1 AND session_id = $2
-			    AND origin_caller_id = $3 AND origin_key_id = $4
-			    AND (status = 'pending' OR (status = 'unknown' AND verified_at IS NULL))
-			  ORDER BY created_at DESC, extraction_id DESC
-			  LIMIT 1`, row.Agent, row.SessionID, callerID, keyID))
-		if err == nil {
-			return core.ErrLearningUnresolved
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("学习抽取: 判定未决行（agent=%s）: %w", row.Agent, err)
-		}
-
-		retry, retryErr := scanLearningExtraction(tx.QueryRowContext(ctx,
-			`SELECT `+learningExtractionColumns+`
-			   FROM memory_extractions
-			  WHERE agent_name = $1 AND session_id = $2
-			    AND origin_caller_id = $3 AND origin_key_id = $4
-			    AND status = 'failed' AND attempts < 3
-			  ORDER BY created_at DESC, extraction_id DESC
-			  LIMIT 1
-			  FOR UPDATE`, row.Agent, row.SessionID, callerID, keyID))
-		hasRetry := retryErr == nil
-		if retryErr != nil && !errors.Is(retryErr, sql.ErrNoRows) {
-			return fmt.Errorf("学习抽取: 读取可重试行（agent=%s）: %w", row.Agent, retryErr)
-		}
-
-		// 滚动预算：按每行 last_attempt_at 归组（重试计入）；达到上限即拒绝，宁可少算额度
-		// 也不超额（§3.1.12）。判定在写入之前，耗尽不建行、不增量。
-		var used int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(SUM(attempts), 0) FROM memory_extractions
-			  WHERE agent_name = $1 AND last_attempt_at >= $2`,
-			row.Agent, now.Add(-learningBudgetWindow).UnixMilli()).Scan(&used); err != nil {
-			return fmt.Errorf("学习抽取: 判定尝试预算（agent=%s）: %w", row.Agent, err)
-		}
-		if used >= learningAttemptsPerAgent {
-			return core.ErrLearningBudgetExhausted
-		}
-
-		if hasRetry {
-			out, err = scanLearningExtraction(tx.QueryRowContext(ctx,
-				`UPDATE memory_extractions
-				    SET status = 'pending', attempts = attempts + 1,
-				        last_attempt_run_id = $2, last_attempt_at = $3,
-				        provider = $4, model = $5, config_hash = $6,
-				        prompt_version = $7, rule_version = $8,
-				        finished_at = NULL, failure_class = NULL, error_message = NULL
-				  WHERE extraction_id = $1 AND status = 'failed'
-				 RETURNING `+learningExtractionColumns,
-				retry.ExtractionID, row.RunID, nowMs, row.Provider, row.Model,
-				nullIfEmpty(row.ConfigHash), row.PromptVersion, row.RuleVersion))
-			if err != nil {
-				return fmt.Errorf("学习抽取: 重试改回 pending（%s）: %w", retry.ExtractionID, err)
-			}
-			return nil
-		}
-
-		// 来源不取 row.OriginCallerID / row.OriginKeyID——即使调用方填了，也以 runs 行为准。
-		out, err = scanLearningExtraction(tx.QueryRowContext(ctx,
-			`INSERT INTO memory_extractions
-			   (extraction_id, agent_name, session_id, run_id, last_attempt_run_id,
-			    origin_caller_id, origin_key_id, status, window_from_message_id, window_to_message_id,
-			    window_messages, dropped_window_messages, prior_messages, attempts, existing_entries,
-			    items_total, items_accepted, items_dropped, prompt_version, rule_version, provider, model,
-			    config_hash, failure_class, error_message, created_at, last_attempt_at, finished_at, verified_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14,
-			         0, 0, 0, $15, $16, $17, $18, $19, NULL, NULL, $20, $21, NULL, NULL)
-			 RETURNING `+learningExtractionColumns,
-			row.ExtractionID, row.Agent, row.SessionID, row.RunID, row.RunID,
-			callerID, keyID, string(core.LearningExtractionPending),
-			row.WindowFromMessageID, row.WindowToMessageID, row.WindowMessages,
-			row.DroppedWindowMessages, row.PriorMessages, row.ExistingEntries,
-			row.PromptVersion, row.RuleVersion, row.Provider, row.Model,
-			nullIfEmpty(row.ConfigHash), createdAt.UnixMilli(), nowMs))
-		if err != nil {
-			return fmt.Errorf("学习抽取: 预写抽取行（%s）: %w", row.ExtractionID, err)
-		}
-		return nil
-	})
+	callerID, keyID, err := learningRunOrigin(ctx, tx, row.RunID)
 	if err != nil {
 		return core.LearningExtraction{}, err
 	}
+
+	// 未决阻断：pending 与未查证 unknown 都不建行、不发调用（恢复查证后自然解除）。
+	_, err = scanLearningExtraction(tx.QueryRowContext(ctx,
+		`SELECT `+learningExtractionColumns+`
+		   FROM memory_extractions
+		  WHERE agent_name = $1 AND session_id = $2
+		    AND origin_caller_id = $3 AND origin_key_id = $4
+		    AND (status = 'pending' OR (status = 'unknown' AND verified_at IS NULL))
+		  ORDER BY created_at DESC, extraction_id DESC
+		  LIMIT 1`, row.Agent, row.SessionID, callerID, keyID))
+	if err == nil {
+		return core.LearningExtraction{}, core.ErrLearningUnresolved
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return core.LearningExtraction{}, fmt.Errorf("学习抽取: 判定未决行（agent=%s）: %w", row.Agent, err)
+	}
+
+	retry, retryErr := scanLearningExtraction(tx.QueryRowContext(ctx,
+		`SELECT `+learningExtractionColumns+`
+		   FROM memory_extractions
+		  WHERE agent_name = $1 AND session_id = $2
+		    AND origin_caller_id = $3 AND origin_key_id = $4
+		    AND status = 'failed' AND attempts < 3
+		  ORDER BY created_at DESC, extraction_id DESC
+		  LIMIT 1
+		  FOR UPDATE`, row.Agent, row.SessionID, callerID, keyID))
+	hasRetry := retryErr == nil
+	if retryErr != nil && !errors.Is(retryErr, sql.ErrNoRows) {
+		return core.LearningExtraction{}, fmt.Errorf("学习抽取: 读取可重试行（agent=%s）: %w", row.Agent, retryErr)
+	}
+
+	// 滚动预算：按每行 last_attempt_at 归组（重试计入）；达到上限即拒绝，宁可少算额度
+	// 也不超额（§3.1.12）。判定在写入之前，耗尽不建行、不增量。
+	var used int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(attempts), 0) FROM memory_extractions
+		  WHERE agent_name = $1 AND last_attempt_at >= $2`,
+		row.Agent, now.Add(-learningBudgetWindow).UnixMilli()).Scan(&used); err != nil {
+		return core.LearningExtraction{}, fmt.Errorf("学习抽取: 判定尝试预算（agent=%s）: %w", row.Agent, err)
+	}
+	if used >= learningAttemptsPerAgent {
+		return core.LearningExtraction{}, core.ErrLearningBudgetExhausted
+	}
+
+	if hasRetry {
+		// 重试的 UPDATE 带两个 CAS 预期值（§2.3.5）：行已在同一事务里 FOR UPDATE，
+		// 预期值来自锁内重读，不会与并发改写赛跑；条件保留为防御——未来若去掉行锁，
+		// 它仍然拒绝"扫到之后已被换手"的写入。0 行按冲突上抛，不改任何行。
+		out, err := scanLearningExtraction(tx.QueryRowContext(ctx,
+			`UPDATE memory_extractions
+			    SET status = 'pending', attempts = attempts + 1,
+			        last_attempt_run_id = $2, last_attempt_at = $3,
+			        provider = $4, model = $5, config_hash = $6,
+			        prompt_version = $7, rule_version = $8,
+			        finished_at = NULL, failure_class = NULL, error_message = NULL
+			  WHERE extraction_id = $1 AND status = 'failed'
+			    AND attempts = $9 AND last_attempt_run_id = $10
+			 RETURNING `+learningExtractionColumns,
+			retry.ExtractionID, triggerRunID, nowMs, row.Provider, row.Model,
+			nullIfEmpty(row.ConfigHash), row.PromptVersion, row.RuleVersion,
+			retry.Attempts, retry.LastAttemptRunID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return core.LearningExtraction{}, fmt.Errorf(
+				"学习抽取: 重试预期值已变（%s）: %w", retry.ExtractionID, core.ErrConflict)
+		}
+		if err != nil {
+			return core.LearningExtraction{}, fmt.Errorf("学习抽取: 重试改回 pending（%s）: %w", retry.ExtractionID, err)
+		}
+		return out, nil
+	}
+
+	// 来源不取 row.OriginCallerID / row.OriginKeyID——即使调用方填了，也以 runs 行为准。
+	out, err := scanLearningExtraction(tx.QueryRowContext(ctx,
+		`INSERT INTO memory_extractions
+		   (extraction_id, agent_name, session_id, run_id, last_attempt_run_id,
+		    origin_caller_id, origin_key_id, status, window_from_message_id, window_to_message_id,
+		    window_messages, dropped_window_messages, prior_messages, attempts, existing_entries,
+		    items_total, items_accepted, items_dropped, prompt_version, rule_version, provider, model,
+		    config_hash, failure_class, error_message, created_at, last_attempt_at, finished_at, verified_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, $14,
+		         0, 0, 0, $15, $16, $17, $18, $19, NULL, NULL, $20, $21, NULL, NULL)
+		 RETURNING `+learningExtractionColumns,
+		row.ExtractionID, row.Agent, row.SessionID, row.RunID, triggerRunID,
+		callerID, keyID, string(core.LearningExtractionPending),
+		row.WindowFromMessageID, row.WindowToMessageID, row.WindowMessages,
+		row.DroppedWindowMessages, row.PriorMessages, row.ExistingEntries,
+		row.PromptVersion, row.RuleVersion, row.Provider, row.Model,
+		nullIfEmpty(row.ConfigHash), createdAt.UnixMilli(), nowMs))
+	if err != nil {
+		return core.LearningExtraction{}, fmt.Errorf("学习抽取: 预写抽取行（%s）: %w", row.ExtractionID, err)
+	}
 	return out, nil
+}
+
+// learningFailWrite 是一次失败回填的输入（包内结构，避免九参签名在事务体里重复展开）。
+// learningFailWrite carries one failure write into the transaction body.
+type learningFailWrite struct {
+	extractionID     string
+	triggerRunID     string
+	fenced           bool
+	expectedPrev     string
+	expectedAttempts int
+	class            core.LearningFailureClass
+	message          string
+	failedAt         time.Time
 }
 
 // FailExtraction 在事务内把行 FOR UPDATE 后写失败终态（§3.1.7）：
@@ -379,73 +493,144 @@ func (r *LearningRepo) BeginExtraction(ctx context.Context, row core.LearningExt
 // 清理时行还停在上一次尝试的 failed；若不在这里终结，行会永远 failed（attempts
 // 不增、finished_at 为空、游标不推进），同来源新窗口被永久阻断。其余非 pending
 // 行是幂等空操作：恢复已查证的 unknown 绝不被一次迟到的失败回填覆盖。
-// FailExtraction writes the failure state under a row lock; the source states are pending,
-// or failed+window_gone on the C-33 retry path; every other state is a no-op.
-func (r *LearningRepo) FailExtraction(ctx context.Context, extractionID string, class core.LearningFailureClass, message string, failedAt time.Time) error {
+//
+// 归属保护（§2.3.5 / FR-24-36）：token 非零时事务经 fencedTxWithPre，先 advisory、
+// 再锁**触发 Run** 的租约行并校验 owner + epoch + 未释放 + 未过期；pending 分支在
+// 行锁后断言 last_attempt_run_id = triggerRunID。window_gone 分支不 fence
+// last_attempt_run_id（本轮没有 Begin，它停在上一次尝试），改用三条同时成立的受控
+// 收尾条件：① 当前租约（外壳校验）；② 同来源；③ 预期旧尝试 CAS。
+// FailExtraction writes the failure state under the fenced lease on the triggering run;
+// the window_gone path instead verifies current lease + same origin + expected old attempt.
+func (r *LearningRepo) FailExtraction(ctx context.Context, extractionID, triggerRunID string,
+	token core.LeaseToken, expectedPrev string, expectedAttempts int,
+	class core.LearningFailureClass, message string, failedAt time.Time,
+) error {
 	if !learningFailureClassAllowed(class) {
 		return fmt.Errorf("学习抽取: 失败分类取值域外：%q", class)
+	}
+	if !token.IsZero() && triggerRunID != token.ResourceID {
+		// fence 对象必须就是 token 所属的 Run；两者不一致说明调用方把身份拆开了，
+		// 继续执行会让租约 A 替 Run B 背书。
+		return fmt.Errorf("学习抽取: fence 对象与执行权凭证不一致（trigger=%s, token=%s）",
+			triggerRunID, token.ResourceID)
 	}
 	if failedAt.IsZero() {
 		failedAt = r.db.clock()
 	}
-	return r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		var (
-			agent, sessionID, callerID, keyID, status string
-			attempts                                  int
-			windowTo                                  int64
-		)
-		err := tx.QueryRowContext(ctx,
-			`SELECT agent_name, session_id, origin_caller_id, origin_key_id, status, attempts,
-			        window_to_message_id
-			   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, extractionID).
-			Scan(&agent, &sessionID, &callerID, &keyID, &status, &attempts, &windowTo)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", extractionID, core.ErrLearningNotFound)
-		}
+	write := learningFailWrite{
+		extractionID:     extractionID,
+		triggerRunID:     triggerRunID,
+		fenced:           !token.IsZero(),
+		expectedPrev:     expectedPrev,
+		expectedAttempts: expectedAttempts,
+		class:            class,
+		message:          message,
+		failedAt:         failedAt,
+	}
+	pre := func(ctx context.Context, tx *sql.Tx) error {
+		agent, err := learningAgentOf(ctx, tx, extractionID)
 		if err != nil {
-			return fmt.Errorf("学习抽取: 读取失败回填目标（%s）: %w", extractionID, err)
+			return err
 		}
-		fromStatus := string(core.LearningExtractionPending)
-		switch {
-		case status == fromStatus:
-		case status == string(core.LearningExtractionFailed) && class == core.LearningFailureWindowGone:
-			// C-33 重试路径：行仍是上一次尝试的 failed，直接终结为 skipped。
-			fromStatus = string(core.LearningExtractionFailed)
-		default:
-			return nil // 已恢复 / 已终结：不覆盖
-		}
-
-		terminal := class == core.LearningFailureWindowGone || attempts >= 3
-		target := core.LearningExtractionFailed
-		if terminal {
-			target = core.LearningExtractionSkipped
-		}
-		var finishedAt any
-		if terminal {
-			finishedAt = failedAt.UnixMilli()
-		}
-		res, err := tx.ExecContext(ctx,
-			`UPDATE memory_extractions
-			    SET status = $2, failure_class = $3, error_message = $4, finished_at = $5
-			  WHERE extraction_id = $1 AND status = $6`,
-			extractionID, string(target), string(class),
-			nullIfEmpty(truncateUTF8(message, learningErrorLimit)), finishedAt, fromStatus)
-		if err != nil {
-			return fmt.Errorf("学习抽取: 写失败终态（%s）: %w", extractionID, err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("学习抽取: 确认失败终态写入（%s）: %w", extractionID, err)
-		}
-		if affected != 1 {
-			// 行锁在手却改不动：只剩"状态在锁外被改"这一种可能，按冲突上抛。
-			return fmt.Errorf("学习抽取: 失败终态写入未生效（%s）: %w", extractionID, core.ErrConflict)
-		}
-		if terminal {
-			return advanceLearningCursor(ctx, tx, agent, sessionID, callerID, keyID, windowTo, failedAt)
-		}
-		return nil
+		return lockLearningAgent(ctx, tx, agent)
+	}
+	if token.IsZero() {
+		return r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			if err := pre(ctx, tx); err != nil {
+				return err
+			}
+			return r.failExtractionTx(ctx, tx, write)
+		})
+	}
+	return fencedTxWithPre(ctx, r.db, token, pre, func(ctx context.Context, tx *sql.Tx) error {
+		return r.failExtractionTx(ctx, tx, write)
 	})
+}
+
+// failExtractionTx 是失败回填的业务体：调用方已取 advisory，fenced 路径还已校验租约。
+// failExtractionTx is the business body under the already-held advisory and lease fence.
+func (r *LearningRepo) failExtractionTx(ctx context.Context, tx *sql.Tx, w learningFailWrite) error {
+	row, err := scanLearningExtraction(tx.QueryRowContext(ctx,
+		`SELECT `+learningExtractionColumns+`
+		   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, w.extractionID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", w.extractionID, core.ErrLearningNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("学习抽取: 读取失败回填目标（%s）: %w", w.extractionID, err)
+	}
+
+	fromStatus := string(core.LearningExtractionPending)
+	controlled := false
+	switch {
+	case row.Status == core.LearningExtractionPending:
+		if w.fenced && row.LastAttemptRunID != w.triggerRunID {
+			// 本轮已 Begin 过，last_attempt_run_id 必然等于触发 Run；不等说明行被
+			// 换手（并发重试 / 恢复抢先），按冲突退出，不写失败终态（§2.3.5 表）。
+			return fmt.Errorf("学习抽取: 失败回填目标已被换手（%s，last_attempt_run_id=%s）: %w",
+				w.extractionID, row.LastAttemptRunID, core.ErrConflict)
+		}
+	case row.Status == core.LearningExtractionFailed && w.class == core.LearningFailureWindowGone:
+		// C-33 重试路径：行仍是上一次尝试的 failed，直接终结为 skipped。
+		if w.triggerRunID == "" {
+			return fmt.Errorf("学习抽取: window_gone 收尾缺少触发 Run（%s）: %w",
+				w.extractionID, core.ErrConflict)
+		}
+		origin, err := learningRunIdentity(ctx, tx, w.triggerRunID)
+		if err != nil {
+			return err
+		}
+		// 同来源：四项逐项相等，否则这个 Run 与该抽取行无关，不得替它收尾。
+		if origin.Agent != row.Agent || origin.SessionID != row.SessionID ||
+			origin.CallerID != row.OriginCallerID || origin.KeyID != row.OriginKeyID {
+			return fmt.Errorf("学习抽取: window_gone 收尾来源不符（%s）: %w",
+				w.extractionID, core.ErrConflict)
+		}
+		fromStatus = string(core.LearningExtractionFailed)
+		controlled = true
+	default:
+		return nil // 已恢复 / 已终结：不覆盖
+	}
+
+	terminal := w.class == core.LearningFailureWindowGone || row.Attempts >= 3
+	target := core.LearningExtractionFailed
+	if terminal {
+		target = core.LearningExtractionSkipped
+	}
+	var finishedAt any
+	if terminal {
+		finishedAt = w.failedAt.UnixMilli()
+	}
+	query := `UPDATE memory_extractions
+		    SET status = $2, failure_class = $3, error_message = $4, finished_at = $5
+		  WHERE extraction_id = $1 AND status = $6`
+	args := []any{
+		w.extractionID, string(target), string(w.class),
+		nullIfEmpty(truncateUTF8(w.message, learningErrorLimit)), finishedAt, fromStatus,
+	}
+	if controlled {
+		// 受控收尾条件 ③：预期旧尝试。这条 SQL 一个字都不改 attempts / last_attempt_run_id
+		// ——这次 Run 没有真正尝试过，不计费也不冒名顶替上一次尝试。
+		query += ` AND last_attempt_run_id = $7 AND attempts = $8`
+		args = append(args, w.expectedPrev, w.expectedAttempts)
+	}
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("学习抽取: 写失败终态（%s）: %w", w.extractionID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("学习抽取: 确认失败终态写入（%s）: %w", w.extractionID, err)
+	}
+	if affected != 1 {
+		// 行锁在手却改不动：只剩"状态 / 预期值在锁外被改"这一类可能，按冲突上抛。
+		return fmt.Errorf("学习抽取: 失败终态写入未生效（%s）: %w", w.extractionID, core.ErrConflict)
+	}
+	if terminal {
+		return advanceLearningCursor(ctx, tx, row.Agent, row.SessionID,
+			row.OriginCallerID, row.OriginKeyID, row.WindowToMessageID, w.failedAt)
+	}
+	return nil
 }
 
 // CommitExtraction 在单事务内写候选、元数据、来源关系、草案行、success 状态并推进游标
@@ -453,104 +638,140 @@ func (r *LearningRepo) FailExtraction(ctx context.Context, extractionID string, 
 // 去重与来源子集在**事务内按数据库重新判定**——提示词快照只有 8 KiB，截断的快照不得让
 // 重复条目漏过，也不得让模型把不存在的条目当成来源。被事务内判定丢弃的候选计入
 // items_dropped、从 items_accepted 中扣除，账本与实际写入行保持一致。
+//
+// token 非零时事务经 fencedTxWithPre：advisory 之后锁**触发 Run** 的租约行并校验，
+// 行锁后再断言 last_attempt_run_id = trigger.RunID；任何一步不成立候选 / 草案 / 游标
+// 零写入。
 // CommitExtraction re-judges dedupe and source existence inside the transaction and
-// keeps the ledger counts consistent with the rows actually written.
-func (r *LearningRepo) CommitExtraction(ctx context.Context, req core.CommitLearningExtraction) (core.LearningCommitResult, error) {
+// keeps the ledger counts consistent with the rows actually written; a non-zero token
+// fences the whole commit on the triggering run's lease.
+func (r *LearningRepo) CommitExtraction(ctx context.Context, req core.CommitLearningExtraction,
+	token core.LeaseToken,
+) (core.LearningCommitResult, error) {
 	now := req.CompletedAt
 	if now.IsZero() {
 		now = r.db.clock()
 	}
+	fenceRunID := token.ResourceID // 零值 token 时为空串：不加绑定断言
+
+	// 先做**不加锁**的 Agent 读取，再取 advisory lock，最后取行锁：锁顺序与
+	// BeginExtraction 一致（advisory → 租约行 → 业务行），不会与「重试改回 pending」互锁。
+	pre := func(ctx context.Context, tx *sql.Tx) error {
+		agent, err := learningAgentOf(ctx, tx, req.ExtractionID)
+		if err != nil {
+			return err
+		}
+		return lockLearningAgent(ctx, tx, agent)
+	}
+	var result core.LearningCommitResult
+	run := func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		result, err = r.commitExtractionTx(ctx, tx, req, now, fenceRunID)
+		return err
+	}
+	var err error
+	if token.IsZero() {
+		err = r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+			if err := pre(ctx, tx); err != nil {
+				return err
+			}
+			return run(ctx, tx)
+		})
+	} else {
+		err = fencedTxWithPre(ctx, r.db, token, pre, run)
+	}
+	if err != nil {
+		return core.LearningCommitResult{}, err
+	}
+	return result, nil
+}
+
+// commitExtractionTx 是提交事务的业务体：advisory 已由调用方取到，fenced 路径还已校验
+// 租约；锁序继续遵守 advisory → 租约行 → 业务行。
+// commitExtractionTx is the commit body; the advisory (and, when fenced, the lease) is
+// already held by the caller.
+func (r *LearningRepo) commitExtractionTx(ctx context.Context, tx *sql.Tx,
+	req core.CommitLearningExtraction, now time.Time, fenceRunID string,
+) (core.LearningCommitResult, error) {
 	nowMs := now.UnixMilli()
 	result := core.LearningCommitResult{}
 
-	err := r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		// 先做**不加锁**的 Agent 读取，再取 advisory lock，最后取行锁：锁顺序与
-		// BeginExtraction 一致（advisory → 行锁），不会与"重试改回 pending"互锁。
-		var agent string
-		err := tx.QueryRowContext(ctx,
-			`SELECT agent_name FROM memory_extractions WHERE extraction_id = $1`, req.ExtractionID).
-			Scan(&agent)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", req.ExtractionID, core.ErrLearningNotFound)
-		}
+	row, err := scanLearningExtraction(tx.QueryRowContext(ctx,
+		`SELECT `+learningExtractionColumns+`
+		   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, req.ExtractionID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return result, fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", req.ExtractionID, core.ErrLearningNotFound)
+	}
+	if err != nil {
+		return result, fmt.Errorf("学习抽取: 锁定提交目标（%s）: %w", req.ExtractionID, err)
+	}
+	if row.Status != core.LearningExtractionPending {
+		// 已被恢复查证或已终结：不覆盖已恢复行（提交只会发生在 pending 上）。
+		return result, fmt.Errorf("学习抽取: 提交目标不在 pending（%s，status=%s）: %w",
+			req.ExtractionID, row.Status, core.ErrConflict)
+	}
+	if fenceRunID != "" && row.LastAttemptRunID != fenceRunID {
+		// 行锁后断言本轮绑定（§2.3.5）：不等说明行被换手，零写入退出。
+		return result, fmt.Errorf("学习抽取: 提交目标绑定的是另一次尝试（%s，last_attempt_run_id=%s）: %w",
+			req.ExtractionID, row.LastAttemptRunID, core.ErrConflict)
+	}
+
+	droppedAtCommit := 0
+	for _, candidate := range req.Candidates {
+		entryID, written, err := commitLearningCandidate(ctx, tx, row, candidate, nowMs)
 		if err != nil {
-			return fmt.Errorf("学习抽取: 读取提交目标（%s）: %w", req.ExtractionID, err)
+			return result, err
+		}
+		if !written {
+			droppedAtCommit++
+			continue
+		}
+		result.CandidateEntryIDs = append(result.CandidateEntryIDs, entryID)
+	}
+
+	for _, draft := range req.Drafts {
+		evidenceJSON, err := marshalLearningEvidence(draft.Evidence)
+		if err != nil {
+			return result, fmt.Errorf("学习抽取: 序列化草案证据（%s）: %w", draft.DraftID, err)
+		}
+		createdAt := draft.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = now
 		}
 		if _, err := tx.ExecContext(ctx,
-			`SELECT pg_advisory_xact_lock(hashtext('memory_extract:' || $1))`, agent); err != nil {
-			return fmt.Errorf("学习抽取: 取 Agent 锁（agent=%s）: %w", agent, err)
+			`INSERT INTO memory_method_drafts
+			   (draft_id, extraction_id, agent_name, name, content_sha256, evidence_json, rel_dir, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			draft.DraftID, req.ExtractionID, row.Agent, draft.Name, draft.ContentSHA256,
+			evidenceJSON, draft.RelDir, createdAt.UnixMilli()); err != nil {
+			return result, fmt.Errorf("学习抽取: 写草案行（%s）: %w", draft.DraftID, err)
 		}
+		result.DraftIDs = append(result.DraftIDs, draft.DraftID)
+	}
 
-		row, err := scanLearningExtraction(tx.QueryRowContext(ctx,
-			`SELECT `+learningExtractionColumns+`
-			   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, req.ExtractionID))
-		if err != nil {
-			return fmt.Errorf("学习抽取: 锁定提交目标（%s）: %w", req.ExtractionID, err)
-		}
-		if row.Status != core.LearningExtractionPending {
-			// 已被恢复查证或已终结：不覆盖已恢复行（提交只会发生在 pending 上）。
-			return fmt.Errorf("学习抽取: 提交目标不在 pending（%s，status=%s）: %w",
-				req.ExtractionID, row.Status, core.ErrConflict)
-		}
-
-		droppedAtCommit := 0
-		for _, candidate := range req.Candidates {
-			entryID, written, err := commitLearningCandidate(ctx, tx, row, candidate, nowMs)
-			if err != nil {
-				return err
-			}
-			if !written {
-				droppedAtCommit++
-				continue
-			}
-			result.CandidateEntryIDs = append(result.CandidateEntryIDs, entryID)
-		}
-
-		for _, draft := range req.Drafts {
-			evidenceJSON, err := marshalLearningEvidence(draft.Evidence)
-			if err != nil {
-				return fmt.Errorf("学习抽取: 序列化草案证据（%s）: %w", draft.DraftID, err)
-			}
-			createdAt := draft.CreatedAt
-			if createdAt.IsZero() {
-				createdAt = now
-			}
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO memory_method_drafts
-				   (draft_id, extraction_id, agent_name, name, content_sha256, evidence_json, rel_dir, created_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				draft.DraftID, req.ExtractionID, row.Agent, draft.Name, draft.ContentSHA256,
-				evidenceJSON, draft.RelDir, createdAt.UnixMilli()); err != nil {
-				return fmt.Errorf("学习抽取: 写草案行（%s）: %w", draft.DraftID, err)
-			}
-			result.DraftIDs = append(result.DraftIDs, draft.DraftID)
-		}
-
-		accepted := req.ItemsAccepted - droppedAtCommit
-		if accepted < 0 {
-			accepted = 0
-		}
-		res, err := tx.ExecContext(ctx,
-			`UPDATE memory_extractions
-			    SET status = 'success', items_total = $2, items_accepted = $3,
-			        items_dropped = $4, finished_at = $5
-			  WHERE extraction_id = $1 AND status = 'pending'`,
-			req.ExtractionID, req.ItemsTotal, accepted, req.ItemsDropped+droppedAtCommit, nowMs)
-		if err != nil {
-			return fmt.Errorf("学习抽取: 写提交终态（%s）: %w", req.ExtractionID, err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("学习抽取: 确认提交终态写入（%s）: %w", req.ExtractionID, err)
-		}
-		if affected != 1 {
-			return fmt.Errorf("学习抽取: 提交终态写入未生效（%s）: %w", req.ExtractionID, core.ErrConflict)
-		}
-		return advanceLearningCursor(ctx, tx, row.Agent, row.SessionID,
-			row.OriginCallerID, row.OriginKeyID, row.WindowToMessageID, now)
-	})
+	accepted := req.ItemsAccepted - droppedAtCommit
+	if accepted < 0 {
+		accepted = 0
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE memory_extractions
+		    SET status = 'success', items_total = $2, items_accepted = $3,
+		        items_dropped = $4, finished_at = $5
+		  WHERE extraction_id = $1 AND status = 'pending'`,
+		req.ExtractionID, req.ItemsTotal, accepted, req.ItemsDropped+droppedAtCommit, nowMs)
 	if err != nil {
-		return core.LearningCommitResult{}, err
+		return result, fmt.Errorf("学习抽取: 写提交终态（%s）: %w", req.ExtractionID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return result, fmt.Errorf("学习抽取: 确认提交终态写入（%s）: %w", req.ExtractionID, err)
+	}
+	if affected != 1 {
+		return result, fmt.Errorf("学习抽取: 提交终态写入未生效（%s）: %w", req.ExtractionID, core.ErrConflict)
+	}
+	if err := advanceLearningCursor(ctx, tx, row.Agent, row.SessionID,
+		row.OriginCallerID, row.OriginKeyID, row.WindowToMessageID, now); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -710,13 +931,56 @@ func advanceLearningCursor(ctx context.Context, tx *sql.Tx, agent, sessionID, ca
 	return nil
 }
 
-// PendingExtractions 返回所有 pending 行供启动恢复查证（只查证、不重放）。
-// PendingExtractions lists every pending row for startup verification; nothing is replayed.
+// learningOrphanPredicate 是 pending 抽取行的**归属判据**（P-18 / §2.3.5 B3）：最近一次
+// 尝试的 Run（last_attempt_run_id，重试时会被改写）已无有效 run 租约，才说明属主失联、
+// 这行不会有人收尾。启动扫描与回收器 B3 共用这一份谓词——两处各写一份会在改判定时漂移，
+// 而漂移的后果是"别人还在跑，我们就把它正在收尾的抽取判成孤儿"。
+//
+// 用 last_attempt_run_id 而不是 run_id：后者是首次创建行且 UNIQUE，拿它判会漏掉重试中
+// 的活属主（§2.3.5）。无归属信息的历史行（无对应租约行）同样入选——没有属主可等。
+// The shared ownership predicate. It reads last_attempt_run_id, never run_id: the latter
+// is the first attempt and never moves, so it would miss a live retry owner.
+const learningOrphanPredicate = `
+   AND NOT EXISTS (
+         SELECT 1
+           FROM execution_leases l
+          WHERE l.kind = 'run'
+            AND l.resource_id = e.last_attempt_run_id
+            AND l.released_at IS NULL
+            AND l.expires_at > (extract(epoch from clock_timestamp()) * 1000)::bigint)`
+
+// PendingExtractions 返回**属主已失联**的 pending 行供启动恢复查证（只查证、不重放）。
+// 仍有有效 run 租约的行由属主自己收尾，这里不入选（P-18）。
+// PendingExtractions lists pending rows whose owner is gone; a live owner keeps its row.
 func (r *LearningRepo) PendingExtractions(ctx context.Context) ([]core.LearningExtraction, error) {
-	rows, err := r.db.pool.QueryContext(ctx,
-		`SELECT `+learningExtractionColumns+`
-		   FROM memory_extractions WHERE status = 'pending'
-		  ORDER BY created_at, extraction_id`)
+	return r.pendingExtractions(ctx, 0)
+}
+
+// OrphanPendingExtractions 是回收器 B3 的读面：同一归属判据 + 每轮条数上限。预期值
+// （last_attempt_run_id）随行一起带出，供写入事务重检（R6）。
+// OrphanPendingExtractions is the bounded B3 read face; the expected attempt travels
+// with each row so the write transaction can re-check it.
+func (r *LearningRepo) OrphanPendingExtractions(ctx context.Context, limit int) ([]core.LearningExtraction, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("学习抽取: 孤儿扫描的条数上限必须为正（收到 %d）", limit)
+	}
+	return r.pendingExtractions(ctx, limit)
+}
+
+// pendingExtractions 是两个读面的共同实现；limit <= 0 表示不限条数。
+// pendingExtractions is the shared implementation; a non-positive limit means no bound.
+func (r *LearningRepo) pendingExtractions(ctx context.Context, limit int) ([]core.LearningExtraction, error) {
+	query := `SELECT ` + learningExtractionColumns + `
+	   FROM memory_extractions e
+	  WHERE e.status = 'pending'` + learningOrphanPredicate + `
+	  ORDER BY e.created_at, e.extraction_id`
+	var args []any
+	if limit > 0 {
+		query += `
+	  LIMIT $1`
+		args = append(args, limit)
+	}
+	rows, err := r.db.pool.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("学习抽取: 列出待决行: %w", err)
 	}
@@ -760,54 +1024,108 @@ func (r *LearningRepo) ExtractionDraftCount(ctx context.Context, extractionID st
 	return count, nil
 }
 
-// RecoverExtraction 在单事务内只处理 pending 行：写 success / unknown 与 verified_at，
-// 并把该行来源的游标推进到 window_to_message_id（unknown 也不重放）。已处理过的行是
-// 幂等空操作——恢复不能把已查证的结论改口。
-// RecoverExtraction verifies a pending row in one transaction; a non-pending row is a no-op.
-func (r *LearningRepo) RecoverExtraction(ctx context.Context, extractionID string,
-	status core.LearningExtractionState, verifiedAt time.Time,
-) error {
-	if status != core.LearningExtractionSuccess && status != core.LearningExtractionUnknown {
-		return fmt.Errorf("学习抽取: 恢复查证状态取值域外：%q", status)
+// RecoverExtraction 在单事务内**受归属保护**地写查证结论（P-18 / §2.3.5 / R6 / R7）。
+// 锁序与学习写面一致，不得倒置：
+//
+//	advisory(agent) → 租约行 `FOR UPDATE` → 抽取行 `FOR UPDATE`
+//
+// 获锁后用**数据库时间**重判扫描时那次尝试（ExpectedLastAttemptRunID）的 run 租约是否
+// 仍失效——`NOT EXISTS` 只是快照读、与续约不互斥，只有行锁能排队；续约事务先提交时这里
+// 会读到推后的 expires_at 并跳过。随后断言抽取行仍是那次尝试（status='pending' 且
+// last_attempt_run_id=$expected），任一不成立返回 recovered=false 且**零写入**（行已被
+// 合法重试接手或属主仍活着，不是错误）。通过才写 success / unknown 与 verified_at，并把
+// 来源游标推进到 window_to_message_id（unknown 也不重放）。
+//
+// RecoverExtraction writes one verdict under the learning lock order. A stale scan (the
+// row was legitimately retried) or a still-live owner yields recovered=false with zero
+// writes; only the lease row lock can serialize against renewal.
+func (r *LearningRepo) RecoverExtraction(ctx context.Context,
+	req core.RecoverLearningExtraction,
+) (bool, error) {
+	if req.Verdict != core.LearningExtractionSuccess && req.Verdict != core.LearningExtractionUnknown {
+		return false, fmt.Errorf("学习抽取: 恢复查证状态取值域外：%q", req.Verdict)
+	}
+	verifiedAt := req.VerifiedAt
+	if verifiedAt.IsZero() {
+		verifiedAt = req.Now
 	}
 	if verifiedAt.IsZero() {
 		verifiedAt = r.db.clock()
 	}
-	return r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	// advisory 之前的不加锁读：普通 SELECT 不取行锁，不改变锁序（与 Commit / Fail 同形）。
+	agent, err := learningAgentOf(ctx, r.db.pool, req.ExtractionID)
+	if err != nil {
+		return false, err
+	}
+
+	recovered := false
+	err = r.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if err := lockLearningAgent(ctx, tx, agent); err != nil {
+			return err
+		}
+		// ① 锁**扫描时那次尝试**的租约行。行不存在 = 该 Run 从未领取租约，没有可续约的
+		//    属主，直接进抽取行判定。
+		row, found, err := lockLeaseRow(ctx, tx, core.LeaseRun, req.ExpectedLastAttemptRunID)
+		if err != nil {
+			return fmt.Errorf("学习抽取: 锁定预期尝试的租约（%s）: %w",
+				req.ExpectedLastAttemptRunID, err)
+		}
+		// ② 获锁后用数据库时间重判：仍有效 ⇒ 属主还活着，本轮零写入跳过。
+		if found && !row.Released.Valid {
+			nowMS, err := readDBMillis(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if row.Expires > nowMS {
+				return nil
+			}
+		}
+		// ③ 抽取行 FOR UPDATE，再断言行仍是那次尝试。
 		var (
-			agent, sessionID, callerID, keyID, current string
-			windowTo                                   int64
+			sessionID, callerID, keyID, current, lastAttempt string
+			windowTo                                         int64
 		)
-		err := tx.QueryRowContext(ctx,
-			`SELECT agent_name, session_id, origin_caller_id, origin_key_id, status,
+		err = tx.QueryRowContext(ctx,
+			`SELECT session_id, origin_caller_id, origin_key_id, status, last_attempt_run_id,
 			        window_to_message_id
-			   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, extractionID).
-			Scan(&agent, &sessionID, &callerID, &keyID, &current, &windowTo)
+			   FROM memory_extractions WHERE extraction_id = $1 FOR UPDATE`, req.ExtractionID).
+			Scan(&sessionID, &callerID, &keyID, &current, &lastAttempt, &windowTo)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", extractionID, core.ErrLearningNotFound)
+			return fmt.Errorf("学习抽取: 抽取行不存在（%s）: %w", req.ExtractionID, core.ErrLearningNotFound)
 		}
 		if err != nil {
-			return fmt.Errorf("学习抽取: 读取恢复目标（%s）: %w", extractionID, err)
+			return fmt.Errorf("学习抽取: 读取恢复目标（%s）: %w", req.ExtractionID, err)
 		}
-		if current != string(core.LearningExtractionPending) {
-			return nil // 已查证 / 已终结：不改口
+		if current != string(core.LearningExtractionPending) ||
+			lastAttempt != req.ExpectedLastAttemptRunID {
+			return nil // 已查证 / 已终结，或扫描后已被合法重试接手：不改口、零写入
 		}
 		res, err := tx.ExecContext(ctx,
 			`UPDATE memory_extractions SET status = $2, verified_at = $3
-			  WHERE extraction_id = $1 AND status = 'pending'`,
-			extractionID, string(status), verifiedAt.UnixMilli())
+			  WHERE extraction_id = $1 AND status = 'pending' AND last_attempt_run_id = $4`,
+			req.ExtractionID, string(req.Verdict), verifiedAt.UnixMilli(),
+			req.ExpectedLastAttemptRunID)
 		if err != nil {
-			return fmt.Errorf("学习抽取: 写恢复结论（%s）: %w", extractionID, err)
+			return fmt.Errorf("学习抽取: 写恢复结论（%s）: %w", req.ExtractionID, err)
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("学习抽取: 确认恢复结论写入（%s）: %w", extractionID, err)
+			return fmt.Errorf("学习抽取: 确认恢复结论写入（%s）: %w", req.ExtractionID, err)
 		}
 		if affected != 1 {
-			return fmt.Errorf("学习抽取: 恢复结论写入未生效（%s）: %w", extractionID, core.ErrConflict)
+			return fmt.Errorf("学习抽取: 恢复结论写入未生效（%s）: %w", req.ExtractionID, core.ErrConflict)
 		}
-		return advanceLearningCursor(ctx, tx, agent, sessionID, callerID, keyID, windowTo, verifiedAt)
+		if err := advanceLearningCursor(ctx, tx, agent, sessionID, callerID, keyID,
+			windowTo, verifiedAt); err != nil {
+			return err
+		}
+		recovered = true
+		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return recovered, nil
 }
 
 // ListExtractions 是管理台与 CLI 的只读列表：主键倒序、可选 Agent / 状态过滤，并带出

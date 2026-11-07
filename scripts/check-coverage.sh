@@ -15,11 +15,14 @@
 # Generating the profile runs `-tags=integration`, so BASALT_TEST_PG_DSN is required and
 # its absence is a failure (D-01); the injected-profile mode runs no tests.
 #
-# 阈值 / thresholds: core / tool / memory / storage / postgres >= 70%，其余 >= 50%。
+# 阈值 / thresholds: core / tool / memory / storage / postgres / assets >= 70%，其余 >= 50%。
 # `postgres` 是 `internal/storage/postgres` 的基名——它不在 `internal/storage` 包内
 # （两个谱系各自成包），基名匹配单列，否则它会落到 50% 档（US-16 §4.7 / T136 / T138）。
+# `assets` 是 US-24 新增的 `internal/assets`：模块卡 §4.7 判定"按 core 口径 >= 70%"，
+# 不加这一档它会静默落到 50%（同样的基名匹配问题）。
 # `postgres` here is the base name of `internal/storage/postgres`, which lives outside
-# the `internal/storage` package, so it needs its own entry in the 70% tier.
+# the `internal/storage` package, so it needs its own entry in the 70% tier. `assets` is
+# the US-24 package judged at the core tier by module card §4.7.
 #
 # 判据六类 / six verdicts:
 #   1) 低于阈值 -> 失败                2) 恰好达标（>=）-> 通过
@@ -177,7 +180,7 @@ while IFS= read -r line; do
 	base=${import_path##*/}
 
 	case "$base" in
-	core | tool | memory | storage | postgres) threshold=70 ;;
+	core | tool | memory | storage | postgres | assets) threshold=70 ;;
 	*) threshold=50 ;;
 	esac
 

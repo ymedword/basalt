@@ -185,7 +185,7 @@ type OperationStore interface {
 // NewOperationID builds `op-<unix_millis>-<six lowercase alphanumerics>`; the clock is
 // explicit and the entropy failure mode never degrades into a predictable counter.
 func NewOperationID(now time.Time) string {
-	return "op-" + strconv.FormatInt(now.UnixMilli(), 10) + "-" + runSuffix()
+	return "op-" + strconv.FormatInt(now.UnixMilli(), 10) + "-" + RunIDSuffix()
 }
 
 // FileEntry 是 Agent 受管文件清单的一项：**Agent 目录内**相对路径（`/` 分隔，注 19：

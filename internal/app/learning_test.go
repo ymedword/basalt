@@ -64,6 +64,10 @@ func (f *fakeLearningAdminStore) PendingExtractions(context.Context) ([]core.Lea
 	return nil, nil
 }
 
+func (f *fakeLearningAdminStore) OrphanPendingExtractions(context.Context, int) ([]core.LearningExtraction, error) {
+	return nil, nil
+}
+
 func (f *fakeLearningAdminStore) ExtractionCandidateCount(context.Context, string) (int, error) {
 	return 0, nil
 }
@@ -72,10 +76,10 @@ func (f *fakeLearningAdminStore) ExtractionDraftCount(context.Context, string) (
 	return 0, nil
 }
 
-func (f *fakeLearningAdminStore) RecoverExtraction(context.Context, string,
-	core.LearningExtractionState, time.Time,
-) error {
-	return nil
+func (f *fakeLearningAdminStore) RecoverExtraction(context.Context,
+	core.RecoverLearningExtraction,
+) (bool, error) {
+	return false, nil
 }
 
 func (f *fakeLearningAdminStore) ListExtractions(context.Context,
@@ -1069,8 +1073,14 @@ func TestUS22_Recovery_TerminalRefsReleased(t *testing.T) {
 		VALUES ('run_refs', 'agent-1', 'chan-1', 'ops')`)
 	require.NoError(t, err)
 
-	_, err = env.db.Recover(t.Context(), us22DiscardLogger(), baselineClock())
+	// US-24 起没有"启动时全局恢复扫描"这一入口；这类"终态已写、引用未释放"的残留在
+	// 新口径里属于 B1（终态残留对账），由回收器每轮以幂等条件更新补齐。判据一字未改：
+	// `released_at` 必须落时间戳，Run 终态不被回滚。
+	// US-24 removes the global startup scan; terminal residue is repaired by the
+	// reclaimer's B1 pass. The assertions are unchanged.
+	residue, err := postgres.NewReclaimerStore(env.db).ReclaimTerminalResidue(t.Context(), 64, baselineClock())
 	require.NoError(t, err)
+	require.Equal(t, 1, residue.RefsReleased, "B1 必须把这条 Run 的残留引用算进本轮读数")
 
 	var released sql.NullInt64
 	require.NoError(t, env.raw.QueryRowContext(t.Context(),

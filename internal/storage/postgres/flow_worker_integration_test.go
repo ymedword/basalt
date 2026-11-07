@@ -52,6 +52,20 @@ func (r *flowWorkerRunner) Joined(context.Context, flow.Task) (bool, error) {
 	return r.active.Load() == 0, nil
 }
 
+// flowWorkerForStore 按真实装配给 Worker 注入身份、租约端口与持久判据（US-24
+// §3.1.7）。缺任一项 advanceRoot 会 fail-closed 成 ErrStateConflict，根永远推不动；
+// 这里刻意不省略，让用例覆盖"领取 → 推进 → 交还"的完整路径。
+func flowWorkerForStore(s *FlowStore, service *flow.Service, startup func(context.Context) error) *flow.Worker {
+	return &flow.Worker{
+		Service: service, Repository: s, Startup: startup,
+		Identity:      core.WorkerIdentity{InstanceID: "flow-store-fixture", Name: "fixture"},
+		Leases:        NewLeaseStore(s.db),
+		Gate:          NewSubtreeGate(s.db),
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 5 * time.Second,
+	}
+}
+
 func TestFlow_WorkerUsesBoundedPoolAndDurableQueue(t *testing.T) {
 	s, def := newFlowStoreTest(t)
 	service := flowServiceForStore(s)
@@ -66,7 +80,7 @@ func TestFlow_WorkerUsesBoundedPoolAndDurableQueue(t *testing.T) {
 		ids = append(ids, task.ID)
 	}
 	var startup atomic.Int64
-	worker := &flow.Worker{Service: service, Repository: s, Startup: func(context.Context) error { startup.Add(1); return nil }}
+	worker := flowWorkerForStore(s, service, func(context.Context) error { startup.Add(1); return nil })
 	require.Zero(t, runner.calls.Load(), "constructing does not start work")
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -110,7 +124,7 @@ func TestFlow_WorkerShutdownWaitsForActualJoin(t *testing.T) {
 	service.Runner = runner
 	_, err := service.Start(t.Context(), startFlowRequest(def, "worker-shutdown"))
 	require.NoError(t, err)
-	worker := &flow.Worker{Service: service, Repository: s, Startup: func(context.Context) error { return nil }}
+	worker := flowWorkerForStore(s, service, func(context.Context) error { return nil })
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- worker.Run(ctx) }()

@@ -56,6 +56,19 @@ var (
 	// ErrCapacity 表示持久容量耗尽，不是无限排队。
 	// ErrCapacity is a bounded durable-capacity refusal.
 	ErrCapacity = errors.New("flow capacity exhausted")
+	// ErrFlowRootBusy 表示管理面要写推进类状态（Queued）时，该根的 flow_root
+	// 租约正被另一个执行者持有：既不能排队，也不能退化成无租约写入。
+	// 由 HTTP 层映射 409 FLOW_ROOT_BUSY（US-24 §3.1.6 / FR-24-37）。
+	// ErrFlowRootBusy reports a root lease held by another executor: the management
+	// path refuses rather than writing without a lease.
+	ErrFlowRootBusy = errors.New("flow root lease busy")
+	// ErrFlowAttemptStale 拒绝用已被接管或已改版的 attempt 创建子 Run：
+	// attempt 不属于调用方固定的父根（root_task_id），或 execution_epoch /
+	// task_revision 已被任务当前值取代。宁可在创建时拒绝，也不让 Run 白跑一轮
+	// 才在写回时被拒（US-24 §3.1.9 / FR-24-37）。
+	// ErrFlowAttemptStale rejects creating a child Run from an attempt whose parent
+	// root ownership, execution epoch or task revision has been superseded.
+	ErrFlowAttemptStale = errors.New("flow attempt stale")
 	// ErrDrainTimeout 表示排空宽限已过；真实join仍必须完成，取消不能吞掉此失败。
 	// ErrDrainTimeout reports grace expiry without manufacturing a join.
 	ErrDrainTimeout = errors.New("flow drain timeout")

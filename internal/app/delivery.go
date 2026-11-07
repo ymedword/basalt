@@ -81,6 +81,7 @@ func (d *deliveryService) Prepare(ctx context.Context, intent core.DeliveryInten
 	record := core.ScheduleDeliveryRecord{
 		RunID:       intent.RunID,
 		TaskID:      intent.TaskID,
+		ExecutionID: intent.ExecutionID,
 		Agent:       intent.Agent,
 		AgentUID:    agentUID,
 		ChannelUID:  channel.ResourceUID,
@@ -132,6 +133,19 @@ func (d *deliveryService) Deliver(ctx context.Context, intent core.DeliveryInten
 		}
 	}
 
+	if record.Status != core.DeliveryPending {
+		// 预写行是**唯一**的发送权威：被回收器按终态残留判为 unknown、或已被别的
+		// 结算路径改判的行，一律不再发送（FR-24-21「永不自动重发」）。同实例的回收器
+		// 可能在租约过期后先领回该 Run 并结算了这一行，此时调用方即使持有看似合法的
+		// 代次也不得补发。A settled row is the single send authority: never resend.
+		d.logger.Warn("投递预写行已结算，本次不发送",
+			"task_id", intent.TaskID, "run_id", intent.RunID, "status", string(record.Status))
+		return core.DeliveryOutcome{
+			Status: record.Status,
+			Detail: "投递预写行已结算（" + string(record.Status) + "），不重发",
+		}
+	}
+
 	var outcome core.DeliveryOutcome
 	channel, lookupErr := d.sender.Lookup(ctx, record.ChannelUID, record.AgentUID)
 	if lookupErr != nil {
@@ -154,12 +168,13 @@ func (d *deliveryService) Skip(ctx context.Context, intent core.DeliveryIntent, 
 	return d.store.Finish(ctx, intent.RunID, core.DeliverySkipped, 0, nil, reason, now, now)
 }
 
-// Recover 处理崩溃遗留的 pending 行：关联运行已完成 → unknown（**不自动重发**），
-// 其余 → skipped。由调度器 Start 在恢复执行行之后调用。
-// Recover resolves pending rows left by a crash; a completed run becomes unknown and is
-// never resent.
-func (d *deliveryService) Recover(ctx context.Context, now time.Time) (int, error) {
-	return d.store.Recover(ctx, now)
+// Recover 处理**指定 Run** 崩溃遗留的 pending 行：关联运行已完成 → unknown
+// （**不自动重发**），其余 → skipped。作用域参数由回收器在合法领取该 Run 后给出；
+// 启动路径不再调用它（全局扫描会改判其他 Worker 的在跑投递，FR-24-21 / C-15）。
+// Recover resolves the named run's pending row and is only reachable from the
+// reclaimer's claimed scope.
+func (d *deliveryService) Recover(ctx context.Context, now time.Time, runID string) (int, error) {
+	return d.store.Recover(ctx, now, runID)
 }
 
 // finish 回填终态；写失败只记 ERROR——行保持 pending，下次启动恢复会标为未知，不会

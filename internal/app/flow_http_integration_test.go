@@ -346,7 +346,11 @@ func TestFlow_HTTPResumeIdempotentFactBeforeCurrentVersion(t *testing.T) {
 	require.Equal(t, 202, status, response)
 	var task web.FlowTaskView
 	require.NoError(t, json.Unmarshal(raw, &task))
+	// ParkTask 在 Queued 上先写 Running（推进类 → 需根租约）再写 Blocked（关闭类）；
+	// 这里按生产执行者身份补一次真实领取，随后立刻交还，管理面 resume 才能自己领。
+	parkRoot := acquireFlowRootForTest(t, f.rt.db, task.ID)
 	require.NoError(t, f.rt.flows.store.ParkTask(t.Context(), core.LocalAdminPrincipal(), task.ID, task.Version, "manual_reconciliation"))
+	releaseFlowRootForTest(t, f.rt.db, parkRoot)
 	path := "/api/v1/flow-tasks/" + task.ID
 	status, _, raw, response = f.request(http.MethodGet, path, f.admin, "", "", nil)
 	require.Equal(t, 200, status, response)

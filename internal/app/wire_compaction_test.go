@@ -1120,9 +1120,14 @@ type cmpwRunStore struct {
 	status  map[string]core.RunStatus
 }
 
-// StartRun 实现 `core.RunStore`。
-// StartRun implements core.RunStore.
-func (s *cmpwRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
+// StartRun 实现 `core.RunStore`（本用例不持有租约，返回零值 token）。
+// StartRun implements core.RunStore; this fixture holds no leases.
+func (s *cmpwRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest,
+	owner core.WorkerIdentity, admission core.CallerAdmission, runID string,
+) (core.LeaseToken, error) {
+	if !owner.IsZero() {
+		return core.LeaseToken{}, core.ErrLeaseLost
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.status == nil {
@@ -1130,12 +1135,30 @@ func (s *cmpwRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifes
 	}
 	s.started = append(s.started, rec.RunID)
 	s.status[rec.RunID] = core.StatusRunning
+	return core.LeaseToken{}, nil
+}
+
+// CheckAdmission 实现 `core.RunStore`（本用例不判准入）。
+// CheckAdmission implements core.RunStore; this fixture never refuses.
+func (s *cmpwRunStore) CheckAdmission(context.Context, string, core.Principal, core.CallerAdmission) error {
 	return nil
+}
+
+// LookupAdmittedRun 实现 `core.RunStore`（本用例不会有未知提交结果）。
+// LookupAdmittedRun implements core.RunStore; no unknown commit can occur here.
+func (s *cmpwRunStore) LookupAdmittedRun(context.Context, string) (core.LeaseToken, error) {
+	return core.LeaseToken{}, core.ErrRunNotFound
+}
+
+// RequestCancel 实现 `core.RunStore`（本用例不跨 Worker 取消）。
+// RequestCancel implements core.RunStore; nothing to cancel here.
+func (s *cmpwRunStore) RequestCancel(context.Context, string) (core.RunDetail, error) {
+	return core.RunDetail{}, core.ErrRunNotFound
 }
 
 // FinishRun 实现 `core.RunStore`。
 // FinishRun implements core.RunStore.
-func (s *cmpwRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
+func (s *cmpwRunStore) FinishRun(ctx context.Context, runID string, token core.LeaseToken, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.status == nil {
@@ -1143,6 +1166,12 @@ func (s *cmpwRunStore) FinishRun(ctx context.Context, runID string, status core.
 	}
 	s.status[runID] = status
 	return true, nil
+}
+
+// CompleteRunCloseout 实现 `core.RunStore`（本用例不持有租约与引用）。
+// CompleteRunCloseout implements core.RunStore; this fixture holds neither leases nor refs.
+func (s *cmpwRunStore) CompleteRunCloseout(context.Context, string, core.LeaseToken, time.Time) error {
+	return nil
 }
 
 // ReleaseRunRefs 实现 `core.RunStore`（本用例不持有引用）。

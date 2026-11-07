@@ -27,7 +27,11 @@ func (d *draftVerification) RecordVerification(_ context.Context, _ VerifyReques
 	return nil
 }
 
-func (s *Service) acceptAttempt(ctx context.Context, p core.Principal, task Task, node Node, attempt NodeAttempt, result NodeRunResult, runErr error) (Task, error) {
+// acceptAttempt 在调用方的根租约凭证下提交一次节点结论：Commit 属推进类写入，
+// 存储层按目标行的 root_task_id 校验租约（P-04）。凭证缺失只可能出现在未接执行权
+// 的装配里（单测 / SQLite 谱系），真实 Worker 恒为非零。
+// acceptAttempt commits one node conclusion under the caller's root credential.
+func (s *Service) acceptAttempt(ctx context.Context, p core.Principal, task Task, node Node, attempt NodeAttempt, result NodeRunResult, runErr error, lease core.LeaseToken) (Task, error) {
 	// The model/tool callback may have revoked the original key while the Run
 	// completed. Its output is not a grant to accept a durable task result.
 	current, err := s.Authority.Current(ctx, task)
@@ -95,7 +99,7 @@ func (s *Service) acceptAttempt(ctx context.Context, p core.Principal, task Task
 		revision.NodeID = node.Next
 	}
 	acceptanceID := fmt.Sprintf("accept:%s:%d:%d:%d", attempt.ID, task.Version.Revision, task.Version.ExecutionEpoch, task.Version.StateVersion)
-	request := CommitNode{Recovered: result.Reused, Principal: p, TaskID: task.ID, AttemptID: attempt.ID, OperationID: acceptanceID, Expected: task.Version, Revision: revision, Outcome: status, Reason: reason, AttemptState: attemptState, Output: raw, OutputHash: flowInputHash(raw), Now: s.clock().UnixMilli()}
+	request := CommitNode{Recovered: result.Reused, Principal: p, TaskID: task.ID, AttemptID: attempt.ID, OperationID: acceptanceID, Expected: task.Version, Revision: revision, Outcome: status, Reason: reason, AttemptState: attemptState, Output: raw, OutputHash: flowInputHash(raw), Lease: lease, Now: s.clock().UnixMilli()}
 	if valid {
 		if err := s.collectEvidence(task, attempt, result, &graph, &request); err != nil {
 			return task, err

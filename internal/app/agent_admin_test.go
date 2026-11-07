@@ -24,6 +24,7 @@ package app
 //	S5 `TestAgentAdmin_SubmitValidationFailureNoOperation`——加载期校验失败 → 400 零操作行
 //	S6 `TestAgentAdmin_SubmitWriteFailureFinishesFailed`——预写后失败 → failed 并如实上报
 //	S7 `TestAgentAdmin_SubmitPreWriteFailureZeroWrites`——预写失败零写入
+//	P1 `TestAgentAdmin_PublishBundleAfterWrite`——创建 / 提交成功后发布资产；发布失败不改写成功
 //	A1 `TestAgentAdmin_GenerateFilesNoOperationRow`——草稿只回内存、零操作行、零落盘
 //	A2 `TestAgentAdmin_GenerateFilesNotConfigured`——作者未配置 → 503 分类
 //	A3 `TestAgentAdmin_GenerateFilesCallErrorPassthrough`——上游调用失败不被改判为 400
@@ -585,6 +586,43 @@ func TestAgentAdmin_SubmitCollectionETag(t *testing.T) {
 	require.Equal(t, view.ETag, detail.CandidateETag)
 }
 
+// TestAgentAdmin_PublishBundleAfterWrite：创建与提交成功之后都会调用资产发布面
+// （US-24 §2.3.9 / FR-24-25）；发布失败只记 ERROR，**不**把已生效的写改写成失败
+// （与索引、投影同一纪律）。
+func TestAgentAdmin_PublishBundleAfterWrite(t *testing.T) {
+	t.Parallel()
+
+	var calls []string
+	var publishErr error
+	env := newAgentAdminEnv(t, func(deps *AgentAdminDeps) {
+		deps.PublishBundle = func(_ context.Context, agent string) (int64, error) {
+			calls = append(calls, agent)
+			if publishErr != nil {
+				return 0, publishErr
+			}
+			return int64(len(calls)), nil
+		}
+	})
+
+	ctx := context.Background()
+	_, err := env.admin.Create(ctx, consoleActor(), core.AgentSpec{Name: "fresh"})
+	require.NoError(t, err)
+
+	base, err := env.admin.Files(ctx, "fresh")
+	require.NoError(t, err)
+	updated := authorAgentMD("fresh", "alpha", "alpha-model-2", nil, nil)
+	publishErr = errors.New("模拟共享发布记录不可写")
+	_, err = env.admin.SubmitFiles(ctx, consoleActor(), "fresh", base.ETag,
+		[]core.AuthorFile{{Path: "AGENT.md", Content: updated}})
+	require.NoError(t, err, "发布失败不得把已生效的提交改写成失败")
+	require.Equal(t, updated, readAdminFile(t, env.root, "agents/fresh/AGENT.md"),
+		"提交必须已经落盘")
+
+	require.Equal(t, []string{"fresh", "fresh"}, calls, "创建与提交各触发一次发布")
+	require.Contains(t, env.logs.String(), "发布 Agent 资产失败",
+		"发布失败必须留 ERROR 点名后果（准入将按资产缺失失败关闭）")
+}
+
 // TestAgentAdmin_SubmitStaleETagNoOperation：缺失 / 弱 / `*` / 形状非法与不匹配一律 412，
 // 磁盘零写入、操作行零行（约束 30 / 约束 3）。
 func TestAgentAdmin_SubmitStaleETagNoOperation(t *testing.T) {
@@ -979,21 +1017,29 @@ func (s *archiveScheduler) snapshotSchedules() map[string][]core.Schedule {
 	return out
 }
 
-// archiveCanceller 是 RunCanceller 的替身：running 里的 Run 永不退出，WaitRuns 在窗口
-// 结束时把它们原样交回——归档超时分支的判据（约束 32 ③）。
-// archiveCanceller keeps the listed runs alive forever; WaitRuns hands them back.
+// archiveCanceller 是 RunCanceller 的替身：running 里的 Run 永不退出，Residuals 每次都
+// 如实报告"仍有 running 行"这一条未达成——归档超时分支的判据（约束 32 ③ / 图 8 [4]）。
+// archiveCanceller keeps the listed runs alive forever; every Residuals reports the
+// no_running_run predicate as unmet.
 type archiveCanceller struct {
 	mu        sync.Mutex
 	running   map[string][]string
 	cancelled []string
 }
 
-// RunningRunIDs 返回该 Agent 仍在运行的 Run 快照。
-// RunningRunIDs snapshots the runs still alive for the agent.
-func (c *archiveCanceller) RunningRunIDs(_ context.Context, agent string) ([]string, error) {
+// Residuals 返回该 Agent 仍被替身当作在途的 Run 与未达成判据。
+// Residuals snapshots the fake's live runs and the predicate they violate.
+func (c *archiveCanceller) Residuals(_ context.Context, agent string) (core.ArchiveResiduals, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]string(nil), c.running[agent]...), nil
+	ids := append([]string(nil), c.running[agent]...)
+	if len(ids) == 0 {
+		return core.ArchiveResiduals{}, nil
+	}
+	return core.ArchiveResiduals{
+		RunIDs: ids,
+		Unmet:  []string{core.ArchiveResidualRunningRun},
+	}, nil
 }
 
 // CancelRun 记录取消信号（返回不代表 Run 已退出）。
@@ -1005,28 +1051,11 @@ func (c *archiveCanceller) CancelRun(_ context.Context, runID string) error {
 	return nil
 }
 
-// WaitRuns 在窗口结束时交回仍未退出的标识（替身里的 Run 永不退出）。
-// WaitRuns returns the ids still alive when the window closes.
-func (c *archiveCanceller) WaitRuns(_ context.Context, runIDs []string) ([]string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	alive := make([]string, 0, len(runIDs))
-	for _, id := range runIDs {
-		for _, runs := range c.running {
-			if slices.Contains(runs, id) {
-				alive = append(alive, id)
-				break
-			}
-		}
-	}
-	return alive, nil
-}
-
-// archiveExitCanceller 在 archiveCanceller 之上给出可控的退出信号：RunningRunIDs 总是
-// 返回一个在途 Run，WaitRuns 阻塞到测试关闭 exit 或等待窗口到期——归档的"取消后真正
-// 退出"分支因此可在 -race 下端到端判定（约束 32 ③ 的成功侧）。
-// archiveExitCanceller blocks WaitRuns until the test closes exit (or the window
-// expires), so the archive path can be judged end to end under -race.
+// archiveExitCanceller 在 archiveCanceller 之上给出可控的退出信号：发出取消**之前**的
+// Residuals 如实报告在途，之后的 Residuals 阻塞到测试关闭 exit 或等待窗口到期——归档的
+// "取消后真正退出"分支因此可在 -race 下端到端判定（约束 32 ③ 的成功侧）。
+// archiveExitCanceller blocks Residuals after the cancel signal until the test closes
+// exit (or the window expires), so the archive path can be judged end to end.
 type archiveExitCanceller struct {
 	mu        sync.Mutex
 	cancelled []string
@@ -1046,10 +1075,26 @@ func newArchiveExitCanceller(runID string) *archiveExitCanceller {
 	}
 }
 
-// RunningRunIDs 总是返回同一条在途 Run。
-// RunningRunIDs always reports the same live run.
-func (c *archiveExitCanceller) RunningRunIDs(context.Context, string) ([]string, error) {
-	return []string{c.runID}, nil
+// Residuals 在取消信号之前报告在途；之后阻塞到 exit 关闭或窗口到期。
+// Residuals reports the live run before the signal, then waits for exit or the window.
+func (c *archiveExitCanceller) Residuals(ctx context.Context, _ string) (core.ArchiveResiduals, error) {
+	select {
+	case <-c.signalled:
+	default:
+		return core.ArchiveResiduals{
+			RunIDs: []string{c.runID},
+			Unmet:  []string{core.ArchiveResidualRunningRun},
+		}, nil
+	}
+	select {
+	case <-c.exit:
+		return core.ArchiveResiduals{}, nil
+	case <-ctx.Done():
+		return core.ArchiveResiduals{
+			RunIDs: []string{c.runID},
+			Unmet:  []string{core.ArchiveResidualRunningRun},
+		}, nil
+	}
 }
 
 // CancelRun 记录取消并关闭 signalled（只关一次）。
@@ -1060,17 +1105,6 @@ func (c *archiveExitCanceller) CancelRun(_ context.Context, runID string) error 
 	c.mu.Unlock()
 	c.once.Do(func() { close(c.signalled) })
 	return nil
-}
-
-// WaitRuns 阻塞到测试关闭 exit；窗口到期则把剩余集合原样交回（超时分支）。
-// WaitRuns blocks until exit closes; an expired window returns the remaining ids.
-func (c *archiveExitCanceller) WaitRuns(ctx context.Context, runIDs []string) ([]string, error) {
-	select {
-	case <-c.exit:
-		return nil, nil
-	case <-ctx.Done():
-		return append([]string(nil), runIDs...), nil
-	}
 }
 
 // cancelledRunIDs 返回已发出取消的 Run 标识副本。

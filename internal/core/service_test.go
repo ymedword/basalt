@@ -52,13 +52,13 @@ func newRecordingStore() *recordingStore {
 
 // FinishRun 先记录列面再落库。
 // FinishRun records the column surface before delegating to the wrapped store.
-func (s *recordingStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
+func (s *recordingStore) FinishRun(ctx context.Context, runID string, token core.LeaseToken, status core.RunStatus, reason string, iterations, toolCalls int, now time.Time) (bool, error) {
 	s.mu.Lock()
 	s.iters[runID] = iterations
 	s.calls[runID] = toolCalls
 	s.at[runID] = now
 	s.mu.Unlock()
-	return s.fakeStore.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
+	return s.fakeStore.FinishRun(ctx, runID, token, status, reason, iterations, toolCalls, now)
 }
 
 // SaveSnapshot 落快照（可注入失败）。
@@ -1407,20 +1407,28 @@ func sampleResolvedRefs() core.ResolvedResources {
 func (h *loopHarness) assembleWithResources(resources core.RunResources, snapshots core.RunSnapshotBuilder) (*core.AgentService, *recordingStore) {
 	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	store := newRecordingStore()
+	// 执行权接线随 harness 选项透传（`withLeaseKeeper` 未调用时全部零值，装配与
+	// 接线前逐字节相同）：包装仓储的假存储也必须进入同一"有执行权"形态，否则
+	// StartRun 会因没有任何租约可发而报装配错误。
+	store.fakeStore.leases = h.store.leases
 	svc := core.NewAgentService(core.ServiceOptions{
-		Agents:       h.agents,
-		Client:       h.provider,
-		Messages:     store,
-		Runs:         store,
-		Snapshots:    store,
-		Audit:        h.audit,
-		Loop:         core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
-		Logger:       logger,
-		Now:          func() time.Time { return h.now },
-		Lifecycle:    newFakeLifecycle(core.AgentActive),
-		Gate:         core.NewAgentGate(),
-		Resources:    resources,
-		RunSnapshots: snapshots,
+		Agents:        h.agents,
+		Client:        h.provider,
+		Messages:      store,
+		Runs:          store,
+		Snapshots:     store,
+		Audit:         h.audit,
+		Loop:          core.NewReActLoop(core.NewPromptBuilder(h.registry), core.NewToolExecutor(h.registry, h.audit, logger), logger),
+		Logger:        logger,
+		Now:           func() time.Time { return h.now },
+		Lifecycle:     newFakeLifecycle(core.AgentActive),
+		Gate:          core.NewAgentGate(),
+		Resources:     resources,
+		RunSnapshots:  snapshots,
+		Worker:        h.worker,
+		Leases:        h.leases,
+		RenewInterval: h.renewInterval,
+		LeaseTTL:      h.leaseTTL,
 	})
 	return svc, store
 }
@@ -1446,7 +1454,7 @@ func TestAgentService_Resources_ManifestPassesThroughAndRuntimeReleased(t *testi
 	require.Equal(t, 1, builder.callCount())
 
 	manifest := store.lastManifest
-	require.Equal(t, 2, manifest.FormatVersion, "清单必须是正式形态 v2（零值 = 未接线）")
+	require.Equal(t, 3, manifest.FormatVersion, "清单必须是正式形态 v3（零值 = 未接线）")
 	require.Equal(t, string(core.AgentActive), manifest.AgentLifecycle, "清单状态取准入门禁的同一次读数")
 	require.Equal(t, "fake", manifest.Provider.Name)
 	require.Equal(t, "aaa", manifest.Provider.ContentHash)
@@ -1507,6 +1515,64 @@ func TestAgentService_Resources_AdmissionLeaseReleasedOnStartRunFailure(t *testi
 	require.Equal(t, 1, runtime.admissionReleaseCount(), "失败路径必须归还准入读锁（经 Release）")
 	require.Equal(t, 1, runtime.releaseCount(), "失败路径必须归还运行时")
 	require.Zero(t, h.provider.callCount(), "账本失败不得开始模型调用")
+}
+
+// TestAgentService_UnknownAdmissionLookupRefusesForeignLease（review ② finding 4）：
+// 提交结果未知后的回查拿到的是租约的**当前**视图，不是"本次准入创建的那条"——确认丢失
+// 的等待一旦跨过租约时长，回收器就会以更高代次把同一条租约领回（属主换成别人、
+// `ownership_epoch + 1`、未释放且在有效期内）。此时若直接采纳，本进程会以他人的
+// owner/epoch 继续受保护写入与续约（fenced 校验只比对 token 与租约行，不比对执行者），
+// 等于借用别人的执行权。准入租约代次恒为 1、续约不改代次，所以 owner 不符或 `epoch != 1`
+// 就是"已不归本次准入"的判据：必须按未知结局失败关闭（FR-24-33：不退款、不重试）。
+//
+// 逆改点：删掉 `service.go` 回查分支的归属守卫 → 第一个子用例以 `wrk_other/epoch=2`
+// 的 token 走完 fenced 追加并调用模型（`provider.callCount()==1`、`err==nil`）而红。
+// 第二个子用例是正向对照：回查到的是本次准入自己的 epoch=1 租约时必须照常继续——
+// 守卫不得把合法的"提交已成功、只是确认丢失"误判成失权。
+func TestAgentService_UnknownAdmissionLookupRefusesForeignLease(t *testing.T) {
+	newService := func(t *testing.T) (*core.AgentService, *loopHarness, *recordingStore, *fakeRuntime) {
+		t.Helper()
+		h := newLoopHarness(t, withLeaseKeeper(&fakeLeaseStore{}, 2*time.Millisecond, time.Hour))
+		runtime := &fakeRuntime{provider: h.provider, providerName: "fake"}
+		resources := &fakeRunResources{resolved: sampleResolvedRefs(), runtime: runtime}
+		svc, store := h.assembleWithResources(resources, &fakeSnapshotBuilder{})
+		store.fakeStore.startRunErr = fmt.Errorf("%w: lost ack", core.ErrAdmissionOutcomeUnknown)
+		return svc, h, store, runtime
+	}
+
+	t.Run("foreign_lease_fails_closed", func(t *testing.T) {
+		svc, h, store, runtime := newService(t)
+		h.provider.onCall(0, textResponse("不得被调用"))
+		// A/B/A：回查命中的是回收器以更高代次领回的他人租约。
+		store.fakeStore.lookupToken = core.LeaseToken{
+			Kind: core.LeaseRun, ResourceID: "run-taken-over",
+			OwnerWorkerID: "wrk_other", OwnershipEpoch: 2,
+		}
+
+		res, err := svc.Run(ctx, h.req("在吗"))
+		require.ErrorIs(t, err, core.ErrAdmissionOutcomeUnknown,
+			"回查到的租约不属于本次准入，必须保持未知分类失败关闭")
+		require.ErrorContains(t, err, "start run ledger row")
+		require.Equal(t, core.RunResult{}, res, "未知结局不得返回一个可被当成成功的运行结果")
+		require.Zero(t, h.provider.callCount(), "不得借用他人的 owner/epoch 继续执行（零模型调用）")
+		require.Zero(t, store.fakeStore.finishCalls, "未知结局不得写本 Run 的终态")
+		require.Equal(t, 1, runtime.admissionReleaseCount(), "失败路径仍须归还准入读锁")
+	})
+
+	t.Run("own_admission_lease_continues", func(t *testing.T) {
+		svc, h, store, _ := newService(t)
+		h.provider.onCall(0, textResponse("提交已成功，只是确认丢失"))
+		// 回查命中的正是本次准入创建的租约：owner=本 Worker、epoch=1（INSERT 常量）。
+		store.fakeStore.lookupToken = core.LeaseToken{
+			Kind: core.LeaseRun, ResourceID: "run-admitted",
+			OwnerWorkerID: h.worker.InstanceID, OwnershipEpoch: 1,
+		}
+
+		res, err := svc.Run(ctx, h.req("在吗"))
+		require.NoError(t, err, "本次准入自己的租约是合法的：不得误判成失权")
+		require.Equal(t, core.StatusCompleted, res.Status)
+		require.Equal(t, 1, h.provider.callCount(), "回查证实提交后必须照常跑完（不重放、不拒跑）")
+	})
 }
 
 // TestAgentService_Resources_PinnedClientServesModelCalls（人工 review ② 缺陷 2）：资源接线

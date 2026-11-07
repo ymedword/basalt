@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -360,7 +361,7 @@ func TestAgentConsole_TransitionEnableWritesOperationAndIndex(t *testing.T) {
 	require.True(t, strings.HasPrefix(row.RequestHash, "sha256:"))
 	require.Len(t, row.RequestHash, len("sha256:")+64)
 
-	indexed, valid, errMsg, err := env.versions.LifecycleIndex(context.Background(), "writer")
+	indexed, valid, errMsg, err := env.versions.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Empty(t, errMsg)
@@ -519,7 +520,7 @@ func TestAgentConsole_TransitionPreWriteFailureZeroWrites(t *testing.T) {
 	require.Equal(t, before, readConsoleState(t, env.root), "预写失败不得改状态文件")
 	require.Empty(t, listConsoleOperations(t, env.ops), "预写失败不得留下任何操作行")
 
-	_, valid, _, indexErr := env.versions.LifecycleIndex(context.Background(), "writer")
+	_, valid, _, indexErr := env.versions.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, indexErr)
 	require.False(t, valid)
 	require.Contains(t, logs.String(), "启停预写操作记录失败")
@@ -533,6 +534,25 @@ type failingLifecycleIndex struct {
 
 func (f failingLifecycleIndex) PutLifecycleIndex(context.Context, core.LifecycleRecord, bool, string) error {
 	return f.err
+}
+
+// ReadLifecycleIndex 与写面同一个失败面：索引读不到时同样按失败上报，不回落到零值。
+// ReadLifecycleIndex fails like the write surface; it never falls back to a zero value.
+func (f failingLifecycleIndex) ReadLifecycleIndex(context.Context, string) (core.LifecycleRecord, bool, string, error) {
+	return core.LifecycleRecord{}, false, "", f.err
+}
+
+// SetLifecycleBarrier 与 PutLifecycleIndex 同一个失败面：管理面归档在屏障写不进时同样
+// 必须停手并留下 pending 行（FR-24-41 的 fail-closed）。
+// SetLifecycleBarrier fails the same way, so the archive barrier is fail-closed too.
+func (f failingLifecycleIndex) SetLifecycleBarrier(context.Context, string, string, time.Time) (bool, error) {
+	return false, f.err
+}
+
+// RestoreLifecycleBarrier 同上。
+// RestoreLifecycleBarrier mirrors the failing surface above.
+func (f failingLifecycleIndex) RestoreLifecycleBarrier(context.Context, core.LifecycleRecord, string, int64) (bool, error) {
+	return false, f.err
 }
 
 // TestAgentConsole_TransitionIndexFailureKeepsStateAndLogsError：索引可重建、状态文件是
@@ -566,7 +586,7 @@ func TestAgentConsole_TransitionIndexFailureKeepsStateAndLogsError(t *testing.T)
 	row := findConsoleOperation(t, env.ops, actionEnable)
 	require.Equal(t, core.OperationSuccess, row.Status)
 
-	_, valid, _, indexErr := env.versions.LifecycleIndex(context.Background(), "writer")
+	_, valid, _, indexErr := env.versions.ReadLifecycleIndex(context.Background(), "writer")
 	require.NoError(t, indexErr)
 	require.False(t, valid, "索引写失败后不应出现索引行")
 	require.Contains(t, logs.String(), "生命周期索引同步失败")

@@ -162,6 +162,20 @@ func (m *mcpRuntime) AppliedVersion(name string) (int64, bool) {
 	return status.AppliedVersionID, true
 }
 
+// BuiltVersion 报告该 server 的本地构建证据（US-24 P-21）：进程里真正连接着的是
+// **applied** 那一版，所以版本段只填已应用版本 ID。没有 supervisor / 尚未接管
+// （`AppliedVersion` 为假）时返回零值 = 未声明——轻装配与测试夹具不声明构建证据，
+// 准入据此跳过本地实例比对。凭据段为零：MCP 连接不持有可比的凭据 pin。
+// BuiltVersion reports the applied version as the local build proof; an absent applied
+// version is "undeclared", and the credential segment is zero for a live connection.
+func (m *mcpRuntime) BuiltVersion(name string) core.BuiltVersion {
+	applied, ok := m.AppliedVersion(name)
+	if !ok {
+		return core.BuiltVersion{}
+	}
+	return core.BuiltVersion{Resource: core.ResourceVersionRef{Name: name, VersionID: applied}}
+}
+
 // PendingRestart 派生 pending_restart：发布版本非零且与已应用版本不一致（含尚未应用）。
 // 注 13 真值表——待重启的 server 仍可用旧版本工具，但新发布的内容要重启进程才生效。
 // PendingRestart derives published != applied, including the never-applied case.

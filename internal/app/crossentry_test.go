@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,53 +33,33 @@ import (
 	"github.com/ymedword/basalt/internal/web"
 )
 
-// capturingEngine 捕获 Add 注册的作业，测试按 spec（= task id）精确驱动触发；
-// cron 表达式本身不在这里解析（解析 / 枚举由 cron_test.go 覆盖）。
-// capturingEngine captures registered jobs keyed by spec (= task id); cron parsing
-// itself is covered by cron_test.go.
-type capturingEngine struct {
-	mu   sync.Mutex
-	jobs map[string]func()
+// crossEntryEngine 是 CronEngine 的最小替身：本夹具不解析 cron 表达式（解析 / 枚举由
+// cron_test.go 覆盖）。US-24 起触发权属于数据库——引擎不再登记作业，测试改由拨动
+// `next_fire_at` 制造到期（见 Fire），因此这里只剩"下一次 / 区间"两个纯计算方法。
+// A minimal CronEngine stand-in: the trigger right moved into the database, so the test
+// makes a task due via next_fire_at instead of capturing a registered job.
+type crossEntryEngine struct{}
+
+// Next 把下一次触发固定推后一小时：用例只关心"这一笔到期是否被领取"，不关心节奏。
+// Next pushes the next occurrence one hour out; the fixture only cares about one claim.
+func (crossEntryEngine) Next(_ string, from time.Time) (time.Time, error) {
+	return from.Add(time.Hour), nil
 }
 
-// newCapturingEngine 构造空引擎。
-// newCapturingEngine builds an empty engine.
-func newCapturingEngine() *capturingEngine {
-	return &capturingEngine{jobs: make(map[string]func())}
-}
-
-// Add 以 spec 为键记录作业并返回空句柄（同一键重注册即覆盖，与引擎的替换语义一致）。
-// Add records the job under spec and returns a no-op handle; re-registration overwrites.
-func (e *capturingEngine) Add(spec string, job func()) (core.CronHandle, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.jobs[spec] = job
-	return noopCronHandle{}, nil
-}
-
-// Start 是空实现：作业只由测试显式触发。
-// Start is a no-op: jobs fire only when the test drives them.
-func (e *capturingEngine) Start() {}
-
-// Stop 返回已完成的 ctx（没有在途作业）。
-// Stop returns an already-done context; there is never an in-flight job here.
-func (e *capturingEngine) Stop() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
-}
-
-// Occurrences 返回空集：本夹具没有错过触发点的判定需求。
+// Occurrences 返回空集：错过触发点的计数不在本文件覆盖。
 // Occurrences returns nothing: missed-trigger accounting is not exercised here.
-func (e *capturingEngine) Occurrences(string, time.Time, time.Time, int) []time.Time { return nil }
+func (crossEntryEngine) Occurrences(string, time.Time, time.Time, int) []time.Time { return nil }
 
-// job 取出指定任务的作业（未注册返回 false）。
-// job looks up the captured job for one task id.
-func (e *capturingEngine) job(taskID string) (func(), bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	job, ok := e.jobs[taskID]
-	return job, ok
+// crossEntryWorker 是本夹具的 Worker 身份：调度器领取执行权必须带真实归属
+// （空实例标识不是"轻装配"，而是装配缺陷）。
+// crossEntryWorker is the fixture's worker identity; the scheduler refuses to run
+// without one because a lease needs a real owner.
+var crossEntryWorker = core.WorkerIdentity{
+	InstanceID:    "crossentry-worker",
+	Name:          "crossentry",
+	Hostname:      "localhost",
+	Version:       "test",
+	SchemaVersion: 12,
 }
 
 // crossEntryEnv 是跨入口用例的全链路夹具：真实库、真实运行入口、真实调度器与
@@ -93,9 +74,12 @@ type crossEntryEnv struct {
 	svc      *core.AgentService
 	sched    *core.Scheduler
 	srv      *web.Server
-	engine   *capturingEngine
+	engine   core.CronEngine
 	baseURL  string
 	taskID   string
+	// fireSeq 让每次 Fire 拿到互不相同的 planned_at：`(task_id, planned_at)` 去重
+	// 只认这一对，同一毫秒两次触发会被判成"已领取"而静默跳过。
+	fireSeq atomic.Int64
 
 	gateMu   sync.Mutex
 	pending  bool
@@ -138,7 +122,7 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 		db:       db,
 		sessions: sessions,
 		store:    postgres.NewTaskStore(db),
-		engine:   newCapturingEngine(),
+		engine:   crossEntryEngine{},
 		bodies:   make(map[*http.Response]string),
 		client:   &http.Client{Timeout: 30 * time.Second},
 	}
@@ -176,6 +160,16 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 		RunTimeout: scheduleRunTimeout,
 		StopGrace:  scheduleStopGrace,
 		Logger:     logger,
+		// US-24：触发权在数据库，调度器必须有真实归属与续约端口才能启动
+		// （空装配在 Start 处失败关闭）。轮询间隔取小值，让测试不必等 500ms。
+		Leases:        postgres.NewLeaseStore(db),
+		Worker:        crossEntryWorker,
+		LeaseTTL:      60 * time.Second,
+		RenewInterval: 20 * time.Second,
+		PollInterval:  20 * time.Millisecond,
+		// 宽限放宽到 10 分钟：夹具从不验证"错过窗口"（那在 core / postgres 用例里），
+		// 只要求本机与容器之间的时钟偏差不会把一次正常触发误判成错失。
+		MissedGrace: 10 * time.Minute,
 	})
 	require.NoError(t, env.sched.Start(context.Background()))
 	t.Cleanup(env.sched.Stop)
@@ -306,22 +300,65 @@ func (e *crossEntryEnv) WaitRunFinished() {
 	}, 5*time.Second, 5*time.Millisecond, "运行未在时限内收尾")
 }
 
-// Fire 异步执行 cron 作业（与 cron 引擎的作业 goroutine 同语义）；返回的 channel
-// 在作业返回（Run 与 FinishExecution 均已完成）后关闭。未注册即 Fatal。
-// Fire runs the captured cron job asynchronously; the channel closes when the job
-// returns. An unregistered task is fatal.
+// Fire 触发一次**定时**触发：把 `next_fire_at` 拨到刚刚过去，交给调度器的到期扫描
+// 领取并执行（US-24 起触发权在数据库，测试不再直接调作业）。返回的 channel 在本次
+// planned_at 对应的执行行离开 started 后关闭——与 cron 作业返回同语义。
+// Fire makes the task due in the database and returns a channel that closes once this
+// planned instant has a terminal execution row.
 func (e *crossEntryEnv) Fire(taskID string) <-chan struct{} {
 	e.t.Helper()
-	job, ok := e.engine.job(taskID)
-	if !ok {
-		e.t.Fatalf("任务 %s 未注册任何 cron 作业", taskID)
-	}
+	e.awaitInitialized(taskID)
+	planned := time.Now().UTC().Truncate(time.Millisecond).
+		Add(-time.Duration(e.fireSeq.Add(1)) * 100 * time.Millisecond)
+	require.NoError(e.t, e.store.SetNextFire(context.Background(), taskID, nil, planned),
+		"Fire 必须能把任务拨到已到期")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		job()
+		e.awaitTerminal(taskID, planned)
 	}()
 	return done
+}
+
+// awaitInitialized 等到首次初始化把 `next_fire_at` 写进未来（任务离开到期集合）。
+//
+// 对账后的第一轮扫描看到 NULL 只做初始化、不执行，且写入是**无条件** UPDATE；
+// 在它落库之前直接拨表会被它覆盖回未来，本次触发就永远不来。观察到"任务不在
+// 到期集合里"即证明那一笔已提交——扫描是单 goroutine 顺序推进，之后不会再有人写。
+// Wait until the first init pass has committed its unconditional write.
+func (e *crossEntryEnv) awaitInitialized(taskID string) {
+	e.t.Helper()
+	require.Eventually(e.t, func() bool {
+		due, err := e.store.ListDispatchable(context.Background(), 32)
+		if err != nil {
+			return false
+		}
+		for _, item := range due {
+			if item.Task.TaskID == taskID {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 5*time.Millisecond, "任务 %s 未完成首次 next_fire_at 初始化", taskID)
+}
+
+// awaitTerminal 轮询到本次 planned_at 的执行行出现终态为止（在 goroutine 里跑，
+// 只能用 Errorf，不能用 require / Fatal）。
+// awaitTerminal polls until the execution row of this planned instant is terminal.
+func (e *crossEntryEnv) awaitTerminal(taskID string, planned time.Time) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := e.store.ListExecutions(context.Background(), taskID, 64)
+		if err == nil {
+			for _, row := range rows {
+				if row.PlannedAt.Equal(planned) && row.Status != core.ExecutionStarted {
+					return
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	e.t.Errorf("任务 %s 的计划触发 %s 未在时限内收尾", taskID, planned.Format(time.RFC3339Nano))
 }
 
 // GetHTTP 发出 GET 并返回已读完 body 的响应（RawBody 可再次读取缓存）。

@@ -17,7 +17,7 @@ func TestFlow_HistoryRetentionPreservesReferencedRun(t *testing.T) {
 			p := newPGFlowActionProbe(t)
 			now := time.Now()
 			old := now.Add(-40 * 24 * time.Hour)
-			_, err := NewRunStore(p.store.db).FinishRun(t.Context(), p.env.RunID, core.StatusCompleted, "", 0, 0, old)
+			_, err := NewRunStore(p.store.db).FinishRun(t.Context(), p.env.RunID, core.LeaseToken{}, core.StatusCompleted, "", 0, 0, old)
 			require.NoError(t, err)
 			_, err = p.store.db.pool.ExecContext(t.Context(), `UPDATE runs SET started_at=$2 WHERE run_id=$1`, p.env.RunID, old.UnixMilli())
 			require.NoError(t, err)

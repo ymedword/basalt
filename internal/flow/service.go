@@ -27,8 +27,16 @@ type Service struct {
 	Outputs      OutputRevalidator
 	Verification *VerificationService
 	Operations   core.OperationStore
-	workMu       sync.Mutex
-	work         map[string]*localWork
+	// Identity / Leases / LeaseTTL 是根租约的装配面（US-24 §3.1.6）：
+	// 管理面 resume / revise 的请求里没有租约，写推进类状态时由 `withRootLease`
+	// 用这三项自取；零值 = 未装配，此时写 Queued 只能拒绝（不得退化成无租约写入）。
+	// Identity / Leases / LeaseTTL let management resume/revise acquire the root lease
+	// themselves; a zero assembly refuses advance-class writes instead of degrading.
+	Identity core.WorkerIdentity
+	Leases   core.LeaseStore
+	LeaseTTL time.Duration
+	workMu   sync.Mutex
+	work     map[string]*localWork
 }
 
 // Start durably accepts one immutable definition/contract/input identity. Existing

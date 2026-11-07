@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -75,7 +76,13 @@ func isolatedSchemaConn(t *testing.T) (*sql.Conn, string) {
 	pool := testPool(t)
 	conn, err := pool.Conn(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	// 停机迁移用例会**主动**先关这条连接（模拟停机后再由 `Open` 迁移），cleanup 因此
+	// 必须容忍"已关闭"：`sql.ErrConnDone` 之外的错误照旧判失败。
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil && !errors.Is(err, sql.ErrConnDone) {
+			require.NoError(t, err)
+		}
+	})
 
 	schema := createSchema(t, pool)
 	_, err = conn.ExecContext(ctx, "SET search_path TO "+schema)

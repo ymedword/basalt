@@ -229,7 +229,7 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 	toolCalls := 0
 	for round := 1; round <= env.Budget.MaxIterations; round++ { // round 从 1 起（契约 §7.1 的 round 语义）
 		// ① 轮首查取消：本轮的模型调用未发出，故**不计**当前轮（iterations = round-1）。
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
 			return env.cancelled(ctxErr, round-1, toolCalls), nil
 		}
 
@@ -255,7 +255,7 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 			finishContext(outcome.abort)
 			// 压缩的接线 / 存储失败是基础设施失败，不静默降级成"看起来正常的一轮"；
 			// 取消不算失败（轮首与轮内口径一致）。
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(ctx); ctxErr != nil {
 				return env.cancelled(ctxErr, round-1, toolCalls), nil
 			}
 			return env.fail(outcome.abort, round-1, toolCalls), nil
@@ -281,7 +281,7 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 		ticket, quotaErr := l.admitCall(ctx, runID, round, env, prompt)
 		if quotaErr != nil {
 			// 取消优先：上下文已取消时不是配额拒绝，按取消收场（不计当前轮）。
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(ctx); ctxErr != nil {
 				return env.cancelled(ctxErr, round-1, toolCalls), nil
 			}
 			return RunResult{}, quotaErr
@@ -295,7 +295,7 @@ func (l *ReActLoop) run(ctx context.Context, runID string, env *RunEnv) (RunResu
 		if err != nil {
 			// **先看 ctx.Err()**：取消不是失败——截止时间到与被取消都归 cancelled，
 			// 而非 cancelled 的错误（含预写失败被拒发）才是 failed。
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(ctx); ctxErr != nil {
 				return env.cancelled(ctxErr, round-1, toolCalls), nil
 			}
 			if env.Flow != nil && errors.Is(err, ErrFlowBudget) && errors.Is(err, ErrFlowModelNotIssued) {

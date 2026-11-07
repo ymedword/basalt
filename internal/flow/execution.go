@@ -78,10 +78,15 @@ func (s *Service) Advance(ctx context.Context, req AdvanceRequest) (Task, error)
 		close(entry.done)
 		s.workMu.Unlock()
 	}()
-	return s.advanceOne(runCtx, current, task)
+	return s.advanceOne(runCtx, current, task, req.Lease)
 }
 
-func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task) (Task, error) {
+// advanceOne 在已取得的根租约凭证下推进一个节点：节点领取 / 提交都是推进类写入，
+// 存储层按目标行的 root_task_id 校验根租约存在且未过期（P-04）。凭证原样下传，
+// 叶子的 Run 创建（createRunForNode）也用它证明父根此刻有人合法持有。
+// advanceOne advances one node under the caller's root credential; every
+// advance-class write is fenced by that lease in the storage layer.
+func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task, lease core.LeaseToken) (Task, error) {
 	var node Node
 	found := false
 	for _, candidate := range task.AcceptedVersion.Definition.Nodes {
@@ -125,10 +130,10 @@ func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task) (
 		}
 	}
 	if node.Kind == "subflow" {
-		return s.advanceSubflow(ctx, p, task, node, input, hash)
+		return s.advanceSubflow(ctx, p, task, node, input, hash, lease)
 	}
 	if node.Kind == "agent" || node.Kind == "tool" {
-		if reused, found, err := s.reuseCompleted(ctx, p, task, node, hash); found {
+		if reused, found, err := s.reuseCompleted(ctx, p, task, node, hash, lease); found {
 			return reused, err
 		}
 	}
@@ -148,7 +153,7 @@ func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task) (
 		}
 	}
 	attempt := NodeAttempt{ID: id, TaskID: task.ID, NodeID: node.ID, NodeInvocationID: task.ID + ":" + node.ID, Attempt: task.Revision.Attempts[node.ID] + 1, TaskRevision: task.Version.Revision, ExecutionEpoch: task.Version.ExecutionEpoch, RunID: runID, SessionID: sessionID, Input: input, InputHash: hash}
-	attempt, err = s.Repository.Claim(ctx, ClaimNode{Principal: p, TaskID: task.ID, Expected: task.Version, Attempt: attempt, Now: s.clock().UnixMilli()})
+	attempt, err = s.Repository.Claim(ctx, ClaimNode{Principal: p, TaskID: task.ID, Expected: task.Version, Attempt: attempt, Lease: lease, Now: s.clock().UnixMilli()})
 	if err != nil {
 		return task, err
 	}
@@ -166,7 +171,7 @@ func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task) (
 		if node.Agent == nil {
 			return task, ErrDefinitionInvalid
 		}
-		f := &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, NodeInvocationID: attempt.NodeInvocationID, NodeAttemptID: attempt.ID, TaskRevision: task.Version.Revision, AgentUID: node.Agent.UID, AgentConfigHash: node.Agent.ConfigHash, ResourceManifestHash: node.Agent.ManifestHash, Authority: task.Contract.Scope}
+		f := &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.RootTaskID, ParentTaskID: task.ParentTaskID, NodeInvocationID: attempt.NodeInvocationID, NodeAttemptID: attempt.ID, TaskRevision: task.Version.Revision, Lease: lease, AgentUID: node.Agent.UID, AgentConfigHash: node.Agent.ConfigHash, ResourceManifestHash: node.Agent.ManifestHash, Authority: task.Contract.Scope}
 		result, err = s.Runner.Run(ctx, NodeRunRequest{Principal: p, Task: task, Node: node, Attempt: attempt, Flow: f})
 	}
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -187,10 +192,16 @@ func (s *Service) advanceOne(ctx context.Context, p core.Principal, task Task) (
 			return s.Repository.Read(finishCtx, p, task.ID)
 		}
 	}
-	return s.acceptAttempt(finishCtx, p, latest, node, attempt, result, err)
+	return s.acceptAttempt(finishCtx, p, latest, node, attempt, result, err, lease)
 }
 
 func (s *Service) closeJoined(ctx context.Context, p core.Principal, task Task) (Task, error) {
+	// 关闭类是停住，不需要根租约；但 attempt 收敛必须携带 Isolated——本地执行已退出
+	// 不等于整棵子树的旧执行已被隔离（§2.3.6 第 4 个必须填写的调用点）。
+	isolated, err := s.isolatedOf(ctx, task)
+	if err != nil {
+		return task, err
+	}
 	req := ResumeRequest{Principal: p, TaskID: task.ID, Expected: task.Version, OperationID: fmt.Sprintf("joined:%s:%d", task.ID, task.Version.StateVersion), Reason: "local execution joined"}
-	return s.Repository.Recover(ctx, ReconcileTask{Request: req, Status: Blocked, Joined: true, Now: s.clock().UnixMilli()})
+	return s.Repository.Recover(ctx, ReconcileTask{Request: req, Status: Blocked, Joined: true, Isolated: isolated, Now: s.clock().UnixMilli()})
 }

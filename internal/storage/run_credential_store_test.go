@@ -48,7 +48,7 @@ func TestRunCredentialStore_FreezeAndRelease(t *testing.T) {
 	// 独立冻结：先有一条 Run 行（零清单只写运行行，不伪造引用）。
 	standalone := startRow("cli")
 	standalone.RunID = "cli-1776000000123-pin001"
-	require.NoError(t, runs.StartRun(ctx, standalone, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(runs, ctx, standalone, core.RunResourceManifest{}))
 
 	ref := core.RunCredentialRef{
 		RunID:             standalone.RunID,
@@ -111,7 +111,7 @@ func TestRunCredentialStore_AdmissionFreezesAndFinishReleases(t *testing.T) {
 
 	rec := startRow("cli")
 	rec.RunID = "cli-1776000000123-pin003"
-	require.NoError(t, runs.StartRun(ctx, rec, managed))
+	require.NoError(t, startRunTest(runs, ctx, rec, managed))
 
 	stored, err := pins.Pins(ctx, rec.RunID)
 	require.NoError(t, err)
@@ -131,7 +131,7 @@ func TestRunCredentialStore_AdmissionFreezesAndFinishReleases(t *testing.T) {
 	// env 模式的清单不写固定行（没有凭据身份可固定）。
 	envRec := startRow("web")
 	envRec.RunID = "web-1776000000123-pin004"
-	require.NoError(t, runs.StartRun(ctx, envRec, fx.manifest))
+	require.NoError(t, startRunTest(runs, ctx, envRec, fx.manifest))
 	stored, err = pins.Pins(ctx, envRec.RunID)
 	require.NoError(t, err)
 	require.Empty(t, stored)

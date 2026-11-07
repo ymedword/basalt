@@ -626,17 +626,49 @@ func scanSkills(ctx context.Context, deps BaselineDeps) ([]skillWork, error) {
 // scanAgents 逐个 Agent 判定：状态文件缺失 → 建 disabled / generation=1；
 // 状态文件损坏 → **整个基线失败**（约束 13，不得静默重建）；索引缺失或与状态文件
 // 不一致 → 只用状态文件重建索引（索引是派生面，写失败不阻止启动）。
-// scanAgents bootstraps missing state files, refuses corrupt ones, and reconciles the
-// rebuildable index against the authoritative file.
+//
+// **归档准入屏障守卫**（FR-24-41 / R3 的崩溃对账）：归档在索引上留下的 `disabled` 是
+// 准入否决，而状态文件此刻仍是 `active`——若照常按文件重建索引，每次 Worker 启动都会
+// 把屏障悄悄抹掉，"崩溃后不得自动放回 active"就成了一句空话。因此只要还有 pending 的
+// `agent.archive` 行带屏障标记、且索引仍是 `disabled`，就不重建该 Agent 的索引：屏障
+// 保留到人工查证（`archive_resume_required`），准入继续被拒。
+// scanAgents guards the archive admission barrier: while a pending archive operation
+// still holds the index at disabled, the rebuild from the (still active) state file is
+// skipped, so a restart can never silently release the barrier.
 func scanAgents(ctx context.Context, deps BaselineDeps) ([]agentWork, error) {
+	barriers, err := pendingArchiveBarriers(ctx, deps.Operations)
+	if err != nil {
+		return nil, err
+	}
 	var work []agentWork
 	for _, entry := range deps.Agents {
 		record, exists, err := deps.Lifecycle.Read(ctx, entry.Name)
 		switch {
 		case err == nil && exists:
-			index, ok, _, indexErr := deps.Resources.LifecycleIndex(ctx, entry.Name)
+			index, ok, _, indexErr := deps.Resources.ReadLifecycleIndex(ctx, entry.Name)
 			if indexErr != nil {
 				return nil, indexErr
+			}
+			if ok && barriers[entry.Name] && index.State == core.AgentDisabled &&
+				record.State != core.AgentArchived {
+				deps.logger().Warn("启动基线：归档准入屏障仍在，跳过索引重建（archive_resume_required）",
+					"agent", entry.Name, "state_file_state", string(record.State))
+				continue
+			}
+			// P-17：本地代次**高于**共享索引时不得自动重建——无条件写回等于把高代次
+			// 单方面写进索引，绕过"本地更大走管理操作单调修复"的准入判据。这里跳过
+			// 写入并记 WARN；该 Agent 因此**不可准入**：StartRun 事务内的复查会看到
+			// 索引代次低于期望值并以 `AGENT_LIFECYCLE_MISMATCH` 拒绝，而修复只能由
+			// 管理操作推进索引。单个 Agent 停留在这个状态**不阻塞**启动。
+			// A local generation above the index is never written back automatically;
+			// the agent stays non-admissible until a management operation advances the
+			// index, and one such agent must never block the whole startup.
+			if ok && record.Generation > index.Generation {
+				deps.logger().Warn("启动基线：本地生命周期代次高于共享索引，拒绝重建索引（需管理操作单调修复）",
+					"agent", entry.Name,
+					"local_generation", record.Generation,
+					"index_generation", index.Generation)
+				continue
 			}
 			if ok && index.State == record.State && index.Generation == record.Generation &&
 				index.OperationID == record.OperationID && index.Checksum == record.Checksum {
@@ -652,6 +684,49 @@ func scanAgents(ctx context.Context, deps BaselineDeps) ([]agentWork, error) {
 		}
 	}
 	return work, nil
+}
+
+// archiveBarrierDetail 是 pending 归档行 `detail_json` 里与屏障有关的两项。
+// archiveBarrierDetail projects the two barrier fields out of an archive detail.
+type archiveBarrierDetail struct {
+	ArchiveBarrier bool   `json:"archive_barrier"`
+	Agent          string `json:"agent"`
+}
+
+// pendingArchiveBarriers 从 pending 行里读出"屏障仍立着"的 Agent 集合。detail 读不懂
+// 按"没有屏障"处理——否则一条坏 JSON 就能把 Agent 永久锁在 disabled 里；真正决定
+// 是否保留的是索引状态本身（只有 `disabled` 才会被守卫跳过）。
+// pendingArchiveBarriers reads the barrier marker out of pending archive rows; an
+// unparseable detail counts as no barrier so one bad row can never lock an agent out.
+func pendingArchiveBarriers(ctx context.Context, ops core.OperationStore) (map[string]bool, error) {
+	if ops == nil {
+		return nil, nil
+	}
+	pending, err := ops.PendingOperations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("启动基线：读取未完成操作失败: %w", err)
+	}
+	held := make(map[string]bool, len(pending))
+	for _, op := range pending {
+		if op.Action != core.ActionAgentArchive {
+			continue
+		}
+		var detail archiveBarrierDetail
+		if len(op.DetailJSON) == 0 || json.Unmarshal(op.DetailJSON, &detail) != nil {
+			continue
+		}
+		if !detail.ArchiveBarrier {
+			continue
+		}
+		name := detail.Agent
+		if name == "" {
+			name = op.TargetID
+		}
+		if name != "" {
+			held[name] = true
+		}
+	}
+	return held, nil
 }
 
 // applyBaselineWork 逐项补齐待办并计数；任一项失败立刻返回，由调用方回填 failed。
@@ -840,8 +915,13 @@ func applyAgentWork(ctx context.Context, deps BaselineDeps, item agentWork, opID
 	}
 
 	if err := deps.Resources.PutLifecycleIndex(ctx, record, true, ""); err != nil {
-		deps.logger().Warn("启动基线：生命周期索引写入失败（状态文件为准，下次启动重建）",
-			"agent", item.name, "error", err)
+		// 代次拒绝（低于索引 / 同代次异内容）**不是**"下次启动自然修复"的暂时故障：
+		// 索引的代次单调规则会持续拒绝同一次写入，准入复查也会持续拒绝该 Agent，
+		// 直到管理操作把索引单调推进。WARN 里带本地代次，排障面才能与索引对号。
+		// A generation refusal is not a transient failure that heals on the next
+		// start; it persists until a management operation advances the index.
+		deps.logger().Warn("启动基线：生命周期索引写入被拒绝（状态文件为准，准入按索引判据拒绝）",
+			"agent", item.name, "local_generation", record.Generation, "error", err)
 	}
 	return nil
 }
@@ -923,6 +1003,16 @@ func recoverPendingOperations(ctx context.Context, deps RecoveryDeps) error {
 	}
 
 	for _, op := range pending {
+		if resumeRequired, guardErr := archiveResumeRequired(ctx, deps, op); guardErr != nil {
+			return guardErr
+		} else if resumeRequired {
+			// R3 的崩溃对账：屏障立住、归档未落地 → **不回滚**（恢复 active 可能指向一个
+			// 目录已被搬走的 Agent），保留 pending 并把准入继续拒之门外，等人工查证。
+			// 下一轮启动仍按同一判据重新判定，状态不会漂移。
+			logger.Warn("启动恢复：归档仍停在准入屏障上，保留 pending 等管理员查证（archive_resume_required）",
+				"operation_id", op.OperationID, "agent", op.TargetID)
+			continue
+		}
 		verification := verifyOperation(ctx, deps, op)
 		if verification == core.VerificationIndeterminate {
 			// 无法判定 → unknown，保留原样；**不重做**（约束 38）。
@@ -941,6 +1031,36 @@ func recoverPendingOperations(ctx context.Context, deps RecoveryDeps) error {
 			"action", op.Action, "verification", verification, "status", string(status))
 	}
 	return nil
+}
+
+// archiveResumeRequired 判定一条 pending 归档行是否停在"屏障已立、归档尚未落地"的中间态：
+// `detail_json` 带 `archive_barrier` 标记，且共享索引此刻仍是 `disabled`。两种含义都不
+// 能由恢复自行处置——索引 `disabled` 既可能是屏障，也可能是用户停用，但带标记的行只会由
+// 归档留下，所以判据取"标记 + 索引 disabled"这一对（R3）。
+//
+// 读不到索引**不得**猜：返回错误并中止启动（"标了没查"比不标更危险）。
+// archiveResumeRequired detects a pending archive row whose barrier is still holding the
+// index at disabled; the caller must leave it pending instead of rolling back.
+func archiveResumeRequired(ctx context.Context, deps RecoveryDeps, op core.OperationRecord) (bool, error) {
+	if op.Action != core.ActionAgentArchive {
+		return false, nil
+	}
+	var detail archiveBarrierDetail
+	if len(op.DetailJSON) == 0 || json.Unmarshal(op.DetailJSON, &detail) != nil || !detail.ArchiveBarrier {
+		return false, nil
+	}
+	name := detail.Agent
+	if name == "" {
+		name = op.TargetID
+	}
+	if name == "" {
+		return false, nil
+	}
+	index, ok, _, err := deps.Resources.ReadLifecycleIndex(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("启动恢复：读取 Agent %s 的生命周期索引: %w", name, err)
+	}
+	return ok && index.State == core.AgentDisabled, nil
 }
 
 // verifyOperation 按 action 组选择查证方式（约束 44 / 契约 §9.4 的恢复表）：
@@ -1003,6 +1123,9 @@ func verifyOperation(ctx context.Context, deps RecoveryDeps, op core.OperationRe
 		core.ActionSkillAdmissionCancel, core.ActionSkillAdmissionPublish,
 		core.ActionSkillAdmissionWithdraw:
 		return verifyAdmissionOperation(ctx, deps, op)
+	case core.ActionAgentBundlePublish:
+		// US-24 §2.3.9：发布成立的唯一判据是"指针已指向本哈希"，**不**重放安装。
+		return verifyBundlePublish(ctx, deps, op)
 	default:
 		return core.VerificationIndeterminate
 	}

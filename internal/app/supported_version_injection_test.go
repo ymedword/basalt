@@ -35,7 +35,8 @@ func TestApp_SupportedVersionInjectedPerBackend(t *testing.T) {
 	// `0002_agent_binding_knowledge_kind.sql` 加宽 `resource_kind` 闭集并前移到 2；
 	// R59 的 `source_text` 补列修复以 `0003_knowledge_source_text_repair.sql` 前移到 3
 	// ——已发布的 0001 现场字面量保持逐字节不变（D-19 裁决 2026-10-30 / R59 2026-10-31）。
-	require.Equal(t, 11, postgres.SupportedSchemaVersion, "运行期PostgreSQL追加已批准的0009隔离、0010学习准入与0011记忆学习提取迁移，SQLite源谱系独立")
+	require.GreaterOrEqual(t, postgres.SupportedSchemaVersion, 11,
+		"运行期PostgreSQL至少包含已批准的 0009 隔离、0010 学习准入与 0011 记忆学习提取迁移（US-24 追加 0012），SQLite 源谱系独立")
 	require.Equal(t, 6, storage.SupportedSchemaVersion, "SQLite 源谱系保持 v6（导出 / 旧库升级来源）")
 
 	workDir := t.TempDir()

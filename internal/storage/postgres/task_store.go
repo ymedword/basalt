@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -40,14 +41,52 @@ var _ core.TaskStore = (*TaskStore)(nil)
 // NewTaskStore binds the store to an opened writable database handle.
 func NewTaskStore(db *DB) *TaskStore { return &TaskStore{db: db} }
 
+// taskRecordColumns 是 `core.TaskRecord` 的投影列；顺序即 `scanTaskRecord` 的扫描顺序。
+// `ListTasks`（全量）与 `ListDispatchable`（到期扫描）共用同一份列序，避免两处漂移。
+// taskRecordColumns is the projection of core.TaskRecord shared by ListTasks and
+// ListDispatchable; the order is the scan order.
+const taskRecordColumns = `task_id, agent_name, cron, zone, message, deliver_to, enabled,
+	        definition_hash, last_run_at, last_status, retired_at, created_at, updated_at,
+	        caller_id, authorizing_kind, authorizing_key_id`
+
+// scanTaskRecord 把一行 `taskRecordColumns` 投影读成 `core.TaskRecord`（`rowScanner`
+// 在 run_query.go 声明，单行与多行共用同一次扫描）。
+// scanTaskRecord maps one projected row onto core.TaskRecord.
+func scanTaskRecord(row rowScanner) (core.TaskRecord, error) {
+	var (
+		rec        core.TaskRecord
+		lastRunAt  sql.NullInt64
+		lastStatus sql.NullString
+		retiredAt  sql.NullInt64
+		createdAt  int64
+		updatedAt  int64
+		authKind   string
+		keyID      sql.NullString
+	)
+	if err := row.Scan(&rec.TaskID, &rec.Agent, &rec.Cron, &rec.Zone, &rec.Message,
+		&rec.DeliverTo, &rec.Enabled, &rec.DefinitionHash, &lastRunAt, &lastStatus, &retiredAt,
+		&createdAt, &updatedAt, &rec.CallerID, &authKind, &keyID); err != nil {
+		return core.TaskRecord{}, err
+	}
+	// 归属与授权来源是 NOT NULL 列（schema 的 CHECK 也保证组合成立）：原样读出，
+	// **不**做任何"空则补管理员"的兜底——缺值只可能是库被绕过写入，交由调度器
+	// 按 fail-closed 拒绝。
+	// The ownership columns are NOT NULL and read verbatim; there is no fallback.
+	rec.AuthorizingKind = core.AuthorizingKind(authKind)
+	rec.AuthorizingKeyID = keyID.String
+	rec.LastRunAt = unixMilliOrZero(lastRunAt)
+	rec.LastStatus = core.ExecutionStatus(lastStatus.String)
+	rec.RetiredAt = unixMilliOrZero(retiredAt)
+	rec.CreatedAt = time.UnixMilli(createdAt).UTC()
+	rec.UpdatedAt = time.UnixMilli(updatedAt).UTC()
+	return rec, nil
+}
+
 // ListTasks 按 task_id 升序返回**全部**任务行（含 retired 行，由 core 做可见性过滤）。
 // ListTasks returns every row ordered by task_id, retired rows included; core filters.
 func (s *TaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
 	rows, err := s.db.pool.QueryContext(ctx,
-		`SELECT task_id, agent_name, cron, zone, message, deliver_to, enabled, definition_hash,
-		        last_run_at, last_status, retired_at, created_at, updated_at,
-		        caller_id, authorizing_kind, authorizing_key_id
-		   FROM scheduled_tasks ORDER BY task_id ASC`)
+		`SELECT `+taskRecordColumns+` FROM scheduled_tasks ORDER BY task_id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("列出定时任务: %w", err)
 	}
@@ -55,32 +94,10 @@ func (s *TaskStore) ListTasks(ctx context.Context) ([]core.TaskRecord, error) {
 
 	var out []core.TaskRecord
 	for rows.Next() {
-		var (
-			rec        core.TaskRecord
-			lastRunAt  sql.NullInt64
-			lastStatus sql.NullString
-			retiredAt  sql.NullInt64
-			createdAt  int64
-			updatedAt  int64
-			authKind   string
-			keyID      sql.NullString
-		)
-		if err := rows.Scan(&rec.TaskID, &rec.Agent, &rec.Cron, &rec.Zone, &rec.Message,
-			&rec.DeliverTo, &rec.Enabled, &rec.DefinitionHash, &lastRunAt, &lastStatus, &retiredAt,
-			&createdAt, &updatedAt, &rec.CallerID, &authKind, &keyID); err != nil {
+		rec, err := scanTaskRecord(rows)
+		if err != nil {
 			return nil, fmt.Errorf("读取定时任务行: %w", err)
 		}
-		// 归属与授权来源是 NOT NULL 列（schema 的 CHECK 也保证组合成立）：原样读出，
-		// **不**做任何"空则补管理员"的兜底——缺值只可能是库被绕过写入，交由调度器
-		// 按 fail-closed 拒绝。
-		// The ownership columns are NOT NULL and read verbatim; there is no fallback.
-		rec.AuthorizingKind = core.AuthorizingKind(authKind)
-		rec.AuthorizingKeyID = keyID.String
-		rec.LastRunAt = unixMilliOrZero(lastRunAt)
-		rec.LastStatus = core.ExecutionStatus(lastStatus.String)
-		rec.RetiredAt = unixMilliOrZero(retiredAt)
-		rec.CreatedAt = time.UnixMilli(createdAt).UTC()
-		rec.UpdatedAt = time.UnixMilli(updatedAt).UTC()
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
@@ -199,40 +216,98 @@ func (s *TaskStore) MarkTaskRun(ctx context.Context, taskID string, at time.Time
 	return nil
 }
 
-// StartExecution 插入 `status = 'started'` 的执行行并返回自增 id；起始态由 SQL 固定，
-// 调用方没有传错的可能（与 StartRun 同一手法）。
-// StartExecution inserts the started row and returns its auto-increment id; the status
-// is fixed here, not accepted from the caller.
-func (s *TaskStore) StartExecution(ctx context.Context, rec core.ExecutionRecord) (int64, error) {
-	var id int64
-	err := s.db.pool.QueryRowContext(ctx,
-		`INSERT INTO task_executions(task_id, run_id, status, trigger, started_at)
-		 VALUES ($1, $2, $3, $4, $5)
-		 RETURNING id`,
-		rec.TaskID, nullIfEmpty(rec.RunID), string(core.ExecutionStarted),
-		string(rec.Trigger), rec.StartedAt.UnixMilli()).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("预写任务执行行（task_id=%s）: %w", rec.TaskID, err)
+// StartExecution 在**同一事务**里写 `status = 'started'` 的执行行与
+// `schedule_execution` 租约（手动补跑路径；定时触发走 `ClaimDueTrigger` 的同一套写法）。
+//
+// 同任务已有 `started` 执行 → `core.ErrTaskBusy`：事务内先判一次给出可区分的哨兵，
+// 部分唯一索引 `ux_task_executions_active` 仍是最后一道（并发下两笔同时通过预判时
+// 由索引拒绝，错误原样上抛——那说明任务级串行被绕过，不该静默吞掉）。
+// StartExecution writes the started row and its lease in one transaction; an existing
+// started row for the same task yields core.ErrTaskBusy.
+func (s *TaskStore) StartExecution(ctx context.Context, rec core.ExecutionRecord,
+	owner core.WorkerIdentity, ttl time.Duration,
+) (int64, core.LeaseToken, error) {
+	if owner.InstanceID == "" {
+		return 0, core.LeaseToken{}, fmt.Errorf("postgres: 起始执行缺少领取者身份（task_id=%s）", rec.TaskID)
 	}
-	return id, nil
+	ttlMS, err := validateLeaseTTL(ttl)
+	if err != nil {
+		return 0, core.LeaseToken{}, err
+	}
+	if rec.RunID == "" {
+		return 0, core.LeaseToken{}, fmt.Errorf("postgres: 起始执行缺少 RunID（task_id=%s）", rec.TaskID)
+	}
+
+	var (
+		id    int64
+		token core.LeaseToken
+	)
+	_, err = s.db.Tx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		// 任务行锁把同一任务的全部触发状态转换串起来：并发下线 / 并发补跑都在这里排队，
+		// 预判因此是权威读而不是快照猜测。
+		if _, err := lockTaskRow(ctx, tx, rec.TaskID); err != nil {
+			return err
+		}
+		busy, err := executionStartedExists(ctx, tx, rec.TaskID)
+		if err != nil {
+			return err
+		}
+		if busy {
+			return core.ErrTaskBusy
+		}
+		nowMS, err := readDBMillis(ctx, tx)
+		if err != nil {
+			return err
+		}
+		startedMS := rec.StartedAt.UnixMilli()
+		if rec.StartedAt.IsZero() {
+			startedMS = nowMS
+		}
+		if err := tx.QueryRowContext(ctx, `
+INSERT INTO task_executions(task_id, run_id, status, trigger, started_at,
+                           planned_at, owner_worker_id, ownership_epoch)
+VALUES ($1, $2, $3, $4, $5, NULL, $6, 1)
+RETURNING id`,
+			rec.TaskID, rec.RunID, string(core.ExecutionStarted), string(rec.Trigger),
+			startedMS, owner.InstanceID).Scan(&id); err != nil {
+			return fmt.Errorf("预写任务执行行（task_id=%s）: %w", rec.TaskID, err)
+		}
+		token, err = insertExecutionLease(ctx, tx, id, owner.InstanceID, nowMS, ttlMS)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, core.LeaseToken{}, err
+	}
+	return id, token, nil
 }
 
-// FinishExecution 写执行行终态并在**同一事务**内同步 `scheduled_tasks.last_status`
-// （含 skipped——任何终态都要让任务列表说真话）。`run_id` 的保留判据是该行在 `runs`
-// 表是否真实存在：会话忙 / 准入失败等未产生 Run 的终态一律置 NULL（P-04）。
-// FinishExecution writes the terminal row and syncs last_status in the same transaction.
-// run_id survives only when the runs row actually exists.
-func (s *TaskStore) FinishExecution(ctx context.Context, id int64, status core.ExecutionStatus,
-	duration time.Duration, errMsg string, at time.Time,
+// FinishExecution 带 token 做 fencing 写执行行终态：**同一事务**内回填终态、同步
+// `scheduled_tasks.last_status`（含 skipped——任何终态都要让任务列表说真话）并释放
+// `schedule_execution` 租约。`run_id` 的保留判据是该行在 `runs` 表是否真实存在：
+// 会话忙 / 准入失败等未产生 Run 的终态一律置 NULL（P-04）。
+//
+// 已终态的行幂等返回（重试不重写、不再写事件）；失权由 `fencedTx` 以 `ErrLeaseLost`
+// 拒绝——接管提交后旧属主重读一定看到新代次。
+// FinishExecution fences on the token, writes the terminal row, syncs last_status and
+// releases the lease in one transaction; an already-terminal row is an idempotent no-op.
+func (s *TaskStore) FinishExecution(ctx context.Context, id int64, token core.LeaseToken,
+	status core.ExecutionStatus, duration time.Duration, errMsg string, at time.Time,
 ) error {
-	return s.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	if token.Kind != core.LeaseScheduleExecution || token.ResourceID != strconv.FormatInt(id, 10) {
+		return fmt.Errorf("postgres: 执行行收尾的执行权凭证不匹配（id=%d, kind=%s）", id, token.Kind)
+	}
+	return fencedTx(ctx, s.db, token, func(ctx context.Context, tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE task_executions
 			    SET status = $1, duration_ms = $2, error_message = $3, finished_at = $4,
 			        run_id = CASE WHEN EXISTS (SELECT 1 FROM runs r WHERE r.run_id = task_executions.run_id)
 			                      THEN run_id ELSE NULL END
-			  WHERE id = $5`,
-			string(status), duration.Milliseconds(), nullIfEmpty(errMsg), at.UnixMilli(), id)
+			  WHERE id = $5 AND status = $6`,
+			string(status), duration.Milliseconds(), nullIfEmpty(errMsg), at.UnixMilli(),
+			id, string(core.ExecutionStarted))
 		if err != nil {
 			return fmt.Errorf("回填任务执行终态（id=%d）: %w", id, err)
 		}
@@ -241,8 +316,22 @@ func (s *TaskStore) FinishExecution(ctx context.Context, id int64, status core.E
 			return fmt.Errorf("确认任务执行终态写入（id=%d）: %w", id, err)
 		}
 		if affected == 0 {
-			// 未知行号：如实报错，且**不**写 last_status——否则会误伤同任务已有状态。
-			return fmt.Errorf("回填任务执行终态（id=%d）: %w", id, fs.ErrNotExist)
+			// 0 行只有两种可能：行已被收尾（幂等）或行不存在（数据损坏）。
+			// 失权在第 0 行之前就已由 fencedTx 判掉，不会走到这里。
+			var current string
+			err := tx.QueryRowContext(ctx,
+				`SELECT status FROM task_executions WHERE id = $1`, id).Scan(&current)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("回填任务执行终态（id=%d）: %w", id, fs.ErrNotExist)
+			case err != nil:
+				return fmt.Errorf("读取任务执行状态（id=%d）: %w", id, err)
+			case current == string(core.ExecutionStarted):
+				// 条件更新没命中却仍是 started：只可能是并发写绕过了行锁。
+				return fmt.Errorf("postgres: 执行行收尾未命中（id=%d）", id)
+			default:
+				return nil // 已终态：重试幂等
+			}
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE scheduled_tasks SET last_status = $1
@@ -250,8 +339,36 @@ func (s *TaskStore) FinishExecution(ctx context.Context, id int64, status core.E
 			string(status), id); err != nil {
 			return fmt.Errorf("同步任务最后状态（id=%d）: %w", id, err)
 		}
-		return nil
+		nowMS, err := readDBMillis(ctx, tx)
+		if err != nil {
+			return err
+		}
+		return releaseExecutionLease(ctx, tx, token, nowMS)
 	})
+}
+
+// readExecutionForRecovery 读 A2 需要的执行行读数：本行状态、起始时刻与**关联 Run
+// 的当前状态**（LEFT JOIN——预写后尚未建 Run 时 run_id 为 NULL，那是"无 Run"分支，
+// 不是缺失数据）。返回 found=false 表示行本身不存在（数据损坏），由调用方决定怎么报。
+//
+// 读出来的 run 状态只用于**分类**：权威判据仍在 `FinishExecution` 的 fence 里
+// （`WHERE id=$5 AND status='started'`），快照过期不会写出错误终态。
+// readExecutionForRecovery gathers A2's inputs; the authoritative guard stays inside
+// FinishExecution's fence, so a stale snapshot cannot produce a wrong terminal value.
+func (s *TaskStore) readExecutionForRecovery(ctx context.Context, id int64) (executionRecoveryRow, bool, error) {
+	var row executionRecoveryRow
+	err := s.db.pool.QueryRowContext(ctx,
+		`SELECT e.status, e.started_at, r.status
+		   FROM task_executions e
+		   LEFT JOIN runs r ON r.run_id = e.run_id
+		  WHERE e.id = $1`, id).Scan(&row.status, &row.startedAt, &row.runStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return executionRecoveryRow{}, false, nil
+	}
+	if err != nil {
+		return executionRecoveryRow{}, false, fmt.Errorf("读取待收尾的执行行（id=%d）: %w", id, err)
+	}
+	return row, true, nil
 }
 
 // RecordSkipped 直接插入零时长的 skipped 终态行（锁失路径）：无 Run、无 started 前驱，
@@ -271,89 +388,12 @@ func (s *TaskStore) RecordSkipped(ctx context.Context, rec core.ExecutionRecord)
 	return nil
 }
 
-// RecoverStartedExecutions 收尾崩溃遗留的 `started` 行：LEFT JOIN `runs` 取 Run 终态，
-// Run 完成 / 达上限 → completed，其余（failed / cancelled / 仍 running / 无 Run）→ failed。
-// 无 Run 行同时把 `run_id` 置 NULL（与 FinishExecution 同一条存在性判据，P-04）。
-//
-// `run_id` 与 `r.status` 都用 `sql.NullString` 接：前者可空、后者在 LEFT JOIN 无匹配时
-// 为 NULL。按 `started_at` 正序处理是判据的一部分——同一任务多行遗留时，最后写入的
-// `last_status` 必来自最新一行。
-// Recovery closes leftover started rows; ordering by started_at ascending is part of the
-// contract so the newest row wins last_status.
-func (s *TaskStore) RecoverStartedExecutions(ctx context.Context, now time.Time) (int, error) {
-	type startedRow struct {
-		id       int64
-		taskID   string
-		runID    sql.NullString
-		runState sql.NullString
-	}
-
-	var pending []startedRow
-	recovered := 0
-	err := s.db.withTx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx,
-			`SELECT e.id, e.task_id, e.run_id, r.status
-			   FROM task_executions e
-			   LEFT JOIN runs r ON r.run_id = e.run_id
-			  WHERE e.status = $1
-			  ORDER BY e.started_at ASC, e.id ASC`, string(core.ExecutionStarted))
-		if err != nil {
-			return fmt.Errorf("扫描遗留的 started 执行行: %w", err)
-		}
-		for rows.Next() {
-			var row startedRow
-			if err := rows.Scan(&row.id, &row.taskID, &row.runID, &row.runState); err != nil {
-				_ = rows.Close()
-				return fmt.Errorf("读取遗留的 started 执行行: %w", err)
-			}
-			pending = append(pending, row)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("遍历遗留的 started 执行行: %w", err)
-		}
-		// 必须先关闭游标再写：写与读共用钉住的那一条写连接。
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("关闭遗留执行行游标: %w", err)
-		}
-
-		for _, row := range pending {
-			status := core.ExecutionFailed
-			if row.runState.Valid &&
-				(row.runState.String == string(core.StatusCompleted) ||
-					row.runState.String == string(core.StatusLimitReached)) {
-				status = core.ExecutionCompleted
-			}
-			runID := row.runID
-			if !row.runState.Valid {
-				runID = sql.NullString{} // 无 Run 行 → 不留悬空引用
-			}
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE task_executions SET status = $1, finished_at = $2, run_id = $3
-				  WHERE id = $4`, string(status), now.UnixMilli(), runID, row.id); err != nil {
-				return fmt.Errorf("收尾遗留执行行（id=%d）: %w", row.id, err)
-			}
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE scheduled_tasks SET last_status = $1 WHERE task_id = $2`,
-				string(status), row.taskID); err != nil {
-				return fmt.Errorf("同步任务最后状态（task_id=%s）: %w", row.taskID, err)
-			}
-			recovered++
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return recovered, nil
-}
-
 // ListExecutions 按 started_at 降序（同刻按 id 降序）返回某任务的执行历史，最多 limit 条。
 // ListExecutions returns the newest execution rows first, capped at limit.
 func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int) ([]core.ExecutionRecord, error) {
 	rows, err := s.db.pool.QueryContext(ctx,
 		`SELECT e.id, e.task_id, e.run_id, e.status, e.trigger, e.duration_ms, e.error_message,
-		        d.status, d.channel_uid, d.detail, e.started_at, e.finished_at
+		        d.status, d.channel_uid, d.detail, e.started_at, e.finished_at, e.planned_at
 		   FROM task_executions e
 		   LEFT JOIN schedule_deliveries d ON d.run_id = e.run_id
 		  WHERE e.task_id = $1
@@ -377,10 +417,11 @@ func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int
 			deliveryDetail  sql.NullString
 			startedAt       int64
 			finishedAt      sql.NullInt64
+			plannedAt       sql.NullInt64
 		)
 		if err := rows.Scan(&rec.ID, &rec.TaskID, &runID, &status, &trigger,
 			&durationMS, &errMsg, &deliveryStatus, &deliveryChannel, &deliveryDetail,
-			&startedAt, &finishedAt); err != nil {
+			&startedAt, &finishedAt, &plannedAt); err != nil {
 			return nil, fmt.Errorf("读取任务执行行: %w", err)
 		}
 		rec.RunID = runID.String
@@ -393,6 +434,10 @@ func (s *TaskStore) ListExecutions(ctx context.Context, taskID string, limit int
 		rec.DeliveryDetail = deliveryDetail.String
 		rec.StartedAt = time.UnixMilli(startedAt).UTC()
 		rec.FinishedAt = unixMilliOrZero(finishedAt)
+		if plannedAt.Valid {
+			planned := time.UnixMilli(plannedAt.Int64).UTC()
+			rec.PlannedAt = &planned
+		}
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {

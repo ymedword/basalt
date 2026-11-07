@@ -22,11 +22,17 @@ import (
 // flowNodeRunner is the one production leaf adapter: it only enters the shared
 // runAdmission and AgentService, never appending messages or invoking a tool.
 type flowNodeRunner struct {
-	service         *core.AgentService
-	admission       *runAdmission
-	store           *postgres.FlowStore
-	authority       flow.AuthorityResolver
-	sources         flow.SourceValidity
+	service   *core.AgentService
+	admission *runAdmission
+	store     *postgres.FlowStore
+	authority flow.AuthorityResolver
+	sources   flow.SourceValidity
+	// gate 是根子树的三个持久判据（US-24 §3.1.8 / core.SubtreeGate）。Joined 与
+	// Isolated 各答各的问题，**不得**互换：前者问"还有没有子节点可能提交"，
+	// 后者问"还有没有人能提交"。nil（未装配）一律 fail-closed。
+	// gate carries the three durable subtree criteria; Joined and Isolated never
+	// substitute for each other, and a nil gate fails closed.
+	gate            core.SubtreeGate
 	collections     knowledge.Authz
 	schemas         *tool.SchemaCompiler
 	writeReady      bool
@@ -190,16 +196,69 @@ func (r *flowNodeRunner) Run(ctx context.Context, req flow.NodeRunRequest) (flow
 	return observed, runErr
 }
 
-func (r *flowNodeRunner) Joined(_ context.Context, task flow.Task) (bool, error) {
-	if r == nil {
+// Joined = 根子树下不存在 prepared / running attempt（US-24 §3.1.8 / FR-24-38）。
+//
+// 本地活跃表只作**快路径**（命中即 false，本进程还有节点在跑，不查库）；未命中时
+// 必须查库，**不再**用租约有效性代替——租约有效性属于另一个判据 Isolated。
+// interrupted / unknown 不计入 Joined：它们只能由 Recover 清理，计入就永远等不到
+// 放行；租约是否过期也不参与本判据（TTL 不能推断子 Run 已退出）。
+func (r *flowNodeRunner) Joined(ctx context.Context, task flow.Task) (bool, error) {
+	if r == nil || r.gate == nil {
 		return false, core.ErrFlowDispatch
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	startupComplete, active := r.startupComplete, r.active[task.RootTaskID] > 0
+	r.mu.Unlock()
 	// Startup is set only after original recovery under the process instance lock.
 	// Every current-process leaf is registered before admission and removed after
 	// the synchronous original Run has actually returned, including audit cleanup.
-	return r.startupComplete && r.active[task.RootTaskID] == 0, nil
+	if !startupComplete || active {
+		return false, nil
+	}
+	inflight, err := r.inFlightFor(ctx, task)
+	if err != nil {
+		return false, err
+	}
+	return !inflight, nil
+}
+
+// inFlightFor 按**推进目标**的作用域判"子树是否在途"：
+//   - 根任务：整棵根子树（`core.SubtreeGate`，FR-24-20 / FR-24-38 的既有口径，
+//     与 Worker 的门 ② 同一份查询）；
+//   - 子任务：目标任务自身子树（`HasInFlightNodeAttemptUnder`）。祖先链上的 attempt
+//     是**调用方自己**在同一轮 `advanceSubflow` 里刚 Claim 的父 / 祖父 subflow 节点
+//     凭证——subflow 节点没有 Run，attempt 就是它的执行凭证——把它计入等于让子复用
+//     自我阻塞：Joined=false → ErrCapacity → Worker 当竞争错误吞掉 → 每轮重复。
+//     后代的 prepared / running attempt 仍然计入，interrupted / unknown 仍不计入。
+//
+// 两处都只认持久事实（TTL 不参与推断）；本进程活跃表只是上面的快路径。
+// inFlightFor scopes the Joined criterion to the task being advanced: the whole root
+// subtree for a root, the task's own subtree for a child, so the parent subflow attempt
+// claimed by this very advance cannot block reuse of a completed child Run.
+func (r *flowNodeRunner) inFlightFor(ctx context.Context, task flow.Task) (bool, error) {
+	if task.ParentTaskID == "" {
+		return r.gate.HasInFlightNodeAttempt(ctx, task.RootTaskID)
+	}
+	if r.store == nil {
+		return false, core.ErrFlowDispatch
+	}
+	return r.store.HasInFlightNodeAttemptUnder(ctx, task.ID)
+}
+
+// Isolated = 根子树下没有仍有效的 run 租约；**只**用于驱动 Recover /
+// 关闭路径把 prepared|running attempt 收敛为 interrupted，不参与推进门禁。
+// 判据是租约有效性而非进程存活性：受保护写入全走 FencedTx，租约失效后旧属主的
+// 提交被拒——这是 fencing 的语义，不是猜测。
+// Isolated gates attempt convergence only; it never gates advancement.
+func (r *flowNodeRunner) Isolated(ctx context.Context, task flow.Task) (bool, error) {
+	if r == nil || r.gate == nil {
+		return false, core.ErrFlowDispatch
+	}
+	live, err := r.gate.HasLiveRunLease(ctx, task.RootTaskID)
+	if err != nil {
+		return false, err
+	}
+	return !live, nil
 }
 
 func (r *flowNodeRunner) ObserveCompleted(ctx context.Context, req flow.NodeRunRequest) (flow.NodeRunResult, error) {

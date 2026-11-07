@@ -91,7 +91,7 @@ var allKinds = []Kind{
 // Valid reports whether the kind is one of the contract values.
 func (k Kind) Valid() bool { return slices.Contains(allKinds, k) }
 
-// ReasonCode 是稳定原因码枚举（契约 `DiagnosticReasonCode` 十七值）；面向人的文案由
+// ReasonCode 是稳定原因码枚举（契约 `DiagnosticReasonCode` 十九值）；面向人的文案由
 // UI 映射，**不得**把自由文本写进该字段。
 // ReasonCode is the stable reason enumeration; human-facing text is mapped by the UI.
 type ReasonCode string
@@ -140,6 +140,12 @@ const (
 	// ReasonChunkInvalidated 表示轮次间撤权/删除/换版导致注入范围收窄。
 	// ReasonChunkInvalidated records narrowed context after revalidation.
 	ReasonChunkInvalidated ReasonCode = "chunk_invalidated"
+	// ReasonRecoveryUnknown 表示恢复路径发现一条**已发出、结果不可知且不会重放**的
+	// 副作用（US-24 §2.3.5 A1）。它不是"执行失败"：模型 / 工具可能已经生效，正因为
+	// 无法查证才停在 `unknown`，事件把这条审计行挂回 Run 的时间线，而不是发第二次。
+	// ReasonRecoveryUnknown marks an already-issued side effect whose outcome is
+	// unknowable and will never be replayed; it is not a failed call.
+	ReasonRecoveryUnknown ReasonCode = "recovery_unknown"
 )
 
 // allReasonCodes 是原因码契约枚举的完整取值集合（与 `allKinds` 同一条纪律）。
@@ -150,6 +156,7 @@ var allReasonCodes = []ReasonCode{
 	ReasonCitationUnresolved, ReasonChunkerFailed, ReasonEmbedFailed, ReasonIndexFailed,
 	ReasonQuotaExhausted, ReasonRateLimited, ReasonKeyRevoked, ReasonMigrationVerifyFailed,
 	ReasonLLMCallFailed, ReasonConcurrencyLimited, ReasonChunkInvalidated,
+	ReasonRecoveryUnknown,
 }
 
 // Valid 报告原因码是否落在契约枚举内；空串表示未给出原因，按合法处理。

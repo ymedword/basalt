@@ -59,8 +59,14 @@ type Config struct {
 	// Execution 是执行档位段（`execution`，14D）：**只作首次种子**——落库之后以库为准，
 	// 改这里不会覆盖管理台写入的值（与 `http.allowed_domains` 同一口径）。
 	// The execution section seeds the profile once; the database is authoritative after.
-	Execution ExecutionConfig   `yaml:"execution"`
-	Learning  LearningConfig    `yaml:"learning"`
+	Execution ExecutionConfig `yaml:"execution"`
+	Learning  LearningConfig  `yaml:"learning"`
+	// 分布式执行三段（US-24 §3.3）：显式解析入口、未知键拒绝、装载期逐条校验。
+	// The three distributed-execution sections: explicit parsing, unknown keys refused,
+	// every rule checked at load time.
+	Worker    WorkerConfig      `yaml:"-"`
+	Scheduler SchedulerConfig   `yaml:"-"`
+	Assets    AssetsConfig      `yaml:"-"`
 	Author    core.AuthorConfig `yaml:"-"`
 }
 
@@ -791,6 +797,26 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 		return nil, err
 	}
 	cfg.Flows = flowConfig
+
+	// US-24 三段（§3.3）：三段各自的段内规则在 parse* 里解，跨段上限（dispatch_batch
+	// 与 flows.max_active 共同容纳于 max_inflight）在 validateDistributedConfig 里判。
+	// 顺序固定在 flows 之后——跨段校验需要 flows 的上限。
+	workerSection, workerPresent := tree["worker"]
+	if cfg.Worker, err = parseWorkerConfig(workerSection, workerPresent); err != nil {
+		return nil, err
+	}
+	schedulerSection, schedulerPresent := tree["scheduler"]
+	if cfg.Scheduler, err = parseSchedulerConfig(schedulerSection, schedulerPresent); err != nil {
+		return nil, err
+	}
+	assetsSection, assetsPresent := tree["assets"]
+	if cfg.Assets, err = parseAssetsConfig(assetsSection, assetsPresent); err != nil {
+		return nil, err
+	}
+	if err := validateDistributedConfig(cfg.Worker, cfg.Scheduler, cfg.Assets, cfg.Flows); err != nil {
+		return nil, err
+	}
+
 	isolationSection, isolationPresent := tree["isolation"]
 	cfg.Isolation, err = parseIsolationConfig(isolationSection, isolationPresent)
 	if err != nil {

@@ -2,7 +2,8 @@
 
 package app
 
-// 本文件是 US-22 T024 的启动恢复验收（颗粒度文档 §2.3.6 / §4.3 ⑤ / C-13 / C-14 / C-15）：
+// 本文件是 US-22 T024 的启动恢复验收（颗粒度文档 §2.3.6 / §4.3 ⑤ / C-13 / C-14 / C-15），
+// 并在 US-24 T019 扩入**归属保护**与回收器 B3（模块卡 §2.3.5 B3 / FR-24-39 / P-18 / R6 / R7）：
 //
 //	R1 `TestUS22_Recovery_CandidatesMeanSuccess`——已有候选元数据判 success，游标推进
 //	R2 `TestUS22_Recovery_DraftsMeanSuccess`——只有草案行同样判 success，草案行保留
@@ -11,18 +12,31 @@ package app
 //	R4 `TestUS22_Recovery_UnknownNotRewritten`——已查证的 unknown 不被下一次启动补成
 //	   success（不改口），`verified_at` 保持首次读数
 //	R5 `TestUS22_Recovery_NoReplay`——恢复只调用「扫描 → 计数 → 写结论」四个只读查询与
-//	   一个查证写方法；时钟只取一次；端口缺失拒绝启动
+//	   一个查证写方法；时钟只取一次；预期尝试随行进写入事务；端口缺失拒绝启动
 //	R6 `TestUS22_Recovery_RecoveredUnknownUnblocks`——恢复前同来源新窗口被阻断，恢复后
 //	   解除（`UnresolvedForOrigin` 归空、`BeginExtraction` 建新行）
 //	R7 `TestUS22_Unknown_NoRestartNextRunNoReplay`——提交未知且**不重启**时，同来源下一
 //	   Run 零写入零调用（B-08）
 //
-// 为什么 R1–R4 / R6–R7 走真实 PostgreSQL：查证结论、`verified_at` 与游标推进都写在
-// 存储层的单事务里（`RecoverExtraction`），用内存替身只会变成"替身替我做了判断"。
-// R5 用假存储，因为它判的是**装配层调用形状**——恢复经手的写方法只能有一个，且根本没有
-// 抽取器可调（"不重放"在依赖面里就表达不出来）。
-// The real-database cases assert the verdict, verified_at and cursor the store writes in
-// one transaction; the fake-store case asserts the assembly's call shape and clock usage.
+// 归属保护与 B3（US-24 T019）：
+//
+//	O1 `TestUS22_Recovery_SkipsLiveOwnerExtraction`——`last_attempt_run_id` 仍有有效 run
+//	   租约的 pending 行不进启动扫描（零写入）；同轮里无租约的行照常查证
+//	O2 `TestReclaimer_OrphanExtractionVerifiedWithoutRestart`——属主失联后，回收器先由
+//	   A1 收尾 Run、再由 B3 查证同一行：进程不重启也能解除同来源阻断
+//	O3 `TestReclaimer_OrphanExtractionSkipsLegitimateRetry`——扫描后该行经合法重试换手
+//	   （`last_attempt_run_id` 变、新属主持有效租约）→ 本轮零写入、不改口
+//	O4 `TestReclaimer_OrphanExtractionWaitsForConcurrentRenewal`——写入与续约在同一租约
+//	   行锁上排队：续约提交（租约被推后）→ 跳过；回滚（租约仍过期）→ 照常查证（R7）
+//
+// 为什么 R1–R4 / R6–R7 / O1–O4 走真实 PostgreSQL：查证结论、`verified_at`、游标推进与
+// 归属保护的锁序（advisory → 租约行 → 抽取行）都写在存储层的事务里，用内存替身只会变成
+// "替身替我做了判断"。R5 用假存储，因为它判的是**装配层调用形状**——恢复经手的写方法只能
+// 有一个，且根本没有抽取器可调（"不重放"在依赖面里就表达不出来）。O4 只能对真实数据库
+// 做：行锁排队是 PostgreSQL 的语义，不是本仓代码可以模拟的。
+// The real-database cases assert the verdict, verified_at, cursor and the ownership fence;
+// the fake-store case asserts the assembly's call shape and clock usage. Only a live
+// PostgreSQL can show that the recovery write queues behind a concurrent renewal.
 
 import (
 	"context"
@@ -36,6 +50,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ymedword/basalt/internal/core"
+	"github.com/ymedword/basalt/internal/flow"
 	"github.com/ymedword/basalt/internal/memory"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
@@ -110,9 +125,20 @@ func (e *us22RecoveryEnv) seedRun(t *testing.T, runID, callerID string, keyID *s
 	require.NoError(t, err)
 }
 
-// seedPending 落一条 pending 抽取行（提交结果未知的现场）。
-// seedPending inserts a pending extraction row — the "outcome unknown" scene.
+// seedPending 落一条 pending 抽取行（提交结果未知的现场），last_attempt_run_id 取
+// `<extractionID>_run`——没有对应租约行，因此按"无属主可等"入选。
+// seedPending inserts a pending extraction row whose last attempt has no lease row.
 func (e *us22RecoveryEnv) seedPending(t *testing.T, extractionID string, from, to int64) {
+	t.Helper()
+	e.seedPendingFor(t, extractionID, extractionID+"_run", from, to)
+}
+
+// seedPendingFor 落一条 pending 抽取行并显式指定 `last_attempt_run_id`：US-24 的归属
+// 判据只认这一列（`run_id` 是首次尝试且 UNIQUE，拿它判会漏掉重试中的活属主）。
+// seedPendingFor pins last_attempt_run_id, the only column the ownership predicate reads.
+func (e *us22RecoveryEnv) seedPendingFor(t *testing.T, extractionID, lastAttemptRunID string,
+	from, to int64,
+) {
 	t.Helper()
 	at := baselineClock().UnixMilli()
 	_, err := e.raw.ExecContext(t.Context(), `
@@ -121,10 +147,10 @@ func (e *us22RecoveryEnv) seedPending(t *testing.T, extractionID string, from, t
 			 origin_caller_id, origin_key_id, status, window_from_message_id, window_to_message_id,
 			 window_messages, prompt_version, rule_version, provider, model,
 			 created_at, last_attempt_at)
-		VALUES ($1, $2, $3, $1 || '_run', $1 || '_run', $4, $5, 'pending', $6, $7, $8,
-		        'memory-extract-v1', 'memory-rules-v1', 'stub', 'stub-model', $9, $9)`,
-		extractionID, us22RecoveryAgent, us22RecoverySession, us22RecoveryCaller,
-		us22RecoveryKey, from, to, int(to-from+1), at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10,
+		        'memory-extract-v1', 'memory-rules-v1', 'stub', 'stub-model', $11, $11)`,
+		extractionID, us22RecoveryAgent, us22RecoverySession, extractionID+"_run", lastAttemptRunID,
+		us22RecoveryCaller, us22RecoveryKey, from, to, int(to-from+1), at)
 	require.NoError(t, err)
 }
 
@@ -176,6 +202,20 @@ func (e *us22RecoveryEnv) extractionVerdict(t *testing.T, extractionID string) (
 		`SELECT status, verified_at FROM memory_extractions WHERE extraction_id = $1`,
 		extractionID).Scan(&status, &verified))
 	return status, verified
+}
+
+// extractionAttempt 读回最近一次尝试与尝试次数（归属保护断言只认这两列）。
+// extractionAttempt reads the last attempt binding and the attempt counter.
+func (e *us22RecoveryEnv) extractionAttempt(t *testing.T, extractionID string) (string, int) {
+	t.Helper()
+	var (
+		lastAttempt string
+		attempts    int
+	)
+	require.NoError(t, e.raw.QueryRowContext(t.Context(),
+		`SELECT last_attempt_run_id, attempts FROM memory_extractions WHERE extraction_id = $1`,
+		extractionID).Scan(&lastAttempt, &attempts))
+	return lastAttempt, attempts
 }
 
 // cursorAt 经生产读面取该 Run 来源的游标位置。
@@ -290,20 +330,28 @@ func TestUS22_Recovery_UnknownNotRewritten(t *testing.T) {
 }
 
 // R5：恢复的调用形状固定——PendingExtractions → 每行（候选计数、草案计数、写结论）；
-// 时钟只取一次；缺少查证端口直接拒绝启动（不静默跳过）。
-// 逆改点：恢复调用任何抽取入口 / 每行重取时钟 / nil 端口静默返回 → 对应断言红。
+// 时钟只取一次；扫描读到的预期尝试原样进写入请求；缺少查证端口直接拒绝启动。
+// 逆改点：恢复调用任何抽取入口 / 每行重取时钟 / 丢掉 ExpectedLastAttemptRunID /
+// nil 端口静默返回 → 对应断言红。
 func TestUS22_Recovery_NoReplay(t *testing.T) {
 	fixed := time.Date(2026, 11, 6, 8, 30, 0, 0, time.UTC)
 	clockCalls := 0
 	store := &us22RecoveryRecordingStore{
 		pending: []core.LearningExtraction{
-			{ExtractionID: "lrn_a", Agent: us22RecoveryAgent, WindowToMessageID: 7},
-			{ExtractionID: "lrn_b", Agent: us22RecoveryAgent, WindowToMessageID: 9},
+			{
+				ExtractionID: "lrn_a", Agent: us22RecoveryAgent,
+				LastAttemptRunID: "run_a", WindowToMessageID: 7,
+			},
+			{
+				ExtractionID: "lrn_b", Agent: us22RecoveryAgent,
+				LastAttemptRunID: "run_b", WindowToMessageID: 9,
+			},
 		},
 		candidates: map[string]int{"lrn_a": 0, "lrn_b": 0},
 		drafts:     map[string]int{"lrn_a": 1, "lrn_b": 0},
 		recovered:  map[string]core.LearningExtractionState{},
 		verifiedAt: map[string]time.Time{},
+		expected:   map[string]string{},
 	}
 	require.NoError(t, recoverLearning(t.Context(), LearningRecoveryDeps{
 		Store:  store,
@@ -324,6 +372,8 @@ func TestUS22_Recovery_NoReplay(t *testing.T) {
 	require.Equal(t, core.LearningExtractionUnknown, store.recovered["lrn_b"])
 	require.Equal(t, fixed, store.verifiedAt["lrn_a"])
 	require.Equal(t, fixed, store.verifiedAt["lrn_b"])
+	require.Equal(t, "run_a", store.expected["lrn_a"], "预期尝试必须随行进写入事务")
+	require.Equal(t, "run_b", store.expected["lrn_b"])
 
 	require.Error(t, recoverLearning(t.Context(), LearningRecoveryDeps{}),
 		"查证端口未装配时必须拒绝启动，不得静默跳过")
@@ -357,7 +407,7 @@ func TestUS22_Recovery_RecoveredUnknownUnblocks(t *testing.T) {
 		Provider:            "stub",
 		Model:               "stub-model",
 		LastAttemptAt:       baselineClock().Add(time.Minute),
-	})
+	}, core.LeaseToken{})
 	require.ErrorIs(t, err, core.ErrLearningUnresolved, "恢复前新窗口必须被阻断")
 	require.Equal(t, 1, env.countRows(t, `SELECT count(*) FROM memory_extractions`),
 		"被阻断的新窗口不得建行")
@@ -383,7 +433,7 @@ func TestUS22_Recovery_RecoveredUnknownUnblocks(t *testing.T) {
 		Provider:            "stub",
 		Model:               "stub-model",
 		LastAttemptAt:       baselineClock().Add(2 * time.Minute),
-	})
+	}, core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, core.LearningExtractionPending, created.Status)
 	require.Equal(t, 2, env.countRows(t, `SELECT count(*) FROM memory_extractions`))
@@ -416,7 +466,7 @@ func TestUS22_Unknown_NoRestartNextRunNoReplay(t *testing.T) {
 		Provider:            "stub",
 		Model:               "stub-model",
 		LastAttemptAt:       baselineClock().Add(time.Minute),
-	})
+	}, core.LeaseToken{})
 	require.ErrorIs(t, err, core.ErrLearningUnresolved,
 		"未查证的 pending 阻断同来源新窗口——不重启也不放行")
 
@@ -430,6 +480,370 @@ func TestUS22_Unknown_NoRestartNextRunNoReplay(t *testing.T) {
 	require.False(t, verified.Valid)
 }
 
+// O1（US-24 T019 / P-18）：归属保护。`last_attempt_run_id` 仍有有效 run 租约的 pending
+// 行不进启动扫描——那是另一个 Worker 正在收尾的抽取，把它当孤儿会推进它的游标。
+// 同一轮里没有租约的对照行照常查证，证明"跳过"是逐行判定而不是整轮放弃。
+// 逆改点：去掉 `NOT EXISTS` 归属谓词 / 改成按 `run_id` 判（对照行与活行都命中）→
+// 活行被写成 unknown、游标越过它，断言红。
+func TestUS22_Recovery_SkipsLiveOwnerExtraction(t *testing.T) {
+	env := newUS22RecoveryEnv(t)
+	ctx := t.Context()
+
+	// 属主仍活着：last_attempt_run_id 上有未过期的 run 租约。
+	_, err := postgres.NewLeaseStore(env.db).Acquire(ctx, core.LeaseRun, "run_live_owner",
+		core.WorkerIdentity{InstanceID: "worker-live", Name: "live"}, time.Minute)
+	require.NoError(t, err)
+
+	env.seedPendingFor(t, "lrn_live", "run_live_owner", 5, 9)
+	env.seedPending(t, "lrn_dead", 1, 4) // 无任何租约行：属主已不可考
+	key := us22RecoveryKey
+	env.seedRun(t, "run_cursor", us22RecoveryCaller, &key)
+
+	// 判据直接落在扫描输出上：活属主的行**不入选**，不能靠写入侧的二次判定兜底——
+	// 那会在扫描、计数与日志里多出一条本不该存在的"孤儿"。
+	scanned, err := env.store.PendingExtractions(ctx)
+	require.NoError(t, err)
+	require.Len(t, scanned, 1, "启动扫描只入选属主已失联的 pending 行")
+	require.Equal(t, "lrn_dead", scanned[0].ExtractionID)
+
+	env.recover(t)
+
+	status, verified := env.extractionVerdict(t, "lrn_live")
+	require.Equal(t, "pending", status, "属主仍有有效租约的 pending 行不得被启动恢复查证")
+	require.False(t, verified.Valid, "跳过必须零写入：verified_at 仍为空")
+
+	dead, deadVerified := env.extractionVerdict(t, "lrn_dead")
+	require.Equal(t, "unknown", dead, "无租约的孤儿行照常查证")
+	require.True(t, deadVerified.Valid)
+
+	position, found := env.cursorAt(t, "run_cursor")
+	require.True(t, found)
+	require.Equal(t, int64(4), position, "游标只按真正查证过的行推进，活属主那一行没有被碰")
+}
+
+// O2（US-24 T019 / FR-24-39 / P-18）：属主失联后，回收器 A1 先收尾 Run、B3 再查证同一
+// 行——**进程不重启**也能解除同来源阻断。这是 B3 存在的理由：启动扫描只在启动时跑一次，
+// 之后崩溃的属主留下的 pending 行不能等下一次重启。
+// 逆改点：B3 只接启动扫描、或查证后不推进游标 → 行仍是 pending / 游标不到窗口末端。
+func TestReclaimer_OrphanExtractionVerifiedWithoutRestart(t *testing.T) {
+	env := newUS22RecoveryEnv(t)
+	ctx := t.Context()
+
+	// A 崩溃的现场：Run 停在 running、租约已过期；学习钩子已预写 pending 行。
+	appSeedRun(t, env.db, "run_orphan", "s-orphan", "worker-gone")
+	expireLeaseForTest(t, env.db, core.LeaseRun, "run_orphan")
+	env.seedPendingFor(t, "lrn_orphan", "run_orphan", 10, 12)
+	key := us22RecoveryKey
+	env.seedRun(t, "run_cursor", us22RecoveryCaller, &key)
+
+	report, err := appNewReclaimer(t, env.db).ReclaimOnce(ctx, 32)
+	require.NoError(t, err)
+	require.Equal(t, 1, report.Runs, "A1 先收尾失联的 Run")
+	require.Zero(t, report.Errors)
+
+	require.Equal(t, string(core.StatusFailed), appRunStatus(t, env.db, "run_orphan"))
+
+	status, verified := env.extractionVerdict(t, "lrn_orphan")
+	require.Equal(t, "unknown", status, "没有结果证据判 unknown——回收器只查证、不重放")
+	require.True(t, verified.Valid, "进程不重启也必须写出查证时刻")
+	require.Greater(t, verified.Int64, baselineClock().UnixMilli(),
+		"查证时刻来自回收器本轮时钟，不是历史夹具值")
+
+	position, found := env.cursorAt(t, "run_cursor")
+	require.True(t, found)
+	require.Equal(t, int64(12), position, "查证把来源游标推进到冻结窗口末端")
+
+	pending, err := env.store.UnresolvedForOrigin(ctx, us22RecoveryAgent, us22RecoverySession, "run_cursor")
+	require.NoError(t, err)
+	require.Nil(t, pending, "B3 查证后同来源新窗口不再被阻断（不重启）")
+	require.Equal(t, 0, env.countRows(t, `SELECT count(*) FROM llm_calls`), "B3 不得调用模型")
+}
+
+// O3（US-24 T019 / R6）：扫描读到的预期尝试在写入时必须重检。扫描之后该行经合法重试
+// 换手（`last_attempt_run_id` 从 RunA 变成持有效租约的 RunB），回收器不得把旧结论写
+// 到新尝试上——必须 recovered=false、零写入、游标不动。
+//
+// 逆改点：`RecoverExtraction` 只看 `status` 与 `extraction_id`（去掉预期尝试 CAS）→
+// 新尝试被写成 unknown 并推进游标，状态 / 预期值 / 游标三处断言红。
+// The retry itself is staged through FailExtraction + BeginExtraction's unfenced entry:
+// the fenced pair requires a live lease at failure time, which the scan cannot have just
+// seen as expired; the contract under test (expected-attempt CAS on the write) is identical
+// on both paths.
+func TestReclaimer_OrphanExtractionSkipsLegitimateRetry(t *testing.T) {
+	env := newUS22RecoveryEnv(t)
+	ctx := t.Context()
+	key := us22RecoveryKey
+
+	// 原始 Run 行：BeginExtraction 从它复制来源身份。
+	env.seedRun(t, "lrn_retry_run", us22RecoveryCaller, &key)
+	leases := postgres.NewLeaseStore(env.db)
+	// 扫描时看到的那次尝试（RunA）已过期——孤儿判据因此成立。
+	_, err := leases.Acquire(ctx, core.LeaseRun, "run_retry_a",
+		core.WorkerIdentity{InstanceID: "worker-a", Name: "a"}, time.Minute)
+	require.NoError(t, err)
+	expireLeaseForTest(t, env.db, core.LeaseRun, "run_retry_a")
+	// 合法重试的新属主（RunB）持有有效租约。
+	_, err = leases.Acquire(ctx, core.LeaseRun, "run_retry_b",
+		core.WorkerIdentity{InstanceID: "worker-b", Name: "b"}, time.Minute)
+	require.NoError(t, err)
+	env.seedPendingFor(t, "lrn_retry", "run_retry_a", 1, 6)
+
+	// 扫描之后、写入之前：行经 failed 被 RunB 合法重试回 pending。
+	store := &us24PostScanRetryStore{LearningRepo: env.store, takeover: func() {
+		require.NoError(t, env.store.FailExtraction(ctx, "lrn_retry", "", core.LeaseToken{}, "", 0,
+			core.LearningFailureModel, "模型超时", baselineClock()))
+		_, err := env.store.BeginExtraction(ctx, core.LearningExtraction{
+			ExtractionID:        "lrn_retry_next",
+			Agent:               us22RecoveryAgent,
+			SessionID:           us22RecoverySession,
+			RunID:               "lrn_retry_run",
+			LastAttemptRunID:    "run_retry_b",
+			WindowFromMessageID: 1,
+			WindowToMessageID:   6,
+			WindowMessages:      6,
+			PromptVersion:       "memory-extract-v1",
+			RuleVersion:         "memory-rules-v1",
+			Provider:            "stub",
+			Model:               "stub-model",
+			LastAttemptAt:       baselineClock().Add(time.Minute),
+		}, core.LeaseToken{})
+		require.NoError(t, err)
+	}}
+
+	reclaimer, err := newLeaseReclaimer(reclaimerDeps{
+		DB:       env.db,
+		Flows:    &flow.Service{},
+		Leases:   leases,
+		Worker:   us24B3Identity(),
+		LeaseTTL: time.Minute,
+		Learning: store,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	report, err := reclaimer.ReclaimOnce(ctx, 32)
+	require.NoError(t, err)
+	require.Zero(t, report.Runs, "RunA 的 runs 行已终态，A1 不领取它")
+	require.Zero(t, report.Errors)
+
+	status, verified := env.extractionVerdict(t, "lrn_retry")
+	require.Equal(t, "pending", status, "扫描后的合法重试不得被旧结论覆盖")
+	require.False(t, verified.Valid, "跳过必须零写入：不得替新尝试写 verified_at")
+	lastAttempt, attempts := env.extractionAttempt(t, "lrn_retry")
+	require.Equal(t, "run_retry_b", lastAttempt, "行仍绑定合法重试的尝试")
+	require.Equal(t, 2, attempts, "重试计数不得被回收器改写")
+
+	_, found := env.cursorAt(t, "lrn_retry_run")
+	require.False(t, found, "跳过时不得推进来源游标")
+}
+
+// O4（US-24 T019 / R7）：`NOT EXISTS` 只是快照读，拦不住并发续约；写入必须锁**租约行**
+// 并在获锁后用数据库时间重判。属主的续约事务先把行锁住、尚未提交：回收器的写入排在它
+// 后面；提交后看到推后的 `expires_at` → 本轮跳过（租约仍有效）；回滚后看到过期租约 →
+// 照常查证。两个分支共同证明互斥来自行锁而不是扫描快照。
+//
+// 逆改点：把 `RecoverExtraction` 的租约行锁改成 `EXISTS` 快照读（不阻塞续约）→ 提交
+// 分支里回收器会先返回并把活属主的行写成 unknown，断言红。
+func TestReclaimer_OrphanExtractionWaitsForConcurrentRenewal(t *testing.T) {
+	t.Run("renewal_commits_skips", func(t *testing.T) {
+		env, rows, identity := us24RenewalScene(t)
+		renewal := us24OpenRenewal(t, env, "run_renew", identity)
+		defer func() { _ = renewal.Close() }()
+
+		done := us24StartVerify(env, rows)
+		us24RequireBlockedByRenewal(t, env, renewal.PID(), done)
+
+		require.NoError(t, renewal.Commit())
+		out := <-done
+		require.NoError(t, out.err)
+		require.Zero(t, out.result.Verified, "续约提交后租约仍有效：不得写查证结论")
+		require.Equal(t, 1, out.result.Skipped)
+
+		status, verified := env.extractionVerdict(t, "lrn_renew")
+		require.Equal(t, "pending", status, "活属主的行保持 pending")
+		require.False(t, verified.Valid)
+		_, found := env.cursorAt(t, "run_renew_cursor")
+		require.False(t, found, "跳过时不得推进来源游标")
+	})
+
+	t.Run("renewal_rolls_back_verifies", func(t *testing.T) {
+		env, rows, identity := us24RenewalScene(t)
+		renewal := us24OpenRenewal(t, env, "run_renew", identity)
+		defer func() { _ = renewal.Close() }()
+
+		done := us24StartVerify(env, rows)
+		us24RequireBlockedByRenewal(t, env, renewal.PID(), done)
+
+		require.NoError(t, renewal.Rollback())
+		out := <-done
+		require.NoError(t, out.err)
+		require.Equal(t, 1, out.result.Verified, "续约回滚后租约仍过期：照常查证")
+		require.Equal(t, 1, out.result.Unknown)
+
+		status, verified := env.extractionVerdict(t, "lrn_renew")
+		require.Equal(t, "unknown", status)
+		require.True(t, verified.Valid)
+		position, found := env.cursorAt(t, "run_renew_cursor")
+		require.True(t, found)
+		require.Equal(t, int64(7), position, "查证把来源游标推进到冻结窗口末端")
+	})
+}
+
+// us24RenewalScene 准备"扫描已完成、属主续约在途"的现场：孤儿行已从扫描取出，续约事务
+// 尚未开始。返回的 rows 就是扫描结果——写入侧只能凭它带出的预期值重检。
+func us24RenewalScene(t *testing.T) (*us22RecoveryEnv, []core.LearningExtraction, core.WorkerIdentity) {
+	t.Helper()
+	env := newUS22RecoveryEnv(t)
+	ctx := t.Context()
+	identity := core.WorkerIdentity{InstanceID: "worker-owner", Name: "owner"}
+
+	_, err := postgres.NewLeaseStore(env.db).Acquire(ctx, core.LeaseRun, "run_renew", identity, time.Minute)
+	require.NoError(t, err)
+	expireLeaseForTest(t, env.db, core.LeaseRun, "run_renew")
+	env.seedPendingFor(t, "lrn_renew", "run_renew", 1, 7)
+	key := us22RecoveryKey
+	env.seedRun(t, "run_renew_cursor", us22RecoveryCaller, &key)
+
+	// 扫描发生在续约提交之前：快照读到"已过期"，行入选（NOT EXISTS 挡不住续约）。
+	rows, err := env.store.OrphanPendingExtractions(ctx, 8)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "run_renew", rows[0].LastAttemptRunID)
+	return env, rows, identity
+}
+
+// us24Renewal 是一个持锁的续约事务：连接要留到用例结束，事务本身按分支提交或回滚。
+// us24Renewal keeps the dedicated connection alive so the transaction can end either way.
+type us24Renewal struct {
+	conn *sql.Conn
+	tx   *sql.Tx
+	pid  int
+}
+
+// Commit 提交续约（租约被推后，属主仍然有效）。
+func (r *us24Renewal) Commit() error { return r.tx.Commit() }
+
+// Rollback 撤销续约（租约仍过期，属主已失联）。
+func (r *us24Renewal) Rollback() error { return r.tx.Rollback() }
+
+// Close 未结束的事务必须先回滚——`database/sql` 的连接关闭要等事务收尾，直接关会卡死。
+// Close must end the transaction first: the connection close waits for the tx to finish.
+func (r *us24Renewal) Close() error {
+	_ = r.tx.Rollback() // 已提交 / 已回滚时返回 ErrTxDone，忽略即可
+	return r.conn.Close()
+}
+
+// PID 是本续约连接的后端进程号，用于查"谁排在它后面"。
+func (r *us24Renewal) PID() int { return r.pid }
+
+// us24OpenRenewal 打开一个**未提交**的续约事务并持有租约行锁。语句与 `LeaseStore.Renew`
+// 同形；唯一的差别是把"现在"取到 5 秒前——模拟"续约在到期前校验通过、随后才到期"的
+// 在途事务。测试无法稳定地把墙钟卡在到期前后，因此把时间样本前移；被验的是回收器获锁
+// 后的重判，不是续约自身的校验时序。
+// us24OpenRenewal holds the lease row lock with an uncommitted renewal whose clock sample
+// predates the expiry, the only state a deterministic test can hold open.
+func us24OpenRenewal(t *testing.T, env *us22RecoveryEnv, resourceID string,
+	identity core.WorkerIdentity,
+) *us24Renewal {
+	t.Helper()
+	conn, err := env.raw.Conn(t.Context())
+	require.NoError(t, err)
+
+	tx, err := conn.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	res, err := tx.ExecContext(t.Context(), `
+WITH now AS (SELECT ((extract(epoch from clock_timestamp()) * 1000)::bigint - 5000) AS ms)
+UPDATE execution_leases l
+   SET renewed_at = now.ms, expires_at = now.ms + $5
+  FROM now
+ WHERE l.kind = $1 AND l.resource_id = $2
+   AND l.owner_worker_id = $3 AND l.ownership_epoch = $4
+   AND l.released_at IS NULL AND l.expires_at > now.ms`,
+		string(core.LeaseRun), resourceID, identity.InstanceID, int64(1), 60_000)
+	require.NoError(t, err, "续约事务必须能命中同一行（持有行锁）")
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected)
+
+	var pid int
+	require.NoError(t, tx.QueryRowContext(t.Context(), `SELECT pg_backend_pid()`).Scan(&pid))
+	return &us24Renewal{conn: conn, tx: tx, pid: pid}
+}
+
+// b3Outcome 是后台查证的结果。
+type b3Outcome struct {
+	result learningVerifyResult
+	err    error
+}
+
+// us24StartVerify 在后台跑共享查证步骤；写入会阻塞在租约行上。
+func us24StartVerify(env *us22RecoveryEnv, rows []core.LearningExtraction) <-chan b3Outcome {
+	done := make(chan b3Outcome, 1)
+	go func() {
+		result, err := verifyPendingExtractions(context.Background(), env.store, rows,
+			time.Now().UTC())
+		done <- b3Outcome{result: result, err: err}
+	}()
+	return done
+}
+
+// us24RequireBlockedByRenewal 断言后台写入确实排在续约事务后面。读数用
+// `pg_blocking_pids(pid)` 而不是猜锁类型：行被未提交事务更新时，后到的 `FOR UPDATE`
+// 等的是**更新事务号**（locktype=transactionid，没有 relation），按表名过滤会漏掉。
+// 带类型参数是因为 B3 查证（b3Outcome）与 B1 终态残留（residueOutcome）各有自己的
+// 结果类型；判据只关心"它还没返回"。
+// us24RequireBlockedByRenewal reads pg_blocking_pids because a FOR UPDATE against a row
+// updated by an open transaction waits on the transaction id, not a relation lock.
+func us24RequireBlockedByRenewal[T any](t *testing.T, env *us22RecoveryEnv, renewalPid int,
+	done <-chan T,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var blocked int
+		require.NoError(t, env.raw.QueryRowContext(t.Context(), `
+SELECT count(*) FROM pg_stat_activity a
+ WHERE $1 = ANY (pg_blocking_pids(a.pid))`, renewalPid).Scan(&blocked))
+		if blocked > 0 {
+			return
+		}
+		select {
+		case out := <-done:
+			t.Fatalf("写入在续约提交前就返回了（没有排在续约后面）：%+v", out)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("5s 内没有观察到排在续约事务后面的后台写入")
+}
+
+// us24B3Identity 是 B3 用例共用的回收器身份。
+func us24B3Identity() core.WorkerIdentity {
+	return core.WorkerIdentity{
+		InstanceID:    "worker-b3",
+		Name:          "b3",
+		Version:       "test",
+		SchemaVersion: postgres.SupportedSchemaVersion,
+	}
+}
+
+// us24PostScanRetryStore 在共享查证步骤的"扫描 → 写入"之间插入一次合法重试；
+// 其余方法由内嵌的生产仓储原样承担。
+// us24PostScanRetryStore injects the legitimate retry between the scan and the write.
+type us24PostScanRetryStore struct {
+	*postgres.LearningRepo
+	takeover func()
+}
+
+func (s *us24PostScanRetryStore) OrphanPendingExtractions(ctx context.Context, limit int) (
+	[]core.LearningExtraction, error,
+) {
+	rows, err := s.LearningRepo.OrphanPendingExtractions(ctx, limit)
+	if err == nil && len(rows) > 0 {
+		s.takeover()
+	}
+	return rows, err
+}
+
 // us22RecoveryRecordingStore 在只读替身之上记录调用顺序与查证写入；其余接口方法由
 // 内嵌替身以零值满足——若恢复意外调用它们，调用形状断言会先红。
 // The recording store embeds the read-only fake and records the recovery call shape.
@@ -441,6 +855,7 @@ type us22RecoveryRecordingStore struct {
 	calls      []string
 	recovered  map[string]core.LearningExtractionState
 	verifiedAt map[string]time.Time
+	expected   map[string]string
 }
 
 func (s *us22RecoveryRecordingStore) PendingExtractions(context.Context) ([]core.LearningExtraction, error) {
@@ -458,11 +873,12 @@ func (s *us22RecoveryRecordingStore) ExtractionDraftCount(_ context.Context, ext
 	return s.drafts[extractionID], nil
 }
 
-func (s *us22RecoveryRecordingStore) RecoverExtraction(_ context.Context, extractionID string,
-	status core.LearningExtractionState, verifiedAt time.Time,
-) error {
-	s.calls = append(s.calls, "recover:"+extractionID+":"+string(status))
-	s.recovered[extractionID] = status
-	s.verifiedAt[extractionID] = verifiedAt
-	return nil
+func (s *us22RecoveryRecordingStore) RecoverExtraction(_ context.Context,
+	req core.RecoverLearningExtraction,
+) (bool, error) {
+	s.calls = append(s.calls, "recover:"+req.ExtractionID+":"+string(req.Verdict))
+	s.recovered[req.ExtractionID] = req.Verdict
+	s.verifiedAt[req.ExtractionID] = req.VerifiedAt
+	s.expected[req.ExtractionID] = req.ExpectedLastAttemptRunID
+	return true, nil
 }

@@ -39,9 +39,14 @@ var errUnknownIngressClass = errors.New("callers: unknown ingress class")
 
 // ErrConcurrencyLimited 表示调用方在跑的 Run 数已达上限；对外映射 429
 // CALLER_CONCURRENCY_LIMITED。它与速率、配额是三个独立判据（C-35），不得合并。
+// 自 US-24 起它是 core.ErrCallerConcurrencyLimited 的**别名**：数据库权威准入
+// （`StartRun` 内复查）与进程内名额表预检共用同一哨兵，调用方按 errors.Is 判定
+// 不受影响（FR-24-34 / P-06）。
 // ErrConcurrencyLimited maps to 429 CALLER_CONCURRENCY_LIMITED and stays
-// independent of both rate and quota.
-var ErrConcurrencyLimited = errors.New("callers: caller concurrency limit reached")
+// independent of both rate and quota. Since US-24 it aliases
+// core.ErrCallerConcurrencyLimited so the in-process precheck and the
+// DB-authoritative admission share one sentinel; errors.Is callers are unaffected.
+var ErrConcurrencyLimited = core.ErrCallerConcurrencyLimited
 
 // errConcurrencyUnconfigured 是装配错误：缺少并发端口时拒绝请求，**不得**放行。
 // errConcurrencyUnconfigured fails closed when the concurrency port is missing.

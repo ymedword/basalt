@@ -65,6 +65,9 @@ var (
 type commitFaults struct {
 	mu     sync.Mutex
 	action commitAction
+	// admission 是"已持生命周期行锁"的一次性暂停点；nil 表示未装载。
+	// admission is the one-shot admission hold; nil means not armed.
+	admission *admissionHold
 	// started 把"某次事务开始提交"的 TxAttempt 交给 WaitCommitInFlight；容量 1，
 	// 没有等待者时写入被丢弃（不阻塞事务路径）。
 	started chan TxAttempt
@@ -110,6 +113,22 @@ func ArmLoseNextCommitAck(t *testing.T, db *DB) {
 // AbortNextCommitAfterAckLoss 让下一次提交在服务端回滚，但同样只报"确认丢失"。
 // AbortNextCommitAfterAckLoss rolls back server-side while reporting a lost ack.
 func (f *commitFaults) AbortNextCommitAfterAckLoss() { f.arm(faultAbortAfterAckLoss) }
+
+// ArmAbortNextCommitAfterAckLoss 是 `AbortNextCommitAfterAckLoss` 的**跨包**入口，
+// 与 `ArmLoseNextCommitAck` 同一形态：真实回滚、真实 xid、客户端只看到"确认丢失"。
+//
+// 它守的是"回查查不到"这一支：只读快照看不见任何行，既可能是真回滚、也可能是原
+// COMMIT 仍在服务端执行（C-34），因此上层只能按未知结局失败关闭——不得判未落、不得
+// 退款、不得重试。仅集成构建可见。
+// The cross-package entry for the abort-after-ack-loss shape: it exercises the "lookup
+// finds nothing" branch, which must fail closed rather than conclude a rollback.
+func ArmAbortNextCommitAfterAckLoss(t *testing.T, db *DB) {
+	t.Helper()
+	if db == nil || db.faults == nil {
+		t.Fatal("提交故障钩子不可用：句柄未经 newCommitFaults 装配（集成构建里应恒为非 nil）")
+	}
+	db.faults.AbortNextCommitAfterAckLoss()
+}
 
 // SeedDeferredUniqueConflict 在隔离 schema 上把 `caller_usage_periods` 的主键改成
 // **延迟唯一约束**，再用一条已提交的冲突行占位：业务事务的重复插入直到 COMMIT 才被
@@ -296,6 +315,60 @@ func (f *commitFaults) waitBackendLocked(t *testing.T, pid int32) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("事务后端 pid=%d 未进入锁等待：无法证明 COMMIT 正在服务端执行", pid)
+}
+
+// admissionHold 是"StartRun 事务已持生命周期行锁"的暂停点（FR-24-41 的获锁顺序①）。
+// 它是一个可装载一次的门：装载后**下一次**走到该点的准入会阻塞在 release 上，其余准入
+// 直接通过——测试只需一次真实的锁持有，不改变其他用例的时序。
+// admissionHold lets exactly one admission stop after taking the lifecycle row lock.
+type admissionHold struct {
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// HoldStartRunAfterLifecycleLock 装载一次暂停点，返回"已到达"信号与放行函数。
+// 放行函数幂等；用例应在 t.Cleanup 里调用，避免失败路径把连接一直挂住。
+//
+// HoldStartRunAfterLifecycleLock arms the pause once and returns reached/release.
+func (f *commitFaults) HoldStartRunAfterLifecycleLock() (<-chan struct{}, func()) {
+	hold := &admissionHold{reached: make(chan struct{}), release: make(chan struct{})}
+	f.mu.Lock()
+	f.admission = hold
+	f.mu.Unlock()
+	return hold.reached, func() { hold.once.Do(func() { close(hold.release) }) }
+}
+
+// holdAdmissionLock 是 RunStore 在生命周期复查之后调用的暂停点；未装载即无操作。
+// holdAdmissionLock blocks once when armed; otherwise it is a no-op.
+func (f *commitFaults) holdAdmissionLock(ctx context.Context) error {
+	f.mu.Lock()
+	hold := f.admission
+	f.admission = nil
+	f.mu.Unlock()
+	if hold == nil {
+		return nil
+	}
+	close(hold.reached)
+	select {
+	case <-hold.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ArmStartRunLockHold 是 `HoldStartRunAfterLifecycleLock` 的**跨包**入口（`internal/app`
+// 的 FR-24-41 用例用真实句柄驱动真实运行入口）。仅集成构建可见；句柄未经装配时 `t.Fatal`，
+// 不静默当成"已装载"。返回的 release 幂等，务必挂到 `t.Cleanup`。
+//
+// ArmStartRunLockHold is the cross-package entry to the same hold point; integration-only.
+func ArmStartRunLockHold(t *testing.T, db *DB) (<-chan struct{}, func()) {
+	t.Helper()
+	if db == nil || db.faults == nil {
+		t.Fatal("准入锁暂停点不可用：句柄未经 newCommitFaults 装配（集成构建里应恒为非 nil）")
+	}
+	return db.faults.HoldStartRunAfterLifecycleLock()
 }
 
 // mustExec 是钩子自身的装配语句，失败即让用例立刻停下（装配错误不该表现成断言失败）。

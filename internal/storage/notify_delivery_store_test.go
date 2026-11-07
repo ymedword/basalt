@@ -118,7 +118,7 @@ func TestNotifyDeliveryStore_AdmissionFreezesChannels(t *testing.T) {
 
 	rec := startRow("scheduler")
 	rec.RunID = "scheduler-1776000000123-notify1"
-	require.NoError(t, runs.StartRun(ctx, rec, manifest))
+	require.NoError(t, startRunTest(runs, ctx, rec, manifest))
 
 	refs, err := store.Refs(ctx, rec.RunID)
 	require.NoError(t, err)

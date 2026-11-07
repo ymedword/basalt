@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 
+	"github.com/ymedword/basalt/internal/assets"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/provider"
 	"github.com/ymedword/basalt/internal/storage/postgres"
@@ -59,6 +61,15 @@ const (
 	resourceReasonBinding    = "agent resource bindings are missing, invalid or ineligible; fix resource_bindings in AGENT.md and republish the referenced resources"
 	resourceReasonNotify     = "notification grant cannot be frozen from the declared notify_mode; fix notify_mode / notify_channels in AGENT.md"
 	resourceReasonCredential = "model connection credential is unusable at admission; fix its credential_mode / api_key and republish"
+	// US-24 新增的两类固定原因（§2.3.9）：内容寻址资产包无法校验 / 与共享发布记录
+	// 不一致，以及本地实例与目标版本（含凭据 pin）对不上。两者都指向具体修复动作。
+	// US-24 admission reasons: an unverifiable asset bundle and a local instance that
+	// disagrees with its target version.
+	resourceReasonAsset = "agent bundle is unavailable or disagrees with the shared publication record; run `basalt assets install` and retry"
+	// 本地实例版本证明失败（RESOURCE_VERSION_MISMATCH）沿用 Provider / MCP 两条既有原因：
+	// 修复入口本来就是"重新发布该资源 / 重启服务"，单列一条不改变排障动作，且会让
+	// 既有准入用例的 Reason 断言失去判别力。
+	// Instance-version proof failures reuse the provider / mcp reasons on purpose.
 )
 
 // mcpTransportStdio 是 v1 唯一接受的传输方式（与 workspace 的解析门禁同口径）。
@@ -139,6 +150,16 @@ type runResources struct {
 	// nil = 本进程不发诊断，运行行为与接线前逐字一致（诊断可丢弃，不是必需端口）。
 	// Diagnostics is the run-path producer; nil simply means no events are emitted.
 	Diagnostics diagnosticRecorder
+
+	// Assets 是内容寻址资产包的准入校验面（US-24 §2.3.9 / FR-24-25）。资产校验是
+	// **无条件**不变量；nil 在准入处失败关闭（`ASSET_UNAVAILABLE`），测试与轻装配
+	// 必须显式给一个"不声明"的实现（`undeclaredAssets`），不得靠 nil 蒙混。
+	// Assets verifies the content-addressed bundle; nil fails closed at admission.
+	Assets AssetVerifier
+	// Rebuild 是本地 Provider / MCP 实例的**重建接缝**（P-21）：实例构建证据与目标
+	// 版本不一致时按同一目标版本重建并原子换入，再比一次。nil 且发生不一致 → 503。
+	// Rebuild rebuilds a local instance at the same target version; nil refuses.
+	Rebuild ResourceRebuildPort
 }
 
 // AdmissionDeps 是 v3 准入冻结所需的只读依赖集合（与 runResources 的字段一一对应）。
@@ -155,6 +176,13 @@ type AdmissionDeps struct {
 	// Diagnostics 是运行路径的诊断生产端（可为 nil：诊断可丢弃）。
 	// Diagnostics is the run-path producer and may be nil.
 	Diagnostics diagnosticRecorder
+	// Assets 是资产包校验面（US-24）。nil 在准入处失败关闭——资产校验没有跳过开关；
+	// 轻装配与测试显式给 `undeclaredAssets{}`（读作"未记录"）。
+	// Assets verifies the asset bundle; nil fails closed at admission.
+	Assets AssetVerifier
+	// Rebuild 是本地实例重建接缝（US-24 P-21）；nil 时不一致直接 503。
+	// Rebuild repairs a diverged local instance; nil turns the mismatch into a 503.
+	Rebuild ResourceRebuildPort
 }
 
 // NewRunResources 是准入解析端口的唯一构造点（图 A ⑥）。
@@ -179,6 +207,9 @@ func NewRunResources(versions *postgres.ResourceStore, providers *providerCatalo
 		CredentialPins: deps.CredentialPins,
 		Checkpoint:     deps.Checkpoint,
 		Diagnostics:    deps.Diagnostics,
+
+		Assets:  deps.Assets,
+		Rebuild: deps.Rebuild,
 	}
 }
 
@@ -228,6 +259,32 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonIdentity, err)
 	}
 
+	// ② 内容寻址资产包（§2.3.9 事务外段 / FR-24-25）：期望哈希来自共享发布记录
+	// （`resource_pointers` + `resource_versions.content_hash`），本地不可变目录必须
+	// 与它逐项一致。校验是**无条件**不变量，不存在跳过开关；装配缺校验器即失败关闭。
+	// The content-addressed bundle is verified unconditionally against the shared
+	// publication record; a missing verifier fails closed rather than skipping.
+	bundle, err := r.verifyAssets(ctx, entry.Name, agentUID)
+	if err != nil {
+		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonAsset, err)
+	}
+	resolved.AssetBundle = bundle
+	// ②′ 清单侧与执行侧必须是**同一份** Agent 定义字节（review ② finding 6 / P-21）：
+	// 清单里的 Provider / 模型 / MCP / 技能 / 通知来自 `entry.Profile`（注册表装载时解析
+	// 工作副本 `agents/<name>/AGENT.md`），而执行期快照重读的是**资产包内**同名文件并重新
+	// 解析（`runSnapshotBuilder.Build`）。工作副本被编辑（watcher 热载，不触发发布）或
+	// 发布链路失败而旧包仍可解析时，两处给出不同配置：清单记 M1、实际调用 M2，而且两边
+	// 都"验过"——谁都不报错。资产包清单已由 `assets.Verify` 逐文件核对，因此把它的
+	// AGENT.md 哈希与注册表持有的已校验定义字节比一次，就覆盖了全部 frontmatter 字段
+	// （provider / model / skills / mcp / notify / bootstrap 都写在里面）。不同 → 拒绝新 Run
+	// （409 `ASSET_VERSION_MISMATCH`），先让工作副本与已发布资产包对齐。
+	// The manifest side (entry.Profile) and the execution side (the pinned bundle's
+	// AGENT.md) must be the same bytes; comparing the bundle's recorded hash with the
+	// registry's validated definition covers every frontmatter field that could diverge.
+	if err := checkDefinitionMatchesBundle(entry, bundle); err != nil {
+		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonAsset, err)
+	}
+
 	providerName := profile.Provider.Name
 	if providerName == "" {
 		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonProvider,
@@ -246,17 +303,7 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 	resolved.Provider = versionRef(providerName, providerVersion)
 	runtime.providers[providerName] = client
 
-	// 摘要客户端同样在准入门内固定（原则 III）：与对话视图取自同一条目录条目，但
-	// 不套审计视图——摘要的 `purpose='compaction'` 审计由压缩接线自己先写后发。
-	// 取不到不在这里失败：压缩是否启用要到装配期才知道（`compaction.enabled`），
-	// 装配期对"启用了压缩但拿不到摘要客户端"做失败关闭，不把未启用的实例挡在门外。
-	// The summary client is pinned inside the same admission window; a miss is refused at
-	// assembly time instead, because compaction may simply be disabled.
-	if summary, ok := r.summaryProviderClient(providerName); ok {
-		resolved.SummaryProvider = summary
-	}
-
-	// ② 模型名与凭据固定（契约 ProviderVersionRef）：模型取 AGENT.md 冻结的那一个
+	// ③ 模型名与凭据固定（契约 ProviderVersionRef）：模型取 AGENT.md 冻结的那一个
 	// （运行实际发出的就是它），凭据按发布定义的模式固定；env 模式的目标绑定哈希由
 	// 规范化 base_url 派生，托管模式在缺解析器时失败关闭（T130 接线后走凭据仓储）。
 	// The model is the one frozen in AGENT.md; the credential pin follows the published
@@ -277,13 +324,40 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 	}
 	resolved.ProviderCredential = pin
 
+	// ④ 本地实例版本证明（P-21 / FR-24-25）：版本段对 `published_version_id`、凭据段
+	// 对本次准入固定出的同一份 pin——只比版本会让"同版本重发布、凭据换代"漏判。
+	// 不一致 → 按同一目标版本重建-换入-再比；仍不符即 503 `RESOURCE_VERSION_MISMATCH`。
+	// The instance must prove the published version and the same pin; a mismatch rebuilds
+	// at the same target version and compares once more.
+	if err := r.ensureProviderInstance(ctx, runtime, providerName, resolved.Provider, pin, client); err != nil {
+		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonProvider, err)
+	}
+
+	// 摘要客户端同样在准入门内固定（原则 III）：与对话视图取自同一条目录条目，但
+	// 不套审计视图——摘要的 `purpose='compaction'` 审计由压缩接线自己先写后发。
+	// 取不到不在这里失败：压缩是否启用要到装配期才知道（`compaction.enabled`），
+	// 装配期对"启用了压缩但拿不到摘要客户端"做失败关闭，不把未启用的实例挡在门外。
+	// 重建之后才取：重建换掉的是目录里的条目，摘要客户端必须取自同一份新表。
+	// The summary client is pinned inside the same admission window, after any rebuild.
+	if summary, ok := r.summaryProviderClient(providerName); ok {
+		resolved.SummaryProvider = summary
+	}
+
 	for _, name := range profile.MCPServers {
 		ref, err := r.resolveMCP(ctx, name)
 		if err != nil {
 			return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonMCP, err)
 		}
+		// 本地实例版本证明（P-21）：目标版本是**已应用**的那一版，不是发布指针。
+		// 不一致按同一目标版本重建并原子换入，再比一次；仍不符即 503。
+		// The local instance must prove it runs the applied version; a mismatch rebuilds
+		// at that same target version and compares once more.
+		built, err := r.ensureMCPInstance(ctx, name, ref)
+		if err != nil {
+			return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonMCP, err)
+		}
 		resolved.MCPServers = append(resolved.MCPServers, ref)
-		runtime.mcp[name] = mcpHandle(name)
+		runtime.mcp[name] = mcpHandle{name: name, built: built}
 	}
 
 	for _, name := range profile.Skills {
@@ -294,8 +368,14 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 		resolved.Skills = append(resolved.Skills, ref)
 		resolved.SkillDirs[name] = dir
 	}
+	// 技能版本与资产包清单的交叉核对（FR-24-25「技能版本不符 → 拒绝新 Run」）：
+	// 放在技能固定之后——缺技能先报技能原因，包内记录与固定结果不一致再报资产原因。
+	// The recorded skill refs must match the pinned published versions exactly.
+	if err := checkBundleSkills(resolved.AssetBundle, resolved.Skills); err != nil {
+		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonAsset, err)
+	}
 
-	// ③ 绑定校验（R4.4）：引用与绑定严格一一对应，UID 是当前指针、有资格、凭据可用。
+	// ⑤ 绑定校验（R4.4）：引用与绑定严格一一对应，UID 是当前指针、有资格、凭据可用。
 	// 放在版本固定之后：资源本身缺失时先报资源原因，绑定层不掩盖更具体的修复入口。
 	// The binding check runs after the version pins so a missing resource keeps its own
 	// repair hint instead of being masked by the binding layer.
@@ -307,7 +387,7 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonBinding, err)
 	}
 
-	// ④ 通知授权冻结（R4.7）：三态按兼容规则归一后枚举成**具体渠道 UID**，
+	// ⑥ 通知授权冻结（R4.7）：三态按兼容规则归一后枚举成**具体渠道 UID**，
 	// 集合里永远没有通配；`none` 不读目录。冻结结果随清单落库，运行中改文件不影响它。
 	// The notification grant is frozen into concrete channel uids; none carries no lookup.
 	notify, err := FreezeNotifyGrant(ctx, NotifyGrantDeps{Channels: r.Channels, Bindings: r.Bindings},
@@ -319,6 +399,181 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 
 	handedOff = true
 	return resolved, nil
+}
+
+// —— US-24：资产一致性与本地实例版本证明（§2.3.9 / FR-24-25 / P-21）——
+
+// verifyAssets 校验该 Agent 的内容寻址资产包，返回本次准入固定的 bundle（哈希 +
+// 目录 + 逐文件清单）。校验**无条件**执行：装配没接校验器即失败关闭——"没有校验器"
+// 不等于"不需要校验"，放行会让一个从未校验过的本地目录冒充共享发布记录里的那一份。
+// verifyAssets verifies the content-addressed bundle unconditionally; a missing verifier
+// fails closed rather than skipping the check.
+func (r *runResources) verifyAssets(ctx context.Context, agent string, uid core.AgentUID) (core.AssetBundlePin, error) {
+	if r.Assets == nil {
+		return core.AssetBundlePin{}, errors.New("准入解析未装配资产校验器")
+	}
+	return r.Assets.VerifyBundle(ctx, agent, uid)
+}
+
+// checkDefinitionMatchesBundle 核对**清单侧**（注册表持有的已校验工作副本定义字节）
+// 与**执行侧**（已发布资产包内同名 AGENT.md）逐字节一致（review ② finding 6 / P-21）。
+//
+// 两处来源不同：清单字段取 `entry.Profile`，执行期快照重读包内文件并重新解析。只比
+// 包内文件存在不够——内容漂移才是"清单记 M1、实际调用 M2"的成因。资产包清单的
+// `ConfigFiles` 已由 `assets.Verify` 逐文件核对，所以这里比哈希即可。
+//
+// 跳过条件两个，都读作"没有可比的记录"：`entry.Definition` 为空（轻装配与手工构造的
+// 测试条目；生产注册表装载恒填已校验字节）与 `bundle.Hash` 为空（`undeclaredAssets`
+// 的零值，读作"未记录"）。生产装配两者恒非空，因此本判据在生产路径上不可绕过。
+// checkDefinitionMatchesBundle compares the registry's validated definition bytes with
+// the pinned bundle's AGENT.md hash; the zero cases read as "nothing recorded".
+func checkDefinitionMatchesBundle(entry core.AgentEntry, bundle core.AssetBundlePin) error {
+	if len(entry.Definition) == 0 || bundle.Hash == "" {
+		return nil
+	}
+	definitionRel := path.Join(agentsDirName, entry.Name, agentDefinitionFileName)
+	sum := sha256.Sum256(entry.Definition)
+	want := hex.EncodeToString(sum[:])
+	for _, file := range bundle.ConfigFiles {
+		if file.Path != definitionRel {
+			continue
+		}
+		if file.SHA256 != want {
+			return fmt.Errorf(
+				"%w: 工作副本定义 %s 与已发布资产包 %s 不一致（清单配置与实际执行配置必须同一份，先执行 `basalt assets install`）",
+				core.ErrAssetVersionMismatch, definitionRel, bundle.Hash)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: 已发布资产包 %s 未记录 %s",
+		core.ErrAssetVersionMismatch, bundle.Hash, definitionRel)
+}
+
+// checkBundleSkills 核对资产包清单记录的技能版本与本次准入固定的发布技能逐项一致：
+// `resource_uid + version_id + content_hash + 文件清单` 任一项不符都说明本地装的不是
+// 发布时那一版，按 FR-24-25 拒绝新 Run（409 `ErrAssetVersionMismatch`）。
+//
+// 只核对 bundle **记录了的**技能：尚未携带技能列表的发布形态不因此被拒，技能版本仍由
+// `resolveSkill` 对发布指针逐项校验；反过来，准入固定但包内未记录的多余技能不影响
+// 执行——包内 AGENT.md 才是本次运行实际注入的声明面，未声明的技能不会被读。
+// checkBundleSkills requires every skill the bundle records to match the pinned
+// published version exactly.
+func checkBundleSkills(pin core.AssetBundlePin, resolved []core.SkillVersionRef) error {
+	if len(pin.Skills) == 0 {
+		return nil
+	}
+	byName := make(map[string]core.SkillVersionRef, len(resolved))
+	for _, ref := range resolved {
+		byName[ref.Name] = ref
+	}
+	for _, recorded := range pin.Skills {
+		actual, ok := byName[recorded.Name]
+		if !ok {
+			return fmt.Errorf("%w: 资产包记录了技能 %s，本次准入没有固定该技能",
+				core.ErrAssetVersionMismatch, recorded.Name)
+		}
+		if actual.ResourceUID != recorded.ResourceUID || actual.VersionID != recorded.VersionID ||
+			actual.ContentHash != recorded.ContentHash || !slices.Equal(actual.Files, recorded.Files) {
+			return fmt.Errorf("%w: 技能 %s 的发布版本与资产包记录不符（包内版本 %d，准入固定 %d）",
+				core.ErrAssetVersionMismatch, recorded.Name, recorded.VersionID, actual.VersionID)
+		}
+	}
+	return nil
+}
+
+// builtVersionOf 读本地实例自报的构建证据；实例不实现 `core.BuiltVersioned` 时返回零值
+// （未声明）。零值只允许出现在轻装配与评测替身上——生产装配的两条路径都会声明。
+// builtVersionOf reads the instance's build proof; not implementing the interface means
+// "undeclared", which only light assemblies and eval doubles may produce.
+func builtVersionOf(client core.ProviderClient) core.BuiltVersion {
+	if declared, ok := client.(core.BuiltVersioned); ok {
+		return declared.BuiltVersion()
+	}
+	return core.BuiltVersion{}
+}
+
+// providerInstanceMatches 逐项比对两段构建证据：版本类（UID / 版本 ID / 内容哈希）与
+// 凭据 pin（模式 / ID / 版本 / 目标绑定）。只比版本会让"同版本重发布、凭据换代"漏判
+// ——凭据轮换不动版本行与内容哈希，比不出来。
+// providerInstanceMatches compares both segments; comparing only the version would miss a
+// credential rotation published on the same version row.
+func providerInstanceMatches(built, target core.BuiltVersion) bool {
+	return built.Resource.ResourceUID == target.Resource.ResourceUID &&
+		built.Resource.VersionID == target.Resource.VersionID &&
+		built.Resource.ContentHash == target.Resource.ContentHash &&
+		built.Credential == target.Credential
+}
+
+// ensureProviderInstance 落实 Provider 侧的本地实例版本证明（P-21）：构建证据与目标版本
+// 一致即放行；不一致按**同一目标版本**重建-换入-再比，仍不符即 `ErrResourceVersionMismatch`。
+// 重建后取的是 `providerClient` 交出的审计固定视图——**不得**把裸协议客户端塞进运行时。
+// ensureProviderInstance proves the local provider matches its target version, rebuilds at
+// that same version once, and re-fetches the audited pinned view afterwards.
+func (r *runResources) ensureProviderInstance(ctx context.Context, runtime *runRuntime,
+	name string, target core.ResourceVersionRef, pin core.CredentialPin, client core.ProviderClient,
+) error {
+	built := builtVersionOf(client)
+	if built.IsZero() {
+		// 未声明：轻装配 / 评测替身，版本由别的机制固定（`BuiltVersion` 的零值语义）。
+		return nil
+	}
+	wanted := core.BuiltVersion{Resource: target, Credential: pin}
+	if providerInstanceMatches(built, wanted) {
+		return nil
+	}
+	if r.Rebuild == nil {
+		return fmt.Errorf("%w: 模型连接 %s 的本地实例版本证明不成立，且本次装配没有重建接缝",
+			core.ErrResourceVersionMismatch, name)
+	}
+	if err := r.Rebuild.RebuildProvider(ctx, target, pin); err != nil {
+		return fmt.Errorf("%w: 按目标版本重建模型连接 %s 失败: %w",
+			core.ErrResourceVersionMismatch, name, err)
+	}
+	rebuilt, ok := r.providerClient(name)
+	if !ok {
+		return fmt.Errorf("%w: 重建后模型连接 %s 不在已发布映射表中",
+			core.ErrResourceVersionMismatch, name)
+	}
+	// 重建路径要求**已声明**的证据：重建之后仍报零值说明装配被绕过，不能当成"无需比对"。
+	// A rebuild-requested path requires declared evidence; zero afterwards is a failure.
+	after := builtVersionOf(rebuilt)
+	if after.IsZero() || !providerInstanceMatches(after, wanted) {
+		return fmt.Errorf("%w: 模型连接 %s 重建后仍与目标版本不一致",
+			core.ErrResourceVersionMismatch, name)
+	}
+	runtime.providers[name] = rebuilt
+	return nil
+}
+
+// ensureMCPInstance 落实 MCP 侧的本地实例版本证明：比对基准是 **applied** 版本（D-12：
+// 发布指针可以尚未 apply，准入既不跟随 published，也**不**隐式执行 apply）。MCP 侧只
+// 有版本段可比——进程里的连接不持有可比的凭据 pin，因此凭据段为零值。
+// ensureMCPInstance proves the local MCP instance runs the applied version; the credential
+// segment is zero because a live connection carries no comparable pin.
+func (r *runResources) ensureMCPInstance(ctx context.Context, name string,
+	target core.ResourceVersionRef,
+) (core.BuiltVersion, error) {
+	if r.MCP == nil {
+		return core.BuiltVersion{}, errors.New("准入解析未装配 MCP 运行时")
+	}
+	built := r.MCP.BuiltVersion(name)
+	if built.IsZero() || built.Resource.VersionID == target.VersionID {
+		return built, nil
+	}
+	if r.Rebuild == nil {
+		return core.BuiltVersion{}, fmt.Errorf("%w: mcp_server/%s 的本地实例版本证明不成立，且本次装配没有重建接缝",
+			core.ErrResourceVersionMismatch, name)
+	}
+	if err := r.Rebuild.RebuildMCP(ctx, target); err != nil {
+		return core.BuiltVersion{}, fmt.Errorf("%w: 按已应用版本重建 mcp_server/%s 失败: %w",
+			core.ErrResourceVersionMismatch, name, err)
+	}
+	after := r.MCP.BuiltVersion(name)
+	if after.IsZero() || after.Resource.VersionID != target.VersionID {
+		return core.BuiltVersion{}, fmt.Errorf("%w: mcp_server/%s 重建后仍与已应用版本不一致",
+			core.ErrResourceVersionMismatch, name)
+	}
+	return after, nil
 }
 
 // resolveAgentUID 读生命周期索引里的 Agent 身份并校验形态：索引缺失与未回填是两回事，
@@ -449,6 +704,19 @@ var (
 	_ core.MemoryExtractor = (*guardedProviderClient)(nil)
 )
 
+// BuiltVersion 转发内层的构建证据（US-24 P-21）：准入读到的是装饰器，任何一层不转发
+// 都会让生产装配被当成"未声明"，本地实例版本证明随之失效——而它正是凭据换代与
+// "发布换表后实例仍是旧版"的唯一判据。
+// BuiltVersion forwards the inner proof; a decorator that drops it would silently
+// disable the instance check in production.
+func (c *guardedProviderClient) BuiltVersion() core.BuiltVersion {
+	return builtVersionOf(c.inner)
+}
+
+// 编译期断言：装饰器仍能自报构建证据（否则准入在装饰层读到零值 = 未声明）。
+// Compile-time assertion that the decorator still reports the build proof.
+var _ core.BuiltVersioned = (*guardedProviderClient)(nil)
+
 // Chat 先复核 Run 固定的凭据版本，再交给固定视图发出。
 // Chat checks the pinned credential and then delegates to the pinned view.
 func (c *guardedProviderClient) Chat(ctx context.Context, req core.ChatRequest) (core.ChatResponse, error) {
@@ -484,7 +752,11 @@ func (r *runResources) resolveMCP(ctx context.Context, name string) (core.Resour
 		return core.ResourceVersionRef{}, err
 	}
 	if ptr.AppliedVersionID == nil {
-		return core.ResourceVersionRef{}, fmt.Errorf("%w: mcp_server/%s 尚无已应用版本", core.ErrResourceNotFound, name)
+		// 发布指针存在但从未 apply：这不是"资源不存在"（404 会让调用方改名字），而是
+		// 本地没有可证明的已应用实例——按实例版本证明失败归类，web 映射 503
+		// `RESOURCE_VERSION_MISMATCH`（评审 IDX-21）。准入**不**隐式 apply（FR-24-25）。
+		// No applied version is an instance-proof failure (503), not a missing resource.
+		return core.ResourceVersionRef{}, fmt.Errorf("%w: mcp_server/%s 尚无已应用版本", core.ErrResourceVersionMismatch, name)
 	}
 	version, err := r.versionOf(ctx, core.ResourceMCPServer, name, *ptr.AppliedVersionID)
 	if err != nil {
@@ -499,27 +771,58 @@ func (r *runResources) resolveMCP(ctx context.Context, name string) (core.Resour
 	return versionRef(name, version), nil
 }
 
-// resolveSkill 取技能的发布版本、完整文件清单与不可变目录：目录取 `storage_path`
+// resolvePublishedSkill 取技能的发布版本、完整文件清单与版本行：目录取 `storage_path`
 // （约束 31 的契约字面量），文件清单来自版本行的 `manifest_json`；返回的切片非 nil，
-// 空清单序列化为 `[]`。
-// resolveSkill returns the published version, its non-nil file list and the immutable
-// directory taken verbatim from storage_path.
-func (r *runResources) resolveSkill(ctx context.Context, name string) (core.SkillVersionRef, string, error) {
-	version, err := r.publishedVersion(ctx, core.ResourceSkill, name)
+// 空清单序列化为 `[]`。准入与资产构建共用这一条发布指针口径——两边各写一份时，
+// "准入固定的技能"与"装进 bundle 的技能"可以不是同一版。
+// resolvePublishedSkill is the single published-skill read shared by admission and
+// asset builds; two copies could pin and package different versions.
+func resolvePublishedSkill(ctx context.Context, versions *postgres.ResourceStore, name string) (core.SkillVersionRef, core.ResourceVersion, error) {
+	if versions == nil {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, errors.New("技能读取未接资源仓储")
+	}
+	if name == "" {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, fmt.Errorf("%w: skill 名为空", core.ErrResourceNotFound)
+	}
+	ptr, err := versions.Pointer(ctx, core.ResourceSkill, name)
 	if err != nil {
-		return core.SkillVersionRef{}, "", err
+		return core.SkillVersionRef{}, core.ResourceVersion{}, err
+	}
+	if ptr.DeletedAt != nil {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, fmt.Errorf("%w: skill/%s 已删除", core.ErrResourceNotFound, name)
+	}
+	version, err := versions.VersionByID(ctx, ptr.PublishedVersionID)
+	if err != nil {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, err
+	}
+	if version.Kind != core.ResourceSkill || version.ResourceID != name {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, fmt.Errorf("资源 %s/%s 的版本 %d 属于 %s/%s",
+			core.ResourceSkill, name, version.ID, version.Kind, version.ResourceID)
+	}
+	if err := expectSameResourceUID(core.ResourceSkill, name, ptr, version); err != nil {
+		return core.SkillVersionRef{}, core.ResourceVersion{}, err
 	}
 	if strings.TrimSpace(version.StoragePath) == "" {
-		return core.SkillVersionRef{}, "", fmt.Errorf("技能 %s 的发布版本缺少存储路径", name)
+		return core.SkillVersionRef{}, core.ResourceVersion{}, fmt.Errorf("技能 %s 的发布版本缺少存储路径", name)
 	}
 	files, err := parseSkillManifest(name, version.ManifestJSON)
 	if err != nil {
-		return core.SkillVersionRef{}, "", err
+		return core.SkillVersionRef{}, core.ResourceVersion{}, err
 	}
 	return core.SkillVersionRef{
 		ResourceVersionRef: versionRef(name, version),
 		Files:              files,
-	}, version.StoragePath, nil
+	}, version, nil
+}
+
+// resolveSkill 取技能的发布版本、完整文件清单与不可变目录（`storage_path` 逐字返回）。
+// resolveSkill returns the published version, its file list and the immutable dir.
+func (r *runResources) resolveSkill(ctx context.Context, name string) (core.SkillVersionRef, string, error) {
+	ref, version, err := resolvePublishedSkill(ctx, r.Versions, name)
+	if err != nil {
+		return core.SkillVersionRef{}, "", err
+	}
+	return ref, version.StoragePath, nil
 }
 
 // runSnapshotBuilder 是 `core.RunSnapshotBuilder` 的生产实现（约束 31 / 图 F）：把准入
@@ -546,11 +849,29 @@ func newRunSnapshotBuilder(loader *workspace.ContextLoader, root string, now fun
 	return &runSnapshotBuilder{loader: loader, root: root, now: now}
 }
 
-// Build 冻结一次运行的配置：解析结果只消费 `SkillDirs`（版本号已在准入时固定，本处不再
-// 查库）；工作副本路径不会出现在卡片行与清单里。
-// Build freezes one run's config; only SkillDirs is consumed, so no version can drift here.
+// Build 冻结一次运行的配置：`AssetBundle` 指向准入验证过的内容寻址目录时，AGENT.md 与
+// bootstrap 只从该目录读取（逐文件复核准入清单的哈希）；`SkillDirs` 指向发布版本目录，
+// 卡片行不会出现工作副本路径。两条来源都在准入时固定，本处不再查库。
+//
+// 零值 `AssetBundle`（目录为空）只可能来自**显式声明"不声明资产版本"的装配**
+// （测试与轻装配的 `undeclaredAssets`）：生产装配的 `assetVerifier` 要么给出目录、
+// 要么在准入处失败关闭。该分支保留既有快照口径，不是生产执行路径。
+// Build freezes one run's config from the pinned bundle when one was verified, and
+// only falls back to the work-copy snapshot for assemblies that declare no bundle.
 func (b *runSnapshotBuilder) Build(_ context.Context, entry core.AgentEntry, resolved core.ResolvedResources) (core.ConfigSnapshot, error) {
-	snapshot, err := b.loader.SnapshotPublished(b.root, entry, workspace.PublishedSkills(resolved.SkillDirs), b.now())
+	published := workspace.PublishedSkills(resolved.SkillDirs)
+	if resolved.AssetBundle.Dir == "" {
+		snapshot, err := b.loader.SnapshotPublished(b.root, entry, published, b.now())
+		if err != nil {
+			return core.ConfigSnapshot{}, err
+		}
+		return *snapshot, nil
+	}
+	reader, err := assets.OpenBundleReader(resolved.AssetBundle)
+	if err != nil {
+		return core.ConfigSnapshot{}, err
+	}
+	snapshot, err := b.loader.SnapshotBundle(b.root, reader, entry, published, b.now())
 	if err != nil {
 		return core.ConfigSnapshot{}, err
 	}
@@ -739,14 +1060,26 @@ func (r *runRuntime) Release() {
 	r.once.Do(func() { r.released.Store(true) })
 }
 
-// mcpHandle 只是 server 名的只读包装：本 US 的 `core.MCPHandle` 只要求报名字，
-// 句柄生命周期归 US-12。
-// mcpHandle wraps the server name; the handle lifecycle belongs to US-12.
-type mcpHandle string
+// mcpHandle 是 server 名的只读包装，并带上本进程**实际已应用**的版本号（US-24
+// P-21 / FR-24-25）：准入拿它与 `applied_version_id` 比对，发布未 apply 的新版本
+// 因此不会被准入顺手当成目标版本。句柄生命周期仍归 US-12。
+// mcpHandle wraps the server name and the locally applied version; admission compares
+// that version with the applied pointer, never with the freshly published one.
+type mcpHandle struct {
+	name  string
+	built core.BuiltVersion
+}
 
 // ServerName 返回该句柄对应的 MCP server 名。
 // ServerName reports the server this handle pins.
-func (h mcpHandle) ServerName() string { return string(h) }
+func (h mcpHandle) ServerName() string { return h.name }
+
+// BuiltVersion 报告本地实例的构建证据：`Resource.VersionID` 是本进程真正连上的
+// 已应用版本，其余段留零——MCP 侧没有可比的凭据 pin 来源，准入只按版本列比对
+// （模块卡 §2.3.9 的 "MCP 对 applied_version_id"）。零值 = 未声明（测试夹具）。
+// BuiltVersion reports the locally applied MCP version; the proof is undeclared when
+// the runtime has no supervisor record.
+func (h mcpHandle) BuiltVersion() core.BuiltVersion { return h.built }
 
 // resourceViews 是 `web.ResourceReader` 的唯一实现（图 A ⑨）：只读投影发布指针、
 // 版本行与运行期连接视图。`lifecycle` 按卡片固定签名注入，留给 US-12 的资源写面

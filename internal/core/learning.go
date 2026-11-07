@@ -40,6 +40,16 @@ type LearningRunInput struct {
 	// picked up at assembly time. Nil is an assembly defect: the service logs and gives up
 	// rather than switching clients.
 	Extractor MemoryExtractor
+	// Token 是**触发 Run** 的执行权凭证（US-24 §2.3.5 / P-20），由 `callLearningHook`
+	// 从 RunEnv 原样传入；钩子不自己 `Acquire`、不读全局映射。三个学习写面按
+	// `Token.IsZero()` 分流：非零必须走 fenced 入口，实现缺失即 fail-closed。
+	// `Token.ResourceID` 恒等于本字段所属的 `RunID`——重试路径上**不得**改用抽取行的
+	// `run_id`（首次 Run）或 `last_attempt_run_id`（上一次尝试）做 fence。
+	// Token is the triggering run's ownership credential, passed through verbatim from the
+	// run environment. The hook never acquires a lease itself; a non-zero token forces the
+	// fenced entry points, and the fence target is always this run, never the historical
+	// run ids stored on the extraction row.
+	Token LeaseToken
 }
 
 // LearningHook 是 Run 终态之后唯一允许的同步回调；没有返回值，从类型上保证它不能
@@ -174,6 +184,24 @@ type LearningExtraction struct {
 	LastAttemptAt         time.Time
 	FinishedAt            time.Time
 	VerifiedAt            time.Time
+}
+
+// RecoverLearningExtraction 是一次**受归属保护**的查证结论写入请求（US-24 §2.3.5 / P-18）：
+// 扫描阶段读到的 ExpectedLastAttemptRunID 随请求进入写入事务，存储层在同一事务里按
+// advisory(agent) → 租约行 `FOR UPDATE` → 抽取行 `FOR UPDATE` 重新断言"行仍是那次尝试"
+// 与"该 Run 的租约确实已失效"；任一不成立返回 recovered=false 且**零写入**——行已被
+// 合法重试接手或属主仍活着，本轮跳过即可，不是错误。
+//
+// VerifiedAt 是要落库的查证时刻；为零时依次回退到 Now（调用方本轮采样）与存储句柄时钟。
+// RecoverLearningExtraction carries the scanned attempt into the write transaction; a
+// mismatch (legit retry took over, or the owner is still alive) is a zero-write skip,
+// not an error. VerifiedAt falls back to Now, then to the store's own clock.
+type RecoverLearningExtraction struct {
+	ExtractionID             string
+	ExpectedLastAttemptRunID string
+	Verdict                  LearningExtractionState
+	VerifiedAt               time.Time
+	Now                      time.Time
 }
 
 // Retryable 表示这一行是「可重试的失败」：同来源下一 Run 只重读冻结窗口。

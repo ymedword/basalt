@@ -38,6 +38,14 @@ type SystemReadings struct {
 	MCPServers        int64
 	Skills            int64
 	SchemaVersion     int
+	// Workers / ActiveLeases 是分布式执行的只读诊断读数（US-24 §3.1.13）：
+	// 登记的 Worker 实例与**全库**仍有效的执行权数量。`ActiveLeases` 统计全部
+	// 负责人（含没有 worker_nodes 行的 `legacy` 回填租约），因此不等于各节点
+	// 活跃租约数之和。
+	// Workers and ActiveLeases are the distributed runtime's read-only readings; the
+	// total counts every owner, including owners without a node row.
+	Workers      []core.WorkerNodeView
+	ActiveLeases int64
 }
 
 // SystemReader 是概览的数据库侧数据源（由 app 层适配 storage 的 Ping /
@@ -58,8 +66,30 @@ type SystemOverviewView struct {
 	Agents        SystemAgentsView     `json:"agents"`
 	Runs          *SystemRunsView      `json:"runs,omitempty"`
 	Resources     *SystemResourcesView `json:"resources,omitempty"`
+	Workers       *SystemWorkersView   `json:"workers,omitempty"`
 	Database      SystemDatabaseView   `json:"database"`
 	Auth          SystemAuthView       `json:"auth"`
+}
+
+// SystemWorkersView 是 Worker 列表与活跃租约计数（US-24 §3.1.13）。与 runs /
+// resources 同一条纪律：数据库不可读时**整组省略**，不把"读不到"显示成 0；
+// 反过来，能读到时的 0 是真实读数（没有 Worker 在跑）。
+// The worker group follows the same rule as runs/resources: omitted as a whole when
+// the database is unreadable, while a readable zero is a real reading.
+type SystemWorkersView struct {
+	ActiveLeases int64              `json:"active_leases"`
+	Nodes        []SystemWorkerView `json:"nodes"`
+}
+
+// SystemWorkerView 是单个 Worker 的只读行，字段与 `basalt workers list` 同源同形
+// （instance / name / started / heartbeat / active leases）。
+// One worker row, identical to the fields of `basalt workers list`.
+type SystemWorkerView struct {
+	Instance     string `json:"instance"`
+	Name         string `json:"name"`
+	StartedAt    string `json:"started_at"`
+	HeartbeatAt  string `json:"heartbeat_at"`
+	ActiveLeases int64  `json:"active_leases"`
 }
 
 // SystemAgentsView 是 Agent 计数（契约 SystemOverview.agents）；invalid 表示装载期
@@ -183,6 +213,19 @@ func (s *Server) handleSystemOverview(w http.ResponseWriter, r *http.Request, ac
 		MCPServers:       readings.MCPServers,
 		Skills:           readings.Skills,
 	}
+	// Worker 组永远编码为数组（没有实例时 `[]`），与列表端点同一纪律。
+	// The node list is always an array, empty when no worker has registered.
+	nodes := make([]SystemWorkerView, 0, len(readings.Workers))
+	for _, node := range readings.Workers {
+		nodes = append(nodes, SystemWorkerView{
+			Instance:     node.InstanceID,
+			Name:         node.Name,
+			StartedAt:    formatTime(node.StartedAt),
+			HeartbeatAt:  formatTime(node.LastHeartbeatAt),
+			ActiveLeases: node.ActiveLeases,
+		})
+	}
+	view.Workers = &SystemWorkersView{ActiveLeases: readings.ActiveLeases, Nodes: nodes}
 	view.Database = SystemDatabaseView{Status: databaseStatusOK, SchemaVersion: &schemaVersion}
 	s.writeOK(w, view)
 }

@@ -457,8 +457,18 @@ type RunView struct {
 	// ManifestHash 是准入清单哈希（契约 RunView.manifest_hash）；历史 Run 为空串，
 	// 详情里的清单视图同时标 legacy_unrecorded（约束 24）。
 	ManifestHash string `json:"manifest_hash"`
-	StartedAt    string `json:"started_at"`
-	FinishedAt   string `json:"finished_at"`
+	// WorkerInstanceID / OwnershipEpoch 是 run 租约的只读诊断投影（US-24 §3.1.13）：
+	// 最后一个负责人与归属代次，历史 Run 无租约行时为空串 / 0。它们**不**参与归属
+	// 判定，也不改变取消语义——非属主的取消请求仍只写标志并如实回报当前状态。
+	// The two lease readings are diagnostic only; they never affect cancel semantics.
+	WorkerInstanceID string `json:"worker_instance_id"`
+	OwnershipEpoch   int64  `json:"ownership_epoch"`
+	// AssetBundleHash 是准入时固定的资产包哈希（清单 v3 起）；更早的清单为空串 =
+	// 未记录。列表路径不解析清单正文，因此列表视图此字段恒为空。
+	// AssetBundleHash is the frozen bundle hash; lists never parse the manifest body.
+	AssetBundleHash string `json:"asset_bundle_hash"`
+	StartedAt       string `json:"started_at"`
+	FinishedAt      string `json:"finished_at"`
 }
 
 // RunDetailView 是运行详情：RunView 全字段摊平 + 准入清单视图（契约
@@ -976,8 +986,14 @@ func runRecordView(rec core.RunDetail) RunView {
 		ToolCalls:    rec.ToolCalls,
 		ConfigHash:   rec.ConfigHash,
 		ManifestHash: rec.ManifestHash,
-		StartedAt:    formatTime(rec.StartedAt),
-		FinishedAt:   formatTime(rec.FinishedAt),
+		// 三个只读字段原样投影：空串 / 0 就是"未记录"，不补造（历史 Run 没有租约行
+		// 与 v3 清单时，页面上本来就没有可显示的值）。
+		// The three readings project verbatim; empty means "not recorded".
+		WorkerInstanceID: rec.WorkerInstanceID,
+		OwnershipEpoch:   rec.OwnershipEpoch,
+		AssetBundleHash:  rec.AssetBundleHash,
+		StartedAt:        formatTime(rec.StartedAt),
+		FinishedAt:       formatTime(rec.FinishedAt),
 	}
 }
 

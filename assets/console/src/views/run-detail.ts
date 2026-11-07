@@ -162,6 +162,12 @@ export const RunDetailView = defineComponent({
             ['工具调用', String(detail.tool_calls)],
             ['配置哈希', h('code', { title: detail.config_hash }, shortHash(detail.config_hash))],
             ['清单哈希', h('code', { title: detail.manifest_hash }, shortHash(detail.manifest_hash))],
+            // US-24 只读诊断：谁是属主、第几代、钉住哪个资产包。历史 Run 与未记录
+            // 清单没有这三项——显示"未记录"而不是补当前值。
+            // US-24 read-only diagnostics; legacy runs show "unrecorded", never a guess.
+            ['执行 Worker', detail.worker_instance_id === '' ? '未记录' : h('code', { title: detail.worker_instance_id }, shortHash(detail.worker_instance_id))],
+            ['归属代次', detail.ownership_epoch === 0 ? '未记录' : String(detail.ownership_epoch)],
+            ['资产包哈希', detail.asset_bundle_hash === '' ? '未记录' : h('code', { title: detail.asset_bundle_hash }, shortHash(detail.asset_bundle_hash))],
             ['开始时间', formatTimestamp(detail.started_at)],
             ['结束时间', formatTimestamp(detail.finished_at)],
             ['原因', detail.reason === '' ? '—' : detail.reason],

@@ -28,14 +28,16 @@ func testResourceUID(last byte) core.ResourceUID {
 }
 
 // requireFinishRun 断言终态写回成功并返回 `applied`（US-22 C-05：终态写回与引用释放
-// 已拆成两个显式调用，释放由 `ReleaseRunRefs` 承担）。
+// 已拆成两个显式调用，释放由 `ReleaseRunRefs` 承担）。这里一律用零值 token——本包是
+// SQLite 源谱系，没有执行租约（US-24 fencing 用例在 postgres 包按真实 token 落地）。
 // requireFinishRun asserts a successful terminal write and returns applied; release is a
-// separate explicit call since US-22.
+// separate explicit call since US-22. The token is always zero here: this package is the
+// SQLite lineage without execution leases.
 func requireFinishRun(t *testing.T, store core.RunStore, ctx context.Context, runID string,
 	status core.RunStatus, reason string, iterations, toolCalls int, now time.Time,
 ) bool {
 	t.Helper()
-	applied, err := store.FinishRun(ctx, runID, status, reason, iterations, toolCalls, now)
+	applied, err := store.FinishRun(ctx, runID, core.LeaseToken{}, status, reason, iterations, toolCalls, now)
 	require.NoError(t, err)
 	return applied
 }
@@ -101,7 +103,7 @@ func TestRunStore_StartRunInsertsRunningRow(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("cli")
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusRunning), row.Status, "起始态由仓储固定写 running")
@@ -126,7 +128,7 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("web")
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	finished := fixedStart.Add(90 * time.Second)
 	requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 2, 1, finished)
@@ -142,7 +144,7 @@ func TestRunStore_FinishRunUpdatesAllTerminalColumns(t *testing.T) {
 	// 非正常终止：reason 落文本（另一行——同一行的第二次 Finish 归幂等用例，见 K7）。
 	limited := startRow("web")
 	limited.RunID = "web-1776000000123-limit1"
-	require.NoError(t, store.StartRun(ctx, limited, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, limited, core.RunResourceManifest{}))
 	requireFinishRun(t, store, ctx, limited.RunID, core.StatusLimitReached, "工具调用次数超限", 3, 50, finished)
 	again := readRunRow(t, db, limited.RunID)
 	require.Equal(t, string(core.StatusLimitReached), again.Status)
@@ -162,22 +164,22 @@ func TestRunStore_CloseRunningLeavesTerminalRowsUntouched(t *testing.T) {
 	// 两种终态各一行 + 一行仍 running + 一行无状态（空 session）仍 running。
 	completed := startRow("cli")
 	completed.RunID = "cli-1776000000123-comple"
-	require.NoError(t, store.StartRun(ctx, completed, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, completed, core.RunResourceManifest{}))
 	requireFinishRun(t, store, ctx, completed.RunID, core.StatusCompleted, "", 1, 0, fixedStart)
 
 	cancelled := startRow("cli")
 	cancelled.RunID = "cli-1776000000123-cancel"
-	require.NoError(t, store.StartRun(ctx, cancelled, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, cancelled, core.RunResourceManifest{}))
 	requireFinishRun(t, store, ctx, cancelled.RunID, core.StatusCancelled, "context canceled", 1, 0, fixedStart)
 
 	stale := startRow("scheduler")
 	stale.RunID = "scheduler-1776000000123-stale0"
-	require.NoError(t, store.StartRun(ctx, stale, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, stale, core.RunResourceManifest{}))
 
 	stateless := startRow("web")
 	stateless.RunID = "web-1776000000123-statle"
 	stateless.SessionID = ""
-	require.NoError(t, store.StartRun(ctx, stateless, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, stateless, core.RunResourceManifest{}))
 
 	running, err := listRunningRunIDs(ctx, db.write)
 	require.NoError(t, err)
@@ -272,7 +274,7 @@ func TestRunStore_TimestampsAreUnixMilli(t *testing.T) {
 	start := time.Date(2026, 10, 16, 8, 30, 0, 987*int(time.Millisecond), time.UTC)
 	rec := startRow("admin")
 	rec.StartedAt = start
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	finish := start.Add(1500 * time.Millisecond)
 	requireFinishRun(t, store, ctx, rec.RunID, core.StatusFailed, "模型调用失败", 1, 0, finish)
@@ -334,11 +336,11 @@ func TestRunStore_TriggerDerivesFromChannel(t *testing.T) {
 		"admin":     triggerManual,
 	} {
 		rec := startRow(channel)
-		require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}), "渠道 %s", channel)
+		require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}), "渠道 %s", channel)
 		require.Equal(t, want, readRunRow(t, db, rec.RunID).Trigger, "渠道 %s 的 trigger", channel)
 	}
 
-	err := store.StartRun(ctx, startRow("email"), core.RunResourceManifest{})
+	err := startRunTest(store, ctx, startRow("email"), core.RunResourceManifest{})
 	require.Error(t, err, "未映射的渠道不得建行")
 	require.Contains(t, err.Error(), "email", "错误必须点名渠道")
 
@@ -533,7 +535,7 @@ func TestRunStore_StartRunWithoutManifestWritesOnlyTheRow(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("cli")
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusRunning), row.Status)
@@ -558,7 +560,7 @@ func TestRunStore_StartRunWritesRunManifestAndRefs(t *testing.T) {
 	fx := seedRunManifest(t, db)
 
 	rec := startRow("web")
-	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, startRunTest(store, ctx, rec, fx.manifest))
 
 	row := readRunRow(t, db, rec.RunID)
 	require.Equal(t, string(core.StatusRunning), row.Status, "准入写 running（由 SQL 固定）")
@@ -624,7 +626,7 @@ func TestRunStore_StartRunRollsBackOnMissingVersion(t *testing.T) {
 	rehashManifest(t, &broken)         // 内容合法、哈希自洽——失败只能来自外键
 
 	rec := startRow("cli")
-	err := store.StartRun(ctx, rec, broken)
+	err := startRunTest(store, ctx, rec, broken)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "预写运行资源引用", "失败点是被外键拒绝的引用行")
 	require.Contains(t, err.Error(), "model_connection/openai", "错误必须点名是哪条引用")
@@ -647,7 +649,7 @@ func TestRunStore_StartRunRejectsMissingIdentity(t *testing.T) {
 	rehashManifest(t, &broken)
 
 	rec := startRow("cli")
-	err := store.StartRun(ctx, rec, broken)
+	err := startRunTest(store, ctx, rec, broken)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "资源身份")
 	require.Contains(t, err.Error(), broken.MCPServers[0].Name, "错误必须点名是哪条引用")
@@ -668,7 +670,7 @@ func TestRunStore_StartRunRejectsMissingAgentUID(t *testing.T) {
 	rehashManifest(t, &broken)
 
 	rec := startRow("cli")
-	err := store.StartRun(ctx, rec, broken)
+	err := startRunTest(store, ctx, rec, broken)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "Agent 身份")
 	requireNoRunTrace(t, db, rec.RunID)
@@ -688,7 +690,7 @@ func TestRunStore_StartRunRejectsTamperedHash(t *testing.T) {
 	tampered.Skills[0].Files[0].SHA256 = "sha256:tampered" // 故意不重算哈希
 
 	rec := startRow("cli")
-	err := store.StartRun(ctx, rec, tampered)
+	err := startRunTest(store, ctx, rec, tampered)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "哈希与内容不一致")
 	requireNoRunTrace(t, db, rec.RunID)
@@ -708,7 +710,7 @@ func TestRunStore_StartRunRejectsNonActiveLifecycle(t *testing.T) {
 	require.NoError(t, err, "构造器允许冻结非启用态——拒绝发生在写侧")
 
 	rec := startRow("cli")
-	err = store.StartRun(ctx, rec, disabled)
+	err = startRunTest(store, ctx, rec, disabled)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "生命周期状态必须是 active")
 	requireNoRunTrace(t, db, rec.RunID)
@@ -726,10 +728,10 @@ func TestRunStore_ReleaseRunRefsScopedToRun(t *testing.T) {
 	fx := seedRunManifest(t, db)
 
 	rec := startRow("web")
-	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, startRunTest(store, ctx, rec, fx.manifest))
 	other := startRow("web")
 	other.RunID = "web-1776000000123-other1"
-	require.NoError(t, store.StartRun(ctx, other, fx.manifest),
+	require.NoError(t, startRunTest(store, ctx, other, fx.manifest),
 		"同一批版本可被多个 Run 同时引用（引用表主键是 run_id + 资源）")
 
 	finished := fixedStart.Add(2 * time.Minute)
@@ -769,7 +771,7 @@ func TestUS22_ReleaseRunRefsSkipsWhileRunning(t *testing.T) {
 	fx := seedRunManifest(t, db)
 
 	rec := startRow("cli")
-	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, startRunTest(store, ctx, rec, fx.manifest))
 
 	// ① 仍在运行：释放是空操作，引用原样保留（钩子还要用凭据）。
 	require.NoError(t, store.ReleaseRunRefs(ctx, rec.RunID, fixedStart.Add(time.Minute)))
@@ -802,7 +804,7 @@ func TestUS22_FinishRunKeepsTerminalWhenReleaseFails(t *testing.T) {
 	fx := seedRunManifest(t, db)
 
 	rec := startRow("cli")
-	require.NoError(t, store.StartRun(ctx, rec, fx.manifest))
+	require.NoError(t, startRunTest(store, ctx, rec, fx.manifest))
 
 	_, err := db.write.ExecContext(ctx, `CREATE TRIGGER fail_run_ref_release
 	    BEFORE UPDATE ON run_resource_refs
@@ -815,7 +817,7 @@ func TestUS22_FinishRunKeepsTerminalWhenReleaseFails(t *testing.T) {
 	})
 
 	finished := fixedStart.Add(time.Minute)
-	applied, err := store.FinishRun(ctx, rec.RunID, core.StatusCompleted, "", 1, 0, finished)
+	applied, err := store.FinishRun(ctx, rec.RunID, core.LeaseToken{}, core.StatusCompleted, "", 1, 0, finished)
 	require.NoError(t, err, "释放失败不得让终态写回失败")
 	require.True(t, applied)
 
@@ -842,7 +844,7 @@ func TestRunStore_FinishRunDoesNotOverwriteTerminalState(t *testing.T) {
 	store := NewRunStore(db)
 
 	rec := startRow("web")
-	require.NoError(t, store.StartRun(ctx, rec, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(store, ctx, rec, core.RunResourceManifest{}))
 	first := fixedStart.Add(90 * time.Second)
 	require.True(t, requireFinishRun(t, store, ctx, rec.RunID, core.StatusCompleted, "", 2, 1, first))
 
@@ -868,7 +870,7 @@ func TestRunStore_FinishRunMissingRowIsError(t *testing.T) {
 	db := openTempDB(t)
 	store := NewRunStore(db)
 
-	_, err := store.FinishRun(ctx, "web-1776000000123-ghost", core.StatusFailed, "", 0, 0, fixedStart)
+	_, err := store.FinishRun(ctx, "web-1776000000123-ghost", core.LeaseToken{}, core.StatusFailed, "", 0, 0, fixedStart)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "账本行不存在")
 }

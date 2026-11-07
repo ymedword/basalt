@@ -42,6 +42,16 @@ type compactionAuditPort interface {
 	FinishCall(ctx context.Context, id int64, result core.LLMCallResult) error
 }
 
+// compactionFencedAuditPort 是摘要预写的**受归属保护**入口（US-24 T008 / FR-24-36）。
+// 接口声明在消费方（本包）：装配层据执行权凭证选 fenced 路径，实现仍是
+// `*postgres.LLMCallRepo`。与 `compactionAuditPort` 分开声明，未接执行权的装配
+// （以及不连库的接线用例）不必实现它，行为与接入前逐字一致。
+// The fenced pre-write of the summary call, declared here because the assembly layer is
+// its consumer; unleased assemblies and wiring tests need not implement it.
+type compactionFencedAuditPort interface {
+	FencedBeginCompactionCall(ctx context.Context, token core.LeaseToken, call core.LLMCall) (int64, error)
+}
+
 // compactionQuotaPort 是配额闸门的窄端口（消费方声明、`*callers.Limiter` 实现）。
 // 只声明压缩真正用到的三件事：预留、结算、释放。`AdmitCall` 是**每次真正发出**的
 // 调用一次（C-29 / C-35），压缩不获取也不释放 Run 并发名额。
@@ -208,6 +218,9 @@ func (w *compactionWiring) Assemble(env *core.RunEnv) core.ContextCompactor {
 		wiring:    w,
 		principal: env.Req.Principal,
 		provider:  providerNameOf(env),
+		// 摘要预写是受保护写入面（§2.3.3）：凭证随本次 Run 的冻结环境到达闸门。
+		// 零值 = 未接执行权，预写退回普通入口。
+		lease: env.Lease,
 	}
 	summarizer := compaction.NewModelSummarizer(
 		map[string]core.ProviderClient{model: client}, model, gate)
@@ -247,6 +260,9 @@ type summaryCallGate struct {
 	wiring    *compactionWiring
 	principal core.Principal
 	provider  string
+	// lease 是触发本次压缩的 Run 的执行权凭证（US-24 T008）：非零时预写走 fenced 入口。
+	// The ownership credential of the triggering run; a non-zero value fences the pre-write.
+	lease core.LeaseToken
 }
 
 // Begin 完成"预留 + 预写"。任何一步失败都返回错误，`ModelSummarizer` 据此**不发出**调用。
@@ -277,7 +293,7 @@ func (g *summaryCallGate) Begin(ctx context.Context, call compaction.SummaryCall
 
 	auditCtx, cancel := compactionAuditContext(ctx)
 	defer cancel()
-	id, err := g.wiring.audit.BeginCompactionCall(auditCtx, core.LLMCall{
+	pending := core.LLMCall{
 		RunID:     call.RunID,
 		SessionID: call.SessionID,
 		// 摘要不是对话轮：`round` 记 0（DDL 对它没有 CHECK），轮次语义由 `attempt_id`
@@ -286,13 +302,29 @@ func (g *summaryCallGate) Begin(ctx context.Context, call compaction.SummaryCall
 		Provider:  g.provider,
 		Model:     call.Model,
 		CreatedAt: g.wiring.now(),
-	})
+	}
+	id, err := g.beginCall(auditCtx, pending)
 	if err != nil {
 		// 预写失败 ⇒ 调用不得发出（宪法 V）：把刚拿到的预留按"审计失败"归还。
 		g.wiring.releaseQuota(ctx, ticket, callers.ReleaseAuditFailed)
 		return nil, fmt.Errorf("摘要调用审计预写失败: %w", err)
 	}
 	return &summaryCallTicket{gate: g, callID: id, ticket: ticket}, nil
+}
+
+// beginCall 选摘要预写的入口：零值凭证走普通入口；非零凭证**必须**走 fenced 入口，
+// 实现缺失即 fail-closed（装配缺陷不得降级成无保护预写）。
+// beginCall picks the summary pre-write entry point and fails closed when a fence is
+// required but the audit port has no fenced implementation.
+func (g *summaryCallGate) beginCall(ctx context.Context, pending core.LLMCall) (int64, error) {
+	if g.lease.IsZero() {
+		return g.wiring.audit.BeginCompactionCall(ctx, pending)
+	}
+	fenced, ok := g.wiring.audit.(compactionFencedAuditPort)
+	if !ok {
+		return 0, fmt.Errorf("%w（摘要审计端口 %T）", core.ErrLeaseFenceUnavailable, g.wiring.audit)
+	}
+	return fenced.FencedBeginCompactionCall(ctx, g.lease, pending)
 }
 
 // summaryCallTicket 是一次已预写、已预留的摘要调用的回执。

@@ -767,9 +767,9 @@ type dedupeLearningStore struct {
 }
 
 func (s *dedupeLearningStore) CommitExtraction(ctx context.Context,
-	req core.CommitLearningExtraction,
+	req core.CommitLearningExtraction, token core.LeaseToken,
 ) (core.LearningCommitResult, error) {
-	result, err := s.learningFakeStore.CommitExtraction(ctx, req)
+	result, err := s.learningFakeStore.CommitExtraction(ctx, req, token)
 	for _, candidate := range req.Candidates {
 		if _, duplicate := s.dbContents[candidate.Content]; duplicate {
 			continue
@@ -927,7 +927,9 @@ func (s *serialLearningStore) EntriesForExtraction(context.Context, core.Scope, 
 	return nil, nil
 }
 
-func (s *serialLearningStore) BeginExtraction(_ context.Context, row core.LearningExtraction) (core.LearningExtraction, error) {
+func (s *serialLearningStore) BeginExtraction(_ context.Context, row core.LearningExtraction,
+	_ core.LeaseToken,
+) (core.LearningExtraction, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rows = append(s.rows, row)
@@ -935,7 +937,8 @@ func (s *serialLearningStore) BeginExtraction(_ context.Context, row core.Learni
 	return row, nil
 }
 
-func (s *serialLearningStore) FailExtraction(_ context.Context, _ string,
+func (s *serialLearningStore) FailExtraction(_ context.Context, _, _ string,
+	_ core.LeaseToken, _ string, _ int,
 	class core.LearningFailureClass, _ string, _ time.Time,
 ) error {
 	s.mu.Lock()
@@ -945,7 +948,7 @@ func (s *serialLearningStore) FailExtraction(_ context.Context, _ string,
 }
 
 func (s *serialLearningStore) CommitExtraction(_ context.Context,
-	req core.CommitLearningExtraction,
+	req core.CommitLearningExtraction, _ core.LeaseToken,
 ) (core.LearningCommitResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

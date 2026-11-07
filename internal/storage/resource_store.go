@@ -1024,6 +1024,77 @@ func (s *ResourceStore) PutLifecycleIndex(ctx context.Context, rec core.Lifecycl
 	return nil
 }
 
+// SetLifecycleBarrier 实现归档准入屏障（FR-24-41 / 图 8 的 [1]）：一条条件 UPDATE 把
+// `active` 改成 `disabled`，只动 state / operation_id / updated_at。SQLite 档是单进程单
+// 工作区，屏障照同一语义落地——单写连接上的条件 UPDATE 与准入复查天然串行，因此缺远端
+// Worker 不影响本档正确性；接口同一份，两档不各写一套编排。
+//
+// SetLifecycleBarrier flips active→disabled and touches nothing else; the SQLite profile
+// keeps the same semantics so one port serves both storage profiles.
+func (s *ResourceStore) SetLifecycleBarrier(ctx context.Context, agent, operationID string,
+	at time.Time,
+) (bool, error) {
+	if agent == "" {
+		return false, errors.New("写归档准入屏障: agent 不能为空")
+	}
+	if operationID == "" {
+		// 屏障身份是恢复补偿的 CAS 条件：空值写进去后无法证明恢复的是哪一次屏障。
+		return false, errors.New("写归档准入屏障: 操作标识不能为空")
+	}
+	res, err := s.db.write.ExecContext(ctx,
+		`UPDATE agent_lifecycle
+		    SET state = 'disabled', operation_id = ?, updated_at = ?
+		  WHERE agent_name = ? AND state = 'active'`,
+		nullIfEmpty(operationID), at.UTC().UnixMilli(), agent)
+	if err != nil {
+		return false, fmt.Errorf("写归档准入屏障 %s: %w", agent, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("确认归档准入屏障 %s: %w", agent, err)
+	}
+	return affected == 1, nil
+}
+
+// RestoreLifecycleBarrier 用状态文件的权威记录把索引写回，且**只撤销本次归档操作
+// 留下的那一行**：CAS 条件是 `state='disabled'` + `operation_id = <本次屏障标识>` +
+// `generation = <屏障期观测到的代次>`。只判状态会把后续停用（同为 disabled）回写成
+// 旧代次；只判身份会覆盖同一归档操作自己推进过的代次。写回的是**同一代次**的权威
+// 内容，因此不走 `PutLifecycleIndex` 的代次单调规则（T028 的代次守卫需豁免本法）。
+//
+// RestoreLifecycleBarrier writes the authoritative tuple back only while the row is
+// still the disabled row this archive operation installed.
+func (s *ResourceStore) RestoreLifecycleBarrier(ctx context.Context, rec core.LifecycleRecord,
+	barrierOperationID string, expectedGeneration int64,
+) (bool, error) {
+	if rec.Agent == "" {
+		return false, errors.New("恢复生命周期屏障: agent 不能为空")
+	}
+	if barrierOperationID == "" {
+		return false, errors.New("恢复生命周期屏障: 屏障操作标识不能为空")
+	}
+	updatedAt := rec.UpdatedAt
+	if updatedAt == 0 {
+		updatedAt = time.Now().UnixMilli()
+	}
+	res, err := s.db.write.ExecContext(ctx,
+		`UPDATE agent_lifecycle
+		    SET state = ?, generation = ?, state_file_hash = ?, valid = 1,
+		        error_message = NULL, updated_at = ?, operation_id = ?
+		  WHERE agent_name = ? AND state = 'disabled'
+		    AND operation_id = ? AND generation = ?`,
+		string(rec.State), rec.Generation, nullIfEmpty(rec.Checksum),
+		updatedAt, nullIfEmpty(rec.OperationID), rec.Agent, barrierOperationID, expectedGeneration)
+	if err != nil {
+		return false, fmt.Errorf("恢复生命周期屏障 %s: %w", rec.Agent, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("确认生命周期屏障恢复 %s: %w", rec.Agent, err)
+	}
+	return affected == 1, nil
+}
+
 // uidSourceOf 把身份映射为镜像来源：有 UID = 状态文件（`state_file`），无 UID = NULL
 // （"尚未对账"）。`legacy_unrecorded` 只由迁移回填写入，索引重建不擅自改判。
 // uidSourceOf maps an identity to its mirror source; only the migration writes
@@ -1155,11 +1226,13 @@ func uidSourceString(uid core.AgentUID) string {
 	return "state_file"
 }
 
-// LifecycleIndex 读 `agent_lifecycle` 索引：返回记录、`valid` 标志与无效原因；
+// ReadLifecycleIndex 读 `agent_lifecycle` 索引：返回记录、`valid` 标志与无效原因；
 // 索引无该 Agent 时返回零记录、valid=false、空原因、nil 错误（"没有索引行"不是故障，
-// 视图据此回退到状态文件读取）。
-// LifecycleIndex reads the index row; a missing row is not an error.
-func (s *ResourceStore) LifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error) {
+// 视图据此回退到状态文件读取）。本包是 v3 迁移的**旧 SQLite 读取源**，不是执行路径；
+// US-24 的代次守卫只落在 PostgreSQL 的 `PutLifecycleIndex` 上。
+// ReadLifecycleIndex reads the index row. This package is the legacy SQLite migration
+// source, not an execution path, so the US-24 generation guard lives in PostgreSQL only.
+func (s *ResourceStore) ReadLifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error) {
 	var (
 		state      sql.NullString
 		generation int64

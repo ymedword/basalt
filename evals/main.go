@@ -884,12 +884,25 @@ func executeCase(ctx context.Context, ec evalCase, gate string, logger *slog.Log
 		}
 	}()
 
+	// US-24 §2.3.9：准入在每次新 Run 时校验"本地 bundle ↔ 共享发布记录"一致（缺记录即
+	// 拒绝），而夹具的 Agent 目录在装配时还没有发布记录——所以先按生产的同一条发布器
+	// （`bundlePublisher`）把夹具 Agent 的 bundle 构建、安装、发布，再启用、再跑。
+	// 这一步不是给评测开的口子：`assets install` 与它走的是同一个实现，评测只补"从
+	// 工作区目录构建"这一前段（包外拿不到 CLI 的安装入口）。
+	// US-24 §2.3.9: admission verifies the local bundle against the shared publication
+	// record, so the fixture bundle is published first through the same single publisher.
+	if _, err := rt.PublishWorkspaceAgentBundle(ctx, ec.Fixture.Agent); err != nil {
+		cr.Error = fmt.Sprintf("发布夹具 Agent 资产失败：%v", err)
+		return cr
+	}
+
 	// US-11（D-01 A）：基线把既有 Agent 一律写成 disabled——评测夹具代表"运维已启用"的
 	// 初始态，所以在拿到运行入口之后、跑之前，按生产的同一条状态机把夹具 Agent 迁到
 	// active。迁移失败没有"没启用"的借口：fake 档与真模型档一样如实判 FAIL。
 	// US-11 (D-01 A): the baseline disables pre-existing agents, so the fixture is enabled
 	// through the production state machine before the one run.
-	if err := enableFixtureAgent(filepath.Join(workDir, workspaceDirName), ec.Fixture.Agent); err != nil {
+	if err := enableFixtureAgent(ctx, schema.DSN, filepath.Join(workDir, workspaceDirName),
+		ec.Fixture.Agent, logger); err != nil {
 		cr.Error = fmt.Sprintf("启用夹具 Agent 失败：%v", err)
 		return cr
 	}
@@ -1000,28 +1013,50 @@ func declareFixtureBindings(ctx context.Context, workDir string, ec evalCase, op
 	return nil
 }
 
-// enableFixtureAgent 在基线之后把夹具 Agent 迁到 active：用独立闸门 + 生产状态存储完成
-// 一次真实迁移（此时没有在途运行，与包外适配同一手法）。已是 active 时原样返回，同一
-// 工作区重复执行的用例因此不会撞上"没有可执行的迁移"。
-// enableFixtureAgent transitions the fixture agent to active through the production
-// state machine once the baseline has written disabled/generation=1; an already-active
-// agent is a no-op.
-func enableFixtureAgent(wsRoot, agent string) error {
-	gate := core.NewAgentGate()
+// enableFixtureAgent 在基线之后把夹具 Agent 迁到 active：走**生产启停入口**
+// （`app.NewAgentConsole(...).Transition`）完成一次真实迁移——不是只改状态文件。
+//
+// US-24 FR-42 起 `StartRun` 在事务里用 `agent_lifecycle` 索引核对代次；只迁状态文件会
+// 让准入看到"本地代次高于共享索引"并 `AGENT_LIFECYCLE_MISMATCH`。索引行带
+// `operation_id` 外键，必须先有 pending 管理操作行——`BeginOperation → Transition →
+// PutLifecycleIndex → 回填终态` 的顺序封装在 console 里，夹具走它即可。已是 active 时
+// 原样返回，同一工作区重复执行的用例因此不会撞上"没有可执行的迁移"。
+// The fixture is enabled through the production console entry: US-24 FR-42 admission
+// cross-checks the shared lifecycle index, which only a full transition writes.
+func enableFixtureAgent(ctx context.Context, dsn, wsRoot, agent string, logger *slog.Logger) error {
+	db, err := postgres.Open(ctx, postgres.Config{DSN: dsn})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }() // 只读终态已写回；关库失败不改变迁移结果
+
 	store := workspace.NewLifecycleStore(wsRoot, time.Now)
+	console := app.NewAgentConsole(app.AgentConsoleDeps{
+		Lifecycle:  store,
+		Index:      postgres.NewResourceStore(db),
+		Gate:       core.NewAgentGate(), // 此刻没有在途运行：闸门只防本夹具自身并发
+		Operations: postgres.NewManagementStore(db),
+		Logger:     logger,
+		Now:        time.Now,
+	})
 
-	release := gate.Lock(agent)
-	defer release()
-
-	record, exists, err := store.Read(context.Background(), agent)
+	record, exists, err := store.Read(ctx, agent)
 	if err != nil {
 		return err
 	}
 	if exists && record.State == core.AgentActive {
 		return nil
 	}
-	_, err = store.Transition(context.Background(), agent, record.State, record.Generation,
-		core.AgentActive, core.NewOperationID(time.Now()))
+	_, err = console.Transition(ctx, agent, core.AgentActive, core.AgentLifecycleTransition{
+		ExpectedState:      record.State,
+		ExpectedGeneration: record.Generation,
+	}, core.Actor{
+		// 评测夹具跑在本机进程内，等价于运维自己的终端：与运行请求同一个本机信任身份
+		// （不是零值——actor 的 Subject / Method 是审计行必填列）。
+		Subject: core.ActorSubjectLocalTrust,
+		Method:  core.AuthMethodLocalTrust,
+		Source:  "eval-fixture",
+	})
 	return err
 }
 

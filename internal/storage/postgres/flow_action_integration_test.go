@@ -69,6 +69,7 @@ func newPGFlowActionProbe(t *testing.T) *pgFlowActionProbe {
 	createReq.Contract.Scope = core.FlowAuthority{CallerID: core.LocalAdminCallerID, AuthorizingKind: core.AuthorizingKindAdminBuiltin, Tools: []string{"flow_probe"}, Scopes: []string{core.ScopeFlowsWrite}, AgentUIDs: []string{"ag_one"}}
 	created, err := s.Create(t.Context(), createReq)
 	require.NoError(t, err)
+	rootLease := flowRootLeaseFor(t, s.db, created.RootTaskID)
 	runID := "flow-probe-run"
 	_, err = s.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: created.ID, Expected: created.Version, Now: created.CreatedAt + 1, Attempt: flow.NodeAttempt{ID: "node-action", TaskID: created.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: 1, RunID: runID, SessionID: "", Input: created.Revision.Input, InputHash: created.Revision.InputHash}})
 	require.NoError(t, err)
@@ -76,7 +77,7 @@ func newPGFlowActionProbe(t *testing.T) *pgFlowActionProbe {
 	require.NoError(t, err)
 	// The original RunStore atomically validates and writes the planned Flow link.
 	// This executor probe remains separate from full production AgentService wiring.
-	require.NoError(t, NewRunStore(s.db).StartRun(t.Context(), core.RunRecord{RunID: runID, Agent: "writer", Channel: "cli", UserID: "test", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.RootTaskID, NodeAttemptID: "node-action", TaskRevision: task.Version.Revision}}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(NewRunStore(s.db), t.Context(), core.RunRecord{RunID: runID, Agent: "writer", Channel: "cli", UserID: "test", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), Flow: &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.RootTaskID, NodeAttemptID: "node-action", TaskRevision: task.Version.Revision, Lease: rootLease}}, core.RunResourceManifest{}))
 	p := &pgFlowActionProbe{store: s, task: task}
 	p.actions = &FlowActions{Store: s, Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, NodeAttemptID: "node-action", Recheck: func(context.Context) error { return nil }}
 	p.budget = &FlowBudget{Store: s, Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID}

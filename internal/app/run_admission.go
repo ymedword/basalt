@@ -12,6 +12,14 @@ package app
 //   - 归还用 `context.WithoutCancel`：取消路径上调用方 ctx 已取消，但名额照还。
 //     这不是业务状态进 context，而是把"取消"与"到期"从一次记账操作上摘掉。
 //
+// US-24 P-06：这里的进程内名额表**降为预检**（快、不排队、跨进程无共识）。权威判定
+// 在 `core.AgentService.Run` 的 `StartRun` 事务内——调用方 advisory 锁之后按共享库
+// 的 running 行复查（FR-24-08 / FR-24-34）。预检放行、事务复查拒绝是**正常结局**：
+// 拒绝方经 `core.ErrCallerConcurrencyLimited`（callers 侧是同一哨兵的别名）映射 429
+// `CALLER_CONCURRENCY_LIMITED`，且本次准入零占用。本层不得声称自己强制了集群级名额。
+// Since US-24 P-06 the in-process slot table is a precheck only; StartRun's
+// transaction holds the authoritative verdict and rejects with the same sentinel.
+//
 // panic 收口：工具执行或循环内部的 panic 是**运行期致命错误**，按
 // `run-and-errors.md` §2 走 `RunResult.Status=failed` + `Reason`（含 "panic" 字样，
 // 便于与超时 / 预算失败区分），**不**抬高成函数级 error——调用方问题才走 error。
@@ -32,7 +40,21 @@ import (
 // A nil limiter means admission is not wired; the panic guard still applies.
 type runAdmission struct {
 	limiter *callers.Limiter
-	logger  *slog.Logger
+	// inflight 是 `worker.max_inflight` 的池化名额（US-24 FR-24-40）：三条执行路径
+	// 共用，nil 表示未接线。取槽在调用方名额之后、Run 开始之前——满额被拒的 Run
+	// 零占用。
+	// inflight is the pooled max_inflight budget shared by the three execution paths.
+	inflight *inflightLimiter
+	// runs / admission 把 [4] 的**调用方并发**结论提到容量类判定之前（FR-24-34）：
+	// `max_inflight` 满额与实例上限同码（TOO_MANY_RUNS），若先取槽，跨 Worker 的
+	// 调用方名额已满时返回的就是容量码而不是 CALLER_CONCURRENCY_LIMITED。两者 nil =
+	// 未接线（轻装配与既有单测），行为与接线前逐字一致。
+	// runs/admission hoist the caller-concurrency verdict ahead of the capacity rejects:
+	// a full inflight pool shares TOO_MANY_RUNS with the instance cap and must not
+	// outrank CALLER_CONCURRENCY_LIMITED. Nil keeps the pre-US-24 behaviour.
+	runs      core.RunStore
+	admission core.CallerAdmissionResolver
+	logger    *slog.Logger
 	// diag 是配额判定诊断（V-8）：Run 准入是全流程的第一次配额判定，`deny` 在这里
 	// 意味着 Run 从未开始，事件是它唯一的时间线痕迹（没有执行、没有审计行）。
 	// diag records the run-admission verdict; a denial here has no audit row at all.
@@ -87,6 +109,32 @@ func (a *runAdmission) run(
 		}()
 	}
 
+	// [4] 预检前移（FR-24-34）：调用方并发是准入的第一判据段，必须排在**任何**容量类
+	// 拒绝之前。`worker.max_inflight` 满额与实例上限同码（TOO_MANY_RUNS）；先取槽就会让
+	// "跨 Worker 调用方名额已满 + 本进程名额池也满"返回 TOO_MANY_RUNS，而契约要求
+	// CALLER_CONCURRENCY_LIMITED（模块卡 §4.5 的负向用例）。core 的 [4] 仍然保留——CLI
+	// 与其他直接调用不经过本层；两处都是只读预检，权威复查在 `StartRun` 事务内。
+	// The precheck moves ahead of the pooled slot: a full inflight pool is a capacity
+	// verdict (same code as the instance cap) and must not outrank the cross-worker
+	// caller-concurrency verdict. The precheck in core stays for direct callers.
+	if precheckErr := a.precheckAdmission(ctx, req); precheckErr != nil {
+		return core.RunResult{}, precheckErr
+	}
+
+	// 池化在途名额（US-24 FR-24-40 / 图 11 [1]）：三条执行路径共用同一个信号量。
+	// 交互 Run 取槽非阻塞（满额立即 TOO_MANY_RUNS，不排队）；后台路径阻塞可取消。
+	// 名额在调用方名额**之后**取：CALLER_CONCURRENCY_LIMITED 的优先级高于容量判定
+	// （FR-24-34），被拒的 Run 不占任何名额。
+	// The pooled slot is taken after the caller slot: the caller-concurrency verdict
+	// ranks above capacity, and a rejected run holds nothing.
+	if slot, slotErr := a.acquireInflight(ctx, req); slotErr != nil {
+		return core.RunResult{}, slotErr
+	} else if slot != nil {
+		// 归还必须来自本层 defer：正常完成、失败、取消、panic 都会走到这里。
+		// The slot is returned by this layer's defer on every outcome.
+		defer slot()
+	}
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			// 栈不进 Reason（会撑爆 HTTP 响应），只进日志；Reason 点名 panic 即可。
@@ -103,6 +151,37 @@ func (a *runAdmission) run(
 	}()
 
 	return next(ctx, req)
+}
+
+// precheckAdmission 在取在途名额之前给出调用方并发 / 会话的只读结论。未接线
+// （runs 或 admission 为 nil）时不做任何事——轻装配与既有单测的行为保持不变。
+// precheckAdmission runs the read-only verdict before the pooled slot; an unwired
+// admission is a no-op so light assemblies keep their prior behaviour.
+func (a *runAdmission) precheckAdmission(ctx context.Context, req core.RunRequest) error {
+	if a == nil || a.runs == nil || a.admission == nil {
+		return nil
+	}
+	admission, err := a.admission.For(req.Principal)
+	if err != nil {
+		return err
+	}
+	admission.IsFlow = req.Flow != nil
+	return a.runs.CheckAdmission(ctx, req.SessionID, req.Principal, admission)
+}
+
+// acquireInflight 判定这次 Run 走哪一档取槽语义：`Flow != nil`（Flow 节点 Run）或
+// `Trigger != ""`（只有调度器填 cron / manual，web 与 CLI 留空）都是后台执行；
+// 其余是交互 Run。装配层不另立字段，判定只用既有请求面。
+// acquireInflight classifies the run: a flow leaf or any scheduler-triggered run is
+// background; everything else is interactive.
+func (a *runAdmission) acquireInflight(ctx context.Context, req core.RunRequest) (func(), error) {
+	if a == nil || a.inflight == nil {
+		return nil, nil
+	}
+	if req.Flow != nil || req.Trigger != "" {
+		return a.inflight.acquireBackground(ctx)
+	}
+	return a.inflight.acquireInteractive()
 }
 
 // logWarn 在日志器缺失时静默（轻装配测试不强制注入日志器）。

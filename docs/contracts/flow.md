@@ -224,7 +224,7 @@ TaskRevision JSON 内的槽位／摘要与 NodeAttempt 的 Observation 仍按正
 | `GET /api/v1/admin/flow-tasks`、`GET .../{id}` | 最小管理认证；安全管理投影 | 跨任务运维查看不等于获得原调用方来源阅读权；正文按可证明权限返回，否则仅状态 |
 | `POST /api/v1/admin/flow-tasks/{id}/abandon` | 管理身份＋If-Match＋操作 ID＋非空理由；原 Key 可已撤销 | 持久禁止推进，仍活返回 202；执行收束后 200 abandoned；不重放／不伪造成功／不解未知预留 |
 
-所有响应复用现有 envelope、RequestID、Host／Origin／body 限制。除上文定义版本错误外，错误为 400 `FLOW_DEFINITION_INVALID / FLOW_SCHEMA_UNSUPPORTED`，409 `FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_CLOSED / FLOW_DEADLINE_EXPIRED`，412 `PRECONDITION_FAILED`，429 `FLOW_CAPACITY_EXHAUSTED / FLOW_INTERACTIVE_RESERVE`；认证／归属／限流／配额／存储错误沿用原分类。任务内停止原因在 data 呈现。If-Match 为完整条件版本 opaque ETag，缺失／过期 412 零写入。
+所有响应复用现有 envelope、RequestID、Host／Origin／body 限制。除上文定义版本错误外，错误为 400 `FLOW_DEFINITION_INVALID / FLOW_SCHEMA_UNSUPPORTED`，409 `FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_CLOSED / FLOW_DEADLINE_EXPIRED / FLOW_ROOT_BUSY`，412 `PRECONDITION_FAILED`，429 `FLOW_CAPACITY_EXHAUSTED / FLOW_INTERACTIVE_RESERVE`；认证／归属／限流／配额／存储错误沿用原分类。`FLOW_ROOT_BUSY` 只由 `resume` / `revise` 在需要把根推进（写 `queued`）而 `flow_root` 租约已被执行者持有时返回，**不重试、不降级成无租约写入**（见文末「US-24 分布式执行补充」）。任务内停止原因在 data 呈现。If-Match 为完整条件版本 opaque ETag，缺失／过期 412 零写入。
 
 列表使用稳定游标＋limit（默认 50，上限 100），不以 offset 越来越慢或无界响应代替；任务展开的节点／产物／验证分别分页并显示截断。重新读取不触发自动恢复。取消／恢复必须具有操作幂等身份，网络超时后 UI 只查证原操作，不能换键再提交。发布操作必须说明影响新任务，不能静默替换在途版本。
 
@@ -316,3 +316,23 @@ BeforeCall 在发出新工具前检测，AfterCall 在结果与观察保存后�
 归属检查、工作流筛选、`updated_at DESC, task_id DESC` 排序都在 SQL 分页前执行；
 游标携带更新时间和任务 ID，切换筛选应清空游标，旧 ID 单字段游标应从首页重读。
 这是实时分页，不承诺跨页快照；刷新任务回到最新第一页，不触发执行或恢复。
+
+## US-24 分布式执行补充
+
+多 Worker 部署下 Flow 的推进权由数据库租约承担（`execution_leases.kind = 'flow_root'`，资源为根任务行）。`Service.Leases.Acquire` 返回 `TookOver`：**接管**（上一持有者已失联、`ownership_epoch` 已推进）必须**先 `Recover` 再 `Advance`**；只有**正常交棒**（`TookOver = false`）才可直接推进。`Recover` 出错时**不释放租约**——释放会让下一轮继续以正常交棒领到同一根、直接 `Advance` 绕开查证；不释放则租约到期后必为 `TookOver = true`，重跑 `Recover`。接管递增 `execution_epoch`，旧代次的提交按既有条件提交被拒。
+
+**三道门各挡一种"还有人在动"的情形，不得互相顶替**：
+
+| 门 | 判据（命中 = 仍有活动） | 命中时 |
+| --- | --- | --- |
+| ① 活租约 `HasLiveRunLease`（对应 `Isolated` 的反面） | 子树仍有未释放且未过期的 `run` 租约 | 本轮不查证也不推进，交还租约（稳定结论） |
+| ② 在途 attempt `HasInFlightNodeAttempt`（对应 `Joined` 的反面） | 子树仍有 `prepared` / `running` attempt；`interrupted` / `unknown` **不计入** | 不 `Advance`；释放后根停在 `blocked`，下一轮由回收器的 blocked 分支接住再做一次 `Recover` |
+| ③ 未决动作 `HasUnresolvedAction` | 子树仍有 `outcome ∈ dispatching / unknown` 的动作 | **不得** `Advance`，必须 `Abandon`（**不** Release），把下一轮逼成 `TookOver = true` |
+
+- **不得用 TTL 到期推断子 Run 已退出**：租约判据是 `released_at IS NULL AND expires_at > <db_ms>`，不按时间推测；已完成节点按运行证据复用而不重跑。
+- 普通 Worker 以**真实** `TookOver = false` 领到含未决动作的根时，同样不派发新 Run / 动作、**不写任何审计新行**（含 `status = 'pending'` 的预写）——门 ③ 在 `Advance` 之前判决。
+- 子 Run 创建（`CreateRunForNode`）在同一事务内校验：① 父根的 `flow_root` 租约未释放未过期（否则 `core.ErrLeaseLost`）；② attempt 归属的父根就是本次固定的 `root_task_id`（持根 A 的租约不得为根 B 下的 attempt 建 Run）；③ attempt 的 `execution_epoch` 与 `task_revision` 等于任务当前值、任务仍 `running`、未关闭 / 未取消、未过 deadline（否则 `flow.ErrFlowAttemptStale`）。`ErrFlowAttemptStale` 是**内部信号**，不进对外错误码表；唯一写入仍是那条带 EXISTS 兜底的单条 `INSERT`。
+
+**两个判据分开，各有收敛职责。** `ReconcileTask.Isolated`、`CancelTask.Isolated`、`AbandonTask.Isolated` 语义逐字相同：`Isolated = true` 时 `Recover` 把**整棵子树**的 `prepared|running → interrupted`；`Isolated = false` 时存储层 **attempt 一字不动**（仍有活执行，fail-closed）。`closeFlowTask` / `propagateFlowClose` / `CloseDeadline` 三处收敛由 `joined` 改判 `isolated`，范围覆盖整棵子树；`CloseState` 仍用 `joined`。deadline 的终态是 `stopped`，**不是** `cancelled`。
+
+**管理面推进类入口。** `resume`（`Service.Recover`）与 `revise`（`Service.Revise`）的请求里没有租约；需要把根写回 `queued` 时由 `withRootLease` 自取一个 `flow_root` 租约。`Acquire` 返回 `core.ErrLeaseHeld` 映射 `flow.ErrFlowRootBusy` → HTTP **409 `FLOW_ROOT_BUSY`**，**不重试、不降级成无租约写入**，`flow_tasks` 一行不改；租约释放后重放同一请求才开始成功。`Blocked` 写入不是推进类、不需要租约，管理面照常可用。

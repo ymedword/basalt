@@ -20,11 +20,13 @@ import (
 )
 
 // runResourceManifestFormatVersion 是清单持久形态的版本号：v1 是 US-11 的形态，
-// v2（US-12 R4）增加 `agent_uid`、Provider 凭据固定与 `notify` 三态冻结。v1 清单
-// 只读保留、不回写；结构变更必须同时升级 schema 与视图，不得让旧读者按子集猜测。
-// runResourceManifestFormatVersion pins the manifest format; v2 adds agent_uid, the
-// provider credential pin and the notify freeze. v1 manifests stay readable, never rewritten.
-const runResourceManifestFormatVersion = 2
+// v2（US-12 R4）增加 `agent_uid`、Provider 凭据固定与 `notify` 三态冻结，
+// v3（US-24 P-11 / Q11）增加 `asset_bundle_hash`（准入时固定的内容寻址资产包）。
+// 旧清单只读保留、不回写；缺字段一律读作"未记录"，**不补造**——v1 / v2 清单按兼容
+// 路径解析，结构变更必须同时升级 schema 与视图，不得让旧读者按子集猜测。
+// runResourceManifestFormatVersion pins the manifest format; v3 adds asset_bundle_hash.
+// Older manifests stay readable and their missing fields read as "unrecorded".
+const runResourceManifestFormatVersion = 3
 
 // sha256HexLength 是小写十六进制 sha256 的固定长度（`target_binding` 与各类哈希同形）。
 // sha256HexLength is the fixed length of a lowercase hex sha256.
@@ -61,6 +63,11 @@ func (g *ResourceGate) Unlock() { g.mu.Unlock() }
 // US-12 will extend the lifecycle around it.
 type MCPHandle interface {
 	ServerName() string
+	// BuiltVersion 报告本地 MCP 实例的构建证据（US-24 P-21）：版本引用对
+	// `resource_pointers.applied_version_id`，凭据 pin 是连接时使用的材料。零值 =
+	// 未声明（轻装配 / 评测替身），准入跳过本地实例比对；生产装配必须声明。
+	// BuiltVersion reports the applied-version proof of the local MCP instance.
+	BuiltVersion() BuiltVersion
 }
 
 // RunRuntime 是准入时固定的不可变运行时视图：Provider 客户端映射与 MCP 句柄。技能版本
@@ -79,6 +86,27 @@ type RunRuntime interface {
 	Release()
 }
 
+// AssetBundlePin 是准入验证过的内容寻址资产包（US-24 §2.3.9 / FR-24-42 / FR-24-44）：
+// `Dir` 就是 `assets.Resolve` 的返回值（`<bundle_root>/bundles/<agent>/<bundle_hash>`），
+// 与 `assets.Install` 返回的目录、执行期读取前缀**逐字相同**；`ConfigFiles` / `Skills`
+// 是同一份已校验清单的逐文件记录，执行期只读它们列出的文件（不在清单里的文件一律拒绝，
+// 不静默读取目录里的其他内容）。
+//
+// `ConfigFiles[i].Path` 相对**工作区根**（`<workdir>/.basalt`），与
+// `assets.BuildSpec.ConfigFiles`、快照清单的条目路径同一基准：Agent 定义是
+// `agents/<agent>/AGENT.md`，`bootstrap:` 声明的文件保持其工作区相对写法。执行期
+// 读取把同一相对路径交给 `assets.ConfigBundleRel`，包内布局只在 assets 包拼一次。
+//
+// AssetBundlePin is the verified content-addressed bundle: Dir is the very value
+// Install and Resolve return, and execution reads only the files listed here. Config
+// paths are workspace-root-relative, the same base the snapshot manifest uses.
+type AssetBundlePin struct {
+	Hash        string            `json:"hash"`
+	Dir         string            `json:"dir"`
+	ConfigFiles []FileHash        `json:"config_files"`
+	Skills      []SkillVersionRef `json:"skills"`
+}
+
 // ResolvedResources 是准入解析出的发布版本集合：版本与运行时来自**同一快照**，
 // SkillDirs 给出每个技能发布版本的绝对目录（运行中按清单读文件，不回读工作副本）。
 // ResolvedResources pairs the published versions with the exact runtime they were
@@ -93,11 +121,14 @@ type ResolvedResources struct {
 	// ProviderModel 是本次 Run 使用的模型名（来自已发布版本的定义，准入时冻结）。
 	// ProviderCredential 是同一发布版本上固定的凭据引用与目标绑定哈希。
 	// Notify 是准入时按 notify_mode 枚举出的具体渠道集合（v2 起必填）。
+	// AssetBundle 是本次准入校验通过的内容寻址资产包（v3 起写进清单；未接资产准入时
+	// 为零值，读作"未记录"）。执行期只读它的目录与清单列出的文件。
 	// ProviderModel and ProviderCredential pin the provider version's model and credential;
-	// Notify freezes the resolved notification channels.
+	// Notify freezes the resolved notification channels; AssetBundle pins the bundle.
 	ProviderModel      string
 	ProviderCredential CredentialPin
 	Notify             NotifyManifest
+	AssetBundle        AssetBundlePin
 
 	// SummaryProvider 是会话压缩摘要调用专用的**裸协议客户端**，同样在准入时按
 	// `Provider` 固定（原则 III：摘要不得按名字重新解析、不得自动换供应商）。
@@ -138,8 +169,12 @@ type RunSnapshotBuilder interface {
 	Build(ctx context.Context, entry AgentEntry, resolved ResolvedResources) (ConfigSnapshot, error)
 }
 
-// ResourceKind 是资源版本表的三值字面量（schema.sql CHECK 逐字）。
-// ResourceKind is the three-value literal set of resource kinds.
+// ResourceKind 是资源版本表的种类字面量（schema CHECK 逐字）。US-24 迁移 0012 把
+// `resource_versions` / `resource_pointers` 的闭集扩到四值（追加 `agent_bundle`）；
+// **管理 API 的 `ParseResourceKind` 仍只认前三类**——资产 bundle 由 `basalt assets`
+// 安装 / 发布，不是管理台可发布的资源类型。
+// ResourceKind is the literal kind set of the version table. Migration 0012 widened the
+// SQL closure to four values; the admin API parser deliberately stays at three.
 type ResourceKind string
 
 const (
@@ -149,8 +184,14 @@ const (
 	ResourceMCPServer ResourceKind = "mcp_server"
 	// ResourceSkill 是技能资源。
 	ResourceSkill ResourceKind = "skill"
+	// ResourceAgentBundle 是 Agent 资产 bundle 的版本种类（US-24 §2.3.9）：一次安装
+	// 对应一份内容寻址的版本行，`resource_uid` 与 `resource_id` 都取规范化后的
+	// AgentUID（`ag_`，不是 `rs_`）——身份适配在仓储层按 kind 分派。
+	// ResourceAgentBundle is the content-addressed asset bundle kind; both the uid and
+	// the resource id are the canonical AgentUID, dispatched by kind in the store.
+	ResourceAgentBundle ResourceKind = "agent_bundle"
 	// ResourceNotifyChannel 是通知渠道在**身份表**里的种类：渠道有身份与删除历史，
-	// 但没有版本行——`resource_versions` 仍只认上面三值（ParseResourceKind 口径不变）。
+	// 但没有版本行——`resource_versions` 只认上面四值（ParseResourceKind 口径不变）。
 	// ResourceNotifyChannel exists only in the identity table: channels have identities
 	// and deletion history but no version rows.
 	ResourceNotifyChannel ResourceKind = "notify_channel"
@@ -324,11 +365,17 @@ type RunResourceManifest struct {
 	FormatVersion int    `json:"format_version"`
 	Hash          string `json:"hash"`
 	// AgentUID 是准入时固定下来的 Agent 稳定身份（v2 起必填；v1 清单为空）。
-	AgentUID       AgentUID             `json:"agent_uid"`
-	AgentLifecycle string               `json:"agent_lifecycle_state"`
-	Provider       ProviderVersionRef   `json:"provider"`
-	MCPServers     []ResourceVersionRef `json:"mcp_servers"`
-	Skills         []SkillVersionRef    `json:"skills"`
+	AgentUID       AgentUID `json:"agent_uid"`
+	AgentLifecycle string   `json:"agent_lifecycle_state"`
+	// AssetBundleHash 是准入时固定的**内容寻址**资产包哈希（v3 起；旧清单为空 =
+	// 未记录）。执行期只按它定位 `bundles/<agent>/<hash>/`，**不**解析"最新版本"，
+	// 因此新安装不会让在途 Run 漂移（FR-24-42）。
+	// AssetBundleHash pins the content-addressed bundle at admission; older manifests
+	// leave it empty and are read as unrecorded, never backfilled.
+	AssetBundleHash string               `json:"asset_bundle_hash"`
+	Provider        ProviderVersionRef   `json:"provider"`
+	MCPServers      []ResourceVersionRef `json:"mcp_servers"`
+	Skills          []SkillVersionRef    `json:"skills"`
 	// Notify 是准入时冻结的通知授权（v2 起必填；v1 清单为零值，旧语义是
 	// 「空白名单 = 不限制」）。
 	Notify NotifyManifest `json:"notify"`
@@ -384,12 +431,13 @@ func BuildRunResourceManifest(agentUID AgentUID, state AgentState, resolved Reso
 	}
 
 	manifest := RunResourceManifest{
-		FormatVersion:  runResourceManifestFormatVersion,
-		AgentUID:       agentUID,
-		AgentLifecycle: string(state),
-		Provider:       provider,
-		MCPServers:     make([]ResourceVersionRef, 0, len(resolved.MCPServers)),
-		Skills:         make([]SkillVersionRef, 0, len(resolved.Skills)),
+		FormatVersion:   runResourceManifestFormatVersion,
+		AgentUID:        agentUID,
+		AgentLifecycle:  string(state),
+		AssetBundleHash: resolved.AssetBundle.Hash,
+		Provider:        provider,
+		MCPServers:      make([]ResourceVersionRef, 0, len(resolved.MCPServers)),
+		Skills:          make([]SkillVersionRef, 0, len(resolved.Skills)),
 	}
 
 	for _, ref := range resolved.MCPServers {

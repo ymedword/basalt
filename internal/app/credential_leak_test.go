@@ -303,7 +303,7 @@ func TestCredentialLeak_NoPlaintextInSurfaces(t *testing.T) {
 
 	//    落库面：清单与引用行在同一事务里写进 runs / run_resource_manifests /
 	//    run_credential_refs / run_notify_refs；下面的库扫描据此覆盖持久形态。
-	require.NoError(t, postgres.NewRunStore(f.db).StartRun(ctx, core.RunRecord{
+	require.NoError(t, startRunTest(postgres.NewRunStore(f.db), ctx, core.RunRecord{
 		RunID:     leakRunID,
 		Agent:     "writer",
 		Channel:   "cli",

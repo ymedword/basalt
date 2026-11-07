@@ -98,6 +98,15 @@ type ChatRequest struct {
 	Round      int    // 该 Run 内第几轮（1 起）
 	ConfigHash string // 配置快照 hash；US-4 起由运行入口**运行期填充**，空则列写 NULL（§2.4 裁决注 3）
 
+	// Lease 是触发这次调用的 Run 的执行权凭证（US-24 §2.3.3 / FR-24-36）：审计
+	// `pending` 预写属于受保护写入面，服务据它选 fenced 入口。零值 = 未接执行权的
+	// 装配（单进程 / 轻装配），走普通预写。业务状态显式传参，**不**进 context（宪法 VII）。
+	// 它**不进**供应商请求体（与 Phases 等同为观察 / 关联字段，`json:"-"`）。
+	// Lease is the ownership credential of the triggering run; the pending audit pre-write
+	// is a protected surface and picks its fenced entry point by it. Zero means an
+	// unleased assembly. It never reaches the provider request envelope.
+	Lease LeaseToken `json:"-"`
+
 	// —— 协议内容（ProviderClient 消费）——
 	// Protocol payload, consumed by ProviderClient.
 
@@ -132,6 +141,38 @@ type ProviderClient interface {
 	// Chat 发出一次调用；返回的响应与错误都未经二次包装（错误链保留）。
 	// Chat performs one call and returns the response and error unwrapped.
 	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+}
+
+// BuiltVersion 是本地 Provider / MCP 实例的**构建证据**（US-24 P-21 / FR-24-25）：
+// 版本引用 + 凭据 pin 两段**都要**比对——版本行相同但凭据 pin 变了，说明实例手里的
+// 材料已经漂移，同样不可信；只比版本会让"发布同版本、轮换凭据"这一路径漏判。
+//
+// 比对基准由调用方给：Provider 对 `published_version_id`，MCP 对 `applied_version_id`
+// （准入**不得**隐式执行 MCP apply，D-12）。
+//
+// 零值 = **未声明**：轻装配与评测注入的不带版本的替身不声明构建证据，准入跳过本地
+// 实例比对（它们的版本必须由别的机制固定）。生产装配**必须**声明——`wire` 的目录
+// 构建与 MCP supervisor 报告的就是它。
+// BuiltVersion is the two-part build proof of a local instance. Both parts are
+// compared; the zero value means "undeclared", which only light assemblies and eval
+// doubles may produce.
+type BuiltVersion struct {
+	Resource   ResourceVersionRef
+	Credential CredentialPin
+}
+
+// IsZero 报告"未声明"。零值不是"版本 0"，而是"没有证据"——调用方据此跳过比对，
+// **不得**把它当成任何一个真实版本。
+// IsZero reports an undeclared proof; it is never a real version.
+func (v BuiltVersion) IsZero() bool {
+	return v.Resource.VersionID == 0 && v.Resource.Name == "" && v.Credential == CredentialPin{}
+}
+
+// BuiltVersioned 由能自报构建证据的本地实例实现：`provider.ProviderService`（Provider
+// 侧）与 `RunRuntime.MCP` 交出的句柄（MCP 侧）。
+// BuiltVersioned is implemented by local instances that can report their build proof.
+type BuiltVersioned interface {
+	BuiltVersion() BuiltVersion
 }
 
 // LLMCallStatus 是 llm_calls.status 的字面量（契约 schema.sql；pending/success/failed/unknown）。

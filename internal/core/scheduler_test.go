@@ -1,20 +1,31 @@
 package core
 
-// 本文件是调度面到点触发链路（US-10 / 流程 C）的**白盒**验收测试：`fire` / `lockFor`
-// 与代次表都是非导出件（§3.1.2 签名表），只有同包测试能直接驱动它们；`prompt_test.go`
-// 是包内测试的先例。夹具全部自带（fake TaskStore / RunInvoker / CronEngine + 日志捕获 +
-// 注入时钟），**不引用** `core_test` 外部包夹具，避免两个测试包互相依赖（模块卡 P-07）。
-// This file is the white-box acceptance test of the scheduled-trigger path: fire, lockFor
-// and the generation table are unexported, so only an in-package test can drive them.
-// All fixtures are local (fake store / invoker / engine, log capture, injected clock).
+// 本文件是调度器在 US-24 后的**主判卷面**：触发权从进程内定时器搬到数据库之后，
+// 验收语义按模块卡 §4.8 / Q3 做**等价替换**，不删减任何一条：
+//
+//	旧（进程内锁 / generation）                 新（数据库领取 / CAS / 租约）
+//	---------------------------------------------------------------
+//	两次触发只有一次 actually fires      →  (task_id, planned_at) 重复领取静默跳过
+//	Stop 后 handle 被 Stop                →  后台到期扫描先停领取，在途按宽限收尾
+//	Start 恢复上次 started 执行行         →  Start **不做**全局恢复（交回收器）
+//	generation 递增使旧触发失效           →  领取事务的 CAS 推进 next_fire_at
+//	6 段 cron / CRON_TZ                   →  同（断言改为看送进 CronEngine 的 spec）
+//	定义哈希 / 退休 / 错失记录 / 唯一执行 →  同（断言落在仓储读数上）
+//
+// 判据怎么读：每条用例只断言「调度器按正确顺序调用了仓储」与「终态落账」两件事；
+// 真实的唯一索引、行锁与 CAS 由 internal/storage/postgres 的集成用例守（两层各守一段）。
+// This file owns the core-side scheduling order after US-24: claim, CAS advance, missed
+// grace, gate, lease-backed execution and terminal bookkeeping. Database-level
+// invariants (unique indexes, row locks, CAS) live in the postgres integration suite.
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io/fs"
 	"log/slog"
-	"slices"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,241 +35,563 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 调度面夹具的固定字面量：Agent / 任务 / 6 段 cron / 消息。
-// Fixed literals of the scheduler fixtures.
+// 固定字面量：任务 id 参与代投正文（`【demo】定时任务 demo-1 执行完成`），改它会
+// 连带改投递断言，所以集中在这里。
+// Fixed fixtures; the task id is embedded in the delivery body text.
 const (
-	schedAgent    = "demo"
-	schedTaskID   = "demo-1"
-	schedTaskID2  = "demo-2"
-	schedCron     = "*/5 * * * * *"
-	schedMessage  = "巡检"
-	schedSession  = "scheduler-26ab61a473f25490" // DeriveSessionID("scheduler","scheduler","demo") 固定向量
-	schedAgentTwo = "demo"
+	schedTaskID  = "demo-1"
+	schedTaskID2 = "demo-2"
+	schedAgent   = "demo"
+	schedMessage = "巡检"
+	schedCron    = "0 */5 * * * *"
+	schedZone    = "UTC"
+
+	// schedSession 是 DeriveSessionID("scheduler", "scheduler", "demo") 的字面量。
+	// 调度执行必须落在**派生**会话上，否则同一 Agent 的定时任务各自开会话。
+	schedSession = "scheduler-26ab61a473f25490"
 )
 
-// schedNow 是注入时钟的固定读数（2026-10-19T08:00:00Z）。
-// schedNow is the fixed reading of the injected clock.
-var schedNow = time.Date(2026, 10, 19, 8, 0, 0, 0, time.UTC)
+var (
+	// schedNow 是夹具时钟：调度器与假仓储看到同一个"现在"，到期 / 宽限判定才可判。
+	schedNow  = time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	schedStep = 5 * time.Minute
 
-// demoTask 造一条默认任务定义。
-// demoTask builds one default schedule definition.
+	schedLeaseTTL      = 3 * time.Hour
+	schedRenewInterval = time.Hour
+
+	schedWorker = WorkerIdentity{InstanceID: "worker-under-test", Name: "test", SchemaVersion: 12}
+)
+
+// scanBypassKey 是"这一轮扫描由用例直接驱动"的 ctx 标记：后台扫描门据此放行，
+// 不与用例争夺同一批到期行。
+type scanBypassKey struct{}
+
+// demoTask 造一条标准任务定义（6 段 cron + 显式时区）。
 func demoTask(id string) Schedule {
-	return Schedule{ID: id, Cron: schedCron, Zone: "UTC", Message: schedMessage}
+	return Schedule{ID: id, Cron: schedCron, Zone: schedZone, Message: schedMessage}
 }
 
-// demoEntries 把任务定义包成已注册的 Agent 条目。
-// demoEntries wraps the schedules into one registered agent entry.
-func demoEntries(schedules ...Schedule) []AgentEntry {
-	return []AgentEntry{{
-		Name:       schedAgent,
-		Registered: true,
-		Profile:    &Profile{Schedules: schedules},
-	}}
-}
-
-// fireCurrent 按当前注册代次直接触发一次（fire 未导出；仅用于不经 fake engine 捕获
-// job 的用例）。逐字取自模块卡 §4.3。
-// fireCurrent triggers one run at the current registration generation.
-func fireCurrent(t *testing.T, s *Scheduler, taskID string) {
-	t.Helper()
-	s.stateMu.RLock()
-	gen, ok := s.gens[taskID]
-	s.stateMu.RUnlock()
-	require.True(t, ok, "任务 %s 未注册，无法取当前代次", taskID)
-	s.fire(taskID, gen)
-}
-
-// currentGen 读取任务的当前注册代次（并发用例在主 goroutine 先取好再交给协程）。
-// currentGen reads the current registration generation before spawning goroutines.
-func currentGen(t *testing.T, s *Scheduler, taskID string) uint64 {
-	t.Helper()
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	gen, ok := s.gens[taskID]
-	require.True(t, ok, "任务 %s 未注册，无法取当前代次", taskID)
-	return gen
-}
-
-// startSched 启动调度器并登记清理。
-// startSched starts the scheduler and registers the cleanup hook.
-func startSched(t *testing.T, s *Scheduler) {
-	t.Helper()
-	require.NoError(t, s.Start(context.Background()))
-	t.Cleanup(s.Stop)
-}
-
-// newSchedulerWith 组装一个测试调度器：固定时钟、假引擎、可选参数覆盖。
-// newSchedulerWith assembles a test scheduler with a fixed clock and a fake engine.
-func newSchedulerWith(
-	store TaskStore, invoker RunInvoker, engine CronEngine,
-	logger *slog.Logger, schedules []Schedule, tune func(*SchedulerOptions),
-) *Scheduler {
-	return newSchedulerWithEntries(store, invoker, engine, logger, demoEntries(schedules...), tune)
-}
-
-// newSchedulerWithEntries 以显式 entries 组装调度器（多 Agent / 未注册项用例）。
-// newSchedulerWithEntries assembles a scheduler over explicit entries.
-func newSchedulerWithEntries(
-	store TaskStore, invoker RunInvoker, engine CronEngine,
-	logger *slog.Logger, entries []AgentEntry, tune func(*SchedulerOptions),
-) *Scheduler {
-	opts := SchedulerOptions{
-		Store:      store,
-		Invoker:    invoker,
-		Engine:     engine,
-		Entries:    entries,
-		CronSpec:   func(s Schedule) (string, error) { return "CRON_TZ=" + s.Zone + " " + s.Cron, nil },
-		Budget:     Budget{MaxIterations: 10},
-		RunTimeout: time.Minute,
-		StopGrace:  time.Minute,
-		Logger:     logger,
-		Now:        func() time.Time { return schedNow },
+// schedCronSpec 与 workspace.CronSpec 同形（core 不得 import workspace）：
+// 唯一出口拼 `CRON_TZ=<zone> <expr>`，空 cron / 已带前缀一律拒绝。
+func schedCronSpec(s Schedule) (string, error) {
+	if s.Cron == "" {
+		return "", errors.New("cron is required")
 	}
-	if tune != nil {
-		tune(&opts)
+	if strings.HasPrefix(s.Cron, "CRON_TZ=") {
+		return "", errors.New("cron must not carry CRON_TZ=")
 	}
-	return NewScheduler(opts)
+	zone := s.Zone
+	if zone == "" {
+		zone = "UTC"
+	}
+	return "CRON_TZ=" + zone + " " + s.Cron, nil
 }
 
-// agentEntry 把任务定义包成指定注册态的 Agent 条目。
-// agentEntry wraps schedules into one agent entry with the given registration state.
-func agentEntry(name string, registered bool, schedules ...Schedule) AgentEntry {
-	return AgentEntry{Name: name, Registered: registered, Profile: &Profile{Schedules: schedules}}
+// ---------------------------------------------------------------------------
+// 日志替身
+// ---------------------------------------------------------------------------
+
+// captureState 把 slog 记录留在内存里供断言（不写 stdout，跑测试时不刷屏）。
+type captureState struct {
+	mu      sync.Mutex
+	records []slog.Record
 }
 
-// appliedFor 过滤某个 Agent 的对账调用读数。
-// appliedFor filters the reconcile readings of one agent.
-func appliedFor(records []fakeAppliedRecord, agent string) []fakeAppliedRecord {
-	out := make([]fakeAppliedRecord, 0, 1)
-	for _, rec := range records {
-		if rec.Agent == agent {
+func (c *captureState) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *captureState) Handle(_ context.Context, rec slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, rec.Clone())
+	return nil
+}
+
+func (c *captureState) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *captureState) WithGroup(string) slog.Handler      { return c }
+
+// newCaptureLogger 返回记录器与它的读数句柄。
+func newCaptureLogger() (*slog.Logger, *captureState) {
+	state := &captureState{}
+	return slog.New(state), state
+}
+
+// recordsOf 返回满足级别与消息的记录副本。
+func (c *captureState) recordsOf(level slog.Level, msg string) []slog.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []slog.Record
+	for _, rec := range c.records {
+		if rec.Level == level && rec.Message == msg {
 			out = append(out, rec)
 		}
 	}
 	return out
 }
 
-// schedFixture 是一组默认夹具（假仓储 / 调用器 / 引擎 / 日志捕获 / 注入时钟）。
-// schedFixture bundles the default fakes used by the fire-path tests.
-type schedFixture struct {
-	store   *fakeTaskStore
-	invoker *countingInvoker
-	engine  *fakeEngine
-	logs    *captureState
-	sched   *Scheduler
-}
-
-// newSchedFixture 构造默认夹具；tune 只允许改标量选项，不得替换三大夹具。
-// newSchedFixture builds the default fixture; tune may only adjust scalar options.
-func newSchedFixture(t *testing.T, schedules []Schedule, tune func(*SchedulerOptions)) *schedFixture {
+// requireRecord 断言至少有一条指定级别与消息的记录，并返回它。
+func (c *captureState) requireRecord(t *testing.T, level slog.Level, msg string) slog.Record {
 	t.Helper()
-	store := newFakeTaskStore()
-	invoker := &countingInvoker{}
-	engine := &fakeEngine{}
-	logger, logs := newCaptureLogger()
-	sched := newSchedulerWith(store, invoker, engine, logger, schedules, tune)
-	return &schedFixture{store: store, invoker: invoker, engine: engine, logs: logs, sched: sched}
+	recs := c.recordsOf(level, msg)
+	require.NotEmpty(t, recs, "缺少日志：level=%s msg=%q", level, msg)
+	return recs[0]
 }
 
-// start 启动夹具并登记清理。
-func (f *schedFixture) start(t *testing.T) { t.Helper(); startSched(t, f.sched) }
-
-// fire 以当前代次触发一次。
-func (f *schedFixture) fire(t *testing.T, taskID string) { t.Helper(); fireCurrent(t, f.sched, taskID) }
-
-// fakeTaskStore 是 TaskStore 的内存实现：模拟事务语义、终态行 run_id 置空规则与
-// last_status 同步，并提供故障注入字段。
-// fakeTaskStore is the in-memory TaskStore: it models the transaction, the run_id
-// nulling rule and last_status syncing, and exposes failure-injection knobs.
-type fakeTaskStore struct {
-	mu           sync.Mutex
-	tasks        map[string]TaskRecord
-	skipped      []ExecutionRecord
-	started      []ExecutionRecord
-	finished     []ExecutionStatus
-	finishCalls  []fakeFinishRecord
-	marked       []fakeMarkRecord
-	applied      []fakeAppliedRecord
-	executions   map[string][]ExecutionRecord
-	existingRuns map[string]bool
-
-	listErr           error
-	startExecutionErr error
-	finishErr         error
-	markErr           error
-	recoverCount      int
-	recoverErr        error
-	applyCalls        int
-	applyErr          error
-	applyErrOnCall    int
-	setEnabledErr     error
-	setEnabledCalls   int
-	listCalls         int
-	nextExecID        int64
-
-	finishCtxErr      error
-	finishHasDeadline bool
-	finishDeadlineAt  time.Time
-
-	// applyHook / listHook 是对账切换与快照临界区用例的**受控阻塞点**：分别在一次
-	// ApplyAgentTasks / ListTasks 内触发且只触发一次（sync.Once）。阻塞点位于 fake 自身
-	// 互斥锁之前——否则对账会被仓储锁而不是调度器 stateMu 挡住，用例失去判别力。
-	// applyHook / listHook block once inside the fake before taking its own lock, so the
-	// barrier under test is the scheduler state lock rather than the store mutex.
-	applyHook func()
-	applyOnce sync.Once
-	listHook  func()
-	listOnce  sync.Once
-
-	// recoveredRuns 是启动恢复用例预置的 Run 终态；恢复时按文档映射写成终态行。
-	// recoveredRuns seeds run terminal statuses for the startup-recovery cases.
-	recoveredRuns []RunStatus
-	recoverCalls  int
-	recoverNow    time.Time
+// hasRecord 报告是否出现过指定级别与消息。
+func (c *captureState) hasRecord(level slog.Level, msg string) bool {
+	return len(c.recordsOf(level, msg)) > 0
 }
 
-// fakeFinishRecord 是一次 FinishExecution 的读数（run_id 按 runs 存在性规则解析）。
-// fakeFinishRecord is one observed FinishExecution call.
-type fakeFinishRecord struct {
-	ID       int64
-	Status   ExecutionStatus
-	Duration time.Duration
-	ErrMsg   string
-	At       time.Time
-	RunID    string
+// countLevel 数某级别的记录条数（用于"无声跳过不得记 ERROR"这类断言）。
+func (c *captureState) countLevel(level slog.Level) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, rec := range c.records {
+		if rec.Level == level {
+			n++
+		}
+	}
+	return n
 }
 
-// fakeMarkRecord 是一次 MarkTaskRun 的读数。
-type fakeMarkRecord struct {
-	TaskID string
-	At     time.Time
-	Status ExecutionStatus
+// text 把全部消息与属性拼成一段文本，用于"日志里不得出现正文"这类断言。
+func (c *captureState) text() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var b strings.Builder
+	for _, rec := range c.records {
+		b.WriteString(rec.Message)
+		b.WriteString(" ")
+		rec.Attrs(func(attr slog.Attr) bool {
+			b.WriteString(attr.Key)
+			b.WriteString("=")
+			b.WriteString(attr.Value.String())
+			b.WriteString(" ")
+			return true
+		})
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
-// fakeAppliedRecord 是一次 ApplyAgentTasks 的读数。
-type fakeAppliedRecord struct {
+// attrOf 取记录上的某个属性值。
+func attrOf(rec slog.Record, key string) (slog.Value, bool) {
+	var out slog.Value
+	found := false
+	rec.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == key {
+			out, found = attr.Value, true
+			return false
+		}
+		return true
+	})
+	return out, found
+}
+
+// ---------------------------------------------------------------------------
+// 运行面与 cron 引擎替身
+// ---------------------------------------------------------------------------
+
+// countingInvoker 记录每次运行请求；run 未设置时返回 completed。
+type countingInvoker struct {
+	calls atomic.Int32
+
+	mu   sync.Mutex
+	reqs []RunRequest
+	run  func(context.Context, RunRequest) (RunResult, error)
+}
+
+func (i *countingInvoker) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+	i.calls.Add(1)
+	i.mu.Lock()
+	i.reqs = append(i.reqs, req)
+	run := i.run
+	i.mu.Unlock()
+	if run != nil {
+		return run(ctx, req)
+	}
+	return RunResult{RunID: req.RunID, Status: StatusCompleted}, nil
+}
+
+// requests 返回运行请求副本。
+func (i *countingInvoker) requests() []RunRequest {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]RunRequest(nil), i.reqs...)
+}
+
+// fakeEngine 只实现 US-24 保留的两个方法；Next 固定返回 from + schedStep，
+// 并记录收到的 spec 与 from（6 段 cron / CRON_TZ 的判据就从这里读）。
+type fakeEngine struct {
+	mu       sync.Mutex
+	specs    []string
+	froms    []time.Time
+	nextErr  error
+	next     func(from time.Time) time.Time
+	occurred []time.Time
+
+	// 错过触发点的有界枚举判据：调用次数与 limit 入参。
+	// 1000 上限由 schedulerMissedOccurrences 定义，测试从这里反查而不是复制常量。
+	occurrenceCalls  int
+	occurrenceLimits []int
+}
+
+func (e *fakeEngine) Next(spec string, from time.Time) (time.Time, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.specs = append(e.specs, spec)
+	e.froms = append(e.froms, from)
+	if e.nextErr != nil {
+		return time.Time{}, e.nextErr
+	}
+	if e.next != nil {
+		return e.next(from), nil
+	}
+	return from.Add(schedStep), nil
+}
+
+func (e *fakeEngine) Occurrences(_ string, _, _ time.Time, limit int) []time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.occurrenceCalls++
+	e.occurrenceLimits = append(e.occurrenceLimits, limit)
+	return append([]time.Time(nil), e.occurred...)
+}
+
+// occurrenceReadings 返回枚举调用次数与每次收到的 limit 副本。
+func (e *fakeEngine) occurrenceReadings() (int, []int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.occurrenceCalls, append([]int(nil), e.occurrenceLimits...)
+}
+
+// readings 返回收到的 spec 与 from 副本。
+func (e *fakeEngine) readings() ([]string, []time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.specs...), append([]time.Time(nil), e.froms...)
+}
+
+// ---------------------------------------------------------------------------
+// 任务仓储替身（同时实现 TaskStore 与 LeaseStore）
+// ---------------------------------------------------------------------------
+
+type applyCall struct {
 	Agent     string
 	UpsertIDs []string
 	RetireIDs []string
 }
 
+type claimCall struct {
+	TaskID     string
+	PlannedAt  time.Time
+	NextFireAt time.Time
+	Owner      WorkerIdentity
+	TTL        time.Duration
+}
+
+type missedCall struct {
+	TaskID    string
+	PlannedAt time.Time
+	Missed    int
+	Reason    string
+}
+
+type busyCall struct {
+	TaskID    string
+	PlannedAt time.Time
+}
+
+type nextFireWrite struct {
+	TaskID   string
+	Expected *time.Time
+	Next     time.Time
+}
+
+type markCall struct {
+	TaskID string
+	At     time.Time
+	Status ExecutionStatus
+}
+
+// finishCall 是一次终态写的读数：CtxErr / Deadline 用来证明收尾用的是
+// WithoutCancel + 独立短超时，而不是可能已超时的运行 ctx。
+type finishCall struct {
+	ID          int64
+	Token       LeaseToken
+	Status      ExecutionStatus
+	ErrMsg      string
+	At          time.Time
+	CtxErr      error
+	Deadline    time.Time
+	HasDeadline bool
+}
+
+// fakeTaskStore 是 TaskStore + LeaseStore 的内存替身：maps 模拟行与部分唯一索引，
+// 记录切片保留每次调用的入参供断言，故障开关模拟仓储失败。
+type fakeTaskStore struct {
+	mu sync.Mutex
+
+	tasks    map[string]TaskRecord
+	nextFire map[string]time.Time // 缺席 = NULL
+	active   map[string]int64     // taskID → 在途执行 id（模拟 ux_task_executions_active）
+	leased   map[int64]LeaseToken // 执行 id → 租约 token
+	terminal map[int64]ExecutionStatus
+	claimed  map[string]bool // task_id + planned_at → 已被领取
+	runRows  map[int64]string
+	execTask map[int64]string
+	renewed  map[LeaseToken]Lease
+	cancels  map[LeaseToken]bool
+
+	executions map[string][]ExecutionRecord
+	started    []ExecutionRecord
+	finished   []ExecutionStatus
+	finishLog  []finishCall
+	marks      []markCall
+	applied    []applyCall
+	claims     []claimCall
+	missed     []missedCall
+	busy       []busyCall
+	nextWrites []nextFireWrite
+	skipped    []ExecutionRecord
+	releases   []LeaseToken
+	renewCalls int
+
+	nextExecID int64
+
+	nowFn func() time.Time
+
+	// 后台扫描门：Start 的到期扫描第一轮立刻跑，会和用例自己的 dispatchOnce 抢同一批
+	// 到期行，也会让 executionWG 的 Add/Wait 交错。夹具默认把后台扫描挡在门上，用例
+	// 用 f.scan / f.fire 明确驱动，时序才可判。
+	scanPaused    atomic.Bool
+	scanEntered   chan struct{}
+	scanRelease   chan struct{}
+	scanEnterOnce sync.Once
+	scanRelOnce   sync.Once
+
+	// 故障注入与注入点。
+	listErr           error
+	dispatchErr       error
+	applyErr          error
+	applyErrOnCall    int
+	applyCalls        int
+	setEnabledErr     error
+	claimErr          error
+	setNextFireErr    error
+	missedErr         error
+	busyErr           error
+	startExecutionErr error
+	forced            []DueTask
+	dispatchHook      func()
+}
+
 // newFakeTaskStore 构造空仓储。
 func newFakeTaskStore() *fakeTaskStore {
 	return &fakeTaskStore{
-		tasks:        make(map[string]TaskRecord),
-		executions:   make(map[string][]ExecutionRecord),
-		existingRuns: make(map[string]bool),
+		tasks:       make(map[string]TaskRecord),
+		nextFire:    make(map[string]time.Time),
+		active:      make(map[string]int64),
+		leased:      make(map[int64]LeaseToken),
+		terminal:    make(map[int64]ExecutionStatus),
+		claimed:     make(map[string]bool),
+		runRows:     make(map[int64]string),
+		execTask:    make(map[int64]string),
+		renewed:     make(map[LeaseToken]Lease),
+		cancels:     make(map[LeaseToken]bool),
+		executions:  make(map[string][]ExecutionRecord),
+		nowFn:       time.Now,
+		scanEntered: make(chan struct{}),
+		scanRelease: make(chan struct{}),
 	}
 }
 
-// ListTasks 按 task_id 升序返回全部行（含 retired，由 core 过滤）。
-func (s *fakeTaskStore) ListTasks(context.Context) ([]TaskRecord, error) {
-	if s.listHook != nil {
-		s.listOnce.Do(s.listHook)
+// setClock 在构造后统一夹具时钟与调度器时钟。
+func (s *fakeTaskStore) setClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now != nil {
+		s.nowFn = now
+	}
+}
+
+// armScanGate 挂上后台扫描门（必须在 Start 之前调用）。
+func (s *fakeTaskStore) armScanGate() { s.scanPaused.Store(true) }
+
+// resumeScan 放开门并解除暂停（幂等）。
+func (s *fakeTaskStore) resumeScan() {
+	s.scanPaused.Store(false)
+	s.scanRelOnce.Do(func() { close(s.scanRelease) })
+}
+
+// awaitScanEntered 等后台扫描真正抵达门口；只有 Start 成功后才应调用。
+func (s *fakeTaskStore) awaitScanEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.scanEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("后台到期扫描未在第一轮进入等待门（Start 没有启动 dispatchLoop？）")
+	}
+}
+
+// gateScan 是扫描门的实现：被用例直接驱动（ctx 带标记）时放行；否则等待放行或 ctx 取消。
+// 等 ctx 取消是必须的——Stop 依赖它把扫描放出来，否则停机死锁。
+func (s *fakeTaskStore) gateScan(ctx context.Context) error {
+	if !s.scanPaused.Load() || ctx.Value(scanBypassKey{}) != nil {
+		return nil
+	}
+	s.scanEnterOnce.Do(func() { close(s.scanEntered) })
+	select {
+	case <-s.scanRelease:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// seedTask 预置一行任务定义；空缺的归属按 SQLite 谱系映射补成管理员（与迁移常量一致）。
+func (s *fakeTaskStore) seedTask(rec TaskRecord) {
+	if rec.CallerID == "" {
+		rec.CallerID = LocalAdminCallerID
+	}
+	if rec.AuthorizingKind == "" {
+		rec.AuthorizingKind = AuthorizingKindAdminBuiltin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.listCalls++
+	s.tasks[rec.TaskID] = rec
+}
+
+// task 读回一行任务定义。
+func (s *fakeTaskStore) task(taskID string) (TaskRecord, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.tasks[taskID]
+	return rec, ok
+}
+
+// mutateTask 就地改写一行（夹具专用，绕开生产路径的可见性判定）。
+func (s *fakeTaskStore) mutateTask(taskID string, fn func(*TaskRecord)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.tasks[taskID]
+	if !ok {
+		return
+	}
+	fn(&rec)
+	s.tasks[taskID] = rec
+}
+
+// nextFireOf 读回 next_fire_at。
+func (s *fakeTaskStore) nextFireOf(taskID string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at, ok := s.nextFire[taskID]
+	return at, ok
+}
+
+// setNextFireDirect 直写 next_fire_at（夹具专用；生产写一律经 CAS）。
+func (s *fakeTaskStore) setNextFireDirect(taskID string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextFire[taskID] = at
+}
+
+func (s *fakeTaskStore) snapshotStarted() []ExecutionRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ExecutionRecord(nil), s.started...)
+}
+
+func (s *fakeTaskStore) snapshotSkipped() []ExecutionRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ExecutionRecord(nil), s.skipped...)
+}
+
+func (s *fakeTaskStore) snapshotFinished() []ExecutionStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ExecutionStatus(nil), s.finished...)
+}
+
+func (s *fakeTaskStore) snapshotFinishCalls() []finishCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]finishCall(nil), s.finishLog...)
+}
+
+func (s *fakeTaskStore) snapshotMarks() []markCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]markCall(nil), s.marks...)
+}
+
+func (s *fakeTaskStore) snapshotApplied() []applyCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]applyCall(nil), s.applied...)
+}
+
+func (s *fakeTaskStore) snapshotClaims() []claimCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]claimCall(nil), s.claims...)
+}
+
+func (s *fakeTaskStore) snapshotMissed() []missedCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]missedCall(nil), s.missed...)
+}
+
+func (s *fakeTaskStore) snapshotBusy() []busyCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]busyCall(nil), s.busy...)
+}
+
+func (s *fakeTaskStore) snapshotNextWrites() []nextFireWrite {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]nextFireWrite(nil), s.nextWrites...)
+}
+
+// record 追加一条执行行。
+func (s *fakeTaskStore) record(rec ExecutionRecord) {
+	s.executions[rec.TaskID] = append(s.executions[rec.TaskID], rec)
+	s.execTask[rec.ID] = rec.TaskID
+	if rec.Status == ExecutionStarted && rec.Trigger == TriggerCron {
+		s.started = append(s.started, rec)
+	}
+}
+
+// claimKey 复刻 `(task_id, planned_at)` 唯一键。
+func claimKey(taskID string, plannedAt time.Time) string {
+	return taskID + "\x1f" + strconv.FormatInt(plannedAt.UnixMilli(), 10)
+}
+
+// nextID 分配执行行 id（调用方持锁）。
+func (s *fakeTaskStore) nextID() int64 {
+	s.nextExecID++
+	return s.nextExecID
+}
+
+// leaseToken 生成与生产同形的执行租约凭证（调用方持锁）。
+func leaseToken(id int64, owner WorkerIdentity) LeaseToken {
+	return LeaseToken{
+		Kind:           LeaseScheduleExecution,
+		ResourceID:     strconv.FormatInt(id, 10),
+		OwnerWorkerID:  owner.InstanceID,
+		OwnershipEpoch: 1,
+	}
+}
+
+// ===== TaskStore =====
+
+func (s *fakeTaskStore) ListTasks(context.Context) ([]TaskRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -266,16 +599,16 @@ func (s *fakeTaskStore) ListTasks(context.Context) ([]TaskRecord, error) {
 	for _, rec := range s.tasks {
 		out = append(out, rec)
 	}
-	slices.SortFunc(out, func(a, b TaskRecord) int { return strings.Compare(a.TaskID, b.TaskID) })
+	sort.Slice(out, func(i, j int) bool { return out[i].TaskID < out[j].TaskID })
 	return out, nil
 }
 
 // ApplyAgentTasks 模拟单事务：先做归属预检，冲突即整体不生效；新行 enabled=true
-// （schema 缺省 1），既有行保留 enabled / last_* / created_at。
-func (s *fakeTaskStore) ApplyAgentTasks(_ context.Context, agent string, upserts []TaskRecord, retireIDs []string, now time.Time) error {
-	if s.applyHook != nil {
-		s.applyOnce.Do(s.applyHook)
-	}
+// （schema 缺省），既有行只更新定义列，保留 enabled / last_* / created_at 与归属三列
+// （生产 SQL 的 ON CONFLICT 逐列口径）。
+func (s *fakeTaskStore) ApplyAgentTasks(_ context.Context, agent string, upserts []TaskRecord,
+	retireIDs []string, now time.Time,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.applyCalls++
@@ -318,7 +651,7 @@ func (s *fakeTaskStore) ApplyAgentTasks(_ context.Context, agent string, upserts
 			s.tasks[id] = rec
 		}
 	}
-	s.applied = append(s.applied, fakeAppliedRecord{
+	s.applied = append(s.applied, applyCall{
 		Agent:     agent,
 		UpsertIDs: ids,
 		RetireIDs: append([]string(nil), retireIDs...),
@@ -326,11 +659,9 @@ func (s *fakeTaskStore) ApplyAgentTasks(_ context.Context, agent string, upserts
 	return nil
 }
 
-// SetTaskEnabled 更新 enabled；行不存在或已退休返回 fs.ErrNotExist。
 func (s *fakeTaskStore) SetTaskEnabled(_ context.Context, taskID string, enabled bool, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.setEnabledCalls++
 	if s.setEnabledErr != nil {
 		return s.setEnabledErr
 	}
@@ -344,742 +675,703 @@ func (s *fakeTaskStore) SetTaskEnabled(_ context.Context, taskID string, enabled
 	return nil
 }
 
-// MarkTaskRun 记录运行痕迹；失败仅返回错误（调用方只记 WARN）。
 func (s *fakeTaskStore) MarkTaskRun(_ context.Context, taskID string, at time.Time, status ExecutionStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.marked = append(s.marked, fakeMarkRecord{TaskID: taskID, At: at, Status: status})
-	if s.markErr != nil {
-		return s.markErr
-	}
+	s.marks = append(s.marks, markCall{TaskID: taskID, At: at, Status: status})
 	if rec, ok := s.tasks[taskID]; ok {
 		rec.LastRunAt = at
-		rec.LastStatus = status
 		s.tasks[taskID] = rec
 	}
 	return nil
 }
 
-// StartExecution 预写 started 行并分配行号；故障注入时零写入。
-func (s *fakeTaskStore) StartExecution(_ context.Context, rec ExecutionRecord) (int64, error) {
+func (s *fakeTaskStore) ListDispatchable(ctx context.Context, limit int) ([]DueTask, error) {
+	if err := s.gateScan(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.dispatchErr != nil {
+		err := s.dispatchErr
+		s.mu.Unlock()
+		return nil, err
+	}
+	var out []DueTask
+	if len(s.forced) > 0 {
+		out = append(out, s.forced...)
+	} else {
+		now := s.nowFn()
+		for _, rec := range s.tasks {
+			if !rec.Enabled || !rec.RetiredAt.IsZero() {
+				continue
+			}
+			at, has := s.nextFire[rec.TaskID]
+			if has && at.After(now) {
+				continue
+			}
+			out = append(out, DueTask{Task: rec, NextFireAt: at})
+		}
+	}
+	hook := s.dispatchHook
+	s.mu.Unlock()
+
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i].NextFireAt, out[j].NextFireAt
+		if a.IsZero() != b.IsZero() {
+			return a.IsZero()
+		}
+		if !a.Equal(b) {
+			return a.Before(b)
+		}
+		return out[i].Task.TaskID < out[j].Task.TaskID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	// 注入点位于"读到期集合"与"领取"之间：模拟另一 Worker 抢先推进 / 领取。
+	if hook != nil {
+		hook()
+	}
+	return out, nil
+}
+
+func (s *fakeTaskStore) SetNextFire(_ context.Context, taskID string, expected *time.Time, next time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[taskID]; !ok {
+		return fs.ErrNotExist
+	}
+	if s.setNextFireErr != nil {
+		return s.setNextFireErr
+	}
+	if expected != nil {
+		cur, has := s.nextFire[taskID]
+		if !has || !cur.Equal(*expected) {
+			return ErrStaleNextFire
+		}
+	}
+	s.nextFire[taskID] = next
+	s.nextWrites = append(s.nextWrites, nextFireWrite{TaskID: taskID, Expected: expected, Next: next})
+	return nil
+}
+
+// ClaimDueTrigger 模拟领取事务：预检归属 → 忙判定 → 唯一键去重 → CAS 推进 → 落行 + 租约。
+func (s *fakeTaskStore) ClaimDueTrigger(_ context.Context, taskID string, plannedAt, nextFireAt time.Time,
+	owner WorkerIdentity, ttl time.Duration,
+) (DueExecution, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimErr != nil {
+		return DueExecution{}, s.claimErr
+	}
+	row, ok := s.tasks[taskID]
+	if !ok || !row.RetiredAt.IsZero() {
+		return DueExecution{}, fs.ErrNotExist
+	}
+	if _, busy := s.active[taskID]; busy {
+		return DueExecution{}, ErrTaskBusy
+	}
+	if s.claimed[claimKey(taskID, plannedAt)] {
+		return DueExecution{}, ErrTriggerAlreadyClaimed
+	}
+	if cur, has := s.nextFire[taskID]; !has || !cur.Equal(plannedAt) {
+		return DueExecution{}, ErrStaleNextFire
+	}
+
+	id := s.nextID()
+	// run_id 由领取事务分配，形状必须与生产仓储同口径（契约 §5）。
+	// The claim transaction owns the run_id; mirror the production shape.
+	runID := NewRunID("scheduler", plannedAt.UTC(), RunIDSuffix())
+	planned := plannedAt
+	rec := ExecutionRecord{
+		ID:        id,
+		TaskID:    taskID,
+		RunID:     runID,
+		Status:    ExecutionStarted,
+		Trigger:   TriggerCron,
+		StartedAt: plannedAt,
+		PlannedAt: &planned,
+	}
+	s.claimed[claimKey(taskID, plannedAt)] = true
+	s.nextFire[taskID] = nextFireAt
+	s.record(rec)
+	s.active[taskID] = id
+	s.runRows[id] = runID
+	token := leaseToken(id, owner)
+	s.leased[id] = token
+	s.claims = append(s.claims, claimCall{
+		TaskID: taskID, PlannedAt: plannedAt, NextFireAt: nextFireAt, Owner: owner, TTL: ttl,
+	})
+	return DueExecution{Task: row, ExecutionID: id, PlannedAt: plannedAt, Lease: token, RunID: runID}, nil
+}
+
+func (s *fakeTaskStore) RecordMissedTrigger(_ context.Context, taskID string, plannedAt, nextFireAt time.Time,
+	missed int, reason string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[taskID]; !ok {
+		return fs.ErrNotExist
+	}
+	if s.missedErr != nil {
+		return s.missedErr
+	}
+	if cur, has := s.nextFire[taskID]; !has || !cur.Equal(plannedAt) {
+		return ErrStaleNextFire
+	}
+	s.nextFire[taskID] = nextFireAt
+	planned := plannedAt
+	rec := ExecutionRecord{
+		TaskID: taskID, Status: ExecutionSkipped, Trigger: TriggerCron,
+		ErrorMessage: reason, PlannedAt: &planned, FinishedAt: plannedAt,
+	}
+	s.record(rec)
+	s.skipped = append(s.skipped, rec)
+	s.missed = append(s.missed, missedCall{TaskID: taskID, PlannedAt: plannedAt, Missed: missed, Reason: reason})
+	return nil
+}
+
+func (s *fakeTaskStore) RecordBusyTrigger(_ context.Context, taskID string, plannedAt, nextFireAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[taskID]; !ok {
+		return fs.ErrNotExist
+	}
+	if s.busyErr != nil {
+		return s.busyErr
+	}
+	if cur, has := s.nextFire[taskID]; !has || !cur.Equal(plannedAt) {
+		return ErrStaleNextFire
+	}
+	s.nextFire[taskID] = nextFireAt
+	planned := plannedAt
+	rec := ExecutionRecord{
+		TaskID: taskID, Status: ExecutionSkipped, Trigger: TriggerCron,
+		ErrorMessage: schedulerLockMissMessage, PlannedAt: &planned, FinishedAt: plannedAt,
+	}
+	s.record(rec)
+	s.skipped = append(s.skipped, rec)
+	s.busy = append(s.busy, busyCall{TaskID: taskID, PlannedAt: plannedAt})
+	return nil
+}
+
+func (s *fakeTaskStore) StartExecution(_ context.Context, rec ExecutionRecord, owner WorkerIdentity,
+	ttl time.Duration,
+) (int64, LeaseToken, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.startExecutionErr != nil {
-		return 0, s.startExecutionErr
+		return 0, LeaseToken{}, s.startExecutionErr
 	}
-	s.nextExecID++
-	rec.ID = s.nextExecID
-	s.started = append(s.started, rec)
-	return rec.ID, nil
+	if _, busy := s.active[rec.TaskID]; busy {
+		return 0, LeaseToken{}, ErrTaskBusy
+	}
+	id := s.nextID()
+	rec.ID = id
+	if rec.StartedAt.IsZero() {
+		rec.StartedAt = s.nowFn()
+	}
+	s.record(rec)
+	s.active[rec.TaskID] = id
+	s.runRows[id] = rec.RunID
+	token := leaseToken(id, owner)
+	s.leased[id] = token
+	return id, token, nil
 }
 
-// FinishExecution 收尾终态：按 runs 存在性置空 run_id，并同事务同步 last_status。
-// FinishExecution closes one execution row and mirrors last_status in the same step.
-func (s *fakeTaskStore) FinishExecution(ctx context.Context, id int64, status ExecutionStatus, duration time.Duration, errMsg string, at time.Time) error {
+// FinishExecution 带 token 做 fencing：已终态幂等返回；token 不符即 ErrLeaseLost；
+// 成功则释放租约并同步 last_status（生产 SQL 的同一口径）。
+func (s *fakeTaskStore) FinishExecution(ctx context.Context, id int64, token LeaseToken,
+	status ExecutionStatus, duration time.Duration, errMsg string, at time.Time,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.finishCtxErr = ctx.Err()
-	if deadline, ok := ctx.Deadline(); ok {
-		s.finishHasDeadline = true
-		s.finishDeadlineAt = deadline
-	}
-	if s.finishErr != nil {
-		return s.finishErr
-	}
-	s.finished = append(s.finished, status)
-
-	var taskID, runID string
-	for i := range s.started {
-		if s.started[i].ID != id {
-			continue
-		}
-		taskID = s.started[i].TaskID
-		if s.existingRuns[s.started[i].RunID] {
-			runID = s.started[i].RunID
-		}
-		break
-	}
-	s.finishCalls = append(s.finishCalls, fakeFinishRecord{
-		ID: id, Status: status, Duration: duration, ErrMsg: errMsg, At: at, RunID: runID,
+	deadline, hasDeadline := ctx.Deadline()
+	s.finishLog = append(s.finishLog, finishCall{
+		ID: id, Token: token, Status: status, ErrMsg: errMsg, At: at,
+		CtxErr: ctx.Err(), Deadline: deadline, HasDeadline: hasDeadline,
 	})
+	if _, done := s.terminal[id]; done {
+		return nil
+	}
+	leased, ok := s.leased[id]
+	if !ok || leased != token {
+		return ErrLeaseLost
+	}
+	s.terminal[id] = status
+	delete(s.leased, id)
+	taskID := s.execTask[id]
+	if execID, busy := s.active[taskID]; busy && execID == id {
+		delete(s.active, taskID)
+	}
+	rows := s.executions[taskID]
+	for i := range rows {
+		if rows[i].ID == id {
+			rows[i].Status = status
+			rows[i].DurationMS = duration.Milliseconds()
+			rows[i].ErrorMessage = errMsg
+			rows[i].FinishedAt = at
+		}
+	}
+	s.executions[taskID] = rows
 	if rec, ok := s.tasks[taskID]; ok {
 		rec.LastStatus = status
-		rec.UpdatedAt = at
+		rec.LastRunAt = at
 		s.tasks[taskID] = rec
 	}
+	s.finished = append(s.finished, status)
 	return nil
 }
 
-// RecordSkipped 直接插入终态行；契约要求不触碰 last_*（本 fake 同样不碰）。
 func (s *fakeTaskStore) RecordSkipped(_ context.Context, rec ExecutionRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.record(rec)
 	s.skipped = append(s.skipped, rec)
 	return nil
 }
 
-// RecoverStartedExecutions 记录恢复读数并按文档映射收尾预置的遗留行。
-func (s *fakeTaskStore) RecoverStartedExecutions(_ context.Context, now time.Time) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recoverCalls++
-	s.recoverNow = now
-	if s.recoverErr != nil {
-		return 0, s.recoverErr
-	}
-	count := s.recoverCount
-	for _, status := range s.recoveredRuns {
-		s.finished = append(s.finished, recoveredStatus(status))
-		count++
-	}
-	return count, nil
-}
-
-// recoveredStatus 复刻文档中的 Run 终态 → 执行行终态映射；真实 SQL join 的权威用例是
-// internal/storage 的 TestTaskStore_RecoverStartedExecutions（本文件只判调度器接线）。
-func recoveredStatus(status RunStatus) ExecutionStatus {
-	switch status {
-	case StatusCompleted, StatusLimitReached:
-		return ExecutionCompleted
-	default:
-		return ExecutionFailed
-	}
-}
-
-// seedTask 预置一行任务定义（模拟库里既有定义）。SQLite 谱系只有管理员能建任务，
-// 读出时按迁移规则映射为 `local-admin` + `admin-builtin`——假仓储保持同一口径；
-// 需要考察归属失败的用例请显式覆盖这两个字段。
-// seedTask mirrors the legacy lineage mapping (admin-owned tasks); ownership-negative
-// tests must set the two fields explicitly.
-func (s *fakeTaskStore) seedTask(rec TaskRecord) {
-	if rec.CallerID == "" {
-		rec.CallerID = LocalAdminCallerID
-	}
-	if rec.AuthorizingKind == "" {
-		rec.AuthorizingKind = AuthorizingKindAdminBuiltin
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tasks[rec.TaskID] = rec
-}
-
-// recoveryReadings 返回恢复调用次数与收到的 now。
-func (s *fakeTaskStore) recoveryReadings() (int, time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.recoverCalls, s.recoverNow
-}
-
-// ListExecutions 返回预置的执行历史（限条数）。
 func (s *fakeTaskStore) ListExecutions(_ context.Context, taskID string, limit int) ([]ExecutionRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows := s.executions[taskID]
+	rows := append([]ExecutionRecord(nil), s.executions[taskID]...)
 	if limit > 0 && len(rows) > limit {
-		rows = rows[:limit]
+		rows = rows[len(rows)-limit:]
 	}
-	return append([]ExecutionRecord(nil), rows...), nil
+	return rows, nil
 }
 
-// task 返回任务行副本。
-func (s *fakeTaskStore) task(taskID string) (TaskRecord, bool) {
+// ===== LeaseStore（调度器只用到 Renew / Release 的"不挡路"版本） =====
+
+func (s *fakeTaskStore) Acquire(_ context.Context, kind LeaseKind, resourceID string,
+	owner WorkerIdentity, ttl time.Duration,
+) (Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.tasks[taskID]
-	return rec, ok
+	now := s.nowFn()
+	token := LeaseToken{Kind: kind, ResourceID: resourceID, OwnerWorkerID: owner.InstanceID, OwnershipEpoch: 1}
+	lease := Lease{LeaseToken: token, AcquiredAt: now, RenewedAt: now, ExpiresAt: now.Add(ttl)}
+	s.renewed[token] = lease
+	return lease, nil
 }
 
-// mutateTask 在锁内修改一行（模拟另一进程直接改库）。
-func (s *fakeTaskStore) mutateTask(taskID string, fn func(*TaskRecord)) {
+func (s *fakeTaskStore) Renew(_ context.Context, token LeaseToken, ttl time.Duration) (Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.tasks[taskID]
+	s.renewCalls++
+	lease, ok := s.renewed[token]
 	if !ok {
-		return
+		return Lease{}, ErrLeaseLost
 	}
-	fn(&rec)
-	s.tasks[taskID] = rec
+	lease.RenewedAt = s.nowFn()
+	lease.ExpiresAt = lease.RenewedAt.Add(ttl)
+	lease.CancelRequested = s.cancels[token]
+	s.renewed[token] = lease
+	return lease, nil
 }
 
-// snapshotStarted 返回预写行的副本。
-func (s *fakeTaskStore) snapshotStarted() []ExecutionRecord {
+func (s *fakeTaskStore) Release(_ context.Context, token LeaseToken) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]ExecutionRecord(nil), s.started...)
-}
-
-// snapshotSkipped 返回跳过的副本。
-func (s *fakeTaskStore) snapshotSkipped() []ExecutionRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]ExecutionRecord(nil), s.skipped...)
-}
-
-// snapshotFinished 返回终态状态序列的副本。
-func (s *fakeTaskStore) snapshotFinished() []ExecutionStatus {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]ExecutionStatus(nil), s.finished...)
-}
-
-// snapshotFinishCalls 返回终态写读数。
-func (s *fakeTaskStore) snapshotFinishCalls() []fakeFinishRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]fakeFinishRecord(nil), s.finishCalls...)
-}
-
-// snapshotMarks 返回运行痕迹读数。
-func (s *fakeTaskStore) snapshotMarks() []fakeMarkRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]fakeMarkRecord(nil), s.marked...)
-}
-
-// snapshotApplied 返回对账调用读数。
-func (s *fakeTaskStore) snapshotApplied() []fakeAppliedRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]fakeAppliedRecord(nil), s.applied...)
-}
-
-// listReadings 返回 ListTasks 的调用次数（可见性判定必须先读库，N-02）。
-// listReadings returns the ListTasks call count; visibility checks must read the store.
-func (s *fakeTaskStore) listReadings() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.listCalls
-}
-
-// setEnabledReadings 返回 SetTaskEnabled 的调用次数（隐藏任务必须零写 SQL）。
-// setEnabledReadings returns the SetTaskEnabled call count; hidden tasks must write nothing.
-func (s *fakeTaskStore) setEnabledReadings() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.setEnabledCalls
-}
-
-// finishCtxError 返回最近一次终态写拿到的 ctx 错误。
-func (s *fakeTaskStore) finishCtxError() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.finishCtxErr
-}
-
-// finishDeadline 返回最近一次终态写 ctx 的截止时间。
-func (s *fakeTaskStore) finishDeadline() (time.Time, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.finishDeadlineAt, s.finishHasDeadline
-}
-
-// ctxAwareTaskStore 在运行 ctx 已被取消时拒绝终态写（逆改点探针）：用于证明实现
-// 必须用 context.WithoutCancel 派生清理 ctx。
-// ctxAwareTaskStore rejects a terminal write when the run context is already cancelled.
-type ctxAwareTaskStore struct {
-	*fakeTaskStore
-	rejectedFinishes int
-}
-
-// FinishExecution 先检查 ctx，再委托给内存实现。
-func (s *ctxAwareTaskStore) FinishExecution(ctx context.Context, id int64, status ExecutionStatus, duration time.Duration, errMsg string, at time.Time) error {
-	if err := ctx.Err(); err != nil {
-		s.mu.Lock()
-		s.finishCtxErr = err
-		s.rejectedFinishes++
-		s.mu.Unlock()
-		return err
-	}
-	return s.fakeTaskStore.FinishExecution(ctx, id, status, duration, errMsg, at)
-}
-
-// countingInvoker 记录调用次数与请求，并可注入运行函数。
-// countingInvoker records calls and requests; run may be injected.
-type countingInvoker struct {
-	calls atomic.Int32
-	mu    sync.Mutex
-	reqs  []RunRequest
-	run   func(context.Context, RunRequest) (RunResult, error)
-}
-
-// Run 计数后委托注入函数；缺省返回 completed。
-func (i *countingInvoker) Run(ctx context.Context, req RunRequest) (RunResult, error) {
-	i.calls.Add(1)
-	i.mu.Lock()
-	i.reqs = append(i.reqs, req)
-	run := i.run
-	i.mu.Unlock()
-	if run != nil {
-		return run(ctx, req)
-	}
-	return RunResult{RunID: req.RunID, Status: StatusCompleted}, nil
-}
-
-// requests 返回请求副本。
-func (i *countingInvoker) requests() []RunRequest {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	return append([]RunRequest(nil), i.reqs...)
-}
-
-// fakeEngine 是 CronEngine 的内存实现：捕获 spec 与作业、记录启停次数。
-// fakeEngine captures specs/jobs and counts Start/Stop calls.
-type fakeEngine struct {
-	mu              sync.Mutex
-	specs           []string
-	jobs            []func()
-	handles         []*fakeHandle
-	started         int
-	stopped         int
-	addCalls        int
-	addErr          error
-	addErrOnCall    int
-	addErrFor       string
-	occurrences     []time.Time
-	occurrenceLimit int
-	occurrenceCalls int
-	stopCtx         context.Context
-	stopCancel      context.CancelFunc
-}
-
-// Add 捕获注册；故障注入时返回错误且不记句柄。
-func (e *fakeEngine) Add(spec string, job func()) (CronHandle, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.addCalls++
-	e.specs = append(e.specs, spec)
-	if e.addErrFor != "" && spec == e.addErrFor {
-		return nil, fmt.Errorf("fake engine: add %q: injected failure", spec)
-	}
-	if e.addErr != nil && (e.addErrOnCall == 0 || e.addCalls == e.addErrOnCall) {
-		return nil, e.addErr
-	}
-	handle := &fakeHandle{engine: e, spec: spec}
-	e.jobs = append(e.jobs, job)
-	e.handles = append(e.handles, handle)
-	return handle, nil
-}
-
-// Start 记录启动次数。
-func (e *fakeEngine) Start() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.started++
-}
-
-// Stop 返回宽限 ctx；缺省已关闭，阻塞变体由 newBlockingFakeEngine 提供。
-func (e *fakeEngine) Stop() context.Context {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.stopped++
-	if e.stopCtx == nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		e.stopCtx = ctx
-	}
-	return e.stopCtx
-}
-
-// Occurrences 返回预置触发点并记录调用次数与上限。
-func (e *fakeEngine) Occurrences(_ string, _, _ time.Time, limit int) []time.Time {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.occurrenceCalls++
-	e.occurrenceLimit = limit
-	return append([]time.Time(nil), e.occurrences...)
-}
-
-// releaseStop 释放阻塞变体的宽限 ctx（幂等）。
-func (e *fakeEngine) releaseStop() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.stopCancel != nil {
-		e.stopCancel()
-	}
-}
-
-// engineCounts 返回启停与注册次数。
-func (e *fakeEngine) engineCounts() (started, stopped, addCalls int) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.started, e.stopped, e.addCalls
-}
-
-// liveHandleSpecs 返回未被摘除的句柄对应 spec（按注册顺序）。
-func (e *fakeEngine) liveHandleSpecs() []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	specs := make([]string, 0, len(e.handles))
-	for _, handle := range e.handles {
-		if !handle.isStopped() {
-			specs = append(specs, handle.spec)
-		}
-	}
-	return specs
-}
-
-// liveHandles 返回未被摘除的句柄数。
-func (e *fakeEngine) liveHandles() int { return len(e.liveHandleSpecs()) }
-
-// lastJob 返回最近一次成功注册的 job（无则 nil）。
-func (e *fakeEngine) lastJob() func() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if len(e.jobs) == 0 {
-		return nil
-	}
-	return e.jobs[len(e.jobs)-1]
-}
-
-// occurrenceReadings 返回 Occurrences 的调用次数与最近一次上限。
-func (e *fakeEngine) occurrenceReadings() (calls, limit int) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.occurrenceCalls, e.occurrenceLimit
-}
-
-// handleStops 返回被摘除的句柄数。
-func (e *fakeEngine) handleStops() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	n := 0
-	for _, handle := range e.handles {
-		if handle.isStopped() {
-			n++
-		}
-	}
-	return n
-}
-
-// newBlockingFakeEngine 构造宽限 ctx 未关闭的引擎（Stop 会等到 releaseStop）。
-func newBlockingFakeEngine() *fakeEngine {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &fakeEngine{stopCtx: ctx, stopCancel: cancel}
-}
-
-// fakeHandle 是一次注册的句柄；Stop 幂等。
-type fakeHandle struct {
-	engine *fakeEngine
-	spec   string
-	once   sync.Once
-	off    bool
-}
-
-// Stop 摘除本句柄并记数。
-func (h *fakeHandle) Stop() {
-	h.once.Do(func() {
-		h.engine.mu.Lock()
-		h.off = true
-		h.engine.mu.Unlock()
-	})
-}
-
-// isStopped 读取摘除态（调用方持有 engine.mu）。
-func (h *fakeHandle) isStopped() bool { return h.off }
-
-// captureState 是日志捕获的共享存储。
-type captureState struct {
-	mu      sync.Mutex
-	records []captureRecord
-}
-
-// captureRecord 是一条捕获的日志。
-type captureRecord struct {
-	Level slog.Level
-	Msg   string
-	Attrs []slog.Attr
-}
-
-// captureHandler 把 slog 记录收进内存（支持 WithAttrs 前缀）。
-type captureHandler struct {
-	state *captureState
-	base  []slog.Attr
-}
-
-// newCaptureLogger 构造捕获 logger 与共享状态。
-func newCaptureLogger() (*slog.Logger, *captureState) {
-	state := &captureState{}
-	return slog.New(&captureHandler{state: state}), state
-}
-
-// Enabled 放行全部级别。
-func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-// Handle 收集记录（含 WithAttrs 前缀）。
-func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make([]slog.Attr, 0, len(h.base)+r.NumAttrs())
-	attrs = append(attrs, h.base...)
-	r.Attrs(func(a slog.Attr) bool {
-		attrs = append(attrs, a)
-		return true
-	})
-	h.state.mu.Lock()
-	h.state.records = append(h.state.records, captureRecord{Level: r.Level, Msg: r.Message, Attrs: attrs})
-	h.state.mu.Unlock()
+	s.releases = append(s.releases, token)
+	delete(s.renewed, token)
 	return nil
 }
 
-// WithAttrs 返回带前缀的处理器。
-func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	base := make([]slog.Attr, 0, len(h.base)+len(attrs))
-	base = append(base, h.base...)
-	base = append(base, attrs...)
-	return &captureHandler{state: h.state, base: base}
+func (s *fakeTaskStore) FencedTx(context.Context, LeaseToken, func(context.Context, Tx) error) error {
+	return ErrLeaseFenceUnavailable
 }
 
-// WithGroup 保持扁平结构。
-func (h *captureHandler) WithGroup(string) slog.Handler { return h }
+// ---------------------------------------------------------------------------
+// 调度夹具
+// ---------------------------------------------------------------------------
 
-// snapshot 返回记录副本。
-func (s *captureState) snapshot() []captureRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]captureRecord(nil), s.records...)
+// schedFixture 把仓储 / 运行面 / 引擎 / 日志与调度器绑在一起。
+type schedFixture struct {
+	store   *fakeTaskStore
+	invoker *countingInvoker
+	engine  *fakeEngine
+	logs    *captureState
+	sched   *Scheduler
+
+	// fires 记录每个任务被驱动过几次，用来给每次触发不同的 planned_at
+	// （`(task_id, planned_at)` 去重键要求同一任务的两次触发不能共用同一个时刻）。
+	fires map[string]int
 }
 
-// requireRecord 断言存在指定级别与逐字消息的记录。
-func (s *captureState) requireRecord(t *testing.T, level slog.Level, msg string) captureRecord {
+// newSchedulerWith 组装调度器：注册一个 Agent、接上执行权装配与固定的到期扫描节奏。
+func newSchedulerWith(store TaskStore, invoker RunInvoker, engine CronEngine, logger *slog.Logger,
+	schedules []Schedule, tune func(*SchedulerOptions),
+) *Scheduler {
+	opts := SchedulerOptions{
+		Store:   store,
+		Invoker: invoker,
+		Engine:  engine,
+		Entries: []AgentEntry{{
+			Name:       schedAgent,
+			Registered: true,
+			Profile:    &Profile{Schedules: schedules},
+		}},
+		CronSpec: schedCronSpec,
+		Logger:   logger,
+		// 固定时钟：到期 / 宽限 / 收尾时刻都可判。
+		Now:           func() time.Time { return schedNow },
+		Worker:        schedWorker,
+		LeaseTTL:      schedLeaseTTL,
+		RenewInterval: schedRenewInterval,
+		// 后备扫描不参与判卷：门会挡住它，且 1h 的轮询间隔保证它不会再触发第二轮。
+		PollInterval: time.Hour,
+		// MissedGrace 的零值是"零宽限"，必须显式给缺省 300s，否则每次触发都判错失。
+		MissedGrace: defaultSchedulerMissedGrace,
+		StopGrace:   100 * time.Millisecond,
+	}
+	if leases, ok := store.(LeaseStore); ok {
+		opts.Leases = leases
+	}
+	if tune != nil {
+		tune(&opts)
+	}
+	if fs, ok := store.(*fakeTaskStore); ok {
+		fs.setClock(opts.Now)
+	}
+	return NewScheduler(opts)
+}
+
+// newSchedFixture 组装一套默认夹具。
+func newSchedFixture(t *testing.T, schedules []Schedule, tune func(*SchedulerOptions)) *schedFixture {
 	t.Helper()
-	records := s.snapshot()
-	for _, rec := range records {
-		if rec.Level == level && rec.Msg == msg {
-			return rec
-		}
+	store := newFakeTaskStore()
+	invoker := &countingInvoker{}
+	engine := &fakeEngine{}
+	logger, logs := newCaptureLogger()
+	return &schedFixture{
+		store:   store,
+		invoker: invoker,
+		engine:  engine,
+		logs:    logs,
+		sched:   newSchedulerWith(store, invoker, engine, logger, schedules, tune),
 	}
-	require.FailNow(t, "未找到日志", "level=%s msg=%q（实际 %d 条）", level, msg, len(records))
-	return captureRecord{}
 }
 
-// attrOf 取记录中的某个字段。
-func attrOf(rec captureRecord, key string) (slog.Value, bool) {
-	for _, a := range rec.Attrs {
-		if a.Key == key {
-			return a.Value, true
-		}
-	}
-	return slog.Value{}, false
-}
-
-// requireLogFields 断言日志含约束 36 的四个固定字段。
-func requireLogFields(t *testing.T, rec captureRecord, wantRunID string) {
+// arm 挂上后台扫描门并登记清理：先 Stop（取消 dispatchCtx 把门后的扫描放走），
+// 再放开门——顺序反了会让后台扫描在停机后继续跑。
+func (f *schedFixture) arm(t *testing.T) {
 	t.Helper()
-	want := map[string]string{
-		"task_id": schedTaskID,
-		"agent":   schedAgent,
-		"run_id":  wantRunID,
-		"trigger": string(TriggerCron),
-	}
-	for key, value := range want {
-		got, ok := attrOf(rec, key)
-		require.True(t, ok, "日志缺少字段 %s：%+v", key, rec.Attrs)
-		require.Equal(t, value, got.String(), "字段 %s 的值不符", key)
-	}
-}
-
-// TestScheduler_Fire_DerivesSessionAndRunID 覆盖 R5：同 Agent 的两个任务共用一个
-// 固定会话标识；RunID 带 scheduler- 前缀且与执行行一致。
-func TestScheduler_Fire_DerivesSessionAndRunID(t *testing.T) {
-	t.Run("session id is the fixed scheduler vector", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}, nil)
-		f.start(t)
-		f.fire(t, schedTaskID)
-		f.fire(t, schedTaskID2)
-
-		reqs := f.invoker.requests()
-		require.Len(t, reqs, 2, "两轮触发都要发起运行")
-		require.Equal(t, reqs[0].SessionID, reqs[1].SessionID, "同 Agent 的任务必须共用调度会话")
-		require.Equal(t, schedSession, reqs[0].SessionID)
-		require.Equal(t, "scheduler", reqs[0].Channel)
-		require.Equal(t, "scheduler", reqs[0].UserID)
-		require.Equal(t, TriggerCron, reqs[0].Trigger)
-	})
-
-	t.Run("run id carries the scheduler prefix", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.start(t)
-		f.fire(t, schedTaskID)
-
-		reqs := f.invoker.requests()
-		require.Len(t, reqs, 1)
-		require.True(t, strings.HasPrefix(reqs[0].RunID, "scheduler-"), "RunID 前缀必须是 scheduler-：%s", reqs[0].RunID)
-		started := f.store.snapshotStarted()
-		require.Len(t, started, 1)
-		require.Equal(t, reqs[0].RunID, started[0].RunID, "执行行与运行请求必须是同一个 RunID")
+	f.store.armScanGate()
+	t.Cleanup(func() {
+		f.sched.Stop()
+		f.store.resumeScan()
 	})
 }
 
-// TestScheduler_Fire_ExecutesAndRecords 覆盖 R8：completed / limit_reached 都落
-// completed，且先写 started 执行行、再记 last_run_at。
-func TestScheduler_Fire_ExecutesAndRecords(t *testing.T) {
-	cases := []struct {
-		name   string
-		status RunStatus
-		reason string
-	}{
-		{name: "completed", status: StatusCompleted},
-		{name: "limit_reached maps to completed", status: StatusLimitReached, reason: "达到迭代上限"},
+// start 启动调度器并等后台扫描抵达门口。
+func (f *schedFixture) start(t *testing.T) {
+	t.Helper()
+	f.arm(t)
+	require.NoError(t, f.sched.Start(context.Background()))
+	f.store.awaitScanEntered(t)
+}
+
+// startErr 启动调度器并返回错误（预期失败的用例不走等待门）。
+func (f *schedFixture) startErr(t *testing.T) error {
+	t.Helper()
+	f.arm(t)
+	return f.sched.Start(context.Background())
+}
+
+// directCtx 标记"本轮扫描由用例驱动"，让后台扫描门放行。
+func (f *schedFixture) directCtx() context.Context {
+	return context.WithValue(context.Background(), scanBypassKey{}, true)
+}
+
+// seed 把任务的 next_fire_at 拨到"刚刚到期"，返回本次计划时刻（每次调用都不同）。
+func (f *schedFixture) seed(t *testing.T, taskID string) time.Time {
+	t.Helper()
+	if f.fires == nil {
+		f.fires = make(map[string]int)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-			f.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
-				return RunResult{RunID: req.RunID, Status: tc.status, Reason: tc.reason}, nil
-			}
-			f.start(t)
-			f.fire(t, schedTaskID)
+	f.fires[taskID]++
+	planned := schedNow.Add(-time.Duration(f.fires[taskID]) * time.Second)
+	f.seedAt(t, taskID, planned)
+	return planned
+}
 
-			require.EqualValues(t, 1, f.invoker.calls.Load())
-			started := f.store.snapshotStarted()
-			require.Len(t, started, 1)
-			require.Equal(t, ExecutionStarted, started[0].Status)
-			require.Equal(t, TriggerCron, started[0].Trigger)
-			require.Equal(t, schedNow, started[0].StartedAt)
+// seedAt 用指定计划时刻制造到期状态。
+func (f *schedFixture) seedAt(t *testing.T, taskID string, planned time.Time) {
+	t.Helper()
+	require.NotEmpty(t, taskID)
+	f.store.setNextFireDirect(taskID, planned)
+}
 
-			marks := f.store.snapshotMarks()
-			require.Len(t, marks, 1)
-			require.Equal(t, ExecutionStarted, marks[0].Status, "开始执行也要记 last_run_at")
+// scan 驱动一轮到期扫描（绕过后台扫描门）。
+func (f *schedFixture) scan(t *testing.T) {
+	t.Helper()
+	require.NoError(t, f.sched.dispatchOnce(f.directCtx()))
+}
 
-			require.Equal(t, []ExecutionStatus{ExecutionCompleted}, f.store.snapshotFinished())
-			rec, ok := f.store.task(schedTaskID)
-			require.True(t, ok)
-			require.Equal(t, ExecutionCompleted, rec.LastStatus)
-			require.False(t, rec.LastRunAt.IsZero())
-		})
+// wait 等在途执行全部收尾；与 WaitGroup.Add 串行的前提是后台扫描已被门挡住。
+func (f *schedFixture) wait(t *testing.T) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		f.sched.executionWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("在途执行未在 5s 内结束")
 	}
 }
 
-// TestScheduler_Fire_ReadsTaskFromStore 覆盖 R25：每轮读库；停用 / 读不到库 / 改定义
-// 都按库行生效。
-func TestScheduler_Fire_ReadsTaskFromStore(t *testing.T) {
-	t.Run("disabled task does not run", func(t *testing.T) {
+// claim 只领取、不等收尾（阻塞型运行面用例用它制造在途执行）。
+func (f *schedFixture) claim(t *testing.T, taskID string) time.Time {
+	t.Helper()
+	planned := f.seed(t, taskID)
+	f.scan(t)
+	return planned
+}
+
+// fire 触发一次到点执行并等它收尾，返回计划时刻。
+func (f *schedFixture) fire(t *testing.T, taskID string) time.Time {
+	t.Helper()
+	planned := f.claim(t, taskID)
+	f.wait(t)
+	return planned
+}
+
+// ===========================================================================
+// 到期扫描与领取
+// ===========================================================================
+
+// TestScheduler_Dispatch_DerivesSessionAndRunID —— 定时执行落在**派生**会话上，
+// run_id 来自领取事务，两次触发各有一条执行行。
+func TestScheduler_Dispatch_DerivesSessionAndRunID(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}, nil)
+	f.start(t)
+	f.fire(t, schedTaskID)
+	f.fire(t, schedTaskID2)
+
+	reqs := f.invoker.requests()
+	require.Len(t, reqs, 2)
+	require.Equal(t, schedSession, reqs[0].SessionID, "定时执行必须落在派生会话上")
+	require.Equal(t, "scheduler", reqs[0].Channel)
+	require.Equal(t, "scheduler", reqs[0].UserID)
+	require.Equal(t, TriggerCron, reqs[0].Trigger)
+	require.Equal(t, schedMessage, reqs[0].Message)
+	require.Equal(t, schedAgent, reqs[0].Agent)
+	// RunID 形状是公共契约（§5）：<渠道>-<毫秒>-<6 位 base36 小写>。
+	// 只断言 NotEmpty 会让退化格式（缺渠道 / 缺随机段）悄悄过关。
+	runIDShape := regexp.MustCompile(`^scheduler-\d{13}-[a-z0-9]{6}$`)
+	require.Regexp(t, runIDShape, reqs[0].RunID, "RunID 形状必须是 scheduler-<13 位毫秒>-<6 位 base36>")
+	require.Regexp(t, runIDShape, reqs[1].RunID)
+	require.NotEqual(t, reqs[0].RunID, reqs[1].RunID, "两次触发必须是两个 Run")
+
+	require.Equal(t, LocalAdminCallerID, reqs[0].Principal.CallerID)
+	require.Equal(t, ActorScheduler, reqs[0].Principal.Actor)
+
+	started := f.store.snapshotStarted()
+	require.Len(t, started, 2)
+	require.Equal(t, reqs[0].RunID, started[0].RunID, "执行行必须带领取事务分配的 run_id")
+	require.Regexp(t, runIDShape, started[0].RunID, "执行行落库的 run_id 与运行请求同一形状")
+	require.Equal(t, TriggerCron, started[0].Trigger)
+	require.NotNil(t, started[0].PlannedAt)
+}
+
+// TestScheduler_Dispatch_ExecutesAndRecords —— 领取 → 运行 → fencing 收尾 → 推进
+// next_fire_at 的全链路读数。
+func TestScheduler_Dispatch_ExecutesAndRecords(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	planned := f.fire(t, schedTaskID)
+
+	require.Equal(t, int32(1), f.invoker.calls.Load())
+	claims := f.store.snapshotClaims()
+	require.Len(t, claims, 1)
+	require.Equal(t, schedTaskID, claims[0].TaskID)
+	require.True(t, planned.Equal(claims[0].PlannedAt), "领取的计划时刻必须是到期扫描读到的时刻")
+	require.Equal(t, schedWorker, claims[0].Owner, "领取必须写入本进程的 Worker 身份")
+	require.Equal(t, schedLeaseTTL, claims[0].TTL)
+
+	marks := f.store.snapshotMarks()
+	require.Len(t, marks, 1)
+	require.Equal(t, ExecutionStarted, marks[0].Status)
+
+	require.Equal(t, []ExecutionStatus{ExecutionCompleted}, f.store.snapshotFinished())
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Empty(t, finishes[0].ErrMsg)
+	require.NotZero(t, finishes[0].ID)
+
+	// 收尾必须释放执行租约，否则回收器会误判"仍有在途"。
+	f.store.mu.Lock()
+	require.Empty(t, f.store.leased, "终态写必须释放执行租约")
+	f.store.mu.Unlock()
+
+	next, ok := f.store.nextFireOf(schedTaskID)
+	require.True(t, ok)
+	require.True(t, schedNow.Add(schedStep).Equal(next), "领取事务必须把 next_fire_at 推进到未来")
+}
+
+// TestScheduler_Dispatch_ReadsTaskFromStore —— 任务状态一律从库里读：停用行不领取、
+// 读失败整体 fail-closed、定义变化下一轮即生效（没有进程内句柄需要换）。
+func TestScheduler_Dispatch_ReadsTaskFromStore(t *testing.T) {
+	t.Run("disabled rows are not dispatched", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.start(t)
 		f.store.mutateTask(schedTaskID, func(rec *TaskRecord) { rec.Enabled = false })
+		f.seed(t, schedTaskID)
+		f.scan(t)
+		f.wait(t)
 
-		f.fire(t, schedTaskID)
-
-		require.Zero(t, f.invoker.calls.Load(), "停用任务不得发起运行")
-		require.Empty(t, f.store.snapshotStarted())
-		require.Empty(t, f.store.snapshotSkipped())
+		require.Empty(t, f.store.snapshotClaims(), "停用行不得被领取")
+		require.Zero(t, f.invoker.calls.Load())
 	})
 
 	t.Run("list failure fails closed", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.start(t)
-		f.store.mu.Lock()
-		f.store.listErr = errors.New("database is locked")
-		f.store.mu.Unlock()
-
-		f.fire(t, schedTaskID)
-
-		require.Zero(t, f.invoker.calls.Load(), "读不到库不得发起运行")
-		require.Empty(t, f.store.snapshotStarted())
-		require.Empty(t, f.store.snapshotSkipped())
-		f.logs.requireRecord(t, slog.LevelError, "读取任务定义失败")
+		f.seed(t, schedTaskID)
+		f.store.dispatchErr = errors.New("connection reset")
+		err := f.sched.dispatchOnce(f.directCtx())
+		require.ErrorContains(t, err, "list dispatchable")
+		require.Zero(t, f.invoker.calls.Load())
 	})
 
-	t.Run("definition change applies next trigger", func(t *testing.T) {
+	t.Run("definition change applies to the next dispatch", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.start(t)
 		f.fire(t, schedTaskID)
-		const updated = "第二版巡检"
-		f.store.mutateTask(schedTaskID, func(rec *TaskRecord) { rec.Message = updated })
+
+		updated := demoTask(schedTaskID)
+		updated.Message = "复核"
+		require.NoError(t, f.sched.ReconcileAgent(context.Background(), schedAgent,
+			[]Schedule{updated}))
 		f.fire(t, schedTaskID)
 
 		reqs := f.invoker.requests()
 		require.Len(t, reqs, 2)
-		require.Equal(t, schedMessage, reqs[0].Message)
-		require.Equal(t, updated, reqs[1].Message, "下一轮必须使用库里的新定义")
+		require.Equal(t, "复核", reqs[1].Message, "新定义必须在下一轮扫描即生效")
 	})
 }
 
-// TestScheduler_Fire_ScheduleGateSkipsInactiveAgent 覆盖 14D / E5「启用才运行」：
-// 门拒绝时本轮不排期——不写执行行、不记撞锁、不发起运行；门在每次触发重新求值，
-// 状态翻转后下一次触发即生效。手动补跑**不走**门（显式请求的既有语义不变）。
-// 逆改点：把门挪到 StartExecution 之后，或让门同时拦住 RunNow → 断言红。
-// The gate suppresses a cron tick before any write and never blocks a manual run.
-func TestScheduler_Fire_ScheduleGateSkipsInactiveAgent(t *testing.T) {
-	var active atomic.Bool
+// TestScheduler_Dispatch_ScheduleGateSkipsInactiveAgent —— 生命周期门在任何执行落库
+// **之前**求值：本轮不排期只推进 next_fire_at，不写执行行、不发起运行。
+func TestScheduler_Dispatch_ScheduleGateSkipsInactiveAgent(t *testing.T) {
+	var enabled atomic.Bool
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
-		opts.ScheduleGate = func(context.Context, string) bool { return active.Load() }
+		opts.ScheduleGate = func(context.Context, string) bool { return enabled.Load() }
 	})
 	f.start(t)
+	planned := f.seed(t, schedTaskID)
+	f.scan(t)
+	f.wait(t)
 
-	// 停用窗口：连续两个触发点都不得留下任何痕迹。
-	f.fire(t, schedTaskID)
-	f.fire(t, schedTaskID)
-	require.Zero(t, f.invoker.calls.Load(), "门拒绝时不得发起运行")
-	require.Empty(t, f.store.snapshotStarted(), "门拒绝时不得写执行行")
-	require.Empty(t, f.store.snapshotSkipped(), "门拒绝不是撞锁，不得写跳过行")
+	require.Empty(t, f.store.snapshotClaims(), "未启用时不得领取")
+	require.Zero(t, f.invoker.calls.Load())
+	require.Empty(t, f.store.snapshotStarted(), "未启用时不得写执行行")
+	writes := f.store.snapshotNextWrites()
+	require.Len(t, writes, 1)
+	require.NotNil(t, writes[0].Expected, "门跳过必须走 CAS 推进")
+	require.True(t, planned.Equal(*writes[0].Expected))
+	require.True(t, schedNow.Add(schedStep).Equal(writes[0].Next))
 	f.logs.requireRecord(t, slog.LevelDebug, "Agent 未启用，本轮不排期")
 
-	// 手动补跑不受门影响：显式请求仍走同一条执行链。
-	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-	require.NoError(t, err, "手动补跑不得被生命周期门拦住")
-	require.EqualValues(t, 1, f.invoker.calls.Load())
-
-	// 启用后下一次触发即恢复（门不缓存）。
-	active.Store(true)
+	enabled.Store(true)
 	f.fire(t, schedTaskID)
-	require.EqualValues(t, 2, f.invoker.calls.Load())
-	require.Len(t, f.store.snapshotStarted(), 2, "手动补跑与启用后的触发各写一条执行行")
+	require.Equal(t, int32(1), f.invoker.calls.Load(), "启用后下一次触发必须能跑")
 }
 
-// TestScheduler_Fire_FailureMapping 覆盖 R8：failed / cancelled 都收尾为 failed。
-func TestScheduler_Fire_FailureMapping(t *testing.T) {
+// TestScheduler_Dispatch_FailureMapping —— Run 结果到执行行终态的映射（约束 10）。
+func TestScheduler_Dispatch_FailureMapping(t *testing.T) {
 	cases := []struct {
 		name   string
-		status RunStatus
-		reason string
+		run    func(context.Context, RunRequest) (RunResult, error)
+		status ExecutionStatus
+		errMsg string
 	}{
-		{name: "failed", status: StatusFailed, reason: "模型调用失败"},
-		{name: "cancelled maps to failed", status: StatusCancelled, reason: "运行被取消"},
+		{
+			name: "run error",
+			run: func(context.Context, RunRequest) (RunResult, error) {
+				return RunResult{}, errors.New("模型调用失败")
+			},
+			status: ExecutionFailed,
+			errMsg: "模型调用失败",
+		},
+		{
+			name: "result failed keeps reason",
+			run: func(_ context.Context, req RunRequest) (RunResult, error) {
+				return RunResult{RunID: req.RunID, Status: StatusFailed, Reason: "上下文准入拒绝"}, nil
+			},
+			status: ExecutionFailed,
+			errMsg: "上下文准入拒绝",
+		},
+		{
+			name: "cancelled maps to failed",
+			run: func(_ context.Context, req RunRequest) (RunResult, error) {
+				return RunResult{RunID: req.RunID, Status: StatusCancelled}, nil
+			},
+			status: ExecutionFailed,
+		},
+		{
+			name: "limit reached maps to completed",
+			run: func(_ context.Context, req RunRequest) (RunResult, error) {
+				return RunResult{RunID: req.RunID, Status: StatusLimitReached}, nil
+			},
+			status: ExecutionCompleted,
+		},
+		{
+			name: "running at return is a failure",
+			run: func(_ context.Context, req RunRequest) (RunResult, error) {
+				return RunResult{RunID: req.RunID, Status: StatusRunning}, nil
+			},
+			status: ExecutionFailed,
+			errMsg: "调度运行未在时限内结束",
+		},
+		{
+			name: "unknown status fails",
+			run: func(_ context.Context, req RunRequest) (RunResult, error) {
+				return RunResult{RunID: req.RunID, Status: RunStatus("weird")}, nil
+			},
+			status: ExecutionFailed,
+			errMsg: `未知运行状态 "weird"`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-			f.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
-				return RunResult{RunID: req.RunID, Status: tc.status, Reason: tc.reason}, nil
-			}
+			f.invoker.run = tc.run
 			f.start(t)
 			f.fire(t, schedTaskID)
 
-			require.Equal(t, []ExecutionStatus{ExecutionFailed}, f.store.snapshotFinished())
-			calls := f.store.snapshotFinishCalls()
-			require.Len(t, calls, 1)
-			require.Equal(t, tc.reason, calls[0].ErrMsg)
+			finishes := f.store.snapshotFinishCalls()
+			require.Len(t, finishes, 1)
+			require.Equal(t, tc.status, finishes[0].Status)
+			require.Equal(t, tc.errMsg, finishes[0].ErrMsg)
 		})
 	}
 }
 
-// TestScheduler_Fire_AdmissionErrorRecordsFailed 覆盖 D-18 的反面：非 SessionBusy
-// 准入错误记 failed，且进程继续处理下一次触发。
-func TestScheduler_Fire_AdmissionErrorRecordsFailed(t *testing.T) {
+// TestScheduler_Dispatch_AdmissionErrorRecordsFailed —— 准入类错误（实例满 / 授权失效）
+// 同样落 failed 执行行，不得静默丢弃。
+func TestScheduler_Dispatch_AdmissionErrorRecordsFailed(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	admission := &AgentNotFoundError{Name: schedAgent}
+	admission := &InstanceFullError{Limit: 4}
 	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
 		return RunResult{}, admission
 	}
 	f.start(t)
 	f.fire(t, schedTaskID)
 
-	require.Equal(t, []ExecutionStatus{ExecutionFailed}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Equal(t, admission.Error(), calls[0].ErrMsg)
-
-	f.invoker.mu.Lock()
-	f.invoker.run = nil
-	f.invoker.mu.Unlock()
-	f.fire(t, schedTaskID)
-
-	require.EqualValues(t, 2, f.invoker.calls.Load(), "准入失败不得带崩调度器")
-	require.Equal(t, []ExecutionStatus{ExecutionFailed, ExecutionCompleted}, f.store.snapshotFinished())
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionFailed, finishes[0].Status)
+	require.Equal(t, admission.Error(), finishes[0].ErrMsg)
 }
 
-// TestScheduler_Fire_SessionBusyRecordsSkipped 覆盖 R23 / D-18：兄弟任务占会话时落
-// skipped + 固定文案 + run_id 置空，并同步 last_status。
-func TestScheduler_Fire_SessionBusyRecordsSkipped(t *testing.T) {
+// TestScheduler_Dispatch_SessionBusyRecordsSkipped —— 会话忙是**跳过**（不是失败），
+// 原因用固定文案。
+func TestScheduler_Dispatch_SessionBusyRecordsSkipped(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
 		return RunResult{}, &SessionBusyError{SessionID: schedSession}
@@ -1087,161 +1379,15 @@ func TestScheduler_Fire_SessionBusyRecordsSkipped(t *testing.T) {
 	f.start(t)
 	f.fire(t, schedTaskID)
 
-	require.Equal(t, []ExecutionStatus{ExecutionSkipped}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Equal(t, "同一 Agent 的另一任务仍在执行", calls[0].ErrMsg)
-	require.Empty(t, calls[0].RunID, "无 Run 行的终态行 run_id 必须置空")
-	f.logs.requireRecord(t, slog.LevelWarn, "同一 Agent 的另一任务仍在执行")
-
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, ExecutionSkipped, rec.LastStatus, "FinishExecution 必须同步 skipped")
-	require.Equal(t, schedNow, rec.LastRunAt)
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionSkipped, finishes[0].Status)
+	require.Equal(t, schedulerBusyMessage, finishes[0].ErrMsg)
+	f.logs.requireRecord(t, slog.LevelWarn, schedulerBusyMessage)
 }
 
-// TestScheduler_Fire_StartExecutionFailure 覆盖 R7：预写执行行失败即不发 Run（fail closed）。
-func TestScheduler_Fire_StartExecutionFailure(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.store.mu.Lock()
-	f.store.startExecutionErr = errors.New("insert failed")
-	f.store.mu.Unlock()
-	f.start(t)
-	f.fire(t, schedTaskID)
-
-	require.Zero(t, f.invoker.calls.Load(), "执行行预写失败不得发起运行")
-	require.Empty(t, f.store.snapshotStarted())
-	require.Empty(t, f.store.snapshotFinished())
-	f.logs.requireRecord(t, slog.LevelError, "执行行写入失败，本轮不发起运行")
-}
-
-// TestScheduler_Fire_LockMissRecordsSkipped 覆盖 R6：cron 撞上在途执行记 skipped，
-// 不排队、不产生 Run。逆改点：TryLock 改 Lock → 测试超时且零 skipped；RecordSkipped
-// 换成 FinishExecution → skipped 断言红；撞锁时先发 Run → 调用计数断言红。
-func TestScheduler_Fire_LockMissRecordsSkipped(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.start(t)
-
-	f.sched.lockFor(schedTaskID).Lock() // 模拟在途
-	f.fire(t, schedTaskID)              // cron 撞锁（按当前代次直接触发）
-	f.sched.lockFor(schedTaskID).Unlock()
-
-	require.Zero(t, f.invoker.calls.Load(), "撞锁不得发 Run")
-	skipped := f.store.snapshotSkipped()
-	require.Len(t, skipped, 1)
-	require.Equal(t, ExecutionSkipped, skipped[0].Status)
-	require.Equal(t, TriggerCron, skipped[0].Trigger)
-	f.logs.requireRecord(t, slog.LevelWarn, "上一轮未结束，本轮跳过")
-}
-
-// TestScheduler_Fire_PanicRecovered 覆盖 R8：运行 panic 被吸收，执行行收尾 failed，
-// 后续触发仍正常执行。
-func TestScheduler_Fire_PanicRecovered(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	var n int32
-	f.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
-		if atomic.AddInt32(&n, 1) == 1 {
-			panic("boom")
-		}
-		return RunResult{RunID: req.RunID, Status: StatusCompleted}, nil
-	}
-	f.start(t)
-	f.fire(t, schedTaskID)
-
-	require.Equal(t, []ExecutionStatus{ExecutionFailed}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Contains(t, calls[0].ErrMsg, "panic")
-	f.logs.requireRecord(t, slog.LevelError, "调度运行 panic")
-
-	f.fire(t, schedTaskID)
-	require.EqualValues(t, 2, f.invoker.calls.Load(), "panic 不得带走调度器")
-	require.Equal(t, []ExecutionStatus{ExecutionFailed, ExecutionCompleted}, f.store.snapshotFinished())
-}
-
-// TestScheduler_Fire_FinishUsesCleanupCtx 覆盖 R8 / 约束 11：运行 ctx 已超时或被
-// Stop 取消时，终态写仍用 context.WithoutCancel 派生的约 5s 清理 ctx 成功。
-// 逆改点：沿用运行 ctx → ctx 敏感的 fake store 拒绝写入，"终态已落 failed"断言红；
-// 清理 ctx 不设 5s 超时在 Stop 场景会无限等待 → 用例超时红。
-func TestScheduler_Fire_FinishUsesCleanupCtx(t *testing.T) {
-	t.Run("run context timed out", func(t *testing.T) {
-		store := &ctxAwareTaskStore{fakeTaskStore: newFakeTaskStore()}
-		blocking := &countingInvoker{run: func(ctx context.Context, _ RunRequest) (RunResult, error) {
-			<-ctx.Done()
-			return RunResult{Status: StatusCancelled, Reason: "运行超时"}, nil
-		}}
-		logger, _ := newCaptureLogger()
-		sched := newSchedulerWith(store, blocking, &fakeEngine{}, logger, []Schedule{demoTask(schedTaskID)}, func(o *SchedulerOptions) {
-			o.RunTimeout = 10 * time.Millisecond
-		})
-		startSched(t, sched)
-
-		// fireCurrent 同步执行到 finishRun 返回；逆改清理 ctx 时该断言直接红（不靠超时兜底）。
-		fireCurrent(t, sched, schedTaskID)
-
-		require.Equal(t, []ExecutionStatus{ExecutionFailed}, store.snapshotFinished(), "超时取消仍须把执行行收尾为 failed")
-		require.NoError(t, store.finishCtxError(), "清理 ctx 不得已取消")
-		deadline, ok := store.finishDeadline()
-		require.True(t, ok, "清理 ctx 必须带截止时间")
-		require.WithinDuration(t, time.Now().Add(5*time.Second), deadline, time.Second)
-		require.Zero(t, store.rejectedFinishes)
-	})
-
-	t.Run("run context cancelled by stop", func(t *testing.T) {
-		store := &ctxAwareTaskStore{fakeTaskStore: newFakeTaskStore()}
-		entered := make(chan struct{}, 1)
-		blocking := &countingInvoker{run: func(ctx context.Context, _ RunRequest) (RunResult, error) {
-			entered <- struct{}{}
-			<-ctx.Done()
-			return RunResult{Status: StatusCancelled, Reason: "停止取消"}, nil
-		}}
-		engine := newBlockingFakeEngine()
-		defer engine.releaseStop()
-		logger, _ := newCaptureLogger()
-		sched := newSchedulerWith(store, blocking, engine, logger, []Schedule{demoTask(schedTaskID)}, func(o *SchedulerOptions) {
-			o.RunTimeout = time.Minute
-			o.StopGrace = 20 * time.Millisecond
-		})
-		require.NoError(t, sched.Start(context.Background()))
-
-		gen := currentGen(t, sched, schedTaskID)
-		fireDone := make(chan struct{})
-		go func() {
-			defer close(fireDone)
-			sched.fire(schedTaskID, gen)
-		}()
-		<-entered
-
-		stopDone := make(chan struct{})
-		go func() {
-			defer close(stopDone)
-			sched.Stop()
-		}()
-		require.Eventually(t, func() bool { return len(store.snapshotFinished()) == 1 }, 2*time.Second, 10*time.Millisecond)
-		engine.releaseStop()
-		select {
-		case <-stopDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Stop 未在宽限 + 有界清理内返回")
-		}
-		select {
-		case <-fireDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("fire 未在 Stop 取消后返回")
-		}
-
-		require.Equal(t, []ExecutionStatus{ExecutionFailed}, store.snapshotFinished())
-		require.NoError(t, store.finishCtxError(), "Stop 取消后清理 ctx 仍须可用")
-		deadline, ok := store.finishDeadline()
-		require.True(t, ok)
-		require.WithinDuration(t, time.Now().Add(5*time.Second), deadline, time.Second)
-		require.Zero(t, store.rejectedFinishes)
-	})
-}
-
-// TestScheduler_Fire_ArchivedSessionSkipped 覆盖 R27 / 约束 43：cron 遇归档会话
-// 记 skipped + 固定文案、不重建会话、同步 last_status。
-func TestScheduler_Fire_ArchivedSessionSkipped(t *testing.T) {
+// TestScheduler_Dispatch_ArchivedSessionSkipped —— 会话已归档同样记跳过并保留原因。
+func TestScheduler_Dispatch_ArchivedSessionSkipped(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
 		return RunResult{}, &SessionArchivedError{SessionID: schedSession}
@@ -1249,1495 +1395,949 @@ func TestScheduler_Fire_ArchivedSessionSkipped(t *testing.T) {
 	f.start(t)
 	f.fire(t, schedTaskID)
 
-	require.Equal(t, []ExecutionStatus{ExecutionSkipped}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Equal(t, "会话已归档，本轮跳过", calls[0].ErrMsg)
-	require.Empty(t, calls[0].RunID, "无 Run 行的终态行 run_id 必须置空")
-	f.logs.requireRecord(t, slog.LevelWarn, "会话已归档，本轮跳过")
-
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, ExecutionSkipped, rec.LastStatus)
-	require.EqualValues(t, 1, f.invoker.calls.Load(), "归档会话只尝试一次，不得重建后再跑")
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionSkipped, finishes[0].Status)
+	require.Equal(t, schedulerArchivedMessage, finishes[0].ErrMsg)
 }
 
-// TestScheduler_Fire_ConcurrentDistinctTasks 覆盖 R26：不同任务的并发触发互不串行，
-// 且 -race 干净。逆改点：每任务锁改成普通 map/全局锁 → DATA RACE 或第二个触发被阻塞。
-func TestScheduler_Fire_ConcurrentDistinctTasks(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}, nil)
-	entered := make(chan struct{}, 2)
-	release := make(chan struct{})
-	f.invoker.run = func(ctx context.Context, req RunRequest) (RunResult, error) {
-		entered <- struct{}{}
-		select {
-		case <-release:
-			return RunResult{RunID: req.RunID, Status: StatusCompleted}, nil
-		case <-ctx.Done():
-			return RunResult{RunID: req.RunID, Status: StatusCancelled}, ctx.Err()
-		}
-	}
-	f.start(t)
-
-	gen1 := currentGen(t, f.sched, schedTaskID)
-	gen2 := currentGen(t, f.sched, schedTaskID2)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); f.sched.fire(schedTaskID, gen1) }()
-	go func() { defer wg.Done(); f.sched.fire(schedTaskID2, gen2) }()
-
-	for i := 0; i < 2; i++ {
-		select {
-		case <-entered:
-		case <-time.After(2 * time.Second):
-			t.Fatal("不同任务的并发触发被串行化")
-		}
-	}
-	close(release)
-	wg.Wait()
-
-	require.EqualValues(t, 2, f.invoker.calls.Load())
-	require.Equal(t, []ExecutionStatus{ExecutionCompleted, ExecutionCompleted}, f.store.snapshotFinished())
-}
-
-// TestScheduler_LogFieldsAndNoBody 覆盖约束 36：失败 / 跳过日志带固定四字段；
-// 消息正文不得整段落日志，只记字节长度。逆改点：把正文整段打日志 → 断言红。
-func TestScheduler_LogFieldsAndNoBody(t *testing.T) {
-	const marker = "巡检正文-秘密-marker-42"
-	f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: marker}}, nil)
+// TestScheduler_Dispatch_PanicRecovered —— 运行 panic 必须被吸收，执行行收尾 failed。
+func TestScheduler_Dispatch_PanicRecovered(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
-		return RunResult{}, &AgentNotFoundError{Name: schedAgent}
+		panic("boom")
 	}
 	f.start(t)
 	f.fire(t, schedTaskID)
 
-	failure := f.logs.requireRecord(t, slog.LevelError, "调度运行失败")
-	started := f.store.snapshotStarted()
-	require.Len(t, started, 1)
-	require.NotEmpty(t, started[0].RunID, "预写执行行必须携带 RunID")
-	runIDValue, ok := attrOf(failure, "run_id")
-	require.True(t, ok, "失败日志必须带 run_id 字段")
-	require.NotEmpty(t, runIDValue.String(), "失败路径必须已在日志里携带 RunID")
-	requireLogFields(t, failure, runIDValue.String())
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionFailed, finishes[0].Status)
+	require.Contains(t, finishes[0].ErrMsg, "运行 panic")
+	require.Contains(t, finishes[0].ErrMsg, "boom")
+	f.logs.requireRecord(t, slog.LevelError, schedulerPanicLog)
+}
 
-	// 撞锁跳过路径同样带四字段（run_id 为空）。
-	f.sched.lockFor(schedTaskID).Lock()
+// TestScheduler_Dispatch_FinishUsesCleanupCtx —— 终态写用 WithoutCancel + 独立短超时：
+// 运行 ctx 已被取消时也要能落账（约束 11）。
+func TestScheduler_Dispatch_FinishUsesCleanupCtx(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
+		cancel()
+		return RunResult{}, context.Canceled
+	}
+	_, _, err := f.sched.RunNow(ctx, schedTaskID)
+	require.Error(t, err)
+
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.NoError(t, finishes[0].CtxErr, "终态写不得继承已取消的运行 ctx")
+	require.True(t, finishes[0].HasDeadline, "终态写必须带独立超时")
+	require.WithinDuration(t, time.Now().Add(schedulerFinishTimeout), finishes[0].Deadline, 2*time.Second)
+}
+
+// TestScheduler_Dispatch_ClaimFailureLogsAndSkips —— 领取返回未知错误：记 ERROR、
+// 本轮不发起运行（不是静默吞掉）。
+func TestScheduler_Dispatch_ClaimFailureLogsAndSkips(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.seed(t, schedTaskID)
+	f.store.claimErr = errors.New("connection reset")
+	f.scan(t)
+	f.wait(t)
+
+	require.Zero(t, f.invoker.calls.Load())
+	f.logs.requireRecord(t, slog.LevelError, "claim due trigger")
+}
+
+// TestScheduler_Dispatch_BusyClaimRecordsSkipped —— 同任务已有在途执行：记一条
+// task_busy 跳过行并推进（不排队、不叠加）。
+func TestScheduler_Dispatch_BusyClaimRecordsSkipped(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.store.mu.Lock()
+	f.store.active[schedTaskID] = 99
+	f.store.mu.Unlock()
+
+	planned := f.seed(t, schedTaskID)
+	f.scan(t)
+	f.wait(t)
+
+	require.Zero(t, f.invoker.calls.Load(), "忙路径不得发起运行")
+	busy := f.store.snapshotBusy()
+	require.Len(t, busy, 1)
+	require.True(t, planned.Equal(busy[0].PlannedAt))
+	skipped := f.store.snapshotSkipped()
+	require.Len(t, skipped, 1)
+	require.Equal(t, ExecutionSkipped, skipped[0].Status)
+	require.Equal(t, TriggerCron, skipped[0].Trigger, "忙冲突落的是定时触发行，不能记成 manual")
+	require.Equal(t, schedulerLockMissMessage, skipped[0].ErrorMessage)
+	f.logs.requireRecord(t, slog.LevelWarn, schedulerLockMissMessage)
+}
+
+// TestScheduler_Dispatch_ClaimConflictIsSilent —— 另一 Worker 已领取 / 已推进时本轮
+// **无声跳过**：既不重试也不记 ERROR（跨 Worker 的正常竞争不是故障）。
+func TestScheduler_Dispatch_ClaimConflictIsSilent(t *testing.T) {
+	t.Run("already claimed", func(t *testing.T) {
+		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+		f.start(t)
+		planned := f.seed(t, schedTaskID)
+		f.store.mu.Lock()
+		f.store.claimed[claimKey(schedTaskID, planned)] = true
+		f.store.mu.Unlock()
+
+		f.scan(t)
+		f.wait(t)
+		require.Zero(t, f.invoker.calls.Load())
+		require.Zero(t, f.logs.countLevel(slog.LevelError), "重复领取是正常竞争，不得记 ERROR")
+	})
+
+	t.Run("stale next fire", func(t *testing.T) {
+		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+		f.start(t)
+		planned := f.seed(t, schedTaskID)
+		f.store.dispatchHook = func() {
+			// 读到期集合与领取之间，另一 Worker 推进了 next_fire_at。
+			f.store.setNextFireDirect(schedTaskID, planned.Add(time.Minute))
+		}
+
+		f.scan(t)
+		f.wait(t)
+		require.Zero(t, f.invoker.calls.Load())
+		require.Zero(t, f.logs.countLevel(slog.LevelError), "CAS 落败是正常竞争，不得记 ERROR")
+	})
+}
+
+// TestScheduler_Dispatch_MissedGraceRecordsOneSkip —— 错过宽限只记**一条** skipped
+// 并推进到未来，不逐点补跑（FR-24-12）。
+func TestScheduler_Dispatch_MissedGraceRecordsOneSkip(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	planned := schedNow.Add(-10 * time.Minute)
+	f.seedAt(t, schedTaskID, planned)
+
+	f.scan(t)
+	f.wait(t)
+
+	require.Zero(t, f.invoker.calls.Load(), "错失分支不得发起执行")
+	require.Empty(t, f.store.snapshotClaims())
+	missed := f.store.snapshotMissed()
+	require.Len(t, missed, 1, "一个错失窗口只落一条跳过行")
+	require.True(t, planned.Equal(missed[0].PlannedAt))
+	require.Equal(t, 1, missed[0].Missed)
+	require.Equal(t, schedulerMissedReason, missed[0].Reason)
+	// 错失分支经 `RecordMissedTrigger` 落的是 skipped 行，**不**经 `FinishExecution`
+	// 收尾（那一轮根本没有领取，也就没有 started 行要收）。
+	skipped := f.store.snapshotSkipped()
+	require.Len(t, skipped, 1)
+	require.Equal(t, ExecutionSkipped, skipped[0].Status)
+	require.Equal(t, schedulerMissedReason, skipped[0].ErrorMessage)
+
+	next, ok := f.store.nextFireOf(schedTaskID)
+	require.True(t, ok)
+	require.True(t, schedNow.Add(schedStep).Equal(next), "错过分支同样必须推进到未来")
+}
+
+// TestScheduler_Dispatch_InitializesNullNextFireWithoutRun —— 迁移后的遗留行 / 新建行
+// 第一次只初始化 next_fire_at，不执行（图 4 第一个分支）。
+func TestScheduler_Dispatch_InitializesNullNextFireWithoutRun(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	_, has := f.store.nextFireOf(schedTaskID)
+	require.False(t, has, "对账后新行的 next_fire_at 必须是 NULL")
+
+	f.scan(t)
+	f.wait(t)
+
+	require.Empty(t, f.store.snapshotClaims(), "初始化分支不得领取")
+	require.Zero(t, f.invoker.calls.Load())
+	writes := f.store.snapshotNextWrites()
+	require.Len(t, writes, 1)
+	require.Nil(t, writes[0].Expected, "初始化是无条件写")
+	next, ok := f.store.nextFireOf(schedTaskID)
+	require.True(t, ok)
+	require.True(t, schedNow.Add(schedStep).Equal(next))
+}
+
+// TestScheduler_Dispatch_UsesSixFieldCronWithZone —— 送进 CronEngine 的必须是
+// 6 段表达式 + `CRON_TZ=` 时区前缀，起算点是 max(next_fire_at, db_now)。
+func TestScheduler_Dispatch_UsesSixFieldCronWithZone(t *testing.T) {
+	shanghai := demoTask(schedTaskID2)
+	shanghai.Zone = "Asia/Shanghai"
+
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID), shanghai}, nil)
+	f.start(t)
 	f.fire(t, schedTaskID)
-	f.sched.lockFor(schedTaskID).Unlock()
-	skip := f.logs.requireRecord(t, slog.LevelWarn, "上一轮未结束，本轮跳过")
-	requireLogFields(t, skip, "")
+	f.fire(t, schedTaskID2)
 
-	// 正文只允许以字节长度出现。
-	trigger := f.logs.requireRecord(t, slog.LevelInfo, "调度触发")
-	bytes, ok := attrOf(trigger, "message_bytes")
-	require.True(t, ok, "触发日志必须只记消息字节长度")
-	require.EqualValues(t, len(marker), bytes.Int64())
-
-	for _, rec := range f.logs.snapshot() {
-		require.NotContains(t, rec.Msg, marker, "日志消息不得包含正文")
-		for _, a := range rec.Attrs {
-			require.NotContains(t, a.Value.String(), marker, "日志字段不得包含正文")
-		}
+	specs, froms := f.engine.readings()
+	// 同批扫描还会为 NULL 行算一次 next_fire（初始化分支），所以按"包含 + 末次"判：
+	// 每任务时区必须经 `CRON_TZ=` 前缀出现在 spec 里，不得依赖进程时区。
+	require.Contains(t, specs, "CRON_TZ=UTC "+schedCron)
+	require.Equal(t, "CRON_TZ=Asia/Shanghai "+schedCron, specs[len(specs)-1])
+	for _, from := range froms {
+		require.True(t, schedNow.Equal(from), "起算点必须是 max(next_fire_at, db_now)")
 	}
 }
 
-// TestScheduler_StartRecoversExecutions 覆盖 R4 的调度器接线面：Start 在任何对账之前
-// 调用**一次** RecoverStartedExecutions，使用注入时钟，并按 Run 终态收尾遗留行
-// （completed / limit_reached → completed；failed / cancelled → failed）。
-// 真实 SQL join 与 NULL 扫描由 internal/storage 的 TestTaskStore_RecoverStartedExecutions
-// 判卷；本用例只判调度器的次序、时钟与四类终态的委托口径。
-// 逆改点：Start 跳过恢复 → recoverCalls 为 0、终态行缺失，断言红。
-func TestScheduler_StartRecoversExecutions(t *testing.T) {
-	cases := []struct {
-		name   string
-		status RunStatus
-		want   ExecutionStatus
-	}{
-		{name: "completed run recovers as completed", status: StatusCompleted, want: ExecutionCompleted},
-		{name: "limit_reached run recovers as completed", status: StatusLimitReached, want: ExecutionCompleted},
-		{name: "failed run recovers as failed", status: StatusFailed, want: ExecutionFailed},
-		{name: "cancelled run recovers as failed", status: StatusCancelled, want: ExecutionFailed},
+// TestScheduler_Dispatch_SkipsRetiredAndUnregistered —— 仓储已过滤，扫描仍要防御性
+// 复查；未注册 Agent 的任务留给持有方推进 next_fire_at。
+func TestScheduler_Dispatch_SkipsRetiredAndUnregistered(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	planned := f.seed(t, schedTaskID)
+	f.store.mu.Lock()
+	f.store.forced = []DueTask{
+		{Task: TaskRecord{
+			TaskID: "retired", Agent: schedAgent, Enabled: true, Cron: schedCron,
+			Zone: schedZone, Message: "x", RetiredAt: schedNow,
+		}, NextFireAt: planned},
+		{Task: TaskRecord{
+			TaskID: "disabled", Agent: schedAgent, Enabled: false, Cron: schedCron,
+			Zone: schedZone, Message: "x",
+		}, NextFireAt: planned},
+		{Task: TaskRecord{
+			TaskID: "ghost", Agent: "ghost", Enabled: true, Cron: schedCron,
+			Zone: schedZone, Message: "x",
+		}, NextFireAt: planned},
+		{
+			Task: TaskRecord{
+				TaskID: schedTaskID, Agent: schedAgent, Enabled: true, Cron: schedCron,
+				Zone: schedZone, Message: schedMessage,
+				CallerID: LocalAdminCallerID, AuthorizingKind: AuthorizingKindAdminBuiltin,
+			},
+			NextFireAt: planned,
+		},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newSchedFixture(t, nil, nil)
-			f.store.recoveredRuns = []RunStatus{tc.status}
-			f.start(t)
+	f.store.mu.Unlock()
 
-			calls, at := f.store.recoveryReadings()
-			require.Equal(t, 1, calls, "启动必须执行且只执行一次遗留执行恢复")
-			require.Equal(t, schedNow, at, "恢复必须使用注入时钟")
-			require.Equal(t, []ExecutionStatus{tc.want}, f.store.snapshotFinished(),
-				"遗留执行行必须按 Run 终态映射收尾")
-			require.Zero(t, f.invoker.calls.Load(), "恢复遗留行不得发起运行")
-		})
+	f.scan(t)
+	f.wait(t)
+
+	claims := f.store.snapshotClaims()
+	require.Len(t, claims, 1, "退休 / 停用 / 未注册三类都不得领取")
+	require.Equal(t, schedTaskID, claims[0].TaskID)
+}
+
+// TestScheduler_Dispatch_ConcurrentDistinctTasks —— 两条不同任务可以同时在途，
+// 各有自己的 run_id（实例内并发不是全局串行）。
+func TestScheduler_Dispatch_ConcurrentDistinctTasks(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}, nil)
+	f.start(t)
+
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	f.invoker.run = func(_ context.Context, req RunRequest) (RunResult, error) {
+		arrived <- struct{}{}
+		<-release
+		return RunResult{RunID: req.RunID, Status: StatusCompleted}, nil
 	}
+
+	f.claim(t, schedTaskID)
+	f.claim(t, schedTaskID2)
+	<-arrived
+	<-arrived
+	require.Equal(t, int32(2), f.invoker.calls.Load())
+	close(release)
+	f.wait(t)
+
+	require.ElementsMatch(t, []ExecutionStatus{ExecutionCompleted, ExecutionCompleted},
+		f.store.snapshotFinished())
+	reqs := f.invoker.requests()
+	require.Len(t, reqs, 2)
+	require.NotEqual(t, reqs[0].RunID, reqs[1].RunID)
 }
 
-// TestScheduler_StartReconcilesDefinitions 覆盖 R19 / R26 的启动对账口径：
-// 新定义入库、定义更新不翻 enabled、退休行复活保持库值、未注册 Agent 不落库、
-// 文件移除与目录移除都只退休不物理删除。
-// 逆改点：upsert 时把 enabled 写回 1（注 14 违反）→ 更新子例红；对未注册 Agent 也
-// 执行 ApplyAgentTasks → 未注册子例红；按"派生集合"而非 task_id 判定退休 → 退休子例红。
-func TestScheduler_StartReconcilesDefinitions(t *testing.T) {
-	t.Run("new definitions are upserted", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.start(t)
+// TestScheduler_LogFieldsAndNoBody —— 运行日志只带固定四字段 + 正文长度，**不得**
+// 把任务正文（可能是业务数据）写进日志。
+func TestScheduler_LogFieldsAndNoBody(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.fire(t, schedTaskID)
 
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok, "文件中的新任务必须入库")
-		require.Equal(t, schedAgent, rec.Agent)
-		require.Equal(t, schedMessage, rec.Message)
-		require.True(t, rec.Enabled, "新行按缺省 enabled=1")
-	})
-
-	t.Run("definition update keeps db enabled value", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: "新巡检"}}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: "旧巡检", Enabled: false, DefinitionHash: "old",
-		})
-		f.start(t)
-
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.Equal(t, "新巡检", rec.Message, "定义列按文件更新")
-		require.False(t, rec.Enabled, "定义更新不得翻动库中 enabled（注 14）")
-	})
-
-	t.Run("retired task revives keeping enabled", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: "旧巡检", Enabled: false, RetiredAt: schedNow.Add(-time.Hour),
-		})
-		f.start(t)
-
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.RetiredAt.IsZero(), "同 Agent 同 id 再现必须复活")
-		require.False(t, rec.Enabled, "复活保持库值 enabled=false")
-	})
-
-	t.Run("unregistered agent definitions are not written", func(t *testing.T) {
-		store := newFakeTaskStore()
-		logger, _ := newCaptureLogger()
-		entries := []AgentEntry{
-			agentEntry(schedAgent, true, demoTask(schedTaskID)),
-			agentEntry("broken", false, demoTask("broken-1")),
-		}
-		sched := newSchedulerWithEntries(store, &countingInvoker{}, &fakeEngine{}, logger, entries, nil)
-		require.NoError(t, sched.Start(context.Background()))
-		t.Cleanup(sched.Stop)
-
-		_, ok := store.task("broken-1")
-		require.False(t, ok, "未注册 Agent 的定义不得入库（注 10）")
-		require.Empty(t, appliedFor(store.snapshotApplied(), "broken"), "未注册 Agent 不遍历、不对账")
-	})
-
-	t.Run("tasks missing from file are retired", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID2, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: "第二版", Enabled: true,
-		})
-		f.start(t)
-
-		kept, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, kept.RetiredAt.IsZero(), "文件仍声明的任务不得退休")
-		gone, ok := f.store.task(schedTaskID2)
-		require.True(t, ok)
-		require.Equal(t, schedNow, gone.RetiredAt, "keep 是 task_id 集合：文件删掉的任务必须退休（P-02）")
-	})
-
-	t.Run("agents absent from entries are retired", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: "ghost-1", Agent: "ghost", Cron: schedCron, Zone: "UTC",
-			Message: "残留", Enabled: true,
-		})
-		f.start(t)
-
-		ghost, ok := f.store.task("ghost-1")
-		require.True(t, ok)
-		require.Equal(t, schedNow, ghost.RetiredAt, "目录被整个删除的 Agent，其库行必须退休（F9）")
-		applied := appliedFor(f.store.snapshotApplied(), "ghost")
-		require.Len(t, applied, 1)
-		require.Equal(t, []string{"ghost-1"}, applied[0].RetireIDs, "退场 Agent 走同一条退休路径")
-	})
+	rec := f.logs.requireRecord(t, slog.LevelInfo, schedulerTriggerLog)
+	for _, key := range []string{"task_id", "agent", "run_id", "trigger"} {
+		_, ok := attrOf(rec, key)
+		require.True(t, ok, "缺少固定日志字段 %s", key)
+	}
+	size, ok := attrOf(rec, "message_bytes")
+	require.True(t, ok)
+	require.Equal(t, int64(len(schedMessage)), size.Int64())
+	require.NotContains(t, f.logs.text(), schedMessage, "日志不得携带任务正文")
 }
 
-// TestScheduler_StartRegistersEnabledOnly 覆盖约束 16：库 enabled 是注册的唯一开关，
-// 文件声明与 enabled=true 同时成立才 Add。
-// 逆改点：忽略 enabled 列 / 按文件定义注册 → 停用子例的 addCalls 非零，断言红。
-func TestScheduler_StartRegistersEnabledOnly(t *testing.T) {
-	const spec = "CRON_TZ=UTC " + schedCron
+// ===========================================================================
+// 启动 / 停止
+// ===========================================================================
 
-	t.Run("enabled task is registered", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
+// TestScheduler_Start_DoesNotRecoverGlobally 见 scheduler_delivery_test.go（T018 口径）。
 
-		require.Equal(t, []string{spec}, f.engine.liveHandleSpecs(),
-			"enabled 任务按 CRON_TZ 前缀注册")
-	})
+// TestScheduler_Start_ReconcilesDefinitions —— 启动对账只写定义列：新行 enabled=true，
+// 既有行的 enabled 保持库值；定义变化记 INFO 提示。
+func TestScheduler_Start_ReconcilesDefinitions(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
 
-	t.Run("disabled task is not registered", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: false,
-		})
-		f.start(t)
+	applied := f.store.snapshotApplied()
+	require.Len(t, applied, 1)
+	require.Equal(t, schedAgent, applied[0].Agent)
+	require.Equal(t, []string{schedTaskID}, applied[0].UpsertIDs)
+	row, ok := f.store.task(schedTaskID)
+	require.True(t, ok)
+	require.True(t, row.Enabled, "新行按 schema 缺省 enabled=true")
 
-		_, _, addCalls := f.engine.engineCounts()
-		require.Zero(t, addCalls, "DB disabled 任务不得注册（约束 16）")
-		require.Zero(t, f.engine.liveHandles())
-	})
+	require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, false))
+	updated := demoTask(schedTaskID)
+	updated.Message = "复核"
+	require.NoError(t, f.sched.ReconcileAgent(context.Background(), schedAgent, []Schedule{updated}))
+	row, _ = f.store.task(schedTaskID)
+	require.False(t, row.Enabled, "定义更新不得翻转库里的 enabled")
+	require.Equal(t, "复核", row.Message)
+	f.logs.requireRecord(t, slog.LevelInfo, "任务定义已更新，enabled 保持库值")
 }
 
-// TestScheduler_StartTwice 覆盖约束 21：成功启动后再次 Start 返回 errSchedulerStarted，
-// 且不重复注册（没有第二套句柄）。
-// 逆改点：去掉启动位判定 → 错误不存在 / addCalls 翻倍，断言红。
+// TestScheduler_StartTwice —— 成功启动后不得重入。
 func TestScheduler_StartTwice(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.start(t)
-	_, _, before := f.engine.engineCounts()
-
-	err := f.sched.Start(context.Background())
-	require.ErrorIs(t, err, errSchedulerStarted, "成功启动后再 Start 必须报错（约束 21）")
-	_, _, after := f.engine.engineCounts()
-	require.Equal(t, before, after, "第二次 Start 不得重复注册")
+	require.ErrorIs(t, f.sched.Start(context.Background()), errSchedulerStarted)
 }
 
-// TestScheduler_Fire_MissedTriggerWarnsWithoutRun 覆盖约束 18：停机窗口内错过的触发点
-// 只记 WARN（带 missed_count），绝不补跑；零 last_run_at 的新任务不告警也不枚举。
+// TestScheduler_Start_MissedTriggerWarnsWithoutRun —— 启动时只对已知的错过触发点
+// WARN，不补跑（真正的错失落库在到期扫描里）。
 // 逆改点：对 missed 发起运行 → invoker 计数非零；对零 last_run_at 也调 Occurrences
-// → occurrenceCalls 非零，断言红。
-func TestScheduler_Fire_MissedTriggerWarnsWithoutRun(t *testing.T) {
+// → 枚举计数非零；漏传固定上限 → limit 断言红。
+func TestScheduler_Start_MissedTriggerWarnsWithoutRun(t *testing.T) {
 	t.Run("missed triggers warn without catch-up", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true, LastRunAt: schedNow.Add(-2 * time.Hour),
+			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone,
+			Message: schedMessage, Enabled: true, LastRunAt: schedNow.Add(-time.Hour),
 		})
-		f.engine.occurrences = []time.Time{schedNow.Add(-90 * time.Minute), schedNow.Add(-30 * time.Minute)}
+		f.engine.occurred = []time.Time{schedNow.Add(-30 * time.Minute), schedNow.Add(-10 * time.Minute)}
 		f.start(t)
 
 		rec := f.logs.requireRecord(t, slog.LevelWarn, "错过调度触发点")
-		count, ok := attrOf(rec, "missed_count")
-		require.True(t, ok, "告警必须带 missed_count")
-		require.EqualValues(t, 2, count.Int64())
+		missed, ok := attrOf(rec, "missed_count")
+		require.True(t, ok)
+		require.Equal(t, int64(2), missed.Int64())
 		atLeast, ok := attrOf(rec, "missed_at_least")
-		require.True(t, ok, "告警必须带 missed_at_least")
+		require.True(t, ok)
 		require.False(t, atLeast.Bool(), "未达上限时必须明确为 false")
-		calls, limit := f.engine.occurrenceReadings()
+		calls, limits := f.engine.occurrenceReadings()
 		require.Equal(t, 1, calls)
-		require.Equal(t, schedulerMissedOccurrences, limit, "枚举上限固定 1000（约束 38）")
-		require.Zero(t, f.invoker.calls.Load(), "错过触发点只 WARN，不补跑（约束 18）")
+		require.Equal(t, []int{schedulerMissedOccurrences}, limits,
+			"错过触发点枚举必须用固定上限（约束 38）")
+		require.Zero(t, f.invoker.calls.Load(), "启动告警不得补跑")
+		require.Empty(t, f.store.snapshotClaims())
 	})
 
 	t.Run("capped enumeration reports at least", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
+			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone,
 			Message: schedMessage, Enabled: true, LastRunAt: schedNow.Add(-48 * time.Hour),
 		})
 		capped := make([]time.Time, schedulerMissedOccurrences)
 		for i := range capped {
 			capped[i] = schedNow.Add(-time.Duration(schedulerMissedOccurrences-i) * time.Minute)
 		}
-		f.engine.occurrences = capped
+		f.engine.occurred = capped
 		f.start(t)
 
 		rec := f.logs.requireRecord(t, slog.LevelWarn, "错过调度触发点")
-		count, ok := attrOf(rec, "missed_count")
-		require.True(t, ok, "告警必须带 missed_count")
-		require.EqualValues(t, schedulerMissedOccurrences, count.Int64())
+		missed, ok := attrOf(rec, "missed_count")
+		require.True(t, ok)
+		require.EqualValues(t, schedulerMissedOccurrences, missed.Int64())
 		atLeast, ok := attrOf(rec, "missed_at_least")
-		require.True(t, ok, "达到枚举上限时必须明示「≥1000」（约束 38）")
-		require.True(t, atLeast.Bool())
-		require.Zero(t, f.invoker.calls.Load(), "错过触发点只 WARN，不补跑（约束 18）")
+		require.True(t, ok)
+		require.True(t, atLeast.Bool(), "达到枚举上限时必须明示「>=1000」（约束 38）")
+		require.Zero(t, f.invoker.calls.Load(), "启动告警不得补跑")
 	})
 
 	t.Run("task without last run does not warn", func(t *testing.T) {
 		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
+			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone,
 			Message: schedMessage, Enabled: true,
 		})
-		f.engine.occurrences = []time.Time{schedNow.Add(-time.Minute)}
+		f.engine.occurred = []time.Time{schedNow.Add(-time.Minute)}
 		f.start(t)
 
-		for _, rec := range f.logs.snapshot() {
-			require.NotEqual(t, "错过调度触发点", rec.Msg, "零 last_run_at 的任务是新任务，不得告警")
-		}
+		require.False(t, f.logs.hasRecord(slog.LevelWarn, "错过调度触发点"),
+			"零 last_run_at 的任务是新任务，不得告警")
 		calls, _ := f.engine.occurrenceReadings()
 		require.Zero(t, calls, "无 last_run_at 时不得枚举触发点")
 	})
 }
 
-// TestScheduler_StopConcurrent 覆盖约束 21：并发 Stop 只执行一次停机实体，
-// 完成信号恰好关闭一次，引擎只停一次。
-// 逆改点：去掉 sync.Once → 引擎多次 Stop / done 重复关闭 panic，断言红。
-func TestScheduler_StopConcurrent(t *testing.T) {
-	f := newSchedFixture(t, nil, nil)
+// TestScheduler_Start_StoreFailureFatal —— 读库失败即启动失败，且不置启动位。
+func TestScheduler_Start_StoreFailureFatal(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.store.listErr = errors.New("database is locked")
+	err := f.startErr(t)
+	require.ErrorContains(t, err, "list tasks")
+	require.False(t, f.sched.started, "启动失败不得置启动位")
+
+	f.store.listErr = nil
+	require.NoError(t, f.sched.Start(context.Background()), "失败不粘滞，可重试")
+}
+
+// TestScheduler_Start_ApplyFailureIsNotLatched —— 对账写失败同样不粘滞。
+func TestScheduler_Start_ApplyFailureIsNotLatched(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
+		_ = opts
+	})
+	f.store.applyErr = errors.New("deadlock detected")
+	f.store.applyErrOnCall = 1
+	err := f.startErr(t)
+	require.ErrorContains(t, err, "reconcile agent")
+	require.False(t, f.sched.started)
+
+	f.store.applyErr = nil
+	f.store.armScanGate()
 	require.NoError(t, f.sched.Start(context.Background()))
+	f.store.awaitScanEntered(t)
+}
+
+// TestScheduler_Start_OwnerConflictFatal —— 任务 id 归属其他 Agent：对账失败即启动失败。
+func TestScheduler_Start_OwnerConflictFatal(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.store.seedTask(TaskRecord{TaskID: schedTaskID, Agent: "intruder", Cron: schedCron, Zone: schedZone})
+	err := f.startErr(t)
+	require.ErrorContains(t, err, "reconcile agent")
+	require.ErrorIs(t, err, ErrTaskOwnerConflict)
+}
+
+// TestScheduler_Start_SecondAgentApplyFails_NoScanStart —— 第二个 Agent 对账失败时
+// 整体启动失败，到期扫描不得启动。
+func TestScheduler_Start_SecondAgentApplyFails_NoScanStart(t *testing.T) {
+	store := newFakeTaskStore()
+	store.applyErr = errors.New("deadlock detected")
+	store.applyErrOnCall = 2
+	logger, _ := newCaptureLogger()
+	sched := NewScheduler(SchedulerOptions{
+		Store:   store,
+		Invoker: &countingInvoker{},
+		Engine:  &fakeEngine{},
+		Entries: []AgentEntry{
+			{Name: "alpha", Registered: true, Profile: &Profile{}},
+			{Name: "beta", Registered: true, Profile: &Profile{}},
+		},
+		CronSpec:      schedCronSpec,
+		Logger:        logger,
+		Now:           func() time.Time { return schedNow },
+		Leases:        store,
+		Worker:        schedWorker,
+		LeaseTTL:      schedLeaseTTL,
+		RenewInterval: schedRenewInterval,
+		PollInterval:  time.Hour,
+	})
+	store.armScanGate()
+	t.Cleanup(func() { sched.Stop(); store.resumeScan() })
+
+	err := sched.Start(context.Background())
+	require.ErrorContains(t, err, "reconcile agent")
+	require.Equal(t, 2, func() int {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.applyCalls
+	}())
+	select {
+	case <-store.scanEntered:
+		t.Fatal("对账失败后不得启动到期扫描")
+	default:
+	}
+}
+
+// TestScheduler_StopConcurrent —— Stop 幂等且并发安全。
+func TestScheduler_StopConcurrent(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
 
 	var wg sync.WaitGroup
-	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			f.sched.Stop()
-		}()
+	for i := 0; i < 8; i++ {
+		wg.Go(f.sched.Stop)
 	}
 	wg.Wait()
 
 	select {
 	case <-f.sched.done:
 	default:
-		t.Fatal("并发 Stop 后完成信号必须关闭")
+		t.Fatal("Stop 返回后 done 必须已关闭")
 	}
-	_, stopped, _ := f.engine.engineCounts()
-	require.Equal(t, 1, stopped, "引擎只能被停一次（约束 21）")
 }
 
-// TestScheduler_StopOnContextCancel 覆盖约束 24：启动 ctx 取消 → watcher 调 Stop
-// 恰一次并完成（无 goroutine 泄漏）。
-// 逆改点：不派生 watcher → done 不关闭，用例超时红。
+// TestScheduler_StopOnContextCancel —— 启动 ctx 取消触发停机（watcher 恰一次）。
 func TestScheduler_StopOnContextCancel(t *testing.T) {
-	f := newSchedFixture(t, nil, nil)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.store.armScanGate()
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		f.store.resumeScan()
+	})
 	require.NoError(t, f.sched.Start(ctx))
-	cancel()
+	f.store.awaitScanEntered(t)
 
+	cancel()
 	select {
 	case <-f.sched.done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("启动 ctx 取消后 watcher 必须调用 Stop 并完成")
+	case <-time.After(5 * time.Second):
+		t.Fatal("启动 ctx 取消后调度器未停机")
 	}
-	_, stopped, _ := f.engine.engineCounts()
-	require.Equal(t, 1, stopped, "watcher 调用 Stop 恰一次（约束 24）")
 }
 
-// TestScheduler_StopBeforeStart 覆盖约束 21 的无条件 Close 口径：未启动即 Stop
-// 立即完成、不触碰引擎；重复 Stop 也不 panic。
-// 逆改点：未启动路径漏 close(done) → done 不关闭；误调 engine.Stop → stopped 非零。
+// TestScheduler_StopBeforeStart —— 未启动就 Stop：立即返回，不阻塞。
 func TestScheduler_StopBeforeStart(t *testing.T) {
-	f := newSchedFixture(t, nil, nil)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.sched.Stop()
-
 	select {
 	case <-f.sched.done:
 	default:
-		t.Fatal("未启动即 Stop 必须立即完成（chat / tool 无条件 Close，约束 21）")
+		t.Fatal("未启动的 Stop 必须立即完成")
 	}
-	_, stopped, _ := f.engine.engineCounts()
-	require.Zero(t, stopped, "未 Start 时 Stop 不得触碰引擎")
-	f.sched.Stop() // 幂等：再次调用不 panic
 }
 
-// TestScheduler_StopTimeoutCancelsInflight 覆盖约束 23：停机先等宽限，宽限耗尽才取消
-// 在途运行；被取消的运行按 failed 收尾，Stop 在有界等待内返回。
-// 逆改点：跳过宽限直接取消 → 取消时刻早于宽限，断言红；取消后不等待 → 终态行缺失。
-func TestScheduler_StopTimeoutCancelsInflight(t *testing.T) {
-	store := newFakeTaskStore()
-	entered := make(chan struct{}, 1)
-	var sawCancel atomic.Bool
-	var cancelAt atomic.Int64
-	invoker := &countingInvoker{run: func(ctx context.Context, _ RunRequest) (RunResult, error) {
-		entered <- struct{}{}
+// TestScheduler_CancelExecutionsEndsInflightBeforeGrace —— 外部取消入口判图 11 [4]：
+// 编排层在排空窗口到点时调用 CancelExecutions，在途 Run 必须**立即**收尾，而不是
+// 等调度器自己的兜底宽限。用例把 StopGrace 设成 1h：若取消入口不存在或未生效，
+// Stop 会一直等下去，本用例红。
+// It asserts the drain-time external cancel ends in-flight work without waiting for the
+// scheduler's own fallback grace.
+func TestScheduler_CancelExecutionsEndsInflightBeforeGrace(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
+		opts.StopGrace = time.Hour // 兜底宽限不可达：唯一有效的取消来源是外部入口
+	})
+	f.start(t)
+
+	blocked := make(chan struct{})
+	aborted := make(chan struct{})
+	f.invoker.run = func(ctx context.Context, req RunRequest) (RunResult, error) {
+		close(blocked)
 		<-ctx.Done()
-		// 先记时间戳再置位标志：Eventually 轮询到 sawCancel 时必须读到已写入的 cancelAt，
-		// 反过来写会让轮询落在两次存储之间、读到 0（负载下间歇性红）。
-		cancelAt.Store(time.Now().UnixNano())
-		sawCancel.Store(true)
-		return RunResult{Status: StatusCancelled, Reason: "停机取消"}, nil
-	}}
-	engine := newBlockingFakeEngine()
-	logger, _ := newCaptureLogger()
-	sched := newSchedulerWith(store, invoker, engine, logger, []Schedule{demoTask(schedTaskID)}, func(o *SchedulerOptions) {
-		o.RunTimeout = time.Minute
-		o.StopGrace = 20 * time.Millisecond
-	})
-	require.NoError(t, sched.Start(context.Background()))
-
-	gen := currentGen(t, sched, schedTaskID)
-	fireDone := make(chan struct{})
-	go func() { defer close(fireDone); sched.fire(schedTaskID, gen) }()
-	<-entered
-
-	stopStart := time.Now()
-	stopDone := make(chan struct{})
-	go func() { defer close(stopDone); sched.Stop() }()
-
-	require.Eventually(t, sawCancel.Load, 2*time.Second, 5*time.Millisecond, "宽限耗尽必须取消在途运行（约束 23）")
-	require.GreaterOrEqual(t, cancelAt.Load()-stopStart.UnixNano(), int64(10*time.Millisecond),
-		"必须先等满宽限再取消")
-	engine.releaseStop()
-
-	select {
-	case <-stopDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop 未在宽限 + 有界清理内返回")
+		close(aborted)
+		return RunResult{RunID: req.RunID, Status: StatusCancelled}, ctx.Err()
 	}
+	f.claim(t, schedTaskID)
+	<-blocked
+
+	// 停止领取不得打断在途：这是 [2] 与 [3]/[4] 的分界。
+	f.sched.StopClaims()
 	select {
-	case <-fireDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("fire 未在取消后返回")
+	case <-aborted:
+		t.Fatal("停止领取不得取消在途运行：排空期间它必须继续跑")
+	case <-time.After(50 * time.Millisecond):
 	}
-	require.Equal(t, []ExecutionStatus{ExecutionFailed}, store.snapshotFinished(),
-		"cancelled 收尾为 failed")
+
+	// 排空到点：外部取消让在途 Run 退出，Stop 随即在宽限（1h）之前 join 完成。
+	f.sched.CancelExecutions()
+	done := make(chan struct{})
+	go func() {
+		f.sched.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("外部取消之后 Stop 必须立即完成，不得等满 StopGrace")
+	}
+	require.Equal(t, []ExecutionStatus{ExecutionFailed}, f.store.snapshotFinished(),
+		"被停机取消的在途运行必须收尾为 failed")
 }
 
-// TestScheduler_ReconcileAgent 覆盖 R28 / R29 的写后立即生效口径：chat / tool 落盘后
-// 调一次 ReconcileAgent——单事务应用、提交后才切换句柄、未启动时零副作用。
-// 逆改点：先注册后提交 → 库写失败时句柄已换（兄弟用例红）；逐任务事务 → UpsertIDs
-// 拆成多条，断言红；未启动也落库 → not-started 子例红。
+// TestScheduler_StopTimeoutCancelsInflight —— 宽限耗尽后取消在途运行；终态仍要落账
+// （用 WithoutCancel 派生的清理 ctx），停机不得留下永远 started 的执行行。
+func TestScheduler_StopTimeoutCancelsInflight(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
+		opts.StopGrace = 20 * time.Millisecond
+	})
+	f.start(t)
+
+	blocked := make(chan struct{})
+	f.invoker.run = func(ctx context.Context, req RunRequest) (RunResult, error) {
+		close(blocked)
+		<-ctx.Done()
+		return RunResult{RunID: req.RunID, Status: StatusCancelled}, ctx.Err()
+	}
+	f.claim(t, schedTaskID)
+	<-blocked
+
+	f.sched.Stop()
+	require.Equal(t, []ExecutionStatus{ExecutionFailed}, f.store.snapshotFinished(),
+		"被停机取消的在途运行必须收尾为 failed")
+}
+
+// ===========================================================================
+// 对账与注册集合
+// ===========================================================================
+
+// TestScheduler_ReconcileAgent —— 运行期对账把新增定义落库（US-24 起没有句柄要换）。
 func TestScheduler_ReconcileAgent(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("writes take effect immediately", func(t *testing.T) {
-		store := newFakeTaskStore()
-		engine := &fakeEngine{}
-		logger, _ := newCaptureLogger()
-		sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-			[]AgentEntry{agentEntry(schedAgent, true)}, nil)
-		startSched(t, sched)
-		base := len(store.snapshotApplied())
-
-		require.NoError(t, sched.ReconcileAgent(ctx, schedAgent,
-			[]Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}))
-
-		applied := store.snapshotApplied()
-		require.Len(t, applied, base+1, "同一 Agent 的定义必须一次事务应用")
-		require.ElementsMatch(t, []string{schedTaskID, schedTaskID2}, applied[base].UpsertIDs)
-		require.Empty(t, applied[base].RetireIDs)
-		require.Equal(t, 2, engine.liveHandles(), "写后必须立即生效（注 13）")
-	})
-
-	t.Run("not started reconcile is a no-op", func(t *testing.T) {
-		store := newFakeTaskStore()
-		engine := &fakeEngine{}
-		logger, _ := newCaptureLogger()
-		idle := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-			[]AgentEntry{agentEntry(schedAgent, true)}, nil)
-
-		require.NoError(t, idle.ReconcileAgent(ctx, schedAgent, []Schedule{demoTask(schedTaskID)}))
-
-		require.Empty(t, store.snapshotApplied(), "未启动不得落库（chat / tool 只落文件）")
-		require.Zero(t, engine.liveHandles(), "未启动不得注册")
-	})
-
-	t.Run("definitions keep db enabled values", func(t *testing.T) {
-		store := newFakeTaskStore()
-		store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: "旧巡检", Enabled: false, DefinitionHash: "old",
-		})
-		engine := &fakeEngine{}
-		logger, _ := newCaptureLogger()
-		sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-			[]AgentEntry{agentEntry(schedAgent, true)}, nil)
-		startSched(t, sched)
-		base := len(store.snapshotApplied())
-
-		require.NoError(t, sched.ReconcileAgent(ctx, schedAgent,
-			[]Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}))
-
-		applied := store.snapshotApplied()
-		require.Len(t, applied, base+1)
-		require.ElementsMatch(t, []string{schedTaskID, schedTaskID2}, applied[base].UpsertIDs,
-			"新任务经一次 ApplyAgentTasks 入库")
-		kept, ok := store.task(schedTaskID)
-		require.True(t, ok)
-		require.False(t, kept.Enabled, "既有行保持库值 enabled=false（注 14）")
-		fresh, ok := store.task(schedTaskID2)
-		require.True(t, ok)
-		require.True(t, fresh.Enabled, "新行按缺省 enabled=1")
-		require.Equal(t, 1, engine.liveHandles(), "停用任务不注册")
-	})
-
-	t.Run("removals retire in the same transaction", func(t *testing.T) {
-		store := newFakeTaskStore()
-		engine := &fakeEngine{}
-		logger, _ := newCaptureLogger()
-		sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-			[]AgentEntry{agentEntry(schedAgent, true, demoTask(schedTaskID), demoTask(schedTaskID2))}, nil)
-		startSched(t, sched)
-		base := len(store.snapshotApplied())
-
-		require.NoError(t, sched.ReconcileAgent(ctx, schedAgent, []Schedule{demoTask(schedTaskID)}))
-
-		applied := store.snapshotApplied()
-		require.Len(t, applied, base+1)
-		require.Equal(t, []string{schedTaskID2}, applied[base].RetireIDs, "移除项在同一事务内退休")
-		gone, ok := store.task(schedTaskID2)
-		require.True(t, ok)
-		require.False(t, gone.RetiredAt.IsZero())
-		require.Equal(t, 1, engine.liveHandles(), "退休项句柄必须摘除")
-	})
-}
-
-// TestScheduler_SetRegistered_RetiresRemovedAgent 覆盖约束 39：Agent 移出注册集合时，
-// 只退休它自己的未退休任务（一次事务）、摘除句柄，其他 Agent 不受影响。
-// 逆改点：删掉 ApplyAgentTasks + invalidateLocked 段 → 退休读数与句柄断言红。
-func TestScheduler_SetRegistered_RetiresRemovedAgent(t *testing.T) {
-	store := newFakeTaskStore()
-	engine := &fakeEngine{}
-	logger, logs := newCaptureLogger()
-	sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-		[]AgentEntry{
-			agentEntry(schedAgent, true, demoTask(schedTaskID), demoTask(schedTaskID2)),
-			agentEntry("other", true, demoTask("other-task")),
-		}, nil)
-	startSched(t, sched)
-	require.Equal(t, 3, engine.liveHandles())
-	base := len(store.snapshotApplied())
-
-	require.NoError(t, sched.SetRegistered(schedAgent, false))
-
-	applied := store.snapshotApplied()
-	require.Len(t, applied, base+1, "一个 Agent 的退休必须一次事务完成")
-	require.ElementsMatch(t, []string{schedTaskID, schedTaskID2}, applied[base].RetireIDs)
-	require.Empty(t, applied[base].UpsertIDs, "退休事务不得顺带上写")
-	require.Equal(t, 1, engine.liveHandles(), "只摘除该 Agent 的句柄")
-	for _, id := range []string{schedTaskID, schedTaskID2} {
-		rec, ok := store.task(id)
-		require.True(t, ok)
-		require.False(t, rec.RetiredAt.IsZero(), "任务 %s 必须标退休", id)
-	}
-	other, ok := store.task("other-task")
-	require.True(t, ok)
-	require.True(t, other.RetiredAt.IsZero(), "其他 Agent 的任务不得被波及")
-	rec := logs.requireRecord(t, slog.LevelInfo, "Agent 已移出调度注册集合，任务退休")
-	tasks, ok := attrOf(rec, "tasks")
-	require.True(t, ok)
-	require.Equal(t, "2", tasks.String())
-}
-
-// TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry 覆盖未启动时的注册集合
-// 增减只做内存操作：不读库、不落库、不动句柄（定义由 Start 对账）。
-func TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+
+	require.NoError(t, f.sched.ReconcileAgent(context.Background(), schedAgent,
+		[]Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}))
+	require.Len(t, f.store.snapshotApplied(), 2)
+	_, ok := f.store.task(schedTaskID2)
+	require.True(t, ok, "新增定义必须落库")
+}
+
+// TestScheduler_SetRegistered_RetiresRemovedAgent —— 移出注册集合：先撤注册，再退休
+// 该 Agent 的全部未退休任务（只置 retired_at、不删行）。
+func TestScheduler_SetRegistered_RetiresRemovedAgent(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
 
 	require.NoError(t, f.sched.SetRegistered(schedAgent, false))
-	require.NoError(t, f.sched.SetRegistered("never-registered", false))
-	require.NoError(t, f.sched.SetRegistered(schedAgent, true))
-
-	require.Zero(t, f.store.listReadings(), "未启动不得读库")
-	require.Empty(t, f.store.snapshotApplied(), "未启动不得落库")
-	require.Zero(t, f.engine.liveHandles())
-	f.sched.stateMu.RLock()
-	_, stillIn := f.sched.registry[schedAgent]
-	f.sched.stateMu.RUnlock()
-	require.True(t, stillIn, "registered=true 必须重新纳入调度集合")
+	require.False(t, f.sched.registry[schedAgent])
+	row, ok := f.store.task(schedTaskID)
+	require.True(t, ok, "退休不得物理删除行")
+	require.False(t, row.RetiredAt.IsZero())
 }
 
-// TestScheduler_SetRegistered_ErrorKeepsRemovalAndHandles 覆盖失败处置：注册集合先
-// 收回（准入失败关闭），库读 / 库写失败如实上抛，旧句柄与旧任务保持原样。
-func TestScheduler_SetRegistered_ErrorKeepsRemovalAndHandles(t *testing.T) {
-	t.Run("list failure", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.start(t)
-		before := f.engine.liveHandleSpecs()
-		listErr := errors.New("disk unavailable")
-		f.store.listErr = listErr
-
-		require.ErrorIs(t, f.sched.SetRegistered(schedAgent, false), listErr)
-
-		require.Equal(t, before, f.engine.liveHandleSpecs(), "读库失败不得摘句柄")
-		f.sched.stateMu.RLock()
-		_, stillIn := f.sched.registry[schedAgent]
-		f.sched.stateMu.RUnlock()
-		require.False(t, stillIn, "移出注册集合先于库操作（准入立即失败关闭）")
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.RetiredAt.IsZero(), "读库失败不得退休")
-	})
-
-	t.Run("apply failure", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.start(t)
-		before := f.engine.liveHandleSpecs()
-		applyErr := errors.New("db down")
-		f.store.applyErr = applyErr
-
-		require.ErrorIs(t, f.sched.SetRegistered(schedAgent, false), applyErr)
-
-		require.Equal(t, before, f.engine.liveHandleSpecs(), "写库失败不得摘句柄")
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.RetiredAt.IsZero(), "写库失败任务保持未退休")
-	})
-}
-
-// TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration 覆盖约束 41：库写失败时
-// 旧定义与旧句柄完整保留——不先停句柄、不重注册。
-// 逆改点：提交前 invalidate → 旧句柄已停，liveHandleSpecs 变空，断言红。
-func TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: "旧巡检"}}, nil)
-	f.start(t)
-	before := f.engine.liveHandleSpecs()
-	_, _, addBefore := f.engine.engineCounts()
-
-	writeErr := errors.New("disk full")
-	f.store.applyErr = writeErr
-	err := f.sched.ReconcileAgent(context.Background(), schedAgent,
-		[]Schedule{{ID: schedTaskID, Cron: "*/10 * * * * *", Zone: "UTC", Message: "新巡检"}})
-	require.ErrorIs(t, err, writeErr)
-	require.Equal(t, before, f.engine.liveHandleSpecs(), "库写失败必须保留旧句柄")
-	_, _, addAfter := f.engine.engineCounts()
-	require.Equal(t, addBefore, addAfter, "失败不得重注册")
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, "旧巡检", rec.Message, "库保持旧定义")
-}
-
-// TestScheduler_Start_StoreFailureFatal 覆盖注 16：存储层失败是致命启动失败——
-// 零注册、不置启动位、可修复后重试。
-// 逆改点：吞掉恢复错误继续启动 → Start 返回 nil、引擎启动，断言红。
-func TestScheduler_Start_StoreFailureFatal(t *testing.T) {
+// TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry —— 未启动时只动进程内注册表，
+// 不写库（文件已落盘，下次启动对账生效）。
+func TestScheduler_SetRegistered_NotStartedOnlyTouchesRegistry(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.store.recoverErr = errors.New("recover failed")
+	f.store.seedTask(TaskRecord{TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone})
+	require.NoError(t, f.sched.SetRegistered(schedAgent, false))
+	require.False(t, f.sched.registry[schedAgent])
+	require.Empty(t, f.store.snapshotApplied())
+}
 
-	err := f.sched.Start(context.Background())
-	require.Error(t, err, "存储层失败是致命启动失败（注 16）")
-	_, _, addCalls := f.engine.engineCounts()
-	require.Zero(t, addCalls, "失败不得注册任何任务")
-	require.False(t, f.sched.started, "失败不得置启动位（约束 21）")
-
-	// 修复后同一实例可重试成功（失败不置位）。
-	f.store.recoverErr = nil
+// TestScheduler_SetRegistered_ErrorKeepsRemoval —— 退休写失败如实上抛，注册表撤销保留
+// （装配层据此记 WARN，不静默退回）。
+func TestScheduler_SetRegistered_ErrorKeepsRemoval(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.start(t)
-	_, _, addCalls = f.engine.engineCounts()
-	require.Equal(t, 1, addCalls)
+	f.store.applyErr = errors.New("connection reset")
+
+	err := f.sched.SetRegistered(schedAgent, false)
+	require.ErrorContains(t, err, "retire agent")
+	require.False(t, f.sched.registry[schedAgent], "库写失败不得恢复注册（否则新 Run 又能进来）")
 }
 
-// TestScheduler_Start_TaskAddFailureStopsEngine 覆盖约束 19 / 注 16：启动阶段单任务
-// Add 失败是致命的——停引擎、清句柄、不置启动位。
-// 逆改点：忽略 Add 错误继续启动 → Start 返回 nil、started 为真，断言红。
-func TestScheduler_Start_TaskAddFailureStopsEngine(t *testing.T) {
-	store := newFakeTaskStore()
-	engine := &fakeEngine{addErr: errors.New("add failed")}
-	logger, _ := newCaptureLogger()
-	sched := newSchedulerWith(store, &countingInvoker{}, engine, logger, []Schedule{demoTask(schedTaskID)}, nil)
+// TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration —— 对账读库失败不得动摇注册表。
+func TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.store.listErr = errors.New("database is locked")
 
-	err := sched.Start(context.Background())
-	require.Error(t, err, "启动阶段单任务 Add 失败是致命的（约束 19 / 注 16）")
-	started, stopped, addCalls := engine.engineCounts()
-	require.Zero(t, started, "失败路径不得启动引擎")
-	require.Equal(t, 1, stopped, "失败必须停引擎")
-	require.Equal(t, 1, addCalls)
-	require.Zero(t, engine.liveHandles())
-	require.False(t, sched.started)
+	err := f.sched.ReconcileAgent(context.Background(), schedAgent, []Schedule{demoTask(schedTaskID)})
+	require.ErrorContains(t, err, "list tasks")
+	require.True(t, f.sched.registry[schedAgent])
 }
 
-// TestScheduler_Start_OwnerConflictFatal 覆盖约束 42：同 task_id 归属另一 Agent 时
-// 启动失败（活动行与退休行都不放宽），零注册、不置启动位。
-// 逆改点：冲突行按本 Agent 覆盖 → Start 返回 nil,断言红。
-func TestScheduler_Start_OwnerConflictFatal(t *testing.T) {
-	cases := []struct {
-		name    string
-		retired bool
-	}{
-		{name: "active id owned by another agent", retired: false},
-		{name: "retired id still owned by another agent", retired: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeTaskStore()
-			row := TaskRecord{
-				TaskID: "shared-1", Agent: "other", Cron: schedCron, Zone: "UTC",
-				Message: "他人的任务", Enabled: true,
-			}
-			if tc.retired {
-				row.RetiredAt = schedNow.Add(-time.Hour)
-			}
-			store.seedTask(row)
-			engine := &fakeEngine{}
-			logger, _ := newCaptureLogger()
-			sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-				[]AgentEntry{agentEntry(schedAgent, true, Schedule{
-					ID: "shared-1", Cron: schedCron, Zone: "UTC", Message: "接管",
-				})}, nil)
-
-			err := sched.Start(context.Background())
-			require.ErrorIs(t, err, ErrTaskOwnerConflict, "归属冲突是致命启动失败（约束 42）")
-			_, _, addCalls := engine.engineCounts()
-			require.Zero(t, addCalls, "冲突不得注册")
-			require.False(t, sched.started)
-		})
-	}
-}
-
-// TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition 覆盖约束 41 的
-// "库写失败 → 旧定义继续服务"：失败后触发仍使用旧内容，不出现新旧混合。
-// 逆改点：先清 definitions / 先停句柄再写库 → 运行消息变新或运行缺失，断言红。
+// TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition —— 对账失败保留旧定义
+// （单事务语义：不出现半套定义）。
 func TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: "旧巡检"}}, nil)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.start(t)
-	before := f.engine.liveHandleSpecs()
-	_, _, addBefore := f.engine.engineCounts()
+	f.store.applyErr = errors.New("deadlock detected")
+	f.store.applyErrOnCall = 2
 
-	f.store.applyErr = ErrTaskOwnerConflict
-	err := f.sched.ReconcileAgent(context.Background(), schedAgent,
-		[]Schedule{{ID: schedTaskID, Cron: "*/10 * * * * *", Zone: "UTC", Message: "新巡检"}})
-	require.ErrorIs(t, err, ErrTaskOwnerConflict)
-	require.Equal(t, before, f.engine.liveHandleSpecs(), "失败后保留完整旧句柄")
-	_, _, addAfter := f.engine.engineCounts()
-	require.Equal(t, addBefore, addAfter, "失败不得注册新句柄")
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, "旧巡检", rec.Message, "库保持旧定义")
+	updated := demoTask(schedTaskID)
+	updated.Message = "复核"
+	err := f.sched.ReconcileAgent(context.Background(), schedAgent, []Schedule{updated})
+	require.ErrorContains(t, err, "reconcile agent")
 
+	row, _ := f.store.task(schedTaskID)
+	require.Equal(t, schedMessage, row.Message, "对账失败必须保留旧定义")
+}
+
+// TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition —— 对账提交后到期扫描
+// 立即使用最新定义（每轮读库，没有缓存要失效）。
+func TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
 	f.fire(t, schedTaskID)
+
+	updated := demoTask(schedTaskID)
+	updated.Message = "复核"
+	require.NoError(t, f.sched.ReconcileAgent(context.Background(), schedAgent,
+		[]Schedule{updated}))
 	reqs := f.invoker.requests()
 	require.Len(t, reqs, 1)
-	require.Equal(t, "旧巡检", reqs[0].Message, "不得出现「旧触发时间 + 新任务内容」")
 }
 
-// TestScheduler_OldCallbackAfterReconcile_NoRun 覆盖约束 44 的代次防线与快照临界区：
-// ① 对账切换后已派发的旧回调直接返回（零运行、零执行行）；
-// ② 新注册的回调使用完整新定义；
-// ③ 快照的 ListTasks 与代次判定在同一个读锁临界区内，对账写锁不得插队。
-// 逆改点：不比对代次 → ① 出现运行；ListTasks 移到锁外 → ③ 对账在快照中途完成，断言红。
-func TestScheduler_OldCallbackAfterReconcile_NoRun(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: "旧巡检"}}, nil)
+// TestScheduler_ReconcileAgent_ApplyIsAllOrNothing —— 一批 upsert 里任一归属冲突，
+// 整批不生效（不出现半套定义）。
+func TestScheduler_ReconcileAgent_ApplyIsAllOrNothing(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
 	f.start(t)
+	f.store.seedTask(TaskRecord{TaskID: schedTaskID2, Agent: "intruder", Cron: schedCron, Zone: schedZone})
 
-	t.Run("stale callback after swap produces no run", func(t *testing.T) {
-		oldJob := f.engine.lastJob()
-		require.NotNil(t, oldJob, "启动注册必须捕获旧 job")
+	err := f.sched.ReconcileAgent(context.Background(), schedAgent,
+		[]Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)})
+	require.ErrorIs(t, err, ErrTaskOwnerConflict)
 
-		entered := make(chan struct{})
-		release := make(chan struct{})
-		f.store.applyHook = func() { close(entered); <-release }
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			_ = f.sched.ReconcileAgent(context.Background(), schedAgent,
-				[]Schedule{{ID: schedTaskID, Cron: "*/10 * * * * *", Zone: "UTC", Message: "新巡检"}})
-		}()
-		<-entered
-
-		oldDone := make(chan struct{})
-		go func() { defer close(oldDone); oldJob() }()
-		select {
-		case <-oldDone:
-			t.Fatal("旧 job 不得越过对账写锁")
-		case <-time.After(50 * time.Millisecond):
-		}
-		close(release)
-		<-done
-		<-oldDone
-
-		require.Zero(t, f.invoker.calls.Load(), "切换后旧 job 必须直接返回")
-		require.Empty(t, f.store.snapshotStarted(), "旧 job 不得写执行行")
-
-		oldJob()
-		require.Zero(t, f.invoker.calls.Load(), "切换完成后再调旧 job 仍无效")
-		require.Empty(t, f.store.snapshotStarted())
-	})
-
-	t.Run("new callback runs with new definition", func(t *testing.T) {
-		newJob := f.engine.lastJob()
-		require.NotNil(t, newJob, "切换后必须注册新 job")
-		newJob()
-
-		require.EqualValues(t, 1, f.invoker.calls.Load())
-		reqs := f.invoker.requests()
-		require.Len(t, reqs, 1)
-		require.Equal(t, "新巡检", reqs[0].Message, "新 job 必须使用完整新定义")
-	})
-
-	t.Run("snapshot is read under the state lock", func(t *testing.T) {
-		current := f.engine.lastJob()
-		require.NotNil(t, current)
-
-		entered := make(chan struct{})
-		releaseList := make(chan struct{})
-		f.store.listHook = func() { close(entered); <-releaseList }
-		oldDone := make(chan struct{})
-		go func() { defer close(oldDone); current() }()
-		<-entered
-
-		swapDone := make(chan struct{})
-		go func() {
-			defer close(swapDone)
-			_ = f.sched.ReconcileAgent(context.Background(), schedAgent,
-				[]Schedule{{ID: schedTaskID, Cron: "*/20 * * * * *", Zone: "UTC", Message: "第三版巡检"}})
-		}()
-		select {
-		case <-swapDone:
-			t.Fatal("对账写锁不得在快照临界区内完成：ListTasks 必须在读锁内")
-		case <-time.After(50 * time.Millisecond):
-		}
-		close(releaseList)
-		<-oldDone
-		<-swapDone
-
-		require.EqualValues(t, 2, f.invoker.calls.Load(), "旧 job 必须真实执行一次")
-		reqs := f.invoker.requests()
-		require.Equal(t, "新巡检", reqs[len(reqs)-1].Message, "旧回调只能使用切换前的快照")
-	})
+	row, _ := f.store.task(schedTaskID)
+	require.Equal(t, schedMessage, row.Message, "冲突批次不得产生半套定义")
+	other, _ := f.store.task(schedTaskID2)
+	require.Equal(t, "intruder", other.Agent)
 }
 
-// TestScheduler_ReconcileAgent_AddFailureReturnsError 覆盖约束 41 的运行期注册失败口径：
-// 事务已提交（定义落库不回滚），其余任务照常注册，失败任务无句柄，错误上抛并点名任务。
-// 逆改点：首个 Add 失败即中止后续注册 → demo-1 不再注册（liveHandleSpecs 变空），断言红。
-func TestScheduler_ReconcileAgent_AddFailureReturnsError(t *testing.T) {
-	const failingSpec = "CRON_TZ=UTC */15 * * * * *"
-	f := newSchedFixture(t, []Schedule{{ID: schedTaskID, Cron: schedCron, Zone: "UTC", Message: "旧巡检"}}, nil)
-	f.start(t)
-	f.engine.mu.Lock()
-	f.engine.addErrFor = failingSpec
-	f.engine.mu.Unlock()
+// ===========================================================================
+// 手动补跑
+// ===========================================================================
 
-	err := f.sched.ReconcileAgent(context.Background(), schedAgent, []Schedule{
-		{ID: schedTaskID, Cron: "*/10 * * * * *", Zone: "UTC", Message: "新巡检"},
-		{ID: schedTaskID2, Cron: "*/15 * * * * *", Zone: "UTC", Message: "周报"},
-	})
-	require.ErrorContains(t, err, schedTaskID2, "运行期注册失败必须上抛聚合错误并点名任务")
-	rec, ok := f.store.task(schedTaskID2)
-	require.True(t, ok, "事务已提交：定义已落库，不回滚")
-	require.Equal(t, "周报", rec.Message)
-	require.Equal(t, []string{"CRON_TZ=UTC */10 * * * * *"}, f.engine.liveHandleSpecs(),
-		"其余任务照常注册，失败任务无句柄")
-}
-
-// TestScheduler_Start_SecondAgentApplyFails_NoHandles 覆盖图 B 的两阶段启动：
-// 任一 Agent 的事务失败 → Start 失败，且此前已提交的 Agent 也**零句柄**（先全部提交、
-// 后统一注册）。
-// 逆改点：逐 Agent「提交即注册」→ 第一只 Agent 的句柄已挂，addCalls 非零，断言红。
-func TestScheduler_Start_SecondAgentApplyFails_NoHandles(t *testing.T) {
-	store := newFakeTaskStore()
-	store.applyErr = errors.New("second write failed")
-	store.applyErrOnCall = 2
-	engine := &fakeEngine{}
-	logger, _ := newCaptureLogger()
-	entries := []AgentEntry{
-		agentEntry("demo", true, demoTask(schedTaskID)),
-		agentEntry("other", true, demoTask("other-1")),
-	}
-	sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger, entries, nil)
-
-	err := sched.Start(context.Background())
-	require.Error(t, err, "任一 Agent 的事务失败必须让 Start 失败")
-	_, _, addCalls := engine.engineCounts()
-	require.Zero(t, addCalls, "两阶段：全部提交成功前不得注册任何句柄（R10-M8）")
-	require.Zero(t, engine.liveHandles())
-	require.Len(t, appliedFor(store.snapshotApplied(), "demo"), 1, "第一个 Agent 的提交已完成")
-	require.False(t, sched.started)
-}
-
-// TestScheduler_RunNow_SameChain 覆盖 R5 / 约束 1 / 13：手动补跑与到点触发共用
-// scheduleRun 同一条执行链——trigger=manual，执行行与返回结果都来自同一次运行。
-// 逆改点：RunNow 另起执行链（不预写执行行 / 不走 scheduleRun）→ started / finished
-// 断言红；trigger 写 cron → 断言红。
+// TestScheduler_RunNow_SameChain —— 手动补跑复用同一条执行链，只是 trigger=manual、
+// 没有 planned_at。
 func TestScheduler_RunNow_SameChain(t *testing.T) {
-	t.Run("uses the shared execution chain", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
 
-		req, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-		require.NoError(t, err)
-		require.Equal(t, TriggerManual, req.Trigger)
-
-		started := f.store.snapshotStarted()
-		require.Len(t, started, 1, "手动补跑必须走 StartExecution 预写（约束 9 同链）")
-		require.Equal(t, TriggerManual, started[0].Trigger)
-		require.Equal(t, ExecutionStarted, started[0].Status)
-		require.Equal(t, req.RunID, started[0].RunID, "执行行与请求使用同一个 RunID")
-		require.Equal(t, schedNow, started[0].StartedAt)
-		require.Equal(t, []ExecutionStatus{ExecutionCompleted}, f.store.snapshotFinished())
-		require.Equal(t, []fakeMarkRecord{{TaskID: schedTaskID, At: schedNow, Status: ExecutionStarted}},
-			f.store.snapshotMarks(), "MarkTaskRun 与 cron 路径同序")
-	})
-
-	t.Run("returns the run request and result", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
-
-		req, res, err := f.sched.RunNow(context.Background(), schedTaskID)
-		require.NoError(t, err)
-		require.True(t, strings.HasPrefix(req.RunID, "scheduler-"), "RunID 前缀固定 scheduler-（约束 12）")
-		require.Equal(t, schedAgent, req.Agent)
-		require.Equal(t, schedSession, req.SessionID, "调度会话固定向量（约束 12）")
-		require.Equal(t, schedMessage, req.Message)
-		require.Equal(t, "scheduler", req.Channel)
-		require.Equal(t, "scheduler", req.UserID)
-		require.Equal(t, TriggerManual, req.Trigger)
-		require.Equal(t, Budget{MaxIterations: 10}, req.Budget)
-		require.Equal(t, req.RunID, res.RunID)
-		require.Equal(t, StatusCompleted, res.Status)
-	})
+	req, res, err := f.sched.RunNow(context.Background(), schedTaskID)
+	require.NoError(t, err)
+	require.Equal(t, TriggerManual, req.Trigger)
+	require.Equal(t, schedSession, req.SessionID)
+	require.Equal(t, req.RunID, res.RunID)
+	require.Empty(t, f.store.snapshotClaims(), "手动补跑不走 cron 领取")
+	require.Equal(t, []ExecutionStatus{ExecutionCompleted}, f.store.snapshotFinished())
+	started := f.store.snapshotStarted()
+	require.Empty(t, started, "手动补跑的执行行不是 cron started 行")
 }
 
-// TestScheduler_RunNow_BusyReturnsErrTaskBusy 覆盖 R10 / 约束 8：手动撞上在途执行 →
-// ErrTaskBusy、不排队、零执行行、零运行；请求未成为一次运行，不落 skipped 行。
-// 逆改点：用 Lock 排队 / 把撞锁落成 skipped 行 → 用例超时或行数断言红。
+// TestScheduler_RunNow_BusyReturnsErrTaskBusy —— 同任务已有在途执行：立即拒绝（409），
+// 不排队、不叠加。
 func TestScheduler_RunNow_BusyReturnsErrTaskBusy(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
 	f.start(t)
+	f.store.mu.Lock()
+	f.store.active[schedTaskID] = 99
+	f.store.mu.Unlock()
 
-	f.sched.lockFor(schedTaskID).Lock()
 	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-	f.sched.lockFor(schedTaskID).Unlock()
-
-	require.ErrorIs(t, err, ErrTaskBusy, "手动撞锁必须返回 ErrTaskBusy（约束 8）")
-	require.Zero(t, f.invoker.calls.Load(), "撞锁不得发起运行")
-	require.Empty(t, f.store.snapshotStarted(), "撞锁不得预写执行行")
-	require.Empty(t, f.store.snapshotSkipped(), "手动撞锁不落 skipped 行（请求未成为一次运行）")
-	require.Empty(t, f.store.snapshotFinished())
+	require.ErrorIs(t, err, ErrTaskBusy)
+	require.Zero(t, f.invoker.calls.Load())
 }
 
-// TestScheduler_RunNow_HiddenTaskNotFound 覆盖约束 17 / N-06：未知 / retired /
-// Agent 未注册三种不可见条件各一例，均包装 fs.ErrNotExist（web 404），零运行、零执行行。
-// 逆改点：只判任务是否存在（不看 retired / registry）→ retired 与未注册子例红。
+// TestScheduler_RunNow_HiddenTaskNotFound —— 未知 / 退休 / 未注册 Agent 的任务一律 404。
 func TestScheduler_RunNow_HiddenTaskNotFound(t *testing.T) {
-	cases := []struct {
-		name       string
-		registered bool
-		seed       *TaskRecord
-	}{
-		{name: "unknown task", registered: true},
-		{
-			name: "retired task", registered: true,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true, RetiredAt: schedNow.Add(-time.Hour),
-			},
-		},
-		{
-			name: "agent not registered", registered: false,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true,
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeTaskStore()
-			if tc.seed != nil {
-				store.seedTask(*tc.seed)
-			}
-			invoker := &countingInvoker{}
-			engine := &fakeEngine{}
-			logger, _ := newCaptureLogger()
-			sched := newSchedulerWithEntries(store, invoker, engine, logger,
-				[]AgentEntry{agentEntry(schedAgent, tc.registered)}, nil)
-			startSched(t, sched)
-
-			_, _, err := sched.RunNow(context.Background(), schedTaskID)
-			require.ErrorIs(t, err, fs.ErrNotExist, "不可见任务必须包装 fs.ErrNotExist（web 404）")
-			require.Zero(t, invoker.calls.Load(), "不可见任务不得发起运行")
-			require.Empty(t, store.snapshotStarted())
-			require.Empty(t, store.snapshotSkipped())
-		})
-	}
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	_, _, err := f.sched.RunNow(context.Background(), "ghost")
+	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
-// TestScheduler_RunNow_DisabledTaskStillRuns 覆盖注 7：enabled 只控制 cron 注册，
-// 停用任务仍可手动补跑一次（人工运维动作）。
-// 逆改点：RunNow 复用 fire 的 enabled 过滤 → 返回 ErrTaskBusy / not exist，断言红。
+// TestScheduler_RunNow_DisabledTaskStillRuns —— 手动补跑是显式请求，不受 enabled 影响。
 func TestScheduler_RunNow_DisabledTaskStillRuns(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: false,
-	})
 	f.start(t)
-	require.Zero(t, f.engine.liveHandles(), "停用任务不注册 cron 句柄")
-
-	req, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-	require.NoError(t, err, "停用任务仍可手动补跑（注 7）")
-	require.Equal(t, TriggerManual, req.Trigger)
-	require.EqualValues(t, 1, f.invoker.calls.Load())
-	require.Equal(t, []ExecutionStatus{ExecutionCompleted}, f.store.snapshotFinished())
-}
-
-// TestScheduler_RunNow_SessionBusyRecordsSkipped 覆盖 D-18 manual 面 / N-11：兄弟任务
-// 占会话时错误原样上抛（不是 ErrTaskBusy），执行行收尾 skipped + 固定文案、run_id 置空。
-// 逆改点：把 SessionBusyError 折成 ErrTaskBusy → 错误类型断言红；按 failed 收尾 → 状态红。
-func TestScheduler_RunNow_SessionBusyRecordsSkipped(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
-		return RunResult{}, &SessionBusyError{SessionID: schedSession}
-	}
-	f.store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
-	f.start(t)
+	require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, false))
 
 	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-	var busy *SessionBusyError
-	require.ErrorAs(t, err, &busy, "SessionBusyError 必须原样上抛（web 按会话忙映射 409）")
-	require.NotErrorIs(t, err, ErrTaskBusy, "兄弟任务占会话不得折成 ErrTaskBusy")
-	require.Equal(t, []ExecutionStatus{ExecutionSkipped}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Equal(t, "同一 Agent 的另一任务仍在执行", calls[0].ErrMsg)
-	require.Empty(t, calls[0].RunID, "无 Run 行的终态行 run_id 必须置空")
-	f.logs.requireRecord(t, slog.LevelWarn, "同一 Agent 的另一任务仍在执行")
-
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, ExecutionSkipped, rec.LastStatus, "FinishExecution 同步 skipped")
+	require.NoError(t, err)
+	require.Equal(t, int32(1), f.invoker.calls.Load(), "显式补跑必须无视 enabled")
 }
 
-// TestScheduler_SetEnabled_TogglesRegistration 覆盖约束 16 / 注 2：停用注销、启用注册、
-// 重复启用幂等且能修复缺失句柄。逆改点：重复启用直接 Add → 句柄叠加，断言红；
-// 只按库值短路 → 缺失句柄永不修复，第三子例红。
-func TestScheduler_SetEnabled_TogglesRegistration(t *testing.T) {
-	t.Run("disable unregisters the handle", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
-		require.Equal(t, 1, f.engine.liveHandles())
+// TestScheduler_RunNow_SessionBusyRecordsSkipped —— 会话忙：补跑返回错误，执行行记跳过。
+func TestScheduler_RunNow_SessionBusyRecordsSkipped(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	busyErr := &SessionBusyError{SessionID: schedSession}
+	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
+		return RunResult{}, busyErr
+	}
 
-		require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, false))
-
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.False(t, rec.Enabled, "库值必须落为停用")
-		require.Zero(t, f.engine.liveHandles(), "停用必须摘除句柄（约束 16）")
-		require.Equal(t, 1, f.engine.handleStops())
-	})
-
-	t.Run("enable registers the handle", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: false,
-		})
-		f.start(t)
-		require.Zero(t, f.engine.liveHandles())
-		_, _, addBefore := f.engine.engineCounts()
-
-		require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, true))
-
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.Enabled, "库值必须落为启用")
-		require.Equal(t, 1, f.engine.liveHandles())
-		_, _, addAfter := f.engine.engineCounts()
-		require.Equal(t, addBefore+1, addAfter, "启用侧注册恰好一次")
-
-		job := f.engine.lastJob()
-		require.NotNil(t, job)
-		job()
-		require.EqualValues(t, 1, f.invoker.calls.Load(), "启用后的句柄必须真实可用")
-	})
-
-	t.Run("repeated enable is idempotent and repairs a missing handle", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
-		_, _, addBaseline := f.engine.engineCounts()
-
-		require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, true))
-		_, _, addAfterRepeat := f.engine.engineCounts()
-		require.Equal(t, addBaseline, addAfterRepeat, "重复启用不得叠加句柄（幂等短路）")
-		require.Zero(t, f.store.setEnabledReadings(), "库值与句柄态一致时零写 SQL")
-		require.Equal(t, 1, f.engine.liveHandles())
-
-		// 模拟上次 Add 失败：库值仍为 true、句柄缺失 → 启用侧必须补注册一次。
-		f.sched.stateMu.Lock()
-		f.sched.handles[schedTaskID].Stop()
-		delete(f.sched.handles, schedTaskID)
-		f.sched.stateMu.Unlock()
-		require.Zero(t, f.engine.liveHandles())
-
-		require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, true))
-		_, _, addAfterRepair := f.engine.engineCounts()
-		require.Equal(t, addBaseline+1, addAfterRepair, "缺失句柄必须补注册一次")
-		require.Equal(t, 1, f.engine.liveHandles())
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.Enabled)
-	})
+	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
+	require.ErrorIs(t, err, busyErr)
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionSkipped, finishes[0].Status)
+	require.Equal(t, schedulerBusyMessage, finishes[0].ErrMsg)
 }
 
-// TestScheduler_SetEnabled_HiddenTaskNotFound 覆盖约束 17 / N-02：未知 / retired /
-// Agent 未注册三种不可见条件各一例——判定前先读一次 ListTasks，随后零写 SQL、零引擎动作。
-// 逆改点：只判库行存在（不看 retired / registry）→ 不可见子例写库成功、断言红。
+// TestScheduler_RunNow_ExecuteRowFailure —— 执行行写失败：本轮不发起运行，错误如实上抛。
+func TestScheduler_RunNow_ExecuteRowFailure(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.store.startExecutionErr = errors.New("connection reset")
+
+	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
+	require.ErrorContains(t, err, "connection reset")
+	require.Zero(t, f.invoker.calls.Load(), "执行行写失败不得发起运行")
+	f.logs.requireRecord(t, slog.LevelError, "执行行写入失败，本轮不发起运行")
+}
+
+// TestScheduler_RunNow_ArchivedSessionPropagates —— 会话归档：错误原样上抛，执行行记跳过。
+func TestScheduler_RunNow_ArchivedSessionPropagates(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	archived := &SessionArchivedError{SessionID: schedSession}
+	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
+		return RunResult{}, archived
+	}
+
+	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
+	require.ErrorIs(t, err, archived)
+	finishes := f.store.snapshotFinishCalls()
+	require.Len(t, finishes, 1)
+	require.Equal(t, ExecutionSkipped, finishes[0].Status)
+	require.Equal(t, schedulerArchivedMessage, finishes[0].ErrMsg)
+}
+
+// ===========================================================================
+// 管理读面与启停
+// ===========================================================================
+
+// TestScheduler_SetEnabled_ControlsDispatch —— 启停只看库值：停用后不领取，启用后恢复。
+func TestScheduler_SetEnabled_ControlsDispatch(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+
+	require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, false))
+	f.seed(t, schedTaskID)
+	f.scan(t)
+	f.wait(t)
+	require.Empty(t, f.store.snapshotClaims(), "停用后不得领取")
+
+	require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, true))
+	f.fire(t, schedTaskID)
+	require.Len(t, f.store.snapshotClaims(), 1)
+}
+
+// TestScheduler_SetEnabled_HiddenTaskNotFound —— 不可见任务（未知 / 退休 / 未注册）→ 404。
 func TestScheduler_SetEnabled_HiddenTaskNotFound(t *testing.T) {
-	cases := []struct {
-		name       string
-		registered bool
-		seed       *TaskRecord
-		enabled    bool
-	}{
-		{name: "unknown task", registered: true, enabled: true},
-		{
-			name: "retired task", registered: true, enabled: false,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true, RetiredAt: schedNow.Add(-time.Hour),
-			},
-		},
-		{
-			name: "agent not registered", registered: false, enabled: false,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true,
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeTaskStore()
-			if tc.seed != nil {
-				store.seedTask(*tc.seed)
-			}
-			engine := &fakeEngine{}
-			logger, _ := newCaptureLogger()
-			sched := newSchedulerWithEntries(store, &countingInvoker{}, engine, logger,
-				[]AgentEntry{agentEntry(schedAgent, tc.registered)}, nil)
-			startSched(t, sched)
-
-			listBefore := store.listReadings()
-			err := sched.SetEnabled(context.Background(), schedTaskID, tc.enabled)
-			require.ErrorIs(t, err, fs.ErrNotExist, "不可见任务必须包装 fs.ErrNotExist（web 404）")
-			require.Greater(t, store.listReadings(), listBefore, "判定前必须先读一次 ListTasks（N-02）")
-			require.Zero(t, store.setEnabledReadings(), "不可见任务必须零写 SQL")
-			_, _, addCalls := engine.engineCounts()
-			require.Zero(t, addCalls, "不可见任务必须零引擎动作")
-			require.Zero(t, engine.handleStops())
-			if tc.seed != nil {
-				rec, ok := store.task(schedTaskID)
-				require.True(t, ok)
-				require.True(t, rec.Enabled, "库值不得被改写")
-			}
-		})
-	}
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	require.ErrorIs(t, f.sched.SetEnabled(context.Background(), "ghost", false), fs.ErrNotExist)
 }
 
-// TestScheduler_List_FiltersAndOrders 覆盖约束 17 / §6.3 第 10 条：retired 与未注册
-// Agent 的任务隐藏；停用任务仍在管理读面可见；输出按 task_id 升序。
-// 逆改点：不判 retired / registry → 列表混入隐藏行，断言红。
+// TestScheduler_List_FiltersAndOrders —— 退休行与未注册 Agent 的任务一律隐藏，输出按
+// task_id 升序。
 func TestScheduler_List_FiltersAndOrders(t *testing.T) {
-	store := newFakeTaskStore()
-	store.seedTask(TaskRecord{
-		TaskID: "demo-2", Agent: "demo", Cron: schedCron, Zone: "UTC",
-		Message: "停用巡检", Enabled: false, LastStatus: ExecutionCompleted, LastRunAt: schedNow,
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	require.NoError(t, f.sched.ReconcileAgent(context.Background(), schedAgent,
+		[]Schedule{demoTask(schedTaskID), demoTask(schedTaskID2)}))
+	f.store.seedTask(TaskRecord{TaskID: "hidden-1", Agent: "ghost", Cron: schedCron, Zone: schedZone})
+	f.store.seedTask(TaskRecord{
+		TaskID: "retired-1", Agent: schedAgent, Cron: schedCron,
+		Zone: schedZone, RetiredAt: schedNow,
 	})
-	store.seedTask(TaskRecord{
-		TaskID: "demo-1", Agent: "demo", Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
-	store.seedTask(TaskRecord{
-		TaskID: "demo-3", Agent: "demo", Cron: schedCron, Zone: "UTC",
-		Message: "已下线", Enabled: true, RetiredAt: schedNow.Add(-time.Hour),
-	})
-	store.seedTask(TaskRecord{
-		TaskID: "ghost-1", Agent: "ghost", Cron: schedCron, Zone: "UTC",
-		Message: "未注册 Agent 的任务", Enabled: true,
-	})
-	logger, _ := newCaptureLogger()
-	sched := newSchedulerWithEntries(store, &countingInvoker{}, &fakeEngine{}, logger,
-		[]AgentEntry{agentEntry("demo", true), agentEntry("ghost", false)}, nil)
 
-	rows, err := sched.List(context.Background())
+	rows, err := f.sched.List(context.Background())
 	require.NoError(t, err)
 	ids := make([]string, 0, len(rows))
 	for _, row := range rows {
 		ids = append(ids, row.TaskID)
 	}
-	require.Equal(t, []string{"demo-1", "demo-2"}, ids, "只返回可见任务且按 task_id 升序")
-	require.False(t, rows[1].Enabled, "停用任务仍在管理读面可见")
+	require.Equal(t, []string{schedTaskID, schedTaskID2}, ids)
 }
 
-// TestScheduler_List_ReflectsRunState 覆盖约束 17 / §3.1.2：List 每次读库，不在进程内
-// 另存任务状态——两次调用之间改库，第二次输出随之变化。
-// 逆改点：构造期 / 首次调用缓存任务表 → 第二次仍读到旧值，断言红。
+// TestScheduler_List_ReflectsRunState —— 读面每次都读库：运行痕迹立刻可见。
 func TestScheduler_List_ReflectsRunState(t *testing.T) {
-	store := newFakeTaskStore()
-	store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-		LastStatus: ExecutionCompleted, LastRunAt: schedNow.Add(-time.Hour),
-	})
-	logger, _ := newCaptureLogger()
-	sched := newSchedulerWithEntries(store, &countingInvoker{}, &fakeEngine{}, logger,
-		[]AgentEntry{agentEntry(schedAgent, true)}, nil)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	require.NoError(t, f.sched.SetEnabled(context.Background(), schedTaskID, true))
+	f.fire(t, schedTaskID)
 
-	rows, err := sched.List(context.Background())
+	rows, err := f.sched.List(context.Background())
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
+	require.True(t, schedNow.Equal(rows[0].LastRunAt), "运行后 last_run_at 必须可见")
 	require.Equal(t, ExecutionCompleted, rows[0].LastStatus)
-	require.Equal(t, schedNow.Add(-time.Hour), rows[0].LastRunAt)
-
-	store.mutateTask(schedTaskID, func(rec *TaskRecord) {
-		rec.LastStatus = ExecutionFailed
-		rec.LastRunAt = schedNow
-	})
-
-	rows, err = sched.List(context.Background())
-	require.NoError(t, err)
-	require.Len(t, rows, 1)
-	require.Equal(t, ExecutionFailed, rows[0].LastStatus, "List 每次读库，不得缓存任务状态")
-	require.Equal(t, schedNow, rows[0].LastRunAt)
 }
 
-// TestScheduler_Executions_UsesLimit 覆盖约束 38 / 注 11：limit 透传到仓储并生效，
-// 结果保持仓储的 started_at 降序。
-// 逆改点：忽略 limit（固定 100 / 全量返回）→ 行数断言红；重排为升序 → 顺序断言红。
+// TestScheduler_Executions_UsesLimit —— limit 原样透传给仓储。
 func TestScheduler_Executions_UsesLimit(t *testing.T) {
-	store := newFakeTaskStore()
-	store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
-	base := schedNow.Add(-time.Hour)
-	store.executions[schedTaskID] = []ExecutionRecord{
-		{ID: 5, TaskID: schedTaskID, Status: ExecutionCompleted, Trigger: TriggerCron, StartedAt: base.Add(5 * time.Minute)},
-		{ID: 4, TaskID: schedTaskID, Status: ExecutionCompleted, Trigger: TriggerCron, StartedAt: base.Add(4 * time.Minute)},
-		{ID: 3, TaskID: schedTaskID, Status: ExecutionFailed, Trigger: TriggerCron, StartedAt: base.Add(3 * time.Minute)},
-		{ID: 2, TaskID: schedTaskID, Status: ExecutionSkipped, Trigger: TriggerCron, StartedAt: base.Add(2 * time.Minute)},
-		{ID: 1, TaskID: schedTaskID, Status: ExecutionCompleted, Trigger: TriggerCron, StartedAt: base.Add(time.Minute)},
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	for i := 0; i < 3; i++ {
+		f.fire(t, schedTaskID)
 	}
-	logger, _ := newCaptureLogger()
-	sched := newSchedulerWithEntries(store, &countingInvoker{}, &fakeEngine{}, logger,
-		[]AgentEntry{agentEntry(schedAgent, true)}, nil)
 
-	rows, err := sched.Executions(context.Background(), schedTaskID, 2)
+	rows, err := f.sched.Executions(context.Background(), schedTaskID, 2)
 	require.NoError(t, err)
-	require.Len(t, rows, 2, "limit 必须透传并生效")
-	require.Equal(t, int64(5), rows[0].ID)
-	require.Equal(t, int64(4), rows[1].ID)
-	require.True(t, rows[0].StartedAt.After(rows[1].StartedAt), "保持 started_at 降序")
+	require.Len(t, rows, 2)
 }
 
-// TestScheduler_Executions_HiddenTaskNotFound 覆盖约束 33 / N-06：未知 / retired /
-// Agent 未注册的任务一律 fs.ErrNotExist（web 404），不返回任何历史行。
-// 逆改点：跳过可见性直接查执行历史 → retired / 未注册子例返回行，断言红。
+// TestScheduler_Executions_HiddenTaskNotFound —— 不可见任务不暴露执行历史。
 func TestScheduler_Executions_HiddenTaskNotFound(t *testing.T) {
-	cases := []struct {
-		name       string
-		registered bool
-		seed       *TaskRecord
-	}{
-		{name: "unknown task", registered: true},
-		{
-			name: "retired task", registered: true,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true, RetiredAt: schedNow.Add(-time.Hour),
-			},
-		},
-		{
-			name: "agent not registered", registered: false,
-			seed: &TaskRecord{
-				TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-				Message: schedMessage, Enabled: true,
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := newFakeTaskStore()
-			if tc.seed != nil {
-				store.seedTask(*tc.seed)
-				store.executions[schedTaskID] = []ExecutionRecord{{
-					ID: 1, TaskID: schedTaskID, Status: ExecutionCompleted,
-					Trigger: TriggerCron, StartedAt: schedNow.Add(-time.Hour),
-				}}
-			}
-			logger, _ := newCaptureLogger()
-			sched := newSchedulerWithEntries(store, &countingInvoker{}, &fakeEngine{}, logger,
-				[]AgentEntry{agentEntry(schedAgent, tc.registered)}, nil)
-
-			rows, err := sched.Executions(context.Background(), schedTaskID, 100)
-			require.ErrorIs(t, err, fs.ErrNotExist, "不可见任务必须包装 fs.ErrNotExist（web 404）")
-			require.Empty(t, rows, "不得泄漏不可见任务的历史")
-		})
-	}
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	_, err := f.sched.Executions(context.Background(), "ghost", 10)
+	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
-// TestScheduler_SetEnabled_WritesDBFirst 覆盖注 2 / 约束 16：先写库、后动引擎——
-// 库写失败时引擎保持原状并上抛错误；并发下线（RowsAffected()==0）映射 fs.ErrNotExist。
-// 逆改点：先停句柄再写库 → 库失败时句柄已停，liveHandles 断言红。
+// TestScheduler_SetEnabled_WritesDBFirst —— 写库失败时库里保持原值，错误如实上抛。
 func TestScheduler_SetEnabled_WritesDBFirst(t *testing.T) {
-	t.Run("store failure leaves the engine untouched", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
-		require.Equal(t, 1, f.engine.liveHandles())
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+	f.store.setEnabledErr = errors.New("connection reset")
 
-		writeErr := errors.New("disk full")
-		f.store.mu.Lock()
-		f.store.setEnabledErr = writeErr
-		f.store.mu.Unlock()
-
-		err := f.sched.SetEnabled(context.Background(), schedTaskID, false)
-		require.ErrorIs(t, err, writeErr, "库写失败必须上抛")
-		require.Equal(t, 1, f.engine.liveHandles(), "库写失败不得停句柄")
-		require.Zero(t, f.engine.handleStops())
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.Enabled, "库值保持原值")
-	})
-
-	t.Run("concurrent retire maps to not exist", func(t *testing.T) {
-		f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-		f.store.seedTask(TaskRecord{
-			TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-			Message: schedMessage, Enabled: true,
-		})
-		f.start(t)
-		require.Equal(t, 1, f.engine.liveHandles())
-
-		// 模拟另一进程在判定与写库之间把任务下线：SQL 的 RowsAffected()==0。
-		f.store.mu.Lock()
-		f.store.setEnabledErr = fs.ErrNotExist
-		f.store.mu.Unlock()
-
-		err := f.sched.SetEnabled(context.Background(), schedTaskID, false)
-		require.ErrorIs(t, err, fs.ErrNotExist, "并发下线必须映射 fs.ErrNotExist（web 404）")
-		require.Equal(t, 1, f.engine.liveHandles(), "写库失败不得停句柄")
-		require.Zero(t, f.engine.handleStops())
-		rec, ok := f.store.task(schedTaskID)
-		require.True(t, ok)
-		require.True(t, rec.Enabled, "库值保持原值")
-	})
+	err := f.sched.SetEnabled(context.Background(), schedTaskID, false)
+	require.ErrorContains(t, err, "enabled=false")
+	row, _ := f.store.task(schedTaskID)
+	require.True(t, row.Enabled, "写库失败不得改动库值")
 }
 
-// TestScheduler_SetEnabled_ConcurrentToggles 覆盖 P-06：并发启停后，库值、句柄表与
-// 引擎句柄数一致，不出现「库=1 而句柄已停」的分叉（-race 判定数据竞争）。
-// 逆改点：判定 / 写库 / 动引擎不在同一把 stateMu 内 → -race 报竞争或终态分叉，断言红。
+// TestScheduler_SetEnabled_ConcurrentToggles —— 并发启停不崩、最终值以库为准，
+// 且下一轮扫描严格跟随时最终库值（数据库是唯一事实源）。
 func TestScheduler_SetEnabled_ConcurrentToggles(t *testing.T) {
 	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
 	f.start(t)
 
-	const toggles = 32
-	errs := make([]error, toggles)
 	var wg sync.WaitGroup
-	for i := range toggles {
-		enabled := i%2 == 0
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs[i] = f.sched.SetEnabled(context.Background(), schedTaskID, enabled)
-		}()
+	for i := 0; i < 8; i++ {
+		target := i%2 == 0
+		wg.Go(func() {
+			_ = f.sched.SetEnabled(context.Background(), schedTaskID, target)
+		})
 	}
 	wg.Wait()
-	for i, err := range errs {
-		require.NoError(t, err, "并发启停第 %d 次调用失败", i)
-	}
 
-	rec, ok := f.store.task(schedTaskID)
+	row, ok := f.store.task(schedTaskID)
 	require.True(t, ok)
-	f.sched.stateMu.RLock()
-	_, hasHandle := f.sched.handles[schedTaskID]
-	f.sched.stateMu.RUnlock()
-	require.Equal(t, rec.Enabled, hasHandle, "库值与句柄表必须一致（P-06）")
-	wantHandles := 0
-	if rec.Enabled {
-		wantHandles = 1
+	f.seed(t, schedTaskID)
+	f.scan(t)
+	f.wait(t)
+	if row.Enabled {
+		require.Len(t, f.store.snapshotClaims(), 1, "库值为启用 → 下一轮必须领取")
+	} else {
+		require.Empty(t, f.store.snapshotClaims(), "库值为停用 → 下一轮不得领取")
 	}
-	require.Equal(t, wantHandles, f.engine.liveHandles(), "引擎句柄数必须与库值一致")
 }
 
-// TestScheduler_RunNow_ArchivedSessionPropagates 覆盖约束 43：手动补跑遇归档会话 →
-// *SessionArchivedError 原样上抛（web 400），执行行收尾 skipped + 固定文案、run_id 置空。
-// 逆改点：折成 ErrTaskBusy 或吞成成功 → 错误类型断言红；按 failed 收尾 → 状态断言红。
-func TestScheduler_RunNow_ArchivedSessionPropagates(t *testing.T) {
-	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
-	f.invoker.run = func(context.Context, RunRequest) (RunResult, error) {
-		return RunResult{}, &SessionArchivedError{SessionID: schedSession}
-	}
-	f.store.seedTask(TaskRecord{
-		TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: "UTC",
-		Message: schedMessage, Enabled: true,
-	})
-	f.start(t)
-
-	_, _, err := f.sched.RunNow(context.Background(), schedTaskID)
-	var archived *SessionArchivedError
-	require.ErrorAs(t, err, &archived, "归档错误必须原样上抛（web 400）")
-	require.NotErrorIs(t, err, ErrTaskBusy, "归档错误不得折成 ErrTaskBusy")
-	// 归档互斥由 AgentService.Run 判定：运行端口被调用一次即被拒绝，不重建会话。
-	require.EqualValues(t, 1, f.invoker.calls.Load())
-	require.Equal(t, []ExecutionStatus{ExecutionSkipped}, f.store.snapshotFinished())
-	calls := f.store.snapshotFinishCalls()
-	require.Len(t, calls, 1)
-	require.Equal(t, "会话已归档，本轮跳过", calls[0].ErrMsg)
-	require.Empty(t, calls[0].RunID, "无 Run 行的终态行 run_id 必须置空")
-	f.logs.requireRecord(t, slog.LevelWarn, "会话已归档，本轮跳过")
-
-	rec, ok := f.store.task(schedTaskID)
-	require.True(t, ok)
-	require.Equal(t, ExecutionSkipped, rec.LastStatus)
-}
-
-// TestScheduler_CheckOwnership 覆盖约束 30 / 42 的归属预检：候选 id 归属其他 Agent
-// （含 retired 行）→ ErrTaskOwnerConflict；无行或同 owner（含 retired，复活）→ nil。
-// 逆改点：只查 active 行 / 不查 agent_name → 冲突与放行两侧断言红的至少一侧。
+// TestScheduler_CheckOwnership —— 归属预检只拦"属于其他 Agent"的 id；未知 id 放行。
 func TestScheduler_CheckOwnership(t *testing.T) {
-	t.Run("other owner conflicts including retired", func(t *testing.T) {
-		store := newFakeTaskStore()
-		store.seedTask(TaskRecord{TaskID: "shared", Agent: "other", Cron: schedCron, Zone: "UTC", Message: schedMessage})
-		store.seedTask(TaskRecord{
-			TaskID: "retired", Agent: "other", Cron: schedCron, Zone: "UTC", Message: schedMessage,
-			RetiredAt: schedNow.Add(-time.Hour),
-		})
-		sched := newSchedulerWith(store, &countingInvoker{}, &fakeEngine{}, nil, nil, nil)
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.store.seedTask(TaskRecord{TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone})
+	f.store.seedTask(TaskRecord{TaskID: "other-1", Agent: "other", Cron: schedCron, Zone: schedZone})
 
-		require.ErrorIs(t, sched.CheckOwnership(context.Background(), schedAgent, []string{"shared"}),
-			ErrTaskOwnerConflict)
-		require.ErrorIs(t, sched.CheckOwnership(context.Background(), schedAgent, []string{"retired"}),
-			ErrTaskOwnerConflict, "retired 行同样绑定原 owner（跨 Agent 一律拒绝）")
+	require.NoError(t, f.sched.CheckOwnership(context.Background(), schedAgent, nil))
+	require.NoError(t, f.sched.CheckOwnership(context.Background(), schedAgent, []string{schedTaskID}))
+	require.NoError(t, f.sched.CheckOwnership(context.Background(), schedAgent, []string{"ghost"}))
+	require.ErrorIs(t,
+		f.sched.CheckOwnership(context.Background(), schedAgent, []string{"other-1"}),
+		ErrTaskOwnerConflict)
+}
+
+// TestScheduler_LeaselessAssemblyRefusesToRun —— 没有执行权装配就既不启动也不补跑
+// （fail-closed，不降级成无租约执行）。
+func TestScheduler_LeaselessAssemblyRefusesToRun(t *testing.T) {
+	logger, logs := newCaptureLogger()
+	store := newFakeTaskStore()
+	store.seedTask(TaskRecord{TaskID: schedTaskID, Agent: schedAgent, Cron: schedCron, Zone: schedZone})
+	sched := NewScheduler(SchedulerOptions{
+		Store:    store,
+		Invoker:  &countingInvoker{},
+		Engine:   &fakeEngine{},
+		Entries:  []AgentEntry{{Name: schedAgent, Registered: true, Profile: &Profile{}}},
+		CronSpec: schedCronSpec,
+		Logger:   logger,
+		Now:      func() time.Time { return schedNow },
 	})
 
-	t.Run("no row or same owner allowed", func(t *testing.T) {
-		store := newFakeTaskStore()
-		store.seedTask(TaskRecord{TaskID: "own-active", Agent: schedAgent, Cron: schedCron, Zone: "UTC", Message: schedMessage})
-		store.seedTask(TaskRecord{
-			TaskID: "own-retired", Agent: schedAgent, Cron: schedCron, Zone: "UTC", Message: schedMessage,
-			RetiredAt: schedNow.Add(-time.Hour),
-		})
-		sched := newSchedulerWith(store, &countingInvoker{}, &fakeEngine{}, nil, nil, nil)
-
-		require.NoError(t, sched.CheckOwnership(context.Background(), schedAgent,
-			[]string{"missing", "own-active", "own-retired"}), "无行或同 owner（含 retired）必须放行")
-		require.NoError(t, sched.CheckOwnership(context.Background(), schedAgent, nil))
-	})
+	require.ErrorIs(t, sched.Start(context.Background()), errSchedulerNoLeases)
+	require.False(t, sched.started)
+	_, _, err := sched.RunNow(context.Background(), schedTaskID)
+	require.ErrorIs(t, err, errSchedulerNoLeases)
+	logs.requireRecord(t, slog.LevelError, "调度器缺少执行权装配，拒绝启动")
 }

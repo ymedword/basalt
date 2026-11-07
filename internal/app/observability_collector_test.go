@@ -278,7 +278,7 @@ service:
 	db := pgtest.NewTestDB(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	runID := "collector-synthetic-run"
-	require.NoError(t, postgres.NewRunStore(db).StartRun(t.Context(), core.RunRecord{RunID: runID, SessionID: "CANARY_SESSION", Agent: "CANARY_AGENT", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now.Add(-10 * time.Minute)}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(postgres.NewRunStore(db), t.Context(), core.RunRecord{RunID: runID, SessionID: "CANARY_SESSION", Agent: "CANARY_AGENT", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now.Add(-10 * time.Minute)}, core.RunResourceManifest{}))
 	_, err = db.ExecContext(t.Context(), `UPDATE runs SET status='completed',trigger='api',finished_at=$1,reason='CANARY_RUN_BODY' WHERE run_id=$2`, now.Add(-3*time.Minute).UnixMilli(), runID)
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(), `INSERT INTO llm_calls(run_id,round,provider,model,duration_ms,status,created_at,error_message,recovered_at) VALUES($1,1,'CANARY_PROVIDER','CANARY_MODEL',100,'success',$2,'CANARY_LLM_BODY',NULL),($1,2,'CANARY_PROVIDER','CANARY_MODEL',0,'unknown',$3,'CANARY_LLM_ERROR',$4)`, runID, now.Add(-9*time.Minute).UnixMilli(), now.Add(-8*time.Minute).UnixMilli(), now.Add(-2*time.Minute).UnixMilli())

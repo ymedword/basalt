@@ -114,7 +114,7 @@ describe('workspace navigation', () => {
   })
 
   it('keeps run navigation unselected and final output in a single section', async () => {
-    const run = { run_id: 'run-long-0123456789abcdef', agent: 'writer', session_id: 's1', status: 'completed', trigger: 'manual', channel: 'api', iterations: 2, tool_calls: 1, config_hash: 'abc', manifest_hash: 'def', started_at: '2026-10-21T12:00:00Z', finished_at: '2026-10-21T12:01:00Z', reason: '', final_text: '', resource_manifest: null }
+    const run = { run_id: 'run-long-0123456789abcdef', agent: 'writer', session_id: 's1', status: 'completed', trigger: 'manual', channel: 'api', iterations: 2, tool_calls: 1, config_hash: 'abc', manifest_hash: 'def', worker_instance_id: '', ownership_epoch: 0, asset_bundle_hash: '', started_at: '2026-10-21T12:00:00Z', finished_at: '2026-10-21T12:01:00Z', reason: '', final_text: '', resource_manifest: null }
     await signIn(false, { '/api/v1/runs': [run], ['/api/v1/runs/' + run.run_id]: run })
     expect(wrapper!.find('.recent-run').attributes('href')).toBe('/console/runs/' + run.run_id)
     await visit('/console/runs')

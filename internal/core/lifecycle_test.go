@@ -308,6 +308,26 @@ func (s *stubLifecycleIndex) PutLifecycleIndex(_ context.Context, _ core.Lifecyc
 	return nil
 }
 
+// ReadLifecycleIndex 替身：始终"没有索引行"，读法语义由存储层用例判定。
+// ReadLifecycleIndex always reports a missing row; storage tests judge the semantics.
+func (s *stubLifecycleIndex) ReadLifecycleIndex(_ context.Context, agent string) (core.LifecycleRecord, bool, string, error) {
+	return core.LifecycleRecord{Agent: agent}, false, "", nil
+}
+
+// SetLifecycleBarrier 替身：只记录调用参数，屏障语义由存储层用例判定。
+// SetLifecycleBarrier records its arguments; storage tests judge the semantics.
+func (s *stubLifecycleIndex) SetLifecycleBarrier(_ context.Context, _, _ string, _ time.Time) (bool, error) {
+	return true, nil
+}
+
+// RestoreLifecycleBarrier 替身：同上。
+// RestoreLifecycleBarrier mirrors the stub behaviour above.
+func (s *stubLifecycleIndex) RestoreLifecycleBarrier(_ context.Context, _ core.LifecycleRecord,
+	_ string, _ int64,
+) (bool, error) {
+	return true, nil
+}
+
 var _ core.LifecycleIndex = (*stubLifecycleIndex)(nil)
 
 // TestLifecycleRecord_IndexInterfaceShape：索引写端口接受"无效 + 原因"形态——

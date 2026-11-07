@@ -11,19 +11,26 @@ package postgres
 //     两次读取拿到同一份顺序。诊断只承诺**局部有序**，不设跨节点全局序号。
 //  4. **`audit_ref` 以 `table:id` 落一列**：三张审计表的 id 都没有表名前缀，单看数字
 //     无法回指；读侧经 `diagnostics.ParseAuditRef` 还原成对象。
+//  5. **归属两项由写入路径回填**（US-24 C-23）：`worker_instance_id` / `ownership_epoch`
+//     取自 `execution_leases` 的当前行，且只在本进程是该行属主时写入——旧属主被接管后
+//     迟到的诊断不得被标成新属主。
 //
 // This file is the only SQL entry point for diagnostic_events: one row per event and no
 // business transaction, an anchor enforced twice, a fixed order, and audit_ref carried
-// as `table:id` so a bare id can still be traced back to its table.
+// as `table:id` so a bare id can still be traced back to its table. Lease attributes are
+// backfilled on the write path and only while this process owns the run lease.
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/diagnostics"
 )
 
@@ -49,6 +56,11 @@ const diagnosticInsert = `INSERT INTO diagnostic_events (` + diagnosticColumns +
 // DiagnosticStore implements the diagnostics write and read ports structurally.
 type DiagnosticStore struct {
 	db *DB
+	// worker 是本进程的 Worker 实例标识（US-24 T032 / C-23）。只在**本进程确实持有该
+	// Run 的租约**时给 attrs 补归属两项；零值 = 不补（非 Worker 进程与既有装配）。
+	// worker is this process's instance id; the lease attributes are written only while
+	// this very process holds the run lease, and a zero value disables the backfill.
+	worker string
 }
 
 // 编译期断言：本仓储满足诊断包的读写两个端口。
@@ -62,12 +74,65 @@ var (
 // NewDiagnosticStore binds the database handle.
 func NewDiagnosticStore(db *DB) *DiagnosticStore { return &DiagnosticStore{db: db} }
 
+// WithWorker 绑定本进程的 Worker 实例标识并返回自身（链式，与其他装配修饰器同形）。
+// 只影响写入路径：读面不按它过滤，也不改写历史行。
+// WithWorker binds this process's worker instance id; only the write path is affected.
+func (s *DiagnosticStore) WithWorker(instanceID string) *DiagnosticStore {
+	s.worker = instanceID
+	return s
+}
+
+// leaseAttrs 读该 Run 的租约归属，并**只在归属者就是本进程时**返回代次。
+//
+// 为什么必须比对归属者：attrs 里的 `worker_instance_id` 断言的是"本进程写下这条事件"。
+// 只按租约行回填会在接管后把旧属主迟到的诊断标成新属主——错误归因比缺属性更糟。
+// 归属不符或根本没有租约时 attrs 原样不动，读侧因此看到的是"没有归属"而不是猜测。
+// 不看 `released_at`：本进程释放租约之后写下的迟到事件仍由本进程产生，代次也仍是事实。
+// leaseAttrs returns the run's lease epoch only when this process owns the lease row.
+// Backfilling from the row alone would relabel a stale owner's late events as the new
+// owner's; missing attribution is honest, wrong attribution is not. Release state is
+// deliberately ignored: a late event from this process is still this process's event.
+func (s *DiagnosticStore) leaseAttrs(ctx context.Context, runID string) (int64, bool, error) {
+	if s.worker == "" || runID == "" {
+		return 0, false, nil
+	}
+	var owner string
+	var epoch int64
+	err := s.db.pool.QueryRowContext(ctx, `
+SELECT owner_worker_id, ownership_epoch FROM execution_leases
+ WHERE kind = $1 AND resource_id = $2`, string(core.LeaseRun), runID).Scan(&owner, &epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("读取诊断事件的 Run 租约归属: %w", err)
+	}
+	return epoch, owner == s.worker, nil
+}
+
 // InsertEvent 落一条事件。`attrs` 以 JSON 文本写 `jsonb`（脱敏已在写入路径完成，
 // 本层不再二次过滤——但也不接受 nil：`jsonb NOT NULL` 要求 `{}`）。
 // InsertEvent writes one row; attrs travel as JSON text and a nil map still becomes `{}`
 // because the column is NOT NULL.
 func (s *DiagnosticStore) InsertEvent(ctx context.Context, ev diagnostics.DiagnosticEvent) error {
 	attrs := ev.Attrs
+	// 归属两项在这里补齐（C-23）：以**写入时刻**的租约行为准，且必须归属本进程。
+	// 查租约失败即放弃这条事件（Recorder 记 WARN + 计数）：诊断可丢弃，但**不得**带着
+	// 没有依据的归属落库。
+	// The lease attributes are stamped from the row as it stands at write time, and only
+	// when this process owns it. A failed lookup drops the event: diagnostics may be
+	// dropped, but they must never be stored with unsupported attribution.
+	epoch, owned, err := s.leaseAttrs(ctx, ev.Correlation.RunID)
+	if err != nil {
+		return err
+	}
+	if owned {
+		stamped := make(map[string]any, len(attrs)+2)
+		maps.Copy(stamped, attrs)
+		stamped["worker_instance_id"] = s.worker
+		stamped["ownership_epoch"] = epoch
+		attrs = stamped
+	}
 	if attrs == nil {
 		attrs = map[string]any{}
 	}

@@ -136,6 +136,13 @@ type runHarness struct {
 	// scopes 是追加到调用方身份上的额外 scope（知识读 scope 落在这里）。
 	// scopes are extra caller scopes on top of sessions:write.
 	scopes []string
+	// serviceOptions 是主服务的冻结装配；`workerService` 用它派生第二个 Worker
+	// （同一组端口、独立进程内实例计数）。
+	serviceOptions core.ServiceOptions
+	// limitClock 是限额投影缓存的可推进时钟：管理面改完上限调 `tickLimitCache`
+	// 让新值立刻在预检名额表与准入解析器上生效（生产 TTL 是 10s，用例不真的等）。
+	// limitClock advances the limit projection cache so mid-test limit changes apply.
+	limitClock *runHarnessLimitClock
 
 	limitMu    sync.Mutex
 	maxLimit   map[string]int
@@ -174,16 +181,20 @@ type runHarnessOptions struct {
 	// Assembly builds the chat assembly recorder from the fixture database; a nil factory
 	// keeps every existing case byte-for-byte identical, including knowledge E2E row counts.
 	Assembly func(t *testing.T, db *postgres.DB) core.AssemblyRecorder
-	// ArmLostAckBeforeStartRun 在**业务事务**（账本行 + 清单 + 引用）的提交前一刻装上
-	// "确认丢失"钩子。N-01 之后运行路径上先有配额事务（预留 / 结算各一次提交），
-	// "下一次提交丢确认"若直接装在 Run 之前，打中的是预留提交而不是业务事务——
-	// C-34 判的是业务事务不得被重放，钩子因此必须精确挂在它前面。
-	// The lost-ack hook must arm right before the business transaction, because N-01 put
-	// quota commits in front of it on the run path.
+	// ArmLostAckBeforeStartRun 在准入事务（US-24 Q21 起：账本行 + 清单 + 引用 + 租约 +
+	// 任务次数记账**同一笔提交**）之前一刻装上"确认丢失"钩子。钩子必须精确挂在
+	// `StartRun` 前：C-34 判的就是这笔提交的未知结局不得被当成"未提交"去重放。
+	// The lost-ack hook arms right before StartRun — the single admission commit on the
+	// run path since US-24 Q21.
 	ArmLostAckBeforeStartRun bool
 	// Learning 是抽取钩子；nil = 未装配（既有用例的行为与读数逐字节不变）。
 	// Learning is the extraction hook; nil keeps every existing case identical.
 	Learning core.LearningHook
+	// MaxConcurrent 覆盖实例并发上限（`TOO_MANY_RUNS` 的判据面）：0 = 沿用夹具惯例的
+	// 64（见 `serviceOptions` 注释：放大以免替调用方名额挡下请求）。错误优先级用例必须
+	// 把它压到 1，才能让"实例满"真的发生在名额与会话门禁之后而不是之前。
+	// MaxConcurrent overrides the per-worker instance cap; 0 keeps the fixture's 64.
+	MaxConcurrent int
 }
 
 // newRunHarness 组装默认夹具。
@@ -214,12 +225,14 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 		tokenLimit: make(map[string]int64),
 		taskLimit:  make(map[string]int64),
 		taskSet:    make(map[string]bool),
+		limitClock: &runHarnessLimitClock{},
 	}
 	writeRunHarnessAgent(t, root, h.agent, runHarnessProvider, runHarnessModel,
 		[]string{runHarnessToolName}, core.KnowledgeBindingNames(opts.Knowledge))
 
 	limits := concurrencyLimitReader(postgres.NewQuotaStore(db).MaxConcurrent)
-	h.slots = &runHarnessSlots{inner: newRunHarnessConcurrency(t, limits), inUse: make(map[string]int)}
+	slots, limitCache := newRunHarnessConcurrency(t, limits, h.limitClock.now)
+	h.slots = &runHarnessSlots{inner: slots, inUse: make(map[string]int)}
 	h.buckets = newRunHarnessBuckets(t)
 	quotas := &togglableQuotaStore{QuotaStore: postgres.NewQuotaStore(db)}
 	h.quotas = quotas
@@ -235,7 +248,7 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 	if opts.Observability {
 		metrics := observability.NewMetricsCollector(postgres.NewObservabilityStore(db), time.Now)
 		var err error
-		h.diag, _, err = newDiagnosticsPortsWithMetrics(cli.DiagnosticsConfig{}, db, time.Now, logger, metrics)
+		h.diag, _, err = newDiagnosticsPortsWithMetrics(cli.DiagnosticsConfig{}, db, core.WorkerIdentity{}, time.Now, logger, metrics)
 		require.NoError(t, err)
 		cfg := cli.DefaultObservabilityConfig()
 		h.observation, err = NewObservability(t.Context(), cfg, Deps{Store: postgres.NewObservabilityStore(db), Metrics: metrics, Diagnostics: h.diag, Clock: time.Now, Logger: logger})
@@ -298,35 +311,66 @@ func newRunHarnessWith(t *testing.T, opts runHarnessOptions) *runHarness {
 			postgres.ArmLoseNextCommitAck(t, db)
 		}}
 	}
+	// 实例级并发上限与线上缺省不同值是刻意的：用例判的是**调用方**名额（[3]），
+	// 实例级上限放大到不会被误触的水平，避免它替 [3] 挡下请求。错误优先级用例
+	// 经 `runHarnessOptions.MaxConcurrent` 显式调小。
+	// The fixture inflates the instance cap so it never steals [3]'s denials.
+	maxConcurrent := opts.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 64
+	}
 	serviceOptions := core.ServiceOptions{
-		Agents:    agents,
-		Client:    routing,
-		Runs:      runPort,
-		Snapshots: postgres.NewSnapshotStore(db),
-		Audit:     invocations,
-		Sessions:  h.sessions,
-		Loop:      loop,
-		Logger:    logger,
-		// 实例级并发上限与线上缺省不同值是刻意的：用例判的是**调用方**名额（[3]），
-		// 实例级上限放大到不会被误触的水平，避免它替 [3] 挡下请求。
-		MaxConcurrent: 64,
-		// Run 级任务次数（N-01）：与 [3] / [5] 共用同一个限制器实例（C-35），
-		// 任务次数与对话 Token 因此读同一份限额行、落在同一张预留表上。
+		Agents:        agents,
+		Client:        routing,
+		Runs:          runPort,
+		Snapshots:     postgres.NewSnapshotStore(db),
+		Audit:         invocations,
+		Sessions:      h.sessions,
+		Loop:          loop,
+		Logger:        logger,
+		MaxConcurrent: maxConcurrent,
+		// Run 级任务次数（N-01）：与 [3] / [5] 共用同一个限制器实例（C-35）。
+		// US-24 P-12 起准入记账在 `StartRun` 事务内完成，本端口只作 Flow 准入前置。
 		RunQuota: newRunQuota(h.limiter, h.diag, logger),
 		Learning: opts.Learning,
+		// 调用方并发判定输入（US-24 T013）：与上面的名额表共用同一份限额投影。
+		// localAdminUnlimited 与限制器的同名开关同源——夹具里未开启，与生产缺省不同
+		// 是有意的（夹具调用方都是 `PrincipalCaller`，走不到该分支）。
+		Admission: &callerAdmissionResolver{limits: limitCache},
 	}
 	if opts.Wire != nil {
 		// Run 侧知识端口按需接线：未接线时 `Knowledge` 保持 nil，服务路径逐字节不变。
 		serviceOptions.Knowledge = opts.Wire(t, db, agents)
 	}
+	h.serviceOptions = serviceOptions
 	svc := core.NewAgentService(serviceOptions)
-	admission := &runAdmission{limiter: h.limiter, logger: logger, diag: h.diag}
+	// 夹具按生产口径接上 [4] 预检的两个依赖（US-24 FR-24-34）：入口在取在途名额之前
+	// 先判调用方并发，判据与 `core.AgentService` 的 [4] / `StartRun` 复查同源。
+	admission := &runAdmission{
+		limiter:   h.limiter,
+		logger:    logger,
+		diag:      h.diag,
+		runs:      serviceOptions.Runs,
+		admission: serviceOptions.Admission,
+	}
 	h.invoker = &admittedRunInvoker{inner: svc, admission: admission}
 	h.service = NewRunService(svc, runs, withRunAdmission(admission))
 
 	// 默认调用方先落一条限额行：它同时满足 `runs.caller_id` 外键与 [5] 的"限额缺失即拒绝"。
 	h.applyLimit(t, runHarnessCaller)
 	return h
+}
+
+// workerService 构造**另一个 Worker** 的服务实例：端口与主实例相同（同一 PostgreSQL、
+// 同一批仓储），但进程内实例计数独立——`TOO_MANY_RUNS` 按每个 Worker 计就是靠这一点。
+// 跨 Worker 的调用方并发仍由 `StartRun` 事务在共享库里复查，所以第二个 Worker 放行
+// 不变量并不依赖任何进程内状态。
+// workerService builds a second worker: same ports and database, its own in-process
+// instance counter, which is exactly what the per-worker TOO_MANY_RUNS limit means.
+func (h *runHarness) workerService(maxConcurrent int) *core.AgentService {
+	opts := h.serviceOptions
+	opts.MaxConcurrent = maxConcurrent
+	return core.NewAgentService(opts)
 }
 
 // armingRunStore 在 `StartRun`（业务事务入口）之前装上"提交确认丢失"钩子，其余方法
@@ -337,22 +381,44 @@ type armingRunStore struct {
 	before func()
 }
 
-// StartRun 先装钩子再转调真实仓储。
-func (s *armingRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest) error {
+// StartRun 先装钩子再转调真实仓储（US-24 签名：owner / admission / runID 原样透传）。
+func (s *armingRunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest core.RunResourceManifest,
+	owner core.WorkerIdentity, admission core.CallerAdmission, runID string,
+) (core.LeaseToken, error) {
 	if s.before != nil {
 		s.before()
 	}
-	return s.inner.StartRun(ctx, rec, manifest)
+	return s.inner.StartRun(ctx, rec, manifest, owner, admission, runID)
 }
 
 // FinishRun 原样转发。
-func (s *armingRunStore) FinishRun(ctx context.Context, runID string, status core.RunStatus, reason string, iterations, toolCalls int, at time.Time) (bool, error) {
-	return s.inner.FinishRun(ctx, runID, status, reason, iterations, toolCalls, at)
+func (s *armingRunStore) FinishRun(ctx context.Context, runID string, token core.LeaseToken, status core.RunStatus, reason string, iterations, toolCalls int, at time.Time) (bool, error) {
+	return s.inner.FinishRun(ctx, runID, token, status, reason, iterations, toolCalls, at)
+}
+
+// CompleteRunCloseout 原样转发。
+func (s *armingRunStore) CompleteRunCloseout(ctx context.Context, runID string, token core.LeaseToken, at time.Time) error {
+	return s.inner.CompleteRunCloseout(ctx, runID, token, at)
 }
 
 // ReleaseRunRefs 原样转发。
 func (s *armingRunStore) ReleaseRunRefs(ctx context.Context, runID string, at time.Time) error {
 	return s.inner.ReleaseRunRefs(ctx, runID, at)
+}
+
+// CheckAdmission 原样转发。
+func (s *armingRunStore) CheckAdmission(ctx context.Context, sessionID string, p core.Principal, admission core.CallerAdmission) error {
+	return s.inner.CheckAdmission(ctx, sessionID, p, admission)
+}
+
+// LookupAdmittedRun 原样转发。
+func (s *armingRunStore) LookupAdmittedRun(ctx context.Context, runID string) (core.LeaseToken, error) {
+	return s.inner.LookupAdmittedRun(ctx, runID)
+}
+
+// RequestCancel 原样转发。
+func (s *armingRunStore) RequestCancel(ctx context.Context, runID string) (core.RunDetail, error) {
+	return s.inner.RequestCancel(ctx, runID)
 }
 
 // GetRun 原样转发。
@@ -368,13 +434,44 @@ func (s *armingRunStore) ListRuns(ctx context.Context, filter core.RunFilter) ([
 // newRunHarnessConcurrency 建真实名额表（限额读 `caller_limits.max_concurrent`，读不到
 // 时回退实例级上限——与 `concurrency_limits.go` 的三档语义同一份实现）。
 // newRunHarnessConcurrency builds the production slot table over the real limit reader.
-func newRunHarnessConcurrency(t *testing.T, reader concurrencyLimitReader) callers.Concurrency {
+func newRunHarnessConcurrency(
+	t *testing.T, reader concurrencyLimitReader, now func() time.Time,
+) (callers.Concurrency, *concurrencyLimitCache) {
 	t.Helper()
 
-	cache := newConcurrencyLimitCache(reader, 64, nil)
+	cache := newConcurrencyLimitCache(reader, 64, now)
 	concurrency, err := callers.NewMemoryConcurrency(cache.limit)
 	require.NoError(t, err)
-	return concurrency
+	return concurrency, cache
+}
+
+// runHarnessLimitClock 是限额投影缓存的可推进时钟：只前进、不回拨，读数与真实时钟
+// 相加，因此缓存的过期判定语义与生产逐字相同，用例只是把 TTL 提前走完。
+// runHarnessLimitClock only moves forward; expiry semantics stay production-identical.
+type runHarnessLimitClock struct {
+	mu  sync.Mutex
+	off time.Duration
+}
+
+// now 返回真实时钟加偏移。
+func (c *runHarnessLimitClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Now().Add(c.off)
+}
+
+// advance 前进偏移。
+func (c *runHarnessLimitClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.off += d
+	c.mu.Unlock()
+}
+
+// tickLimitCache 推进限额投影缓存，让刚写的调用方上限立刻在预检名额表与准入解析器
+// 上生效（`concurrencyLimitTTL` 是生产行为，用例不真的等 10 秒）。
+// tickLimitCache expires the limit projection so a just-written limit applies at once.
+func (h *runHarness) tickLimitCache() {
+	h.limitClock.advance(concurrencyLimitTTL + time.Second)
 }
 
 // runHarnessSlots 是名额表的**观察装饰器**：`Acquire` / `Release` 原样转给真实名额表，
@@ -590,6 +687,21 @@ func (s *togglableCallStore) BeginCall(ctx context.Context, call core.LLMCall) (
 // FinishCall 恒走真实实现。
 func (s *togglableCallStore) FinishCall(ctx context.Context, id int64, res core.LLMCallResult) error {
 	return s.inner.FinishCall(ctx, id, res)
+}
+
+// FencedBeginCall 把**受保护**预写原样交给真实仓储（US-24 的跨 Worker 用例需要
+// 非零执行权凭证；归属校验与 `ErrLeaseLost` 由仓储判，夹具不该在旁边另判一份）。
+// 武装开关（`FailNext`）只管普通入口：它模拟的是"审计不可用"这一种失败，不是失权。
+// FencedBeginCall delegates the fenced pre-write to the real repo; the toggle only
+// guards the unfenced entry because it simulates audit unavailability, not lease loss.
+func (s *togglableCallStore) FencedBeginCall(ctx context.Context, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	fenced, ok := s.inner.(core.FencedChatCallStore)
+	if !ok {
+		return 0, fmt.Errorf("%w（llm_calls 存储 %T）", core.ErrLeaseFenceUnavailable, s.inner)
+	}
+	return fenced.FencedBeginCall(ctx, token, call)
 }
 
 // 脚本化 provider 的三种"非文本"模式。

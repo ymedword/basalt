@@ -25,6 +25,19 @@ import (
 	"github.com/ymedword/basalt/internal/core"
 )
 
+// ProfileFromDefinition 用**装载期同一份解析器**解析一份 AGENT.md 字节的 frontmatter，
+// 只取 Profile（含 bootstrap 与 skills 声明）：资产构建据此确定哪些文件参与 bundle。
+// 本函数不读盘、不判注册、不产出段一，也不改变运行期冻结的任何口径。
+// ProfileFromDefinition parses a definition exactly as the loader does so asset builds
+// know which files the definition drags in; it performs no I/O and no registration check.
+func ProfileFromDefinition(raw []byte) (*core.Profile, error) {
+	profile, _, err := parseFrontmatter(raw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Agent 定义: %s", frontmatterErrorSummary(err))
+	}
+	return profile, nil
+}
+
 // ContextLoader 组装系统提示词段一、并冻结运行级配置快照（技术方案 §3.3 / §3.6）。
 // ContextLoader assembles section one and freezes the run-level config snapshot; it
 // holds no state beyond its logger — every call re-reads its sources.
@@ -96,6 +109,64 @@ func (c *ContextLoader) SnapshotPublished(root string, entry core.AgentEntry, sk
 	return c.snapshot(root, entry, now, skills)
 }
 
+// ConfigBundleReader 是资产快照的配置读取面（**消费方接口**，实现在 `internal/assets`）：
+// 只按准入清单覆盖的工作区相对路径读取，并逐文件复核准入时固定的 sha256 / 大小。实现
+// 返回错误即失败关闭——**不得**回落到工作副本：那正是"清单记一个哈希、实际执行另一份
+// 内容"的缺陷形态（FR-24-42）。
+// ConfigBundleReader is the consumer-side read face of a pinned asset bundle; the
+// implementation lives in internal/assets and never falls back to the work copy.
+type ConfigBundleReader interface {
+	ReadConfig(rel string) ([]byte, error)
+}
+
+// SnapshotBundle 按**内容寻址资产包**冻结一次运行的配置（FR-24-42 / FR-24-44）：
+// AGENT.md 与 bootstrap 文件只从准入固定的 bundle 目录读取（`reader` 逐文件核对清单
+// 哈希），技能卡片仍按准入固定的发布版本目录读取（`published` 非 nil）。技能版本目录
+// 与 bundle 目录同为不可变目录，两者的一致性由准入交叉核对，本函数不另判。
+//
+// 与 SnapshotPublished 的差别只有"配置文件的来源"：`entry.Definition` 是工作副本的
+// 已校验字节，准入之后工作副本可以被合法改写（热加载尚未生效、或另一 Worker 装了
+// 另一版），执行期**不得**再读它——否则 Run 清单固定的资产版本与实际注入的提示词可以
+// 不是同一份内容（执行期不读 bundle 的实现缺陷）。
+// SnapshotBundle freezes the run configuration from the pinned bundle: AGENT.md and
+// bootstrap come from the bundle with per-file digest checks, never from the work copy.
+func (c *ContextLoader) SnapshotBundle(root string, reader ConfigBundleReader,
+	entry core.AgentEntry, published PublishedSkills, now time.Time,
+) (*core.ConfigSnapshot, error) {
+	if reader == nil {
+		return nil, errors.New("资产快照缺少 bundle 读取面，拒绝组装配置快照")
+	}
+	if entry.Profile == nil || !entry.Registered {
+		return nil, fmt.Errorf("未注册的 Agent %s，不得组装系统提示词", entry.Name)
+	}
+	defPath := agentDefinitionPath(entry.Name)
+	raw, err := reader.ReadConfig(defPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取资产包内的 Agent 正文 %s: %w", defPath, err)
+	}
+	if published == nil {
+		published = PublishedSkills{}
+	}
+
+	base, err := os.OpenRoot(root) // 技能卡片仍经工作区根句柄读取发布目录
+	if err != nil {
+		return nil, fmt.Errorf("打开工作区目录 %s: %w", root, err)
+	}
+	defer func() {
+		// 关闭错误只在与组装无关时才暴露：技能卡片已全部读入内存，关闭失败说明
+		// 句柄生命周期有问题，如实上抛而不是静默丢弃。
+		if closeErr := base.Close(); closeErr != nil {
+			c.logger.Warn("关闭工作区目录", "root", root, "error", closeErr)
+		}
+	}()
+
+	frozen, err := c.freezeBytesFrom(base, root, entry.Name, raw, now, published, reader.ReadConfig)
+	if err != nil {
+		return nil, err
+	}
+	return c.snapshotOf(entry.Name, frozen)
+}
+
 // snapshot 是两个公开入口的共用实现：published 非 nil = 发布版本来源，nil = 工作副本。
 // snapshot is the shared implementation behind both public entry points.
 func (c *ContextLoader) snapshot(root string, entry core.AgentEntry, now time.Time, published PublishedSkills) (*core.ConfigSnapshot, error) {
@@ -103,18 +174,23 @@ func (c *ContextLoader) snapshot(root string, entry core.AgentEntry, now time.Ti
 	if err != nil {
 		return nil, err
 	}
+	return c.snapshotOf(entry.Name, frozen)
+}
 
-	// 排序 / 规整序列化 / 哈希只有一份实现（`core.BuildConfigSnapshot`）：工作副本与
-	// 发布版本两条来源共用同一段代码，哈希不可能分叉。重复路径不合并（声明两次出两条
-	// 清单条——与卡片"不去重"同口径，"读即所记"记的是读取行为）。
-	snapshot, err := core.BuildConfigSnapshot(entry.Name, frozen.raw, frozen.section, frozen.profile, frozen.manifest)
+// snapshotOf 把一次读取的全部产物折算成快照：排序 / 规整序列化 / 哈希只有一份实现
+// （`core.BuildConfigSnapshot`），工作副本、发布版本与资产包三条来源共用同一段代码，
+// 哈希不可能分叉。重复路径不合并（声明两次出两条清单条——与卡片"不去重"同口径，
+// "读即所记"记的是读取行为）。
+// snapshotOf turns one read into the frozen snapshot through the single shared builder.
+func (c *ContextLoader) snapshotOf(name string, frozen *frozenConfig) (*core.ConfigSnapshot, error) {
+	snapshot, err := core.BuildConfigSnapshot(name, frozen.raw, frozen.section, frozen.profile, frozen.manifest)
 	if err != nil {
 		// 元素全是字符串字段，Marshal 实际不会失败；仍如实上抛，不吞。
 		return nil, err
 	}
 
 	// 留痕只到「条数」为止——**不得**回显文件全文或配置原文（FR-027 可观测性双轨）。
-	c.logger.Debug("配置快照已冻结", "agent", entry.Name, "hash", snapshot.Hash, "files", len(snapshot.Manifest))
+	c.logger.Debug("配置快照已冻结", "agent", name, "hash", snapshot.Hash, "files", len(snapshot.Manifest))
 
 	return &snapshot, nil
 }
@@ -167,7 +243,9 @@ func (c *ContextLoader) freeze(root string, entry core.AgentEntry, now time.Time
 			return nil, fmt.Errorf("读取 Agent 正文 %s: %w", defPath, readErr)
 		}
 	}
-	return c.freezeBytes(base, root, entry.Name, raw, now, published)
+	return c.freezeBytesFrom(base, root, entry.Name, raw, now, published, func(rel string) ([]byte, error) {
+		return base.ReadFile(filepath.FromSlash(rel))
+	})
 }
 
 // freezeBytes 从**已读入的候选字节**产出快照素材：内容条件写的装载期闸门
@@ -176,6 +254,20 @@ func (c *ContextLoader) freeze(root string, entry core.AgentEntry, now time.Time
 // freezeBytes assembles the frozen material from already-read candidate bytes, so the
 // candidate-validation path and the run-snapshot path can never diverge.
 func (c *ContextLoader) freezeBytes(base *os.Root, root, name string, raw []byte, now time.Time, published PublishedSkills) (*frozenConfig, error) {
+	return c.freezeBytesFrom(base, root, name, raw, now, published, func(rel string) ([]byte, error) {
+		return base.ReadFile(filepath.FromSlash(rel))
+	})
+}
+
+// freezeBytesFrom 是冻结组装的唯一实现：AGENT.md 字节由调用方给（工作副本的已校验
+// 字节、候选字节或资产包内的清单校验字节），bootstrap 的读取面由 readBootstrap 给出
+// （工作副本经根句柄 / 资产包经清单校验的读取面），技能卡片仍经 base 读发布目录。
+// 三条来源共用同一段拼装与记账，"清单记什么"与"注入了什么"因此不可能分叉。
+// freezeBytesFrom is the single assembly implementation shared by all three sources;
+// only the bootstrap reader differs.
+func (c *ContextLoader) freezeBytesFrom(base *os.Root, root, name string, raw []byte, now time.Time,
+	published PublishedSkills, readBootstrap func(string) ([]byte, error),
+) (*frozenConfig, error) {
 	defPath := agentDefinitionPath(name)
 	// **同一份字节**解 Profile（不得读第二遍——陷阱 39）：运行期传进来的是准入校验过的
 	// entry.Definition，候选路径传进来的就是候选字节——Profile、段一正文与清单哈希因此
@@ -222,7 +314,7 @@ func (c *ContextLoader) freezeBytes(base *os.Root, root, name string, raw []byte
 	b.WriteString("你的名字是「" + profile.Identity.AgentName + "」。\n\n")
 	b.WriteString(string(body))
 	for _, f := range profile.Bootstrap {
-		content, err := base.ReadFile(filepath.FromSlash(f))
+		content, err := readBootstrap(f)
 		if err != nil {
 			return nil, fmt.Errorf("读取 bootstrap 文件 %s: %w", f, err) // 不得静默省略
 		}

@@ -643,7 +643,7 @@ func freezeNotifyRef(t *testing.T, env *notifyEnv, runID string, agentUID core.A
 ) {
 	t.Helper()
 	startedAt := baselineClock()
-	require.NoError(t, postgres.NewRunStore(env.db).StartRun(context.Background(),
+	require.NoError(t, startRunTest(postgres.NewRunStore(env.db), context.Background(),
 		core.RunRecord{
 			RunID: runID, Agent: "billing-agent", Channel: "cli", UserID: "tester",
 			Principal: core.LocalAdminPrincipal(), StartedAt: startedAt,

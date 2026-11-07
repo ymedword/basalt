@@ -33,6 +33,9 @@ type ToolInvocationRepo struct{ db *DB }
 var (
 	_ core.ToolInvocationStore  = (*ToolInvocationRepo)(nil)
 	_ core.ToolInvocationReader = (*ToolInvocationRepo)(nil)
+	// fenced 写入口（US-24 T008 / FR-24-36）：与普通写接口并存，供持有执行权凭证的
+	// 执行路径使用；未接执行权的装配继续走上面两个普通接口。
+	_ core.FencedToolAuditStore = (*ToolInvocationRepo)(nil)
 )
 
 // NewToolInvocationRepo 绑定一个已打开的写模式库句柄。
@@ -50,6 +53,35 @@ func NewToolInvocationRepo(db *DB) *ToolInvocationRepo { return &ToolInvocationR
 // input_json is stored verbatim; duration_ms stays NULL so "not yet known" cannot be
 // confused with "took zero".
 func (r *ToolInvocationRepo) BeginInvocation(ctx context.Context, inv core.ToolInvocation) (int64, error) {
+	return r.beginInvocation(ctx, r.db.pool, inv)
+}
+
+// FencedBeginInvocation 是同一 INSERT 的**受归属保护**入口（US-24 T008 / FR-24-36）：
+// 先锁租约行、校验归属，再写 pending。失权返回 `ErrLeaseLost` 且**零新行**——
+// 调用方据此拒绝执行该次工具调用（审计 fail-closed 与失权叠加，两者都不放行）。
+// FencedBeginInvocation runs the same INSERT behind the ownership fence; losing the
+// lease means no row is written and the tool call is refused.
+func (r *ToolInvocationRepo) FencedBeginInvocation(ctx context.Context, token core.LeaseToken,
+	inv core.ToolInvocation,
+) (int64, error) {
+	var id int64
+	err := fencedTx(ctx, r.db, token, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		id, err = r.beginInvocation(ctx, tx, inv)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// beginInvocation 是两条预写入口共用的唯一 INSERT（列清单只写一份）。`ex` 是普通写
+// （池）与 fenced 写（事务）的公共执行面——同一句 SQL，不可能出现两份。
+// beginInvocation is the single INSERT behind both entry points.
+func (r *ToolInvocationRepo) beginInvocation(ctx context.Context, ex sqlExecutor,
+	inv core.ToolInvocation,
+) (int64, error) {
 	startedAt := inv.CreatedAt
 	if startedAt.IsZero() {
 		// 列是 NOT NULL 且含义为"这一时刻"；零值时间会落到 1677 年之前，比缺省当前时刻更误导。
@@ -59,7 +91,7 @@ func (r *ToolInvocationRepo) BeginInvocation(ctx context.Context, inv core.ToolI
 
 	// pgx stdlib 不支持 LastInsertId：审计行标识随 INSERT 一起取回。
 	var id int64
-	err := r.db.pool.QueryRowContext(ctx,
+	err := ex.QueryRowContext(ctx,
 		`INSERT INTO tool_invocations
 		   (run_id, session_id, tool_call_id, tool_name, input_json, result_json,
 		    status, error_message, error_kind, duration_ms, started_at, finished_at)
@@ -86,7 +118,28 @@ func (r *ToolInvocationRepo) BeginInvocation(ctx context.Context, inv core.ToolI
 // finished_at is derived from the row's start plus the caller's duration so the repo never
 // reads a clock and the stored value is reproducible from explicit inputs.
 func (r *ToolInvocationRepo) FinishInvocation(ctx context.Context, id int64, result core.ToolInvocationResult) error {
-	res, err := r.db.pool.ExecContext(ctx,
+	return r.finishInvocation(ctx, r.db.pool, id, result)
+}
+
+// FencedFinishInvocation 是同一回填的**受归属保护**入口（工具结果回填面，§2.3.3）。
+// 失权时终态**不落库**、行留 pending：旧持有者不得改写新属主视野里的审计行；
+// 行本身由回收器按本次合法领取的 run_id 作用域归一化（FR-16 / FR-39）。
+// FencedFinishInvocation refuses to write a terminal state without ownership; the row
+// stays pending for the scoped normalization pass.
+func (r *ToolInvocationRepo) FencedFinishInvocation(ctx context.Context, token core.LeaseToken,
+	id int64, result core.ToolInvocationResult,
+) error {
+	return fencedTx(ctx, r.db, token, func(ctx context.Context, tx *sql.Tx) error {
+		return r.finishInvocation(ctx, tx, id, result)
+	})
+}
+
+// finishInvocation 是两条回填入口共用的唯一 UPDATE。`ex` 的含义同 beginInvocation。
+// finishInvocation is the single UPDATE behind both entry points.
+func (r *ToolInvocationRepo) finishInvocation(ctx context.Context, ex sqlExecutor,
+	id int64, result core.ToolInvocationResult,
+) error {
+	res, err := ex.ExecContext(ctx,
 		`UPDATE tool_invocations
 		    SET status = $1, error_kind = $2, result_json = $3, error_message = $4,
 		        duration_ms = $5, finished_at = started_at + $6

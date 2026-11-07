@@ -21,6 +21,17 @@ package app
 //
 // This file adapts callers.Limiter to the core RunQuota port: one task per logical run,
 // idempotent on run:<run_id>:admit, settled immediately, never auto-released.
+//
+// US-24 P-12 起准入路径**不再调用** `ChargeRun`：任务次数记账改由仓储在 `StartRun`
+// 的同一事务内完成（`chargeRunTaskQuotaTx`，幂等键同为 `run:<run_id>:admit`，
+// FR-24-03 / FR-24-33），与 Run 行、清单、引用、lease 同生共死；`core.Service.Run`
+// 因此删掉了这里的一笔调用（重复记账会把同一次准入扣两次）。本适配器仍保留并接线：
+//   - `ServiceOptions.RunQuota` 非 nil 是 Flow 准入的前置（service.go 的 Flow 守卫），
+//     零值会让 Flow 请求在装配层被误判为未就绪；
+//   - 端口是 `core.RunQuota` 的公开形状，非仓储装配（轻装配 / 测试替身）仍可用它。
+// 任何路径都**不得**让本适配器与事务内记账同时生效——那是同一次准入的两条记账路径。
+// Since US-24 P-12 the admission charge commits inside StartRun's transaction; this
+// adapter remains wired as the core.RunQuota port but must never double-charge.
 
 import (
 	"context"

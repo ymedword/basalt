@@ -156,7 +156,7 @@ func TestScopeConversion_BlockedByRun(t *testing.T) {
 	require.NoError(t, err)
 	manifest.Hash = manifestHash
 	runID := "run-scope-1"
-	require.NoError(t, env.runs.StartRun(ctx, core.RunRecord{
+	require.NoError(t, startRunTest(env.runs, ctx, core.RunRecord{
 		RunID: runID, Agent: "reporter", Channel: "web", UserID: "u-1",
 		Principal: core.LocalAdminPrincipal(), StartedAt: baselineClock(),
 	}, manifest))
@@ -170,7 +170,7 @@ func TestScopeConversion_BlockedByRun(t *testing.T) {
 	require.Equal(t, core.ScopeShared, env.pointerScope(t, "alpha").Scope)
 
 	// 运行结束 → 引用释放 → 转换通过。US-22 C-05：终态写回与引用释放是两个显式调用。
-	applied, err := env.runs.FinishRun(ctx, runID, core.StatusCompleted, "", 1, 0,
+	applied, err := env.runs.FinishRun(ctx, runID, core.LeaseToken{}, core.StatusCompleted, "", 1, 0,
 		baselineClock().Add(0))
 	require.NoError(t, err)
 	require.True(t, applied)

@@ -178,13 +178,24 @@ func TestFlow_RuntimeConstructionAndAuthenticatedWorkerLifecycle(t *testing.T) {
 	orphan, err := rt.flows.service.Start(t.Context(), flow.StartRequest{Principal: core.LocalAdminCLIPrincipal(), DefinitionUID: definition.DefinitionUID, IdempotencyKey: "startup-orphan", Input: json.RawMessage(`{"answer":"input"}`)})
 	require.NoError(t, err)
 	sum := sha256.Sum256(orphan.Revision.Input)
-	_, err = rt.flows.store.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: orphan.Version, Now: time.Now().UnixMilli(), Attempt: flow.NodeAttempt{ID: "orphan-attempt", TaskID: orphan.ID, NodeID: "draft", NodeInvocationID: orphan.ID + ":draft", Attempt: 1, ExecutionEpoch: orphan.Version.ExecutionEpoch, RunID: "orphan-planned-run", SessionID: "orphan-planned-session", Input: orphan.Revision.Input, InputHash: hex.EncodeToString(sum[:])}})
+	// 夹具把这条根建模成"属主已崩溃"：按真实身份领取后**不释放**，留到 TTL 到期由
+	// 管理面 / 回收器合法接管。活租约同时把它挡在 ReadyRoots 之外（§3.1.6：就绪扫描
+	// 排除未释放且未过期的行），用例才能在无并发争用下先观察"启动不 Park"。
+	// The fixture models a crashed owner: take the root lease, never release it.
+	orphanLease := acquireFlowRootForTest(t, rt.db, orphan.ID)
+	_, err = rt.flows.store.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: orphan.Version, Lease: orphanLease, Now: time.Now().UnixMilli(), Attempt: flow.NodeAttempt{ID: "orphan-attempt", TaskID: orphan.ID, NodeID: "draft", NodeInvocationID: orphan.ID + ":draft", Attempt: 1, ExecutionEpoch: orphan.Version.ExecutionEpoch, RunID: "orphan-planned-run", SessionID: "orphan-planned-session", Input: orphan.Revision.Input, InputHash: hex.EncodeToString(sum[:])}})
 	require.NoError(t, err)
 	rt.flows.service.Config.MaxOpenTasks = 1 // Simulate a lowered admission ceiling after two roots existed.
 	require.NoError(t, rt.flows.Start(t.Context()))
 	orphan, err = rt.flows.store.ReadForWorker(t.Context(), orphan.ID)
 	require.NoError(t, err)
-	require.Equal(t, flow.Blocked, orphan.Status, "startup must park an interrupted root before any dispatch")
+	// US-24 起启动**不得**全局扫未收口根：多 Worker 下这条根可能正被别的活实例推进，
+	// 按"启动时还看到 running"Park 掉就是打断别人（FR-24-02）。状态与 attempt 都必须
+	// 原样保留，遗留根由回收器按过期租约取证后 Recover 处理。
+	require.Equal(t, flow.Running, orphan.Status, "startup must not park an interrupted root (FR-24-02)")
+	var attemptState string
+	require.NoError(t, rt.db.QueryRowContext(t.Context(), `SELECT state FROM flow_node_attempts WHERE task_id=$1`, orphan.ID).Scan(&attemptState))
+	require.Equal(t, "running", attemptState, "startup must leave the claimed attempt untouched")
 	require.Empty(t, model.requests(), "Worker must await the validated listener authentication posture")
 	rt.flows.authenticationReady()
 	require.Eventually(t, func() bool {
@@ -192,14 +203,23 @@ func TestFlow_RuntimeConstructionAndAuthenticatedWorkerLifecycle(t *testing.T) {
 		return err == nil && current.Status == flow.Succeeded
 	}, 5*time.Second, 10*time.Millisecond)
 	require.Len(t, model.requests(), 1)
-	_, err = rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: orphan.Version, OperationID: "resume-startup-orphan", Reason: "original process gone; no external action issued"})
-	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		current, err := rt.flows.store.ReadForWorker(t.Context(), orphan.ID)
-		return err == nil && current.Status == flow.Succeeded
-	}, 5*time.Second, 10*time.Millisecond)
-	require.Len(t, model.requests(), 2)
+	// 先停掉本进程的 Worker 再驱动遗留根：两轮 Recover 的版本推进由本用例独占，
+	// 不与池子的领取交错（生产里这一步归回收器 A3）。
 	require.NoError(t, rt.flows.Close())
+	expireFlowRootLeaseForTest(t, rt.db, orphan.ID)
+	// 两轮收敛（US-24 §2.3.6 / FR-24-38）：第一轮以 Isolated=true 把整棵子树的
+	// prepared / running 收敛成 interrupted，结论仍是 Blocked；第二轮没有 in-flight
+	// attempt 才允许写 Queued（推进类结论要根租约，withRootLease 走接管领取）。
+	blocked, err := rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: orphan.Version, OperationID: "resume-startup-orphan", Reason: "worker_lease_expired"})
+	require.NoError(t, err)
+	require.Equal(t, flow.Blocked, blocked.Status)
+	queued, err := rt.flows.service.Recover(t.Context(), flow.ResumeRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: blocked.Version, OperationID: "resume-startup-orphan-joined", Reason: "worker_lease_expired"})
+	require.NoError(t, err)
+	require.Equal(t, flow.Queued, queued.Status)
+	finished, err := advanceUnderFlowRoot(t, rt.db, rt.flows.service, orphan.ID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: orphan.ID, Expected: queued.Version})
+	require.NoError(t, err)
+	require.Equal(t, flow.Succeeded, finished.Status)
+	require.Len(t, model.requests(), 2)
 	var count int
 	require.NoError(t, rt.db.QueryRowContext(t.Context(), `SELECT count(*) FROM runs`).Scan(&count))
 	require.Equal(t, 2, count, "DB remains open through the actual Worker join; planned orphan was never a Run")

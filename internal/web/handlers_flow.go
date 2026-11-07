@@ -147,6 +147,10 @@ func (s *Server) writeFlowError(w http.ResponseWriter, err error) {
 		status, code, message = 429, "FLOW_INTERACTIVE_RESERVE", "当前调用方并发额度已全部预留给交互运行；请调整额度或交互预留后再新建任务"
 	case errors.Is(err, flow.ErrBudget):
 		status, code, message = 409, "FLOW_STATE_CONFLICT", "任务预算已耗尽，不能继续分配"
+	case errors.Is(err, flow.ErrFlowRootBusy):
+		// 执行者持有根租约时，管理面 resume / revise 不降级成无租约写入，
+		// 如实回应 409，由调用方在其他 Worker 交棒后重试（FR-24-37 / §2.3.6）。
+		status, code, message = 409, codeFlowRootBusy, "根任务正由执行者推进，请在其他执行者交棒后重试"
 	case errors.Is(err, flow.ErrStateConflict), errors.Is(err, flow.ErrCommitUnknown):
 		status, code, message = 409, "FLOW_STATE_CONFLICT", "任务状态或操作结果尚未核对，请读取当前状态"
 	}

@@ -206,6 +206,9 @@ func Run(ctx context.Context, args []string) int {
 			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
 			Database:               databaseConfig(cfg),
 			Logger:                 logger,
+			// 创建成功后即发布资产（US-24 §2.3.9 / FR-24-25）：CLI 写路径与
+			// `assets install --agent` 用同一个资产根，装在哪与读哪不分叉（FR-24-44）。
+			BundleRoot: resolveAssetBundleRoot(cfg, workDir),
 		},
 		// PostgreSQL 迁移端口与库、锁、运行期资源都无关（每次调用自建并释放连接池），
 		// 因此两条路径都安全带上：`db migrate` 是建库前置，不能要求先有运行期装配。
@@ -256,6 +259,21 @@ func Run(ctx context.Context, args []string) int {
 			AutoExtract:            learningPortConfig(cfg).AutoExtract,
 			Agents:                 learningPortConfig(cfg).Agents,
 			Logger:                 logger,
+		},
+		// Worker 登记行的**只读**列表端口（US-24 §3.1.12）：只开只读会话、不取锁、
+		// 不刷新心跳——诊断命令不得替任何人续命。
+		// The read-only worker listing: read-only session, no lock, no heartbeat write.
+		Workers: workersPort{Database: databaseConfig(cfg)},
+		// 资产 bundle 命令面（US-24 §3.1.11）：资产根在这里按 `assets.bundle_root`
+		// 解析（相对路径以进程工作目录为基准），install 的共享发布写入在实例锁内完成；
+		// 每次调用自建句柄，两条路径都安全带上。
+		// The asset surface resolves the bundle root here and publishes under the lock.
+		Assets: assetsPort{
+			WorkDir:                workDir,
+			SupportedSchemaVersion: postgres.SupportedSchemaVersion,
+			Database:               databaseConfig(cfg),
+			Logger:                 logger,
+			Root:                   resolveAssetBundleRoot(cfg, workDir),
 		},
 		CLIWriteActor: func() core.Actor { return cliWriteActor(logger) },
 	}
@@ -336,6 +354,29 @@ func Run(ctx context.Context, args []string) int {
 			var stopSignals context.CancelFunc
 			runCtx, stopSignals = a.signalContext(ctx)
 			defer stopSignals()
+			// 图 11 的三段预算都从**信号**起算，不是从 Close 起算：HTTP 优雅关闭
+			// 花掉的秒数必须计入，否则进程会比配置承诺的 45s 多活一段。
+			// All figure-11 budgets count from the signal instant, not from Close.
+			rt.shutdown.watchSignal(runCtx)
+
+			// Worker 身份先于一切领取（US-24 图 1）：Register 成功才参与协调，失败即启动
+			// 失败。放在调度器 Start 之前——调度器一旦开始领取，进程就必须已经有身份。
+			// The worker registers before anything claims work; a failed registration
+			// aborts startup (figure 1).
+			workerRT, workerErr := a.startWorkerRuntime(runCtx, rt.db, rt.workerIdentity, rt.reclaimer)
+			if workerErr != nil {
+				code := scheduleStartExitCode(runCtx, workerErr)
+				if code == 0 {
+					logger.Warn("启动被信号中断", "error", workerErr)
+				} else {
+					logger.Error("Worker 注册失败", "error", workerErr)
+				}
+				if closeErr := rt.Close(); closeErr != nil {
+					logger.Error("重路径资源释放失败", "error", closeErr)
+				}
+				return code
+			}
+			rt.worker = workerRT
 
 			// 启动失败两层边界（注 16）：存储层致命 → fail closed；runCtx 已被信号取消
 			// → 属于"启动被信号打断"，退出码 0（WARN），其余 → 1（ERROR）。判定只调一次。

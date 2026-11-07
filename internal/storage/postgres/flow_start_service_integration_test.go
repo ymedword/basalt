@@ -8,6 +8,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -41,7 +42,12 @@ func (p *flowStartAuthorityProbe) Freeze(_ context.Context, principal core.Princ
 func flowServiceForStore(s *FlowStore) *flow.Service {
 	config := flow.DefaultConfig()
 	config.Enabled = true
-	return &flow.Service{Repository: s, Definitions: s, Schemas: tool.NewSchemaCompiler(), Authority: &flowStartAuthorityProbe{}, Config: config}
+	// 管理面 Revise / Recover 写 Queued 属推进类，需要根租约（US-24 §3.1.6）：
+	// 夹具按真实装配注入身份与租约端口，缺这三项会被拒为 ErrFlowRootBusy。
+	return &flow.Service{
+		Repository: s, Definitions: s, Schemas: tool.NewSchemaCompiler(), Authority: &flowStartAuthorityProbe{}, Config: config,
+		Identity: core.WorkerIdentity{InstanceID: "flow-store-fixture", Name: "fixture"}, Leases: NewLeaseStore(s.db), LeaseTTL: 30 * time.Second,
+	}
 }
 
 func startFlowRequest(def flow.DefinitionVersion, key string) flow.StartRequest {

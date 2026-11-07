@@ -33,6 +33,10 @@ type ProviderService struct {
 	// view cannot extract and must fail closed rather than fall back to purpose='chat'.
 	memoryStore core.MemoryExtractCallStore
 	logger      *slog.Logger
+	// built 是本视图所绑 Provider 实例的构建证据（US-24 P-21 / FR-24-25）：版本引用 +
+	// 凭据 pin。零值 = 未声明（轻装配 / 评测注入），准入据此跳过本地实例比对。
+	// built is the local instance's build proof; the zero value means undeclared.
+	built core.BuiltVersion
 }
 
 // 编译期断言：路由面与单供应商面同形——调用方不必知道自己在跟谁说话。
@@ -52,6 +56,27 @@ func NewProviderService(clients map[string]core.ProviderClient, models map[strin
 		logger = slog.Default()
 	}
 	return &ProviderService{clients: clients, models: models, store: store, logger: logger}
+}
+
+// WithBuiltVersion 给本视图挂上构建证据并返回自身（与 `WithMemoryExtractStore` 同形：
+// 装配期一次性配置，运行期只读）。生产目录在构造条目时写入，`Resolve` 用它做
+// "本地实例版本证明"；不带证据的视图（零值）由准入跳过比对。
+// WithBuiltVersion attaches the instance's build proof at assembly time.
+func (s *ProviderService) WithBuiltVersion(built core.BuiltVersion) *ProviderService {
+	if s == nil {
+		return nil
+	}
+	s.built = built
+	return s
+}
+
+// BuiltVersion 报告本视图的构建证据（`core.BuiltVersioned`）。
+// BuiltVersion reports this view's build proof.
+func (s *ProviderService) BuiltVersion() core.BuiltVersion {
+	if s == nil {
+		return core.BuiltVersion{}
+	}
+	return s.built
 }
 
 // clientFor 是路由的唯一实现：只查显式映射表——不遍历、不推断、不取"唯一的那个"当默认
@@ -117,7 +142,7 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	// 3. 预写（留痕先于发出，契约 §7.2）：审计不可用时**拒绝发出**——审计为什么比调用更硬，
 	// 见宪法 V：没有留痕的调用在事后无法被复核，等于没发生过。
 	beginCtx, cancelBegin := auditContext(ctx)
-	callID, err := s.store.BeginCall(beginCtx, core.LLMCall{
+	callID, err := beginChatCall(beginCtx, s.store, req.Lease, core.LLMCall{
 		RunID:      req.RunID,
 		SessionID:  req.SessionID,
 		Round:      req.Round,
@@ -205,6 +230,41 @@ func (s *ProviderService) Chat(ctx context.Context, req core.ChatRequest) (core.
 	return resp, chatErr
 }
 
+// beginChatCall 选对话预写入口（US-24 T008 / FR-24-36）：零值凭证走普通入口（未接
+// 执行权的装配），非零凭证**必须**走 fenced 入口；实现缺失即 fail-closed——装配缺陷
+// 不得降级成无保护预写，否则旧持有者仍能在接管后写审计行。
+// beginChatCall picks the chat pre-write entry point by the credential and fails closed
+// when a fenced entry is required but absent.
+func beginChatCall(ctx context.Context, store core.LLMCallStore, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	if token.IsZero() {
+		return store.BeginCall(ctx, call)
+	}
+	fenced, ok := store.(core.FencedChatCallStore)
+	if !ok {
+		return 0, fmt.Errorf("%w（llm_calls 存储 %T）", core.ErrLeaseFenceUnavailable, store)
+	}
+	return fenced.FencedBeginCall(ctx, token, call)
+}
+
+// beginExtractCall 选抽取预写入口：口径与 beginChatCall 相同，但**不**在两套接口之间
+// 互相顶替——抽取凭证缺失时也绝不退回 `purpose='chat'` 的预写（那会写错用途列）。
+// beginExtractCall mirrors beginChatCall for the extraction surface; it never falls back
+// to the chat entry, which would write the wrong purpose.
+func beginExtractCall(ctx context.Context, store core.MemoryExtractCallStore, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	if token.IsZero() {
+		return store.BeginMemoryExtractCall(ctx, call)
+	}
+	fenced, ok := store.(core.FencedMemoryExtractCallStore)
+	if !ok {
+		return 0, fmt.Errorf("%w（memory_extract 存储 %T）", core.ErrLeaseFenceUnavailable, store)
+	}
+	return fenced.FencedBeginMemoryExtractCall(ctx, token, call)
+}
+
 // WithMemoryExtractStore 返回共享客户端、模型表、日志与聊天审计仓储的新实例，并装上抽取
 // 预写面；装配期调用，运行期只读。未设置该仓储时 `ChatMemoryExtract` 拒绝发出（fail-closed）。
 // WithMemoryExtractStore returns a new view that shares the routing map, model map, logger
@@ -272,7 +332,7 @@ func (s *ProviderService) ChatMemoryExtract(ctx context.Context, req core.ChatRe
 
 	// 2. 预写：受工作段截止约束（不 WithoutCancel 外扩），失败即拒绝发出（宪法 V）。
 	beginCtx, cancelBegin := context.WithTimeout(ctx, auditWriteTimeout)
-	callID, err := s.memoryStore.BeginMemoryExtractCall(beginCtx, core.LLMCall{
+	callID, err := beginExtractCall(beginCtx, s.memoryStore, req.Lease, core.LLMCall{
 		RunID:      req.RunID,
 		SessionID:  req.SessionID,
 		Round:      req.Round,
@@ -366,6 +426,9 @@ func (s *ProviderService) Pinned(name string) (*ProviderService, bool) {
 		store:       s.store,
 		memoryStore: s.memoryStore,
 		logger:      s.logger,
+		// 构建证据随固定视图一起交出（US-24 P-21）：丢了它，准入就无法证明运行时
+		// 实际拿到的实例是目标版本。
+		built: s.built,
 	}, true
 }
 

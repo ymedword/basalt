@@ -53,6 +53,8 @@ func TestFlow_CommitRechecksOriginalKeyAfterValidation(t *testing.T) {
 			create.Contract.Scope = core.FlowAuthority{CallerID: p.CallerID, KeyID: p.KeyID, AuthorizingKind: core.AuthorizingKindCallerKey, Scopes: scopes, AgentUIDs: []string{"ag_one"}}
 			task, err := s.Create(t.Context(), create)
 			require.NoError(t, err)
+			// 凭证必须原样下传：子 Run 创建（createRunForNode）以它证明父根归属。
+			root := flowRootLeaseFor(t, s.db, task.RootTaskID)
 			fired := false
 			schemas := &flowCallbackSchemas{SchemaCompiler: tool.NewSchemaCompiler(), callback: func() {
 				fired = true
@@ -67,7 +69,7 @@ func TestFlow_CommitRechecksOriginalKeyAfterValidation(t *testing.T) {
 			config := flow.DefaultConfig()
 			config.Enabled = true
 			service := &flow.Service{Repository: s, Definitions: s, Schemas: schemas, Authority: &flowCommitAuthority{p: p}, Runner: &flowAdvanceRunner{store: s, output: json.RawMessage(`{"answer":"known output"}`)}, Config: config}
-			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: p, TaskID: task.ID, Expected: task.Version})
+			finished, err := service.Advance(t.Context(), flow.AdvanceRequest{Principal: p, TaskID: task.ID, Expected: task.Version, Lease: root})
 			require.True(t, fired, "the mutation must occur in the last validator")
 			var artifacts int
 			require.NoError(t, s.db.pool.QueryRowContext(t.Context(), `SELECT count(*) FROM flow_artifacts WHERE task_id=$1`, task.ID).Scan(&artifacts))

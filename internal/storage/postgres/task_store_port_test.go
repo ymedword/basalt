@@ -17,7 +17,10 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -100,7 +103,8 @@ func taskPortSeedExecutionAt(t *testing.T, w *sql.DB, taskID, runID string, stat
 func taskPortListExecutions(t *testing.T, r *sql.DB, taskID string) []core.ExecutionRecord {
 	t.Helper()
 	rows, err := r.QueryContext(context.Background(),
-		`SELECT id, task_id, run_id, status, trigger, duration_ms, error_message, started_at, finished_at
+		`SELECT id, task_id, run_id, status, trigger, duration_ms, error_message, started_at, finished_at,
+		        planned_at
 		   FROM task_executions WHERE task_id = $1 ORDER BY id ASC`, taskID)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rows.Close()) }()
@@ -116,9 +120,10 @@ func taskPortListExecutions(t *testing.T, r *sql.DB, taskID string) []core.Execu
 			errMsg     sql.NullString
 			startedAt  int64
 			finishedAt sql.NullInt64
+			plannedAt  sql.NullInt64
 		)
 		require.NoError(t, rows.Scan(&rec.ID, &rec.TaskID, &runID, &status, &trigger,
-			&durationMS, &errMsg, &startedAt, &finishedAt))
+			&durationMS, &errMsg, &startedAt, &finishedAt, &plannedAt))
 		rec.RunID = runID.String
 		rec.Status = core.ExecutionStatus(status)
 		rec.Trigger = core.Trigger(trigger)
@@ -127,6 +132,10 @@ func taskPortListExecutions(t *testing.T, r *sql.DB, taskID string) []core.Execu
 		rec.StartedAt = time.UnixMilli(startedAt).UTC()
 		if finishedAt.Valid {
 			rec.FinishedAt = time.UnixMilli(finishedAt.Int64).UTC()
+		}
+		if plannedAt.Valid {
+			at := time.UnixMilli(plannedAt.Int64).UTC()
+			rec.PlannedAt = &at
 		}
 		out = append(out, rec)
 	}
@@ -533,19 +542,69 @@ func TestTaskStore_MarkTaskRun(t *testing.T) {
 	require.Equal(t, opNow.UnixMilli(), taskPortUpdatedAtOf(t, db, "demo-1").UnixMilli())
 }
 
-// TestTaskStore_StartExecutionAndFinish：起始行恒为 started；收尾填时长与错误消息。
+// portWorker 造一个固定的进程身份（租约归属只看 InstanceID，Name 仅诊断）。
+// portWorker builds a fixed worker identity; only InstanceID carries ownership.
+func portWorker(instanceID string) core.WorkerIdentity {
+	return core.WorkerIdentity{InstanceID: instanceID, Name: "worker-" + instanceID}
+}
+
+// portLeaseTTL 是这些用例使用的执行租约时长：足够长，判据只关心"是否仍有执行权"，
+// 不靠到期制造失权（到期路径由 schedule_coord / reclaimer 用例覆盖）。
+// portLeaseTTL is long enough that these assertions never depend on expiry.
+const portLeaseTTL = time.Minute
+
+// portLeaseState 是直读出的租约行快照（只取这三列，够判建约与释放）。
+// portLeaseState holds the three lease columns these assertions need.
+type portLeaseState struct {
+	Owner    string
+	Epoch    int64
+	Released sql.NullInt64
+}
+
+// portLeaseRow 直读 `(kind, resource_id)` 的租约行：起始写必须建约、收尾必须释放，
+// 这两处副作用无法从执行行本身观察到，只能回查租约表。
+// portLeaseRow reads the lease row back; acquire/release effects are invisible on the
+// execution row alone.
+func portLeaseRow(t *testing.T, db *DB, kind core.LeaseKind, resourceID string) (portLeaseState, bool) {
+	t.Helper()
+	var out portLeaseState
+	err := db.pool.QueryRowContext(context.Background(),
+		`SELECT owner_worker_id, ownership_epoch, released_at
+		   FROM execution_leases WHERE kind = $1 AND resource_id = $2`,
+		string(kind), resourceID).Scan(&out.Owner, &out.Epoch, &out.Released)
+	if errors.Is(err, sql.ErrNoRows) {
+		return portLeaseState{}, false
+	}
+	require.NoError(t, err)
+	return out, true
+}
+
+// TestTaskStore_StartExecutionAndFinish：起始写在**同一事务**里落执行行与
+// `schedule_execution` 租约（US-24 T015）；收尾带 token 做 fencing，成功后释放租约。
+// 逆改点：只写执行行不写租约 → 租约断言红；收尾不校验归属 → 失权断言红；
+// 收尾不释放租约 → released_at 断言红。
 func TestTaskStore_StartExecutionAndFinish(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("start", func(t *testing.T) {
+	start := func(t *testing.T, store *TaskStore, runID string) (int64, core.LeaseToken) {
+		t.Helper()
+		id, token, err := store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", RunID: runID, Status: core.ExecutionStarted,
+			Trigger: core.TriggerCron, StartedAt: opNow,
+		}, portWorker("worker-a"), portLeaseTTL)
+		require.NoError(t, err)
+		return id, token
+	}
+
+	t.Run("start_writes_row_and_lease", func(t *testing.T) {
 		db := portTestDB(t)
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 
-		id, err := store.StartExecution(ctx, core.ExecutionRecord{
+		id, token, err := store.StartExecution(ctx, core.ExecutionRecord{
 			TaskID: "demo-1", RunID: "scheduler-1-a", Status: core.ExecutionStarted,
 			Trigger: core.TriggerCron, StartedAt: opNow,
-		})
+		}, portWorker("worker-a"), portLeaseTTL)
 		require.NoError(t, err)
 		require.NotZero(t, id)
 
@@ -560,6 +619,50 @@ func TestTaskStore_StartExecutionAndFinish(t *testing.T) {
 		require.Empty(t, got.ErrorMessage)
 		require.True(t, got.FinishedAt.IsZero(), "起始行未结束 → finished_at 为 NULL")
 		require.Equal(t, opNow.UnixMilli(), got.StartedAt.UnixMilli())
+		require.True(t, got.PlannedAt == nil, "手补跑的起始行没有计划时刻（manual 为 nil）")
+
+		// 执行权凭证：kind / 资源 / 归属 / 首代次。
+		require.Equal(t, core.LeaseScheduleExecution, token.Kind)
+		require.Equal(t, strconv.FormatInt(id, 10), token.ResourceID)
+		require.Equal(t, "worker-a", token.OwnerWorkerID)
+		require.Equal(t, int64(1), token.OwnershipEpoch)
+
+		lease, ok := portLeaseRow(t, db, core.LeaseScheduleExecution, token.ResourceID)
+		require.True(t, ok, "起始写必须同时建执行租约（没有执行权就没有可 fencing 的收尾）")
+		require.Equal(t, "worker-a", lease.Owner)
+		require.Equal(t, int64(1), lease.Epoch)
+		require.False(t, lease.Released.Valid, "新建租约未释放")
+	})
+
+	t.Run("start_rejects_missing_identity_or_run", func(t *testing.T) {
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+
+		_, _, err := store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", RunID: "run-a", Trigger: core.TriggerCron, StartedAt: opNow,
+		}, core.WorkerIdentity{}, portLeaseTTL)
+		require.Error(t, err, "没有领取者身份就不是合法执行")
+
+		_, _, err = store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", Trigger: core.TriggerCron, StartedAt: opNow,
+		}, portWorker("worker-a"), portLeaseTTL)
+		require.Error(t, err, "没有 RunID 就没有可归属的运行（执法 §3.1.5）")
+
+		require.Empty(t, taskPortListExecutions(t, db.pool, "demo-1"), "两次拒绝都零写入")
+	})
+
+	t.Run("start_second_rejected_busy", func(t *testing.T) {
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		start(t, store, "run-a")
+
+		_, _, err := store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", RunID: "run-b", Trigger: core.TriggerManual, StartedAt: opNow,
+		}, portWorker("worker-b"), portLeaseTTL)
+		require.ErrorIs(t, err, core.ErrTaskBusy, "同任务同时最多一条 started 执行（FR-24-13）")
+		require.Len(t, taskPortListExecutions(t, db.pool, "demo-1"), 1)
 	})
 
 	t.Run("finish_fills_duration_and_error", func(t *testing.T) {
@@ -567,15 +670,10 @@ func TestTaskStore_StartExecutionAndFinish(t *testing.T) {
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 		taskPortSeedRun(t, db, "run-a", "failed")
-
-		id, err := store.StartExecution(ctx, core.ExecutionRecord{
-			TaskID: "demo-1", RunID: "run-a", Status: core.ExecutionStarted,
-			Trigger: core.TriggerCron, StartedAt: opNow,
-		})
-		require.NoError(t, err)
+		id, token := start(t, store, "run-a")
 
 		finished := opNow.Add(1500 * time.Millisecond)
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionFailed,
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionFailed,
 			1500*time.Millisecond, "模型调用失败", finished))
 
 		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
@@ -585,53 +683,68 @@ func TestTaskStore_StartExecutionAndFinish(t *testing.T) {
 		require.Equal(t, finished.UnixMilli(), got.FinishedAt.UnixMilli())
 		require.Equal(t, "run-a", got.RunID, "Run 行存在 → run_id 保留")
 		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
+
+		lease, ok := portLeaseRow(t, db, core.LeaseScheduleExecution, token.ResourceID)
+		require.True(t, ok)
+		require.True(t, lease.Released.Valid, "收尾成功必须释放执行租约")
 	})
-}
 
-// TestTaskStore_FinishExecution：终态写在同一事务同步 last_status（含 skipped）；
-// run_id 的判据是"该行是否真的产生过 Run"，不是 status 取值（P-04）。
-// 逆改点：只写执行行 → last_status 保持旧值；按 status == 'skipped' 判清除 →
-// 准入失败行留悬空引用；未知行号静默成功 → 错误断言红。
-func TestTaskStore_FinishExecution(t *testing.T) {
-	ctx := context.Background()
+	t.Run("finish_rejects_stale_owner", func(t *testing.T) {
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		id, token := start(t, store, "run-a")
 
-	start := func(t *testing.T, store *TaskStore, runID string) int64 {
-		t.Helper()
-		id, err := store.StartExecution(ctx, core.ExecutionRecord{
-			TaskID: "demo-1", RunID: runID, Status: core.ExecutionStarted,
-			Trigger: core.TriggerCron, StartedAt: opNow,
-		})
-		require.NoError(t, err)
-		return id
-	}
+		stale := token
+		stale.OwnerWorkerID = "worker-b"
+		err := store.FinishExecution(ctx, id, stale, core.ExecutionCompleted, time.Second, "", opNow)
+		require.ErrorIs(t, err, core.ErrLeaseLost, "非属主的终态写必须被租约挡住")
+		require.Equal(t, core.ExecutionStarted, taskPortListExecutions(t, db.pool, "demo-1")[0].Status,
+			"被拒的收尾不得改动执行行")
+	})
+
+	t.Run("finish_twice_is_lease_lost", func(t *testing.T) {
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		id, token := start(t, store, "run-a")
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionCompleted, time.Second, "", opNow))
+
+		err := store.FinishExecution(ctx, id, token, core.ExecutionFailed, 2*time.Second, "重试", opNow)
+		require.ErrorIs(t, err, core.ErrLeaseLost,
+			"租约已释放：同一凭证的第二次收尾不是幂等成功，而是失权")
+		require.Equal(t, core.ExecutionCompleted, taskPortListExecutions(t, db.pool, "demo-1")[0].Status)
+	})
+
+	t.Run("finish_rejects_mismatched_token", func(t *testing.T) {
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		id, token := start(t, store, "run-a")
+
+		wrongKind := token
+		wrongKind.Kind = core.LeaseRun
+		require.Error(t, store.FinishExecution(ctx, id, wrongKind, core.ExecutionCompleted, 0, "", opNow),
+			"执行行收尾只认 schedule_execution 凭证")
+
+		wrongID := token
+		wrongID.ResourceID = "9999"
+		require.Error(t, store.FinishExecution(ctx, id, wrongID, core.ExecutionCompleted, 0, "", opNow),
+			"凭证的资源标识必须指向这一行执行")
+	})
 
 	t.Run("completed_syncs_last_status", func(t *testing.T) {
 		db := portTestDB(t)
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 		taskPortSeedRun(t, db, "run-a", "completed")
-		id := start(t, store, "run-a")
+		id, token := start(t, store, "run-a")
 
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionCompleted, time.Second, "", opNow))
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionCompleted, time.Second, "", opNow))
 
 		require.Equal(t, core.ExecutionCompleted, taskPortListExecutions(t, db.pool, "demo-1")[0].Status)
 		require.Equal(t, "completed", taskPortLastStatusOf(t, db.pool, "demo-1"))
 		require.Equal(t, "run-a", taskPortListExecutions(t, db.pool, "demo-1")[0].RunID)
-	})
-
-	t.Run("failed_syncs_last_status", func(t *testing.T) {
-		db := portTestDB(t)
-		store := NewTaskStore(db)
-		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		taskPortSeedRun(t, db, "run-b", "failed")
-		id := start(t, store, "run-b")
-
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionFailed, 2*time.Second, "运行失败", opNow))
-
-		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status)
-		require.Equal(t, "run-b", got.RunID)
-		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
 	})
 
 	t.Run("skipped_nulls_run_id", func(t *testing.T) {
@@ -639,9 +752,9 @@ func TestTaskStore_FinishExecution(t *testing.T) {
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 		// run-x 不落 runs 表：跳过行没有产生过 Run。
-		id := start(t, store, "run-x")
+		id, token := start(t, store, "run-x")
 
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionSkipped, 0, "", opNow))
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionSkipped, 0, "", opNow))
 
 		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
 		require.Equal(t, core.ExecutionSkipped, got.Status)
@@ -655,9 +768,9 @@ func TestTaskStore_FinishExecution(t *testing.T) {
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 		// 准入失败（未知 Agent / 实例满）：失败终态但从未进 runs 表。
-		id := start(t, store, "run-ghost")
+		id, token := start(t, store, "run-ghost")
 
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionFailed,
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionFailed,
 			0, "Agent 不存在", opNow))
 
 		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
@@ -666,30 +779,35 @@ func TestTaskStore_FinishExecution(t *testing.T) {
 		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
 	})
 
-	t.Run("unknown_id_not_found", func(t *testing.T) {
+	t.Run("unknown_id_is_lease_lost", func(t *testing.T) {
 		db := portTestDB(t)
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 
-		err := store.FinishExecution(ctx, 9999, core.ExecutionCompleted, 0, "", opNow)
-		require.ErrorIs(t, err, fs.ErrNotExist, "未知行号必须如实报错，不得静默成功")
+		// 不存在的执行行也没有租约行：fencing 先于行定位，所以是失权而不是"找不到"。
+		// 这与 US-10 的"未知行号 → fs.ErrNotExist"不同，原因是收尾现在必须先证明归属。
+		ghost := core.LeaseToken{
+			Kind: core.LeaseScheduleExecution, ResourceID: "9999",
+			OwnerWorkerID: "worker-a", OwnershipEpoch: 1,
+		}
+		err := store.FinishExecution(ctx, 9999, ghost, core.ExecutionCompleted, 0, "", opNow)
+		require.ErrorIs(t, err, core.ErrLeaseLost)
 		require.Empty(t, taskPortLastStatusOf(t, db.pool, "demo-1"), "未知行号不得误写 last_status")
 		require.Empty(t, taskPortListExecutions(t, db.pool, "demo-1"))
 	})
 
-	t.Run("unknown_id_leaves_previous_last_status", func(t *testing.T) {
+	t.Run("next_start_allowed_after_finish", func(t *testing.T) {
 		db := portTestDB(t)
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		taskPortSeedRun(t, db, "run-a", "completed")
-		id := start(t, store, "run-a")
-		require.NoError(t, store.FinishExecution(ctx, id, core.ExecutionCompleted, time.Second, "", opNow))
-		require.Equal(t, "completed", taskPortLastStatusOf(t, db.pool, "demo-1"))
+		id, token := start(t, store, "run-a")
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionCompleted, time.Second, "", opNow))
 
-		err := store.FinishExecution(ctx, 9999, core.ExecutionFailed, 0, "幽灵行", opNow)
-		require.ErrorIs(t, err, fs.ErrNotExist)
-		require.Equal(t, "completed", taskPortLastStatusOf(t, db.pool, "demo-1"),
-			"未知行号不得覆盖已有 last_status")
+		next, _, err := store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", RunID: "run-b", Trigger: core.TriggerManual, StartedAt: opNow,
+		}, portWorker("worker-a"), portLeaseTTL)
+		require.NoError(t, err, "前一条已收尾 → 同任务可再起一条 started（FR-24-13 只约束同时）")
+		require.Greater(t, next, id)
 	})
 }
 
@@ -753,117 +871,67 @@ func TestTaskStore_RecordSkipped(t *testing.T) {
 	})
 }
 
-// TestTaskStore_RecoverStartedExecutions：启动恢复把遗留 started 行按 Run 终态收尾
-// （completed / limit_reached → completed；failed / cancelled / 仍 running / 无 Run → failed），
-// 无 Run 行的 run_id 置 NULL，同任务多行按 started_at 正序处理。
-// 逆改点：用 string 直扫 run_id → NULL 行 Scan 报错；乱序处理 → last_status 来自旧行。
-func TestTaskStore_RecoverStartedExecutions(t *testing.T) {
+// TestTaskStore_NoStartupRecovery：US-24 的冻结面守点——启动恢复的全局扫描已从
+// `TaskStore` **接口与两个实现**一并删除（FR-24-02 / 模块卡第 3278 行）。原先这一族的
+// 判据（四终态映射、无 Run → failed、run_id 为 NULL 可扫、按 started_at 正序处理）随
+// `RecoverStartedExecutions` 作废；**等价语义没有消失，而是换了执行者**：现在只有
+// 合法领到过期 `schedule_execution` 租约的回收器才能收尾执行行，四终态映射与
+// `worker_lost` / `missed_grace_exceeded` / `renew_failed` 文案由回收器用例承接
+// （`reclaimer_test.go`，T018）。**不得**因为"删了旧测试"就把该覆盖面记成已覆盖。
+//
+// 逆改点：把 `RecoverStartedExecutions` 加回接口 → reflection 子例红；去掉 0012 的
+// `ux_task_executions_active` → 同任务两条 started 的直插会成功，索引子例红。
+// This test is the freeze guard for FR-24-02: startup recovery is gone from the port and
+// both stores; the equivalent semantics now belong to the lease-fenced reclaimer.
+func TestTaskStore_NoStartupRecovery(t *testing.T) {
 	ctx := context.Background()
 
-	// 四终态映射：Run 终态 → 执行行终态。
-	for _, tc := range []struct {
-		runStatus string
-		want      core.ExecutionStatus
-	}{
-		{"completed", core.ExecutionCompleted},
-		{"limit_reached", core.ExecutionCompleted},
-		{"failed", core.ExecutionFailed},
-		{"cancelled", core.ExecutionFailed},
-	} {
-		t.Run("run_"+tc.runStatus, func(t *testing.T) {
-			db := portTestDB(t)
-			store := NewTaskStore(db)
-			taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-			taskPortSeedRun(t, db, "run-a", tc.runStatus)
-			taskPortSeedExecution(t, db.pool, "demo-1", "run-a", core.ExecutionStarted)
+	t.Run("port_has_no_recovery_scan", func(t *testing.T) {
+		iface := reflect.TypeOf((*core.TaskStore)(nil)).Elem()
+		_, present := iface.MethodByName("RecoverStartedExecutions")
+		require.False(t, present,
+			"`TaskStore` 不得再暴露启动恢复扫描：恢复只作用于合法领取的过期租约（FR-24-02）")
 
-			n, err := store.RecoverStartedExecutions(ctx, opNow)
-			require.NoError(t, err)
-			require.Equal(t, 1, n)
-
-			got := taskPortListExecutions(t, db.pool, "demo-1")[0]
-			require.Equal(t, tc.want, got.Status, "runs.status=%s", tc.runStatus)
-			require.Equal(t, "run-a", got.RunID, "Run 行存在 → run_id 保留")
-			require.Equal(t, opNow.UnixMilli(), got.FinishedAt.UnixMilli())
-			require.Equal(t, string(tc.want), taskPortLastStatusOf(t, db.pool, "demo-1"))
-		})
-	}
-
-	t.Run("no_run_row_maps_failed_and_nulls_run_id", func(t *testing.T) {
-		db := portTestDB(t)
-		store := NewTaskStore(db)
-		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		// run-ghost 不在 runs 表：崩溃遗留行没有任何 Run 可依。
-		taskPortSeedExecution(t, db.pool, "demo-1", "run-ghost", core.ExecutionStarted)
-
-		n, err := store.RecoverStartedExecutions(ctx, opNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-
-		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status)
-		require.Empty(t, got.RunID, "无 Run 行同时把 run_id 置 NULL（不留下悬空引用）")
-		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
+		impl := reflect.TypeOf(&TaskStore{})
+		_, present = impl.MethodByName("RecoverStartedExecutions")
+		require.False(t, present, "PostgreSQL 实现同样不得留全局恢复入口")
 	})
 
-	t.Run("run_still_running_maps_failed", func(t *testing.T) {
-		db := portTestDB(t)
-		store := NewTaskStore(db)
-		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		taskPortSeedRun(t, db, "run-live", "running")
-		taskPortSeedExecution(t, db.pool, "demo-1", "run-live", core.ExecutionStarted)
-
-		n, err := store.RecoverStartedExecutions(ctx, opNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-
-		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status, "Run 未收尾 = 崩溃遗留 → failed")
-		require.Equal(t, "run-live", got.RunID, "Run 行存在 → run_id 保留")
-		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
-	})
-
-	t.Run("null_run_id_scannable", func(t *testing.T) {
-		db := portTestDB(t)
-		store := NewTaskStore(db)
-		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		taskPortSeedExecution(t, db.pool, "demo-1", "", core.ExecutionStarted)
-
-		// 夹具自检：确实造出了 run_id IS NULL 的遗留行（sql.NullString 的判别力来源）。
-		var nulls int
-		require.NoError(t, db.pool.QueryRowContext(ctx,
-			`SELECT count(*) FROM task_executions WHERE run_id IS NULL`).Scan(&nulls))
-		require.Equal(t, 1, nulls)
-
-		n, err := store.RecoverStartedExecutions(ctx, opNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n, "run_id 为 NULL 的遗留行同样可被扫描收尾")
-
-		got := taskPortListExecutions(t, db.pool, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status)
-		require.Empty(t, got.RunID)
-		require.Equal(t, "failed", taskPortLastStatusOf(t, db.pool, "demo-1"))
-	})
-
-	t.Run("same_task_multiple_started_uses_newest", func(t *testing.T) {
+	// FR-24-13 之后"同一任务两条 started"在库里已经不可能存在：0012 的部分唯一索引
+	// `ux_task_executions_active` 直接拒绝。原先这里的 same_task_multiple_started_uses_newest
+	// 构造的正是这种状态，它的判据随 `RecoverStartedExecutions` 一并废除（P-02）；改为直接
+	// 守新不变量，避免留一条"数据库里造不出来的前置"。
+	// After FR-24-13 a second started row for one task cannot exist; assert the index instead.
+	t.Run("second_started_row_rejected_by_schema", func(t *testing.T) {
 		db := portTestDB(t)
 		store := NewTaskStore(db)
 		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
 		taskPortSeedRun(t, db, "run-old", "failed")
 		taskPortSeedRun(t, db, "run-new", "completed")
-		taskPortSeedExecutionAt(t, db.pool, "demo-1", "run-old", core.ExecutionStarted, opNow.Add(-time.Minute))
-		taskPortSeedExecutionAt(t, db.pool, "demo-1", "run-new", core.ExecutionStarted, opNow)
 
-		n, err := store.RecoverStartedExecutions(ctx, opNow)
+		// 第一条由仓储的受控路径建（同时建租约），收尾才能合法释放。
+		id, token, err := store.StartExecution(ctx, core.ExecutionRecord{
+			TaskID: "demo-1", RunID: "run-old", Status: core.ExecutionStarted,
+			Trigger: core.TriggerCron, StartedAt: opNow,
+		}, portWorker("worker-a"), portLeaseTTL)
 		require.NoError(t, err)
-		require.Equal(t, 2, n)
 
-		rows := taskPortListExecutions(t, db.pool, "demo-1")
-		require.Len(t, rows, 2)
-		require.Equal(t, core.ExecutionFailed, rows[0].Status)
-		require.Equal(t, core.ExecutionCompleted, rows[1].Status)
-		require.Equal(t, "completed", taskPortLastStatusOf(t, db.pool, "demo-1"),
-			"last_status 必须来自最新一行（按 started_at 正序收尾）")
+		_, err = db.pool.ExecContext(ctx,
+			`INSERT INTO task_executions (task_id, run_id, status, trigger, started_at)
+			 VALUES ('demo-1', 'run-new', $1, 'cron', $2)`,
+			string(core.ExecutionStarted), opNow.Add(time.Minute).UnixMilli())
+		require.Error(t, err, "同一任务同时最多一条 started 执行（FR-24-13）")
+		require.Contains(t, err.Error(), "ux_task_executions_active",
+			"拒绝必须来自部分唯一索引，而不是别的原因")
+
+		// 收尾之后同一任务可以再起一条 started：索引只约束"同时"。
+		require.NoError(t, store.FinishExecution(ctx, id, token, core.ExecutionFailed,
+			time.Second, "worker_lost", opNow))
+		_, err = db.pool.ExecContext(ctx,
+			`INSERT INTO task_executions (task_id, run_id, status, trigger, started_at)
+			 VALUES ('demo-1', 'run-new', $1, 'cron', $2)`,
+			string(core.ExecutionStarted), opNow.Add(time.Minute).UnixMilli())
+		require.NoError(t, err, "前一条已收尾时新执行必须可写")
 	})
 }
 

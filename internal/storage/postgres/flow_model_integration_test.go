@@ -41,11 +41,12 @@ func newPGFlowModelProbe(t *testing.T) *pgFlowModelProbe {
 	create.Contract.Scope = core.FlowAuthority{CallerID: core.LocalAdminCallerID, AuthorizingKind: core.AuthorizingKindAdminBuiltin, Scopes: []string{core.ScopeFlowsWrite}, AgentUIDs: []string{string(resources.manifest.AgentUID)}}
 	task, err := store.Create(t.Context(), create)
 	require.NoError(t, err)
+	rootLease := flowRootLeaseFor(t, store.db, task.RootTaskID)
 	attempt := flow.NodeAttempt{ID: "model-attempt", TaskID: task.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: 1, RunID: "model-run", SessionID: "model-session", Input: task.Revision.Input, InputHash: task.Revision.InputHash}
 	_, err = store.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Attempt: attempt, Now: task.CreatedAt + 1})
 	require.NoError(t, err)
-	f := &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: attempt.ID, NodeInvocationID: attempt.NodeInvocationID, TaskRevision: 0, AgentUID: string(resources.manifest.AgentUID), AgentConfigHash: "config", ResourceManifestHash: resources.manifest.Hash, Authority: create.Contract.Scope}
-	require.NoError(t, NewRunStore(store.db).StartRun(t.Context(), core.RunRecord{RunID: attempt.RunID, SessionID: attempt.SessionID, Agent: "writer", Channel: "cli", UserID: "model-probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), ConfigHash: "config", Flow: f}, resources.manifest))
+	f := &core.FlowRunContext{TaskID: task.ID, RootTaskID: task.ID, NodeAttemptID: attempt.ID, NodeInvocationID: attempt.NodeInvocationID, TaskRevision: 0, Lease: rootLease, AgentUID: string(resources.manifest.AgentUID), AgentConfigHash: "config", ResourceManifestHash: resources.manifest.Hash, Authority: create.Contract.Scope}
+	require.NoError(t, startRunTest(NewRunStore(store.db), t.Context(), core.RunRecord{RunID: attempt.RunID, SessionID: attempt.SessionID, Agent: "writer", Channel: "cli", UserID: "model-probe", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.Now(), ConfigHash: "config", Flow: f}, resources.manifest))
 	p := &pgFlowModelProbe{store: store, withUsage: true}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.received.Add(1)

@@ -237,9 +237,9 @@ func TestAdminViews_ResourceVersionDetailFields(t *testing.T) {
 	require.Equal(t, []any{}, empty["manifest"].(map[string]any)["files"])
 }
 
-// TestAdminViews_ErrorDataShape：失败 `data` 只投影四个契约数组、当前 ETag 与
-// `pending` 之后的操作标识——未知键丢弃、类型不符丢弃、空数组合法（输出 `[]`）；
-// 没有白名单字段时不带 data。
+// TestAdminViews_ErrorDataShape：失败 `data` 只投影契约数组（含归档判据
+// `unmet_predicates`）、当前 ETag 与 `pending` 之后的操作标识——未知键丢弃、类型
+// 不符丢弃、空数组合法（输出 `[]`）；没有白名单字段时不带 data。
 // TestAdminViews_ErrorDataShape pins the failure-data whitelist and its edge cases.
 func TestAdminViews_ErrorDataShape(t *testing.T) {
 	if _, ok := errorDataView(errors.New("plain")); ok {
@@ -253,12 +253,13 @@ func TestAdminViews_ErrorDataShape(t *testing.T) {
 		Kind:    core.ErrConflict,
 		Message: "resource is referenced",
 		Data: map[string]any{
-			"agents":          []string{"writer", "reviewer"},
-			"active_runs":     []string{"run-42"},
-			"problems":        []string{},
-			"operation_id":    "op-123",
-			"definition_yaml": "api_key: ${TEST_KEY}",  // 非白名单键必须丢弃
-			"run_ids":         []any{"not", "strings"}, // 类型不符必须丢弃
+			"agents":           []string{"writer", "reviewer"},
+			"active_runs":      []string{"run-42"},
+			"problems":         []string{},
+			"unmet_predicates": []string{"no_pending_audit"},
+			"operation_id":     "op-123",
+			"definition_yaml":  "api_key: ${TEST_KEY}",  // 非白名单键必须丢弃
+			"run_ids":          []any{"not", "strings"}, // 类型不符必须丢弃
 		},
 	}
 	data, ok := errorDataView(err)
@@ -269,14 +270,17 @@ func TestAdminViews_ErrorDataShape(t *testing.T) {
 	require.Equal(t, []string{"run-42"}, *data.ActiveRuns)
 	require.NotNil(t, data.Problems, "present empty array must stay present")
 	require.Empty(t, *data.Problems)
+	require.NotNil(t, data.UnmetPredicates, "409 AGENT_BUSY 必须能点名未达成的判据")
+	require.Equal(t, []string{"no_pending_audit"}, *data.UnmetPredicates)
 	require.Nil(t, data.RunIDs)
 	require.NotNil(t, data.OperationID, "post-pending failures must stay traceable")
 	require.Equal(t, "op-123", *data.OperationID)
 
 	obj := viewJSON(t, data)
-	requireKeys(t, obj, "agents", "active_runs", "problems", "operation_id")
+	requireKeys(t, obj, "agents", "active_runs", "problems", "unmet_predicates", "operation_id")
 	require.Equal(t, []any{"writer", "reviewer"}, obj["agents"])
 	require.Equal(t, []any{}, obj["problems"])
+	require.Equal(t, []any{"no_pending_audit"}, obj["unmet_predicates"])
 	require.Equal(t, "op-123", obj["operation_id"])
 
 	// 空串操作标识视为未携带（形状合法但没有可追查的值）。

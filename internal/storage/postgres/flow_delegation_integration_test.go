@@ -34,7 +34,10 @@ func TestFlow_SubflowUsesOnlyLeafRunAndFrozenIdentity(t *testing.T) {
 			service.Runner = runner
 			task, err := service.Start(t.Context(), startFlowRequest(parent, "parent-start"))
 			require.NoError(t, err)
-			task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			// 子任务行按自身 root_task_id 查父根租约：预领整棵子树的根。
+			// 凭证必须原样下传：子 Run 创建（createRunForNode）以它证明父根归属。
+			root := flowRootLeaseFor(t, s.db, task.RootTaskID)
+			task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 			require.NoError(t, err)
 			if deferOnce {
 				require.Equal(t, flow.Running, task.Status)
@@ -42,7 +45,7 @@ func TestFlow_SubflowUsesOnlyLeafRunAndFrozenIdentity(t *testing.T) {
 				require.Equal(t, 1, task.Revision.Attempts["child"])
 				runner.capacity = false
 				service.Now = func() time.Time { return time.Now().Add(time.Second) }
-				task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+				task, err = service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: root})
 				require.NoError(t, err)
 			}
 			require.Equal(t, flow.Succeeded, task.Status)

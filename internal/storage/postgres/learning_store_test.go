@@ -89,6 +89,21 @@ func lsRow(extractionID, agent, sessionID, runID string, from, to int64, message
 	}
 }
 
+// lsRecover 按生产写入形状调用恢复：查证请求必须带上扫描时读到的预期尝试，
+// 与行的 last_attempt_run_id 一致才允许写结论（US-24 T019 / P-18）。
+// lsRecover calls the recovery write the way the scan does, carrying the expected attempt.
+func lsRecover(ctx context.Context, store *LearningRepo, extractionID, expectedRunID string,
+	verdict core.LearningExtractionState, verifiedAt time.Time,
+) (bool, error) {
+	return store.RecoverExtraction(ctx, core.RecoverLearningExtraction{
+		ExtractionID:             extractionID,
+		ExpectedLastAttemptRunID: expectedRunID,
+		Verdict:                  verdict,
+		VerifiedAt:               verifiedAt,
+		Now:                      verifiedAt,
+	})
+}
+
 // TestUS22_Origin_FromRunRecord：抽取行与游标的来源都取自 runs 行，请求里填的来源被忽略；
 // 同会话不同来源的未决行互不阻断（C-07 / B-07）。
 // TestUS22_Origin_FromRunRecord pins origin copying from the runs row and per-origin
@@ -100,7 +115,7 @@ func TestUS22_Origin_FromRunRecord(t *testing.T) {
 	lsSeedRun(t, db, "lr-r1", "ls-s1", "k1", lsBase)
 	lsSeedRun(t, db, "lr-r2", "ls-s1", "k2", lsBase.Add(time.Minute))
 
-	got, err := store.BeginExtraction(ctx, lsRow("ext-1", "demo", "ls-s1", "lr-r1", 1, 2, 2))
+	got, err := store.BeginExtraction(ctx, lsRow("ext-1", "demo", "ls-s1", "lr-r1", 1, 2, 2), core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, "c1", got.OriginCallerID, "来源调用方必须复制自 runs，不得取请求字段")
 	require.Equal(t, "k1", got.OriginKeyID, "来源 Key 必须复制自 runs，不得取请求字段")
@@ -119,7 +134,7 @@ func TestUS22_Origin_FromRunRecord(t *testing.T) {
 	require.Equal(t, "ext-1", self.ExtractionID)
 
 	// 窗口关闭后游标落库：来源仍是 runs 行的值。
-	require.NoError(t, store.FailExtraction(ctx, "ext-1", core.LearningFailureWindowGone, "gone", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-1", "lr-r1", core.LeaseToken{}, "", 0, core.LearningFailureWindowGone, "gone", lsBase))
 	cursor, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "lr-r1")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -148,30 +163,30 @@ func TestUS22_Cursor_PerOrigin(t *testing.T) {
 	lsSeedRun(t, db, "lc-r3", "ls-s1", "k2", lsBase.Add(2*time.Minute))
 
 	// 第一次尝试：窗口关闭 → skipped 并推进游标到 5（attempts 不增）。
-	_, err := store.BeginExtraction(ctx, lsRow("ext-a", "demo", "ls-s1", "lc-r1", 1, 5, 3))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-a", "demo", "ls-s1", "lc-r1", 1, 5, 3), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.FailExtraction(ctx, "ext-a", core.LearningFailureWindowGone, "gone", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-a", "lc-r1", core.LeaseToken{}, "", 0, core.LearningFailureWindowGone, "gone", lsBase))
 	cursor, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "lc-r1")
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, int64(5), cursor.CommittedMessageID)
 
 	// 同来源重试：failed（可重试）不改游标。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-b", "demo", "ls-s1", "lc-r2", 6, 8, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-b", "demo", "ls-s1", "lc-r2", 6, 8, 2), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.FailExtraction(ctx, "ext-b", core.LearningFailureModel, "boom", lsBase.Add(time.Minute)))
+	require.NoError(t, store.FailExtraction(ctx, "ext-b", "lc-r2", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase.Add(time.Minute)))
 	cursor, found, err = store.LoadCursor(ctx, "demo", "ls-s1", "lc-r2")
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, int64(5), cursor.CommittedMessageID, "可重试失败不得推进游标")
 
 	// 另一个来源（k2）成功后推进到自己的窗口末端，不影响 k1。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-c", "demo", "ls-s1", "lc-r3", 9, 10, 1))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-c", "demo", "ls-s1", "lc-r3", 9, 10, 1), core.LeaseToken{})
 	require.NoError(t, err)
 	_, err = store.CommitExtraction(ctx, core.CommitLearningExtraction{
 		ExtractionID: "ext-c", ItemsTotal: 0, ItemsAccepted: 0, ItemsDropped: 0,
 		CompletedAt: lsBase.Add(2 * time.Minute),
-	})
+	}, core.LeaseToken{})
 	require.NoError(t, err)
 	k2, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "lc-r3")
 	require.NoError(t, err)
@@ -199,12 +214,12 @@ func TestUS22_Store_BeginExtractionUniqueRun(t *testing.T) {
 	store := NewLearningRepo(db)
 	lsSeedRun(t, db, "lu-r1", "ls-s1", "k1", lsBase)
 
-	_, err := store.BeginExtraction(ctx, lsRow("ext-a", "demo", "ls-s1", "lu-r1", 1, 2, 2))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-a", "demo", "ls-s1", "lu-r1", 1, 2, 2), core.LeaseToken{})
 	require.NoError(t, err)
 	// 终结首行（window_gone → skipped），让第二次触发走到 INSERT 而不是重试分支。
-	require.NoError(t, store.FailExtraction(ctx, "ext-a", core.LearningFailureWindowGone, "gone", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-a", "lu-r1", core.LeaseToken{}, "", 0, core.LearningFailureWindowGone, "gone", lsBase))
 
-	_, err = store.BeginExtraction(ctx, lsRow("ext-b", "demo", "ls-s1", "lu-r1", 3, 4, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-b", "demo", "ls-s1", "lu-r1", 3, 4, 2), core.LeaseToken{})
 	require.Error(t, err, "同一 run_id 不得写出第二行抽取账本")
 	var pgErr *pgconn.PgError
 	require.ErrorAs(t, err, &pgErr, "唯一约束拒绝必须保留原始 PgError")
@@ -228,18 +243,18 @@ func TestUS22_Store_RetryKeepsFrozenWindow(t *testing.T) {
 	retryAt := lsBase.Add(time.Hour)
 	lsSeedRun(t, db, "lf-r2", "ls-s1", "k1", retryAt)
 
-	first, err := store.BeginExtraction(ctx, lsRow("ext-f", "demo", "ls-s1", "lf-r1", 10, 20, 4))
+	first, err := store.BeginExtraction(ctx, lsRow("ext-f", "demo", "ls-s1", "lf-r1", 10, 20, 4), core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, int64(10), first.WindowFromMessageID)
 	require.Equal(t, int64(20), first.WindowToMessageID)
-	require.NoError(t, store.FailExtraction(ctx, "ext-f", core.LearningFailureModel, "boom", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-f", "lf-r1", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase))
 
 	retry := lsRow("ext-g", "demo", "ls-s1", "lf-r2", 90, 99, 7)
 	retry.LastAttemptAt = retryAt
 	retry.CreatedAt = retryAt
 	retry.Provider, retry.Model, retry.ConfigHash = "prov-b", "model-b", "hash-b"
 	retry.PromptVersion, retry.RuleVersion = "pv2", "rv2"
-	got, err := store.BeginExtraction(ctx, retry)
+	got, err := store.BeginExtraction(ctx, retry, core.LeaseToken{})
 	require.NoError(t, err)
 
 	require.Equal(t, "ext-f", got.ExtractionID, "重试复用同一行，不新建")
@@ -283,30 +298,30 @@ func TestUS22_Store_RetryUpdatesAttemptIdentity(t *testing.T) {
 
 	first := lsRow("ext-a", "demo", "ls-s1", "la-r1", 10, 20, 4)
 	first.LastAttemptAt, first.CreatedAt = at1, at1
-	got, err := store.BeginExtraction(ctx, first)
+	got, err := store.BeginExtraction(ctx, first, core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, 1, got.Attempts)
 	require.Equal(t, "la-r1", got.LastAttemptRunID)
-	require.NoError(t, store.FailExtraction(ctx, "ext-a", core.LearningFailureModel, "boom", at1))
+	require.NoError(t, store.FailExtraction(ctx, "ext-a", "la-r1", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", at1))
 
 	retryAt2 := lsRow("ext-ignored", "demo", "ls-s1", "la-r2", 90, 99, 7)
 	retryAt2.LastAttemptAt, retryAt2.CreatedAt = at2, at2
 	retryAt2.Provider, retryAt2.Model, retryAt2.ConfigHash = "prov-b", "model-b", "hash-b"
-	got, err = store.BeginExtraction(ctx, retryAt2)
+	got, err = store.BeginExtraction(ctx, retryAt2, core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, "ext-a", got.ExtractionID, "重试复用同一行")
 	require.Equal(t, 2, got.Attempts)
 	require.Equal(t, "la-r2", got.LastAttemptRunID, "第 2 次尝试绑定本次 Run")
 	require.Equal(t, "prov-b", got.Provider)
-	require.NoError(t, store.FailExtraction(ctx, "ext-a", core.LearningFailureModel, "boom", at2))
+	require.NoError(t, store.FailExtraction(ctx, "ext-a", "la-r2", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", at2))
 
 	retryAt3 := lsRow("ext-ignored", "demo", "ls-s1", "la-r3", 90, 99, 7)
 	retryAt3.LastAttemptAt, retryAt3.CreatedAt = at3, at3
-	got, err = store.BeginExtraction(ctx, retryAt3)
+	got, err = store.BeginExtraction(ctx, retryAt3, core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, 3, got.Attempts)
 	require.Equal(t, "la-r3", got.LastAttemptRunID, "第 3 次尝试绑定本次 Run")
-	require.NoError(t, store.FailExtraction(ctx, "ext-a", core.LearningFailureModel, "boom", at3))
+	require.NoError(t, store.FailExtraction(ctx, "ext-a", "la-r3", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", at3))
 
 	var status string
 	var finishedAt sql.NullInt64
@@ -354,7 +369,7 @@ func TestUS22_Store_BudgetAtomic(t *testing.T) {
 
 		row := lsRow("ext-new", "demo", "ls-s1", "lb-r1", 10, 20, 4)
 		row.LastAttemptAt, row.CreatedAt = now, now
-		_, err := store.BeginExtraction(ctx, row)
+		_, err := store.BeginExtraction(ctx, row, core.LeaseToken{})
 		require.ErrorIs(t, err, core.ErrLearningBudgetExhausted)
 
 		var count int
@@ -376,7 +391,7 @@ func TestUS22_Store_BudgetAtomic(t *testing.T) {
 
 		row := lsRow("ext-new", "demo", "ls-s1", "lb-r2", 10, 20, 4)
 		row.LastAttemptAt, row.CreatedAt = now, now
-		got, err := store.BeginExtraction(ctx, row)
+		got, err := store.BeginExtraction(ctx, row, core.LeaseToken{})
 		require.NoError(t, err, "窗口外的历史尝试不计入滚动预算")
 		require.Equal(t, 1, got.Attempts)
 	})
@@ -413,7 +428,7 @@ func TestUS22_Store_CommitAtomic(t *testing.T) {
 		db := newLearningStoreDB(t)
 		store := NewLearningRepo(db)
 		lsSeedRun(t, db, "lr-r1", "ls-s1", "k1", lsBase)
-		_, err := store.BeginExtraction(ctx, lsRow("ext-atomic", "demo", "ls-s1", "lr-r1", 10, 20, 4))
+		_, err := store.BeginExtraction(ctx, lsRow("ext-atomic", "demo", "ls-s1", "lr-r1", 10, 20, 4), core.LeaseToken{})
 		require.NoError(t, err)
 
 		broken := lsCandidate("第二条候选")
@@ -424,7 +439,7 @@ func TestUS22_Store_CommitAtomic(t *testing.T) {
 			ItemsTotal:    2,
 			ItemsAccepted: 2,
 			CompletedAt:   lsBase,
-		})
+		}, core.LeaseToken{})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "缺少证据时刻")
 
@@ -455,7 +470,7 @@ func TestUS22_Store_CommitAtomic(t *testing.T) {
 		db := newLearningStoreDB(t)
 		store := NewLearningRepo(db)
 		lsSeedRun(t, db, "lr-r2", "ls-s1", "k1", lsBase)
-		_, err := store.BeginExtraction(ctx, lsRow("ext-ok", "demo", "ls-s1", "lr-r2", 10, 20, 4))
+		_, err := store.BeginExtraction(ctx, lsRow("ext-ok", "demo", "ls-s1", "lr-r2", 10, 20, 4), core.LeaseToken{})
 		require.NoError(t, err)
 
 		candidate := lsCandidate("提交成功的候选")
@@ -466,7 +481,7 @@ func TestUS22_Store_CommitAtomic(t *testing.T) {
 			ItemsTotal:    2,
 			ItemsAccepted: 2,
 			CompletedAt:   lsBase,
-		})
+		}, core.LeaseToken{})
 		require.NoError(t, err)
 		require.Len(t, result.CandidateEntryIDs, 1)
 		require.Len(t, result.DraftIDs, 1)
@@ -501,7 +516,7 @@ func TestUS22_Store_CommitAdvisoryLock(t *testing.T) {
 	db := newLearningStoreDB(t)
 	store := NewLearningRepo(db)
 	lsSeedRun(t, db, "lr-r3", "ls-s1", "k1", lsBase)
-	_, err := store.BeginExtraction(ctx, lsRow("ext-lock", "demo", "ls-s1", "lr-r3", 10, 20, 4))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-lock", "demo", "ls-s1", "lr-r3", 10, 20, 4), core.LeaseToken{})
 	require.NoError(t, err)
 
 	holder, err := db.pool.Conn(ctx)
@@ -519,7 +534,7 @@ func TestUS22_Store_CommitAdvisoryLock(t *testing.T) {
 		ExtractionID: "ext-lock",
 		Candidates:   []core.LearningCandidate{lsCandidate("锁下的候选")},
 		ItemsTotal:   1, ItemsAccepted: 1, CompletedAt: lsBase,
-	})
+	}, core.LeaseToken{})
 	require.Error(t, lockErr, "持锁期间提交必须等待而不是直接写库")
 	require.Contains(t, lockErr.Error(), "取 Agent 锁")
 
@@ -530,7 +545,7 @@ func TestUS22_Store_CommitAdvisoryLock(t *testing.T) {
 		ExtractionID: "ext-lock",
 		Candidates:   []core.LearningCandidate{lsCandidate("锁下的候选")},
 		ItemsTotal:   1, ItemsAccepted: 1, CompletedAt: lsBase,
-	})
+	}, core.LeaseToken{})
 	require.NoError(t, err, "锁释放后同一提交必须成功")
 
 	var status string
@@ -555,25 +570,29 @@ func TestUS22_Store_RetryWindowMissingSkips(t *testing.T) {
 	store := NewLearningRepo(db)
 	lsSeedRun(t, db, "lw-r1", "ls-s1", "k1", lsBase)
 	lsSeedRun(t, db, "lw-r2", "ls-s1", "k1", lsBase.Add(time.Minute))
+	// 第 3 次尝试的触发 Run：与抽取行同来源（同会话、同 Key），但它是**新** Run
+	// ——受控收尾校验的正是"同来源 + 预期旧尝试"，不是"同一个 Run"。
+	lsSeedRun(t, db, "lw-r3", "ls-s1", "k1", lsBase.Add(2*time.Minute))
 
 	// 第 1 次尝试：pending → 模型错误 → failed（attempts=1，可重试）。
-	_, err := store.BeginExtraction(ctx, lsRow("ext-gone", "demo", "ls-s1", "lw-r1", 10, 20, 4))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-gone", "demo", "ls-s1", "lw-r1", 10, 20, 4), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.FailExtraction(ctx, "ext-gone", core.LearningFailureModel, "boom", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-gone", "lw-r1", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase))
 
 	// 第 2 次尝试：复用同一冻结窗口，attempts 递增到 2；这次仍以模型错误结束。
 	retry := lsRow("ext-ignored", "demo", "ls-s1", "lw-r2", 90, 99, 7) // 新边界必须被忽略
 	retry.LastAttemptAt, retry.CreatedAt = lsBase.Add(time.Minute), lsBase.Add(time.Minute)
-	got, err := store.BeginExtraction(ctx, retry)
+	got, err := store.BeginExtraction(ctx, retry, core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, "ext-gone", got.ExtractionID)
 	require.Equal(t, 2, got.Attempts)
 	require.Equal(t, int64(20), got.WindowToMessageID, "窗口边界取冻结值")
-	require.NoError(t, store.FailExtraction(ctx, "ext-gone", core.LearningFailureModel, "boom", lsBase.Add(time.Minute)))
+	require.NoError(t, store.FailExtraction(ctx, "ext-gone", "lw-r2", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase.Add(time.Minute)))
 
 	// 第 3 次尝试：服务在 BeginExtraction 之前发现冻结窗口已被清理——行仍为
 	// failed，必须在这里直接终结为 skipped 并推进游标。
-	require.NoError(t, store.FailExtraction(ctx, "ext-gone", core.LearningFailureWindowGone,
+	require.NoError(t, store.FailExtraction(ctx, "ext-gone", "lw-r3", core.LeaseToken{},
+		"lw-r2", 2, core.LearningFailureWindowGone,
 		"frozen window incomplete", lsBase.Add(2*time.Minute)))
 
 	var status, class string
@@ -660,38 +679,39 @@ func TestUS22_Store_PendingScan(t *testing.T) {
 
 	first := lsRow("ext-p1", "demo", "ls-s1", "pk-r1", 1, 2, 2)
 	first.CreatedAt = lsBase
-	_, err := store.BeginExtraction(ctx, first)
+	_, err := store.BeginExtraction(ctx, first, core.LeaseToken{})
 	require.NoError(t, err)
 	second := lsRow("ext-p2", "demo", "ls-s1", "pk-r2", 3, 4, 2)
 	second.CreatedAt = lsBase.Add(time.Minute)
-	_, err = store.BeginExtraction(ctx, second)
+	_, err = store.BeginExtraction(ctx, second, core.LeaseToken{})
 	require.NoError(t, err)
 
 	// success：零候选也是合法提交，终态行不再待决。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-p3", "demo", "ls-s1", "pk-r3", 5, 6, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-p3", "demo", "ls-s1", "pk-r3", 5, 6, 2), core.LeaseToken{})
 	require.NoError(t, err)
 	_, err = store.CommitExtraction(ctx, core.CommitLearningExtraction{
 		ExtractionID: "ext-p3", CompletedAt: lsBase,
-	})
+	}, core.LeaseToken{})
 	require.NoError(t, err)
 
 	// skipped：窗口缺失是终态。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-p4", "demo", "ls-s1", "pk-r4", 7, 8, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-p4", "demo", "ls-s1", "pk-r4", 7, 8, 2), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.FailExtraction(ctx, "ext-p4", core.LearningFailureWindowGone, "gone", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-p4", "pk-r4", core.LeaseToken{}, "", 0, core.LearningFailureWindowGone, "gone", lsBase))
 
 	// failed：可重试失败仍不是 pending。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-p5", "demo", "ls-s1", "pk-r5", 9, 10, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-p5", "demo", "ls-s1", "pk-r5", 9, 10, 2), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.FailExtraction(ctx, "ext-p5", core.LearningFailureModel, "boom", lsBase))
+	require.NoError(t, store.FailExtraction(ctx, "ext-p5", "pk-r5", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase))
 
 	// 已查证 unknown：恢复路径的正常产物。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-p6", "demo", "ls-s1", "pk-r6", 11, 12, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-p6", "demo", "ls-s1", "pk-r6", 11, 12, 2), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-p6", core.LearningExtractionUnknown, lsBase))
+	_, err = lsRecover(ctx, store, "ext-p6", "pk-r6", core.LearningExtractionUnknown, lsBase)
+	require.NoError(t, err)
 
 	// 未查证 unknown：恢复写入总会带查证时刻，这里直接造出防御性判据覆盖的状态。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-p7", "demo", "ls-s1", "pk-r7", 13, 14, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-p7", "demo", "ls-s1", "pk-r7", 13, 14, 2), core.LeaseToken{})
 	require.NoError(t, err)
 	_, err = db.pool.ExecContext(ctx,
 		`UPDATE memory_extractions SET status = 'unknown' WHERE extraction_id = 'ext-p7'`)
@@ -707,7 +727,8 @@ func TestUS22_Store_PendingScan(t *testing.T) {
 	require.Equal(t, "k1", pending[0].OriginKeyID)
 
 	// 查证一条后它退出扫描面，另一条不受影响。
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-p1", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute)))
+	_, err = lsRecover(ctx, store, "ext-p1", "pk-r1", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute))
+	require.NoError(t, err)
 	pending, err = store.PendingExtractions(ctx)
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
@@ -725,11 +746,13 @@ func TestUS22_Store_RecoverAdvancesCursor(t *testing.T) {
 		db := newLearningStoreDB(t)
 		store := NewLearningRepo(db)
 		lsSeedRun(t, db, "pc-r1", "ls-s1", "k1", lsBase)
-		_, err := store.BeginExtraction(ctx, lsRow("ext-pc", "demo", "ls-s1", "pc-r1", 10, 20, 4))
+		_, err := store.BeginExtraction(ctx, lsRow("ext-pc", "demo", "ls-s1", "pc-r1", 10, 20, 4), core.LeaseToken{})
 		require.NoError(t, err)
 
 		verifiedAt := lsBase.Add(5 * time.Minute)
-		require.NoError(t, store.RecoverExtraction(ctx, "ext-pc", core.LearningExtractionSuccess, verifiedAt))
+		recovered, err := lsRecover(ctx, store, "ext-pc", "pc-r1", core.LearningExtractionSuccess, verifiedAt)
+		require.NoError(t, err)
+		require.True(t, recovered, "孤儿行必须真的写入结论")
 
 		cursor, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "pc-r1")
 		require.NoError(t, err)
@@ -743,19 +766,20 @@ func TestUS22_Store_RecoverAdvancesCursor(t *testing.T) {
 		db := newLearningStoreDB(t)
 		store := NewLearningRepo(db)
 		lsSeedRun(t, db, "pc-r1", "ls-s1", "k1", lsBase)
-		_, err := store.BeginExtraction(ctx, lsRow("ext-first", "demo", "ls-s1", "pc-r1", 25, 30, 2))
+		_, err := store.BeginExtraction(ctx, lsRow("ext-first", "demo", "ls-s1", "pc-r1", 25, 30, 2), core.LeaseToken{})
 		require.NoError(t, err)
 		_, err = store.CommitExtraction(ctx, core.CommitLearningExtraction{
 			ExtractionID: "ext-first", CompletedAt: lsBase,
-		})
+		}, core.LeaseToken{})
 		require.NoError(t, err)
 
 		// 存储层不校验窗口与游标的先后（窗口切割由服务层按游标完成）；这里刻意造一个更小的
 		// 窗口，钉住「恢复只前进、不回退」。
 		lsSeedRun(t, db, "pc-r2", "ls-s1", "k1", lsBase.Add(time.Minute))
-		_, err = store.BeginExtraction(ctx, lsRow("ext-second", "demo", "ls-s1", "pc-r2", 1, 2, 2))
+		_, err = store.BeginExtraction(ctx, lsRow("ext-second", "demo", "ls-s1", "pc-r2", 1, 2, 2), core.LeaseToken{})
 		require.NoError(t, err)
-		require.NoError(t, store.RecoverExtraction(ctx, "ext-second", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute)))
+		_, err = lsRecover(ctx, store, "ext-second", "pc-r2", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute))
+		require.NoError(t, err)
 
 		cursor, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "pc-r2")
 		require.NoError(t, err)
@@ -768,7 +792,7 @@ func TestUS22_Store_RecoverAdvancesCursor(t *testing.T) {
 		db := newLearningStoreDB(t)
 		store := NewLearningRepo(db)
 		lsSeedRun(t, db, "pc-r1", "ls-s1", "k1", lsBase)
-		_, err := store.BeginExtraction(ctx, lsRow("ext-rollback", "demo", "ls-s1", "pc-r1", 10, 20, 2))
+		_, err := store.BeginExtraction(ctx, lsRow("ext-rollback", "demo", "ls-s1", "pc-r1", 10, 20, 2), core.LeaseToken{})
 		require.NoError(t, err)
 
 		// 先建游标行，让推进走 ON CONFLICT 分支；BEFORE INSERT/UPDATE 触发器把这次写入打回，
@@ -789,7 +813,7 @@ func TestUS22_Store_RecoverAdvancesCursor(t *testing.T) {
 			 FOR EACH ROW EXECUTE FUNCTION us22_deny_cursor_write()`)
 		require.NoError(t, err)
 
-		err = store.RecoverExtraction(ctx, "ext-rollback", core.LearningExtractionSuccess, lsBase.Add(time.Minute))
+		_, err = lsRecover(ctx, store, "ext-rollback", "pc-r1", core.LearningExtractionSuccess, lsBase.Add(time.Minute))
 		require.Error(t, err, "游标写失败必须让整次恢复失败")
 		require.Contains(t, err.Error(), "推进游标")
 
@@ -806,7 +830,8 @@ func TestUS22_Store_RecoverAdvancesCursor(t *testing.T) {
 		require.NoError(t, err)
 		_, err = db.pool.ExecContext(ctx, `DROP FUNCTION us22_deny_cursor_write()`)
 		require.NoError(t, err)
-		require.NoError(t, store.RecoverExtraction(ctx, "ext-rollback", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute)))
+		_, err = lsRecover(ctx, store, "ext-rollback", "pc-r1", core.LearningExtractionSuccess, lsBase.Add(2*time.Minute))
+		require.NoError(t, err)
 
 		cursor, found, err := store.LoadCursor(ctx, "demo", "ls-s1", "pc-r1")
 		require.NoError(t, err)
@@ -829,10 +854,11 @@ func TestUS22_Store_RecoverSetsVerifiedAt(t *testing.T) {
 	lsSeedRun(t, db, "rv-r2", "ls-s1", "k2", lsBase)
 	lsSeedRun(t, db, "rv-r3", "ls-s1", "k3", lsBase)
 
-	_, err := store.BeginExtraction(ctx, lsRow("ext-v", "demo", "ls-s1", "rv-r1", 10, 20, 4))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-v", "demo", "ls-s1", "rv-r1", 10, 20, 4), core.LeaseToken{})
 	require.NoError(t, err)
 	verifiedAt := lsBase.Add(90 * time.Minute)
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-v", core.LearningExtractionSuccess, verifiedAt))
+	_, err = lsRecover(ctx, store, "ext-v", "rv-r1", core.LearningExtractionSuccess, verifiedAt)
+	require.NoError(t, err)
 
 	var status string
 	var verifiedMS sql.NullInt64
@@ -844,7 +870,9 @@ func TestUS22_Store_RecoverSetsVerifiedAt(t *testing.T) {
 	require.Equal(t, verifiedAt.UnixMilli(), verifiedMS.Int64, "查证时刻按毫秒落库")
 
 	// 二次查证不改口：结论与时刻都保持首次写入。
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-v", core.LearningExtractionUnknown, verifiedAt.Add(time.Hour)))
+	recovered, err := lsRecover(ctx, store, "ext-v", "rv-r1", core.LearningExtractionUnknown, verifiedAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.False(t, recovered, "已查证行是幂等空操作")
 	require.NoError(t, db.pool.QueryRowContext(ctx,
 		`SELECT status, verified_at FROM memory_extractions WHERE extraction_id = 'ext-v'`).
 		Scan(&status, &verifiedMS))
@@ -852,10 +880,11 @@ func TestUS22_Store_RecoverSetsVerifiedAt(t *testing.T) {
 	require.Equal(t, verifiedAt.UnixMilli(), verifiedMS.Int64, "查证时刻不得被二次调用覆盖")
 
 	// unknown 是另一条合法结论，同样写查证时刻。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-u", "demo", "ls-s1", "rv-r2", 21, 22, 1))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-u", "demo", "ls-s1", "rv-r2", 21, 22, 1), core.LeaseToken{})
 	require.NoError(t, err)
 	unknownAt := lsBase.Add(2 * time.Hour)
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-u", core.LearningExtractionUnknown, unknownAt))
+	_, err = lsRecover(ctx, store, "ext-u", "rv-r2", core.LearningExtractionUnknown, unknownAt)
+	require.NoError(t, err)
 	require.NoError(t, db.pool.QueryRowContext(ctx,
 		`SELECT status, verified_at FROM memory_extractions WHERE extraction_id = 'ext-u'`).
 		Scan(&status, &verifiedMS))
@@ -863,9 +892,9 @@ func TestUS22_Store_RecoverSetsVerifiedAt(t *testing.T) {
 	require.Equal(t, unknownAt.UnixMilli(), verifiedMS.Int64)
 
 	// 取值域外：skipped / failed / pending 不是恢复结论，拒绝且不落任何写入。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-bad", "demo", "ls-s1", "rv-r3", 23, 24, 1))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-bad", "demo", "ls-s1", "rv-r3", 23, 24, 1), core.LeaseToken{})
 	require.NoError(t, err)
-	err = store.RecoverExtraction(ctx, "ext-bad", core.LearningExtractionSkipped, lsBase.Add(3*time.Hour))
+	_, err = lsRecover(ctx, store, "ext-bad", "rv-r3", core.LearningExtractionSkipped, lsBase.Add(3*time.Hour))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "取值域外")
 	var badStatus string
@@ -877,7 +906,7 @@ func TestUS22_Store_RecoverSetsVerifiedAt(t *testing.T) {
 	require.False(t, badVerified.Valid)
 
 	// 不存在的行：ErrLearningNotFound。
-	err = store.RecoverExtraction(ctx, "ext-missing", core.LearningExtractionSuccess, lsBase)
+	_, err = lsRecover(ctx, store, "ext-missing", "rv-r1", core.LearningExtractionSuccess, lsBase)
 	require.ErrorIs(t, err, core.ErrLearningNotFound)
 }
 
@@ -895,7 +924,7 @@ func TestUS22_Store_UnresolvedBlocksSameOrigin(t *testing.T) {
 	lsSeedRun(t, db, "ub-r2", "ls-s1", "k2", lsBase)
 	lsSeedRun(t, db, "ub-r3", "ls-s1", "k1", lsBase.Add(time.Minute))
 
-	_, err := store.BeginExtraction(ctx, lsRow("ext-block", "demo", "ls-s1", "ub-r1", 1, 2, 2))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-block", "demo", "ls-s1", "ub-r1", 1, 2, 2), core.LeaseToken{})
 	require.NoError(t, err)
 
 	pending, err := store.UnresolvedForOrigin(ctx, "demo", "ls-s1", "ub-r1")
@@ -905,7 +934,7 @@ func TestUS22_Store_UnresolvedBlocksSameOrigin(t *testing.T) {
 	require.Equal(t, core.LearningExtractionPending, pending.Status)
 
 	// 同来源的新窗口在预写层被拒绝，且不建第二行。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-second", "demo", "ls-s1", "ub-r3", 3, 4, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-second", "demo", "ls-s1", "ub-r3", 3, 4, 2), core.LeaseToken{})
 	require.ErrorIs(t, err, core.ErrLearningUnresolved)
 	var count int
 	require.NoError(t, db.pool.QueryRowContext(ctx,
@@ -916,14 +945,14 @@ func TestUS22_Store_UnresolvedBlocksSameOrigin(t *testing.T) {
 	otherOrigin, err := store.UnresolvedForOrigin(ctx, "demo", "ls-s1", "ub-r2")
 	require.NoError(t, err)
 	require.Nil(t, otherOrigin)
-	_, err = store.BeginExtraction(ctx, lsRow("ext-other", "demo", "ls-s1", "ub-r2", 3, 4, 2))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-other", "demo", "ls-s1", "ub-r2", 3, 4, 2), core.LeaseToken{})
 	require.NoError(t, err, "未决判定必须按来源隔离")
 	otherAgent, err := store.UnresolvedForOrigin(ctx, "other-agent", "ls-s1", "ub-r1")
 	require.NoError(t, err)
 	require.Nil(t, otherAgent)
 
 	// 可重试 failed 仍算未决：下一次尝试复用冻结窗口，不算新窗口。
-	require.NoError(t, store.FailExtraction(ctx, "ext-block", core.LearningFailureModel, "boom", lsBase.Add(30*time.Second)))
+	require.NoError(t, store.FailExtraction(ctx, "ext-block", "ub-r1", core.LeaseToken{}, "", 0, core.LearningFailureModel, "boom", lsBase.Add(30*time.Second)))
 	retryable, err := store.UnresolvedForOrigin(ctx, "demo", "ls-s1", "ub-r1")
 	require.NoError(t, err)
 	require.NotNil(t, retryable, "可重试失败必须仍算未决")
@@ -931,7 +960,7 @@ func TestUS22_Store_UnresolvedBlocksSameOrigin(t *testing.T) {
 	require.Equal(t, 1, retryable.Attempts)
 
 	// 重试改回 pending，继续阻断。
-	retried, err := store.BeginExtraction(ctx, lsRow("ext-ignored", "demo", "ls-s1", "ub-r3", 99, 99, 7))
+	retried, err := store.BeginExtraction(ctx, lsRow("ext-ignored", "demo", "ls-s1", "ub-r3", 99, 99, 7), core.LeaseToken{})
 	require.NoError(t, err)
 	require.Equal(t, "ext-block", retried.ExtractionID)
 	require.Equal(t, 2, retried.Attempts)
@@ -955,15 +984,16 @@ func TestUS22_Store_UnresolvedSkipsVerifiedUnknown(t *testing.T) {
 	lsSeedRun(t, db, "uv-r3", "ls-s1", "k2", lsBase)
 	lsSeedRun(t, db, "uv-r4", "ls-s1", "k2", lsBase.Add(time.Minute))
 
-	_, err := store.BeginExtraction(ctx, lsRow("ext-verified", "demo", "ls-s1", "uv-r1", 1, 5, 2))
+	_, err := store.BeginExtraction(ctx, lsRow("ext-verified", "demo", "ls-s1", "uv-r1", 1, 5, 2), core.LeaseToken{})
 	require.NoError(t, err)
-	require.NoError(t, store.RecoverExtraction(ctx, "ext-verified", core.LearningExtractionUnknown, lsBase.Add(2*time.Minute)))
+	_, err = lsRecover(ctx, store, "ext-verified", "uv-r1", core.LearningExtractionUnknown, lsBase.Add(2*time.Minute))
+	require.NoError(t, err)
 
 	// 已查证 unknown 保留为历史，但不再阻断。
 	unresolved, err := store.UnresolvedForOrigin(ctx, "demo", "ls-s1", "uv-r1")
 	require.NoError(t, err)
 	require.Nil(t, unresolved)
-	next, err := store.BeginExtraction(ctx, lsRow("ext-next", "demo", "ls-s1", "uv-r2", 6, 8, 2))
+	next, err := store.BeginExtraction(ctx, lsRow("ext-next", "demo", "ls-s1", "uv-r2", 6, 8, 2), core.LeaseToken{})
 	require.NoError(t, err, "查证后同来源新窗口必须解除阻断")
 	require.Equal(t, core.LearningExtractionPending, next.Status)
 
@@ -974,7 +1004,7 @@ func TestUS22_Store_UnresolvedSkipsVerifiedUnknown(t *testing.T) {
 	require.Equal(t, 2, count, "查证记录保留为历史，不删除")
 
 	// 未查证 unknown：恢复写入总会带查证时刻，这里直接造出防御性判据覆盖的状态。
-	_, err = store.BeginExtraction(ctx, lsRow("ext-unverified", "demo", "ls-s1", "uv-r3", 9, 10, 1))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-unverified", "demo", "ls-s1", "uv-r3", 9, 10, 1), core.LeaseToken{})
 	require.NoError(t, err)
 	_, err = db.pool.ExecContext(ctx,
 		`UPDATE memory_extractions SET status = 'unknown' WHERE extraction_id = 'ext-unverified'`)
@@ -985,6 +1015,6 @@ func TestUS22_Store_UnresolvedSkipsVerifiedUnknown(t *testing.T) {
 	require.NotNil(t, blocking, "未查证 unknown 必须阻断同来源")
 	require.Equal(t, core.LearningExtractionUnknown, blocking.Status)
 	require.True(t, blocking.VerifiedAt.IsZero(), "未查证行不得带查证时刻")
-	_, err = store.BeginExtraction(ctx, lsRow("ext-blocked", "demo", "ls-s1", "uv-r4", 11, 12, 1))
+	_, err = store.BeginExtraction(ctx, lsRow("ext-blocked", "demo", "ls-s1", "uv-r4", 11, 12, 1), core.LeaseToken{})
 	require.ErrorIs(t, err, core.ErrLearningUnresolved)
 }

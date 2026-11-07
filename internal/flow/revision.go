@@ -208,7 +208,24 @@ func (s *Service) Revise(ctx context.Context, req RevisionRequest) (Task, error)
 	if err != nil {
 		return task, err
 	}
-	return s.Repository.Revise(ctx, AcceptRevision{Request: req, Revision: next, InvalidClaims: claims, InvalidArtifacts: artifacts, Now: s.clock().UnixMilli()})
+	// Revise 写 `Queued`，属推进类：必须先在根上持有 flow_root 租约（§2.3.6 写入分档
+	// 第 14 行 / §3.1.6）。RevisionRequest 没有租约来源，因此走"零值即自取"；
+	// 撞上执行者持有的根租约 → ErrFlowRootBusy → 409 FLOW_ROOT_BUSY，不重试、不降级。
+	accept := AcceptRevision{Request: req, Revision: next, InvalidClaims: claims, InvalidArtifacts: artifacts, Now: s.clock().UnixMilli()}
+	var written Task
+	attempted := false
+	if err := s.withRootLease(ctx, task.RootTaskID, core.LeaseToken{}, func(core.LeaseToken) error {
+		attempted = true
+		var writeErr error
+		written, writeErr = s.Repository.Revise(ctx, accept)
+		return writeErr
+	}); err != nil {
+		if attempted {
+			return written, err
+		}
+		return task, err
+	}
+	return written, nil
 }
 
 // rework follows only the published bounded author route after Advance joins.

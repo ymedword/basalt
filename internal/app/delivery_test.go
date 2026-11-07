@@ -34,6 +34,9 @@ type fakeDeliveryStore struct {
 	finishErr    error
 	recoverCount int
 	recoverErr   error
+	// lastRecoverRunID 记录最近一次恢复收到的作用域：服务层必须原样透传，
+	// 否则一次"看起来对"的恢复会悄悄退化成全局扫描。
+	lastRecoverRunID string
 }
 
 func newFakeDeliveryStore() *fakeDeliveryStore {
@@ -94,7 +97,10 @@ func (s *fakeDeliveryStore) ListByTask(_ context.Context, _ string,
 	return nil, nil
 }
 
-func (s *fakeDeliveryStore) Recover(_ context.Context, _ time.Time) (int, error) {
+func (s *fakeDeliveryStore) Recover(_ context.Context, _ time.Time, runID string) (int, error) {
+	s.mu.Lock()
+	s.lastRecoverRunID = runID
+	s.mu.Unlock()
 	return s.recoverCount, s.recoverErr
 }
 
@@ -406,6 +412,35 @@ func TestDeliveryService_DeliverMissingRecordFailsWithoutSend(t *testing.T) {
 	require.Empty(t, store.rows)
 }
 
+// TestDeliveryService_DeliverSettledRowFailsWithoutSend —— 预写行已被别的结算路径
+// 改判（回收器按「终态 Run + pending 投递」标成 unknown，或本轮已标 skipped）时，
+// Deliver **一律不发送**，只把行上已有的结论如实带回。预写行是唯一的发送权威：
+// 代次可能已被回收器领回，调用方手里的租约视图再"合法"也不能补发（FR-24-21）。
+// 逆改点：去掉 Deliver 的 pending 守卫，适配器立刻被调用一次。
+// A settled row is the single send authority: Deliver never sends over it.
+func TestDeliveryService_DeliverSettledRowFailsWithoutSend(t *testing.T) {
+	t.Setenv("BASALT_TEST_DELIVERY_HOOK", "https://example.test/hook")
+	adapter := &fakeDeliveryAdapter{outcome: core.DeliveryOutcome{Status: core.DeliverySent}}
+	channels := []core.NotifyChannel{deliveryTestChannel("rs_ops", "feishu-ops")}
+	service, store := newDeliveryTestService(t, channels, adapter,
+		fakeDeliveryProfiles{"writer": writerEntry(nil)})
+
+	intent := core.DeliveryIntent{
+		RunID: "run_1", TaskID: "daily", Agent: "writer", ChannelUID: "rs_ops",
+	}
+	require.NoError(t, service.Prepare(context.Background(), intent))
+	require.NoError(t, service.Skip(context.Background(), intent, "运行未成功，未投递"))
+
+	outcome := service.Deliver(context.Background(), intent, "正文")
+
+	require.Equal(t, core.DeliverySkipped, outcome.Status, "如实返回行上已有的结论")
+	require.Contains(t, outcome.Detail, "不重发")
+	require.Zero(t, adapter.calls, "已结算的预写行不得再次发送")
+	row, err := store.Get(context.Background(), "run_1")
+	require.NoError(t, err)
+	require.Equal(t, core.DeliverySkipped, row.Status, "守卫不得改写已有终态")
+}
+
 // TestDeliveryService_DeliverUnknownIsRecordedNotRetried —— 结果未知按 unknown 回填，
 // 只调用一次适配器（不盲目重发）。
 // An ambiguous outcome is recorded as unknown and never resent.
@@ -494,15 +529,17 @@ func TestDeliveryService_FinishWriteFailureKeepsPending(t *testing.T) {
 	require.Equal(t, core.DeliveryPending, row.Status, "写失败时行保持 pending")
 }
 
-// TestDeliveryService_RecoverDelegates —— 启动恢复直接交给存储，不在这里做二次判断。
-// Recover delegates to the store.
+// TestDeliveryService_RecoverDelegates —— 作用域恢复直接交给存储，不在这里做二次判断。
+// Recover delegates the scoped run id to the store.
 func TestDeliveryService_RecoverDelegates(t *testing.T) {
 	t.Setenv("BASALT_TEST_DELIVERY_HOOK", "https://example.test/hook")
 	service, store := newDeliveryTestService(t, nil, &fakeDeliveryAdapter{},
 		fakeDeliveryProfiles{})
 	store.recoverCount = 2
+	store.lastRecoverRunID = ""
 
-	count, err := service.Recover(context.Background(), time.Now())
+	count, err := service.Recover(context.Background(), time.Now(), "run-scoped")
 	require.NoError(t, err)
 	require.Equal(t, 2, count)
+	require.Equal(t, "run-scoped", store.lastRecoverRunID, "作用域必须原样传到底")
 }

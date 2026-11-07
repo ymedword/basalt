@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"time"
@@ -129,61 +130,50 @@ func (s *DeliveryStore) ListByTask(ctx context.Context, taskID string, limit int
 	return out, nil
 }
 
-// Recover 处理崩溃遗留的 pending 行：LEFT JOIN `runs` 取实际终态——Run 已完成 /
-// 达上限 → unknown（模型已产出正文，但投递是否发生无法证明，**不自动重发**）；
+// Recover 处理**指定 Run** 崩溃遗留的 pending 行：LEFT JOIN `runs` 取实际终态——
+// 已完成 / 达上限 → unknown（模型已产出正文，但投递是否发生无法证明，**不自动重发**）；
 // 其余（失败 / 取消 / 仍 running / 无 Run）→ skipped。
-// Recover resolves leftover pending rows from the actual run state without resending.
-func (s *DeliveryStore) Recover(ctx context.Context, now time.Time) (int, error) {
-	type pendingRow struct {
-		runID    string
-		runState sql.NullString
+//
+// 作用域是 US-24 的修正（FR-24-21 / C-15）：全局扫描会把其他 Worker 正在收尾的
+// pending 行一并改判。SQLite 实现只保留同一语义，**不**提供无作用域版本。
+// Recover resolves only the named run's pending row; the global scan is gone.
+func (s *DeliveryStore) Recover(ctx context.Context, now time.Time, runID string) (int, error) {
+	if runID == "" {
+		return 0, fmt.Errorf("收尾遗留投递行: run_id 不得为空（恢复必须按被领取的 Run 作用域）")
 	}
-
-	var pending []pendingRow
 	recovered := 0
 	err := withWriteLock(ctx, s.db.write, func(ctx context.Context, conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx,
-			`SELECT d.run_id, r.status
+		recovered = 0
+		var runState sql.NullString
+		err := conn.QueryRowContext(ctx,
+			`SELECT r.status
 			   FROM schedule_deliveries d
 			   LEFT JOIN runs r ON r.run_id = d.run_id
-			  WHERE d.status = ?
-			  ORDER BY d.created_at ASC`, string(core.DeliveryPending))
+			  WHERE d.status = ? AND d.run_id = ?`,
+			string(core.DeliveryPending), runID).Scan(&runState)
+		if errors.Is(err, sql.ErrNoRows) {
+			// 该 Run 没有 pending 投递：恢复是空操作。
+			return nil
+		}
 		if err != nil {
-			return fmt.Errorf("扫描遗留的 pending 投递行: %w", err)
-		}
-		for rows.Next() {
-			var row pendingRow
-			if err := rows.Scan(&row.runID, &row.runState); err != nil {
-				_ = rows.Close()
-				return fmt.Errorf("读取遗留的 pending 投递行: %w", err)
-			}
-			pending = append(pending, row)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("遍历遗留的 pending 投递行: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("关闭遗留投递行游标: %w", err)
+			return fmt.Errorf("读取遗留的 pending 投递行（run_id=%s）: %w", runID, err)
 		}
 
-		for _, row := range pending {
-			status := core.DeliverySkipped
-			detail := "运行未完成，未投递"
-			if row.runState.Valid &&
-				(row.runState.String == string(core.StatusCompleted) ||
-					row.runState.String == string(core.StatusLimitReached)) {
-				status = core.DeliveryUnknown
-				detail = "进程在投递完成前退出，投递结果未知"
-			}
-			if _, err := conn.ExecContext(ctx,
-				`UPDATE schedule_deliveries SET status = ?, detail = ?, finished_at = ?
-				  WHERE run_id = ? AND status = ?`,
-				string(status), detail, now.UnixMilli(), row.runID, string(core.DeliveryPending)); err != nil {
-				return fmt.Errorf("收尾遗留投递行（run_id=%s）: %w", row.runID, err)
-			}
-			recovered++
+		status := core.DeliverySkipped
+		detail := "运行未完成，未投递"
+		if runState.Valid &&
+			(runState.String == string(core.StatusCompleted) ||
+				runState.String == string(core.StatusLimitReached)) {
+			status = core.DeliveryUnknown
+			detail = "进程在投递完成前退出，投递结果未知"
 		}
+		if _, err := conn.ExecContext(ctx,
+			`UPDATE schedule_deliveries SET status = ?, detail = ?, finished_at = ?
+			  WHERE run_id = ? AND status = ?`,
+			string(status), detail, now.UnixMilli(), runID, string(core.DeliveryPending)); err != nil {
+			return fmt.Errorf("收尾遗留投递行（run_id=%s）: %w", runID, err)
+		}
+		recovered++
 		return nil
 	})
 	if err != nil {

@@ -34,8 +34,15 @@ const (
 // ScheduleDeliveryRecord is the authoritative system-delivery row; it never fakes a
 // model tool invocation.
 type ScheduleDeliveryRecord struct {
-	RunID       string
-	TaskID      string
+	RunID  string
+	TaskID string
+	// ExecutionID 指向写下这条预写行的 `task_executions.id`（0012 新增可空列）。
+	// 它是"是否还有合法执行者"的唯一持久关联：回收器 B2 用 `execution_id` 找到对应的
+	// `schedule_execution` 租约，租约仍有效就说明属主还在推进，不得替它结算。
+	// 迁移遗留行没有它（NULL），B2 退回按 `task_id` 判断。
+	// ExecutionID links the prewritten row to its execution row; B2 uses it to prove
+	// ownership before settling a run-less delivery.
+	ExecutionID int64
 	Agent       string
 	AgentUID    AgentUID
 	ChannelUID  ResourceUID
@@ -55,10 +62,14 @@ type ScheduleDeliveryRecord struct {
 // DeliveryIntent freezes the delivery target for one run; the agent identity is resolved
 // by the delivery service at prepare time and stored with the row.
 type DeliveryIntent struct {
-	RunID      string
-	TaskID     string
-	Agent      string
-	ChannelUID ResourceUID
+	RunID  string
+	TaskID string
+	// ExecutionID 是本次调度执行的 `task_executions.id`。预写行与它一起落库，回收器
+	// 才能判定"这条 Run 创建前的投递是否还有合法执行者"（FR-24-39 / C-29）。
+	// ExecutionID ties the pending row to the schedule execution that owns it.
+	ExecutionID int64
+	Agent       string
+	ChannelUID  ResourceUID
 }
 
 // DeliveryOutcome 是一次发送的终态。Status 只取 DeliverySent / DeliveryFailed /
@@ -74,14 +85,16 @@ type DeliveryOutcome struct {
 
 // ScheduleDelivery 是调度器使用的系统代投端口。Prepare 在运行前写 pending 行（写不
 // 进去即不发起运行）；Deliver 只在运行成功后调用；Skip 把未成功的运行标为跳过。
-// 崩溃恢复由 Recover 完成：pending + 运行已完成 → unknown（不自动重发）。
-// ScheduleDelivery prepares the authoritative row before the run, delivers only after
-// a successful run, and recovers pending rows without blind resends.
+// 崩溃恢复由 Recover 按**被领取的 Run 作用域**完成：该 Run 的 pending + 运行已完成
+// → unknown（不自动重发），其余 → skipped。全局扫描会改判其他 Worker 的在跑投递，
+// 因此端口上不再提供无作用域的版本（FR-24-21 / C-15）。
+// ScheduleDelivery prepares the authoritative row before the run and recovers pending
+// rows only inside the claimed run scope.
 type ScheduleDelivery interface {
 	Prepare(ctx context.Context, intent DeliveryIntent) error
 	Deliver(ctx context.Context, intent DeliveryIntent, content string) DeliveryOutcome
 	Skip(ctx context.Context, intent DeliveryIntent, reason string) error
-	Recover(ctx context.Context, now time.Time) (int, error)
+	Recover(ctx context.Context, now time.Time, runID string) (int, error)
 }
 
 // DeliveryStore 是 `schedule_deliveries` 的仓储端口（实现在 internal/storage）。
@@ -96,6 +109,8 @@ type DeliveryStore interface {
 	Get(ctx context.Context, runID string) (ScheduleDeliveryRecord, error)
 	// ListByTask 返回某任务最近的投递记录（新→旧）。
 	ListByTask(ctx context.Context, taskID string, limit int) ([]ScheduleDeliveryRecord, error)
-	// Recover 处理崩溃遗留的 pending 行：关联 Run 已完成 → unknown，否则 skipped。
-	Recover(ctx context.Context, now time.Time) (int, error)
+	// Recover 只处理**指定 Run** 崩溃遗留的 pending 行：该 Run 已完成 / 达上限 →
+	// unknown，否则 skipped。**不得**退化成全局扫描——那会把其他 Worker 正在收尾
+	// 的投递一并改判（FR-24-21 / C-15）。
+	Recover(ctx context.Context, now time.Time, runID string) (int, error)
 }

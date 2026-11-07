@@ -65,8 +65,11 @@ const (
 // （模块卡 §4.5.11 / FR-021）。
 // 判据落在**系统提示词**上：本 Run 的第 2 次模型请求（工具结果之后）仍带旧正文，
 // 下一个 Run 的第 1 次请求带新正文。
+// 改写走控制台提交：US-24 起执行期只读准入时固定的内容寻址 bundle，控制台保存定义
+// 在服务端一并发布——"运行中改写"这一步的语义与运维真实操作一致。
 // TestReleaseE2E_HotReload: a mid-run AGENT.md rewrite must not leak into the running
-// run, while the next run picks the new body up.
+// run, while the next run picks the new body up. The rewrite goes through the console
+// save path, which publishes the bundle the next run is admitted against.
 func TestReleaseE2E_HotReload(t *testing.T) {
 	h := newHarness(t)
 	exe := helperBinary(t)
@@ -92,8 +95,10 @@ func TestReleaseE2E_HotReload(t *testing.T) {
 	// 工具卡在 block 上 = 本 Run 的快照已冻结、第一次模型请求已带着旧正文发出。
 	waitPathAppears(t, release+".started", 60*time.Second, p.output)
 
+	// 改写走控制台提交（服务端写路径）：US-24 起执行期只读准入时固定的 bundle，直接改
+	// 磁盘的正文在发布前不影响任何 Run；控制台保存定义会一并发布，下一个 Run 才取新正文。
 	agentPath := filepath.Join(h.Root, ".basalt", "agents", "demo", "AGENT.md")
-	rewriteAgentBody(t, agentPath, newPrompt)
+	submitAgentContent(t, addr, "demo", agentBodyWithPrompt(t, agentPath, newPrompt))
 
 	// 热加载的确定性观测点：注册表已换成新条目（运行中的 Run 仍用旧快照）。
 	p.waitOutput(t, "Agent 配置已热加载", 30*time.Second)
@@ -467,11 +472,11 @@ func waitToolAuditRow(t *testing.T, h *harness, runID string, timeout time.Durat
 	return "", ""
 }
 
-// rewriteAgentBody 只替换 AGENT.md 的正文：frontmatter（含夹具写进的绑定块）逐字保留，
+// agentBodyWithPrompt 只替换 AGENT.md 的正文：frontmatter（含夹具写进的绑定块）逐字保留，
 // 热加载因此能通过校验、绑定不失效——用例判的就只是"正文何时刷新"。
-// rewriteAgentBody replaces only the prompt body; the frontmatter (including the
+// agentBodyWithPrompt replaces only the prompt body; the frontmatter (including the
 // fixture-seeded bindings) stays byte for byte, so the reload passes validation.
-func rewriteAgentBody(t *testing.T, path, body string) {
+func agentBodyWithPrompt(t *testing.T, path, body string) string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -487,8 +492,19 @@ func rewriteAgentBody(t *testing.T, path, body string) {
 		t.Fatalf("AGENT.md %s 缺 frontmatter 结束行：\n%s", path, text)
 	}
 	front := text[:len("---\n")+end+len("\n---\n")]
-	content := front + "\n" + strings.TrimRight(body, "\n") + "\n"
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("改写 AGENT.md %s 失败: %v", path, err)
-	}
+	return front + "\n" + strings.TrimRight(body, "\n") + "\n"
+}
+
+// submitAgentContent 经控制台提交一份新的 AGENT.md 全文。US-24 起执行期只读准入时
+// 固定的内容寻址 bundle：直接改磁盘的正文在显式发布之前不会影响任何 Run，控制台写
+// 路径在服务端完成发布，等价于运维"保存定义"这一步。
+// submitAgentContent saves a full AGENT.md through the console write path, which also
+// publishes the bundle the next run is admitted against.
+func submitAgentContent(t *testing.T, addr, agent, content string) {
+	t.Helper()
+	before := adminAgentFiles(t, addr, agent)
+	resp := adminWrite(t, addr, http.MethodPost, "/api/v1/agents/"+agent+"/files", map[string]any{
+		"files": []map[string]string{{"path": "AGENT.md", "content": content}},
+	}, map[string]string{"If-Match": before.ETag})
+	requireWriteOK(t, resp, nil, "提交 AGENT.md（运行中改写）")
 }

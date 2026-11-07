@@ -17,8 +17,12 @@ func TestFlow_UnadmittedCapacityDoesNotConsumeAttempt(t *testing.T) {
 	require.NoError(t, err)
 	task = claimFlowForTest(t, s, task)
 	eligible := task.UpdatedAt + 250
+	// YieldUnadmitted 写回 running + next_eligible_at，属推进类：执行期间持根租约，
+	// 写完即释放，让下面的就绪扫描能看见这颗空闲根。
+	lease := flowRootLeaseFor(t, s.db, task.RootTaskID)
 	require.NoError(t, s.YieldUnadmitted(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, "attempt-"+task.ID, task.Version, eligible))
 	require.NoError(t, s.YieldUnadmitted(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, "attempt-"+task.ID, task.Version, eligible), "same refusal fact is idempotent")
+	require.NoError(t, NewLeaseStore(s.db).Release(t.Context(), lease))
 	task, err = s.ReadForWorker(t.Context(), task.ID)
 	require.NoError(t, err)
 	require.Zero(t, task.Revision.Attempts["draft"])
@@ -31,6 +35,7 @@ func TestFlow_UnadmittedCapacityDoesNotConsumeAttempt(t *testing.T) {
 	ready, err = s.ReadyRoots(t.Context(), eligible, 32)
 	require.NoError(t, err)
 	require.Len(t, ready, 1)
+	acquireFlowRootLease(t, s.db, task.RootTaskID)
 	_, err = s.Claim(t.Context(), flow.ClaimNode{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Now: eligible, Attempt: flow.NodeAttempt{ID: "yield-retry", TaskID: task.ID, NodeID: "draft", NodeInvocationID: "draft-invocation", Attempt: 1, ExecutionEpoch: task.Version.ExecutionEpoch, Input: task.Revision.Input, InputHash: task.Revision.InputHash}})
 	require.NoError(t, err)
 	// A separate admitted Run cannot be refunded even if it made no tool call.

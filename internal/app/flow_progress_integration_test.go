@@ -52,7 +52,7 @@ func TestFlow_ProductionProgressAcceptsNewSourcesAndRejectsChangedBytes(t *testi
 			require.NoError(t, err)
 			task, err := rt.flows.service.Start(t.Context(), flow.StartRequest{Principal: core.LocalAdminCLIPrincipal(), DefinitionUID: published.DefinitionUID, IdempotencyKey: "progress", Input: json.RawMessage(`{"answer":"input"}`)})
 			require.NoError(t, err)
-			finished, err := rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+			finished, err := advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
 			require.NoError(t, err)
 			window := finished.Revision.Progress[task.ID+":draft"]
 			var calls int
@@ -107,7 +107,7 @@ func TestFlow_ProductionAliasReplacementChainCannotMintProgress(t *testing.T) {
 	require.NoError(t, err)
 	task, err := rt.flows.service.Start(t.Context(), flow.StartRequest{Principal: core.LocalAdminCLIPrincipal(), DefinitionUID: published.DefinitionUID, IdempotencyKey: "alias-chain", Input: json.RawMessage(`{"answer":"input"}`)})
 	require.NoError(t, err)
-	finished, err := rt.flows.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+	finished, err := advanceUnderFlowRoot(t, rt.db, rt.flows.service, task.RootTaskID, flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
 	require.NoError(t, err)
 	require.Equal(t, flow.Stopped, finished.Status)
 	window := finished.Revision.Progress[task.ID+":draft"]

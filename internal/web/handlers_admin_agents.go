@@ -67,6 +67,17 @@ const (
 	// messageCredentialUnavailable 是主密钥不可用时的兜底文案（503）。
 	// #nosec G101 -- 固定用户文案，值不是凭据（变量名含 credential 命中的误报）。
 	messageCredentialUnavailable = "托管凭据在当前主密钥下不可用"
+	// US-24 资产 / 生命周期准入的兜底文案：一律点名"要改什么"，不回显绝对路径、
+	// bundle 内容或哈希明细（错误文案纪律）。适配器可选带更具体的 `AdminError.Message`。
+	// US-24 admission fallbacks: name the fix, never echo paths, bundle bytes or hashes.
+	messageAssetUnavailable        = "Agent 的资产发布记录缺失或本地资产目录不可读：请先执行 basalt assets install 再重试"
+	messageAssetMismatch           = "本地资产包与共享发布记录不一致：请重新执行 basalt assets install 后再试"
+	messageLifecycleStale          = "本地生命周期代次低于共享索引：请等待调度或管理员推进后再试"
+	messageLifecycleMismatch       = "本地生命周期与共享索引同代次内容不一致：请用管理操作单调修复后再试"
+	messageResourceVersionMismatch = "模型连接 / MCP 的本地实例与目标版本不一致且重建后仍不符：请稍后重试或检查发布状态"
+	// messageResourceVersionConflict 是 409 分支的兜底文案：指针在准入窗口内被推进，
+	// 条件已变但资源本身可用——重试这一笔即可，**不得**改用最新版本。
+	messageResourceVersionConflict = "模型连接 / MCP 的发布指针或凭据在准入窗口内被推进：请重试本次请求；不得把固定版本替换为最新版本"
 )
 
 // handleAdminCreateAgent 处理 `POST /agents`：模板创建默认停用，响应是落盘后的真值

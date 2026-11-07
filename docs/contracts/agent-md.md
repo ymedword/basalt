@@ -168,6 +168,12 @@ schedules:
   - `archived`：不在活动注册表；只能经受控 restore 恢复，恢复默认 `disabled`。
 - **一致性边界**：禁用 / 启用与 Run 准入共用同一 Agent 级读写锁（见 [run-and-errors.md](run-and-errors.md) §3.4）；HTTP、CLI、定时器与内部入口都必须检查。
 - **复制与恢复**：复制创建新 Agent 目录与**新 `agent_uid`**，不复制生命周期文件、会话 / 记忆 / 审计、`schedules`（清空以免全局 `id` 冲突）；初始 `disabled`。归档恢复沿用**原 `agent_uid`**（原名与异名两条路径都只改名称、不改身份），默认 `disabled` 并清空 `schedules`，由管理员显式启用 / 重配。删除后同名重建是**新 Agent**：新 `agent_uid`，旧绑定与旧专属资源不自动连接。旧归档缺可信 UID 时标 `legacy_unrecorded`，恢复时生成新 UID，**不得**按同名猜出旧身份。不得把手工移动目录当作正常恢复。
+- **多 Worker 代次守卫（US-24）**：`agent_lifecycle` 索引是状态文件的**派生面**，多 Worker 共享；写入遵守**代次单调**，索引**不得**被旧代次覆盖：
+  - 本地代次**低于**索引 → 拒绝（`AGENT_LIFECYCLE_STALE`），索引一个字节不动；
+  - **同代次** → 只接受 `generation / state / state_file_hash / agent_uid / uid_source / operation_id` **六列逐项完全一致**：一致即幂等成功（**不**刷新 `updated_at`），不一致 → `AGENT_LIFECYCLE_MISMATCH`、零写入；
+  - 本地代次**高于**索引 → **不再自动放行**：启动基线**不**把它写回索引（记 WARN，该 Agent 不可准入），修复只能由管理操作单调推进索引——无条件写回等于单方面把高代次塞进索引，绕开这条判据；
+  - `valid = false` 的派生写入（"这份文件不可用"，`state` 归 NULL、代次归零）**不受**单调规则约束：它不携带代次主张，若也纳入比较，索引就再也无法记录"文件损坏"这件事本身。
+- **准入比对（`StartRun` 事务内，与归档屏障同一行 `FOR UPDATE`）**：索引代次高于期望 → `AGENT_LIFECYCLE_STALE`；低于期望 → `AGENT_LIFECYCLE_MISMATCH`（不自动放行）；同代次但 `state` 非 `active`、`state_file_hash` 不符或**索引无行** → `AGENT_LIFECYCLE_MISMATCH`。**零值期望直接拒绝**——缺期望不是"跳过复查"（P-16）。
 
 ### 2.3 内容版本、ETag 与结构化编辑
 

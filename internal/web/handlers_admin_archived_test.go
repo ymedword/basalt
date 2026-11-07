@@ -189,14 +189,17 @@ func TestArchivedAgents_ArchiveProjectsRecord(t *testing.T) {
 }
 
 // TestArchivedAgents_ArchiveBusy 断言在途运行等待超时映射 409 AGENT_BUSY，并在
-// `data.run_ids` 点名运行标识（契约点名的活动运行），`pending` 之后失败同时带
-// `data.operation_id`（约束 1a），自由文本不得带标识。
-// A drain timeout maps to 409 AGENT_BUSY with data.run_ids and the operation id.
+// `data.run_ids` 点名运行标识（契约点名的活动运行），同时点名仍未达成的完成判据
+// （FR-24-41：`unmet_predicates`）；`pending` 之后失败同时带 `data.operation_id`
+// （约束 1a），自由文本不得带标识。
+// A drain timeout maps to 409 AGENT_BUSY with data.run_ids, the unmet predicates and
+// the operation id.
 func TestArchivedAgents_ArchiveBusy(t *testing.T) {
 	srv := newAgentAdminServer(t, &fakeArchivedAgentService{
 		archiveFn: func(context.Context, core.Actor, string) (core.AgentArchiveRecord, error) {
 			return core.AgentArchiveRecord{}, &core.AgentBusyError{
 				RunIDs: []string{"run-1", "run-2"}, OperationID: "op-archive-busy",
+				Unmet: []string{"no_running_run", "no_pending_delivery"},
 			}
 		},
 	})
@@ -210,6 +213,8 @@ func TestArchivedAgents_ArchiveBusy(t *testing.T) {
 	data, ok := env.Data.(map[string]any)
 	require.True(t, ok, "data 必须携带 run_ids")
 	require.Equal(t, []any{"run-1", "run-2"}, data["run_ids"])
+	require.Equal(t, []any{"no_running_run", "no_pending_delivery"}, data["unmet_predicates"],
+		"409 必须点名未达成的完成判据，操作员不必反推")
 	require.Equal(t, "op-archive-busy", data["operation_id"])
 	require.NotContains(t, env.Message, "run-1")
 }

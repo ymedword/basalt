@@ -37,7 +37,7 @@ func TestObservabilityTaskReasonProjectionDoesNotChangeExportSource(t *testing.T
 	ctx := t.Context()
 	const runID = "obs-safe-task-reason"
 	taskPortSeedTask(t, db, "obs-safe-task", "synthetic", "0 * * * * *", "synthetic")
-	require.NoError(t, NewRunStore(db).StartRun(ctx, core.RunRecord{RunID: runID, Agent: "synthetic", Channel: "web", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.UnixMilli(1000)}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(NewRunStore(db), ctx, core.RunRecord{RunID: runID, Agent: "synthetic", Channel: "web", Principal: core.LocalAdminCLIPrincipal(), StartedAt: time.UnixMilli(1000)}, core.RunResourceManifest{}))
 	const reason = "上下文超限：不可裁部分估算 66171 tokens 超过 budget.context_tokens=65536（含余量 1024）"
 	_, err := db.pool.ExecContext(ctx, `UPDATE runs SET status='failed',reason=$1,finished_at=2000 WHERE run_id=$2`, reason, runID)
 	require.NoError(t, err)

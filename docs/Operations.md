@@ -94,6 +94,50 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 首启验收（Windows 与 Linux 同一组动作）：解压 → `basalt serve` → 用访问密码登录 → 「执行环境 → 运行环境」核对组件存在 / 可用 / 执行授权 → 对已配置 MCP server 点「测试」看到 `stage=complete` 与工具清单。缺少用户个人凭据（如 `GITHUB_PERSONAL_ACCESS_TOKEN`）只显示待配置，不算包缺陷。
 
+### 1.5 首次配置清单（安装后到 Demo / Flow 可运行）
+
+开箱安装只把**文件与目录**就位：配置模板、工作区、5 个每日 Demo Agent、4 个 Flow 角色与采购示例素材、3 条免凭据 MCP、样例库与文档库。模型、凭据与业务选择**必须**由人完成。下面顺序不可交换：知识库绑定在 Agent 注册期解析，Flow 模板在载入时固定当时的发布版本。
+
+| 步骤 | 动作 | 判据 |
+| --- | --- | --- |
+| 1. 首启补配置 | 首次 `serve` 生成 `basalt.yaml` 后，按日志补齐 `database.dsn` 与 `callers.ingress` 六项（§5.10），再启动；托管凭据另需主密钥（见下） | 不再报「服务启动前的入口限流配置不完整」；管理台可登录 |
+| 2. 模型连接 | 资源 → 模型连接 → 新建：Base URL、默认模型、凭据（托管或 `${VAR}`）；保存即发布 | 「测试」返回 `ok=true`；托管凭据要求主密钥已就绪（§6） |
+| 3. Agent 绑定与启用 | Agents → 选 Agent → 配置 → 模型连接 / 通知渠道 → 保存 → 启用 | `resource_bindings.model_connection` 有一条且指向当前发布版本；`provider.model` 不是模板占位符 |
+| 4. 知识库（Flow 演示） | 先建集合 → 摄取 → 再加只读绑定（见下） | 集合内有成功版本；加绑定后 Agent 仍注册 |
+| 5. 记忆确认 | 按 `.basalt/samples/bid-readiness/memory-suggestions.json` 逐条在 Agents → 记忆页提议并确认 | 四条均为「生效」；候选不参与召回 |
+| 6. Flow 开关 | `basalt.yaml` 设 `flows.enabled: true` 并重启 | Worker 随 `serve` 启动；启用本身不创建任务 |
+| 7. 模板发布 | 工作流 → 工作流定义 → 载入采购准备模板 → 只读在线校验 → 确认发布 | 发布版本绑定四个角色当前 UID / 版本 / 哈希 |
+| 8. 手动建任务 | 执行任务 → 新建任务，选 `bid-readiness-matrix-v1` 并提交 | 任务出现并逐节点推进 |
+
+**知识库四步（顺序固定）**：
+
+1. 在 `basalt.yaml` 增加向量连接后重启：
+
+   ```yaml
+   embedding:
+     model_connection: bailian
+     model: text-embedding-v4
+     dimensions: 512
+     batch_size: 32
+     timeout_seconds: 30
+   ```
+
+   `model_connection` 填控制台里**已发布**的模型连接名；`dimensions` 必须是 512（向量列已冻结）。启动日志应出现「知识库：向量路径已装配」。
+
+2. 控制台 → 知识库 → 新建集合 `bid-request`，摄取 `samples/bid-readiness/sources/request-01.md` 至 `request-08.md`。
+3. 新建集合 `bid-product`，摄取 `samples/bid-readiness/sources/product-main.md`。
+4. 最后给 Agent 加只读绑定：`bid-requirements` 勾 `bid-request`；`bid-technical` 勾 `bid-product` 与 `bid-request`；保存发布。
+
+摄取路径相对工作区 `.basalt/`；每次摄取都会调用向量模型并产生费用。**不得**先绑定再建集合——声明名解析不到活动集合时整只 Agent 不注册。`bid-delivery` / `bid-reviewer` 不需要绑定，它们直接读冻结原文。
+
+**Flow 联动判定点**：Flow 节点只有在 Agent 声明了 `knowledge:` 时才做检索注入；没有绑定就整个跳过。载入模板前必须完成第 2–4 步；模板固定载入当时的发布版本，事后修改 Agent 绑定不会回写已有模板版本。
+
+**首启中断与主密钥**：
+
+> 如果目标是开箱安装（5 个每日 Demo + 4 个 Flow 角色），**不得**在全新目录先执行 `basalt init`：它会让实例被判为「存量」，跳过主密钥自动初始化与开箱 Agent 安装。全新安装直接 `serve`，按日志补配置。
+>
+> 让 `serve` 生成模板后因缺入口限流而退出的实例，重试会续做开箱安装（初始化时写了安装意图标记），但**不会**自动生成主密钥；在控制台「高级：实例加密诊断」初始化，或停机执行 `basalt secrets init`。只用 `${VAR}` 环境凭据的部署可跳过。若已经先跑过 `basalt init`，停机后按顺序补齐：`basalt secrets init` → `basalt demo install` → `basalt demo workflow install`，再启动 `serve`。
+
 ---
 
 ## 2. 监听与出网
@@ -1625,3 +1669,89 @@ learning:
 首次启动自动前向迁移到 schema v11（`0011_memory_learning.sql`：新增 `memory_extractions` / `memory_extraction_cursors` / `memory_candidate_meta` / `memory_candidate_sources` / `memory_method_drafts` 五张表，并把 `memory_entries.source` 闭集扩到含 `auto_extract`、`llm_calls.purpose` 闭集扩到含 `memory_extract`）；迁移 0001–0010 不改写，旧二进制拒绝打开 v11 库，回退须恢复升级前的同版本数据库 / 工作区快照。升级前按 §5.1 做停机备份。
 
 方法草案写在 `<工作区>/.basalt/learning/drafts/<draft_id>/`（`DRAFT.md` + `evidence.json`，文件 0444、目录 0555），随 `.basalt/` 整目录备份（§4.1），不纳入自动清理；该目录**不在**任何 Agent 读写白名单。草案只能经 `basalt learning handoff`（本机 CLI、实例锁、用户确认来源）转交 US-21 的技能准入提议入口；评估 / 批准 / 发布仍全部归学习准入。
+
+## 分布式执行（US-24）
+
+多个 `serve` 进程可以共享**同一个 PostgreSQL** 分摊离线 / 定时 Agent 任务；SQLite 谱系仍是单进程，**不得**把同一个 SQLite 文件同时挂给两个进程。每个 Worker 保留自己的工作区（各自的 `agent/`、技能与 `.basalt/`），执行权、资产发布记录与调用方周期配额以数据库为唯一权威。默认仍是同步执行：本档只把"谁有资格写"提升到多进程，不引入第二条执行路径，模型 / 工具调用不自动重放。
+
+### 前提与配置
+
+- 所有 Worker 指向同一套 PostgreSQL，并使用支持 schema v12 的同一发布版本；旧二进制打开 v12 库会以 `ErrSchemaTooNew` 拒绝启动（见下「停机迁移升级与回滚边界」）。
+- 一个工作区只归一个 Worker。第二个 `serve` 用同一工作区会被实例锁拒绝；`workers list` / `assets verify|export` 等只读命令不取锁，可在服务运行时执行。
+- QPS 是**每 Worker** 软限额，集群总量不承诺硬上限；并发与周期配额跨 Worker 生效，硬配额无法核实即拒绝新增消耗。
+- 三段配置由装载期显式解析：未知键（如把 `lease_ttl_seconds` 拼成 `lease_ttl_second`）、null 与越界值一律拒绝启动——**不得**把"配置看着改了、行为没变"当成启动成功。
+
+```yaml
+worker:
+  name: ""                        # 仅诊断，空 = hostname；允许重复（身份是 InstanceID）
+  lease_ttl_seconds: 30           # 5..300
+  renew_interval_seconds: 10      # ≥1 且 < lease_ttl_seconds/2
+  reclaim_interval_seconds: 5     # 1..60 且 ≤ lease_ttl_seconds
+  reclaim_batch: 32               # 1..256
+  heartbeat_interval_seconds: 10  # ≥1；只驱动 worker_nodes 心跳，不参与归属判定
+  max_inflight: 64                # 1..512；交互 Run / 调度执行 / Flow 节点共用
+  shutdown_grace_seconds: 45      # ≥ flows.shutdown_grace_seconds+5 且 ≤ HTTP 宽限-5
+scheduler:
+  poll_interval_ms: 500           # 100..5000；数据库到期扫描，不是进程内 cron 定时器
+  dispatch_batch: 32              # 1..256；且 dispatch_batch + flows.max_active ≤ max_inflight
+  missed_grace_seconds: 300       # 0..86400；超过只记一条 skipped 并推进到未来
+assets:
+  bundle_root: .basalt/assets     # 必须非空
+```
+
+### Worker 与租约排障
+
+`basalt workers list`（`--json` 机器可读）只读展示已登记实例：`INSTANCE` 是身份，`NAME` 只作诊断（允许重复），`HEARTBEAT` 只是诊断——**心跳过期不等于死亡，也不能证明归属**；唯一的存活判据是租约是否过期。排除故障时按这个顺序看：
+
+- **Run 停在 running 而属主已死**：等租约过期（至多 `lease_ttl_seconds`）再加一轮回收（至多 `reclaim_interval_seconds`），由任意活 Worker 的回收循环收为 `failed`。**没有**启动全局恢复扫描，重启其他 Worker 不会让它更早结束；**不得**手工改 `runs.status`。
+- **`SESSION_BUSY`（409）来自已死属主**：恢复期间会话租约不释放，旧会话在新 Run 准入时仍为 409；租约过期并被接管后才会放行。**不得**为了放行而手工删租约行。
+- **`FLOW_ROOT_BUSY`（409）**：执行者正持有 Flow 根租约；管理面 `resume` / `revise` 不重试、不降级。等根推进结束或租约过期被接管后再操作。
+- **看租约**：`execution_leases` 的 `kind` ∈ `run` / `schedule_execution` / `flow_root`，`resource_id` 对应 `runs.run_id` / `task_executions.id` / Flow 根 `task_id`；`owner_worker_id` + `ownership_epoch` 是归属，`released_at` 非空表示已交还。时间列是 **bigint 毫秒**，判定过期要写成 `expires_at <= (extract(epoch from clock_timestamp()) * 1000)::bigint`——**不得**把毫秒列直接和 `clock_timestamp()` 比较（类型不匹配或静默按秒比较，结论必错）。
+- **看转换**：`lease_events` 只记状态转换（`claimed` / `takeover` / `released` / `renew_failed` / `reclaimed`），不是审计结论。用户可见的失败原因是机器可读固定字面量：回收接管收尾为 `worker_lost`，绑定调用方 Key 已失效时为 `owner_unauthorized`（优先），错过调度宽限为 `missed_grace_exceeded`；原始原因不出现在 API 里，管理面读投影后的值。
+- **禁止**手工改 `owner_worker_id` / `ownership_epoch`，也**不得**强制释放活租约：这两件事都会绕过归属校验，让旧属主的写入重新被接受。需要恢复就等过期回收；需要停就按下面顺序停。
+
+### 资产导出、安装与校验
+
+Agent 配置与技能版本以内容寻址 bundle 分发：`manifest` + 逐文件 SHA-256 + `bundle_hash`。bundle 的内容来自**工作区**：`agents/<agent>/AGENT.md`、其 `bootstrap:` 声明的文件（工作区相对路径）与技能当前发布版本的文件。跨机器**没有**自动分发（S3 / PVC / NFS 不在本档），走"构建 → 导出 → 人工复制 → 每台安装"：
+
+```sh
+# 1. 首次部署（或改了 AGENT.md / bootstrap 文件 / 技能发布版本之后）：从本机工作区
+#    构建并发布。install 取工作区实例锁并写共享发布记录——服务必须已停。
+basalt assets install --agent <agent>
+
+# 2. 在源宿主校验并导出（verify 只复算、零写入；export 先校验再逐文件复制）
+basalt assets verify .basalt/assets/bundles/<agent>/<bundle_hash>
+basalt assets export .basalt/assets/bundles/<agent>/<bundle_hash> ./out/<agent>-<bundle_hash>
+
+# 3. 把导出的目录复制到每台 Worker（保持目录内容不变）
+# 4. 在每台 Worker 上安装同一份：同样需要服务已停（命令写共享发布记录）
+basalt assets install ./out/<agent>-<bundle_hash>
+```
+
+- `install --agent <agent>` 是首次部署的起点：共享发布记录里没有 `agent_bundle` 指针时，**任何** Run 都会以 `ASSET_UNAVAILABLE` 拒绝——服务器**不会**自动把工作区内容发布为真相。两种 `install` 形态互斥：`--agent` 从工作区构建，`<bundle-dir>` 只装已导出的副本。
+- 构建只读共享发布记录（生命周期身份与技能指针），写到临时暂存目录；构建失败不改动任何已安装目录。写共享记录仍发生在同一条 `install` 的发布段里：锁 → 可写库 → 发布。
+- `install` 写到 `<bundle_root>/bundles/<agent>/<bundle_hash>`，**不可变**：已存在时只做逐文件比对（一致即幂等成功，不一致拒绝且不覆盖）；截断 / 损坏的来源在复制前就拒收，不改动原目录。安装同时推进**共享**发布记录，所有 Worker 都要尽快装同一份——本机 bundle 与共享记录不一致时，新 Run 准入 fail-closed（`ASSET_UNAVAILABLE` / `ASSET_VERSION_MISMATCH`），这是设计行为，不是可以绕过的小故障。
+- `bundle_hash` 由配置内容与技能版本共同决定：内容不变重复安装幂等；内容变了得到新 hash 与新目录，旧目录保持原样。
+- 旧 Run 固定在它启动时的 hash 目录，不随新安装漂移；运行中的 Run 因此不受安装影响。
+- 安装目录**没有**垃圾回收：`bundles/` 下只清理写入失败的暂存目录。**不得**手工删除 `bundles/<agent>/<hash>`——在途 Run 仍按原路径读取。
+- 生命周期代次的放行条件：本地代次低于索引 → 拒绝（`AGENT_LIFECYCLE_STALE`）；高于索引**不**自动放行，需走管理操作单调修复；同代次只接受逐项内容完全一致的写入。
+
+### 停机顺序
+
+固定顺序：**停止领取 → drain 期间继续续约 → 等待执行与收尾退出 → 释放租约 → 关闭数据库**。正常停机按这个顺序走完后进程退出，租约以 `released` 交还，下一个 Worker 可直接接手。
+
+超过 `worker.shutdown_grace_seconds` 仍有执行未退出时，进程**直接退出**：不 `Release` 租约、不关闭 PG 连接。这是"不再假装收尾成功"的有意行为——租约到期后由别的 Worker 按回收规则收尾（普通 Run 记 `worker_lost`）。审计终态写入用 `WithoutCancel` + 独立短超时，不随 drain 上下文被立即取消。
+
+### 停机迁移升级与回滚边界
+
+v11 → v12 的 `0012_distributed_execution.sql` 是**前向追加**的 stop-the-world 升级，**不得**在线混跑：
+
+1. 停全部 Worker（按上面的停机顺序）；
+2. 备份同一份停机快照：PostgreSQL、**每个**工作区（含 `.basalt/` 与 `bundles/`）、配置文件与当前二进制；
+3. 先用新二进制启动一台（启动时前向迁移到 v12），确认 `schema_version` 为 12 且回收一轮完成；
+4. 再启动其余 Worker。
+
+- 旧二进制**拒绝**打开 v12 库（`ErrSchemaTooNew`）——回退只能恢复第 2 步的**同一套**备份（库 + 工作区 + 旧二进制），**不得**只回退库或只回退二进制。
+- 迁移前的在途行（`runs` 的 running、`task_executions` 的 started、非关闭态 Flow 根）被回填为 `owner='legacy'`、代次 0、**已过期**的租约；它们不属于任何活 Worker，由首个新 Worker 的首轮回收立即领取并按既有规则收尾（普通 Run 收为 failed），**不会**被续跑。升级窗口因此要选在没有在途执行时。
+- 关闭态 Flow 根（cancelling / 带关闭意图 / 已过 deadline）不回填，由原有收尾路径推进。
+- 本档不改 `schema.pg.sql`，不改写 `0001`–`0011`。

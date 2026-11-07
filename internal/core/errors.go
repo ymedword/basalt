@@ -351,6 +351,51 @@ var (
 	// ErrExecutionProfileMismatch stops a stale confirmation dialog from silently
 	// applying a direction the user never saw.
 	ErrExecutionProfileMismatch = errors.New("execution profile mismatch")
+
+	// —— 准入拦障错误分类（US-24 §2.3.9；既有哨兵一个不动）——
+	// Admission-barrier classifications added by US-24; existing sentinels stay
+	// untouched. The web layer maps these in T035; the codes are frozen here.
+
+	// ErrAssetUnavailable 表示资产发布指针缺失 / 已软删除，或本地 content-addressed
+	// 目录不可读——**fail-closed**：准入拒绝，web 映射 503 `ASSET_UNAVAILABLE`。
+	// 它不是"暂时读不到"，而是"没有可用的发布事实"，重试同一状态不会自愈。
+	// ErrAssetUnavailable marks a missing or soft-deleted asset publication pointer;
+	// the web layer maps it to 503 ASSET_UNAVAILABLE.
+	ErrAssetUnavailable = errors.New("asset bundle unavailable")
+
+	// ErrAssetVersionMismatch 表示本地 bundle 哈希与共享发布记录不一致（目录名、
+	// 逐文件哈希或 bundle hash 任一项不符）——web 映射 409 `ASSET_VERSION_MISMATCH`。
+	// 不静默换版本：换成"最新"会让在途 Run 读到从未校验过的内容。
+	// ErrAssetVersionMismatch marks a local bundle that disagrees with the shared
+	// publication record; the version is never silently switched to "latest".
+	ErrAssetVersionMismatch = errors.New("asset bundle version mismatch")
+
+	// ErrResourceVersionMismatch 是同一个业务码 `RESOURCE_VERSION_MISMATCH` 的两种形态，
+	// 由 web 层按**是否被 `*ResourceUnavailableError` 包装**分成两个状态：
+	//   - 裸 sentinel（准入事务内复查发现 Provider 的 `published_version_id` / MCP 的
+	//     `applied_version_id` / 凭据 pin 在预检之后被推进或删除）→ 409，说明"这一笔
+	//     准入了过期事实，重试即可"，被拒请求零占用；
+	//   - 经 `*ResourceUnavailableError` 包装（本地实例版本证明不成立：`BuiltVersion`
+	//     与目标不符且按同一目标版本重建-换入-再比仍不符，或 MCP 尚无已应用版本）
+	//     → 503，修复入口是"重启服务 / 重新发布该资源"。
+	// 两者都可重试，都**不得**以最新为准；把 409 报成 503（或反之）会让调用方去修一个
+	// 已经正确的东西。
+	// ErrResourceVersionMismatch carries two documented statuses: the bare sentinel from
+	// the in-transaction recheck is 409, while the instance-proof failure wrapped in
+	// *ResourceUnavailableError is 503. Neither ever replaces the pinned version.
+	ErrResourceVersionMismatch = errors.New("resource version mismatch")
+
+	// ErrAgentLifecycleStale 表示本地生命周期代次**低于**共享索引（另一个 Worker 已
+	// 推进过）——web 映射 409 `AGENT_LIFECYCLE_STALE`。本地不得把旧代次写回索引。
+	// ErrAgentLifecycleStale marks a local generation behind the shared index.
+	ErrAgentLifecycleStale = errors.New("agent lifecycle stale")
+
+	// ErrAgentLifecycleMismatch 表示同代次内容不一致、索引行缺失 / 非 active，或
+	// 准入没有提供生命周期期望值（P-16 的零值即拒绝）——web 映射 409
+	// `AGENT_LIFECYCLE_MISMATCH`。
+	// ErrAgentLifecycleMismatch marks same-generation disagreement, a missing /
+	// inactive index row, or an absent lifecycle expectation (P-16 refuses zero).
+	ErrAgentLifecycleMismatch = errors.New("agent lifecycle mismatch")
 )
 
 // AdminError 把管理写面分类与结构化 `data` 绑定：错误信封的 `data` 只承载契约固定
@@ -401,6 +446,11 @@ func AdminErrorData(err error) map[string]any {
 type AgentBusyError struct {
 	RunIDs      []string
 	OperationID string
+	// Unmet 是等待窗口结束时仍未达成的归档完成判据（FR-24-41 的固定字面量：
+	// `no_running_run` / `no_pending_audit` / `refs_released` / `no_pending_delivery`）。
+	// 只点名**未达成**项，经 `data.unmet_predicates` 出站；为空时不写该键。
+	// Unmet names only the predicates that still failed when the window closed.
+	Unmet []string
 }
 
 // Error 返回不带 Run 列表的固定文案（列表只经 data.run_ids 对外，避免把标识拼进
@@ -417,6 +467,9 @@ func (e *AgentBusyError) Unwrap() error {
 	data := map[string]any{"run_ids": e.RunIDs}
 	if e.OperationID != "" {
 		data["operation_id"] = e.OperationID
+	}
+	if len(e.Unmet) > 0 {
+		data["unmet_predicates"] = e.Unmet
 	}
 	return &AdminError{
 		Kind:    ErrBusy,

@@ -185,14 +185,33 @@ func TestResourceGate_ConcurrentPublishAndAdmission(t *testing.T) {
 	wg.Wait()
 }
 
-// TestBuildRunResourceManifest_FormatVersionIsTwo：v2 清单格式号固定为 2（v1 只读保留，
-// 视图按 format_version 区分代际）。
-func TestBuildRunResourceManifest_FormatVersionIsTwo(t *testing.T) {
+// TestBuildRunResourceManifest_FormatVersionIsThree：v3 清单格式号固定为 3（v1 / v2 只读保留，
+// 视图按 format_version 区分代际）；v3 的增量只有 `asset_bundle_hash`，既有字段语义不变。
+// US-24 T011：原用例名为 …FormatVersionIsTwo（v2 = US-12 R4 形态），v3 增加内容寻址资产包哈希。
+func TestBuildRunResourceManifest_FormatVersionIsThree(t *testing.T) {
 	t.Parallel()
 	manifest, err := core.BuildRunResourceManifest(sampleAgentUID, core.AgentActive, sampleResolved())
 	require.NoError(t, err)
-	require.Equal(t, 2, manifest.FormatVersion)
+	require.Equal(t, 3, manifest.FormatVersion)
 	require.Equal(t, sampleAgentUID, manifest.AgentUID)
+}
+
+// TestRunResourceManifest_V2ReadsAsUnrecorded：v2 清单（无 `asset_bundle_hash` 键）按兼容
+// 路径解析——格式号仍是 2、资产包哈希读作"未记录"（空串），既有字段逐字保留、不补造。
+// TestRunResourceManifest_V2ReadsAsUnrecorded pins the compat path: a v2 manifest parses
+// with an empty asset bundle hash and every pre-existing field intact.
+func TestRunResourceManifest_V2ReadsAsUnrecorded(t *testing.T) {
+	t.Parallel()
+	raw := `{"format_version":2,"hash":"deadbeef","agent_uid":"` + sampleAgentUID.String() +
+		`","agent_lifecycle_state":"active","provider":{},"mcp_servers":[],"skills":[],` +
+		`"notify":{"mode":"none","channels":[]}}`
+	var manifest core.RunResourceManifest
+	require.NoError(t, json.Unmarshal([]byte(raw), &manifest))
+	require.Equal(t, 2, manifest.FormatVersion, "v2 清单不得被读成当前代际")
+	require.Empty(t, manifest.AssetBundleHash, "缺失字段必须读作未记录，不得补造")
+	require.Equal(t, sampleAgentUID, manifest.AgentUID)
+	require.Equal(t, "active", manifest.AgentLifecycle)
+	require.Equal(t, "none", string(manifest.Notify.Mode))
 }
 
 // TestBuildRunResourceManifest_SortsMCPServersByName：MCP 顺序只由 name 决定，与输入序无关。
@@ -361,13 +380,14 @@ func TestRunResourceManifest_CanonicalJSONIsCompactAndOrdered(t *testing.T) {
 	raw, err := core.MarshalManifest(manifest)
 	require.NoError(t, err)
 
-	prefix := `{"format_version":2,"hash":"` + manifest.Hash +
-		`","agent_uid":"` + sampleAgentUID.String() + `","agent_lifecycle_state":"active","provider":`
+	// v3 起 `asset_bundle_hash` 紧跟 `agent_lifecycle_state`（US-24 T011，契约 §1.1 同步）。
+	prefix := `{"format_version":3,"hash":"` + manifest.Hash +
+		`","agent_uid":"` + sampleAgentUID.String() + `","agent_lifecycle_state":"active","asset_bundle_hash":"","provider":`
 	require.True(t, strings.HasPrefix(string(raw), prefix), "字段顺序偏离契约：%s", raw)
 	require.NotContains(t, string(raw), "\n")
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(raw, &decoded))
-	require.Len(t, decoded, 8)
+	require.Len(t, decoded, 9)
 	require.Contains(t, decoded, "notify")
 }
 

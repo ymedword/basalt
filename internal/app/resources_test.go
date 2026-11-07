@@ -128,6 +128,11 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 		NotifyAdmin: postgres.NewNotifyAdminStore(db),
 		Channels:    postgres.NewNotifyChannelRepo(db),
 		Bindings:    postgres.NewBindingStore(db),
+		// 资产校验是无条件不变量：轻装配必须显式声明"本清单不记 bundle 哈希"，
+		// nil 会在准入处失败关闭（`ASSET_UNAVAILABLE`）。
+		// Asset verification has no bypass: light assemblies declare "unrecorded"
+		// explicitly, while nil fails closed at admission.
+		Assets: undeclaredAssets{},
 	}
 
 	return &runResourcesEnv{
@@ -1077,7 +1082,8 @@ func TestRunResources_SystemOverviewCountsPublishedPointers(t *testing.T) {
 		mcpDefinition("web", "npx", "MCP_TOKEN"), "", "")
 	env.publish(t, core.ResourceMCPServer, "web", webVersion.ID, true)
 
-	reader := newSystemReader(env.db, postgres.NewRunStore(env.db), env.versions, baselineClock)
+	reader := newSystemReader(env.db, postgres.NewRunStore(env.db), env.versions,
+		postgres.NewWorkerStore(env.db), baselineClock)
 	readings, err := reader.ReadOverview(ctx)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, readings.ModelConnections)

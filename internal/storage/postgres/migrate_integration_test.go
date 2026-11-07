@@ -22,6 +22,17 @@ import (
 // the extension schemas the DDL references.
 func migrationConn(t *testing.T) *sql.Conn {
 	t.Helper()
+	conn, _ := migrationConnWithSchema(t)
+	return conn
+}
+
+// migrationConnWithSchema 是 migrationConn 的"带路径"版本：停机迁移用例要在这条连接
+// 关闭之后，用**同一份 search_path** 由 `Open` 重新打开同一个 schema（`Open` 内部跑
+// 前向迁移），否则会在别的 schema 上迁移。
+// migrationConnWithSchema also returns the search_path list so a stop-the-world upgrade
+// case can reopen the very same schema through Open.
+func migrationConnWithSchema(t *testing.T) (*sql.Conn, []string) {
+	t.Helper()
 	conn, schema := isolatedSchemaConn(t)
 
 	paths := []string{schema}
@@ -54,7 +65,7 @@ func migrationConn(t *testing.T) *sql.Conn {
 		require.False(t, shadow.Valid,
 			"search_path 已能解析到 %s 表（%s）——迁移会在别的 schema 上空转", name, shadow.String)
 	}
-	return conn
+	return conn, paths
 }
 
 // TestPostgres_FreshSchemaIsV1 判空库从 v1 基线起建、一次建到**当前支持版本**：版本记录
@@ -90,6 +101,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		9:  "migrations/0009_sandbox_execution.sql",
 		10: "migrations/0010_skill_admission.sql",
 		11: "migrations/0011_memory_learning.sql",
+		12: "migrations/0012_distributed_execution.sql",
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT version, description FROM schema_version ORDER BY version`)
 	require.NoError(t, err)
@@ -106,7 +118,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 
 	tables, err := tableNames(ctx, conn)
 	require.NoError(t, err)
-	require.Len(t, tables, 87, "原77表、0009 的隔离执行账本、0010 的准入四表与 0011 的学习五表必须全部存在")
+	require.Len(t, tables, 90, "原77表、0009 的隔离执行账本、0010 的准入四表、0011 的学习五表与 0012 的分布式执行三表必须全部存在")
 	for _, name := range []string{
 		"callers", "sessions", "messages", "runs", "kb_chunks", "kb_chunk_embeddings",
 		"compaction_entries", "context_assembly_records", "diagnostic_events", "storage_cutover",
@@ -116,6 +128,7 @@ func TestPostgres_FreshSchemaIsV1(t *testing.T) {
 		"skill_admission_decisions", "skill_admission_publications",
 		"memory_extractions", "memory_extraction_cursors", "memory_candidate_meta",
 		"memory_candidate_sources", "memory_method_drafts",
+		"worker_nodes", "execution_leases", "lease_events",
 		"flow_definitions", "flow_pointers", "flow_tasks", "flow_task_contracts", "flow_task_revisions", "flow_transitions", "flow_node_attempts", "flow_actions", "flow_action_attempts", "flow_evidence_refs", "flow_claims", "flow_claim_evidence", "flow_claim_dependencies", "flow_artifacts", "flow_artifact_claims", "flow_verifications", "flow_budget_allocations",
 	} {
 		require.Contains(t, tables, name)

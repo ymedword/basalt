@@ -11,6 +11,7 @@ package e2e
 // verbatim; every scenario kills or restarts a real process.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,10 +23,13 @@ import (
 )
 
 const (
-	// recoveryCloseReason 是崩溃收尾写进 `runs.reason` 的逐字文本（生产常量在
-	// internal/storage/recovery.go；本侧独立冻结，改动任一侧即红）。
-	// recoveryCloseReason pins the crash-closure reason verbatim.
-	recoveryCloseReason = "进程中断（启动时发现未完成的运行）"
+	// recoveryCloseReason 是接管收尾写进 `runs.reason` 的逐字文本（生产常量
+	// `workerLostReason` 在 internal/storage/postgres/reclaimer_store.go；本侧独立冻结，
+	// 改动任一侧即红）。US-24 起收尾来自"合法领取的过期租约"，不再是启动时的全局扫描，
+	// 文案因此换成机器可读的 `worker_lost`。
+	// recoveryCloseReason pins the takeover-closure reason verbatim; since US-24 the
+	// closure comes from a legitimately claimed expired lease, not a startup scan.
+	recoveryCloseReason = "worker_lost"
 
 	// resultUnknownText 是「执行中崩溃」的工具调用合成结果（生产常量
 	// internal/core/synthesis.go 的 TextResultUnknown）。
@@ -61,7 +65,7 @@ func testRestartRecoveryCrash(t *testing.T) {
 		})),
 	)
 	addr := freeLoopbackAddr(t)
-	h.writeConfig(t, configWithAddr(fake.URL(), addr)+shellSection(exe, []string{shellHelperEnv}))
+	h.writeConfig(t, configWithAddr(fake.URL(), addr)+shellSection(exe, []string{shellHelperEnv})+fastWorkerSection())
 	// 定时只在远离当前时刻的整点触发：本用例走手动补跑，重启窗口里不得有第二次运行。
 	hour := (time.Now().UTC().Hour() + 6) % 24
 	h.writeAgent(t, "demo",
@@ -85,14 +89,16 @@ func testRestartRecoveryCrash(t *testing.T) {
 	}
 
 	addr2 := freeLoopbackAddr(t)
-	h.writeConfig(t, configWithAddr(fake.URL(), addr2)+shellSection(exe, []string{shellHelperEnv}))
+	h.writeConfig(t, configWithAddr(fake.URL(), addr2)+shellSection(exe, []string{shellHelperEnv})+fastWorkerSection())
 	p2 := startGrouped(t, h, env, "serve")
 	waitHealthHTTP(t, p2, addr2, 30*time.Second)
-	p2.waitOutput(t, "崩溃恢复扫描完成 unknowns=1 repaired_groups=1 closed_runs=1", 30*time.Second)
-	p2.waitOutput(t, "启动恢复完成 recovered=1", 30*time.Second)
-	p2.stop(t)
 
+	// US-24 起启动不再全局扫描：收尾由**合法领取的过期租约**触发（图 1 的接管顺序），
+	// 发生时刻由 worker 配置的租约时效决定。因此这里轮询库里的终态列，而不是等某条
+	// 启动日志文案——日志字段随轮次变化，终态列才是权威判据。
 	db := h.openDB(t)
+	waitNoRunningRuns(t, db, 90*time.Second, p2.output)
+	p2.stop(t)
 	runs := queryRows(t, db, `SELECT status, reason, finished_at FROM runs`)
 	if len(runs) != 1 {
 		t.Fatalf("runs 应有 1 行，实际 %d 行：%v", len(runs), runs)
@@ -221,12 +227,14 @@ func testRestartRecoveryServe(t *testing.T) {
 	p.kill()
 	p.waitExit(t, 30*time.Second)
 
-	// 换一个空闲端口重启：本项判的是数据与启动摘要，不是端口复用。
+	// 换一个空闲端口重启：本项判的是数据与"回收不碰无关行"，不是端口复用。
 	addr2 := freeLoopbackAddr(t)
-	h.writeConfig(t, configWithAddr(fake.URL(), addr2))
+	h.writeConfig(t, configWithAddr(fake.URL(), addr2)+fastWorkerSection())
 	p2 := startGrouped(t, h, fixtureEnv(), "serve")
 	waitHealthHTTP(t, p2, addr2, 30*time.Second)
-	p2.waitOutput(t, "崩溃恢复扫描完成 unknowns=0 repaired_groups=0 closed_runs=0", 30*time.Second)
+	// US-24 起启动没有全局扫描；等价判据是"周期回收至少跑过一轮且没有动任何行"。
+	// 首轮回收在第一个 tick 之后发生，因此按 1s 的回收间隔留出两个周期再断言。
+	time.Sleep(2500 * time.Millisecond)
 	p2.stop(t)
 
 	db := h.openDB(t)
@@ -475,6 +483,38 @@ func triggerScheduleRun(addr, id string) {
 		return
 	}
 	_ = resp.Body.Close()
+}
+
+// fastWorkerSection 把执行权时效压到用例可等待的量级：US-24 的接管发生在租约过期后的
+// 回收轮次，缺省 30s TTL + 5s 回收间隔会让每个崩溃用例白白多等半分钟。
+// fastWorkerSection shortens lease timing so takeover lands inside the test's wait.
+func fastWorkerSection() string {
+	return "worker:\n  lease_ttl_seconds: 6\n  renew_interval_seconds: 2\n  reclaim_interval_seconds: 1\n"
+}
+
+// waitNoRunningRuns 轮询到库里既没有 running 的 Run、也没有 started 的执行行。US-24 起
+// 没有启动扫描，收尾由合法领取的过期租约触发（A1 收 Run、A2 收执行行），发生时刻由
+// worker 配置决定——判据取终态列，不取日志文案；两域都清空才说明本轮接管走完。
+// waitNoRunningRuns polls until neither a run nor an execution is left in flight; the
+// terminal columns are the authority now that closure comes from claiming expired leases.
+func waitNoRunningRuns(t *testing.T, db *sql.DB, timeout time.Duration, diagnostics func() string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastRuns, lastExecs []map[string]any
+	for time.Now().Before(deadline) {
+		lastRuns = queryRows(t, db, `SELECT run_id, status, reason FROM runs WHERE status = 'running'`)
+		lastExecs = queryRows(t, db, `SELECT id, status FROM task_executions WHERE status = 'started'`)
+		if len(lastRuns) == 0 && len(lastExecs) == 0 {
+			return
+		}
+		time.Sleep(readinessPoll)
+	}
+	detail := ""
+	if diagnostics != nil {
+		detail = "\n" + diagnostics()
+	}
+	t.Fatalf("等待接管收尾超时（%s）：仍在 running 的 Run %v，仍在 started 的执行行 %v%s",
+		timeout, lastRuns, lastExecs, detail)
 }
 
 // waitPathAppears 轮询到文件出现；超时附带调用方给的诊断读数（进程输出）。

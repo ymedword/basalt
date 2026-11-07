@@ -34,7 +34,7 @@ func TestObservability_APINoCanary(t *testing.T) {
 	f.cfg.Observability.Export.Headers = "X-OBS=CANARY_HEADER"
 	rt := f.assemble(t)
 	now := time.Now().UTC()
-	require.NoError(t, postgres.NewRunStore(rt.db).StartRun(t.Context(), core.RunRecord{RunID: "obs-api-real", RequestID: "obs-api-request", Agent: "synthetic", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(postgres.NewRunStore(rt.db), t.Context(), core.RunRecord{RunID: "obs-api-real", RequestID: "obs-api-request", Agent: "synthetic", Channel: "cli", Principal: core.LocalAdminCLIPrincipal(), StartedAt: now}, core.RunResourceManifest{}))
 	for _, stmt := range []string{
 		`UPDATE runs SET status='failed',reason='password=CANARY_RUN',user_id='CANARY_USER',finished_at=started_at+1 WHERE run_id='obs-api-real'`,
 		`INSERT INTO llm_calls(run_id,round,provider,model,duration_ms,status,created_at,error_kind,error_message) VALUES('obs-api-real',1,'fake','fake',12,'failed',1,'timeout','CANARY_LLM_ERROR')`,

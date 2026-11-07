@@ -38,9 +38,15 @@ const (
 	// `manifest_hash` 走 LEFT JOIN：历史 Run 没有清单行 → 空串（约束 24），不是错误。
 	// The single read-side column projection shared by detail and list; a missing manifest
 	// row yields an empty hash rather than an error.
+	// `worker_instance_id` / `ownership_epoch` 来自 run 租约行（US-24 §3.1.13）：
+	// (kind, resource_id) 是主键，LEFT JOIN 至多一行，不会放大行数；历史 Run 没有
+	// 租约行 → 空串 / 0。**只读诊断**，任何归属判定仍走 `LeaseStore`。
+	// The two lease columns come from the (kind, resource_id) primary key, so the
+	// LEFT JOIN never multiplies rows; legacy runs read as "" / 0.
 	runBaseColumns = `r.run_id, r.session_id, r.agent, r.channel, r.user_id, r.trigger,
 		       r.status, r.reason, r.iterations, r.tool_calls, r.config_hash,
-		       r.started_at, r.finished_at, COALESCE(m.manifest_hash, ''), r.request_id`
+		       r.started_at, r.finished_at, COALESCE(m.manifest_hash, ''), r.request_id,
+		       COALESCE(l.owner_worker_id, ''), COALESCE(l.ownership_epoch, 0)`
 
 	// runFinalTextColumn 是**列表**的 final_text 派生列：该 Run 最近一条 assistant 消息
 	// （按 `seq` 倒序取一条），没有则空串。详情走 finalText 单查（注 16 允许两种形态）。
@@ -50,11 +56,14 @@ const (
 		                  WHERE messages.run_id = r.run_id AND messages.role = 'assistant'
 		                  ORDER BY messages.seq DESC LIMIT 1), '')`
 
-	// runFromClause 是读侧唯一的 FROM 基座（清单 LEFT JOIN 只此一处）。
-	// The single FROM base of the read side.
+	// runFromClause 是读侧唯一的 FROM 基座（清单与租约两个 LEFT JOIN 只此一处）。
+	// 租约连接键是主键 (kind, resource_id)，因此一条 Run 至多匹配一行。
+	// The single FROM base of the read side; the lease join is keyed by the primary
+	// key (kind, resource_id), so at most one row matches.
 	runFromClause = `
 		  FROM runs r
-		  LEFT JOIN run_resource_manifests m ON m.run_id = r.run_id`
+		  LEFT JOIN run_resource_manifests m ON m.run_id = r.run_id
+		  LEFT JOIN execution_leases l ON l.kind = 'run' AND l.resource_id = r.run_id`
 
 	// runListSelect / runDetailSelect 是常量拼接：可变的只有三个值谓词，排序与列面不动。
 	// Constant concatenation: only value predicates vary; ordering and columns never do.
@@ -94,6 +103,15 @@ func (s *RunStore) GetRun(ctx context.Context, runID string) (core.RunDetail, er
 		return core.RunDetail{}, err
 	}
 	detail.ResourceManifest = manifest
+	// 资产包哈希只在详情路径从**已校验**的清单取：它是 `snapshot_json` 里的字段，
+	// 列表路径不做 jsonb 解析——那会把一条损坏的历史清单变成列表失败，改变既有
+	// 列表语义（历史 Run 只读 manifest_hash 列，那是真实列）。
+	// The bundle hash comes from the verified manifest on the detail path only; the
+	// list path never parses snapshot_json, so a corrupt historical row cannot break
+	// list reads.
+	if manifest != nil {
+		detail.AssetBundleHash = manifest.AssetBundleHash
+	}
 	return detail, nil
 }
 
@@ -193,6 +211,7 @@ func scanRunDetail(row rowScanner, lastText *sql.NullString) (core.RunDetail, er
 		&detail.RunID, &sessionID, &detail.Agent, &detail.Channel, &detail.UserID, &trigger,
 		&status, &reason, &detail.Iterations, &detail.ToolCalls, &configHsh,
 		&startedAt, &finished, &detail.ManifestHash, &requestID,
+		&detail.WorkerInstanceID, &detail.OwnershipEpoch,
 	}
 	if lastText != nil {
 		dests = append(dests, lastText)

@@ -226,6 +226,14 @@ type RunEnv struct {
 	Budget    Budget   // RunRequest.Budget 与 Profile 覆盖合并后的实际预算（契约 §6）
 	ToolSet   []string // 本轮可用工具名（Profile 的 tools 解析结果，空 = 无工具）
 
+	// Lease 是本次 Run 的**执行权凭证**（US-24 §2.3.3，FR-24-36）：受保护的写入面
+	// （消息追加 / 工具审计 / 模型调用预写）据它走 fenced 入口。业务状态显式传参、
+	// 不进 context（宪法 VII）；零值 = 未接执行权的装配（SQLite 谱系 / 轻装配），
+	// 写入退回普通入口。准入层在领取租约后填它——**只填一次**，运行内不换代次。
+	// Lease is this run's ownership credential; the protected write surfaces pick their
+	// fenced entry point by it. Zero means an unleased assembly; admission fills it once.
+	Lease LeaseToken
+
 	// llmClient 是唯一的模型调用入口：资源接线后取**准入固定的** ProviderService 视图
 	// （路由表只含本次 Provider，两阶段审计仍在其内）；未接线时取装配期的全局服务。
 	// llmClient is the sole model-call entry: the pinned ProviderService view when
@@ -375,6 +383,13 @@ type ToolEnv struct {
 	// Tools carries the pinned instances of this run; a nil map falls back to the
 	// registry exactly as before.
 	Tools map[string]Tool
+
+	// lease 是本次 Run 的执行权凭证，由 `RunEnv.ToolEnv` 从 `RunEnv.Lease` 原样带过来。
+	// **刻意不导出**：工具侧不得读、不得改、不得用它自建写入面——执行权只属于执行器
+	// （`ToolExecutor`），工具只产出结果。零值 = 未接执行权，审计退回普通入口。
+	// lease stays unexported on purpose: tools must never read or rewrite the ownership
+	// credential, only the executor (same package) fences its audit writes with it.
+	lease LeaseToken
 }
 
 // NewRunID 生成运行标识：`<渠道>-<毫秒时间戳>-<6 位 base36 小写>`（契约 §5）。
@@ -442,6 +457,10 @@ func (e *RunEnv) llmEnv(runID string, round int, p Prompt) ChatRequest {
 		Model:              ref.Model,
 		Messages:           msgs,
 		Tools:              p.Tools,
+		// 审计 pending 预写是受保护写入面：凭证随请求显式到达 ProviderService。
+		// The pending pre-write is a protected surface, so the credential travels
+		// explicitly with the request.
+		Lease: e.Lease,
 	}
 }
 
@@ -490,6 +509,10 @@ func (e *RunEnv) ToolEnv(ctx context.Context, runID string) ToolEnv {
 		// The pinned instances travel to the executor; a later registry swap cannot
 		// retarget this run.
 		Tools: e.pinnedTools,
+		// 执行权凭证同上：只给执行器，工具侧读不到（未导出字段）。
+		// The credential goes to the executor only; the unexported field keeps it away
+		// from the tool side.
+		lease: e.Lease,
 	}
 }
 
@@ -508,15 +531,26 @@ func (e *RunEnv) limitReached(reason string, iterations, toolCalls int) RunResul
 }
 
 // cancelled 组装"已取消"终态。Reason 取 ctx 原因（流程 B ①）——截止时间到记契约 §6 的
-// 时限字面量，显式取消记 ctx 的原样原因（契约 §1.1：Reason 仅 limit_reached / failed 必填）。
-// cancelled assembles the cancelled outcome; the reason derives from the context cause.
+// 时限字面量，租约丢失 / 续约有界停止记契约「租约丢失的 reason 字面量」的固定值，
+// 显式取消记 ctx 的原样原因（契约 §1.1：Reason 仅 limit_reached / failed 必填）。
+//
+// 调用方传 `context.Cause(ctx)` 而不是 `ctx.Err()`：keeper 用 CancelCause 登记了
+// `ErrLeaseLost` / `ErrLeaseRenewDeadline` / `ErrCancelRequested`，只取 ctx.Err() 会把
+// 三者一律写成 "context canceled"，Run 行再也分不出"租约丢了"与"用户取消"（评审
+// IDX-26）。他处取消请求仍按普通取消的原样文案落库——它不是租约故障。
+// cancelled assembles the cancelled outcome from the context cause, so lease loss is
+// distinguishable from an ordinary caller cancellation in runs.reason.
 func (e *RunEnv) cancelled(cause error, iterations, toolCalls int) RunResult {
 	reason := ""
-	if cause != nil {
+	switch {
+	case errors.Is(cause, ErrLeaseLost), errors.Is(cause, ErrLeaseRenewDeadline):
+		reason = reasonLeaseRenewFailed
+	case errors.Is(cause, ErrCancelRequested):
+		reason = context.Canceled.Error()
+	case errors.Is(cause, context.DeadlineExceeded):
+		reason = reasonRunTimeout
+	case cause != nil:
 		reason = cause.Error()
-		if errors.Is(cause, context.DeadlineExceeded) {
-			reason = reasonRunTimeout
-		}
 	}
 	return e.outcome(StatusCancelled, "", reason, iterations, toolCalls)
 }
@@ -534,6 +568,11 @@ func (e *RunEnv) fail(err error, iterations, toolCalls int) RunResult {
 
 // reasonRunTimeout 是 Run 自身时限耗尽的 Reason 字面量（契约 §6 的 RunTimeout 行）。
 const reasonRunTimeout = "超过运行时限"
+
+// reasonLeaseRenewFailed 是执行权丢失 / 续约有界停止的 Reason 字面量（模块卡 §2.4.3
+// 「租约丢失原因」的固定值；内部 sentinel 文本**不得**落进 runs.reason）。
+// reasonLeaseRenewFailed is the fixed reason for lease loss / bounded renew failure.
+const reasonLeaseRenewFailed = "renew_failed"
 
 // outcome 组装终态 RunResult 的公共部分。
 // **不填 RunID**：RunEnv 的字段字没有它（契约 §1.1），由运行入口持本地变量、返回前填充。

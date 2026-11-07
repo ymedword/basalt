@@ -390,3 +390,37 @@ func TestLimiterAdmitIngress_DenialDoesNotTakeRunSlot(t *testing.T) {
 	require.ErrorIs(t, limiter.AdmitIngress(ctx, testCallerPrincipal("c1"), IngressRun), ErrRateLimited)
 	require.Zero(t, recording.acquires, "入口速率被拒时尚未进入并发阶段")
 }
+
+// TestLimiter_QPSRemainsPerWorkerSoftLimit 验证入口 QPS 是**每 Worker 软限额**：
+// 两个进程各自持有限制器时，同一调用方的突发额度按进程各算一份，集群总量不承诺
+// 硬上限（FR-24-32）。逆改点：让两个实例共享同一个令牌桶 → Worker B 的第一次
+// 请求即被拒（此时 A 已用尽），本用例转红。
+// The ingress QPS stays a per-worker soft limit: two independent limiters each admit
+// one burst for the same caller, so no cluster-wide ceiling is promised.
+func TestLimiter_QPSRemainsPerWorkerSoftLimit(t *testing.T) {
+	const burst = 3
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	newWorker := func() *Limiter {
+		bucket, err := NewRateBucket(IngressLimits{Run: IngressBudget{QPS: 1, Burst: burst}}, clock)
+		require.NoError(t, err)
+		return NewLimiter(LimiterDeps{Buckets: bucket})
+	}
+	workerA, workerB := newWorker(), newWorker()
+	ctx := context.Background()
+	p := testCallerPrincipal("c1")
+
+	for i := range burst {
+		require.NoError(t, workerA.AdmitIngress(ctx, p, IngressRun), "Worker A 第 %d 次", i+1)
+	}
+	require.ErrorIs(t, workerA.AdmitIngress(ctx, p, IngressRun), ErrRateLimited,
+		"Worker A 用尽自己的突发额度")
+
+	// 同一调用方、同一冻结时刻：Worker B 拥有独立的一份突发额度——QPS 不跨进程。
+	for i := range burst {
+		require.NoError(t, workerB.AdmitIngress(ctx, p, IngressRun), "Worker B 第 %d 次", i+1)
+	}
+	require.ErrorIs(t, workerB.AdmitIngress(ctx, p, IngressRun), ErrRateLimited,
+		"Worker B 用尽自己的突发额度")
+}

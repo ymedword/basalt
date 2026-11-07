@@ -85,7 +85,9 @@ func (r *coordinatorLeaf) Run(ctx context.Context, req flow.NodeRunRequest) (flo
 	for old := r.maximum.Load(); n > old && !r.maximum.CompareAndSwap(old, n); old = r.maximum.Load() {
 	}
 	runs := postgres.NewRunStore(r.db)
-	err := runs.StartRun(ctx, core.RunRecord{RunID: req.Attempt.RunID, SessionID: req.Attempt.SessionID, Agent: req.Node.Agent.Name, Channel: "cli", UserID: "coordinator-seam", Principal: req.Principal, StartedAt: time.Now(), Flow: req.Flow}, core.RunResourceManifest{})
+	// US-24：StartRun 返回租约 token；该夹具不参与租约判定，只关心写入是否成功。
+	// US-24: StartRun returns a lease token; this fixture only cares about the write.
+	_, err := runs.StartRun(ctx, core.RunRecord{RunID: req.Attempt.RunID, SessionID: req.Attempt.SessionID, Agent: req.Node.Agent.Name, Channel: "cli", UserID: "coordinator-seam", Principal: req.Principal, StartedAt: time.Now(), Flow: req.Flow}, core.RunResourceManifest{}, core.WorkerIdentity{}, core.CallerAdmission{}, req.Attempt.RunID)
 	if err != nil {
 		return flow.NodeRunResult{}, err
 	}
@@ -103,7 +105,7 @@ func (r *coordinatorLeaf) Run(ctx context.Context, req flow.NodeRunRequest) (flo
 	// 复现同一症状（回填运行终态: 开启事务: context deadline exceeded），机制同源。
 	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
-	if _, err := runs.FinishRun(finish, req.Attempt.RunID, status, "", 1, 0, time.Now()); err != nil {
+	if _, err := runs.FinishRun(finish, req.Attempt.RunID, core.LeaseToken{}, status, "", 1, 0, time.Now()); err != nil {
 		return flow.NodeRunResult{}, err
 	}
 	output := json.RawMessage(`{"answer":"coordinator result"}`)
@@ -120,6 +122,8 @@ type coordinatorFixture struct {
 	publisher  *flow.Publisher
 	definition flow.Definition
 	leaf       *coordinatorLeaf
+	leases     core.LeaseStore
+	identity   core.WorkerIdentity
 }
 
 func newCoordinatorFixture(t *testing.T) *coordinatorFixture {
@@ -133,12 +137,16 @@ func newCoordinatorFixture(t *testing.T) *coordinatorFixture {
 	config := flow.DefaultConfig()
 	config.Enabled = true
 	leaf := &coordinatorLeaf{db: db}
-	service := &flow.Service{Repository: store, Definitions: store, Schemas: schemas, Authority: authority, Runner: leaf, Outputs: coordinatorOutputs{}, Verification: &flow.VerificationService{Schemas: schemas}, Config: config, Operations: postgres.NewManagementStore(db)}
+	// 管理面 Revise 写 Queued 属推进类，需要根租约（US-24 §3.1.6）：夹具按真实装配
+	// 注入身份与租约端口，让 withRootLease 能自取；缺这三项会被拒为 ErrFlowRootBusy。
+	identity := core.WorkerIdentity{InstanceID: "coordinator-fixture", Name: "fixture"}
+	leases := postgres.NewLeaseStore(db)
+	service := &flow.Service{Repository: store, Definitions: store, Schemas: schemas, Authority: authority, Runner: leaf, Outputs: coordinatorOutputs{}, Verification: &flow.VerificationService{Schemas: schemas}, Config: config, Operations: postgres.NewManagementStore(db), Identity: identity, Leases: leases, LeaseTTL: 30 * time.Second}
 	publisher := &flow.Publisher{Definitions: store, Operations: service.Operations, Validator: &flow.ContractValidator{Schemas: schemas, Resolver: authority}}
 	schema := json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`)
 	budget := config.Budget()
 	d := flow.Definition{FormatVersion: 1, Name: "coordinator", TaskContract: "TASK.json", Entry: "draft", Limits: budget, Nodes: []flow.Node{{ID: "draft", Kind: "agent", Agent: &flow.AgentRef{UID: "ag_coordinator", Name: "writer", Version: 1, ConfigHash: "config", ManifestHash: "manifest"}, OutputSchema: schema, Failure: flow.FailurePolicy{MaxAttempts: 1}}}, Contract: flow.TaskContract{ContractVersion: 1, Goal: "return a checked result", Constraints: []string{"never infer successful acceptance"}, InputSchema: schema, OutputSchema: schema, Budget: budget, StopConditions: []string{"budget", "deadline", "unknown"}, Escalation: "show unresolved", ArtifactSpec: []flow.ArtifactSpec{{ID: "report", Format: "json", Required: true}}, Acceptance: []flow.AcceptanceRule{{ID: "shape", Version: 1, Kind: "deterministic", TargetKind: "artifact", TargetID: "report", Required: true, Schema: schema}}}}
-	return &coordinatorFixture{db: db, store: store, service: service, publisher: publisher, definition: d, leaf: leaf}
+	return &coordinatorFixture{db: db, store: store, service: service, publisher: publisher, definition: d, leaf: leaf, leases: leases, identity: identity}
 }
 
 func (f *coordinatorFixture) publish(t *testing.T, d flow.Definition, op string) flow.DefinitionVersion {
@@ -157,8 +165,17 @@ func (f *coordinatorFixture) start(t *testing.T, v flow.DefinitionVersion, key s
 
 func (f *coordinatorFixture) advance(t *testing.T, task flow.Task) flow.Task {
 	t.Helper()
-	next, err := f.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version})
+	// US-24：推进类写入必须由持有 flow_root 租约的执行者发起（FR-24-18），存储层按
+	// 目标行自己的 root_task_id 校验租约。夹具照生产 Worker 的做法先领根租约、带凭证
+	// 推进、完成后交还——不再有"无租约直接 Advance"的夹具旁路。
+	// US-24: advance-class writes are fenced by a live flow_root lease; the fixture
+	// acquires one exactly like the production worker and releases it afterwards.
+	held, err := f.leases.Acquire(t.Context(), core.LeaseFlowRoot, task.RootTaskID, f.identity, 30*time.Second)
 	require.NoError(t, err)
+	next, advanceErr := f.service.Advance(t.Context(), flow.AdvanceRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, Lease: held.LeaseToken})
+	releaseErr := f.leases.Release(t.Context(), held.LeaseToken)
+	require.NoError(t, advanceErr)
+	require.NoError(t, releaseErr)
 	return next
 }
 
@@ -263,7 +280,18 @@ func TestFlow_CoordinatorWorkerNeverStartsAtConstruction(t *testing.T) {
 	}
 	f.service.Config.MaxActive = 2
 	f.service.Config.PollIntervalMS = 100
-	worker := &flow.Worker{Service: f.service, Repository: f.store, Startup: func(context.Context) error { return nil }}
+	// 执行权装配按生产注入（US-24）：Worker 自己领 flow_root 租约再推进，缺任一项
+	// advanceRoot 会 fail-closed，进程内永远推进不了。
+	worker := &flow.Worker{
+		Service:       f.service,
+		Repository:    f.store,
+		Identity:      f.identity,
+		Leases:        f.leases,
+		Gate:          postgres.NewSubtreeGate(f.db),
+		LeaseTTL:      30 * time.Second,
+		RenewInterval: 10 * time.Second,
+		Startup:       func(context.Context) error { return nil },
+	}
 	require.Zero(t, f.leaf.calls.Load())
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

@@ -112,6 +112,21 @@ const (
 	codeCallerRateLimited        = "CALLER_RATE_LIMITED"        // 429 调用方入口速率超限
 	codeCallerConcurrencyLimited = "CALLER_CONCURRENCY_LIMITED" // 429 调用方并发 Run 名额用尽
 	codeQuotaExhausted           = "QUOTA_EXHAUSTED"            // 429 周期配额不足
+
+	// US-24 新增（契约 run-and-errors §8 的资产 / 生命周期准入行 + R4 的 Flow 根忙行）。
+	// 六个字面量都是契约冻结值：共享发布指针缺失 503、本地 bundle 与共享记录不符 409、
+	// 本地代次落后 409、同代次内容不一致 409、管理面 resume / revise 撞上执行者持有根
+	// 租约 409。`RESOURCE_VERSION_MISMATCH` 是唯一一个**两种状态共用**的字面量：准入
+	// 事务内复查发现指针 / 凭据 pin 漂移 → 409，本地实例版本证明不成立 → 503（契约 §8
+	// 两行）。前五项全部 fail-closed——资产 / 生命周期不成立时拒绝新 Run，**不得**退回
+	// "按名称临时生成"或"以最新为准"；最后一项**不得**重试或降级成无租约写入。
+	// US-24's asset and lifecycle admission rows plus the R4 flow-root-busy row.
+	codeAssetUnavailable        = "ASSET_UNAVAILABLE"         // 503 资产发布指针缺失 / 已软删除 / 本地目录不可读
+	codeAssetVersionMismatch    = "ASSET_VERSION_MISMATCH"    // 409 本地 bundle 哈希与共享发布记录不一致
+	codeAgentLifecycleStale     = "AGENT_LIFECYCLE_STALE"     // 409 本地生命周期代次低于共享索引
+	codeAgentLifecycleMismatch  = "AGENT_LIFECYCLE_MISMATCH"  // 409 同代次内容不一致 / 索引缺失 / 期望值缺失
+	codeResourceVersionMismatch = "RESOURCE_VERSION_MISMATCH" // 409 指针在准入窗口内漂移；503 本地实例版本证明不成立
+	codeFlowRootBusy            = "FLOW_ROOT_BUSY"            // 409 管理面推进撞上执行者持有的 flow_root 租约
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"io/fs"
+	"reflect"
 	"testing"
 	"time"
 
@@ -708,118 +709,30 @@ func TestTaskStore_RecordSkipped(t *testing.T) {
 	})
 }
 
-// TestTaskStore_RecoverStartedExecutions：启动恢复把遗留 started 行按 Run 终态收尾
-// （completed / limit_reached → completed；failed / cancelled / 仍 running / 无 Run → failed），
-// 无 Run 行的 run_id 置 NULL，同任务多行按 started_at 正序处理。
-// 逆改点：用 string 直扫 run_id → NULL 行 Scan 报错；乱序处理 → last_status 来自旧行。
-func TestTaskStore_RecoverStartedExecutions(t *testing.T) {
-	ctx := context.Background()
-
-	// 四终态映射：Run 终态 → 执行行终态。
-	for _, tc := range []struct {
-		runStatus string
-		want      core.ExecutionStatus
-	}{
-		{"completed", core.ExecutionCompleted},
-		{"limit_reached", core.ExecutionCompleted},
-		{"failed", core.ExecutionFailed},
-		{"cancelled", core.ExecutionFailed},
+// TestTaskStore_NoGlobalRecoveryScan：US-24 冻结面的守点。`RecoverStartedExecutions`
+// 已从两个仓储一并删除（FR-24-02 / 模块卡第 3278 行）：启动不得做全局恢复扫描，遗留
+// 执行行只能由回收器按过期 / 已释放的**执行租约**领取收尾。SQLite 谱系不再满足
+// `core.TaskStore`，也不再提供协调方法——重新加回任何一个都会形成第二套触发或恢复
+// 路径，本用例让这种回退在测试面直接变红。
+// 逆改点：把 `RecoverStartedExecutions` 或任一协调方法加回 `*TaskStore` → 本用例红。
+//
+// 被废除的旧判据（原 `TestTaskStore_RecoverStartedExecutions` 的 5 组断言：四终态
+// 映射 / 无 Run 行置 NULL / Run 仍 running / NULL run_id 可扫 / 同任务多行按时间正序）
+// 随方法一并作废，等价语义在 PostgreSQL 侧由回收器用例承接（T017 / T018）。
+func TestTaskStore_NoGlobalRecoveryScan(t *testing.T) {
+	typ := reflect.TypeOf(&TaskStore{})
+	for _, name := range []string{
+		"RecoverStartedExecutions",
+		"ListDispatchable",
+		"ClaimDueTrigger",
+		"RecordMissedTrigger",
+		"RecordBusyTrigger",
 	} {
-		t.Run("run_"+tc.runStatus, func(t *testing.T) {
-			db := openTempDB(t)
-			store := NewTaskStore(db)
-			seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-			seedRun(t, db.write, "run-a", tc.runStatus)
-			seedExecution(t, db.write, "demo-1", "run-a", core.ExecutionStarted)
-
-			n, err := store.RecoverStartedExecutions(ctx, fixedNow)
-			require.NoError(t, err)
-			require.Equal(t, 1, n)
-
-			got := listExecutions(t, db.read, "demo-1")[0]
-			require.Equal(t, tc.want, got.Status, "runs.status=%s", tc.runStatus)
-			require.Equal(t, "run-a", got.RunID, "Run 行存在 → run_id 保留")
-			require.Equal(t, fixedNow.UnixMilli(), got.FinishedAt.UnixMilli())
-			require.Equal(t, string(tc.want), lastStatusOf(t, db.read, "demo-1"))
-		})
+		_, ok := typ.MethodByName(name)
+		require.False(t, ok,
+			"SQLite 谱系不得提供 %s：触发权与恢复权都在 PostgreSQL 的租约协调面（FR-24-02 / FR-24-10）",
+			name)
 	}
-
-	t.Run("no_run_row_maps_failed_and_nulls_run_id", func(t *testing.T) {
-		db := openTempDB(t)
-		store := NewTaskStore(db)
-		seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		// run-ghost 不在 runs 表：崩溃遗留行没有任何 Run 可依。
-		seedExecution(t, db.write, "demo-1", "run-ghost", core.ExecutionStarted)
-
-		n, err := store.RecoverStartedExecutions(ctx, fixedNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-
-		got := listExecutions(t, db.read, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status)
-		require.Empty(t, got.RunID, "无 Run 行同时把 run_id 置 NULL（不留下悬空引用）")
-		require.Equal(t, "failed", lastStatusOf(t, db.read, "demo-1"))
-	})
-
-	t.Run("run_still_running_maps_failed", func(t *testing.T) {
-		db := openTempDB(t)
-		store := NewTaskStore(db)
-		seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		seedRun(t, db.write, "run-live", "running")
-		seedExecution(t, db.write, "demo-1", "run-live", core.ExecutionStarted)
-
-		n, err := store.RecoverStartedExecutions(ctx, fixedNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n)
-
-		got := listExecutions(t, db.read, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status, "Run 未收尾 = 崩溃遗留 → failed")
-		require.Equal(t, "run-live", got.RunID, "Run 行存在 → run_id 保留")
-		require.Equal(t, "failed", lastStatusOf(t, db.read, "demo-1"))
-	})
-
-	t.Run("null_run_id_scannable", func(t *testing.T) {
-		db := openTempDB(t)
-		store := NewTaskStore(db)
-		seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		seedExecution(t, db.write, "demo-1", "", core.ExecutionStarted)
-
-		// 夹具自检：确实造出了 run_id IS NULL 的遗留行（sql.NullString 的判别力来源）。
-		var nulls int
-		require.NoError(t, db.read.QueryRowContext(ctx,
-			`SELECT count(*) FROM task_executions WHERE run_id IS NULL`).Scan(&nulls))
-		require.Equal(t, 1, nulls)
-
-		n, err := store.RecoverStartedExecutions(ctx, fixedNow)
-		require.NoError(t, err)
-		require.Equal(t, 1, n, "run_id 为 NULL 的遗留行同样可被扫描收尾")
-
-		got := listExecutions(t, db.read, "demo-1")[0]
-		require.Equal(t, core.ExecutionFailed, got.Status)
-		require.Empty(t, got.RunID)
-		require.Equal(t, "failed", lastStatusOf(t, db.read, "demo-1"))
-	})
-
-	t.Run("same_task_multiple_started_uses_newest", func(t *testing.T) {
-		db := openTempDB(t)
-		store := NewTaskStore(db)
-		seedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
-		seedRun(t, db.write, "run-old", "failed")
-		seedRun(t, db.write, "run-new", "completed")
-		seedExecutionAt(t, db.write, "demo-1", "run-old", core.ExecutionStarted, fixedNow.Add(-time.Minute))
-		seedExecutionAt(t, db.write, "demo-1", "run-new", core.ExecutionStarted, fixedNow)
-
-		n, err := store.RecoverStartedExecutions(ctx, fixedNow)
-		require.NoError(t, err)
-		require.Equal(t, 2, n)
-
-		rows := listExecutions(t, db.read, "demo-1")
-		require.Len(t, rows, 2)
-		require.Equal(t, core.ExecutionFailed, rows[0].Status)
-		require.Equal(t, core.ExecutionCompleted, rows[1].Status)
-		require.Equal(t, "completed", lastStatusOf(t, db.read, "demo-1"),
-			"last_status 必须来自最新一行（按 started_at 正序收尾）")
-	})
 }
 
 // ---- 列表读数 ----------------------------------------------------------------

@@ -10,16 +10,24 @@ import (
 type FlowRunContext struct {
 	TaskID, RootTaskID, ParentTaskID, ParentRunID, NodeInvocationID, NodeAttemptID string
 	TaskRevision                                                                   int64
-	AgentUID, AgentConfigHash, ResourceManifestHash                                string
-	Authority                                                                      FlowAuthority
-	Budget                                                                         AncestorBudget
-	Actions                                                                        FlowActionLedger
-	Progress                                                                       ProgressGuard
-	Tools                                                                          FlowToolBinder
-	Models                                                                         FlowModelLedger
-	State                                                                          *StructuredState
-	InputEvidenceRefs                                                              []EvidenceRef
-	Retrieval                                                                      FlowRetrievalGuard
+	// Lease 是本次推进持有的 flow_root 根租约凭证（US-24 §2.3.6 / P-05）：
+	// 子 Run 创建时以它为父根归属的唯一证据——存储层在同一事务里锁租约行，
+	// 要求 kind / resource / owner / ownership_epoch 与它一致且未过期，旧代次
+	// 即使租约尚未被接管也不得凭空创建子 Run。零值只在未接执行权的装配
+	// （单测 / SQLite 谱系）出现；真实 Worker 领取后恒为非零。
+	// Lease is the root credential proved when creating a child Run; zero only in
+	// unleased assemblies, never for a leased worker.
+	Lease                                           LeaseToken
+	AgentUID, AgentConfigHash, ResourceManifestHash string
+	Authority                                       FlowAuthority
+	Budget                                          AncestorBudget
+	Actions                                         FlowActionLedger
+	Progress                                        ProgressGuard
+	Tools                                           FlowToolBinder
+	Models                                          FlowModelLedger
+	State                                           *StructuredState
+	InputEvidenceRefs                               []EvidenceRef
+	Retrieval                                       FlowRetrievalGuard
 }
 
 // FlowRetrievalGuard rechecks original authority and the frozen collection

@@ -49,7 +49,7 @@ type MessageRoutePort interface {
 // AgentDirectory resolves an agent name to its identity and lifecycle state.
 type AgentDirectory interface {
 	AgentIdentity(ctx context.Context, agent string) (core.AgentUID, string, bool, error)
-	LifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error)
+	ReadLifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error)
 }
 
 // ScopeRequest 是一次范围转换请求（HTTP 体的领域形态）。
@@ -304,7 +304,7 @@ func (s *ScopeService) resolveOwner(ctx context.Context, agent string) (core.Age
 			core.ErrResourceNotFound, agent)
 	}
 
-	rec, valid, errMsg, err := s.Agents.LifecycleIndex(ctx, agent)
+	rec, valid, errMsg, err := s.Agents.ReadLifecycleIndex(ctx, agent)
 	if err != nil {
 		return "", fmt.Errorf("范围转换: 读取属主 %s 的生命周期: %w", agent, err)
 	}

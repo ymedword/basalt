@@ -151,12 +151,38 @@ type ServiceOptions struct {
 	// ToolPins freezes this run's tool instances against a later controlled rebuild; a
 	// nil pinner keeps the pre-14D name lookup.
 	ToolPins ToolPinner
-	// RunQuota 是 Run 级任务次数端口（图 6 [5] 的 `ClassRun` 一支，N-01）：在全部准入
-	// 通过之后、业务执行之前预留并结算 1 次。nil = 不记账（既有零值单测与轻装配），
-	// 行为与接线前逐字节相同；生产装配由 wire.go 单点接上。
-	// RunQuota charges one task per admitted run before any business write; nil keeps the
-	// pre-wiring behaviour byte for byte.
+	// RunQuota 是 Run 级任务次数端口（图 6 [5] 的 `ClassRun` 一支，N-01）。自 US-24
+	// P-12（T012）起，生产路径的预留与结算由仓储在 `StartRun` 的同一事务内完成，
+	// `Run` **不再**在此调用 `ChargeRun`；该端口保留为 Flow 准入的前置（非 nil 才
+	// 视为 Flow 装配就绪）与既有轻装配 / 测试替身的公开形状。nil = 不记账。
+	// Since US-24 P-12 the production charge commits inside StartRun's transaction; this
+	// port stays as the Flow readiness precondition and for non-store assemblies.
 	RunQuota RunQuota
+	// Worker 是本进程的 Worker 身份：`StartRun` 用它写租约归属（`owner_worker_id`），
+	// 之后本 Run 的一切受保护写入都拿它与 token 里的负责人比对。零值 = 未接线（轻装配
+	// 与既有零值单测），此时仓储按"没有执行权"处理——与 US-24 之前的行为一致。
+	// Worker is this process's identity, written into the run lease by StartRun. Zero means
+	// an unleased assembly, which keeps the pre-US-24 behaviour.
+	Worker WorkerIdentity
+	// Leases 是执行权续约端口（与 `Worker` 同进同出）：`Run` 在账本行落库之后派生
+	// 续约循环，失权 / 续约超时沿运行上下文取消执行（FR-24-04 / FR-24-05）。
+	// nil = 无租约装配（Worker 零值时合法）；Worker 非零而它缺位是装配错误。
+	// Leases renews the run lease. It is legal to leave nil only when Worker is zero;
+	// a worker identity without a renewal port fails closed before any run starts.
+	Leases LeaseStore
+	// RenewInterval / LeaseTTL 是续约周期与租约时长（装配层从 `worker.*` 投影，装载期
+	// 已校验 5–300s 且 renew < ttl/2）。两者必须为正——否则没有续约循环可用，Run 会在
+	// TTL 后被他人合法接管而本进程仍在执行，属装配错误。
+	// RenewInterval and LeaseTTL come from the worker configuration; both must be
+	// positive or the run could be taken over while this process still executes.
+	RenewInterval time.Duration
+	LeaseTTL      time.Duration
+	// Admission 把调用方身份投影成并发判定输入（`CallerAdmission`）：解析在装配层，
+	// 因为它要读 `caller_limits` 行并回落到实例上限。nil = 未接线，按零值
+	// `CallerAdmission`（不占调用方名额桶）处理——与 `Enabled=false` 的语义一致。
+	// Admission resolves the caller-concurrency input in the assembly; nil falls back to
+	// the zero value, which simply takes no caller slot.
+	Admission CallerAdmissionResolver
 	// Learning 是 Run 终态之后的**唯一**同步回调（US-22 记忆抽取）；nil = 关闭，
 	// 行为与接线前逐字节相同。它**没有返回值**：从类型上就不可能改变 Run 的结果、
 	// 状态或错误；触发点只在本文件的 `finish`（C-05），**不得**在 web / CLI / 调度器
@@ -236,9 +262,12 @@ func NewAgentService(opts ServiceOptions) *AgentService {
 // Run 执行一次运行。返回的 `RunResult` 无论成败都非零（Status 表达结局）；**函数级 error
 // 只表达调用方问题**：Agent 不存在 / 同会话忙 / 实例满（契约 §1.2）——这三类**不排队**、
 // 不落任何痕迹。其余失败一律体现在 `RunResult.Status`（含 failed 的 Reason）。
+// 返回值具名只为 US-24 的 panic 兜底能改写结果：准入事务提交之后 panic 若原样上抛，
+// 账本行会停在 running，DB 侧的调用方并发判定随后会永久占住一个名额。
 // Run runs one run. A function-level error means a caller-side problem only; everything
-// else shows up in the result status.
-func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, error) {
+// else shows up in the result status. The results are named so the post-admission panic
+// net can rewrite them after closing the ledger row.
+func (s *AgentService) Run(ctx context.Context, req RunRequest) (ret RunResult, retErr error) {
 	// ⓪ 身份准入（设计 §3.1.0 / P-04）：零值或非法 Principal 在**任何副作用之前**以
 	// `ErrUnauthorized` 拒绝——不排队、不落痕迹，也**不得**补成内置管理员再继续
 	// （"零值即管理员"正是 C-28 要关掉的那条提权路径）。
@@ -257,7 +286,34 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		return RunResult{}, ErrFlowDispatch
 	}
 
-	// ① 准入：未知 Agent → 会话锁 → 实例计数（顺序即错误优先级），三道都**不排队**。
+	// ① 准入：未知 Agent → 只读预检 [4] → 会话锁 / 实例计数（顺序即错误优先级），三道都
+	// **不排队**。
+	//
+	// [4] 必须在本地会话 / 实例判定**之前**：它的首判是调用方并发（数共享库里的
+	// `runs(status='running')`，跨 Worker 有效），而本地忙集与实例计数只看本进程。
+	// 两个 Worker 共用一个库时，"调用方名额已满 + 本进程会话正好忙"完全可能同时成立；
+	// 反过来先判本地就把 FR-24-34 的顺序倒置成 SESSION_BUSY，契约要求的是
+	// CALLER_CONCURRENCY_LIMITED（模块卡 §2.3.2 图 2：并发 → 会话 / 实例 → 配额）。
+	// The read-only precheck comes first: its leading verdict is the cross-worker caller
+	// concurrency, which must outrank the process-local session/instance fast paths.
+	// 只读预检（§2.3.2）：快速拒绝，不写任何行、不产生任何占用；结论可能被 [5] 的
+	// 权威复查推翻——所以它只是"早失败"，不是判定来源。
+	// [4] is a read-only precheck: it fails fast without writing anything, and its verdict
+	// may be overturned by the authoritative recheck in [5].
+	admission := CallerAdmission{IsFlow: req.Flow != nil}
+	if s.opts.Admission != nil {
+		resolvedAdmission, aerr := s.opts.Admission.For(req.Principal)
+		if aerr != nil {
+			return RunResult{}, aerr
+		}
+		admission = resolvedAdmission
+		admission.IsFlow = req.Flow != nil
+	}
+	if s.opts.Runs != nil {
+		if err := s.opts.Runs.CheckAdmission(ctx, req.SessionID, req.Principal, admission); err != nil {
+			return RunResult{}, err
+		}
+	}
 	entry, ok := s.lookupAgent(req.Agent)
 	if !ok {
 		return RunResult{}, &AgentNotFoundError{Name: req.Agent}
@@ -278,6 +334,15 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// error and fails closed before any trace is written.
 	if s.opts.Resources != nil && (s.opts.RunSnapshots == nil || s.opts.Lifecycle == nil) {
 		return RunResult{}, errors.New("agent service: run resources are configured without a snapshot builder or lifecycle port")
+	}
+	// 执行权装配必须完整：写了租约行却没人续约，TTL 一到别处即可合法接管，而本进程
+	// 还在执行——两边同时写，fencing 只能事后拒绝一方。零 `Worker` 是明确的"无租约
+	// 装配"（轻装配 / 既有单测）；非零而缺续约端口或时长非法则在这里失败关闭。
+	// A leased run needs a live keeper: a row without renewal could be taken over
+	// while this process still executes. A partial wiring fails closed here.
+	if !s.opts.Worker.IsZero() &&
+		(s.opts.Leases == nil || s.opts.RenewInterval <= 0 || s.opts.LeaseTTL <= 0) {
+		return RunResult{}, errors.New("agent service: worker identity is configured without lease renewal")
 	}
 
 	// ③ 生命周期门禁（图 F ③）：在 Agent 级读锁内**现场重读**状态文件——不得缓存为
@@ -339,7 +404,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	// 公式生成——既有 CLI / REST / 评测调用方零改动（约束 13 / 14）。
 	runID := req.RunID
 	if runID == "" {
-		runID = NewRunID(req.Channel, now, runSuffix())
+		runID = NewRunID(req.Channel, now, RunIDSuffix())
 	}
 
 	// ⑤ 在途登记（约束 20）：登记发生在快照 / 会话 / 账本预写**之前**，取消因此覆盖整个
@@ -484,32 +549,22 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 		env.memory = text
 	}
 
-	// ⑤″ Run 级任务次数（N-01）：预留与结算一起做，且都在**业务执行之前**——账本行、
-	// 用户消息与循环都是可审计的执行痕迹，被任务配额拒绝的 Run 一条都不该留下。
-	// 拒绝经函数级 error 上抛（与 [3] 并发名额 / [4] 会话门禁同一形态），web 入口据
-	// 哨兵映射 429 `QUOTA_EXHAUSTED`。
-	// 计时点选在会话 / 快照落库之后：那些步骤失败时 Run 本就没执行，不该先扣任务；
-	// 选在 StartRun 之前：任务次数是准入成本，不是运行结果——先跑后扣会给并发窗口
-	// 留出超额放行的口子（与"零值即不限量"同一个失败方向）。
-	// 记下的预留标识写进账本行，与 `quota_reservations` 对得上（契约列
-	// `runs.reservation_id`）；适配层没预留时（内置管理员不限量）为空。
-	// The task charge is admission cost, not an execution result: it is reserved and
-	// settled before the ledger row, and a refusal leaves no trace at all.
-	if s.opts.RunQuota != nil {
-		charged, qerr := s.opts.RunQuota.ChargeRun(ctx, RunQuotaRequest{
-			Principal: req.Principal,
-			RunID:     runID,
-		})
-		if qerr != nil {
-			return RunResult{}, qerr
-		}
-		req.ReservationID = charged.ReservationID
-	}
+	// ⑤″ Run 级任务次数（N-01）自 US-24 T012 起**随 StartRun 的同一事务**记账：
+	// 预留与结算由仓储在准入事务内完成（Q21），本层不再单独调用 `RunQuota.ChargeRun`
+	// ——两条记账路径并存会把同一次准入记两次。被任务配额拒绝时整个准入事务回滚，
+	// Run 行、消息与模型调用一条都不留（与 [3] 并发名额 / [4] 会话门禁同一形态），
+	// web 入口据 `QuotaExhaustedError` 映射 429 `QUOTA_EXHAUSTED`。
+	// The run-level task charge now commits inside StartRun's transaction; calling
+	// RunQuota.ChargeRun here would charge the same admission twice.
 
-	// ⑤ 预写账本行（status=running）+ 资源清单 + 引用，同一事务（约束 18）：**写失败 →
-	// 直接 error**——账本不落下就不开跑。未接线时清单为零值，仓储只写运行行（读作"未记录"）。
+	// [5] 预写账本行（status=running）+ 资源清单 + 引用 + run 租约，同一事务（约束 18 /
+	// FR-24-03）：**写失败 → 直接 error**——账本不落下就不开跑。未接线时清单为零值，
+	// 仓储只写运行行（读作"未记录"）。返回的 token 是本 Run 的执行权凭证：填进 env 后
+	// 终态提交、收尾与受保护写入面都带它；未接执行权的装配返回零值（行为同 US-24 前）。
+	// [5] writes the row, manifest, refs and run lease in one transaction; the returned
+	// token is this run's credential from here on.
 	if s.opts.Runs != nil {
-		if err := s.opts.Runs.StartRun(ctx, RunRecord{
+		token, err := s.opts.Runs.StartRun(ctx, RunRecord{
 			RunID:         runID,
 			RequestID:     req.RequestID,
 			SessionID:     req.SessionID,
@@ -521,9 +576,102 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			Trigger:       req.Trigger,
 			ConfigHash:    snap.Hash,
 			StartedAt:     now,
-			Flow:          req.Flow,
-		}, manifest); err != nil {
+			Lifecycle: LifecycleExpectation{
+				Generation:    lifecycle.Generation,
+				StateFileHash: lifecycle.Checksum,
+			},
+			Flow: req.Flow,
+		}, manifest, s.opts.Worker, admission, runID)
+		if errors.Is(err, ErrAdmissionOutcomeUnknown) {
+			// [6] 提交结果未知：按 run_id 回查，**不退款、不重试**（FR-24-33）。
+			// 查得到 → 视为成功继续（Run 行可见即已提交，不是"重放"）；查不到 →
+			// **保持未知分类**按失败返回——只读快照查无行不构成"未提交"的证据
+			// （C-34：原 COMMIT 可能仍在服务端执行），回查结论只作诊断日志。
+			// An unknown commit is looked up by run id; a miss keeps the unknown
+			// classification because absence never proves a rollback (C-34).
+			unknown := err
+			lookedUp, lookupErr := s.opts.Runs.LookupAdmittedRun(ctx, runID)
+			switch {
+			case lookupErr != nil:
+				if s.opts.Logger != nil {
+					s.opts.Logger.Warn("准入回查未证实提交结果，按未知结局失败关闭",
+						"run_id", runID, "error", lookupErr)
+				}
+				token, err = LeaseToken{}, unknown
+			case !s.opts.Worker.IsZero() &&
+				(lookedUp.OwnerWorkerID != s.opts.Worker.InstanceID || lookedUp.OwnershipEpoch != 1):
+				// 回查拿到的是租约的**当前**视图，不是"本次准入创建的那条"：确认丢失的
+				// 等待一旦超过租约时长，回收器就会以更高代次领回同一条租约（属主换成别人、
+				// `ownership_epoch + 1`、未释放且在有效期内）。此时若直接采纳，本进程会以
+				// **他人的 owner/epoch** 继续话题追加、续约与终态提交——受保护写入只把 token
+				// 与租约行比对，不比对执行者，所以全部会通过，等于借用别人的执行权。准入
+				// 创建的租约代次恒为 1、续约不改代次，所以 owner 不符或 epoch != 1 就是"已不是
+				// 本次准入"的判据（与 `scheduler.go` 代投回查同一道闸）。按未知结局失败关闭：
+				// **不退款、不重试**（FR-24-33），Run 行与租约留给回收器按其作用域收尾。
+				// The look-up returns the lease's current row, not the one admission created:
+				// an unknown commit that outlives the lease lets the reclaimer re-claim it at a
+				// higher epoch under another owner. Adopting that token would let this process
+				// execute under someone else's credential, so it fails closed as unknown.
+				if s.opts.Logger != nil {
+					s.opts.Logger.Warn("准入回查发现租约已不归本次准入，按未知结局失败关闭",
+						"run_id", runID, "owner", lookedUp.OwnerWorkerID,
+						"epoch", lookedUp.OwnershipEpoch)
+				}
+				token, err = LeaseToken{}, unknown
+			default:
+				token, err = lookedUp, nil
+			}
+		}
+		if err != nil {
 			return RunResult{}, fmt.Errorf("start run ledger row: %w", err)
+		}
+		env.Lease = token
+		// panic 兜底（US-24 FR-24-03 的账本后果）：准入事务已提交，账本行不再由调用方
+		// 的异常传播负责收口。本进程里 panic 若原样上抛，`finish` 不会执行，行会永远停在
+		// running；而调用方并发判定（`checkCallerConcurrency`）按 status=running 计数，
+		// 于是**一次 panic 就永久占住一个名额**，同一调用方此后再也进不来。注册位置就
+		// 在拿到执行权之后：按本 Run 的 token 走完整 `finish`（终态 → 钩子 → 释放 →
+		// 租约收尾），再把 panic 收成 `StatusFailed` 的普通结果——栈只进日志，不进 Reason。
+		// 入口层（`internal/app`）的同类 recover 保留为兜底：它只覆盖本段之前的 panic，
+		// 那些 panic 还没有账本行，不需要收尾。
+		// A panic after the admission commit must still close the ledger row: the DB-side
+		// caller-concurrency check counts running rows, so a leaked row would block the
+		// caller forever. The entry layer keeps its own recover as a net for panics that
+		// happen before the row exists.
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			s.opts.Logger.Error("运行主体 panic——已按失败收口",
+				"run_id", runID, "panic", recovered)
+			ret = s.finish(ctx, runID, env, RunResult{
+				Status: StatusFailed,
+				Reason: fmt.Sprintf("panic: %v", recovered),
+			})
+			retErr = nil
+		}()
+		// 会话面同步绑定执行权：此后本 Run 的消息追加走 fenced 入口（T008 的写入面
+		// 分流在这里接到准入令牌上）。只绑一次，运行内不换代次。
+		// The session binds the credential once here, so later appends take the fenced
+		// entry point selected by a non-zero token.
+		sess.BindLease(token)
+
+		// 续约循环从此接管执行权（FR-24-04 / FR-24-05）：失权、他处取消请求与续约
+		// 超时都经取消沿 `runCtx` 传到知识检索与循环的检查点（轮首 / 调用后 / 每次
+		// 工具前）——受保护写入仍由仓储按 token 逐笔拒绝，取消只是让本进程尽早停手。
+		// **不**声称在途外部请求被撤销：它们各自到界（模块卡 §2.3.3）。
+		// 只 `abandon` 不 `stop`：交还租约的唯一位置是 `finish` 的收尾末笔
+		// （`CompleteRunCloseout`），系统代投的 Run 由调用方在投递结算后补这一笔——
+		// 在这里 Release 会把"投递尚未落库"的 Run 提前让给别处回收（B1 误判 unknown）。
+		// The keeper starts here and lease loss cancels execution through the loop's
+		// checkpoints. Run abandons rather than stops: CompleteRunCloseout is the single
+		// release point, and delivery-settled runs close out after Run returns.
+		if !token.IsZero() && s.opts.Leases != nil {
+			leaseCtx, _, abandon := KeepLease(runCtx, s.opts.Leases, token,
+				s.opts.RenewInterval, s.opts.LeaseTTL, s.opts.Logger)
+			runCtx = leaseCtx
+			defer abandon()
 		}
 	}
 
@@ -575,7 +723,7 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 			// 截止不是"知识库故障"——按循环的同一口径记 cancelled，不写成 failed。
 			// Cancellation wins over failure: an aborted retrieval is a cancelled run, not
 			// a knowledge failure.
-			if ctxErr := runCtx.Err(); ctxErr != nil {
+			if ctxErr := context.Cause(runCtx); ctxErr != nil {
 				return s.finish(ctx, runID, env, env.cancelled(ctxErr, 0, 0)), nil
 			}
 			return s.finish(ctx, runID, env, RunResult{
@@ -628,13 +776,19 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (RunResult, erro
 	return s.finish(ctx, runID, env, res), nil
 }
 
-// finish 写终态账本行、按条件触发唯一的同步学习钩子，并释放运行引用；返回结果。
-// 三段顺序固定（C-05）：**终态落库 → 抽取钩子 → 引用释放**。写失败只记 ERROR：
-// 结果照常返回——修复历史不能以扣下已得结果为代价。释放**无条件**执行（钩子 panic、
-// 超时、跳过都不影响），失败只记 ERROR 并留给启动恢复兜底。
-// finish writes the terminal ledger state, triggers the one synchronous learning hook
-// under its conditions, and releases the run's references — in that fixed order. The
-// release is unconditional; neither the hook nor the release can change the result.
+// finish 写终态账本行、按条件触发唯一的同步学习钩子，并收尾运行；返回结果。
+// 五步顺序固定（US-24 模块卡 §2.3.5 / P-01）：**终态落库 → 抽取钩子 → 引用释放 →
+// 投递结算 → `CompleteRunCloseout`**。前四步在本方法内，投递结算发生在 `Run` 返回
+// 之后（系统代投的调用方执行），所以它的 `CompleteRunCloseout` 也由该调用方补上：
+// 本方法对 `SuppressNotify` 的 Run 跳过收尾末笔，租约因此活到投递结果落库之后；
+// 否则 B1 会把一条正在发送的投递误判成 `unknown`。写失败只记 ERROR：结果照常返回
+// ——修复历史不能以扣下已得结果为代价。释放与收尾**无条件**执行（钩子 panic、超时、
+// 跳过都不影响），失败只记 ERROR 并留给回收器兜底。
+// finish writes the terminal ledger state, triggers the one synchronous learning hook,
+// releases refs and closes the run out — in that fixed order. Delivery settlement runs
+// after Run returns, so those runs (SuppressNotify) skip the final closeout here and let
+// the caller finish it after settlement; the lease must outlive the delivery write, or B1
+// would mark an in-flight delivery unknown.
 func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, res RunResult) RunResult {
 	res.RunID = runID
 	if res.ConfigHash == "" {
@@ -650,16 +804,40 @@ func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, re
 	if s.opts.Runs == nil {
 		return res
 	}
+	// 执行权凭证随运行环境显式传递（宪法 VII：业务状态不进 context）。零值只在
+	// 未接执行权的装配出现，此时仓储走无 fencing 的条件更新。
+	// The lease token travels as an explicit parameter; zero marks an unleased assembly.
+	var token LeaseToken
+	if env != nil {
+		token = env.Lease
+	}
 
 	// 终态写回用独立 5 秒 + WithoutCancel：调用方取消不得让终态落不进去（既有
 	// Flow 取消路径的同一纪律，现在统一适用）。`applied` 是本次是否真正完成转换。
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	applied, err := s.opts.Runs.FinishRun(finishCtx, runID, res.Status, res.Reason,
+	applied, err := s.opts.Runs.FinishRun(finishCtx, runID, token, res.Status, res.Reason,
 		res.Iterations, res.ToolCalls, s.opts.Now())
 	if err != nil {
 		s.opts.Logger.Error("运行终态落库失败",
 			"run_id", runID, "store", "runs", "op", "finish")
+	}
+
+	// 收尾末笔：引用（幂等的第二道）+ **最后**释放租约。注册在释放之前，所以它
+	// 之后才跑——LIFO：释放 → 收尾。系统代投的 Run 例外（投递在 Run 返回之后结算，
+	// 由调用方在投递结果落库后补这一笔）：`SuppressNotify` 是本 Run "不向模型提供
+	// notify 且通知授权固定 none" 的唯一标记，也正是"投递由调用方结算"的信号。
+	// The closeout runs last (registered before the release, so it runs after it). Runs
+	// whose delivery is settled by the caller skip it here and close out after settlement.
+	if env == nil || !env.Req.SuppressNotify {
+		defer func() {
+			closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelClose()
+			if cerr := s.opts.Runs.CompleteRunCloseout(closeCtx, runID, token, s.opts.Now()); cerr != nil {
+				s.opts.Logger.Error("运行收尾未完成——租约等 TTL 由回收器接手",
+					"run_id", runID, "store", "runs", "op", "closeout")
+			}
+		}()
 	}
 
 	// 释放无条件执行：钩子 panic、超时、跳过都不影响；失败由启动恢复补齐。
@@ -702,6 +880,9 @@ func (s *AgentService) finish(ctx context.Context, runID string, env *RunEnv, re
 		ConfigHash:  res.ConfigHash,
 		CompletedAt: s.opts.Now(),
 		Extractor:   extractor,
+		// 执行权凭证原样透传（US-24 / P-20）：学习三写面据此走 fenced 入口。零值只在
+		// 未接执行权的装配出现（SQLite 谱系 / 轻装配），那时写入面用普通端口。
+		Token: env.Lease,
 	}, res)
 	return res
 }
@@ -731,8 +912,10 @@ func (s *AgentService) callLearningHook(ctx context.Context, in LearningRunInput
 // 让循环自己收场。② 无论等到与否都读库取**当前**状态返回——超时可能仍是 running，由
 // 调用方轮询；调用方自己取消上下文时同样停止等待（不算降级）。③ 未命中登记表时读库：
 // 无行 → `ErrRunNotFound`（HTTP 404）；已是终态 → 原样返回（重复取消因此幂等）；仍写作
-// running → 单进程下只可能是恢复未完或缺陷，如实返回当前状态并记 ERROR，**不假装取消成功**
-// （注 15）。等待上限授权的是"等"，不是"写"：本方法没有任何 FinishRun 调用。
+// running → 运行在别的 Worker 上，改走 `RequestCancel` **只写** `runs.cancel_requested`，
+// 返回写后的真实状态（仍可能是 running），由属主在下次续约 / 检查点观察并自行收敛
+// （US-24 / FR-24-22 / C-16）——**不假装取消成功**。等待上限授权的是"等"，不是"写"：
+// 本方法没有任何 FinishRun 调用，跨 Worker 分支也不代替属主写终态。
 func (s *AgentService) Cancel(ctx context.Context, runID string) (RunDetail, error) {
 	s.mu.Lock()
 	run := s.active[runID]
@@ -753,10 +936,22 @@ func (s *AgentService) Cancel(ctx context.Context, runID string) (RunDetail, err
 	if err != nil {
 		return RunDetail{}, err
 	}
-	// 库说 running、内存没有登记：取消信号无处可送。如实返回当前状态并留 ERROR 供排障，
-	// 不把"没送到"伪装成"已取消"（注 15）。
+	// 库说 running、内存没有登记：运行在别的 Worker 上。跨 Worker 取消的**唯一**合法动作
+	// 是请求取消——写 `runs.cancel_requested`，由属主在下次续约 / 检查点观察并自行收敛；
+	// 返回值是写后的真实状态（可能仍是 running），不把"请求已写入"伪装成"已取消"（注 15 /
+	// FR-24-22）。归属已失时属主的 FinishRun 会被 fencing 拒绝，由回收方按失败收尾。
+	// Running without a local entry means another worker owns it: raise the flag only and
+	// report the real state; the owner observes it on its next renewal.
 	if run == nil && detail.Status == StatusRunning {
-		s.opts.Logger.Error("运行不在本进程，取消信号未送达", "run_id", runID, "op", "cancel")
+		requested, err := s.opts.Runs.RequestCancel(ctx, runID)
+		if err != nil {
+			return RunDetail{}, err
+		}
+		if requested.Status == StatusRunning {
+			s.opts.Logger.Warn("运行不在本进程，取消请求已写入，等待属主观察",
+				"run_id", runID, "op", "cancel")
+		}
+		return requested, nil
 	}
 	return detail, nil
 }
@@ -1173,12 +1368,15 @@ func withoutToolName(tools []string, name string) []string {
 	return out
 }
 
-// runSuffix 生成 RunID 的随机段：**6 位 base36 小写**（§6 固定口径）。
+// RunIDSuffix 生成 RunID 的随机段：**6 位 base36 小写**（§6 固定口径）。
 // 随机源取不到时不回落时间 / 计数器（那会退化成可预测的 id）：以全零段收场，唯一性仍由
 // 时间戳段保证，而这次故障会由启动期的完整性检查暴露。
-// runSuffix returns the six-character base36 suffix of a run id; a missing entropy source
-// never degrades into a predictable counter.
-func runSuffix() string {
+// 导出是因为调度领取（storage 层的 ClaimDueTrigger）与操作 id（management.go）都要用
+// 同一段生成器；调用方只拼 id，不实现第二套随机段。
+// RunIDSuffix returns the six-character base36 suffix of a run id; a missing entropy
+// source never degrades into a predictable counter. Exported because the scheduler claim
+// path (ClaimDueTrigger) lives in storage and must use the same generator.
+func RunIDSuffix() string {
 	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
 	// 252 = 36×7：把 ≥252 的字节剔除，取模偏差即归零（256 = 36×7 + 4）。
 	const cutoff = 252

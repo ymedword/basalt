@@ -103,6 +103,9 @@ func TestFlow_FixedReadOnlyRunHasNoModelPromptOrChatCharge(t *testing.T) {
 			resources := &fakeRunResources{resolved: resolved}
 			snapshot := &fakeSnapshotBuilder{}
 			quota := &recordingRunQuota{}
+			// US-24 Q21：任务次数记账已并入 `RunStore.StartRun` 的事务，本用例的
+			// 假仓储因此拿到同一端口来模拟事务内扣费（扣费失败 → 整笔不落、零占用）。
+			h.store.runQuota = quota
 			if scenario == "run-quota-denied" {
 				quota.err = errRunQuotaDenied
 			}

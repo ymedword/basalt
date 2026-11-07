@@ -35,6 +35,12 @@ func (p *flowHandlerProbe) Cancel(_ context.Context, req flow.CancelRequest) (Fl
 	return p.view, p.failure
 }
 
+func (p *flowHandlerProbe) Resume(_ context.Context, req flow.ResumeRequest) (FlowTaskView, error) {
+	p.controls++
+	p.expected = req.Expected
+	return p.view, p.failure
+}
+
 func (p *flowHandlerProbe) Validate(context.Context, core.Principal, core.Actor, flow.Definition) error {
 	p.validations++
 	return p.failure
@@ -107,6 +113,23 @@ func TestFlow_HTTPFullETagAndMissingPreconditionZeroWrite(t *testing.T) {
 	require.Equal(t, 202, w.Code)
 	require.Equal(t, 1, probe.controls)
 	require.Equal(t, probe.view.Version, probe.expected)
+}
+
+// TestFlow_HTTPRootBusyMapsTo409 固定管理面 resume 撞上执行者根租约的线上契约：
+// 必须映射 409 FLOW_ROOT_BUSY，**不得**落成 500，也不得在参数校验阶段短路
+// （FR-24-37 / 模块卡 §3.1.6，T023）。
+func TestFlow_HTTPRootBusyMapsTo409(t *testing.T) {
+	probe := &flowHandlerProbe{view: flowProbeView(), failure: flow.ErrFlowRootBusy}
+	srv := newTestServer(t, func(o *Options) { o.Flows = probe })
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"operation_id":"resume-1","reason":"worker_lease_expired"}`))
+	r.SetPathValue("id", "ft_fixture")
+	r.Header.Set("If-Match", probe.view.ETag)
+	w := httptest.NewRecorder()
+	srv.handleFlowResume(w, r, callerPrincipal("owner", core.ScopeFlowsWrite))
+	require.Equal(t, 1, probe.controls, "冲突发生在后端调用内，不是参数校验失败")
+	require.Equal(t, probe.view.Version, probe.expected)
+	require.Equal(t, http.StatusConflict, w.Code, "根租约冲突不得落成 500")
+	require.Contains(t, w.Body.String(), "FLOW_ROOT_BUSY")
 }
 
 func TestFlow_HTTPScopesAndAdminAreSeparate(t *testing.T) {

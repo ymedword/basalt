@@ -297,7 +297,7 @@ func TestRunBaseline_BootstrapsAgentDisabled(t *testing.T) {
 
 	require.FileExists(t, filepath.Join(env.root, "control", "agents", "writer.json"))
 
-	index, ok, errMessage, err := env.deps.Resources.LifecycleIndex(ctx, "writer")
+	index, ok, errMessage, err := env.deps.Resources.ReadLifecycleIndex(ctx, "writer")
 	require.NoError(t, err)
 	require.True(t, ok, "基线必须同步可重建的生命周期索引")
 	require.Empty(t, errMessage)

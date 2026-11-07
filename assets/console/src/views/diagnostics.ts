@@ -78,6 +78,7 @@ const REASON_LABELS: Record<string, string> = {
   llm_call_failed: '模型调用没有拿到可用响应',
   concurrency_limited: '并发名额不足（随请求结束恢复）',
   chunk_invalidated: '资料可见性已收窄',
+  recovery_unknown: '属主失联后被接管：结果未知，未重放',
 }
 
 /** 判定 → 中文；四值与契约 `decision` 枚举逐字对应，空串保持空。 */

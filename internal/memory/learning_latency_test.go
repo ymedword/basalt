@@ -41,12 +41,14 @@ type learningLatencyStore struct {
 	failDeadline time.Time
 }
 
-func (s *learningLatencyStore) FailExtraction(ctx context.Context, extractionID string,
+func (s *learningLatencyStore) FailExtraction(ctx context.Context, extractionID, triggerRunID string,
+	token core.LeaseToken, expectedPrev string, expectedAttempts int,
 	class core.LearningFailureClass, message string, failedAt time.Time,
 ) error {
 	s.failCtxErr = ctx.Err()
 	s.failDeadline, _ = ctx.Deadline()
-	return s.learningFakeStore.FailExtraction(ctx, extractionID, class, message, failedAt)
+	return s.learningFakeStore.FailExtraction(ctx, extractionID, triggerRunID, token,
+		expectedPrev, expectedAttempts, class, message, failedAt)
 }
 
 // learningLatencyExtractor 是可控的模型桩：可延迟、可阻塞到工作段截止、可在调用内

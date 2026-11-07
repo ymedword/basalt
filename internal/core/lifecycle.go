@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // 本文件是 Agent 生命周期的领域类型与**进程内同步原语**（颗粒度文档 §3.1.10）：
@@ -45,6 +46,18 @@ type LifecycleRecord struct {
 	UpdatedAt   int64  // Unix 毫秒（UTC）
 	OperationID string // 写入本次状态的真实 op-... 标识（含基线）
 	Checksum    string // "sha256:<64 位小写十六进制>"
+}
+
+// LifecycleExpectation 是准入时从 AgentGate 读到的生命周期期望值（P-16）：`StartRun`
+// 在事务内与 `agent_lifecycle` 索引比对（代次 + 状态文件哈希），不符即拒绝。
+// `StateFileHash` 与索引列同口径（`sha256:<64 位小写十六进制>`）。零值表示调用方
+// **未提供**——`StartRun` 据此**拒绝**而不是跳过：缺少期望值就无法做最终复查，
+// "跳过复查"等于让发布竞争静默通过。
+// LifecycleExpectation is the admission-time lifecycle expectation compared inside
+// StartRun's transaction. Zero means "not provided" and is refused, never skipped.
+type LifecycleExpectation struct {
+	Generation    int64
+	StateFileHash string
 }
 
 // ErrLifecycleConflict 表示生命周期迁移 / 撤销的前置条件不成立：期望状态或代数不符，
@@ -90,12 +103,77 @@ type IdentityUpgradePort interface {
 	UpgradeIdentity(ctx context.Context, agent, operationID string) (LifecycleRecord, bool, error)
 }
 
-// LifecycleIndex 是 `agent_lifecycle` 索引的写端口：索引可由状态文件重建，
+// LifecycleIndex 是 `agent_lifecycle` 索引的读写端口：索引可由状态文件重建，
 // 写失败不回滚状态文件，但必须让调用方可见（WARN + 下次启动基线修复）。
-// LifecycleIndex is the rebuildable index write port; a write failure never rolls
-// back the authoritative file, but must stay visible to the caller.
+// 写入遵守**代次单调**：本地代次低于索引即拒绝（`ErrAgentLifecycleStale`）；同代次
+// 只接受逐项完全一致的内容（`ErrAgentLifecycleMismatch`），本地代次更高由调用方
+// 走管理操作单调修复，索引自己**不得**自动回退或分裂。
+// LifecycleIndex is the rebuildable index read/write port; writes are monotonic in
+// generation and refuse same-generation disagreement, never rolling back the index.
 type LifecycleIndex interface {
+	// ReadLifecycleIndex 读共享索引行：返回记录、`valid` 标志与无效原因。索引无该
+	// Agent 时返回带 Agent 名的零记录、valid=false、空原因与 nil 错误（"没有索引行"
+	// 不是故障，调用方据此回退到状态文件读取）。调用方从返回的代次与
+	// `state_file_hash` 派生准入期期望（`LifecycleExpectation`，本文件）。
+	//
+	// ReadLifecycleIndex reads one index row; a missing row is not an error, so callers
+	// can fall back to the authoritative state file.
+	ReadLifecycleIndex(ctx context.Context, agent string) (LifecycleRecord, bool, string, error)
 	PutLifecycleIndex(ctx context.Context, rec LifecycleRecord, valid bool, errMsg string) error
+	// SetLifecycleBarrier 是归档的**准入屏障**（FR-24-41）：在同一条 `agent_lifecycle`
+	// 行上把 `active` 条件更新为 `disabled`，并记下发起归档的操作标识。它是准入否决，
+	// **不是**状态迁移——`generation`、`state_file_hash` 与状态文件一律不动：状态文件
+	// 仍是唯一权威，屏障只封住共享索引上的新 Run。取行锁的 UPDATE 与 `StartRun` 事务内
+	// 对同一行的 `SELECT … FOR UPDATE` 复查因此互斥（两种真实获锁顺序都成立）。
+	// 行不存在或已非 active → applied=false（这两种情况本就不再准入）；只有数据库
+	// 不可用才返回 error。
+	//
+	// SetLifecycleBarrier flips active→disabled on the shared row as an admission veto.
+	// It is not a state transition: generation, state_file_hash and the authoritative
+	// file are untouched, so the row lock it takes is exactly the lock StartRun's
+	// FOR UPDATE recheck takes.
+	SetLifecycleBarrier(ctx context.Context, agent, operationID string, at time.Time) (applied bool, err error)
+	// RestoreLifecycleBarrier 把状态文件记录里的 `(state, generation, state_file_hash,
+	// updated_at, operation_id)` 原样写回索引，且**只撤销本次屏障**：条件是当前行仍
+	// 为 `disabled`、`operation_id` 等于本次归档屏障写下的标识、`generation` 仍等于
+	// 屏障期的代次。三者缺一即 applied=false——屏障之外的推进（别的进程已完成归档、
+	// 用户重新启用、同一归档操作自己推进了代次）都**不得**被这次补偿覆盖。
+	// 只判 `state='disabled'` 不够：后续停用同样把行置为 disabled，会把更晚的管理
+	// 操作回写成旧代次。
+	// 它不走 `PutLifecycleIndex` 的代次单调规则：写回的是**同一代次**的权威内容。
+	//
+	// RestoreLifecycleBarrier writes the state-file tuple back only when the row is
+	// still the disabled row this archive operation installed: same barrier operation id
+	// and the generation observed at barrier time. It bypasses the monotonic-generation
+	// rule because it restores the same generation from the authoritative file.
+	RestoreLifecycleBarrier(ctx context.Context, rec LifecycleRecord,
+		barrierOperationID string, expectedGeneration int64) (applied bool, err error)
+}
+
+// 归档完成判据的**固定字面量**（图 8 [4] ①②③④）。它们是 `AgentBusyError.Unmet`
+// 与 `data.unmet_predicates` 的出站取值，**不得**改写或本地另拼。
+// The fixed predicate literals for "the agent finished cleanly"; they are the only
+// values that may appear in AgentBusyError.Unmet.
+const (
+	// ArchiveResidualRunningRun ①：该 Agent 仍有 `status='running'` 的 run 行。
+	ArchiveResidualRunningRun = "no_running_run"
+	// ArchiveResidualPendingAudit ②：以该 Agent 的 Run 为范围仍有 pending 审计行。
+	ArchiveResidualPendingAudit = "no_pending_audit"
+	// ArchiveResidualRefsReleased ③：三类运行引用对该 Agent 的 Run 全部已释放。
+	ArchiveResidualRefsReleased = "refs_released"
+	// ArchiveResidualPendingDelivery ④：该 Agent 没有 pending 的投递。
+	ArchiveResidualPendingDelivery = "no_pending_delivery"
+)
+
+// ArchiveResiduals 是一次"归档完成判据"快照：仍在运行的 Run 与**未达成**的判据
+// （取值只来自上面四个固定字面量）。空 Unmet 表示可以安全继续归档；租约到期与否
+// 不参与判定——租约只说明没人能再提交，不证明执行已退出（图 8 的 R4 修正）。
+//
+// ArchiveResiduals snapshots the archive-completion predicates: the runs still running
+// and the predicates that do not hold yet. An empty Unmet means the archive may proceed.
+type ArchiveResiduals struct {
+	RunIDs []string
+	Unmet  []string
 }
 
 // AgentGate 按 Agent 名分桶：同一 Agent 的准入读锁、启停写锁、内容写锁互斥，

@@ -18,7 +18,7 @@ type flowTerminalProbe struct {
 	status   RunStatus
 }
 
-func (p *flowTerminalProbe) FinishRun(ctx context.Context, _ string, status RunStatus, _ string, _, _ int, _ time.Time) (bool, error) {
+func (p *flowTerminalProbe) FinishRun(ctx context.Context, _ string, _ LeaseToken, status RunStatus, _ string, _, _ int, _ time.Time) (bool, error) {
 	p.calls++
 	p.err = ctx.Err()
 	p.deadline, _ = ctx.Deadline()
@@ -27,6 +27,10 @@ func (p *flowTerminalProbe) FinishRun(ctx context.Context, _ string, status RunS
 }
 
 func (p *flowTerminalProbe) ReleaseRunRefs(context.Context, string, time.Time) error { return nil }
+
+func (p *flowTerminalProbe) CompleteRunCloseout(context.Context, string, LeaseToken, time.Time) error {
+	return nil
+}
 
 func TestFlow_CancelledLeafUsesBoundedOriginalTerminalWriter(t *testing.T) {
 	for _, isFlow := range []bool{false, true} {

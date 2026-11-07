@@ -22,7 +22,7 @@ func TestObservabilityStore_MetricWindows(t *testing.T) {
 		age time.Duration
 	}{{"recent", time.Minute}, {"older", 10 * time.Minute}} {
 		start := now.Add(-run.age)
-		require.NoError(t, NewRunStore(db).StartRun(t.Context(), core.RunRecord{RunID: run.id, Agent: "CANARY_AGENT", Channel: "web", StartedAt: start, Principal: core.LocalAdminCLIPrincipal()}, core.RunResourceManifest{}))
+		require.NoError(t, startRunTest(NewRunStore(db), t.Context(), core.RunRecord{RunID: run.id, Agent: "CANARY_AGENT", Channel: "web", StartedAt: start, Principal: core.LocalAdminCLIPrincipal()}, core.RunResourceManifest{}))
 		_, err := db.pool.ExecContext(t.Context(), `UPDATE runs SET status='completed',finished_at=started_at+500 WHERE run_id=$1`, run.id)
 		require.NoError(t, err)
 	}

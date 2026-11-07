@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ymedword/basalt/internal/cli"
+	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/diagnostics"
 	"github.com/ymedword/basalt/internal/observability"
 	"github.com/ymedword/basalt/internal/storage/postgres"
@@ -30,10 +31,12 @@ import (
 
 // newDiagnosticsPortsWithMetrics 构造诊断的写入器、读取器及可选指标回调。调用方持有实例：
 // 写入器进运行路径（`AdmissionDeps.Diagnostics`），读取器进管理面
-// （`web.Options.Diagnostics`）。
+// （`web.Options.Diagnostics`）。`worker` 是本进程身份（US-24 T032）：写入路径只在
+// 本进程持有该 Run 租约时给 attrs 补归属两项；零值装配不补，不报错。
 // newDiagnosticsPortsWithMetrics builds the recorder, reader and optional metric callback.
-func newDiagnosticsPortsWithMetrics(cfg cli.DiagnosticsConfig, db *postgres.DB, now func() time.Time,
-	logger *slog.Logger, metrics *observability.MetricsCollector,
+// The worker identity gates the lease attributes written onto run-anchored events.
+func newDiagnosticsPortsWithMetrics(cfg cli.DiagnosticsConfig, db *postgres.DB, worker core.WorkerIdentity,
+	now func() time.Time, logger *slog.Logger, metrics *observability.MetricsCollector,
 ) (*diagnostics.Recorder, *diagnostics.Reader, error) {
 	if db == nil {
 		// 重路径恒有库句柄；nil 只可能来自被绕过的装配。与 web 侧同一口径——
@@ -44,7 +47,7 @@ func newDiagnosticsPortsWithMetrics(cfg cli.DiagnosticsConfig, db *postgres.DB, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("诊断配置: %w", err)
 	}
-	store := postgres.NewDiagnosticStore(db)
+	store := postgres.NewDiagnosticStore(db).WithWorker(worker.InstanceID)
 	recorder := diagnostics.NewRecorder(diagnostics.RecorderOptions{
 		OnResult: diagnosticMetricResult(metrics),
 		Store:    store,

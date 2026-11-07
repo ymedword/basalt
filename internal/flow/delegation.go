@@ -18,7 +18,7 @@ type activeAttemptReader interface {
 // advanceSubflow uses a durable static child, not a root Run. Each child leaf
 // gets its own session and the same original owner; recursive depth is bounded by
 // the accepted contract, and a capacity refusal yields the whole root interval.
-func (s *Service) advanceSubflow(ctx context.Context, p core.Principal, task Task, node Node, input json.RawMessage, hash string) (Task, error) {
+func (s *Service) advanceSubflow(ctx context.Context, p core.Principal, task Task, node Node, input json.RawMessage, hash string, lease core.LeaseToken) (Task, error) {
 	if node.Subflow == nil || task.Depth >= task.Contract.Budget.MaxDepth {
 		return task, ErrBudget
 	}
@@ -33,7 +33,7 @@ func (s *Service) advanceSubflow(ctx context.Context, p core.Principal, task Tas
 			return task, idErr
 		}
 		attempt = NodeAttempt{ID: id, TaskID: task.ID, NodeID: node.ID, NodeInvocationID: task.ID + ":" + node.ID, Attempt: task.Revision.Attempts[node.ID] + 1, TaskRevision: task.Version.Revision, ExecutionEpoch: task.Version.ExecutionEpoch, Input: input, InputHash: hash}
-		attempt, err = s.Repository.Claim(ctx, ClaimNode{Principal: p, TaskID: task.ID, Expected: task.Version, Attempt: attempt, Now: s.clock().UnixMilli()})
+		attempt, err = s.Repository.Claim(ctx, ClaimNode{Principal: p, TaskID: task.ID, Expected: task.Version, Attempt: attempt, Lease: lease, Now: s.clock().UnixMilli()})
 	}
 	if err != nil {
 		return task, err
@@ -71,7 +71,7 @@ func (s *Service) advanceSubflow(ctx context.Context, p core.Principal, task Tas
 			return task, core.ErrUnauthorized
 		}
 		leafCtx, cancel := context.WithDeadline(ctx, time.UnixMilli(child.Deadline))
-		child, err = s.advanceOne(leafCtx, current, child)
+		child, err = s.advanceOne(leafCtx, current, child, lease)
 		cancel()
 		if err != nil {
 			return task, err
@@ -121,7 +121,7 @@ func (s *Service) advanceSubflow(ctx context.Context, p core.Principal, task Tas
 	} else if child.Status == Stopped {
 		result.Run.Status = core.StatusLimitReached
 	}
-	return s.acceptAttempt(finish, p, task, node, attempt, result, nil)
+	return s.acceptAttempt(finish, p, task, node, attempt, result, nil, lease)
 }
 
 func (s *Service) createChild(ctx context.Context, p core.Principal, parent Task, node Node, key string, input json.RawMessage, hash string) (Task, error) {

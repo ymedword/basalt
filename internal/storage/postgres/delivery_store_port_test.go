@@ -368,9 +368,11 @@ func TestDeliveryStore_GetMissingReportsNotExist(t *testing.T) {
 	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
-// TestDeliveryStore_RecoverResolvesFromRunState —— 崩溃遗留的 pending 行按关联 Run 的
-// 实际终态改判：已完成 / 达上限 → unknown（模型已产出正文，投递是否发生无法证明），
-// 失败 / 仍运行 / 无 Run → skipped；已回填的行不动；再跑一次恢复 0 条。
+// TestDeliveryStore_RecoverResolvesFromRunState —— 崩溃遗留的 pending 行按**被领取
+// Run 的实际终态**改判：已完成 / 达上限 → unknown（模型已产出正文，投递是否发生
+// 无法证明），失败 / 仍运行 / 无 Run → skipped；已回填的行不动；再跑一次恢复 0 条。
+//
+// 作用域是 US-24 的修正（FR-24-21 / C-15）：恢复只处理调用方点名的 Run。
 // 逆改点：unknown 被写成 failed 并重发 → 重复投递，本用例红。
 func TestDeliveryStore_RecoverResolvesFromRunState(t *testing.T) {
 	store, db := deliveryPortNewStore(t)
@@ -391,10 +393,6 @@ func TestDeliveryStore_RecoverResolvesFromRunState(t *testing.T) {
 		deliveryPortPolicyNow, deliveryPortPolicyNow))
 
 	now := deliveryPortPolicyNow.Add(time.Hour)
-	recovered, err := store.Recover(ctx, now)
-	require.NoError(t, err)
-	require.Equal(t, 5, recovered, "只改判当次仍为 pending 的行")
-
 	for runID, want := range map[string]core.DeliveryStatus{
 		"run-completed": core.DeliveryUnknown,
 		"run-limit":     core.DeliveryUnknown,
@@ -402,6 +400,10 @@ func TestDeliveryStore_RecoverResolvesFromRunState(t *testing.T) {
 		"run-running":   core.DeliverySkipped,
 		"run-orphan":    core.DeliverySkipped,
 	} {
+		recovered, err := store.Recover(ctx, now, runID)
+		require.NoError(t, err)
+		require.Equal(t, 1, recovered, "%s：作用域恢复只改判这一条", runID)
+
 		rec, getErr := store.Get(ctx, runID)
 		require.NoError(t, getErr)
 		require.Equal(t, want, rec.Status, "%s 的恢复结论", runID)
@@ -418,17 +420,46 @@ func TestDeliveryStore_RecoverResolvesFromRunState(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, core.DeliverySent, sent.Status, "已回填的行不得被恢复改动")
 	require.Equal(t, "发送成功", sent.Detail)
+	sentAgain, err := store.Recover(ctx, now, "run-sent")
+	require.NoError(t, err)
+	require.Equal(t, 0, sentAgain, "已回填行不在 pending 里，恢复是空操作")
 
-	again, err := store.Recover(ctx, now)
+	again, err := store.Recover(ctx, now, "run-completed")
 	require.NoError(t, err)
 	require.Equal(t, 0, again, "恢复是幂等的")
+}
+
+// TestDeliveryStore_RecoverScopedToOneRun —— 恢复的作用域是硬边界：改判 run-target
+// 的 pending 行时，同一张表里另一条 pending 行（例如另一个 Worker 正在收尾的 Run）
+// **一字不动**（US-24 / FR-24-21 / C-15）。
+// Recovery is scoped: another run's pending row is never touched.
+func TestDeliveryStore_RecoverScopedToOneRun(t *testing.T) {
+	store, db := deliveryPortNewStore(t)
+	ctx := context.Background()
+	deliveryPortPrepare(t, store, "run-target", deliveryPortPolicyNow)
+	deliveryPortPrepare(t, store, "run-other", deliveryPortPolicyNow)
+	deliveryPortSeedRunRow(t, db, "run-target", string(core.StatusCompleted), sql.NullString{}, nil, nil)
+	deliveryPortSeedRunRow(t, db, "run-other", string(core.StatusCompleted), sql.NullString{}, nil, nil)
+
+	recovered, err := store.Recover(ctx, deliveryPortPolicyNow.Add(time.Hour), "run-target")
+	require.NoError(t, err)
+	require.Equal(t, 1, recovered)
+
+	target, err := store.Get(ctx, "run-target")
+	require.NoError(t, err)
+	require.Equal(t, core.DeliveryUnknown, target.Status)
+
+	other, err := store.Get(ctx, "run-other")
+	require.NoError(t, err)
+	require.Equal(t, core.DeliveryPending, other.Status, "集合外的 pending 行不得被改判")
+	require.True(t, other.FinishedAt.IsZero())
 }
 
 // TestDeliveryStore_RecoverWithoutPendingIsNoop —— 没有 pending 行时恢复返回 0 且不改
 // 任何行。
 func TestDeliveryStore_RecoverWithoutPendingIsNoop(t *testing.T) {
 	store, _ := deliveryPortNewStore(t)
-	recovered, err := store.Recover(context.Background(), deliveryPortPolicyNow)
+	recovered, err := store.Recover(context.Background(), deliveryPortPolicyNow, "run-none")
 	require.NoError(t, err)
 	require.Equal(t, 0, recovered)
 }
@@ -468,7 +499,7 @@ func TestDeliveryStore_ErrorPathsReportContext(t *testing.T) {
 		require.Contains(t, err.Error(), "回填定时投递记录")
 
 		// PG 只有一个连接池：关闭后 Recover 的失败点在事务开启（SQLite 侧是「获取写连接」）。
-		_, err = store.Recover(ctx, deliveryPortPolicyNow)
+		_, err = store.Recover(ctx, deliveryPortPolicyNow, "run-x")
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "开启 PostgreSQL 事务")
 	})
@@ -577,7 +608,7 @@ func TestNotifyDeliveryStore_AdmissionFreezesChannels(t *testing.T) {
 
 	rec := notifyPortStartRow("scheduler")
 	rec.RunID = "scheduler-1776000000123-notify1"
-	require.NoError(t, runs.StartRun(ctx, rec, manifest))
+	require.NoError(t, startRunTest(runs, ctx, rec, manifest))
 
 	refs, err := store.Refs(ctx, rec.RunID)
 	require.NoError(t, err)

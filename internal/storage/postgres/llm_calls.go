@@ -31,6 +31,15 @@ var _ core.LLMCallStore = (*LLMCallRepo)(nil)
 // The same implementation also satisfies the read-only surface, mirroring the tool repo.
 var _ core.LLMCallReader = (*LLMCallRepo)(nil)
 
+// 编译期断言：两条 pending 预写（对话 / 记忆抽取）各有 fenced 入口（US-24 T008）。
+// 摘要预写的 fenced 入口由 internal/app 的消费方接口断言（同一声明纪律：接口在消费方）。
+// Compile-time assertions for the two fenced pre-writes declared in core; the compaction
+// one is asserted against the app-side consumer interface.
+var (
+	_ core.FencedChatCallStore          = (*LLMCallRepo)(nil)
+	_ core.FencedMemoryExtractCallStore = (*LLMCallRepo)(nil)
+)
+
 // NewLLMCallRepo 绑定一个已打开的写模式库句柄。
 // NewLLMCallRepo binds the repo to an opened writable database handle.
 func NewLLMCallRepo(db *DB) *LLMCallRepo { return &LLMCallRepo{db: db} }
@@ -74,7 +83,7 @@ func (r *LLMCallRepo) CallsByRun(ctx context.Context, runID string) ([]core.LLMC
 // config_hash）空值写 NULL，与"写了空串"区分开；created_at 存 Unix 毫秒。
 // The status is written here as a literal, so no caller can get it wrong.
 func (r *LLMCallRepo) BeginCall(ctx context.Context, call core.LLMCall) (int64, error) {
-	return r.beginPendingCall(ctx, string(core.LLMCallPurposeChat), call)
+	return r.beginPendingCall(ctx, r.db.pool, string(core.LLMCallPurposeChat), call)
 }
 
 // BeginCompactionCall 插入**摘要调用**的 pending 审计行（`purpose='compaction'`），
@@ -87,7 +96,7 @@ func (r *LLMCallRepo) BeginCall(ctx context.Context, call core.LLMCall) (int64, 
 // A separate entry point keeps core.LLMCallStore's signature frozen (P-02); the purpose
 // is a storage-layer literal, just like status, and round 0 marks a non-conversational call.
 func (r *LLMCallRepo) BeginCompactionCall(ctx context.Context, call core.LLMCall) (int64, error) {
-	return r.beginPendingCall(ctx, string(core.LLMCallPurposeCompaction), call)
+	return r.beginPendingCall(ctx, r.db.pool, string(core.LLMCallPurposeCompaction), call)
 }
 
 // BeginMemoryExtractCall 插入**记忆抽取**调用的 pending 审计行
@@ -97,13 +106,63 @@ func (r *LLMCallRepo) BeginCompactionCall(ctx context.Context, call core.LLMCall
 // BeginMemoryExtractCall pre-writes the extraction audit row; the purpose is fixed here,
 // and the single INSERT stays in beginPendingCall.
 func (r *LLMCallRepo) BeginMemoryExtractCall(ctx context.Context, call core.LLMCall) (int64, error) {
-	return r.beginPendingCall(ctx, string(core.LLMCallPurposeMemoryExtract), call)
+	return r.beginPendingCall(ctx, r.db.pool, string(core.LLMCallPurposeMemoryExtract), call)
+}
+
+// FencedBeginCall 是对话预写的**受归属保护**入口（US-24 T008 / FR-24-36）：先锁租约行、
+// 校验归属，再写 pending。失权返回 `ErrLeaseLost` 且零新行——调用方拒绝发出该次模型调用。
+// FencedBeginCall fences the chat pre-write; losing the lease refuses the call outright.
+func (r *LLMCallRepo) FencedBeginCall(ctx context.Context, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	return r.fencedBeginPendingCall(ctx, token, string(core.LLMCallPurposeChat), call)
+}
+
+// FencedBeginCompactionCall 是摘要预写的受保护入口（用途仍由本层固定写）。
+// FencedBeginCompactionCall fences the compaction pre-write; the purpose stays a
+// storage-layer literal, exactly as its unfenced twin.
+func (r *LLMCallRepo) FencedBeginCompactionCall(ctx context.Context, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	return r.fencedBeginPendingCall(ctx, token, string(core.LLMCallPurposeCompaction), call)
+}
+
+// FencedBeginMemoryExtractCall 是记忆抽取预写的受保护入口。抽取的 fence 目标是
+// **触发它的那条 Run**（P-20）；抽取行自身的归属由 `memory` 包的恢复路径另行处理。
+// FencedBeginMemoryExtractCall fences the extraction pre-write; the fence target is the
+// triggering run (P-20).
+func (r *LLMCallRepo) FencedBeginMemoryExtractCall(ctx context.Context, token core.LeaseToken,
+	call core.LLMCall,
+) (int64, error) {
+	return r.fencedBeginPendingCall(ctx, token, string(core.LLMCallPurposeMemoryExtract), call)
+}
+
+// fencedBeginPendingCall 是三条 fenced 预写入口的唯一事务体：fence 与 INSERT 同一事务，
+// 失权时 INSERT 根本不会执行。
+// fencedBeginPendingCall is the single fenced transaction body behind all three entries.
+func (r *LLMCallRepo) fencedBeginPendingCall(ctx context.Context, token core.LeaseToken,
+	purpose string, call core.LLMCall,
+) (int64, error) {
+	var id int64
+	err := fencedTx(ctx, r.db, token, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		id, err = r.beginPendingCall(ctx, tx, purpose, call)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // beginPendingCall 是三条预写入口的**唯一** INSERT（列清单只写一份，三处各写一份就是
-// 三处漂移点）：状态恒 'pending'，purpose 由调用种类固定给出。
-// beginPendingCall is the single INSERT behind all pre-write entry points.
-func (r *LLMCallRepo) beginPendingCall(ctx context.Context, purpose string, call core.LLMCall) (int64, error) {
+// 三处漂移点）：状态恒 'pending'，purpose 由调用种类固定给出。`ex` 是普通写（池）与
+// fenced 写（事务）的公共执行面——普通与受保护入口共用这一句 SQL。
+// beginPendingCall is the single INSERT behind all pre-write entry points; ex is the
+// shared execution surface of the pool and the fenced transaction.
+func (r *LLMCallRepo) beginPendingCall(ctx context.Context, ex sqlExecutor,
+	purpose string, call core.LLMCall,
+) (int64, error) {
 	createdAt := call.CreatedAt
 	if createdAt.IsZero() {
 		// 列是 NOT NULL 且含义为"这一时刻"；零值时间会落到 1677 年之前，比缺省当前时刻更误导。
@@ -114,7 +173,7 @@ func (r *LLMCallRepo) beginPendingCall(ctx context.Context, purpose string, call
 	// `RETURNING id`：pgx 的 stdlib 驱动不实现 `LastInsertId`（SQLite 迁移遗留），
 	// 标识只能随 INSERT 一起取回。
 	var id int64
-	err := r.db.pool.QueryRowContext(ctx,
+	err := ex.QueryRowContext(ctx,
 		`INSERT INTO llm_calls
 		   (run_id, session_id, round, provider, model,
 		    prompt_tokens, completion_tokens, total_tokens, duration_ms,

@@ -359,11 +359,38 @@ func (s *FlowStore) Claim(ctx context.Context, req flow.ClaimNode) (flow.NodeAtt
 	return result, err
 }
 
+// flowWriteAdvances 判定一次任务头写入属于「推进类」还是「关闭 / 停住类」
+// （US-24 §2.3.6 / P-04）：写后状态 ∈ queued / running / succeeded / failed，
+// 且无关闭意图、未置取消位，才算推进。关闭类（blocked / cancelling / cancelled /
+// abandoned / stopped，或任何关闭意图、取消位）只保留既有 CAS——关闭正是失权
+// 执行者也要能完成的收尾，不能被租约反过来挡住。
+// flowWriteAdvances classifies head writes: only advance-class writes are fenced by
+// a live flow_root lease; close-class writes keep the plain CAS.
+func flowWriteAdvances(status flow.TaskStatus, intent flow.CloseIntent, cancel bool) bool {
+	if cancel || intent != flow.CloseNone {
+		return false
+	}
+	switch status {
+	case flow.Queued, flow.Running, flow.Succeeded, flow.Failed:
+		return true
+	default:
+		return false
+	}
+}
+
 func updateFlowHead(ctx context.Context, tx *sql.Tx, old flow.Task, status flow.TaskStatus, revision, epoch int64, intent flow.CloseIntent, cancel bool, now int64, reason string) error {
 	if old.Status.Terminal() || status != old.Status && !flow.CanTransition(old.Status, status) || !flow.ValidCloseIntent(status, intent, cancel) || old.CancelRequested && !cancel {
 		return flow.ErrStateConflict
 	}
-	changed, err := tx.ExecContext(ctx, `UPDATE flow_tasks SET status=$2,state_version=state_version+1,current_revision=$3,execution_epoch=$4,close_intent=$5,cancel_requested=$6,updated_at=$7,next_eligible_at=$7,reason=$8 WHERE task_id=$1 AND current_revision=$9 AND state_version=$10 AND execution_epoch=$11`, old.ID, status, revision, epoch, intent, cancel, now, reason, old.Version.Revision, old.Version.StateVersion, old.Version.ExecutionEpoch)
+	query := `UPDATE flow_tasks SET status=$2,state_version=state_version+1,current_revision=$3,execution_epoch=$4,close_intent=$5,cancel_requested=$6,updated_at=$7,next_eligible_at=$7,reason=$8 WHERE task_id=$1 AND current_revision=$9 AND state_version=$10 AND execution_epoch=$11`
+	if flowWriteAdvances(status, intent, cancel) {
+		// 推进类写入必须由当前持有根租约的执行者发起（US-24 §3.1.6 / FR-24-18）：
+		// 子任务行自己没有 flow_root 键，按**目标行自己的 root_task_id** 查父根；
+		// 过期比较用调用方传入的 now（$7），与 updated_at 同一读数。
+		// Advance-class writes require a live lease on the target row's own root.
+		query += ` AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.kind='flow_root' AND l.resource_id=flow_tasks.root_task_id AND l.released_at IS NULL AND l.expires_at>$7)`
+	}
+	changed, err := tx.ExecContext(ctx, query, old.ID, status, revision, epoch, intent, cancel, now, reason, old.Version.Revision, old.Version.StateVersion, old.Version.ExecutionEpoch)
 	if err != nil {
 		return err
 	}
@@ -373,6 +400,78 @@ func updateFlowHead(ctx context.Context, tx *sql.Tx, old flow.Task, status flow.
 	}
 	if n != 1 {
 		return core.ErrPreconditionFailed
+	}
+	return nil
+}
+
+// createRunForNode 在 Run 行的**同一事务**内校验「子 Run 创建」的父根条件
+// （US-24 §2.3.9 / P-05 / FR-24-37）：
+//
+//	① 父根（目标任务行的 root_task_id）上存在未释放且未过期的 flow_root 租约，
+//	   否则 ErrLeaseLost——没有执行权的 Worker 不得凭空创建子 Run；
+//	② attempt 归属的父根必须就是本次固定的 root（root_task_id 归属），
+//	   否则 ErrFlowAttemptStale——持根 A 的租约不得为根 B 下的 attempt 建 Run；
+//	③ attempt 未被取代：state ∈ prepared / running，execution_epoch 与
+//	   task_revision 都等于任务当前值，任务仍 running、未关闭 / 未取消、未过
+//	   deadline，否则 ErrFlowAttemptStale——旧代次 / 旧 revision 的 attempt 若
+//	   放行，Run 会白跑一轮后才在写回时被拒。
+//
+// 本函数只做**前置判定**并给出可区分的领域错误；真正的写入仍由 insertRunRow 的
+// 唯一 INSERT（带 EXISTS 兜底）完成，两段之间即使发生并发变化也只会落到
+// core.ErrPreconditionFailed，不会出现第二条写入路径。父根判定以
+// `FlowRunContext.Lease`（rootToken）为**唯一**归属证据：租约行先 `FOR UPDATE`
+// 再加 owner + ownership_epoch 条件，INSERT 的 EXISTS 重复同一谓词。
+// createRunForNode is the pre-check for child Run creation; the single INSERT remains
+// the only write path and re-checks the same owner/epoch predicate via EXISTS.
+func createRunForNode(ctx context.Context, ex sqlExecutor, f core.FlowRunContext, now int64) error {
+	if f.TaskID == "" || f.NodeAttemptID == "" || f.RootTaskID == "" {
+		return flow.ErrFlowAttemptStale
+	}
+	// ⓪ 凭证形状：没有根租约凭证就没有父根归属可证。声明根与凭证资源必须同一：
+	// 只填一半的 token 是装配缺陷，按失权处理（fail-closed），不得退化成
+	// "库里有活租约就放行"——那样旧持有者恰能在接管后凭残留租约建子 Run。
+	// The credential must be shaped like a flow-root token for this root.
+	if f.Lease.Kind != core.LeaseFlowRoot || f.Lease.OwnerWorkerID == "" || f.Lease.ResourceID != f.RootTaskID {
+		return core.ErrLeaseLost
+	}
+	// ① 租约行锁：先锁行，再校验 owner + ownership_epoch + 未过期。EXISTS 快照会
+	// 在"校验通过 → 另一 Worker 接管并递增代次 → 本事务继续"的窗口里放行旧持有者；
+	// 行锁把接管 UPDATE 与本判定串行化，旧代次只能看到 ErrLeaseLost（§2.3.6）。
+	// Lock the flow-root lease row first so a takeover either waits for this
+	// transaction or is observed here as a stale owner/epoch.
+	var epoch int64
+	err := ex.QueryRowContext(ctx, `SELECT ownership_epoch FROM execution_leases
+	  WHERE kind='flow_root' AND resource_id=$1 AND owner_worker_id=$2
+	    AND released_at IS NULL AND expires_at>$3
+	  FOR UPDATE`, f.Lease.ResourceID, f.Lease.OwnerWorkerID, now).Scan(&epoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.ErrLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if epoch != f.Lease.OwnershipEpoch {
+		return core.ErrLeaseLost
+	}
+	// ② 归属 / 代次 / revision：持根 A 的租约不得为根 B 下的 attempt 建 Run，
+	// 旧 revision 的 attempt 也不得建（Run 白跑一轮后才在写回被拒）。
+	var owned, fresh bool
+	err = ex.QueryRowContext(ctx, `SELECT
+		t.root_task_id=$3,
+		a.state IN ('prepared','running') AND a.execution_epoch=t.execution_epoch
+		  AND a.task_revision=t.current_revision AND t.current_revision=$5
+		  AND t.status='running' AND t.close_intent='none' AND NOT t.cancel_requested
+		  AND t.deadline>$4
+	  FROM flow_tasks t JOIN flow_node_attempts a ON a.task_id=t.task_id
+	 WHERE t.task_id=$1 AND a.node_attempt_id=$2`, f.TaskID, f.NodeAttemptID, f.RootTaskID, now, f.TaskRevision).Scan(&owned, &fresh)
+	if errors.Is(err, sql.ErrNoRows) {
+		return flow.ErrFlowAttemptStale
+	}
+	if err != nil {
+		return err
+	}
+	if !owned || !fresh {
+		return flow.ErrFlowAttemptStale
 	}
 	return nil
 }
@@ -398,8 +497,15 @@ func readFlowRoots(ctx context.Context, q Queryer, readyOnly bool, now int64, li
 	if limit < 1 || limit > 32 {
 		return nil, flow.ErrCapacity
 	}
+	// 就绪扫描必须排除"根上已有未释放且未过期 flow_root 租约"的行（US-24 §3.1.6 / R7
+	// 修正 17）：`released_at IS NULL` 与 `expires_at > now` **两个条件都要**——Release
+	// 会写 released_at 但保留未来的 expires_at，漏掉前半句会让刚交还的根被排除一整个 TTL，
+	// 把租约误当成"领取冷却时间"。OpenRoots（关闭扫描）不加这条：关闭类写入不要求
+	// 根租约，持有根租约的执行者也不能阻止关闭。
+	// Ready roots exclude rows whose flow_root lease is live (not released, not expired).
 	rows, err := q.QueryContext(ctx, `SELECT `+flowTaskColumns+flowTaskJoin+` WHERE t.parent_task_id IS NULL AND
-	 (($3 AND (t.status IN ('queued','running') OR t.status='blocked' AND t.reason='bounded_rework_required') AND NOT t.cancel_requested AND t.close_intent='none' AND t.next_eligible_at<=$1)
+	 (($3 AND (t.status IN ('queued','running') OR t.status='blocked' AND t.reason='bounded_rework_required') AND NOT t.cancel_requested AND t.close_intent='none' AND t.next_eligible_at<=$1
+	      AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.kind='flow_root' AND l.resource_id=t.task_id AND l.released_at IS NULL AND l.expires_at>$1))
 	 OR (NOT $3 AND t.status IN ('queued','running','blocked','cancelling') AND $1>=0))
 	 ORDER BY t.next_eligible_at,t.created_at,t.task_id LIMIT $2`, now, limit, readyOnly)
 	if err != nil {

@@ -41,6 +41,13 @@ func newProviderClients(cfg *cli.Config) (map[string]core.ProviderClient, map[st
 type providerCatalog struct {
 	clients map[string]core.ProviderClient
 	models  map[string]string
+	// built 是每个条目**本地实例**的构建证据（US-24 P-21 / FR-24-25）：版本引用取
+	// 构建该客户端时读到的发布版本，凭据 pin 取同一份定义算出的 pin。准入拿它与
+	// `published_version_id` 及本次准入的 pin 比对；零值（评测替身 / 轻装配）表示
+	// "未声明"，准入跳过本地实例比对。
+	// built is the per-entry build proof of the local client; the zero value means the
+	// assembly did not declare one.
+	built map[string]core.BuiltVersion
 }
 
 // with 返回一份**新**目录快照：复制两张映射表后只替换目标键，旧快照永不原地修改——已
@@ -48,22 +55,33 @@ type providerCatalog struct {
 // 的是既有键值对，键仍取自版本条目自身，不构成"遍历推断"。
 // with returns a fresh snapshot with one entry replaced; the old snapshot is never
 // mutated, so admitted runs keep their table while new admissions see the new one.
-func (c *providerCatalog) with(name string, client core.ProviderClient, model string) *providerCatalog {
+func (c *providerCatalog) with(name string, client core.ProviderClient, model string,
+	built core.BuiltVersion,
+) *providerCatalog {
 	clients := make(map[string]core.ProviderClient)
 	models := make(map[string]string)
+	builtVersions := make(map[string]core.BuiltVersion)
 	if c != nil {
 		clients = make(map[string]core.ProviderClient, len(c.clients)+1)
 		models = make(map[string]string, len(c.models)+1)
+		builtVersions = make(map[string]core.BuiltVersion, len(c.built)+1)
 		for k, v := range c.clients {
 			clients[k] = v
 		}
 		for k, v := range c.models {
 			models[k] = v
 		}
+		for k, v := range c.built {
+			builtVersions[k] = v
+		}
 	}
 	clients[name] = client
 	models[name] = model
-	return &providerCatalog{clients: clients, models: models}
+	// 换入的客户端必须连构建证据一起换：只换客户端会让旧证据继续描述新实例，
+	// 准入就会拿错版本比对（比零值更糟——那是"错误的证据"，不是"没有证据"）。
+	// The proof travels with the client it describes; a stale proof is worse than none.
+	builtVersions[name] = built
+	return &providerCatalog{clients: clients, models: models, built: builtVersions}
 }
 
 // newProviderCatalog 按配置数组的**有序**条目逐条建表，名字取条目自己的 name——不遍历
@@ -108,6 +126,17 @@ type managedCredentialSource interface {
 	ResolveModelCredential(ctx context.Context, connection core.ResourceVersionRef) (string, error)
 }
 
+// catalogCredentialSource 是**目录构建**需要的完整凭据面：取 Key 之外还要能算出该条目
+// 的凭据 pin（US-24 P-21）——本地实例的构建证据两段缺一不可。生产装配传同一个
+// `CredentialResolver`（它同时实现两者）；只实现解析的半张面**不得**用于构建目录，
+// 否则构建证据只能写半份，准入的凭据漂移判据会退化成"永远相等"。
+// catalogCredentialSource is the complete credential face of the catalog builder: the
+// key resolution plus the pin, so a build proof can never be half-recorded.
+type catalogCredentialSource interface {
+	managedCredentialSource
+	CredentialPinSource
+}
+
 // newProviderCatalogFromPublished 按**已发布** model_connection 版本构建显式映射表（约束 3 /
 // 约束 16 / 图 A ⑥）：键取自版本条目自身的 `name`，每个已发布资源恰一个条目，**不遍历
 // 映射表推断**、**不取"唯一那个"当默认**、未发布的名称绝不进表。生产装配只走这一条；
@@ -122,7 +151,7 @@ type managedCredentialSource interface {
 // model-connection versions only. With an override it never constructs a real client,
 // never issues a request, never reads the environment and never decrypts.
 func newProviderCatalogFromPublished(ctx context.Context, store *postgres.ResourceStore,
-	override core.ProviderClient, logger *slog.Logger, credentials managedCredentialSource,
+	override core.ProviderClient, logger *slog.Logger, credentials catalogCredentialSource,
 ) (*providerCatalog, error) {
 	return newProviderCatalogFromPublishedExcept(ctx, store, override, logger, "", credentials)
 }
@@ -138,7 +167,7 @@ func newProviderCatalogFromPublished(ctx context.Context, store *postgres.Resour
 // missing credential can never block its deletion.
 func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.ResourceStore,
 	override core.ProviderClient, logger *slog.Logger, skipResourceID string,
-	credentials managedCredentialSource,
+	credentials catalogCredentialSource,
 ) (*providerCatalog, error) {
 	pointers, err := store.ListPointers(ctx, core.ResourceModelConnection)
 	if err != nil {
@@ -147,6 +176,7 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 
 	clients := make(map[string]core.ProviderClient, len(pointers))
 	models := make(map[string]string, len(pointers))
+	built := make(map[string]core.BuiltVersion, len(pointers))
 	for _, pointer := range pointers {
 		if skipResourceID != "" && pointer.ResourceID == skipResourceID {
 			continue
@@ -160,8 +190,29 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 		}
 
 		if override != nil {
+			// 评测注入：替身不带版本语义，构建证据记**零值（未声明）**——凭空写一个
+			// 版本会让准入拿"错误的证据"比对，比没有证据更危险。
 			clients[entry.Name] = override
 		} else {
+			// 构建证据与客户端必须是**同一份**凭据材料（P-21）：取 Key 与取 pin 是两次
+			// 独立读，中间若有换代提交（托管凭据的轮换是一次独立事务，`current_version`
+			// 由此推进），客户端里装的是旧版本明文、证据却写新版本号——准入随后拿这份
+			// 假证据比对"相等"，重建被跳过，每一次调用都带旧 Key 而审计记新 Key。
+			// 版本号单调，所以在取 Key 前后各取一次 pin：两次相等 ⇔ 两次读之间没有换代
+			// 提交，证据的版本号就是装进客户端的那个版本。env 模式下 `credentialPinOf`
+			// 是纯计算（不读库），这次额外调用不产生任何 I/O 与行为变化。
+			// The pin is read before and after the key resolution: equal pins prove no
+			// rotation committed in between, so the recorded version describes the key
+			// actually installed in the client.
+			definition := resourceProviderDefinition{
+				Name:           entry.Name,
+				BaseURL:        entry.BaseURL,
+				CredentialMode: entry.CredentialMode,
+			}
+			pinBefore, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
+			if err != nil {
+				return nil, err
+			}
 			apiKey, err := catalogAPIKey(ctx, pointer, entry, version, credentials)
 			if err != nil {
 				return nil, err
@@ -174,7 +225,25 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 			if err != nil {
 				return nil, fmt.Errorf("模型连接 %s: %w", entry.Name, err)
 			}
+			// 构建证据与客户端同一份输入：版本行 + 同一份定义算出的凭据 pin（P-21）。
+			pin, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
+			if err != nil {
+				return nil, err
+			}
+			if pin != pinBefore {
+				// 取 Key 的窗口内发生了换代：客户端里的材料与证据版本不再对应。失败关闭
+				// （构建失败保留旧表），不记录一份"看起来对"的假证据。
+				// A rotation committed inside the key-read window: refuse to record a
+				// build proof whose version does not describe the installed key.
+				return nil, fmt.Errorf(
+					"%w: 模型连接 %s 的凭据在目录构建窗口内换代，拒绝记录与客户端材料不符的构建证据",
+					core.ErrCredentialUnavailable, entry.Name)
+			}
 			clients[entry.Name] = client
+			built[entry.Name] = core.BuiltVersion{
+				Resource:   versionRef(entry.Name, version),
+				Credential: pin,
+			}
 		}
 		models[entry.Name] = entry.DefaultModel
 	}
@@ -182,7 +251,48 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 	if logger != nil {
 		logger.Debug("模型连接目录：按已发布版本构建", "count", len(clients))
 	}
-	return &providerCatalog{clients: clients, models: models}, nil
+	return &providerCatalog{clients: clients, models: models, built: built}, nil
+}
+
+// builtVersionFrom 由一个已发布版本行与它的定义原文算出本地实例构建证据：版本引用取
+// 该行，凭据 pin 取同一份定义经 `credentialPinOf` 的结果（US-24 P-21）。三条换入路径
+// （启动重建 / 发布提交段 / 托管凭据采纳）都走这里，避免同一事实在两处算出两种形状。
+// builtVersionFrom derives the build proof from one published version row.
+func builtVersionFrom(ctx context.Context, name string, version core.ResourceVersion,
+	definitionYAML string, pins CredentialPinSource,
+) (core.BuiltVersion, error) {
+	definition, err := parseProviderDefinition(name, definitionYAML)
+	if err != nil {
+		return core.BuiltVersion{}, err
+	}
+	pin, err := credentialPinOf(ctx, name, version.ResourceUID, definition, pins)
+	if err != nil {
+		return core.BuiltVersion{}, err
+	}
+	return core.BuiltVersion{Resource: versionRef(name, version), Credential: pin}, nil
+}
+
+// builtProviderVersion 按**当前发布指针**读回构建证据：增量换入目录时调用，语义与
+// 启动重建逐字相同（读指针 → 版本行 → 同一份定义算 pin）。读不到 / 形状不符 → 返回
+// 错误，调用方按"未声明"处理并留 WARN——**不得**编一个版本出来。
+// builtProviderVersion reads the current published row back into a build proof.
+func builtProviderVersion(ctx context.Context, store *postgres.ResourceStore, name string,
+	pins CredentialPinSource,
+) (core.BuiltVersion, error) {
+	pointer, err := store.Pointer(ctx, core.ResourceModelConnection, name)
+	if err != nil {
+		return core.BuiltVersion{}, err
+	}
+	version, err := store.VersionByID(ctx, pointer.PublishedVersionID)
+	if err != nil {
+		return core.BuiltVersion{}, err
+	}
+	if version.Kind != core.ResourceModelConnection || version.ResourceID != name {
+		return core.BuiltVersion{}, fmt.Errorf(
+			"模型连接 %s 的发布版本 %d 归属不符（got %s/%s）",
+			name, version.ID, version.Kind, version.ResourceID)
+	}
+	return builtVersionFrom(ctx, name, version, version.DefinitionYAML, pins)
 }
 
 // catalogAPIKey 按条目声明的凭据模式取 Key：env 走精确 `${VAR}` 解析，managed 走
@@ -355,7 +465,7 @@ func (s *providerCatalogStore) Store(catalog *providerCatalog) {
 // 「构建失败保留旧表」的结构判据（`TestProviderCatalog_BuildFailureKeepsOld`）。
 // rebuild replaces the catalog only when the build succeeds.
 func (s *providerCatalogStore) rebuild(ctx context.Context, store *postgres.ResourceStore,
-	override core.ProviderClient, logger *slog.Logger, credentials managedCredentialSource,
+	override core.ProviderClient, logger *slog.Logger, credentials catalogCredentialSource,
 ) error {
 	catalog, err := newProviderCatalogFromPublished(ctx, store, override, logger, credentials)
 	if err != nil {
@@ -495,6 +605,14 @@ func (r *catalogProviderRouter) Pinned(name string) (*provider.ProviderService, 
 	// fail-closed，而不是静默退回 `purpose='chat'`——后者会让抽取费用记进对话审计。
 	// The pinned view must carry the extraction pre-write surface; a missing surface fails
 	// the extraction closed instead of quietly charging it to the chat audit.
+	//
+	// 构建证据随视图一起固定（US-24 P-21）：运行时拿到的就是这个视图，准入要证明的
+	// 也正是"这个视图背后的实例是哪一版"。目录里没有证据（评测替身）→ 零值 → 跳过。
+	// The build proof is pinned with the view so admission can prove which instance the
+	// runtime actually holds.
+	if built, ok := snapshot.built[name]; ok {
+		service.WithBuiltVersion(built)
+	}
 	return service.WithMemoryExtractStore(r.memoryStore), true
 }
 

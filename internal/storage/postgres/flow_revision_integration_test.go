@@ -17,7 +17,7 @@ func TestFlow_RevisionClosedProposalAndImmutableLimits(t *testing.T) {
 	service.Runner = &flowAdvanceRunner{store: s}
 	task, err := service.Start(t.Context(), startFlowRequest(def, "revise"))
 	require.NoError(t, err)
-	require.NoError(t, s.ParkTask(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, task.Version, "verification_missing"))
+	parkFlowWithLease(t, s, core.LocalAdminCLIPrincipal(), task.ID, task.Version, "verification_missing")
 	task, err = s.ReadForWorker(t.Context(), task.ID)
 	require.NoError(t, err)
 	req := flow.RevisionRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, OperationID: "revise-1", Expected: task.Version}
@@ -55,7 +55,7 @@ func TestFlow_RevisionClosedProposalAndImmutableLimits(t *testing.T) {
 	require.JSONEq(t, `{"answer":"input"}`, oldInput)
 	// Two revisions are a task ceiling, not a fresh allowance per parked epoch.
 	for i := range 2 {
-		require.NoError(t, s.ParkTask(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, revised.Version, "verification_missing"))
+		parkFlowWithLease(t, s, core.LocalAdminCLIPrincipal(), task.ID, revised.Version, "verification_missing")
 		parked, err := s.ReadForWorker(t.Context(), task.ID)
 		require.NoError(t, err)
 		req.Expected = parked.Version
@@ -77,7 +77,7 @@ func TestFlow_RevisionCheckpointFaultIsAtomic(t *testing.T) {
 	service.Runner = &flowAdvanceRunner{store: s}
 	task, err := service.Start(t.Context(), startFlowRequest(def, "revision-fault"))
 	require.NoError(t, err)
-	require.NoError(t, s.ParkTask(t.Context(), core.LocalAdminCLIPrincipal(), task.ID, task.Version, "verification_missing"))
+	parkFlowWithLease(t, s, core.LocalAdminCLIPrincipal(), task.ID, task.Version, "verification_missing")
 	task, err = s.ReadForWorker(t.Context(), task.ID)
 	require.NoError(t, err)
 	req := flow.RevisionRequest{Principal: core.LocalAdminCLIPrincipal(), TaskID: task.ID, Expected: task.Version, OperationID: "revise-fault", Proposal: json.RawMessage(`{"reason":"retry","node_id":"draft"}`)}

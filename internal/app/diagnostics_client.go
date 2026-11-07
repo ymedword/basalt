@@ -72,6 +72,17 @@ func newDiagnosticProviderClient(inner core.ProviderClient, recorder diagnosticR
 	return &diagnosticProviderClient{inner: inner, recorder: recorder}
 }
 
+// BuiltVersion 原样转发内层的构建证据（US-24 P-21）：本层只观测、不介入，**不得**
+// 在装饰链上把证据截掉——截掉等于告诉准入"这个实例没有版本"，本地实例版本证明失效。
+// BuiltVersion forwards the inner proof untouched; the decorator observes only.
+func (c *diagnosticProviderClient) BuiltVersion() core.BuiltVersion {
+	return builtVersionOf(c.inner)
+}
+
+// 编译期断言：诊断装饰器同样保留构建证据的自报能力。
+// Compile-time assertion that the diagnostics decorator keeps the build proof.
+var _ core.BuiltVersioned = (*diagnosticProviderClient)(nil)
+
 // Chat 转调内层并记一条 `llm_call` 事件（成败都记）：关联锚点是 `run_id`（Run 级事件
 // 的主锚点），`step_id` 与 `seq` 都取轮号（同一 Run 内单调，与装配 / 配额键同一口径），
 // `attempt_id` 固定 `a1`，`actor` 留空（本层不知道是调度、恢复还是调用方触发——归属由

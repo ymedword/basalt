@@ -70,7 +70,7 @@ paths:
   /flow-tasks/{id}/artifacts: {"get":{"summary":"Read owned artifact versions; revoked sources redact content","description":"Scope: flows:read. Bounded Flow protocol; unknown effects are never replayed.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowArtifactPage"}}}]}}},"headers":{}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"}},"security":[{"callerKey":[]},{"bearerAuth":[]},{"localTrust":[]}],"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"cursor","in":"query","required":false,"schema":{"type":"string"}},{"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":100,"default":50}}]}}
   /flow-tasks/{id}/verifications: {"get":{"summary":"Read owned exact version verification facts","description":"Scope: flows:read. Bounded Flow protocol; unknown effects are never replayed.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowVerificationPage"}}}]}}},"headers":{}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"}},"security":[{"callerKey":[]},{"bearerAuth":[]},{"localTrust":[]}],"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"cursor","in":"query","required":false,"schema":{"type":"string"}},{"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":100,"default":50}}]}}
   /flow-tasks/{id}/cancel: {"post":{"summary":"Persist cancellation, then wait for real join","description":"Scope: flows:write. Bounded Flow protocol; unknown effects are never replayed.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowTaskView"}}}]}}},"headers":{"ETag":{"description":"Strong task identity plus complete task_revision/state_version/execution_epoch; required by controls.","schema":{"type":"string"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"},"202":{"description":"Durably accepted or stopping; not proof of task completion","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowTaskView"}}}]}}},"headers":{"ETag":{"description":"Strong task identity plus complete task_revision/state_version/execution_epoch; required by controls.","schema":{"type":"string"}}}}},"security":[{"callerKey":[]},{"bearerAuth":[]},{"localTrust":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/FlowControlRequest"}}}},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"If-Match","in":"header","required":true,"schema":{"type":"string"}}]}}
-  /flow-tasks/{id}/resume: {"post":{"summary":"Reconcile original key and evidence; never replay unknown","description":"Scope: flows:write. Bounded Flow protocol; unknown effects are never replayed.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowTaskView"}}}]}}},"headers":{"ETag":{"description":"Strong task identity plus complete task_revision/state_version/execution_epoch; required by controls.","schema":{"type":"string"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"}},"security":[{"callerKey":[]},{"bearerAuth":[]},{"localTrust":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/FlowControlRequest"}}}},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"If-Match","in":"header","required":true,"schema":{"type":"string"}}]}}
+  /flow-tasks/{id}/resume: {"post":{"summary":"Reconcile original key and evidence; never replay unknown","description":"Scope: flows:write. Bounded Flow protocol; unknown effects are never replayed. When the root must be advanced while another executor holds the flow_root lease, the request yields 409 FLOW_ROOT_BUSY: no retry, no unleased write, zero task mutation.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowTaskView"}}}]}}},"headers":{"ETag":{"description":"Strong task identity plus complete task_revision/state_version/execution_epoch; required by controls.","schema":{"type":"string"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT / FLOW_ROOT_BUSY"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"}},"security":[{"callerKey":[]},{"bearerAuth":[]},{"localTrust":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/FlowControlRequest"}}}},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"If-Match","in":"header","required":true,"schema":{"type":"string"}}]}}
   /admin/flows: {"get":{"summary":"Administrative definition metadata including retired versions","description":"Admin only. Bounded Flow protocol; unknown effects are never replayed.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowDefinitionPage"}}}]}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"FLOW_STATE_CONFLICT / FLOW_ACTION_UNKNOWN / FLOW_CLOSED / FLOW_CHECKPOINT_UNSUPPORTED / FLOW_IDEMPOTENCY_CONFLICT / FLOW_DEADLINE_EXPIRED / FLOW_DEFINITION_RETIRED / FLOW_DEFINITION_NOT_CURRENT"},"412":{"description":"PRECONDITION_FAILED; missing or stale full task ETag, zero mutation"},"429":{"$ref":"#/components/responses/IngressRateLimited"},"500":{"$ref":"#/components/responses/InternalError"}},"parameters":[{"name":"cursor","in":"query","required":false,"schema":{"type":"string"}},{"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":100,"default":50}}]}}
   /admin/flow-agents: {"get":{"summary":"Current registered Agent references for workflow authoring","description":"Admin only. Read-only authoring metadata; never invokes a model, tool or MCP connection.","parameters":[{"name":"cursor","in":"query","schema":{"type":"string","maxLength":128}},{"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":100,"default":50}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowAgentPage"}}}]}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"500":{"$ref":"#/components/responses/InternalError"}}}}
   /admin/flows/{uid}/versions/{version}: {"get":{"summary":"Read exact immutable workflow author definition","description":"Admin only. Read-only authoring metadata; never invokes a model, tool or MCP connection.","parameters":[{"name":"uid","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"allOf":[{"$ref":"#/components/schemas/Envelope"},{"type":"object","properties":{"data":{"$ref":"#/components/schemas/FlowAuthoringVersion"}}}]}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"500":{"$ref":"#/components/responses/InternalError"}}}}
@@ -4858,7 +4858,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     TooManyRuns:
-      description: 实例级并发运行超限
+      description: 本 Worker 实例的并发运行超限（`server.max_concurrent_runs` 按实例计，不是集群总量；业务码 `TOO_MANY_RUNS`）
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -4875,7 +4875,14 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     ServiceUnavailable:
-      description: 托管凭据不可用（主密钥缺失 / 权限不符 / 格式错误 / key_id 不匹配 / 解密失败；业务码 `CREDENTIAL_UNAVAILABLE`）
+      description: |
+        前置条件当前不可用（503，fail-closed）。三种业务码：
+
+        - `CREDENTIAL_UNAVAILABLE`——托管凭据不可用（主密钥缺失 / 权限不符 / 格式错误 / key_id 不匹配 / 解密失败）
+        - `ASSET_UNAVAILABLE`——`agent_bundle` 发布指针缺失 / 已软删除，或本地内容寻址目录缺失 / 不可读
+        - `RESOURCE_VERSION_MISMATCH`——Provider / MCP 的本地实例版本证明不成立（含 MCP 尚无已应用版本），且按同一目标版本重建-换入-再比后仍不符（同一业务码的 409 形态见 `Conflict`）
+
+        这三种都只拒绝**新 Run**，不静默换版本、不以最新为准、不自动发布本地内容为真相。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -4906,7 +4913,16 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
     Conflict:
-      description: 状态冲突（同名存在 / 生命周期 generation 或 expected_state 不匹配 / Agent 忙碌，业务码 `CONFLICT`、`AGENT_BUSY` 等）
+      description: |
+        状态冲突（409）。除各端点自有的业务码外，US-24 的多 Worker 准入 / 生命周期判定还给出：
+
+        - `ASSET_VERSION_MISMATCH`——本地资产包的目录名 / 逐文件哈希 / `bundle_hash` 与共享发布记录不一致；点名"重新安装"入口，不静默换版本
+        - `AGENT_LIFECYCLE_STALE`——本地生命周期代次**低于**共享索引（另一个 Worker 已推进）；本地不得把旧代次写回索引
+        - `AGENT_LIFECYCLE_MISMATCH`——同代次内容不一致、索引行缺失 / 非 `active`，或准入未携带生命周期期望值
+        - `RESOURCE_VERSION_MISMATCH`——准入事务内复查发现 Provider 的 `published_version_id` / MCP 的 `applied_version_id` / 凭据 pin 在预检之后被推进或删除；这一笔固定的是过期事实，重试即可，不静默换版本（同一业务码的 503 形态见 `ServiceUnavailable`）
+        - `FLOW_ROOT_BUSY`——管理面 `resume` / `revise` 需要把根推进时，`flow_root` 租约已被执行者持有；不重试、不降级成无租约写入
+
+        既有取值（`CONFLICT`、`AGENT_BUSY`、`SESSION_BUSY` 等）语义不变。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -6485,6 +6501,9 @@ components:
         tool_calls: { type: integer }
         config_hash: { type: string, description: 合成输入哈希（含义不变） }
         manifest_hash: { type: string, description: 新增资源清单哈希；历史 Run 为空，查看时标 legacy_unrecorded }
+        worker_instance_id: { type: string, description: 'US-24 只读诊断：该 Run 租约的负责人；租约交还后**保留最后一个负责人**，不表示当前归属（当前归属看租约是否未释放）；历史 Run 无租约行时为空' }
+        ownership_epoch: { type: integer, description: 'US-24 只读诊断：该 Run 租约的归属代次；租约交还后保留最后一次代次；历史 Run 为 0' }
+        asset_bundle_hash: { type: string, description: 'US-24 只读诊断：准入固定的内容寻址资产包哈希（来自 v3 资源清单）；列表视图与旧清单为空' }
         started_at: { type: string, format: date-time }
         finished_at: { oneOf: [{ type: string, format: date-time }, { const: "" }], description: "未结束（running 等非终态）时为空串；结束时为 RFC3339 date-time" }
 
@@ -7353,6 +7372,21 @@ components:
             model_connections: { type: integer }
             mcp_servers: { type: integer }
             skills: { type: integer }
+        workers:
+          type: object
+          description: 'US-24 只读诊断：登记过的 Worker 实例与全库仍有效的执行权。数据库不可读时整组省略，不补 0。active_leases 统计全部负责人（含无节点行的回填租约），不等于 nodes 各行之和'
+          properties:
+            active_leases: { type: integer }
+            nodes:
+              type: array
+              items:
+                type: object
+                properties:
+                  instance: { type: string, description: 进程实例标识（身份以此为准，Name 可重复） }
+                  name: { type: string }
+                  started_at: { type: string, format: date-time }
+                  heartbeat_at: { type: string, format: date-time, description: 仅作诊断，不用作死亡判定 }
+                  active_leases: { type: integer }
         database:
           type: object
           properties:
@@ -8548,7 +8582,8 @@ components:
         - llm_call_failed
         - concurrency_limited
         - chunk_invalidated
-      description: 稳定枚举；面向人的文案由 UI 映射，**不得**把自由文本写进 `reason_code`。
+        - recovery_unknown
+      description: 稳定枚举；面向人的文案由 UI 映射，**不得**把自由文本写进 `reason_code`。`recovery_unknown` 表示属主失联后被接管、结果不可知且**不会重放**的副作用（`actor=recovery`，`audit_ref` 指回原审计行），它不是一次失败的调用。
 
     DiagnosticEventView:
       type: object

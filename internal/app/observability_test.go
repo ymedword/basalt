@@ -164,7 +164,7 @@ func TestObservability_NoBusinessStateInContext(t *testing.T) {
 
 func TestObservability_DiagnosticWriteFailureDoesNotFailRun(t *testing.T) {
 	o, h := newObservationFixture(t, cli.DefaultObservabilityConfig())
-	recorder, _, err := newDiagnosticsPortsWithMetrics(cli.DiagnosticsConfig{}, h.db, time.Now, slog.New(slog.DiscardHandler), o.Metrics)
+	recorder, _, err := newDiagnosticsPortsWithMetrics(cli.DiagnosticsConfig{}, h.db, core.WorkerIdentity{}, time.Now, slog.New(slog.DiscardHandler), o.Metrics)
 	require.NoError(t, err)
 	_, err = h.db.ExecContext(t.Context(), `CREATE FUNCTION obs_reject_runtime_diagnostic() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic diagnostic failure'; END $$;
 		CREATE TRIGGER obs_reject_runtime_diagnostic BEFORE INSERT ON diagnostic_events FOR EACH ROW EXECUTE FUNCTION obs_reject_runtime_diagnostic()`)
@@ -257,7 +257,7 @@ func TestObservability_ConfigurationFrozen(t *testing.T) {
 func TestObservability_ClockMatchesWindow(t *testing.T) {
 	db := openAuthorDB(t)
 	at := time.UnixMilli(1700000000000).UTC()
-	require.NoError(t, postgres.NewRunStore(db).StartRun(t.Context(), core.RunRecord{RunID: "clock-window", Agent: "synthetic", Channel: "cli", StartedAt: at.Add(-time.Minute), Principal: core.LocalAdminCLIPrincipal()}, core.RunResourceManifest{}))
+	require.NoError(t, startRunTest(postgres.NewRunStore(db), t.Context(), core.RunRecord{RunID: "clock-window", Agent: "synthetic", Channel: "cli", StartedAt: at.Add(-time.Minute), Principal: core.LocalAdminCLIPrincipal()}, core.RunResourceManifest{}))
 	o, err := NewObservability(t.Context(), cli.DefaultObservabilityConfig(), Deps{Store: postgres.NewObservabilityStore(db), Clock: func() time.Time { return at }, Logger: slog.New(slog.DiscardHandler)})
 	require.NoError(t, err)
 	defer o.Close()
