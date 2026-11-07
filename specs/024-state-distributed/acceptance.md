@@ -544,4 +544,4 @@ CI run 42409706693（提交 `9c01b2e`）step 9「Current cumulative stage」在 
 | CI step 9 同款 `015-backfill` 正则（11 个 `TestBackfill_*`） | RC=0，115 pass / 0 fail，包 130.554s；`.loop/reviews/us24-repair-20261107/backfill-20261108.json` |
 | 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`，七目标全绿：format 干净 / vet（`-tags=integration`）+ staticcheck + gosec + govulncheck 通过 / `test` 与 `test-integration` 全包 `ok` 零 `FAIL` / `check-coverage: 全部包达标`（postgres 72.18%）/ `CGO_ENABLED=0` 构建成功；日志 `.loop/reviews/us24-repair-20261107/make-check-20261108.log` |
 
-**未验证**：远端 CI 对修复提交的读数在推送后回填（不把运行中写成通过）；完整累计 stage 的远端执行以 CI 为准，本地只复跑了失败的 check 与 scheduler 套件。
+**远端复验（2026-11-08 回填）**：修复提交 `9d34273` 推送 main 后触发 CI run [42418694700](https://github.com/ymedword/basalt/actions/runs/42418694700)，`conclusion=success`，7 个 job 全绿：`test`（fmt / lint / sec / test / test-integration / cover）、`postgres`（`-tags=integration`）、`flow`（US19 完整阶段 + 真实进程，含累计 current stage 与 `015-backfill`）、`build`（`CGO_ENABLED=0` 四平台）、`container`（us18-linux 真实镜像 + Compose）、`console`、`website`。原「未验证：远端 CI 读数」项就此关闭；本地定向复跑与远端读数分开记录，互为佐证而非替代。
