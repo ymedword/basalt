@@ -328,7 +328,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	// ④ 对账：逐已注册 Agent 单事务提交；未注册项不遍历（坏文件不写库）。
 	// 本阶段**只提交**，不注册任何句柄——句柄已经不存在，到期扫描直接读库。
-	for _, agent := range s.registeredAgentNames() {
+	for _, agent := range s.registeredAgentNamesLocked() {
 		fresh, _, err := s.commitAgentLocked(ctx, agent, s.definitions[agent], rows)
 		if err != nil {
 			s.logger.Error("启动对账失败", "agent", agent, "error", err)
@@ -892,7 +892,10 @@ func (s *Scheduler) dueTasks(ctx context.Context) ([]DueTask, error) {
 	if !ok {
 		return s.store.ListDispatchable(ctx, s.dispatchBatch)
 	}
-	agents := s.registeredAgentNames()
+	// 扫描不持 stateMu：先取注册集合快照，再在快照上排序——直接遍历 s.registry 会与
+	// SetRegistered 的并发增删构成数据竞争（归档屏障在派发循环运行时就是这条路径）。
+	// The scan holds no lock: copy the registry first, then sort the copy.
+	agents := sortedRegisteredNames(s.registeredSnapshot())
 	if len(agents) == 0 {
 		return nil, nil
 	}
@@ -1219,7 +1222,12 @@ func (s *Scheduler) RunNow(ctx context.Context, taskID string) (RunRequest, RunR
 // retired 行与构造期未注册 Agent 的任务一律隐藏（§3.1.2）。
 // visible is the shared visibility rule: retired rows and unregistered agents are hidden.
 func (s *Scheduler) visible(row TaskRecord) bool {
-	return row.RetiredAt.IsZero() && s.registry[row.Agent]
+	// 与管理面的 SetRegistered 并发时必须持锁读注册集合（同一张 map 的增删）。
+	// The registry is mutated by SetRegistered, so the read must take the lock.
+	s.stateMu.RLock()
+	registered := s.registry[row.Agent]
+	s.stateMu.RUnlock()
+	return row.RetiredAt.IsZero() && registered
 }
 
 // visibleRow 在同一次读库结果里定位可见任务；不可见返回 false。
@@ -1289,11 +1297,22 @@ func (s *Scheduler) runAttrs(task TaskRecord, runID string, trigger Trigger) []a
 	}
 }
 
-// registeredAgentNames 返回已注册 Agent 名（排序保证对账顺序稳定）。
-// registeredAgentNames returns the registered agent names in sorted order.
-func (s *Scheduler) registeredAgentNames() []string {
-	names := make([]string, 0, len(s.registry))
-	for name, ok := range s.registry {
+// registeredAgentNamesLocked 返回已注册 Agent 名（排序保证对账顺序稳定）。
+// **调用方必须持有 stateMu**（Start 在写锁内调用）；不持锁的路径一律走
+// registeredSnapshot + sortedRegisteredNames，直接遍历 s.registry 会与 SetRegistered
+// 的并发增删构成数据竞争。
+// registeredAgentNamesLocked returns the registered agent names in sorted order; the
+// caller must hold stateMu.
+func (s *Scheduler) registeredAgentNamesLocked() []string {
+	return sortedRegisteredNames(s.registry)
+}
+
+// sortedRegisteredNames 从注册集合（或其快照）提取已注册名字并排序，供持锁路径与
+// 快照路径共用。
+// sortedRegisteredNames extracts the registered names from a registry or its snapshot.
+func sortedRegisteredNames(registry map[string]bool) []string {
+	names := make([]string, 0, len(registry))
+	for name, ok := range registry {
 		if ok {
 			names = append(names, name)
 		}

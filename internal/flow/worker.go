@@ -388,7 +388,7 @@ func workerQueryError(ctx context.Context, err error) error {
 // `errors.Join(rows.Err(), rows.Close())` 即便只有一个非空子错误也会产生带
 // `Unwrap() []error` 的 join 节点，单链 `errors.Unwrap` 到它就停住；若只按单链
 // 判断，取消期间一句普通查询的 context.Canceled 会被误报为数据库故障，把正常
-// 停机变成 rt.Close() 失败（CI `-race` 的 010-race 即此症状）。携带任何真实
+// 停机变成 rt.Close() 失败（CI `-race` 的 010-race-distributed 即此症状）。携带任何真实
 // 失败叶子（例如数据库错误、drain 超时）的 join 一律保留，交给调用方报告。
 // CancellationOnly reports whether err consists solely of the cancellation sentinel.
 // It descends through both single-chain wrappers and errors.Join trees because a

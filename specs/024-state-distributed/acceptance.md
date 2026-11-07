@@ -465,3 +465,48 @@ git diff 138382f -- go.mod go.sum   # 期望空输出
 - **指纹**：两轮 stage 均为 `75ca47f3a9f469de281d22d36bb75f67277ddd427f97d6fcc56600f5d2d302bd`（2176 个文件），`base_commit=138382f`、`dirty=true`。修复前 2026-11-07 报告是 `845002664a36…`，本轮改了源码，属「必须重跑」而不是「仅文档回填」。
 - **回填后差异**：本节、§1.4 与文件头状态段的回填只改 `specs/024-state-distributed/acceptance.md`（`run-state.md` 不计入源码指纹）；回填完成后用与 `scripts/acceptance/fingerprint.go` 同一算法的取证工具复算指纹并输出逐文件 SHA-256 清单，与冻结时清单逐个 diff，差异必须只落在 `acceptance.md` 一行，结果与命令记录在 run-state §5。
 - **送审口径**：机器侧以该轮为送审依据；M-12 仍为未验证，真实双宿主 / S3 / DB HA / 真实模型与 webhook 仍归 US-25 / US-17（§6.3、run-state §4），不因本轮全绿翻转。
+
+### 8.6 收口后 CI 修复：累计 stage 的 superseded_checks（2026-11-08）
+
+合入 main 后的 CI（run 42399360393，job `test` / 128483577470）在 step「Lint stage definitions (read-only existence precheck)」判红：`harness/stages/current.json` 的四个历史 check 仍按名索取被本 US 批准范围改写掉的测试，共 28 行 ERROR（21 + 3 + 1 + 3），其余 job 全绿。`make check` 不含 `--lint-stages`，因此七目标全绿不能发现这类失配；覆盖它的是 CI 的 stage lint step 与手工 `--lint-stages`（同一个只读检查）。
+
+按 [开发操作](../../docs/DevelopmentLoop.md) §9.3 的既有机制处理：历史 stage 文件零改写（仍按 SHA-256 冻结），失配以 `superseded_checks` 显式登记，替代 check 的 `required_tests` 由 `scripts/acceptance/stages_test.go` 的 `pinnedRequiredTests` 逐字钉住，argv / 超时由 `pinnedStageChecks` 钉住。逐条承接如下（**只更名等价项或改 Approved 删除行为的承接断言，无一项是删断言转绿**）：
+
+| 历史 check | 现行 check | 失配来源（模块卡依据） | 承接方式 |
+| --- | --- | --- | --- |
+| `010-core-scheduler`（46 项） | `010-core-scheduler-distributed`（47 项） | `Fire_*` → `Dispatch_*` 更名；`StartRecoversExecutions` 由 FR-24-02「启动不得全局扫描」删除；`StartRegistersEnabledOnly` / `SetEnabled_TogglesRegistration` 由注册模型改为 `SetRegistered`；`Start_TaskAddFailureStopsEngine` 随进程内 cron 生命周期移除；`OldCallbackAfterReconcile_NoRun` 随 cron 回调移除；`ReconcileAgent_AddFailureReturnsError` 改为 `ApplyIsAllOrNothing` 同一判据 | `Fire_*` → `Dispatch_*` 及其余两处同义改名（`StartReconcilesDefinitions` → `Start_ReconcilesDefinitions`、`Start_SecondAgentApplyFails_NoHandles` → `Start_SecondAgentApplyFails_NoScanStart`）逐条承接；删除项换为负向断言 `Start_DoesNotRecoverDeliveriesGlobally`、`Dispatch_SkipsRetiredAndUnregistered`、`SetEnabled_ControlsDispatch`、`Start_ApplyFailureIsNotLatched`、`AfterReconcile_NextDispatchUsesLatestDefinition`、`ReconcileAgent_ApplyIsAllOrNothing`；另补 `Dispatch_MissedGraceRecordsOneSkip`（FR-24-12），净增 1 项 |
+| `010-cron-adapter`（9 项） | `010-cron-adapter-parser`（7 项） | `TestEngine_AddAndStop` / `TestEngine_StopWaitsForJobs` 随 cron 生命周期移除（适配器收敛为纯解析器，模块卡 §3）；`ParsesSixFieldWithCRONTZ` 配套更名 `NextParsesSixFieldWithCRONTZ` | 保留 7 项，其中 6 项逐字同名、1 项按更名承接 |
+| `010-storage-tasks`（15 项） | `010-storage-tasks-distributed`（15 项） | `TestTaskStore_RecoverStartedExecutions` 由 FR-24-02 删除 | 换为负向断言 `TestTaskStore_NoGlobalRecoveryScan`，其余 14 项逐字保留 |
+| `010-race`（14 项） | `010-race-distributed`（14 项） | 三个更名项同上 | `Fire_LockMissRecordsSkipped` → `Dispatch_BusyClaimRecordsSkipped`、`Fire_ConcurrentDistinctTasks` → `Dispatch_ConcurrentDistinctTasks`、`OldCallbackAfterReconcile_NoRun` → `AfterReconcile_NextDispatchUsesLatestDefinition`，其余 11 项逐字保留 |
+
+- **判据面变更登记**：这是判据面变更（累计 stage 的 check ID 改名与 required_tests 换项），来源是已审模块卡 §3「`scheduler_test.go`（改写）」与 FR-24-02 / FR-24-17 的范围改写，不是为转绿放水。净变化：46→47（更名项 1:1 承接，删除项换成负向 / 新语义断言，另补 1 项 FR-24-12 用例）、9→7（2 项随 cron 生命周期移除，无同名承接；触发时间线改由 `us24-base` 的调度与回收用例覆盖）、15→15（1 项换成负向断言）、14→14（3 项更名承接）。四个替代项全部纳入 `pinnedStageChecks` 的 argv / 超时 / 层级钉住。
+- **验证读数**：`go test ./scripts/acceptance -run '^TestStages_'` 通过；WSL 上 `sh scripts/check-acceptance.sh --lint-stages --stage harness/stages/current.json` → `stage lint: ok`，`ERROR` 零行（`current.json` 是本轮唯一 fail stage，其全部 `required_tests` 均存在）。同一条命令共打印 **509 行 WARN**、分布在 8 个历史 stage 文件（`us12` 309 / `us11` 72 / `us10` 53 / `us14-release` 31 / `us14-14d` 27 / `us9-web` 8 / `us16a` 6 / `us8-notify-r1` 3）：lint 会遍历 `harness/stages/*.json`，对**非 fail stage** 的每个缺失项只告警；历史 stage 按冻结口径不随本 US 改写，因此其中 `us10-scheduler.json` 的 28 行正是本轮改名 / 删除的测试名，其余 WARN 属历史 drift（含带 `//go:build integration` 的测试在无 `-tags=integration` 的旧 check 下不可列）。WARN 不影响退出码，但**不得**据此宣称「只有个别历史 stage 漂移」。
+- **本地门禁**：`dev-env/scripts/with-postgres.sh make check`（WSL）`MAKE_CHECK2_EXIT=0`，七目标全绿（`check-format` 干净；`vet -tags=integration` / `staticcheck` / `gosec` / `govulncheck` 通过；`test` / `test-integration` 零 `FAIL`；`check-coverage: 全部包达标`；`CGO_ENABLED=0` 构建成功），详见 run-state §5。
+- **未验证**：完整累计 stage 的执行与远端 CI 由推送后那轮 CI 复验，读数回填到 run-state §5。
+
+### 8.7 收口后本地 -race 复验发现的产品竞态：调度注册集合的读未持锁（2026-11-08）
+
+为复验 §8.6 的 `010-race-distributed`，本地按该 check 的 argv 在 WSL + PostgreSQL 上跑 `go test -race -tags=integration`（七个包）。`internal/app` 判红（430.380s），三个用例报 `race detected during execution of test`：`TestAgentArchive_RollbackRestoresRetirement`、`TestAgentRestore_DoesNotAutoEnableSchedules`、`TestRun_ServeStartsConfigWatcher`。
+
+竞态对（同一张 `s.registry` map）：
+
+```text
+Read  (dispatch loop)  Scheduler.registeredAgentNames()   scheduler.go:1295
+                       ← dueTasks() ← dispatchOnce() ← dispatchLoop() ← Start.gowrap2
+Write (admin archive)  Scheduler.SetRegistered()          scheduler.go:1423 (delete)
+                       ← scheduleEditorAdapter.SetRegistered ← TestAgentRestore_…
+```
+
+根因：`SetRegistered` 按 `stateMu` 写锁增删注册集合，而本 US 新增的到期扫描在 `dueTasks` 里**不持锁**直接遍历同一张 map；管理读面的 `visible()`（`List` / `Executions` / `SetEnabled` / `RunNow` 共用）同样不持锁读该 map，属同一类缺陷。这不是测试夹具泄漏——归档屏障在派发循环运行时正是生产路径（FR-24-41 准入屏障 + 运行期 `SetRegistered(false)`）。
+
+- **为什么此前没暴露**：`make check` 的 `test` 目标虽有 `-race`，但不带 `-tags=integration`，归档 / 恢复类集成用例不在编译集；唯一覆盖组合是 stage check `010-race-distributed`（`-race` + `-tags=integration` + 七个包），而它在 §8.6 那轮 CI 中因 lint 先红未被执行。
+- **修复**（`internal/core/scheduler.go`，仅加锁与快照，无行为改写）：
+  - `dueTasks` 改用既有的 `registeredSnapshot()`（`stateMu.RLock` 内复制）再对新引入的 `sortedRegisteredNames` 排序，扫描路径不再触碰共享 map；
+  - 原 `registeredAgentNames` 更名 `registeredAgentNamesLocked`，注释写明「调用方必须持有 `stateMu`」，唯一调用方 `Start` 在写锁内（`scheduler.go:310`）；
+  - `visible()` 读 `s.registry` 前取 `stateMu.RLock()`（其四个调用方均不持锁，无重入死锁）。
+- **判据面判定**：只改产品代码，未新增 / 删除 / 放宽任何断言、未提高超时、未加抑制注释；竞态检测器本身就是判据，用例在修复前红、修复后绿即为证据。
+- **验证读数**：
+  - 修复前：上述三例 `— FAIL` + `race detected`（本轮 WSL `-race -tags=integration`，`internal/app` FAIL 430.380s）；
+  - 修复后定向复跑：`go test -race -tags=integration ./internal/app -run 'TestAgentArchive_RollbackRestoresRetirement|TestAgentRestore_DoesNotAutoEnableSchedules|TestRun_ServeStartsConfigWatcher'` → `ok … 5.226s`；
+  - 修复后全量七包：`core 4.071s / cron 1.018s / storage 43.498s / workspace 17.414s / tool 20.551s / web 18.682s / app 387.446s`，全部 `ok`，日志内 `WARNING: DATA RACE` 零行，`RACE2_EXIT=0`。
+- **未验证**：远端 CI 对该修复的复验读数在推送后回填 run-state §5；竞态检测依赖调度交错，本地单轮通过不构成「永不发生」的证明，但修复把所有访问点都置于同一把锁下，属结构性消除而非概率降低。

@@ -546,7 +546,7 @@ func TestApplySchedule_AtomicOnRenameFailure(t *testing.T) {
 
 // TestApplySchedule_ConcurrentSets 验证 writeMu 串行化「读-改-写」全过程：
 // 并发 set 不得互相覆盖，最终文件仍是合法 frontmatter 且包含全部任务。
-// 逆改点：去掉锁 / 锁范围只覆盖写 → 丢更新，任务数断言红（-race 归 010-race）。
+// 逆改点：去掉锁 / 锁范围只覆盖写 → 丢更新，任务数断言红（-race 归 010-race-distributed）。
 func TestApplySchedule_ConcurrentSets(t *testing.T) {
 	root := t.TempDir()
 	writeScheduleAgent(t, root, "tester", baseScheduleFrontmatter("tester", oneDailyReport), "正文")

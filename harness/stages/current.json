@@ -404,7 +404,7 @@
       ]
     },
     {
-      "id": "010-core-scheduler",
+      "id": "010-core-scheduler-distributed",
       "args": [
         "go",
         "test",
@@ -416,26 +416,27 @@
       ],
       "timeout_seconds": 180,
       "required_tests": [
-        "TestScheduler_StartRecoversExecutions",
-        "TestScheduler_StartReconcilesDefinitions",
-        "TestScheduler_StartRegistersEnabledOnly",
+        "TestScheduler_Start_DoesNotRecoverDeliveriesGlobally",
+        "TestScheduler_Start_ReconcilesDefinitions",
+        "TestScheduler_Dispatch_SkipsRetiredAndUnregistered",
         "TestScheduler_StartTwice",
-        "TestScheduler_Fire_DerivesSessionAndRunID",
-        "TestScheduler_Fire_ExecutesAndRecords",
-        "TestScheduler_Fire_ReadsTaskFromStore",
-        "TestScheduler_Fire_FailureMapping",
-        "TestScheduler_Fire_AdmissionErrorRecordsFailed",
-        "TestScheduler_Fire_SessionBusyRecordsSkipped",
-        "TestScheduler_Fire_StartExecutionFailure",
-        "TestScheduler_Fire_LockMissRecordsSkipped",
-        "TestScheduler_Fire_PanicRecovered",
-        "TestScheduler_Fire_MissedTriggerWarnsWithoutRun",
+        "TestScheduler_Dispatch_DerivesSessionAndRunID",
+        "TestScheduler_Dispatch_ExecutesAndRecords",
+        "TestScheduler_Dispatch_ReadsTaskFromStore",
+        "TestScheduler_Dispatch_FailureMapping",
+        "TestScheduler_Dispatch_AdmissionErrorRecordsFailed",
+        "TestScheduler_Dispatch_SessionBusyRecordsSkipped",
+        "TestScheduler_Dispatch_ClaimFailureLogsAndSkips",
+        "TestScheduler_Dispatch_BusyClaimRecordsSkipped",
+        "TestScheduler_Dispatch_PanicRecovered",
+        "TestScheduler_Start_MissedTriggerWarnsWithoutRun",
+        "TestScheduler_Dispatch_MissedGraceRecordsOneSkip",
         "TestScheduler_RunNow_SameChain",
         "TestScheduler_RunNow_BusyReturnsErrTaskBusy",
         "TestScheduler_RunNow_HiddenTaskNotFound",
         "TestScheduler_RunNow_DisabledTaskStillRuns",
         "TestScheduler_RunNow_SessionBusyRecordsSkipped",
-        "TestScheduler_SetEnabled_TogglesRegistration",
+        "TestScheduler_SetEnabled_ControlsDispatch",
         "TestScheduler_SetEnabled_HiddenTaskNotFound",
         "TestScheduler_List_FiltersAndOrders",
         "TestScheduler_List_ReflectsRunState",
@@ -448,20 +449,20 @@
         "TestScheduler_StopTimeoutCancelsInflight",
         "TestScheduler_ReconcileAgent",
         "TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration",
-        "TestScheduler_Fire_FinishUsesCleanupCtx",
+        "TestScheduler_Dispatch_FinishUsesCleanupCtx",
         "TestScheduler_Start_StoreFailureFatal",
-        "TestScheduler_Start_TaskAddFailureStopsEngine",
+        "TestScheduler_Start_ApplyFailureIsNotLatched",
         "TestScheduler_SetEnabled_WritesDBFirst",
         "TestScheduler_SetEnabled_ConcurrentToggles",
-        "TestScheduler_Fire_ArchivedSessionSkipped",
+        "TestScheduler_Dispatch_ArchivedSessionSkipped",
         "TestScheduler_RunNow_ArchivedSessionPropagates",
         "TestScheduler_Start_OwnerConflictFatal",
         "TestScheduler_CheckOwnership",
         "TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition",
-        "TestScheduler_OldCallbackAfterReconcile_NoRun",
-        "TestScheduler_ReconcileAgent_AddFailureReturnsError",
-        "TestScheduler_Start_SecondAgentApplyFails_NoHandles",
-        "TestScheduler_Fire_ConcurrentDistinctTasks"
+        "TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition",
+        "TestScheduler_ReconcileAgent_ApplyIsAllOrNothing",
+        "TestScheduler_Start_SecondAgentApplyFails_NoScanStart",
+        "TestScheduler_Dispatch_ConcurrentDistinctTasks"
       ]
     },
     {
@@ -504,7 +505,7 @@
       ]
     },
     {
-      "id": "010-cron-adapter",
+      "id": "010-cron-adapter-parser",
       "args": [
         "go",
         "test",
@@ -518,17 +519,15 @@
       "required_tests": [
         "TestEngine_RejectsFiveFieldSpec",
         "TestEngine_RejectsMissingCRONTZ",
-        "TestEngine_ParsesSixFieldWithCRONTZ",
+        "TestEngine_NextParsesSixFieldWithCRONTZ",
         "TestEngine_OccurrencesFromFixedStart",
         "TestEngine_OccurrencesCapsAtLimit",
         "TestEngine_OccurrencesNoMoreTimes",
-        "TestEngine_AddAndStop",
-        "TestEngine_StopWaitsForJobs",
         "TestEngine_UnknownZoneFails"
       ]
     },
     {
-      "id": "010-storage-tasks",
+      "id": "010-storage-tasks-distributed",
       "args": [
         "go",
         "test",
@@ -551,7 +550,7 @@
         "TestTaskStore_StartExecutionAndFinish",
         "TestTaskStore_FinishExecution",
         "TestTaskStore_RecordSkipped",
-        "TestTaskStore_RecoverStartedExecutions",
+        "TestTaskStore_NoGlobalRecoveryScan",
         "TestTaskStore_ListTasks",
         "TestTaskStore_ListExecutions",
         "TestRunStore_TriggerForScheduler"
@@ -726,7 +725,7 @@
       ]
     },
     {
-      "id": "010-race",
+      "id": "010-race-distributed",
       "args": [
         "go",
         "test",
@@ -745,11 +744,11 @@
       "timeout_seconds": 900,
       "required_tests": [
         "TestScheduler_StopConcurrent",
-        "TestScheduler_Fire_LockMissRecordsSkipped",
+        "TestScheduler_Dispatch_BusyClaimRecordsSkipped",
         "TestScheduler_StopTimeoutCancelsInflight",
         "TestScheduler_SetEnabled_ConcurrentToggles",
-        "TestScheduler_Fire_ConcurrentDistinctTasks",
-        "TestScheduler_OldCallbackAfterReconcile_NoRun",
+        "TestScheduler_Dispatch_ConcurrentDistinctTasks",
+        "TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition",
         "TestApplySchedule_ConcurrentSets",
         "TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
         "TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
@@ -970,11 +969,11 @@
     {
       "id": "us10",
       "checks": [
-        "010-core-scheduler",
+        "010-core-scheduler-distributed",
         "010-core-sessiongate",
         "010-core-runid",
-        "010-cron-adapter",
-        "010-storage-tasks",
+        "010-cron-adapter-parser",
+        "010-storage-tasks-distributed",
         "010-workspace-writegate",
         "010-tool-manageschedule",
         "010-web-schedules",
@@ -982,7 +981,7 @@
         "010-app-schedule",
         "010-app-tools-eleven",
         "010-app-crossentry",
-        "010-race"
+        "010-race-distributed"
       ]
     },
     {
@@ -997,6 +996,10 @@
   ],
   "superseded_checks": {
     "008-ports-nine": "008-ports-eleven",
-    "010-app-tools": "010-app-tools-eleven"
+    "010-app-tools": "010-app-tools-eleven",
+    "010-core-scheduler": "010-core-scheduler-distributed",
+    "010-cron-adapter": "010-cron-adapter-parser",
+    "010-race": "010-race-distributed",
+    "010-storage-tasks": "010-storage-tasks-distributed"
   }
 }

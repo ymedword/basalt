@@ -71,7 +71,7 @@ var integrationTaggedChecks = map[string]bool{
 	"010-app-schedule":     true,
 	"010-app-tools-eleven": true,
 	"010-app-crossentry":   true,
-	"010-race":             true,
+	"010-race-distributed": true,
 }
 
 // countArg 数某个 argv 元素在参数里出现的次数。重复出现必须能数出来——剥离式比对会让
@@ -128,18 +128,27 @@ func TestStages_CurrentCoversHistorical(t *testing.T) {
 	}
 
 	// 替代关系是**显式清单**：每加一条都必须改这里并留下依据，不靠"字段碰巧相同"。
-	// 现有两条：US-8 的九件（14D 起工具集为十一件）与 US-10 的十件（同一断言）。
+	// 现有六条：US-8 的九件（14D 起工具集为十一件）、US-10 的十件（同一断言），
+	// 以及 US-24 因批准的范围改写（`Fire` → `Dispatch`、进程内 cron 生命周期移除、
+	// 启动全局恢复扫描按 FR-2 禁止）而改名的四个 check。
 	require.Equal(t,
-		map[string]string{"008-ports-nine": "008-ports-eleven", "010-app-tools": "010-app-tools-eleven"},
+		map[string]string{
+			"008-ports-nine":     "008-ports-eleven",
+			"010-app-tools":      "010-app-tools-eleven",
+			"010-core-scheduler": "010-core-scheduler-distributed",
+			"010-cron-adapter":   "010-cron-adapter-parser",
+			"010-race":           "010-race-distributed",
+			"010-storage-tasks":  "010-storage-tasks-distributed",
+		},
 		current.SupersededChecks,
-		"current.json must register exactly the explicit US-8 and US-10 replacements")
+		"current.json must register exactly the explicit US-8, US-10 and US-24 replacements")
 	require.Contains(t, currentByID, "008-ports-eleven")
 
 	// 构建标签同样是显式清单（US-16 起）：清单内的 check 才可带 `-tags=integration`，
 	// 清单外一律不得带——否则等于绕过逐字段比对，把任意 check 静默挪进集成构建面。
 	require.Equal(t, []string{
 		"008-app-notify", "008-ports-eleven", "009-app-web", "010-app-crossentry",
-		"010-app-schedule", "010-app-tools-eleven", "010-race",
+		"010-app-schedule", "010-app-tools-eleven", "010-race-distributed",
 	}, slices.Sorted(maps.Keys(integrationTaggedChecks)),
 		"the integration-tag allowlist must stay explicit; a new entry needs its own decision record")
 	for id := range integrationTaggedChecks {
@@ -214,9 +223,11 @@ func TestStages_HistoricalFilesPinned(t *testing.T) {
 	}
 }
 
-// pinnedStageCheck 是 015-* 与 US-8 替代项的静态定义期望表。
-// pinnedStageCheck is the static expectation table for the 015-* checks and the two
-// supersession targets (008-ports-eleven, 010-app-tools-eleven).
+// pinnedStageCheck 是 015-* 与全部替代项（US-8 / US-10 / US-24 共六个）的静态定义期望表。
+// pinnedStageCheck is the static expectation table for the 015-* checks and all six
+// supersession targets: 008-ports-eleven, 010-app-tools-eleven and the four US-24
+// replacements (010-core-scheduler-distributed, 010-cron-adapter-parser,
+// 010-storage-tasks-distributed, 010-race-distributed).
 type pinnedStageCheck struct {
 	stage   string
 	id      string
@@ -306,6 +317,55 @@ var pinnedStageChecks = []pinnedStageCheck{
 		timeout: 120,
 		level:   "source",
 	},
+	{
+		stage: "harness/stages/current.json",
+		id:    "010-core-scheduler-distributed",
+		args: []string{
+			"go", "test", "-json", "-count=1", "-run",
+			"^TestScheduler_",
+			"./internal/core",
+		},
+		timeout: 180,
+		level:   "source",
+	},
+	{
+		stage: "harness/stages/current.json",
+		id:    "010-cron-adapter-parser",
+		args: []string{
+			"go", "test", "-json", "-count=1", "-run",
+			"^TestEngine_",
+			"./internal/adapters/cron",
+		},
+		timeout: 120,
+		level:   "source",
+	},
+	{
+		stage: "harness/stages/current.json",
+		id:    "010-storage-tasks-distributed",
+		args: []string{
+			"go", "test", "-json", "-count=1", "-run",
+			"^(TestApplyAgentTasks_|TestTaskStore_|TestRunStore_TriggerForScheduler$)",
+			"./internal/storage",
+		},
+		timeout: 180,
+		level:   "source",
+	},
+	{
+		stage: "harness/stages/current.json",
+		id:    "010-race-distributed",
+		args: []string{
+			"go", "test", "-race", "-json", "-count=1", "-tags=integration",
+			"./internal/core",
+			"./internal/adapters/cron",
+			"./internal/storage",
+			"./internal/workspace",
+			"./internal/tool",
+			"./internal/web",
+			"./internal/app",
+		},
+		timeout: 900,
+		level:   "source",
+	},
 }
 
 // pinnedRequiredTests 只钉住可静态列举的 required_tests；其余由目录一致性测试钉住。
@@ -359,14 +419,111 @@ var pinnedRequiredTests = map[string][]string{
 		"TestRun_HeavyCommandSplit",
 		"TestToolListerPort_HeavyAssemblyRegistersElevenTools",
 	},
+	// US-24 四个替代项：逐条承接历史 46 + 9 + 15 + 14 个具名测试。被批准的范围改写
+	// 逐项给出承接测试（Fire→Dispatch、cron 生命周期移除、启动全局扫描按 FR-24-02 禁止）。
+	// 注意「承接」不等于「只增不减」：010-cron-adapter 的 9→7 移除两项且无同名替代
+	// （触发时间线改由 us24-base 覆盖，见 acceptance.md §8.6），故本表不变量是
+	// 「每一项变更有据可查」，不是「总数不减」。
+	"010-core-scheduler-distributed": {
+		"TestScheduler_Start_DoesNotRecoverDeliveriesGlobally",
+		"TestScheduler_Start_ReconcilesDefinitions",
+		"TestScheduler_Dispatch_SkipsRetiredAndUnregistered",
+		"TestScheduler_StartTwice",
+		"TestScheduler_Dispatch_DerivesSessionAndRunID",
+		"TestScheduler_Dispatch_ExecutesAndRecords",
+		"TestScheduler_Dispatch_ReadsTaskFromStore",
+		"TestScheduler_Dispatch_FailureMapping",
+		"TestScheduler_Dispatch_AdmissionErrorRecordsFailed",
+		"TestScheduler_Dispatch_SessionBusyRecordsSkipped",
+		"TestScheduler_Dispatch_ClaimFailureLogsAndSkips",
+		"TestScheduler_Dispatch_BusyClaimRecordsSkipped",
+		"TestScheduler_Dispatch_PanicRecovered",
+		"TestScheduler_Start_MissedTriggerWarnsWithoutRun",
+		"TestScheduler_Dispatch_MissedGraceRecordsOneSkip",
+		"TestScheduler_RunNow_SameChain",
+		"TestScheduler_RunNow_BusyReturnsErrTaskBusy",
+		"TestScheduler_RunNow_HiddenTaskNotFound",
+		"TestScheduler_RunNow_DisabledTaskStillRuns",
+		"TestScheduler_RunNow_SessionBusyRecordsSkipped",
+		"TestScheduler_SetEnabled_ControlsDispatch",
+		"TestScheduler_SetEnabled_HiddenTaskNotFound",
+		"TestScheduler_List_FiltersAndOrders",
+		"TestScheduler_List_ReflectsRunState",
+		"TestScheduler_Executions_UsesLimit",
+		"TestScheduler_Executions_HiddenTaskNotFound",
+		"TestScheduler_LogFieldsAndNoBody",
+		"TestScheduler_StopConcurrent",
+		"TestScheduler_StopOnContextCancel",
+		"TestScheduler_StopBeforeStart",
+		"TestScheduler_StopTimeoutCancelsInflight",
+		"TestScheduler_ReconcileAgent",
+		"TestScheduler_ReconcileAgent_StoreFailureKeepsRegistration",
+		"TestScheduler_Dispatch_FinishUsesCleanupCtx",
+		"TestScheduler_Start_StoreFailureFatal",
+		"TestScheduler_Start_ApplyFailureIsNotLatched",
+		"TestScheduler_SetEnabled_WritesDBFirst",
+		"TestScheduler_SetEnabled_ConcurrentToggles",
+		"TestScheduler_Dispatch_ArchivedSessionSkipped",
+		"TestScheduler_RunNow_ArchivedSessionPropagates",
+		"TestScheduler_Start_OwnerConflictFatal",
+		"TestScheduler_CheckOwnership",
+		"TestScheduler_Reconcile_SecondWriteFails_KeepsOldDefinition",
+		"TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition",
+		"TestScheduler_ReconcileAgent_ApplyIsAllOrNothing",
+		"TestScheduler_Start_SecondAgentApplyFails_NoScanStart",
+		"TestScheduler_Dispatch_ConcurrentDistinctTasks",
+	},
+	"010-cron-adapter-parser": {
+		"TestEngine_RejectsFiveFieldSpec",
+		"TestEngine_RejectsMissingCRONTZ",
+		"TestEngine_NextParsesSixFieldWithCRONTZ",
+		"TestEngine_OccurrencesFromFixedStart",
+		"TestEngine_OccurrencesCapsAtLimit",
+		"TestEngine_OccurrencesNoMoreTimes",
+		"TestEngine_UnknownZoneFails",
+	},
+	"010-storage-tasks-distributed": {
+		"TestApplyAgentTasks_UpsertPreservesState",
+		"TestTaskStore_RetireAndRevive",
+		"TestApplyAgentTasks_SameOwnerReviveAllowed",
+		"TestApplyAgentTasks_CrossOwnerRejected",
+		"TestApplyAgentTasks_CrossOwnerRetiredRejected",
+		"TestApplyAgentTasks_RollbackOnSecondWrite",
+		"TestTaskStore_SetTaskEnabled",
+		"TestTaskStore_MarkTaskRun",
+		"TestTaskStore_StartExecutionAndFinish",
+		"TestTaskStore_FinishExecution",
+		"TestTaskStore_RecordSkipped",
+		"TestTaskStore_NoGlobalRecoveryScan",
+		"TestTaskStore_ListTasks",
+		"TestTaskStore_ListExecutions",
+		"TestRunStore_TriggerForScheduler",
+	},
+	"010-race-distributed": {
+		"TestScheduler_StopConcurrent",
+		"TestScheduler_Dispatch_BusyClaimRecordsSkipped",
+		"TestScheduler_StopTimeoutCancelsInflight",
+		"TestScheduler_SetEnabled_ConcurrentToggles",
+		"TestScheduler_Dispatch_ConcurrentDistinctTasks",
+		"TestScheduler_AfterReconcile_NextDispatchUsesLatestDefinition",
+		"TestApplySchedule_ConcurrentSets",
+		"TestScheduleEditorAdapter_ConcurrentCrossAgentSameID",
+		"TestScheduleEditorAdapter_ConcurrentWithProfilesRead",
+		"TestSchedules_RunConflict",
+		"TestHeavyRuntime_CloseStopsSchedulerFirst",
+		"TestAgentService_Archive_RejectsInflightRun",
+		"TestAgentService_StatelessRunsNotSerialized",
+		"TestCrossEntry_CronArchiveCoordination",
+	},
 }
 
-// TestStages_PinsUS15Checks 钉住八个 015-* check 与两个替代项（US-8 / US-10）的 argv /
-// 超时 / 层级，以及可静态列举的 required_tests，防止新 check 被静默删项、去标签或改命令行。
+// TestStages_PinsUS15Checks 钉住八个 015-* check 与六个替代项（US-8 / US-10 / US-24）的
+// argv / 超时 / 层级，以及可静态列举的 required_tests，防止新 check 被静默删项、去标签或改命令行。
 // 该测试在 us15-linux / us15-slow / us15-real 三个 stage 落地后才转绿（T035 / T047）。
 // TestStages_PinsUS15Checks pins argv, timeout and level for the eight 015-* checks and
-// the US-8 replacement, plus the statically enumerated required_tests. It turns green
-// once the us15-linux / us15-slow / us15-real stages exist (T035 / T047).
+// the six replacements (US-8 / US-10 / US-24), plus the statically enumerated
+// required_tests. It turns green once the us15-linux / us15-slow / us15-real stages
+// exist (T035 / T047).
 func TestStages_PinsUS15Checks(t *testing.T) {
 	root := stageTestRoot(t)
 	loaded := map[string]stage{}

@@ -326,3 +326,22 @@ diff .loop/reviews/us24-repair-20261107/fingerprint-files-pre-backfill.txt \
 | 逐文件 diff（冻结 vs 现值） | **只有 1 行**：`specs/024-state-distributed/acceptance.md` 的 SHA-256 由 `1340d8a1…` →（第一轮 `c4aa5c81…`）→ `1547425d…`；无新增 / 删除文件，其余 2175 个文件哈希不变 |
 
 结论：两轮文档改动都只落在 `acceptance.md` 一份计入指纹的文档（第一轮回填验收读数；第二轮按独立复核校正 §8.1 表述并补记复核结果 / 勘误二）；`run-state.md` 与模块卡按文件名规则不进指纹。因此「源码冻结」结论成立，冻结轮读数即为当前源码树的读数。
+
+**收口后 CI 修复（2026-11-08）：累计 stage 的 superseded_checks**：
+
+- **现象**：合入 main 的提交 `d615b10` 触发 CI run 42399360393；job `test`（128483577470）在 step「Lint stage definitions」判红，`harness/stages/current.json` 四个历史 check 共 28 行 ERROR（`010-core-scheduler` 21、`010-cron-adapter` 3、`010-storage-tasks` 1、`010-race` 3），其余 job（build / container / console / flow / postgres / website）全绿。`make check` 不含 `--lint-stages`，本地七目标全绿不覆盖该判据面。
+- **根因**：本 US 批准范围改写（模块卡 §3 写明 `scheduler_test.go` 改写；FR-24-02 禁止启动全局扫描；FR-24-17 让回收独立于 cron）更名 / 移除了 28 个具名测试，而累计 stage 按名索取。US-24 交付物清单未包含 `current.json`，是实现遗漏。
+- **处置**：按 [开发操作](../../docs/DevelopmentLoop.md) §9.3 的既有机制，历史 stage 文件零改写，失配以 `superseded_checks` 显式登记四个替代 check，并在 `scripts/acceptance/stages_test.go` 逐字钉住替代项（`pinnedRequiredTests` 新增四组、`pinnedStageChecks` 新增四组 argv / 超时、`integrationTaggedChecks` 的 `010-race` → `010-race-distributed`）。逐条承接表见 `acceptance.md` §8.6。
+- **判据面判定**：属「判据面变更」，来源是已审范围的改写而非转绿；更名项 1:1 承接，删除行为换负向断言，净变化 46→47 / 9→7 / 15→15 / 14→14，无一项是删除断言。
+- **验证**：`go test ./scripts/acceptance -run '^TestStages_'` 通过；WSL 上 `sh scripts/check-acceptance.sh --lint-stages --stage harness/stages/current.json` → `stage lint: ok`、`ERROR` 零行；同一条命令打印 **509 行 WARN**，分布在 8 个历史 stage 文件（`us10-scheduler.json` 的 28 行正是本轮改名 / 删除的测试名，其余为历史 drift；lint 对非 fail stage 只告警，不影响退出码）。完整累计 stage 执行与远端 CI 读数见下方回填。
+- **本地门禁读数（2026-11-08）**：`dev-env/scripts/with-postgres.sh make check`（WSL）复跑，`MAKE_CHECK2_EXIT=0`，七目标全绿：`check-format` 干净；`go vet -tags=integration` + `staticcheck` + `gosec` + `govulncheck` 通过（`Your code is affected by 0 vulnerabilities`）；`test` / `test-integration` 全 `ok`、`FAIL` 零行；`check-coverage: 全部包达标`；`CGO_ENABLED=0 go build` 成功。该轮在 `stages_test.go` 的两处注释修订之前启动（`fmt` 已先跑），随后对该文件单独 `gofumpt -w` + `gofumpt -l` 零输出、`go test ./scripts/acceptance -run '^TestStages_'` 再跑通过（`ok … 5.792s`），注释级改动不改行为与断言面。
+- **回填位置**：本节；CI 结论以推送后 run 的 `conclusion` 为准，不把运行中写成通过。
+
+**收口后本地 -race 复验发现的产品竞态（2026-11-08）**：
+
+- **现象**：按 `010-race-distributed` 的 argv 在 WSL + PostgreSQL 跑 `go test -race -tags=integration`（七包），`internal/app` FAIL（430.380s），`TestAgentArchive_RollbackRestoresRetirement` / `TestAgentRestore_DoesNotAutoEnableSchedules` / `TestRun_ServeStartsConfigWatcher` 报 `race detected`。
+- **根因**：`Scheduler.SetRegistered` 在 `stateMu` 写锁内 `delete(s.registry, agent)`（`scheduler.go:1423`），而 US-24 新增的到期扫描在 `dueTasks` 不持锁遍历同一张 map（`registeredAgentNames`，`scheduler.go:1295`）；管理读面 `visible()` 同样不持锁读该 map。属产品缺陷，不是测试夹具泄漏——归档屏障在派发循环运行时即生产路径。
+- **处置**：`dueTasks` 改用 `registeredSnapshot()`（RLock 内复制）+ 新增 `sortedRegisteredNames`；`registeredAgentNames` 更名 `registeredAgentNamesLocked`（契约：调用方持 `stateMu`，唯一调用方 `Start` 在写锁内）；`visible()` 读前取 `RLock`。仅加锁与快照，无行为改写、无断言改动。
+- **验证**：修复前三例 `— FAIL`；修复后定向复跑 `ok … 5.226s`；修复后全量七包全 `ok`（core 4.071s / cron 1.018s / storage 43.498s / workspace 17.414s / tool 20.551s / web 18.682s / app 387.446s），`WARNING: DATA RACE` 零行，`RACE2_EXIT=0`。逐项记录见 `acceptance.md` §8.7。
+- **未验证**：远端 CI 复验；竞态检测依赖交错，单轮通过不证明「永不发生」，但所有访问点已置于同一把锁下（结构性消除）。
+- **临时物清理**：本轮探针脚本 `.loop/reviews/us24-repair-20261107/fpcheck.go` 已删除——gosec 的 `./...` 会扫到 `.loop/` 下的 `.go` 文件（`make check` 的 `sec` 因该文件的 G703 / G306 判红），本地门禁须与 CI 的干净检出同口径。指纹复算命令的重跑入口随脚本一并移除；已记录的哈希值（见上表）仍是验证证据。
