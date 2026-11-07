@@ -144,6 +144,8 @@ review ② 打回后的定向修复改了源码（`internal/core` / `internal/fl
 
 过程日志 `.loop/reviews/us24-repair-20261107/final-make-check.log` 与 `final-e2e.log` 保存在 `.loop/`（整体不进版本库），stage 判读依据是 `.loop/runs/*/report.json` 与逐 check 日志；回填后工作树与冻结指纹的逐文件差异见 §8.5。
 
+> **2026-11-08 后注**：本节读数对应提交 `9c01b2e` 的树。合入 main 后 CI 在 `015-backfill` 发现 e2e 夹具身份缺陷，修复该缺陷又暴露一处 US-24 产品回归（cron / zone 变更不重排 `next_fire_at`）；修复改动了 3 个文件（见 §8.8），因此本节的「源码冻结」结论只对该提交成立。修复后的完整复验以推送后 CI 的全绿读数为准，本地定向复跑记录在 §8.8 与 run-state §5。
+
 ## 2. Harness 与逆改判别力
 
 ### 2.1 结构（引用公共配置，不复制）
@@ -510,3 +512,36 @@ Write (admin archive)  Scheduler.SetRegistered()          scheduler.go:1423 (del
   - 修复后定向复跑：`go test -race -tags=integration ./internal/app -run 'TestAgentArchive_RollbackRestoresRetirement|TestAgentRestore_DoesNotAutoEnableSchedules|TestRun_ServeStartsConfigWatcher'` → `ok … 5.226s`；
   - 修复后全量七包：`core 4.071s / cron 1.018s / storage 43.498s / workspace 17.414s / tool 20.551s / web 18.682s / app 387.446s`，全部 `ok`，日志内 `WARNING: DATA RACE` 零行，`RACE2_EXIT=0`。
 - **未验证**：远端 CI 对该修复的复验读数在推送后回填 run-state §5；竞态检测依赖调度交错，本地单轮通过不构成「永不发生」的证明，但修复把所有访问点都置于同一把锁下，属结构性消除而非概率降低。
+
+### 8.8 收口后 CI 修复 ②：e2e 夹具身份与调度游标重排（2026-11-08）
+
+CI run 42409706693（提交 `9c01b2e`）step 9「Current cumulative stage」在 check `015-backfill` 判红，失败点是 `TestBackfill_Scheduler/archive_meets_cron`。修复过程中定位到两个独立缺陷（一个夹具、一个产品），逐项如下。
+
+**缺陷一：夹具在「编辑 AGENT.md」时更换了 Agent 身份（`internal/e2e/harness_test.go`）**
+
+- 失败读数：`scheduler_test.go:678: 等待文件出现 … 超时（1m0s）`；Stage B 进程日志只有 `Agent demo 的共享发布记录缺失或已删除`（`internal/storage/postgres/run_store.go:354` 的 `recheckAgentBundle`，503 `ASSET_UNAVAILABLE`）。
+- 链路：`archive_meets_cron` 在 Stage B 用同一 `active` / 代次 2 重写 `AGENT.md` → 夹具 `writeLifecycleState` 再铸造一个新 `AgentUID` → 启动基线按「同代次 2 的内容与索引不一致」（`ErrAgentLifecycleMismatch`）只 WARN、索引保留 Stage A 身份 → `prepareHeavy` 的 `basalt assets install --agent` 按**索引** UID 发布 bundle → `BuildRunResourceManifest` 用**状态文件** UID → `StartRun` 的事务复查查不到 `resource_pointers(kind=agent_bundle, resource_id=状态文件 UID)` → 503。
+- 归因：产品行为符合 FR-24-25（bundle 与共享发布记录不一致时 fail-closed）与 FR-24-42（代次一致写入）；缺陷在夹具把真实系统里「编辑 `AGENT.md` 不触碰生命周期状态、身份不随工作区编辑变化」建模成了「换身份」。
+- 修复：`writeLifecycleState` 在状态与代次都没变时保持原文件字节、复用原 `AgentUID` 与原 `OperationID`（操作行补种 `ON CONFLICT DO NOTHING`）；只有文件不存在 / 不可解析时才铸造新身份。跨阶段身份稳定后，Stage B 的 `assets install` 按内容哈希发布新版本、指针 CAS 到新版本，准入与 `StartRun` 复查锁同一 UID。
+
+**缺陷二：cron / zone 变更不重排 `next_fire_at`（`internal/storage/postgres/task_store.go`）**
+
+- 失败读数：夹具修好后同一子例改在 `scheduler_test.go:688` 超时（`等待输出 "会话已归档，本轮跳过" 超时（1m0s）`）；Stage B 日志有 `trigger=manual`、无任何 `trigger=cron` 派发。
+- 链路：Stage A 的任务行在首轮到期扫描时按 `farFutureCron()` 初始化 `next_fire_at`；Stage B 启动对账把 cron 改成 `now+15s`，但 `ApplyAgentTasks` 的 `ON CONFLICT DO UPDATE` 只写定义列，`next_fire_at` 保持远期值 → `ListDispatchable`（`next_fire_at IS NULL OR next_fire_at <= db_now`）永远不选中该行 → 新 cron 不生效。
+- 归因：US-24 把触发权威从进程内 cron 句柄改为数据库游标；US-10 时代每次对账重注册句柄会按新表达式从当前时刻重算，迁移时漏掉了「表达式变化 → 重排游标」。属**产品回归**（不是夹具问题）：任何通过编辑 `AGENT.md` 修改 cron / zone 的部署都会受影响。
+- 修复：`DO UPDATE` 增加 `next_fire_at = CASE WHEN scheduled_tasks.cron IS DISTINCT FROM excluded.cron OR scheduled_tasks.zone IS DISTINCT FROM excluded.zone THEN NULL ELSE scheduled_tasks.next_fire_at END`。置 NULL 后由下一轮到期扫描走既有「`next_fire_at IS NULL` → 初始化」分支（`internal/core/scheduler.go` 的 `dispatchOnce`：只 `SetNextFire` 并 `continue`，不执行），与模块卡「`next_fire_at` 由注册 / 推进时计算」一致；只在表达式本身变化时重排，仅改 message / deliver_to 时保留游标（避免对账把临近的触发点跳过）。
+- 回归用例：`TestApplyAgentTasks_ScheduleChangeRearmsNextFire`（`internal/storage/postgres/task_store_port_test.go`）三子例：cron 变化清空游标、zone 变化清空游标、仅 message 变化保留原值。
+
+**判据面**：零删除 / 零放宽——不删断言、不提高超时、不加抑制注释；新增一个用例；`make check` 的覆盖率与门禁口径不变。
+
+**验证读数**：
+
+| 项 | 读数 |
+| --- | --- |
+| 逆改（`HEAD` 版 SQL 经仓库外 `-overlay` 探针） | `cron_change` / `zone_change` 逐字 FAIL（`Should be false`），`message_only` PASS；探针 `/tmp/us24rearm` 用毕即删 |
+| `TestBackfill_Scheduler/archive_meets_cron` | PASS 15.57s（修复前 61.27s 超时） |
+| `TestBackfill_Scheduler` 全套 | 10/10 PASS，包 55.86s |
+| CI step 9 同款 `015-backfill` 正则（11 个 `TestBackfill_*`） | RC=0，115 pass / 0 fail，包 130.554s；`.loop/reviews/us24-repair-20261107/backfill-20261108.json` |
+| 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`，七目标全绿：format 干净 / vet（`-tags=integration`）+ staticcheck + gosec + govulncheck 通过 / `test` 与 `test-integration` 全包 `ok` 零 `FAIL` / `check-coverage: 全部包达标`（postgres 72.18%）/ `CGO_ENABLED=0` 构建成功；日志 `.loop/reviews/us24-repair-20261107/make-check-20261108.log` |
+
+**未验证**：远端 CI 对修复提交的读数在推送后回填（不把运行中写成通过）；完整累计 stage 的远端执行以 CI 为准，本地只复跑了失败的 check 与 scheduler 套件。

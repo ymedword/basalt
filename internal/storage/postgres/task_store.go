@@ -18,7 +18,10 @@ import (
 //
 // 四条纪律。① **定义与运行状态分离**：`ApplyAgentTasks` 的 upsert 只写定义列与
 // `retired_at`，从不覆盖 `agent_name` / `enabled` / `last_*` / `created_at`——文件对齐是
-// 一件事，运行痕迹是另一件事（约束 16）。② **归属守卫在 SQL 里**：upsert 的 WHERE 谓词与
+// 一件事，运行痕迹是另一件事（约束 16）。`next_fire_at` 不是运行痕迹：它是**按当前
+// cron / zone 算出的调度游标**，表达式一变就必须置 NULL 交给下一轮到期扫描按新定义
+// 重新初始化（否则新 cron 可能被旧游标挡到很远以后，或在非触发点上被领取）。
+// ② **归属守卫在 SQL 里**：upsert 的 WHERE 谓词与
 // retire 的预检只看 `agent_name`，冲突即拒绝并回滚整个事务（约束 41 / 42）；retired 行同样
 // 受保护——下线不释放归属。③ **无 Run 即无引用**：执行行终态写 `run_id = NULL` 的判据是
 // "`runs` 表是否真的存在该行"，不是状态取值（P-04）——会话忙 / 准入失败 / 崩溃遗留都不会
@@ -138,6 +141,17 @@ func (s *TaskStore) ApplyAgentTasks(ctx context.Context, agent string, upserts [
 				   message         = excluded.message,
 				   deliver_to      = excluded.deliver_to,
 				   definition_hash = excluded.definition_hash,
+				   -- 调度游标随表达式重排：cron / zone 变了，旧 next_fire_at 是按旧表达
+				   -- 式算出的，既可能落在新表达式的非触发点上，也可能把新定义挡在很远
+				   -- 之后。置 NULL 后由下一轮到期扫描按新表达式初始化（只初始化、不执行）。
+				   -- Rearm the schedule cursor when the expression changes; NULL makes the
+				   -- next due scan initialize it from the new cron without executing.
+				   next_fire_at    = CASE
+				                       WHEN scheduled_tasks.cron IS DISTINCT FROM excluded.cron
+				                         OR scheduled_tasks.zone IS DISTINCT FROM excluded.zone
+				                       THEN NULL
+				                       ELSE scheduled_tasks.next_fire_at
+				                     END,
 				   updated_at      = excluded.updated_at,
 				   retired_at      = NULL
 				 WHERE scheduled_tasks.agent_name = excluded.agent_name`,

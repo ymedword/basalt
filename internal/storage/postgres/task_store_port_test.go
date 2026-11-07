@@ -323,6 +323,54 @@ func TestApplyAgentTasks_UpsertPreservesState(t *testing.T) {
 	})
 }
 
+// TestApplyAgentTasks_ScheduleChangeRearmsNextFire：调度游标只在表达式变化时重排——
+// cron / zone 变更把旧 next_fire_at 置 NULL（下一轮到期扫描按新表达式初始化），仅 message
+// 变更保留游标。逆改点：DO UPDATE 不重排 → `cron_change_clears_next_fire` 红。
+// The schedule cursor is re-armed only when the expression itself changes.
+func TestApplyAgentTasks_ScheduleChangeRearmsNextFire(t *testing.T) {
+	ctx := context.Background()
+	farFuture := opNow.Add(6 * time.Hour)
+
+	seed := func(t *testing.T) (*DB, *TaskStore) {
+		t.Helper()
+		db := portTestDB(t)
+		store := NewTaskStore(db)
+		taskPortSeedTask(t, db, "demo-1", "demo", "0 8 * * * *", "巡检")
+		scheduleSetNextFire(t, db, "demo-1", farFuture)
+		return db, store
+	}
+	upsert := func(t *testing.T, store *TaskStore, cron, zone, message string) {
+		t.Helper()
+		require.NoError(t, store.ApplyAgentTasks(ctx, "demo", []core.TaskRecord{{
+			TaskID: "demo-1", Agent: "demo", Cron: cron, Zone: zone, Message: message,
+			DefinitionHash: "h2",
+			CallerID:       core.LocalAdminCallerID, AuthorizingKind: core.AuthorizingKindAdminBuiltin,
+		}}, nil, opNow))
+	}
+
+	t.Run("cron_change_clears_next_fire", func(t *testing.T) {
+		db, store := seed(t)
+		upsert(t, store, "0 9 * * * *", "UTC", "巡检")
+		_, ok := scheduleNextFireOf(t, db, "demo-1")
+		require.False(t, ok, "cron 变更必须把旧调度游标置 NULL，交给下一轮扫描按新表达式初始化")
+	})
+
+	t.Run("zone_change_clears_next_fire", func(t *testing.T) {
+		db, store := seed(t)
+		upsert(t, store, "0 8 * * * *", "Asia/Shanghai", "巡检")
+		_, ok := scheduleNextFireOf(t, db, "demo-1")
+		require.False(t, ok, "zone 变更必须把旧调度游标置 NULL")
+	})
+
+	t.Run("message_only_keeps_next_fire", func(t *testing.T) {
+		db, store := seed(t)
+		upsert(t, store, "0 8 * * * *", "UTC", "新巡检")
+		at, ok := scheduleNextFireOf(t, db, "demo-1")
+		require.True(t, ok, "仅 message 变更不得清空调度游标（否则会在对账时跳过临近的触发点）")
+		require.Equal(t, farFuture.UnixMilli(), at.UnixMilli())
+	})
+}
+
 // TestTaskStore_RetireAndRevive：退休只置时间、不物理删；同 id 再现复活且 enabled 保持库值。
 // 逆改点：物理删除 → 执行历史行随之消失；复活重置 enabled=1 → 断言红。
 func TestTaskStore_RetireAndRevive(t *testing.T) {

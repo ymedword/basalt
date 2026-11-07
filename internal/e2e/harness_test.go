@@ -956,6 +956,23 @@ func (h *harness) writeActiveLifecycleState(t *testing.T, name string) {
 func (h *harness) writeLifecycleState(t *testing.T, name, state string, generation int64) {
 	t.Helper()
 
+	dir := filepath.Join(h.Root, ".basalt", "control", "agents")
+	path := filepath.Join(dir, name+".json")
+	previous, hasPrevious := readLifecycleStateFileIfPresent(path)
+	// 状态与代次都没变时保持原文件字节：真实系统里编辑 `AGENT.md` 不触碰生命周期状态，
+	// 身份也不随工作区编辑变化。重写会铸造新 UID，把"同代次、异内容"的状态文件交给
+	// 启动基线——索引按同代次内容不一致拒绝，随后索引身份与状态文件身份分叉，US-24
+	// 起表现为准入解析与 `StartRun` 事务复查各锁一个 UID（503 ASSET_UNAVAILABLE）。
+	// Keep the existing bytes when state and generation are unchanged: editing AGENT.md
+	// never rewrites the lifecycle file, and a same-generation rewrite would split the
+	// state-file uid from the index uid that admission and StartRun both key on.
+	if hasPrevious && previous.State == state && previous.Generation == generation {
+		if previous.OperationID != "" {
+			h.seedLifecycleOperation(t, previous.OperationID, name, previous.UpdatedAt)
+		}
+		return
+	}
+
 	now := time.Now()
 	record := lifecycleStateFile{
 		// v3 库的准入要求状态文件给出稳定身份（缺 UID 的 v1 文件仍可读，但没有身份
@@ -968,6 +985,12 @@ func (h *harness) writeLifecycleState(t *testing.T, name, state string, generati
 		UpdatedAt:     now.UnixMilli(),
 		OperationID:   fmt.Sprintf("op-e2e-%s-%d", name, now.UnixNano()),
 	}
+	// Agent 身份跨启停保持不变（契约：UID 是 Agent 的身份，不随状态与代次变化）；
+	// 只有文件不存在时才铸造新身份。
+	// The agent uid is the identity across transitions; mint one only when there is none.
+	if hasPrevious && previous.AgentUID != "" {
+		record.AgentUID = previous.AgentUID
+	}
 	unsigned, err := json.Marshal(record) // checksum 为空串，正与被哈希的形态一致
 	if err != nil {
 		t.Fatalf("编码生命周期状态 %s 失败: %v", name, err)
@@ -979,14 +1002,28 @@ func (h *harness) writeLifecycleState(t *testing.T, name, state string, generati
 		t.Fatalf("编码生命周期状态 %s 失败: %v", name, err)
 	}
 
-	dir := filepath.Join(h.Root, ".basalt", "control", "agents")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("建生命周期控制目录 %s 失败: %v", dir, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, name+".json"), raw, 0o644); err != nil {
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("写生命周期状态 %s 失败: %v", name, err)
 	}
 	h.seedLifecycleOperation(t, record.OperationID, name, now.UnixMilli())
+}
+
+// readLifecycleStateFileIfPresent 读回夹具写的状态文件；不存在或不可解析时返回 false——
+// 夹具只对**自己生成**的契约形态复用身份，损坏文件仍按"没有前值"处理。
+// readLifecycleStateFileIfPresent returns the fixture-written state file, if readable.
+func readLifecycleStateFileIfPresent(path string) (lifecycleStateFile, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return lifecycleStateFile{}, false
+	}
+	var record lifecycleStateFile
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return lifecycleStateFile{}, false
+	}
+	return record, true
 }
 
 // seedLifecycleOperation 在库里补一条**真实存在**的启用操作行：v3 的
