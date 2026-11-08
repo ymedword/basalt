@@ -545,3 +545,26 @@ CI run 42409706693（提交 `9c01b2e`）step 9「Current cumulative stage」在 
 | 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`，七目标全绿：format 干净 / vet（`-tags=integration`）+ staticcheck + gosec + govulncheck 通过 / `test` 与 `test-integration` 全包 `ok` 零 `FAIL` / `check-coverage: 全部包达标`（postgres 72.18%）/ `CGO_ENABLED=0` 构建成功；日志 `.loop/reviews/us24-repair-20261107/make-check-20261108.log` |
 
 **远端复验（2026-11-08 回填）**：修复提交 `9d34273` 推送 main 后触发 CI run [42418694700](https://github.com/ymedword/basalt/actions/runs/42418694700)，`conclusion=success`，7 个 job 全绿：`test`（fmt / lint / sec / test / test-integration / cover）、`postgres`（`-tags=integration`）、`flow`（US19 完整阶段 + 真实进程，含累计 current stage 与 `015-backfill`）、`build`（`CGO_ENABLED=0` 四平台）、`container`（us18-linux 真实镜像 + Compose）、`console`、`website`。原「未验证：远端 CI 读数」项就此关闭；本地定向复跑与远端读数分开记录，互为佐证而非替代。
+
+### 8.9 收口后 CI 修复 ③：检查点归一化的取消被折成"检查点损坏"（2026-11-08）
+
+CI run 42422682818（分支 `024-state-distributed`，提交 `2547c80`）job `flow` step 8「US19 complete source stage」在 check `019-flow-race` 判红。失败点是 `TestFlow_TransientRecoverErrorRetriesRecoverBeforeAdvance` 的夹具 cleanup：`testhelpers_distributed_test.go:518` 的 `require.NoError(t, err)` 报 `Received unexpected error: flow checkpoint unsupported`；测试主体的断言此前全部通过。同一提交的 main run 42422680493 全绿。回溯发现分支 run 42418682267（提交 `9d34273`）以同一位置、同一错误在 `TestFlow_InFlightAttemptWithUnresolvedActionAbandons` 上失败（`--- FAIL … (1.53s)`），上一轮只回填了 main run 42418694700、漏记该分支 run。两例共用 `startDistributedWorker` 夹具。
+
+**根因**：`scanFlowTaskData`（`internal/storage/postgres/flow_store.go`）把输入 / 输出归一化的错误与哈希不符合并判红。`flow.CanonicalJSON → core.CanonicalFlowJSON → DecodeFlowJSON(ctx, …)` 在上下文结束时返回 `ctx.Err()`；测试的 `t.Context()` 在 cleanup 函数之前取消，worker goroutine 的轮询（`ReadyRoots → readFlowRoots → scanFlowTask → scanFlowTaskData`）恰好落在归一化之中时，取消被折成 `flow.ErrCheckpointUnsupported`；`workerQueryError → CancellationOnly` 只认纯取消，`Worker.Run` 于是把正常停机返回成致命错误。两个测试的取消都发生在契约解码之后、输入归一化之中，`-race` 放大时序窗口。
+
+**修复**：新增 `flowCheckpointScanError(ctx, err)`：ctx 已结束 → 返回 `ctx.Err()`；错误本身是 `context.Canceled` / `context.DeadlineExceeded` → 原样上抛；其余才折成 `flow.ErrCheckpointUnsupported`。输入与输出两处归一化共用；只改错误分类，不改归一化结果与哈希判据。同包另两处 `CanonicalJSON` 错误折叠（`flow_completed_store.go` 的 `validateFinalOutput`、`flow_query_store.go` 的查证读取）走 `ErrStateConflict` 且不与 Worker 停机轮询相连，本轮不动。
+
+**判据面**：零删除 / 零放宽——不删断言、不提高超时、不加抑制注释；新增 `TestFlowCheckpointScanErrorDistinguishesCancellation`（4 子例：取消上下文、过期 deadline、活上下文 + 取消哨兵、活上下文 + 真实损坏）。真实数据损坏的折叠语义不变，仍由 `TestFlow_CrossCallerMalformedCheckpointHidden` / `TestFlow_TaskContractHashMismatchBlocksWorker` 判红。
+
+**验证读数**：
+
+| 项 | 读数 |
+| --- | --- |
+| 逆改（仓库外 `-overlay` 把 helper 退回一律折 `ErrCheckpointUnsupported`） | 三取消子例逐字 FAIL（`expected: "context canceled"` / `"context deadline exceeded"`，`in chain: "flow checkpoint unsupported"`），`corrupt-checkpoint` PASS；`.loop/reviews/us24-repair-20261107/inverse-mutation-8-checkpoint-cancellation.log` |
+| helper 单测（真实代码） | 4/4 PASS（`ok … 0.005s`）；`checkpoint-scan-unit-20261108.log` |
+| 定向 `-race` 复跑两例（真实 PG） | 两例 PASS（0.54s / 1.47s，包 3.047s）；`targeted-race-flow-20261108.log` |
+| 真实损坏语义复跑 | 两例 PASS（0.27s / 0.24s，包 0.519s）；`corruption-semantics-20261108.log` |
+| 复现尝试 `-race -count=12` | 12/12 PASS（`ok … 6.551s`），窗口极窄、本地无法稳定复现；`repro-count12-20261108.log` |
+| 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`，七目标全绿；`internal/app` 三轮 39.058s / 348.371s / 355.164s，`internal/storage/postgres` 三轮 1.080s / 243.277s / 242.716s，`FAIL` 零行；`check-coverage: 全部包达标`（postgres 72.18%）；日志 `.loop/reviews/us24-repair-20261107/make-check-20261108b.log` |
+
+**远端复验（回填）**：推送后补。

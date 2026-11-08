@@ -58,13 +58,26 @@ func scanFlowTaskData(ctx context.Context, row flowScanner) (flow.Task, error) {
 	}
 	// JSONB may rewrite whitespace/number spellings inside RawMessage. Restore
 	// semantic canonical bytes before checking frozen input and output identities.
+	//
+	// 归一化失败**不得**一律当成"检查点损坏"：CanonicalJSON 在 ctx 结束时返回
+	// ctx.Err()，若与哈希不符一起折成 ErrCheckpointUnsupported，正常停机就会把
+	// `flow.Worker.Run` 变成致命错误（CI `-race` 019-flow-race 的偶发失败即这条
+	// 路径：停机取消恰好落在契约解码之后、输入归一化之中）。取消原样上抛。
+	// A cancelled canonicalization must propagate as cancellation, not corruption;
+	// only a live context plus a real data fault maps to ErrCheckpointUnsupported.
 	task.Revision.Input, err = flow.CanonicalJSON(ctx, task.Revision.Input)
-	if err != nil || flowDataHash(task.Revision.Input) != task.Revision.InputHash {
+	if err != nil {
+		return task, flowCheckpointScanError(ctx, err)
+	}
+	if flowDataHash(task.Revision.Input) != task.Revision.InputHash {
 		return task, flow.ErrCheckpointUnsupported
 	}
 	for key, output := range task.Revision.Outputs {
 		output.Value, err = flow.CanonicalJSON(ctx, output.Value)
-		if err != nil || flowDataHash(output.Value) != output.Hash {
+		if err != nil {
+			return task, flowCheckpointScanError(ctx, err)
+		}
+		if flowDataHash(output.Value) != output.Hash {
 			return task, flow.ErrCheckpointUnsupported
 		}
 		task.Revision.Outputs[key] = output
@@ -262,6 +275,22 @@ func (s *FlowStore) Create(ctx context.Context, req flow.CreateTask) (flow.Task,
 }
 
 func flowDataHash(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
+
+// flowCheckpointScanError 把检查点归一化的失败分成两类：ctx 已结束（或错误本身
+// 就是取消哨兵）时**原样返回取消**，其余才折叠为 ErrCheckpointUnsupported。
+// 取消必须可辨认：`flow.Worker.Run` 用 workerQueryError → CancellationOnly 判定
+// 停机期间的纯取消，折成"检查点损坏"会让一次正常停机返回致命错误。
+// flowCheckpointScanError keeps a cancelled scan distinct from a corrupted
+// checkpoint so worker shutdown is not reported as data corruption.
+func flowCheckpointScanError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return flow.ErrCheckpointUnsupported
+}
 
 // mustFlowJSON handles only our bounded structs; all arbitrary input is checked
 // before this helper. A marshal error produces invalid JSON and fails SQL closed.
