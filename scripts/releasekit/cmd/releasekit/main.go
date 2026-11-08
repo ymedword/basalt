@@ -203,6 +203,21 @@ func runPackage(ctx context.Context, args []string, out io.Writer) error {
 	return nil
 }
 
+// resolveBuildDir 把"缺省用临时目录"落成真实目录；返回的清理函数只在临时目录
+// 上真正删除（显式传入的目录归调用方所有）。
+// resolveBuildDir turns the "use a temporary directory" default into a real one; the
+// returned cleanup only removes a temporary directory, never a caller-provided one.
+func resolveBuildDir(dir string) (string, func(), error) {
+	if dir != "" {
+		return dir, func() {}, nil
+	}
+	temp, err := os.MkdirTemp("", "basalt-release-build-")
+	if err != nil {
+		return "", nil, fmt.Errorf("创建构建目录：%w", err)
+	}
+	return temp, func() { _ = os.RemoveAll(temp) }, nil
+}
+
 // runRelease 是单目标的完整发布流程：构建、打包、静态校验，匹配宿主时再做双构建
 // 比较与冒烟 / 升级探针，并写出可汇总的宿主证据。四平台发布在各自宿主上各跑一次。
 // runRelease drives one target end to end: build, package, static verification and,
@@ -244,9 +259,16 @@ func runRelease(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// 帮助说"缺省用临时目录"，实现必须给出真目录：BuildTarget 不接受空字符串。
+	// The help promises a temporary directory; BuildTarget cannot take an empty one.
+	buildDirValue, cleanup, err := resolveBuildDir(*buildDir)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	opts := releasekit.ReleaseOptions{
 		Repo: *repo, Version: *version, Tag: *tag, Mode: releasekit.Mode(*mode),
-		Target: target, WorkDir: *buildDir, OutDir: *outDir, RuntimeDir: *runtimeDir,
+		Target: target, WorkDir: buildDirValue, OutDir: *outDir, RuntimeDir: *runtimeDir,
 		Format: *format, EvidenceDir: *evidenceDir, NotesPath: *notes,
 		SigningKey: *signingKey, PublicKey: *publicKey, TrustFile: *trust,
 		Workspace: *workspace, DSN: *dsn, Agent: *agent, Addr: *addr, AdminTokenEnv: *tokenEnv,

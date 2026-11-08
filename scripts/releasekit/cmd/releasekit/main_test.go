@@ -110,3 +110,37 @@ func TestWriteJSONFile(t *testing.T) {
 		t.Fatal("目录不存在应报错")
 	}
 }
+
+// 中文验收点：--build-dir 缺省时必须给出真实目录（此前空字符串直接让构建失败），
+// 显式目录不得被清理。
+// resolveBuildDir must yield a real directory when the flag is empty, and must never
+// remove a caller-provided directory.
+func TestResolveBuildDir(t *testing.T) {
+	explicit := t.TempDir()
+	got, cleanup, err := resolveBuildDir(explicit)
+	if err != nil {
+		t.Fatalf("显式目录不应失败：%v", err)
+	}
+	if got != explicit {
+		t.Fatalf("显式目录应原样返回：%q != %q", got, explicit)
+	}
+	cleanup()
+	if _, err := os.Stat(explicit); err != nil {
+		t.Fatalf("显式目录不得被清理：%v", err)
+	}
+
+	got, cleanup, err = resolveBuildDir("")
+	if err != nil {
+		t.Fatalf("缺省临时目录不应失败：%v", err)
+	}
+	if got == "" {
+		t.Fatal("缺省时必须返回真实目录，收到空字符串")
+	}
+	if _, err := os.Stat(got); err != nil {
+		t.Fatalf("临时目录应已创建：%v", err)
+	}
+	cleanup()
+	if _, err := os.Stat(got); !os.IsNotExist(err) {
+		t.Fatalf("临时目录应在清理后消失：%v", err)
+	}
+}
