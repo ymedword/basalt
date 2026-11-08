@@ -676,6 +676,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # job 容器以 root 运行，而 checkout 的属主是 runner 用户：git 会以 dubious
+      # ownership 拒绝读取工作区，`git describe`（make build 的版本注入）与 go 的
+      # buildvcs 都会失败。只把本工作区登记为 safe，不改构建参数与判据。
+      # The container runs as root while the checkout is owned by the runner user;
+      # git refuses to read it. Mark only this workspace safe.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install make, python and psql
         run: |
           apt-get update
