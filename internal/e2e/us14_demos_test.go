@@ -1428,6 +1428,20 @@ func (f *demoFixture) installAgent(t *testing.T, source string, opts demoOptions
 		t.Fatalf("写 %s/AGENT.md 失败: %v", source, err)
 	}
 	f.h.writeActiveLifecycleState(t, source)
+	// 安装器落盘时基线已经把这五只 Demo 索引成 disabled / 代数 1；夹具刚把状态文件
+	// 直接写成 active / 代数 2——绕过了真实启用操作对共享索引的推进。P-17 守卫不允许
+	// 把更高的本地代次写回索引，索引会停在代数 1，StartRun 随即以
+	// AGENT_LIFECYCLE_MISMATCH 拒绝。索引只是状态文件的可重建派生面：删掉这一行，
+	// 下一次启动基线按状态文件重建（与 `writeAgent` 夹具"先写状态文件、基线再索引"
+	// 的次序等价），bundle 发布与准入仍走产品自己的路径。
+	// The baseline already indexed this demo as disabled/generation 1 when the installer
+	// landed it; the fixture then writes active/generation 2 directly, bypassing the
+	// management operation that would advance the shared index. P-17 forbids writing the
+	// higher local generation back, so the stale derived row is dropped and the next
+	// startup baseline rebuilds it from the authoritative state file.
+	if _, err := f.h.openDB(t).Exec(`DELETE FROM agent_lifecycle WHERE agent_name = $1`, source); err != nil {
+		t.Fatalf("清理 Demo %s 的派生生命周期索引失败: %v", source, err)
+	}
 	return dir
 }
 
