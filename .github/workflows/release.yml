@@ -43,7 +43,7 @@ jobs:
             goarch: arm64
             target: linux/arm64
             tier: binary
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: arm64
             target: darwin/arm64
