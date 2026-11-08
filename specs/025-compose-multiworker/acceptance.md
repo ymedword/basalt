@@ -176,6 +176,17 @@
 
 见 §1.1 `test` / `test-integration` / `cover` 三个目标的读数：`go test -race -cover ./...` 与 `go test -tags=integration ./...` 全仓执行，前序 24 个 US 的用例与 US-25 新增用例在同一轮判定（40 + 42 包全 ok、0 FAIL）。base stage 另外重跑前序承重用例：`TestInstanceSecrets_*`（US-18 自动建钥）、`TestCLI_Init*`、`TestDemoWorkflow*`、`scripts/releasekit` 既有镜像用例。`docker/compose.yaml`（US-18）、`release/support-matrix.json`、`harness/acceptance.json` 均空 diff；`us18_stack_test.go` 只做新字段适配（#5），断言不变。
 
+### 4.3 收口后的 CI 修复与历史 stage 回归（2026-11-08）
+
+收口提交 `c0a5e92` 推送后，main CI 运行 [42485963668](https://github.com/ymedword/basalt/actions/runs/42485963668) 的 test job 判红，其余六个 job（console / build / website / postgres / flow / container）全绿；判红点只有一个：累计 stage 的 `015-backfill` 里 `TestBackfill_Bootstrap/status_no_config` 输出缺少「未发现配置」。
+
+- **根因（已复现）**：该用例是 US-1 的 e2e 夹具，仍假设 `basalt init` 不写配置文件；US-25 的 FR-25-01 批准了相反的行为（init 在 SQLite `Bootstrap` 之前写出 `basalt.yaml`）。本地按 `harness/stages/current.json` 的 `015-backfill` 原始命令复跑，得到同一失败子测试与同一文案（包耗时 181.53s 判红）。
+- **修复（判据面不变）**：夹具在 init 之后、断言之前移除生成的 `basalt.yaml`，用例继续判「有骨架与源库、没有配置文件」的工作区（存量工作区，或运维删掉配置的现场）；断言、退出码与期望文案逐字未改。提交 `e98d55e`。
+- **同题第二处**：历史 stage `us14-14d` 的 E10（`TestUS14D_ExistingNoConfigUntouched`）有同一类假设——它用 `init` 构造「存量实例缺配置」的夹具。修复改为移除 init 生成的两份文件（`basalt.yaml`、`.basalt/instance.json`）、保留源库，重建 US-25 之前的现场；存量判定（库在 → 非新实例）与全部断言逐字不变。提交 `4b7b246`。
+- **本地验证**：修复后按 stage 原始命令复跑 `015-backfill` 全绿（0 失败，包耗时 163.41s）；`^TestUS14D` 组 10 个 `required_tests` 中 9 个通过（含修改前判红的 E10），`FixtureEndToEnd` 与 `TestUS14Demos_Fixture` 因非 root 绑 `127.0.0.1:80` 在夹具阶段失败（未调用任何产品路径），登记为本地未验证（run-state §4）；`gofumpt -l` 无差异，`go vet -tags=e2e,slow,real ./internal/e2e` 退出 0。
+- **修复后的 CI（2026-11-08 回填）**：最终 HEAD `4b7b246` 的运行 [42492426068](https://github.com/ymedword/basalt/actions/runs/42492426068) **全 7 个 job 绿**。首次修复 `e98d55e` 的运行 [42492076028](https://github.com/ymedword/basalt/actions/runs/42492076028) 的 test job 已绿（证明 `015-backfill` 修复生效），仅 postgres job 红一次：`TestFlow_ContextKeepsHardConstraintsAndFailsClosed/overflow` 报 `write tcp 127.0.0.1:5432: i/o timeout`，同一套件在 `c0a5e92` 与 `4b7b246` 的运行中均绿，且本次改动只动 e2e build tag 文件、不参与 `-tags=integration` 编译——按 CI 基础设施颤动登记（run-state §2），不写成代码缺陷、不重试掩盖。
+- **影响面**：只改两个 `_test.go` 文件（`internal/e2e/bootstrap_test.go` +10、`internal/e2e/us14_builtin_test.go` +15/−1），不改产品代码、契约、依赖、迁移与设计工件；四份 stage 报告与冻结指纹的依据仍是交付树 `c0a5e92`，见 §9 追加说明。
+
 ## 5. 全局不变量自查（机器可判）
 
 逐条复核命令与当场读数（2026-11-08，冻结树；命令保留于本表可按行复跑，过程产物收口时已删）。
@@ -352,3 +363,5 @@ $ diff /tmp/us25-fp-freeze.txt /tmp/us25-fp-after.txt
 （原始 `diff` 输出以 TAB 作列分隔，上面以 `\t` 转义显示；路径与哈希逐字保留。）
 
 本节写入会改变本文件自身的内容哈希，因此上面的逐文件哈希与聚合指纹是**本节写入前**的快照，不再回填（避免自指）。写入本节后再次重算清单并对比冻结清单：差异集合仍为且仅为 `specs/025-compose-multiworker/acceptance.md` 一条路径，无其他增删；复核判据是“diff 恰好一行且路径为本文件”，不以某个固定哈希值为判据。同一判据的机器证据是四份 `report.json` 的 `fingerprint` 字段同为 `d7c285f2…`（本轮四份 stage 在同一冻结树上执行）。
+
+**收口后修复的范围说明（2026-11-08 追加）**：本节指纹快照取自交付树 `c0a5e92`。其后的两个修复提交只改 `internal/e2e/bootstrap_test.go`（+10）与 `internal/e2e/us14_builtin_test.go`（+15/−1），都是测试夹具（§4.3）；现在重算清单会在这两条路径上与本文件一起出现差异——这是收口后修复的预期结果，不是交付树漂移。产品代码、契约、迁移与设计工件未变，四份 stage 报告仍对应 `c0a5e92` 树。

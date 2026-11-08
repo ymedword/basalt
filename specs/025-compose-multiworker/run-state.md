@@ -391,6 +391,9 @@ analyze（只读）结论 CRITICAL=0、33/33 FR 有 check、50/50 `required_test
 | 2026-11-08 | 升级用例把 `agent_resource_bindings.projected_at` 判成业务改动（`1:affe8c4f… → 1:76923001…`） | 该列每次启动由 `BindingStore.Rebuild` 全量重建刷新，是派生时间戳不是业务事实 | 指纹投影剔除 `scheduled_tasks.updated_at` 与 `agent_resource_bindings.projected_at` 两列；行数与其余列仍在指纹内；复跑通过 | 1（用例判据，非产品缺陷） |
 | 2026-11-08 | 升级用例读 `secrets/master.key` 报 permission denied | 宿主文件 `0400 10001:10001`，测试进程非属主；`0400` 是该密钥的正确权限，不是配置错误 | 摘要 / 备份 / 恢复改走 root 一次性容器，不打印密钥字节与哈希；复跑通过 | 1（用例执行方式，非产品缺陷） |
 | 2026-11-08 | 升级用例读 bundle 内定义副本报 `No such file`：`…/<hash>/agent/.basalt/agents/us25-probe/AGENT.md` | 测试常量把卷相对路径拼到 bundle 后；实际布局是 `agent/<工作区根相对路径>`（`assets.ConfigBundleRel`） | 常量改为 `<bundle>/agent/agents/<agent>/AGENT.md`；复跑通过 | 1（用例问题，非产品缺陷） |
+| 2026-11-08 | 收口后 main CI 运行 [42485963668](https://github.com/ymedword/basalt/actions/runs/42485963668) 的 test job 判红：累计 stage 的 `015-backfill` 失败，`TestBackfill_Bootstrap/status_no_config` 报输出缺少「未发现配置」（其余六个 job 全绿） | US-1 的 e2e 夹具仍假设 `basalt init` 不写配置文件；US-25 FR-25-01 已让 init 在 SQLite `Bootstrap` 之前写出 `basalt.yaml` | 判据面逐字不变：夹具在 init 之后、断言之前移除生成的 `basalt.yaml`，用例仍判「有骨架与源库、没有配置文件」的工作区；按 `harness/stages/current.json` 的 `015-backfill` 原始命令本地复跑 0 失败（包耗时 163.41s）；修复提交 `e98d55e` | 1（已批准接口变更触及历史夹具，非产品缺陷） |
+| 2026-11-08 | 同题第二处：历史 stage `us14-14d` 的 `TestUS14D_ExistingNoConfigUntouched`（E10）复跑判红，输出缺少「存量实例」——`init` 之后配置与名册都已存在，`serve` 走的是入口限流缺失路径 | 同一类假设：E10 用 `init` 构造「存量实例缺配置」的夹具，而 US-25 起 init 同时写配置与名册 | 夹具移除 init 生成的两份文件（`basalt.yaml`、`.basalt/instance.json`）、保留 `.basalt/basalt.db`，重建 US-25 之前的现场；存量判定与全部断言逐字不变，移除前先断言两份文件确实存在；本地 `^TestUS14D` 组 10 个 `required_tests` 中 9 个通过（含 E10），`FixtureEndToEnd` 与 `TestUS14Demos_Fixture` 因非 root 绑 `127.0.0.1:80` 在夹具阶段失败，登记为本地未验证；修复提交 `4b7b246` | 2（与上一条同根：init 语义变更后的历史夹具假设） |
+| 2026-11-08 | 运行 [42492076028](https://github.com/ymedword/basalt/actions/runs/42492076028)（`e98d55e`）的 postgres job 判红：`TestFlow_ContextKeepsHardConstraintsAndFailsClosed/overflow` 报 `write tcp 127.0.0.1:46812->127.0.0.1:5432: i/o timeout`（`internal/app/flow_context_integration_test.go:77`；同因导致 `wire_test.go:359` 一处断言失败） | CI 服务容器到 PostgreSQL 的网络超时（基础设施颤动），不是代码回归：同一套件在 `c0a5e92`（运行 42485963668）与 `4b7b246`（运行 42492426068）两次运行均绿；该修复只改 e2e build tag 文件，不参与 `-tags=integration` 编译 | 不重试、不改用例；以 `4b7b246` 的全绿运行作为结论文据；本行只如实登记，不把基础设施颤动写成已修复的代码缺陷 | 1（基础设施颤动，非本 US 改动引入） |
 
 ## 3. 停止预算与计数
 
@@ -413,6 +416,7 @@ analyze（只读）结论 CRITICAL=0、33/33 FR 有 check、50/50 `required_test
 | 数据库 HA / 主备 / 故障转移 | 未验证 | 明确不在本 US 范围；支持矩阵不得写入 |
 | 容器隔离（OCI/gVisor）验证与 Demo 双模适配 | 未验证 | 归 US-20 / US-25B；本 US 只写文档警告 |
 | Windows 原生 L3 容器用例 | 未验证 | 需 Linux 容器或 WSL2；缺环境按跳过登记，不冒充通过 |
+| `TestUS14D_FixtureEndToEnd` 与 `TestUS14Demos_Fixture` 的本地复跑 | 未验证 | 两者的夹具都要绑 `127.0.0.1:80`，WSL 非 root 报 `permission denied`，失败发生在调用任何产品路径之前；CI 当前累计 stage 不含 `us14-14d`，本次未改这两例的断言 |
 | `3f8d0dc` 的 main 分支 CI 运行（42433483456） | 未验证 | 收尾文档提交触发的 CI 在开始实施时仍 in_progress；变红须先定位，不阻塞 US-25 实施本身 |
 | 正式发布 tag / 签名 / Release 上传 | 未验证 | 归 US-17 流程，需用户明确触发 |
 | `docs/GettingStarted.md` 的 T023 编辑 | 未入库（非交付面） | 该文件被 `.git/info/exclude:30` 排除且未受跟踪（`git ls-files --error-unmatch` 非零）；T023 的导航改动只留在本地工作区，**不得** `git add -f`；US-25 交付面不含此文件 |
@@ -427,8 +431,8 @@ analyze（只读）结论 CRITICAL=0、33/33 FR 有 check、50/50 `required_test
 | 人工 review ② | **通过（用户 2026-11-08 预授权直通）** | 用户原话见 `acceptance.md` §8；本次为 AI 代执行的收口提交，非用户逐项走查 |
 | 人工项 10–11（文档走查 / 隔离声明核对） | **未人工执行** | 自动断言通过；`acceptance.md` §6.2 明列，不写成人工已接受 |
 | 人工项 12（真实双宿主） | **不做 / 未测量** | 按范围推迟到首发后 A+B 演示；§4 未验证清单保留 |
-| 提交与推送 | **随本文件所在提交执行** | 分支 `025-compose-multiworker` → `main` 快进合并；提交 SHA 用 `git log -1` 核对（本文件不能记录自身提交的 SHA） |
-| 推送后 CI | **待跟踪** | 变绿后回填运行号与结论；变红先定位修复，不把进行中写成通过 |
-| 未验证清单（§4） | **保持原样（10 条）** | 收口不翻转任何"未验证"项 |
+| 提交与推送 | **已完成** | 交付提交 `c0a5e92`（分支 `025-compose-multiworker` → `main` 快进合并，两端同 SHA）；收口后修复 `e98d55e`（`015-backfill` 夹具）、`4b7b246`（US-14D E10 夹具）；文档回填随本文件所在提交执行 |
+| 推送后 CI | **通过（最终 HEAD）** | `4b7b246` 的运行 [42492426068](https://github.com/ymedword/basalt/actions/runs/42492426068) 全 7 个 job 绿（test job 的累计 stage 含 `015-backfill`，postgres 集成套件绿）。首次修复 `e98d55e` 的运行 [42492076028](https://github.com/ymedword/basalt/actions/runs/42492076028) test job 绿、postgres job 红一次：`TestFlow_ContextKeepsHardConstraintsAndFailsClosed/overflow` 报 `write tcp 127.0.0.1:5432: i/o timeout`（容器网络超时），同一套件在 `c0a5e92` 与 `4b7b246` 两次运行均绿，且该改动只动 e2e build tag 文件、不参与 `-tags=integration` 编译；按基础设施颤动登记，见 §2 |
+| 未验证清单（§4） | **11 条** | 收口不翻转任何"未验证"项；新增一条：`TestUS14D_*` 两个 Demo 组因 `127.0.0.1:80` 需 root 而本地未验证 |
 
-**待回填**：CI 运行号与结果（提交 / 推送后追加本行，不预写）。
+**CI 回填（2026-11-08）**：最终 HEAD `4b7b246` 的 main CI 运行 [42492426068](https://github.com/ymedword/basalt/actions/runs/42492426068) **全绿（7/7）**；判红到变绿的过程（`015-backfill` 夹具、US-14D E10 夹具、一次 postgres 网络超时）见 §2 台账末三行。
