@@ -70,6 +70,9 @@ jobs:
           GOPROXY: https://goproxy.cn
         run: |
           set -euo pipefail
+          # TestRepoInvariants_CIRunDirsUnique 按字面判 --out：参数本身必须带
+          # GITHUB_RUN_ID 与 GITHUB_RUN_ATTEMPT（变量引用不算），故此处直接写全，
+          # 不复用下面的 $run / $artifacts 简写。
           run=dist/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
           artifacts="$run/artifacts"
           evidence="$run/evidence"
@@ -81,13 +84,14 @@ jobs:
             go run ./scripts/releasekit/cmd/releasekit build \
               --repo . --version "${{ inputs.version }}" --mode rehearsal \
               --target "${{ matrix.target }}" --tier full \
-              --out "$run/build"
+              --out "dist/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/build"
             binary="$run/build/basalt"
             if [ "${{ matrix.goos }}" = "windows" ]; then binary="$binary.exe"; fi
             go run ./scripts/releasekit/cmd/releasekit package \
               --repo . --version "${{ inputs.version }}" \
               --binary "$binary" --target "${{ matrix.target }}" \
-              --tier full --runtime "$runtime" --out "$artifacts"
+              --tier full --runtime "$runtime" \
+              --out "dist/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/artifacts"
             go run ./scripts/releasekit/cmd/releasekit verify-package \
               --archive "$archive" --version "${{ inputs.version }}" \
               --target "${{ matrix.target }}" --tier full
@@ -96,7 +100,8 @@ jobs:
             go run ./scripts/releasekit/cmd/releasekit release \
               --repo . --version "${{ inputs.version }}" --mode rehearsal \
               --target "${{ matrix.target }}" --tier binary \
-              --out "$artifacts" --evidence-dir "$evidence"
+              --out "dist/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/artifacts" \
+              --evidence-dir "$evidence"
           fi
           # 汇总目录只放两类文件：归档与证据。evidence-*.json 前缀唯一，汇总侧按名字分流。
           mkdir -p dist/upload
@@ -152,7 +157,8 @@ jobs:
           go run ./scripts/releasekit/cmd/releasekit assemble \
             --artifact-dir dist/artifacts --evidence-dir dist/evidence \
             --version "${{ inputs.version }}" --mode rehearsal \
-            --notes "$notes" --out "$out"
+            --notes "$notes" \
+            --out "dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           go run ./scripts/releasekit/cmd/releasekit verify --release-dir "$out"
           echo "== support matrix =="
           cat "$out/support-matrix.json"
