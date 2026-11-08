@@ -1,8 +1,10 @@
 name: release
 
-# 发布工作流只构建、打包并汇总候选制品；tag、push 与公开发布由用户执行。
-# The release workflow only builds and assembles candidates; tagging, pushing and
-# publishing remain user actions.
+# 发布工作流：四平台构建 + 打包 + 静态校验，能真实运行的目标再跑一次宿主冒烟并写证据，
+# 最后汇总成预演目录并验证。正式 tag、签名与公开上传仍由用户发出发布指令后单独执行。
+# The release workflow builds, packages and statically verifies all four targets, runs
+# the host smoke on targets that can actually execute there, then assembles and verifies
+# a rehearsal directory. Tagging, signing and publishing remain separate user actions.
 
 on:
   workflow_dispatch:
@@ -21,45 +23,92 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # full 档的两台宿主必须产出携带运行时组件的完整归档；冒烟与升级探针需要
+          # 部署工作区与数据库，归本地真实宿主执行（见 F-02 / F-03 证据），
+          # 本工作流只保证同一干净提交下可构建、可打包、可静态校验。
           - os: windows-latest
+            goos: windows
+            goarch: amd64
             target: windows/amd64
             tier: full
           - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
             target: linux/amd64
             tier: full
+          # arm 目标在各自真实宿主上运行一次 `basalt --version`（binary 档冒烟），
+          # 证据写进预演目录——交叉编译不算运行通过。
           - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
             target: linux/arm64
             tier: binary
           - os: macos-14
+            goos: darwin
+            goarch: arm64
             target: darwin/arm64
             tier: binary
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.3"
-      - name: Build and package
+
+      # 运行时组件按 release/runtime-manifest.json 装配：每个下载物先校验 SHA-256，
+      # 版本回显与清单不一致即失败。缓存目录按平台分开，避免两平台同名归档互相污染。
+      - name: Stage runtime components (full tier)
+        if: matrix.tier == 'full'
+        shell: bash
+        run: |
+          sh scripts/release-package/stage-runtime.sh \
+            "${{ matrix.goos }}" "$RUNNER_TEMP/runtime" "$RUNNER_TEMP/runtime-cache"
+      - name: Build, package and verify
         shell: bash
         env:
           GOPROXY: https://goproxy.cn
         run: |
-          # 每次运行 / 重试独占目录：run id + attempt 由 Actions 注入，避免证据互相覆盖。
-          go run ./scripts/releasekit/cmd/releasekit build \
-            --repo . --version "${{ inputs.version }}" --mode rehearsal \
-            --target "${{ matrix.target }}" --tier "${{ matrix.tier }}" \
-            --out "dist/build-${{ matrix.os }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          binary="dist/build-${{ matrix.os }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/basalt"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then binary="$binary.exe"; fi
-          go run ./scripts/releasekit/cmd/releasekit package \
-            --repo . --version "${{ inputs.version }}" \
-            --binary "$binary" --target "${{ matrix.target }}" \
-            --tier "${{ matrix.tier }}" --runtime "release/runtime" \
-            --out "dist/artifacts-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          set -euo pipefail
+          run=dist/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          artifacts="$run/artifacts"
+          evidence="$run/evidence"
+          mkdir -p "$artifacts" "$evidence"
+          if [ "${{ matrix.goos }}" = "windows" ]; then ext=zip; else ext=tar.gz; fi
+          archive="$artifacts/basalt-${{ inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.${ext}"
+          if [ "${{ matrix.tier }}" = "full" ]; then
+            runtime="$RUNNER_TEMP/runtime"
+            go run ./scripts/releasekit/cmd/releasekit build \
+              --repo . --version "${{ inputs.version }}" --mode rehearsal \
+              --target "${{ matrix.target }}" --tier full \
+              --out "$run/build"
+            binary="$run/build/basalt"
+            if [ "${{ matrix.goos }}" = "windows" ]; then binary="$binary.exe"; fi
+            go run ./scripts/releasekit/cmd/releasekit package \
+              --repo . --version "${{ inputs.version }}" \
+              --binary "$binary" --target "${{ matrix.target }}" \
+              --tier full --runtime "$runtime" --out "$artifacts"
+            go run ./scripts/releasekit/cmd/releasekit verify-package \
+              --archive "$archive" --version "${{ inputs.version }}" \
+              --target "${{ matrix.target }}" --tier full
+          else
+            # binary 档：匹配宿主时 `release` 会解包并真实运行一次 `basalt --version`。
+            go run ./scripts/releasekit/cmd/releasekit release \
+              --repo . --version "${{ inputs.version }}" --mode rehearsal \
+              --target "${{ matrix.target }}" --tier binary \
+              --out "$artifacts" --evidence-dir "$evidence"
+          fi
+          # 汇总目录只放两类文件：归档与证据。evidence-*.json 前缀唯一，汇总侧按名字分流。
+          mkdir -p dist/upload
+          cp "$artifacts"/* dist/upload/
+          if ls "$evidence"/evidence-*.json >/dev/null 2>&1; then
+            cp "$evidence"/evidence-*.json dist/upload/
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: artifact-${{ strategy.job-index }}
-          path: dist/artifacts-${{ github.run_id }}-${{ github.run_attempt }}/*
+          name: release-${{ strategy.job-index }}
+          path: dist/upload/*
+          if-no-files-found: error
 
   assemble:
     needs: build
@@ -71,25 +120,44 @@ jobs:
           go-version: "1.27.3"
       - uses: actions/download-artifact@v4
         with:
-          path: dist/artifacts
+          path: dist/collected
           merge-multiple: true
+      - name: Split archives and host evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/artifacts dist/evidence
+          shopt -s nullglob
+          for file in dist/collected/*; do
+            case "$(basename "$file")" in
+              evidence-*.json) mv "$file" dist/evidence/ ;;
+              *) mv "$file" dist/artifacts/ ;;
+            esac
+          done
+          ls -l dist/artifacts dist/evidence
       - name: Assemble rehearsal release
         shell: bash
         env:
           GOPROXY: https://goproxy.cn
         run: |
-          # 发布说明写到 runner 临时目录：汇总要求工作区干净（git status 无输出），
-          # 落在仓库根会变成未跟踪文件，assemble 直接失败。
-          notes="$RUNNER_TEMP/basalt-notes-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.md"
-          sed "s/__VERSION__/${{ inputs.version }}/g" release/notes/TEMPLATE.md > "$notes"
+          set -euo pipefail
+          # 发布说明优先用仓库里的正式文本；没有时为本次版本从模板生成。
+          # 生成物写 runner 临时目录：汇总要求工作区干净，落在仓库根会变成未跟踪文件。
+          notes="release/notes/${{ inputs.version }}.md"
+          if [ ! -f "$notes" ]; then
+            notes="$RUNNER_TEMP/basalt-notes-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.md"
+            sed "s/__VERSION__/${{ inputs.version }}/g" release/notes/TEMPLATE.md > "$notes"
+          fi
+          out="dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           go run ./scripts/releasekit/cmd/releasekit assemble \
             --artifact-dir dist/artifacts --evidence-dir dist/evidence \
             --version "${{ inputs.version }}" --mode rehearsal \
-            --notes "$notes" \
-            --out "dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          go run ./scripts/releasekit/cmd/releasekit verify \
-            --release-dir "dist/release/${{ inputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            --notes "$notes" --out "$out"
+          go run ./scripts/releasekit/cmd/releasekit verify --release-dir "$out"
+          echo "== support matrix =="
+          cat "$out/support-matrix.json"
       - uses: actions/upload-artifact@v4
         with:
           name: release-rehearsal
           path: dist/release/${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}/*
+          if-no-files-found: error
