@@ -143,8 +143,14 @@ func TestTemplates_LoadAndTools(t *testing.T) {
 
 	// 模板是「复制到 .basalt/agents 与 .basalt/skills」的交付物：判据必须落在仓库里
 	// 发出去的那一份字节上，夹具不另写 AGENT.md。
-	// The templates are copied verbatim into the workspace; the gate judges the shipped bytes.
-	workspaceDir := filepath.Join(h.Root, ".basalt")
+	// 判卷目录必须是干净的独立工作区根：`tool list` 走完整装配，开箱安装器会往
+	// h.Root 的工作区装五个内置 Agent 与四个 Flow 角色（US-25 首次安装意图落盘后，
+	// init 之后的下一次完整装配即安装）；装进那里会让下面的条目计数混入产品自己
+	// 装的 Agent。条目数仍固定为八，判据面不变。
+	// The staging root must be pristine: `tool list` runs the full assembly and the
+	// open-box installer writes nine agents into h.Root's workspace. The eight-entry
+	// assertion is unchanged; only the staging directory is isolated.
+	workspaceDir := filepath.Join(t.TempDir(), ".basalt")
 	for _, tc := range templateCatalog {
 		templateStage(t, repo, workspaceDir, tc.name)
 	}

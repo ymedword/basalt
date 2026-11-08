@@ -533,12 +533,14 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 
 	// Linux 专属 ①：实例私有目录 0700、主密钥与访问密码 0600（设计 §2.4.2 的 Unix 边）。
 	privateDir := filepath.Join(dataRoot, "basalt", "instances", instanceID)
-	// 本场景首次serve曾被入口校验拒绝，重试不是Fresh；按US-16公开契约显式初始化。
-	// This interrupted-start retry is not fresh; initialize through the approved explicit HTTP action.
-	if _, err := os.Stat(filepath.Join(privateDir, "master.key")); !os.IsNotExist(err) {
-		t.Fatalf("显式初始化前主密钥应不存在，实际 %v", err)
+	// 本场景首次 serve 曾被入口校验拒绝；按 US-25 FR-25-02（取代 US-16 的"重试不再
+	// 自动铸钥"口径），重试补发主密钥与访问密码，不存在"已有实例永远没有密钥"的死局。
+	// The interrupted first start is resumed by the retry, which mints the master key
+	// (US-25 FR-25-02); explicit initialization is no longer this path's remedy.
+	if _, err := os.Stat(filepath.Join(privateDir, "master.key")); err != nil {
+		t.Fatalf("中断首启后的重试应补发主密钥，实际 %v", err)
 	}
-	us14dInitializeRetrySecrets(t, us14dDefaultAddr, token)
+	us14dRequireRetrySecretsReady(t, us14dDefaultAddr, token)
 	us14dRequireMode(t, privateDir, 0o700, "实例私有目录")
 	us14dRequireMode(t, filepath.Join(privateDir, "master.key"), 0o600, "主密钥文件")
 	us14dRequireMode(t, filepath.Join(privateDir, "admin-token"), 0o600, "访问密码文件")
@@ -571,9 +573,10 @@ func TestFullPackage_LinuxInstallSmoke(t *testing.T) {
 		"instance_id=%s", installDir, pkg.BinaryBytes, pkg.RuntimeBytes, pkg.FileCount, instanceID)
 }
 
-// us14dInitializeRetrySecrets 只在无密钥、无恢复态的中断重试夹具中执行现有显式初始化。
-// Exercise the existing explicit init contract without relaxing new-instance or recovery rules.
-func us14dInitializeRetrySecrets(t *testing.T, addr, token string) {
+// us14dRequireRetrySecretsReady 判中断首启重试后的公开加密状态：主密钥已由重试补发、
+// 状态 ready、不再可初始化、有 key_id——与 US-25 FR-25-02 的续做语义同口径。
+// It asserts the public secrets view after the retry minted the key (FR-25-02).
+func us14dRequireRetrySecretsReady(t *testing.T, addr, token string) {
 	t.Helper()
 	type view struct {
 		State         string `json:"state"`
@@ -581,18 +584,11 @@ func us14dInitializeRetrySecrets(t *testing.T, addr, token string) {
 		KeyID         string `json:"key_id"`
 	}
 	resp := webRequest(t, addr, http.MethodGet, "/api/v1/instance/secrets", "", us14dAuthHeader(token))
-	var before view
-	requireWriteOK(t, resp, &before, "显式初始化前读取加密状态")
-	if before.State != "uninitialized" || !before.CanInitialize || before.KeyID != "" {
-		t.Fatalf("显式初始化前状态 = %s、can_initialize=%t、has_key_id=%t", before.State, before.CanInitialize, before.KeyID != "")
-	}
-	resp = webRequest(t, addr, http.MethodPost, "/api/v1/instance/secrets/init", `{"confirm":true}`, us14dAuthHeader(token))
-	requireWriteOK(t, resp, nil, "中断首启后显式初始化主密钥")
-	resp = webRequest(t, addr, http.MethodGet, "/api/v1/instance/secrets", "", us14dAuthHeader(token))
 	var after view
-	requireWriteOK(t, resp, &after, "显式初始化后读取加密状态")
+	requireWriteOK(t, resp, &after, "读取中断首启重试后的加密状态")
 	if after.State != "ready" || after.CanInitialize || after.KeyID == "" {
-		t.Fatalf("显式初始化后状态 = %s、can_initialize=%t、has_key_id=%t", after.State, after.CanInitialize, after.KeyID != "")
+		t.Fatalf("中断首启重试后状态 = %s、can_initialize=%t、has_key_id=%t（FR-25-02 要求已补发主密钥）",
+			after.State, after.CanInitialize, after.KeyID != "")
 	}
 }
 
