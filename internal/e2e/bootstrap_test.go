@@ -93,6 +93,16 @@ func testBootstrapInitIdempotent(t *testing.T) {
 func testBootstrapStatusNoConfig(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
+	// US-25（FR-25-01）起 `init` 会在工作区根写出首次配置 `basalt.yaml`。本节判的是
+	// **没有配置文件**时的纯工作区诊断（存量工作区，或运维删掉配置后的现场），因此
+	// 先移除这份生成物再断言——判据面逐字不变：节 2「未发现配置」点名路径、节 3 因
+	// 缺 `database.dsn` 失败、退出码 1、汇总点名「存储」。
+	// Since US-25 init writes the first-install config, this case judges the config-less
+	// workspace (legacy workdir, or an operator-removed file) and removes the generated
+	// config first; every assertion below stays unchanged.
+	if err := os.Remove(filepath.Join(h.Root, "basalt.yaml")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("移除 init 生成的配置失败: %v", err)
+	}
 
 	res := h.run(t, nil, "status")
 	requireExit(t, res, 1, "status 无配置")
