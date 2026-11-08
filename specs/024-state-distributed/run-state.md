@@ -386,5 +386,6 @@ diff .loop/reviews/us24-repair-20261107/fingerprint-files-pre-backfill.txt \
 | 复现尝试 `-race -count=12` | 12/12 PASS（`ok … 6.551s`），窗口极窄、本地无法稳定复现；日志 `repro-count12-20261108.log` |
 | 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`：format 干净；vet（`-tags=integration`）+ staticcheck + gosec + govulncheck 通过；`test` / `test-integration` / `cover` 三轮全包 `ok`、`FAIL` 零行（`internal/app` 39.058s / 348.371s / 355.164s；`internal/storage/postgres` 1.080s / 243.277s / 242.716s）；`check-coverage: 全部包达标`（`internal/storage/postgres` 72.18%）；`CGO_ENABLED=0` 构建成功；日志 `make-check-20261108b.log` |
 
-- **未验证**：远端 CI 复验读数在推送后回填；本地无法稳定复现该时序窗口，回归用例判在 helper 层（集成路径上已取消的 ctx 会先被契约解码消费掉，构造不出确定性的红态）。
+- **未验证**：本地无法稳定复现该时序窗口，回归用例判在 helper 层（集成路径上已取消的 ctx 会先被契约解码消费掉，构造不出确定性的红态）。远端 CI 复验见下一条。
+- **远端 CI 复验（2026-11-08）**：修复提交 `e470091` 推送分支与 main 后各触发一次 CI run，均 `status=completed`、`conclusion=success`，7 个 job 全 `success`——分支 run [42429728778](https://github.com/ymedword/basalt/actions/runs/42429728778)（`024-state-distributed`）的 `flow` job 含 `019-flow-race`，此前两轮分支 run（42418682267 / 42422682818）都在该 check 判红，本轮同一 check 通过；main run [42429731608](https://github.com/ymedword/basalt/actions/runs/42429731608) 同样 7/7 全绿（build / test / postgres / flow / container / console / website）。
 - **临时物清理**：本轮 `/tmp` 探针与下载产物（WSL `/tmp/us24scan`、Windows `/tmp/branch-flow-fail.log`、`/tmp/repro-app.log`、`/tmp/run42418682267`、`/tmp/wf-evi`）用毕即删；两份 CI 失败日志与四份定向证据日志复制到 `.loop/reviews/us24-repair-20261107/` 留档。

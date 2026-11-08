@@ -567,4 +567,4 @@ CI run 42422682818（分支 `024-state-distributed`，提交 `2547c80`）job `fl
 | 复现尝试 `-race -count=12` | 12/12 PASS（`ok … 6.551s`），窗口极窄、本地无法稳定复现；`repro-count12-20261108.log` |
 | 本地七目标 `make check` | `MAKE_CHECK_EXIT=0`，七目标全绿；`internal/app` 三轮 39.058s / 348.371s / 355.164s，`internal/storage/postgres` 三轮 1.080s / 243.277s / 242.716s，`FAIL` 零行；`check-coverage: 全部包达标`（postgres 72.18%）；日志 `.loop/reviews/us24-repair-20261107/make-check-20261108b.log` |
 
-**远端复验（回填）**：推送后补。
+**远端复验（2026-11-08）**：修复提交 `e470091` 推送后，分支 run [42429728778](https://github.com/ymedword/basalt/actions/runs/42429728778) 与 main run [42429731608](https://github.com/ymedword/basalt/actions/runs/42429731608) 均 `conclusion=success`、7 个 job 全绿（build / test / postgres / flow / container / console / website）；分支 run 的 `flow` job 通过 `019-flow-race`——此前两次分支失败（42418682267 / 42422682818）正落在该 check，此处闭环。§8.9 的「未验证：远端 CI 读数」就此关闭。
