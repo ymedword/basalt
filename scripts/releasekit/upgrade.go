@@ -124,16 +124,14 @@ func RunUpgrade(ctx context.Context, opts UpgradeOptions) (Backup, error) {
 		MasterKey: opts.MasterKey, AdminToken: opts.AdminToken,
 	}
 	backup.PostgresDump = filepath.Join(root, "postgres.dump")
-	args := []string{
-		"--format=custom", "--no-owner", "--file", backup.PostgresDump,
-		"--dbname", opts.DSN,
-	}
-	if opts.Schema != "" {
-		args = append(args, "--schema="+opts.Schema)
-	}
-	if err := runExternal(ctx, opts.PGDump, "pg_dump", args...); err != nil {
-		return Backup{}, fmt.Errorf("PostgreSQL 备份失败：%w", err)
-	}
+	// 先拍工作区、配置与凭据（快、且此后再无写者——服务已在 StopCommand 停掉），
+	// 最后跑耗时的数据库 dump：dump 是备份窗口的最后一步，它之后的任何写入都发生在
+	// "备份完成"之后，恢复时必须被抛弃而不是被当成备份内容。三对象齐备后才写
+	// backup.json——半截备份没有摘要元数据，restoreWith 会拒绝采用。
+	// Snapshot the cheap, already-quiescent objects first and run the heavy dump last,
+	// so anything written during the dump is strictly post-backup and must be discarded
+	// by a restore. backup.json (with digests) is written only after all three objects
+	// exist, so a half-finished backup is never accepted by restoreWith.
 	if err := copyDir(opts.Workspace, filepath.Join(root, "workspace")); err != nil {
 		return Backup{}, fmt.Errorf("workspace 备份失败：%w", err)
 	}
@@ -151,6 +149,16 @@ func RunUpgrade(ctx context.Context, opts UpgradeOptions) (Backup, error) {
 		if err := copyFile(source, filepath.Join(root, name), 0o600); err != nil {
 			return Backup{}, err
 		}
+	}
+	args := []string{
+		"--format=custom", "--no-owner", "--file", backup.PostgresDump,
+		"--dbname", opts.DSN,
+	}
+	if opts.Schema != "" {
+		args = append(args, "--schema="+opts.Schema)
+	}
+	if err := runExternal(ctx, opts.PGDump, "pg_dump", args...); err != nil {
+		return Backup{}, fmt.Errorf("PostgreSQL 备份失败：%w", err)
 	}
 	dumpSHA, err := FileSHA256(backup.PostgresDump)
 	if err != nil {

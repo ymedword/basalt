@@ -14,6 +14,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/scripts/releasekit"
 )
 
@@ -116,6 +118,7 @@ type upgradeFixture struct {
 	oldSHA256  string
 	workspace  string
 	configPath string
+	dsn        string
 }
 
 func newUpgradeFixture(t *testing.T) *upgradeFixture {
@@ -130,6 +133,14 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 	h := newHarness(t)
 	initWorkspace(t, h)
 	h.writeConfig(t, configWithAddr("http://127.0.0.1:1", freeLoopbackAddr(t)))
+	// 升级探针（releasekit.RunUpgrade）在本进程内读配置，解析的是**本进程**的环境：
+	// 夹具配置里的 ${BASALT_E2E_DSN} 必须在进程环境里指向本用例的隔离 schema，且要换成
+	// libpq 可解析的形态（探针把连接串原样交给 pg_dump / pg_restore）。
+	// The in-process probe resolves ${BASALT_E2E_DSN} from this process's env and hands
+	// the DSN to libpq tools, so the pinned schema must ride in `options=`, not pgx's
+	// `search_path` runtime key.
+	probeDSN := libpqDSN(t, h.Schema.DSN)
+	t.Setenv(dsnEnv, probeDSN)
 	requireExit(t, h.run(t, nil, "db", "migrate"), 0, "db migrate")
 
 	installDir := t.TempDir()
@@ -156,7 +167,30 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 	return &upgradeFixture{
 		h: h, archive: archive, version: version, installDir: installDir,
 		installed: installed, oldSHA256: oldSHA, workspace: workspace, configPath: configPath,
+		dsn: probeDSN,
 	}
+}
+
+// libpqDSN 把 pgtemp 的 `search_path` 运行参数改写成 libpq 认可的
+// `options=-csearch_path=...`。pgx 把未知查询键当会话参数，pg_dump / pg_restore 只认
+// libpq 关键字；生产连接串不带 search_path，这个改写只补平测试夹具与探针的契约差。
+// libpqDSN rewrites pgtemp's pgx-only search_path key into the libpq-standard options
+// parameter; production DSNs never carry the pgx extension in the first place.
+func libpqDSN(t *testing.T, dsn string) string {
+	t.Helper()
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("解析测试 DSN：%v", err)
+	}
+	query := parsed.Query()
+	paths := query.Get("search_path")
+	if paths == "" {
+		return dsn
+	}
+	query.Del("search_path")
+	query.Set("options", "-csearch_path="+paths)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func hostBinaryName() string {
@@ -169,7 +203,7 @@ func hostBinaryName() string {
 func (f *upgradeFixture) options(t *testing.T, name string) releasekit.UpgradeOptions {
 	t.Helper()
 	return releasekit.UpgradeOptions{
-		NewArchive: f.archive, DSN: f.h.Schema.DSN, Schema: f.h.Schema.Name,
+		NewArchive: f.archive, DSN: f.dsn, Schema: f.h.Schema.Name,
 		Workspace: f.workspace, ConfigPath: f.configPath, InstallDir: f.installDir,
 		WorkDir: filepath.Join(t.TempDir(), name),
 	}
@@ -229,9 +263,9 @@ func exeSuffix(name string) string {
 	return name
 }
 
-// TestUS17_Upgrade_Success：升级后旧数据保留、schema 到 7、新任务通过（FR-12）。
-// TestUS17_Upgrade_Success: old data survives, the schema reaches 7, and the new
-// binary serves a mock task.
+// TestUS17_Upgrade_Success：升级后旧数据保留、schema 到当前支持版本、新任务通过（FR-12）。
+// TestUS17_Upgrade_Success: old data survives, the schema reaches the supported
+// version, and the new binary serves a mock task.
 func TestUS17_Upgrade_Success(t *testing.T) {
 	f := newUpgradeFixture(t)
 	backup, err := runUpgrade(t, f.options(t, "backup"))
@@ -248,8 +282,8 @@ func TestUS17_Upgrade_Success(t *testing.T) {
 		t.Fatalf("升级必须保留 basalt.old：%v", err)
 	}
 	db := f.h.openDB(t)
-	if got := schemaVersionMax(t, db); got != 7 {
-		t.Fatalf("升级后 schema_version = %d，期望 7", got)
+	if got := schemaVersionMax(t, db); got != postgres.SupportedSchemaVersion {
+		t.Fatalf("升级后 schema_version = %d，期望 %d", got, postgres.SupportedSchemaVersion)
 	}
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM upgrade_seed WHERE id = 'old-data'`); n != 1 {
 		t.Fatalf("升级后旧数据应保留（1 行），实际 %d 行", n)
@@ -294,8 +328,8 @@ func TestUS17_Upgrade_FailureRecovery(t *testing.T) {
 	if got := markerCount(t, db); got != 0 {
 		t.Fatalf("恢复后备份后标记应消失，实际仍有 %d 行", got)
 	}
-	if got := schemaVersionMax(t, db); got != 7 {
-		t.Fatalf("恢复后 schema_version = %d，期望回到 7", got)
+	if got := schemaVersionMax(t, db); got != postgres.SupportedSchemaVersion {
+		t.Fatalf("恢复后 schema_version = %d，期望回到 %d", got, postgres.SupportedSchemaVersion)
 	}
 	if _, err := os.Stat(filepath.Join(f.workspace, "post-backup-marker.txt")); !os.IsNotExist(err) {
 		t.Fatalf("恢复后工作区标记文件应消失：%v", err)
@@ -339,36 +373,74 @@ func TestUS17_Upgrade_FailureRecoveryNeedsRestore(t *testing.T) {
 	}
 }
 
-// TestUS17_Upgrade_MigrationPath：基线 schema < 7，迁移后旧数据可读（FR-12）。
-// TestUS17_Upgrade_MigrationPath: a v6 baseline migrates forward and keeps old data.
+// migrationV6Files 是 PostgreSQL 谱系 v1～v6 的迁移脚本，按版本顺序排列。v6 是
+// SQLite → PostgreSQL 交接落地的历史版本；用它重建基线而不是"从当前版本删对象"，
+// 避免基线其实依赖更高版本残留、断言却看起来成立。
+// migrationV6Files lists the v1..v6 scripts; the baseline is rebuilt from them rather
+// than by deleting objects from the current schema.
+var migrationV6Files = []string{
+	"0001_postgres_v1.sql",
+	"0002_agent_binding_knowledge_kind.sql",
+	"0003_knowledge_source_text_repair.sql",
+	"0004_knowledge_version_revision.sql",
+	"0005_knowledge_collection_description.sql",
+	"0006_observability.sql",
+}
+
+// TestUS17_Upgrade_MigrationPath：真实 v6 基线前向迁移到当前支持版本，旧数据可读、
+// 后续版本的新对象存在（FR-12）。
+// TestUS17_Upgrade_MigrationPath: a real v6 baseline migrates forward to the supported
+// version, keeps old data readable, and gains the newer objects.
 func TestUS17_Upgrade_MigrationPath(t *testing.T) {
 	f := newUpgradeFixture(t)
 	db := f.h.openDB(t)
-	// v7 只新增历史保留两张表与两个索引（0007_history_retention.sql）：删掉它们并把
-	// 版本记录退回 6，得到真实的 v6 基线；旧数据表不动。
+	migrationsDir := filepath.Join("..", "..", "internal", "storage", "postgres", "migrations")
+
+	// 清空 fixture 建出的当前版本 schema，从仓库里的 v1～v6 脚本重建基线。
+	if _, err := db.Exec(fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, f.h.Schema.Name)); err != nil {
+		t.Fatalf("清空隔离 schema：%v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`CREATE SCHEMA "%s"`, f.h.Schema.Name)); err != nil {
+		t.Fatalf("重建隔离 schema：%v", err)
+	}
+	for index, file := range migrationV6Files {
+		version := index + 1
+		body, err := os.ReadFile(filepath.Join(migrationsDir, file))
+		if err != nil {
+			t.Fatalf("读取迁移脚本 %s：%v", file, err)
+		}
+		if _, err := db.Exec(string(body)); err != nil {
+			t.Fatalf("应用 v%d 脚本 %s：%v", version, file, err)
+		}
+		if _, err := db.Exec(`
+			INSERT INTO schema_version (version, applied_at, description)
+			VALUES ($1, $2, $3)`, version, time.Now().UTC().UnixMilli(), "migrations/"+file); err != nil {
+			t.Fatalf("记录 v%d 版本：%v", version, err)
+		}
+	}
+	// 旧数据：模拟交接前就存在的业务行，迁移前后都必须可读。
 	for _, statement := range []string{
-		`DROP TABLE IF EXISTS history_retention_rollups`,
-		`DROP TABLE IF EXISTS history_retention_runs`,
-		`DROP INDEX IF EXISTS idx_runs_retention_session`,
-		`DROP INDEX IF EXISTS idx_sessions_retention`,
-		`DELETE FROM schema_version WHERE version = 7`,
+		`CREATE TABLE upgrade_seed (id text PRIMARY KEY)`,
+		`INSERT INTO upgrade_seed (id) VALUES ('old-data')`,
 	} {
 		if _, err := db.Exec(statement); err != nil {
-			t.Fatalf("构造 v6 基线失败（%s）：%v", statement, err)
+			t.Fatalf("准备基线旧数据失败（%s）：%v", statement, err)
 		}
 	}
 	if got := schemaVersionMax(t, db); got != 6 {
 		t.Fatalf("基线 schema_version = %d，期望 6", got)
 	}
-	requireExit(t, f.h.run(t, nil, "db", "migrate"), 0, "v6 → v7 迁移")
-	if got := schemaVersionMax(t, db); got != 7 {
-		t.Fatalf("迁移后 schema_version = %d，期望 7", got)
+
+	requireExit(t, f.h.run(t, nil, "db", "migrate"), 0, "v6 → 当前版本迁移")
+	if got := schemaVersionMax(t, db); got != postgres.SupportedSchemaVersion {
+		t.Fatalf("迁移后 schema_version = %d，期望 %d", got, postgres.SupportedSchemaVersion)
 	}
 	if n := scalarInt(t, db, `SELECT COUNT(*) FROM upgrade_seed WHERE id = 'old-data'`); n != 1 {
 		t.Fatalf("迁移后旧数据应可读（1 行），实际 %d 行", n)
 	}
+	// 新对象存在：v12 的分布式执行表由 0012 引入，基线里没有。
 	var present string
-	if err := db.QueryRow(`SELECT to_regclass('history_retention_runs')::text`).Scan(&present); err != nil || present == "" {
-		t.Fatalf("迁移后缺少 v7 表：%q（%v）", present, err)
+	if err := db.QueryRow(`SELECT to_regclass('worker_nodes')::text`).Scan(&present); err != nil || present == "" {
+		t.Fatalf("迁移后缺少 v12 表 worker_nodes：%q（%v）", present, err)
 	}
 }
