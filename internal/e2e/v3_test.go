@@ -462,9 +462,17 @@ func TestV3E2E_CredentialLifecycle(t *testing.T) {
 	addr := freeLoopbackAddr(t)
 	h.writeConfig(t, v3ServeConfig(addr, "", v3SecretsSection(keyPath)))
 
-	res := h.run(t, fixtureEnv(), "secrets", "init")
-	requireExit(t, res, 0, "生成主密钥")
-	requireContains(t, res.Stdout, "主密钥已生成：key_id=", "生成主密钥")
+	// US-25 FR-25-02：全新工作区的第一次重路径装配就补发主密钥（`auto_init` 缺省
+	// true），显式 `secrets init` 只服务存量实例或关掉自动初始化的部署。这里保留
+	// "首次装配后主密钥就绪"的原判据，改判公开状态面而不是那条已不再适用的命令。
+	// US-25 FR-25-02: the first runtime assembly mints the key; explicit init is
+	// reserved for existing instances. The readiness check moves to the public status.
+	res := h.run(t, fixtureEnv(), "secrets", "status")
+	requireExit(t, res, 0, "首次装配补发主密钥")
+	requireContains(t, res.Stdout, "主密钥：已就绪", "首次装配补发主密钥")
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("首次装配后主密钥文件应存在：%v", err)
+	}
 
 	p := startServe(t, h, addr)
 
@@ -871,8 +879,15 @@ func TestV3E2E_RuntimePublishThenBind(t *testing.T) {
 	providers := "providers:\n" + v3ProviderBlock(fixtureProvider, model.URL(), fixtureModel)
 	h.writeConfig(t, v3ServeConfig(addr, providers, v3SecretsSection(keyPath)))
 
-	res := h.run(t, fixtureEnv(), "secrets", "init")
-	requireExit(t, res, 0, "生成主密钥")
+	// 同 CredentialLifecycle：首次重路径装配即补发主密钥（US-25 FR-25-02），不再走
+	// 显式 `secrets init`；就绪状态改由公开状态面判卷。
+	// As above: the first runtime assembly mints the key; readiness is judged on status.
+	res := h.run(t, fixtureEnv(), "secrets", "status")
+	requireExit(t, res, 0, "首次装配补发主密钥")
+	requireContains(t, res.Stdout, "主密钥：已就绪", "首次装配补发主密钥")
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("首次装配后主密钥文件应存在：%v", err)
+	}
 	startServe(t, h, addr)
 
 	// Agent 先于新连接存在：模板绑定启动时唯一的已发布 Provider。
