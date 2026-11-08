@@ -92,11 +92,29 @@ fetch_pinned() {
 	echo "$file"
 }
 
+# Windows 盘符路径在 GNU tar 下有两处陷阱：归档名里的冒号会被当成远程主机
+# （"Cannot connect to D: resolve failed"），-C 也不接受反斜杠形式。MSYS /
+# Cygwin 提供 cygpath 时统一转成 POSIX 路径；Linux / macOS 上原样返回。
+# Two GNU tar traps with Windows drive paths: a colon in the archive name is
+# parsed as a remote host, and -C rejects backslashes. Normalize via cygpath
+# where it exists; return the path unchanged elsewhere.
+native_path() {
+	if command -v cygpath >/dev/null 2>&1; then
+		cygpath -u -- "$1"
+	else
+		printf '%s' "$1"
+	fi
+}
+
+tar_xf() {
+	tar -xf "$(native_path "$1")" -C "$(native_path "$2")"
+}
+
 extract_zip() {
 	archive=$1 dest=$2
 	if command -v unzip >/dev/null 2>&1; then
 		unzip -q -o "$archive" -d "$dest"
-	elif tar -xf "$archive" -C "$dest" 2>/dev/null; then
+	elif tar_xf "$archive" "$dest" 2>/dev/null; then
 		:
 	else
 		# Windows 自带 tar 是 bsdtar，zip 由它处理;PowerShell 是最后兜底。
@@ -108,7 +126,7 @@ extract_zip() {
 if [ "$GOOS" = linux ]; then
 	node_archive=$(fetch_pinned "$NODE_LINUX_URL" "$NODE_LINUX_SHA256")
 	mkdir -p "$WORK/node"
-	tar -xf "$node_archive" -C "$WORK/node"
+	tar_xf "$node_archive" "$WORK/node"
 	mv "$WORK/node/node-v$NODE_VERSION-linux-x64" "$OUT/node"
 else
 	node_archive=$(fetch_pinned "$NODE_WINDOWS_URL" "$NODE_WINDOWS_SHA256")
@@ -120,10 +138,10 @@ fi
 # --- python（python-build-standalone install_only，包内自带 python/ 目录） ---
 if [ "$GOOS" = linux ]; then
 	pbs_archive=$(fetch_pinned "$PBS_LINUX_URL" "$PBS_LINUX_SHA256")
-	tar -xf "$pbs_archive" -C "$OUT"
+	tar_xf "$pbs_archive" "$OUT"
 else
 	pbs_archive=$(fetch_pinned "$PBS_WINDOWS_URL" "$PBS_WINDOWS_SHA256")
-	tar -xf "$pbs_archive" -C "$OUT"
+	tar_xf "$pbs_archive" "$OUT"
 fi
 # PBS 根目录只有 lib/python3.12/LICENSE.txt；清单要求 python/LICENSE.txt。
 if [ ! -f "$OUT/python/LICENSE.txt" ]; then
@@ -144,7 +162,7 @@ else
 	gh_archive=$(fetch_pinned "$GHMCP_WINDOWS_URL" "$GHMCP_WINDOWS_SHA256")
 fi
 case "$gh_archive" in
-*.tar.gz) tar -xf "$gh_archive" -C "$WORK/ghmcp" ;;
+*.tar.gz) tar_xf "$gh_archive" "$WORK/ghmcp" ;;
 *) extract_zip "$gh_archive" "$WORK/ghmcp" ;;
 esac
 gh_bin=$(find "$WORK/ghmcp" -type f \( -name "github-mcp-server" -o -name "github-mcp-server.exe" \) | head -1)
