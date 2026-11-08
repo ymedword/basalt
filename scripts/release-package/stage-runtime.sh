@@ -175,6 +175,12 @@ else
 	npm_node="$OUT/node/node.exe"
 	npm_cli="$OUT/node/node_modules/npm/bin/npm-cli.js"
 fi
+# 依赖的生命周期脚本（ssh2 / oracledb 等）经 PATH 找 node；Windows 下 cmd.exe
+# 不认 shell 变量，只有把随包 node 目录放进 PATH 才不依赖宿主安装 Node。
+# Lifecycle scripts resolve node through PATH; point it at the bundled runtime
+# so the host's Node installation is irrelevant.
+PATH="$OUT/node:$OUT/node/bin:$PATH"
+export PATH
 "$npm_node" "$npm_cli" install --omit=dev --no-audit --no-fund \
 	--prefix "$OUT/mcp/dbhub/$DBHUB_VERSION" "@bytebase/dbhub@$DBHUB_VERSION" >/dev/null
 
