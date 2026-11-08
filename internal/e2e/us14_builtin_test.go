@@ -978,8 +978,22 @@ func TestUS14D_ExistingNoConfigUntouched(t *testing.T) {
 	dataRoot := t.TempDir()
 	us14dRequireFreePort(t, us14dDefaultAddr)
 
-	// `init` 只建骨架与库、不写名册：之后的工作区是"存量实例"，不是新实例。
+	// US-25（FR-25-01）起 `init` 会同时写出首次配置与实例名册。E10 判的是**没有**这两样
+	// 生成物的存量工作区（US-25 之前建库的现场，或运维删掉配置后的现场），因此先移除
+	// 这两份生成物、保留源库——存量判定（库在 → 非新实例）与下面全部断言逐字不变。
+	// Since US-25 init writes the first-install config and roster, this case removes those
+	// two generated files (keeping the source database) to reconstruct a legacy workspace;
+	// the freshness rule and every assertion below stay unchanged.
 	initWorkspace(t, h)
+	for _, name := range []string{"basalt.yaml", filepath.Join(".basalt", "instance.json")} {
+		path := filepath.Join(h.Root, name)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("init 应生成 %s（US-25 FR-25-01），实际读不到: %v", name, err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("移除 init 生成的 %s 失败: %v", name, err)
+		}
+	}
 
 	res := h.run(t, us14dPrivateEnv(dataRoot), "serve")
 	if res.ExitCode == 0 {
