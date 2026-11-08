@@ -151,6 +151,40 @@ basalt session list
 
 [The full quickstart](https://ymedword.github.io/basalt/quickstart/) includes console field mappings and expected output; the console currently uses Chinese labels. Replies depend on your model and configuration. The website animation is a labelled local scripted demo.
 
+### First-run configuration order
+
+The installation only places files: the configuration template, the workspace, five daily demo agents, four Flow roles with the procurement sample, three credential-free MCP recipes and the sample documents. Models, credentials and business choices are yours. Keep this order — knowledge bindings are resolved when an agent registers, and a workflow template pins the versions that were published when it was loaded.
+
+1. **Complete the startup configuration.** Fill the `database.dsn` and the six `callers.ingress` limits the startup log asks for, then start again. A fresh directory may begin with `basalt init` followed by the first `basalt serve`, or with the first `basalt serve` alone — both are valid first steps. If the first start is interrupted, a retry continues the installation and re-issues the master key when the instance has no business history yet.
+2. **model connection** — Resources → Model connections → New: base URL, default model and credentials (managed or `${VAR}`); saving publishes the connection.
+3. **bind and enable the agent** — Agents → select the agent → Configuration → model connection and notification channel → save, then enable the agent.
+4. **Knowledge (Flow demo)**: first **create collections** `bid-request` and `bid-product`, then **ingest** the sample documents, and only then add **read-only knowledge bindings** to `bid-requirements` and `bid-technical`. Binding before the collections exist leaves the agent unregistered.
+5. **confirm memory (4 entries)** — propose and confirm the four entries from `.basalt/samples/bid-readiness/memory-suggestions.json`.
+6. **Set `flows.enabled: true`** in `basalt.yaml` and restart; the Flow executor starts with the control plane's `serve`.
+7. **publish the workflow template** — Workflows → Definitions → load the procurement template, run the read-only validation, then publish.
+8. **create a task manually** — Tasks → New task, choose `bid-readiness-matrix-v1` and submit.
+
+Ingestion calls your embedding model and costs money on every run; the console reports the model id and dimension it used.
+
+### Multi-worker deployment (Compose)
+
+[`docker/compose.multiworker.yaml`](docker/compose.multiworker.yaml) is one file with two profiles: a **control plane** running `serve` (with PostgreSQL and the management API) and at least one Worker running `gateway`. A Worker process has no HTTP listener, no admin token and no ingress limits; every node shares the same PostgreSQL, and execution ownership is decided by database leases, not by the orchestrator. The single-instance [`docker/compose.yaml`](docker/compose.yaml) stays the default and is not replaced.
+
+| Role | Service (profile) | Process and ports | Needs |
+| --- | --- | --- | --- |
+| Control plane host A | `basalt-preflight` / `postgres` / `basalt-control` (`control`) | `serve`; publishes the HTTP port; PostgreSQL bound to the private address | DSN, PostgreSQL password, exported master key |
+| Worker host B | `basalt-worker` (`worker`) | `gateway`; **no published ports**, no `restart` policy | a **copy** of A's DSN and master key; no PostgreSQL password |
+
+- **startup order**: bring up the control plane first with the Compose `control` profile enabled (`up -d --wait`), confirm the management API answers, then start the Worker with the `worker` profile enabled. The Worker service has no `depends_on` — the database lives in another profile and Compose rejects a cross-profile dependency. Each host gets its own `docker/` assets and `.env`.
+- **master key**: run `(cd docker && sudo sh export-master-key.sh basalt secrets/master.key)` on the control plane host (expected owner `10001:10001`, file `0400`, parent directory `0700`) and copy the file to the Worker unchanged. The path is relative to `docker/`, matching the bind mount in the Compose file — `docker/secrets/master.key` would land in `docker/docker/secrets/`. The container mounts it read-only at `/run/basalt-secrets/master_key`, not `/run/secrets`. The Worker **must not generate** its own master key: two valid keys for one instance make half of the managed credentials unreadable.
+- **DSN**: on host B run `(cd docker && sudo sh init-secrets.sh secrets --copy-from <A's docker/secrets> --db-host <A's private address>)`. The Worker **must not generate** a new database password — it would never match A's PostgreSQL.
+- **seed**: stop the control plane, install each agent's asset bundle with `assets install` (a write-mode command: a live `serve` or `gateway` holds the instance lock), then export the workspace volume with `seed-workspace.sh export` and import it into the Worker's named volume before its first start. Both workspaces are named volumes, so the Operations one-off-container commands are the supported method (§8.3 step 5). The archive carries a manifest with a size and SHA-256 per file; a tampered, truncated, path-traversing or symlinked archive is refused, and configuration, SQLite databases, locks, logs, `runs/` and agent runtime state are excluded. The seed does **not** contain `basalt.yaml`: the Worker template's `providers`, `embedding` and `flows` must match the control plane.
+- **Verify**: `basalt workers list` in the Worker container shows one row per host with distinct instance IDs and heartbeats inside the TTL. The Worker health check only proves the database is reachable, not that the Worker is registered.
+- Every Worker installs the same content-addressed asset bundle. A missing or mismatched bundle rejects new runs at admission (`ASSET_*`), and a Worker never installs or publishes assets.
+- **Upgrade**: stop **all** old processes first, back up the database, every workspace, the keys and the old images, then migrate with the new control plane and start the new Workers. Two versions on the same schema have no artifact-version gate — mixed old/new processes are forbidden by deployment discipline, not by a check. Roll back the whole set (database + every workspace + master key + old images), not the database alone.
+
+Container isolation (OCI / gVisor) is **opt-in** and **not in the first-release support matrix**. With it enabled, the **5 daily scripts** that run tools fail unless the images and runtime were adapted, while the **4 Flow roles** only read frozen text and are unaffected. To **fall back to local**, switch `sandbox.*` back to the default and restart — no data migration and no new instance. This release makes no claim that container isolation has been verified; see [Operations §8.3](docs/Operations.md#multiworker-compose).
+
 ## Templates & demos
 
 `examples/` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials, no delivery channels. You copy it into a workspace, follow its setup notes, and bind your own model, tools and channel.

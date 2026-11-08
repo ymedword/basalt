@@ -62,11 +62,17 @@ var heavyCommands = []string{"chat", "tool", "serve", "gateway", "secrets"}
 // （§2.12.0a / §2.12.0b / §3.1.8b / §3.1.8c）。走重路径会把库迁移、`Ensure` 自动 adopt
 // 与 `ApplyPublished` 的 MCP 启动带进来——那正是这两条命令存在要避免的行为；而且重路径
 // 已持实例锁，命令自己的取锁会直接 `workspace_busy`。
+//
+// `check-key`（US-25 P-18）是第三条：Worker 启动预检时控制面可能正在迁移或持锁，
+// 预检只读一次密钥文件与直接父目录，**不得**连库、取锁或迁移——否则预检会把
+// “密钥不可读”与“库没就绪”混成一个失败，Worker 也就无法执行 78 的部署语义。
+// check-key (US-25 P-18) joins them: the preflight reads one file and its directory
+// only, never the database, the lock or the migration chain.
 // offlineSecretsCommands must never assemble the runtime: each holds its own workspace
 // lock and opens its own backup / isolated copy. The heavy path would migrate, adopt and
 // start MCP servers — exactly what these offline procedures exist to avoid — and its
 // lock would make the command's own acquisition fail as workspace_busy.
-var offlineSecretsCommands = []string{"recover-record", "adopt-legacy"}
+var offlineSecretsCommands = []string{"recover-record", "adopt-legacy", "check-key"}
 
 // readStoreCommands 是需要**只读库句柄**的命令组：`session list` 要读会话数据，但它
 // **不是**重命令——不取锁、不做恢复、不写库（口径 23：别的实例持锁时也该能看清单）。
@@ -183,6 +189,23 @@ func Run(ctx context.Context, args []string) int {
 		return 1
 	}
 
+	// Demo 准备端口（US-25 §2.3.7）：只持配置、工作目录与一个 HTTP 客户端——不连库、
+	// 不装配运行期、不取实例锁，因此两条路径都安全带上。构造失败只记一条装配错误并
+	// 把端口留空：命令面把 nil 当装配错误报出来，**不**静默跳过。
+	// The demo-prepare port holds a config, a work directory and an HTTP client only;
+	// a nil port surfaces as a wiring error on the command face.
+	// 构造失败时端口必须保持**真正的 nil 接口**：`*DemoPrepareService` 的 nil 指针装进
+	// 接口后接口本身不为 nil，命令面的"端口缺失即装配错误"判据会被绕过，随后在 Plan
+	// 里以空指针崩溃。只在成功时赋值。
+	// Assign only on success: a typed-nil pointer in the interface would defeat the
+	// command face's missing-port check.
+	var demoPrepare cli.DemoPrepare
+	if service, demoPrepareErr := newDemoPrepareService(cfg, cfgErr, workDir, filepath.Join(workDir, workspaceDirName), logger); demoPrepareErr != nil {
+		logger.Error("Demo 准备端口装配失败", "error", demoPrepareErr)
+	} else {
+		demoPrepare = service
+	}
+
 	// Store / Workspace / Agents 是装配层注入的适配器（ports.go）：命令面只认自己
 	// 声明的端口，storage / workspace 的实现细节不越过这道接缝。
 	// The adapters are injected here; the command surface only sees its own ports.
@@ -198,6 +221,12 @@ func Run(ctx context.Context, args []string) int {
 		Store:                storageStore{},
 		Workspace:            workspacePort{},
 		AcquireWorkspaceLock: workspacePort{}.AcquireLock,
+		// 首次安装准备（US-25 §3.1.1）：`init` 在骨架之后、建库之前调用。无状态、
+		// 不取实例锁；`serve` / `gateway` 不走这条端口（serve 在装配前直接调用
+		// ensureNewInstanceConfig，gateway 不得写名册或铸钥）。
+		// The stateless first-install port for init; serve keeps its own pre-assembly
+		// call and gateway never prepares or mints anything.
+		FirstInstall: firstInstallAdapter{},
 		// Agents 是写模式端口（create / delete 在实现侧取实例锁、开关库、写操作行）——
 		// schema 目标版本与命令面同源，构造参数显式传递。
 		// The agents port owns the CLI write path; the schema target matches the command face.
@@ -237,6 +266,10 @@ func Run(ctx context.Context, args []string) int {
 		// The handoff gate is read-only and offline, so it is wired on every path.
 		Handoff: handoffVerifyPort{Logger: logger},
 		Flow:    flowCLIPort{},
+		// `demo workflow prepare` 的计划 / 应用两段（US-25 §3.1.1）：同一个端口对象，
+		// 计划只发 GET，应用才写。
+		// The demo-prepare port backs both halves; only Apply writes.
+		DemoPrepare: demoPrepare,
 		// 学习准入端口：写命令的实例锁由命令面持有（本适配器不再取锁），读命令走只读
 		// 会话；行为与身份口径见 admission_port.go。CLIWriteActor 是七个写动作唯一的
 		// 身份来源——命令面没有 --approver 之类旁路。
@@ -441,21 +474,28 @@ func Run(ctx context.Context, args []string) int {
 			return cli.ExitStatusOf(execErr)
 		}
 		return 0
-	} else if needsReadStore(args) {
-		// 轻路径里需要数据的命令：**只读**打开一次（不取锁、不做恢复、不开写池）。
-		// 打不开就如实报——库里没有可列的东西时，"列不出来"比"列出空清单"更接近事实。
-		// A light command that needs data gets a read-only open, nothing else.
-		read, readErr := a.readStore(ctx)
-		if readErr != nil {
-			logger.Error("只读打开数据库失败", "error", readErr)
-			return 1
-		}
-		defer func() {
-			if closeErr := read.Close(); closeErr != nil {
-				logger.Error("只读库句柄释放失败", "error", closeErr)
+	} else {
+		// 轻路径才注入主密钥预检端口（US-25 §3.1.4）：`secrets check-key` 只读文件与
+		// 直接父目录，重路径上没有任何调用者——把它放进重路径装配会诱导后来者"顺手"
+		// 依赖已开好的库或锁，而那正是预检要避免的耦合。
+		// The key preflight is wired on the light path only; the heavy path has no caller.
+		deps.MasterKeyCheck = masterKeyCheckPort{}
+		if needsReadStore(args) {
+			// 轻路径里需要数据的命令：**只读**打开一次（不取锁、不做恢复、不开写池）。
+			// 打不开就如实报——库里没有可列的东西时，"列不出来"比"列出空清单"更接近事实。
+			// A light command that needs data gets a read-only open, nothing else.
+			read, readErr := a.readStore(ctx)
+			if readErr != nil {
+				logger.Error("只读打开数据库失败", "error", readErr)
+				return 1
 			}
-		}()
-		deps.SessionLister = sessionListerPort{store: postgres.NewSessionStore(read)}
+			defer func() {
+				if closeErr := read.Close(); closeErr != nil {
+					logger.Error("只读库句柄释放失败", "error", closeErr)
+				}
+			}()
+			deps.SessionLister = sessionListerPort{store: postgres.NewSessionStore(read)}
+		}
 	}
 
 	if err := executeRoot(ctx, args, deps); err != nil {

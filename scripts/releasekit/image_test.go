@@ -7,9 +7,11 @@ package releasekit
 // docker-free judgements belong here.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -361,5 +363,151 @@ func TestUS18_Image_AppendImageRowsValidation(t *testing.T) {
 	bad.Platform = "linux/arm64"
 	if _, err := AppendImageRows(matrix, []ImageRecord{bad}); err == nil {
 		t.Fatal("非法记录必须被拒")
+	}
+}
+
+// 中文验收点（FR-25-32）：构建上下文必须带齐 8 个文件，Worker 模板与两个运维脚本
+// 按 Dockerfile 期望的权限位暂存；缺任一 Worker 工件必须在 docker build 之前报错，
+// 旧发布记录（三项摘要为空）仍可通过校验，新形态摘要必须是小写 64 位十六进制。
+// Acceptance (FR-25-32): the context carries all eight files with the modes the
+// Dockerfile expects; a missing worker asset fails before docker build; old records
+// (empty digests) still validate while the new digest shape must be lowercase hex.
+func TestUS25_Image_ContextStagesWorkerAssets(t *testing.T) {
+	fixture := t.TempDir()
+	sources := map[string]string{
+		"basalt":               "binary",
+		"Dockerfile":           "FROM scratch\n",
+		"entrypoint.sh":        "#!/bin/sh\n",
+		"basalt.yaml":          "server: {}\n",
+		"LICENSE":              "license\n",
+		"basalt.worker.yaml":   "server: {}\n",
+		"export-master-key.sh": "#!/bin/sh\n",
+		"seed-workspace.sh":    "#!/bin/sh\n",
+	}
+	for name, body := range sources {
+		if err := os.WriteFile(filepath.Join(fixture, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	in := ImageInputs{
+		Repo:             "repo",
+		Version:          "1.2.3",
+		Target:           Target{GOOS: "linux", GOARCH: "amd64", Tier: TierBinary},
+		Binary:           filepath.Join(fixture, "basalt"),
+		BaseRef:          "alpine:3.23@sha256:" + hex64("b"),
+		Dockerfile:       filepath.Join(fixture, "Dockerfile"),
+		Entrypoint:       filepath.Join(fixture, "entrypoint.sh"),
+		ConfigFile:       filepath.Join(fixture, "basalt.yaml"),
+		License:          filepath.Join(fixture, "LICENSE"),
+		WorkerConfigFile: filepath.Join(fixture, "basalt.worker.yaml"),
+		ExportKeyScript:  filepath.Join(fixture, "export-master-key.sh"),
+		SeedScript:       filepath.Join(fixture, "seed-workspace.sh"),
+		OutDir:           t.TempDir(),
+	}
+	contextDir, cleanup, err := in.stageImageContext()
+	if err != nil {
+		t.Fatalf("暂存构建上下文失败: %v", err)
+	}
+	entries, err := os.ReadDir(contextDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(sources) {
+		t.Fatalf("构建上下文必须恰好暂存 %d 个文件，got %d", len(sources), len(entries))
+	}
+	modes := map[string]os.FileMode{
+		"basalt":               0o755,
+		"Dockerfile":           0o644,
+		"entrypoint.sh":        0o755,
+		"basalt.yaml":          0o644,
+		"LICENSE":              0o644,
+		"basalt.worker.yaml":   0o644,
+		"export-master-key.sh": 0o755,
+		"seed-workspace.sh":    0o755,
+	}
+	for _, entry := range entries {
+		want, ok := sources[entry.Name()]
+		if !ok {
+			t.Fatalf("构建上下文出现预期外的文件 %s", entry.Name())
+		}
+		body, err := os.ReadFile(filepath.Join(contextDir, entry.Name())) // #nosec G304 -- 测试自建的暂存目录
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != want {
+			t.Fatalf("%s 的暂存内容与源文件不一致", entry.Name())
+		}
+		// Windows 上 POSIX 权限位不具意义，权限断言只在类 Unix 宿主执行。
+		// POSIX mode bits are meaningless on Windows, so the mode check is Unix-only.
+		if runtime.GOOS != "windows" {
+			info, err := entry.Info()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != modes[entry.Name()] {
+				t.Fatalf("%s 的暂存权限是 %#o，期望 %#o", entry.Name(), got, modes[entry.Name()])
+			}
+		}
+	}
+	cleanup()
+	if _, err := os.Stat(contextDir); !os.IsNotExist(err) {
+		t.Fatalf("cleanup 必须删除整个构建上下文，stat 返回 %v", err)
+	}
+
+	// 缺任一 Worker 工件都必须在 docker build 之前失败：validate 是 BuildImage 的
+	// 第一条语句，因此 BuildImage 返回该错误本身就证明 docker 没有被调用。
+	// A missing worker asset must fail before docker build: validate is BuildImage's
+	// first statement, so getting this error back proves docker was never invoked.
+	for _, item := range []struct {
+		label string
+		name  string
+		set   func(*ImageInputs, string)
+	}{
+		{"WorkerConfigFile", "basalt.worker.yaml", func(x *ImageInputs, path string) { x.WorkerConfigFile = path }},
+		{"ExportKeyScript", "export-master-key.sh", func(x *ImageInputs, path string) { x.ExportKeyScript = path }},
+		{"SeedScript", "seed-workspace.sh", func(x *ImageInputs, path string) { x.SeedScript = path }},
+	} {
+		missing := in
+		item.set(&missing, filepath.Join(fixture, "absent-"+item.name))
+		if err := missing.validate(); err == nil || !strings.Contains(err.Error(), item.name) {
+			t.Fatalf("缺 %s 必须点名拒绝，got %v", item.name, err)
+		}
+		if _, err := BuildImage(context.Background(), missing); err == nil ||
+			!strings.Contains(err.Error(), item.name) {
+			t.Fatalf("BuildImage 缺 %s 必须在 docker build 之前报错，got %v", item.name, err)
+		}
+	}
+	blank := in
+	blank.SeedScript = ""
+	if err := blank.validate(); err == nil || !strings.Contains(err.Error(), "SeedScript") {
+		t.Fatalf("空 SeedScript 必须点名拒绝，got %v", err)
+	}
+
+	// 记录面兼容：空摘要的旧记录仍通过；非空摘要必须是小写 64 位十六进制。
+	// Record compatibility: old empty digests still pass; a non-empty digest must be
+	// 64 lowercase hex chars.
+	if err := validImageRecord().Validate(); err != nil {
+		t.Fatalf("旧记录（三项摘要为空）必须仍然可校验：%v", err)
+	}
+	filled := validImageRecord()
+	filled.WorkerConfigSHA256 = hex64("a")
+	filled.ExportKeySHA256 = hex64("b")
+	filled.SeedScriptSHA256 = hex64("c")
+	if err := filled.Validate(); err != nil {
+		t.Fatalf("带三个小写摘要的记录必须通过：%v", err)
+	}
+	for _, item := range []struct {
+		label  string
+		mutate func(record *ImageRecord)
+	}{
+		{"worker_config_sha256", func(r *ImageRecord) { r.WorkerConfigSHA256 = strings.ToUpper(hex64("a")) }},
+		{"export_key_sha256", func(r *ImageRecord) { r.ExportKeySHA256 = "not-a-hash" }},
+		{"seed_script_sha256", func(r *ImageRecord) { r.SeedScriptSHA256 = hex64("c") + "0" }},
+	} {
+		record := filled
+		item.mutate(&record)
+		if err := record.Validate(); err == nil || !strings.Contains(err.Error(), item.label) {
+			t.Fatalf("%s 被改坏后必须点名拒绝，got %v", item.label, err)
+		}
 	}
 }

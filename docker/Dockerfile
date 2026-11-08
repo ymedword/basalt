@@ -23,16 +23,31 @@ RUN apk add --no-cache ca-certificates
 # creation, so both mount points are pre-created for the fixed numeric UID.
 RUN mkdir -p /data /var/lib/basalt /task /output && chown 10001:10001 /data /var/lib/basalt
 
+# Worker 共享主密钥的挂载点必须在镜像内预建：`read_only: true` 的根文件系统里
+# Docker 无法为 bind mount 现建目标，缺了它 Worker 直接起不来。权限与
+# `LoadMasterKey` 的**直接父目录**判据一致（组 / 其他位为零）——默认 0755 的
+# `/run/secrets` 做不到这一点，所以密钥不走那条路。
+# The worker's key mount point is pre-created because Docker cannot create a bind
+# target on a read-only rootfs; 0700 matches LoadMasterKey's parent-directory rule.
+RUN mkdir -p /run/basalt-secrets && chown 10001:10001 /run/basalt-secrets && chmod 0700 /run/basalt-secrets
+
 COPY basalt /opt/basalt/basalt
 COPY entrypoint.sh /opt/basalt/entrypoint.sh
 COPY basalt.yaml /opt/basalt/basalt.yaml
+# Worker 模板与两个运维脚本：entrypoint 按 BASALT_ROLE 选模板，脚本由部署者在宿主机
+# 侧执行（导出主密钥 / 导出与导入种子），进镜像只为随制品一起分发、版本对齐。
+# The worker template plus the two operator scripts ship with the artifact so the
+# entrypoint's role switch and the host-side procedures stay version-matched.
+COPY basalt.worker.yaml /opt/basalt/basalt.worker.yaml
+COPY export-master-key.sh seed-workspace.sh /opt/basalt/
 COPY LICENSE /opt/basalt/LICENSE
 
 # releasekit 暂存时已带上可执行位；这里显式再设一次，让直接 docker build 的
 # 产物与暂存路径一致（Windows 上创建的上下文不带 POSIX 位）。
 # releasekit already stages the execute bits; setting them again keeps a direct
 # docker build identical to the staged one (Windows-created contexts lose POSIX bits).
-RUN chmod 0755 /opt/basalt/basalt /opt/basalt/entrypoint.sh
+RUN chmod 0755 /opt/basalt/basalt /opt/basalt/entrypoint.sh \
+    /opt/basalt/export-master-key.sh /opt/basalt/seed-workspace.sh
 
 USER 10001:10001
 WORKDIR /data

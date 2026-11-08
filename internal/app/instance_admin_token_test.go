@@ -311,6 +311,9 @@ func TestAdminToken_InteractiveOnce(t *testing.T) {
 func TestInstanceSecrets_AdminTokenSeparateFile(t *testing.T) {
 	ctx := context.Background()
 	env := newResolverFixture(t)
+	// 本用例判的是"新实例首次初始化"，资源夹具预置的生命周期身份行不属于该场景；
+	// US-25 起 create 还要求零业务历史，先把它清掉（逐表判据在 postgres 包）。
+	clearBusinessHistory(t, env.db)
 	workDir := filepath.Dir(env.root) // workDir/.basalt 才是工作区根
 	dataRoot := filepath.Join(t.TempDir(), "userdata")
 	t.Setenv("LOCALAPPDATA", dataRoot)

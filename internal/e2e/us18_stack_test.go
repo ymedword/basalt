@@ -407,7 +407,13 @@ func us18BuildImageOnce(t *testing.T, version, baseRef string) releasekit.ImageR
 		Entrypoint: filepath.Join(root, "docker", "entrypoint.sh"),
 		ConfigFile: filepath.Join(root, "docker", "basalt.yaml"),
 		License:    filepath.Join(root, "LICENSE"),
-		OutDir:     outDir,
+		// US-25 起镜像上下文还带 Worker 模板与两个运维脚本；US-18 的镜像判据不变。
+		// Since US-25 the context also carries the worker template and both operator
+		// scripts; US-18's image assertions stay unchanged.
+		WorkerConfigFile: filepath.Join(root, "docker", "basalt.worker.yaml"),
+		ExportKeyScript:  filepath.Join(root, "docker", "export-master-key.sh"),
+		SeedScript:       filepath.Join(root, "docker", "seed-workspace.sh"),
+		OutDir:           outDir,
 	})
 	if err != nil {
 		t.Fatalf("构建镜像 %s 失败: %v", version, err)

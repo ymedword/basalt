@@ -12,6 +12,14 @@
 # env mode uses ${ENV_VAR} placeholders (unresolved/empty/plaintext rejected at load time);
 # managed mode stores ciphertext in the PostgreSQL database and only a server-written `credential_ref` in this file.
 
+# 首次配置顺序（固定）：模型连接 → Agent 绑定与启用 →
+# （装完到 Demo / Flow 可运行；详细清单见 docs/Operations.md §1.5）
+# 先建集合 → 摄取 → 只读绑定 → 记忆确认（4 条）→ flows.enabled → 模板发布 → 手动建任务。
+# 全新目录可先 `basalt init` 再首次 `serve`（init 不生成主密钥、不发放访问密码）；
+# 首启中断后重试会续做安装并补发主密钥（资格判定见 docs/Operations.md §6.1）。
+# 知识库必须先建集合再绑定——声明名解析不到活动集合时整只 Agent 不注册；
+# 工作流模板在载入时固定当时的发布版本，之后改绑定不会回写既有模板版本。
+
 # 存储段：PostgreSQL 16/17（必需）——运行期唯一后端。缺 DSN / 连不上 / 缺扩展一律拒绝
 # 启动，**不**回退 SQLite（出处 docs/Operations.md §1.2）。部署侧先建库并安装扩展
 # vector（≥ 0.8，需 hnsw.iterative_scan 能力）与 pg_trgm；应用**不**自动 CREATE EXTENSION。
@@ -297,3 +305,34 @@ observability:
   alerts:
     enabled: true
     evaluation_interval: 1m
+
+# 分布式执行段（US-24；US-25 多 Worker 部署同样生效）：三段都按"未知键拒绝"解析，
+# 拼错的键会让启动失败，而不是静默取缺省；显式写 null 一律拒绝。整段省略即用下列缺省。
+# worker:
+#   name: ""                        # 仅诊断；空 = hostname；允许重复——身份是 InstanceID
+#   lease_ttl_seconds: 30           # 5..300；续约与接管判定都以数据库时间为准
+#   renew_interval_seconds: 10      # 必须 < lease_ttl_seconds / 2
+#   reclaim_interval_seconds: 5     # 1..60，且不得超过 lease_ttl_seconds
+#   reclaim_batch: 32               # 1..256；单轮回收条数
+#   heartbeat_interval_seconds: 10  # 只驱动 worker_nodes 心跳，不参与归属判定
+#   max_inflight: 64                # 三条执行路径共用的总在途上限（1..512）
+#   shutdown_grace_seconds: 45      # ≥ flows.shutdown_grace_seconds + 5 且 ≤ HTTP 宽限 − 5
+# scheduler:
+#   poll_interval_ms: 500           # 100..5000；数据库到期扫描间隔（不是进程内 cron）
+#   dispatch_batch: 32              # 1..256；且 dispatch_batch + flows.max_active ≤ max_inflight
+#   missed_grace_seconds: 300       # 0..86400；超过只记 skipped，不逐点补跑
+# assets:
+#   bundle_root: .basalt/assets     # 不得为空；内容寻址 bundle 的根目录
+
+# 多 Worker 部署（Compose，docs/Operations.md §8.3）：一个控制面 `serve` + 至少一个
+# Worker `gateway`，共享同一个 PostgreSQL；没有消息队列，也没有第二套执行路径。
+# Worker 从种子工作区启动，使用共享主密钥与从控制面复制来的 DSN；启动顺序固定为
+# 先控制面、后 Worker。Worker 不得自行生成主密钥，也不得自行生成新 DSN / 数据库密码。
+# Worker 侧配置只需要 database.dsn、secrets 与 log，但 providers、embedding 与 flows
+# **必须与源实例一致**（种子不含 basalt.yaml）——Worker 领取执行后要用同一组 provider
+# 与向量维度，缺声明会在执行期失败。它没有 HTTP 面，不要求 http.admin_auth 与
+# callers.ingress（控制面专属）。
+#
+# 容器隔离（OCI / gVisor）是实例级 opt-in，默认关闭，不在首发支持矩阵内；开启后依赖
+# 工具执行的 5 个 daily 脚本会失败，4 个 Flow 角色只读原文、不受影响。要回退 local
+# 把 sandbox.* 改回默认档并重启即可，不需要迁移数据。本样例不声称容器隔离已适配。

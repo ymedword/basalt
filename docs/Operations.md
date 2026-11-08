@@ -94,18 +94,25 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 首启验收（Windows 与 Linux 同一组动作）：解压 → `basalt serve` → 用访问密码登录 → 「执行环境 → 运行环境」核对组件存在 / 可用 / 执行授权 → 对已配置 MCP server 点「测试」看到 `stage=complete` 与工具清单。缺少用户个人凭据（如 `GITHUB_PERSONAL_ACCESS_TOKEN`）只显示待配置，不算包缺陷。
 
-### 1.5 首次配置清单（安装后到 Demo / Flow 可运行）
+### 1.5 首次配置清单（安装后到 Demo / Flow 可运行） {#first-run}
 
 开箱安装只把**文件与目录**就位：配置模板、工作区、5 个每日 Demo Agent、4 个 Flow 角色与采购示例素材、3 条免凭据 MCP、样例库与文档库。模型、凭据与业务选择**必须**由人完成。下面顺序不可交换：知识库绑定在 Agent 注册期解析，Flow 模板在载入时固定当时的发布版本。
 
+**第一步有两个合法入口，任选其一**：
+
+- **全新目录先 `basalt init`**：按固定顺序写出 `basalt.yaml`、首次初始化进度、内置安装意图与 `.basalt/instance.json`，最后才建 SQLite 源库（M1 迁移的起点，§5.6）。`init` 本身不生成主密钥、不发放管理面密码。
+- **全新目录直接首次 `serve`**：上述准备由启动流程按同一顺序自动完成；同一进程继续生成主密钥、发放一次管理面访问密码、安装开箱 Agent 与内置工作流素材。
+
+两条路都保留实例身份与「可续做」资格：`init` 写下的初始化进度让随后的首次 `serve` 仍按新实例完成主密钥与会话面初始化（§6.1 判定表）。本清单按单进程 `serve` 编写；Compose 多 Worker 拓扑的额外步骤（种子、主密钥共享、启动顺序）见 §8.3——控制面执行本清单，Worker 只跑 `gateway`，不重复首次配置。
+
 | 步骤 | 动作 | 判据 |
 | --- | --- | --- |
-| 1. 首启补配置 | 首次 `serve` 生成 `basalt.yaml` 后，按日志补齐 `database.dsn` 与 `callers.ingress` 六项（§5.10），再启动；托管凭据另需主密钥（见下） | 不再报「服务启动前的入口限流配置不完整」；管理台可登录 |
+| 1. 首启补配置 | 按启动日志补齐 `database.dsn` 与 `callers.ingress` 六项（§5.10），再启动；托管凭据另需主密钥（见下） | 不再报「服务启动前的入口限流配置不完整」；管理台可登录 |
 | 2. 模型连接 | 资源 → 模型连接 → 新建：Base URL、默认模型、凭据（托管或 `${VAR}`）；保存即发布 | 「测试」返回 `ok=true`；托管凭据要求主密钥已就绪（§6） |
 | 3. Agent 绑定与启用 | Agents → 选 Agent → 配置 → 模型连接 / 通知渠道 → 保存 → 启用 | `resource_bindings.model_connection` 有一条且指向当前发布版本；`provider.model` 不是模板占位符 |
 | 4. 知识库（Flow 演示） | 先建集合 → 摄取 → 再加只读绑定（见下） | 集合内有成功版本；加绑定后 Agent 仍注册 |
-| 5. 记忆确认 | 按 `.basalt/samples/bid-readiness/memory-suggestions.json` 逐条在 Agents → 记忆页提议并确认 | 四条均为「生效」；候选不参与召回 |
-| 6. Flow 开关 | `basalt.yaml` 设 `flows.enabled: true` 并重启 | Worker 随 `serve` 启动；启用本身不创建任务 |
+| 5. 记忆确认（4 条） | 按 `.basalt/samples/bid-readiness/memory-suggestions.json` 逐条在 Agents → 记忆页提议并确认 | 四条均为「生效」；候选不参与召回 |
+| 6. Flow 开关 | `basalt.yaml` 设 `flows.enabled: true` 并重启 | Flow 执行器随控制面 `serve` 启动；启用本身不创建任务 |
 | 7. 模板发布 | 工作流 → 工作流定义 → 载入采购准备模板 → 只读在线校验 → 确认发布 | 发布版本绑定四个角色当前 UID / 版本 / 哈希 |
 | 8. 手动建任务 | 执行任务 → 新建任务，选 `bid-readiness-matrix-v1` 并提交 | 任务出现并逐节点推进 |
 
@@ -134,9 +141,9 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 **首启中断与主密钥**：
 
-> 如果目标是开箱安装（5 个每日 Demo + 4 个 Flow 角色），**不得**在全新目录先执行 `basalt init`：它会让实例被判为「存量」，跳过主密钥自动初始化与开箱 Agent 安装。全新安装直接 `serve`，按日志补配置。
+> 首次 `serve` 因缺入口限流或数据库未就绪而退出后，工作区保留初始化进度与名册；重试会续做开箱安装并**补发主密钥**——资格判定为无记录、无密钥、零托管密文、零业务历史且 `auto_init` 未关闭（§6.1 判定表），不出现「已存在实例但无密钥」的死局。
 >
-> 让 `serve` 生成模板后因缺入口限流而退出的实例，重试会续做开箱安装（初始化时写了安装意图标记），但**不会**自动生成主密钥；在控制台「高级：实例加密诊断」初始化，或停机执行 `basalt secrets init`。只用 `${VAR}` 环境凭据的部署可跳过。若已经先跑过 `basalt init`，停机后按顺序补齐：`basalt secrets init` → `basalt demo install` → `basalt demo workflow install`，再启动 `serve`。
+> 只有实例已有业务历史（`runs` / `task_executions` / `agent_lifecycle` / `kb_documents` 任一有行）、显式 `secrets.auto_init: false` 或已处于恢复态时，重试才只续做安装、不铸钥：在控制台「高级：实例加密诊断」初始化，或停机执行 `basalt secrets init`。**不得**删除名册或重建实例来"重获"自动初始化资格，也**不得**生成第二把密钥。只用 `${VAR}` 环境凭据的部署可跳过主密钥。
 
 ---
 
@@ -564,6 +571,8 @@ systemctl start basalt
 
 **不得**把"停"与"起"拆成两段（先起旧版 → 换文件 → 再起新版）：那两段之间跑的还是**旧代码**——迁移没跑、验证假绿，真正的切换只发生在文件替换那一刻，而没有任何步骤检查过它。
 
+**多 Worker 拓扑（Compose，§8.3）的升级顺序**：停**全部**旧进程 → 备份（库 + 每个工作区 + 密钥 + 旧镜像）→ 新控制面启动迁移 → 新 Worker。同 schema 的两个版本之间产品**没有**制品版本门禁（例如 US-24 与 US-25 同为 v12）——「不得新旧混跑」是部署纪律，不是启动检查；跨 schema 时旧二进制会因 `schema_version` 高于自身支持版本**拒绝启动**（§5.2），那是唯一的硬拒绝。整组回滚 = 数据库 + 每个工作区 + 主密钥 + 旧镜像成套恢复（§8.3）；只恢复数据库而留着漂移过的工作区，新 Run 会在准入被 `ASSET_*` 拒绝——这是设计行为，不是可以绕过的故障。
+
 建议：先用备份在独立目录起一次新版做 dry run（与 §4.3 同一手法，含其中"演练隔离"三步），确认迁移与启动无误再动生产目录。
 
 **升级后的首个动作**：v2 资源基线把既有 Agent 的状态统一初始化为 `disabled`（**不得**在升级瞬间悄悄放行新 Run），因此升级完成后需要逐个复核并按需启用——`POST /api/v1/agents/{name}/enable` 或管理台「Agent → 启用」。这是设计行为，不是迁移失败；`GET /api/v1/profiles` 里 `runnable=false` 是同一件事的表现。
@@ -780,6 +789,8 @@ powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1 -Frontend 
 6. **交接核对**（离线，只读）：`basalt db verify --handoff <copy-root>/.basalt`
 
    核对项：名册、`instance_secrets` 记录、密钥路径与权限、全部密文可解、目标配置。`<copy-root>/.basalt` 是**副本的工作区根**（与 `db export --workspace` 同一口径），同级的 `basalt.yaml` 是被核对的配置。密钥在原配置路径可用时，直接对本工作区跑这条命令也成立——它是只读的。
+
+   **源库没有的对象逐项登记**：`flow_*`、学习审批（`skill_admission_*`）与 `kb_*` 在 SQLite v6 源谱系中可能不存在；报告按「源无对象、目标新建空表」逐项登记，**不得**把新建的空表当作已迁移（FR-25-24）。源库无 `kb_*` 表时知识引用计数为 **0** 且报告写明原因——这是如实计数；文档与验收记录**不得**声称知识已完成迁移（FR-25-25），SQLite 源库中的知识不在本迁移包范围内。
 
 7. **切换**：`basalt db switch --dump /backup/us16-pkg --workspace /opt/basalt/.basalt`
 
@@ -1038,6 +1049,7 @@ go test -race -tags integration ./internal/storage/postgres -run '^TestObservabi
 
 - **生成**：由 `basalt secrets init`（或管理台「实例加密」的初始化按钮）生成 32 字节主密钥，写入 `secrets.master_key_file` 指向的**工作区之外**文件（如 `/etc/basalt/master.key`）；文件为 JSON `{"version":1,"key_id":"k_…","key":"<base64 32 字节>"}`，`key_id` 由初始化流程生成、随密文一起记录，**不是**配置项。新建实例（库与 `instance.json` 均为本次启动新建）在 `secrets.auto_init` 缺省 `true` 时由首次 `serve` 自动完成初始化；**已有实例绝不自动生成**——密钥缺失 / 损坏 / `key_id` 不符 / 来源不可证明一律进恢复态，等待显式修复。`auto_init: false` 显式声明纯 env 实例（此时可省略路径）。**不得**把主密钥放进工作区、仓库、容器镜像或共享配置。
 - **权限**：Linux `0600` 且属主为服务账户（`chown basalt:basalt`）；Windows 用 `icacls` 把主密钥**文件与父目录**都只授予服务账户、SYSTEM 与管理员组（`icacls <path> /inheritance:r /grant:r "<服务账户>:(R)" "NT AUTHORITY\\SYSTEM:(R)" "BUILTIN\\Administrators:(R)"`；目录带 `(OI)(CI)` 继承标志）。启动与每次使用前都会校验路径、格式与平台权限：Linux 按权限位（目录 0700 / 文件 0600），Windows 读取文件与父目录的实际 DACL——只允许当前进程用户、SYSTEM 与 Administrators 三类受托人，其他用户 / 组（含 `Users`、`Authenticated Users`、AppContainer 包 SID）、缺失或空的 DACL、无法读取的安全描述符一律拒绝并返回 `CREDENTIAL_UNAVAILABLE`。权限在校验之后被放宽，下一次读取会拒绝（不缓存校验结果）。`os.Chmod` 在 Windows 只切只读位，**不得**用它代替 `icacls`。
+- **多 Worker 共享（Compose，§8.3）**：控制面把主密钥导出到宿主 `docker/secrets/master.key`（文件 `0400`、属主 `10001:10001`；目录 `0700`、`10001:10001`），Worker 以**只读** bind mount 挂到镜像内预建的 `/run/basalt-secrets/`（`0700`、`10001:10001`）。**不得**放进 `/run/secrets`——Docker 默认把该目录建成 `0755`，`LoadMasterKey` 的直接父目录判据会拒绝一份本来正确的密钥。导出与复制都只搬运字节：**不得**在终端回显、不入镜像、不入种子归档；Worker 侧**不得自行生成**主密钥——同一实例出现两把有效密钥会让托管凭据半数不可解。
 - **按需加载**：主密钥**不常驻内存**——每次使用托管凭据时读取并校验（文件缺失 / 权限不符 / 长度不是 32 字节 / `key_id` 不匹配 / 解密失败），失败只影响本次调用（503 `CREDENTIAL_UNAVAILABLE`），**不**自动回退到 env 或旧版本。
 - **启动依赖**：先判定当前发布且被绑定的**托管**模型连接；只有它需要解密时才读取主密钥。纯 env 实例（含只配 env 的模型连接）**不因缺主密钥而启动失败**；通知渠道的托管凭据也不阻断启动，失败发生在发送时。
 - **备份与恢复**：主密钥与数据库**分开备份、分开存放**；恢复时必须是同一 `key_id` 与原密钥，否则所有托管凭据不可读。
@@ -1065,6 +1077,8 @@ sqlite3 /opt/basalt/.basalt/basalt.db \
 sqlite3 /opt/basalt/.basalt/basalt.db \
   "select owner_kind, owner_name, state, current_version, revocation_epoch from credentials;"  # 只查元数据
 ls -l /etc/basalt/master.key    # 期望：600，属主为服务账户；路径不在工作区内
+stat -c '%u:%g:%a' docker/secrets               # 多 Worker：期望 10001:10001:700（目录）
+stat -c '%u:%g:%a' docker/secrets/master.key    # 多 Worker：期望 10001:10001:400（文件）
 ```
 
 前两条只查 `name` / `type` / 模式 / 长度 / host——**不得**把 `url` 原值或密文打印出来（一次回显就把它写进了终端历史与截图）。
@@ -1474,6 +1488,128 @@ releasekit assemble --image-record dist/images/image-record.json \
 | 健康检查绿但业务接口 500 | `/api/v1/health` 只判存活，不查库；按 §5.8 查启动 / 数据库错误 |
 | `服务启动要求下列配置项大于零` | 六项 ingress 中有 0 或空值 |
 
+### 8.3 多 Worker 拓扑（Compose，US-25 起） {#multiworker-compose}
+
+单文件 [`docker/compose.multiworker.yaml`](../docker/compose.multiworker.yaml) 用两个 profile 表达双角色拓扑：一个**控制面**（`serve`，带 PostgreSQL 与管理面）加至少一个 Worker（`gateway`，无 HTTP 面、无 admin token、不做入口限流）。三者共享同一个 PostgreSQL；没有消息队列、没有 etcd、也没有第二套执行路径——谁能执行由数据库租约决定，不由编排决定。本节与 §8.2 的单实例编排并存：`docker/compose.yaml` 不改、仍是默认形态，两者**不**互相覆盖。
+
+#### 拓扑与两个部署目录
+
+| 角色 | 服务（profile） | 进程与端口 | 需要的材料 |
+| --- | --- | --- | --- |
+| 控制面宿主 A | `basalt-preflight` / `postgres` / `basalt-control`（`control`） | `serve`；HTTP 发布 `BASALT_HTTP_BIND:BASALT_HTTP_PORT → 8080`；PostgreSQL 绑 `BASALT_DB_BIND`（单宿主回环，双宿主为 A 的私网地址） | `basalt.yaml`、`secrets/database_dsn`、`secrets/postgres_password`、六项 `BASALT_INGRESS_*`、`BASALT_IMAGE`（版本 + digest）、`BASALT_DB_BIND`；主密钥由首次启动生成，再从私有卷导出 |
+| Worker 宿主 B | `basalt-worker`（`worker`） | `gateway`；**不发布任何端口**，没有 `restart` 策略 | `basalt.yaml`（`providers` / `embedding` / `flows` 与源实例一致）、`secrets/database_dsn`（**复制**自 A）、`secrets/master.key`（**复制**自 A）、`BASALT_IMAGE`；不需要 `postgres_password`，也不需要六项入口限流 |
+
+- 单宿主（自动化与取证）：同一目录先后 `--profile control up -d`、`--profile worker up -d`。双宿主（参考部署）：A 跑 `control`，B 跑 `worker`；两台**各自**一份 `.env` 与 `secrets/` 目录。
+- **启动顺序**：先起控制面（预检通过 + 数据库健康），确认管理面可用，再起 Worker。Worker 服务**没有** `depends_on`——数据库在另一个 profile 里，跨 profile 依赖会被 Compose 判为无效项目（实测 compose v5.6.1），顺序由部署者保证。
+- 控制面 profile 的 `basalt-preflight` 在启动前拒绝空 `BASALT_DB_BIND`、拒绝 `0.0.0.0` 与 IPv6 全地址（含 `[::]`、`[::0]`、八段全零及其带端口 / 带前导零的等价拼写）、拒绝六项入口限流缺值（产品不设默认，D-30）；不通过则数据库与控制面都不启动。Worker-only 渲染不要求控制面变量齐备。双宿主所说的“私网”指 RFC1918 段（`10/8`、`172.16/12`、`192.168/16`）或控制面宿主回环；预检**不**判定地址是否真的私网，写成公网地址属于部署纪律错误，预检照常放行。
+- Worker 容器内**没有** PostgreSQL；两个角色都满足 §8.2 的安全不变量（`user 10001:10001`、只读根文件系统、`cap_drop ALL`、`no-new-privileges`、`init`、`tmpfs`、无 Docker socket）。镜像以 `.env` 的 `BASALT_IMAGE` 固定为「版本 + digest」——预检只挡空值，**不**校验 digest 形式，tag-only 镜像只允许本地预演，对外部署必须写 digest（部署纪律，不是运行期判据）。
+
+#### 首次部署（A + B 双宿主）
+
+1. **控制面宿主 A**：在 `docker/` 下把 [`docker/.env.multiworker.example`](../docker/.env.multiworker.example) 复制为 **`docker/.env`**（Compose 从 `-f` 文件所在目录读取 `.env`，不要复制到仓库根），填 `BASALT_IMAGE`（版本 + digest）；生成部署 secret 并启动控制面：
+
+   ```sh
+   cd docker
+   sudo sh init-secrets.sh secrets
+   docker compose -f compose.multiworker.yaml -p basalt --profile control up -d --wait
+   ```
+
+   控制面首次启动完成 §1.5 的第一步：生成主密钥（私有卷 `/var/lib/basalt`）、发放一次管理面密码（`docker compose -f compose.multiworker.yaml -p basalt exec basalt-control sh -c 'cat /var/lib/basalt/basalt/instances/*/admin-token'`），并按 §1.5 完成业务配置。
+
+2. **导出主密钥**到宿主（仍在 `docker/` 目录；`dest` 相对**当前目录**——写成 `docker/secrets/master.key` 会落到 `docker/docker/secrets/`，而 Compose 实际挂载的是 `docker/secrets/master.key`）：
+
+   ```sh
+   sudo sh export-master-key.sh basalt secrets/master.key
+   stat -c '%u:%g:%a' secrets/master.key   # 期望 10001:10001:400
+   ```
+
+   导出后目录 `0700`、文件 `0400`，属主均为 `10001:10001`；脚本写后逐项 `stat` 复核，9p / drvfs 忽略 `chown` / `chmod` 时非零退出。脚本先校验目标形态、已存在、卷与密钥，最后才创建目录——校验失败不会改动任何宿主目录的属主。
+
+3. **Worker 宿主 B 准备部署目录**：复制 `docker/` 资产与 `.env`（B 上不需要 `postgres_password`，也没有控制面的六项入口限流变量）；**复制** DSN 并把主机改成 A 的私网地址——**不得自行生成**新密码或新 DSN，新密码与 A 的 PostgreSQL 对不上，B 会永远连不上：
+
+   ```sh
+   sudo sh init-secrets.sh secrets --copy-from <A 的 docker/secrets> --db-host <A 的私网地址>
+   ```
+
+4. **复制主密钥**：把 A 导出的 `docker/secrets/master.key` 原样复制到 B 的同一路径并复核属主与权限。Worker 侧同样**不得自行生成**主密钥——同一实例出现两把有效密钥会让托管凭据半数不可解；`secrets.auto_init: false` 是这套纪律的配置面表达。容器把它只读挂到 `/run/basalt-secrets/master_key`——**不得**放进 `/run/secrets`（默认 `0755`，父目录判据会拒绝一把本来正确的密钥，§6.1）。
+
+5. **资产与种子工作区**：`assets install` 是写模式命令，运行中的 `serve` / `gateway` 全程持有实例锁，**必须停机执行**；Worker **不**执行资产安装或发布（FR-25-22）。顺序是：停控制面 → 在控制面工作区安装 bundle → 导出种子（bundle 随 `.basalt/assets` 进归档）→ 导入 Worker 卷。工作区是**命名卷**（`basalt_control-workspace` / `basalt_worker-workspace`），不是宿主目录，用一次性容器挂卷执行：
+
+   ```sh
+   # A（全程 docker/ 目录；<agent> 换成要发布的 Agent，可重复多次）
+   docker compose -f compose.multiworker.yaml -p basalt --profile control stop basalt-control
+   docker compose -f compose.multiworker.yaml -p basalt --profile control run --rm --no-deps \
+     basalt-control assets install --agent <agent>
+
+   # A（已停服）：导出 .basalt/ 子树与逐文件 SHA-256 清单到 docker/ 下的种子文件
+   docker run --rm --user 0 \
+     -v basalt_control-workspace:/src:ro -v "$PWD:/seed" \
+     --entrypoint /opt/basalt/seed-workspace.sh <BASALT_IMAGE> \
+     export /src /seed/us25-seed.tar
+
+   # B：先让 compose 建好 Worker 卷（继承镜像内 /data 的 10001:10001 属主），再导入
+   docker compose -f compose.multiworker.yaml -p basalt --profile worker create --no-recreate basalt-worker
+   docker run --rm --user 0 \
+     -v basalt_worker-workspace:/data -v "$PWD:/seed:ro" \
+     --entrypoint /opt/basalt/seed-workspace.sh <BASALT_IMAGE> \
+     import /seed/us25-seed.tar /data
+   ```
+
+   `<BASALT_IMAGE>` 取 `.env` 里同名变量的值（版本 + digest）；`--force` 才会覆盖非空目标。归档只含 `.basalt/` 子树里的普通文件；`basalt.yaml`、SQLite 库、锁、日志、`runs/` 与 Agent 运行时状态**不在**归档内。篡改一字节、截断、路径穿越或符号链接（归档侧或目标侧）一律拒绝导入。
+   **种子不含 `basalt.yaml`**：B 的 `docker/basalt.worker.yaml` 中 `providers`、`embedding`、`flows` 必须与 A 的 `basalt.yaml` 一致——Worker 领取执行后要用同一组 provider 与向量维度，缺声明会在执行期失败而不是启动期。
+
+6. **启动 Worker** 并核对注册：
+
+   ```sh
+   docker compose -f compose.multiworker.yaml -p basalt --profile worker up -d
+   # exec 起的是独立进程，不经过 entrypoint：自行从 secret 文件导出 DSN（与健康检查同口径）
+   docker compose -f compose.multiworker.yaml -p basalt exec basalt-worker \
+     sh -c 'BASALT_DATABASE_DSN="$(cat /run/secrets/database_dsn)" basalt workers list'
+   ```
+
+   两台宿主各出现一行、`INSTANCE` 不同、心跳在 TTL 内即是「已注册」；**心跳过期不等于死亡**，归属只由租约决定（见「分布式执行」一节的「Worker 与租约排障」）。
+
+7. **资产分发**：共享发布记录是准入权威，bundle 已随第 5 步的种子进入 Worker 工作区——Worker 运行中**无法**安装（实例锁），也不应安装或发布（FR-25-22）。新增 Agent 或定义漂移时按第 5 步重做：停全部进程 → 在控制面装 bundle → 重新导出 / 导入种子。bundle 缺失或哈希不符时新 Run 在准入被 `ASSET_*` 拒绝。
+
+#### 健康检查、停机与接管
+
+- 控制面健康检查打 `GET /api/v1/health`，**只判存活**：数据库断开时它仍是 200（§8.2 同口径）。
+- Worker 健康检查自行从 `database_dsn` 解析 DSN 后运行只读的 `workers list`，只表示「数据库可达」，**不**表示已注册或心跳健康；后两者看 `workers list` 的列与租约。
+- 停机顺序见「分布式执行」一节的「停机顺序」：停止领取 → drain 期间继续续约 → 取消并 join → 释放租约 → 关库；超过 `worker.shutdown_grace_seconds` 直接退出，租约到期后由别的 Worker 回收收尾。
+- 控制面停机后，存活 Worker 的回收器接管过期租约：**只收尾不重放**——旧 `planned_at` 不产生第二个 Run，调用与工具计数不变；后续到期任务由存活 Worker 正常领取。Flow 根只由控制面推进，Worker 只回收不推进。
+- 编排层**不设** `restart` 策略，也**不**提供自动重启或进程守护：Worker 崩溃就停下，接管是另一个 Worker 的职责，重启循环只会掩盖故障。
+- PostgreSQL 短暂中断恢复后，未确认的未知副作用标记为停止或待查，**不**自动重放；Run 终态与审计一致。
+
+#### 升级与整组回滚
+
+升级顺序见 §5.1：停**全部**旧进程 → 备份（库 + 每个工作区 + 密钥 + 旧镜像）→ 新控制面启动迁移 → 新 Worker。同 schema 的两个版本之间**没有**制品版本门禁（US-24 与 US-25 均为 v12）——「不得新旧混跑」是部署纪律；跨 schema 时旧二进制因 `schema_version` 高于自身支持版本**拒绝启动**（§5.2）。
+
+整组回滚 = 数据库 + 每个工作区 + 主密钥 + 旧镜像成套恢复：只恢复数据库而留着漂移过的工作区，发布指针与工作区不一致会让准入拒绝新运行（`ASSET_*`），这是设计行为，不是可以绕过的故障。
+
+#### 多 Worker 排障
+
+| 症状 | 原因与处理 |
+| --- | --- |
+| Worker exit 78，点名 `/run/basalt-secrets/master_key` | 密钥未复制、不可读或权限不符；按 §6.1 复核文件 `0400`、父目录 `0700`、属主 `10001:10001` |
+| Worker exit 78，点名名册 / 工作区 | 工作区未从种子导入；先 `seed-workspace.sh import` 再启动，**不得**让 Worker 自己建工作区 |
+| Worker 起不来，日志点名 `database_dsn` | B 上 DSN 缺失或仍指向旧主机；用 `--copy-from --db-host <A 的私网地址>` 重新准备部署目录（已有文件不覆盖，先按脚本提示处理） |
+| `workers list` 只有一行 | 第二台没连上同一个库、或 `--profile worker` 没起；先看 `docker compose -p <项目> ps` 与 Worker 日志，再看租约表 |
+| 新 Run 一律 `ASSET_UNAVAILABLE` | 共享发布记录里没有该 Agent 的 bundle 指针，或本机 bundle 与记录不一致；按「资产导出、安装与校验」在每台 Worker 装同一份 |
+
+#### 容器隔离开关（US-20 起，本档不验证）
+
+> 容器隔离（OCI / gVisor 执行档）是**实例级 opt-in**，默认关闭；本档**不在首发支持矩阵**内。开启后，依赖工具执行的 **5 个 daily 脚本**会因镜像与运行时未适配而执行失败（默认 demo 演示路径受影响），**4 个 Flow 角色**只读原文、不执行工具、**不受影响**。确认执行档后若要**回退 local**：把 `sandbox.*` 改回默认档或删除对应配置并重启即可，不需要迁移数据，也不需要重建实例。本档**不**声称容器隔离已经验证——真实适配与双模验证属于 US-25B，**不**在本档范围。
+
+#### 首发支持矩阵
+
+| 形态 | 状态 | 说明 |
+| --- | --- | --- |
+| Compose 多 Worker（本档） | 已支持 | 单宿主编排按本节步骤部署；自动化证据见 `specs/025-compose-multiworker/` |
+| `LocalRunner` 执行档 | 已支持 | 默认执行档，首发唯一验证过的工具执行方式 |
+| K8s 单实例 / 多 Worker | 未验证 | 规划中的 US-23 / US-25A，**不得**用本档证据冒充 |
+| 数据库 HA（主备 / 自动故障转移） | 未验证 | 不在本档范围；PostgreSQL 单实例是唯一受支持形态 |
+| 真实双宿主（A + B 云服务器） | 未验证 | 编排与自动化按单宿主验证；两宿主实测在首发后演示阶段补充，不写成首发已验证 |
+
 ## 9. 管理面写操作要点（US-12 起）
 
 管理台（`/console/`）的写操作全部先写 `pending` 管理操作再动目标，可在「操作记录」里按 `operation_id` 查证终态。日常写操作有几条固定边界：
@@ -1672,7 +1808,9 @@ learning:
 
 ## 分布式执行（US-24）
 
-多个 `serve` 进程可以共享**同一个 PostgreSQL** 分摊离线 / 定时 Agent 任务；SQLite 谱系仍是单进程，**不得**把同一个 SQLite 文件同时挂给两个进程。每个 Worker 保留自己的工作区（各自的 `agent/`、技能与 `.basalt/`），执行权、资产发布记录与调用方周期配额以数据库为唯一权威。默认仍是同步执行：本档只把"谁有资格写"提升到多进程，不引入第二条执行路径，模型 / 工具调用不自动重放。
+多个 `serve` 进程（或 Compose 拓扑里的控制面 `serve` + Worker `gateway`，§8.3）可以共享**同一个 PostgreSQL** 分摊离线 / 定时 Agent 任务；SQLite 谱系仍是单进程，**不得**把同一个 SQLite 文件同时挂给两个进程。每个 Worker 保留自己的工作区（各自的 `agent/`、技能与 `.basalt/`），执行权、资产发布记录与调用方周期配额以数据库为唯一权威。默认仍是同步执行：本档只把"谁有资格写"提升到多进程，不引入第二条执行路径，模型 / 工具调用不自动重放。
+
+Worker 进程是 `basalt gateway`：**无 HTTP 面、无 admin token、不做入口限流**，管理面与 Flow 根推进只属于控制面的 `serve`。首发支持矩阵只写 Compose 多 Worker 与 `LocalRunner`（§8.3「首发支持矩阵」）；K8s、数据库 HA 与真实双宿主均为未验证形态。
 
 ### 前提与配置
 

@@ -1,0 +1,89 @@
+# Basalt Worker 容器配置模板（US-25）：entrypoint 首启播种到 Worker 工作区的
+# /data/basalt.yaml，之后永不覆盖。
+# Basalt worker container template, seeded once to /data/basalt.yaml and never
+# overwritten afterwards.
+#
+# Worker 只跑 `gateway`：它领取数据库里的到期执行、续约与回收，**不**提供 HTTP 面、
+# 不接受调用方请求、不生成管理面密码。因此本文件**没有** `http` / `callers` 两段——
+# 入口限流与 admin token 都是控制面专属，Worker 复制了也不会被用到，只会让"改一处
+# 忘一处"变成两处配置漂移。
+# A worker runs gateway only: it claims due executions, renews leases and reclaims.
+# It serves no HTTP face and has no admin token, so the http and callers sections are
+# deliberately absent; ingress limits belong to the control plane alone.
+
+database:
+  # entrypoint（resolve_dsn）把 /run/secrets/database_dsn 读进 BASALT_DATABASE_DSN；
+  # 这里只留占位，DSN 永不写进文件。
+  # The entrypoint exports the DSN from the secret file; only the placeholder is here.
+  dsn: ${BASALT_DATABASE_DSN}
+
+secrets:
+  # Worker **不得**自建主密钥：它与控制面共享同一份，由只读 bind mount 提供。
+  # 挂载点必须是镜像内预建、属主 10001:10001、权限 0700 的 /run/basalt-secrets——
+  # /run/secrets 默认 0755，会被父目录权限判据拒绝（§2.3.5）。
+  # The key is shared with the control plane and bind-mounted read-only from a 0700
+  # directory; /run/secrets is 0755 by default and would be refused.
+  master_key_file: ${BASALT_MASTER_KEY_FILE}
+  # 显式为 false：Worker 永不铸钥。缺省是 true，写漏这一行会让“零历史 + pending”的
+  # Worker 生成第二把主密钥，控制面已有的密文随之不可解（§2.3.5 失败路径）。
+  # Explicit false: a worker must never mint a key, or the control plane's ciphertexts
+  # become undecryptable.
+  auto_init: false
+
+worker:
+  # 仅作诊断（worker_nodes 的展示名）；身份是 InstanceID，**允许重复**。
+  # Diagnostic name only; the identity is the InstanceID, and duplicates are allowed.
+  name: ${BASALT_WORKER_NAME}
+
+server:
+  max_concurrent_runs: 32
+
+budget:
+  max_iterations: 30
+
+# 与控制面**必须一致**：flows 的启停、上限与停机预算参与执行资格判定，两侧不同会让
+# 同一个任务在一侧可以领取、另一侧拒绝。控制面改了这里也要改。
+# Must match the control plane: the flow switch and limits participate in execution
+# eligibility, so a mismatch makes the same task claimable on one side only.
+flows:
+  enabled: false
+  max_active: 4
+  interactive_reserved_runs: 1
+  interactive_reserved_per_caller: 1
+  max_open_tasks: 32
+  max_stored_tasks: 10000
+  cancel_wait_seconds: 30
+  shutdown_grace_seconds: 35
+
+scheduler:
+  poll_interval_ms: 500
+  dispatch_batch: 32
+  missed_grace_seconds: 300
+
+assets:
+  # 相对 WORKDIR（/data）：种子导入把控制面的 .basalt/assets 一并带到 Worker，
+  # 准入核对读的就是这里。空值不是“取缺省”，装载期直接拒绝。
+  # Relative to WORKDIR (/data); the seed archive carries the bundles here.
+  bundle_root: .basalt/assets
+
+# ── 示例段（默认注释）──────────────────────────────────────────────────────────
+# embedding / providers 与控制面**必须一致**，但它们引用模型连接与凭据，写死占位会
+# 让 Worker 在没有这些环境变量时拒绝加载。按部署实际情况取消注释并补齐变量。
+# Embedding and providers must match the control plane, but they reference model
+# connections and credentials; uncomment and fill them for your deployment.
+#
+# embedding:
+#   model_connection: ${BASALT_EMBEDDING_CONNECTION}
+#   model: ${BASALT_EMBEDDING_MODEL}
+#   dimensions: 1024
+#   batch_size: 32
+#   timeout_seconds: 60
+#
+# providers:
+#   - name: ${BASALT_PROVIDER_NAME}
+#     base_url: ${BASALT_PROVIDER_BASE_URL}
+#     api_key: ${BASALT_PROVIDER_API_KEY}
+#     # 键名是 default_model（不是 model）：模型连接定义必填 non-empty default_model，
+#     # 写成 model 会在装载期被判"缺 default_model"。
+#     # The key is default_model, not model; a definition without it is refused at load.
+#     default_model: ${BASALT_PROVIDER_MODEL}

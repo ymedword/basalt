@@ -122,6 +122,23 @@ type SecretsFacts struct {
 	CiphertextsVerified bool
 	// CiphertextsErr 是试解路径本身的错误（读表失败），与"解不开"分开。
 	CiphertextsErr error
+
+	// ProvisioningPending 表示本实例还欠一次首次初始化（名册存在、进度记录属于该实例
+	// 且状态为 pending）。它是"中断后重试"的续做资格；名册读不懂 / 标识不符一律 false
+	// （失败关闭），不把含糊状态当成可续做。
+	// ProvisioningPending is the resume eligibility left by an interrupted first install.
+	ProvisioningPending bool
+	// RuntimeHistory 表示四张业务历史表任意一张已有行（`runs` / `task_executions` /
+	// `agent_lifecycle` / `kb_documents`）。有历史 = 实例已经跑过真实业务，即使本次启动
+	// 看起来是"新目录"也不得自动铸钥（空工作区指向已有业务库的主要误配置）。
+	// 它是**本轮资格判据**，不是"整个共享库从未被使用"的证明；`management_operations`
+	// 不计入——首次准备自己会写 pending 审计，计入会让续做永远失去资格。
+	// RuntimeHistory is the four-table eligibility fact, not a claim about every table.
+	RuntimeHistory bool
+	// RuntimeHistoryErr 是业务历史查询本身的错误。**不得**把它当成"没有历史"：读不到
+	// 就落 `await_init`，由人工确认，而不是在存量库上静默生成新密钥。
+	// RuntimeHistoryErr must never be read as "no history"; it forces await_init.
+	RuntimeHistoryErr error
 }
 
 // EvaluateSecrets 按 §2.4.1 判定表给出结论；纯函数，不做 I/O。
@@ -140,11 +157,7 @@ func EvaluateSecrets(facts SecretsFacts) SecretsDecision {
 		if facts.ManagedCiphertexts > 0 {
 			return recoveryDecision(core.SecretRecoveryUnprovableProvenance)
 		}
-		return SecretsDecision{
-			State:  core.SecretStateUninitialized,
-			Reason: core.SecretRecoveryNone,
-			Action: SecretsActionAwaitInit,
-		}
+		return uninitializedDecision(SecretsActionAwaitInit)
 	}
 	if facts.Record != nil {
 		switch {
@@ -174,17 +187,23 @@ func EvaluateSecrets(facts SecretsFacts) SecretsDecision {
 			// 有密文却既无记录也无密钥：来源不可证明，**不得**当成未初始化去生成。
 			return recoveryDecision(core.SecretRecoveryUnprovableProvenance)
 		}
-		if facts.FreshInstance && facts.AutoInit {
-			return SecretsDecision{
-				State:  core.SecretStateUninitialized,
-				Reason: core.SecretRecoveryNone,
-				Action: SecretsActionCreate,
-			}
-		}
-		return SecretsDecision{
-			State:  core.SecretStateUninitialized,
-			Reason: core.SecretRecoveryNone,
-			Action: SecretsActionAwaitInit,
+		// 首次自动铸钥的完整资格（US-25 §2.3.3 / FR-25-03 / FR-25-04）：除"无记录、
+		// 无密钥、零托管密文"外，还要求实例没跑过业务（四表零历史），且要么本次确实是
+		// 新实例、要么留有属于本实例的 pending 续做记录。历史读不到**不得**当成没有
+		// ——落 await_init 由人工确认，而不是在存量共享库上静默生成新密钥。
+		// Minting requires zero business history plus a fresh or resume-eligible instance;
+		// an unreadable history is await_init, never "no history".
+		switch {
+		case facts.RuntimeHistoryErr != nil:
+			return uninitializedDecision(SecretsActionAwaitInit)
+		case facts.RuntimeHistory:
+			return uninitializedDecision(SecretsActionAwaitInit)
+		case !facts.AutoInit:
+			return uninitializedDecision(SecretsActionAwaitInit)
+		case facts.FreshInstance || facts.ProvisioningPending:
+			return uninitializedDecision(SecretsActionCreate)
+		default:
+			return uninitializedDecision(SecretsActionAwaitInit)
 		}
 	}
 	if facts.KeyErr != nil {
@@ -217,6 +236,17 @@ func recoveryDecision(reason core.SecretRecoveryReason) SecretsDecision {
 		State:  core.SecretStateRecoveryRequired,
 		Reason: reason,
 		Action: SecretsActionRecover,
+	}
+}
+
+// uninitializedDecision 收敛"未初始化"的三元组：状态与原因固定，只有下一步动作不同
+// （auto_init 关闭 / 有历史 / 读历史失败都落 await_init，资格齐全才 create）。
+// uninitializedDecision builds one uninitialized verdict with the given action.
+func uninitializedDecision(action SecretsAction) SecretsDecision {
+	return SecretsDecision{
+		State:  core.SecretStateUninitialized,
+		Reason: core.SecretRecoveryNone,
+		Action: action,
 	}
 }
 
@@ -731,6 +761,15 @@ func (s *InstanceSecretsService) gatherFacts(ctx context.Context) (SecretsFacts,
 		return facts, nil, nil
 	}
 	facts.ManagedCiphertexts = count
+
+	// 首次自动铸钥的资格事实（US-25 §2.3.3 / FR-25-03 / FR-25-04）：续做进度与四表
+	// 零业务历史。两者都只在"无记录、无密钥"分支参与判定；历史读失败**不**在这里吞成
+	// false，也不提前返回错误——由判定表落 await_init，交给人工确认。
+	// The resume marker and the four-table history feed only create eligibility; a read
+	// failure is carried to the table, never flattened into "no history".
+	facts.ProvisioningPending, _, _ = adminTokenProvisioningPending(s.deps.WorkDir)
+	facts.RuntimeHistory, facts.RuntimeHistoryErr = s.deps.Store.HasRuntimeHistory(ctx)
+
 	if !facts.Configured {
 		return facts, nil, nil
 	}

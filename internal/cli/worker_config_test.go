@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -133,4 +134,48 @@ func TestWorkerConfig_ErrorNamesTheKey(t *testing.T) {
 	_, err = decodeConfig(map[string]any{"assets": map[string]any{"bundle_root": ""}})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "assets.bundle_root")
+}
+
+// TestUS25_Compose_WorkerConfigParsesWithoutControlSecrets 判交付的 Worker 模板能
+// **脱离控制面专属变量独立装载**（FR-25-33）：只提供 compose 保证的三个变量
+// （DSN / 主密钥路径 / Worker 名）时，`docker/basalt.worker.yaml` 必须通过装载。
+//
+// 逆改点：模板里加上 `http`（含 admin token 或端口）或 `callers.ingress` 六项的任何
+// 一处 `${...}` 占位 → 本用例在装载层红，因为 `resolveString` 对缺失变量一律拒绝；
+// 把 `secrets.auto_init` 改成 true 或删掉 → 自动建钥资格断言红（Worker 不得铸钥）。
+// Any control-plane-only placeholder in the template fails the load, and a worker that
+// could mint its own key fails the auto_init assertion.
+func TestUS25_Compose_WorkerConfigParsesWithoutControlSecrets(t *testing.T) {
+	template := filepath.Join("..", "..", "docker", "basalt.worker.yaml")
+	// 只有部署期保证的三个变量；控制面专属的入口限流 / admin token / 端口一个都不给。
+	// Only the three deployment-guaranteed variables; no ingress, token or port.
+	workerEnv := map[string]string{
+		"BASALT_DATABASE_DSN":    "postgres://basalt@postgres:5432/basalt?sslmode=disable",
+		"BASALT_MASTER_KEY_FILE": "/run/basalt-secrets/master_key",
+		"BASALT_WORKER_NAME":     "worker-a",
+	}
+	cfg, err := LoadConfig(template, func(key string) (string, bool) {
+		value, ok := workerEnv[key]
+		return value, ok
+	})
+	require.NoError(t, err, "Worker 模板必须能独立装载（FR-25-33）")
+
+	require.False(t, cfg.Secrets.AutoInitEnabled(), "Worker 不得自铸主密钥（C-08）")
+	require.Equal(t, "/run/basalt-secrets/master_key", cfg.Secrets.MasterKeyFile)
+	require.Equal(t, "worker-a", cfg.Worker.Name)
+
+	// 没有 http / callers 两段：Worker 无 HTTP 面（C-06）。
+	require.Empty(t, cfg.HTTP.Addr)
+	require.NotEmpty(t, cfg.ingressMissing,
+		"入口限流六项只在控制面要求；Worker 装载时必须留空且不影响通过")
+	require.Error(t, ValidateServeIngress(cfg),
+		"同一份 Worker 配置不得具备 serve 资格——缺入口限流就该拒绝服务启动")
+
+	// 分布式执行三段：worker 段只写 name，其余落 §3.3 冻结缺省；scheduler 写出的是
+	// 缺省同值，因此两份都必须等于缺省。
+	expectedWorker := DefaultWorkerConfig()
+	expectedWorker.Name = "worker-a"
+	require.Equal(t, expectedWorker, cfg.Worker, "worker 段只写 name，其余落缺省")
+	require.Equal(t, DefaultSchedulerConfig(), cfg.Scheduler)
+	require.Equal(t, DefaultAssetsConfig(), cfg.Assets)
 }

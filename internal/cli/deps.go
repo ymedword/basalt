@@ -57,6 +57,14 @@ type Deps struct {
 	// AcquireWorkspaceLock injects the original lock without importing its implementation.
 	AcquireWorkspaceLock func(root string) (release func() error, err error)
 
+	// FirstInstall 是首次安装准备端口（见 ports.go）：`init` 在 Workspace.Init 与
+	// Store.Bootstrap 之间调用它，先写配置、进度与名册再建源库；首次 `serve` 经
+	// 同一条实现续做（US-25 T004）。拿到 nil 即报缺件并**不建库**——不得退化成
+	// "跳过准备直接 Bootstrap"。
+	// FirstInstall runs between Workspace.Init and Store.Bootstrap; a nil port is a
+	// wiring gap and the command must not fall back to bootstrapping without it.
+	FirstInstall FirstInstall
+
 	// Agents 是 Agent 目录端口：list / show 只读（轻路径——不取实例锁、不触数据库），
 	// create / delete 是**写模式**（实现侧先取实例锁：被活实例持有时拒绝启动且零写入）。
 	// Agents is the agent-directory port: list / show stay read-only, while create /
@@ -79,6 +87,13 @@ type Deps struct {
 	// （它要库、撤销编排与解析器），轻路径拿到 nil 即报缺件，不自造第二套读面。
 	// Secrets is only produced by the heavy-path assembly; a nil here is a wiring gap.
 	Secrets Secrets
+
+	// MasterKeyCheck 是 `secrets check-key` 的离线端口（见 ports.go）：只读校验主密钥
+	// 文件与父目录后返回公开摘要，不触数据库、不取实例锁。Worker 启动预检也走它
+	// （US-25 T008）。拿到 nil 即报缺件——命令面不得自行解析密钥文件补出第二条读面。
+	// MasterKeyCheck is the offline preflight behind secrets check-key; a nil here is a
+	// wiring gap, never a reason for the command surface to parse the key itself.
+	MasterKeyCheck MasterKeyCheck
 
 	// DatabaseMigrator 是 PostgreSQL 迁移端口（见 ports.go）：`db migrate` 经它建库 /
 	// 前向迁移。装配层常驻注入（它与库、锁、运行期资源都无关，轻路径也能安全带上）；
@@ -153,6 +168,13 @@ type Deps struct {
 	// install 缺 Publish 时失败关闭（**不得**退化成只装本地）。
 	// The asset command surface; a nil port is a wiring gap and install fails closed.
 	Assets AssetsPort
+
+	// DemoPrepare 是 `demo workflow prepare` 的端口（见 ports.go）：计划只读、应用分步
+	// 执行，管理面写动作全部经实现侧的管理端点与审计（US-25 T017/T018）。拿到 nil 即
+	// 报缺件——命令面不得自建第二套 HTTP 客户端或旁路写面。
+	// DemoPrepare backs demo workflow prepare; a nil here is a wiring gap, never a
+	// reason for the command surface to grow a second write path.
+	DemoPrepare DemoPrepare
 
 	// CLIWriteActor 给出**本机 CLI 写动作**的操作主体（`cli:<OS user>`）。它是七个
 	// 准入写动作的唯一身份来源：命令面没有 `--approver` 之类旁路，缺失即报缺件；

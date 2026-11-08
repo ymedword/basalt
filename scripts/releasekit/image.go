@@ -53,32 +53,46 @@ type ImageInputs struct {
 	Entrypoint string
 	ConfigFile string
 	License    string
-	OutDir     string
-	RuntimeDir string // 空 = binary 档；非空必须通过 US-17 full 档完整性检查
+	// US-25 起镜像内随制品分发 Worker 模板与两个运维脚本；三者必填，缺件在
+	// docker build 之前报错，避免正式发布路径上 COPY 源缺失。
+	// US-25 ships the worker template and two operator scripts inside the image;
+	// all three are required and a missing file fails before docker build.
+	WorkerConfigFile string
+	ExportKeyScript  string
+	SeedScript       string
+	OutDir           string
+	RuntimeDir       string // 空 = binary 档；非空必须通过 US-17 full 档完整性检查
 }
 
 // ImageRecord 是镜像的权威记录，进 release-record.json 的 images[]。
 // ImageRecord is the authoritative image record stored in release-record.json.
 type ImageRecord struct {
-	Name             string     `json:"name"`
-	Version          string     `json:"version"`
-	Platform         string     `json:"platform"`
-	Tier             Tier       `json:"tier"`
-	Tag              string     `json:"tag"`
-	LocalID          string     `json:"local_id"`
-	RepoDigest       string     `json:"repo_digest,omitempty"`
-	BaseRef          string     `json:"base_ref"`
-	BaseDigest       string     `json:"base_digest"`
-	BinarySHA256     string     `json:"binary_sha256"`
-	DockerfileSHA256 string     `json:"dockerfile_sha256"`
-	EntrypointSHA256 string     `json:"entrypoint_sha256"`
-	ConfigSHA256     string     `json:"config_sha256"`
-	SBOMPath         string     `json:"sbom_path"`
-	SBOMSHA256       string     `json:"sbom_sha256"`
-	ProvenancePath   string     `json:"provenance_path"`
-	ProvenanceSHA256 string     `json:"provenance_sha256"`
-	Scan             ScanRecord `json:"scan"`
-	Evidence         []string   `json:"evidence,omitempty"`
+	Name             string `json:"name"`
+	Version          string `json:"version"`
+	Platform         string `json:"platform"`
+	Tier             Tier   `json:"tier"`
+	Tag              string `json:"tag"`
+	LocalID          string `json:"local_id"`
+	RepoDigest       string `json:"repo_digest,omitempty"`
+	BaseRef          string `json:"base_ref"`
+	BaseDigest       string `json:"base_digest"`
+	BinarySHA256     string `json:"binary_sha256"`
+	DockerfileSHA256 string `json:"dockerfile_sha256"`
+	EntrypointSHA256 string `json:"entrypoint_sha256"`
+	ConfigSHA256     string `json:"config_sha256"`
+	// 三个 Worker 工件摘要自 US-25 起写入；旧发布记录没有这三项，omitempty 让它们
+	// 反序列化后为空并通过 Validate，而新构建必须在返回前断言非空。
+	// The three worker-asset digests arrive with US-25; old records deserialize to
+	// empty and still validate, while new builds assert non-empty before returning.
+	WorkerConfigSHA256 string     `json:"worker_config_sha256,omitempty"`
+	ExportKeySHA256    string     `json:"export_key_sha256,omitempty"`
+	SeedScriptSHA256   string     `json:"seed_script_sha256,omitempty"`
+	SBOMPath           string     `json:"sbom_path"`
+	SBOMSHA256         string     `json:"sbom_sha256"`
+	ProvenancePath     string     `json:"provenance_path"`
+	ProvenanceSHA256   string     `json:"provenance_sha256"`
+	Scan               ScanRecord `json:"scan"`
+	Evidence           []string   `json:"evidence,omitempty"`
 }
 
 // ScanRecord 记录镜像漏洞扫描状态；没扫描就写 not-run 与原因，不编造结论。
@@ -179,30 +193,11 @@ func BuildImage(ctx context.Context, in ImageInputs) (ImageRecord, error) {
 		return ImageRecord{}, fmt.Errorf("创建镜像产物目录：%w", err)
 	}
 
-	contextDir, err := os.MkdirTemp(in.OutDir, ".image-context-")
+	contextDir, cleanupContext, err := in.stageImageContext()
 	if err != nil {
-		return ImageRecord{}, fmt.Errorf("创建镜像构建上下文：%w", err)
-	}
-	defer func() { _ = os.RemoveAll(contextDir) }()
-	staged := []struct {
-		src  string
-		name string
-		perm fs.FileMode
-	}{
-		{in.Binary, imageArtifactName, 0o755},
-		{in.Dockerfile, "Dockerfile", 0o644},
-		{in.Entrypoint, "entrypoint.sh", 0o755},
-		{in.ConfigFile, "basalt.yaml", 0o644},
-		{in.License, "LICENSE", 0o644},
-	}
-	for _, item := range staged {
-		if err := copyFile(item.src, filepath.Join(contextDir, item.name), item.perm); err != nil {
-			return ImageRecord{}, fmt.Errorf("暂存 %s：%w", item.name, err)
-		}
-	}
-	if err := CheckImageContext(contextDir); err != nil {
 		return ImageRecord{}, err
 	}
+	defer cleanupContext()
 
 	started := time.Now().UTC()
 	record := ImageRecord{
@@ -226,6 +221,9 @@ func BuildImage(ctx context.Context, in ImageInputs) (ImageRecord, error) {
 		{in.Dockerfile, &record.DockerfileSHA256},
 		{in.Entrypoint, &record.EntrypointSHA256},
 		{in.ConfigFile, &record.ConfigSHA256},
+		{in.WorkerConfigFile, &record.WorkerConfigSHA256},
+		{in.ExportKeyScript, &record.ExportKeySHA256},
+		{in.SeedScript, &record.SeedScriptSHA256},
 	} {
 		sum, err := FileSHA256(item.path)
 		if err != nil {
@@ -313,7 +311,52 @@ func BuildImage(ctx context.Context, in ImageInputs) (ImageRecord, error) {
 		cleanup()
 		return ImageRecord{}, err
 	}
+	// Validate 对旧发布记录放行三个空摘要；新构建不能借这条兼容规则漏记工件。
+	// Validate lets old records carry empty digests; a fresh build must not use that
+	// allowance to ship an unrecorded worker asset set.
+	if record.WorkerConfigSHA256 == "" || record.ExportKeySHA256 == "" || record.SeedScriptSHA256 == "" {
+		cleanup()
+		return ImageRecord{}, errors.New("新构建的镜像记录缺少 Worker 工件摘要（basalt.worker.yaml / export-master-key.sh / seed-workspace.sh）")
+	}
 	return record, nil
+}
+
+// stageImageContext 把镜像构建所需的 8 个文件暂存到一个临时目录，并跑构建上下文
+// 守卫；返回的 cleanup 必须由调用方执行。失败时自行清理，不留下半截上下文。
+// stageImageContext stages the eight files the image build needs into a temporary
+// directory and runs the context guard; the caller must run the returned cleanup.
+// Failures clean up after themselves so no half-staged context survives.
+func (in ImageInputs) stageImageContext() (string, func(), error) {
+	contextDir, err := os.MkdirTemp(in.OutDir, ".image-context-")
+	if err != nil {
+		return "", nil, fmt.Errorf("创建镜像构建上下文：%w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(contextDir) }
+	staged := []struct {
+		src  string
+		name string
+		perm fs.FileMode
+	}{
+		{in.Binary, imageArtifactName, 0o755},
+		{in.Dockerfile, "Dockerfile", 0o644},
+		{in.Entrypoint, "entrypoint.sh", 0o755},
+		{in.ConfigFile, "basalt.yaml", 0o644},
+		{in.License, "LICENSE", 0o644},
+		{in.WorkerConfigFile, "basalt.worker.yaml", 0o644},
+		{in.ExportKeyScript, "export-master-key.sh", 0o755},
+		{in.SeedScript, "seed-workspace.sh", 0o755},
+	}
+	for _, item := range staged {
+		if err := copyFile(item.src, filepath.Join(contextDir, item.name), item.perm); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("暂存 %s：%w", item.name, err)
+		}
+	}
+	if err := CheckImageContext(contextDir); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return contextDir, cleanup, nil
 }
 
 func (in ImageInputs) validate() error {
@@ -336,6 +379,9 @@ func (in ImageInputs) validate() error {
 		{"Entrypoint", in.Entrypoint},
 		{"ConfigFile", in.ConfigFile},
 		{"License", in.License},
+		{"WorkerConfigFile", in.WorkerConfigFile},
+		{"ExportKeyScript", in.ExportKeyScript},
+		{"SeedScript", in.SeedScript},
 		{"OutDir", in.OutDir},
 	} {
 		if strings.TrimSpace(item.path) == "" {
@@ -351,6 +397,9 @@ func (in ImageInputs) validate() error {
 		{"entrypoint.sh", in.Entrypoint},
 		{"basalt.yaml", in.ConfigFile},
 		{"LICENSE", in.License},
+		{"basalt.worker.yaml", in.WorkerConfigFile},
+		{"export-master-key.sh", in.ExportKeyScript},
+		{"seed-workspace.sh", in.SeedScript},
 	} {
 		info, err := os.Stat(item.path)
 		if err != nil {
@@ -415,6 +464,25 @@ func (r ImageRecord) Validate() error {
 	} {
 		if !isHex64(item.sum) {
 			return fmt.Errorf("镜像记录 %s 不是 64 位十六进制摘要：%q", item.label, item.sum)
+		}
+	}
+	// 三个 Worker 工件摘要按记录版本兼容：空表示 US-25 之前的旧记录，仍可校验；
+	// 非空则必须是 64 位小写十六进制（新构建写的就是这个形态）。
+	// The three worker-asset digests are version-tolerant: empty means a pre-US-25
+	// record that must still verify; non-empty must be 64 lowercase hex.
+	for _, item := range []struct {
+		label string
+		sum   string
+	}{
+		{"worker_config_sha256", r.WorkerConfigSHA256},
+		{"export_key_sha256", r.ExportKeySHA256},
+		{"seed_script_sha256", r.SeedScriptSHA256},
+	} {
+		if item.sum == "" {
+			continue
+		}
+		if !isLowerHex64(item.sum) {
+			return fmt.Errorf("镜像记录 %s 不是 64 位小写十六进制摘要：%q", item.label, item.sum)
 		}
 	}
 	if err := checkRecordFileName(r.SBOMPath); err != nil {
@@ -971,6 +1039,14 @@ func checkImageIdentity(value string) error {
 		return fmt.Errorf("必须是 sha256:<64 hex>，got %q", value)
 	}
 	return nil
+}
+
+// isLowerHex64 只接受 64 位小写十六进制：镜像记录里新写的摘要按小写形态落盘，大小
+// 写混写视同篡改形态。
+// isLowerHex64 accepts 64 lowercase hex chars only; the new digests are written in
+// lowercase, so mixed case is treated as a malformed record.
+func isLowerHex64(value string) bool {
+	return isHex64(value) && value == strings.ToLower(value)
 }
 
 func isHex64(value string) bool {

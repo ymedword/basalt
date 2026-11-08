@@ -86,6 +86,8 @@ func TestRun_OfflineSecretsCommandsSkipHeavyPath(t *testing.T) {
 		"adopt-legacy 只操作隔离副本，不得装配 runtime（§2.12.0b）")
 	require.False(t, needsRuntime([]string{"secrets", "recover-record", "--workspace", "/ws/.basalt"}),
 		"recover-record 自己持实例锁，重路径先取锁会让它 workspace_busy（§3.1.8b）")
+	require.False(t, needsRuntime([]string{"secrets", "check-key", "--path", "/run/basalt-secrets/master.key"}),
+		"check-key 是 Worker 启动预检：不连库、不取锁、不迁移（US-25 P-18）")
 
 	// 选项夹在命令名与子命令之间也不影响判定。
 	require.False(t, needsRuntime([]string{"--verbose", "secrets", "adopt-legacy"}),

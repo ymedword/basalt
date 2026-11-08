@@ -963,3 +963,175 @@ type AssetsPort interface {
 	// is the first half of install --agent, and the adapter owns all the reading.
 	Build(ctx context.Context, agent, dest string) (assets.Manifest, error)
 }
+
+// ─────────────────────────── first install / demo prepare / master-key check ───────────────────────────
+//
+// 下面三组端口服务于 US-25 的部署命令面（模块卡 §3.1.1 / §3.1.3 / §3.1.4）。同一条
+// 端口纪律：报告类型定义在消费方，实现类型不出装配层——`cli` 因此不 import `app`。
+// The three port families behind the US-25 deployment commands follow the same rule:
+// report types live in the consumer, so cli never imports the assembly layer.
+
+// FirstInstallReport 是首次安装准备（`init` 与首次 `serve` 共用）的只读报告：只报
+// **本次真的写了什么**，让命令面能逐项打印而不是笼统宣称"初始化完成"。
+// FirstInstallReport states what this call actually wrote; the command surface prints
+// the flags one by one instead of claiming a blanket initialization.
+type FirstInstallReport struct {
+	// Fresh 表示本次准备之前是全新实例（库与名册都不存在）。
+	// Fresh reports that both the database and the roster were absent beforehand.
+	Fresh bool
+
+	// ConfigCreated 表示本次写了配置文件。
+	// ConfigCreated reports that this call wrote the configuration file.
+	ConfigCreated bool
+
+	// ProvisioningRecorded 表示本次写了首次进度记录（pending）。
+	// ProvisioningRecorded reports that this call wrote the pending progress record.
+	ProvisioningRecorded bool
+
+	// MarkerCreated 表示本次写了实例名册。
+	// MarkerCreated reports that this call wrote the instance roster.
+	MarkerCreated bool
+
+	// InstanceID 是名册中的实例标识。
+	// InstanceID is the instance identifier recorded in the roster.
+	InstanceID string
+}
+
+// FirstInstall 是首次安装准备的端口（`init` 消费，适配器 ← 装配层的
+// `ensureNewInstanceConfig`）。`Prepare` **不取实例锁**：`init` 的既有契约就是不取锁、
+// 不做恢复；第二次调用 `detectNewInstance=false`，零写入。
+// FirstInstall prepares a new instance without taking the instance lock; a second call
+// detects an existing instance and writes nothing.
+type FirstInstall interface {
+	// Prepare 按固定顺序写配置 → provisioning.pending → 内置安装意图 → 名册；已完成
+	// 的步骤不重写（并发首次启动由 O_EXCL 与名册判定保证只有一个成功）。
+	// Prepare writes config, pending progress, builtin intent and roster in that fixed
+	// order; completed steps are never rewritten, so one concurrent starter wins.
+	Prepare(workDir string) (FirstInstallReport, error)
+}
+
+// DemoPrepareRequest 是 `demo workflow prepare` 的输入：管理面地址与 token 文件。
+// DemoPrepareRequest names the management endpoint and the token file.
+type DemoPrepareRequest struct {
+	// Server 为空时从配置的监听地址派生（通配监听改写为同族回环）。
+	// Server falls back to the configured listen address, wildcard rewritten to loopback.
+	Server string
+
+	// TokenFile 为空时按配置 token → 实例私有 admin-token 的顺序只读查找，不生成。
+	// TokenFile falls back to the configured token then the instance-private one; the
+	// command never mints a token.
+	TokenFile string
+}
+
+// DemoCollectionPlan 是一个集合在计划里的动作：create 或 reuse。
+// DemoCollectionPlan is one collection's planned action: create or reuse.
+type DemoCollectionPlan struct {
+	Name         string
+	CollectionID string
+	Exists       bool
+	Action       string
+}
+
+// DemoDocumentPlan 是一个文档在计划里的动作：ingest 或 unchanged。
+// DemoDocumentPlan is one document's planned action: ingest or unchanged.
+type DemoDocumentPlan struct {
+	Collection string
+	Path       string
+	Action     string
+}
+
+// DemoBindingPlan 是一个 Agent 的知识绑定计划：bind / unchanged / conflict。
+// DemoBindingPlan is one agent's binding plan; conflict is refused before any write.
+type DemoBindingPlan struct {
+	Agent     string
+	Knowledge []core.KnowledgeBinding
+	Action    string
+}
+
+// DemoPreparePlan 是只读预演结果：集合、文档与绑定的逐项动作，以及 embedding 调用
+// 与费用提示。`Warnings` 非空表示这次应用会产生模型调用。
+// DemoPreparePlan is the read-only preview; a non-empty Warnings means applying it
+// will spend embedding calls.
+type DemoPreparePlan struct {
+	Server      string
+	WorkflowDir string
+	Collections []DemoCollectionPlan
+	Documents   []DemoDocumentPlan
+	Bindings    []DemoBindingPlan
+	Warnings    []string
+}
+
+// DemoCollectionResult 是一个集合的应用结果。
+// DemoCollectionResult is one collection's applied outcome.
+type DemoCollectionResult struct {
+	Name         string
+	CollectionID string
+	Created      bool
+}
+
+// DemoDocumentResult 是一个文档的应用结果；`Status` 取服务端的 active / failed。
+// DemoDocumentResult is one document's applied outcome; Status is the server's own
+// active or failed verdict, never the HTTP status code.
+type DemoDocumentResult struct {
+	Collection   string
+	Path         string
+	Status       string
+	Deduplicated bool
+}
+
+// DemoBindingResult 是一个 Agent 的绑定结果：applied / unchanged / conflict / stale。
+// stale 表示读取与提交之间他人改动导致 412，必须重新计划而不是重提旧正文。
+// DemoBindingResult is one agent's outcome; stale means the base ETag changed under us
+// and the plan must be rebuilt rather than resubmitted.
+type DemoBindingResult struct {
+	Agent  string
+	Status string
+}
+
+// DemoPrepareResult 是应用结果；`Partial` 表示至少一个 Agent 未绑定（退出码 3，可续）。
+// DemoPrepareResult reports the applied outcome; Partial means at least one agent was
+// left unbound and a rerun resumes only the failed items.
+type DemoPrepareResult struct {
+	Collections []DemoCollectionResult
+	Documents   []DemoDocumentResult
+	Bindings    []DemoBindingResult
+	Partial     bool
+}
+
+// DemoPrepare 是 `demo workflow prepare` 的端口：计划与应用分开，`Plan` 零写入。
+// DemoPrepare separates the read-only plan from the applying half.
+type DemoPrepare interface {
+	// Plan 只发 GET：列集合、读两个 Agent 的基础 ETag 与正文，算出逐项动作与费用提示。
+	// Plan sends GETs only and computes every action plus the cost warning.
+	Plan(ctx context.Context, req DemoPrepareRequest) (DemoPreparePlan, error)
+
+	// Apply 以计划为输入创建集合、摄取文档并绑定知识；写前重取 ETag 并重判冲突，
+	// 412 记 stale 并停止该 Agent，不用新 ETag 重提旧正文。
+	// Apply creates, ingests and binds; it re-reads the base ETag before writing, turns
+	// 412 into stale and never resubmits the stale body with a fresh ETag.
+	Apply(ctx context.Context, req DemoPrepareRequest, plan DemoPreparePlan) (DemoPrepareResult, error)
+}
+
+// MasterKeyCheckReport 是 `secrets check-key` 的只读结果：只回公开摘要，**不含**密钥
+// 字节或可反推密钥的材料。
+// MasterKeyCheckReport carries the public key identifiers only.
+type MasterKeyCheckReport struct {
+	// KeyID 是主密钥的稳定标识。
+	// KeyID is the master key's stable identifier.
+	KeyID string
+
+	// Fingerprint 是主密钥的公开比对值。
+	// Fingerprint is the public comparison value of the master key.
+	Fingerprint string
+}
+
+// MasterKeyCheck 是 `secrets check-key` 的端口（离线、无数据库）：复用 `LoadMasterKey`
+// 的文件与直接父目录权限语义，供 Worker 启动预检调用。
+// MasterKeyCheck is the offline preflight behind `secrets check-key`; it reuses the
+// LoadMasterKey file and parent-directory permission rules and needs no database.
+type MasterKeyCheck interface {
+	// Check 校验密钥文件与直接父目录后返回公开摘要；失败时返回原因且不回显密钥内容。
+	// Check verifies the key file and its parent directory, returning public digests
+	// only; failures name the reason and never echo key material.
+	Check(path, workspaceRoot string) (MasterKeyCheckReport, error)
+}

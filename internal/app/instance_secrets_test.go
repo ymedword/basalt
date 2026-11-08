@@ -17,6 +17,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -45,12 +46,33 @@ type instanceSecretsFixture struct {
 	keyDir  string
 }
 
+// clearBusinessHistory 把四张业务历史表清空，让夹具回到"可证明的新实例"（空库）。
+// 资源夹具为准入预置了一条 `agent_lifecycle` 身份行；US-25 起自动铸钥还要求零业务
+// 历史（§2.3.3），那行属于准入场景，留着会让本文件所有"新实例自动铸钥"用例误判成
+// 存量库。四表的逐表判据在 internal/storage/postgres/instance_secrets_store_test.go，
+// 这里只是把夹具恢复到"从未跑过业务"的状态。
+// clearBusinessHistory resets the four business-history tables so the fixture starts
+// as a provably-new instance; the per-table judgement lives in the postgres package.
+func clearBusinessHistory(t *testing.T, db *postgres.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`DELETE FROM task_executions`,
+		`DELETE FROM runs`,
+		`DELETE FROM agent_lifecycle`,
+		`DELETE FROM kb_documents`,
+	} {
+		_, err := db.ExecContext(context.Background(), statement)
+		require.NoError(t, err)
+	}
+}
+
 // newInstanceSecretsFixture 建夹具；私有目录本身**不预建**——建目录与校验权限是
 // 被测行为的一部分（T088）。
 // newInstanceSecretsFixture leaves the private directory absent on purpose.
 func newInstanceSecretsFixture(t *testing.T) *instanceSecretsFixture {
 	t.Helper()
 	env := newResolverFixture(t)
+	clearBusinessHistory(t, env.db)
 	instanceRoot := filepath.Join(t.TempDir(), "instance")
 	keyPath := filepath.Join(instanceRoot, "master.key")
 	store := postgres.NewInstanceSecretsStore(env.db)
@@ -830,4 +852,229 @@ func TestWebOptions_InstanceSecretsProjection(t *testing.T) {
 	opts = (&App{}).webOptions(rt)
 	require.NotNil(t, opts.InstanceSecrets)
 	require.IsType(t, instanceSecretsPort{}, opts.InstanceSecrets)
+}
+
+// TestFirstInstall_SecretsEligibility 判自动铸钥判定表的每一格（US-25 §2.3.3 /
+// FR-25-03 / FR-25-04）：只有"无记录、无密钥、零密文、零历史、auto_init、
+// （fresh 或 pending）"同时成立才 create；有历史 / 读历史失败 / 关闭 auto_init /
+// 既非新实例也无 pending 一律 await_init。恢复态与就绪态不因新增字段改变。
+// 逆改点：退回只看 FreshInstance → "有业务历史"行从 await_init 变 create；把
+// RuntimeHistoryErr 当 false → "读历史失败"行变 create。
+func TestFirstInstall_SecretsEligibility(t *testing.T) {
+	historyErr := errors.New("业务历史读取失败")
+	base := SecretsFacts{Configured: true, AutoInit: true, FreshInstance: true}
+	with := func(mutate func(*SecretsFacts)) SecretsFacts {
+		facts := base
+		mutate(&facts)
+		return facts
+	}
+
+	cases := []struct {
+		name  string
+		facts SecretsFacts
+		want  SecretsAction
+	}{
+		{"全新实例且零历史", base, SecretsActionCreate},
+		{"中断续做 pending 且零历史", with(func(f *SecretsFacts) {
+			f.FreshInstance = false
+			f.ProvisioningPending = true
+		}), SecretsActionCreate},
+		{"历史优先于 fresh 与 pending", with(func(f *SecretsFacts) {
+			f.ProvisioningPending = true
+			f.RuntimeHistory = true
+		}), SecretsActionAwaitInit},
+		{"读历史失败不得当成没有", with(func(f *SecretsFacts) {
+			f.RuntimeHistoryErr = historyErr
+		}), SecretsActionAwaitInit},
+		{"auto_init 关闭", with(func(f *SecretsFacts) {
+			f.AutoInit = false
+		}), SecretsActionAwaitInit},
+		{"既非新实例也无 pending", with(func(f *SecretsFacts) {
+			f.FreshInstance = false
+		}), SecretsActionAwaitInit},
+		{"有托管密文仍是恢复态", with(func(f *SecretsFacts) {
+			f.ManagedCiphertexts = 1
+		}), SecretsActionRecover},
+		{"记录与密钥齐全仍是就绪", with(func(f *SecretsFacts) {
+			f.Record = &postgres.InstanceSecretRecord{KeyID: "mk_0123456789abcdef"}
+			f.KeyPresent = true
+			f.KeyID = "mk_0123456789abcdef"
+		}), SecretsActionReady},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision := EvaluateSecrets(tc.facts)
+			require.Equal(t, tc.want, decision.Action)
+			if tc.want == SecretsActionRecover {
+				require.Equal(t, core.SecretStateRecoveryRequired, decision.State)
+				require.Equal(t, core.SecretRecoveryUnprovableProvenance, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestFirstInstall_ExistingInstanceNeverMints 判"看起来全新的目录指向已有业务库"
+// 与中断续做两条真实路径：
+//   - 四张业务历史表任一有行时，即使 FreshInstance=true 也不得自动铸钥（否则会
+//     在共享业务库上静默换钥匙）；删掉该行后同一路径才回到 create（正向对照）；
+//   - `init` 已落名册与 pending、首次 serve 因缺入口限流退出后，重试以
+//     FreshInstance=false + pending 续做并补发主密钥（FR-25-02）。
+//
+// 逆改点：判定表只看 FreshInstance → 第一个子例把密钥写出来；把 pending 从 create
+// 条件里删掉 → 续做子例停在 uninitialized。
+func TestFirstInstall_ExistingInstanceNeverMints(t *testing.T) {
+	ctx := context.Background()
+	seedLifecycleHistory := func(t *testing.T, f *instanceSecretsFixture) {
+		t.Helper()
+		_, err := f.db.ExecContext(ctx,
+			`INSERT INTO agent_lifecycle (agent_name, updated_at) VALUES ('hist-agent', 1)`)
+		require.NoError(t, err)
+	}
+
+	t.Run("已有业务历史的新目录不铸钥", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		seedLifecycleHistory(t, f)
+
+		status, err := f.service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateUninitialized, status.Decision.State)
+		require.Equal(t, SecretsActionAwaitInit, status.Decision.Action)
+		_, statErr := os.Lstat(f.keyPath)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "有业务历史时不得生成密钥")
+		_, exists, err := f.store.Load(ctx, core.InstanceSecretScopeMasterKey)
+		require.NoError(t, err)
+		require.False(t, exists, "有业务历史时不得写初始化记录")
+		require.Empty(t, f.secretsInitOps(t), "有业务历史时不得预写初始化审计")
+	})
+
+	t.Run("删除历史后同一路径恢复 create", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		seedLifecycleHistory(t, f)
+		_, err := f.db.ExecContext(ctx, `DELETE FROM agent_lifecycle`)
+		require.NoError(t, err)
+
+		status, err := f.service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateReady, status.Decision.State)
+		require.FileExists(t, f.keyPath)
+	})
+
+	t.Run("init 的 pending 记录续做", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		workDir := t.TempDir()
+		_, err := firstInstallAdapter{}.Prepare(workDir)
+		require.NoError(t, err)
+
+		service, err := NewInstanceSecretsService(InstanceSecretsDeps{
+			Store:         f.store,
+			Operations:    f.ops,
+			MasterKeyFile: f.keyPath,
+			WorkspaceRoot: f.root,
+			WorkDir:       workDir,
+			AutoInit:      true,
+			FreshInstance: false, // 首次 serve 已退出：名册在、库未建
+			Logger:        f.service.deps.Logger,
+			Now:           baselineClock,
+		})
+		require.NoError(t, err)
+
+		status, err := service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateReady, status.Decision.State, "pending + 零历史必须续做")
+		require.FileExists(t, f.keyPath)
+	})
+}
+
+// TestFirstInstall_RecoveryNeverCreates 判恢复态不会因新增资格字段改变：有托管密文
+// 但无记录无密钥、或有记录但密钥缺失时，Ensure 都不得生成替代密钥，也不得写记录。
+// 逆改点：把零历史加进恢复分支的放行条件，或让 create 先于恢复判定 → 密钥文件出现。
+func TestFirstInstall_RecoveryNeverCreates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("有密文无记录无密钥仍是恢复态", func(t *testing.T) {
+		target, err := CredentialTargetBinding(core.BindingModelConnection, "https://api.example.com/v1", "")
+		require.NoError(t, err)
+		f := newInstanceSecretsFixture(t)
+		f.seedSealedCredential(t, core.ResourceModelConnection, "alpha", target, "sk-alpha-plaintext")
+
+		status, err := f.service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateRecoveryRequired, status.Decision.State)
+		require.Equal(t, core.SecretRecoveryUnprovableProvenance, status.Decision.Reason)
+		_, statErr := os.Lstat(f.keyPath)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "恢复态不得生成替代密钥")
+		require.Empty(t, f.secretsInitOps(t))
+	})
+
+	t.Run("有记录缺密钥不生成第二把", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		fingerprint, err := MasterKeyFingerprint(f.key)
+		require.NoError(t, err)
+		existing := postgres.InstanceSecretRecord{
+			Scope:         core.InstanceSecretScopeMasterKey,
+			KeyID:         f.key.KeyID,
+			Fingerprint:   fingerprint,
+			InitializedAt: baselineClock(),
+			OperationID:   "op-recovery-missing-key",
+		}
+		require.NoError(t, f.store.Insert(ctx, existing))
+
+		status, err := f.service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateRecoveryRequired, status.Decision.State)
+		require.Equal(t, core.SecretRecoveryMissing, status.Decision.Reason)
+		_, statErr := os.Lstat(f.keyPath)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "记录在而密钥缺失时不得生成第二把")
+		require.Equal(t, existing.KeyID, f.record(t).KeyID, "既有记录不得被改写")
+		require.Empty(t, f.secretsInitOps(t))
+	})
+}
+
+// TestFirstInstall_KeyCreationAudited 判 create 的审计顺序（宪法第 5 条 / C-27）：
+// 审计预写失败即拒绝生成（盘上零密钥、库里零记录）；成功路径恰好一条 success 行，
+// 且记录的 operation_id 与审计行一致。
+// 逆改点：把 beginSecretsInit 移到 generateAndPublish 之后 → 第一个子例留下密钥文件。
+func TestFirstInstall_KeyCreationAudited(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("预写失败即拒绝铸钥", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		service, err := NewInstanceSecretsService(InstanceSecretsDeps{
+			Store:         f.store,
+			Operations:    us21FailingOperationStore{OperationStore: f.ops, err: errors.New("audit down")},
+			MasterKeyFile: f.keyPath,
+			WorkspaceRoot: f.root,
+			AutoInit:      true,
+			FreshInstance: true,
+			Logger:        f.service.deps.Logger,
+			Now:           baselineClock,
+		})
+		require.NoError(t, err)
+
+		_, err = service.Ensure(ctx)
+		require.Error(t, err, "审计预写失败必须拒绝生成密钥")
+		require.ErrorIs(t, err, core.ErrCredentialUnavailable)
+		_, statErr := os.Lstat(f.keyPath)
+		require.ErrorIs(t, statErr, os.ErrNotExist, "预写失败时不得留下密钥文件")
+		_, exists, loadErr := f.store.Load(ctx, core.InstanceSecretScopeMasterKey)
+		require.NoError(t, loadErr)
+		require.False(t, exists, "预写失败时不得写初始化记录")
+	})
+
+	t.Run("成功路径留一条 success 且 operation_id 一致", func(t *testing.T) {
+		f := newInstanceSecretsFixture(t)
+		status, err := f.service.Ensure(ctx)
+		require.NoError(t, err)
+		require.Equal(t, core.SecretStateReady, status.Decision.State)
+
+		ops := f.secretsInitOps(t)
+		require.Len(t, ops, 1, "一次初始化只产生一条操作行")
+		require.Equal(t, core.OperationSuccess, ops[0].Status)
+		record := f.record(t)
+		require.Equal(t, record.OperationID, ops[0].OperationID)
+		require.Equal(t, record.KeyID, status.KeyID)
+		require.JSONEq(t, `{"key_id":"`+status.KeyID+`","fingerprint":"`+status.Fingerprint+`","recovered":false}`,
+			string(ops[0].DetailJSON))
+	})
 }

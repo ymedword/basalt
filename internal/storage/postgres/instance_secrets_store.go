@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -148,6 +149,36 @@ func (s *InstanceSecretsStore) SealedCredentials(ctx context.Context) ([]SealedC
 		return nil, fmt.Errorf("遍历现存托管密文: %w", err)
 	}
 	return out, nil
+}
+
+// runtimeHistoryTables 是"业务历史"的唯一清单（US-25 §3.1.2 / FR-25-03）：只有这四张
+// 表里的行才证明实例已经跑过真实业务，因此不再适用自动建钥。`management_operations`
+// **不在**清单里——首次准备自己会写 pending 审计，把它计入会让"可证明的新实例"永远
+// 不成立（自己把自己判成存量）。清单是包内常量数组，SQL 由它静态拼接，不接受外部输入。
+// runtimeHistoryTables is the single allow-list of business-history tables; audit rows
+// written by the first install itself must not disqualify the instance.
+var runtimeHistoryTables = [...]string{"runs", "task_executions", "agent_lifecycle", "kb_documents"}
+
+// HasRuntimeHistory 报告四张业务历史表是否任意一张已有行。单条只读查询、EXISTS 短路，
+// 不把整表读进内存；任何一张表查询失败都返回错误——**不得**吞成 false，否则"读不到"
+// 会被当成"没有历史"，进而在存量实例上生成新密钥。
+// HasRuntimeHistory answers whether any business-history table has rows; a read failure
+// is an error, never a false.
+func (s *InstanceSecretsStore) HasRuntimeHistory(ctx context.Context) (bool, error) {
+	var query strings.Builder
+	query.WriteString("SELECT ")
+	for i, table := range runtimeHistoryTables {
+		if i > 0 {
+			query.WriteString(" OR ")
+		}
+		// 表名来自包内常量清单；EXISTS 在首行即短路，不需要额外 LIMIT。
+		fmt.Fprintf(&query, "EXISTS (SELECT 1 FROM %s)", table)
+	}
+	var exists bool
+	if err := s.db.pool.QueryRowContext(ctx, query.String()).Scan(&exists); err != nil {
+		return false, fmt.Errorf("检查业务历史表: %w", err)
+	}
+	return exists, nil
 }
 
 // validateInstanceSecretScope 只放行 `master_key`：本表记的是实例加密身份，迁移版本

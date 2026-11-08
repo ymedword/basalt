@@ -454,6 +454,9 @@ func runImageBuild(ctx context.Context, args []string, out io.Writer) error {
 	dockerfile := flags.String("dockerfile", "docker/Dockerfile", "Dockerfile")
 	entrypoint := flags.String("entrypoint", "docker/entrypoint.sh", "entrypoint.sh")
 	configFile := flags.String("config", "docker/basalt.yaml", "basalt.yaml 模板")
+	workerConfig := flags.String("worker-config", "docker/basalt.worker.yaml", "Worker 配置模板")
+	exportKeyScript := flags.String("export-key-script", "docker/export-master-key.sh", "主密钥导出脚本")
+	seedScript := flags.String("seed-script", "docker/seed-workspace.sh", "种子导出 / 导入脚本")
 	outDir := flags.String("out", "dist/images", "镜像 SBOM / provenance / 记录输出目录")
 	recordPath := flags.String("record", "", "镜像记录路径（缺省 <out>/image-record.json）")
 	if err := flags.Parse(args); err != nil {
@@ -485,7 +488,9 @@ func runImageBuild(ctx context.Context, args []string, out io.Writer) error {
 		Target: releasekit.Target{GOOS: "linux", GOARCH: "amd64", Tier: releasekit.TierBinary},
 		Binary: *binary, BaseRef: *baseRef,
 		Dockerfile: *dockerfile, Entrypoint: *entrypoint, ConfigFile: *configFile,
-		License: filepath.Join(*repo, "LICENSE"), OutDir: *outDir,
+		License:          filepath.Join(*repo, "LICENSE"),
+		WorkerConfigFile: *workerConfig, ExportKeyScript: *exportKeyScript, SeedScript: *seedScript,
+		OutDir: *outDir,
 	})
 	if err != nil {
 		return err

@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -24,14 +25,16 @@ import (
 func newSecretsCommand(deps Deps) *cobra.Command {
 	secrets := &cobra.Command{
 		Use:   "secrets",
-		Short: "主密钥与托管凭据运维（init / status / verify / revoke-managed / recover-record / adopt-legacy）",
+		Short: "主密钥与托管凭据运维（init / status / verify / revoke-managed / check-key / recover-record / adopt-legacy）",
 		Long: "主密钥与托管凭据运维：init 生成主密钥（已有或存在托管依赖即拒绝）、\n" +
 			"status 报告就绪状态、verify 校验现有密文、revoke-managed 清空全部托管凭据；\n" +
-			"recover-record 从可信备份恢复初始化记录、adopt-legacy 在隔离副本上完成\n" +
-			"schema 3～5 的受控升级——后两条离线执行、零外呼。\n" +
+			"check-key 离线校验密钥文件与直接父目录权限；recover-record 从可信备份恢复\n" +
+			"初始化记录、adopt-legacy 在隔离副本上完成 schema 3～5 的受控升级——后三条\n" +
+			"离线执行、零外呼。\n" +
 			"Manage the master key: mint once, report readiness, verify ciphertexts, revoke\n" +
-			"every managed credential, recover the record from a trusted backup, and adopt a\n" +
-			"legacy schema 3–5 copy offline. No automatic rotation is offered.",
+			"every managed credential, preflight the key file offline, recover the record from\n" +
+			"a trusted backup, and adopt a legacy schema 3–5 copy. No automatic rotation is\n" +
+			"offered.",
 		// 与根命令 / provider / profile 组同一形态：可运行的父命令 + 显式未知命令分支
 		// （不可运行的父命令会让 cobra 把未知子命令按"请求帮助"处理并以 0 退出）。
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -46,10 +49,68 @@ func newSecretsCommand(deps Deps) *cobra.Command {
 		newSecretsStatusCommand(deps),
 		newSecretsVerifyCommand(deps),
 		newSecretsRevokeManagedCommand(deps),
+		newSecretsCheckKeyCommand(deps),
 		newSecretsRecoverRecordCommand(deps),
 		newSecretsAdoptLegacyCommand(deps),
 	)
 	return secrets
+}
+
+// newSecretsCheckKeyCommand 组装 secrets check-key：Worker 启动预检与运维手工核验共用的
+// **离线**入口。它只读主密钥文件与直接父目录权限，零外呼、不连库、不取实例锁。
+// newSecretsCheckKeyCommand builds the offline key preflight; it never touches a database,
+// the instance lock or the network.
+func newSecretsCheckKeyCommand(deps Deps) *cobra.Command {
+	var (
+		path      string
+		workspace string
+	)
+	cmd := &cobra.Command{
+		Use:   "check-key",
+		Short: "离线校验主密钥文件与直接父目录权限（Worker 启动预检；不连库）",
+		Long: "校验主密钥文件：路径在工作区外、不经符号链接 / junction / 硬链接、文件与\n" +
+			"**直接父目录**权限受限（Unix 文件 0600 / 目录 0700；Windows 判 DACL）、JSON\n" +
+			"形态与 32 字节长度逐项吻合。通过时只打印 key_id 与指纹；失败时点名原因，\n" +
+			"**不**回显密钥内容。\n" +
+			"离线执行：不装配运行期、不取实例锁、不迁移、不连库，因此可在 Worker 预检与\n" +
+			"实例停机后的手工核验里使用。\n" +
+			"Validate the master-key file and its direct parent directory offline; print the\n" +
+			"key id and fingerprint only, never the key bytes.",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSecretsCheckKey(cmd.OutOrStdout(), deps, path, workspace)
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "",
+		"主密钥文件路径（必填；对应 secrets.master_key_file）")
+	cmd.Flags().StringVar(&workspace, "workspace", "",
+		"工作区根 <WorkDir>/.basalt（缺省按 --workdir 推导；密钥必须落在它之外）")
+	return cmd
+}
+
+// runSecretsCheckKey 补齐缺省工作区后调用端口；退出码由错误决定（成功 0，失败 1）。
+// runSecretsCheckKey fills the default workspace root, then calls the port.
+func runSecretsCheckKey(out io.Writer, deps Deps, path, workspace string) error {
+	if deps.MasterKeyCheck == nil {
+		return errOfflinePortMissing("secrets check-key")
+	}
+	if path == "" {
+		return refuseCommand(out, exitValidation,
+			"缺少 --path：需要主密钥文件路径（对应 secrets.master_key_file）")
+	}
+	if workspace == "" {
+		// 缺省与其余命令同一推导：`<WorkDir>/.basalt`。密钥**必须**在工作区之外，
+		// 因此这个缺省就是“工作区边界”的判据输入，而不是可选的展示参数。
+		// The default mirrors every other command: `<WorkDir>/.basalt`.
+		workspace = filepath.Join(deps.WorkDir, workspaceDirName)
+	}
+	report, err := deps.MasterKeyCheck.Check(path, workspace)
+	if err != nil {
+		return refuseCommand(out, exitValidation, "%s", err.Error())
+	}
+	fmt.Fprintf(out, "主密钥可读：key_id=%s fingerprint=%s\n", report.KeyID, report.Fingerprint)
+	return nil
 }
 
 // newSecretsInitCommand 组装 secrets init：生成主密钥，拒绝覆盖与拒绝孤儿两种情况

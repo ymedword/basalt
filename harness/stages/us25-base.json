@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "id": "us25-base",
+  "approval": "Human review 1 passed 2026-11-08 (user: 'us-25 人工 review1 我授权通过'; approve R3, registry and in-scope implementation; Q-25-01..14 accepted; in-scope decisions delegated to the implementing agent). Reviewed module card docs/us/us25-compose-multiworker.md R3, approved body sha256 9b13034e659c48ab85c68b62dcf5c035f4560fed4851cdaef934559c0bde6d64 (1906 lines); current file sha256 22e203fb2ef72cdeaafa02f637ad87993642ddc0dee1afb70a4939f4d91b9973 (1917 lines) differs only by the section 6.2 review-1 record, no design change. Registry row 25. Derived by module-dev from module card section 4.8 and tasks.md 'Check mapping'. Windows-native stage: needs the local PostgreSQL fixture for the integration checks, no container host. Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. Human review 2 pending.",
+  "inputs": [
+    "specs/025-compose-multiworker/spec.md",
+    "specs/025-compose-multiworker/plan.md",
+    "specs/025-compose-multiworker/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/app/instance_secrets.go",
+    "internal/app/instance_bootstrap.go",
+    "internal/app/instance_provisioning.go",
+    "internal/app/instance_admin_token.go",
+    "internal/app/first_install.go",
+    "internal/app/demo_prepare.go",
+    "internal/app/master_key_check.go",
+    "internal/app/run.go",
+    "internal/app/wire.go",
+    "internal/cli/init.go",
+    "internal/cli/deps.go",
+    "internal/cli/ports.go",
+    "internal/cli/secrets.go",
+    "internal/cli/demo_workflow.go",
+    "internal/cli/config.go",
+    "internal/storage/postgres/instance_secrets_store.go",
+    "internal/app/instance_secrets_test.go",
+    "internal/app/instance_bootstrap_test.go",
+    "internal/app/demo_prepare_test.go",
+    "internal/app/demo_prepare_integration_test.go",
+    "internal/app/instance_secrets_managed_write_test.go",
+    "internal/app/master_key_check_test.go",
+    "internal/cli/init_test.go",
+    "internal/cli/demo_workflow_test.go",
+    "internal/cli/demo_workflow_prepare_test.go",
+    "internal/cli/docs_first_run_test.go",
+    "internal/cli/secrets_check_key_test.go",
+    "internal/cli/worker_config_test.go",
+    "internal/storage/postgres/instance_secrets_store_test.go",
+    "internal/e2e/us25_asset_test.go",
+    "internal/e2e/us25_compose_test.go",
+    "internal/e2e/us25_first_install_test.go",
+    "internal/e2e/us25_fixture_test.go",
+    "internal/e2e/us25_migration_test.go",
+    "internal/e2e/us25_outage_test.go",
+    "internal/e2e/us25_schedule_fixture_test.go",
+    "internal/e2e/us25_schedule_test.go",
+    "internal/e2e/us25_seed_test.go",
+    "internal/e2e/us25_shutdown_test.go",
+    "internal/e2e/us25_takeover_test.go",
+    "internal/e2e/us25_upgrade_test.go",
+    "internal/e2e/us25_workers_test.go",
+    "scripts/releasekit/image.go",
+    "scripts/releasekit/image_test.go",
+    "scripts/releasekit/cmd/releasekit/main.go",
+    "docker/compose.yaml",
+    "docker/compose.multiworker.yaml",
+    "docker/Dockerfile",
+    "docker/basalt.worker.yaml",
+    "docker/entrypoint.sh",
+    "docker/init-secrets.sh",
+    "docker/seed-workspace.sh",
+    "docker/export-master-key.sh",
+    "docs/contracts/agent-md.md",
+    "docs/contracts/flow.md",
+    "docs/contracts/flow.pg.sql",
+    "docs/contracts/isolation.md",
+    "docs/contracts/isolation.pg.sql",
+    "docs/contracts/memory-learning.md",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/run-and-errors.md",
+    "docs/contracts/schema.pg.sql",
+    "docs/contracts/schema.sql",
+    "docs/contracts/skill-admission.md",
+    "harness/acceptance.json"
+  ],
+  "checks": [
+    {
+      "id": "us25-base-first-install",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=10m", "./internal/app", "-run",
+        "^(TestFirstInstall_|TestUS25_FirstInstall_|TestInstanceSecrets_)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestFirstInstall_SecretsEligibility",
+        "TestFirstInstall_ExistingInstanceNeverMints",
+        "TestFirstInstall_RecoveryNeverCreates",
+        "TestFirstInstall_PrepareOrderAndIdempotency",
+        "TestFirstInstall_ConcurrentStartOneWinner",
+        "TestFirstInstall_KeyCreationAudited",
+        "TestUS25_FirstInstall_HalfWrittenRosterFailsClosed",
+        "TestInstanceSecrets_FreshInstanceStillAutoInitializes",
+        "TestInstanceSecrets_ExistingInstanceNotAutoInit"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25-base-history",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=10m", "./internal/storage/postgres", "-run",
+        "^TestRuntimeHistory_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestRuntimeHistory_Tables",
+        "TestRuntimeHistory_ManagementOperationsExcluded"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25-base-cli",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/cli", "-run",
+        "^(TestCLI_(Init|DemoWorkflow|SecretsCheckKey)|TestUS25_Compose_WorkerConfigParsesWithoutControlSecrets)"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestCLI_InitPreparesFirstInstallBeforeBootstrap",
+        "TestCLI_InitNilFirstInstallFailsClosed",
+        "TestCLI_DemoWorkflowPreparePlanNoWrites",
+        "TestCLI_DemoWorkflowPrepareRequiresYesForWrites",
+        "TestCLI_SecretsCheckKeyOffline",
+        "TestUS25_Compose_WorkerConfigParsesWithoutControlSecrets"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25-base-demo",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=15m", "./internal/app", "-run",
+        "^TestDemoPrepare_"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestDemoPrepare_PlanNoWrites",
+        "TestDemoPrepare_ApplyBindsAndIngests",
+        "TestDemoPrepare_SecondRunIdempotent",
+        "TestDemoPrepare_RefusesConflictingBinding",
+        "TestDemoPrepare_ETagPinnedAcrossReads",
+        "TestDemoPrepare_PartialBindingResumable",
+        "TestDemoPrepare_TokenSources",
+        "TestDemoPrepare_RemotePlainHTTPRejected",
+        "TestDemoPrepare_HTTPFilesAndKnowledge"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25-base-releasekit",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./scripts/releasekit", "-run",
+        "^TestUS25_Image_ContextStagesWorkerAssets$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestUS25_Image_ContextStagesWorkerAssets"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25-base-race",
+      "args": [
+        "go", "test", "-json", "-count=1", "-race", "-tags=integration", "-timeout=15m", "./internal/app", "-run",
+        "^(TestFirstInstall_ConcurrentStartOneWinner|TestUS25_FirstInstall_HalfWrittenRosterFailsClosed|TestDemoPrepare_ETagPinnedAcrossReads)$"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestFirstInstall_ConcurrentStartOneWinner",
+        "TestUS25_FirstInstall_HalfWrittenRosterFailsClosed",
+        "TestDemoPrepare_ETagPinnedAcrossReads"
+      ],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T004", "checks": ["us25-base-first-install", "us25-base-cli", "us25-base-race"]},
+    {"id": "T005", "checks": ["us25-base-history"]},
+    {"id": "T006", "checks": ["us25-base-first-install"]},
+    {"id": "T008", "checks": ["us25-base-cli"]},
+    {"id": "T009", "checks": ["us25-base-cli"]},
+    {"id": "T012", "checks": ["us25-base-releasekit"]},
+    {"id": "T017", "checks": ["us25-base-demo"]},
+    {"id": "T018", "checks": ["us25-base-demo", "us25-base-race"]},
+    {"id": "T019", "checks": ["us25-base-demo", "us25-base-cli"]}
+  ]
+}

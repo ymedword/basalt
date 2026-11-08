@@ -1,0 +1,254 @@
+# Basalt 多 Worker 编排（US-25）：一个控制面 serve + 一个 Worker gateway + 一个共享
+# PostgreSQL。**单文件双 profile**——`control` 起数据库与控制面，`worker` 只起 Worker。
+# Multi-worker orchestration: one control plane, one worker and one shared PostgreSQL
+# in a single file with two profiles.
+#
+# 单宿主（自动化与取证）：
+#   docker compose -f docker/compose.multiworker.yaml --profile control up -d
+#   docker compose -f docker/compose.multiworker.yaml --profile worker  up -d
+# 双宿主（参考部署）：A 上跑 `--profile control`，B 上跑 `--profile worker`；两台各自
+# 一份 `.env` 与 `secrets/`，DSN 用 docker/init-secrets.sh --copy-from 复制并改主机。
+# Dual host: the control profile on A, the worker profile on B, each with its own .env
+# and secrets/ (the DSN is copied with --copy-from).
+#
+# 与 docker/compose.yaml（US-18 单实例）的关系：那份不改、仍是默认；本文件是**另一
+# 种拓扑**，两者不互相覆盖。共享 PostgreSQL、无消息队列、无 etcd、无第二套执行路径；
+# 谁能执行由数据库租约决定，不由编排决定。
+# This is a second topology, not a replacement: the US-18 single-instance file stays
+# the default. Who executes what is decided by database leases, not by orchestration.
+
+services:
+  # ── 控制面组 ────────────────────────────────────────────────────────────────
+  basalt-preflight:
+    # Compose 只能插值、不能对取值做断言：`${VAR:?}` 只挡空值，挡不住 0.0.0.0，而把
+    # `:?` 写进控制面服务又会让 `--profile worker` 的单宿主渲染一并失败（FR-25-33 /
+    # Q-25-02：Worker-only 不得要求控制面变量齐备）。因此用一个同 profile 的一次性
+    # 预检容器做 fail-closed：它不通过，`postgres` 与控制面都不会启动。
+    # Compose cannot assert on values, and a `:?` in the control service would also break
+    # the worker-only render. A one-shot preflight in the same profile gives fail-closed.
+    profiles: [control]
+    image: ${BASALT_IMAGE:?set BASALT_IMAGE to basalt:X.Y.Z@sha256:...}
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/sh", "-c"]
+    # Compose 在按 profile 过滤之前先对整个文件做插值，`$NAME` / `${NAME}` 都会被替换成
+    # 宿主环境的值；要留给容器内 shell 的 `$` 必须写成 `$$`。下面每个变量都由本服务的
+    # environment 显式给出（未设置时为空串），`set -u` 因此不会误伤。
+    # Compose interpolates the whole file before profile filtering, so every `$` meant for
+    # the container's shell is escaped as `$$`. All names below come from this service's
+    # environment (empty when unset).
+    command:
+      - |
+        set -eu
+        require_value() {
+            [ -n "$$2" ] || {
+                echo "basalt: $$1 未设置或为空——$$3" >&2
+                exit 1
+            }
+        }
+        require_value BASALT_DB_BIND "$$BASALT_DB_BIND" \
+            "单宿主写 127.0.0.1，双宿主写控制面私网地址；空值会被 Docker 当成所有地址"
+        # `[::]` 是 IPv6 的全地址，Docker 会同时接受 IPv4 映射连接；它与 0.0.0.0 等价。
+        # 逐字枚举拼写必然漏（`[::0]`、八段全零、带前导零、带端口形式都是同一个地址），
+        # 所以先归一化：去掉端口后缀与方括号，再看主机部分是否**只**由 `0`、`:`、`.`
+        # 组成——任何真实地址都含非零字符。IPv4 映射的全地址另列两条精确形式。
+        # Enumerating spellings always misses one; normalise first (strip port and
+        # brackets) and reject a host part made only of `0`, `:`, `.`.
+        bind_host=$$BASALT_DB_BIND
+        case "$$bind_host" in
+          \[*\]:[0-9]*) bind_host=$${bind_host%:*} ;;
+          *.*:[0-9]*) bind_host=$${bind_host%:*} ;;
+        esac
+        case "$$bind_host" in
+          \[*\]) bind_host=$${bind_host#\[}; bind_host=$${bind_host%\]} ;;
+        esac
+        case "$$bind_host" in
+          ::ffff:0.0.0.0|::ffff:0:0)
+            echo "basalt: BASALT_DB_BIND=$$BASALT_DB_BIND 是 IPv4 映射的全地址，等价于 0.0.0.0——只允许回环或控制面私网地址" >&2
+            exit 1
+            ;;
+          *[!0:.]*)
+            ;;
+          *)
+            echo "basalt: BASALT_DB_BIND=$$BASALT_DB_BIND 会把 PostgreSQL 暴露到每一块网卡（含 IPv6 全地址及其等价拼写）——只允许回环或控制面私网地址" >&2
+            exit 1
+            ;;
+        esac
+        missing=
+        for value in "$$BASALT_INGRESS_RUN_QPS" "$$BASALT_INGRESS_RUN_BURST" \
+                     "$$BASALT_INGRESS_INGEST_QPS" "$$BASALT_INGRESS_INGEST_BURST" \
+                     "$$BASALT_INGRESS_READ_QPS" "$$BASALT_INGRESS_READ_BURST"; do
+          [ -n "$$value" ] || missing=1
+        done
+        if [ -n "$$missing" ]; then
+          echo "basalt: 入口限流六项（BASALT_INGRESS_*）缺值——产品不设默认（D-30），请在 .env 显式给出" >&2
+          exit 1
+        fi
+        echo "basalt: BASALT_DB_BIND=$$BASALT_DB_BIND 与六项入口限流通过预检"
+    environment:
+      BASALT_DB_BIND: ${BASALT_DB_BIND:-}
+      BASALT_INGRESS_RUN_QPS: ${BASALT_INGRESS_RUN_QPS:-}
+      BASALT_INGRESS_RUN_BURST: ${BASALT_INGRESS_RUN_BURST:-}
+      BASALT_INGRESS_INGEST_QPS: ${BASALT_INGRESS_INGEST_QPS:-}
+      BASALT_INGRESS_INGEST_BURST: ${BASALT_INGRESS_INGEST_BURST:-}
+      BASALT_INGRESS_READ_QPS: ${BASALT_INGRESS_READ_QPS:-}
+      BASALT_INGRESS_READ_BURST: ${BASALT_INGRESS_READ_BURST:-}
+
+  postgres:
+    profiles: [control]
+    depends_on:
+      # 预检不通过则数据库不启动：端口在容器启动时才发布，因此不会出现“先暴露后失败”的窗口。
+      # Nothing starts unless the preflight passes; ports are published at container start.
+      basalt-preflight: { condition: service_completed_successfully }
+    # digest 与 docker/compose.yaml、release/image-lock.json 逐字一致（CheckImageLock
+    # 判卷）；本文件不引入第二个数据库镜像版本。
+    # Same digest as the single-instance file and the lock file, byte for byte.
+    image: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-basalt}
+      POSTGRES_USER: ${POSTGRES_USER:-basalt}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      # 单宿主：只绑回环，供宿主侧取证（psql / 计数核对）；双宿主：把 BASALT_DB_BIND
+      # 改成 A 的**私网**地址，并只放行 B。**不得**写 0.0.0.0 或 IPv6 `[::]`——那会把
+      # 数据库暴露到所有网卡；空值按回环处理（Docker 会把空绑定解释为所有地址，缺省值
+      # 挡住它），预检仍拒绝显式空值。
+      # Loopback by default; the dual-host case sets a private address. Never 0.0.0.0 or
+      # IPv6 `[::]` — an empty value is treated as loopback because Docker reads empty as
+      # all addresses.
+      - "${BASALT_DB_BIND:-127.0.0.1}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-basalt} -d ${POSTGRES_DB:-basalt}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  basalt-control:
+    profiles: [control]
+    image: ${BASALT_IMAGE:?set BASALT_IMAGE to basalt:X.Y.Z@sha256:...}
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    working_dir: /data
+    stop_grace_period: 90s
+    # 控制面缺省命令就是 serve（镜像 CMD），这里显式写出来只是为了让角色一眼可见。
+    # The control plane runs serve; the image CMD already says so.
+    command: ["serve"]
+    depends_on:
+      basalt-preflight: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    volumes:
+      - control-workspace:/data
+      - control-private:/var/lib/basalt
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    secrets: [database_dsn, postgres_password]
+    environment:
+      XDG_DATA_HOME: /var/lib/basalt
+      HOME: /var/lib/basalt
+      BASALT_DATABASE_DSN_FILE: /run/secrets/database_dsn
+      # 六项入口限流只在控制面要求（产品不设默认，D-30）；Worker 配置里没有 callers 段。
+      # 这里写 `:-` 而不是 `:?`：Compose 的插值发生在按 profile 过滤之前，控制面用 `:?`
+      # 会让 Worker-only 宿主（B）的渲染一并失败（FR-25-33 / Q-25-02）——缺值改由同一
+      # profile 的 basalt-preflight 在启动前挡下。
+      # `:-` not `:?`: compose interpolates before profile filtering, so `:?` here would
+      # break the worker-only render on host B. The preflight service enforces presence.
+      BASALT_INGRESS_RUN_QPS: ${BASALT_INGRESS_RUN_QPS:-}
+      BASALT_INGRESS_RUN_BURST: ${BASALT_INGRESS_RUN_BURST:-}
+      BASALT_INGRESS_INGEST_QPS: ${BASALT_INGRESS_INGEST_QPS:-}
+      BASALT_INGRESS_INGEST_BURST: ${BASALT_INGRESS_INGEST_BURST:-}
+      BASALT_INGRESS_READ_QPS: ${BASALT_INGRESS_READ_QPS:-}
+      BASALT_INGRESS_READ_BURST: ${BASALT_INGRESS_READ_BURST:-}
+    healthcheck:
+      # 只判 HTTP 存活：数据库断开不会让 /api/v1/health 变红（与 US-18 同口径）。
+      # Liveness only, exactly as in the single-instance file.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    ports:
+      - "${BASALT_HTTP_BIND:-127.0.0.1}:${BASALT_HTTP_PORT:-8080}:8080"
+
+  # ── Worker 组 ───────────────────────────────────────────────────────────────
+  basalt-worker:
+    profiles: [worker]
+    image: ${BASALT_IMAGE:?set BASALT_IMAGE to basalt:X.Y.Z@sha256:...}
+    user: "10001:10001"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    working_dir: /data
+    stop_grace_period: 90s
+    # Worker 只跑 gateway：无 HTTP 面、无 admin token、不做入口限流校验。
+    # A worker runs gateway only: no HTTP face, no admin token, no ingress limits.
+    command: ["gateway"]
+    # 没有 depends_on：`--profile worker` 单独启动时数据库服务不在本项目的活动 profile
+    # 内，跨 profile 依赖会被判为无效项目（`depends on undefined service "postgres"`，
+    # 实测 compose v5.6.1）。启动顺序由部署者保证（先起 A 的控制面）。
+    # No depends_on: the database lives in the other profile; a cross-profile dependency
+    # is rejected as an invalid project. The operator owns the startup order.
+    volumes:
+      - worker-workspace:/data
+      - worker-private:/var/lib/basalt
+      # 主密钥**只**从控制面导出的那份只读挂载进来，且**不得**放进 /run/secrets：
+      # 该目录默认 0755，`LoadMasterKey` 的直接父目录判据会拒绝一份正确的新密钥。
+      # 镜像内已预建 /run/basalt-secrets（0700、10001:10001）作为挂载点。
+      # The key is a read-only bind mount into the image's pre-created 0700 directory;
+      # /run/secrets defaults to 0755 and would be refused on the parent-directory rule.
+      - ./secrets/master.key:/run/basalt-secrets/master_key:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    secrets: [database_dsn]
+    environment:
+      XDG_DATA_HOME: /var/lib/basalt
+      HOME: /var/lib/basalt
+      BASALT_ROLE: worker
+      BASALT_DATABASE_DSN_FILE: /run/secrets/database_dsn
+      BASALT_MASTER_KEY_FILE: /run/basalt-secrets/master_key
+      # 仅作 worker_nodes 的诊断名；身份是进程内随机的 InstanceID，同名允许重复。
+      # Diagnostic only: the identity is a per-process InstanceID; duplicates are fine.
+      BASALT_WORKER_NAME: ${BASALT_WORKER_NAME:-worker-a}
+    healthcheck:
+      # Worker 没有 HTTP 面，探活只能打数据库：**自行**从 secret 文件解析 DSN（不依赖
+      # entrypoint 导出的环境——探针是另起的进程），再跑只读的 `workers list`。
+      # 它只表示“数据库可达”，**不**表示已注册或心跳健康；后者看 `workers list` 的列。
+      # The probe resolves the DSN itself and runs the read-only listing: database
+      # reachability only, never proof of registration or a live heartbeat.
+      test:
+        - "CMD-SHELL"
+        - >-
+          export BASALT_DATABASE_DSN="$$(cat /run/secrets/database_dsn)" &&
+          /opt/basalt/basalt workers list >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 没有 ports：Worker 不发布任何端口。
+    # 没有 restart：崩溃就停下，接管由另一个 Worker 完成，不靠自动重启掩盖故障。
+    # No ports and no restart policy: a crashed worker stays down, and the takeover is
+    # another worker's job — a restart loop would only hide the failure.
+
+volumes:
+  postgres-data:
+  control-workspace:
+  control-private:
+  worker-workspace:
+  worker-private:
+
+secrets:
+  database_dsn:
+    file: ./secrets/database_dsn
+  postgres_password:
+    file: ./secrets/postgres_password
