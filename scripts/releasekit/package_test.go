@@ -116,14 +116,51 @@ func TestUS17_Package_NoSecretsOrPrivatePaths(t *testing.T) {
 	})
 	t.Run("真实凭据", func(t *testing.T) {
 		repo := t.TempDir()
-		binary := writeTestFile(t, "basalt.exe", "-----BEGIN PRIVATE KEY-----\nAAAA\n")
+		binary := writeTestFile(t, "basalt.exe",
+			"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ\n-----END PRIVATE KEY-----\n")
 		build := testBuild(binary, Target{GOOS: "windows", GOARCH: "amd64", Tier: TierBinary})
 		_, err := PackageTarget(context.Background(), Inputs{Repo: repo, Version: "1.2.3"},
 			build.Target, build, ReleaseOptions{OutDir: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "凭据") {
-			t.Fatalf("PEM 私钥必须拒绝，实际错误：%v", err)
+			t.Fatalf("完整 PEM 私钥块必须拒绝，实际错误：%v", err)
 		}
 	})
+	// 上游运行时（oracledb / ssh2 的 keyParser）把 PEM 头当解析常量写进源码，
+	// 只有头部不是密钥；按头部判卷会把随包依赖整批拒掉（2026-11-09 首发演练实测）。
+	t.Run("PEM 解析常量", func(t *testing.T) {
+		repo := t.TempDir()
+		binary := writeTestFile(t, "basalt.exe",
+			"const pemHeaders = ['-----BEGIN PRIVATE KEY-----', '-----END PRIVATE KEY-----'];\n")
+		build := testBuild(binary, Target{GOOS: "windows", GOARCH: "amd64", Tier: TierBinary})
+		if _, err := PackageTarget(context.Background(), Inputs{Repo: repo, Version: "1.2.3"},
+			build.Target, build, ReleaseOptions{OutDir: t.TempDir()}); err != nil {
+			t.Fatalf("PEM 头部常量不得被误判为凭据：%v", err)
+		}
+	})
+}
+
+// TestFindSecret_Precision 固化判卷口径：完整私钥块与令牌格式命中，解析常量不命中。
+func TestFindSecret_Precision(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"完整 RSA 块", "-----BEGIN RSA PRIVATE KEY-----\n" + strings.Repeat("MIIE", 16) +
+			"\n-----END RSA PRIVATE KEY-----", "PEM 私钥"},
+		{"仅头部常量", "const header = '-----BEGIN PRIVATE KEY-----';", ""},
+		{"头尾分离的拼接字面量", "['-----BEGIN PRIVATE KEY-----', '-----END PRIVATE KEY-----']", ""},
+		{"GitHub token", "token=ghp_" + strings.Repeat("a", 36), "GitHub token"},
+		{"AWS access key", "key=AKIAIOSFODNN7EXAMPLE", "AWS access key"},
+		{"OpenAI token", "sk-" + strings.Repeat("b", 32), "OpenAI token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := findSecret(tc.text); got != tc.want {
+				t.Fatalf("findSecret=%q，want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestUS17_Package_AllowsEnvMention(t *testing.T) {

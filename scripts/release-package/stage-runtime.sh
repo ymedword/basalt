@@ -184,6 +184,15 @@ export PATH
 "$npm_node" "$npm_cli" install --omit=dev --no-audit --no-fund \
 	--prefix "$OUT/mcp/dbhub/$DBHUB_VERSION" "@bytebase/dbhub@$DBHUB_VERSION" >/dev/null
 
+# 依赖里的测试夹具、类型声明与文档不是运行时资产：ssh2 / node-forge 等包自带
+# 完整 PEM 测试私钥，原样进发布会触发出包扫描拒绝；类型声明与文档还会把上游的
+# 示例占位密钥（AKIA…）带进归档。删除时保留 LICENSE / NOTICE / COPYING 等许可文。
+dbhub_modules="$OUT/mcp/dbhub/$DBHUB_VERSION/node_modules"
+find "$dbhub_modules" -type d -name test -prune -exec rm -rf {} +
+find "$dbhub_modules" -type f \( -name '*.d.ts' -o -name '*.ts' -o -name '*.map' \) -delete
+find "$dbhub_modules" -type f -name '*.md' \
+	! -iname 'license*' ! -iname 'notice*' ! -iname 'copying*' -delete
+
 # --- fetch（pip 包快照 + 随包启动器） ----------------------------------
 fetch_root="$OUT/mcp/fetch/$FETCH_VERSION"
 mkdir -p "$fetch_root/site-packages"

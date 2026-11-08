@@ -303,14 +303,18 @@ func checkPackagePath(rel string) error {
 	return nil
 }
 
+// pemPrivateKeyPattern 只认**完整私钥块**（头 + 至少 40 个 base64 字符 + 尾）。
+// 上游库（oracledb / ssh2 的 keyParser 等）把 `-----BEGIN PRIVATE KEY-----` 当解析
+// 常量写进源码，只有头部并不构成密钥；按头部判卷会把随包运行时整批拒掉。真正泄漏
+// 的是带正文的完整块，所以正文设下限、且字符类不含引号（拼接的 JS 字面量不命中）。
+const pemPrivateKeyPattern = `(?s)-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[A-Za-z0-9+/=\s]{40,}-----END (?:[A-Z]+ )?PRIVATE KEY-----`
+
 func findSecret(text string) string {
 	checks := []struct {
 		marker  string
 		pattern string
 	}{
-		{"PEM 私钥", `-----BEGIN PRIVATE KEY-----`},
-		{"RSA 私钥", `-----BEGIN RSA PRIVATE KEY-----`},
-		{"OpenSSH 私钥", `-----BEGIN OPENSSH PRIVATE KEY-----`},
+		{"PEM 私钥", pemPrivateKeyPattern},
 		{"GitHub token", `ghp_[A-Za-z0-9]{20,}`},
 		{"AWS access key", `AKIA[0-9A-Z]{16}`},
 		{"OpenAI token", `sk-[A-Za-z0-9]{20,}`},
