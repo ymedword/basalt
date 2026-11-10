@@ -40,6 +40,13 @@ const (
 	// signalScheduleLead is the cron lead time used by the other scheduler cases.
 	signalScheduleLead = 15 * time.Second
 
+	// signalGatewayLead 是乙段的 cron 余量：乙段在 gateway 启动前多一次控制面落行
+	// （US-25C FR-25C-12：Worker 不再写调度定义列），余量放大一倍，慢机器上 cron
+	// 时刻不会在准备阶段就过去（cronAt 只精确到"每天同刻"，错过要等到次日）。
+	// The gateway segment runs one control-plane pass before the gateway starts, so its
+	// cron lead is doubled: cronAt fires once a day, and a missed minute costs a day.
+	signalGatewayLead = 30 * time.Second
+
 	// signalGraceLower / signalGraceUpper 把 flows.shutdown_grace_seconds（缺省 35s）
 	// 的取消点夹在中间：下界留 2s 时钟与调度抖动，上界再留 25s 给取消后的收尾与
 	// 进程退出（worker.shutdown_grace 45s 是硬上界，超出即非零退出）。
@@ -308,12 +315,23 @@ func testSignalOrder(t *testing.T) {
 	// 乙段：gateway——无 HTTP，SIGTERM 同样等宽限里的在途运行收场。
 	hGateway := newHarness(t)
 	initWorkspace(t, hGateway)
-	cronGateway := cronAt(time.Now().UTC().Add(signalScheduleLead))
+	cronGateway := cronAt(time.Now().UTC().Add(signalGatewayLead))
 	modelGateway := newBarrierModel(t)
 	addrGateway := freeLoopbackAddr(t)
 	hGateway.writeConfig(t, configWithAddr(modelGateway.URL(), addrGateway))
 	hGateway.writeAgent(t, "demo", agentFrontmatter("demo", nil)+scheduleBlock(cronGateway, "", signalMessage),
 		"gateway 停机演示")
+
+	// US-25C FR-25C-12：Worker 角色的重命令不再写调度定义列，gateway 单跑的乙段
+	// 必须先有一次真控制面把任务定义行落库（运维顺序 = 先在 A 发布，再由 B 领取）。
+	// 预热的短命 serve 不能承担这一步：它在退出时把自己写的定义行按快照还原掉。
+	// 控制面只活到 health 就绪，cron 到点属于 gateway 段——「谁领取」由此确定。
+	// Since US-25C workers never write the definition columns, one real control-plane
+	// pass lands the task row before the gateway starts (the publish-then-pick order);
+	// the warm-up serve cannot stand in for it, because it restores what it wrote.
+	ctl := startGrouped(t, hGateway, fixtureEnv(), "serve")
+	waitHealthHTTP(t, ctl, addrGateway, 30*time.Second)
+	ctl.stop(t)
 
 	g := startGrouped(t, hGateway, fixtureEnv(), "gateway")
 	g.waitOutput(t, "调度器已启动", 30*time.Second)
