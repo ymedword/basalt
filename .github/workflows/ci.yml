@@ -713,7 +713,15 @@ jobs:
       # 超时截断、缺 `binary_source=candidate` 或非环境闸门的失败原因一律判红。
       # A failing `make e2e` is judged by the F-06 approved-scope checker, which rejects
       # any failure outside the item-by-item US-20 exclusion.
+      #
+      # 必须显式用 bash：container job 的默认 shell 是 `sh -e`（本镜像为 dash），
+      # 没有 `PIPESTATUS`——`status=${PIPESTATUS[0]}` 会以 "Bad substitution" 直接
+      # 终止步骤（退出码 2），判卷器根本不会执行，等于每次 e2e 都被判红。这是
+      # 2026-11-10 在 c63e1ae 的运行里实测到的判卷器接线缺陷（非测试失败）。
+      # The container job defaults to `sh -e` (dash), which has no PIPESTATUS and
+      # aborts the step with "Bad substitution" before the judge runs. Use bash.
       - name: Full e2e at the F-06 60m budget
+        shell: bash
         run: |
           set +e
           mkdir -p .loop/runs
