@@ -76,7 +76,7 @@
 <text x="914" y="500" font-size="13" fill="#59687a">每节点文件 · 按内容寻址安装</text>
 <text x="30" y="31" font-size="14" fill="#2447df">BASALT / 架构概览</text>
 <text x="30" y="70" font-size="29" fill="#151e2b" font-weight="600">独立 Agent，共享同一运行底座。</text>
-<text x="36" y="616" font-size="20" fill="#151e2b" font-weight="600">US-25C · 已发布资产同步与钉住准入</text>
+<text x="36" y="616" font-size="20" fill="#151e2b" font-weight="600">已发布资产同步与钉住准入</text>
 <text x="36" y="650" font-size="15" fill="#151e2b">控制面为每个 Agent 发布不可变资产包；Worker 按哈希安装，不发布资产。</text>
 <text x="36" y="678" font-size="15" fill="#151e2b">每个领取的执行固定 bundle 哈希；准入先校验这一份目录，再发出调用。</text>
 <text x="36" y="706" font-size="15" fill="#151e2b">技能从已发布版本物化。跨节点业务状态共享、数据库 HA 与 K8s 仍不属于本版本。</text>

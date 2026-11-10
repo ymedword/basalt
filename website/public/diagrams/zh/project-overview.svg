@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
-<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 当前单节点实现的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、自托管 PostgreSQL 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、实例锁与不重放恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图或未来分布式架构。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4. US20 working-tree addition: explicit OCI/runc shell and gVisor/runsc code isolation; default local execution, no network or service credentials in tasks, signed images and fail-closed startup.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969">
+<title id="overview-title">Basalt 项目架构全景</title><desc id="overview-desc">Basalt 逻辑层次的项目全景：接入与触发、独立 Agent 作用域、管理与准入、共享 PromptBuilder／ReActLoop／ToolExecutor、模型／记忆／工具／通知能力、自托管 PostgreSQL 与工作区文件。使用者、模型 API、本地子进程、MCP／HTTP 业务系统、通知接收方在 Go 运行边界之外。生命周期与资源作用域检查、Run 发布版本固定、执行预算、取消、失败关闭的两阶段审计、仅写模式进程持有的工作区锁与租约范围的崩溃恢复贯穿各层。逻辑作用域不是容器隔离；CLI 与 serve 写操作共享独占工作区锁。外部模型及工具按配置发送数据。本图是逻辑项目架构，不是动态执行图；Compose 多 Worker 拓扑见部署图。 US19：顺序 Flow 复用同一 Run、消息与审计路径；未知动作阻断，不提供并行或分布式图。US20：显式 OCI/runc shell 与 gVisor/runsc 代码隔离；默认 local 执行，任务不携带网络或服务凭据，镜像签名并失败关闭启动。</desc>
 <metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
-<rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
+<rect width="1600" height="1840" fill="#faf8f1"/><g font-family="sans-serif">
 <text x="40" y="35" font-size="15" fill="#2447df">BASALT / PROJECT OVERVIEW</text>
 <text x="40" y="85" font-size="34" fill="#151e2b" font-weight="600">Basalt · 项目架构全景</text>
 <text x="40" y="119" font-size="19" fill="#59687a">当前实现 · 独立业务 Agent，共享自托管 Go 运行底座</text>
@@ -153,11 +153,11 @@
 <text x="44" y="1084" font-size="17" fill="#59687a">按配置发送请求数据</text>
 </g>
 <g data-node-id="processes"><rect x="1320" y="590" width="250" height="160" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
-<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">本地子进程</text>
+<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">执行档位</text>
 <text x="1334" y="638" font-size="17" fill="#59687a">命令与脚本</text>
 <text x="1334" y="660" font-size="17" fill="#59687a">策略与执行器</text>
-<text x="1334" y="682" font-size="17" fill="#59687a">当前不提供容器</text>
-<text x="1334" y="704" font-size="17" fill="#59687a">级别的故障隔离</text>
+<text x="1334" y="682" font-size="17" fill="#59687a">默认 local 进程</text>
+<text x="1334" y="704" font-size="17" fill="#59687a">可选 OCI / gVisor 隔离</text>
 </g>
 <g data-node-id="mcp"><rect x="1320" y="970" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
 <text x="1334" y="995" font-size="20" fill="#151e2b" font-weight="600">外部工具系统</text>
@@ -174,11 +174,11 @@
 <text x="350" y="559" font-size="18" fill="#59687a">每个 Agent 有独立声明，按作用域管理业务状态。</text>
 <text x="350" y="606" font-size="18" fill="#59687a">应用服务：生命周期／资源管理／任务调度</text>
 <text x="350" y="1426" font-size="18" fill="#59687a">管理 token · 作用域绑定 · 执行预算／取消</text>
-<text x="350" y="1453" font-size="18" fill="#59687a">两阶段调用审计 · 实例锁 · 恢复时不自动重放</text>
+<text x="350" y="1453" font-size="18" fill="#59687a">两阶段调用审计 · 写进程锁 · 租约范围恢复，不重放</text>
 <text x="40" y="1530" font-size="18" fill="#2447df">实线：进程内调用或依赖     虚线：按配置跨越运行边界</text>
 <text x="40" y="1560" font-size="18" fill="#2447df">这里展示逻辑分层，不是执行时序；CLI 写命令与 serve 共用工作区实例锁。</text>
-<text x="40" y="1600" font-size="18" fill="#59687a">Agent 按逻辑作用域管理；当前图不承诺 Agent 协作、多节点执行或容器隔离。</text>
+<text x="40" y="1600" font-size="18" fill="#59687a">Agent 按逻辑作用域管理；Agent 协作不在本图范围，Compose 多 Worker 与可选隔离见部署图。</text>
 <text x="40" y="1629" font-size="18" fill="#59687a">模型与 MCP 可按配置在主机外处理数据；本地工具策略不能约束外部 MCP 服务自身的 I/O。</text>
-<text x="40" y="1665" font-size="15" fill="#59687a">当前实现 · 源码 ca9a0d29f185</text>
-</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1765" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+<text x="40" y="1665" font-size="15" fill="#59687a">源码提交：2bfcede9db06 · 当前实现</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1765" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1800" font-size="18" fill="#202b30">自托管 PostgreSQL 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
 </svg>

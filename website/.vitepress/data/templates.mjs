@@ -24,7 +24,7 @@ export const DEMOS = [
     id: 'repo-digest',
     path: 'examples/daily/repo-digest/',
     titleEn: 'Repository digest',
-    titleZh: '仓库周报',
+    titleZh: '代码仓库日报',
     bodyEn: 'Pull request, issue and release counts with follow-up items, delivered by its schedule.',
     bodyZh: '统计 PR、Issue 与发布数量，列出待跟进项，由定时任务投递。',
     needsEn: 'GitHub MCP server and a personal access token',

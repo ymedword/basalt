@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
-<title id="overview-title">Basalt project architecture</title><desc id="overview-desc">Basalt project overview of the current single-node implementation: entry points and triggers, independently defined Agent scopes, management and admission, shared PromptBuilder/ReActLoop/ToolExecutor, Provider/Memory/tool/notification capabilities, self-hosted PostgreSQL and workspace files. External users, model APIs, local processes, MCP/HTTP systems and notification destinations are outside the Go runtime boundary. Lifecycle and resource scope checks, published Run snapshots, execution budgets, cancellation, fail-closed two-phase audit, instance locking and non-replay recovery cut across the layers. Logical scopes are not container isolation; CLI and serve writers share an exclusive workspace lock. External model and tool requests follow configured data boundaries. This is a logical project map, not a claimed dynamic workflow or future distributed architecture. US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4. US20 working-tree addition: explicit OCI/runc shell and gVisor/runsc code isolation; default local execution, no network or service credentials in tasks, signed images and fail-closed startup.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1840" role="img" aria-labelledby="overview-title overview-desc" data-diagram-id="project-overview" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969">
+<title id="overview-title">Basalt project architecture</title><desc id="overview-desc">Basalt project overview of the logical layers: entry points and triggers, independently defined Agent scopes, management and admission, shared PromptBuilder/ReActLoop/ToolExecutor, Provider/Memory/tool/notification capabilities, self-hosted PostgreSQL and workspace files. External users, model APIs, local processes, MCP/HTTP systems and notification destinations are outside the Go runtime boundary. Lifecycle and resource scope checks, published Run snapshots, execution budgets, cancellation, fail-closed two-phase audit, a writer-only workspace lock and lease-scoped crash recovery without replay cut across the layers. Logical scopes are not container isolation; CLI and serve writers share an exclusive workspace lock. External model and tool requests follow configured data boundaries. This is a logical project map, not a dynamic workflow diagram; the Compose multi-Worker topology is shown in the deployment diagram. US19: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. US20: explicit OCI/runc shell and gVisor/runsc code isolation; default local execution, no network or service credentials in tasks, signed images and fail-closed startup.</desc>
 <metadata>{&quot;evidence&quot;:[&quot;internal/app/wire.go&quot;,&quot;internal/app/web.go&quot;,&quot;internal/core/service.go&quot;,&quot;internal/core/prompt.go&quot;,&quot;internal/core/resources.go&quot;,&quot;internal/tool/policy.go&quot;,&quot;internal/storage/migrations&quot;]}</metadata>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2447df"/></marker><marker id="external-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7953a6"/></marker></defs>
-<rect width="1600" height="1690" fill="#faf8f1"/><g font-family="sans-serif">
+<rect width="1600" height="1840" fill="#faf8f1"/><g font-family="sans-serif">
 <text x="40" y="35" font-size="15" fill="#2447df">BASALT / PROJECT OVERVIEW</text>
 <text x="40" y="85" font-size="34" fill="#151e2b" font-weight="600">Basalt · project architecture</text>
 <text x="40" y="119" font-size="19" fill="#59687a">Current implementation · independent agents on a shared, self-hosted Go runtime</text>
@@ -153,11 +153,11 @@
 <text x="44" y="1084" font-size="17" fill="#59687a">Request / response data</text>
 </g>
 <g data-node-id="processes"><rect x="1320" y="590" width="250" height="160" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
-<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">Local processes</text>
+<text x="1334" y="615" font-size="20" fill="#151e2b" font-weight="600">Execution profiles</text>
 <text x="1334" y="638" font-size="17" fill="#59687a">Commands and scripts</text>
 <text x="1334" y="660" font-size="17" fill="#59687a">Policy + Runners</text>
-<text x="1334" y="682" font-size="17" fill="#59687a">No container boundary</text>
-<text x="1334" y="704" font-size="17" fill="#59687a">in this version</text>
+<text x="1334" y="682" font-size="17" fill="#59687a">Default: local process</text>
+<text x="1334" y="704" font-size="17" fill="#59687a">Opt-in OCI / gVisor</text>
 </g>
 <g data-node-id="mcp"><rect x="1320" y="970" width="250" height="140" rx="6" fill="#fffdf8" stroke="#7953a6" stroke-dasharray="5 4"/>
 <text x="1334" y="995" font-size="20" fill="#151e2b" font-weight="600">External tool systems</text>
@@ -174,11 +174,11 @@
 <text x="350" y="559" font-size="18" fill="#59687a">Each Agent has its own declaration and scoped business state.</text>
 <text x="350" y="606" font-size="18" fill="#59687a">Application services · lifecycle / resources / task scheduling</text>
 <text x="350" y="1426" font-size="18" fill="#59687a">Admin token · scoped bindings · execution budgets / cancellation</text>
-<text x="350" y="1453" font-size="18" fill="#59687a">Two-phase call audit · instance lock · recovery without replay</text>
+<text x="350" y="1453" font-size="18" fill="#59687a">Two-phase call audit · writer lock · lease-scoped recovery, no replay</text>
 <text x="40" y="1530" font-size="18" fill="#2447df">SOLID: in-process dependency     DASHED: configured boundary crossing</text>
 <text x="40" y="1560" font-size="18" fill="#2447df">Logical layers, not an execution sequence. CLI and serve share an exclusive workspace lock.</text>
-<text x="40" y="1600" font-size="18" fill="#59687a">Agent scopes are logical. Collaboration, multi-node execution and container isolation are outside this view.</text>
+<text x="40" y="1600" font-size="18" fill="#59687a">Agent scopes are logical. Agent collaboration is outside this view; Compose multi-Worker and opt-in isolation are in the deployment diagram.</text>
 <text x="40" y="1629" font-size="18" fill="#59687a">Models and MCP may process data outside the host. Local tool policies do not contain an external MCP server.</text>
-<text x="40" y="1665" font-size="15" fill="#59687a">Current implementation · source ca9a0d29f185</text>
-</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1765" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
+<text x="40" y="1665" font-size="15" fill="#59687a">Source commit: 2bfcede9db06 · Current implementation</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1564" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1765" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1800" font-size="18" fill="#202b30">Self-hosted PostgreSQL holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
 </svg>

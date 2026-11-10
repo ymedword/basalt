@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="1840" viewBox="0 0 1380 1840" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="execution-flow" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
+<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="1840" viewBox="0 0 1380 1840" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="execution-flow" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969">
 <title id="diagram-title">一次 Run，边界清楚，记录可查。</title>
-<desc id="diagram-desc">当前执行流程包含请求准入、生命周期与资源资格、Run 资源和预算固定、PromptBuilder、模型审计 pending 预写、Provider 协议调用、模型审计 success/failed、assistant 消息追加、工具归属与入参检查、工具审计 pending 预写、受策略约束的执行、工具审计 success/failed 与工具结果追加。明确展示失败、拒绝、取消、恢复分支。Run 的四个终态为 completed、limit_reached、cancelled、failed。limit_reached 保留部分结果，不是错误；工具拒绝或失败会回填模型，不自动使 Run 失败；取消判断优先于预算。启动恢复先持有实例锁：pending 调用审计归为 unknown，未完成 Run 归为 failed，补齐半截工具组，绝不自动重放。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
+<desc id="diagram-desc">当前执行流程包含请求准入、生命周期与资源资格、Run 资源和预算固定、PromptBuilder、模型审计 pending 预写、Provider 协议调用、模型审计 success/failed、assistant 消息追加、工具归属与入参检查、工具审计 pending 预写、受策略约束的执行、工具审计 success/failed 与工具结果追加。明确展示失败、拒绝、取消、恢复分支。Run 的四个终态为 completed、limit_reached、cancelled、failed。limit_reached 保留部分结果，不是错误；工具拒绝或失败会回填模型，不自动使 Run 失败；取消判断优先于预算。崩溃恢复按租约范围进行：启动只登记 Worker 并回收过期执行；pending 调用审计归为 unknown，未完成 Run 归为 failed，补齐半截工具组，绝不自动重放；工作区实例锁只负责串行化写模式进程。 US19：顺序 Flow 复用同一 Run、消息与审计路径；未知动作阻断，不提供并行或分布式图。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
-<rect width="1380" height="1690" fill="#f7f4eb"/>
+<rect width="1380" height="1840" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
 <text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / EXECUTION FLOW</text>
 <text x="40" y="85" font-size="32" font-weight="600">一次 Run，边界清楚，记录可查。</text>
@@ -109,7 +109,7 @@
 <text x="98" y="1216" font-size="16" fill="#5d6a70">assistant／tool 消息仅由 ReActLoop 追加</text>
 </g>
 <g data-node-id="recovery"><rect x="815" y="1140" width="485" height="128" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
-<text x="833" y="1168" font-size="20" font-weight="600">崩溃恢复 · 必须持有实例锁</text>
+<text x="833" y="1168" font-size="20" font-weight="600">崩溃恢复 · 租约范围回收</text>
 <text x="833" y="1193" font-size="16" fill="#5d6a70">pending 审计 → unknown；running Run → failed</text>
 <text x="833" y="1216" font-size="16" fill="#5d6a70">补齐半截工具组；不自动重放</text>
 <text x="833" y="1239" font-size="16" fill="#5d6a70">管理操作按独立契约查证实际结果</text>
@@ -125,6 +125,6 @@
 <text x="98" y="1586" font-size="16" fill="#5d6a70">持久化运行结果并释放资源引用；调用审计仍使用独立状态机</text>
 </g>
 <text x="40" y="1645" font-size="15" fill="#5d6a70">预算用于约束执行，不触发重试。工具失败不自动等于 Run 失败；取消判断优先。</text>
-<text x="40" y="1671" font-size="12" fill="#5d6a70">源码提交: ca9a0d29f185 · 当前实现</text>
-</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1344" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1765" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+<text x="40" y="1671" font-size="12" fill="#5d6a70">源码提交：2bfcede9db06 · 当前实现</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1344" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1765" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1800" font-size="18" fill="#202b30">自托管 PostgreSQL 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
 </svg>

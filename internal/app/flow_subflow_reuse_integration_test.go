@@ -68,6 +68,19 @@ func (r *subflowRefusalRunner) ObserveCompleted(ctx context.Context, req flow.No
 	return r.distributedNodeRunner.ObserveCompleted(ctx, req)
 }
 
+// testFlowClock 是夹具用的可控服务时钟：容量推迟窗口按 `PollIntervalMS` 从服务
+// 时钟起算，真实时钟下这个窗口可能在 CI 慢机上一次 advance 的中途就过期——生产
+// 随后合法地重试叶子，夹具形状便随负载漂移（2026-11-10 CI 上 `middle` attempt
+// 偶发 succeeded 即此形态）。用例显式推进时钟：窗口不会在单次推进内部过期，
+// 需要跨推进等待时由用例赋值。
+// testFlowClock gives fixtures a controllable service clock so the capacity
+// deferral window cannot expire halfway through one advance on slow machines.
+type testFlowClock struct {
+	at time.Time
+}
+
+func (c *testFlowClock) Now() time.Time { return c.at }
+
 // TestFlow_SubflowChildCompletedRunReusedUnderRunningParentAttempt 走一遍生产时序：
 // 父 subflow 节点领取 → 建子任务 → 子叶子容量拒绝（父 attempt 留在 running、子
 // attempt 收敛为 interrupted、无 Run 行）→ 补上"崩溃前子 Run 已 completed"的证据 →
@@ -76,6 +89,8 @@ func TestFlow_SubflowChildCompletedRunReusedUnderRunningParentAttempt(t *testing
 	db := pgtest.NewTestDB(t)
 	runner := &subflowRefusalRunner{distributedNodeRunner: newDistributedRunner(db)}
 	service := newDistributedService(db, runner)
+	clock := &testFlowClock{at: time.Now()}
+	service.Now = clock.Now
 
 	child := publishDistributedDefinition(t, db, "probe-subflow-child")
 	definition := distributedDefinition()
@@ -113,7 +128,8 @@ func TestFlow_SubflowChildCompletedRunReusedUnderRunningParentAttempt(t *testing
 	// "目标子任务自己的子树在途吗"，不是"整棵根子树在途吗"——两者取值必须分开。
 	require.True(t, gateInFlight(t, postgres.NewSubtreeGate(db), root.RootTaskID),
 		"根子树口径：父 subflow attempt 仍在途")
-	waitUntilEligibleForSubflowTest(t, childTask.NextEligibleAt)
+	// 把服务时钟推进到推迟点之后，等价于真实等待窗口过去，但不受 CI 机器速度影响。
+	clock.at = time.UnixMilli(childTask.NextEligibleAt).Add(time.Millisecond)
 	final, err := advanceUnderFlowRoot(t, db, service, root.RootTaskID, flow.AdvanceRequest{
 		Principal: core.LocalAdminCLIPrincipal(), TaskID: root.ID, Expected: deferred.Version,
 	})
@@ -140,6 +156,10 @@ func TestFlow_TaskScopedInFlightAttemptCoversDescendantAttempts(t *testing.T) {
 	db := pgtest.NewTestDB(t)
 	runner := &subflowRefusalRunner{distributedNodeRunner: newDistributedRunner(db)}
 	service := newDistributedService(db, runner)
+	// 夹具阶段只做一次推进：冻结服务时钟，容量推迟窗口不会在推进中途过期，
+	// "middle 保持 running、孙任务叶子退还为 interrupted"的形状与机器速度无关。
+	clock := &testFlowClock{at: time.Now()}
+	service.Now = clock.Now
 	store := postgres.NewFlowStore(db)
 
 	grandchildDefinition := publishDistributedDefinition(t, db, "probe-subflow-descendant")
@@ -226,13 +246,4 @@ func readLatestAttemptForSubflowTest(t *testing.T, db *postgres.DB, taskID strin
 			&attempt.State, &input, &attempt.InputHash, &attempt.StartedAt))
 	attempt.Input = json.RawMessage(input)
 	return attempt
-}
-
-// waitUntilEligibleForSubflowTest 等到容量推迟窗口过去；多留 20ms 抵消时钟取整。
-func waitUntilEligibleForSubflowTest(t *testing.T, eligibleMS int64) {
-	t.Helper()
-	wait := time.Until(time.UnixMilli(eligibleMS)) + 20*time.Millisecond
-	if wait > 0 {
-		time.Sleep(wait)
-	}
 }

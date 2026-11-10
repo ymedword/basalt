@@ -88,6 +88,13 @@ func TestReleaseE2E_HotReload(t *testing.T) {
 	)
 	addr, p := startReleaseServe(t, h, fake.URL(), oldPrompt)
 	defer p.stop(t)
+	// 失败时把 serve 两路输出打出来：热加载 500 的底层原因只进服务端日志，
+	// 只报 HTTP 状态会让排障退回"再跑一遍猜"。判据面不变，仅诊断。
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("serve 进程输出：\n%s", p.output())
+		}
+	})
 
 	sess := webCreateSession(t, addr, "demo", nil)
 	inflight := startReleaseMessage(t, addr, sess.SessionID, "改写前发起")

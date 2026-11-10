@@ -479,9 +479,14 @@ func Run(ctx context.Context, args []string) int {
 				return code
 			}
 			// 调度起来之后两个循环才进后台：它们与调度共享 runCtx，停机时先随取消返回，
-			// joinWorkers 在关库之前等它们（§2.3.4）。
-			// The loops go to the background only after the scheduler starts.
-			rt.startSyncLoops(runCtx, logger)
+			// joinWorkers 在关库之前等它们（§2.3.4）。循环另派一层子 ctx：信号只覆盖
+			// 信号停机，**启动失败**路径（端口占用、监听启动失败）没有信号，第 [2] 步
+			// 「停止领取」经 `stopSyncLoops` 取消它们，否则 join 会等满 worker 宽限。
+			// The loops get their own child context so a startup-failure shutdown can stop
+			// them without a signal (step [2] cancels it through stopSyncLoops).
+			loopCtx, stopLoops := context.WithCancel(runCtx)
+			rt.stopSyncLoops = stopLoops
+			rt.startSyncLoops(loopCtx, logger)
 		}
 		if needsServer(args) {
 			if flowErr := rt.flows.Start(runCtx); flowErr != nil {

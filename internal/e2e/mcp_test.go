@@ -96,10 +96,17 @@ func testMCPZeroCode(t *testing.T) {
 	requireContains(t, list.Stdout, mcpEchoTool+"：回显 text 参数", "tool list 看到 MCP 工具")
 }
 
-// testMCPBadCommand：错误 `command` 负向（U-2 第 3 项）。判据：启动不中断；日志出现
-// `MCP server 启动失败——继续其余 server` 并点名 server；依赖它的 Agent 未注册
-// （`mcp server skipped`）；其余 Agent 正常可聊。命令在 `shell.allowed_commands` 名单内
-// （US-12 起 supervisor 连接前先判可执行名），因此走的仍是**连接失败**而不是策略拒绝。
+// testMCPBadCommand：错误 `command` 负向（U-2 第 3 项）。判据：启动不中断；日志点名
+// 该 server 的准备失败结局；依赖它的 Agent 未注册（`mcp server skipped`）；其余 Agent
+// 正常可聊。命令在 `shell.allowed_commands` 名单内（US-12 起 supervisor 连接前先判
+// 可执行名），因此走的仍是**连接失败**而不是策略拒绝。
+//
+// US-25C 起 Worker 启动路径由 `ApplyPublished` 改为 `PrepareAtApplied`（模块卡 §2.3.1
+// 启动角色门）：已 applied 的坏 server 走受控重建，失败结局记 `outcome=failed` +
+// `failure_class=command_not_found`（原 `MCP server 启动失败——继续其余 server` 属控制面
+// 路径）；`detail` 仍是固定短语（tool 层 `safeErrorSummary`），不得回显原始 command。
+// The worker startup path prepares applied servers instead of applying them; the failure
+// is still named per server and still only reports a fixed phrase.
 func testMCPBadCommand(t *testing.T) {
 	h := newHarness(t)
 	initWorkspace(t, h)
@@ -112,9 +119,12 @@ func testMCPBadCommand(t *testing.T) {
 	res := h.run(t, fixtureEnv(), "chat", "--agent", "safe", "--message", "你好")
 	requireExit(t, res, 0, "坏 command 不中断启动")
 	requireContains(t, res.Stdout, "正常回答", "其余 Agent 正常可聊")
-	requireContains(t, res.Stderr, "MCP server 启动失败——继续其余 server", "单 server 失败不中断其余")
+	requireContains(t, res.Stderr, "MCP server 准备失败——保留应用版本，依赖它的 Agent 本轮不注册",
+		"单 server 失败不中断其余：逐条点名结局")
 	requireContains(t, res.Stderr, "server=broken", "WARN 点名 server")
-	requireContains(t, res.Stderr, "detail=连接失败", "WARN 的 detail 只给固定短语")
+	requireContains(t, res.Stderr, "outcome=failed", "失败结局按固定字面量记录")
+	requireContains(t, res.Stderr, "failure_class=command_not_found", "失败分类来自结构化连接失败")
+	requireContains(t, res.Stderr, "detail=可执行文件不存在", "WARN 的 detail 只给固定短语")
 	requireAbsent(t, res.Stderr, "basalt-e2e-missing-mcp-server", "WARN 不得回显原始 command")
 	requireContains(t, res.Stderr, "mcp_connected=0", "启动摘要按实际连接数计 0")
 	requireContains(t, res.Stderr, "Agent 未注册", "依赖失败 server 的 Agent 未注册")
@@ -237,7 +247,10 @@ func testMCPEnvNegative(t *testing.T) {
 			res := h.run(t, tc.env, "tool", "list")
 			requireExit(t, res, 0, tc.name+"：单个 server 凭据缺失只跳过该 server，不中止启动")
 			output := res.Stdout + res.Stderr
-			requireContains(t, output, "MCP server 凭据不可用，本次启动跳过该 server",
+			// US-25C 起 Worker 的只读发布解析（`publishedMCPPrepareTargets`）承担启动
+			// 隔离，文案是「本轮跳过」而不是控制面的「本次启动跳过」；判据语义不变。
+			// The worker's read-only resolve performs startup isolation with round wording.
+			requireContains(t, output, "MCP server 凭据不可用，本轮跳过该 server",
 				"启动隔离必须留下点明跳过事实的 WARN")
 			requireContains(t, output, "server=helper", "WARN 点名被跳过的 server")
 			requireContains(t, output, "槽位 BASALT_MCP_HELPER 引用的 "+missingVar+" 未设置或为空",
@@ -322,7 +335,7 @@ func testMCPRedaction(t *testing.T) {
 
 		res := h.run(t, fixtureEnv(), "chat", "--agent", "safe", "--message", "你好")
 		requireExit(t, res, 0, "原始命令不回显")
-		requireContains(t, res.Stderr, "detail=连接失败", "detail 只给固定短语")
+		requireContains(t, res.Stderr, "detail=可执行文件不存在", "detail 只给固定短语")
 		requireAbsent(t, res.Stdout+res.Stderr, sentinel, "WARN 不得回显原始 command")
 	})
 

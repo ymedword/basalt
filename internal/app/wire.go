@@ -1014,6 +1014,7 @@ func (a *App) newRuntime(ctx context.Context, role runtimeRole) (*heavyRuntime, 
 	// The source backfill is a control-plane shared write; workers resolve published
 	// servers read-only and never touch the source table.
 	var publishedMCP []core.PublishedMCPServer
+	var workerMCPTargets []mcpPrepareTarget
 	var workerMCPConfigs []core.MCPServerConfig
 	if role.allowSharedInit(sharedInitMCPCredentialSource) {
 		publishedMCP, err = publishedMCPServers(ctx, versions, fileServers, mcpCredentials, a.nowOr(), logger)
@@ -1021,11 +1022,12 @@ func (a *App) newRuntime(ctx context.Context, role runtimeRole) (*heavyRuntime, 
 			return fail(fmt.Errorf("解析已发布 MCP server: %w", err))
 		}
 	} else {
-		// 启动期只取配置名单；准备输入（targets）由同步轮按**当轮**快照重新解析，
-		// 不在此处留存（§2.3.8 M5：名单可增长，准备要跟发布走）。
-		// Startup keeps only the configured names; each sync round resolves its own
-		// targets afresh.
-		_, workerMCPConfigs, err = publishedMCPPrepareTargets(ctx, versions, fileServers, mcpCredentials, logger)
+		// Worker 的启动快照同时留作启动准备输入：一次性 `chat` / `tool` 不跑同步轮，
+		// 没有这一份就永远连不上已 applied 的 server（§2.3.1 启动角色门）。同步轮仍按
+		// **当轮**快照重新解析（§2.3.8 M5：名单可增长，准备要跟发布走），两者不共用。
+		// Workers keep the startup snapshot for the startup prepare: one-shot commands
+		// never run a sync round; sync rounds still re-resolve their own snapshot.
+		workerMCPTargets, workerMCPConfigs, err = publishedMCPPrepareTargets(ctx, versions, fileServers, mcpCredentials, logger)
 		if err != nil {
 			return fail(fmt.Errorf("只读解析已发布 MCP server: %w", err))
 		}
@@ -1163,6 +1165,24 @@ func (a *App) newRuntime(ctx context.Context, role runtimeRole) (*heavyRuntime, 
 		if err := mcpSupervisor.ApplyPublished(ctx, publishedMCP); err != nil {
 			return fail(fmt.Errorf("启动 MCP supervisor: %w", err))
 		}
+	} else {
+		// Worker 启动同样走 `PrepareAtApplied`（§2.3.1 行「改为」）：已 applied 且版本与
+		// 凭据代次一致即零副作用复用，不一致才受控重建；**不写 applied**、不补凭据来源。
+		// 一次性 `chat` / `tool` 没有同步轮，注册表建立之前必须在这里把已 applied 的
+		// 连接准备好，否则依赖 MCP 的 Agent 永远按 "mcp server skipped" 拒载。
+		// 未 applied 的只记录、不连接（D-12：不得隐式 apply）。
+		// Workers prepare applied servers read-only at startup; they never write applied.
+		report, prepErr := prepareMCPInstances(ctx, mcpPrepareDeps{
+			Targets: func(context.Context) ([]mcpPrepareTarget, error) { return workerMCPTargets, nil },
+			Prepare: mcpSupervisor.PrepareAtApplied,
+			Status:  mcpSupervisor.Status,
+		})
+		if prepErr != nil {
+			// targets 已在上面的只读解析里取到，这里失败即装配缺陷：失败关闭，不把
+			// 未连接的 MCP 冒充成就绪。
+			return fail(fmt.Errorf("启动 MCP 准备: %w", prepErr))
+		}
+		logMCPStartupPrepare(logger, report)
 	}
 	mcpConfigs := mcpPublishedConfigs(publishedMCP)
 	if role != roleControl {
@@ -2616,6 +2636,15 @@ type heavyRuntime struct {
 	policyRefresherDeps *PolicyRefresherDeps
 	policyRefresher     *PolicyRefresher
 	policyRefreshDone   chan struct{}
+
+	// stopSyncLoops 取消两个后台循环的专属 ctx（`runCtx` 的子 ctx，只在 serve /
+	// gateway 路径赋值）。停机第 [2] 步「停止领取」调用它：**启动失败**的停机路径
+	// （端口占用等）没有信号去取消 `runCtx`，不单独取消的话 join 会一直等这两个循环，
+	// 撞满 `worker.shutdown_grace_seconds` 后走"直接退出"分支、丢掉「停机完成」标记
+	// （`TestBackfill_Web/release_order` 的 exec 出错路径即此形态）。
+	// stopSyncLoops cancels the loops' own child context; step [2] of figure 11 fires
+	// it because a startup-failure shutdown has no signal to cancel runCtx.
+	stopSyncLoops context.CancelFunc
 
 	// watch 是 serve 打开的配置监听（只有 serve 赋值；其余重命令为 nil）。停机时
 	// **最先**关闭它：它会在回调里推进注册表并联动调度器，必须赶在调度器停止与库

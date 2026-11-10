@@ -58,8 +58,8 @@ The management token is basic management authentication. Personal accounts, SSO 
 | Agent | A named business worker with its own definition, resource declarations and scoped state |
 | Run | One bounded execution of a request or scheduled task, with a recorded outcome |
 | Session | A persisted conversation that can contain multiple Runs |
-| Workspace | The instance's local data directory, .basalt/ by default, holding Agent definitions and supporting files; runtime state and audit live in PostgreSQL |
-| Resource | A reusable model connection, MCP service, skill or notification channel; eligible published versions are bound to an Agent and resolved for execution |
+| Workspace | The instance's local data directory, .basalt/ by default, holding Agent definitions, their lifecycle state under control/ and supporting files; sessions, runs, audit and the rebuildable lifecycle index live in PostgreSQL |
+| Resource | A reusable model connection, MCP service, skill or notification channel. Model connections and MCP servers are bound through published versions; skills bind by the AGENT.md declaration and install the published version; notification channels are referenced by name |
 
 ## Get started
 
@@ -81,7 +81,7 @@ Management authentication, listening addresses, access policies, backups, upgrad
 
 ## Templates & demos {#templates-demos}
 
-`examples/` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials and no delivery channels. Copy one into a workspace, then bind your own model, tools and channel; Basalt never imports an example and never widens the command allowlist on its own.
+`examples/` ships five daily agents and eight templates. Each directory is a portable baseline: no instance IDs, no credentials and no delivery channels. On a new instance's first start Basalt installs the five daily agents as disabled built-ins; an existing workspace is not given them automatically. To use a template, copy its directory into the workspace, then bind your own model, tools and channel; a copied example never widens the command allowlist on its own.
 
 <TemplateTable section="demos" />
 
@@ -114,18 +114,18 @@ The CLI animation on the home page is a labelled local fixture: it demonstrates 
 
 ## Future direction {#roadmap}
 
-The direction is an enterprise self-hosted Agent OS where tasks can be executed, checked, traced and improved. **The following entries are planned work, not current capabilities; no delivery date is committed.**
+The direction is an enterprise self-hosted Agent OS where tasks can be executed, checked, traced and improved. Entries marked delivered are part of this version and are described in [What the current code provides](#current-capabilities); entries marked planned are not current capabilities, and no delivery date is committed.
 
 | Priority area | Intended result | Status |
 | --- | --- | --- |
-| Knowledge and memory | Use private material with permission checks, traceable citations, semantic retrieval and a complete update/delete lifecycle | Planned; first capability priority |
-| Diagnostics and task orchestration | Explain task failures, persist long-task progress and support bounded delegation and revision | Planned |
-| Execution isolation and controlled learning | Establish isolation, evaluation and approval before proposing reusable skills; version and roll back accepted changes | Planned |
-| Kubernetes and database HA | Run the same distributed model on Kubernetes and add database high availability | Planned; Compose multi-Worker is delivered |
+| Knowledge and memory | Versioned knowledge collections with citation-bearing retrieval, history compaction and Agent-scoped persistent memory | Delivered |
+| Diagnostics and task orchestration | Operation records and run diagnostics, plus durable sequential flows with bounded delegation and evidence checks | Delivered |
+| Execution isolation and controlled learning | Opt-in container isolation for controlled shell and code tools, evaluation and approval gates for learned skills, and versioned rollback | Available as opt-in; not in the release support matrix |
+| Kubernetes and database HA | Run the same multi-Worker model on Kubernetes and add database high availability | Planned |
 | Enterprise governance and integrations | Add enterprise identity, roles, tenant/project boundaries, audit queries, quotas, approvals and richer channel access | Planned |
 | Goal-to-deliverable workflows | Organize specialist Agents around a business goal with traceable artifacts and bounded review | Longer-term direction |
 
-Knowledge and memory come first. Diagnostics support later orchestration; isolation and learning admission precede controlled capability updates. Kubernetes and database HA extend the delivered Compose multi-Worker model; enterprise governance builds on the same foundations. Each area needs its own design review and reproducible validation. Features described here are not enabled by changing a configuration switch in the current version.
+Planned areas each need their own design review and reproducible validation, and are not enabled by changing a configuration switch in the current version.
 
 ## Project
 

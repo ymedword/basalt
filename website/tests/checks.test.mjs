@@ -106,6 +106,10 @@ test('content negative fixtures exercise the same production rules', async () =>
     ['website/index.md', value => value + '\nReady in 5 minutes.\n', 'unmeasured-duration'],
     ['website/index.md', value => value + '\n已验证\n', 'unverified-claim'],
     ['website/architecture/index.md', value => value.replace('## ', 'Supports vector search.\n\n## '), 'future-capability-claim'],
+    // 定向禁令的负向夹具：current-scope 之前宣称 K8s / 数据库高可用为已支持必须被检出。
+    // Negative fixtures for the targeted ban on undelivered distributed claims.
+    ['website/architecture/index.md', value => value.replace('## ', 'Supports Kubernetes deployment.\n\n## '), 'future-capability-claim'],
+    ['website/zh/architecture/index.md', value => value.replace('## ', '支持数据库高可用。\n\n## '), 'future-capability-claim'],
     ['website/demo/transcript.json', value => JSON.stringify({ ...JSON.parse(value), lines: ['Invented reply'] }), 'reply-drift']
   ]) {
     const findings = checkPublicContent({ ...original, [file]: change(original[file]) })

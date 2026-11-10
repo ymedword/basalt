@@ -560,6 +560,11 @@ func (s *AgentAdmin) SubmitFiles(ctx context.Context, actor core.Actor, name, if
 		case core.IsInvalidInput(submitErr):
 			code = agentResultBadRequest
 		}
+		// 终态操作行只留分类与 ETag 详情，底层原因（rename / 权限 / 磁盘）必须同时
+		// 进日志：只落审计不记日志会让 500 变成排障黑洞（工程规范 §4 可观测性双轨）。
+		// The audit row keeps the classification; the underlying cause needs a log too.
+		s.logger.Error("多文件提交失败", "agent", name, "operation_id", operationID,
+			"code", code, "error", submitErr)
 		s.finish(ctx, operationID, core.OperationFailed, code, "多文件提交失败", detail)
 		return AgentFilesView{}, postPendingError(submitErr, operationID)
 	}

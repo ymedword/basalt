@@ -9,16 +9,16 @@ export const CAPABILITIES = [
 export const CORE_CAPABILITIES = [
   { id: 'provider', titleEn: 'Provider', titleZh: '模型接入', bodyEn: 'Explicit model connections, published versions and a frozen mapping for each run.', bodyZh: '显式模型连接、受控版本发布，以及每次运行固定的模型映射。', evidence: 'internal/app/providers.go' },
   { id: 'react', titleEn: 'ReAct', titleZh: '执行循环', bodyEn: 'A Go execution loop owns model requests, tool calls, budgets and stopping.', bodyZh: 'Go 执行循环统一负责模型请求、工具调用、预算和停止。', evidence: 'internal/core/loop.go' },
-  { id: 'memory', titleEn: 'Memory', titleZh: '记忆', bodyEn: 'Scoped persistent memory, core-context injection and keyword recall.', bodyZh: '作用域内的持久记忆、核心记忆注入与关键词回查。', evidence: 'internal/memory/memory.go' },
+  { id: 'memory', titleEn: 'Memory', titleZh: '记忆', bodyEn: 'Scoped persistent memory, core-context injection and semantic recall (keyword mode keeps the legacy surface).', bodyZh: '作用域内的持久记忆、核心记忆注入与语义召回（keyword 模式保留旧兼容面）。', evidence: 'internal/memory/memory.go' },
   { id: 'tool', titleEn: 'Tool', titleZh: '工具', bodyEn: 'Declared tools, skills and MCP, with policy checks and audited execution.', bodyZh: '声明式工具、技能和 MCP，执行前检查策略并记录审计。', evidence: 'internal/core/tool_exec.go' },
   { id: 'web', titleEn: 'Web Service', titleZh: 'Web 服务', bodyEn: 'An embedded console and authenticated HTTP API on the control plane; Workers execute without an HTTP listener.', bodyZh: '控制面上的内嵌管理台与经过认证的 HTTP API；Worker 无 HTTP 监听地执行。', evidence: 'internal/web/server.go' }
 ]
 export const DIAGRAMS = [
-  { id: 'project-overview', titleEn: 'Project architecture overview', titleZh: '项目架构全景', descriptionEn: 'Five logical layers: access, application, execution engine, infrastructure services and storage, with cross-cutting security and audit.', descriptionZh: '按接入层、应用层、执行引擎层、基础服务层、存储层划分，安全与审计贯穿各层。', width: 1600, height: 1690 },
+  { id: 'project-overview', titleEn: 'Project architecture overview', titleZh: '项目架构全景', descriptionEn: 'Five logical layers: access, application, execution engine, infrastructure services and storage, with cross-cutting security and audit.', descriptionZh: '按接入层、应用层、执行引擎层、基础服务层、存储层划分，安全与审计贯穿各层。', width: 1600, height: 1840 },
   { id: 'system-architecture', titleEn: 'System architecture summary', titleZh: '系统架构简图', descriptionEn: 'A compact view of five logical layers, Compose multi-Worker execution and published-asset sync.', descriptionZh: '用五个逻辑层概括系统，并标出 Compose 多 Worker 执行与已发布资产同步。', width: 1360, height: 800 },
-  { id: 'execution-flow', titleEn: 'Core execution flow', titleZh: '核心执行流程', descriptionEn: 'Admission, model and tool calls, auditing, bounded stopping and recovery.', descriptionZh: '准入、模型与工具调用、审计、有界停止及恢复。' },
-  { id: 'module-map', titleEn: 'Module map', titleZh: '模块职责', descriptionEn: 'Responsibilities and the interfaces connecting implementation modules.', descriptionZh: '实现模块的职责与协作接口。' },
-  { id: 'package-dependencies', titleEn: 'Go package dependencies', titleZh: 'Go 包依赖', descriptionEn: 'Actual package import directions in the current Go source.', descriptionZh: '当前 Go 源码中的真实包导入方向。' },
+  { id: 'execution-flow', titleEn: 'Core execution flow', titleZh: '核心执行流程', descriptionEn: 'Admission, model and tool calls, auditing, bounded stopping and recovery.', descriptionZh: '准入、模型与工具调用、审计、有界停止及恢复。', width: 1380, height: 1840 },
+  { id: 'module-map', titleEn: 'Module map', titleZh: '模块职责', descriptionEn: 'Responsibilities and the interfaces connecting implementation modules.', descriptionZh: '实现模块的职责与协作接口。', width: 1280, height: 1280 },
+  { id: 'package-dependencies', titleEn: 'Go package dependencies', titleZh: 'Go 包依赖', descriptionEn: 'Actual package import directions in the current Go source.', descriptionZh: '当前 Go 源码中的真实包导入方向。', width: 1320, height: 1450 },
   { id: 'deployment', titleEn: 'Current deployment', titleZh: '当前部署', descriptionEn: 'Compose multi-Worker: a control plane, Workers and one shared PostgreSQL.', descriptionZh: 'Compose 多 Worker：控制面、Worker 与一个共享 PostgreSQL。', width: 1320, height: 1180 }
 ]
 export const CURRENT_SCOPE_NOTE = {

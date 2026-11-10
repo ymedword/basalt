@@ -22,7 +22,12 @@ http:
   addr: 127.0.0.1:8080
   admin_auth:
     mode: token
-    token: \${BASALT_ADMIN_TOKEN}`
+    token: \${BASALT_ADMIN_TOKEN}
+callers:
+  ingress:
+    run:    { qps: 10, burst: 20 }
+    ingest: { qps: 10, burst: 20 }
+    read:   { qps: 100, burst: 200 }`
 export const PREREQUISITES = [
   { id: 'runtime', en: 'Prebuilt binary: no additional language tooling.', zh: '预构建二进制：不需要额外语言工具链。' },
   { id: 'source', en: 'Source build: Go, using the toolchain in go.mod.', zh: '源码构建：需要 Go，版本以 go.mod 的 toolchain 为准。' },

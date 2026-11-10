@@ -41,10 +41,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goccy/go-yaml"
+
 	// 判卷侧走裸连接读库（与 internal/app 的既有先例同一手法）：运行期读 PG，源谱系
 	// 形态用例读工作区 SQLite。
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/ymedword/basalt/internal/storage/postgres/pgtemp"
+	"github.com/ymedword/basalt/internal/workspace"
 	_ "modernc.org/sqlite"
 )
 
@@ -90,6 +93,33 @@ const (
 	// 的配置引用 dsnEnv，产品自己生成的配置引用这个名字，两者都指向本用例的隔离 schema。
 	// generatedDSNEnv is the variable name the generated template references verbatim.
 	generatedDSNEnv = "BASALT_DATABASE_DSN"
+
+	// controlInitReadyMarker 是控制面预热的停机标记：`Worker 已登记` 打在 shared-init
+	// 全部落地之后、资产同步与调度启动之前（internal/app/worker_runtime.go）。在这里
+	// 投递中断，启动流程随后在 `Scheduler.Start` 的 `ListTasks(ctx)` 上看到已取消的
+	// 上下文并以 0 退出——预热因此不会领取任何到期任务、也不会写调度定义列。
+	// controlInitReadyMarker fires after every shared-init item, before scheduling starts.
+	controlInitReadyMarker = "Worker 已登记"
+
+	// controlWarmupTokenEnv 只为预热临时配置的管理面 token 提供值：预热正常在登记标记
+	// 处中止、碰不到管理面；它存在是为了即使信号迟到、进程多走几步，也不会触发
+	// "新实例生成 token"（那会污染首启类用例的断言）。
+	// controlWarmupTokenEnv feeds the warm-up config's admin token so no token is minted.
+	controlWarmupTokenEnv   = "BASALT_E2E_WARMUP_ADMIN_TOKEN"
+	controlWarmupTokenValue = "e2e-warmup-admin-token"
+
+	// controlWarmupPollMS 把预热的调度轮询拉到允许上界（100..5000，见 cli 校验）：
+	// 信号迟到的最坏情形下至多多跑一轮派发。
+	// controlWarmupPollMS pins the scheduler poll to its allowed maximum (100..5000).
+	controlWarmupPollMS = 5000
+)
+
+// 预热进程的时限：启动到登记标记 + 之后的优雅停机。二者都不进用例的 runTimeout——
+// 预热失败只登记，不应占用被测命令的预算。
+// Warm-up process deadlines; they are separate from the case's runTimeout.
+const (
+	controlWarmupBootTimeout = 90 * time.Second
+	controlWarmupStopTimeout = 30 * time.Second
 )
 
 // binaryPath / binarySHA256 / binarySource / expectedVersion 由 TestMain 决定一次后写入；
@@ -494,6 +524,13 @@ type harness struct {
 	// storeReady records that ensureStore already migrated this case's schema.
 	storeReady bool
 
+	// controlInitDone 记住本用例已跑过一次控制面预热（shared-init 全部落地）。
+	// US-25C 起重命令按角色分流：`serve` 之外的重命令是 Worker，跳过共享初始化写入
+	// （宪法 VII / FR-25C-12），因此夹具不能再靠跑一次轻命令来补基线——那正是
+	// 2026-11-10 CI 上 91 条 e2e 变红的根因。预热只在首个重命令前跑一次。
+	// controlInitDone records that the control-plane warm-up already ran for this case.
+	controlInitDone bool
+
 	// notifyChannels 是夹具登记的通知渠道（`insertNotifyChannel` 写入）：重命令启动前
 	// 补给声明 `notify` 工具的 Agent——R4 起 Run 只冻结定义里声明过的渠道。
 	// notifyChannels are the fixture-registered channels seeded into notify-capable agents.
@@ -522,6 +559,13 @@ func newHarness(t *testing.T) *harness {
 		Schema:       schema,
 		runTimeout:   defaultRunTimeout,
 	}
+	// 已发布技能版本目录是只读的（文件 0o444、目录 0o555，约束 25）：Unix 上删除子项
+	// 需要目录写权限，US-25C 起同步会把技能物化进 `.basalt/versions/skills/`，不先改回
+	// 可写，`t.TempDir` 的清理就会以 `permission denied` 判红（测试 109 行实测）。
+	// 先于 `t.TempDir` 的清理注册（LIFO），只改权限、不动内容。
+	// Published skill version dirs are read-only by contract, so the fixture restores
+	// write permission before the temp dir's own cleanup runs.
+	t.Cleanup(func() { makeTreeRemovable(h.Root) })
 	// 回收次序：Cleanup 后进先出——进程都杀完之后才 drop schema，否则 DROP 会撞上
 	// 仍持有的连接。drop 失败判红（残留 schema 会让下一轮的"空库"前提失真）。
 	// LIFO cleanup: every process is killed before the schema is dropped; a failed drop
@@ -532,6 +576,23 @@ func newHarness(t *testing.T) *harness {
 		}
 	})
 	return h
+}
+
+// makeTreeRemovable 把整棵工作区改回可写（目录 0o755、文件 0o644），供临时目录回收；
+// 读不到的项跳过——它只服务于清理，失败会由随后的 RemoveAll 如实暴露。
+// makeTreeRemovable restores write permission so the temp dir can be removed.
+func makeTreeRemovable(root string) {
+	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			_ = os.Chmod(path, 0o755)
+			return nil
+		}
+		_ = os.Chmod(path, 0o644)
+		return nil
+	})
 }
 
 // newIsolatedSchema 在测试库上建一个隔离 schema；缺 DSN 时直接判红并给出排查路径
@@ -1515,6 +1576,12 @@ func (h *harness) prepareHeavy(t *testing.T, env []string, args []string) {
 	if !isHeavyCommand(args) {
 		return
 	}
+	// 控制面预热先于绑定补齐：基线 / 策略种子 / 开箱安装等共享初始化写入只由控制面
+	// （`serve`）执行，Worker 角色的重命令会按 FR-25C-12 全部跳过。没有这一步，
+	// `assets install` 读不到生命周期身份、执行期准入读不到策略行。
+	// The control-plane warm-up runs before binding seeding: shared-init writes belong
+	// to the control role only, and the worker-role commands skip them by contract.
+	h.ensureControlPlaneInit(t, env)
 	docs := h.bindingDocs(t)
 	if len(docs) == 0 {
 		return
@@ -1765,18 +1832,495 @@ func (h *harness) modelConnectionUID(t *testing.T, name string) (string, bool) {
 	return uid, true
 }
 
-// runBaselineWarmup 跑一次 `tool list` 触发启动基线：基线只补建发布版本与指针
+// runBaselineWarmup 跑一次控制面预热触发启动基线：基线只补建发布版本与指针
 // （内容未变则 no-op），不改 Agent 状态、不写管理操作行。输出与退出码刻意忽略——
 // 这次调用只为了让指针存在，判卷交给随后的被测命令；失败（如锁被占用）同样不影响判卷。
-// runBaselineWarmup publishes the baseline once; its output and exit code are ignored.
+//
+// US-25C 起 `tool list` 是 Worker 角色、不再执行共享初始化写入，基线路径改由
+// 短命的 `serve` 承担（见 bootControlServe）。
+// Since US-25C the light commands are workers and no longer write shared init, so the
+// baseline path is a short-lived `serve` stopped at the registration marker.
 func (h *harness) runBaselineWarmup(t *testing.T, env []string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), h.timeout())
+	_ = h.bootControlServe(t, env)
+}
+
+// ensureControlPlaneInit 让本用例的共享状态（基线、策略种子、开箱安装、调度定义列、
+// 知识代际……）在首个重命令之前落地，且**每个用例只做一次**。成败都不判卷：
+// 预热失败时随后的被测命令按原判据报错，夹具不替它掩盖。
+//
+// 三个前置不满足时直接跳过（不置位缓存，后一个重命令可以再试）：
+//   - 没有 `basalt.yaml`：配置还没写，预热没有输入；
+//   - 没有 `.basalt/`：首启类用例（US14）刻意让被测 `serve` 自己走首次初始化，
+//     预热提前建目录会把"首次初始化未完成""不生成 token / 主密钥"等断言破坏掉；
+//   - 实例锁被占用：常驻进程正在跑，它自己就是控制面；且预热要临时改写配置，
+//     不能让常驻进程的配置监视看到中间态。
+//
+// ensureControlPlaneInit lands the shared state once per case; every precondition it
+// cannot satisfy skips the warm-up without caching, so a later heavy command retries.
+func (h *harness) ensureControlPlaneInit(t *testing.T, env []string) {
+	t.Helper()
+	h.mu.Lock()
+	done := h.controlInitDone
+	h.mu.Unlock()
+	if done {
+		return
+	}
+	if !h.workspaceInitialized() {
+		return
+	}
+	if busy, detail := instanceLockBusy(h.lockRoot()); busy {
+		t.Logf("控制面预热跳过：实例锁被占用（%s）——常驻进程自己承担控制面初始化", detail)
+		return
+	}
+	if !h.bootControlServe(t, env) {
+		return
+	}
+	h.mu.Lock()
+	h.controlInitDone = true
+	h.mu.Unlock()
+}
+
+// workspaceInitialized 判定用例工作区是否已具备预热前提：`basalt.yaml` 与 `.basalt/`
+// 都在。缺一即跳过（见 ensureControlPlaneInit 的三条理由）。
+// workspaceInitialized reports whether the case workspace can be warmed at all.
+func (h *harness) workspaceInitialized() bool {
+	if _, err := os.Stat(filepath.Join(h.Root, "basalt.yaml")); err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(h.Root, ".basalt"))
+	return err == nil && info.IsDir()
+}
+
+// lockRoot 是生产装配使用的实例锁目录：`<工作目录>/.basalt`（run.go 取 workDir 下的
+// `.basalt`，锁文件再拼 `basalt.lock`）。探锁必须用同一路径——拿工作区根去探会落到
+// 一个**无人持有**的 `<root>/basalt.lock` 上，永远判"空闲"，随后预热的临时配置就会
+// 在常驻进程眼皮底下改写 `basalt.yaml`（2026-11-10 实测：交互 chat 读到中间态
+// `${BASALT_E2E_WARMUP_ADMIN_TOKEN}` 后退出，实例锁提前释放，被测 serve 反而获锁）。
+// lockRoot is the instance-lock directory production uses: <workDir>/.basalt.
+func (h *harness) lockRoot() string {
+	return filepath.Join(h.Root, ".basalt")
+}
+
+// instanceLockBusy 非阻塞探一次实例锁：被活实例持有返回 true 与占用人诊断；
+// 探到就立即释放，不改变锁状态。
+// instanceLockBusy probes the instance lock without blocking and releases it at once.
+func instanceLockBusy(root string) (bool, string) {
+	lock, err := workspace.AcquireInstanceLock(root)
+	if err == nil {
+		_ = lock.Release()
+		return false, ""
+	}
+	var busy *workspace.LockBusyError
+	if errors.As(err, &busy) {
+		return true, busy.Error()
+	}
+	// 非竞争类失败（磁盘 / 权限）同样不放行预热：取不到锁就不要动工作区。
+	return true, err.Error()
+}
+
+// bootControlServe 起一个临时 `serve` 进程，等到 `Worker 已登记` 就投递中断并等它退出。
+// 返回 true 表示共享初始化已经落地。整段过程**不改用例判据**：失败只登记日志。
+//
+// 为什么在登记标记处停：全部 15 项 shared-init 都在 newRuntime 里、注册之前完成
+// （internal/app/wire.go），因此标记一出现，基线 / 策略种子 / 开箱安装等就已经写完。
+// 标记之后的资产同步与 `Scheduler.Start` 本不属于预热：若此刻投递的中断及时生效，
+// `Scheduler.Start` 的首次 `ListTasks(ctx)` 看到已取消的上下文、整段启动以 0 退出。
+//
+// 但中断与调度启动之间存在真实的竞态（2026-11-11 实测）：标记到 `Scheduler.Start`
+// 之间只有数十毫秒的数据库往返，Windows 的 Ctrl+Break 投递可能晚于 `ListTasks`，
+// 预热进程于是按工作区定义提交了调度定义列（`scheduled_tasks` 的新增 / 改写 / 退休）。
+// 这些行属于被测用例，不属于预热——Reconcile 用例因预热先提交新定义而看不到
+// `任务定义已更新`，LegacyD1 因预热登记了内置任务的 cron 而计数不为 0。因此预热在
+// 启动前快照 `scheduled_tasks`、进程退出后**按行还原**（预热创建的行删除、被改写的
+// 行恢复原值）：契约仍是"预热不写调度定义列"，只是由夹具还原兜底，不再赌中断时机。
+// 仍存在的边界：若预热真的领取了到期任务，执行行与 next_fire_at 不在还原面内；
+// 夹具触发点都落在数小时之后，此窗口按"不领取"设计，未额外兜底。
+//
+// 预热的临时配置只强制三处：管理面绑回环随机端口、token 模式取自环境（不生成新
+// token）、调度轮询取允许上界；配置在进程退出后逐字节还原，解码失败则整段跳过。
+//
+// bootControlServe stops a temporary serve right after the shared init has landed.
+// The interrupt can lose the race with Scheduler.Start, so scheduled_tasks is
+// snapshotted before the warm-up and restored row by row after it exits.
+func (h *harness) bootControlServe(t *testing.T, env []string) bool {
+	t.Helper()
+	// 锁守卫收在函数入口：ensureControlPlaneInit 之外还有 runBaselineWarmup /
+	// publishBeforeSnapshot 等直接调用方，它们同样不能在有活实例时改写配置。
+	// 预热要临时改写 `basalt.yaml`，运行中的进程会重读配置（实测并发 chat 因此退出），
+	// 所以只要有任一重命令持锁就整段跳过；不置位缓存，锁释放后下一次重命令可以再试。
+	// The lock guard sits at the entry point so every caller skips while a live
+	// holder exists: the warm-up rewrites basalt.yaml, and a running process rereads it.
+	if busy, detail := instanceLockBusy(h.lockRoot()); busy {
+		t.Logf("控制面预热跳过：实例锁不可得（%s）——不动工作区配置", detail)
+		return false
+	}
+	cfgPath := filepath.Join(h.Root, "basalt.yaml")
+	info, statErr := os.Stat(cfgPath)
+	if statErr != nil {
+		return false
+	}
+	saved, readErr := os.ReadFile(cfgPath)
+	if readErr != nil {
+		t.Logf("控制面预热跳过：读取 %s 失败：%v", cfgPath, readErr)
+		return false
+	}
+	warmed, ok := controlWarmupConfig(saved)
+	if !ok {
+		t.Logf("控制面预热跳过：%s 不是可解析的 YAML 映射，交给被测命令判卷", cfgPath)
+		return false
+	}
+	if err := os.WriteFile(cfgPath, warmed, info.Mode().Perm()); err != nil {
+		t.Logf("控制面预热跳过：写入临时配置失败：%v", err)
+		return false
+	}
+	defer func() {
+		// 还原必须逐字节（内容与权限位）：用例的后续断言、配置监视与重试都读这一份。
+		if err := os.WriteFile(cfgPath, saved, info.Mode().Perm()); err != nil {
+			t.Errorf("控制面预热后还原 %s 失败：%v", cfgPath, err)
+		}
+	}()
+
+	// 快照先于进程启动；还原挂在 defer 上，此处之后每条返回路径都已等进程退出。
+	// The snapshot is taken before the process starts; every return path below waits
+	// for the process to exit before the deferred restore runs.
+	snapshot := h.snapshotScheduledTasks(t)
+	defer h.restoreScheduledTasks(t, snapshot)
+
+	ctx, cancel := context.WithTimeout(context.Background(), controlWarmupBootTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, h.Binary, "tool", "list")
+	cmd := exec.CommandContext(ctx, h.Binary, "serve")
 	cmd.Dir = h.Root
-	cmd.Env = h.environ(env)
-	_ = cmd.Run()
+	cmd.Env = h.environ(append(append([]string(nil), env...),
+		controlWarmupTokenEnv+"="+controlWarmupTokenValue))
+	cmd.SysProcAttr = groupedSysProcAttr()
+	output := &lockedBuffer{}
+	cmd.Stdout, cmd.Stderr = output, output
+	if err := cmd.Start(); err != nil {
+		t.Logf("控制面预热跳过：启动 serve 失败：%v", err)
+		return false
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+
+	// 轮询比 waitOutput 更细、且**不判红**：标记一出现就投递中断，把"进程继续走到
+	// 调度启动"的窗口压到最小；进程提前退出同样只登记。
+	for {
+		if strings.Contains(output.String(), controlInitReadyMarker) {
+			break
+		}
+		select {
+		case <-exited:
+			t.Logf("控制面预热未完成：serve 在登记前退出\n%s", h.redact(output.String()))
+			return false
+		case <-time.After(readinessPoll):
+		}
+	}
+
+	if err := interruptProcess(cmd.Process.Pid); err != nil {
+		t.Logf("控制面预热投递中断失败（%v），改为强制结束", err)
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-exited:
+	case <-time.After(controlWarmupStopTimeout):
+		t.Logf("控制面预热停机超时（%s），强制结束", controlWarmupStopTimeout)
+		_ = cmd.Process.Kill()
+		<-exited
+	}
+	return true
+}
+
+// scheduledTaskRow 是 scheduled_tasks 的一行原值；列序与 0001 建表 + 0012 追加列一致。
+// 可空列用 sql.Null* 保存，整行因此可比较（还原时按值判等，避免无谓写库）。
+// scheduledTaskRow mirrors one scheduled_tasks row; nullable columns use sql.Null* so
+// the whole struct is comparable.
+type scheduledTaskRow struct {
+	taskID           string
+	agentName        string
+	cron             string
+	zone             string
+	message          string
+	deliverTo        string
+	enabled          bool
+	definitionHash   string
+	lastRunAt        sql.NullInt64
+	lastStatus       sql.NullString
+	retiredAt        sql.NullInt64
+	createdAt        int64
+	updatedAt        int64
+	callerID         string
+	authorizingKind  string
+	authorizingKeyID sql.NullString
+	nextFireAt       sql.NullInt64
+}
+
+// scheduledTasksSnapshot 是预热前的原值快照。usable 为 false 表示表还不存在（隔离
+// schema 尚未迁移）或读取失败——此时没有可还原的原值，预热也只会补出自己的库表，
+// 与被测命令自己的迁移结果等价，夹具不额外兜底。
+// scheduledTasksSnapshot holds the pre-warm-up rows; unusable means the table did not
+// exist yet, so there is nothing to restore.
+type scheduledTasksSnapshot struct {
+	usable bool
+	rows   []scheduledTaskRow
+}
+
+// scheduledTasksSelect 显式列名：不依赖 `SELECT *` 的列序随迁移漂移。
+// The column list is explicit so migration-added columns stay visible here.
+const scheduledTasksSelect = `SELECT task_id, agent_name, cron, zone, message, deliver_to,
+	enabled, definition_hash, last_run_at, last_status, retired_at, created_at, updated_at,
+	caller_id, authorizing_kind, authorizing_key_id, next_fire_at
+  FROM scheduled_tasks ORDER BY task_id`
+
+// snapshotScheduledTasks 在预热进程启动前取原值（见 bootControlServe 的竞态说明）。
+// snapshotScheduledTasks reads the rows the warm-up must leave untouched.
+func (h *harness) snapshotScheduledTasks(t *testing.T) scheduledTasksSnapshot {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db := h.openDB(t)
+	var present sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('scheduled_tasks')::text`).Scan(&present); err != nil {
+		t.Logf("控制面预热：检查 scheduled_tasks 失败（%v）——不做还原", err)
+		return scheduledTasksSnapshot{}
+	}
+	if !present.Valid || present.String == "" {
+		return scheduledTasksSnapshot{}
+	}
+	rows, err := h.readScheduledTasks(t, ctx, db)
+	if err != nil {
+		t.Logf("控制面预热：读取 scheduled_tasks 快照失败（%v）——不做还原", err)
+		return scheduledTasksSnapshot{}
+	}
+	return scheduledTasksSnapshot{usable: true, rows: rows}
+}
+
+// readScheduledTasks 读全表；失败由调用方按"预热不判卷"处理，不在这里判红。
+// readScheduledTasks reads the whole table; callers decide how to degrade.
+func (h *harness) readScheduledTasks(t *testing.T, ctx context.Context, db *sql.DB) ([]scheduledTaskRow, error) {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, scheduledTasksSelect)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []scheduledTaskRow
+	for rows.Next() {
+		var r scheduledTaskRow
+		if err := rows.Scan(&r.taskID, &r.agentName, &r.cron, &r.zone, &r.message, &r.deliverTo,
+			&r.enabled, &r.definitionHash, &r.lastRunAt, &r.lastStatus, &r.retiredAt,
+			&r.createdAt, &r.updatedAt, &r.callerID, &r.authorizingKind, &r.authorizingKeyID,
+			&r.nextFireAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// restoreScheduledTasks 把预热进程退出后的 scheduled_tasks 还原成快照：预热创建的行
+// 删除、被改写（含 retired_at / next_fire_at / 定义哈希）的行恢复原值、缺失的行补回。
+// 只按行 diff 写库——不 TRUNCATE，预存行不会被删后重插（task_executions 等外键仍指向
+// 同一批 task_id）。还原失败只登记：被测命令随后的断言会如实暴露残留。
+// The restore diffs rows, never truncates, and only logs failures.
+func (h *harness) restoreScheduledTasks(t *testing.T, snap scheduledTasksSnapshot) {
+	t.Helper()
+	if !snap.usable {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db := h.openDB(t)
+	current, err := h.readScheduledTasks(t, ctx, db)
+	if err != nil {
+		t.Logf("控制面预热还原：读取当前 scheduled_tasks 失败（%v）——未还原", err)
+		return
+	}
+	before := make(map[string]scheduledTaskRow, len(snap.rows))
+	for _, row := range snap.rows {
+		before[row.taskID] = row
+	}
+	now := make(map[string]scheduledTaskRow, len(current))
+	for _, row := range current {
+		now[row.taskID] = row
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Logf("控制面预热还原：开启事务失败（%v）——未还原", err)
+		return
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Logf("控制面预热还原：回滚失败（%v）", err)
+		}
+	}()
+	removed, restored := 0, 0
+	// 预热新增的行：快照里没有，删除。
+	for _, row := range current {
+		if _, ok := before[row.taskID]; ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM scheduled_tasks WHERE task_id = $1`, row.taskID); err != nil {
+			t.Logf("控制面预热还原：删除预热登记的任务 %s 失败（%v）——未还原", row.taskID, err)
+			return
+		}
+		removed++
+	}
+	// 快照里的行：缺失则补回，被改写则恢复原值。
+	for _, row := range snap.rows {
+		currentRow, exists := now[row.taskID]
+		if !exists {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO scheduled_tasks
+				(task_id, agent_name, cron, zone, message, deliver_to, enabled, definition_hash,
+				 last_run_at, last_status, retired_at, created_at, updated_at, caller_id,
+				 authorizing_kind, authorizing_key_id, next_fire_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				row.taskID, row.agentName, row.cron, row.zone, row.message, row.deliverTo,
+				row.enabled, row.definitionHash, row.lastRunAt, row.lastStatus, row.retiredAt,
+				row.createdAt, row.updatedAt, row.callerID, row.authorizingKind,
+				row.authorizingKeyID, row.nextFireAt); err != nil {
+				t.Logf("控制面预热还原：补回任务 %s 失败（%v）——未还原", row.taskID, err)
+				return
+			}
+			restored++
+			continue
+		}
+		if currentRow == row {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE scheduled_tasks SET
+			agent_name = $2, cron = $3, zone = $4, message = $5, deliver_to = $6, enabled = $7,
+			definition_hash = $8, last_run_at = $9, last_status = $10, retired_at = $11,
+			created_at = $12, updated_at = $13, caller_id = $14, authorizing_kind = $15,
+			authorizing_key_id = $16, next_fire_at = $17
+			WHERE task_id = $1`,
+			row.taskID, row.agentName, row.cron, row.zone, row.message, row.deliverTo,
+			row.enabled, row.definitionHash, row.lastRunAt, row.lastStatus, row.retiredAt,
+			row.createdAt, row.updatedAt, row.callerID, row.authorizingKind,
+			row.authorizingKeyID, row.nextFireAt); err != nil {
+			t.Logf("控制面预热还原：恢复任务 %s 失败（%v）——未还原", row.taskID, err)
+			return
+		}
+		restored++
+	}
+	if err := tx.Commit(); err != nil {
+		t.Logf("控制面预热还原：提交失败（%v）——未还原", err)
+		return
+	}
+	if removed > 0 || restored > 0 {
+		t.Logf("控制面预热还原完成：删除预热登记 %d 行、恢复原值 %d 行", removed, restored)
+	}
+}
+
+// interruptProcess delivers the graceful interrupt the platform's fixtures use.
+func interruptProcess(pid int) error {
+	if runtime.GOOS == "windows" {
+		return sendCtrlBreakWindows(pid)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Signal(os.Interrupt)
+}
+
+// controlWarmupConfig 把用例配置转成预热的临时形态：其余键逐项保留，只强制三处
+// （管理面回环随机端口 / token 取自预热环境 / 调度轮询取上界，理由见 bootControlServe）。
+// 解码失败（不是 YAML 映射）返回 false——预热不该替用例解释坏配置。
+// controlWarmupConfig overrides only the three keys the warm-up needs.
+func controlWarmupConfig(raw []byte) ([]byte, bool) {
+	var root map[string]any
+	if err := yaml.Unmarshal(raw, &root); err != nil || root == nil {
+		return nil, false
+	}
+	httpSection, _ := root["http"].(map[string]any)
+	if httpSection == nil {
+		httpSection = map[string]any{}
+	}
+	httpSection["addr"] = "127.0.0.1:0"
+	httpSection["admin_auth"] = map[string]any{
+		"mode":  "token",
+		"token": "${" + controlWarmupTokenEnv + "}",
+	}
+	root["http"] = httpSection
+	schedulerSection, _ := root["scheduler"].(map[string]any)
+	if schedulerSection == nil {
+		schedulerSection = map[string]any{}
+	}
+	schedulerSection["poll_interval_ms"] = controlWarmupPollMS
+	root["scheduler"] = schedulerSection
+	warmed, err := yaml.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	// map 往返会按字典序重排 `providers:` 块内的键；启动对账按字节判"外部编辑"，
+	// 临时配置因此会把 Provider 发布成新版本并移动指针——冻结在 Flow 任务上的
+	// 资源版本随之中断（US-19 崩溃窗口实测：复活后 ErrFlowDispatch → 500）。
+	// `providers:` 是这份文件里唯一被启动对账消费的块，原样拼回原始字节。
+	// The map round-trip sorts the providers block; reconcile judges edits by bytes,
+	// so the temporary file must keep that block byte-identical to the case file.
+	warmed = spliceTopLevelBlock(warmed, raw, providersTopLevelKey)
+	return warmed, true
+}
+
+// providersTopLevelKey 是 `basalt.yaml` 里模型连接定义的顶层键（启动对账的输入）。
+// providersTopLevelKey is the top-level key reconcile consumes from basalt.yaml.
+const providersTopLevelKey = "providers"
+
+// spliceTopLevelBlock 用 src 里的顶层块替换 dst 的同名块；任一侧找不到时原样返回 dst。
+// spliceTopLevelBlock replaces one top-level block in dst with the block from src.
+func spliceTopLevelBlock(dst, src []byte, key string) []byte {
+	dstStart, dstEnd, ok := topLevelBlockRange(dst, key)
+	if !ok {
+		return dst
+	}
+	srcStart, srcEnd, ok := topLevelBlockRange(src, key)
+	if !ok {
+		return dst
+	}
+	out := make([]byte, 0, len(dst)-(dstEnd-dstStart)+(srcEnd-srcStart))
+	out = append(out, dst[:dstStart]...)
+	out = append(out, src[srcStart:srcEnd]...)
+	out = append(out, dst[dstEnd:]...)
+	return out
+}
+
+// topLevelBlockRange 找出顶层键 `key:` 的行区间 [start, end)：end 是下一个非空、
+// 非注释且不以空白或 `-` 开头的行（或文件末尾）。`-` 开头的行是紧贴上文的块序列项
+// ——goccy 编码把列表项顶格输出（`providers:\n- name: ...`），它仍属于 `providers:`
+// 的值，不能当成新的顶层键。键名按冒号边界精确匹配——`providers_x:` 不算 `providers`。
+// 行内 `\r\n` 的平台差异由调用方逐字节拼接处理。
+// topLevelBlockRange locates one top-level block; it ends at the next top-level key,
+// treating column-zero sequence items (`- ...`) as part of the preceding block.
+func topLevelBlockRange(doc []byte, key string) (int, int, bool) {
+	needle := []byte(key + ":")
+	offset := 0
+	start := -1
+	for offset < len(doc) {
+		next := bytes.IndexByte(doc[offset:], '\n')
+		end := len(doc)
+		if next >= 0 {
+			end = offset + next + 1
+		}
+		line := bytes.TrimRight(doc[offset:end], "\r\n")
+		switch {
+		case start < 0:
+			if bytes.HasPrefix(line, needle) &&
+				(len(line) == len(needle) || line[len(needle)] == ' ' || line[len(needle)] == '\t') {
+				start = offset
+			}
+		case len(line) > 0 && line[0] != ' ' && line[0] != '\t' && line[0] != '#' && line[0] != '-':
+			return start, offset, true
+		}
+		offset = end
+	}
+	if start >= 0 {
+		return start, len(doc), true
+	}
+	return 0, 0, false
 }
 
 // rewriteFixtureBindings 用一份完整块替换夹具上一轮写的块（闭合 `---` 之前）：

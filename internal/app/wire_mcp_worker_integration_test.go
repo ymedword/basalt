@@ -3,16 +3,19 @@
 package app
 
 // 本文件是 US-25C 2026-11-10 复核 **P1（Worker 的 MCP 准备链路）**的生产装配判据：
-// 在真实 `newRuntime` 装配下（不是组件夹具）验证三段行为——
-//  1. 首次连接：Worker 装配期**不**连接（`sharedInitMCPApplied` 是控制面的写），
-//     第一轮同步由 `assetSyncDeps.MCP` 按 applied 指针连接、登记工具；
+// 在真实 `newRuntime` 装配下（不是组件夹具）验证四段行为——
+//  1. 首次连接：Worker **启动**按 §2.3.1 行「改为 `PrepareAtApplied`」准备已 applied 的
+//     server——装配期连接一次、工具进入注册池；`applied` 指针不动（`sharedInitMCPApplied`
+//     仍是控制面的写）。一次性 `chat` / `tool` 没有同步轮，准备必须先于 Entry 构建与注册
+//     （FR-25C-18），否则依赖 MCP 的 Agent 永远按 "mcp server skipped" 拒载。
+//     随后第一轮同步对同一版本**零副作用复用**（不重复 Connect）。
 //  2. 版本更新：发布并应用一个新版本后，下一轮**受控重建**——连接一次、整组换工具；
 //  3. 无变化复用：第三轮版本与凭据代次都相符、连接仍 live → 零 Connect / 零 Close；
 //  4. 接线守卫：生产 `MCPSupervisorDeps` 字面量必须带 `PrepareVerify`，且准备轮**不得**
 //     在外层持 `ResourceGate`——外层再持会与 `commitReplace` 的写锁自锁（`core.ResourceGate`
-//     是不可重入的 `sync.RWMutex`，§2.3.8 M3）。逆改点：删掉 `PrepareVerify` 接线 → 首轮
-//     失败关闭（dependency_unconfirmed）；保留 wire 闭包外层 `resourceGate.Lock()` →
-//     第二轮受控重建永久挂住，本文件的守卫以超时落红。
+//     是不可重入的 `sync.RWMutex`，§2.3.8 M3）。逆改点：删掉 `PrepareVerify` 接线 →
+//     准备失败关闭（dependency_unconfirmed）；保留 wire 闭包外层 `resourceGate.Lock()` →
+//     受控重建永久挂住，本文件的守卫以超时落红。
 //
 // 装配拓扑说明：生产里控制面与 Worker 分处两台宿主；`workspace.AcquireInstanceLock`
 // 一个工作区只容一个实例，所以本文件先起控制面（完成共享初始化写、连接并把 applied
@@ -219,10 +222,11 @@ func runMCPRoundGuarded(t *testing.T, deps *AssetSyncDeps) MCPReport {
 	}
 }
 
-// TestWireWorker_MCPPrepareChain（复核 P1 的生产装配判据）：首次连接 → 版本更新受控重建 →
-// 无变化零副作用复用，全程走真实 `newRuntime` 装配；并钉住 `PrepareVerify` 的接线守卫。
-// The production assembly must connect on the first sync round, rebuild on a version
-// update, and reuse with zero side effects when nothing changed.
+// TestWireWorker_MCPPrepareChain（复核 P1 的生产装配判据）：启动首次连接 → 同步轮复用 →
+// 版本更新受控重建 → 无变化零副作用复用，全程走真实 `newRuntime` 装配；并钉住
+// `PrepareVerify` 的接线守卫。
+// The production assembly must prepare applied servers at startup, reuse on the first
+// sync round, rebuild on a version update, and reuse with zero side effects after.
 func TestWireWorker_MCPPrepareChain(t *testing.T) {
 	fx := newWireFixture(t)
 	writeMCPServersYAML(t, fx.root, []string{wireWorkerMCPServer})
@@ -245,7 +249,8 @@ func TestWireWorker_MCPPrepareChain(t *testing.T) {
 	require.Equal(t, applied.PublishedVersionID, *applied.AppliedVersionID,
 		"控制面启动连接成功后必须把 applied 对齐到最新发布版本")
 
-	// —— Worker：装配期零连接；第一轮同步完成首次连接。——
+	// —— Worker：启动准备已 applied 的 server（一次连接、工具入池、不动 applied）；——
+	// —— 第一轮同步对同一版本零副作用复用。——
 	workerConn := &mcpRoundConnector{toolFor: mcpToolForGeneration}
 	workerApp := fx.app()
 	workerApp.mcpConnect = workerConn
@@ -255,22 +260,22 @@ func TestWireWorker_MCPPrepareChain(t *testing.T) {
 
 	require.NotNil(t, worker.mcpSupervisor.deps.PrepareVerify,
 		"生产装配必须接上换入前复核：缺这条接线时 Worker 的 MCP 永远失败关闭（复核 P1 的 1a）")
-	require.Zero(t, workerConn.connectCount(),
-		"Worker 装配期不得连接（applied 写与启动连接都是控制面的共享初始化）")
+	require.Equal(t, 1, workerConn.connectCount(),
+		"Worker 启动必须准备已 applied 的 server（§2.3.1 行「改为 PrepareAtApplied」）")
+	require.Equal(t, wireWorkerMCPServer, workerConn.specAt(t, 0).Name)
+	_, registered := worker.registry.Resolve(wireWorkerMCPToolV1)
+	require.True(t, registered, "启动准备连接成功后的工具必须进入注册池（供注册前 Entry 判定）")
 
 	first := runMCPRoundGuarded(t, worker.assetSyncDeps)
 	require.Equal(t, []string{wireWorkerMCPServer}, first.Configured)
-	require.Equal(t, []string{wireWorkerMCPServer}, first.Connected, "首轮必须连上已 applied 的 server")
+	require.Equal(t, []string{wireWorkerMCPServer}, first.Connected, "首轮必须看见已连接的同版本 server")
 	require.Contains(t, first.Tools, wireWorkerMCPToolV1, "首轮的工具名快照必须来自本次连接")
 	require.Len(t, first.Results, 1)
 	require.Equal(t, string(core.MCPApplyApplied), first.Results[0].Outcome)
-	require.False(t, first.Results[0].Reused, "首次连接不是复用")
+	require.True(t, first.Results[0].Reused, "启动已连接同一版本：首轮必须零副作用复用")
 	require.Equal(t, applied.PublishedVersionID, first.Results[0].AppliedVersionID,
-		"首轮必须连接并生效控制面写下的同一已发布版本")
-	require.Equal(t, 1, workerConn.connectCount(), "首轮必须且只建连一次")
-	require.Equal(t, wireWorkerMCPServer, workerConn.specAt(t, 0).Name)
-	_, registered := worker.registry.Resolve(wireWorkerMCPToolV1)
-	require.True(t, registered, "连接成功后的工具必须进入注册池")
+		"首轮必须生效控制面写下的同一已发布版本")
+	require.Equal(t, 1, workerConn.connectCount(), "首轮复用不得再次建连")
 
 	// —— 版本更新：发布并应用 v2，下一轮必须受控重建（连一次、整组换工具）。——
 	_ = seedPublishedMCPVersions(t, fx.dsn, wireWorkerMCPServer,

@@ -60,9 +60,14 @@ http:
   admin_auth:
     mode: token
     token: ${BASALT_ADMIN_TOKEN}
+callers:
+  ingress:
+    run:    { qps: 10, burst: 20 }
+    ingest: { qps: 10, burst: 20 }
+    read:   { qps: 100, burst: 200 }
 ```
 
-`database.dsn` is mandatory. An unset or unresolved `${...}` placeholder counts as an empty value and startup is refused with an error naming the key. The configuration that a fresh first start generates carries the same placeholder — it reserves the key, it does not provide a database.
+`database.dsn` is mandatory. An unset or unresolved `${...}` placeholder counts as an empty value and startup is refused with an error naming the key. The configuration that a fresh first start generates carries the same placeholder — it reserves the key, it does not provide a database. `basalt serve` additionally requires the six `callers.ingress` values above: it ships no built-in defaults, and a missing or non-positive value refuses startup with an error naming the key. The example rates suit a local trial only; size them for your callers before serving traffic.
 
 In the same terminal, set the database connection string, your model key, and generate a management token with a system cryptographic random source. Replace the example placeholders; keep only environment references in the configuration file.
 
@@ -142,7 +147,7 @@ cli-<id>：N 条（最后活动 <UTC 时间>）
 共 1 个会话
 ```
 
-The example preserves the CLI format; identifiers, counts and timestamps depend on the run. An empty workspace prints “未发现会话”. Messages, model calls and run records are stored in .basalt/basalt.db. A tool record exists only if a tool was actually invoked. Restart the service to inspect the agent’s executions and sessions in the console.
+The example preserves the CLI format; identifiers, counts and timestamps depend on the run. An empty workspace prints “未发现会话”. Messages, model calls and run records are stored in the PostgreSQL database named by `database.dsn`; `.basalt/basalt.db` is the frozen SQLite lineage that only serves migration and rollback, not runtime data. A tool record exists only if a tool was actually invoked. Restart the service to inspect the agent’s executions and sessions in the console.
 
 ## CLI commands {#commands}
 

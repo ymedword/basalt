@@ -573,13 +573,23 @@ func (p *groupedProcess) interrupt(t *testing.T) {
 // PowerShell P/Invoke; the Go runtime maps it to os.Interrupt.
 func interruptWindows(t *testing.T, pid int) {
 	t.Helper()
+	if err := sendCtrlBreakWindows(pid); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sendCtrlBreakWindows 与 interruptWindows 同一手法，但**返回错误不判红**：
+// 夹具预热这类"停机失败只登记、不影响用例判卷"的调用方需要它。
+// sendCtrlBreakWindows is the non-fatal form of interruptWindows.
+func sendCtrlBreakWindows(pid int) error {
 	script := `Add-Type -Namespace W -Name K -MemberDefinition '[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);'; if (-not [W.K]::GenerateConsoleCtrlEvent(1, ` +
 		fmt.Sprint(pid) + `)) { exit 3 }`
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("经 PowerShell 投递 Ctrl+Break 失败（pid %d）: %v\n%s", pid, err, out)
+		return fmt.Errorf("经 PowerShell 投递 Ctrl+Break 失败（pid %d）: %w\n%s", pid, err, out)
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

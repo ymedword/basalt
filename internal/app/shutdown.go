@@ -291,6 +291,14 @@ func (r *heavyRuntime) closeCoordinated() error {
 					r.logShutdownWarn("配置监听关闭失败", err)
 				}
 			}
+			// 两个后台同步循环同属"停止领取"：取消它们的专属 ctx，在飞的一轮随取消
+			// 返回，join 因此能在预算内收尾。信号停机时 runCtx 已取消、这里是幂等重申；
+			// **启动失败**停机（HTTP 面装配失败等）没有信号，只有这一步能停住它们。
+			// The sync loops stop claiming here; on a startup-failure shutdown this is the
+			// only cancellation they see.
+			if r.stopSyncLoops != nil {
+				r.stopSyncLoops()
+			}
 			if r.scheduler != nil {
 				r.scheduler.StopClaims()
 			}

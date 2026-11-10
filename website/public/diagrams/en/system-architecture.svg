@@ -76,7 +76,7 @@
 <text x="914" y="500" font-size="13" fill="#59687a">per-node files · content-addressed install</text>
 <text x="30" y="31" font-size="14" fill="#2447df">BASALT / ARCHITECTURE AT A GLANCE</text>
 <text x="30" y="70" font-size="29" fill="#151e2b" font-weight="600">Independent agents on one shared foundation.</text>
-<text x="36" y="616" font-size="20" fill="#151e2b" font-weight="600">US-25C · published-asset sync and pinned admission</text>
+<text x="36" y="616" font-size="20" fill="#151e2b" font-weight="600">Published-asset sync and pinned admission</text>
 <text x="36" y="650" font-size="15" fill="#151e2b">The control plane publishes an immutable bundle per Agent; Workers install it by hash and never publish.</text>
 <text x="36" y="678" font-size="15" fill="#151e2b">Each claimed execution pins the bundle hash; admission verifies that exact directory before dispatch.</text>
 <text x="36" y="706" font-size="15" fill="#151e2b">Skills materialize from published versions. Cross-node business-state sharing, database HA and Kubernetes remain outside this version.</text>

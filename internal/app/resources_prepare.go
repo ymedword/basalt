@@ -185,6 +185,28 @@ const mcpPrepareOutcomeNotApplied = "not_applied"
 // `publishedMCPServers`——那条路径含 `BackfillEnvSources` 写面，只属控制面。
 // prepareMCPInstances prepares applied servers only and reports the three name sets
 // separately; it never touches the backfill write path.
+// logMCPStartupPrepare 把启动准备的逐条结局写进日志（§2.3.1 启动角色门）：未 applied
+// 与准备失败都用 WARN 点名 server，但不回显 command / 凭据（脱敏口径与 ApplyPublished
+// 的 `detail` 一致）；复用与重建只进汇总 INFO，避免每轮刷屏。
+// Startup prepare outcomes are logged per server; the command and credentials never are.
+func logMCPStartupPrepare(logger *slog.Logger, report MCPReport) {
+	for _, result := range report.Results {
+		switch result.Outcome {
+		case mcpPrepareOutcomeNotApplied:
+			// 未 applied 不是失败：Worker 不得隐式 apply（D-12），但依赖它的 Agent 本轮
+			// 不注册，运维需要看到"为什么没连"。
+			logger.Warn("MCP server 未应用——Worker 不隐式 apply，依赖它的 Agent 本轮不注册",
+				"server", result.Name, "outcome", result.Outcome)
+		case string(core.MCPApplyFailed):
+			logger.Warn("MCP server 准备失败——保留应用版本，依赖它的 Agent 本轮不注册",
+				"server", result.Name, "outcome", result.Outcome,
+				"failure_class", result.FailureClass)
+		}
+	}
+	logger.Info("MCP 启动准备完成", "configured", len(report.Configured),
+		"connected", len(report.Connected), "tools", len(report.Tools))
+}
+
 func prepareMCPInstances(ctx context.Context, deps mcpPrepareDeps) (MCPReport, error) {
 	if deps.Targets == nil {
 		return MCPReport{}, nil

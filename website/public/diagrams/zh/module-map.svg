@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1280" viewBox="0 0 1280 1280" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="module-map" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1280" viewBox="0 0 1280 1280" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="module-map" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969">
 <title id="diagram-title">职责明确的包，显式装配的依赖。</title>
-<desc id="diagram-desc">cmd/basalt 启动装配根 internal/app。CLI 与 HTTP 入口适配器通过注入端口调用 core 的 AgentService 与 ReActLoop。core 持有消费方端口、准入、预算和运行循环；provider、tool、memory、workspace、storage 提供对应实现，cron 适配器提供调度机制。本图表达职责协作，Go 的实际导入方向另图展示。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
+<desc id="diagram-desc">cmd/basalt 启动装配根 internal/app。CLI 与 HTTP 入口适配器通过注入端口调用 core 的 AgentService 与 ReActLoop。core 持有消费方端口、准入、预算和运行循环；provider、tool、memory、workspace、storage 提供对应实现，cron 适配器提供调度机制。本图表达职责协作，Go 的实际导入方向另图展示。 US19：顺序 Flow 复用同一 Run、消息与审计路径；未知动作阻断，不提供并行或分布式图。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
-<rect width="1280" height="1130" fill="#f7f4eb"/>
+<rect width="1280" height="1280" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
 <text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / MODULE MAP</text>
 <text x="40" y="85" font-size="32" font-weight="600">职责明确的包，显式装配的依赖。</text>
@@ -77,9 +77,9 @@
 </g>
 <g data-node-id="storage"><rect x="665" y="900" width="350" height="75" rx="7" fill="#fffdf8" stroke="#bfc9cc" stroke-width="1.2"/>
 <text x="683" y="928" font-size="20" font-weight="600">internal/storage</text>
-<text x="683" y="953" font-size="15" fill="#5d6a70">PostgreSQL 仓储与受控迁移</text>
+<text x="683" y="953" font-size="15" fill="#5d6a70">SQLite 谱系 · PG 仓储见 storage/postgres</text>
 </g>
 <text x="40" y="1085" font-size="15" fill="#5d6a70">本图箭头表示经注入契约发生的运行时调用；具体实现依赖 core，core 不反向导入实现包。</text>
-<text x="40" y="1111" font-size="12" fill="#5d6a70">源码提交: ca9a0d29f185 · 当前实现</text>
-</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1140" width="1244" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1170" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1205" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1240" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+<text x="40" y="1111" font-size="12" fill="#5d6a70">源码提交：2bfcede9db06 · 当前实现</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1140" width="1244" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1170" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="1205" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="1240" font-size="18" fill="#202b30">自托管 PostgreSQL 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
 </svg>

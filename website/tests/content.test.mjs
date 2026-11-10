@@ -51,6 +51,7 @@ export function checkPublicContent(files) {
     const commands = extractBasaltCommands(quick)
     if (JSON.stringify(commands) !== JSON.stringify(QUICKSTART_COMMANDS)) report(locale, 'quickstart-command-drift')
     for (const marker of ['registered=true', '请在此填写模型名', 'disabled', 'Convert]::ToBase64String', 'RandomNumberGenerator', 'openssl rand', '.basalt/basalt.db']) if (!quick.includes(marker)) report(locale, `quickstart-missing-${marker}`)
+    for (const band of ['run', 'ingest', 'read']) if (!new RegExp(`${band}:\\s*\\{ qps: \\d+, burst: \\d+ \\}`).test(quick)) report(locale, `quickstart-missing-ingress-${band}`)
     if (!/registered=true[^\n]*(不等于|≠|only means|does not mean)/i.test(quick)) report(locale, 'registered-is-not-runnable')
     if (!/session list[\s\S]{0,400}(?:共\s*\d+\s*个会话|未发现会话)/.test(quick)) report(locale, 'missing-session-output')
     const docs = files[`website${locale === 'zh' ? '/zh' : ''}/docs/index.md`]
@@ -62,6 +63,15 @@ export function checkPublicContent(files) {
     for (const { id } of DIAGRAMS) if (!architecture.includes(`<DiagramFigure id="${id}"`)) report(locale, `missing-diagram-${id}`)
     const statement = architecture.split('{#current-scope}')[0]
     if (/supports vector|支持向量检索|自动生成技能/i.test(statement)) report(locale, 'future-capability-claim')
+    // 定向禁令：current-scope 之前的正文不得把 K8s、数据库高可用、跨节点业务状态
+    // 共享或多节点部署声明为已支持，也不得把多节点执行写成未来能力。2026-11-11 审计
+    // 发现 a92b04f 删掉整条 distributed 禁令后此处无文案门禁；改为只禁未交付项，
+    // 不再误伤「已发布资产分发」的 distribution 用词。
+    // Targeted ban: pre-scope prose must not claim Kubernetes, database HA, cross-node
+    // business-state sharing or multi-node deployment as supported.
+    const overclaim =
+      /(?:supports?|provides?|delivers?|available)[^.\n]{0,60}(?:Kubernetes|K8s|database high availability|database HA|cross-node business-state sharing|distributed deployment|multi-node deployment)|(?:Kubernetes|K8s|database high availability|database HA|cross-node business-state sharing)[^.\n]{0,30}(?:is|are) (?:supported|available|delivered)|支持[^。\n]{0,30}(?:K8s|Kubernetes|数据库高可用|跨节点业务状态共享|分布式部署|多节点部署)|(?:K8s|Kubernetes|数据库高可用|跨节点业务状态共享|分布式部署|多节点部署)[^。\n]{0,20}(?:已支持|已交付|已上线)/i
+    if (overclaim.test(statement)) report(locale, 'future-capability-claim')
     for (const name of ['daily-report', 'file-review']) {
       if (!architecture.includes(name)) report(locale, `missing-agent-example-${name}`)
     }
@@ -130,7 +140,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.deepEqual([tiers.filter(tier => tier === 'A').length, tiers.filter(tier => tier === 'A*').length, tiers.filter(tier => tier === 'B').length], [6, 1, 1])
   })
   test('configuration, token methods and dependency scenarios are complete', () => {
-    for (const marker of ['${BASALT_MODEL_KEY}', '${BASALT_ADMIN_TOKEN}', '127.0.0.1:8080', 'credential_mode: env']) assert.ok(MINIMAL_CONFIG.includes(marker))
+    for (const marker of ['${BASALT_MODEL_KEY}', '${BASALT_ADMIN_TOKEN}', '127.0.0.1:8080', 'credential_mode: env', 'callers:', 'ingress:', 'run:    { qps: 10, burst: 20 }', 'ingest: { qps: 10, burst: 20 }', 'read:   { qps: 100, burst: 200 }']) assert.ok(MINIMAL_CONFIG.includes(marker))
     assert.match(TOKEN_GENERATION.windows, /RandomNumberGenerator/)
     assert.match(TOKEN_GENERATION.posix, /openssl rand/)
     assert.equal(PREREQUISITES.length, 5)
@@ -143,6 +153,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       const note = CURRENT_SCOPE_NOTE[locale]
       assert.ok(note && note.length > 0, locale)
       for (const term of locale === 'en' ? ['Compose multi-Worker', 'Kubernetes', 'database high availability', 'cross-node business-state sharing'] : ['Compose 多 Worker', 'K8s', '数据库高可用', '跨节点业务状态共享']) assert.ok(note.includes(term), `${locale}: missing ${term}`)
+      // 不只要出现词：必须写明这些边界不在本版本内，且逻辑作用域不等于故障隔离。
+      // Not just presence: the note must state they are outside this version and that
+      // logical scope is not fault isolation.
+      if (locale === 'en') {
+        assert.match(note, /remain outside this version/, `${locale}: boundaries not marked outside this version`)
+        assert.match(note, /do not provide process or container fault isolation/, `${locale}: isolation caveat missing`)
+      } else {
+        assert.match(note, /仍不属于本版本/, `${locale}: boundaries not marked outside this version`)
+        assert.match(note, /不等同于进程或容器故障隔离/, `${locale}: isolation caveat missing`)
+      }
+      assert.doesNotMatch(note, /(?:Kubernetes|K8s|database high availability|数据库高可用|cross-node business-state sharing|跨节点业务状态共享)[^.\n]{0,20}(?:is supported|are supported|已支持|已交付)/i, `${locale}: scope note claims an undelivered boundary`)
     }
   })
   test('footer includes only the approved destination set', () => {

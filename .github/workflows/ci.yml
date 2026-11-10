@@ -648,14 +648,18 @@ jobs:
           if-no-files-found: error
 
   e2e:
-    # F-06：默认 `E2E_TIMEOUT=10m` 的完整 `make e2e` 要在 CI 判卷一次。容器级用例
-    # （US-18 / US-25）按套件自身的判据在无 Docker 宿主上跳过并登记未验证——跳过的
-    # 那些用例由 container job 用真实镜像与 Compose 单独判卷，这里不重复、也不放水。
-    # The full `make e2e` at the default 10m timeout, inside a container without Docker so
-    # container-level cases take their documented skip path (they run in the container job).
-    name: e2e（完整套件，默认 E2E_TIMEOUT=10m）
+    # F-06 用户裁决（2026-11-09）：取消「完整 e2e 必须在默认 10 分钟内完成」的要求，
+    # 按 60 分钟预算执行；该预算同样适用于 CI 判卷。Makefile 的默认值仍是 10m（保持
+    # 原口径不静默改动），本 job 显式传预算。容器级用例（US-18 / US-25）按套件自身的
+    # 判据在无 Docker 宿主上跳过并登记未验证——那些用例由 container job 用真实镜像与
+    # Compose 单独判卷，这里不重复、也不放水。
+    # F-06 ruling (2026-11-09): the "full e2e within the default 10m" requirement was
+    # cancelled in favour of the approved 60m budget, which CI applies explicitly; the
+    # Makefile default stays 10m. Container-level cases take their documented skip path
+    # here (they run in the container job).
+    name: e2e（完整套件，F-06 裁决预算 60m）
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     container:
       image: golang:1.27.3
     services:
@@ -673,6 +677,9 @@ jobs:
           --health-retries 5
     env:
       BASALT_TEST_PG_DSN: postgres://basalt:basalt_ci_only@postgres:5432/basalt_test?sslmode=disable
+      # F-06 裁决预算（2026-11-09）：显式覆盖 Makefile 的默认 10m；该裁决已取代
+      # 「完整 e2e 必须默认 10 分钟内完成」的旧要求。
+      E2E_TIMEOUT: 60m
     steps:
       - uses: actions/checkout@v4
 
@@ -701,11 +708,21 @@ jobs:
             -c "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm') ORDER BY extname"
 
       # PYTHON 覆盖仅是本机默认值（`py -3`）的平台差异，不是放宽：示例单测缺解释器即失败。
-      - name: Full e2e at the default E2E_TIMEOUT
+      # `make e2e` 失败不再直接判红：先落 console 日志，再由判卷器按 F-06 批准范围逐条
+      # 核对失败集合——US-20 原生容器用例按裁决逐条排除并保留未验证，任何范围外失败、
+      # 超时截断、缺 `binary_source=candidate` 或非环境闸门的失败原因一律判红。
+      # A failing `make e2e` is judged by the F-06 approved-scope checker, which rejects
+      # any failure outside the item-by-item US-20 exclusion.
+      - name: Full e2e at the F-06 60m budget
         run: |
-          set -o pipefail
+          set +e
           mkdir -p .loop/runs
-          make e2e PYTHON=python3 2>&1 | tee ".loop/runs/e2e-console-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          log=".loop/runs/e2e-console-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          make e2e PYTHON=python3 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          python3 scripts/e2e-approved-scope.py --self-test
+          python3 scripts/e2e-approved-scope.py --log "$log" --exit-code "$status"
 
       - name: Upload e2e evidence (including failures)
         if: always()

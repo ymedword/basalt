@@ -11,7 +11,7 @@ Basalt hosts multiple independent business agents on a unified Go runtime and ma
 
 ## Project architecture {#overview}
 
-The project uses five logical layers: access, application, execution engine, infrastructure services and storage. Independent Agents are managed objects in the application layer, alongside lifecycle, resource and scheduling services. A `serve` control plane owns the HTTP API, the embedded console and asset publication; `gateway` Workers claim due executions and run them without an HTTP listener. Security, budgets and auditing apply across layers. External model endpoints, MCP/HTTP systems, local subprocesses and notification destinations sit outside the Go runtime boundary.
+The project uses five logical layers: access, application, execution engine, infrastructure services and storage. Independent Agents are managed objects in the application layer, alongside lifecycle, resource and scheduling services. A `serve` control plane owns the HTTP API and the embedded console, publishes asset bundles, and also claims due executions; `gateway` Workers claim and run due executions without an HTTP listener, while Flow roots advance only on the control plane. Security, budgets and auditing apply across layers. External model endpoints, MCP/HTTP systems, local subprocesses and notification destinations sit outside the Go runtime boundary.
 
 <DiagramFigure id="project-overview" />
 
@@ -23,7 +23,7 @@ The project uses five logical layers: access, application, execution engine, inf
 | Infrastructure services | Model adapters, memory, built-in/MCP tools, skills and notifications |
 | Storage | One self-hosted PostgreSQL for runtime state and audit, plus per-node workspace files and content-addressed asset bundles |
 
-The layers describe runtime responsibilities. Actual Go import directions are shown separately in the package-dependency view. Both Agent examples reuse the engine and infrastructure services, with separate declarations, sessions and scoped memory. CLI writers and serve share an exclusive workspace lock.
+The layers describe runtime responsibilities. Actual Go import directions are shown separately in the package-dependency view. Both Agent examples reuse the engine and infrastructure services, with separate declarations, sessions and scoped memory. Write-mode processes (`serve`, `gateway` and CLI writers) take an exclusive per-workspace instance lock.
 
 ### Published assets and Workers
 
@@ -41,7 +41,7 @@ A Go execution loop owns model requests, tool calls, budgets and stopping.
 
 ### Memory
 
-Scoped persistent memory, core-context injection and keyword recall.
+Scoped persistent memory, core-context injection and semantic recall (keyword mode keeps the legacy surface).
 
 ### Tool
 

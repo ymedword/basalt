@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="1840" viewBox="0 0 1380 1840" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="execution-flow" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19">
+<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="1840" viewBox="0 0 1380 1840" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="execution-flow" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969">
 <title id="diagram-title">One Run, with evidence at every boundary.</title>
-<desc id="diagram-desc">Current execution flow: request admission, lifecycle and resource eligibility, frozen Run resources and budgets, PromptBuilder, fail-closed pending model audit, Provider protocol call, model audit success/failed, persisted assistant message, tool ownership/input checks, pending tool audit, policy-controlled execution, tool audit success/failed and appended result. Failure, denial, cancel and recovery branches are explicit. Run terminal outcomes are completed, limit_reached, cancelled and failed. limit_reached preserves partial results and is not an error. Tool denial/failure is model feedback and does not automatically fail the Run. Cancellation is checked before budgets. Startup recovery holds the instance lock: pending call audits become unknown; unfinished Runs become failed; partial tool groups are repaired, never replayed. US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc>
+<desc id="diagram-desc">Current execution flow: request admission, lifecycle and resource eligibility, frozen Run resources and budgets, PromptBuilder, fail-closed pending model audit, Provider protocol call, model audit success/failed, persisted assistant message, tool ownership/input checks, pending tool audit, policy-controlled execution, tool audit success/failed and appended result. Failure, denial, cancel and recovery branches are explicit. Run terminal outcomes are completed, limit_reached, cancelled and failed. limit_reached preserves partial results and is not an error. Tool denial/failure is model feedback and does not automatically fail the Run. Cancellation is checked before budgets. Crash recovery is lease-scoped: startup registers the Worker and reclaims expired executions, so pending call audits become unknown; unfinished Runs become failed; partial tool groups are repaired, never replayed. The workspace instance lock only serializes write-mode processes. US19: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#244bd8"/></marker></defs>
-<rect width="1380" height="1690" fill="#f7f4eb"/>
+<rect width="1380" height="1840" fill="#f7f4eb"/>
 <g font-family="Arial, Microsoft YaHei, sans-serif" fill="#202b30">
 <text x="40" y="38" font-size="14" letter-spacing="2" fill="#244bd8">BASALT / EXECUTION FLOW</text>
 <text x="40" y="85" font-size="32" font-weight="600">One Run, with evidence at every boundary.</text>
@@ -109,7 +109,7 @@
 <text x="98" y="1216" font-size="16" fill="#5d6a70">Only ReActLoop appends assistant / tool messages</text>
 </g>
 <g data-node-id="recovery"><rect x="815" y="1140" width="485" height="128" rx="7" fill="#f0eee7" stroke="#bfc9cc" stroke-width="1.2"/>
-<text x="833" y="1168" font-size="20" font-weight="600">Crash recovery · instance lock required</text>
+<text x="833" y="1168" font-size="20" font-weight="600">Crash recovery · lease-scoped</text>
 <text x="833" y="1193" font-size="16" fill="#5d6a70">pending audit → unknown; running Run → failed</text>
 <text x="833" y="1216" font-size="16" fill="#5d6a70">Repair partial tool groups; no automatic replay</text>
 <text x="833" y="1239" font-size="16" fill="#5d6a70">Management-operation recovery uses its own proof</text>
@@ -125,6 +125,6 @@
 <text x="98" y="1586" font-size="16" fill="#5d6a70">Persist outcome and release resource references; audit terminal states remain separate</text>
 </g>
 <text x="40" y="1645" font-size="15" fill="#5d6a70">Budget checks are bounds, not retries. A tool failure is not automatically a failed Run; cancellation has priority.</text>
-<text x="40" y="1671" font-size="12" fill="#5d6a70">Source commit: ca9a0d29f185 · Current implementation</text>
-</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1344" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1765" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1800" font-size="18" fill="#202b30">PostgreSQL v8 holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
+<text x="40" y="1671" font-size="12" fill="#5d6a70">Source commit: 2bfcede9db06 · Current implementation</text>
+</g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="1700" width="1344" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="1730" font-size="21" fill="#202b30">US19 · optional durable sequential Flow</text><text x="36" y="1765" font-size="18" fill="#202b30">Published contract → bounded Worker → original Run / ToolExecutor → verification</text><text x="36" y="1800" font-size="18" fill="#202b30">Self-hosted PostgreSQL holds checkpoints, actions and evidence; unknown side effects are never replayed.</text></g>
 </svg>
