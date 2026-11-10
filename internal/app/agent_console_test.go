@@ -12,6 +12,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -19,11 +21,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/ymedword/basalt/internal/assets"
 	"github.com/ymedword/basalt/internal/core"
 	"github.com/ymedword/basalt/internal/storage/postgres"
 	"github.com/ymedword/basalt/internal/storage/postgres/pgtest"
@@ -59,9 +63,21 @@ type agentConsoleEnv struct {
 	logs      *bytes.Buffer
 }
 
+// consoleEnvParts 把夹具的两组依赖一起交给变参：发布回调归编辑器（写锁内发布），
+// 适配器只保留投影 / 生命周期等。
+// consoleEnvParts exposes both dependency sets to the variadic option.
+type consoleEnvParts struct {
+	console *AgentConsoleDeps
+	editor  *workspace.AgentEditorDeps
+}
+
 // newAgentConsoleEnv 建夹具；Agent `writer` 的 AGENT.md 已落盘，状态文件尚未建立。
+// 变参 opts 在构造编辑器与适配器之前改写依赖：需要真实发布链的用例因此不用另装一套
+// 夹具；既有调用点不传参，行为不变。
 // newAgentConsoleEnv builds the fixture; the agent file exists, the state file does not.
-func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
+// Variadic opts adjust the deps before construction, so tests that need the real publish
+// chain reuse the same fixture; existing call sites pass nothing and are unchanged.
+func newAgentConsoleEnv(t *testing.T, opts ...func(*agentConsoleEnv, *consoleEnvParts)) *agentConsoleEnv {
 	t.Helper()
 
 	root := filepath.Join(t.TempDir(), workspaceDirName)
@@ -76,31 +92,7 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 	gate := core.NewAgentGate()
 	lifecycle := workspace.NewLifecycleStore(root, baselineClock)
 	logger, logs := newCapturedLogger()
-	editor := workspace.NewAgentEditor(workspace.AgentEditorDeps{
-		Root:      root,
-		Gate:      gate,
-		Ops:       ops,
-		Snapshots: postgres.NewSnapshotStore(db),
-		Registry:  &consoleRegistry{entries: map[string]core.AgentEntry{}},
-		Scheduler: consoleSchedules{},
-		Validate:  consoleValidator,
-		Now:       baselineClock,
-	})
-	console := NewAgentConsole(AgentConsoleDeps{
-		// 内容写完之后按落盘文件重建绑定投影：夹具给真实现，判据才看得见"投影跟文件走"。
-		Root: root,
-		Projection: NewBindingProjection(postgres.NewBindingStore(db), versions,
-			postgres.NewAgentAdminStore(db), postgres.NewKnowledgeCatalogStore(db), root, logger, baselineClock),
-		Editor:     editor,
-		Lifecycle:  lifecycle,
-		Index:      versions,
-		Gate:       gate,
-		Operations: ops,
-		Logger:     logger,
-		Now:        baselineClock,
-	})
-	return &agentConsoleEnv{
-		console:   console,
+	env := &agentConsoleEnv{
 		root:      root,
 		db:        db,
 		ops:       ops,
@@ -109,6 +101,35 @@ func newAgentConsoleEnv(t *testing.T) *agentConsoleEnv {
 		gate:      gate,
 		logs:      logs,
 	}
+	editorDeps := workspace.AgentEditorDeps{
+		Root:      root,
+		Gate:      gate,
+		Ops:       ops,
+		Snapshots: postgres.NewSnapshotStore(db),
+		Registry:  &consoleRegistry{entries: map[string]core.AgentEntry{}},
+		Scheduler: consoleSchedules{},
+		Validate:  consoleValidator,
+		Now:       baselineClock,
+	}
+	deps := AgentConsoleDeps{
+		// 内容写完之后按落盘文件重建绑定投影：夹具给真实现，判据才看得见"投影跟文件走"。
+		Root: root,
+		Projection: NewBindingProjection(postgres.NewBindingStore(db), versions,
+			postgres.NewAgentAdminStore(db), postgres.NewKnowledgeCatalogStore(db), root, logger, baselineClock),
+		Lifecycle:  lifecycle,
+		Index:      versions,
+		Gate:       gate,
+		Operations: ops,
+		Logger:     logger,
+		Now:        baselineClock,
+	}
+	parts := &consoleEnvParts{console: &deps, editor: &editorDeps}
+	for _, opt := range opts {
+		opt(env, parts)
+	}
+	deps.Editor = workspace.NewAgentEditor(editorDeps)
+	env.console = NewAgentConsole(deps)
+	return env
 }
 
 // consoleRegistry 是注册表替换面的最小实现；Lookup 让编辑器在回滚路径上取旧条目。
@@ -327,6 +348,204 @@ func TestAgentConsole_UpdateContentRebuildsBindingProjection(t *testing.T) {
 		require.NoError(t, err, "身份缺失不得把已生效的写入改写成失败")
 		require.Contains(t, env.logs.String(), "重建绑定投影跳过")
 	})
+}
+
+// TestAgentConsole_UpdateContentPublishesBundle：保存即发布（2026-11-09 用户裁决，
+// 修订 D-25-10 的"内容写不发布"）——内容写成功后适配器必须用同一个 Agent 名与**真实
+// 操作主体**调用发布端口，并把发布结果随响应返回；条件写失败（ETag 过期）时不得发布；
+// 发布失败不回滚已生效的写入，但必须留 ERROR、响应带 failed 与固定提示。
+// The console content write publishes with the request actor and reports the outcome;
+// a failed conditional write publishes nothing, and a failed publish never rewrites a
+// committed write.
+func TestAgentConsole_UpdateContentPublishesBundle(t *testing.T) {
+	t.Parallel()
+
+	t.Run("publishes_after_successful_write", func(t *testing.T) {
+		t.Parallel()
+		var published []string
+		var actors []core.Actor
+		env := newAgentConsoleEnv(t, func(_ *agentConsoleEnv, parts *consoleEnvParts) {
+			parts.editor.PublishBundle = contentPublishHook(parts.console.Logger,
+				func(_ context.Context, agent string, actor core.Actor) (int64, error) {
+					published = append(published, agent)
+					actors = append(actors, actor)
+					return 42, nil
+				})
+		})
+		bootstrapConsoleAgent(t, env)
+
+		actor := consoleActor()
+		current, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		files, err := env.console.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Content: strings.Replace(consoleAgentContent, "写手", "记者", 1)},
+			current.ETag, actor)
+		require.NoError(t, err)
+		require.Equal(t, []string{"writer"}, published, "保存成功必须发布一次")
+		require.Equal(t, []core.Actor{actor}, actors, "发布必须透传本次请求的真实操作主体")
+		require.Equal(t, core.AgentPublishStatusPublished, files.Publish.Status)
+		require.EqualValues(t, 42, files.Publish.VersionID, "响应必须带回发布版本号")
+		require.Empty(t, files.Publish.Error)
+
+		_, err = env.console.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Content: consoleAgentContent}, "sha256:stale", actor)
+		require.Error(t, err, "过期 ETag 必须按条件写失败")
+		require.Equal(t, []string{"writer"}, published, "写入未生效时不得发布")
+	})
+
+	t.Run("publish_failure_keeps_write_and_logs", func(t *testing.T) {
+		t.Parallel()
+		env := newAgentConsoleEnv(t, func(_ *agentConsoleEnv, parts *consoleEnvParts) {
+			parts.editor.PublishBundle = contentPublishHook(parts.console.Logger,
+				func(context.Context, string, core.Actor) (int64, error) {
+					return 0, errors.New("共享发布记录不可用")
+				})
+		})
+		bootstrapConsoleAgent(t, env)
+
+		current, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		replacement := strings.Replace(consoleAgentContent, "写手", "编辑", 1)
+		files, err := env.console.UpdateContent(context.Background(), "writer",
+			core.AgentContentUpdate{Content: replacement}, current.ETag, consoleActor())
+		require.NoError(t, err, "发布失败不得把已生效的写入改写成失败")
+		require.Equal(t, "writer", files.Agent)
+		// 发布失败必须页面可见：状态 + 固定提示，且不得把底层错误原文（可能含路径）
+		// 带进响应。
+		require.Equal(t, core.AgentPublishStatusFailed, files.Publish.Status)
+		require.NotEmpty(t, files.Publish.Error)
+		require.NotContains(t, files.Publish.Error, "共享发布记录不可用",
+			"底层错误只进日志，响应只给固定提示")
+
+		onDisk, readErr := os.ReadFile(filepath.Join(env.root, "agents", "writer", "AGENT.md"))
+		require.NoError(t, readErr)
+		require.Equal(t, replacement, string(onDisk), "发布失败不得回滚工作副本")
+		require.Contains(t, env.logs.String(), "publish agent bundle after content update failed")
+		require.Contains(t, env.logs.String(), slog.LevelError.String())
+	})
+
+	t.Run("save_waits_for_inflight_publish", func(t *testing.T) {
+		t.Parallel()
+		// 并发顺序：第一次发布被挂起时，第二次保存必须等在门外，不能抢先写盘——
+		// 否则"后完成的发布构建了较早写入的内容"会让共享指针倒退。
+		// A save must not overtake an in-flight publication of the same agent.
+		started := make(chan struct{})
+		release := make(chan struct{})
+		var calls int32
+		env := newAgentConsoleEnv(t, func(_ *agentConsoleEnv, parts *consoleEnvParts) {
+			parts.editor.PublishBundle = contentPublishHook(parts.console.Logger,
+				func(ctx context.Context, _ string, _ core.Actor) (int64, error) {
+					if atomic.AddInt32(&calls, 1) == 1 {
+						close(started)
+						select {
+						case <-release:
+						case <-ctx.Done():
+							return 0, ctx.Err()
+						}
+					}
+					return 1, nil
+				})
+		})
+		bootstrapConsoleAgent(t, env)
+
+		current, err := env.console.ReadContent(context.Background(), "writer")
+		require.NoError(t, err)
+		staleETag := current.ETag
+
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := env.console.UpdateContent(context.Background(), "writer",
+				core.AgentContentUpdate{Content: strings.Replace(consoleAgentContent, "写手", "甲", 1)},
+				staleETag, consoleActor())
+			firstDone <- err
+		}()
+		<-started // 第一次保存已写盘，发布进行中
+
+		secondDone := make(chan error, 1)
+		go func() {
+			// 用同一份过期 ETag：串行化生效时它会先等发布结束，再按条件写失败。
+			_, err := env.console.UpdateContent(context.Background(), "writer",
+				core.AgentContentUpdate{Content: strings.Replace(consoleAgentContent, "写手", "乙", 1)},
+				staleETag, consoleActor())
+			secondDone <- err
+		}()
+
+		select {
+		case <-secondDone:
+			t.Fatal("第二次保存不得越过在途发布")
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(release)
+		require.NoError(t, <-firstDone)
+		require.Error(t, <-secondDone, "发布结束后，过期 ETag 仍必须按条件写失败")
+	})
+}
+
+// TestAgentConsole_UpdateContentPublishesBundleRecord：接上**真实**发布链之后，保存
+// 成功即意味着共享记录与工作副本逐字一致——准入的 `checkDefinitionMatchesBundle`
+// 比对的正是这两处字节。2026-11-09 用户报告的症状（控制台改完内容，下一次 Run 报
+// 「本地资产包与共享发布记录不一致」）在这里钉成回归用例：旧的"内容写不发布"行为
+// 会让本用例在共享指针 / 清单哈希处失败。
+// With the real publish chain installed, a committed console save leaves the shared
+// record pinning the saved definition bytes — the exact pair admission compares.
+func TestAgentConsole_UpdateContentPublishesBundleRecord(t *testing.T) {
+	t.Parallel()
+	bundleRoot := filepath.Join(t.TempDir(), "bundles")
+	env := newAgentConsoleEnv(t, func(env *agentConsoleEnv, parts *consoleEnvParts) {
+		parts.editor.PublishBundle = contentPublishHook(parts.console.Logger,
+			func(ctx context.Context, agent string, actor core.Actor) (int64, error) {
+				return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
+					Root:         env.root,
+					BundleRoot:   bundleRoot,
+					Versions:     env.versions,
+					Operations:   env.ops,
+					Payloads:     postgres.NewAssetDistributionStore(env.db),
+					PayloadStore: postgres.NewBundlePayloadStore(env.db),
+					MaxBytes:     defaultPayloadMaxBytes,
+					Actor:        actor,
+					Logger:       parts.console.Logger,
+					Now:          baselineClock,
+				}, agent)
+			})
+	})
+	bootstrapConsoleAgent(t, env)
+	// 发布要求生命周期索引里有身份：启用一次，把状态文件的 AgentUID 写进索引
+	// （生产装配里这一步由创建 / 启用路径完成）。
+	_, err := env.console.Transition(context.Background(), "writer", core.AgentActive,
+		core.AgentLifecycleTransition{ExpectedState: core.AgentDisabled, ExpectedGeneration: 1},
+		consoleActor())
+	require.NoError(t, err)
+
+	current, err := env.console.ReadContent(context.Background(), "writer")
+	require.NoError(t, err)
+	replacement := strings.Replace(consoleAgentContent, "写手", "终审", 1)
+	_, err = env.console.UpdateContent(context.Background(), "writer",
+		core.AgentContentUpdate{Content: replacement}, current.ETag, consoleActor())
+	require.NoError(t, err)
+
+	uid, _, ok, err := env.versions.AgentIdentity(context.Background(), "writer")
+	require.NoError(t, err)
+	require.True(t, ok, "启用后索引里必须有身份")
+	pointer, err := env.versions.PointerByUID(context.Background(), core.ResourceAgentBundle,
+		core.ResourceUID(uid))
+	require.NoError(t, err, "保存后必须已发布 agent_bundle 指针")
+	require.Nil(t, pointer.DeletedAt)
+	version, err := env.versions.VersionByID(context.Background(), pointer.PublishedVersionID)
+	require.NoError(t, err)
+
+	dir, err := assets.Resolve(context.Background(), bundleRoot, "writer", version.ContentHash)
+	require.NoError(t, err)
+	manifest, err := assets.Verify(context.Background(), dir)
+	require.NoError(t, err)
+	sum := sha256.Sum256([]byte(replacement))
+	want := hex.EncodeToString(sum[:])
+	var got string
+	for _, file := range manifest.ConfigFiles {
+		if file.Path == "agents/writer/AGENT.md" {
+			got = file.SHA256
+		}
+	}
+	require.Equal(t, want, got, "bundle 清单必须钉住保存后的定义字节")
 }
 
 // TestAgentConsole_TransitionEnableWritesOperationAndIndex：启用先写 pending 再动状态

@@ -1,6 +1,6 @@
 ---
-title: Architecture — Independent agents on a shared foundation
-description: "The current single-node Agent OS: system boundaries, five core capabilities, execution, module dependencies and deployment."
+title: Architecture — Basalt, self-hosted Agent OS
+description: "The Compose multi-Worker Agent OS: system boundaries, five core capabilities, execution, published-asset distribution, module dependencies and deployment."
 ---
 
 <!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","DiagramFigure"]}} -->
@@ -11,19 +11,23 @@ Basalt hosts multiple independent business agents on a unified Go runtime and ma
 
 ## Project architecture {#overview}
 
-The project uses five logical layers: access, application, execution engine, infrastructure services and storage. Independent Agents are managed objects in the application layer, alongside lifecycle, resource and scheduling services. Security, budgets and auditing apply across layers. External model endpoints, MCP/HTTP systems, local subprocesses and notification destinations sit outside the Go runtime boundary.
+The project uses five logical layers: access, application, execution engine, infrastructure services and storage. Independent Agents are managed objects in the application layer, alongside lifecycle, resource and scheduling services. A `serve` control plane owns the HTTP API, the embedded console and asset publication; `gateway` Workers claim due executions and run them without an HTTP listener. Security, budgets and auditing apply across layers. External model endpoints, MCP/HTTP systems, local subprocesses and notification destinations sit outside the Go runtime boundary.
 
 <DiagramFigure id="project-overview" />
 
 | Layer | Responsibilities |
 | --- | --- |
 | Access | CLI, HTTP API and the embedded console |
-| Application | Agent definitions and lifecycle, resource management, Run admission and task scheduling |
-| Execution engine | PromptBuilder, ReActLoop and ToolExecutor |
+| Application | Agent definitions and lifecycle, resource management, Run admission, task scheduling and published asset bundles |
+| Execution engine | PromptBuilder, ReActLoop and ToolExecutor on every Worker |
 | Infrastructure services | Model adapters, memory, built-in/MCP tools, skills and notifications |
-| Storage | Embedded SQLite and workspace files |
+| Storage | One self-hosted PostgreSQL for runtime state and audit, plus per-node workspace files and content-addressed asset bundles |
 
 The layers describe runtime responsibilities. Actual Go import directions are shown separately in the package-dependency view. Both Agent examples reuse the engine and infrastructure services, with separate declarations, sessions and scoped memory. CLI writers and serve share an exclusive workspace lock.
+
+### Published assets and Workers
+
+A control-plane publication writes the payload first and then moves the pointer, so a Worker never reads a half-published version. Workers synchronize the immutable bundle, materialize its skills, prepare resources and refresh the registry before claiming work; they install bundles by content hash and never publish. Each claimed execution pins one bundle hash, and admission verifies that exact directory before dispatch. A publication that arrives while a Worker is executing leaves the in-flight Run on its pinned version; new Runs use the new one.
 
 ## Five core capabilities {#capabilities}
 
@@ -69,7 +73,7 @@ The compact summary below is also used in the README. Four additional views expl
 | Execution flow | How a request moves through model calls, tools, auditing and stopping |
 | Module map | How model access, execution, memory, tools and web services divide responsibilities |
 | Go package dependencies | Actual import directions and source-code boundaries |
-| Deployment | Connections between the Go process, local data, browser and external services |
+| Deployment | Compose multi-Worker: the control plane, Workers, shared PostgreSQL and per-node files |
 
 <DiagramFigure id="system-architecture" />
 
@@ -83,7 +87,7 @@ The compact summary below is also used in the README. Four additional views expl
 
 ## Current scope {#current-scope}
 
-This version provides single-node, multi-agent hosting. Opt-in durable sequential flows coordinate immutable published steps through the original Run and audit path. Unknown side effects stop advancement. Parallel graphs, multi-node distributed execution, automatic learning, enterprise SSO and multi-tenant governance remain outside this version. Logical scopes do not provide process or container fault isolation. Data sent to model endpoints and external tools follows their configured services.
+This version provides Compose multi-Worker hosting: a control plane, one or more Workers and one shared PostgreSQL, with published assets distributed automatically and pinned per execution. The single-instance Compose file remains the default. Opt-in durable sequential flows coordinate immutable published steps through the original Run and audit path; unknown side effects stop advancement. Kubernetes, database high availability and cross-node business-state sharing remain outside this version, as do parallel graphs, automatic learning, enterprise SSO and multi-tenant governance. Logical scopes do not provide process or container fault isolation. Data sent to model endpoints and external tools follows their configured services.
 
 ## Opt-in task isolation
 

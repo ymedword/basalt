@@ -68,6 +68,15 @@ func newMCPLink(server string) *mcpLink {
 	return &mcpLink{server: server}
 }
 
+// isLive 回答这一代门是否仍在正常服务（US-25C §2.3.8 P1 的复用判据之一）：排空 /
+// 关闭态都不能算"连接仍可用"，否则复用会把新调用交给一代正在退场的连接。
+// isLive reports whether the gate still accepts new calls; draining and closed do not.
+func (l *mcpLink) isLive() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.state == mcpLinkLive
+}
+
 // enter 登记一次在途调用；非 live 时返回固定短语的 `*core.ExternalError`。
 // enter registers one call or refuses it with a fixed-phrase external error.
 func (l *mcpLink) enter() error {

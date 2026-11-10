@@ -1,6 +1,6 @@
 ---
-title: 文档 — 理解与使用 Basalt
-description: 理解 Basalt 的 Agent OS 定位、独立 Agent 与共享底座、当前能力、使用入口和未来方向。
+title: 文档 — Basalt｜企业自托管 Agent OS
+description: 理解 Basalt 的 Agent OS 定位、独立 Agent 与共享底座、当前能力、工程验证、使用入口和未来方向。
 ---
 
 <!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script","TemplateTable"]}} -->
@@ -44,7 +44,8 @@ Basalt 用一个 Go 应用承接后两个层次。模型提出动作，运行时
 - 按 Agent 管理定时任务，并向配置的通知渠道投递结果。
 - 按需启用持久顺序流程：固定任务契约、有界 Agent／工具／子流程节点、原运行与审计关联、证据验收及未知副作用阻断。
 - 内嵌管理台、HTTP API、执行记录，以及模型与工具调用审计。
-- 单节点 Go 运行时、自托管 PostgreSQL（vector／pg_trgm 扩展）与本地文件；内置工具分别执行文件、命令和网络访问策略。
+- Go 运行时可以作为控制面（`serve`）与可选 Worker（`gateway`）运行，共用自托管 PostgreSQL（vector／pg_trgm 扩展）；内置工具分别执行文件、命令和网络访问策略。
+- 已发布资产分发：控制面为每个 Agent 发布不可变资产包，Worker 按内容哈希安装，每次领取的执行固定版本，且从不发布资产。
 
 长期记忆在 save_memory 成功时保存。会话历史是另一类记录，普通对话不会自动晋升为长期记忆。模型与外部工具会按所配置的服务接收相应请求数据。
 
@@ -57,7 +58,7 @@ Basalt 用一个 Go 应用承接后两个层次。模型提出动作，运行时
 | Agent | 具备独立定义、资源声明与作用域状态的业务执行者 |
 | Run | 一次请求或定时任务的有界执行，有独立的结果记录 |
 | Session（会话） | 持久保存的对话，可以包含多次 Run |
-| Workspace（工作区） | 实例的数据目录，默认是 .basalt/，保存数据库、Agent 定义与配套文件 |
+| Workspace（工作区） | 实例的数据目录，默认是 .basalt/，保存 Agent 定义与配套文件；运行状态与审计保存在 PostgreSQL |
 | Resource（资源） | 可复用的模型连接、MCP 服务、技能或通知渠道；符合资格的发布版本绑定到 Agent，在执行时解析使用 |
 
 ## 开始使用
@@ -94,6 +95,23 @@ Basalt 用一个 Go 应用承接后两个层次。模型提出动作，运行时
 
 <TemplateTable section="catalog" />
 
+## 工程验证与自动化验收 {#verification}
+
+下列检查都存在于本仓库；证据来自实际运行，不用文字宣称代替。`make check` 是七目标完成口径：格式、静态检查、安全、竞态测试、PostgreSQL 集成、覆盖率底线和发布构建；`make acceptance` 在此基础上再跑固定行为与注入评测。
+
+| 检查 | 命令 | 落地位置 |
+| --- | --- | --- |
+| 格式 | `make fmt` | [scripts/check-format.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-format.sh) |
+| 静态检查与命名 | `make lint` | [Makefile](https://github.com/ymedword/basalt/blob/main/Makefile)、[internal/app](https://github.com/ymedword/basalt/tree/main/internal/app) |
+| 单元与竞态测试 | `make test` | [internal/core](https://github.com/ymedword/basalt/tree/main/internal/core) |
+| PostgreSQL 集成 | `make test-integration`（需要 `BASALT_TEST_PG_DSN`；缺 DSN 直接失败，不跳过） | [internal/storage/postgres](https://github.com/ymedword/basalt/tree/main/internal/storage/postgres) |
+| 覆盖率底线 | `make cover` | [scripts/check-coverage.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-coverage.sh) |
+| 候选二进制的发布场景 | `make e2e` | [internal/e2e](https://github.com/ymedword/basalt/tree/main/internal/e2e) |
+| 完整验收 | `make acceptance` | [scripts/check-acceptance.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-acceptance.sh) |
+| 固定字面量 | 契约文件 | [schema.sql](https://github.com/ymedword/basalt/blob/main/docs/contracts/schema.sql)、[run-and-errors.md](https://github.com/ymedword/basalt/blob/main/docs/contracts/run-and-errors.md)、[openapi.yaml](https://github.com/ymedword/basalt/blob/main/docs/contracts/openapi.yaml) |
+
+首页的 CLI 动画是明确标注的本地夹具：它展示执行链路，不代表模型效果。真实模型与外部服务调用不在上述门禁内。
+
 ## 未来方向 {#roadmap}
 
 目标是形成面向企业自托管的 Agent OS，让任务能够被执行、验证、追踪和持续改进。**以下内容属于规划，尚未成为当前能力，也没有交付日期承诺。**
@@ -103,11 +121,11 @@ Basalt 用一个 Go 应用承接后两个层次。模型提出动作，运行时
 | 知识与记忆 | 按权限使用私有资料，提供可追溯引用、语义检索和完整的更新／删除生命周期 | 规划；能力建设第一优先 |
 | 诊断与任务编排 | 解释任务失败，持久保存长任务进度，支持有界委托与修订 | 规划 |
 | 执行隔离与受控学习 | 先建立隔离、评测与准入，再生成可复用技能候选；批准的改动有版本且能回滚 | 规划 |
-| 分布式执行 | 将状态外置，在多个节点之间协调任务归属、预算与恢复 | 规划 |
+| K8s 与数据库 HA | 在 Kubernetes 上运行同一套分发模型，并增加数据库高可用 | 规划；Compose 多 Worker 已交付 |
 | 企业治理与接入 | 补齐企业身份、角色、租户／项目范围、审计查询、配额、审批和更多渠道接入 | 规划 |
 | 目标到产物的任务交付 | 围绕业务目标组织专业 Agent，以可追溯产物和有界复核完成交付 | 长期方向 |
 
-知识与记忆优先推进，诊断为后续编排提供基础；隔离与学习准入先于受控能力更新，分布式和完整企业治理在这些基础上继续建设。每个方向都需要独立设计评审和可复现验证，不能在当前版本中通过打开一个配置开关直接获得。
+知识与记忆优先推进，诊断为后续编排提供基础；隔离与学习准入先于受控能力更新，K8s 与数据库 HA 在已交付的 Compose 多 Worker 模型上扩展，完整企业治理继续建设。每个方向都需要独立设计评审和可复现验证，不能在当前版本中通过打开一个配置开关直接获得。
 
 ## 项目
 

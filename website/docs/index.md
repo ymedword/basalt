@@ -1,6 +1,6 @@
 ---
-title: Documentation — Understand and use Basalt
-description: "What Basalt's Agent OS does, how independent agents share a runtime, current capabilities, guides and future direction."
+title: Documentation — Basalt, self-hosted Agent OS
+description: "What Basalt's Agent OS does, how independent agents share a runtime, current capabilities, engineering verification and future direction."
 ---
 
 <!-- markdownlint-configure-file {"MD025":{"front_matter_title":""},"MD033":{"allowed_elements":["a","script","TemplateTable"]}} -->
@@ -44,7 +44,8 @@ Basalt combines the last two layers in a Go application. The model proposes acti
 - Per-Agent schedules and delivery to configured notification channels.
 - Opt-in durable sequential flows: immutable task contracts, bounded Agent/tool/subflow steps, original Run/audit links, evidence verification and unknown-side-effect stops.
 - An embedded management console, HTTP API, execution records and model/tool call audit.
-- A single-node Go runtime backed by self-hosted PostgreSQL (vector and pg_trgm extensions) and local files; built-in tools use their respective file, command and network policies.
+- A Go runtime that runs as a control plane (`serve`) plus optional Workers (`gateway`) over one self-hosted PostgreSQL (vector and pg_trgm extensions); built-in tools use their respective file, command and network policies.
+- Published asset distribution: the control plane publishes an immutable bundle per Agent, Workers install it by content hash, pin each claimed execution and never publish assets.
 
 Long-term memory is saved when save_memory succeeds. Session history is a separate record; ordinary conversation is not automatically promoted to long-term memory. External models and tools may receive request data according to their configured services.
 
@@ -57,7 +58,7 @@ The management token is basic management authentication. Personal accounts, SSO 
 | Agent | A named business worker with its own definition, resource declarations and scoped state |
 | Run | One bounded execution of a request or scheduled task, with a recorded outcome |
 | Session | A persisted conversation that can contain multiple Runs |
-| Workspace | The instance's local data directory, .basalt/ by default, containing the database, Agent definitions and supporting files |
+| Workspace | The instance's local data directory, .basalt/ by default, holding Agent definitions and supporting files; runtime state and audit live in PostgreSQL |
 | Resource | A reusable model connection, MCP service, skill or notification channel; eligible published versions are bound to an Agent and resolved for execution |
 
 ## Get started
@@ -94,6 +95,23 @@ The console lists six MCP recipes: GitHub, Brave Search, Fetch, Playwright, read
 
 <TemplateTable section="catalog" />
 
+## Engineering verification {#verification}
+
+The checks below exist in this repository; running them produces the evidence, and no prose badge replaces a run. `make check` is the seven-gate definition of done: format, static analysis, security, race tests, PostgreSQL integration, coverage floors and the release build. `make acceptance` runs that gate plus the fixed behaviour and injection evaluations.
+
+| Check | Command | Enforced by |
+| --- | --- | --- |
+| Formatting | `make fmt` | [scripts/check-format.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-format.sh) |
+| Static analysis and naming | `make lint` | [Makefile](https://github.com/ymedword/basalt/blob/main/Makefile), [internal/app](https://github.com/ymedword/basalt/tree/main/internal/app) |
+| Unit and race tests | `make test` | [internal/core](https://github.com/ymedword/basalt/tree/main/internal/core) |
+| PostgreSQL integration | `make test-integration` (requires `BASALT_TEST_PG_DSN`; it fails closed instead of skipping) | [internal/storage/postgres](https://github.com/ymedword/basalt/tree/main/internal/storage/postgres) |
+| Coverage floors | `make cover` | [scripts/check-coverage.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-coverage.sh) |
+| Release scenarios against the built binary | `make e2e` | [internal/e2e](https://github.com/ymedword/basalt/tree/main/internal/e2e) |
+| Full acceptance | `make acceptance` | [scripts/check-acceptance.sh](https://github.com/ymedword/basalt/blob/main/scripts/check-acceptance.sh) |
+| Fixed literals | contract files | [schema.sql](https://github.com/ymedword/basalt/blob/main/docs/contracts/schema.sql), [run-and-errors.md](https://github.com/ymedword/basalt/blob/main/docs/contracts/run-and-errors.md), [openapi.yaml](https://github.com/ymedword/basalt/blob/main/docs/contracts/openapi.yaml) |
+
+The CLI animation on the home page is a labelled local fixture: it demonstrates the execution path, not model quality. Real model and external-service runs are outside these gates.
+
 ## Future direction {#roadmap}
 
 The direction is an enterprise self-hosted Agent OS where tasks can be executed, checked, traced and improved. **The following entries are planned work, not current capabilities; no delivery date is committed.**
@@ -103,11 +121,11 @@ The direction is an enterprise self-hosted Agent OS where tasks can be executed,
 | Knowledge and memory | Use private material with permission checks, traceable citations, semantic retrieval and a complete update/delete lifecycle | Planned; first capability priority |
 | Diagnostics and task orchestration | Explain task failures, persist long-task progress and support bounded delegation and revision | Planned |
 | Execution isolation and controlled learning | Establish isolation, evaluation and approval before proposing reusable skills; version and roll back accepted changes | Planned |
-| Distributed execution | Externalize state and coordinate task ownership, budgets and recovery across nodes | Planned |
+| Kubernetes and database HA | Run the same distributed model on Kubernetes and add database high availability | Planned; Compose multi-Worker is delivered |
 | Enterprise governance and integrations | Add enterprise identity, roles, tenant/project boundaries, audit queries, quotas, approvals and richer channel access | Planned |
 | Goal-to-deliverable workflows | Organize specialist Agents around a business goal with traceable artifacts and bounded review | Longer-term direction |
 
-Knowledge and memory come first. Diagnostics support later orchestration; isolation and learning admission precede controlled capability updates. Distributed execution and enterprise governance build on those foundations. Each area needs its own design review and reproducible validation. Features described here are not enabled by changing a configuration switch in the current version.
+Knowledge and memory come first. Diagnostics support later orchestration; isolation and learning admission precede controlled capability updates. Kubernetes and database HA extend the delivered Compose multi-Worker model; enterprise governance builds on the same foundations. Each area needs its own design review and reproducible validation. Features described here are not enabled by changing a configuration switch in the current version.
 
 ## Project
 

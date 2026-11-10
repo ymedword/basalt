@@ -184,15 +184,26 @@ func (b *localRebuilder) RebuildMCP(ctx context.Context, target core.ResourceVer
 			target.Name, version.ID, cfg.Name)
 	}
 	// 凭据只按**声明来源**取：managed 取不到即失败，**不**回落进程环境（与启动解析同一
-	// 口径）；解析出的值用完立刻归零，不留在重建路径的局部变量之外。
-	// Values are resolved by the declared source only and zeroed right after use.
+	// 口径）；解析出的值用完立刻归零，不留在重建路径的局部变量之外。代次冻结先于解析
+	// （与 `publishedMCPServers` 同一理由，US-25C §2.3.8 P6）：窗口内换代最多多重建一次，
+	// 反序则可能把新代次配旧明文记进连接。
+	// Values are resolved by the declared source only and zeroed right after use; the
+	// generation is frozen first so a race errs toward one extra rebuild.
+	frozen, err := b.mcpCreds.Freeze(ctx, target.Name, version.ResourceUID, cfg)
+	if err != nil {
+		return err
+	}
 	values, err := b.mcpCreds.Resolve(ctx, target.Name, version.ResourceUID, cfg)
 	if err != nil {
 		return err
 	}
 	resolved := ApplyResolvedMCP(cfg, values)
 	ZeroMCPCredentialValues(values)
-	published := core.PublishedMCPServer{VersionID: version.ID, Config: resolved}
+	published := core.PublishedMCPServer{
+		VersionID:            version.ID,
+		CredentialGeneration: mcpCredentialGeneration(frozen),
+		Config:               resolved,
+	}
 	if err := b.mcp.supervisor.RebuildAtApplied(context.WithoutCancel(ctx), published); err != nil {
 		return err
 	}

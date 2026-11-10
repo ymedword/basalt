@@ -28,10 +28,13 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -739,12 +742,15 @@ func (s *MCPCredentialService) resolveManaged(ctx context.Context, serverName st
 }
 
 // mcpCredentialFreeze 是一个槽位在 apply 第 2 步的冻结读数：来源模式与被引用托管凭据
-// 的版本号 / 主密钥 key_id。`env` 槽位没有版本可冻，撤销判定对它不适用（环境变量不是
-// 版本化资源）。
-// mcpCredentialFreeze is one slot's frozen reading; env slots have no version to freeze.
+// 的实体身份 / 版本号 / 主密钥 key_id。`env` 槽位没有版本可冻，撤销判定对它不适用
+// （环境变量不是版本化资源）。`id` 让"同一槽位换了一条托管凭据"也能被代次判据发现
+// （US-25C §2.3.8 P6）：只比版本号会漏掉"删旧建新"后版本号恰好相同的形态。
+// mcpCredentialFreeze is one slot's frozen reading; the identity id makes a credential
+// replaced at the same version number visible to the generation check.
 type mcpCredentialFreeze struct {
 	key       string
 	mode      core.CredentialMode
+	id        string
 	versionNo int
 	keyID     string
 }
@@ -782,6 +788,7 @@ func (s *MCPCredentialService) Freeze(ctx context.Context, serverName string,
 				return nil, identityErr
 			}
 			if found {
+				entry.id = identity.ID
 				entry.versionNo = identity.CurrentVersion
 				entry.keyID = identity.KeyID
 			}
@@ -789,6 +796,26 @@ func (s *MCPCredentialService) Freeze(ctx context.Context, serverName string,
 		frozen = append(frozen, entry)
 	}
 	return frozen, nil
+}
+
+// mcpCredentialGeneration 把一组冻结读数压成一个稳定的代次摘要（US-25C §2.3.8 P6）：
+// 排序后的 key / mode / id / versionNo / keyID 参与 sha256，与连接无关的易变字段
+// （解析时间戳、值本身）**不得**进入——否则每轮都会判成"换代"，退化成周期性重连。
+// 空集合给空串：没有槽位就没有代次可判，两侧都为空即"相符"。
+// mcpCredentialGeneration derives a stable digest of the frozen readings so a rotation
+// at an unchanged version is visible; volatile or connection-irrelevant fields stay out.
+func mcpCredentialGeneration(frozen []mcpCredentialFreeze) string {
+	if len(frozen) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(frozen))
+	for _, entry := range frozen {
+		lines = append(lines, fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%s",
+			entry.key, entry.mode, entry.id, entry.versionNo, entry.keyID))
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(sum[:])
 }
 
 // StillCurrent 判定冻结的托管凭据是否仍然全部有效（第 6 步的撤销校验）：任一槽位换了

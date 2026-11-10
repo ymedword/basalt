@@ -54,9 +54,12 @@ import (
 // 9 adds the sandbox execution ledger; 10 adds the skill admission ledgers;
 // 11 adds the memory learning ledgers and widens the source/purpose closed sets;
 // 12 adds worker nodes, execution leases with their transition log, DB-claimed scheduling
-// columns and indexes, the cross-worker cancel flag, and the agent_bundle resource kind.
+// columns and indexes, the cross-worker cancel flag, and the agent_bundle resource kind;
+// 13 = `0013_agent_bundle_payloads.sql`（已发布 bundle 的内容寻址载荷表、
+// `worker_nodes.heartbeat_interval_seconds`、`resource_pointers` 键集索引、
+// `task_executions.pinned_bundle_hash` 与到期扫描的非 NULL 段索引）。
 // Migrations are append-only: published scripts are never rewritten.
-const SupportedSchemaVersion = 12
+const SupportedSchemaVersion = 13
 
 // undefinedTableSQLState 是 PostgreSQL 的 `undefined_table`（42P01）：它把"版本表不存在"
 // 从其他查询失败里区分出来，避免把连接故障误判成"未初始化"。
@@ -162,9 +165,31 @@ var capabilityProbes = map[string]func(extSchema string) string{
 
 // Open 装配唯一运行后端：连接 → 扩展能力 → schema（建库 / 前向迁移），任一失败即拒绝
 // 启动。**没有**降级分支：不回退 SQLite、不重试成循环、不自动修补结构。
-// Open assembles the single runtime backend; every prerequisite is fail-closed with no
-// degraded branch.
+// 这是**控制面**入口：它拥有迁移权（migrate.go 的 `DB.Migrate`）。Worker 走
+// `OpenForWorker`——共享定义的迁移权只归控制面，见该函数的说明。
+// Open assembles the control-plane runtime backend; every prerequisite is fail-closed
+// with no degraded branch. Workers use OpenForWorker instead.
 func Open(ctx context.Context, cfg Config) (*DB, error) {
+	return openWith(ctx, cfg, true)
+}
+
+// OpenForWorker 装配 **Worker** 后端：连接 → 扩展能力 → **精确版本校验**，不迁移。
+//
+// 为什么单列一个入口：迁移会写共享 schema（建表、加列、回填），那是控制面的职责；
+// Worker 只允许读共享定义与写执行协调列。要求 `current == SupportedSchemaVersion`
+// （精确相等）而不是"低于就迁"——低一版说明控制面还没升级完，Worker 必须失败退出
+// 并点名先启动控制面，**不得**自行前向迁移，也不得容忍"差一点也能跑"。
+// 库版本高于二进制同样是拒绝（旧二进制不得打开新库）。
+// OpenForWorker opens the worker-side backend: connection, extension check and an
+// exact schema-version equality check. It never migrates — schema evolution belongs to
+// the control plane, and a mismatch is a fail-closed startup error.
+func OpenForWorker(ctx context.Context, cfg Config) (*DB, error) {
+	return openWith(ctx, cfg, false)
+}
+
+// openWith 是两个入口的共同装配序列；`migrate` 只决定最后一步是迁移还是精确版本校验。
+// openWith is the shared assembly sequence; migrate only chooses the last step.
+func openWith(ctx context.Context, cfg Config, migrate bool) (*DB, error) {
 	pool, err := openPool(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -178,6 +203,12 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	// 扩展先于建表：新库的 `vector(n)` 列依赖扩展已安装（设计 图 1 的顺序不是随意的）。
 	if err := CheckExtensions(ctx, pool, requiredExtensions); err != nil {
 		return nil, closeOnError(db, err)
+	}
+	if !migrate {
+		if err := verifySchemaVersionExact(ctx, pool, SupportedSchemaVersion); err != nil {
+			return nil, closeOnError(db, err)
+		}
+		return db, nil
 	}
 	// 建库与前向迁移在 advisory 锁内完成（migrate.go 的 `DB.Migrate`）；失败整体回滚。
 	// `db migrate` 与这里走的是**同一个**方法——测试与运维看到的行为不来自两套实现。
@@ -423,6 +454,37 @@ func verifySchemaVersion(ctx context.Context, q Queryer, target int) error {
 	}
 	// 1 <= current < target：前向迁移由 ensureSchema 在 advisory lock 内完成。
 	return nil
+}
+
+// verifySchemaVersionExact 是 **Worker 入口**的版本判定：要求 `current` 与 `target`
+// **精确相等**，不迁移、不放行低版本。
+//
+// 为什么不复用 `verifySchemaVersion`：那个函数的语义是"能不能从这里前向迁到 target"，
+// `1 ≤ current < target` 是**允许**的（随后由 ensureSchema 迁移）；Worker 恰恰不能迁移，
+// 把那个判定搬过来会让"控制面还没升级完"的库被 Worker 当成可以启动。
+// 失败文案点名动作：版本表缺失 / 版本更低 → 先由控制面启动完成初始化与迁移；
+// 版本更高 → 旧二进制不得打开新库（与 `ErrSchemaTooNew` 同一语义）。
+// verifySchemaVersionExact is the worker-side verdict: exact equality, never a migration.
+func verifySchemaVersionExact(ctx context.Context, q Queryer, target int) error {
+	if target < 1 {
+		return fmt.Errorf("postgres: 目标版本 %d 非法——版本从 1 起", target)
+	}
+	current, err := schemaVersion(ctx, q)
+	if errors.Is(err, core.ErrDatabaseMissing) {
+		return fmt.Errorf("%w: 库尚未初始化——Worker 不执行建库 / 迁移，请先启动控制面完成初始化", core.ErrDatabaseMissing)
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case current == target:
+		return nil
+	case current > target:
+		return fmt.Errorf("%w: 库版本 %d 高于二进制支持的 %d——旧二进制不得打开新库",
+			core.ErrSchemaTooNew, current, target)
+	default:
+		return fmt.Errorf("库版本 %d 低于二进制要求的 %d——Worker 不执行迁移，请先由控制面完成升级", current, target)
+	}
 }
 
 // schemaVersion 读 `schema_version` 的最大版本。版本表不存在映射成

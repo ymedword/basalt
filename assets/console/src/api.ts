@@ -152,6 +152,17 @@ export interface AgentToolChangeView {
   tools_removed: string[]
 }
 
+/**
+ * 写触发的资产发布结果（2026-11-09 用户裁决，修订 D-25-10）：写已生效且不回退；
+ * `failed` 表示下一次 Run 会被准入拒绝，页面必须显示 `error` 提示。内容保存、
+ * 创建、多文件提交、复制、恢复的成功响应恒带；只读读取省略。
+ */
+export interface AgentPublishView {
+  status: 'published' | 'failed' | 'skipped'
+  published_version_id?: number
+  error?: string
+}
+
 export interface AgentFilesView {
   agent: string
   lifecycle: AgentLifecycleView
@@ -159,6 +170,8 @@ export interface AgentFilesView {
   files: AgentFileEntry[]
   /** 本次保存中被系统自动加入 / 移除的工具；空数组 = 本次没有自动调整。 */
   changes: AgentToolChangeView
+  /** 本次写触发的资产发布结果；只读读取省略（零值不出键）。 */
+  publish?: AgentPublishView
 }
 
 export interface AgentLifecycleTransition {
@@ -1127,6 +1140,49 @@ export interface ToolView {
   source: 'builtin' | 'mcp' | 'code'
 }
 
+/** Worker 进程实例的服务端状态；由数据库时钟判定，页面只显示、不推算。 */
+export type WorkerStatus = 'active' | 'stale' | 'stopped'
+
+/** 概览里的单个 Worker 登记行（US-25C §2.3.9）；身份是 instance，不是服务器。 */
+export interface SystemWorkerView {
+  instance: string
+  name: string
+  started_at: string
+  heartbeat_at: string
+  active_leases: number
+  hostname: string
+  build_version: string
+  schema_version: number
+  /** 走过停机流程才有；只有该字段非空才算「已停止」。 */
+  stopped_at?: string
+  /** 距上次心跳的秒数（服务端按数据库时钟计算），页面不得自行换算状态。 */
+  heartbeat_age_seconds: number
+  /** 旧登记行缺省（字段省略）→ 详情标注「阈值取部署默认」。 */
+  heartbeat_interval_seconds?: number
+  /** 该行的诊断阈值 max(3 × 心跳间隔, 30 秒)。 */
+  stale_after_seconds: number
+  status: WorkerStatus
+}
+
+/** 概览的 Worker 段：计数与明细来自同一条语句（同一快照）。 */
+export interface SystemWorkersView {
+  /** 全库活跃执行权（未释放且未过期），不等于各行之和。 */
+  active_leases: number
+  /** 数据库时间（RFC3339）；页面标注「最近更新于」。 */
+  as_of: string
+  /** 全库聚合计数；不得用返回的明细行推算。 */
+  counts: {
+    active: number
+    stale: number
+    stopped: number
+  }
+  /** 三类计数之和。 */
+  total: number
+  /** total > nodes.length。 */
+  truncated: boolean
+  nodes: SystemWorkerView[]
+}
+
 export interface SystemOverview {
   version: string
   uptime_seconds: number
@@ -1148,17 +1204,8 @@ export interface SystemOverview {
     mcp_servers: number
     skills: number
   }
-  /** US-24 只读诊断：数据库不可读时整组省略，不补 0。 */
-  workers?: {
-    active_leases: number
-    nodes: {
-      instance: string
-      name: string
-      started_at: string
-      heartbeat_at: string
-      active_leases: number
-    }[]
-  }
+  /** US-24 / US-25C 只读诊断：数据库不可读时整组省略，不补 0。 */
+  workers?: SystemWorkersView
   database: {
     status: 'ok' | 'unavailable'
     schema_version: number

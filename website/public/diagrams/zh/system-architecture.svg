@@ -1,68 +1,86 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1360 790" role="img" aria-labelledby="summary-title summary-desc" data-diagram-id="system-architecture" data-source-commit="ca9a0d29f185a548b14b595e6068c52df1c3cdf4" data-working-tree-feature="US19"><title id="summary-title">Basalt 简化系统架构</title><desc id="summary-desc">用于项目 README 的 Basalt 简化架构。按常见五层划分：接入层（CLI、HTTP API、内嵌管理台）、应用层（独立 Agent 定义与状态，以及生命周期、资源和调度服务）、执行引擎层（PromptBuilder、ReActLoop、ToolExecutor）、基础服务层（模型适配、工具／MCP／技能、记忆与通知）、存储层（自托管 PostgreSQL、工作区文件）。认证、资源作用域、执行约束与持久审计贯穿各层。展示当前单节点 Go 实现；Agent 逻辑作用域不等于进程或容器隔离，外部端点按配置接入。详细执行和部署视图由官网文档承接。 US19 working-tree addition: sequential Flow uses the same Run, messages and audit path. Unknown actions block; no parallel or distributed graph. Base commit ca9a0d29f185a548b14b595e6068c52df1c3cdf4.</desc><rect width="1360" height="640" fill="#faf8f1"/><g font-family="sans-serif">
-<rect x="20" y="100" width="1320" height="450" rx="7" fill="#faf8f1" stroke="#2447df" stroke-width="1.2"/>
-<rect x="40" y="130" width="230" height="386" rx="7" fill="#eff2fb" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="55" y="178" width="200" height="82" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="55" y="278" width="200" height="82" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="55" y="378" width="200" height="82" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="800" viewBox="0 0 1360 800" role="img" aria-labelledby="diagram-title diagram-desc" data-diagram-id="system-architecture" data-source-commit="2bfcede9db06baf7cec27f1adb825a8e1ffb3969" data-working-tree-feature="US25C">
+<title id="diagram-title">Basalt 系统架构简图</title>
+<desc id="diagram-desc">用于 README 的紧凑架构图。五个逻辑层：接入层（控制面上的命令行、HTTP API 与内嵌管理台）；应用层（Agent 定义与已发布资产包、serve 控制面与 gateway Worker）；执行引擎层（每个 Worker 上的 PromptBuilder、ReActLoop 与 ToolExecutor）；基础服务层（模型适配、工具、MCP、技能、记忆与通知）；存储层（所有节点共享的自托管 PostgreSQL，以及每节点工作区与内容寻址资产包）。控制面发布不可变资产包，Worker 按哈希安装且不发布；每个领取的执行固定 bundle 哈希，准入先校验这一份目录再发出调用。技能从已发布版本物化。认证、预算与持久审计贯穿各层。跨节点业务状态共享、数据库 HA 与 K8s 仍不属于本版本；逻辑作用域不等同于进程隔离。基线提交 2bfcede9db06baf7cec27f1adb825a8e1ffb3969。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#2447df"/></marker></defs>
+<g font-family="Arial, Microsoft YaHei, sans-serif" fill="#151e2b">
+<rect width="1360" height="800" fill="#faf8f1"/>
+<rect x="20" y="100" width="1320" height="460" rx="7" fill="#faf8f1" stroke="#2447df" stroke-width="1.2"/>
+<rect x="40" y="130" width="230" height="410" rx="7" fill="#eff2fb" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="55" y="170" width="200" height="100" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="55" y="292" width="200" height="100" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="55" y="414" width="200" height="100" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="294" y="130" width="1026" height="66" rx="7" fill="#f1f5fa" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="294" y="210" width="1026" height="66" rx="7" fill="#f1f0fa" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="294" y="290" width="1026" height="66" rx="7" fill="#edf1fb" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="294" y="370" width="1026" height="66" rx="7" fill="#f1f5fa" stroke="#c8cfd8" stroke-width="1.2"/>
+<rect x="294" y="450" width="1026" height="66" rx="7" fill="#f0f5ef" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="490" y="138" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="750" y="138" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="1010" y="138" width="300" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="294" y="210" width="1026" height="66" rx="7" fill="#f1f0fa" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="490" y="218" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="750" y="218" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="1010" y="218" width="300" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="294" y="290" width="1026" height="66" rx="7" fill="#edf1fb" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="490" y="298" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="750" y="298" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="1010" y="298" width="300" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="294" y="370" width="1026" height="66" rx="7" fill="#f1f5fa" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="490" y="378" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="750" y="378" width="240" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="1010" y="378" width="300" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<rect x="294" y="450" width="1026" height="66" rx="7" fill="#f0f5ef" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="490" y="458" width="390" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
 <rect x="900" y="458" width="390" height="50" rx="7" fill="#fffdf8" stroke="#c8cfd8" stroke-width="1.2"/>
-<path d="M810 196V210" fill="none" stroke="#2447df" stroke-width="1.4"/><path d="M806 203L810 210L814 203" fill="none" stroke="#2447df" stroke-width="1.4"/>
-<path d="M810 276V290" fill="none" stroke="#2447df" stroke-width="1.4"/><path d="M806 283L810 290L814 283" fill="none" stroke="#2447df" stroke-width="1.4"/>
-<path d="M810 356V370" fill="none" stroke="#2447df" stroke-width="1.4"/><path d="M806 363L810 370L814 363" fill="none" stroke="#2447df" stroke-width="1.4"/>
-<path d="M810 436V450" fill="none" stroke="#2447df" stroke-width="1.4"/><path d="M806 443L810 450L814 443" fill="none" stroke="#2447df" stroke-width="1.4"/>
-<text x="55" y="158" font-size="18" fill="#2447df" font-weight="600">安全与运行保障</text>
-<text x="68" y="202" font-size="16" fill="#151e2b" font-weight="600">认证与作用域</text>
-<text x="68" y="224" font-size="14" fill="#59687a">管理 token</text>
-<text x="68" y="244" font-size="14" fill="#59687a">资源作用域</text>
-<text x="68" y="302" font-size="16" fill="#151e2b" font-weight="600">执行约束</text>
-<text x="68" y="324" font-size="14" fill="#59687a">预算与取消</text>
-<text x="68" y="344" font-size="14" fill="#59687a">工具访问策略</text>
-<text x="68" y="402" font-size="16" fill="#151e2b" font-weight="600">持久记录</text>
-<text x="68" y="424" font-size="14" fill="#59687a">模型与工具调用</text>
-<text x="68" y="444" font-size="14" fill="#59687a">运行与管理操作</text>
-<text x="55" y="493" font-size="15" fill="#2447df">贯穿各层</text>
+<rect x="18" y="585" width="1324" height="140" rx="8" fill="#eef1fb" stroke="#244bd8" stroke-width="1.2"/>
+<polyline points="810,196 810,210" fill="none" stroke="#2447df" stroke-width="1.5" marker-end="url(#arrow)"/>
+<polyline points="810,276 810,290" fill="none" stroke="#2447df" stroke-width="1.5" marker-end="url(#arrow)"/>
+<polyline points="810,356 810,370" fill="none" stroke="#2447df" stroke-width="1.5" marker-end="url(#arrow)"/>
+<polyline points="810,436 810,450" fill="none" stroke="#2447df" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="55" y="156" font-size="18" fill="#2447df" font-weight="600">安全与运行保障</text>
+<text x="68" y="196" font-size="16" fill="#151e2b" font-weight="600">认证与授权</text>
+<text x="68" y="218" font-size="14" fill="#59687a">管理 token 只在控制面</text>
+<text x="68" y="238" font-size="14" fill="#59687a">按 Agent 划分资源作用域</text>
+<text x="68" y="318" font-size="16" fill="#151e2b" font-weight="600">执行边界</text>
+<text x="68" y="340" font-size="14" fill="#59687a">预算 / 取消</text>
+<text x="68" y="360" font-size="14" fill="#59687a">工具访问策略</text>
+<text x="68" y="440" font-size="16" fill="#151e2b" font-weight="600">持久记录</text>
+<text x="68" y="462" font-size="14" fill="#59687a">运行 / 模型与工具调用</text>
+<text x="68" y="482" font-size="14" fill="#59687a">管理操作</text>
+<text x="55" y="528" font-size="15" fill="#2447df">贯穿各层</text>
 <text x="309" y="169" font-size="18" fill="#2447df" font-weight="600">接入层</text>
-<text x="504" y="170" font-size="17" fill="#151e2b" font-weight="600">命令行</text>
-<text x="764" y="170" font-size="17" fill="#151e2b" font-weight="600">HTTP API</text>
-<text x="1024" y="170" font-size="17" fill="#151e2b" font-weight="600">Web 管理台</text>
 <text x="309" y="249" font-size="18" fill="#2447df" font-weight="600">应用层</text>
-<text x="504" y="239" font-size="17" fill="#151e2b" font-weight="600">Agent A</text>
-<text x="504" y="257" font-size="14" fill="#59687a">独立定义与状态</text>
-<text x="764" y="239" font-size="17" fill="#151e2b" font-weight="600">Agent B</text>
-<text x="764" y="257" font-size="14" fill="#59687a">独立定义与状态</text>
-<text x="1024" y="239" font-size="17" fill="#151e2b" font-weight="600">应用服务</text>
-<text x="1024" y="257" font-size="14" fill="#59687a">生命周期／资源／调度</text>
 <text x="309" y="329" font-size="18" fill="#2447df" font-weight="600">执行引擎层</text>
-<text x="504" y="330" font-size="17" fill="#151e2b" font-weight="600">PromptBuilder</text>
-<text x="764" y="330" font-size="17" fill="#151e2b" font-weight="600">ReActLoop</text>
-<text x="1024" y="330" font-size="17" fill="#151e2b" font-weight="600">ToolExecutor</text>
 <text x="309" y="409" font-size="18" fill="#2447df" font-weight="600">基础服务层</text>
-<text x="504" y="410" font-size="17" fill="#151e2b" font-weight="600">模型接入</text>
-<text x="764" y="410" font-size="17" fill="#151e2b" font-weight="600">工具／MCP／技能</text>
-<text x="1024" y="410" font-size="17" fill="#151e2b" font-weight="600">记忆／通知</text>
 <text x="309" y="489" font-size="18" fill="#2447df" font-weight="600">存储层</text>
-<text x="504" y="490" font-size="17" fill="#151e2b" font-weight="600">PostgreSQL</text>
-<text x="914" y="490" font-size="17" fill="#151e2b" font-weight="600">工作区文件</text>
-<text x="30" y="31" font-size="14" fill="#2447df">BASALT / 架构总览</text>
-<text x="30" y="70" font-size="29" fill="#151e2b" font-weight="600">独立业务 Agent，共享运行底座。</text>
-<text x="30" y="587" font-size="17" fill="#59687a">当前单节点实现 · 统一 Go 运行时 · 内嵌管理台 · 外置 PostgreSQL</text>
-<text x="30" y="612" font-size="16" fill="#59687a">按逻辑层与 Agent 作用域划分；外部模型和工具通过显式配置的适配器接入。</text>
-<text x="1110" y="631" font-size="11" fill="#59687a">源码 ca9a0d29f185</text></g><g id="us19-flow" font-family="Arial, Microsoft YaHei, sans-serif"><rect x="18" y="650" width="1324" height="128" rx="8" fill="#eef1fb" stroke="#244bd8"/><text x="36" y="680" font-size="21" fill="#202b30">US19 · 可选持久顺序流程</text><text x="36" y="715" font-size="18" fill="#202b30">已发布契约 → 有界 Worker → 原 Run／ToolExecutor → 证据验收</text><text x="36" y="750" font-size="18" fill="#202b30">PostgreSQL v8 保存检查点、动作与证据；未知副作用不自动重放。</text></g>
+<text x="504" y="162" font-size="17" fill="#151e2b" font-weight="600">命令行</text>
+<text x="504" y="180" font-size="13" fill="#59687a">本地写命令</text>
+<text x="764" y="162" font-size="17" fill="#151e2b" font-weight="600">HTTP API</text>
+<text x="764" y="180" font-size="13" fill="#59687a">认证入口 · 控制面</text>
+<text x="1024" y="162" font-size="17" fill="#151e2b" font-weight="600">Web 管理台</text>
+<text x="1024" y="180" font-size="13" fill="#59687a">内嵌于 /console/</text>
+<text x="504" y="242" font-size="17" fill="#151e2b" font-weight="600">控制面（serve）</text>
+<text x="504" y="260" font-size="13" fill="#59687a">生命周期 · 资源 · 调度</text>
+<text x="764" y="242" font-size="17" fill="#151e2b" font-weight="600">Worker（gateway）</text>
+<text x="764" y="260" font-size="13" fill="#59687a">领取到期执行 · 执行 · 回写</text>
+<text x="1024" y="242" font-size="17" fill="#151e2b" font-weight="600">Agent 定义与已发布资产包</text>
+<text x="1024" y="260" font-size="13" fill="#59687a">身份 · 版本 · 每次执行固定</text>
+<text x="504" y="329" font-size="17" fill="#151e2b" font-weight="600">PromptBuilder</text>
+<text x="764" y="329" font-size="17" fill="#151e2b" font-weight="600">ReActLoop</text>
+<text x="1024" y="329" font-size="17" fill="#151e2b" font-weight="600">ToolExecutor</text>
+<text x="504" y="402" font-size="17" fill="#151e2b" font-weight="600">模型接入</text>
+<text x="504" y="420" font-size="13" fill="#59687a">每次运行固定 provider 映射</text>
+<text x="764" y="402" font-size="17" fill="#151e2b" font-weight="600">工具 / MCP / 技能</text>
+<text x="764" y="420" font-size="13" fill="#59687a">声明式 · 策略检查 · 审计</text>
+<text x="1024" y="402" font-size="17" fill="#151e2b" font-weight="600">记忆 / 通知</text>
+<text x="1024" y="420" font-size="13" fill="#59687a">Agent 作用域 · 按配置投递</text>
+<text x="504" y="482" font-size="17" fill="#151e2b" font-weight="600">PostgreSQL</text>
+<text x="504" y="500" font-size="13" fill="#59687a">所有节点共享 · 会话、审计、记忆</text>
+<text x="914" y="482" font-size="17" fill="#151e2b" font-weight="600">工作区与资产包</text>
+<text x="914" y="500" font-size="13" fill="#59687a">每节点文件 · 按内容寻址安装</text>
+<text x="30" y="31" font-size="14" fill="#2447df">BASALT / 架构概览</text>
+<text x="30" y="70" font-size="29" fill="#151e2b" font-weight="600">独立 Agent，共享同一运行底座。</text>
+<text x="36" y="616" font-size="20" fill="#151e2b" font-weight="600">US-25C · 已发布资产同步与钉住准入</text>
+<text x="36" y="650" font-size="15" fill="#151e2b">控制面为每个 Agent 发布不可变资产包；Worker 按哈希安装，不发布资产。</text>
+<text x="36" y="678" font-size="15" fill="#151e2b">每个领取的执行固定 bundle 哈希；准入先校验这一份目录，再发出调用。</text>
+<text x="36" y="706" font-size="15" fill="#151e2b">技能从已发布版本物化。跨节点业务状态共享、数据库 HA 与 K8s 仍不属于本版本。</text>
+<text x="30" y="752" font-size="15" fill="#59687a">Compose 多 Worker 是首发部署档 · 共用一个 PostgreSQL · 外部模型与工具经显式配置接入</text>
+<text x="1110" y="782" font-size="11" fill="#59687a">源码 2bfcede9db06</text>
+</g>
 </svg>

@@ -32,6 +32,7 @@ import { adminApi } from '../api-admin'
 import { catalogApi } from '../api-catalog'
 import type {
   AdminResourceKind,
+  AgentRepublishView,
   McpServerApplyResult,
   McpServerDetail,
   McpServerTestResult,
@@ -45,6 +46,12 @@ import {
   CREDENTIAL_MODE_LABELS,
   CREDENTIAL_STATE_LABELS,
 } from '../components/credential-field'
+import {
+  REPUBLISH_STATUS_LABELS,
+  republishRows,
+  republishSummaryText,
+  republishWarningText,
+} from '../components/publish-results'
 import { ResourceForm } from '../components/resource-form'
 import { SCOPE_LABELS, ScopePicker } from '../components/scope-picker'
 import {
@@ -521,6 +528,10 @@ export const ResourceDetailView = defineComponent({
     const deniedAgents = ref<string[]>([])
     const deniedRuns = ref<string[]>([])
     const notice = ref('')
+    // 技能发布联动重发的逐 Agent 结果：只在本次发布触发重发时非 undefined，
+    // 下一次写操作或重读前清空（不放缓历史结果假装是当前状态）。
+    // Per-agent republish results of the latest publish action.
+    const publishResults = ref<AgentRepublishView[] | undefined>(undefined)
     const deleteOpen = ref(false)
     const testResult = ref<ModelConnectionTestResult | McpServerTestResult | null>(null)
     // 受控应用（apply）：成功时记结果对象；失败时以操作台账为准再读一次详情，
@@ -542,6 +553,7 @@ export const ResourceDetailView = defineComponent({
       deniedAgents.value = []
       deniedRuns.value = []
       notice.value = ''
+      publishResults.value = undefined
       testResult.value = null
       testReference.value = 'unknown'
       applyResult.value = null
@@ -601,6 +613,7 @@ export const ResourceDetailView = defineComponent({
           ifMatch,
           versionId,
         )
+        publishResults.value = result.publish
         if (result.pending_restart) {
           notice.value = `已发布版本 ${result.version.version_no}；MCP 连接在重启后生效（列表会标“需重启”）。`
         } else if (versionId === undefined) {
@@ -1466,6 +1479,38 @@ export const ResourceDetailView = defineComponent({
     }
 
     /**
+     * 技能发布联动重发的逐 Agent 结果（US-25C §2.3.7）：发布本身成功与否看
+     * 版本号，重发是后续动作；missing / failed 追加 warn 通知，其余状态只列
+     * 徽标。下一次写操作或重新发布前整体清空，不放缓历史结果。
+     * Per-agent republish results of the latest skill publish.
+     */
+    function renderPublishResults(): VNodeChild {
+      const rows = republishRows(publishResults.value)
+      if (rows.length === 0) {
+        return null
+      }
+      const warning = republishWarningText(publishResults.value)
+      return section('技能发布联动结果', [
+        h('p', { class: 'muted' }, republishSummaryText(publishResults.value)),
+        h(
+          'ul',
+          { class: 'plain-list' },
+          rows.map((row) =>
+            h('li', { key: row.agent }, [
+              badge(
+                row.label,
+                row.alert ? 'warn' : row.label === REPUBLISH_STATUS_LABELS.ok ? 'ok' : 'muted',
+              ),
+              h('span', {}, ` ${row.agent}`),
+              row.error === '' ? null : h('span', { class: 'muted small' }, ` · ${row.error}`),
+            ]),
+          ),
+        ),
+        warning === '' ? null : h(Notice, { tone: 'warn', text: warning }),
+      ])
+    }
+
+    /**
      * 按 UID 精确绑定的 Agent：归档的也列出（仍占引用）；迁移前没有 UID 证据的
      * 旧状态文件如实标“引用未记录”，不补造身份。
      */
@@ -1938,6 +1983,7 @@ export const ResourceDetailView = defineComponent({
       if (notice.value !== '') {
         children.push(h(Notice, { tone: 'info', text: notice.value }))
       }
+      children.push(renderPublishResults())
 
       children.push(
         section('引用与占用', [renderReferences()]),

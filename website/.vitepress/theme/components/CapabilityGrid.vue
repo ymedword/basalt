@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { useData, withBase } from 'vitepress'
-import { CAPABILITIES } from '../../data/capabilities.mjs'
+import { CAPABILITIES, CURRENT_SCOPE_NOTE } from '../../data/capabilities.mjs'
 const { lang } = useData()
 const zh = computed(() => lang.value.startsWith('zh'))
 </script>
@@ -17,5 +17,6 @@ const zh = computed(() => lang.value.startsWith('zh'))
         <img :src="withBase(item.illustration)" :alt="zh ? item.altZh : item.altEn" width="400" height="320" loading="lazy">
       </article>
     </div>
+    <p class="capability-scope">{{ CURRENT_SCOPE_NOTE[zh ? 'zh' : 'en'] }}</p>
   </section>
 </template>

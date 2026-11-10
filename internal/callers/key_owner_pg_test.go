@@ -94,6 +94,8 @@ func newKeyOwnerHarness(t *testing.T) *keyOwnerHarness {
 		StopGrace:     time.Minute,
 		Logger:        slog.New(slog.DiscardHandler),
 		Now:           func() time.Time { return h.now },
+		// 夹具建模控制面实例（US-25C T033 起的显式定义写权开关）。
+		DefinitionAuthority: true,
 	})
 	h.seedCaller("caller-1")
 	return h

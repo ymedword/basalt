@@ -170,6 +170,8 @@ func newCrossEntryEnv(t *testing.T, entries ...core.AgentEntry) *crossEntryEnv {
 		// 宽限放宽到 10 分钟：夹具从不验证"错过窗口"（那在 core / postgres 用例里），
 		// 只要求本机与容器之间的时钟偏差不会把一次正常触发误判成错失。
 		MissedGrace: 10 * time.Minute,
+		// 夹具建模控制面实例：启动对账照常写共享定义列（US-25C T033 起的显式开关）。
+		DefinitionAuthority: true,
 	})
 	require.NoError(t, env.sched.Start(context.Background()))
 	t.Cleanup(env.sched.Stop)
@@ -310,8 +312,16 @@ func (e *crossEntryEnv) Fire(taskID string) <-chan struct{} {
 	e.awaitInitialized(taskID)
 	planned := time.Now().UTC().Truncate(time.Millisecond).
 		Add(-time.Duration(e.fireSeq.Add(1)) * 100 * time.Millisecond)
-	require.NoError(e.t, e.store.SetNextFire(context.Background(), taskID, nil, planned),
-		"Fire 必须能把任务拨到已到期")
+	// 夹具直写拨表：`SetNextFire` 的 nil 预期只服务"初始化 NULL 行"，是行条件写，
+	// 不再兼作强制改期（外部写入不会被迟到的初始化覆盖，ADJ-20）。这里要的是把已
+	// 初始化行的触发点直接改到过去。
+	res, err := e.db.ExecContext(context.Background(),
+		`UPDATE scheduled_tasks SET next_fire_at = $2 WHERE task_id = $1 AND retired_at IS NULL`,
+		taskID, planned.UnixMilli())
+	require.NoError(e.t, err, "Fire 必须能把任务拨到已到期")
+	affected, err := res.RowsAffected()
+	require.NoError(e.t, err)
+	require.EqualValues(e.t, 1, affected, "Fire 必须命中恰一条未退休任务行")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -322,10 +332,10 @@ func (e *crossEntryEnv) Fire(taskID string) <-chan struct{} {
 
 // awaitInitialized 等到首次初始化把 `next_fire_at` 写进未来（任务离开到期集合）。
 //
-// 对账后的第一轮扫描看到 NULL 只做初始化、不执行，且写入是**无条件** UPDATE；
-// 在它落库之前直接拨表会被它覆盖回未来，本次触发就永远不来。观察到"任务不在
-// 到期集合里"即证明那一笔已提交——扫描是单 goroutine 顺序推进，之后不会再有人写。
-// Wait until the first init pass has committed its unconditional write.
+// 对账后的第一轮扫描看到 NULL 只做初始化、不执行；初始化是行条件写（ADJ-20），
+// 观察到"任务不在到期集合里"即证明那一笔已提交且任务行已存在，此后它不会再改写
+// 非 NULL 行。随后 Fire 的夹具直写才有一个确定的目标行可拨。
+// Wait until the first init pass has committed and the task row exists.
 func (e *crossEntryEnv) awaitInitialized(taskID string) {
 	e.t.Helper()
 	require.Eventually(e.t, func() bool {

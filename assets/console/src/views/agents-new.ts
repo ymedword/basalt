@@ -11,6 +11,7 @@ import type { AgentContentChanges, AgentFilesView, AgentLifecycleView, ModelConn
 import { adminApi, problemsOf } from '../api-admin'
 import type { AgentCreateRequest, AgentDraftAnswer, AgentDraftQuestion, FileDraft } from '../api-admin'
 import { splitAgentBody } from '../agent-body'
+import { publishWarningText } from '../components/publish-status'
 import { Notice } from '../components/ui'
 import { agentHref } from '../router'
 import {
@@ -803,6 +804,12 @@ export const AgentsNewView = defineComponent({
       ]
       if (saveError.value !== '') {
         children.push(h(Notice, { tone: 'error', text: saveError.value }))
+      }
+      // 创建 / 提交的成功响应都会带发布结果；失败时写仍生效，单独告警。
+      // Both create and submit responses carry it; a failure never rolls back the write.
+      const publishWarning = publishWarningText(shown.publish)
+      if (publishWarning !== '') {
+        children.push(h(Notice, { tone: 'warn', text: publishWarning }))
       }
       if (saved.value !== null) {
         children.push(h(Notice, { tone: 'info', text: '草稿文件已提交；上面是服务端重读后的受管文件集合。' }))

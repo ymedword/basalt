@@ -70,22 +70,64 @@ type bundlePublishDetail struct {
 	PreviousPublishedVersionID int64  `json:"previous_published_version_id"`
 }
 
+// bundleRecordStore 是发布链对共享资源记录的最小读取 / 写入面（接口定义在消费方）：
+// 生产实现是 `*postgres.ResourceStore`，单元用例用内存夹具替换——没有这条缝，
+// "先载荷后指针"只能靠集成库观察，判据就落不到模块卡 §4.3 要求的单元层。
+// bundleRecordStore is the consumer-side view of the shared resource record used by the
+// publish chain; production passes *postgres.ResourceStore, unit tests a memory fake.
+type bundleRecordStore interface {
+	AgentIdentity(ctx context.Context, agent string) (core.AgentUID, string, bool, error)
+	Pointer(ctx context.Context, kind core.ResourceKind, resourceID string) (core.ResourcePointer, error)
+	PointerByUID(ctx context.Context, kind core.ResourceKind, uid core.ResourceUID) (core.ResourcePointer, error)
+	VersionByID(ctx context.Context, id int64) (core.ResourceVersion, error)
+	EnsureVersion(ctx context.Context, v core.ResourceVersion) (core.ResourceVersion, bool, error)
+	PublishAgentBundle(ctx context.Context, uid core.AgentUID, versionID, expectedPublished int64,
+		operationID string, now time.Time) (bool, error)
+}
+
+// bundlePayloadReader 是同哈希发布核对载荷用的只读面：只回答"这一版载荷在不在、
+// 自不自洽"。读写分属两个生产实现（`AssetDistributionStore` / `BundlePayloadStore`），
+// 因此这里只声明消费方真正用到的方法。
+// bundlePayloadReader is the read face the same-hash publication needs to prove a
+// payload exists and is self-consistent.
+type bundlePayloadReader interface {
+	ReadBundlePayload(ctx context.Context, hash string) (core.BundlePayloadRecord, bool, error)
+}
+
 // bundlePublisher 是 `assets.Deps.Publish` 的生产实现：装好之后写共享发布记录。
 // CLI 安装入口与服务启动路径的装配复用同一份实现——发布只有这一条路。
 // bundlePublisher is the single implementation behind every install path.
 type bundlePublisher struct {
-	versions   *postgres.ResourceStore
+	versions   bundleRecordStore
 	operations core.OperationStore
+	payloads   core.BundlePayloadStore
+	maxBytes   int64
 	logger     *slog.Logger
 	now        func() time.Time
+}
+
+// bundleFinalizeTimeout 是审计终态回填的独立有界预算（2026-11-10 复核 P1）。
+// 外层发布时限（`bundlePublishTimeout`）在回填处被 `context.WithoutCancel` 一并剥掉，
+// 数据库阻塞或连接池等待就没有任何上限——发布在编辑器写锁内执行，回填挂住会把保存
+// 请求一起占住。超时留 pending 行，由 `verifyBundlePublish` 按"未确认"恢复，因此
+// 有界回填失败是安全方向。
+// bundleFinalizeTimeout bounds the audit finalization independently of the caller's
+// cancellation; a timed-out finalization leaves the pending row for the recovery path.
+const bundleFinalizeTimeout = 5 * time.Second
+
+// finalizeContext 为终态回填构造一条**有界**且不受调用方取消影响的上下文：取消不丢
+// 终态，但任何数据库 / 连接池等待都不得超过 `bundleFinalizeTimeout`。
+// finalizeContext keeps finalization independent of caller cancellation while bounding it.
+func (p *bundlePublisher) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bundleFinalizeTimeout)
 }
 
 // newBundlePublisher 构造发布器。仓储必须显式传入：缺接线时 `Publish` 失败关闭，
 // **不**退化成"只装本地"（§2.3.9 的首次初始化由显式安装完成，没有旁路）。
 // newBundlePublisher wires the publisher; a missing store fails closed instead of
 // degrading into a local-only install.
-func newBundlePublisher(versions *postgres.ResourceStore, operations core.OperationStore,
-	logger *slog.Logger, now func() time.Time,
+func newBundlePublisher(versions bundleRecordStore, operations core.OperationStore,
+	payloads core.BundlePayloadStore, maxBytes int64, logger *slog.Logger, now func() time.Time,
 ) *bundlePublisher {
 	if logger == nil {
 		logger = slog.Default()
@@ -93,7 +135,70 @@ func newBundlePublisher(versions *postgres.ResourceStore, operations core.Operat
 	if now == nil {
 		now = time.Now
 	}
-	return &bundlePublisher{versions: versions, operations: operations, logger: logger, now: now}
+	return &bundlePublisher{
+		versions: versions, operations: operations, payloads: payloads,
+		maxBytes: maxBytes, logger: logger, now: now,
+	}
+}
+
+// resolveMaxBundleBytes 取 `assets.max_bundle_bytes`：配置校验已拒绝非正值，零值只
+// 出现在零值装配（测试 / 轻路径）里，此时回落缺省上限而不是让载荷编码把一切都判超限。
+// resolveMaxBundleBytes falls back to the default limit for a zero-value assembly.
+func resolveMaxBundleBytes(cfg *cli.Config) int64 {
+	if cfg != nil && cfg.Assets.MaxBundleBytes > 0 {
+		return cfg.Assets.MaxBundleBytes
+	}
+	return cli.DefaultAssetsConfig().MaxBundleBytes
+}
+
+// payloadSelfConsistent 复核一份载荷记录是否**自洽**（C15 的读取侧判据）：哈希对得上
+// 指针、长度与声明一致、重算的 sha256 与 `payload_sha256` 逐字相等。不做这一步时，
+// 「载荷存在」只证明行在，证明不了字节就是发布时那一份。
+// payloadSelfConsistent re-derives the stored payload digest; an existing row alone does
+// not prove the bytes are the ones that were published.
+func payloadSelfConsistent(rec core.BundlePayloadRecord, hash string) bool {
+	if rec.BundleHash != hash || rec.PayloadSHA256 == "" || len(rec.Payload) == 0 {
+		return false
+	}
+	if int64(len(rec.Payload)) != rec.SizeBytes {
+		return false
+	}
+	sum := sha256.Sum256(rec.Payload)
+	return hex.EncodeToString(sum[:]) == rec.PayloadSHA256
+}
+
+// writePayload 把已安装目录编码成确定性载荷并写进内容寻址载荷表（§2.3.2 的冻结字面量）。
+// 失败一律上抛：调用方据此拒绝推进指针——"只装本地不写载荷"正是 C15 要消灭的形态。
+// CreatedAt 由 Go 写毫秒值（表不设数据库 DEFAULT）；上限语义由 `EncodeBundle` 判，
+// 超限返回错误而不截断。
+// writePayload encodes the installed directory and inserts the content-addressed payload;
+// every failure is raised so the caller refuses to move the pointer.
+func writePayload(ctx context.Context, dir string, m assets.Manifest,
+	store core.BundlePayloadStore, maxBytes int64,
+) error {
+	if store == nil {
+		return errors.New("资产载荷未接线：缺载荷写入仓储（不得只装本地）")
+	}
+	if maxBytes <= 0 {
+		return errors.New("资产载荷未接线：缺少 max_bundle_bytes 上限（装配错误）")
+	}
+	payload, sum, err := assets.EncodeBundle(ctx, dir, maxBytes)
+	if err != nil {
+		return fmt.Errorf("编码 Agent %s 的资产载荷: %w", m.Agent, err)
+	}
+	if err := store.PutBundlePayload(ctx, core.BundlePayloadRecord{
+		BundleHash:    m.BundleHash,
+		Agent:         m.Agent,
+		AgentUID:      m.AgentUID,
+		FormatVersion: m.FormatVersion,
+		Payload:       payload,
+		PayloadSHA256: sum,
+		SizeBytes:     int64(len(payload)),
+		CreatedAt:     time.Now().UnixMilli(),
+	}); err != nil {
+		return fmt.Errorf("写入 Agent %s 的资产载荷: %w", m.Agent, err)
+	}
+	return nil
 }
 
 // workspaceBundleDeps 是"从工作区构建一个 Agent bundle"的输入：工作区根（配置文件的
@@ -103,13 +208,13 @@ func newBundlePublisher(versions *postgres.ResourceStore, operations core.Operat
 // which only bundlePublisher writes.
 type workspaceBundleDeps struct {
 	Root     string
-	Versions *postgres.ResourceStore
+	Versions bundleRecordStore
 }
 
 // resolveWorkspaceAgentUID 取 Agent 在生命周期索引里的身份（构建清单的 `agent_uid`）。
 // 索引没有身份即拒绝：没有身份的 Agent 进不了共享发布记录，构建出来也无处发布。
 // resolveWorkspaceAgentUID refuses an agent the lifecycle index has no identity for.
-func resolveWorkspaceAgentUID(ctx context.Context, versions *postgres.ResourceStore, agent string) (core.AgentUID, error) {
+func resolveWorkspaceAgentUID(ctx context.Context, versions bundleRecordStore, agent string) (core.AgentUID, error) {
 	if err := workspace.ValidateAgentName(agent); err != nil {
 		return "", &core.InvalidInputError{Tool: "assets", Reason: err.Error()}
 	}
@@ -257,12 +362,20 @@ func bundleSkillSources(ctx context.Context, deps workspaceBundleDeps, names []s
 // workspacePublishDeps carries the full build-install-publish chain; the write of the
 // shared record still happens only inside bundlePublisher.
 type workspacePublishDeps struct {
-	Root       string
-	BundleRoot string
-	Versions   *postgres.ResourceStore
-	Operations core.OperationStore
-	Logger     *slog.Logger
-	Now        func() time.Time
+	Root         string
+	BundleRoot   string
+	Versions     bundleRecordStore
+	Operations   core.OperationStore
+	Payloads     bundlePayloadReader     // 同哈希核对载荷存在性（§2.3.2 的 C15 修复面）
+	PayloadStore core.BundlePayloadStore // 发布路径的载荷写入面（writePayload 的唯一入口）
+	MaxBytes     int64                   // 载荷上限（assets.max_bundle_bytes）
+	// Actor 是触发本次发布的真实操作主体（HTTP 会话身份或 CLI 身份）。零值表示
+	// "装配面没有给出"，由发布器回落为 CLI 身份——只允许出现在离线安装路径。
+	// Actor is the real operation identity behind this publication; the zero value
+	// falls back to the CLI identity for offline install paths only.
+	Actor  core.Actor
+	Logger *slog.Logger
+	Now    func() time.Time
 }
 
 // publishedBundleMatchesHash 报告共享指针是否已指向**同内容**的 bundle 版本，并在是时
@@ -271,7 +384,7 @@ type workspacePublishDeps struct {
 // "同一份资产"的判据，无需另设去重键。
 // publishedBundleMatchesHash reports whether the pointer already names a version with the
 // same content hash, so repeated writes of identical content add no operation row.
-func publishedBundleMatchesHash(ctx context.Context, versions *postgres.ResourceStore,
+func publishedBundleMatchesHash(ctx context.Context, versions bundleRecordStore,
 	uid core.AgentUID, hash string,
 ) (int64, bool, error) {
 	pointer, err := versions.PointerByUID(ctx, core.ResourceAgentBundle, core.ResourceUID(uid))
@@ -296,6 +409,32 @@ func publishedBundleMatchesHash(ctx context.Context, versions *postgres.Resource
 		return 0, false, nil
 	}
 	return version.ID, true, nil
+}
+
+// ensureInstalledPayload 是同哈希发布的**载荷核对**（§2.3.2 的 C15 修复面）：载荷存在
+// 且自洽即真幂等返回；缺失（或内容不自洽）只补写载荷、**不动指针**——同哈希发布不是
+// 一次新发布，因此不预写操作行，也就没有可回填的 failed 终态。
+// 内容不自洽的行不会在这里被覆盖：`PutBundlePayload` 对同哈希不同载荷按明确错误拒绝
+// （fail-closed，留给人处置）。
+// ensureInstalledPayload proves the payload exists for a same-hash publication and
+// backfills a missing one without moving the pointer or opening an operation row.
+func ensureInstalledPayload(ctx context.Context, deps workspacePublishDeps, installed assets.Installed) error {
+	if deps.Payloads == nil || deps.PayloadStore == nil {
+		return errors.New("资产载荷未接线：同哈希发布必须核对载荷，缺读取面或写入面")
+	}
+	hash := installed.Manifest.BundleHash
+	rec, ok, err := deps.Payloads.ReadBundlePayload(ctx, hash)
+	if err != nil {
+		return fmt.Errorf("核对 Agent %s 的资产载荷: %w", installed.Manifest.Agent, err)
+	}
+	if ok && payloadSelfConsistent(rec, hash) {
+		return nil
+	}
+	if err := writePayload(ctx, installed.Dir, installed.Manifest, deps.PayloadStore,
+		deps.MaxBytes); err != nil {
+		return fmt.Errorf("补写 Agent %s 的资产载荷（指针不变）: %w", installed.Manifest.Agent, err)
+	}
+	return nil
 }
 
 // publishWorkspaceAgentBundle 把工作区里的一个 Agent 定义构建、安装并发布为共享资产
@@ -331,15 +470,20 @@ func publishWorkspaceAgentBundle(ctx context.Context, deps workspacePublishDeps,
 	if err != nil {
 		return 0, fmt.Errorf("安装 Agent %s 的资产 bundle: %w", agent, err)
 	}
-	// 指针已是同内容版本：本地目录刚被 Install 幂等重建，共享记录不需要新操作行。
+	// 指针已是同内容版本：本地目录刚被 Install 幂等重建，共享记录不需要新操作行；
+	// 但载荷仍须核对——存量指针（US-25 及以前发布）没有载荷，缺失时在这里补写。
 	if versionID, same, err := publishedBundleMatchesHash(ctx, deps.Versions, uid,
 		manifest.BundleHash); err != nil {
 		return 0, err
 	} else if same {
+		if err := ensureInstalledPayload(ctx, deps, installed); err != nil {
+			return 0, err
+		}
 		return versionID, nil
 	}
-	publisher := newBundlePublisher(deps.Versions, deps.Operations, deps.Logger, deps.Now)
-	return publisher.Publish(ctx, installed)
+	publisher := newBundlePublisher(deps.Versions, deps.Operations, deps.PayloadStore,
+		deps.MaxBytes, deps.Logger, deps.Now)
+	return publisher.publishAs(ctx, installed, deps.Actor)
 }
 
 // PublishWorkspaceAgentBundle 把工作区里的一个 Agent 定义构建、安装并发布为共享资产
@@ -356,8 +500,8 @@ func (r *Runtime) PublishWorkspaceAgentBundle(ctx context.Context, agent string)
 		return 0, errors.New("资产发布未接线：运行期句柄为空")
 	}
 	rt := r.inner
-	if rt.versions == nil || rt.ops == nil || rt.root == "" || rt.bundleRoot == "" {
-		return 0, errors.New("资产发布未接线：缺共享发布记录、操作仓储、工作区根或资产根")
+	if rt.versions == nil || rt.ops == nil || rt.db == nil || rt.root == "" || rt.bundleRoot == "" {
+		return 0, errors.New("资产发布未接线：缺共享发布记录、操作仓储、数据库句柄、工作区根或资产根")
 	}
 	uid, err := resolveWorkspaceAgentUID(ctx, rt.versions, agent)
 	if err != nil {
@@ -372,23 +516,36 @@ func (r *Runtime) PublishWorkspaceAgentBundle(ctx context.Context, agent string)
 		return 0, err
 	}
 	return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
-		Root:       rt.root,
-		BundleRoot: rt.bundleRoot,
-		Versions:   rt.versions,
-		Operations: rt.ops,
-		Logger:     nil,
-		Now:        time.Now,
+		Root:         rt.root,
+		BundleRoot:   rt.bundleRoot,
+		Versions:     rt.versions,
+		Operations:   rt.ops,
+		Payloads:     postgres.NewAssetDistributionStore(rt.db),
+		PayloadStore: postgres.NewBundlePayloadStore(rt.db),
+		MaxBytes:     resolveMaxBundleBytes(rt.cfg),
+		Logger:       nil,
+		Now:          time.Now,
 	}, agent)
 }
 
-// Publish 把一个**已安装**的 bundle 写进共享发布记录并推进指针，返回本次发布的
+// Publish 是 `assets.Deps.Publish` 的生产实现（离线安装 / CLI 路径）：操作主体按
+// CLI 固定身份归因。HTTP 写路径必须走 `publishAs` 透传真实操作主体。
+// Publish is the offline install path's entry and attributes the operation to the CLI
+// identity; HTTP write paths must go through publishAs with the real actor.
+func (p *bundlePublisher) Publish(ctx context.Context, installed assets.Installed) (int64, error) {
+	return p.publishAs(ctx, installed, core.Actor{})
+}
+
+// publishAs 把一个**已安装**的 bundle 写进共享发布记录并推进指针，返回本次发布的
 // `published_version_id`。所有失败路径都把预写的 pending 行回填 failed 后原样上抛；
 // 唯一"重试"是 CAS 期望不成立时的重读重试，且**有界**（一次）。
-// Publish writes the installed bundle into the shared record and moves the pointer; every
-// failure path closes the pending row as failed and re-raises the original error.
-func (p *bundlePublisher) Publish(ctx context.Context, installed assets.Installed) (int64, error) {
-	if p == nil || p.versions == nil || p.operations == nil {
-		return 0, errors.New("资产发布未接线：缺资源仓储或操作仓储（不得只装本地）")
+// 零值 actor 回落为 CLI 身份（仅离线安装路径），非零 actor 原样记入操作行。
+// publishAs writes the installed bundle into the shared record and moves the pointer;
+// every failure path closes the pending row as failed. A zero actor falls back to the
+// CLI identity for offline installs.
+func (p *bundlePublisher) publishAs(ctx context.Context, installed assets.Installed, actor core.Actor) (int64, error) {
+	if p == nil || p.versions == nil || p.operations == nil || p.payloads == nil {
+		return 0, errors.New("资产发布未接线：缺资源仓储、操作仓储或载荷仓储（不得只装本地）")
 	}
 	manifest := installed.Manifest
 	uid, err := core.ParseAgentUID(string(manifest.AgentUID))
@@ -420,7 +577,10 @@ func (p *bundlePublisher) Publish(ctx context.Context, installed assets.Installe
 		return 0, fmt.Errorf("序列化资产发布详情: %w", err)
 	}
 
-	actor := cliWriteActor(p.logger)
+	if actor.Subject == "" {
+		// 零值只在离线安装路径出现：按 CLI 固定身份归因，不编造会话主体。
+		actor = cliWriteActor(p.logger)
+	}
 	if err := p.operations.BeginOperation(ctx, core.OperationRecord{
 		OperationID:  operationID,
 		Action:       core.ActionAgentBundlePublish,
@@ -462,6 +622,14 @@ func (p *bundlePublisher) Publish(ctx context.Context, installed assets.Installe
 		return 0, fmt.Errorf("写入资产版本行: %w", err)
 	}
 
+	// 载荷严格先于指针 CAS（C15）：载荷落库失败时指针一步不动，pending 行回填 failed。
+	// The payload is written strictly before the pointer CAS, so a payload failure
+	// never leaves a pointer whose payload is missing.
+	if err := writePayload(ctx, installed.Dir, manifest, p.payloads, p.maxBytes); err != nil {
+		p.finishFailed(ctx, operationID, err.Error(), detail)
+		return 0, err
+	}
+
 	published, err := p.compareAndSet(ctx, uid, version.ID, previous, operationID, now)
 	if err != nil {
 		p.finishFailed(ctx, operationID, err.Error(), detail)
@@ -494,11 +662,14 @@ func (p *bundlePublisher) compareAndSet(ctx context.Context, uid core.AgentUID,
 	}
 	if current == versionID {
 		// 指针已指向本版本：同一内容的并发发布，不是丢更新。成功事务属于对方，
-		// 我们的 pending 行仍待回填。
-		if finishErr := p.operations.FinishOperation(context.WithoutCancel(ctx), operationID,
+		// 我们的 pending 行仍待回填——回填同样走独立有界预算，不得随 `WithoutCancel`
+		// 一起无限等待。
+		finalizeCtx, cancel := p.finalizeContext(ctx)
+		if finishErr := p.operations.FinishOperation(finalizeCtx, operationID,
 			core.OperationSuccess, lifecycleResultOK, "", nil, p.now()); finishErr != nil {
 			p.logger.Error("回填资产发布终态失败", "operation_id", operationID, "error", finishErr)
 		}
+		cancel()
 		return true, nil
 	}
 	return p.versions.PublishAgentBundle(ctx, uid, versionID, current, operationID, now)
@@ -521,10 +692,14 @@ func (p *bundlePublisher) previousPublished(ctx context.Context, uid core.AgentU
 	return pointer.PublishedVersionID, nil
 }
 
-// finishFailed 回填 failed 终态（独立于调用方取消：审计终态不能因请求取消而丢）。
-// finishFailed closes the pending row independently of caller cancellation.
+// finishFailed 回填 failed 终态（独立于调用方取消：审计终态不能因请求取消而丢；
+// 同时受 `bundleFinalizeTimeout` 约束：数据库 / 连接池等待不得无限挂住写锁）。
+// finishFailed closes the pending row independently of caller cancellation, within a
+// bounded budget so a stuck store cannot pin the editor's write lock.
 func (p *bundlePublisher) finishFailed(ctx context.Context, operationID, message string, detail []byte) {
-	if err := p.operations.FinishOperation(context.WithoutCancel(ctx), operationID,
+	finalizeCtx, cancel := p.finalizeContext(ctx)
+	defer cancel()
+	if err := p.operations.FinishOperation(finalizeCtx, operationID,
 		core.OperationFailed, lifecycleResultInternal, message, detail, p.now()); err != nil {
 		p.logger.Error("回填资产发布失败终态失败", "operation_id", operationID, "error", err)
 	}
@@ -582,6 +757,17 @@ func verifyBundlePublish(ctx context.Context, deps RecoveryDeps, op core.Operati
 	return core.VerificationIndeterminate
 }
 
+// assetBootstrapRecords 是自举与存量载荷回填共用的共享记录读取面（消费方接口；
+// `*postgres.ResourceStore` 是唯一实现）。它只有读：指针、版本行与生命周期索引，
+// 两条启动路径都不写共享记录。
+// assetBootstrapRecords is the read-only shared-record face shared by the startup
+// bootstrap and the legacy payload backfill.
+type assetBootstrapRecords interface {
+	PointerByUID(ctx context.Context, kind core.ResourceKind, uid core.ResourceUID) (core.ResourcePointer, error)
+	VersionByID(ctx context.Context, id int64) (core.ResourceVersion, error)
+	ReadLifecycleIndex(ctx context.Context, agent string) (core.LifecycleRecord, bool, string, error)
+}
+
 // assetBootstrapDeps 是启动自举的全部依赖（§2.3.9"启动自举"）：工作区根、资产根、
 // 共享发布记录、生命周期文件与索引、活动 Agent 清单。它只读共享记录、只写本地 hash
 // 目录——**不**发布、**不**改索引。
@@ -590,7 +776,7 @@ func verifyBundlePublish(ctx context.Context, deps RecoveryDeps, op core.Operati
 type assetBootstrapDeps struct {
 	Root      string
 	AssetRoot string
-	Versions  *postgres.ResourceStore
+	Versions  assetBootstrapRecords
 	Lifecycle *workspace.LifecycleStore
 	Agents    []core.AgentEntry
 	Logger    *slog.Logger

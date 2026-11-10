@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -1454,4 +1455,89 @@ func TestLoadConfig_ResolvesDSNPlaceholders(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "database.dsn")
 	})
+}
+
+// TestConfig_ParsesAssetAndPolicySections：US-25C §3.3 的七个键走显式解析入口；
+// 段缺席取冻结缺省；`sync_interval: 0s` 合法（只在启动时同步一次），其余零值拒绝。
+// 逆改点：把 policy 段交回 yaml 解码器（不注册显式入口）→ 未知键被静默忽略，
+// explicit_values / unknown_key 子用例变红。
+func TestConfig_ParsesAssetAndPolicySections(t *testing.T) {
+	env := envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	})
+
+	t.Run("explicit_values", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"assets:\n"+
+			"  bundle_root: .basalt/assets\n"+
+			"  sync_interval: 45s\n"+
+			"  sync_timeout: 25s\n"+
+			"  sync_batch: 7\n"+
+			"  max_bundle_bytes: 4096\n"+
+			"  full_scan_every: 3\n"+
+			"policy:\n"+
+			"  sync_interval: 12s\n"+
+			"  max_stale: 90s\n"), env)
+		require.NoError(t, err)
+		require.Equal(t, 45*time.Second, cfg.Assets.SyncInterval)
+		require.Equal(t, 25*time.Second, cfg.Assets.SyncTimeout)
+		require.Equal(t, 7, cfg.Assets.SyncBatch)
+		require.Equal(t, int64(4096), cfg.Assets.MaxBundleBytes)
+		require.Equal(t, 3, cfg.Assets.FullScanEvery)
+		require.Equal(t, 12*time.Second, cfg.Policy.SyncInterval)
+		require.Equal(t, 90*time.Second, cfg.Policy.MaxStale)
+	})
+
+	t.Run("defaults_when_absent", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig), env)
+		require.NoError(t, err)
+		require.Equal(t, 30*time.Second, cfg.Assets.SyncInterval)
+		require.Equal(t, 20*time.Second, cfg.Assets.SyncTimeout)
+		require.Equal(t, 50, cfg.Assets.SyncBatch)
+		require.Equal(t, int64(16777216), cfg.Assets.MaxBundleBytes)
+		require.Equal(t, 20, cfg.Assets.FullScanEvery)
+		require.Equal(t, 30*time.Second, cfg.Policy.SyncInterval)
+		require.Equal(t, 300*time.Second, cfg.Policy.MaxStale)
+	})
+
+	t.Run("zero_sync_interval_is_startup_only", func(t *testing.T) {
+		cfg, err := cli.LoadConfig(writeConfig(t, baseConfig+
+			"assets:\n  sync_interval: 0s\n"), env)
+		require.NoError(t, err)
+		require.Zero(t, cfg.Assets.SyncInterval)
+	})
+}
+
+// TestConfig_RejectsUnknownAssetKey：`assets` / `policy` 段的未知键与裸数字在装载期
+// 拒绝（yaml 解码器默认静默忽略，拼错键会让进程跑在缺省值上）。
+func TestConfig_RejectsUnknownAssetKey(t *testing.T) {
+	env := envLookup(map[string]string{
+		"DEMO_KEY":  "resolved-secret-value",
+		"DEMO_HOST": "api.internal",
+	})
+
+	for name, tc := range map[string]struct {
+		section string
+		want    string
+	}{
+		"asset_typo": {
+			section: "assets:\n  sync_intervals: 30s\n",
+			want:    "assets 配置包含未知键或非法类型",
+		},
+		"policy_typo": {
+			section: "policy:\n  max_staleness: 5m\n",
+			want:    "policy 配置包含未知键或非法类型",
+		},
+		"bare_number_rejected": {
+			section: "assets:\n  sync_interval: 30\n",
+			want:    "assets 配置包含未知键或非法类型",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := cli.LoadConfig(writeConfig(t, baseConfig+tc.section), env)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
 }

@@ -593,10 +593,12 @@ func TestAgentAdmin_PublishBundleAfterWrite(t *testing.T) {
 	t.Parallel()
 
 	var calls []string
+	var actors []core.Actor
 	var publishErr error
 	env := newAgentAdminEnv(t, func(deps *AgentAdminDeps) {
-		deps.PublishBundle = func(_ context.Context, agent string) (int64, error) {
+		deps.PublishBundle = func(_ context.Context, agent string, actor core.Actor) (int64, error) {
 			calls = append(calls, agent)
+			actors = append(actors, actor)
 			if publishErr != nil {
 				return 0, publishErr
 			}
@@ -619,6 +621,8 @@ func TestAgentAdmin_PublishBundleAfterWrite(t *testing.T) {
 		"提交必须已经落盘")
 
 	require.Equal(t, []string{"fresh", "fresh"}, calls, "创建与提交各触发一次发布")
+	require.Equal(t, []core.Actor{consoleActor(), consoleActor()}, actors,
+		"发布必须透传每次写的真实操作主体")
 	require.Contains(t, env.logs.String(), "发布 Agent 资产失败",
 		"发布失败必须留 ERROR 点名后果（准入将按资产缺失失败关闭）")
 }

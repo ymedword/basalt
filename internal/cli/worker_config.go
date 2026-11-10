@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ymedword/basalt/internal/flow"
@@ -59,12 +60,39 @@ type SchedulerConfig struct {
 	MissedGraceSeconds int `json:"missed_grace_seconds"`
 }
 
-// AssetsConfig 是 `assets` 段：内容寻址 bundle 的根目录。
-// AssetsConfig is the `assets` section: the content-addressed bundle root.
+// AssetsConfig 是 `assets` 段：内容寻址 bundle 的根目录，以及 US-25C 的同步节奏。
+// AssetsConfig is the `assets` section: the content-addressed bundle root plus the
+// US-25C sync cadence.
 type AssetsConfig struct {
 	// BundleRoot 必须非空——空值曾被解释为"取缺省"，与"校验失败即 fail-closed"
 	// 直接矛盾，R3 已删除该二义。
 	BundleRoot string `json:"bundle_root"`
+	// SyncInterval 是**发现检查频率**，不是就绪时限；0 表示只在启动时同步一次。
+	// SyncInterval is the discovery-check cadence, not a readiness SLA; zero means
+	// startup-only sync.
+	SyncInterval time.Duration `json:"-"`
+	// SyncTimeout 是单轮同步的总超时（含发现、安装、准备与注册）。
+	// SyncTimeout bounds one whole sync round.
+	SyncTimeout time.Duration `json:"-"`
+	// SyncBatch 是单轮**尝试**上限（按 attemptSeq 轮转，失败项退到队尾）。
+	// SyncBatch caps attempts per round; failures rotate to the tail.
+	SyncBatch int `json:"sync_batch"`
+	// MaxBundleBytes 是单个载荷的上限，编码与解码两侧都判。
+	// MaxBundleBytes bounds one bundle payload on both encode and decode.
+	MaxBundleBytes int64 `json:"max_bundle_bytes"`
+	// FullScanEvery 是每 N 轮发起一次全量发现兜底；1 表示每轮全量。
+	// FullScanEvery launches a full discovery sweep every N rounds; 1 means always.
+	FullScanEvery int `json:"full_scan_every"`
+}
+
+// PolicyConfig 是 `policy` 段（US-25C §3.3）：运行期策略的刷新周期与过期上限。
+// 段缺席时取冻结缺省；未知键在解析入口拒绝。
+// PolicyConfig is the `policy` section: refresh cadence and the staleness ceiling.
+type PolicyConfig struct {
+	// SyncInterval 是四类运行期策略的一致快照刷新周期。
+	SyncInterval time.Duration `json:"-"`
+	// MaxStale 超过即准入拒绝（POLICY_STALE / 503）。
+	MaxStale time.Duration `json:"-"`
 }
 
 // DefaultWorkerConfig 返回 §3.3 冻结的缺省值。段缺席时由解析入口填入，
@@ -88,10 +116,23 @@ func DefaultSchedulerConfig() SchedulerConfig {
 	return SchedulerConfig{PollIntervalMS: 500, DispatchBatch: 32, MissedGraceSeconds: 300}
 }
 
-// DefaultAssetsConfig 返回 `assets` 段缺省值。
+// DefaultAssetsConfig 返回 `assets` 段缺省值（US-25C §3.3）。
 // DefaultAssetsConfig returns the defaults of the assets section.
 func DefaultAssetsConfig() AssetsConfig {
-	return AssetsConfig{BundleRoot: ".basalt/assets"}
+	return AssetsConfig{
+		BundleRoot:     ".basalt/assets",
+		SyncInterval:   30 * time.Second,
+		SyncTimeout:    20 * time.Second,
+		SyncBatch:      50,
+		MaxBundleBytes: 16777216,
+		FullScanEvery:  20,
+	}
+}
+
+// DefaultPolicyConfig 返回 `policy` 段缺省值（US-25C §3.3）。
+// DefaultPolicyConfig returns the defaults of the policy section.
+func DefaultPolicyConfig() PolicyConfig {
+	return PolicyConfig{SyncInterval: 30 * time.Second, MaxStale: 300 * time.Second}
 }
 
 // LeaseTTL 把秒换算成时长（调用方不再各自乘 time.Second）。
@@ -180,14 +221,91 @@ func parseSchedulerConfig(section any, present bool) (SchedulerConfig, error) {
 	return cfg, nil
 }
 
+// assetsSection 是 `assets` 段解码的影子结构：两个时长键在 YAML 里写 Go duration
+// 字符串（`30s`），先按字符串收下再转换，避免把 "30s" 交给 JSON 数字解码。
+// assetsSection shadows the assets section: duration keys arrive as Go duration
+// strings and are converted after the strict decode.
+type assetsSection struct {
+	BundleRoot     string `json:"bundle_root"`
+	SyncInterval   string `json:"sync_interval"`
+	SyncTimeout    string `json:"sync_timeout"`
+	SyncBatch      int    `json:"sync_batch"`
+	MaxBundleBytes int64  `json:"max_bundle_bytes"`
+	FullScanEvery  int    `json:"full_scan_every"`
+}
+
 // parseAssetsConfig 解析 `assets` 段。
 // parseAssetsConfig parses the assets section.
 func parseAssetsConfig(section any, present bool) (AssetsConfig, error) {
 	cfg := DefaultAssetsConfig()
-	if err := decodeSection(section, present, &cfg, "assets"); err != nil {
+	raw := assetsSection{
+		BundleRoot:     cfg.BundleRoot,
+		SyncInterval:   cfg.SyncInterval.String(),
+		SyncTimeout:    cfg.SyncTimeout.String(),
+		SyncBatch:      cfg.SyncBatch,
+		MaxBundleBytes: cfg.MaxBundleBytes,
+		FullScanEvery:  cfg.FullScanEvery,
+	}
+	if err := decodeSection(section, present, &raw, "assets"); err != nil {
 		return cfg, err
 	}
+	interval, err := parseConfigDuration(raw.SyncInterval, "assets.sync_interval")
+	if err != nil {
+		return cfg, err
+	}
+	timeout, err := parseConfigDuration(raw.SyncTimeout, "assets.sync_timeout")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.BundleRoot = raw.BundleRoot
+	cfg.SyncInterval = interval
+	cfg.SyncTimeout = timeout
+	cfg.SyncBatch = raw.SyncBatch
+	cfg.MaxBundleBytes = raw.MaxBundleBytes
+	cfg.FullScanEvery = raw.FullScanEvery
 	return cfg, nil
+}
+
+// policySection 是 `policy` 段解码的影子结构（两个时长键）。
+// policySection shadows the policy section's two duration keys.
+type policySection struct {
+	SyncInterval string `json:"sync_interval"`
+	MaxStale     string `json:"max_stale"`
+}
+
+// parsePolicyConfig 解析 `policy` 段。
+// parsePolicyConfig parses the policy section.
+func parsePolicyConfig(section any, present bool) (PolicyConfig, error) {
+	cfg := DefaultPolicyConfig()
+	raw := policySection{
+		SyncInterval: cfg.SyncInterval.String(),
+		MaxStale:     cfg.MaxStale.String(),
+	}
+	if err := decodeSection(section, present, &raw, "policy"); err != nil {
+		return cfg, err
+	}
+	interval, err := parseConfigDuration(raw.SyncInterval, "policy.sync_interval")
+	if err != nil {
+		return cfg, err
+	}
+	maxStale, err := parseConfigDuration(raw.MaxStale, "policy.max_stale")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SyncInterval = interval
+	cfg.MaxStale = maxStale
+	return cfg, nil
+}
+
+// parseConfigDuration 解析 Go 时长字面量；裸数字与空串一律拒绝——「写 30 以为是
+// 30 秒」是装载期就该失败的歧义。
+// parseConfigDuration accepts Go duration literals only; bare numbers are refused.
+func parseConfigDuration(value, key string) (time.Duration, error) {
+	parsed, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("配置项 %s 必须是时长字符串（如 30s / 5m），实际为 %q", key, value)
+	}
+	return parsed, nil
 }
 
 // httpShutdownGrace 是既有 HTTP 服务的停机宽限（技术方案 §6.5：70s）。worker 段的
@@ -199,7 +317,7 @@ const httpShutdownGrace = 70 * time.Second
 // 任何一条不成立都让启动失败，不静默取缺省、不把非法值解释成"没配"。
 // validateDistributedConfig implements every rule of §3.3 as a load-time refusal.
 func validateDistributedConfig(worker WorkerConfig, scheduler SchedulerConfig,
-	assets AssetsConfig, flows flow.Config,
+	assets AssetsConfig, policy PolicyConfig, flows flow.Config,
 ) error {
 	if worker.LeaseTTLSeconds < 5 || worker.LeaseTTLSeconds > 300 {
 		return fmt.Errorf("配置项 worker.lease_ttl_seconds 取值非法（%d）——只允许 5..300 秒",
@@ -271,6 +389,31 @@ func validateDistributedConfig(worker WorkerConfig, scheduler SchedulerConfig,
 	if assets.BundleRoot == "" {
 		return errors.New("配置项 assets.bundle_root 不得为空——资产根是内容寻址校验的唯一入口，" +
 			"空值不允许被解释成缺省（US-24 R3）")
+	}
+	// US-25C §3.3：同步节奏与载荷上限。`sync_interval = 0` 是合法值（只在启动时
+	// 同步一次）；其余为零或负数都说明配置写错，不静默当缺省。
+	// US-25C §3.3: zero sync_interval is legal (startup-only); every other zero or
+	// negative value is a configuration mistake and fails at load time.
+	if assets.SyncInterval < 0 {
+		return fmt.Errorf("配置项 assets.sync_interval 不得为负（%s）", assets.SyncInterval)
+	}
+	if assets.SyncTimeout <= 0 {
+		return fmt.Errorf("配置项 assets.sync_timeout 必须为正（%s）", assets.SyncTimeout)
+	}
+	if assets.SyncBatch < 1 {
+		return fmt.Errorf("配置项 assets.sync_batch 必须不小于 1（%d）", assets.SyncBatch)
+	}
+	if assets.MaxBundleBytes < 1 {
+		return fmt.Errorf("配置项 assets.max_bundle_bytes 必须为正（%d）", assets.MaxBundleBytes)
+	}
+	if assets.FullScanEvery < 1 {
+		return fmt.Errorf("配置项 assets.full_scan_every 必须不小于 1（%d）", assets.FullScanEvery)
+	}
+	if policy.SyncInterval <= 0 {
+		return fmt.Errorf("配置项 policy.sync_interval 必须为正（%s）", policy.SyncInterval)
+	}
+	if policy.MaxStale <= 0 {
+		return fmt.Errorf("配置项 policy.max_stale 必须为正（%s）", policy.MaxStale)
 	}
 	return nil
 }

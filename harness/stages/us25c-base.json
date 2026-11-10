@@ -1,0 +1,360 @@
+{
+  "version": 1,
+  "id": "us25c-base",
+  "approval": "Human review 1 passed 2026-11-09 (user: 'Review ① 通过，按 R8 收口。定稿时仅补清扫描终止性和次数保证的适用条件，不扩大设计、不重开已闭合项；更新指纹后进入 /us-register 25C → /module-dev 25C。实施时先完成定向判据，稳定后冻结代码再运行完整门禁。文档评审通过不代表运行验收通过，commit / push / 发布 / 部署仍按既有授权执行。'). Reviewed module card docs/us/us25c-distributed-consistency.md R8 (1472 lines; card section 7 records body sha256 04c84264...b28e106dc1e03986d809ae92db42 with the middle truncated in the card); finalization R9 appends only section 2.3.5 applicability conditions and the section 7 R8 row, final file 1488 lines sha256 9fb665e14d1ad8492edeea1477f95c5a7da8218fe23e03bf7d5ddf84b72c3f1c. Registry row 25C. Derived by module-dev step 6.1 from module card sections 4.3/4.4 and tasks.md. Windows-native stage: the local PostgreSQL fixture (127.0.0.1:55432 via dev-env/scripts/with-postgres.sh) and the WSL npm toolchain are external prerequisites; no container host. Unit checks carry no build tag; integration, e2e and -race checks live in us25c-sync and us25c-fault. A test-first task may be checked against its red reading; only its implementation task turns the same check green. Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. Human review 2 pending.",
+  "inputs": [
+    "specs/025c-distributed-consistency/spec.md",
+    "specs/025c-distributed-consistency/plan.md",
+    "specs/025c-distributed-consistency/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/app/assets_admission_test.go",
+    "internal/app/schedule_test.go",
+    "internal/core/scheduler_test.go",
+    "internal/web/contract_test.go",
+    "internal/cli/assets_test.go",
+    "internal/cli/config_test.go",
+    "internal/storage/postgres/run_lease_test.go",
+    "internal/storage/postgres/lease_store_test.go",
+    "internal/storage/postgres/worker_store_test.go",
+    "internal/e2e/us25_takeover_test.go",
+    "internal/e2e/us25_shutdown_test.go",
+    "internal/e2e/us25_migration_test.go",
+    "internal/e2e/us25_upgrade_test.go",
+    "docs/contracts/run-and-errors.md",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/schema.pg.sql",
+    "harness/acceptance.json"
+  ],
+  "checks": [
+    {
+      "id": "us25c-base-build",
+      "args": ["go", "build", "./..."],
+      "timeout_seconds": 600,
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-cli-config",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/cli", "-run",
+        "^(TestConfig_ParsesAssetAndPolicySections|TestConfig_RejectsUnknownAssetKey)$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestConfig_ParsesAssetAndPolicySections",
+        "TestConfig_RejectsUnknownAssetKey"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-cli-assets",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/cli", "-run",
+        "^TestCLI_AssetsStatusReadOnly$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestCLI_AssetsStatusReadOnly"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-assets-codec",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/assets", "-run",
+        "^(TestEncodeBundle_|TestDecodeBundle_)"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestEncodeBundle_Deterministic",
+        "TestDecodeBundle_Rejects"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-core-scheduler",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/core", "-run",
+        "^TestScheduler_ReplaceEntries"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestScheduler_ReplaceEntriesBeforeStart",
+        "TestScheduler_ReplaceEntriesAfterStart_DispatchesNewAgent",
+        "TestScheduler_ReplaceEntriesDoesNotRetireAbsentAgent",
+        "TestScheduler_ReplaceEntriesKeepsScanProgress"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-app-publish",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestPublish_|TestBackfill_)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestPublish_WritesPayloadBeforePointer",
+        "TestPublish_SameHashWritesMissingPayload",
+        "TestPublish_PayloadFailureLeavesPointer",
+        "TestBackfill_LegacyPointer",
+        "TestBackfill_MissingDirVisible",
+        "TestBackfill_DoesNotMovePointer"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-app-assetsync",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^TestAssetSync_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestAssetSync_InstalledIsNotReady",
+        "TestAssetSync_InstallAndShortCircuit",
+        "TestAssetSync_RegisterFailureRecoversWithoutRestart",
+        "TestAssetSync_StarvedPrefixStillProgresses",
+        "TestAssetSync_KeysetCursorAdvancesWithinSameMillisecond",
+        "TestAssetSync_InterruptedFullScanRemovesNothing",
+        "TestAssetSync_PeriodicFullScanCatchesDelayedCommit",
+        "TestAssetSync_RefreshesRegistryAndScheduler",
+        "TestAssetSync_RecoversAfterCrashBetweenInstallAndRegister",
+        "TestAssetSync_TickTimeout",
+        "TestAssetSync_DoesNotTouchWorkspace"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-app-skill-materialize",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestAssetSync_MaterializesSkills|TestRun_ReadsL2FromMaterializedSkill)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestAssetSync_MaterializesSkills",
+        "TestRun_ReadsL2FromMaterializedSkill"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-worker-authority",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestWorkerStartup_SkipsSharedWrites|TestWorkerRestart_KeepsNewChannel|TestWorker_AdvancesNextFire|TestScheduler_DefinitionAuthorityFailClosed)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestWorkerStartup_SkipsSharedWrites",
+        "TestWorkerRestart_KeepsNewChannel",
+        "TestWorker_AdvancesNextFire",
+        "TestScheduler_DefinitionAuthorityFailClosed"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-worker-knowledge",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^TestWorkerKnowledge_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestWorkerKnowledge_BoundAgentRetrievalWorks",
+        "TestWorkerKnowledge_MissingGenerationFailsClosed",
+        "TestWorkerKnowledge_NeverEnsuresGeneration"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-policy-refresh",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^TestPolicyRefresh_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestPolicyRefresh_DigestMatchesApplied",
+        "TestPolicyRefresh_DigestDetectsDelete",
+        "TestPolicyRefresh_SameContentNewRevision",
+        "TestPolicyRefresh_ConcurrentNoRegression",
+        "TestPolicyRefresh_LongIdleStaysFresh",
+        "TestPolicyRefresh_StaleRejectsRun"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-skill-repair",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestSkillPublish_|TestSkillRepublish_|TestSkillRepair_)"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestSkillPublish_RepublishesDependents",
+        "TestSkillPublish_DoesNotPublishWorkCopy",
+        "TestSkillRepublish_OutOfOrderPublishKeepsNewest",
+        "TestSkillRepair_RecoversWithoutRestart",
+        "TestSkillRepair_BlockedAfterRepeatedFailures",
+        "TestSkillRepair_WorkerDoesNotRepublish"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-resource-prepare",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestProviderPrepare_PartialFailureIsolated|TestMCPPrepare_(OnlyApplied|SameVersionReusesConnection|CredentialRotationRebuilds|SupersededBeforeSwap|NoDoubleLock)|TestMCPApply_AdminPathSwapsAfterCAS|TestAssetSync_(PrepareBeforeEntryBuild|EntryUsesPreparedSnapshot|PreparedToolsIncludeBuiltins)|TestRegistration_BlocksOnMissingResource)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestProviderPrepare_PartialFailureIsolated",
+        "TestMCPPrepare_OnlyApplied",
+        "TestMCPPrepare_SameVersionReusesConnection",
+        "TestMCPPrepare_CredentialRotationRebuilds",
+        "TestMCPPrepare_SupersededBeforeSwap",
+        "TestMCPApply_AdminPathSwapsAfterCAS",
+        "TestMCPPrepare_NoDoubleLock",
+        "TestAssetSync_PrepareBeforeEntryBuild",
+        "TestAssetSync_EntryUsesPreparedSnapshot",
+        "TestAssetSync_PreparedToolsIncludeBuiltins",
+        "TestRegistration_BlocksOnMissingResource"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-lifecycle",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=10m", "./internal/app", "-run",
+        "^(TestAdmission_UsesLifecycleIndex|TestScheduleGate_UsesIndex|TestLifecycleIndex_NoRowFallsBackToFile)$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestAdmission_UsesLifecycleIndex",
+        "TestScheduleGate_UsesIndex",
+        "TestLifecycleIndex_NoRowFallsBackToFile"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-scheduler-ready",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=15m", "./internal/app", "-run",
+        "^(TestScheduler_(NotReadyLeavesTrigger|PublishBetweenGateAndClaimLeavesTrigger|UnreadyPrefixDoesNotStarveHealthyTask|ErrAssetMovedPrefixDoesNotStarveHealthyTask|NullFullPageDoesNotStarveHealthyTask|SyncRefreshKeepsScanProgress|MissedBehindUnreadyPrefixStillRecorded|DueScanCursorWrapsAfterSweep|SweepCompletesUnderContinuousDue|ScanRespectsFrozenSweepCutoff)|TestClaim_ErrAssetMovedWritesNothing|TestRun_(UsesPinnedBundleWhileSyncAdvances|ForgedPinWithoutClaimRecordRejected)|TestStartRun_PinnedClaimSubstitutesOnlyPointerEquality)$"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestScheduler_NotReadyLeavesTrigger",
+        "TestScheduler_PublishBetweenGateAndClaimLeavesTrigger",
+        "TestClaim_ErrAssetMovedWritesNothing",
+        "TestScheduler_UnreadyPrefixDoesNotStarveHealthyTask",
+        "TestScheduler_ErrAssetMovedPrefixDoesNotStarveHealthyTask",
+        "TestScheduler_NullFullPageDoesNotStarveHealthyTask",
+        "TestScheduler_SyncRefreshKeepsScanProgress",
+        "TestScheduler_MissedBehindUnreadyPrefixStillRecorded",
+        "TestScheduler_DueScanCursorWrapsAfterSweep",
+        "TestScheduler_SweepCompletesUnderContinuousDue",
+        "TestScheduler_ScanRespectsFrozenSweepCutoff",
+        "TestRun_UsesPinnedBundleWhileSyncAdvances",
+        "TestRun_ForgedPinWithoutClaimRecordRejected",
+        "TestStartRun_PinnedClaimSubstitutesOnlyPointerEquality"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-web-publish",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/web", "-run",
+        "^TestOpenAPI_AdminWriteViewsMatchContract$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestOpenAPI_AdminWriteViewsMatchContract"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-web-overview",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/web", "-run",
+        "^TestOpenAPI_SystemOverviewWorkersFields$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestOpenAPI_SystemOverviewWorkersFields"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-app-overview",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=10m", "./internal/app",
+        "-run", "^TestOverview_WorkerViewMapping$"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestOverview_WorkerViewMapping"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-console-test",
+      "args": ["npm", "--prefix", "assets/console", "test"],
+      "timeout_seconds": 600,
+      "level": "source"
+    },
+    {
+      "id": "us25c-base-console-build",
+      "args": ["npm", "--prefix", "assets/console", "run", "build"],
+      "timeout_seconds": 600,
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T002", "checks": ["us25c-base-build"]},
+    {"id": "T003", "checks": ["us25c-base-build"]},
+    {"id": "T001", "checks": ["us25c-base-cli-config"]},
+    {"id": "T005", "checks": ["us25c-base-assets-codec"]},
+    {"id": "T009", "checks": ["us25c-base-assets-codec", "us25c-base-build"]},
+    {"id": "T010", "checks": ["us25c-base-build"]},
+    {"id": "T011", "checks": ["us25c-base-build"]},
+    {"id": "T013", "checks": ["us25c-base-build"]},
+    {"id": "T014", "checks": ["us25c-base-app-publish"]},
+    {"id": "T015", "checks": ["us25c-base-app-publish"]},
+    {"id": "T016", "checks": ["us25c-base-app-assetsync"]},
+    {"id": "T017", "checks": ["us25c-base-app-skill-materialize"]},
+    {"id": "T018", "checks": ["us25c-base-core-scheduler"]},
+    {"id": "T019", "checks": ["us25c-base-app-publish"]},
+    {"id": "T020", "checks": ["us25c-base-app-publish"]},
+    {"id": "T021", "checks": ["us25c-base-app-assetsync"]},
+    {"id": "T022", "checks": ["us25c-base-app-skill-materialize"]},
+    {"id": "T023", "checks": ["us25c-base-app-assetsync"]},
+    {"id": "T024", "checks": ["us25c-base-cli-assets"]},
+    {"id": "T026", "checks": ["us25c-base-worker-authority"]},
+    {"id": "T027", "checks": ["us25c-base-worker-knowledge"]},
+    {"id": "T028", "checks": ["us25c-base-policy-refresh"]},
+    {"id": "T029", "checks": ["us25c-base-skill-repair"]},
+    {"id": "T030", "checks": ["us25c-base-resource-prepare"]},
+    {"id": "T031", "checks": ["us25c-base-lifecycle"]},
+    {"id": "T032", "checks": ["us25c-base-worker-authority"]},
+    {"id": "T033", "checks": ["us25c-base-worker-authority"]},
+    {"id": "T034", "checks": ["us25c-base-lifecycle"]},
+    {"id": "T035", "checks": ["us25c-base-policy-refresh"]},
+    {"id": "T036", "checks": ["us25c-base-skill-repair", "us25c-base-web-publish"]},
+    {"id": "T037", "checks": ["us25c-base-skill-repair"]},
+    {"id": "T038", "checks": ["us25c-base-resource-prepare"]},
+    {"id": "T039", "checks": ["us25c-base-worker-knowledge"]},
+    {"id": "T041", "checks": ["us25c-base-scheduler-ready"]},
+    {"id": "T043", "checks": ["us25c-base-scheduler-ready"]},
+    {"id": "T046", "checks": ["us25c-base-scheduler-ready"]},
+    {"id": "T048", "checks": ["us25c-base-scheduler-ready"]},
+    {"id": "T050", "checks": ["us25c-base-scheduler-ready"]},
+    {"id": "T053", "checks": ["us25c-base-app-overview"]},
+    {"id": "T054", "checks": ["us25c-base-console-test"]},
+    {"id": "T056", "checks": ["us25c-base-web-overview", "us25c-base-app-overview"]},
+    {"id": "T057", "checks": ["us25c-base-console-test"]},
+    {"id": "T058", "checks": ["us25c-base-console-build"]}
+  ]
+}

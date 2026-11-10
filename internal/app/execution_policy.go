@@ -425,6 +425,28 @@ func (a *ExecutionPolicyService) apply(policy core.ExecutionPolicy) {
 	a.current.Store(&snapshot)
 }
 
+// RefreshFromStore 在服务锁内读一次权威行、应用，并用这份实际应用的行计算子摘要
+// （FR-25C-15）。档位内容与修订号一一对应，子摘要只取修订号：同内容不同修订号同样是
+// 变化。行缺失按失败关闭处理（Worker 不执行种子写，缺行只能由控制面初始化）。
+// RefreshFromStore applies and digests the row it read under the lock; a missing row
+// fails closed because workers never seed the policy tables.
+func (a *ExecutionPolicyService) RefreshFromStore(ctx context.Context) (bool, string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	policy, exists, err := a.deps.Store.Load(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	if !exists {
+		return false, "", fmt.Errorf("execution policy 行缺失：先由控制面初始化策略行")
+	}
+	previous := policyExecutionSubDigest(a.Current())
+	digest := policyExecutionSubDigest(policy)
+	a.apply(policy)
+	return digest != previous, digest, nil
+}
+
 // reloadAfterConflict 在修订号 CAS 落败后重读权威行并应用：让页面随后的 GET 与授权
 // 判定看到数据库真值。重读失败只记 WARN——调用方不得据此声称"当前值已知"。
 // reloadAfterConflict converges the live snapshot after a CAS loss.

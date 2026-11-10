@@ -236,8 +236,10 @@ func Run(ctx context.Context, args []string) int {
 			Database:               databaseConfig(cfg),
 			Logger:                 logger,
 			// 创建成功后即发布资产（US-24 §2.3.9 / FR-24-25）：CLI 写路径与
-			// `assets install --agent` 用同一个资产根，装在哪与读哪不分叉（FR-24-44）。
-			BundleRoot: resolveAssetBundleRoot(cfg, workDir),
+			// `assets install --agent` 用同一个资产根，装在哪与读哪不分叉（FR-24-44）；
+			// 载荷上限与 serve 同源（US-25C §2.3.2）。
+			BundleRoot:     resolveAssetBundleRoot(cfg, workDir),
+			MaxBundleBytes: resolveMaxBundleBytes(cfg),
 		},
 		// PostgreSQL 迁移端口与库、锁、运行期资源都无关（每次调用自建并释放连接池），
 		// 因此两条路径都安全带上：`db migrate` 是建库前置，不能要求先有运行期装配。
@@ -307,6 +309,17 @@ func Run(ctx context.Context, args []string) int {
 			Database:               databaseConfig(cfg),
 			Logger:                 logger,
 			Root:                   resolveAssetBundleRoot(cfg, workDir),
+			MaxBundleBytes:         resolveMaxBundleBytes(cfg),
+		},
+		// 分发只读诊断（US-25C §3.1.5）：只开只读会话、不取实例锁、不触发同步。
+		// 资产根与 `assets` 命令组同源——诊断看到的树就是安装写的那棵树。
+		// The read-only distribution diagnostic shares the asset root with the assets
+		// command group; it never takes a lock or triggers a sync.
+		AssetStatus: assetStatusPort{
+			WorkDir:  workDir,
+			Database: databaseConfig(cfg),
+			Logger:   logger,
+			Root:     resolveAssetBundleRoot(cfg, workDir),
 		},
 		CLIWriteActor: func() core.Actor { return cliWriteActor(logger) },
 	}
@@ -344,9 +357,12 @@ func Run(ctx context.Context, args []string) int {
 
 	if needsRuntime(args) {
 		// 重路径：固定次序（取锁 → 打开 → 迁移 → 恢复）在 newRuntime 内一次走完，四个次序
-		// 读数以 `step` 键落日志（T050 T1 的判据）。
-		// The heavy path walks its fixed order inside newRuntime and logs the four steps.
-		rt, rtErr := a.newRuntime(ctx)
+		// 读数以 `step` 键落日志（T050 T1 的判据）。运行期角色由子命令判定（D-25C-06）：
+		// `serve` = control，`gateway` = worker；**不新增** role 配置键。
+		// The heavy path walks its fixed order inside newRuntime and logs the four steps;
+		// the role comes from the subcommand alone.
+		heavyCommand, _ := commandName(args)
+		rt, rtErr := a.newRuntime(ctx, roleForCommand(heavyCommand))
 		if rtErr != nil {
 			logger.Error("重路径装配失败", "error", rtErr)
 			return 1
@@ -411,6 +427,41 @@ func Run(ctx context.Context, args []string) int {
 			}
 			rt.worker = workerRT
 
+			// US-25C §2.3.1：两个后台同步器在调度启动**之前**建好并各跑首轮——领取第一次
+			// 触发时，注册集合与四类运行期策略都已是本进程核对过的读数。构造失败是装配
+			// 接线缺陷（依赖包由 wire.go 固定），按启动失败处理；首轮运行失败**不**阻断
+			// 启动：失败轮不推进策略新鲜度，准入按 POLICY_STALE 失败关闭、下一拍重试即
+			// 恢复（§2.3.6），同步的失败项留在工作集里由后台轮次有界自愈（§2.3.4）。
+			// The two loopers are built and run their first round before the scheduler
+			// starts; a failed first round degrades to the stale-policy gate instead of
+			// aborting startup.
+			syncLoop, syncBuildErr := NewAssetSync(*rt.assetSyncDeps)
+			if syncBuildErr != nil {
+				logger.Error("asset sync wiring is invalid", "error", syncBuildErr)
+				if closeErr := rt.Close(); closeErr != nil {
+					logger.Error("重路径资源释放失败", "error", closeErr)
+				}
+				return 1
+			}
+			rt.assetSync = syncLoop
+			// 就绪门在这里接上同步器（US-25C ADJ-1）：调度器先于本段构造，盒子是两者
+			// 之间唯一的交汇点。必须在 `startSchedules` 之前发布——调度一旦开始领取，
+			// 每一拍都要按同一份同步快照既判门又取钉住哈希。
+			// Bind the readiness gate before the scheduler starts claiming.
+			rt.assetReadyHash.bind(syncLoop)
+			rt.policyRefresher = NewPolicyRefresher(*rt.policyRefresherDeps)
+			if report, syncRunErr := rt.assetSync.SyncOnce(runCtx); syncRunErr != nil {
+				logger.Warn("asset sync first round did not finish",
+					"error", syncRunErr, "round", report.Round)
+			}
+			if _, refreshErr := rt.policyRefresher.RefreshOnce(runCtx); refreshErr != nil {
+				logger.Error("runtime policy first refresh failed", "error", refreshErr)
+			}
+			// 新鲜度门接的是**这一份**刷新器：准入与后台刷新读同一个 `LastVerified`，
+			// 两处各建一份会让准入永远看到"从未核对"。
+			// Admission reads the very same refresher that keeps refreshing it.
+			rt.admission.policyFreshness = rt.policyRefresher
+
 			// 启动失败两层边界（注 16）：存储层致命 → fail closed；runCtx 已被信号取消
 			// → 属于"启动被信号打断"，退出码 0（WARN），其余 → 1（ERROR）。判定只调一次。
 			// A cancelled run context means the signal interrupted startup (0); anything
@@ -427,6 +478,10 @@ func Run(ctx context.Context, args []string) int {
 				}
 				return code
 			}
+			// 调度起来之后两个循环才进后台：它们与调度共享 runCtx，停机时先随取消返回，
+			// joinWorkers 在关库之前等它们（§2.3.4）。
+			// The loops go to the background only after the scheduler starts.
+			rt.startSyncLoops(runCtx, logger)
 		}
 		if needsServer(args) {
 			if flowErr := rt.flows.Start(runCtx); flowErr != nil {

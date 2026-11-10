@@ -194,56 +194,12 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 			// 版本会让准入拿"错误的证据"比对，比没有证据更危险。
 			clients[entry.Name] = override
 		} else {
-			// 构建证据与客户端必须是**同一份**凭据材料（P-21）：取 Key 与取 pin 是两次
-			// 独立读，中间若有换代提交（托管凭据的轮换是一次独立事务，`current_version`
-			// 由此推进），客户端里装的是旧版本明文、证据却写新版本号——准入随后拿这份
-			// 假证据比对"相等"，重建被跳过，每一次调用都带旧 Key 而审计记新 Key。
-			// 版本号单调，所以在取 Key 前后各取一次 pin：两次相等 ⇔ 两次读之间没有换代
-			// 提交，证据的版本号就是装进客户端的那个版本。env 模式下 `credentialPinOf`
-			// 是纯计算（不读库），这次额外调用不产生任何 I/O 与行为变化。
-			// The pin is read before and after the key resolution: equal pins prove no
-			// rotation committed in between, so the recorded version describes the key
-			// actually installed in the client.
-			definition := resourceProviderDefinition{
-				Name:           entry.Name,
-				BaseURL:        entry.BaseURL,
-				CredentialMode: entry.CredentialMode,
-			}
-			pinBefore, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
+			client, proof, err := buildProviderClient(ctx, pointer, entry, version, credentials)
 			if err != nil {
 				return nil, err
-			}
-			apiKey, err := catalogAPIKey(ctx, pointer, entry, version, credentials)
-			if err != nil {
-				return nil, err
-			}
-			client, err := provider.NewOpenAIClient(provider.Options{
-				Name:    entry.Name,
-				BaseURL: entry.BaseURL,
-				APIKey:  apiKey,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("模型连接 %s: %w", entry.Name, err)
-			}
-			// 构建证据与客户端同一份输入：版本行 + 同一份定义算出的凭据 pin（P-21）。
-			pin, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
-			if err != nil {
-				return nil, err
-			}
-			if pin != pinBefore {
-				// 取 Key 的窗口内发生了换代：客户端里的材料与证据版本不再对应。失败关闭
-				// （构建失败保留旧表），不记录一份"看起来对"的假证据。
-				// A rotation committed inside the key-read window: refuse to record a
-				// build proof whose version does not describe the installed key.
-				return nil, fmt.Errorf(
-					"%w: 模型连接 %s 的凭据在目录构建窗口内换代，拒绝记录与客户端材料不符的构建证据",
-					core.ErrCredentialUnavailable, entry.Name)
 			}
 			clients[entry.Name] = client
-			built[entry.Name] = core.BuiltVersion{
-				Resource:   versionRef(entry.Name, version),
-				Credential: pin,
-			}
+			built[entry.Name] = proof
 		}
 		models[entry.Name] = entry.DefaultModel
 	}
@@ -252,6 +208,61 @@ func newProviderCatalogFromPublishedExcept(ctx context.Context, store *postgres.
 		logger.Debug("模型连接目录：按已发布版本构建", "count", len(clients))
 	}
 	return &providerCatalog{clients: clients, models: models, built: built}, nil
+}
+
+// buildProviderClient 为单个已发布模型连接构建客户端与构建证据（P-21）：整体重建与
+// 同步阶段的逐条准备共用本函数——两条路径各写一份时，凭据窗口复核会只存在于其中一边。
+//
+// 构建证据与客户端必须是**同一份**凭据材料：取 Key 与取 pin 是两次独立读，中间若有
+// 换代提交（托管凭据的轮换是一次独立事务，`current_version` 由此推进），客户端里装的
+// 是旧版本明文、证据却写新版本号——准入随后拿这份假证据比对"相等"，重建被跳过，每
+// 一次调用都带旧 Key 而审计记新 Key。版本号单调，所以在取 Key 前后各取一次 pin：两次
+// 相等 ⇔ 两次读之间没有换代提交，证据的版本号就是装进客户端的那个版本。env 模式下
+// `credentialPinOf` 是纯计算（不读库），这次额外调用不产生任何 I/O 与行为变化。
+// buildProviderClient builds one published connection's client together with the
+// proof describing the very same credential material.
+func buildProviderClient(ctx context.Context, pointer core.ResourcePointer,
+	entry workspace.ProviderEntry, version core.ResourceVersion, credentials catalogCredentialSource,
+) (core.ProviderClient, core.BuiltVersion, error) {
+	definition := resourceProviderDefinition{
+		Name:           entry.Name,
+		BaseURL:        entry.BaseURL,
+		CredentialMode: entry.CredentialMode,
+	}
+	pinBefore, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
+	if err != nil {
+		return nil, core.BuiltVersion{}, err
+	}
+	apiKey, err := catalogAPIKey(ctx, pointer, entry, version, credentials)
+	if err != nil {
+		return nil, core.BuiltVersion{}, err
+	}
+	client, err := provider.NewOpenAIClient(provider.Options{
+		Name:    entry.Name,
+		BaseURL: entry.BaseURL,
+		APIKey:  apiKey,
+	})
+	if err != nil {
+		return nil, core.BuiltVersion{}, fmt.Errorf("模型连接 %s: %w", entry.Name, err)
+	}
+	// 构建证据与客户端同一份输入：版本行 + 同一份定义算出的凭据 pin（P-21）。
+	pin, err := credentialPinOf(ctx, entry.Name, version.ResourceUID, definition, credentials)
+	if err != nil {
+		return nil, core.BuiltVersion{}, err
+	}
+	if pin != pinBefore {
+		// 取 Key 的窗口内发生了换代：客户端里的材料与证据版本不再对应。失败关闭
+		// （构建失败保留旧表），不记录一份"看起来对"的假证据。
+		// A rotation committed inside the key-read window: refuse to record a
+		// build proof whose version does not describe the installed key.
+		return nil, core.BuiltVersion{}, fmt.Errorf(
+			"%w: 模型连接 %s 的凭据在目录构建窗口内换代，拒绝记录与客户端材料不符的构建证据",
+			core.ErrCredentialUnavailable, entry.Name)
+	}
+	return client, core.BuiltVersion{
+		Resource:   versionRef(entry.Name, version),
+		Credential: pin,
+	}, nil
 }
 
 // builtVersionFrom 由一个已发布版本行与它的定义原文算出本地实例构建证据：版本引用取
@@ -330,13 +341,20 @@ func catalogAPIKey(ctx context.Context, pointer core.ResourcePointer,
 	}
 }
 
+// resourceVersionReader 是 `publishedProviderEntry` 对存储的唯一读需求：按版本号取版本
+// 行。接口声明在消费方，真实实现是 `*postgres.ResourceStore`，定向用例给最小替身即可。
+// resourceVersionReader is the single storage read publishedProviderEntry needs.
+type resourceVersionReader interface {
+	VersionByID(ctx context.Context, id int64) (core.ResourceVersion, error)
+}
+
 // publishedProviderEntry 从发布指针取版本并解析成**恰一个**条目：版本必须属于该资源，
 // 定义原文必须是块式列表片段（发布时写入的块原文），条目名必须与资源标识一致——任何
 // 一条不成立都说明存储与定义分叉，启动必须失败关闭而不是构造一张错表。版本一并返回，
 // 供托管凭据按**发布版本**解析（准入固定语义）。
 // publishedProviderEntry resolves one published version into exactly one entry and
 // fails closed on any identity or shape mismatch.
-func publishedProviderEntry(ctx context.Context, store *postgres.ResourceStore,
+func publishedProviderEntry(ctx context.Context, store resourceVersionReader,
 	pointer core.ResourcePointer,
 ) (workspace.ProviderEntry, core.ResourceVersion, error) {
 	var entry workspace.ProviderEntry

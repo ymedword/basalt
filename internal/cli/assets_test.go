@@ -17,6 +17,9 @@ package cli
 //	C4 `TestCLI_AssetsInstallAgentBuildsThenPublishes`——`install --agent` 把 Agent
 //	   名原样交给构建入口，构建结果再走与 `<bundle-dir>` 相同的安装与发布路径；
 //	   两种 install 形态互斥，参数被拒时零发布。
+//	C5 `TestCLI_AssetsStatusReadOnly`——只读诊断逐 Agent 打印五个字段，汇总由同一份
+//	   行数据数出；触发面（Build / Publish）零调用，空表与端口失败各有明确文案
+//	   （US-25C §3.1.5）。
 //
 // The command surface's own acceptance: recording fakes, a real bundle built in a
 // temp dir, and no database.
@@ -70,6 +73,22 @@ func (p *fakeAssetsPort) Build(ctx context.Context, agent, dest string) (assets.
 		return assets.Manifest{}, errors.New("测试替身未注入 Build")
 	}
 	return p.build(ctx, agent, dest)
+}
+
+// fakeAssetStatusReader 是只读诊断端口的替身：返回固定报告与固定错误，调用次数可数。
+// fakeAssetStatusReader returns a fixed report and counts its calls.
+type fakeAssetStatusReader struct {
+	report AssetStatusReport
+	err    error
+	calls  int
+}
+
+func (f *fakeAssetStatusReader) Status(context.Context) (AssetStatusReport, error) {
+	f.calls++
+	if f.err != nil {
+		return AssetStatusReport{}, f.err
+	}
+	return f.report, nil
 }
 
 // fakeWorkerLister 是只读端口的替身：返回固定行与固定错误。
@@ -192,6 +211,86 @@ func TestCLI_AssetsExportInstallVerifyRoundTrip(t *testing.T) {
 	require.Contains(t, out, "published_version_id=42")
 	require.Len(t, port.published, 2)
 	require.Equal(t, wantDir, port.published[1].Dir)
+}
+
+// C5：`assets status` 是只读诊断——五个字段逐行齐全、计数由同一份行数据数出，
+// 且**零触发**：它不碰 AssetsPort（不 Build、不 Publish）、只调一次只读端口。
+// C5: assets status is a read-only diagnostic — every field is printed, the summary is
+// counted from the same rows, and the triggering surface is never touched.
+func TestCLI_AssetsStatusReadOnly(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "assets-root")
+	busy := &fakeAssetStatusReader{report: AssetStatusReport{
+		AssetRoot: root,
+		Agents: []AssetStatusRow{
+			{
+				Agent:         "alpha",
+				PointerHash:   "hash-alpha",
+				InstalledHash: "hash-alpha",
+				Payload:       "present",
+				Skills:        "materialized",
+			},
+			{
+				Agent:         "beta",
+				PointerHash:   "hash-beta",
+				Payload:       "payload_missing",
+				Skills:        "unknown",
+				BlockedReason: "payload_missing",
+			},
+		},
+	}}
+	// 触发面：任何一次 Build / Publish 都会被记下来，用例据此断言"零调用"。
+	// The triggering surface records every call so the test can assert zero.
+	triggered := 0
+	assetsPortFake := &fakeAssetsPort{root: root}
+	assetsPortFake.build = func(context.Context, string, string) (assets.Manifest, error) {
+		triggered++
+		return assets.Manifest{}, errors.New("status 不得调用构建入口")
+	}
+	deps := Deps{
+		WorkDir:     t.TempDir(),
+		Logger:      quietLogger(),
+		Assets:      assetsPortFake,
+		AssetStatus: busy,
+	}
+
+	out, err := executeAssets(t, deps, "status")
+	require.NoError(t, err)
+	require.Equal(t, 1, busy.calls, "每条子命令只调一次只读端口")
+
+	// 资产根与两行读数：五个字段逐项出现，缺任何一项都算诊断不完整。
+	require.Contains(t, out, "资产根："+root)
+	for _, want := range []string{
+		"agent=alpha", "指针哈希：hash-alpha", "已安装哈希：hash-alpha",
+		"载荷：present", "技能物化：materialized", "阻塞原因：—",
+		"agent=beta", "指针哈希：hash-beta", "已安装哈希：—",
+		"载荷：payload_missing", "技能物化：unknown", "阻塞原因：payload_missing",
+		"汇总：agents=2 ready=1 blocked=1",
+	} {
+		require.Contains(t, out, want)
+	}
+
+	// 只读：触发路径零调用，命令面不得以"顺手刷新"为名绕过同步。
+	require.Zero(t, triggered, "status 不得调用构建入口")
+	require.Empty(t, assetsPortFake.published, "status 不得发生任何发布")
+
+	// 空表：照实说没有已发布的 bundle，汇总全零而不是留白。
+	empty := &fakeAssetStatusReader{report: AssetStatusReport{AssetRoot: root}}
+	out, err = executeAssets(t, Deps{WorkDir: t.TempDir(), Logger: quietLogger(), AssetStatus: empty}, "status")
+	require.NoError(t, err)
+	require.Contains(t, out, "（没有已发布的 Agent bundle）")
+	require.Contains(t, out, "汇总：agents=0 ready=0 blocked=0")
+
+	// 缺端口：命令面不得自己打开数据库补出第二条读面。
+	_, err = executeAssets(t, Deps{WorkDir: t.TempDir(), Logger: quietLogger()}, "status")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "资产状态端口")
+
+	// 端口失败：原样上抛、非空，不重试。
+	broken := &fakeAssetStatusReader{err: errors.New("数据库不可用：连接被拒绝")}
+	_, err = executeAssets(t, Deps{WorkDir: t.TempDir(), Logger: quietLogger(), AssetStatus: broken}, "status")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "连接被拒绝")
+	require.Equal(t, 1, broken.calls, "失败不得重试")
 }
 
 // C4：`install --agent` 先构建、再走与 `<bundle-dir>` 完全相同的安装与发布路径。

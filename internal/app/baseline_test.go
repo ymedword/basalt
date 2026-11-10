@@ -329,7 +329,7 @@ func TestRunBaseline_ConcurrentStartup(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-begin
-			rt, err := fx.app().newRuntime(context.Background())
+			rt, err := fx.app().newRuntime(context.Background(), roleControl)
 			starts[i] = startup{rt: rt, err: err}
 		}()
 	}

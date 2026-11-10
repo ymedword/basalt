@@ -38,14 +38,18 @@ type SystemReadings struct {
 	MCPServers        int64
 	Skills            int64
 	SchemaVersion     int
-	// Workers / ActiveLeases 是分布式执行的只读诊断读数（US-24 §3.1.13）：
-	// 登记的 Worker 实例与**全库**仍有效的执行权数量。`ActiveLeases` 统计全部
-	// 负责人（含没有 worker_nodes 行的 `legacy` 回填租约），因此不等于各节点
-	// 活跃租约数之和。
-	// Workers and ActiveLeases are the distributed runtime's read-only readings; the
-	// total counts every owner, including owners without a node row.
-	Workers      []core.WorkerNodeView
-	ActiveLeases int64
+	// Workers / ActiveLeases 是分布式执行的只读诊断读数（US-24 §3.1.13，US-25C
+	// §2.3.9 扩展为按进程实例的三态读数）：`Workers` 携带同一快照的全库计数与有界
+	// 明细，`ActiveLeases` 与它们来自**同一条语句的快照**，统计**全部**负责人（含
+	// 没有 worker_nodes 行的 `legacy` 回填租约），因此不等于各节点活跃租约数之和。
+	// `WorkerDefaultIntervalSeconds` 是本部署的心跳间隔，仅用于迁移前旧行的诊断
+	// 阈值兜底与详情标注，不参与任何归属判定。
+	// Workers and ActiveLeases are the distributed runtime's read-only readings from one
+	// statement snapshot; the total counts every owner, including owners without a node
+	// row.
+	Workers                      core.WorkerOverview
+	ActiveLeases                 int64
+	WorkerDefaultIntervalSeconds int
 }
 
 // SystemReader 是概览的数据库侧数据源（由 app 层适配 storage 的 Ping /
@@ -71,25 +75,76 @@ type SystemOverviewView struct {
 	Auth          SystemAuthView       `json:"auth"`
 }
 
-// SystemWorkersView 是 Worker 列表与活跃租约计数（US-24 §3.1.13）。与 runs /
-// resources 同一条纪律：数据库不可读时**整组省略**，不把"读不到"显示成 0；
-// 反过来，能读到时的 0 是真实读数（没有 Worker 在跑）。
-// The worker group follows the same rule as runs/resources: omitted as a whole when
-// the database is unreadable, while a readable zero is a real reading.
+// SystemWorkersView 是 Worker 列表与活跃租约计数（US-24 §3.1.13；US-25C §2.3.9
+// 扩展为按进程实例的三态读数）。与 runs / resources 同一条纪律：数据库不可读时
+// **整组省略**，不把"读不到"显示成 0；反过来，能读到时的 0 是真实读数。
+//
+// 统计对象是**进程实例**，不是服务器：同一 `worker_name` 的多个实例各自成行，页面
+// 不得按名称合并，也不得由行数推断物理机数量。`counts` / `total` 是全库聚合，
+// `nodes` 是有界明细（`truncated = true` 表示明细被截断）。
+// The counts are process instances, not servers; they come from the database aggregate,
+// never from the bounded detail rows.
 type SystemWorkersView struct {
-	ActiveLeases int64              `json:"active_leases"`
-	Nodes        []SystemWorkerView `json:"nodes"`
+	AsOf         string                 `json:"as_of"`
+	Counts       SystemWorkerCountsView `json:"counts"`
+	Total        int                    `json:"total"`
+	Truncated    bool                   `json:"truncated"`
+	ActiveLeases int64                  `json:"active_leases"`
+	Nodes        []SystemWorkerView     `json:"nodes"`
 }
 
-// SystemWorkerView 是单个 Worker 的只读行，字段与 `basalt workers list` 同源同形
-// （instance / name / started / heartbeat / active leases）。
-// One worker row, identical to the fields of `basalt workers list`.
+// SystemWorkerCountsView 是三类服务端状态的全库计数（`active` 只表示近期有心跳，
+// 不等于任务运行正常；`stale` 是心跳超时待确认，不证明进程已死）。
+// The database-wide counts of the three server-side states.
+type SystemWorkerCountsView struct {
+	Active  int `json:"active"`
+	Stale   int `json:"stale"`
+	Stopped int `json:"stopped"`
+}
+
+// SystemWorkerView 是单个 Worker 的只读行，字段与 `basalt workers list` 同源同形，
+// 另加服务端计算的状态与诊断读数（§3.1.6）。
+//
+//   - `status` 只取 `active` / `stale` / `stopped` 三值，由服务端用数据库时钟判定；
+//     页面不得用浏览器时钟重算；
+//   - `heartbeat_interval_seconds` 缺省（旧行）表示迁移前登记，阈值取部署默认并由
+//     `stale_after_seconds` 给出实际生效值；
+//   - `active_leases` 是该实例仍有效的执行权数量，不是"正在执行的任务数"。
+//
+// One worker row: the same shape as `basalt workers list`, plus server-computed status
+// and diagnostic readings.
 type SystemWorkerView struct {
-	Instance     string `json:"instance"`
-	Name         string `json:"name"`
-	StartedAt    string `json:"started_at"`
-	HeartbeatAt  string `json:"heartbeat_at"`
-	ActiveLeases int64  `json:"active_leases"`
+	Instance                 string `json:"instance"`
+	Name                     string `json:"name"`
+	Hostname                 string `json:"hostname"`
+	BuildVersion             string `json:"build_version"`
+	SchemaVersion            int    `json:"schema_version"`
+	StartedAt                string `json:"started_at"`
+	HeartbeatAt              string `json:"heartbeat_at"`
+	StoppedAt                string `json:"stopped_at,omitempty"`
+	HeartbeatAgeSeconds      int64  `json:"heartbeat_age_seconds"`
+	HeartbeatIntervalSeconds *int   `json:"heartbeat_interval_seconds,omitempty"`
+	StaleAfterSeconds        int    `json:"stale_after_seconds"`
+	Status                   string `json:"status"`
+	ActiveLeases             int64  `json:"active_leases"`
+}
+
+// workerStaleAfterSeconds 是逐行诊断阈值 `max(3 × 心跳间隔, 30s)`（§2.3.9）。
+// 旧行没有登记间隔时用部署默认兜底——不得拿管理台进程自己的间隔套给所有实例。
+// workerStaleAfterSeconds is the per-row diagnostic threshold; a nil interval means a
+// pre-migration row falling back to the deployment default.
+func workerStaleAfterSeconds(interval *int, deploymentDefault int) int {
+	seconds := deploymentDefault
+	if interval != nil {
+		seconds = *interval
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	if threshold := 3 * seconds; threshold > 30 {
+		return threshold
+	}
+	return 30
 }
 
 // SystemAgentsView 是 Agent 计数（契约 SystemOverview.agents）；invalid 表示装载期
@@ -213,19 +268,44 @@ func (s *Server) handleSystemOverview(w http.ResponseWriter, r *http.Request, ac
 		MCPServers:       readings.MCPServers,
 		Skills:           readings.Skills,
 	}
-	// Worker 组永远编码为数组（没有实例时 `[]`），与列表端点同一纪律。
-	// The node list is always an array, empty when no worker has registered.
-	nodes := make([]SystemWorkerView, 0, len(readings.Workers))
-	for _, node := range readings.Workers {
-		nodes = append(nodes, SystemWorkerView{
-			Instance:     node.InstanceID,
-			Name:         node.Name,
-			StartedAt:    formatTime(node.StartedAt),
-			HeartbeatAt:  formatTime(node.LastHeartbeatAt),
-			ActiveLeases: node.ActiveLeases,
-		})
+	// Worker 组永远编码为数组（没有实例时 `[]`），与列表端点同一纪律。计数与明细
+	// 来自存储层**同一条语句的同一快照**；这里只做投影，不重算、不合并、不补 0。
+	// The node list is always an array, empty when no worker has registered; counts and
+	// rows are projected from the store's single-statement snapshot.
+	overview := readings.Workers
+	nodes := make([]SystemWorkerView, 0, len(overview.Nodes))
+	for _, node := range overview.Nodes {
+		row := SystemWorkerView{
+			Instance:                 node.InstanceID,
+			Name:                     node.Name,
+			Hostname:                 node.Hostname,
+			BuildVersion:             node.BuildVersion,
+			SchemaVersion:            node.SchemaVersion,
+			StartedAt:                formatTime(node.StartedAt),
+			HeartbeatAt:              formatTime(node.LastHeartbeatAt),
+			HeartbeatAgeSeconds:      node.HeartbeatAgeSeconds,
+			HeartbeatIntervalSeconds: node.HeartbeatIntervalSeconds,
+			StaleAfterSeconds:        workerStaleAfterSeconds(node.HeartbeatIntervalSeconds, readings.WorkerDefaultIntervalSeconds),
+			Status:                   node.Status,
+			ActiveLeases:             node.ActiveLeases,
+		}
+		if node.StoppedAt != nil {
+			row.StoppedAt = formatTime(*node.StoppedAt)
+		}
+		nodes = append(nodes, row)
 	}
-	view.Workers = &SystemWorkersView{ActiveLeases: readings.ActiveLeases, Nodes: nodes}
+	view.Workers = &SystemWorkersView{
+		AsOf: formatTime(overview.AsOf),
+		Counts: SystemWorkerCountsView{
+			Active:  overview.Counts.Active,
+			Stale:   overview.Counts.Stale,
+			Stopped: overview.Counts.Stopped,
+		},
+		Total:        overview.Total,
+		Truncated:    overview.Truncated,
+		ActiveLeases: readings.ActiveLeases,
+		Nodes:        nodes,
+	}
 	view.Database = SystemDatabaseView{Status: databaseStatusOK, SchemaVersion: &schemaVersion}
 	s.writeOK(w, view)
 }

@@ -1,10 +1,18 @@
 import { createServer as httpServer } from 'node:http'
 import { pathToFileURL } from 'node:url'
 
+// 定时任务消息是演示数据的唯一固定输入：AGENT.md 的 schedules.message 与站点断言共用它。
+// The scheduled-task message is the single fixed input shared by the demo AGENT.md and tests.
+export const SCHEDULED_MESSAGE = 'Prepare the daily brief from the project records.'
+
 // 此夹具只模拟协议，不进行推断；浏览器不会调用该进程。
 // This fixture simulates the protocol, not inference; the browser never calls it.
 export function replyFor(messages) {
   const lastUser = messages.findLastIndex(message => message.role === 'user')
+  if (messages[lastUser]?.content === SCHEDULED_MESSAGE) return {
+    role: 'assistant',
+    content: 'Basalt is a self-hosted Agent OS.\nThis scheduled run reused the shared scheduler, execution and audit path.'
+  }
   const result = messages.slice(lastUser + 1).findLast(message => message.role === 'tool' && message.tool_call_id === 'basalt-demo-readme')
   if (result) return {
     role: 'assistant',

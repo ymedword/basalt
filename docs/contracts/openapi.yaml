@@ -4876,13 +4876,14 @@ components:
           schema: { $ref: '#/components/schemas/Envelope' }
     ServiceUnavailable:
       description: |
-        前置条件当前不可用（503，fail-closed）。三种业务码：
+        前置条件当前不可用（503，fail-closed）。四种业务码：
 
         - `CREDENTIAL_UNAVAILABLE`——托管凭据不可用（主密钥缺失 / 权限不符 / 格式错误 / key_id 不匹配 / 解密失败）
         - `ASSET_UNAVAILABLE`——`agent_bundle` 发布指针缺失 / 已软删除，或本地内容寻址目录缺失 / 不可读
         - `RESOURCE_VERSION_MISMATCH`——Provider / MCP 的本地实例版本证明不成立（含 MCP 尚无已应用版本），且按同一目标版本重建-换入-再比后仍不符（同一业务码的 409 形态见 `Conflict`）
+        - `POLICY_STALE`——四类运行期策略（允许域 / 拒绝域 / 访问例外 / 执行档位）最近一次**全部成功**的核对超过 `policy.max_stale`，或从未成功过；文案点名最近成功核对时间，后台刷新成功一轮后自动放行
 
-        这三种都只拒绝**新 Run**，不静默换版本、不以最新为准、不自动发布本地内容为真相。
+        这四种都只拒绝**新 Run**，不静默换版本、不以最新为准、不自动发布本地内容为真相。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Envelope' }
@@ -7179,6 +7180,21 @@ components:
           properties:
             tools_added: { type: array, items: { type: string } }
             tools_removed: { type: array, items: { type: string } }
+        publish:
+          type: object
+          description: '本次写触发的资产发布结果（2026-11-09 用户裁决，修订 D-25-10）：内容保存（`PUT /agents/{name}/content`）与创建 / 多文件提交 / 复制 / 恢复的成功响应恒带；发布在各自写锁内完成，写的顺序即发布的顺序。写本身已生效且不回退，失败只影响资产发布——下一次 Run 会被准入拒绝，页面必须显示 `error` 提示。只读装配面（`GET`）没有发布结果，省略该字段。'
+          properties:
+            status:
+              type: string
+              enum: [published, failed, skipped]
+              description: '`published` = 共享发布指针已指向本次内容对应的版本；`failed` = 保存已生效但发布未完成；`skipped` = 该写面未接线发布。'
+            published_version_id:
+              type: integer
+              description: '本次发布的版本号；仅 `published` 时出现。'
+            error:
+              type: string
+              description: '面向页面的固定中文提示，仅 `failed` 时出现；不含底层错误原文与路径。'
+          required: [status]
 
     AgentDraftView:
       type: object
@@ -7374,9 +7390,19 @@ components:
             skills: { type: integer }
         workers:
           type: object
-          description: 'US-24 只读诊断：登记过的 Worker 实例与全库仍有效的执行权。数据库不可读时整组省略，不补 0。active_leases 统计全部负责人（含无节点行的回填租约），不等于 nodes 各行之和'
+          description: 'US-24 只读诊断：登记过的 Worker 实例与全库仍有效的执行权。统计对象是**进程实例，不是服务器**——同一宿主机上的多个进程各占一行，同一 worker_name 的多个实例也不合并。数据库不可读时整组省略，不补 0（不得渲染成 0）。active_leases 统计全部负责人（含无节点行的回填租约），是**全库计数、不等于 nodes 各行之和**。US-25C 起按进程实例给出服务端判定的三类状态（active / stale / stopped）；stale 只表示心跳超时待确认，不推断已停止；状态与心跳只作显示，不参与准入、调度或租约接管'
           properties:
-            active_leases: { type: integer }
+            as_of: { type: string, format: date-time, description: '数据库时间；同一快照内所有年龄与状态都按它计算（浏览器时钟不参与判定）' }
+            active_leases: { type: integer, description: '全库仍有效的执行租约总数（全局计数，不等于 nodes 各行之和）' }
+            counts:
+              type: object
+              description: '全库聚合（与 nodes 同一条 SQL、同一快照）：分状态计数'
+              properties:
+                active: { type: integer }
+                stale: { type: integer }
+                stopped: { type: integer }
+            total: { type: integer, description: '三类计数之和（active + stale + stopped，含已停止的登记行）的全库总数；可能大于 nodes 长度' }
+            truncated: { type: boolean, description: '明细是否因上限截断；true 时 total 仍为全库数' }
             nodes:
               type: array
               items:
@@ -7384,8 +7410,16 @@ components:
                 properties:
                   instance: { type: string, description: 进程实例标识（身份以此为准，Name 可重复） }
                   name: { type: string }
+                  hostname: { type: string, description: 宿主名，仅作诊断展示 }
+                  build_version: { type: string, description: 构建版本（stamp），空串表示未登记 }
+                  schema_version: { type: integer, description: 该实例登记的 schema 版本 }
                   started_at: { type: string, format: date-time }
                   heartbeat_at: { type: string, format: date-time, description: 仅作诊断，不用作死亡判定 }
+                  stopped_at: { type: string, format: date-time, description: '仅 status=stopped 时出现' }
+                  heartbeat_age_seconds: { type: integer, description: '服务端按 as_of 计算的心跳年龄（秒）' }
+                  heartbeat_interval_seconds: { type: integer, description: '登记的心跳间隔（迁移 0013 可空列）；旧行缺值（迁移前登记）时省略，前端按部署默认展示并在详情标注' }
+                  stale_after_seconds: { type: integer, description: '诊断阈值 max(3 × heartbeat_interval_seconds, 30s)；心跳年龄超过该值判 stale' }
+                  status: { type: string, enum: [active, stale, stopped], description: '服务端判定：active 心跳正常；stale 心跳超时待确认（不推断死亡）；stopped 已停止' }
                   active_leases: { type: integer }
         database:
           type: object
@@ -7992,6 +8026,19 @@ components:
       properties:
         version: { $ref: '#/components/schemas/ResourceVersionView' }
         pending_restart: { type: boolean, description: 仅 MCP 首版可能为 true }
+        publish:
+          type: array
+          description: 'US-25C：技能发布成功后联动重发直接依赖的 Agent（锁内复核 Agent 指针与技能当前已发布版本，发布前再复查）。逐 Agent 给出结果；非技能发布或未触发重发时省略。发布请求内不重试，failed / missing / superseded 由控制面技能修复器在后续轮次有界重试'
+          items:
+            type: object
+            properties:
+              agent: { type: string, description: Agent 名 }
+              status:
+                type: string
+                enum: [ok, skipped, superseded, missing, failed]
+                description: '`ok` = 已重发；`skipped` = 该 Agent 无需重发（未直接引用或指针已是新版本）；`superseded` = 发布前复查发现技能指针已被更新的版本覆盖，本次不写；`missing` = Agent 定义 / 目录缺失；`failed` = 重发失败'
+              error: { type: string, description: '仅 missing / failed 时出现的固定中文原因；不含底层原文与路径' }
+            required: [agent, status]
 
     CredentialRevokeRequest:
       type: object

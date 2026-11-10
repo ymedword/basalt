@@ -269,7 +269,7 @@ func TestScheduleCoord_ListDispatchableAndCASAdvance(t *testing.T) {
 	require.Equal(t, []string{"never", "due"}, ids,
 		"NULL 排最前（先初始化）、再按 next_fire_at 升序；停用 / 退休 / 未到期都不在集合里")
 
-	// 初始化分支：无预期值 → 无条件写一次。
+	// 初始化分支：无预期值 → 条件写（行仍为 NULL 时成功）。
 	next := opNow.Add(5 * time.Minute)
 	require.NoError(t, store.SetNextFire(ctx, "never", nil, next))
 	got, ok := scheduleNextFireOf(t, db, "never")
@@ -291,6 +291,40 @@ func TestScheduleCoord_ListDispatchableAndCASAdvance(t *testing.T) {
 
 	// 未知任务：初始化写必须如实报"不存在"，不得静默成功。
 	require.ErrorIs(t, store.SetNextFire(ctx, "ghost", nil, next), fs.ErrNotExist)
+}
+
+// TestScheduleCoord_InitDoesNotClobberConcurrentArm：初始化（next_fire_at 从 NULL 写成
+// 非空）必须是**行条件写**——扫描到 NULL 只是快照，不是写权。若在读取与写入之间外部
+// （管理面重写 / 夹具武装）已把行改成"已到期"，迟到的初始化必须放弃（ErrStaleNextFire）
+// 并一字不改；无条件 UPDATE 会把外部刚写下的触发覆盖成 cron 算出的未来值，触发被静默
+// 吞掉（US-25C 收尾实测：一整圈 60s 无执行行、无任何 WARN/ERROR）。
+//
+// 逆改点：把初始化写回无条件 UPDATE → 本用例红（armed 被覆盖成 future）。
+// The NULL-initialization is a conditional write: a late init loses to an external
+// writer with ErrStaleNextFire instead of clobbering the armed trigger.
+func TestScheduleCoord_InitDoesNotClobberConcurrentArm(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := portTestDB(t)
+	store := NewTaskStore(db)
+
+	taskPortSeedTask(t, db, "race", "demo", "0 0 0 1 1 *", "并发武装")
+	due, err := store.ListDispatchable(ctx, 32)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	require.True(t, due[0].NextFireAt.IsZero(), "初态必须是扫描可见的 NULL 行")
+
+	// 扫描之后、初始化之前：外部把该行改成"已到期"（等价于夹具武装 / 管理面重写）。
+	armed := opNow.Add(-time.Minute)
+	scheduleSetNextFire(t, db, "race", armed)
+
+	// 迟到的初始化：必须放弃且一字不改。
+	future := opNow.Add(5 * time.Minute)
+	err = store.SetNextFire(ctx, "race", nil, future)
+	require.ErrorIs(t, err, core.ErrStaleNextFire)
+	got, ok := scheduleNextFireOf(t, db, "race")
+	require.True(t, ok)
+	require.Equal(t, armed.UnixMilli(), got.UnixMilli(), "迟到的初始化不得覆盖外部刚写下的触发")
 }
 
 // TestScheduler_ClaimRejectsTaskDisabledAfterScan 判领取对**最新已提交启停状态**的复查

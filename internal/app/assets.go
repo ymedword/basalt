@@ -92,6 +92,48 @@ func (v *assetVerifier) VerifyBundle(ctx context.Context, agent string, uid core
 		return core.AssetBundlePin{}, fmt.Errorf("%w: Agent %s 的资产版本 %d 没有内容哈希",
 			core.ErrAssetVersionMismatch, agent, version.ID)
 	}
+	return v.verifyAt(ctx, agent, uid, expected)
+}
+
+// VerifyBundleAt 按**给定的固定哈希**解析并校验资产包（US-25C §2.3.5.1 T2）：不读
+// 发布指针——领取时钉住的哈希就是权威，同步即使已推进到新版本，本次 Run 仍只认这一份。
+// 目录缺失 / 不可读 / 身份或哈希不符一律 `core.ErrAssetUnavailable`（本实例现在给不出
+// 领取钉住的那一份），不退回指针目录；目录内容与清单逐文件不符仍按版本不符拒绝。
+// VerifyBundleAt verifies the claimed hash without reading the publication pointer; a
+// missing or mismatched directory is unavailable rather than "switch to latest".
+func (v *assetVerifier) VerifyBundleAt(ctx context.Context, agent string, uid core.AgentUID,
+	hash string,
+) (core.AssetBundlePin, error) {
+	if v == nil || v.versions == nil {
+		return core.AssetBundlePin{}, fmt.Errorf("%w: 资产校验器未接资源仓储", core.ErrAssetUnavailable)
+	}
+	if strings.TrimSpace(v.root) == "" {
+		return core.AssetBundlePin{}, fmt.Errorf("%w: 资产根为空（assets.bundle_root 必须非空）", core.ErrAssetUnavailable)
+	}
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return core.AssetBundlePin{}, fmt.Errorf("%w: Agent %s 的钉住 bundle 哈希为空", core.ErrAssetUnavailable, agent)
+	}
+	pin, err := v.verifyAt(ctx, agent, uid, hash)
+	if err != nil {
+		// 钉住路径的错误分类统一为"不可用"：对本次 Run 而言，领取钉住的那一版
+		// 在本实例读不出来就是服务不了，而不是"有一个可用的新版本"。
+		// A pinned verification failure always means this version is unserviceable here.
+		if errors.Is(err, core.ErrAssetVersionMismatch) {
+			return core.AssetBundlePin{}, fmt.Errorf("%w: %v", core.ErrAssetUnavailable, err)
+		}
+		return core.AssetBundlePin{}, err
+	}
+	return pin, nil
+}
+
+// verifyAt 是两条校验路径共用的尾部：按期望哈希定位不可变目录、逐文件复核、断言清单
+// 属于同一 Agent 身份。目录缺失 / 不可读由 `assets.Resolve` / `Verify` 以
+// `ErrAssetUnavailable` 报出；内容与记录不符以 `ErrAssetVersionMismatch` 报出。
+// verifyAt shares the resolve/verify/identity tail of both verification paths.
+func (v *assetVerifier) verifyAt(ctx context.Context, agent string, uid core.AgentUID,
+	expected string,
+) (core.AssetBundlePin, error) {
 	dir, err := assets.Resolve(ctx, v.root, agent, expected)
 	if err != nil {
 		return core.AssetBundlePin{}, err

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "id": "us25c-docs",
+  "approval": "Human review 1 passed 2026-11-09 (user: 'Review ① 通过，按 R8 收口。定稿时仅补清扫描终止性和次数保证的适用条件，不扩大设计、不重开已闭合项；更新指纹后进入 /us-register 25C → /module-dev 25C。实施时先完成定向判据，稳定后冻结代码再运行完整门禁。文档评审通过不代表运行验收通过，commit / push / 发布 / 部署仍按既有授权执行。'). Reviewed module card docs/us/us25c-distributed-consistency.md R8 (1472 lines) finalized as R9 (1488 lines, sha256 9fb665e14d1ad8492edeea1477f95c5a7da8218fe23e03bf7d5ddf84b72c3f1c). Registry row 25C. Derived by module-dev step 6.1 from module card sections 4.3/4.4 and tasks.md T059-T064. Site checks use the WSL npm toolchain because Git Bash and PowerShell on this host have no npm; Node 24.22.0 per website/.nvmrc remains unverified on this machine and is recorded in run-state, not silently downgraded. No real model calls; DEMO_COMMAND uses the local stub. Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. Human review 2 pending.",
+  "inputs": [
+    "specs/025c-distributed-consistency/spec.md",
+    "specs/025c-distributed-consistency/plan.md",
+    "specs/025c-distributed-consistency/tasks.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "website/tests/routes.test.mjs",
+    "website/tests/content.test.mjs",
+    "website/tests/demo.test.mjs",
+    "website/scripts/check-links.mjs",
+    "website/scripts/check-diagrams.mjs",
+    "internal/cli/docs_first_run_test.go",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/run-and-errors.md",
+    "harness/acceptance.json"
+  ],
+  "checks": [
+    {
+      "id": "us25c-docs-cli",
+      "args": [
+        "go", "test", "-json", "-count=1", "-timeout=5m", "./internal/cli", "-run",
+        "^(TestDocs_AssetSyncSectionAndRecovery|TestDocs_ReadmeArchitectureAndDemoLink)$"
+      ],
+      "timeout_seconds": 600,
+      "required_tests": [
+        "TestDocs_AssetSyncSectionAndRecovery",
+        "TestDocs_ReadmeArchitectureAndDemoLink"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-docs-website-test",
+      "args": ["npm", "--prefix", "website", "test"],
+      "timeout_seconds": 900,
+      "level": "source"
+    },
+    {
+      "id": "us25c-docs-website-build",
+      "args": ["npm", "--prefix", "website", "run", "build"],
+      "timeout_seconds": 1200,
+      "level": "source"
+    },
+    {
+      "id": "us25c-docs-website-check",
+      "args": ["npm", "--prefix", "website", "run", "check"],
+      "timeout_seconds": 1200,
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T059", "checks": ["us25c-docs-website-test"]},
+    {"id": "T060", "checks": ["us25c-docs-cli"]},
+    {"id": "T061", "checks": ["us25c-docs-website-test"]},
+    {"id": "T062", "checks": ["us25c-docs-website-test", "us25c-docs-website-check"]},
+    {"id": "T063", "checks": ["us25c-docs-cli"]},
+    {"id": "T064", "checks": ["us25c-docs-website-test", "us25c-docs-website-build", "us25c-docs-website-check"]},
+    {"id": "T065", "checks": ["us25c-docs-cli", "us25c-docs-website-test", "us25c-docs-website-build", "us25c-docs-website-check"]},
+    {"id": "T069", "checks": ["us25c-docs-website-test"]},
+    {"id": "T070", "checks": ["us25c-docs-website-test"]},
+    {"id": "T071", "checks": ["us25c-docs-website-test"]},
+    {"id": "T072", "checks": ["us25c-docs-website-test", "us25c-docs-website-build", "us25c-docs-website-check"]}
+  ]
+}

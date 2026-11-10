@@ -30,6 +30,12 @@ func (p flowResourcesProbe) Resolve(context.Context, core.AgentEntry) (core.Reso
 	return p.resolved, nil
 }
 
+// ResolvePinned 与 Resolve 同解：本文件的 Flow 判据只用普通 Run 路径。
+// ResolvePinned mirrors Resolve because Flow judges here never pin a bundle.
+func (p flowResourcesProbe) ResolvePinned(context.Context, core.AgentEntry, string) (core.ResolvedResources, error) {
+	return p.resolved, nil
+}
+
 func (p *flowLifecycleProbe) Read(context.Context, string) (core.LifecycleRecord, bool, error) {
 	return p.record, p.exists, nil
 }

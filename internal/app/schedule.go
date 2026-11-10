@@ -78,14 +78,15 @@ func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entrie
 	delivery core.ScheduleDelivery, closeout core.RunCloseout, gate core.ScheduleGate,
 	cfg *cli.Config, logger *slog.Logger,
 	ownerKeys core.OwnerKeyVerifier, posture *postureBox,
-	leases core.LeaseStore, worker core.WorkerIdentity,
+	leases core.LeaseStore, worker core.WorkerIdentity, role runtimeRole,
+	assets *assetReadyHashBox,
 ) *core.Scheduler {
 	if logger == nil {
 		logger = a.loggerOr()
 	}
 	workerCfg := workerSettings(cfg)
 	schedCfg := schedulerSettings(cfg)
-	return core.NewScheduler(core.SchedulerOptions{
+	options := core.SchedulerOptions{
 		Store:        store,
 		Invoker:      invoker,
 		Engine:       cronadapter.New(logger),
@@ -115,7 +116,74 @@ func (a *App) newScheduler(store core.TaskStore, invoker core.RunInvoker, entrie
 		PollInterval:  schedCfg.PollInterval(),
 		DispatchBatch: schedCfg.DispatchBatch,
 		MissedGrace:   schedCfg.MissedGrace(),
-	})
+		// 定义写权（§2.3.1 / `sharedInitTaskDefinitions`）：调度定义列的写归控制面；Worker
+		// 只做只读对账、运行期定义写失败关闭。判定走统一角色门，与其余共享初始化写同源。
+		// Definition authority is a shared-initialization write; workers reconcile read-only.
+		DefinitionAuthority: role.allowSharedInit(sharedInitTaskDefinitions),
+	}
+	// 就绪门与领取钉住由同步器**迟到发布**（AssetSync 在 run.go 里比调度器晚构造）：
+	// 未发布时保持 nil，调度器按"不设门"运行——轻装配与测试因此不受影响；发布后每一拍
+	// 都以同一份同步快照既判门又取钉住哈希（ADJ-1）。
+	// The readiness gate is published late by the sync loop; nil keeps the light assembly
+	// ungated until then.
+	if assets != nil {
+		options.AssetReadyHash = assets.get
+	}
+	return core.NewScheduler(options)
+}
+
+// assetReadyHashBox 是资产就绪门的**迟绑定发布盒**（US-25C ADJ-1，与 postureBox 同一
+// 模式）：调度器在重路径装配里构造，AssetSync 在 run.go 的启动段才创建，两者之间没有
+// 别的交汇点。盒子只做一次写、每拍读；未发布时 `get` 报错（未就绪）而不是放行——
+// 宁可让到期行多等一轮，也不得在没接同步器的进程里领取一条无法证明版本的执行。
+// The box publishes the sync loop's readiness snapshot to the already-built scheduler;
+// before publication every due row reads as "not ready" rather than ungated.
+type assetReadyHashBox struct {
+	mu     sync.RWMutex
+	source claimReadySource
+}
+
+// claimReadySource 是发布盒消费的窄接口：同步器给"本机是否可按该哈希服务"的判定
+// （ClaimReadyHash），未就绪原因走同一个 Readiness 快照，供 WARN 点名。
+// claimReadySource is the narrow consumer port filled by the sync loop.
+type claimReadySource interface {
+	ClaimReadyHash(agent string) (string, bool)
+	Readiness() map[string]Readiness
+}
+
+// bind 发布同步器实例；同一次启动内只应调用一次。
+// bind publishes the sync loop instance.
+func (b *assetReadyHashBox) bind(source claimReadySource) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.source = source
+}
+
+// get 求值就绪门：返回本次领取应钉住的哈希；error 表示未就绪（原因进限速 WARN）。
+// 未发布 / 不在工作集 / 已安装哈希与目标不符都算未就绪——不领取、不推进、不写执行行。
+// get evaluates the gate; every "cannot serve this hash here" outcome reads as not ready.
+func (b *assetReadyHashBox) get(_ context.Context, agent string) (string, error) {
+	if b == nil {
+		return "", errors.New("asset sync is not initialized yet")
+	}
+	b.mu.RLock()
+	source := b.source
+	b.mu.RUnlock()
+	if source == nil {
+		return "", errors.New("asset sync is not initialized yet")
+	}
+	hash, ok := source.ClaimReadyHash(agent)
+	if ok {
+		return hash, nil
+	}
+	if ready, found := source.Readiness()[agent]; found {
+		return "", fmt.Errorf("asset bundle is not claimable yet (pointer=%s ready=%s lifecycle=%s blocked=%s)",
+			ready.PointerHash, ready.ReadyHash, ready.Lifecycle, ready.BlockedReason)
+	}
+	return "", errors.New("agent is not in the asset sync working set")
 }
 
 // schedulerSettings 取出 `scheduler` 段；配置文件整体缺失时（`cfg == nil` 或未经解码
@@ -130,20 +198,14 @@ func schedulerSettings(cfg *cli.Config) cli.SchedulerConfig {
 }
 
 // lifecycleScheduleGate 把「生命周期状态是否为 active」接成调度门的默认实现
-// （14D / E5「启用才运行」；设计 §2.5.1 的硬约束）。状态**每次触发都重读状态文件**，
-// 不缓存：启用 / 停用在下一次到点即生效，与准入路径读同一份文件、同一套校验。
-// 读不到、校验失败、文件不存在一律返回 false（失败关闭）——门的作用是少跑而不是
-// 多跑，读不出来时宁可跳过本轮，也不得把损坏状态读成 active。
-// The gate re-reads the lifecycle file on every tick and fails closed: an unreadable or
-// invalid state never counts as active.
+// （14D / E5「启用才运行」；设计 §2.5.1 的硬约束）。未装配生命周期索引时（老部署）
+// 它退化为 `lifecycleScheduleGateFor(file, nil)`——读状态文件、每次触发都重读、不缓存，
+// 行为与改造前逐字一致。索引优先的口径在 lifecycleScheduleGateFor / readLifecyclePreferred
+// （`lifecycle_index.go`）：门与准入必须读同一套判定，不得各写一套。
+// Without a lifecycle index this degrades to the file-only gate, byte-for-byte the
+// pre-change behavior; index-first semantics live in lifecycleScheduleGateFor.
 func lifecycleScheduleGate(lifecycle *workspace.LifecycleStore) core.ScheduleGate {
-	if lifecycle == nil {
-		return nil
-	}
-	return func(ctx context.Context, agent string) bool {
-		rec, exists, err := lifecycle.Read(ctx, agent)
-		return err == nil && exists && rec.State == core.AgentActive
-	}
+	return lifecycleScheduleGateFor(lifecycle, nil)
 }
 
 // needsSchedules 只对 serve / gateway 为真（约束 20）：其余重命令不构造运行期调度，

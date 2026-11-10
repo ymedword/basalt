@@ -247,6 +247,8 @@ func TestHeavyRuntime_CloseStopsSchedulerFirst(t *testing.T) {
 		Worker:        schedTestWorker,
 		LeaseTTL:      30 * time.Second,
 		RenewInterval: 10 * time.Second,
+		// 夹具建模控制面实例（US-25C T033 起的显式定义写权开关）。
+		DefinitionAuthority: true,
 	})
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	t.Cleanup(cancelRun)
@@ -497,8 +499,11 @@ func newScheduleTestScheduler(t *testing.T, cfg *cli.Config, entries []core.Agen
 	// The clock is real: the due set is filtered by the database clock, so a past
 	// reading would make every scan claim the same task again.
 	a := &App{logger: slog.Default(), now: time.Now}
+	// 夹具跑控制面语义（DefinitionAuthority 打开）——这批用例在角色拆分之前写成，
+	// 打的是 serve 形态的调度行为；Worker 形态由 worker_authority 测试单独覆盖。
+	// The fixture runs control semantics; worker behaviour has its own tests.
 	sched := a.newScheduler(store, invoker, entries, nil, nil, nil, cfg, slog.Default(), nil,
-		&postureBox{}, postgres.NewLeaseStore(db), schedTestWorker)
+		&postureBox{}, postgres.NewLeaseStore(db), schedTestWorker, roleControl, nil)
 	return sched, invoker, store
 }
 
@@ -979,6 +984,8 @@ func newArchiveScheduleFixture(t *testing.T, entries []core.AgentEntry, store co
 		Worker:        schedTestWorker,
 		LeaseTTL:      30 * time.Second,
 		RenewInterval: 10 * time.Second,
+		// 夹具建模控制面实例（US-25C T033 起的显式定义写权开关）。
+		DefinitionAuthority: true,
 	})
 	require.NoError(t, sched.Start(context.Background()))
 	t.Cleanup(sched.Stop)
@@ -1057,6 +1064,8 @@ func newAdapterFixture(t *testing.T, root string, entries []core.AgentEntry, sto
 		Worker:        schedTestWorker,
 		LeaseTTL:      30 * time.Second,
 		RenewInterval: 10 * time.Second,
+		// 夹具建模控制面实例（US-25C T033 起的显式定义写权开关）。
+		DefinitionAuthority: true,
 	})
 	if start {
 		require.NoError(t, sched.Start(context.Background()))
@@ -1217,7 +1226,7 @@ func TestScheduler_DeliveredRunReleasesLeaseAfterCloseout(t *testing.T) {
 	}}
 	a := &App{logger: slog.Default(), now: time.Now}
 	sched := a.newScheduler(store, invoker, entries, delivery, runs, nil,
-		&cli.Config{}, slog.Default(), nil, &postureBox{}, leases, schedTestWorker)
+		&cli.Config{}, slog.Default(), nil, &postureBox{}, leases, schedTestWorker, roleControl, nil)
 	require.NoError(t, sched.Start(ctx))
 	t.Cleanup(sched.Stop)
 

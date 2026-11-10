@@ -296,11 +296,29 @@ type agentRegistry struct {
 	// current 是当前快照；只通过 Load / CompareAndSwap 访问。
 	// current is the published snapshot, touched only through Load / CompareAndSwap.
 	current atomic.Pointer[registrySnapshot]
+
+	// pinned 是钉住运行装载面的**晚绑定**槽（US-25C §2.3.5.1 T2）：装配在构造注册表
+	// 之后、调度启动之前填一次。未绑定（nil）时 `LookupPinned` 失败关闭——钉住运行
+	// 绝不退回当前快照。
+	// pinned is the late-bound pinned loader slot; unbound means fail closed.
+	pinned atomic.Pointer[pinnedBinding]
 }
 
-// 编译期断言：注册表就是运行入口消费的 AgentSource（§3.1.20 的方法表）。
-// Compile-time assertion that the registry satisfies the consumer's port.
-var _ core.AgentSource = (*agentRegistry)(nil)
+// pinnedBinding 包一层指针槽以允许 `atomic.Pointer` 承载接口值。
+// pinnedBinding wraps the interface in a pointer slot for atomic publication.
+type pinnedBinding struct {
+	source core.PinnedAgentSource
+}
+
+// 编译期断言：注册表就是运行入口消费的 AgentSource（§3.1.20 的方法表），也是同步的
+// 窄写面（US-25C C18）。
+// Compile-time assertions: the registry satisfies the consumer port and the sync's
+// narrow write face.
+var (
+	_ core.AgentSource       = (*agentRegistry)(nil)
+	_ core.PinnedAgentSource = (*agentRegistry)(nil)
+	_ AgentRegistryReplacer  = (*agentRegistry)(nil)
+)
 
 // newAgentRegistry 用装载结果建首版快照；root / logger 供 `Dir` 与 `Snapshot` 使用
 // （§3.1.20 的构造签名只列了 entries，但两个 AgentSource 方法需要工作区根与装载器，
@@ -327,10 +345,57 @@ func (r *agentRegistry) Lookup(name string) (core.AgentEntry, bool) {
 	return entry, ok
 }
 
+// BindPinned 绑定钉住运行的装载面（装配期一次，之后只读）。绑定前 `LookupPinned`
+// 失败关闭：钉住运行不会因为槽为空而退回当前快照。
+// BindPinned installs the pinned loader once during assembly.
+func (r *agentRegistry) BindPinned(source core.PinnedAgentSource) {
+	r.pinned.Store(&pinnedBinding{source: source})
+}
+
+// LookupPinned 是 `core.PinnedAgentSource` 的委托实现：注册表本身不持有 bundle
+// 知识，只把调用交给绑定过的装载面。未绑定 / 装载面为 nil → `ErrAssetUnavailable`。
+// LookupPinned delegates to the bound loader; an unbound slot fails closed.
+func (r *agentRegistry) LookupPinned(ctx context.Context, agent, hash string) (core.AgentEntry, error) {
+	binding := r.pinned.Load()
+	if binding == nil || binding.source == nil {
+		return core.AgentEntry{}, fmt.Errorf("%w: 钉住装载面未绑定（agent=%s）", core.ErrAssetUnavailable, agent)
+	}
+	return binding.source.LookupPinned(ctx, agent, hash)
+}
+
 // Entries 返回按 name 升序的副本——调用方改动切片不影响注册表。
 // Entries returns a name-sorted copy, so callers cannot mutate the registry.
 func (r *agentRegistry) Entries() []core.AgentEntry {
 	return slices.Clone(r.current.Load().entries)
+}
+
+// ReplaceAll 是同步工作集的整批发布（US-25C C18 / FR-25C-10）：在**一次** CAS 里把
+// 一批条目 upsert 进当前快照，与其他写者并发时重读重试。两处语义收窄都是刻意的：
+// ① **不删除**输入之外的条目——共享库缺席的 Agent 只从本进程内存移除，注册表不推断
+// "这次没送来"等于"该下线"；② 未注册条目与 `with` 同口径按移除处理，注册不变量仍
+// 只由本文件维护。方法不返回错误：快照构建是纯内存操作，冲突由重试吸收。
+// ReplaceAll publishes one sync batch through a single CAS; entries absent from the
+// batch are never deleted, and a non-registered entry is still treated as removal.
+func (r *agentRegistry) ReplaceAll(entries []core.AgentEntry) error {
+	for {
+		old := r.current.Load()
+		byName := make(map[string]core.AgentEntry, len(old.byName)+len(entries))
+		for key, value := range old.byName {
+			byName[key] = value
+		}
+		for _, entry := range entries {
+			if entry.Registered {
+				byName[entry.Name] = entry
+				continue
+			}
+			// 未注册条目与 `with` 同口径：upsert 成"存在但不可运行"等价于移除。
+			delete(byName, entry.Name)
+		}
+		next := snapshotFrom(byName)
+		if r.current.CompareAndSwap(old, &next) {
+			return nil
+		}
+	}
 }
 
 // Replace 是 upsert：名字不存在即插入（US-12 归档回滚用它把旧条目放回）；重复冲突时

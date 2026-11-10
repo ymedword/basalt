@@ -81,6 +81,11 @@ type assetsPort struct {
 	// Root 是已经解析（绝对化）的内容寻址 bundle 根目录。
 	// Root is the already-resolved content-addressed bundle root.
 	Root string
+	// MaxBundleBytes 是发布载荷的上限（`assets.max_bundle_bytes`，US-25C §2.3.2）：
+	// 接线缺失时发布按装配错误失败关闭，不退化成"跳过载荷只装本地"。
+	// MaxBundleBytes bounds the published payload; a missing value fails the publish
+	// closed instead of degrading into a local-only install.
+	MaxBundleBytes int64
 	// open 默认为 postgres.Open（含前向迁移）；测试注入以证明锁的次序。
 	// open defaults to postgres.Open; a test injects it to observe the lock order.
 	open func(context.Context, postgres.Config) (*postgres.DB, error)
@@ -153,7 +158,8 @@ func (p assetsPort) Publish(ctx context.Context, installed assets.Installed) (in
 			return err
 		}
 		publisher := newBundlePublisher(postgres.NewResourceStore(db),
-			postgres.NewManagementStore(db), p.logger(), p.nowOr())
+			postgres.NewManagementStore(db), postgres.NewBundlePayloadStore(db), p.MaxBundleBytes,
+			p.logger(), p.nowOr())
 		published, publishErr := publisher.Publish(ctx, installed)
 		closeErr := db.Close()
 		if publishErr != nil {

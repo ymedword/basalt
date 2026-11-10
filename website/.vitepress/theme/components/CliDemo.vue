@@ -55,7 +55,7 @@ onBeforeUnmount(() => { cancelAnimationFrame(frame); observer?.disconnect(); pre
 
 <template>
   <section ref="stage" class="cli-demo" :aria-label="zh ? 'CLI 演示' : 'CLI demo'">
-    <p class="cli-subtitle">{{ zh ? '读取文件，查看摘要。' : 'Read a file. Get a summary.' }}</p>
+    <p class="cli-subtitle">{{ zh ? '按计划执行一次，查看运行记录。' : 'Run one scheduled task. Inspect the recorded run.' }}</p>
     <div class="terminal" :data-playing="playing">
       <div class="terminal-title"><span class="terminal-dot" aria-hidden="true"></span>Basalt — CLI</div>
       <pre class="terminal-output" aria-hidden="true"><span v-for="(line, index) in text.split('\n')" :key="index" class="terminal-line"><template v-if="index === 0"><span class="terminal-prompt">{{ line.slice(0, 1) }}</span>{{ line.slice(1) }}</template><template v-else>{{ line }}</template><span v-if="index === text.split('\n').length - 1" class="terminal-cursor"></span></span></pre>

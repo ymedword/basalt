@@ -2073,6 +2073,22 @@ type AgentFilesView struct {
 	// Changes reports the system-applied tool deltas of this save; notify is the only
 	// possible name and both arrays are always present.
 	Changes AgentToolChangeView `json:"changes"`
+	// Publish 是本次写触发的资产发布结果（2026-11-09 用户裁决，修订 D-25-10）：
+	// 内容保存与创建 / 多文件提交 / 复制 / 恢复的成功响应恒带（published / failed /
+	// skipped）；只读读取没有发布结果，省略该字段。
+	// Publish rides on every successful write face; read-only responses omit it.
+	Publish *AgentPublishView `json:"publish,omitempty"`
+}
+
+// AgentPublishView 是内容保存触发的资产发布结果（契约 AgentPublishView）：
+// `status` 取 published / failed / skipped；`error` 是面向页面的固定中文提示，
+// 只在 failed 时出现，底层错误原文与路径只进日志。
+// AgentPublishView is the publication outcome of a content save; the fixed Chinese
+// error text appears only on failure and never carries the underlying error.
+type AgentPublishView struct {
+	Status             string `json:"status"`
+	PublishedVersionID int64  `json:"published_version_id,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 // AgentToolChangeView 是系统自动工具变更的响应投影（数组恒非 nil，约束 34）。
@@ -2095,7 +2111,7 @@ func agentFilesView(files core.AgentFiles, etag string) AgentFilesView {
 	for i, file := range files.Files {
 		items[i] = AgentFileView{Path: file.Path, Size: file.Size}
 	}
-	return AgentFilesView{
+	view := AgentFilesView{
 		Agent: files.Agent,
 		Lifecycle: AgentLifecycleView{
 			Agent:          files.Agent,
@@ -2110,6 +2126,14 @@ func agentFilesView(files core.AgentFiles, etag string) AgentFilesView {
 			Removed: stringSlice(files.Changes.Removed),
 		},
 	}
+	if files.Publish.Status != "" {
+		view.Publish = &AgentPublishView{
+			Status:             string(files.Publish.Status),
+			PublishedVersionID: files.Publish.VersionID,
+			Error:              files.Publish.Error,
+		}
+	}
+	return view
 }
 
 // AdmissionListView 是学习准入候选的列表行（US-21 §3.1.11）：只有数据库行的

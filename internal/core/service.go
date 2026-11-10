@@ -78,6 +78,16 @@ type AgentSource interface {
 	Snapshot(ctx context.Context, entry AgentEntry, now time.Time) (*ConfigSnapshot, error)
 }
 
+// PinnedAgentSource 是**钉住运行**的 Entry 装载面（US-25C §2.3.5.1 T2）：只在
+// `RunRequest.Pinned != nil` 时使用，从领取记录固定的 bundle 构建 Entry，**不**读注册表
+// 的当前原子快照。刻意不并进 `AgentSource`：普通 Run 与钉住 Run 的来源不同，绑在一起
+// 会让"没有钉住能力的装载面"在编译期假装支持钉住。
+// PinnedAgentSource builds an entry from the pinned bundle and never reads the registry's
+// current snapshot. It is deliberately separate from AgentSource.
+type PinnedAgentSource interface {
+	LookupPinned(ctx context.Context, agent, hash string) (AgentEntry, error)
+}
+
 // SessionStatusStore 是会话状态端口（消费方 = AgentService，实现 = storage.SessionStore）：
 // 运行准入据它拒绝已归档会话，归档动作经它与在途运行互斥。未命中一律 fs.ErrNotExist。
 // SessionStatusStore is the session-status port the entry point consumes; a miss is
@@ -141,6 +151,12 @@ type ServiceOptions struct {
 	// Resources resolves the published resources at admission. When non-nil it requires
 	// Lifecycle and RunSnapshots as well; a partial wiring fails closed before any run.
 	Resources RunResources
+	// Claims 回读调度领取的执行行（US-25C §2.3.5.1 T2）：只在 `RunRequest.Pinned != nil`
+	// 时使用，作为准入的**廉价前置**——领取记录缺失 / 状态不是 started / Run、Agent、
+	// 哈希或租约副本不符一律 `ErrClaimPinInvalid`，不回落当前指针。nil 表示没有调度
+	// 领取通道的装配；此时钉住请求直接按无效领取拒绝（编排错误不得被当成普通 Run）。
+	// Claims reads the claimed execution row; it is the cheap precheck for pinned runs only.
+	Claims PinnedClaimReader
 	// RunSnapshots 把解析结果与配置快照合成一次运行的冻结输入（越早固定越不会漂移）。
 	// nil = 尚未接线；与 Resources 必须同进同出。
 	// RunSnapshots folds resolved resources into the run's frozen snapshot; it must be
@@ -314,9 +330,9 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (ret RunResult, 
 			return RunResult{}, err
 		}
 	}
-	entry, ok := s.lookupAgent(req.Agent)
-	if !ok {
-		return RunResult{}, &AgentNotFoundError{Name: req.Agent}
+	entry, err := s.lookupRunEntry(ctx, req)
+	if err != nil {
+		return RunResult{}, err
 	}
 	release, err := s.admit(ctx, req)
 	if err != nil {
@@ -334,6 +350,12 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (ret RunResult, 
 	// error and fails closed before any trace is written.
 	if s.opts.Resources != nil && (s.opts.RunSnapshots == nil || s.opts.Lifecycle == nil) {
 		return RunResult{}, errors.New("agent service: run resources are configured without a snapshot builder or lifecycle port")
+	}
+	// 钉住 Run 必须能在清单里留下固定哈希（`BuildRunResourceManifest` 的 `AssetBundleHash`）；
+	// 没有资源接线就没有清单，钉住的证明链断在这里——装配错误，失败关闭。
+	// A pinned run without run resources cannot record its frozen hash: assembly error.
+	if req.Pinned != nil && s.opts.Resources == nil {
+		return RunResult{}, errors.New("agent service: pinned run requires run resources")
 	}
 	// 执行权装配必须完整：写了租约行却没人续约，TTL 一到别处即可合法接管，而本进程
 	// 还在执行——两边同时写，fencing 只能事后拒绝一方。零 `Worker` 是明确的"无租约
@@ -374,7 +396,15 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (ret RunResult, 
 		llmClient = s.opts.Client
 	)
 	if s.opts.Resources != nil {
-		resolved, err = s.opts.Resources.Resolve(ctx, entry)
+		// 钉住 Run 的技能与配置从固定 bundle 解析（US-25C §2.3.5.1 T2）：领取之后同步
+		// 可能已推进到新版本，本次 Run 仍必须用领取时钉住的那一份；其余检查与普通路径
+		// 逐项相同。普通 Run 行为不变。
+		// A pinned run resolves skills from its frozen bundle; every other check matches.
+		if req.Pinned != nil {
+			resolved, err = s.opts.Resources.ResolvePinned(ctx, entry, req.Pinned.BundleHash)
+		} else {
+			resolved, err = s.opts.Resources.Resolve(ctx, entry)
+		}
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
 		}
@@ -393,6 +423,14 @@ func (s *AgentService) Run(ctx context.Context, req RunRequest) (ret RunResult, 
 		manifest, err = BuildRunResourceManifest(lifecycle.AgentUID, lifecycle.State, resolved)
 		if err != nil {
 			return RunResult{}, s.resourceUnavailable(req.Agent, err)
+		}
+		// 最后一道对账：清单记录的 bundle 必须**就是**领取时钉住的哈希。上面的
+		// `ResolvePinned` 已按固定哈希取件，这里是独立复核——装配层若把两条路径接错，
+		// 这里以 `ErrClaimPinInvalid` 失败关闭，而不是带着错版本继续跑。
+		// The manifest must record exactly the claimed hash; a wiring mistake fails closed here.
+		if req.Pinned != nil && manifest.AssetBundleHash != req.Pinned.BundleHash {
+			return RunResult{}, fmt.Errorf("%w: manifest bundle %q differs from claimed pin %q (execution_id=%d)",
+				ErrClaimPinInvalid, manifest.AssetBundleHash, req.Pinned.BundleHash, req.Pinned.ExecutionID)
 		}
 		if req.Flow != nil && manifest.Hash != req.Flow.ResourceManifestHash {
 			return RunResult{}, ErrFlowDispatch
@@ -1066,6 +1104,70 @@ func (s *AgentService) lookupAgent(name string) (AgentEntry, bool) {
 		return AgentEntry{}, false
 	}
 	return s.opts.Agents.Lookup(name)
+}
+
+// lookupRunEntry 按请求种类选择 Entry 来源（US-25C §2.3.5.1 T2）：
+//
+//   - 普通 Run（`Pinned == nil`）：既有注册表查找；
+//   - 钉住 Run：先回读领取记录并逐项核对（执行行存在、status=started、run_id /
+//     agent / 哈希 / 租约 owner+epoch 全等），再从**固定的 bundle** 构建 Entry。
+//     **不得**退回注册表的当前快照——领取之后同步可能已推进到新版本，本次 Run 的
+//     定义与技能必须仍来自领取时钉住的那一份。
+//
+// 任一不符 → `ErrClaimPinInvalid`；装载面不支持钉住 → `ErrAssetUnavailable`。
+// 两者都是失败关闭：不重试、不回退、不"尽量跑"。
+// lookupRunEntry picks the entry source: the registry for ordinary runs, the pinned
+// bundle for scheduled claims. It never falls back to the current snapshot.
+func (s *AgentService) lookupRunEntry(ctx context.Context, req RunRequest) (AgentEntry, error) {
+	if req.Pinned == nil {
+		entry, ok := s.lookupAgent(req.Agent)
+		if !ok {
+			return AgentEntry{}, &AgentNotFoundError{Name: req.Agent}
+		}
+		return entry, nil
+	}
+	if err := s.verifyClaimedPin(ctx, req); err != nil {
+		return AgentEntry{}, err
+	}
+	src, ok := s.opts.Agents.(PinnedAgentSource)
+	if !ok {
+		return AgentEntry{}, fmt.Errorf("%w: pinned entry source is not wired", ErrAssetUnavailable)
+	}
+	return src.LookupPinned(ctx, req.Agent, req.Pinned.BundleHash)
+}
+
+// verifyClaimedPin 是钉住 Run 的准入前置：按执行行主键回读领取记录，并与本次请求的
+// Run、Agent、固定哈希与租约副本逐项比对。本方法只读、不加锁；权威判定在
+// `StartRun` 的同事务 `recheckClaimPinInTx`（固定锁序），两层用同一组相等条件。
+// verifyClaimedPin is the cheap precheck; StartRun's in-transaction recheck is authoritative.
+func (s *AgentService) verifyClaimedPin(ctx context.Context, req RunRequest) error {
+	pin := req.Pinned
+	if req.RunID == "" || s.opts.Claims == nil {
+		return fmt.Errorf("%w: pinned run carries no verifiable claim (execution_id=%d)",
+			ErrClaimPinInvalid, pin.ExecutionID)
+	}
+	rec, ok, err := s.opts.Claims.ReadClaimedPin(ctx, pin.ExecutionID)
+	if err != nil {
+		return fmt.Errorf("读取领取记录（execution_id=%d）: %w", pin.ExecutionID, err)
+	}
+	invalid := func(reason string) error {
+		return fmt.Errorf("%w: %s (execution_id=%d)", ErrClaimPinInvalid, reason, pin.ExecutionID)
+	}
+	switch {
+	case !ok:
+		return invalid("claim row is missing")
+	case rec.Status != string(ExecutionStarted):
+		return invalid("claim row is not started")
+	case rec.RunID != req.RunID:
+		return invalid("claim row belongs to another run")
+	case rec.Agent != req.Agent:
+		return invalid("claim row belongs to another agent")
+	case rec.BundleHash != pin.BundleHash:
+		return invalid("claim row pins another bundle")
+	case rec.OwnerWorkerID != pin.Lease.OwnerWorkerID || rec.OwnershipEpoch != pin.Lease.OwnershipEpoch:
+		return invalid("claim row belongs to another lease")
+	}
+	return nil
 }
 
 // buildRunSnapshot 按装配选择快照来源：资源接线后走发布版本构建（技能卡片与正文从准入

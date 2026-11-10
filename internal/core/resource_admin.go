@@ -135,13 +135,42 @@ type ResourcePublishRequest struct {
 	ExpectedETag string
 }
 
-// ResourcePublishResult 是发布结果：新发布的版本与 MCP 是否待重启。
-// ResourcePublishResult carries the published version and whether an MCP restart is
-// pending (published version != applied version).
+// ResourcePublishResult 是发布结果：新发布的版本、MCP 是否待重启，以及技能发布触发的
+// 联动重发逐 Agent 结果。`Publish` 只由技能发布填充——其它资源与"无依赖"的技能发布
+// 保持 nil（契约里非技能发布省略该字段）。
+// ResourcePublishResult carries the published version, the MCP pending-restart flag and,
+// for skills only, the per-agent republish results of the dependent agents.
 type ResourcePublishResult struct {
 	Version        ResourceVersion
 	PendingRestart bool
+	Publish        []BundlePublishResult
 }
+
+// BundlePublishResult 是一条技能联动重发结果（契约 ResourcePublishResult.publish 项）：
+// `Status` 只取五个固定字面量，`Error` 只在 missing / failed 时给出固定中文原因——
+// 不得携带底层错误原文或路径。
+// BundlePublishResult reports one dependent agent's republish outcome; the error text is
+// a fixed reason and never carries raw backend output or paths.
+type BundlePublishResult struct {
+	Agent  string
+	Status string
+	Error  string
+}
+
+// 技能联动重发的五个固定状态（契约 openapi.yaml 的 status enum，逐字不得改）。
+// The five fixed republish statuses; the contract enum is authoritative.
+const (
+	// BundlePublishOK 表示本次已按当前技能版本重发并推进指针。
+	BundlePublishOK = "ok"
+	// BundlePublishSkipped 表示该 Agent 已引用当前技能版本，无需重发（幂等）。
+	BundlePublishSkipped = "skipped"
+	// BundlePublishSuperseded 表示发布前复查发现技能指针已被更新版本覆盖，本次不写。
+	BundlePublishSuperseded = "superseded"
+	// BundlePublishMissing 表示 Agent 定义 / 已安装目录 / 载荷缺失，无法重建。
+	BundlePublishMissing = "missing"
+	// BundlePublishFailed 表示重建或发布失败（可重试，由技能修复器在后续轮次重试）。
+	BundlePublishFailed = "failed"
+)
 
 // ResourceReferences 是资源的引用联合视图：资源身份、定义名引用、绑定投影引用与
 // 未释放的运行引用。不得用"当前没有运行"推断无引用——ActiveRuns 只来自

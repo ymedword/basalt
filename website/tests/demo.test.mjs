@@ -1,9 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { createServer, replyFor } from '../demo/local-model.mjs'
-import { visibleLines, shouldAutoplay } from '../.vitepress/data/demo.mjs'
-import { QUICKSTART_COMMANDS } from '../.vitepress/data/quickstart.mjs'
+import { createServer, replyFor, SCHEDULED_MESSAGE } from '../demo/local-model.mjs'
+import { visibleLines, shouldAutoplay, DEMO_COMMAND } from '../.vitepress/data/demo.mjs'
 test('scripted reply reads the sample before summarizing, including subsequent turns', () => {
   const first = replyFor([{ role: 'user', content: 'Hello' }])
   assert.equal(first.tool_calls[0].function.name, 'read_file')
@@ -27,19 +26,20 @@ test('loopback fixture requires a key, rejects malformed requests and closes', a
     assert.equal((await fetch(url.replace('/chat/completions', '/other'))).status, 404)
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) }
 })
-test('recorded transcript and reduced-motion output agree with the fixture', async () => {
+test('recorded scheduled trigger and reduced-motion output agree with the fixture', async () => {
   const transcript = JSON.parse(await readFile(new URL('../demo/transcript.json', import.meta.url), 'utf8'))
-  assert.equal(transcript.command, QUICKSTART_COMMANDS[4])
+  assert.equal(transcript.command, DEMO_COMMAND)
+  assert.equal(transcript.command, 'basalt serve')
   assert.equal(transcript.exitCode, 0)
   assert.equal(transcript.source, 'local-openai-compatible')
   assert.equal(transcript.stub, 'website/demo/local-model.mjs')
   assert.ok(!Number.isNaN(Date.parse(transcript.capturedAt)))
-  const expected = replyFor([{ role: 'user', content: 'Hello' }, { role: 'tool', tool_call_id: 'basalt-demo-readme', content: '# Basalt\nA self-hosted Agent OS.' }]).content.split('\n')
+  const expected = replyFor([{ role: 'user', content: SCHEDULED_MESSAGE }]).content.split('\n')
   assert.deepEqual(transcript.lines.slice(-expected.length), expected)
-  assert.ok(transcript.lines.some(line => line.includes('read_file')))
-  assert.deepEqual(visibleLines(transcript, true), [`$ ${transcript.command}`, '⚙ Calling tool read_file…', ...expected])
-  assert.ok(transcript.lines.some(line => line.includes('调用工具')), 'raw capture stays unchanged')
-  assert.ok(!/[\u3400-\u9fff]/u.test(visibleLines(transcript, true).join('\n')), 'terminal presentation is fully English')
+  const trigger = transcript.lines[0].replace(/msg=调度触发/u, 'msg="scheduled trigger"')
+  assert.deepEqual(visibleLines(transcript, true), [`$ ${transcript.command}`, trigger, ...expected])
+  assert.ok(transcript.lines.some(line => line.includes('msg=调度触发')), 'raw capture stays unchanged')
+  assert.ok(!/[㐀-鿿]/u.test(visibleLines(transcript, true).join('\n')), 'terminal presentation is fully English')
   assert.equal(shouldAutoplay(true), false)
   assert.equal(shouldAutoplay(false), true)
 })

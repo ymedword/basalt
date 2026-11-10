@@ -369,6 +369,13 @@ func (s *Server) writeRunAdmissionError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, core.ErrAssetUnavailable):
 		s.writeError(w, http.StatusServiceUnavailable, codeAssetUnavailable,
 			adminMessageOr(err, messageAssetUnavailable))
+	// 伪造 / 失效的领取记录（US-25C FR-25C-08）：同样 503 `ASSET_UNAVAILABLE`，
+	// **不新增契约错误码**。对调用方而言结论与上一条相同——本实例现在给不出这次领取
+	// 固定住的那一版，重发同一次也不会成立；执行行编号与不符原因只进服务端日志。
+	// A forged or stale claim maps to the same 503 without a new contract code.
+	case errors.Is(err, core.ErrClaimPinInvalid):
+		s.writeError(w, http.StatusServiceUnavailable, codeAssetUnavailable,
+			adminMessageOr(err, messageAssetUnavailable))
 	case errors.Is(err, core.ErrAssetVersionMismatch):
 		s.writeError(w, http.StatusConflict, codeAssetVersionMismatch,
 			adminMessageOr(err, messageAssetMismatch))
@@ -393,6 +400,12 @@ func (s *Server) writeRunAdmissionError(w http.ResponseWriter, err error) bool {
 			s.writeError(w, http.StatusConflict, codeResourceVersionMismatch,
 				adminMessageOr(err, messageResourceVersionConflict))
 		}
+	// 运行期策略过期（FR-25C-16）：503 `POLICY_STALE`。刷新失败的进程拒绝新 Run，
+	// 后台刷新成功一轮即自动解除；文案点名最近成功核对时间（`AdminError.Message`）。
+	// A stale snapshot refuses new runs until one refresh round fully succeeds.
+	case errors.Is(err, core.ErrPolicyStale):
+		s.writeError(w, http.StatusServiceUnavailable, codePolicyStale,
+			adminMessageOr(err, messagePolicyStale))
 	default:
 		return false
 	}

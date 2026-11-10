@@ -1,4 +1,4 @@
-import{t as e}from"./index-C68SfmIA.js";var t=`{
+import{t as e}from"./index-DwcCoedf.js";var t=`{
   "format_version": 1,
   "name": "bid-readiness-matrix-v1",
   "entry": "requirements_1",

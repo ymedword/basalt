@@ -341,6 +341,9 @@ func mcpConfigFromEntry(entry map[string]any, index int) (core.MCPServerConfig, 
 // existingFile is positive-only evidence for the multi-word disambiguation; it never
 // authorizes anything, and absence keeps the whole string as one path.
 func existingFile(path string) bool {
+	// #nosec G703 -- 本函数只做正面证据（候选命令整串是否是一个已存在的普通文件）：
+	// 不打开、不执行、不据此放行任何东西；路径来自部署者维护的 MCP 配置或管理端候选，
+	// 不是请求正文里的任意路径。
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }

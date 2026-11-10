@@ -36,6 +36,7 @@ import { splitAgentBody } from '../agent-body'
 import { BindingList } from '../components/binding-list'
 import type { BindingRow } from '../components/binding-list'
 import { CredentialField } from '../components/credential-field'
+import { publishWarningText } from '../components/publish-status'
 import { ScopePicker } from '../components/scope-picker'
 import { Notice } from '../components/ui'
 import { agentHref, resourceDetailHref } from '../router'
@@ -231,16 +232,24 @@ export const AgentConfigPage = defineComponent({
     const error = ref('')
     const problems = ref<string[]>([])
     const notice = ref('')
+    /**
+     * 保存已生效但资产发布失败时的警告（2026-11-09 用户裁决，修订 D-25-10）：
+     * 与 error / notice 分开——保存本身成功，失败的是发布；下一次运行会被准入拒绝，
+     * 页面必须显示服务端给出的固定提示，不能只把发布失败留在日志里。
+     */
+    const publishWarning = ref('')
 
     function resetFeedback(): void {
       error.value = ''
       problems.value = []
       notice.value = ''
+      publishWarning.value = ''
     }
 
     function resetRawFeedback(): void {
       rawError.value = ''
       rawNotice.value = ''
+      publishWarning.value = ''
     }
 
     function bindingUID(view: AgentConfigView, kind: AgentConfigReference['resource_kind'], refName: string): string {
@@ -2106,6 +2115,7 @@ export const AgentConfigPage = defineComponent({
         emptyBodyArmed.value = false
         // 关系变化随保存结果回显（系统自动增删只可能是 notify）；不在这里重算推断。
         const applied = systemToolChange(updated.changes)
+        publishWarning.value = publishWarningText(updated.publish)
         notice.value =
           (context.createdResource === undefined
             ? '已保存；配置与资源关联已从服务端重新读取。新运行使用这份配置，已开始的运行不受影响。'
@@ -2158,6 +2168,7 @@ export const AgentConfigPage = defineComponent({
         rawOriginal.value = rawEditor.value
         etag.value = updated.etag
         rawNotice.value = '已保存原文；表单已从服务端重新读取。' + systemToolChange(updated.changes)
+        publishWarning.value = publishWarningText(updated.publish)
         await Promise.all([config.reload(), candidates.reload(), content.reload()])
         emit('saved')
       } catch (caught) {
@@ -2619,6 +2630,9 @@ export const AgentConfigPage = defineComponent({
       }
       if (notice.value !== '') {
         children.push(h(Notice, { tone: 'info', text: notice.value }))
+      }
+      if (publishWarning.value !== '') {
+        children.push(h(Notice, { tone: 'warn', text: publishWarning.value }))
       }
       if (problems.value.length > 0) {
         children.push(

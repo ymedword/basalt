@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "id": "us25c-sync",
+  "approval": "Human review 1 passed 2026-11-09 (user: 'Review ① 通过，按 R8 收口。定稿时仅补清扫描终止性和次数保证的适用条件，不扩大设计、不重开已闭合项；更新指纹后进入 /us-register 25C → /module-dev 25C。实施时先完成定向判据，稳定后冻结代码再运行完整门禁。文档评审通过不代表运行验收通过，commit / push / 发布 / 部署仍按既有授权执行。'). Reviewed module card docs/us/us25c-distributed-consistency.md R8 (1472 lines) finalized as R9 (1488 lines, sha256 9fb665e14d1ad8492edeea1477f95c5a7da8218fe23e03bf7d5ddf84b72c3f1c). Registry row 25C. Derived by module-dev step 6.1 from module card sections 4.3/4.4 and tasks.md. This stage carries the integration-tagged judgment surface: local PostgreSQL fixture 127.0.0.1:55432 via dev-env/scripts/with-postgres.sh, no container host, no real model calls. e2e files follow the reviewed card section 3.4 literally: internal/e2e/us25c_*.go carry //go:build integration, so they are self-contained and do not reuse e2e-tagged helpers. Local-only stage: inputs exclude the private module card and it must not enter current.json or CI. Human review 2 pending.",
+  "inputs": [
+    "specs/025c-distributed-consistency/spec.md",
+    "specs/025c-distributed-consistency/plan.md",
+    "specs/025c-distributed-consistency/tasks.md",
+    "specs/025c-distributed-consistency/data-model.md",
+    "harness/acceptance.json"
+  ],
+  "protect": [
+    "internal/storage/postgres/run_lease_test.go",
+    "internal/storage/postgres/lease_store_test.go",
+    "internal/storage/postgres/worker_store_test.go",
+    "internal/storage/postgres/migration_0012_test.go",
+    "internal/storage/postgres/flow_migration_integration_test.go",
+    "internal/storage/postgres/learning_migration_test.go",
+    "internal/storage/postgres/observability_migration_test.go",
+    "internal/app/assets_admission_test.go",
+    "internal/web/contract_test.go",
+    "internal/e2e/us25_takeover_test.go",
+    "internal/e2e/us25_shutdown_test.go",
+    "internal/e2e/us25_migration_test.go",
+    "internal/e2e/us25_upgrade_test.go",
+    "docs/contracts/run-and-errors.md",
+    "docs/contracts/openapi.yaml",
+    "docs/contracts/schema.pg.sql",
+    "harness/acceptance.json"
+  ],
+  "checks": [
+    {
+      "id": "us25c-sync-migration",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=10m",
+        "./internal/storage/postgres", "-run", "^TestMigration0013_"
+      ],
+      "timeout_seconds": 900,
+      "required_tests": [
+        "TestMigration0013_Idempotent",
+        "TestMigration0013_Columns",
+        "TestMigration0013_SchemaVersion13"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-distribution-store",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=15m",
+        "./internal/storage/postgres", "-run",
+        "^(TestBundlePayloadStore_|TestAssetDistribution_|TestResourceStore_PointerVersion$)"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestBundlePayloadStore_Idempotent",
+        "TestAssetDistribution_KeysetSameMillisecond",
+        "TestAssetDistribution_FullScanResume",
+        "TestResourceStore_PointerVersion"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-app-distribution",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=20m",
+        "./internal/app", "-run",
+        "^(TestAssetsDistribution_|TestSkillRepublishIntegration_)"
+      ],
+      "timeout_seconds": 1500,
+      "required_tests": [
+        "TestAssetsDistribution_CrossProcessInstallAndReady",
+        "TestAssetsDistribution_AdmissionUsesInstalledVersion",
+        "TestAssetsDistribution_CrashBetweenInstallAndRegisterRecovers",
+        "TestSkillRepublishIntegration_PerAgentResultsVisible",
+        "TestSkillRepublishIntegration_NextRoundRepair",
+        "TestSkillRepublishIntegration_RestartIsFallbackOnly"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-claim",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=15m",
+        "./internal/storage/postgres", "-run",
+        "^(TestClaim_ErrAssetMovedWritesNothing|TestStartRun_(Pinned|NormalRunKeepsCurrentPointerCheck))"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestClaim_ErrAssetMovedWritesNothing",
+        "TestStartRun_PinnedClaimRejectedAfterLeaseTakeover",
+        "TestStartRun_PinnedClaimRejectedAfterLeaseExpiry",
+        "TestStartRun_NormalRunKeepsCurrentPointerCheck",
+        "TestStartRun_PinnedLockOrderNoDeadlock"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-upgrade",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=15m",
+        "./internal/app", "-run", "^TestUpgradeBackfill_"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestUpgradeBackfill_V12PointerToEmptyCacheWorkerSync"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-overview",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=15m",
+        "./internal/storage/postgres", "-run",
+        "^(TestWorkerOverview_|TestRegister_(PersistsHeartbeatInterval|RejectsInvalidInterval)$)"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestWorkerOverview_StatusBuckets",
+        "TestWorkerOverview_CountsAreAggregates",
+        "TestWorkerOverview_CountsAndDetailSameSnapshot",
+        "TestWorkerOverview_SameNameKeptSeparate",
+        "TestWorkerOverview_PerInstanceThreshold",
+        "TestWorkerOverview_LegacyRowUsesDeploymentDefault",
+        "TestRegister_PersistsHeartbeatInterval",
+        "TestRegister_RejectsInvalidInterval"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-e2e",
+      "args": [
+        "go", "test", "-json", "-count=1", "-tags=integration", "-timeout=20m",
+        "./internal/e2e", "-run",
+        "^TestUS25C_(Distribution_VersionsMatchAcrossInstances|PinnedRun_KeepsOldVersionAfterPublish|Scan_UnreadyAgentOnADoesNotStarveB)$"
+      ],
+      "timeout_seconds": 1500,
+      "required_tests": [
+        "TestUS25C_Distribution_VersionsMatchAcrossInstances",
+        "TestUS25C_PinnedRun_KeepsOldVersionAfterPublish",
+        "TestUS25C_Scan_UnreadyAgentOnADoesNotStarveB"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-race",
+      "args": [
+        "go", "test", "-json", "-count=1", "-race", "-tags=integration", "-timeout=15m",
+        "./internal/storage/postgres", "-run", "^TestStartRun_PinnedLockOrderNoDeadlock$"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestStartRun_PinnedLockOrderNoDeadlock"
+      ],
+      "level": "source"
+    },
+    {
+      "id": "us25c-sync-race-scheduler",
+      "args": [
+        "go", "test", "-json", "-count=1", "-race", "-timeout=15m",
+        "./internal/app", "-run",
+        "^(TestScheduler_SweepCompletesUnderContinuousDue|TestScheduler_ScanRespectsFrozenSweepCutoff)$"
+      ],
+      "timeout_seconds": 1200,
+      "required_tests": [
+        "TestScheduler_SweepCompletesUnderContinuousDue",
+        "TestScheduler_ScanRespectsFrozenSweepCutoff"
+      ],
+      "level": "source"
+    }
+  ],
+  "tasks": [
+    {"id": "T004", "checks": ["us25c-sync-migration"]},
+    {"id": "T006", "checks": ["us25c-sync-distribution-store"]},
+    {"id": "T007", "checks": ["us25c-sync-migration"]},
+    {"id": "T008", "checks": ["us25c-sync-migration"]},
+    {"id": "T012", "checks": ["us25c-sync-distribution-store"]},
+    {"id": "T025", "checks": ["us25c-sync-app-distribution"]},
+    {"id": "T040", "checks": ["us25c-sync-app-distribution"]},
+    {"id": "T042", "checks": ["us25c-sync-claim", "us25c-sync-race"]},
+    {"id": "T047", "checks": ["us25c-sync-claim"]},
+    {"id": "T049", "checks": ["us25c-sync-claim"]},
+    {"id": "T051", "checks": ["us25c-sync-upgrade", "us25c-sync-e2e"]},
+    {"id": "T052", "checks": ["us25c-sync-overview"]},
+    {"id": "T055", "checks": ["us25c-sync-overview"]},
+    {"id": "T044", "checks": ["us25c-sync-e2e"]},
+    {"id": "T045", "checks": ["us25c-sync-e2e"]},
+    {"id": "T046", "checks": ["us25c-sync-race-scheduler"]}
+  ]
+}

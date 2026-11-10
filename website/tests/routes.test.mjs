@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { BASE, ROUTES, localePath, switchLocalePath, resolveNav, resolveFooter, REPO_URL } from '../.vitepress/data/navigation.mjs'
+import { BASE, ROUTES, localePath, switchLocalePath, resolveNav, resolveFooter, REPO_URL, DEMO_CONSOLE_URL } from '../.vitepress/data/navigation.mjs'
 
 test('four routes are paired, and every declared anchor exists in both source pages', async () => {
   assert.deepEqual(ROUTES.map(item => item.id), ['home', 'quickstart', 'architecture', 'docs'])
@@ -25,7 +25,7 @@ test('locale switching preserves route, query, hash and exactly one base', () =>
 test('navigation and footer resolve to the approved real targets', () => {
   for (const locale of ['en', 'zh']) {
     const nav = resolveNav(locale)
-    assert.deepEqual(nav.map(item => item.link), [localePath(locale, 'home'), localePath(locale, 'docs'), REPO_URL, `${localePath(locale, 'home')}#demo`])
+    assert.deepEqual(nav.map(item => item.link), [localePath(locale, 'home'), localePath(locale, 'docs'), REPO_URL, DEMO_CONSOLE_URL])
     const links = resolveFooter(locale).flatMap(group => group.links).map(item => item.link)
     for (const target of [`${localePath(locale, 'quickstart')}#deploy`, `${localePath(locale, 'quickstart')}#commands`, `${localePath(locale, 'architecture')}#tools-and-mcp`]) assert.ok(links.includes(target), target)
     assert.ok(!links.some(link => /contribut|license/.test(link)))

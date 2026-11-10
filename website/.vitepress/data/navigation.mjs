@@ -2,6 +2,7 @@ export const BASE = '/basalt/'
 export const REPO_URL = 'https://github.com/ymedword/basalt'
 export const ISSUES_URL = `${REPO_URL}/issues`
 export const OPERATIONS_URL = `${REPO_URL}/blob/main/docs/Operations.md`
+export const DEMO_CONSOLE_URL = 'http://43.161.200.168:8080/console/'
 export const ROUTES = [
   { id: 'home', en: '/', zh: '/zh/', anchors: ['demo'] },
   { id: 'quickstart', en: '/quickstart/', zh: '/zh/quickstart/', anchors: ['deploy', 'config', 'console', 'commands', 'first-chat', 'verify', 'troubleshoot'] },
@@ -35,7 +36,7 @@ export function resolveNav(locale) {
     { text: zh ? '首页' : 'Home', link: localePath(locale, 'home'), activeMatch: zh ? '^/zh/$' : '^/$' },
     { text: zh ? '文档' : 'Docs', link: localePath(locale, 'docs'), activeMatch: zh ? '^/zh/(docs|quickstart|architecture)/' : '^/(docs|quickstart|architecture)/' },
     { text: 'GitHub', link: REPO_URL },
-    { text: zh ? '演示' : 'Demo', link: `${localePath(locale, 'home')}#demo` }
+    { text: zh ? '演示' : 'Demo', link: DEMO_CONSOLE_URL }
   ]
 }
 

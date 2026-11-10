@@ -1,0 +1,277 @@
+# Tasks: 已发布资产自动分发与跨进程一致性（US-25C）
+
+**Input**: Design documents from `/specs/025c-distributed-consistency/`
+
+**Prerequisites**: plan.md（必需）、spec.md（用户故事）、research.md、data-model.md、contracts/
+
+**Tests**: 本 US 明确要求测试先行（模块卡 §3.4 与 §4.4 逐条具名）；测试任务先于或伴随对应实现任务。
+
+**Organization**: 按 spec 的五个用户故事分组；测试任务与实现任务同阶段，先红后绿。
+
+## Format: `[ID] [P?] [Story] Description`
+
+- **[P]**: 不同文件、无未完成依赖，可并行
+- **[Story]**: US1～US5；Setup / Foundational 无标签
+- 描述带仓库相对路径
+
+## Phase 1: Setup (Shared Infrastructure)
+
+**Purpose**: 配置解析、契约字面量与专属 stage 骨架先行，避免实现阶段返工。
+
+- [x] T001 [P] 扩展 `internal/cli/config.go` 与 `internal/cli/worker_config.go`：新增 `assets.sync_interval` / `sync_timeout` / `sync_batch` / `max_bundle_bytes` / `full_scan_every` 与 `policy.sync_interval` / `max_stale` 的解析、默认值（30s / 20s / 50 / 16777216 / 20 / 30s / 300s）与严格未知字段拒绝；测试 `internal/cli/config_test.go`（`TestConfig_ParsesAssetAndPolicySections`、`TestConfig_RejectsUnknownAssetKey`）。
+- [x] T002 [P] 追加契约固定字面量：`docs/contracts/run-and-errors.md` 新增 `POLICY_STALE`（503）并注明 `ASSET_UNAVAILABLE` / `ASSET_VERSION_MISMATCH` 复用语义；`docs/contracts/openapi.yaml` 追加技能发布 `publish` 数组与 `SystemOverview.workers` 新字段（`as_of` / `counts` / `total` / `truncated` / 行级 `status` 等，描述写明「进程实例不是服务器」）。契约测试随实现任务落地（T036 `publish` 块、T056 概览字段），T002 本身不引入跨阶段红态。
+- [x] T003 [P] 派生四个专属 stage 骨架 `harness/stages/us25c-base.json`、`us25c-sync.json`、`us25c-fault.json`、`us25c-docs.json`：引用 `harness/acceptance.json` 公共集合，不复制公共清单；`required_tests` 指向本文件后续任务列出的具名测试；保护既有 412/409、`TestOpenAPI_AdminWriteViewsMatchContract`、US-24 租约与 fencing、US-25 接管 / 停机 / 迁移用例。
+
+---
+
+## Phase 2: Foundational (Blocking Prerequisites)
+
+**Purpose**: 迁移 0013、载荷编解码、core 端口与仓储、Entry 构建快照；完成前任何用户故事不得开始。
+
+**⚠️ CRITICAL**: 本阶段完成前不得进入 US1～US5。
+
+### Tests for Foundational
+
+- [x] T004 [P] 迁移测试 `internal/storage/postgres/migration_test.go`（`TestMigration0013_Idempotent`、`TestMigration0013_Columns`、`TestMigration0013_SchemaVersion13`）：重复执行幂等；列可空性 / CHECK / 索引与 `data-model.md` §1 一致；`schema.pg.sql` 零 diff。
+- [x] T005 [P] 编解码测试 `internal/assets/bundle_payload_test.go`（`TestEncodeBundle_Deterministic`、`TestDecodeBundle_Rejects`）：路径排序 / 固定 mode / 零 mtime / 不跟随符号链接；拒绝绝对路径、`..`、符号链接、非普通文件、超限；复算哈希不符即失败。
+- [x] T006 [P] 仓储测试 `internal/storage/postgres/asset_distribution_store_test.go`：载荷写入幂等与哈希复核（`TestBundlePayloadStore_Idempotent`）；`(updated_at, resource_id)` 键集同毫秒 201 行每行只读一次（`TestAssetDistribution_KeysetSameMillisecond`）；全量扫描按 `resource_id` 翻页且中断不删项（`TestAssetDistribution_FullScanResume`）；`PointerVersion` 单快照（`TestResourceStore_PointerVersion`）。
+
+### Implementation for Foundational
+
+- [x] T007 [P] 新增 `internal/storage/postgres/migrations/0013_agent_bundle_payloads.sql`：建 `agent_bundle_payloads` 与索引；`worker_nodes.heartbeat_interval_seconds`（可空 + 正数 CHECK）；`resource_pointers (resource_kind, updated_at, resource_id)` 索引；`task_executions.pinned_bundle_hash`；可选 `scheduled_tasks (next_fire_at, task_id)` 部分索引；幂等、只追加、时间列由 Go 写毫秒值。
+- [x] T008 [P] `internal/storage/postgres/connect.go`：`SupportedSchemaVersion = 13`，`Open` 增加 `migrate bool`（worker 走 `OpenForWorker` 精确版本、不迁移）；`internal/storage/postgres/resource_store.go` 的 `ReadLifecycleIndex` 扫描列补 `agent_uid`。
+- [x] T009 [P] 新增 `internal/assets/bundle_payload.go`：`EncodeBundle(ctx, dir, maxBytes)` 确定性 tar、`DecodeBundle(ctx, payload, dest, wantHash, maxBytes)` 拒绝清单与哈希复算。
+- [x] T010 [P] 扩展 `internal/core/assets.go`（或现有资产端口文件）：`BundlePayloadRecord`、`PublishedBundle`、`PublishedBundleCursor`、`SkillVersionRecord`、`AssetDistributionPort`、`BundlePayloadStore`；`WorkerOverview` / `WorkerOverviewCounts` / `WorkerNodeStatus` / `WorkerOverviewReader`；`WorkerIdentity.HeartbeatIntervalSeconds`。
+- [x] T011 [P] 扩展 `internal/core/scheduler.go` 与 `internal/core/errors.go`：`SweepBounds`、`DueScanCursor`、`DueExecution.PinnedBundleHash`、`ClaimedBundlePin`、`ClaimedPinRecord`、`PinnedClaimReader`、`AssetPinnedClaimer`、`ErrClaimPinInvalid`、`SchedulerOptions.AssetReady` / `DefinitionAuthority`、`Scheduler.ReplaceEntries`、`PolicyDigestSource`。
+- [x] T012 实现 `internal/storage/postgres/asset_distribution_store.go`：`PutBundlePayload`（`ON CONFLICT DO NOTHING` + 哈希复核）、`ListPublishedBundlesAfter`（键集）、`ListPublishedBundlesPage`（全量）、`ReadBundlePayload`、`ReadSkillVersion`；`resource_store.go` 的 `PointerVersion`。
+- [x] T013 [P] 新增 `internal/app/resources_prepare.go`：`PreparedResources` 结构与 `prepareProviderCatalog`（逐条构建、失败隔离、点名）；`internal/app/loader.go` 增加 `EntryFromBundle(root, installed, prepared, published)`，Entry 判定只读 `prepared` 快照。
+
+**Checkpoint**: 迁移与端口就绪，用户故事可开始。
+
+---
+
+## Phase 3: User Story 1 - 发布即分发（Priority: P1）🎯 MVP
+
+**Goal**: 发布写载荷再移指针；Worker 有界同步、安装、技能物化、注册表与调度刷新、只读诊断。
+
+**Independent Test**: 双实例夹具中发布新版本 → 两端安装哈希 = 指针哈希；在途 Run 旧哈希；破坏载荷后新 Run 被拒、旧版本继续；同步前后种子与运行数据哈希不变。
+
+### Tests for User Story 1 ⚠️（先红）
+
+- [x] T014 [P] [US1] 发布链测试 `internal/app/assets_publish_payload_test.go`：`TestPublish_WritesPayloadBeforePointer`、`TestPublish_SameHashWritesMissingPayload`、`TestPublish_PayloadFailureLeavesPointer`。
+- [x] T015 [P] [US1] 回填测试 `internal/app/backfill_payload_test.go`：`TestBackfill_LegacyPointer`、`TestBackfill_MissingDirVisible`、`TestBackfill_DoesNotMovePointer`。
+- [x] T016 [P] [US1] 同步测试 `internal/app/asset_sync_test.go`：状态机四态、`installed != ready`（`TestAssetSync_InstalledIsNotReady`）、`TestAssetSync_InstallAndShortCircuit`、`TestAssetSync_RegisterFailureRecoversWithoutRestart`、`TestAssetSync_StarvedPrefixStillProgresses`、`TestAssetSync_KeysetCursorAdvancesWithinSameMillisecond`、`TestAssetSync_InterruptedFullScanRemovesNothing`、`TestAssetSync_PeriodicFullScanCatchesDelayedCommit`、`TestAssetSync_RefreshesRegistryAndScheduler`、`TestAssetSync_RecoversAfterCrashBetweenInstallAndRegister`、`TestAssetSync_TickTimeout`、`TestAssetSync_DoesNotTouchWorkspace`。
+- [x] T017 [P] [US1] 技能物化测试 `internal/app/skill_materialize_test.go`：`TestAssetSync_MaterializesSkills`、`TestRun_ReadsL2FromMaterializedSkill`，以及路径形态、逐文件哈希、工作副本不动、失败不回落、种子缺版本时仍可读。
+- [x] T018 [P] [US1] 调度集合测试 `internal/core/scheduler_test.go`（扩展）：`TestScheduler_ReplaceEntriesBeforeStart`、`TestScheduler_ReplaceEntriesAfterStart_DispatchesNewAgent`、`TestScheduler_ReplaceEntriesDoesNotRetireAbsentAgent`、`TestScheduler_ReplaceEntriesKeepsScanProgress`。
+
+### Implementation for User Story 1
+
+- [x] T019 [US1] `internal/app/assets_publish.go`：`writePayload` 插入 `publishAs`，严格先于指针 CAS；同哈希仍核对并补写载荷；载荷失败 `finishFailed(ctx.WithoutCancel)`、指针不变、失败终态可见。
+- [x] T020 [US1] 新增 `internal/app/backfill_payload.go`：`BackfillBundlePayloads` 只接受目录自洽来源，先验目录再编码；逐条报告 `payload_missing` / `corrupt`；启动期调用（control 专属）。
+- [x] T021 [US1] 新增 `internal/app/asset_sync.go`：`AssetSync` / `AssetSyncDeps` / `SyncReport` / `AgentSyncResult` / `Readiness`；四态状态机、`attemptSeq` 轮转与退避、单轮超时、单飞、停机 join；安装成功进入 `installed`，每轮重做物化与 Entry 构建后才 `ready`。
+- [x] T022 [US1] `internal/app/asset_sync.go`：技能物化 `materializeBundleSkills`——每轮无条件执行，`ReadSkillVersion` → `PublishedVersionRelDir` → `.staging-<hash>` → rename → `FinalizeVersionDir`（`internal/workspace` 新导出包装只读权限）；失败即未就绪，不回落工作副本。
+- [x] T023 [US1] `internal/app`：注册表与调度集合同轮刷新——`agentRegistry.ReplaceAll`（单次快照 upsert、不删除）、`ScheduleSetUpdater.ReplaceEntries` 窄接口；固定顺序「注册表 → 调度集合」，失败条目退回 `installed` 下一轮重做。
+- [x] T024 [US1] `internal/cli/assets.go` 与 `internal/cli/assets_test.go`：只读 `basalt assets status`，逐 Agent 打印指针哈希 / 已安装哈希 / 载荷存在 / 技能物化 / 阻塞原因；不触发、不写库；测试 `TestCLI_AssetsStatusReadOnly` 断言输出字段齐全且不调用触发路径。
+- [x] T025 [US1] 集成测试 `internal/app/assets_distribution_integration_test.go`（`//go:build integration`，postgres 夹具）：发布 → 同步 → 物化 → 就绪 → 准入 → 执行版本一致（`TestAssetsDistribution_CrossProcessInstallAndReady`、`TestAssetsDistribution_AdmissionUsesInstalledVersion`）；崩溃于安装与注册之间可恢复（`TestAssetsDistribution_CrashBetweenInstallAndRegisterRecovers`）。
+
+**Checkpoint**: US1 独立可验——发布与分发闭环成立。
+
+---
+
+## Phase 4: User Story 2 - 管理台已改、Worker 生效（Priority: P1）
+
+**Goal**: 角色门、生命周期索引、策略刷新、技能联动与修复、资源准备与 MCP 复用。
+
+**Independent Test**: 逐组构造管理台变更并观察 Worker：策略删除下一轮检出；停用后调度门与准入同时拒绝；技能发布后运行期自愈；新增 Provider / applied MCP 不重启可用；Worker 启动零共享写、知识只读可用。
+
+### Tests for User Story 2 ⚠️（先红）
+
+- [x] T026 [P] [US2] 角色门测试 `internal/app/worker_authority_test.go` 与 `internal/app/scheduler_authority_test.go`：`TestWorkerStartup_SkipsSharedWrites`（逐项零写）、`TestWorkerRestart_KeepsNewChannel`、`TestWorker_AdvancesNextFire`、`TestScheduler_DefinitionAuthorityFailClosed`（协调列仍写）。
+- [x] T027 [P] [US2] 知识面测试 `internal/app/worker_knowledge_test.go`：`TestWorkerKnowledge_BoundAgentRetrievalWorks`、`TestWorkerKnowledge_MissingGenerationFailsClosed`、`TestWorkerKnowledge_NeverEnsuresGeneration`。
+- [x] T028 [P] [US2] 策略测试 `internal/app/policy_refresh_test.go`：`TestPolicyRefresh_DigestMatchesApplied`、`TestPolicyRefresh_DigestDetectsDelete`、`TestPolicyRefresh_SameContentNewRevision`、`TestPolicyRefresh_ConcurrentNoRegression`、`TestPolicyRefresh_LongIdleStaysFresh`（连续十个刷新周期不误判过期）、`TestPolicyRefresh_StaleRejectsRun`。
+- [x] T029 [P] [US2] 技能联动与修复测试 `internal/app/skill_repair_test.go`、`internal/app/rebuild_bundle_skill_test.go`：`TestSkillPublish_RepublishesDependents`、`TestSkillPublish_DoesNotPublishWorkCopy`、`TestSkillRepublish_OutOfOrderPublishKeepsNewest`、`TestSkillRepair_RecoversWithoutRestart`、`TestSkillRepair_BlockedAfterRepeatedFailures`、`TestSkillRepair_WorkerDoesNotRepublish`；从已安装目录重建、不读工作副本、ConfigHash 沿用。
+- [x] T030 [P] [US2] 资源准备测试 `internal/app/resource_prepare_test.go`：`TestProviderPrepare_PartialFailureIsolated`、`TestMCPPrepare_OnlyApplied`、`TestMCPPrepare_SameVersionReusesConnection`、`TestMCPPrepare_CredentialRotationRebuilds`、`TestMCPPrepare_SupersededBeforeSwap`、`TestMCPApply_AdminPathSwapsAfterCAS`、`TestMCPPrepare_NoDoubleLock`、`TestAssetSync_PrepareBeforeEntryBuild`、`TestAssetSync_EntryUsesPreparedSnapshot`、`TestRegistration_BlocksOnMissingResource`。
+- [x] T031 [P] [US2] 生命周期测试 `internal/app/lifecycle_index_admission_test.go`：`TestAdmission_UsesLifecycleIndex`、`TestScheduleGate_UsesIndex`、`TestLifecycleIndex_NoRowFallsBackToFile`。
+
+### Implementation for User Story 2
+
+- [x] T032 [US2] `internal/app/run.go` / `wire.go`：`runtimeRole`（`serve` = control、`gateway` = worker，不新增 `role` 配置键）与 `newRuntime(ctx, role)`；按 §2.3.1 表逐项包裹共享初始化写，Worker 保留只读知识装配与合法协调写；`AssetSync` / `PolicyRefresher` 只构造、不启动。
+- [x] T033 [US2] `internal/core/scheduler.go`：`DefinitionAuthority=false` 时 `SetRegistered` / `ReconcileAgent` 失败关闭（不写定义列），协调列照写。
+- [x] T034 [US2] `internal/app/schedule.go`：`scheduleGate` 索引优先，无索引行才回退本地状态文件。
+- [x] T035 [US2] 四类策略服务实现 `RefreshFromStore(ctx) (changed, digest, err)`：各持自身 `mu` 读表、应用、用该份行算子摘要；新增 `internal/app/policy_refresh.go` 的 `PolicyRefresher` / `PolicyRefresherDeps`（单飞、`appliedDigest`、`lastVerifiedAt`、`MaxStale`）；`internal/web/envelope.go` 常量区新增 `POLICY_STALE`（503），`internal/web` 与 `internal/app` 准入映射该码。
+- [x] T036 [US2] `internal/app/skill_republish.go`：`rebuildBundleWithSkill`（从已安装 bundle 重建、`ConfigFiles` 逐项核对）、`republishDependentBundles` / `republishOne`（`AgentGate.Lock` 内复核指针与 `PointerVersion`、发布前复查、`superseded`）；`internal/web/views.go` 管理台写响应接入 `publish: [{agent,status,error}]`，并在 `internal/web/contract_test.go` 补 `publish` 块断言（`TestOpenAPI_AdminWriteViewsMatchContract`）。
+- [x] T037 [US2] `internal/app/skill_repair.go`：`SkillRepairer` / `RepairOnce` / `RepairAll`（批量 5、按名轮转、退避 5m、连续 8 次 `blocked`、全量扫描复位）；`repairStaleBundleSkills` 启动兜底；Worker `Repair` 为 nil。
+- [x] T038 [US2] `internal/app/mcp_*.go`：`PrepareAtApplied`（P1–P6 快照 → 锁外构建 → `ResourceGate → entry.mu` 提交、`Commit: nil`、`OldLegal: nil`、换入前 `Verify`）、`MCPApplyInput.Verify`、`mcpCredentialFreeze.id` 与 `mcpCredentialGeneration`、`mcpLink.isLive`、`mcpRuntime.ReplaceSpecs`、`prepareMCPInstances` / `MCPPrepareResult`；管理 apply 路径 `Commit != nil` 不传 `Verify`。
+- [x] T039 [US2] `internal/app/wire.go` / `runtime`：`resolveDefinition`（worker 从 bundle 读、control 保留工作区语义）与 `newKnowledgeWiring` 只读装配（Embedder / Generation / Retriever / SourceViewer / Run / Assembly / Validity；缺 active 代际 `ErrGenerationNotInitialized` 并点名控制面初始化）。
+- [x] T040 [US2] 集成测试 `internal/app/skill_republish_integration_test.go`（`//go:build integration`）：技能发布成功、一个依赖 Agent 重发失败 → 逐项可见（`TestSkillRepublishIntegration_PerAgentResultsVisible`）；失败项运行期下一轮修复（`TestSkillRepublishIntegration_NextRoundRepair`）；重启后 `repairStaleBundleSkills` 仅兜底（`TestSkillRepublishIntegration_RestartIsFallbackOnly`）。
+
+**Checkpoint**: US2 独立可验——五组缺口逐项收口。
+
+---
+
+## Phase 5: User Story 3 - 领取与准入（Priority: P1）
+
+**Goal**: 就绪门、公平扫描、领取事务钉住版本、StartRun 同事务复核执行权、A+B 真实链路与故障恢复。
+
+**Independent Test**: 前 N 条不可领取 / 整页 NULL / 持续高频到期 / 同步穿插长扫描下健康任务不被饿死；领取后发布同步仍用旧版本；伪造领取记录、接管与过期均 503 零写入；载荷与数据库故障恢复不靠重导种子，未知调用不重放。
+
+### Tests for User Story 3 ⚠️（先红）
+
+- [x] T041 [P] [US3] 调度就绪与公平测试 `internal/app/scheduler_ready_test.go`：`TestScheduler_NotReadyLeavesTrigger`、`TestScheduler_PublishBetweenGateAndClaimLeavesTrigger`、`TestClaim_ErrAssetMovedWritesNothing`、`TestScheduler_UnreadyPrefixDoesNotStarveHealthyTask`、`TestScheduler_ErrAssetMovedPrefixDoesNotStarveHealthyTask`、`TestScheduler_NullFullPageDoesNotStarveHealthyTask`、`TestScheduler_SyncRefreshKeepsScanProgress`、`TestScheduler_MissedBehindUnreadyPrefixStillRecorded`、`TestScheduler_DueScanCursorWrapsAfterSweep`、`TestScheduler_SweepCompletesUnderContinuousDue`、`TestScheduler_ScanRespectsFrozenSweepCutoff`。
+- [x] T042 [P] [US3] 存储领取测试 `internal/storage/postgres/run_store_test.go`（扩展）：`TestClaim_ErrAssetMovedWritesNothing`、`TestStartRun_PinnedClaimRejectedAfterLeaseTakeover`、`TestStartRun_PinnedClaimRejectedAfterLeaseExpiry`、`TestStartRun_NormalRunKeepsCurrentPointerCheck`、`TestStartRun_PinnedLockOrderNoDeadlock`（-race）。
+- [x] T043 [P] [US3] 钉住运行测试 `internal/app/scheduler_ready_test.go`（同文件扩展）：`TestRun_UsesPinnedBundleWhileSyncAdvances`、`TestRun_ForgedPinWithoutClaimRecordRejected`、`TestStartRun_PinnedClaimSubstitutesOnlyPointerEquality`。
+- [x] T044 [P] [US3] 双实例 e2e `internal/e2e/us25c_distribution_test.go`、`us25c_pinned_test.go`、`us25c_fault_test.go`（`//go:build integration`）：发布-同步-执行版本一致（`TestUS25C_Distribution_VersionsMatchAcrossInstances`）、在途旧版本（`TestUS25C_PinnedRun_KeepsOldVersionAfterPublish`）、载荷 / 数据库故障恢复（`TestUS25C_Fault_PayloadFailureRecovers`、`TestUS25C_Fault_DatabaseOutageNoReplay`）、未知调用不重放、A 侧未就绪不影响 B 侧健康任务（`TestUS25C_Scan_UnreadyAgentOnADoesNotStarveB`）。
+
+### Implementation for User Story 3
+
+- [x] T045 [US3] `internal/storage/postgres/schedule_scan.go`：`ReadSweepBounds`（单语句：数据库时间 + NULL 段最大 `task_id`）与 `ListDispatchableForAgents` 两段键集（NULL 段 `task_id`；非 NULL 段 `next_fire_at <= cutoff`；首屏省略元组下界；两段边界截断）。
+- [x] T046 [US3] `internal/app/scheduler.go`：就绪门（WARN 限流、不领取 / 不推进 / 不写执行行）、missed 先于就绪门、`DueScanCursor` 两段轮转、每圈冻结边界、只有 `Start` 清空游标；`SetRegistered` / `ReplaceEntries` 不清空。
+- [x] T047 [US3] `internal/storage/postgres/claim.go`：`ClaimDueTriggerPinned` 在既有领取事务内锁指针行 `FOR SHARE`，`ErrAssetNotReady` / `ErrAssetMoved` 零写入；成功写 `pinned_bundle_hash` 与租约。
+- [x] T048 [US3] `internal/app/scheduler.go` / `internal/core/scheduler.go`：`runClaimed` 组装 `RunRequest.Pinned`（`ClaimedBundlePin` 只由调度通道填，web / cli / admin 为 nil）。
+- [x] T049 [US3] `internal/storage/postgres/run_store.go`：`StartRun` 内 `recheckClaimPinInTx`（固定锁序：生命周期行 → 执行租约 `FOR SHARE` → 执行行普通读；租约 owner / epoch / 未释放 / 未过期 + 执行行 status / run_id / Agent / 哈希），`ErrClaimPinInvalid` 回滚；`recheckResourceVersions` 对 `Pin != nil` 的技能 arm 改 `VersionByID`；`Pin == nil` 保持当前指针判据。
+- [x] T050 [US3] `internal/app/loader.go` / `resources.go`：`PinnedAgentSource.LookupPinned`（从 `<assetRoot>/bundles/<agent>/<hash>/agent` 构建 Entry）与 `RunResources.ResolvePinned`（按 bunde `manifest.Skills` 经 `VersionByID` 解析并与 `Resolve` 共用 `verifyAssets`）。
+- [x] T051 [US3] 集成与 e2e 收尾：`internal/app/upgrade_backfill_integration_test.go`（`//go:build integration`，v12 + 指针 + 空载荷 → 回填 → 空缓存 Worker 同步成功，`TestUpgradeBackfill_V12PointerToEmptyCacheWorkerSync`）；e2e 回归插桩点「领取之后、准入之前插入一次完整发布 + 同步」。
+
+**Checkpoint**: US3 独立可验——固定版本贯穿领取到执行，扫描与恢复有界。
+
+---
+
+## Phase 6: User Story 4 - 概览节点状态（Priority: P2）
+
+**Goal**: 概览按进程实例的只读三态读数；心跳间隔登记与旧行兜底。
+
+**Independent Test**: 250 行登记、limit 200 → 全库计数、明细 200、截断如实、同一快照；同名两实例不合并；旧行兜底标注；读取失败显示不可用不补 0；只读、无管理动作。
+
+### Tests for User Story 4 ⚠️（先红）
+
+- [x] T052 [P] [US4] 存储测试 `internal/storage/postgres/worker_store_test.go`（扩展）：`TestWorkerOverview_StatusBuckets`、`TestWorkerOverview_CountsAreAggregates`、`TestWorkerOverview_CountsAndDetailSameSnapshot`、`TestWorkerOverview_SameNameKeptSeparate`、`TestWorkerOverview_PerInstanceThreshold`、`TestWorkerOverview_LegacyRowUsesDeploymentDefault`、`TestRegister_PersistsHeartbeatInterval`、`TestRegister_RejectsInvalidInterval`。
+- [x] T053 [P] [US4] Web 映射测试 `internal/app/web_test.go`（扩展）：`TestOverview_WorkerViewMapping`（`counts` / `total` / `truncated` / `as_of` / 行级 `status` / `heartbeat_age_seconds` / `stale_after_seconds`）；读取失败整组省略不补 0；`workers list` 形状不变（`ListNodes` 全量与字段保持）。
+- [x] T054 [P] [US4] 控制台测试 `assets/console/tests/overview-workers.test.ts`（新）、`skill-publish.test.ts`（新）、`distributed.test.ts`（更新）：三类计数、37 行不显示「37 台机器」、超时「待确认」、200 截断文案、浏览器时钟无影响、读取失败「状态不可用」、同名两行、历史折叠、禁语断言；旧「能读到的 0」「读不到待确认」断言保留。
+
+### Implementation for User Story 4
+
+- [x] T055 [US4] `internal/storage/postgres/worker_store.go`：`Register` 写 `heartbeat_interval_seconds`（`> 0` 正整数、`0` → NULL、负数应用层拒绝）；`ReadWorkerOverview` 单条 SQL（四段 `MATERIALIZED` CTE + 外层 LEFT JOIN、`now()` 非 `clock_timestamp()`、按行阈值 `max(3 × 间隔, 30s)`、`total` = 三计数之和、`truncated`）；`NewWorkerStore` 可选默认间隔入口（缺省 10s）。
+- [x] T056 [US4] `internal/web/views.go` / `internal/app/system_reader.go`：`SystemWorkersView` 追加 `as_of` / `counts` / `total` / `truncated`；`SystemWorkerView` 追加 `name` / `hostname` / `build_version` / `schema_version` / `stopped_at` / `heartbeat_age_seconds` / `heartbeat_interval_seconds` / `stale_after_seconds` / `status`；`ReadOverview` 改用 `ReadWorkerOverview(ctx, 200)`，失败整组省略；`internal/web/contract_test.go` 补概览字段断言（`TestOpenAPI_SystemOverviewWorkersFields`）。
+- [x] T057 [US4] `assets/console/src/api.ts` / `api-admin.ts` / `views/overview.ts` / `components/overview-worker-labels.ts` / `components/publish-status.ts`：类型与渲染——顶部三块计数 + 活跃执行权、正常组行精简、超时组默认展开 5 条、停止组折叠、截断文案、`as_of`、失败不可用；不得用浏览器时钟推算状态、不按名称合并。
+- [x] T058 [US4] 重建 `assets/console/dist`（`npm run build`），确保内嵌静态资源与源码一致。
+
+**Checkpoint**: US4 独立可验——概览读数与真实进程实例一致。
+
+---
+
+## Phase 7: User Story 5 - 门面与门禁（Priority: P3）
+
+**Goal**: 网站 / README / 演示动画 / 图示更新；四个 stage 与全量门禁证据。
+
+**Independent Test**: 站点 `npm test`、`npm run build`、`npm run check` 通过；能力与范围注不夸大；12 页双语图示；导航 Demo 指向部署实例；四个 stage 顺序全绿后全量门禁一次通过。
+
+### Tests for User Story 5 ⚠️（先红）
+
+- [x] T059 [P] [US5] 站点测试 `website/tests/routes.test.mjs`、`content.test.mjs`、`demo.test.mjs`：导航 `[home, docs, REPO_URL, DEMO_CONSOLE_URL]`、`DEMO_COMMAND` 定时触发、范围注必须列出未交付项（K8s、数据库 HA、跨节点业务状态共享）、禁词表移除「分布式」保留向量检索与自动生成技能。
+- [x] T060 [P] [US5] 文档断言 `internal/cli/docs_first_run_test.go`（或现有 docs 测试扩展）：Operations 新增「已发布资产同步」小节、`assets status`、失败原因、恢复路径、不要重导种子（`TestDocs_AssetSyncSectionAndRecovery`）；README 架构描述与 Demo 链接口径一致（`TestDocs_ReadmeArchitectureAndDemoLink`）。
+
+### Implementation for User Story 5
+
+- [x] T061 [US5] `website/.vitepress/data/capabilities.mjs` / `navigation.mjs` / `demo.mjs`、`website/demo/transcript.json`、`local-model.mjs`、`CliDemo.vue`：能力文案、`CURRENT_SCOPE_NOTE`、`DEMO_CONSOLE_URL`、`DEMO_COMMAND` 与定时触发 transcript（真实二进制 + 本地桩，不调用真实模型）。
+- [x] T062 [US5] 双语图示：`website/public/diagrams/{en,zh}` 的 `system-architecture`、`deployment` 两图重绘（SVG + PNG + 可编辑源），`website/diagrams/basalt-diagrams.drawio` 同步、`data-source-commit` 指向本次提交、页数保持 12。
+- [x] T063 [US5] 门面文档：`README.md` / `README.zh-CN.md` 架构描述与范围注；`docs/Operations.md` §5.5 + 资产同步小节；`docs/TechnicalDesign.md` 资产分发与技能物化小节；`docs/Compatibility.md` US-25 → US-25C 承接。
+- [x] T064 [US5] `website/scripts/check-links.mjs` 允许清单增加 `DEMO_CONSOLE_URL` 的 origin + `/console/` 路径；运行 `npm test` / `npm run build` / `npm run check` 并记录读数。
+- [x] T065 [US5] 完成四个 stage 的 `required_tests` 与保护用例清单（T003 骨架补全），按 `us25c-base → us25c-sync → us25c-fault → us25c-docs` 顺序逐项跑绿并登记证据。
+
+---
+
+## Phase 7B: 产品定位与对外表达补强（R9，用户 2026-11-09 追加）
+
+**Goal**: 按用户定位语义基准统一 README 与官网分层表达；细化 T061～T064，并补充 T068 收口材料。**在 T065 之后、T066 冻结代码之前执行**（文档改完先跑站点测试 / 构建 / 检查，不因此重复跑全量门禁）。
+
+**Independent Test**: 站点 `npm test` / `npm run build` / `npm run check` 通过；首屏与 README 表达三层（Agent OS / 执行能力 / 工程验证）且不展开内部契约细节；过时描述逐处修正；不新增脆弱全文匹配断言。
+
+- [x] T069 [US5] 统一产品定位文案：以「Basalt｜企业自托管 Agent OS」为语义基准，`website/.vitepress/theme/components/HomeHero.vue` 首屏标题 / 副标题、中英文首页与产品文档 / 架构页的页面标题与 description；首屏不展开 pending / epoch / event_id / 锁序等内部细节（留在技术文档）；沿用现有视觉与组件，不扩展站点功能。
+- [x] T070 [US5] 能力区与工程验证区：`website/.vitepress/data/capabilities.mjs` 与首页能力区分别讲清公共能力、工作流编排、多 Worker 分布式执行；新增工程验证说明（功能回归与端到端、并发／故障注入与恢复、构建／制品／发布验证），每条对应既有脚本 / 测试 / 契约，不写成「真实模型效果已验证」。
+- [x] T071 [US5] README 组织与过时描述修正：`README.md` / `README.zh-CN.md` 开头按「是什么 / 解决什么问题 / 有什么特点」重组并新增「工程验证／自动化验收」小节（保留快速开始、部署方式与使用示例，不重做整份 README）；逐处核实修正「single-node」与「分布式列为规划」；按四条边界表述（单二进制≠单进程单机、多 Worker≠全组件高可用、公共能力复用≠跨 Agent 私有数据可读、资产同步≠工作区 / 业务状态跨节点共享）；不全局机械删除「规划／未验证」，US-25C 能力验收前不宣称已发布。
+- [x] T072 [US5] 站点验证与收口材料：文档修改完成后跑现有 `npm test` / `npm run build` / `npm run check` 并记录读数；收口包附 ① README 开头与官网首屏最终中英文文案 ② 首屏 / 能力区 / 工程验证区截图 ③ 过时描述修正位置 ④ 各项主要能力对应实现或验证依据 ⑤ 仍未交付 / 未验证边界 ⑥ 本地修改、构建通过、线上发布三者实际状态；不为每句文案新增全文匹配测试。
+
+---
+
+## Phase 8: Polish & Cross-Cutting Concerns
+
+- [x] T066 冻结代码前的定向复核：`gofumpt -w` 本轮改动文件；`go vet -tags=integration` / `staticcheck -tags=integration` / `gosec` 全绿；`go mod tidy` 后 `go.mod` / `go.sum` 与起点空 diff。
+- [x] T067 冻结代码后一次性全量门禁 `sh scripts/check-acceptance.sh`（七目标 + 四 stage + 固定评测），记录四态读数与源码指纹；未通过项如实登记，不用子集冒充。
+- [x] T068 收口证据整理：`docs/us/` 模块卡证据表回填；`specs/025c-distributed-consistency/run-state.md` 未验证清单更新；§2.6 判据表逐行核对（修复行 → 具名测试，边界行 → 守护断言或明确不测理由），FR-25C-19 注明「仅人工 §4.5 步 7 验收」或补具名集成用例；人工 review ② 包（A+B 九步与未授权项清单）。
+
+---
+
+## Dependencies & Execution Order
+
+### Phase Dependencies
+
+- **Setup（Phase 1）**：可立即开始；T002 的契约测试先红。
+- **Foundational（Phase 2）**：依赖 Setup；**阻塞所有用户故事**。
+- **US1（Phase 3）**：依赖 Foundational；MVP。
+- **US2 / US3 / US4（Phase 4～6）**：依赖 Foundational；与 US1 有共享文件（`asset_sync.go`、`scheduler.go`、`wire.go`），按 US1 → US2 → US3 → US4 顺序执行，避免同文件冲突。
+- **US5（Phase 7）**：依赖运行时故事落地后才能做最终断言；文档与站点可并行起草，测试最后转绿。
+- **Polish（Phase 8）**：依赖全部故事。
+
+### User Story Dependencies
+
+- **US1**：无跨故事依赖（Foundational 之后）。
+- **US2**：与 US1 共用 `wire.go` / `asset_sync.go`；其资源准备为 US1 Entry 构建提供 `PreparedResources`（Foundational 已给最小实现）。
+- **US3**：依赖 US1 的同步与就绪记录；复用 US2 的资源准备与角色门。
+- **US4**：独立于 US1～US3 的运行时语义，只读投影；可与 US5 并行。
+- **US5**：内容依赖 US1～US4 的事实；顺序执行。
+
+### Parallel Opportunities
+
+- Setup：T001 / T002 / T003 三文件互不冲突。
+- Foundational：T004～T006 测试并行；T007～T011 实现并行（不同文件）；T012 / T013 依赖端口。
+- 各故事的测试任务（标 [P]）可先并行写红。
+- US4 控制台（T054 / T057）与 Web / 存储（T052 / T053 / T055 / T056）可并行。
+
+### Within Each User Story
+
+- 测试先红；实现后转绿；同一任务内实现 + 测试一起落地。
+- 模型 / 端口先于服务；服务先于端点 / 视图。
+- 同一文件的多任务串行（`asset_sync.go` T021 → T022 → T023；`scheduler.go` T046 → T048）。
+
+---
+
+## Parallel Example: User Story 1
+
+```text
+# 同时开写四个测试文件（均为新文件）：
+T014 internal/app/assets_publish_payload_test.go
+T015 internal/app/backfill_payload_test.go
+T016 internal/app/asset_sync_test.go
+T017 internal/app/skill_materialize_test.go
+
+# 端口与仓储并行（不同文件）：
+T010 internal/core/assets.go
+T011 internal/core/scheduler.go
+T012 internal/storage/postgres/asset_distribution_store.go
+```
+
+---
+
+## Implementation Strategy
+
+### MVP First (User Story 1)
+
+1. 完成 Setup + Foundational。
+2. 完成 US1：发布 → 同步 → 物化 → 注册 → 就绪。
+3. **STOP and VALIDATE**：`us25c-base` + 双实例分发集成测试。
+4. 再进入 US2 / US3。
+
+### Incremental Delivery
+
+1. Foundational → US1（分发闭环）→ 独立验证。
+2. US2（五组一致性）→ 独立验证。
+3. US3（钉住与公平扫描）→ 独立验证。
+4. US4（概览读数）→ 独立验证。
+5. US5（门面与 stage）→ 定向 stage 全绿。
+6. 冻结代码 → 全量门禁一次 → 收口证据。
+
+### Notes
+
+- 每个任务完成即写 run-state（证据位置 / 未验证项 / 下一条动作），不在任务边界停下等确认。
+- 判据面变更（删断言 / 放宽阈值 / 改验收语义）必须停下裁决；新增测试与等价重构允许。
+- 真实模型与真实 webhook 不在自动验收内；A+B 九步只执行不触发模型的步骤并登记未验证。

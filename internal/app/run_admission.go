@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/ymedword/basalt/internal/callers"
 	"github.com/ymedword/basalt/internal/core"
@@ -61,6 +62,13 @@ type runAdmission struct {
 	diag diagnosticRecorder
 	// Nil keeps the approved default reserve of one; explicit zero opts out.
 	flowReservedPerCaller *int
+	// policyFreshness 是运行期策略新鲜度的只读面（FR-25C-16）：nil = 本路径不设门
+	// （`chat` / `tool` 是单进程、启动时装载策略的轻路径，不得因几分钟没刷新被判过期）。
+	// policyMaxStale 取 `policy.max_stale`；`now` 为 nil 时用系统时钟（测试注入假时钟）。
+	// A nil freshness face disables the gate; the chat/tool paths stay ungated.
+	policyFreshness PolicyFreshness
+	policyMaxStale  time.Duration
+	now             func() time.Time
 }
 
 // run 取名额 → 执行 → 归还。`next` 是真正跑 Run 的函数（core 运行入口）。
@@ -72,6 +80,14 @@ func (a *runAdmission) run(
 ) (res core.RunResult, err error) {
 	if req.Flow != nil && (a == nil || a.limiter == nil) {
 		return core.RunResult{}, core.ErrFlowDispatch
+	}
+	// 策略新鲜度门（FR-25C-16）排在取名额之前：过期时**任何**新 Run 都不得进入执行路径，
+	// 也不占名额。刷新由控制面 / Worker 的后台 `PolicyRefresher` 恢复，成功一轮即自动放行。
+	// The freshness gate sits ahead of every slot: a stale policy never occupies one.
+	if staleErr := a.checkPolicyFreshness(); staleErr != nil {
+		a.logWarn("refusing run: runtime policy snapshot is stale", "error", staleErr,
+			"agent", req.Agent, "run_id", req.RunID)
+		return core.RunResult{}, staleErr
 	}
 	if a != nil && a.limiter != nil {
 		var ticket callers.RunTicket
@@ -151,6 +167,41 @@ func (a *runAdmission) run(
 	}()
 
 	return next(ctx, req)
+}
+
+// checkPolicyFreshness 是 FR-25C-16 的准入判据：最近一次四类策略**全部成功**的核对
+// 距今超过 `policy.max_stale`，或从未成功过 → `core.ErrPolicyStale`（web 映射 503
+// `POLICY_STALE`）。过期判定只认成功核对时间戳，与内容版本无关——内容长期不变不构成
+// 过期，只有刷新失败让时间戳停在原地。`policyFreshness` 为 nil = 本路径不设门。
+// Staleness follows only the last fully successful round; nil disables the gate.
+func (a *runAdmission) checkPolicyFreshness() error {
+	if a == nil || a.policyFreshness == nil {
+		return nil
+	}
+	now := time.Now()
+	if a.now != nil {
+		now = a.now()
+	}
+	verified := a.policyFreshness.LastVerified()
+	if verified.IsZero() {
+		return &core.AdminError{
+			Kind:    core.ErrPolicyStale,
+			Message: "运行期策略尚未完成一次成功核对（允许域 / 拒绝域 / 访问例外 / 执行档位）：确认策略表可达，刷新成功后自动放行",
+		}
+	}
+	maxStale := a.policyMaxStale
+	if maxStale <= 0 {
+		maxStale = defaultPolicyMaxStale
+	}
+	if age := now.Sub(verified); age > maxStale {
+		return &core.AdminError{
+			Kind: core.ErrPolicyStale,
+			Message: fmt.Sprintf(
+				"运行期策略快照已过期：最近一次成功核对在 %s（距今 %s，超过 policy.max_stale）；刷新恢复后自动放行",
+				verified.Format(time.RFC3339), age.Round(time.Second)),
+		}
+	}
+	return nil
 }
 
 // precheckAdmission 在取在途名额之前给出调用方并发 / 会话的只读结论。未接线

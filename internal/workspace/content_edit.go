@@ -130,6 +130,16 @@ type AgentEditorDeps struct {
 	// AssembleTools is the controlled tool assembly injected by the assembly layer;
 	// its only allowed delta is notify, and a nil hook skips assembly.
 	AssembleTools func(ctx context.Context, agent string, profile *core.Profile) (tools []string, change core.ToolChange, err error)
+	// PublishBundle 在内容写提交并回填成功之后、**仍在同一把 Agent 写锁内**把落盘定义
+	// 发布为共享资产，返回值随写结果回给页面。放进写锁的原因：创建 / 提交 / 复制 /
+	// 恢复四条管理写面都在共享闸门内完成「写 + 发布」，内容写必须与它们同序——否则
+	// 后完成的发布可能构建的是较早那次写入，共享指针倒退（2026-11-09 用户裁决）。
+	// 回调自己决定超时与失败口径：发布失败**不得**把已生效的写改写成失败。
+	// nil = 未接线（只读 / 轻量装配面），不发布。
+	// PublishBundle publishes the committed definition inside the same agent write
+	// lock that every admin write face holds through its own publication; the
+	// callback owns the timeout and never turns a committed write into a failure.
+	PublishBundle func(ctx context.Context, agent string, actor core.Actor) core.AgentPublishView
 	// Now 是注入时钟；nil 时退回 time.Now。
 	Now func() time.Time
 }
@@ -148,6 +158,7 @@ type AgentEditor struct {
 	validate  func(ctx context.Context, agent string, candidate []byte) (core.AgentEntry, string, []core.ManifestEntry, error)
 	bindings  func(ctx context.Context, agent string, profile *core.Profile) error
 	assemble  func(ctx context.Context, agent string, profile *core.Profile) ([]string, core.ToolChange, error)
+	publish   func(ctx context.Context, agent string, actor core.Actor) core.AgentPublishView
 	now       func() time.Time
 	rename    renameFunc
 }
@@ -172,6 +183,7 @@ func NewAgentEditor(deps AgentEditorDeps) *AgentEditor {
 		validate:  deps.Validate,
 		bindings:  deps.ValidateBindings,
 		assemble:  deps.AssembleTools,
+		publish:   deps.PublishBundle,
 		now:       deps.Now,
 	}
 }
@@ -388,6 +400,18 @@ func (e *AgentEditor) UpdateContent(ctx context.Context, agent string, update co
 	finish(core.OperationSuccess, resultCodeOK, "")
 	removeBackup(base, defPath)
 
+	// 保存即发布，且在**写锁内**完成（2026-11-09 用户裁决，修订 D-25-10）：创建 /
+	// 提交 / 复制 / 恢复四条管理写面都在同一把共享闸门内「写 + 发布」，内容写只有
+	// 也留在锁内，才能保证并发写的发布顺序与写顺序一致——否则后完成的发布可能
+	// 构建较早那次写入，共享指针倒退到旧内容（下一 Run 按 ASSET_VERSION_MISMATCH
+	// 失败关闭）。发布失败只影响 Publish 状态，不回滚写、不改写操作终态。
+	// Publish inside the same write lock every admin write face holds: ordering is
+	// guaranteed by the shared gate, and a failed publication never fails the write.
+	var publish core.AgentPublishView
+	if e.publish != nil {
+		publish = e.publish(ctx, agent, actor)
+	}
+
 	files, err := listManagedFiles(base, agent)
 	if err != nil {
 		// 写与发布都已成功：这次 500 只表示"响应视图没能组装"，操作行保持 success，
@@ -395,7 +419,7 @@ func (e *AgentEditor) UpdateContent(ctx context.Context, agent string, update co
 		slog.Default().Error("内容写成功但文件清单读取失败", "agent", agent, "operation_id", opID, "error", err)
 		return core.AgentFiles{}, fmt.Errorf("读取 Agent 文件清单（operation %s）: %w", opID, err)
 	}
-	return core.AgentFiles{Agent: agent, Files: files, Changes: toolChange}, nil
+	return core.AgentFiles{Agent: agent, Files: files, Changes: toolChange, Publish: publish}, nil
 }
 
 // assembleCandidateTools 在候选字节上执行受控工具装配（R7 / 宪法约束 11）：

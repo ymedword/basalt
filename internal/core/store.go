@@ -412,6 +412,10 @@ type RunRecord struct {
 	// Lifecycle carries the admission-time expectation rechecked inside StartRun's
 	// transaction; a zero value is refused rather than skipped.
 	Lifecycle LifecycleExpectation
+	// Pin 是本 Run 的固定版本凭证（US-25C FR-25C-08）：非 nil 时 `StartRun` 在同一
+	// 准入事务内按固定锁序复核领取记录与执行租约；nil 时保持既有当前指针判据。
+	// Pin drives the in-transaction claim recheck; nil keeps the current-pointer checks.
+	Pin *ClaimedBundlePin
 	// Flow associates an admitted Run with the already durable node attempt.
 	Flow *FlowRunContext
 }

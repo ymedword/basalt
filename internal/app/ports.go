@@ -130,6 +130,11 @@ type agentsPort struct {
 	// BundleRoot is the resolved asset root shared with `assets install --agent`; an
 	// empty value means this assembly offers no bundle publication.
 	BundleRoot string
+
+	// MaxBundleBytes 是发布载荷的上限（`assets.max_bundle_bytes`）：CLI 写路径与
+	// serve 用同一个上限，超限一律拒绝而不是截断。
+	// MaxBundleBytes bounds the published payload exactly as serve does.
+	MaxBundleBytes int64
 }
 
 // List 转调装载器：provider 名集由调用方显式传入（适配器**不**另读一次配置）；工具池用
@@ -304,28 +309,35 @@ func (p agentsPort) openCLIAdmin(ctx context.Context, root string, now func() ti
 		// 装配不提供资产发布面（零值测试装配），此时不接线。
 		// The same shared publication chain runs here under the already-held instance
 		// lock; going through assetsPort.Publish would take the lock a second time.
-		PublishBundle: p.publishBundle(root, index, operations),
+		PublishBundle: p.publishBundle(root, index, operations, db),
 	})
 	return &cliAdminSession{db: db, admin: admin}, nil
 }
 
 // publishBundle 构造 CLI 写路径的资产发布回调；BundleRoot 未配置时返回 nil（不接线）。
+// 载荷读写两个仓储以同一次装配的库句柄现建（与本路径其他仓储同一装法）。
 // publishBundle returns nil when the assembly carries no asset root, so the write path
 // keeps its exact behaviour in zero-value test assemblies.
 func (p agentsPort) publishBundle(root string, index *postgres.ResourceStore,
-	operations core.OperationStore,
-) func(ctx context.Context, agent string) (int64, error) {
+	operations core.OperationStore, db *postgres.DB,
+) func(ctx context.Context, agent string, actor core.Actor) (int64, error) {
 	if p.BundleRoot == "" {
 		return nil
 	}
-	return func(ctx context.Context, agent string) (int64, error) {
+	payloads := postgres.NewAssetDistributionStore(db)
+	payloadStore := postgres.NewBundlePayloadStore(db)
+	return func(ctx context.Context, agent string, actor core.Actor) (int64, error) {
 		return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
-			Root:       root,
-			BundleRoot: p.BundleRoot,
-			Versions:   index,
-			Operations: operations,
-			Logger:     p.logger(),
-			Now:        time.Now,
+			Root:         root,
+			BundleRoot:   p.BundleRoot,
+			Versions:     index,
+			Operations:   operations,
+			Payloads:     payloads,
+			PayloadStore: payloadStore,
+			MaxBytes:     p.MaxBundleBytes,
+			Actor:        actor,
+			Logger:       p.logger(),
+			Now:          time.Now,
 		}, agent)
 	}
 }

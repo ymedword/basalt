@@ -235,7 +235,7 @@ func (s *restartSequence) start() *heavyRuntime {
 	// 与 `assemble` 同一前置：探针 provider 的已发布版本要先在库里，绑定才有可对齐的身份。
 	// Same precondition as `assemble`: the probe's published version must precede the agent.
 	s.fx.seedPublishedProviders(s.t)
-	rt, err := s.fx.app().newRuntime(context.Background())
+	rt, err := s.fx.app().newRuntime(context.Background(), roleControl)
 	require.NoError(s.t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	s.fx.enableAgents(s.t, rt)
 	s.last = rt

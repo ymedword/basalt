@@ -64,10 +64,13 @@ type Config struct {
 	// 分布式执行三段（US-24 §3.3）：显式解析入口、未知键拒绝、装载期逐条校验。
 	// The three distributed-execution sections: explicit parsing, unknown keys refused,
 	// every rule checked at load time.
-	Worker    WorkerConfig      `yaml:"-"`
-	Scheduler SchedulerConfig   `yaml:"-"`
-	Assets    AssetsConfig      `yaml:"-"`
-	Author    core.AuthorConfig `yaml:"-"`
+	Worker    WorkerConfig    `yaml:"-"`
+	Scheduler SchedulerConfig `yaml:"-"`
+	Assets    AssetsConfig    `yaml:"-"`
+	// Policy 是运行期策略刷新段（US-25C §3.3）：`sync_interval` / `max_stale`。
+	// 与 assets 一样走显式解析入口——未知段若交给 yaml 解码器会被静默忽略。
+	Policy PolicyConfig      `yaml:"-"`
+	Author core.AuthorConfig `yaml:"-"`
 }
 
 // LearningConfig 是受控自我进化的启用段（`learning`，US-22 §3.1.11）。
@@ -813,7 +816,11 @@ func decodeConfig(tree map[string]any) (*Config, error) {
 	if cfg.Assets, err = parseAssetsConfig(assetsSection, assetsPresent); err != nil {
 		return nil, err
 	}
-	if err := validateDistributedConfig(cfg.Worker, cfg.Scheduler, cfg.Assets, cfg.Flows); err != nil {
+	policyTree, policyPresent := tree["policy"]
+	if cfg.Policy, err = parsePolicyConfig(policyTree, policyPresent); err != nil {
+		return nil, err
+	}
+	if err := validateDistributedConfig(cfg.Worker, cfg.Scheduler, cfg.Assets, cfg.Policy, cfg.Flows); err != nil {
 		return nil, err
 	}
 

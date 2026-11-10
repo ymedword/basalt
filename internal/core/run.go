@@ -73,6 +73,11 @@ type RunRequest struct {
 	// When set, the notify tool is removed from this run's ToolSet and the notify grant is
 	// forced to none; the scheduler sets it whenever the task delivers its result itself.
 	SuppressNotify bool
+	// Pinned 是调度通道带入的固定版本凭证（US-25C §2.3.5.1）：**只由调度通道填**，
+	// web / cli / admin 一律 nil。非 nil 时 Run 准入按领取记录 + 执行租约复核，
+	// **不再**比较当前指针；nil 时保持既有当前指针判据。
+	// Pinned is filled only by the scheduling path; other entries leave it nil.
+	Pinned *ClaimedBundlePin
 	// Flow is server-constructed durable execution context, absent from HTTP DTOs.
 	Flow *FlowRunContext `json:"-"`
 	// FixedTool is app-owned control and is never decoded from an ordinary DTO.

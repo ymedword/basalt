@@ -368,6 +368,24 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 	return entry, rej
 }
 
+// validationNames 是一次判定实际使用的名字集快照（US-25C C14）：工作区装载取装载器
+// 构造期快照 / 动态来源，bundle 装载取本轮资源准备结果——判定函数只认这份入参，不再
+// 自己回读装载器的实时字段（否则 bundle 路径又经 `ProvidersFunc` 读一次实时目录）。
+// validationNames is the name-set snapshot one validation runs against; the workspace
+// path snapshots the loader's sources, the bundle path takes the prepared resources.
+type validationNames struct {
+	providers    []string
+	tools        []string
+	mcpServers   []string
+	mcpConnected []string // nil = 连接结果未知（轻路径第三态）
+}
+
+// skillResolver 判定一条声明的技能是否有可用实体：工作区路径查技能库，bundle 路径查
+// 已物化的发布目录（§3.1.4）——规则 5 的判定逻辑只写一份，判定面由调用方给出。
+// skillResolver decides whether a declared skill has a usable entity; the workspace
+// path consults the library, the bundle path consults materialized publications.
+type skillResolver func(name string) bool
+
 // validateProfile 对一份**已解析**的 Profile 执行装载期全部规则（规则 1–8）；读取与
 // 解析由调用方负责——loadOne 读目录里的 AGENT.md，ValidateCandidate 读内存候选字节，
 // 两条路径因此判定的是同一段代码（内容条件写与热加载同一道闸门）。返回首个失败的
@@ -375,13 +393,26 @@ func (l *AgentLoader) loadOne(base, lib *os.Root, name string, mcpNames, mcpConn
 // validateProfile applies the load-time rules to an already-parsed profile; both the
 // directory loader and the candidate validator judge through this one function.
 func (l *AgentLoader) validateProfile(base, lib *os.Root, name string, profile *core.Profile, mcpNames, mcpConnected []string, claim map[string]string) (reject, bool) {
+	return l.validateProfileWith(base, name, profile, validationNames{
+		providers:    l.registeredProviders(),
+		tools:        l.tools,
+		mcpServers:   mcpNames,
+		mcpConnected: mcpConnected,
+	}, func(skill string) bool {
+		return missingSkill(lib, []string{skill}) == ""
+	}, claim)
+}
+
+// validateProfileWith 是规则 1–8 的唯一实现：名字集与技能判定面一律由调用方给定。
+// validateProfileWith is the single implementation of rules 1–8 over explicit inputs.
+func (l *AgentLoader) validateProfileWith(base *os.Root, name string, profile *core.Profile, names validationNames, skillOK skillResolver, claim map[string]string) (reject, bool) {
 	if profile.Name != name { // 规则 1
 		return reject{
 			kind:   core.AgentRejectNameMismatch,
 			detail: fmt.Sprintf("目录名 %s 与 frontmatter name %s 不一致", name, profile.Name),
 		}, false
 	}
-	if !slices.Contains(l.registeredProviders(), profile.Provider.Name) { // 规则 2
+	if !slices.Contains(names.providers, profile.Provider.Name) { // 规则 2
 		return reject{kind: core.AgentRejectProviderNotRegistered, detail: profile.Provider.Name}, false
 	}
 	if strings.TrimSpace(profile.Provider.Model) == "" { // 规则 3（占位文本是普通文本，天然放行）
@@ -402,29 +433,31 @@ func (l *AgentLoader) validateProfile(base, lib *os.Root, name string, profile *
 	// 重路径（连接结果已知）与零配置仍按原规则拒载。
 	deferred := false
 	for _, toolName := range profile.Tools {
-		if slices.Contains(l.tools, toolName) {
+		if slices.Contains(names.tools, toolName) {
 			continue
 		}
-		if mcpConnected == nil && len(mcpNames) > 0 {
+		if names.mcpConnected == nil && len(names.mcpServers) > 0 {
 			deferred = true
 			continue
 		}
 		return reject{kind: core.AgentRejectToolNotRegistered, detail: toolName}, false
 	}
-	if missing := missingSkill(lib, profile.Skills); missing != "" { // 规则 5
-		return reject{kind: core.AgentRejectSkillNotFound, detail: missing}, false
+	for _, skillName := range profile.Skills { // 规则 5（判定面由调用方给出）
+		if !skillOK(skillName) {
+			return reject{kind: core.AgentRejectSkillNotFound, detail: skillName}, false
+		}
 	}
 	// 规则 6（US-7 全条）：先判**已配置**、再判**已连接**——存在但未连接的 server
 	// 与不存在的 server 同判（R4）；轻路径连接结果未知时只标记待确认。
 	for _, m := range profile.MCPServers {
-		if !slices.Contains(mcpNames, m) {
+		if !slices.Contains(names.mcpServers, m) {
 			return reject{kind: core.AgentRejectMCPServerSkipped, detail: m}, false
 		}
-		if mcpConnected == nil && len(mcpNames) > 0 {
+		if names.mcpConnected == nil && len(names.mcpServers) > 0 {
 			deferred = true
 			continue
 		}
-		if !slices.Contains(mcpConnected, m) {
+		if !slices.Contains(names.mcpConnected, m) {
 			return reject{kind: core.AgentRejectMCPServerSkipped, detail: m}, false
 		}
 	}

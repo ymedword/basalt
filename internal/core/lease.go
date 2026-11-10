@@ -67,6 +67,14 @@ var (
 	// ErrTaskDisabled marks a cron claim rejected by a committed disable; the claim
 	// must recheck the latest enabled flag under the task row lock.
 	ErrTaskDisabled = errors.New("core: task disabled after scan")
+	// ErrAssetNotReady / ErrAssetMoved 是钉住领取的两种**零写入**拒绝（US-25C
+	// FR-25C-11）：前者表示发布指针缺失 / 已软删除，后者表示指针哈希与领取期望不符
+	// （扫描后、领取前被发布抢先）。两者都**不写执行行、不推进 `next_fire_at`**，
+	// 触发原样留在原地，由下一次考察从就绪门重新求值——不得改写成"暂存补发"。
+	// Both pinned-claim refusals write nothing: the trigger stays in place and is
+	// re-evaluated from the readiness gate on the next sweep.
+	ErrAssetNotReady = errors.New("core: asset bundle not ready for claim")
+	ErrAssetMoved    = errors.New("core: asset bundle moved before claim")
 )
 
 // WorkerIdentity 是一次进程的身份。InstanceID 是协调身份，Name 只作诊断。
@@ -76,12 +84,20 @@ var (
 // 管理面拒绝"在线混跑"式升级（Q15 的停机迁移口径）。
 // WorkerIdentity is the identity of one process. InstanceID coordinates; Name is
 // diagnostic only. SchemaVersion is written once at Register and never refreshed.
+// HeartbeatIntervalSeconds is the process's actual heartbeat cadence, also written
+// once at Register (0 = undeclared, stored as NULL).
 type WorkerIdentity struct {
 	InstanceID    string
 	Name          string
 	Hostname      string
 	Version       string
 	SchemaVersion int
+	// HeartbeatIntervalSeconds 是本进程实际的心跳间隔（秒），登记时落库，供概览按行
+	// 计算诊断阈值 `max(3 × 间隔, 30s)`；0 = 未声明 → 列写 NULL，读取方用部署默认兜底。
+	// 进程生命周期内不变，心跳不重复上报；它只作显示，不参与准入、调度或租约判定。
+	// HeartbeatIntervalSeconds is the actual heartbeat cadence, stored once at Register
+	// for the per-row diagnostic threshold; it never feeds admission or scheduling.
+	HeartbeatIntervalSeconds int
 }
 
 // IsZero 判定"这次装配没有 Worker 身份"——未接执行权的轻装配与 SQLite 源谱系为真。
@@ -265,6 +281,67 @@ type WorkerNodeView struct {
 	// ActiveLeases 是该实例当前仍有效的执行权数量（只读诊断，不是占有权证明）。
 	// ActiveLeases counts the instance's still-valid execution leases.
 	ActiveLeases int64
+}
+
+// WorkerOverviewCounts 是全库三类服务端状态的计数。三值与 `WorkerOverview.Total`
+// 必须来自**同一条 SQL 语句的同一快照**，不得由明细条数推算，也不得拆成多次查询
+// （中途插入的行会让计数与明细互相矛盾）。
+// WorkerOverviewCounts holds the database-wide counts of the three server-side states;
+// they and Total come from one statement's snapshot, never from the detail rows.
+type WorkerOverviewCounts struct {
+	Active  int
+	Stale   int
+	Stopped int
+}
+
+// WorkerNodeStatus 是概览的逐实例投影：内嵌 `WorkerNodeView`（与 `basalt workers
+// list` 同一份形状），追加服务端计算的状态与诊断读数。
+//
+//   - `Status` 只取 `active`（心跳正常）/ `stale`（心跳超时待确认）/ `stopped`（已停止）
+//     三值，由数据库时钟与按行阈值 `max(3 × 心跳间隔, 30s)` 判定；
+//   - `HeartbeatIntervalSeconds` 为 nil 表示迁移前的旧行（列写 NULL），阈值取部署默认，
+//     详情必须如实标注这一来源；
+//   - `HeartbeatAgeSeconds` 同样以数据库 `now()` 计算，浏览器时钟不参与。
+//
+// 状态与读数只作显示：不参与准入、调度或租约接管，也不提供任何管理动作。
+// WorkerNodeStatus is the per-instance overview projection: the shared WorkerNodeView
+// plus server-computed status (active/stale/stopped) and diagnostic readings. Status is
+// display-only; a nil interval marks a pre-migration row falling back to the deployment
+// default.
+type WorkerNodeStatus struct {
+	WorkerNodeView
+	HeartbeatAgeSeconds      int64
+	HeartbeatIntervalSeconds *int
+	Status                   string
+}
+
+// WorkerOverview 是系统概览“分布式执行”面板的唯一数据源：`AsOf` 是判定用的数据库
+// 时刻，`Counts` / `ActiveLeases` / `Total` 是全库聚合，`Nodes` 是有界明细（排序稳定、
+// 按 limit 截断），`Truncated` 表示 `Total > len(Nodes)`。读取失败必须整组报错、由调用方
+// 显示“状态不可用”，不得渲染成 0。
+// WorkerOverview is the single source for the console's distributed-execution panel: a
+// database-time snapshot with aggregate counts and a bounded, honestly truncated detail
+// list. Callers render a failed read as unavailable, never as zero.
+type WorkerOverview struct {
+	AsOf   time.Time
+	Counts WorkerOverviewCounts
+	// ActiveLeases 是全库仍有效的租约总数（未释放且未过期），与 `Counts` / `Nodes`
+	// 来自**同一条语句的同一快照**；它统计**全部**负责人——包括没有 `worker_nodes`
+	// 行的 legacy 持有者，因此不等于 `Nodes` 各行租约数之和（§2.3.9 L918）。
+	// ActiveLeases is the cluster-wide live lease count from the same statement snapshot;
+	// it counts every owner, including legacy owners without a node row.
+	ActiveLeases int64
+	Total        int
+	Truncated    bool
+	Nodes        []WorkerNodeStatus
+}
+
+// WorkerOverviewReader 是概览读取端口：`limit` 只约束明细条数，不影响全库计数；
+// 部署默认心跳间隔由实现方在构造期注入，供旧行兜底。
+// WorkerOverviewReader is the overview read port; limit bounds only the detail rows,
+// and the deployment default interval is injected at construction for legacy rows.
+type WorkerOverviewReader interface {
+	ReadWorkerOverview(ctx context.Context, limit int) (WorkerOverview, error)
 }
 
 // Reclaimer 每次只回收已过期或已释放的租约所覆盖的执行域。

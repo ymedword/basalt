@@ -964,6 +964,63 @@ type AssetsPort interface {
 	Build(ctx context.Context, agent, dest string) (assets.Manifest, error)
 }
 
+// AssetStatusRow 是 `basalt assets status` 的一个 Agent 诊断行（US-25C 模块卡 §3.1.5
+// / C15）。五个读数**互相独立**，不得由另一个推算：指针哈希来自共享资源指针；已安装
+// 哈希来自本机内容寻址目录（Resolve + 逐文件复算）；载荷读数来自共享载荷表；技能
+// 物化来自本机发布版本目录的逐文件核对；阻塞原因按同步自己的判定顺序给出。
+// One agent's read-only distribution row: five independent readings, never derived from
+// one another, with the blocked reason following the sync's own judgement order.
+type AssetStatusRow struct {
+	// Agent 是资源指针对应的 Agent 名（列表按资源标识升序）。
+	Agent string
+
+	// PointerHash 是当前已发布的 bundle 哈希。
+	PointerHash string
+
+	// InstalledHash 是本机已安装目录的哈希；空串表示本机没有该指针版本的目录
+	// （**不是**"读不到"——读失败会让整条命令失败，不在这里降级成空）。
+	InstalledHash string
+
+	// Payload 是共享载荷表的读数，取值 present / payload_missing /
+	// payload_unavailable（读失败与"没有这一行"是两件事，不得混写）。
+	Payload string
+
+	// Skills 是本机技能物化的读数：materialized / skills_unavailable / unknown。
+	// unknown 只在未安装时为真——没有已安装清单就没有可核对的对象，不猜成已物化。
+	Skills string
+
+	// BlockedReason 是阻塞原因，空串表示就绪。词表与 `AssetSync` 报告共用：
+	// payload_missing / payload_unavailable / not_installed / corrupt /
+	// skills_unavailable；`not_installed` 只在诊断里出现（同步工作集把它记作
+	// pending 而不是失败）。
+	BlockedReason string
+}
+
+// AssetStatusReport 是一次只读诊断的完整读数：资产根 + 逐 Agent 行。
+// AssetStatusReport is one read-only diagnostic pass: the asset root plus every row.
+type AssetStatusReport struct {
+	// AssetRoot 是装配层解析后的内容寻址 bundle 根目录（命令面据此确认查的是哪棵树）。
+	AssetRoot string
+
+	// Agents 是全部已发布 Agent 的诊断行，按资源标识升序。
+	Agents []AssetStatusRow
+}
+
+// AssetStatusReader 是 `basalt assets status` 的**只读**端口（US-25C §3.1.5）。
+//
+// 它刻意不是 `AssetsPort` 的扩展：那个字面量冻结在 AssetRoot / Publish / Build 三个
+// 方法上（US-24 §3.1.11 已定），给它加方法等于改已定字面量；而本命令的依赖面也
+// 完全不同——只开只读会话，不取实例锁、不触发同步、不写任何行。与 `WorkerLister`
+// 同一条先例：新命令一个独立端口、一个独立 Deps 字段。
+// AssetStatusReader is deliberately not an extension of the frozen AssetsPort: a new
+// command gets its own port and Deps field, exactly like WorkerLister.
+type AssetStatusReader interface {
+	// Status 汇总全部已发布 Agent 的分发读数：只读打开运行期后端，不触发同步、
+	// 不取实例锁、不写任何行——服务运行中也能执行。
+	// Status reads the distribution state without triggering sync or writing anything.
+	Status(ctx context.Context) (AssetStatusReport, error)
+}
+
 // ─────────────────────────── first install / demo prepare / master-key check ───────────────────────────
 //
 // 下面三组端口服务于 US-25 的部署命令面（模块卡 §3.1.1 / §3.1.3 / §3.1.4）。同一条

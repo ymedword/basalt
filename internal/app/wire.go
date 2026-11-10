@@ -174,10 +174,16 @@ func (a *App) builtinRuntimeRootOr() string {
 // newRuntime 按固定次序装配一次重路径运行期；返回的句柄归调用方所有，**必须** Close（释放
 // 次序与取得次序相反）。任何一步失败都不留半开的资源：已到手的锁与库句柄在这一层释放并
 // 并入错误链。
+//
+// `role` 是本进程的启动角色（US-25C §2.3.1 / D-25C-06）：`serve` 走 control，`gateway`
+// 走 Worker；共享初始化写**逐项**经 `role.allowSharedInit(...)` 判定，Worker 只做只读
+// 装配与合法的执行协调写（FR-25C-12 / FR-25C-13）。Worker 打不开需要迁移的库——
+// `postgres.OpenForWorker` 只校验版本，不建库、不迁移。
 // newRuntime assembles the heavy-path runtime in the fixed order. The returned handle owns
 // the instance lock and the database and must be closed by the caller; every failure path
-// below releases whatever it already holds.
-func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
+// below releases whatever it already holds. The role decides, item by item, which
+// shared-initialization writes run; workers also open the database in verify-only mode.
+func (a *App) newRuntime(ctx context.Context, role runtimeRole) (*heavyRuntime, error) {
 	logger := a.loggerOr()
 	root := a.wsRoot()
 
@@ -213,10 +219,19 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 
 	// ② 打开 PostgreSQL：连接、扩展能力校验与建库 / 前向迁移都在 `postgres.Open` 内完成
 	// （advisory 锁保护）。失败即拒绝启动——**不回退** SQLite（D-01）；DSN 不进日志。
+	// Worker 走 `postgres.OpenForWorker`：只校验 schema 版本，不建库、不迁移——库结构是
+	// 控制面的共享初始化写，Worker 一项不做（FR-25C-12 / §2.3.1）。
 	// The PostgreSQL handle is opened here; capability checks and the forward
 	// migration happen inside postgres.Open, and a failure aborts startup instead of
-	// falling back to SQLite. The DSN never reaches the log.
-	db, err := postgres.Open(ctx, runtimePostgresConfig(cfg))
+	// falling back to SQLite. The DSN never reaches the log. Workers open in
+	// verify-only mode: creating or migrating the schema is a control-plane write.
+	openDatabase := postgres.Open
+	if role != roleControl {
+		// Worker 走版本校验路径（`OpenForWorker` 只接受精确的受支持版本）。
+		// Workers verify the schema version and never migrate it.
+		openDatabase = postgres.OpenForWorker
+	}
+	db, err := openDatabase(ctx, runtimePostgresConfig(cfg))
 	if err != nil {
 		return nil, abortRuntime(fmt.Errorf("打开 PostgreSQL: %w", err), nil, lock)
 	}
@@ -237,6 +252,13 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	archives := postgres.NewAgentAdminStore(db)
 	ops := postgres.NewManagementStore(db)
 	lifecycle := workspace.NewLifecycleStore(root, a.nowOr())
+	// 生命周期读面的索引优先装配（US-25C FR-25C-14 / §2.6 判据表第 3 行）：准入端口与
+	// 调度门共用同一份读取实现——本地状态文件在各机是旧副本，共享判定以 `agent_lifecycle`
+	// 索引为准；索引无行才回退状态文件，索引行不可用或读失败一律失败关闭。写仍只走
+	// `lifecycle`（状态文件），索引由管理面在落盘成功后就地回写。
+	// The index-first reader is shared by admission and the schedule gate; writes keep
+	// going through the state-file store, and the management path owns the index write.
+	lifecyclePort := newLifecycleIndexPort(lifecycle, versions)
 	channels := postgres.NewNotifyChannelRepo(db)
 	// connectionTests 是「最后一次连接测试」投影（R7 范围修订、schema v4）：模型连接与
 	// 通知渠道的测试写同一张表，管理读面与两个测试端点共用这一实例——页面读到的就是
@@ -308,18 +330,26 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 加密三态判定与首次初始化在**同一把实例锁内**先走一遍（T085 / T087）：可证明的新实例
 	// 在这里生成主密钥；恢复态只记录、不生成替代密钥，也**不**阻断启动（管理面显示
 	// 「恢复中」，托管凭据按失败关闭）。
+	// Worker 跳过这一步：生成 / 轮换主密钥是共享初始化写（`sharedInitSecretsEnsure`，
+	// FR-25C-12）。Worker 只使用控制面已经写下的那份密钥；读不到时托管凭据按失败关闭。
 	// The three-state verdict and the first-run mint happen inside the instance lock;
-	// the recovery state is reported but never blocks startup.
-	secretsStatus, err := instanceSecrets.Ensure(ctx)
-	if err != nil {
-		return nil, abortRuntime(fmt.Errorf("实例加密初始化: %w", err), db, lock)
-	}
-	logger.Info("实例加密：三态判定完成", "step", "secrets",
-		"state", secretsStatus.Decision.State, "reason", secretsStatus.Decision.Reason,
-		"action", secretsStatus.Decision.Action, "key_id", secretsStatus.KeyID)
-	if secretsStatus.Decision.State == core.SecretStateRecoveryRequired {
-		logger.Warn("实例加密：主密钥处于恢复态——不生成替代密钥、不回落 env，托管凭据将失败关闭",
-			"reason", secretsStatus.Decision.Reason)
+	// the recovery state is reported but never blocks startup. Workers skip the mint:
+	// the master key is a control-plane shared write.
+	if role.allowSharedInit(sharedInitSecretsEnsure) {
+		secretsStatus, err := instanceSecrets.Ensure(ctx)
+		if err != nil {
+			return nil, abortRuntime(fmt.Errorf("实例加密初始化: %w", err), db, lock)
+		}
+		logger.Info("实例加密：三态判定完成", "step", "secrets",
+			"state", secretsStatus.Decision.State, "reason", secretsStatus.Decision.Reason,
+			"action", secretsStatus.Decision.Action, "key_id", secretsStatus.KeyID)
+		if secretsStatus.Decision.State == core.SecretStateRecoveryRequired {
+			logger.Warn("实例加密：主密钥处于恢复态——不生成替代密钥、不回落 env，托管凭据将失败关闭",
+				"reason", secretsStatus.Decision.Reason)
+		}
+	} else {
+		logger.Info("Worker 跳过主密钥初始化（共享初始化写归控制面）",
+			"item", sharedInitItemName(sharedInitSecretsEnsure))
 	}
 
 	resolver, err := newCredentialResolver(CredentialResolverDeps{
@@ -571,25 +601,30 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// MCP 条目就位；凭据就绪时补写需要凭据的条目。**必须排在下面第一次解析文件之前**——
 	// 写下的条目正是由紧随其后的启动基线发布，本次启动即生效（不需要用户重启）。
 	// 存量实例与安装标记损坏时本段直接返回（见 builtin_install.go 的纪律）。
+	// 装 Agent / 样例库是共享初始化写（`sharedInitBuiltinOpenBox`）：Worker 不装，
+	// 但走同一条首次装载——控制面装好的定义经资产包分发到 Worker。
 	// The open-box installer runs before the first parse so the baseline publishes what it
-	// wrote in this very start.
-	openBoxReport, err := prepareBuiltinOpenBox(ctx, builtinOpenBoxDeps{
-		WorkspaceRoot: root,
-		RuntimeRoot:   a.builtinRuntimeRootOr(),
-		Fresh:         a.freshInstance,
-		WorkflowKnown: func(name string) (bool, error) {
-			record, valid, reason, readErr := versions.ReadLifecycleIndex(ctx, name)
-			return valid || record.Generation != 0 || reason != "", readErr
-		},
-		LookupEnv: os.LookupEnv,
-		Now:       a.nowOr(),
-		Logger:    logger,
-	})
-	if err != nil {
-		return nil, abortRuntime(fmt.Errorf("准备内置 Agent 与 MCP 条目: %w", err), db, lock)
-	}
-	if openBoxReport.Skipped != "" {
-		logger.Info("内置安装器跳过", "reason", openBoxReport.Skipped)
+	// wrote in this very start. Workers skip the install; the control plane's bundles
+	// carry those definitions to them.
+	if role.allowSharedInit(sharedInitBuiltinOpenBox) {
+		openBoxReport, err := prepareBuiltinOpenBox(ctx, builtinOpenBoxDeps{
+			WorkspaceRoot: root,
+			RuntimeRoot:   a.builtinRuntimeRootOr(),
+			Fresh:         a.freshInstance,
+			WorkflowKnown: func(name string) (bool, error) {
+				record, valid, reason, readErr := versions.ReadLifecycleIndex(ctx, name)
+				return valid || record.Generation != 0 || reason != "", readErr
+			},
+			LookupEnv: os.LookupEnv,
+			Now:       a.nowOr(),
+			Logger:    logger,
+		})
+		if err != nil {
+			return nil, abortRuntime(fmt.Errorf("准备内置 Agent 与 MCP 条目: %w", err), db, lock)
+		}
+		if openBoxReport.Skipped != "" {
+			logger.Info("内置安装器跳过", "reason", openBoxReport.Skipped)
+		}
 	}
 
 	// MCP 配置解析在等值门禁**之后**（约束 9），但**不再在这里连接**：连接生命周期自
@@ -712,91 +747,156 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// The asset root resolves against the process working directory, the same base as
 	// the workspace; an empty value only appears in a zero-value test assembly.
 	bundleRoot := resolveAssetBundleRoot(cfg, a.workDir)
-	if err := runBaseline(ctx, BaselineDeps{
-		Operations: ops,
-		Resources:  versions,
-		Skills:     skills,
-		Lifecycle:  lifecycle,
-		Providers:  providerDefs,
-		MCPServers: mcpDefs,
-		Agents:     entries,
-		Logger:     logger,
-		Now:        a.nowOr(),
-	}); err != nil {
-		return fail(err)
+	// 启动基线发布共享记录（`sharedInitBaseline`）：Worker 不发布，只读控制面已经发布的
+	// 版本；它的运行集合由资产同步按 bundle 重建（§2.3.4）。跳过基线不改变装载语义——
+	// 上面那一遍装载只读工作区种子。
+	// The baseline publishes shared records; workers never do — their run sets come from
+	// the asset sync. Skipping it leaves the read-only seed load untouched.
+	if role.allowSharedInit(sharedInitBaseline) {
+		if err := runBaseline(ctx, BaselineDeps{
+			Operations: ops,
+			Resources:  versions,
+			Skills:     skills,
+			Lifecycle:  lifecycle,
+			Providers:  providerDefs,
+			MCPServers: mcpDefs,
+			Agents:     entries,
+			Logger:     logger,
+			Now:        a.nowOr(),
+		}); err != nil {
+			return fail(err)
+		}
+		logger.Info("重路径：启动基线完成", "step", stepBaseline,
+			"providers", len(providerDefs), "mcp", len(mcpDefs), "agents", len(entries))
+	} else {
+		logger.Info("Worker 跳过启动基线（共享初始化写归控制面）",
+			"item", sharedInitItemName(sharedInitBaseline), "agents", len(entries))
 	}
-	logger.Info("重路径：启动基线完成", "step", stepBaseline,
-		"providers", len(providerDefs), "mcp", len(mcpDefs), "agents", len(entries))
 
 	// 资产自举（US-24 §2.3.9 启动自举）：只在"共享发布记录在、本地 hash 目录缺"且本地
 	// 代次与共享索引**相等**时按记录重建；不发布、不改索引、不覆盖既有目录，单个 Agent
 	// 失败只 WARN 不阻塞启动。这里**不带 `step` 键**：启动步骤清单是已定判据，自举不是
 	// 新步骤，也不是一次独立的恢复扫描。
 	// The asset bootstrap never publishes, never touches the index and never blocks
-	// startup; it deliberately carries no "step" key.
-	bootstrapAgentBundles(ctx, assetBootstrapDeps{
-		Root:      root,
-		AssetRoot: bundleRoot,
-		Versions:  versions,
-		Lifecycle: lifecycle,
-		Agents:    entries,
-		Logger:    logger,
-	})
+	// startup; it deliberately carries no "step" key. It is a control-plane shared
+	// write (`sharedInitAssetBootstrap`): workers receive bundles through the sync.
+	if role.allowSharedInit(sharedInitAssetBootstrap) {
+		bootstrapAgentBundles(ctx, assetBootstrapDeps{
+			Root:      root,
+			AssetRoot: bundleRoot,
+			Versions:  versions,
+			Lifecycle: lifecycle,
+			Agents:    entries,
+			Logger:    logger,
+		})
+	}
+
+	// 存量载荷回填（US-25C §2.3.3）：为 US-25 及以前发布的指针补载荷，幂等、可重复。
+	// 它**只**在控制面启动链里执行（US-25C §2.3.1 树图 / `sharedInitPayloadBackfill`）；
+	// Worker 不补写载荷——缺口由 `assets status` 如实标注，Worker 以 ASSET_UNAVAILABLE
+	// 失败关闭并留下可见原因，重导种子不在恢复手段之列。失败不阻塞启动。
+	// The backfill stays control-only per §2.3.1; workers report the gap through asset
+	// status instead of writing payloads.
+	if role.allowSharedInit(sharedInitPayloadBackfill) {
+		if _, err := BackfillBundlePayloads(ctx, BackfillDeps{
+			Distribution:  postgres.NewAssetDistributionStore(db),
+			PayloadStore:  postgres.NewBundlePayloadStore(db),
+			Versions:      versions,
+			Lifecycle:     lifecycle,
+			WorkspaceRoot: root,
+			AssetRoot:     bundleRoot,
+			MaxBytes:      resolveMaxBundleBytes(cfg),
+			Logger:        logger,
+		}); err != nil {
+			logger.Warn("bundle payload backfill did not finish; missing payloads stay visible in asset status",
+				"error", err)
+		}
+	}
+
+	// 技能启动兜底（US-25C §2.3.7 / `sharedInitSkillRepair`）：控制面重启后不等下一轮
+	// 就先把 `failed` / `missing` / `superseded` 的联动重发全量补齐。Worker 不发起重发
+	// （FR-25C-17）——它的运行集合由同步轮从已发布内容重建，修复写归控制面。
+	// The control-startup drain repairs stale skill linkage once per boot; workers never
+	// originate republishes.
+	if role.allowSharedInit(sharedInitSkillRepair) {
+		if _, err := repairStaleBundleSkills(ctx, RepairDeps{
+			Distribution:  postgres.NewAssetDistributionStore(db),
+			AssetRoot:     bundleRoot,
+			WorkspaceRoot: root,
+			Versions:      versions,
+			Operations:    ops,
+			Payloads:      postgres.NewAssetDistributionStore(db),
+			PayloadStore:  postgres.NewBundlePayloadStore(db),
+			AgentGate:     agentGate,
+			MaxBytes:      resolveMaxBundleBytes(cfg),
+			Logger:        logger,
+			Now:           a.nowOr(),
+			Batch:         skillRepairDefaultBatch,
+			Interval:      cfg.Assets.SyncInterval,
+		}); err != nil {
+			logger.Warn("skill repair startup drain did not finish; stale skills stay visible for the next round",
+				"error", err)
+		}
+	}
 
 	// 管理面恢复（图 A ④ / 约束 38）：基线自己若留下 pending 行，它已在上一段收口；
 	// 其余按动作组查证，判定不了的标 unknown 并**保留原样**——重放一次停用会让 generation
-	// 跳两格，重放一次内容写会覆盖第三方的修改。
-	// Management recovery verifies each pending row and never replays a change.
-	if err := recoverPendingOperations(ctx, RecoveryDeps{
-		Operations: ops,
-		Resources:  versions,
-		Lifecycle:  lifecycle,
-		Editor:     workspace.NewAgentEditor(workspace.AgentEditorDeps{Root: root}),
-		Logger:     logger,
-		Now:        a.nowOr(),
+	// 跳两格，重放一次内容写会覆盖第三方的修改。查证本身会推进操作行状态，属共享初始化写
+	// （`sharedInitOperationRecovery`）：Worker 不做，控制面下一次启动会收口。
+	// Management recovery verifies each pending row and never replays a change; the
+	// verdict writes the operation row, so it is a control-plane shared write.
+	if role.allowSharedInit(sharedInitOperationRecovery) {
+		if err := recoverPendingOperations(ctx, RecoveryDeps{
+			Operations: ops,
+			Resources:  versions,
+			Lifecycle:  lifecycle,
+			Editor:     workspace.NewAgentEditor(workspace.AgentEditorDeps{Root: root}),
+			Logger:     logger,
+			Now:        a.nowOr(),
 
-		// US-12 动作组的查证面：工作区根与实例配置用于读定义文件，`skills` / `agentGate` /
-		// 两个管理仓储与写路径是**同一批**共享实例——恢复只能看到写路径真实的留痕。
-		// The US-12 verification surfaces are the very instances the write paths use.
-		Root:       root,
-		ConfigPath: filepath.Join(a.workDir, configFileName),
-		Skills:     skills,
-		Gate:       agentGate,
-		Archives:   archives,
-		Notify:     notifyAdminStore,
-		// 凭据四证（FR-081 / 契约 §9.4）与库版本读数：与写路径同一个凭据仓储，读到的
-		// 就是写路径留下的提交事实；`db` 回答 v3 迁移是否真的完成。
-		// The credential store is the same instance the write paths use; db answers the
-		// schema version for the v3 baseline-v3 verdict.
-		Credentials: credentials,
-		Schema:      db,
-		// 出网白名单的三态查证读同一张权威表（R8.2.4 第 6 条）。
-		NetworkPolicy: networkPolicy,
-		// 访问例外的三态查证读同一张 `network_exceptions` 表（契约 §9.4）。
-		NetworkExceptions: networkExceptionStore,
-		// 执行档位的三态查证读同一行表（14D）：档位与修订号都要对上才算 applied。
-		ExecutionPolicy: executionPolicyStore,
-		// 实例初始化记录与主密钥路径：`system.secrets_init` 的恢复查证按记录 + key_id
-		// + 完整读回判定 applied / not_applied / indeterminate（契约 §9.4）。
-		InstanceSecrets: instanceSecretsStore,
-		MasterKeyFile:   masterKeyFile,
-		// 记忆条目的只读查证面：与记忆门面 / 管理面共用同一个载体，`memory.*` 的
-		// pending 行按条目行状态与正文摘要判定三态（契约 §9.4）。
-		// The memory verdicts read the very carrier the write path uses.
-		Memory: memStore,
-		// 准入操作的只读查证面（US-21 / 颗粒度文档 §2.3.7）：准入写面走独立 CLI 端口，
-		// 崩溃留下的 pending 行由下一次服务启动查证。这里只装配查证需要的工作区根与
-		// 准入仓储——`LockResource` / `References` 归写会话，恢复只读行与候选目录。
-		// The admission verifier needs only the workspace root and the admission store;
-		// the write-side lock table stays with the CLI session.
-		Admission: NewAdmissionAdmin(AdmissionAdminDeps{
-			Root:   root,
-			Store:  postgres.NewAdmissionStore(db),
-			Logger: logger,
-			Now:    a.nowOr(),
-		}),
-	}); err != nil {
-		return fail(err)
+			// US-12 动作组的查证面：工作区根与实例配置用于读定义文件，`skills` / `agentGate` /
+			// 两个管理仓储与写路径是**同一批**共享实例——恢复只能看到写路径真实的留痕。
+			// The US-12 verification surfaces are the very instances the write paths use.
+			Root:       root,
+			ConfigPath: filepath.Join(a.workDir, configFileName),
+			Skills:     skills,
+			Gate:       agentGate,
+			Archives:   archives,
+			Notify:     notifyAdminStore,
+			// 凭据四证（FR-081 / 契约 §9.4）与库版本读数：与写路径同一个凭据仓储，读到的
+			// 就是写路径留下的提交事实；`db` 回答 v3 迁移是否真的完成。
+			// The credential store is the same instance the write paths use; db answers the
+			// schema version for the v3 baseline-v3 verdict.
+			Credentials: credentials,
+			Schema:      db,
+			// 出网白名单的三态查证读同一张权威表（R8.2.4 第 6 条）。
+			NetworkPolicy: networkPolicy,
+			// 访问例外的三态查证读同一张 `network_exceptions` 表（契约 §9.4）。
+			NetworkExceptions: networkExceptionStore,
+			// 执行档位的三态查证读同一行表（14D）：档位与修订号都要对上才算 applied。
+			ExecutionPolicy: executionPolicyStore,
+			// 实例初始化记录与主密钥路径：`system.secrets_init` 的恢复查证按记录 + key_id
+			// + 完整读回判定 applied / not_applied / indeterminate（契约 §9.4）。
+			InstanceSecrets: instanceSecretsStore,
+			MasterKeyFile:   masterKeyFile,
+			// 记忆条目的只读查证面：与记忆门面 / 管理面共用同一个载体，`memory.*` 的
+			// pending 行按条目行状态与正文摘要判定三态（契约 §9.4）。
+			// The memory verdicts read the very carrier the write path uses.
+			Memory: memStore,
+			// 准入操作的只读查证面（US-21 / 颗粒度文档 §2.3.7）：准入写面走独立 CLI 端口，
+			// 崩溃留下的 pending 行由下一次服务启动查证。这里只装配查证需要的工作区根与
+			// 准入仓储——`LockResource` / `References` 归写会话，恢复只读行与候选目录。
+			// The admission verifier needs only the workspace root and the admission store;
+			// the write-side lock table stays with the CLI session.
+			Admission: NewAdmissionAdmin(AdmissionAdminDeps{
+				Root:   root,
+				Store:  postgres.NewAdmissionStore(db),
+				Logger: logger,
+				Now:    a.nowOr(),
+			}),
+		}); err != nil {
+			return fail(err)
+		}
 	}
 	logger.Info("重路径：管理面恢复完成", "step", stepRecovery)
 
@@ -805,22 +905,27 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 条目被删则忽略并保留。对账**必须**在运行目录与注册表之前：运行对象只由已发布版本
 	// 构建，手工编辑因此不可能绕过发布闸门直接生效。发布写库失败 → 启动失败，不带病运行。
 	// Startup reconciliation runs before the catalog and the registry, so a hand edit can
-	// never bypass the publish gate; a failed publish aborts startup.
-	reconcileResult, err := ReconcileDefinitions(ctx, ReconcileDeps{
-		ConfigPath:     filepath.Join(a.workDir, configFileName),
-		MCPServersPath: filepath.Join(a.wsRoot(), mcpServersFileName),
-		Store:          versions,
-		Operations:     ops,
-		Skills:         skills,
-		Gate:           resourceGate,
-		Logger:         logger,
-		Now:            a.nowOr(),
-		// 托管条目的候选核对与准入期同一判据（只读、不解密）；没有它，手改托管
-		// 模型连接会被误判成缺占位而永远对不上账。
-		Credentials: resolver,
-	})
-	if err != nil {
-		return fail(fmt.Errorf("启动定义对账: %w", err))
+	// never bypass the publish gate; a failed publish aborts startup. Publishing is a
+	// control-plane shared write (`sharedInitDefinitionReconcile`): the worker skips it
+	// and reads published versions only.
+	var reconcileResult ReconcileResult
+	if role.allowSharedInit(sharedInitDefinitionReconcile) {
+		reconcileResult, err = ReconcileDefinitions(ctx, ReconcileDeps{
+			ConfigPath:     filepath.Join(a.workDir, configFileName),
+			MCPServersPath: filepath.Join(a.wsRoot(), mcpServersFileName),
+			Store:          versions,
+			Operations:     ops,
+			Skills:         skills,
+			Gate:           resourceGate,
+			Logger:         logger,
+			Now:            a.nowOr(),
+			// 托管条目的候选核对与准入期同一判据（只读、不解密）；没有它，手改托管
+			// 模型连接会被误判成缺占位而永远对不上账。
+			Credentials: resolver,
+		})
+		if err != nil {
+			return fail(fmt.Errorf("启动定义对账: %w", err))
+		}
 	}
 	// 全量重建绑定投影（约束 38 / 图 A ⑤）：投影是 `AGENT.md` 的可重建派生视图，对账把
 	// 文件与已发布版本对齐之后必须从**文件**重算，不能沿用上一进程的残行。它与对账同属
@@ -835,16 +940,25 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// it, and reused by the registration gate, the watcher and the knowledge wiring.
 	knowledgeCatalogStore := postgres.NewKnowledgeCatalogStore(db)
 	projection := NewBindingProjection(bindingStore, versions, archives, knowledgeCatalogStore, root, logger, a.nowOr())
-	projectionReport, err := rebuildStartupBindings(ctx, projection, logger)
-	if err != nil {
-		return fail(err)
+	// 绑定投影重建会整表替换派生行（`sharedInitStartupBindings`）：Worker 跳过，
+	// 控制面在下一次启动重建；Worker 的准入判定不依赖这份派生视图。
+	// The projection rebuild rewrites derived rows; workers skip it.
+	var projectionReport ProjectionReport
+	if role.allowSharedInit(sharedInitStartupBindings) {
+		projectionReport, err = rebuildStartupBindings(ctx, projection, logger)
+		if err != nil {
+			return fail(err)
+		}
+		logger.Info("重路径：启动定义对账完成", "step", stepReconcile,
+			"published", reconcileResult.Published, "retained", reconcileResult.Retained,
+			"unchanged", reconcileResult.Unchanged, "ignored", reconcileResult.Ignored,
+			"bindings_rebuilt", projectionReport.Rebuilt,
+			"bindings_cleared", projectionReport.Cleared,
+			"bindings_failed", len(projectionReport.Failures))
+	} else {
+		logger.Info("Worker 跳过定义对账与绑定投影重建（共享初始化写归控制面）",
+			"item", sharedInitItemName(sharedInitDefinitionReconcile))
 	}
-	logger.Info("重路径：启动定义对账完成", "step", stepReconcile,
-		"published", reconcileResult.Published, "retained", reconcileResult.Retained,
-		"unchanged", reconcileResult.Unchanged, "ignored", reconcileResult.Ignored,
-		"bindings_rebuilt", projectionReport.Rebuilt,
-		"bindings_cleared", projectionReport.Cleared,
-		"bindings_failed", len(projectionReport.Failures))
 
 	// 凭据启动校验（R4.8「启动顺序」第四步）：投影已从文件重算，此刻按**已注册** Agent 的
 	// 绑定查验每一份托管凭据——密文可解、key_id 对得上、模型连接的绑定目标与当前发布版本的
@@ -894,15 +1008,41 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 槽位事实补记成 `env`，再逐槽位取值——`managed` 取不到即失败，**不**回落进程环境。
 	// Slots are resolved by declared source; file-seeded ones get their env fact recorded
 	// first, and a managed slot that cannot be read fails closed.
-	publishedMCP, err := publishedMCPServers(ctx, versions, fileServers, mcpCredentials, a.nowOr(), logger)
-	if err != nil {
-		return fail(fmt.Errorf("解析已发布 MCP server: %w", err))
+	// 来源补记（`BackfillEnvSources`）是共享初始化写（`sharedInitMCPCredentialSource`）：
+	// 只有 control 走 `publishedMCPServers`；Worker 走只读解析——applied 指针存在时读
+	// 那一版并按声明来源只读解析凭据（M4），未 applied 的只列名字（D-12）。
+	// The source backfill is a control-plane shared write; workers resolve published
+	// servers read-only and never touch the source table.
+	var publishedMCP []core.PublishedMCPServer
+	var workerMCPConfigs []core.MCPServerConfig
+	if role.allowSharedInit(sharedInitMCPCredentialSource) {
+		publishedMCP, err = publishedMCPServers(ctx, versions, fileServers, mcpCredentials, a.nowOr(), logger)
+		if err != nil {
+			return fail(fmt.Errorf("解析已发布 MCP server: %w", err))
+		}
+	} else {
+		// 启动期只取配置名单；准备输入（targets）由同步轮按**当轮**快照重新解析，
+		// 不在此处留存（§2.3.8 M5：名单可增长，准备要跟发布走）。
+		// Startup keeps only the configured names; each sync round resolves its own
+		// targets afresh.
+		_, workerMCPConfigs, err = publishedMCPPrepareTargets(ctx, versions, fileServers, mcpCredentials, logger)
+		if err != nil {
+			return fail(fmt.Errorf("只读解析已发布 MCP server: %w", err))
+		}
 	}
 	mcpDeps := MCPSupervisorDeps{
 		Policy: policy,
 		Gate:   resourceGate,
 		Logger: logger,
 		Now:    a.nowOr(),
+		// 同步准备路径的换入前只读复核（§2.3.8 M2 / 提交复核分支表）：指针仍存在、
+		// applied 仍是目标版本、目标版本的原文定义仍解出同一凭据代次且未撤销。缺这条
+		// 接线时 `replace` 在 Commit / Verify 都为空时失败关闭——Worker 的 MCP 永远
+		// 准备失败，依赖 MCP 的 Agent 无法就绪。
+		// The sync path's pre-swap recheck: pointer alive, applied still the target, and
+		// the target's credential generation still current; without it the prepare path
+		// fails closed and workers never connect MCP.
+		PrepareVerify: newMCPPrepareVerify(versions, mcpCredentials),
 		// applied 的落库只在发布指针仍指向该版本时发生：期间若有更新的发布，写入旧版本
 		// 会把指针倒退——直接跳过，`pending_restart` 自然为真。
 		MarkApplied: func(markCtx context.Context, name string, versionID int64) error {
@@ -949,8 +1089,16 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Logger:     logger,
 		Now:        a.nowOr(),
 	})
-	if err := networkAllowlist.EnsureSeeded(ctx, cfg.HTTP.AllowedDomains); err != nil {
-		return fail(fmt.Errorf("装载网络域名白名单: %w", err))
+	// 策略种子写（`sharedInitPolicySeed`）只归控制面：Worker 按只读重读装载，缺行即
+	// 失败关闭并点名先由控制面初始化——凭空播种会让两个角色对"权威行"各写一次。
+	// Seeding the policy rows is a control-plane shared write; workers re-read and fail
+	// closed on a missing row.
+	if role.allowSharedInit(sharedInitPolicySeed) {
+		if err := networkAllowlist.EnsureSeeded(ctx, cfg.HTTP.AllowedDomains); err != nil {
+			return fail(fmt.Errorf("装载网络域名白名单: %w", err))
+		}
+	} else if _, _, err := networkAllowlist.RefreshFromStore(ctx); err != nil {
+		return fail(fmt.Errorf("装载网络域名白名单（只读）: %w", err))
 	}
 	// 禁止域名表是同一张 `network_domain_policy` 的第二行（14D §2.2.5）：同一个策略
 	// 实例、同一套 ETag / CAS，只在审计动作名与生效字段上分开。配置键 `http.denied_domains`
@@ -965,8 +1113,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Logger:     logger,
 		Now:        a.nowOr(),
 	})
-	if err := networkDenylist.EnsureSeeded(ctx, cfg.HTTP.DeniedDomains); err != nil {
-		return fail(fmt.Errorf("装载网络禁止域名表: %w", err))
+	if role.allowSharedInit(sharedInitPolicySeed) {
+		if err := networkDenylist.EnsureSeeded(ctx, cfg.HTTP.DeniedDomains); err != nil {
+			return fail(fmt.Errorf("装载网络禁止域名表: %w", err))
+		}
+	} else if _, _, err := networkDenylist.RefreshFromStore(ctx); err != nil {
+		return fail(fmt.Errorf("装载网络禁止域名表（只读）: %w", err))
 	}
 	// 访问例外与运行期策略、守门器快照同源（14D §2.2.6）：服务在这里把库里已装载的
 	// 集合复制到策略实例与视图快照上（守门器快照在迁移之后已由 `refreshNetworkExceptions`
@@ -997,13 +1149,28 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Logger:        logger,
 		Now:           a.nowOr(),
 	})
-	if err := executionPolicy.EnsureSeeded(ctx, cfg.Execution.Profile); err != nil {
-		return fail(fmt.Errorf("装载执行档位: %w", err))
+	if role.allowSharedInit(sharedInitPolicySeed) {
+		if err := executionPolicy.EnsureSeeded(ctx, cfg.Execution.Profile); err != nil {
+			return fail(fmt.Errorf("装载执行档位: %w", err))
+		}
+	} else if _, _, err := executionPolicy.RefreshFromStore(ctx); err != nil {
+		return fail(fmt.Errorf("装载执行档位（只读）: %w", err))
 	}
-	if err := mcpSupervisor.ApplyPublished(ctx, publishedMCP); err != nil {
-		return fail(fmt.Errorf("启动 MCP supervisor: %w", err))
+	// applied 指针写（`sharedInitMCPApplied`）只在 control：Worker 的连接由同步轮的
+	// `prepareMCPInstances` 按 applied 指针准备（`Commit: nil`，不写指针）。
+	// The applied write is control-only; workers connect through the sync round.
+	if role.allowSharedInit(sharedInitMCPApplied) {
+		if err := mcpSupervisor.ApplyPublished(ctx, publishedMCP); err != nil {
+			return fail(fmt.Errorf("启动 MCP supervisor: %w", err))
+		}
 	}
-	mcpRT := newMCPRuntimeFromSupervisor(mcpSupervisor, mcpPublishedConfigs(publishedMCP))
+	mcpConfigs := mcpPublishedConfigs(publishedMCP)
+	if role != roleControl {
+		// Worker 的配置名单来自同一次只读解析；运行期由同步轮 `ReplaceSpecs` 增长。
+		// The worker's configured list comes from the same read-only resolution.
+		mcpConfigs = workerMCPConfigs
+	}
+	mcpRT := newMCPRuntimeFromSupervisor(mcpSupervisor, mcpConfigs)
 	// 来源表挂在运行期句柄上（视图经 `mcpRT.ToolDisposition` 读）：supervisor 的
 	// `OnConnected` 已在上面写完本表，此处只做一次引用交付，不复制。
 	// The table is handed to the runtime handle once; the view reads it through there.
@@ -1105,12 +1272,21 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// 抽取行开始服务，同来源的下一窗口要么永久阻断，要么被重复抽取。
 	// Startup recovery verifies pending extractions before serving; it never replays,
 	// and a storage failure aborts startup.
-	if err := recoverLearning(ctx, LearningRecoveryDeps{
-		Store:  learningRepo,
-		Logger: logger,
-		Now:    a.nowOr(),
-	}); err != nil {
-		return fail(fmt.Errorf("启动恢复：学习抽取查证: %w", err))
+	// 角色门：学习回填会推进来源游标与 `verified_at`，属共享初始化写，Worker 一项不做
+	// （FR-25C-12）；Worker 侧未查证的行保持 pending，由控制面下次启动处理。
+	// The learning recovery advances source cursors and `verified_at`; it stays on the
+	// control plane per FR-25C-12.
+	if role.allowSharedInit(sharedInitLearningRecovery) {
+		if err := recoverLearning(ctx, LearningRecoveryDeps{
+			Store:  learningRepo,
+			Logger: logger,
+			Now:    a.nowOr(),
+		}); err != nil {
+			return fail(fmt.Errorf("启动恢复：学习抽取查证: %w", err))
+		}
+	} else {
+		logger.Info("Worker 跳过学习抽取回填（共享初始化写归控制面）",
+			"item", sharedInitItemName(sharedInitLearningRecovery))
 	}
 	learningDraftRoot := filepath.Join(root, "learning", "drafts")
 	learningSvc := memory.NewLearningService(memory.LearningDeps{
@@ -1206,6 +1382,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		admission: admissionResolver,
 		logger:    logger,
 		diag:      diagRecorder,
+		// 策略新鲜度门（FR-25C-16）：阈值取 `policy.max_stale`；新鲜度面本身由 run.go 在
+		// 建好 `PolicyRefresher` 后接到这个同一对象上——chat / tool 不设刷新器，保持 nil 即
+		// 不设门（单进程轻路径不得因没刷新被判过期）。
+		// The staleness bound comes from policy.max_stale; the freshness face is attached by
+		// run.go once the refresher exists, so chat/tool keep the gate disabled.
+		policyMaxStale: policySettings(cfg).MaxStale,
 	}
 	// 知识库与历史回查接线（US-16 T099 前置）：领域对象必须在压缩接线**之前**落地——
 	// 压缩的来源闸门要用知识库的有效性判定，而读面（来源视图 / 引用有效性）用的必须是
@@ -1231,8 +1413,14 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// Retrieval authz reads declarations off this very registry snapshot.
 		Agents:  agents,
 		Catalog: knowledgeCatalogStore,
-		Logger:  logger,
-		Now:     a.nowOr(),
+		// 角色门（D-25C-06）：透传子命令判定的真实角色（`serve` = control，`gateway` =
+		// worker）；知识代际的 Ensure 属共享初始化写，装配层按 `sharedInitKnowledgeGeneration`
+		// 逐项问门（wire_knowledge.go），Worker 只走只读 `Pin`。
+		// The subcommand role flows through; the knowledge assembly consults the
+		// knowledge-generation gate itself and workers only pin an existing generation.
+		Role:   role,
+		Logger: logger,
+		Now:    a.nowOr(),
 	})
 	if err != nil {
 		return fail(err)
@@ -1333,6 +1521,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	admissionResolver.reserved = flowConfig.InteractiveReservedPerCaller
 	// Exactly the same resolver and snapshot builder feed ordinary Run and Flow
 	// pin validation; all credential/lifecycle/resource gates remain shared.
+	// 调度领取的执行行回读口（US-25C §2.3.5.1 T2）：准入按领取记录复核钉住哈希，
+	// 与调度器**共用同一个** TaskStore 实例——两处各建一份会让"领取写了、准入读不到"。
+	// The claimed-execution reader shares one TaskStore with the scheduler.
+	taskStore := postgres.NewTaskStore(db)
 	runResources := NewRunResources(versions, catalog, client, mcpRT, skills, resourceGate, AdmissionDeps{Identities: versions, NotifyAdmin: notifyAdminStore, Channels: channels, Bindings: bindingStore, Credentials: resolver, CredentialPins: resolver, Checkpoint: checkpoint, Diagnostics: diagRecorder, Assets: newAssetVerifier(versions, bundleRoot), Rebuild: newLocalRebuilder(versions, catalogStore, resolver, mcpRT, mcpCredentials)})
 	runSnapshots := newRunSnapshotBuilder(workspace.NewContextLoader(logger), root, a.nowOr())
 	service := core.NewAgentService(core.ServiceOptions{
@@ -1342,12 +1534,12 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		ToolPins:                    registry,
 		Phases:                      newPhaseAdapter(diagRecorder),
 		Agents:                      agents,
-		// 生命周期准入（图 F ③ / 约束 15）：状态文件端口与 Agent 级闸门传的是上面那一份
-		// 共享实例——准入在读锁内现场重读，启停迁移持写锁，两者因此互斥。nil 会让准入
-		// 门禁与启停互斥同时静默消失，生产装配**不得**省略。
-		// Admission shares the very gate and store the lifecycle transitions use; a nil
-		// would silently disable the fail-closed gate.
-		Lifecycle: lifecycle,
+		// 生命周期准入（图 F ③ / 约束 15）：端口与 Agent 级闸门传的是上面那一份共享实例
+		// ——准入在读锁内现场重读，启停迁移持写锁，两者因此互斥。nil 会让准入门禁与启停
+		// 互斥同时静默消失，生产装配**不得**省略。US-25C 起读面索引优先（FR-25C-14）：
+		// 端口写仍落状态文件，读以数据库索引为准，Worker 不再因本地没有状态文件而失败关闭。
+		// Admission shares the gate and store, and reads index-first since US-25C.
+		Lifecycle: lifecyclePort,
 		Gate:      agentGate,
 		// 发布资源的两件必须同进同出（图 F ③ / N1）：解析端口在资源闸门读锁内固定版本，
 		// 快照构建器按固定的 SkillDirs 读发布目录；缺一件由 core 在准入前失败关闭。
@@ -1404,6 +1596,10 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		Leases:        leases,
 		RenewInterval: workerCfg.RenewInterval(),
 		LeaseTTL:      workerCfg.LeaseTTL(),
+		// 领取记录回读（US-25C §2.3.5.1 T2）：`RunRequest.Pinned` 非 nil 时，准入按
+		// 执行行复核归属与哈希；未接则该类请求直接按无效领取拒绝（失败关闭）。
+		// The claimed-execution reader; a pinned request is refused when it is nil.
+		Claims: taskStore,
 	})
 
 	observation.History = postgres.NewHistoryRetentionStore(db, observationConfig.Export.Enabled)
@@ -1520,11 +1716,15 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	if reclaimErr != nil {
 		return nil, abortRuntime(reclaimErr, db, lock)
 	}
-	scheduler := a.newScheduler(postgres.NewTaskStore(db),
+	// 资产就绪门的发布盒（US-25C ADJ-1）：调度器在这里构造，同步器在 run.go 才建，
+	// 由后者把实例写进盒子；未写入前到期行一律读作未就绪（不领取、不推进）。
+	// The readiness box bridges the sync loop (built later in run.go) to the scheduler.
+	readyHashBox := &assetReadyHashBox{}
+	scheduler := a.newScheduler(taskStore,
 		&admittedRunInvoker{inner: service, admission: admission},
 		agents.Entries(), delivery, runs,
-		lifecycleScheduleGate(lifecycle), cfg, logger, ownerKeys, adminPosture,
-		leases, workerIdentity)
+		lifecycleScheduleGateFor(lifecycle, versions), cfg, logger, ownerKeys, adminPosture,
+		leases, workerIdentity, role, readyHashBox)
 	// 两段绑定的第二段（颗粒度文档 §3.1.17）：runtime 就绪后把生产编辑后端交给工具
 	// 槽位。此后 `manage_schedule` 的写入门 = 归属预检 → 工作区写闸门 → 即时对账。
 	// 适配器同时保留在运行期上：配置热加载的调度联动必须走**同一实例**（约束 39 的
@@ -1533,6 +1733,124 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	// once the loader and scheduler exist, and the same instance is retained for hot reload.
 	scheduleEditor := newScheduleEditorAdapter(loader, root, entries, scheduler, logger)
 	scheduleSlot.Bind(scheduleEditor)
+
+	// ⑦ US-25C 两个后台同步器的**依赖包**（§2.3.1 / §3.1.4）：这里只构造，不启动。
+	// 实例与首轮同步归 run.go（需要 serve / gateway 的运行上下文），后台循环随 ctx 退出、
+	// 停机 join 在关库之前（§2.3.4）。角色差异按 §2.3.1 表：Worker 拿注册表 / 调度集合 /
+	// Entry 构建器，控制面拿技能修复入口；资源准备闭包两侧相同（都持 ResourceGate 写锁、
+	// 只读本轮快照，版本与凭据未变时零副作用复用）。
+	// The two sync dependency bundles are assembled here and started nowhere; run.go owns
+	// the instances, the first round and the shutdown join.
+	syncAssets := assetsSettings(cfg)
+	syncPolicy := policySettings(cfg)
+	syncNow := a.nowOr()
+	// 控制面的运行期技能修复器（§2.3.7）：与启动兜底共用同一套重发实现与同一把
+	// AgentGate；Worker 不建实例——`assetSyncRepair` 也按角色再挡一次。
+	// The control-only runtime skill repairer shares the startup drain's republisher.
+	var runtimeRepairer *SkillRepairer
+	if role.allowSharedInit(sharedInitSkillRepair) {
+		runtimeRepairer = NewSkillRepairer(SkillRepairerDeps{
+			Distribution: postgres.NewAssetDistributionStore(db),
+			Versions:     versions,
+			Admin: newSkillRepublisher(skillRepublishDeps{
+				AssetRoot:     bundleRoot,
+				WorkspaceRoot: root,
+				Versions:      versions,
+				Operations:    ops,
+				Payloads:      postgres.NewAssetDistributionStore(db),
+				PayloadStore:  postgres.NewBundlePayloadStore(db),
+				AgentGate:     agentGate,
+				MaxBytes:      resolveMaxBundleBytes(cfg),
+				Logger:        logger,
+				Now:           syncNow,
+			}),
+			Logger:   logger,
+			Now:      syncNow,
+			Batch:    skillRepairDefaultBatch,
+			Interval: syncAssets.SyncInterval,
+		})
+	}
+	assetSyncDeps := &AssetSyncDeps{
+		WorkspaceRoot: root,
+		AssetRoot:     bundleRoot,
+		Distribution:  postgres.NewAssetDistributionStore(db),
+		Versions:      versions,
+		Providers: func(ctx context.Context) (CatalogReport, error) {
+			resourceGate.Lock()
+			defer resourceGate.Unlock()
+			return prepareProviderCatalog(ctx, providerPrepareDeps{
+				catalog:     catalogStore,
+				store:       versions,
+				override:    a.providerOverride,
+				credentials: resolver,
+				logger:      logger,
+			})
+		},
+		MCP: func(ctx context.Context) (MCPReport, error) {
+			// **不得**在此持 `ResourceGate`（§2.3.8 M3）：受控重建的提交段在
+			// `commitReplace` 里按 `ResourceGate → entry.mu` 自己取同一把写锁，而
+			// `core.ResourceGate` 是不可重入的 `sync.RWMutex`——外层再持会在第一次
+			// 真正重建时自锁，准备从"失败关闭"变成"永久挂住"（2026-11-10 复核 P1）。
+			// 本轮一致性由目标快照 + 换入前复核保证：指针在窗口内移动 / 凭据换代都由
+			// `PrepareVerify` 判 superseded，候选不换入。
+			// The commit section takes the same (non-reentrant) gate itself; consistency
+			// comes from the round snapshot plus the pre-swap recheck.
+			// 准备输入按**当轮**快照重新解析（§2.3.8 M5）：发布名单可在两轮之间增长，
+			// 沿用启动期名单会让新增 server 永远等不到准备。
+			// Targets are re-resolved from the round's own snapshot.
+			targets, configs, err := publishedMCPPrepareTargets(ctx, versions, fileServers, mcpCredentials, logger)
+			if err != nil {
+				return MCPReport{}, err
+			}
+			mcpRT.ReplaceSpecs(configs)
+			return prepareMCPInstances(ctx, mcpPrepareDeps{
+				Targets: func(context.Context) ([]mcpPrepareTarget, error) { return targets, nil },
+				Prepare: mcpSupervisor.PrepareAtApplied,
+				Status:  mcpSupervisor.Status,
+			})
+		},
+		Repair:        assetSyncRepair(role, runtimeRepairer),
+		Logger:        logger,
+		Now:           syncNow,
+		Interval:      syncAssets.SyncInterval,
+		Timeout:       syncAssets.SyncTimeout,
+		Batch:         syncAssets.SyncBatch,
+		MaxBytes:      syncAssets.MaxBundleBytes,
+		FullScanEvery: syncAssets.FullScanEvery,
+	}
+	// 资源准备快照的交接槽（§3.1.4 C14 / §2.3.5.1 T2）：同步器每轮在 prepare() 里写入
+	// 本轮实际准备出的 Providers / MCP / Tools，钉住装载面读的必须是**同一份**快照——
+	// 准备闭包要持 ResourceGate 写锁，准入期重跑一次会与发布互锁。
+	// The prepared-resources slot hands the round's snapshot to the pinned entry source.
+	preparedBox := &preparedResourcesBox{}
+	assetSyncDeps.prepared = preparedBox
+	if role != roleControl {
+		// Worker 才有的三件写面（§2.3.1）：注册表替换、调度集合替换与 Entry 构建。
+		// The three worker-only faces: registry, schedule set and entry building.
+		assetSyncDeps.Registry = agents
+		assetSyncDeps.Scheduler = scheduler
+		assetSyncDeps.Loader = loader
+	}
+	// 钉住装载面（US-25C §2.3.5.1 T2）：把「按领取时固定的 bundle 哈希构建 Entry」
+	// 绑进注册表。两种角色都要接——调度器在 serve 与 gateway 上都会领取到期行，
+	// 控制面的同步项同样走 buildEntry（技能在这之前已物化），只是不做注册表替换。
+	// Both roles claim due rows, so both bind the pinned entry source.
+	agents.BindPinned(newPinnedEntries(bundleRoot, root, postgres.NewAssetDistributionStore(db), loader, preparedBox))
+	policyRefresherDeps := &PolicyRefresherDeps{
+		Allowlist:  networkAllowlist,
+		Denylist:   networkDenylist,
+		Exceptions: networkExceptions,
+		Execution:  executionPolicy,
+		// 任一步内容变化即收紧已建立的 MCP http 连接（撤销是安全方向）。
+		// A changed round tightens every live MCP http link, which is the safe side.
+		RevokeHTTP: func() int {
+			return len(mcpSupervisor.RevokeDisallowedHTTP(policy.AllowsHost))
+		},
+		Logger:   logger,
+		Now:      syncNow,
+		Interval: syncPolicy.SyncInterval,
+		MaxStale: syncPolicy.MaxStale,
+	}
 
 	// ⑧ US-12 写面（颗粒度文档 §3.1.5 / 图 A）：Agent 管理编排在这里**一次构造**。锁表、
 	// 生命周期存储、资源仓储与管理操作仓储全部传上面那几份共享实例——另建一份会让写锁与
@@ -1611,14 +1929,18 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 发布与 `basalt assets install --agent` 是同一份实现，不新增协议。
 		// The console write path publishes the committed definition through the same chain
 		// as `assets install --agent`.
-		PublishBundle: func(ctx context.Context, agent string) (int64, error) {
+		PublishBundle: func(ctx context.Context, agent string, actor core.Actor) (int64, error) {
 			return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
-				Root:       root,
-				BundleRoot: bundleRoot,
-				Versions:   versions,
-				Operations: ops,
-				Logger:     logger,
-				Now:        now,
+				Root:         root,
+				BundleRoot:   bundleRoot,
+				Versions:     versions,
+				Operations:   ops,
+				Payloads:     postgres.NewAssetDistributionStore(db),
+				PayloadStore: postgres.NewBundlePayloadStore(db),
+				MaxBytes:     resolveMaxBundleBytes(cfg),
+				Actor:        actor,
+				Logger:       logger,
+				Now:          now,
 			}, agent)
 		},
 	})
@@ -1679,8 +2001,18 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		// 最后一次连接测试投影：测试端点写完即被列表页读到（同一实例、零缓存）。
 		// The last-test projection written by the test endpoint and read by the list.
 		ConnectionTests: connectionTests,
-		Logger:          logger,
-		Now:             now,
+		// 技能发布联动重发（US-25C §2.3.7）：Agent 锁必须是进程里**那一把**（与内容编辑 /
+		// 准入同一实例），否则联动与编辑互不互斥；载荷面与 `PublishBundle` 用同一组生产
+		// 实现，重建来源只有已安装目录与已发布技能目录。
+		// Linkage publishing shares the process-wide agent gate and the same payload stores
+		// as the console publish path.
+		AgentGate:      agentGate,
+		AssetRoot:      bundleRoot,
+		Payloads:       postgres.NewAssetDistributionStore(db),
+		PayloadStore:   postgres.NewBundlePayloadStore(db),
+		MaxBundleBytes: resolveMaxBundleBytes(cfg),
+		Logger:         logger,
+		Now:            now,
 	})
 	// 通知渠道写面（颗粒度文档 §3.1.7 / 约束 38）：类型表取 `GET /notify-channels/types`
 	// 的**同一装配来源**（`notifyTypeNames` 与发送面共用 `newNotifyAdapters`），不是另抄
@@ -1754,9 +2086,14 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 	logger.Info("重路径装配完成", "agents", len(agents.Entries()), "tools", registry.Names(),
 		"mcp_connected", len(mcpRT.ConnectedNames()))
 	return &heavyRuntime{
-		isolation:         isolationRT,
-		flows:             flowRuntime,
-		observability:     observation,
+		isolation:     isolationRT,
+		flows:         flowRuntime,
+		observability: observation,
+		// 角色由子命令透传（T032）：共享初始化写的地面已在各点上按
+		// `role.allowSharedInit(...)` 逐项包裹，这里只记录本进程的真实角色供装配产物
+		// 与停机路径共用。
+		// The real subcommand role travels here for downstream assembly products.
+		role:              role,
 		lock:              lock,
 		db:                db,
 		service:           service,
@@ -1780,28 +2117,35 @@ func (a *App) newRuntime(ctx context.Context) (*heavyRuntime, error) {
 		adminPosture:      adminPosture,
 		scheduleSlot:      scheduleSlot,
 		scheduleEditor:    scheduleEditor,
-		agents:            agents,
-		agentGate:         agentGate,
-		lifecycle:         lifecycle,
-		resourceGate:      resourceGate,
-		versions:          versions,
-		ops:               ops,
-		credentials:       credentials,
-		connectionTests:   connectionTests,
-		notifyAdminStore:  notifyAdminStore,
-		resolver:          resolver,
-		secrets:           secrets,
-		instanceSecrets:   instanceSecrets,
-		mcpRT:             mcpRT,
-		mcpCredentials:    mcpCredentials,
-		skills:            skills,
-		agentAdmin:        agentAdmin,
-		projection:        projection,
-		resourceAdmin:     resourceAdmin,
-		notifyAdmin:       notifyAdmin,
-		channelRead:       channelRead,
-		catalogStore:      catalogStore,
-		bundleRoot:        bundleRoot,
+		// 两个后台同步器的**依赖包**在装配期构造（构造器不启动，见 §3.1.4）；实例
+		// 由 run.go 在调度启动前建、启动后跑，停机时 join 在关库之前（§2.3.4）。
+		// The sync dependency structs are assembled here; run.go builds, starts and
+		// joins the instances around scheduler startup and before the DB closes.
+		assetSyncDeps:       assetSyncDeps,
+		assetReadyHash:      readyHashBox,
+		policyRefresherDeps: policyRefresherDeps,
+		agents:              agents,
+		agentGate:           agentGate,
+		lifecycle:           lifecycle,
+		resourceGate:        resourceGate,
+		versions:            versions,
+		ops:                 ops,
+		credentials:         credentials,
+		connectionTests:     connectionTests,
+		notifyAdminStore:    notifyAdminStore,
+		resolver:            resolver,
+		secrets:             secrets,
+		instanceSecrets:     instanceSecrets,
+		mcpRT:               mcpRT,
+		mcpCredentials:      mcpCredentials,
+		skills:              skills,
+		agentAdmin:          agentAdmin,
+		projection:          projection,
+		resourceAdmin:       resourceAdmin,
+		notifyAdmin:         notifyAdmin,
+		channelRead:         channelRead,
+		catalogStore:        catalogStore,
+		bundleRoot:          bundleRoot,
 		// US-16 知识与历史两条链路的装配产物：web 的八个消费方端口由 `webOptions` 里的
 		// `wireKnowledgePorts` 逐槽位投影；压缩读面的链目录也在这里（与压缩写面同一个
 		// `CompactionStore` 实例，读到的就是刚写下的链）。
@@ -2058,6 +2402,27 @@ func outputBudget(cfg *cli.Config) int {
 	return 0
 }
 
+// assetsSettings 取出 `assets` 段；配置文件整体缺失时（`cfg == nil` 或未解码的零值）
+// 退回 §3.3 的冻结缺省。段存在时解析入口已填入缺省并通过装载期校验，这里不再判——
+// 与 `schedulerSettings` / `workerSettings` 同一套取数口径。
+// assetsSettings falls back to the frozen defaults only when the config file itself is
+// absent; a present section was defaulted and validated at load time.
+func assetsSettings(cfg *cli.Config) cli.AssetsConfig {
+	if cfg == nil || cfg.Assets.SyncTimeout == 0 {
+		return cli.DefaultAssetsConfig()
+	}
+	return cfg.Assets
+}
+
+// policySettings 取出 `policy` 段，缺省口径同上（`max_stale` 是段存在与否的哨兵）。
+// policySettings falls back to the frozen defaults when the policy section is absent.
+func policySettings(cfg *cli.Config) cli.PolicyConfig {
+	if cfg == nil || cfg.Policy.MaxStale == 0 {
+		return cli.DefaultPolicyConfig()
+	}
+	return cfg.Policy
+}
+
 // memoryCarrier 返回运行期唯一的长期记忆载体：PostgreSQL（D-18 / D-22）。
 //
 // 没有载体开关可读：`memory.backend` 已退役（装载期出现即拒绝启动），markdown 文件
@@ -2088,6 +2453,12 @@ type heavyRuntime struct {
 	isolation     *isolationRuntime
 	flows         *flowRuntime
 	observability *Observability
+	// role 是本进程的启动角色（US-25C D-25C-06：`serve` = control，`gateway` =
+	// worker）。零值是 `roleWorker`（最小权限）——**不得**依赖零值表达控制面：
+	// 装配必须显式赋值；T032 把子命令判定的角色经 `newRuntime(ctx, role)` 透传进来。
+	// role is the startup role; the zero value is the least-privileged worker, so the
+	// assembly always assigns it explicitly.
+	role runtimeRole
 	// lock 是实例锁：进程存续期间持有（写模式的语义就是"这一进程是唯一写者"）。
 	lock *workspace.InstanceLock
 
@@ -2217,6 +2588,34 @@ type heavyRuntime struct {
 	// scheduleEditor is the very adapter bound to the slot, shared with hot reload so
 	// the private claim baseline stays in step with the scheduler.
 	scheduleEditor *scheduleEditorAdapter
+
+	// assetSyncDeps 是自动分发同步器的依赖包（US-25C §3.1.4）：装配期构造、构造不启动；
+	// run.go 用它在调度启动前建实例、跑首轮同步，启动后跑后台循环。Worker 与控制面
+	// 各按 §2.3.1 表取不同字段（Registry / Scheduler / Loader 只在 Worker 侧装配）。
+	// assetSyncDeps is the asset-sync dependency bundle; construction never starts it.
+	assetSyncDeps *AssetSyncDeps
+
+	// assetReadyHash 是到期触发就绪门的迟绑定盒（US-25C ADJ-1）：调度器构造时经它
+	// 取门，run.go 在建好同步器后把实例发布进来。构造后、发布前，到期行读作未就绪。
+	// assetReadyHash bridges the sync loop into the already-built scheduler gate.
+	assetReadyHash *assetReadyHashBox
+
+	// assetSync 是 run.go 建好的同步器实例（构造后先跑 SyncOnce）；只由 serve / gateway
+	// 路径赋值，其余重命令保持 nil。停机 join 在关库之前（§2.3.4）。
+	// assetSync is built by run.go for serve/gateway only, started after the first sync.
+	assetSync *AssetSync
+
+	// assetSyncDone 在后台同步循环退出时关闭：停机 join 用它证明循环已收尾，
+	// 库才是最后关闭的那一个（§2.3.4 的停机次序）。
+	// assetSyncDone closes when the sync loop returns, so shutdown joins it first.
+	assetSyncDone chan struct{}
+
+	// policyRefresherDeps / policyRefresher / policyRefreshDone 与上面三件同构，
+	// 只是对象换成四类运行期策略的刷新器（§3.1.9）。
+	// The policy refresher mirrors the asset sync trio.
+	policyRefresherDeps *PolicyRefresherDeps
+	policyRefresher     *PolicyRefresher
+	policyRefreshDone   chan struct{}
 
 	// watch 是 serve 打开的配置监听（只有 serve 赋值；其余重命令为 nil）。停机时
 	// **最先**关闭它：它会在回调里推进注册表并联动调度器，必须赶在调度器停止与库
@@ -2661,7 +3060,10 @@ func OpenRuntime(ctx context.Context, opts Options) (*Runtime, error) {
 		cfgErr:           cfgErr,
 		providerOverride: opts.ProviderClient,
 	}
-	rt, err := a.newRuntime(ctx)
+	// 评测基座按控制面装配：它就是"这条生产路径"的单进程形态（迁移、共享初始化写入
+	// 全部执行），与 `serve` 逐字同义，角色显式写死为 control。
+	// The evaluation base is the single-process control-plane shape by definition.
+	rt, err := a.newRuntime(ctx, roleControl)
 	if err != nil {
 		return nil, err
 	}

@@ -20,6 +20,7 @@ import { adminApi } from '../api-admin'
 import type { CredentialResourceKind, ResourceMapping, ScheduleDraftView } from '../api-admin'
 import { AgentReadinessPanels } from '../components/agent-readiness'
 import { MemoryEntries } from '../components/memory-entries'
+import { publishFailedFallback, publishFailedQuery } from '../components/publish-status'
 import {
   CodeBlock,
   ConfirmDialog,
@@ -900,7 +901,8 @@ export const AgentDetailView = defineComponent({
       try {
         const created = await admin.copyAgent(name, target, mapping)
         copyOpen.value = false
-        router.navigate(agentHref(created.agent) + '?copied=1')
+        // 发布失败不阻止跳转：写已生效，到达页用 `publish=failed` 显示同一条告警。
+        router.navigate(agentHref(created.agent) + '?copied=1' + publishFailedQuery(created.publish))
       } catch (caught) {
         // 409 有两种：目标名冲突与源专属引用未映射；后者进入映射向导，不冒充重名。
         if (caught instanceof ApiError && caught.code === 'AGENT_COPY_BLOCKED') {
@@ -2053,6 +2055,11 @@ export const AgentDetailView = defineComponent({
               ? null
               : h(Notice, { tone: 'error', text: transitionError.value }),
             arrivalNotice === '' ? null : h(Notice, { tone: 'info', text: arrivalNotice }),
+            // 复制 / 恢复的发布结果不落库，只能经 URL 带过来；失败时单独告警。
+            // A failed publication rides in on the URL because it is not persisted.
+            props.query.get('publish') === 'failed'
+              ? h(Notice, { tone: 'warn', text: publishFailedFallback })
+              : null,
             archiveError.value === ''
               ? null
               : h(Notice, { tone: 'error', text: archiveError.value }),

@@ -10,16 +10,25 @@
 
 Independent agents. Shared infrastructure.
 
-[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](https://ymedword.github.io/basalt/#demo) · [Issues](https://github.com/ymedword/basalt/issues)
+[Website](https://ymedword.github.io/basalt/) · [Quick start](#quick-start) · [Docs](https://ymedword.github.io/basalt/docs/) · [Architecture](#architecture) · [Demo](http://43.161.200.168:8080/console/) · [Issues](https://github.com/ymedword/basalt/issues)
 
 </div>
 
-## Why Basalt
+## What Basalt is
+
+Basalt is a self-hosted Agent OS for enterprise teams: one Go binary that runs and manages multiple independent business agents on infrastructure you control. Each agent keeps its own definition, configuration, sessions and scoped business state; execution, model connections, scheduling, storage and audit belong to the shared foundation.
+
+## What it solves
+
+Running several business agents usually means gluing together a scheduler, a model proxy, tool permissions, a memory store and an audit trail once per agent. Basalt supplies that foundation once, so a new business agent is mainly its own responsibilities and resource bindings. Operators get one console, one HTTP API and one record of what each agent did.
+
+## What makes it different
 
 - **Independent agents** — Configure different models, tools, skills and scoped business state on one platform.
 - **Reusable resources** — Extend agents through model connections, built-in tools, MCP and skills.
-- **Scheduled automation** — Manage recurring tasks per agent and deliver results to configured channels.
+- **Scheduled automation** — Manage recurring tasks and durable sequential flows per agent, and deliver results to configured channels.
 - **Inspectable execution** — Persist runs and model/tool calls, with budgets and applicable tool policies.
+- **Multi-worker execution** — Optional Compose profiles add a `serve` control plane and one or more `gateway` Workers over one PostgreSQL. Published asset bundles sync automatically, and every claimed execution is pinned to one bundle; Workers never publish assets. See [multi-worker deployment](#multi-worker-deployment-compose).
 - **Opt-in task isolation** — On Linux, bind controlled shell commands to hardened OCI and generated code to gVisor. Tasks run without network access or service credentials; unavailable isolation fails closed. Local execution remains the default. See the [isolation contract](docs/contracts/isolation.md).
 - **Durable sequential flows** — Publish immutable task contracts and bounded Agent/tool/subflow steps. Acceptance, evidence and budgets persist in PostgreSQL; unknown side effects stop advancement. Ordinary messages and Runs remain synchronous. Flows are opt-in; see [operations](docs/Operations.md#durable-flows).
 - **Self-hosted operation** — A single Go binary with an embedded console, backed by PostgreSQL with the `vector` and `pg_trgm` extensions, which you run yourself; no Node service at runtime.
@@ -30,7 +39,14 @@ For example, configure daily-report for scheduled briefings and file-review for 
 
 ![Basalt architecture: access, application, execution engine, infrastructure services and storage](website/public/diagrams/en/system-architecture.svg)
 
-The current architecture is single-node, multi-agent hosting with logical Agent scopes. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.
+The current architecture is Compose multi-Worker hosting with logical Agent scopes: a control plane owns the HTTP API, the embedded console and asset publication; `gateway` Workers claim due executions and run them without an HTTP listener; every node shares one PostgreSQL. A publication is written payload-first and then made visible by a pointer, Workers install bundles by content hash, and each claimed execution is pinned to one bundle. The single-instance Compose file remains the default. The [full system diagram](website/public/diagrams/en/project-overview.svg) expands components and external boundaries. [Architecture documentation](https://ymedword.github.io/basalt/architecture/) covers execution, dependencies and deployment; [product documentation](https://ymedword.github.io/basalt/docs/) separates current capabilities from planned direction.
+
+Deployment support and boundaries for this release:
+
+- **Supported profile:** Compose multi-Worker — a control plane, one or more Workers and one PostgreSQL.
+- **Kubernetes:** not delivered.
+- **Database HA:** not delivered.
+- **Cross-node business-state sharing:** not delivered; workspace files stay per node, and each execution is pinned to a content-addressed bundle rather than to shared mutable state.
 
 ## Quick start
 
@@ -220,7 +236,13 @@ Saving, publishing or rolling back an MCP configuration fails closed when a refe
 
 The demo scripts need Python 3; the MCP servers are separate processes you install yourself, and what each one reaches is decided by that server, not by Basalt. [The examples index](examples/README.md) carries the prerequisites and the per-directory setup.
 
-## What is verified
+## What is verified: engineering and automated acceptance
+
+`make check` is the seven-gate definition of done: format, static analysis, security, race tests, PostgreSQL integration, coverage floors and the release build. [Makefile](Makefile) binds every target; the commands are the evidence, and no badge replaces a run.
+
+- `make acceptance` runs the same gate plus fixed behaviour and injection evaluations: [scripts/check-acceptance.sh](scripts/check-acceptance.sh).
+- `make test-integration` fails closed when `BASALT_TEST_PG_DSN` is unset instead of skipping; coverage floors are enforced per package by [scripts/check-coverage.sh](scripts/check-coverage.sh).
+- `make e2e` runs release scenarios against the binary produced by `make build` ([internal/e2e](internal/e2e)); `make example-tests` runs the bundled MCP server tests and every demo script's unit tests.
 
 Two kinds of claim live in this repository, and they are not interchangeable:
 
@@ -229,7 +251,7 @@ Two kinds of claim live in this repository, and they are not interchangeable:
 | Fixture replay | The directory loads, its declared tools resolve, and its script produces the expected business result from fixed input | `make example-tests`, plus the release end-to-end suite |
 | Real external run | The same flow against GitHub, DeepSeek Search, Brave, Fetch, Playwright, DBHub, a real model and a real notification receiver | Not run in this repository: those credentials are not provided, so the claim stays unverified |
 
-A successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above. `make check` runs the local gate, `make e2e` runs the release scenarios against the built binary, and `make example-tests` runs the bundled MCP server tests plus every demo script's unit tests.
+A successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above.
 
 ## Documentation
 

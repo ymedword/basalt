@@ -1024,6 +1024,11 @@ func newSchedulerWith(store TaskStore, invoker RunInvoker, engine CronEngine, lo
 		// MissedGrace 的零值是"零宽限"，必须显式给缺省 300s，否则每次触发都判错失。
 		MissedGrace: defaultSchedulerMissedGrace,
 		StopGrace:   100 * time.Millisecond,
+		// 既有夹具建模的是**控制面**实例：启动对账照常写共享定义列。零值（worker）
+		// 的只读对账与失败关闭由 US-25C 的角色门用例单独覆盖。
+		// The historical fixture models a control instance; worker semantics have
+		// their own cases (US-25C).
+		DefinitionAuthority: true,
 	}
 	if leases, ok := store.(LeaseStore); ok {
 		opts.Leases = leases
@@ -1835,6 +1840,8 @@ func TestScheduler_Start_SecondAgentApplyFails_NoScanStart(t *testing.T) {
 		LeaseTTL:      schedLeaseTTL,
 		RenewInterval: schedRenewInterval,
 		PollInterval:  time.Hour,
+		// 本用例判启动对账失败：控制面实例才有定义写权（US-25C T033）。
+		DefinitionAuthority: true,
 	})
 	store.armScanGate()
 	t.Cleanup(func() { sched.Stop(); store.resumeScan() })
@@ -2340,4 +2347,168 @@ func TestScheduler_LeaselessAssemblyRefusesToRun(t *testing.T) {
 	_, _, err := sched.RunNow(context.Background(), schedTaskID)
 	require.ErrorIs(t, err, errSchedulerNoLeases)
 	logs.requireRecord(t, slog.LevelError, "调度器缺少执行权装配，拒绝启动")
+}
+
+// ===========================================================================
+// 注册集合整体替换（US-25C C18 / FR-25C-10）
+// ===========================================================================
+
+// copyRegistry 在锁内复制注册集合与定义快照：断言不读共享 map。
+// copyRegistry snapshots both in-memory sets under stateMu.
+func copyRegistry(s *Scheduler) (map[string]bool, map[string][]Schedule) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	registry := make(map[string]bool, len(s.registry))
+	for name, ok := range s.registry {
+		registry[name] = ok
+	}
+	definitions := make(map[string][]Schedule, len(s.definitions))
+	for name, schedules := range s.definitions {
+		definitions[name] = append([]Schedule(nil), schedules...)
+	}
+	return registry, definitions
+}
+
+// TestScheduler_ReplaceEntriesBeforeStart —— 启动前整体替换只改内存：不触库；随后的
+// Start 在**替换后的定义快照**上对账，新 Agent 的任务被登记进共享库。
+// 逆改点：ReplaceEntries 改写成只增不减 / Start 仍用构造期快照 → 注册集合或库行不符。
+// Acceptance point: a pre-start replacement is memory-only, and Start reconciles on it.
+func TestScheduler_ReplaceEntriesBeforeStart(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	require.NoError(t, f.sched.ReplaceEntries([]AgentEntry{
+		{Name: schedAgent, Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask(schedTaskID)}}},
+		{Name: "writer", Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask("writer-1")}}},
+	}))
+
+	// 纯内存替换：一个仓储方法都不许调（锁内零 I/O）。
+	require.Empty(t, f.store.snapshotApplied(), "ReplaceEntries 不得写库")
+	registry, definitions := copyRegistry(f.sched)
+	require.Equal(t, map[string]bool{schedAgent: true, "writer": true}, registry)
+	require.Len(t, definitions["writer"], 1)
+	require.Equal(t, "writer-1", definitions["writer"][0].ID)
+
+	// Start 对账走替换后的定义快照。
+	f.start(t)
+	row, ok := f.store.task("writer-1")
+	require.True(t, ok, "替换进来的 Agent 的任务必须被登记进共享库")
+	require.Equal(t, "writer", row.Agent)
+	require.True(t, row.RetiredAt.IsZero())
+	require.True(t, row.Enabled)
+
+	var writerApplied bool
+	for _, call := range f.store.snapshotApplied() {
+		if call.Agent == "writer" {
+			writerApplied = true
+			require.Contains(t, call.UpsertIDs, "writer-1")
+			require.Empty(t, call.RetireIDs)
+		}
+	}
+	require.True(t, writerApplied, "Start 必须对替换后的新 Agent 做一次对账提交")
+}
+
+// TestScheduler_ReplaceEntriesAfterStart_DispatchesNewAgent —— 运行期加入的 Agent
+// 不重启即可被下一轮扫描领取；加入之前它的任务一行都不得被本进程动。
+// 逆改点：扫描改读构造期快照（不取 registeredSnapshot）→ 加入后仍然领取失败。
+// Acceptance point: a runtime addition is claimable on the next scan pass.
+func TestScheduler_ReplaceEntriesAfterStart_DispatchesNewAgent(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+
+	// 共享库里已有另一个 Agent 的任务行；本进程启动时还不认识它。
+	f.store.seedTask(TaskRecord{
+		TaskID: "writer-1", Agent: "writer", Enabled: true,
+		Cron: schedCron, Zone: schedZone, Message: schedMessage,
+	})
+	planned := f.seed(t, "writer-1")
+	f.scan(t)
+	require.Empty(t, f.store.snapshotClaims(), "未注册 Agent 的任务不得被本进程领取")
+
+	require.NoError(t, f.sched.ReplaceEntries([]AgentEntry{
+		{Name: schedAgent, Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask(schedTaskID)}}},
+		{Name: "writer", Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask("writer-1")}}},
+	}))
+
+	f.scan(t)
+	f.wait(t)
+	claims := f.store.snapshotClaims()
+	require.Len(t, claims, 1, "运行期加入的 Agent 应在下一轮扫描被领取")
+	require.Equal(t, "writer-1", claims[0].TaskID)
+	require.True(t, planned.Equal(claims[0].PlannedAt))
+}
+
+// TestScheduler_ReplaceEntriesDoesNotRetireAbsentAgent —— 缺席项只从**本进程内存**
+// 移除：不写库、不退休、不删行；该 Agent 的任务从此不被本进程领取，行留给持有方。
+// 逆改点：ReplaceEntries 改成"缺席即 ApplyAgentTasks(retire)" → 库行被退休，断言红。
+// Acceptance point: an absent agent leaves only this process's memory, never the store.
+func TestScheduler_ReplaceEntriesDoesNotRetireAbsentAgent(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, func(opts *SchedulerOptions) {
+		opts.Entries = []AgentEntry{
+			{Name: schedAgent, Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask(schedTaskID)}}},
+			{Name: "ops", Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask("ops-1")}}},
+		}
+	})
+	f.start(t)
+	appliedBefore := len(f.store.snapshotApplied())
+	row, ok := f.store.task("ops-1")
+	require.True(t, ok)
+	require.True(t, row.RetiredAt.IsZero())
+	require.True(t, row.Enabled)
+
+	require.NoError(t, f.sched.ReplaceEntries([]AgentEntry{
+		{Name: schedAgent, Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask(schedTaskID)}}},
+	}))
+
+	require.Len(t, f.store.snapshotApplied(), appliedBefore, "替换不得触发任何对账写")
+	row, ok = f.store.task("ops-1")
+	require.True(t, ok, "共享库里的任务行不得被删除")
+	require.True(t, row.RetiredAt.IsZero(), "缺席项不得被退休")
+	require.True(t, row.Enabled, "缺席项不得被停用")
+	registry, _ := copyRegistry(f.sched)
+	require.NotContains(t, registry, "ops", "缺席项只从本进程内存移除")
+
+	// 本进程不再领取它的任务。
+	f.seed(t, "ops-1")
+	f.scan(t)
+	require.Empty(t, f.store.snapshotClaims())
+}
+
+// TestScheduler_ReplaceEntriesKeepsScanProgress —— 替换注册集合与单点增删都**不得**
+// 复位到期扫描的两段游标与冻结边界；只有 Start 清空扫描进度。
+// 逆改点：ReplaceEntries / SetRegistered 顺手 `scanCursor = DueScanCursor{}` → 游标被
+// 清空、本圈重头再扫（同毫秒 / 大表下的重复读取），断言红。
+// Acceptance point: registry refreshes never reset the two-segment scan cursor.
+func TestScheduler_ReplaceEntriesKeepsScanProgress(t *testing.T) {
+	f := newSchedFixture(t, []Schedule{demoTask(schedTaskID)}, nil)
+	f.start(t)
+
+	cutoff := schedNow.Add(time.Minute)
+	after := schedNow.Add(-time.Minute)
+	sweep := &SweepBounds{Cutoff: cutoff, NullUpperTaskID: "zzz"}
+	f.sched.stateMu.Lock()
+	f.sched.scanCursor = DueScanCursor{
+		Sweep:           sweep,
+		InNullSegment:   true,
+		NullAfterTaskID: "m",
+		AfterNextFireAt: &after,
+		AfterTaskID:     "n",
+	}
+	f.sched.stateMu.Unlock()
+
+	require.NoError(t, f.sched.ReplaceEntries([]AgentEntry{
+		{Name: schedAgent, Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask(schedTaskID)}}},
+		{Name: "writer", Registered: true, Profile: &Profile{Schedules: []Schedule{demoTask("writer-1")}}},
+	}))
+	require.NoError(t, f.sched.SetRegistered("late", true))
+
+	f.sched.stateMu.RLock()
+	got := f.sched.scanCursor
+	f.sched.stateMu.RUnlock()
+	require.Same(t, sweep, got.Sweep, "本圈边界不得被重建")
+	require.True(t, cutoff.Equal(got.Sweep.Cutoff))
+	require.Equal(t, "zzz", got.Sweep.NullUpperTaskID)
+	require.True(t, got.InNullSegment)
+	require.Equal(t, "m", got.NullAfterTaskID)
+	require.Equal(t, "n", got.AfterTaskID)
+	require.NotNil(t, got.AfterNextFireAt)
+	require.True(t, after.Equal(*got.AfterNextFireAt))
 }

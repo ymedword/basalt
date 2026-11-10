@@ -323,6 +323,32 @@ func (r *heavyRuntime) closeCoordinated() error {
 	return err
 }
 
+// startSyncLoops 把两个后台同步循环送进协程（US-25C §2.3.1）：只有调度启动成功之后
+// 才调用，因此 runCtx 的取消同时覆盖调度与这两个循环。完成通道先建后跑——停机 join
+// 靠它们证明循环已退出，而 join 必须在关库之前（§2.3.4）。
+// startSyncLoops starts the two background loops after the scheduler is up; the done
+// channels are what shutdown joins before closing the database.
+func (r *heavyRuntime) startSyncLoops(ctx context.Context, logger *slog.Logger) {
+	if r.assetSync != nil {
+		r.assetSyncDone = make(chan struct{})
+		go func() {
+			defer close(r.assetSyncDone)
+			if err := r.assetSync.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("asset sync loop exited with error", "error", err)
+			}
+		}()
+	}
+	if r.policyRefresher != nil {
+		r.policyRefreshDone = make(chan struct{})
+		go func() {
+			defer close(r.policyRefreshDone)
+			if err := r.policyRefresher.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("runtime policy refresh loop exited with error", "error", err)
+			}
+		}()
+	}
+}
+
 // joinWorkers 等待调度器与 Flow worker 真正退出。两个关闭入口都可能阻塞到各自
 // 的上界（调度器 70s 宽限、Flow worker 自己的 grace），因此必须在调用方给的预算
 // 内等待，超界返回 ctx.Err() 交给编排层判"直接退出"。
@@ -356,6 +382,17 @@ func (r *heavyRuntime) joinWorkers(ctx context.Context) error {
 	go func() {
 		flowErr = <-flowDone
 		<-schedDone
+		// 两个后台同步循环同样要 join 在关库之前（§2.3.4）：它们各持一条库连接池，
+		// 在飞的那一轮随 ctx 取消退出。未启动（其余重命令 / 测试夹具）时通道为 nil，
+		// 直接跳过——**不得**对 nil 通道做接收（那会永久阻塞）。
+		// The two loops also join before the database closes; nil channels mean the
+		// loops were never started and are skipped.
+		if r.assetSyncDone != nil {
+			<-r.assetSyncDone
+		}
+		if r.policyRefreshDone != nil {
+			<-r.policyRefreshDone
+		}
 		close(joined)
 	}()
 	select {

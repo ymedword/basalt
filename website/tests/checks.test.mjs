@@ -105,7 +105,7 @@ test('content negative fixtures exercise the same production rules', async () =>
     ['website/index.md', value => value + '\n[Private](https://github.com/ymedword/basalt/blob/main/docs/Requirements.md)\n', 'private-path'],
     ['website/index.md', value => value + '\nReady in 5 minutes.\n', 'unmeasured-duration'],
     ['website/index.md', value => value + '\n已验证\n', 'unverified-claim'],
-    ['website/architecture/index.md', value => value.replace('## ', 'Supports distributed execution.\n\n## '), 'future-capability-claim'],
+    ['website/architecture/index.md', value => value.replace('## ', 'Supports vector search.\n\n## '), 'future-capability-claim'],
     ['website/demo/transcript.json', value => JSON.stringify({ ...JSON.parse(value), lines: ['Invented reply'] }), 'reply-drift']
   ]) {
     const findings = checkPublicContent({ ...original, [file]: change(original[file]) })

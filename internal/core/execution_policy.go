@@ -394,6 +394,17 @@ type NetworkExceptionStore interface {
 	Lookup(ctx context.Context, exceptionID string) (NetworkException, bool, error)
 }
 
+// PolicyDigestSource 是四类运行期策略服务的一致快照刷新端口（US-25C FR-25C-15）：
+// 每个服务**持自己的锁**读各自的表、应用，并只用**这份实际应用的行**计算子摘要，
+// 再组合成应用摘要。`changed` 表示本次读到的内容与之应用前不同（新增、修改、删除、
+// 同内容不同版本号、同毫秒变化都必须被发现）；刷新单飞由调用方保证。
+// **不得**用 `max(updated_at)` 或发现阶段另一次读的摘要顶替本次实际应用的行。
+// PolicyDigestSource refreshes and digests the exact rows each service just applied;
+// timestamps or a second discovery read must never stand in for that snapshot.
+type PolicyDigestSource interface {
+	RefreshFromStore(ctx context.Context) (changed bool, digest string, err error)
+}
+
 // ExecutionPolicyAdmin 是 web 管理面依赖的端口（消费方声明，app 实现）。
 // ExecutionPolicyAdmin is the web-facing execution-policy port.
 type ExecutionPolicyAdmin interface {

@@ -47,6 +47,20 @@ const (
 	// lifecycleTool 是启停入参错误的点名标识（*core.InvalidInputError.Tool）。
 	// lifecycleTool names the transition surface in invalid-input errors.
 	lifecycleTool = "agent.transition"
+
+	// bundlePublishTimeout 是 HTTP 写面触发的资产发布的单次时限：写已提交，发布
+	// 不得无限占住写请求；超时按发布失败回给页面（有界发布，2026-11-09 用户裁决）。
+	// 内容保存与创建 / 提交 / 复制 / 恢复四条管理写面共用同一条时限。
+	// bundlePublishTimeout bounds every HTTP-triggered publication; a timeout is a
+	// publication failure, never a write failure.
+	bundlePublishTimeout = 30 * time.Second
+
+	// contentPublishFailedNotice 是发布失败时随写响应回给页面的固定文案：
+	// 点名"变更已生效"、"下次运行会被拒绝"与恢复入口，**不**带底层错误原文
+	// （可能含路径）——底层错误只进日志（约束 45）。
+	// contentPublishFailedNotice is the fixed page-facing text for a failed
+	// publication; the underlying error (which may carry paths) stays in the log.
+	contentPublishFailedNotice = "变更已保存，但资产发布未完成：该 Agent 的下一次运行会被准入拒绝。请重新保存；仍未恢复时执行 basalt assets install --agent <名称> 重新发布。"
 )
 
 // 编译期断言：适配器满足 web 依赖的消费方端口（§3.1.30）。
@@ -141,6 +155,11 @@ func (a *agentConsole) ReadContent(ctx context.Context, agent string) (core.Agen
 // projection: the editor has no lifecycle dependency, while the response contract
 // requires the state-file truth for this agent.
 func (a *agentConsole) UpdateContent(ctx context.Context, agent string, update core.AgentContentUpdate, ifMatch string, actor core.Actor) (core.AgentFiles, error) {
+	// 保存即发布在**编辑器写锁内**完成（2026-11-09 用户裁决，修订 D-25-10）：
+	// 与创建 / 提交 / 复制 / 恢复共用同一把共享闸门，写的顺序即发布的顺序，后完成
+	// 的发布不可能构建较早那次写入（共享指针倒退会让下一 Run 按版本不符失败关闭）。
+	// The editor publishes inside the same write lock every admin write face holds;
+	// the publication ordering therefore matches the write ordering.
 	files, err := a.editor.UpdateContent(ctx, agent, update, ifMatch, actor)
 	if err != nil {
 		return core.AgentFiles{}, err
@@ -152,6 +171,34 @@ func (a *agentConsole) UpdateContent(ctx context.Context, agent string, update c
 	// the file; an unreadable or absent identity skips the rebuild and logs.
 	a.rebuildProjection(ctx, agent)
 	return a.withLifecycle(ctx, files), nil
+}
+
+// contentPublishHook 把一次内容写触发的资产发布包成交给工作区编辑器的回调：
+// 写锁内执行（顺序保证）、有界（bundlePublishTimeout）、失败可见（状态 + 固定文案 +
+// ERROR 日志）。写已提交，发布失败**不得**把写改写成失败，但必须让页面看见后果——
+// 准入会按资产缺失或版本不符失败关闭，重试保存或重跑 `basalt assets install --agent`
+// 即可收敛。用 WithoutCancel：客户端断开不应让共享记录停在旧版本。
+//
+// contentPublishHook wraps the publication as the editor's in-lock callback: bounded,
+// failure visible, and never able to fail the committed write.
+func contentPublishHook(logger *slog.Logger,
+	publish func(ctx context.Context, agent string, actor core.Actor) (int64, error),
+) func(ctx context.Context, agent string, actor core.Actor) core.AgentPublishView {
+	if publish == nil {
+		// 未接线（只读 / 轻量装配面）：不发布，响应省略 publish，不伪装成 skipped。
+		return nil
+	}
+	return func(ctx context.Context, agent string, actor core.Actor) core.AgentPublishView {
+		publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bundlePublishTimeout)
+		defer cancel()
+		versionID, err := publish(publishCtx, agent, actor)
+		if err != nil {
+			logger.Error("publish agent bundle after content update failed (write effective; admission fails closed until republished)",
+				"agent", agent, "actor", actor.Subject, "error", err)
+			return core.AgentPublishView{Status: core.AgentPublishStatusFailed, Error: contentPublishFailedNotice}
+		}
+		return core.AgentPublishView{Status: core.AgentPublishStatusPublished, VersionID: versionID}
+	}
 }
 
 // rebuildProjection 按落盘定义重建该 Agent 的绑定投影；身份缺失 / 读取失败只记 ERROR。

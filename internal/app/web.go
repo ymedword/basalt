@@ -572,6 +572,7 @@ func agentFileSet(view AgentFilesView) web.AgentFileSet {
 			Agent:     view.Agent,
 			Lifecycle: view.Lifecycle,
 			Files:     view.Files,
+			Publish:   view.Publish,
 		},
 		ETag: view.ETag,
 	}
@@ -1202,7 +1203,11 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		// 现建现用，不额外占 heavyRuntime 字段。
 		// The worker store is stateless per call, so it is constructed inline like the
 		// snapshot store rather than parked on heavyRuntime.
-		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, postgres.NewWorkerStore(rt.db), a.nowOr())
+		// 概览的旧行兜底间隔取本部署的 worker 配置；读不到 Worker 概览时整组省略（不补 0）。
+		// The overview reader carries the deployment heartbeat interval for legacy rows.
+		workerStore := postgres.NewWorkerStore(rt.db,
+			postgres.WithDefaultHeartbeatInterval(workerSettings(a.cfg).HeartbeatIntervalSeconds))
+		opts.System = newSystemReader(rt.db, rt.runs, rt.versions, workerStore, a.nowOr())
 	}
 	opts.Sampler = web.NewSampler(a.nowOr())
 
@@ -1235,6 +1240,25 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		Snapshots: postgres.NewSnapshotStore(rt.db),
 		Registry:  rt.agents,
 		Scheduler: scheduler,
+		// 控制台内容保存即发布（2026-11-09 用户裁决，修订 D-25-10）：与创建 / 提交 /
+		// 复制 / 恢复同一个 `publishWorkspaceAgentBundle`，且在同一把 Agent 写锁内
+		// 完成——写的顺序即发布的顺序，共享指针不会倒退到较早保存的内容。不发布会让
+		// 下一次 Run 以 ASSET_VERSION_MISMATCH 失败关闭。
+		// Console saves publish through the same chain, inside the same write lock.
+		PublishBundle: contentPublishHook(a.loggerOr(), func(ctx context.Context, agent string, actor core.Actor) (int64, error) {
+			return publishWorkspaceAgentBundle(ctx, workspacePublishDeps{
+				Root:         rt.root,
+				BundleRoot:   rt.bundleRoot,
+				Versions:     rt.versions,
+				Operations:   rt.ops,
+				Payloads:     postgres.NewAssetDistributionStore(rt.db),
+				PayloadStore: postgres.NewBundlePayloadStore(rt.db),
+				MaxBytes:     resolveMaxBundleBytes(rt.cfg),
+				Actor:        actor,
+				Logger:       a.loggerOr(),
+				Now:          now,
+			}, agent)
+		}),
 		// 候选校验走装载器的同一道规则；调度占用基线取**当前**注册表快照——热加载
 		// 之后不能还拿装配时的 entries 判冲突。
 		Validate: func(_ context.Context, agent string, candidate []byte) (core.AgentEntry, string, []core.ManifestEntry, error) {
@@ -1265,10 +1289,19 @@ func (a *App) wireManagementPorts(opts *web.Options, rt *heavyRuntime) {
 		Index:      rt.versions,
 		Gate:       rt.agentGate,
 		Operations: rt.ops,
-		Logger:     a.loggerOr(),
-		Now:        now,
+		// 发布由编辑器在同一次写锁内完成（PublishBundle 注入在上方编辑器装配处）；
+		// 适配器只补充生命周期投影，**不得**在锁外补第二次发布。
+		// Publication is owned by the editor inside its write lock; the adapter only
+		// fills the lifecycle projection and never publishes a second time.
+		Logger: a.loggerOr(),
+		Now:    now,
 	})
 }
+
+// overviewNodeLimit 是概览 Worker 明细的固定上限（模块卡 §3.1.4：常量 200，不新增
+// 配置键）。全库计数不受它影响——被截断时 `truncated` 如实置位。
+// overviewNodeLimit bounds the overview worker detail rows; counts are unaffected.
+const overviewNodeLimit = 200
 
 // systemReader 是 web.SystemReader 的生产适配：`storage/db.go` 的 Ping / SchemaVersion、
 // `RunStore.CountRuns` 与三类发布指针计数。任一读失败整体返回错误——handler 据此把
@@ -1327,28 +1360,27 @@ func (r systemReader) ReadOverview(ctx context.Context) (web.SystemReadings, err
 	if err != nil {
 		return web.SystemReadings{}, err
 	}
-	// Worker 列表与全库活跃租约数（US-24 §3.1.13）：两者都是**只读诊断**，读不到就整体
-	// 失败——概览页不把"读不到"显示成"没有 Worker"。
-	// Worker rows and the cluster-wide active lease count; a read failure fails the
-	// reading rather than showing an empty cluster.
-	nodes, err := r.workers.ListNodes(ctx)
-	if err != nil {
-		return web.SystemReadings{}, err
-	}
-	activeLeases, err := r.workers.CountActiveLeases(ctx)
+	// Worker 三态读数与全库活跃租约数（US-24 §3.1.13、US-25C §2.3.9）：两者都是
+	// **只读诊断**，读不到就整体失败——概览页不把"读不到"显示成"没有 Worker"。
+	// 计数、明细与全库活跃租约数由 `ReadWorkerOverview` 的一条语句同快照取回，不在
+	// 这一层重算、合并或补 0。
+	// Worker status readings and the cluster-wide active lease count come from the same
+	// statement snapshot; a read failure fails the whole reading.
+	overview, err := r.workers.ReadWorkerOverview(ctx, overviewNodeLimit)
 	if err != nil {
 		return web.SystemReadings{}, err
 	}
 	return web.SystemReadings{
-		RunsRunning:       running,
-		RunsLast24h:       last24h,
-		RunsFailedLast24h: failedLast24h,
-		ModelConnections:  modelConnections,
-		MCPServers:        mcpServers,
-		Skills:            skills,
-		SchemaVersion:     schemaVersion,
-		Workers:           nodes,
-		ActiveLeases:      activeLeases,
+		RunsRunning:                  running,
+		RunsLast24h:                  last24h,
+		RunsFailedLast24h:            failedLast24h,
+		ModelConnections:             modelConnections,
+		MCPServers:                   mcpServers,
+		Skills:                       skills,
+		SchemaVersion:                schemaVersion,
+		Workers:                      overview,
+		ActiveLeases:                 overview.ActiveLeases,
+		WorkerDefaultIntervalSeconds: r.workers.DefaultHeartbeatIntervalSeconds(),
 	}, nil
 }
 

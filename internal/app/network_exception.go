@@ -304,6 +304,25 @@ func (s *NetworkExceptionService) apply(list []core.NetworkException) {
 	s.current.Store(&snapshot)
 }
 
+// RefreshFromStore 在服务锁内读一次例外集合、应用，并用这份实际应用的集合计算子摘要
+// （FR-25C-15）：例外表只有 `created_at`、更新走 `DELETE` + `INSERT`，删除对任何时间
+// 戳比较都不可见，只有内容摘要能看见——因此这里坚持按 (kind, value) 身份对取摘要。
+// RefreshFromStore applies and digests the exact list it read under the lock; row
+// deletion is only visible through content, never through timestamps.
+func (s *NetworkExceptionService) RefreshFromStore(ctx context.Context) (bool, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	list, err := s.deps.Store.List(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	previous := policyExceptionSubDigest(s.List())
+	digest := policyExceptionSubDigest(list)
+	s.apply(list)
+	return digest != previous, digest, nil
+}
+
 // reload 从库里重读并应用：仅在并发冲突 / 行已被删除的失败路径上调用，让视图与
 // 判定随后看到数据库真值。重读失败只记 WARN，不臆造当前集合。
 // reload converges the live faces after a conflict; a failed reload is only logged.

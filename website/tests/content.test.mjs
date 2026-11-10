@@ -2,12 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile, readdir, access } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
-import { CAPABILITIES, CORE_CAPABILITIES, DIAGRAMS } from '../.vitepress/data/capabilities.mjs'
+import { CAPABILITIES, CORE_CAPABILITIES, CURRENT_SCOPE_NOTE, DIAGRAMS } from '../.vitepress/data/capabilities.mjs'
+import { DEMO_COMMAND } from '../.vitepress/data/demo.mjs'
 import { CATALOG, DEMOS, TEMPLATES, TIERS } from '../.vitepress/data/templates.mjs'
 import { ROUTES, resolveFooter } from '../.vitepress/data/navigation.mjs'
 import { QUICKSTART_COMMANDS, DURATION_MEASURED, MINIMAL_CONFIG, TOKEN_GENERATION, PREREQUISITES, assertQuickstartParity, extractBasaltCommands } from '../.vitepress/data/quickstart.mjs'
 import { isForbiddenPath } from '../scripts/check-links.mjs'
-import { replyFor } from '../demo/local-model.mjs'
+import { replyFor, SCHEDULED_MESSAGE } from '../demo/local-model.mjs'
 
 const root = new URL('../../', import.meta.url)
 export const CONTENT_FILES = ['README.md', ...ROUTES.flatMap(route => ['en', 'zh'].map(locale => `website${route[locale]}index.md`)), 'website/.vitepress/data/quickstart.mjs', 'website/.vitepress/data/templates.mjs', 'website/demo/transcript.json', 'website/.vitepress/theme/components/CapabilityGrid.vue', 'website/.vitepress/theme/components/CliDemo.vue', 'website/.vitepress/theme/components/TemplateTable.vue']
@@ -60,7 +61,7 @@ export function checkPublicContent(files) {
     const architecture = files[`website${locale === 'zh' ? '/zh' : ''}/architecture/index.md`]
     for (const { id } of DIAGRAMS) if (!architecture.includes(`<DiagramFigure id="${id}"`)) report(locale, `missing-diagram-${id}`)
     const statement = architecture.split('{#current-scope}')[0]
-    if (/supports distributed|supports vector|支持分布式|支持向量检索|自动生成技能/i.test(statement)) report(locale, 'future-capability-claim')
+    if (/supports vector|支持向量检索|自动生成技能/i.test(statement)) report(locale, 'future-capability-claim')
     for (const name of ['daily-report', 'file-review']) {
       if (!architecture.includes(name)) report(locale, `missing-agent-example-${name}`)
     }
@@ -75,9 +76,9 @@ export function checkPublicContent(files) {
   try {
     const transcript = JSON.parse(files['website/demo/transcript.json'])
     for (const key of ['capturedAt', 'source', 'stub', 'command', 'lines', 'exitCode']) if (!(key in transcript)) report('transcript', `missing-${key}`)
-    if (transcript.command !== QUICKSTART_COMMANDS[4]) report('transcript', 'command-drift')
+    if (transcript.command !== DEMO_COMMAND) report('transcript', 'command-drift')
     if (transcript.source !== 'local-openai-compatible' || transcript.stub !== 'website/demo/local-model.mjs' || transcript.exitCode !== 0 || Number.isNaN(Date.parse(transcript.capturedAt))) report('transcript', 'invalid-source')
-    const expected = replyFor([{ role: 'user', content: 'Hello' }, { role: 'tool', tool_call_id: 'basalt-demo-readme', content: '# Basalt\nA self-hosted Agent OS.' }]).content.split('\n')
+    const expected = replyFor([{ role: 'user', content: SCHEDULED_MESSAGE }]).content.split('\n')
     if (!Array.isArray(transcript.lines) || JSON.stringify(transcript.lines.slice(-expected.length)) !== JSON.stringify(expected)) report('transcript', 'reply-drift')
   } catch { report('transcript', 'invalid-json') }
   return findings
@@ -136,6 +137,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     for (const locale of ['en', 'zh']) assert.ok(!/\b(?:Go|Node|PostgreSQL|MySQL|Redis)\b/.test(PREREQUISITES[0][locale]))
     assert.match(PREREQUISITES[1].en, /Go/)
     assert.match(PREREQUISITES[4].en, /Node/)
+  })
+  test('current scope note names the delivered profile and the un-delivered boundaries', () => {
+    for (const locale of ['en', 'zh']) {
+      const note = CURRENT_SCOPE_NOTE[locale]
+      assert.ok(note && note.length > 0, locale)
+      for (const term of locale === 'en' ? ['Compose multi-Worker', 'Kubernetes', 'database high availability', 'cross-node business-state sharing'] : ['Compose 多 Worker', 'K8s', '数据库高可用', '跨节点业务状态共享']) assert.ok(note.includes(term), `${locale}: missing ${term}`)
+    }
   })
   test('footer includes only the approved destination set', () => {
     assert.equal(resolveFooter('en').length, 3)

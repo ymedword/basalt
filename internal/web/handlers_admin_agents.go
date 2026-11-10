@@ -78,6 +78,9 @@ const (
 	// messageResourceVersionConflict 是 409 分支的兜底文案：指针在准入窗口内被推进，
 	// 条件已变但资源本身可用——重试这一笔即可，**不得**改用最新版本。
 	messageResourceVersionConflict = "模型连接 / MCP 的发布指针或凭据在准入窗口内被推进：请重试本次请求；不得把固定版本替换为最新版本"
+	// messagePolicyStale 是 503 `POLICY_STALE` 的兜底文案（FR-25C-16）：过期是「刷新
+	// 未成功」，不是「策略被停用」——文案只说等刷新恢复，不建议改策略内容。
+	messagePolicyStale = "运行期策略快照已过期：后台刷新尚未成功，请确认策略表可达；刷新恢复后自动放行"
 )
 
 // handleAdminCreateAgent 处理 `POST /agents`：模板创建默认停用，响应是落盘后的真值

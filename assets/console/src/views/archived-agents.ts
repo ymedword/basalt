@@ -12,6 +12,7 @@ import type { VNode, VNodeChild } from 'vue'
 import { ApiError, errorMessage } from '../api'
 import { adminApi } from '../api-admin'
 import type { ArchivedAgentView } from '../api-admin'
+import { publishFailedQuery, publishWarningText } from '../components/publish-status'
 import { DataTable, Notice, formatTimestamp, shortHash } from '../components/ui'
 import type { TableRow } from '../components/ui'
 import { agentHref } from '../router'
@@ -84,10 +85,16 @@ export const ArchivedAgentsView = defineComponent({
           target === ''
             ? `已按原名恢复「${restored.agent}」；generation 已递增，默认停用、定时任务已清空。`
             : `已恢复为「${restored.agent}」；generation=1，默认停用、定时任务已清空。`
-        if (!router.navigate(agentHref(restored.agent) + '?restored=1')) {
-          // 跳转被拦下（守卫）时退回本页说明，并重新读取归档列表。
+        if (
+          !router.navigate(
+            agentHref(restored.agent) + '?restored=1' + publishFailedQuery(restored.publish),
+          )
+        ) {
+          // 跳转被拦下（守卫）时退回本页说明，并重新读取归档列表；发布失败无法经
+          // URL 传递，就地追加同一条告警。
           // If navigation is blocked, stay truthful here and re-read the archives.
-          notice.value = message
+          const publishWarning = publishWarningText(restored.publish)
+          notice.value = publishWarning === '' ? message : `${message} ${publishWarning}`
           await archives.reload()
         }
       } catch (caught) {

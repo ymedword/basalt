@@ -280,6 +280,31 @@ func (a *NetworkAllowlist) reloadAfterConflict(ctx context.Context) {
 		"scope", scope, "revision", policy.Revision, "revoked_mcp_http", revoked)
 }
 
+// RefreshFromStore 在服务锁内**读一次**权威行、应用，并用这份实际应用的行计算子摘要
+// （FR-25C-15）：读、应用、摘要三者同源，**不得**先做发现读再用它的摘要顶替。行缺失
+// 按失败关闭处理——本进程没有策略行说明控制面尚未初始化，凭空清空比报错更危险。
+// 撤销已建立的 MCP http 连接不在这里做：由刷新器在整轮结束后统一收紧。
+// RefreshFromStore reads once, applies once and digests that same row under the lock;
+// a missing row fails closed. Tightening live links belongs to the refresher's round.
+func (a *NetworkAllowlist) RefreshFromStore(ctx context.Context) (bool, string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	scope := a.deps.scope()
+	policy, exists, err := a.deps.Store.Load(ctx, scope)
+	if err != nil {
+		return false, "", err
+	}
+	if !exists {
+		return false, "", fmt.Errorf(
+			"network domain %s 行缺失：先由控制面初始化策略行", a.deps.label())
+	}
+	previous := policyDomainSubDigest(a.Current())
+	digest := policyDomainSubDigest(policy)
+	a.apply(policy)
+	return digest != previous, digest, nil
+}
+
 // apply 同时替换策略实例与生效快照：两处必须来自同一次写入，否则页面显示与判定会分叉。
 // 禁止域名表落在策略的 `denied` 快照上（两档都先于放行判定），白名单落在 `domains`。
 // apply swaps the policy instance and the live snapshot together; the denylist lands

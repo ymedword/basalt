@@ -406,7 +406,7 @@ func TestNewRuntime_MaxConcurrentRuns(t *testing.T) {
 	f.seedPublishedProviders(t)
 	a := f.app()
 	a.providerOverride = blocker
-	rt, err := a.newRuntime(context.Background())
+	rt, err := a.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		blocker.Release()
@@ -953,4 +953,79 @@ func TestWritePorts_IndependentOfContentEditor(t *testing.T) {
 	opts = (&App{}).webOptions(partial)
 	require.NotNil(t, opts.AgentAdminService)
 	require.Nil(t, opts.AgentAdmin, "写面端口不得让内容编辑器变成非 nil")
+}
+
+// TestOverview_WorkerViewMapping 判 app 层概览适配的 Worker 投影（US-25C §2.3.9 /
+// FR-25C-30）：`SystemReadings` 携带同一快照的计数、有界明细与全库活跃租约数，
+// 部署默认心跳间隔单独透传给 web 层（旧行标注用）——四者都不得在这一层重算、
+// 合并或补 0。
+//
+// 逆改点：把明细行数当计数 → Counts 断言红；不传部署默认 → 60 断言红；
+// 用固定阈值 → 旧行（200s / 默认 60s）被误判 stopped 或 stale，状态断言红。
+// Reverse-edit points: deriving counts from rows, dropping the default interval, or a
+// fixed threshold all turn the matching assertion red.
+func TestOverview_WorkerViewMapping(t *testing.T) {
+	env := newRunResourcesEnv(t)
+	ctx := context.Background()
+	workers := postgres.NewWorkerStore(env.db, postgres.WithDefaultHeartbeatInterval(60))
+	reader := newSystemReader(env.db, postgres.NewRunStore(env.db), env.versions, workers, baselineClock)
+
+	register := func(instanceID, name string, interval int) {
+		t.Helper()
+		require.NoError(t, workers.Register(ctx, core.WorkerIdentity{
+			InstanceID: instanceID, Name: name, Hostname: "host-" + instanceID,
+			Version: "0.2.0-test", SchemaVersion: postgres.SupportedSchemaVersion,
+			HeartbeatIntervalSeconds: interval,
+		}))
+	}
+	register("wrk_fresh", "worker-fresh", 10)
+	register("wrk_legacy", "worker-legacy", 0)
+	register("wrk_stopped", "worker-stopped", 10)
+
+	age := func(instanceID string, seconds int64) {
+		t.Helper()
+		_, err := env.db.ExecContext(ctx, `
+UPDATE worker_nodes
+   SET last_heartbeat_at = (extract(epoch FROM clock_timestamp()) * 1000)::bigint - $2
+ WHERE instance_id = $1`, instanceID, seconds*1000)
+		require.NoError(t, err)
+	}
+	age("wrk_fresh", 1)
+	age("wrk_legacy", 200) // 部署默认 60s → 阈值 180s：200s 未心跳是 stale
+	age("wrk_stopped", 1)
+	_, err := env.db.ExecContext(ctx, `
+UPDATE worker_nodes
+   SET stopped_at = (extract(epoch FROM clock_timestamp()) * 1000)::bigint
+ WHERE instance_id = 'wrk_stopped'`)
+	require.NoError(t, err)
+
+	readings, err := reader.ReadOverview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 60, readings.WorkerDefaultIntervalSeconds,
+		"部署默认心跳间隔必须透传给 web 层标注旧行")
+	require.Equal(t, core.WorkerOverviewCounts{Active: 1, Stale: 1, Stopped: 1}, readings.Workers.Counts)
+	require.Equal(t, 3, readings.Workers.Total, "total 是三类计数之和")
+	require.False(t, readings.Workers.Truncated)
+	require.False(t, readings.Workers.AsOf.IsZero(), "快照时刻来自数据库")
+	require.Zero(t, readings.ActiveLeases, "空租约表是真实读数 0，不是缺读数")
+
+	require.Len(t, readings.Workers.Nodes, 3)
+	require.Equal(t, "wrk_fresh", readings.Workers.Nodes[0].InstanceID, "active 排在最前")
+	rows := map[string]core.WorkerNodeStatus{}
+	for _, node := range readings.Workers.Nodes {
+		rows[node.InstanceID] = node
+	}
+	require.Equal(t, "active", rows["wrk_fresh"].Status)
+	require.Equal(t, "stale", rows["wrk_legacy"].Status,
+		"旧行按部署默认 60s 计算阈值（180s），不是固定 30s")
+	require.Equal(t, "stopped", rows["wrk_stopped"].Status)
+	require.NotNil(t, rows["wrk_stopped"].StoppedAt)
+	require.Nil(t, rows["wrk_legacy"].HeartbeatIntervalSeconds, "旧行没有登记间隔")
+	require.NotNil(t, rows["wrk_fresh"].HeartbeatIntervalSeconds)
+	require.Equal(t, 10, *rows["wrk_fresh"].HeartbeatIntervalSeconds)
+	require.InDelta(t, 200, rows["wrk_legacy"].HeartbeatAgeSeconds, 5)
+	require.Equal(t, "worker-fresh", rows["wrk_fresh"].Name)
+	require.Equal(t, "host-wrk_fresh", rows["wrk_fresh"].Hostname)
+	require.Equal(t, "0.2.0-test", rows["wrk_fresh"].BuildVersion)
+	require.Equal(t, postgres.SupportedSchemaVersion, rows["wrk_fresh"].SchemaVersion)
 }

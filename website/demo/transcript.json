@@ -1,12 +1,12 @@
 {
-    "capturedAt":  "2026-10-24T09:52:31.8241711+00:00",
-    "source":  "local-openai-compatible",
-    "stub":  "website/demo/local-model.mjs",
-    "command":  "basalt chat --agent demo --message \"Hello\"",
-    "lines":  [
-                  "⚙ 调用工具 read_file…",
-                  "Basalt is a self-hosted Agent OS.",
-                  "Independent agents share execution, scheduling and auditing."
-              ],
-    "exitCode":  0
+  "capturedAt": "2026-11-09T15:53:10.091+00:00",
+  "source": "local-openai-compatible",
+  "stub": "website/demo/local-model.mjs",
+  "command": "basalt serve",
+  "lines": [
+    "time=2026-11-09T23:53:10.091+08:00 level=INFO msg=调度触发 task_id=daily-brief agent=demo run_id=scheduler-1794239590000-yqpv04 trigger=cron message_bytes=49",
+    "Basalt is a self-hosted Agent OS.",
+    "This scheduled run reused the shared scheduler, execution and audit path."
+  ],
+  "exitCode": 0
 }

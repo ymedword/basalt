@@ -281,6 +281,23 @@ type ResourceAdminDeps struct {
 	// MCPCredentials is the per-slot MCP credential surface; a nil service refuses every
 	// save that declares slots instead of guessing a source.
 	MCPCredentials *MCPCredentialService
+	// AgentGate 是技能联动重发使用的 Agent 级写锁（US-25C §2.3.7 锁序）：必须与内容
+	// 编辑**共用同一个实例**（wire.go 的同一把），联动才能在技能资源锁释放后按 Agent
+	// 逐个串行。nil 时联动重发按"未接线"逐项失败并记日志——**不得**在联动路径里
+	// `NewAgentGate()` 另造一把（那样与内容编辑互不排斥）。
+	// AgentGate must be the same instance content editing uses; nil fails the linkage
+	// closed instead of creating a second gate.
+	AgentGate *core.AgentGate
+	// AssetRoot 是内容寻址资产根（`assets.bundle_root`）：联动重发从这里读已安装
+	// bundle，也把重建结果装回这里。
+	// AssetRoot is the content-addressed asset root used by skill republication.
+	AssetRoot string
+	// Payloads / PayloadStore / MaxBundleBytes 服务"本机目录缺失时从载荷还原"与
+	// 重建后的发布载荷写入。三者与资产发布链同源，不另建第二套仓储。
+	// Payloads / PayloadStore / MaxBundleBytes reuse the asset publication seam.
+	Payloads       bundlePayloadReader
+	PayloadStore   core.BundlePayloadStore
+	MaxBundleBytes int64
 }
 
 // ResourceAdmin 是公共资源写面的编排实现；字段全部私有，构造后不再变化。
@@ -315,6 +332,11 @@ type ResourceAdmin struct {
 	// Two keyed mutex tables; the resource lock is always acquired before the file lock.
 	resourceLocks *resourceLockTable
 	fileLocks     *resourceLockTable
+
+	// republisher 是技能发布后的联动重发实现（FR-25C-17）：与 `RepublishOne` 同一
+	// 消费方接口，运行期修复器拿到的也是它。
+	// republisher performs the dependent-agent republication after a skill publish.
+	republisher *skillRepublisher
 }
 
 // resourceLockTable 是进程内的按键互斥表：同一个键串行、不同键并行。表项按见过的键
@@ -386,6 +408,22 @@ func NewResourceAdmin(deps ResourceAdminDeps) *ResourceAdmin {
 	if timeout <= 0 {
 		timeout = defaultModelTestTimeout
 	}
+	// 联动重发器与 `RepublishOne` 共用同一份依赖；缺项时保持 `wired() == false`，
+	// 技能照常发布、联动结果逐条报 `failed`（不伪造成功、不阻塞发布）。
+	// The republisher shares one dependency set with RepublishOne; unwired builds keep
+	// publishing the skill and report per-agent `failed` linkage instead of pretending.
+	republisher := newSkillRepublisher(skillRepublishDeps{
+		AssetRoot:     deps.AssetRoot,
+		WorkspaceRoot: deps.Root,
+		Versions:      deps.Store,
+		Operations:    deps.Operations,
+		Payloads:      deps.Payloads,
+		PayloadStore:  deps.PayloadStore,
+		AgentGate:     deps.AgentGate,
+		MaxBytes:      deps.MaxBundleBytes,
+		Logger:        logger,
+		Now:           now,
+	})
 	return &ResourceAdmin{
 		configPath:       deps.ConfigPath,
 		root:             deps.Root,
@@ -406,6 +444,7 @@ func NewResourceAdmin(deps ResourceAdminDeps) *ResourceAdmin {
 		diagnoseMCP:      deps.DiagnoseMCP,
 		mcpDependencies:  deps.MCPDependencies,
 		mcpCredentials:   deps.MCPCredentials,
+		republisher:      republisher,
 		logger:           logger,
 		now:              now,
 		publishVersion:   publishVersion,
@@ -1687,7 +1726,15 @@ func (s *ResourceAdmin) Publish(ctx context.Context, actor core.Actor, req core.
 	}
 	action := publishAction(req.Kind)
 	if req.Kind == core.ResourceSkill {
-		return s.publishSkillVersion(ctx, actor, req, action)
+		result, err := s.publishSkillVersion(ctx, actor, req, action)
+		if err != nil {
+			return result, err
+		}
+		// 联动必须在技能资源锁**释放之后**：`publishSkillVersion` 的 defer 已随返回执行，
+		// 重发器再逐 Agent 取自己的锁，锁序恒为「技能锁 → 释放 → Agent 锁」，不会嵌套。
+		// Linkage runs after publishSkillVersion returns, so the skill lock is released
+		// before any agent lock is taken.
+		return s.withSkillLinkage(ctx, actor, req.ID, result), nil
 	}
 	definitionPath := s.configPath
 	blockKey := providersBlockKey

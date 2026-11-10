@@ -56,6 +56,14 @@ type MCPApplyInput struct {
 	// OldLegal reports whether the previous version is still legal after a failure; nil
 	// means undeterminable and is treated as legal.
 	OldLegal func(ctx context.Context) bool
+	// Verify 是同步准备路径的**换入前**只读复核（US-25C §2.3.8）：候选在锁外构建期间可能
+	// 发生新发布或凭据轮换，"构建成功"不等于"这一版仍该上"。它只在 `Commit == nil` 时
+	// 使用，且必须在 `commitReplace` 的同一临界区（gate + entry.mu）内、换入之前完成：
+	// 失败时库未写、工具未换，两侧都没有中间态。返回非空 `supersededBy` 表示目标已被
+	// 顶替；返回 error 表示无法确认（按失败关闭处理）。
+	// Verify is the swap-time read-only recheck of the sync path; it runs inside the same
+	// critical section as the swap so a failure leaves both sides untouched.
+	Verify func(ctx context.Context, published core.PublishedMCPServer) (core.MCPApplySupersededBy, error)
 }
 
 // MCPApplyResult 是受控重建的结论（与契约 `McpServerApplyResult` 一一对应；`server` 与
@@ -67,6 +75,10 @@ type MCPApplyResult struct {
 	DrainDeadline    time.Time
 	FailureClass     string
 	SupersededBy     core.MCPApplySupersededBy
+	// Reused 只在同步准备路径由 `PrepareAtApplied` 置真：版本与凭据代次都相符且连接仍
+	// live，本轮**零副作用**（不建连、不换池、不递增 epoch、不写审计）。
+	// Reused marks the zero-side-effect branch of PrepareAtApplied.
+	Reused bool
 }
 
 // mcpReplaceCommit 是提交段的读数。
@@ -77,10 +89,38 @@ type mcpReplaceCommit struct {
 	drainAt      time.Time
 }
 
-// Replace 执行一次受控重建（八步中的 4–8；1–3 在调用方）。
-// Replace runs the controlled rebuild of one server.
+// Replace 执行一次受控重建（八步中的 4–8；1–3 在调用方）。这是**管理 apply** 的入口：
+// `Commit` 非空（事务校验 + CAS），复核在事务内已完成，换入必须紧跟 CAS、不得再插入
+// 提交后可失败的检查（US-25C §2.3.8 的路径分支表）。
+// Replace is the admin-apply entry: the commit callback already verified inside its
+// transaction, so the swap follows it immediately.
 func (s *MCPSupervisor) Replace(ctx context.Context, in MCPApplyInput) MCPApplyResult {
+	return s.replace(ctx, in, true)
+}
+
+// replace 是 Replace / PrepareAtApplied 的共同实现。`recordAudit` 为假时**不**发
+// `mcp.apply` 审计事件——同步准备路径的受控重建是运行期例行维护，不是一次管理发布，
+// 把它写进管理事件面只会让"谁发布了这一版"失真（§2.3.8 M2）。策略检查照常进行。
+// replace is the shared implementation; recordAudit=false keeps the sync path out of the
+// admin audit surface while still checking policy.
+func (s *MCPSupervisor) replace(ctx context.Context, in MCPApplyInput, recordAudit bool) MCPApplyResult {
 	cfg := in.Target.Config
+	if in.Commit != nil && in.Verify != nil {
+		// 接线错误：管理路径的事务内校验与同步路径的换入前复核是两条互斥分支，同时
+		// 传入无法判定该信哪一条——按失败关闭拒绝，不静默忽略其中一个。
+		return MCPApplyResult{
+			Outcome: core.MCPApplyFailed, AppliedVersionID: in.PreviousVersionID,
+			FailureClass: mcpTestClassDependencyUnconfirmed,
+		}
+	}
+	if in.Commit == nil && in.Verify == nil {
+		// 没有复核就没有换入依据：装配缺少复核入口时失败关闭，且必须在建连**之前**——
+		// 先建连再判会把一次注定被丢弃的连接留给对端（§2.3.8「不得把跳过复核当成功」）。
+		return MCPApplyResult{
+			Outcome: core.MCPApplyFailed, AppliedVersionID: in.PreviousVersionID,
+			FailureClass: mcpTestClassDependencyUnconfirmed,
+		}
+	}
 	if err := validateSupervisorConfig(cfg); err != nil {
 		// 配置本身不可用属于"预检之后仍无法建连"的同一档：不猜具体原因。
 		return MCPApplyResult{
@@ -90,7 +130,8 @@ func (s *MCPSupervisor) Replace(ctx context.Context, in MCPApplyInput) MCPApplyR
 	}
 
 	// 第 4 步：先授权、后建连。拒绝**不碰**旧连接——本次没有切换，旧版本仍在合法运行。
-	if err := s.authorize(ctx, mcpApplyEvent, cfg, in.Target.VersionID); err != nil {
+	// 准备路径不记管理审计事件，但策略检查一样不能跳过。
+	if err := s.authorizeWithAudit(ctx, mcpApplyEvent, cfg, in.Target.VersionID, recordAudit); err != nil {
 		s.deps.Logger.Error("MCP 受控重建被策略拒绝", "server", cfg.Name,
 			"target_version_id", in.Target.VersionID)
 		return MCPApplyResult{
@@ -195,6 +236,18 @@ func (s *MCPSupervisor) commitReplace(ctx context.Context, entry *mcpServerEntry
 			return mcpReplaceCommit{supersededBy: by}
 		}
 	}
+	if in.Verify != nil {
+		// 同步准备路径的换入前复核（§2.3.8）：与换入同段临界区，失败时库未写、工具未换。
+		// 管理路径不会走到这里（`Commit != nil && Verify != nil` 已按接线错误拒绝）。
+		// The sync-path recheck runs in the same critical section as the swap.
+		by, err := in.Verify(context.WithoutCancel(ctx), in.Target)
+		if err != nil {
+			return mcpReplaceCommit{err: err}
+		}
+		if by != core.MCPApplySupersededByNone {
+			return mcpReplaceCommit{supersededBy: by}
+		}
+	}
 	// CAS 成功之后立刻换池，仍在同一段临界区：新 Run 要么看到旧的一整组，要么看到新的
 	// 一整组（C1 / C4）。候选在 CAS 之前从未登记，因此丢弃分支不需要"撤回注册"。
 	// The swap follows the CAS under the same lock; a discarded candidate was never
@@ -206,6 +259,7 @@ func (s *MCPSupervisor) commitReplace(ctx context.Context, entry *mcpServerEntry
 	entry.epoch++
 	entry.conn = connector
 	entry.link = link
+	entry.credentialGeneration = in.Target.CredentialGeneration
 	entry.httpHost = ""
 	if mcpTransport(in.Target.Config.Transport) == mcpTransportHTTP {
 		entry.httpHost = mcpHost(in.Target.Config.URL)
@@ -275,6 +329,7 @@ func (s *MCPSupervisor) releaseIllegalOld(ctx context.Context, entry *mcpServerE
 	if stillOurs {
 		entry.conn = nil
 		entry.link = nil
+		entry.credentialGeneration = ""
 		entry.httpHost = ""
 		entry.status.Connected = false
 		entry.status.Tools = nil
@@ -310,6 +365,7 @@ func (s *MCPSupervisor) RevokeServer(ctx context.Context, name string) error {
 	link := entry.link
 	entry.conn = nil
 	entry.link = nil
+	entry.credentialGeneration = ""
 	entry.httpHost = ""
 	entry.status.Connected = false
 	entry.status.Tools = nil

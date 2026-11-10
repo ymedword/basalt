@@ -127,6 +127,12 @@ const (
 	codeAgentLifecycleMismatch  = "AGENT_LIFECYCLE_MISMATCH"  // 409 同代次内容不一致 / 索引缺失 / 期望值缺失
 	codeResourceVersionMismatch = "RESOURCE_VERSION_MISMATCH" // 409 指针在准入窗口内漂移；503 本地实例版本证明不成立
 	codeFlowRootBusy            = "FLOW_ROOT_BUSY"            // 409 管理面推进撞上执行者持有的 flow_root 租约
+
+	// US-25C 新增（契约 run-and-errors §8 的运行期策略过期行）：四类运行期策略最近一次
+	// **全部成功**的核对超过 `policy.max_stale`（或从未成功过）→ 503，拒绝新 Run。
+	// 与内容版本无关：内容长期不变不构成过期，只有刷新失败让时间戳停在原地。
+	// US-25C: a stale runtime policy snapshot refuses new runs with 503.
+	codePolicyStale = "POLICY_STALE" // 503 运行期策略快照过期（最近成功核对超 max_stale / 从未成功）
 )
 
 // messageSuccess / messageBusy / messageInternal 是固定文案；messageBusy 逐字取自

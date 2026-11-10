@@ -231,6 +231,128 @@ func TestDocs_SupportMatrixOnlyComposeMultiworker(t *testing.T) {
 	}
 }
 
+// TestDocs_AssetSyncSectionAndRecovery 判 US-25C 的运维契约：Operations 必须有一节
+// 「已发布资产同步」，写清只读诊断、机器可读失败原因与恢复路径，并明确排除「重导种子」；
+// §5.5 的发布可见性口径必须同口径。测试读真实文档，删掉或改坏小节即红。
+// TestDocs_AssetSyncSectionAndRecovery judges the US-25C operations contract.
+func TestDocs_AssetSyncSectionAndRecovery(t *testing.T) {
+	operations := docsRead(t, docsOperationsPath)
+	section := docsBlockBetween(t, "Operations 已发布资产同步", operations,
+		"### 已发布资产同步（US-25C 起）", "\n### ")
+	for _, want := range []string{
+		"basalt assets status",
+		"指针哈希",
+		"已安装哈希",
+		"载荷",
+		"技能物化",
+		"阻塞原因",
+		"payload_missing",
+		"payload_unavailable",
+		"not_installed",
+		"corrupt",
+		"skills_unavailable",
+		"ASSET_UNAVAILABLE",
+		"ASSET_VERSION_MISMATCH",
+		"POLICY_STALE",
+		"AGENT_LIFECYCLE_STALE",
+		"发现检查频率",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("Operations「已发布资产同步」缺少 %q：诊断读数、失败原因与发现频率必须写清"+
+				"（T063 / FR-25C-22～24）", want)
+		}
+	}
+	recovery := docsBlockBetween(t, "Operations 资产同步恢复路径", section,
+		"**恢复路径**", "\n**")
+	for _, want := range []string{"assets status", "不要重导种子"} {
+		if !strings.Contains(recovery, want) {
+			t.Fatalf("Operations 恢复路径缺少 %q：恢复必须先看只读诊断，并明确不得重导种子"+
+				"（T063 / FR-25C-22）", want)
+		}
+	}
+	if strings.Contains(operations, "跨机器**没有**自动分发") {
+		t.Fatalf("Operations 仍写「跨机器没有自动分发」：US-25C 已交付数据库载荷分发，" +
+			"手工路径只用于首次部署与存量升级（T063）")
+	}
+
+	visibility := docsBlockBetween(t, "Operations §5.5 发布可见性", operations,
+		"**发布可见性口径**", "\n### ")
+	for _, want := range []string{"basalt assets status", "重导种子", "ASSET_*"} {
+		if !strings.Contains(visibility, want) {
+			t.Fatalf("Operations §5.5 发布可见性口径缺少 %q：重部署不重发资产，"+
+				"恢复走只读诊断而不是重导种子（T063）", want)
+		}
+	}
+}
+
+// TestDocs_ReadmeArchitectureAndDemoLink 判 README 的门面契约：首屏 Demo 指向真实
+// 控制台地址；架构段按 Compose 多 Worker 表述，发布边界只写已交付档并逐条点名未交付项；
+// 「工程验证」小节链接既有命令入口。不得出现未验证的能力声明。
+// TestDocs_ReadmeArchitectureAndDemoLink judges the README facade contract.
+func TestDocs_ReadmeArchitectureAndDemoLink(t *testing.T) {
+	readme := docsRead(t, docsReadmePath)
+	const demoConsole = "http://43.161.200.168:8080/console/"
+	headerEnd := strings.Index(readme, "</div>")
+	if headerEnd < 0 {
+		t.Fatalf("README 缺少居中的首屏块结束标记 </div>（T072）")
+	}
+	header := readme[:headerEnd]
+	if !strings.Contains(header, "[Demo]("+demoConsole+")") {
+		t.Fatalf("README 首屏 Demo 必须指向 %s（T072）", demoConsole)
+	}
+
+	arch := docsBlockBetween(t, "README 架构段", readme, "## Architecture", "\n## ")
+	for _, want := range []string{
+		"Compose multi-Worker",
+		"payload-first",
+		"pinned to one bundle",
+		"gateway",
+	} {
+		if !strings.Contains(arch, want) {
+			t.Fatalf("README 架构段缺少 %q：必须按已交付的 Compose 多 Worker 与发布链表述"+
+				"（T063 / T069）", want)
+		}
+	}
+
+	boundaries := docsBlockBetween(t, "README 发布边界", readme,
+		"Deployment support and boundaries for this release:", "\n## ")
+	for _, want := range []string{
+		"- **Supported profile:** Compose multi-Worker",
+		"- **Kubernetes:** not delivered.",
+		"- **Database HA:** not delivered.",
+		"- **Cross-node business-state sharing:** not delivered",
+	} {
+		if !strings.Contains(boundaries, want) {
+			t.Fatalf("README 发布边界缺少 %q：首发只写 Compose 多 Worker，"+
+				"K8s / 数据库 HA / 跨节点业务状态共享必须如实标未交付（T063）", want)
+		}
+	}
+
+	for _, want := range []string{
+		"## What Basalt is",
+		"## What it solves",
+		"## What makes it different",
+		"## What is verified: engineering and automated acceptance",
+		"make check",
+		"scripts/check-acceptance.sh",
+		"scripts/check-coverage.sh",
+		"internal/e2e",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Fatalf("README 缺少 %q：开头按「是什么 / 解决什么问题 / 有什么特点」重组，"+
+				"并新增链接既有验证入口的工程验证小节（T069～T071）", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"real-model quality is verified",
+		"real model quality is verified",
+	} {
+		if strings.Contains(strings.ToLower(readme), forbidden) {
+			t.Fatalf("README 出现未验证声明 %q：本地桩与夹具回放不代表真实模型效果（T069）", forbidden)
+		}
+	}
+}
+
 // docsRequireSupportMatrixScope 判一个支持矩阵区块：只承诺 Compose 多 Worker 与
 // LocalRunner，K8s / 数据库 HA / 双宿主的每一行都必须带「未验证」。
 // docsRequireSupportMatrixScope judges one support-matrix block.

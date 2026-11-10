@@ -222,6 +222,28 @@ func NewRunResources(versions *postgres.ResourceStore, providers *providerCatalo
 // the published pointer, MCP uses the applied one. A missing or inconsistent row is an
 // error; nothing ever falls back to a work copy.
 func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core.ResolvedResources, error) {
+	return r.resolve(ctx, entry, "")
+}
+
+// ResolvePinned 按**领取钉住的 bundle 哈希**解析一次运行（US-25C §2.3.5.1 T2）：
+// 资产包不读当前发布指针，技能只认该 bundle 清单记录的版本行；其余检查（身份 /
+// Provider / 凭据 / MCP / 绑定 / 通知 / 定义一致性）与 `Resolve` 逐项相同，一个不少。
+// 空哈希是编排错误：钉住运行没有可解析的对象，失败关闭而不是退回当前指针。
+// ResolvePinned resolves a pinned run; every other check matches Resolve exactly.
+func (r *runResources) ResolvePinned(ctx context.Context, entry core.AgentEntry, hash string) (core.ResolvedResources, error) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonAsset,
+			fmt.Errorf("%w: 钉住运行的 bundle 哈希为空", core.ErrClaimPinInvalid))
+	}
+	return r.resolve(ctx, entry, hash)
+}
+
+// resolve 是两条解析入口共用的唯一实现：`frozenHash == ""` 时按当前发布指针取件
+// （普通 Run），否则按固定哈希取件（钉住 Run）。分叉只在两处——资产包来源与技能
+// 来源；其余判据共用，避免两套解析在凭据 / 绑定 / 通知上悄悄分叉。
+// resolve is the single body of both entries; the fork is only bundle and skill sourcing.
+func (r *runResources) resolve(ctx context.Context, entry core.AgentEntry, frozenHash string) (core.ResolvedResources, error) {
 	if entry.Profile == nil {
 		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonProfile, errors.New("agent entry has no profile"))
 	}
@@ -261,10 +283,16 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 
 	// ② 内容寻址资产包（§2.3.9 事务外段 / FR-24-25）：期望哈希来自共享发布记录
 	// （`resource_pointers` + `resource_versions.content_hash`），本地不可变目录必须
-	// 与它逐项一致。校验是**无条件**不变量，不存在跳过开关；装配缺校验器即失败关闭。
-	// The content-addressed bundle is verified unconditionally against the shared
-	// publication record; a missing verifier fails closed rather than skipping.
-	bundle, err := r.verifyAssets(ctx, entry.Name, agentUID)
+	// 与它逐项一致；钉住 Run 的期望哈希来自领取记录（`frozenHash`），不读指针。
+	// 校验是**无条件**不变量，不存在跳过开关；装配缺校验器即失败关闭。
+	// The bundle is verified unconditionally; a pinned run takes its expectation from the
+	// claim instead of the pointer, and a missing verifier still fails closed.
+	var bundle core.AssetBundlePin
+	if frozenHash != "" {
+		bundle, err = r.verifyAssetsAt(ctx, entry.Name, agentUID, frozenHash)
+	} else {
+		bundle, err = r.verifyAssets(ctx, entry.Name, agentUID)
+	}
 	if err != nil {
 		return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonAsset, err)
 	}
@@ -360,13 +388,22 @@ func (r *runResources) Resolve(ctx context.Context, entry core.AgentEntry) (core
 		runtime.mcp[name] = mcpHandle{name: name, built: built}
 	}
 
-	for _, name := range profile.Skills {
-		ref, dir, err := r.resolveSkill(ctx, name)
-		if err != nil {
+	if frozenHash != "" {
+		// 钉住 Run 的技能只认 bundle 清单记录的版本（T2）：当前发布指针可能已在领取
+		// 之后前进，按它解析会让本次 Run 的 Entry 与技能来自两个版本。
+		// Pinned skills come only from the bundle's recorded version rows.
+		if err := r.resolvePinnedSkills(ctx, profile, resolved.AssetBundle, &resolved); err != nil {
 			return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonSkill, err)
 		}
-		resolved.Skills = append(resolved.Skills, ref)
-		resolved.SkillDirs[name] = dir
+	} else {
+		for _, name := range profile.Skills {
+			ref, dir, err := r.resolveSkill(ctx, name)
+			if err != nil {
+				return core.ResolvedResources{}, unavailable(entry.Name, resourceReasonSkill, err)
+			}
+			resolved.Skills = append(resolved.Skills, ref)
+			resolved.SkillDirs[name] = dir
+		}
 	}
 	// 技能版本与资产包清单的交叉核对（FR-24-25「技能版本不符 → 拒绝新 Run」）：
 	// 放在技能固定之后——缺技能先报技能原因，包内记录与固定结果不一致再报资产原因。
@@ -413,6 +450,88 @@ func (r *runResources) verifyAssets(ctx context.Context, agent string, uid core.
 		return core.AssetBundlePin{}, errors.New("准入解析未装配资产校验器")
 	}
 	return r.Assets.VerifyBundle(ctx, agent, uid)
+}
+
+// pinnedAssetVerifier 是资产校验面的**按固定哈希**形态（可选扩展，US-25C §2.3.5.1
+// T2）。生产校验器实现它；未实现该形态的装配在钉住路径上失败关闭——钉住运行不得
+// 退回"按当前指针校验"，那等于换掉领取钉住的版本。
+// pinnedAssetVerifier is the hash-addressed form of the verifier; an assembly without
+// it fails closed on the pinned path instead of verifying the current pointer.
+type pinnedAssetVerifier interface {
+	VerifyBundleAt(ctx context.Context, agent string, uid core.AgentUID, hash string) (core.AssetBundlePin, error)
+}
+
+// verifyAssetsAt 与 `verifyAssets` 同一道判据，期望哈希改由领取记录给出。
+// verifyAssetsAt verifies the claimed hash; the check is otherwise identical.
+func (r *runResources) verifyAssetsAt(ctx context.Context, agent string, uid core.AgentUID,
+	hash string,
+) (core.AssetBundlePin, error) {
+	if r.Assets == nil {
+		return core.AssetBundlePin{}, errors.New("准入解析未装配资产校验器")
+	}
+	verifier, ok := r.Assets.(pinnedAssetVerifier)
+	if !ok {
+		return core.AssetBundlePin{}, fmt.Errorf("%w: 资产校验器不支持按固定哈希校验",
+			core.ErrAssetUnavailable)
+	}
+	return verifier.VerifyBundleAt(ctx, agent, uid, hash)
+}
+
+// resolvePinnedSkills 按 bundle 清单记录的技能版本经**不可变版本行**解析（T2）：
+// 版本行必须存在、kind / resource_id / uid / 内容哈希 / 文件清单逐项与记录相符，
+// 目录取该行的 `storage_path`。任一不符 → `core.ErrAssetVersionMismatch`（bundle 记录
+// 与共享库不一致）；版本行读不到 → 原样上报。AGENT.md 声明但 bundle 未记录的技能同样
+// 拒绝——本次 Run 的技能集就是 bundle 记录的那一组，缺一个都说明两份记录不同源。
+// resolvePinnedSkills resolves the bundle's recorded skill versions through immutable
+// version rows and refuses any row that disagrees with the record.
+func (r *runResources) resolvePinnedSkills(ctx context.Context, profile *core.Profile,
+	bundle core.AssetBundlePin, resolved *core.ResolvedResources,
+) error {
+	if r.Versions == nil {
+		return errors.New("技能读取未接资源仓储")
+	}
+	byName := make(map[string]struct{}, len(bundle.Skills))
+	for _, recorded := range bundle.Skills {
+		version, err := r.Versions.VersionByID(ctx, recorded.VersionID)
+		if err != nil {
+			return err
+		}
+		if version.Kind != core.ResourceSkill || version.ResourceID != recorded.Name ||
+			version.ResourceUID != recorded.ResourceUID {
+			return fmt.Errorf("%w: 技能 %s 的版本 %d 归属不符（got %s/%s）",
+				core.ErrAssetVersionMismatch, recorded.Name, recorded.VersionID,
+				version.Kind, version.ResourceID)
+		}
+		if version.ContentHash != recorded.ContentHash {
+			return fmt.Errorf("%w: 技能 %s 版本 %d 的内容哈希 %s 与 bundle 记录 %s 不符",
+				core.ErrAssetVersionMismatch, recorded.Name, recorded.VersionID,
+				version.ContentHash, recorded.ContentHash)
+		}
+		if strings.TrimSpace(version.StoragePath) == "" {
+			return fmt.Errorf("技能 %s 的发布版本缺少存储路径", recorded.Name)
+		}
+		files, err := parseSkillManifest(recorded.Name, version.ManifestJSON)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(files, recorded.Files) {
+			return fmt.Errorf("%w: 技能 %s 版本 %d 的文件清单与 bundle 记录不符",
+				core.ErrAssetVersionMismatch, recorded.Name, recorded.VersionID)
+		}
+		resolved.Skills = append(resolved.Skills, core.SkillVersionRef{
+			ResourceVersionRef: versionRef(recorded.Name, version),
+			Files:              files,
+		})
+		resolved.SkillDirs[recorded.Name] = version.StoragePath
+		byName[recorded.Name] = struct{}{}
+	}
+	for _, name := range profile.Skills {
+		if _, ok := byName[name]; !ok {
+			return fmt.Errorf("%w: AGENT.md 声明了技能 %s，bundle %s 未记录该技能",
+				core.ErrAssetVersionMismatch, name, bundle.Hash)
+		}
+	}
+	return nil
 }
 
 // checkDefinitionMatchesBundle 核对**清单侧**（注册表持有的已校验工作副本定义字节）
@@ -777,7 +896,7 @@ func (r *runResources) resolveMCP(ctx context.Context, name string) (core.Resour
 // "准入固定的技能"与"装进 bundle 的技能"可以不是同一版。
 // resolvePublishedSkill is the single published-skill read shared by admission and
 // asset builds; two copies could pin and package different versions.
-func resolvePublishedSkill(ctx context.Context, versions *postgres.ResourceStore, name string) (core.SkillVersionRef, core.ResourceVersion, error) {
+func resolvePublishedSkill(ctx context.Context, versions bundleRecordStore, name string) (core.SkillVersionRef, core.ResourceVersion, error) {
 	if versions == nil {
 		return core.SkillVersionRef{}, core.ResourceVersion{}, errors.New("技能读取未接资源仓储")
 	}

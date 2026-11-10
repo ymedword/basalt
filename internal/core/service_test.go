@@ -1339,6 +1339,14 @@ func (f *fakeRunResources) Resolve(_ context.Context, _ core.AgentEntry) (core.R
 	return resolved, nil
 }
 
+// ResolvePinned 按领取钉住的哈希解析；本文件的假件不区分两条路径，统一走 Resolve。
+// ResolvePinned delegates to Resolve: this fake does not model pinning.
+func (f *fakeRunResources) ResolvePinned(ctx context.Context, entry core.AgentEntry,
+	_ string,
+) (core.ResolvedResources, error) {
+	return f.Resolve(ctx, entry)
+}
+
 // callCount 是已发生的解析次数。
 func (f *fakeRunResources) callCount() int {
 	f.mu.Lock()

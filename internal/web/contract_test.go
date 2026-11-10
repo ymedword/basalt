@@ -415,7 +415,7 @@ func contractErrorCodes(t *testing.T) map[string]string {
 	return contract
 }
 
-// TestContract_ErrorCodes 逐个断言本包产生的 46 个错误码及其 HTTP 状态（§6.3 /
+// TestContract_ErrorCodes 逐个断言本包产生的 47 个错误码及其 HTTP 状态（§6.3 /
 // run-and-errors §8，含 LIMIT_REACHED 与 R4 的凭据 / 范围 / 绑定码，不含 OK），并把
 // envelope.go 的常量集合与契约表逐条对账（等价于模块卡 §6.3 行 2247 的 grep 判据）。
 // 判据面沿革（记录在 run-state）：T016 把 US-11 的集合扩到 18 个码；R4 修订把契约表
@@ -428,10 +428,11 @@ func contractErrorCodes(t *testing.T) map[string]string {
 // 46；US-24 收口评审 IDX-15 把 `RESOURCE_VERSION_MISMATCH` 按"准入窗口内漂移 409 /
 // 本地实例证明不成立 503"拆成两行后，契约表行 47、码仍 46，本表的状态列写成
 // `"409/503"`——对账口径（不得多、不得少、不得改字面量）**原样保留**，适配是扩大
-// 期望集合与允许一个码带两个状态，不是删除断言。
+// 期望集合与允许一个码带两个状态，不是删除断言。US-25C T035 并入运行期策略过期行
+// `POLICY_STALE`（503）后契约表行 48、码 47；对账口径不变。
 // 逆改点：新增一个未入契约的码常量 / 改错某个码字面量 / 从契约表删掉任一码 →
 // 表比对或常量比对红。
-// The 46 codes this package produces must equal the contract table both by literal
+// The 47 codes this package produces must equal the contract table both by literal
 // and by HTTP status; the constant set in envelope.go is reconciled the same way.
 func TestContract_ErrorCodes(t *testing.T) {
 	contract := contractErrorCodes(t)
@@ -488,9 +489,10 @@ func TestContract_ErrorCodes(t *testing.T) {
 		{"codeCredentialUnavailable", codeCredentialUnavailable, "503"},
 		{"codeAssetUnavailable", codeAssetUnavailable, "503"},
 		{"codeResourceVersionMismatch", codeResourceVersionMismatch, "409/503"},
+		{"codePolicyStale", codePolicyStale, "503"},
 		{"codeTimeout", codeTimeout, "504"},
 	}
-	require.Len(t, produced, 46, "本包产生契约 §8 的全部 46 个错误码（不含 OK）")
+	require.Len(t, produced, 47, "本包产生契约 §8 的全部 47 个错误码（不含 OK）")
 
 	byCode := make(map[string]string, len(produced))
 	byName := make(map[string]string, len(produced))
@@ -1056,6 +1058,117 @@ func TestOpenAPI_SystemSampleHasNoDiskFields(t *testing.T) {
 	require.Error(t, schema.Validate(invalid), "伪造的字符串读数必须被 schema 拒绝")
 }
 
+// TestOpenAPI_SystemOverviewWorkersFields 钉住 US-25C §3.1.6 的概览 Worker 契约：
+// `workers` 追加 `as_of` / `counts` / `total` / `truncated`，每行追加名称、宿主、构建
+// 与 schema 版本、`stopped_at`、心跳年龄 / 间隔、`stale_after_seconds` 与服务端状态。
+//
+// 三条护栏：① 嵌套对象逐层判字段集（顶层比较只覆盖 SystemOverview 自身）；② 旧行
+// （迁移前无间隔）省略 `heartbeat_interval_seconds` 而不是伪造 0，未停止行省略
+// `stopped_at`；③ 契约 description 必须写明「统计对象是进程实例，不是服务器」与
+// 「active_leases 是全库计数、不等于各行之和」。
+// 逆改点：视图漏投影任一新增字段 → 字段集红；把旧行的间隔补成 0 → 省略断言红；
+// 文案退回「N 台服务器」→ description 断言红；阈值规则写错 → helper 断言红。
+func TestOpenAPI_SystemOverviewWorkersFields(t *testing.T) {
+	doc := readContractDoc(t, "openapi.yaml")
+	interval := 10
+	view := SystemOverviewView{
+		Version:       "0.2.0",
+		UptimeSeconds: 60,
+		StartedAt:     "2026-11-09T10:00:00Z",
+		Agents:        SystemAgentsView{Total: 1, Active: 1},
+		Runs:          &SystemRunsView{},
+		Resources:     &SystemResourcesView{},
+		Workers: &SystemWorkersView{
+			AsOf:         "2026-11-09T10:00:00Z",
+			Counts:       SystemWorkerCountsView{Active: 1, Stale: 1, Stopped: 1},
+			Total:        3,
+			Truncated:    true,
+			ActiveLeases: 2,
+			Nodes: []SystemWorkerView{
+				{
+					Instance: "wrk_a", Name: "worker-a", Hostname: "host-a",
+					BuildVersion: "0.2.0", SchemaVersion: 13,
+					StartedAt: "2026-11-09T09:00:00Z", HeartbeatAt: "2026-11-09T09:59:58Z",
+					HeartbeatAgeSeconds: 2, HeartbeatIntervalSeconds: &interval,
+					StaleAfterSeconds: 30, Status: "active", ActiveLeases: 1,
+				},
+				{
+					// 迁移前旧行：没有登记间隔，阈值取部署默认；心跳 120s 前 → stale。
+					Instance: "wrk_b", Name: "worker-a", Hostname: "host-b",
+					BuildVersion: "0.2.0", SchemaVersion: 13,
+					StartedAt: "2026-11-09T09:00:00Z", HeartbeatAt: "2026-11-09T09:58:00Z",
+					HeartbeatAgeSeconds: 120, StaleAfterSeconds: 30, Status: "stale",
+				},
+				{
+					Instance: "wrk_c", Name: "worker-c", Hostname: "host-c",
+					BuildVersion: "0.1.0", SchemaVersion: 12,
+					StartedAt: "2026-11-08T09:00:00Z", HeartbeatAt: "2026-11-08T09:00:30Z",
+					StoppedAt: "2026-11-08T09:00:30Z", HeartbeatAgeSeconds: 86400,
+					HeartbeatIntervalSeconds: &interval, StaleAfterSeconds: 30,
+					Status: "stopped",
+				},
+			},
+		},
+		Database: SystemDatabaseView{Status: databaseStatusOK},
+		Auth:     SystemAuthView{Mode: "token"},
+	}
+	requireViewMatchesSchema(t, doc, "SystemOverview", view)
+
+	workersProps, ok := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "properties").(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, propertyKeySet(workersProps), viewKeys(t, *view.Workers),
+		"workers 的字段集必须与契约完全一致")
+
+	nodeProps, ok := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "properties", "nodes", "items", "properties").(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, propertyKeySet(nodeProps), viewKeys(t, view.Workers.Nodes[2]),
+		"已停止行投影全部字段（含两个可选字段）")
+	require.Subset(t, propertyKeySet(nodeProps), viewKeys(t, view.Workers.Nodes[0]),
+		"未停止行的字段集是契约子集（可选字段按 omitempty 省略）")
+
+	// 旧行 / 未停止行按契约省略：不伪造 0，也不把沉默当成已停止。
+	legacy := string(mustMarshal(t, view.Workers.Nodes[1]))
+	require.NotContains(t, legacy, "heartbeat_interval_seconds", "旧行缺值必须省略而不是伪造 0")
+	require.NotContains(t, legacy, "stopped_at", "未停止的行不得带 stopped_at")
+	require.Contains(t, legacy, `"stale_after_seconds":30`, "旧行的实际阈值仍须给出")
+
+	statusEnum, ok := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "properties", "nodes", "items", "properties", "status", "enum").([]any)
+	require.True(t, ok)
+	require.ElementsMatch(t, []any{"active", "stale", "stopped"}, statusEnum,
+		"status 是三字面量闭集")
+
+	// 措辞护栏：统计对象是进程实例不是服务器；active_leases 是全库计数。
+	desc, _ := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "description").(string)
+	require.Contains(t, desc, "进程实例，不是服务器")
+	require.Contains(t, desc, "不等于 nodes 各行之和")
+	leaseDesc, _ := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "properties", "active_leases", "description").(string)
+	require.Contains(t, leaseDesc, "全局计数")
+	totalDesc, _ := mustDig(t, doc, "components", "schemas", "SystemOverview",
+		"properties", "workers", "properties", "total", "description").(string)
+	require.Contains(t, totalDesc, "三类计数之和", "total 必须如实等于三类之和（含已停止）")
+
+	// stale_after_seconds 的取值规则：max(3 × 间隔, 30s)；旧行用部署默认。
+	ten, sixty := 10, 60
+	require.Equal(t, 30, workerStaleAfterSeconds(&ten, 60), "快心跳行按 3×10=30s")
+	require.Equal(t, 180, workerStaleAfterSeconds(&sixty, 10), "慢心跳行按 3×60=180s")
+	require.Equal(t, 30, workerStaleAfterSeconds(nil, 10), "旧行取部署默认 10s → 30s")
+	require.Equal(t, 180, workerStaleAfterSeconds(nil, 60), "旧行取部署默认 60s → 180s")
+}
+
+// propertyKeySet 把契约属性映射转成键集合，便于与视图 JSON 键集比较。
+func propertyKeySet(props map[string]any) map[string]bool {
+	keys := make(map[string]bool, len(props))
+	for key := range props {
+		keys[key] = true
+	}
+	return keys
+}
+
 // TestContract_PersistenceShapeNotSerialized 钉住 T031 的"持久形态不直接序列化"：
 // 同一份数据，core 的持久结构带 `hash` / 单数 `provider` / `detail_json` 等内部
 // 键，而 HTTP 视图必须只出契约键。
@@ -1173,7 +1286,7 @@ func TestContractAdmin_NewErrorCodes(t *testing.T) {
 	}
 	require.Equal(t, "OK", declared["codeOK"])
 	delete(declared, "codeOK")
-	require.Len(t, declared, 46, "US-24 / T035 契约落地后错误码常量恰为契约 §8 的 46 个")
+	require.Len(t, declared, 47, "US-24 / T035 / US-25C T035 契约落地后错误码常量恰为契约 §8 的 47 个")
 
 	declaredByCode := make(map[string]string, len(declared))
 	for _, code := range declared {
@@ -1671,9 +1784,15 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 			Applied:               true,
 			RevertedFromVersionID: &revertedFrom,
 		}))
+	// 技能发布触发的联动结果（US-25C）：发布块的三项都在线上形态里——契约要求
+	// 字段集与 schema 完全一致，空结果会省略 `publish`，因此样例必须带一条逐 Agent 结果。
 	requireViewMatchesSchema(t, doc, "ResourcePublishResult",
 		resourcePublishResultView(core.ResourcePublishRequest{VersionID: &revertedFrom},
-			core.ResourcePublishResult{Version: version}))
+			core.ResourcePublishResult{Version: version, Publish: []core.BundlePublishResult{{
+				Agent:  "demo-agent",
+				Status: core.BundlePublishFailed,
+				Error:  "重建 Agent 资产失败",
+			}}}))
 
 	// 引用视图：三项 R4 字段（resource_uid / bound_agents[].agent_uid /
 	// archived）都在线上形态里。
@@ -1777,6 +1896,7 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 			Agent:     "writer",
 			Lifecycle: core.AgentLifecycleView{Valid: true},
 			Files:     []core.FileEntry{{Path: "AGENT.md", Size: 12}},
+			Publish:   core.AgentPublishView{Status: core.AgentPublishStatusPublished, VersionID: 7},
 		}, `"sha256:abc"`))
 
 	// 受控工具装配的变更随保存结果返回：两个数组恒非 nil（空 = `[]`，不是 `null`）。
@@ -1784,6 +1904,7 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 	assembled := agentFilesView(core.AgentFiles{
 		Agent:   "writer",
 		Changes: core.ToolChange{Added: []string{core.NotifyToolName}},
+		Publish: core.AgentPublishView{Status: core.AgentPublishStatusFailed, Error: "保存后发布未完成"},
 	}, `"sha256:abc"`)
 	requireViewMatchesSchema(t, doc, "AgentFilesView", assembled)
 	changeJSON, err := json.Marshal(assembled.Changes)
@@ -1792,6 +1913,22 @@ func TestOpenAPI_AdminWriteViewsMatchContract(t *testing.T) {
 	emptyJSON, err := json.Marshal(agentFilesView(core.AgentFiles{Agent: "writer"}, `"sha256:abc"`).Changes)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"tools_added":[],"tools_removed":[]}`, string(emptyJSON))
+
+	// 契约把 `publish` 声明为写响应专属的可选字段（2026-11-09 用户裁决，修订
+	// D-25-10）：内容保存、创建、多文件提交、复制、恢复的成功响应恒带发布结果；
+	// 只读装配面（GET）不带，零值发布状态不得出站伪状态。
+	// publish rides on every write face; read-only responses omit the key
+	// entirely instead of inventing a status.
+	withoutPublish, err := json.Marshal(agentFilesView(core.AgentFiles{Agent: "writer"}, `"sha256:abc"`))
+	require.NoError(t, err)
+	var rawKeys map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(withoutPublish, &rawKeys))
+	_, hasPublish := rawKeys["publish"]
+	require.False(t, hasPublish, "零值发布状态必须省略 publish 键")
+
+	failedJSON, err := json.Marshal(assembled.Publish)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"status":"failed","error":"保存后发布未完成"}`, string(failedJSON))
 
 	requireViewMatchesSchema(t, doc, "AgentArchiveView", agentArchiveView(core.AgentArchiveRecord{
 		ArchiveID:   "writer-20261016T093000Z",

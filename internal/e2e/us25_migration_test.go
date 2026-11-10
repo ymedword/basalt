@@ -2,7 +2,7 @@
 
 package e2e
 
-// US-25 存量迁移验收 · M1（SQLite v6 → PostgreSQL v12）九步与跨 schema 拒绝
+// US-25 存量迁移验收 · M1（SQLite v6 → PostgreSQL，当前支持版本 v13）九步与跨 schema 拒绝
 // （FR-25-24 / FR-25-25 / FR-25-27 的制品拒绝半段）。
 //
 // 判据：从一份**真** `init` 工作区出发（真 SQLite v6 库、真名册、真内置安装意图），按 M1
@@ -41,7 +41,7 @@ package e2e
 // 逐字比对，不依赖"源库本来就有"。
 //
 // 跨 schema 拒绝（FR-25-27）：用**旧版本制品**（提交 138382f 构建的 v11 二进制）打开本
-// 用例建好的 v12 库，必须拒绝并点名两端版本；拒绝后库版本不变。制品缺失 / 无法构建时
+// 用例建好的新库（当前支持版本，US-25C 起为 v13），必须拒绝并点名两端版本；拒绝后库版本不变。制品缺失 / 无法构建时
 // 跳过并写明理由——不拿当前二进制冒充旧制品。
 //
 // 逆改点（改坏这里就会红）：
@@ -65,7 +65,7 @@ package e2e
 // import and worker boot write no business rows: agent identity, lifecycle index,
 // roster bytes, the governance fingerprint and the old bundle tree stay byte-identical,
 // and the worker's admitted run still pins the old bundle.
-// A pinned v11 binary must refuse the v12 database.
+// A pinned v11 binary must refuse the current-version database.
 
 import (
 	"archive/tar"
@@ -420,7 +420,7 @@ func us25MigrationRunM1(t *testing.T, h *harness, env []string) us25MigrationRes
 	requireContains(t, verifyDumpOut, "复核模式：dump", "db verify --dump")
 	requireContains(t, verifyDumpOut, "结论：通过", "db verify --dump")
 
-	// ⑥ 导入前：目标库先迁到 v12。`init` 只建 SQLite 源库，PostgreSQL 谱系的建表是运维
+	// ⑥ 导入前：目标库先迁到当前支持版本（v13）。`init` 只建 SQLite 源库，PostgreSQL 谱系的建表是运维
 	// 单独一步（`db migrate`）；"空目标库"指业务表零行，不是"没有表"。
 	h.ensureStore(t)
 	importRes := h.run(t, env, "db", "import", "--dump", result.Package)
@@ -723,7 +723,9 @@ func TestUS25_Migration_KnowledgeAbsentRecorded(t *testing.T) {
 }
 
 // TestUS25_Migration_CrossSchemaRefusal 覆盖 FR-25-27 的制品拒绝半段：旧版本二进制
-// （支持到 v11）不得打开 v12 库。
+// （支持到 v11）不得打开当前支持版本的库。判据里的版本字面量随
+// `SupportedSchemaVersion` 前移（US-25C 起为 13）——被拒绝的仍是"旧二进制 + 新库"
+// 这一对，拒绝语义不变。
 // TestUS25_Migration_CrossSchemaRefusal covers the artifact-side schema gate of FR-25-27.
 func TestUS25_Migration_CrossSchemaRefusal(t *testing.T) {
 	h := newHarness(t)
@@ -738,8 +740,8 @@ func TestUS25_Migration_CrossSchemaRefusal(t *testing.T) {
 	if err := h.openDB(t).QueryRow(`SELECT max(version) FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("读取目标库版本失败：%v", err)
 	}
-	if version != 12 {
-		t.Fatalf("目标库版本 = %d，要求 12（当前二进制迁移到 v12）", version)
+	if version != 13 {
+		t.Fatalf("目标库版本 = %d，要求 13（当前二进制迁移到 v13）", version)
 	}
 
 	oldBinary := us25MigrationLegacyBinary(t)
@@ -753,7 +755,7 @@ func TestUS25_Migration_CrossSchemaRefusal(t *testing.T) {
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
 	if err == nil {
-		t.Fatalf("旧版本制品在 v12 库上执行 db migrate 成功——跨 schema 拒绝失效\n%s",
+		t.Fatalf("旧版本制品在 v13 库上执行 db migrate 成功——跨 schema 拒绝失效\n%s",
 			h.redact(out.String()))
 	}
 	var exitErr *exec.ExitError
@@ -765,7 +767,7 @@ func TestUS25_Migration_CrossSchemaRefusal(t *testing.T) {
 		t.Fatalf("旧版本制品的退出码 = %d，要求 1\n%s", exitErr.ExitCode(), output)
 	}
 	for _, want := range []string{
-		"库版本 12 高于二进制支持的 11",
+		"库版本 13 高于二进制支持的 11",
 		"旧二进制不得打开新库",
 	} {
 		requireContains(t, output, want, "旧版本制品拒绝新库")
@@ -773,10 +775,10 @@ func TestUS25_Migration_CrossSchemaRefusal(t *testing.T) {
 	if err := h.openDB(t).QueryRow(`SELECT max(version) FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("拒绝后读取目标库版本失败：%v", err)
 	}
-	if version != 12 {
-		t.Fatalf("拒绝后库版本 = %d，要求仍为 12（拒绝不得改动库）", version)
+	if version != 13 {
+		t.Fatalf("拒绝后库版本 = %d，要求仍为 13（拒绝不得改动库）", version)
 	}
-	t.Logf("跨 schema 拒绝：v11 制品（提交 %s）拒绝打开 v12 库，库版本保持 12",
+	t.Logf("跨 schema 拒绝：v11 制品（提交 %s）拒绝打开 v13 库，库版本保持 13",
 		us25MigrationOldCommit[:7])
 }
 
@@ -1162,8 +1164,8 @@ func TestUS25_Migration_SingleInstanceToMultiworker(t *testing.T) {
 	if !us25ContainsLine(both, workerID) {
 		t.Fatalf("M2 收尾的在线 Worker 集合 %v 不含 %q", both, workerID)
 	}
-	if got, want := s.liveArtifactFingerprint(t, ctx), us18DefaultVersion+"|12"; got != want {
-		t.Fatalf("在线制品牌本 = %q，要求 %q（两节点必须同版本、同 schema v12）", got, want)
+	if got, want := s.liveArtifactFingerprint(t, ctx), us18DefaultVersion+"|13"; got != want {
+		t.Fatalf("在线制品牌本 = %q，要求 %q（两节点必须同版本、同 schema v13）", got, want)
 	}
 	if again := s.stableBusinessFingerprint(t, 10*time.Second); !maps.Equal(again, after) {
 		t.Fatalf("控制面重启改写了业务表：%s", us25FingerprintDiff(after, again))

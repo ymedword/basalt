@@ -51,6 +51,13 @@ var (
 	// 换模型**必须**先新建代际、校验通过再切换，**不得**在启动或请求路径里自动切换。
 	// ErrGenerationMismatch reports an active generation that differs from the spec.
 	ErrGenerationMismatch = errors.New("knowledge: active index generation does not match the requested spec")
+
+	// ErrGenerationNotInitialized 表示库里没有 active 代际：只读固定（`Pin`）不做
+	// 首代际兜底，必须由控制面先创建并激活（FR-25C-12）。与 `ErrGenerationMismatch`
+	// 分开——一个是"从未初始化"，一个是"初始化过但配置已换"。
+	// ErrGenerationNotInitialized reports that no active generation exists; only the
+	// control plane may create and activate the first one.
+	ErrGenerationNotInitialized = errors.New("knowledge: no active index generation is initialized")
 )
 
 // GenerationStatus 是 `kb_index_generations.status` 的三值闭集（契约冻结）。
@@ -305,6 +312,47 @@ func (m *GenerationManager) Ensure(ctx context.Context, spec GenerationSpec) (In
 	}
 	m.logger.InfoContext(ctx, "first index generation activated", generationAttrs(switched.Active)...)
 	return switched.Active, nil
+}
+
+// Pin 是 `Ensure` 的**只读**对照：返回与 spec 一致的 active 代际，**绝不**建行、
+// 激活或退休。Worker 的知识面必须走这里——它只读共享代际，初始化写入归控制面
+// （FR-25C-12）。没有 active 代际时失败关闭为 `ErrGenerationNotInitialized` 并点名
+// 先由控制面创建并激活；active 代际与配置不一致时仍按 `ErrGenerationMismatch`
+// 拒绝，**不得**把它当成"没初始化"再就地补建。
+// Pin is the read-only counterpart of Ensure: it never creates, activates or retires a
+// generation, and a missing active row fails closed and names the control plane.
+func (m *GenerationManager) Pin(ctx context.Context, spec GenerationSpec) (IndexGeneration, error) {
+	if err := m.ready(); err != nil {
+		return IndexGeneration{}, err
+	}
+	normalized, err := normalizeGenerationSpec(spec)
+	if err != nil {
+		return IndexGeneration{}, err
+	}
+	active, ok, err := m.store.ActiveGeneration(ctx)
+	if err != nil {
+		m.logger.ErrorContext(ctx, "index generation lookup failed",
+			"operation", "generation.pin", "error", err)
+		return IndexGeneration{}, fmt.Errorf("knowledge: 读取 active 代际失败: %w", err)
+	}
+	if !ok {
+		err := fmt.Errorf("%w: 数据库中还没有 active 索引代际——请先由控制面（serve）创建并激活，Worker 不执行代际初始化",
+			ErrGenerationNotInitialized)
+		m.logger.WarnContext(ctx, "index generation pin rejected",
+			"operation", "generation.pin", "reason", "not_initialized",
+			"embedding_model", sanitizeField(normalized.EmbeddingModel),
+			"dimensions", normalized.Dimensions)
+		return IndexGeneration{}, err
+	}
+	if mismatch := specMismatch(normalized, active); mismatch != "" {
+		err := fmt.Errorf("%w: active 代际 %d 与配置不一致（%s）——换模型 / 维度必须先新建代际、校验通过再切换",
+			ErrGenerationMismatch, active.Generation, mismatch)
+		m.logger.WarnContext(ctx, "index generation mismatch rejected",
+			append(generationAttrs(active), "operation", "generation.pin",
+				"reason", "spec_mismatch", "error", err)...)
+		return IndexGeneration{}, err
+	}
+	return active, nil
 }
 
 // Validate 校验一个非 active 代际的向量一致性：状态必须是 `building` 或 `retired`、

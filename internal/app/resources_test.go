@@ -155,32 +155,6 @@ func newRunResourcesEnv(t *testing.T) *runResourcesEnv {
 	}
 }
 
-// fixtureResourceUID 由 `(kind, id)` 派生一个**稳定**的资源身份：同一资源的多个版本
-// 必须共享一个 UID（指针与版本按 UID 对账），重复播种也要得到同一个值。载荷按
-// Crockford Base32 取模映射，与 `core.NewResourceUID` 的字符集一致。
-// fixtureResourceUID derives a stable uid for a (kind, id) pair so repeated seeding of
-// the same resource keeps one identity.
-func fixtureResourceUID(t *testing.T, kind core.ResourceKind, id string) core.ResourceUID {
-	t.Helper()
-	uid := fixtureResourceUIDFor(kind, id)
-	_, err := core.ParseResourceUID(string(uid))
-	require.NoError(t, err)
-	return uid
-}
-
-// fixtureResourceUIDFor 是 fixtureResourceUID 的无 *testing.T 版本：绑定声明要在构造
-// Agent 入口时同步给出同名 UID，那里拿不到 t。
-// fixtureResourceUIDFor is the t-free form so entry builders can declare bindings.
-func fixtureResourceUIDFor(kind core.ResourceKind, id string) core.ResourceUID {
-	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ" // 与 core 的字符集一致
-	sum := sha256.Sum256([]byte(string(kind) + "\x00" + id))
-	payload := make([]byte, 26)
-	for i := range payload {
-		payload[i] = crockford[int(sum[i%len(sum)])%len(crockford)]
-	}
-	return core.ResourceUID(core.ResourceUIDPrefix) + core.ResourceUID(payload)
-}
-
 // seedVersion 幂等写入一个资源版本行；哈希由内容原文派生，同内容天然幂等。
 // seedVersion writes one version row whose hash derives from its content.
 func (e *runResourcesEnv) seedVersion(t *testing.T, kind core.ResourceKind, id, definition, manifest, storagePath string) core.ResourceVersion {
@@ -934,16 +908,6 @@ func (e *runResourcesEnv) publishSkillVersion(t *testing.T, name string, version
 	version := e.seedVersion(t, core.ResourceSkill, name, "", skillManifest("SKILL.md"), published.Dir)
 	e.publish(t, core.ResourceSkill, name, version.ID, true)
 	return published.Dir
-}
-
-// manifestHashes 把快照清单摊平成 path → sha256。
-// manifestHashes flattens the snapshot manifest into a lookup map.
-func manifestHashes(snapshot core.ConfigSnapshot) map[string]string {
-	m := make(map[string]string, len(snapshot.Manifest))
-	for _, entry := range snapshot.Manifest {
-		m[entry.Path] = entry.SHA256
-	}
-	return m
 }
 
 // TestRunResources_SnapshotBuilderUsesPublishedCards 覆盖约束 31 的生产接线：准入结果里的

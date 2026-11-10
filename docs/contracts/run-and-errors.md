@@ -532,7 +532,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 409 | `AGENT_LIFECYCLE_STALE` | 本地生命周期代次**低于**共享索引（另一个 Worker 已推进） | 给出两侧代次；本地**不得**把旧代次写回索引 |
 | 409 | `AGENT_LIFECYCLE_MISMATCH` | 同代次内容不一致、索引行缺失 / 非 active，或准入未携带生命周期期望值（零值即拒绝） | 给出状态与代次；走管理操作单调修复，不自动放行 |
 | 409 | `RESOURCE_VERSION_MISMATCH` | 准入事务内复查发现 Provider 的 `published_version_id` / MCP 的 `applied_version_id` / 凭据 pin 在预检之后被推进或删除（发布 / apply / 轮换插进了窗口） | 说明这一笔固定的是过期事实、重试即可；被拒请求零占用；**不得**以最新为准 |
-| 503 | `ASSET_UNAVAILABLE` | `agent_bundle` 发布指针缺失 / 已软删除，或本地内容寻址目录缺失 / 不可读 | 点名 Agent 与"先执行 `basalt assets install --agent <agent>`（首次发布）或 `basalt assets install <bundle_dir>`（装入已导出副本）"；**不**自动发布本地内容为真相 |
+| 503 | `ASSET_UNAVAILABLE` | `agent_bundle` 发布指针缺失 / 已软删除，或本地内容寻址目录缺失 / 不可读；**领取记录或执行租约复核不符**（钉住哈希、租约 owner / epoch / 未释放 / 未过期任一不成立）同样归此码 | 点名 Agent 与"先执行 `basalt assets install --agent <agent>`（首次发布）或 `basalt assets install <bundle_dir>`（装入已导出副本）"；**不**自动发布本地内容为真相；领取复核失败时**零写入、零新 Run**，**不**以重放补救 |
 | 503 | `RESOURCE_VERSION_MISMATCH` | Provider / MCP 的本地实例版本证明不成立（含 MCP 尚无已应用版本），且按同一目标版本重建-换入-再比后仍不符 | 说明可重试但**不得**以最新为准；修复入口是重启服务或重新发布该资源；不回显凭据或连接细节 |
 | 410 | `GONE` | 目标已被保留策略 / 软删移除，**不再**可读（被裁剪的消息、已软删的文档与版本） | 说明已不可读与原因；不回显原文、标题或片段 |
 | 412 | `PRECONDITION_FAILED` | `If-Match` 缺失 / 不等于当前 ETag | 给出当前 ETag（可安全公开的部分） |
@@ -544,6 +544,7 @@ Run 准入与 Agent 禁用 / 启用共用**同一把按 Agent 的进程内读写
 | 500 | `INTERNAL` | 未归类错误 | **不回显内部细节**（路径、堆栈、SQL） |
 | 503 | `NOT_CONFIGURED` | 能力未配置（作者模型缺失等） | **点名配置键** + 说明怎么配 |
 | 503 | `CREDENTIAL_UNAVAILABLE` | 托管凭据无法在当前主密钥下读取（文件缺失 / 权限不符 / 格式错误 / `key_id` 不匹配 / 解密失败） | 点名固定原因；说明 env 模式不受影响；不回显密钥材料 |
+| 503 | `POLICY_STALE` | 四类运行期策略（允许域 / 拒绝域 / 网络例外 / 执行档位）最近一次成功核对已超过 `policy.max_stale`，或最近一次刷新失败 | 点名过期类别与最近成功核对时间；拒绝**新 Run**，不改写策略、不把旧快照当有效；恢复由控制面刷新后自动解除 |
 | 504 | `TIMEOUT` | Run 超过调用方时限 | 给出时限值；Run 本身记为 `cancelled` |
 
 **US-16 准入类错误的判定顺序与合并禁区**（对应三段式 `Limiter`：`AdmitIngress` / `AdmitRun` / `AdmitCall`）：

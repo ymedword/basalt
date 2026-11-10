@@ -748,6 +748,8 @@ powershell -NoProfile -File D:\code\basalt\scripts\redeploy-local.ps1 -Frontend 
 
 **Windows 启动解析陷阱（脚本已规避，手工启动同样适用）**：同目录若还留着 `bin\basalt.exe`，经 `cmd /c` 或只写无扩展名的 `bin\basalt` 启动时，CreateProcess 会按追加 `.exe` 的规则解析到 `basalt.exe`——结果是旧构建在跑、部署却报成功。演练实测：cmd 启动实际执行的是 `bin\basalt.exe`（schema 2、旧前端 0/3），改成 `Start-Process -FilePath <完整路径>` 直连后才落到新构建（schema 4、资源 3/3）。因此脚本用完整路径直接启动；手工启动也**必须**给完整路径，并用 `Get-CimInstance Win32_Process` 的 `ExecutablePath` 复核实际镜像。
 
+**发布可见性口径**：重部署只重启进程，**不**重发资产。控制台保存 / 发布在写锁内完成「先写载荷、再移动指针」，Worker 以数据库发布记录为准入权威；直接改工作区文件不会产生新的发布记录，Worker 仍按最后发布的指针准入。重部署完成后先跑 `basalt assets status`（只读、不取实例锁），核对「指针哈希 / 已安装哈希 / 载荷 / 技能物化 / 阻塞原因」；Worker 侧不一致时新 Run 按 `ASSET_*` fail-closed，等同步按「已发布资产同步」处理，**不得**用重导种子、手工改指针或反复重启冒充修复。
+
 ### 5.6 SQLite v6 → PostgreSQL 的一次性迁移与切换（US-16 起）
 
 已在 PostgreSQL 上的实例日常升级走 §5.1；本节只适用于**数据还在工作区 `basalt.db`** 的旧实例。迁移是一次性的：切过去之后 `basalt.db` 只作回退快照、不再写入，此后备份按 §4.4。
@@ -1533,7 +1535,7 @@ releasekit assemble --image-record dist/images/image-record.json \
 
 4. **复制主密钥**：把 A 导出的 `docker/secrets/master.key` 原样复制到 B 的同一路径并复核属主与权限。Worker 侧同样**不得自行生成**主密钥——同一实例出现两把有效密钥会让托管凭据半数不可解；`secrets.auto_init: false` 是这套纪律的配置面表达。容器把它只读挂到 `/run/basalt-secrets/master_key`——**不得**放进 `/run/secrets`（默认 `0755`，父目录判据会拒绝一把本来正确的密钥，§6.1）。
 
-5. **资产与种子工作区**：`assets install` 是写模式命令，运行中的 `serve` / `gateway` 全程持有实例锁，**必须停机执行**；Worker **不**执行资产安装或发布（FR-25-22）。顺序是：停控制面 → 在控制面工作区安装 bundle → 导出种子（bundle 随 `.basalt/assets` 进归档）→ 导入 Worker 卷。工作区是**命名卷**（`basalt_control-workspace` / `basalt_worker-workspace`），不是宿主目录，用一次性容器挂卷执行：
+5. **资产与种子工作区**：控制面控制台的写入（创建 Agent、内容保存、定时保存、多文件提交）在服务运行中**自动发布** bundle（`PUT /agents/{name}/content` 与 `POST /agents/{name}/files` 共用同一条发布链，2026-11-09 起），控制面自身的下一次 Run 立即按新定义准入；Worker 运行中按数据库发布记录**自动同步**，不需要把发布结果重新导出成种子。**仍然需要本步停机安装**的只有：控制台之外的改动（直接编辑工作区内的 `AGENT.md`）与存量实例升级后的首次安装。`assets install` 是写模式命令，运行中的 `serve` / `gateway` 全程持有实例锁，**必须停机执行**；Worker **不**执行资产安装或发布（FR-25-22）。顺序是：停控制面 → 在控制面工作区安装 bundle → 导出种子（bundle 随 `.basalt/assets` 进归档）→ 导入 Worker 卷。工作区是**命名卷**（`basalt_control-workspace` / `basalt_worker-workspace`），不是宿主目录，用一次性容器挂卷执行：
 
    ```sh
    # A（全程 docker/ 目录；<agent> 换成要发布的 Agent，可重复多次）
@@ -1569,7 +1571,7 @@ releasekit assemble --image-record dist/images/image-record.json \
 
    两台宿主各出现一行、`INSTANCE` 不同、心跳在 TTL 内即是「已注册」；**心跳过期不等于死亡**，归属只由租约决定（见「分布式执行」一节的「Worker 与租约排障」）。
 
-7. **资产分发**：共享发布记录是准入权威，bundle 已随第 5 步的种子进入 Worker 工作区——Worker 运行中**无法**安装（实例锁），也不应安装或发布（FR-25-22）。新增 Agent 或定义漂移时按第 5 步重做：停全部进程 → 在控制面装 bundle → 重新导出 / 导入种子。bundle 缺失或哈希不符时新 Run 在准入被 `ASSET_*` 拒绝。
+7. **资产分发**：共享发布记录是准入权威。US-25C 起，控制面发布后 Worker **运行中自动同步**（发现 → 解码校验 → 原子安装 → 技能物化 → 资源准备 → 注册表与调度刷新 → `ready` 后才领取），不需要停机、复制文件或重导种子；同步失败时已安装的旧版本目录保留、在途 Run 继续完成，但新 Run 按指针判定 fail-closed，旧版本不会被当作降级替代。`sync_interval` 只是**发现检查频率**，不是就绪时限；实际就绪受批量轮转、续扫与退避影响，可能跨多轮。用 `basalt assets status` 核对「指针 / 已安装 / 载荷 / 技能物化 / 阻塞原因」。Worker 仍**不**执行资产安装或发布（FR-25-22）；只有控制台之外的改动与存量升级首次安装需要按第 5 步停机执行。bundle 缺失或哈希不符时新 Run 在准入被 `ASSET_*` 拒绝。
 
 #### 健康检查、停机与接管
 
@@ -1594,7 +1596,7 @@ releasekit assemble --image-record dist/images/image-record.json \
 | Worker exit 78，点名名册 / 工作区 | 工作区未从种子导入；先 `seed-workspace.sh import` 再启动，**不得**让 Worker 自己建工作区 |
 | Worker 起不来，日志点名 `database_dsn` | B 上 DSN 缺失或仍指向旧主机；用 `--copy-from --db-host <A 的私网地址>` 重新准备部署目录（已有文件不覆盖，先按脚本提示处理） |
 | `workers list` 只有一行 | 第二台没连上同一个库、或 `--profile worker` 没起；先看 `docker compose -p <项目> ps` 与 Worker 日志，再看租约表 |
-| 新 Run 一律 `ASSET_UNAVAILABLE` | 共享发布记录里没有该 Agent 的 bundle 指针，或本机 bundle 与记录不一致；按「资产导出、安装与校验」在每台 Worker 装同一份 |
+| 新 Run 一律 `ASSET_UNAVAILABLE` | 共享发布记录里没有该 Agent 的 bundle 指针，或本机 bundle 与记录不一致；先跑 `basalt assets status` 看阻塞原因，再按「已发布资产同步」处理；**不得**靠重导种子 |
 
 #### 容器隔离开关（US-20 起，本档不验证）
 
@@ -1850,11 +1852,12 @@ assets:
 
 ### 资产导出、安装与校验
 
-Agent 配置与技能版本以内容寻址 bundle 分发：`manifest` + 逐文件 SHA-256 + `bundle_hash`。bundle 的内容来自**工作区**：`agents/<agent>/AGENT.md`、其 `bootstrap:` 声明的文件（工作区相对路径）与技能当前发布版本的文件。跨机器**没有**自动分发（S3 / PVC / NFS 不在本档），走"构建 → 导出 → 人工复制 → 每台安装"：
+Agent 配置与技能版本以内容寻址 bundle 分发：`manifest` + 逐文件 SHA-256 + `bundle_hash`。bundle 的内容来自**工作区**：`agents/<agent>/AGENT.md`、其 `bootstrap:` 声明的文件（工作区相对路径）与技能当前发布版本的文件。US-25C 起，**正常运行中的跨进程分发由数据库发布记录自动完成**（见下一小节「已发布资产同步」）；本小节的手工路径只用于**首次部署、存量升级首次安装和控制台之外的离线改动**（S3 / PVC / NFS 仍不在本档）：
 
 ```sh
-# 1. 首次部署（或改了 AGENT.md / bootstrap 文件 / 技能发布版本之后）：从本机工作区
-#    构建并发布。install 取工作区实例锁并写共享发布记录——服务必须已停。
+# 1. 首次部署，或在控制台之外改了 AGENT.md / bootstrap 文件 / 技能发布版本：
+#    从本机工作区构建并发布。install 取工作区实例锁并写共享发布记录——服务必须已停。
+#    控制台内的保存 / 发布会在运行中自动分发，不需要本步。
 basalt assets install --agent <agent>
 
 # 2. 在源宿主校验并导出（verify 只复算、零写入；export 先校验再逐文件复制）
@@ -1868,11 +1871,47 @@ basalt assets install ./out/<agent>-<bundle_hash>
 
 - `install --agent <agent>` 是首次部署的起点：共享发布记录里没有 `agent_bundle` 指针时，**任何** Run 都会以 `ASSET_UNAVAILABLE` 拒绝——服务器**不会**自动把工作区内容发布为真相。两种 `install` 形态互斥：`--agent` 从工作区构建，`<bundle-dir>` 只装已导出的副本。
 - 构建只读共享发布记录（生命周期身份与技能指针），写到临时暂存目录；构建失败不改动任何已安装目录。写共享记录仍发生在同一条 `install` 的发布段里：锁 → 可写库 → 发布。
-- `install` 写到 `<bundle_root>/bundles/<agent>/<bundle_hash>`，**不可变**：已存在时只做逐文件比对（一致即幂等成功，不一致拒绝且不覆盖）；截断 / 损坏的来源在复制前就拒收，不改动原目录。安装同时推进**共享**发布记录，所有 Worker 都要尽快装同一份——本机 bundle 与共享记录不一致时，新 Run 准入 fail-closed（`ASSET_UNAVAILABLE` / `ASSET_VERSION_MISMATCH`），这是设计行为，不是可以绕过的小故障。
+- `install` 写到 `<bundle_root>/bundles/<agent>/<bundle_hash>`，**不可变**：已存在时只做逐文件比对（一致即幂等成功，不一致拒绝且不覆盖）；截断 / 损坏的来源在复制前就拒收，不改动原目录。安装同时推进**共享**发布记录，运行中的 Worker 按该记录自动同步（US-25C）；同步完成前本机 bundle 与共享记录不一致时，新 Run 准入 fail-closed（`ASSET_UNAVAILABLE` / `ASSET_VERSION_MISMATCH`），这是设计行为，不是可以绕过的小故障。
 - `bundle_hash` 由配置内容与技能版本共同决定：内容不变重复安装幂等；内容变了得到新 hash 与新目录，旧目录保持原样。
 - 旧 Run 固定在它启动时的 hash 目录，不随新安装漂移；运行中的 Run 因此不受安装影响。
 - 安装目录**没有**垃圾回收：`bundles/` 下只清理写入失败的暂存目录。**不得**手工删除 `bundles/<agent>/<hash>`——在途 Run 仍按原路径读取。
 - 生命周期代次的放行条件：本地代次低于索引 → 拒绝（`AGENT_LIFECYCLE_STALE`）；高于索引**不**自动放行，需走管理操作单调修复；同代次只接受逐项内容完全一致的写入。
+
+### 已发布资产同步（US-25C 起）
+
+已发布资产（Agent 定义与配置、技能正文）以数据库发布记录为**唯一权威**；控制台保存 / 发布写入新 bundle 并推进指针，Worker 在**运行中**自动同步。发布链固定为「先写载荷、再移动指针」：载荷写失败时指针保持旧值，读者永远看不到半份内容；指针移动后各 Worker 各自按记录安装，不需要停机、复制文件或重新导出种子。
+
+Worker 的同步顺序固定：发现发布记录 → 解码并逐文件核对载荷 → 写入暂存目录后 rename 原子安装到 `<bundle_root>/bundles/<agent>/<bundle_hash>` → 把技能物化到 `<workspace>/.basalt/versions/skills/**` → 准备 Provider / MCP 等资源 → 刷新注册表与调度 → 标记 `ready` 后才允许领取。写入面只有这两处；工作区内容、`state/`、`runs/` 与业务状态不被覆盖。在途 Run 继续使用领取时钉住的 bundle 哈希，新发布只影响后续领取。
+
+`assets.sync_interval`（默认 30s）是**发现检查频率**，不是就绪时限：实际就绪还受 `sync_batch`（默认 50）轮转、完整扫描（`full_scan_every`，默认 20 轮）与失败退避影响，可能跨多轮。撤回 / 删除与迟到的发布靠下一趟完整全量扫描发现；单轮超时 `sync_timeout`（默认 20s），载荷上限 `max_bundle_bytes`（默认 16 MiB）。已 `ready` 的条目不再重读载荷，要观察一次新的恢复需发布一个新哈希。
+
+**只读诊断**：`basalt assets status` 逐 Agent 打印「指针哈希 / 已安装哈希 / 载荷 / 技能物化 / 阻塞原因」，末尾汇总 `agents=N ready=N blocked=N`。它不触发同步、不取实例锁、不写库，服务运行中可直接执行。
+
+| 读数（`status`） | 含义 |
+| --- | --- |
+| 载荷 `present` | 指针版本对应载荷存在且自洽 |
+| 载荷 `payload_missing` / `payload_unavailable` | 载荷缺失 / 读取失败；存量指针由控制面升级时回填，回填前如实标注 |
+| 技能物化 `materialized` / `skills_unavailable` / `unknown` | 已物化 / 物化缺失 / 尚未安装，无可核对对象 |
+| 阻塞原因 `not_installed` / `corrupt` / `skills_unavailable` / `payload_missing` / `payload_unavailable` | 尚未就绪的机器可读原因；就绪时显示 `—` |
+
+**准入失败原因**（fail-closed，不降级到旧版本）：
+
+- `ASSET_UNAVAILABLE`（409）：共享发布记录没有该 Agent 的指针，或本机目录与记录不一致。
+- `ASSET_VERSION_MISMATCH`（409）：本机已安装哈希与指针不一致（点名 Agent）；手动 / 交互 Run 直接拒绝，等同步完成。
+- `POLICY_STALE`（503）：策略快照超过 `policy.max_stale` 未成功核对；恢复后下一次刷新放行，**不得**放宽阈值绕过。
+- `AGENT_LIFECYCLE_STALE`：本地生命周期代次低于索引；高于索引不自动放行，走管理操作单调修复。
+
+**恢复路径**（按顺序，**不要重导种子**）：
+
+1. 先跑 `basalt assets status`，按「阻塞原因」区分是载荷、本机目录还是技能物化问题。
+2. `payload_missing` / `payload_unavailable`：查数据库侧（等待控制面存量回填，或确认读取权限 / 连接）；**不得**手工写空载荷或手改指针。
+3. 本机目录损坏：按同步报告定位该哈希；只有确认没有在途 Run 使用该哈希时，才可在停机窗口移除坏目录并等同步重装。**不得**删除在途 Run 仍在读取的其他哈希。
+4. 技能物化缺失：等待同步重试；连续失败会在同步信息里保留原因，必要时重新发布技能以触发联动重发。
+5. 未确认副作用的调用保持「停止 / 待查」，**不得**自动重放。
+
+**不要重导种子，也不要反复重启碰运气**：重导种子会覆盖 Worker 工作区，却不解决技能物化、生命周期代次、Provider / MCP 与策略联动；重启也不会让已 `ready` 的条目重新读载荷。种子的作用只剩首次部署与存量升级（见上一小节）。
+
+**已知边界**：本档不自动清理旧载荷，跨哈希体积单调增长（登记为 D-25C-09）；资产同步不等于共享工作区或业务状态——每个 Worker 保留自己的工作区与运行记录。
 
 ### 停机顺序
 

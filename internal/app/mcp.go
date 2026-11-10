@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -30,8 +31,12 @@ import (
 // connected name lists, both kept in file order because order is the registration
 // criterion.
 type mcpRuntime struct {
-	specs []core.MCPServerConfig
-	conns []tool.MCPConnection
+	// specsMu 护住配置名单的换入与读取（US-25C §2.3.8 M5）：同步轮次会在运行期换名单，
+	// 装载器 / 视图同时在读；名单可增长，但**不得**因换名单重建已有连接。
+	// specsMu guards the configured-name list; replacing it never rebuilds live connections.
+	specsMu sync.RWMutex
+	specs   []core.MCPServerConfig
+	conns   []tool.MCPConnection
 	// supervisor 非 nil 时，连接与工具名单实时取自 supervisor 快照——US-12 起连接
 	// 生命周期归 supervisor，句柄不再持有连接池结果（`conns` 只服务无 supervisor
 	// 的测试夹具与旧装配路径）。
@@ -69,10 +74,31 @@ func mcpRevokerOf(runtime *mcpRuntime) func(ctx context.Context, name string) er
 	return runtime.supervisor.RevokeServer
 }
 
+// ReplaceSpecs 换入一份新的配置名单（US-25C §2.3.8 M5）：互斥替换、按文件序保存；
+// 只换名单，**不**重建已有连接——新 server 由下一轮准备按 P4 首次连接，旧 server 的
+// 连接与工具代际原样保留。空名单同样是合法读数（发布被删空）。
+// ReplaceSpecs swaps the configured-name list; live connections are never rebuilt here.
+func (m *mcpRuntime) ReplaceSpecs(specs []core.MCPServerConfig) {
+	if m == nil {
+		return
+	}
+	m.specsMu.Lock()
+	m.specs = slices.Clone(specs)
+	m.specsMu.Unlock()
+}
+
+// specsSnapshot 返回配置名单的只读副本（持锁复制，调用方改动不影响内部）。
+// specsSnapshot copies the configured list under the lock.
+func (m *mcpRuntime) specsSnapshot() []core.MCPServerConfig {
+	m.specsMu.RLock()
+	defer m.specsMu.RUnlock()
+	return slices.Clone(m.specs)
+}
+
 // ConfiguredNames 返回已配置 server 名（文件序）——装载器据此判定"声明了不存在的 server"。
 // ConfiguredNames lists the configured servers in file order.
 func (m *mcpRuntime) ConfiguredNames() []string {
-	return mcpConfigNames(m.specs)
+	return mcpConfigNames(m.specsSnapshot())
 }
 
 // mcpConfigNames 按给定顺序列出 server 名；启动早期的第一遍装载在发布版本尚不存在时
@@ -92,8 +118,9 @@ func mcpConfigNames(specs []core.MCPServerConfig) []string {
 func (m *mcpRuntime) ConnectedNames() []string {
 	if m.supervisor != nil {
 		snapshot := m.supervisor.Snapshot()
-		names := make([]string, 0, len(m.specs))
-		for _, spec := range m.specs {
+		specs := m.specsSnapshot()
+		names := make([]string, 0, len(specs))
+		for _, spec := range specs {
 			if status, ok := snapshot[spec.Name]; ok && status.Connected {
 				names = append(names, spec.Name)
 			}
@@ -277,24 +304,7 @@ func publishedMCPServers(ctx context.Context, store *postgres.ResourceStore, fil
 	if err != nil {
 		return nil, fmt.Errorf("读取已发布 MCP server 指针: %w", err)
 	}
-	byName := make(map[string]core.ResourcePointer, len(pointers))
-	for _, pointer := range pointers {
-		byName[pointer.ResourceID] = pointer
-	}
-	ordered := make([]core.ResourcePointer, 0, len(pointers))
-	seen := make(map[string]struct{}, len(pointers))
-	for _, name := range fileOrder {
-		if pointer, ok := byName[name]; ok {
-			ordered = append(ordered, pointer)
-			seen[name] = struct{}{}
-		}
-	}
-	for _, pointer := range pointers { // ListPointers 已按 resource_id 升序
-		if _, ok := seen[pointer.ResourceID]; ok {
-			continue
-		}
-		ordered = append(ordered, pointer)
-	}
+	ordered := orderMCPPointers(pointers, fileOrder)
 
 	servers := make([]core.PublishedMCPServer, 0, len(ordered))
 	for _, pointer := range ordered {
@@ -325,6 +335,23 @@ func publishedMCPServers(ctx context.Context, store *postgres.ResourceStore, fil
 			cfg, backfillOperation, now()); err != nil {
 			return nil, err
 		}
+		// 代次冻结发生在占位解析**之前**（US-25C §2.3.8 P6）：若窗口内恰好换代，代次读到的
+		// 是旧值而解析拿到新值——下一轮会因代次不符多重建一次（安全方向）；反过来先解析后
+		// 冻结则可能把新代次配旧明文记进连接，让复用判据永远为真。方向选择不对称，取前者。
+		// Freeze before resolve: a rotation inside the window costs one extra rebuild, while
+		// the opposite order could pin a new generation onto a connection holding old material.
+		frozen, err := credentials.Freeze(ctx, pointer.ResourceID, pointer.ResourceUID, cfg)
+		if err != nil {
+			if !mcpCredentialUnavailable(err) {
+				return nil, err
+			}
+			if logger != nil {
+				logger.Warn("MCP server 凭据不可用，本次启动跳过该 server（其余照常；页面显示未就绪）",
+					"server", pointer.ResourceID, "error", err)
+			}
+			continue
+		}
+		generation := mcpCredentialGeneration(frozen)
 		// 占位解析发生在**任何连接之前**（技术方案 §3.7）：只按声明的来源取值，
 		// `managed` 失败即失败、不回落 env；错误里只有 server / 槽位 / 变量名，没有值。
 		// Resolution happens before any connection and follows the declared source only.
@@ -345,13 +372,128 @@ func publishedMCPServers(ctx context.Context, store *postgres.ResourceStore, fil
 		}
 		resolved := ApplyResolvedMCP(cfg, values)
 		ZeroMCPCredentialValues(values)
-		servers = append(servers, core.PublishedMCPServer{VersionID: version.ID, Config: resolved})
+		servers = append(servers, core.PublishedMCPServer{
+			VersionID: version.ID, CredentialGeneration: generation, Config: resolved,
+		})
 	}
 	return servers, nil
 }
 
-// mcpCredentialResolver 是装配期需要的两个凭据动作：按声明来源解析，与补记来源事实。
-// `*MCPCredentialService` 是唯一实现。
+// orderMCPPointers 按配置文件序列出指针，文件里已删但指针保留的排在其后、按
+// resource_id 升序（`ListPointers` 已按该序返回）。返回顺序即连接与注册顺序。
+// orderMCPPointers orders configured servers first, then pointer-only servers.
+func orderMCPPointers(pointers []core.ResourcePointer, fileOrder []string) []core.ResourcePointer {
+	byName := make(map[string]core.ResourcePointer, len(pointers))
+	for _, pointer := range pointers {
+		byName[pointer.ResourceID] = pointer
+	}
+	ordered := make([]core.ResourcePointer, 0, len(pointers))
+	seen := make(map[string]struct{}, len(pointers))
+	for _, name := range fileOrder {
+		if pointer, ok := byName[name]; ok {
+			ordered = append(ordered, pointer)
+			seen[name] = struct{}{}
+		}
+	}
+	for _, pointer := range pointers {
+		if _, ok := seen[pointer.ResourceID]; ok {
+			continue
+		}
+		ordered = append(ordered, pointer)
+	}
+	return ordered
+}
+
+// publishedMCPPrepareTargets 是 Worker 侧的**只读**发布解析（US-25C §2.3.8 M4）：
+// 与 `publishedMCPServers` 读同一批指针，但**不**调用 `BackfillEnvSources`——来源补记
+// 是控制面的启动写。applied 指针存在时读**applied 那一版**、按声明来源只读解析凭据
+// 并组装准备输入；未 applied 的条目只列名字，不连接、不隐式 apply（D-12）。
+//
+// 返回的 configs 与 targets 同源（同一轮快照）：`mcpRuntime.ReplaceSpecs` 换入的名集
+// 因此不会比本轮判定多出或缺少条目。凭据当前取不到值的 applied 条目沿用启动隔离口径
+// ——WARN 后跳过该条（其余照常），页面经资源视图看到它的槽位状态。
+// publishedMCPPrepareTargets resolves published MCP servers read-only: applied pointers
+// are resolved by declared source without the backfill write path; the never-applied
+// ones are listed by name only. It never writes an applied pointer.
+func publishedMCPPrepareTargets(ctx context.Context, store *postgres.ResourceStore,
+	fileOrder []string, credentials mcpCredentialResolver, logger *slog.Logger,
+) ([]mcpPrepareTarget, []core.MCPServerConfig, error) {
+	if credentials == nil {
+		return nil, nil, errors.New("解析已发布 MCP server: 本次装配没有 MCP 凭据面——来源无法按声明解析")
+	}
+	pointers, err := store.ListPointers(ctx, core.ResourceMCPServer)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取已发布 MCP server 指针: %w", err)
+	}
+	ordered := orderMCPPointers(pointers, fileOrder)
+	targets := make([]mcpPrepareTarget, 0, len(ordered))
+	configs := make([]core.MCPServerConfig, 0, len(ordered))
+	for _, pointer := range ordered {
+		if pointer.AppliedVersionID == nil {
+			targets = append(targets, mcpPrepareTarget{Name: pointer.ResourceID})
+			configs = append(configs, core.MCPServerConfig{Name: pointer.ResourceID})
+			continue
+		}
+		version, err := store.VersionByID(ctx, *pointer.AppliedVersionID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("读取 MCP server %s 的 applied 版本 %d: %w",
+				pointer.ResourceID, *pointer.AppliedVersionID, err)
+		}
+		if version.Kind != core.ResourceMCPServer || version.ResourceID != pointer.ResourceID {
+			return nil, nil, fmt.Errorf("MCP server %s 的 applied 版本 %d 归属不符（got %s/%s）",
+				pointer.ResourceID, version.ID, version.Kind, version.ResourceID)
+		}
+		cfg, err := workspace.ParseMCPServerBlock([]byte(version.DefinitionYAML))
+		if err != nil {
+			return nil, nil, fmt.Errorf("MCP server %s 的 applied 版本 %d 定义非法: %w",
+				pointer.ResourceID, version.ID, err)
+		}
+		if cfg.Name != pointer.ResourceID {
+			return nil, nil, fmt.Errorf("MCP server %s 的 applied 版本 %d 条目名 %q 与资源标识不一致",
+				pointer.ResourceID, version.ID, cfg.Name)
+		}
+		// 代次冻结先于解析（P6）：窗口内换代只会多重建一次，反序则可能把新代次配旧明文。
+		// Freeze before resolve, for the same asymmetry P6 documents.
+		frozen, err := credentials.Freeze(ctx, pointer.ResourceID, pointer.ResourceUID, cfg)
+		if err != nil {
+			if !mcpCredentialUnavailable(err) {
+				return nil, nil, err
+			}
+			if logger != nil {
+				logger.Warn("MCP server 凭据不可用，本轮跳过该 server（其余照常；页面显示未就绪）",
+					"server", pointer.ResourceID, "error", err)
+			}
+			continue
+		}
+		values, err := credentials.Resolve(ctx, pointer.ResourceID, pointer.ResourceUID, cfg)
+		if err != nil {
+			if !mcpCredentialUnavailable(err) {
+				return nil, nil, err
+			}
+			if logger != nil {
+				logger.Warn("MCP server 凭据不可用，本轮跳过该 server（其余照常；页面显示未就绪）",
+					"server", pointer.ResourceID, "error", err)
+			}
+			continue
+		}
+		resolved := ApplyResolvedMCP(cfg, values)
+		ZeroMCPCredentialValues(values)
+		targets = append(targets, mcpPrepareTarget{
+			Name:    pointer.ResourceID,
+			Applied: true,
+			Published: core.PublishedMCPServer{
+				VersionID:            version.ID,
+				CredentialGeneration: mcpCredentialGeneration(frozen),
+				Config:               resolved,
+			},
+		})
+		configs = append(configs, resolved)
+	}
+	return targets, configs, nil
+}
+
+// mcpCredentialResolver 是装配期需要的凭据动作：按声明来源解析、补记来源事实，以及
+// 冻结本次连接依赖的凭据代次（US-25C §2.3.8 P6）。`*MCPCredentialService` 是唯一实现。
 // mcpCredentialResolver is the assembly-time credential face; the service is its only
 // implementation.
 type mcpCredentialResolver interface {
@@ -359,6 +501,110 @@ type mcpCredentialResolver interface {
 		cfg core.MCPServerConfig) (map[string]string, error)
 	BackfillEnvSources(ctx context.Context, serverName string, serverUID core.ResourceUID,
 		cfg core.MCPServerConfig, operationID string, at time.Time) (core.MCPBackfillReport, error)
+	Freeze(ctx context.Context, serverName string, serverUID core.ResourceUID,
+		cfg core.MCPServerConfig) ([]mcpCredentialFreeze, error)
+}
+
+// mcpPrepareVerifyStore 是换入前复核要读的两行：指针与 applied 版本定义。生产实现是
+// `*postgres.ResourceStore`；定义在消费方是为了让分支判定可离线判卷。
+// mcpPrepareVerifyStore is the two rows the pre-swap recheck reads.
+type mcpPrepareVerifyStore interface {
+	Pointer(ctx context.Context, kind core.ResourceKind, resourceID string) (core.ResourcePointer, error)
+	VersionByID(ctx context.Context, id int64) (core.ResourceVersion, error)
+}
+
+// mcpPrepareVerifyCredentials 是复核需要的凭据面：冻结当前读数并判撤销。生产实现是
+// `*MCPCredentialService`。
+// mcpPrepareVerifyCredentials is the credential face the recheck needs.
+type mcpPrepareVerifyCredentials interface {
+	mcpCredentialResolver
+	StillCurrent(ctx context.Context, serverUID core.ResourceUID,
+		frozen []mcpCredentialFreeze) (bool, error)
+}
+
+// newMCPPrepareVerify 构造同步准备路径的**换入前只读复核**（US-25C §2.3.8 提交复核分支
+// 表）：在 `commitReplace` 的同一临界区（`ResourceGate → entry.mu`）内执行——
+//  1. 指针行仍存在且未软删除；
+//  2. `derefVersionID(pointer.AppliedVersionID) == 目标版本`；
+//  3. 由 applied 版本的**原文**定义重新冻结凭据代次并 `StillCurrent`：任一不符（换代 /
+//     撤销 / 删除）都按 `revoke` 取代。
+//
+// 冻结必须读原文定义：`published.Config` 已把 `${VAR}` 解析成明文，`MCPCredentialSlots`
+// 在它上面读不到槽位，代次会恒为空而与目标代次不符。任一失败都返回可分类的取代原因，
+// 换入两侧因此都不改变；查询失败返回错误（失败关闭，不把跳过复核当成功）。
+// newMCPPrepareVerify builds the read-only pre-swap recheck: pointer alive, applied still
+// the target, and the target's raw definition still yields the same live credential
+// generation. Any mismatch is a classified supersede; errors fail closed.
+func newMCPPrepareVerify(store mcpPrepareVerifyStore, credentials mcpPrepareVerifyCredentials,
+) func(context.Context, core.PublishedMCPServer) (core.MCPApplySupersededBy, error) {
+	return func(ctx context.Context, published core.PublishedMCPServer) (core.MCPApplySupersededBy, error) {
+		name := published.Config.Name
+		if store == nil || credentials == nil {
+			return core.MCPApplySupersededByNone,
+				errors.New("MCP 换入前复核未接线：缺指针读取面或凭据面")
+		}
+		pointer, err := store.Pointer(ctx, core.ResourceMCPServer, name)
+		if err != nil {
+			if errors.Is(err, core.ErrResourceNotFound) {
+				// 行已不存在：发布 / 撤销都先改指针，没有可换入的依据。
+				return core.MCPApplySupersededByApply, nil
+			}
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 换入前复核读取指针: %w", name, err)
+		}
+		if pointer.DeletedAt != nil {
+			return core.MCPApplySupersededByApply, nil
+		}
+		if derefVersionID(pointer.AppliedVersionID) != published.VersionID {
+			// 与 `commitMCPApply` 同一分类口径：发布推进了指针 → publish；只有 applied
+			// 变了 → 另一次 apply。
+			if pointer.PublishedVersionID != published.VersionID {
+				return core.MCPApplySupersededByPublish, nil
+			}
+			return core.MCPApplySupersededByApply, nil
+		}
+		version, err := store.VersionByID(ctx, published.VersionID)
+		if err != nil {
+			if errors.Is(err, core.ErrResourceNotFound) {
+				return core.MCPApplySupersededByPublish, nil
+			}
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 换入前复核读取目标版本 %d: %w", name, published.VersionID, err)
+		}
+		if version.Kind != core.ResourceMCPServer || version.ResourceID != name {
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 的目标版本 %d 归属不符（got %s/%s）",
+					name, version.ID, version.Kind, version.ResourceID)
+		}
+		raw, err := workspace.ParseMCPServerBlock([]byte(version.DefinitionYAML))
+		if err != nil {
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 的目标版本 %d 定义非法: %w", name, version.ID, err)
+		}
+		frozen, err := credentials.Freeze(ctx, name, pointer.ResourceUID, raw)
+		if err != nil {
+			if mcpCredentialUnavailable(err) {
+				// 槽位来源被删 / 托管值不可得：与撤销同档，候选不得换入。
+				return core.MCPApplySupersededByRevoke, nil
+			}
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 换入前复核冻结凭据: %w", name, err)
+		}
+		if mcpCredentialGeneration(frozen) != published.CredentialGeneration {
+			// 目标构建之后发生了凭据换代：候选连接用的是旧代次，不得换入。
+			return core.MCPApplySupersededByRevoke, nil
+		}
+		still, err := credentials.StillCurrent(ctx, pointer.ResourceUID, frozen)
+		if err != nil {
+			return core.MCPApplySupersededByNone,
+				fmt.Errorf("MCP server %s 换入前复核判定凭据撤销: %w", name, err)
+		}
+		if !still {
+			// 版本号未变而状态被撤销 / 删除：代次摘要看不出状态，必须由 StillCurrent 判。
+			return core.MCPApplySupersededByRevoke, nil
+		}
+		return core.MCPApplySupersededByNone, nil
+	}
 }
 
 // mcpPublishedConfigs 抽取配置（运行期句柄只要配置与文件序名集）。

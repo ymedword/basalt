@@ -4,7 +4,8 @@ package e2e
 
 // US-25 容器验收 · 两节点升级与整组回滚（FR-25-27 / US5）。
 //
-// 同 schema 边界：US-24 与 US-25 都停在 v12，新控制面启动时**没有迁移可跑**——本用例
+// 同 schema 边界：两枚测试镜像都由当前源码构建（US-25C 起 schema 均为 v13），新控制面
+// 启动时**没有迁移可跑**——本用例
 // 因此不宣称"制品版本门禁"；跨 schema 的制品拒绝由
 // TestUS25_Migration_CrossSchemaRefusal（us25_migration_test.go）用旧版本二进制实测，
 // 本用例只验同 schema 下的另一半：停全部旧进程、制品一致（两个容器同一镜像 ID）、
@@ -15,7 +16,7 @@ package e2e
 //     把已发布资产种子给 Worker，再起控制面凑齐两个在线节点。
 //  1. 停全部旧进程（各自退出码 0、在线 Worker 归零），备份 PostgreSQL（pg_dump -Fc）、
 //     两个工作区（tar）、主密钥（字节副本 + 摘要）与旧制品（docker save）。
-//  2. 换镜像 B 强制重建两个容器：schema 仍 12、build_version 变 B、两个容器镜像 ID
+//  2. 换镜像 B 强制重建两个容器：schema 仍 13、build_version 变 B、两个容器镜像 ID
 //     相同且与 A 不同；业务表、身份索引、生命周期文件、名册与 h0 资产树逐字不变；
 //     新执行仍钉住 h0 并正常准入。
 //  3. 停机后在工作区制造定义漂移并 `assets install`：发布指针推进到新 bundle h1。
@@ -215,8 +216,8 @@ func TestUS25_Upgrade_TwoNodeAbortAndRollback(t *testing.T) {
 			t.Fatalf("%s 容器跑的镜像 ID 是 %s，要求与镜像 A（%s）一致", service, got, idA)
 		}
 	}
-	if got := s.liveArtifactFingerprint(t, ctx); got != us18DefaultVersion+"|12" {
-		t.Fatalf("基线在线节点的制品读数是 %q，要求 %q", got, us18DefaultVersion+"|12")
+	if got := s.liveArtifactFingerprint(t, ctx); got != us18DefaultVersion+"|13" {
+		t.Fatalf("基线在线节点的制品读数是 %q，要求 %q", got, us18DefaultVersion+"|13")
 	}
 
 	baseline := s.stableBusinessFingerprint(t, 5*time.Second)
@@ -225,8 +226,8 @@ func TestUS25_Upgrade_TwoNodeAbortAndRollback(t *testing.T) {
 	baselineRoster := us25VolumeText(t, s, ctx, controlVolume, us25VolumeRosterRel)
 	baselineWorkerRoster := us25VolumeText(t, s, ctx, workerVolume, us25VolumeRosterRel)
 	baselineBundle := us25VolumeTreeText(t, s, ctx, controlVolume, us25BundleRel(bundleA))
-	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "12" {
-		t.Fatalf("基线 schema 版本是 %q，本用例的判据按 v12 组织", got)
+	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "13" {
+		t.Fatalf("基线 schema 版本是 %q，本用例的判据按 v13 组织", got)
 	}
 	baselineKeyDigest := s.masterKeyDigest(t, ctx)
 	if got := s.instanceID(t, baselineRoster); got != s.instanceID(t, baselineWorkerRoster) {
@@ -263,11 +264,11 @@ func TestUS25_Upgrade_TwoNodeAbortAndRollback(t *testing.T) {
 			t.Fatalf("%s 容器跑的镜像 ID 是 %s，要求与镜像 B（%s）一致（制品必须整组切换）", service, got, idB)
 		}
 	}
-	if got := s.liveArtifactFingerprint(t, ctx); got != us18UpgradeVersion+"|12" {
-		t.Fatalf("升级后在线节点的制品读数是 %q，要求 %q", got, us18UpgradeVersion+"|12")
+	if got := s.liveArtifactFingerprint(t, ctx); got != us18UpgradeVersion+"|13" {
+		t.Fatalf("升级后在线节点的制品读数是 %q，要求 %q", got, us18UpgradeVersion+"|13")
 	}
-	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "12" {
-		t.Fatalf("同 schema 升级后版本是 %q，要求仍为 12（本用例不宣称制品版本门禁）", got)
+	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "13" {
+		t.Fatalf("同 schema 升级后版本是 %q，要求仍为 13（本用例不宣称制品版本门禁）", got)
 	}
 
 	// 升级本身不改写业务面：指纹、身份、状态文件、名册与资产树逐字不变。
@@ -368,11 +369,11 @@ func TestUS25_Upgrade_TwoNodeAbortAndRollback(t *testing.T) {
 			t.Fatalf("回滚后 %s 容器跑的镜像 ID 是 %s，要求镜像 A（%s）", service, got, idA)
 		}
 	}
-	if got := s.liveArtifactFingerprint(t, ctx); got != us18DefaultVersion+"|12" {
-		t.Fatalf("回滚后在线节点的制品读数是 %q，要求 %q", got, us18DefaultVersion+"|12")
+	if got := s.liveArtifactFingerprint(t, ctx); got != us18DefaultVersion+"|13" {
+		t.Fatalf("回滚后在线节点的制品读数是 %q，要求 %q", got, us18DefaultVersion+"|13")
 	}
-	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "12" {
-		t.Fatalf("回滚后 schema 版本是 %q，要求仍是 12", got)
+	if got := s.psql(t, "SELECT max(version)::text FROM schema_version"); got != "13" {
+		t.Fatalf("回滚后 schema 版本是 %q，要求仍是 13", got)
 	}
 
 	// 四件备份全部生效：数据库、两个工作区、主密钥都回到基线。

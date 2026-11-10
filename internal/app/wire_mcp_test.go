@@ -129,7 +129,7 @@ func TestWire_MCPToolsRegisteredAfterEqualityGate(t *testing.T) {
 
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err, "等值门禁必须先于 MCP 注册，否则装配直接失败")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 
@@ -155,7 +155,7 @@ func TestWire_DuplicateMCPToolKeepsBuiltin(t *testing.T) {
 
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 
@@ -181,7 +181,7 @@ func TestWire_AgentDeclaringFailedMCPToolIsNotRegistered(t *testing.T) {
 	connector := &fakeMCPConnector{conns: nil}
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err, "连接失败不得中断启动")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 	require.NotContains(t, rt.registry.Names(), "broken_probe")
@@ -213,7 +213,7 @@ func TestWire_AgentDeclaringFailedServerOnlyIsNotRegistered(t *testing.T) {
 	connector := &fakeMCPConnector{} // 零连接：broken 已配置但未连接
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err, "连接失败不得中断启动")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 
@@ -233,7 +233,7 @@ func TestWire_ConnectCanceledAbortsAndClosesPool(t *testing.T) {
 	connector := &fakeMCPConnector{err: context.Canceled}
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.Error(t, err, "整体取消必须中断装配（其余失败才吸收为跳过）")
 	require.Nil(t, rt)
 	require.True(t, connector.closed, "装配失败必须关闭连接池——半开会话不得留过启动")
@@ -253,7 +253,7 @@ func TestWire_StartupSummaryCountsConnectedServers(t *testing.T) {
 
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 
@@ -276,7 +276,7 @@ func TestWire_MCPConfigChangesNeedRestart(t *testing.T) {
 	}}}
 	app := fx.app()
 	app.mcpConnect = first
-	rt1, err := app.newRuntime(context.Background())
+	rt1, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	require.Contains(t, rt1.registry.Names(), "alpha_tool")
 
@@ -294,7 +294,7 @@ func TestWire_MCPConfigChangesNeedRestart(t *testing.T) {
 	}}}
 	app2 := fx.app()
 	app2.mcpConnect = second
-	rt2, err := app2.newRuntime(context.Background())
+	rt2, err := app2.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rt2.Close()) })
 
@@ -339,7 +339,7 @@ func TestWire_CloseClosesMCPBeforeDatabase(t *testing.T) {
 	}
 	app := fx.app()
 	app.mcpConnect = connector
-	got, err := app.newRuntime(context.Background())
+	got, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	rt = got
 	require.NoError(t, rt.Close())

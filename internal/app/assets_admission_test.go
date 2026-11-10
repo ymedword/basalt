@@ -267,7 +267,7 @@ func (e *assetsAdmissionEnv) buildAndInstall(t *testing.T, ctx context.Context,
 // publishBundle writes the installed bundle into the shared record.
 func (e *assetsAdmissionEnv) publishBundle(t *testing.T, installed assets.Installed) int64 {
 	t.Helper()
-	versionID, err := newBundlePublisher(e.versions, e.ops, nil, time.Now).
+	versionID, err := newBundlePublisher(e.versions, e.ops, postgres.NewBundlePayloadStore(e.db), defaultPayloadMaxBytes, nil, time.Now).
 		Publish(context.Background(), installed)
 	require.NoError(t, err)
 	return versionID
@@ -591,7 +591,7 @@ func TestAssets_FirstDeployFromEmptyWorkspace(t *testing.T) {
 				workspaceBundleDeps{Root: env.root, Versions: env.versions}, agent, uid, dest)
 		},
 		Publish: func(ctx context.Context, installed assets.Installed) (int64, error) {
-			return newBundlePublisher(env.versions, env.ops, nil, time.Now).Publish(ctx, installed)
+			return newBundlePublisher(env.versions, env.ops, postgres.NewBundlePayloadStore(env.db), defaultPayloadMaxBytes, nil, time.Now).Publish(ctx, installed)
 		},
 	}, []string{"install", "--agent", "writer"})
 	require.NoError(t, err, "首次部署必须有一条出货命令可用，而不是要求自写构建程序")

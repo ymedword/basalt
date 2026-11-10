@@ -249,7 +249,8 @@ func (f *wireFixture) seedPublishedBundles(t *testing.T) {
 
 	versions := postgres.NewResourceStore(db)
 	operations := postgres.NewManagementStore(db)
-	publisher := newBundlePublisher(versions, operations, f.logger, time.Now)
+	publisher := newBundlePublisher(versions, operations, postgres.NewBundlePayloadStore(db),
+		defaultPayloadMaxBytes, f.logger, time.Now)
 	// 资产根与运行期同一解析口径（`assets.bundle_root` 的缺省值 + 进程工作目录）：
 	// 夹具装的目录必须就是准入要读的目录，否则这条判据本身就成了假象。
 	assetRoot := resolveAssetBundleRoot(f.cfg, f.workDir)
@@ -349,7 +350,7 @@ func (f *wireFixture) assemble(t *testing.T) *heavyRuntime {
 	// `seedPublishedProviders`）；不种子时基线会另发一个身份，绑定必然对不上。
 	// The probe must already be published so the fixture's bindings name a real pointer.
 	f.seedPublishedProviders(t)
-	rt, err := f.app().newRuntime(context.Background())
+	rt, err := f.app().newRuntime(context.Background(), roleControl)
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() {
 		err := rt.Close()
@@ -643,7 +644,7 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 	t.Run("Release 之后可再次装配", func(t *testing.T) {
 		require.NoError(t, rt.Close(), "释放失败不得静默")
 
-		second, err := fx.app().newRuntime(context.Background())
+		second, err := fx.app().newRuntime(context.Background(), roleControl)
 		require.NoError(t, err, "句柄关掉后锁必须回到可取得状态——锁没放回时这里会红")
 		require.NoError(t, second.Close())
 	})
@@ -655,7 +656,7 @@ func TestWire_HeavyPathStepsAppearInOrder(t *testing.T) {
 			logger:           fx.logger,
 			cfg:              fx.cfg,
 		}
-		_, err := bare.newRuntime(context.Background())
+		_, err := bare.newRuntime(context.Background(), roleControl)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "basalt init", "骨架缺失要给出可操作的指引，而不是裸 ENOENT")
 	})
@@ -1252,7 +1253,7 @@ func TestWire_BaselineDisablesThenEnableAdmits(t *testing.T) {
 	// 那次 Run 会停在绑定准入而不是预算准入。
 	// The probe's version is still seeded first so the post-enable run reaches budget admission.
 	fx.seedPublishedProviders(t)
-	rt, err := fx.app().newRuntime(context.Background())
+	rt, err := fx.app().newRuntime(context.Background(), roleControl)
 	require.NoError(t, err, "重路径装配必须成功（失败时先看日志里的 step 停在哪一步）")
 	t.Cleanup(func() { require.NoError(t, rt.Close()) })
 
@@ -1324,7 +1325,7 @@ func TestWire_CloseReleasesInstanceLockLast(t *testing.T) {
 
 	app := fx.app()
 	app.mcpConnect = connector
-	rt, err := app.newRuntime(context.Background())
+	rt, err := app.newRuntime(context.Background(), roleControl)
 	require.NoError(t, err)
 	require.NoError(t, rt.Close(), "释放失败不得静默")
 
@@ -1798,7 +1799,7 @@ func TestWire_StartupRunsMigrationOrchestration(t *testing.T) {
 		fx := newWireFixture(t)
 		require.NoError(t, os.RemoveAll(filepath.Join(fx.root, agentsDirName)))
 
-		_, err := fx.app().newRuntime(context.Background())
+		_, err := fx.app().newRuntime(context.Background(), roleControl)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "工作区残留判定",
 			"扫描 Agent 目录的是 ④ 恢复步：失败必须归因到那里")

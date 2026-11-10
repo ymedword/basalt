@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/ymedword/basalt/internal/core"
@@ -130,6 +131,22 @@ func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest co
 			return core.LeaseToken{}, fmt.Errorf("预写运行账本（run_id=%s）: %w", rec.RunID, err)
 		}
 	}
+	// 钉住准入的静态前置（US-25C §2.3.5.1 T3）：固定版本凭证必须自带执行行主键与哈希，
+	// 且清单必须带 bundle 哈希——后者是发布 / 生命周期拦障（`admitPublishedResources`）
+	// 的启用条件，也是「生命周期行 → 执行租约 `FOR SHARE` → 执行行」这把锁序的入口。
+	// 缺失即装配错误，按 `ErrClaimPinInvalid` 拒绝，**不**降级成普通准入。
+	// A pinned admission without a manifest bundle hash would skip the lifecycle barrier
+	// and break the frozen lock order, so it is refused rather than downgraded.
+	if rec.Pin != nil {
+		if manifest.FormatVersion == 0 || manifest.AssetBundleHash == "" {
+			return core.LeaseToken{}, fmt.Errorf("%w: 钉住准入缺少资源清单或 bundle 哈希（run_id=%s）",
+				core.ErrClaimPinInvalid, rec.RunID)
+		}
+		if rec.Pin.ExecutionID <= 0 || rec.Pin.BundleHash == "" {
+			return core.LeaseToken{}, fmt.Errorf("%w: 钉住准入缺执行行主键或固定哈希（run_id=%s）",
+				core.ErrClaimPinInvalid, rec.RunID)
+		}
+	}
 
 	var token core.LeaseToken
 	outcome, err := s.db.Tx(ctx, func(ctx context.Context, tx *sql.Tx) error {
@@ -176,6 +193,17 @@ func (s *RunStore) StartRun(ctx context.Context, rec core.RunRecord, manifest co
 			// （FR-24-41）。生产构建的同名方法是无操作。
 			// Integration-only hold point: the lifecycle row lock is already taken here.
 			if err := s.holdAdmissionLock(ctx); err != nil {
+				return err
+			}
+		}
+		// 钉住准入的权威判定（§2.3.5.1 T3）：必须在拦障段**之后**——锁序固定为
+		// 「生命周期行（拦障段的 FOR UPDATE）→ 执行租约行 FOR SHARE → 执行行」，与回收器
+		// `ClaimExpired` 的「租约行 FOR UPDATE SKIP LOCKED → 执行行」同向。
+		// The authoritative pin recheck runs after the lifecycle barrier so the lock order
+		// stays lifecycle → schedule lease → execution row, the same direction the
+		// reclaimer takes.
+		if rec.Pin != nil {
+			if err := recheckClaimPinInTx(ctx, tx, rec); err != nil {
 				return err
 			}
 		}
@@ -326,10 +354,17 @@ func sessionAdvisoryKey(sessionID string) int64 { return advisoryKey("basalt/ses
 func admitPublishedResources(ctx context.Context, tx *sql.Tx, rec core.RunRecord,
 	manifest core.RunResourceManifest,
 ) error {
-	if err := recheckAgentBundle(ctx, tx, manifest); err != nil {
-		return err
+	// `recheckAgentBundle` 只对 `Pin == nil` 生效（US-25C §2.3.5.1）：钉住准入的
+	// bundle 凭证由领取记录 + 执行租约承载，**不再**比当时的指针——否则"领取后发布"
+	// 会把这个已领取的触发挡在门外，钉住就失去意义。
+	// The bundle-vs-pointer equality applies only to unpinned runs; a pinned run is bound
+	// to the claim record and the execution lease instead.
+	if rec.Pin == nil {
+		if err := recheckAgentBundle(ctx, tx, manifest); err != nil {
+			return err
+		}
 	}
-	if err := recheckResourceVersions(ctx, tx, manifest); err != nil {
+	if err := recheckResourceVersions(ctx, tx, manifest, rec.Pin != nil); err != nil {
 		return err
 	}
 	if err := recheckProviderCredentialPin(ctx, tx, manifest); err != nil {
@@ -369,21 +404,46 @@ func recheckAgentBundle(ctx context.Context, tx *sql.Tx, manifest core.RunResour
 // `applied_version_id`（运行必须用进程里真正连接着的那个版本，D-12）。
 // 指针行在预检之后被删除或版本被推进 → `ErrResourceVersionMismatch`（409，可重试）：
 // 预检刚刚读过它，此刻消失是竞态而不是永久缺失，**不得**"以最新为准"静默换版本。
-// recheckResourceVersions re-reads the three pointer kinds and compares the frozen
-// version ids; drift is a retryable 409, never a silent upgrade.
-func recheckResourceVersions(ctx context.Context, tx *sql.Tx, manifest core.RunResourceManifest) error {
+//
+// `pinned` 只放宽**技能**这一支（US-25C §2.3.5.1）：钉住 Run 的技能版本来自固定
+// bundle 的清单，按版本 ID 复核该行仍存在即可，不再要求它等于当前发布指针——
+// 领取后发布新技能版本正是在途 Run 保持旧版本的正常场景。Provider 与 MCP 两支在
+// 两条路径上都要求当前指针相等：路由与凭据必须按此刻的共享记录判定，资源删除
+// （指针墓碑）与撤权检查因此都保留。
+// The pinned flag relaxes only the skill arm: pinned runs verify the version row exists
+// instead of equating it with the current pointer; provider and MCP keep the current
+// pointer equality on both paths.
+func recheckResourceVersions(ctx context.Context, tx *sql.Tx, manifest core.RunResourceManifest,
+	pinned bool,
+) error {
 	for _, ref := range manifestRefs(manifest) {
 		var (
 			versionID int64
 			err       error
 		)
-		switch ref.kind {
-		case core.ResourceMCPServer:
+		switch {
+		case ref.kind == core.ResourceMCPServer:
 			err = tx.QueryRowContext(ctx, `
 				SELECT COALESCE(applied_version_id, 0)
 				  FROM resource_pointers
 				 WHERE resource_kind = $1 AND resource_id = $2 AND deleted_at IS NULL`,
 				string(ref.kind), ref.ref.Name).Scan(&versionID)
+		case ref.kind == core.ResourceSkill && pinned:
+			// 版本行不可变且不随发布移动：存在即"这一版仍然可用"。
+			// Version rows are immutable; existence is the whole check here.
+			var found int
+			err = tx.QueryRowContext(ctx, `
+				SELECT 1 FROM resource_versions
+				 WHERE id = $1 AND resource_kind = $2`,
+				ref.ref.VersionID, string(core.ResourceSkill)).Scan(&found)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: 钉住的技能 %s 版本 %d 不存在",
+					core.ErrResourceVersionMismatch, ref.ref.Name, ref.ref.VersionID)
+			}
+			if err != nil {
+				return fmt.Errorf("重读钉住的技能版本（%s@%d）: %w", ref.ref.Name, ref.ref.VersionID, err)
+			}
+			continue
 		default:
 			err = tx.QueryRowContext(ctx, `
 				SELECT published_version_id
@@ -402,6 +462,87 @@ func recheckResourceVersions(ctx context.Context, tx *sql.Tx, manifest core.RunR
 			return fmt.Errorf("%w: 资源 %s/%s 的指针版本 %d 与准入清单 %d 不一致",
 				core.ErrResourceVersionMismatch, ref.kind, ref.ref.Name, versionID, ref.ref.VersionID)
 		}
+	}
+	return nil
+}
+
+// recheckClaimPinInTx 在 `StartRun` 的同一事务内按**固定锁序**核对固定版本凭证
+// （US-25C §2.3.5.1 T3）：执行租约（`FOR SHARE`）→ 执行行（普通读）。
+//
+//	① execution_leases：kind='schedule_execution'、resource_id=str(ExecutionID)，
+//	   要求 owner / epoch 与 `Pin.Lease` 相同、`released_at IS NULL`、
+//	   `expires_at > readDBMillis(同一事务)`——执行权的唯一权威；
+//	② task_executions（JOIN scheduled_tasks 取 agent_name）：要求
+//	   `status='started'`、`run_id` = 本 Run、Agent 相同、`pinned_bundle_hash` = Pin 的哈希。
+//
+// 任一不符 → `core.ErrClaimPinInvalid`，调用方回滚整笔事务：零 Run 行、零清单、
+// 零引用、零业务调用。为什么四项不够：租约被接管后执行行在收尾前**仍是** started，
+// 四项照样全相符——只有租约行能证明"执行权此刻仍归本 owner / epoch"。
+// recheckClaimPinInTx verifies the schedule lease then the execution row, in that fixed
+// lock order; the lease is the only authority on execution rights.
+func recheckClaimPinInTx(ctx context.Context, tx *sql.Tx, rec core.RunRecord) error {
+	pin := rec.Pin
+	resourceID := strconv.FormatInt(pin.ExecutionID, 10)
+	var (
+		owner      string
+		epoch      int64
+		releasedAt sql.NullInt64
+		expiresAt  int64
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT owner_worker_id, ownership_epoch, released_at, expires_at
+		  FROM execution_leases
+		 WHERE kind = $1 AND resource_id = $2
+		   FOR SHARE`, string(core.LeaseScheduleExecution), resourceID).
+		Scan(&owner, &epoch, &releasedAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: 执行行 %d 的调度租约不存在（run_id=%s）",
+			core.ErrClaimPinInvalid, pin.ExecutionID, rec.RunID)
+	}
+	if err != nil {
+		return fmt.Errorf("锁定调度租约（execution_id=%d）: %w", pin.ExecutionID, err)
+	}
+	nowMS, err := readDBMillis(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if owner != pin.Lease.OwnerWorkerID || epoch != pin.Lease.OwnershipEpoch {
+		return fmt.Errorf("%w: 调度租约 owner/epoch %s/%d 与凭证 %s/%d 不符（execution_id=%d）",
+			core.ErrClaimPinInvalid, owner, epoch,
+			pin.Lease.OwnerWorkerID, pin.Lease.OwnershipEpoch, pin.ExecutionID)
+	}
+	if releasedAt.Valid {
+		return fmt.Errorf("%w: 调度租约已释放（execution_id=%d）",
+			core.ErrClaimPinInvalid, pin.ExecutionID)
+	}
+	if expiresAt <= nowMS {
+		return fmt.Errorf("%w: 调度租约已过期（execution_id=%d, expires_at=%d, now=%d）",
+			core.ErrClaimPinInvalid, pin.ExecutionID, expiresAt, nowMS)
+	}
+
+	var (
+		runID  string
+		agent  string
+		status string
+		hash   sql.NullString
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT e.run_id, t.agent_name, e.status, e.pinned_bundle_hash
+		  FROM task_executions e
+		  JOIN scheduled_tasks t ON t.task_id = e.task_id
+		 WHERE e.id = $1`, pin.ExecutionID).
+		Scan(&runID, &agent, &status, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: 领取记录 %d 不存在（run_id=%s）",
+			core.ErrClaimPinInvalid, pin.ExecutionID, rec.RunID)
+	}
+	if err != nil {
+		return fmt.Errorf("回读领取记录（execution_id=%d）: %w", pin.ExecutionID, err)
+	}
+	if status != string(core.ExecutionStarted) || runID != rec.RunID || agent != rec.Agent ||
+		hash.String != pin.BundleHash || !hash.Valid {
+		return fmt.Errorf("%w: 领取记录 %d 与本次 Run 不符（status=%s, run_id=%s, agent=%s）",
+			core.ErrClaimPinInvalid, pin.ExecutionID, status, runID, agent)
 	}
 	return nil
 }

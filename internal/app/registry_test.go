@@ -244,6 +244,40 @@ func TestAgentRegistry_Remove(t *testing.T) {
 	require.Len(t, registry.Entries(), 1)
 }
 
+// TestAgentRegistry_ReplaceAllUpsertsWithoutDeleting —— 同步工作集的整批发布（US-25C
+// C18 / FR-25C-10）：输入之外的条目**不得**被删除（共享库缺席只从本进程内存移除，
+// 注册表不推断"这次没送来"等于"该下线"）；批内同名条目整条替换；未注册条目按移除
+// 处理（注册不变量仍只由本文件维护）。
+// 逆改点：ReplaceAll 从空映射重建而不复制旧快照 → legacy 被抹掉，断言红。
+// ReplaceAll upserts one batch without deleting entries outside it.
+func TestAgentRegistry_ReplaceAllUpsertsWithoutDeleting(t *testing.T) {
+	t.Parallel()
+	registry, _ := newTestRegistry(t, []core.AgentEntry{
+		registeredAgent("alpha"), registeredAgent("beta"), registeredAgent("legacy"),
+	})
+
+	updated := registeredAgent("alpha")
+	updated.Unverified = true
+	require.NoError(t, registry.ReplaceAll([]core.AgentEntry{
+		updated,
+		registeredAgent("gamma"),
+		{Name: "beta", RejectReason: "同步拒绝"},
+	}))
+
+	entry, ok := registry.Lookup("alpha")
+	require.True(t, ok)
+	require.True(t, entry.Unverified, "批内同名条目必须整条替换")
+	require.True(t, registry.Exists("gamma"), "批内新条目必须插入")
+	require.False(t, registry.Exists("beta"), "未注册条目按移除处理")
+	require.True(t, registry.Exists("legacy"), "输入之外的条目不得被删除")
+
+	names := make([]string, 0, len(registry.Entries()))
+	for _, got := range registry.Entries() {
+		names = append(names, got.Name)
+	}
+	require.Equal(t, []string{"alpha", "gamma", "legacy"}, names, "快照仍按 name 升序")
+}
+
 // TestAgentRegistry_CurrentSnapshotIsImmutable：已发布的快照不会被后续替换改写——持有旧
 // 快照的读者看到的仍是它读到的那一刻（原子替换的语义）。
 func TestAgentRegistry_CurrentSnapshotIsImmutable(t *testing.T) {

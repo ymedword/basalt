@@ -168,7 +168,11 @@ func (s *ResourceAdmin) ApplyMCPServer(ctx context.Context, actor core.Actor, na
 	// 在同一段临界区里紧跟它完成。
 	// Steps 4–8 belong to the supervisor; Commit does the concurrent check and the CAS only.
 	in := MCPApplyInput{
-		Target:            core.PublishedMCPServer{VersionID: targetID, Config: resolved},
+		Target: core.PublishedMCPServer{
+			VersionID:            targetID,
+			CredentialGeneration: mcpCredentialGeneration(frozen),
+			Config:               resolved,
+		},
 		PreviousVersionID: previous,
 		DrainTimeout:      window,
 		Commit: func(commitCtx context.Context) (core.MCPApplySupersededBy, error) {

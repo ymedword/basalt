@@ -767,6 +767,28 @@ func (s *ResourceStore) Pointer(ctx context.Context, kind core.ResourceKind, res
 	return ptr, nil
 }
 
+// PointerVersion 读指针**当前指向**的版本 ID（不是该资源的最大版本号）：单条
+// `resource_pointers p JOIN resource_versions v` 查询、一次快照、不额外取锁——
+// 供技能联动在 `AgentGate` 锁内复核（§2.3.7）；他人持有指针行锁时本读仍按 MVCC
+// 立即返回已提交值。未命中返回 core.ErrResourceNotFound。
+// PointerVersion reads the version the pointer currently points at, in one snapshot
+// and without taking any lock; a miss is ErrResourceNotFound.
+func (s *ResourceStore) PointerVersion(ctx context.Context, kind core.ResourceKind, resourceID string) (int64, error) {
+	var versionID int64
+	err := s.db.pool.QueryRowContext(ctx,
+		`SELECT p.published_version_id FROM resource_pointers p
+		   JOIN resource_versions v ON v.id = p.published_version_id
+		  WHERE p.resource_kind = $1 AND p.resource_id = $2`,
+		string(kind), resourceID).Scan(&versionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("%w: %s/%s", core.ErrResourceNotFound, kind, resourceID)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("读取发布指针版本 %s/%s: %w", kind, resourceID, err)
+	}
+	return versionID, nil
+}
+
 // PointerByUID 按资源实例身份读它当前占据的名称与指针行（含删除标记）——
 // 凭据与范围动作按 UID 寻址，不经过名称猜测。未命中 → core.ErrResourceNotFound。
 // PointerByUID reads the pointer row by resource identity; credential and scope actions
@@ -1584,6 +1606,11 @@ func (s *ResourceStore) ReadLifecycleIndex(ctx context.Context, agent string) (c
 		state      sql.NullString
 		generation int64
 		fileHash   sql.NullString
+		// `agent_uid` 必须一并读回：写入面一直写它，读取面漏扫会让从索引读纪录的
+		// 调用方拿到空身份——准入与技能联动都以 UID 认 Agent，空值等于换了一种拒绝。
+		// The read must carry agent_uid back; a write-only column leaves callers that
+		// judge identity by UID with an empty one.
+		agentUID sql.NullString
 		// 同 PutLifecycleIndex：`valid` 是 boolean 列，扫描目标是 Go bool。
 		// As in PutLifecycleIndex, valid is a boolean column and scans into a Go bool.
 		validValue bool
@@ -1592,9 +1619,9 @@ func (s *ResourceStore) ReadLifecycleIndex(ctx context.Context, agent string) (c
 		operation  sql.NullString
 	)
 	err := s.db.pool.QueryRowContext(ctx,
-		`SELECT state, generation, state_file_hash, valid, error_message, updated_at, operation_id
+		`SELECT state, generation, state_file_hash, agent_uid, valid, error_message, updated_at, operation_id
 		   FROM agent_lifecycle WHERE agent_name = $1`, agent).
-		Scan(&state, &generation, &fileHash, &validValue, &errMessage, &updatedAt, &operation)
+		Scan(&state, &generation, &fileHash, &agentUID, &validValue, &errMessage, &updatedAt, &operation)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 没有索引行不是故障：带上 Agent 名返回，调用方据 valid=false 回退到状态文件。
 		return core.LifecycleRecord{Agent: agent}, false, "", nil
@@ -1606,6 +1633,7 @@ func (s *ResourceStore) ReadLifecycleIndex(ctx context.Context, agent string) (c
 	rec := core.LifecycleRecord{
 		SchemaVersion: 1,
 		Agent:         agent,
+		AgentUID:      core.AgentUID(agentUID.String),
 		Generation:    generation,
 		UpdatedAt:     updatedAt,
 		OperationID:   operation.String,

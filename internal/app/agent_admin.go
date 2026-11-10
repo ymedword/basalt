@@ -124,14 +124,20 @@ type AgentArchiveStore interface {
 }
 
 // AgentFilesView 是 Agent 写面的响应视图（契约 `AgentFilesView`）：Agent、生命周期
-// 投影、受管文件集合 ETag 与文件清单。它是 `internal/app` 的返回类型，web 只做字段
-// 投影，不重复定义领域类型（§3.1.7 冻结节）。
+// 投影、受管文件集合 ETag、文件清单与本次写触发的资产发布结果。它是 `internal/app`
+// 的返回类型，web 只做字段投影，不重复定义领域类型（§3.1.7 冻结节）。
 // AgentFilesView is the write-surface response view; the web layer only projects it.
 type AgentFilesView struct {
 	Agent     string
 	Lifecycle core.AgentLifecycleView
 	ETag      string
 	Files     []core.FileEntry
+	// Publish 是本次写触发的资产发布结果（2026-11-09 用户裁决，修订 D-25-10）：
+	// 四条管理写面与内容保存都在写锁内发布，结果随响应回给页面；发布失败只影响
+	// 该字段，不把已生效的写改写成失败。
+	// Publish reports the publication triggered by this write; a failure here never
+	// rewrites the committed write.
+	Publish core.AgentPublishView
 }
 
 // AgentDraft 是作者草稿的响应视图（契约 `AgentDraftView`）：草稿只在内存里，磁盘上
@@ -226,9 +232,11 @@ type AgentAdminDeps struct {
 	// 控制台与 CLI 的创建 / 提交 / 复制 / 恢复成功之后调用，准入因此总能读到与本机
 	// 定义一致的 bundle。可选：nil 表示装配不提供资产发布面（只读面或纯写面测试），
 	// 写路径行为一字不变；发布失败只记 ERROR，**不**把已生效的写改写成失败。
+	// `actor` 是触发本次写的真实操作主体，发布操作行按它归因（2026-11-09 用户裁决）。
 	// PublishBundle publishes the just-written definition as a shared bundle. It is
-	// optional; a failure is logged and never turns a committed write into a failure.
-	PublishBundle func(ctx context.Context, agent string) (int64, error)
+	// optional; a failure is logged and never turns a committed write into a failure,
+	// and the actor is recorded on the publication operation row.
+	PublishBundle func(ctx context.Context, agent string, actor core.Actor) (int64, error)
 }
 
 // AgentAdmin 是 Agent 写面的编排实现；字段全部私有，构造后不再变化。
@@ -257,7 +265,7 @@ type AgentAdmin struct {
 	resources       *postgres.ResourceStore
 	notify          *postgres.NotifyAdminStore
 	projection      *BindingProjection
-	publishBundle   func(ctx context.Context, agent string) (int64, error)
+	publishBundle   func(ctx context.Context, agent string, actor core.Actor) (int64, error)
 }
 
 // NewAgentAdmin 组装 Agent 写面；Gate 为 nil 时退化为私有锁表（只防本实例自身并发，
@@ -432,9 +440,11 @@ func (s *AgentAdmin) Create(ctx context.Context, actor core.Actor, spec core.Age
 	s.rebuildActiveProjection(ctx, spec.Name, rec.AgentUID)
 	// 同一时刻发布资产：控制台 / CLI 创建的 Agent 在启用后必须能被准入读到本机定义
 	// 对应的 bundle，否则第一次运行会按 ASSET_UNAVAILABLE 失败关闭（FR-24-25）。
-	s.publishAgentBundle(ctx, spec.Name)
+	// 发布结果随创建响应回给页面（发布失败不改写创建成功）。
+	publish := s.publishAgentBundle(ctx, spec.Name, actor)
 
 	if view, ok := s.readFilesView(ctx, spec.Name); ok {
+		view.Publish = publish
 		return view, nil
 	}
 	// 创建已经生效：重新读取失败不得改写成创建失败（与 withLifecycle 同一纪律）。
@@ -444,6 +454,7 @@ func (s *AgentAdmin) Create(ctx context.Context, actor core.Actor, spec core.Age
 		Agent:     spec.Name,
 		Lifecycle: s.lifecycleView(ctx, spec.Name),
 		Files:     baseNameEntries(infos),
+		Publish:   publish,
 	}, nil
 }
 
@@ -564,14 +575,16 @@ func (s *AgentAdmin) SubmitFiles(ctx context.Context, actor core.Actor, name, if
 	}
 
 	// 定义已整份落盘：把新内容发布为共享 bundle——下一个 Run 的准入固定到本次哈希，
-	// 运行中的 Run 仍固定在它开始时的那份目录上（FR-24-42）。
-	s.publishAgentBundle(ctx, name)
+	// 运行中的 Run 仍固定在它开始时的那份目录上（FR-24-42）。发布发生在同一把写锁内，
+	// 结果随提交响应回给页面。
+	publish := s.publishAgentBundle(ctx, name, actor)
 
 	return AgentFilesView{
 		Agent:     name,
 		Lifecycle: s.lifecycleView(ctx, name),
 		ETag:      newETag,
 		Files:     infoEntries(infos),
+		Publish:   publish,
 	}, nil
 }
 
@@ -1092,16 +1105,19 @@ func (s *AgentAdmin) Copy(ctx context.Context, actor core.Actor, source, target 
 	// 复制成功即按副本的定义重建投影：副本的新身份与改写后的绑定清单都已落盘，
 	// 不能沿用源 Agent 的投影行（那属于源身份）。
 	s.rebuildActiveProjection(ctx, target, rec.AgentUID)
-	// 副本是新身份：共享记录里还没有它的 bundle，必须此刻发布（FR-24-25）。
-	s.publishAgentBundle(ctx, target)
+	// 副本是新身份：共享记录里还没有它的 bundle，必须此刻发布（FR-24-25）；
+	// 发布结果随复制响应回给页面。
+	publish := s.publishAgentBundle(ctx, target, actor)
 
 	if view, ok := s.readFilesView(ctx, target); ok {
+		view.Publish = publish
 		return view, nil
 	}
 	return AgentFilesView{
 		Agent:     target,
 		Lifecycle: s.lifecycleView(ctx, target),
 		Files:     infoEntries(infos),
+		Publish:   publish,
 	}, nil
 }
 
@@ -1554,16 +1570,19 @@ func (s *AgentAdmin) Restore(ctx context.Context, actor core.Actor, archiveID, n
 		s.clearProjectionIdentity(ctx, row.AgentUID)
 	}
 	// 恢复把定义写回活动区：同名恢复可能连内容带代次一起回退，异名恢复换了新身份，
-	// 两种情形都必须让共享 bundle 跟上落盘后的定义（FR-24-25 / FR-24-42）。
-	s.publishAgentBundle(ctx, target)
+	// 两种情形都必须让共享 bundle 跟上落盘后的定义（FR-24-25 / FR-24-42）；
+	// 发布结果随恢复响应回给页面。
+	publish := s.publishAgentBundle(ctx, target, actor)
 
 	if view, ok := s.readFilesView(ctx, target); ok {
+		view.Publish = publish
 		return view, nil
 	}
 	return AgentFilesView{
 		Agent:     target,
 		Lifecycle: s.lifecycleView(ctx, target),
 		Files:     infoEntries(infos),
+		Publish:   publish,
 	}, nil
 }
 
@@ -2231,23 +2250,30 @@ func (s *AgentAdmin) rebuildActiveProjection(ctx context.Context, agent string, 
 	RebuildAgentFromDisk(ctx, s.projection, s.root, agent, uid, s.logger)
 }
 
-// publishAgentBundle 在写路径成功之后尽力把该 Agent 的最新定义发布为共享资产。
+// publishAgentBundle 在写路径成功之后把该 Agent 的最新定义发布为共享资产，并把结果
+// 作为响应的一部分返回（有界：bundlePublishTimeout）。
 //
-// 为什么是"尽力"：目录与状态文件此刻已经生效，发布失败不得把一次成功的写改写成失败
+// 为什么写不失败：目录与状态文件此刻已经生效，发布失败不得把一次成功的写改写成失败
 // （与索引、投影同一纪律）。但失败必须留 ERROR 并**点名后果**——准入会按资产缺失或
 // 版本不符失败关闭（FR-24-25），运维据此重跑 `basalt assets install --agent`。
 // 用 WithoutCancel：客户端断开不应让共享记录停在旧版本（写已提交，后续动作必须完成）。
 //
-// publishAgentBundle is best-effort after a committed write: the write never turns into a
-// failure, but the log names the consequence (admission fails closed until a republish).
-func (s *AgentAdmin) publishAgentBundle(ctx context.Context, agent string) {
+// publishAgentBundle publishes after a committed write and returns the bounded outcome;
+// the write never turns into a failure, while the log names the consequence.
+func (s *AgentAdmin) publishAgentBundle(ctx context.Context, agent string, actor core.Actor) core.AgentPublishView {
 	if s.publishBundle == nil {
-		return
+		// 未接线（只读 / 轻量装配面）：不发布，也不伪装成一次发布结果。
+		return core.AgentPublishView{Status: core.AgentPublishStatusSkipped}
 	}
-	if _, err := s.publishBundle(context.WithoutCancel(ctx), agent); err != nil {
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bundlePublishTimeout)
+	defer cancel()
+	versionID, err := s.publishBundle(publishCtx, agent, actor)
+	if err != nil {
 		s.logger.Error("写路径成功后发布 Agent 资产失败（变更已生效，准入将按资产缺失或版本不符失败关闭）",
-			"agent", agent, "error", err)
+			"agent", agent, "actor", actor.Subject, "error", err)
+		return core.AgentPublishView{Status: core.AgentPublishStatusFailed, Error: contentPublishFailedNotice}
 	}
+	return core.AgentPublishView{Status: core.AgentPublishStatusPublished, VersionID: versionID}
 }
 
 // rebuildArchivedProjection 按归档副本的定义文件重建投影（归档成功之后调用）：归档

@@ -225,6 +225,36 @@ type AgentFiles struct {
 	// Changes lists the system-applied tool deltas of this save; notify is the only
 	// possible name, and the delta is always reported back to the caller.
 	Changes ToolChange
+	// Publish 是本次保存触发的资产发布结果（2026-11-09 用户裁决，修订 D-25-10）：
+	// 保存已生效且不回退，但发布失败**必须**随响应回给页面——否则操作者以为新配置
+	// 已生效，而下一次 Run 会被准入拒绝。Status 为空表示该写面不负责发布
+	// （创建 / 提交等路径仍走各自的操作结果，不出现在内容写响应里）。
+	// Publish reports the bundle publication triggered by this save; an empty status
+	// means this response carries no publication outcome.
+	Publish AgentPublishView
+}
+
+// AgentPublishStatus 是内容保存触发的资产发布结果字面量（契约 AgentPublishView）。
+// AgentPublishStatus is the fixed literal set of a save-triggered publication outcome.
+type AgentPublishStatus string
+
+const (
+	// AgentPublishStatusPublished：共享发布指针已指向本次内容对应的版本。
+	AgentPublishStatusPublished AgentPublishStatus = "published"
+	// AgentPublishStatusFailed：保存已生效，但发布未完成——准入会失败关闭。
+	AgentPublishStatusFailed AgentPublishStatus = "failed"
+	// AgentPublishStatusSkipped：写面未接线发布（只读 / 轻量装配），不是失败。
+	AgentPublishStatusSkipped AgentPublishStatus = "skipped"
+)
+
+// AgentPublishView 是内容保存触发的资产发布结果：状态、发布版本号与面向页面的
+// 固定中文提示。Error 只放不含路径与底层原文的可操作文案，底层错误进日志。
+// AgentPublishView carries the outcome, the published version id and a fixed
+// page-facing notice; the underlying error stays in the log.
+type AgentPublishView struct {
+	Status    AgentPublishStatus
+	VersionID int64
+	Error     string
 }
 
 // ToolChange 是系统在受控写面自动应用的受控工具增删（R7 / 宪法约束 11）：

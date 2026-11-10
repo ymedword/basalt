@@ -2,8 +2,27 @@
 // System overview prioritizes readiness, actionable issues and measured process data.
 import { computed, defineComponent, h } from 'vue'
 import type { VNode, VNodeChild } from 'vue'
+import type { SystemWorkerView } from '../api'
 import { Notice, formatBytes, formatTimestamp, formatUptime } from '../components/ui'
 import { brandMark } from '../components/brand'
+import {
+  WORKER_ACTIVE_NOTE,
+  WORKER_STALE_HINT,
+  WORKER_STALE_NOTE,
+  WORKER_STATUS_LABELS,
+  WORKER_STOPPED_NOTE,
+  formatHeartbeatAge,
+  groupWorkers,
+  normalizeWorkerStatus,
+  truncationText,
+  workerAsOfText,
+  workerCountText,
+  workerDetailPairs,
+  workerGroupCountText,
+  workerStatusLabel,
+  workerStatusTone,
+  workerTotalLabel,
+} from '../components/overview-worker-labels'
 import {
   CREDENTIAL_SUMMARY_TITLE,
   INSTANCE_SECRETS_TITLE,
@@ -21,6 +40,11 @@ import { badge, definitions, RUN_STATUS_LABELS, useLoader, viewProps } from './s
 /** shortInstance 把 16 进制实例标识压成可读短码；完整值留在 title 里。 */
 function shortInstance(instance: string): string {
   return instance.length <= 18 ? instance : `${instance.slice(0, 8)}…${instance.slice(-6)}`
+}
+
+/** 心跳年龄排序键：只使用服务端字段，缺失值排到最后；不读浏览器时钟。 */
+function heartbeatSortKey(node: SystemWorkerView): number {
+  return Number.isFinite(node.heartbeat_age_seconds) ? node.heartbeat_age_seconds : Number.POSITIVE_INFINITY
 }
 
 function metric(label: string, value: string, note: VNodeChild, accent = false): VNode {
@@ -121,39 +145,129 @@ export const OverviewView = defineComponent({
       ])
     }
     /**
-     * 分布式执行面板（US-24 §3.1.13）：Worker 列表与全库活跃租约数都是只读诊断。
-     * 数据库不可读时整组省略——这里显示"读不到"，**不得**显示成"没有 Worker 在跑"；
-     * 反过来，能读到的 0 是真实读数（单 Worker 空闲）。
-     * The distributed-execution panel is read-only diagnostics; an unreadable database
-     * shows "unknown", never an empty cluster.
+     * 单个 Worker 实例行（US-25C §2.3.9）：默认只显示名称、状态与距上次心跳，
+     * 宿主 / 版本 / 租约进「详情」；状态只读服务端字段，同名的不同实例各占一行。
+     * One process instance per row: compact by default, host/version/leases in details.
+     */
+    function renderWorkerRow(node: SystemWorkerView): VNode {
+      const label = workerStatusLabel(node.status)
+      const title = node.name === '' ? shortInstance(node.instance) : node.name
+      return h('div', { key: node.instance, class: ['worker-row', `worker-row-${normalizeWorkerStatus(node.status)}`] }, [
+        h('div', { class: 'worker-row-main' }, [
+          h('div', { class: 'worker-row-identity' }, [
+            h('strong', { title: node.instance }, title),
+            h('p', { class: 'worker-row-reading' }, `${label} · 距上次心跳 ${formatHeartbeatAge(node.heartbeat_age_seconds)}`),
+          ]),
+          badge(label, workerStatusTone(node.status)),
+        ]),
+        h('details', { class: 'technical-details worker-details' }, [
+          h('summary', {}, '详情'),
+          definitions(workerDetailPairs(node)),
+        ]),
+      ])
+    }
+    /** 分组标题：组计数取自服务端聚合，始终可见。 Group heading with the aggregate count. */
+    function renderWorkerGroupHeading(title: string, count: number | undefined): VNode {
+      return h('div', { class: 'worker-group-heading' }, [
+        h('h3', {}, title),
+        h('span', { class: 'dependency-count' }, workerGroupCountText(count)),
+      ])
+    }
+    /**
+     * 组内没有明细行时的说明：聚合计数仍大于 0 说明是明细截断，
+     * **不得**写成「当前没有」，否则与组计数自相矛盾。
+     * An absent page never claims the group is empty when its aggregate count is nonzero.
+     */
+    function emptyWorkerGroupNote(label: string, count: number | undefined, rows: number): VNode | null {
+      if (rows > 0) {
+        return null
+      }
+      const bounded = typeof count === 'number' && count > 0
+      return h('p', { class: 'muted small' }, bounded
+        ? `本页未包含${label}的登记行（明细有界）。`
+        : `当前没有${label}的实例。`)
+    }
+    /**
+     * 分布式执行面板（US-24 §3.1.13 / US-25C §2.3.9）：Worker 列表与全库活跃执行权都是
+     * 只读诊断。数据库不可读时整组省略——这里显示「状态不可用」，**不得**显示成 0 个实例
+     * 或全部已停止；反过来，能读到的 0 是真实读数（单 Worker 空闲）。
+     * Refreshing after a successful read keeps the last reading but marks it expired.
      */
     function renderWorkersPanel(): VNode {
       const summary = overview.data.value
       const workers = summary?.workers ?? null
-      const rows: VNodeChild[] =
+      const readFailed = overview.error.value !== ''
+      const expired = readFailed && workers !== null
+      const headingBadge =
         workers === null
-          ? [h('p', { class: 'muted' }, summary === null ? '正在读取 Worker 状态…' : '数据库不可读，Worker 状态暂不可用。')]
-          : workers.nodes.length === 0
-            ? [h('p', { class: 'muted' }, '还没有 Worker 登记：启动一个 serve 进程后会出现在这里。')]
-            : workers.nodes.map(node =>
-                h('div', { key: node.instance, class: 'dependency-row' }, [
-                  h('div', [
-                    h('strong', { title: node.instance }, node.name === '' ? shortInstance(node.instance) : `${node.name} · ${shortInstance(node.instance)}`),
-                    h('p', `启动 ${formatTimestamp(node.started_at)} · 心跳 ${formatTimestamp(node.heartbeat_at)}`),
-                  ]),
-                  h('span', { class: 'dependency-count' }, `${node.active_leases} 个活跃租约`),
-                ]),
-              )
+          ? badge('待确认', 'muted')
+          : expired
+            ? badge('数据已过期', 'warn')
+            : badge(workerTotalLabel(workers.total), (workers.counts?.stale ?? 0) > 0 ? 'warn' : 'ok')
+      const body: VNodeChild[] = []
+      if (workers === null) {
+        body.push(
+          h('p', { class: 'muted' }, readFailed || summary !== null
+            ? '状态不可用：数据库不可读，Worker 状态待确认。'
+            : '正在读取 Worker 状态…'),
+          h('p', { class: 'muted small' }, '活跃租约数读不到时不显示为 0。'),
+        )
+      } else {
+        body.push(
+          h('p', { class: expired ? 'notice notice-warn' : 'muted small worker-asof' }, expired
+            ? `状态不可用：数据已过期，以下为${workerAsOfText(workers.as_of)}的上次读数。`
+            : `${workerAsOfText(workers.as_of)}（数据库时间）`),
+          h('p', { class: 'muted small' }, `全库活跃执行权 ${workers.active_leases} 个；心跳只作诊断，执行权归属以租约到期为准。`),
+          h('div', { class: 'overview-metrics worker-metrics' }, [
+            metric('心跳正常', workerCountText(workers.counts?.active), WORKER_ACTIVE_NOTE),
+            metric('心跳超时待确认', workerCountText(workers.counts?.stale), WORKER_STALE_NOTE),
+            metric('已停止', workerCountText(workers.counts?.stopped), WORKER_STOPPED_NOTE),
+          ]),
+        )
+        const groups = groupWorkers(workers.nodes)
+        // 心跳超时组最近的在前：按服务端给出的心跳年龄升序，默认只展开 5 条。
+        // Oldest heartbeat first would hide fresh stale rows; sort by server-provided age.
+        const stale = [...groups.stale].sort(
+          (left, right) => heartbeatSortKey(left) - heartbeatSortKey(right),
+        )
+        const staleVisible = stale.slice(0, 5)
+        const staleRest = stale.slice(5)
+        body.push(
+          h('section', { class: 'workers-group workers-active' }, [
+            renderWorkerGroupHeading(WORKER_STATUS_LABELS.active, workers.counts?.active),
+            ...groups.active.map(renderWorkerRow),
+            emptyWorkerGroupNote('心跳正常', workers.counts?.active, groups.active.length),
+          ]),
+          h('section', { class: 'workers-group workers-stale' }, [
+            renderWorkerGroupHeading(WORKER_STATUS_LABELS.stale, workers.counts?.stale),
+            h('p', { class: 'worker-group-hint' }, WORKER_STALE_HINT),
+            ...staleVisible.map(renderWorkerRow),
+            staleRest.length > 0
+              ? h('details', { class: 'technical-details workers-overflow' }, [
+                  h('summary', {}, `展开其余 ${staleRest.length} 条`),
+                  ...staleRest.map(renderWorkerRow),
+                ])
+              : null,
+            emptyWorkerGroupNote('心跳超时', workers.counts?.stale, stale.length),
+          ]),
+          h('details', { class: 'workers-group workers-stopped' }, [
+            h('summary', {}, `已停止 · ${workerGroupCountText(workers.counts?.stopped)}`),
+            ...groups.stopped.map(renderWorkerRow),
+            emptyWorkerGroupNote('已停止', workers.counts?.stopped, groups.stopped.length),
+          ]),
+        )
+        const shown = workers.nodes.length
+        const total = Math.max(workers.total, shown)
+        const truncation = truncationText(shown, total)
+        if (truncation !== '') {
+          body.push(h('p', { class: 'muted small worker-truncation' }, `${truncation}；完整登记可用本地命令 basalt workers list 查看。`))
+        } else if (shown === 0) {
+          body.push(h('p', { class: 'muted small' }, '还没有 Worker 登记：启动一个 serve 进程后会出现在这里。'))
+        }
+      }
       return h('section', { class: 'overview-panel workers-panel' }, [
-        h('div', { class: 'panel-heading' }, [
-          h('h2', '分布式执行'),
-          badge(workers === null ? '待确认' : `${workers.nodes.length} 个 Worker`, workers === null ? 'muted' : 'ok'),
-        ]),
-        h('p', { class: 'muted small' },
-          workers === null
-            ? '活跃租约数读不到时不显示为 0。'
-            : `全库活跃执行权 ${workers.active_leases} 个；心跳只作诊断，死亡判定以租约到期为准。`),
-        ...rows,
+        h('div', { class: 'panel-heading' }, [h('h2', '分布式执行'), headingBadge]),
+        ...body,
       ])
     }
     return (): VNode => {
@@ -205,7 +319,7 @@ export const OverviewView = defineComponent({
             h('a', { class: 'dependency-row', href: resourceHref('model-connections') }, [h('div', [h('strong', '模型连接'), h('p', '配置已加载；未执行模型探测')]), h('span', { class: 'dependency-count' }, summary ? summary.resources.model_connections + ' 项 ↗' : '—')]),
             h('a', { class: 'dependency-row', href: resourceHref('mcp-servers') }, [h('div', [h('strong', 'MCP 服务'), h('p', '当前实际建立的服务连接')]), h('span', { class: 'dependency-count' }, mcps.data.value ? mcps.data.value.filter(item => item.connected).length + ' / ' + mcps.data.value.length + ' ↗' : '—')]),
             h('div', { class: 'dependency-row' }, [h('div', [h('strong', '管理面认证'), h('p', summary ? summary.auth.loopback_only ? '仅回环访问' : '允许远程访问' : '正在读取')]), h('span', { class: 'dependency-count' }, summary ? summary.auth.mode === 'token' ? 'Token' : '本机信任' : '—')]),
-            h('div', { class: 'dependency-row' }, [h('div', [h('strong', '分布式执行'), h('p', '登记的 Worker 与全库活跃执行权')]), h('span', { class: 'dependency-count' }, summary?.workers ? `${summary.workers.nodes.length} 节点 · ${summary.workers.active_leases} 租约` : '待确认')]),
+            h('div', { class: 'dependency-row' }, [h('div', [h('strong', '分布式执行'), h('p', '登记的 Worker 实例与全库活跃执行权')]), h('span', { class: 'dependency-count' }, summary?.workers ? `${summary.workers.total} 个实例 · ${summary.workers.active_leases} 个活跃执行权` : '待确认')]),
           ]),
         ]),
         renderSecretsPanel(),

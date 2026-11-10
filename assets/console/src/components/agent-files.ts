@@ -12,6 +12,7 @@ import { ApiError, errorMessage } from '../api'
 import type { ApiClient } from '../api'
 import { adminApi } from '../api-admin'
 import type { FileDraft } from '../api-admin'
+import { publishWarningText } from './publish-status'
 import { Notice } from './ui'
 
 /** 一个可编辑文件：`original` 是最近一次从服务端读到的正文，脏判定由此比较。 */
@@ -39,6 +40,9 @@ export const AgentFiles = defineComponent({
     const loadError = ref('')
     const actionError = ref('')
     const notice = ref('')
+    // 提交响应里的资产发布结果：写已生效但发布失败时单独告警（2026-11-09 用户裁决）。
+    // Publication outcome from the submit response; the write itself stays successful.
+    const publishWarning = ref('')
 
     const dirty = computed(() =>
       files.value.some((file) => file.loaded && file.content !== file.original),
@@ -118,8 +122,10 @@ export const AgentFiles = defineComponent({
       busy.value = true
       actionError.value = ''
       notice.value = ''
+      publishWarning.value = ''
       try {
-        await client.submitAgentFiles(props.agent, payload, etag.value)
+        const written = await client.submitAgentFiles(props.agent, payload, etag.value)
+        publishWarning.value = publishWarningText(written.publish)
         // 写后重读：清单与正文重新从服务端读取，不把请求体当结果回显。
         await load()
         notice.value = '已提交，文件集合与 ETag 已重新读取'
@@ -210,6 +216,9 @@ export const AgentFiles = defineComponent({
       }
       if (notice.value !== '') {
         children.push(h(Notice, { tone: 'info', text: notice.value }))
+      }
+      if (publishWarning.value !== '') {
+        children.push(h(Notice, { tone: 'warn', text: publishWarning.value }))
       }
       if (unreadable.value.length > 0) {
         children.push(

@@ -33,10 +33,12 @@ type MCPServerConfig struct {
 }
 
 // PublishedMCPServer 把解析后的配置与明确的已发布版本绑定；supervisor 只消费该
-// 结构，不再自行拆分 command。
+// 结构，不再自行拆分 command。`CredentialGeneration` 是该版本依赖的凭据材料代次
+// （US-25C §2.3.8 P6）：版本号不变而凭据换代时，运行期凭它判定必须受控重建。
 // PublishedMCPServer binds a parsed configuration to its published version; the
-// supervisor consumes this shape instead of splitting command itself.
+// credential generation lets the runtime detect a rotation at an unchanged version.
 type PublishedMCPServer struct {
-	VersionID int64
-	Config    MCPServerConfig
+	VersionID            int64
+	CredentialGeneration string
+	Config               MCPServerConfig
 }

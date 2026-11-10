@@ -161,6 +161,14 @@ type CredentialPin struct {
 // RunResources resolves one agent's bound resources under the gate's read lock.
 type RunResources interface {
 	Resolve(ctx context.Context, entry AgentEntry) (ResolvedResources, error)
+
+	// ResolvePinned 按**固定的 bundle 哈希**解析（US-25C §2.3.5.1 T2）：技能按该 bundle
+	// 的 `manifest.Skills` 经不可变版本行解析，**不**读当前发布指针——领取钉住 H1 之后
+	// 即使同步已推进到 H2，本次 Run 的技能与配置仍必须来自 H1。其余（Provider / MCP /
+	// 凭据 pin / 绑定 / 通知 / 生命周期）与 `Resolve` 逐项相同，一个不得少。
+	// ResolvePinned resolves the pinned hash's skills through immutable version rows and
+	// never re-reads the current pointers; every other check matches Resolve exactly.
+	ResolvePinned(ctx context.Context, entry AgentEntry, hash string) (ResolvedResources, error)
 }
 
 // RunSnapshotBuilder 把准入解析结果与配置快照合成为一次运行的冻结输入。

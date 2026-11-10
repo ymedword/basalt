@@ -1019,6 +1019,14 @@ func (r *cmpwResources) Resolve(ctx context.Context, entry core.AgentEntry) (cor
 	}, nil
 }
 
+// ResolvePinned 与 Resolve 同解：本文件的装配判据只用普通 Run 路径。
+// ResolvePinned mirrors Resolve because the wiring judges here never pin a bundle.
+func (r *cmpwResources) ResolvePinned(ctx context.Context, entry core.AgentEntry,
+	_ string,
+) (core.ResolvedResources, error) {
+	return r.Resolve(ctx, entry)
+}
+
 // cmpwRuntime 实现 `core.RunRuntime`：模型映射表里只有一条目（不遍历、不推断）。
 // cmpwRuntime implements core.RunRuntime with exactly one mapped provider.
 type cmpwRuntime struct {

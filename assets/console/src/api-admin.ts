@@ -405,9 +405,24 @@ export interface PublishRequest {
   version_id?: number
 }
 
+/**
+ * 技能发布联动重发的逐 Agent 结果（US-25C）。`ok` = 已重发；`skipped` = 该
+ * Agent 无需重发（未直接引用或指针已是新版本）；`superseded` = 发布前复查发现
+ * 技能指针已被更新的版本覆盖，本次不写；`missing` = Agent 定义 / 目录缺失；
+ * `failed` = 重发失败。`error` 只在 missing / failed 出现，是固定中文原因。
+ * Per-agent results of the US-25C skill-publish dependent republish.
+ */
+export interface AgentRepublishView {
+  agent: string
+  status: 'ok' | 'skipped' | 'superseded' | 'missing' | 'failed'
+  error?: string
+}
+
 export interface ResourcePublishResult {
   version: ResourceVersionView
   pending_restart: boolean
+  /** 仅技能发布且触发了联动重发时出现；非技能发布省略。 */
+  publish?: AgentRepublishView[]
 }
 
 export interface ResourceReferencesView {

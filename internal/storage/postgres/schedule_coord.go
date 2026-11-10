@@ -76,20 +76,8 @@ func (s *TaskStore) ListDispatchable(ctx context.Context, limit int) ([]core.Due
 	return s.listDue(ctx, dueTasksQuery, []any{limit}, limit)
 }
 
-// ListDispatchableForAgents 是 `ListDispatchable` 的按 Agent 收窄版本（`core.AgentDueLister`）：
-// 只返回属于给定 Agent 集合的到期行。多 Worker 共用一张 `scheduled_tasks` 时，全局批次
-// 会被其他工作区的到期行占满（它们既不归本进程领取，也不会被本进程推进），本地 Agent
-// 因此永远进不了批次——按注册集合先收窄就消除了这种饿死（F6）。
-// ListDispatchableForAgents narrows the due scan to the given agents so foreign rows can
-// never occupy the whole batch.
-func (s *TaskStore) ListDispatchableForAgents(ctx context.Context, agents []string,
-	limit int,
-) ([]core.DueTask, error) {
-	if len(agents) == 0 {
-		return nil, nil
-	}
-	return s.listDue(ctx, dueTasksLocalQuery, []any{limit, agents}, limit)
-}
+// ListDispatchableForAgents 的按 Agent 收窄 + 两段键集分页版本在
+// `schedule_scan.go`（`core.AgentDueLister` 的扩展签名）。
 
 // listDue 是两条到期扫描共用的执行体：查询文本由调用方从上面两个常量里选定
 // （参数顺序固定为 limit 在前、agents 在后），本函数不接收也不拼接任何 SQL 片段。
@@ -136,11 +124,15 @@ func (s *TaskStore) DBNow(ctx context.Context) (time.Time, error) {
 
 // SetNextFire 只初始化（expected == nil）或 CAS 推进 next_fire_at，**不**执行任务。
 //
-// 初始化分支允许覆盖旧值：它只在 `next_fire_at IS NULL` 的迁移遗留行与新行上被调用，
-// 覆盖是为了让"扫描到 NULL → 算一次 → 写回"这条路径可重入。推进分支必须带
-// `expected`：0 行即 `core.ErrStaleNextFire`（另一 Worker 已推进，或任务已下线）——
-// 不区分这两者，调用方对二者都只需放弃本轮。
-// SetNextFire only initializes or CAS-advances next_fire_at; it never executes a task.
+// 两个分支都是**行条件写**：扫描读到的 `next_fire_at IS NULL` 只是快照，不是写权。
+// 读后、写回前若有外部写（管理面重写 / 用例上弦 / 另一进程初始化）把值写成非空，
+// 迟到的初始化必须**零写入放弃**（`core.ErrStaleNextFire`）——无条件覆盖会把那次
+// 写入抹掉，本次触发永久丢失（US-25C §2.3.5「外部写有限」的前提是外部写入本身不
+// 被内部写覆盖）。初始化分支 0 行后的存在性回读只用于区分"行已不在"（`fs.ErrNotExist`，
+// 调用方记日志）与"值已被别人改"（`core.ErrStaleNextFire`，调用方静默放弃本轮）；
+// 推进分支口径不变：0 行一律 `core.ErrStaleNextFire`，不区分两种结局。
+// Both branches write conditionally: the NULL a scan saw is a snapshot, not a write
+// right. A late initialization must never overwrite a value written after that read.
 func (s *TaskStore) SetNextFire(ctx context.Context, taskID string, expected *time.Time, next time.Time) error {
 	if taskID == "" {
 		return fmt.Errorf("postgres: 推进下一次触发时任务标识为空")
@@ -152,7 +144,7 @@ func (s *TaskStore) SetNextFire(ctx context.Context, taskID string, expected *ti
 		res, err := s.db.pool.ExecContext(ctx, `
 UPDATE scheduled_tasks
    SET next_fire_at = $1, updated_at = (extract(epoch from clock_timestamp()) * 1000)::bigint
- WHERE task_id = $2 AND retired_at IS NULL`, next.UnixMilli(), taskID)
+ WHERE task_id = $2 AND retired_at IS NULL AND next_fire_at IS NULL`, next.UnixMilli(), taskID)
 		if err != nil {
 			return fmt.Errorf("初始化下一次触发（task_id=%s）: %w", taskID, err)
 		}
@@ -161,7 +153,7 @@ UPDATE scheduled_tasks
 			return fmt.Errorf("确认下一次触发初始化（task_id=%s）: %w", taskID, err)
 		}
 		if affected == 0 {
-			return fmt.Errorf("初始化下一次触发（task_id=%s）: %w", taskID, fs.ErrNotExist)
+			return s.classifyMissedScheduledWrite(ctx, taskID, "初始化下一次触发")
 		}
 		return nil
 	}
@@ -186,6 +178,22 @@ UPDATE scheduled_tasks
 	return nil
 }
 
+// classifyMissedScheduledWrite 把行条件写的 0 行结局归类：行已不存在 → `fs.ErrNotExist`
+// （调用方记日志）；行仍在但值在这之后被并发写改掉（含已退休）→ `core.ErrStaleNextFire`
+// （调用方静默放弃本轮，下一圈按新值重新考察）。
+// classifyMissedScheduledWrite separates "row gone" from "value changed under us".
+func (s *TaskStore) classifyMissedScheduledWrite(ctx context.Context, taskID, action string) error {
+	var exists bool
+	if err := s.db.pool.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE task_id = $1)`, taskID).Scan(&exists); err != nil {
+		return fmt.Errorf("%s（task_id=%s）: %w", action, taskID, err)
+	}
+	if !exists {
+		return fmt.Errorf("%s（task_id=%s）: %w", action, taskID, fs.ErrNotExist)
+	}
+	return fmt.Errorf("%s（task_id=%s）: %w", action, taskID, core.ErrStaleNextFire)
+}
+
 // ClaimDueTrigger 在**一个事务**里领取一次计划触发（模块卡 §2.3.4 图 4）：
 //
 //	任务行 FOR UPDATE（退休即视为不存在）
@@ -203,102 +211,10 @@ UPDATE scheduled_tasks
 func (s *TaskStore) ClaimDueTrigger(ctx context.Context, taskID string, plannedAt, nextFireAt time.Time,
 	owner core.WorkerIdentity, ttl time.Duration,
 ) (core.DueExecution, error) {
-	if owner.InstanceID == "" {
-		return core.DueExecution{}, fmt.Errorf("postgres: 领取计划触发缺少领取者身份（task_id=%s）", taskID)
-	}
-	ttlMS, err := validateLeaseTTL(ttl)
-	if err != nil {
-		return core.DueExecution{}, err
-	}
-	if plannedAt.IsZero() || nextFireAt.IsZero() {
-		return core.DueExecution{}, fmt.Errorf("postgres: 计划触发时刻为空（task_id=%s）", taskID)
-	}
-
-	var claimed core.DueExecution
-	outcome, err := s.db.Tx(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		task, err := lockTaskRow(ctx, tx, taskID)
-		if err != nil {
-			return err
-		}
-		// 停用可能提交在到期扫描之后：任务行锁保证这里读到的是最新已提交的 `enabled`。
-		// 停用即拒绝领取——不得留下 started 执行行与租约（FR-24-10 的启停语义）。
-		// The disable may have committed after the due scan; under the task row lock
-		// this recheck sees the latest enabled flag and rejects the claim outright.
-		if !task.Enabled {
-			return core.ErrTaskDisabled
-		}
-		nowMS, err := readDBMillis(ctx, tx)
-		if err != nil {
-			return err
-		}
-		taken, err := executionPlannedExists(ctx, tx, taskID, plannedAt)
-		if err != nil {
-			return err
-		}
-		if taken {
-			return core.ErrTriggerAlreadyClaimed
-		}
-		busy, err := executionStartedExists(ctx, tx, taskID)
-		if err != nil {
-			return err
-		}
-		if busy {
-			return core.ErrTaskBusy
-		}
-
-		res, err := tx.ExecContext(ctx, `
-UPDATE scheduled_tasks
-   SET next_fire_at = $1, updated_at = $2
- WHERE task_id = $3 AND next_fire_at = $4`,
-			nextFireAt.UnixMilli(), nowMS, taskID, plannedAt.UnixMilli())
-		if err != nil {
-			return fmt.Errorf("推进下一次触发（task_id=%s）: %w", taskID, err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("确认下一次触发推进（task_id=%s）: %w", taskID, err)
-		}
-		if affected == 0 {
-			return core.ErrStaleNextFire
-		}
-
-		// Run ID 在领取事务内分配：`task_executions.run_id` 必须与随后 Run 行同一个值，
-		// 而冻结签名没有 RunID 入参（T014 裁决 ①）。时间段用计划时刻——同一次计划
-		// 触发的多条线索在日志里可归并，随机段保证唯一。
-		runID := core.NewRunID("scheduler", plannedAt.UTC(), core.RunIDSuffix())
-		var id int64
-		if err := tx.QueryRowContext(ctx, `
-INSERT INTO task_executions(task_id, run_id, status, trigger, started_at,
-                           planned_at, owner_worker_id, ownership_epoch)
-VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
-RETURNING id`,
-			taskID, runID, string(core.ExecutionStarted), string(core.TriggerCron),
-			nowMS, plannedAt.UnixMilli(), owner.InstanceID).Scan(&id); err != nil {
-			return fmt.Errorf("预写计划触发执行行（task_id=%s）: %w", taskID, err)
-		}
-		token, err := insertExecutionLease(ctx, tx, id, owner.InstanceID, nowMS, ttlMS)
-		if err != nil {
-			return err
-		}
-		claimed = core.DueExecution{
-			Task:        task,
-			ExecutionID: id,
-			PlannedAt:   plannedAt.UTC(),
-			Lease:       token,
-			RunID:       runID,
-		}
-		return nil
-	})
-	if err != nil {
-		return core.DueExecution{}, err
-	}
-	if outcome != TxCommitted {
-		// 领取是否落库未知：**不得**重试、**不得**当未领取。调用方记 ERROR 后由下一轮
-		// 到期扫描按真实行状态收敛。
-		return core.DueExecution{}, fmt.Errorf("%w: 计划触发领取结局为 %q（task_id=%s）",
-			ErrTxOutcomeUnknown, outcome, taskID)
-	}
-	return claimed, nil
+	// 非钉住入口：事务体与钉住分支共用 `claimDueTrigger`（claim.go），这里只把
+	// 期望哈希留空——执行行的 `pinned_bundle_hash` 写 NULL，准入走既有当前指针语义。
+	// The unpinned entry delegates to the shared body; pinned_bundle_hash stays NULL.
+	return s.claimDueTrigger(ctx, taskID, plannedAt, nextFireAt, owner, ttl, "")
 }
 
 // RecordMissedTrigger 为一次"超出宽限"的到期写一条 skipped 行并在**同一事务**里 CAS

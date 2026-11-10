@@ -259,6 +259,50 @@ describe('agent files editor', () => {
     expect(button('提交文件').attributes('disabled')).toBeDefined()
   })
 
+  it('warns when the write succeeded but the asset publication failed', async () => {
+    let filesReads = 0
+    const calls = mountEditor((call) => {
+      if (call.method === 'GET' && call.path === FILES_PATH) {
+        filesReads += 1
+        return filesReads === 1
+          ? envelope(200, 'OK', '', filesView('"set-1"', ['AGENT.md']), '"set-1"')
+          : envelope(200, 'OK', '', filesView('"set-2"', ['AGENT.md']), '"set-2"')
+      }
+      if (call.method === 'GET' && call.path === WORKSPACE_PATH) {
+        return envelope(200, 'OK', '', workspaceFile(`${AGENT}/AGENT.md`, '# v1'))
+      }
+      if (call.method === 'POST' && call.path === FILES_PATH) {
+        const written = filesView('"set-2"', ['AGENT.md']) as Record<string, unknown>
+        return envelope(
+          200,
+          'OK',
+          '',
+          {
+            ...written,
+            publish: {
+              status: 'failed',
+              error: '变更已保存，但资产发布未完成：该 Agent 的下一次运行会被准入拒绝。',
+            },
+          },
+          '"set-2"',
+        )
+      }
+      return undefined
+    })
+    await flushPromises()
+
+    await required(textareas()[0], 'AGENT.md 编辑器').setValue('# mine')
+    await button('提交文件').trigger('click')
+    await flushPromises()
+
+    // 写成功与发布失败分开显示：成功提示保留，发布失败单独告警。
+    expect(submitCall(calls).ifMatch).toBe('"set-1"')
+    expect(wrapper!.find('.notice-info').text()).toContain('已提交')
+    expect(wrapper!.find('.notice-warn').text()).toContain('资产发布未完成')
+    // 写已生效：重读后的集合已换上，不因发布失败回退编辑状态。
+    expect(wrapper!.find('.files-etag').text()).toBe('"set-2"')
+  })
+
   it('keeps unreadable files out of the submission', async () => {
     const calls = mountEditor((call) => {
       if (call.method === 'GET' && call.path === FILES_PATH) {

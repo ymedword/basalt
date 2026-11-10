@@ -112,7 +112,13 @@ type MCPSupervisorDeps struct {
 	// 同一段临界区里发生，否则新 Run 可能看到"指针已换、工具还是旧的"（C1 / C4）。
 	// ReplaceTools is the single registration seam of a controlled apply; it runs in the
 	// same critical section as the CAS so no run sees a half-switched tool set.
-	ReplaceTools   func(server string, tools []core.Tool)
+	ReplaceTools func(server string, tools []core.Tool)
+	// PrepareVerify 是**同步准备路径**的换入前只读复核（US-25C §2.3.8）：`PrepareAtApplied`
+	// 受控重建时把它交给 `MCPApplyInput.Verify`；管理 apply 路径不使用它。nil 表示装配
+	// 没有复核入口——准备路径一律失败关闭（不得把"跳过复核"当成功）。
+	// PrepareVerify is the sync-path swap-time recheck; nil fails the prepare path closed.
+	// The admin apply path never uses it.
+	PrepareVerify  func(ctx context.Context, published core.PublishedMCPServer) (core.MCPApplySupersededBy, error)
 	NewConnector   func() mcpConnector
 	TestTimeout    time.Duration
 	Root           string
@@ -142,8 +148,12 @@ type mcpServerEntry struct {
 	// link 是当前这代连接的门（14D）：受控重建与撤销靠它把"新调用拒绝、在途调用覆盖到"
 	// 落到这一代的具体工具实例上。没有连接时为 nil。
 	// link gates this generation's calls; nil while no connection is installed.
-	link   *mcpLink
-	status MCPServerStatus
+	link *mcpLink
+	// credentialGeneration 是这代连接实际使用的凭据材料代次（US-25C §2.3.8 P6）：
+	// 准备路径只有它和发布侧代次相符才允许复用；没有连接时为空。
+	// credentialGeneration is the generation used by this connection; empty without one.
+	credentialGeneration string
+	status               MCPServerStatus
 	// httpHost 是已建立 http 连接的目标主机（小写；stdio 为空）。撤销判定只看它：
 	// `status` 里没有 URL（约束 23 的脱敏面），而白名单收紧后必须能按 host 重新判定。
 	// httpHost is the connected http host, kept solely for re-judging after the allowlist
@@ -207,6 +217,42 @@ func (s *MCPSupervisor) RebuildAtApplied(ctx context.Context, published core.Pub
 	return s.start(ctx, published, false)
 }
 
+// PrepareAtApplied 保证"库里已 applied 的那一版在本进程可用"（US-25C §2.3.8）：
+// P1 已连接、版本与凭据代次都相符且连接仍 live → **零副作用复用**；其余（P2–P6）走
+// `Replace` 的候选构建 + `commitReplace` + `drainOld` 受控重建，传 `Commit: nil`（不写
+// applied）、`OldLegal: nil`，换入前由 `PrepareVerify` 在同一临界区做只读复核。
+//
+// 锁序按 M3 分三段：① `entry.mu` 内取快照后**立即释放**；② 锁外构建候选；③ 提交段按
+// `ResourceGate → entry.mu`。**不得**持 `entry.mu` 调 `Replace`——那里会再取一次 entry.mu。
+// PrepareAtApplied reuses a matching live generation with zero side effects and rebuilds
+// otherwise without writing applied; the snapshot lock is released before any rebuild.
+func (s *MCPSupervisor) PrepareAtApplied(ctx context.Context, published core.PublishedMCPServer) MCPApplyResult {
+	cfg := published.Config
+	entry := s.entry(cfg.Name)
+	// ① 快照：只读四个判据，取完立刻解锁（M3）。
+	entry.mu.Lock()
+	connected := entry.conn != nil && entry.status.Connected
+	applied := entry.status.AppliedVersionID
+	generation := entry.credentialGeneration
+	link := entry.link
+	entry.mu.Unlock()
+
+	// P1：复用必须零副作用——不 seal、不 Close、不 Connect、不 epoch++、不 authorize、不写库。
+	if connected && applied == published.VersionID &&
+		generation == published.CredentialGeneration && link != nil && link.isLive() {
+		return MCPApplyResult{
+			Outcome: core.MCPApplyApplied, AppliedVersionID: applied, Reused: true,
+		}
+	}
+
+	// ②③ 受控重建：候选在锁外构建，换入前复核与换入同段临界区；管理审计事件不发。
+	return s.replace(ctx, MCPApplyInput{
+		Target:            published,
+		PreviousVersionID: applied,
+		Verify:            s.deps.PrepareVerify,
+	}, false)
+}
+
 // start 是 Start / RebuildAtApplied 的共同实现；`recordApplied` 决定是否写库。
 // start is the shared implementation; recordApplied selects whether applied is written.
 func (s *MCPSupervisor) start(ctx context.Context, published core.PublishedMCPServer,
@@ -224,6 +270,7 @@ func (s *MCPSupervisor) start(ctx context.Context, published core.PublishedMCPSe
 	if err := s.authorize(ctx, "mcp.start", cfg, published.VersionID); err != nil {
 		// 拒绝不碰旧连接：已连接旧版本时仍可声明该 server（注 13 真值表第二行）。
 		if entry.conn == nil {
+			entry.credentialGeneration = ""
 			entry.status = MCPServerStatus{
 				Name: cfg.Name, Transport: mcpTransport(cfg.Transport),
 				Connected: false, AppliedVersionID: entry.status.AppliedVersionID,
@@ -249,6 +296,7 @@ func (s *MCPSupervisor) start(ctx context.Context, published core.PublishedMCPSe
 		}
 		entry.conn = nil
 		entry.link = nil
+		entry.credentialGeneration = ""
 	}
 
 	connector := s.newConnector()
@@ -280,6 +328,7 @@ func (s *MCPSupervisor) start(ctx context.Context, published core.PublishedMCPSe
 	conns = mcpWrapConnections(link, conns)
 	entry.conn = connector
 	entry.link = link
+	entry.credentialGeneration = published.CredentialGeneration
 	// 只记 http 目标主机供白名单收紧后重新判定（R8.2.3）；stdio 留空。
 	// Only the http host is remembered for later revocation; stdio leaves it empty.
 	entry.httpHost = ""
@@ -355,6 +404,7 @@ func (s *MCPSupervisor) abandonApply(entry *mcpServerEntry, epoch uint64,
 	if stillOurs {
 		entry.conn = nil
 		entry.link = nil
+		entry.credentialGeneration = ""
 		entry.status.Connected = false
 		entry.status.Tools = nil
 		entry.status.Error = mcpStatusApplyFailed
@@ -388,6 +438,7 @@ func (s *MCPSupervisor) Stop(ctx context.Context, name string) error {
 	link := entry.link
 	entry.conn = nil
 	entry.link = nil
+	entry.credentialGeneration = ""
 	entry.httpHost = ""
 	entry.status.Connected = false
 	entry.status.Tools = nil
@@ -432,6 +483,7 @@ func (s *MCPSupervisor) RevokeDisallowedHTTP(stillAllowed func(host string) bool
 		host := entry.httpHost
 		entry.conn = nil
 		entry.link = nil
+		entry.credentialGeneration = ""
 		entry.httpHost = ""
 		entry.status.Connected = false
 		entry.status.Tools = nil
@@ -648,6 +700,16 @@ func (s *MCPSupervisor) markApplied(ctx context.Context, entry *mcpServerEntry, 
 // 出网授权（`ActionHTTPRequest`）——**不得**让 http 借命令通道绕过域名白名单。
 // authorize checks the per-transport policy and records one structured audit event.
 func (s *MCPSupervisor) authorize(ctx context.Context, event string, cfg core.MCPServerConfig, versionID int64) error {
+	return s.authorizeWithAudit(ctx, event, cfg, versionID, true)
+}
+
+// authorizeWithAudit 是 authorize 的共同实现；`record` 为假时**只**做策略判定、不写
+// 管理审计事件（同步准备路径的例行重建不得冒充一次管理发布，US-25C §2.3.8 M2）。
+// authorizeWithAudit checks policy always; record=false keeps the event off the admin
+// audit surface for routine sync-path rebuilds.
+func (s *MCPSupervisor) authorizeWithAudit(ctx context.Context, event string,
+	cfg core.MCPServerConfig, versionID int64, record bool,
+) error {
 	transport := mcpTransport(cfg.Transport)
 	action := core.Action{Type: core.ActionShellCommand, Target: cfg.Command}
 	if transport == mcpTransportHTTP {
@@ -668,11 +730,13 @@ func (s *MCPSupervisor) authorize(ctx context.Context, event string, cfg core.MC
 		audit.Decision = "deny"
 		audit.Reason = mcpResultPolicyDenied
 	}
-	s.deps.Logger.Info("MCP 授权审计", "event", audit.Event, "server", audit.Server,
-		"transport", audit.Transport, "version_id", audit.VersionID,
-		"decision", audit.Decision, "reason", audit.Reason, "at", audit.At)
-	if s.deps.Audit != nil {
-		s.deps.Audit(audit)
+	if record {
+		s.deps.Logger.Info("MCP 授权审计", "event", audit.Event, "server", audit.Server,
+			"transport", audit.Transport, "version_id", audit.VersionID,
+			"decision", audit.Decision, "reason", audit.Reason, "at", audit.At)
+		if s.deps.Audit != nil {
+			s.deps.Audit(audit)
+		}
 	}
 	return checkErr
 }

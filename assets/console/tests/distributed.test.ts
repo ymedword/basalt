@@ -124,6 +124,10 @@ describe('distributed execution projections', () => {
       ...baseSummary,
       workers: {
         active_leases: 3,
+        as_of: '2026-10-21T13:00:00Z',
+        counts: { active: 2, stale: 0, stopped: 0 },
+        total: 2,
+        truncated: false,
         nodes: [
           {
             instance: 'abcdef0123456789abcdef0123456789',
@@ -131,6 +135,13 @@ describe('distributed execution projections', () => {
             started_at: '2026-10-21T10:00:00Z',
             heartbeat_at: '2026-10-21T12:59:30Z',
             active_leases: 2,
+            hostname: 'host-a',
+            build_version: 'test-version',
+            schema_version: 12,
+            heartbeat_age_seconds: 30,
+            heartbeat_interval_seconds: 10,
+            stale_after_seconds: 30,
+            status: 'active',
           },
           {
             instance: '0123456789abcdef0123456789abcdef',
@@ -138,6 +149,13 @@ describe('distributed execution projections', () => {
             started_at: '2026-10-21T11:00:00Z',
             heartbeat_at: '2026-10-21T12:59:31Z',
             active_leases: 0,
+            hostname: 'host-b',
+            build_version: 'test-version',
+            schema_version: 12,
+            heartbeat_age_seconds: 29,
+            heartbeat_interval_seconds: 10,
+            stale_after_seconds: 30,
+            status: 'active',
           },
         ],
       },
@@ -167,7 +185,7 @@ describe('distributed execution projections', () => {
 
   it('renders lease ownership and bundle hash on the run detail page', async () => {
     await signIn(
-      { ...baseSummary, workers: { active_leases: 0, nodes: [] } },
+      { ...baseSummary, workers: { active_leases: 0, as_of: '2026-10-21T13:00:00Z', counts: { active: 0, stale: 0, stopped: 0 }, total: 0, truncated: false, nodes: [] } },
       runDetail({
         worker_instance_id: 'abcdef0123456789',
         ownership_epoch: 7,
@@ -185,7 +203,7 @@ describe('distributed execution projections', () => {
 
   it('marks unrecorded lease fields instead of fabricating values', async () => {
     // 历史 Run 没有租约行、旧清单没有资产包哈希：三项都显示“未记录”。
-    await signIn({ ...baseSummary, workers: { active_leases: 0, nodes: [] } }, runDetail())
+    await signIn({ ...baseSummary, workers: { active_leases: 0, as_of: '2026-10-21T13:00:00Z', counts: { active: 0, stale: 0, stopped: 0 }, total: 0, truncated: false, nodes: [] } }, runDetail())
     await visit('/console/runs/run-24')
 
     const text = wrapper!.find('.view-run-detail').text()

@@ -192,11 +192,12 @@ func mintWorkerIdentity(cfg *cli.Config) (core.WorkerIdentity, error) {
 		name = workerHostname()
 	}
 	return core.WorkerIdentity{
-		InstanceID:    instanceID,
-		Name:          name,
-		Hostname:      workerHostname(),
-		Version:       Version,
-		SchemaVersion: postgres.SupportedSchemaVersion,
+		InstanceID:               instanceID,
+		Name:                     name,
+		Hostname:                 workerHostname(),
+		Version:                  Version,
+		SchemaVersion:            postgres.SupportedSchemaVersion,
+		HeartbeatIntervalSeconds: workerSettings(cfg).HeartbeatIntervalSeconds,
 	}, nil
 }
 
@@ -214,7 +215,9 @@ func (a *App) startWorkerRuntime(ctx context.Context, db *postgres.DB,
 	worker core.WorkerIdentity, reclaimer core.Reclaimer,
 ) (*workerRuntime, error) {
 	cfg := workerSettings(a.cfg)
-	registry := postgres.NewWorkerStore(db)
+	// 登记表同时是概览读数的来源：注入本部署的心跳间隔，迁移前旧行（列为 NULL）
+	// 的判阈用它兜底并在详情标注来源。
+	registry := postgres.NewWorkerStore(db, postgres.WithDefaultHeartbeatInterval(cfg.HeartbeatIntervalSeconds))
 	if err := registry.Register(ctx, worker); err != nil {
 		return nil, fmt.Errorf("register worker: %w", err)
 	}

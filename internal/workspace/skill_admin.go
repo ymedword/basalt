@@ -469,6 +469,21 @@ func makeSkillVersionReadOnly(root, relDir string) (err error) {
 	return nil
 }
 
+// FinalizeVersionDir 冻结一个刚物化的发布版本目录（约束 25）：运行期同步把版本正文
+// 换入 `versions/skills/<name>/[<uid>/]<no>` 之后**必须**调用它，否则目录仍可被后续
+// 轮次覆盖。`relDir` 是工作区相对路径（由 `PublishedVersionRelDir` 投影得到）。
+// 幂等：对已只读的目录再跑一遍不会改变内容，只重设权限。
+//
+// FinalizeVersionDir freezes a freshly materialized published version directory. It is
+// the exported wrapper of makeSkillVersionReadOnly for the runtime asset sync, and it is
+// idempotent so a crash between rename and chmod heals on the next round.
+func FinalizeVersionDir(root, relDir string) error {
+	if !fs.ValidPath(relDir) {
+		return fmt.Errorf("技能版本目录 %q 不是工作区相对形态", relDir)
+	}
+	return makeSkillVersionReadOnly(root, relDir)
+}
+
 // importRejected 把边界校验失败归入 `core.ErrImportRejected`（web 映射 400
 // IMPORT_REJECTED）；文案原样保留，便于调用方点名违规路径与上限。
 // importRejected classifies a boundary failure as ErrImportRejected.

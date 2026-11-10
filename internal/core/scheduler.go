@@ -65,6 +65,11 @@ const (
 	defaultSchedulerMissedGrace   = 300 * time.Second
 	defaultSchedulerRunTimeout    = 300 * time.Second
 	defaultSchedulerStopGrace     = 70 * time.Second
+
+	// schedulerNotReadyWarnInterval 是就绪门 WARN 的限速窗口（卡 §2.3.5 步骤 ④：
+	// 同一 Agent 的同一原因每 5 分钟最多一条）。
+	// schedulerNotReadyWarnInterval throttles the not-ready WARN per agent and reason.
+	schedulerNotReadyWarnInterval = 5 * time.Minute
 )
 
 // errSchedulerStarted 表示调度器已经成功启动或已被停止，不得再次启动。
@@ -76,6 +81,22 @@ var errSchedulerStarted = errors.New("scheduler: already started")
 // errSchedulerNoLeases is an assembly defect: without a lease store and a worker
 // identity the scheduler cannot claim or fence anything.
 var errSchedulerNoLeases = errors.New("scheduler: lease store and worker identity are required")
+
+// errSchedulerNoPinnedClaim 表示就绪门给出了期望哈希，而任务仓储没有实现钉住领取
+// （`core.AssetPinnedClaimer`）。这是装配缺陷：退回未钉住的领取会绕过 FR-25C-08 的
+// 版本绑定，因此本拍不领取（零写入）并报错，由装配修复而不是降级。
+// errSchedulerNoPinnedClaim is an assembly defect: a ready hash without a pinned-claim
+// store must never fall back to the unpinned claim.
+var errSchedulerNoPinnedClaim = errors.New(
+	"scheduler: readiness provides a bundle hash but the task store has no pinned claim")
+
+// errSchedulerNoDefinitionAuthority 表示本进程没有共享任务定义列的写权（Worker 角色），
+// 运行期定义协调与退休必须失败关闭：悄悄跳过会让装配缺陷不可见，照写会让旧 Worker
+// 把控制面已发布的定义盖回本地种子（US-25C FR-25C-13 / C18）。
+// errSchedulerNoDefinitionAuthority is the worker-side fail-closed answer to any
+// runtime shared-definition write.
+var errSchedulerNoDefinitionAuthority = errors.New(
+	"定义写权缺失：本进程无权写共享任务定义列，定义变更须由控制面发布")
 
 // RunCloseout 是系统代投 Run 的收尾末笔端口（模块卡 §2.3.5 五步收尾 / P-01）：
 // 投递结算发生在 Run 返回之后，所以第 4、5 步由调度器代做——先按 run_id 取回本次
@@ -171,6 +192,26 @@ type SchedulerOptions struct {
 	PollInterval  time.Duration
 	DispatchBatch int
 	MissedGrace   time.Duration
+
+	// AssetReady 是到期触发的就绪门（US-25C FR-25C-11）：nil = 不设门（测试与轻装配）；
+	// 非 nil 时每次领取前先问一次该 Agent 是否已就绪，未就绪**不领取、不推进
+	// `next_fire_at`、不写执行行**。
+	// AssetReady is the per-tick readiness gate; nil disables it.
+	AssetReady func(ctx context.Context, agent string) error
+
+	// AssetReadyHash 是就绪门的**带哈希**形态（US-25C ADJ-1）：非 nil 时以它为准，
+	// 一次读到「是否就绪 + 就绪快照里的已安装哈希」，门与领取钉住因此来自同一份快照；
+	// 返回 error = 未就绪（原因进限速 WARN）。nil 时退回 AssetReady 作门，领取走未钉住
+	// 的 `ClaimDueTrigger`。
+	// AssetReadyHash carries the ready hash so the gate and the claim pin share one
+	// snapshot; nil falls back to AssetReady plus the unpinned claim.
+	AssetReadyHash func(ctx context.Context, agent string) (string, error)
+
+	// DefinitionAuthority 表示本进程是否有权写共享任务定义列（US-25C §2.3.1）：
+	// 仅 control 为 true；为 false（Worker）时 `SetRegistered` / `ReconcileAgent`
+	// 必须 fail-closed，只保留执行协调写。
+	// DefinitionAuthority is true only on the control role; workers fail closed.
+	DefinitionAuthority bool
 }
 
 // Scheduler 是定时任务调度器。任务运行期状态一律读库，进程内只保留**注册事实**
@@ -204,8 +245,23 @@ type Scheduler struct {
 	dispatchBatch int
 	missedGrace   time.Duration
 
+	// US-25C：就绪门与定义权（装配期固化）。
+	assetReady          func(ctx context.Context, agent string) error
+	assetReadyHash      func(ctx context.Context, agent string) (string, error)
+	definitionAuthority bool
+	// scanCursor 是到期扫描的两段键集游标（US-25C §2.3.5）：stateMu 保护，锁内零 I/O。
+	// **只有 Start 清空**——SetRegistered / ReplaceEntries 只换内存集合，不得复位。
+	// scanCursor is cleared only by Start; registry refreshes never reset it.
+	scanCursor DueScanCursor
+	// gateWarnMu / gateWarnAt 是就绪门 WARN 的限速表：键为 Agent + 原因，同一原因
+	// 每 5 分钟最多一条（卡 §2.3.5 步骤 ④）。未就绪的行每拍都会命中门，不限速会写满日志。
+	// gateWarnMu throttles the not-ready WARN per agent and reason.
+	gateWarnMu sync.Mutex
+	gateWarnAt map[string]time.Time
+
 	// 构造期固化的只读快照（P-05）：registry 只当 Agent 注册表，definitions 仅供
 	// Start 对账；二者都不得回写，也不缓存运行期任务状态（约束 3）。
+	// ReplaceEntries 在运行期整体替换这两个集合（US-25C C18）。
 	registry    map[string]bool
 	definitions map[string][]Schedule
 
@@ -255,18 +311,7 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 	if opts.StopGrace <= 0 {
 		opts.StopGrace = defaultSchedulerStopGrace
 	}
-	registry := make(map[string]bool, len(opts.Entries))
-	definitions := make(map[string][]Schedule, len(opts.Entries))
-	for _, entry := range opts.Entries {
-		if entry.Registered {
-			registry[entry.Name] = true
-		}
-		var schedules []Schedule
-		if entry.Profile != nil {
-			schedules = append(schedules, entry.Profile.Schedules...)
-		}
-		definitions[entry.Name] = schedules
-	}
+	registry, definitions := deriveEntries(opts.Entries)
 	return &Scheduler{
 		store:         opts.Store,
 		invoker:       opts.Invoker,
@@ -289,10 +334,50 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		pollInterval:  opts.PollInterval,
 		dispatchBatch: opts.DispatchBatch,
 		missedGrace:   opts.MissedGrace,
-		registry:      registry,
-		definitions:   definitions,
-		done:          make(chan struct{}),
+
+		assetReady:          opts.AssetReady,
+		assetReadyHash:      opts.AssetReadyHash,
+		definitionAuthority: opts.DefinitionAuthority,
+
+		registry:    registry,
+		definitions: definitions,
+		done:        make(chan struct{}),
 	}
+}
+
+// deriveEntries 把装载结果派生成调度器的两个只读集合：注册表只收 `Registered`，
+// 定义按 Agent 名保存一份 `Profile.Schedules` 的副本（nil Profile = 空定义）。
+// NewScheduler 与 ReplaceEntries **共用**本函数，派生规则因此逐字相同（US-25C C18）。
+// deriveEntries is the single derivation shared by construction and runtime replacement.
+func deriveEntries(entries []AgentEntry) (map[string]bool, map[string][]Schedule) {
+	registry := make(map[string]bool, len(entries))
+	definitions := make(map[string][]Schedule, len(entries))
+	for _, entry := range entries {
+		if entry.Registered {
+			registry[entry.Name] = true
+		}
+		var schedules []Schedule
+		if entry.Profile != nil {
+			schedules = append(schedules, entry.Profile.Schedules...)
+		}
+		definitions[entry.Name] = schedules
+	}
+	return registry, definitions
+}
+
+// ReplaceEntries 以纯内存方式整体替换调度器的注册集合与定义快照（US-25C C18 /
+// §2.3.4）：派生规则与 NewScheduler 逐字相同；`stateMu` 内整体替换、**锁内零 I/O**；
+// Start 前后语义相同。它**不写库**、**不退休**共享库里未出现的 Agent（只从本进程
+// 内存集合移除），也**不得**复位或清空扫描游标与本圈边界——扫描进度只由 Start 清空。
+// ReplaceEntries swaps both in-memory sets without any I/O, never retires absent agents,
+// and never touches the scan cursor.
+func (s *Scheduler) ReplaceEntries(entries []AgentEntry) error {
+	registry, definitions := deriveEntries(entries)
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.registry = registry
+	s.definitions = definitions
+	return nil
 }
 
 // leaseless 判定本次装配是否缺少执行权：租约仓储或 Worker 身份任一缺失即不可调度。
@@ -328,13 +413,23 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	// ④ 对账：逐已注册 Agent 单事务提交；未注册项不遍历（坏文件不写库）。
 	// 本阶段**只提交**，不注册任何句柄——句柄已经不存在，到期扫描直接读库。
-	for _, agent := range s.registeredAgentNamesLocked() {
-		fresh, _, err := s.commitAgentLocked(ctx, agent, s.definitions[agent], rows)
-		if err != nil {
-			s.logger.Error("启动对账失败", "agent", agent, "error", err)
-			return fmt.Errorf("scheduler: reconcile agent %q: %w", agent, err)
+	// 定义写权缺失（Worker）时退化为**只读对账**：不提交任何定义行，只在下面按库行
+	// 告警；协调写（领取 / 推进 / 执行行）不受影响（US-25C §2.3.1 / C18）。
+	// A worker reconciles read-only: no definition-row commit, warnings only.
+	if s.definitionAuthority {
+		for _, agent := range s.registeredAgentNamesLocked() {
+			fresh, _, err := s.commitAgentLocked(ctx, agent, s.definitions[agent], rows)
+			if err != nil {
+				s.logger.Error("启动对账失败", "agent", agent, "error", err)
+				return fmt.Errorf("scheduler: reconcile agent %q: %w", agent, err)
+			}
+			rows = fresh
 		}
-		rows = fresh
+	} else if owners := s.registeredAgentNamesLocked(); len(owners) > 0 {
+		// 只读对账的可见性：本进程注册了定义，但共享行归控制面写——点名说明为何
+		// 启动时没有任何 `ApplyAgentTasks`，避免运维把"没写"当成对账失败。
+		s.logger.Info("definition authority absent; startup reconcile is read-only",
+			"agents", len(owners))
 	}
 
 	// ⑥ 库里有、本进程工作区没有的 Agent：**不**退休，只报告（F7）。
@@ -352,6 +447,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	s.baseCtx, s.cancelBase = context.WithCancel(context.WithoutCancel(ctx))
 	s.dispatchCtx, s.cancelDispatch = context.WithCancel(s.baseCtx)
 	s.dispatchDone = make(chan struct{})
+	// 扫描游标与冻结边界**只在这里**清空（US-25C §2.3.5）：运行期的集合替换不得把
+	// 长扫描拉回第一页。
+	s.scanCursor = DueScanCursor{}
 	s.started = true
 
 	go s.dispatchLoop(s.dispatchCtx)
@@ -502,24 +600,24 @@ func (s *Scheduler) dispatchLoop(ctx context.Context) {
 // 初始化 → 错失 → 生命周期门 → 领取。单任务失败只记日志、不中断本轮。
 // dispatchOnce runs one due-scan pass: initialize, missed, lifecycle gate, claim.
 func (s *Scheduler) dispatchOnce(ctx context.Context) error {
-	tasks, err := s.dueTasks(ctx)
-	if err != nil {
-		return fmt.Errorf("scheduler: list dispatchable: %w", err)
-	}
 	// 本轮所有到期 / 宽限 / 下一次触发判定共用**数据库时钟**（§2.3.4 的 db_now）：
 	// 线程内一致，且与领取事务里的 CAS 基准同源。读不到就放弃本轮（扫描下一拍重试），
-	// 不用进程时钟顶替——时钟偏差正是这里要消除的变量（F8）。
+	// 不用进程时钟顶替——时钟偏差正是这里要消除的变量（F8）。开圈那一拍的 dbNow
+	// 直接取冻结边界里的数据库时间（同一次读）。
 	// One database-clock reading per pass; a failure skips the pass rather than falling
 	// back to a process clock that could disagree with the claim transaction.
-	now, err := s.dbNow(ctx)
+	tasks, now, cursor, err := s.duePage(ctx)
 	if err != nil {
-		return fmt.Errorf("scheduler: db now: %w", err)
+		return err
 	}
 	registered := s.registeredSnapshot()
+	complete := true
 	for _, due := range tasks {
-		// 停止领取：扫描 ctx 一取消就不再处理本轮剩余项（§2.3.11 [1]）。
+		// 停止领取：扫描 ctx 一取消就不再处理本轮剩余项（§2.3.11 [1]）。本页没走完
+		// 就**不推进**扫描游标——下次重扫整页（领取有 CAS，不会重复）。
 		if ctx.Err() != nil {
-			return nil
+			complete = false
+			break
 		}
 		// 防御性复查：仓储已按 enabled / retired 过滤，这里再判一次，避免可见性
 		// 判据分叉（管理读面与调度路径共用同一规则）。
@@ -545,8 +643,15 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) error {
 		}
 
 		if due.NextFireAt.IsZero() {
-			// 迁移后的遗留行 / 新建行：只初始化，不执行（图 4 第一个分支）。
-			if err := s.store.SetNextFire(ctx, due.Task.TaskID, nil, next); err != nil {
+			// 迁移后的遗留行 / 新建行：只初始化，不执行（图 4 第一个分支）。初始化是
+			// **行条件写**：扫描到 NULL 只是快照，不是写权。若在读取与写入之间外部
+			// （管理面重写 / 测试夹具武装）已把 next_fire_at 改成非 NULL，本次初始化
+			// 必须放弃——ErrStaleNextFire 按既有口径无声跳过（与下方推进分支一致），
+			// 否则会把外部刚写下的触发覆盖成 cron 计算的未来值，触发被静默吞掉。
+			// The NULL-initialization is a conditional write; losing the race to an
+			// external writer abandons this round with ErrStaleNextFire, silently.
+			if err := s.store.SetNextFire(ctx, due.Task.TaskID, nil, next); err != nil &&
+				!errors.Is(err, ErrStaleNextFire) {
 				s.logger.Error("initialize next fire",
 					append(s.runAttrs(due.Task, "", TriggerCron), "error", err)...)
 			}
@@ -580,11 +685,29 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) error {
 			continue
 		}
 
-		claimed, claimErr := s.store.ClaimDueTrigger(ctx, due.Task.TaskID, due.NextFireAt, next,
-			s.worker, s.leaseTTL)
+		// ④ 就绪门（US-25C FR-25C-11 / 卡 §2.3.5）：本进程还没有该 Agent 的**已安装**
+		// 版本时不领取、不推进 `next_fire_at`、不写执行行——本次触发原样留在原地，
+		// 下一拍重新求值。门在 ③ 之后：越过宽限的未就绪行必须**如实记 missed**，而不是
+		// 被门悄悄跳过（那是"永不消失"的假条）。
+		// The readiness gate runs after the missed branch: an overdue unready row still
+		// records its missed skip instead of silently holding the trigger forever.
+		expectHash, readyErr := s.readyHash(ctx, due.Task.Agent)
+		if readyErr != nil {
+			s.warnNotReady(due.Task, readyErr)
+			continue
+		}
+
+		claimed, claimErr := s.claimDue(ctx, due, next, expectHash)
 		switch {
 		case errors.Is(claimErr, ErrTriggerAlreadyClaimed), errors.Is(claimErr, ErrStaleNextFire):
 			// 另一 Worker 已领取 / 已推进：本轮无声跳过（FR-24-11）。
+			continue
+		case errors.Is(claimErr, ErrAssetNotReady), errors.Is(claimErr, ErrAssetMoved):
+			// 指针缺失 / 扫描后、领取前被发布抢先：**零写入**结局，行留在到期集合，
+			// 再次被考察时从 ④ 重新求值。不得引入"暂存触发、稍后补发"的第二套待办
+			// （卡 §2.3.5「不得用重放补救」）。
+			s.logger.Debug("pinned claim refused, trigger left in place",
+				append(s.runAttrs(due.Task, "", TriggerCron), "reason", claimErr.Error())...)
 			continue
 		case errors.Is(claimErr, ErrTaskDisabled):
 			// 扫描之后被停用：本轮无声跳过，不写执行行、不推进。重新启用后若
@@ -611,7 +734,160 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) error {
 			_ = s.executeClaimed(s.executionContext(), claimed, spec)
 		})
 	}
+	if complete {
+		// 前进不看领取结果：④ 未就绪、⑤ 零写入拒绝、③ missed 都照常前进（卡 §2.3.5）。
+		s.commitScanCursor(cursor, tasks)
+	}
 	return nil
+}
+
+// duePage 取一拍到期扫描的一页，并在需要时开新圈（US-25C §2.3.5）：
+//   - 存储实现 `AgentDueLister` 时按两段键集游标取一页；`Sweep == nil` 表示本拍开圈，
+//     先以**一次**只读查询冻结边界（数据库时间 + NULL 段上界），并用同一次读到的
+//     数据库时间充当本拍 dbNow；此后各拍照常各读一次 dbNow。
+//   - 未实现扩展（轻装配 / 零值单测）时退回全局批次 + 装配时钟，语义与从前一致。
+//
+// 边界读不到就放弃本拍（**不推进**游标），下一拍重试；不得用进程时钟顶替。
+// duePage returns one page of the due scan and opens a new sweep when needed; a failed
+// bounds read abandons the pass without advancing the cursor.
+func (s *Scheduler) duePage(ctx context.Context) ([]DueTask, time.Time, DueScanCursor, error) {
+	lister, ok := s.store.(AgentDueLister)
+	if !ok {
+		tasks, err := s.store.ListDispatchable(ctx, s.dispatchBatch)
+		if err != nil {
+			return nil, time.Time{}, DueScanCursor{}, fmt.Errorf("scheduler: list dispatchable: %w", err)
+		}
+		now, err := s.dbNow(ctx)
+		if err != nil {
+			return nil, time.Time{}, DueScanCursor{}, fmt.Errorf("scheduler: db now: %w", err)
+		}
+		return tasks, now, DueScanCursor{}, nil
+	}
+	// 扫描不持 stateMu：先取注册集合快照，再在快照上排序——直接遍历 s.registry 会与
+	// SetRegistered 的并发增删构成数据竞争（归档屏障在派发循环运行时就是这条路径）。
+	// The scan holds no lock: copy the registry first, then sort the copy.
+	agents := sortedRegisteredNames(s.registeredSnapshot())
+	if len(agents) == 0 {
+		return nil, time.Time{}, DueScanCursor{}, nil
+	}
+	cursor := s.scanCursorSnapshot()
+	var now time.Time
+	if cursor.Sweep == nil {
+		bounds, err := lister.ReadSweepBounds(ctx, agents)
+		if err != nil {
+			return nil, time.Time{}, DueScanCursor{}, fmt.Errorf("scheduler: read sweep bounds: %w", err)
+		}
+		cursor = DueScanCursor{Sweep: &bounds, InNullSegment: true}
+		now = bounds.Cutoff
+	} else {
+		dbNow, err := s.dbNow(ctx)
+		if err != nil {
+			return nil, time.Time{}, DueScanCursor{}, fmt.Errorf("scheduler: db now: %w", err)
+		}
+		now = dbNow
+	}
+	tasks, err := lister.ListDispatchableForAgents(ctx, agents, &cursor, s.dispatchBatch)
+	if err != nil {
+		return nil, time.Time{}, DueScanCursor{}, fmt.Errorf("scheduler: list dispatchable: %w", err)
+	}
+	return tasks, now, cursor, nil
+}
+
+// scanCursorSnapshot 复制当前扫描游标（stateMu 内取，锁内零 I/O）。
+// scanCursorSnapshot copies the cursor under the state mutex.
+func (s *Scheduler) scanCursorSnapshot() DueScanCursor {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.scanCursor
+}
+
+// commitScanCursor 按本页末行推进两段游标：整页取自 NULL 段时按 `task_id` 前进（整页
+// NULL 也前进，不得复位），取自非 NULL 段时按 `(next_fire_at, task_id)` 前进。
+//
+// 短页是**段尾信号**——它表示本圈边界内的行已经走完，而不是"此刻恰好没有到期触发"：
+// 持续到期时后者永远不成立（卡 §2.3.5）。因此短页（含空页）即结束本圈、清空边界；
+// 下一拍开新圈并重新冻结 cutoff 与 NULL 上界。
+// commitScanCursor advances the two-segment cursor; a short page ends the sweep.
+func (s *Scheduler) commitScanCursor(cursor DueScanCursor, page []DueTask) {
+	if cursor.Sweep == nil {
+		return
+	}
+	if len(page) < s.dispatchBatch {
+		s.setScanCursor(DueScanCursor{})
+		return
+	}
+	last := page[len(page)-1]
+	next := DueScanCursor{Sweep: cursor.Sweep}
+	if last.NextFireAt.IsZero() {
+		next.InNullSegment = true
+		next.NullAfterTaskID = last.Task.TaskID
+	} else {
+		at := last.NextFireAt
+		next.InNullSegment = false
+		next.AfterNextFireAt = &at
+		next.AfterTaskID = last.Task.TaskID
+	}
+	s.setScanCursor(next)
+}
+
+// setScanCursor 写回扫描游标（stateMu 内，锁内零 I/O）。
+// setScanCursor stores the cursor under the state mutex.
+func (s *Scheduler) setScanCursor(cursor DueScanCursor) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.scanCursor = cursor
+}
+
+// readyHash 求值领取前的就绪门（卡 §2.3.5 步骤 ④）：返回本次领取可用的期望哈希，
+// error 表示未就绪。带哈希的端口优先——门与领取哈希来自同一份就绪快照，不会在两次
+// 读之间撕裂；两个端口都没接线时视为不设门（轻装配）。
+// readyHash evaluates the readiness gate and returns the claim's expected hash.
+func (s *Scheduler) readyHash(ctx context.Context, agent string) (string, error) {
+	if s.assetReadyHash != nil {
+		return s.assetReadyHash(ctx, agent)
+	}
+	if s.assetReady != nil {
+		return "", s.assetReady(ctx, agent)
+	}
+	return "", nil
+}
+
+// warnNotReady 按 `(Agent, 原因)` 限速地记一条 WARN：未就绪的行每拍都会命中 ④，
+// 不限速会把日志写满（卡 §2.3.5：同一原因每 5 分钟最多一条）。
+// warnNotReady throttles one WARN per agent and reason every five minutes.
+func (s *Scheduler) warnNotReady(task TaskRecord, reason error) {
+	key := task.Agent + "\x00" + reason.Error()
+	now := s.now()
+	s.gateWarnMu.Lock()
+	if s.gateWarnAt == nil {
+		s.gateWarnAt = make(map[string]time.Time)
+	}
+	if last, ok := s.gateWarnAt[key]; ok && now.Sub(last) < schedulerNotReadyWarnInterval {
+		s.gateWarnMu.Unlock()
+		return
+	}
+	s.gateWarnAt[key] = now
+	s.gateWarnMu.Unlock()
+	s.logger.Warn("agent not ready, trigger left in place",
+		append(s.runAttrs(task, "", TriggerCron), "reason", reason.Error())...)
+}
+
+// claimDue 领取一次计划触发：有期望哈希时走钉住版本（`AssetPinnedClaimer`），
+// 否则走既有未钉住的领取。哈希来源已就绪而存储不支持钉住属于装配缺陷——**不得**
+// 退回未钉住的领取，那等于把 FR-25C-08 的版本绑定整条绕开。
+// claimDue prefers the pinned claim whenever an expected hash is available.
+func (s *Scheduler) claimDue(ctx context.Context, due DueTask, next time.Time,
+	expectHash string,
+) (DueExecution, error) {
+	if expectHash == "" {
+		return s.store.ClaimDueTrigger(ctx, due.Task.TaskID, due.NextFireAt, next, s.worker, s.leaseTTL)
+	}
+	claimer, ok := s.store.(AssetPinnedClaimer)
+	if !ok {
+		return DueExecution{}, errSchedulerNoPinnedClaim
+	}
+	return claimer.ClaimDueTriggerPinned(ctx, due.Task.TaskID, due.NextFireAt, next,
+		s.worker, s.leaseTTL, expectHash)
 }
 
 // executionContext 返回在途执行与其续约使用的父 ctx：Start 建立的 baseCtx。
@@ -777,6 +1053,17 @@ func (s *Scheduler) runClaimed(ctx context.Context, claimed DueExecution, spec s
 		// 系统代投接管投递：本 Run 不向模型提供 `notify`，授权层同时固定为 none。
 		SuppressNotify: deliveryPrepared,
 	}
+	if claimed.PinnedBundleHash != "" {
+		// 领取事务已钉住版本（卡 §2.3.5.1 T1→T2 的传递）：准入按这枚凭证复核领取
+		// 记录与执行租约，**不**重读当时的指针。手动补跑没有领取事务，哈希为空，
+		// 因此保持既有当前指针判据。
+		// The claim transaction pinned the bundle; manual reruns carry no pin.
+		req.Pinned = &ClaimedBundlePin{
+			ExecutionID: claimed.ExecutionID,
+			BundleHash:  claimed.PinnedBundleHash,
+			Lease:       claimed.Lease,
+		}
+	}
 	res, err = s.invoker.Run(leaseCtx, req)
 
 	status, errMsg := s.classifyRun(task, runID, trigger, res, err)
@@ -881,25 +1168,6 @@ func (s *Scheduler) nextFire(task TaskRecord, from time.Time) (time.Time, string
 		return time.Time{}, spec, err
 	}
 	return next, spec, nil
-}
-
-// dueTasks 取本轮到期扫描的候选行。存储实现 `AgentDueLister` 时只取本地注册集合内的
-// 行——全局批次会被其他 Worker 工作区的到期行占满，而它们永远不会被本进程推进，
-// 本地任务会因此长期饿死（F6）。未实现该扩展时退回全局批次 + 循环内的注册过滤。
-// dueTasks narrows the batch to locally registered agents when the store supports it.
-func (s *Scheduler) dueTasks(ctx context.Context) ([]DueTask, error) {
-	lister, ok := s.store.(AgentDueLister)
-	if !ok {
-		return s.store.ListDispatchable(ctx, s.dispatchBatch)
-	}
-	// 扫描不持 stateMu：先取注册集合快照，再在快照上排序——直接遍历 s.registry 会与
-	// SetRegistered 的并发增删构成数据竞争（归档屏障在派发循环运行时就是这条路径）。
-	// The scan holds no lock: copy the registry first, then sort the copy.
-	agents := sortedRegisteredNames(s.registeredSnapshot())
-	if len(agents) == 0 {
-		return nil, nil
-	}
-	return lister.ListDispatchableForAgents(ctx, agents, s.dispatchBatch)
 }
 
 // dbNow 返回本轮扫描使用的时钟：存储提供 `DBNowReader` 时取数据库时钟（模块卡
@@ -1405,6 +1673,15 @@ func (s *Scheduler) ReconcileAgent(ctx context.Context, agent string, tasks []Sc
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
+	// 定义写权缺失即失败关闭（US-25C FR-25C-13）：静默 no-op 会让装配缺陷不可见，
+	// 照写则会把控制面已发布的共享定义盖回本机旧种子。放在启动判定**之前**——这条
+	// 路径的存在本身就说明有人以为本进程能写定义列。
+	// A worker refuses the call outright, before the started check.
+	if !s.definitionAuthority {
+		s.logger.Error("reconcile refused: no definition authority", "agent", agent)
+		return errSchedulerNoDefinitionAuthority
+	}
+
 	if !s.started || s.stopped {
 		s.logger.Debug("调度器未启动，定义不落库", "agent", agent)
 		return nil
@@ -1438,6 +1715,14 @@ func (s *Scheduler) SetRegistered(agent string, registered bool) error {
 	}
 	if _, ok := s.registry[agent]; !ok {
 		return nil
+	}
+	// 移出注册集合会退休该 Agent 在共享库里的全部未退休任务（下方 ApplyAgentTasks）
+	// ——Worker 上必须失败关闭，且**不改**本进程内存集合，避免"注册已撤、库行还在"
+	// 的半截状态；运行期的集合替换走 ReplaceEntries（纯内存、不退休），见 C18。
+	// Removal retires shared rows, so a worker refuses it before touching memory.
+	if !s.definitionAuthority {
+		s.logger.Error("unregister refused: no definition authority", "agent", agent)
+		return errSchedulerNoDefinitionAuthority
 	}
 	delete(s.registry, agent)
 	if !s.started || s.stopped {

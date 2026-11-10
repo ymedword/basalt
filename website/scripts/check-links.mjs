@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { BASE, REPO_URL } from '../.vitepress/data/navigation.mjs'
+import { BASE, REPO_URL, DEMO_CONSOLE_URL } from '../.vitepress/data/navigation.mjs'
 
 export function isForbiddenPath(value, internal = false) {
   let name
@@ -21,8 +21,10 @@ function decode(value) {
 }
 function allowedExternal(url) {
   const repo = new URL(REPO_URL)
+  const demo = new URL(DEMO_CONSOLE_URL)
   return (url.protocol === 'https:' && url.hostname === repo.hostname && (url.pathname === repo.pathname || url.pathname.startsWith(repo.pathname + '/'))) ||
-    (url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port === '8080' && url.pathname === '/console/' && !url.search)
+    (url.protocol === 'http:' && url.hostname === '127.0.0.1' && url.port === '8080' && url.pathname === '/console/' && !url.search) ||
+    (url.protocol === demo.protocol && url.hostname === demo.hostname && url.port === demo.port && url.pathname === demo.pathname)
 }
 export function checkLinks({ distDir, base = BASE }) {
   const findings = []

@@ -219,8 +219,20 @@ func resourceVersionDetailView(d core.ResourceVersionDetail) ResourceVersionDeta
 // ResourcePublishResultView marks the returned version published; applied is the
 // negation of pending_restart, and the revert source is derived from the request.
 type ResourcePublishResultView struct {
-	Version        ResourceVersionView `json:"version"`
-	PendingRestart bool                `json:"pending_restart"`
+	Version        ResourceVersionView       `json:"version"`
+	PendingRestart bool                      `json:"pending_restart"`
+	Publish        []BundlePublishResultView `json:"publish,omitempty"`
+}
+
+// BundlePublishResultView 是契约 `ResourcePublishResult.publish` 的一项（US-25C）：技能
+// 发布触发的逐 Agent 重发结果。`error` 只在 missing / failed 时出现，且是固定中文原因——
+// 不携带底层错误原文与路径。
+// BundlePublishResultView is one per-agent republish outcome; `error` appears only for
+// missing / failed and is a fixed reason, never raw backend text.
+type BundlePublishResultView struct {
+	Agent  string `json:"agent"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 // resourcePublishResultView 投影一次发布结果。请求版本号与新版本号相同说明这是
@@ -232,10 +244,17 @@ func resourcePublishResultView(req core.ResourcePublishRequest, result core.Reso
 	if req.VersionID != nil && *req.VersionID != result.Version.ID {
 		revertedFrom = req.VersionID
 	}
-	return ResourcePublishResultView{
+	view := ResourcePublishResultView{
 		Version:        resourceVersionView(result.Version, true, !result.PendingRestart, revertedFrom),
 		PendingRestart: result.PendingRestart,
 	}
+	if len(result.Publish) > 0 {
+		view.Publish = make([]BundlePublishResultView, len(result.Publish))
+		for i, item := range result.Publish {
+			view.Publish[i] = BundlePublishResultView{Agent: item.Agent, Status: item.Status, Error: item.Error}
+		}
+	}
+	return view
 }
 
 // CredentialRevokeView 是契约 CredentialRevokeResult：只回状态与版本计数，

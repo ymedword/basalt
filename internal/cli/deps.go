@@ -169,6 +169,14 @@ type Deps struct {
 	// The asset command surface; a nil port is a wiring gap and install fails closed.
 	Assets AssetsPort
 
+	// AssetStatus 是分发诊断的**只读**端口（见 ports.go）：`assets status` 经它逐
+	// Agent 取指针 / 已安装 / 载荷 / 技能物化 / 阻塞原因，只开只读会话、不触发同步、
+	// 不取实例锁、不写任何行。拿到 nil 即报缺件——命令面**不得**自己打开数据库补出
+	// 第二条读面。
+	// The read-only distribution diagnostic; a nil here is a wiring gap, never a reason
+	// for the command surface to open a second database path.
+	AssetStatus AssetStatusReader
+
 	// DemoPrepare 是 `demo workflow prepare` 的端口（见 ports.go）：计划只读、应用分步
 	// 执行，管理面写动作全部经实现侧的管理端点与审计（US-25 T017/T018）。拿到 nil 即
 	// 报缺件——命令面不得自建第二套 HTTP 客户端或旁路写面。

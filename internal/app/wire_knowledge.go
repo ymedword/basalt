@@ -118,6 +118,11 @@ type knowledgeWiringDeps struct {
 	// 解析声明名），这里复用而不是再建一个——两个实例只是两个指针，但"同一个"能让
 	// 未来加缓存时不会出现两份互不可见的目录态。
 	Catalog *postgres.KnowledgeCatalogStore
+	// Role 是启动角色（D-25C-06）：`roleControl` 可建首代际（`Ensure`），
+	// `roleWorker` 只做只读固定（`Pin`）——缺 active 代际时失败关闭并点名先由控制面
+	// 初始化（FR-25C-12），**不得**在 Worker 上执行代际写。
+	// Role decides whether this process may bootstrap the first generation.
+	Role runtimeRole
 	// Logger / Now 与运行时其余部分同源。
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -206,9 +211,12 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 	}
 
 	// 代际在**启动期**固定：本 US 没有"运行期切换代际"的端点，固定点是装配而不是
-	// 每请求；`Ensure` 在 active 代际与配置不一致时拒绝启动（换模型必须显式切换，
-	// 启动路径不得自动切），无 active 代际时建首代际——两句都是 C-09 的原文。
-	// The generation is pinned at startup; there is no runtime switch in this US.
+	// 每请求；active 代际与配置不一致时拒绝启动（换模型必须显式切换，启动路径不得
+	// 自动切）——那句是 C-09 的原文。控制面无 active 代际时建首代际、校验并激活
+	// （`Ensure`）；Worker **只**做只读固定（`Pin`），缺 active 代际时失败关闭并点名
+	// 先由控制面创建并激活，不在 Worker 上执行任何代际写（FR-25C-12）。
+	// The generation is pinned at startup; control may bootstrap the first one, the
+	// worker only reads it and fails closed when none is active.
 	// 两阶段审计的**唯一** SQL 入口：摄取侧直接用 `embedBatch` 写它，查询侧由
 	// `auditedEmbedder` 写它——同一个实例、两条各写各的路径，互不嵌套（嵌套会把
 	// 每批调用双记成两行）。查询侧 embedding（管理面检索与 `recall_memory` 语义路）
@@ -230,10 +238,21 @@ func newKnowledgeWiring(ctx context.Context, deps knowledgeWiringDeps) (*knowled
 			Logger: logger,
 			Now:    now,
 		})
-		pinned, err := manager.Ensure(ctx, knowledge.GenerationSpec{
+		spec := knowledge.GenerationSpec{
 			EmbeddingModel: strings.TrimSpace(cfg.Embedding.Model),
 			Dimensions:     cfg.Embedding.Dimensions,
-		})
+		}
+		var pinned knowledge.IndexGeneration
+		// 角色门（FR-25C-12）：建首代际（`Ensure`）是共享初始化写，只归控制面；Worker
+		// 只读固定（`Pin`），缺 active 代际失败关闭。判定走统一清单，不另设例外。
+		// Generation bootstrap is a shared-initialization write; workers only pin.
+		if deps.Role.allowSharedInit(sharedInitKnowledgeGeneration) {
+			pinned, err = manager.Ensure(ctx, spec)
+		} else {
+			// Worker 只读固定：缺 active 代际即 `ErrGenerationNotInitialized`，
+			// 错误原文点名先由控制面初始化。
+			pinned, err = manager.Pin(ctx, spec)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("固定索引代际: %w", err)
 		}

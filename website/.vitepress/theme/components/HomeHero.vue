@@ -8,9 +8,9 @@ const zh = computed(() => lang.value.startsWith('zh'))
 
 <template>
   <section class="home-hero" aria-labelledby="home-title">
-    <p class="eyebrow">BASALT / AGENT OS</p>
-    <h1 id="home-title">{{ zh ? '看见 Agent 的工作过程。' : 'See your agents at work.' }}</h1>
-    <p class="hero-description">{{ zh ? '面向企业团队的自托管 Agent OS。' : 'A self-hosted Agent OS for enterprise teams.' }}<br>{{ zh ? '独立业务 Agent，共享运行底座。' : 'Independent agents. Shared infrastructure.' }}</p>
+    <p class="eyebrow">AGENT OS</p>
+    <h1 id="home-title">{{ zh ? 'Basalt｜企业自托管 Agent OS' : 'Basalt | Self-hosted Agent OS' }}</h1>
+    <p class="hero-description">{{ zh ? '独立业务 Agent，共享运行、调度与审计底座。' : 'Independent business agents share one runtime, scheduler and audit trail.' }}<br>{{ zh ? '一个 Go 二进制，运行在你自己的基础设施上。' : 'One Go binary, on infrastructure you run yourself.' }}</p>
     <div class="hero-actions">
       <a class="action-primary" :href="withBase(localePath(zh ? 'zh' : 'en', 'quickstart'))">{{ zh ? '开始使用' : 'Get started' }} <span aria-hidden="true">→</span></a>
       <a class="action-secondary" :href="withBase(localePath(zh ? 'zh' : 'en', 'home') + '#demo')">{{ zh ? '观看演示' : 'Watch demo' }}</a>

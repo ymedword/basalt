@@ -396,6 +396,25 @@ var (
 	// ErrAgentLifecycleMismatch marks same-generation disagreement, a missing /
 	// inactive index row, or an absent lifecycle expectation (P-16 refuses zero).
 	ErrAgentLifecycleMismatch = errors.New("agent lifecycle mismatch")
+
+	// ErrClaimPinInvalid 表示 Run 携带的固定版本凭证不再成立（US-25C FR-25C-08）：
+	// 领取记录缺失、状态非 started、`run_id` / Agent / 哈希任一不符，**或**执行租约的
+	// owner / epoch / 已释放 / 已过期任一不符——**fail-closed**：整笔准入事务回滚，
+	// 零新 Run、零业务调用。web 复用 503 `ASSET_UNAVAILABLE`，**不新增**契约错误码。
+	// ErrClaimPinInvalid marks a pinned claim that no longer holds: the execution row
+	// disagrees, or the execution lease is no longer held. Admission rolls back entirely.
+	ErrClaimPinInvalid = errors.New("claimed execution pin is invalid")
+
+	// ErrPolicyStale 表示四类运行期策略（允许域 / 拒绝域 / 网络例外 / 执行档位）的
+	// 最近一次**全部成功**的核对已超过 `policy.max_stale`，或从未成功过（US-25C
+	// FR-25C-16）——web 映射 503 `POLICY_STALE`，拒绝新 Run。过期判定只认「最近成功
+	// 核对时间」，与内容版本无关：内容长期不变本身**不**构成过期，只有读失败才会让
+	// 时间戳停在原地、随实际时间推移越过阈值。被拒时策略快照不被改写，恢复由控制面
+	// 刷新成功后自动解除。
+	// ErrPolicyStale marks a policy set whose last fully successful verification is
+	// older than policy.max_stale (or never happened). Freshness never follows content
+	// timestamps; only failed rounds keep the stamp from advancing.
+	ErrPolicyStale = errors.New("runtime policy snapshot is stale")
 )
 
 // AdminError 把管理写面分类与结构化 `data` 绑定：错误信封的 `data` 只承载契约固定

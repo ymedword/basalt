@@ -105,6 +105,79 @@ type DueExecution struct {
 	Lease       LeaseToken
 	// RunID 由领取事务分配，与 `task_executions.run_id` 同一值。
 	RunID string
+	// PinnedBundleHash 是领取事务内与执行行同笔写入的固定 bundle 哈希
+	// （`task_executions.pinned_bundle_hash`，US-25C FR-25C-08）：Run 准入只按它
+	// 复核领取记录，**不得**在准入时重读当时的指针。
+	// PinnedBundleHash is fixed by the claim transaction and is the only hash the
+	// admission path may trust for this execution.
+	PinnedBundleHash string
+}
+
+// SweepBounds 是一圈到期扫描的冻结边界（US-25C §2.3.5）：开圈时由**一次**只读查询
+// 取数据库时间与本圈 NULL 段的最大 `task_id`。非 NULL 段只考察 `next_fire_at <= Cutoff`，
+// NULL 段只考察 `task_id <= NullUpperTaskID`；两者都只出不进，因此一圈必然结束。
+// `NullUpperTaskID` 为空串表示本圈没有 NULL 行。
+// SweepBounds freezes one sweep: the database clock plus the largest NULL-segment task id.
+type SweepBounds struct {
+	Cutoff          time.Time
+	NullUpperTaskID string
+}
+
+// DueScanCursor 是到期扫描的两段键集游标（US-25C FR-25C-11）：`Sweep == nil` 表示
+// 下一拍开新圈；`InNullSegment` 为真时按 `task_id` 在 NULL 段前进，为假时按
+// `(next_fire_at, task_id)` 前进。非 NULL 段首屏 `AfterNextFireAt == nil`——存储层
+// **不得**把 NULL 当元组下界拼接。
+//
+// 游标由调度器持在 `stateMu` 内（锁内零 I/O），**只有 `Start` 清空**：
+// `SetRegistered` / `ReplaceEntries` 只换内存集合，不得复位扫描进度。
+// DueScanCursor is the two-segment keyset cursor; only Start ever clears it.
+type DueScanCursor struct {
+	Sweep           *SweepBounds
+	InNullSegment   bool
+	NullAfterTaskID string
+	AfterNextFireAt *time.Time
+	AfterTaskID     string
+}
+
+// AssetPinnedClaimer 是到期领取的钉住扩展（TaskStore 的可选扩展，US-25C FR-25C-08）：
+// 在**同一领取事务**内锁住发布指针行并核对期望哈希，成功时把哈希写进 started 执行行。
+// 指针缺失 / 已撤销与哈希不符分别返回 `ErrAssetNotReady` / `ErrAssetMoved`，两者都
+// **零写入**（不写执行行、不推进 `next_fire_at`）。
+// AssetPinnedClaimer is the optional pinned-claim extension of TaskStore; both refusal
+// outcomes write nothing at all.
+type AssetPinnedClaimer interface {
+	ClaimDueTriggerPinned(ctx context.Context, taskID string, plannedAt, nextFireAt time.Time,
+		owner WorkerIdentity, ttl time.Duration, expectHash string) (DueExecution, error)
+}
+
+// ClaimedBundlePin 是调度通道带入 Run 的固定版本凭证（§2.3.5.1）：
+// `RunRequest.Pinned` **只由调度通道填**，web / cli / admin 一律 nil。
+// ClaimedBundlePin is filled only by the scheduling path; other entries leave it nil.
+type ClaimedBundlePin struct {
+	ExecutionID int64
+	BundleHash  string
+	Lease       LeaseToken
+}
+
+// ClaimedPinRecord 是准入回读的领取记录（执行行 + 领取时写下的租约副本）：
+// `Agent` 经 `task_executions.task_id` 关联 `scheduled_tasks.agent_name` 读出
+// （执行行没有 agent 列）；owner / epoch 来自领取时写下的副本，仅供准入的一致性前置。
+// ClaimedPinRecord is the claimed execution row plus the lease copy written at claim time.
+type ClaimedPinRecord struct {
+	ExecutionID    int64
+	RunID          string
+	Agent          string
+	Status         string
+	BundleHash     string
+	OwnerWorkerID  string
+	OwnershipEpoch int64
+}
+
+// PinnedClaimReader 是准入路径回读领取记录的消费方端口（实现在 storage）：
+// `(零值, false, nil)` 表示查无此行，调用方据此映射为 `ErrClaimPinInvalid`。
+// PinnedClaimReader reads the claim record for admission; a miss is (zero, false, nil).
+type PinnedClaimReader interface {
+	ReadClaimedPin(ctx context.Context, executionID int64) (ClaimedPinRecord, bool, error)
 }
 
 // ExecutionRecord 是 `task_executions` 的一行（执行历史；无 Run 的终态行 RunID 为空）。
@@ -188,17 +261,24 @@ type TaskStore interface {
 }
 
 // AgentDueLister 是到期扫描的**可选扩展**（不属于冻结的 TaskStore 面）：只返回属于
-// 给定 Agent 集合的到期任务。
+// 给定 Agent 集合的到期任务，并按两段键集游标分页（US-25C FR-25C-11）。
 //
 // 为什么需要它：`ListDispatchable` 是全局批次（所有 Worker 的 Agent 一起按 next_fire_at
 // 排序取前 N 条）。多 Worker 下其他工作区的到期行既不归本进程领取、又不会被本进程推进，
 // 当它们的条数达到单轮上限时，本地 Agent 的任务**永远**进不了批次（F6 饿死）。
 // 存储实现本扩展时，调度器按本地注册集合过滤后再取；未实现（单进程 / 轻装配）时退回
 // 全局批次 + 内存过滤，语义与从前一致。
+//
+// 扫描公平的扩展面（卡 §3.1.2）：`ReadSweepBounds` **每圈一次**取冻结边界（数据库时间
+// 与 NULL 段上界），`ListDispatchableForAgents` 单拍只取一页；`after == nil` 表示调用方
+// 尚未开圈，存储层**不得**自行取边界，只按本拍传入的游标取一页（`Sweep` 为空时按
+// 等价于旧全局批次的语义取首屏）。
 // AgentDueLister is an optional due-scan extension: it narrows the batch to the given
-// agents so rows belonging to other workers can never starve the local pass.
+// agents and pages it through the two-segment keyset cursor.
 type AgentDueLister interface {
-	ListDispatchableForAgents(ctx context.Context, agents []string, limit int) ([]DueTask, error)
+	ListDispatchableForAgents(ctx context.Context, agents []string, after *DueScanCursor,
+		limit int) ([]DueTask, error)
+	ReadSweepBounds(ctx context.Context, agents []string) (SweepBounds, error)
 }
 
 // DBNowReader 是扫描时钟的可选扩展：有数据库时钟时，到期判定、错失宽限与下一次触发
