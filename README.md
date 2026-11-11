@@ -253,6 +253,36 @@ Two kinds of claim live in this repository, and they are not interchangeable:
 
 A successful MCP connection proves only that a server started and answered its tool list — it is neither of the two claims above.
 
+### Measured baseline: single-process Flow capacity (2026-11-11)
+
+This is an isolated single-process baseline, not a production SLO and not a real-model benchmark. The model is a loopback OpenAI-compatible stub with a fixed 50 ms delay; the run uses a local PostgreSQL and no external network, real model or multi-host deployment. The numbers are a snapshot of commit `640b1de` and will change on another machine or a later revision.
+
+| Environment | Value |
+| --- | --- |
+| Host | Windows 11 (10.0.26300), 12th Gen Intel Core i7-12700, 12 cores / 20 threads, 31.8 GB RAM |
+| Runtime | WSL2 Ubuntu 26.04 LTS, kernel 6.6.114.1-microsoft-standard-WSL2, 20 vCPU, 15.5 GiB visible memory |
+| Toolchain | Go 1.27.3 (linux/amd64) |
+| Database | PostgreSQL 17.11 (Debian), local development container on the same host |
+| Workload | 200 independent tasks × 20 nodes, `max_active` 4, `max_open` 32, mock model delay 50 ms |
+| Build | binary SHA-256 `5dfb1b0781b09dc198f7aa92c31afadd875fb20359675a625b1ef907111e2161`; config SHA-256 `717e13dcd217c8716c2f8b886393f35bed9ea967a550a2b4e4f2083ae275f71f` |
+| Date | 2026-11-11 |
+
+| Metric | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| Task submission, 200 samples | 74.5 ms | 90.3 ms | 98.5 ms |
+| Task status read, 1,705 samples | 9.6 ms | 12.5 ms | 15.1 ms |
+| Ready to start with no queued slot, 80 samples | 25 ms | 31 ms | 124 ms |
+| Queued first node start | 1,382 ms | 1,557 ms | 1,642 ms |
+
+All 200 tasks and 4,000 node runs completed with a failure rate of 0. Peak resident memory was 56,549,376 bytes (~54 MiB); the shared test database peaked at 10 connections and 124 relation locks, with at most one lock-waiting connection (maximum observed wait 13.3 ms). The load phase lasted 215.1 s. A binary restart with 32 open tasks reconciled in 5,875 ms: 28 tasks completed safely, and the 4 with an unknown external action stayed non-terminal with zero replay.
+
+Reproduce with the end-to-end suite (see [Operations](docs/Operations.md) for the measured table and its boundaries):
+
+```sh
+go test -count=1 -timeout=1200s -tags=e2e ./internal/e2e \
+  -run '^TestFlow_(BinaryCapacity200TasksAndUnqueuedLatency|BinaryRestartReconciles32OpenWithin30Seconds)$' -v
+```
+
 ## Documentation
 
 | Your goal | Start here |

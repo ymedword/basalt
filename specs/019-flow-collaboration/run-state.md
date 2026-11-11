@@ -849,3 +849,13 @@ Claude接手时保留该待办并告知用户，不以此前T037的四角色证�
 main 从 ca9a0d2 快进到 7d7968c 并推送 origin/main；推送触发同 SHA 的重复运行 41773179803。合并为纯快进，未改写历史、契约或已发布迁移。
 仍未落实：`bid-general` 及 scope／delivery／commercial 三组对照模板的默认随包增量，保留为后续待办，不登记为已实现或已验收。
 未打 tag、未发布、未部署；未读取或上传发布私钥；60481 人工实例与 8080 用户演示未改动；本轮无真实模型调用。
+
+### 2026-11-11 最终候选容量与32任务恢复复跑
+
+按用户“压测并补数据”要求，在 HEAD `640b1dee06681278edebf95831a13ff0ccbb47e3`（工作区干净）以本机 WSL2 Ubuntu 26.04、root 执行 `dev-env/scripts/with-postgres.sh go test -count=1 -timeout=1200s -tags=e2e ./internal/e2e -run '^TestFlow_(BinaryCapacity200TasksAndUnqueuedLatency|BinaryRestartReconciles32OpenWithin30Seconds)$' -v`，两个用例均PASS（`go test ok ... 243.775s`）。
+
+容量（200任务×20节点、4 active、32 open、回环mock固定50ms）：失败率0；受理p50/p95/p99=74.485/90.297/98.471ms（200样本），读9.623/12.456/15.099ms（1705样本），空队列ready→start 25/31/124ms（80样本），有容量排队首节点1382/1557/1642ms；峰值RSS 56549376字节，共享测试库峰值10连接、本schema关系锁124、最大锁等待13.297ms；负载215.121514461s。二进制SHA256 `5dfb1b0781b09dc198f7aa92c31afadd875fb20359675a625b1ef907111e2161`，配置SHA256 `717e13dcd217c8716c2f8b886393f35bed9ea967a550a2b4e4f2083ae275f71f`，PostgreSQL 17.11 (Debian)。
+
+恢复（32 open、4个已外发调用）：`open=32 safe_succeeded=28 unknown_nonterminal=4 replayed=0 reconciliation_ms=5875.502`；模型调用总数33（1预热+4中断+28安全）。
+
+原始输出 `.loop/runs/us19-capacity-2026-11-11-rerun.log`（13行，SHA256 `937c92c94e87f34a64c079727edc19a2b8a424fa5424662663f81222e1605f2d`），由后台任务输出重建为UTF-8；任务捕获文件为混合编码（首行wsl.exe警告UTF-16LE、其余UTF-8），重建时去掉首行警告与NUL字节，未改动任何基准行。README新增单进程基线小节并附环境配置；Operations新增同源详表。仍为隔离回环单进程基准，不声称生产SLO、真实模型、多Worker或多宿主。未commit/push/tag。

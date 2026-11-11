@@ -1690,6 +1690,34 @@ observability:
 
 接近stored上限时先导出业务所需产物并规划维护，不会自动删除Flow恢复权威。历史30天清理继续保护Flow引用的Run、消息、调用审计和证据，任务终态也不删除未知动作。流程关闭仅停止新受理／推进；启动核对与已存在任务的关闭操作仍有效。
 
+### 单进程容量与 32 任务恢复复跑（2026-11-11）
+
+可复跑命令（测试自建并清理独占schema；本机`/run/basalt-dev/test-password`为root专属，故以root执行`with-postgres.sh`；`dev-env/`为本地目录、不进版本库，其他环境等价做法是设置`BASALT_TEST_PG_DSN`后直接运行`go test`）：
+
+```bash
+dev-env/scripts/with-postgres.sh go test -count=1 -timeout=1200s -tags=e2e ./internal/e2e \
+  -run '^TestFlow_(BinaryCapacity200TasksAndUnqueuedLatency|BinaryRestartReconciles32OpenWithin30Seconds)$' -v
+```
+
+本次环境：Windows 11（10.0.26300）宿主 + WSL2 Ubuntu 26.04（内核6.6.114.1-microsoft-standard-WSL2）；12th Gen Intel Core i7-12700（12核/20线程），宿主内存31.8GB，WSL可见15.5GiB、20 vCPU；Go 1.27.3 linux/amd64；本地PostgreSQL 17.11（Debian 17.11-1.pgdg12+2）开发容器同宿主；HEAD `640b1de`，工作区干净。模型为回环OpenAI兼容桩、固定50ms；无外部网络、真实模型或多宿主参与。
+
+容量用例为200个独立任务×20节点（4000个叶子Run）、`max_active=4`、`max_open=32`，另有4根×80节点的空队列cohort；失败率0。
+
+| 本次测量 | p50 | p95 | p99 | 样本数 |
+| --- | --- | --- | --- | --- |
+| 任务受理（ms） | 74.485 | 90.297 | 98.471 | 200 |
+| 任务状态读取（ms） | 9.623 | 12.456 | 15.099 | 1705 |
+| 空队列ready→start（ms） | 25 | 31 | 124 | 80 |
+| 有容量排队首节点启动（ms，每任务一条） | 1382 | 1557 | 1642 | 200 |
+
+峰值RSS 56549376字节（约54MiB）；RSS从约51.2MB起步，样本在54–56.5MB间波动，未持续单调增长。共享测试库峰值10连接、本schema关系锁124、最多1个锁等待连接（观测到最大等待13.297ms）。负载时长215.121514461s。进程CPU在负载期间约150%–190%（可用2000%）。
+
+恢复用例为32个真实open任务（4个已外发模型调用、28个排队根）：进程重启后5875.502ms内核对完成；28个安全完成，4个未决动作保持非终态、零重放（模型调用总数=1预热+4中断+28安全）。这只证明核对完成，不等于4个未知调用已业务恢复，也没有自动改写为成功。
+
+原始输出保存在本机被 git 忽略的 `.loop/runs/us19-capacity-2026-11-11-rerun.log`（13行，SHA256 `937c92c94e87f34a64c079727edc19a2b8a424fa5424662663f81222e1605f2d`），不进版本库。二进制SHA256 `5dfb1b0781b09dc198f7aa92c31afadd875fb20359675a625b1ef907111e2161`；测试配置SHA256 `717e13dcd217c8716c2f8b886393f35bed9ea967a550a2b4e4f2083ae275f71f`。
+
+以上仅为隔离回环、单进程基准：不含真实模型、外部网络、多Worker/多宿主、数据库故障或生产数据规模，不能外推为生产SLO、容量承诺或模型质量证据。复跑读数会随机器、负载与源码变化；2026-11-03的旧记录（受理p95 159.454ms、负载399.454s）保留在US19 run-state，其环境与代码同本轮不同，不构成同一基线的回归判定，也不得择优引用。
+
 ### 定义、发布与调用
 
 目录包含 `FLOW.yaml` 与其 `task_contract` 指向的普通JSON契约文件。离线校验只验证结构；发布前实例还核对真实Agent UID、生命周期版本、配置／资源清单hash、工具适配器、子定义和当前权限。同名Agent不能接管旧身份。
